@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 #
 # Deploys the upstream EEZ + ECDSAProofSystem + Rollup manager + creates
-# our rollupId — mirrors the 5-step sequence in
-# /root/rollup-node/scripts/devnet-compose-up.sh.
+# our rollupId — 4 steps.
 #
 # Reads from .env (poster key, proof signer key, RPC url, etc.).
 # Writes deployments.env with the addresses + rollupId + deploy block.
@@ -58,8 +57,8 @@ extract_uint() {
     grep -oE "${key}=[0-9]+" <<< "$out" | tail -1 | cut -d= -f2
 }
 
-# ── 1/5 DeployEEZ ────────────────────────────────────────────────────
-echo "[1/5] DeployEEZ"
+# ── 1/4 DeployEEZ ────────────────────────────────────────────────────
+echo "[1/4] DeployEEZ"
 OUT="$(cd "$CONTRACTS" && forge script script/DeployEEZ.s.sol:DeployEEZ $RPC $KEY --broadcast 2>&1)"
 EEZ_REGISTRY_ADDRESS="$(extract EEZ "$OUT")"
 [[ -n "$EEZ_REGISTRY_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture EEZ address" >&2; exit 1; }
@@ -67,26 +66,16 @@ EEZ_REGISTRY_DEPLOY_BLOCK="$(cast block-number --rpc-url "$EEZ_L1_RPC_URL")"
 echo "      EEZ        = $EEZ_REGISTRY_ADDRESS"
 echo "      deployBlock= $EEZ_REGISTRY_DEPLOY_BLOCK"
 
-# ── 2/5 DeployECDSAProofSystem ──────────────────────────────────────
-echo "[2/5] DeployECDSAProofSystem(authorizedSigner=$AUTHORIZED_SIGNER)"
+# ── 2/4 DeployECDSAProofSystem ──────────────────────────────────────
+echo "[2/4] DeployECDSAProofSystem(authorizedSigner=$AUTHORIZED_SIGNER)"
 OUT="$(cd "$CONTRACTS" && forge script script/DeployECDSAProofSystem.s.sol:DeployECDSAProofSystem \
     --sig "run(address)" "$AUTHORIZED_SIGNER" $RPC $KEY --broadcast 2>&1)"
 EEZ_ECDSA_PROOF_SYSTEM_ADDRESS="$(extract ECDSA_PS "$OUT")"
 [[ -n "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture ECDSA_PS address" >&2; exit 1; }
 echo "      ECDSA_PS   = $EEZ_ECDSA_PROOF_SYSTEM_ADDRESS"
 
-# ── 3/5 BurnRollupZero ──────────────────────────────────────────────
-echo "[3/5] BurnRollupZero"
-OUT="$(cd "$CONTRACTS" && forge script script/BurnRollupZero.s.sol:BurnRollupZero \
-    --sig "run(address,address,address,address)" \
-    "$EEZ_REGISTRY_ADDRESS" "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS" "$AUTHORIZED_SIGNER" "$OWNER" \
-    $RPC $KEY --broadcast 2>&1)"
-EEZ_BURN_ROLLUP_ADDRESS="$(extract BURN_ROLLUP "$OUT")"
-[[ -n "$EEZ_BURN_ROLLUP_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: BurnRollupZero failed" >&2; exit 1; }
-echo "      burnRollup = $EEZ_BURN_ROLLUP_ADDRESS"
-
-# ── 4/5 DeployRollup ────────────────────────────────────────────────
-echo "[4/5] DeployRollup"
+# ── 3/4 DeployRollup ────────────────────────────────────────────────
+echo "[3/4] DeployRollup"
 OUT="$(cd "$CONTRACTS" && forge script script/DeployRollup.s.sol:DeployRollup \
     --sig "run(address,address,address,address)" \
     "$EEZ_REGISTRY_ADDRESS" "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS" "$AUTHORIZED_SIGNER" "$OWNER" \
@@ -95,8 +84,8 @@ EEZ_ROLLUP_MANAGER_ADDRESS="$(extract ROLLUP_CONTRACT "$OUT")"
 [[ -n "$EEZ_ROLLUP_MANAGER_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: DeployRollup failed" >&2; exit 1; }
 echo "      rollupMgr  = $EEZ_ROLLUP_MANAGER_ADDRESS"
 
-# ── 5/5 RegisterRollup ──────────────────────────────────────────────
-echo "[5/5] RegisterRollup(initialState=$EEZ_INITIAL_STATE_ROOT)"
+# ── 4/4 RegisterRollup ──────────────────────────────────────────────
+echo "[4/4] RegisterRollup(initialState=$EEZ_INITIAL_STATE_ROOT)"
 OUT="$(cd "$CONTRACTS" && forge script script/RegisterRollup.s.sol:RegisterRollup \
     --sig "run(address,address,bytes32)" \
     "$EEZ_REGISTRY_ADDRESS" "$EEZ_ROLLUP_MANAGER_ADDRESS" "$EEZ_INITIAL_STATE_ROOT" \
@@ -114,7 +103,6 @@ EEZ_REGISTRY_ADDRESS=$EEZ_REGISTRY_ADDRESS
 EEZ_REGISTRY_DEPLOY_BLOCK=$EEZ_REGISTRY_DEPLOY_BLOCK
 EEZ_ECDSA_PROOF_SYSTEM_ADDRESS=$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS
 EEZ_ROLLUP_MANAGER_ADDRESS=$EEZ_ROLLUP_MANAGER_ADDRESS
-EEZ_BURN_ROLLUP_ADDRESS=$EEZ_BURN_ROLLUP_ADDRESS
 EEZ_ROLLUP_ID=$EEZ_ROLLUP_ID
 EOF
 

@@ -187,7 +187,7 @@ mod eez_l1_batch {
     alloy_sol_types::sol! {
         #![sol(rpc, all_derives)]
 
-        /// Per-rollup state delta — mirrors `sync-rollups-protocol/src/EEZ.sol`.
+        /// Per-rollup state delta — mirrors `sync-rollups-protocol/src/interfaces/IEEZ.sol`.
         struct StateDelta {
             uint256 rollupId;
             bytes32 currentState;
@@ -195,7 +195,7 @@ mod eez_l1_batch {
             int256 etherDelta;
         }
 
-        struct CrossChainCall {
+        struct L2ToL1Call {
             address targetAddress;
             uint256 value;
             bytes data;
@@ -204,7 +204,7 @@ mod eez_l1_batch {
             uint256 revertSpan;
         }
 
-        struct NestedAction {
+        struct ExpectedL1ToL2Call {
             bytes32 crossChainCallHash;
             uint256 callCount;
             bytes returnData;
@@ -212,10 +212,10 @@ mod eez_l1_batch {
 
         struct ExecutionEntry {
             StateDelta[] stateDeltas;
-            bytes32 crossChainCallHash;
+            bytes32 proxyEntryHash;
             uint256 destinationRollupId;
-            CrossChainCall[] calls;
-            NestedAction[] nestedActions;
+            L2ToL1Call[] L2ToL1Calls;
+            ExpectedL1ToL2Call[] expectedL1ToL2Calls;
             uint256 callCount;
             bytes returnData;
             bytes32 rollingHash;
@@ -228,7 +228,7 @@ mod eez_l1_batch {
             bool failed;
             uint64 callNumber;
             uint64 lastNestedActionConsumed;
-            CrossChainCall[] calls;
+            L2ToL1Call[] calls;
             bytes32 rollingHash;
         }
 
@@ -243,7 +243,7 @@ mod eez_l1_batch {
         /// hold cross-chain content in stage 4. The full struct types are
         /// declared here (not shortened to `bytes[]`) because the function
         /// selector hashes the canonical types — if our declared types
-        /// diverge from `EEZ.sol`'s, `postVerifyAndExecuteOrSaveExecutionsFromBatch`'s
+        /// diverge from `EEZ.sol`'s, `postAndVerifyBatch`'s
         /// 4-byte selector won't match and the call hits no function.
         struct ProofSystemBatchPerVerificationEntries {
             ExecutionEntry[] entries;
@@ -262,7 +262,7 @@ mod eez_l1_batch {
         /// needs from `sync-rollups-protocol/src/EEZ.sol`.
         #[sol(rpc)]
         contract EezRegistry {
-            function postVerifyAndExecuteOrSaveExecutionsFromBatch(
+            function postAndVerifyBatch(
                 ProofSystemBatchPerVerificationEntries calldata batch
             ) external;
 
@@ -285,10 +285,10 @@ mod tests {
     #[test]
     fn selector_matches_contract_abi() {
         use alloy_sol_types::SolCall;
-        let sel = EezRegistry::postVerifyAndExecuteOrSaveExecutionsFromBatchCall::SELECTOR;
+        let sel = EezRegistry::postAndVerifyBatchCall::SELECTOR;
         // From contracts/out/EEZ.sol/EEZ.json — methodIdentifiers entry for
-        // the canonical postVerifyAndExecuteOrSaveExecutionsFromBatch signature.
-        let expected = hex::decode("618f5a78").unwrap();
+        // the canonical postAndVerifyBatch signature.
+        let expected = hex::decode("7dd4d7d7").unwrap();
         assert_eq!(
             sel.as_slice(),
             expected.as_slice(),
@@ -327,7 +327,10 @@ mod tests {
         };
 
         let proof = prover
-            .prove(ProvingContext { batch: &batch, rollup_id: 0 })
+            .prove(ProvingContext {
+                batch: &batch,
+                rollup_id: 0,
+            })
             .await
             .unwrap();
         assert_eq!(proof.len(), 65, "proof must be r||s||v");

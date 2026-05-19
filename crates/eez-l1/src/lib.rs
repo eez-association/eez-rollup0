@@ -9,8 +9,8 @@
 //!   `ProofSystemBatchPerVerificationEntries` carrying our payload bytes in
 //!   `callData`, compute the public-inputs hash exactly as `EEZ` does, ask the
 //!   injected [`Prover`](eez_prover::Prover) for a proof, and submit
-//!   `postVerifyAndExecuteOrSaveExecutionsFromBatch`. Stateless by design —
-//!   no on-disk cursor; the L1 contract's event log is the source of truth.
+//!   `postAndVerifyBatch`. Stateless by design — no on-disk cursor; the
+//!   L1 contract's event log is the source of truth.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 

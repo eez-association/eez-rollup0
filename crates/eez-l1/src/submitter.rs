@@ -1,4 +1,4 @@
-//! Stage-2 Submitter: posts L2 batches to `EEZ.postVerifyAndExecuteOrSaveExecutionsFromBatch`.
+//! Stage-2 Submitter: posts L2 batches to `EEZ.postAndVerifyBatch`.
 //!
 //! Construction:
 //!
@@ -18,7 +18,7 @@
 //!   `(posted_through + 1 ..= local)`, encode the §8.1 payload, build the
 //!   batch with our payload in `callData` (every cross-chain slot empty
 //!   for stage 2), hand it to [`Prover::prove`], submit
-//!   `postVerifyAndExecuteOrSaveExecutionsFromBatch`, wait for one
+//!   `postAndVerifyBatch`, wait for one
 //!   confirmation. On success: `posted_through = local`.
 //!
 //! After startup `posted_through` lives in memory only — no on-chain
@@ -254,7 +254,7 @@ where
         // Pre-simulate via eth_call to surface a typed revert before we
         // ever broadcast — saves gas on bugs and prevents stuck pending
         // txs from misformed batches.
-        let call_builder = eez.postVerifyAndExecuteOrSaveExecutionsFromBatch(batch);
+        let call_builder = eez.postAndVerifyBatch(batch);
         call_builder
             .call()
             .await
@@ -337,9 +337,8 @@ async fn scan_on_chain_head(
             .map_err(|e| L1Error::Provider(format!("get_tx({tx_hash}): {e}")))?
             .ok_or_else(|| L1Error::Provider(format!("tx {tx_hash} not found")))?;
         let input = tx.inner.input();
-        let decoded =
-            EezRegistry::postVerifyAndExecuteOrSaveExecutionsFromBatchCall::abi_decode(input)
-                .map_err(|e| L1Error::Provider(format!("decode postBatch({tx_hash}): {e}")))?;
+        let decoded = EezRegistry::postAndVerifyBatchCall::abi_decode(input)
+            .map_err(|e| L1Error::Provider(format!("decode postBatch({tx_hash}): {e}")))?;
         let payload = decoded.batch.callData.as_ref();
         let batch = eez_payload_codec::decode(payload)?;
         head += batch.block_count() as u64;

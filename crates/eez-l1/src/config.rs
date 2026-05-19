@@ -29,7 +29,7 @@ pub struct SubmitterConfig {
     pub eez: Address,
     /// Deployed `ECDSAProofSystem` address — the one PS we attest with.
     pub proof_system: Address,
-    /// `rollupId` returned by `EEZ.createRollup` for our L2.
+    /// `rollupId` returned by `EEZ.registerRollup` for our L2.
     pub rollup_id: u64,
     /// L1 block where `EEZ` was deployed. Lower bound for the startup
     /// `BatchPosted` log scan that seeds `posted_through`. Keeps the scan

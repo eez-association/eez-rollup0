@@ -6,7 +6,7 @@ import {Script, console} from "forge-std/Script.sol";
 import {EEZ} from "sync-rollups-protocol/src/EEZ.sol";
 
 /// @title RegisterRollup
-/// @notice Calls `EEZ.createRollup(rollupContract, initialState)`. The
+/// @notice Calls `EEZ.registerRollup(rollupContract, initialState)`. The
 ///         registry assigns the next sequential `rollupId` (starting at
 ///         1 — `MAINNET_ROLLUP_ID = 0` is reserved for L1 self), emits
 ///         `RollupCreated(rollupId, rollupContract, initialState)`, and
@@ -35,7 +35,7 @@ contract RegisterRollup is Script {
         bytes32 initialState
     ) external {
         vm.startBroadcast();
-        uint256 rollupId = EEZ(eez).createRollup(rollupContract, initialState);
+        uint256 rollupId = EEZ(eez).registerRollup(rollupContract, initialState);
         vm.stopBroadcast();
         console.log("L2_ROLLUP_ID=%s", rollupId);
     }

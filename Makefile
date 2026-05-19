@@ -49,14 +49,13 @@ fmt:
 
 # ─── Contracts ────────────────────────────────────────────────────────────
 #
-# Runs the same 5-step sequence /root/rollup-node uses on its devnet:
+# Runs the 4-step deploy sequence:
 #
 #   1. DeployEEZ                 → EEZ_REGISTRY_ADDRESS + deploy block
 #   2. DeployECDSAProofSystem    → EEZ_ECDSA_PROOF_SYSTEM_ADDRESS
 #                                   (authorizedSigner derived from EEZ_PROOF_SIGNER_KEY)
-#   3. BurnRollupZero            (id 0 is reserved for L1 self)
-#   4. DeployRollup              → Rollup manager contract
-#   5. RegisterRollup            → EEZ_ROLLUP_ID = 1
+#   3. DeployRollup              → Rollup manager contract
+#   4. RegisterRollup            → EEZ_ROLLUP_ID = 1
 #
 # Outputs land in deployments.env (gitignored). eez-node loads it
 # alongside .env at startup, so a successful deploy means `make run-node`

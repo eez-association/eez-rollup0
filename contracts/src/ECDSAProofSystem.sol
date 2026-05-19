@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {IProofSystem} from "sync-rollups-protocol/src/IProofSystem.sol";
+import {IProofSystem} from "sync-rollups-protocol/src/interfaces/IProofSystem.sol";
 
 /// @title ECDSAProofSystem
 /// @notice Development-only `IProofSystem` implementation backed by a single
@@ -20,7 +20,7 @@ import {IProofSystem} from "sync-rollups-protocol/src/IProofSystem.sol";
 ///         `EEZ._verifyProofSystemBatch` so the composer can hand the same
 ///         bytes to this verifier and to a real zisk prover interchangeably
 ///         (per `IProofSystem.verify(bytes proof, bytes32 publicInputsHash)`
-///         at `sync-rollups-protocol/src/IProofSystem.sol:15`).
+///         at `sync-rollups-protocol/src/interfaces/IProofSystem.sol:15`).
 ///
 ///         The contract is registered on a per-rollup `IRollupContract`'s
 ///         vkey map; the rollup owner sets `vkey = bytes32(uint256(uint160(

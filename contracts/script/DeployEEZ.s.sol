@@ -8,7 +8,7 @@ import {EEZ} from "sync-rollups-protocol/src/EEZ.sol";
 /// @title DeployEEZ
 /// @notice Deploys the central `EEZ.sol` registry on L1. Stateless deploy —
 ///         no constructor args; `rollupCounter` starts at 0 and each
-///         `createRollup` bumps it.
+///         `registerRollup` bumps it.
 ///
 ///         Outputs: EEZ=<address>
 ///
