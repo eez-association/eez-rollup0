@@ -1,23 +1,11 @@
 //! Follower task: tracks the sequencer's chain by querying its JSON-RPC for
 //! the current head hash and driving local reth via `forkchoiceUpdated`.
 //!
-//! Block data flows over reth's existing devp2p (eth/68) — the FCU points at
-//! a head reth doesn't yet have, reth enters `SYNCING`, pipeline sync pulls
-//! the missing blocks from peers (including the sequencer), and the FCU
-//! eventually resolves to `VALID`. Catch-up after downtime works the same
-//! way: the first FCU at startup kicks off backfill from genesis (or
-//! whatever the local best block is) to the current head.
-//!
-//! The sequencer JSON-RPC carries only the 32-byte head hash per tick. Every
-//! byte of block data, transactions, and receipts flows over P2P.
-//!
 //! Per-tick algorithm:
 //!
 //! 1. `eth_getBlockByNumber(latest)` against the sequencer — the sequencer is
 //!    authoritative for "current head", so we don't try to derive a slot
-//!    locally. (Wall-clock-derived slot math breaks on dev chains, where
-//!    `genesis.timestamp = 0` but the sequencer's first produced block has
-//!    `timestamp ≈ now`.)
+//!    locally.
 //! 2. If `null` (sequencer has no blocks yet) — skip, retry next tick.
 //! 3. If the hash matches what we already FCU'd last tick — refresh and skip
 //!    the push so the deque doesn't accumulate duplicates.
@@ -25,11 +13,6 @@
 //!    (`head`, `head - 32`, `head - 64`), and call `fork_choice_updated`.
 //! 5. `VALID` → head advanced. `SYNCING` → reth still backfilling (benign).
 //!    `INVALID` → log error, drop the hash so the next tick can retry.
-//!
-//! The forkchoice math (`SAFE_LAG`, `FINALIZED_LAG`, `FORKCHOICE_HISTORY`)
-//! intentionally duplicates `eez-driver`'s `Sequencer` rather than refactor
-//! into a shared abstraction. Extraction can wait until a second consumer
-//! signals real drift.
 
 use core::fmt;
 use std::{collections::VecDeque, time::Duration};
@@ -45,10 +28,7 @@ use tracing::{Level, event};
 
 use crate::error::FollowerError;
 
-/// Mirrors `eez_driver::Sequencer`'s forkchoice tracking constants. See
-/// `crates/eez-driver/src/sequencer.rs:44-46` for the rationale (2-minute
-/// history at 2s block time; safe/finalized lags chosen so those pointers
-/// don't move every block).
+/// Mirrors `eez_driver::Sequencer`'s forkchoice tracking constants.
 const FORKCHOICE_HISTORY: usize = 64;
 const SAFE_LAG: usize = 32;
 const FINALIZED_LAG: usize = 64;
@@ -58,8 +38,7 @@ const FINALIZED_LAG: usize = 64;
 const FCU_REFRESH: Duration = Duration::from_secs(1);
 
 /// Drives a reth node by translating per-tick sequencer head-pointer lookups
-/// into engine-API `forkchoiceUpdated` calls. The actual block data is
-/// transferred by reth's P2P stack as a side-effect of FCU.
+/// into engine-API `forkchoiceUpdated` calls, latest head taken from sequencer RPC.
 pub(crate) struct Follower<T>
 where
     T: PayloadTypes,
