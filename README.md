@@ -4,25 +4,36 @@ L2 rollup node with a custom sequencer driving a near-vanilla reth via the engin
 
 ## Status
 
-Stage 1 only — produces an L2 block every 2 seconds on a dev chain. No L1, no postBatch, no cross-chain yet. The Sequencer + Scheduler shape is in place; subsequent stages bolt new tasks alongside without rewriting the core.
+Stages 1 and 2 done — `eez-node` produces L2 blocks every 2s and posts contiguous batches to `EEZ.postVerifyAndExecuteOrSaveExecutionsFromBatch` on the configured L1 every minute. Batches carry only L2 user txs in stage 2; cross-chain entries arrive in stage 4.
 
 ## Run
+
+```bash
+git submodule update --init --recursive
+
+cp .env.example .env                 # fill in L1 RPC, poster + proof-signer keys, datadir
+make deploy-protocol                 # deploys EEZ + ECDSAProofSystem + Rollup manager + creates rollupId
+                                     # paste each printed address into .env
+make run-node                        # spawns sequencer + submitter
+```
+
+Run without `.env` (sequencer-only smoke test):
 
 ```bash
 cargo run -p eez-node -- node --chain dev --datadir /tmp/eez-rollup0-data
 ```
 
-You should see an `eez.sequencer.block.produced` event every 2 seconds. `eth_blockNumber` over JSON-RPC advances by 1 per tick.
+Logs you should see: `eez.sequencer.block.produced` every 2s; `eez.submitter.batch.posted` every 60s when L1 config is present.
 
 ## Roadmap
 
 ### Done
 
-- [x] **Stage 1** — sequenced reth (Sequencer + Scheduler + Eth attributes; engine-API consumer loop)
+- [x] **Stage 1** — sequenced reth (Sequencer + Scheduler; engine-API consumer loop)
+- [x] **Stage 2** — postBatch submission (upstream `EEZ.sol` + `ECDSAProofSystem` + `eez-payload-codec` + `eez-prover` + `eez-l1::Submitter`; stateless, restart-safe, reorg-safe)
 
 ### To do
 
-- [ ] **Stage 2** — postBatch submission (L2-only txs batched + posted to L1)
 - [ ] **Stage 3** — reorg handling + `eez-follower` (derivation-based fullnode)
 - [ ] **Stage 4** — cross-chain composer (sync blocks with system txs, proof, full L1↔L2)
 

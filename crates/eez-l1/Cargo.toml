@@ -1,0 +1,35 @@
+[package]
+name                   = "eez-l1"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+description            = "L1 RPC client + Submitter task that posts L2 batches to BatchPoster.sol."
+
+[dependencies]
+eez-payload-codec.workspace = true
+eez-prover.workspace        = true
+
+# reth — needed for the L2 BlockReader bounds (the Submitter reads the
+# local L2 directly to assemble batch payloads; lifting this through a
+# trait wasn't worth the extra abstraction for stage 2).
+reth-primitives-traits.workspace = true
+reth-storage-api.workspace       = true
+
+# alloy — alloy-contract is pulled in transitively via eez-prover.
+alloy-eips.workspace          = true
+alloy-network.workspace       = true
+alloy-primitives.workspace    = true
+alloy-provider.workspace      = true
+alloy-rpc-types-eth.workspace = true
+alloy-signer-local.workspace  = true
+alloy-sol-types.workspace     = true
+
+# async + diagnostics
+thiserror.workspace = true
+tokio.workspace     = true
+tracing.workspace   = true
+url.workspace       = true
+
+[lints]
+workspace = true

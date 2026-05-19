@@ -1,0 +1,23 @@
+[package]
+name                   = "eez-prover"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+description            = "Prover trait + stage-2 EcdsaProver. Stage-4 ZiskProver slots in behind the same trait."
+
+[dependencies]
+alloy-contract.workspace     = true
+alloy-primitives.workspace   = true
+alloy-signer.workspace       = true
+alloy-signer-local.workspace = true
+alloy-sol-types.workspace    = true
+async-trait.workspace        = true
+thiserror.workspace          = true
+
+[dev-dependencies]
+futures-util.workspace = true
+tokio              = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true
