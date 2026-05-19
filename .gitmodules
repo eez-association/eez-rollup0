@@ -1,4 +1,4 @@
 [submodule "sync-rollups-protocol"]
 	path = sync-rollups-protocol
 	url = https://github.com/eez-association/sync-rollups-protocol.git
-	branch = feature/fixInitialRollup
+	branch = main
