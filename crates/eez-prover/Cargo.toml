@@ -4,7 +4,7 @@ version.workspace      = true
 edition.workspace      = true
 license.workspace      = true
 rust-version.workspace = true
-description            = "Prover trait + stage-2 EcdsaProver. Stage-4 ZiskProver slots in behind the same trait."
+description            = "Prover trait + stage-2 MockEcdsaProver. Real prover slots in behind the same trait."
 
 [dependencies]
 alloy-contract.workspace     = true

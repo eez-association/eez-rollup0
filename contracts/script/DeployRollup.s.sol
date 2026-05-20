@@ -8,7 +8,7 @@ import {Rollup} from "sync-rollups-protocol/src/rollupContract/Rollup.sol";
 /// @title DeployRollup
 /// @notice Deploys the per-rollup `IRollupContract` manager (reference
 ///         `Rollup.sol`) configured for a single-PS, threshold-1 setup:
-///         the workspace-local `ECDSAProofSystem` with vkey =
+///         the workspace-local `MockECDSAProofSystem` with vkey =
 ///         `bytes32(uint256(uint160(authorizedSigner)))`.
 ///
 ///         Outputs: ROLLUP_CONTRACT=<address>
@@ -16,15 +16,15 @@ import {Rollup} from "sync-rollups-protocol/src/rollupContract/Rollup.sol";
 ///         Call shape:
 ///           forge script ... DeployRollup
 ///             --sig "run(address,address,address,address)"
-///                   $EEZ $ECDSA_PS $AUTHORIZED_SIGNER $OWNER
+///                   $EEZ $MOCK_PS $AUTHORIZED_SIGNER $OWNER
 ///             --rpc-url $L1_RPC --broadcast --private-key $PK
 ///
 ///         Args:
 ///           - eez                — central registry address (from DeployEEZ).
-///           - ecdsaProofSystem   — workspace-local proof-system address
-///                                  (from DeployECDSAProofSystem).
+///           - proofSystem        — workspace-local proof-system address
+///                                  (from DeployMockECDSAProofSystem).
 ///           - authorizedSigner   — the same value passed to
-///                                  DeployECDSAProofSystem; its address
+///                                  DeployMockECDSAProofSystem; its address
 ///                                  becomes the vkey membership ticket
 ///                                  the registry stores.
 ///           - owner              — owner of the Rollup manager. The owner
@@ -43,21 +43,21 @@ contract DeployRollup is Script {
 
     function run(
         address eez,
-        address ecdsaProofSystem,
+        address proofSystem,
         address authorizedSigner,
         address owner
     ) external {
-        if (ecdsaProofSystem == address(0)) revert InvalidProofSystem();
+        if (proofSystem == address(0)) revert InvalidProofSystem();
 
         address[] memory proofSystems = new address[](1);
-        proofSystems[0] = ecdsaProofSystem;
+        proofSystems[0] = proofSystem;
 
         bytes32[] memory vkeys = new bytes32[](1);
         // The registry treats vkey as opaque (only checks non-zero +
         // membership). Embedding the signer address as the vkey gives
         // off-chain tooling a way to read the expected signer without
         // a separate getter, and guarantees a non-zero membership
-        // ticket. See `ECDSAProofSystem.sol`'s `signer()` for the
+        // ticket. See `MockECDSAProofSystem.sol`'s `signer()` for the
         // actual signing-address surface (the verifier reads it from
         // its own storage, not from the vkey).
         vkeys[0] = bytes32(uint256(uint160(authorizedSigner)));

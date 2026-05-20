@@ -13,8 +13,8 @@ use std::{env, str::FromStr, sync::Arc, time::Duration};
 use alloy_primitives::B256;
 use alloy_signer_local::PrivateKeySigner;
 use eez_driver::{EthAttributesBuilder, Scheduler, Sequencer};
-use eez_l1::{Submitter, SubmitterConfig};
-use eez_prover::EcdsaProver;
+use eez_l1::{Composer, ComposerConfig, Submitter, SubmitterConfig};
+use eez_prover::MockEcdsaProver;
 use mimalloc::MiMalloc;
 use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
 use reth_node_ethereum::EthereumNode;
@@ -89,34 +89,38 @@ fn main() -> eyre::Result<()> {
             sequencer.run().await;
         });
 
-        // Submitter — opt-in via env. If `EEZ_L1_RPC_URL` is set, we
-        // parse the full SubmitterConfig and spawn the task. Missing
-        // required vars produce a loud config error; without `EEZ_L1_RPC_URL`
-        // the node runs sequencer-only (stage-1-style smoke test).
+        // Composer + Submitter — opt-in via env. If `EEZ_L1_RPC_URL` is
+        // set, we parse both configs, build the prover, and spawn the
+        // composer task. Missing required vars produce a loud config
+        // error; without `EEZ_L1_RPC_URL` the node runs sequencer-only
+        // (stage-1-style smoke test).
         if env::var_os("EEZ_L1_RPC_URL").is_some() {
-            let config = SubmitterConfig::from_env()?;
+            let submitter_config = SubmitterConfig::from_env()?;
+            let composer_config = ComposerConfig::from_env()?;
             let proof_signer_key = env::var("EEZ_PROOF_SIGNER_KEY").map_err(|_| {
                 eyre::eyre!("EEZ_PROOF_SIGNER_KEY required when EEZ_L1_RPC_URL set")
             })?;
             let proof_signer = PrivateKeySigner::from_bytes(&B256::from_str(
                 proof_signer_key.trim_start_matches("0x"),
             )?)?;
-            let prover = Arc::new(EcdsaProver::new(proof_signer));
-            let submitter = Submitter::new(config, prover, Arc::new(provider)).await?;
+            let prover = Arc::new(MockEcdsaProver::new(proof_signer));
+            let submitter = Submitter::new(submitter_config);
+            let composer =
+                Composer::new(composer_config, prover, Arc::new(provider), submitter).await?;
             event!(
-                name: "eez.node.submitter.spawned",
+                name: "eez.node.composer.spawned",
                 Level::INFO,
-                "spawning eez submitter",
+                "spawning eez composer",
             );
             handle
                 .node
                 .task_executor
-                .spawn_critical_task("eez-submitter", async move {
-                    submitter.run().await;
+                .spawn_critical_task("eez-composer", async move {
+                    composer.run().await;
                 });
         } else {
             event!(
-                name: "eez.node.submitter.skipped",
+                name: "eez.node.composer.skipped",
                 Level::INFO,
                 "EEZ_L1_RPC_URL not set; running sequencer only",
             );
