@@ -7,7 +7,9 @@ rust-version.workspace = true
 description            = "eez Rollup-0 follower node — tracks the sequencer's chain via FCU + reth P2P sync."
 
 [dependencies]
-eez-driver.workspace = true
+eez-driver.workspace        = true
+eez-payload-codec.workspace = true
+eez-prover.workspace        = true
 
 # reth
 reth-chainspec.workspace                  = true
@@ -18,15 +20,19 @@ reth-node-builder.workspace               = true
 reth-node-ethereum.workspace              = true
 reth-payload-primitives.workspace         = true
 reth-primitives-traits.workspace          = true
+reth-storage-api.workspace                = true
 
 # alloy
+alloy-eips.workspace             = true
 alloy-primitives.workspace       = true
 alloy-provider.workspace         = true
 alloy-rpc-types-engine.workspace = true
 alloy-rpc-types-eth.workspace    = true
+alloy-sol-types.workspace        = true
 
 # app
 clap.workspace               = true
+dotenvy.workspace            = true
 eyre.workspace               = true
 mimalloc.workspace           = true
 thiserror.workspace          = true

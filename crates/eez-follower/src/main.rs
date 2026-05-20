@@ -1,20 +1,21 @@
 //! eez Rollup-0 follower node binary.
 //!
-//! Wraps reth with a [`Follower`] task: reth provides the EVM, storage, P2P
-//! networking, and RPC; we drive its engine API to track whatever chain head
-//! the sequencer publishes via its standard JSON-RPC. The actual block data
-//! flows over reth's devp2p (eth/68) — see `follower::Follower` docs for
-//! the data-plane vs. control-plane split.
+//! Wraps reth with a [`Follower`] task plus an [`L1Watcher`] task. Reth
+//! provides the EVM, storage, P2P networking, RPC, and engine; the
+//! follower drives the engine API to track the sequencer's chain
+//! (unsafe head from sequencer JSON-RPC, safe/finalized from L1
+//! `BatchPosted` events tailed by the L1 watcher).
 //!
-//! Stage 1 hard-codes the 2-second block time (same as `eez-node`). The
-//! sequencer's RPC endpoint is configured via `--sequencer-rpc` (or the
-//! `EEZ_SEQUENCER_RPC` env var). P2P peering with the sequencer's reth is
-//! configured via reth's own `--trusted-peers` flag.
+//! L1 is mandatory — see `l1.rs`. All `EEZ_*` env vars must be set.
+//! `EEZ_SEQUENCER_RPC` is required too (or `--sequencer-rpc`).
+//! P2P peering with the sequencer's reth is configured via reth's
+//! own `--trusted-peers` flag.
 
 mod error;
 mod follower;
+mod l1;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use alloy_provider::RootProvider;
 use clap::Parser as _;
@@ -25,13 +26,14 @@ use reth_node_ethereum::EthereumNode;
 use tracing::{Level, event};
 
 use crate::follower::Follower;
+use crate::l1::{L1Config, L1View, L1Watcher};
 
 /// Per M-MIMALLOC-APPS — meaningful win on allocation-heavy workloads.
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 /// L2 block cadence for Rollup-0. Must match the sequencer's value
-/// (`eez-node/src/main.rs:27`); both will move to a shared config later.
+/// (`eez-node/src/main.rs:31`); both will move to a shared config later.
 const BLOCK_TIME: Duration = Duration::from_secs(2);
 
 /// Follower-specific CLI arguments, layered on top of reth's `Cli` via the
@@ -45,6 +47,11 @@ struct FollowerExt {
 }
 
 fn main() -> eyre::Result<()> {
+    // Auto-load `.env` from cwd and the machine-written `deployments.env`
+    // that `scripts/deploy.sh` produces — same convention as `eez-node`.
+    let _ = dotenvy::dotenv();
+    let _ = dotenvy::from_filename("deployments.env");
+
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         // SAFETY: set during single-threaded startup before any other thread is spawned.
         unsafe {
@@ -53,12 +60,17 @@ fn main() -> eyre::Result<()> {
     }
 
     Cli::<EthereumChainSpecParser, FollowerExt>::parse().run(async move |builder, ext| {
+        // Validate L1 config BEFORE launching reth so missing env vars
+        // fail in milliseconds rather than after reth boots RPC servers.
+        let l1_config = L1Config::from_env()?;
+
         event!(
             name: "eez.follower.launching",
             Level::INFO,
             block_time.secs = BLOCK_TIME.as_secs(),
             sequencer_rpc = %ext.sequencer_rpc,
-            "launching eez-follower with {{block_time.secs}}s block time, sequencer={{sequencer_rpc}}",
+            l1_rpc = %l1_config.rpc_url,
+            "launching eez-follower with {{block_time.secs}}s block time, sequencer={{sequencer_rpc}}, l1={{l1_rpc}}",
         );
 
         // Launch reth with all default Ethereum components: tx pool, network,
@@ -69,10 +81,23 @@ fn main() -> eyre::Result<()> {
 
         let beacon_engine_handle = handle.node.add_ons_handle.beacon_engine_handle.clone();
         let task_executor = handle.node.task_executor.clone();
+        let l2_provider = Arc::new(handle.node.provider.clone());
 
-        let rpc: RootProvider = RootProvider::new_http(ext.sequencer_rpc.clone());
+        let l1_view = Arc::new(L1View::default());
+        let l1_watcher = L1Watcher::new(l1_config, l1_view.clone()).await?;
+        task_executor.spawn_critical_task("eez-follower-l1", async move {
+            l1_watcher.run().await;
+        });
+
+        let sequencer_rpc: RootProvider = RootProvider::new_http(ext.sequencer_rpc.clone());
         let scheduler = Scheduler::interval(BLOCK_TIME);
-        let follower = Follower::new(beacon_engine_handle, rpc, scheduler);
+        let follower = Follower::new(
+            beacon_engine_handle,
+            sequencer_rpc,
+            scheduler,
+            l2_provider,
+            l1_view,
+        );
 
         event!(
             name: "eez.follower.spawned",

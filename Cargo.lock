@@ -2751,6 +2751,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "eez-follower"
+version = "0.1.0"
+dependencies = [
+ "alloy-eips 2.0.5",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types-engine",
+ "alloy-rpc-types-eth",
+ "alloy-sol-types",
+ "clap",
+ "dotenvy",
+ "eez-driver",
+ "eez-payload-codec",
+ "eez-prover",
+ "eyre",
+ "mimalloc",
+ "reth-chainspec",
+ "reth-engine-primitives",
+ "reth-ethereum-cli",
+ "reth-ethereum-engine-primitives",
+ "reth-node-builder",
+ "reth-node-ethereum",
+ "reth-payload-primitives",
+ "reth-primitives-traits",
+ "reth-storage-api",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+ "url",
+]
+
+[[package]]
 name = "eez-l1"
 version = "0.1.0"
 dependencies = [
