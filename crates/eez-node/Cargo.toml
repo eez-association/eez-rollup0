@@ -8,15 +8,22 @@ description            = "eez Rollup-0 node — vanilla reth driven by an eez se
 
 [dependencies]
 eez-driver.workspace = true
+eez-l1.workspace     = true
+eez-prover.workspace = true
 
 # reth
-reth-chainspec.workspace    = true
-reth-ethereum-cli.workspace = true
-reth-node-builder.workspace = true
+reth-chainspec.workspace     = true
+reth-ethereum-cli.workspace  = true
+reth-node-builder.workspace  = true
 reth-node-ethereum.workspace = true
+
+# alloy
+alloy-primitives.workspace   = true
+alloy-signer-local.workspace = true
 
 # app
 clap.workspace               = true
+dotenvy.workspace            = true
 eyre.workspace               = true
 mimalloc.workspace           = true
 tokio.workspace              = true

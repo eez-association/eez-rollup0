@@ -8,9 +8,13 @@
 //! recipient. Future CLI flags will expose these; for now they're constants
 //! at the top of `main`.
 
-use std::{sync::Arc, time::Duration};
+use std::{env, str::FromStr, sync::Arc, time::Duration};
 
+use alloy_primitives::B256;
+use alloy_signer_local::PrivateKeySigner;
 use eez_driver::{EthAttributesBuilder, Scheduler, Sequencer};
+use eez_l1::{Composer, ComposerConfig, Submitter, SubmitterConfig};
+use eez_prover::MockEcdsaProver;
 use mimalloc::MiMalloc;
 use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
 use reth_node_ethereum::EthereumNode;
@@ -27,6 +31,16 @@ static GLOBAL: MiMalloc = MiMalloc;
 const BLOCK_TIME: Duration = Duration::from_secs(2);
 
 fn main() -> eyre::Result<()> {
+    // Auto-load `.env` from the current working directory (gitignored).
+    // Plus, if it exists, the machine-written `deployments.env` that
+    // `scripts/deploy.sh` produces — addresses + rollup id flow from
+    // there into the Submitter's config without manual paste-in.
+    //
+    // Failure to find either is fine — operators may set env vars
+    // out-of-band (CI / systemd unit / shell `source`).
+    let _ = dotenvy::dotenv();
+    let _ = dotenvy::from_filename("deployments.env");
+
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         // SAFETY: set during single-threaded startup before any other thread is spawned.
         unsafe {
@@ -74,6 +88,43 @@ fn main() -> eyre::Result<()> {
         task_executor.spawn_critical_task("eez-sequencer", async move {
             sequencer.run().await;
         });
+
+        // Composer + Submitter — opt-in via env. If `EEZ_L1_RPC_URL` is
+        // set, we parse both configs, build the prover, and spawn the
+        // composer task. Missing required vars produce a loud config
+        // error; without `EEZ_L1_RPC_URL` the node runs sequencer-only
+        // (stage-1-style smoke test).
+        if env::var_os("EEZ_L1_RPC_URL").is_some() {
+            let submitter_config = SubmitterConfig::from_env()?;
+            let composer_config = ComposerConfig::from_env()?;
+            let proof_signer_key = env::var("EEZ_PROOF_SIGNER_KEY").map_err(|_| {
+                eyre::eyre!("EEZ_PROOF_SIGNER_KEY required when EEZ_L1_RPC_URL set")
+            })?;
+            let proof_signer = PrivateKeySigner::from_bytes(&B256::from_str(
+                proof_signer_key.trim_start_matches("0x"),
+            )?)?;
+            let prover = Arc::new(MockEcdsaProver::new(proof_signer));
+            let submitter = Submitter::new(submitter_config);
+            let composer =
+                Composer::new(composer_config, prover, Arc::new(provider), submitter).await?;
+            event!(
+                name: "eez.node.composer.spawned",
+                Level::INFO,
+                "spawning eez composer",
+            );
+            handle
+                .node
+                .task_executor
+                .spawn_critical_task("eez-composer", async move {
+                    composer.run().await;
+                });
+        } else {
+            event!(
+                name: "eez.node.composer.skipped",
+                Level::INFO,
+                "EEZ_L1_RPC_URL not set; running sequencer only",
+            );
+        }
 
         handle.wait_for_node_exit().await
     })
