@@ -1,1 +1,14 @@
+# Rust
 target/
+
+# Foundry
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+
+# Local config (contains private keys) + machine-written deploy outputs
+.env
+deployments.env
+
+# Default L2 datadir if it lands in the repo
+datadir/

@@ -24,7 +24,6 @@ alloy-primitives.workspace       = true
 alloy-provider.workspace         = true
 alloy-rpc-types-engine.workspace = true
 alloy-rpc-types-eth.workspace    = true
-alloy-transport-http.workspace   = true
 
 # app
 clap.workspace               = true
