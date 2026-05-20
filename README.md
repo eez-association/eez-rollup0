@@ -37,4 +37,3 @@ Logs you should see: `eez.sequencer.block.produced` every 2s; `eez.composer.batc
 - [ ] **Stage 3** — reorg handling + `eez-follower` (derivation-based fullnode)
 - [ ] **Stage 4** — cross-chain composer (sync blocks with system txs, proof, full L1↔L2)
 
-See [`docs/plans/IMPLEMENTATION.md`](docs/plans/IMPLEMENTATION.md) for the full plan, per-stage breakdowns, and open spec items.
