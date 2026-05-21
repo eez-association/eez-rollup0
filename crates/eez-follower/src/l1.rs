@@ -105,15 +105,6 @@ fn require_env(name: &str) -> Result<String, FollowerError> {
     env::var(name).map_err(|_| FollowerError::L1Config(format!("{name} is required")))
 }
 
-/// Result of one `ingest_logs` pass over an L1 block range.
-#[derive(Debug, Clone, Copy, Default)]
-struct IngestSummary {
-    /// `BatchPosted` events seen in the range, regardless of rollup.
-    observed: usize,
-    /// Of those, how many targeted our rollup and were recorded.
-    recorded: usize,
-}
-
 /// L1 watcher task — tails `BatchPosted` events and publishes L1-derived
 /// safe/finalized into `L1View`.
 #[derive(Debug)]
@@ -149,12 +140,31 @@ impl L1Watcher {
     }
 
     async fn bootstrap(&mut self) -> Result<(), FollowerError> {
+        // Verify the configured rollup_id is actually registered on the EEZ
+        // before doing anything else. `rollupCounter` is the auto-generated
+        // getter on EEZ.sol's `uint256 public rollupCounter` — registered
+        // ids are 1..=counter. Failing here saves the historical event scan
+        // and gives the operator a precise error instead of a silent
+        // "follower runs but never observes anything for us".
+        let registry = EezRegistry::new(self.config.eez_address, &self.l1_rpc);
+        let counter = registry
+            .rollupCounter()
+            .call()
+            .await
+            .map_err(|e| FollowerError::L1Rpc(format!("rollupCounter: {e}")))?;
+        if self.config.rollup_id == 0 || U256::from(self.config.rollup_id) > counter {
+            return Err(FollowerError::L1Config(format!(
+                "rollup_id={} not registered on EEZ at {} (rollupCounter={counter})",
+                self.config.rollup_id, self.config.eez_address,
+            )));
+        }
+
         let latest = self
             .l1_rpc
             .get_block_number()
             .await
             .map_err(|e| FollowerError::L1Rpc(format!("get_block_number: {e}")))?;
-        let summary = self.ingest_logs(self.config.deploy_block, latest).await?;
+        self.ingest_logs(self.config.deploy_block, latest).await?;
         self.refresh_view().await?;
         self.cursor = latest;
         self.view
@@ -167,24 +177,11 @@ impl L1Watcher {
             name: "eez.follower.l1.bootstrap.complete",
             Level::INFO,
             batches,
-            observed = summary.observed,
             l1_block = latest,
             safe_l2,
             finalized_l2,
-            "L1 bootstrap complete: {{batches}} past batches matched (of {{observed}} observed), safe_l2={{safe_l2}} finalized_l2={{finalized_l2}}",
+            "L1 bootstrap complete: {{batches}} past batches, safe_l2={{safe_l2}} finalized_l2={{finalized_l2}}",
         );
-        // Misconfig sniff-test: BatchPosted events exist on the EEZ but
-        // none target our rollup. Almost always means EEZ_ROLLUP_ID is set
-        // to a value that doesn't match what was actually registered.
-        if summary.observed > 0 && summary.recorded == 0 {
-            event!(
-                name: "eez.follower.l1.rollup_id.mismatch",
-                Level::WARN,
-                rollup_id = self.config.rollup_id,
-                observed = summary.observed,
-                "observed {{observed}} BatchPosted events but none target rollup_id={{rollup_id}}; check EEZ_ROLLUP_ID matches the registered rollup",
-            );
-        }
         Ok(())
     }
 
@@ -265,7 +262,7 @@ impl L1Watcher {
     /// — the watcher's `run` loop classifies that as a permanent halt
     /// rather than retrying. Silently skipping would drift our cumulative
     /// L2-block sum below the L1 contract's accepted height permanently.
-    async fn ingest_logs(&mut self, from: u64, to: u64) -> Result<IngestSummary, FollowerError> {
+    async fn ingest_logs(&mut self, from: u64, to: u64) -> Result<(), FollowerError> {
         let filter = Filter::new()
             .address(self.config.eez_address)
             .event_signature(EezRegistry::BatchPosted::SIGNATURE_HASH)
@@ -276,10 +273,6 @@ impl L1Watcher {
             .get_logs(&filter)
             .await
             .map_err(|e| FollowerError::L1Rpc(format!("get_logs: {e}")))?;
-        let mut summary = IngestSummary {
-            observed: logs.len(),
-            recorded: 0,
-        };
         for log in &logs {
             let l1_block = log
                 .block_number
@@ -334,7 +327,6 @@ impl L1Watcher {
                 l1_block,
                 l2_block_end,
             });
-            summary.recorded += 1;
             event!(
                 name: "eez.follower.l1.batch.observed",
                 Level::INFO,
@@ -345,7 +337,7 @@ impl L1Watcher {
                 "observed batch at L1 block {{l1_block}}: +{{block_count}} L2 blocks, cumulative end {{l2_block_end}}",
             );
         }
-        Ok(summary)
+        Ok(())
     }
 
     /// Query L1's safe/finalized block numbers, resolve to L2 block numbers

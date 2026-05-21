@@ -202,12 +202,19 @@ mod eez_l1_batch {
         }
 
         /// The EEZ entry point + event. Just the surface the Submitter
-        /// needs from `sync-rollups-protocol/src/EEZ.sol`.
+        /// and Follower need from `sync-rollups-protocol/src/EEZ.sol`.
+        ///
+        /// `rollupCounter()` is the auto-generated getter on the
+        /// `uint256 public rollupCounter` state variable — total rollups
+        /// registered. Used by the Follower at startup to validate the
+        /// configured `EEZ_ROLLUP_ID` is actually in the registry.
         #[sol(rpc)]
         contract EezRegistry {
             function postAndVerifyBatch(
                 ProofSystemBatchPerVerificationEntries calldata batch
             ) external;
+
+            function rollupCounter() external view returns (uint256);
 
             event BatchPosted(uint256 indexed rollupCount);
         }
