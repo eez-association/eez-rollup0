@@ -105,6 +105,15 @@ fn require_env(name: &str) -> Result<String, FollowerError> {
     env::var(name).map_err(|_| FollowerError::L1Config(format!("{name} is required")))
 }
 
+/// Result of one `ingest_logs` pass over an L1 block range.
+#[derive(Debug, Clone, Copy, Default)]
+struct IngestSummary {
+    /// `BatchPosted` events seen in the range, regardless of rollup.
+    observed: usize,
+    /// Of those, how many targeted our rollup and were recorded.
+    recorded: usize,
+}
+
 /// L1 watcher task — tails `BatchPosted` events and publishes L1-derived
 /// safe/finalized into `L1View`.
 #[derive(Debug)]
@@ -117,6 +126,10 @@ pub(crate) struct L1Watcher {
     /// Past batches that target our rollup, in L1-block order.
     batches: VecDeque<BatchRecord>,
     view: Arc<L1View>,
+    /// Set after a tick fails; cleared on first success. Used to demote
+    /// repeat L1-outage warnings to DEBUG so a multi-minute outage doesn't
+    /// drown the log.
+    last_tick_failed: bool,
 }
 
 impl L1Watcher {
@@ -127,8 +140,9 @@ impl L1Watcher {
             config,
             l1_rpc,
             cursor: 0,
-            batches: VecDeque::with_capacity(BATCH_HISTORY_CAP.min(256)),
+            batches: VecDeque::with_capacity(256),
             view,
+            last_tick_failed: false,
         };
         this.bootstrap().await?;
         Ok(this)
@@ -140,7 +154,7 @@ impl L1Watcher {
             .get_block_number()
             .await
             .map_err(|e| FollowerError::L1Rpc(format!("get_block_number: {e}")))?;
-        self.ingest_logs(self.config.deploy_block, latest).await?;
+        let summary = self.ingest_logs(self.config.deploy_block, latest).await?;
         self.refresh_view().await?;
         self.cursor = latest;
         self.view
@@ -153,11 +167,24 @@ impl L1Watcher {
             name: "eez.follower.l1.bootstrap.complete",
             Level::INFO,
             batches,
+            observed = summary.observed,
             l1_block = latest,
             safe_l2,
             finalized_l2,
-            "L1 bootstrap complete: {{batches}} past batches, safe_l2={{safe_l2}} finalized_l2={{finalized_l2}}",
+            "L1 bootstrap complete: {{batches}} past batches matched (of {{observed}} observed), safe_l2={{safe_l2}} finalized_l2={{finalized_l2}}",
         );
+        // Misconfig sniff-test: BatchPosted events exist on the EEZ but
+        // none target our rollup. Almost always means EEZ_ROLLUP_ID is set
+        // to a value that doesn't match what was actually registered.
+        if summary.observed > 0 && summary.recorded == 0 {
+            event!(
+                name: "eez.follower.l1.rollup_id.mismatch",
+                Level::WARN,
+                rollup_id = self.config.rollup_id,
+                observed = summary.observed,
+                "observed {{observed}} BatchPosted events but none target rollup_id={{rollup_id}}; check EEZ_ROLLUP_ID matches the registered rollup",
+            );
+        }
         Ok(())
     }
 
@@ -166,13 +193,49 @@ impl L1Watcher {
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Err(err) = self.tick().await {
-                event!(
-                    name: "eez.follower.l1.tick.failed",
-                    Level::WARN,
-                    error = %err,
-                    "L1 watcher tick failed; will retry next tick",
-                );
+            match self.tick().await {
+                Ok(()) => {
+                    if self.last_tick_failed {
+                        event!(
+                            name: "eez.follower.l1.recovered",
+                            Level::WARN,
+                            "L1 watcher recovered after prior tick failures",
+                        );
+                        self.last_tick_failed = false;
+                    }
+                }
+                Err(err) if err.is_permanent_batch_failure() => {
+                    // Halt the watcher. The sum-based L2-height tracking
+                    // can't tolerate a skipped batch (would drift below the
+                    // L1 contract's accepted height permanently). The
+                    // follower keeps tracking unsafe head; safe/finalized
+                    // stall at last-known. Operator must investigate.
+                    event!(
+                        name: "eez.follower.l1.halted",
+                        Level::ERROR,
+                        error = %err,
+                        "L1 watcher halting: permanent batch failure (safe/finalized will no longer advance)",
+                    );
+                    return;
+                }
+                Err(err) => {
+                    if self.last_tick_failed {
+                        event!(
+                            name: "eez.follower.l1.tick.failed",
+                            Level::DEBUG,
+                            error = %err,
+                            "L1 watcher tick failed; will retry next tick",
+                        );
+                    } else {
+                        event!(
+                            name: "eez.follower.l1.tick.failed",
+                            Level::WARN,
+                            error = %err,
+                            "L1 watcher tick failed; subsequent failures will log at DEBUG until recovery",
+                        );
+                        self.last_tick_failed = true;
+                    }
+                }
             }
         }
     }
@@ -195,9 +258,14 @@ impl L1Watcher {
     }
 
     /// Walk `BatchPosted` events in `[from..=to]` and append `BatchRecord`s
-    /// for those that target our rollup. Skips batches with malformed
-    /// payloads (logged, not fatal).
-    async fn ingest_logs(&mut self, from: u64, to: u64) -> Result<(), FollowerError> {
+    /// for those that target our rollup.
+    ///
+    /// Decode failures (`postAndVerifyBatchCall` ABI mismatch, or
+    /// `eez_payload_codec::decode`) raise [`FollowerError::BatchMalformed`]
+    /// — the watcher's `run` loop classifies that as a permanent halt
+    /// rather than retrying. Silently skipping would drift our cumulative
+    /// L2-block sum below the L1 contract's accepted height permanently.
+    async fn ingest_logs(&mut self, from: u64, to: u64) -> Result<IngestSummary, FollowerError> {
         let filter = Filter::new()
             .address(self.config.eez_address)
             .event_signature(EezRegistry::BatchPosted::SIGNATURE_HASH)
@@ -208,6 +276,10 @@ impl L1Watcher {
             .get_logs(&filter)
             .await
             .map_err(|e| FollowerError::L1Rpc(format!("get_logs: {e}")))?;
+        let mut summary = IngestSummary {
+            observed: logs.len(),
+            recorded: 0,
+        };
         for log in &logs {
             let l1_block = log
                 .block_number
@@ -225,7 +297,11 @@ impl L1Watcher {
                 .ok_or_else(|| FollowerError::L1Rpc(format!("tx {tx_hash} not found")))?;
             let input = tx.inner.input();
             let decoded = EezRegistry::postAndVerifyBatchCall::abi_decode(input).map_err(|e| {
-                FollowerError::L1Rpc(format!("decode postBatch({tx_hash}): {e}"))
+                FollowerError::BatchMalformed {
+                    l1_block,
+                    tx_hash,
+                    detail: format!("postAndVerifyBatch ABI decode: {e}"),
+                }
             })?;
             // Filter to batches that target our rollup. Indexed event topic
             // is only `rollupCount` (registry-wide), so we have to decode the
@@ -244,19 +320,13 @@ impl L1Watcher {
                 );
                 continue;
             }
-            let batch = match eez_payload_codec::decode(decoded.batch.callData.as_ref()) {
-                Ok(b) => b,
-                Err(e) => {
-                    event!(
-                        name: "eez.follower.l1.batch.skipped.bad_payload",
-                        Level::WARN,
-                        tx_hash = %tx_hash,
-                        error = %e,
-                        "BatchPosted payload failed to decode; skipping",
-                    );
-                    continue;
-                }
-            };
+            let batch = eez_payload_codec::decode(decoded.batch.callData.as_ref()).map_err(
+                |e| FollowerError::BatchMalformed {
+                    l1_block,
+                    tx_hash,
+                    detail: format!("payload codec: {e}"),
+                },
+            )?;
             let block_count = batch.block_count() as u64;
             let prev_end = self.batches.back().map_or(0, |r| r.l2_block_end);
             let l2_block_end = prev_end + block_count;
@@ -264,6 +334,7 @@ impl L1Watcher {
                 l1_block,
                 l2_block_end,
             });
+            summary.recorded += 1;
             event!(
                 name: "eez.follower.l1.batch.observed",
                 Level::INFO,
@@ -274,7 +345,7 @@ impl L1Watcher {
                 "observed batch at L1 block {{l1_block}}: +{{block_count}} L2 blocks, cumulative end {{l2_block_end}}",
             );
         }
-        Ok(())
+        Ok(summary)
     }
 
     /// Query L1's safe/finalized block numbers, resolve to L2 block numbers

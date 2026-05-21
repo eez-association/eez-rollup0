@@ -28,8 +28,9 @@ pub(crate) enum FollowerError {
     #[error("local L2 provider error: {0}")]
     L2Provider(String),
 
-    /// L1 JSON-RPC transport / log fetch / abi decode failure. Per-tick;
-    /// logged and the watcher loop continues.
+    /// L1 JSON-RPC transport / log fetch failure. Treated as transient by
+    /// the watcher: log + retry on the next tick without advancing the
+    /// cursor.
     #[error("L1 RPC error: {0}")]
     L1Rpc(String),
 
@@ -38,7 +39,24 @@ pub(crate) enum FollowerError {
     #[error("L1 config error: {0}")]
     L1Config(String),
 
-    /// A posted batch's payload decoded to nonsense. Logged, batch skipped.
-    #[error("payload codec error: {0}")]
-    Codec(#[from] eez_payload_codec::CodecError),
+    /// A posted batch's calldata or payload couldn't be decoded
+    /// (`postAndVerifyBatchCall` ABI mismatch or `eez_payload_codec::decode`
+    /// failure). Treated as **permanent** by the watcher — silently skipping
+    /// would drift the cumulative L2-block count below what the L1 contract
+    /// accepted, so we halt instead and let the operator diagnose.
+    #[error("permanently-malformed batch in L1 tx {tx_hash} at L1 block {l1_block}: {detail}")]
+    BatchMalformed {
+        l1_block: u64,
+        tx_hash: alloy_primitives::TxHash,
+        detail: String,
+    },
+}
+
+impl FollowerError {
+    /// True for errors that indicate a permanently-corrupt state the
+    /// watcher can't recover from by retrying. Currently: only
+    /// [`Self::BatchMalformed`]. The watcher's `run` loop exits on these.
+    pub(crate) fn is_permanent_batch_failure(&self) -> bool {
+        matches!(self, Self::BatchMalformed { .. })
+    }
 }

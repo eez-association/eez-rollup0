@@ -170,23 +170,42 @@ where
 
     /// Builds the FCU triplet. `head` from `last_head`; `safe`/`finalized`
     /// from `L1View` resolved against local reth, with sticky fallback to
-    /// the last hashes we successfully FCU'd, then to genesis. Preserves
-    /// the `finalized ≤ safe ≤ head` invariant: finalized's last-resort
-    /// fallback is `safe`, not head/genesis directly.
+    /// the last hashes we successfully FCU'd, then to genesis.
+    ///
+    /// Preserves the `finalized ≤ safe ≤ head` invariant by **pairing** the
+    /// lookups: if we have to fall back to sticky for `safe` (because reth
+    /// hasn't backfilled the L1-published `safe_l2` yet), we also fall back
+    /// to sticky for `finalized` — never use a fresh-from-reth `finalized`
+    /// alongside a stale-sticky `safe`. The watcher publishes
+    /// `finalized_l2 ≤ safe_l2`, so once we commit to fresh-for-both, the
+    /// numeric invariant follows automatically. The sticky values were
+    /// persisted together on the same prior successful FCU, so they share
+    /// the invariant too.
     ///
     /// Returns `None` only before we've ever seen the sequencer.
     fn forkchoice_state(&self) -> Option<ForkchoiceState> {
         let head = self.last_head?;
         let safe_l2 = self.l1_view.safe_l2_block.load(Ordering::Acquire);
         let finalized_l2 = self.l1_view.finalized_l2_block.load(Ordering::Acquire);
-        let safe = self
-            .lookup_l2_hash(safe_l2)
-            .or(self.last_safe_hash)
-            .unwrap_or(self.genesis_hash);
-        let finalized = self
-            .lookup_l2_hash(finalized_l2)
-            .or(self.last_finalized_hash)
-            .unwrap_or(safe);
+
+        let (safe, finalized) = if let Some(safe) = self.lookup_l2_hash(safe_l2) {
+            // Fresh safe is available; finalized can be fresh too. The
+            // watcher guarantees finalized_l2 ≤ safe_l2, so if reth has
+            // safe_l2 it has finalized_l2 (sequential import). Fall back
+            // through sticky → safe if reth lookup somehow fails.
+            let finalized = self
+                .lookup_l2_hash(finalized_l2)
+                .or(self.last_finalized_hash)
+                .unwrap_or(safe);
+            (safe, finalized)
+        } else {
+            // Stale safe: reth doesn't yet have the L1-published block, or
+            // L1 hasn't published one. Commit to sticky for BOTH pointers —
+            // using fresh-finalized here would risk finalized > safe.
+            let safe = self.last_safe_hash.unwrap_or(self.genesis_hash);
+            let finalized = self.last_finalized_hash.unwrap_or(safe);
+            (safe, finalized)
+        };
         Some(ForkchoiceState {
             head_block_hash: head,
             safe_block_hash: safe,
