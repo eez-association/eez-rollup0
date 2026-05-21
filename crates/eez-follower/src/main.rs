@@ -97,7 +97,7 @@ fn main() -> eyre::Result<()> {
             scheduler,
             l2_provider,
             l1_view,
-        );
+        )?;
 
         event!(
             name: "eez.follower.spawned",

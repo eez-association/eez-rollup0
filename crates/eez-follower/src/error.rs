@@ -22,6 +22,12 @@ pub(crate) enum FollowerError {
     #[error("engine-API transport error: {0}")]
     EngineRpc(String),
 
+    /// Local reth provider returned an error or unexpected `None`. Fatal at
+    /// startup (we can't run without genesis); per-tick lookups fall back
+    /// gracefully and don't surface as this error.
+    #[error("local L2 provider error: {0}")]
+    L2Provider(String),
+
     /// L1 JSON-RPC transport / log fetch / abi decode failure. Per-tick;
     /// logged and the watcher loop continues.
     #[error("L1 RPC error: {0}")]

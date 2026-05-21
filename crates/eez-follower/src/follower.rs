@@ -43,6 +43,16 @@ const FCU_REFRESH: Duration = Duration::from_secs(1);
 /// into engine-API `forkchoiceUpdated` calls. The unsafe `head` comes from
 /// the sequencer RPC; `safe` and `finalized` come from a shared [`L1View`]
 /// populated by the L1 watcher task.
+///
+/// Sticky safe/finalized: after every successful FCU we cache the
+/// `safe_block_hash` / `finalized_block_hash` we just sent. On a later tick,
+/// if [`L1View`] hasn't yet published fresh numbers or local reth doesn't
+/// have the L1-published block yet, we re-use the cached values. The
+/// genesis hash is the cold-start floor — once we've sent it once, sticky
+/// takes over. This guarantees safe/finalized are monotonically
+/// non-decreasing across the process lifetime: external observers calling
+/// `eth_getBlockByNumber("safe")` / `("finalized")` on the follower never
+/// see those pointers regress to head, nor flip backwards mid-run.
 pub(crate) struct Follower<T, P>
 where
     T: PayloadTypes,
@@ -60,6 +70,16 @@ where
     /// Last head hash we successfully FCU'd. `None` before the first
     /// successful sequencer poll.
     last_head: Option<B256>,
+    /// Last safe hash we successfully FCU'd. Sticky fallback when fresh
+    /// L1 data is unavailable or the L1-published block isn't yet in
+    /// local reth.
+    last_safe_hash: Option<B256>,
+    /// Last finalized hash we successfully FCU'd. Same sticky semantics
+    /// as [`Self::last_safe_hash`].
+    last_finalized_hash: Option<B256>,
+    /// Cold-start floor — used as the safe/finalized fallback before we've
+    /// ever successfully FCU'd anything. Captured at construction.
+    genesis_hash: B256,
 }
 
 impl<T, P> fmt::Debug for Follower<T, P>
@@ -90,15 +110,28 @@ where
         scheduler: Scheduler,
         l2_provider: Arc<P>,
         l1_view: Arc<L1View>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, FollowerError> {
+        // Capture genesis hash for the cold-start floor. Reth always has
+        // genesis by the time `launch_node` has completed; an error here
+        // means the local L2 chain isn't in a usable state and the
+        // follower has no business starting.
+        let genesis_hash = l2_provider
+            .block_hash(0)
+            .map_err(|e| FollowerError::L2Provider(format!("genesis block_hash: {e}")))?
+            .ok_or_else(|| {
+                FollowerError::L2Provider("genesis block missing from local L2".into())
+            })?;
+        Ok(Self {
             to_engine,
             sequencer_rpc,
             scheduler,
             l2_provider,
             l1_view,
             last_head: None,
-        }
+            last_safe_hash: None,
+            last_finalized_hash: None,
+            genesis_hash,
+        })
     }
 
     /// Runs the follower loop until cancellation.
@@ -136,16 +169,24 @@ where
     }
 
     /// Builds the FCU triplet. `head` from `last_head`; `safe`/`finalized`
-    /// from `L1View` resolved against local reth. Collapses missing
-    /// pointers to `head` so reth always receives a valid triplet.
+    /// from `L1View` resolved against local reth, with sticky fallback to
+    /// the last hashes we successfully FCU'd, then to genesis. Preserves
+    /// the `finalized ≤ safe ≤ head` invariant: finalized's last-resort
+    /// fallback is `safe`, not head/genesis directly.
     ///
     /// Returns `None` only before we've ever seen the sequencer.
     fn forkchoice_state(&self) -> Option<ForkchoiceState> {
         let head = self.last_head?;
         let safe_l2 = self.l1_view.safe_l2_block.load(Ordering::Acquire);
         let finalized_l2 = self.l1_view.finalized_l2_block.load(Ordering::Acquire);
-        let safe = self.lookup_l2_hash(safe_l2).unwrap_or(head);
-        let finalized = self.lookup_l2_hash(finalized_l2).unwrap_or(head);
+        let safe = self
+            .lookup_l2_hash(safe_l2)
+            .or(self.last_safe_hash)
+            .unwrap_or(self.genesis_hash);
+        let finalized = self
+            .lookup_l2_hash(finalized_l2)
+            .or(self.last_finalized_hash)
+            .unwrap_or(safe);
         Some(ForkchoiceState {
             head_block_hash: head,
             safe_block_hash: safe,
@@ -154,7 +195,8 @@ where
     }
 
     /// Returns `Some(hash)` if local reth has block `num` and `num > 0`;
-    /// `None` otherwise (caller collapses to `head`).
+    /// `None` otherwise (caller falls back to sticky last-known, then
+    /// genesis).
     fn lookup_l2_hash(&self, num: u64) -> Option<B256> {
         if num == 0 {
             return None;
@@ -162,7 +204,7 @@ where
         self.l2_provider.block_hash(num).ok().flatten()
     }
 
-    async fn refresh_forkchoice(&self) -> Result<(), FollowerError> {
+    async fn refresh_forkchoice(&mut self) -> Result<(), FollowerError> {
         let Some(state) = self.forkchoice_state() else {
             return Ok(());
         };
@@ -174,6 +216,10 @@ where
         if res.is_invalid() {
             return Err(FollowerError::InvalidForkchoice(format!("{res:?}")));
         }
+        // Sticky: reth accepted these hashes; cache for next tick's
+        // fallback if L1 data or local DB lookups come up empty.
+        self.last_safe_hash = Some(state.safe_block_hash);
+        self.last_finalized_hash = Some(state.finalized_block_hash);
         Ok(())
     }
 
@@ -219,9 +265,16 @@ where
             // Reth rejected this hash. Restore prior head so the next tick
             // retries cleanly (possibly with the same hash if it was a
             // transient reth state issue, or a new hash if a reorg happened).
+            // Don't touch last_safe_hash / last_finalized_hash — those were
+            // set on prior successful FCUs and the rejection is on head.
             self.last_head = prior_head;
             return Err(FollowerError::InvalidForkchoice(format!("{res:?}")));
         }
+
+        // Sticky: reth accepted these hashes; cache for next tick's
+        // fallback if L1 data or local DB lookups come up empty.
+        self.last_safe_hash = Some(state.safe_block_hash);
+        self.last_finalized_hash = Some(state.finalized_block_hash);
 
         if res.is_valid() {
             event!(
