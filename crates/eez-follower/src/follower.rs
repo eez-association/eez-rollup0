@@ -24,9 +24,9 @@ use std::{sync::Arc, sync::atomic::Ordering, time::Duration};
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::B256;
 use alloy_provider::{Provider, RootProvider};
-use alloy_rpc_types_engine::ForkchoiceState;
+use alloy_rpc_types_engine::{ForkchoiceState, ForkchoiceUpdated};
 use eez_driver::Scheduler;
-use reth_engine_primitives::ConsensusEngineHandle;
+use reth_engine_primitives::{BeaconForkChoiceUpdateError, ConsensusEngineHandle};
 use reth_payload_primitives::PayloadTypes;
 use reth_storage_api::BlockReader;
 use tracing::{Level, event};
@@ -145,23 +145,47 @@ where
         loop {
             tokio::select! {
                 _ = self.scheduler.next() => {
-                    if let Err(err) = self.advance().await {
-                        event!(
-                            name: "eez.follower.advance.failed",
-                            Level::ERROR,
-                            error = %err,
-                            "advance failed: {{error}}",
-                        );
+                    match self.advance().await {
+                        Ok(()) => {}
+                        Err(err) if err.is_permanent_chain_failure() => {
+                            event!(
+                                name: "eez.follower.halted",
+                                Level::ERROR,
+                                error = %err,
+                                "follower halting: sequencer chain failed reth validation; manual investigation required",
+                            );
+                            return;
+                        }
+                        Err(err) => {
+                            event!(
+                                name: "eez.follower.advance.failed",
+                                Level::ERROR,
+                                error = %err,
+                                "advance failed: {{error}}",
+                            );
+                        }
                     }
                 }
                 _ = fcu_interval.tick() => {
-                    if let Err(err) = self.refresh_forkchoice().await {
-                        event!(
-                            name: "eez.follower.fcu.failed",
-                            Level::WARN,
-                            error = %err,
-                            "forkchoice refresh failed: {{error}}",
-                        );
+                    match self.refresh_forkchoice().await {
+                        Ok(()) => {}
+                        Err(err) if err.is_permanent_chain_failure() => {
+                            event!(
+                                name: "eez.follower.halted",
+                                Level::ERROR,
+                                error = %err,
+                                "follower halting: sequencer chain failed reth validation; manual investigation required",
+                            );
+                            return;
+                        }
+                        Err(err) => {
+                            event!(
+                                name: "eez.follower.fcu.failed",
+                                Level::WARN,
+                                error = %err,
+                                "forkchoice refresh failed: {{error}}",
+                            );
+                        }
                     }
                 }
             }
@@ -227,13 +251,25 @@ where
         let Some(state) = self.forkchoice_state() else {
             return Ok(());
         };
-        let res = self
-            .to_engine
-            .fork_choice_updated(state, None)
-            .await
-            .map_err(|e| FollowerError::EngineRpc(e.to_string()))?;
+        let res = match self.to_engine.fork_choice_updated(state, None).await {
+            Ok(r) => r,
+            Err(BeaconForkChoiceUpdateError::ForkchoiceUpdateError(e)) => {
+                // Reth rejected the triplet as inconsistent (safe/finalized
+                // not in head's chain, zero head, etc.). Transient — next
+                // tick rebuilds from current state.
+                return Err(FollowerError::InvalidForkchoice(e.to_string()));
+            }
+            Err(e) => {
+                // Transport / engine-unavailable. Probably worth retrying.
+                return Err(FollowerError::EngineRpc(e.to_string()));
+            }
+        };
         if res.is_invalid() {
-            return Err(FollowerError::InvalidForkchoice(format!("{res:?}")));
+            // Head's chain links to a block reth rejected during payload
+            // validation — i.e., the sequencer published a block that
+            // fails STF. We can't fix this by retrying; the chain itself
+            // is the problem. Permanent — run loop halts the follower.
+            return Err(invalid_chain_from_response(&state, &res, &*self.l2_provider));
         }
         // Sticky: reth accepted these hashes; cache for next tick's
         // fallback if L1 data or local DB lookups come up empty.
@@ -267,27 +303,43 @@ where
         }
 
         // Tentatively adopt the new head so forkchoice_state() can build a
-        // triplet, then roll back on INVALID.
+        // triplet, then roll back if reth rejects.
         let prior_head = self.last_head;
         self.last_head = Some(hash);
         let state = self
             .forkchoice_state()
             .expect("last_head was just set");
 
-        let res = self
-            .to_engine
-            .fork_choice_updated(state, None)
-            .await
-            .map_err(|e| FollowerError::EngineRpc(e.to_string()))?;
+        let res = match self.to_engine.fork_choice_updated(state, None).await {
+            Ok(r) => r,
+            Err(BeaconForkChoiceUpdateError::ForkchoiceUpdateError(e)) => {
+                // Reth rejected our triplet (safe/finalized not in head's
+                // chain, zero head, invalid payload attributes, etc.).
+                // Roll back tentative last_head so the next tick retries
+                // with a freshly-built triplet. Don't touch sticky —
+                // last_safe/last_finalized were set on prior successful
+                // FCUs and are still our best floor for the next attempt.
+                self.last_head = prior_head;
+                return Err(FollowerError::InvalidForkchoice(e.to_string()));
+            }
+            Err(e) => {
+                // Transport / engine-unavailable. Leave last_head as-is
+                // (reth might have processed the FCU before the transport
+                // error fired); next tick will see whatever sequencer
+                // reports and reconcile.
+                return Err(FollowerError::EngineRpc(e.to_string()));
+            }
+        };
 
         if res.is_invalid() {
-            // Reth rejected this hash. Restore prior head so the next tick
-            // retries cleanly (possibly with the same hash if it was a
-            // transient reth state issue, or a new hash if a reorg happened).
-            // Don't touch last_safe_hash / last_finalized_hash — those were
-            // set on prior successful FCUs and the rejection is on head.
+            // Head's chain contains a block reth has previously rejected
+            // during payload validation. In this follower, the only path
+            // to that rejection is reth's P2P backfill executing a
+            // sequencer-published block and failing STF — meaning the
+            // sequencer is publishing an invalid chain. Permanent: roll
+            // back tentative last_head and signal the run loop to halt.
             self.last_head = prior_head;
-            return Err(FollowerError::InvalidForkchoice(format!("{res:?}")));
+            return Err(invalid_chain_from_response(&state, &res, &*self.l2_provider));
         }
 
         // Sticky: reth accepted these hashes; cache for next tick's
@@ -314,5 +366,35 @@ where
         }
 
         Ok(())
+    }
+}
+
+/// Build a `FollowerError::InvalidChain` from an `Ok(ForkchoiceUpdated)`
+/// response whose status is `Invalid`. Extracts the validation error
+/// from the engine response and looks up head's block number via local
+/// reth (best-effort; falls back to 0 if reth doesn't have it).
+fn invalid_chain_from_response<P: BlockReader>(
+    state: &ForkchoiceState,
+    res: &ForkchoiceUpdated,
+    l2_provider: &P,
+) -> FollowerError {
+    let detail = res
+        .payload_status
+        .status
+        .validation_error()
+        .map_or_else(
+            || "no validation_error provided by engine".to_owned(),
+            str::to_owned,
+        );
+    let block_hash = state.head_block_hash;
+    let block_number = l2_provider
+        .block_number(block_hash)
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    FollowerError::InvalidChain {
+        block_number,
+        block_hash,
+        detail,
     }
 }

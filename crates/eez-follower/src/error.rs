@@ -14,13 +14,32 @@ pub(crate) enum FollowerError {
     #[error("sequencer RPC error: {0}")]
     Rpc(String),
 
-    /// `engine_forkchoiceUpdated` returned a non-`VALID`, non-`SYNCING` status.
+    /// Engine refused our forkchoice triplet as inconsistent — typically
+    /// `safe`/`finalized` not in head's canonical chain, or zero head hash.
+    /// Surfaced from reth as `ForkchoiceUpdateError`, distinct from
+    /// transport failures. Transient: the next tick re-attempts with a
+    /// freshly-built triplet after rolling back tentative state.
     #[error("engine rejected forkchoice update: {0}")]
     InvalidForkchoice(String),
 
-    /// Engine-API transport error.
+    /// Engine-API transport error (RPC channel down, engine task crashed,
+    /// etc.). Transient at the transport layer; retry next tick.
     #[error("engine-API transport error: {0}")]
     EngineRpc(String),
+
+    /// Reth reported the FCU head links back to a block it rejected via
+    /// payload validation (STF failure: bad state root, gas overflow,
+    /// invalid tx, etc.). In our follower the rejection comes from reth's
+    /// P2P backfill executing a sequencer-published block and finding it
+    /// invalid — meaning the sequencer is publishing a chain we can't
+    /// canonicalize. **Permanent**: the run loop halts the follower task
+    /// so the operator notices instead of looping forever.
+    #[error("sequencer chain rejected at block {block_number} ({block_hash}): {detail}")]
+    InvalidChain {
+        block_number: u64,
+        block_hash: alloy_primitives::B256,
+        detail: String,
+    },
 
     /// Local reth provider returned an error or unexpected `None`. Fatal at
     /// startup (we can't run without genesis); per-tick lookups fall back
@@ -53,10 +72,19 @@ pub(crate) enum FollowerError {
 }
 
 impl FollowerError {
-    /// True for errors that indicate a permanently-corrupt state the
-    /// watcher can't recover from by retrying. Currently: only
-    /// [`Self::BatchMalformed`]. The watcher's `run` loop exits on these.
+    /// True for errors that indicate a permanently-corrupt watcher state —
+    /// the L1 has accepted a batch our codec can't decode, so our
+    /// cumulative L2-block sum would silently drift below truth.
+    /// The watcher's `run` loop exits on these.
     pub(crate) fn is_permanent_batch_failure(&self) -> bool {
         matches!(self, Self::BatchMalformed { .. })
+    }
+
+    /// True for errors that indicate a permanently-corrupt chain state the
+    /// follower can't recover from by retrying — the sequencer has
+    /// published a block reth rejects via STF validation. The follower's
+    /// `run` loop exits on these.
+    pub(crate) fn is_permanent_chain_failure(&self) -> bool {
+        matches!(self, Self::InvalidChain { .. })
     }
 }
