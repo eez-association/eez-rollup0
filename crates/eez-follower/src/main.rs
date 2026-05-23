@@ -84,7 +84,8 @@ fn main() -> eyre::Result<()> {
         let l2_provider = Arc::new(handle.node.provider.clone());
 
         let l1_view = Arc::new(L1View::default());
-        let l1_watcher = L1Watcher::new(l1_config, l1_view.clone()).await?;
+        let l1_watcher =
+            L1Watcher::new(l1_config, l1_view.clone(), l2_provider.clone()).await?;
         task_executor.spawn_critical_task("eez-follower-l1", async move {
             l1_watcher.run().await;
         });

@@ -1,15 +1,21 @@
 //! L1 watcher: tails `EEZ.BatchPosted` events, maps each batch's L1 inclusion
-//! block to the cumulative L2 block count it represents, and publishes the
-//! L1-derived safe/finalized L2 block numbers via a shared [`L1View`].
+//! block to the cumulative L2 block count it represents, verifies the
+//! sequencer-served L2 chain matches what L1 committed to (tx-equivalence),
+//! and publishes the L1-derived safe/finalized L2 block numbers via a
+//! shared [`L1View`].
 //!
 //! `Follower` reads `L1View` on every FCU build to drive `safe` and
 //! `finalized` block hashes. The watcher itself never touches the engine —
 //! the two tasks communicate only through atomics in `L1View`.
 //!
-//! Trust model: we trust that L1 ran `IProofSystem.verify` before emitting
-//! `BatchPosted`. We decode the posted payload only to learn how many L2
-//! blocks the batch represents (the L1 contract doesn't surface this
-//! directly — it's implicit in the payload's `blockTxCounts.len()`).
+//! Trust model: we trust L1's own `IProofSystem.verify` to gate
+//! `BatchPosted` emission. *On top of that*, we tx-verify each batch's
+//! decoded payload against local reth before allowing the corresponding
+//! L2 block number into `L1View::safe_l2_block` / `finalized_l2_block`.
+//! That closes the equivocation gap between "what the sequencer posted
+//! to L1" and "what the sequencer serves to our reth P2P" — if they
+//! disagree, we halt the follower instead of canonicalizing a chain L1
+//! didn't sign off on.
 
 use std::collections::VecDeque;
 use std::env;
@@ -18,12 +24,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use alloy_eips::BlockNumberOrTag;
-use alloy_primitives::{Address, U256};
+use alloy_eips::{BlockNumberOrTag, Encodable2718};
+use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_types_eth::{Filter, TransactionTrait};
 use alloy_sol_types::{SolCall, SolEvent};
 use eez_prover::EezRegistry;
+use reth_primitives_traits::{Block, BlockBody};
+use reth_storage_api::{BlockReader, TransactionsProvider};
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tracing::{Level, event};
 use url::Url;
@@ -60,13 +68,32 @@ pub(crate) struct L1View {
 }
 
 /// One past `BatchPosted` event we've observed.
-#[derive(Debug, Clone, Copy)]
+///
+/// Carries per-L2-block tx-hash expectations decoded from the batch's
+/// `callData`. The verifier compares these against local reth and clears
+/// the vector once the batch is fully verified, so steady-state memory is
+/// just the two `u64`s.
+#[derive(Debug, Clone)]
 struct BatchRecord {
     /// L1 block the batch landed in.
     l1_block: u64,
     /// Cumulative L2 block height the contract has accepted as of and
     /// including this batch.
     l2_block_end: u64,
+    /// Per-L2-block tx-hash expectations decoded from this batch's
+    /// `callData`. Drained as the verifier matches each block against
+    /// local reth. Empty once the batch is fully verified.
+    expectations: Vec<BlockExpectation>,
+}
+
+/// What the L1-committed batch says block `l2_block_num` must contain.
+#[derive(Debug, Clone)]
+struct BlockExpectation {
+    l2_block_num: u64,
+    /// EIP-2718 envelope hashes of the user txs in this block, in
+    /// block-internal order. Compared positionally against the same hash
+    /// computed from local reth's `block_by_number(l2_block_num)`.
+    tx_hashes: Vec<B256>,
 }
 
 /// Required L1 config, populated from env at startup.
@@ -105,10 +132,11 @@ fn require_env(name: &str) -> Result<String, FollowerError> {
     env::var(name).map_err(|_| FollowerError::L1Config(format!("{name} is required")))
 }
 
-/// L1 watcher task — tails `BatchPosted` events and publishes L1-derived
-/// safe/finalized into `L1View`.
+/// L1 watcher task — tails `BatchPosted` events, verifies each batch's
+/// txs match local reth, and publishes L1-derived safe/finalized into
+/// `L1View`.
 #[derive(Debug)]
-pub(crate) struct L1Watcher {
+pub(crate) struct L1Watcher<P: BlockReader> {
     config: L1Config,
     l1_rpc: RootProvider,
     /// Last L1 block we've fully ingested. The next tick scans
@@ -117,15 +145,31 @@ pub(crate) struct L1Watcher {
     /// Past batches that target our rollup, in L1-block order.
     batches: VecDeque<BatchRecord>,
     view: Arc<L1View>,
+    /// Local reth provider, used by the verifier to look up the txs the
+    /// sequencer actually served us for each L2 block number L1 committed to.
+    l2_provider: Arc<P>,
+    /// Highest L2 block number whose tx contents we've matched against an
+    /// L1-committed batch. The atomic safe/finalized writes are capped by
+    /// this value, so we never advertise a hash for a block we haven't
+    /// verified — even if L1 has already finalized the batch covering it.
+    verified_through_l2_block: u64,
     /// Set after a tick fails; cleared on first success. Used to demote
     /// repeat L1-outage warnings to DEBUG so a multi-minute outage doesn't
     /// drown the log.
     last_tick_failed: bool,
 }
 
-impl L1Watcher {
+impl<P> L1Watcher<P>
+where
+    P: BlockReader + Send + Sync + 'static,
+    <P as TransactionsProvider>::Transaction: Encodable2718,
+{
     /// Build the watcher and run the one-shot bootstrap scan.
-    pub(crate) async fn new(config: L1Config, view: Arc<L1View>) -> Result<Self, FollowerError> {
+    pub(crate) async fn new(
+        config: L1Config,
+        view: Arc<L1View>,
+        l2_provider: Arc<P>,
+    ) -> Result<Self, FollowerError> {
         let l1_rpc = RootProvider::new_http(config.rpc_url.clone());
         let mut this = Self {
             config,
@@ -133,6 +177,8 @@ impl L1Watcher {
             cursor: 0,
             batches: VecDeque::with_capacity(256),
             view,
+            l2_provider,
+            verified_through_l2_block: 0,
             last_tick_failed: false,
         };
         this.bootstrap().await?;
@@ -201,17 +247,19 @@ impl L1Watcher {
                         self.last_tick_failed = false;
                     }
                 }
-                Err(err) if err.is_permanent_batch_failure() => {
-                    // Halt the watcher. The sum-based L2-height tracking
-                    // can't tolerate a skipped batch (would drift below the
-                    // L1 contract's accepted height permanently). The
-                    // follower keeps tracking unsafe head; safe/finalized
-                    // stall at last-known. Operator must investigate.
+                Err(err)
+                    if err.is_permanent_batch_failure() || err.is_permanent_chain_failure() =>
+                {
+                    // Halt the watcher. Either a batch is unrecoverably
+                    // malformed (cumulative-count tracking would drift) or
+                    // the sequencer-served chain disagrees with what L1
+                    // committed to (equivocation). Both are operator-only
+                    // recoveries; safe/finalized stall at last-verified.
                     event!(
                         name: "eez.follower.l1.halted",
                         Level::ERROR,
                         error = %err,
-                        "L1 watcher halting: permanent batch failure (safe/finalized will no longer advance)",
+                        "L1 watcher halting: permanent failure (safe/finalized will no longer advance)",
                     );
                     return;
                 }
@@ -250,7 +298,86 @@ impl L1Watcher {
                 .last_l1_block_seen
                 .store(latest, Ordering::Release);
         }
+        self.verify_pending()?;
         self.refresh_view().await?;
+        Ok(())
+    }
+
+    /// Walk pending block expectations against local reth. Advances
+    /// `verified_through_l2_block`; halts the watcher (via `InvalidChain`)
+    /// if any L1-committed block disagrees with what the sequencer served
+    /// our P2P. If local reth hasn't synced a pending block yet, we stop
+    /// and retry on the next tick.
+    ///
+    /// TODO(reorgs): this implementation assumes both L1 and L2 history
+    /// are append-only beyond this watcher's lifetime.
+    ///
+    /// - On an L1 reorg that drops a `BatchPosted` we already ingested,
+    ///   our in-memory expectations become stale and the verifier could
+    ///   halt on a sequencer chain that's actually correct on the new
+    ///   canonical L1. Fix: pin each `BatchRecord` to its L1 block hash;
+    ///   on tick, re-fetch the hash for any unfinalized batch and rewind
+    ///   `cursor` + `verified_through_l2_block` on mismatch.
+    /// - On an L2 reorg that replaces a block at or below
+    ///   `verified_through_l2_block`, our "verified" status outlives the
+    ///   block it was attached to. Fix: degraded mode — rewind FCU to
+    ///   `head = safe = last_verified_safe_hash` and wait for the
+    ///   L1-canonical chain to re-arrive over P2P.
+    fn verify_pending(&mut self) -> Result<(), FollowerError> {
+        for record in &mut self.batches {
+            while let Some(expected) = record.expectations.first() {
+                let n = expected.l2_block_num;
+                let block = match self.l2_provider.block_by_number(n) {
+                    Ok(Some(b)) => b,
+                    Ok(None) => return Ok(()),
+                    Err(e) => {
+                        return Err(FollowerError::L2Provider(format!(
+                            "block_by_number({n}): {e}",
+                        )));
+                    }
+                };
+
+                let local_hashes: Vec<B256> = block
+                    .body()
+                    .transactions()
+                    .iter()
+                    .map(|tx| keccak256(tx.encoded_2718()))
+                    .collect();
+
+                if local_hashes != expected.tx_hashes {
+                    // Best-effort hash for the error payload; `block_hash`
+                    // is a cheap lookup and the verifier has already
+                    // succeeded in fetching the block above.
+                    let block_hash = self
+                        .l2_provider
+                        .block_hash(n)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(B256::ZERO);
+                    let detail = format!(
+                        "L1-committed batch has {} tx(s) at L2 block {}, sequencer-served block has {} tx(s); positional hash compare failed",
+                        expected.tx_hashes.len(),
+                        n,
+                        local_hashes.len(),
+                    );
+                    event!(
+                        name: "eez.follower.l1.verify.mismatch",
+                        Level::ERROR,
+                        l2_block = n,
+                        block_hash = %block_hash,
+                        "sequencer-served L2 block disagrees with L1-committed batch — halting",
+                    );
+                    return Err(FollowerError::InvalidChain {
+                        block_number: n,
+                        block_hash,
+                        detail,
+                    });
+                }
+
+                self.verified_through_l2_block = n;
+                record.expectations.remove(0);
+            }
+        }
         Ok(())
     }
 
@@ -323,9 +450,11 @@ impl L1Watcher {
             let block_count = batch.block_count() as u64;
             let prev_end = self.batches.back().map_or(0, |r| r.l2_block_end);
             let l2_block_end = prev_end + block_count;
+            let expectations = expectations_from_decoded(prev_end, &batch);
             self.batches.push_back(BatchRecord {
                 l1_block,
                 l2_block_end,
+                expectations,
             });
             event!(
                 name: "eez.follower.l1.batch.observed",
@@ -349,13 +478,22 @@ impl L1Watcher {
         let prior_safe = self.view.safe_l2_block.load(Ordering::Acquire);
         let prior_finalized = self.view.finalized_l2_block.load(Ordering::Acquire);
 
-        // `.max(prior)` enforces monotonicity even if our history gets trimmed
-        // out from under us. L1 reorgs that move `safe`/`finalized` backwards
-        // are out of scope for this PR (handled by stage-3 reorg work).
-        let safe_l2 = self.l2_at_or_before(safe_l1).unwrap_or(0).max(prior_safe);
+        // Cap both pointers at `verified_through_l2_block`: never advertise
+        // a safe/finalized hash for an L2 block whose txs we haven't matched
+        // against an L1-committed batch yet. `.max(prior)` then enforces
+        // monotonicity even if our history gets trimmed out from under us.
+        // L1 reorgs that move `safe`/`finalized` backwards are out of scope
+        // for this PR (handled by stage-3 reorg work).
+        let cap = self.verified_through_l2_block;
+        let safe_l2 = self
+            .l2_at_or_before(safe_l1)
+            .unwrap_or(0)
+            .min(cap)
+            .max(prior_safe);
         let finalized_l2 = self
             .l2_at_or_before(finalized_l1)
             .unwrap_or(0)
+            .min(cap)
             .max(prior_finalized);
 
         if safe_l2 != prior_safe {
@@ -379,9 +517,14 @@ impl L1Watcher {
             );
         }
 
+        // Trim verified, L1-finalized batches. The verified-guard prevents
+        // dropping a record whose expectations the verifier hasn't drained
+        // yet — without it, a sufficiently old unverified batch (e.g.,
+        // reth slow to backfill) could silently disappear and let a wrong
+        // block slip past as "verified" by omission.
         let trim_below = finalized_l1.saturating_sub(FINALIZED_HYSTERESIS);
         while let Some(front) = self.batches.front() {
-            if front.l1_block < trim_below {
+            if front.l1_block < trim_below && front.expectations.is_empty() {
                 self.batches.pop_front();
             } else {
                 break;
@@ -412,4 +555,26 @@ impl L1Watcher {
             .find(|r| r.l1_block <= l1)
             .map(|r| r.l2_block_end)
     }
+}
+
+/// Slice the codec's flat `(block_tx_counts, transactions)` into per-L2-block
+/// expectations starting at `prev_end + 1`. Transactions are EIP-2718
+/// envelopes; we hash each with `keccak256` for positional comparison
+/// against `keccak256(tx.encoded_2718())` over local reth's block body.
+fn expectations_from_decoded(
+    prev_end: u64,
+    batch: &eez_payload_codec::DecodedBatch,
+) -> Vec<BlockExpectation> {
+    let mut out = Vec::with_capacity(batch.block_count());
+    let mut cursor = 0usize;
+    for (i, count) in batch.block_tx_counts.iter().enumerate() {
+        let n_txs = usize::from(*count);
+        let slice = &batch.transactions[cursor..cursor + n_txs];
+        cursor += n_txs;
+        out.push(BlockExpectation {
+            l2_block_num: prev_end + (i as u64) + 1,
+            tx_hashes: slice.iter().map(keccak256).collect(),
+        });
+    }
+    out
 }
