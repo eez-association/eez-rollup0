@@ -1,49 +1,47 @@
-//! Engine-API consumer that advances the chain one block per scheduler tick.
+//! Engine-API consumer that advances the chain on a 2s cadence aligned to
+//! wall-clock time, with **greedy backfill** of any timestamp slots that
+//! were missed due to a reorg or downtime.
 //!
-//! [`Sequencer::run`] is the long-running loop. Each iteration either:
+//! [`Sequencer::run`] is the long-running loop. Each iteration handles one
+//! of:
 //!
-//! 1. Receives a [`ProposalRequest`](crate::ProposalRequest) from the
-//!    scheduler and runs [`Sequencer::advance`]: sends
-//!    `engine_forkchoiceUpdated` with fresh payload attributes, resolves the
-//!    returned payload id, sends `engine_newPayload`, and updates the local
-//!    head cursor. Or
-//! 2. Re-publishes the current forkchoice state on a slower timer so the
-//!    engine's view doesn't drift during quiet periods.
+//! 1. A scheduler tick. [`Sequencer::advance`] runs in a loop, producing
+//!    blocks at deterministic `parent.timestamp() + BLOCK_TIME_SECS`
+//!    slots until the chain catches up to the tick's wall-clock target.
+//!    Most ticks produce a single block (the chain is on cadence); after
+//!    a reorg or a stall, the same tick may produce several filler
+//!    blocks to backfill the slots that passed during the rewind.
+//! 2. A slower FCU-refresh timer, used to keep reth's engine view alive
+//!    during quiet periods.
 //!
-//! Stage 1 hard-codes Ethereum's payload types and the attribute construction.
-//! When stage 4 introduces composer-supplied sync-block contents, the
-//! [`EthAttributesBuilder`] grows additional fields (e.g., a "system txs"
-//! input) rather than the [`Sequencer`] loop itself.
+//! The Sequencer does **not** keep a local mirror of the canonical head.
+//! Every iteration of `advance` reads the current head from the
+//! [`BlockCommitterHandle::last_header`] — the actor is the single source
+//! of truth, updated synchronously inside every Sequence + Derive command.
+//! This is what fixes the race where the Deriver-driven canonical change
+//! was visible to the actor immediately, but the Sequencer's own mirror
+//! lagged behind reth's `CanonStateNotification` broadcast — producing
+//! "invalid payload attributes" errors when the Sequencer issued FCU+attrs
+//! based on a stale parent.
 
 use core::fmt;
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use alloy_primitives::{Address, B256};
-use alloy_rpc_types_engine::ForkchoiceState;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_payload_builder::PayloadBuilderHandle;
-use reth_payload_primitives::{BuiltPayload, PayloadKind, PayloadTypes};
-use reth_primitives_traits::{AlloyBlockHeader, HeaderTy, SealedHeader, SealedHeaderFor};
+use reth_payload_primitives::{BuiltPayload, PayloadTypes};
+use reth_primitives_traits::{
+    AlloyBlockHeader, HeaderTy, NodePrimitives, SealedHeader, SealedHeaderFor,
+};
 use reth_storage_api::BlockReader;
 use tracing::{Level, event};
 
+use crate::block_committer::BlockCommitterHandle;
 use crate::error::{DriverError, DriverResult};
 use crate::scheduler::{ProposalRequest, Scheduler};
-
-/// How many recent block hashes we retain for safe/finalized forkchoice
-/// tracking.
-///
-/// Reth treats forkchoice state as `head/safe/finalized` triplets. Until L1
-/// derivation lands (stage 3), we pick "safe = head - 32" and
-/// "finalized = head - 64" — large enough that those pointers don't move
-/// every block (so a downstream observer sees a stable safe head) but small
-/// enough that we don't unnecessarily delay finalization signals. At a 2s
-/// block time, 64 blocks ≈ 2 minutes of history.
-const FORKCHOICE_HISTORY: usize = 64;
-const SAFE_LAG: usize = 32;
-const FINALIZED_LAG: usize = 64;
 
 /// How often the sequencer re-publishes the current forkchoice state.
 ///
@@ -52,10 +50,45 @@ const FINALIZED_LAG: usize = 64;
 /// miner uses.
 const FCU_REFRESH: Duration = Duration::from_secs(1);
 
+/// L2 block time, in seconds. Pinned at 2s per Rollup-1 spec §1.3 "no
+/// skipped blocks" — each block's timestamp is exactly
+/// `parent.timestamp() + BLOCK_TIME_SECS`.
+const BLOCK_TIME_SECS: u64 = 2;
+
+/// Yield bound on the per-tick backfill loop — caps blocks committed
+/// in one scheduler tick before returning to the run-loop. Catch-up
+/// resumes next tick. 32 blocks / 2s tick ≈ 16 blocks/s.
+const MAX_BLOCKS_PER_TICK: usize = 32;
+
+/// Max speculative gap the Sequencer can run ahead of L1-confirmed
+/// cursor (W3.17). Pauses beyond this so reth's state-retention
+/// window keeps recent ancestors alive for the Deriver's replay.
+pub const DEFAULT_MAX_SPECULATIVE_DEPTH: u64 = 64;
+
+/// L1-confirmed L2 head height (W3.17). `eez_l1::L1CanonicalHead`
+/// implements this; the Sequencer uses it to bound speculative depth.
+pub trait ConfirmedHeadSource: Send + Sync + 'static {
+    /// Highest L2 block confirmed by an L1-landed batch.
+    fn confirmed_head(&self) -> u64;
+}
+
+struct SpeculativeLimit {
+    max_depth: u64,
+    source: Arc<dyn ConfirmedHeadSource>,
+}
+
+impl fmt::Debug for SpeculativeLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpeculativeLimit")
+            .field("max_depth", &self.max_depth)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Builds [`EthPayloadAttributes`] for the next block.
 ///
 /// Stage 1 produces minimal valid attributes: a strictly-increasing timestamp
-/// honoring the scheduler's target, a placeholder `prev_randao`, a
+/// honoring the caller's target, a placeholder `prev_randao`, a
 /// caller-configured `suggested_fee_recipient`, and the post-Shanghai /
 /// post-Cancun fields filled in based on the chainspec.
 ///
@@ -119,18 +152,20 @@ where
     }
 }
 
-/// Drives a reth node by translating scheduler proposals into engine-API
-/// `forkchoiceUpdated` + `newPayload` round-trips.
+/// Translates scheduler proposals into engine-API `forkchoiceUpdated`
+/// then `newPayload` via the [`BlockCommitter`](crate::BlockCommitterHandle).
+/// Stateless w.r.t. head — reads `committer.last_header()` (the actor
+/// writes synchronously on every Sequence/Derive).
 pub struct Sequencer<T, ChainSpec>
 where
     T: PayloadTypes<PayloadAttributes = EthPayloadAttributes>,
 {
     attributes: EthAttributesBuilder<ChainSpec>,
-    to_engine: ConsensusEngineHandle<T>,
-    payload_builder: PayloadBuilderHandle<T>,
     scheduler: Scheduler,
-    last_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
-    recent_hashes: VecDeque<B256>,
+    committer: BlockCommitterHandle<T>,
+    /// Optional speculative-depth cap (W3.17). None = no limit
+    /// (single-composer / follower mode). See `DEFAULT_MAX_SPECULATIVE_DEPTH`.
+    speculative_limit: Option<SpeculativeLimit>,
 }
 
 impl<T, ChainSpec> fmt::Debug for Sequencer<T, ChainSpec>
@@ -139,36 +174,41 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Sequencer")
-            .field("head", &self.recent_hashes.back())
-            .field("recent_hashes", &self.recent_hashes.len())
+            .field("committer", &self.committer)
+            .field("speculative_limit", &self.speculative_limit)
             .finish_non_exhaustive()
     }
 }
 
 impl<T, ChainSpec> Sequencer<T, ChainSpec>
 where
-    T: PayloadTypes<PayloadAttributes = EthPayloadAttributes>,
+    T: PayloadTypes<PayloadAttributes = EthPayloadAttributes> + Send + Sync + 'static,
+    <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives + Send + Sync + 'static,
+    SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>: Send,
     ChainSpec: EthChainSpec<Header = HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>
         + EthereumHardforks
         + Send
         + Sync
         + 'static,
 {
-    /// Constructs a new sequencer by reading the current best block from
-    /// `provider` and binding the engine handles.
+    /// Constructs a sequencer by reading the current best block from
+    /// Construct a sequencer: read `provider`'s best block, spawn a
+    /// `BlockCommitter` seeded with that header.
     ///
     /// # Errors
     ///
-    /// Returns [`DriverError::is_provider`] if the provider lookups fail, or
-    /// [`DriverError::is_missing_header`] if the best block doesn't have a
-    /// header (only happens during a brief startup race).
-    pub fn new(
-        provider: &impl BlockReader<Header = HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>,
+    /// `provider` (lookup failure), `missing_header` (best block has no
+    /// header — brief startup race).
+    pub fn new<P>(
+        provider: &P,
         attributes: EthAttributesBuilder<ChainSpec>,
         to_engine: ConsensusEngineHandle<T>,
         scheduler: Scheduler,
         payload_builder: PayloadBuilderHandle<T>,
-    ) -> DriverResult<Self> {
+    ) -> DriverResult<Self>
+    where
+        P: BlockReader<Header = HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>,
+    {
         let best = provider
             .best_block_number()
             .map_err(DriverError::provider)?;
@@ -176,23 +216,40 @@ where
             .sealed_header(best)
             .map_err(DriverError::provider)?
             .ok_or_else(|| DriverError::missing_header(best))?;
-        let recent_hashes = VecDeque::from([last_header.hash()]);
+        let committer = BlockCommitterHandle::spawn(last_header, to_engine, payload_builder);
         Ok(Self {
             attributes,
-            to_engine,
-            payload_builder,
             scheduler,
-            last_header,
-            recent_hashes,
+            committer,
+            speculative_limit: None,
         })
     }
 
-    /// Runs the sequencer loop until cancellation.
-    ///
-    /// Errors during an advance are logged and the loop continues — a single
-    /// failed FCU / `newPayload` round-trip shouldn't kill the node.
-    /// Recoverable failures show up in metrics and traces; permanent failure
-    /// modes require an explicit shutdown signal (not yet wired).
+    /// Cap blocks above `source`'s L1-confirmed head; `advance` pauses
+    /// past `max_depth` so the Deriver gets time to replay L1 batches
+    /// without state-pruning churn (W3.17). Skip for single-composer /
+    /// follower setups. Use `DEFAULT_MAX_SPECULATIVE_DEPTH` for the
+    /// typical based-mode deployment.
+    #[must_use]
+    pub fn with_speculative_limit(
+        mut self,
+        max_depth: u64,
+        source: Arc<dyn ConfirmedHeadSource>,
+    ) -> Self {
+        self.speculative_limit = Some(SpeculativeLimit { max_depth, source });
+        self
+    }
+
+    /// Clone-cheap handle to the underlying `BlockCommitter` actor.
+    /// Other components (Deriver) push commands through the same task.
+    #[must_use]
+    pub fn committer(&self) -> BlockCommitterHandle<T> {
+        self.committer.clone()
+    }
+
+    /// Runs the sequencer loop until cancellation. Errors during advance
+    /// are logged and the loop continues; `committer_closed` should
+    /// trigger an explicit shutdown (not yet wired).
     pub async fn run(mut self) {
         let mut fcu_interval = tokio::time::interval(FCU_REFRESH);
         loop {
@@ -208,7 +265,7 @@ where
                     }
                 }
                 _ = fcu_interval.tick() => {
-                    if let Err(err) = self.refresh_forkchoice().await {
+                    if let Err(err) = self.committer.refresh_forkchoice().await {
                         event!(
                             name: "eez.sequencer.fcu.failed",
                             Level::WARN,
@@ -221,92 +278,88 @@ where
         }
     }
 
-    fn forkchoice_state(&self) -> ForkchoiceState {
-        let head = *self
-            .recent_hashes
-            .back()
-            .expect("recent_hashes is never empty post-new");
-        let safe = *self
-            .recent_hashes
-            .get(self.recent_hashes.len().saturating_sub(SAFE_LAG))
-            .expect("len >= 1 keeps index valid under saturating_sub");
-        let finalized = *self
-            .recent_hashes
-            .get(self.recent_hashes.len().saturating_sub(FINALIZED_LAG))
-            .expect("len >= 1 keeps index valid under saturating_sub");
-        ForkchoiceState {
-            head_block_hash: head,
-            safe_block_hash: safe,
-            finalized_block_hash: finalized,
-        }
-    }
-
-    async fn refresh_forkchoice(&self) -> DriverResult<()> {
-        let state = self.forkchoice_state();
-        let res = self
-            .to_engine
-            .fork_choice_updated(state, None)
-            .await
-            .map_err(DriverError::engine_rpc)?;
-        if !res.is_valid() {
-            return Err(DriverError::invalid_forkchoice(format!("{res:?}")));
-        }
-        Ok(())
-    }
-
+    /// Greedy backfill loop. Each iteration commits one block at the
+    /// next deterministic `parent.timestamp() + BLOCK_TIME_SECS` slot
+    /// until the chain is within one block-time of the tick's
+    /// wall-clock target. If the gap is large enough to exceed
+    /// [`MAX_BLOCKS_PER_TICK`] in one tick, the loop yields and
+    /// resumes on the next scheduler tick — catch-up isn't abandoned,
+    /// just spread over multiple ticks so the run-loop stays
+    /// responsive to canon-state notifications and FCU refreshes.
     async fn advance(&mut self, req: ProposalRequest) -> DriverResult<()> {
-        let attrs = self
-            .attributes
-            .build(&self.last_header, req.target_timestamp);
-        let timestamp = attrs.timestamp;
+        let target_wall = req.target_timestamp;
+        let mut produced: usize = 0;
 
-        let fcu = self
-            .to_engine
-            .fork_choice_updated(self.forkchoice_state(), Some(attrs))
-            .await
-            .map_err(DriverError::engine_rpc)?;
-        if !fcu.is_valid() {
-            return Err(DriverError::invalid_forkchoice(format!("{fcu:?}")));
+        while produced < MAX_BLOCKS_PER_TICK {
+            // Read the current canonical head from the committer per
+            // iteration. The committer is the single source of truth
+            // — Deriver-driven advances are visible here immediately,
+            // with no `CanonStateNotification` broadcast lag.
+            let last_header = self.committer.last_header();
+            let parent_num = last_header.number();
+            let parent_ts = last_header.timestamp();
+            let gap = target_wall.saturating_sub(parent_ts);
+
+            // Chain has reached (or passed) the tick's target — nothing
+            // more to produce this tick.
+            if gap < BLOCK_TIME_SECS {
+                break;
+            }
+
+            // Speculative-depth limit (W3.17): if we're already too far
+            // ahead of the L1-confirmed cursor, pause and let the Deriver
+            // catch up. Without this, the Sequencer races ahead during
+            // a long timestamp-backfill and the Deriver's subsequent
+            // reorgs displace blocks faster than reth's state-retention
+            // window — eventually producing `no state found` on a deep
+            // replay.
+            if let Some(limit) = &self.speculative_limit {
+                let confirmed = limit.source.confirmed_head();
+                let speculative_depth = parent_num.saturating_sub(confirmed);
+                if speculative_depth >= limit.max_depth {
+                    event!(
+                        name: "eez.sequencer.speculative.paused",
+                        Level::DEBUG,
+                        parent_num,
+                        confirmed,
+                        speculative_depth,
+                        max_depth = limit.max_depth,
+                        "paused: speculative depth at cap; waiting for Deriver to catch up",
+                    );
+                    break;
+                }
+            }
+
+            let next_ts = parent_ts.saturating_add(BLOCK_TIME_SECS);
+            let attrs = self.attributes.build(&last_header, next_ts);
+            let timestamp = attrs.timestamp;
+            let outcome = self.committer.commit_sequenced(attrs).await?;
+            let block_number = outcome.header.number();
+            let block_hash = outcome.header.hash();
+
+            event!(
+                name: "eez.sequencer.block.produced",
+                Level::INFO,
+                slot.kind = %req.kind,
+                block.number = block_number,
+                block.hash = %block_hash,
+                block.timestamp = timestamp,
+                block.is_filler = produced > 0,
+                "produced block {{block.number}} hash={{block.hash}} ts={{block.timestamp}}",
+            );
+
+            produced += 1;
         }
-        let payload_id = fcu.payload_id.ok_or_else(DriverError::payload_missing)?;
 
-        let payload = self
-            .payload_builder
-            .resolve_kind(payload_id, PayloadKind::WaitForPending)
-            .await
-            .ok_or_else(DriverError::payload_missing)?
-            .map_err(DriverError::engine_rpc)?;
-
-        let header = payload.block().sealed_header().clone();
-        let block_number = header.number();
-        let block_hash = header.hash();
-        let exec_payload = T::block_to_payload(payload.block().clone());
-
-        let np = self
-            .to_engine
-            .new_payload(exec_payload)
-            .await
-            .map_err(DriverError::engine_rpc)?;
-        if !np.is_valid() {
-            return Err(DriverError::invalid_payload(format!("{np:?}")));
+        if produced == MAX_BLOCKS_PER_TICK {
+            event!(
+                name: "eez.sequencer.backfill.yield",
+                Level::INFO,
+                target_timestamp = target_wall,
+                last_block_timestamp = self.committer.last_header().timestamp(),
+                "hit per-tick block cap; continuing catch-up on next tick",
+            );
         }
-
-        self.recent_hashes.push_back(block_hash);
-        if self.recent_hashes.len() > FORKCHOICE_HISTORY {
-            self.recent_hashes.pop_front();
-        }
-        self.last_header = header;
-
-        event!(
-            name: "eez.sequencer.block.produced",
-            Level::INFO,
-            slot.kind = %req.kind,
-            block.number = block_number,
-            block.hash = %block_hash,
-            block.timestamp = timestamp,
-            "produced block {{block.number}} hash={{block.hash}} ts={{block.timestamp}}",
-        );
-
         Ok(())
     }
 }

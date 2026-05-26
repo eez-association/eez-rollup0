@@ -35,6 +35,9 @@ pub(crate) enum ErrorKind {
     PayloadMissing,
     /// Engine-API RPC transport error.
     EngineRpc(String),
+    /// `BlockCommitter` actor task is gone (channel closed). The Sequencer
+    /// can't recover; the caller (typically eez-node main) will log + exit.
+    CommitterClosed,
 }
 
 impl DriverError {
@@ -60,6 +63,10 @@ impl DriverError {
 
     pub(crate) fn engine_rpc(err: impl fmt::Display) -> Self {
         Self::new(ErrorKind::EngineRpc(err.to_string()))
+    }
+
+    pub(crate) fn committer_closed() -> Self {
+        Self::new(ErrorKind::CommitterClosed)
     }
 
     fn new(kind: ErrorKind) -> Self {
@@ -91,6 +98,13 @@ impl DriverError {
     #[must_use]
     pub fn is_invalid_payload(&self) -> bool {
         matches!(self.kind, ErrorKind::InvalidPayload(_))
+    }
+
+    /// Returns true if the `BlockCommitter` actor task has exited and
+    /// can no longer receive commands.
+    #[must_use]
+    pub fn is_committer_closed(&self) -> bool {
+        matches!(self.kind, ErrorKind::CommitterClosed)
     }
 
     /// Returns the captured backtrace for diagnostics.
@@ -125,6 +139,9 @@ impl fmt::Display for DriverError {
                 write!(f, "payload builder returned no payload for issued id")
             }
             ErrorKind::EngineRpc(msg) => write!(f, "engine-API transport error: {msg}"),
+            ErrorKind::CommitterClosed => {
+                write!(f, "block committer actor task has exited")
+            }
         }
     }
 }
