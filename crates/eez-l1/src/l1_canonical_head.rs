@@ -187,19 +187,9 @@ impl L1CanonicalHead {
         (new_cursor, *finalized_ref, dropped)
     }
 
-    /// Highest `last_l2_block` of any batch with `l1_block ≤ bound`.
-    /// Used to map an L1-finalized block to its L2 head.
-    ///
-    /// # Panics
-    ///
-    /// If the `batches` mutex is poisoned.
-    pub fn highest_l2_at_or_below_l1(&self, l1_block_bound: u64) -> Option<u64> {
-        self.highest_l2_ref_at_or_below_l1(l1_block_bound)
-            .map(|r| r.number)
-    }
-
     /// Highest hash-bearing L2 checkpoint of any batch with
-    /// `l1_block <= bound`.
+    /// `l1_block <= bound`. Used to map an L1-finalized block to its
+    /// L2 head.
     ///
     /// # Panics
     ///
@@ -212,27 +202,6 @@ impl L1CanonicalHead {
             .rev()
             .find(|b| b.l1_block <= l1_block_bound)
             .map(|b| b.last_l2)
-    }
-
-    /// Update the `finalized_l2` mirror. Caller is responsible for
-    /// keeping it `<= cursor()`.
-    ///
-    /// # Panics
-    ///
-    /// If either mutex is poisoned.
-    pub fn set_finalized_l2(&self, l2_block: u64) {
-        let finalized = if l2_block == 0 {
-            None
-        } else {
-            self.batches
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|b| b.last_l2.number == l2_block)
-                .map(|b| b.last_l2)
-        };
-        *self.finalized_ref.lock().unwrap() = finalized;
-        self.finalized_l2.store(l2_block, Ordering::Release);
     }
 
     /// Update the hash-bearing finalized mirror. Caller is responsible
@@ -304,7 +273,10 @@ mod tests {
             record(101, 0xcc, 70),
             record(102, 0xdd, 80),
         ]);
-        head.set_finalized_l2(60);
+        head.set_finalized_ref(Some(L2BlockRef {
+            number: 60,
+            hash: B256::with_last_byte(0xbb),
+        }));
         let (new_cursor, new_finalized, dropped) = head.retreat_on_l1_reorg(100);
         assert_eq!(new_cursor.map(|r| r.number), Some(60)); // both batches at L1=100 survive
         assert_eq!(new_finalized.map(|r| r.number), Some(60));
@@ -312,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn highest_l2_at_or_below_l1_returns_max_within_bound() {
+    fn highest_l2_ref_at_or_below_l1_returns_max_within_bound() {
         let head = L1CanonicalHead::default();
         head.append_many([
             record(100, 0xaa, 50),
@@ -320,33 +292,26 @@ mod tests {
             record(101, 0xcc, 70),
             record(102, 0xdd, 80),
         ]);
-        assert_eq!(head.highest_l2_at_or_below_l1(100), Some(60));
-        assert_eq!(head.highest_l2_at_or_below_l1(101), Some(70));
-        assert_eq!(head.highest_l2_at_or_below_l1(99), None);
-    }
-
-    #[test]
-    fn highest_l2_ref_at_or_below_l1_preserves_hash_identity() {
-        let head = L1CanonicalHead::default();
-        head.append_many([record(100, 0xaa, 50), record(101, 0xbb, 60)]);
-
-        let l2 = head.highest_l2_ref_at_or_below_l1(101).unwrap();
-        assert_eq!(l2.number, 60);
-        assert_eq!(l2.hash, B256::with_last_byte(0xbb));
+        let at_100 = head.highest_l2_ref_at_or_below_l1(100).unwrap();
+        assert_eq!(at_100.number, 60);
+        assert_eq!(at_100.hash, B256::with_last_byte(0xbb));
+        let at_101 = head.highest_l2_ref_at_or_below_l1(101).unwrap();
+        assert_eq!(at_101.number, 70);
+        assert_eq!(at_101.hash, B256::with_last_byte(0xcc));
+        assert!(head.highest_l2_ref_at_or_below_l1(99).is_none());
     }
 
     #[test]
     fn finalized_ref_tracks_hash_bearing_checkpoint() {
         let head = L1CanonicalHead::default();
         head.append_many([record(100, 0xaa, 50), record(101, 0xbb, 60)]);
-        head.set_finalized_l2(60);
+        let checkpoint = L2BlockRef {
+            number: 60,
+            hash: B256::with_last_byte(0xbb),
+        };
+        head.set_finalized_ref(Some(checkpoint));
 
-        assert_eq!(
-            head.finalized_ref(),
-            Some(L2BlockRef {
-                number: 60,
-                hash: B256::with_last_byte(0xbb),
-            })
-        );
+        assert_eq!(head.finalized_ref(), Some(checkpoint));
+        assert_eq!(head.finalized_l2(), 60);
     }
 }
