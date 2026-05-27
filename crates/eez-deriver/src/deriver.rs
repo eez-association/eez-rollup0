@@ -6,15 +6,16 @@
 //! STF-replay pattern adapted from `based-rollup`'s `build_derived_block`
 //! at `/root/sync-rollups-composer/crates/based-rollup/src/driver/protocol_txs.rs:453`.
 
-use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BlockCommitterHandle, DeriveOutcome, ForkchoiceOutcome};
-use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Watcher, L2BlockRef, Submitter};
+use eez_l1::{
+    BatchRecord, HistoricalBatch, L1CanonicalHead, L1Event, L1Watcher, L2BlockRef, Submitter,
+};
 use reth_chainspec::ChainSpec;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_ethereum_primitives::TransactionSigned;
@@ -35,18 +36,6 @@ use crate::error::{DeriverError, DeriverResult};
 /// Used by [`Deriver::execute_block`] to derive each block's
 /// timestamp from its parent's deterministically.
 const BLOCK_TIME_SECS: u64 = 2;
-
-/// Policy for when L1-landed batches become safe in reth.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SafetyPolicy {
-    /// PR #5 sequencer/base-node behavior: a winning L1-latest batch is
-    /// derived and promoted immediately.
-    L1Latest,
-    /// Follower behavior: a winning L1-latest batch is indexed as
-    /// pending, then derived/promoted only once its L1 block is under
-    /// the L1 safe tag.
-    L1Safe,
-}
 
 /// L1-derived L2 consensus engine. Cheaply [`Clone`]able.
 #[derive(Clone)]
@@ -77,19 +66,6 @@ where
     /// used to compute the FCU when advancing finalized without
     /// disturbing safe (and vice versa).
     safe_l2_block: AtomicU64,
-    safety_policy: SafetyPolicy,
-    pending_batches: Mutex<VecDeque<PendingBatch>>,
-}
-
-#[derive(Debug, Clone)]
-struct PendingBatch {
-    l1_block_number: u64,
-    l1_block_hash: B256,
-    tx_hash: B256,
-    submitter: Address,
-    call_data: Bytes,
-    state_applied: bool,
-    claimed_new_state: Option<B256>,
 }
 
 struct DerivedBlock {
@@ -149,36 +125,6 @@ where
                 deploy_block,
                 l1_head,
                 safe_l2_block: AtomicU64::new(0),
-                safety_policy: SafetyPolicy::L1Latest,
-                pending_batches: Mutex::new(VecDeque::new()),
-            }),
-        }
-    }
-
-    /// Builds a deriver that only promotes batches once they are under
-    /// the L1 safe tag.
-    pub fn new_l1_safe(
-        l1_watcher: L1Watcher,
-        committer: BlockCommitterHandle<EthEngineTypes>,
-        l2_provider: Arc<L2>,
-        submitter: Submitter,
-        chain_spec: Arc<ChainSpec>,
-        deploy_block: u64,
-        l1_head: Arc<L1CanonicalHead>,
-    ) -> Self {
-        let evm_config = EthEvmConfig::new(chain_spec);
-        Self {
-            inner: Arc::new(Inner {
-                l1_watcher,
-                committer,
-                l2_provider,
-                submitter,
-                evm_config,
-                deploy_block,
-                l1_head,
-                safe_l2_block: AtomicU64::new(0),
-                safety_policy: SafetyPolicy::L1Safe,
-                pending_batches: Mutex::new(VecDeque::new()),
             }),
         }
     }
@@ -203,10 +149,6 @@ where
     ///
     /// If the `batches` mutex is poisoned.
     pub async fn catch_up(&self) -> DeriverResult<()> {
-        if self.inner.safety_policy == SafetyPolicy::L1Safe {
-            return self.catch_up_l1_safe().await;
-        }
-
         let local_head = self
             .inner
             .l2_provider
@@ -365,39 +307,6 @@ where
                 "scan completed without replaying any blocks",
             );
         }
-        Ok(())
-    }
-
-    async fn catch_up_l1_safe(&self) -> DeriverResult<()> {
-        let historical = self
-            .inner
-            .submitter
-            .scan_batches(self.inner.deploy_block)
-            .await
-            .map_err(|e| DeriverError::l2_provider(format!("safe catch-up scan: {e}")))?;
-
-        let mut queued = 0usize;
-        for batch in historical {
-            if self.enqueue_pending_batch(PendingBatch {
-                l1_block_number: batch.l1_block_number,
-                l1_block_hash: batch.l1_block_hash,
-                tx_hash: batch.tx_hash,
-                submitter: batch.submitter,
-                call_data: batch.call_data,
-                state_applied: batch.state_applied,
-                claimed_new_state: batch.claimed_new_state,
-            }) {
-                queued += 1;
-            }
-        }
-
-        event!(
-            name: "eez.deriver.safe.catch_up.done",
-            Level::INFO,
-            queued,
-            cursor = self.cursor(),
-            "safe-gated catch-up indexed historical batches as pending",
-        );
         Ok(())
     }
 
@@ -744,21 +653,23 @@ where
                 submitter,
                 call_data,
                 state_applied,
+                claimed_current_state,
                 claimed_new_state,
                 ..
             } => {
-                self.on_batch_posted(PendingBatch {
+                self.on_batch_posted(HistoricalBatch {
                     l1_block_number,
                     l1_block_hash,
                     tx_hash,
                     submitter,
                     call_data,
                     state_applied,
+                    claimed_current_state,
                     claimed_new_state,
                 })
                 .await
             }
-            L1Event::NewHead { .. } => Ok(()),
+            L1Event::NewHead { .. } | L1Event::Safe { .. } => Ok(()),
             L1Event::Reorg {
                 common_ancestor_number,
                 old_head_hash,
@@ -774,42 +685,11 @@ where
                 )
                 .await
             }
-            L1Event::Safe { block_number, .. } => self.on_l1_safe(block_number).await,
             L1Event::Finalized { block_number, .. } => self.on_l1_finalized(block_number).await,
         }
     }
 
-    fn enqueue_pending_batch(&self, batch: PendingBatch) -> bool {
-        if self.inner.l1_head.contains_l1_tx(&batch.tx_hash) {
-            return false;
-        }
-
-        if !batch.state_applied {
-            event!(
-                name: "eez.deriver.safe.pending.skipped_loser",
-                Level::INFO,
-                l1_block_number = batch.l1_block_number,
-                tx_hash = %batch.tx_hash,
-                submitter = %batch.submitter,
-                "batch lost the race on L1; not queueing for safe derivation",
-            );
-            return false;
-        }
-
-        let mut pending = self.inner.pending_batches.lock().unwrap();
-        if pending.iter().any(|p| p.tx_hash == batch.tx_hash) {
-            return false;
-        }
-        pending.push_back(batch);
-        true
-    }
-
-    async fn on_batch_posted(&self, batch: PendingBatch) -> DeriverResult<()> {
-        if self.inner.safety_policy == SafetyPolicy::L1Safe {
-            self.enqueue_pending_batch(batch);
-            return Ok(());
-        }
-
+    async fn on_batch_posted(&self, batch: HistoricalBatch) -> DeriverResult<()> {
         let decoded = eez_payload_codec::decode(batch.call_data.as_ref())?;
         let block_count = decoded.block_count() as u64;
         if block_count == 0 {
@@ -975,139 +855,6 @@ where
         Ok(())
     }
 
-    async fn on_l1_safe(&self, l1_safe_block: u64) -> DeriverResult<()> {
-        if self.inner.safety_policy == SafetyPolicy::L1Latest {
-            return Ok(());
-        }
-
-        self.process_pending_through(l1_safe_block).await?;
-        let Some(safe_ref) = self
-            .inner
-            .l1_head
-            .highest_l2_ref_at_or_below_l1(l1_safe_block)
-        else {
-            return Ok(());
-        };
-        let old_safe = self.inner.safe_l2_block.load(Ordering::Acquire);
-        if safe_ref.number <= old_safe {
-            return Ok(());
-        }
-
-        let finalized_ref = self
-            .inner
-            .l1_head
-            .finalized_ref()
-            .filter(|finalized| finalized.number <= safe_ref.number);
-        let finalized_hash = finalized_ref.map_or(self.l2_hash_at(0)?, |r| r.hash);
-        self.advance_safe_finalized_or_recover(safe_ref, finalized_hash)
-            .await?;
-        self.inner
-            .safe_l2_block
-            .store(safe_ref.number, Ordering::Release);
-
-        event!(
-            name: "eez.deriver.safe.advanced_from_l1_safe",
-            Level::INFO,
-            l1_safe_block,
-            l2_safe = safe_ref.number,
-            safe_hash = %safe_ref.hash,
-            "advanced L2 safe head from L1 safe-derived checkpoint",
-        );
-        Ok(())
-    }
-
-    async fn process_pending_through(&self, l1_safe_block: u64) -> DeriverResult<()> {
-        let ready: Vec<PendingBatch> = {
-            let mut pending = self.inner.pending_batches.lock().unwrap();
-            let ready_len = pending
-                .iter()
-                .take_while(|batch| batch.l1_block_number <= l1_safe_block)
-                .count();
-            pending.drain(..ready_len).collect()
-        };
-
-        for batch in ready {
-            self.process_pending_batch(batch).await?;
-        }
-        Ok(())
-    }
-
-    async fn process_pending_batch(&self, batch: PendingBatch) -> DeriverResult<()> {
-        if self.inner.l1_head.contains_l1_tx(&batch.tx_hash) {
-            return Ok(());
-        }
-
-        let decoded = eez_payload_codec::decode(batch.call_data.as_ref())?;
-        let block_count = decoded.block_count() as u64;
-        if block_count == 0 {
-            return Ok(());
-        }
-
-        let last_indexed_l2 = self.inner.l1_head.last_indexed_l2();
-        let from_block = last_indexed_l2 + 1;
-        let to_block = last_indexed_l2 + block_count;
-        let mut tx_offset = 0usize;
-        let mut replayed_count = 0u64;
-        let mut batch_end_header = None;
-        for (i, count) in decoded.block_tx_counts.iter().enumerate() {
-            let l2_block = from_block + i as u64;
-            let count_usize = usize::from(*count);
-            let block_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
-            tx_offset += count_usize;
-
-            let derived = self.derive_or_commit_block(l2_block - 1, block_txs).await?;
-            if !derived.already_canonical {
-                replayed_count += 1;
-            }
-            batch_end_header = Some(derived.header);
-        }
-        let batch_end_header = batch_end_header.ok_or_else(|| {
-            DeriverError::l2_provider(format!("batch {} decoded to no L2 blocks", batch.tx_hash))
-        })?;
-
-        if let Some(claimed) = batch.claimed_new_state {
-            let local_root = batch_end_header.state_root();
-            if local_root != claimed {
-                event!(
-                    name: "eez.deriver.state.diverged",
-                    Level::ERROR,
-                    l1_block_number = batch.l1_block_number,
-                    tx_hash = %batch.tx_hash,
-                    to_block,
-                    local_root = %local_root,
-                    claimed = %claimed,
-                    "safe-gated derivation produced a state root different from L1's claimed newState",
-                );
-                return Err(DeriverError::local_diverged(to_block));
-            }
-        }
-
-        let l2 = L2BlockRef {
-            number: to_block,
-            hash: batch_end_header.hash(),
-        };
-        self.inner.l1_head.append(BatchRecord {
-            l1_block: batch.l1_block_number,
-            l1_block_hash: batch.l1_block_hash,
-            tx_hash: batch.tx_hash,
-            last_l2: l2,
-        });
-
-        event!(
-            name: "eez.deriver.safe.pending.derived",
-            Level::INFO,
-            l1_block_number = batch.l1_block_number,
-            l1_block_hash = %batch.l1_block_hash,
-            tx_hash = %batch.tx_hash,
-            from_block,
-            to_block,
-            l2_hash = %l2.hash,
-            replayed = replayed_count,
-            "derived L1-safe batch into an exact L2 checkpoint",
-        );
-        Ok(())
-    }
-
     async fn on_l1_reorg(
         &self,
         common_ancestor_number: u64,
@@ -1122,12 +869,6 @@ where
         // L1CanonicalHead handles the cursor + finalized retreats
         // atomically; we just propagate to reth's safe head below.
         let old_cursor = self.inner.l1_head.cursor();
-        let dropped_pending = {
-            let mut pending = self.inner.pending_batches.lock().unwrap();
-            let original_len = pending.len();
-            pending.retain(|batch| batch.l1_block_number <= common_ancestor_number);
-            original_len - pending.len()
-        };
         let (new_cursor_ref, new_finalized_ref, dropped) = self
             .inner
             .l1_head
@@ -1143,7 +884,6 @@ where
                 old_head_hash = %old_head_hash,
                 new_head_number,
                 new_head_hash = %new_head_hash,
-                dropped_pending,
                 "L1 reorg above our batches; no L2 retreat needed",
             );
             return Ok(());
@@ -1179,7 +919,6 @@ where
             old_cursor,
             new_cursor,
             dropped_batches = dropped,
-            dropped_pending,
             "L1 reorg rolled out confirmed batches; L2 safe head retreated",
         );
         Ok(())

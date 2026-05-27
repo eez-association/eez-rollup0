@@ -2,7 +2,7 @@
 //!
 //! The follower uses PR #5's L1 derivation path for safe/finalized
 //! correctness. Sequencer RPC, when configured, is only an unsafe-head
-//! source; L1-safe/finalized checkpoints are hash-bearing blocks derived
+//! source; L1-latest/finalized checkpoints are hash-bearing blocks derived
 //! from posted batches and applied through the shared `BlockCommitter`.
 
 mod error;
@@ -39,7 +39,7 @@ const BLOCK_TIME: Duration = Duration::from_secs(2);
 #[derive(clap::Args, Debug, Clone)]
 struct FollowerExt {
     /// Sequencer JSON-RPC URL. When omitted, the node runs as an
-    /// L1-derived-only follower and head advances only when L1-safe
+    /// L1-derived-only follower and head advances only when L1-latest
     /// batches are derived.
     #[arg(long, env = "EEZ_SEQUENCER_RPC")]
     sequencer_rpc: Option<url::Url>,
@@ -91,7 +91,7 @@ fn main() -> eyre::Result<()> {
         let l1_head = Arc::new(L1CanonicalHead::default());
         let submitter = Submitter::new(submitter_config);
         let l1_watcher = L1Watcher::spawn(l1_watcher_config);
-        let deriver = Deriver::new_l1_safe(
+        let deriver = Deriver::new(
             l1_watcher,
             block_committer.clone(),
             Arc::new(provider.clone()),
@@ -106,7 +106,7 @@ fn main() -> eyre::Result<()> {
                 name: "eez.follower.deriver.boot_catch_up.failed",
                 Level::WARN,
                 error = %err,
-                "boot-time safe-gated catch_up failed; deriver.run() will retry post-subscribe",
+                "boot-time catch_up failed; deriver.run() will retry post-subscribe",
             );
         }
 
