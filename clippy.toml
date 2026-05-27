@@ -1,0 +1,8 @@
+# Clippy configuration thresholds.
+#
+# `too-many-lines` defaults to 100, which fires on the eez-node bootstrap
+# closure (linear wiring of sequencer + L1 watcher + deriver + composer
+# is hard to compress without uglier abstractions). 150 leaves room for
+# the bootstrap to grow modestly while still catching genuinely sprawling
+# functions.
+too-many-lines-threshold = 150

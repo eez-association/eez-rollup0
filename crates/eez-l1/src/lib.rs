@@ -21,6 +21,8 @@
 pub mod composer;
 pub mod config;
 pub mod error;
+pub mod l1_canonical_head;
+pub mod l1_watcher;
 pub mod submitter;
 
 #[doc(inline)]
@@ -30,4 +32,8 @@ pub use config::{ComposerConfig, SubmitterConfig};
 #[doc(inline)]
 pub use error::{L1Error, L1Result};
 #[doc(inline)]
-pub use submitter::{SendOutcome, Submitter};
+pub use l1_canonical_head::{BatchRecord, L1CanonicalHead};
+#[doc(inline)]
+pub use l1_watcher::{L1Event, L1Watcher, L1WatcherConfig};
+#[doc(inline)]
+pub use submitter::{HistoricalBatch, SendOutcome, Submitter};

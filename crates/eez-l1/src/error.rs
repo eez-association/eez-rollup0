@@ -33,4 +33,11 @@ pub enum L1Error {
     /// automatically once it lands.
     #[error("local L2 head ({local}) is behind on-chain posted head ({on_chain})")]
     L2Behind { local: u64, on_chain: u64 },
+    /// L1 reorg deeper than the configured tolerance — beyond Ethereum
+    /// finality. Operator must intervene (most likely a transient L1
+    /// node anomaly; check L1 health and restart).
+    #[error(
+        "L1 reorg too deep: walked {walked} blocks without finding a common ancestor (max {max})"
+    )]
+    ReorgTooDeep { walked: usize, max: usize },
 }

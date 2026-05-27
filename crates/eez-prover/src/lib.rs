@@ -24,7 +24,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 pub use eez_l1_batch::{
-    EezRegistry, ProofSystemBatchPerVerificationEntries, RollupIdWithProofSystems,
+    EezRegistry, ExecutionEntry, ProofSystemBatchPerVerificationEntries, RollupIdWithProofSystems,
+    StateDelta,
 };
 
 /// Result alias.
@@ -217,6 +218,11 @@ mod eez_l1_batch {
             function rollupCounter() external view returns (uint256);
 
             event BatchPosted(uint256 indexed rollupCount);
+
+            /// Winner signal: emitted by `_applyStateDeltas`
+            /// (EEZ.sol:979) when a batch's state delta actually
+            /// applied. Absence ⇒ loser (`ImmediateEntrySkipped`).
+            event L2ExecutionPerformed(uint256 indexed rollupId, bytes32 newState);
         }
     }
 }
