@@ -28,11 +28,11 @@ pub mod submitter;
 #[doc(inline)]
 pub use composer::Composer;
 #[doc(inline)]
-pub use config::{ComposerConfig, SubmitterConfig};
+pub use config::{ComposerConfig, SubmitterConfig, registry_deploy_block_from_env};
 #[doc(inline)]
 pub use error::{L1Error, L1Result};
 #[doc(inline)]
-pub use l1_canonical_head::{BatchRecord, L1CanonicalHead};
+pub use l1_canonical_head::{BatchRecord, L1CanonicalHead, L2BlockRef};
 #[doc(inline)]
 pub use l1_watcher::{L1Event, L1Watcher, L1WatcherConfig};
 #[doc(inline)]

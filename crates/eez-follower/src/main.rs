@@ -1,54 +1,51 @@
 //! eez Rollup-0 follower node binary.
 //!
-//! Wraps reth with a [`Follower`] task plus an [`L1Watcher`] task. Reth
-//! provides the EVM, storage, P2P networking, RPC, and engine; the
-//! follower drives the engine API to track the sequencer's chain
-//! (unsafe head from sequencer JSON-RPC, safe/finalized from L1
-//! `BatchPosted` events tailed by the L1 watcher).
-//!
-//! L1 is mandatory — see `l1.rs`. All `EEZ_*` env vars must be set.
-//! `EEZ_SEQUENCER_RPC` is required too (or `--sequencer-rpc`).
-//! P2P peering with the sequencer's reth is configured via reth's
-//! own `--trusted-peers` flag.
+//! The follower uses PR #5's L1 derivation path for safe/finalized
+//! correctness. Sequencer RPC, when configured, is only an unsafe-head
+//! source; L1-safe/finalized checkpoints are hash-bearing blocks derived
+//! from posted batches and applied through the shared `BlockCommitter`.
 
 mod error;
 mod follower;
-mod l1;
 
 use std::{sync::Arc, time::Duration};
 
 use alloy_provider::RootProvider;
 use clap::Parser as _;
-use eez_driver::Scheduler;
+use eez_deriver::Deriver;
+use eez_driver::{BlockCommitterHandle, Scheduler};
+use eez_l1::{
+    L1CanonicalHead, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
+    registry_deploy_block_from_env,
+};
 use mimalloc::MiMalloc;
 use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
+use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_ethereum::EthereumNode;
+use reth_storage_api::{BlockNumReader, HeaderProvider};
 use tracing::{Level, event};
 
 use crate::follower::Follower;
-use crate::l1::{L1Config, L1View, L1Watcher};
 
 /// Per M-MIMALLOC-APPS — meaningful win on allocation-heavy workloads.
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-/// L2 block cadence for Rollup-0. Must match the sequencer's value
-/// (`eez-node/src/main.rs:31`); both will move to a shared config later.
+/// L2 block cadence for Rollup-0. Must match the sequencer's value.
 const BLOCK_TIME: Duration = Duration::from_secs(2);
 
 /// Follower-specific CLI arguments, layered on top of reth's `Cli` via the
 /// `Ext` typestate.
 #[derive(clap::Args, Debug, Clone)]
 struct FollowerExt {
-    /// Sequencer JSON-RPC URL. Used per tick to fetch the current head hash
-    /// (`eth_getBlockByNumber`); block bodies and receipts flow over P2P.
+    /// Sequencer JSON-RPC URL. When omitted, the node runs as an
+    /// L1-derived-only follower and head advances only when L1-safe
+    /// batches are derived.
     #[arg(long, env = "EEZ_SEQUENCER_RPC")]
-    sequencer_rpc: url::Url,
+    sequencer_rpc: Option<url::Url>,
 }
 
 fn main() -> eyre::Result<()> {
-    // Auto-load `.env` from cwd and the machine-written `deployments.env`
-    // that `scripts/deploy.sh` produces — same convention as `eez-node`.
     let _ = dotenvy::dotenv();
     let _ = dotenvy::from_filename("deployments.env");
 
@@ -60,55 +57,88 @@ fn main() -> eyre::Result<()> {
     }
 
     Cli::<EthereumChainSpecParser, FollowerExt>::parse().run(async move |builder, ext| {
-        // Validate L1 config BEFORE launching reth so missing env vars
-        // fail in milliseconds rather than after reth boots RPC servers.
-        let l1_config = L1Config::from_env()?;
+        let l1_watcher_config = L1WatcherConfig::from_env()?;
+        let submitter_config = SubmitterConfig::from_env_read_only()?;
+        let deploy_block = registry_deploy_block_from_env()?;
 
         event!(
             name: "eez.follower.launching",
             Level::INFO,
             block_time.secs = BLOCK_TIME.as_secs(),
-            sequencer_rpc = %ext.sequencer_rpc,
-            l1_rpc = %l1_config.rpc_url,
-            "launching eez-follower with {{block_time.secs}}s block time, sequencer={{sequencer_rpc}}, l1={{l1_rpc}}",
+            sequencer_rpc = ext.sequencer_rpc.as_ref().map_or("<disabled>", url::Url::as_str),
+            l1_rpc = %l1_watcher_config.rpc_url,
+            "launching eez-follower",
         );
 
-        // Launch reth with all default Ethereum components: tx pool, network,
-        // payload builder, RPC, engine. Same `launch_node` (not the debug
-        // variant) as eez-node — avoids racing reth's own `LocalMiner` if
-        // `--dev` is set on the follower.
         let handle = builder.launch_node(EthereumNode::default()).await?;
 
+        let chain_spec = handle.node.chain_spec();
+        let provider = handle.node.provider.clone();
+        let payload_builder_handle = handle.node.payload_builder_handle.clone();
         let beacon_engine_handle = handle.node.add_ons_handle.beacon_engine_handle.clone();
         let task_executor = handle.node.task_executor.clone();
-        let l2_provider = Arc::new(handle.node.provider.clone());
 
-        let l1_view = Arc::new(L1View::default());
-        let l1_watcher =
-            L1Watcher::new(l1_config, l1_view.clone(), l2_provider.clone()).await?;
-        task_executor.spawn_critical_task("eez-follower-l1", async move {
-            l1_watcher.run().await;
-        });
-
-        let sequencer_rpc: RootProvider = RootProvider::new_http(ext.sequencer_rpc.clone());
-        let scheduler = Scheduler::interval(BLOCK_TIME);
-        let follower = Follower::new(
+        let best = provider.best_block_number()?;
+        let initial_header = provider
+            .sealed_header(best)?
+            .ok_or_else(|| eyre::eyre!("local L2 header at block {best} missing"))?;
+        let block_committer = BlockCommitterHandle::<EthEngineTypes>::spawn(
+            initial_header,
             beacon_engine_handle,
-            sequencer_rpc,
-            scheduler,
-            l2_provider,
-            l1_view,
-        )?;
-
-        event!(
-            name: "eez.follower.spawned",
-            Level::INFO,
-            "spawning eez follower",
+            payload_builder_handle,
         );
 
-        task_executor.spawn_critical_task("eez-follower", async move {
-            follower.run().await;
+        let l1_head = Arc::new(L1CanonicalHead::default());
+        let submitter = Submitter::new(submitter_config);
+        let l1_watcher = L1Watcher::spawn(l1_watcher_config);
+        let deriver = Deriver::new_l1_safe(
+            l1_watcher,
+            block_committer.clone(),
+            Arc::new(provider.clone()),
+            submitter,
+            chain_spec,
+            deploy_block,
+            Arc::clone(&l1_head),
+        );
+
+        if let Err(err) = deriver.catch_up().await {
+            event!(
+                name: "eez.follower.deriver.boot_catch_up.failed",
+                Level::WARN,
+                error = %err,
+                "boot-time safe-gated catch_up failed; deriver.run() will retry post-subscribe",
+            );
+        }
+
+        let deriver_run = deriver.clone();
+        task_executor.spawn_critical_task("eez-follower-deriver", async move {
+            deriver_run.run().await;
         });
+
+        if let Some(sequencer_rpc) = ext.sequencer_rpc {
+            let sequencer_rpc = RootProvider::new_http(sequencer_rpc);
+            let scheduler = Scheduler::interval(BLOCK_TIME);
+            let follower = Follower::new(
+                block_committer,
+                sequencer_rpc,
+                scheduler,
+                Arc::new(provider.clone()),
+            );
+            event!(
+                name: "eez.follower.sequencer_rpc.spawned",
+                Level::INFO,
+                "spawning sequencer-RPC unsafe-head follower",
+            );
+            task_executor.spawn_critical_task("eez-follower-unsafe-head", async move {
+                follower.run().await;
+            });
+        } else {
+            event!(
+                name: "eez.follower.l1_derived_only",
+                Level::INFO,
+                "EEZ_SEQUENCER_RPC not set; running L1-derived-only follower",
+            );
+        }
 
         handle.wait_for_node_exit().await
     })

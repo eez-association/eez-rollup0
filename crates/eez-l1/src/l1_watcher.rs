@@ -1,4 +1,4 @@
-//! Polls L1 for new heads, `BatchPosted` events, and finalized-head
+//! Polls L1 for new heads, `BatchPosted` events, and safe/finalized-head
 //! advances. Emits [`L1Event`]s on a [`broadcast::Sender`] for the
 //! Deriver and Composer to consume.
 //!
@@ -37,6 +37,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// the result changed. 6 ticks × 2s = 12s — matches L1 mainnet block
 /// time, fine-grained enough that consumers see finality move promptly.
 const FINALIZED_REFRESH_TICKS: u64 = 6;
+
+/// Same cadence as finalized for now. Safe can move more often on some
+/// chains, but the follower only needs a steady L1-safe checkpoint feed.
+const SAFE_REFRESH_TICKS: u64 = FINALIZED_REFRESH_TICKS;
 
 /// Broadcast channel capacity for [`L1Event`]s. 256 events ≈ several
 /// minutes of L1 activity — plenty for any subscriber that processes
@@ -90,6 +94,8 @@ pub enum L1Event {
         /// result at `to_block` to catch claimed-vs-derived divergence.
         claimed_new_state: Option<B256>,
     },
+    /// L1 safe head advanced.
+    Safe { block_number: u64, block_hash: B256 },
     /// L1 finalized head advanced.
     Finalized { block_number: u64, block_hash: B256 },
 }
@@ -321,7 +327,11 @@ impl L1Watcher {
             }
         }
 
-        if tick_count % FINALIZED_REFRESH_TICKS == 0 {
+        if state.last_safe_hash.is_none() || tick_count % SAFE_REFRESH_TICKS == 0 {
+            self.refresh_safe(provider, state).await?;
+        }
+
+        if state.last_finalized_hash.is_none() || tick_count % FINALIZED_REFRESH_TICKS == 0 {
             self.refresh_finalized(provider, state).await?;
         }
 
@@ -471,6 +481,23 @@ impl L1Watcher {
         Ok(())
     }
 
+    async fn refresh_safe(
+        &self,
+        provider: &impl Provider,
+        state: &mut WatcherState,
+    ) -> L1Result<()> {
+        let safe = fetch_block_by_tag(provider, BlockNumberOrTag::Safe).await?;
+        if state.last_safe_hash == Some(safe.hash) {
+            return Ok(());
+        }
+        state.last_safe_hash = Some(safe.hash);
+        self.emit(L1Event::Safe {
+            block_number: safe.number,
+            block_hash: safe.hash,
+        });
+        Ok(())
+    }
+
     fn emit(&self, event: L1Event) {
         // `send` returns Err if there are no active subscribers, which
         // is fine — events were never observed and that's OK.
@@ -487,6 +514,7 @@ struct WatcherState {
     /// ancestor without an additional RPC.
     recent: VecDeque<(u64, B256)>,
     reorg_max_depth: usize,
+    last_safe_hash: Option<B256>,
     last_finalized_hash: Option<B256>,
 }
 
@@ -495,6 +523,7 @@ impl WatcherState {
         Self {
             recent: VecDeque::with_capacity(reorg_max_depth),
             reorg_max_depth,
+            last_safe_hash: None,
             last_finalized_hash: None,
         }
     }

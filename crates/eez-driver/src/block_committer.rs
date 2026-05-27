@@ -10,6 +10,7 @@
 //! - `Sequence` — Sequencer's per-tick FCU+attrs → resolve payload → newPayload.
 //! - `RefreshForkchoice` — bare FCU to keep reth's view alive during quiet periods.
 //! - `AdvanceSafeFinalized` — Deriver pushes safe/finalized cursors forward.
+//! - `AdvanceHead` — follower points unsafe head at a sequencer-served block.
 //! - `Derive` — Deriver submits a pre-built `ExecutionPayload` via newPayload + head-FCU.
 //!
 //! Until the Deriver speaks, `safe` and `finalized` stay at the boot-time head.
@@ -18,8 +19,8 @@ use core::fmt;
 use std::sync::{Arc, RwLock};
 
 use alloy_primitives::B256;
-use alloy_rpc_types_engine::ForkchoiceState;
-use reth_engine_primitives::ConsensusEngineHandle;
+use alloy_rpc_types_engine::{ForkchoiceState, ForkchoiceUpdateError, ForkchoiceUpdated};
+use reth_engine_primitives::{BeaconForkChoiceUpdateError, ConsensusEngineHandle};
 use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{BuiltPayload, ExecutionPayload, PayloadKind, PayloadTypes};
@@ -48,6 +49,16 @@ impl<T: PayloadTypes> fmt::Debug for CommitOutcome<T> {
     }
 }
 
+/// Non-invalid forkchoice result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkchoiceOutcome {
+    /// Reth accepted the forkchoice as canonical.
+    Valid,
+    /// Reth accepted the target as a sync target and still needs to
+    /// backfill/import blocks.
+    Syncing,
+}
+
 enum CommitCommand<T: PayloadTypes> {
     Sequence {
         attrs: EthPayloadAttributes,
@@ -60,6 +71,15 @@ enum CommitCommand<T: PayloadTypes> {
         safe: B256,
         finalized: B256,
         response: oneshot::Sender<DriverResult<()>>,
+    },
+    AdvanceHead {
+        header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+        response: oneshot::Sender<DriverResult<ForkchoiceOutcome>>,
+    },
+    RecoverHeadToSafe {
+        safe_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+        finalized: Option<B256>,
+        response: oneshot::Sender<DriverResult<ForkchoiceOutcome>>,
     },
     Derive {
         payload: <T as PayloadTypes>::ExecutionData,
@@ -85,6 +105,7 @@ pub struct DeriveOutcome {
 pub struct BlockCommitterHandle<T: PayloadTypes> {
     sender: mpsc::Sender<CommitCommand<T>>,
     last_header: Arc<RwLock<SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>>>,
+    safe_hash: Arc<RwLock<B256>>,
 }
 
 impl<T: PayloadTypes> Clone for BlockCommitterHandle<T> {
@@ -92,6 +113,7 @@ impl<T: PayloadTypes> Clone for BlockCommitterHandle<T> {
         Self {
             sender: self.sender.clone(),
             last_header: Arc::clone(&self.last_header),
+            safe_hash: Arc::clone(&self.safe_hash),
         }
     }
 }
@@ -121,11 +143,13 @@ where
         let (sender, receiver) = mpsc::channel(COMMAND_BUFFER);
         let initial_hash = initial_header.hash();
         let last_header = Arc::new(RwLock::new(initial_header));
+        let safe_hash_mirror = Arc::new(RwLock::new(initial_hash));
         let actor = Actor {
             receiver,
             to_engine,
             payload_builder,
             last_header: Arc::clone(&last_header),
+            safe_hash_mirror: Arc::clone(&safe_hash_mirror),
             safe_hash: initial_hash,
             finalized_hash: initial_hash,
         };
@@ -133,6 +157,7 @@ where
         Self {
             sender,
             last_header,
+            safe_hash: safe_hash_mirror,
         }
     }
 
@@ -148,6 +173,16 @@ where
         SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>: Clone,
     {
         self.last_header.read().unwrap().clone()
+    }
+
+    /// Current safe hash mirror.
+    ///
+    /// # Panics
+    ///
+    /// If the mirror's `RwLock` is poisoned.
+    #[must_use]
+    pub fn safe_hash(&self) -> B256 {
+        self.safe_hash.read().unwrap().to_owned()
     }
 
     /// Builds a payload with the given attributes, commits it via
@@ -220,6 +255,61 @@ where
             .map_err(|_| DriverError::committer_closed())?
     }
 
+    /// Advances the unsafe head mirror through a bare FCU. Safe and
+    /// finalized stay exactly where the committer last accepted them.
+    ///
+    /// This is used by follower nodes whose unsafe head comes from a
+    /// sequencer RPC. A `SYNCING` response is returned as a successful
+    /// [`ForkchoiceOutcome::Syncing`]; the engine has accepted the target
+    /// and will backfill it through normal sync.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_forkchoice`, transport failures, or `committer_closed`.
+    pub async fn advance_unsafe_head(
+        &self,
+        header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+    ) -> DriverResult<ForkchoiceOutcome> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(CommitCommand::AdvanceHead {
+                header,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| DriverError::committer_closed())?;
+        response_rx
+            .await
+            .map_err(|_| DriverError::committer_closed())?
+    }
+
+    /// Repoints forkchoice to `head = safe = safe_header.hash()`, keeping
+    /// finalized at the supplied hash, or at the last accepted finalized
+    /// cursor when `finalized` is `None`.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_forkchoice_state`, `invalid_forkchoice_payload`, transport
+    /// failures, or `committer_closed`.
+    pub async fn recover_head_to_safe(
+        &self,
+        safe_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+        finalized: Option<B256>,
+    ) -> DriverResult<ForkchoiceOutcome> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(CommitCommand::RecoverHeadToSafe {
+                safe_header,
+                finalized,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| DriverError::committer_closed())?;
+        response_rx
+            .await
+            .map_err(|_| DriverError::committer_closed())?
+    }
+
     /// Commit a Deriver-built [`ExecutionData`] via `newPayloadV3` +
     /// head-FCU. `safe` / `finalized` are unchanged; move them via
     /// [`Self::advance_safe_finalized`].
@@ -256,6 +346,7 @@ struct Actor<T: PayloadTypes> {
     /// Shared with the `BlockCommitterHandle`. The actor is the sole writer;
     /// Updated synchronously inside `process_sequence` and `process_derive`
     last_header: Arc<RwLock<SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>>>,
+    safe_hash_mirror: Arc<RwLock<B256>>,
     safe_hash: B256,
     finalized_hash: B256,
 }
@@ -285,6 +376,20 @@ where
                     let result = self.process_advance_safe_finalized(safe, finalized).await;
                     let _ = response.send(result);
                 }
+                CommitCommand::AdvanceHead { header, response } => {
+                    let result = self.process_advance_head(header).await;
+                    let _ = response.send(result);
+                }
+                CommitCommand::RecoverHeadToSafe {
+                    safe_header,
+                    finalized,
+                    response,
+                } => {
+                    let result = self
+                        .process_recover_head_to_safe(safe_header, finalized)
+                        .await;
+                    let _ = response.send(result);
+                }
                 CommitCommand::Derive {
                     payload,
                     header,
@@ -307,13 +412,8 @@ where
 
     async fn process_refresh_forkchoice(&self) -> DriverResult<()> {
         let state = self.forkchoice_state();
-        let res = self
-            .to_engine
-            .fork_choice_updated(state, None)
-            .await
-            .map_err(DriverError::engine_rpc)?;
-        if !res.is_valid() {
-            return Err(DriverError::invalid_forkchoice(format!("{res:?}")));
+        match self.send_fcu(state).await? {
+            ForkchoiceOutcome::Valid | ForkchoiceOutcome::Syncing => {}
         }
         Ok(())
     }
@@ -323,18 +423,48 @@ where
         safe: B256,
         finalized: B256,
     ) -> DriverResult<()> {
+        let mut state = self.forkchoice_state();
+        state.safe_block_hash = safe;
+        state.finalized_block_hash = finalized;
+        let outcome = self.send_fcu(state).await?;
+        ensure_valid_outcome(outcome)?;
         self.safe_hash = safe;
         self.finalized_hash = finalized;
-        let state = self.forkchoice_state();
-        let res = self
-            .to_engine
-            .fork_choice_updated(state, None)
-            .await
-            .map_err(DriverError::engine_rpc)?;
-        if !res.is_valid() {
-            return Err(DriverError::invalid_forkchoice(format!("{res:?}")));
-        }
+        *self.safe_hash_mirror.write().unwrap() = safe;
         Ok(())
+    }
+
+    async fn process_advance_head(
+        &mut self,
+        header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+    ) -> DriverResult<ForkchoiceOutcome> {
+        let mut state = self.forkchoice_state();
+        state.head_block_hash = header.hash();
+        let outcome = self.send_fcu(state).await?;
+        *self.last_header.write().unwrap() = header;
+        Ok(outcome)
+    }
+
+    async fn process_recover_head_to_safe(
+        &mut self,
+        safe_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+        finalized: Option<B256>,
+    ) -> DriverResult<ForkchoiceOutcome> {
+        let safe_hash = safe_header.hash();
+        let finalized_hash = finalized.unwrap_or(self.finalized_hash);
+        let state = ForkchoiceState {
+            head_block_hash: safe_hash,
+            safe_block_hash: safe_hash,
+            finalized_block_hash: finalized_hash,
+        };
+        let outcome = self.send_fcu(state).await?;
+        if outcome == ForkchoiceOutcome::Valid {
+            *self.last_header.write().unwrap() = safe_header;
+            self.safe_hash = safe_hash;
+            self.finalized_hash = finalized_hash;
+            *self.safe_hash_mirror.write().unwrap() = safe_hash;
+        }
+        Ok(outcome)
     }
 
     async fn process_derive(
@@ -359,14 +489,7 @@ where
         // thing that moves them.
         let mut state = self.forkchoice_state();
         state.head_block_hash = block_hash;
-        let fcu = self
-            .to_engine
-            .fork_choice_updated(state, None)
-            .await
-            .map_err(DriverError::engine_rpc)?;
-        if !fcu.is_valid() {
-            return Err(DriverError::invalid_forkchoice(format!("{fcu:?}")));
-        }
+        ensure_valid_outcome(self.send_fcu(state).await?)?;
         // Mirror the new head into the shared `RwLock`.
         *self.last_header.write().unwrap() = header;
 
@@ -384,10 +507,8 @@ where
             .to_engine
             .fork_choice_updated(self.forkchoice_state(), Some(attrs))
             .await
-            .map_err(DriverError::engine_rpc)?;
-        if !fcu.is_valid() {
-            return Err(DriverError::invalid_forkchoice(format!("{fcu:?}")));
-        }
+            .map_err(classify_fcu_error)?;
+        ensure_valid_outcome(classify_fcu_response(&fcu)?)?;
         let payload_id = fcu.payload_id.ok_or_else(DriverError::payload_missing)?;
 
         let payload = self
@@ -411,5 +532,53 @@ where
 
         *self.last_header.write().unwrap() = header.clone();
         Ok(CommitOutcome { header })
+    }
+
+    async fn send_fcu(&self, state: ForkchoiceState) -> DriverResult<ForkchoiceOutcome> {
+        let res = self
+            .to_engine
+            .fork_choice_updated(state, None)
+            .await
+            .map_err(classify_fcu_error)?;
+        classify_fcu_response(&res)
+    }
+}
+
+fn classify_fcu_response(res: &ForkchoiceUpdated) -> DriverResult<ForkchoiceOutcome> {
+    if res.is_valid() {
+        Ok(ForkchoiceOutcome::Valid)
+    } else if res.is_syncing() {
+        Ok(ForkchoiceOutcome::Syncing)
+    } else {
+        Err(DriverError::invalid_forkchoice_payload(format!("{res:?}")))
+    }
+}
+
+fn classify_fcu_error(err: BeaconForkChoiceUpdateError) -> DriverError {
+    match err {
+        BeaconForkChoiceUpdateError::ForkchoiceUpdateError(ForkchoiceUpdateError::InvalidState) => {
+            DriverError::invalid_forkchoice_state(ForkchoiceUpdateError::InvalidState.to_string())
+        }
+        BeaconForkChoiceUpdateError::ForkchoiceUpdateError(
+            ForkchoiceUpdateError::UnknownFinalBlock,
+        ) => DriverError::unknown_final_block(ForkchoiceUpdateError::UnknownFinalBlock.to_string()),
+        BeaconForkChoiceUpdateError::ForkchoiceUpdateError(
+            ForkchoiceUpdateError::UpdatedInvalidPayloadAttributes,
+        ) => DriverError::invalid_payload_attributes(
+            ForkchoiceUpdateError::UpdatedInvalidPayloadAttributes.to_string(),
+        ),
+        BeaconForkChoiceUpdateError::EngineUnavailable => {
+            DriverError::engine_rpc(BeaconForkChoiceUpdateError::EngineUnavailable)
+        }
+        BeaconForkChoiceUpdateError::Internal(err) => DriverError::engine_rpc(err),
+    }
+}
+
+fn ensure_valid_outcome(outcome: ForkchoiceOutcome) -> DriverResult<()> {
+    match outcome {
+        ForkchoiceOutcome::Valid => Ok(()),
+        ForkchoiceOutcome::Syncing => Err(DriverError::invalid_forkchoice(
+            "expected VALID forkchoice update, got SYNCING",
+        )),
     }
 }
