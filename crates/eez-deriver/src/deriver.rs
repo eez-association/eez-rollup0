@@ -22,7 +22,7 @@ use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes, execute::BlockBuilder};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_payload_primitives::PayloadTypes;
-use reth_primitives_traits::{AlloyBlockHeader, SealedHeader, SignedTransaction};
+use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody, SealedHeader, SignedTransaction};
 use reth_provider::StateProviderFactory;
 use reth_revm::database::StateProviderDatabase;
 use reth_storage_api::{BlockReader, HeaderProvider, TransactionsProvider};
@@ -68,7 +68,7 @@ where
     safe_l2_block: AtomicU64,
 }
 
-struct DerivedBlock {
+struct ReconciledBlock {
     header: SealedHeader<alloy_consensus::Header>,
     already_canonical: bool,
 }
@@ -205,8 +205,8 @@ where
                 let block_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
                 tx_offset += count_usize;
 
-                let derived = self.derive_or_commit_block(l2_block - 1, block_txs).await?;
-                let matched = derived.already_canonical;
+                let reconciled = self.reconcile_l1_block(l2_block, block_txs).await?;
+                let matched = reconciled.already_canonical;
                 event!(
                     name: "eez.deriver.catch_up.block",
                     Level::DEBUG,
@@ -217,7 +217,7 @@ where
                     tx_count = block_txs.len(),
                     "catch_up_to: reconciling batch block",
                 );
-                batch_end_header = Some(derived.header);
+                batch_end_header = Some(reconciled.header);
                 if !matched {
                     last_replayed = Some(l2_block);
                 }
@@ -228,15 +228,16 @@ where
                     batch.tx_hash
                 ))
             })?;
+            let batch_end_ref = L2BlockRef {
+                number: batch_last_l2,
+                hash: batch_end_header.hash(),
+            };
             if !known_tx_hashes.contains(&batch.tx_hash) {
                 new_batches.push(BatchRecord {
                     l1_block: batch.l1_block_number,
                     l1_block_hash: batch.l1_block_hash,
                     tx_hash: batch.tx_hash,
-                    last_l2: L2BlockRef {
-                        number: batch_last_l2,
-                        hash: batch_end_header.hash(),
-                    },
+                    last_l2: batch_end_ref,
                 });
             }
             // Same divergence check as on_batch_posted — once the block
@@ -468,26 +469,27 @@ where
         Ok(self.inner.committer.commit_derived(payload, header).await?)
     }
 
-    async fn derive_or_commit_block(
+    async fn reconcile_l1_block(
         &self,
-        parent_block_number: u64,
+        l2_block: u64,
         raw_txs: &[Vec<u8>],
-    ) -> DeriverResult<DerivedBlock> {
-        let l2_block = parent_block_number + 1;
-        let (payload, header) = self.execute_block(parent_block_number, raw_txs)?;
-        let derived_hash = header.hash();
-        if self.local_hash_matches(l2_block, derived_hash)? {
-            return Ok(DerivedBlock {
+    ) -> DeriverResult<ReconciledBlock> {
+        if let Some(header) = self.local_block_matches(l2_block, raw_txs)? {
+            return Ok(ReconciledBlock {
                 header,
                 already_canonical: true,
             });
         }
 
+        let parent_block_number = l2_block.checked_sub(1).ok_or_else(|| {
+            DeriverError::l2_provider("cannot reconcile L2 genesis as a derived block")
+        })?;
+        let (payload, header) = self.execute_block(parent_block_number, raw_txs)?;
         self.inner
             .committer
             .commit_derived(payload, header.clone())
             .await?;
-        Ok(DerivedBlock {
+        Ok(ReconciledBlock {
             header,
             already_canonical: false,
         })
@@ -562,13 +564,53 @@ where
         }
     }
 
-    fn local_hash_matches(&self, l2_block: u64, expected_hash: B256) -> DeriverResult<bool> {
-        Ok(self
+    /// Returns the local canonical header iff the local block's ordered
+    /// tx list matches the L1-posted tx list. This is a staged
+    /// equivalence check: it preserves PR #5's cheap happy path while
+    /// still letting the follower store hash-bearing L1 checkpoints.
+    fn local_block_matches(
+        &self,
+        l2_block: u64,
+        expected_txs: &[Vec<u8>],
+    ) -> DeriverResult<Option<SealedHeader<alloy_consensus::Header>>> {
+        let Some(local_block) = self
             .inner
             .l2_provider
-            .sealed_header(l2_block)
+            .block_by_number(l2_block)
             .map_err(DeriverError::l2_provider)?
-            .is_some_and(|header| header.hash() == expected_hash))
+        else {
+            return Ok(None);
+        };
+
+        let local_txs: Vec<Vec<u8>> = local_block
+            .body()
+            .transactions()
+            .iter()
+            .map(Encodable2718::encoded_2718)
+            .collect();
+        if local_txs.len() != expected_txs.len() {
+            return Ok(None);
+        }
+
+        if local_txs
+            .iter()
+            .zip(expected_txs.iter())
+            .all(|(l, e)| l == e)
+        {
+            let header = self
+                .inner
+                .l2_provider
+                .sealed_header(l2_block)
+                .map_err(DeriverError::l2_provider)?
+                .ok_or_else(|| {
+                    DeriverError::l2_provider(format!(
+                        "local L2 header at matched block {l2_block} missing"
+                    ))
+                })?;
+            Ok(Some(header))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Runs the deriver loop. Subscribes to the `L1Watcher`'s event
@@ -751,8 +793,8 @@ where
             let count_usize = usize::from(*count);
             let block_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
             tx_offset += count_usize;
-            let derived = self.derive_or_commit_block(l2_block - 1, block_txs).await?;
-            let matched = derived.already_canonical;
+            let reconciled = self.reconcile_l1_block(l2_block, block_txs).await?;
+            let matched = reconciled.already_canonical;
             event!(
                 name: "eez.deriver.reconcile.block",
                 Level::DEBUG,
@@ -764,7 +806,7 @@ where
                 replayed_so_far = replayed_count,
                 "reconciling batch block",
             );
-            batch_end_header = Some(derived.header);
+            batch_end_header = Some(reconciled.header);
             // If replay fails, the error propagates out. Subsequent logs
             // (`execute_block.parent_missing`, `execute_block.no_state`,
             // etc.) show why; the `replayed_so_far` value above is what
