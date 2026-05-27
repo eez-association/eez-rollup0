@@ -669,7 +669,7 @@ where
                 })
                 .await
             }
-            L1Event::NewHead { .. } | L1Event::Safe { .. } => Ok(()),
+            L1Event::NewHead { .. } => Ok(()),
             L1Event::Reorg {
                 common_ancestor_number,
                 old_head_hash,
