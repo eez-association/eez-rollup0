@@ -474,7 +474,7 @@ where
         l2_block: u64,
         raw_txs: &[Vec<u8>],
     ) -> DeriverResult<ReconciledBlock> {
-        if let Some(header) = self.local_block_matches(l2_block, raw_txs)? {
+        if let Some(header) = local_block_matches(&self.inner.l2_provider, l2_block, raw_txs)? {
             return Ok(ReconciledBlock {
                 header,
                 already_canonical: true,
@@ -561,55 +561,6 @@ where
                 }
             }
             Err(err) => Err(err.into()),
-        }
-    }
-
-    /// Returns the local canonical header iff the local block's ordered
-    /// tx list matches the L1-posted tx list. This is a staged
-    /// equivalence check: it preserves PR #5's cheap happy path while
-    /// still letting the follower store hash-bearing L1 checkpoints.
-    fn local_block_matches(
-        &self,
-        l2_block: u64,
-        expected_txs: &[Vec<u8>],
-    ) -> DeriverResult<Option<SealedHeader<alloy_consensus::Header>>> {
-        let Some(local_block) = self
-            .inner
-            .l2_provider
-            .block_by_number(l2_block)
-            .map_err(DeriverError::l2_provider)?
-        else {
-            return Ok(None);
-        };
-
-        let local_txs: Vec<Vec<u8>> = local_block
-            .body()
-            .transactions()
-            .iter()
-            .map(Encodable2718::encoded_2718)
-            .collect();
-        if local_txs.len() != expected_txs.len() {
-            return Ok(None);
-        }
-
-        if local_txs
-            .iter()
-            .zip(expected_txs.iter())
-            .all(|(l, e)| l == e)
-        {
-            let header = self
-                .inner
-                .l2_provider
-                .sealed_header(l2_block)
-                .map_err(DeriverError::l2_provider)?
-                .ok_or_else(|| {
-                    DeriverError::l2_provider(format!(
-                        "local L2 header at matched block {l2_block} missing"
-                    ))
-                })?;
-            Ok(Some(header))
-        } else {
-            Ok(None)
         }
     }
 
@@ -1055,5 +1006,54 @@ where
             return Ok(finalized.hash);
         }
         self.l2_hash_at(l2_block)
+    }
+}
+
+/// Returns the local canonical header iff the local block's ordered
+/// tx list matches the L1-posted tx list. This is a staged
+/// equivalence check: it preserves PR #5's cheap happy path while
+/// still letting the follower store hash-bearing L1 checkpoints.
+fn local_block_matches<L2>(
+    l2_provider: &Arc<L2>,
+    l2_block: u64,
+    expected_txs: &[Vec<u8>],
+) -> DeriverResult<Option<SealedHeader<alloy_consensus::Header>>>
+where
+    L2: BlockReader<Header = alloy_consensus::Header>,
+    <L2 as TransactionsProvider>::Transaction: Encodable2718,
+{
+    let Some(local_block) = l2_provider
+        .block_by_number(l2_block)
+        .map_err(DeriverError::l2_provider)?
+    else {
+        return Ok(None);
+    };
+
+    let local_txs: Vec<Vec<u8>> = local_block
+        .body()
+        .transactions()
+        .iter()
+        .map(Encodable2718::encoded_2718)
+        .collect();
+    if local_txs.len() != expected_txs.len() {
+        return Ok(None);
+    }
+
+    if local_txs
+        .iter()
+        .zip(expected_txs.iter())
+        .all(|(l, e)| l == e)
+    {
+        let header = l2_provider
+            .sealed_header(l2_block)
+            .map_err(DeriverError::l2_provider)?
+            .ok_or_else(|| {
+                DeriverError::l2_provider(format!(
+                    "local L2 header at matched block {l2_block} missing"
+                ))
+            })?;
+        Ok(Some(header))
+    } else {
+        Ok(None)
     }
 }
