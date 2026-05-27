@@ -79,6 +79,7 @@ enum CommitCommand<T: PayloadTypes> {
     RecoverHeadToSafe {
         safe_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
         finalized: Option<B256>,
+        require_current_safe: bool,
         response: oneshot::Sender<DriverResult<ForkchoiceOutcome>>,
     },
     Derive {
@@ -296,11 +297,39 @@ where
         safe_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
         finalized: Option<B256>,
     ) -> DriverResult<ForkchoiceOutcome> {
+        self.send_recover_head_to_safe(safe_header, finalized, false)
+            .await
+    }
+
+    /// Repoints forkchoice to the current accepted safe hash. The supplied
+    /// header must still match the actor's safe hash when the command is
+    /// dequeued; stale follower snapshots are rejected so recovery cannot
+    /// regress safe after a newer safe advance wins the actor queue first.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_forkchoice_state`, `invalid_forkchoice_payload`, stale safe
+    /// snapshots, transport failures, or `committer_closed`.
+    pub async fn recover_head_to_current_safe(
+        &self,
+        safe_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+    ) -> DriverResult<ForkchoiceOutcome> {
+        self.send_recover_head_to_safe(safe_header, None, true)
+            .await
+    }
+
+    async fn send_recover_head_to_safe(
+        &self,
+        safe_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+        finalized: Option<B256>,
+        require_current_safe: bool,
+    ) -> DriverResult<ForkchoiceOutcome> {
         let (response_tx, response_rx) = oneshot::channel();
         self.sender
             .send(CommitCommand::RecoverHeadToSafe {
                 safe_header,
                 finalized,
+                require_current_safe,
                 response: response_tx,
             })
             .await
@@ -383,10 +412,11 @@ where
                 CommitCommand::RecoverHeadToSafe {
                     safe_header,
                     finalized,
+                    require_current_safe,
                     response,
                 } => {
                     let result = self
-                        .process_recover_head_to_safe(safe_header, finalized)
+                        .process_recover_head_to_safe(safe_header, finalized, require_current_safe)
                         .await;
                     let _ = response.send(result);
                 }
@@ -449,8 +479,16 @@ where
         &mut self,
         safe_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
         finalized: Option<B256>,
+        require_current_safe: bool,
     ) -> DriverResult<ForkchoiceOutcome> {
         let safe_hash = safe_header.hash();
+        if require_current_safe && safe_hash != self.safe_hash {
+            return Err(DriverError::invalid_forkchoice(format!(
+                "stale safe recovery snapshot {safe_hash}; current safe is {}",
+                self.safe_hash
+            )));
+        }
+
         let finalized_hash = finalized.unwrap_or(self.finalized_hash);
         let state = ForkchoiceState {
             head_block_hash: safe_hash,

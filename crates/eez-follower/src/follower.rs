@@ -163,7 +163,11 @@ where
                 FollowerError::Driver(format!("safe header {safe_hash} missing locally"))
             })?;
 
-        match self.committer.recover_head_to_safe(safe_header, None).await {
+        match self
+            .committer
+            .recover_head_to_current_safe(safe_header)
+            .await
+        {
             Ok(ForkchoiceOutcome::Valid) => {
                 self.last_head = Some(safe_hash);
                 event!(
