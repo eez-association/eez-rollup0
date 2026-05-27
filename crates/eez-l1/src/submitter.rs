@@ -22,7 +22,7 @@ use crate::config::SubmitterConfig;
 use crate::error::{L1Error, L1Result};
 
 /// Upper bound on how long we wait for a postBatch tx to confirm.
-/// later we switch to bundler-routed submission (see plan doc §5.4.2)
+/// later we switch to bundler-routed submission.
 const RECEIPT_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Buffer to absorb some variance (for contentious txs)
@@ -130,28 +130,6 @@ impl Submitter {
         })?;
 
         Ok(SendOutcome { tx_hash, l1_block })
-    }
-
-    /// Walk every past `BatchPosted` event from `deploy_block` to L1
-    /// head, decode each tx's callData via [`eez_payload_codec::decode`],
-    /// and return the total L2 block count the contract has accepted.
-    /// Returns 0 when no batch has landed yet.
-    ///
-    /// Called once at composer startup; not on the per-tick hot path.
-    ///
-    /// # Errors
-    ///
-    /// - [`L1Error::Provider`] on RPC failure (log fetch, tx fetch,
-    ///   abi decode).
-    /// - [`L1Error::Codec`] if a past batch's payload is malformed.
-    pub async fn scan_on_chain_head(&self, deploy_block: u64) -> L1Result<u64> {
-        let batches = self.scan_batches(deploy_block).await?;
-        let mut head: u64 = 0;
-        for batch in &batches {
-            let decoded = eez_payload_codec::decode(batch.call_data.as_ref())?;
-            head += decoded.block_count() as u64;
-        }
-        Ok(head)
     }
 
     /// Walks every past `BatchPosted` event from `deploy_block` to L1

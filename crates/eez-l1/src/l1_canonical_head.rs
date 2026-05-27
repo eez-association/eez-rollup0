@@ -1,8 +1,7 @@
 //! Shared L1-confirmed L2 head: cursor + per-tx batch index + finalized.
 //! Deriver writes, Composer reads `cursor()` for next batch's
 //! `from_block`. Indexed per-L1-tx (not per-L1-block) so competing
-//! batches in the same L1 block don't shadow each other. See plan
-//! §10 W3.16 + W3.18.
+//! batches in the same L1 block don't shadow each other.
 
 use std::collections::HashSet;
 use std::sync::Mutex;

@@ -57,7 +57,6 @@ where
     /// Shared canonical-head state — cursor + per-batch index +
     /// `finalized_l2`. The Deriver is the sole writer; the Composer
     /// reads `cursor()` to compute the next batch's `from_block`.
-    /// W3.16 — replaces the previous duplicate cursor/batches state.
     l1_head: Arc<L1CanonicalHead>,
     /// L2 block number currently reth `safe` head points at. Mirrors
     /// what we last passed to [`BlockCommitterHandle::advance_safe_finalized`];
@@ -311,8 +310,8 @@ where
         parent_block_number: u64,
         raw_txs: &[Vec<u8>],
     ) -> DeriverResult<(ExecutionData, SealedHeader<alloy_consensus::Header>)> {
-        // W3.18 diagnostic: log parent context before touching reth so
-        // we can pinpoint failing `state_by_block_hash` lookups.
+        // Diagnostic: log parent context before touching reth so we can
+        // pinpoint failing `state_by_block_hash` lookups.
         let local_best = self
             .inner
             .l2_provider
@@ -363,11 +362,9 @@ where
             .l2_provider
             .state_by_block_hash(parent_hash)
             .map_err(|e| {
-                // W3.18 root-cause hunting: this is the specific error
-                // the user has been chasing — reth has the *header* for
-                // this block (sealed_header succeeded above) but is
-                // refusing to give us its state. Capture as much
-                // context as possible.
+                // reth has the *header* for this block (sealed_header
+                // succeeded above) but refuses to give us its state.
+                // Capture as much context as possible.
                 event!(
                     name: "eez.deriver.execute_block.no_state",
                     Level::ERROR,
@@ -624,11 +621,11 @@ where
         //   * local missing                  → replay (we were lagging)
         //   * local has different tx list    → replay; reth handles the L2
         //     reorg transparently via `newPayload + head-FCU` on the new
-        //     fork. This is W3.15 — the based-mode path where competing
-        //     composers produce locally-different blocks at the same
-        //     height and whoever lands first becomes canonical for both.
+        //     fork. This is the based-mode path where competing composers
+        //     produce locally-different blocks at the same height and
+        //     whoever lands first becomes canonical for both.
         //
-        // W3.18 diagnostic: the loop is NOT transactional today — partial
+        // Diagnostic: the loop is NOT transactional today — partial
         // replays before a mid-loop failure leave reth's canonical chain
         // in a half-state. Per-iteration logging shows exactly which
         // block we got to before a panic / error, so we know how much
@@ -774,13 +771,8 @@ where
             return Ok(());
         }
 
-        // Compute the new safe head's L2 hash.
-        let new_safe_hash = if new_cursor == 0 {
-            // Fall back to L2 genesis. The L2 provider should have it.
-            self.l2_hash_at(0)?
-        } else {
-            self.l2_hash_at(new_cursor)?
-        };
+        // Compute the new safe head's L2 hash. (even if <new_cursor> is 0)
+        let new_safe_hash = self.l2_hash_at(new_cursor)?;
 
         // Finalized was already bounded inside retreat_on_l1_reorg.
         let new_finalized = self.inner.l1_head.finalized_l2();
@@ -863,7 +855,7 @@ where
 /// tx list (in encoded-2718 form) matches the given expected bytes.
 /// Returns `false` if local is missing the block or has different
 /// content — caller's signal to STF-replay this slot and let reth
-/// reorg if needed (W3.15 fork-switch path).
+/// reorg if needed (fork-switch path).
 fn local_block_matches<L2>(
     l2_provider: &Arc<L2>,
     block_number: u64,
