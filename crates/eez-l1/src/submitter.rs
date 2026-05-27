@@ -147,66 +147,26 @@ impl Submitter {
     ///   malformed batch.
     pub async fn scan_batches(&self, deploy_block: u64) -> L1Result<Vec<HistoricalBatch>> {
         let provider = self.inner.build_provider();
-        let filter = Filter::new()
-            .address(self.inner.config.eez)
-            .event_signature(EezRegistry::BatchPosted::SIGNATURE_HASH)
-            .from_block(deploy_block)
-            .to_block(BlockNumberOrTag::Latest);
-        let logs = provider
-            .get_logs(&filter)
-            .await
-            .map_err(|e| L1Error::Provider(format!("get_logs(BatchPosted): {e}")))?;
-
-        // Winner filter: same logic as L1Watcher::scan_batch_posted —
-        // `L2ExecutionPerformed` only fires when the state delta
-        // actually applied. Losers emit `BatchPosted` only.
-        let winners_filter = Filter::new()
-            .address(self.inner.config.eez)
-            .event_signature(EezRegistry::L2ExecutionPerformed::SIGNATURE_HASH)
-            .topic1(alloy_primitives::U256::from(self.inner.config.rollup_id))
-            .from_block(deploy_block)
-            .to_block(BlockNumberOrTag::Latest);
-        let winner_logs = provider
-            .get_logs(&winners_filter)
-            .await
-            .map_err(|e| L1Error::Provider(format!("get_logs(L2ExecutionPerformed): {e}")))?;
-        let winner_tx_hashes: std::collections::HashSet<alloy_primitives::B256> = winner_logs
-            .iter()
-            .filter_map(|l| l.transaction_hash)
-            .collect();
-
-        let mut out: Vec<HistoricalBatch> = Vec::with_capacity(logs.len());
-        for log in &logs {
-            let l1_block_number = log
-                .block_number
-                .ok_or_else(|| L1Error::Provider("BatchPosted log missing block_number".into()))?;
-            let tx_hash = log
-                .transaction_hash
-                .ok_or_else(|| L1Error::Provider("BatchPosted log missing tx_hash".into()))?;
-            let tx = provider
-                .get_transaction_by_hash(tx_hash)
-                .await
-                .map_err(|e| L1Error::Provider(format!("get_tx({tx_hash}): {e}")))?
-                .ok_or_else(|| L1Error::Provider(format!("tx {tx_hash} not found")))?;
-            let submitter = tx.inner.signer();
-            let input = tx.inner.input();
-            let decoded = EezRegistry::postAndVerifyBatchCall::abi_decode(input)
-                .map_err(|e| L1Error::Provider(format!("decode postBatch({tx_hash}): {e}")))?;
-            let our_delta = our_state_delta(&decoded.batch, self.inner.config.rollup_id);
-            let claimed_current_state = our_delta.map(|d| d.currentState);
-            let claimed_new_state = our_delta.map(|d| d.newState);
-            let state_applied = winner_tx_hashes.contains(&tx_hash);
-            out.push(HistoricalBatch {
-                l1_block_number,
-                tx_hash,
-                submitter,
-                call_data: decoded.batch.callData,
-                state_applied,
-                claimed_current_state,
-                claimed_new_state,
-            });
-        }
-        Ok(out)
+        let scanned = scan_batch_logs(
+            &provider,
+            self.inner.config.eez,
+            self.inner.config.rollup_id,
+            deploy_block,
+            BlockNumberOrTag::Latest,
+        )
+        .await?;
+        Ok(scanned
+            .into_iter()
+            .map(|b| HistoricalBatch {
+                l1_block_number: b.l1_block_number,
+                tx_hash: b.tx_hash,
+                submitter: b.submitter,
+                call_data: b.call_data,
+                state_applied: b.state_applied,
+                claimed_current_state: b.claimed_current_state,
+                claimed_new_state: b.claimed_new_state,
+            })
+            .collect())
     }
 }
 
@@ -252,4 +212,103 @@ pub(crate) fn our_state_delta(
         .iter()
         .flat_map(|entry| entry.stateDeltas.iter())
         .find(|delta| delta.rollupId == rid)
+}
+
+/// One decoded `BatchPosted` log: winner flag plus the claimed state
+/// roots from our rollup's `StateDelta`. Produced by [`scan_batch_logs`];
+/// the Deriver's catch-up scan and the live
+/// [`L1Watcher`](crate::L1Watcher) poll each project it into their own
+/// type.
+pub(crate) struct ScannedBatch {
+    pub l1_block_number: u64,
+    pub l1_block_hash: alloy_primitives::B256,
+    pub tx_hash: alloy_primitives::B256,
+    pub submitter: alloy_primitives::Address,
+    pub rollup_count: alloy_primitives::U256,
+    pub call_data: alloy_primitives::Bytes,
+    pub state_applied: bool,
+    pub claimed_current_state: Option<alloy_primitives::B256>,
+    pub claimed_new_state: Option<alloy_primitives::B256>,
+}
+
+/// Fetch every `BatchPosted` log in `[from_block, to_block]` and cross-
+/// reference each against `L2ExecutionPerformed` for our rollup — present
+/// ⇔ this batch's state delta applied (winner; losers emit `BatchPosted`
+/// only). For each, decode the originating tx for the submitter, callData
+/// and our rollup's claimed state roots. Shared by
+/// [`Submitter::scan_batches`] (catch-up) and
+/// [`L1Watcher::scan_batch_posted`](crate::L1Watcher) (live poll).
+pub(crate) async fn scan_batch_logs(
+    provider: &impl Provider,
+    eez: alloy_primitives::Address,
+    rollup_id: u64,
+    from_block: u64,
+    to_block: BlockNumberOrTag,
+) -> L1Result<Vec<ScannedBatch>> {
+    let filter = Filter::new()
+        .address(eez)
+        .event_signature(EezRegistry::BatchPosted::SIGNATURE_HASH)
+        .from_block(from_block)
+        .to_block(to_block);
+    let logs = provider
+        .get_logs(&filter)
+        .await
+        .map_err(|e| L1Error::Provider(format!("get_logs(BatchPosted): {e}")))?;
+
+    let winners_filter = Filter::new()
+        .address(eez)
+        .event_signature(EezRegistry::L2ExecutionPerformed::SIGNATURE_HASH)
+        .topic1(alloy_primitives::U256::from(rollup_id))
+        .from_block(from_block)
+        .to_block(to_block);
+    let winner_logs = provider
+        .get_logs(&winners_filter)
+        .await
+        .map_err(|e| L1Error::Provider(format!("get_logs(L2ExecutionPerformed): {e}")))?;
+    let winner_tx_hashes: std::collections::HashSet<alloy_primitives::B256> = winner_logs
+        .iter()
+        .filter_map(|l| l.transaction_hash)
+        .collect();
+
+    let mut out: Vec<ScannedBatch> = Vec::with_capacity(logs.len());
+    for log in &logs {
+        let l1_block_number = log
+            .block_number
+            .ok_or_else(|| L1Error::Provider("BatchPosted log missing block_number".into()))?;
+        let l1_block_hash = log
+            .block_hash
+            .ok_or_else(|| L1Error::Provider("BatchPosted log missing block_hash".into()))?;
+        let tx_hash = log
+            .transaction_hash
+            .ok_or_else(|| L1Error::Provider("BatchPosted log missing tx_hash".into()))?;
+        let tx = provider
+            .get_transaction_by_hash(tx_hash)
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_tx({tx_hash}): {e}")))?
+            .ok_or_else(|| L1Error::Provider(format!("tx {tx_hash} not found")))?;
+        let submitter = tx.inner.signer();
+        let input = tx.inner.input();
+        let decoded = EezRegistry::postAndVerifyBatchCall::abi_decode(input)
+            .map_err(|e| L1Error::Provider(format!("decode postBatch({tx_hash}): {e}")))?;
+        let decoded_event = EezRegistry::BatchPosted::decode_log(&alloy_primitives::Log {
+            address: log.address(),
+            data: log.data().clone(),
+        })
+        .map_err(|e| L1Error::Provider(format!("decode BatchPosted({tx_hash}): {e}")))?;
+        let our_delta = our_state_delta(&decoded.batch, rollup_id);
+        let claimed_current_state = our_delta.map(|d| d.currentState);
+        let claimed_new_state = our_delta.map(|d| d.newState);
+        out.push(ScannedBatch {
+            l1_block_number,
+            l1_block_hash,
+            tx_hash,
+            submitter,
+            rollup_count: decoded_event.rollupCount,
+            call_data: decoded.batch.callData,
+            state_applied: winner_tx_hashes.contains(&tx_hash),
+            claimed_current_state,
+            claimed_new_state,
+        });
+    }
+    Ok(out)
 }

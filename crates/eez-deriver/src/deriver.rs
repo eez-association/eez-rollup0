@@ -163,7 +163,7 @@ where
         let known_tx_hashes = self.inner.l1_head.known_tx_hashes();
         let mut new_batches: Vec<BatchRecord> = Vec::new();
         let mut cumulative_l2: u64 = 0;
-        let mut last_replayed: Option<u64> = None;
+        let mut total_replayed: u64 = 0;
         for batch in &historical {
             let decoded = eez_payload_codec::decode(batch.call_data.as_ref())?;
 
@@ -183,37 +183,15 @@ where
             let batch_first_l2 = cumulative_l2 + 1;
             let batch_last_l2 = cumulative_l2 + decoded.block_count() as u64;
 
-            // Same per-block reconciliation as on_batch_posted:
-            // replay any block whose local content doesn't match the
-            // batch's. Lets startup catch-up handle the case where a
-            // prior local Sequencer produced blocks that L1 doesn't
-            // agree with (e.g., the previous proposing run lost a race
-            // and never reorged its local chain).
-            let mut tx_offset = 0usize;
-            for (i, count) in decoded.block_tx_counts.iter().enumerate() {
-                let l2_block = batch_first_l2 + i as u64;
-                let count_usize = usize::from(*count);
-                let block_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
-                tx_offset += count_usize;
+            total_replayed += self
+                .reconcile_batch_blocks(
+                    batch_first_l2,
+                    &decoded,
+                    batch.l1_block_number,
+                    batch.tx_hash,
+                )
+                .await?;
 
-                let matched = local_block_matches(&self.inner.l2_provider, l2_block, block_txs)?;
-                event!(
-                    name: "eez.deriver.catch_up.block",
-                    Level::DEBUG,
-                    l1_block_number = batch.l1_block_number,
-                    tx_hash = %batch.tx_hash,
-                    l2_block,
-                    action = if matched { "skip" } else { "replay" },
-                    tx_count = block_txs.len(),
-                    "catch_up_to: reconciling batch block",
-                );
-                if matched {
-                    continue;
-                }
-                let parent_block_number = l2_block - 1;
-                self.replay_block(parent_block_number, block_txs).await?;
-                last_replayed = Some(l2_block);
-            }
             if !known_tx_hashes.contains(&batch.tx_hash) {
                 new_batches.push(BatchRecord {
                     l1_block: batch.l1_block_number,
@@ -221,37 +199,15 @@ where
                     last_l2_block: batch_last_l2,
                 });
             }
-            // Same divergence check as on_batch_posted — once the block
-            // is locally present, compare its STF-produced state root
-            // to the batch's claimed `newState`. Catches drift early
-            // (during startup catch-up) instead of waiting for a live
-            // event later.
-            if let Some(claimed) = batch.claimed_new_state {
-                let local_root = self
-                    .inner
-                    .l2_provider
-                    .sealed_header(batch_last_l2)
-                    .map_err(DeriverError::l2_provider)?
-                    .ok_or_else(|| {
-                        DeriverError::l2_provider(format!(
-                            "local L2 header at {batch_last_l2} missing"
-                        ))
-                    })?
-                    .state_root();
-                if local_root != claimed {
-                    event!(
-                        name: "eez.deriver.state.diverged",
-                        Level::ERROR,
-                        l1_block_number = batch.l1_block_number,
-                        tx_hash = %batch.tx_hash,
-                        to_block = batch_last_l2,
-                        local_root = %local_root,
-                        claimed = %claimed,
-                        "during catch-up: local L2 state root differs from batch's claimed newState",
-                    );
-                    return Err(DeriverError::local_diverged(batch_last_l2));
-                }
-            }
+
+            // Catch claimed-vs-derived drift now, during startup, rather
+            // than waiting for a live event.
+            self.check_claimed_state(
+                batch.claimed_new_state,
+                batch_last_l2,
+                batch.l1_block_number,
+                batch.tx_hash,
+            )?;
             cumulative_l2 = batch_last_l2;
         }
 
@@ -278,12 +234,12 @@ where
                 .store(cumulative_l2, Ordering::Release);
         }
 
-        if let Some(last) = last_replayed {
+        if total_replayed > 0 {
             event!(
                 name: "eez.deriver.catch_up.done",
                 Level::INFO,
                 local_head,
-                replayed_through = last,
+                replayed = total_replayed,
                 cursor = cumulative_l2,
                 "catch-up replay complete",
             );
@@ -616,49 +572,12 @@ where
         let from_block = last_indexed_l2 + 1;
         let to_block = last_indexed_l2 + block_count;
 
-        // Per-block reconciliation. For each block in the batch:
-        //   * local matches (same tx list)   → skip (chain already canonical here)
-        //   * local missing                  → replay (we were lagging)
-        //   * local has different tx list    → replay; reth handles the L2
-        //     reorg transparently via `newPayload + head-FCU` on the new
-        //     fork. This is the based-mode path where competing composers
-        //     produce locally-different blocks at the same height and
-        //     whoever lands first becomes canonical for both.
-        //
-        // Diagnostic: the loop is NOT transactional today — partial
-        // replays before a mid-loop failure leave reth's canonical chain
-        // in a half-state. Per-iteration logging shows exactly which
-        // block we got to before a panic / error, so we know how much
-        // state mutation already happened on failure.
-        let mut tx_offset = 0usize;
-        let mut replayed_count: u64 = 0;
-        for (i, count) in decoded.block_tx_counts.iter().enumerate() {
-            let l2_block = from_block + i as u64;
-            let count_usize = usize::from(*count);
-            let block_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
-            tx_offset += count_usize;
-            let matched = local_block_matches(&self.inner.l2_provider, l2_block, block_txs)?;
-            event!(
-                name: "eez.deriver.reconcile.block",
-                Level::DEBUG,
-                l1_block_number,
-                tx_hash = %tx_hash,
-                l2_block,
-                action = if matched { "skip" } else { "replay" },
-                tx_count = block_txs.len(),
-                replayed_so_far = replayed_count,
-                "reconciling batch block",
-            );
-            if matched {
-                continue;
-            }
-            // If replay fails, the error propagates out. Subsequent logs
-            // (`execute_block.parent_missing`, `execute_block.no_state`,
-            // etc.) show why; the `replayed_so_far` value above is what
-            // we'd want to roll back if we made the loop transactional.
-            self.replay_block(l2_block - 1, block_txs).await?;
-            replayed_count += 1;
-        }
+        // Per-block reconciliation: skip blocks that already match the
+        // batch, STF-replay the rest (reth fork-switches as needed). See
+        // `reconcile_batch_blocks` for the open transactional caveat.
+        let replayed = self
+            .reconcile_batch_blocks(from_block, &decoded, l1_block_number, tx_hash)
+            .await?;
         event!(
             name: "eez.deriver.reconcile.done",
             Level::DEBUG,
@@ -666,48 +585,13 @@ where
             tx_hash = %tx_hash,
             from_block,
             to_block,
-            replayed = replayed_count,
+            replayed,
             "per-block reconciliation complete (pre-divergence check)",
         );
 
-        let new_safe_header = self
-            .inner
-            .l2_provider
-            .sealed_header(to_block)
-            .map_err(DeriverError::l2_provider)?
-            .ok_or_else(|| {
-                DeriverError::l2_provider(format!("local L2 header at {to_block} missing"))
-            })?;
+        self.check_claimed_state(claimed_new_state, to_block, l1_block_number, tx_hash)?;
 
-        // Divergence detection (mock-prover regime): the on-chain
-        // `StateDelta.newState` should equal our STF's state root at
-        // `to_block`. With a real zk prover this is enforced
-        // cryptographically; with the mock, a buggy / dishonest
-        // composer could claim a wrong root and L1 would accept it.
-        // Then our next post's `currentState` (local L2 state root at
-        // `posted_through`) will mismatch L1's stored root and we'll
-        // revert with `StateRootMismatch`. Better to halt this batch
-        // now so the operator sees the loud failure here, where the
-        // mismatch originated.
-        if let Some(claimed) = claimed_new_state {
-            let local_root = new_safe_header.state_root();
-            if local_root != claimed {
-                event!(
-                    name: "eez.deriver.state.diverged",
-                    Level::ERROR,
-                    l1_block_number,
-                    tx_hash = %tx_hash,
-                    submitter = %submitter,
-                    to_block,
-                    local_root = %local_root,
-                    claimed = %claimed,
-                    "local L2 state root differs from the batch's claimed newState; refusing to advance safe",
-                );
-                return Err(DeriverError::local_diverged(to_block));
-            }
-        }
-
-        let new_safe_hash = new_safe_header.hash();
+        let new_safe_hash = self.l2_hash_at(to_block)?;
 
         // Advance safe; keep finalized where it is (only L1 finality
         // moves it).
@@ -848,6 +732,95 @@ where
                 DeriverError::l2_provider(format!("local L2 header at {l2_block} missing"))
             })?
             .hash())
+    }
+
+    /// Per-block reconciliation against a decoded batch beginning at
+    /// `from_block`: for each block, skip if local reth already holds the
+    /// same tx list, otherwise STF-replay it (reth fork-switches via
+    /// `newPayload` + head-FCU). Returns the count of blocks replayed.
+    ///
+    /// NOTE: not transactional. If a replay fails partway, earlier blocks
+    /// are already committed to reth's canonical chain, leaving local L2
+    /// in a half-state. The per-block `eez.deriver.reconcile.block` log
+    /// records progress so a failure shows how far the loop got.
+    /// [open: roll the canonical head back to the pre-loop snapshot on
+    /// failure.]
+    async fn reconcile_batch_blocks(
+        &self,
+        from_block: u64,
+        decoded: &eez_payload_codec::DecodedBatch,
+        l1_block_number: u64,
+        tx_hash: B256,
+    ) -> DeriverResult<u64> {
+        let mut tx_offset = 0usize;
+        let mut replayed: u64 = 0;
+        for (i, count) in decoded.block_tx_counts.iter().enumerate() {
+            let l2_block = from_block + i as u64;
+            let count_usize = usize::from(*count);
+            let block_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
+            tx_offset += count_usize;
+            let matched = local_block_matches(&self.inner.l2_provider, l2_block, block_txs)?;
+            event!(
+                name: "eez.deriver.reconcile.block",
+                Level::DEBUG,
+                l1_block_number,
+                tx_hash = %tx_hash,
+                l2_block,
+                action = if matched { "skip" } else { "replay" },
+                tx_count = block_txs.len(),
+                replayed_so_far = replayed,
+                "reconciling batch block",
+            );
+            if matched {
+                continue;
+            }
+            self.replay_block(l2_block - 1, block_txs).await?;
+            replayed += 1;
+        }
+        Ok(replayed)
+    }
+
+    /// Loud-fail if the batch's claimed `newState` disagrees with our
+    /// STF's state root at `to_block`. No-op when the batch carries no
+    /// claim for our rollup.
+    ///
+    /// Under the mock prover, `verify` can't enforce linearity, so a
+    /// dishonest composer could land a wrong `newState` that L1 accepts.
+    /// Halting here surfaces the mismatch where it originates instead of
+    /// later, when our own next post reverts with `StateRootMismatch`.
+    fn check_claimed_state(
+        &self,
+        claimed_new_state: Option<B256>,
+        to_block: u64,
+        l1_block_number: u64,
+        tx_hash: B256,
+    ) -> DeriverResult<()> {
+        let Some(claimed) = claimed_new_state else {
+            return Ok(());
+        };
+        let local_root = self
+            .inner
+            .l2_provider
+            .sealed_header(to_block)
+            .map_err(DeriverError::l2_provider)?
+            .ok_or_else(|| {
+                DeriverError::l2_provider(format!("local L2 header at {to_block} missing"))
+            })?
+            .state_root();
+        if local_root != claimed {
+            event!(
+                name: "eez.deriver.state.diverged",
+                Level::ERROR,
+                l1_block_number,
+                tx_hash = %tx_hash,
+                to_block,
+                local_root = %local_root,
+                claimed = %claimed,
+                "local L2 state root differs from the batch's claimed newState",
+            );
+            return Err(DeriverError::local_diverged(to_block));
+        }
+        Ok(())
     }
 }
 

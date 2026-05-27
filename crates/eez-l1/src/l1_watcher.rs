@@ -17,9 +17,6 @@ use std::time::Duration;
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{Provider, ProviderBuilder};
-use alloy_rpc_types_eth::{Filter, TransactionTrait};
-use alloy_sol_types::{SolCall, SolEvent};
-use eez_prover::EezRegistry;
 use tokio::sync::broadcast;
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tracing::{Level, event};
@@ -369,11 +366,10 @@ impl L1Watcher {
         Ok(())
     }
 
-    /// Fetches `BatchPosted` logs in `[from, to]` and emits one
-    /// [`L1Event::BatchPosted`] per log. Also fetches
-    /// `L2ExecutionPerformed` in the same range to tag winners vs
-    /// losers (`BatchPosted` fires for both; `L2ExecutionPerformed`
-    /// only for winners).
+    /// Fetches `BatchPosted` logs in `[from, to]` via
+    /// [`scan_batch_logs`](crate::submitter::scan_batch_logs) (winner
+    /// tagging + tx decode) and emits one [`L1Event::BatchPosted`] per
+    /// log.
     async fn scan_batch_posted(
         &self,
         provider: &impl Provider,
@@ -381,74 +377,25 @@ impl L1Watcher {
         to: u64,
         _to_hash: B256,
     ) -> L1Result<()> {
-        let filter = Filter::new()
-            .address(self.inner.config.eez)
-            .event_signature(EezRegistry::BatchPosted::SIGNATURE_HASH)
-            .from_block(from)
-            .to_block(to);
-        let logs = provider
-            .get_logs(&filter)
-            .await
-            .map_err(|e| L1Error::Provider(format!("get_logs(BatchPosted): {e}")))?;
-
-        // Winner filter: `L2ExecutionPerformed` only fires when the
-        // state delta actually applied (EEZ.sol:967-979). Losers
-        // emit `BatchPosted` only.
-        let winners_filter = Filter::new()
-            .address(self.inner.config.eez)
-            .event_signature(EezRegistry::L2ExecutionPerformed::SIGNATURE_HASH)
-            .topic1(U256::from(self.inner.config.rollup_id))
-            .from_block(from)
-            .to_block(to);
-        let winner_logs = provider
-            .get_logs(&winners_filter)
-            .await
-            .map_err(|e| L1Error::Provider(format!("get_logs(L2ExecutionPerformed): {e}")))?;
-        let winner_tx_hashes: std::collections::HashSet<B256> = winner_logs
-            .iter()
-            .filter_map(|l| l.transaction_hash)
-            .collect();
-
-        for log in &logs {
-            let tx_hash = log
-                .transaction_hash
-                .ok_or_else(|| L1Error::Provider("BatchPosted log missing tx_hash".into()))?;
-            let l1_block_number = log
-                .block_number
-                .ok_or_else(|| L1Error::Provider("BatchPosted log missing block_number".into()))?;
-            let l1_block_hash = log
-                .block_hash
-                .ok_or_else(|| L1Error::Provider("BatchPosted log missing block_hash".into()))?;
-            let tx = provider
-                .get_transaction_by_hash(tx_hash)
-                .await
-                .map_err(|e| L1Error::Provider(format!("get_tx({tx_hash}): {e}")))?
-                .ok_or_else(|| L1Error::Provider(format!("tx {tx_hash} not found")))?;
-            let submitter = tx.inner.signer();
-            let input = tx.inner.input();
-            let decoded = EezRegistry::postAndVerifyBatchCall::abi_decode(input)
-                .map_err(|e| L1Error::Provider(format!("decode postBatch({tx_hash}): {e}")))?;
-            // Decode the BatchPosted event topics for rollupCount.
-            let decoded_event = EezRegistry::BatchPosted::decode_log(&alloy_primitives::Log {
-                address: log.address(),
-                data: log.data().clone(),
-            })
-            .map_err(|e| L1Error::Provider(format!("decode BatchPosted({tx_hash}): {e}")))?;
-            let our_delta =
-                crate::submitter::our_state_delta(&decoded.batch, self.inner.config.rollup_id);
-            let claimed_current_state = our_delta.map(|d| d.currentState);
-            let claimed_new_state = our_delta.map(|d| d.newState);
-            let state_applied = winner_tx_hashes.contains(&tx_hash);
+        let scanned = crate::submitter::scan_batch_logs(
+            provider,
+            self.inner.config.eez,
+            self.inner.config.rollup_id,
+            from,
+            BlockNumberOrTag::Number(to),
+        )
+        .await?;
+        for b in scanned {
             self.emit(L1Event::BatchPosted {
-                l1_block_number,
-                l1_block_hash,
-                tx_hash,
-                submitter,
-                rollup_count: decoded_event.rollupCount,
-                call_data: decoded.batch.callData,
-                state_applied,
-                claimed_current_state,
-                claimed_new_state,
+                l1_block_number: b.l1_block_number,
+                l1_block_hash: b.l1_block_hash,
+                tx_hash: b.tx_hash,
+                submitter: b.submitter,
+                rollup_count: b.rollup_count,
+                call_data: b.call_data,
+                state_applied: b.state_applied,
+                claimed_current_state: b.claimed_current_state,
+                claimed_new_state: b.claimed_new_state,
             });
         }
         Ok(())
