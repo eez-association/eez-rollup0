@@ -50,7 +50,6 @@ struct Inner<L2: BlockReader> {
     /// Shared L1-confirmed L2 head. Composer is a read-only consumer
     /// (uses `cursor()` to compute the next batch's `from_block`); the
     /// Deriver writes on every `L1Event::BatchPosted / Reorg / Finalized`.
-    /// W3.16 — replaces the previous duplicate Composer-local index.
     l1_head: Arc<L1CanonicalHead>,
 }
 
@@ -73,7 +72,7 @@ where
     <L2 as TransactionsProvider>::Transaction: Encodable2718,
 {
     /// Constructs a Composer that reads its L1-confirmed L2 head from
-    /// the shared [`L1CanonicalHead`] (W3.16). The Deriver is the sole
+    /// the shared [`L1CanonicalHead`]. The Deriver is the sole
     /// writer of that state; this Composer never owns the cursor.
     ///
     /// Synchronous — does no I/O.

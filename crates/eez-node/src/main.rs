@@ -11,7 +11,7 @@
 //! - `EEZ_L1_RPC_URL` (and friends) — present → L1 stack spawns.
 //! - `EEZ_COMPOSER_DISABLED` — when set, no postBatch tx leaves this
 //!   node. Sequencer + Deriver still run (local block production + L1
-//!   replay). Used for follower smoke runs against an active deployment.
+//!   replay).
 //! - `EEZ_SEQUENCER_DISABLED` — when set, no local block production.
 //!   `BlockCommitter` still spawns (Deriver needs it for engine-API
 //!   replay), but the per-tick FCU+attrs loop is suppressed. Pair with
@@ -69,7 +69,7 @@ fn main() -> eyre::Result<()> {
         let task_executor = handle.node.task_executor.clone();
 
         // Shared L1-confirmed L2 head. Created unconditionally so the
-        // Sequencer's speculative-depth limit (W3.17) can be wired
+        // Sequencer's speculative-depth limit can be wired
         // even when the L1 stack isn't activated this run
         // When the L1 stack does spin up, the same Arc is
         // handed to the Deriver as the write side.
@@ -126,7 +126,7 @@ fn main() -> eyre::Result<()> {
                 Arc::clone(&l1_head),
             );
 
-            // Boot-time catch-up is best-effort: the W3.18 state-
+            // Boot-time catch-up is best-effort: the state-
             // retention race can surface mid-replay against a stale
             // datadir. `Deriver::run()` retries `catch_up()` after
             // subscribing (warn-and-continue on failure), so we

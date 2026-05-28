@@ -9,7 +9,7 @@
 //! - L2-finality mapping from `L1Event::Finalized` (advances reth finalized)
 //!
 //! Multi-L2 fan-out (per-rollup `Deriver` sharing one `L1Watcher`) is the
-//! next layer up — see plan §5.4.3.
+//! next layer up.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 

@@ -61,11 +61,11 @@ const BLOCK_TIME_SECS: u64 = 2;
 const MAX_BLOCKS_PER_TICK: usize = 32;
 
 /// Max speculative gap the Sequencer can run ahead of L1-confirmed
-/// cursor (W3.17). Pauses beyond this so reth's state-retention
+/// cursor. Pauses beyond this so reth's state-retention
 /// window keeps recent ancestors alive for the Deriver's replay.
 pub const DEFAULT_MAX_SPECULATIVE_DEPTH: u64 = 64;
 
-/// L1-confirmed L2 head height (W3.17). `eez_l1::L1CanonicalHead`
+/// L1-confirmed L2 head height. `eez_l1::L1CanonicalHead`
 /// implements this; the Sequencer uses it to bound speculative depth.
 pub trait ConfirmedHeadSource: Send + Sync + 'static {
     /// Highest L2 block confirmed by an L1-landed batch.
@@ -163,7 +163,7 @@ where
     attributes: EthAttributesBuilder<ChainSpec>,
     scheduler: Scheduler,
     committer: BlockCommitterHandle<T>,
-    /// Optional speculative-depth cap (W3.17). None = no limit
+    /// Optional speculative-depth cap. None = no limit
     /// (single-composer / follower mode). See `DEFAULT_MAX_SPECULATIVE_DEPTH`.
     speculative_limit: Option<SpeculativeLimit>,
 }
@@ -227,7 +227,7 @@ where
 
     /// Cap blocks above `source`'s L1-confirmed head; `advance` pauses
     /// past `max_depth` so the Deriver gets time to replay L1 batches
-    /// without state-pruning churn (W3.17). Skip for single-composer /
+    /// without state-pruning churn. Skip for single-composer /
     /// follower setups. Use `DEFAULT_MAX_SPECULATIVE_DEPTH` for the
     /// typical based-mode deployment.
     #[must_use]
@@ -306,7 +306,7 @@ where
                 break;
             }
 
-            // Speculative-depth limit (W3.17): if we're already too far
+            // Speculative-depth limit: if we're already too far
             // ahead of the L1-confirmed cursor, pause and let the Deriver
             // catch up. Without this, the Sequencer races ahead during
             // a long timestamp-backfill and the Deriver's subsequent
