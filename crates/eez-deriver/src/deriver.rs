@@ -655,13 +655,8 @@ where
             return Ok(());
         }
 
-        // Compute the new safe head's L2 hash.
-        let new_safe_hash = if new_cursor == 0 {
-            // Fall back to L2 genesis. The L2 provider should have it.
-            self.l2_hash_at(0)?
-        } else {
-            self.l2_hash_at(new_cursor)?
-        };
+        // Compute the new safe head's L2 hash. (even if <new_cursor> is 0)
+        let new_safe_hash = self.l2_hash_at(new_cursor)?;
 
         // Finalized was already bounded inside retreat_on_l1_reorg.
         let new_finalized = self.inner.l1_head.finalized_l2();
