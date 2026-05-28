@@ -27,9 +27,9 @@ Logs you should see: `eez.sequencer.block.produced` every 2s; `eez.composer.batc
 
 ### Follower
 
-Tracks the sequencer's chain. Unsafe `head` comes from the sequencer's standard JSON-RPC; `safe` and `finalized` come from tailing `EEZ.BatchPosted` events on L1 and mapping each batch's L1 inclusion block against L1's own `safe` / `finalized` block tags. Block bodies and receipts flow over reth's existing devp2p (eth/68) — the FCU just points reth at the head and pipeline-sync handles the rest.
+Runs a reth node with the PR #5 L1 watcher + deriver. L1 `BatchPosted` events are decoded, reconciled against local blocks, replayed into reth when needed, and used to advance the FCU `safe` / `finalized` anchors. The follower can also poll a sequencer RPC for a faster unsafe `head`; that RPC head is only accepted while compatible with the L1-derived anchors.
 
-L1 is mandatory — all `EEZ_*` env vars used by the sequencer must be set in the follower's environment too (the easiest path is to source the same `.env` + `deployments.env`). Start the sequencer first and grab its enode URL from the startup log.
+L1 config is mandatory: `EEZ_L1_RPC_URL`, `EEZ_REGISTRY_ADDRESS`, `EEZ_ROLLUP_ID`, and `EEZ_REGISTRY_DEPLOY_BLOCK` must be set. `EEZ_L1_POSTER_KEY` is optional for the follower because it only reads from L1. Start the sequencer first if you want sequencer-RPC unsafe head, and grab its enode URL from the startup log.
 
 ```bash
 cargo run -p eez-follower -- node --chain dev \
@@ -41,7 +41,9 @@ cargo run -p eez-follower -- node --chain dev \
   --disable-discovery
 ```
 
-Logs you should see: `eez.follower.l1.bootstrap.complete` once at startup, `eez.follower.l1.batch.observed` per posted batch, `eez.follower.l1.safe.advanced` and `.finalized.advanced` when L1 tags cross batch boundaries, and `eez.follower.head.syncing` (or `.head.advanced`) each 2 s tick. Confirm convergence via `cast block-number` and `cast block safe` / `cast block finalized` on the follower's RPC (`http://127.0.0.1:8645`) vs the sequencer's.
+To run L1-derived-only, omit `--sequencer-rpc` and peer flags. In that mode the head advances from L1 batches rather than the sequencer RPC.
+
+Logs you should see: `eez.deriver.catch_up.start` on boot, `eez.deriver.safe.advanced` as L1 batches are accepted, `eez.deriver.finalized.advanced` as L1 finality catches up, and, when sequencer RPC is enabled, `eez.follower.head.advanced`, `.head.syncing`, or `.head.inconsistent` for unsafe-head polling. Confirm convergence with `cast block-number`, `cast block safe`, and `cast block finalized` against the follower RPC.
 
 ## Roadmap
 
@@ -52,6 +54,5 @@ Logs you should see: `eez.follower.l1.bootstrap.complete` once at startup, `eez.
 
 ### To do
 
-- [ ] **Stage 3** — reorg handling + full `eez-follower` derivation (follower binary itself ships now with L1-derived `safe`/`finalized`; trustless full derivation from L1 batches and reorg handling still open)
+- [ ] **Stage 3** — fuller follower hardening (follower binary now runs L1-derived safe/finalized and optional sequencer-RPC unsafe head; remaining work includes deeper recovery behavior and production-grade validation)
 - [ ] **Stage 4** — cross-chain composer (sync blocks with system txs, proof, full L1↔L2)
-
