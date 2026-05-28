@@ -13,9 +13,7 @@ use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BlockCommitterHandle, DeriveOutcome, ForkchoiceOutcome};
-use eez_l1::{
-    BatchRecord, HistoricalBatch, L1CanonicalHead, L1Event, L1Watcher, L2BlockRef, Submitter,
-};
+use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Watcher, Submitter};
 use reth_chainspec::ChainSpec;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_ethereum_primitives::TransactionSigned;
@@ -66,11 +64,6 @@ where
     /// used to compute the FCU when advancing finalized without
     /// disturbing safe (and vice versa).
     safe_l2_block: AtomicU64,
-}
-
-struct ReconciledBlock {
-    header: SealedHeader<alloy_consensus::Header>,
-    already_canonical: bool,
 }
 
 impl<L2> std::fmt::Debug for Deriver<L2>
@@ -198,15 +191,13 @@ where
             // agree with (e.g., the previous proposing run lost a race
             // and never reorged its local chain).
             let mut tx_offset = 0usize;
-            let mut batch_end_header = None;
             for (i, count) in decoded.block_tx_counts.iter().enumerate() {
                 let l2_block = batch_first_l2 + i as u64;
                 let count_usize = usize::from(*count);
                 let block_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
                 tx_offset += count_usize;
 
-                let reconciled = self.reconcile_l1_block(l2_block, block_txs).await?;
-                let matched = reconciled.already_canonical;
+                let matched = local_block_matches(&self.inner.l2_provider, l2_block, block_txs)?;
                 event!(
                     name: "eez.deriver.catch_up.block",
                     Level::DEBUG,
@@ -217,27 +208,18 @@ where
                     tx_count = block_txs.len(),
                     "catch_up_to: reconciling batch block",
                 );
-                batch_end_header = Some(reconciled.header);
-                if !matched {
-                    last_replayed = Some(l2_block);
+                if matched {
+                    continue;
                 }
+                let parent_block_number = l2_block - 1;
+                self.replay_block(parent_block_number, block_txs).await?;
+                last_replayed = Some(l2_block);
             }
-            let batch_end_header = batch_end_header.ok_or_else(|| {
-                DeriverError::l2_provider(format!(
-                    "batch {} decoded to no L2 blocks",
-                    batch.tx_hash
-                ))
-            })?;
-            let batch_end_ref = L2BlockRef {
-                number: batch_last_l2,
-                hash: batch_end_header.hash(),
-            };
             if !known_tx_hashes.contains(&batch.tx_hash) {
                 new_batches.push(BatchRecord {
                     l1_block: batch.l1_block_number,
-                    l1_block_hash: batch.l1_block_hash,
                     tx_hash: batch.tx_hash,
-                    last_l2: batch_end_ref,
+                    last_l2_block: batch_last_l2,
                 });
             }
             // Same divergence check as on_batch_posted — once the block
@@ -246,7 +228,17 @@ where
             // (during startup catch-up) instead of waiting for a live
             // event later.
             if let Some(claimed) = batch.claimed_new_state {
-                let local_root = batch_end_header.state_root();
+                let local_root = self
+                    .inner
+                    .l2_provider
+                    .sealed_header(batch_last_l2)
+                    .map_err(DeriverError::l2_provider)?
+                    .ok_or_else(|| {
+                        DeriverError::l2_provider(format!(
+                            "local L2 header at {batch_last_l2} missing"
+                        ))
+                    })?
+                    .state_root();
                 if local_root != claimed {
                     event!(
                         name: "eez.deriver.state.diverged",
@@ -276,16 +268,10 @@ where
         // catch the safe head up after a bulk replay so RPC clients
         // see the right safe head before the next live event lands.
         if cumulative_l2 > self.inner.safe_l2_block.load(Ordering::Acquire) {
-            let safe_hash = self.l2_ref_or_hash_at(cumulative_l2)?;
-            let finalized_hash = self.l2_ref_or_hash_at(self.inner.l1_head.finalized_l2())?;
-            self.advance_safe_finalized_or_recover(
-                L2BlockRef {
-                    number: cumulative_l2,
-                    hash: safe_hash,
-                },
-                finalized_hash,
-            )
-            .await?;
+            let safe_hash = self.l2_hash_at(cumulative_l2)?;
+            let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
+            self.advance_safe_finalized_or_recover(cumulative_l2, safe_hash, finalized_hash)
+                .await?;
             self.inner
                 .safe_l2_block
                 .store(cumulative_l2, Ordering::Release);
@@ -469,41 +455,16 @@ where
         Ok(self.inner.committer.commit_derived(payload, header).await?)
     }
 
-    async fn reconcile_l1_block(
-        &self,
-        l2_block: u64,
-        raw_txs: &[Vec<u8>],
-    ) -> DeriverResult<ReconciledBlock> {
-        if let Some(header) = local_block_matches(&self.inner.l2_provider, l2_block, raw_txs)? {
-            return Ok(ReconciledBlock {
-                header,
-                already_canonical: true,
-            });
-        }
-
-        let parent_block_number = l2_block.checked_sub(1).ok_or_else(|| {
-            DeriverError::l2_provider("cannot reconcile L2 genesis as a derived block")
-        })?;
-        let (payload, header) = self.execute_block(parent_block_number, raw_txs)?;
-        self.inner
-            .committer
-            .commit_derived(payload, header.clone())
-            .await?;
-        Ok(ReconciledBlock {
-            header,
-            already_canonical: false,
-        })
-    }
-
     async fn advance_safe_finalized_or_recover(
         &self,
-        safe: L2BlockRef,
+        safe_l2: u64,
+        safe_hash: B256,
         finalized_hash: B256,
     ) -> DeriverResult<()> {
         match self
             .inner
             .committer
-            .advance_safe_finalized(safe.hash, finalized_hash)
+            .advance_safe_finalized(safe_hash, finalized_hash)
             .await
         {
             Ok(()) => Ok(()),
@@ -511,8 +472,8 @@ where
                 event!(
                     name: "eez.deriver.safe.inconsistent",
                     Level::WARN,
-                    l2_safe = safe.number,
-                    safe_hash = %safe.hash,
+                    l2_safe = safe_l2,
+                    safe_hash = %safe_hash,
                     finalized_hash = %finalized_hash,
                     error = %err,
                     "L1-derived safe/finalized hashes are incompatible with the current head; recovering head to safe",
@@ -520,20 +481,17 @@ where
                 let safe_header = self
                     .inner
                     .l2_provider
-                    .sealed_header_by_hash(safe.hash)
+                    .sealed_header_by_hash(safe_hash)
                     .map_err(DeriverError::l2_provider)?
                     .ok_or_else(|| {
                         DeriverError::l2_provider(format!(
-                            "L1-derived safe header {} missing locally",
-                            safe.hash
+                            "L1-derived safe header {safe_hash} missing locally"
                         ))
                     })?;
-                if safe_header.number() != safe.number {
+                if safe_header.number() != safe_l2 {
                     return Err(DeriverError::l2_provider(format!(
-                        "L1-derived safe hash {} resolved to block {}, expected {}",
-                        safe.hash,
-                        safe_header.number(),
-                        safe.number
+                        "L1-derived safe hash {safe_hash} resolved to block {}, expected {safe_l2}",
+                        safe_header.number()
                     )));
                 }
 
@@ -547,16 +505,15 @@ where
                         event!(
                             name: "eez.deriver.safe.recovered",
                             Level::WARN,
-                            l2_safe = safe.number,
-                            safe_hash = %safe.hash,
+                            l2_safe = safe_l2,
+                            safe_hash = %safe_hash,
                             finalized_hash = %finalized_hash,
                             "recovered forkchoice head to L1-derived safe block",
                         );
                         Ok(())
                     }
                     ForkchoiceOutcome::Syncing => Err(DeriverError::invalid_forkchoice(format!(
-                        "recovery FCU for L1-derived safe {} returned SYNCING",
-                        safe.hash
+                        "recovery FCU for L1-derived safe {safe_hash} returned SYNCING"
                     ))),
                 }
             }
@@ -641,25 +598,21 @@ where
         match event {
             L1Event::BatchPosted {
                 l1_block_number,
-                l1_block_hash,
                 tx_hash,
                 submitter,
                 call_data,
                 state_applied,
-                claimed_current_state,
                 claimed_new_state,
                 ..
             } => {
-                self.on_batch_posted(HistoricalBatch {
+                self.on_batch_posted(
                     l1_block_number,
-                    l1_block_hash,
                     tx_hash,
                     submitter,
                     call_data,
                     state_applied,
-                    claimed_current_state,
                     claimed_new_state,
-                })
+                )
                 .await
             }
             L1Event::NewHead { .. } => Ok(()),
@@ -682,8 +635,16 @@ where
         }
     }
 
-    async fn on_batch_posted(&self, batch: HistoricalBatch) -> DeriverResult<()> {
-        let decoded = eez_payload_codec::decode(batch.call_data.as_ref())?;
+    async fn on_batch_posted(
+        &self,
+        l1_block_number: u64,
+        tx_hash: B256,
+        submitter: Address,
+        call_data: Bytes,
+        state_applied: bool,
+        claimed_new_state: Option<B256>,
+    ) -> DeriverResult<()> {
+        let decoded = eez_payload_codec::decode(call_data.as_ref())?;
         let block_count = decoded.block_count() as u64;
         if block_count == 0 {
             return Ok(());
@@ -691,12 +652,12 @@ where
 
         // Dedup by tx_hash — already-indexed = already processed by
         // catch_up; this is a stale live event.
-        if self.inner.l1_head.contains_l1_tx(&batch.tx_hash) {
+        if self.inner.l1_head.contains_l1_tx(&tx_hash) {
             event!(
                 name: "eez.deriver.batch_posted.skipped",
                 Level::DEBUG,
-                l1_block_number = batch.l1_block_number,
-                tx_hash = %batch.tx_hash,
+                l1_block_number,
+                tx_hash = %tx_hash,
                 "live event for an already-indexed batch; skipping",
             );
             return Ok(());
@@ -704,13 +665,13 @@ where
 
         // Skip losers — L1's `_applyStateDeltas` (EEZ.sol:967) decides
         // the winner; `state_applied` mirrors `L2ExecutionPerformed`.
-        if !batch.state_applied {
+        if !state_applied {
             event!(
                 name: "eez.deriver.batch.lost_race",
                 Level::INFO,
-                l1_block_number = batch.l1_block_number,
-                tx_hash = %batch.tx_hash,
-                submitter = %batch.submitter,
+                l1_block_number,
+                tx_hash = %tx_hash,
+                submitter = %submitter,
                 "batch lost the race on L1 (no L2ExecutionPerformed emitted — competing batch's state delta won); skipping",
             );
             return Ok(());
@@ -738,48 +699,52 @@ where
         // state mutation already happened on failure.
         let mut tx_offset = 0usize;
         let mut replayed_count: u64 = 0;
-        let mut batch_end_header = None;
         for (i, count) in decoded.block_tx_counts.iter().enumerate() {
             let l2_block = from_block + i as u64;
             let count_usize = usize::from(*count);
             let block_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
             tx_offset += count_usize;
-            let reconciled = self.reconcile_l1_block(l2_block, block_txs).await?;
-            let matched = reconciled.already_canonical;
+            let matched = local_block_matches(&self.inner.l2_provider, l2_block, block_txs)?;
             event!(
                 name: "eez.deriver.reconcile.block",
                 Level::DEBUG,
-                l1_block_number = batch.l1_block_number,
-                tx_hash = %batch.tx_hash,
+                l1_block_number,
+                tx_hash = %tx_hash,
                 l2_block,
                 action = if matched { "skip" } else { "replay" },
                 tx_count = block_txs.len(),
                 replayed_so_far = replayed_count,
                 "reconciling batch block",
             );
-            batch_end_header = Some(reconciled.header);
+            if matched {
+                continue;
+            }
             // If replay fails, the error propagates out. Subsequent logs
             // (`execute_block.parent_missing`, `execute_block.no_state`,
             // etc.) show why; the `replayed_so_far` value above is what
             // we'd want to roll back if we made the loop transactional.
-            if !matched {
-                replayed_count += 1;
-            }
+            self.replay_block(l2_block - 1, block_txs).await?;
+            replayed_count += 1;
         }
         event!(
             name: "eez.deriver.reconcile.done",
             Level::DEBUG,
-            l1_block_number = batch.l1_block_number,
-            tx_hash = %batch.tx_hash,
+            l1_block_number,
+            tx_hash = %tx_hash,
             from_block,
             to_block,
             replayed = replayed_count,
             "per-block reconciliation complete (pre-divergence check)",
         );
 
-        let new_safe_header = batch_end_header.ok_or_else(|| {
-            DeriverError::l2_provider(format!("batch {} decoded to no L2 blocks", batch.tx_hash))
-        })?;
+        let new_safe_header = self
+            .inner
+            .l2_provider
+            .sealed_header(to_block)
+            .map_err(DeriverError::l2_provider)?
+            .ok_or_else(|| {
+                DeriverError::l2_provider(format!("local L2 header at {to_block} missing"))
+            })?;
 
         // Divergence detection (mock-prover regime): the on-chain
         // `StateDelta.newState` should equal our STF's state root at
@@ -791,15 +756,15 @@ where
         // revert with `StateRootMismatch`. Better to halt this batch
         // now so the operator sees the loud failure here, where the
         // mismatch originated.
-        if let Some(claimed) = batch.claimed_new_state {
+        if let Some(claimed) = claimed_new_state {
             let local_root = new_safe_header.state_root();
             if local_root != claimed {
                 event!(
                     name: "eez.deriver.state.diverged",
                     Level::ERROR,
-                    l1_block_number = batch.l1_block_number,
-                    tx_hash = %batch.tx_hash,
-                    submitter = %batch.submitter,
+                    l1_block_number,
+                    tx_hash = %tx_hash,
+                    submitter = %submitter,
                     to_block,
                     local_root = %local_root,
                     claimed = %claimed,
@@ -813,25 +778,15 @@ where
 
         // Advance safe; keep finalized where it is (only L1 finality
         // moves it).
-        let finalized_hash = self.l2_ref_or_hash_at(self.inner.l1_head.finalized_l2())?;
-        self.advance_safe_finalized_or_recover(
-            L2BlockRef {
-                number: to_block,
-                hash: new_safe_hash,
-            },
-            finalized_hash,
-        )
-        .await?;
+        let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
+        self.advance_safe_finalized_or_recover(to_block, new_safe_hash, finalized_hash)
+            .await?;
 
         self.inner.safe_l2_block.store(to_block, Ordering::Release);
         self.inner.l1_head.append(BatchRecord {
-            l1_block: batch.l1_block_number,
-            l1_block_hash: batch.l1_block_hash,
-            tx_hash: batch.tx_hash,
-            last_l2: L2BlockRef {
-                number: to_block,
-                hash: new_safe_hash,
-            },
+            l1_block: l1_block_number,
+            tx_hash,
+            last_l2_block: to_block,
         });
 
         event!(
@@ -839,9 +794,9 @@ where
             Level::INFO,
             from_block,
             to_block,
-            l1_block_number = batch.l1_block_number,
-            tx_hash = %batch.tx_hash,
-            submitter = %batch.submitter,
+            l1_block_number,
+            tx_hash = %tx_hash,
+            submitter = %submitter,
             new_safe_hash = %new_safe_hash,
             "advanced L2 safe head from L1-confirmed batch",
         );
@@ -862,11 +817,10 @@ where
         // L1CanonicalHead handles the cursor + finalized retreats
         // atomically; we just propagate to reth's safe head below.
         let old_cursor = self.inner.l1_head.cursor();
-        let (new_cursor_ref, new_finalized_ref, dropped) = self
+        let (new_cursor, new_finalized, dropped) = self
             .inner
             .l1_head
             .retreat_on_l1_reorg(common_ancestor_number);
-        let new_cursor = new_cursor_ref.map_or(0, |r| r.number);
         if new_cursor >= old_cursor {
             // L1 reorg happened above where our batches live; nothing
             // for us to retreat.
@@ -883,19 +837,17 @@ where
         }
 
         // Compute the new safe head's L2 hash.
-        let new_safe_ref = match new_cursor_ref {
-            Some(r) => r,
-            None => L2BlockRef {
-                number: 0,
-                hash: self.l2_hash_at(0)?,
-            },
+        let new_safe_hash = if new_cursor == 0 {
+            // Fall back to L2 genesis. The L2 provider should have it.
+            self.l2_hash_at(0)?
+        } else {
+            self.l2_hash_at(new_cursor)?
         };
 
         // Finalized was already bounded inside retreat_on_l1_reorg.
-        let new_finalized_hash =
-            new_finalized_ref.map_or_else(|| self.l2_hash_at(0), |r| Ok(r.hash))?;
+        let new_finalized_hash = self.l2_hash_at(new_finalized)?;
 
-        self.advance_safe_finalized_or_recover(new_safe_ref, new_finalized_hash)
+        self.advance_safe_finalized_or_recover(new_cursor, new_safe_hash, new_finalized_hash)
             .await?;
 
         self.inner
@@ -920,14 +872,11 @@ where
     async fn on_l1_finalized(&self, l1_finalized_block: u64) -> DeriverResult<()> {
         // Find highest batch with l1_block <= l1_finalized_block.
         // That batch's last_l2_block is the new L2 finalized head.
-        let Some(new_finalized_ref) = self
+        let new_finalized = self
             .inner
             .l1_head
-            .highest_l2_ref_at_or_below_l1(l1_finalized_block)
-        else {
-            return Ok(());
-        };
-        let new_finalized = new_finalized_ref.number;
+            .highest_l2_at_or_below_l1(l1_finalized_block)
+            .unwrap_or(0);
         let old_finalized = self.inner.l1_head.finalized_l2();
         if new_finalized <= old_finalized {
             return Ok(());
@@ -938,37 +887,12 @@ where
         if bounded <= old_finalized {
             return Ok(());
         }
-        let bounded_ref = if bounded == new_finalized_ref.number {
-            new_finalized_ref
-        } else {
-            self.inner
-                .l1_head
-                .cursor_ref()
-                .filter(|r| r.number == bounded)
-                .or_else(|| {
-                    self.inner
-                        .l1_head
-                        .highest_l2_ref_at_or_below_l1(l1_finalized_block)
-                        .filter(|r| r.number == bounded)
-                })
-                .ok_or_else(|| {
-                    DeriverError::l2_provider(format!(
-                        "no finalized checkpoint hash for L2 block {bounded}"
-                    ))
-                })?
-        };
 
-        let safe_hash = self.l2_ref_or_hash_at(current_safe)?;
-        let finalized_hash = bounded_ref.hash;
-        self.advance_safe_finalized_or_recover(
-            L2BlockRef {
-                number: current_safe,
-                hash: safe_hash,
-            },
-            finalized_hash,
-        )
-        .await?;
-        self.inner.l1_head.set_finalized_ref(Some(bounded_ref));
+        let safe_hash = self.l2_hash_at(current_safe)?;
+        let finalized_hash = self.l2_hash_at(bounded)?;
+        self.advance_safe_finalized_or_recover(current_safe, safe_hash, finalized_hash)
+            .await?;
+        self.inner.l1_head.set_finalized_l2(bounded);
         event!(
             name: "eez.deriver.finalized.advanced",
             Level::INFO,
@@ -990,45 +914,28 @@ where
             })?
             .hash())
     }
-
-    fn l2_ref_or_hash_at(&self, l2_block: u64) -> DeriverResult<B256> {
-        if l2_block == 0 {
-            return self.l2_hash_at(0);
-        }
-        if let Some(cursor) = self.inner.l1_head.cursor_ref()
-            && cursor.number == l2_block
-        {
-            return Ok(cursor.hash);
-        }
-        if let Some(finalized) = self.inner.l1_head.finalized_ref()
-            && finalized.number == l2_block
-        {
-            return Ok(finalized.hash);
-        }
-        self.l2_hash_at(l2_block)
-    }
 }
 
-/// Returns the local canonical header iff the local block's ordered
-/// tx list matches the L1-posted tx list. This is a staged
-/// equivalence check: it preserves PR #5's cheap happy path while
-/// still letting the follower store hash-bearing L1 checkpoints.
+/// Returns `true` iff local reth has a block at `block_number` whose
+/// tx list (in encoded-2718 form) matches the given expected bytes.
+/// Returns `false` if local is missing the block or has different
+/// content — caller's signal to STF-replay this slot and let reth
+/// reorg if needed (W3.15 fork-switch path).
 fn local_block_matches<L2>(
     l2_provider: &Arc<L2>,
-    l2_block: u64,
+    block_number: u64,
     expected_txs: &[Vec<u8>],
-) -> DeriverResult<Option<SealedHeader<alloy_consensus::Header>>>
+) -> DeriverResult<bool>
 where
-    L2: BlockReader<Header = alloy_consensus::Header>,
+    L2: BlockReader,
     <L2 as TransactionsProvider>::Transaction: Encodable2718,
 {
     let Some(local_block) = l2_provider
-        .block_by_number(l2_block)
+        .block_by_number(block_number)
         .map_err(DeriverError::l2_provider)?
     else {
-        return Ok(None);
+        return Ok(false);
     };
-
     let local_txs: Vec<Vec<u8>> = local_block
         .body()
         .transactions()
@@ -1036,24 +943,10 @@ where
         .map(Encodable2718::encoded_2718)
         .collect();
     if local_txs.len() != expected_txs.len() {
-        return Ok(None);
+        return Ok(false);
     }
-
-    if local_txs
+    Ok(local_txs
         .iter()
         .zip(expected_txs.iter())
-        .all(|(l, e)| l == e)
-    {
-        let header = l2_provider
-            .sealed_header(l2_block)
-            .map_err(DeriverError::l2_provider)?
-            .ok_or_else(|| {
-                DeriverError::l2_provider(format!(
-                    "local L2 header at matched block {l2_block} missing"
-                ))
-            })?;
-        Ok(Some(header))
-    } else {
-        Ok(None)
-    }
+        .all(|(l, e)| l == e))
 }

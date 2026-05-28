@@ -11,21 +11,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use alloy_primitives::B256;
 use eez_driver::ConfirmedHeadSource;
 
-/// L2 block identity derived from an L1 batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct L2BlockRef {
-    pub number: u64,
-    pub hash: B256,
-}
-
 /// One winning `BatchPosted` event in the per-tx index. Walked by the
 /// L1-reorg and L1-finality handlers. Losers aren't recorded.
 #[derive(Debug, Clone, Copy)]
 pub struct BatchRecord {
     pub l1_block: u64,
-    pub l1_block_hash: B256,
     pub tx_hash: B256,
-    pub last_l2: L2BlockRef,
+    pub last_l2_block: u64,
 }
 
 /// Shared canonical-head state. See module docs.
@@ -34,13 +26,9 @@ pub struct L1CanonicalHead {
     /// Highest L2 block any L1-landed batch confirmed.
     cursor: AtomicU64,
     /// L2 block number reth's `finalized` head was last advanced to via
-    /// `BlockCommitterHandle::advance_safe_finalized`. Kept as an atomic
-    /// for cheap telemetry; the hash-bearing mirror lives in
-    /// `finalized_ref`.
+    /// `BlockCommitterHandle::advance_safe_finalized`. Used to bound
+    /// subsequent advance/retreat calls so finalized never crosses safe.
     finalized_l2: AtomicU64,
-    /// Hash-bearing finalized checkpoint. `None` means genesis/no
-    /// finalized batch yet.
-    finalized_ref: Mutex<Option<L2BlockRef>>,
     /// Per-tx batch index appended on each accepted `BatchPosted` event.
     /// Walked by the L1-reorg handler to drop entries above the new
     /// common ancestor, and by the L1-finality handler to find the
@@ -59,24 +47,6 @@ impl L1CanonicalHead {
         self.finalized_l2.load(Ordering::Acquire)
     }
 
-    /// Hash-bearing finalized checkpoint, if one has been set.
-    ///
-    /// # Panics
-    ///
-    /// If the `finalized_ref` mutex is poisoned.
-    pub fn finalized_ref(&self) -> Option<L2BlockRef> {
-        *self.finalized_ref.lock().unwrap()
-    }
-
-    /// Hash-bearing cursor, if any L1 batch has been indexed.
-    ///
-    /// # Panics
-    ///
-    /// If the `batches` mutex is poisoned.
-    pub fn cursor_ref(&self) -> Option<L2BlockRef> {
-        self.batches.lock().unwrap().last().map(|b| b.last_l2)
-    }
-
     /// Highest indexed `last_l2_block`, or 0 if empty.
     ///
     /// # Panics
@@ -87,7 +57,7 @@ impl L1CanonicalHead {
             .lock()
             .unwrap()
             .last()
-            .map_or(0, |b| b.last_l2.number)
+            .map_or(0, |b| b.last_l2_block)
     }
 
     /// `true` iff `tx_hash` is already indexed. Used by the Deriver
@@ -131,8 +101,8 @@ impl L1CanonicalHead {
             return;
         }
         batches.push(record);
-        if record.last_l2.number > self.cursor.load(Ordering::Acquire) {
-            self.cursor.store(record.last_l2.number, Ordering::Release);
+        if record.last_l2_block > self.cursor.load(Ordering::Acquire) {
+            self.cursor.store(record.last_l2_block, Ordering::Release);
         }
     }
 
@@ -149,8 +119,8 @@ impl L1CanonicalHead {
         for r in records {
             if !known.contains(&r.tx_hash) {
                 batches.push(r);
-                if r.last_l2.number > max_l2 {
-                    max_l2 = r.last_l2.number;
+                if r.last_l2_block > max_l2 {
+                    max_l2 = r.last_l2_block;
                 }
             }
         }
@@ -158,62 +128,47 @@ impl L1CanonicalHead {
     }
 
     /// Drop indexed batches above `common_ancestor_number`; retreat
-    /// `cursor` (and finalized if it would cross cursor).
+    /// `cursor` (and `finalized_l2` if it would cross cursor).
     /// Returns `(new_cursor, new_finalized, dropped_count)`.
     ///
     /// # Panics
     ///
     /// If the `batches` mutex is poisoned.
-    pub fn retreat_on_l1_reorg(
-        &self,
-        common_ancestor_number: u64,
-    ) -> (Option<L2BlockRef>, Option<L2BlockRef>, usize) {
+    pub fn retreat_on_l1_reorg(&self, common_ancestor_number: u64) -> (u64, u64, usize) {
         let mut batches = self.batches.lock().unwrap();
         let original_len = batches.len();
         batches.retain(|b| b.l1_block <= common_ancestor_number);
         let dropped = original_len - batches.len();
-        let new_cursor = batches.last().map(|b| b.last_l2);
-        self.cursor
-            .store(new_cursor.map_or(0, |r| r.number), Ordering::Release);
-
-        let mut finalized_ref = self.finalized_ref.lock().unwrap();
-        if finalized_ref
-            .is_some_and(|finalized| finalized.number > new_cursor.map_or(0, |r| r.number))
-        {
-            *finalized_ref = new_cursor;
+        let new_cursor = batches.last().map_or(0, |b| b.last_l2_block);
+        self.cursor.store(new_cursor, Ordering::Release);
+        let old_finalized = self.finalized_l2.load(Ordering::Acquire);
+        let new_finalized = old_finalized.min(new_cursor);
+        if new_finalized != old_finalized {
+            self.finalized_l2.store(new_finalized, Ordering::Release);
         }
-        self.finalized_l2
-            .store((*finalized_ref).map_or(0, |r| r.number), Ordering::Release);
-        (new_cursor, *finalized_ref, dropped)
+        (new_cursor, new_finalized, dropped)
     }
 
-    /// Highest hash-bearing L2 checkpoint of any batch with
-    /// `l1_block <= bound`. Used to map an L1-finalized block to its
-    /// L2 head.
+    /// Highest `last_l2_block` of any batch with `l1_block ≤ bound`.
+    /// Used to map an L1-finalized block to its L2 head.
     ///
     /// # Panics
     ///
     /// If the `batches` mutex is poisoned.
-    pub fn highest_l2_ref_at_or_below_l1(&self, l1_block_bound: u64) -> Option<L2BlockRef> {
+    pub fn highest_l2_at_or_below_l1(&self, l1_block_bound: u64) -> Option<u64> {
         self.batches
             .lock()
             .unwrap()
             .iter()
             .rev()
             .find(|b| b.l1_block <= l1_block_bound)
-            .map(|b| b.last_l2)
+            .map(|b| b.last_l2_block)
     }
 
-    /// Update the hash-bearing finalized mirror. Caller is responsible
-    /// for keeping it `<= cursor()`.
-    ///
-    /// # Panics
-    ///
-    /// If the `finalized_ref` mutex is poisoned.
-    pub fn set_finalized_ref(&self, finalized: Option<L2BlockRef>) {
-        *self.finalized_ref.lock().unwrap() = finalized;
-        self.finalized_l2
-            .store(finalized.map_or(0, |r| r.number), Ordering::Release);
+    /// Update the `finalized_l2` mirror. Caller is responsible for
+    /// keeping it `<= cursor()`.
+    pub fn set_finalized_l2(&self, l2_block: u64) {
+        self.finalized_l2.store(l2_block, Ordering::Release);
     }
 }
 
@@ -230,12 +185,8 @@ mod tests {
     fn record(l1_block: u64, tx_byte: u8, last_l2_block: u64) -> BatchRecord {
         BatchRecord {
             l1_block,
-            l1_block_hash: B256::with_last_byte(0x11),
             tx_hash: B256::with_last_byte(tx_byte),
-            last_l2: L2BlockRef {
-                number: last_l2_block,
-                hash: B256::with_last_byte(tx_byte),
-            },
+            last_l2_block,
         }
     }
 
@@ -273,18 +224,15 @@ mod tests {
             record(101, 0xcc, 70),
             record(102, 0xdd, 80),
         ]);
-        head.set_finalized_ref(Some(L2BlockRef {
-            number: 60,
-            hash: B256::with_last_byte(0xbb),
-        }));
+        head.set_finalized_l2(60);
         let (new_cursor, new_finalized, dropped) = head.retreat_on_l1_reorg(100);
-        assert_eq!(new_cursor.map(|r| r.number), Some(60)); // both batches at L1=100 survive
-        assert_eq!(new_finalized.map(|r| r.number), Some(60));
+        assert_eq!(new_cursor, 60); // both batches at L1=100 survive
+        assert_eq!(new_finalized, 60);
         assert_eq!(dropped, 2);
     }
 
     #[test]
-    fn highest_l2_ref_at_or_below_l1_returns_max_within_bound() {
+    fn highest_l2_at_or_below_l1_returns_max_within_bound() {
         let head = L1CanonicalHead::default();
         head.append_many([
             record(100, 0xaa, 50),
@@ -292,26 +240,8 @@ mod tests {
             record(101, 0xcc, 70),
             record(102, 0xdd, 80),
         ]);
-        let at_100 = head.highest_l2_ref_at_or_below_l1(100).unwrap();
-        assert_eq!(at_100.number, 60);
-        assert_eq!(at_100.hash, B256::with_last_byte(0xbb));
-        let at_101 = head.highest_l2_ref_at_or_below_l1(101).unwrap();
-        assert_eq!(at_101.number, 70);
-        assert_eq!(at_101.hash, B256::with_last_byte(0xcc));
-        assert!(head.highest_l2_ref_at_or_below_l1(99).is_none());
-    }
-
-    #[test]
-    fn finalized_ref_tracks_hash_bearing_checkpoint() {
-        let head = L1CanonicalHead::default();
-        head.append_many([record(100, 0xaa, 50), record(101, 0xbb, 60)]);
-        let checkpoint = L2BlockRef {
-            number: 60,
-            hash: B256::with_last_byte(0xbb),
-        };
-        head.set_finalized_ref(Some(checkpoint));
-
-        assert_eq!(head.finalized_ref(), Some(checkpoint));
-        assert_eq!(head.finalized_l2(), 60);
+        assert_eq!(head.highest_l2_at_or_below_l1(100), Some(60));
+        assert_eq!(head.highest_l2_at_or_below_l1(101), Some(70));
+        assert_eq!(head.highest_l2_at_or_below_l1(99), None);
     }
 }
