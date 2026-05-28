@@ -489,42 +489,9 @@ where
             cursor = self.cursor(),
             "deriver loop started",
         );
-        let mut needs_catch_up = false;
         loop {
             match rx.recv().await {
                 Ok(event) => {
-                    if needs_catch_up {
-                        match self.catch_up().await {
-                            Ok(()) => {
-                                needs_catch_up = false;
-                                event!(
-                                    name: "eez.deriver.resync.succeeded",
-                                    Level::INFO,
-                                    cursor = self.cursor(),
-                                    "catch_up repaired deriver state after a missed or failed event",
-                                );
-                            }
-                            Err(err) => {
-                                if err.is_committer_closed() {
-                                    event!(
-                                        name: "eez.deriver.committer.closed",
-                                        Level::ERROR,
-                                        error = %err,
-                                        "block committer gone; deriver exiting",
-                                    );
-                                    return;
-                                }
-                                event!(
-                                    name: "eez.deriver.resync.retry_failed",
-                                    Level::WARN,
-                                    error = %err,
-                                    "catch_up still failing; skipping live event until resync succeeds",
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                    let is_batch_posted = matches!(&event, L1Event::BatchPosted { .. });
                     if let Err(err) = self.handle_event(event).await {
                         if err.is_committer_closed() {
                             event!(
@@ -534,44 +501,6 @@ where
                                 "block committer gone; deriver exiting",
                             );
                             return;
-                        }
-                        if is_batch_posted {
-                            event!(
-                                name: "eez.deriver.batch_posted.failed",
-                                Level::WARN,
-                                error = %err,
-                                "BatchPosted handling failed; running catch_up before processing later live events",
-                            );
-                            needs_catch_up = true;
-                            match self.catch_up().await {
-                                Ok(()) => {
-                                    needs_catch_up = false;
-                                    event!(
-                                        name: "eez.deriver.resync.succeeded",
-                                        Level::INFO,
-                                        cursor = self.cursor(),
-                                        "catch_up repaired deriver state after BatchPosted failure",
-                                    );
-                                }
-                                Err(resync_err) => {
-                                    if resync_err.is_committer_closed() {
-                                        event!(
-                                            name: "eez.deriver.committer.closed",
-                                            Level::ERROR,
-                                            error = %resync_err,
-                                            "block committer gone; deriver exiting",
-                                        );
-                                        return;
-                                    }
-                                    event!(
-                                        name: "eez.deriver.resync.failed",
-                                        Level::WARN,
-                                        error = %resync_err,
-                                        "catch_up after BatchPosted failure failed; will retry before next live event",
-                                    );
-                                }
-                            }
-                            continue;
                         }
                         event!(
                             name: "eez.deriver.event.failed",
@@ -586,9 +515,8 @@ where
                         name: "eez.deriver.l1_events.lagged",
                         Level::WARN,
                         skipped,
-                        "L1 event stream lagged; catch_up will run before the next live event",
+                        "L1 event stream lagged; cursor may be stale until next batch",
                     );
-                    needs_catch_up = true;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     event!(
