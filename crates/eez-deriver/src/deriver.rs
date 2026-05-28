@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
-use eez_driver::BlockCommitterHandle;
+use eez_driver::{BlockCommitterHandle, DeriveOutcome};
 use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Watcher, Submitter};
 use reth_chainspec::ChainSpec;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -164,7 +164,6 @@ where
         let known_tx_hashes = self.inner.l1_head.known_tx_hashes();
         let mut new_batches: Vec<BatchRecord> = Vec::new();
         let mut cumulative_l2: u64 = 0;
-        let mut cumulative_tip_header: Option<SealedHeader<alloy_consensus::Header>> = None;
         let mut last_replayed: Option<u64> = None;
         for batch in &historical {
             let decoded = eez_payload_codec::decode(batch.call_data.as_ref())?;
@@ -182,13 +181,8 @@ where
                 continue;
             }
 
-            let block_count = decoded.block_count() as u64;
-            if block_count == 0 {
-                continue;
-            }
-
             let batch_first_l2 = cumulative_l2 + 1;
-            let batch_last_l2 = cumulative_l2 + block_count;
+            let batch_last_l2 = cumulative_l2 + decoded.block_count() as u64;
 
             // Same per-block reconciliation as on_batch_posted:
             // replay any block whose local content doesn't match the
@@ -197,38 +191,30 @@ where
             // agree with (e.g., the previous proposing run lost a race
             // and never reorged its local chain).
             let mut tx_offset = 0usize;
-            let mut batch_tip_header: Option<SealedHeader<alloy_consensus::Header>> = None;
             for (i, count) in decoded.block_tx_counts.iter().enumerate() {
                 let l2_block = batch_first_l2 + i as u64;
                 let count_usize = usize::from(*count);
                 let block_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
                 tx_offset += count_usize;
 
-                let matched_header =
-                    local_block_matches(&self.inner.l2_provider, l2_block, block_txs)?;
+                let matched = local_block_matches(&self.inner.l2_provider, l2_block, block_txs)?;
                 event!(
                     name: "eez.deriver.catch_up.block",
                     Level::DEBUG,
                     l1_block_number = batch.l1_block_number,
                     tx_hash = %batch.tx_hash,
                     l2_block,
-                    action = if matched_header.is_some() { "skip" } else { "replay" },
+                    action = if matched { "skip" } else { "replay" },
                     tx_count = block_txs.len(),
                     "catch_up_to: reconciling batch block",
                 );
-                let reconciled_header = if let Some(header) = matched_header {
-                    header
-                } else {
-                    let parent_block_number = l2_block - 1;
-                    let header = self.replay_block(parent_block_number, block_txs).await?;
-                    last_replayed = Some(l2_block);
-                    header
-                };
-                batch_tip_header = Some(reconciled_header);
+                if matched {
+                    continue;
+                }
+                let parent_block_number = l2_block - 1;
+                self.replay_block(parent_block_number, block_txs).await?;
+                last_replayed = Some(l2_block);
             }
-            let batch_tip_header = batch_tip_header.ok_or_else(|| {
-                DeriverError::l2_provider(format!("batch {} applied no L2 blocks", batch.tx_hash))
-            })?;
             if !known_tx_hashes.contains(&batch.tx_hash) {
                 new_batches.push(BatchRecord {
                     l1_block: batch.l1_block_number,
@@ -242,7 +228,17 @@ where
             // (during startup catch-up) instead of waiting for a live
             // event later.
             if let Some(claimed) = batch.claimed_new_state {
-                let local_root = batch_tip_header.state_root();
+                let local_root = self
+                    .inner
+                    .l2_provider
+                    .sealed_header(batch_last_l2)
+                    .map_err(DeriverError::l2_provider)?
+                    .ok_or_else(|| {
+                        DeriverError::l2_provider(format!(
+                            "local L2 header at {batch_last_l2} missing"
+                        ))
+                    })?
+                    .state_root();
                 if local_root != claimed {
                     event!(
                         name: "eez.deriver.state.diverged",
@@ -258,7 +254,6 @@ where
                 }
             }
             cumulative_l2 = batch_last_l2;
-            cumulative_tip_header = Some(batch_tip_header);
         }
 
         // Index every batch we walked (de-duped against startup
@@ -273,10 +268,7 @@ where
         // catch the safe head up after a bulk replay so RPC clients
         // see the right safe head before the next live event lands.
         if cumulative_l2 > self.inner.safe_l2_block.load(Ordering::Acquire) {
-            let safe_hash = cumulative_tip_header
-                .as_ref()
-                .ok_or_else(|| DeriverError::l2_provider("no reconciled batch tip header"))?
-                .hash();
+            let safe_hash = self.l2_hash_at(cumulative_l2)?;
             let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
             self.inner
                 .committer
@@ -460,15 +452,9 @@ where
         &self,
         parent_block_number: u64,
         raw_txs: &[Vec<u8>],
-    ) -> DeriverResult<SealedHeader<alloy_consensus::Header>> {
+    ) -> DeriverResult<DeriveOutcome> {
         let (payload, header) = self.execute_block(parent_block_number, raw_txs)?;
-        let outcome = self
-            .inner
-            .committer
-            .commit_derived(payload, header.clone())
-            .await?;
-        debug_assert_eq!(outcome.block_hash, header.hash());
-        Ok(header)
+        Ok(self.inner.committer.commit_derived(payload, header).await?)
     }
 
     /// Runs the deriver loop. Subscribes to the `L1Watcher`'s event
@@ -649,36 +635,32 @@ where
         // state mutation already happened on failure.
         let mut tx_offset = 0usize;
         let mut replayed_count: u64 = 0;
-        let mut reconciled_tip_header: Option<SealedHeader<alloy_consensus::Header>> = None;
         for (i, count) in decoded.block_tx_counts.iter().enumerate() {
             let l2_block = from_block + i as u64;
             let count_usize = usize::from(*count);
             let block_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
             tx_offset += count_usize;
-            let matched_header = local_block_matches(&self.inner.l2_provider, l2_block, block_txs)?;
+            let matched = local_block_matches(&self.inner.l2_provider, l2_block, block_txs)?;
             event!(
                 name: "eez.deriver.reconcile.block",
                 Level::DEBUG,
                 l1_block_number,
                 tx_hash = %tx_hash,
                 l2_block,
-                action = if matched_header.is_some() { "skip" } else { "replay" },
+                action = if matched { "skip" } else { "replay" },
                 tx_count = block_txs.len(),
                 replayed_so_far = replayed_count,
                 "reconciling batch block",
             );
-            let reconciled_header = if let Some(header) = matched_header {
-                header
-            } else {
-                // If replay fails, the error propagates out. Subsequent logs
-                // (`execute_block.parent_missing`, `execute_block.no_state`,
-                // etc.) show why; the `replayed_so_far` value above is what
-                // we'd want to roll back if we made the loop transactional.
-                let header = self.replay_block(l2_block - 1, block_txs).await?;
-                replayed_count += 1;
-                header
-            };
-            reconciled_tip_header = Some(reconciled_header);
+            if matched {
+                continue;
+            }
+            // If replay fails, the error propagates out. Subsequent logs
+            // (`execute_block.parent_missing`, `execute_block.no_state`,
+            // etc.) show why; the `replayed_so_far` value above is what
+            // we'd want to roll back if we made the loop transactional.
+            self.replay_block(l2_block - 1, block_txs).await?;
+            replayed_count += 1;
         }
         event!(
             name: "eez.deriver.reconcile.done",
@@ -691,9 +673,14 @@ where
             "per-block reconciliation complete (pre-divergence check)",
         );
 
-        let new_safe_header = reconciled_tip_header.ok_or_else(|| {
-            DeriverError::l2_provider(format!("batch {tx_hash} applied no L2 blocks"))
-        })?;
+        let new_safe_header = self
+            .inner
+            .l2_provider
+            .sealed_header(to_block)
+            .map_err(DeriverError::l2_provider)?
+            .ok_or_else(|| {
+                DeriverError::l2_provider(format!("local L2 header at {to_block} missing"))
+            })?;
 
         // Divergence detection (mock-prover regime): the on-chain
         // `StateDelta.newState` should equal our STF's state root at
@@ -872,25 +859,25 @@ where
     }
 }
 
-/// Returns the local header iff reth has a block at `block_number`
-/// whose tx list (in encoded-2718 form) matches the given expected
-/// bytes. Returns `None` if local is missing the block or has different
-/// content — caller's signal to STF-replay this slot and let reth reorg
-/// if needed (W3.15 fork-switch path).
+/// Returns `true` iff local reth has a block at `block_number` whose
+/// tx list (in encoded-2718 form) matches the given expected bytes.
+/// Returns `false` if local is missing the block or has different
+/// content — caller's signal to STF-replay this slot and let reth
+/// reorg if needed (W3.15 fork-switch path).
 fn local_block_matches<L2>(
     l2_provider: &Arc<L2>,
     block_number: u64,
     expected_txs: &[Vec<u8>],
-) -> DeriverResult<Option<SealedHeader<alloy_consensus::Header>>>
+) -> DeriverResult<bool>
 where
-    L2: BlockReader<Header = alloy_consensus::Header>,
+    L2: BlockReader,
     <L2 as TransactionsProvider>::Transaction: Encodable2718,
 {
     let Some(local_block) = l2_provider
         .block_by_number(block_number)
         .map_err(DeriverError::l2_provider)?
     else {
-        return Ok(None);
+        return Ok(false);
     };
     let local_txs: Vec<Vec<u8>> = local_block
         .body()
@@ -899,14 +886,10 @@ where
         .map(Encodable2718::encoded_2718)
         .collect();
     if local_txs.len() != expected_txs.len() {
-        return Ok(None);
+        return Ok(false);
     }
-    if !local_txs
+    Ok(local_txs
         .iter()
         .zip(expected_txs.iter())
-        .all(|(l, e)| l == e)
-    {
-        return Ok(None);
-    }
-    Ok(Some(SealedHeader::seal_slow(local_block.header().clone())))
+        .all(|(l, e)| l == e))
 }
