@@ -7,12 +7,12 @@
 //! at `/root/sync-rollups-composer/crates/based-rollup/src/driver/protocol_txs.rs:453`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
-use eez_driver::{BlockCommitterHandle, DeriveOutcome, ForkchoiceOutcome};
+use eez_driver::{BlockCommitterHandle, DeriveOutcome};
 use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Watcher, Submitter};
 use reth_chainspec::ChainSpec;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -58,9 +58,6 @@ where
     /// `finalized_l2`. The Deriver is the sole writer; the Composer
     /// reads `cursor()` to compute the next batch's `from_block`.
     l1_head: Arc<L1CanonicalHead>,
-    /// If true, an L1 reorg that retreats safe also retreats head to the
-    /// surviving L1-derived block. Used by L1-derived-only followers.
-    retreat_head_on_l1_reorg: AtomicBool,
     /// L2 block number currently reth `safe` head points at. Mirrors
     /// what we last passed to [`BlockCommitterHandle::advance_safe_finalized`];
     /// used to compute the FCU when advancing finalized without
@@ -119,21 +116,9 @@ where
                 evm_config,
                 deploy_block,
                 l1_head,
-                retreat_head_on_l1_reorg: AtomicBool::new(false),
                 safe_l2_block: AtomicU64::new(0),
             }),
         }
-    }
-
-    /// In L1-derived-only mode, L1 reorgs should retreat the FCU head
-    /// along with safe/finalized instead of leaving an unsafe head above
-    /// the surviving L1-derived cursor.
-    #[must_use]
-    pub fn with_l1_reorg_head_retreat(self) -> Self {
-        self.inner
-            .retreat_head_on_l1_reorg
-            .store(true, Ordering::Release);
-        self
     }
 
     /// Current cursor — highest L2 block confirmed by any L1-landed
@@ -670,9 +655,13 @@ where
             return Ok(());
         }
 
-        // Compute the new safe head's L2 hash. (even if new_cursor is 0)
-        let new_safe_header = self.l2_header_at(new_cursor)?;
-        let new_safe_hash = new_safe_header.hash();
+        // Compute the new safe head's L2 hash.
+        let new_safe_hash = if new_cursor == 0 {
+            // Fall back to L2 genesis. The L2 provider should have it.
+            self.l2_hash_at(0)?
+        } else {
+            self.l2_hash_at(new_cursor)?
+        };
 
         // Finalized was already bounded inside retreat_on_l1_reorg.
         let new_finalized = self.inner.l1_head.finalized_l2();
@@ -687,20 +676,6 @@ where
             .safe_l2_block
             .store(new_cursor, Ordering::Release);
 
-        let retreated_head = self.inner.retreat_head_on_l1_reorg.load(Ordering::Acquire);
-        if retreated_head {
-            let outcome = self
-                .inner
-                .committer
-                .advance_unsafe_head(new_safe_header)
-                .await?;
-            if outcome != ForkchoiceOutcome::Valid {
-                return Err(DeriverError::invalid_forkchoice(format!(
-                    "L1-derived head retreat returned {outcome:?}"
-                )));
-            }
-        }
-
         event!(
             name: "eez.deriver.l1.reorg.retreated",
             Level::WARN,
@@ -711,7 +686,6 @@ where
             old_cursor,
             new_cursor,
             dropped_batches = dropped,
-            retreated_head,
             "L1 reorg rolled out confirmed batches; L2 safe head retreated",
         );
         Ok(())
@@ -754,17 +728,15 @@ where
     }
 
     fn l2_hash_at(&self, l2_block: u64) -> DeriverResult<B256> {
-        Ok(self.l2_header_at(l2_block)?.hash())
-    }
-
-    fn l2_header_at(&self, l2_block: u64) -> DeriverResult<SealedHeader<alloy_consensus::Header>> {
-        self.inner
+        Ok(self
+            .inner
             .l2_provider
             .sealed_header(l2_block)
             .map_err(DeriverError::l2_provider)?
             .ok_or_else(|| {
                 DeriverError::l2_provider(format!("local L2 header at {l2_block} missing"))
-            })
+            })?
+            .hash())
     }
 
     /// Per-block reconciliation against a decoded batch beginning at

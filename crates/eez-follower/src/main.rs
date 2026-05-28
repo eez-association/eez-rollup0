@@ -91,7 +91,6 @@ fn main() -> eyre::Result<()> {
         let l1_head = Arc::new(L1CanonicalHead::default());
         let submitter = Submitter::new(submitter_config);
         let l1_watcher = L1Watcher::spawn(l1_watcher_config);
-        let l1_derived_only = ext.sequencer_rpc.is_none();
         let deriver = Deriver::new(
             l1_watcher,
             block_committer.clone(),
@@ -101,11 +100,6 @@ fn main() -> eyre::Result<()> {
             deploy_block,
             Arc::clone(&l1_head),
         );
-        let deriver = if l1_derived_only {
-            deriver.with_l1_reorg_head_retreat()
-        } else {
-            deriver
-        };
 
         if let Err(err) = deriver.catch_up().await {
             event!(

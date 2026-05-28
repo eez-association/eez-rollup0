@@ -10,7 +10,7 @@
 //! - `Sequence` — Sequencer's per-tick FCU+attrs → resolve payload → newPayload.
 //! - `RefreshForkchoice` — bare FCU to keep reth's view alive during quiet periods.
 //! - `AdvanceSafeFinalized` — Deriver pushes safe/finalized cursors forward.
-//! - `AdvanceHead` — points unsafe head at an externally selected block.
+//! - `AdvanceHead` — follower points unsafe head at a sequencer-served block.
 //! - `Derive` — Deriver submits a pre-built `ExecutionPayload` via newPayload + head-FCU.
 //!
 //! Until the Deriver speaks, `safe` and `finalized` stay at the boot-time head.
@@ -241,8 +241,7 @@ where
     /// finalized stay exactly where the committer last accepted them.
     ///
     /// This is used by follower nodes whose unsafe head comes from a
-    /// sequencer RPC, and by L1-derived-only followers when an L1 reorg
-    /// retreats head to safe. A `SYNCING` response is returned as a successful
+    /// sequencer RPC. A `SYNCING` response is returned as a successful
     /// [`ForkchoiceOutcome::Syncing`]; the engine has accepted the target
     /// and will backfill it through normal sync.
     ///
