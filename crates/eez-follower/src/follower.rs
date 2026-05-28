@@ -5,14 +5,13 @@
 //! reth to point unsafe head at the sequencer's latest block while that
 //! head remains compatible with the L1-derived anchors.
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use alloy_eips::BlockNumberOrTag;
 use alloy_provider::{Provider, RootProvider};
 use eez_driver::{BlockCommitterHandle, ForkchoiceOutcome, Scheduler};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_primitives_traits::SealedHeader;
-use reth_storage_api::HeaderProvider;
 use tracing::{Level, event};
 
 use crate::error::FollowerError;
@@ -24,32 +23,23 @@ const FCU_REFRESH: Duration = Duration::from_secs(1);
 /// Polls the sequencer RPC for unsafe heads and routes every engine call
 /// through the shared [`BlockCommitterHandle`].
 #[derive(Debug)]
-pub(crate) struct Follower<P>
-where
-    P: HeaderProvider<Header = alloy_consensus::Header>,
-{
+pub(crate) struct Follower {
     committer: BlockCommitterHandle<EthEngineTypes>,
     sequencer_rpc: RootProvider,
     scheduler: Scheduler,
-    l2_provider: Arc<P>,
     last_head: Option<alloy_primitives::B256>,
 }
 
-impl<P> Follower<P>
-where
-    P: HeaderProvider<Header = alloy_consensus::Header> + Send + Sync + 'static,
-{
+impl Follower {
     pub(crate) fn new(
         committer: BlockCommitterHandle<EthEngineTypes>,
         sequencer_rpc: RootProvider,
         scheduler: Scheduler,
-        l2_provider: Arc<P>,
     ) -> Self {
         Self {
             committer,
             sequencer_rpc,
             scheduler,
-            l2_provider,
             last_head: None,
         }
     }
@@ -117,7 +107,6 @@ where
                 Ok(())
             }
             Ok(ForkchoiceOutcome::Syncing) => {
-                self.last_head = Some(hash);
                 event!(
                     name: "eez.follower.head.syncing",
                     Level::INFO,
@@ -127,63 +116,13 @@ where
                 );
                 Ok(())
             }
-            Err(err) if err.is_invalid_forkchoice_state() => {
+            Ok(ForkchoiceOutcome::InvalidState) => {
                 event!(
                     name: "eez.follower.head.inconsistent",
                     Level::WARN,
                     block.number = number,
                     block.hash = %hash,
-                    error = %err,
-                    "sequencer head is incompatible with current L1-derived safe/finalized anchors; recovering to safe",
-                );
-                self.recover_to_safe().await
-            }
-            Err(err) if err.is_invalid_forkchoice_payload() => {
-                event!(
-                    name: "eez.follower.head.invalid_payload",
-                    Level::ERROR,
-                    block.number = number,
-                    block.hash = %hash,
-                    error = %err,
-                    "reth marked sequencer head invalid; not recovering as an L1-safe conflict",
-                );
-                Err(FollowerError::Driver(err.to_string()))
-            }
-            Err(err) => Err(FollowerError::Driver(err.to_string())),
-        }
-    }
-
-    async fn recover_to_safe(&mut self) -> Result<(), FollowerError> {
-        let safe_hash = self.committer.safe_hash();
-        let safe_header = self
-            .l2_provider
-            .sealed_header_by_hash(safe_hash)
-            .map_err(|e| FollowerError::Driver(format!("safe header lookup {safe_hash}: {e}")))?
-            .ok_or_else(|| {
-                FollowerError::Driver(format!("safe header {safe_hash} missing locally"))
-            })?;
-
-        match self
-            .committer
-            .recover_head_to_current_safe(safe_header)
-            .await
-        {
-            Ok(ForkchoiceOutcome::Valid) => {
-                self.last_head = Some(safe_hash);
-                event!(
-                    name: "eez.follower.head.recovered_to_safe",
-                    Level::WARN,
-                    safe.hash = %safe_hash,
-                    "recovered forkchoice to L1-derived safe head",
-                );
-                Ok(())
-            }
-            Ok(ForkchoiceOutcome::Syncing) => {
-                event!(
-                    name: "eez.follower.head.recovery_syncing",
-                    Level::WARN,
-                    safe.hash = %safe_hash,
-                    "recovery FCU returned SYNCING; will retry",
+                    "sequencer head is incompatible with current L1-derived safe/finalized anchors; dropping unsafe head",
                 );
                 Ok(())
             }

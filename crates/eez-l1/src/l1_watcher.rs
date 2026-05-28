@@ -321,7 +321,7 @@ impl L1Watcher {
             }
         }
 
-        if state.last_finalized_hash.is_none() || tick_count % FINALIZED_REFRESH_TICKS == 0 {
+        if tick_count % FINALIZED_REFRESH_TICKS == 0 {
             self.refresh_finalized(provider, state).await?;
         }
 

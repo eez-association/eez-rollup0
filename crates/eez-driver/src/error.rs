@@ -29,14 +29,6 @@ pub(crate) enum ErrorKind {
     MissingHeader { block_number: u64 },
     /// `engine_forkchoiceUpdated` returned a non-`VALID` status.
     InvalidForkchoice(String),
-    /// `engine_forkchoiceUpdated` returned `payloadStatus: INVALID`.
-    InvalidForkchoicePayload(String),
-    /// `engine_forkchoiceUpdated` returned `ForkchoiceUpdateError::InvalidState`.
-    InvalidForkchoiceState(String),
-    /// `engine_forkchoiceUpdated` returned `ForkchoiceUpdateError::UnknownFinalBlock`.
-    UnknownFinalBlock(String),
-    /// `engine_forkchoiceUpdated` returned `ForkchoiceUpdateError::UpdatedInvalidPayloadAttributes`.
-    InvalidPayloadAttributes(String),
     /// `engine_newPayload` returned a non-`VALID` status.
     InvalidPayload(String),
     /// Payload builder returned no payload for an issued ID.
@@ -59,22 +51,6 @@ impl DriverError {
 
     pub(crate) fn invalid_forkchoice(detail: impl Into<String>) -> Self {
         Self::new(ErrorKind::InvalidForkchoice(detail.into()))
-    }
-
-    pub(crate) fn invalid_forkchoice_payload(detail: impl Into<String>) -> Self {
-        Self::new(ErrorKind::InvalidForkchoicePayload(detail.into()))
-    }
-
-    pub(crate) fn invalid_forkchoice_state(detail: impl Into<String>) -> Self {
-        Self::new(ErrorKind::InvalidForkchoiceState(detail.into()))
-    }
-
-    pub(crate) fn unknown_final_block(detail: impl Into<String>) -> Self {
-        Self::new(ErrorKind::UnknownFinalBlock(detail.into()))
-    }
-
-    pub(crate) fn invalid_payload_attributes(detail: impl Into<String>) -> Self {
-        Self::new(ErrorKind::InvalidPayloadAttributes(detail.into()))
     }
 
     pub(crate) fn invalid_payload(detail: impl Into<String>) -> Self {
@@ -115,39 +91,7 @@ impl DriverError {
     /// Returns true if the engine rejected a forkchoice update.
     #[must_use]
     pub fn is_invalid_forkchoice(&self) -> bool {
-        matches!(
-            self.kind,
-            ErrorKind::InvalidForkchoice(_)
-                | ErrorKind::InvalidForkchoicePayload(_)
-                | ErrorKind::InvalidForkchoiceState(_)
-                | ErrorKind::UnknownFinalBlock(_)
-                | ErrorKind::InvalidPayloadAttributes(_)
-        )
-    }
-
-    /// Returns true if reth rejected the FCU as an invalid or inconsistent
-    /// forkchoice state.
-    #[must_use]
-    pub fn is_invalid_forkchoice_state(&self) -> bool {
-        matches!(self.kind, ErrorKind::InvalidForkchoiceState(_))
-    }
-
-    /// Returns true if reth returned `payloadStatus: INVALID` for the FCU.
-    #[must_use]
-    pub fn is_invalid_forkchoice_payload(&self) -> bool {
-        matches!(self.kind, ErrorKind::InvalidForkchoicePayload(_))
-    }
-
-    /// Returns true if reth could not resolve the requested finalized block.
-    #[must_use]
-    pub fn is_unknown_final_block(&self) -> bool {
-        matches!(self.kind, ErrorKind::UnknownFinalBlock(_))
-    }
-
-    /// Returns true if reth rejected supplied payload attributes.
-    #[must_use]
-    pub fn is_invalid_payload_attributes(&self) -> bool {
-        matches!(self.kind, ErrorKind::InvalidPayloadAttributes(_))
+        matches!(self.kind, ErrorKind::InvalidForkchoice(_))
     }
 
     /// Returns true if the engine rejected a built payload.
@@ -187,21 +131,6 @@ impl fmt::Display for DriverError {
             }
             ErrorKind::InvalidForkchoice(detail) => {
                 write!(f, "engine rejected forkchoice update: {detail}")
-            }
-            ErrorKind::InvalidForkchoicePayload(detail) => {
-                write!(f, "engine marked forkchoice payload invalid: {detail}")
-            }
-            ErrorKind::InvalidForkchoiceState(detail) => {
-                write!(
-                    f,
-                    "engine rejected forkchoice state as inconsistent: {detail}"
-                )
-            }
-            ErrorKind::UnknownFinalBlock(detail) => {
-                write!(f, "engine could not resolve finalized block: {detail}")
-            }
-            ErrorKind::InvalidPayloadAttributes(detail) => {
-                write!(f, "engine rejected payload attributes: {detail}")
             }
             ErrorKind::InvalidPayload(detail) => {
                 write!(f, "engine rejected new payload: {detail}")

@@ -118,12 +118,7 @@ fn main() -> eyre::Result<()> {
         if let Some(sequencer_rpc) = ext.sequencer_rpc {
             let sequencer_rpc = RootProvider::new_http(sequencer_rpc);
             let scheduler = Scheduler::interval(BLOCK_TIME);
-            let follower = Follower::new(
-                block_committer,
-                sequencer_rpc,
-                scheduler,
-                Arc::new(provider.clone()),
-            );
+            let follower = Follower::new(block_committer, sequencer_rpc, scheduler);
             event!(
                 name: "eez.follower.sequencer_rpc.spawned",
                 Level::INFO,

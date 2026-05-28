@@ -202,9 +202,6 @@ impl Submitter {
             let l1_block_number = log
                 .block_number
                 .ok_or_else(|| L1Error::Provider("BatchPosted log missing block_number".into()))?;
-            let l1_block_hash = log
-                .block_hash
-                .ok_or_else(|| L1Error::Provider("BatchPosted log missing block_hash".into()))?;
             let tx_hash = log
                 .transaction_hash
                 .ok_or_else(|| L1Error::Provider("BatchPosted log missing tx_hash".into()))?;
@@ -223,7 +220,6 @@ impl Submitter {
             let state_applied = winner_tx_hashes.contains(&tx_hash);
             out.push(HistoricalBatch {
                 l1_block_number,
-                l1_block_hash,
                 tx_hash,
                 submitter,
                 call_data: decoded.batch.callData,
@@ -241,7 +237,6 @@ impl Submitter {
 #[derive(Debug, Clone)]
 pub struct HistoricalBatch {
     pub l1_block_number: u64,
-    pub l1_block_hash: alloy_primitives::B256,
     pub tx_hash: alloy_primitives::B256,
     pub submitter: alloy_primitives::Address,
     pub call_data: alloy_primitives::Bytes,

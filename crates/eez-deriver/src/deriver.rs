@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
-use eez_driver::{BlockCommitterHandle, DeriveOutcome, ForkchoiceOutcome};
+use eez_driver::{BlockCommitterHandle, DeriveOutcome};
 use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Watcher, Submitter};
 use reth_chainspec::ChainSpec;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -23,7 +23,7 @@ use reth_payload_primitives::PayloadTypes;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody, SealedHeader, SignedTransaction};
 use reth_provider::StateProviderFactory;
 use reth_revm::database::StateProviderDatabase;
-use reth_storage_api::{BlockReader, HeaderProvider, TransactionsProvider};
+use reth_storage_api::{BlockReader, TransactionsProvider};
 use revm::database::State;
 use tokio::sync::broadcast;
 use tracing::{Level, event};
@@ -270,7 +270,9 @@ where
         if cumulative_l2 > self.inner.safe_l2_block.load(Ordering::Acquire) {
             let safe_hash = self.l2_hash_at(cumulative_l2)?;
             let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
-            self.advance_safe_finalized_or_recover(cumulative_l2, safe_hash, finalized_hash)
+            self.inner
+                .committer
+                .advance_safe_finalized(safe_hash, finalized_hash)
                 .await?;
             self.inner
                 .safe_l2_block
@@ -453,72 +455,6 @@ where
     ) -> DeriverResult<DeriveOutcome> {
         let (payload, header) = self.execute_block(parent_block_number, raw_txs)?;
         Ok(self.inner.committer.commit_derived(payload, header).await?)
-    }
-
-    async fn advance_safe_finalized_or_recover(
-        &self,
-        safe_l2: u64,
-        safe_hash: B256,
-        finalized_hash: B256,
-    ) -> DeriverResult<()> {
-        match self
-            .inner
-            .committer
-            .advance_safe_finalized(safe_hash, finalized_hash)
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(err) if err.is_invalid_forkchoice_state() => {
-                event!(
-                    name: "eez.deriver.safe.inconsistent",
-                    Level::WARN,
-                    l2_safe = safe_l2,
-                    safe_hash = %safe_hash,
-                    finalized_hash = %finalized_hash,
-                    error = %err,
-                    "L1-derived safe/finalized hashes are incompatible with the current head; recovering head to safe",
-                );
-                let safe_header = self
-                    .inner
-                    .l2_provider
-                    .sealed_header_by_hash(safe_hash)
-                    .map_err(DeriverError::l2_provider)?
-                    .ok_or_else(|| {
-                        DeriverError::l2_provider(format!(
-                            "L1-derived safe header {safe_hash} missing locally"
-                        ))
-                    })?;
-                if safe_header.number() != safe_l2 {
-                    return Err(DeriverError::l2_provider(format!(
-                        "L1-derived safe hash {safe_hash} resolved to block {}, expected {safe_l2}",
-                        safe_header.number()
-                    )));
-                }
-
-                match self
-                    .inner
-                    .committer
-                    .recover_head_to_safe(safe_header, Some(finalized_hash))
-                    .await?
-                {
-                    ForkchoiceOutcome::Valid => {
-                        event!(
-                            name: "eez.deriver.safe.recovered",
-                            Level::WARN,
-                            l2_safe = safe_l2,
-                            safe_hash = %safe_hash,
-                            finalized_hash = %finalized_hash,
-                            "recovered forkchoice head to L1-derived safe block",
-                        );
-                        Ok(())
-                    }
-                    ForkchoiceOutcome::Syncing => Err(DeriverError::invalid_forkchoice(format!(
-                        "recovery FCU for L1-derived safe {safe_hash} returned SYNCING"
-                    ))),
-                }
-            }
-            Err(err) => Err(err.into()),
-        }
     }
 
     /// Runs the deriver loop. Subscribes to the `L1Watcher`'s event
@@ -779,7 +715,9 @@ where
         // Advance safe; keep finalized where it is (only L1 finality
         // moves it).
         let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
-        self.advance_safe_finalized_or_recover(to_block, new_safe_hash, finalized_hash)
+        self.inner
+            .committer
+            .advance_safe_finalized(new_safe_hash, finalized_hash)
             .await?;
 
         self.inner.safe_l2_block.store(to_block, Ordering::Release);
@@ -817,7 +755,7 @@ where
         // L1CanonicalHead handles the cursor + finalized retreats
         // atomically; we just propagate to reth's safe head below.
         let old_cursor = self.inner.l1_head.cursor();
-        let (new_cursor, new_finalized, dropped) = self
+        let (new_cursor, _new_finalized, dropped) = self
             .inner
             .l1_head
             .retreat_on_l1_reorg(common_ancestor_number);
@@ -845,9 +783,12 @@ where
         };
 
         // Finalized was already bounded inside retreat_on_l1_reorg.
+        let new_finalized = self.inner.l1_head.finalized_l2();
         let new_finalized_hash = self.l2_hash_at(new_finalized)?;
 
-        self.advance_safe_finalized_or_recover(new_cursor, new_safe_hash, new_finalized_hash)
+        self.inner
+            .committer
+            .advance_safe_finalized(new_safe_hash, new_finalized_hash)
             .await?;
 
         self.inner
@@ -890,7 +831,9 @@ where
 
         let safe_hash = self.l2_hash_at(current_safe)?;
         let finalized_hash = self.l2_hash_at(bounded)?;
-        self.advance_safe_finalized_or_recover(current_safe, safe_hash, finalized_hash)
+        self.inner
+            .committer
+            .advance_safe_finalized(safe_hash, finalized_hash)
             .await?;
         self.inner.l1_head.set_finalized_l2(bounded);
         event!(
