@@ -2812,8 +2812,10 @@ dependencies = [
  "eez-driver",
  "eez-payload-codec",
  "eez-prover",
+ "reqwest 0.12.28",
  "reth-primitives-traits",
  "reth-storage-api",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3783,6 +3785,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -6242,6 +6245,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
