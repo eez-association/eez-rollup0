@@ -183,12 +183,16 @@ where
             let batch_first_l2 = cumulative_l2 + 1;
             let batch_last_l2 = cumulative_l2 + decoded.block_count() as u64;
 
+            // Catch-up always replays — the deriver is the authority on L2
+            // chain state during boot. Skips would trust whatever's locally
+            // canonical, which can be a Sequencer-race-produced block.
             total_replayed += self
                 .reconcile_batch_blocks(
                     batch_first_l2,
                     &decoded,
                     batch.l1_block_number,
                     batch.tx_hash,
+                    true,
                 )
                 .await?;
 
@@ -573,10 +577,10 @@ where
         let to_block = last_indexed_l2 + block_count;
 
         // Per-block reconciliation: skip blocks that already match the
-        // batch, STF-replay the rest (reth fork-switches as needed). See
-        // `reconcile_batch_blocks` for the open transactional caveat.
+        // batch (tx-list + env determinism fields), STF-replay the rest
+        // (reth fork-switches as needed).
         let replayed = self
-            .reconcile_batch_blocks(from_block, &decoded, l1_block_number, tx_hash)
+            .reconcile_batch_blocks(from_block, &decoded, l1_block_number, tx_hash, false)
             .await?;
         event!(
             name: "eez.deriver.reconcile.done",
@@ -751,6 +755,7 @@ where
         decoded: &eez_payload_codec::DecodedBatch,
         l1_block_number: u64,
         tx_hash: B256,
+        force_replay: bool,
     ) -> DeriverResult<u64> {
         let mut tx_offset = 0usize;
         let mut replayed: u64 = 0;
@@ -759,7 +764,11 @@ where
             let count_usize = usize::from(*count);
             let block_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
             tx_offset += count_usize;
-            let matched = local_block_matches(&self.inner.l2_provider, l2_block, block_txs)?;
+            let matched = if force_replay {
+                false
+            } else {
+                local_block_matches(&self.inner.l2_provider, l2_block, block_txs)?
+            };
             event!(
                 name: "eez.deriver.reconcile.block",
                 Level::DEBUG,
@@ -824,11 +833,9 @@ where
     }
 }
 
-/// Returns `true` iff local reth has a block at `block_number` whose
-/// tx list (in encoded-2718 form) matches the given expected bytes.
-/// Returns `false` if local is missing the block or has different
-/// content — caller's signal to STF-replay this slot and let reth
-/// reorg if needed (fork-switch path).
+/// `true` iff local reth has a block at `block_number` whose tx list
+/// matches `expected_txs`. `false` if the block is missing or has
+/// different txs — caller's signal to STF-replay this slot.
 fn local_block_matches<L2>(
     l2_provider: &Arc<L2>,
     block_number: u64,
