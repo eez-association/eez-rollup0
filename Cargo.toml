@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/eez-deriver",
     "crates/eez-driver",
     "crates/eez-l1",
     "crates/eez-node",
@@ -31,19 +32,26 @@ mimalloc           = "0.1"
 # CLI
 clap               = { version = "4", features = ["derive"] }
 
-# reth — pinned to upstream tag v2.2.0.
-reth-chainspec                  = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-cli-runner                 = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-engine-primitives          = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-ethereum-cli               = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-node-builder               = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-node-ethereum              = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-payload-builder            = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-payload-primitives         = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+# reth — pinned to mediocregopher/partial-persistence-clean tip (contains the receipts-reorg truncation fix).
+reth-chain-state                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-chainspec                  = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-cli-runner                 = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-engine-primitives          = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-ethereum-cli               = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-ethereum-primitives        = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-evm                        = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-evm-ethereum               = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-node-builder               = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-node-ethereum              = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-payload-builder            = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-payload-primitives         = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-primitives-traits          = { version = "0.3.1", default-features = false }
-reth-storage-api                = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
-reth-tasks                      = { git = "https://github.com/paradigmxyz/reth", tag = "v2.2.0" }
+reth-provider                   = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-revm                       = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-storage-api                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-tasks                      = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+revm                            = { version = "38", default-features = false }
 
 # alloy — aligned with reth v2.2.0's transitive picks:
 #   consensus / eips / network / rpc-types-engine / provider / contract → 2.x
@@ -65,6 +73,7 @@ alloy-sol-types        = { version = "1", default-features = false }
 url                    = "2"
 
 # internal crates
+eez-deriver        = { path = "crates/eez-deriver" }
 eez-driver         = { path = "crates/eez-driver" }
 eez-l1             = { path = "crates/eez-l1" }
 eez-payload-codec  = { path = "crates/eez-payload-codec" }

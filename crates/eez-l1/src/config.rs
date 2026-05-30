@@ -23,6 +23,7 @@ const ENV_PROOF_SYSTEM_ADDRESS: &str = "EEZ_MOCK_PROOF_SYSTEM_ADDRESS";
 const ENV_ROLLUP_ID: &str = "EEZ_ROLLUP_ID";
 const ENV_DEPLOY_BLOCK: &str = "EEZ_REGISTRY_DEPLOY_BLOCK";
 const ENV_INTERVAL_SECS: &str = "EEZ_COMPOSER_INTERVAL_SECS";
+const ENV_EXPECT_EXTERNAL: &str = "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES";
 
 const DEFAULT_INTERVAL_SECS: u64 = 60;
 
@@ -36,6 +37,10 @@ pub struct SubmitterConfig {
     pub poster: PrivateKeySigner,
     /// Deployed `EEZ` (rollups registry) address.
     pub eez: Address,
+    /// Our rollup's id. Used by `scan_batches` to filter the
+    /// `L2ExecutionPerformed(rollupId indexed, ...)` event topic so
+    /// each historical batch is tagged winner / loser.
+    pub rollup_id: u64,
 }
 
 impl std::fmt::Debug for SubmitterConfig {
@@ -44,6 +49,7 @@ impl std::fmt::Debug for SubmitterConfig {
             .field("rpc_url", &self.rpc_url.as_str())
             .field("poster", &self.poster.address())
             .field("eez", &self.eez)
+            .field("rollup_id", &self.rollup_id)
             .finish()
     }
 }
@@ -60,6 +66,7 @@ impl SubmitterConfig {
             rpc_url: parse_url(ENV_RPC_URL)?,
             poster: parse_key(ENV_POSTER_KEY)?,
             eez: parse_address(ENV_EEZ_ADDRESS)?,
+            rollup_id: parse_u64(ENV_ROLLUP_ID)?,
         })
     }
 }
@@ -79,6 +86,12 @@ pub struct ComposerConfig {
     pub deploy_block: u64,
     /// Tick interval. One tick = at most one postBatch tx.
     pub interval: Duration,
+    /// Based-rollup mode flag. When `true`, the Composer logs external
+    /// batches at info level (normal flow — anyone can post). When
+    /// `false` (sequenced), externals log at error level (someone
+    /// else shouldn't be sequencing our chain). The code path is
+    /// identical either way; only log level differs.
+    pub expect_external_batches: bool,
 }
 
 impl ComposerConfig {
@@ -94,6 +107,7 @@ impl ComposerConfig {
             rollup_id: parse_u64(ENV_ROLLUP_ID)?,
             deploy_block: parse_u64(ENV_DEPLOY_BLOCK)?,
             interval: Duration::from_secs(parse_u64_or(ENV_INTERVAL_SECS, DEFAULT_INTERVAL_SECS)?),
+            expect_external_batches: parse_bool_or(ENV_EXPECT_EXTERNAL, false)?,
         })
     }
 }
@@ -127,6 +141,22 @@ fn parse_u64_or(name: &str, default: u64) -> L1Result<u64> {
         Ok(v) => v
             .parse::<u64>()
             .map_err(|e| L1Error::Config(format!("{name}: {e}"))),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(L1Error::Config(format!("{name} contains non-UTF-8 bytes")))
+        }
+    }
+}
+
+fn parse_bool_or(name: &str, default: bool) -> L1Result<bool> {
+    match env::var(name) {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" | "" => Ok(false),
+            other => Err(L1Error::Config(format!(
+                "{name}: expected boolean (true/false/1/0/yes/no), got {other:?}"
+            ))),
+        },
         Err(env::VarError::NotPresent) => Ok(default),
         Err(env::VarError::NotUnicode(_)) => {
             Err(L1Error::Config(format!("{name} contains non-UTF-8 bytes")))
