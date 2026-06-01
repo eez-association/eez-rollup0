@@ -15,6 +15,8 @@ use alloy_primitives::Address;
 use eez_driver::RollupTiming;
 use eez_l1::{L1CanonicalHead, L1Error, L1Result};
 
+use crate::held_pool::HeldPool;
+
 /// Immutable per-rollup configuration. Sourced from env at startup.
 #[derive(Debug, Clone)]
 pub struct RollupConfig {
@@ -102,4 +104,10 @@ pub struct RollupState<L2> {
     pub timing: RollupTiming,
     pub l2_provider: Arc<L2>,
     pub l1_head: Arc<L1CanonicalHead>,
+    /// Per-rollup cross-chain held-tx pool. `None` for rollups that
+    /// don't participate in cross-chain composition (entry-only
+    /// deployments without cross-chain content, or pure-follower
+    /// roles). When present, drained on each Sync-slot trigger by
+    /// the umbrella's `compose_sync_slot`.
+    pub held_pool: Option<Arc<HeldPool>>,
 }

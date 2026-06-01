@@ -52,14 +52,12 @@ pub mod types;
 pub mod witness;
 
 use alloy_primitives::{Address, Bytes, U256};
-use eez_protocol::{
-    ChainProtocol, ProtocolErrorKind, ProtocolResult, RecordedCall, RollupId,
-};
+use eez_protocol::{ChainProtocol, ProtocolErrorKind, ProtocolResult, RecordedCall, RollupId};
 
 #[doc(inline)]
 pub use authorized_proxies::{
-    decode_proxy_value, proxy_mapping_key, ProxyInfo, CCM_AUTHORIZED_PROXIES_SLOT,
-    ROLLUPS_AUTHORIZED_PROXIES_SLOT,
+    CCM_AUTHORIZED_PROXIES_SLOT, ProxyInfo, ROLLUPS_AUTHORIZED_PROXIES_SLOT, decode_proxy_value,
+    proxy_mapping_key,
 };
 #[doc(inline)]
 pub use batch::EvmBatch;

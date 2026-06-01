@@ -19,8 +19,10 @@
 //! Tests inject fake schedules by sending events directly into the
 //! channel.
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use alloy_primitives::Bytes;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
@@ -106,6 +108,46 @@ pub struct L1HeadInfo {
 pub trait L1HeadSource: Send + 'static {
     async fn next_head(&mut self) -> Option<L1HeadInfo>;
 }
+
+/// Per-Sync-slot system-tx producer.
+///
+/// Called by the Sequencer before each Sync block to fetch the
+/// type-0x7E system txs that should land in that block (Rollup-1 §5).
+/// The umbrella's `eez-composer::Composer` is the production impl;
+/// it drains its `HeldPool` and runs each held tx through
+/// `eez_protocol::Composer::simulate_and_resolve` to produce the
+/// cross-chain content.
+///
+/// Returns `Vec::new()` when there is no cross-chain content for the
+/// given rollup this slot (the common case until cross-chain wiring
+/// is exercised). When non-empty, the Sequencer routes through the
+/// manual-block-construction path (`commit_with_system_txs`) per the
+/// S4.3 design — the Sync block is built in-process via revm + reth-
+/// evm rather than reth's payload builder.
+///
+/// Implementor location: `eez-composer` (downstream crate). This
+/// trait lives in `eez-driver` so the Sequencer can call into the
+/// umbrella without depending on it (composer crate depends on
+/// driver, not the other way around).
+#[async_trait]
+pub trait SyncSlotComposer: Send + Sync + 'static {
+    async fn compose_sync_slot(&self, rollup_id: u64) -> Vec<Bytes>;
+}
+
+/// No-op [`SyncSlotComposer`] — used when no umbrella is wired
+/// (standalone-mode dev) or when the per-rollup `HeldPool` is absent.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoCrossChainContent;
+
+#[async_trait]
+impl SyncSlotComposer for NoCrossChainContent {
+    async fn compose_sync_slot(&self, _rollup_id: u64) -> Vec<Bytes> {
+        Vec::new()
+    }
+}
+
+/// Cheap clone-able handle for a [`SyncSlotComposer`].
+pub type SyncSlotComposerHandle = Arc<dyn SyncSlotComposer>;
 
 /// Spawn an interval ticker that emits [`SlotEvent::Live`] every
 /// `block_time`. Returns the receiver side of the channel.

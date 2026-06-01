@@ -15,19 +15,19 @@
 //! them from the prover registry. See `docs/plans/08-protocol-
 //! alignment.md` §D for the staging.
 
-use alloy_primitives::{Bytes, B256, U256};
+use alloy_primitives::{B256, Bytes, U256};
 use alloy_sol_types::SolCall;
-use eez_protocol::{rolling_hash::EntryRollingHash, ProtocolResult, RecordedCall, RollupId};
+use eez_protocol::{ProtocolResult, RecordedCall, RollupId, rolling_hash::EntryRollingHash};
 
+use crate::EvmProtocol;
 use crate::action::cross_chain_call_hash;
 use crate::batch::EvmBatch;
 use crate::dialect::ChainDialect;
 use crate::types::{
-    loadExecutionTableCall, postVerifyAndExecuteOrSaveExecutionsFromBatchCall, ExecutionEntrySol,
-    ExpectedL1ToL2CallSol, L2ToL1CallSol, LookupCallSol, ProofSystemBatchPerVerificationEntriesSol,
-    StateDeltaSol,
+    ExecutionEntrySol, ExpectedL1ToL2CallSol, L2ToL1CallSol, LookupCallSol,
+    ProofSystemBatchPerVerificationEntriesSol, StateDeltaSol, loadExecutionTableCall,
+    postVerifyAndExecuteOrSaveExecutionsFromBatchCall,
 };
-use crate::EvmProtocol;
 
 /// Classification of a single [`RecordedCall`] within an entry's
 /// flat call window. Drives [`build_batch`]'s emission decision.

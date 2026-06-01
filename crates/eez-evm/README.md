@@ -1,6 +1,6 @@
-# crosschain-evm
+# eez-evm
 
-EVM implementation of the chain-agnostic `crosschain-protocol` traits.
+EVM implementation of the chain-agnostic `eez-protocol` traits.
 This is where "a cross-chain call" stops being a trait-generic concept
 and becomes Solidity ABI types, 20-byte addresses, 32-byte roots, and
 keccak-derived cross-chain call hashes.
@@ -8,25 +8,25 @@ keccak-derived cross-chain call hashes.
 ## Where it fits
 
 ```
-crosschain-protocol   ←  async traits, chain-agnostic
+eez-protocol   ←  async traits, chain-agnostic
         ↑
-crosschain-evm        ←  YOU ARE HERE  (EvmProtocol + ABI + entry building)
+eez-evm        ←  YOU ARE HERE  (EvmProtocol + ABI + entry building)
         ↑
-crosschain-evm-composer · crosschain-evm-grpc
+eez-evm-inspector · eez-evm-grpc
         ↑
-rollup-node           ←  reth integration, wiring
+eez-composer           ←  reth integration, wiring
 ```
 
 ## What it exports
 
 - **`EvmProtocol`** — unit struct, `impl ChainProtocol`. Stateless; every
   operation takes the rollup ids it needs as arguments. Per-tx state
-  lives on `CompositionBuilder<EvmProtocol>` in `crosschain-protocol`.
+  lives on `CompositionBuilder<EvmProtocol>` in `eez-protocol`.
 - **Slot constants and helpers** (`ROLLUPS_AUTHORIZED_PROXIES_SLOT`
   = 3, `CCM_AUTHORIZED_PROXIES_SLOT` = 2, `proxy_mapping_key`,
   `decode_proxy_value`) — storage-slot math for the
   `authorizedProxies` mapping. The live-state lookup that consumes
-  them lives in `crosschain-evm-composer`'s inspector.
+  them lives in `eez-evm-inspector`'s inspector.
 - **`ProxyInfo`** — decoded mapping entry (`original_address`,
   `original_rollup_id`).
 - **`EvmRecordedCall`** — `RecordedCall<EvmProtocol>` alias.
@@ -60,13 +60,13 @@ rollup-node           ←  reth integration, wiring
 4. [`action.rs`](src/action.rs) — action-hash derivation, byte-identical
    with the reference protocol's Solidity implementation.
 5. Composition orchestration (CCM verification + finalize) lives on
-   `CompositionBuilder<P>` in `crosschain-protocol`.
+   `CompositionBuilder<P>` in `eez-protocol`.
 
 ## Running tests
 
 ```bash
 # Unit tests for this crate (entries + session)
-cargo test -p crosschain-evm
+cargo test -p eez-evm
 
 # Against all workspace crates
 cargo test --workspace
@@ -80,7 +80,7 @@ cargo clippy --workspace -- -D warnings
 This crate has no reth / revm dependency. It consumes
 `RecordedCall<EvmProtocol>` values and produces ABI-encoded bytes;
 *how* those calls are detected (revm inspector in the composer) and
-*where* state is read from (reth providers in `rollup-node`) are
+*where* state is read from (reth providers in `eez-composer`) are
 concerns of other crates. That separation is deliberate — see
 `docs/ARCHITECTURE.md` for the full crate-layering rationale.
 

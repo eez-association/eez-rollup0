@@ -18,15 +18,17 @@
 //! Replaces the old `EEZ_SEQUENCER_DISABLED` / `EEZ_COMPOSER_DISABLED`
 //! flags — mode is now implicit from which credentials are configured.
 
+mod ingress;
+
 use std::{collections::HashMap, env, str::FromStr, sync::Arc};
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use alloy_signer_local::PrivateKeySigner;
-use eez_composer::{Composer, RollupConfig, RollupState};
+use eez_composer::{Composer, HeldPool, IngressClassifier, RollupConfig, RollupState};
 use eez_deriver::Deriver;
 use eez_driver::{
     BatchCandidate, BatchPolicy, EthAttributesBuilder, RollupTiming, Sequencer, SlotEvent,
-    spawn_interval, spawn_l1_anchored,
+    SyncSlotComposerHandle, spawn_interval, spawn_l1_anchored,
 };
 use eez_l1::{
     L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
@@ -102,8 +104,42 @@ fn main() -> eyre::Result<()> {
 
         warn_on_deprecated_env();
 
-        // Launch reth with all default Ethereum components.
-        let handle = builder.launch_node(EthereumNode::default()).await?;
+        // Construct the per-rollup HeldPool + IngressClassifier
+        // BEFORE reth launches: they're attached to reth's RPC layer
+        // as an `eth_sendRawTransaction` middleware (`ingress::IngressLayer`).
+        // The same `held_pool` Arc is shared with the umbrella's
+        // RollupState in composer mode so the middleware's pushes and
+        // the Sync-slot drain see the same queue.
+        //
+        // Live in all modes: in follower/standalone the classifier is
+        // empty (no proxies registered), so the middleware passes
+        // every tx through to reth's pool — zero behavior change.
+        let held_pool = Arc::new(HeldPool::new());
+        let classifier: Arc<IngressClassifier> = Arc::new(
+            parse_cross_chain_proxy_env().into_iter().collect(),
+        );
+        if !classifier.is_empty() {
+            event!(
+                name: "eez.node.ingress.classifier",
+                Level::INFO,
+                proxy_count = classifier.len(),
+                "ingress classifier configured with cross-chain proxy addresses",
+            );
+        }
+
+        // Launch reth with the IngressLayer attached to its RPC stack.
+        let handle = builder
+            .with_types::<EthereumNode>()
+            .with_components(EthereumNode::components())
+            .with_add_ons(
+                reth_node_ethereum::node::EthereumAddOns::default()
+                    .with_rpc_middleware(ingress::IngressLayer::new(
+                        Arc::clone(&held_pool),
+                        Arc::clone(&classifier),
+                    )),
+            )
+            .launch_with_debug_capabilities()
+            .await?;
 
         let chain_spec: Arc<_> = handle.node.chain_spec();
         let l2_genesis_timestamp = chain_spec.genesis().timestamp;
@@ -199,13 +235,45 @@ fn main() -> eyre::Result<()> {
         let submitter = Submitter::new(submitter_config);
         let l1_watcher = L1Watcher::spawn(l1_watcher_config);
 
-        // ─── Composer-only: rebuild Sequencer with L1-anchored ───────
-        // schedule + batch_emitter. The placeholder Sequencer above was
-        // wired with a dummy receiver to keep types simple at the build
-        // site; for composer mode we drop and rebuild now that the
-        // L1Watcher is available.
-        let (sequencer, batch_rx) = if mode == Mode::Composer {
+        // ─── Composer-only: build the umbrella first, then rebuild ────
+        // Sequencer with L1-anchored schedule + batch_emitter + the
+        // umbrella attached as SyncSlotComposer. The placeholder
+        // Sequencer above was wired with a dummy receiver to keep types
+        // simple at the build site; for composer mode we drop and
+        // rebuild now that the L1Watcher exists. Building the umbrella
+        // first lets us pass it to the Sequencer for per-Sync-slot
+        // cross-chain-content drain.
+        let (sequencer, batch_rx, umbrella) = if mode == Mode::Composer {
             drop(sequencer);
+
+            // Umbrella construction first. The rollup state owns its
+            // HeldPool (S4.7 drain target).
+            let proof_signer_key = env::var("EEZ_PROOF_SIGNER_KEY")
+                .map_err(|_| eyre::eyre!("EEZ_PROOF_SIGNER_KEY required in composer mode"))?;
+            let proof_signer = PrivateKeySigner::from_bytes(&B256::from_str(
+                proof_signer_key.trim_start_matches("0x"),
+            )?)?;
+            let prover = Arc::new(MockEcdsaProver::new(proof_signer));
+            let rollup_id = rollup_config.rollup_id;
+            // Share the SAME HeldPool the ingress middleware pushes
+            // into. RollupState's `Option<Arc<HeldPool>>` wraps the
+            // shared Arc so multi-rollup deployments later can keep
+            // per-rollup pools while still sharing one ingress layer.
+            let held_pool_for_rollup = Some(Arc::clone(&held_pool));
+            let rollup_state = RollupState {
+                config: rollup_config.clone(),
+                timing,
+                l2_provider: Arc::new(provider.clone()),
+                l1_head: Arc::clone(&l1_head),
+                held_pool: held_pool_for_rollup,
+            };
+            let mut rollups = HashMap::with_capacity(1);
+            rollups.insert(rollup_id, rollup_state);
+            let composer = Composer::new(rollups, prover, submitter.clone(), l1_watcher.clone());
+            let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
+
+            // Sequencer with all hooks: speculative-depth, batch
+            // emitter, sync-slot composer.
             let attributes = EthAttributesBuilder::new(chain_spec.clone());
             let schedule_rx = spawn_l1_anchored(
                 L1HeadStream::from_watcher(&l1_watcher),
@@ -224,16 +292,17 @@ fn main() -> eyre::Result<()> {
             )?
             .with_speculative_limit(64, Arc::clone(&l1_head) as _)
             .with_batch_emitter(
-                rollup_config.rollup_id,
+                rollup_id,
                 BatchPolicy::EveryKBlocks(u64::from(timing.k())),
                 batch_tx,
-            );
-            (Some(sequencer), Some(batch_rx))
+            )
+            .with_sync_slot_composer(sync_slot_handle);
+            (Some(sequencer), Some(batch_rx), Some(composer))
         } else {
             // Follower: drop the placeholder Sequencer (BlockCommitter
             // stays alive via the cloned handle held below).
             drop(sequencer);
-            (None, None)
+            (None, None, None)
         };
 
         // Deriver: drives BlockCommitter from L1Events. Active in both
@@ -269,30 +338,14 @@ fn main() -> eyre::Result<()> {
         });
 
         // ─── Composer-only: spawn Sequencer + umbrella ───────────────
-        if let (Some(sequencer), Some(batch_rx)) = (sequencer, batch_rx) {
+        if let (Some(sequencer), Some(batch_rx), Some(composer)) =
+            (sequencer, batch_rx, umbrella)
+        {
             event!(name: "eez.node.sequencer.spawned", Level::INFO, mode = "composer", "spawning eez sequencer (L1-anchored)");
             task_executor.spawn_critical_task("eez-sequencer", async move {
                 sequencer.run().await;
             });
 
-            let proof_signer_key = env::var("EEZ_PROOF_SIGNER_KEY")
-                .map_err(|_| eyre::eyre!("EEZ_PROOF_SIGNER_KEY required in composer mode"))?;
-            let proof_signer = PrivateKeySigner::from_bytes(&B256::from_str(
-                proof_signer_key.trim_start_matches("0x"),
-            )?)?;
-            let prover = Arc::new(MockEcdsaProver::new(proof_signer));
-
-            let rollup_id = rollup_config.rollup_id;
-            let rollup_state = RollupState {
-                config: rollup_config,
-                timing,
-                l2_provider: Arc::new(provider.clone()),
-                l1_head,
-            };
-            let mut rollups = HashMap::with_capacity(1);
-            rollups.insert(rollup_id, rollup_state);
-
-            let composer = Composer::new(rollups, prover, submitter, l1_watcher);
             event!(name: "eez.node.composer.spawned", Level::INFO, "spawning eez composer umbrella");
             task_executor.spawn_critical_task("eez-composer", async move {
                 composer.run(batch_rx).await;
@@ -301,6 +354,20 @@ fn main() -> eyre::Result<()> {
 
         handle.wait_for_node_exit().await
     })
+}
+
+/// Parse `EEZ_CROSS_CHAIN_PROXY_ADDRESSES` (comma-separated hex
+/// addresses) into a `Vec<Address>`. Empty / unset / malformed → empty
+/// vec (the ingress classifier then becomes a passthrough).
+fn parse_cross_chain_proxy_env() -> Vec<Address> {
+    let Ok(raw) = env::var("EEZ_CROSS_CHAIN_PROXY_ADDRESSES") else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| Address::from_str(s).ok())
+        .collect()
 }
 
 fn warn_on_deprecated_env() {

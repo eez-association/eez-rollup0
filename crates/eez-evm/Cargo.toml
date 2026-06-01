@@ -1,25 +1,25 @@
 [package]
-name = "crosschain-evm"
-version = "0.1.0"
-edition = "2021"
-license.workspace = true
+name                   = "eez-evm"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
 rust-version.workspace = true
-readme = "README.md"
-description = "EVM implementation of ChainProtocol — Solidity ABI types, flat action hashing, unified-emitter batch building"
+readme                 = "README.md"
+description            = "EVM implementation of ChainProtocol — Solidity ABI types, flat action hashing, unified-emitter batch building"
 
 [lints]
 workspace = true
 
 [dependencies]
 async-trait.workspace = true
-crosschain-protocol.workspace = true
+eez-protocol.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 # Phase 09 §B2: on-chain reads for the EvmProofPlanResolver
 # (`EEZ.rollups`, `Rollup.checkProofSystemsAndGetVkeys`,
 # `IRollupContract.getTimestampAndBlockHash`). Network type is
 # `Ethereum` from `alloy-network`; the HTTP transport is the only
-# one currently wired through `crates/crosschain-evm`.
+# one currently wired through `crates/eez-evm`.
 alloy-network.workspace = true
 alloy-provider.workspace = true
 alloy-rpc-client.workspace = true

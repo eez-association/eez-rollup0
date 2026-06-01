@@ -4,7 +4,7 @@ version.workspace      = true
 edition.workspace      = true
 license.workspace      = true
 rust-version.workspace = true
-description            = "Chain-agnostic cross-chain composition: protocol traits, generic composer, checkpoint format. Ported from crosschain-protocol (rollup-node)."
+description            = "Chain-agnostic cross-chain composition: protocol traits, generic composer, checkpoint format."
 
 [dependencies]
 async-trait.workspace = true

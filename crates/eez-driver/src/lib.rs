@@ -42,7 +42,10 @@ pub use error::{DriverError, DriverResult};
 #[doc(inline)]
 pub use sequencer::{ConfirmedHeadSource, EthAttributesBuilder, Sequencer};
 #[doc(inline)]
-pub use slot::{L1HeadInfo, L1HeadSource, SlotEvent, SlotKind, spawn_interval, spawn_l1_anchored};
+pub use slot::{
+    L1HeadInfo, L1HeadSource, NoCrossChainContent, SlotEvent, SlotKind, SyncSlotComposer,
+    SyncSlotComposerHandle, spawn_interval, spawn_l1_anchored,
+};
 #[doc(inline)]
 pub use submit::{BatchCandidate, BatchPolicy};
 #[doc(inline)]

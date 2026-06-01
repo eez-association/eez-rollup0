@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 use alloy_eips::Encodable2718;
 use alloy_primitives::{B256, Bytes, U256};
-use eez_driver::BatchCandidate;
+use async_trait::async_trait;
+use eez_driver::{BatchCandidate, SyncSlotComposer};
 use eez_l1::{BundleTarget, L1Error, L1Event, L1Result, L1Watcher, SendOutcome, Submitter};
 use eez_prover::{
     ExecutionEntry, ProofSystemBatchPerVerificationEntries, Prover, ProvingContext,
@@ -505,5 +506,51 @@ where
             .map_err(|e| L1Error::L2Source(format!("sealed_header({block_number}): {e}")))?
             .ok_or_else(|| L1Error::L2Source(format!("L2 header at {block_number} missing")))?;
         Ok(header.state_root())
+    }
+}
+
+#[async_trait]
+impl<L2> SyncSlotComposer for Composer<L2>
+where
+    L2: BlockReader<Header = alloy_consensus::Header> + Send + Sync + 'static,
+    <L2 as TransactionsProvider>::Transaction: Encodable2718,
+{
+    /// Produce the type-0x7E system txs for `rollup_id`'s next Sync
+    /// slot. S4.7 placeholder — drains the rollup's `HeldPool` but
+    /// does not yet route through `eez_protocol::Composer::simulate_and_resolve`
+    /// (the per-tx orchestrator that produces the actual cross-chain
+    /// content). The drained txs are dropped; the returned vec is
+    /// empty. Real composition lands when `TxIngress` (S4.8) starts
+    /// feeding cross-chain txs and the manual-block-construction path
+    /// (S4.3 design) connects.
+    ///
+    /// Effect today: if `TxIngress` (or a test) pushes anything into
+    /// the `HeldPool`, it gets discarded each Sync slot — the WARN
+    /// log surfaces the dropped count so this contract is loud, not
+    /// silent (`invariant 7`).
+    async fn compose_sync_slot(&self, rollup_id: u64) -> Vec<Bytes> {
+        let Some(rollup) = self.inner.rollups.get(&rollup_id) else {
+            event!(
+                name: "eez.composer.sync_slot.unknown_rollup",
+                Level::ERROR,
+                rollup_id,
+                "compose_sync_slot called for unknown rollup_id",
+            );
+            return Vec::new();
+        };
+        let Some(pool) = rollup.held_pool.as_ref() else {
+            return Vec::new();
+        };
+        let drained = pool.pop_all();
+        if !drained.is_empty() {
+            event!(
+                name: "eez.composer.sync_slot.drained_unrouted",
+                Level::WARN,
+                rollup_id,
+                count = drained.len(),
+                "drained {{count}} held tx(s) but composer wiring not in place yet; dropping. Real composition lands when commit_with_system_txs + EvmComposer wiring complete.",
+            );
+        }
+        Vec::new()
     }
 }

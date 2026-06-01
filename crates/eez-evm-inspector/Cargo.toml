@@ -1,19 +1,19 @@
 [package]
-name = "crosschain-evm-composer"
-version = "0.1.0"
-edition = "2024"
-license.workspace = true
+name                   = "eez-evm-inspector"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
 rust-version.workspace = true
-readme = "README.md"
-description = "EVM composer glue: revm Inspector for proxy-call detection + EVM-bound type aliases for the chain-agnostic Composer"
+readme                 = "README.md"
+description            = "EVM composer glue: revm Inspector for proxy-call detection + EVM-bound type aliases for the chain-agnostic Composer"
 
 [lints]
 workspace = true
 
 [dependencies]
 # Protocol + EVM
-crosschain-protocol.workspace = true
-crosschain-evm.workspace = true
+eez-protocol.workspace = true
+eez-evm.workspace = true
 
 # Alloy types (Bytes, Address) for inspector calldata/addr handling +
 # RPC types / sol! / provider stack for Phase 09 §E1 post-batch

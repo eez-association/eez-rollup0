@@ -43,7 +43,7 @@ use tokio::sync::mpsc;
 
 use crate::block_committer::BlockCommitterHandle;
 use crate::error::{DriverError, DriverResult};
-use crate::slot::{SlotEvent, SlotKind};
+use crate::slot::{SlotEvent, SlotKind, SyncSlotComposerHandle};
 use crate::submit::{BatchCandidate, BatchEmitter, BatchPolicy};
 use crate::timing::{RollupTiming, SlotComposition};
 
@@ -167,6 +167,11 @@ where
     /// Optional [`BatchCandidate`] emitter. None on follower setups
     /// where no Composer is co-located.
     batch_emitter: Option<BatchEmitter>,
+    /// Optional Sync-slot system-tx producer. When present, called
+    /// before each Sync block to fetch the cross-chain system txs
+    /// for the slot. Defaults to `None` — equivalent to producing
+    /// empty Sync blocks (no cross-chain content).
+    sync_slot_composer: Option<SyncSlotComposerHandle>,
 }
 
 impl<T, ChainSpec> fmt::Debug for Sequencer<T, ChainSpec>
@@ -227,7 +232,17 @@ where
             timing,
             speculative_limit: None,
             batch_emitter: None,
+            sync_slot_composer: None,
         })
+    }
+
+    /// Attach a [`SyncSlotComposerHandle`]. When set, the Sequencer
+    /// calls it before each Sync block to fetch cross-chain system
+    /// txs. None = empty Sync blocks (no cross-chain content).
+    #[must_use]
+    pub fn with_sync_slot_composer(mut self, composer: SyncSlotComposerHandle) -> Self {
+        self.sync_slot_composer = Some(composer);
+        self
     }
 
     /// Cap blocks above `source`'s L1-confirmed head; `advance` pauses
@@ -412,6 +427,28 @@ where
                         "sync-slot timestamp drift: parent + L2_block_time != Scheduler-supplied sync_slot_timestamp; producing with parent-derived value",
                     );
                 }
+
+                // Cross-chain content hook (S4.7): pull any pre-composed
+                // system txs for this Sync slot from the umbrella's
+                // composer. Empty in the common case (no cross-chain
+                // content this slot). Non-empty routes through the
+                // manual-block-construction path (commit_with_system_txs)
+                // per the S4.3 design — not implemented yet, so we
+                // assert empty until S4.8 wiring lands.
+                if let (Some(composer), Some(emitter)) = (
+                    self.sync_slot_composer.as_ref(),
+                    self.batch_emitter.as_ref(),
+                ) {
+                    let system_txs = composer.compose_sync_slot(emitter.rollup_id).await;
+                    assert!(
+                        system_txs.is_empty(),
+                        "S4.7 contract: {} cross-chain system tx(s) produced for sync slot, but \
+                         commit_with_system_txs path lands in a later phase. Disable cross-chain \
+                         composition or land the manual block-construction path.",
+                        system_txs.len(),
+                    );
+                }
+
                 self.commit_one(SlotKind::Sync, &last_header).await?;
             }
         }

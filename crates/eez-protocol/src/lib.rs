@@ -240,7 +240,7 @@ pub use checkpoint::ExecutionCheckpoint;
 pub use compose::compose_transaction;
 #[doc(inline)]
 pub use composer::{
-    Composer, ProxyLookupConfig, SourceAttribution, TargetConfig, DEFAULT_CCM_GAS_LIMIT,
+    Composer, DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig, SourceAttribution, TargetConfig,
 };
 #[doc(inline)]
 pub use composition::{CompositionBuilder, Dispatcher, Rollup};

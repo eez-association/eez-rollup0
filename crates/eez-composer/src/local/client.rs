@@ -29,9 +29,9 @@ use reth_primitives_traits::SignerRecoverable;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::{BlockNumReader, HeaderProvider, StateProvider, StateProviderFactory};
 
-use crosschain_evm::EvmProtocol;
-use crosschain_evm_composer::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
-use crosschain_protocol::{
+use eez_evm::EvmProtocol;
+use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
+use eez_protocol::{
     ChainClient, CommittedRootReader, Dispatcher, EntryChainClient, ExecutorError,
     ExecutorErrorKind, ExecutorResult, ProxyLookupConfig, RollupId, TargetBatchSimulation,
     TargetExecutionSession, TargetTransaction,
@@ -45,7 +45,7 @@ use super::session::{LocalExecutionSession, simulate_local_transactions};
 /// Both variants carry `dispatch_address` — the contract holding this
 /// chain's `authorizedProxies` mapping (and, for `EvmL1Style` chains,
 /// the canonical committed-root storage). The slot is derived from the
-/// client's [`crosschain_evm::ChainDialect`] (stored alongside) at
+/// client's [`eez_evm::ChainDialect`] (stored alongside) at
 /// `proxy_lookup_config` time.
 #[derive(Debug, Clone)]
 pub enum Role {
@@ -60,7 +60,7 @@ pub enum Role {
         /// Contract holding `authorizedProxies` on this chain. For
         /// EvmL1-style followers (the L1 follower in L2-as-entry
         /// topology) this is `EEZ.sol`, allowing the follower to
-        /// serve [`crosschain_protocol::CommittedRootReader`].
+        /// serve [`eez_protocol::CommittedRootReader`].
         dispatch_address: Address,
     },
 }
@@ -104,11 +104,11 @@ pub struct LocalChainClient<Provider, EvmConfig> {
     role: Role,
     ccm_address: Address,
     /// Per-chain dialect — drives proxy-lookup slot, CCM-verify shape,
-    /// and the [`crosschain_protocol::CommittedRootReader`] capability
+    /// and the [`eez_protocol::CommittedRootReader`] capability
     /// honestly: only `EvmL1Style` clients actually serve canonical
     /// committed-root reads (the L1 `EEZ.sol` storage layout
     /// `compute_state_root_slot` assumes).
-    dialect: crosschain_evm::ChainDialect,
+    dialect: eez_evm::ChainDialect,
     /// Bidirectional overlay channel for shared-source-state nested
     /// dispatch. `Some(channel)` only on entry-role clients —
     /// populated by the source-sim inspector with source's in-flight
@@ -153,8 +153,8 @@ where
 
     /// Build an entry-role client. Returned as
     /// `Arc<Self>` so the call site can erase it into BOTH
-    /// `Arc<dyn EntryChainClient>` (for [`ComposerBuilder::entry`](crosschain_protocol::composer::ComposerBuilder::entry))
-    /// AND `Arc<dyn CommittedRootReader>` (for [`ComposerBuilder::root_reader`](crosschain_protocol::composer::ComposerBuilder::root_reader))
+    /// `Arc<dyn EntryChainClient>` (for [`ComposerBuilder::entry`](eez_protocol::composer::ComposerBuilder::entry))
+    /// AND `Arc<dyn CommittedRootReader>` (for [`ComposerBuilder::root_reader`](eez_protocol::composer::ComposerBuilder::root_reader))
     /// when the entry chain is L1. The two trait views share one
     /// allocation; cheap.
     pub fn new_entry(
@@ -164,7 +164,7 @@ where
         rollup_id: RollupId,
         dispatch_address: Address,
         ccm_address: Address,
-        dialect: crosschain_evm::ChainDialect,
+        dialect: eez_evm::ChainDialect,
     ) -> Arc<Self> {
         let cp = Self::build_chain_provider(&provider, &chain_spec);
         Arc::new(Self {
@@ -195,7 +195,7 @@ where
         rollup_id: RollupId,
         dispatch_address: Address,
         ccm_address: Address,
-        dialect: crosschain_evm::ChainDialect,
+        dialect: eez_evm::ChainDialect,
     ) -> Arc<Self> {
         let cp = Self::build_chain_provider(&provider, &chain_spec);
         Arc::new(Self {
@@ -237,7 +237,7 @@ where
         rollups_address: Address,
         target_rollup_id: RollupId,
     ) -> ExecutorResult<[u8; 32]> {
-        let root_slot = crosschain_evm::action::compute_state_root_slot(target_rollup_id);
+        let root_slot = eez_evm::action::compute_state_root_slot(target_rollup_id);
         let value = state
             .storage(rollups_address, root_slot)
             .map_err(ExecutorError::provider)?
@@ -485,7 +485,7 @@ where
             .raw_evm_config
             .evm_with_env_and_inspector(&mut state, evm_env, inspector);
         let (gas_used, success) = match evm.transact(tx_env) {
-            Ok(r) => (r.result.gas_used(), r.result.is_success()),
+            Ok(r) => (r.result.tx_gas_used(), r.result.is_success()),
             Err(e) => {
                 tracing::warn!(%e, "source sim reverted");
                 (0, false)
@@ -573,7 +573,7 @@ where
         // the storage-slot math `compute_state_root_slot` assumes the
         // L1 `EEZ.sol` layout. L2-style clients return `Unavailable`
         // so a misregistered root_reader fails loudly at first dispatch.
-        if self.dialect != crosschain_evm::ChainDialect::EvmL1Style {
+        if self.dialect != eez_evm::ChainDialect::EvmL1Style {
             return Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
                 "stored_target_state_root called on a non-L1 LocalChainClient \
                  (only EvmL1Style clients hold canonical committed-root storage)"

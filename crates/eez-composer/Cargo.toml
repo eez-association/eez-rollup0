@@ -7,24 +7,38 @@ rust-version.workspace = true
 description            = "Composer umbrella — owns per-rollup Sequencer/Scheduler/HeldPool maps and the shared Aggregator/Submitter/Prover."
 
 [dependencies]
-# internal
-eez-driver.workspace        = true
-eez-l1.workspace            = true
-eez-payload-codec.workspace = true
-eez-prover.workspace        = true
-
-# reth — L2 provider bounds for batch building
-reth-primitives-traits.workspace = true
-reth-storage-api.workspace       = true
+# Internal — protocol, EVM port + inspector, and the existing umbrella siblings
+eez-driver.workspace         = true
+eez-evm.workspace            = true
+eez-evm-inspector.workspace  = true
+eez-l1.workspace             = true
+eez-payload-codec.workspace  = true
+eez-protocol.workspace       = true
+eez-prover.workspace         = true
 
 # alloy
-alloy-consensus.workspace  = true
-alloy-eips.workspace       = true
-alloy-primitives.workspace = true
+alloy-consensus.workspace    = true
+alloy-eips.workspace         = true
+alloy-primitives.workspace   = true
+alloy-sol-types.workspace    = true
+
+# reth (state + revm + chainspec + evm + trie for LocalChainClient + sessions)
+reth-chainspec.workspace            = true
+reth-ethereum-primitives.workspace  = true
+reth-evm.workspace                  = true
+reth-evm-ethereum.workspace         = true
+reth-primitives-traits.workspace    = true
+reth-revm.workspace                 = true
+reth-storage-api.workspace          = true
+reth-trie-common.workspace          = true
+
+# revm direct (overlay-channel paths in local/session.rs)
+revm.workspace = true
 
 # async + diagnostics
-tokio.workspace     = true
-tracing.workspace   = true
+async-trait.workspace = true
+tokio.workspace       = true
+tracing.workspace     = true
 
 [lints]
 workspace = true

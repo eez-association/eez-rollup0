@@ -865,7 +865,7 @@ impl<P: ChainProtocol + 'static> Dispatcher for CompositionBuilder<P> {
 mod tests {
     use super::*;
     use crate::checkpoint::ExecutionCheckpoint;
-    use crate::composer::{ProxyLookupConfig, DEFAULT_CCM_GAS_LIMIT};
+    use crate::composer::{DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig};
     use crate::error::ProtocolResult;
     use crate::executor::{TargetBatchSimulation, TargetVerificationContext};
     use crate::types::ExecutionOutcome;

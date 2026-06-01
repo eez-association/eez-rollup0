@@ -38,14 +38,20 @@ pub use overlay::{OverlayError, apply_overlay_diff, clone_state};
 
 // Re-export chain-agnostic types so callers can `use eez_evm_inspector::*`
 // without reaching into the protocol crate for everyday composition needs.
-pub use eez_protocol::{
-    ComposerError, ComposerResult, DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig,
-};
+pub use eez_protocol::{ComposerError, ComposerResult, DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig};
 
 use eez_evm::EvmProtocol;
 
 /// EVM-bound composer. Alias for `eez_protocol::Composer<EvmProtocol>`.
-pub type Composer = eez_protocol::Composer<EvmProtocol>;
+///
+/// Renamed from `Composer` to `EvmComposer` during the port: the
+/// `eez-composer` umbrella crate (orchestration role) owns the
+/// `Composer` name. The two are distinct concerns — this alias names
+/// the per-tx protocol orchestrator; the umbrella names the run-loop
+/// + per-rollup state. Same naming clash that motivated
+/// `crosschain-evm-composer` → `eez-evm-inspector` for the crate
+/// name, applied consistently to the type alias.
+pub type EvmComposer = eez_protocol::Composer<EvmProtocol>;
 
 /// EVM-bound per-target config. Alias for `eez_protocol::TargetConfig<EvmProtocol>`.
-pub type TargetConfig = eez_protocol::TargetConfig<EvmProtocol>;
+pub type EvmTargetConfig = eez_protocol::TargetConfig<EvmProtocol>;

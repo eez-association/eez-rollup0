@@ -20,8 +20,15 @@ reth-node-builder.workspace  = true
 reth-node-ethereum.workspace = true
 
 # alloy
+alloy-consensus.workspace    = true
+alloy-eips.workspace         = true
 alloy-primitives.workspace   = true
 alloy-signer-local.workspace = true
+
+# RPC ingress middleware (eth_sendRawTransaction override)
+jsonrpsee.workspace  = true
+serde_json.workspace = true
+tower.workspace      = true
 
 # app
 clap.workspace               = true

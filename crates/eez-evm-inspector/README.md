@@ -1,4 +1,4 @@
-# crosschain-evm-composer
+# eez-evm-inspector
 
 EVM-specific glue for the cross-chain composer.
 
@@ -14,20 +14,20 @@ This crate is deliberately tiny. It contributes:
 
 Everything else (orchestration, composition state, config types, the
 composer error families) lives in
-[`crosschain-protocol`](../crosschain-protocol/) as chain-agnostic
+[`eez-protocol`](../eez-protocol/) as chain-agnostic
 generics; this crate only supplies the EVM-specific inspector and the
 type aliases.
 
 ## Where it fits
 
 ```
-crosschain-protocol   (traits + types + generic Composer<P>, CompositionBuilder<P>)
+eez-protocol   (traits + types + generic Composer<P>, CompositionBuilder<P>)
         ↑
-crosschain-evm        (EvmProtocol + ABI + entry building)
+eez-evm        (EvmProtocol + ABI + entry building)
         ↑
-crosschain-evm-composer   ← YOU ARE HERE  (SessionInspector + EVM aliases)
+eez-evm-inspector   ← YOU ARE HERE  (SessionInspector + EVM aliases)
         ↑
-rollup-node           (reth integration, wiring)
+eez-composer           (reth integration, wiring)
 ```
 
 ## What this crate exports
@@ -43,24 +43,24 @@ pub use inspector::{OverlayChannel, OverlayChannelHandle, new_overlay_channel};
 pub use overlay::{apply_overlay_diff, clone_state, OverlayError};
 
 // Type aliases over the generic orchestrator:
-pub type Composer     = crosschain_protocol::Composer<EvmProtocol>;
-pub type TargetConfig = crosschain_protocol::TargetConfig<EvmProtocol>;
+pub type Composer     = eez_protocol::Composer<EvmProtocol>;
+pub type TargetConfig = eez_protocol::TargetConfig<EvmProtocol>;
 
 // Re-exports (chain-agnostic things callers shouldn't have to reach for):
-pub use crosschain_protocol::{
+pub use eez_protocol::{
     ComposerError, ComposerResult, DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig,
 };
 ```
 
-Downstream callers (e.g. `rollup-node`) `use crosschain_evm_composer::{Composer, TargetConfig, ...}` and never deal with the `<EvmProtocol>` generic.
+Downstream callers (e.g. `eez-composer`) `use eez_evm_inspector::{Composer, TargetConfig, ...}` and never deal with the `<EvmProtocol>` generic.
 
 ## Running tests
 
 ```bash
-cargo test -p crosschain-evm-composer
+cargo test -p eez-evm-inspector
 ```
 
-Composer / composition-builder tests live in `crosschain-protocol` (the
+Composer / composition-builder tests live in `eez-protocol` (the
 crate that owns the generic code). This crate's tests cover only
 `SessionInspector`-specific behavior.
 

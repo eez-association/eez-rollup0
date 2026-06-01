@@ -14,7 +14,7 @@
 //! by [`crate::entries::build_batch`]. Phase 09 populates the
 //! proof-system fields from the prover registry.
 
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 
 use crate::types::{
     ExecutionEntrySol, LookupCallSol, ProofSystemBatchPerVerificationEntriesSol,

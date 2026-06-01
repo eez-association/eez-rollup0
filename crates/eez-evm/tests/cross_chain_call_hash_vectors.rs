@@ -23,7 +23,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use alloy_primitives::{hex, Address, Bytes, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256, hex};
 use eez_evm::action::cross_chain_call_hash;
 use eez_protocol::RollupId;
 use serde::Deserialize;

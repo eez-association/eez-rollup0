@@ -67,12 +67,12 @@
 //! naive `vkMatrix[r][k]` global index silently produces the
 //! wrong fold (caught in §A1 spec audit; see DERIVATION.md §6e).
 
-use alloy_primitives::{keccak256, Bytes, B256, U256};
-use alloy_sol_types::{sol, SolValue};
+use alloy_primitives::{B256, Bytes, U256, keccak256};
+use alloy_sol_types::{SolValue, sol};
 use eez_protocol::{ProofPlan, ProofPlanInvariantError};
 
-use crate::types::{ExecutionEntrySol, LookupCallSol};
 use crate::EvmProtocol;
+use crate::types::{ExecutionEntrySol, LookupCallSol};
 
 // ── Per-element atomic hashes ─────────────────────────────────────
 

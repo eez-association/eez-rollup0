@@ -358,7 +358,7 @@ impl<P: ChainProtocol + 'static> TargetExecutionSession for FakeChainSession<P> 
                             "FakeChainSession(rollup_id={}): checkpoint_factory not installed",
                             self.rollup_id,
                         ),
-                    )))
+                    )));
                 }
             }
         };
@@ -403,7 +403,7 @@ mod tests {
     use super::*;
     use crate::checkpoint::ExecutionCheckpoint;
     use crate::compose::compose_transaction;
-    use crate::composer::{ProxyLookupConfig, TargetConfig, DEFAULT_CCM_GAS_LIMIT};
+    use crate::composer::{DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig, TargetConfig};
     use crate::composition::Rollup;
     use crate::error::ProtocolResult;
     use crate::types::RecordedCall;

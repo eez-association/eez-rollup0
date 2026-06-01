@@ -10,10 +10,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use eez_protocol::{
-    ChainClient, ChainProtocol, CompositionErrorKind, Dispatcher, EntryChainClient,
-    ExecutionOutcome, ExecutionRequest, ExecutionResponse, ExecutorResult, ProtocolErrorKind,
-    ProtocolResult, ProxyLookupConfig, RecordedCall, Rollup, RollupId, TargetBatchSimulation,
-    TargetConfig, TargetExecutionSession, TargetTransaction, DEFAULT_CCM_GAS_LIMIT,
+    ChainClient, ChainProtocol, CompositionErrorKind, DEFAULT_CCM_GAS_LIMIT, Dispatcher,
+    EntryChainClient, ExecutionOutcome, ExecutionRequest, ExecutionResponse, ExecutorResult,
+    ProtocolErrorKind, ProtocolResult, ProxyLookupConfig, RecordedCall, Rollup, RollupId,
+    TargetBatchSimulation, TargetConfig, TargetExecutionSession, TargetTransaction,
 };
 
 // ── Minimal mock protocol ──────────────────────────────────────
@@ -142,10 +142,7 @@ impl TargetExecutionSession for MockSession {
         Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
     }
 
-    async fn rollback(
-        &mut self,
-        _snap: eez_protocol::SessionSnapshot,
-    ) -> ExecutorResult<()> {
+    async fn rollback(&mut self, _snap: eez_protocol::SessionSnapshot) -> ExecutorResult<()> {
         Ok(())
     }
 
@@ -379,15 +376,10 @@ async fn compose_transaction_happy_path() {
         vec![(target_id, vec![outcome([1; 32]), outcome([2; 32])], [2; 32])],
     );
 
-    let composition = eez_protocol::compose_transaction(
-        &MockProtocol,
-        entry.as_ref(),
-        &[],
-        source_id,
-        rollups,
-    )
-    .await
-    .expect("compose");
+    let composition =
+        eez_protocol::compose_transaction(&MockProtocol, entry.as_ref(), &[], source_id, rollups)
+            .await
+            .expect("compose");
 
     assert_eq!(composition.source.batch.len(), 2);
     assert_eq!(composition.source.batch[0].post, [1; 32]);
@@ -408,14 +400,8 @@ async fn compose_transaction_no_dispatches_errors() {
         vec![(RollupId(1), vec![], [0; 32])],
     );
 
-    match eez_protocol::compose_transaction(
-        &MockProtocol,
-        entry.as_ref(),
-        &[],
-        source_id,
-        rollups,
-    )
-    .await
+    match eez_protocol::compose_transaction(&MockProtocol, entry.as_ref(), &[], source_id, rollups)
+        .await
     {
         Err(e)
             if matches!(
@@ -445,14 +431,8 @@ async fn compose_transaction_dispatch_to_unregistered_target_errors() {
         vec![(RollupId(1), vec![], [0; 32])],
     );
 
-    match eez_protocol::compose_transaction(
-        &MockProtocol,
-        entry.as_ref(),
-        &[],
-        source_id,
-        rollups,
-    )
-    .await
+    match eez_protocol::compose_transaction(&MockProtocol, entry.as_ref(), &[], source_id, rollups)
+        .await
     {
         Err(e) if matches!(e.kind(), CompositionErrorKind::Executor(_)) => {}
         other => panic!("expected Executor error, got {other:?}"),

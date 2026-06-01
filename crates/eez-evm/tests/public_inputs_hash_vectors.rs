@@ -27,9 +27,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use alloy_primitives::{hex, Bytes, B256, U256};
-use eez_evm::public_inputs::{per_ps_public_inputs_hash, shared_public_input};
+use alloy_primitives::{B256, Bytes, U256, hex};
 use eez_evm::EvmProtocol;
+use eez_evm::public_inputs::{per_ps_public_inputs_hash, shared_public_input};
 use eez_protocol::{ProofPlan, RollupId, RollupProofAssignment, TimestampAndBlockHash};
 use serde::Deserialize;
 

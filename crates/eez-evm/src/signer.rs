@@ -33,7 +33,7 @@
 //!   `{27, 28}`".
 //! - `docs/plans/09-postbatch-poster.md` §D.
 
-use alloy_primitives::{Address, Bytes, B256};
+use alloy_primitives::{Address, B256, Bytes};
 use k256::ecdsa::{RecoveryId, Signature as K256Signature, SigningKey};
 
 /// Narrow ECDSA signer over raw `B256` digests. Produces a

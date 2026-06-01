@@ -32,7 +32,7 @@
 //! `LookupCall.crossChainCallHash` on lookup calls. Values are
 //! byte-identical; only the struct-field names diverge.
 
-use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_sol_types::SolValue;
 use eez_protocol::RollupId;
 

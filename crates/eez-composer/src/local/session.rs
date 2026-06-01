@@ -13,8 +13,8 @@
 
 use alloy_primitives::{Address, B256, Bytes, U256};
 
-use crosschain_evm::EvmProtocol;
-use crosschain_evm_composer::{OverlayChannelHandle, SessionInspectorFactory};
+use eez_evm::EvmProtocol;
+use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory};
 use reth_evm::{ConfigureEvm, Evm as _};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_revm::{database::StateProviderDatabase, db::State};
@@ -23,7 +23,7 @@ use reth_trie_common::{HashedPostState, KeccakKeyHasher};
 use revm::DatabaseCommit;
 use revm::database::CacheState;
 
-use crosschain_protocol::{
+use eez_protocol::{
     Dispatcher, ExecutionRequest, ExecutionResponse, ExecutorError, ExecutorErrorKind,
     ExecutorResult, RollupId, TargetBatchSimulation, TargetExecutionSession, TargetTransaction,
 };
@@ -59,7 +59,7 @@ pub struct LocalExecutionSession {
     chain_id: u64,
     ccm_address: Address,
     /// When `Some`, `execute()` runs each target call under a
-    /// [`crosschain_evm_composer::SessionInspector`] built from this factory — forwarding
+    /// [`eez_evm_inspector::SessionInspector`] built from this factory — forwarding
     /// detected proxy CALLs to the dispatcher. `None` means a plain
     /// direct execute with no inspection layer (used for the entry
     /// role's target-session path when the topology has no nested
@@ -93,7 +93,7 @@ impl LocalExecutionSession {
     ///
     /// `inspector_factory` pins this session's target-side inspection
     /// policy. When supplied, each `execute` call runs under a
-    /// [`crosschain_evm_composer::SessionInspector`] so proxy CALLs
+    /// [`eez_evm_inspector::SessionInspector`] so proxy CALLs
     /// detected during the target-chain execution dispatch back
     /// through the supplied `dispatcher` and are recorded into the
     /// composition's preorder `recorded[..]` slice. When `None`, the
@@ -105,7 +105,7 @@ impl LocalExecutionSession {
     /// target-session frame dispatches back to the entry rollup, the
     /// entry session is lazily opened with a clone of source-sim's
     /// in-flight cache (via the
-    /// [`crosschain_evm_composer::OverlayChannel`] side-channel), so
+    /// [`eez_evm_inspector::OverlayChannel`] side-channel), so
     /// the nested L1 call observes source-sim's pending writes —
     /// load-bearing for fixtures that mutate L1 state inside a single
     /// source tx (e.g. `flash-loan`). `None` opens a fresh State.
@@ -224,7 +224,7 @@ impl LocalExecutionSession {
         value: &U256,
         source_address: &Address,
         source_rollup: RollupId,
-    ) -> ExecutorResult<crosschain_protocol::ExecutionOutcome> {
+    ) -> ExecutorResult<eez_protocol::ExecutionOutcome> {
         let tx_env = self.build_tx_env(destination, calldata, value, source_address, source_rollup);
         let caller = tx_env.caller;
         let pre_root = self.current_root;
@@ -235,7 +235,7 @@ impl LocalExecutionSession {
             let result = evm.transact(tx_env).map_err(evm_err)?;
             (
                 result.result.output().cloned().unwrap_or_default(),
-                result.result.gas_used(),
+                result.result.tx_gas_used(),
                 result.result.is_success(),
                 result.state,
             )
@@ -245,7 +245,7 @@ impl LocalExecutionSession {
     }
 
     /// Inspected direct-call path. Runs the target-chain tx under the
-    /// supplied [`crosschain_evm_composer::SessionInspector`] so proxy CALLs detected during
+    /// supplied [`eez_evm_inspector::SessionInspector`] so proxy CALLs detected during
     /// execution dispatch back through the underlying `Dispatcher`.
     ///
     /// The session takes the inspector by value (non-`'static`
@@ -264,13 +264,13 @@ impl LocalExecutionSession {
     /// the amendment C15 regression test.
     fn execute_internal_with_inspector(
         &mut self,
-        inspector: crosschain_evm_composer::SessionInspector<'_>,
+        inspector: eez_evm_inspector::SessionInspector<'_>,
         destination: &Address,
         calldata: &Bytes,
         value: &U256,
         source_address: &Address,
         source_rollup: RollupId,
-    ) -> ExecutorResult<crosschain_protocol::ExecutionOutcome> {
+    ) -> ExecutorResult<eez_protocol::ExecutionOutcome> {
         let tx_env = self.build_tx_env(destination, calldata, value, source_address, source_rollup);
         let caller = tx_env.caller;
         let pre_root = self.current_root;
@@ -284,7 +284,7 @@ impl LocalExecutionSession {
             let inspector_error = evm.inspector_mut().take_error();
             (
                 result.result.output().cloned().unwrap_or_default(),
-                result.result.gas_used(),
+                result.result.tx_gas_used(),
                 result.result.is_success(),
                 result.state,
                 inspector_error,
@@ -299,7 +299,7 @@ impl LocalExecutionSession {
 
     /// Shared post-commit bookkeeping: commit the revm bundle, compute
     /// the post-state root, advance `current_root`, log, and emit an
-    /// [`ExecutionOutcome`](crosschain_protocol::ExecutionOutcome).
+    /// [`ExecutionOutcome`](eez_protocol::ExecutionOutcome).
     fn commit_and_finish(
         &mut self,
         pre_root: B256,
@@ -307,7 +307,7 @@ impl LocalExecutionSession {
         gas_used: u64,
         success: bool,
         changes: revm::primitives::map::AddressHashMap<revm::state::Account>,
-    ) -> ExecutorResult<crosschain_protocol::ExecutionOutcome> {
+    ) -> ExecutorResult<eez_protocol::ExecutionOutcome> {
         self.state.commit(changes);
 
         let post_root = compute_state_root(&mut self.state, self.state_provider.as_ref())?;
@@ -345,7 +345,7 @@ impl LocalExecutionSession {
             return_len = return_data.len(),
             "target call completed");
 
-        Ok(crosschain_protocol::ExecutionOutcome::Resolved {
+        Ok(eez_protocol::ExecutionOutcome::Resolved {
             return_data: return_data.to_vec(),
             pre_state_root: pre_root.0,
             post_state_root: post_root.0,
@@ -433,14 +433,14 @@ impl TargetExecutionSession for LocalExecutionSession {
 
         let pre = outcome.pre_state_root().copied().unwrap_or([0u8; 32]);
         let post = outcome.post_state_root().copied().unwrap_or([0u8; 32]);
-        let checkpoint = crosschain_protocol::ExecutionCheckpoint {
+        let checkpoint = eez_protocol::ExecutionCheckpoint {
             version: 1,
             chain_id: self.chain_id,
             base_block_number: 0,
             base_block_hash: [0u8; 32],
             base_state_root: pre,
             current_root: post,
-            overlay: crosschain_evm::EvmOverlay::default(),
+            overlay: eez_evm::EvmOverlay::default(),
             witness: None,
         };
 
@@ -450,17 +450,14 @@ impl TargetExecutionSession for LocalExecutionSession {
         })
     }
 
-    async fn checkpoint(&mut self) -> ExecutorResult<crosschain_protocol::SessionSnapshot> {
+    async fn checkpoint(&mut self) -> ExecutorResult<eez_protocol::SessionSnapshot> {
         // Opaque snapshot carrying the current root only. The full
         // revm `State<DB>` deep-clone is tracked as known debt — see
         // CLAUDE.md "Known limitations".
         Ok(Box::new(self.current_root.0) as Box<dyn std::any::Any + Send>)
     }
 
-    async fn rollback(
-        &mut self,
-        snapshot: crosschain_protocol::SessionSnapshot,
-    ) -> ExecutorResult<()> {
+    async fn rollback(&mut self, snapshot: eez_protocol::SessionSnapshot) -> ExecutorResult<()> {
         let root: [u8; 32] = *snapshot.downcast::<[u8; 32]>().map_err(|_e| {
             ExecutorError::from(ExecutorErrorKind::Encoding(
                 "LocalExecutionSession::rollback: snapshot type mismatch".into(),
@@ -473,15 +470,15 @@ impl TargetExecutionSession for LocalExecutionSession {
     /// Placeholder checkpoint until overlay/witness recording is implemented.
     async fn take_checkpoint(
         &mut self,
-    ) -> Option<crosschain_protocol::ProtocolCheckpoint<Self::Protocol>> {
-        Some(crosschain_protocol::ExecutionCheckpoint {
+    ) -> Option<eez_protocol::ProtocolCheckpoint<Self::Protocol>> {
+        Some(eez_protocol::ExecutionCheckpoint {
             version: 1,
             chain_id: self.chain_id,
             base_block_number: 0,
             base_block_hash: [0u8; 32],
             base_state_root: [0u8; 32],
             current_root: self.current_root.0,
-            overlay: crosschain_evm::EvmOverlay::default(),
+            overlay: eez_evm::EvmOverlay::default(),
             witness: None,
         })
     }
@@ -533,7 +530,7 @@ pub(super) fn simulate_local_transactions(
 
         tracing::trace!(
             tx = index,
-            gas = result.result.gas_used(),
+            gas = result.result.tx_gas_used(),
             "target batch tx simulated"
         );
         state.commit(result.state);

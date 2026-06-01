@@ -210,7 +210,9 @@ pub enum ProofPlanInvariantError {
     /// assignment's `rollup_id` MUST be `> 0`. This validator
     /// matches that behavior — `index == 0` means the first
     /// rollup_id was 0 (reserved).
-    #[error("rollup_assignments not strictly increasing at index {index} (sentinel = MAINNET_ROLLUP_ID = 0)")]
+    #[error(
+        "rollup_assignments not strictly increasing at index {index} (sentinel = MAINNET_ROLLUP_ID = 0)"
+    )]
     RollupAssignmentsNotSorted {
         /// Position of the first non-sorted entry; `0` if the
         /// first entry's `rollup_id` itself was `0`.

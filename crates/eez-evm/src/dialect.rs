@@ -16,9 +16,9 @@
 use alloy_sol_types::SolCall;
 use eez_protocol::{RecordedCall, RollupId};
 
+use crate::EvmProtocol;
 use crate::authorized_proxies::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
 use crate::types::executeL1ToL2CallCall;
-use crate::EvmProtocol;
 
 /// Selects the contract ABI and entry-emission rules for one rollup.
 ///

@@ -37,9 +37,18 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 pub mod composer;
+pub mod held_pool;
+pub mod ingress;
+pub mod local;
 pub mod rollup;
 
 #[doc(inline)]
 pub use composer::Composer;
+#[doc(inline)]
+pub use held_pool::{HeldPool, HeldTx};
+#[doc(inline)]
+pub use ingress::{Classification, IngressClassifier};
+#[doc(inline)]
+pub use local::{EvmComposer, LocalChainClient};
 #[doc(inline)]
 pub use rollup::{RollupConfig, RollupState};
