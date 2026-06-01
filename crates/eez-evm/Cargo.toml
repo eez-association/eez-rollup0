@@ -1,0 +1,36 @@
+[package]
+name = "crosschain-evm"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+description = "EVM implementation of ChainProtocol — Solidity ABI types, flat action hashing, unified-emitter batch building"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+crosschain-protocol.workspace = true
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+# Phase 09 §B2: on-chain reads for the EvmProofPlanResolver
+# (`EEZ.rollups`, `Rollup.checkProofSystemsAndGetVkeys`,
+# `IRollupContract.getTimestampAndBlockHash`). Network type is
+# `Ethereum` from `alloy-network`; the HTTP transport is the only
+# one currently wired through `crates/crosschain-evm`.
+alloy-network.workspace = true
+alloy-provider.workspace = true
+alloy-rpc-client.workspace = true
+alloy-transport-http.workspace = true
+alloy-contract.workspace = true
+# Phase 09 §D: narrow ECDSA signing for the postBatch poster's
+# proof system. See workspace `[dependencies]` rationale.
+k256.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { workspace = true }
