@@ -39,7 +39,7 @@ use reth_primitives_traits::{
 use reth_storage_api::BlockReader;
 use tracing::{Level, event};
 
-use crate::block_committer::BlockCommitterHandle;
+use crate::block_committer::{BlockCommitterHandle, SequenceOutcome};
 use crate::error::{DriverError, DriverResult};
 use crate::scheduler::{ProposalRequest, Scheduler};
 
@@ -297,6 +297,7 @@ where
             // with no `CanonStateNotification` broadcast lag.
             let last_header = self.committer.last_header();
             let parent_num = last_header.number();
+            let parent_hash = last_header.hash();
             let parent_ts = last_header.timestamp();
             let gap = target_wall.saturating_sub(parent_ts);
 
@@ -333,7 +334,30 @@ where
             let next_ts = parent_ts.saturating_add(BLOCK_TIME_SECS);
             let attrs = self.attributes.build(&last_header, next_ts);
             let timestamp = attrs.timestamp;
-            let outcome = self.committer.commit_sequenced(attrs).await?;
+            let outcome = self
+                .committer
+                .commit_sequenced(parent_hash, parent_num, attrs)
+                .await?;
+            let outcome = match outcome {
+                SequenceOutcome::Committed(outcome) => outcome,
+                SequenceOutcome::StaleParent {
+                    expected_hash,
+                    expected_number,
+                    actual_hash,
+                    actual_number,
+                } => {
+                    event!(
+                        name: "eez.sequencer.parent.stale",
+                        Level::DEBUG,
+                        expected_parent.number = expected_number,
+                        expected_parent.hash = %expected_hash,
+                        actual_parent.number = actual_number,
+                        actual_parent.hash = %actual_hash,
+                        "sequencer parent changed before commit; rebuilding attributes",
+                    );
+                    continue;
+                }
+            };
             let block_number = outcome.header.number();
             let block_hash = outcome.header.hash();
 

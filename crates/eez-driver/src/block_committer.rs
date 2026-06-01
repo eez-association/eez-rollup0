@@ -7,7 +7,7 @@
 //! traffic stays strictly ordered.
 //!
 //! Commands:
-//! - `Sequence` — Sequencer's per-tick FCU+attrs → resolve payload → newPayload.
+//! - `Sequence` — parent-bound Sequencer FCU+attrs → resolve payload → newPayload.
 //! - `RefreshForkchoice` — bare FCU to keep reth's view alive during quiet periods.
 //! - `AdvanceSafeFinalized` — Deriver pushes safe/finalized cursors forward.
 //! - `AdvanceHead` — follower points unsafe head at a sequencer-served block.
@@ -24,7 +24,7 @@ use reth_engine_primitives::{BeaconForkChoiceUpdateError, ConsensusEngineHandle}
 use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{BuiltPayload, ExecutionPayload, PayloadKind, PayloadTypes};
-use reth_primitives_traits::{SealedHeader, SealedHeaderFor};
+use reth_primitives_traits::{AlloyBlockHeader, SealedHeader, SealedHeaderFor};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{DriverError, DriverResult};
@@ -49,6 +49,44 @@ impl<T: PayloadTypes> fmt::Debug for CommitOutcome<T> {
     }
 }
 
+/// Result of a parent-bound sequencer commit attempt.
+pub enum SequenceOutcome<T: PayloadTypes> {
+    /// The payload was built and committed against the requested parent.
+    Committed(CommitOutcome<T>),
+    /// The actor's head changed after attributes were built but before
+    /// the sequence command was processed. The caller should rebuild
+    /// attributes against `actual_*` and retry.
+    StaleParent {
+        expected_hash: B256,
+        expected_number: u64,
+        actual_hash: B256,
+        actual_number: u64,
+    },
+}
+
+impl<T: PayloadTypes> fmt::Debug for SequenceOutcome<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Committed(outcome) => f
+                .debug_tuple("SequenceOutcome::Committed")
+                .field(outcome)
+                .finish(),
+            Self::StaleParent {
+                expected_hash,
+                expected_number,
+                actual_hash,
+                actual_number,
+            } => f
+                .debug_struct("SequenceOutcome::StaleParent")
+                .field("expected_hash", expected_hash)
+                .field("expected_number", expected_number)
+                .field("actual_hash", actual_hash)
+                .field("actual_number", actual_number)
+                .finish(),
+        }
+    }
+}
+
 /// Follower unsafe-head forkchoice result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkchoiceOutcome {
@@ -63,8 +101,10 @@ pub enum ForkchoiceOutcome {
 
 enum CommitCommand<T: PayloadTypes> {
     Sequence {
+        expected_parent_hash: B256,
+        expected_parent_number: u64,
         attrs: EthPayloadAttributes,
-        response: oneshot::Sender<DriverResult<CommitOutcome<T>>>,
+        response: oneshot::Sender<DriverResult<SequenceOutcome<T>>>,
     },
     RefreshForkchoice {
         response: oneshot::Sender<DriverResult<()>>,
@@ -167,10 +207,10 @@ where
         self.last_header.read().unwrap().clone()
     }
 
-    /// Builds a payload with the given attributes, commits it via
-    /// `newPayload`, and advances the head cursor. `safe` / `finalized`
-    /// are unaffected — only [`Self::advance_safe_finalized`] moves
-    /// those.
+    /// Builds a payload with the given attributes if the actor's head
+    /// still matches `expected_parent_*`, commits it via `newPayload`,
+    /// and advances the head cursor. `safe` / `finalized` are unaffected
+    /// — only [`Self::advance_safe_finalized`] moves those.
     ///
     /// # Errors
     ///
@@ -178,11 +218,15 @@ where
     /// `invalid_payload`, transport) or `committer_closed`.
     pub async fn commit_sequenced(
         &self,
+        expected_parent_hash: B256,
+        expected_parent_number: u64,
         attrs: EthPayloadAttributes,
-    ) -> DriverResult<CommitOutcome<T>> {
+    ) -> DriverResult<SequenceOutcome<T>> {
         let (response_tx, response_rx) = oneshot::channel();
         self.sender
             .send(CommitCommand::Sequence {
+                expected_parent_hash,
+                expected_parent_number,
                 attrs,
                 response: response_tx,
             })
@@ -314,8 +358,15 @@ where
     async fn run(mut self) {
         while let Some(cmd) = self.receiver.recv().await {
             match cmd {
-                CommitCommand::Sequence { attrs, response } => {
-                    let result = self.process_sequence(attrs).await;
+                CommitCommand::Sequence {
+                    expected_parent_hash,
+                    expected_parent_number,
+                    attrs,
+                    response,
+                } => {
+                    let result = self
+                        .process_sequence(expected_parent_hash, expected_parent_number, attrs)
+                        .await;
                     let _ = response.send(result);
                 }
                 CommitCommand::RefreshForkchoice { response } => {
@@ -449,11 +500,31 @@ where
 
     async fn process_sequence(
         &mut self,
+        expected_parent_hash: B256,
+        expected_parent_number: u64,
         attrs: EthPayloadAttributes,
-    ) -> DriverResult<CommitOutcome<T>> {
+    ) -> DriverResult<SequenceOutcome<T>> {
+        let (actual_hash, actual_number) = {
+            let current_parent = self.last_header.read().unwrap();
+            (current_parent.hash(), current_parent.number())
+        };
+        if actual_hash != expected_parent_hash || actual_number != expected_parent_number {
+            return Ok(SequenceOutcome::StaleParent {
+                expected_hash: expected_parent_hash,
+                expected_number: expected_parent_number,
+                actual_hash,
+                actual_number,
+            });
+        }
+
+        let state = ForkchoiceState {
+            head_block_hash: actual_hash,
+            safe_block_hash: self.safe_hash,
+            finalized_block_hash: self.finalized_hash,
+        };
         let fcu = self
             .to_engine
-            .fork_choice_updated(self.forkchoice_state(), Some(attrs))
+            .fork_choice_updated(state, Some(attrs))
             .await
             .map_err(DriverError::engine_rpc)?;
         if !fcu.is_valid() {
@@ -481,7 +552,7 @@ where
         }
 
         *self.last_header.write().unwrap() = header.clone();
-        Ok(CommitOutcome { header })
+        Ok(SequenceOutcome::Committed(CommitOutcome { header }))
     }
 }
 
