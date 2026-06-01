@@ -24,8 +24,8 @@
 //! (multi-tx composition). Reading through revm's journal captures
 //! both; a pre-tx storage snapshot would not.
 //!
-//! [`Dispatcher`]: crosschain_protocol::Dispatcher
-//! [`Dispatcher::dispatch_call`]: crosschain_protocol::Dispatcher::dispatch_call
+//! [`Dispatcher`]: eez_protocol::Dispatcher
+//! [`Dispatcher::dispatch_call`]: eez_protocol::Dispatcher::dispatch_call
 
 use alloy_primitives::{Address, Bytes};
 use std::sync::{Arc, Mutex};
@@ -37,8 +37,8 @@ use revm::interpreter::{
     CallInputs, CallOutcome, CallScheme, Gas, InstructionResult, InterpreterResult,
 };
 
-use crosschain_evm::{EvmProtocol, ProxyInfo, decode_proxy_value, proxy_mapping_key};
-use crosschain_protocol::{Dispatcher, ExecutorError, ProxyLookupConfig, RollupId};
+use eez_evm::{EvmProtocol, ProxyInfo, decode_proxy_value, proxy_mapping_key};
+use eez_protocol::{Dispatcher, ExecutorError, ProxyLookupConfig, RollupId};
 
 /// Bidirectional side-channel between source-sim and the overlay
 /// session opened on the entry rollup.
@@ -298,7 +298,7 @@ pub struct SessionInspector<'a> {
     dispatcher: &'a mut (dyn Dispatcher<Protocol = EvmProtocol> + Send),
     /// Rollup id of the chain this inspector is running on — the
     /// `caller_id` passed to `dispatch_call` so the resulting
-    /// [`RecordedCall.caller_rollup_id`](crosschain_protocol::RecordedCall::caller_rollup_id)
+    /// [`RecordedCall.caller_rollup_id`](eez_protocol::RecordedCall::caller_rollup_id)
     /// is correct for nested action-hash emission.
     caller_rollup_id: RollupId,
     /// First target execution error, if any.
@@ -314,7 +314,7 @@ pub struct SessionInspector<'a> {
     /// Per-EVM-frame snapshot of the dispatcher's recorded-call count
     /// at the entry of `Inspector::call`. On `Inspector::call_end`,
     /// the popped value pairs with the current count to bracket the
-    /// range of [`crosschain_protocol::RecordedCall`]s dispatched
+    /// range of [`eez_protocol::RecordedCall`]s dispatched
     /// inside this frame. If the frame's outcome is
     /// `InstructionResult::Revert` AND the range is non-empty, the
     /// inspector forwards `(start, span)` to
@@ -530,7 +530,7 @@ where
             CallScheme::StaticCall => "STATICCALL",
         };
 
-        let req = crosschain_protocol::ExecutionRequest {
+        let req = eez_protocol::ExecutionRequest {
             destination: info.original_address,
             calldata: calldata.clone(),
             value: call_value,
@@ -761,7 +761,7 @@ mod tests {
 
     use super::*;
     use alloy_primitives::{U256, address};
-    use crosschain_evm::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
+    use eez_evm::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
     use revm::MainContext;
     use revm::context::Context;
     use revm::database::{CacheDB, EmptyDB};

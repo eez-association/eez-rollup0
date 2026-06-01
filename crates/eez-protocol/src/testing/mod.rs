@@ -2,7 +2,7 @@
 //!
 //! Gated by the `testing` Cargo feature so library consumers never
 //! pull the fake into their production binary. Test code opts in via
-//! `crosschain-protocol = { ..., features = ["testing"] }` in
+//! `eez-protocol = { ..., features = ["testing"] }` in
 //! `[dev-dependencies]`.
 //!
 //! This module is also visible in this crate's own `#[cfg(test)]` code

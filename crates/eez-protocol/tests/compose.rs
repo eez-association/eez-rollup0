@@ -1,7 +1,7 @@
 //! Integration test for [`compose_transaction`] against a minimal mock
 //! `ChainProtocol` impl. Validates the happy path and the error-path
 //! early returns (empty dispatch, dispatch to unregistered target)
-//! without depending on `crosschain-evm`.
+//! without depending on `eez-evm`.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crosschain_protocol::{
+use eez_protocol::{
     ChainClient, ChainProtocol, CompositionErrorKind, Dispatcher, EntryChainClient,
     ExecutionOutcome, ExecutionRequest, ExecutionResponse, ExecutorResult, ProtocolErrorKind,
     ProtocolResult, ProxyLookupConfig, RecordedCall, Rollup, RollupId, TargetBatchSimulation,
@@ -46,7 +46,7 @@ impl ChainProtocol for MockProtocol {
     fn build_batch(
         &self,
         recorded: &[RecordedCall<Self>],
-        attribution: &crosschain_protocol::SourceAttribution<'_>,
+        attribution: &eez_protocol::SourceAttribution<'_>,
         _dialect: &Self::Dialect,
         _source_rollup_id: RollupId,
         _raw_tx: &[u8],
@@ -125,7 +125,7 @@ impl TargetExecutionSession for MockSession {
             .expect("test seeded enough outcomes");
         Ok(ExecutionResponse {
             outcome,
-            checkpoint: crosschain_protocol::ExecutionCheckpoint {
+            checkpoint: eez_protocol::ExecutionCheckpoint {
                 version: 0,
                 chain_id: 0,
                 base_block_number: 0,
@@ -138,20 +138,20 @@ impl TargetExecutionSession for MockSession {
         })
     }
 
-    async fn checkpoint(&mut self) -> ExecutorResult<crosschain_protocol::SessionSnapshot> {
+    async fn checkpoint(&mut self) -> ExecutorResult<eez_protocol::SessionSnapshot> {
         Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
     }
 
     async fn rollback(
         &mut self,
-        _snap: crosschain_protocol::SessionSnapshot,
+        _snap: eez_protocol::SessionSnapshot,
     ) -> ExecutorResult<()> {
         Ok(())
     }
 
     async fn take_checkpoint(
         &mut self,
-    ) -> Option<crosschain_protocol::ProtocolCheckpoint<Self::Protocol>> {
+    ) -> Option<eez_protocol::ProtocolCheckpoint<Self::Protocol>> {
         None
     }
 }
@@ -281,7 +281,7 @@ impl EntryChainClient for MockEntryClient {
 }
 
 #[async_trait]
-impl crosschain_protocol::CommittedRootReader for MockEntryClient {
+impl eez_protocol::CommittedRootReader for MockEntryClient {
     async fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
         Ok(self
             .stored_roots
@@ -379,7 +379,7 @@ async fn compose_transaction_happy_path() {
         vec![(target_id, vec![outcome([1; 32]), outcome([2; 32])], [2; 32])],
     );
 
-    let composition = crosschain_protocol::compose_transaction(
+    let composition = eez_protocol::compose_transaction(
         &MockProtocol,
         entry.as_ref(),
         &[],
@@ -408,7 +408,7 @@ async fn compose_transaction_no_dispatches_errors() {
         vec![(RollupId(1), vec![], [0; 32])],
     );
 
-    match crosschain_protocol::compose_transaction(
+    match eez_protocol::compose_transaction(
         &MockProtocol,
         entry.as_ref(),
         &[],
@@ -445,7 +445,7 @@ async fn compose_transaction_dispatch_to_unregistered_target_errors() {
         vec![(RollupId(1), vec![], [0; 32])],
     );
 
-    match crosschain_protocol::compose_transaction(
+    match eez_protocol::compose_transaction(
         &MockProtocol,
         entry.as_ref(),
         &[],

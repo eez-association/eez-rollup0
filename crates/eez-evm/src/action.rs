@@ -34,7 +34,7 @@
 
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_sol_types::SolValue;
-use crosschain_protocol::RollupId;
+use eez_protocol::RollupId;
 
 use crate::types::ActionSol;
 

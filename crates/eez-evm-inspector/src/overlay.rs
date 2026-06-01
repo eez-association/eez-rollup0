@@ -31,9 +31,9 @@
 //!
 //! # Crate-layering invariants
 //!
-//! This module lives in `crosschain-evm-composer` because that crate
+//! This module lives in `eez-evm-inspector` because that crate
 //! already depends on `revm`. It must not depend on `reth_*` or
-//! `rollup-node`. The actual nested-call execution + diff-apply path
+//! `eez-composer`. The actual nested-call execution + diff-apply path
 //! lives in this crate's `inspector.rs` (which has the necessary
 //! `&mut Context` access during the `Inspector::call` hook).
 

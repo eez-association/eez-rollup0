@@ -1,6 +1,6 @@
 //! Per-chain dialect for entry encoding and CCM-verify batch construction.
 //!
-//! [`ChainDialect`] is the [`ChainProtocol::Dialect`](crosschain_protocol::ChainProtocol::Dialect)
+//! [`ChainDialect`] is the [`ChainProtocol::Dialect`](eez_protocol::ChainProtocol::Dialect)
 //! implementation for EVM chains. Two variants distinguish the two
 //! contract surfaces the protocol exposes:
 //!
@@ -14,7 +14,7 @@
 //! see `ChainDialect` directly.
 
 use alloy_sol_types::SolCall;
-use crosschain_protocol::{RecordedCall, RollupId};
+use eez_protocol::{RecordedCall, RollupId};
 
 use crate::authorized_proxies::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
 use crate::types::executeL1ToL2CallCall;
@@ -22,7 +22,7 @@ use crate::EvmProtocol;
 
 /// Selects the contract ABI and entry-emission rules for one rollup.
 ///
-/// Stored on [`crosschain_protocol::TargetConfig`] (via
+/// Stored on [`eez_protocol::TargetConfig`] (via
 /// `ChainProtocol::Dialect = ChainDialect`) and read at composition
 /// time to select the correct calldata encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

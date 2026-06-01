@@ -6,7 +6,7 @@
 //! which runs the Foundry script
 //! `contracts/script/GenPublicInputsHashVectors.s.sol`) and
 //! asserts that the Rust mirror in
-//! [`crosschain_evm::public_inputs`] produces byte-identical
+//! [`eez_evm::public_inputs`] produces byte-identical
 //! shared + per-PS hashes for every vector.
 //!
 //! Vectors are flattened — they carry per-element hashes
@@ -28,9 +28,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use alloy_primitives::{hex, Bytes, B256, U256};
-use crosschain_evm::public_inputs::{per_ps_public_inputs_hash, shared_public_input};
-use crosschain_evm::EvmProtocol;
-use crosschain_protocol::{ProofPlan, RollupId, RollupProofAssignment, TimestampAndBlockHash};
+use eez_evm::public_inputs::{per_ps_public_inputs_hash, shared_public_input};
+use eez_evm::EvmProtocol;
+use eez_protocol::{ProofPlan, RollupId, RollupProofAssignment, TimestampAndBlockHash};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]

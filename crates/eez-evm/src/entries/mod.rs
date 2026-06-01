@@ -17,7 +17,7 @@
 
 use alloy_primitives::{Bytes, B256, U256};
 use alloy_sol_types::SolCall;
-use crosschain_protocol::{rolling_hash::EntryRollingHash, ProtocolResult, RecordedCall, RollupId};
+use eez_protocol::{rolling_hash::EntryRollingHash, ProtocolResult, RecordedCall, RollupId};
 
 use crate::action::cross_chain_call_hash;
 use crate::batch::EvmBatch;
@@ -90,7 +90,7 @@ impl CallKind {
 /// should be resolved before entering finalize).
 pub fn build_batch(
     recorded: &[RecordedCall<EvmProtocol>],
-    attribution: &crosschain_protocol::SourceAttribution<'_>,
+    attribution: &eez_protocol::SourceAttribution<'_>,
     dialect: &ChainDialect,
     source_rollup_id: RollupId,
     raw_tx: &[u8],
@@ -172,7 +172,7 @@ pub fn build_batch(
 ///
 /// Under the multi-prover ABI, proofs live inside the batch struct
 /// (`batch.inner.proofs[]`). Callers populate `proofs[]` before
-/// encoding — see `crosschain_evm_composer::post_batch_submitter`
+/// encoding — see `eez_evm_inspector::post_batch_submitter`
 /// for the canonical fill+encode+submit pipeline.
 #[must_use]
 pub fn encode_postbatch(batch: &EvmBatch) -> Vec<u8> {
@@ -231,10 +231,10 @@ impl EntryBuilder {
             outer.caller_rollup_id,
         );
         let return_data: Bytes = match &outer.outcome {
-            crosschain_protocol::ExecutionOutcome::Resolved { return_data, .. } => {
+            eez_protocol::ExecutionOutcome::Resolved { return_data, .. } => {
                 Bytes::from(return_data.clone())
             }
-            crosschain_protocol::ExecutionOutcome::Pending => Bytes::new(),
+            eez_protocol::ExecutionOutcome::Pending => Bytes::new(),
         };
         Self {
             proxy_entry_hash,
@@ -332,7 +332,7 @@ fn lookup_call_sol(call: &RecordedCall<EvmProtocol>, failed: bool) -> LookupCall
 mod tests {
     use super::*;
     use alloy_primitives::address;
-    use crosschain_protocol::{ExecutionOutcome, SourceAttribution};
+    use eez_protocol::{ExecutionOutcome, SourceAttribution};
     use std::collections::HashMap;
 
     fn record(

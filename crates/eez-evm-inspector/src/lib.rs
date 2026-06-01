@@ -1,30 +1,30 @@
 //! EVM-specific composer glue.
 //!
 //! The chain-agnostic orchestration ([`Composer<P>`], [`CompositionBuilder<P>`],
-//! configs, errors) lives in [`crosschain_protocol`]. This crate contributes
+//! configs, errors) lives in [`eez_protocol`]. This crate contributes
 //! the one genuinely EVM-coupled piece — [`SessionInspector`], a
 //! `revm::Inspector` impl — plus type aliases that bind the generic
 //! orchestrator to [`EvmProtocol`] for downstream convenience.
 //!
 //! ```text
-//! crosschain-protocol
+//! eez-protocol
 //!   traits, types, generic Composer<P>, CompositionBuilder<P>
 //!         ↑
-//! crosschain-evm            (EvmProtocol, ABI, entry building)
+//! eez-evm            (EvmProtocol, ABI, entry building)
 //!         ↑
-//! crosschain-evm-composer   ← you are here (inspector + aliases)
+//! eez-evm-inspector   ← you are here (inspector + aliases)
 //!         ↑
-//! rollup-node               (reth integration, wiring)
+//! eez-composer               (reth integration, wiring)
 //! ```
 //!
 //! Revm is confined to this crate so downstream readers of EVM protocol
-//! types (verifiers, external tools) can depend on `crosschain-evm`
+//! types (verifiers, external tools) can depend on `eez-evm`
 //! without pulling in the full EVM execution stack.
 //!
 //! [`SessionInspector`]: crate::SessionInspector
-//! [`Composer<P>`]: crosschain_protocol::Composer
-//! [`CompositionBuilder<P>`]: crosschain_protocol::CompositionBuilder
-//! [`EvmProtocol`]: crosschain_evm::EvmProtocol
+//! [`Composer<P>`]: eez_protocol::Composer
+//! [`CompositionBuilder<P>`]: eez_protocol::CompositionBuilder
+//! [`EvmProtocol`]: eez_evm::EvmProtocol
 
 pub mod inspector;
 pub mod overlay;
@@ -36,16 +36,16 @@ pub use inspector::{
 };
 pub use overlay::{OverlayError, apply_overlay_diff, clone_state};
 
-// Re-export chain-agnostic types so callers can `use crosschain_evm_composer::*`
+// Re-export chain-agnostic types so callers can `use eez_evm_inspector::*`
 // without reaching into the protocol crate for everyday composition needs.
-pub use crosschain_protocol::{
+pub use eez_protocol::{
     ComposerError, ComposerResult, DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig,
 };
 
-use crosschain_evm::EvmProtocol;
+use eez_evm::EvmProtocol;
 
-/// EVM-bound composer. Alias for `crosschain_protocol::Composer<EvmProtocol>`.
-pub type Composer = crosschain_protocol::Composer<EvmProtocol>;
+/// EVM-bound composer. Alias for `eez_protocol::Composer<EvmProtocol>`.
+pub type Composer = eez_protocol::Composer<EvmProtocol>;
 
-/// EVM-bound per-target config. Alias for `crosschain_protocol::TargetConfig<EvmProtocol>`.
-pub type TargetConfig = crosschain_protocol::TargetConfig<EvmProtocol>;
+/// EVM-bound per-target config. Alias for `eez_protocol::TargetConfig<EvmProtocol>`.
+pub type TargetConfig = eez_protocol::TargetConfig<EvmProtocol>;

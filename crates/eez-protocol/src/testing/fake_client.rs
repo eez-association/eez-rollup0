@@ -548,7 +548,7 @@ mod tests {
                     };
                     // The real inspector bridges sync → async via a
                     // scoped OS thread + `Handle::block_on` (see
-                    // `crosschain-evm-composer`). Mirror that here so
+                    // `eez-evm-inspector`). Mirror that here so
                     // the hook can invoke the async dispatcher from a
                     // sync closure without deadlocking the outer
                     // tokio multi-thread test runtime.

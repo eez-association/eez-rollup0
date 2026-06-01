@@ -1,7 +1,7 @@
 //! EVM implementation of the cross-chain protocol.
 //!
-//! Sits between [`crosschain_protocol`] (abstract traits) and
-//! `crosschain-evm-composer` (orchestration). Provides the EVM-specific
+//! Sits between [`eez_protocol`] (abstract traits) and
+//! `eez-evm-inspector` (orchestration). Provides the EVM-specific
 //! materialization of every associated type and method on the
 //! [`ChainProtocol`] trait:
 //!
@@ -30,7 +30,7 @@
 //!
 //! - The crate entry point is [`EvmProtocol`], a **unit struct** — all
 //!   per-transaction state lives on the composition builder in
-//!   `crosschain-protocol`.
+//!   `eez-protocol`.
 //! - For the ABI boundary, [`entries::build_batch`] walks the preorder
 //!   `recorded[..]` slice and materializes an [`EvmBatch`]; the
 //!   per-dialect encoders (`encode_postbatch` / `encode_load_table`)
@@ -52,7 +52,7 @@ pub mod types;
 pub mod witness;
 
 use alloy_primitives::{Address, Bytes, U256};
-use crosschain_protocol::{
+use eez_protocol::{
     ChainProtocol, ProtocolErrorKind, ProtocolResult, RecordedCall, RollupId,
 };
 
@@ -78,7 +78,7 @@ pub use witness::EvmWitness;
 // ── Type aliases ────────────────────────────────────────────────
 
 pub type EvmRecordedCall = RecordedCall<EvmProtocol>;
-pub type EvmCheckpoint = crosschain_protocol::ExecutionCheckpoint<EvmOverlay, EvmWitness>;
+pub type EvmCheckpoint = eez_protocol::ExecutionCheckpoint<EvmOverlay, EvmWitness>;
 
 // ── EvmProtocol ─────────────────────────────────────────────────
 
@@ -101,7 +101,7 @@ impl ChainProtocol for EvmProtocol {
     fn build_batch(
         &self,
         recorded: &[RecordedCall<Self>],
-        attribution: &crosschain_protocol::SourceAttribution<'_>,
+        attribution: &eez_protocol::SourceAttribution<'_>,
         dialect: &Self::Dialect,
         source_rollup_id: RollupId,
         raw_tx: &[u8],

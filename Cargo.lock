@@ -2816,6 +2816,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "eez-evm"
+version = "0.1.0"
+dependencies = [
+ "alloy-contract",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-client",
+ "alloy-sol-types",
+ "alloy-transport-http",
+ "async-trait",
+ "eez-protocol",
+ "k256",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "eez-evm-inspector"
+version = "0.1.0"
+dependencies = [
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types-eth",
+ "alloy-sol-types",
+ "async-trait",
+ "eez-evm",
+ "eez-protocol",
+ "revm",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "eez-l1"
 version = "0.1.0"
 dependencies = [
@@ -2870,6 +2908,20 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "eez-protocol"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha3 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

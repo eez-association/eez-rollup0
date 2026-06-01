@@ -9,7 +9,7 @@
 //! Chain-agnostic traits and types for cross-chain composition.
 //!
 //! The abstract layer beneath every chain-specific implementation.
-//! `crosschain-evm` is the EVM instantiation; sibling crates implement
+//! `eez-evm` is the EVM instantiation; sibling crates implement
 //! the same traits for non-EVM chain families. Nothing in this crate
 //! knows about Solidity, ABI, keccak, alloy, reth, or revm. It defines
 //! what a cross-chain call *is*, how chains communicate, and how a
@@ -19,19 +19,19 @@
 //! # Where it fits
 //!
 //! ```text
-//! crosschain-protocol        ← this crate (chain-agnostic traits + generic orchestrator)
+//! eez-protocol        ← this crate (chain-agnostic traits + generic orchestrator)
 //!         ↑
-//! crosschain-evm             (EvmProtocol: ABI + entry building)
+//! eez-evm             (EvmProtocol: ABI + entry building)
 //!         ↑
-//! crosschain-evm-composer             crosschain-evm-grpc
+//! eez-evm-inspector             eez-evm-grpc
 //!         ↑                                    ↑
-//!         └──────────── rollup-node ───────────┘
+//!         └──────────── eez-composer ───────────┘
 //!                       (reth integration)
 //! ```
 //!
-//! `crosschain-evm-composer` and `crosschain-evm-grpc` both depend
-//! only on `crosschain-evm`; they do not depend on each other.
-//! `rollup-node` is the only crate that imports both.
+//! `eez-evm-inspector` and `eez-evm-grpc` both depend
+//! only on `eez-evm`; they do not depend on each other.
+//! `eez-composer` is the only crate that imports both.
 //!
 //! # How composition works
 //!
@@ -74,10 +74,10 @@
 //! The canonical flow — build a composer once, register source +
 //! targets, simulate one source tx at a time. `MyProtocol`,
 //! `MySourceClient`, `MyTargetClient` come from a concrete chain
-//! family (e.g. `crosschain-evm`).
+//! family (e.g. `eez-evm`).
 //!
 //! ```ignore
-//! use crosschain_protocol::{
+//! use eez_protocol::{
 //!     Composer, ProxyLookupConfig, RollupId, TargetConfig,
 //!     DEFAULT_CCM_GAS_LIMIT,
 //! };
@@ -104,12 +104,12 @@
 //! // composition.source and composition.targets carry both entries
 //! // and pre-encoded calldata; wrap each payload in a tx of your
 //! // choice to finalize.
-//! # Ok::<_, crosschain_protocol::ComposerError>(())
+//! # Ok::<_, eez_protocol::ComposerError>(())
 //! ```
 //!
 //! For a runnable EVM instantiation of the above, substitute
-//! `EvmProtocol` (from `crosschain-evm`) + `LocalChainClient`
-//! (from `rollup-node`) — see `rollup-node/src/main.rs` for the
+//! `EvmProtocol` (from `eez-evm`) + `LocalChainClient`
+//! (from `eez-composer`) — see `eez-composer/src/main.rs` for the
 //! full wiring.
 //!
 //! # Trait cheat-sheet

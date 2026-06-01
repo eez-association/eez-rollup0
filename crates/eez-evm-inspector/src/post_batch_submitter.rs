@@ -55,12 +55,12 @@
 //!   - `src/EEZ.sol:486-555` (`_validateStructure`).
 //!   - `src/EEZ.sol:606-668` (`_verifyProofSystemBatch`).
 //!
-//! [`EvmBatch`]: crosschain_evm::EvmBatch
-//! [`ProofPlanResolver::resolve`]: crosschain_protocol::ProofPlanResolver::resolve
-//! [`ProofPlan`]: crosschain_protocol::ProofPlan
-//! [`all_per_ps_hashes`]: crosschain_evm::public_inputs::all_per_ps_hashes
-//! [`EvmProtocol::encode_postbatch`]: crosschain_evm::EvmProtocol::encode_postbatch
-//! [`EcdsaProofSigner`]: crosschain_evm::signer::EcdsaProofSigner
+//! [`EvmBatch`]: eez_evm::EvmBatch
+//! [`ProofPlanResolver::resolve`]: eez_protocol::ProofPlanResolver::resolve
+//! [`ProofPlan`]: eez_protocol::ProofPlan
+//! [`all_per_ps_hashes`]: eez_evm::public_inputs::all_per_ps_hashes
+//! [`EvmProtocol::encode_postbatch`]: eez_evm::EvmProtocol::encode_postbatch
+//! [`EcdsaProofSigner`]: eez_evm::signer::EcdsaProofSigner
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -70,14 +70,14 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::{Log, TransactionReceipt, TransactionRequest};
 use alloy_sol_types::{SolEvent, sol};
-use crosschain_evm::public_inputs::{all_per_ps_hashes, entry_hash, lookup_call_hash};
-use crosschain_evm::signer::{EcdsaProofSigner, SignerError};
-use crosschain_evm::{EvmBatch, EvmProtocol};
-use crosschain_protocol::{
+use eez_evm::public_inputs::{all_per_ps_hashes, entry_hash, lookup_call_hash};
+use eez_evm::signer::{EcdsaProofSigner, SignerError};
+use eez_evm::{EvmBatch, EvmProtocol};
+use eez_protocol::{
     ChainProtocol, ExecutorError, ProofPlan, ProofPlanInvariantError, ProofPlanResolver, RollupId,
 };
 
-use crosschain_evm::types::RollupIdWithProofSystemsSol;
+use eez_evm::types::RollupIdWithProofSystemsSol;
 
 // ── Event bindings ─────────────────────────────────────────────────
 
@@ -142,7 +142,7 @@ pub enum PostBatchError {
     #[error("post_batch: batch is empty — no entries, no lookup calls")]
     EmptyBatch,
     /// A referenced `rollupId` overflowed `u64`. The on-chain ABI is
-    /// `uint256` but `crosschain-protocol`'s `RollupId(u64)` is the
+    /// `uint256` but `eez-protocol`'s `RollupId(u64)` is the
     /// workspace-wide carrier. Surfacing this explicitly (rather than
     /// silently saturating) means the caller sees a typed boundary
     /// violation instead of a confusing later registry-miss.
@@ -493,7 +493,7 @@ where
 ///
 /// Returns [`PostBatchError::RollupIdOverflow`] if any referenced
 /// `uint256` rollupId doesn't fit in `u64`. The on-chain ABI is
-/// `uint256` but `crosschain-protocol`'s `RollupId(u64)` is the
+/// `uint256` but `eez-protocol`'s `RollupId(u64)` is the
 /// workspace-wide carrier; surfacing the boundary explicitly is
 /// loud per `invariant 7` (silent saturation would let a malformed
 /// batch sail past the resolver into a confusing registry-miss).
@@ -625,10 +625,10 @@ fn decode_outcome_from_logs(
 mod tests {
     use super::*;
     use alloy_primitives::I256;
-    use crosschain_evm::types::{
+    use eez_evm::types::{
         ExecutionEntrySol, LookupCallSol, ProofSystemBatchPerVerificationEntriesSol, StateDeltaSol,
     };
-    use crosschain_protocol::{RollupProofAssignment, TimestampAndBlockHash};
+    use eez_protocol::{RollupProofAssignment, TimestampAndBlockHash};
 
     fn entry_with(dest: u64, delta_rids: &[u64]) -> ExecutionEntrySol {
         ExecutionEntrySol {

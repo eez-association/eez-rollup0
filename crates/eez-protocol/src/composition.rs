@@ -493,7 +493,7 @@ impl<P: ChainProtocol + 'static> CompositionBuilder<P> {
         // empty-`proofs[]` batch destined for the CCM-verify simulator
         // and follower-side `loadExecutionTable` payloads; the real
         // L1-poster path (proofs populated, signatures attached) lives
-        // in `crosschain_evm_composer::post_batch_submitter`.
+        // in `eez_evm_inspector::post_batch_submitter`.
 
         // Phase 2 — per-rollup CCM verify (non-entry rollups only).
         //

@@ -1,12 +1,12 @@
 //! EVM-side concrete impl of
-//! [`crosschain_protocol::ProofPlanResolver`].
+//! [`eez_protocol::ProofPlanResolver`].
 //!
 //! Reads `EEZ.rollups(rid).rollupContract`,
 //! `Rollup.checkProofSystemsAndGetVkeys(candidates)`, and
 //! `IRollupContract.getTimestampAndBlockHash()` over an alloy
 //! provider; assembles the result into a
 //! `ProofPlan<EvmProtocol>` validated against
-//! [`crosschain_protocol::ProofPlan::check_invariants`] before
+//! [`eez_protocol::ProofPlan::check_invariants`] before
 //! return.
 //!
 //! # Reader abstraction
@@ -44,7 +44,7 @@ use alloy_primitives::{Address, U256};
 use alloy_provider::DynProvider;
 use alloy_sol_types::sol;
 use async_trait::async_trait;
-use crosschain_protocol::{
+use eez_protocol::{
     ExecutorError, ExecutorErrorKind, ExecutorResult, ProofPlan, ProofPlanResolver, RollupId,
     RollupProofAssignment, TimestampAndBlockHash,
 };
@@ -211,7 +211,7 @@ impl RollupReader for AlloyRollupReader {
 // ── Resolver ──────────────────────────────────────────────────────
 
 /// EVM-side concrete impl of
-/// [`crosschain_protocol::ProofPlanResolver`].
+/// [`eez_protocol::ProofPlanResolver`].
 ///
 /// Holds the batch-wide candidate PS set (sorted ascending by
 /// address; validated at construction) and a [`RollupReader`] for

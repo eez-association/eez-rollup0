@@ -1,6 +1,6 @@
 //! The [`ChainProtocol`] trait — the extension point for chain-specific logic.
 //!
-//! EVM is the first implementation (in `crosschain-evm`). Non-EVM chains
+//! EVM is the first implementation (in `eez-evm`). Non-EVM chains
 //! implement the same trait with their own types.
 //!
 //! # Static dispatch by design
@@ -22,8 +22,8 @@
 //! A new chain family contributes exactly one `impl ChainProtocol`:
 //!
 //! ```ignore
-//! use crosschain_protocol::{ChainProtocol, RecordedCall, RollupId, ProtocolResult};
-//! use crosschain_protocol::composer::SourceAttribution;
+//! use eez_protocol::{ChainProtocol, RecordedCall, RollupId, ProtocolResult};
+//! use eez_protocol::composer::SourceAttribution;
 //!
 //! /// Unit struct — state lives on CompositionBuilder, not here.
 //! pub struct MyChainProtocol;
@@ -117,14 +117,14 @@ pub trait ChainProtocol: Send + Sync {
     /// Captures the concrete differences between chain families
     /// (e.g. L1 `EEZ.executeL1ToL2Call` vs L2
     /// `CrossChainManagerL2.executeIncomingCrossChainCall`) so that
-    /// generic orchestration code in `crosschain-protocol` can dispatch
+    /// generic orchestration code in `eez-protocol` can dispatch
     /// to a single `encode_follower_trigger` method without naming
     /// chain-specific types.
     ///
     /// Stored on [`crate::composer::TargetConfig`] so each rollup
     /// carries its own dialect without global mutable state. The
     /// concrete type lives in the chain-specific crate
-    /// (`crosschain-evm`), keeping `crosschain-protocol` free of EVM
+    /// (`eez-evm`), keeping `eez-protocol` free of EVM
     /// imports.
     type Dialect: Clone + std::fmt::Debug + Send + Sync + 'static;
 
@@ -163,7 +163,7 @@ pub trait ChainProtocol: Send + Sync {
     /// struct arg). Under the multi-prover ABI, proofs live inside
     /// the batch struct itself (`batch.inner.proofs[]`); callers
     /// populate `proofs[]` before encoding — see
-    /// `crosschain_evm_composer::post_batch_submitter` for the
+    /// `eez_evm_inspector::post_batch_submitter` for the
     /// canonical fill+encode+submit pipeline.
     fn encode_postbatch(&self, batch: &Self::Batch) -> Vec<u8>;
 

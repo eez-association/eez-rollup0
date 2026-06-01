@@ -9,7 +9,7 @@
 //! every proof verifies if and only if both sides agreed.
 //!
 //! The byte-equality lock against the Solidity oracle lives at
-//! `crates/crosschain-evm/tests/public_inputs_hash_vectors.rs`,
+//! `crates/eez-evm/tests/public_inputs_hash_vectors.rs`,
 //! mirroring the `cross_chain_call_hash_vectors.rs` shape from D2.
 //! The Foundry generator script is
 //! `contracts/script/GenPublicInputsHashVectors.s.sol`.
@@ -69,7 +69,7 @@
 
 use alloy_primitives::{keccak256, Bytes, B256, U256};
 use alloy_sol_types::{sol, SolValue};
-use crosschain_protocol::{ProofPlan, ProofPlanInvariantError};
+use eez_protocol::{ProofPlan, ProofPlanInvariantError};
 
 use crate::types::{ExecutionEntrySol, LookupCallSol};
 use crate::EvmProtocol;
@@ -258,7 +258,7 @@ pub fn all_per_ps_hashes(
 mod tests {
     use super::*;
     use alloy_primitives::address;
-    use crosschain_protocol::{RollupId, RollupProofAssignment, TimestampAndBlockHash};
+    use eez_protocol::{RollupId, RollupProofAssignment, TimestampAndBlockHash};
 
     #[test]
     fn position_of_finds_existing() {

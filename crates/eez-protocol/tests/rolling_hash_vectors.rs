@@ -2,7 +2,7 @@
 //! accumulators (`EntryRollingHash`, `StaticCallRollingHash`).
 //!
 //! Mirror of
-//! `crates/crosschain-evm/tests/cross_chain_call_hash_vectors.rs` —
+//! `crates/eez-evm/tests/cross_chain_call_hash_vectors.rs` —
 //! reads the JSON fixture at
 //! `tests/fixtures/rolling_hash_vectors.json` (regenerated via
 //! `scripts/regen-rolling-hash-vectors.sh`, which runs the Foundry
@@ -18,7 +18,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crosschain_protocol::rolling_hash::{EntryRollingHash, StaticCallRollingHash};
+use eez_protocol::rolling_hash::{EntryRollingHash, StaticCallRollingHash};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
