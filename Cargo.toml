@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/eez-composer",
     "crates/eez-deriver",
     "crates/eez-driver",
     "crates/eez-l1",
@@ -77,6 +78,7 @@ reqwest                = { version = "0.12", default-features = false, features 
 serde_json             = "1"
 
 # internal crates
+eez-composer       = { path = "crates/eez-composer" }
 eez-deriver        = { path = "crates/eez-deriver" }
 eez-driver         = { path = "crates/eez-driver" }
 eez-l1             = { path = "crates/eez-l1" }

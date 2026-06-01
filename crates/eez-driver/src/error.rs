@@ -38,6 +38,9 @@ pub(crate) enum ErrorKind {
     /// `BlockCommitter` actor task is gone (channel closed). The Sequencer
     /// can't recover; the caller (typically eez-node main) will log + exit.
     CommitterClosed,
+    /// `RollupTiming` env loading or validation failed (operator misconfig
+    /// at startup). The Sequencer refuses to start.
+    TimingConfig(String),
 }
 
 impl DriverError {
@@ -67,6 +70,10 @@ impl DriverError {
 
     pub(crate) fn committer_closed() -> Self {
         Self::new(ErrorKind::CommitterClosed)
+    }
+
+    pub(crate) fn timing_config(detail: impl Into<String>) -> Self {
+        Self::new(ErrorKind::TimingConfig(detail.into()))
     }
 
     fn new(kind: ErrorKind) -> Self {
@@ -107,6 +114,13 @@ impl DriverError {
         matches!(self.kind, ErrorKind::CommitterClosed)
     }
 
+    /// Returns true if [`RollupTiming`](crate::timing::RollupTiming)
+    /// env loading or validation failed at startup.
+    #[must_use]
+    pub fn is_timing_config(&self) -> bool {
+        matches!(self.kind, ErrorKind::TimingConfig(_))
+    }
+
     /// Returns the captured backtrace for diagnostics.
     pub fn backtrace(&self) -> &Backtrace {
         &self.backtrace
@@ -141,6 +155,9 @@ impl fmt::Display for DriverError {
             ErrorKind::EngineRpc(msg) => write!(f, "engine-API transport error: {msg}"),
             ErrorKind::CommitterClosed => {
                 write!(f, "block committer actor task has exited")
+            }
+            ErrorKind::TimingConfig(detail) => {
+                write!(f, "RollupTiming misconfig: {detail}")
             }
         }
     }

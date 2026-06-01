@@ -5,10 +5,17 @@
 //! The split mirrors the runtime split: [`SubmitterConfig`] carries what
 //! the L1 send primitive needs (RPC, wallet, EEZ address), while
 //! [`ComposerConfig`] carries orchestration knobs (rollup id, proof
-//! system, deploy block for the startup scan, tick interval). The
-//! eez-node binary reads both at startup.
+//! system, deploy block for the startup scan). The eez-node binary
+//! reads both at startup.
+//!
+//! Submission cadence moved off `ComposerConfig` in stage 4 — it's now
+//! Sequencer-driven via
+//! [`BatchPolicy`](eez_driver::BatchPolicy)
+//! and the
+//! [`BatchCandidate`](eez_driver::BatchCandidate) channel. See
+//! `docs/plans/IMPLEMENTATION.md` §5.4.1.
 
-use std::{env, str::FromStr, time::Duration};
+use std::{env, str::FromStr};
 
 use alloy_primitives::Address;
 use alloy_signer_local::PrivateKeySigner;
@@ -23,10 +30,7 @@ const ENV_EEZ_ADDRESS: &str = "EEZ_REGISTRY_ADDRESS";
 const ENV_PROOF_SYSTEM_ADDRESS: &str = "EEZ_MOCK_PROOF_SYSTEM_ADDRESS";
 const ENV_ROLLUP_ID: &str = "EEZ_ROLLUP_ID";
 const ENV_DEPLOY_BLOCK: &str = "EEZ_REGISTRY_DEPLOY_BLOCK";
-const ENV_INTERVAL_SECS: &str = "EEZ_COMPOSER_INTERVAL_SECS";
 const ENV_EXPECT_EXTERNAL: &str = "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES";
-
-const DEFAULT_INTERVAL_SECS: u64 = 60;
 
 /// L1 connectivity for the [`Submitter`](crate::Submitter) — what's
 /// needed to send and read transactions against the EEZ registry.
@@ -78,8 +82,7 @@ impl SubmitterConfig {
 }
 
 /// Orchestration knobs for the [`Composer`](crate::Composer) — protocol
-/// identifiers, the L1 block to start the startup scan from, and the
-/// tick interval.
+/// identifiers and the L1 block to start the startup scan from.
 #[derive(Debug, Clone)]
 pub struct ComposerConfig {
     /// Deployed `MockECDSAProofSystem` address — the one PS we attest with.
@@ -90,8 +93,6 @@ pub struct ComposerConfig {
     /// `BatchPosted` log scan that seeds `posted_through`. Keeps the scan
     /// bounded on busy chains.
     pub deploy_block: u64,
-    /// Tick interval. One tick = at most one postBatch tx.
-    pub interval: Duration,
     /// Based-rollup mode flag. When `true`, the Composer logs external
     /// batches at info level (normal flow — anyone can post). When
     /// `false` (sequenced), externals log at error level (someone
@@ -112,7 +113,6 @@ impl ComposerConfig {
             proof_system: parse_address(ENV_PROOF_SYSTEM_ADDRESS)?,
             rollup_id: parse_u64(ENV_ROLLUP_ID)?,
             deploy_block: parse_u64(ENV_DEPLOY_BLOCK)?,
-            interval: Duration::from_secs(parse_u64_or(ENV_INTERVAL_SECS, DEFAULT_INTERVAL_SECS)?),
             expect_external_batches: parse_bool_or(ENV_EXPECT_EXTERNAL, false)?,
         })
     }
@@ -140,18 +140,6 @@ fn parse_u64(name: &str) -> L1Result<u64> {
     require(name)?
         .parse::<u64>()
         .map_err(|e| L1Error::Config(format!("{name}: {e}")))
-}
-
-fn parse_u64_or(name: &str, default: u64) -> L1Result<u64> {
-    match env::var(name) {
-        Ok(v) => v
-            .parse::<u64>()
-            .map_err(|e| L1Error::Config(format!("{name}: {e}"))),
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(env::VarError::NotUnicode(_)) => {
-            Err(L1Error::Config(format!("{name} contains non-UTF-8 bytes")))
-        }
-    }
 }
 
 fn parse_bool_or(name: &str, default: bool) -> L1Result<bool> {

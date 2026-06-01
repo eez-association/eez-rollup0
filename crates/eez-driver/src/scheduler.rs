@@ -1,87 +1,109 @@
-//! Decides when the sequencer should propose the next block.
+//! Schedule event types + standalone-mode interval spawner.
 //!
-//! Stage 1 contains the simplest possible scheduler: a wall-clock interval
-//! that fires one [`ProposalRequest`] every `block_time`. The interval is
-//! configurable so a deployment can pick its L2 block time (2s for Rollup-1
-//! v1).
+//! Sequencer consumes [`ScheduleEvent`]s from an `mpsc::Receiver`,
+//! agnostic to source. The source is one of:
 //!
-//! Later stages will extend [`Scheduler`] to also accept external events
-//! (safe-head updates from L1, prover-ready signals) without changing the
-//! [`Sequencer`](crate::Sequencer)'s consuming interface — the contract is
-//! "scheduler emits [`ProposalRequest`]; sequencer turns each into one
-//! block."
+//! - **Interval** ([`spawn_interval`], this module): fixed wall-clock
+//!   cadence emitting [`ScheduleEvent::LiveTick`]. No L1 awareness;
+//!   used in standalone-mode dev workflows.
+//!
+//! - **L1-anchored** (`eez-composer::schedule::spawn_l1_anchored`):
+//!   subscribes to `L1Event::NewHead`, sleeps `proof_window_open`
+//!   after each L1 block lands, emits [`ScheduleEvent::SyncSlotTrigger`]
+//!   with the deterministic Sync block height + timestamp. Production
+//!   path.
+//!
+//! Decoupling via channel: Sequencer holds a `Receiver<ScheduleEvent>`,
+//! source-side is whatever spawned that channel's sender. Tests inject
+//! fake schedulers by sending events directly.
 
 use core::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at};
+use tokio::sync::mpsc;
+use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
-/// Classification of the slot a proposal is being built for.
+/// Classification of the slot a single block is being produced for.
 ///
-/// Stage 1 only constructs [`SlotKind::Live`]. The variant exists so that
-/// later stages (batch pre-building, cross-chain sync slots) can add their
-/// own kinds and the [`Sequencer`](crate::Sequencer) loop's `match` stays
-/// exhaustive.
+/// Logged on every commit so dashboards can show the Live / Future /
+/// Sync mix per slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SlotKind {
-    /// Normal block at current wall-clock time.
+    /// Normal block at current wall-clock cadence.
     Live,
-    // Will also include Sync, Future etc. here
+    /// Proof-window padding block — timestamp is in the future
+    /// relative to wall-clock at production time; reth accepts as
+    /// long as timestamps strictly increase.
+    Future,
+    /// Sync block — last block of a slot, where cross-chain system
+    /// txs and the matching `ExecutionEntries` land. Timestamp matches
+    /// the L1 block that will carry the corresponding `postBatch`.
+    Sync,
 }
 
 impl fmt::Display for SlotKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Live => f.write_str("live"),
+            Self::Future => f.write_str("future"),
+            Self::Sync => f.write_str("sync"),
         }
     }
 }
 
-/// One request from the scheduler to build a single block.
+/// Event from the Scheduler telling the Sequencer when to act.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ProposalRequest {
-    /// What this block is for.
-    pub kind: SlotKind,
-    /// Wall-clock timestamp the resulting block should advertise, in unix
-    /// seconds. Stage 1 sets this to "now".
-    pub target_timestamp: u64,
+pub enum ScheduleEvent {
+    /// L1-anchored: produce the rest of a sync slot. Sequencer reads
+    /// current head and
+    /// [`RollupTiming::per_trigger_composition`](crate::RollupTiming::per_trigger_composition)
+    /// to decide the Live / Future / Sync block count for this trigger.
+    SyncSlotTrigger {
+        /// L2 block height the Sync block will land at.
+        sync_slot_block_height: u64,
+        /// Wall-clock unix timestamp the Sync block will advertise.
+        /// = `L1.timestamp_of_anchor + L1_block_time`.
+        sync_slot_timestamp: u64,
+    },
+    /// Interval-mode tick — produce one Live block at this target
+    /// wall-clock timestamp. Sequencer's existing greedy-backfill
+    /// path handles it (catches up if behind).
+    LiveTick {
+        /// Wall-clock unix timestamp the block should advertise.
+        target_timestamp: u64,
+    },
 }
 
-/// Emits [`ProposalRequest`]s on a fixed interval.
-#[derive(Debug)]
-pub struct Scheduler {
-    interval: Interval,
-}
-
-impl Scheduler {
-    /// Creates a scheduler that fires every `block_time`.
-    ///
-    /// The first tick fires after `block_time` (not immediately) so the node
-    /// has a moment to finish startup before the first proposal lands.
-    ///
-    /// Uses [`MissedTickBehavior::Delay`] — if a tick is missed because a
-    /// prior `advance` ran long, the next tick fires `block_time` after the
-    /// previous one completed rather than immediately catching up. This
-    /// matches the cadence guarantee we want: blocks advertised at strict
-    /// `block_time` spacing even under load.
-    #[must_use]
-    pub fn interval(block_time: Duration) -> Self {
+/// Spawn an interval ticker that emits [`ScheduleEvent::LiveTick`]
+/// every `block_time`. Returns the receiver side of the channel.
+///
+/// The spawned task lives until the receiver is dropped. First tick
+/// fires after `block_time` (not immediately) to leave room for
+/// startup. [`MissedTickBehavior::Delay`] keeps cadence under load.
+///
+/// Used in standalone mode (no L1 stack). L1-anchored mode uses
+/// `eez_composer::schedule::spawn_l1_anchored` instead.
+#[must_use]
+pub fn spawn_interval(block_time: Duration) -> mpsc::Receiver<ScheduleEvent> {
+    let (tx, rx) = mpsc::channel(8);
+    tokio::spawn(async move {
         let start = Instant::now() + block_time;
         let mut interval = interval_at(start, block_time);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        Self { interval }
-    }
-
-    /// Waits for the next tick and returns the resulting [`ProposalRequest`].
-    pub async fn next(&mut self) -> ProposalRequest {
-        self.interval.tick().await;
-        let target_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        ProposalRequest {
-            kind: SlotKind::Live,
-            target_timestamp,
+        loop {
+            interval.tick().await;
+            let target_timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if tx
+                .send(ScheduleEvent::LiveTick { target_timestamp })
+                .await
+                .is_err()
+            {
+                break; // Sequencer dropped the receiver; exit cleanly.
+            }
         }
-    }
+    });
+    rx
 }

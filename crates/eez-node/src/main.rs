@@ -17,12 +17,14 @@
 //!   replay), but the per-tick FCU+attrs loop is suppressed. Pair with
 //!   `EEZ_COMPOSER_DISABLED` for a clean follower.
 
-use std::{env, str::FromStr, sync::Arc, time::Duration};
+use std::{env, str::FromStr, sync::Arc};
 
 use alloy_primitives::B256;
 use alloy_signer_local::PrivateKeySigner;
 use eez_deriver::Deriver;
-use eez_driver::{EthAttributesBuilder, Scheduler, Sequencer};
+use eez_driver::{
+    BatchCandidate, BatchPolicy, EthAttributesBuilder, RollupTiming, Sequencer, scheduler,
+};
 use eez_l1::{
     Composer, ComposerConfig, L1CanonicalHead, L1Watcher, L1WatcherConfig, Submitter,
     SubmitterConfig,
@@ -31,15 +33,31 @@ use eez_prover::MockEcdsaProver;
 use mimalloc::MiMalloc;
 use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
 use reth_node_ethereum::EthereumNode;
+use tokio::sync::mpsc;
 use tracing::{Level, event};
 
 /// Per M-MIMALLOC-APPS — meaningful win on allocation-heavy workloads.
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-/// L2 block cadence for Rollup-0. Pinned at 2s per Rollup-1 spec §1.3.
-const BLOCK_TIME: Duration = Duration::from_secs(2);
+/// Sequencer → Composer batch-candidate channel capacity. Small fixed
+/// queue: the produce loop applies backpressure if the Composer falls
+/// behind, which is the desired behavior (slow down rather than drop).
+const BATCH_CANDIDATE_CHAN: usize = 16;
 
+/// L2 blocks per Sequencer-side batch window for stage 4.
+///
+/// 30 blocks × 2 s = 60 s — preserves the current `EEZ_COMPOSER_INTERVAL_SECS`
+/// cadence so smoke tests stay stable. S4.2's `RollupTiming` makes this
+/// env-driven and ties it to `L1_block_time / L2_block_time`; until
+/// then it's a single named constant.
+const BATCH_BLOCK_WINDOW: u64 = 30;
+
+// Bootstrap wiring is linear; splitting it across helpers fragments the
+// dependency chain without making it easier to read. The clippy.toml
+// threshold catches genuinely sprawling logic — main() is the
+// exception.
+#[allow(clippy::too_many_lines)]
 fn main() -> eyre::Result<()> {
     let _ = dotenvy::dotenv();
     let _ = dotenvy::from_filename("deployments.env");
@@ -55,8 +73,7 @@ fn main() -> eyre::Result<()> {
         event!(
             name: "eez.node.launching",
             Level::INFO,
-            block_time.secs = BLOCK_TIME.as_secs(),
-            "launching eez-node with {{block_time.secs}}s block time",
+            "launching eez-node (timing config logged after env reads)",
         );
 
         // Launch reth with all default Ethereum components.
@@ -68,6 +85,19 @@ fn main() -> eyre::Result<()> {
         let beacon_engine_handle = handle.node.add_ons_handle.beacon_engine_handle.clone();
         let task_executor = handle.node.task_executor.clone();
 
+        // Stage-4 cadence-source change: warn loudly if a deployment
+        // still sets the stage-2 polling knob so operators notice their
+        // setting is now a no-op rather than silently lose
+        // configurability (invariant 7).
+        if env::var_os("EEZ_COMPOSER_INTERVAL_SECS").is_some() {
+            event!(
+                name: "eez.node.env.deprecated",
+                Level::WARN,
+                env = "EEZ_COMPOSER_INTERVAL_SECS",
+                "EEZ_COMPOSER_INTERVAL_SECS is ignored from stage 4 onward; submission cadence is now Sequencer-driven (BatchPolicy::EveryKBlocks via the BatchCandidate channel — see docs/plans/IMPLEMENTATION.md §5.4.1). Remove from env to silence this warning."
+            );
+        }
+
         // Shared L1-confirmed L2 head. Created unconditionally so the
         // Sequencer's speculative-depth limit can be wired
         // even when the L1 stack isn't activated this run
@@ -75,23 +105,78 @@ fn main() -> eyre::Result<()> {
         // handed to the Deriver as the write side.
         let l1_head = Arc::new(L1CanonicalHead::default());
         let l1_enabled = env::var_os("EEZ_L1_RPC_URL").is_some();
+        let sequencer_disabled = env::var_os("EEZ_SEQUENCER_DISABLED").is_some();
+        // Composer needs a live Sequencer feeding it BatchCandidates;
+        // auto-couple the disable flags to keep the channel from
+        // closing under a half-running stack.
+        let composer_disabled =
+            env::var_os("EEZ_COMPOSER_DISABLED").is_some() || sequencer_disabled;
+        if sequencer_disabled && env::var_os("EEZ_COMPOSER_DISABLED").is_none() {
+            event!(
+                name: "eez.node.composer.auto_disabled",
+                Level::WARN,
+                "EEZ_SEQUENCER_DISABLED set; auto-disabling Composer (no Sequencer to feed BatchCandidates)",
+            );
+        }
 
-        // ─── Sequencer (always-on) ───────────────────────────────────
+        // Sequencer-side ComposerConfig hoist: rollup_id is needed at
+        // Sequencer-builder time to tag emitted BatchCandidates.
+        let composer_config = if l1_enabled {
+            Some(ComposerConfig::from_env()?)
+        } else {
+            None
+        };
+
+        // Build the BatchCandidate channel only when both ends will run.
+        let (batch_tx, batch_rx) = if l1_enabled && !composer_disabled {
+            let (tx, rx) = mpsc::channel::<BatchCandidate>(BATCH_CANDIDATE_CHAN);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        // ─── Sequencer (always-on; produce loop suppressed by env) ───
+        // Stage-4 step S4.2: Sequencer takes `RollupTiming` + a
+        // `Receiver<ScheduleEvent>`. For now both standalone and
+        // L1-enabled modes use the interval scheduler (functional
+        // regression: L1-enabled mode produces Live-only blocks at
+        // L2_block_time cadence, no sync slots — matches pre-S4.2
+        // behavior). The L1-anchored Scheduler lands in `eez-composer`
+        // as part of the umbrella extraction; eez-node will branch on
+        // `l1_enabled` at that point.
+        let timing = if l1_enabled {
+            RollupTiming::from_env()?
+        } else {
+            event!(
+                name: "eez.node.timing.standalone_default",
+                Level::INFO,
+                "no L1 stack; using standalone-dev RollupTiming defaults (L2=2s)",
+            );
+            RollupTiming::standalone_default()
+        };
         let attributes = EthAttributesBuilder::new(chain_spec);
-        let scheduler = Scheduler::interval(BLOCK_TIME);
+        let schedule_rx = scheduler::spawn_interval(timing.l2_block_time());
         let mut sequencer = Sequencer::new(
             &provider,
             attributes,
             beacon_engine_handle,
-            scheduler,
+            schedule_rx,
             payload_builder_handle,
+            timing,
         )?;
         if l1_enabled {
             sequencer = sequencer.with_speculative_limit(64, Arc::clone(&l1_head) as _);
         }
+        if let (Some(tx), Some(cfg)) = (batch_tx, composer_config.as_ref()) {
+            sequencer = sequencer.with_batch_emitter(
+                cfg.rollup_id,
+                BatchPolicy::EveryKBlocks(BATCH_BLOCK_WINDOW),
+                tx,
+            );
+        }
         let block_committer = sequencer.committer();
 
-        if env::var_os("EEZ_SEQUENCER_DISABLED").is_some() {
+        if sequencer_disabled {
             event!(
                 name: "eez.node.sequencer.disabled",
                 Level::INFO,
@@ -108,7 +193,7 @@ fn main() -> eyre::Result<()> {
         // ─── L1 stack (opt-in via EEZ_L1_RPC_URL) ────────────────────
         if l1_enabled {
             let submitter_config = SubmitterConfig::from_env()?;
-            let composer_config = ComposerConfig::from_env()?;
+            let composer_config = composer_config.expect("hoisted above when l1_enabled");
             let l1_watcher_config = L1WatcherConfig::from_env()?;
 
             let submitter = Submitter::new(submitter_config);
@@ -153,13 +238,14 @@ fn main() -> eyre::Result<()> {
             });
 
             // ─── Composer (opt-out via EEZ_COMPOSER_DISABLED) ────────
-            if env::var_os("EEZ_COMPOSER_DISABLED").is_some() {
+            if composer_disabled {
                 event!(
                     name: "eez.node.composer.disabled",
                     Level::INFO,
-                    "EEZ_COMPOSER_DISABLED set; this node will not post any batches",
+                    "Composer disabled; this node will not post any batches",
                 );
             } else {
+                let batch_rx = batch_rx.expect("channel built when composer is enabled");
                 let proof_signer_key = env::var("EEZ_PROOF_SIGNER_KEY").map_err(|_| {
                     eyre::eyre!("EEZ_PROOF_SIGNER_KEY required when EEZ_L1_RPC_URL set")
                 })?;
@@ -177,7 +263,7 @@ fn main() -> eyre::Result<()> {
                 );
                 event!(name: "eez.node.composer.spawned", Level::INFO, "spawning eez composer");
                 task_executor.spawn_critical_task("eez-composer", async move {
-                    composer.run().await;
+                    composer.run(batch_rx).await;
                 });
             }
         } else {

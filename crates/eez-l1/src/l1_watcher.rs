@@ -51,6 +51,9 @@ pub enum L1Event {
         block_number: u64,
         /// L1 block hash.
         block_hash: B256,
+        /// L1 block unix timestamp. Used by the Scheduler to anchor
+        /// the proof-window trigger (`L1_ts + proof_window_open`).
+        timestamp: u64,
     },
     /// Canonical L1 chain rewound. `common_ancestor_*` is the most
     /// recent block still in canon; everything strictly above it on
@@ -260,6 +263,7 @@ impl L1Watcher {
                 self.emit(L1Event::NewHead {
                     block_number: latest_number,
                     block_hash: latest_hash,
+                    timestamp: latest.timestamp,
                 });
                 self.scan_batch_posted(provider, latest_number, latest_number, latest_hash)
                     .await?;
@@ -274,6 +278,7 @@ impl L1Watcher {
                 self.emit(L1Event::NewHead {
                     block_number: latest_number,
                     block_hash: latest_hash,
+                    timestamp: latest.timestamp,
                 });
                 self.scan_batch_posted(provider, latest_number, latest_number, latest_hash)
                     .await?;
@@ -340,27 +345,33 @@ impl L1Watcher {
         if from > to {
             return Ok(());
         }
-        // Collect (number, hash) for from..=to by walking back from
-        // (to, to_hash) via parent_hash.
+        // Collect (number, hash, timestamp) for from..=to by walking
+        // back from (to, to_hash) via parent_hash. We need each
+        // block's timestamp for downstream Scheduler trigger anchoring,
+        // so unlike the earlier hash-only walk, fetch every step.
         let span = usize::try_from(to - from + 1).unwrap_or(usize::MAX);
-        let mut collected: Vec<(u64, B256)> = Vec::with_capacity(span);
+        let mut collected: Vec<(u64, B256, u64)> = Vec::with_capacity(span);
         let mut cursor_hash = to_hash;
         let mut cursor_number = to;
-        for _ in 0..span {
-            collected.push((cursor_number, cursor_hash));
+        loop {
+            let block = fetch_block_by_hash(provider, cursor_hash).await?;
+            collected.push((cursor_number, cursor_hash, block.timestamp));
             if cursor_number == from {
                 break;
             }
-            let block = fetch_block_by_hash(provider, cursor_hash).await?;
             cursor_hash = block.parent_hash;
             cursor_number = block.number.saturating_sub(1);
+            if collected.len() >= span {
+                break;
+            }
         }
         // Emit oldest to newest.
-        for (n, h) in collected.iter().rev() {
+        for (n, h, ts) in collected.iter().rev() {
             state.push_canonical(*n, *h);
             self.emit(L1Event::NewHead {
                 block_number: *n,
                 block_hash: *h,
+                timestamp: *ts,
             });
         }
         Ok(())
@@ -525,6 +536,9 @@ struct BlockSnapshot {
     number: u64,
     hash: B256,
     parent_hash: B256,
+    /// Unix timestamp from `block.header.timestamp`. Used by downstream
+    /// Schedulers to anchor proof-window triggers.
+    timestamp: u64,
 }
 
 async fn fetch_block_by_tag(
@@ -540,6 +554,7 @@ async fn fetch_block_by_tag(
         number: block.header.number,
         hash: block.header.hash,
         parent_hash: block.header.inner.parent_hash,
+        timestamp: block.header.inner.timestamp,
     })
 }
 
@@ -553,6 +568,7 @@ async fn fetch_block_by_hash(provider: &impl Provider, hash: B256) -> L1Result<B
         number: block.header.number,
         hash: block.header.hash,
         parent_hash: block.header.inner.parent_hash,
+        timestamp: block.header.inner.timestamp,
     })
 }
 

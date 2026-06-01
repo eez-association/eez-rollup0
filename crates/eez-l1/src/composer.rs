@@ -3,24 +3,30 @@
 //! for a proof, and hands the assembled batch to the [`Submitter`].
 //!
 //! `posted_through` is driven by [`L1Watcher`] events (own + external
-//! batches go through the same code path). Per tick:
+//! batches go through the same code path). Per
+//! [`BatchCandidate`](eez_driver::BatchCandidate) arrival:
 //! `from = posted_through + 1`,
 //! `to = min(local, posted_through + MAX_BLOCKS_PER_BATCH)`,
 //! encode payload, prove, submit. The `expect_external_batches` flag
 //! only changes the log level on observed external batches (info vs error).
+//!
+//! Cadence is Sequencer-driven from stage 4 onward: the Composer fires
+//! whenever a Sequencer closes a batch window per its
+//! [`BatchPolicy`](eez_driver::BatchPolicy). The Sequencer's `K` knob
+//! sets effective submission interval.
 
 use std::sync::Arc;
 
 use alloy_eips::Encodable2718;
 use alloy_primitives::{B256, Bytes, U256};
+use eez_driver::BatchCandidate;
 use eez_prover::{
     ExecutionEntry, ProofSystemBatchPerVerificationEntries, Prover, ProvingContext,
     RollupIdWithProofSystems, StateDelta,
 };
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
 use reth_storage_api::{BlockReader, TransactionsProvider};
-use tokio::sync::broadcast;
-use tokio::time::{Instant, MissedTickBehavior, interval_at};
+use tokio::sync::{broadcast, mpsc};
 use tracing::{Level, event};
 
 use crate::config::ComposerConfig;
@@ -57,7 +63,6 @@ impl<L2: BlockReader> std::fmt::Debug for Composer<L2> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Composer")
             .field("rollup_id", &self.inner.config.rollup_id)
-            .field("interval", &self.inner.config.interval)
             .field("posted_through", &self.inner.l1_head.cursor())
             .field("prover", &self.inner.prover)
             .field("submitter", &self.inner.submitter)
@@ -99,13 +104,17 @@ where
 
     /// Run loop. Two event sources via `tokio::select!`:
     ///
-    /// - Interval ticker: try to compose + submit one batch.
-    /// - `L1Watcher` broadcast: advance `posted_through` from any
-    ///   landed `BatchPosted` event (ours or external).
-    pub async fn run(self) {
-        let interval = self.inner.config.interval;
-        let mut ticker = interval_at(Instant::now() + interval, interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    /// - `batch_rx`: Sequencer-driven [`BatchCandidate`] arrivals —
+    ///   try to compose + submit one batch.
+    /// - `L1Watcher` broadcast: log own/external [`BatchPosted`] events
+    ///   (cursor itself is owned by the Deriver via shared
+    ///   [`L1CanonicalHead`]).
+    ///
+    /// The candidate's `from_block`/`to_block` are advisory only — the
+    /// composer re-clamps against its L1-confirmed cursor at submit
+    /// time. When `batch_rx` closes, the Sequencer task has died and
+    /// the run loop exits.
+    pub async fn run(self, mut batch_rx: mpsc::Receiver<BatchCandidate>) {
         let mut l1_events = self.inner.l1_watcher.subscribe();
         let our_address = self.inner.config_poster_address();
 
@@ -113,7 +122,6 @@ where
             name: "eez.composer.started",
             Level::INFO,
             rollup_id = self.inner.config.rollup_id,
-            interval_secs = self.inner.config.interval.as_secs(),
             posted_through = self.inner.l1_head.cursor(),
             expect_external_batches = self.inner.config.expect_external_batches,
             our_address = %our_address,
@@ -122,47 +130,27 @@ where
 
         loop {
             tokio::select! {
-                _ = ticker.tick() => {
-                    match self.inner.try_compose_one_batch().await {
-                        Ok(Outcome::NothingToDo { local, posted }) => event!(
-                            name: "eez.composer.idle",
-                            Level::DEBUG,
-                            local_head = local,
-                            posted_through = posted,
-                            "no new L2 blocks to post",
-                        ),
-                        Ok(Outcome::Posted { from, to, tx_hash, l1_block, state_applied }) => event!(
-                            name: "eez.composer.batch.posted",
-                            Level::INFO,
-                            from, to,
-                            tx_hash = %tx_hash,
-                            l1_block,
-                            state_applied,
-                            "posted batch [{{from}}, {{to}}] in L1 block {{l1_block}}",
-                        ),
-                        Ok(Outcome::BundleDropped { from, to, tx_hash, target_block }) => event!(
-                            name: "eez.composer.batch.bundle_dropped",
-                            Level::WARN,
-                            from, to,
-                            tx_hash = %tx_hash,
-                            target_block,
-                            "bundle missed target block; will rebuild + retry next tick",
-                        ),
-                        Ok(Outcome::CursorRaced { from, to, expected_cursor, actual_cursor }) => event!(
-                            name: "eez.composer.batch.cursor_raced",
-                            Level::INFO,
-                            from, to,
-                            expected_cursor,
-                            actual_cursor,
-                            "cursor advanced under our batch build (peer's batch landed first); aborting submission, will rebuild next tick",
-                        ),
-                        Err(err) => event!(
-                            name: "eez.composer.cycle.failed",
-                            Level::WARN,
-                            error = %err,
-                            "compose cycle failed; will retry next tick",
-                        ),
+                maybe_candidate = batch_rx.recv() => {
+                    let Some(mut latest) = maybe_candidate else {
+                        event!(
+                            name: "eez.composer.batch_rx.closed",
+                            Level::ERROR,
+                            "batch candidate channel closed; composer task exiting",
+                        );
+                        break;
+                    };
+                    // Coalesce: while we were composing the last batch,
+                    // the Sequencer may have queued more candidates with
+                    // higher `to_block` values. Drain non-blockingly and
+                    // submit one batch covering up to the latest. During
+                    // catchup this turns N queued candidates into one
+                    // submission instead of N (with N-1 NothingToDo
+                    // cycles); in steady-state the queue is normally
+                    // empty so this is a no-op.
+                    while let Ok(next) = batch_rx.try_recv() {
+                        latest = next;
                     }
+                    self.inner.handle_candidate(&latest).await;
                 }
                 event = l1_events.recv() => {
                     self.inner.on_l1_event(&event, our_address);
@@ -175,7 +163,7 @@ where
 #[derive(Debug)]
 enum Outcome {
     NothingToDo {
-        local: u64,
+        candidate_to: u64,
         posted: u64,
     },
     Posted {
@@ -216,25 +204,95 @@ where
         self.submitter.poster_address()
     }
 
-    async fn try_compose_one_batch(&self) -> L1Result<Outcome> {
+    /// One submission cycle, triggered by a Sequencer-emitted
+    /// [`BatchCandidate`]. Logs the outcome at the appropriate level.
+    async fn handle_candidate(&self, candidate: &BatchCandidate) {
+        match self.try_compose_one_batch(candidate).await {
+            Ok(Outcome::NothingToDo {
+                candidate_to,
+                posted,
+            }) => event!(
+                name: "eez.composer.idle",
+                Level::DEBUG,
+                candidate.to = candidate_to,
+                posted_through = posted,
+                "candidate already covered by posted cursor; no new L2 blocks to post",
+            ),
+            Ok(Outcome::Posted {
+                from,
+                to,
+                tx_hash,
+                l1_block,
+                state_applied,
+            }) => event!(
+                name: "eez.composer.batch.posted",
+                Level::INFO,
+                from, to,
+                tx_hash = %tx_hash,
+                l1_block,
+                state_applied,
+                "posted batch [{{from}}, {{to}}] in L1 block {{l1_block}}",
+            ),
+            Ok(Outcome::BundleDropped {
+                from,
+                to,
+                tx_hash,
+                target_block,
+            }) => event!(
+                name: "eez.composer.batch.bundle_dropped",
+                Level::WARN,
+                from, to,
+                tx_hash = %tx_hash,
+                target_block,
+                "bundle missed target block; will rebuild + retry next candidate",
+            ),
+            Ok(Outcome::CursorRaced {
+                from,
+                to,
+                expected_cursor,
+                actual_cursor,
+            }) => event!(
+                name: "eez.composer.batch.cursor_raced",
+                Level::INFO,
+                from, to,
+                expected_cursor,
+                actual_cursor,
+                "cursor advanced under our batch build (peer's batch landed first); aborting submission, will rebuild next candidate",
+            ),
+            Err(err) => event!(
+                name: "eez.composer.cycle.failed",
+                Level::WARN,
+                error = %err,
+                "compose cycle failed; will retry next candidate",
+            ),
+        }
+    }
+
+    async fn try_compose_one_batch(&self, candidate: &BatchCandidate) -> L1Result<Outcome> {
         // Read the L1-confirmed cursor through the shared L1CanonicalHead.
         // Deriver is the sole writer; advances + retreats are visible
         // here immediately.
         let posted = self.l1_head.cursor();
-        let local = self
-            .l2_provider
-            .best_block_number()
-            .map_err(|e| L1Error::L2Source(e.to_string()))?;
 
-        if local <= posted {
-            return Ok(Outcome::NothingToDo { local, posted });
+        // Authoritative upper bound is the Sequencer's `to_block` —
+        // not `best_block_number()`. The cross-chain proof's
+        // `ExecutionEntry[]` is sync-slot-pinned (Rollup-1 §6 + §12),
+        // so the Composer cannot legitimately extend past the
+        // Sequencer's chosen sync-slot terminator. In catchup
+        // (Live-only, no entries), partial extension up to `to_block`
+        // is permitted per Rollup-1 §13.4.23.
+        if candidate.to_block <= posted {
+            return Ok(Outcome::NothingToDo {
+                candidate_to: candidate.to_block,
+                posted,
+            });
         }
 
         // Cap the batch's L2-block span at MAX_BLOCKS_PER_BATCH so a
         // long stall doesn't produce an unbounded postBatch tx. The
-        // remainder lands on subsequent ticks.
+        // remainder lands on subsequent candidates.
         let from = posted + 1;
-        let to = local.min(posted + MAX_BLOCKS_PER_BATCH);
+        let to = candidate.to_block.min(posted + MAX_BLOCKS_PER_BATCH);
         let capacity = usize::try_from(to - from + 1).unwrap_or(0);
         let mut blocks: Vec<Vec<Vec<u8>>> = Vec::with_capacity(capacity);
         for n in from..=to {

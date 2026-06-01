@@ -18,6 +18,7 @@
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+pub mod aggregator;
 pub mod composer;
 pub mod config;
 pub mod error;
@@ -25,6 +26,8 @@ pub mod l1_canonical_head;
 pub mod l1_watcher;
 pub mod submitter;
 
+#[doc(inline)]
+pub use aggregator::SubmitTrigger;
 #[doc(inline)]
 pub use composer::Composer;
 #[doc(inline)]

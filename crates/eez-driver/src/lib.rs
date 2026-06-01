@@ -28,12 +28,18 @@ pub mod block_committer;
 pub mod error;
 pub mod scheduler;
 pub mod sequencer;
+pub mod submit;
+pub mod timing;
 
 #[doc(inline)]
 pub use block_committer::{BlockCommitterHandle, CommitOutcome, DeriveOutcome};
 #[doc(inline)]
 pub use error::{DriverError, DriverResult};
 #[doc(inline)]
-pub use scheduler::{ProposalRequest, Scheduler, SlotKind};
+pub use scheduler::{ScheduleEvent, SlotKind, spawn_interval};
 #[doc(inline)]
 pub use sequencer::{ConfirmedHeadSource, EthAttributesBuilder, Sequencer};
+#[doc(inline)]
+pub use submit::{BatchCandidate, BatchPolicy};
+#[doc(inline)]
+pub use timing::{MAX_BLOCKS_PER_CATCHUP, RollupTiming, SlotComposition};

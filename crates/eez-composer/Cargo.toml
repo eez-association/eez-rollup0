@@ -1,0 +1,13 @@
+[package]
+name                   = "eez-composer"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+description            = "Composer umbrella — owns per-rollup Sequencer/Scheduler/HeldPool maps and the shared Aggregator/Submitter/Prover."
+
+[dependencies]
+# Filled in incrementally as logic relocates from eez-l1.
+
+[lints]
+workspace = true
