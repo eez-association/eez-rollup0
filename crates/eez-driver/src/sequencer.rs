@@ -43,7 +43,7 @@ use tokio::sync::mpsc;
 
 use crate::block_committer::BlockCommitterHandle;
 use crate::error::{DriverError, DriverResult};
-use crate::scheduler::{ScheduleEvent, SlotKind};
+use crate::slot::{SlotEvent, SlotKind};
 use crate::submit::{BatchCandidate, BatchEmitter, BatchPolicy};
 use crate::timing::{RollupTiming, SlotComposition};
 
@@ -155,7 +155,7 @@ where
     T: PayloadTypes<PayloadAttributes = EthPayloadAttributes>,
 {
     attributes: EthAttributesBuilder<ChainSpec>,
-    schedule_rx: mpsc::Receiver<ScheduleEvent>,
+    schedule_rx: mpsc::Receiver<SlotEvent>,
     committer: BlockCommitterHandle<T>,
     /// Per-rollup timing (L1/L2 cadence, proof window, slack). Used to
     /// compute per-trigger Live/Future/Sync block composition and per-
@@ -205,7 +205,7 @@ where
         provider: &P,
         attributes: EthAttributesBuilder<ChainSpec>,
         to_engine: ConsensusEngineHandle<T>,
-        schedule_rx: mpsc::Receiver<ScheduleEvent>,
+        schedule_rx: mpsc::Receiver<SlotEvent>,
         payload_builder: PayloadBuilderHandle<T>,
         timing: RollupTiming,
     ) -> DriverResult<Self>
@@ -307,19 +307,14 @@ where
         }
     }
 
-    /// Dispatch on schedule event variant.
-    async fn advance(&mut self, event: ScheduleEvent) -> DriverResult<()> {
+    /// Dispatch on slot event variant.
+    async fn advance(&mut self, event: SlotEvent) -> DriverResult<()> {
         match event {
-            ScheduleEvent::LiveTick { target_timestamp } => {
-                self.advance_live_tick(target_timestamp).await
-            }
-            ScheduleEvent::SyncSlotTrigger {
-                sync_slot_block_height,
-                sync_slot_timestamp,
-            } => {
-                self.advance_sync_slot(sync_slot_block_height, sync_slot_timestamp)
-                    .await
-            }
+            SlotEvent::Live { target_timestamp } => self.advance_live_tick(target_timestamp).await,
+            SlotEvent::SyncSlot {
+                block_height,
+                timestamp,
+            } => self.advance_sync_slot(block_height, timestamp).await,
         }
     }
 

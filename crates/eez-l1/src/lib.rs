@@ -1,41 +1,40 @@
-//! L1 anchor for eez-rollup0.
+//! L1 anchor primitives for eez-rollup0.
 //!
-//! Two-layer surface:
+//! Pure primitives — no orchestration. Stage-4 moved the Composer
+//! orchestration into the [`eez-composer`](https://docs.rs/eez-composer)
+//! umbrella crate; `eez-l1` now exposes only the L1-side building
+//! blocks the umbrella (and the Deriver) compose with.
 //!
-//! - [`Submitter`] is the thin L1-interaction primitive: send
-//!   `postAndVerifyBatch` and scan past `BatchPosted` events. No state,
-//!   no orchestration.
-//! - [`Composer`] owns the orchestration: holds the in-memory
-//!   `posted_through` cursor seeded from a startup scan via the
-//!   Submitter, ticks on interval, detects the L2-head gap, builds the
-//!   stage-2 batch payload, asks the injected [`Prover`](eez_prover::Prover)
-//!   for a proof, packs it, and hands the assembled batch to the
-//!   Submitter to send.
-//!
-//! Stateless after startup — no on-disk cursor; the L1 contract's event
-//! log is the source of truth. Stage 3's Deriver will own the L1-event-
-//! driven catch-up + reorg path.
+//! - [`Submitter`] — the thin L1 send primitive: `postAndVerifyBatch`
+//!   via the bundle relay, plus a startup scan of past `BatchPosted`
+//!   events.
+//! - [`L1Watcher`] — polls L1, fans out `NewHead` / `BatchPosted` /
+//!   `Reorg` / `Finalized` over a broadcast channel.
+//! - [`L1CanonicalHead`] — shared `posted_through` cursor (Deriver
+//!   writes; Composer / Sequencer / others read).
+//! - [`SubmitTrigger`] — Aggregator policy enum (S4.2 scaffold; the
+//!   Aggregator struct itself lands later in stage-N).
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 pub mod aggregator;
-pub mod composer;
 pub mod config;
 pub mod error;
 pub mod l1_canonical_head;
+pub mod l1_head_stream;
 pub mod l1_watcher;
 pub mod submitter;
 
 #[doc(inline)]
 pub use aggregator::SubmitTrigger;
 #[doc(inline)]
-pub use composer::Composer;
-#[doc(inline)]
-pub use config::{ComposerConfig, SubmitterConfig};
+pub use config::SubmitterConfig;
 #[doc(inline)]
 pub use error::{L1Error, L1Result};
 #[doc(inline)]
 pub use l1_canonical_head::{BatchRecord, L1CanonicalHead};
+#[doc(inline)]
+pub use l1_head_stream::L1HeadStream;
 #[doc(inline)]
 pub use l1_watcher::{L1Event, L1Watcher, L1WatcherConfig};
 #[doc(inline)]

@@ -2757,6 +2757,19 @@ dependencies = [
 [[package]]
 name = "eez-composer"
 version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.5",
+ "alloy-primitives",
+ "eez-driver",
+ "eez-l1",
+ "eez-payload-codec",
+ "eez-prover",
+ "reth-primitives-traits",
+ "reth-storage-api",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "eez-deriver"
@@ -2790,6 +2803,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-engine",
+ "async-trait",
  "reth-chainspec",
  "reth-engine-primitives",
  "reth-ethereum-engine-primitives",
@@ -2813,12 +2827,11 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-signer-local",
  "alloy-sol-types",
+ "async-trait",
  "eez-driver",
  "eez-payload-codec",
  "eez-prover",
  "reqwest 0.12.28",
- "reth-primitives-traits",
- "reth-storage-api",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -2834,6 +2847,7 @@ dependencies = [
  "alloy-signer-local",
  "clap",
  "dotenvy",
+ "eez-composer",
  "eez-deriver",
  "eez-driver",
  "eez-l1",

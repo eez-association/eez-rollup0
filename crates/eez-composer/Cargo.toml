@@ -7,7 +7,24 @@ rust-version.workspace = true
 description            = "Composer umbrella — owns per-rollup Sequencer/Scheduler/HeldPool maps and the shared Aggregator/Submitter/Prover."
 
 [dependencies]
-# Filled in incrementally as logic relocates from eez-l1.
+# internal
+eez-driver.workspace        = true
+eez-l1.workspace            = true
+eez-payload-codec.workspace = true
+eez-prover.workspace        = true
+
+# reth — L2 provider bounds for batch building
+reth-primitives-traits.workspace = true
+reth-storage-api.workspace       = true
+
+# alloy
+alloy-consensus.workspace  = true
+alloy-eips.workspace       = true
+alloy-primitives.workspace = true
+
+# async + diagnostics
+tokio.workspace     = true
+tracing.workspace   = true
 
 [lints]
 workspace = true

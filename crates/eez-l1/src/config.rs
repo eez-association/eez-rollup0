@@ -1,19 +1,10 @@
-//! Configuration for the [`Submitter`](crate::Submitter) (send-path) and
-//! [`Composer`](crate::Composer) (orchestration), populated from `EEZ_*`
-//! environment variables.
+//! Configuration for the [`Submitter`](crate::Submitter) (send-path),
+//! populated from `EEZ_*` environment variables.
 //!
-//! The split mirrors the runtime split: [`SubmitterConfig`] carries what
-//! the L1 send primitive needs (RPC, wallet, EEZ address), while
-//! [`ComposerConfig`] carries orchestration knobs (rollup id, proof
-//! system, deploy block for the startup scan). The eez-node binary
-//! reads both at startup.
-//!
-//! Submission cadence moved off `ComposerConfig` in stage 4 — it's now
-//! Sequencer-driven via
-//! [`BatchPolicy`](eez_driver::BatchPolicy)
-//! and the
-//! [`BatchCandidate`](eez_driver::BatchCandidate) channel. See
-//! `docs/plans/IMPLEMENTATION.md` §5.4.1.
+//! Per-rollup composer/orchestration knobs (rollup id, proof system,
+//! deploy block, mode flag) now live in
+//! `eez-composer::RollupConfig` per the S4.2 umbrella extraction. See
+//! `docs/plans/IMPLEMENTATION.md` §5.4.8.
 
 use std::{env, str::FromStr};
 
@@ -27,10 +18,7 @@ const ENV_RPC_URL: &str = "EEZ_L1_RPC_URL";
 const ENV_BUILDER_RPC_URL: &str = "EEZ_L1_BUILDER_RPC_URL";
 const ENV_POSTER_KEY: &str = "EEZ_L1_POSTER_KEY";
 const ENV_EEZ_ADDRESS: &str = "EEZ_REGISTRY_ADDRESS";
-const ENV_PROOF_SYSTEM_ADDRESS: &str = "EEZ_MOCK_PROOF_SYSTEM_ADDRESS";
 const ENV_ROLLUP_ID: &str = "EEZ_ROLLUP_ID";
-const ENV_DEPLOY_BLOCK: &str = "EEZ_REGISTRY_DEPLOY_BLOCK";
-const ENV_EXPECT_EXTERNAL: &str = "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES";
 
 /// L1 connectivity for the [`Submitter`](crate::Submitter) — what's
 /// needed to send and read transactions against the EEZ registry.
@@ -81,43 +69,6 @@ impl SubmitterConfig {
     }
 }
 
-/// Orchestration knobs for the [`Composer`](crate::Composer) — protocol
-/// identifiers and the L1 block to start the startup scan from.
-#[derive(Debug, Clone)]
-pub struct ComposerConfig {
-    /// Deployed `MockECDSAProofSystem` address — the one PS we attest with.
-    pub proof_system: Address,
-    /// `rollupId` returned by `EEZ.registerRollup` for our L2.
-    pub rollup_id: u64,
-    /// L1 block where `EEZ` was deployed. Lower bound for the startup
-    /// `BatchPosted` log scan that seeds `posted_through`. Keeps the scan
-    /// bounded on busy chains.
-    pub deploy_block: u64,
-    /// Based-rollup mode flag. When `true`, the Composer logs external
-    /// batches at info level (normal flow — anyone can post). When
-    /// `false` (sequenced), externals log at error level (someone
-    /// else shouldn't be sequencing our chain). The code path is
-    /// identical either way; only log level differs.
-    pub expect_external_batches: bool,
-}
-
-impl ComposerConfig {
-    /// Read from `EEZ_*` env vars.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`L1Error::Config`] for any missing required var or
-    /// malformed value.
-    pub fn from_env() -> L1Result<Self> {
-        Ok(Self {
-            proof_system: parse_address(ENV_PROOF_SYSTEM_ADDRESS)?,
-            rollup_id: parse_u64(ENV_ROLLUP_ID)?,
-            deploy_block: parse_u64(ENV_DEPLOY_BLOCK)?,
-            expect_external_batches: parse_bool_or(ENV_EXPECT_EXTERNAL, false)?,
-        })
-    }
-}
-
 fn require(name: &str) -> L1Result<String> {
     env::var(name).map_err(|_| L1Error::Config(format!("{name} is required (see .env.example)")))
 }
@@ -140,20 +91,4 @@ fn parse_u64(name: &str) -> L1Result<u64> {
     require(name)?
         .parse::<u64>()
         .map_err(|e| L1Error::Config(format!("{name}: {e}")))
-}
-
-fn parse_bool_or(name: &str, default: bool) -> L1Result<bool> {
-    match env::var(name) {
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(true),
-            "0" | "false" | "no" | "off" | "" => Ok(false),
-            other => Err(L1Error::Config(format!(
-                "{name}: expected boolean (true/false/1/0/yes/no), got {other:?}"
-            ))),
-        },
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(env::VarError::NotUnicode(_)) => {
-            Err(L1Error::Config(format!("{name} contains non-UTF-8 bytes")))
-        }
-    }
 }

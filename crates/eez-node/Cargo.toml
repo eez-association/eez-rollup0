@@ -7,10 +7,11 @@ rust-version.workspace = true
 description            = "eez Rollup-0 node — vanilla reth driven by an eez sequencer."
 
 [dependencies]
-eez-deriver.workspace = true
-eez-driver.workspace  = true
-eez-l1.workspace      = true
-eez-prover.workspace  = true
+eez-composer.workspace = true
+eez-deriver.workspace  = true
+eez-driver.workspace   = true
+eez-l1.workspace       = true
+eez-prover.workspace   = true
 
 # reth
 reth-chainspec.workspace     = true
