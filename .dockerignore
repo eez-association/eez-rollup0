@@ -3,7 +3,6 @@
 deployments.env
 datadir
 target
-qa-work
 contracts/out
 contracts/cache
 contracts/broadcast
