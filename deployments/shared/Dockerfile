@@ -59,4 +59,12 @@ COPY deployments ./deployments
 COPY scripts ./scripts
 COPY sync-rollups-protocol ./sync-rollups-protocol
 
+RUN test -f sync-rollups-protocol/src/EEZ.sol \
+    && test -f sync-rollups-protocol/lib/forge-std/src/Script.sol \
+    || { \
+        echo "sync-rollups-protocol submodule is incomplete."; \
+        echo "Run: git submodule update --init --recursive"; \
+        exit 1; \
+    }
+
 ENTRYPOINT ["/bin/bash"]

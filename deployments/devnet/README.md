@@ -7,6 +7,7 @@ then starts the L2 sequencer/composer against that L1.
 ## Quick Start
 
 ```bash
+git submodule update --init --recursive
 cp deployments/devnet/.env.example deployments/devnet/.env
 docker compose -f deployments/devnet/docker-compose.yml up --build
 ```
@@ -48,3 +49,11 @@ The compose stack builds the sequencer runtime image inside Docker so the
 container always gets a Linux `eez-node` binary. The first build is slow on a
 cold cache; subsequent builds reuse Docker BuildKit cache mounts for Cargo
 registry, git, and target data.
+
+The deploy image also needs the `sync-rollups-protocol` submodule and its
+nested Foundry dependencies. If Forge reports missing `sync-rollups-protocol`
+or `forge-std` imports, run:
+
+```bash
+git submodule update --init --recursive
+```
