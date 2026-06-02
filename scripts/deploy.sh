@@ -12,8 +12,14 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-ENV_FILE="$REPO/.env"
-OUT_FILE="$REPO/deployments.env"
+ENV_FILE="${EEZ_ENV_FILE:-$REPO/.env}"
+OUT_FILE="${EEZ_DEPLOYMENTS_ENV:-$REPO/deployments.env}"
+GENESIS_TEMPLATE="${EEZ_L2_GENESIS_TEMPLATE:-$REPO/genesis.json}"
+GENESIS_OUT="${EEZ_L2_GENESIS_OUT:-$REPO/datadir/genesis.json}"
+
+if [[ ! -f "$GENESIS_TEMPLATE" && -f "$REPO/deployments/devnet/genesis-l2.json" ]]; then
+    GENESIS_TEMPLATE="$REPO/deployments/devnet/genesis-l2.json"
+fi
 
 # Timestamp marker — used at the end to find broadcast/ entries produced
 # by *this* run (vs stale ones from prior chain ids or earlier deploys).
@@ -22,6 +28,7 @@ trap 'rm -f "$START_MARKER"' EXIT
 
 # ── Inputs from .env ──────────────────────────────────────────────────
 [[ -f "$ENV_FILE" ]] || { echo "deploy: $ENV_FILE not found — copy .env.example to .env first" >&2; exit 1; }
+[[ -f "$GENESIS_TEMPLATE" ]] || { echo "deploy: L2 genesis template $GENESIS_TEMPLATE not found" >&2; exit 1; }
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
@@ -47,6 +54,7 @@ echo "deploy: RPC                  = $EEZ_L1_RPC_URL"
 echo "deploy: poster / owner       = $OWNER"
 echo "deploy: authorized signer    = $AUTHORIZED_SIGNER"
 echo "deploy: initial state root   = $EEZ_INITIAL_STATE_ROOT"
+echo "deploy: L2 genesis template  = $GENESIS_TEMPLATE"
 echo
 
 CONTRACTS="$REPO/contracts"
@@ -127,17 +135,21 @@ echo "      rollupId   = $EEZ_ROLLUP_ID"
 # Useless work. We write a per-deploy genesis with timestamp set to
 # the L1 block that confirmed RegisterRollup, so catch-up only
 # bridges deploy-time to now.
-GENESIS_OUT="$REPO/datadir/genesis.json"
-mkdir -p "$REPO/datadir"
+mkdir -p "$(dirname "$GENESIS_OUT")" "$(dirname "$OUT_FILE")"
 DEPLOY_BLOCK_TS_HEX="$(cast block "$EEZ_REGISTRY_DEPLOY_BLOCK" --rpc-url "$EEZ_L1_RPC_URL" --json | jq -r '.timestamp')"
 [[ -n "$DEPLOY_BLOCK_TS_HEX" && "$DEPLOY_BLOCK_TS_HEX" != "null" ]] || {
     echo "deploy: failed to capture L1 block timestamp for $EEZ_REGISTRY_DEPLOY_BLOCK" >&2
     exit 1
 }
-python3 -c "
-import json, sys
-g = json.load(open('$REPO/genesis.json'))
-g['timestamp'] = '$DEPLOY_BLOCK_TS_HEX'
+python3 - "$GENESIS_TEMPLATE" "$GENESIS_OUT" "$DEPLOY_BLOCK_TS_HEX" <<'PY'
+import json
+import sys
+
+genesis_template, genesis_out, deploy_block_ts_hex = sys.argv[1:]
+with open(genesis_template) as f:
+    g = json.load(f)
+
+g['timestamp'] = deploy_block_ts_hex
 # Mirror reth --chain dev's hardfork activation (all forks at genesis).
 # Without these the chain spec defaults to no-forks, the produced
 # blocks omit Cancun/Shanghai header fields, and the Deriver's STF
@@ -152,9 +164,11 @@ g['config'].update({
     'shanghaiTime': 0, 'cancunTime': 0, 'pragueTime': 0,
     'terminalTotalDifficulty': 0, 'terminalTotalDifficultyPassed': True,
 })
-json.dump(g, open('$GENESIS_OUT', 'w'), indent=2)
-" || { echo "deploy: failed to write $GENESIS_OUT" >&2; exit 1; }
+with open(genesis_out, 'w') as f:
+    json.dump(g, f, indent=2)
+PY
 echo "      genesis.ts = $DEPLOY_BLOCK_TS_HEX ($(printf %d $DEPLOY_BLOCK_TS_HEX))"
+echo "      genesis.out= $GENESIS_OUT"
 
 # ── Write deployments.env ───────────────────────────────────────────
 cat > "$OUT_FILE" <<EOF

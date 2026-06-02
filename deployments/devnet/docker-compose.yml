@@ -1,0 +1,107 @@
+services:
+  l1:
+    image: ghcr.io/paradigmxyz/reth:v2.2.0
+    command:
+      - node
+      - --dev
+      - --dev.block-time=2s
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.api=debug,trace,txpool,eth,net,web3
+      - --http.corsdomain=*
+      - --ws
+      - --ws.addr=0.0.0.0
+      - --ws.port=8546
+      - --ws.api=debug,trace,txpool,eth,net,web3
+      - --datadir=/data
+    ports:
+      - "9555:8545"
+      - "9556:8546"
+    volumes:
+      - l1-data:/data
+
+  deploy:
+    build:
+      context: ../..
+      dockerfile: deployments/shared/Dockerfile
+      target: deploy
+    image: eez-rollup0:deploy
+    command:
+      - -lc
+      - |
+        if [ -f /shared/deployments.env ] && [ -f /shared/genesis-l2.json ]; then
+          echo "deploy: existing /shared/deployments.env and /shared/genesis-l2.json found; skipping"
+          cat /shared/deployments.env
+          exit 0
+        fi
+        /app/scripts/deploy.sh
+    environment:
+      EEZ_ENV_FILE: /config/.env
+      EEZ_DEPLOYMENTS_ENV: /shared/deployments.env
+      EEZ_L2_GENESIS_TEMPLATE: /app/deployments/devnet/genesis-l2.json
+      EEZ_L2_GENESIS_OUT: /shared/genesis-l2.json
+    volumes:
+      - ./.env:/config/.env:ro
+      - shared:/shared
+    depends_on:
+      - l1
+
+  sequencer:
+    build:
+      context: ../..
+      dockerfile: deployments/shared/Dockerfile
+      target: runtime
+    image: eez-rollup0:runtime
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - |
+        set -a
+        source /config/.env
+        source /shared/deployments.env
+        set +a
+        exec eez-node node \
+          --chain /shared/genesis-l2.json \
+          --datadir /data \
+          --http \
+          --http.addr=0.0.0.0 \
+          --http.port=8545 \
+          --http.api=debug,trace,txpool,eth,net,web3 \
+          --http.corsdomain=* \
+          --ws \
+          --ws.addr=0.0.0.0 \
+          --ws.port=8546 \
+          --ws.api=debug,trace,txpool,eth,net,web3 \
+          --builder.extradata "" \
+          --builder.gaslimit 30000000
+    ports:
+      - "9545:8545"
+      - "9546:8546"
+    volumes:
+      - ./.env:/config/.env:ro
+      - shared:/shared
+      - l2-data:/data
+    depends_on:
+      deploy:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -sf
+        - -X
+        - POST
+        - -H
+        - "Content-Type: application/json"
+        - -d
+        - '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
+        - http://localhost:8545
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+volumes:
+  l1-data:
+  l2-data:
+  shared:

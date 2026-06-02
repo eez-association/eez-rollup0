@@ -1,0 +1,11 @@
+.git
+.env
+deployments.env
+datadir
+target
+qa-work
+contracts/out
+contracts/cache
+contracts/broadcast
+sync-rollups-protocol/visualizator/dashboard/node_modules
+**/.DS_Store
