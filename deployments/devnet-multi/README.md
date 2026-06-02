@@ -46,6 +46,29 @@ cast block-number --rpc-url http://127.0.0.1:9649
 cast block-number --rpc-url http://127.0.0.1:9651
 ```
 
+Check whether the sequencers are converging:
+
+```bash
+deployments/shared/scripts/check-multi-convergence.sh
+```
+
+Run the same check inside Docker:
+
+```bash
+docker compose -f deployments/devnet-multi/docker-compose.yml --profile check up \
+  --abort-on-container-exit --exit-code-from convergence-check convergence-check
+```
+
+For the current all-active contention devnet, this can be inverted into a
+reproducible failure witness. The command exits successfully as soon as it
+observes block/state-root divergence:
+
+```bash
+EEZ_CONVERGENCE_EXPECT_DIVERGENCE=1 \
+docker compose -f deployments/devnet-multi/docker-compose.yml --profile check up \
+  --abort-on-container-exit --exit-code-from convergence-check convergence-check
+```
+
 ## Reset
 
 ```bash
