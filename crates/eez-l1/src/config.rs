@@ -160,14 +160,25 @@ fn parse_key(name: &str) -> L1Result<PrivateKeySigner> {
 
 fn parse_key_or_dummy(name: &str) -> L1Result<PrivateKeySigner> {
     match env::var(name) {
-        Ok(raw) => PrivateKeySigner::from_str(raw.trim_start_matches("0x"))
-            .map_err(|e| L1Error::Config(format!("{name}: {e}"))),
-        Err(env::VarError::NotPresent) => PrivateKeySigner::from_bytes(&B256::with_last_byte(1))
-            .map_err(|e| L1Error::Config(format!("dummy {name}: {e}"))),
+        Ok(raw) => {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                dummy_key(name)
+            } else {
+                PrivateKeySigner::from_str(raw.trim_start_matches("0x"))
+                    .map_err(|e| L1Error::Config(format!("{name}: {e}")))
+            }
+        }
+        Err(env::VarError::NotPresent) => dummy_key(name),
         Err(env::VarError::NotUnicode(_)) => {
             Err(L1Error::Config(format!("{name} contains non-UTF-8 bytes")))
         }
     }
+}
+
+fn dummy_key(name: &str) -> L1Result<PrivateKeySigner> {
+    PrivateKeySigner::from_bytes(&B256::with_last_byte(1))
+        .map_err(|e| L1Error::Config(format!("dummy {name}: {e}")))
 }
 
 fn parse_u64(name: &str) -> L1Result<u64> {

@@ -60,13 +60,15 @@ fn main() -> eyre::Result<()> {
         let l1_watcher_config = L1WatcherConfig::from_env()?;
         let submitter_config = SubmitterConfig::from_env_read_only()?;
         let deploy_block = registry_deploy_block_from_env()?;
+        let sequencer_rpc_log = ext.sequencer_rpc.as_ref().map(redact_rpc_url);
+        let l1_rpc_log = redact_rpc_url(&l1_watcher_config.rpc_url);
 
         event!(
             name: "eez.follower.launching",
             Level::INFO,
             block_time.secs = BLOCK_TIME.as_secs(),
-            sequencer_rpc = ext.sequencer_rpc.as_ref().map_or("<disabled>", url::Url::as_str),
-            l1_rpc = %l1_watcher_config.rpc_url,
+            sequencer_rpc = sequencer_rpc_log.as_deref().unwrap_or("<disabled>"),
+            l1_rpc = %l1_rpc_log,
             "launching eez-follower",
         );
 
@@ -137,4 +139,57 @@ fn main() -> eyre::Result<()> {
 
         handle.wait_for_node_exit().await
     })
+}
+
+fn redact_rpc_url(url: &url::Url) -> String {
+    let mut redacted = url.clone();
+    if !redacted.username().is_empty() || redacted.password().is_some() {
+        let _ = redacted.set_username("");
+        let _ = redacted.set_password(None);
+    }
+    redacted.set_fragment(None);
+
+    if redacted.query().is_none() {
+        return redacted.to_string();
+    }
+
+    let query_pairs: Vec<(String, String)> = redacted
+        .query_pairs()
+        .map(|(key, value)| {
+            let is_sensitive = is_sensitive_query_key(&key);
+            (
+                key.into_owned(),
+                if is_sensitive {
+                    "redacted".to_string()
+                } else {
+                    value.into_owned()
+                },
+            )
+        })
+        .collect();
+    redacted.set_query(None);
+    redacted.query_pairs_mut().extend_pairs(
+        query_pairs
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    );
+    redacted.to_string()
+}
+
+fn is_sensitive_query_key(key: &str) -> bool {
+    const SENSITIVE_PARTS: &[&str] = &[
+        "api_key",
+        "apikey",
+        "auth",
+        "credential",
+        "jwt",
+        "key",
+        "pass",
+        "secret",
+        "sig",
+        "token",
+    ];
+
+    let key = key.to_ascii_lowercase();
+    SENSITIVE_PARTS.iter().any(|part| key.contains(part))
 }

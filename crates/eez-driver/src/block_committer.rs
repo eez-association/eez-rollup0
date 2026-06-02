@@ -1,7 +1,7 @@
 //! Single-task actor that serializes every engine-API call to reth.
 //!
 //! Owns the `ConsensusEngineHandle`, the `PayloadBuilderHandle`,
-//! `last_header`, and the `safe` / `finalized` hash cursors.
+//! `last_header`, and the unsafe / safe / finalized hash cursors.
 //! [`BlockCommitterHandle`] is a clone-cheap `mpsc::Sender` wrapper —
 //! both the Sequencer and the Deriver hold clones, so all engine
 //! traffic stays strictly ordered.
@@ -183,6 +183,7 @@ where
             to_engine,
             payload_builder,
             last_header: Arc::clone(&last_header),
+            unsafe_head_hash: initial_hash,
             safe_hash: initial_hash,
             finalized_hash: initial_hash,
         };
@@ -345,6 +346,9 @@ struct Actor<T: PayloadTypes> {
     /// Shared with the `BlockCommitterHandle`. The actor is the sole writer;
     /// Updated synchronously inside `process_sequence` and `process_derive`
     last_header: Arc<RwLock<SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>>>,
+    /// Last head accepted by forkchoice. May point at a syncing unsafe head
+    /// before reth has imported the canonical header.
+    unsafe_head_hash: B256,
     safe_hash: B256,
     finalized_hash: B256,
 }
@@ -399,7 +403,7 @@ where
 
     fn forkchoice_state(&self) -> ForkchoiceState {
         ForkchoiceState {
-            head_block_hash: self.last_header.read().unwrap().hash(),
+            head_block_hash: self.unsafe_head_hash,
             safe_block_hash: self.safe_hash,
             finalized_block_hash: self.finalized_hash,
         }
@@ -412,7 +416,7 @@ where
             .fork_choice_updated(state, None)
             .await
             .map_err(DriverError::engine_rpc)?;
-        if !res.is_valid() {
+        if !res.is_valid() && !res.is_syncing() {
             return Err(DriverError::invalid_forkchoice(format!("{res:?}")));
         }
         Ok(())
@@ -431,7 +435,7 @@ where
             .fork_choice_updated(state, None)
             .await
             .map_err(DriverError::engine_rpc)?;
-        if !res.is_valid() {
+        if !res.is_valid() && !res.is_syncing() {
             return Err(DriverError::invalid_forkchoice(format!("{res:?}")));
         }
         self.safe_hash = safe;
@@ -453,6 +457,12 @@ where
             Err(err) => return Err(DriverError::engine_rpc(err)),
         };
         let outcome = classify_advance_head_response(&res)?;
+        if matches!(
+            outcome,
+            ForkchoiceOutcome::Valid | ForkchoiceOutcome::Syncing
+        ) {
+            self.unsafe_head_hash = header.hash();
+        }
         if outcome == ForkchoiceOutcome::Valid {
             *self.last_header.write().unwrap() = header;
         }
@@ -490,6 +500,7 @@ where
             return Err(DriverError::invalid_forkchoice(format!("{fcu:?}")));
         }
         // Mirror the new head into the shared `RwLock`.
+        self.unsafe_head_hash = block_hash;
         *self.last_header.write().unwrap() = header;
 
         Ok(DeriveOutcome {
@@ -551,6 +562,7 @@ where
             return Err(DriverError::invalid_payload(format!("{np:?}")));
         }
 
+        self.unsafe_head_hash = header.hash();
         *self.last_header.write().unwrap() = header.clone();
         Ok(SequenceOutcome::Committed(CommitOutcome { header }))
     }

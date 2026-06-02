@@ -60,6 +60,11 @@ const BLOCK_TIME_SECS: u64 = 2;
 /// resumes next tick. 32 blocks / 2s tick ≈ 16 blocks/s.
 const MAX_BLOCKS_PER_TICK: usize = 32;
 
+/// Bound parent-rebuild attempts that do not produce a block. Keeps one
+/// scheduler tick from starving forkchoice refresh if another task keeps
+/// moving the canonical parent underneath the sequencer.
+const MAX_STALE_PARENT_RETRIES_PER_TICK: usize = MAX_BLOCKS_PER_TICK;
+
 /// Max speculative gap the Sequencer can run ahead of L1-confirmed
 /// cursor. Pauses beyond this so reth's state-retention
 /// window keeps recent ancestors alive for the Deriver's replay.
@@ -289,6 +294,7 @@ where
     async fn advance(&mut self, req: ProposalRequest) -> DriverResult<()> {
         let target_wall = req.target_timestamp;
         let mut produced: usize = 0;
+        let mut stale_parent_retries: usize = 0;
 
         while produced < MAX_BLOCKS_PER_TICK {
             // Read the current canonical head from the committer per
@@ -339,13 +345,17 @@ where
                 .commit_sequenced(parent_hash, parent_num, attrs)
                 .await?;
             let outcome = match outcome {
-                SequenceOutcome::Committed(outcome) => outcome,
+                SequenceOutcome::Committed(outcome) => {
+                    stale_parent_retries = 0;
+                    outcome
+                }
                 SequenceOutcome::StaleParent {
                     expected_hash,
                     expected_number,
                     actual_hash,
                     actual_number,
                 } => {
+                    stale_parent_retries += 1;
                     event!(
                         name: "eez.sequencer.parent.stale",
                         Level::DEBUG,
@@ -355,6 +365,15 @@ where
                         actual_parent.hash = %actual_hash,
                         "sequencer parent changed before commit; rebuilding attributes",
                     );
+                    if stale_parent_retries >= MAX_STALE_PARENT_RETRIES_PER_TICK {
+                        event!(
+                            name: "eez.sequencer.parent.stale.yield",
+                            Level::DEBUG,
+                            retries = stale_parent_retries,
+                            "stale-parent retry budget exhausted; yielding scheduler tick",
+                        );
+                        break;
+                    }
                     continue;
                 }
             };
