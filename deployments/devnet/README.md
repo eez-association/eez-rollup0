@@ -33,6 +33,18 @@ Watch batch posting:
 docker compose -f deployments/devnet/docker-compose.yml logs -f sequencer
 ```
 
+Run with simple L2 transfer traffic:
+
+```bash
+docker compose -f deployments/devnet/docker-compose.yml --profile traffic up --build
+```
+
+Check the live devnet:
+
+```bash
+deployments/shared/scripts/check-devnet.sh
+```
+
 ## Reset
 
 ```bash

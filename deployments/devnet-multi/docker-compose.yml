@@ -1,0 +1,176 @@
+name: devnet-multi
+
+x-sequencer-healthcheck: &sequencer-healthcheck
+  test:
+    - CMD
+    - curl
+    - -sf
+    - -X
+    - POST
+    - -H
+    - "Content-Type: application/json"
+    - -d
+    - '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
+    - http://localhost:8545
+  interval: 5s
+  timeout: 3s
+  retries: 30
+  start_period: 30s
+
+x-sequencer-common: &sequencer-common
+  build:
+    context: ../..
+    dockerfile: deployments/shared/Dockerfile
+    target: runtime
+  image: eez-rollup0:runtime
+  entrypoint: ["/bin/bash", "-lc"]
+  command:
+    - /app/deployments/shared/scripts/start-sequencer.sh
+  depends_on:
+    deploy:
+      condition: service_completed_successfully
+  healthcheck: *sequencer-healthcheck
+
+services:
+  l1:
+    image: ghcr.io/paradigmxyz/reth:v2.2.0
+    command:
+      - node
+      - --dev
+      - --dev.block-time=2s
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.api=debug,trace,txpool,eth,net,web3
+      - --http.corsdomain=*
+      - --ws
+      - --ws.addr=0.0.0.0
+      - --ws.port=8546
+      - --ws.api=debug,trace,txpool,eth,net,web3
+      - --datadir=/data
+    ports:
+      - "9655:8545"
+      - "9656:8546"
+    volumes:
+      - l1-data:/data
+
+  deploy:
+    build:
+      context: ../..
+      dockerfile: deployments/shared/Dockerfile
+      target: deploy
+    image: eez-rollup0:deploy
+    command:
+      - -lc
+      - |
+        set -a
+        source /config/.env
+        set +a
+        /app/deployments/shared/scripts/wait-rpc.sh "$$EEZ_L1_RPC_URL" l1
+        if [ -f /shared/deployments.env ] && [ -f /shared/genesis-l2.json ]; then
+          echo "deploy: existing /shared/deployments.env and /shared/genesis-l2.json found; skipping"
+          cat /shared/deployments.env
+          exit 0
+        fi
+        /app/scripts/deploy.sh
+    environment:
+      EEZ_ENV_FILE: /config/.env
+      EEZ_DEPLOYMENTS_ENV: /shared/deployments.env
+      EEZ_L2_GENESIS_TEMPLATE: /app/deployments/devnet/genesis-l2.json
+      EEZ_L2_GENESIS_OUT: /shared/genesis-l2.json
+    volumes:
+      - ./.env:/config/.env:ro
+      - shared:/shared
+    depends_on:
+      - l1
+
+  sequencer1:
+    <<: *sequencer-common
+    environment:
+      EEZ_NODE_NAME: sequencer1
+      EEZ_NODE_L1_POSTER_KEY: 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+      EEZ_NODE_COMPOSER_INTERVAL_SECS: "17"
+      EEZ_NODE_COMPOSER_EXPECT_EXTERNAL_BATCHES: "true"
+    ports:
+      - "9645:8545"
+      - "9646:8546"
+    volumes:
+      - ./.env:/config/.env:ro
+      - shared:/shared
+      - sequencer1-data:/data
+
+  sequencer2:
+    <<: *sequencer-common
+    environment:
+      EEZ_NODE_NAME: sequencer2
+      EEZ_NODE_L1_POSTER_KEY: 0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
+      EEZ_NODE_COMPOSER_INTERVAL_SECS: "19"
+      EEZ_NODE_COMPOSER_EXPECT_EXTERNAL_BATCHES: "true"
+    ports:
+      - "9647:8545"
+      - "9648:8546"
+    volumes:
+      - ./.env:/config/.env:ro
+      - shared:/shared
+      - sequencer2-data:/data
+
+  sequencer3:
+    <<: *sequencer-common
+    environment:
+      EEZ_NODE_NAME: sequencer3
+      EEZ_NODE_L1_POSTER_KEY: 0x5de4111a759a5f9f3f84f1754ad0f3657b6d6f0b12f1b1bdb4a651bd0f3418e0
+      EEZ_NODE_COMPOSER_INTERVAL_SECS: "23"
+      EEZ_NODE_COMPOSER_EXPECT_EXTERNAL_BATCHES: "true"
+    ports:
+      - "9649:8545"
+      - "9650:8546"
+    volumes:
+      - ./.env:/config/.env:ro
+      - shared:/shared
+      - sequencer3-data:/data
+
+  sequencer4:
+    <<: *sequencer-common
+    environment:
+      EEZ_NODE_NAME: sequencer4
+      EEZ_NODE_L1_POSTER_KEY: 0x7c85211829459a3d817f3efc8b234a6fc13bdf1cf88663050b89b780ba0d14bb
+      EEZ_NODE_COMPOSER_INTERVAL_SECS: "29"
+      EEZ_NODE_COMPOSER_EXPECT_EXTERNAL_BATCHES: "true"
+    ports:
+      - "9651:8545"
+      - "9652:8546"
+    volumes:
+      - ./.env:/config/.env:ro
+      - shared:/shared
+      - sequencer4-data:/data
+
+  tx-sender:
+    build:
+      context: ../..
+      dockerfile: deployments/shared/Dockerfile
+      target: deploy
+    image: eez-rollup0:deploy
+    restart: unless-stopped
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - /app/deployments/shared/scripts/send-test-txs.sh
+    environment:
+      EEZ_TX_SENDER_RPCS: http://sequencer1:8545,http://sequencer2:8545,http://sequencer3:8545,http://sequencer4:8545
+      EEZ_TX_SENDER_INTERVAL_SECS: "12"
+    depends_on:
+      sequencer1:
+        condition: service_healthy
+      sequencer2:
+        condition: service_healthy
+      sequencer3:
+        condition: service_healthy
+      sequencer4:
+        condition: service_healthy
+
+volumes:
+  l1-data:
+  shared:
+  sequencer1-data:
+  sequencer2-data:
+  sequencer3-data:
+  sequencer4-data:

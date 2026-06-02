@@ -30,6 +30,10 @@ services:
     command:
       - -lc
       - |
+        set -a
+        source /config/.env
+        set +a
+        /app/deployments/shared/scripts/wait-rpc.sh "$$EEZ_L1_RPC_URL" l1
         if [ -f /shared/deployments.env ] && [ -f /shared/genesis-l2.json ]; then
           echo "deploy: existing /shared/deployments.env and /shared/genesis-l2.json found; skipping"
           cat /shared/deployments.env
@@ -55,25 +59,9 @@ services:
     image: eez-rollup0:runtime
     entrypoint: ["/bin/bash", "-lc"]
     command:
-      - |
-        set -a
-        source /config/.env
-        source /shared/deployments.env
-        set +a
-        exec eez-node node \
-          --chain /shared/genesis-l2.json \
-          --datadir /data \
-          --http \
-          --http.addr=0.0.0.0 \
-          --http.port=8545 \
-          --http.api=debug,trace,txpool,eth,net,web3 \
-          --http.corsdomain=* \
-          --ws \
-          --ws.addr=0.0.0.0 \
-          --ws.port=8546 \
-          --ws.api=debug,trace,txpool,eth,net,web3 \
-          --builder.extradata "" \
-          --builder.gaslimit 30000000
+      - /app/deployments/shared/scripts/start-sequencer.sh
+    environment:
+      EEZ_NODE_NAME: sequencer
     ports:
       - "9545:8545"
       - "9546:8546"
@@ -100,6 +88,22 @@ services:
       timeout: 3s
       retries: 30
       start_period: 30s
+
+  tx-sender:
+    profiles: ["traffic"]
+    build:
+      context: ../..
+      dockerfile: deployments/shared/Dockerfile
+      target: deploy
+    image: eez-rollup0:deploy
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - /app/deployments/shared/scripts/send-test-txs.sh
+    environment:
+      EEZ_TX_SENDER_RPCS: http://sequencer:8545
+    depends_on:
+      sequencer:
+        condition: service_healthy
 
 volumes:
   l1-data:
