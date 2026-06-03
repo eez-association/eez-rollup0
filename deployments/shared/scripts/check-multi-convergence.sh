@@ -201,16 +201,34 @@ while true; do
     baseline_safe_hash="${safe_hashes[0]}"
     baseline_finalized_number="${finalized_numbers[0]}"
     baseline_finalized_hash="${finalized_hashes[0]}"
+    same_safe_height=1
+    same_finalized_height=1
+    safe_hash_mismatch=0
+    finalized_hash_mismatch=0
     for i in "${!RPCS[@]}"; do
-        if [[ "${safe_numbers[$i]}" != "$baseline_safe_number" || "${safe_hashes[$i]}" != "$baseline_safe_hash" ]]; then
-            safe_diverged=1
+        if [[ "${safe_numbers[$i]}" != "$baseline_safe_number" ]]; then
+            same_safe_height=0
         fi
-        if [[ "${finalized_numbers[$i]}" != "$baseline_finalized_number" || "${finalized_hashes[$i]}" != "$baseline_finalized_hash" ]]; then
-            safe_diverged=1
+        if [[ "${finalized_numbers[$i]}" != "$baseline_finalized_number" ]]; then
+            same_finalized_height=0
+        fi
+        if [[ "${safe_hashes[$i]}" != "$baseline_safe_hash" ]]; then
+            safe_hash_mismatch=1
+        fi
+        if [[ "${finalized_hashes[$i]}" != "$baseline_finalized_hash" ]]; then
+            finalized_hash_mismatch=1
         fi
     done
-    if (( safe_diverged == 1 )); then
-        echo "check-multi-convergence: safe/finalized heads are not aligned" >&2
+    if (( same_safe_height == 1 && safe_hash_mismatch == 1 )); then
+        safe_diverged=1
+        echo "check-multi-convergence: same-height safe heads have different hashes" >&2
+    fi
+    if (( same_finalized_height == 1 && finalized_hash_mismatch == 1 )); then
+        safe_diverged=1
+        echo "check-multi-convergence: same-height finalized heads have different hashes" >&2
+    fi
+    if (( same_safe_height == 0 || same_finalized_height == 0 )); then
+        echo "check-multi-convergence: safe/finalized heads are still catching up"
     fi
 
     if (( round_diverged == 1 || safe_diverged == 1 )); then
