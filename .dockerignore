@@ -1,5 +1,6 @@
 .git
 .env
+**/.env
 deployments.env
 datadir
 target

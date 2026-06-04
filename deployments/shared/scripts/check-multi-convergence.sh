@@ -87,7 +87,6 @@ done
 echo "check-multi-convergence: rounds=${ROUNDS} interval=${INTERVAL_SECS}s lag_blocks=${LAG_BLOCKS} safe_lag_limit=${SAFE_LAG_LIMIT}"
 
 round=0
-divergence_seen=0
 while true; do
     round=$((round + 1))
     if (( ROUNDS > 0 && round > ROUNDS )); then
@@ -192,7 +191,7 @@ while true; do
     fi
 
     safe_diverged=0
-    if (( max_safe - min_safe > SAFE_LAG_LIMIT )); then
+    if (( min_safe >= 0 && max_safe - min_safe > SAFE_LAG_LIMIT )); then
         safe_diverged=1
         echo "check-multi-convergence: safe head lag exceeds limit (${min_safe}..${max_safe}, limit ${SAFE_LAG_LIMIT})" >&2
     fi
@@ -232,7 +231,6 @@ while true; do
     fi
 
     if (( round_diverged == 1 || safe_diverged == 1 )); then
-        divergence_seen=1
         if is_true "$EXPECT_DIVERGENCE"; then
             echo "check-multi-convergence: divergence observed as expected"
             exit 0
