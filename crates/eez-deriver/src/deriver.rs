@@ -741,7 +741,9 @@ where
     /// Per-block reconciliation against a decoded batch beginning at
     /// `from_block`: for each block, skip if local reth already holds the
     /// same tx list, otherwise STF-replay it (reth fork-switches via
-    /// `newPayload` + head-FCU). Returns the count of blocks replayed.
+    /// `newPayload` + head-FCU). Once any block in the batch is replayed,
+    /// replay every later block too so matching tx lists are rebuilt on the
+    /// new ancestry. Returns the count of blocks replayed.
     ///
     /// NOTE: not transactional. If a replay fails partway, earlier blocks
     /// are already committed to reth's canonical chain, leaving local L2
@@ -764,10 +766,61 @@ where
             let count_usize = usize::from(*count);
             let block_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
             tx_offset += count_usize;
-            let matched = if force_replay {
-                false
+            let local = if force_replay {
+                None
             } else {
-                local_block_matches(&self.inner.l2_provider, l2_block, block_txs)?
+                inspect_local_block(&self.inner.l2_provider, l2_block, block_txs)?
+            };
+            let matched = local.as_ref().is_some_and(|local| local.txs_match);
+            if let Some(local) = &local {
+                event!(
+                    name: "eez.deriver.reconcile.local_header",
+                    Level::DEBUG,
+                    l1_block_number,
+                    tx_hash = %tx_hash,
+                    l2_block,
+                    tx_count = block_txs.len(),
+                    txs_match = local.txs_match,
+                    local_hash = %local.hash,
+                    local_parent_hash = %local.header.parent_hash,
+                    local_state_root = %local.header.state_root,
+                    local_transactions_root = %local.header.transactions_root,
+                    local_receipts_root = %local.header.receipts_root,
+                    local_number = local.header.number,
+                    local_timestamp = local.header.timestamp,
+                    local_gas_limit = local.header.gas_limit,
+                    local_gas_used = local.header.gas_used,
+                    local_base_fee_per_gas = ?local.header.base_fee_per_gas,
+                    local_beneficiary = %local.header.beneficiary,
+                    local_extra_data = ?local.header.extra_data,
+                    local_mix_hash = %local.header.mix_hash,
+                    local_withdrawals_root = ?local.header.withdrawals_root,
+                    local_blob_gas_used = ?local.header.blob_gas_used,
+                    local_excess_blob_gas = ?local.header.excess_blob_gas,
+                    local_parent_beacon_block_root = ?local.header.parent_beacon_block_root,
+                    "local block header observed during L1 reconciliation",
+                );
+                if local.txs_match {
+                    self.log_deterministic_header_check(
+                        l1_block_number,
+                        tx_hash,
+                        l2_block,
+                        block_txs,
+                        local,
+                    );
+                }
+            }
+            let should_replay = force_replay || replayed > 0 || !matched;
+            let replay_reason = if force_replay {
+                "force_replay"
+            } else if replayed > 0 {
+                "prior_replay"
+            } else if matched {
+                "txs_match"
+            } else if local.is_some() {
+                "txs_mismatch"
+            } else {
+                "local_missing"
             };
             event!(
                 name: "eez.deriver.reconcile.block",
@@ -775,18 +828,113 @@ where
                 l1_block_number,
                 tx_hash = %tx_hash,
                 l2_block,
-                action = if matched { "skip" } else { "replay" },
+                action = if should_replay { "replay" } else { "skip" },
+                replay_reason,
                 tx_count = block_txs.len(),
                 replayed_so_far = replayed,
                 "reconciling batch block",
             );
-            if matched {
+            if !should_replay {
                 continue;
             }
             self.replay_block(l2_block - 1, block_txs).await?;
             replayed += 1;
         }
         Ok(replayed)
+    }
+
+    fn log_deterministic_header_check(
+        &self,
+        l1_block_number: u64,
+        tx_hash: B256,
+        l2_block: u64,
+        block_txs: &[Vec<u8>],
+        local: &LocalBlockInspection,
+    ) {
+        let expected = match self.execute_block(l2_block - 1, block_txs) {
+            Ok((_payload, header)) => header,
+            Err(err) => {
+                event!(
+                    name: "eez.deriver.header.determinism_failed",
+                    Level::WARN,
+                    l1_block_number,
+                    tx_hash = %tx_hash,
+                    l2_block,
+                    tx_count = block_txs.len(),
+                    local_hash = %local.hash,
+                    local_parent_hash = %local.header.parent_hash,
+                    error = %err,
+                    "could not build deterministic comparison header for tx-list-matched local block",
+                );
+                return;
+            }
+        };
+        let expected_hash = expected.hash();
+        let expected_header = expected.header();
+        let first_mismatch = first_header_mismatch(local.hash, &local.header, expected_hash, expected_header);
+        let exact_match = first_mismatch.is_none();
+        let first_mismatch = first_mismatch.unwrap_or("none");
+        if exact_match {
+            event!(
+                name: "eez.deriver.header.determinism",
+                Level::DEBUG,
+                l1_block_number,
+                tx_hash = %tx_hash,
+                l2_block,
+                tx_count = block_txs.len(),
+                exact_match,
+                first_mismatch,
+                local_hash = %local.hash,
+                expected_hash = %expected_hash,
+                "deterministic header comparison for tx-list-matched local block",
+            );
+            return;
+        }
+        event!(
+            name: "eez.deriver.header.determinism",
+            Level::WARN,
+            l1_block_number,
+            tx_hash = %tx_hash,
+            l2_block,
+            tx_count = block_txs.len(),
+            exact_match,
+            first_mismatch,
+            local_hash = %local.hash,
+            expected_hash = %expected_hash,
+            local_parent_hash = %local.header.parent_hash,
+            expected_parent_hash = %expected_header.parent_hash,
+            local_state_root = %local.header.state_root,
+            expected_state_root = %expected_header.state_root,
+            local_transactions_root = %local.header.transactions_root,
+            expected_transactions_root = %expected_header.transactions_root,
+            local_receipts_root = %local.header.receipts_root,
+            expected_receipts_root = %expected_header.receipts_root,
+            local_number = local.header.number,
+            expected_number = expected_header.number,
+            local_timestamp = local.header.timestamp,
+            expected_timestamp = expected_header.timestamp,
+            local_gas_limit = local.header.gas_limit,
+            expected_gas_limit = expected_header.gas_limit,
+            local_gas_used = local.header.gas_used,
+            expected_gas_used = expected_header.gas_used,
+            local_base_fee_per_gas = ?local.header.base_fee_per_gas,
+            expected_base_fee_per_gas = ?expected_header.base_fee_per_gas,
+            local_beneficiary = %local.header.beneficiary,
+            expected_beneficiary = %expected_header.beneficiary,
+            local_extra_data = ?local.header.extra_data,
+            expected_extra_data = ?expected_header.extra_data,
+            local_mix_hash = %local.header.mix_hash,
+            expected_mix_hash = %expected_header.mix_hash,
+            local_withdrawals_root = ?local.header.withdrawals_root,
+            expected_withdrawals_root = ?expected_header.withdrawals_root,
+            local_blob_gas_used = ?local.header.blob_gas_used,
+            expected_blob_gas_used = ?expected_header.blob_gas_used,
+            local_excess_blob_gas = ?local.header.excess_blob_gas,
+            expected_excess_blob_gas = ?expected_header.excess_blob_gas,
+            local_parent_beacon_block_root = ?local.header.parent_beacon_block_root,
+            expected_parent_beacon_block_root = ?expected_header.parent_beacon_block_root,
+            "deterministic header comparison for tx-list-matched local block",
+        );
     }
 
     /// Loud-fail if the batch's claimed `newState` disagrees with our
@@ -833,35 +981,118 @@ where
     }
 }
 
-/// `true` iff local reth has a block at `block_number` whose tx list
-/// matches `expected_txs`. `false` if the block is missing or has
-/// different txs — caller's signal to STF-replay this slot.
-fn local_block_matches<L2>(
+struct LocalBlockInspection {
+    header: alloy_consensus::Header,
+    hash: B256,
+    txs_match: bool,
+}
+
+fn inspect_local_block<L2>(
     l2_provider: &Arc<L2>,
     block_number: u64,
     expected_txs: &[Vec<u8>],
-) -> DeriverResult<bool>
+) -> DeriverResult<Option<LocalBlockInspection>>
 where
-    L2: BlockReader,
+    L2: BlockReader<Header = alloy_consensus::Header>,
     <L2 as TransactionsProvider>::Transaction: Encodable2718,
 {
     let Some(local_block) = l2_provider
         .block_by_number(block_number)
         .map_err(DeriverError::l2_provider)?
     else {
-        return Ok(false);
+        return Ok(None);
     };
+    let header = local_block.header().clone();
+    let hash = SealedHeader::seal_slow(header.clone()).hash();
     let local_txs: Vec<Vec<u8>> = local_block
         .body()
         .transactions()
         .iter()
         .map(Encodable2718::encoded_2718)
         .collect();
-    if local_txs.len() != expected_txs.len() {
-        return Ok(false);
+    let txs_match = local_txs.len() == expected_txs.len()
+        && local_txs
+            .iter()
+            .zip(expected_txs.iter())
+            .all(|(l, e)| l == e);
+    Ok(Some(LocalBlockInspection {
+        header,
+        hash,
+        txs_match,
+    }))
+}
+
+fn first_header_mismatch(
+    local_hash: B256,
+    local: &alloy_consensus::Header,
+    expected_hash: B256,
+    expected: &alloy_consensus::Header,
+) -> Option<&'static str> {
+    if local.parent_hash != expected.parent_hash {
+        return Some("parent_hash");
     }
-    Ok(local_txs
-        .iter()
-        .zip(expected_txs.iter())
-        .all(|(l, e)| l == e))
+    if local.ommers_hash != expected.ommers_hash {
+        return Some("ommers_hash");
+    }
+    if local.beneficiary != expected.beneficiary {
+        return Some("beneficiary");
+    }
+    if local.state_root != expected.state_root {
+        return Some("state_root");
+    }
+    if local.transactions_root != expected.transactions_root {
+        return Some("transactions_root");
+    }
+    if local.receipts_root != expected.receipts_root {
+        return Some("receipts_root");
+    }
+    if local.logs_bloom != expected.logs_bloom {
+        return Some("logs_bloom");
+    }
+    if local.difficulty != expected.difficulty {
+        return Some("difficulty");
+    }
+    if local.number != expected.number {
+        return Some("number");
+    }
+    if local.gas_limit != expected.gas_limit {
+        return Some("gas_limit");
+    }
+    if local.gas_used != expected.gas_used {
+        return Some("gas_used");
+    }
+    if local.timestamp != expected.timestamp {
+        return Some("timestamp");
+    }
+    if local.extra_data != expected.extra_data {
+        return Some("extra_data");
+    }
+    if local.mix_hash != expected.mix_hash {
+        return Some("mix_hash");
+    }
+    if local.nonce != expected.nonce {
+        return Some("nonce");
+    }
+    if local.base_fee_per_gas != expected.base_fee_per_gas {
+        return Some("base_fee_per_gas");
+    }
+    if local.withdrawals_root != expected.withdrawals_root {
+        return Some("withdrawals_root");
+    }
+    if local.blob_gas_used != expected.blob_gas_used {
+        return Some("blob_gas_used");
+    }
+    if local.excess_blob_gas != expected.excess_blob_gas {
+        return Some("excess_blob_gas");
+    }
+    if local.parent_beacon_block_root != expected.parent_beacon_block_root {
+        return Some("parent_beacon_block_root");
+    }
+    if local.requests_hash != expected.requests_hash {
+        return Some("requests_hash");
+    }
+    if local_hash != expected_hash {
+        return Some("hash");
+    }
+    None
 }
