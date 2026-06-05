@@ -72,6 +72,10 @@ alloy-signer-local     = { version = "2", default-features = false }
 alloy-sol-types        = { version = "1", default-features = false }
 url                    = "2"
 
+# bundler (eth_sendBundle) submission path
+reqwest                = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde_json             = "1"
+
 # internal crates
 eez-deriver        = { path = "crates/eez-deriver" }
 eez-driver         = { path = "crates/eez-driver" }

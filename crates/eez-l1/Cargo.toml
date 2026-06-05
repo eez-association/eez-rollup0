@@ -27,6 +27,10 @@ alloy-rpc-types-eth.workspace = true
 alloy-signer-local.workspace  = true
 alloy-sol-types.workspace     = true
 
+# bundler (eth_sendBundle) submission path
+reqwest.workspace    = true
+serde_json.workspace = true
+
 # async + diagnostics
 thiserror.workspace = true
 tokio.workspace     = true
