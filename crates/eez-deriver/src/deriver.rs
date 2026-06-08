@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
-use eez_driver::{BlockCommitterHandle, DeriveOutcome};
+use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT, BlockCommitterHandle, DeriveOutcome};
 use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Watcher, Submitter};
-use reth_chainspec::ChainSpec;
+use reth_chainspec::{ChainSpec, EthereumHardforks};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes, execute::BlockBuilder};
@@ -53,6 +53,8 @@ where
     l2_provider: Arc<L2>,
     submitter: Submitter,
     evm_config: EthEvmConfig,
+    /// Chainspec-aware deriver
+    chain_spec: Arc<ChainSpec>,
     deploy_block: u64,
     /// Shared canonical-head state — cursor + per-batch index +
     /// `finalized_l2`. The Deriver is the sole writer; the Composer
@@ -106,7 +108,7 @@ where
         deploy_block: u64,
         l1_head: Arc<L1CanonicalHead>,
     ) -> Self {
-        let evm_config = EthEvmConfig::new(chain_spec);
+        let evm_config = EthEvmConfig::new(Arc::clone(&chain_spec));
         Self {
             inner: Arc::new(Inner {
                 l1_watcher,
@@ -114,6 +116,7 @@ where
                 l2_provider,
                 submitter,
                 evm_config,
+                chain_spec,
                 deploy_block,
                 l1_head,
                 safe_l2_block: AtomicU64::new(0),
@@ -141,6 +144,8 @@ where
     ///
     /// If the `batches` mutex is poisoned.
     pub async fn catch_up(&self) -> DeriverResult<()> {
+        // Acquire lock to prevent sequencing during catch-up
+        let _guard = self.inner.committer.begin_reconcile().await;
         let local_head = self
             .inner
             .l2_provider
@@ -343,14 +348,21 @@ where
             .with_bundle_update()
             .build();
 
+        // Chainspec-aware deriver
+        // prevents STF mismatches w.r.t. payload builder
+        let chain_spec = &self.inner.chain_spec;
         let attributes = NextBlockEnvAttributes {
             timestamp,
             suggested_fee_recipient: Address::ZERO,
             prev_randao: B256::ZERO,
-            gas_limit: parent_header.gas_limit(),
-            parent_beacon_block_root: Some(B256::ZERO),
-            withdrawals: Some(alloy_eips::eip4895::Withdrawals::default()),
-            extra_data: Bytes::default(),
+            gas_limit: BUILDER_GAS_LIMIT,
+            parent_beacon_block_root: chain_spec
+                .is_cancun_active_at_timestamp(timestamp)
+                .then_some(B256::ZERO),
+            withdrawals: chain_spec
+                .is_shanghai_active_at_timestamp(timestamp)
+                .then(alloy_eips::eip4895::Withdrawals::default),
+            extra_data: Bytes::from_static(BUILDER_EXTRA_DATA),
             slot_number: None,
         };
 
@@ -555,6 +567,9 @@ where
             );
             return Ok(());
         }
+
+        // Acquire lock to prevent sequencing during multi-block derivation
+        let _guard = self.inner.committer.begin_reconcile().await;
 
         // Skip losers — L1's `_applyStateDeltas` (EEZ.sol:967) decides
         // the winner; `state_applied` mirrors `L2ExecutionPerformed`.

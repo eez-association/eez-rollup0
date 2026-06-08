@@ -11,6 +11,8 @@
 use core::fmt;
 use std::backtrace::Backtrace;
 
+use alloy_primitives::B256;
+
 /// Convenience [`Result`] alias used throughout the crate.
 pub type DriverResult<T> = Result<T, DriverError>;
 
@@ -38,6 +40,10 @@ pub(crate) enum ErrorKind {
     /// `BlockCommitter` actor task is gone (channel closed). The Sequencer
     /// can't recover; the caller (typically eez-node main) will log + exit.
     CommitterClosed,
+    /// Sequencer's snapshotted `parent_hash` no longer matches
+    /// `last_header` under the reconcile lock — Deriver advanced the
+    /// chain while we were waiting. Caller retries next tick.
+    StaleParent { expected: B256, actual: B256 },
 }
 
 impl DriverError {
@@ -67,6 +73,10 @@ impl DriverError {
 
     pub(crate) fn committer_closed() -> Self {
         Self::new(ErrorKind::CommitterClosed)
+    }
+
+    pub(crate) fn stale_parent(expected: B256, actual: B256) -> Self {
+        Self::new(ErrorKind::StaleParent { expected, actual })
     }
 
     fn new(kind: ErrorKind) -> Self {
@@ -107,6 +117,13 @@ impl DriverError {
         matches!(self.kind, ErrorKind::CommitterClosed)
     }
 
+    /// Sequencer's snapshot was stale by the time the actor checked;
+    /// caller should retry on the next tick.
+    #[must_use]
+    pub fn is_stale_parent(&self) -> bool {
+        matches!(self.kind, ErrorKind::StaleParent { .. })
+    }
+
     /// Returns the captured backtrace for diagnostics.
     pub fn backtrace(&self) -> &Backtrace {
         &self.backtrace
@@ -141,6 +158,13 @@ impl fmt::Display for DriverError {
             ErrorKind::EngineRpc(msg) => write!(f, "engine-API transport error: {msg}"),
             ErrorKind::CommitterClosed => {
                 write!(f, "block committer actor task has exited")
+            }
+            ErrorKind::StaleParent { expected, actual } => {
+                write!(
+                    f,
+                    "stale parent on sequence: snapshot was {expected}, last_header is now {actual} \
+                     (Deriver advanced the chain between read and FCU)"
+                )
             }
         }
     }

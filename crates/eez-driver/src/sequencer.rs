@@ -333,7 +333,26 @@ where
             let next_ts = parent_ts.saturating_add(BLOCK_TIME_SECS);
             let attrs = self.attributes.build(&last_header, next_ts);
             let timestamp = attrs.timestamp;
-            let outcome = self.committer.commit_sequenced(attrs).await?;
+            // Anchor the FCU on the parent we computed attrs against;
+            // if the Deriver moved the head while we waited for the
+            // reconcile lock, the actor returns StaleParent and we
+            // skip this tick rather than emit a drifted-timestamp block.
+            let parent_hash = last_header.hash();
+            let outcome = match self.committer.commit_sequenced(parent_hash, attrs).await {
+                Ok(outcome) => outcome,
+                Err(err) if err.is_stale_parent() => {
+                    event!(
+                        name: "eez.sequencer.stale_parent",
+                        Level::DEBUG,
+                        parent_hash = %parent_hash,
+                        attrs_timestamp = timestamp,
+                        parent_num,
+                        "deriver advanced the chain between snapshot and FCU; skipping this tick",
+                    );
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
             let block_number = outcome.header.number();
             let block_hash = outcome.header.hash();
 
