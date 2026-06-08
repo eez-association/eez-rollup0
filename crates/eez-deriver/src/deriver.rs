@@ -761,6 +761,8 @@ where
     ) -> DeriverResult<u64> {
         let mut tx_offset = 0usize;
         let mut replayed: u64 = 0;
+        let force_replay =
+            force_replay || !local_batch_boundary_matches(&self.inner.l2_provider, from_block)?;
         for (i, count) in decoded.block_tx_counts.iter().enumerate() {
             let l2_block = from_block + i as u64;
             let count_usize = usize::from(*count);
@@ -867,4 +869,30 @@ where
         .iter()
         .zip(expected_txs.iter())
         .all(|(l, e)| l == e))
+}
+
+/// `true` iff the first local block in a batch is anchored to the current
+/// local parent. `false` if the block is missing or sits on stale ancestry.
+fn local_batch_boundary_matches<L2>(l2_provider: &Arc<L2>, from_block: u64) -> DeriverResult<bool>
+where
+    L2: BlockReader<Header = alloy_consensus::Header>,
+{
+    let Some(local_block) = l2_provider
+        .block_by_number(from_block)
+        .map_err(DeriverError::l2_provider)?
+    else {
+        return Ok(false);
+    };
+    let parent_block = from_block.checked_sub(1).ok_or_else(|| {
+        DeriverError::l2_provider("cannot reconcile a batch starting at genesis block")
+    })?;
+    let expected_parent_hash = l2_provider
+        .sealed_header(parent_block)
+        .map_err(DeriverError::l2_provider)?
+        .ok_or_else(|| {
+            DeriverError::l2_provider(format!("local L2 header at {parent_block} missing"))
+        })?
+        .hash();
+
+    Ok(local_block.header().parent_hash == expected_parent_hash)
 }
