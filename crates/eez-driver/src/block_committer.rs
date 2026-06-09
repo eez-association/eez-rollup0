@@ -85,6 +85,9 @@ pub struct DeriveOutcome {
 pub struct BlockCommitterHandle<T: PayloadTypes> {
     sender: mpsc::Sender<CommitCommand<T>>,
     last_header: Arc<RwLock<SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>>>,
+    /// Held by Deriver across a whole batch reconcile; blocks
+    /// `commit_sequenced` so sequencer ticks can't interleave
+    reconcile_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<T: PayloadTypes> Clone for BlockCommitterHandle<T> {
@@ -92,6 +95,7 @@ impl<T: PayloadTypes> Clone for BlockCommitterHandle<T> {
         Self {
             sender: self.sender.clone(),
             last_header: Arc::clone(&self.last_header),
+            reconcile_lock: Arc::clone(&self.reconcile_lock),
         }
     }
 }
@@ -133,7 +137,13 @@ where
         Self {
             sender,
             last_header,
+            reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Hold across a multi-block reconcile to suppress concurrent `commit_sequenced`
+    pub async fn begin_reconcile(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.reconcile_lock).lock_owned().await
     }
 
     /// Clone of the actor's current canonical head mirror. Reflects the
@@ -155,14 +165,28 @@ where
     /// are unaffected — only [`Self::advance_safe_finalized`] moves
     /// those.
     ///
+    /// `parent_hash` is the head the caller computed `attrs.timestamp`
+    /// against; returns [`DriverError::is_stale_parent`] upon mismatch
+    /// prevents timestamp-drifted block.
+    ///
     /// # Errors
     ///
-    /// Propagates engine-API failures (`invalid_forkchoice`,
-    /// `invalid_payload`, transport) or `committer_closed`.
+    /// - [`DriverError::is_stale_parent`] on snapshot mismatch.
+    /// - Engine-API failures or `committer_closed`.
     pub async fn commit_sequenced(
         &self,
+        parent_hash: B256,
         attrs: EthPayloadAttributes,
     ) -> DriverResult<CommitOutcome<T>> {
+        // Prevents interleave with the Deriver's per-block reconcile.
+        let _guard = self.reconcile_lock.lock().await;
+        // Snapshot may have gone stale while we waited for the lock;
+        // `attrs.timestamp` was computed against `parent_hash`, so if
+        // the head moved we'd produce a drifted block.
+        let current_head = self.last_header.read().unwrap().hash();
+        if current_head != parent_hash {
+            return Err(DriverError::stale_parent(parent_hash, current_head));
+        }
         let (response_tx, response_rx) = oneshot::channel();
         self.sender
             .send(CommitCommand::Sequence {
