@@ -56,15 +56,23 @@ def wait_for_target_parent(target_hex: str | None) -> None:
         return
 
     target = int(target_hex, 16)
-    deadline = time.monotonic() + TARGET_WAIT_SECS
+    start = time.monotonic()
+    deadline = start + TARGET_WAIT_SECS
+    latest_seen: int | None = None
     while time.monotonic() < deadline:
         resp = rpc_call("eth_blockNumber")
         if "error" in resp:
             raise RuntimeError(f"eth_blockNumber: {resp['error']}")
         latest = int(resp["result"], 16)
+        latest_seen = latest
         if latest + 1 >= target:
             return
         time.sleep(POLL_SECS)
+    latest_msg = "unknown" if latest_seen is None else f"0x{latest_seen:x}"
+    raise TimeoutError(
+        f"target block {target_hex} not reached within {TARGET_WAIT_SECS}s "
+        f"(latest={latest_msg})"
+    )
 
 
 def handle_bundle(request_id: Any, params: list[Any]) -> dict[str, Any]:
