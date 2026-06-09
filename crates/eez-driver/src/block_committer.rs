@@ -63,7 +63,6 @@ pub enum ForkchoiceOutcome {
 
 enum CommitCommand<T: PayloadTypes> {
     Sequence {
-        parent_hash: B256,
         attrs: EthPayloadAttributes,
         response: oneshot::Sender<DriverResult<CommitOutcome<T>>>,
     },
@@ -209,7 +208,6 @@ where
         let (response_tx, response_rx) = oneshot::channel();
         self.sender
             .send(CommitCommand::Sequence {
-                parent_hash,
                 attrs,
                 response: response_tx,
             })
@@ -344,12 +342,8 @@ where
     async fn run(mut self) {
         while let Some(cmd) = self.receiver.recv().await {
             match cmd {
-                CommitCommand::Sequence {
-                    parent_hash,
-                    attrs,
-                    response,
-                } => {
-                    let result = self.process_sequence(parent_hash, attrs).await;
+                CommitCommand::Sequence { attrs, response } => {
+                    let result = self.process_sequence(attrs).await;
                     let _ = response.send(result);
                 }
                 CommitCommand::RefreshForkchoice { response } => {
@@ -490,16 +484,11 @@ where
 
     async fn process_sequence(
         &mut self,
-        parent_hash: B256,
         attrs: EthPayloadAttributes,
     ) -> DriverResult<CommitOutcome<T>> {
-        let actual_hash = self.last_header.read().unwrap().hash();
-        if actual_hash != parent_hash {
-            return Err(DriverError::stale_parent(parent_hash, actual_hash));
-        }
-
+        let head_block_hash = self.last_header.read().unwrap().hash();
         let state = ForkchoiceState {
-            head_block_hash: parent_hash,
+            head_block_hash,
             safe_block_hash: self.safe_hash,
             finalized_block_hash: self.finalized_hash,
         };
