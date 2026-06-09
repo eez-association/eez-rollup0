@@ -36,4 +36,4 @@ pub use l1_canonical_head::{BatchRecord, L1CanonicalHead};
 #[doc(inline)]
 pub use l1_watcher::{L1Event, L1Watcher, L1WatcherConfig};
 #[doc(inline)]
-pub use submitter::{HistoricalBatch, SendOutcome, Submitter};
+pub use submitter::{BundleTarget, HistoricalBatch, SendOutcome, Submitter};

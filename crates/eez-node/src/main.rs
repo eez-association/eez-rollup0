@@ -30,8 +30,12 @@ use eez_l1::{
 use eez_prover::MockEcdsaProver;
 use mimalloc::MiMalloc;
 use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
+use reth_node_builder::{Node, components::BasicPayloadServiceBuilder};
 use reth_node_ethereum::EthereumNode;
 use tracing::{Level, event};
+
+mod payload;
+use payload::EezPayloadBuilder;
 
 /// Per M-MIMALLOC-APPS — meaningful win on allocation-heavy workloads.
 #[global_allocator]
@@ -59,8 +63,18 @@ fn main() -> eyre::Result<()> {
             "launching eez-node with {{block_time.secs}}s block time",
         );
 
-        // Launch reth with all default Ethereum components.
-        let handle = builder.launch_node(EthereumNode::default()).await?;
+        // Launch reth, swapping the default payload builder for
+        // `EezPayloadBuilder` so gas_limit / extra_data come from our
+        // shared constants instead of `--builder.*` CLI flags.
+        let handle = builder
+            .with_types::<EthereumNode>()
+            .with_components(
+                EthereumNode::components()
+                    .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder)),
+            )
+            .with_add_ons(EthereumNode::default().add_ons())
+            .launch()
+            .await?;
 
         let chain_spec: Arc<_> = handle.node.chain_spec();
         let provider = handle.node.provider.clone();

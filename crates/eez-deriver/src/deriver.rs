@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
-use eez_driver::{BlockCommitterHandle, DeriveOutcome};
+use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT, BlockCommitterHandle, DeriveOutcome};
 use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Watcher, Submitter};
-use reth_chainspec::ChainSpec;
+use reth_chainspec::{ChainSpec, EthereumHardforks};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes, execute::BlockBuilder};
@@ -53,6 +53,8 @@ where
     l2_provider: Arc<L2>,
     submitter: Submitter,
     evm_config: EthEvmConfig,
+    /// Chainspec-aware deriver
+    chain_spec: Arc<ChainSpec>,
     deploy_block: u64,
     /// Shared canonical-head state — cursor + per-batch index +
     /// `finalized_l2`. The Deriver is the sole writer; the Composer
@@ -106,7 +108,7 @@ where
         deploy_block: u64,
         l1_head: Arc<L1CanonicalHead>,
     ) -> Self {
-        let evm_config = EthEvmConfig::new(chain_spec);
+        let evm_config = EthEvmConfig::new(Arc::clone(&chain_spec));
         Self {
             inner: Arc::new(Inner {
                 l1_watcher,
@@ -114,6 +116,7 @@ where
                 l2_provider,
                 submitter,
                 evm_config,
+                chain_spec,
                 deploy_block,
                 l1_head,
                 safe_l2_block: AtomicU64::new(0),
@@ -141,6 +144,8 @@ where
     ///
     /// If the `batches` mutex is poisoned.
     pub async fn catch_up(&self) -> DeriverResult<()> {
+        // Acquire lock to prevent sequencing during catch-up
+        let _guard = self.inner.committer.begin_reconcile().await;
         let local_head = self
             .inner
             .l2_provider
@@ -183,12 +188,16 @@ where
             let batch_first_l2 = cumulative_l2 + 1;
             let batch_last_l2 = cumulative_l2 + decoded.block_count() as u64;
 
+            // Catch-up always replays — the deriver is the authority on L2
+            // chain state during boot. Skips would trust whatever's locally
+            // canonical, which can be a Sequencer-race-produced block.
             total_replayed += self
                 .reconcile_batch_blocks(
                     batch_first_l2,
                     &decoded,
                     batch.l1_block_number,
                     batch.tx_hash,
+                    true,
                 )
                 .await?;
 
@@ -339,14 +348,21 @@ where
             .with_bundle_update()
             .build();
 
+        // Chainspec-aware deriver
+        // prevents STF mismatches w.r.t. payload builder
+        let chain_spec = &self.inner.chain_spec;
         let attributes = NextBlockEnvAttributes {
             timestamp,
             suggested_fee_recipient: Address::ZERO,
             prev_randao: B256::ZERO,
-            gas_limit: parent_header.gas_limit(),
-            parent_beacon_block_root: Some(B256::ZERO),
-            withdrawals: Some(alloy_eips::eip4895::Withdrawals::default()),
-            extra_data: Bytes::default(),
+            gas_limit: BUILDER_GAS_LIMIT,
+            parent_beacon_block_root: chain_spec
+                .is_cancun_active_at_timestamp(timestamp)
+                .then_some(B256::ZERO),
+            withdrawals: chain_spec
+                .is_shanghai_active_at_timestamp(timestamp)
+                .then(alloy_eips::eip4895::Withdrawals::default),
+            extra_data: Bytes::from_static(BUILDER_EXTRA_DATA),
             slot_number: None,
         };
 
@@ -552,6 +568,9 @@ where
             return Ok(());
         }
 
+        // Acquire lock to prevent sequencing during multi-block derivation
+        let _guard = self.inner.committer.begin_reconcile().await;
+
         // Skip losers — L1's `_applyStateDeltas` (EEZ.sol:967) decides
         // the winner; `state_applied` mirrors `L2ExecutionPerformed`.
         if !state_applied {
@@ -572,11 +591,11 @@ where
         let from_block = last_indexed_l2 + 1;
         let to_block = last_indexed_l2 + block_count;
 
-        // Per-block reconciliation: skip blocks that already match the
-        // batch, STF-replay the rest (reth fork-switches as needed). See
-        // `reconcile_batch_blocks` for the open transactional caveat.
+        // Per-block reconciliation: skip blocks whose tx lists already
+        // match the batch, and STF-replay the rest (reth fork-switches
+        // as needed).
         let replayed = self
-            .reconcile_batch_blocks(from_block, &decoded, l1_block_number, tx_hash)
+            .reconcile_batch_blocks(from_block, &decoded, l1_block_number, tx_hash, false)
             .await?;
         event!(
             name: "eez.deriver.reconcile.done",
@@ -742,7 +761,9 @@ where
     /// Per-block reconciliation against a decoded batch beginning at
     /// `from_block`: for each block, skip if local reth already holds the
     /// same tx list, otherwise STF-replay it (reth fork-switches via
-    /// `newPayload` + head-FCU). Returns the count of blocks replayed.
+    /// `newPayload` + head-FCU). Once any block in the batch is replayed,
+    /// replay every later block too so matching tx lists are rebuilt on the
+    /// new ancestry. Returns the count of blocks replayed.
     ///
     /// NOTE: not transactional. If a replay fails partway, earlier blocks
     /// are already committed to reth's canonical chain, leaving local L2
@@ -756,27 +777,35 @@ where
         decoded: &eez_payload_codec::DecodedBatch,
         l1_block_number: u64,
         tx_hash: B256,
+        force_replay: bool,
     ) -> DeriverResult<u64> {
         let mut tx_offset = 0usize;
         let mut replayed: u64 = 0;
+        let force_replay =
+            force_replay || !local_batch_boundary_matches(&self.inner.l2_provider, from_block)?;
         for (i, count) in decoded.block_tx_counts.iter().enumerate() {
             let l2_block = from_block + i as u64;
             let count_usize = usize::from(*count);
             let block_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
             tx_offset += count_usize;
-            let matched = local_block_matches(&self.inner.l2_provider, l2_block, block_txs)?;
+            let matched = if force_replay {
+                false
+            } else {
+                local_block_matches(&self.inner.l2_provider, l2_block, block_txs)?
+            };
+            let should_replay = force_replay || replayed > 0 || !matched;
             event!(
                 name: "eez.deriver.reconcile.block",
                 Level::DEBUG,
                 l1_block_number,
                 tx_hash = %tx_hash,
                 l2_block,
-                action = if matched { "skip" } else { "replay" },
+                action = if should_replay { "replay" } else { "skip" },
                 tx_count = block_txs.len(),
                 replayed_so_far = replayed,
                 "reconciling batch block",
             );
-            if matched {
+            if !should_replay {
                 continue;
             }
             self.replay_block(l2_block - 1, block_txs).await?;
@@ -829,11 +858,9 @@ where
     }
 }
 
-/// Returns `true` iff local reth has a block at `block_number` whose
-/// tx list (in encoded-2718 form) matches the given expected bytes.
-/// Returns `false` if local is missing the block or has different
-/// content — caller's signal to STF-replay this slot and let reth
-/// reorg if needed (fork-switch path).
+/// `true` iff local reth has a block at `block_number` whose tx list
+/// matches `expected_txs`. `false` if the block is missing or has
+/// different txs — caller's signal to STF-replay this slot.
 fn local_block_matches<L2>(
     l2_provider: &Arc<L2>,
     block_number: u64,
@@ -862,4 +889,30 @@ where
         .iter()
         .zip(expected_txs.iter())
         .all(|(l, e)| l == e))
+}
+
+/// `true` iff the first local block in a batch is anchored to the current
+/// local parent. `false` if the block is missing or sits on stale ancestry.
+fn local_batch_boundary_matches<L2>(l2_provider: &Arc<L2>, from_block: u64) -> DeriverResult<bool>
+where
+    L2: BlockReader<Header = alloy_consensus::Header>,
+{
+    let Some(local_block) = l2_provider
+        .block_by_number(from_block)
+        .map_err(DeriverError::l2_provider)?
+    else {
+        return Ok(false);
+    };
+    let parent_block = from_block.checked_sub(1).ok_or_else(|| {
+        DeriverError::l2_provider("cannot reconcile a batch starting at genesis block")
+    })?;
+    let expected_parent_hash = l2_provider
+        .sealed_header(parent_block)
+        .map_err(DeriverError::l2_provider)?
+        .ok_or_else(|| {
+            DeriverError::l2_provider(format!("local L2 header at {parent_block} missing"))
+        })?
+        .hash();
+
+    Ok(local_block.header().parent_hash == expected_parent_hash)
 }

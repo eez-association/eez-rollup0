@@ -49,44 +49,6 @@ impl<T: PayloadTypes> fmt::Debug for CommitOutcome<T> {
     }
 }
 
-/// Result of a parent-bound sequencer commit attempt.
-pub enum SequenceOutcome<T: PayloadTypes> {
-    /// The payload was built and committed against the requested parent.
-    Committed(CommitOutcome<T>),
-    /// The actor's head changed after attributes were built but before
-    /// the sequence command was processed. The caller should rebuild
-    /// attributes against `actual_*` and retry.
-    StaleParent {
-        expected_hash: B256,
-        expected_number: u64,
-        actual_hash: B256,
-        actual_number: u64,
-    },
-}
-
-impl<T: PayloadTypes> fmt::Debug for SequenceOutcome<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Committed(outcome) => f
-                .debug_tuple("SequenceOutcome::Committed")
-                .field(outcome)
-                .finish(),
-            Self::StaleParent {
-                expected_hash,
-                expected_number,
-                actual_hash,
-                actual_number,
-            } => f
-                .debug_struct("SequenceOutcome::StaleParent")
-                .field("expected_hash", expected_hash)
-                .field("expected_number", expected_number)
-                .field("actual_hash", actual_hash)
-                .field("actual_number", actual_number)
-                .finish(),
-        }
-    }
-}
-
 /// Follower unsafe-head forkchoice result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkchoiceOutcome {
@@ -101,10 +63,9 @@ pub enum ForkchoiceOutcome {
 
 enum CommitCommand<T: PayloadTypes> {
     Sequence {
-        expected_parent_hash: B256,
-        expected_parent_number: u64,
+        parent_hash: B256,
         attrs: EthPayloadAttributes,
-        response: oneshot::Sender<DriverResult<SequenceOutcome<T>>>,
+        response: oneshot::Sender<DriverResult<CommitOutcome<T>>>,
     },
     RefreshForkchoice {
         response: oneshot::Sender<DriverResult<()>>,
@@ -142,6 +103,9 @@ pub struct DeriveOutcome {
 pub struct BlockCommitterHandle<T: PayloadTypes> {
     sender: mpsc::Sender<CommitCommand<T>>,
     last_header: Arc<RwLock<SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>>>,
+    /// Held by Deriver across a whole batch reconcile; blocks
+    /// `commit_sequenced` so sequencer ticks can't interleave
+    reconcile_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<T: PayloadTypes> Clone for BlockCommitterHandle<T> {
@@ -149,6 +113,7 @@ impl<T: PayloadTypes> Clone for BlockCommitterHandle<T> {
         Self {
             sender: self.sender.clone(),
             last_header: Arc::clone(&self.last_header),
+            reconcile_lock: Arc::clone(&self.reconcile_lock),
         }
     }
 }
@@ -191,7 +156,13 @@ where
         Self {
             sender,
             last_header,
+            reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Hold across a multi-block reconcile to suppress concurrent `commit_sequenced`
+    pub async fn begin_reconcile(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.reconcile_lock).lock_owned().await
     }
 
     /// Clone of the actor's current canonical head mirror. Reflects the
@@ -209,25 +180,36 @@ where
     }
 
     /// Builds a payload with the given attributes if the actor's head
-    /// still matches `expected_parent_*`, commits it via `newPayload`,
-    /// and advances the head cursor. `safe` / `finalized` are unaffected
-    /// — only [`Self::advance_safe_finalized`] moves those.
+    /// still matches `parent_hash`, commits it via `newPayload`, and
+    /// advances the head cursor. `safe` / `finalized` are unaffected —
+    /// only [`Self::advance_safe_finalized`] moves those.
+    ///
+    /// `parent_hash` is the head the caller computed `attrs.timestamp`
+    /// against; returns [`DriverError::is_stale_parent`] upon mismatch
+    /// prevents timestamp-drifted block.
     ///
     /// # Errors
     ///
-    /// Propagates engine-API failures (`invalid_forkchoice`,
-    /// `invalid_payload`, transport) or `committer_closed`.
+    /// - [`DriverError::is_stale_parent`] on snapshot mismatch.
+    /// - Engine-API failures or `committer_closed`.
     pub async fn commit_sequenced(
         &self,
-        expected_parent_hash: B256,
-        expected_parent_number: u64,
+        parent_hash: B256,
         attrs: EthPayloadAttributes,
-    ) -> DriverResult<SequenceOutcome<T>> {
+    ) -> DriverResult<CommitOutcome<T>> {
+        // Prevents interleave with the Deriver's per-block reconcile.
+        let _guard = self.reconcile_lock.lock().await;
+        // Snapshot may have gone stale while we waited for the lock;
+        // `attrs.timestamp` was computed against `parent_hash`, so if
+        // the head moved we'd produce a drifted block.
+        let current_head = self.last_header.read().unwrap().hash();
+        if current_head != parent_hash {
+            return Err(DriverError::stale_parent(parent_hash, current_head));
+        }
         let (response_tx, response_rx) = oneshot::channel();
         self.sender
             .send(CommitCommand::Sequence {
-                expected_parent_hash,
-                expected_parent_number,
+                parent_hash,
                 attrs,
                 response: response_tx,
             })
@@ -363,14 +345,11 @@ where
         while let Some(cmd) = self.receiver.recv().await {
             match cmd {
                 CommitCommand::Sequence {
-                    expected_parent_hash,
-                    expected_parent_number,
+                    parent_hash,
                     attrs,
                     response,
                 } => {
-                    let result = self
-                        .process_sequence(expected_parent_hash, expected_parent_number, attrs)
-                        .await;
+                    let result = self.process_sequence(parent_hash, attrs).await;
                     let _ = response.send(result);
                 }
                 CommitCommand::RefreshForkchoice { response } => {
@@ -511,25 +490,16 @@ where
 
     async fn process_sequence(
         &mut self,
-        expected_parent_hash: B256,
-        expected_parent_number: u64,
+        parent_hash: B256,
         attrs: EthPayloadAttributes,
-    ) -> DriverResult<SequenceOutcome<T>> {
-        let (actual_hash, actual_number) = {
-            let current_parent = self.last_header.read().unwrap();
-            (current_parent.hash(), current_parent.number())
-        };
-        if actual_hash != expected_parent_hash || actual_number != expected_parent_number {
-            return Ok(SequenceOutcome::StaleParent {
-                expected_hash: expected_parent_hash,
-                expected_number: expected_parent_number,
-                actual_hash,
-                actual_number,
-            });
+    ) -> DriverResult<CommitOutcome<T>> {
+        let actual_hash = self.last_header.read().unwrap().hash();
+        if actual_hash != parent_hash {
+            return Err(DriverError::stale_parent(parent_hash, actual_hash));
         }
 
         let state = ForkchoiceState {
-            head_block_hash: actual_hash,
+            head_block_hash: parent_hash,
             safe_block_hash: self.safe_hash,
             finalized_block_hash: self.finalized_hash,
         };
@@ -564,7 +534,7 @@ where
 
         self.unsafe_head_hash = header.hash();
         *self.last_header.write().unwrap() = header.clone();
-        Ok(SequenceOutcome::Committed(CommitOutcome { header }))
+        Ok(CommitOutcome { header })
     }
 }
 

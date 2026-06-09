@@ -39,7 +39,7 @@ use reth_primitives_traits::{
 use reth_storage_api::BlockReader;
 use tracing::{Level, event};
 
-use crate::block_committer::{BlockCommitterHandle, SequenceOutcome};
+use crate::block_committer::BlockCommitterHandle;
 use crate::error::{DriverError, DriverResult};
 use crate::scheduler::{ProposalRequest, Scheduler};
 
@@ -59,11 +59,6 @@ const BLOCK_TIME_SECS: u64 = 2;
 /// in one scheduler tick before returning to the run-loop. Catch-up
 /// resumes next tick. 32 blocks / 2s tick ≈ 16 blocks/s.
 const MAX_BLOCKS_PER_TICK: usize = 32;
-
-/// Bound parent-rebuild attempts that do not produce a block. Keeps one
-/// scheduler tick from starving forkchoice refresh if another task keeps
-/// moving the canonical parent underneath the sequencer.
-const MAX_STALE_PARENT_RETRIES_PER_TICK: usize = MAX_BLOCKS_PER_TICK;
 
 /// Max speculative gap the Sequencer can run ahead of L1-confirmed
 /// cursor. Pauses beyond this so reth's state-retention
@@ -294,7 +289,6 @@ where
     async fn advance(&mut self, req: ProposalRequest) -> DriverResult<()> {
         let target_wall = req.target_timestamp;
         let mut produced: usize = 0;
-        let mut stale_parent_retries: usize = 0;
 
         while produced < MAX_BLOCKS_PER_TICK {
             // Read the current canonical head from the committer per
@@ -340,42 +334,24 @@ where
             let next_ts = parent_ts.saturating_add(BLOCK_TIME_SECS);
             let attrs = self.attributes.build(&last_header, next_ts);
             let timestamp = attrs.timestamp;
-            let outcome = self
-                .committer
-                .commit_sequenced(parent_hash, parent_num, attrs)
-                .await?;
-            let outcome = match outcome {
-                SequenceOutcome::Committed(outcome) => {
-                    stale_parent_retries = 0;
-                    outcome
-                }
-                SequenceOutcome::StaleParent {
-                    expected_hash,
-                    expected_number,
-                    actual_hash,
-                    actual_number,
-                } => {
-                    stale_parent_retries += 1;
+            // Anchor the FCU on the parent we computed attrs against;
+            // if the Deriver moved the head while we waited for the
+            // reconcile lock, the actor returns StaleParent and we
+            // skip this tick rather than emit a drifted-timestamp block.
+            let outcome = match self.committer.commit_sequenced(parent_hash, attrs).await {
+                Ok(outcome) => outcome,
+                Err(err) if err.is_stale_parent() => {
                     event!(
-                        name: "eez.sequencer.parent.stale",
+                        name: "eez.sequencer.stale_parent",
                         Level::DEBUG,
-                        expected_parent.number = expected_number,
-                        expected_parent.hash = %expected_hash,
-                        actual_parent.number = actual_number,
-                        actual_parent.hash = %actual_hash,
-                        "sequencer parent changed before commit; rebuilding attributes",
+                        parent_hash = %parent_hash,
+                        attrs_timestamp = timestamp,
+                        parent_num,
+                        "deriver advanced the chain between snapshot and FCU; skipping this tick",
                     );
-                    if stale_parent_retries >= MAX_STALE_PARENT_RETRIES_PER_TICK {
-                        event!(
-                            name: "eez.sequencer.parent.stale.yield",
-                            Level::DEBUG,
-                            retries = stale_parent_retries,
-                            "stale-parent retry budget exhausted; yielding scheduler tick",
-                        );
-                        break;
-                    }
-                    continue;
+                    break;
                 }
+                Err(err) => return Err(err),
             };
             let block_number = outcome.header.number();
             let block_hash = outcome.header.hash();

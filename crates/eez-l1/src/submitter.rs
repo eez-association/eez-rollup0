@@ -1,45 +1,76 @@
-//! Thin L1-interaction primitive: sends `postAndVerifyBatch` and reads
-//! past `BatchPosted` events. Stateless — no cursors, no batch
-//! construction, no prover orchestration. The [`Composer`](crate::Composer)
-//! owns all of that and calls into here.
+//! Thin L1-interaction primitive: sends `postAndVerifyBatch` via
+//! `eth_sendBundle` and reads past `BatchPosted` events. Stateless —
+//! the [`Composer`](crate::Composer) owns cursors, batch construction,
+//! and prover orchestration.
 //!
-//! Per-call: builds a fresh provider from
-//! [`SubmitterConfig`](crate::SubmitterConfig), pre-simulates via
-//! `eth_call` to surface typed reverts before broadcasting, sends, and
-//! awaits one confirmation within [`RECEIPT_TIMEOUT`].
+//! `eth_sendBundle` pins inclusion to one L1 block. If the bundle
+//! isn't in that block we report [`SendOutcome::Dropped`] and the
+//! Composer rebuilds on the next tick with a fresh target + nonce.
+//! Real Flashbots-style relays don't consume the nonce on miss; the
+//! anvil-side `scripts/builder-stub.py` does (it forwards via
+//! `eth_sendRawTransaction`), but the cursor-race guard +
+//! `pending` nonce read keep both paths correct.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_eips::BlockNumberOrTag;
-use alloy_network::EthereumWallet;
+use alloy_consensus::{Transaction, TxEip1559, TxEnvelope, TypedTransaction};
+use alloy_eips::{BlockNumberOrTag, Encodable2718};
+use alloy_network::{Ethereum, EthereumWallet, NetworkWallet};
+use alloy_primitives::{TxHash, TxKind, U256, hex};
 use alloy_provider::{Provider, ProviderBuilder};
-use alloy_rpc_types_eth::{Filter, TransactionTrait};
+use alloy_rpc_types_eth::Filter;
 use alloy_sol_types::{SolCall, SolEvent};
 use eez_prover::{EezRegistry, ProofSystemBatchPerVerificationEntries, StateDelta};
+use tracing::{Level, event};
 
 use crate::config::SubmitterConfig;
 use crate::error::{L1Error, L1Result};
 
-/// Upper bound on how long we wait for a postBatch tx to confirm.
-/// later we switch to bundler-routed submission.
-const RECEIPT_TIMEOUT: Duration = Duration::from_secs(45);
-
-/// Buffer to absorb some variance (for contentious txs)
+/// Buffer to absorb some variance (for contentious txs).
 const GAS_BUFFER_NUM: u128 = 3;
 const GAS_BUFFER_DEN: u128 = 2;
 
-/// Outcome of a successful [`Submitter::send`].
+/// `max_fee_per_gas` headroom over `estimate_eip1559_fees`
+const MAX_FEE_BUFFER_NUM: u128 = 2;
+const MAX_FEE_BUFFER_DEN: u128 = 1;
+
+/// Wall-clock cap on the target-block + inclusion check.
+const TARGET_WAIT_BUDGET: Duration = Duration::from_secs(30);
+const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// L1 block offset for [`BundleTarget::NextBlock`].
+const NEXT_BLOCK_SLACK: u64 = 2;
+
+/// Which L1 block the bundle should land in. Stage-3 passes
+/// [`BundleTarget::NextBlock`]; stage-4 will pick exact targets from
+/// the sync-slot scheduler.
 #[derive(Debug, Clone, Copy)]
-pub struct SendOutcome {
-    /// Tx hash of the broadcasted postBatch.
-    pub tx_hash: alloy_primitives::TxHash,
-    /// L1 block in which the tx landed.
-    pub l1_block: u64,
+pub enum BundleTarget {
+    /// Resolved to `latest + NEXT_BLOCK_SLACK` at send time.
+    NextBlock,
+    /// Caller-picked exact L1 block.
+    Exact(u64),
 }
 
-/// Thin L1-interaction primitive — send postBatch txs and read
-/// past `BatchPosted` events. Cheaply [`Clone`]able.
+/// One bundle attempt's outcome. `Dropped` is the expected miss path —
+/// caller rebuilds on the next tick.
+#[derive(Debug, Clone, Copy)]
+pub enum SendOutcome {
+    Included {
+        tx_hash: TxHash,
+        l1_block: u64,
+        /// Same L1 tx emitted `L2ExecutionPerformed` for our rollup,
+        /// i.e. the contract advanced its state root.
+        state_applied: bool,
+    },
+    Dropped {
+        tx_hash: TxHash,
+        target_block: u64,
+    },
+}
+
+/// Thin L1-interaction primitive. Cheaply [`Clone`]able.
 #[derive(Clone)]
 pub struct Submitter {
     inner: Arc<Inner>,
@@ -47,6 +78,7 @@ pub struct Submitter {
 
 struct Inner {
     config: SubmitterConfig,
+    http: reqwest::Client,
 }
 
 impl std::fmt::Debug for Submitter {
@@ -62,7 +94,10 @@ impl Submitter {
     #[must_use]
     pub fn new(config: SubmitterConfig) -> Self {
         Self {
-            inner: Arc::new(Inner { config }),
+            inner: Arc::new(Inner {
+                config,
+                http: reqwest::Client::new(),
+            }),
         }
     }
 
@@ -74,29 +109,26 @@ impl Submitter {
         self.inner.config.poster.address()
     }
 
-    /// Pre-simulate, broadcast, and await one confirmation for
-    /// `postAndVerifyBatch(batch)`.
+    /// Pre-simulate, sign, POST `eth_sendBundle`, observe target.
     ///
     /// # Errors
     ///
-    /// - [`L1Error::Submission`] on simulation revert, send failure,
-    ///   receipt-await timeout, or on-chain revert.
+    /// - [`L1Error::Submission`] on simulation revert or relay rejection.
+    /// - [`L1Error::Provider`] on RPC failure.
     pub async fn send(
         &self,
         batch: ProofSystemBatchPerVerificationEntries,
+        target: BundleTarget,
     ) -> L1Result<SendOutcome> {
         let provider = self.inner.build_provider();
+        let from = self.inner.config.poster.address();
         let eez = EezRegistry::new(self.inner.config.eez, &provider);
+        let call = eez.postAndVerifyBatch(batch).from(from);
 
-        let call_builder = eez.postAndVerifyBatch(batch);
-        call_builder
-            .call()
+        call.call()
             .await
             .map_err(|e| L1Error::Submission(format!("eth_call simulation reverted: {e}")))?;
-
-        // Apply the gas-limit buffer (see GAS_BUFFER_NUM/DEN docs above)
-        // so a contention-time heavier branch doesn't OOG mid-execution.
-        let estimated = call_builder
+        let estimated = call
             .estimate_gas()
             .await
             .map_err(|e| L1Error::Submission(format!("eth_estimateGas: {e}")))?;
@@ -106,30 +138,28 @@ impl Submitter {
                 .saturating_div(GAS_BUFFER_DEN),
         )
         .unwrap_or(u64::MAX);
-        let pending = call_builder
-            .gas(gas_limit)
-            .send()
-            .await
-            .map_err(|e| L1Error::Submission(format!("send: {e}")))?;
-        let tx_hash = *pending.tx_hash();
 
-        let receipt = pending
-            .with_required_confirmations(1)
-            .with_timeout(Some(RECEIPT_TIMEOUT))
-            .get_receipt()
-            .await
-            .map_err(|e| L1Error::Submission(format!("await receipt {tx_hash}: {e}")))?;
-        if !receipt.status() {
-            return Err(L1Error::Submission(format!(
-                "tx {tx_hash} reverted on-chain (gas used {})",
-                receipt.gas_used
-            )));
-        }
-        let l1_block = receipt.block_number.ok_or_else(|| {
-            L1Error::Submission(format!("receipt {tx_hash} missing block_number"))
-        })?;
+        let target_block = match target {
+            BundleTarget::Exact(n) => n,
+            BundleTarget::NextBlock => {
+                provider
+                    .get_block_number()
+                    .await
+                    .map_err(|e| L1Error::Provider(format!("get_block_number: {e}")))?
+                    + NEXT_BLOCK_SLACK
+            }
+        };
 
-        Ok(SendOutcome { tx_hash, l1_block })
+        let (envelope, tx_hash) = self
+            .inner
+            .sign(&provider, call.calldata().clone(), gas_limit)
+            .await?;
+        self.inner
+            .post_bundle(&hex::encode_prefixed(envelope.encoded_2718()), target_block)
+            .await?;
+        self.inner
+            .observe_target(&provider, tx_hash, target_block)
+            .await
     }
 
     /// Walks every past `BatchPosted` event from `deploy_block` to L1
@@ -191,10 +221,160 @@ pub struct HistoricalBatch {
 
 impl Inner {
     fn build_provider(&self) -> impl Provider + use<> {
-        let wallet = EthereumWallet::from(self.config.poster.clone());
+        // No wallet: writes go through the builder relay, reads
+        // don't need signing. Pre-sim sets `from` explicitly.
         ProviderBuilder::new()
-            .wallet(wallet)
+            .disable_recommended_fillers()
             .connect_http(self.config.rpc_url.clone())
+    }
+
+    async fn sign<P: Provider>(
+        &self,
+        provider: &P,
+        input: alloy_primitives::Bytes,
+        gas_limit: u64,
+    ) -> L1Result<(TxEnvelope, TxHash)> {
+        let from = self.config.poster.address();
+        let nonce = provider
+            .get_transaction_count(from)
+            .pending()
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_transaction_count: {e}")))?;
+        let chain_id = provider
+            .get_chain_id()
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_chain_id: {e}")))?;
+        let fees = provider
+            .estimate_eip1559_fees()
+            .await
+            .map_err(|e| L1Error::Provider(format!("estimate_eip1559_fees: {e}")))?;
+
+        let max_fee_per_gas = fees
+            .max_fee_per_gas
+            .saturating_mul(MAX_FEE_BUFFER_NUM)
+            .saturating_div(MAX_FEE_BUFFER_DEN);
+        let tx = TxEip1559 {
+            chain_id,
+            nonce,
+            gas_limit,
+            max_fee_per_gas,
+            max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+            to: TxKind::Call(self.config.eez),
+            value: U256::ZERO,
+            access_list: alloy_eips::eip2930::AccessList::default(),
+            input,
+        };
+        let wallet = EthereumWallet::from(self.config.poster.clone());
+        let envelope =
+            NetworkWallet::<Ethereum>::sign_transaction(&wallet, TypedTransaction::Eip1559(tx))
+                .await
+                .map_err(|e| L1Error::Submission(format!("sign envelope: {e}")))?;
+        let tx_hash = *envelope.tx_hash();
+        Ok((envelope, tx_hash))
+    }
+
+    async fn post_bundle(&self, raw_tx_hex: &str, target_block: u64) -> L1Result<()> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_sendBundle",
+            "params": [{ "txs": [raw_tx_hex], "blockNumber": format!("0x{target_block:x}") }],
+        });
+        let resp: serde_json::Value = self
+            .http
+            .post(self.config.builder_rpc_url.as_str())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| L1Error::Provider(format!("eth_sendBundle POST: {e}")))?
+            .error_for_status()
+            .map_err(|e| L1Error::Submission(format!("eth_sendBundle HTTP: {e}")))?
+            .json()
+            .await
+            .map_err(|e| L1Error::Provider(format!("eth_sendBundle decode: {e}")))?;
+        if let Some(err) = resp.get("error") {
+            return Err(L1Error::Submission(format!("eth_sendBundle: {err}")));
+        }
+        Ok(())
+    }
+
+    async fn observe_target<P: Provider>(
+        &self,
+        provider: &P,
+        tx_hash: TxHash,
+        target_block: u64,
+    ) -> L1Result<SendOutcome> {
+        let start = tokio::time::Instant::now();
+        loop {
+            let latest = provider
+                .get_block_number()
+                .await
+                .map_err(|e| L1Error::Provider(format!("get_block_number: {e}")))?;
+            if latest >= target_block {
+                break;
+            }
+            if start.elapsed() >= TARGET_WAIT_BUDGET {
+                return Ok(dropped(
+                    tx_hash,
+                    target_block,
+                    "target block not produced within budget",
+                ));
+            }
+            tokio::time::sleep(TARGET_POLL_INTERVAL).await;
+        }
+
+        // TODO: this reads the block at `target_block` height; if the
+        // chain reorgs out the original target between sign and observe,
+        // we'll inspect the replacement block — which may not contain
+        // our tx even though it was included in the orphaned one. Stage-3
+        // accepts the false-Dropped (composer rebuilds next tick); revisit
+        // when the prover commits to a specific L1 anchor.
+        let block = provider
+            .get_block_by_number(BlockNumberOrTag::Number(target_block))
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_block_by_number({target_block}): {e}")))?
+            .ok_or_else(|| {
+                L1Error::Provider(format!("block {target_block} missing after latest>=target"))
+            })?;
+        if !block.transactions.hashes().any(|h| h == tx_hash) {
+            return Ok(dropped(
+                tx_hash,
+                target_block,
+                "tx absent from target block",
+            ));
+        }
+
+        let winners = Filter::new()
+            .address(self.config.eez)
+            .event_signature(EezRegistry::L2ExecutionPerformed::SIGNATURE_HASH)
+            .topic1(U256::from(self.config.rollup_id))
+            .from_block(target_block)
+            .to_block(target_block);
+        let state_applied = provider
+            .get_logs(&winners)
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_logs(L2ExecutionPerformed): {e}")))?
+            .iter()
+            .any(|l| l.transaction_hash == Some(tx_hash));
+
+        Ok(SendOutcome::Included {
+            tx_hash,
+            l1_block: target_block,
+            state_applied,
+        })
+    }
+}
+
+fn dropped(tx_hash: TxHash, target_block: u64, reason: &'static str) -> SendOutcome {
+    event!(
+        name: "eez.submitter.bundle.dropped",
+        Level::WARN,
+        target_block,
+        tx_hash = %tx_hash,
+        reason,
+        "bundle dropped; composer will retry on next tick",
+    );
+    SendOutcome::Dropped {
+        tx_hash,
+        target_block,
     }
 }
 
@@ -206,7 +386,7 @@ pub(crate) fn our_state_delta(
     batch: &ProofSystemBatchPerVerificationEntries,
     rollup_id: u64,
 ) -> Option<&StateDelta> {
-    let rid = alloy_primitives::U256::from(rollup_id);
+    let rid = U256::from(rollup_id);
     batch
         .entries
         .iter()
