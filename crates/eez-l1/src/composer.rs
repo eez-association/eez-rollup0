@@ -27,7 +27,7 @@ use crate::config::ComposerConfig;
 use crate::error::{L1Error, L1Result};
 use crate::l1_canonical_head::L1CanonicalHead;
 use crate::l1_watcher::{L1Event, L1Watcher};
-use crate::submitter::{SendOutcome, Submitter};
+use crate::submitter::{BundleTarget, SendOutcome, Submitter};
 
 /// Maximum L2 block count any single postBatch tx may cover.
 ///
@@ -131,13 +131,22 @@ where
                             posted_through = posted,
                             "no new L2 blocks to post",
                         ),
-                        Ok(Outcome::Posted { from, to, tx_hash, l1_block }) => event!(
+                        Ok(Outcome::Posted { from, to, tx_hash, l1_block, state_applied }) => event!(
                             name: "eez.composer.batch.posted",
                             Level::INFO,
                             from, to,
                             tx_hash = %tx_hash,
                             l1_block,
+                            state_applied,
                             "posted batch [{{from}}, {{to}}] in L1 block {{l1_block}}",
+                        ),
+                        Ok(Outcome::BundleDropped { from, to, tx_hash, target_block }) => event!(
+                            name: "eez.composer.batch.bundle_dropped",
+                            Level::WARN,
+                            from, to,
+                            tx_hash = %tx_hash,
+                            target_block,
+                            "bundle missed target block; will rebuild + retry next tick",
                         ),
                         Ok(Outcome::CursorRaced { from, to, expected_cursor, actual_cursor }) => event!(
                             name: "eez.composer.batch.cursor_raced",
@@ -174,6 +183,15 @@ enum Outcome {
         to: u64,
         tx_hash: alloy_primitives::TxHash,
         l1_block: u64,
+        state_applied: bool,
+    },
+    /// Target L1 block was produced without our tx in it; next tick
+    /// re-reads the cursor and rebuilds with a fresh target + nonce.
+    BundleDropped {
+        from: u64,
+        to: u64,
+        tx_hash: alloy_primitives::TxHash,
+        target_block: u64,
     },
     /// Our cursor advanced between batch-build and submit (a peer's
     /// batch landed and the Deriver indexed it). Our batch's payload
@@ -261,17 +279,30 @@ where
             });
         }
 
-        let SendOutcome { tx_hash, l1_block } = self.submitter.send(batch).await?;
-        // Note: the posted_through advance happens via the
-        // L1Event::BatchPosted subscriber when L1Watcher observes our
-        // tx land. We don't store here to keep external + own batches
-        // on one code path.
-        Ok(Outcome::Posted {
-            from,
-            to,
-            tx_hash,
-            l1_block,
-        })
+        // posted_through advance happens via the L1Event::BatchPosted
+        // subscriber so external + own batches share one code path.
+        match self.submitter.send(batch, BundleTarget::NextBlock).await? {
+            SendOutcome::Included {
+                tx_hash,
+                l1_block,
+                state_applied,
+            } => Ok(Outcome::Posted {
+                from,
+                to,
+                tx_hash,
+                l1_block,
+                state_applied,
+            }),
+            SendOutcome::Dropped {
+                tx_hash,
+                target_block,
+            } => Ok(Outcome::BundleDropped {
+                from,
+                to,
+                tx_hash,
+                target_block,
+            }),
+        }
     }
 
     /// Diagnostic-only handler for L1 events. State (cursor + reorg

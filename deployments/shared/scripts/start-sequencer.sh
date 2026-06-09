@@ -29,6 +29,11 @@ set +a
 [[ -n "${EEZ_NODE_COMPOSER_DISABLED:-}" ]] && export EEZ_COMPOSER_DISABLED="$EEZ_NODE_COMPOSER_DISABLED"
 [[ -n "${EEZ_NODE_SEQUENCER_DISABLED:-}" ]] && export EEZ_SEQUENCER_DISABLED="$EEZ_NODE_SEQUENCER_DISABLED"
 
+# Local devnets do not run a separate builder relay. Use the L1 RPC endpoint
+# unless a deployment explicitly supplies a builder URL.
+: "${EEZ_L1_BUILDER_RPC_URL:=${EEZ_L1_RPC_URL:-}}"
+export EEZ_L1_BUILDER_RPC_URL
+
 GENESIS_PATH="${EEZ_NODE_L2_GENESIS_PATH:-${EEZ_L2_GENESIS_PATH:-/shared/genesis-l2.json}}"
 DATADIR="${EEZ_NODE_DATADIR:-/data}"
 
@@ -41,6 +46,7 @@ echo "start-sequencer: ${NODE_NAME}"
 echo "  genesis     = ${GENESIS_PATH}"
 echo "  datadir     = ${DATADIR}"
 echo "  l1 rpc      = ${EEZ_L1_RPC_URL:-unset}"
+echo "  builder rpc = ${EEZ_L1_BUILDER_RPC_URL:-unset}"
 echo "  poster      = $(cast wallet address --private-key "$EEZ_L1_POSTER_KEY" 2>/dev/null || echo unknown)"
 echo "  external    = ${EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES:-false}"
 echo "  interval    = ${EEZ_COMPOSER_INTERVAL_SECS:-60}s"
@@ -57,5 +63,5 @@ exec eez-node node \
     --ws.addr=0.0.0.0 \
     --ws.port=8546 \
     --ws.api=debug,trace,txpool,eth,net,web3 \
-    --builder.extradata "" \
-    --builder.gaslimit 30000000
+    --engine.persistence-threshold 256 \
+    --engine.memory-block-buffer-target 128

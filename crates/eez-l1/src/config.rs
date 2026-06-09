@@ -17,6 +17,7 @@ use url::Url;
 use crate::error::{L1Error, L1Result};
 
 const ENV_RPC_URL: &str = "EEZ_L1_RPC_URL";
+const ENV_BUILDER_RPC_URL: &str = "EEZ_L1_BUILDER_RPC_URL";
 const ENV_POSTER_KEY: &str = "EEZ_L1_POSTER_KEY";
 const ENV_EEZ_ADDRESS: &str = "EEZ_REGISTRY_ADDRESS";
 const ENV_PROOF_SYSTEM_ADDRESS: &str = "EEZ_MOCK_PROOF_SYSTEM_ADDRESS";
@@ -33,6 +34,9 @@ const DEFAULT_INTERVAL_SECS: u64 = 60;
 pub struct SubmitterConfig {
     /// L1 RPC endpoint (HTTP / HTTPS).
     pub rpc_url: Url,
+    /// L1 builder relay accepting `eth_sendBundle`. All postBatch txs
+    /// go here; `rpc_url` is used for reads only.
+    pub builder_rpc_url: Url,
     /// EOA that signs L1 txs (pays gas).
     pub poster: PrivateKeySigner,
     /// Deployed `EEZ` (rollups registry) address.
@@ -47,6 +51,7 @@ impl std::fmt::Debug for SubmitterConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SubmitterConfig")
             .field("rpc_url", &self.rpc_url.as_str())
+            .field("builder_rpc_url", &self.builder_rpc_url.as_str())
             .field("poster", &self.poster.address())
             .field("eez", &self.eez)
             .field("rollup_id", &self.rollup_id)
@@ -64,6 +69,7 @@ impl SubmitterConfig {
     pub fn from_env() -> L1Result<Self> {
         Ok(Self {
             rpc_url: parse_url(ENV_RPC_URL)?,
+            builder_rpc_url: parse_url(ENV_BUILDER_RPC_URL)?,
             poster: parse_key(ENV_POSTER_KEY)?,
             eez: parse_address(ENV_EEZ_ADDRESS)?,
             rollup_id: parse_u64(ENV_ROLLUP_ID)?,

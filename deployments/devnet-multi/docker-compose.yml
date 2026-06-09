@@ -29,6 +29,8 @@ x-sequencer-common: &sequencer-common
   depends_on:
     deploy:
       condition: service_completed_successfully
+    builder:
+      condition: service_started
   healthcheck: *sequencer-healthcheck
 
 services:
@@ -53,6 +55,20 @@ services:
       - "9656:8546"
     volumes:
       - l1-data:/data
+
+  builder:
+    build:
+      context: ../..
+      dockerfile: deployments/shared/Dockerfile
+      target: deploy
+    image: eez-rollup0:deploy
+    command:
+      - -lc
+      - /app/scripts/builder-stub.py
+    environment:
+      EEZ_BUILDER_STUB_L1_RPC_URL: http://l1:8545
+    depends_on:
+      - l1
 
   deploy:
     build:
@@ -118,7 +134,7 @@ services:
     <<: *sequencer-common
     environment:
       EEZ_NODE_NAME: sequencer3
-      EEZ_NODE_L1_POSTER_KEY: 0x5de4111a759a5f9f3f84f1754ad0f3657b6d6f0b12f1b1bdb4a651bd0f3418e0
+      EEZ_NODE_L1_POSTER_KEY: 0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
       EEZ_NODE_COMPOSER_INTERVAL_SECS: "23"
       EEZ_NODE_COMPOSER_EXPECT_EXTERNAL_BATCHES: "true"
     ports:
@@ -133,7 +149,7 @@ services:
     <<: *sequencer-common
     environment:
       EEZ_NODE_NAME: sequencer4
-      EEZ_NODE_L1_POSTER_KEY: 0x7c85211829459a3d817f3efc8b234a6fc13bdf1cf88663050b89b780ba0d14bb
+      EEZ_NODE_L1_POSTER_KEY: 0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6
       EEZ_NODE_COMPOSER_INTERVAL_SECS: "29"
       EEZ_NODE_COMPOSER_EXPECT_EXTERNAL_BATCHES: "true"
     ports:

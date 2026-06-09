@@ -2812,8 +2812,10 @@ dependencies = [
  "eez-driver",
  "eez-payload-codec",
  "eez-prover",
+ "reqwest 0.12.28",
  "reth-primitives-traits",
  "reth-storage-api",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2836,8 +2838,14 @@ dependencies = [
  "mimalloc",
  "reth-chainspec",
  "reth-ethereum-cli",
+ "reth-ethereum-engine-primitives",
+ "reth-ethereum-payload-builder",
+ "reth-ethereum-primitives",
+ "reth-evm",
+ "reth-node-api",
  "reth-node-builder",
  "reth-node-ethereum",
+ "reth-transaction-pool",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
@@ -3783,6 +3791,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -6242,6 +6251,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
