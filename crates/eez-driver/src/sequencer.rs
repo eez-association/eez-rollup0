@@ -351,7 +351,19 @@ where
             if self.speculative_limit_paused(last_header.number()) {
                 break;
             }
-            self.commit_one(SlotKind::Live, &last_header).await?;
+            match self.commit_one(SlotKind::Live, &last_header).await {
+                Ok(()) => {}
+                Err(err) if err.is_stale_parent() => {
+                    event!(
+                        name: "eez.sequencer.stale_parent",
+                        Level::DEBUG,
+                        parent_hash = %last_header.hash(),
+                        "deriver advanced the chain between snapshot and FCU; breaking backfill loop",
+                    );
+                    break;
+                }
+                Err(err) => return Err(err),
+            }
             produced += 1;
         }
 
@@ -398,7 +410,19 @@ where
                     if self.speculative_limit_paused(last_header.number()) {
                         break;
                     }
-                    self.commit_one(SlotKind::Live, &last_header).await?;
+                    match self.commit_one(SlotKind::Live, &last_header).await {
+                        Ok(()) => {}
+                        Err(err) if err.is_stale_parent() => {
+                            event!(
+                                name: "eez.sequencer.stale_parent",
+                                Level::DEBUG,
+                                parent_hash = %last_header.hash(),
+                                "deriver advanced during catchup; bailing this trigger",
+                            );
+                            return Ok(());
+                        }
+                        Err(err) => return Err(err),
+                    }
                 }
             }
             SlotComposition::Slot { live, future } => {
@@ -407,11 +431,35 @@ where
                     if self.speculative_limit_paused(last_header.number()) {
                         return Ok(()); // Defer Future + Sync to next trigger.
                     }
-                    self.commit_one(SlotKind::Live, &last_header).await?;
+                    match self.commit_one(SlotKind::Live, &last_header).await {
+                        Ok(()) => {}
+                        Err(err) if err.is_stale_parent() => {
+                            event!(
+                                name: "eez.sequencer.stale_parent",
+                                Level::DEBUG,
+                                parent_hash = %last_header.hash(),
+                                "deriver advanced during Slot.live; bailing this trigger",
+                            );
+                            return Ok(());
+                        }
+                        Err(err) => return Err(err),
+                    }
                 }
                 for _ in 0..future {
                     let last_header = self.committer.last_header();
-                    self.commit_one(SlotKind::Future, &last_header).await?;
+                    match self.commit_one(SlotKind::Future, &last_header).await {
+                        Ok(()) => {}
+                        Err(err) if err.is_stale_parent() => {
+                            event!(
+                                name: "eez.sequencer.stale_parent",
+                                Level::DEBUG,
+                                parent_hash = %last_header.hash(),
+                                "deriver advanced during Slot.future; bailing this trigger",
+                            );
+                            return Ok(());
+                        }
+                        Err(err) => return Err(err),
+                    }
                 }
                 let last_header = self.committer.last_header();
                 let expected_sync_ts = last_header
@@ -449,7 +497,19 @@ where
                     );
                 }
 
-                self.commit_one(SlotKind::Sync, &last_header).await?;
+                match self.commit_one(SlotKind::Sync, &last_header).await {
+                    Ok(()) => {}
+                    Err(err) if err.is_stale_parent() => {
+                        event!(
+                            name: "eez.sequencer.stale_parent",
+                            Level::DEBUG,
+                            parent_hash = %last_header.hash(),
+                            "deriver advanced during Slot.sync; bailing this trigger",
+                        );
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         }
         Ok(())
@@ -486,11 +546,12 @@ where
         kind: SlotKind,
         parent: &SealedHeader<ChainSpec::Header>,
     ) -> DriverResult<()> {
+        let parent_hash = parent.hash();
         let parent_ts = parent.timestamp();
         let next_ts = parent_ts.saturating_add(self.timing.l2_block_time().as_secs());
         let attrs = self.attributes.build(parent, next_ts);
         let timestamp = attrs.timestamp;
-        let outcome = self.committer.commit_sequenced(attrs).await?;
+        let outcome = self.committer.commit_sequenced(parent_hash, attrs).await?;
         let block_number = outcome.header.number();
         let block_hash = outcome.header.hash();
 

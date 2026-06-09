@@ -11,6 +11,8 @@
 use core::fmt;
 use std::backtrace::Backtrace;
 
+use alloy_primitives::B256;
+
 /// Convenience [`Result`] alias used throughout the crate.
 pub type DriverResult<T> = Result<T, DriverError>;
 
@@ -41,6 +43,10 @@ pub(crate) enum ErrorKind {
     /// `RollupTiming` env loading or validation failed (operator misconfig
     /// at startup). The Sequencer refuses to start.
     TimingConfig(String),
+    /// Sequencer's snapshotted `parent_hash` no longer matches
+    /// `last_header` under the reconcile lock — Deriver advanced the
+    /// chain while we were waiting. Caller retries next tick.
+    StaleParent { expected: B256, actual: B256 },
 }
 
 impl DriverError {
@@ -74,6 +80,10 @@ impl DriverError {
 
     pub(crate) fn timing_config(detail: impl Into<String>) -> Self {
         Self::new(ErrorKind::TimingConfig(detail.into()))
+    }
+
+    pub(crate) fn stale_parent(expected: B256, actual: B256) -> Self {
+        Self::new(ErrorKind::StaleParent { expected, actual })
     }
 
     fn new(kind: ErrorKind) -> Self {
@@ -121,6 +131,13 @@ impl DriverError {
         matches!(self.kind, ErrorKind::TimingConfig(_))
     }
 
+    /// Sequencer's snapshot was stale by the time the actor checked;
+    /// caller should retry on the next tick.
+    #[must_use]
+    pub fn is_stale_parent(&self) -> bool {
+        matches!(self.kind, ErrorKind::StaleParent { .. })
+    }
+
     /// Returns the captured backtrace for diagnostics.
     pub fn backtrace(&self) -> &Backtrace {
         &self.backtrace
@@ -158,6 +175,13 @@ impl fmt::Display for DriverError {
             }
             ErrorKind::TimingConfig(detail) => {
                 write!(f, "RollupTiming misconfig: {detail}")
+            }
+            ErrorKind::StaleParent { expected, actual } => {
+                write!(
+                    f,
+                    "stale parent on sequence: snapshot was {expected}, last_header is now {actual} \
+                     (Deriver advanced the chain between read and FCU)"
+                )
             }
         }
     }

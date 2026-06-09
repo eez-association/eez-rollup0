@@ -36,9 +36,13 @@ use eez_l1::{
 use eez_prover::MockEcdsaProver;
 use mimalloc::MiMalloc;
 use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
+use reth_node_builder::components::BasicPayloadServiceBuilder;
 use reth_node_ethereum::EthereumNode;
 use tokio::sync::mpsc;
 use tracing::{Level, event};
+
+mod payload;
+use payload::EezPayloadBuilder;
 
 /// Per M-MIMALLOC-APPS — meaningful win on allocation-heavy workloads.
 #[global_allocator]
@@ -127,10 +131,23 @@ fn main() -> eyre::Result<()> {
             );
         }
 
-        // Launch reth with the IngressLayer attached to its RPC stack.
+        // Launch reth with two layered modifications:
+        // 1. Payload service swap (PR #9): `EezPayloadBuilder` provides
+        //    `gas_limit` / `extra_data` from shared constants in
+        //    `eez-driver` so the deriver's `execute_block` and the
+        //    sequencer's payload builder produce byte-identical headers.
+        //    Replaces the old `--builder.extradata` / `--builder.gaslimit`
+        //    CLI flag pattern (those flags are still accepted but
+        //    shadowed by what `EezPayloadBuilder` writes).
+        // 2. IngressLayer middleware on the RPC stack: held-pool +
+        //    classifier route cross-chain user_tx submissions to the
+        //    composer's HeldPool instead of reth's mempool.
         let handle = builder
             .with_types::<EthereumNode>()
-            .with_components(EthereumNode::components())
+            .with_components(
+                EthereumNode::components()
+                    .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder)),
+            )
             .with_add_ons(
                 reth_node_ethereum::node::EthereumAddOns::default()
                     .with_rpc_middleware(ingress::IngressLayer::new(
