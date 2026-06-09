@@ -32,6 +32,10 @@ set +a
 # Local devnets do not run a separate builder relay. Use the L1 RPC endpoint
 # unless a deployment explicitly supplies a builder URL.
 : "${EEZ_L1_BUILDER_RPC_URL:=${EEZ_L1_RPC_URL:-}}"
+[[ -n "$EEZ_L1_BUILDER_RPC_URL" ]] || {
+    echo "start-sequencer: EEZ_L1_RPC_URL or EEZ_L1_BUILDER_RPC_URL must be set" >&2
+    exit 1
+}
 export EEZ_L1_BUILDER_RPC_URL
 
 GENESIS_PATH="${EEZ_NODE_L2_GENESIS_PATH:-${EEZ_L2_GENESIS_PATH:-/shared/genesis-l2.json}}"
@@ -47,7 +51,7 @@ echo "  genesis     = ${GENESIS_PATH}"
 echo "  datadir     = ${DATADIR}"
 echo "  l1 rpc      = ${EEZ_L1_RPC_URL:-unset}"
 echo "  builder rpc = ${EEZ_L1_BUILDER_RPC_URL:-unset}"
-echo "  poster      = $(cast wallet address --private-key "$EEZ_L1_POSTER_KEY" 2>/dev/null || echo unknown)"
+echo "  poster      = $(cast wallet address --private-key "${EEZ_L1_POSTER_KEY:-}" 2>/dev/null || echo unknown)"
 echo "  external    = ${EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES:-false}"
 echo "  interval    = ${EEZ_COMPOSER_INTERVAL_SECS:-60}s"
 

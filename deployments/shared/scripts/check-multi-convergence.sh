@@ -10,6 +10,7 @@ START_BLOCK="${EEZ_CONVERGENCE_START_BLOCK:-1}"
 SAFE_LAG_LIMIT="${EEZ_CONVERGENCE_SAFE_LAG_LIMIT:-24}"
 EXIT_ON_DIVERGENCE="${EEZ_CONVERGENCE_EXIT_ON_DIVERGENCE:-1}"
 EXPECT_DIVERGENCE="${EEZ_CONVERGENCE_EXPECT_DIVERGENCE:-0}"
+RPC_TIMEOUT_SECS="${EEZ_CONVERGENCE_RPC_TIMEOUT_SECS:-5}"
 
 require() {
     command -v "$1" >/dev/null 2>&1 || {
@@ -38,7 +39,7 @@ to_dec() {
 block_json() {
     local rpc="$1"
     local tag="$2"
-    cast rpc --rpc-url "$rpc" eth_getBlockByNumber "$tag" false
+    cast rpc --rpc-url "$rpc" --rpc-timeout "$RPC_TIMEOUT_SECS" eth_getBlockByNumber "$tag" false
 }
 
 block_field() {
@@ -84,7 +85,7 @@ echo "check-multi-convergence: targets"
 for i in "${!RPCS[@]}"; do
     echo "  - ${NAMES[$i]} ${RPCS[$i]}"
 done
-echo "check-multi-convergence: rounds=${ROUNDS} interval=${INTERVAL_SECS}s lag_blocks=${LAG_BLOCKS} safe_lag_limit=${SAFE_LAG_LIMIT}"
+echo "check-multi-convergence: rounds=${ROUNDS} interval=${INTERVAL_SECS}s lag_blocks=${LAG_BLOCKS} safe_lag_limit=${SAFE_LAG_LIMIT} rpc_timeout=${RPC_TIMEOUT_SECS}s"
 
 round=0
 while true; do
