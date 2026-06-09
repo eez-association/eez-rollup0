@@ -24,7 +24,7 @@ use reth_engine_primitives::{BeaconForkChoiceUpdateError, ConsensusEngineHandle}
 use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{BuiltPayload, ExecutionPayload, PayloadKind, PayloadTypes};
-use reth_primitives_traits::{AlloyBlockHeader, SealedHeader, SealedHeaderFor};
+use reth_primitives_traits::{SealedHeader, SealedHeaderFor};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{DriverError, DriverResult};

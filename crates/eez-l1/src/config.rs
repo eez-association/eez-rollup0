@@ -85,8 +85,10 @@ impl SubmitterConfig {
     /// Returns [`L1Error::Config`] for any missing required read-side var
     /// or malformed value.
     pub fn from_env_read_only() -> L1Result<Self> {
+        let rpc_url = parse_url(ENV_RPC_URL)?;
         Ok(Self {
-            rpc_url: parse_url(ENV_RPC_URL)?,
+            rpc_url: rpc_url.clone(),
+            builder_rpc_url: rpc_url,
             poster: parse_key_or_dummy(ENV_POSTER_KEY)?,
             eez: parse_address(ENV_EEZ_ADDRESS)?,
             rollup_id: parse_u64(ENV_ROLLUP_ID)?,
