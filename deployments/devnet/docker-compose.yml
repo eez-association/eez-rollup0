@@ -21,6 +21,20 @@ services:
     volumes:
       - l1-data:/data
 
+  builder:
+    build:
+      context: ../..
+      dockerfile: deployments/shared/Dockerfile
+      target: deploy
+    image: eez-rollup0:deploy
+    command:
+      - -lc
+      - /app/scripts/builder-stub.py
+    environment:
+      EEZ_BUILDER_STUB_L1_RPC_URL: http://l1:8545
+    depends_on:
+      - l1
+
   deploy:
     build:
       context: ../..
@@ -72,6 +86,8 @@ services:
     depends_on:
       deploy:
         condition: service_completed_successfully
+      builder:
+        condition: service_started
     healthcheck:
       test:
         - CMD

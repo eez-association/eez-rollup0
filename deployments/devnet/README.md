@@ -2,7 +2,8 @@
 
 Local Stage 2 devnet: starts an L1 `reth --dev`, deploys the EEZ registry,
 mock proof system, rollup manager, and rollup id with `scripts/deploy.sh`,
-then starts the L2 sequencer/composer against that L1.
+starts a local `eth_sendBundle` builder shim, then starts the L2
+sequencer/composer against that L1.
 
 ## Quick Start
 
