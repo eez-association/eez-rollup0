@@ -85,8 +85,8 @@ impl Default for AnvilConfig {
 
 impl AnvilConfig {
     /// 1s block time, hardhat mnemonic, cancun hardfork, 30M gas.
-    /// (The team's smoke-e.sh uses 5s to mirror chiado; tests prefer
-    /// speed over fidelity. 1s blocks + cancun still permit anvil_reorg.)
+    /// (The team's `smoke-e.sh` uses 5s to mirror chiado; tests prefer
+    /// speed over fidelity. 1s blocks + cancun still permit `anvil_reorg`.)
     pub fn for_reorg() -> Self {
         Self {
             block_time_secs: 1,
