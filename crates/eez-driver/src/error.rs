@@ -11,6 +11,8 @@
 use core::fmt;
 use std::backtrace::Backtrace;
 
+use alloy_primitives::B256;
+
 /// Convenience [`Result`] alias used throughout the crate.
 pub type DriverResult<T> = Result<T, DriverError>;
 
@@ -35,6 +37,13 @@ pub(crate) enum ErrorKind {
     PayloadMissing,
     /// Engine-API RPC transport error.
     EngineRpc(String),
+    /// `BlockCommitter` actor task is gone (channel closed). The Sequencer
+    /// can't recover; the caller (typically eez-node main) will log + exit.
+    CommitterClosed,
+    /// Sequencer's snapshotted `parent_hash` no longer matches
+    /// `last_header` under the reconcile lock — Deriver advanced the
+    /// chain while we were waiting. Caller retries next tick.
+    StaleParent { expected: B256, actual: B256 },
 }
 
 impl DriverError {
@@ -60,6 +69,14 @@ impl DriverError {
 
     pub(crate) fn engine_rpc(err: impl fmt::Display) -> Self {
         Self::new(ErrorKind::EngineRpc(err.to_string()))
+    }
+
+    pub(crate) fn committer_closed() -> Self {
+        Self::new(ErrorKind::CommitterClosed)
+    }
+
+    pub(crate) fn stale_parent(expected: B256, actual: B256) -> Self {
+        Self::new(ErrorKind::StaleParent { expected, actual })
     }
 
     fn new(kind: ErrorKind) -> Self {
@@ -91,6 +108,20 @@ impl DriverError {
     #[must_use]
     pub fn is_invalid_payload(&self) -> bool {
         matches!(self.kind, ErrorKind::InvalidPayload(_))
+    }
+
+    /// Returns true if the `BlockCommitter` actor task has exited and
+    /// can no longer receive commands.
+    #[must_use]
+    pub fn is_committer_closed(&self) -> bool {
+        matches!(self.kind, ErrorKind::CommitterClosed)
+    }
+
+    /// Sequencer's snapshot was stale by the time the actor checked;
+    /// caller should retry on the next tick.
+    #[must_use]
+    pub fn is_stale_parent(&self) -> bool {
+        matches!(self.kind, ErrorKind::StaleParent { .. })
     }
 
     /// Returns the captured backtrace for diagnostics.
@@ -125,6 +156,16 @@ impl fmt::Display for DriverError {
                 write!(f, "payload builder returned no payload for issued id")
             }
             ErrorKind::EngineRpc(msg) => write!(f, "engine-API transport error: {msg}"),
+            ErrorKind::CommitterClosed => {
+                write!(f, "block committer actor task has exited")
+            }
+            ErrorKind::StaleParent { expected, actual } => {
+                write!(
+                    f,
+                    "stale parent on sequence: snapshot was {expected}, last_header is now {actual} \
+                     (Deriver advanced the chain between read and FCU)"
+                )
+            }
         }
     }
 }

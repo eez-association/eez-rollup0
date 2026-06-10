@@ -7,6 +7,7 @@ rust-version.workspace = true
 description            = "L1 RPC client + Submitter task that posts L2 batches to BatchPoster.sol."
 
 [dependencies]
+eez-driver.workspace        = true
 eez-payload-codec.workspace = true
 eez-prover.workspace        = true
 
@@ -17,6 +18,7 @@ reth-primitives-traits.workspace = true
 reth-storage-api.workspace       = true
 
 # alloy — alloy-contract is pulled in transitively via eez-prover.
+alloy-consensus.workspace     = true
 alloy-eips.workspace          = true
 alloy-network.workspace       = true
 alloy-primitives.workspace    = true
@@ -24,6 +26,10 @@ alloy-provider.workspace      = true
 alloy-rpc-types-eth.workspace = true
 alloy-signer-local.workspace  = true
 alloy-sol-types.workspace     = true
+
+# bundler (eth_sendBundle) submission path
+reqwest.workspace    = true
+serde_json.workspace = true
 
 # async + diagnostics
 fail.workspace      = true

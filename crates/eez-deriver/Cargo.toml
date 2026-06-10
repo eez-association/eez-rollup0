@@ -1,0 +1,40 @@
+[package]
+name                   = "eez-deriver"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+description            = "Consumes L1 events, decodes posted batches, drives the BlockCommitter to keep L2 in sync with L1."
+
+[dependencies]
+eez-driver.workspace        = true
+eez-l1.workspace            = true
+eez-payload-codec.workspace = true
+
+# reth — bounds + STF replay machinery (see deriver::execute_block).
+reth-chainspec.workspace                  = true
+reth-ethereum-engine-primitives.workspace = true
+reth-ethereum-primitives.workspace        = true
+reth-evm.workspace                        = true
+reth-evm-ethereum.workspace               = true
+reth-payload-primitives.workspace         = true
+reth-primitives-traits.workspace          = true
+reth-provider.workspace                   = true
+reth-revm.workspace                       = true
+reth-storage-api.workspace                = true
+
+# revm — required by reth-evm's State builder
+revm.workspace = true
+
+# alloy
+alloy-consensus.workspace        = true
+alloy-eips.workspace             = true
+alloy-primitives.workspace       = true
+alloy-rpc-types-engine.workspace = true
+
+# async + diagnostics
+tokio.workspace   = true
+tracing.workspace = true
+
+[lints]
+workspace = true

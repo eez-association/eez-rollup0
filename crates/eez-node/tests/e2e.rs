@@ -196,6 +196,9 @@ async fn failure_prover_signer_mismatch() {
 fn node_env(rpc_url: &str, dep: &Deployment) -> Vec<(&'static str, String)> {
     vec![
         ("EEZ_L1_RPC_URL", rpc_url.to_string()),
+        // PR #6 (eth_sendBundle) added this. Point at the same anvil — it
+        // accepts standard txs even when the submitter targets a bundle endpoint.
+        ("EEZ_L1_BUILDER_RPC_URL", rpc_url.to_string()),
         ("EEZ_L1_POSTER_KEY", ANVIL_KEY.to_string()),
         ("EEZ_PROOF_SIGNER_KEY", ANVIL_KEY.to_string()),
         ("EEZ_REGISTRY_ADDRESS", format!("{:#x}", dep.eez_address)),

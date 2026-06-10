@@ -66,7 +66,13 @@ deploy-protocol:
 # ─── Node ─────────────────────────────────────────────────────────────────
 run-node:
 	@test -n "$(EEZ_L2_DATADIR)" || (echo "EEZ_L2_DATADIR not set; copy .env.example to .env" && exit 1)
-	cargo run -p eez-node -- node --chain dev --datadir $(EEZ_L2_DATADIR)
+	@test -n "$(EEZ_L2_GENESIS_PATH)" -a -f "$(EEZ_L2_GENESIS_PATH)" \
+		|| (echo "EEZ_L2_GENESIS_PATH not set or file missing; run make deploy-protocol first" && exit 1)
+	cargo run -p eez-node -- node \
+		--chain $(EEZ_L2_GENESIS_PATH) \
+		--datadir $(EEZ_L2_DATADIR) \
+		--builder.extradata "" \
+		--builder.gaslimit 30000000
 
 clean-l2:
 	@test -n "$(EEZ_L2_DATADIR)" || (echo "EEZ_L2_DATADIR not set" && exit 1)
