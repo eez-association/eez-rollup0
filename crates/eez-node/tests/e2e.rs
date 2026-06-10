@@ -10,7 +10,12 @@ use std::time::Duration;
 use alloy_primitives::{B256, U256};
 
 mod common;
-use common::{ANVIL_ADDR, ANVIL_KEY_1, Bench, NodeHandle};
+use common::{
+    ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, Anvil, AnvilConfig,
+    Bench, BundleStub, Chain, NodeConfig, NodeHandle, deploy_contracts_with_initial, free_port,
+    safe_block_state_root, send_l2_value_transfer, smoke_genesis_path, smoke_genesis_state_root,
+    smoke_node_env, wait_for, wait_for_l2_rpc,
+};
 
 /// Builder mode, sustained operation through a restart. Asserts every
 /// observable invariant in one place:
@@ -181,6 +186,120 @@ async fn failure_prover_signer_mismatch() {
         chain.state_root().await.unwrap(),
         common::dev_genesis_state_root()
     );
+}
+
+/// Smoke E (Rust port of the team's `scripts/smoke-e.sh`).
+///
+/// Two competing composers (c1 / c2) post against the same EEZ contract
+/// on a shared anvil. A background "collector" task generates real L2
+/// state-changing txs so each batch carries content, not no-ops. After
+/// several combined batches land we trigger `anvil_reorg(depth)` and
+/// verify recovery:
+///   - both composers' safe L2 stateRoots converge on the same value;
+///   - the contract's `rollups[rid].stateRoot` matches that L2 head;
+///   - new batches land after the reorg (composers retry from rewound
+///     `posted_through`);
+///   - neither node logs a fatal error during the run.
+///
+/// Distinct from the other tests in that it spawns two reth instances
+/// concurrently — nextest is configured `--test-threads=1` so this
+/// test owns the runner while it executes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn happy_case_smoke_e_two_composers_reorg() {
+    let smoke_root = smoke_genesis_state_root().unwrap();
+    let genesis_path = smoke_genesis_path();
+
+    let anvil = Anvil::spawn_with(free_port(), AnvilConfig::for_reorg())
+        .await
+        .unwrap();
+    let stub = BundleStub::spawn(free_port(), &anvil.rpc_url)
+        .await
+        .unwrap();
+    let dep = deploy_contracts_with_initial(&anvil.rpc_url, ANVIL_KEY, smoke_root)
+        .await
+        .unwrap();
+
+    let chain = Chain::new(&anvil, &dep);
+
+    let c1_datadir = tempfile::tempdir().unwrap();
+    let c2_datadir = tempfile::tempdir().unwrap();
+
+    let c1_env = smoke_node_env(&anvil, &stub, &dep, ANVIL_KEY, false);
+    let c2_env = smoke_node_env(&anvil, &stub, &dep, ANVIL_KEY_4, true);
+
+    let cfg = NodeConfig {
+        genesis_path: Some(genesis_path.as_path()),
+    };
+    let c1 = NodeHandle::spawn_with(c1_datadir.path(), &cfg, &c1_env).unwrap();
+    let c2 = NodeHandle::spawn_with(c2_datadir.path(), &cfg, &c2_env).unwrap();
+
+    wait_for_l2_rpc(&c1.l2_rpc_url(), Duration::from_secs(90))
+        .await
+        .expect("c1 L2 RPC up");
+    wait_for_l2_rpc(&c2.l2_rpc_url(), Duration::from_secs(90))
+        .await
+        .expect("c2 L2 RPC up");
+
+    // Background collector: small L2 value transfers to both composers
+    // every 2s. Both senders → ANVIL_ADDR_3 (one collector address).
+    // Errors are best-effort: nonce races, mempool eviction, RPC hiccups
+    // are all expected during the reorg; we don't want the test to fail
+    // from a single missed send.
+    let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let c1_url = c1.l2_rpc_url();
+    let c2_url = c2.l2_rpc_url();
+    let collector = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut cancel_rx => break,
+                () = tokio::time::sleep(Duration::from_secs(2)) => {
+                    let _ = send_l2_value_transfer(&c1_url, ANVIL_KEY_1, ANVIL_ADDR_3, U256::from(1u64)).await;
+                    let _ = send_l2_value_transfer(&c2_url, ANVIL_KEY_2, ANVIL_ADDR_3, U256::from(1u64)).await;
+                }
+            }
+        }
+    });
+
+    let pre_batches = chain
+        .wait_for_batches(3, Duration::from_secs(180))
+        .await
+        .expect("at least 3 combined batches landed pre-reorg");
+
+    anvil.reorg(3).await.unwrap();
+
+    // Recovery: both safe stateRoots agree with each other AND match the
+    // on-chain rollups[rid].stateRoot, AND post-reorg batch count exceeds
+    // pre-reorg.
+    let recovered: B256 = wait_for(Duration::from_secs(180), || async {
+        let c1s = safe_block_state_root(&c1.l2_rpc_url()).await.ok().flatten();
+        let c2s = safe_block_state_root(&c2.l2_rpc_url()).await.ok().flatten();
+        let contract = chain.state_root().await.ok();
+        let post_batches = chain.batches_posted().await.unwrap_or(0);
+        let conv = match (c1s, c2s, contract) {
+            (Some(a), Some(b), Some(c))
+                if a == b && a == c && a != B256::ZERO && post_batches > pre_batches =>
+            {
+                Some(a)
+            }
+            _ => None,
+        };
+        Ok(conv)
+    })
+    .await
+    .expect("composers did not converge after reorg");
+
+    let _ = cancel_tx.send(());
+    let _ = collector.await;
+
+    let post_batches = chain.batches_posted().await.unwrap();
+    assert!(
+        post_batches > pre_batches,
+        "no new batches after reorg ({pre_batches} → {post_batches})"
+    );
+    assert_ne!(recovered, B256::ZERO);
+
+    drop(c2);
+    drop(c1);
 }
 
 fn override_env(

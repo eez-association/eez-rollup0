@@ -24,6 +24,10 @@ pub const ANVIL_ADDR: Address = address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb9
 /// Anvil's second default account — used for tests that need a key
 /// distinct from the deployer / authorized signer.
 pub const ANVIL_KEY_1: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+pub const ANVIL_KEY_2: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
+pub const ANVIL_KEY_3: &str = "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6";
+pub const ANVIL_KEY_4: &str = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a";
+pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906");
 
 pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -57,10 +61,67 @@ pub struct Anvil {
     pub rpc_url: String,
 }
 
+/// Anvil configuration. `Anvil::spawn(port)` is the default (1s block,
+/// random mnemonic). Smoke E uses [`AnvilConfig::for_reorg`] which
+/// matches the hardhat mnemonic (so we have predictable prefunded EOAs)
+/// and enables the cancun hardfork (required by `anvil_reorg`).
+pub struct AnvilConfig {
+    pub block_time_secs: u64,
+    pub mnemonic: Option<&'static str>,
+    pub hardfork: Option<&'static str>,
+    pub gas_limit: Option<u64>,
+}
+
+impl Default for AnvilConfig {
+    fn default() -> Self {
+        Self {
+            block_time_secs: 1,
+            mnemonic: None,
+            hardfork: None,
+            gas_limit: None,
+        }
+    }
+}
+
+impl AnvilConfig {
+    /// 5s block time, hardhat mnemonic, cancun hardfork, 30M gas.
+    /// Mirrors the team's smoke-e.sh / chiado cadence.
+    pub fn for_reorg() -> Self {
+        Self {
+            block_time_secs: 5,
+            mnemonic: Some(HARDHAT_MNEMONIC),
+            hardfork: Some("cancun"),
+            gas_limit: Some(30_000_000),
+        }
+    }
+}
+
+pub const HARDHAT_MNEMONIC: &str = "test test test test test test test test test test test junk";
+
 impl Anvil {
     pub async fn spawn(port: u16) -> Result<Self> {
-        let child = Command::new(anvil_bin())
-            .args(["--port", &port.to_string(), "--block-time", "1", "--silent"])
+        Self::spawn_with(port, AnvilConfig::default()).await
+    }
+
+    pub async fn spawn_with(port: u16, cfg: AnvilConfig) -> Result<Self> {
+        let mut cmd = Command::new(anvil_bin());
+        cmd.args([
+            "--port",
+            &port.to_string(),
+            "--block-time",
+            &cfg.block_time_secs.to_string(),
+            "--silent",
+        ]);
+        if let Some(m) = cfg.mnemonic {
+            cmd.args(["--mnemonic", m]);
+        }
+        if let Some(h) = cfg.hardfork {
+            cmd.args(["--hardfork", h]);
+        }
+        if let Some(g) = cfg.gas_limit {
+            cmd.args(["--gas-limit", &g.to_string()]);
+        }
+        let child = cmd
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -100,6 +161,20 @@ impl Anvil {
             .request("anvil_setBalance", (addr, wei))
             .await
             .context("anvil_setBalance")?;
+        Ok(())
+    }
+
+    /// `anvil_reorg` — drops the most recent `depth` L1 blocks. Requires
+    /// the cancun hardfork (see [`AnvilConfig::for_reorg`]). The empty
+    /// array is the optional list of replacement txs (we use none —
+    /// blocks are dropped, nodes notice via head moving backward).
+    pub async fn reorg(&self, depth: u64) -> Result<()> {
+        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
+        let _: serde_json::Value = provider
+            .client()
+            .request("anvil_reorg", (depth, Vec::<serde_json::Value>::new()))
+            .await
+            .context("anvil_reorg")?;
         Ok(())
     }
 }
@@ -247,6 +322,137 @@ pub fn dev_genesis_state_root() -> B256 {
     reth_chainspec::DEV.genesis_header().state_root
 }
 
+/// Path to the genesis fixture used by Smoke E (multi-composer). 23
+/// prefunded accounts (hardhat defaults), all hardforks at block 0,
+/// matches what the team uses for local reorg testing.
+pub fn smoke_genesis_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/genesis.json")
+}
+
+/// Genesis state root of `smoke_genesis_path()`. Computed by reading the
+/// JSON into reth's `Genesis` and converting to a `ChainSpec`.
+pub fn smoke_genesis_state_root() -> Result<B256> {
+    let raw = std::fs::read_to_string(smoke_genesis_path()).context("read genesis.json")?;
+    let genesis: alloy_genesis::Genesis =
+        serde_json::from_str(&raw).context("parse genesis.json")?;
+    let spec: reth_chainspec::ChainSpec = genesis.into();
+    Ok(spec.genesis_header().state_root)
+}
+
+/// Send one EIP-1559 value transfer on the L2 at `rpc_url` from
+/// `signing_key` to `to`. Used by Smoke E's collector load. Builds,
+/// signs, and submits in one call; returns the tx hash. Rejects with
+/// nonce/funds/RPC errors propagated.
+pub async fn send_l2_value_transfer(
+    rpc_url: &str,
+    signing_key: &str,
+    to: Address,
+    value: U256,
+) -> Result<alloy_primitives::TxHash> {
+    use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+    use alloy_network::TxSignerSync;
+    use alloy_network::eip2718::Encodable2718;
+
+    let signer: PrivateKeySigner = signing_key
+        .strip_prefix("0x")
+        .unwrap_or(signing_key)
+        .parse()
+        .context("parse signing key")?;
+    let from = signer.address();
+
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let chain_id = provider.get_chain_id().await?;
+    let nonce = provider.get_transaction_count(from).await?;
+    let fees = provider.estimate_eip1559_fees().await?;
+
+    let mut tx = TxEip1559 {
+        chain_id,
+        nonce,
+        gas_limit: 21_000,
+        max_fee_per_gas: fees.max_fee_per_gas,
+        max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+        to: alloy_primitives::TxKind::Call(to),
+        value,
+        access_list: alloy_rpc_types_eth::AccessList::default(),
+        input: alloy_primitives::Bytes::default(),
+    };
+    let sig = signer.sign_transaction_sync(&mut tx)?;
+    let envelope = TxEnvelope::from(tx.into_signed(sig));
+    let raw = envelope.encoded_2718();
+
+    let hash = provider
+        .send_raw_transaction(&raw)
+        .await?
+        .tx_hash()
+        .to_owned();
+    Ok(hash)
+}
+
+/// Wait until `eth_blockNumber` responds at `rpc_url`. Used to confirm a
+/// just-spawned eez-node's L2 RPC is up before we send txs at it.
+pub async fn wait_for_l2_rpc(rpc_url: &str, timeout: Duration) -> Result<()> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    wait_for(timeout, || async {
+        Ok(provider.get_block_number().await.ok().map(|_| ()))
+    })
+    .await
+}
+
+/// Read the `stateRoot` of the latest `safe` block on the L2 at `rpc_url`.
+/// Returns `Ok(None)` while the L2 hasn't yet adopted any safe block
+/// (genesis L1 derivation pending). The convergence check in Smoke E
+/// uses this to verify both composers settle on the same canonical L2
+/// head after a reorg.
+pub async fn safe_block_state_root(rpc_url: &str) -> Result<Option<B256>> {
+    use alloy_rpc_types_eth::BlockNumberOrTag;
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let block = provider.get_block_by_number(BlockNumberOrTag::Safe).await?;
+    Ok(block.map(|b| b.header.state_root))
+}
+
+/// Env block for a smoke-E composer. `poster_key` lets c1/c2 differ.
+/// `expect_external` is set on c2 to tell its composer that other
+/// composers will also be posting (so it doesn't treat foreign batches
+/// as misbehavior).
+pub fn smoke_node_env(
+    anvil: &Anvil,
+    stub: &BundleStub,
+    dep: &Deployment,
+    poster_key: &str,
+    expect_external: bool,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("EEZ_L1_RPC_URL", anvil.rpc_url.clone()),
+        ("EEZ_L1_BUILDER_RPC_URL", stub.url.clone()),
+        ("EEZ_L1_POSTER_KEY", poster_key.to_string()),
+        ("EEZ_PROOF_SIGNER_KEY", ANVIL_KEY.to_string()),
+        ("EEZ_REGISTRY_ADDRESS", format!("{:#x}", dep.eez_address)),
+        ("EEZ_REGISTRY_DEPLOY_BLOCK", dep.deploy_block.to_string()),
+        (
+            "EEZ_MOCK_PROOF_SYSTEM_ADDRESS",
+            format!("{:#x}", dep.mock_ps_address),
+        ),
+        (
+            "EEZ_ROLLUP_MANAGER_ADDRESS",
+            format!("{:#x}", dep.rollup_manager_address),
+        ),
+        ("EEZ_ROLLUP_ID", dep.rollup_id.to_string()),
+        ("EEZ_COMPOSER_INTERVAL_SECS", "3".to_string()),
+        (
+            "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES",
+            expect_external.to_string(),
+        ),
+        (
+            "EEZ_L2_DATADIR",
+            "/tmp/unused-overridden-by-flag".to_string(),
+        ),
+        (
+            "RUST_LOG",
+            std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
+        ),
+    ]
+}
+
 /// Deploy `EEZ` + `MockECDSAProofSystem` + `Rollup`, then register the rollup.
 /// Pure alloy — reads compiled foundry artifacts and sends each deploy
 /// as an in-process tx. Mirrors `sync-rollups-composer`'s
@@ -254,6 +460,17 @@ pub fn dev_genesis_state_root() -> B256 {
 /// codebase surveyed). Prereq: `forge build` must have run in
 /// `contracts/`.
 pub async fn deploy_contracts(rpc_url: &str, key: &str) -> Result<Deployment> {
+    deploy_contracts_with_initial(rpc_url, key, dev_genesis_state_root()).await
+}
+
+/// Deploy with an explicit `initialState`. Use this when registering a
+/// rollup whose L2 will run a non-`--chain dev` genesis (Smoke E uses
+/// `smoke_genesis_state_root()`).
+pub async fn deploy_contracts_with_initial(
+    rpc_url: &str,
+    key: &str,
+    initial_state: B256,
+) -> Result<Deployment> {
     // Anvil auto-signs for its default accounts when `from` is set; no wallet
     // filler needed. Matches sync-rollups-composer's pattern.
     let signer: PrivateKeySigner = key
@@ -312,7 +529,7 @@ pub async fn deploy_contracts(rpc_url: &str, key: &str) -> Result<Deployment> {
     // accounts); avoids the alloy wallet-filler requirement on `to`.
     let calldata = IEEZ::registerRollupCall {
         rollupContract: rollup_manager_address,
-        initialState: dev_genesis_state_root(),
+        initialState: initial_state,
     }
     .abi_encode();
     let receipt = provider
@@ -380,15 +597,34 @@ async fn deploy<P: Provider>(
 pub struct NodeHandle {
     child: Child,
     pub log_path: Option<PathBuf>,
+    /// L2 HTTP RPC port for this node — tracked so tests that need to
+    /// send L2 txs (Smoke E's collector load) can target it.
+    pub http_port: u16,
+}
+
+#[derive(Default)]
+pub struct NodeConfig<'a> {
+    /// Path to a custom genesis JSON. `None` uses `--chain dev`.
+    pub genesis_path: Option<&'a std::path::Path>,
 }
 
 impl NodeHandle {
-    /// Spawn `eez-node` against `datadir` with the given env. Caller owns
-    /// the datadir (e.g. a `tempfile::TempDir`) so kill+respawn tests can
-    /// share state across handles. Uses the test-built binary path
-    /// (`CARGO_BIN_EXE_eez-node`) directly — skips the `cargo run`
-    /// metadata-resolution overhead per spawn.
+    /// Spawn `eez-node` against `datadir` with `--chain dev` and the
+    /// given env. See [`Self::spawn_with`] for custom genesis.
     pub fn spawn(datadir: &std::path::Path, env: &[(&'static str, String)]) -> Result<Self> {
+        Self::spawn_with(datadir, &NodeConfig::default(), env)
+    }
+
+    /// Spawn `eez-node` against `datadir` with the given config + env.
+    /// Caller owns the datadir (e.g. a `tempfile::TempDir`) so
+    /// kill+respawn tests can share state across handles. Uses the
+    /// test-built binary path (`CARGO_BIN_EXE_eez-node`) directly —
+    /// skips the `cargo run` metadata-resolution overhead per spawn.
+    pub fn spawn_with(
+        datadir: &std::path::Path,
+        cfg: &NodeConfig<'_>,
+        env: &[(&'static str, String)],
+    ) -> Result<Self> {
         let log_path = std::env::var("EEZ_TEST_LOG_DIR").ok().map(|d| {
             std::path::PathBuf::from(d).join(format!("eez-node-{}.log", std::process::id()))
         });
@@ -408,18 +644,27 @@ impl NodeHandle {
         let http_port = free_port();
         let ws_port = free_port();
         let p2p_port = free_port();
+        let chain_arg: std::ffi::OsString = cfg.genesis_path.map_or_else(
+            || std::ffi::OsString::from("dev"),
+            |p| p.as_os_str().to_owned(),
+        );
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_eez-node"));
         cmd.current_dir(repo_root())
-            .args(["node", "--chain", "dev", "--datadir"])
+            .args(["node", "--chain"])
+            .arg(&chain_arg)
+            .arg("--datadir")
             .arg(datadir)
             .stdout(stdout)
             .args([
-                "--authrpc.port",
-                &authrpc_port.to_string(),
+                "--http",
+                "--http.addr",
+                "127.0.0.1",
                 "--http.port",
                 &http_port.to_string(),
                 "--ws.port",
                 &ws_port.to_string(),
+                "--authrpc.port",
+                &authrpc_port.to_string(),
                 "--port",
                 &p2p_port.to_string(),
                 "--disable-discovery",
@@ -440,7 +685,15 @@ impl NodeHandle {
             cmd.env(*k, v);
         }
         let child = cmd.spawn().context("spawn eez-node")?;
-        Ok(Self { child, log_path })
+        Ok(Self {
+            child,
+            log_path,
+            http_port,
+        })
+    }
+
+    pub fn l2_rpc_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.http_port)
     }
 }
 
