@@ -49,5 +49,10 @@ jobs:
       - name: Build contracts (artifacts read by harness)
         working-directory: contracts
         run: forge build
-      - name: Run tests (unit + integration)
-        run: cargo nextest run --workspace --all-targets --no-fail-fast
+      # Both nextest runs read from the cache populated by the build step.
+      # Lib tests parallelise across cores; integration tests serialise to
+      # one runner-wide reth+anvil set at a time (memory-bounded).
+      - name: Unit tests (lib, parallel)
+        run: cargo nextest run --workspace --lib --no-fail-fast
+      - name: Integration tests (test '*', serial)
+        run: cargo nextest run --workspace --test '*' --test-threads=1 --no-fail-fast

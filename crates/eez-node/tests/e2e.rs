@@ -11,10 +11,9 @@ use alloy_primitives::{B256, U256};
 
 mod common;
 use common::{
-    ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, Anvil, AnvilConfig,
-    Bench, BundleStub, Chain, NodeConfig, NodeHandle, deploy_contracts_with_initial, free_port,
-    safe_block_state_root, send_l2_value_transfer, smoke_genesis_path, smoke_genesis_state_root,
-    smoke_node_env, wait_for, wait_for_l2_rpc,
+    ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig,
+    Harness, NodeConfig, NodeHandle, reorg_genesis_path, reorg_genesis_state_root,
+    safe_block_state_root, send_l2_value_transfer, wait_for, wait_for_l2_rpc,
 };
 
 /// Builder mode, sustained operation through a restart. Asserts every
@@ -31,10 +30,10 @@ use common::{
 /// advances) AND any future replay bug across the restart boundary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn happy_case_builder_sustained() {
-    let bench = Bench::fresh().await.unwrap();
-    let chain = bench.chain();
+    let harness = Harness::fresh().await.unwrap();
+    let chain = harness.chain();
     let datadir = tempfile::tempdir().unwrap();
-    let env = bench.env();
+    let env = harness.env();
 
     // Phase 1 — sustained operation under the first node.
     let n_before;
@@ -106,9 +105,9 @@ async fn happy_case_builder_sustained() {
 /// `postAndVerifyBatch` reverts at the structural validation step.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failure_wrong_rollup_id() {
-    let bench = Bench::fresh().await.unwrap();
-    let chain = bench.chain();
-    let env = override_env(bench.env(), "EEZ_ROLLUP_ID", "999");
+    let harness = Harness::fresh().await.unwrap();
+    let chain = harness.chain();
+    let env = override_env(harness.env(), "EEZ_ROLLUP_ID", "999");
     let datadir = tempfile::tempdir().unwrap();
     let _node = NodeHandle::spawn(datadir.path(), &env).unwrap();
 
@@ -130,17 +129,17 @@ async fn failure_wrong_rollup_id() {
 /// no new batches land. When balance is restored, batches resume.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failure_l1_outage_recovery() {
-    let bench = Bench::fresh().await.unwrap();
-    let chain = bench.chain();
+    let harness = Harness::fresh().await.unwrap();
+    let chain = harness.chain();
     let datadir = tempfile::tempdir().unwrap();
-    let _node = NodeHandle::spawn(datadir.path(), &bench.env()).unwrap();
+    let _node = NodeHandle::spawn(datadir.path(), &harness.env()).unwrap();
 
     let n_before = chain
         .wait_for_batches(2, Duration::from_secs(60))
         .await
         .unwrap();
 
-    bench
+    harness
         .anvil
         .set_balance(ANVIL_ADDR, U256::ZERO)
         .await
@@ -156,7 +155,11 @@ async fn failure_l1_outage_recovery() {
     );
 
     let restored = U256::from(10u64).pow(U256::from(21u64));
-    bench.anvil.set_balance(ANVIL_ADDR, restored).await.unwrap();
+    harness
+        .anvil
+        .set_balance(ANVIL_ADDR, restored)
+        .await
+        .unwrap();
     chain
         .wait_for_batches(n_before + 1, Duration::from_secs(60))
         .await
@@ -169,9 +172,9 @@ async fn failure_l1_outage_recovery() {
 /// reverts at the proof-verification step.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failure_prover_signer_mismatch() {
-    let bench = Bench::fresh().await.unwrap();
-    let chain = bench.chain();
-    let env = override_env(bench.env(), "EEZ_PROOF_SIGNER_KEY", ANVIL_KEY_1);
+    let harness = Harness::fresh().await.unwrap();
+    let chain = harness.chain();
+    let env = override_env(harness.env(), "EEZ_PROOF_SIGNER_KEY", ANVIL_KEY_1);
     let datadir = tempfile::tempdir().unwrap();
     let _node = NodeHandle::spawn(datadir.path(), &env).unwrap();
 
@@ -188,71 +191,62 @@ async fn failure_prover_signer_mismatch() {
     );
 }
 
-/// Smoke E (Rust port of the team's `scripts/smoke-e.sh`).
-///
-/// Two competing composers (c1 / c2) post against the same EEZ contract
-/// on a shared anvil. A background "collector" task generates real L2
-/// state-changing txs so each batch carries content, not no-ops. After
-/// several combined batches land we trigger `anvil_reorg(depth)` and
-/// verify recovery:
+/// Two competing composers (different poster EOAs, same proof-signer
+/// key) post against the same EEZ contract on a shared anvil. A
+/// background "collector" task generates real L2 state-changing txs so
+/// batches carry content, not no-ops. After ≥4 combined batches land,
+/// trigger `anvil_reorg(depth=3)` and verify recovery:
 ///   - both composers' safe L2 stateRoots converge on the same value;
 ///   - the contract's `rollups[rid].stateRoot` matches that L2 head;
 ///   - new batches land after the reorg (composers retry from rewound
 ///     `posted_through`);
-///   - neither node logs a fatal error during the run.
+///   - both derivers logged the L1 reorg retreat (the test's whole
+///     point — without this assertion, convergence could happen via
+///     unrelated re-derivation paths);
+///   - neither node logs `Fatal` / `UnexpectedStaticFile`.
 ///
-/// Distinct from the other tests in that it spawns two reth instances
-/// concurrently — nextest is configured `--test-threads=1` so this
-/// test owns the runner while it executes.
+/// Spawns two reth instances concurrently; nextest CI runs integration
+/// tests with `--test-threads=1` so this test owns the runner while
+/// executing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn happy_case_smoke_e_two_composers_reorg() {
-    let smoke_root = smoke_genesis_state_root().unwrap();
-    let genesis_path = smoke_genesis_path();
-
-    let anvil = Anvil::spawn_with(free_port(), AnvilConfig::for_reorg())
-        .await
-        .unwrap();
-    let stub = BundleStub::spawn(free_port(), &anvil.rpc_url)
-        .await
-        .unwrap();
-    let dep = deploy_contracts_with_initial(&anvil.rpc_url, ANVIL_KEY, smoke_root)
-        .await
-        .unwrap();
-
-    let chain = Chain::new(&anvil, &dep);
-
+async fn happy_case_two_composers_l1_reorg_recovers() {
+    let harness = Harness::with_anvil_config(
+        AnvilConfig::for_reorg(),
+        reorg_genesis_state_root().unwrap(),
+    )
+    .await
+    .unwrap();
+    let chain = harness.chain();
+    let genesis = reorg_genesis_path();
+    let cfg = NodeConfig {
+        genesis_path: Some(genesis.as_path()),
+    };
     let c1_datadir = tempfile::tempdir().unwrap();
     let c2_datadir = tempfile::tempdir().unwrap();
-
-    let c1_env = smoke_node_env(&anvil, &stub, &dep, ANVIL_KEY, false);
-    let c2_env = smoke_node_env(&anvil, &stub, &dep, ANVIL_KEY_4, true);
-
-    let cfg = NodeConfig {
-        genesis_path: Some(genesis_path.as_path()),
-    };
-    let c1 = NodeHandle::spawn_with(c1_datadir.path(), &cfg, &c1_env).unwrap();
-    let c2 = NodeHandle::spawn_with(c2_datadir.path(), &cfg, &c2_env).unwrap();
+    let c1 =
+        NodeHandle::spawn_with(c1_datadir.path(), &cfg, &harness.env_for(ANVIL_KEY, true)).unwrap();
+    let c2 = NodeHandle::spawn_with(c2_datadir.path(), &cfg, &harness.env_for(ANVIL_KEY_4, true))
+        .unwrap();
 
     wait_for_l2_rpc(&c1.l2_rpc_url(), Duration::from_secs(90))
         .await
-        .expect("c1 L2 RPC up");
+        .unwrap();
     wait_for_l2_rpc(&c2.l2_rpc_url(), Duration::from_secs(90))
         .await
-        .expect("c2 L2 RPC up");
+        .unwrap();
 
-    // Background collector: small L2 value transfers to both composers
-    // every 2s. Both senders → ANVIL_ADDR_3 (one collector address).
-    // Errors are best-effort: nonce races, mempool eviction, RPC hiccups
-    // are all expected during the reorg; we don't want the test to fail
-    // from a single missed send.
+    // Background collector: best-effort L2 value transfers every 4s to
+    // give each composer's batches real content. `let _ =` because during
+    // `anvil_reorg` the nonce view becomes stale, dropped blocks evict
+    // pending txs, and reth's L2 RPC briefly pauses — all expected
+    // transient failures. We just need *some* txs to land, not all.
     let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
-    let c1_url = c1.l2_rpc_url();
-    let c2_url = c2.l2_rpc_url();
+    let (c1_url, c2_url) = (c1.l2_rpc_url(), c2.l2_rpc_url());
     let collector = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = &mut cancel_rx => break,
-                () = tokio::time::sleep(Duration::from_secs(2)) => {
+                () = tokio::time::sleep(Duration::from_secs(4)) => {
                     let _ = send_l2_value_transfer(&c1_url, ANVIL_KEY_1, ANVIL_ADDR_3, U256::from(1u64)).await;
                     let _ = send_l2_value_transfer(&c2_url, ANVIL_KEY_2, ANVIL_ADDR_3, U256::from(1u64)).await;
                 }
@@ -261,45 +255,68 @@ async fn happy_case_smoke_e_two_composers_reorg() {
     });
 
     let pre_batches = chain
-        .wait_for_batches(2, Duration::from_secs(90))
+        .wait_for_batches(4, Duration::from_secs(120))
         .await
-        .expect("at least 2 combined batches landed pre-reorg");
+        .expect("pre-reorg: ≥4 combined batches");
 
-    anvil.reorg(3).await.unwrap();
+    // Drop the most recent 3 L1 blocks. Composer's bundle-target window
+    // is `latest + 2`, so depth=3 is enough to roll back at least one
+    // landed `BatchPosted` and force both derivers to retreat.
+    harness.anvil.reorg(3).await.unwrap();
 
-    // Recovery: both safe stateRoots agree with each other AND match the
-    // on-chain rollups[rid].stateRoot, AND post-reorg batch count exceeds
-    // pre-reorg.
-    let recovered: B256 = wait_for(Duration::from_secs(90), || async {
+    // Stop the collector before the convergence wait — under continuous
+    // content the composers' state keeps moving and may never be
+    // simultaneously equal for one polling window. Recovery should
+    // settle the chain to a stable canonical L2 head.
+    let _ = cancel_tx.send(());
+    collector.await.unwrap();
+
+    // Recovery: both safe stateRoots agree AND match the on-chain
+    // stateRoot AND post-reorg batch count grew.
+    let Ok(recovered) = wait_for(Duration::from_secs(120), || async {
         let c1s = safe_block_state_root(&c1.l2_rpc_url()).await.ok().flatten();
         let c2s = safe_block_state_root(&c2.l2_rpc_url()).await.ok().flatten();
         let contract = chain.state_root().await.ok();
-        let post_batches = chain.batches_posted().await.unwrap_or(0);
-        let conv = match (c1s, c2s, contract) {
+        let post = chain.batches_posted().await.unwrap_or(0);
+        Ok(match (c1s, c2s, contract) {
             (Some(a), Some(b), Some(c))
-                if a == b && a == c && a != B256::ZERO && post_batches > pre_batches =>
+                if a == b && a == c && a != B256::ZERO && post > pre_batches =>
             {
                 Some(a)
             }
             _ => None,
-        };
-        Ok(conv)
+        })
     })
     .await
-    .expect("composers did not converge after reorg");
+    else {
+        panic!(
+            "post-reorg convergence failed:\n  c1.safe = {:?}\n  c2.safe = {:?}\n  contract = {:?}\n  batches: {pre_batches} → {}",
+            safe_block_state_root(&c1.l2_rpc_url()).await.ok().flatten(),
+            safe_block_state_root(&c2.l2_rpc_url()).await.ok().flatten(),
+            chain.state_root().await.ok(),
+            chain.batches_posted().await.unwrap_or(0),
+        );
+    };
 
-    let _ = cancel_tx.send(());
-    let _ = collector.await;
-
-    let post_batches = chain.batches_posted().await.unwrap();
-    assert!(
-        post_batches > pre_batches,
-        "no new batches after reorg ({pre_batches} → {post_batches})"
-    );
     assert_ne!(recovered, B256::ZERO);
+    assert!(chain.batches_posted().await.unwrap() > pre_batches);
 
-    drop(c2);
-    drop(c1);
+    // Both derivers actually noticed the reorg. Without this, the test
+    // would pass even if reorg-detection regressed (some unrelated path
+    // re-derives consistent state).
+    let retreat = ["reorg rolled out", "l1.reorg.retreated"];
+    assert!(
+        c1.log_count_matching(&retreat).unwrap() > 0,
+        "c1 deriver missed the reorg"
+    );
+    assert!(
+        c2.log_count_matching(&retreat).unwrap() > 0,
+        "c2 deriver missed the reorg"
+    );
+
+    let fatal = ["Fatal", "UnexpectedStaticFile"];
+    assert_eq!(c1.log_count_matching(&fatal).unwrap(), 0, "c1 fatal error");
+    assert_eq!(c2.log_count_matching(&fatal).unwrap(), 0, "c2 fatal error");
 }
 
 fn override_env(

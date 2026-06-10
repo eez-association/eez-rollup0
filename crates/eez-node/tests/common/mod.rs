@@ -62,9 +62,10 @@ pub struct Anvil {
 }
 
 /// Anvil configuration. `Anvil::spawn(port)` is the default (1s block,
-/// random mnemonic). Smoke E uses [`AnvilConfig::for_reorg`] which
-/// matches the hardhat mnemonic (so we have predictable prefunded EOAs)
-/// and enables the cancun hardfork (required by `anvil_reorg`).
+/// random mnemonic). The multi-composer reorg test uses
+/// [`AnvilConfig::for_reorg`] which matches the hardhat mnemonic (so we
+/// have predictable prefunded EOAs) and enables the cancun hardfork
+/// (required by `anvil_reorg`).
 pub struct AnvilConfig {
     pub block_time_secs: u64,
     pub mnemonic: Option<&'static str>,
@@ -85,8 +86,8 @@ impl Default for AnvilConfig {
 
 impl AnvilConfig {
     /// 1s block time, hardhat mnemonic, cancun hardfork, 30M gas.
-    /// (The team's `smoke-e.sh` uses 5s to mirror chiado; tests prefer
-    /// speed over fidelity. 1s blocks + cancun still permit `anvil_reorg`.)
+    /// (Chiado uses 5s; tests prefer speed over fidelity. 1s blocks +
+    /// cancun still permit `anvil_reorg`.)
     pub fn for_reorg() -> Self {
         Self {
             block_time_secs: 1,
@@ -236,19 +237,27 @@ impl Drop for BundleStub {
 }
 
 /// Per-test fixture: anvil + bundle stub + deployed protocol. Every
-/// test starts with `let bench = Bench::fresh().await`; eliminates the
-/// 4-line preamble duplicated across tests.
-pub struct Bench {
+/// test starts with `let harness = Harness::fresh().await` (or
+/// `with_anvil_config` for the reorg test); eliminates the 4-line
+/// preamble duplicated across tests.
+pub struct Harness {
     pub anvil: Anvil,
     pub stub: BundleStub,
     pub dep: Deployment,
 }
 
-impl Bench {
+impl Harness {
+    /// Default: dev-chain anvil + dev-genesis initial state.
     pub async fn fresh() -> Result<Self> {
-        let anvil = Anvil::spawn(free_port()).await?;
+        Self::with_anvil_config(AnvilConfig::default(), dev_genesis_state_root()).await
+    }
+
+    /// Custom anvil config + explicit initial state root. Used by the
+    /// reorg test which needs cancun + hardhat mnemonic + custom L2 genesis.
+    pub async fn with_anvil_config(cfg: AnvilConfig, initial_state: B256) -> Result<Self> {
+        let anvil = Anvil::spawn_with(free_port(), cfg).await?;
         let stub = BundleStub::spawn(free_port(), &anvil.rpc_url).await?;
-        let dep = deploy_contracts(&anvil.rpc_url, ANVIL_KEY).await?;
+        let dep = deploy_contracts_with_initial(&anvil.rpc_url, ANVIL_KEY, initial_state).await?;
         Ok(Self { anvil, stub, dep })
     }
 
@@ -256,12 +265,23 @@ impl Bench {
         Chain::new(&self.anvil, &self.dep)
     }
 
-    /// Default env for spawning `eez-node` against this bench.
+    /// Default env for spawning `eez-node`. Poster + proof signer = anvil#0.
     pub fn env(&self) -> Vec<(&'static str, String)> {
+        self.env_for(ANVIL_KEY, false)
+    }
+
+    /// Env with parameterised poster key and external-batches flag. Used
+    /// by the multi-composer reorg test to spawn c1/c2 with different
+    /// poster EOAs (same proof signer per the contract's `authorizedSigner`).
+    pub fn env_for(
+        &self,
+        poster_key: &str,
+        expect_external_batches: bool,
+    ) -> Vec<(&'static str, String)> {
         vec![
             ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
             ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
-            ("EEZ_L1_POSTER_KEY", ANVIL_KEY.to_string()),
+            ("EEZ_L1_POSTER_KEY", poster_key.to_string()),
             ("EEZ_PROOF_SIGNER_KEY", ANVIL_KEY.to_string()),
             (
                 "EEZ_REGISTRY_ADDRESS",
@@ -280,7 +300,17 @@ impl Bench {
                 format!("{:#x}", self.dep.rollup_manager_address),
             ),
             ("EEZ_ROLLUP_ID", self.dep.rollup_id.to_string()),
-            ("EEZ_COMPOSER_INTERVAL_SECS", "1".to_string()),
+            // 1s for single-composer tests (max speed); 2s for multi-composer
+            // contention (1-tick-per-2-blocks ratio gives the deriver time to
+            // re-sync between ticks, matching bash smoke's ratio).
+            (
+                "EEZ_COMPOSER_INTERVAL_SECS",
+                if expect_external_batches { "2" } else { "1" }.to_string(),
+            ),
+            (
+                "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES",
+                expect_external_batches.to_string(),
+            ),
             (
                 "EEZ_L2_DATADIR",
                 "/tmp/unused-overridden-by-flag".to_string(),
@@ -323,17 +353,17 @@ pub fn dev_genesis_state_root() -> B256 {
     reth_chainspec::DEV.genesis_header().state_root
 }
 
-/// Path to the genesis fixture used by Smoke E (multi-composer). 23
+/// Path to the multi-composer reorg test's L2 genesis fixture. 23
 /// prefunded accounts (hardhat defaults), all hardforks at block 0,
 /// matches what the team uses for local reorg testing.
-pub fn smoke_genesis_path() -> PathBuf {
+pub fn reorg_genesis_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/genesis.json")
 }
 
-/// Genesis state root of `smoke_genesis_path()`. Computed by reading the
+/// Genesis state root of `reorg_genesis_path()`. Computed by reading the
 /// JSON into reth's `Genesis` and converting to a `ChainSpec`.
-pub fn smoke_genesis_state_root() -> Result<B256> {
-    let raw = std::fs::read_to_string(smoke_genesis_path()).context("read genesis.json")?;
+pub fn reorg_genesis_state_root() -> Result<B256> {
+    let raw = std::fs::read_to_string(reorg_genesis_path()).context("read genesis.json")?;
     let genesis: alloy_genesis::Genesis =
         serde_json::from_str(&raw).context("parse genesis.json")?;
     let spec: reth_chainspec::ChainSpec = genesis.into();
@@ -341,7 +371,8 @@ pub fn smoke_genesis_state_root() -> Result<B256> {
 }
 
 /// Send one EIP-1559 value transfer on the L2 at `rpc_url` from
-/// `signing_key` to `to`. Used by Smoke E's collector load. Builds,
+/// `signing_key` to `to`. Used by the multi-composer reorg test's
+/// collector load. Builds,
 /// signs, and submits in one call; returns the tx hash. Rejects with
 /// nonce/funds/RPC errors propagated.
 pub async fn send_l2_value_transfer(
@@ -401,57 +432,13 @@ pub async fn wait_for_l2_rpc(rpc_url: &str, timeout: Duration) -> Result<()> {
 
 /// Read the `stateRoot` of the latest `safe` block on the L2 at `rpc_url`.
 /// Returns `Ok(None)` while the L2 hasn't yet adopted any safe block
-/// (genesis L1 derivation pending). The convergence check in Smoke E
-/// uses this to verify both composers settle on the same canonical L2
-/// head after a reorg.
+/// (genesis L1 derivation pending). Used by the multi-composer reorg
+/// test to verify both composers settle on the same canonical L2 head.
 pub async fn safe_block_state_root(rpc_url: &str) -> Result<Option<B256>> {
     use alloy_rpc_types_eth::BlockNumberOrTag;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let block = provider.get_block_by_number(BlockNumberOrTag::Safe).await?;
     Ok(block.map(|b| b.header.state_root))
-}
-
-/// Env block for a smoke-E composer. `poster_key` lets c1/c2 differ.
-/// `expect_external` is set on c2 to tell its composer that other
-/// composers will also be posting (so it doesn't treat foreign batches
-/// as misbehavior).
-pub fn smoke_node_env(
-    anvil: &Anvil,
-    stub: &BundleStub,
-    dep: &Deployment,
-    poster_key: &str,
-    expect_external: bool,
-) -> Vec<(&'static str, String)> {
-    vec![
-        ("EEZ_L1_RPC_URL", anvil.rpc_url.clone()),
-        ("EEZ_L1_BUILDER_RPC_URL", stub.url.clone()),
-        ("EEZ_L1_POSTER_KEY", poster_key.to_string()),
-        ("EEZ_PROOF_SIGNER_KEY", ANVIL_KEY.to_string()),
-        ("EEZ_REGISTRY_ADDRESS", format!("{:#x}", dep.eez_address)),
-        ("EEZ_REGISTRY_DEPLOY_BLOCK", dep.deploy_block.to_string()),
-        (
-            "EEZ_MOCK_PROOF_SYSTEM_ADDRESS",
-            format!("{:#x}", dep.mock_ps_address),
-        ),
-        (
-            "EEZ_ROLLUP_MANAGER_ADDRESS",
-            format!("{:#x}", dep.rollup_manager_address),
-        ),
-        ("EEZ_ROLLUP_ID", dep.rollup_id.to_string()),
-        ("EEZ_COMPOSER_INTERVAL_SECS", "1".to_string()),
-        (
-            "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES",
-            expect_external.to_string(),
-        ),
-        (
-            "EEZ_L2_DATADIR",
-            "/tmp/unused-overridden-by-flag".to_string(),
-        ),
-        (
-            "RUST_LOG",
-            std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
-        ),
-    ]
 }
 
 /// Deploy `EEZ` + `MockECDSAProofSystem` + `Rollup`, then register the rollup.
@@ -465,8 +452,8 @@ pub async fn deploy_contracts(rpc_url: &str, key: &str) -> Result<Deployment> {
 }
 
 /// Deploy with an explicit `initialState`. Use this when registering a
-/// rollup whose L2 will run a non-`--chain dev` genesis (Smoke E uses
-/// `smoke_genesis_state_root()`).
+/// rollup whose L2 will run a non-`--chain dev` genesis (the reorg
+/// test uses `reorg_genesis_state_root()`).
 pub async fn deploy_contracts_with_initial(
     rpc_url: &str,
     key: &str,
@@ -597,9 +584,13 @@ async fn deploy<P: Provider>(
 
 pub struct NodeHandle {
     child: Child,
-    pub log_path: Option<PathBuf>,
+    /// Where the node's merged stdout+stderr is written. Always set;
+    /// goes to `EEZ_TEST_LOG_DIR/eez-node-<pid>.log` if that env var is
+    /// set, otherwise a per-instance tempfile (kept alive by `_tempdir`).
+    pub log_path: PathBuf,
+    _tempdir: Option<tempfile::TempDir>,
     /// L2 HTTP RPC port for this node — tracked so tests that need to
-    /// send L2 txs (Smoke E's collector load) can target it.
+    /// send L2 txs to it (the multi-composer reorg test's collector) can target it.
     pub http_port: u16,
 }
 
@@ -626,19 +617,21 @@ impl NodeHandle {
         cfg: &NodeConfig<'_>,
         env: &[(&'static str, String)],
     ) -> Result<Self> {
-        let log_path = std::env::var("EEZ_TEST_LOG_DIR").ok().map(|d| {
-            std::path::PathBuf::from(d).join(format!("eez-node-{}.log", std::process::id()))
-        });
-        let (stdout, stderr) = match &log_path {
-            Some(p) => {
-                // tracing_subscriber's default writer is stdout; reth's panics go to stderr.
-                // Merge both into one log file.
-                let f = std::fs::File::create(p).context("create log file")?;
-                let f2 = f.try_clone().context("clone log file")?;
-                (Stdio::from(f), Stdio::from(f2))
-            }
-            None => (Stdio::null(), Stdio::null()),
+        let (log_path, log_tempdir) = if let Ok(d) = std::env::var("EEZ_TEST_LOG_DIR") {
+            let p =
+                std::path::PathBuf::from(d).join(format!("eez-node-{}.log", std::process::id()));
+            (p, None)
+        } else {
+            let td = tempfile::tempdir().context("log tempdir")?;
+            let p = td.path().join("eez-node.log");
+            (p, Some(td))
         };
+        // tracing_subscriber's default writer is stdout; reth's panics go to stderr.
+        // Merge both into one log file so the reorg test can grep
+        // `reorg.retreated` and `Fatal | UnexpectedStaticFile` from a single stream.
+        let f = std::fs::File::create(&log_path).context("create log file")?;
+        let f2 = f.try_clone().context("clone log file")?;
+        let (stdout, stderr) = (Stdio::from(f), Stdio::from(f2));
         // Reth defaults collide if any test or unrelated process holds them.
         // Each NodeHandle picks its own ephemeral ports for authrpc / http / ws / p2p.
         let authrpc_port = free_port();
@@ -689,12 +682,26 @@ impl NodeHandle {
         Ok(Self {
             child,
             log_path,
+            _tempdir: log_tempdir,
             http_port,
         })
     }
 
     pub fn l2_rpc_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.http_port)
+    }
+
+    /// Count lines in `log_path` matching ANY of `patterns` (substring
+    /// match). Used by the multi-composer reorg test to assert
+    /// `reorg.retreated` > 0 on both composers AND zero `Fatal` /
+    /// `UnexpectedStaticFile` events.
+    pub fn log_count_matching(&self, patterns: &[&str]) -> Result<usize> {
+        let contents = std::fs::read_to_string(&self.log_path)
+            .with_context(|| format!("read log {}", self.log_path.display()))?;
+        Ok(contents
+            .lines()
+            .filter(|line| patterns.iter().any(|p| line.contains(p)))
+            .count())
     }
 }
 
