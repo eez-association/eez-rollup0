@@ -26,6 +26,7 @@ alloy-signer-local.workspace  = true
 alloy-sol-types.workspace     = true
 
 # async + diagnostics
+fail.workspace      = true
 thiserror.workspace = true
 tokio.workspace     = true
 tracing.workspace   = true

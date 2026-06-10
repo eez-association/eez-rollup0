@@ -79,7 +79,7 @@ impl Anvil {
 
 impl Anvil {
     /// SIGSTOP — pauses the anvil process. RPC stops responding.
-    /// Used to simulate L1 outage.
+    /// Used to simulate L1 outage (rougher: kills RPC entirely).
     pub fn pause(&self) -> Result<()> {
         signal(self.child.id(), "STOP")
     }
@@ -87,6 +87,20 @@ impl Anvil {
     /// SIGCONT — resumes the anvil process.
     pub fn resume(&self) -> Result<()> {
         signal(self.child.id(), "CONT")
+    }
+
+    /// `anvil_setBalance` — sets the on-chain ETH balance of `addr`.
+    /// Used to simulate the more realistic "poster ran out of gas"
+    /// outage: anvil + RPC stay alive, but the node's tx broadcasts
+    /// revert at the simulation step with `insufficient funds`.
+    pub async fn set_balance(&self, addr: Address, wei: U256) -> Result<()> {
+        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
+        let _: bool = provider
+            .client()
+            .request("anvil_setBalance", (addr, wei))
+            .await
+            .context("anvil_setBalance")?;
+        Ok(())
     }
 }
 
@@ -121,6 +135,7 @@ sol! {
     interface IEEZ {
         event BatchPosted(uint256 rollupCount);
         event L2ExecutionPerformed(uint256 indexed rollupId, bytes32 newState);
+        event ImmediateEntrySkipped(uint256 indexed transientIdx, bytes revertData);
         function rollups(uint256 rollupId) external view returns (address rollupContract, bytes32 stateRoot, uint256 etherBalance);
         function rollupCounter() external view returns (uint256);
         function registerRollup(address rollupContract, bytes32 initialState) external returns (uint256 rollupId);
@@ -249,9 +264,12 @@ async fn deploy<P: Provider>(
     if !receipt.status() {
         bail!("deploy of {} reverted", artifact_path.display());
     }
-    receipt
-        .contract_address
-        .ok_or_else(|| anyhow!("no contract_address in receipt for {}", artifact_path.display()))
+    receipt.contract_address.ok_or_else(|| {
+        anyhow!(
+            "no contract_address in receipt for {}",
+            artifact_path.display()
+        )
+    })
 }
 
 pub struct NodeHandle {
@@ -262,11 +280,13 @@ pub struct NodeHandle {
 impl NodeHandle {
     /// Spawn `eez-node` against `datadir` with the given env. Caller owns
     /// the datadir (e.g. a `tempfile::TempDir`) so kill+respawn tests can
-    /// share state across handles.
+    /// share state across handles. Uses the test-built binary path
+    /// (`CARGO_BIN_EXE_eez-node`) directly — skips the `cargo run`
+    /// metadata-resolution overhead per spawn.
     pub fn spawn(datadir: &std::path::Path, env: &[(&'static str, String)]) -> Result<Self> {
-        let log_path = std::env::var("EEZ_TEST_LOG_DIR")
-            .ok()
-            .map(|d| std::path::PathBuf::from(d).join(format!("eez-node-{}.log", std::process::id())));
+        let log_path = std::env::var("EEZ_TEST_LOG_DIR").ok().map(|d| {
+            std::path::PathBuf::from(d).join(format!("eez-node-{}.log", std::process::id()))
+        });
         let (stdout, stderr) = match &log_path {
             Some(p) => {
                 // tracing_subscriber's default writer is stdout; reth's panics go to stderr.
@@ -283,20 +303,9 @@ impl NodeHandle {
         let http_port = free_port();
         let ws_port = free_port();
         let p2p_port = free_port();
-        let mut cmd = Command::new("cargo");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_eez-node"));
         cmd.current_dir(repo_root())
-            .args([
-                "run",
-                "--quiet",
-                "--release",
-                "-p",
-                "eez-node",
-                "--",
-                "node",
-                "--chain",
-                "dev",
-                "--datadir",
-            ])
+            .args(["node", "--chain", "dev", "--datadir"])
             .arg(datadir)
             .stdout(stdout)
             .args([
@@ -352,6 +361,19 @@ where
     bail!("timed out after {timeout:?}");
 }
 
+/// Wait until L1's `block_number >= target`. Lets tests assert "the
+/// composer had at least N opportunities to act" without arbitrary
+/// sleeps — at anvil's 1s block time, target = current + N is ~N
+/// seconds of real time but tied to L1 progress.
+pub async fn wait_for_l1_blocks(rpc_url: &str, target: u64, timeout: Duration) -> Result<u64> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    wait_for(timeout, || async {
+        let n = provider.get_block_number().await?;
+        Ok((n >= target).then_some(n))
+    })
+    .await
+}
+
 pub async fn state_root(rpc_url: &str, eez: Address, rollup_id: u64) -> Result<B256> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let registry = IEEZ::new(eez, &provider);
@@ -375,4 +397,29 @@ pub async fn count_events(
         .from_block(from_block);
     let logs = provider.get_logs(&filter).await?;
     Ok(logs.len())
+}
+
+/// Return the `newState` of the latest `L2ExecutionPerformed` event
+/// emitted by `contract` for `rollup_id`, or `None` if none exist.
+/// Cross-checks the on-chain `stateRoot` against the per-batch event.
+pub async fn latest_l2_execution_state(
+    rpc_url: &str,
+    contract: Address,
+    rollup_id: u64,
+    from_block: u64,
+) -> Result<Option<B256>> {
+    use alloy_rpc_types_eth::Filter;
+    use alloy_sol_types::SolEvent;
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let filter = Filter::new()
+        .address(contract)
+        .event_signature(IEEZ::L2ExecutionPerformed::SIGNATURE_HASH)
+        .topic1(B256::from(U256::from(rollup_id)))
+        .from_block(from_block);
+    let mut logs = provider.get_logs(&filter).await?;
+    let Some(last) = logs.pop() else {
+        return Ok(None);
+    };
+    let decoded = IEEZ::L2ExecutionPerformed::decode_log(&last.inner)?;
+    Ok(Some(decoded.newState))
 }
