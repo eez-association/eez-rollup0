@@ -791,6 +791,20 @@ impl<'a> Chain<'a> {
         .await
     }
 
+    /// All `newState` values the contract has attested via
+    /// `L2ExecutionPerformed`. Use this to assert "the node imported
+    /// a block whose stateRoot the contract has ever attested" without
+    /// racing against the contract's advancing head.
+    pub async fn executed_states(&self) -> Result<Vec<B256>> {
+        all_l2_execution_states(
+            self.rpc_url,
+            self.eez_address,
+            self.rollup_id,
+            self.deploy_block,
+        )
+        .await
+    }
+
     pub async fn block_number(&self) -> Result<u64> {
         let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
         Ok(provider.get_block_number().await?)
@@ -881,4 +895,29 @@ pub async fn latest_l2_execution_state(
     };
     let decoded = IEEZ::L2ExecutionPerformed::decode_log(&last.inner)?;
     Ok(Some(decoded.newState))
+}
+
+/// All `newState` values from `L2ExecutionPerformed` events for
+/// `rollup_id`, in emission order.
+pub async fn all_l2_execution_states(
+    rpc_url: &str,
+    contract: Address,
+    rollup_id: u64,
+    from_block: u64,
+) -> Result<Vec<B256>> {
+    use alloy_rpc_types_eth::Filter;
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let filter = Filter::new()
+        .address(contract)
+        .event_signature(IEEZ::L2ExecutionPerformed::SIGNATURE_HASH)
+        .topic1(B256::from(U256::from(rollup_id)))
+        .from_block(from_block);
+    let logs = provider.get_logs(&filter).await?;
+    logs.into_iter()
+        .map(|log| {
+            IEEZ::L2ExecutionPerformed::decode_log(&log.inner)
+                .map(|d| d.newState)
+                .map_err(Into::into)
+        })
+        .collect()
 }
