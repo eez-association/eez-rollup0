@@ -62,5 +62,8 @@ jobs:
           sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake
       - name: Install nextest
         uses: taiki-e/install-action@nextest
+      - name: Build contracts (artifacts read by harness)
+        working-directory: contracts
+        run: forge build
       - name: Run integration tests
         run: cargo nextest run --workspace --test '*' --no-fail-fast

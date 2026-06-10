@@ -23,7 +23,7 @@ use common::{
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn state_root_advances_after_first_batch() {
     let anvil = Anvil::spawn(free_port()).await.unwrap();
-    let dep = deploy_contracts(&anvil.rpc_url, ANVIL_KEY).unwrap();
+    let dep = deploy_contracts(&anvil.rpc_url, ANVIL_KEY).await.unwrap();
     let datadir = tempfile::tempdir().unwrap();
     let _node = NodeHandle::spawn(datadir.path(), &node_env(&anvil.rpc_url, &dep)).unwrap();
 
@@ -51,7 +51,7 @@ async fn state_root_advances_after_first_batch() {
 async fn n_batches_emit_n_events() {
     const N: usize = 3;
     let anvil = Anvil::spawn(free_port()).await.unwrap();
-    let dep = deploy_contracts(&anvil.rpc_url, ANVIL_KEY).unwrap();
+    let dep = deploy_contracts(&anvil.rpc_url, ANVIL_KEY).await.unwrap();
     let datadir = tempfile::tempdir().unwrap();
     let _node = NodeHandle::spawn(datadir.path(), &node_env(&anvil.rpc_url, &dep)).unwrap();
 
@@ -97,7 +97,7 @@ async fn n_batches_emit_n_events() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_rollup_id_no_batches_post() {
     let anvil = Anvil::spawn(free_port()).await.unwrap();
-    let dep = deploy_contracts(&anvil.rpc_url, ANVIL_KEY).unwrap();
+    let dep = deploy_contracts(&anvil.rpc_url, ANVIL_KEY).await.unwrap();
     let mut env = node_env(&anvil.rpc_url, &dep);
     for (k, v) in &mut env {
         if *k == "EEZ_ROLLUP_ID" {
@@ -131,7 +131,7 @@ async fn wrong_rollup_id_no_batches_post() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l1_outage_recovers() {
     let anvil = Anvil::spawn(free_port()).await.unwrap();
-    let dep = deploy_contracts(&anvil.rpc_url, ANVIL_KEY).unwrap();
+    let dep = deploy_contracts(&anvil.rpc_url, ANVIL_KEY).await.unwrap();
     let datadir = tempfile::tempdir().unwrap();
     let _node = NodeHandle::spawn(datadir.path(), &node_env(&anvil.rpc_url, &dep)).unwrap();
 
@@ -163,7 +163,7 @@ async fn l1_outage_recovers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_catch_up() {
     let anvil = Anvil::spawn(free_port()).await.unwrap();
-    let dep = deploy_contracts(&anvil.rpc_url, ANVIL_KEY).unwrap();
+    let dep = deploy_contracts(&anvil.rpc_url, ANVIL_KEY).await.unwrap();
     let datadir = tempfile::tempdir().unwrap();
     let env = node_env(&anvil.rpc_url, &dep);
 

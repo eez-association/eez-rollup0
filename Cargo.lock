@@ -2793,6 +2793,7 @@ dependencies = [
  "reth-ethereum-cli",
  "reth-node-builder",
  "reth-node-ethereum",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

@@ -11,9 +11,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy_primitives::{Address, B256, U256, address};
+use alloy_primitives::{Address, B256, U256, address, hex};
 use alloy_provider::{Provider, ProviderBuilder};
-use alloy_sol_types::sol;
+use alloy_rpc_types_eth::TransactionRequest;
+use alloy_signer_local::PrivateKeySigner;
+use alloy_sol_types::{SolCall, SolValue, sol};
 use anyhow::{Context, Result, anyhow, bail};
 
 /// Anvil's first default account (mnemonic `test test test test test test test test test test test junk`).
@@ -120,69 +122,94 @@ sol! {
         event BatchPosted(uint256 rollupCount);
         event L2ExecutionPerformed(uint256 indexed rollupId, bytes32 newState);
         function rollups(uint256 rollupId) external view returns (address rollupContract, bytes32 stateRoot, uint256 etherBalance);
+        function rollupCounter() external view returns (uint256);
+        function registerRollup(address rollupContract, bytes32 initialState) external returns (uint256 rollupId);
     }
 }
 
-/// Run the 4-step deploy via forge scripts. Inlined here rather than
-/// shelling to `scripts/deploy.sh` so each test gets isolated state
-/// (the bash script writes a shared `deployments.env`).
-pub fn deploy_contracts(rpc_url: &str, key: &str) -> Result<Deployment> {
-    let signer_addr = derive_address(key)?;
-    let contracts_dir = repo_root().join("contracts");
+/// Deploy `EEZ` + `MockECDSAProofSystem` + `Rollup`, then register the rollup.
+/// Pure alloy — reads compiled foundry artifacts and sends each deploy
+/// as an in-process tx. Mirrors `sync-rollups-composer`'s
+/// `tests/e2e_anvil.rs` pattern (and that of every other Rust rollup
+/// codebase surveyed). Prereq: `forge build` must have run in
+/// `contracts/`.
+pub async fn deploy_contracts(rpc_url: &str, key: &str) -> Result<Deployment> {
+    // Anvil auto-signs for its default accounts when `from` is set; no wallet
+    // filler needed. Matches sync-rollups-composer's pattern.
+    let signer: PrivateKeySigner = key
+        .strip_prefix("0x")
+        .unwrap_or(key)
+        .parse()
+        .context("parse signer key")?;
+    let signer_addr = signer.address();
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
 
-    let eez_address = forge_extract(
-        &contracts_dir,
-        &["script/DeployEEZ.s.sol:DeployEEZ"],
-        rpc_url,
-        key,
-        "EEZ",
-    )?;
-    let deploy_block = current_block(rpc_url)?;
+    let out = repo_root().join("contracts/out");
 
-    let mock_ps_address = forge_extract(
-        &contracts_dir,
-        &[
-            "script/DeployMockECDSAProofSystem.s.sol:DeployMockECDSAProofSystem",
-            "--sig",
-            "run(address)",
-            &format!("{signer_addr:#x}"),
-        ],
-        rpc_url,
-        key,
-        "MOCK_PS",
-    )?;
+    let eez_address = deploy(
+        &provider,
+        signer_addr,
+        &out.join("EEZ.sol/EEZ.json"),
+        Vec::new(),
+    )
+    .await?;
+    let deploy_block = provider.get_block_number().await?;
 
-    let rollup_manager_address = forge_extract(
-        &contracts_dir,
-        &[
-            "script/DeployRollup.s.sol:DeployRollup",
-            "--sig",
-            "run(address,address,address,address)",
-            &format!("{eez_address:#x}"),
-            &format!("{mock_ps_address:#x}"),
-            &format!("{signer_addr:#x}"),
-            &format!("{signer_addr:#x}"),
-        ],
-        rpc_url,
-        key,
-        "ROLLUP_CONTRACT",
-    )?;
+    let mock_ps_address = deploy(
+        &provider,
+        signer_addr,
+        &out.join("MockECDSAProofSystem.sol/MockECDSAProofSystem.json"),
+        signer_addr.abi_encode(),
+    )
+    .await?;
 
-    let initial_state = B256::ZERO;
-    let rollup_id = forge_extract_uint(
-        &contracts_dir,
-        &[
-            "script/RegisterRollup.s.sol:RegisterRollup",
-            "--sig",
-            "run(address,address,bytes32)",
-            &format!("{eez_address:#x}"),
-            &format!("{rollup_manager_address:#x}"),
-            &format!("{initial_state:#x}"),
-        ],
-        rpc_url,
-        key,
-        "L2_ROLLUP_ID",
-    )?;
+    // Rollup(address eez, address owner, uint256 threshold,
+    //        address[] proofSystems, bytes32[] vkeys)
+    let proof_systems: Vec<Address> = vec![mock_ps_address];
+    // vkey embeds the authorized signer address; the registry treats vkey as
+    // opaque but checks non-zero + membership (see DeployRollup.s.sol:60).
+    let vkeys: Vec<B256> = vec![B256::from_slice(&{
+        let mut padded = [0u8; 32];
+        padded[12..].copy_from_slice(signer_addr.as_slice());
+        padded
+    })];
+    let rollup_manager_address = deploy(
+        &provider,
+        signer_addr,
+        &out.join("Rollup.sol/Rollup.json"),
+        (
+            eez_address,
+            signer_addr,
+            U256::from(1u64),
+            proof_systems,
+            vkeys,
+        )
+            .abi_encode_params(),
+    )
+    .await?;
+
+    // registerRollup via a plain eth_sendTransaction (anvil signs for default
+    // accounts); avoids the alloy wallet-filler requirement on `to`.
+    let calldata = IEEZ::registerRollupCall {
+        rollupContract: rollup_manager_address,
+        initialState: B256::ZERO,
+    }
+    .abi_encode();
+    let receipt = provider
+        .send_transaction(
+            TransactionRequest::default()
+                .from(signer_addr)
+                .to(eez_address)
+                .input(calldata.into()),
+        )
+        .await?
+        .get_receipt()
+        .await?;
+    if !receipt.status() {
+        bail!("registerRollup tx reverted");
+    }
+    let registry = IEEZ::new(eez_address, &provider);
+    let rollup_id = registry.rollupCounter().call().await?.try_into()?;
 
     Ok(Deployment {
         eez_address,
@@ -193,88 +220,38 @@ pub fn deploy_contracts(rpc_url: &str, key: &str) -> Result<Deployment> {
     })
 }
 
-fn forge_extract(
-    cwd: &std::path::Path,
-    args: &[&str],
-    rpc_url: &str,
-    key: &str,
-    label: &str,
+async fn deploy<P: Provider>(
+    provider: &P,
+    from: Address,
+    artifact_path: &std::path::Path,
+    constructor_args: Vec<u8>,
 ) -> Result<Address> {
-    let out = forge_run(cwd, args, rpc_url, key)?;
-    let needle = format!("{label}=");
-    let raw = out
-        .lines()
-        .filter_map(|l| l.find(&needle).map(|i| &l[i + needle.len()..]))
-        .filter_map(|s| s.split_whitespace().next())
-        .next_back()
-        .ok_or_else(|| anyhow!("forge: {label} not found in output:\n{out}"))?;
-    raw.parse::<Address>()
-        .with_context(|| format!("parse {label} = {raw}"))
-}
-
-fn forge_extract_uint(
-    cwd: &std::path::Path,
-    args: &[&str],
-    rpc_url: &str,
-    key: &str,
-    label: &str,
-) -> Result<u64> {
-    let out = forge_run(cwd, args, rpc_url, key)?;
-    let needle = format!("{label}=");
-    let raw = out
-        .lines()
-        .filter_map(|l| l.find(&needle).map(|i| &l[i + needle.len()..]))
-        .filter_map(|s| s.split_whitespace().next())
-        .next_back()
-        .ok_or_else(|| anyhow!("forge: {label} not found in output:\n{out}"))?;
-    raw.parse::<u64>()
-        .with_context(|| format!("parse {label} = {raw}"))
-}
-
-fn forge_run(cwd: &std::path::Path, args: &[&str], rpc_url: &str, key: &str) -> Result<String> {
-    let mut cmd = Command::new("forge");
-    cmd.current_dir(cwd).arg("script").args(args).args([
-        "--rpc-url",
-        rpc_url,
-        "--private-key",
-        key,
-        "--broadcast",
-    ]);
-    let out = cmd.output().context("spawn forge")?;
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    if !out.status.success() {
-        bail!("forge failed: {combined}");
+    let artifact: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(artifact_path)
+            .with_context(|| format!("read {}", artifact_path.display()))?,
+    )?;
+    let bytecode_hex = artifact["bytecode"]["object"]
+        .as_str()
+        .ok_or_else(|| anyhow!("bytecode.object not found in {}", artifact_path.display()))?
+        .strip_prefix("0x")
+        .unwrap_or_default();
+    let mut deploy_data = hex::decode(bytecode_hex).context("decode bytecode hex")?;
+    deploy_data.extend_from_slice(&constructor_args);
+    let receipt = provider
+        .send_transaction(
+            TransactionRequest::default()
+                .from(from)
+                .input(deploy_data.into()),
+        )
+        .await?
+        .get_receipt()
+        .await?;
+    if !receipt.status() {
+        bail!("deploy of {} reverted", artifact_path.display());
     }
-    Ok(combined)
-}
-
-fn derive_address(key: &str) -> Result<Address> {
-    let out = Command::new("cast")
-        .args(["wallet", "address", "--private-key", key])
-        .output()
-        .context("spawn cast")?;
-    if !out.status.success() {
-        bail!("cast failed: {}", String::from_utf8_lossy(&out.stderr));
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse::<Address>()
-        .context("parse cast address")
-}
-
-fn current_block(rpc_url: &str) -> Result<u64> {
-    let out = Command::new("cast")
-        .args(["block-number", "--rpc-url", rpc_url])
-        .output()
-        .context("spawn cast block-number")?;
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse()
-        .context("parse block number")
+    receipt
+        .contract_address
+        .ok_or_else(|| anyhow!("no contract_address in receipt for {}", artifact_path.display()))
 }
 
 pub struct NodeHandle {
