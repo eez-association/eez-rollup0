@@ -120,6 +120,9 @@ impl Submitter {
         batch: ProofSystemBatchPerVerificationEntries,
         target: BundleTarget,
     ) -> L1Result<SendOutcome> {
+        fail::fail_point!("submitter::send::start", |_| Err(L1Error::Submission(
+            "injected failpoint: submitter::send::start".into()
+        )));
         let provider = self.inner.build_provider();
         let from = self.inner.config.poster.address();
         let eez = EezRegistry::new(self.inner.config.eez, &provider);
