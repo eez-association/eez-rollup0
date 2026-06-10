@@ -95,7 +95,7 @@ impl Anvil {
     /// revert at the simulation step with `insufficient funds`.
     pub async fn set_balance(&self, addr: Address, wei: U256) -> Result<()> {
         let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
-        let _: bool = provider
+        let _: serde_json::Value = provider
             .client()
             .request("anvil_setBalance", (addr, wei))
             .await
@@ -122,6 +122,101 @@ impl Drop for Anvil {
     }
 }
 
+/// Minimal `eth_sendBundle` stub: forwards bundles to anvil via
+/// `eth_sendRawTransaction`. Required because PR #6 routes submissions
+/// through `eth_sendBundle`, which anvil doesn't implement.
+pub struct BundleStub {
+    child: Child,
+    pub url: String,
+}
+
+impl BundleStub {
+    pub async fn spawn(port: u16, upstream: &str) -> Result<Self> {
+        let script = repo_root().join("scripts/builder-stub.py");
+        let listen = format!("127.0.0.1:{port}");
+        let child = Command::new("python3")
+            .arg(script)
+            .args(["--listen", &listen, "--upstream", upstream])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn builder-stub.py")?;
+        let url = format!("http://{listen}");
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if std::net::TcpStream::connect(&listen).is_ok() {
+                return Ok(Self { child, url });
+            }
+        }
+        bail!("builder-stub did not bind within 3s on {listen}");
+    }
+}
+
+impl Drop for BundleStub {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Per-test fixture: anvil + bundle stub + deployed protocol. Every
+/// test starts with `let bench = Bench::fresh().await`; eliminates the
+/// 4-line preamble duplicated across tests.
+pub struct Bench {
+    pub anvil: Anvil,
+    pub stub: BundleStub,
+    pub dep: Deployment,
+}
+
+impl Bench {
+    pub async fn fresh() -> Result<Self> {
+        let anvil = Anvil::spawn(free_port()).await?;
+        let stub = BundleStub::spawn(free_port(), &anvil.rpc_url).await?;
+        let dep = deploy_contracts(&anvil.rpc_url, ANVIL_KEY).await?;
+        Ok(Self { anvil, stub, dep })
+    }
+
+    pub fn chain(&self) -> Chain<'_> {
+        Chain::new(&self.anvil, &self.dep)
+    }
+
+    /// Default env for spawning `eez-node` against this bench.
+    pub fn env(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
+            ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
+            ("EEZ_L1_POSTER_KEY", ANVIL_KEY.to_string()),
+            ("EEZ_PROOF_SIGNER_KEY", ANVIL_KEY.to_string()),
+            (
+                "EEZ_REGISTRY_ADDRESS",
+                format!("{:#x}", self.dep.eez_address),
+            ),
+            (
+                "EEZ_REGISTRY_DEPLOY_BLOCK",
+                self.dep.deploy_block.to_string(),
+            ),
+            (
+                "EEZ_MOCK_PROOF_SYSTEM_ADDRESS",
+                format!("{:#x}", self.dep.mock_ps_address),
+            ),
+            (
+                "EEZ_ROLLUP_MANAGER_ADDRESS",
+                format!("{:#x}", self.dep.rollup_manager_address),
+            ),
+            ("EEZ_ROLLUP_ID", self.dep.rollup_id.to_string()),
+            ("EEZ_COMPOSER_INTERVAL_SECS", "1".to_string()),
+            (
+                "EEZ_L2_DATADIR",
+                "/tmp/unused-overridden-by-flag".to_string(),
+            ),
+            (
+                "RUST_LOG",
+                std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
+            ),
+        ]
+    }
+}
+
 pub struct Deployment {
     pub eez_address: Address,
     pub deploy_block: u64,
@@ -140,6 +235,16 @@ sol! {
         function rollupCounter() external view returns (uint256);
         function registerRollup(address rollupContract, bytes32 initialState) external returns (uint256 rollupId);
     }
+}
+
+/// Reth's `--chain dev` genesis state root. Used as the `initialState`
+/// when registering the rollup so the very first batch's prestate
+/// (`l2_state_root(0)`) matches the on-chain `rollups[rid].stateRoot`.
+/// With the default `B256::ZERO`, every batch's `_applyStateDeltas`
+/// reverts with `StateRootMismatch`, caught by the try/catch,
+/// emitting `ImmediateEntrySkipped` instead of `L2ExecutionPerformed`.
+pub fn dev_genesis_state_root() -> B256 {
+    reth_chainspec::DEV.genesis_header().state_root
 }
 
 /// Deploy `EEZ` + `MockECDSAProofSystem` + `Rollup`, then register the rollup.
@@ -207,7 +312,7 @@ pub async fn deploy_contracts(rpc_url: &str, key: &str) -> Result<Deployment> {
     // accounts); avoids the alloy wallet-filler requirement on `to`.
     let calldata = IEEZ::registerRollupCall {
         rollupContract: rollup_manager_address,
-        initialState: B256::ZERO,
+        initialState: dev_genesis_state_root(),
     }
     .abi_encode();
     let receipt = provider
