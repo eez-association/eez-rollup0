@@ -15,7 +15,7 @@ use alloy_primitives::{Address, B256, U256, address, hex};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::{SolCall, SolValue, sol};
+use alloy_sol_types::{SolCall, SolEvent, SolValue, sol};
 use anyhow::{Context, Result, anyhow, bail};
 
 /// Anvil's first default account (mnemonic `test test test test test test test test test test test junk`).
@@ -361,6 +361,100 @@ where
     bail!("timed out after {timeout:?}");
 }
 
+/// Intent-revealing wrapper around `rpc_url + deployment` for queries
+/// that tests make repeatedly. Methods read like prose so tests stay
+/// short and the invariants stay visible.
+pub struct Chain<'a> {
+    rpc_url: &'a str,
+    eez_address: Address,
+    deploy_block: u64,
+    rollup_id: u64,
+}
+
+impl<'a> Chain<'a> {
+    pub fn new(anvil: &'a Anvil, dep: &Deployment) -> Self {
+        Self {
+            rpc_url: &anvil.rpc_url,
+            eez_address: dep.eez_address,
+            deploy_block: dep.deploy_block,
+            rollup_id: dep.rollup_id,
+        }
+    }
+
+    pub async fn batches_posted(&self) -> Result<usize> {
+        count_events(
+            self.rpc_url,
+            self.eez_address,
+            IEEZ::BatchPosted::SIGNATURE_HASH,
+            self.deploy_block,
+        )
+        .await
+    }
+
+    pub async fn executions_performed(&self) -> Result<usize> {
+        count_events(
+            self.rpc_url,
+            self.eez_address,
+            IEEZ::L2ExecutionPerformed::SIGNATURE_HASH,
+            self.deploy_block,
+        )
+        .await
+    }
+
+    pub async fn entries_skipped(&self) -> Result<usize> {
+        count_events(
+            self.rpc_url,
+            self.eez_address,
+            IEEZ::ImmediateEntrySkipped::SIGNATURE_HASH,
+            self.deploy_block,
+        )
+        .await
+    }
+
+    pub async fn state_root(&self) -> Result<B256> {
+        state_root(self.rpc_url, self.eez_address, self.rollup_id).await
+    }
+
+    pub async fn latest_execution_state(&self) -> Result<Option<B256>> {
+        latest_l2_execution_state(
+            self.rpc_url,
+            self.eez_address,
+            self.rollup_id,
+            self.deploy_block,
+        )
+        .await
+    }
+
+    pub async fn block_number(&self) -> Result<u64> {
+        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
+        Ok(provider.get_block_number().await?)
+    }
+
+    /// Wait for L1 to advance `n` more blocks from now.
+    pub async fn wait_for_l1_blocks(&self, n: u64, timeout: Duration) -> Result<u64> {
+        let from = self.block_number().await?;
+        wait_for_l1_blocks(self.rpc_url, from + n, timeout).await
+    }
+
+    /// Wait until ≥ `n` `BatchPosted` events visible.
+    pub async fn wait_for_batches(&self, n: usize, timeout: Duration) -> Result<usize> {
+        wait_for(timeout, || async {
+            let count = self.batches_posted().await?;
+            Ok((count >= n).then_some(count))
+        })
+        .await
+    }
+
+    /// Wait until `state_root()` becomes something other than `from`.
+    pub async fn wait_for_state_change(&self, from: B256, timeout: Duration) -> Result<B256> {
+        wait_for(timeout, || async {
+            let root = self.state_root().await?;
+            Ok((root != from).then_some(root))
+        })
+        .await
+    }
+}
+
 /// Wait until L1's `block_number >= target`. Lets tests assert "the
 /// composer had at least N opportunities to act" without arbitrary
 /// sleeps — at anvil's 1s block time, target = current + N is ~N
@@ -409,7 +503,6 @@ pub async fn latest_l2_execution_state(
     from_block: u64,
 ) -> Result<Option<B256>> {
     use alloy_rpc_types_eth::Filter;
-    use alloy_sol_types::SolEvent;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let filter = Filter::new()
         .address(contract)
