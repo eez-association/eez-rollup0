@@ -2775,8 +2775,13 @@ dependencies = [
 name = "eez-node"
 version = "0.1.0"
 dependencies = [
+ "alloy-contract",
  "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types-eth",
  "alloy-signer-local",
+ "alloy-sol-types",
+ "anyhow",
  "clap",
  "dotenvy",
  "eez-driver",
@@ -2788,6 +2793,7 @@ dependencies = [
  "reth-ethereum-cli",
  "reth-node-builder",
  "reth-node-ethereum",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",

@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - run: cargo +nightly fmt --all --check
+
+  build-and-unit:
+    name: Build, Clippy & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: Unit tests
+        run: cargo nextest run --workspace --lib
+
+  e2e-anvil:
+    name: E2E (anvil + eez-node)
+    runs-on: ubuntu-latest
+    needs: [build-and-unit]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: Run integration tests
+        run: cargo nextest run --workspace --test '*' --no-fail-fast

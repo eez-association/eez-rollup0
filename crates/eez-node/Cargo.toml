@@ -30,5 +30,13 @@ tokio.workspace              = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+alloy-contract.workspace = true
+alloy-provider = { workspace = true, features = ["reqwest"] }
+alloy-rpc-types-eth.workspace = true
+alloy-sol-types.workspace = true
+anyhow = "1"
+tempfile = "3"
+
 [lints]
 workspace = true
