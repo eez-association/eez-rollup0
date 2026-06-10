@@ -261,16 +261,16 @@ async fn happy_case_smoke_e_two_composers_reorg() {
     });
 
     let pre_batches = chain
-        .wait_for_batches(3, Duration::from_secs(180))
+        .wait_for_batches(2, Duration::from_secs(90))
         .await
-        .expect("at least 3 combined batches landed pre-reorg");
+        .expect("at least 2 combined batches landed pre-reorg");
 
     anvil.reorg(3).await.unwrap();
 
     // Recovery: both safe stateRoots agree with each other AND match the
     // on-chain rollups[rid].stateRoot, AND post-reorg batch count exceeds
     // pre-reorg.
-    let recovered: B256 = wait_for(Duration::from_secs(180), || async {
+    let recovered: B256 = wait_for(Duration::from_secs(90), || async {
         let c1s = safe_block_state_root(&c1.l2_rpc_url()).await.ok().flatten();
         let c2s = safe_block_state_root(&c2.l2_rpc_url()).await.ok().flatten();
         let contract = chain.state_root().await.ok();

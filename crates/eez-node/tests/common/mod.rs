@@ -84,11 +84,12 @@ impl Default for AnvilConfig {
 }
 
 impl AnvilConfig {
-    /// 5s block time, hardhat mnemonic, cancun hardfork, 30M gas.
-    /// Mirrors the team's smoke-e.sh / chiado cadence.
+    /// 1s block time, hardhat mnemonic, cancun hardfork, 30M gas.
+    /// (The team's smoke-e.sh uses 5s to mirror chiado; tests prefer
+    /// speed over fidelity. 1s blocks + cancun still permit anvil_reorg.)
     pub fn for_reorg() -> Self {
         Self {
-            block_time_secs: 5,
+            block_time_secs: 1,
             mnemonic: Some(HARDHAT_MNEMONIC),
             hardfork: Some("cancun"),
             gas_limit: Some(30_000_000),
@@ -437,7 +438,7 @@ pub fn smoke_node_env(
             format!("{:#x}", dep.rollup_manager_address),
         ),
         ("EEZ_ROLLUP_ID", dep.rollup_id.to_string()),
-        ("EEZ_COMPOSER_INTERVAL_SECS", "3".to_string()),
+        ("EEZ_COMPOSER_INTERVAL_SECS", "1".to_string()),
         (
             "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES",
             expect_external.to_string(),
