@@ -584,11 +584,14 @@ async fn deploy<P: Provider>(
 
 pub struct NodeHandle {
     child: Child,
-    /// Where the node's merged stdout+stderr is written. Always set;
-    /// goes to `EEZ_TEST_LOG_DIR/eez-node-<pid>.log` if that env var is
-    /// set, otherwise a per-instance tempfile (kept alive by `_tempdir`).
+    /// Where the node's merged stdout+stderr is written. Goes to
+    /// `EEZ_TEST_LOG_DIR/eez-node-<pid>.log` if that env var is set,
+    /// otherwise inside a tempdir held in `keep_alive`.
     pub log_path: PathBuf,
-    _tempdir: Option<tempfile::TempDir>,
+    /// Tempdirs whose lifetime is tied to this handle (the log dir if
+    /// we allocated one, and the datadir if the handle created it via
+    /// [`Self::start`]). They drop with the handle.
+    keep_alive: Vec<tempfile::TempDir>,
     /// L2 HTTP RPC port for this node — tracked so tests that need to
     /// send L2 txs to it (the multi-composer reorg test's collector) can target it.
     pub http_port: u16,
@@ -682,13 +685,50 @@ impl NodeHandle {
         Ok(Self {
             child,
             log_path,
-            _tempdir: log_tempdir,
+            keep_alive: log_tempdir.into_iter().collect(),
             http_port,
         })
     }
 
+    /// Async convenience: allocate a fresh datadir tempdir, spawn the
+    /// node, wait for its L2 HTTP RPC to come up. Datadir is owned by
+    /// the returned handle (dropped with it). Use [`Self::spawn_with`]
+    /// directly when a test needs to share a datadir across handles
+    /// (kill+respawn).
+    pub async fn start(cfg: &NodeConfig<'_>, env: &[(&'static str, String)]) -> Result<Self> {
+        let datadir = tempfile::tempdir().context("datadir tempdir")?;
+        let mut handle = Self::spawn_with(datadir.path(), cfg, env)?;
+        handle.keep_alive.push(datadir);
+        wait_for_l2_rpc(&handle.l2_rpc_url(), Duration::from_secs(90)).await?;
+        Ok(handle)
+    }
+
     pub fn l2_rpc_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.http_port)
+    }
+
+    /// Assert this node's deriver detected and retreated from the L1
+    /// reorg. Without this check the reorg test would silently pass
+    /// even if reorg detection regressed (some unrelated re-derivation
+    /// path could re-converge state).
+    pub fn assert_reorg_seen(&self, who: &str) {
+        let patterns = ["reorg rolled out", "l1.reorg.retreated"];
+        assert!(
+            self.log_count_matching(&patterns).unwrap() > 0,
+            "{who} deriver missed the reorg",
+        );
+    }
+
+    /// Assert this node never logged a fatal-class line (process death
+    /// markers). Without this, every other invariant check is moot —
+    /// a dead node trivially "agrees" by virtue of having stopped.
+    pub fn assert_no_process_death(&self, who: &str) {
+        let patterns = ["Fatal", "UnexpectedStaticFile"];
+        assert_eq!(
+            self.log_count_matching(&patterns).unwrap(),
+            0,
+            "{who} fatal error",
+        );
     }
 
     /// Count lines in `log_path` matching ANY of `patterns` (substring
@@ -920,4 +960,44 @@ pub async fn all_l2_execution_states(
                 .map_err(Into::into)
         })
         .collect()
+}
+
+/// Wait until `node.safe.stateRoot` appears in the contract's
+/// `L2ExecutionPerformed` history for this `Chain`. The attestation
+/// set grows monotonically, so this doesn't race the contract's
+/// advancing head: any past attestation matching the node's current
+/// safe head proves the node imported a block the contract has, at
+/// some point, declared canonical.
+pub async fn wait_for_node_caught_up(
+    node: &NodeHandle,
+    chain: &Chain<'_>,
+    timeout: Duration,
+) -> Result<()> {
+    wait_for(timeout, || async {
+        let node_root = safe_block_state_root(&node.l2_rpc_url())
+            .await
+            .ok()
+            .flatten();
+        let attested = chain.executed_states().await.unwrap_or_default();
+        Ok(match node_root {
+            Some(n) if n != B256::ZERO && attested.contains(&n) => Some(()),
+            _ => None,
+        })
+    })
+    .await
+}
+
+/// Return `env` with `key`'s value replaced by `value`. No-op if `key`
+/// isn't present.
+pub fn override_env(
+    mut env: Vec<(&'static str, String)>,
+    key: &str,
+    value: &str,
+) -> Vec<(&'static str, String)> {
+    for (k, v) in &mut env {
+        if *k == key {
+            *v = value.to_string();
+        }
+    }
+    env
 }

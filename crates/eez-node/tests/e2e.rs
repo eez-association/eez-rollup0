@@ -12,8 +12,8 @@ use alloy_primitives::{B256, U256};
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig,
-    Harness, NodeConfig, NodeHandle, reorg_genesis_path, reorg_genesis_state_root,
-    safe_block_state_root, send_l2_value_transfer, wait_for, wait_for_l2_rpc,
+    Harness, NodeConfig, NodeHandle, override_env, reorg_genesis_path, reorg_genesis_state_root,
+    send_l2_value_transfer, wait_for_node_caught_up,
 };
 
 /// Builder mode, sustained operation through a restart. Asserts every
@@ -233,19 +233,16 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     let cfg = NodeConfig {
         genesis_path: Some(genesis.as_path()),
     };
-    let c1_datadir = tempfile::tempdir().unwrap();
-    let c2_datadir = tempfile::tempdir().unwrap();
-    let c1 =
-        NodeHandle::spawn_with(c1_datadir.path(), &cfg, &harness.env_for(ANVIL_KEY, true)).unwrap();
-    let c2 = NodeHandle::spawn_with(c2_datadir.path(), &cfg, &harness.env_for(ANVIL_KEY_4, true))
-        .unwrap();
-
-    wait_for_l2_rpc(&c1.l2_rpc_url(), Duration::from_secs(90))
-        .await
-        .unwrap();
-    wait_for_l2_rpc(&c2.l2_rpc_url(), Duration::from_secs(90))
-        .await
-        .unwrap();
+    // Start both concurrently — sequential start lets c1 race alone
+    // long enough to skew batch-race dynamics and (empirically) drop
+    // the L1-reorg notification.
+    let env1 = harness.env_for(ANVIL_KEY, true);
+    let env2 = harness.env_for(ANVIL_KEY_4, true);
+    let (c1, c2) = tokio::try_join!(
+        NodeHandle::start(&cfg, &env1),
+        NodeHandle::start(&cfg, &env2),
+    )
+    .unwrap();
 
     // Collector: best-effort L2 value transfers every 4s. Sends are
     // `let _ =` because during `anvil_reorg` the nonce view goes stale,
@@ -300,58 +297,10 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     collector.await.unwrap();
 
     // I2 — Both derivers logged the retreat.
-    let retreat = ["reorg rolled out", "l1.reorg.retreated"];
-    assert!(
-        c1.log_count_matching(&retreat).unwrap() > 0,
-        "c1 deriver missed the reorg"
-    );
-    assert!(
-        c2.log_count_matching(&retreat).unwrap() > 0,
-        "c2 deriver missed the reorg"
-    );
+    c1.assert_reorg_seen("c1");
+    c2.assert_reorg_seen("c2");
 
     // I1 — No process death.
-    let fatal = ["Fatal", "UnexpectedStaticFile"];
-    assert_eq!(c1.log_count_matching(&fatal).unwrap(), 0, "c1 fatal error");
-    assert_eq!(c2.log_count_matching(&fatal).unwrap(), 0, "c2 fatal error");
-}
-
-/// Helper for invariant I3 of the reorg test.
-///
-/// Polls the node's `safe.stateRoot` and the contract's full
-/// `L2ExecutionPerformed` history; succeeds the moment the node's root
-/// appears in that set. The set grows monotonically, so we don't race
-/// the contract's advancing head — any past attestation that matches
-/// the node's current safe head proves the node imported a block the
-/// contract has, at some point, declared canonical.
-async fn wait_for_node_caught_up(
-    node: &NodeHandle,
-    chain: &common::Chain<'_>,
-    timeout: Duration,
-) -> anyhow::Result<()> {
-    wait_for(timeout, || async {
-        let node_root = safe_block_state_root(&node.l2_rpc_url())
-            .await
-            .ok()
-            .flatten();
-        let attested = chain.executed_states().await.unwrap_or_default();
-        Ok(match node_root {
-            Some(n) if n != B256::ZERO && attested.contains(&n) => Some(()),
-            _ => None,
-        })
-    })
-    .await
-}
-
-fn override_env(
-    mut env: Vec<(&'static str, String)>,
-    key: &str,
-    value: &str,
-) -> Vec<(&'static str, String)> {
-    for (k, v) in &mut env {
-        if *k == key {
-            *v = value.to_string();
-        }
-    }
-    env
+    c1.assert_no_process_death("c1");
+    c2.assert_no_process_death("c2");
 }
