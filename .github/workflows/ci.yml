@@ -15,8 +15,8 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  build-and-unit:
-    name: Format, Clippy & Unit Tests
+  ci:
+    name: Format, Clippy, Unit & E2E
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -27,6 +27,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
+      - name: Install nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2
+        with:
+          tool: nextest
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -35,34 +41,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Install nextest
-        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2
-        with:
-          tool: nextest
       - name: Unit tests
         run: cargo nextest run --workspace --lib
-
-  e2e-anvil:
-    name: E2E (anvil + eez-node)
-    runs-on: ubuntu-latest
-    needs: [build-and-unit]
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # @stable
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
-      - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake
-      - name: Install nextest
-        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2
-        with:
-          tool: nextest
       - name: Build contracts (artifacts read by harness)
         working-directory: contracts
         run: forge build
