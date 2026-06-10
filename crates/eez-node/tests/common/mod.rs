@@ -29,6 +29,12 @@ pub const ANVIL_KEY_3: &str = "0x7c852118294e51e653712a81e05800f419141751be58f60
 pub const ANVIL_KEY_4: &str = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a";
 pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906");
 
+/// Composer tick cadence for single-composer tests — max speed.
+pub const COMPOSER_INTERVAL_SINGLE: Duration = Duration::from_secs(1);
+/// Composer tick cadence for multi-composer contention — gives the
+/// deriver time to re-sync between ticks (1-tick-per-2-blocks ratio).
+pub const COMPOSER_INTERVAL_MULTI: Duration = Duration::from_secs(2);
+
 pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -300,12 +306,15 @@ impl Harness {
                 format!("{:#x}", self.dep.rollup_manager_address),
             ),
             ("EEZ_ROLLUP_ID", self.dep.rollup_id.to_string()),
-            // 1s for single-composer tests (max speed); 2s for multi-composer
-            // contention (1-tick-per-2-blocks ratio gives the deriver time to
-            // re-sync between ticks, matching bash smoke's ratio).
             (
                 "EEZ_COMPOSER_INTERVAL_SECS",
-                if expect_external_batches { "2" } else { "1" }.to_string(),
+                if expect_external_batches {
+                    COMPOSER_INTERVAL_MULTI
+                } else {
+                    COMPOSER_INTERVAL_SINGLE
+                }
+                .as_secs()
+                .to_string(),
             ),
             (
                 "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES",
@@ -584,6 +593,8 @@ async fn deploy<P: Provider>(
 
 pub struct NodeHandle {
     child: Child,
+    /// Human label for assertion messages ("c1", "c2", or the default "node").
+    pub name: String,
     /// Where the node's merged stdout+stderr is written. Goes to
     /// `EEZ_TEST_LOG_DIR/eez-node-<pid>.log` if that env var is set,
     /// otherwise inside a tempdir held in `keep_alive`.
@@ -607,7 +618,7 @@ impl NodeHandle {
     /// Spawn `eez-node` against `datadir` with `--chain dev` and the
     /// given env. See [`Self::spawn_with`] for custom genesis.
     pub fn spawn(datadir: &std::path::Path, env: &[(&'static str, String)]) -> Result<Self> {
-        Self::spawn_with(datadir, &NodeConfig::default(), env)
+        Self::spawn_with("node", datadir, &NodeConfig::default(), env)
     }
 
     /// Spawn `eez-node` against `datadir` with the given config + env.
@@ -616,6 +627,7 @@ impl NodeHandle {
     /// test-built binary path (`CARGO_BIN_EXE_eez-node`) directly —
     /// skips the `cargo run` metadata-resolution overhead per spawn.
     pub fn spawn_with(
+        name: &str,
         datadir: &std::path::Path,
         cfg: &NodeConfig<'_>,
         env: &[(&'static str, String)],
@@ -684,6 +696,7 @@ impl NodeHandle {
         let child = cmd.spawn().context("spawn eez-node")?;
         Ok(Self {
             child,
+            name: name.to_string(),
             log_path,
             keep_alive: log_tempdir.into_iter().collect(),
             http_port,
@@ -695,9 +708,13 @@ impl NodeHandle {
     /// the returned handle (dropped with it). Use [`Self::spawn_with`]
     /// directly when a test needs to share a datadir across handles
     /// (kill+respawn).
-    pub async fn start(cfg: &NodeConfig<'_>, env: &[(&'static str, String)]) -> Result<Self> {
+    pub async fn start(
+        name: &str,
+        cfg: &NodeConfig<'_>,
+        env: &[(&'static str, String)],
+    ) -> Result<Self> {
         let datadir = tempfile::tempdir().context("datadir tempdir")?;
-        let mut handle = Self::spawn_with(datadir.path(), cfg, env)?;
+        let mut handle = Self::spawn_with(name, datadir.path(), cfg, env)?;
         handle.keep_alive.push(datadir);
         wait_for_l2_rpc(&handle.l2_rpc_url(), Duration::from_secs(90)).await?;
         Ok(handle)
@@ -707,27 +724,45 @@ impl NodeHandle {
         format!("http://127.0.0.1:{}", self.http_port)
     }
 
+    /// Detached 1-wei spammer from `from_key`. Errors swallowed
+    /// (`anvil_reorg` stales nonces). Aborted by runtime on test return.
+    pub fn run_tx_spammer(&self, from_key: &'static str) {
+        // 2× composer cadence: enough that every tick has ≥1 pending
+        // tx; faster just hammers the RPC.
+        let interval = COMPOSER_INTERVAL_MULTI / 2;
+        let url = self.l2_rpc_url();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let _ =
+                    send_l2_value_transfer(&url, from_key, ANVIL_ADDR_3, U256::from(1u64)).await;
+            }
+        });
+    }
+
     /// Assert this node's deriver detected and retreated from the L1
     /// reorg. Without this check the reorg test would silently pass
     /// even if reorg detection regressed (some unrelated re-derivation
     /// path could re-converge state).
-    pub fn assert_reorg_seen(&self, who: &str) {
+    pub fn assert_reorg_seen(&self) {
         let patterns = ["reorg rolled out", "l1.reorg.retreated"];
         assert!(
             self.log_count_matching(&patterns).unwrap() > 0,
-            "{who} deriver missed the reorg",
+            "{} deriver missed the reorg",
+            self.name,
         );
     }
 
     /// Assert this node never logged a fatal-class line (process death
     /// markers). Without this, every other invariant check is moot —
     /// a dead node trivially "agrees" by virtue of having stopped.
-    pub fn assert_no_process_death(&self, who: &str) {
+    pub fn assert_no_process_death(&self) {
         let patterns = ["Fatal", "UnexpectedStaticFile"];
         assert_eq!(
             self.log_count_matching(&patterns).unwrap(),
             0,
-            "{who} fatal error",
+            "{} fatal error",
+            self.name,
         );
     }
 

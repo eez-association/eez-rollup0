@@ -11,10 +11,12 @@ use alloy_primitives::{B256, U256};
 
 mod common;
 use common::{
-    ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig,
-    Harness, NodeConfig, NodeHandle, override_env, reorg_genesis_path, reorg_genesis_state_root,
-    send_l2_value_transfer, wait_for_node_caught_up,
+    ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeConfig,
+    NodeHandle, override_env, reorg_genesis_path, reorg_genesis_state_root,
+    wait_for_node_caught_up,
 };
+
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Builder mode, sustained operation through a restart. Asserts every
 /// observable invariant in one place:
@@ -239,31 +241,17 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     let env1 = harness.env_for(ANVIL_KEY, true);
     let env2 = harness.env_for(ANVIL_KEY_4, true);
     let (c1, c2) = tokio::try_join!(
-        NodeHandle::start(&cfg, &env1),
-        NodeHandle::start(&cfg, &env2),
+        NodeHandle::start("c1", &cfg, &env1),
+        NodeHandle::start("c2", &cfg, &env2),
     )
     .unwrap();
 
-    // Collector: best-effort L2 value transfers every 4s. Sends are
-    // `let _ =` because during `anvil_reorg` the nonce view goes stale,
-    // dropped blocks evict pending txs, and reth's L2 RPC briefly pauses
-    // — expected transient failures. We just need *some* txs to land.
-    let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
-    let (c1_url, c2_url) = (c1.l2_rpc_url(), c2.l2_rpc_url());
-    let collector = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = &mut cancel_rx => break,
-                () = tokio::time::sleep(Duration::from_secs(4)) => {
-                    let _ = send_l2_value_transfer(&c1_url, ANVIL_KEY_1, ANVIL_ADDR_3, U256::from(1u64)).await;
-                    let _ = send_l2_value_transfer(&c2_url, ANVIL_KEY_2, ANVIL_ADDR_3, U256::from(1u64)).await;
-                }
-            }
-        }
-    });
+    // Distinct keys → independent nonce tracks per node.
+    c1.run_tx_spammer(ANVIL_KEY_1);
+    c2.run_tx_spammer(ANVIL_KEY_2);
 
     let pre_batches = chain
-        .wait_for_batches(4, Duration::from_secs(120))
+        .wait_for_batches(4, DEFAULT_TIMEOUT)
         .await
         .expect("pre-reorg: ≥4 combined batches");
 
@@ -279,28 +267,25 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     // pre-reorg count. Without this, I3 below could trivially succeed
     // against the rewound state (a stale equality, not catch-up).
     chain
-        .wait_for_batches(pre_batches + 1, Duration::from_secs(120))
+        .wait_for_batches(pre_batches + 1, DEFAULT_TIMEOUT)
         .await
         .expect("no batches landed after reorg");
 
     // I3 — Each node independently catches up to the (now-advancing)
     // contract: at some poll, `node.safe.stateRoot == contract.stateRoot`
     // sampled back-to-back. The two nodes don't have to coincide.
-    wait_for_node_caught_up(&c1, &chain, Duration::from_secs(120))
+    wait_for_node_caught_up(&c1, &chain, DEFAULT_TIMEOUT)
         .await
         .expect("c1 did not catch up to contract post-reorg");
-    wait_for_node_caught_up(&c2, &chain, Duration::from_secs(120))
+    wait_for_node_caught_up(&c2, &chain, DEFAULT_TIMEOUT)
         .await
         .expect("c2 did not catch up to contract post-reorg");
 
-    let _ = cancel_tx.send(());
-    collector.await.unwrap();
-
     // I2 — Both derivers logged the retreat.
-    c1.assert_reorg_seen("c1");
-    c2.assert_reorg_seen("c2");
+    c1.assert_reorg_seen();
+    c2.assert_reorg_seen();
 
     // I1 — No process death.
-    c1.assert_no_process_death("c1");
-    c2.assert_no_process_death("c2");
+    c1.assert_no_process_death();
+    c2.assert_no_process_death();
 }
