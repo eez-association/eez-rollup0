@@ -101,6 +101,21 @@ async fn happy_case_builder_sustained() {
         chain.state_root().await.unwrap(),
         "event-state consistency holds across restart",
     );
+
+    // Phase 3 — follower full-replay. Spawn a fresh-datadir node with
+    // sequencer + composer disabled; `Deriver::catch_up` must rebuild
+    // state from L1 events alone and land on a stateRoot the contract
+    // has attested.
+    let mut follower_env = env;
+    follower_env.push(("EEZ_SEQUENCER_DISABLED", "1".to_string()));
+    follower_env.push(("EEZ_COMPOSER_DISABLED", "1".to_string()));
+    let follower = NodeHandle::start("follower", &NodeConfig::default(), &follower_env)
+        .await
+        .unwrap();
+    wait_for_node_caught_up(&follower, &chain, DEFAULT_TIMEOUT)
+        .await
+        .expect("follower did not catch up via L1 replay");
+    follower.assert_no_process_death();
 }
 
 /// `EEZ_ROLLUP_ID=999` against a registry where only rollup 1 exists.
