@@ -257,6 +257,10 @@ where
     ///
     /// - [`DriverError::is_stale_parent`] on snapshot mismatch.
     /// - Engine-API failures or `committer_closed`.
+    ///
+    /// # Panics
+    ///
+    /// If the `last_header` mirror's `RwLock` is poisoned.
     pub async fn commit_sequenced(
         &self,
         parent_hash: B256,
