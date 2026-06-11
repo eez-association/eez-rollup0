@@ -13,8 +13,9 @@ mod common;
 use alloy_rpc_types_eth::BlockNumberOrTag;
 use common::{
     ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeBinary,
-    NodeConfig, NodeHandle, override_env, reorg_genesis_path, reorg_genesis_state_root,
-    safe_block_state_root, wait_for_node_caught_up, wait_for_real_safe_state, with_env,
+    NodeConfig, NodeHandle, block_number_at, override_env, reorg_genesis_path,
+    reorg_genesis_state_root, safe_block_state_root, wait_for_node_caught_up,
+    wait_for_real_safe_state, with_env,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
