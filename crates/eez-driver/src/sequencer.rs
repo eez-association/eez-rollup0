@@ -29,18 +29,15 @@ use std::{sync::Arc, time::Duration};
 
 use alloy_primitives::{Address, B256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_engine_primitives::EthPayloadAttributes;
-use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{BuiltPayload, PayloadTypes};
 use reth_primitives_traits::{
     AlloyBlockHeader, HeaderTy, NodePrimitives, SealedHeader, SealedHeaderFor,
 };
-use reth_storage_api::BlockReader;
 use tracing::{Level, event};
 
 use crate::block_committer::BlockCommitterHandle;
-use crate::error::{DriverError, DriverResult};
+use crate::error::DriverResult;
 use crate::scheduler::{ProposalRequest, Scheduler};
 
 /// How often the sequencer re-publishes the current forkchoice state.
@@ -191,38 +188,23 @@ where
         + Sync
         + 'static,
 {
-    /// Constructs a sequencer by reading the current best block from
-    /// Construct a sequencer: read `provider`'s best block, spawn a
-    /// `BlockCommitter` seeded with that header.
-    ///
-    /// # Errors
-    ///
-    /// `provider` (lookup failure), `missing_header` (best block has no
-    /// header — brief startup race).
-    pub fn new<P>(
-        provider: &P,
+    /// Constructs a sequencer that drives blocks through an existing
+    /// `BlockCommitter` actor (see
+    /// [`BlockCommitterHandle::spawn_from_provider`]). Sharing the
+    /// handle with the Deriver keeps all engine traffic serialized
+    /// through one task.
+    #[must_use]
+    pub fn new(
         attributes: EthAttributesBuilder<ChainSpec>,
-        to_engine: ConsensusEngineHandle<T>,
         scheduler: Scheduler,
-        payload_builder: PayloadBuilderHandle<T>,
-    ) -> DriverResult<Self>
-    where
-        P: BlockReader<Header = HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>,
-    {
-        let best = provider
-            .best_block_number()
-            .map_err(DriverError::provider)?;
-        let last_header = provider
-            .sealed_header(best)
-            .map_err(DriverError::provider)?
-            .ok_or_else(|| DriverError::missing_header(best))?;
-        let committer = BlockCommitterHandle::spawn(last_header, to_engine, payload_builder);
-        Ok(Self {
+        committer: BlockCommitterHandle<T>,
+    ) -> Self {
+        Self {
             attributes,
             scheduler,
             committer,
             speculative_limit: None,
-        })
+        }
     }
 
     /// Cap blocks above `source`'s L1-confirmed head; `advance` pauses

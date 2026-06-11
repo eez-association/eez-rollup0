@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alloy_primitives::B256;
 use eez_driver::ConfirmedHeadSource;
@@ -33,6 +33,12 @@ pub struct L1CanonicalHead {
     /// common ancestor, and by the L1-finality handler to find the
     /// highest L2 block confirmed by an L1-finalized block.
     batches: Mutex<Vec<BatchRecord>>,
+    /// Set once the Deriver completes one successful L1 batch sync
+    /// (boot catch-up or a later resync). Until then `cursor() == 0` is
+    /// indistinguishable from "nothing posted yet", so the Composer
+    /// refuses to build batches — composing from an unpopulated cursor
+    /// would post a bogus batch starting at L2 block 1.
+    initialized: AtomicBool,
 }
 
 impl L1CanonicalHead {
@@ -168,6 +174,17 @@ impl L1CanonicalHead {
     /// keeping it `<= cursor()`.
     pub fn set_finalized_l2(&self, l2_block: u64) {
         self.finalized_l2.store(l2_block, Ordering::Release);
+    }
+
+    /// `true` once the Deriver has completed a successful L1 batch sync.
+    pub fn is_initialized(&self) -> bool {
+        self.initialized.load(Ordering::Acquire)
+    }
+
+    /// Marks the cursor + index as synced with L1. Called by the
+    /// Deriver at the end of every successful catch-up / resync.
+    pub fn mark_initialized(&self) {
+        self.initialized.store(true, Ordering::Release);
     }
 }
 

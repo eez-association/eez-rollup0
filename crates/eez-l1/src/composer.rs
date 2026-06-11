@@ -124,6 +124,11 @@ where
             tokio::select! {
                 _ = ticker.tick() => {
                     match self.inner.try_compose_one_batch().await {
+                        Ok(Outcome::DeriverNotReady) => event!(
+                            name: "eez.composer.deriver_not_ready",
+                            Level::DEBUG,
+                            "deriver has not completed an L1 batch sync yet; skipping compose tick",
+                        ),
                         Ok(Outcome::NothingToDo { local, posted }) => event!(
                             name: "eez.composer.idle",
                             Level::DEBUG,
@@ -174,6 +179,10 @@ where
 
 #[derive(Debug)]
 enum Outcome {
+    /// The Deriver hasn't completed an L1 batch sync yet, so the
+    /// cursor can't be trusted — composing now would post a bogus
+    /// batch anchored at L2 block 1.
+    DeriverNotReady,
     NothingToDo {
         local: u64,
         posted: u64,
@@ -217,6 +226,13 @@ where
     }
 
     async fn try_compose_one_batch(&self) -> L1Result<Outcome> {
+        // Refuse to compose until the Deriver has synced the cursor
+        // with L1 at least once — an unpopulated cursor reads as 0,
+        // which is indistinguishable from "nothing posted yet".
+        if !self.l1_head.is_initialized() {
+            return Ok(Outcome::DeriverNotReady);
+        }
+
         // Read the L1-confirmed cursor through the shared L1CanonicalHead.
         // Deriver is the sole writer; advances + retreats are visible
         // here immediately.

@@ -243,6 +243,9 @@ where
                 .store(cumulative_l2, Ordering::Release);
         }
 
+        // Cursor + index now reflect L1; the Composer may build batches.
+        self.inner.l1_head.mark_initialized();
+
         if total_replayed > 0 {
             event!(
                 name: "eez.deriver.catch_up.done",

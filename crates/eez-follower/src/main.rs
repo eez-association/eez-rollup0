@@ -22,7 +22,6 @@ use mimalloc::MiMalloc;
 use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_ethereum::EthereumNode;
-use reth_storage_api::{BlockNumReader, HeaderProvider};
 use tracing::{Level, event};
 
 use crate::follower::Follower;
@@ -78,15 +77,15 @@ fn main() -> eyre::Result<()> {
         let beacon_engine_handle = handle.node.add_ons_handle.beacon_engine_handle.clone();
         let task_executor = handle.node.task_executor.clone();
 
-        let best = provider.best_block_number()?;
-        let initial_header = provider
-            .sealed_header(best)?
-            .ok_or_else(|| eyre::eyre!("local L2 header at block {best} missing"))?;
-        let block_committer = BlockCommitterHandle::<EthEngineTypes>::spawn(
-            initial_header,
+        // Boot forkchoice anchors come from reth's persisted
+        // safe/finalized (genesis on a fresh chain) — never the
+        // speculative best header, which L1-derived replays can
+        // displace.
+        let block_committer = BlockCommitterHandle::<EthEngineTypes>::spawn_from_provider(
+            &provider,
             beacon_engine_handle,
             payload_builder_handle,
-        );
+        )?;
 
         let l1_head = Arc::new(L1CanonicalHead::default());
         let submitter = Submitter::new(submitter_config);

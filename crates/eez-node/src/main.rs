@@ -22,7 +22,7 @@ use std::{env, str::FromStr, sync::Arc, time::Duration};
 use alloy_primitives::B256;
 use alloy_signer_local::PrivateKeySigner;
 use eez_deriver::Deriver;
-use eez_driver::{EthAttributesBuilder, Scheduler, Sequencer};
+use eez_driver::{BlockCommitterHandle, EthAttributesBuilder, Scheduler, Sequencer};
 use eez_l1::{
     Composer, ComposerConfig, L1CanonicalHead, L1Watcher, L1WatcherConfig, Submitter,
     SubmitterConfig,
@@ -30,6 +30,7 @@ use eez_l1::{
 use eez_prover::MockEcdsaProver;
 use mimalloc::MiMalloc;
 use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
+use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_builder::{Node, components::BasicPayloadServiceBuilder};
 use reth_node_ethereum::EthereumNode;
 use tracing::{Level, event};
@@ -90,33 +91,23 @@ fn main() -> eyre::Result<()> {
         let l1_head = Arc::new(L1CanonicalHead::default());
         let l1_enabled = env::var_os("EEZ_L1_RPC_URL").is_some();
 
-        // ─── Sequencer (always-on) ───────────────────────────────────
-        let attributes = EthAttributesBuilder::new(chain_spec);
-        let scheduler = Scheduler::interval(BLOCK_TIME);
-        let mut sequencer = Sequencer::new(
+        // ─── Block committer + Sequencer (always-on) ─────────────────
+        // The committer's boot forkchoice anchors come from reth's
+        // persisted safe/finalized (genesis on a fresh chain) — never
+        // the speculative best header, which L1-derived replays can
+        // displace. The Sequencer is constructed here but spawned only
+        // after the Deriver's boot catch-up below, so it can't extend a
+        // stale local branch while L1 reconciliation is pending.
+        let block_committer = BlockCommitterHandle::<EthEngineTypes>::spawn_from_provider(
             &provider,
-            attributes,
             beacon_engine_handle,
-            scheduler,
             payload_builder_handle,
         )?;
+        let attributes = EthAttributesBuilder::new(chain_spec);
+        let scheduler = Scheduler::interval(BLOCK_TIME);
+        let mut sequencer = Sequencer::new(attributes, scheduler, block_committer.clone());
         if l1_enabled {
             sequencer = sequencer.with_speculative_limit(64, Arc::clone(&l1_head) as _);
-        }
-        let block_committer = sequencer.committer();
-
-        if env::var_os("EEZ_SEQUENCER_DISABLED").is_some() {
-            event!(
-                name: "eez.node.sequencer.disabled",
-                Level::INFO,
-                "EEZ_SEQUENCER_DISABLED set; BlockCommitter spawned but no local block production",
-            );
-            drop(sequencer);
-        } else {
-            event!(name: "eez.node.sequencer.spawned", Level::INFO, "spawning eez sequencer");
-            task_executor.spawn_critical_task("eez-sequencer", async move {
-                sequencer.run().await;
-            });
         }
 
         // ─── L1 stack (opt-in via EEZ_L1_RPC_URL) ────────────────────
@@ -200,6 +191,21 @@ fn main() -> eyre::Result<()> {
                 Level::INFO,
                 "EEZ_L1_RPC_URL not set; running sequencer only",
             );
+        }
+
+        // ─── Sequencer spawn (after boot catch-up) ───────────────────
+        if env::var_os("EEZ_SEQUENCER_DISABLED").is_some() {
+            event!(
+                name: "eez.node.sequencer.disabled",
+                Level::INFO,
+                "EEZ_SEQUENCER_DISABLED set; BlockCommitter spawned but no local block production",
+            );
+            drop(sequencer);
+        } else {
+            event!(name: "eez.node.sequencer.spawned", Level::INFO, "spawning eez sequencer");
+            task_executor.spawn_critical_task("eez-sequencer", async move {
+                sequencer.run().await;
+            });
         }
 
         handle.wait_for_node_exit().await

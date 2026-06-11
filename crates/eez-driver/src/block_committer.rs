@@ -13,7 +13,8 @@
 //! - `AdvanceHead` — follower points unsafe head at a sequencer-served block.
 //! - `Derive` — Deriver submits a pre-built `ExecutionPayload` via newPayload + head-FCU.
 //!
-//! Until the Deriver speaks, `safe` and `finalized` stay at the boot-time head.
+//! Until the Deriver speaks, `safe` and `finalized` stay at the boot anchors
+//! (reth's persisted safe/finalized, or genesis on a fresh chain).
 
 use core::fmt;
 use std::sync::{Arc, RwLock};
@@ -24,7 +25,8 @@ use reth_engine_primitives::{BeaconForkChoiceUpdateError, ConsensusEngineHandle}
 use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{BuiltPayload, ExecutionPayload, PayloadKind, PayloadTypes};
-use reth_primitives_traits::{SealedHeader, SealedHeaderFor};
+use reth_primitives_traits::{HeaderTy, NodePrimitives, SealedHeader, SealedHeaderFor};
+use reth_storage_api::{BlockIdReader, BlockReader};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{DriverError, DriverResult};
@@ -130,12 +132,19 @@ where
     <T::BuiltPayload as BuiltPayload>::Primitives: Send + Sync + 'static,
     SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>: Send,
 {
-    /// Spawn the actor on the current tokio runtime. `safe` and
-    /// `finalized` are seeded to `initial_header.hash()` until the
-    /// Deriver advances them via [`Self::advance_safe_finalized`].
+    /// Spawn the actor on the current tokio runtime. `safe_hash` /
+    /// `finalized_hash` seed the forkchoice anchors until the Deriver
+    /// advances them via [`Self::advance_safe_finalized`]. They must
+    /// reference durable canonical blocks (persisted safe/finalized or
+    /// genesis) — never the speculative best header: a speculative
+    /// branch can be displaced by L1-derived replays, and an FCU
+    /// carrying a displaced hash is rejected by the engine as an
+    /// inconsistent forkchoice state.
     #[must_use]
     pub fn spawn(
         initial_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+        safe_hash: B256,
+        finalized_hash: B256,
         to_engine: ConsensusEngineHandle<T>,
         payload_builder: PayloadBuilderHandle<T>,
     ) -> Self {
@@ -148,8 +157,8 @@ where
             payload_builder,
             last_header: Arc::clone(&last_header),
             unsafe_head_hash: initial_hash,
-            safe_hash: initial_hash,
-            finalized_hash: initial_hash,
+            safe_hash,
+            finalized_hash,
         };
         tokio::spawn(actor.run());
         Self {
@@ -157,6 +166,63 @@ where
             last_header,
             reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// [`Self::spawn`] with the initial header and forkchoice anchors
+    /// read from `provider`: head from the local best block, safe /
+    /// finalized from reth's persisted forkchoice state (loaded into the
+    /// canonical in-memory state at node startup), falling back to
+    /// genesis when none has been recorded yet.
+    ///
+    /// # Errors
+    ///
+    /// `provider` (lookup failure), `missing_header` (a referenced
+    /// header is absent — brief startup race).
+    pub fn spawn_from_provider<P>(
+        provider: &P,
+        to_engine: ConsensusEngineHandle<T>,
+        payload_builder: PayloadBuilderHandle<T>,
+    ) -> DriverResult<Self>
+    where
+        <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives,
+        P: BlockReader<Header = HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>
+            + BlockIdReader,
+    {
+        let best = provider
+            .best_block_number()
+            .map_err(DriverError::provider)?;
+        let initial_header = provider
+            .sealed_header(best)
+            .map_err(DriverError::provider)?
+            .ok_or_else(|| DriverError::missing_header(best))?;
+        let genesis = || -> DriverResult<B256> {
+            Ok(provider
+                .sealed_header(0)
+                .map_err(DriverError::provider)?
+                .ok_or_else(|| DriverError::missing_header(0))?
+                .hash())
+        };
+        let safe_hash = match provider
+            .safe_block_num_hash()
+            .map_err(DriverError::provider)?
+        {
+            Some(safe) => safe.hash,
+            None => genesis()?,
+        };
+        let finalized_hash = match provider
+            .finalized_block_num_hash()
+            .map_err(DriverError::provider)?
+        {
+            Some(finalized) => finalized.hash,
+            None => genesis()?,
+        };
+        Ok(Self::spawn(
+            initial_header,
+            safe_hash,
+            finalized_hash,
+            to_engine,
+            payload_builder,
+        ))
     }
 
     /// Hold across a multi-block reconcile to suppress concurrent `commit_sequenced`

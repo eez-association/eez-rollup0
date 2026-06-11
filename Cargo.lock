@@ -2815,7 +2815,6 @@ dependencies = [
  "reth-ethereum-engine-primitives",
  "reth-node-ethereum",
  "reth-primitives-traits",
- "reth-storage-api",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
