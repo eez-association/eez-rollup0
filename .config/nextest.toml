@@ -1,0 +1,12 @@
+# Integration tests under `crates/*/tests/` spawn anvil + python stub +
+# 1–2 reth processes per test. With nextest's default parallelism that
+# can blow past CI runner memory limits and produce flaky timing
+# (composer cadence assumptions in the harness). Force serial execution
+# for the integration-test binaries; unit tests still run in parallel.
+[[profile.default.overrides]]
+filter = "kind(test)"
+threads-required = "num-cpus"
+test-group = "integration"
+
+[test-groups]
+integration = { max-threads = 1 }
