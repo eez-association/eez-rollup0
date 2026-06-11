@@ -13,8 +13,8 @@ mod common;
 use alloy_rpc_types_eth::BlockNumberOrTag;
 use common::{
     ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeBinary,
-    NodeConfig, NodeHandle, block_number_at, override_env, reorg_genesis_path,
-    reorg_genesis_state_root, safe_block_state_root, wait_for_node_caught_up, with_env,
+    NodeConfig, NodeHandle, override_env, reorg_genesis_path, reorg_genesis_state_root,
+    safe_block_state_root, wait_for_node_caught_up, wait_for_real_safe_state, with_env,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -509,5 +509,144 @@ async fn happy_case_follower_cross_safe_parity() {
 
     f_l1.assert_no_process_death();
     f_seq.assert_no_process_death();
+    seq.assert_no_process_death();
+}
+
+/// `eez-follower` with `EEZ_SEQUENCER_RPC` pointing at a *rogue* source: a
+/// separate `eez-node` on `--chain dev` (block production on, composer off)
+/// serving a different chain as its `latest`, while the honest sequencer
+/// posts the real batches to L1. The only follower test where the unsafe
+/// source disagrees with L1 — so the only one that proves the deriver is
+/// authoritative rather than merely agreeing with an honest source.
+/// Asserts:
+///   - safe head reaches a non-genesis contract-attested stateRoot
+///     (membership excludes the rogue's chain; non-genesis excludes a
+///     trivial stuck-at-genesis pass).
+///   - the unsafe poll actually processed rogue heads (`eez.follower.head.*`),
+///     so broken wiring can't silently downgrade this to L1-derived-only.
+///   - no process death.
+///
+/// Different-genesis (not a same-chain fork) is deliberate: the follower
+/// never fetches the rogue's bodies (no peers — discovery is disabled), so
+/// reth sees an unknown head and answers `SYNCING`, which the committer
+/// accepts — the deriver advances safe regardless.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
+    let harness =
+        Harness::with_anvil_config(AnvilConfig::for_reorg(), reorg_genesis_state_root().unwrap())
+            .await
+            .unwrap();
+    let chain = harness.chain();
+    let genesis = reorg_genesis_path();
+
+    // Honest sequencer: real genesis, composer on, real txs so attested
+    // states move past genesis.
+    let seq_cfg = NodeConfig {
+        genesis_path: Some(genesis.as_path()),
+        ..NodeConfig::default()
+    };
+    let seq = NodeHandle::start("seq", &seq_cfg, &harness.env())
+        .await
+        .unwrap();
+    seq.run_tx_spammer(ANVIL_KEY_1);
+
+    // Rogue source: a *different* chain (`--chain dev`) that never posts to
+    // L1 (composer off) and never converges on the real chain — it only
+    // feeds the follower divergent unsafe heads.
+    let rogue_env = with_env(harness.env(), "EEZ_COMPOSER_DISABLED", "1");
+    let rogue = NodeHandle::start("rogue", &NodeConfig::default(), &rogue_env)
+        .await
+        .unwrap();
+
+    // Follower: real genesis + L1 deriver, unsafe head pointed at the
+    // rogue. `eez_follower=info` surfaces the per-head outcome events.
+    let follower_env = with_env(
+        with_env(harness.env(), "EEZ_SEQUENCER_RPC", &rogue.l2_rpc_url()),
+        "RUST_LOG",
+        "warn,eez_follower=info",
+    );
+    let follower_cfg = NodeConfig {
+        genesis_path: Some(genesis.as_path()),
+        binary: NodeBinary::EezFollower,
+    };
+    let follower = NodeHandle::start("follower", &follower_cfg, &follower_env)
+        .await
+        .unwrap();
+
+    // Safe head reaches a real (non-genesis) attested stateRoot despite the rogue.
+    wait_for_real_safe_state(
+        &follower,
+        &chain,
+        reorg_genesis_state_root().unwrap(),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("follower safe head did not reach a non-genesis attested stateRoot while on the rogue");
+
+    // Proof the rogue path actually ran (not silently downgraded to L1-derived).
+    assert!(
+        follower
+            .log_count_matching(&["eez.follower.head."])
+            .unwrap()
+            > 0,
+        "follower never processed a rogue unsafe head",
+    );
+
+    follower.assert_no_process_death();
+    seq.assert_no_process_death();
+}
+
+/// `eez-follower` joining late against a deep backlog: the sequencer posts
+/// 10 batches *before* the follower exists, so its boot `catch_up` must
+/// replay the whole history in one pass (`scan_batches`). Every other test
+/// starts the follower after ~2 batches; this is the only one that
+/// exercises catch-up at non-trivial depth (the "spin up a new RPC node
+/// long after genesis" path). The follower can't reach the tip without
+/// replaying every batch below it, so a non-genesis contract-attested safe
+/// head proves the deep replay happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn happy_case_follower_deep_backfill_late_join() {
+    let harness =
+        Harness::with_anvil_config(AnvilConfig::for_reorg(), reorg_genesis_state_root().unwrap())
+            .await
+            .unwrap();
+    let chain = harness.chain();
+    let genesis = reorg_genesis_path();
+
+    // Honest sequencer with real txs, building a deep backlog on L1.
+    let seq_cfg = NodeConfig {
+        genesis_path: Some(genesis.as_path()),
+        ..NodeConfig::default()
+    };
+    let seq = NodeHandle::start("seq", &seq_cfg, &harness.env())
+        .await
+        .unwrap();
+    seq.run_tx_spammer(ANVIL_KEY_1);
+
+    // Pile up history BEFORE the follower exists.
+    chain
+        .wait_for_batches(10, DEFAULT_TIMEOUT)
+        .await
+        .expect("sequencer did not build a deep backlog");
+
+    // Fresh follower joins late; its boot catch-up must replay everything.
+    let follower_cfg = NodeConfig {
+        genesis_path: Some(genesis.as_path()),
+        binary: NodeBinary::EezFollower,
+    };
+    let follower = NodeHandle::start("follower", &follower_cfg, &harness.env())
+        .await
+        .unwrap();
+
+    wait_for_real_safe_state(
+        &follower,
+        &chain,
+        reorg_genesis_state_root().unwrap(),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("late-joining follower did not backfill into a non-genesis attested stateRoot");
+
+    follower.assert_no_process_death();
     seq.assert_no_process_death();
 }

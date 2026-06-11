@@ -1054,6 +1054,32 @@ pub async fn wait_for_node_caught_up(
     .await
 }
 
+/// Like [`wait_for_node_caught_up`] but additionally requires the node's
+/// safe state to be *past genesis* — proof it imported a real honest block,
+/// not that it trivially matched an empty-block attestation at the
+/// `genesis_root` (the rollup's registered initial state, e.g.
+/// [`reorg_genesis_state_root`]). Used by the rogue-source and
+/// deep-backfill tests.
+pub async fn wait_for_real_safe_state(
+    node: &NodeHandle,
+    chain: &Chain<'_>,
+    genesis_root: B256,
+    timeout: Duration,
+) -> Result<()> {
+    wait_for(timeout, || async {
+        let node_root = safe_block_state_root(&node.l2_rpc_url())
+            .await
+            .ok()
+            .flatten();
+        let attested = chain.executed_states().await.unwrap_or_default();
+        Ok(match node_root {
+            Some(n) if n != B256::ZERO && n != genesis_root && attested.contains(&n) => Some(()),
+            _ => None,
+        })
+    })
+    .await
+}
+
 /// Return `env` with `key`'s value replaced by `value`. No-op if `key`
 /// isn't present.
 pub fn override_env(
