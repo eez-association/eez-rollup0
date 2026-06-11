@@ -10,10 +10,11 @@ use std::time::Duration;
 use alloy_primitives::{B256, U256};
 
 mod common;
+use alloy_rpc_types_eth::BlockNumberOrTag;
 use common::{
-    ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeConfig,
-    NodeHandle, override_env, reorg_genesis_path, reorg_genesis_state_root,
-    wait_for_node_caught_up,
+    ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeBinary,
+    NodeConfig, NodeHandle, block_number_at, override_env, reorg_genesis_path,
+    reorg_genesis_state_root, safe_block_state_root, wait_for_node_caught_up, with_env,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -249,6 +250,7 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     let genesis = reorg_genesis_path();
     let cfg = NodeConfig {
         genesis_path: Some(genesis.as_path()),
+        ..NodeConfig::default()
     };
     // Start both concurrently — sequential start lets c1 race alone
     // long enough to skew batch-race dynamics and (empirically) drop
@@ -303,4 +305,209 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     // I1 — No process death.
     c1.assert_no_process_death();
     c2.assert_no_process_death();
+}
+
+/// Helper: spawn an `eez-follower` binary with fresh datadir + the
+/// harness's env. `seq_rpc = Some(_)` sets `EEZ_SEQUENCER_RPC` for
+/// unsafe-head following; `None` runs L1-derived-only mode.
+async fn spawn_follower(
+    name: &str,
+    harness: &Harness,
+    seq_rpc: Option<&str>,
+) -> anyhow::Result<NodeHandle> {
+    let env = match seq_rpc {
+        Some(url) => with_env(harness.env(), "EEZ_SEQUENCER_RPC", url),
+        None => harness.env(),
+    };
+    let cfg = NodeConfig {
+        binary: NodeBinary::EezFollower,
+        ..NodeConfig::default()
+    };
+    NodeHandle::start(name, &cfg, &env).await
+}
+
+/// `eez-follower` binary in L1-derived-only mode (no
+/// `EEZ_SEQUENCER_RPC`). The sequencer posts batches; the follower's
+/// Deriver alone must rebuild state and land on a contract-attested
+/// stateRoot. Distinct from the eez-node Phase 3 because it exercises
+/// the real follower binary (its own boot path, `catch_up` call site,
+/// fcu-refresh loop).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn happy_case_follower_l1_derived() {
+    let harness = Harness::fresh().await.unwrap();
+    let chain = harness.chain();
+    let seq = NodeHandle::start("seq", &NodeConfig::default(), &harness.env())
+        .await
+        .unwrap();
+    chain
+        .wait_for_batches(2, DEFAULT_TIMEOUT)
+        .await
+        .expect("sequencer landed batches");
+
+    let follower = spawn_follower("follower", &harness, None).await.unwrap();
+    wait_for_node_caught_up(&follower, &chain, DEFAULT_TIMEOUT)
+        .await
+        .expect("follower did not catch up via L1 replay");
+
+    follower.assert_no_process_death();
+    seq.assert_no_process_death();
+}
+
+/// `eez-follower` with `EEZ_SEQUENCER_RPC` pointing at the sequencer.
+/// Asserts BOTH paths:
+///   - safe head: still reaches a contract-attested stateRoot (the L1
+///     deriver is authoritative).
+///   - unsafe head: the follower polls the sequencer's `latest` and
+///     advances. Verified by reading the follower's `latest` block
+///     number once safe is caught up — it should be ≥ contract's
+///     `safe` (unsafe head ≥ safe head, by definition).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn happy_case_follower_sequencer_rpc() {
+    let harness = Harness::fresh().await.unwrap();
+    let chain = harness.chain();
+    let seq = NodeHandle::start("seq", &NodeConfig::default(), &harness.env())
+        .await
+        .unwrap();
+    chain
+        .wait_for_batches(2, DEFAULT_TIMEOUT)
+        .await
+        .expect("sequencer landed batches");
+
+    let seq_rpc = seq.l2_rpc_url();
+    let follower = spawn_follower("follower", &harness, Some(&seq_rpc))
+        .await
+        .unwrap();
+    wait_for_node_caught_up(&follower, &chain, DEFAULT_TIMEOUT)
+        .await
+        .expect("follower did not catch up via L1 replay");
+
+    let follower_safe = safe_block_state_root(&follower.l2_rpc_url())
+        .await
+        .unwrap()
+        .expect("follower has a safe block");
+    assert_ne!(follower_safe, B256::ZERO, "follower safe is genesis");
+
+    // Sequencer-RPC unsafe-head must actually drive the follower's
+    // `latest` past its `safe`. The L1 deriver only moves safe (and
+    // finalized); only `EEZ_SEQUENCER_RPC` polling advances `latest`
+    // beyond. So `latest > safe` is the structural proof that the
+    // unsafe-head path ran. Log-grep is unreliable here — the follower
+    // process is SIGKILL'd at test teardown before stdout buffers
+    // flush, so INFO events may never reach the captured file.
+    let latest = block_number_at(&follower.l2_rpc_url(), BlockNumberOrTag::Latest)
+        .await
+        .unwrap()
+        .expect("follower has a latest block");
+    let safe = block_number_at(&follower.l2_rpc_url(), BlockNumberOrTag::Safe)
+        .await
+        .unwrap()
+        .expect("follower has a safe block");
+    assert!(
+        latest > safe,
+        "sequencer-RPC unsafe-head never advanced past safe; latest={latest}, safe={safe}",
+    );
+
+    follower.assert_no_process_death();
+    seq.assert_no_process_death();
+}
+
+/// `eez-follower` in L1-derived-only mode through an `anvil_reorg`:
+/// the follower's deriver must retreat just like the sequencer's, and
+/// its safe head must catch up to a post-reorg attestation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn happy_case_follower_l1_reorg_recovers() {
+    let harness = Harness::with_anvil_config(
+        AnvilConfig::for_reorg(),
+        reorg_genesis_state_root().unwrap(),
+    )
+    .await
+    .unwrap();
+    let chain = harness.chain();
+    let genesis = reorg_genesis_path();
+    let seq_cfg = NodeConfig {
+        genesis_path: Some(genesis.as_path()),
+        ..NodeConfig::default()
+    };
+    let follower_cfg = NodeConfig {
+        genesis_path: Some(genesis.as_path()),
+        binary: NodeBinary::EezFollower,
+    };
+    let env = harness.env();
+    let (seq, follower) = tokio::try_join!(
+        NodeHandle::start("seq", &seq_cfg, &env),
+        NodeHandle::start("follower", &follower_cfg, &env),
+    )
+    .unwrap();
+    seq.run_tx_spammer(ANVIL_KEY_1);
+
+    let pre_batches = chain
+        .wait_for_batches(2, DEFAULT_TIMEOUT)
+        .await
+        .expect("pre-reorg batches");
+    harness.anvil.reorg(3).await.unwrap();
+    chain
+        .wait_for_batches(pre_batches + 1, DEFAULT_TIMEOUT)
+        .await
+        .expect("no batches landed after reorg");
+    wait_for_node_caught_up(&follower, &chain, DEFAULT_TIMEOUT)
+        .await
+        .expect("follower did not catch up post-reorg");
+
+    follower.assert_reorg_seen();
+    follower.assert_no_process_death();
+    seq.assert_no_process_death();
+}
+
+/// Architectural claim: two followers watching *different* sources
+/// (one L1-derived-only, one tracking sequencer RPC) still agree on
+/// the safe head — the L1 deriver overrides the unsafe-head source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn happy_case_follower_cross_safe_parity() {
+    let harness = Harness::fresh().await.unwrap();
+    let chain = harness.chain();
+    let seq = NodeHandle::start("seq", &NodeConfig::default(), &harness.env())
+        .await
+        .unwrap();
+    chain
+        .wait_for_batches(2, DEFAULT_TIMEOUT)
+        .await
+        .expect("sequencer landed batches");
+
+    let seq_rpc = seq.l2_rpc_url();
+    let (f_l1, f_seq) = tokio::try_join!(
+        spawn_follower("f_l1", &harness, None),
+        spawn_follower("f_seq", &harness, Some(&seq_rpc)),
+    )
+    .unwrap();
+    wait_for_node_caught_up(&f_l1, &chain, DEFAULT_TIMEOUT)
+        .await
+        .expect("f_l1 did not catch up");
+    wait_for_node_caught_up(&f_seq, &chain, DEFAULT_TIMEOUT)
+        .await
+        .expect("f_seq did not catch up");
+
+    // The actual parity claim: poll both followers' safe.stateRoot
+    // until they agree at the same instant. The contract keeps
+    // advancing, so we can't compare at arbitrary moments — we wait
+    // for a tick where both followers' safe heads coincide.
+    common::wait_for(DEFAULT_TIMEOUT, || async {
+        let a = safe_block_state_root(&f_l1.l2_rpc_url())
+            .await
+            .ok()
+            .flatten();
+        let b = safe_block_state_root(&f_seq.l2_rpc_url())
+            .await
+            .ok()
+            .flatten();
+        Ok(match (a, b) {
+            (Some(x), Some(y)) if x == y && x != B256::ZERO => Some(()),
+            _ => None,
+        })
+    })
+    .await
+    .expect("followers never agreed on safe head");
+
+    f_l1.assert_no_process_death();
+    f_seq.assert_no_process_death();
+    seq.assert_no_process_death();
 }

@@ -84,6 +84,7 @@ serde_json             = "1"
 # internal crates
 eez-deriver        = { path = "crates/eez-deriver" }
 eez-driver         = { path = "crates/eez-driver" }
+eez-follower       = { path = "crates/eez-follower" }
 eez-l1             = { path = "crates/eez-l1" }
 eez-payload-codec  = { path = "crates/eez-payload-codec" }
 eez-prover         = { path = "crates/eez-prover" }

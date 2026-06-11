@@ -450,6 +450,17 @@ pub async fn safe_block_state_root(rpc_url: &str) -> Result<Option<B256>> {
     Ok(block.map(|b| b.header.state_root))
 }
 
+/// Block number at a named tag (`latest`, `safe`, `finalized`, …).
+/// `None` when no block exists at that tag yet.
+pub async fn block_number_at(
+    rpc_url: &str,
+    tag: alloy_rpc_types_eth::BlockNumberOrTag,
+) -> Result<Option<u64>> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let block = provider.get_block_by_number(tag).await?;
+    Ok(block.map(|b| b.header.number))
+}
+
 /// Deploy `EEZ` + `MockECDSAProofSystem` + `Rollup`, then register the rollup.
 /// Pure alloy — reads compiled foundry artifacts and sends each deploy
 /// as an in-process tx. Mirrors `sync-rollups-composer`'s
@@ -608,10 +619,20 @@ pub struct NodeHandle {
     pub http_port: u16,
 }
 
+/// Which workspace binary to spawn.
+#[derive(Default, Clone, Copy)]
+pub enum NodeBinary {
+    #[default]
+    EezNode,
+    EezFollower,
+}
+
 #[derive(Default)]
 pub struct NodeConfig<'a> {
     /// Path to a custom genesis JSON. `None` uses `--chain dev`.
     pub genesis_path: Option<&'a std::path::Path>,
+    /// Which binary to launch (defaults to `eez-node`).
+    pub binary: NodeBinary,
 }
 
 impl NodeHandle {
@@ -634,7 +655,7 @@ impl NodeHandle {
     ) -> Result<Self> {
         let (log_path, log_tempdir) = if let Ok(d) = std::env::var("EEZ_TEST_LOG_DIR") {
             let p =
-                std::path::PathBuf::from(d).join(format!("eez-node-{}.log", std::process::id()));
+                std::path::PathBuf::from(d).join(format!("{}-{}.log", name, std::process::id()));
             (p, None)
         } else {
             let td = tempfile::tempdir().context("log tempdir")?;
@@ -657,7 +678,17 @@ impl NodeHandle {
             || std::ffi::OsString::from("dev"),
             |p| p.as_os_str().to_owned(),
         );
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_eez-node"));
+        // Only the same-package binary gets a stable `CARGO_BIN_EXE_*`
+        // env var at test-compile time. The follower binary lives in a
+        // sibling crate; cargo builds it as part of `--workspace
+        // --all-targets`, so it sits next to `eez-node` in `target/`.
+        let bin: PathBuf = match cfg.binary {
+            NodeBinary::EezNode => PathBuf::from(env!("CARGO_BIN_EXE_eez-node")),
+            NodeBinary::EezFollower => {
+                PathBuf::from(env!("CARGO_BIN_EXE_eez-node")).with_file_name("eez-follower")
+            }
+        };
+        let mut cmd = Command::new(&bin);
         cmd.current_dir(repo_root())
             .args(["node", "--chain"])
             .arg(&chain_arg)
@@ -1034,5 +1065,24 @@ pub fn override_env(
             *v = value.to_string();
         }
     }
+    env
+}
+
+/// Set or append `(key, value)`. Unlike [`override_env`], inserts when
+/// the key isn't already present — used for follower-only env vars
+/// like `EEZ_SEQUENCER_RPC` that the standard `Harness::env()` doesn't
+/// produce.
+pub fn with_env(
+    mut env: Vec<(&'static str, String)>,
+    key: &'static str,
+    value: &str,
+) -> Vec<(&'static str, String)> {
+    for (k, v) in &mut env {
+        if *k == key {
+            *v = value.to_string();
+            return env;
+        }
+    }
+    env.push((key, value.to_string()));
     env
 }
