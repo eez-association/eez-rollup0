@@ -28,7 +28,7 @@ pub mod submitter;
 #[doc(inline)]
 pub use composer::Composer;
 #[doc(inline)]
-pub use config::{ComposerConfig, SubmitterConfig};
+pub use config::{ComposerConfig, SubmitterConfig, registry_deploy_block_from_env};
 #[doc(inline)]
 pub use error::{L1Error, L1Result};
 #[doc(inline)]

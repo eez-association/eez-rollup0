@@ -10,7 +10,7 @@
 
 use std::{env, str::FromStr, time::Duration};
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use alloy_signer_local::PrivateKeySigner;
 use url::Url;
 
@@ -75,6 +75,25 @@ impl SubmitterConfig {
             rollup_id: parse_u64(ENV_ROLLUP_ID)?,
         })
     }
+
+    /// Read L1 config for read-only consumers. If
+    /// `EEZ_L1_POSTER_KEY` is absent, install a deterministic dummy key
+    /// because scan paths never sign or send transactions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`L1Error::Config`] for any missing required read-side var
+    /// or malformed value.
+    pub fn from_env_read_only() -> L1Result<Self> {
+        let rpc_url = parse_url(ENV_RPC_URL)?;
+        Ok(Self {
+            rpc_url: rpc_url.clone(),
+            builder_rpc_url: rpc_url,
+            poster: parse_key_or_dummy(ENV_POSTER_KEY)?,
+            eez: parse_address(ENV_EEZ_ADDRESS)?,
+            rollup_id: parse_u64(ENV_ROLLUP_ID)?,
+        })
+    }
 }
 
 /// Orchestration knobs for the [`Composer`](crate::Composer) — protocol
@@ -118,6 +137,17 @@ impl ComposerConfig {
     }
 }
 
+/// Reads the EEZ registry deploy block without requiring composer-only
+/// settings such as proof-system addresses.
+///
+/// # Errors
+///
+/// Returns [`L1Error::Config`] if `EEZ_REGISTRY_DEPLOY_BLOCK` is
+/// missing or malformed.
+pub fn registry_deploy_block_from_env() -> L1Result<u64> {
+    parse_u64(ENV_DEPLOY_BLOCK)
+}
+
 fn require(name: &str) -> L1Result<String> {
     env::var(name).map_err(|_| L1Error::Config(format!("{name} is required (see .env.example)")))
 }
@@ -134,6 +164,29 @@ fn parse_key(name: &str) -> L1Result<PrivateKeySigner> {
     let raw = require(name)?;
     PrivateKeySigner::from_str(raw.trim_start_matches("0x"))
         .map_err(|e| L1Error::Config(format!("{name}: {e}")))
+}
+
+fn parse_key_or_dummy(name: &str) -> L1Result<PrivateKeySigner> {
+    match env::var(name) {
+        Ok(raw) => {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                dummy_key(name)
+            } else {
+                PrivateKeySigner::from_str(raw.trim_start_matches("0x"))
+                    .map_err(|e| L1Error::Config(format!("{name}: {e}")))
+            }
+        }
+        Err(env::VarError::NotPresent) => dummy_key(name),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(L1Error::Config(format!("{name} contains non-UTF-8 bytes")))
+        }
+    }
+}
+
+fn dummy_key(name: &str) -> L1Result<PrivateKeySigner> {
+    PrivateKeySigner::from_bytes(&B256::with_last_byte(1))
+        .map_err(|e| L1Error::Config(format!("dummy {name}: {e}")))
 }
 
 fn parse_u64(name: &str) -> L1Result<u64> {

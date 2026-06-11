@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/eez-deriver",
     "crates/eez-driver",
+    "crates/eez-follower",
     "crates/eez-l1",
     "crates/eez-node",
     "crates/eez-payload-codec",

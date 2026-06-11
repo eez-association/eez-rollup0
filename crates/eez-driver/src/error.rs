@@ -41,8 +41,7 @@ pub(crate) enum ErrorKind {
     /// can't recover; the caller (typically eez-node main) will log + exit.
     CommitterClosed,
     /// Sequencer's snapshotted `parent_hash` no longer matches
-    /// `last_header` under the reconcile lock — Deriver advanced the
-    /// chain while we were waiting. Caller retries next tick.
+    /// `last_header`. Caller retries next tick.
     StaleParent { expected: B256, actual: B256 },
 }
 
@@ -117,7 +116,7 @@ impl DriverError {
         matches!(self.kind, ErrorKind::CommitterClosed)
     }
 
-    /// Sequencer's snapshot was stale by the time the actor checked;
+    /// Sequencer's snapshot was stale before the commit could run;
     /// caller should retry on the next tick.
     #[must_use]
     pub fn is_stale_parent(&self) -> bool {
@@ -162,8 +161,7 @@ impl fmt::Display for DriverError {
             ErrorKind::StaleParent { expected, actual } => {
                 write!(
                     f,
-                    "stale parent on sequence: snapshot was {expected}, last_header is now {actual} \
-                     (Deriver advanced the chain between read and FCU)"
+                    "stale parent on sequence: snapshot was {expected}, last_header is now {actual}"
                 )
             }
         }
