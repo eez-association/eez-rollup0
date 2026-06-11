@@ -28,6 +28,7 @@ use reth_payload_primitives::{BuiltPayload, ExecutionPayload, PayloadKind, Paylo
 use reth_primitives_traits::{HeaderTy, NodePrimitives, SealedHeader, SealedHeaderFor};
 use reth_storage_api::{BlockIdReader, BlockReader};
 use tokio::sync::{mpsc, oneshot};
+use tracing::{Level, event};
 
 use crate::error::{DriverError, DriverResult};
 
@@ -452,13 +453,44 @@ where
         }
     }
 
-    async fn process_refresh_forkchoice(&self) -> DriverResult<()> {
+    /// Sends `state` via FCU. If the engine rejects the triplet as an
+    /// inconsistent forkchoice state and the unsafe head is the suspect
+    /// (≠ safe), demote the unsafe head to the safe anchor and retry
+    /// once. The optimistically-adopted head can sit on a branch that
+    /// conflicts with the L1-derived anchors (e.g., taken from a stale
+    /// sequencer before its ancestry was locally verifiable); the safe
+    /// anchor itself always forms a consistent triplet, and the next
+    /// follower poll re-adopts a compatible head within a tick.
+    async fn forkchoice_or_demote_head(
+        &mut self,
+        mut state: ForkchoiceState,
+    ) -> DriverResult<ForkchoiceUpdated> {
+        match self.to_engine.fork_choice_updated(state, None).await {
+            Ok(res) => Ok(res),
+            Err(BeaconForkChoiceUpdateError::ForkchoiceUpdateError(
+                ForkchoiceUpdateError::InvalidState,
+            )) if state.head_block_hash != state.safe_block_hash => {
+                event!(
+                    name: "eez.committer.unsafe_head.demoted",
+                    Level::WARN,
+                    head = %state.head_block_hash,
+                    safe = %state.safe_block_hash,
+                    "engine rejected forkchoice as inconsistent; demoting unsafe head to the safe anchor",
+                );
+                self.unsafe_head_hash = state.safe_block_hash;
+                state.head_block_hash = state.safe_block_hash;
+                self.to_engine
+                    .fork_choice_updated(state, None)
+                    .await
+                    .map_err(DriverError::engine_rpc)
+            }
+            Err(err) => Err(DriverError::engine_rpc(err)),
+        }
+    }
+
+    async fn process_refresh_forkchoice(&mut self) -> DriverResult<()> {
         let state = self.forkchoice_state();
-        let res = self
-            .to_engine
-            .fork_choice_updated(state, None)
-            .await
-            .map_err(DriverError::engine_rpc)?;
+        let res = self.forkchoice_or_demote_head(state).await?;
         if !res.is_valid() && !res.is_syncing() {
             return Err(DriverError::invalid_forkchoice(format!("{res:?}")));
         }
@@ -473,11 +505,7 @@ where
         let mut state = self.forkchoice_state();
         state.safe_block_hash = safe;
         state.finalized_block_hash = finalized;
-        let res = self
-            .to_engine
-            .fork_choice_updated(state, None)
-            .await
-            .map_err(DriverError::engine_rpc)?;
+        let res = self.forkchoice_or_demote_head(state).await?;
         if !res.is_valid() && !res.is_syncing() {
             return Err(DriverError::invalid_forkchoice(format!("{res:?}")));
         }

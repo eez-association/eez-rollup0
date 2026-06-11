@@ -2801,6 +2801,7 @@ dependencies = [
 name = "eez-follower"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
  "alloy-eips 2.0.5",
  "alloy-primitives",
  "alloy-provider",
@@ -2815,6 +2816,7 @@ dependencies = [
  "reth-ethereum-engine-primitives",
  "reth-node-ethereum",
  "reth-primitives-traits",
+ "reth-storage-api",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

@@ -4,14 +4,26 @@
 //! `BlockCommitterHandle::advance_safe_finalized`. This task only asks
 //! reth to point unsafe head at the sequencer's latest block while that
 //! head remains compatible with the L1-derived anchors.
+//!
+//! Compatibility is enforced here, not delegated to reth: the engine
+//! only requires safe/finalized to be *known* headers, so it will
+//! happily canonicalize a head whose ancestry conflicts with our safe
+//! block (e.g., a sequencer that hasn't reconciled a winning batch yet
+//! serves `latest` from its stale, race-losing branch). Before every
+//! forkchoice update we walk the candidate's locally-known ancestry
+//! down to the safe height and reject proven conflicts. Unverifiable
+//! ancestry (blocks not yet synced) stays optimistic — refusing there
+//! would deadlock sync, since reth only fetches those blocks because of
+//! the FCU.
 
 use std::time::Duration;
 
-use alloy_eips::BlockNumberOrTag;
+use alloy_eips::{BlockNumHash, BlockNumberOrTag};
 use alloy_provider::{Provider, RootProvider};
 use eez_driver::{BlockCommitterHandle, ForkchoiceOutcome, Scheduler};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_primitives_traits::SealedHeader;
+use reth_storage_api::{BlockIdReader, HeaderProvider};
 use tracing::{Level, event};
 
 use crate::error::FollowerError;
@@ -20,25 +32,50 @@ use crate::error::FollowerError;
 /// engine view doesn't drift during quiet periods.
 const FCU_REFRESH: Duration = Duration::from_secs(1);
 
+/// Upper bound on the candidate→safe ancestry walk. Far above the
+/// sequencer's speculative-depth cap (64); a longer gap with fully
+/// local ancestry is treated as unverifiable rather than scanned
+/// unboundedly.
+const MAX_ANCESTRY_WALK: u64 = 1024;
+
+/// Verdict of checking a candidate head against the local safe anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SafeCompat {
+    /// The candidate provably descends from the safe block.
+    Extends,
+    /// The candidate provably does NOT descend from the safe block.
+    Conflicts,
+    /// Ancestry is not locally known (not yet synced) — optimistic.
+    Unverifiable,
+}
+
 /// Polls the sequencer RPC for unsafe heads and routes every engine call
 /// through the shared [`BlockCommitterHandle`].
 #[derive(Debug)]
-pub(crate) struct Follower {
+pub(crate) struct Follower<P> {
     committer: BlockCommitterHandle<EthEngineTypes>,
     sequencer_rpc: RootProvider,
+    /// Local chain reader — resolves the current safe anchor and the
+    /// candidate head's ancestry for the compatibility check.
+    local: P,
     scheduler: Scheduler,
     last_head: Option<alloy_primitives::B256>,
 }
 
-impl Follower {
+impl<P> Follower<P>
+where
+    P: HeaderProvider<Header = alloy_consensus::Header> + BlockIdReader,
+{
     pub(crate) fn new(
         committer: BlockCommitterHandle<EthEngineTypes>,
         sequencer_rpc: RootProvider,
+        local: P,
         scheduler: Scheduler,
     ) -> Self {
         Self {
             committer,
             sequencer_rpc,
+            local,
             scheduler,
             last_head: None,
         }
@@ -93,6 +130,20 @@ impl Follower {
             return Ok(());
         }
 
+        // Reject candidates whose ancestry provably conflicts with the
+        // L1-derived safe anchor before they reach the engine.
+        if self.check_extends_safe(&block.header.inner, hash)? == SafeCompat::Conflicts {
+            event!(
+                name: "eez.follower.head.conflicts_safe",
+                Level::WARN,
+                block.number = number,
+                block.hash = %hash,
+                "sequencer head does not descend from the L1-derived safe block (stale or \
+                 race-losing branch); skipping",
+            );
+            return Ok(());
+        }
+
         let header = SealedHeader::new(block.header.inner, hash);
         match self.committer.advance_unsafe_head(header).await {
             Ok(ForkchoiceOutcome::Valid) => {
@@ -128,5 +179,66 @@ impl Follower {
             }
             Err(err) => Err(FollowerError::Driver(err.to_string())),
         }
+    }
+
+    /// Checks whether `candidate` (with hash `candidate_hash`) descends
+    /// from the current safe block by walking its `parent_hash` links
+    /// through locally-known headers down to the safe height.
+    ///
+    /// Steady state this is O(1): the candidate is one block ahead of
+    /// the previously synced chain, so the walk either resolves at the
+    /// first lookup or misses it (unverifiable).
+    fn check_extends_safe(
+        &self,
+        candidate: &alloy_consensus::Header,
+        candidate_hash: alloy_primitives::B256,
+    ) -> Result<SafeCompat, FollowerError> {
+        let Some(safe) = self
+            .local
+            .safe_block_num_hash()
+            .map_err(|e| FollowerError::Provider(format!("safe_block_num_hash: {e}")))?
+        else {
+            // No safe anchor recorded yet — nothing to conflict with.
+            return Ok(SafeCompat::Extends);
+        };
+        let BlockNumHash {
+            number: safe_number,
+            hash: safe_hash,
+        } = safe;
+
+        // A head at the safe height must BE the safe block; below it,
+        // it can never extend it.
+        if candidate.number == safe_number {
+            return Ok(if candidate_hash == safe_hash {
+                SafeCompat::Extends
+            } else {
+                SafeCompat::Conflicts
+            });
+        }
+        if candidate.number < safe_number {
+            return Ok(SafeCompat::Conflicts);
+        }
+        if candidate.number - safe_number > MAX_ANCESTRY_WALK {
+            return Ok(SafeCompat::Unverifiable);
+        }
+
+        let mut cursor_hash = candidate.parent_hash;
+        let mut cursor_number = candidate.number - 1;
+        while cursor_number > safe_number {
+            let Some(parent) = self
+                .local
+                .header(cursor_hash)
+                .map_err(|e| FollowerError::Provider(format!("header({cursor_hash}): {e}")))?
+            else {
+                return Ok(SafeCompat::Unverifiable);
+            };
+            cursor_hash = parent.parent_hash;
+            cursor_number -= 1;
+        }
+        Ok(if cursor_hash == safe_hash {
+            SafeCompat::Extends
+        } else {
+            SafeCompat::Conflicts
+        })
     }
 }

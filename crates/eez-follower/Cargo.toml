@@ -16,8 +16,10 @@ reth-ethereum-cli.workspace               = true
 reth-ethereum-engine-primitives.workspace = true
 reth-node-ethereum.workspace              = true
 reth-primitives-traits.workspace          = true
+reth-storage-api.workspace                = true
 
 # alloy
+alloy-consensus.workspace  = true
 alloy-eips.workspace       = true
 alloy-primitives.workspace = true
 alloy-provider.workspace   = true

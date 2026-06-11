@@ -8,6 +8,10 @@ pub(crate) enum FollowerError {
     #[error("sequencer RPC error: {0}")]
     Rpc(String),
 
+    /// Local chain provider failure while validating a candidate head.
+    #[error("local provider error: {0}")]
+    Provider(String),
+
     /// Shared driver/committer error.
     #[error("driver error: {0}")]
     Driver(String),
