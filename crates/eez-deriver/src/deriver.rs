@@ -612,18 +612,8 @@ where
 
         let new_safe_hash = self.l2_hash_at(to_block)?;
 
-        // The L1 batch index is the source of truth for future batch ranges.
-        // Publish it before the safe FCU so a transient head/safe mismatch
-        // cannot make the next batch derive from a stale `last_indexed_l2`.
-        self.inner.l1_head.append(BatchRecord {
-            l1_block: l1_block_number,
-            tx_hash,
-            last_l2_block: to_block,
-        });
-
         // Advance safe; keep finalized where it is (only L1 finality
-        // moves it). `safe_l2_block` stays after this call because it
-        // mirrors what reth actually accepted as safe.
+        // moves it).
         let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
         self.inner
             .committer
@@ -631,6 +621,11 @@ where
             .await?;
 
         self.inner.safe_l2_block.store(to_block, Ordering::Release);
+        self.inner.l1_head.append(BatchRecord {
+            l1_block: l1_block_number,
+            tx_hash,
+            last_l2_block: to_block,
+        });
 
         event!(
             name: "eez.deriver.safe.advanced",

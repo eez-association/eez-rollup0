@@ -297,7 +297,6 @@ where
             // with no `CanonStateNotification` broadcast lag.
             let last_header = self.committer.last_header();
             let parent_num = last_header.number();
-            let parent_hash = last_header.hash();
             let parent_ts = last_header.timestamp();
             let gap = target_wall.saturating_sub(parent_ts);
 
@@ -338,6 +337,7 @@ where
             // if the Deriver moved the head while we waited for the
             // reconcile lock, the actor returns StaleParent and we
             // skip this tick rather than emit a drifted-timestamp block.
+            let parent_hash = last_header.hash();
             let outcome = match self.committer.commit_sequenced(parent_hash, attrs).await {
                 Ok(outcome) => outcome,
                 Err(err) if err.is_stale_parent() => {
