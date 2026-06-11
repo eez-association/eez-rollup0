@@ -533,10 +533,12 @@ async fn happy_case_follower_cross_safe_parity() {
 /// accepts — the deriver advances safe regardless.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
-    let harness =
-        Harness::with_anvil_config(AnvilConfig::for_reorg(), reorg_genesis_state_root().unwrap())
-            .await
-            .unwrap();
+    let harness = Harness::with_anvil_config(
+        AnvilConfig::for_reorg(),
+        reorg_genesis_state_root().unwrap(),
+    )
+    .await
+    .unwrap();
     let chain = harness.chain();
     let genesis = reorg_genesis_path();
 
@@ -607,10 +609,12 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
 /// head proves the deep replay happened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn happy_case_follower_deep_backfill_late_join() {
-    let harness =
-        Harness::with_anvil_config(AnvilConfig::for_reorg(), reorg_genesis_state_root().unwrap())
-            .await
-            .unwrap();
+    let harness = Harness::with_anvil_config(
+        AnvilConfig::for_reorg(),
+        reorg_genesis_state_root().unwrap(),
+    )
+    .await
+    .unwrap();
     let chain = harness.chain();
     let genesis = reorg_genesis_path();
 
