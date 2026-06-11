@@ -65,6 +65,17 @@ impl L1CanonicalHead {
             .map_or(0, |b| b.last_l2_block)
     }
 
+    /// L1 block of the most recently indexed batch, or `None` if the
+    /// index is empty. Lower bound for the Deriver's bounded resync
+    /// scan.
+    ///
+    /// # Panics
+    ///
+    /// If the `batches` mutex is poisoned.
+    pub fn last_indexed_l1_block(&self) -> Option<u64> {
+        self.batches.lock().unwrap().last().map(|b| b.l1_block)
+    }
+
     /// `true` iff `tx_hash` is already indexed. Used by the Deriver
     /// to dedup live `BatchPosted` events against the catch-up scan.
     ///

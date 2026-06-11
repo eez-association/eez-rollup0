@@ -131,9 +131,13 @@ where
         self.inner.l1_head.cursor()
     }
 
-    /// Sync local state with L1's confirmed batch history: walks past
-    /// `BatchPosted` in tx-order, skips losers via `state_applied`,
-    /// STF-replays non-matching L2 blocks, populates `L1CanonicalHead`.
+    /// Sync local state with L1's full confirmed batch history from the
+    /// registry deploy block: walks past `BatchPosted` in tx-order,
+    /// skips losers via `state_applied`, force-replays every block of
+    /// every winning batch (during boot the deriver is the authority on
+    /// L2 chain state — skips would trust whatever's locally canonical,
+    /// which can be a Sequencer-race-produced block), and populates
+    /// `L1CanonicalHead`.
     ///
     /// # Errors
     ///
@@ -144,7 +148,43 @@ where
     ///
     /// If the `batches` mutex is poisoned.
     pub async fn catch_up(&self) -> DeriverResult<()> {
-        // Acquire lock to prevent sequencing during catch-up
+        self.sync_batches(self.inner.deploy_block, 0, true).await
+    }
+
+    /// Bounded re-sync used by the event loop after a failed or missed
+    /// event: re-scans L1 from the last indexed batch onward (full
+    /// history when the index is empty) and reconciles whatever isn't
+    /// indexed yet. Without this, one dropped `BatchPosted` event
+    /// leaves `last_indexed_l2` permanently behind L1 and every later
+    /// batch replays at the wrong L2 heights.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::catch_up`].
+    async fn resync(&self) -> DeriverResult<()> {
+        match self.inner.l1_head.last_indexed_l1_block() {
+            Some(l1_block) => {
+                self.sync_batches(l1_block, self.inner.l1_head.cursor(), false)
+                    .await
+            }
+            None => self.sync_batches(self.inner.deploy_block, 0, true).await,
+        }
+    }
+
+    /// Shared body of [`Self::catch_up`] / [`Self::resync`]: scan
+    /// `BatchPosted` from `from_l1_block`, reconcile each not-yet-
+    /// indexed winner with L2-range accounting starting at
+    /// `cumulative_start` (the L2 block confirmed just before the scan
+    /// window), then advance the safe/finalized anchors. Batches whose
+    /// tx hash is already indexed are skipped entirely — their L2
+    /// ranges are covered by `cumulative_start`.
+    async fn sync_batches(
+        &self,
+        from_l1_block: u64,
+        cumulative_start: u64,
+        force_replay: bool,
+    ) -> DeriverResult<()> {
+        // Acquire lock to prevent sequencing during the sync
         let _guard = self.inner.committer.begin_reconcile().await;
         let local_head = self
             .inner
@@ -155,23 +195,24 @@ where
             name: "eez.deriver.catch_up.start",
             Level::INFO,
             local_head,
-            "starting historical batch scan to populate L1CanonicalHead and reconcile L2 chain",
+            from_l1_block,
+            cumulative_start,
+            force_replay,
+            "starting batch scan to populate L1CanonicalHead and reconcile L2 chain",
         );
 
         let historical = self
             .inner
             .submitter
-            .scan_batches(self.inner.deploy_block)
+            .scan_batches(from_l1_block)
             .await
             .map_err(|e| DeriverError::l2_provider(format!("catch-up scan: {e}")))?;
 
         let known_tx_hashes = self.inner.l1_head.known_tx_hashes();
         let mut new_batches: Vec<BatchRecord> = Vec::new();
-        let mut cumulative_l2: u64 = 0;
+        let mut cumulative_l2: u64 = cumulative_start;
         let mut total_replayed: u64 = 0;
         for batch in &historical {
-            let decoded = eez_payload_codec::decode(batch.call_data.as_ref())?;
-
             // Skip losers — no `L2ExecutionPerformed`, state didn't
             // move on L1, cursor stays put.
             if !batch.state_applied {
@@ -185,32 +226,34 @@ where
                 continue;
             }
 
+            // Already indexed — processed by an earlier sync; its L2
+            // range is accounted for in `cumulative_start`.
+            if known_tx_hashes.contains(&batch.tx_hash) {
+                continue;
+            }
+
+            let decoded = eez_payload_codec::decode(batch.call_data.as_ref())?;
             let batch_first_l2 = cumulative_l2 + 1;
             let batch_last_l2 = cumulative_l2 + decoded.block_count() as u64;
 
-            // Catch-up always replays — the deriver is the authority on L2
-            // chain state during boot. Skips would trust whatever's locally
-            // canonical, which can be a Sequencer-race-produced block.
             total_replayed += self
                 .reconcile_batch_blocks(
                     batch_first_l2,
                     &decoded,
                     batch.l1_block_number,
                     batch.tx_hash,
-                    true,
+                    force_replay,
                 )
                 .await?;
 
-            if !known_tx_hashes.contains(&batch.tx_hash) {
-                new_batches.push(BatchRecord {
-                    l1_block: batch.l1_block_number,
-                    tx_hash: batch.tx_hash,
-                    last_l2_block: batch_last_l2,
-                });
-            }
+            new_batches.push(BatchRecord {
+                l1_block: batch.l1_block_number,
+                tx_hash: batch.tx_hash,
+                last_l2_block: batch_last_l2,
+            });
 
-            // Catch claimed-vs-derived drift now, during startup, rather
-            // than waiting for a live event.
+            // Catch claimed-vs-derived drift now, during the sync,
+            // rather than waiting for a live event.
             self.check_claimed_state(
                 batch.claimed_new_state,
                 batch_last_l2,
@@ -446,7 +489,7 @@ where
         // `BatchPosted` event for a batch above the gap arrives with
         // its tx-list anchored at an L2 height we never materialised
         // — failing in `execute_block` with a missing parent.
-        if let Err(err) = self.catch_up().await {
+        if let Err(err) = self.resync().await {
             event!(
                 name: "eez.deriver.resync.failed",
                 Level::ERROR,
@@ -474,12 +517,19 @@ where
                             );
                             return;
                         }
+                        // A dropped event would leave `last_indexed_l2`
+                        // permanently behind L1 — every later batch
+                        // would replay at the wrong heights. Re-anchor
+                        // from L1 before processing further events.
                         event!(
                             name: "eez.deriver.event.failed",
                             Level::WARN,
                             error = %err,
-                            "deriver failed to handle event; continuing",
+                            "deriver failed to handle event; resyncing from L1",
                         );
+                        if !self.try_recover().await {
+                            return;
+                        }
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -487,8 +537,11 @@ where
                         name: "eez.deriver.l1_events.lagged",
                         Level::WARN,
                         skipped,
-                        "L1 event stream lagged; cursor may be stale until next batch",
+                        "L1 event stream lagged; resyncing from L1",
                     );
+                    if !self.try_recover().await {
+                        return;
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     event!(
@@ -502,6 +555,43 @@ where
         }
     }
 
+    /// Post-failure recovery: bounded [`Self::resync`] from the last
+    /// indexed batch. Returns `false` iff the committer is gone and the
+    /// event loop must exit. A failed resync is logged and retried
+    /// after the next L1 event — events keep arriving on every batch,
+    /// so recovery is re-attempted at batch cadence.
+    async fn try_recover(&self) -> bool {
+        match self.resync().await {
+            Ok(()) => {
+                event!(
+                    name: "eez.deriver.resync.recovered",
+                    Level::INFO,
+                    cursor = self.cursor(),
+                    "resync complete; cursor re-anchored to L1",
+                );
+                true
+            }
+            Err(err) if err.is_committer_closed() => {
+                event!(
+                    name: "eez.deriver.committer.closed",
+                    Level::ERROR,
+                    error = %err,
+                    "block committer gone; deriver exiting",
+                );
+                false
+            }
+            Err(err) => {
+                event!(
+                    name: "eez.deriver.resync.failed",
+                    Level::ERROR,
+                    error = %err,
+                    "resync failed; will retry after the next L1 event",
+                );
+                true
+            }
+        }
+    }
+
     async fn handle_event(&self, event: L1Event) -> DeriverResult<()> {
         match event {
             L1Event::BatchPosted {
@@ -510,6 +600,7 @@ where
                 submitter,
                 call_data,
                 state_applied,
+                claimed_current_state,
                 claimed_new_state,
                 ..
             } => {
@@ -519,6 +610,7 @@ where
                     submitter,
                     call_data,
                     state_applied,
+                    claimed_current_state,
                     claimed_new_state,
                 )
                 .await
@@ -543,6 +635,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn on_batch_posted(
         &self,
         l1_block_number: u64,
@@ -550,6 +643,7 @@ where
         submitter: Address,
         call_data: Bytes,
         state_applied: bool,
+        claimed_current_state: Option<B256>,
         claimed_new_state: Option<B256>,
     ) -> DeriverResult<()> {
         let decoded = eez_payload_codec::decode(call_data.as_ref())?;
@@ -593,6 +687,40 @@ where
         let last_indexed_l2 = self.inner.l1_head.last_indexed_l2();
         let from_block = last_indexed_l2 + 1;
         let to_block = last_indexed_l2 + block_count;
+
+        // Cursor-alignment guard: a winning batch's claimed
+        // `currentState` must equal our state root at the cursor
+        // height. A mismatch means the local index is misaligned with
+        // L1 (e.g., an earlier event was dropped) — replaying this
+        // batch's txs at our cursor heights would commit blocks that
+        // exist on no other node. Bail out; the run-loop resync
+        // re-anchors the cursor from L1.
+        if let Some(claimed_current) = claimed_current_state {
+            let local_root = self
+                .inner
+                .l2_provider
+                .sealed_header(last_indexed_l2)
+                .map_err(DeriverError::l2_provider)?
+                .ok_or_else(|| {
+                    DeriverError::l2_provider(format!(
+                        "local L2 header at {last_indexed_l2} missing"
+                    ))
+                })?
+                .state_root();
+            if local_root != claimed_current {
+                event!(
+                    name: "eez.deriver.cursor.misaligned",
+                    Level::ERROR,
+                    l1_block_number,
+                    tx_hash = %tx_hash,
+                    last_indexed_l2,
+                    local_root = %local_root,
+                    claimed_current = %claimed_current,
+                    "batch currentState does not match local state root at cursor; resync required",
+                );
+                return Err(DeriverError::local_diverged(from_block));
+            }
+        }
 
         // Per-block reconciliation: skip blocks whose tx lists already
         // match the batch, and STF-replay the rest (reth fork-switches
