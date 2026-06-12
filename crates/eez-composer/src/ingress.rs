@@ -44,34 +44,50 @@ pub enum Classification {
     CrossChain,
 }
 
-/// Proxy-address set used to classify incoming transactions.
+/// Proxy-address set + foreign-chain-id set used to classify incoming
+/// transactions.
 ///
-/// Empty set ⇒ every tx classifies as [`Classification::L2Only`].
-/// Populated from rollup config at startup (S4.8+; for now the set
-/// is configured by `eez-node` at umbrella-build time based on the
-/// env vars `EEZ_CROSS_CHAIN_PROXY_ADDRESSES` — a comma-separated
-/// list of hex addresses).
+/// Two independent fast-path signals decide
+/// [`Classification::CrossChain`]:
+/// 1. **By proxy address**: `to ∈ proxy_addresses` — an L2-source call
+///    touching a known proxy on this rollup.
+/// 2. **By source chainId**: `tx.chain_id ∈ cross_chain_source_chain_ids`
+///    — an L1-source intent (user POSTs an L1-bound raw_tx to L2's RPC;
+///    the chainId mismatch is the signal), processed by the composer on
+///    the next Sync slot.
 ///
-/// The set is read-only after construction; classification is a
-/// hot-path lookup (every incoming `eth_sendRawTransaction`).
+/// Both signals are heuristics — the authoritative classifier is
+/// `SessionInspector` during `simulate_and_resolve`. Empty sets ⇒ every
+/// tx classifies as [`Classification::L2Only`].
+///
+/// Read-only after construction; classification is a hot-path lookup
+/// (every incoming `eth_sendRawTransaction`).
 #[derive(Debug, Clone, Default)]
 pub struct IngressClassifier {
     proxy_addresses: HashSet<Address>,
+    cross_chain_source_chain_ids: HashSet<u64>,
 }
 
 impl IngressClassifier {
     /// Construct from a set of proxy contract addresses on this
-    /// chain. An empty set classifies every tx as L2-only.
+    /// chain and a set of foreign source chain ids. An empty
+    /// combination classifies every tx as L2-only.
     #[must_use]
-    pub fn new(proxy_addresses: HashSet<Address>) -> Self {
-        Self { proxy_addresses }
+    pub fn new(
+        proxy_addresses: HashSet<Address>,
+        cross_chain_source_chain_ids: HashSet<u64>,
+    ) -> Self {
+        Self {
+            proxy_addresses,
+            cross_chain_source_chain_ids,
+        }
     }
 
-    /// True iff no proxy addresses are registered. Classifier will
-    /// return [`Classification::L2Only`] for every tx.
+    /// True iff no proxy addresses AND no source chain ids are
+    /// registered — classification reduces to `L2Only` for every tx.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.proxy_addresses.is_empty()
+        self.proxy_addresses.is_empty() && self.cross_chain_source_chain_ids.is_empty()
     }
 
     /// Total number of registered proxy addresses.
@@ -80,17 +96,31 @@ impl IngressClassifier {
         self.proxy_addresses.len()
     }
 
-    /// Classify a tx by its `to` address.
-    ///
-    /// `to = None` (contract creation) is always
-    /// [`Classification::L2Only`] — cross-chain calls always target
-    /// a known proxy contract, never a creation.
+    /// Number of foreign source chain ids registered.
     #[must_use]
-    pub fn classify(&self, to: Option<&Address>) -> Classification {
-        match to {
-            Some(addr) if self.proxy_addresses.contains(addr) => Classification::CrossChain,
-            _ => Classification::L2Only,
+    pub fn source_chain_id_count(&self) -> usize {
+        self.cross_chain_source_chain_ids.len()
+    }
+
+    /// Classify a tx by its `to` address and its `chain_id`.
+    ///
+    /// `to = None` (contract creation) routes by chain_id only —
+    /// cross-chain proxy calls always target a known proxy, but
+    /// a deposit-intent tx may have any shape.
+    /// `chain_id = None` (pre-EIP-155 legacy) routes by `to` only.
+    #[must_use]
+    pub fn classify(&self, to: Option<&Address>, chain_id: Option<u64>) -> Classification {
+        if let Some(addr) = to {
+            if self.proxy_addresses.contains(addr) {
+                return Classification::CrossChain;
+            }
         }
+        if let Some(cid) = chain_id {
+            if self.cross_chain_source_chain_ids.contains(&cid) {
+                return Classification::CrossChain;
+            }
+        }
+        Classification::L2Only
     }
 }
 
@@ -98,6 +128,7 @@ impl FromIterator<Address> for IngressClassifier {
     fn from_iter<I: IntoIterator<Item = Address>>(addresses: I) -> Self {
         Self {
             proxy_addresses: addresses.into_iter().collect(),
+            cross_chain_source_chain_ids: HashSet::new(),
         }
     }
 }
@@ -112,17 +143,49 @@ mod tests {
         let c = IngressClassifier::default();
         assert!(c.is_empty());
         let addr = address!("1111111111111111111111111111111111111111");
-        assert_eq!(c.classify(Some(&addr)), Classification::L2Only);
-        assert_eq!(c.classify(None), Classification::L2Only);
+        assert_eq!(c.classify(Some(&addr), Some(1)), Classification::L2Only);
+        assert_eq!(c.classify(None, None), Classification::L2Only);
     }
 
     #[test]
     fn proxy_address_classified_cross_chain() {
         let proxy = address!("2222222222222222222222222222222222222222");
         let c: IngressClassifier = [proxy].into_iter().collect();
-        assert_eq!(c.classify(Some(&proxy)), Classification::CrossChain);
+        assert_eq!(
+            c.classify(Some(&proxy), Some(1)),
+            Classification::CrossChain
+        );
         let other = address!("3333333333333333333333333333333333333333");
-        assert_eq!(c.classify(Some(&other)), Classification::L2Only);
-        assert_eq!(c.classify(None), Classification::L2Only);
+        assert_eq!(c.classify(Some(&other), Some(1)), Classification::L2Only);
+        assert_eq!(c.classify(None, Some(1)), Classification::L2Only);
+    }
+
+    #[test]
+    fn foreign_chain_id_classified_cross_chain() {
+        // L2 chainId=1; L1 chainId=31337 (anvil). Tx with chainId=31337
+        // = an L1-source deposit intent posted to L2's RPC.
+        let l1_chain = 31337u64;
+        let c = IngressClassifier::new(HashSet::new(), [l1_chain].into_iter().collect());
+        let any_to = address!("4444444444444444444444444444444444444444");
+        assert_eq!(
+            c.classify(Some(&any_to), Some(l1_chain)),
+            Classification::CrossChain,
+        );
+        // L2-chainId tx with no proxy match → L2Only.
+        assert_eq!(c.classify(Some(&any_to), Some(1)), Classification::L2Only);
+    }
+
+    #[test]
+    fn proxy_match_wins_over_chain_match() {
+        // Both signals say cross-chain; result is the same.
+        let proxy = address!("5555555555555555555555555555555555555555");
+        let c = IngressClassifier::new(
+            [proxy].into_iter().collect(),
+            [31337u64].into_iter().collect(),
+        );
+        assert_eq!(
+            c.classify(Some(&proxy), Some(31337)),
+            Classification::CrossChain
+        );
     }
 }

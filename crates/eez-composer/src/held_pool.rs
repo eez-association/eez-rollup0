@@ -26,7 +26,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
-use alloy_primitives::{Bytes, TxHash};
+use alloy_primitives::{Address, Bytes, TxHash};
 
 /// A cross-chain transaction held between submission and Sync-slot
 /// composition.
@@ -39,6 +39,23 @@ pub struct HeldTx {
     /// [`HeldPool::by_hash`] for [`HeldPool::drain_matching`] lookups
     /// — avoids recomputing on every external-batch landing.
     pub hash: TxHash,
+    /// Failed-bundle attempts so far. Bundles are strict
+    /// all-or-nothing, so a deterministically-reverting tx fails every
+    /// bundle it joins — and from outside, a "tx reverts in builder
+    /// simulation" drop is indistinguishable from a "no builder slot"
+    /// drop. Recovery increments this on each re-queue and EVICTS the
+    /// tx (loud WARN, user resubmits) at
+    /// [`MAX_BUNDLE_ATTEMPTS`](crate::composer::MAX_BUNDLE_ATTEMPTS),
+    /// so one poison tx can't fail every postBatch forever.
+    pub attempts: u32,
+    /// Recovered L1 sender. Together with `nonce`, lets the pool and
+    /// the eviction path keep each sender's nonce chain CONTIGUOUS:
+    /// ingress rejects out-of-sequence submissions, and evicting a tx
+    /// cascades to the sender's higher nonces (they can never land
+    /// once the gap exists — bundling them only poisons bundles).
+    pub sender: Address,
+    /// The tx's L1 nonce.
+    pub nonce: u64,
 }
 
 /// Per-rollup pool of held cross-chain transactions.
@@ -75,6 +92,68 @@ impl HeldPool {
         let mut txs = self.txs.lock().expect("held_pool txs poisoned");
         by_hash.insert(tx.hash, txs.len());
         txs.push_back(tx);
+    }
+
+    /// Re-queue recovered txs at the FRONT of the pool, preserving
+    /// their relative order. Recovery from a failed bundle must put
+    /// the txs AHEAD of anything submitted since — appending to the
+    /// tail re-orders user transactions across retries (setValue(2)
+    /// executing before the retried setValue(1)). Duplicate hashes are
+    /// skipped.
+    pub fn push_front_batch(&self, recovered: Vec<HeldTx>) {
+        let mut txs = self.txs.lock().expect("held_pool txs poisoned");
+        let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
+        for tx in recovered.into_iter().rev() {
+            if by_hash.contains_key(&tx.hash) {
+                continue;
+            }
+            by_hash.insert(tx.hash, 0);
+            txs.push_front(tx);
+        }
+        // Rebuild the index — every position shifted.
+        by_hash.clear();
+        for (i, tx) in txs.iter().enumerate() {
+            by_hash.insert(tx.hash, i);
+        }
+    }
+
+    /// Number of held txs from `sender`. With the contiguity invariant
+    /// (ingress validation + cascade eviction), the sender's next
+    /// valid nonce = on-chain nonce + this count.
+    #[must_use]
+    pub fn held_count_for(&self, sender: Address) -> usize {
+        self.txs
+            .lock()
+            .expect("held_pool txs poisoned")
+            .iter()
+            .filter(|t| t.sender == sender)
+            .count()
+    }
+
+    /// Remove and return every held tx from `sender` with a nonce
+    /// strictly above `nonce`. Called when a tx of that sender is
+    /// evicted: the higher nonces are gapped — invalid until the gap
+    /// fills, which eviction guarantees never happens — so leaving
+    /// them queued only poisons future bundles.
+    #[must_use]
+    pub fn drain_sender_above(&self, sender: Address, nonce: u64) -> Vec<HeldTx> {
+        let mut txs = self.txs.lock().expect("held_pool txs poisoned");
+        let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
+        let mut drained = Vec::new();
+        let mut kept = VecDeque::with_capacity(txs.len());
+        for tx in txs.drain(..) {
+            if tx.sender == sender && tx.nonce > nonce {
+                drained.push(tx);
+            } else {
+                kept.push_back(tx);
+            }
+        }
+        *txs = kept;
+        by_hash.clear();
+        for (i, tx) in txs.iter().enumerate() {
+            by_hash.insert(tx.hash, i);
+        }
+        drained
     }
 
     /// Drain every tx whose hash appears in `consumed`. Returns the
@@ -118,6 +197,25 @@ impl HeldPool {
         drained
     }
 
+    /// Drain up to `max` held txs (FIFO). Empirical fact about the
+    /// rbuilder-chiado relay: bundles containing more than ~3 user_txs
+    /// often have a subset silently dropped at inclusion time even
+    /// when the bundle itself lands. Capping bundle size keeps the
+    /// per-bundle inclusion atomic at the cost of more Sync slots to
+    /// drain a large pool.
+    pub fn pop_n(&self, max: usize) -> Vec<HeldTx> {
+        let mut txs = self.txs.lock().expect("held_pool txs poisoned");
+        let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
+        let n = max.min(txs.len());
+        let drained: Vec<HeldTx> = txs.drain(..n).collect();
+        // Rebuild index for the txs that remain.
+        by_hash.clear();
+        for (i, tx) in txs.iter().enumerate() {
+            by_hash.insert(tx.hash, i);
+        }
+        drained
+    }
+
     /// Number of currently-held txs.
     pub fn len(&self) -> usize {
         self.txs.lock().expect("held_pool txs poisoned").len()
@@ -138,6 +236,9 @@ mod tests {
         HeldTx {
             raw_tx: Bytes::from(vec![byte; 32]),
             hash: TxHash::from(B256::repeat_byte(byte)),
+            attempts: 0,
+            sender: Address::repeat_byte(byte),
+            nonce: u64::from(byte),
         }
     }
 

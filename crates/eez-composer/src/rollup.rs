@@ -16,6 +16,7 @@ use eez_driver::RollupTiming;
 use eez_l1::{L1CanonicalHead, L1Error, L1Result};
 
 use crate::held_pool::HeldPool;
+use crate::optimistic::OptimisticallyIncluded;
 
 /// Immutable per-rollup configuration. Sourced from env at startup.
 #[derive(Debug, Clone)]
@@ -110,4 +111,8 @@ pub struct RollupState<L2> {
     /// roles). When present, drained on each Sync-slot trigger by
     /// the umbrella's `compose_sync_slot`.
     pub held_pool: Option<Arc<HeldPool>>,
+    /// Ledger of optimistically-committed Sync blocks whose L1 bundle
+    /// is in flight or settled-but-unfinalized. Always present (empty
+    /// map costs nothing); only the cross-chain compose path writes it.
+    pub optimistic: Arc<OptimisticallyIncluded>,
 }

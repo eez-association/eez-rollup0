@@ -40,15 +40,20 @@ pub mod composer;
 pub mod held_pool;
 pub mod ingress;
 pub mod local;
+pub mod optimistic;
 pub mod rollup;
 
 #[doc(inline)]
-pub use composer::Composer;
+pub use composer::{Composer, CrossChainExecCtx};
 #[doc(inline)]
 pub use held_pool::{HeldPool, HeldTx};
 #[doc(inline)]
 pub use ingress::{Classification, IngressClassifier};
+
 #[doc(inline)]
-pub use local::{EvmComposer, LocalChainClient};
+pub use local::{
+    BuildError, BuiltSyncBlock, EvmComposer, GnosisL1Adapter, LocalChainClient, build_sync_block,
+};
+pub use optimistic::OptimisticallyIncluded;
 #[doc(inline)]
 pub use rollup::{RollupConfig, RollupState};
