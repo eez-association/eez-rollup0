@@ -677,6 +677,7 @@ mod tests {
                 blobIndices: Vec::new(),
                 callData: Bytes::new(),
                 proofs: Vec::new(),
+                blockNumber: 0,
             },
         }
     }

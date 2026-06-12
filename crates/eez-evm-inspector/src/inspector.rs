@@ -859,8 +859,10 @@ mod tests {
 
     #[test]
     fn wrong_source_contract_slot_returns_none() {
+        // Populate the correct slot; reading an arbitrary other slot
+        // must miss, not silently decode garbage.
         let correct_slot = ROLLUPS_AUTHORIZED_PROXIES_SLOT;
-        let wrong_slot = CCM_AUTHORIZED_PROXIES_SLOT;
+        let wrong_slot: u8 = 7;
         assert_ne!(
             correct_slot, wrong_slot,
             "test premise: the two slots must differ"
@@ -889,14 +891,15 @@ mod tests {
     // ── New tests for ProxyLookupConfig variants ────────────────────
 
     #[test]
-    fn rollups_slot_path_reads_slot_3() {
-        // ProxyLookupConfig with source_contract=EEZ routes to slot 3
-        // under the multi-prover layout (was 5 pre-multi-prover).
+    fn rollups_slot_path_reads_slot_0() {
+        // ProxyLookupConfig with source_contract=EEZ routes to slot 0
+        // (authorizedProxies declared on EEZBase, first storage slot
+        // of every child).
         let config = ProxyLookupConfig::<EvmProtocol> {
             contract_address: ROLLUPS_ADDR,
             authorized_proxies_slot: ROLLUPS_AUTHORIZED_PROXIES_SLOT,
         };
-        assert_eq!(config.authorized_proxies_slot, 3u8);
+        assert_eq!(config.authorized_proxies_slot, 0u8);
 
         let key = proxy_mapping_key(PROXY_ADDR, config.authorized_proxies_slot);
         let value = packed_proxy_value(DESTINATION_ADDR, TARGET_ROLLUP);
@@ -922,13 +925,16 @@ mod tests {
     }
 
     #[test]
-    fn ccm_slot_path_reads_slot_2() {
-        // ProxyLookupConfig with source_contract=CrossChainManager routes to slot 2.
+    fn ccm_slot_path_reads_slot_0() {
+        // ProxyLookupConfig with source_contract=EEZL2 routes to slot 0
+        // (authorizedProxies on EEZBase, first storage slot). Same
+        // value as the L1 path today — kept distinct so the two
+        // constants diverging later breaks loudly.
         let config = ProxyLookupConfig::<EvmProtocol> {
             contract_address: ROLLUPS_ADDR,
             authorized_proxies_slot: CCM_AUTHORIZED_PROXIES_SLOT,
         };
-        assert_eq!(config.authorized_proxies_slot, 2u8);
+        assert_eq!(config.authorized_proxies_slot, 0u8);
 
         let key = proxy_mapping_key(PROXY_ADDR, config.authorized_proxies_slot);
         let value = packed_proxy_value(DESTINATION_ADDR, TARGET_ROLLUP);
