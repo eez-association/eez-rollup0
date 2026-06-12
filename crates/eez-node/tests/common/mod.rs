@@ -1029,13 +1029,29 @@ pub async fn all_l2_execution_states(
         .collect()
 }
 
-/// Shared body for the attestation waiters: wait until the node's safe
-/// `stateRoot` is attested and differs from `exclude` (pass [`B256::ZERO`]
-/// to add no exclusion beyond the zero root).
-async fn wait_for_attested_safe(
+/// Wait until `node.safe.stateRoot` appears in the contract's
+/// `L2ExecutionPerformed` history for this `Chain`. Thin wrapper over
+/// [`wait_for_safe_state`] with no genesis exclusion (passes the zero root).
+pub async fn wait_for_node_caught_up(
     node: &NodeHandle,
     chain: &Chain<'_>,
-    exclude: B256,
+    timeout: Duration,
+) -> Result<()> {
+    wait_for_safe_state(node, chain, B256::ZERO, timeout).await
+}
+
+/// Wait until the node's safe `stateRoot` appears in the contract's
+/// `L2ExecutionPerformed` history for this `Chain` and differs from
+/// `genesis_root`. The attestation set grows monotonically, so this doesn't
+/// race the contract's advancing head: any past attestation matching the
+/// node's current safe head proves the node imported a block the contract
+/// has, at some point, declared canonical. Excluding `genesis_root` stops a
+/// node stuck at genesis from trivially passing by matching an empty-block
+/// attestation whose `newState` equals the registered initial state.
+pub async fn wait_for_safe_state(
+    node: &NodeHandle,
+    chain: &Chain<'_>,
+    genesis_root: B256,
     timeout: Duration,
 ) -> Result<()> {
     wait_for(timeout, || async {
@@ -1045,38 +1061,11 @@ async fn wait_for_attested_safe(
             .flatten();
         let attested = chain.executed_states().await.unwrap_or_default();
         Ok(match node_root {
-            Some(n) if n != B256::ZERO && n != exclude && attested.contains(&n) => Some(()),
+            Some(n) if n != B256::ZERO && n != genesis_root && attested.contains(&n) => Some(()),
             _ => None,
         })
     })
     .await
-}
-
-/// Wait until `node.safe.stateRoot` appears in the contract's
-/// `L2ExecutionPerformed` history for this `Chain`. The attestation
-/// set grows monotonically, so this doesn't race the contract's
-/// advancing head: any past attestation matching the node's current
-/// safe head proves the node imported a block the contract has, at
-/// some point, declared canonical.
-pub async fn wait_for_node_caught_up(
-    node: &NodeHandle,
-    chain: &Chain<'_>,
-    timeout: Duration,
-) -> Result<()> {
-    wait_for_attested_safe(node, chain, B256::ZERO, timeout).await
-}
-
-/// Like [`wait_for_node_caught_up`] but additionally excludes `genesis_root`,
-/// so a node stuck at genesis can't trivially pass by matching an empty-block
-/// attestation whose `newState` equals the registered initial state. Used by
-/// the rogue-source test, which has no depth check to imply non-genesis.
-pub async fn wait_for_safe_state(
-    node: &NodeHandle,
-    chain: &Chain<'_>,
-    genesis_root: B256,
-    timeout: Duration,
-) -> Result<()> {
-    wait_for_attested_safe(node, chain, genesis_root, timeout).await
 }
 
 /// Wait until `node`'s safe head reaches block height `min_block` or
@@ -1089,10 +1078,13 @@ pub async fn wait_for_safe_block(
     timeout: Duration,
 ) -> Result<()> {
     wait_for(timeout, || async {
-        let n = block_number_at(&node.l2_rpc_url(), alloy_rpc_types_eth::BlockNumberOrTag::Safe)
-            .await
-            .ok()
-            .flatten();
+        let n = block_number_at(
+            &node.l2_rpc_url(),
+            alloy_rpc_types_eth::BlockNumberOrTag::Safe,
+        )
+        .await
+        .ok()
+        .flatten();
         Ok(match n {
             Some(b) if b >= min_block => Some(()),
             _ => None,
