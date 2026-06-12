@@ -15,6 +15,10 @@ use eez_driver::ConfirmedHeadSource;
 #[derive(Debug, Clone, Copy)]
 pub struct BatchRecord {
     pub l1_block: u64,
+    /// Hash of the L1 block the batch landed in. Lets the Deriver's
+    /// resync verify the record is still on the canonical L1 chain —
+    /// the only signal that survives a missed `L1Event::Reorg`.
+    pub l1_block_hash: B256,
     pub tx_hash: B256,
     pub last_l2_block: u64,
 }
@@ -65,15 +69,16 @@ impl L1CanonicalHead {
             .map_or(0, |b| b.last_l2_block)
     }
 
-    /// L1 block of the most recently indexed batch, or `None` if the
-    /// index is empty. Lower bound for the Deriver's bounded resync
-    /// scan.
+    /// The most recently indexed batch, or `None` if the index is
+    /// empty. Anchor for the Deriver's bounded resync scan: its
+    /// `l1_block_hash` is checked against the canonical L1 chain and
+    /// its `l1_block` is the scan's lower bound.
     ///
     /// # Panics
     ///
     /// If the `batches` mutex is poisoned.
-    pub fn last_indexed_l1_block(&self) -> Option<u64> {
-        self.batches.lock().unwrap().last().map(|b| b.l1_block)
+    pub fn last_indexed(&self) -> Option<BatchRecord> {
+        self.batches.lock().unwrap().last().copied()
     }
 
     /// `true` iff `tx_hash` is already indexed. Used by the Deriver
@@ -212,6 +217,7 @@ mod tests {
     fn record(l1_block: u64, tx_byte: u8, last_l2_block: u64) -> BatchRecord {
         BatchRecord {
             l1_block,
+            l1_block_hash: B256::with_last_byte(u8::try_from(l1_block).expect("test block fits")),
             tx_hash: B256::with_last_byte(tx_byte),
             last_l2_block,
         }

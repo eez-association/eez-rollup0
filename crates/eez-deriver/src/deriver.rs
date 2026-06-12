@@ -162,9 +162,9 @@ where
     ///
     /// Same as [`Self::catch_up`].
     async fn resync(&self) -> DeriverResult<()> {
-        match self.inner.l1_head.last_indexed_l1_block() {
-            Some(l1_block) => {
-                self.sync_batches(l1_block, self.inner.l1_head.cursor(), false)
+        match self.inner.l1_head.last_indexed() {
+            Some(tail) => {
+                self.sync_batches(tail.l1_block, self.inner.l1_head.cursor(), false)
                     .await
             }
             None => self.sync_batches(self.inner.deploy_block, 0, true).await,
@@ -248,6 +248,7 @@ where
 
             new_batches.push(BatchRecord {
                 l1_block: batch.l1_block_number,
+                l1_block_hash: batch.l1_block_hash,
                 tx_hash: batch.tx_hash,
                 last_l2_block: batch_last_l2,
             });
@@ -596,6 +597,7 @@ where
         match event {
             L1Event::BatchPosted {
                 l1_block_number,
+                l1_block_hash,
                 tx_hash,
                 submitter,
                 call_data,
@@ -606,6 +608,7 @@ where
             } => {
                 self.on_batch_posted(
                     l1_block_number,
+                    l1_block_hash,
                     tx_hash,
                     submitter,
                     call_data,
@@ -639,6 +642,7 @@ where
     async fn on_batch_posted(
         &self,
         l1_block_number: u64,
+        l1_block_hash: B256,
         tx_hash: B256,
         submitter: Address,
         call_data: Bytes,
@@ -755,6 +759,7 @@ where
         self.inner.safe_l2_block.store(to_block, Ordering::Release);
         self.inner.l1_head.append(BatchRecord {
             l1_block: l1_block_number,
+            l1_block_hash,
             tx_hash,
             last_l2_block: to_block,
         });
