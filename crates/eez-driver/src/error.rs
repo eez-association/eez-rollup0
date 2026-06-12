@@ -44,8 +44,7 @@ pub(crate) enum ErrorKind {
     /// at startup). The Sequencer refuses to start.
     TimingConfig(String),
     /// Sequencer's snapshotted `parent_hash` no longer matches
-    /// `last_header` under the reconcile lock — Deriver advanced the
-    /// chain while we were waiting. Caller retries next tick.
+    /// `last_header`. Caller retries next tick.
     StaleParent { expected: B256, actual: B256 },
 }
 
@@ -179,8 +178,7 @@ impl fmt::Display for DriverError {
             ErrorKind::StaleParent { expected, actual } => {
                 write!(
                     f,
-                    "stale parent on sequence: snapshot was {expected}, last_header is now {actual} \
-                     (Deriver advanced the chain between read and FCU)"
+                    "stale parent on sequence: snapshot was {expected}, last_header is now {actual}"
                 )
             }
         }

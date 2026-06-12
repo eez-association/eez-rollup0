@@ -130,6 +130,9 @@ impl Submitter {
         target: BundleTarget,
         expected_final_state: Option<alloy_primitives::B256>,
     ) -> L1Result<SendOutcome> {
+        fail::fail_point!("submitter::send::start", |_| Err(L1Error::Submission(
+            "injected failpoint: submitter::send::start".into()
+        )));
         if raw_txs.is_empty() {
             return Err(L1Error::Submission(
                 "send_bundle called with no txs".to_string(),

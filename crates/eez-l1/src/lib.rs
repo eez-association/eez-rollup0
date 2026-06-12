@@ -28,7 +28,7 @@ pub mod submitter;
 #[doc(inline)]
 pub use aggregator::SubmitTrigger;
 #[doc(inline)]
-pub use config::SubmitterConfig;
+pub use config::{SubmitterConfig, registry_deploy_block_from_env};
 #[doc(inline)]
 pub use error::{L1Error, L1Result};
 #[doc(inline)]

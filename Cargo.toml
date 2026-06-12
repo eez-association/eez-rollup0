@@ -6,6 +6,7 @@ members = [
     "crates/eez-driver",
     "crates/eez-evm",
     "crates/eez-evm-inspector",
+    "crates/eez-follower",
     "crates/eez-l1",
     "crates/eez-node",
     "crates/eez-payload-codec",
@@ -100,6 +101,7 @@ alloy-signer           = { version = "2", default-features = false }
 alloy-signer-local     = { version = "2", default-features = false }
 alloy-sol-types        = { version = "1", default-features = false }
 alloy-transport-http   = { version = "2", default-features = false }
+fail                   = "0.5"
 k256                   = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 url                    = "2"
 

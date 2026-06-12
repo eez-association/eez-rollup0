@@ -2707,7 +2707,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -3167,6 +3167,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "eez-follower"
+version = "0.1.0"
+dependencies = [
+ "alloy-eips 2.0.5",
+ "alloy-primitives",
+ "alloy-provider",
+ "clap",
+ "dotenvy",
+ "eez-deriver",
+ "eez-driver",
+ "eez-l1",
+ "eyre",
+ "mimalloc",
+ "reth-ethereum-cli 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-ethereum-engine-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-node-ethereum 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-primitives-traits",
+ "reth-storage-api 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+ "url",
+]
+
+[[package]]
 name = "eez-l1"
 version = "0.1.0"
 dependencies = [
@@ -3181,6 +3207,7 @@ dependencies = [
  "eez-driver",
  "eez-evm",
  "eez-payload-codec",
+ "fail",
  "reqwest 0.12.28",
  "serde_json",
  "thiserror 2.0.18",
@@ -3194,10 +3221,16 @@ name = "eez-node"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-contract",
  "alloy-eips 2.0.5",
+ "alloy-genesis",
+ "alloy-network",
  "alloy-primitives",
  "alloy-provider",
+ "alloy-rpc-types-eth",
  "alloy-signer-local",
+ "alloy-sol-types",
+ "anyhow",
  "clap",
  "dotenvy",
  "eez-composer",
@@ -3232,6 +3265,7 @@ dependencies = [
  "reth-transaction-pool 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth_gnosis",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower",
  "tracing",
@@ -3488,6 +3522,17 @@ checksum = "7cd915d99f24784cdc19fd37ef22b97e3ff0ae756c7e492e9fbfe897d61e2aec"
 dependencies = [
  "indenter",
  "once_cell",
+]
+
+[[package]]
+name = "fail"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5e43d0f78a42ad591453aedb1d7ae631ce7ee445c7643691055a9ed8d3b01c"
+dependencies = [
+ "log",
+ "once_cell",
+ "rand 0.8.6",
 ]
 
 [[package]]
