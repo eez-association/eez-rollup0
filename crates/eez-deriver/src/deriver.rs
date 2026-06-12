@@ -275,11 +275,11 @@ where
         // catch the safe head up after a bulk replay so RPC clients
         // see the right safe head before the next live event lands.
         if cumulative_l2 > self.inner.safe_l2_block.load(Ordering::Acquire) {
-            let safe_hash = self.l2_hash_at(cumulative_l2)?;
+            let safe_header = self.l2_sealed_header_at(cumulative_l2)?;
             let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
             self.inner
                 .committer
-                .advance_safe_finalized(safe_hash, finalized_hash)
+                .advance_safe_finalized(safe_header, finalized_hash)
                 .await?;
             self.inner
                 .safe_l2_block
@@ -741,14 +741,15 @@ where
 
         self.check_claimed_state(claimed_new_state, to_block, l1_block_number, tx_hash)?;
 
-        let new_safe_hash = self.l2_hash_at(to_block)?;
+        let new_safe_header = self.l2_sealed_header_at(to_block)?;
+        let new_safe_hash = new_safe_header.hash();
 
         // Advance safe; keep finalized where it is (only L1 finality
         // moves it).
         let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
         self.inner
             .committer
-            .advance_safe_finalized(new_safe_hash, finalized_hash)
+            .advance_safe_finalized(new_safe_header, finalized_hash)
             .await?;
 
         self.inner.safe_l2_block.store(to_block, Ordering::Release);
@@ -805,8 +806,8 @@ where
             return Ok(());
         }
 
-        // Compute the new safe head's L2 hash. (even if <new_cursor> is 0)
-        let new_safe_hash = self.l2_hash_at(new_cursor)?;
+        // Compute the new safe head's L2 header. (even if <new_cursor> is 0)
+        let new_safe_header = self.l2_sealed_header_at(new_cursor)?;
 
         // Finalized was already bounded inside retreat_on_l1_reorg.
         let new_finalized = self.inner.l1_head.finalized_l2();
@@ -814,7 +815,7 @@ where
 
         self.inner
             .committer
-            .advance_safe_finalized(new_safe_hash, new_finalized_hash)
+            .advance_safe_finalized(new_safe_header, new_finalized_hash)
             .await?;
 
         self.inner
@@ -855,11 +856,11 @@ where
             return Ok(());
         }
 
-        let safe_hash = self.l2_hash_at(current_safe)?;
+        let safe_header = self.l2_sealed_header_at(current_safe)?;
         let finalized_hash = self.l2_hash_at(bounded)?;
         self.inner
             .committer
-            .advance_safe_finalized(safe_hash, finalized_hash)
+            .advance_safe_finalized(safe_header, finalized_hash)
             .await?;
         self.inner.l1_head.set_finalized_l2(bounded);
         event!(
@@ -872,16 +873,21 @@ where
         Ok(())
     }
 
-    fn l2_hash_at(&self, l2_block: u64) -> DeriverResult<B256> {
-        Ok(self
-            .inner
+    fn l2_sealed_header_at(
+        &self,
+        l2_block: u64,
+    ) -> DeriverResult<SealedHeader<alloy_consensus::Header>> {
+        self.inner
             .l2_provider
             .sealed_header(l2_block)
             .map_err(DeriverError::l2_provider)?
             .ok_or_else(|| {
                 DeriverError::l2_provider(format!("local L2 header at {l2_block} missing"))
-            })?
-            .hash())
+            })
+    }
+
+    fn l2_hash_at(&self, l2_block: u64) -> DeriverResult<B256> {
+        Ok(self.l2_sealed_header_at(l2_block)?.hash())
     }
 
     /// Per-block reconciliation against a decoded batch beginning at
