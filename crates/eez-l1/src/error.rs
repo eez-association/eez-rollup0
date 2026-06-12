@@ -17,6 +17,14 @@ pub enum L1Error {
     /// postBatch tx didn't land or reverted on-chain.
     #[error("postBatch submission failed: {0}")]
     Submission(String),
+    /// The configured builder relay answered `eth_sendBundle` with
+    /// JSON-RPC `-32601` (method not found) — it is a plain execution
+    /// RPC, not a bundle relay. [`Submitter::send_bundle`] catches this
+    /// and degrades to ordered mempool submission (dev L1, anvil).
+    ///
+    /// [`Submitter::send_bundle`]: crate::Submitter::send_bundle
+    #[error("builder relay does not support eth_sendBundle")]
+    BundleRpcUnsupported,
     /// Could not read a block from the L2 reth provider.
     #[error("L2 source error: {0}")]
     L2Source(String),

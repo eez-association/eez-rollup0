@@ -8,13 +8,12 @@ description            = "L1 RPC client + Submitter task that posts L2 batches t
 
 [dependencies]
 eez-driver.workspace        = true
+eez-evm.workspace           = true
 eez-payload-codec.workspace = true
-eez-prover.workspace        = true
 
-# alloy — alloy-contract is pulled in transitively via eez-prover.
+# alloy
 alloy-consensus.workspace     = true
 alloy-eips.workspace          = true
-alloy-network.workspace       = true
 alloy-primitives.workspace    = true
 alloy-provider.workspace      = true
 alloy-rpc-types-eth.workspace = true

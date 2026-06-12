@@ -16,6 +16,7 @@ use crate::error::{L1Error, L1Result};
 
 const ENV_RPC_URL: &str = "EEZ_L1_RPC_URL";
 const ENV_BUILDER_RPC_URL: &str = "EEZ_L1_BUILDER_RPC_URL";
+const ENV_TARGET_RPC_URL: &str = "EEZ_L1_TARGET_RPC_URL";
 const ENV_POSTER_KEY: &str = "EEZ_L1_POSTER_KEY";
 const ENV_EEZ_ADDRESS: &str = "EEZ_REGISTRY_ADDRESS";
 const ENV_ROLLUP_ID: &str = "EEZ_ROLLUP_ID";
@@ -29,6 +30,12 @@ pub struct SubmitterConfig {
     /// L1 builder relay accepting `eth_sendBundle`. All postBatch txs
     /// go here; `rpc_url` is used for reads only.
     pub builder_rpc_url: Url,
+    /// Optional RPC used ONLY for `BundleTarget::NextBlock` target-block
+    /// calculation. The embedded L1 can lag the canonical tip by 2-3
+    /// blocks, so `target = local.latest + slack` lands already-past and
+    /// the bundler drops it; point this at a tip-following node to pick
+    /// an unproposed future block. `None` → falls back to `rpc_url`.
+    pub target_rpc_url: Option<Url>,
     /// EOA that signs L1 txs (pays gas).
     pub poster: PrivateKeySigner,
     /// Deployed `EEZ` (rollups registry) address.
@@ -44,6 +51,10 @@ impl std::fmt::Debug for SubmitterConfig {
         f.debug_struct("SubmitterConfig")
             .field("rpc_url", &self.rpc_url.as_str())
             .field("builder_rpc_url", &self.builder_rpc_url.as_str())
+            .field(
+                "target_rpc_url",
+                &self.target_rpc_url.as_ref().map(Url::as_str),
+            )
             .field("poster", &self.poster.address())
             .field("eez", &self.eez)
             .field("rollup_id", &self.rollup_id)
@@ -59,9 +70,17 @@ impl SubmitterConfig {
     /// Returns [`L1Error::Config`] for any missing required var or
     /// malformed value.
     pub fn from_env() -> L1Result<Self> {
+        let target_rpc_url = match env::var(ENV_TARGET_RPC_URL) {
+            Ok(raw) if !raw.is_empty() => Some(
+                Url::parse(&raw)
+                    .map_err(|e| L1Error::Config(format!("{ENV_TARGET_RPC_URL}: {e}")))?,
+            ),
+            _ => None,
+        };
         Ok(Self {
             rpc_url: parse_url(ENV_RPC_URL)?,
             builder_rpc_url: parse_url(ENV_BUILDER_RPC_URL)?,
+            target_rpc_url,
             poster: parse_key(ENV_POSTER_KEY)?,
             eez: parse_address(ENV_EEZ_ADDRESS)?,
             rollup_id: parse_u64(ENV_ROLLUP_ID)?,
