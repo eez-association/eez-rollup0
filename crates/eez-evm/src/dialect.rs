@@ -18,7 +18,9 @@ use eez_protocol::{RecordedCall, RollupId};
 
 use crate::EvmProtocol;
 use crate::authorized_proxies::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
-use crate::types::executeL1ToL2CallCall;
+use crate::types::{
+    ExecutionEntrySol, LookupCallSol, executeIncomingCrossChainCallCall, executeL1ToL2CallCall,
+};
 
 /// Selects the contract ABI and entry-emission rules for one rollup.
 ///
@@ -100,6 +102,35 @@ pub fn encode_execute_cross_chain_call(
     executeL1ToL2CallCall {
         sourceAddress: source_address,
         callData: call_data.to_vec().into(),
+    }
+    .abi_encode()
+}
+
+/// Encode `EEZL2.executeIncomingCrossChainCall(...)` calldata — the
+/// L2-inbound delivery path, used by the composer's CCM-verify
+/// simulator and the L2 system tx it signs. The contract consumes
+/// `entries[0]` as the inbound call and enforces `msg.value == value`;
+/// the fields mirror the call's identity so the on-chain
+/// `crossChainCallHash` matches the entry's `proxyEntryHash`
+/// (`src/L2/EEZL2.sol:174-212`).
+#[must_use]
+pub fn encode_execute_incoming_cross_chain_call(
+    destination: alloy_primitives::Address,
+    value: alloy_primitives::U256,
+    data: &[u8],
+    source_address: alloy_primitives::Address,
+    source_rollup: u64,
+    entries: Vec<ExecutionEntrySol>,
+    lookup_calls: Vec<LookupCallSol>,
+) -> Vec<u8> {
+    executeIncomingCrossChainCallCall {
+        destination,
+        value,
+        data: data.to_vec().into(),
+        sourceAddress: source_address,
+        sourceRollup: alloy_primitives::U256::from(source_rollup),
+        entries,
+        _lookupCalls: lookup_calls,
     }
     .abi_encode()
 }

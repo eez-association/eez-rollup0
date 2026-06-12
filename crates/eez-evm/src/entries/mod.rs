@@ -4,20 +4,19 @@
 //! classifies each call (top-level / nested-success / nested-failed /
 //! lookup), folds per-entry rolling hashes, and emits an [`EvmBatch`]
 //! carrying the deferred-execution table + lookup queue + transient-
-//! prefix metadata that
-//! `EEZ.postVerifyAndExecuteOrSaveExecutionsFromBatch` /
+//! prefix metadata that `EEZ.postAndVerifyBatch` /
 //! `CrossChainManagerL2.loadExecutionTable` consume. Per-fixture
 //! byte-identity against upstream Foundry goldens is verified
 //! end-to-end in `scripts/protocol-e2e.sh`.
 //!
-//! For Phase 08 the proof-system fields on the produced batch stay
-//! empty (`proofSystems = []`, `proofs = []`, …) — Phase 09 wires
-//! them from the prover registry. See `docs/plans/08-protocol-
-//! alignment.md` §D for the staging.
+//! The proof-system fields on the produced batch stay empty
+//! (`proofSystems = []`, `proofs = []`, …) on the calldata-only path.
 
-use alloy_primitives::{B256, Bytes, U256};
+use alloy_primitives::{B256, Bytes, I256, U256};
 use alloy_sol_types::SolCall;
-use eez_protocol::{ProtocolResult, RecordedCall, RollupId, rolling_hash::EntryRollingHash};
+use eez_protocol::{
+    ProtocolResult, RecordedCall, RollupId, SourceAttribution, rolling_hash::EntryRollingHash,
+};
 
 use crate::EvmProtocol;
 use crate::action::cross_chain_call_hash;
@@ -26,18 +25,18 @@ use crate::dialect::ChainDialect;
 use crate::types::{
     ExecutionEntrySol, ExpectedL1ToL2CallSol, L2ToL1CallSol, LookupCallSol,
     ProofSystemBatchPerVerificationEntriesSol, StateDeltaSol, loadExecutionTableCall,
-    postVerifyAndExecuteOrSaveExecutionsFromBatchCall,
+    postAndVerifyBatchCall,
 };
 
 /// Classification of a single [`RecordedCall`] within an entry's
 /// flat call window. Drives [`build_batch`]'s emission decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallKind {
-    /// Top-level call dispatched directly from `source_rollup_id` —
-    /// becomes one entry's outer call (entry's `proxyEntryHash`
-    /// matches this call's `crossChainCallHash`; entry's
-    /// `L2ToL1Calls[]` carries reentrant children, not this call
-    /// itself).
+    /// Outer call of an entry on `source_rollup_id`'s batch — either
+    /// originating here (`caller_rollup_id == source_id`) or arriving
+    /// from another rollup (`original_rollup_id == source_id`). The
+    /// entry's `proxyEntryHash` matches this call's `crossChainCallHash`;
+    /// `L2ToL1Calls[]` carries reentrant children, not this call itself.
     TopLevel,
     /// Reentrant cross-chain call dispatched from inside a top-level
     /// call's execution and which succeeded — routes to the entry's
@@ -58,7 +57,9 @@ impl CallKind {
         if call.static_meta.is_some() {
             return Self::Static;
         }
-        if call.caller_rollup_id == source_id {
+        // Both directions are TopLevel: originating here (caller ==
+        // source) or arriving from another rollup (original == source).
+        if call.caller_rollup_id == source_id || call.original_rollup_id == source_id {
             return Self::TopLevel;
         }
         if call.outcome.is_success() {
@@ -78,24 +79,30 @@ impl CallKind {
 /// `expectedL1ToL2Calls` arrays or in the batch-level lookup queue,
 /// per their kind.
 ///
-/// `attribution` is plumbed for `StateDelta.currentState` chaining
-/// (Phase 09 fully wires per-fixture); `raw_tx` is plumbed for
-/// L1-style `executeL2TX` raw-tx routing wired per fixture in E2E.
-/// `source_rollup_id` is the rollup THIS batch targets.
+/// `attribution` drives `StateDelta.currentState` chaining; `raw_tx`
+/// is reserved for L1-style raw-tx routing. `source_rollup_id` is the
+/// rollup THIS batch targets.
 ///
 /// # Errors
 ///
 /// Returns [`ProtocolErrorKind::InvalidEncoding`] if a call's
 /// outcome is `Pending` (composition lifecycle bug — every call
 /// should be resolved before entering finalize).
+///
+/// # Panics
+///
+/// Panics when `source_rollup_id` both originates AND receives
+/// cross-chain traffic in one composition (nested re-entry, e.g.
+/// L1→L2→L1) — unsupported while batch-shaping handles only flat
+/// L1↔L2 transfers.
 pub fn build_batch(
     recorded: &[RecordedCall<EvmProtocol>],
-    attribution: &eez_protocol::SourceAttribution<'_>,
+    attribution: &SourceAttribution<'_>,
     dialect: &ChainDialect,
     source_rollup_id: RollupId,
     raw_tx: &[u8],
 ) -> ProtocolResult<EvmBatch> {
-    let _ = (attribution, raw_tx); // wired per fixture in the E2E suite
+    let _ = raw_tx; // L1-style raw-tx routing wired per fixture in the E2E suite
 
     let group: Vec<&RecordedCall<EvmProtocol>> = recorded
         .iter()
@@ -103,6 +110,22 @@ pub fn build_batch(
             c.caller_rollup_id == source_rollup_id || c.original_rollup_id == source_rollup_id
         })
         .collect();
+
+    // Flat L1↔L2 only: a chain that BOTH originates and receives
+    // cross-chain traffic in one composition (nested re-entry, e.g.
+    // L1→L2→L1) needs a state-aware rolling-hash loop we don't have —
+    // panic loudly (invariant 7) rather than emit a wrong batch shape.
+    let has_originated = group.iter().any(|c| c.caller_rollup_id == source_rollup_id);
+    let has_arrived = group.iter().any(|c| {
+        c.original_rollup_id == source_rollup_id && c.caller_rollup_id != source_rollup_id
+    });
+    if has_originated && has_arrived {
+        unimplemented!(
+            "nested cross-chain re-entry not yet supported \
+             (source_rollup_id={source_rollup_id} both originates and receives \
+             cross-chain calls in this composition)"
+        );
+    }
 
     let any_top_level_success = group.iter().any(|c| {
         CallKind::classify(c, source_rollup_id) == CallKind::TopLevel && c.outcome.is_success()
@@ -123,7 +146,19 @@ pub fn build_batch(
                 if let Some(prev) = current_entry.take() {
                     entries.push(prev.finish());
                 }
-                let builder = EntryBuilder::new(call, *dialect);
+                let mut builder = EntryBuilder::new(call, *dialect, source_rollup_id, attribution);
+                // Deposit shape: an entry-rollup batch with a
+                // value-bearing outer omits the outer from `L2ToL1Calls`
+                // (callCount=0, rollingHash=0) and lets the stateDelta's
+                // `+value` satisfy L1's ether-conservation check. Every
+                // other case (target batch, or a value-free entry) keeps
+                // the outer so `executeIncomingCrossChainCall` forwards
+                // the call. (`DEPOSIT_SPEC.md §8`.)
+                let is_entry_rollup = source_rollup_id == attribution.entry_rollup_id;
+                let outer_has_value = call.value > U256::ZERO;
+                if !(is_entry_rollup && outer_has_value) {
+                    builder.append_call(call, 1);
+                }
                 entry_nested_number = 0;
                 current_entry = Some(builder);
             }
@@ -152,23 +187,24 @@ pub fn build_batch(
             l1ToL2lookupCalls: lookup_calls,
             transientExecutionEntryCount: U256::ZERO,
             transientLookupCallCount: U256::ZERO,
-            // Phase 09 wires these four from the prover registry.
+            // Empty on the calldata-only path.
             proofSystems: Vec::new(),
             rollupIdsWithProofSystems: Vec::new(),
             crossProofSystemInteractions: B256::ZERO,
-            // Phase 09 wires blob carriers; D1 ships calldata-only +
-            // empty proofs[]. Composer surfaces the on-chain
-            // `_verifyProofSystemBatch` revert if a caller forgets
-            // to populate these before submission.
+            // Calldata-only: no blob carriers, empty proofs[]. The
+            // on-chain `_verifyProofSystemBatch` reverts loudly if a
+            // caller submits without populating these.
             blobIndices: Vec::new(),
             callData: Bytes::new(),
             proofs: Vec::new(),
+            // 0 = no block context; the composer sets the real L1 block
+            // when posting (the simulator path doesn't bind one).
+            blockNumber: 0,
         },
     })
 }
 
-/// Encode `batch` as
-/// `EEZ.postVerifyAndExecuteOrSaveExecutionsFromBatch` calldata.
+/// Encode `batch` as `EEZ.postAndVerifyBatch` calldata.
 ///
 /// Under the multi-prover ABI, proofs live inside the batch struct
 /// (`batch.inner.proofs[]`). Callers populate `proofs[]` before
@@ -176,7 +212,7 @@ pub fn build_batch(
 /// for the canonical fill+encode+submit pipeline.
 #[must_use]
 pub fn encode_postbatch(batch: &EvmBatch) -> Vec<u8> {
-    postVerifyAndExecuteOrSaveExecutionsFromBatchCall {
+    postAndVerifyBatchCall {
         batch: batch.inner.clone(),
     }
     .abi_encode()
@@ -221,7 +257,12 @@ struct EntryBuilder {
 }
 
 impl EntryBuilder {
-    fn new(outer: &RecordedCall<EvmProtocol>, _dialect: ChainDialect) -> Self {
+    fn new(
+        outer: &RecordedCall<EvmProtocol>,
+        _dialect: ChainDialect,
+        source_rollup_id: RollupId,
+        attribution: &SourceAttribution<'_>,
+    ) -> Self {
         let proxy_entry_hash = cross_chain_call_hash(
             outer.original_rollup_id,
             outer.original_address,
@@ -236,18 +277,18 @@ impl EntryBuilder {
             }
             eez_protocol::ExecutionOutcome::Pending => Bytes::new(),
         };
+        let state_deltas = build_outer_state_deltas(outer, source_rollup_id, attribution);
         Self {
             proxy_entry_hash,
             return_data,
             destination_rollup_id: U256::from(outer.original_rollup_id.0),
-            state_deltas: Vec::new(),
+            state_deltas,
             l2_to_l1_calls: Vec::new(),
             expected_l1_to_l2_calls: Vec::new(),
             rolling: EntryRollingHash::new(),
         }
     }
 
-    #[allow(dead_code, reason = "kept for Phase 09 entry-builder reuse")]
     fn append_call(&mut self, call: &RecordedCall<EvmProtocol>, call_number: u64) {
         let success = call.outcome.is_success();
         let return_data: &[u8] = call.outcome.return_data().unwrap_or(&[]);
@@ -288,17 +329,72 @@ impl EntryBuilder {
     }
 
     fn finish(self) -> ExecutionEntrySol {
+        let call_count = U256::from(self.l2_to_l1_calls.len() as u64);
         ExecutionEntrySol {
             stateDeltas: self.state_deltas,
             proxyEntryHash: self.proxy_entry_hash,
             destinationRollupId: self.destination_rollup_id,
             L2ToL1Calls: self.l2_to_l1_calls,
             expectedL1ToL2Calls: self.expected_l1_to_l2_calls,
-            callCount: U256::ZERO,
+            callCount: call_count,
             returnData: self.return_data,
             rollingHash: B256::from(self.rolling.current()),
         }
     }
+}
+
+/// Compute the per-entry `stateDeltas[]` for an outer cross-chain call.
+///
+/// Only the entry rollup's batch carries deltas — its `_applyStateDeltas`
+/// updates `rollups[id].stateRoot`. Follower batches emit none
+/// (`executeIncomingCrossChainCall` doesn't apply them).
+///
+/// `etherDelta` sign: `+value` when the entry rollup originates the call
+/// (target's tracked balance grows), `-value` when the call arrives at
+/// the entry rollup (caller's balance shrinks).
+fn build_outer_state_deltas(
+    outer: &RecordedCall<EvmProtocol>,
+    source_rollup_id: RollupId,
+    attribution: &SourceAttribution<'_>,
+) -> Vec<StateDeltaSol> {
+    if source_rollup_id != attribution.entry_rollup_id {
+        return Vec::new();
+    }
+
+    let entry_rollup = attribution.entry_rollup_id;
+    let (target_rollup, ether_delta_sign): (RollupId, i8) =
+        if outer.caller_rollup_id == entry_rollup {
+            (outer.original_rollup_id, 1)
+        } else if outer.original_rollup_id == entry_rollup {
+            (outer.caller_rollup_id, -1)
+        } else {
+            return Vec::new();
+        };
+
+    let current_state = attribution
+        .initial_roots
+        .get(&target_rollup)
+        .copied()
+        .unwrap_or([0u8; 32]);
+    let new_state = attribution
+        .per_tx_roots_by_rollup
+        .get(&target_rollup)
+        .and_then(|v| v.last().copied())
+        .unwrap_or(current_state);
+
+    let value_i256 = I256::try_from(outer.value).unwrap_or(I256::ZERO);
+    let ether_delta = if ether_delta_sign >= 0 {
+        value_i256
+    } else {
+        value_i256.wrapping_neg()
+    };
+
+    vec![StateDeltaSol {
+        rollupId: U256::from(target_rollup.0),
+        currentState: B256::from(current_state),
+        newState: B256::from(new_state),
+        etherDelta: ether_delta,
+    }]
 }
 
 fn lookup_call_sol(call: &RecordedCall<EvmProtocol>, failed: bool) -> LookupCallSol {
@@ -332,7 +428,7 @@ fn lookup_call_sol(call: &RecordedCall<EvmProtocol>, failed: bool) -> LookupCall
 mod tests {
     use super::*;
     use alloy_primitives::address;
-    use eez_protocol::{ExecutionOutcome, SourceAttribution};
+    use eez_protocol::ExecutionOutcome;
     use std::collections::HashMap;
 
     fn record(
@@ -340,13 +436,22 @@ mod tests {
         caller_rollup: RollupId,
         success: bool,
     ) -> RecordedCall<EvmProtocol> {
+        record_with_value(target, caller_rollup, success, U256::ZERO)
+    }
+
+    fn record_with_value(
+        target: RollupId,
+        caller_rollup: RollupId,
+        success: bool,
+        value: U256,
+    ) -> RecordedCall<EvmProtocol> {
         RecordedCall {
             original_address: address!("00000000000000000000000000000000000000aa"),
             original_rollup_id: target,
             caller_rollup_id: caller_rollup,
             caller: address!("00000000000000000000000000000000000000bb"),
             calldata: Bytes::from_static(&[0x12, 0x34]),
-            value: U256::ZERO,
+            value,
             outcome: ExecutionOutcome::Resolved {
                 return_data: Vec::new(),
                 pre_state_root: [0u8; 32],
@@ -376,6 +481,7 @@ mod tests {
         let attr = SourceAttribution {
             initial_roots: &init,
             per_tx_roots_by_rollup: &ptx,
+            entry_rollup_id: RollupId(0),
         };
         let batch = build_batch(&[], &attr, &ChainDialect::EvmL1Style, RollupId(1), &[])
             .expect("build_batch ok");
@@ -385,84 +491,90 @@ mod tests {
     }
 
     #[test]
-    fn single_top_level_call_yields_one_entry() {
+    fn originating_call_lands_outer_in_l2_to_l1_calls() {
+        // L1's batch for an originating L1→L2 call: outer in
+        // `L2ToL1Calls[0]`, callCount=1, non-zero rolling hash, plus one
+        // stateDelta for the target.
         let (init, ptx) = empty_attribution();
         let attr = SourceAttribution {
             initial_roots: &init,
             per_tx_roots_by_rollup: &ptx,
+            entry_rollup_id: RollupId(0),
         };
         let calls = vec![record(RollupId(1), RollupId(0), true)];
         let batch = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[])
             .expect("build_batch ok");
         assert_eq!(batch.entries().len(), 1);
-        // The TopLevel call is described by the entry's
-        // `proxyEntryHash` + `returnData`; reentrant children land
-        // in `L2ToL1Calls`. No children here, so both arrays empty.
-        assert!(batch.entries()[0].L2ToL1Calls.is_empty());
+        assert_eq!(batch.entries()[0].L2ToL1Calls.len(), 1);
+        assert_eq!(batch.entries()[0].callCount, U256::from(1));
         assert!(batch.entries()[0].expectedL1ToL2Calls.is_empty());
         assert!(batch.lookup_calls().is_empty());
         assert_ne!(batch.entries()[0].proxyEntryHash, B256::ZERO);
-        assert_eq!(batch.entries()[0].rollingHash, B256::ZERO);
-        assert_eq!(
-            batch.entries()[0].destinationRollupId,
-            U256::from(1),
-            "destinationRollupId is the target chain of the outer call",
-        );
+        assert_ne!(batch.entries()[0].rollingHash, B256::ZERO);
+        assert_eq!(batch.entries()[0].destinationRollupId, U256::from(1));
+        assert_eq!(batch.entries()[0].stateDeltas.len(), 1);
+        assert_eq!(batch.entries()[0].stateDeltas[0].rollupId, U256::from(1));
     }
 
     #[test]
-    fn outgoing_to_other_rollup_yields_empty_batch_for_target() {
+    fn arriving_call_yields_one_entry_on_target_batch() {
+        // L2's batch for an arriving L1→L2 call opens one entry (so
+        // `executeIncomingCrossChainCall` matches a `proxyEntryHash`),
+        // outer in `L2ToL1Calls[0]`, no stateDeltas.
         let (init, ptx) = empty_attribution();
         let attr = SourceAttribution {
             initial_roots: &init,
             per_tx_roots_by_rollup: &ptx,
+            entry_rollup_id: RollupId(0),
         };
         let calls = vec![record(RollupId(1), RollupId(0), true)];
         let batch = build_batch(&calls, &attr, &ChainDialect::EvmL2Style, RollupId(1), &[])
             .expect("build_batch ok");
-        assert!(batch.entries().is_empty());
+        assert_eq!(batch.entries().len(), 1);
+        assert_eq!(batch.entries()[0].L2ToL1Calls.len(), 1);
+        assert_eq!(batch.entries()[0].callCount, U256::from(1));
+        assert!(batch.entries()[0].expectedL1ToL2Calls.is_empty());
         assert!(batch.lookup_calls().is_empty());
+        assert!(
+            batch.entries()[0].stateDeltas.is_empty(),
+            "follower batch carries no state deltas",
+        );
+        assert_eq!(batch.entries()[0].destinationRollupId, U256::from(1));
     }
 
     #[test]
-    fn nested_reentrant_call_lands_in_expected_l1_to_l2_calls() {
+    #[should_panic(expected = "nested cross-chain re-entry not yet supported")]
+    fn nested_reentry_panics_unimplemented_on_entry_batch() {
+        // L1→L2→L1 nested re-entry: unsupported by the flat-only gate.
         let (init, ptx) = empty_attribution();
         let attr = SourceAttribution {
             initial_roots: &init,
             per_tx_roots_by_rollup: &ptx,
+            entry_rollup_id: RollupId(0),
         };
         let calls = vec![
             record(RollupId(1), RollupId(0), true),
             record(RollupId(0), RollupId(1), true),
         ];
-        let batch = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[])
-            .expect("build_batch ok");
-        assert_eq!(batch.entries().len(), 1);
-        assert_eq!(
-            batch.entries()[0].expectedL1ToL2Calls.len(),
-            1,
-            "nested-success child must land in expectedL1ToL2Calls",
-        );
-        assert!(batch.lookup_calls().is_empty());
+        let _ = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[]);
     }
 
     #[test]
-    fn nested_failure_routes_to_lookup_calls() {
+    #[should_panic(expected = "nested cross-chain re-entry not yet supported")]
+    fn nested_reentry_panics_unimplemented_even_on_failure() {
+        // Same topology as above but the inner call fails. The gate
+        // fires before classification, so failure mode is irrelevant.
         let (init, ptx) = empty_attribution();
         let attr = SourceAttribution {
             initial_roots: &init,
             per_tx_roots_by_rollup: &ptx,
+            entry_rollup_id: RollupId(0),
         };
         let calls = vec![
             record(RollupId(1), RollupId(0), true),
             record(RollupId(0), RollupId(1), false),
         ];
-        let batch = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[])
-            .expect("build_batch ok");
-        assert_eq!(batch.entries().len(), 1);
-        assert!(batch.entries()[0].expectedL1ToL2Calls.is_empty());
-        assert_eq!(batch.lookup_calls().len(), 1);
-        assert!(batch.lookup_calls()[0].failed);
+        let _ = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[]);
     }
 
     #[test]
@@ -471,6 +583,7 @@ mod tests {
         let attr = SourceAttribution {
             initial_roots: &init,
             per_tx_roots_by_rollup: &ptx,
+            entry_rollup_id: RollupId(0),
         };
         let calls = vec![record(RollupId(1), RollupId(0), false)];
         let batch = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[])
@@ -479,13 +592,98 @@ mod tests {
     }
 
     #[test]
+    fn value_bearing_outer_yields_deposit_shape_on_entry_batch() {
+        // Deposit shape on L1's batch (entry rollup, value-bearing
+        // outer): callCount=0, empty L2ToL1Calls, rollingHash=0, one
+        // stateDelta with etherDelta=+value.
+        let (init, ptx) = empty_attribution();
+        let attr = SourceAttribution {
+            initial_roots: &init,
+            per_tx_roots_by_rollup: &ptx,
+            entry_rollup_id: RollupId(0),
+        };
+        let value = U256::from(1_000_000_000_000_000_000u128);
+        let calls = vec![record_with_value(RollupId(1), RollupId(0), true, value)];
+        let batch = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[])
+            .expect("build_batch ok");
+        assert_eq!(batch.entries().len(), 1);
+        let entry = &batch.entries()[0];
+        assert!(entry.L2ToL1Calls.is_empty());
+        assert_eq!(entry.callCount, U256::ZERO);
+        assert_eq!(entry.rollingHash, B256::ZERO);
+        assert_eq!(entry.stateDeltas.len(), 1);
+        assert_eq!(entry.stateDeltas[0].rollupId, U256::from(1));
+        assert_eq!(
+            entry.stateDeltas[0].etherDelta,
+            I256::try_from(value).expect("value fits in i256"),
+        );
+        assert_ne!(entry.proxyEntryHash, B256::ZERO);
+        assert_eq!(entry.destinationRollupId, U256::from(1));
+    }
+
+    #[test]
+    fn value_bearing_outer_keeps_full_shape_on_target_batch() {
+        // L2's batch for the same deposit keeps the full shape so
+        // `executeIncomingCrossChainCall` forwards the value; the
+        // inbound call's value must equal `outer.value` (strict on-chain
+        // equality). No stateDeltas on the follower batch.
+        let (init, ptx) = empty_attribution();
+        let attr = SourceAttribution {
+            initial_roots: &init,
+            per_tx_roots_by_rollup: &ptx,
+            entry_rollup_id: RollupId(0),
+        };
+        let value = U256::from(1_000_000_000_000_000_000u128);
+        let calls = vec![record_with_value(RollupId(1), RollupId(0), true, value)];
+        let batch = build_batch(&calls, &attr, &ChainDialect::EvmL2Style, RollupId(1), &[])
+            .expect("build_batch ok");
+        assert_eq!(batch.entries().len(), 1);
+        let entry = &batch.entries()[0];
+        assert_eq!(entry.L2ToL1Calls.len(), 1);
+        assert_eq!(entry.L2ToL1Calls[0].value, value);
+        assert_eq!(entry.callCount, U256::from(1));
+        assert_ne!(entry.rollingHash, B256::ZERO);
+        assert!(entry.stateDeltas.is_empty());
+    }
+
+    #[test]
+    fn value_zero_keeps_existing_shape_on_both_batches() {
+        // Value-free outer (setter) keeps the full shape on BOTH
+        // batches; L1 and L2 entries share the `proxyEntryHash` binding.
+        let (init, ptx) = empty_attribution();
+        let attr = SourceAttribution {
+            initial_roots: &init,
+            per_tx_roots_by_rollup: &ptx,
+            entry_rollup_id: RollupId(0),
+        };
+        let calls = vec![record_with_value(
+            RollupId(1),
+            RollupId(0),
+            true,
+            U256::ZERO,
+        )];
+        let l1_batch = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[])
+            .expect("L1 build_batch ok");
+        let l2_batch = build_batch(&calls, &attr, &ChainDialect::EvmL2Style, RollupId(1), &[])
+            .expect("L2 build_batch ok");
+        for (label, batch) in [("L1", &l1_batch), ("L2", &l2_batch)] {
+            assert_eq!(batch.entries().len(), 1, "{label}: one entry");
+            let entry = &batch.entries()[0];
+            assert_eq!(entry.L2ToL1Calls.len(), 1, "{label}: outer in L2ToL1Calls");
+            assert_eq!(entry.callCount, U256::from(1), "{label}: callCount=1");
+            assert_ne!(entry.rollingHash, B256::ZERO, "{label}: rolling hash set");
+        }
+        assert_eq!(
+            l1_batch.entries()[0].proxyEntryHash,
+            l2_batch.entries()[0].proxyEntryHash,
+        );
+    }
+
+    #[test]
     fn encode_postbatch_selector() {
         let batch = EvmBatch::empty();
         let data = encode_postbatch(&batch);
-        assert_eq!(
-            &data[..4],
-            &postVerifyAndExecuteOrSaveExecutionsFromBatchCall::SELECTOR
-        );
+        assert_eq!(&data[..4], &postAndVerifyBatchCall::SELECTOR);
     }
 
     #[test]

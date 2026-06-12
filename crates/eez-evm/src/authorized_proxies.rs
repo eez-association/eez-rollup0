@@ -1,28 +1,14 @@
 //! Storage layout for the `authorizedProxies` mapping.
 //!
-//! Two EVM contracts hold this mapping:
+//! Both EVM contracts (`EEZ.sol` on L1, `EEZL2.sol` on L2) declare
+//! `authorizedProxies` on the shared `EEZBase` parent, inherited first
+//! with no prior non-transient storage — so it sits at slot 0 of each
+//! ([`ROLLUPS_AUTHORIZED_PROXIES_SLOT`] / [`CCM_AUTHORIZED_PROXIES_SLOT`],
+//! both 0). `EEZ.sol` is the L1→L2 source side, `EEZL2.sol` the L2→L1.
 //!
-//! - **L1 `EEZ.sol`** — `authorizedProxies` at slot
-//!   [`ROLLUPS_AUTHORIZED_PROXIES_SLOT`] (3). Source side for L1→L2
-//!   composition. Storage layout per upstream `EEZ.sol:111-129`:
-//!   `rollupCounter` (0), `rollups` (1), `verificationByRollup` (2),
-//!   **`authorizedProxies` (3)**. The pre-multi-prover `Rollups.sol`
-//!   layout had `authorizedProxies` at slot 5 because of two extra
-//!   global tables (`executions`, `staticCalls`, `executionIndex`)
-//!   that the per-rollup queue model replaced with the
-//!   `verificationByRollup` mapping.
-//! - **L2 `CrossChainManagerL2.sol`** — `authorizedProxies` at slot
-//!   [`CCM_AUTHORIZED_PROXIES_SLOT`] (2). Source side for L2→L1
-//!   composition. Storage layout per upstream
-//!   `CrossChainManagerL2.sol:26-32`: `executions` (0),
-//!   `lookupCalls` (1), **`authorizedProxies` (2)**, `lastLoadBlock`
-//!   (3), `executionIndex` (4). `ROLLUP_ID` and `SYSTEM_ADDRESS` are
-//!   immutables (no storage slot).
-//!
-//! The slot is a compile-time property of the contract's storage
-//! layout. If the Solidity declaration order changes, update the
-//! constant; the E2E byte-equality check against the reference
-//! protocol catches drift loudly.
+//! The slot is a compile-time property of the storage layout; if the
+//! Solidity declaration order changes, update the constant and verify
+//! via `forge inspect <Contract> storage`.
 //!
 //! Both constants are consumed at config build time as the
 //! `authorized_proxies_slot: u8` field on
@@ -35,18 +21,18 @@ use eez_protocol::RollupId;
 
 /// Storage slot of `authorizedProxies` on `EEZ.sol` (L1).
 ///
-/// Used by the entry-rollup proxy-lookup configuration. Matches the
-/// position of the `mapping(address => ProxyInfo) authorizedProxies`
-/// declaration in the contract — slot 3 under the multi-prover
-/// layout (was 5 under the pre-multi-prover `Rollups.sol`).
-pub const ROLLUPS_AUTHORIZED_PROXIES_SLOT: u8 = 3;
+/// Used by the entry-rollup proxy-lookup configuration. The mapping
+/// is inherited from `EEZBase` (first storage declaration there), so
+/// it occupies slot 0 of `EEZ.sol`. Verify with
+/// `forge inspect EEZ storage` from `sync-rollups-protocol/`.
+pub const ROLLUPS_AUTHORIZED_PROXIES_SLOT: u8 = 0;
 
-/// Storage slot of `authorizedProxies` on `CrossChainManagerL2.sol` (L2).
+/// Storage slot of `authorizedProxies` on `EEZL2.sol` (L2).
 ///
-/// Used by the follower-rollup proxy-lookup configuration. Matches
-/// the position of the `mapping(address => ProxyInfo) authorizedProxies`
-/// declaration in the contract.
-pub const CCM_AUTHORIZED_PROXIES_SLOT: u8 = 2;
+/// Used by the follower-rollup proxy-lookup configuration. Inherited
+/// from `EEZBase` and occupies slot 0 of `EEZL2.sol`. Verify with
+/// `forge inspect EEZL2 storage` from `sync-rollups-protocol/`.
+pub const CCM_AUTHORIZED_PROXIES_SLOT: u8 = 0;
 
 /// Information about a registered cross-chain proxy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,10 +97,11 @@ mod tests {
     #[test]
     fn slot_constants() {
         // Compile-time constants from the contracts' storage layout.
-        // Any change here must be paired with a matching change in the
-        // Solidity declaration order.
-        assert_eq!(ROLLUPS_AUTHORIZED_PROXIES_SLOT, 3);
-        assert_eq!(CCM_AUTHORIZED_PROXIES_SLOT, 2);
+        // Any change here must be paired with a matching change in
+        // the Solidity declaration order; re-verify via
+        // `forge inspect <Contract> storage` from sync-rollups-protocol/.
+        assert_eq!(ROLLUPS_AUTHORIZED_PROXIES_SLOT, 0);
+        assert_eq!(CCM_AUTHORIZED_PROXIES_SLOT, 0);
     }
 
     #[test]
@@ -161,11 +148,11 @@ mod tests {
 
         assert_eq!(
             proxy_mapping_key(addr, ROLLUPS_AUTHORIZED_PROXIES_SLOT),
-            proxy_mapping_key(addr, 3),
+            proxy_mapping_key(addr, 0),
         );
         assert_eq!(
             proxy_mapping_key(addr, CCM_AUTHORIZED_PROXIES_SLOT),
-            proxy_mapping_key(addr, 2),
+            proxy_mapping_key(addr, 0),
         );
     }
 }

@@ -47,6 +47,7 @@ impl Default for EvmBatch {
                 blobIndices: Vec::new(),
                 callData: Bytes::new(),
                 proofs: Vec::new(),
+                blockNumber: 0,
             },
         }
     }

@@ -73,9 +73,9 @@ pub fn cross_chain_call_hash(
 }
 
 /// Storage slot of `mapping(uint256 => RollupConfig) public rollups`
-/// on `EEZ.sol`. Slot index `1` is determined by the EEZ contract's
-/// state-variable order: `rollupCounter` at 0, `rollups` at 1.
-const ROLLUPS_MAPPING_SLOT: u8 = 1;
+/// on `EEZ.sol` — slot 2, after `authorizedProxies` (0) and
+/// `rollupCounter` (1). Verify with `forge inspect EEZ storage`.
+const ROLLUPS_MAPPING_SLOT: u8 = 2;
 
 /// Compute the Solidity storage slot for `rollups[rollupId].stateRoot`
 /// on `EEZ.sol`.
@@ -204,15 +204,13 @@ mod tests {
     #[test]
     fn state_root_slot_known_value_for_rollup_one() {
         // Hard-coded oracle: `keccak256(abi.encode(uint256(1),
-        // uint256(1))) + 1` is the slot of `rollups[1].stateRoot`
-        // under the EEZ.sol multi-prover layout. Computed offline
-        // (verified against Foundry `cast keccak`) so the test is
-        // an independent witness rather than a re-derivation of
-        // `compute_state_root_slot`'s own formula. If RollupConfig's
-        // shape ever shifts `stateRoot` back to a different offset,
-        // this test fails loudly.
+        // uint256(2))) + 1` — the slot of `rollups[1].stateRoot`
+        // (`rollups` mapping at slot 2, `stateRoot` at +1). Computed
+        // offline via `cast keccak` so this is an independent witness,
+        // not a re-derivation of the function's own formula; fails
+        // loudly if the mapping slot or `RollupConfig` shape moves.
         let slot = compute_state_root_slot(RollupId(1));
-        let expected: B256 = "0xcc69885fda6bcc1a4ace058b4a62bf5e179ea78fd58a1ccd71c22cc9b6887930"
+        let expected: B256 = "0xe90b7bceb6e7df5418fb78d8ee546e97c83a08bbccc01a0644d599ccd2a7c2e1"
             .parse()
             .expect("hex");
         assert_eq!(slot, expected, "slot {slot} != {expected}");

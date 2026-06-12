@@ -22,7 +22,11 @@
 //! - [`entries`]            — unified [`entries::build_batch`] emitter + ABI payload encoders
 //! - [`dialect`]            — [`ChainDialect`] enum + per-dialect ABI helpers
 //! - [`authorized_proxies`] — slot constants + storage-mapping helpers
-//! - [`types`]              — `sol!`-generated ABI structs ([`ExecutionEntrySol`], [`L2ToL1CallSol`], [`LookupCallSol`], …)
+//! - [`types`]              — `sol!`-generated ABI structs ([`ExecutionEntrySol`], [`L2ToL1CallSol`], [`LookupCallSol`], …) + events + `postAndVerifyBatch`/`loadExecutionTable` calls (the single ABI source)
+//! - [`system_tx`]          — builds the signed inbound L2 system txs (shared composer↔deriver STF source)
+//! - [`signer`]             — narrow ECDSA signer for the postBatch poster's proof system
+//! - [`proof_plan`]         — EVM-side [`eez_protocol::ProofPlanResolver`] impl
+//! - [`public_inputs`]      — two-stage `publicInputsHash` construction (mirrors on-chain)
 //! - [`overlay`]            — [`EvmOverlay`] (`BundleState` equivalent)
 //! - [`witness`]            — [`EvmWitness`] (Phase 2)
 //!
@@ -36,8 +40,11 @@
 //!   per-dialect encoders (`encode_postbatch` / `encode_load_table`)
 //!   produce the calldata wrappers.
 //!
-//! Zero reth deps. Works against any `ChainClient` / `EntryChainClient`
-//! implementation (local reth, gRPC, or a test fake).
+//! The core ABI materialization is client-agnostic (works against any
+//! `ChainClient` / `EntryChainClient` — local reth, gRPC, or a test
+//! fake). [`system_tx`] and [`signer`] additionally depend on
+//! reth/alloy consensus tx types to build + sign the inbound L2 system
+//! transactions.
 
 pub mod action;
 pub mod authorized_proxies;
@@ -48,6 +55,7 @@ pub mod overlay;
 pub mod proof_plan;
 pub mod public_inputs;
 pub mod signer;
+pub mod system_tx;
 pub mod types;
 pub mod witness;
 
@@ -133,6 +141,29 @@ impl ChainProtocol for EvmProtocol {
         dialect.encode_follower_trigger(call, source_rollup_id, raw_tx)
     }
 
+    fn encode_inbound_delivery(
+        &self,
+        outer: &RecordedCall<Self>,
+        batch: &Self::Batch,
+        dialect: &Self::Dialect,
+    ) -> Option<Vec<u8>> {
+        // Only L2-style followers route inbound through
+        // `executeIncomingCrossChainCall`; the L1-style entry rollup
+        // is never the follower here, so it returns `None`.
+        match dialect {
+            ChainDialect::EvmL2Style => Some(dialect::encode_execute_incoming_cross_chain_call(
+                outer.original_address,
+                outer.value,
+                &outer.calldata,
+                outer.caller,
+                outer.caller_rollup_id.0,
+                batch.inner.entries.clone(),
+                batch.inner.l1ToL2lookupCalls.clone(),
+            )),
+            ChainDialect::EvmL1Style => None,
+        }
+    }
+
     fn encode_address(&self, addr: &Address) -> Vec<u8> {
         addr.to_vec()
     }
@@ -177,17 +208,14 @@ fn expect_len(bytes: &[u8], expected: usize, label: &str) -> ProtocolResult<()> 
 mod tests {
     use super::*;
     use alloy_sol_types::SolCall;
-    use types::{loadExecutionTableCall, postVerifyAndExecuteOrSaveExecutionsFromBatchCall};
+    use types::{loadExecutionTableCall, postAndVerifyBatchCall};
 
     #[test]
     fn table_payload_l1_style_emits_post_verify_and_execute_or_save() {
         let proto = EvmProtocol;
         let batch = batch::EvmBatch::empty();
         let data = proto.encode_table_payload(&batch, &ChainDialect::EvmL1Style);
-        assert_eq!(
-            &data[..4],
-            &postVerifyAndExecuteOrSaveExecutionsFromBatchCall::SELECTOR
-        );
+        assert_eq!(&data[..4], &postAndVerifyBatchCall::SELECTOR);
     }
 
     #[test]

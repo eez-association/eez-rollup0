@@ -126,7 +126,7 @@ sol! {
     }
 
     /// The single struct argument to
-    /// [`postVerifyAndExecuteOrSaveExecutionsFromBatchCall`]. Carries
+    /// [`postAndVerifyBatchCall`]. Carries
     /// the deferred-execution table + lookup queue + per-rollup
     /// proof-system subsets + DA carriers + per-PS proofs.
     struct ProofSystemBatchPerVerificationEntriesSol {
@@ -140,6 +140,10 @@ sol! {
         uint256[]                        blobIndices;
         bytes                            callData;
         bytes[]                          proofs;
+        // L1 block the batch binds to — forwarded to each rollup's
+        // `getTimestampAndBlockHash`. 0 = no context, u64::MAX =
+        // "latest" (`EEZ.sol:46-48`).
+        uint64                           blockNumber;
     }
 
     /// L2 (`CrossChainManagerL2.loadExecutionTable`) — system-only.
@@ -150,13 +154,12 @@ sol! {
         LookupCallSol[] _lookupCalls
     ) external;
 
-    /// L1 (`EEZ.postVerifyAndExecuteOrSaveExecutionsFromBatch`) —
-    /// single-struct entrypoint that replaces the prior 7-arg
-    /// `postBatch`. Performs proof-system verification, marks each
-    /// touched rollup verified-this-block, drains the immediate
-    /// (`proxyEntryHash == 0`) prefix inline, drives the meta hook,
-    /// then publishes the deferred remainder into per-rollup queues.
-    function postVerifyAndExecuteOrSaveExecutionsFromBatch(
+    /// L1 (`EEZ.postAndVerifyBatch`) — single-struct entrypoint.
+    /// Verifies the proof systems, marks each touched rollup
+    /// verified-this-block, drains the immediate (`proxyEntryHash == 0`)
+    /// prefix inline, drives the meta hook, then publishes the deferred
+    /// remainder into per-rollup queues (`src/EEZ.sol:329`).
+    function postAndVerifyBatch(
         ProofSystemBatchPerVerificationEntriesSol batch
     ) external;
 
@@ -174,9 +177,57 @@ sol! {
     /// from the prior `executeCrossChainCall`.
     function executeL1ToL2Call(address sourceAddress, bytes callData) external payable returns (bytes);
 
+    /// L2 (`EEZL2.executeIncomingCrossChainCall`) — system-only,
+    /// atomic inbound delivery for a cross-chain call from another
+    /// rollup. Atomically loads the execution table and consumes
+    /// `entries[0]`. `msg.value == value` strict equality (system
+    /// mints exactly the call's value). Reverts `EntryHashMismatch`
+    /// if `entries[0].proxyEntryHash != computeCrossChainCallHash(...)`.
+    /// (`src/L2/EEZL2.sol:174-211`.)
+    function executeIncomingCrossChainCall(
+        address                  destination,
+        uint256                  value,
+        bytes                    data,
+        address                  sourceAddress,
+        uint256                  sourceRollup,
+        ExecutionEntrySol[]      entries,
+        LookupCallSol[]          _lookupCalls
+    ) external payable returns (bytes);
+
     /// `staticCallLookup` — view on both chains. Looks up a cached
     /// [`LookupCallSol`] by `(crossChainCallHash, callNumber,
     /// lastNestedActionConsumed)` and either returns its `returnData`
     /// or reverts with it (when `failed == true`).
     function staticCallLookup(address sourceAddress, bytes callData) external view returns (bytes);
+
+    /// Emitted once per `postAndVerifyBatch` with the participating
+    /// rollup count (`EEZ.sol:185`). The L1 watcher locates posted
+    /// batches by this event signature.
+    event BatchPosted(uint256 indexed rollupCount);
+
+    /// Emitted by `_applyStateDeltas` (`EEZ.sol:176`) each time a
+    /// rollup's state delta applies, carrying the new stored root. The
+    /// submitter counts these per rollup to derive `settled_count` /
+    /// `settled_final_state`; absence marks a loser batch.
+    event L2ExecutionPerformed(uint256 indexed rollupId, bytes32 newState);
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::postAndVerifyBatchCall;
+    use alloy_sol_types::SolCall;
+
+    /// Pins `postAndVerifyBatch`'s selector to the canonical value
+    /// (verified via `forge inspect EEZ methodIdentifiers`). A mismatch
+    /// means a `*Sol` struct field diverged from `EEZ.sol`. Single
+    /// ABI-drift guard for the workspace (eez-l1 / eez-prover reuse
+    /// these types).
+    #[test]
+    fn post_and_verify_batch_selector_matches_contract() {
+        assert_eq!(
+            postAndVerifyBatchCall::SELECTOR,
+            [0x51, 0xdd, 0x0a, 0xf6],
+            "selector diverged from EEZ.sol @ fe7bf66 (canonical 0x51dd0af6)",
+        );
+    }
 }

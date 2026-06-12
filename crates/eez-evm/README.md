@@ -23,7 +23,7 @@ eez-composer           ←  reth integration, wiring
   operation takes the rollup ids it needs as arguments. Per-tx state
   lives on `CompositionBuilder<EvmProtocol>` in `eez-protocol`.
 - **Slot constants and helpers** (`ROLLUPS_AUTHORIZED_PROXIES_SLOT`
-  = 3, `CCM_AUTHORIZED_PROXIES_SLOT` = 2, `proxy_mapping_key`,
+  = 0, `CCM_AUTHORIZED_PROXIES_SLOT` = 0, `proxy_mapping_key`,
   `decode_proxy_value`) — storage-slot math for the
   `authorizedProxies` mapping. The live-state lookup that consumes
   them lives in `eez-evm-inspector`'s inspector.

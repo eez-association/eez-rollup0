@@ -25,11 +25,15 @@ alloy-provider.workspace = true
 alloy-rpc-client.workspace = true
 alloy-transport-http.workspace = true
 alloy-contract.workspace = true
-# Phase 09 §D: narrow ECDSA signing for the postBatch poster's
-# proof system. See workspace `[dependencies]` rationale.
+# narrow ECDSA signing for the postBatch poster's proof system
 k256.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+# signed L2 system txs (system_tx module)
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-signer-local.workspace = true
+reth-ethereum-primitives.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
