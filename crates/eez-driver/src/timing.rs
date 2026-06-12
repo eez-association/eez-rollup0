@@ -125,6 +125,11 @@ impl RollupTiming {
     ///
     /// Returns [`DriverError::is_timing_config`] for any of:
     /// - any zero field
+    /// - `L2_block_time % 1000 != 0` — L2 block time must be whole
+    ///   seconds. Block timestamps are unix integer-seconds and the
+    ///   Scheduler computes `block_height = (sync_slot_ts - genesis_ts)
+    ///   / l2_block_secs`; sub-second cadence truncates and leaves the
+    ///   Sequencer perpetually behind the target.
     /// - `L1_block_time % L2_block_time != 0` (K not integer)
     /// - `K < 2` (Sync slot must be distinct from surrounding Lives)
     /// - `proof_time + submission_slack >= L1_block_time`
@@ -135,6 +140,14 @@ impl RollupTiming {
             return Err(DriverError::timing_config(
                 "all timing fields (l1_block_time, l2_block_time, proof_time) must be > 0",
             ));
+        }
+        if self.l2_block_time_ms % 1000 != 0 {
+            return Err(DriverError::timing_config(format!(
+                "L2 block time ({} ms) must be a whole number of seconds; \
+                 unix block timestamps are integer-second and the sync-slot \
+                 block-height arithmetic relies on it",
+                self.l2_block_time_ms,
+            )));
         }
         if self.l1_block_time_ms % self.l2_block_time_ms != 0 {
             return Err(DriverError::timing_config(format!(
@@ -185,12 +198,6 @@ impl RollupTiming {
         Duration::from_millis(self.proof_time_ms as u64)
     }
 
-    /// Relay propagation buffer as a [`Duration`].
-    #[must_use]
-    pub const fn submission_slack(self) -> Duration {
-        Duration::from_millis(self.submission_slack_ms as u64)
-    }
-
     /// L2 blocks per sync slot. `K = L1_block_time / L2_block_time`.
     #[must_use]
     pub const fn k(self) -> u32 {
@@ -237,6 +244,13 @@ impl RollupTiming {
     /// past `sync_slot_block` — a trigger should not produce that
     /// outcome under normal flow; it indicates a late-firing trigger
     /// or a recent reorg that overshot.
+    ///
+    /// **Catchup over-catch**: when behind, Catchup produces the full
+    /// `sync_slot_block - head_block` gap (capped at
+    /// [`MAX_BLOCKS_PER_CATCHUP`]) so head reaches `sync_slot_block` and
+    /// the next trigger sees `gap = K` → Slot mode. Stopping short (e.g.
+    /// at `live_region_end`) leaves `gap = K + future + 1` after every
+    /// Catchup — perpetually behind, never closing the slot.
     #[must_use]
     pub fn per_trigger_composition(self, head_block: u64, sync_slot_block: u64) -> SlotComposition {
         if head_block >= sync_slot_block {
@@ -258,8 +272,11 @@ impl RollupTiming {
                     future,
                 }
             } else {
+                // Over-catch: bring head up to `sync_slot_block` so the
+                // next trigger enters Slot mode.
+                let gap = sync_slot_block - head_block;
                 SlotComposition::Catchup {
-                    live: live_to_produce.min(MAX_BLOCKS_PER_CATCHUP),
+                    live: gap.min(MAX_BLOCKS_PER_CATCHUP),
                 }
             }
         } else {
@@ -318,8 +335,10 @@ mod tests {
         RollupTiming::new(12_000, 2_000, 4_000, 100)
     }
 
+    // K=2 devnet timing. Whole-second L2 only — sub-second cadence
+    // trips `.as_secs()` truncation in the Scheduler (see `validate`).
     fn chiado_slow() -> RollupTiming {
-        RollupTiming::new(5_000, 2_500, 2_500, 100)
+        RollupTiming::new(4_000, 2_000, 2_000, 100)
     }
 
     fn chiado_fast() -> RollupTiming {
@@ -374,6 +393,16 @@ mod tests {
             .validate()
             .expect_err("non-integer K should be refused");
         assert!(format!("{err}").contains("integer multiple"));
+    }
+
+    #[test]
+    fn sub_second_l2_rejected() {
+        // L1=5s, L2=2.5s — K is integer but the L1-anchored Scheduler
+        // truncates `.as_secs()` and lands perpetually in Catchup.
+        let err = RollupTiming::new(5_000, 2_500, 2_000, 100)
+            .validate()
+            .expect_err("sub-second L2 cadence should be refused");
+        assert!(format!("{err}").contains("whole number of seconds"));
     }
 
     #[test]
@@ -442,16 +471,16 @@ mod tests {
 
     #[test]
     fn mainnet_catchup_one_slot_behind() {
-        // Sync at 12, head at 0. live_region_end = 10. live_to_produce
-        // = 10 > 4 → Catchup. Live blocks = 10 (under cap).
+        // Sync at 12, head at 0: over-catch produces the full gap (12)
+        // so head reaches sync_slot and the next trigger is Slot mode.
         let c = mainnet().per_trigger_composition(0, 12);
-        assert_eq!(c, SlotComposition::Catchup { live: 10 });
+        assert_eq!(c, SlotComposition::Catchup { live: 12 });
     }
 
     #[test]
     fn mainnet_catchup_clamped_to_cap() {
-        // Way behind: sync at 320, head at 0. live_region_end = 318
-        // → live_to_produce = 318 → capped at MAX_BLOCKS_PER_CATCHUP = 300.
+        // Way behind: sync at 320, head at 0. Gap=320 → capped at
+        // MAX_BLOCKS_PER_CATCHUP = 300.
         let c = mainnet().per_trigger_composition(0, 320);
         assert_eq!(
             c,
@@ -459,6 +488,16 @@ mod tests {
                 live: MAX_BLOCKS_PER_CATCHUP
             }
         );
+    }
+
+    #[test]
+    fn catchup_converges_to_slot_mode_next_trigger() {
+        // After over-catch head = sync_slot = 12. Next trigger advances
+        // sync_slot by K to 18 → gap=6 fits Slot mode (live=4, future=1).
+        let head_after_catchup = 12u64;
+        let sync_slot_after_trigger = 18u64;
+        let c = mainnet().per_trigger_composition(head_after_catchup, sync_slot_after_trigger);
+        assert_eq!(c, SlotComposition::Slot { live: 4, future: 1 });
     }
 
     #[test]

@@ -59,6 +59,20 @@ const FCU_REFRESH: Duration = Duration::from_secs(1);
 /// window keeps recent ancestors alive for the Deriver's replay.
 pub const DEFAULT_MAX_SPECULATIVE_DEPTH: u64 = 64;
 
+/// Log a benign stale-parent skip: the Deriver advanced the canonical
+/// head between our snapshot and the engine FCU, so this commit
+/// targeted a no-longer-canonical parent. The caller bails (its
+/// backfill loop or the whole trigger) and the next trigger rebuilds
+/// from the fresh head. `phase` names the commit site for attribution.
+fn log_stale_parent(phase: &str) {
+    event!(
+        name: "eez.sequencer.stale_parent",
+        Level::DEBUG,
+        phase,
+        "deriver advanced the chain under this commit; bailing — next trigger rebuilds from fresh head",
+    );
+}
+
 /// L1-confirmed L2 head height. `eez_l1::L1CanonicalHead`
 /// implements this; the Sequencer uses it to bound speculative depth.
 pub trait ConfirmedHeadSource: Send + Sync + 'static {
@@ -167,11 +181,11 @@ where
     /// Optional [`BatchCandidate`] emitter. None on follower setups
     /// where no Composer is co-located.
     batch_emitter: Option<BatchEmitter>,
-    /// Optional Sync-slot system-tx producer. When present, called
-    /// before each Sync block to fetch the cross-chain system txs
-    /// for the slot. Defaults to `None` — equivalent to producing
-    /// empty Sync blocks (no cross-chain content).
-    sync_slot_composer: Option<SyncSlotComposerHandle>,
+    /// Optional Sync-slot block producer + the rollup id it composes
+    /// for (which HeldPool to drain). When present, called before each
+    /// Sync block to fetch that rollup's cross-chain content. `None` =
+    /// empty Sync blocks.
+    sync_slot_composer: Option<(u64, SyncSlotComposerHandle)>,
 }
 
 impl<T, ChainSpec> fmt::Debug for Sequencer<T, ChainSpec>
@@ -189,8 +203,14 @@ where
 
 impl<T, ChainSpec> Sequencer<T, ChainSpec>
 where
-    T: PayloadTypes<PayloadAttributes = EthPayloadAttributes> + Send + Sync + 'static,
-    <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives + Send + Sync + 'static,
+    T: PayloadTypes<
+            PayloadAttributes = EthPayloadAttributes,
+            ExecutionData = alloy_rpc_types_engine::ExecutionData,
+        > + Send
+        + Sync
+        + 'static,
+    <T::BuiltPayload as BuiltPayload>::Primitives:
+        NodePrimitives<BlockHeader = alloy_consensus::Header> + Send + Sync + 'static,
     SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>: Send,
     ChainSpec: EthChainSpec<Header = HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>
         + EthereumHardforks
@@ -236,12 +256,30 @@ where
         })
     }
 
-    /// Attach a [`SyncSlotComposerHandle`]. When set, the Sequencer
-    /// calls it before each Sync block to fetch cross-chain system
-    /// txs. None = empty Sync blocks (no cross-chain content).
+    /// Replace the schedule receiver. Composer mode constructs the
+    /// Sequencer early with a placeholder channel (so the single
+    /// `BlockCommitter` actor exists for the Deriver wiring), then swaps
+    /// in the L1-anchored scheduler's receiver once the `L1Watcher` is
+    /// up. One Sequencer / one committer actor / one reconcile lock —
+    /// a second Sequencer would split the lock and head mirror across
+    /// two actors.
     #[must_use]
-    pub fn with_sync_slot_composer(mut self, composer: SyncSlotComposerHandle) -> Self {
-        self.sync_slot_composer = Some(composer);
+    pub fn with_schedule_rx(mut self, schedule_rx: mpsc::Receiver<SlotEvent>) -> Self {
+        self.schedule_rx = schedule_rx;
+        self
+    }
+
+    /// Attach a [`SyncSlotComposerHandle`] for `rollup_id`. When set,
+    /// the Sequencer calls it before each Sync block to fetch the
+    /// cross-chain system txs for that rollup. None = empty Sync
+    /// blocks (no cross-chain content).
+    #[must_use]
+    pub fn with_sync_slot_composer(
+        mut self,
+        rollup_id: u64,
+        composer: SyncSlotComposerHandle,
+    ) -> Self {
+        self.sync_slot_composer = Some((rollup_id, composer));
         self
     }
 
@@ -330,6 +368,12 @@ where
                 block_height,
                 timestamp,
             } => self.advance_sync_slot(block_height, timestamp).await,
+            SlotEvent::LiveTick {
+                sync_slot_block_height,
+            } => {
+                self.advance_anchored_live_tick(sync_slot_block_height)
+                    .await
+            }
         }
     }
 
@@ -354,12 +398,7 @@ where
             match self.commit_one(SlotKind::Live, &last_header).await {
                 Ok(()) => {}
                 Err(err) if err.is_stale_parent() => {
-                    event!(
-                        name: "eez.sequencer.stale_parent",
-                        Level::DEBUG,
-                        parent_hash = %last_header.hash(),
-                        "deriver advanced the chain between snapshot and FCU; breaking backfill loop",
-                    );
+                    log_stale_parent("backfill.live");
                     break;
                 }
                 Err(err) => return Err(err),
@@ -377,6 +416,40 @@ where
             );
         }
         Ok(())
+    }
+
+    /// L1-anchored wall-clock tick handler: commit exactly ONE Live
+    /// block, and only while the head is below the live region of the
+    /// next sync slot (`sync_slot_block_height - future_count - 1`).
+    /// The Future + Sync reserve belongs to the anchor trigger
+    /// ([`Self::advance_sync_slot`]); ticks no-op once the live region
+    /// is full, so they can't outrun the anchor.
+    async fn advance_anchored_live_tick(
+        &mut self,
+        sync_slot_block_height: u64,
+    ) -> DriverResult<()> {
+        let last_header = self.committer.last_header();
+        let head = last_header.number();
+        // Reserve = Future blocks + the Sync block itself. Mirrors
+        // `live_region_end` in `RollupTiming::per_trigger_composition`.
+        let reserve = u64::from(self.timing.future_count()) + 1;
+        let live_region_end = sync_slot_block_height.saturating_sub(reserve);
+        if head >= live_region_end {
+            // Live region full (steady state between anchor fire and
+            // the next L1 head). Future + Sync come from the anchor.
+            return Ok(());
+        }
+        if self.speculative_limit_paused(head) {
+            return Ok(());
+        }
+        match self.commit_one(SlotKind::Live, &last_header).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.is_stale_parent() => {
+                log_stale_parent("live_tick");
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// L1-anchored handler: read current head, compute the per-trigger
@@ -405,7 +478,14 @@ where
         match comp {
             SlotComposition::Idle => {}
             SlotComposition::Catchup { live } => {
-                for _ in 0..live {
+                // Behind wall clock: produce `live` Live blocks plus a
+                // terminal Sync block (the Sync block is what gates the
+                // postBatch — without it the trigger has no L1-canonical
+                // backing, invariant 1). Cap live+sync at
+                // MAX_BLOCKS_PER_CATCHUP so the L2 span fits one bundle.
+                let max_live = crate::MAX_BLOCKS_PER_CATCHUP.saturating_sub(1);
+                let live_to_produce = live.min(max_live);
+                for _ in 0..live_to_produce {
                     let last_header = self.committer.last_header();
                     if self.speculative_limit_paused(last_header.number()) {
                         break;
@@ -413,12 +493,52 @@ where
                     match self.commit_one(SlotKind::Live, &last_header).await {
                         Ok(()) => {}
                         Err(err) if err.is_stale_parent() => {
-                            event!(
-                                name: "eez.sequencer.stale_parent",
-                                Level::DEBUG,
-                                parent_hash = %last_header.hash(),
-                                "deriver advanced during catchup; bailing this trigger",
-                            );
+                            log_stale_parent("catchup.live");
+                            return Ok(());
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+
+                // Terminal Sync block of the catchup trigger. No
+                // Scheduler-supplied timestamp here, so it's parent +
+                // l2_block_time — backfill catchup sets its own pace.
+                let last_header = self.committer.last_header();
+                if self.speculative_limit_paused(last_header.number()) {
+                    return Ok(());
+                }
+                let sync_ts = last_header
+                    .timestamp()
+                    .saturating_add(self.timing.l2_block_time().as_secs());
+
+                // Same cross-chain hook as Slot.Sync: a wired composer
+                // returns a prebuilt Sync block (and dispatches the L1
+                // bundle); otherwise fall back to a pool-driven Sync
+                // commit, which fires no postBatch.
+                let prebuilt = if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref()
+                {
+                    let parent = crate::slot::ParentContext {
+                        header: last_header.clone(),
+                    };
+                    composer
+                        .compose_sync_slot(*rollup_id, parent, sync_ts)
+                        .await
+                } else {
+                    None
+                };
+                if let Some(built) = prebuilt {
+                    if let Err(err) = self.commit_one_prebuilt(SlotKind::Sync, built).await {
+                        if err.is_stale_parent() {
+                            log_stale_parent("catchup.sync.prebuilt");
+                            return Ok(());
+                        }
+                        return Err(err);
+                    }
+                } else {
+                    match self.commit_one(SlotKind::Sync, &last_header).await {
+                        Ok(()) => {}
+                        Err(err) if err.is_stale_parent() => {
+                            log_stale_parent("catchup.sync");
                             return Ok(());
                         }
                         Err(err) => return Err(err),
@@ -434,12 +554,7 @@ where
                     match self.commit_one(SlotKind::Live, &last_header).await {
                         Ok(()) => {}
                         Err(err) if err.is_stale_parent() => {
-                            event!(
-                                name: "eez.sequencer.stale_parent",
-                                Level::DEBUG,
-                                parent_hash = %last_header.hash(),
-                                "deriver advanced during Slot.live; bailing this trigger",
-                            );
+                            log_stale_parent("slot.live");
                             return Ok(());
                         }
                         Err(err) => return Err(err),
@@ -450,12 +565,7 @@ where
                     match self.commit_one(SlotKind::Future, &last_header).await {
                         Ok(()) => {}
                         Err(err) if err.is_stale_parent() => {
-                            event!(
-                                name: "eez.sequencer.stale_parent",
-                                Level::DEBUG,
-                                parent_hash = %last_header.hash(),
-                                "deriver advanced during Slot.future; bailing this trigger",
-                            );
+                            log_stale_parent("slot.future");
                             return Ok(());
                         }
                         Err(err) => return Err(err),
@@ -476,36 +586,37 @@ where
                     );
                 }
 
-                // Cross-chain content hook (S4.7): pull any pre-composed
-                // system txs for this Sync slot from the umbrella's
-                // composer. Empty in the common case (no cross-chain
-                // content this slot). Non-empty routes through the
-                // manual-block-construction path (commit_with_system_txs)
-                // per the S4.3 design — not implemented yet, so we
-                // assert empty until S4.8 wiring lands.
-                if let (Some(composer), Some(emitter)) = (
-                    self.sync_slot_composer.as_ref(),
-                    self.batch_emitter.as_ref(),
-                ) {
-                    let system_txs = composer.compose_sync_slot(emitter.rollup_id).await;
-                    assert!(
-                        system_txs.is_empty(),
-                        "S4.7 contract: {} cross-chain system tx(s) produced for sync slot, but \
-                         commit_with_system_txs path lands in a later phase. Disable cross-chain \
-                         composition or land the manual block-construction path.",
-                        system_txs.len(),
-                    );
+                // Cross-chain content hook: ask the composer for a
+                // pre-built Sync block carrying drained HeldPool system
+                // txs. None = no content this slot → pool-driven Sync
+                // commit. Some = commit its `ExecutionData` via the same
+                // engine-API tail the Deriver uses for L1-derived blocks.
+                let prebuilt = if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref()
+                {
+                    let parent = crate::slot::ParentContext {
+                        header: last_header.clone(),
+                    };
+                    composer
+                        .compose_sync_slot(*rollup_id, parent, sync_slot_timestamp)
+                        .await
+                } else {
+                    None
+                };
+                if let Some(built) = prebuilt {
+                    match self.commit_one_prebuilt(SlotKind::Sync, built).await {
+                        Ok(()) => {}
+                        Err(err) if err.is_stale_parent() => {
+                            log_stale_parent("slot.sync.prebuilt");
+                        }
+                        Err(err) => return Err(err),
+                    }
+                    return Ok(());
                 }
 
                 match self.commit_one(SlotKind::Sync, &last_header).await {
                     Ok(()) => {}
                     Err(err) if err.is_stale_parent() => {
-                        event!(
-                            name: "eez.sequencer.stale_parent",
-                            Level::DEBUG,
-                            parent_hash = %last_header.hash(),
-                            "deriver advanced during Slot.sync; bailing this trigger",
-                        );
+                        log_stale_parent("slot.sync");
                         return Ok(());
                     }
                     Err(err) => return Err(err),
@@ -535,6 +646,63 @@ where
             return true;
         }
         false
+    }
+
+    /// Commit a pre-built Sync block (from the cross-chain composer)
+    /// via `commit_derived` — same engine-API tail the Deriver uses
+    /// for L1-derived blocks. Holds the reconcile lock so a sync-slot
+    /// commit can't race with a deriver-side reconcile.
+    async fn commit_one_prebuilt(
+        &mut self,
+        kind: SlotKind,
+        built: crate::slot::SyncSlotBlock,
+    ) -> DriverResult<()> {
+        // `commit_derived` doesn't take the lock itself (only
+        // `commit_sequenced` does, and the Deriver already holds it via
+        // `begin_reconcile`), so hold it here too.
+        let _reconcile_guard = self.committer.begin_reconcile().await;
+        // Stale-parent check under the lock, like commit_sequenced: the
+        // Deriver (or a failed-batch recovery) can move the head between
+        // compose and commit, and a prebuilt block on a stale parent
+        // would silently reorg that newer work via commit_derived's FCU.
+        let current_head = self.committer.last_header().hash();
+        let built_parent = built.header.parent_hash();
+        if current_head != built_parent {
+            return Err(DriverError::stale_parent(built_parent, current_head));
+        }
+        let block_number = built.header.number();
+        let block_hash = built.header.hash();
+        let block_timestamp = built.header.timestamp();
+        let _outcome = self
+            .committer
+            .commit_derived(built.payload, built.header)
+            .await?;
+
+        event!(
+            name: "eez.sequencer.block.produced",
+            Level::INFO,
+            slot.kind = %kind,
+            block.number = block_number,
+            block.hash = %block_hash,
+            block.timestamp = block_timestamp,
+            "produced block {{block.number}} hash={{block.hash}} ts={{block.timestamp}} kind={{slot.kind}}",
+        );
+
+        if let Some(emitter) = self.batch_emitter.as_mut() {
+            if let Some(candidate) = emitter.on_block_committed(block_number) {
+                if let Err(err) = emitter.tx.send(candidate).await {
+                    event!(
+                        name: "eez.sequencer.batch_candidate.send_failed",
+                        Level::ERROR,
+                        rollup_id = candidate.rollup_id,
+                        to_block = candidate.to_block,
+                        error = %err,
+                        "batch candidate channel closed; downstream Composer task is gone",
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Commit one block of the given kind at
