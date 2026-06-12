@@ -708,6 +708,7 @@ impl NodeHandle {
                 "--port",
                 &p2p_port.to_string(),
                 "--disable-discovery",
+                "--ipcdisable",
             ])
             .stderr(stderr)
             .env_clear()
