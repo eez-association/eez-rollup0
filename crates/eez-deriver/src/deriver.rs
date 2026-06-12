@@ -284,6 +284,29 @@ where
             let batch_first_l2 = cumulative_l2 + 1;
             let batch_last_l2 = cumulative_l2 + decoded.block_count() as u64;
 
+            // Cursor-alignment guard, same as on_batch_posted's: a
+            // winning batch's claimed `currentState` must equal our
+            // state root at the height we're about to stack it on. A
+            // mismatch means this scan is misaligned with L1 — replaying
+            // here would commit blocks that exist on no other node, so
+            // bail *before* touching reth rather than after.
+            if let Some(claimed_current) = batch.claimed_current_state {
+                let local_root = self.l2_sealed_header_at(cumulative_l2)?.state_root();
+                if local_root != claimed_current {
+                    event!(
+                        name: "eez.deriver.catch_up.cursor.misaligned",
+                        Level::ERROR,
+                        l1_block_number = batch.l1_block_number,
+                        tx_hash = %batch.tx_hash,
+                        cumulative_l2,
+                        local_root = %local_root,
+                        claimed_current = %claimed_current,
+                        "batch currentState does not match local state root at the scan cursor; refusing to replay",
+                    );
+                    return Err(DeriverError::local_diverged(batch_first_l2));
+                }
+            }
+
             total_replayed += self
                 .reconcile_batch_blocks(
                     batch_first_l2,
