@@ -42,7 +42,9 @@ clap               = { version = "4", features = ["derive"] }
 # reth — pinned to mediocregopher/partial-persistence-clean tip (contains the receipts-reorg truncation fix).
 reth-chain-state                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-chainspec                  = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-cli                        = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-cli-runner                 = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-db                         = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-engine-primitives          = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-ethereum-cli               = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
@@ -50,8 +52,10 @@ reth-ethereum-payload-builder   = { git = "https://github.com/paradigmxyz/reth",
 reth-ethereum-primitives        = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-evm                        = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-evm-ethereum               = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-network-peers              = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-node-api                   = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-node-builder               = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-node-core                  = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-node-ethereum              = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-payload-builder            = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-payload-primitives         = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
@@ -62,6 +66,14 @@ reth-revm                       = { git = "https://github.com/paradigmxyz/reth",
 reth-storage-api                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-tasks                      = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-trie-common                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+
+# reth_gnosis — Gnosis chain (chiado / gnosis mainnet) NodeBuilder.
+# Pinned to the rollup0-fd59fd22 branch which is the reth_gnosis
+# tree on top of the SAME reth commit as our other reth-* deps,
+# so the inner types are wire-compatible. Provides `GnosisNode`,
+# `GnosisChainSpec`, chiado genesis preset.
+reth_gnosis                     = { git = "https://github.com/gnosischain/reth_gnosis", branch = "rollup0-fd59fd22" }
+gnosis-primitives               = { git = "https://github.com/gnosischain/rust-primitives.git", tag = "v0.2.4" }
 revm                            = { version = "38", default-features = false, features = [
     "optional_balance_check",
     "optional_block_gas_limit",

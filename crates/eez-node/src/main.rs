@@ -14,11 +14,9 @@
 //! | unset | — | **standalone** | reth + Sequencer (interval Scheduler, Live blocks only) |
 //! | set | unset | **follower** | reth + `L1Watcher` + Deriver (no Sequencer) |
 //! | set | set | **composer** | reth + `L1Watcher` + Deriver + Sequencer (L1-anchored) + Composer umbrella |
-//!
-//! Replaces the old `EEZ_SEQUENCER_DISABLED` / `EEZ_COMPOSER_DISABLED`
-//! flags — mode is now implicit from which credentials are configured.
 
 mod ingress;
+mod l1_embedded;
 
 use std::{collections::HashMap, env, str::FromStr, sync::Arc};
 
@@ -27,8 +25,8 @@ use alloy_signer_local::PrivateKeySigner;
 use eez_composer::{Composer, HeldPool, IngressClassifier, RollupConfig, RollupState};
 use eez_deriver::Deriver;
 use eez_driver::{
-    BatchCandidate, BatchPolicy, EthAttributesBuilder, RollupTiming, Sequencer, SlotEvent,
-    SyncSlotComposerHandle, spawn_interval, spawn_l1_anchored,
+    EthAttributesBuilder, RollupTiming, Sequencer, SlotEvent, SyncSlotComposerHandle,
+    spawn_interval, spawn_l1_anchored,
 };
 use eez_l1::{
     L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
@@ -48,16 +46,25 @@ use payload::EezPayloadBuilder;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-/// Sequencer → Composer batch-candidate channel capacity. Small fixed
-/// queue: the produce loop applies backpressure if the Composer falls
-/// behind (slow down rather than drop).
-const BATCH_CANDIDATE_CHAN: usize = 16;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Standalone,
     Follower,
     Composer,
+}
+
+/// Embedded L1 reth handle — owned by `main` for the node lifetime so
+/// the L1 stays alive (drop tears it down). Generic over both variants'
+/// `NodeHandle` params because the AddOns type differs between
+/// EthereumNode (Dev) and GnosisNode (Chiado).
+///
+/// Downstream matches `.as_ref()` for the chain_spec / provider /
+/// evm_config to build the cross-chain composer; the Chiado provider
+/// goes through `eez_composer::GnosisL1Adapter` to translate
+/// `GnosisHeader → alloy_consensus::Header` on each read.
+enum EmbeddedL1<Dev, Chiado> {
+    Dev(Dev),
+    Chiado(Chiado),
 }
 
 impl Mode {
@@ -98,7 +105,21 @@ fn main() -> eyre::Result<()> {
 
     let mode = Mode::from_env();
 
-    Cli::<EthereumChainSpecParser>::parse_args().run(async move |builder, _ext| {
+    // The optimistic composer + Deriver roll the L2 head back to a
+    // canonical ancestor; by Engine API spec an FCU to an ancestor is a
+    // no-op, which would freeze payload builds. These flags opt into
+    // reth's proposer-may-reorg-own-chain mode so the FCU unwinds the head.
+    let mut argv: Vec<String> = std::env::args().collect();
+    for flag in [
+        "--engine.always-process-payload-attributes-on-canonical-head",
+        "--engine.allow-unwind-canonical-header",
+    ] {
+        if !argv.iter().any(|a| a == flag) {
+            argv.push(flag.to_owned());
+        }
+    }
+
+    Cli::<EthereumChainSpecParser>::try_parse_args_from(argv)?.run(async move |builder, _ext| {
         event!(
             name: "eez.node.launching",
             Level::INFO,
@@ -108,20 +129,15 @@ fn main() -> eyre::Result<()> {
 
         warn_on_deprecated_env();
 
-        // Construct the per-rollup HeldPool + IngressClassifier
-        // BEFORE reth launches: they're attached to reth's RPC layer
-        // as an `eth_sendRawTransaction` middleware (`ingress::IngressLayer`).
-        // The same `held_pool` Arc is shared with the umbrella's
-        // RollupState in composer mode so the middleware's pushes and
-        // the Sync-slot drain see the same queue.
-        //
-        // Live in all modes: in follower/standalone the classifier is
-        // empty (no proxies registered), so the middleware passes
-        // every tx through to reth's pool — zero behavior change.
+        // Construct the HeldPool + IngressClassifier BEFORE reth launches
+        // — they attach as an `eth_sendRawTransaction` middleware, and the
+        // `held_pool` Arc is shared with the umbrella so pushes and the
+        // Sync-slot drain see one queue. Empty classifier = pass-through.
         let held_pool = Arc::new(HeldPool::new());
-        let classifier: Arc<IngressClassifier> = Arc::new(
+        let classifier: Arc<IngressClassifier> = Arc::new(IngressClassifier::new(
             parse_cross_chain_proxy_env().into_iter().collect(),
-        );
+            parse_cross_chain_source_chain_ids_env().into_iter().collect(),
+        ));
         if !classifier.is_empty() {
             event!(
                 name: "eez.node.ingress.classifier",
@@ -131,17 +147,105 @@ fn main() -> eyre::Result<()> {
             );
         }
 
-        // Launch reth with two layered modifications:
-        // 1. Payload service swap (PR #9): `EezPayloadBuilder` provides
-        //    `gas_limit` / `extra_data` from shared constants in
-        //    `eez-driver` so the deriver's `execute_block` and the
-        //    sequencer's payload builder produce byte-identical headers.
-        //    Replaces the old `--builder.extradata` / `--builder.gaslimit`
-        //    CLI flag pattern (those flags are still accepted but
-        //    shadowed by what `EezPayloadBuilder` writes).
-        // 2. IngressLayer middleware on the RPC stack: held-pool +
-        //    classifier route cross-chain user_tx submissions to the
-        //    composer's HeldPool instead of reth's mempool.
+        // Launch the embedded L1 reth first in composer mode — its
+        // `StateProviderFactory` backs `LocalChainClient::new_entry` for
+        // L1 source-tx simulation. Inline (not in `l1_embedded.rs`)
+        // because the `NodeHandle` AddOns type resists a typed return.
+        let embed_l1 = mode == Mode::Composer
+            && env::var("EEZ_L1_EMBEDDED")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(true);
+        // Shared L1-reth tokio runtime — built once, used by whichever
+        // L1 path runs.
+        let build_l1_runtime = || {
+            reth_tasks::RuntimeBuilder::new(
+                reth_tasks::RuntimeConfig::default().with_tokio(
+                    reth_tasks::TokioConfig::existing_handle(
+                        tokio::runtime::Handle::current(),
+                    ),
+                ),
+            )
+            .build()
+            .map_err(|e| eyre::eyre!("L1 embedded RuntimeBuilder: {e}"))
+        };
+        // Dev = vanilla EthereumNode (5s auto-mine); Chiado =
+        // reth_gnosis::GnosisNode + external CL, its provider wrapped by
+        // `GnosisL1Adapter` for the alloy-Header bound. Returns an
+        // `EmbeddedL1` owning the NodeHandle so the L1 outlives the node.
+        let embedded_l1: Option<EmbeddedL1<_, _>> = if embed_l1 {
+            let l1_cfg = build_embedded_l1_config()?;
+            match l1_cfg.kind {
+                l1_embedded::L1ChainKind::Dev => {
+                    let node_cfg = l1_embedded::build_dev_node_config(&l1_cfg)?;
+                    let db = reth_db::init_db(
+                        node_cfg.datadir().db(),
+                        reth_db::mdbx::DatabaseArguments::default(),
+                    )
+                    .map_err(|e| eyre::eyre!("L1 embedded init_db: {e}"))?;
+                    event!(
+                        name: "eez.node.l1_embedded.launching",
+                        Level::INFO,
+                        kind = "dev",
+                        http_port = l1_cfg.http_port,
+                        "launching embedded L1 reth (dev)",
+                    );
+                    let l1_handle = reth_node_builder::NodeBuilder::new(node_cfg)
+                        .with_database(db)
+                        .with_launch_context(build_l1_runtime()?)
+                        .node(EthereumNode::default())
+                        .launch_with_debug_capabilities()
+                        .await?;
+                    event!(
+                        name: "eez.node.l1_embedded.ready",
+                        Level::INFO,
+                        kind = "dev",
+                        l1_chain_id = %l1_handle.node.chain_spec().chain(),
+                        "embedded L1 reth (dev) ready",
+                    );
+                    Some(EmbeddedL1::Dev(l1_handle))
+                }
+                l1_embedded::L1ChainKind::Chiado => {
+                    let node_cfg = l1_embedded::build_chiado_node_config(&l1_cfg)?;
+                    let db = reth_db::init_db(
+                        node_cfg.datadir().db(),
+                        reth_db::mdbx::DatabaseArguments::default(),
+                    )
+                    .map_err(|e| eyre::eyre!("L1 chiado init_db: {e}"))?;
+                    event!(
+                        name: "eez.node.l1_embedded.launching",
+                        Level::INFO,
+                        kind = "chiado",
+                        http_port = l1_cfg.http_port,
+                        auth_port = l1_cfg.auth_port,
+                        datadir = ?l1_cfg.datadir,
+                        "launching embedded L1 reth (chiado via reth_gnosis::GnosisNode); \
+                         external lighthouse CL must connect to authrpc",
+                    );
+                    let chiado_handle = reth_node_builder::NodeBuilder::new(node_cfg)
+                        .with_database(db)
+                        .with_launch_context(build_l1_runtime()?)
+                        .node(reth_gnosis::GnosisNode::default())
+                        .launch_with_debug_capabilities()
+                        .await?;
+                    event!(
+                        name: "eez.node.l1_embedded.ready",
+                        Level::INFO,
+                        kind = "chiado",
+                        l1_chain_id = %chiado_handle.node.chain_spec().inner.chain(),
+                        "embedded L1 reth (chiado) ready — cross-chain composer \
+                         wraps the provider via eez_composer::GnosisL1Adapter",
+                    );
+                    Some(EmbeddedL1::Chiado(chiado_handle))
+                }
+            }
+        } else {
+            None
+        };
+
+        // L2 reth, two modifications: (1) `EezPayloadBuilder` writes
+        // `gas_limit`/`extra_data` from shared `eez-driver` constants so
+        // deriver replay and sequencer builds yield identical headers;
+        // (2) `IngressLayer` routes cross-chain user txs to the HeldPool.
         let handle = builder
             .with_types::<EthereumNode>()
             .with_components(
@@ -188,30 +292,24 @@ fn main() -> eyre::Result<()> {
 
         // Build per-mode pieces: schedule receiver + (optional) batch
         // candidate channel + (optional) speculative limit.
-        let (schedule_rx, batch_rx, batch_tx) = match mode {
-            Mode::Standalone => {
-                let rx = spawn_interval(timing.l2_block_time());
-                (rx, None, None)
-            }
+        let schedule_rx = match mode {
+            Mode::Standalone => spawn_interval(timing.l2_block_time()),
             Mode::Follower => {
                 // Dummy channel; Sequencer is constructed (to spawn
                 // BlockCommitter) but never .run(). Holding the sender
                 // here keeps the receiver from closing immediately.
                 let (_tx, rx) = mpsc::channel::<SlotEvent>(1);
-                (rx, None, None)
+                rx
             }
             Mode::Composer => {
                 let submitter_config = SubmitterConfig::from_env()?;
                 let _ = submitter_config; // validated by Composer block below
                 let l1_watcher_config_preview = L1WatcherConfig::from_env()?;
                 let _ = l1_watcher_config_preview; // validated below
-                // L1-anchored Scheduler needs the L1Watcher handle —
-                // built inside the composer arm below where we
-                // construct submitter/l1_watcher together.
-                let (bt, br) = mpsc::channel::<BatchCandidate>(BATCH_CANDIDATE_CHAN);
-                // Placeholder for schedule_rx; replaced inside composer arm
+                // Placeholder for schedule_rx; replaced inside the composer
+                // arm with the real L1-anchored schedule (spawn_l1_anchored).
                 let (_drop_tx, drop_rx) = mpsc::channel::<SlotEvent>(1);
-                (drop_rx, Some(br), Some(bt))
+                drop_rx
             }
         };
 
@@ -230,7 +328,13 @@ fn main() -> eyre::Result<()> {
             timing,
         )?;
         if mode != Mode::Standalone {
-            sequencer = sequencer.with_speculative_limit(64, Arc::clone(&l1_head) as _);
+            let depth = env::var("EEZ_MAX_SPECULATIVE_DEPTH")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(64);
+            if depth != 0 {
+                sequencer = sequencer.with_speculative_limit(depth, Arc::clone(&l1_head) as _);
+            }
         }
 
         let block_committer = sequencer.committer();
@@ -252,19 +356,13 @@ fn main() -> eyre::Result<()> {
         let submitter = Submitter::new(submitter_config);
         let l1_watcher = L1Watcher::spawn(l1_watcher_config);
 
-        // ─── Composer-only: build the umbrella first, then rebuild ────
-        // Sequencer with L1-anchored schedule + batch_emitter + the
-        // umbrella attached as SyncSlotComposer. The placeholder
-        // Sequencer above was wired with a dummy receiver to keep types
-        // simple at the build site; for composer mode we drop and
-        // rebuild now that the L1Watcher exists. Building the umbrella
-        // first lets us pass it to the Sequencer for per-Sync-slot
-        // cross-chain-content drain.
-        let (sequencer, batch_rx, umbrella) = if mode == Mode::Composer {
-            drop(sequencer);
-
-            // Umbrella construction first. The rollup state owns its
-            // HeldPool (S4.7 drain target).
+        // Composer-only: build the umbrella, then attach it to the
+        // Sequencer built above (swapping in the L1-anchored schedule via
+        // `with_schedule_rx`). Must reuse that instance — its
+        // BlockCommitter actor is the one the Deriver shares; rebuilding
+        // would spawn a second actor with its own reconcile lock + head
+        // mirror, splitting the serialization domain.
+        let (sequencer, umbrella, system_tx_cfg) = if mode == Mode::Composer {
             let proof_signer_key = env::var("EEZ_PROOF_SIGNER_KEY")
                 .map_err(|_| eyre::eyre!("EEZ_PROOF_SIGNER_KEY required in composer mode"))?;
             let proof_signer = PrivateKeySigner::from_bytes(&B256::from_str(
@@ -272,10 +370,9 @@ fn main() -> eyre::Result<()> {
             )?)?;
             let prover = Arc::new(MockEcdsaProver::new(proof_signer));
             let rollup_id = rollup_config.rollup_id;
-            // Share the SAME HeldPool the ingress middleware pushes
-            // into. RollupState's `Option<Arc<HeldPool>>` wraps the
-            // shared Arc so multi-rollup deployments later can keep
-            // per-rollup pools while still sharing one ingress layer.
+            // Share the SAME HeldPool the ingress middleware pushes into
+            // (the `Option<Arc<HeldPool>>` leaves room for per-rollup
+            // pools under one ingress layer later).
             let held_pool_for_rollup = Some(Arc::clone(&held_pool));
             let rollup_state = RollupState {
                 config: rollup_config.clone(),
@@ -283,55 +380,335 @@ fn main() -> eyre::Result<()> {
                 l2_provider: Arc::new(provider.clone()),
                 l1_head: Arc::clone(&l1_head),
                 held_pool: held_pool_for_rollup,
+                optimistic: Arc::new(eez_composer::OptimisticallyIncluded::new()),
             };
             let mut rollups = HashMap::with_capacity(1);
             rollups.insert(rollup_id, rollup_state);
-            let composer = Composer::new(rollups, prover, submitter.clone(), l1_watcher.clone());
+            // EVM config feeds the manual Sync-block construction path
+            // (build_sync_block → reth-evm BlockBuilder). Same chain spec
+            // the engine uses, so blocks produced here pass validation
+            // when reth ingests them via newPayload.
+            let evm_config = reth_evm_ethereum::EthEvmConfig::new(chain_spec.clone());
+
+            // Build the cross-chain `EvmComposer` when the embedded L1 is
+            // up — it owns `LocalChainClient`s over L1 (entry) and L2
+            // (follower). `None` without an embedded L1. Inlined because
+            // the `FullNode` AddOns type resists a typed helper return.
+            let evm_composer: Option<eez_evm_inspector::EvmComposer> =
+                if let Some(l1_variant) = embedded_l1.as_ref() {
+                    use eez_composer::{GnosisL1Adapter, LocalChainClient};
+                    use eez_evm::EvmProtocol;
+                    use eez_evm_inspector::{
+                        DEFAULT_CCM_GAS_LIMIT, EvmTargetConfig, ProxyLookupConfig,
+                    };
+                    use eez_protocol::Composer as ProtocolComposer;
+                    use eez_protocol::rollup_id::RollupId;
+
+                    let eez_registry: Address = Address::from_str(&env::var("EEZ_REGISTRY_ADDRESS").map_err(
+                        |_| eyre::eyre!("EEZ_REGISTRY_ADDRESS required for EvmComposer (set by deploy.sh)"),
+                    )?)?;
+                    let ccm_l2: Address = Address::from_str(&env::var("EEZ_CCM_L2_ADDRESS").map_err(
+                        |_| eyre::eyre!("EEZ_CCM_L2_ADDRESS required for EvmComposer (set by deploy.sh)"),
+                    )?)?;
+                    let l2_system_address: Address = env::var("EEZ_L2_SYSTEM_ADDRESS")
+                        .ok()
+                        .and_then(|s| Address::from_str(&s).ok())
+                        .unwrap_or(Address::ZERO);
+                    let l1_rollup_id_u64 = read_l1_rollup_id();
+                    let l1_rollup_id = RollupId(l1_rollup_id_u64);
+                    let l2_rollup_id_typed = RollupId(rollup_id);
+
+                    // L1 entry differs per kind: Dev uses the native
+                    // provider + EvmConfig; Chiado wraps it in
+                    // `GnosisL1Adapter` and builds a fresh `EthEvmConfig`
+                    // over the chiado ChainSpec (source-sim needs only
+                    // revm, not GnosisNode's AuRa paths). Both yield the
+                    // same erased views, so composition is identical.
+                    let (entry_client_view, root_reader_view) = match l1_variant {
+                        EmbeddedL1::Dev(l1_handle) => {
+                            let l1_chain_spec = l1_handle.node.chain_spec();
+                            let l1_provider = l1_handle.node.provider.clone();
+                            let l1_evm_config = l1_handle.node.evm_config.clone();
+                            let entry_client = LocalChainClient::new_entry(
+                                l1_provider,
+                                l1_evm_config,
+                                l1_chain_spec,
+                                l1_rollup_id,
+                                eez_registry,
+                                eez_registry,
+                                eez_evm::ChainDialect::EvmL1Style,
+                            );
+                            let entry_view: std::sync::Arc<
+                                dyn eez_protocol::executor::EntryChainClient<Protocol = EvmProtocol>
+                                    + Send
+                                    + Sync,
+                            > = entry_client.clone();
+                            let root_view: std::sync::Arc<
+                                dyn eez_protocol::executor::CommittedRootReader<Protocol = EvmProtocol>
+                                    + Send
+                                    + Sync,
+                            > = entry_client.clone();
+                            (entry_view, root_view)
+                        }
+                        EmbeddedL1::Chiado(chiado_handle) => {
+                            // `GnosisChainSpec.inner` is the standard
+                            // reth `ChainSpec` (via `#[deref]`); wrap it
+                            // fresh as `Arc<ChainSpec>` for both the
+                            // LocalChainClient chain_spec slot and the
+                            // standard `EthEvmConfig` simulation envs.
+                            let gnosis_chain_spec = chiado_handle.node.chain_spec();
+                            let l1_chain_spec: Arc<reth_chainspec::ChainSpec> =
+                                Arc::new(gnosis_chain_spec.inner.clone());
+                            let l1_provider = GnosisL1Adapter::new(
+                                chiado_handle.node.provider.clone(),
+                            );
+                            let l1_evm_config =
+                                reth_evm_ethereum::EthEvmConfig::new(Arc::clone(&l1_chain_spec));
+                            let entry_client = LocalChainClient::new_entry(
+                                l1_provider,
+                                l1_evm_config,
+                                l1_chain_spec,
+                                l1_rollup_id,
+                                eez_registry,
+                                eez_registry,
+                                eez_evm::ChainDialect::EvmL1Style,
+                            );
+                            let entry_view: std::sync::Arc<
+                                dyn eez_protocol::executor::EntryChainClient<Protocol = EvmProtocol>
+                                    + Send
+                                    + Sync,
+                            > = entry_client.clone();
+                            let root_view: std::sync::Arc<
+                                dyn eez_protocol::executor::CommittedRootReader<Protocol = EvmProtocol>
+                                    + Send
+                                    + Sync,
+                            > = entry_client.clone();
+                            (entry_view, root_view)
+                        }
+                    };
+
+                    // L2 follower — EvmL2Style. `dispatch_address` =
+                    // `ccm_address` = CCM-L2 predeploy (where
+                    // authorizedProxies lives at slot 2).
+                    let l2_follower = LocalChainClient::new_follower(
+                        provider.clone(),
+                        evm_config.clone(),
+                        chain_spec.clone(),
+                        l2_rollup_id_typed,
+                        ccm_l2,
+                        ccm_l2,
+                        eez_evm::ChainDialect::EvmL2Style,
+                    );
+                    let l2_follower_view: std::sync::Arc<
+                        dyn eez_protocol::executor::ChainClient<Protocol = EvmProtocol>
+                            + Send
+                            + Sync,
+                    > = l2_follower;
+
+                    let entry_cfg = EvmTargetConfig {
+                        ccm_address: eez_registry,
+                        system_address: Address::ZERO, // entry has no system-tx CCM path
+                        ccm_gas_limit: DEFAULT_CCM_GAS_LIMIT,
+                        proxy_lookup: ProxyLookupConfig {
+                            contract_address: eez_registry,
+                            authorized_proxies_slot: eez_evm::ChainDialect::EvmL1Style
+                                .proxy_lookup_slot(),
+                        },
+                        dialect: eez_evm::ChainDialect::EvmL1Style,
+                    };
+                    let l2_follower_cfg = EvmTargetConfig {
+                        ccm_address: ccm_l2,
+                        system_address: l2_system_address,
+                        ccm_gas_limit: DEFAULT_CCM_GAS_LIMIT,
+                        proxy_lookup: ProxyLookupConfig {
+                            contract_address: ccm_l2,
+                            authorized_proxies_slot: eez_evm::ChainDialect::EvmL2Style
+                                .proxy_lookup_slot(),
+                        },
+                        dialect: eez_evm::ChainDialect::EvmL2Style,
+                    };
+
+                    let composed = ProtocolComposer::<EvmProtocol>::builder(
+                        EvmProtocol,
+                        l1_rollup_id,
+                    )
+                    .entry(entry_client_view, entry_cfg)
+                    .root_reader(root_reader_view)
+                    .rollup(l2_rollup_id_typed, l2_follower_view, l2_follower_cfg)
+                    .build()
+                    .map_err(|e| eyre::eyre!("EvmComposer build failed: {e}"))?;
+                    event!(
+                        name: "eez.node.evm_composer.ready",
+                        Level::INFO,
+                        l1_rollup_id = l1_rollup_id_u64,
+                        l2_rollup_id = rollup_id,
+                        eez_registry = %eez_registry,
+                        ccm_l2 = %ccm_l2,
+                        "cross-chain EvmComposer constructed (L1 entry + L2 follower)",
+                    );
+                    Some(composed)
+                } else {
+                    event!(
+                        name: "eez.node.evm_composer.skipped",
+                        Level::WARN,
+                        "embedded L1 not active; cross-chain EvmComposer disabled",
+                    );
+                    None
+                };
+
+            // CrossChainExecCtx: signer + L2 addresses needed to wrap
+            // EvmComposer's `(load_table, execute)` calldata pairs
+            // into signed legacy L2 system txs at Sync-slot time.
+            // Constructed only when EvmComposer is constructed —
+            // both are tied to embedded L1 mode.
+            let cc_exec_ctx: Option<Arc<eez_composer::CrossChainExecCtx>> = if evm_composer
+                .is_some()
+            {
+                let system_key = env::var("EEZ_L2_SYSTEM_KEY").map_err(|_| {
+                    eyre::eyre!("EEZ_L2_SYSTEM_KEY required when EvmComposer is wired")
+                })?;
+                let system_signer = PrivateKeySigner::from_bytes(&B256::from_str(
+                    system_key.trim_start_matches("0x"),
+                )?)?;
+                let ccm_l2_address: Address = Address::from_str(
+                    &env::var("EEZ_CCM_L2_ADDRESS").map_err(|_| {
+                        eyre::eyre!("EEZ_CCM_L2_ADDRESS required (set by deploy.sh)")
+                    })?,
+                )?;
+                // L1 RPC URL: the embedded L1's HTTP port (so the
+                // composer's L1-forwarding round-trips back into our
+                // own L1 reth). Same value as `EEZ_L1_RPC_URL` for
+                // embedded mode.
+                let l1_rpc_url: reqwest::Url = env::var("EEZ_L1_RPC_URL")
+                    .map_err(|_| eyre::eyre!("EEZ_L1_RPC_URL required for L1 forwarding"))?
+                    .parse()
+                    .map_err(|e| eyre::eyre!("EEZ_L1_RPC_URL malformed: {e}"))?;
+                let l1_provider = alloy_provider::RootProvider::new_http(l1_rpc_url.clone());
+                let l1_poster_key = env::var("EEZ_L1_POSTER_KEY").map_err(|_| {
+                    eyre::eyre!("EEZ_L1_POSTER_KEY required for L1 postBatch signing")
+                })?;
+                let l1_poster_signer = PrivateKeySigner::from_bytes(&B256::from_str(
+                    l1_poster_key.trim_start_matches("0x"),
+                )?)?;
+                let mock_proof_system_address: Address = Address::from_str(
+                    &env::var("EEZ_MOCK_PROOF_SYSTEM_ADDRESS").map_err(|_| {
+                        eyre::eyre!(
+                            "EEZ_MOCK_PROOF_SYSTEM_ADDRESS required for L1 postBatch \
+                             proofSystems[0]"
+                        )
+                    })?,
+                )?;
+                let l2_rollup_id_for_ctx: u64 = env::var("EEZ_ROLLUP_ID")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| {
+                        eyre::eyre!("EEZ_ROLLUP_ID required for L1 postBatch rollupIdsWithProofSystems[]")
+                    })?;
+                // L1 chainId queried from the provider would be more
+                // robust, but pulling it out of env keeps the ctx
+                // construction sync. Embedded reth `--chain dev` is
+                // chainId=1337; smoke harness sets this explicitly.
+                let l1_chain_id: u64 = env::var("EEZ_L1_CHAIN_ID")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1337);
+                // 10 gwei comfortably exceeds the smoke user_tx's
+                // 2-gwei priority fee, so dev-reth's payload builder
+                // orders postBatch ahead of the user_tx within the
+                // L1 block.
+                let l1_post_batch_priority_fee: u128 = env::var("EEZ_L1_POSTBATCH_PRIORITY_FEE")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(10_000_000_000);
+                // One submission path everywhere: the composer always
+                // routes `[postBatch, user_tx_1, …]` through the shared
+                // Submitter. The Submitter owns the transport decision —
+                // `eth_sendBundle` on relays that support it (rbuilder),
+                // ordered mempool submission on plain execution RPCs
+                // (dev reth, anvil) detected via JSON-RPC -32601.
+                Some(Arc::new(eez_composer::CrossChainExecCtx {
+                    system_signer,
+                    ccm_l2_address,
+                    l2_chain_id: chain_spec.chain().id(),
+                    l2_gas_price: 1_000_000_000,
+                    l2_gas_limit: 2_000_000,
+                    l1_provider,
+                    submitter: submitter.clone(),
+                    l1_poster_signer,
+                    l1_chain_id,
+                    l1_post_batch_priority_fee,
+                    mock_proof_system_address,
+                    l2_rollup_id: l2_rollup_id_for_ctx,
+                }))
+            } else {
+                None
+            };
+            // Project the Arc<CrossChainExecCtx> into a SystemTxContext
+            // BEFORE moving it into the Composer. The Deriver picks
+            // this up further down to STF-reconstruct the same L2
+            // system txs the composer produced.
+            let deriver_system_tx_cfg = cc_exec_ctx.as_ref().map(|ctx| {
+                eez_evm::system_tx::SystemTxContext {
+                    system_signer: ctx.system_signer.clone(),
+                    ccm_l2_address: ctx.ccm_l2_address,
+                    l2_chain_id: ctx.l2_chain_id,
+                    l2_gas_price: ctx.l2_gas_price,
+                    l2_gas_limit: ctx.l2_gas_limit,
+                    this_rollup_id: ctx.l2_rollup_id,
+                }
+            });
+            let composer = Composer::new(
+                rollups,
+                prover,
+                submitter.clone(),
+                l1_watcher.clone(),
+                evm_config,
+                evm_composer,
+                cc_exec_ctx,
+            );
             let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
 
-            // Sequencer with all hooks: speculative-depth, batch
-            // emitter, sync-slot composer.
-            let attributes = EthAttributesBuilder::new(chain_spec.clone());
+            // Reuse the same Sequencer (and its single BlockCommitter
+            // actor, shared with the Deriver) — swap in the L1-anchored
+            // schedule + composer hooks. Speculative depth already
+            // applied above.
             let schedule_rx = spawn_l1_anchored(
                 L1HeadStream::from_watcher(&l1_watcher),
                 timing,
                 l2_genesis_timestamp,
             );
-            let batch_tx = batch_tx.expect("composer mode: channel built above");
-            let batch_rx = batch_rx.expect("composer mode: channel built above");
-            let sequencer = Sequencer::new(
-                &provider,
-                attributes,
-                handle.node.add_ons_handle.beacon_engine_handle.clone(),
-                schedule_rx,
-                handle.node.payload_builder_handle.clone(),
-                timing,
-            )?
-            .with_speculative_limit(64, Arc::clone(&l1_head) as _)
-            .with_batch_emitter(
-                rollup_id,
-                BatchPolicy::EveryKBlocks(u64::from(timing.k())),
-                batch_tx,
-            )
-            .with_sync_slot_composer(sync_slot_handle);
-            (Some(sequencer), Some(batch_rx), Some(composer))
+            let sequencer = sequencer
+                .with_schedule_rx(schedule_rx)
+                .with_sync_slot_composer(rollup_id, sync_slot_handle);
+            // Hand the same BlockCommitter handle to the composer so its
+            // slot-context recovery can roll back failed optimistic Sync
+            // blocks — the actor stays the sole engine-API owner.
+            composer.set_committer(sequencer.committer());
+            (Some(sequencer), Some(composer), deriver_system_tx_cfg)
         } else {
             // Follower: drop the placeholder Sequencer (BlockCommitter
-            // stays alive via the cloned handle held below).
+            // survives via the cloned handle). Build a SystemTxContext
+            // from env so the Deriver reconstructs system txs the same
+            // way the composer does; None → pure-user-tx batches only.
             drop(sequencer);
-            (None, None, None)
+            let follower_system_tx_cfg = build_follower_system_tx_cfg(&chain_spec)?;
+            (None, None, follower_system_tx_cfg)
         };
 
-        // Deriver: drives BlockCommitter from L1Events. Active in both
-        // follower and composer modes.
+        // Deriver: drives BlockCommitter from L1Events (follower +
+        // composer). A wired `SystemTxContext` makes it reconstruct the
+        // same L2 system txs the composer produced (single-source STF).
+        let l2_block_time_secs = timing.l2_block_time().as_secs();
         let deriver = Deriver::new(
             l1_watcher.clone(),
             block_committer,
             Arc::new(provider.clone()),
             submitter.clone(),
             chain_spec,
+            l2_block_time_secs,
             rollup_config.deploy_block,
             Arc::clone(&l1_head),
+            system_tx_cfg,
         );
 
         if let Err(err) = deriver.catch_up().await {
@@ -355,9 +732,7 @@ fn main() -> eyre::Result<()> {
         });
 
         // ─── Composer-only: spawn Sequencer + umbrella ───────────────
-        if let (Some(sequencer), Some(batch_rx), Some(composer)) =
-            (sequencer, batch_rx, umbrella)
-        {
+        if let (Some(sequencer), Some(composer)) = (sequencer, umbrella) {
             event!(name: "eez.node.sequencer.spawned", Level::INFO, mode = "composer", "spawning eez sequencer (L1-anchored)");
             task_executor.spawn_critical_task("eez-sequencer", async move {
                 sequencer.run().await;
@@ -365,12 +740,57 @@ fn main() -> eyre::Result<()> {
 
             event!(name: "eez.node.composer.spawned", Level::INFO, "spawning eez composer umbrella");
             task_executor.spawn_critical_task("eez-composer", async move {
-                composer.run(batch_rx).await;
+                composer.run().await;
             });
         }
 
         handle.wait_for_node_exit().await
     })
+}
+
+/// Build a `SystemTxContext` for follower mode from env (the follower
+/// has no Composer to feed the composer-mode projection). Returns
+/// `Ok(None)` when cross-chain env isn't present → pure-user-tx follower
+/// mode. Reads `EEZ_L2_SYSTEM_KEY` / `EEZ_CCM_L2_ADDRESS` /
+/// `EEZ_ROLLUP_ID`; the `l2_gas_price` (1 gwei) and `l2_gas_limit` (2M)
+/// defaults mirror composer-mode so reconstructed system txs are
+/// byte-identical.
+///
+/// # Errors
+///
+/// `eyre::Error` for malformed env values; missing required vars →
+/// `Ok(None)`.
+fn build_follower_system_tx_cfg<ChainSpec>(
+    chain_spec: &ChainSpec,
+) -> eyre::Result<Option<eez_evm::system_tx::SystemTxContext>>
+where
+    ChainSpec: reth_chainspec::EthChainSpec,
+{
+    let Ok(system_key) = env::var("EEZ_L2_SYSTEM_KEY") else {
+        return Ok(None);
+    };
+    let Ok(ccm_l2_str) = env::var("EEZ_CCM_L2_ADDRESS") else {
+        return Ok(None);
+    };
+    let Ok(rollup_id_str) = env::var("EEZ_ROLLUP_ID") else {
+        return Ok(None);
+    };
+
+    let system_signer =
+        PrivateKeySigner::from_bytes(&B256::from_str(system_key.trim_start_matches("0x"))?)?;
+    let ccm_l2_address: Address = Address::from_str(&ccm_l2_str)?;
+    let this_rollup_id: u64 = rollup_id_str
+        .parse()
+        .map_err(|e| eyre::eyre!("EEZ_ROLLUP_ID malformed: {e}"))?;
+
+    Ok(Some(eez_evm::system_tx::SystemTxContext {
+        system_signer,
+        ccm_l2_address,
+        l2_chain_id: chain_spec.chain().id(),
+        l2_gas_price: 1_000_000_000,
+        l2_gas_limit: 2_000_000,
+        this_rollup_id,
+    }))
 }
 
 /// Parse `EEZ_CROSS_CHAIN_PROXY_ADDRESSES` (comma-separated hex
@@ -387,6 +807,90 @@ fn parse_cross_chain_proxy_env() -> Vec<Address> {
         .collect()
 }
 
+/// Parse `EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS` (comma-separated u64s)
+/// into a `Vec<u64>`. Foreign source chain ids whose inbound txs we
+/// classify as cross-chain (i.e., a deposit-intent submitted to L2's
+/// RPC carrying L1's chainId). Empty / unset / malformed → empty vec;
+/// classifier still routes by `to ∈ proxy_set`.
+fn parse_cross_chain_source_chain_ids_env() -> Vec<u64> {
+    let Ok(raw) = env::var("EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS") else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect()
+}
+
+/// Read the L1 rollup id from env. Defaults to `0` to match the bridge
+/// E2E fixture's `MAINNET_ROLLUP_ID`.
+fn read_l1_rollup_id() -> u64 {
+    env::var("EEZ_L1_ROLLUP_ID")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Build the [`EmbeddedL1Config`] from env; all vars optional, with dev
+/// defaults so the smoke harness only overrides what it needs.
+///
+///   - `EEZ_L1_HTTP_PORT` — default `18545`
+///   - `EEZ_L1_AUTH_PORT` — default `18546`
+///   - `EEZ_L1_P2P_PORT`  — default `30444`
+///   - `EEZ_L1_DATADIR`   — default `$TMPDIR/eez-l1-embedded` (ephemeral)
+///   - `EEZ_L1_CHAIN_PATH` — L1 genesis JSON; unset → reth's `dev`
+///     chainspec (all forks at genesis, no funded accounts)
+fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
+    use reth_cli::chainspec::ChainSpecParser;
+
+    let http_port = env::var("EEZ_L1_HTTP_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(18545);
+    let auth_port = env::var("EEZ_L1_AUTH_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(18546);
+    let p2p_port = env::var("EEZ_L1_P2P_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(30444);
+    let datadir = env::var("EEZ_L1_DATADIR").map_or_else(
+        |_| std::env::temp_dir().join("eez-l1-embedded"),
+        std::path::PathBuf::from,
+    );
+
+    // Chain spec: explicit path wins. Otherwise default to reth's
+    // built-in `dev` chainspec — same shape `reth --chain dev` uses,
+    // which has all forks (including Cancun/Prague where supported)
+    // active at genesis with a couple of pre-funded dev EOAs.
+    let chain_arg = env::var("EEZ_L1_CHAIN_PATH").unwrap_or_else(|_| "dev".to_string());
+    let dev_chain_spec = EthereumChainSpecParser::parse(&chain_arg)
+        .map_err(|e| eyre::eyre!("EEZ_L1_CHAIN_PATH={chain_arg}: {e}"))?;
+
+    // L1 chain selector: `dev` (vanilla EthereumNode, auto-mine 5s)
+    // vs `chiado` (reth_gnosis::GnosisNode, real chiado state). The
+    // `dev_chain_spec` is only consumed by the dev path.
+    let kind = l1_embedded::L1ChainKind::from_env();
+
+    // JWT secret path — required for chiado (lighthouse engine API
+    // auth); optional for dev mode (no external CL).
+    let jwtsecret = env::var("EEZ_L1_JWT_SECRET")
+        .ok()
+        .map(std::path::PathBuf::from);
+
+    Ok(l1_embedded::EmbeddedL1Config {
+        dev_chain_spec,
+        kind,
+        datadir,
+        http_port,
+        auth_port,
+        p2p_port,
+        jwtsecret,
+    })
+}
+
 fn warn_on_deprecated_env() {
     for name in [
         "EEZ_COMPOSER_INTERVAL_SECS",
@@ -398,7 +902,7 @@ fn warn_on_deprecated_env() {
                 name: "eez.node.env.deprecated",
                 Level::WARN,
                 env = name,
-                "env var is ignored from S4.2 onward; mode is now derived from EEZ_L1_RPC_URL + EEZ_PROOF_SIGNER_KEY presence (see crate docs)."
+                "env var is ignored; mode is derived from EEZ_L1_RPC_URL + EEZ_PROOF_SIGNER_KEY presence (see crate docs)."
             );
         }
     }
