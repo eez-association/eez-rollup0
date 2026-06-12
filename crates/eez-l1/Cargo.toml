@@ -32,6 +32,7 @@ reqwest.workspace    = true
 serde_json.workspace = true
 
 # async + diagnostics
+fail.workspace      = true
 thiserror.workspace = true
 tokio.workspace     = true
 tracing.workspace   = true

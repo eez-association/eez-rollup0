@@ -261,7 +261,10 @@ where
     ///
     /// # Panics
     ///
-    /// If the `last_header` mirror's `RwLock` is poisoned.
+    /// If the `last_header` lock is poisoned (a prior holder panicked
+    /// while writing). The `BlockCommitter` actor is the only writer; a
+    /// poisoned lock means the actor itself has died and the node
+    /// should shut down anyway.
     pub async fn commit_sequenced(
         &self,
         parent_hash: B256,
