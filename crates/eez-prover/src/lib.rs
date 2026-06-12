@@ -9,9 +9,10 @@
 //! per-rollup hashes, and produces a proof that commits to them; that
 //! redesign reshapes [`ProvingContext`] but keeps the trait surface.
 //!
-//! The EEZ `sol!` binding lives in this crate (re-exported below) so
-//! `ProofSystemBatchPerVerificationEntries` is the same concrete type
-//! both `eez-l1` and `eez-prover` see.
+//! The EEZ `sol!` ABI binding (structs, `postAndVerifyBatch`, and the
+//! `BatchPosted` / `L2ExecutionPerformed` events) lives in `eez-evm` —
+//! the single ABI source the whole workspace shares. This crate is
+//! just the prover abstraction.
 //!
 //! [`MockECDSAProofSystem`]: ../../../contracts/src/MockECDSAProofSystem.sol
 
@@ -22,11 +23,6 @@ use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
 use thiserror::Error;
-
-pub use eez_l1_batch::{
-    EezRegistry, ExecutionEntry, ProofSystemBatchPerVerificationEntries, RollupIdWithProofSystems,
-    StateDelta,
-};
 
 /// Result alias.
 pub type ProverResult<T> = Result<T, ProverError>;
@@ -127,123 +123,11 @@ impl Prover for MockEcdsaProver {
     }
 }
 
-mod eez_l1_batch {
-    alloy_sol_types::sol! {
-        #![sol(rpc, all_derives)]
-
-        /// Per-rollup state delta — mirrors `sync-rollups-protocol/src/interfaces/IEEZ.sol`.
-        struct StateDelta {
-            uint256 rollupId;
-            bytes32 currentState;
-            bytes32 newState;
-            int256 etherDelta;
-        }
-
-        struct L2ToL1Call {
-            address targetAddress;
-            uint256 value;
-            bytes data;
-            address sourceAddress;
-            uint256 sourceRollupId;
-            uint256 revertSpan;
-        }
-
-        struct ExpectedL1ToL2Call {
-            bytes32 crossChainCallHash;
-            uint256 callCount;
-            bytes returnData;
-        }
-
-        struct ExecutionEntry {
-            StateDelta[] stateDeltas;
-            bytes32 proxyEntryHash;
-            uint256 destinationRollupId;
-            L2ToL1Call[] L2ToL1Calls;
-            ExpectedL1ToL2Call[] expectedL1ToL2Calls;
-            uint256 callCount;
-            bytes returnData;
-            bytes32 rollingHash;
-        }
-
-        struct LookupCall {
-            bytes32 crossChainCallHash;
-            uint256 destinationRollupId;
-            bytes returnData;
-            bool failed;
-            uint64 callNumber;
-            uint64 lastNestedActionConsumed;
-            L2ToL1Call[] calls;
-            bytes32 rollingHash;
-        }
-
-        /// One rollup's participation in a posting batch.
-        struct RollupIdWithProofSystems {
-            uint256 rollupId;
-            uint64[] proofSystemIndex;
-        }
-
-        /// Mirrors `sync-rollups-protocol/src/EEZ.sol`. Stage 2 uses
-        /// `entries`/`l1ToL2lookupCalls` as empty dynamic arrays — they
-        /// hold cross-chain content in stage 4. The full struct types are
-        /// declared here (not shortened to `bytes[]`) because the function
-        /// selector hashes the canonical types — if our declared types
-        /// diverge from `EEZ.sol`'s, `postAndVerifyBatch`'s
-        /// 4-byte selector won't match and the call hits no function.
-        struct ProofSystemBatchPerVerificationEntries {
-            ExecutionEntry[] entries;
-            LookupCall[] l1ToL2lookupCalls;
-            uint256 transientExecutionEntryCount;
-            uint256 transientLookupCallCount;
-            address[] proofSystems;
-            RollupIdWithProofSystems[] rollupIdsWithProofSystems;
-            bytes32 crossProofSystemInteractions;
-            uint256[] blobIndices;
-            bytes callData;
-            bytes[] proofs;
-        }
-
-        /// The EEZ entry point + event. Just the surface the Submitter
-        /// needs from `sync-rollups-protocol/src/EEZ.sol`.
-        #[sol(rpc)]
-        contract EezRegistry {
-            function postAndVerifyBatch(
-                ProofSystemBatchPerVerificationEntries calldata batch
-            ) external;
-
-            event BatchPosted(uint256 indexed rollupCount);
-
-            /// Winner signal: emitted by `_applyStateDeltas`
-            /// (EEZ.sol:979) when a batch's state delta actually
-            /// applied. Absence ⇒ loser (`ImmediateEntrySkipped`).
-            event L2ExecutionPerformed(uint256 indexed rollupId, bytes32 newState);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Signature, U256, hex};
+    use alloy_primitives::{Signature, U256};
     use std::str::FromStr;
-
-    /// Permanent guard against the bytes[]-vs-ExecutionEntry[] shortcut bug.
-    /// If anyone re-declares `entries` / `l1ToL2lookupCalls` as `bytes[]`
-    /// in the `sol!` block, the function selector will diverge from
-    /// `EEZ.sol`'s canonical signature and submissions will silently
-    /// fall through dispatch. This test fails before that ships.
-    #[test]
-    fn selector_matches_contract_abi() {
-        use alloy_sol_types::SolCall;
-        let sel = EezRegistry::postAndVerifyBatchCall::SELECTOR;
-        // From contracts/out/EEZ.sol/EEZ.json — methodIdentifiers entry for
-        // the canonical postAndVerifyBatch signature.
-        let expected = hex::decode("7dd4d7d7").unwrap();
-        assert_eq!(
-            sel.as_slice(),
-            expected.as_slice(),
-            "sol! selector must match EEZ.sol's canonical signature; mismatch means our struct fields diverge from the contract.",
-        );
-    }
 
     /// [`MockEcdsaProver`] signs `MOCK_PROVER_DIGEST`; ecrecover against
     /// the same digest returns the signer address. This locks in the
