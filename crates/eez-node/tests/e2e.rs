@@ -15,7 +15,7 @@ use common::{
     ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeBinary,
     NodeConfig, NodeHandle, block_number_at, override_env, reorg_genesis_path,
     reorg_genesis_state_root, safe_block_state_root, wait_for_node_caught_up,
-    wait_for_real_safe_state, with_env,
+    wait_for_safe_block, wait_for_safe_state, with_env,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -523,8 +523,10 @@ async fn happy_case_follower_cross_safe_parity() {
 ///   - safe head reaches a non-genesis contract-attested stateRoot
 ///     (membership excludes the rogue's chain; non-genesis excludes a
 ///     trivial stuck-at-genesis pass).
-///   - the unsafe poll actually processed rogue heads (`eez.follower.head.*`),
-///     so broken wiring can't silently downgrade this to L1-derived-only.
+///   - the unsafe poll actually processed a rogue head: the follower logs
+///     that reth accepted the (body-less, cross-genesis) head as a sync
+///     target, so broken wiring can't silently downgrade this to
+///     L1-derived-only.
 ///   - no process death.
 ///
 /// Different-genesis (not a same-chain fork) is deliberate: the follower
@@ -577,7 +579,7 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
         .unwrap();
 
     // Safe head reaches a real (non-genesis) attested stateRoot despite the rogue.
-    wait_for_real_safe_state(
+    wait_for_safe_state(
         &follower,
         &chain,
         reorg_genesis_state_root().unwrap(),
@@ -589,7 +591,7 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
     // Proof the rogue path actually ran (not silently downgraded to L1-derived).
     assert!(
         follower
-            .log_count_matching(&["eez.follower.head."])
+            .log_count_matching(&["reth accepted sequencer head as a sync target"])
             .unwrap()
             > 0,
         "follower never processed a rogue unsafe head",
@@ -604,9 +606,10 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
 /// replay the whole history in one pass (`scan_batches`). Every other test
 /// starts the follower after ~2 batches; this is the only one that
 /// exercises catch-up at non-trivial depth (the "spin up a new RPC node
-/// long after genesis" path). The follower can't reach the tip without
-/// replaying every batch below it, so a non-genesis contract-attested safe
-/// head proves the deep replay happened.
+/// long after genesis" path). Asserts the follower's safe head reaches a
+/// non-genesis contract-attested stateRoot *and* climbs to the full backlog
+/// depth the chain already had at join time — proving it replayed the entire
+/// history.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn happy_case_follower_deep_backfill_late_join() {
     let harness = Harness::with_anvil_config(
@@ -634,6 +637,14 @@ async fn happy_case_follower_deep_backfill_late_join() {
         .await
         .expect("sequencer did not build a deep backlog");
 
+    // Snapshot how deep the backlog is at join time: the sequencer's
+    // L1-derived safe height is exactly the history the follower must
+    // replay.
+    let backlog_depth = block_number_at(&seq.l2_rpc_url(), BlockNumberOrTag::Safe)
+        .await
+        .unwrap()
+        .expect("sequencer has a safe block");
+
     // Fresh follower joins late; its boot catch-up must replay everything.
     let follower_cfg = NodeConfig {
         genesis_path: Some(genesis.as_path()),
@@ -643,14 +654,18 @@ async fn happy_case_follower_deep_backfill_late_join() {
         .await
         .unwrap();
 
-    wait_for_real_safe_state(
-        &follower,
-        &chain,
-        reorg_genesis_state_root().unwrap(),
-        DEFAULT_TIMEOUT,
-    )
-    .await
-    .expect("late-joining follower did not backfill into a non-genesis attested stateRoot");
+    wait_for_node_caught_up(&follower, &chain, DEFAULT_TIMEOUT)
+        .await
+        .expect("late-joining follower did not backfill into an attested stateRoot");
+
+    // Prove catch-up replayed the *entire* pre-existing backlog, not just
+    // the first batch: the follower's safe head must climb to the depth the
+    // chain already had when it joined (which also implies it is past genesis).
+    wait_for_safe_block(&follower, backlog_depth, DEFAULT_TIMEOUT)
+        .await
+        .unwrap_or_else(|_| {
+            panic!("follower did not replay full backlog to block {backlog_depth}")
+        });
 
     follower.assert_no_process_death();
     seq.assert_no_process_death();

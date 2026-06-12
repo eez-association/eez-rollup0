@@ -1029,6 +1029,29 @@ pub async fn all_l2_execution_states(
         .collect()
 }
 
+/// Shared body for the attestation waiters: wait until the node's safe
+/// `stateRoot` is attested and differs from `exclude` (pass [`B256::ZERO`]
+/// to add no exclusion beyond the zero root).
+async fn wait_for_attested_safe(
+    node: &NodeHandle,
+    chain: &Chain<'_>,
+    exclude: B256,
+    timeout: Duration,
+) -> Result<()> {
+    wait_for(timeout, || async {
+        let node_root = safe_block_state_root(&node.l2_rpc_url())
+            .await
+            .ok()
+            .flatten();
+        let attested = chain.executed_states().await.unwrap_or_default();
+        Ok(match node_root {
+            Some(n) if n != B256::ZERO && n != exclude && attested.contains(&n) => Some(()),
+            _ => None,
+        })
+    })
+    .await
+}
+
 /// Wait until `node.safe.stateRoot` appears in the contract's
 /// `L2ExecutionPerformed` history for this `Chain`. The attestation
 /// set grows monotonically, so this doesn't race the contract's
@@ -1040,40 +1063,38 @@ pub async fn wait_for_node_caught_up(
     chain: &Chain<'_>,
     timeout: Duration,
 ) -> Result<()> {
-    wait_for(timeout, || async {
-        let node_root = safe_block_state_root(&node.l2_rpc_url())
-            .await
-            .ok()
-            .flatten();
-        let attested = chain.executed_states().await.unwrap_or_default();
-        Ok(match node_root {
-            Some(n) if n != B256::ZERO && attested.contains(&n) => Some(()),
-            _ => None,
-        })
-    })
-    .await
+    wait_for_attested_safe(node, chain, B256::ZERO, timeout).await
 }
 
-/// Like [`wait_for_node_caught_up`] but additionally requires the node's
-/// safe state to be *past genesis* — proof it imported a real honest block,
-/// not that it trivially matched an empty-block attestation at the
-/// `genesis_root` (the rollup's registered initial state, e.g.
-/// [`reorg_genesis_state_root`]). Used by the rogue-source and
-/// deep-backfill tests.
-pub async fn wait_for_real_safe_state(
+/// Like [`wait_for_node_caught_up`] but additionally excludes `genesis_root`,
+/// so a node stuck at genesis can't trivially pass by matching an empty-block
+/// attestation whose `newState` equals the registered initial state. Used by
+/// the rogue-source test, which has no depth check to imply non-genesis.
+pub async fn wait_for_safe_state(
     node: &NodeHandle,
     chain: &Chain<'_>,
     genesis_root: B256,
     timeout: Duration,
 ) -> Result<()> {
+    wait_for_attested_safe(node, chain, genesis_root, timeout).await
+}
+
+/// Wait until `node`'s safe head reaches block height `min_block` or
+/// beyond. Used to prove a late-joining follower replayed the *entire*
+/// pre-existing backlog, not just the first few batches: `wait_for_safe_state`
+/// only proves *some* attested non-genesis block landed, this proves depth.
+pub async fn wait_for_safe_block(
+    node: &NodeHandle,
+    min_block: u64,
+    timeout: Duration,
+) -> Result<()> {
     wait_for(timeout, || async {
-        let node_root = safe_block_state_root(&node.l2_rpc_url())
+        let n = block_number_at(&node.l2_rpc_url(), alloy_rpc_types_eth::BlockNumberOrTag::Safe)
             .await
             .ok()
             .flatten();
-        let attested = chain.executed_states().await.unwrap_or_default();
-        Ok(match node_root {
-            Some(n) if n != B256::ZERO && n != genesis_root && attested.contains(&n) => Some(()),
+        Ok(match n {
+            Some(b) if b >= min_block => Some(()),
             _ => None,
         })
     })
