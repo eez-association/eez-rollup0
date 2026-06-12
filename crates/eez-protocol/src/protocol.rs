@@ -230,6 +230,27 @@ pub trait ChainProtocol: Send + Sync {
         dialect: &Self::Dialect,
     ) -> Vec<u8>;
 
+    /// Encode the **single fused** inbound-delivery system tx for a
+    /// follower rollup that is the target of an arriving cross-chain
+    /// call: `executeIncomingCrossChainCall(...)` atomically loads the
+    /// execution table AND consumes `entries[0]`
+    /// (`SYNC_ROLLUPS_PROTOCOL_SPEC.md §B / line 642`, `EEZL2.sol:174-212`).
+    ///
+    /// Used when the outer call is **arriving**
+    /// (`call.original_rollup_id == follower_rollup_id`); originating
+    /// calls use the 2-tx `loadExecutionTable` + `executeL1ToL2Call`
+    /// path. The default returns `None`; protocols with a fused entry
+    /// point override it.
+    fn encode_inbound_delivery(
+        &self,
+        outer: &RecordedCall<Self>,
+        batch: &Self::Batch,
+        dialect: &Self::Dialect,
+    ) -> Option<Vec<u8>> {
+        let _ = (outer, batch, dialect);
+        None
+    }
+
     // ── Transport encoding (for gRPC byte serialization) ────────
     //
     // Round-trip invariant: for every `x` of the appropriate type,

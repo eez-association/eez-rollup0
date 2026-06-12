@@ -55,11 +55,12 @@ pub const DEFAULT_CCM_GAS_LIMIT: u64 = 30_000_000;
 /// Constructed at `main.rs` startup from the rollup's role:
 /// - L1-style client (entry-as-L1 or follower-as-L1):
 ///   `contract_address = rollups_address`,
-///   `authorized_proxies_slot = 3` (`EEZ.authorizedProxies` on EVM).
+///   `authorized_proxies_slot = 0` (`EEZ.authorizedProxies`, declared
+///   first on `EEZBase`).
 /// - L2-style client:
 ///   `contract_address = ccm_address`,
-///   `authorized_proxies_slot = 2`
-///   (`CrossChainManagerL2.authorizedProxies` on EVM).
+///   `authorized_proxies_slot = 0`
+///   (`CrossChainManagerL2.authorizedProxies`).
 ///
 /// Non-EVM chains supply their own slot index via their config.
 pub struct ProxyLookupConfig<P: ChainProtocol + ?Sized> {
@@ -203,6 +204,10 @@ pub struct SourceAttribution<'a> {
     /// rollup's CCM-verify batch. Keyed by `RollupId`; each `Vec` is
     /// ordered by batch tx index.
     pub per_tx_roots_by_rollup: &'a HashMap<RollupId, Vec<[u8; 32]>>,
+    /// Entry rollup (typically L1) — the chain whose batch applies
+    /// `stateDeltas`. Follower batches carry none: their consumer
+    /// `executeIncomingCrossChainCall` doesn't call `_applyStateDeltas`.
+    pub entry_rollup_id: RollupId,
 }
 
 impl<P: ChainProtocol + ?Sized> TargetConfig<P> {
@@ -574,11 +579,11 @@ impl<P: ChainProtocol + 'static> Composer<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TargetExecutionSession;
     use crate::composition::Dispatcher;
     use crate::error::{ExecutorResult, ProtocolResult};
     use crate::executor::{
-        ExecutionRequest, ExecutionResponse, TargetBatchSimulation, TargetExecutionSession,
-        TargetTransaction,
+        ExecutionRequest, ExecutionResponse, TargetBatchSimulation, TargetTransaction,
     };
     use crate::types::RecordedCall;
     use serde::{Deserialize, Serialize};

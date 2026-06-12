@@ -529,6 +529,7 @@ impl<P: ChainProtocol + 'static> CompositionBuilder<P> {
             let attribution_so_far = crate::composer::SourceAttribution {
                 initial_roots: &initial_roots,
                 per_tx_roots_by_rollup: &per_tx_roots_by_rollup,
+                entry_rollup_id: self.entry_rollup_id,
             };
             let batch = protocol.build_batch(
                 &group_calls,
@@ -551,10 +552,6 @@ impl<P: ChainProtocol + 'static> CompositionBuilder<P> {
             // outer-most root by construction.
             let outer_root = &group_calls[0];
 
-            let exec_calldata =
-                protocol.encode_follower_trigger(outer_root, self.entry_rollup_id, raw_tx, dialect);
-            let load_calldata = protocol.encode_table_payload(&batch, dialect);
-
             let verification = rollup.config.verification_context();
             let make_ccm_tx = |calldata: P::Calldata, value: P::Value| TargetTransaction::<P> {
                 caller: verification.system_address.clone(),
@@ -564,15 +561,39 @@ impl<P: ChainProtocol + 'static> CompositionBuilder<P> {
                 gas_limit: verification.gas_limit,
             };
 
-            let tx_load = make_ccm_tx(
-                protocol.decode_calldata(&load_calldata)?,
-                P::Value::default(),
-            );
-            let tx_exec = make_ccm_tx(
-                protocol.decode_calldata(&exec_calldata)?,
-                outer_root.value.clone(),
-            );
-            let txs: Vec<TargetTransaction<P>> = vec![tx_load, tx_exec];
+            // CCM-verify tx shape branches on the outer call's
+            // direction. Arriving (`original == follower`, e.g. L1→L2
+            // deposit): the fused `executeIncomingCrossChainCall` system
+            // tx — one tx, `msg.value` == outer value. Originating
+            // (`caller == follower`, e.g. L2→L1 source side): the 2-tx
+            // pattern (`loadExecutionTable` then `executeL1ToL2Call`).
+            let is_arriving = outer_root.original_rollup_id == *rollup_id
+                && outer_root.caller_rollup_id != *rollup_id;
+            let txs: Vec<TargetTransaction<P>> = if let Some(fused) = is_arriving
+                .then(|| protocol.encode_inbound_delivery(outer_root, &batch, dialect))
+                .flatten()
+            {
+                let tx_fused =
+                    make_ccm_tx(protocol.decode_calldata(&fused)?, outer_root.value.clone());
+                vec![tx_fused]
+            } else {
+                let exec_calldata = protocol.encode_follower_trigger(
+                    outer_root,
+                    self.entry_rollup_id,
+                    raw_tx,
+                    dialect,
+                );
+                let load_calldata = protocol.encode_table_payload(&batch, dialect);
+                let tx_load = make_ccm_tx(
+                    protocol.decode_calldata(&load_calldata)?,
+                    P::Value::default(),
+                );
+                let tx_exec = make_ccm_tx(
+                    protocol.decode_calldata(&exec_calldata)?,
+                    outer_root.value.clone(),
+                );
+                vec![tx_load, tx_exec]
+            };
 
             let sim = rollup.client.simulate_transactions(&txs).await?;
 
@@ -606,6 +627,7 @@ impl<P: ChainProtocol + 'static> CompositionBuilder<P> {
         let attribution = crate::composer::SourceAttribution {
             initial_roots: &initial_roots,
             per_tx_roots_by_rollup: &per_tx_roots_by_rollup,
+            entry_rollup_id: self.entry_rollup_id,
         };
         let entry_dialect = self
             .rollups
@@ -645,11 +667,23 @@ impl<P: ChainProtocol + 'static> CompositionBuilder<P> {
             let load_table_payload = protocol.encode_table_payload(&batch, dialect);
             let execute_payload =
                 protocol.encode_follower_trigger(outer_root, self.entry_rollup_id, raw_tx, dialect);
+            // Same arriving/originating split as Phase-2 dispatch:
+            // arriving outer calls carry a fused inbound payload (signed
+            // as one L2 system tx), originating ones fall back to the
+            // load + exec pair.
+            let is_arriving = outer_root.original_rollup_id == *rollup_id
+                && outer_root.caller_rollup_id != *rollup_id;
+            let inbound_payload = is_arriving
+                .then(|| protocol.encode_inbound_delivery(outer_root, &batch, dialect))
+                .flatten();
+            let inbound_value = outer_root.value.clone();
             target_compositions.push(TargetComposition {
                 rollup_id: *rollup_id,
                 batch,
                 load_table_payload,
                 execute_payload,
+                inbound_payload,
+                inbound_value,
             });
         }
 

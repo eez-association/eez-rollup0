@@ -279,10 +279,25 @@ pub struct TargetComposition<P: ChainProtocol + ?Sized> {
     /// Chain-shaped batch this target rollup will consume — see
     /// [`ChainProtocol::Batch`].
     pub batch: P::Batch,
-    /// Encoded payload for loading the target execution table.
+    /// Encoded `loadExecutionTable(...)` payload for the 2-tx
+    /// CCM-verify path. Unused when [`Self::inbound_payload`] is `Some`
+    /// (the inbound entry point loads the table itself).
     pub load_table_payload: Vec<u8>,
-    /// Encoded payload for executing the first cross-chain call.
+    /// Encoded `executeL1ToL2Call(...)` payload, paired with
+    /// [`Self::load_table_payload`] in the 2-tx path. Unused when
+    /// [`Self::inbound_payload`] is `Some`.
     pub execute_payload: Vec<u8>,
+    /// `Some` when this target is the **arriving** side of a cross-chain
+    /// call (e.g. the L2 side of an L1→L2 deposit). Encodes the fused
+    /// `executeIncomingCrossChainCall(...)` system tx
+    /// (`EEZL2.sol:174-212`); the composer signs it as ONE L2 system tx
+    /// (with [`Self::inbound_value`] as `msg.value`) instead of the
+    /// load+exec pair.
+    pub inbound_payload: Option<Vec<u8>>,
+    /// `msg.value` for the fused inbound system tx — strict-equality
+    /// with the outer call's value (`EEZL2.sol:194`, else
+    /// `ValueMismatch`). Zero for non-deposit calls.
+    pub inbound_value: P::Value,
 }
 
 // Manual Clone + Debug — `derive` would infer overly strict
@@ -294,6 +309,8 @@ impl<P: ChainProtocol + ?Sized> Clone for TargetComposition<P> {
             batch: self.batch.clone(),
             load_table_payload: self.load_table_payload.clone(),
             execute_payload: self.execute_payload.clone(),
+            inbound_payload: self.inbound_payload.clone(),
+            inbound_value: self.inbound_value.clone(),
         }
     }
 }
@@ -304,6 +321,10 @@ impl<P: ChainProtocol + ?Sized> std::fmt::Debug for TargetComposition<P> {
             .field("rollup_id", &self.rollup_id)
             .field("load_table_payload", &self.load_table_payload.len())
             .field("execute_payload", &self.execute_payload.len())
+            .field(
+                "inbound_payload_len",
+                &self.inbound_payload.as_ref().map(Vec::len),
+            )
             .finish()
     }
 }
