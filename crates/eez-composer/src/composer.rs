@@ -811,45 +811,42 @@ where
             let mut dropped = 0usize;
             let mut evicted_chains: Vec<(alloy_primitives::Address, u64)> = Vec::new();
             for mut tx in failed.txs {
-                match submitter.receipt_exists(tx.hash).await {
-                    Ok(true) => {
+                if let Ok(true) = submitter.receipt_exists(tx.hash).await {
+                    dropped += 1;
+                    event!(
+                        name: "eez.composer.recovery.nonce_burned",
+                        Level::WARN,
+                        rollup_id,
+                        tx_hash = %tx.hash,
+                        "user_tx already has an L1 receipt; not re-queueing (user must resubmit)",
+                    );
+                } else {
+                    // A relay drop did NOT burn the nonce (the tx
+                    // never executed), so re-queue for a fresh
+                    // attempt. Poison is normally caught at compose
+                    // time; this bounded retry only backstops poison
+                    // the compose-time sim missed (rbuilder sims
+                    // against a slightly different post-postBatch
+                    // state). After MAX_BUNDLE_ATTEMPTS consecutive
+                    // drops, evict loudly (with the nonce-cascade) so
+                    // a residual poison tx can't block the FIFO queue
+                    // forever. User resubmits.
+                    tx.attempts += 1;
+                    if tx.attempts >= MAX_BUNDLE_ATTEMPTS {
                         dropped += 1;
+                        evicted_chains.push((tx.sender, tx.nonce));
                         event!(
-                            name: "eez.composer.recovery.nonce_burned",
+                            name: "eez.composer.recovery.poison_evicted",
                             Level::WARN,
                             rollup_id,
                             tx_hash = %tx.hash,
-                            "user_tx already has an L1 receipt; not re-queueing (user must resubmit)",
+                            sender = %tx.sender,
+                            nonce = tx.nonce,
+                            attempts = tx.attempts,
+                            "user_tx evicted after MAX_BUNDLE_ATTEMPTS relay drops (likely poison the compose-time sim missed); resubmit required",
                         );
-                    }
-                    _ => {
-                        // A relay drop did NOT burn the nonce (the tx
-                        // never executed), so re-queue for a fresh
-                        // attempt. Poison is normally caught at compose
-                        // time; this bounded retry only backstops poison
-                        // the compose-time sim missed (rbuilder sims
-                        // against a slightly different post-postBatch
-                        // state). After MAX_BUNDLE_ATTEMPTS consecutive
-                        // drops, evict loudly (with the nonce-cascade) so
-                        // a residual poison tx can't block the FIFO queue
-                        // forever. User resubmits.
-                        tx.attempts += 1;
-                        if tx.attempts >= MAX_BUNDLE_ATTEMPTS {
-                            dropped += 1;
-                            evicted_chains.push((tx.sender, tx.nonce));
-                            event!(
-                                name: "eez.composer.recovery.poison_evicted",
-                                Level::WARN,
-                                rollup_id,
-                                tx_hash = %tx.hash,
-                                sender = %tx.sender,
-                                nonce = tx.nonce,
-                                attempts = tx.attempts,
-                                "user_tx evicted after MAX_BUNDLE_ATTEMPTS relay drops (likely poison the compose-time sim missed); resubmit required",
-                            );
-                        } else {
-                            keep.push(tx);
-                        }
+                    } else {
+                        keep.push(tx);
                     }
                 }
             }

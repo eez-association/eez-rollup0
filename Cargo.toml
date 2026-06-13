@@ -183,3 +183,7 @@ if_then_some_else_none           = "allow"
 type_complexity                  = "allow"
 match_single_binding             = "allow"
 clone_on_ref_ptr                 = "allow"
+# constructors / handlers (Deriver::new wires 9 deps,
+# on_batch_posted 10, compose_via_evm_composer 8) need these params;
+# a refactor or dediacted crates would reduce some of this
+too_many_arguments               = "allow"

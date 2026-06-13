@@ -330,106 +330,101 @@ impl L1Watcher {
                 let (old_tip_number, old_tip_hash) =
                     state.tip().expect("tip is Some in this branch");
 
-                let common = match walked {
-                    Some(c) => c,
-                    None => {
-                        // Walk-back exhausted depth without a common
-                        // ancestor. Either the tip is far enough behind
-                        // latest that the walk never reached it (benign
-                        // catch-up) or it's within reorg_max_depth and
-                        // still unmatched (genuine deep reorg → halt).
-                        let depth = state.reorg_max_depth as u64;
-                        if latest_number > old_tip_number.saturating_add(depth) {
-                            // "Far behind" doesn't prove the old tip is
-                            // still canonical — swallowing a reorg across
-                            // the gap is the silent fallback invariant 7
-                            // forbids. Verify by height first.
-                            let at_old_height = fetch_block_by_tag(
-                                provider,
-                                BlockNumberOrTag::Number(old_tip_number),
-                            )
-                            .await?;
-                            let reorged_across_gap = at_old_height.hash != old_tip_hash;
-                            let scan_from = if reorged_across_gap {
-                                // Old tip reorged out. Find the common
-                                // ancestor against the ring (bounded by
-                                // ≤ reorg_max_depth); none in bounds →
-                                // loud halt, not benign catch-up.
-                                let common = find_common_ancestor_by_height(provider, state)
-                                    .await?
-                                    .ok_or(L1Error::ReorgTooDeep {
-                                        walked: state.reorg_max_depth,
-                                        max: state.reorg_max_depth,
-                                    })?;
-                                event!(
-                                    name: "eez.l1_watcher.poll.catchup_reorg",
-                                    Level::WARN,
-                                    tick = tick_count,
-                                    old_tip_number,
-                                    old_tip_hash = %old_tip_hash,
-                                    hash_at_old_height = %at_old_height.hash,
-                                    common_ancestor_number = common.number,
-                                    common_ancestor_hash = %common.hash,
-                                    latest_number,
-                                    "chain reorged across catch-up gap — old tip \
-                                     no longer canonical; emitting Reorg before \
-                                     reseed",
-                                );
-                                self.emit(L1Event::Reorg {
-                                    common_ancestor_number: common.number,
-                                    common_ancestor_hash: common.hash,
-                                    old_head_hash: old_tip_hash,
-                                    new_head_number: latest_number,
-                                    new_head_hash: latest_hash,
-                                });
-                                common.number + 1
-                            } else {
-                                event!(
-                                    name: "eez.l1_watcher.poll.catchup",
-                                    Level::INFO,
-                                    tick = tick_count,
-                                    old_tip_number,
-                                    latest_number,
-                                    reorg_max_depth = state.reorg_max_depth,
-                                    "tip is far behind latest beyond reorg_max_depth \
-                                     and still canonical — treating as catch-up, \
-                                     scanning BatchPosted and reseeding ring at \
-                                     latest",
-                                );
-                                old_tip_number + 1
-                            };
-                            self.scan_batch_posted(provider, scan_from, latest_number, latest_hash)
+                let Some(common) = walked else {
+                    // Walk-back exhausted depth without a common
+                    // ancestor. Either the tip is far enough behind
+                    // latest that the walk never reached it (benign
+                    // catch-up) or it's within reorg_max_depth and
+                    // still unmatched (genuine deep reorg → halt).
+                    let depth = state.reorg_max_depth as u64;
+                    if latest_number > old_tip_number.saturating_add(depth) {
+                        // "Far behind" doesn't prove the old tip is
+                        // still canonical — swallowing a reorg across
+                        // the gap is the silent fallback invariant 7
+                        // forbids. Verify by height first.
+                        let at_old_height =
+                            fetch_block_by_tag(provider, BlockNumberOrTag::Number(old_tip_number))
                                 .await?;
-                            // Ring lost continuity to the gap; reseed
-                            // at latest. (rewind_to(0) drops everything
-                            // above genesis; subsequent push_canonical
-                            // lands latest in an otherwise-empty ring.)
+                        let reorged_across_gap = at_old_height.hash != old_tip_hash;
+                        let scan_from = if reorged_across_gap {
+                            // Old tip reorged out. Find the common
+                            // ancestor against the ring (bounded by
+                            // ≤ reorg_max_depth); none in bounds →
+                            // loud halt, not benign catch-up.
+                            let common = find_common_ancestor_by_height(provider, state)
+                                .await?
+                                .ok_or(L1Error::ReorgTooDeep {
+                                    walked: state.reorg_max_depth,
+                                    max: state.reorg_max_depth,
+                                })?;
                             event!(
-                                name: "eez.l1_watcher.ring.rewind",
+                                name: "eez.l1_watcher.poll.catchup_reorg",
                                 Level::WARN,
                                 tick = tick_count,
                                 old_tip_number,
                                 old_tip_hash = %old_tip_hash,
-                                new_tip_number = latest_number,
-                                new_tip_hash = %latest_hash,
-                                reorged_across_gap,
-                                "reseeding ring at latest — dropping all prior \
-                                 ring entries",
+                                hash_at_old_height = %at_old_height.hash,
+                                common_ancestor_number = common.number,
+                                common_ancestor_hash = %common.hash,
+                                latest_number,
+                                "chain reorged across catch-up gap — old tip \
+                                 no longer canonical; emitting Reorg before \
+                                 reseed",
                             );
-                            state.rewind_to(0);
-                            state.push_canonical(latest_number, latest_hash);
-                            self.emit(L1Event::NewHead {
-                                block_number: latest_number,
-                                block_hash: latest_hash,
-                                timestamp: latest.timestamp,
+                            self.emit(L1Event::Reorg {
+                                common_ancestor_number: common.number,
+                                common_ancestor_hash: common.hash,
+                                old_head_hash: old_tip_hash,
+                                new_head_number: latest_number,
+                                new_head_hash: latest_hash,
                             });
-                            return Ok(());
-                        }
-                        return Err(L1Error::ReorgTooDeep {
-                            walked: state.reorg_max_depth,
-                            max: state.reorg_max_depth,
+                            common.number + 1
+                        } else {
+                            event!(
+                                name: "eez.l1_watcher.poll.catchup",
+                                Level::INFO,
+                                tick = tick_count,
+                                old_tip_number,
+                                latest_number,
+                                reorg_max_depth = state.reorg_max_depth,
+                                "tip is far behind latest beyond reorg_max_depth \
+                                 and still canonical — treating as catch-up, \
+                                 scanning BatchPosted and reseeding ring at \
+                                 latest",
+                            );
+                            old_tip_number + 1
+                        };
+                        self.scan_batch_posted(provider, scan_from, latest_number, latest_hash)
+                            .await?;
+                        // Ring lost continuity to the gap; reseed
+                        // at latest. (rewind_to(0) drops everything
+                        // above genesis; subsequent push_canonical
+                        // lands latest in an otherwise-empty ring.)
+                        event!(
+                            name: "eez.l1_watcher.ring.rewind",
+                            Level::WARN,
+                            tick = tick_count,
+                            old_tip_number,
+                            old_tip_hash = %old_tip_hash,
+                            new_tip_number = latest_number,
+                            new_tip_hash = %latest_hash,
+                            reorged_across_gap,
+                            "reseeding ring at latest — dropping all prior \
+                             ring entries",
+                        );
+                        state.rewind_to(0);
+                        state.push_canonical(latest_number, latest_hash);
+                        self.emit(L1Event::NewHead {
+                            block_number: latest_number,
+                            block_hash: latest_hash,
+                            timestamp: latest.timestamp,
                         });
+                        return Ok(());
                     }
+                    return Err(L1Error::ReorgTooDeep {
+                        walked: state.reorg_max_depth,
+                        max: state.reorg_max_depth,
+                    });
                 };
 
                 let was_reorg = old_tip_number > common.number || old_tip_hash != common.hash;
