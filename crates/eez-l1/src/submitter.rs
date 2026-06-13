@@ -675,11 +675,27 @@ pub(crate) async fn scan_batch_logs(
         let tx_hash = log
             .transaction_hash
             .ok_or_else(|| L1Error::Provider("BatchPosted log missing tx_hash".into()))?;
+        // Fetch the postBatch tx by (block, index), NOT by hash.
+        // Helps use pruned nodes.
+        let tx_index = log
+            .transaction_index
+            .ok_or_else(|| L1Error::Provider("BatchPosted log missing transaction_index".into()))?;
         let tx = provider
-            .get_transaction_by_hash(tx_hash)
+            .get_transaction_by_block_number_and_index(
+                BlockNumberOrTag::Number(l1_block_number),
+                tx_index as usize,
+            )
             .await
-            .map_err(|e| L1Error::Provider(format!("get_tx({tx_hash}): {e}")))?
-            .ok_or_else(|| L1Error::Provider(format!("tx {tx_hash} not found")))?;
+            .map_err(|e| {
+                L1Error::Provider(format!(
+                    "get_tx({l1_block_number}#{tx_index} for {tx_hash}): {e}"
+                ))
+            })?
+            .ok_or_else(|| {
+                L1Error::Provider(format!(
+                    "tx {tx_hash} (block {l1_block_number} idx {tx_index}) not found"
+                ))
+            })?;
         let submitter = tx.inner.signer();
         let input = tx.inner.input();
         let decoded = postAndVerifyBatchCall::abi_decode(input)
