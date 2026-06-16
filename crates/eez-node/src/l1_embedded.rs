@@ -96,13 +96,13 @@ pub fn build_dev_node_config(cfg: &EmbeddedL1Config) -> Result<NodeConfig<ChainS
 /// lighthouse CL (which we expect the operator to launch separately
 /// via `scripts/launch-chiado-lighthouse.sh` / docker-compose).
 pub fn build_chiado_node_config(cfg: &EmbeddedL1Config) -> Result<NodeConfig<GnosisChainSpec>> {
-    let (mut network_args, mut rpc_args) = build_network_rpc_args(cfg)?;
-    // No peering: lighthouse drives newPayload via engine API and the
-    // payload carries every tx, so the EL fetches nothing over discv5.
-    // Disabling also frees the well-known UDP ports for other containers.
-    network_args.discovery.disable_discovery = true;
-    network_args.discovery.disable_dns_discovery = true;
-    network_args.discovery.disable_discv4_discovery = true;
+    let (network_args, mut rpc_args) = build_network_rpc_args(cfg)?;
+    // Keep discovery ENABLED. `newPayload` only lets the EL *execute*
+    // blocks whose parent it already holds — it is not a sync path. A
+    // snapshot behind the chain tip must backfill the gap over P2P, so
+    // the EL needs peers (chiado bootnodes come from the GnosisChainSpec;
+    // discovery runs on `cfg.p2p_port`, set in build_network_rpc_args, so
+    // it won't collide with another reth on the host).
     // Bind auth RPC to all interfaces so docker-compose lighthouse
     // (host-network mode) can reach it. JWT secret guards access.
     rpc_args.auth_addr = "0.0.0.0".parse().expect("static addr");
