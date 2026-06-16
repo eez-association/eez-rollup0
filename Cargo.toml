@@ -1,12 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/eez-composer",
     "crates/eez-deriver",
     "crates/eez-driver",
+    "crates/eez-evm",
+    "crates/eez-evm-inspector",
     "crates/eez-follower",
     "crates/eez-l1",
     "crates/eez-node",
     "crates/eez-payload-codec",
+    "crates/eez-protocol",
     "crates/eez-prover",
 ]
 
@@ -26,6 +30,9 @@ tracing            = "0.1"
 tracing-subscriber = "0.3"
 thiserror          = "2"
 eyre               = "0.6"
+serde              = { version = "1", features = ["derive"] }
+sha3               = "0.10"
+hex                = "0.4"
 
 # allocator for the binary
 mimalloc           = "0.1"
@@ -36,7 +43,9 @@ clap               = { version = "4", features = ["derive"] }
 # reth — pinned to mediocregopher/partial-persistence-clean tip (contains the receipts-reorg truncation fix).
 reth-chain-state                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-chainspec                  = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-cli                        = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-cli-runner                 = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-db                         = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-engine-primitives          = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-ethereum-cli               = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
@@ -44,8 +53,10 @@ reth-ethereum-payload-builder   = { git = "https://github.com/paradigmxyz/reth",
 reth-ethereum-primitives        = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-evm                        = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-evm-ethereum               = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-network-peers              = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-node-api                   = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-node-builder               = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-node-core                  = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-node-ethereum              = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-payload-builder            = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-payload-primitives         = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
@@ -55,7 +66,21 @@ reth-provider                   = { git = "https://github.com/paradigmxyz/reth",
 reth-revm                       = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-storage-api                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-tasks                      = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-revm                            = { version = "38", default-features = false }
+reth-trie-common                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+
+# reth_gnosis — Gnosis chain (chiado / gnosis mainnet) NodeBuilder.
+# Pinned to the rollup0-fd59fd22 branch which is the reth_gnosis
+# tree on top of the SAME reth commit as our other reth-* deps,
+# so the inner types are wire-compatible. Provides `GnosisNode`,
+# `GnosisChainSpec`, chiado genesis preset.
+reth_gnosis                     = { git = "https://github.com/gnosischain/reth_gnosis", branch = "rollup0-fd59fd22" }
+gnosis-primitives               = { git = "https://github.com/gnosischain/rust-primitives.git", tag = "v0.2.4" }
+revm                            = { version = "38", default-features = false, features = [
+    "optional_balance_check",
+    "optional_block_gas_limit",
+    "optional_eip3607",
+    "optional_no_base_fee",
+] }
 
 # alloy — aligned with reth v2.2.0's transitive picks:
 #   consensus / eips / network / rpc-types-engine / provider / contract → 2.x
@@ -69,23 +94,35 @@ alloy-network          = { version = "2", default-features = false }
 alloy-primitives       = { version = "1", default-features = false }
 alloy-provider         = { version = "2", default-features = false, features = ["reqwest"] }
 alloy-rlp              = { version = "0.3", features = ["derive"] }
+alloy-rpc-client       = { version = "2", default-features = false }
 alloy-rpc-types-engine = { version = "2", default-features = false }
 alloy-rpc-types-eth    = { version = "2", default-features = false }
 alloy-signer           = { version = "2", default-features = false }
 alloy-signer-local     = { version = "2", default-features = false }
 alloy-sol-types        = { version = "1", default-features = false }
+alloy-transport-http   = { version = "2", default-features = false }
 fail                   = "0.5"
+k256                   = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 url                    = "2"
 
 # bundler (eth_sendBundle) submission path
 reqwest                = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde_json             = "1"
 
+# jsonrpsee — used by eez-node's TxIngress middleware (eth_sendRawTransaction override).
+# Pinned to whatever reth's pinned rev uses; cargo resolves the right minor.
+jsonrpsee              = { version = "0.26", features = ["server", "macros"] }
+tower                  = { version = "0.5", features = ["util"] }
+
 # internal crates
+eez-composer       = { path = "crates/eez-composer" }
 eez-deriver        = { path = "crates/eez-deriver" }
 eez-driver         = { path = "crates/eez-driver" }
+eez-evm            = { path = "crates/eez-evm" }
+eez-evm-inspector  = { path = "crates/eez-evm-inspector" }
 eez-l1             = { path = "crates/eez-l1" }
 eez-payload-codec  = { path = "crates/eez-payload-codec" }
+eez-protocol       = { path = "crates/eez-protocol" }
 eez-prover         = { path = "crates/eez-prover" }
 
 [profile.release]
@@ -115,3 +152,38 @@ pedantic    = { level = "warn", priority = -1 }
 
 # Permit the structured-logging macro format used by tracing::event! per M-LOG-STRUCTURED.
 literal_string_with_formatting_args = "allow"
+
+# Pragmatic opt-outs for pedantic rules that don't fit the reth-integration / protocol-port style.
+# Mirrors the source workspace (rollup-node) so ported crates compile under the same posture they
+# were written for — adding these later, per-file, would be noise.
+module_name_repetitions          = "allow"
+must_use_candidate               = "allow"
+missing_panics_doc               = "allow"
+missing_errors_doc               = "allow"
+similar_names                    = "allow"
+cast_possible_truncation         = "allow"
+too_many_lines                   = "allow"
+default_trait_access             = "allow"
+missing_fields_in_debug          = "allow"
+renamed_function_params          = "allow"
+doc_markdown                     = "allow"
+doc_lazy_continuation            = "allow"
+ignored_unit_patterns            = "allow"
+implicit_hasher                  = "allow"
+items_after_statements           = "allow"
+unreadable_literal               = "allow"
+semicolon_if_nothing_returned    = "allow"
+many_single_char_names           = "allow"
+assigning_clones                 = "allow"
+match_wildcard_for_single_variants = "allow"
+used_underscore_items            = "allow"
+unused_self                      = "allow"
+needless_pass_by_value           = "allow"
+if_then_some_else_none           = "allow"
+type_complexity                  = "allow"
+match_single_binding             = "allow"
+clone_on_ref_ptr                 = "allow"
+# constructors / handlers (Deriver::new wires 9 deps,
+# on_batch_posted 10, compose_via_evm_composer 8) need these params;
+# a refactor or dediacted crates would reduce some of this
+too_many_arguments               = "allow"

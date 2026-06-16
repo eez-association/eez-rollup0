@@ -8,8 +8,14 @@ description            = "Consumes L1 events, decodes posted batches, drives the
 
 [dependencies]
 eez-driver.workspace        = true
+eez-evm.workspace           = true
 eez-l1.workspace            = true
 eez-payload-codec.workspace = true
+
+# Decode postBatch calldata + reconstruct system txs (via
+# eez-evm::system_tx) so the deriver's Sync block matches the composer's.
+alloy-provider.workspace    = true
+alloy-sol-types.workspace   = true
 
 # reth — bounds + STF replay machinery (see deriver::execute_block).
 reth-chainspec.workspace                  = true

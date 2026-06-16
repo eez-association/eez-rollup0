@@ -83,6 +83,14 @@ enum CommitCommand<T: PayloadTypes> {
         header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
         response: oneshot::Sender<DriverResult<DeriveOutcome>>,
     },
+    /// Roll the canonical head back to `target_header`. Used by the
+    /// composer when a Sync block's bundle didn't settle on L1: per the
+    /// "L1 stateRoot is the finality oracle" model that block is
+    /// unfinalized and must be rebuilt.
+    ReorgTo {
+        target_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+        response: oneshot::Sender<DriverResult<()>>,
+    },
 }
 
 /// Successful result of [`BlockCommitterHandle::commit_derived`].
@@ -203,14 +211,19 @@ where
         parent_hash: B256,
         attrs: EthPayloadAttributes,
     ) -> DriverResult<CommitOutcome<T>> {
-        // Prevents interleave with the Deriver's per-block reconcile.
-        let _guard = self.reconcile_lock.lock().await;
-        // Snapshot may have gone stale while we waited for the lock;
-        // `attrs.timestamp` was computed against `parent_hash`, so if
-        // the head moved we'd produce a drifted block.
-        let current_head = self.last_header.read().unwrap().hash();
-        if current_head != parent_hash {
-            return Err(DriverError::stale_parent(parent_hash, current_head));
+        // The reconcile_lock guards ONLY the parent-hash snapshot check
+        // below — it stops the deriver advancing the head between the
+        // snapshot read and the engine dispatch. Holding it across
+        // `response_rx.await` (seconds, while the engine builds the
+        // payload) starves `begin_reconcile()` callers, and reth then
+        // evicts the issued id → "payload builder returned no payload
+        // for issued id".
+        {
+            let _guard = self.reconcile_lock.lock().await;
+            let current_head = self.last_header.read().unwrap().hash();
+            if current_head != parent_hash {
+                return Err(DriverError::stale_parent(parent_hash, current_head));
+            }
         }
         let (response_tx, response_rx) = oneshot::channel();
         self.sender
@@ -260,6 +273,42 @@ where
             .send(CommitCommand::AdvanceSafeFinalized {
                 safe,
                 finalized,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| DriverError::committer_closed())?;
+        response_rx
+            .await
+            .map_err(|_| DriverError::committer_closed())?
+    }
+
+    /// Roll the canonical L2 head back to `target_header` (FCU with
+    /// this hash, dropping any blocks past it). Two callers:
+    ///
+    /// - **L1 reorg retreat (`Deriver::on_l1_reorg`).** L1 rolled out a
+    ///   confirmed postBatch, so the L2 head must follow. The caller
+    ///   advances safe/finalized FIRST, then calls `reorg_to` — the
+    ///   reverse order yields an FCU where safe ≠ ancestor(head), which
+    ///   reth rejects.
+    /// - **Bundle-failure retreat (Composer).** A just-committed Sync
+    ///   block's L1 bundle didn't settle, so the block is rebuilt.
+    ///   `safe`/`finalized` stay put — a dropped-bundle reorg never
+    ///   invalidates an L1-confirmed block.
+    ///
+    /// # Errors
+    ///
+    /// - [`DriverError::engine_rpc`] on RPC transport failure.
+    /// - [`DriverError::invalid_forkchoice`] if reth rejects the
+    ///   target hash (not on its canonical chain).
+    /// - `committer_closed` if the actor is gone.
+    pub async fn reorg_to(
+        &self,
+        target_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+    ) -> DriverResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(CommitCommand::ReorgTo {
+                target_header,
                 response: response_tx,
             })
             .await
@@ -377,8 +426,50 @@ where
                     let result = self.process_derive(payload, header).await;
                     let _ = response.send(result);
                 }
+                CommitCommand::ReorgTo {
+                    target_header,
+                    response,
+                } => {
+                    let result = self.process_reorg_to(target_header).await;
+                    let _ = response.send(result);
+                }
             }
         }
+    }
+
+    async fn process_reorg_to(
+        &mut self,
+        target_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+    ) -> DriverResult<()> {
+        let target_hash = target_header.hash();
+        // safe/finalized unchanged — only L1 advances them, and a
+        // dropped-bundle reorg can't invalidate an L1-confirmed block.
+        let state = ForkchoiceState {
+            head_block_hash: target_hash,
+            safe_block_hash: self.safe_hash,
+            finalized_block_hash: self.finalized_hash,
+        };
+        let res = self
+            .to_engine
+            .fork_choice_updated(state, None)
+            .await
+            .map_err(DriverError::engine_rpc)?;
+        if !res.is_valid() {
+            return Err(DriverError::invalid_forkchoice(format!(
+                "reorg_to({target_hash}): {res:?}"
+            )));
+        }
+        // Mirror the head only AFTER reth accepted the FCU — writing it
+        // first then erroring would leave every later compose building
+        // on a head reth never adopted (permanent stale-parent loop).
+        // Keep `unsafe_head_hash` in lockstep with `last_header`: a bare
+        // FCU (forkchoice_state reads `unsafe_head_hash`) fires on every
+        // BatchPosted via `process_advance_safe_finalized`, and a stale
+        // `unsafe_head_hash` would re-canonicalize the orphan we just
+        // reorged away — silently undoing this recovery.
+        self.unsafe_head_hash = target_hash;
+        *self.last_header.write().unwrap() = target_header;
+        Ok(())
     }
 
     fn forkchoice_state(&self) -> ForkchoiceState {

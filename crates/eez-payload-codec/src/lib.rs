@@ -1,7 +1,7 @@
 //! Batch payload encode/decode per Rollup-1 spec §8.1.
 //!
 //! ```text
-//!   payload := versionByte ‖ rlp([
+//!   payload := tagByte ‖ rlp([
 //!     blockTxCounts,    # list of uint16, length == toBlock - fromBlock
 //!                       # entry i = number of user txs in block (fromBlock + 1 + i)
 //!                       # 0 means empty block
@@ -9,12 +9,19 @@
 //!                       # the first blockTxCounts[0] entries belong to block fromBlock+1,
 //!                       # the next blockTxCounts[1] entries to block fromBlock+2, etc.
 //!                       # each entry is a standard RLP-encoded EVM tx
+//!     l2_entries,       # list of bytes — ABI-encoded L2-shape
+//!                       # ExecutionEntry the L2 system tx
+//!                       # (executeIncomingCrossChainCall) consumes.
+//!                       # Empty for arbitrary-call batches; populated
+//!                       # for value-bearing (deposit/withdrawal) ones.
 //!   ])
 //!
-//!   versionByte:
-//!     0x00  uncompressed v1 (this version)
-//!     0x01  zstd-compressed (reserved for later)
+//!   tagByte:
+//!     0x00  the current (and only) format
 //! ```
+//!
+//! Single format on the wire today; the one-byte tag prefix leaves
+//! room to add another later without breaking the decoder.
 //!
 //! `fromBlock` and `toBlock` are **not** in the payload — per spec §12 they
 //! are public inputs bound by the proof, derived from on-chain state at
@@ -35,8 +42,10 @@ use alloy_rlp::{Decodable, Encodable};
 /// A raw EIP-2718 signed transaction. Opaque to this crate.
 pub type RawTx = Vec<u8>;
 
-/// Current on-wire version byte for the uncompressed v1 format.
-pub const VERSION_V1: u8 = 0x00;
+/// Tag byte for the current (and only) calldata format. The one-byte
+/// prefix lets a future format swap add a new tag without ambiguity;
+/// [`decode`] dispatches on it.
+pub const TAG_CALLDATA: u8 = 0x00;
 
 /// Convenience [`Result`] alias.
 pub type CodecResult<T> = Result<T, CodecError>;
@@ -44,12 +53,12 @@ pub type CodecResult<T> = Result<T, CodecError>;
 /// Error returned by encode / decode.
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
-    /// Payload was empty or missing the version byte.
+    /// Payload was empty or missing the tag byte.
     #[error("payload too short ({0} bytes)")]
     TooShort(usize),
-    /// Version byte not one we speak.
-    #[error("unsupported version byte 0x{0:02x}; expected 0x{VERSION_V1:02x}")]
-    UnsupportedVersion(u8),
+    /// Tag byte didn't match the current format.
+    #[error("unsupported tag byte 0x{0:02x}; expected 0x{TAG_CALLDATA:02x}")]
+    UnsupportedTag(u8),
     /// RLP decoding failed.
     #[error("rlp decode failed: {0}")]
     Rlp(#[from] alloy_rlp::Error),
@@ -68,6 +77,12 @@ pub struct DecodedBatch {
     pub block_tx_counts: Vec<u16>,
     /// Flat list of raw EIP-2718 signed transactions in block-major order.
     pub transactions: Vec<RawTx>,
+    /// L2-shape `ExecutionEntry` bytes (ABI-encoded). Empty for
+    /// arbitrary-call batches; populated for value-bearing ones
+    /// (deposits/withdrawals), where the L1 `entries[]` is the
+    /// deposit-shape (callCount=0, no L2ToL1Calls) so the L2-shape must
+    /// travel separately for followers to rebuild the L2 system tx.
+    pub l2_entries: Vec<Vec<u8>>,
 }
 
 impl DecodedBatch {
@@ -78,15 +93,18 @@ impl DecodedBatch {
     }
 }
 
-/// Encode the v1 payload from per-block tx vectors.
+/// Encode the calldata payload: per-block tx vectors plus L2-shape
+/// entries.
 ///
 /// `blocks[i]` is the list of raw signed transactions for the i-th L2
-/// block in the range. An empty block is encoded as an empty inner list.
+/// block in the range. `l2_entries[i]` is one ABI-encoded
+/// `ExecutionEntrySol`; pass `&[]` for arbitrary-call batches that
+/// don't need follower-side L2 system-tx reconstruction.
 ///
 /// # Errors
 ///
 /// - [`CodecError::BlockTxCountOverflow`] if any block has > `u16::MAX` txs.
-pub fn encode(blocks: &[Vec<RawTx>]) -> CodecResult<Vec<u8>> {
+pub fn encode(blocks: &[Vec<RawTx>], l2_entries: &[Vec<u8>]) -> CodecResult<Vec<u8>> {
     let mut block_tx_counts: Vec<u16> = Vec::with_capacity(blocks.len());
     for (i, b) in blocks.iter().enumerate() {
         let n = u64::try_from(b.len()).unwrap_or(u64::MAX);
@@ -94,31 +112,32 @@ pub fn encode(blocks: &[Vec<RawTx>]) -> CodecResult<Vec<u8>> {
         block_tx_counts.push(cnt);
     }
     let transactions: Vec<RawTx> = blocks.iter().flatten().cloned().collect();
-
     let body = Body {
         block_tx_counts,
         transactions,
+        l2_entries: l2_entries.to_vec(),
     };
     let mut buf = Vec::with_capacity(1 + body.length());
-    buf.push(VERSION_V1);
+    buf.push(TAG_CALLDATA);
     body.encode(&mut buf);
     Ok(buf)
 }
 
-/// Decode a v1 payload.
+/// Decode a calldata payload.
 ///
 /// # Errors
 ///
 /// - [`CodecError::TooShort`] if `payload` is empty.
-/// - [`CodecError::UnsupportedVersion`] if the version byte isn't [`VERSION_V1`].
+/// - [`CodecError::UnsupportedTag`] if the leading byte isn't
+///   [`TAG_CALLDATA`].
 /// - [`CodecError::Rlp`] if the RLP body is malformed.
 /// - [`CodecError::TxCountMismatch`] if `sum(blockTxCounts) != transactions.len()`.
 pub fn decode(payload: &[u8]) -> CodecResult<DecodedBatch> {
-    let Some((&version, rest)) = payload.split_first() else {
+    let Some((&tag, rest)) = payload.split_first() else {
         return Err(CodecError::TooShort(0));
     };
-    if version != VERSION_V1 {
-        return Err(CodecError::UnsupportedVersion(version));
+    if tag != TAG_CALLDATA {
+        return Err(CodecError::UnsupportedTag(tag));
     }
     let body = Body::decode(&mut &rest[..])?;
     let expected: u64 = body.block_tx_counts.iter().map(|n| u64::from(*n)).sum();
@@ -129,6 +148,7 @@ pub fn decode(payload: &[u8]) -> CodecResult<DecodedBatch> {
     Ok(DecodedBatch {
         block_tx_counts: body.block_tx_counts,
         transactions: body.transactions,
+        l2_entries: body.l2_entries,
     })
 }
 
@@ -136,6 +156,7 @@ pub fn decode(payload: &[u8]) -> CodecResult<DecodedBatch> {
 struct Body {
     block_tx_counts: Vec<u16>,
     transactions: Vec<RawTx>,
+    l2_entries: Vec<Vec<u8>>,
 }
 
 #[cfg(test)]
@@ -149,10 +170,11 @@ mod tests {
     #[test]
     fn roundtrip_single_block_with_two_txs() {
         let blocks = vec![vec![tx(0xa1, 64), tx(0xa2, 32)]];
-        let bytes = encode(&blocks).unwrap();
+        let bytes = encode(&blocks, &[]).unwrap();
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.block_tx_counts, vec![2u16]);
         assert_eq!(decoded.transactions.len(), 2);
+        assert!(decoded.l2_entries.is_empty());
     }
 
     #[test]
@@ -164,7 +186,7 @@ mod tests {
             vec![],
             vec![tx(0x05, 24)],
         ];
-        let bytes = encode(&blocks).unwrap();
+        let bytes = encode(&blocks, &[]).unwrap();
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.block_tx_counts, vec![1, 0, 3, 0, 1]);
         assert_eq!(decoded.transactions.len(), 5);
@@ -172,16 +194,15 @@ mod tests {
     }
 
     #[test]
-    fn version_byte_is_first_byte() {
-        let bytes = encode(&[vec![]]).unwrap();
-        assert_eq!(bytes[0], VERSION_V1);
+    fn tag_byte_is_first_byte() {
+        let bytes = encode(&[vec![]], &[]).unwrap();
+        assert_eq!(bytes[0], TAG_CALLDATA);
     }
 
     #[test]
     fn block_overflow_rejected_on_encode() {
-        // u16::MAX + 1 is the smallest count that overflows.
         let blocks = vec![vec![tx(0, 1); usize::from(u16::MAX) + 1]];
-        let err = encode(&blocks).unwrap_err();
+        let err = encode(&blocks, &[]).unwrap_err();
         assert!(matches!(err, CodecError::BlockTxCountOverflow(_, 0)));
     }
 
@@ -191,18 +212,35 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_version_rejected_on_decode() {
+    fn unsupported_tag_rejected_on_decode() {
         assert!(matches!(
             decode(&[0xff]).unwrap_err(),
-            CodecError::UnsupportedVersion(0xff)
+            CodecError::UnsupportedTag(0xff)
         ));
     }
 
     #[test]
     fn corrupt_rlp_rejected_on_decode() {
         assert!(matches!(
-            decode(&[VERSION_V1, 0x99, 0x99]).unwrap_err(),
+            decode(&[TAG_CALLDATA, 0x99, 0x99]).unwrap_err(),
             CodecError::Rlp(_)
         ));
+    }
+
+    #[test]
+    fn roundtrip_with_l2_entries() {
+        // Value-bearing batch: L2 entries survive the round-trip
+        // alongside per-block tx data.
+        let blocks = vec![vec![], vec![tx(0xa1, 32)], vec![]];
+        let l2_entries: Vec<Vec<u8>> = vec![
+            vec![0xde, 0xad, 0xbe, 0xef],
+            vec![0xca, 0xfe, 0xba, 0xbe, 0x00, 0x11, 0x22, 0x33],
+        ];
+        let bytes = encode(&blocks, &l2_entries).unwrap();
+        assert_eq!(bytes[0], TAG_CALLDATA);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.block_tx_counts, vec![0u16, 1u16, 0u16]);
+        assert_eq!(decoded.transactions.len(), 1);
+        assert_eq!(decoded.l2_entries, l2_entries);
     }
 }

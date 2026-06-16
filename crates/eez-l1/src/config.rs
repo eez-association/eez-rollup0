@@ -1,14 +1,12 @@
-//! Configuration for the [`Submitter`](crate::Submitter) (send-path) and
-//! [`Composer`](crate::Composer) (orchestration), populated from `EEZ_*`
-//! environment variables.
+//! Configuration for the [`Submitter`](crate::Submitter) (send-path),
+//! populated from `EEZ_*` environment variables.
 //!
-//! The split mirrors the runtime split: [`SubmitterConfig`] carries what
-//! the L1 send primitive needs (RPC, wallet, EEZ address), while
-//! [`ComposerConfig`] carries orchestration knobs (rollup id, proof
-//! system, deploy block for the startup scan, tick interval). The
-//! eez-node binary reads both at startup.
+//! Per-rollup composer/orchestration knobs (rollup id, proof system,
+//! deploy block, mode flag) now live in
+//! `eez-composer::RollupConfig` per the S4.2 umbrella extraction. See
+//! `docs/plans/IMPLEMENTATION.md` §5.4.8.
 
-use std::{env, str::FromStr, time::Duration};
+use std::{env, str::FromStr};
 
 use alloy_primitives::{Address, B256};
 use alloy_signer_local::PrivateKeySigner;
@@ -18,15 +16,11 @@ use crate::error::{L1Error, L1Result};
 
 const ENV_RPC_URL: &str = "EEZ_L1_RPC_URL";
 const ENV_BUILDER_RPC_URL: &str = "EEZ_L1_BUILDER_RPC_URL";
+const ENV_TARGET_RPC_URL: &str = "EEZ_L1_TARGET_RPC_URL";
 const ENV_POSTER_KEY: &str = "EEZ_L1_POSTER_KEY";
 const ENV_EEZ_ADDRESS: &str = "EEZ_REGISTRY_ADDRESS";
-const ENV_PROOF_SYSTEM_ADDRESS: &str = "EEZ_MOCK_PROOF_SYSTEM_ADDRESS";
 const ENV_ROLLUP_ID: &str = "EEZ_ROLLUP_ID";
 const ENV_DEPLOY_BLOCK: &str = "EEZ_REGISTRY_DEPLOY_BLOCK";
-const ENV_INTERVAL_SECS: &str = "EEZ_COMPOSER_INTERVAL_SECS";
-const ENV_EXPECT_EXTERNAL: &str = "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES";
-
-const DEFAULT_INTERVAL_SECS: u64 = 60;
 
 /// L1 connectivity for the [`Submitter`](crate::Submitter) — what's
 /// needed to send and read transactions against the EEZ registry.
@@ -37,6 +31,12 @@ pub struct SubmitterConfig {
     /// L1 builder relay accepting `eth_sendBundle`. All postBatch txs
     /// go here; `rpc_url` is used for reads only.
     pub builder_rpc_url: Url,
+    /// Optional RPC used ONLY for `BundleTarget::NextBlock` target-block
+    /// calculation. The embedded L1 can lag the canonical tip by 2-3
+    /// blocks, so `target = local.latest + slack` lands already-past and
+    /// the bundler drops it; point this at a tip-following node to pick
+    /// an unproposed future block. `None` → falls back to `rpc_url`.
+    pub target_rpc_url: Option<Url>,
     /// EOA that signs L1 txs (pays gas).
     pub poster: PrivateKeySigner,
     /// Deployed `EEZ` (rollups registry) address.
@@ -52,6 +52,10 @@ impl std::fmt::Debug for SubmitterConfig {
         f.debug_struct("SubmitterConfig")
             .field("rpc_url", &self.rpc_url.as_str())
             .field("builder_rpc_url", &self.builder_rpc_url.as_str())
+            .field(
+                "target_rpc_url",
+                &self.target_rpc_url.as_ref().map(Url::as_str),
+            )
             .field("poster", &self.poster.address())
             .field("eez", &self.eez)
             .field("rollup_id", &self.rollup_id)
@@ -67,9 +71,17 @@ impl SubmitterConfig {
     /// Returns [`L1Error::Config`] for any missing required var or
     /// malformed value.
     pub fn from_env() -> L1Result<Self> {
+        let target_rpc_url = match env::var(ENV_TARGET_RPC_URL) {
+            Ok(raw) if !raw.is_empty() => Some(
+                Url::parse(&raw)
+                    .map_err(|e| L1Error::Config(format!("{ENV_TARGET_RPC_URL}: {e}")))?,
+            ),
+            _ => None,
+        };
         Ok(Self {
             rpc_url: parse_url(ENV_RPC_URL)?,
             builder_rpc_url: parse_url(ENV_BUILDER_RPC_URL)?,
+            target_rpc_url,
             poster: parse_key(ENV_POSTER_KEY)?,
             eez: parse_address(ENV_EEZ_ADDRESS)?,
             rollup_id: parse_u64(ENV_ROLLUP_ID)?,
@@ -89,50 +101,12 @@ impl SubmitterConfig {
         Ok(Self {
             rpc_url: rpc_url.clone(),
             builder_rpc_url: rpc_url,
+            // Read-only / scan consumers never compute a NextBlock
+            // target, so the override is irrelevant here.
+            target_rpc_url: None,
             poster: parse_key_or_dummy(ENV_POSTER_KEY)?,
             eez: parse_address(ENV_EEZ_ADDRESS)?,
             rollup_id: parse_u64(ENV_ROLLUP_ID)?,
-        })
-    }
-}
-
-/// Orchestration knobs for the [`Composer`](crate::Composer) — protocol
-/// identifiers, the L1 block to start the startup scan from, and the
-/// tick interval.
-#[derive(Debug, Clone)]
-pub struct ComposerConfig {
-    /// Deployed `MockECDSAProofSystem` address — the one PS we attest with.
-    pub proof_system: Address,
-    /// `rollupId` returned by `EEZ.registerRollup` for our L2.
-    pub rollup_id: u64,
-    /// L1 block where `EEZ` was deployed. Lower bound for the startup
-    /// `BatchPosted` log scan that seeds `posted_through`. Keeps the scan
-    /// bounded on busy chains.
-    pub deploy_block: u64,
-    /// Tick interval. One tick = at most one postBatch tx.
-    pub interval: Duration,
-    /// Based-rollup mode flag. When `true`, the Composer logs external
-    /// batches at info level (normal flow — anyone can post). When
-    /// `false` (sequenced), externals log at error level (someone
-    /// else shouldn't be sequencing our chain). The code path is
-    /// identical either way; only log level differs.
-    pub expect_external_batches: bool,
-}
-
-impl ComposerConfig {
-    /// Read from `EEZ_*` env vars.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`L1Error::Config`] for any missing required var or
-    /// malformed value.
-    pub fn from_env() -> L1Result<Self> {
-        Ok(Self {
-            proof_system: parse_address(ENV_PROOF_SYSTEM_ADDRESS)?,
-            rollup_id: parse_u64(ENV_ROLLUP_ID)?,
-            deploy_block: parse_u64(ENV_DEPLOY_BLOCK)?,
-            interval: Duration::from_secs(parse_u64_or(ENV_INTERVAL_SECS, DEFAULT_INTERVAL_SECS)?),
-            expect_external_batches: parse_bool_or(ENV_EXPECT_EXTERNAL, false)?,
         })
     }
 }
@@ -193,32 +167,4 @@ fn parse_u64(name: &str) -> L1Result<u64> {
     require(name)?
         .parse::<u64>()
         .map_err(|e| L1Error::Config(format!("{name}: {e}")))
-}
-
-fn parse_u64_or(name: &str, default: u64) -> L1Result<u64> {
-    match env::var(name) {
-        Ok(v) => v
-            .parse::<u64>()
-            .map_err(|e| L1Error::Config(format!("{name}: {e}"))),
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(env::VarError::NotUnicode(_)) => {
-            Err(L1Error::Config(format!("{name} contains non-UTF-8 bytes")))
-        }
-    }
-}
-
-fn parse_bool_or(name: &str, default: bool) -> L1Result<bool> {
-    match env::var(name) {
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(true),
-            "0" | "false" | "no" | "off" | "" => Ok(false),
-            other => Err(L1Error::Config(format!(
-                "{name}: expected boolean (true/false/1/0/yes/no), got {other:?}"
-            ))),
-        },
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(env::VarError::NotUnicode(_)) => {
-            Err(L1Error::Config(format!("{name} contains non-UTF-8 bytes")))
-        }
-    }
 }

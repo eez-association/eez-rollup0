@@ -39,9 +39,13 @@ use reth_primitives_traits::{
 use reth_storage_api::BlockReader;
 use tracing::{Level, event};
 
+use tokio::sync::mpsc;
+
 use crate::block_committer::BlockCommitterHandle;
 use crate::error::{DriverError, DriverResult};
-use crate::scheduler::{ProposalRequest, Scheduler};
+use crate::slot::{SlotEvent, SlotKind, SyncSlotComposerHandle};
+use crate::submit::{BatchCandidate, BatchEmitter, BatchPolicy};
+use crate::timing::{RollupTiming, SlotComposition};
 
 /// How often the sequencer re-publishes the current forkchoice state.
 ///
@@ -50,20 +54,24 @@ use crate::scheduler::{ProposalRequest, Scheduler};
 /// miner uses.
 const FCU_REFRESH: Duration = Duration::from_secs(1);
 
-/// L2 block time, in seconds. Pinned at 2s per Rollup-1 spec §1.3 "no
-/// skipped blocks" — each block's timestamp is exactly
-/// `parent.timestamp() + BLOCK_TIME_SECS`.
-const BLOCK_TIME_SECS: u64 = 2;
-
-/// Yield bound on the per-tick backfill loop — caps blocks committed
-/// in one scheduler tick before returning to the run-loop. Catch-up
-/// resumes next tick. 32 blocks / 2s tick ≈ 16 blocks/s.
-const MAX_BLOCKS_PER_TICK: usize = 32;
-
 /// Max speculative gap the Sequencer can run ahead of L1-confirmed
 /// cursor. Pauses beyond this so reth's state-retention
 /// window keeps recent ancestors alive for the Deriver's replay.
 pub const DEFAULT_MAX_SPECULATIVE_DEPTH: u64 = 64;
+
+/// Log a benign stale-parent skip: the Deriver advanced the canonical
+/// head between our snapshot and the engine FCU, so this commit
+/// targeted a no-longer-canonical parent. The caller bails (its
+/// backfill loop or the whole trigger) and the next trigger rebuilds
+/// from the fresh head. `phase` names the commit site for attribution.
+fn log_stale_parent(phase: &str) {
+    event!(
+        name: "eez.sequencer.stale_parent",
+        Level::DEBUG,
+        phase,
+        "deriver advanced the chain under this commit; bailing — next trigger rebuilds from fresh head",
+    );
+}
 
 /// L1-confirmed L2 head height. `eez_l1::L1CanonicalHead`
 /// implements this; the Sequencer uses it to bound speculative depth.
@@ -161,11 +169,23 @@ where
     T: PayloadTypes<PayloadAttributes = EthPayloadAttributes>,
 {
     attributes: EthAttributesBuilder<ChainSpec>,
-    scheduler: Scheduler,
+    schedule_rx: mpsc::Receiver<SlotEvent>,
     committer: BlockCommitterHandle<T>,
+    /// Per-rollup timing (L1/L2 cadence, proof window, slack). Used to
+    /// compute per-trigger Live/Future/Sync block composition and per-
+    /// block timestamps.
+    timing: RollupTiming,
     /// Optional speculative-depth cap. None = no limit
     /// (single-composer / follower mode). See `DEFAULT_MAX_SPECULATIVE_DEPTH`.
     speculative_limit: Option<SpeculativeLimit>,
+    /// Optional [`BatchCandidate`] emitter. None on follower setups
+    /// where no Composer is co-located.
+    batch_emitter: Option<BatchEmitter>,
+    /// Optional Sync-slot block producer + the rollup id it composes
+    /// for (which HeldPool to drain). When present, called before each
+    /// Sync block to fetch that rollup's cross-chain content. `None` =
+    /// empty Sync blocks.
+    sync_slot_composer: Option<(u64, SyncSlotComposerHandle)>,
 }
 
 impl<T, ChainSpec> fmt::Debug for Sequencer<T, ChainSpec>
@@ -176,14 +196,21 @@ where
         f.debug_struct("Sequencer")
             .field("committer", &self.committer)
             .field("speculative_limit", &self.speculative_limit)
+            .field("batch_emitter", &self.batch_emitter)
             .finish_non_exhaustive()
     }
 }
 
 impl<T, ChainSpec> Sequencer<T, ChainSpec>
 where
-    T: PayloadTypes<PayloadAttributes = EthPayloadAttributes> + Send + Sync + 'static,
-    <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives + Send + Sync + 'static,
+    T: PayloadTypes<
+            PayloadAttributes = EthPayloadAttributes,
+            ExecutionData = alloy_rpc_types_engine::ExecutionData,
+        > + Send
+        + Sync
+        + 'static,
+    <T::BuiltPayload as BuiltPayload>::Primitives:
+        NodePrimitives<BlockHeader = alloy_consensus::Header> + Send + Sync + 'static,
     SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>: Send,
     ChainSpec: EthChainSpec<Header = HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>
         + EthereumHardforks
@@ -203,8 +230,9 @@ where
         provider: &P,
         attributes: EthAttributesBuilder<ChainSpec>,
         to_engine: ConsensusEngineHandle<T>,
-        scheduler: Scheduler,
+        schedule_rx: mpsc::Receiver<SlotEvent>,
         payload_builder: PayloadBuilderHandle<T>,
+        timing: RollupTiming,
     ) -> DriverResult<Self>
     where
         P: BlockReader<Header = HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>,
@@ -219,10 +247,40 @@ where
         let committer = BlockCommitterHandle::spawn(last_header, to_engine, payload_builder);
         Ok(Self {
             attributes,
-            scheduler,
+            schedule_rx,
             committer,
+            timing,
             speculative_limit: None,
+            batch_emitter: None,
+            sync_slot_composer: None,
         })
+    }
+
+    /// Replace the schedule receiver. Composer mode constructs the
+    /// Sequencer early with a placeholder channel (so the single
+    /// `BlockCommitter` actor exists for the Deriver wiring), then swaps
+    /// in the L1-anchored scheduler's receiver once the `L1Watcher` is
+    /// up. One Sequencer / one committer actor / one reconcile lock —
+    /// a second Sequencer would split the lock and head mirror across
+    /// two actors.
+    #[must_use]
+    pub fn with_schedule_rx(mut self, schedule_rx: mpsc::Receiver<SlotEvent>) -> Self {
+        self.schedule_rx = schedule_rx;
+        self
+    }
+
+    /// Attach a [`SyncSlotComposerHandle`] for `rollup_id`. When set,
+    /// the Sequencer calls it before each Sync block to fetch the
+    /// cross-chain system txs for that rollup. None = empty Sync
+    /// blocks (no cross-chain content).
+    #[must_use]
+    pub fn with_sync_slot_composer(
+        mut self,
+        rollup_id: u64,
+        composer: SyncSlotComposerHandle,
+    ) -> Self {
+        self.sync_slot_composer = Some((rollup_id, composer));
+        self
     }
 
     /// Cap blocks above `source`'s L1-confirmed head; `advance` pauses
@@ -240,6 +298,22 @@ where
         self
     }
 
+    /// Attach a [`BatchCandidate`] sender. After each committed block,
+    /// the Sequencer evaluates `policy` and sends one candidate per
+    /// closed window. Backpressured: if the receiver is full, the
+    /// produce loop awaits — Composer falling behind slows block
+    /// production rather than dropping candidates.
+    #[must_use]
+    pub fn with_batch_emitter(
+        mut self,
+        rollup_id: u64,
+        policy: BatchPolicy,
+        tx: mpsc::Sender<BatchCandidate>,
+    ) -> Self {
+        self.batch_emitter = Some(BatchEmitter::new(rollup_id, policy, tx));
+        self
+    }
+
     /// Clone-cheap handle to the underlying `BlockCommitter` actor.
     /// Other components (Deriver) push commands through the same task.
     #[must_use]
@@ -248,14 +322,22 @@ where
     }
 
     /// Runs the sequencer loop until cancellation. Errors during advance
-    /// are logged and the loop continues; `committer_closed` should
-    /// trigger an explicit shutdown (not yet wired).
+    /// are logged and the loop continues; channel-closed = Scheduler
+    /// task exited, Sequencer exits cleanly.
     pub async fn run(mut self) {
         let mut fcu_interval = tokio::time::interval(FCU_REFRESH);
         loop {
             tokio::select! {
-                req = self.scheduler.next() => {
-                    if let Err(err) = self.advance(req).await {
+                maybe_event = self.schedule_rx.recv() => {
+                    let Some(event) = maybe_event else {
+                        event!(
+                            name: "eez.sequencer.schedule_rx.closed",
+                            Level::ERROR,
+                            "schedule channel closed; sequencer task exiting",
+                        );
+                        break;
+                    };
+                    if let Err(err) = self.advance(event).await {
                         event!(
                             name: "eez.sequencer.advance.failed",
                             Level::ERROR,
@@ -278,106 +360,396 @@ where
         }
     }
 
-    /// Greedy backfill loop. Each iteration commits one block at the
-    /// next deterministic `parent.timestamp() + BLOCK_TIME_SECS` slot
-    /// until the chain is within one block-time of the tick's
-    /// wall-clock target. If the gap is large enough to exceed
-    /// [`MAX_BLOCKS_PER_TICK`] in one tick, the loop yields and
-    /// resumes on the next scheduler tick — catch-up isn't abandoned,
-    /// just spread over multiple ticks so the run-loop stays
-    /// responsive to canon-state notifications and FCU refreshes.
-    async fn advance(&mut self, req: ProposalRequest) -> DriverResult<()> {
-        let target_wall = req.target_timestamp;
-        let mut produced: usize = 0;
+    /// Dispatch on slot event variant.
+    async fn advance(&mut self, event: SlotEvent) -> DriverResult<()> {
+        match event {
+            SlotEvent::Live { target_timestamp } => self.advance_live_tick(target_timestamp).await,
+            SlotEvent::SyncSlot {
+                block_height,
+                timestamp,
+            } => self.advance_sync_slot(block_height, timestamp).await,
+            SlotEvent::LiveTick {
+                sync_slot_block_height,
+            } => {
+                self.advance_anchored_live_tick(sync_slot_block_height)
+                    .await
+            }
+        }
+    }
 
-        while produced < MAX_BLOCKS_PER_TICK {
-            // Read the current canonical head from the committer per
-            // iteration. The committer is the single source of truth
-            // — Deriver-driven advances are visible here immediately,
-            // with no `CanonStateNotification` broadcast lag.
+    /// Interval-mode handler: greedy backfill of Live blocks until the
+    /// chain is within one L2 block-time of `target_wall`, capped at
+    /// [`MAX_BLOCKS_PER_CATCHUP`](crate::MAX_BLOCKS_PER_CATCHUP) per
+    /// invocation so the run-loop stays responsive to FCU refreshes
+    /// and the next schedule event.
+    async fn advance_live_tick(&mut self, target_wall: u64) -> DriverResult<()> {
+        let l2_block_time = self.timing.l2_block_time().as_secs();
+        let mut produced: u64 = 0;
+
+        while produced < crate::MAX_BLOCKS_PER_CATCHUP {
             let last_header = self.committer.last_header();
-            let parent_num = last_header.number();
-            let parent_ts = last_header.timestamp();
-            let gap = target_wall.saturating_sub(parent_ts);
-
-            // Chain has reached (or passed) the tick's target — nothing
-            // more to produce this tick.
-            if gap < BLOCK_TIME_SECS {
+            let gap = target_wall.saturating_sub(last_header.timestamp());
+            if gap < l2_block_time {
                 break;
             }
-
-            // Speculative-depth limit: if we're already too far
-            // ahead of the L1-confirmed cursor, pause and let the Deriver
-            // catch up. Without this, the Sequencer races ahead during
-            // a long timestamp-backfill and the Deriver's subsequent
-            // reorgs displace blocks faster than reth's state-retention
-            // window — eventually producing `no state found` on a deep
-            // replay.
-            if let Some(limit) = &self.speculative_limit {
-                let confirmed = limit.source.confirmed_head();
-                let speculative_depth = parent_num.saturating_sub(confirmed);
-                if speculative_depth >= limit.max_depth {
-                    event!(
-                        name: "eez.sequencer.speculative.paused",
-                        Level::DEBUG,
-                        parent_num,
-                        confirmed,
-                        speculative_depth,
-                        max_depth = limit.max_depth,
-                        "paused: speculative depth at cap; waiting for Deriver to catch up",
-                    );
-                    break;
-                }
+            if self.speculative_limit_paused(last_header.number()) {
+                break;
             }
-
-            let next_ts = parent_ts.saturating_add(BLOCK_TIME_SECS);
-            let attrs = self.attributes.build(&last_header, next_ts);
-            let timestamp = attrs.timestamp;
-            // Anchor the FCU on the parent we computed attrs against;
-            // if the Deriver moved the head while we waited for the
-            // reconcile lock, the actor returns StaleParent and we
-            // skip this tick rather than emit a drifted-timestamp block.
-            let parent_hash = last_header.hash();
-            let outcome = match self.committer.commit_sequenced(parent_hash, attrs).await {
-                Ok(outcome) => outcome,
+            match self.commit_one(SlotKind::Live, &last_header).await {
+                Ok(()) => {}
                 Err(err) if err.is_stale_parent() => {
-                    event!(
-                        name: "eez.sequencer.stale_parent",
-                        Level::DEBUG,
-                        parent_hash = %parent_hash,
-                        attrs_timestamp = timestamp,
-                        parent_num,
-                        "deriver advanced the chain between snapshot and FCU; skipping this tick",
-                    );
+                    log_stale_parent("backfill.live");
                     break;
                 }
                 Err(err) => return Err(err),
-            };
-            let block_number = outcome.header.number();
-            let block_hash = outcome.header.hash();
-
-            event!(
-                name: "eez.sequencer.block.produced",
-                Level::INFO,
-                slot.kind = %req.kind,
-                block.number = block_number,
-                block.hash = %block_hash,
-                block.timestamp = timestamp,
-                block.is_filler = produced > 0,
-                "produced block {{block.number}} hash={{block.hash}} ts={{block.timestamp}}",
-            );
-
+            }
             produced += 1;
         }
 
-        if produced == MAX_BLOCKS_PER_TICK {
+        if produced == crate::MAX_BLOCKS_PER_CATCHUP {
             event!(
                 name: "eez.sequencer.backfill.yield",
                 Level::INFO,
                 target_timestamp = target_wall,
                 last_block_timestamp = self.committer.last_header().timestamp(),
-                "hit per-tick block cap; continuing catch-up on next tick",
+                "hit per-trigger block cap; continuing catch-up on next tick",
             );
+        }
+        Ok(())
+    }
+
+    /// L1-anchored wall-clock tick handler: commit exactly ONE Live
+    /// block, and only while the head is below the live region of the
+    /// next sync slot (`sync_slot_block_height - future_count - 1`).
+    /// The Future + Sync reserve belongs to the anchor trigger
+    /// ([`Self::advance_sync_slot`]); ticks no-op once the live region
+    /// is full, so they can't outrun the anchor.
+    async fn advance_anchored_live_tick(
+        &mut self,
+        sync_slot_block_height: u64,
+    ) -> DriverResult<()> {
+        let last_header = self.committer.last_header();
+        let head = last_header.number();
+        // Reserve = Future blocks + the Sync block itself. Mirrors
+        // `live_region_end` in `RollupTiming::per_trigger_composition`.
+        let reserve = u64::from(self.timing.future_count()) + 1;
+        let live_region_end = sync_slot_block_height.saturating_sub(reserve);
+        if head >= live_region_end {
+            // Live region full (steady state between anchor fire and
+            // the next L1 head). Future + Sync come from the anchor.
+            return Ok(());
+        }
+        if self.speculative_limit_paused(head) {
+            return Ok(());
+        }
+        match self.commit_one(SlotKind::Live, &last_header).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.is_stale_parent() => {
+                log_stale_parent("live_tick");
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// L1-anchored handler: read current head, compute the per-trigger
+    /// Live/Future/Sync split via
+    /// [`RollupTiming::per_trigger_composition`], produce accordingly.
+    async fn advance_sync_slot(
+        &mut self,
+        sync_slot_block_height: u64,
+        sync_slot_timestamp: u64,
+    ) -> DriverResult<()> {
+        let head = self.committer.last_header().number();
+        let comp = self
+            .timing
+            .per_trigger_composition(head, sync_slot_block_height);
+
+        event!(
+            name: "eez.sequencer.sync_slot.composition",
+            Level::INFO,
+            head,
+            sync_slot_block_height,
+            sync_slot_timestamp,
+            composition = ?comp,
+            "computed per-trigger slot composition",
+        );
+
+        match comp {
+            SlotComposition::Idle => {}
+            SlotComposition::Catchup { live } => {
+                // Behind wall clock: produce `live` Live blocks plus a
+                // terminal Sync block (the Sync block is what gates the
+                // postBatch — without it the trigger has no L1-canonical
+                // backing, invariant 1). Cap live+sync at
+                // MAX_BLOCKS_PER_CATCHUP so the L2 span fits one bundle.
+                let max_live = crate::MAX_BLOCKS_PER_CATCHUP.saturating_sub(1);
+                let live_to_produce = live.min(max_live);
+                for _ in 0..live_to_produce {
+                    let last_header = self.committer.last_header();
+                    if self.speculative_limit_paused(last_header.number()) {
+                        break;
+                    }
+                    match self.commit_one(SlotKind::Live, &last_header).await {
+                        Ok(()) => {}
+                        Err(err) if err.is_stale_parent() => {
+                            log_stale_parent("catchup.live");
+                            return Ok(());
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+
+                // Terminal Sync block of the catchup trigger. No
+                // Scheduler-supplied timestamp here, so it's parent +
+                // l2_block_time — backfill catchup sets its own pace.
+                let last_header = self.committer.last_header();
+                if self.speculative_limit_paused(last_header.number()) {
+                    return Ok(());
+                }
+                let sync_ts = last_header
+                    .timestamp()
+                    .saturating_add(self.timing.l2_block_time().as_secs());
+
+                // Same cross-chain hook as Slot.Sync: a wired composer
+                // returns a prebuilt Sync block (and dispatches the L1
+                // bundle); otherwise fall back to a pool-driven Sync
+                // commit, which fires no postBatch.
+                let prebuilt = if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref()
+                {
+                    let parent = crate::slot::ParentContext {
+                        header: last_header.clone(),
+                    };
+                    composer
+                        .compose_sync_slot(*rollup_id, parent, sync_ts)
+                        .await
+                } else {
+                    None
+                };
+                if let Some(built) = prebuilt {
+                    if let Err(err) = self.commit_one_prebuilt(SlotKind::Sync, built).await {
+                        if err.is_stale_parent() {
+                            log_stale_parent("catchup.sync.prebuilt");
+                            return Ok(());
+                        }
+                        return Err(err);
+                    }
+                } else {
+                    match self.commit_one(SlotKind::Sync, &last_header).await {
+                        Ok(()) => {}
+                        Err(err) if err.is_stale_parent() => {
+                            log_stale_parent("catchup.sync");
+                            return Ok(());
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+            SlotComposition::Slot { live, future } => {
+                for _ in 0..live {
+                    let last_header = self.committer.last_header();
+                    if self.speculative_limit_paused(last_header.number()) {
+                        return Ok(()); // Defer Future + Sync to next trigger.
+                    }
+                    match self.commit_one(SlotKind::Live, &last_header).await {
+                        Ok(()) => {}
+                        Err(err) if err.is_stale_parent() => {
+                            log_stale_parent("slot.live");
+                            return Ok(());
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                for _ in 0..future {
+                    let last_header = self.committer.last_header();
+                    match self.commit_one(SlotKind::Future, &last_header).await {
+                        Ok(()) => {}
+                        Err(err) if err.is_stale_parent() => {
+                            log_stale_parent("slot.future");
+                            return Ok(());
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                let last_header = self.committer.last_header();
+                let expected_sync_ts = last_header
+                    .timestamp()
+                    .saturating_add(self.timing.l2_block_time().as_secs());
+                if expected_sync_ts != sync_slot_timestamp {
+                    event!(
+                        name: "eez.sequencer.sync_slot.timestamp_mismatch",
+                        Level::WARN,
+                        expected = expected_sync_ts,
+                        sync_slot_timestamp,
+                        head = last_header.number(),
+                        "sync-slot timestamp drift: parent + L2_block_time != Scheduler-supplied sync_slot_timestamp; producing with parent-derived value",
+                    );
+                }
+
+                // Cross-chain content hook: ask the composer for a
+                // pre-built Sync block carrying drained HeldPool system
+                // txs. None = no content this slot → pool-driven Sync
+                // commit. Some = commit its `ExecutionData` via the same
+                // engine-API tail the Deriver uses for L1-derived blocks.
+                let prebuilt = if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref()
+                {
+                    let parent = crate::slot::ParentContext {
+                        header: last_header.clone(),
+                    };
+                    composer
+                        .compose_sync_slot(*rollup_id, parent, sync_slot_timestamp)
+                        .await
+                } else {
+                    None
+                };
+                if let Some(built) = prebuilt {
+                    match self.commit_one_prebuilt(SlotKind::Sync, built).await {
+                        Ok(()) => {}
+                        Err(err) if err.is_stale_parent() => {
+                            log_stale_parent("slot.sync.prebuilt");
+                        }
+                        Err(err) => return Err(err),
+                    }
+                    return Ok(());
+                }
+
+                match self.commit_one(SlotKind::Sync, &last_header).await {
+                    Ok(()) => {}
+                    Err(err) if err.is_stale_parent() => {
+                        log_stale_parent("slot.sync");
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// True if the speculative-depth limit is reached; logged at DEBUG.
+    fn speculative_limit_paused(&self, head_number: u64) -> bool {
+        let Some(limit) = &self.speculative_limit else {
+            return false;
+        };
+        let confirmed = limit.source.confirmed_head();
+        let speculative_depth = head_number.saturating_sub(confirmed);
+        if speculative_depth >= limit.max_depth {
+            event!(
+                name: "eez.sequencer.speculative.paused",
+                Level::DEBUG,
+                head_number,
+                confirmed,
+                speculative_depth,
+                max_depth = limit.max_depth,
+                "paused: speculative depth at cap; waiting for Deriver to catch up",
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Commit a pre-built Sync block (from the cross-chain composer)
+    /// via `commit_derived` — same engine-API tail the Deriver uses
+    /// for L1-derived blocks. Holds the reconcile lock so a sync-slot
+    /// commit can't race with a deriver-side reconcile.
+    async fn commit_one_prebuilt(
+        &mut self,
+        kind: SlotKind,
+        built: crate::slot::SyncSlotBlock,
+    ) -> DriverResult<()> {
+        // `commit_derived` doesn't take the lock itself (only
+        // `commit_sequenced` does, and the Deriver already holds it via
+        // `begin_reconcile`), so hold it here too.
+        let _reconcile_guard = self.committer.begin_reconcile().await;
+        // Stale-parent check under the lock, like commit_sequenced: the
+        // Deriver (or a failed-batch recovery) can move the head between
+        // compose and commit, and a prebuilt block on a stale parent
+        // would silently reorg that newer work via commit_derived's FCU.
+        let current_head = self.committer.last_header().hash();
+        let built_parent = built.header.parent_hash();
+        if current_head != built_parent {
+            return Err(DriverError::stale_parent(built_parent, current_head));
+        }
+        let block_number = built.header.number();
+        let block_hash = built.header.hash();
+        let block_timestamp = built.header.timestamp();
+        let _outcome = self
+            .committer
+            .commit_derived(built.payload, built.header)
+            .await?;
+
+        event!(
+            name: "eez.sequencer.block.produced",
+            Level::INFO,
+            slot.kind = %kind,
+            block.number = block_number,
+            block.hash = %block_hash,
+            block.timestamp = block_timestamp,
+            "produced block {{block.number}} hash={{block.hash}} ts={{block.timestamp}} kind={{slot.kind}}",
+        );
+
+        if let Some(emitter) = self.batch_emitter.as_mut() {
+            if let Some(candidate) = emitter.on_block_committed(block_number) {
+                if let Err(err) = emitter.tx.send(candidate).await {
+                    event!(
+                        name: "eez.sequencer.batch_candidate.send_failed",
+                        Level::ERROR,
+                        rollup_id = candidate.rollup_id,
+                        to_block = candidate.to_block,
+                        error = %err,
+                        "batch candidate channel closed; downstream Composer task is gone",
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit one block of the given kind at
+    /// `parent.timestamp() + L2_block_time`. Logs `eez.sequencer.block.produced`
+    /// and forwards a `BatchCandidate` to the emitter when the policy
+    /// closes a window.
+    async fn commit_one(
+        &mut self,
+        kind: SlotKind,
+        parent: &SealedHeader<ChainSpec::Header>,
+    ) -> DriverResult<()> {
+        let parent_hash = parent.hash();
+        let parent_ts = parent.timestamp();
+        let next_ts = parent_ts.saturating_add(self.timing.l2_block_time().as_secs());
+        let attrs = self.attributes.build(parent, next_ts);
+        let timestamp = attrs.timestamp;
+        let outcome = self.committer.commit_sequenced(parent_hash, attrs).await?;
+        let block_number = outcome.header.number();
+        let block_hash = outcome.header.hash();
+
+        event!(
+            name: "eez.sequencer.block.produced",
+            Level::INFO,
+            slot.kind = %kind,
+            block.number = block_number,
+            block.hash = %block_hash,
+            block.timestamp = timestamp,
+            "produced block {{block.number}} hash={{block.hash}} ts={{block.timestamp}} kind={{slot.kind}}",
+        );
+
+        if let Some(emitter) = self.batch_emitter.as_mut() {
+            if let Some(candidate) = emitter.on_block_committed(block_number) {
+                // Backpressured: if Composer is slow draining, this
+                // await pauses block production rather than dropping
+                // the window. Channel-closed = Composer task died;
+                // log loudly so the next layer of supervision sees it.
+                if let Err(err) = emitter.tx.send(candidate).await {
+                    event!(
+                        name: "eez.sequencer.batch_candidate.send_failed",
+                        Level::ERROR,
+                        rollup_id = candidate.rollup_id,
+                        to_block = candidate.to_block,
+                        error = %err,
+                        "batch candidate channel closed; downstream Composer task is gone",
+                    );
+                }
+            }
         }
         Ok(())
     }

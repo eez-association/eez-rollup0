@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use alloy_eips::BlockNumberOrTag;
 use alloy_provider::{Provider, RootProvider};
-use eez_driver::{BlockCommitterHandle, ForkchoiceOutcome, Scheduler};
+use eez_driver::{BlockCommitterHandle, ForkchoiceOutcome};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_primitives_traits::SealedHeader;
 use tracing::{Level, event};
@@ -26,7 +26,10 @@ const FCU_REFRESH: Duration = Duration::from_secs(1);
 pub(crate) struct Follower {
     committer: BlockCommitterHandle<EthEngineTypes>,
     sequencer_rpc: RootProvider,
-    scheduler: Scheduler,
+    /// Cadence for polling the sequencer RPC for new unsafe heads. The
+    /// branch's eez-driver has no lightweight scheduler type (slot-based
+    /// scheduling replaced it), so the follower drives its own interval.
+    poll_interval: Duration,
     last_head: Option<alloy_primitives::B256>,
 }
 
@@ -34,21 +37,22 @@ impl Follower {
     pub(crate) fn new(
         committer: BlockCommitterHandle<EthEngineTypes>,
         sequencer_rpc: RootProvider,
-        scheduler: Scheduler,
+        poll_interval: Duration,
     ) -> Self {
         Self {
             committer,
             sequencer_rpc,
-            scheduler,
+            poll_interval,
             last_head: None,
         }
     }
 
     pub(crate) async fn run(mut self) {
+        let mut poll = tokio::time::interval(self.poll_interval);
         let mut fcu_interval = tokio::time::interval(FCU_REFRESH);
         loop {
             tokio::select! {
-                _ = self.scheduler.next() => {
+                _ = poll.tick() => {
                     if let Err(err) = self.advance().await {
                         event!(
                             name: "eez.follower.advance.failed",
