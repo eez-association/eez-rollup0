@@ -12,9 +12,9 @@ use alloy_primitives::{B256, U256};
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeConfig,
-    NodeHandle, override_env, reorg_genesis_path, reorg_genesis_state_root, send_l2_value_transfer,
-    wait_for_finalized_prefix_convergence, wait_for_latest_height, wait_for_node_caught_up,
-    wait_for_safe_prefix_convergence,
+    NodeHandle, override_env, reorg_genesis_path, reorg_genesis_state_root,
+    send_l2_value_transfer_included, wait_for_finalized_prefix_convergence, wait_for_latest_height,
+    wait_for_node_caught_up, wait_for_safe_prefix_convergence,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -119,15 +119,21 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
             .await
             .unwrap();
 
-    send_l2_value_transfer(
+    let inclusion = send_l2_value_transfer_included(
         &seq_a.l2_rpc_url(),
         ANVIL_KEY_1,
         ANVIL_ADDR,
         U256::from(1u64),
+        DEFAULT_TIMEOUT,
     )
     .await
-    .expect("send L2 tx to sequencer A");
-    let target = 4;
+    .expect("include L2 tx on sequencer A");
+    assert!(
+        inclusion.block_number > 0,
+        "L2 tx {} must not be included in genesis",
+        inclusion.tx_hash
+    );
+    let target = inclusion.block_number + 3;
     wait_for_latest_height(&seq_a, target, DEFAULT_TIMEOUT)
         .await
         .expect("sequencer A did not stage enough local blocks");
@@ -157,9 +163,10 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
 }
 
 /// Regression for stale ancestry across a batch boundary. The first
-/// posted batch forces B to replay block 1. B may already have block 2
-/// on its old ancestry with an empty tx list. The next one-block batch
-/// for block 2 must still replay on B because its parent hash is stale.
+/// posted batch forces B to replay the tx block. B may already have the
+/// following block on its old ancestry with an empty tx list. The next
+/// one-block batch for that following height must still replay on B
+/// because its parent hash is stale.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_sequencer_inter_batch_stale_parent_converges() {
     let harness = Harness::with_anvil_config(
@@ -192,20 +199,27 @@ async fn multi_sequencer_inter_batch_stale_parent_converges() {
             .await
             .unwrap();
 
-    send_l2_value_transfer(
+    let inclusion = send_l2_value_transfer_included(
         &seq_a.l2_rpc_url(),
         ANVIL_KEY_1,
         ANVIL_ADDR,
         U256::from(1u64),
+        DEFAULT_TIMEOUT,
     )
     .await
-    .expect("send L2 tx to sequencer A");
-    wait_for_latest_height(&seq_a, 1, DEFAULT_TIMEOUT)
+    .expect("include L2 tx on sequencer A");
+    assert!(
+        inclusion.block_number > 0,
+        "L2 tx {} must not be included in genesis",
+        inclusion.tx_hash
+    );
+    let divergent_height = inclusion.block_number;
+    wait_for_latest_height(&seq_a, divergent_height, DEFAULT_TIMEOUT)
         .await
-        .expect("sequencer A did not produce the first divergent block");
-    wait_for_latest_height(&seq_b, 1, DEFAULT_TIMEOUT)
+        .expect("sequencer A did not produce the divergent block");
+    wait_for_latest_height(&seq_b, divergent_height, DEFAULT_TIMEOUT)
         .await
-        .expect("sequencer B did not produce the first local block");
+        .expect("sequencer B did not produce the matching-height local block");
 
     drop(seq_a);
     let seq_a_env = override_env(
@@ -222,14 +236,15 @@ async fn multi_sequencer_inter_batch_stale_parent_converges() {
     .await
     .unwrap();
 
-    wait_for_latest_height(&seq_b, 2, DEFAULT_TIMEOUT)
+    let stale_parent_height = divergent_height + 1;
+    wait_for_latest_height(&seq_b, stale_parent_height, DEFAULT_TIMEOUT)
         .await
-        .expect("sequencer B did not stage a stale-parent block 2");
+        .expect("sequencer B did not stage a stale-parent block");
     chain
         .wait_for_batches(2, DEFAULT_TIMEOUT)
         .await
         .expect("sequencer A did not post adjacent batches");
-    wait_for_safe_prefix_convergence(&[&seq_a, &seq_b], 2, DEFAULT_TIMEOUT)
+    wait_for_safe_prefix_convergence(&[&seq_a, &seq_b], stale_parent_height, DEFAULT_TIMEOUT)
         .await
         .expect("sequencers did not converge across adjacent batch boundary");
 

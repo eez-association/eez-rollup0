@@ -422,6 +422,66 @@ pub async fn send_l2_value_transfer(
     to: Address,
     value: U256,
 ) -> Result<alloy_primitives::TxHash> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let raw = signed_l2_value_transfer_raw(&provider, signing_key, to, value).await?;
+
+    let hash = provider
+        .send_raw_transaction(&raw)
+        .await?
+        .tx_hash()
+        .to_owned();
+    Ok(hash)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct L2TxInclusion {
+    pub tx_hash: alloy_primitives::TxHash,
+    pub block_hash: B256,
+    pub block_number: u64,
+}
+
+/// Send one L2 value transfer and wait until the node reports an
+/// included, successful receipt. Use this when the tx is a test
+/// precondition; keep [`send_l2_value_transfer`] for best-effort load.
+pub async fn send_l2_value_transfer_included(
+    rpc_url: &str,
+    signing_key: &str,
+    to: Address,
+    value: U256,
+    timeout: Duration,
+) -> Result<L2TxInclusion> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let raw = signed_l2_value_transfer_raw(&provider, signing_key, to, value).await?;
+    let tx_hash = provider
+        .send_raw_transaction(&raw)
+        .await?
+        .tx_hash()
+        .to_owned();
+    let receipt = wait_for(timeout, || async {
+        Ok(provider.get_transaction_receipt(tx_hash).await?)
+    })
+    .await
+    .with_context(|| format!("wait for L2 tx {tx_hash} inclusion"))?;
+    if !receipt.status() {
+        bail!("L2 tx {tx_hash} reverted");
+    }
+    Ok(L2TxInclusion {
+        tx_hash,
+        block_hash: receipt
+            .block_hash
+            .ok_or_else(|| anyhow!("included L2 tx {tx_hash} missing block_hash"))?,
+        block_number: receipt
+            .block_number
+            .ok_or_else(|| anyhow!("included L2 tx {tx_hash} missing block_number"))?,
+    })
+}
+
+async fn signed_l2_value_transfer_raw<P: Provider>(
+    provider: &P,
+    signing_key: &str,
+    to: Address,
+    value: U256,
+) -> Result<Vec<u8>> {
     use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
     use alloy_network::TxSignerSync;
     use alloy_network::eip2718::Encodable2718;
@@ -433,7 +493,6 @@ pub async fn send_l2_value_transfer(
         .context("parse signing key")?;
     let from = signer.address();
 
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let chain_id = provider.get_chain_id().await?;
     let nonce = provider.get_transaction_count(from).await?;
     let fees = provider.estimate_eip1559_fees().await?;
@@ -451,14 +510,7 @@ pub async fn send_l2_value_transfer(
     };
     let sig = signer.sign_transaction_sync(&mut tx)?;
     let envelope = TxEnvelope::from(tx.into_signed(sig));
-    let raw = envelope.encoded_2718();
-
-    let hash = provider
-        .send_raw_transaction(&raw)
-        .await?
-        .tx_hash()
-        .to_owned();
-    Ok(hash)
+    Ok(envelope.encoded_2718())
 }
 
 /// Wait until `eth_blockNumber` responds at `rpc_url`. Used to confirm a
