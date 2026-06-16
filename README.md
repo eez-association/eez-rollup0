@@ -139,6 +139,8 @@ cargo build -p eez-node                    # run from the repo root
 NODE=$PWD/target/debug/eez-node
 set -a; source deployments.env; set +a     # export registry/rollup/genesis/ccm/system-address
 
+rm -rf /tmp/eez-follower-l2                 # clean catch-up from genesis
+
 ( cd /tmp                                   # escape the repo .env (composer creds)
   unset EEZ_PROOF_SIGNER_KEY EEZ_L1_EMBEDDED            # ⇒ follower mode, no embedded L1
   export EEZ_L1_RPC_URL=http://localhost:18645          # any chiado RPC with the BatchPosted history
@@ -152,8 +154,15 @@ set -a; source deployments.env; set +a     # export registry/rollup/genesis/ccm/
   exec "$NODE" node \
     --chain "$EEZ_L2_GENESIS_PATH" --datadir "$EEZ_L2_DATADIR" \
     --http --http.port 28688 --http.api eth,net,web3 \
-    --authrpc.port 28684 --port 31640 --disable-discovery --ipcdisable )
+    --authrpc.port 28684 --port 31640 --disable-discovery --ipcdisable \
+    --engine.persistence-threshold 4 --engine.memory-block-buffer-target 1 )
 ```
+
+The two `--engine.*` flags are not optional: the deriver replays each batch and
+then reads the parent block it just produced (to compute the next batch's
+system-tx nonce), so derived blocks must be flushed to disk promptly.
+Without them reth keeps the head in memory and the deriver wedges with
+`local L2 header at parent N missing`.
 
 (The `( cd /tmp … )` subshell is the trick: from there `eez-node` finds no
 `.env` to load, so only your explicit exports apply.)
