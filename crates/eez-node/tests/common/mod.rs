@@ -14,7 +14,7 @@ use std::{
 
 use alloy_primitives::{Address, B256, U256, address, hex};
 use alloy_provider::{Provider, ProviderBuilder};
-use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionRequest};
+use alloy_rpc_types_eth::{BlockNumHash, BlockNumberOrTag, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent, SolValue, sol};
 use anyhow::{Context, Result, anyhow, bail};
@@ -984,33 +984,17 @@ impl Drop for NodeHandle {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct L2BlockSnapshot {
-    pub number: u64,
-    pub hash: B256,
-    pub parent_hash: B256,
-    pub state_root: B256,
-}
-
-pub async fn l2_block_by_tag(
-    rpc_url: &str,
-    tag: BlockNumberOrTag,
-) -> Result<Option<L2BlockSnapshot>> {
+pub async fn l2_block_by_tag(rpc_url: &str, tag: BlockNumberOrTag) -> Result<Option<BlockNumHash>> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let block = provider.get_block_by_number(tag).await?;
-    Ok(block.map(|b| L2BlockSnapshot {
-        number: b.header.number,
-        hash: b.header.hash,
-        parent_hash: b.header.parent_hash,
-        state_root: b.header.state_root,
-    }))
+    Ok(block.map(|b| BlockNumHash::new(b.header.number, b.header.hash)))
 }
 
-pub async fn l2_block_by_number(rpc_url: &str, number: u64) -> Result<Option<L2BlockSnapshot>> {
+pub async fn l2_block_by_number(rpc_url: &str, number: u64) -> Result<Option<BlockNumHash>> {
     l2_block_by_tag(rpc_url, BlockNumberOrTag::Number(number)).await
 }
 
-pub async fn latest_block_snapshot(node: &NodeHandle) -> Result<Option<L2BlockSnapshot>> {
+pub async fn latest_block_snapshot(node: &NodeHandle) -> Result<Option<BlockNumHash>> {
     l2_block_by_tag(&node.l2_rpc_url(), BlockNumberOrTag::Latest).await
 }
 
@@ -1018,7 +1002,7 @@ pub async fn wait_for_latest_height(
     node: &NodeHandle,
     min_height: u64,
     timeout: Duration,
-) -> Result<L2BlockSnapshot> {
+) -> Result<BlockNumHash> {
     wait_for(timeout, || async {
         let latest = latest_block_snapshot(node).await?;
         Ok(latest.filter(|b| b.number >= min_height))
@@ -1030,7 +1014,7 @@ pub async fn wait_for_safe_prefix_convergence(
     nodes: &[&NodeHandle],
     min_height: u64,
     timeout: Duration,
-) -> Result<L2BlockSnapshot> {
+) -> Result<BlockNumHash> {
     wait_for_tag_prefix_convergence(nodes, BlockNumberOrTag::Safe, min_height, timeout).await
 }
 
@@ -1038,7 +1022,7 @@ pub async fn wait_for_finalized_prefix_convergence(
     nodes: &[&NodeHandle],
     min_height: u64,
     timeout: Duration,
-) -> Result<L2BlockSnapshot> {
+) -> Result<BlockNumHash> {
     wait_for_tag_prefix_convergence(nodes, BlockNumberOrTag::Finalized, min_height, timeout).await
 }
 
@@ -1047,7 +1031,7 @@ async fn wait_for_tag_prefix_convergence(
     tag: BlockNumberOrTag,
     min_height: u64,
     timeout: Duration,
-) -> Result<L2BlockSnapshot> {
+) -> Result<BlockNumHash> {
     wait_for(timeout, || async {
         let mut tag_blocks = Vec::with_capacity(nodes.len());
         for node in nodes {
