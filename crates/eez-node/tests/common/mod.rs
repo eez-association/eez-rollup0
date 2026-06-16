@@ -946,7 +946,7 @@ impl NodeHandle {
         );
     }
 
-    pub fn assert_no_divergence_failures(&self) {
+    pub fn assert_no_divergence_failure_logs(&self) {
         let patterns = [
             "Fatal",
             "UnexpectedStaticFile",

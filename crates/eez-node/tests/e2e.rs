@@ -25,9 +25,9 @@ fn with_composer_disabled(mut env: Vec<(&'static str, String)>) -> Vec<(&'static
     env
 }
 
-fn no_divergence_failures(nodes: &[&NodeHandle]) {
+fn assert_no_divergence_failure_logs(nodes: &[&NodeHandle]) {
     for node in nodes {
-        node.assert_no_divergence_failures();
+        node.assert_no_divergence_failure_logs();
     }
 }
 
@@ -79,7 +79,7 @@ async fn single_sequencer_followers_converge() {
     .await
     .expect("single sequencer/followers did not converge on finalized block hashes");
 
-    no_divergence_failures(&[&seq, &fol_rpc, &fol_l1]);
+    assert_no_divergence_failure_logs(&[&seq, &fol_rpc, &fol_l1]);
 }
 
 /// Regression for the original suffix-replay bug. Sequencer B locally
@@ -159,7 +159,7 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
         .await
         .expect("sequencers did not converge after intra-batch suffix replay");
 
-    no_divergence_failures(&[&seq_a, &seq_b]);
+    assert_no_divergence_failure_logs(&[&seq_a, &seq_b]);
 }
 
 /// Builder mode, sustained operation through a restart. Asserts every
