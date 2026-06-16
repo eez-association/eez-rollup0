@@ -422,8 +422,36 @@ pub async fn send_l2_value_transfer(
     to: Address,
     value: U256,
 ) -> Result<alloy_primitives::TxHash> {
+    use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+    use alloy_network::TxSignerSync;
+    use alloy_network::eip2718::Encodable2718;
+
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let raw = signed_l2_value_transfer_raw(&provider, signing_key, to, value).await?;
+    let signer: PrivateKeySigner = signing_key
+        .strip_prefix("0x")
+        .unwrap_or(signing_key)
+        .parse()
+        .context("parse signing key")?;
+    let from = signer.address();
+
+    let chain_id = provider.get_chain_id().await?;
+    let nonce = provider.get_transaction_count(from).await?;
+    let fees = provider.estimate_eip1559_fees().await?;
+
+    let mut tx = TxEip1559 {
+        chain_id,
+        nonce,
+        gas_limit: 21_000,
+        max_fee_per_gas: fees.max_fee_per_gas,
+        max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
+        to: alloy_primitives::TxKind::Call(to),
+        value,
+        access_list: alloy_rpc_types_eth::AccessList::default(),
+        input: alloy_primitives::Bytes::default(),
+    };
+    let sig = signer.sign_transaction_sync(&mut tx)?;
+    let envelope = TxEnvelope::from(tx.into_signed(sig));
+    let raw = envelope.encoded_2718();
 
     let hash = provider
         .send_raw_transaction(&raw)
@@ -451,12 +479,7 @@ pub async fn send_l2_value_transfer_included(
     timeout: Duration,
 ) -> Result<L2TxInclusion> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let raw = signed_l2_value_transfer_raw(&provider, signing_key, to, value).await?;
-    let tx_hash = provider
-        .send_raw_transaction(&raw)
-        .await?
-        .tx_hash()
-        .to_owned();
+    let tx_hash = send_l2_value_transfer(rpc_url, signing_key, to, value).await?;
     let receipt = wait_for(timeout, || async {
         Ok(provider.get_transaction_receipt(tx_hash).await?)
     })
@@ -474,43 +497,6 @@ pub async fn send_l2_value_transfer_included(
             .block_number
             .ok_or_else(|| anyhow!("included L2 tx {tx_hash} missing block_number"))?,
     })
-}
-
-async fn signed_l2_value_transfer_raw<P: Provider>(
-    provider: &P,
-    signing_key: &str,
-    to: Address,
-    value: U256,
-) -> Result<Vec<u8>> {
-    use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
-    use alloy_network::TxSignerSync;
-    use alloy_network::eip2718::Encodable2718;
-
-    let signer: PrivateKeySigner = signing_key
-        .strip_prefix("0x")
-        .unwrap_or(signing_key)
-        .parse()
-        .context("parse signing key")?;
-    let from = signer.address();
-
-    let chain_id = provider.get_chain_id().await?;
-    let nonce = provider.get_transaction_count(from).await?;
-    let fees = provider.estimate_eip1559_fees().await?;
-
-    let mut tx = TxEip1559 {
-        chain_id,
-        nonce,
-        gas_limit: 21_000,
-        max_fee_per_gas: fees.max_fee_per_gas,
-        max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
-        to: alloy_primitives::TxKind::Call(to),
-        value,
-        access_list: alloy_rpc_types_eth::AccessList::default(),
-        input: alloy_primitives::Bytes::default(),
-    };
-    let sig = signer.sign_transaction_sync(&mut tx)?;
-    let envelope = TxEnvelope::from(tx.into_signed(sig));
-    Ok(envelope.encoded_2718())
 }
 
 /// Wait until `eth_blockNumber` responds at `rpc_url`. Used to confirm a
