@@ -14,7 +14,7 @@ use std::{
 
 use alloy_primitives::{Address, B256, U256, address, hex};
 use alloy_provider::{Provider, ProviderBuilder};
-use alloy_rpc_types_eth::TransactionRequest;
+use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent, SolValue, sol};
 use anyhow::{Context, Result, anyhow, bail};
@@ -44,6 +44,8 @@ pub const COMPOSER_INTERVAL_SINGLE: Duration = Duration::from_secs(1);
 /// Composer tick cadence for multi-composer contention — gives the
 /// deriver time to re-sync between ticks (1-tick-per-2-blocks ratio).
 pub const COMPOSER_INTERVAL_MULTI: Duration = Duration::from_secs(2);
+
+static LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -474,7 +476,6 @@ pub async fn wait_for_l2_rpc(rpc_url: &str, timeout: Duration) -> Result<()> {
 /// (genesis L1 derivation pending). Used by the multi-composer reorg
 /// test to verify both composers settle on the same canonical L2 head.
 pub async fn safe_block_state_root(rpc_url: &str) -> Result<Option<B256>> {
-    use alloy_rpc_types_eth::BlockNumberOrTag;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let block = provider.get_block_by_number(BlockNumberOrTag::Safe).await?;
     Ok(block.map(|b| b.header.state_root))
@@ -638,7 +639,31 @@ pub struct NodeHandle {
     pub http_port: u16,
 }
 
-static LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
+#[derive(Clone, Copy, Debug)]
+pub enum NodeBinary {
+    EezNode,
+    EezFollower,
+}
+
+impl NodeBinary {
+    fn name(self) -> &'static str {
+        match self {
+            Self::EezNode => "eez-node",
+            Self::EezFollower => "eez-follower",
+        }
+    }
+
+    fn path(self) -> PathBuf {
+        let env_path = match self {
+            Self::EezNode => option_env!("CARGO_BIN_EXE_eez-node"),
+            Self::EezFollower => option_env!("CARGO_BIN_EXE_eez-follower"),
+        };
+        env_path.map_or_else(
+            || repo_root().join("target").join("debug").join(self.name()),
+            PathBuf::from,
+        )
+    }
+}
 
 #[derive(Default)]
 pub struct NodeConfig<'a> {
@@ -664,16 +689,47 @@ impl NodeHandle {
         cfg: &NodeConfig<'_>,
         env: &[(&'static str, String)],
     ) -> Result<Self> {
+        Self::spawn_binary(NodeBinary::EezNode, name, datadir, cfg, env, None)
+    }
+
+    pub fn spawn_follower(
+        name: &str,
+        datadir: &std::path::Path,
+        cfg: &NodeConfig<'_>,
+        env: &[(&'static str, String)],
+        sequencer_rpc: Option<&str>,
+    ) -> Result<Self> {
+        Self::spawn_binary(
+            NodeBinary::EezFollower,
+            name,
+            datadir,
+            cfg,
+            env,
+            sequencer_rpc,
+        )
+    }
+
+    fn spawn_binary(
+        binary: NodeBinary,
+        name: &str,
+        datadir: &std::path::Path,
+        cfg: &NodeConfig<'_>,
+        env: &[(&'static str, String)],
+        sequencer_rpc: Option<&str>,
+    ) -> Result<Self> {
         let (log_path, log_tempdir) = if let Ok(d) = std::env::var("EEZ_TEST_LOG_DIR") {
-            let suffix = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let n = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let safe_name = name.replace(|c: char| !c.is_ascii_alphanumeric(), "_");
             let p = std::path::PathBuf::from(d).join(format!(
-                "eez-node-{name}-{}-{suffix}.log",
+                "{}-{}-{}-{n}.log",
+                binary.name(),
+                safe_name,
                 std::process::id()
             ));
             (p, None)
         } else {
             let td = tempfile::tempdir().context("log tempdir")?;
-            let p = td.path().join("eez-node.log");
+            let p = td.path().join(format!("{}-{name}.log", binary.name()));
             (p, Some(td))
         };
         // tracing_subscriber's default writer is stdout; reth's panics go to stderr.
@@ -699,7 +755,15 @@ impl NodeHandle {
             || std::ffi::OsString::from("dev"),
             |p| p.as_os_str().to_owned(),
         );
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_eez-node"));
+        let bin_path = binary.path();
+        if !bin_path.exists() {
+            bail!(
+                "{} binary not found at {}; build workspace binaries first",
+                binary.name(),
+                bin_path.display()
+            );
+        }
+        let mut cmd = Command::new(&bin_path);
         cmd.current_dir(repo_root())
             .args(["node", "--chain"])
             .arg(&chain_arg)
@@ -737,10 +801,15 @@ impl NodeHandle {
             .env("EEZ_L1_AUTH_PORT", l1_auth_port.to_string())
             .env("EEZ_L1_P2P_PORT", l1_p2p_port.to_string())
             .env("EEZ_L1_DATADIR", &l1_datadir);
+        if let Some(sequencer_rpc) = sequencer_rpc {
+            cmd.args(["--sequencer-rpc", sequencer_rpc]);
+        }
         for (k, v) in env {
             cmd.env(*k, v);
         }
-        let child = cmd.spawn().context("spawn eez-node")?;
+        let child = cmd
+            .spawn()
+            .with_context(|| format!("spawn {}", binary.name()))?;
         Ok(Self {
             child,
             name: name.to_string(),
@@ -761,9 +830,32 @@ impl NodeHandle {
         env: &[(&'static str, String)],
     ) -> Result<Self> {
         let datadir = tempfile::tempdir().context("datadir tempdir")?;
-        let mut handle = Self::spawn_with(name, datadir.path(), cfg, env)?;
+        let mut handle = Self::start_with_datadir(name, datadir.path(), cfg, env).await?;
         handle.keep_alive.push(datadir);
+        Ok(handle)
+    }
+
+    pub async fn start_with_datadir(
+        name: &str,
+        datadir: &std::path::Path,
+        cfg: &NodeConfig<'_>,
+        env: &[(&'static str, String)],
+    ) -> Result<Self> {
+        let handle = Self::spawn_with(name, datadir, cfg, env)?;
         wait_for_l2_rpc(&handle.l2_rpc_url(), Duration::from_secs(90)).await?;
+        Ok(handle)
+    }
+
+    pub async fn start_follower(
+        name: &str,
+        cfg: &NodeConfig<'_>,
+        env: &[(&'static str, String)],
+        sequencer_rpc: Option<&str>,
+    ) -> Result<Self> {
+        let datadir = tempfile::tempdir().context("datadir tempdir")?;
+        let mut handle = Self::spawn_follower(name, datadir.path(), cfg, env, sequencer_rpc)?;
+        wait_for_l2_rpc(&handle.l2_rpc_url(), Duration::from_secs(90)).await?;
+        handle.keep_alive.push(datadir);
         Ok(handle)
     }
 
@@ -816,6 +908,23 @@ impl NodeHandle {
         );
     }
 
+    pub fn assert_no_divergence_failures(&self) {
+        let patterns = [
+            "Fatal",
+            "UnexpectedStaticFile",
+            "eez.deriver.state.diverged",
+            "local L2 state root differs",
+            "engine rejected safe/finalized FCU",
+            "payload builder returned no payload",
+        ];
+        assert_eq!(
+            self.log_count_matching(&patterns).unwrap(),
+            0,
+            "{} logged a divergence/fatal-class failure",
+            self.name,
+        );
+    }
+
     /// Count lines in `log_path` matching ANY of `patterns` (substring
     /// match). Used by the multi-composer reorg test to assert
     /// reorg handling on both composers AND zero `Fatal` /
@@ -835,6 +944,101 @@ impl Drop for NodeHandle {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L2BlockSnapshot {
+    pub number: u64,
+    pub hash: B256,
+    pub parent_hash: B256,
+    pub state_root: B256,
+}
+
+pub async fn l2_block_by_tag(
+    rpc_url: &str,
+    tag: BlockNumberOrTag,
+) -> Result<Option<L2BlockSnapshot>> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let block = provider.get_block_by_number(tag).await?;
+    Ok(block.map(|b| L2BlockSnapshot {
+        number: b.header.number,
+        hash: b.header.hash,
+        parent_hash: b.header.parent_hash,
+        state_root: b.header.state_root,
+    }))
+}
+
+pub async fn l2_block_by_number(rpc_url: &str, number: u64) -> Result<Option<L2BlockSnapshot>> {
+    l2_block_by_tag(rpc_url, BlockNumberOrTag::Number(number)).await
+}
+
+pub async fn latest_block_snapshot(node: &NodeHandle) -> Result<Option<L2BlockSnapshot>> {
+    l2_block_by_tag(&node.l2_rpc_url(), BlockNumberOrTag::Latest).await
+}
+
+pub async fn wait_for_latest_height(
+    node: &NodeHandle,
+    min_height: u64,
+    timeout: Duration,
+) -> Result<L2BlockSnapshot> {
+    wait_for(timeout, || async {
+        let latest = latest_block_snapshot(node).await?;
+        Ok(latest.filter(|b| b.number >= min_height))
+    })
+    .await
+}
+
+pub async fn wait_for_safe_prefix_convergence(
+    nodes: &[&NodeHandle],
+    min_height: u64,
+    timeout: Duration,
+) -> Result<L2BlockSnapshot> {
+    wait_for_tag_prefix_convergence(nodes, BlockNumberOrTag::Safe, min_height, timeout).await
+}
+
+pub async fn wait_for_finalized_prefix_convergence(
+    nodes: &[&NodeHandle],
+    min_height: u64,
+    timeout: Duration,
+) -> Result<L2BlockSnapshot> {
+    wait_for_tag_prefix_convergence(nodes, BlockNumberOrTag::Finalized, min_height, timeout).await
+}
+
+async fn wait_for_tag_prefix_convergence(
+    nodes: &[&NodeHandle],
+    tag: BlockNumberOrTag,
+    min_height: u64,
+    timeout: Duration,
+) -> Result<L2BlockSnapshot> {
+    wait_for(timeout, || async {
+        let mut tag_blocks = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let Some(block) = l2_block_by_tag(&node.l2_rpc_url(), tag).await? else {
+                return Ok(None);
+            };
+            tag_blocks.push(block);
+        }
+
+        let target = tag_blocks
+            .iter()
+            .map(|b| b.number)
+            .min()
+            .unwrap_or_default();
+        if target < min_height {
+            return Ok(None);
+        }
+
+        let mut blocks = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let Some(block) = l2_block_by_number(&node.l2_rpc_url(), target).await? else {
+                return Ok(None);
+            };
+            blocks.push(block);
+        }
+        let first = blocks[0];
+        Ok(blocks.iter().all(|b| b.hash == first.hash).then_some(first))
+    })
+    .await
 }
 
 pub async fn wait_for<F, Fut, T>(timeout: Duration, mut f: F) -> Result<T>
