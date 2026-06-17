@@ -461,44 +461,6 @@ pub async fn send_l2_value_transfer(
     Ok(hash)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct L2TxInclusion {
-    pub tx_hash: alloy_primitives::TxHash,
-    pub block_hash: B256,
-    pub block_number: u64,
-}
-
-/// Send one L2 value transfer and wait until the node reports an
-/// included, successful receipt. Use this when the tx is a test
-/// precondition; keep [`send_l2_value_transfer`] for best-effort load.
-pub async fn send_l2_value_transfer_included(
-    rpc_url: &str,
-    signing_key: &str,
-    to: Address,
-    value: U256,
-    timeout: Duration,
-) -> Result<L2TxInclusion> {
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let tx_hash = send_l2_value_transfer(rpc_url, signing_key, to, value).await?;
-    let receipt = wait_for(timeout, || async {
-        Ok(provider.get_transaction_receipt(tx_hash).await?)
-    })
-    .await
-    .with_context(|| format!("wait for L2 tx {tx_hash} inclusion"))?;
-    if !receipt.status() {
-        bail!("L2 tx {tx_hash} reverted");
-    }
-    Ok(L2TxInclusion {
-        tx_hash,
-        block_hash: receipt
-            .block_hash
-            .ok_or_else(|| anyhow!("included L2 tx {tx_hash} missing block_hash"))?,
-        block_number: receipt
-            .block_number
-            .ok_or_else(|| anyhow!("included L2 tx {tx_hash} missing block_number"))?,
-    })
-}
-
 /// Wait until `eth_blockNumber` responds at `rpc_url`. Used to confirm a
 /// just-spawned eez-node's L2 RPC is up before we send txs at it.
 pub async fn wait_for_l2_rpc(rpc_url: &str, timeout: Duration) -> Result<()> {

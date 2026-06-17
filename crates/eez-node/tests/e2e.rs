@@ -8,12 +8,13 @@
 use std::time::Duration;
 
 use alloy_primitives::{B256, U256};
+use alloy_provider::{Provider, ProviderBuilder};
 
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeConfig,
-    NodeHandle, override_env, reorg_genesis_path, reorg_genesis_state_root,
-    send_l2_value_transfer_included, wait_for_finalized_prefix_convergence, wait_for_latest_height,
+    NodeHandle, override_env, reorg_genesis_path, reorg_genesis_state_root, send_l2_value_transfer,
+    wait_for, wait_for_finalized_prefix_convergence, wait_for_latest_height,
     wait_for_node_caught_up, wait_for_safe_prefix_convergence,
 };
 
@@ -119,21 +120,26 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
             .await
             .unwrap();
 
-    let inclusion = send_l2_value_transfer_included(
-        &seq_a.l2_rpc_url(),
-        ANVIL_KEY_1,
-        ANVIL_ADDR,
-        U256::from(1u64),
-        DEFAULT_TIMEOUT,
-    )
+    let seq_a_rpc = seq_a.l2_rpc_url();
+    let seq_a_provider = ProviderBuilder::new().connect_http(seq_a_rpc.parse().unwrap());
+    let tx_hash = send_l2_value_transfer(&seq_a_rpc, ANVIL_KEY_1, ANVIL_ADDR, U256::from(1u64))
+        .await
+        .expect("submit L2 tx to sequencer A");
+    let receipt = wait_for(DEFAULT_TIMEOUT, || async {
+        Ok(seq_a_provider.get_transaction_receipt(tx_hash).await?)
+    })
     .await
-    .expect("include L2 tx on sequencer A");
+    .unwrap_or_else(|err| panic!("wait for L2 tx {tx_hash} inclusion: {err:#}"));
+    assert!(receipt.status(), "L2 tx {tx_hash} reverted");
+    let included_block = receipt
+        .block_number
+        .unwrap_or_else(|| panic!("included L2 tx {tx_hash} missing block_number"));
     assert!(
-        inclusion.block_number > 0,
+        included_block > 0,
         "L2 tx {} must not be included in genesis",
-        inclusion.tx_hash
+        tx_hash
     );
-    let target = inclusion.block_number + 3;
+    let target = included_block + 3;
     wait_for_latest_height(&seq_a, target, DEFAULT_TIMEOUT)
         .await
         .expect("sequencer A did not stage enough local blocks");
