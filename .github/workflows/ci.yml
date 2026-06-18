@@ -40,10 +40,12 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       # Build everything (workspace lib + integration test binaries + the
-      # eez-node binary that integration tests spawn via CARGO_BIN_EXE_).
+      # runnable eez-node/eez-follower binaries that integration tests spawn).
       # Once this completes, clippy and both nextest runs read from cache.
       - name: Build (tests + binaries)
-        run: cargo nextest run --workspace --all-targets --no-run
+        run: |
+          cargo nextest run --workspace --all-targets --no-run
+          cargo build --workspace --bins
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Build contracts (artifacts read by harness)

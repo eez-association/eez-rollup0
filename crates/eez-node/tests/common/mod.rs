@@ -658,11 +658,41 @@ impl NodeBinary {
             Self::EezNode => option_env!("CARGO_BIN_EXE_eez-node"),
             Self::EezFollower => option_env!("CARGO_BIN_EXE_eez-follower"),
         };
-        env_path.map_or_else(
-            || repo_root().join("target").join("debug").join(self.name()),
-            PathBuf::from,
-        )
+        if let Some(path) = env_path {
+            return PathBuf::from(path);
+        }
+
+        let debug_dir = target_debug_dir();
+        let direct_path =
+            debug_dir.join(format!("{}{}", self.name(), std::env::consts::EXE_SUFFIX));
+        if direct_path.exists() {
+            return direct_path;
+        }
+
+        direct_path
     }
+}
+
+fn target_debug_dir() -> PathBuf {
+    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+        return PathBuf::from(target_dir).join("debug");
+    }
+
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        if parent
+            .file_name()
+            .is_some_and(|file_name| file_name == "deps")
+        {
+            if let Some(debug_dir) = parent.parent() {
+                return debug_dir.to_path_buf();
+            }
+        }
+        return parent.to_path_buf();
+    }
+
+    repo_root().join("target").join("debug")
 }
 
 #[derive(Default)]
