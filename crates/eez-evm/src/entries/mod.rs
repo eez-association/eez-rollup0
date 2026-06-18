@@ -147,16 +147,19 @@ pub fn build_batch(
                     entries.push(prev.finish());
                 }
                 let mut builder = EntryBuilder::new(call, *dialect, source_rollup_id, attribution);
-                // Deposit shape: an entry-rollup batch with a
-                // value-bearing outer omits the outer from `L2ToL1Calls`
-                // (callCount=0, rollingHash=0) and lets the stateDelta's
-                // `+value` satisfy L1's ether-conservation check. Every
-                // other case (target batch, or a value-free entry) keeps
-                // the outer so `executeIncomingCrossChainCall` forwards
-                // the call. (`DEPOSIT_SPEC.md §8`.)
+                // Entry-rollup batch: omit the outer (callCount=0,
+                // rollingHash=0). On consume, `executeCrossChainCall`
+                // recomputes `rollingHash` by re-executing `L2ToL1Calls`,
+                // which holds only reentrant L2→L1 children — not the
+                // top-level call, whose effect rides `stateDeltas` and whose
+                // return rides `returnData`. Folding it lets L1 re-execute
+                // the outer against a codeless target, dropping the return
+                // data; any return-bearing call then reverts
+                // `RollingHashMismatch`. The target batch (`!is_entry_rollup`)
+                // keeps the outer so `executeIncomingCrossChainCall` forwards
+                // the call on arrival. (`DEPOSIT_SPEC.md §8`.)
                 let is_entry_rollup = source_rollup_id == attribution.entry_rollup_id;
-                let outer_has_value = call.value > U256::ZERO;
-                if !(is_entry_rollup && outer_has_value) {
+                if !is_entry_rollup {
                     builder.append_call(call, 1);
                 }
                 entry_nested_number = 0;
@@ -491,10 +494,14 @@ mod tests {
     }
 
     #[test]
-    fn originating_call_lands_outer_in_l2_to_l1_calls() {
-        // L1's batch for an originating L1→L2 call: outer in
-        // `L2ToL1Calls[0]`, callCount=1, non-zero rolling hash, plus one
-        // stateDelta for the target.
+    fn originating_call_omits_outer_from_l2_to_l1_calls() {
+        // L1's batch for an originating L1→L2 call (the entry consumed on
+        // the source chain via `executeCrossChainCall`): the top-level call
+        // is NOT folded — `L2ToL1Calls` empty, callCount=0, rollingHash=0.
+        // Only reentrant L2→L1 children fold; the effect rides the
+        // stateDelta and the return value (if any) is carried separately in
+        // `returnData`. (sync-rollups-protocol@fe7bf66 — a folded outer here
+        // makes `executeCrossChainCall` revert `RollingHashMismatch`.)
         let (init, ptx) = empty_attribution();
         let attr = SourceAttribution {
             initial_roots: &init,
@@ -505,12 +512,12 @@ mod tests {
         let batch = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[])
             .expect("build_batch ok");
         assert_eq!(batch.entries().len(), 1);
-        assert_eq!(batch.entries()[0].L2ToL1Calls.len(), 1);
-        assert_eq!(batch.entries()[0].callCount, U256::from(1));
+        assert!(batch.entries()[0].L2ToL1Calls.is_empty());
+        assert_eq!(batch.entries()[0].callCount, U256::ZERO);
         assert!(batch.entries()[0].expectedL1ToL2Calls.is_empty());
         assert!(batch.lookup_calls().is_empty());
         assert_ne!(batch.entries()[0].proxyEntryHash, B256::ZERO);
-        assert_ne!(batch.entries()[0].rollingHash, B256::ZERO);
+        assert_eq!(batch.entries()[0].rollingHash, B256::ZERO);
         assert_eq!(batch.entries()[0].destinationRollupId, U256::from(1));
         assert_eq!(batch.entries()[0].stateDeltas.len(), 1);
         assert_eq!(batch.entries()[0].stateDeltas[0].rollupId, U256::from(1));
@@ -647,9 +654,15 @@ mod tests {
     }
 
     #[test]
-    fn value_zero_keeps_existing_shape_on_both_batches() {
-        // Value-free outer (setter) keeps the full shape on BOTH
-        // batches; L1 and L2 entries share the `proxyEntryHash` binding.
+    fn value_zero_setter_omits_outer_on_origin_keeps_on_target() {
+        // Value-free outer (setter): the L1 origin batch (consumed via
+        // `executeCrossChainCall`) OMITS the outer — callCount=0,
+        // rollingHash=0 (only reentrant L2→L1 children fold). The L2
+        // target batch KEEPS it so `executeIncomingCrossChainCall`
+        // forwards the call on arrival. Both still share the
+        // `proxyEntryHash` binding. (sync-rollups-protocol@fe7bf66 —
+        // folding the outer on the origin batch reverts
+        // `RollingHashMismatch`.)
         let (init, ptx) = empty_attribution();
         let attr = SourceAttribution {
             initial_roots: &init,
@@ -666,17 +679,18 @@ mod tests {
             .expect("L1 build_batch ok");
         let l2_batch = build_batch(&calls, &attr, &ChainDialect::EvmL2Style, RollupId(1), &[])
             .expect("L2 build_batch ok");
-        for (label, batch) in [("L1", &l1_batch), ("L2", &l2_batch)] {
-            assert_eq!(batch.entries().len(), 1, "{label}: one entry");
-            let entry = &batch.entries()[0];
-            assert_eq!(entry.L2ToL1Calls.len(), 1, "{label}: outer in L2ToL1Calls");
-            assert_eq!(entry.callCount, U256::from(1), "{label}: callCount=1");
-            assert_ne!(entry.rollingHash, B256::ZERO, "{label}: rolling hash set");
-        }
-        assert_eq!(
-            l1_batch.entries()[0].proxyEntryHash,
-            l2_batch.entries()[0].proxyEntryHash,
-        );
+        // L1 origin batch: outer omitted, rolling hash zero.
+        let l1 = &l1_batch.entries()[0];
+        assert!(l1.L2ToL1Calls.is_empty(), "L1: outer omitted");
+        assert_eq!(l1.callCount, U256::ZERO, "L1: callCount=0");
+        assert_eq!(l1.rollingHash, B256::ZERO, "L1: rollingHash=0");
+        // L2 target batch: outer kept so the call forwards on arrival.
+        let l2 = &l2_batch.entries()[0];
+        assert_eq!(l2.L2ToL1Calls.len(), 1, "L2: outer kept");
+        assert_eq!(l2.callCount, U256::from(1), "L2: callCount=1");
+        assert_ne!(l2.rollingHash, B256::ZERO, "L2: rolling hash set");
+        // Shared proxyEntryHash binding across both batches.
+        assert_eq!(l1.proxyEntryHash, l2.proxyEntryHash);
     }
 
     #[test]
