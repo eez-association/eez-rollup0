@@ -102,23 +102,22 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
         genesis_path: Some(genesis.as_path()),
     };
 
-    let seq_a_datadir = tempfile::tempdir().unwrap();
-    let seq_b_datadir = tempfile::tempdir().unwrap();
+    let primary_dir = tempfile::tempdir().unwrap();
+    let mirror_dir = tempfile::tempdir().unwrap();
     let seq_a_env_disabled = with_composer_disabled(harness.env_for(ANVIL_KEY, true));
     let seq_b_env = with_composer_disabled(harness.env_for(ANVIL_KEY_4, true));
 
     let seq_a = NodeHandle::start_with_datadir(
         "intra-seq-a-stage",
-        seq_a_datadir.path(),
+        primary_dir.path(),
         &cfg,
         &seq_a_env_disabled,
     )
     .await
     .unwrap();
-    let seq_b =
-        NodeHandle::start_with_datadir("intra-seq-b", seq_b_datadir.path(), &cfg, &seq_b_env)
-            .await
-            .unwrap();
+    let seq_b = NodeHandle::start_with_datadir("intra-seq-b", mirror_dir.path(), &cfg, &seq_b_env)
+        .await
+        .unwrap();
 
     let seq_a_rpc = seq_a.l2_rpc_url();
     let seq_a_provider = ProviderBuilder::new().connect_http(seq_a_rpc.parse().unwrap());
@@ -136,8 +135,7 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
         .unwrap_or_else(|| panic!("included L2 tx {tx_hash} missing block_number"));
     assert!(
         included_block > 0,
-        "L2 tx {} must not be included in genesis",
-        tx_hash
+        "L2 tx {tx_hash} must not be included in genesis"
     );
     let target = included_block + 3;
     wait_for_latest_height(&seq_a, target, DEFAULT_TIMEOUT)
@@ -150,7 +148,7 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
     drop(seq_a);
     let seq_a = NodeHandle::start_with_datadir(
         "intra-seq-a-compose",
-        seq_a_datadir.path(),
+        primary_dir.path(),
         &cfg,
         &harness.env_for(ANVIL_KEY, true),
     )
