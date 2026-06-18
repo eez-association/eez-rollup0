@@ -147,19 +147,17 @@ pub fn build_batch(
                     entries.push(prev.finish());
                 }
                 let mut builder = EntryBuilder::new(call, *dialect, source_rollup_id, attribution);
-                // The origin (entry-rollup) batch is the one consumed on
-                // the source chain via `executeCrossChainCall`, whose
-                // `rollingHash` folds ONLY reentrant L2→L1 children — never
-                // the top-level call itself (see `CallKind::TopLevel`). Its
-                // effect rides the `stateDeltas`, so omit the outer
-                // (callCount=0, rollingHash=0); appending it makes
-                // `executeCrossChainCall` replay a phantom call and revert
-                // `RollingHashMismatch` (sync-rollups-protocol@fe7bf66).
-                // Deposits already relied on this for ether-conservation; it
-                // holds for value-free contract calls (e.g. `setValue`) too.
-                // The target batch (`!is_entry_rollup`) keeps the outer so
-                // `executeIncomingCrossChainCall` forwards the call on
-                // arrival. (`DEPOSIT_SPEC.md §8`.)
+                // Entry-rollup batch: omit the outer (callCount=0,
+                // rollingHash=0). On consume, `executeCrossChainCall`
+                // recomputes `rollingHash` by re-executing `L2ToL1Calls`,
+                // which holds only reentrant L2→L1 children — not the
+                // top-level call, whose effect rides `stateDeltas` and whose
+                // return rides `returnData`. Folding it lets L1 re-execute
+                // the outer against a codeless target, dropping the return
+                // data; any return-bearing call then reverts
+                // `RollingHashMismatch`. The target batch (`!is_entry_rollup`)
+                // keeps the outer so `executeIncomingCrossChainCall` forwards
+                // the call on arrival. (`DEPOSIT_SPEC.md §8`.)
                 let is_entry_rollup = source_rollup_id == attribution.entry_rollup_id;
                 if !is_entry_rollup {
                     builder.append_call(call, 1);
