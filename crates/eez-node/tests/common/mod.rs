@@ -29,6 +29,21 @@ pub const ANVIL_KEY_3: &str = "0x7c852118294e51e653712a81e05800f419141751be58f60
 pub const ANVIL_KEY_4: &str = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a";
 pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906");
 
+/// L1 (anvil) block cadence. Composer-mode `RollupTiming` requires a
+/// whole-second L2 block time and `K = L1/L2 >= 2`, so L1 must be at
+/// least `2 * L2`. With L2 = 1s, the minimum valid L1 cadence is 2s.
+/// Used both for the anvil `--block-time` and `EEZ_L1_BLOCK_TIME_MS`,
+/// which must agree for the sequencer's slot scheduling to converge.
+pub const L1_BLOCK_TIME_SECS: u64 = 2;
+
+/// L2 genesis block timestamp — identical across the dev chainspec, the
+/// root `genesis.json`, and the reorg fixture (all `0x6490fdd2`). Anvil
+/// is started with this as its genesis timestamp so the L1 wall-clock is
+/// aligned to the L2 genesis: the sequencer anchors sync slots to L1
+/// time, and a mismatch (e.g. anvil at real wall-clock) puts it in
+/// permanent multi-million-block catchup that never converges.
+pub const L2_GENESIS_TIMESTAMP: u64 = 0x6490_fdd2;
+
 /// Composer tick cadence for single-composer tests — max speed.
 pub const COMPOSER_INTERVAL_SINGLE: Duration = Duration::from_secs(1);
 /// Composer tick cadence for multi-composer contention — gives the
@@ -82,7 +97,7 @@ pub struct AnvilConfig {
 impl Default for AnvilConfig {
     fn default() -> Self {
         Self {
-            block_time_secs: 1,
+            block_time_secs: L1_BLOCK_TIME_SECS,
             mnemonic: None,
             hardfork: None,
             gas_limit: None,
@@ -91,12 +106,15 @@ impl Default for AnvilConfig {
 }
 
 impl AnvilConfig {
-    /// 1s block time, hardhat mnemonic, cancun hardfork, 30M gas.
-    /// (Chiado uses 5s; tests prefer speed over fidelity. 1s blocks +
-    /// cancun still permit `anvil_reorg`.)
+    /// 2s block time, hardhat mnemonic, cancun hardfork, 30M gas.
+    /// (Chiado uses 5s; tests prefer speed over fidelity. 2s blocks +
+    /// cancun still permit `anvil_reorg`.) The cadence must match
+    /// `EEZ_L1_BLOCK_TIME_MS` in [`Harness::env_for`]: composer-mode
+    /// `RollupTiming` requires whole-second L2 and `K = L1/L2 >= 2`, so
+    /// the L1 block time cannot drop below `2 * L2`.
     pub fn for_reorg() -> Self {
         Self {
-            block_time_secs: 1,
+            block_time_secs: L1_BLOCK_TIME_SECS,
             mnemonic: Some(HARDHAT_MNEMONIC),
             hardfork: Some("cancun"),
             gas_limit: Some(30_000_000),
@@ -118,6 +136,9 @@ impl Anvil {
             &port.to_string(),
             "--block-time",
             &cfg.block_time_secs.to_string(),
+            // Align the L1 clock to the L2 genesis (see L2_GENESIS_TIMESTAMP).
+            "--timestamp",
+            &L2_GENESIS_TIMESTAMP.to_string(),
             "--silent",
         ]);
         if let Some(m) = cfg.mnemonic {
@@ -288,6 +309,30 @@ impl Harness {
             ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
             ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
             ("EEZ_L1_POSTER_KEY", poster_key.to_string()),
+            // Composer-mode RollupTiming (required; no defaults). L1 must
+            // match the anvil cadence (`L1_BLOCK_TIME_SECS`). With L2=1s,
+            // K = L1/L2 = 2; proof = (K-1)*L2 leaves zero Future slots.
+            (
+                "EEZ_L1_BLOCK_TIME_MS",
+                (L1_BLOCK_TIME_SECS * 1000).to_string(),
+            ),
+            ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
+            ("EEZ_PROOF_TIME_MS", "1000".to_string()),
+            ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
+            // EvmComposer (embedded-L1 composer mode) config, normally
+            // emitted by deploy.sh. CCM-L2 is the predeploy baked into the
+            // L2 genesis fixture (0x42..07); the system EOA is anvil #0,
+            // matching the prefunded account these tests deploy with.
+            (
+                "EEZ_CCM_L2_ADDRESS",
+                "0x4200000000000000000000000000000000000007".to_string(),
+            ),
+            ("EEZ_L2_SYSTEM_ADDRESS", format!("{ANVIL_ADDR:#x}")),
+            ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
+            // postBatch is forwarded to the external anvil L1 (via the
+            // bundle stub), so the poster signs for anvil's chain id, not
+            // the embedded reth's default (1337). Anvil's default is 31337.
+            ("EEZ_L1_CHAIN_ID", "31337".to_string()),
             ("EEZ_PROOF_SIGNER_KEY", ANVIL_KEY.to_string()),
             (
                 "EEZ_REGISTRY_ADDRESS",
@@ -653,6 +698,25 @@ impl NodeHandle {
         let http_port = free_port();
         let ws_port = free_port();
         let p2p_port = free_port();
+        // Composer mode launches an embedded L1 reth that, left to its
+        // defaults, binds fixed ports (http 18545, auth 18546, p2p 30444)
+        // and a shared datadir. Its WS server binds `http + 1`, which at
+        // the default http port (18545) collides with the default auth
+        // port (18546) — and any two composers would fight over the same
+        // ports/datadir. Give every node a private set. `auth` skips the
+        // embedded L1's `http + 1` WS port.
+        let l1_http_port = free_port();
+        let mut l1_auth_port = free_port();
+        while l1_auth_port == l1_http_port + 1 {
+            l1_auth_port = free_port();
+        }
+        let l1_p2p_port = free_port();
+        // Embedded-L1 datadir lives inside the node's L2 datadir so it
+        // shares the same lifecycle: unique per node, and persisted across
+        // a kill+respawn that reuses the datadir (the restart tests rely on
+        // the embedded L1 resuming its chain rather than starting empty,
+        // which would desync the reused L2 head into an invalid forkchoice).
+        let l1_datadir = datadir.join("embedded-l1");
         let chain_arg: std::ffi::OsString = cfg.genesis_path.map_or_else(
             || std::ffi::OsString::from("dev"),
             |p| p.as_os_str().to_owned(),
@@ -690,6 +754,12 @@ impl NodeHandle {
                 "CARGO_HOME",
                 std::env::var("CARGO_HOME").unwrap_or_default(),
             );
+        // Per-node embedded-L1 ports/datadir. Set before the caller's env
+        // so an explicit override there still wins.
+        cmd.env("EEZ_L1_HTTP_PORT", l1_http_port.to_string())
+            .env("EEZ_L1_AUTH_PORT", l1_auth_port.to_string())
+            .env("EEZ_L1_P2P_PORT", l1_p2p_port.to_string())
+            .env("EEZ_L1_DATADIR", &l1_datadir);
         for (k, v) in env {
             cmd.env(*k, v);
         }
