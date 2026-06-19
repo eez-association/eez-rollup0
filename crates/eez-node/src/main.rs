@@ -15,10 +15,11 @@
 //! | set | unset | **follower** | reth + `L1Watcher` + Deriver (no Sequencer) |
 //! | set | set | **composer** | reth + `L1Watcher` + Deriver + Sequencer (L1-anchored) + Composer umbrella |
 
+mod crosschain_ingress;
 mod ingress;
 mod l1_embedded;
 
-use std::{collections::HashMap, env, str::FromStr, sync::Arc};
+use std::{collections::HashMap, env, net::SocketAddr, str::FromStr, sync::Arc};
 
 use alloy_primitives::{Address, B256};
 use alloy_signer_local::PrivateKeySigner;
@@ -254,10 +255,7 @@ fn main() -> eyre::Result<()> {
             )
             .with_add_ons(
                 reth_node_ethereum::node::EthereumAddOns::default()
-                    .with_rpc_middleware(ingress::IngressLayer::new(
-                        Arc::clone(&held_pool),
-                        Arc::clone(&classifier),
-                    )),
+                    .with_rpc_middleware(ingress::IngressLayer::new(Arc::clone(&classifier))),
             )
             .launch_with_debug_capabilities()
             .await?;
@@ -741,6 +739,34 @@ fn main() -> eyre::Result<()> {
             event!(name: "eez.node.composer.spawned", Level::INFO, "spawning eez composer umbrella");
             task_executor.spawn_critical_task("eez-composer", async move {
                 composer.run().await;
+            });
+
+            // Cross-chain ingress: an L1-fronting RPC for wallets. Reads
+            // forward to L1 (so nonce/receipt/chainId are coherent for a
+            // tx that executes on L1); `eth_sendRawTransaction` for a
+            // cross-chain proxy is held for the next Sync slot. The L2
+            // node's own RPC stays the L2 mempool endpoint.
+            let cc_port = env::var("EEZ_CROSSCHAIN_INGRESS_PORT")
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(crosschain_ingress::DEFAULT_PORT);
+            let cc_l1_url = env::var("EEZ_L1_TARGET_RPC_URL")
+                .or_else(|_| env::var("EEZ_L1_RPC_URL"))
+                .unwrap_or_default();
+            let cc_addr = SocketAddr::from(([0, 0, 0, 0], cc_port));
+            let cc_held = Arc::clone(&held_pool);
+            let cc_classifier = Arc::clone(&classifier);
+            task_executor.spawn_critical_task("eez-crosschain-ingress", async move {
+                if let Err(err) =
+                    crosschain_ingress::serve(cc_addr, &cc_l1_url, cc_held, cc_classifier).await
+                {
+                    event!(
+                        name: "eez.crosschain_ingress.failed",
+                        Level::ERROR,
+                        error = %err,
+                        "cross-chain ingress stopped",
+                    );
+                }
             });
         }
 

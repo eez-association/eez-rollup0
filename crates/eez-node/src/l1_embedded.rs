@@ -134,6 +134,11 @@ fn build_network_rpc_args(cfg: &EmbeddedL1Config) -> Result<(NetworkArgs, RpcSer
         ..NetworkArgs::default()
     };
     network_args.discovery.port = cfg.p2p_port;
+    // discv5 defaults to a FIXED port (`DEFAULT_DISCOVERY_V5_PORT`) that
+    // ignores `p2p_port`, so two embedded L1s on one host (e.g. a local
+    // node alongside a dockerized one) collide on it. Pin it to the
+    // configured port so each instance is self-consistent.
+    network_args.discovery.discv5_port = Some(cfg.p2p_port);
     let rpc_args = RpcServerArgs {
         http: true,
         ws: true,
