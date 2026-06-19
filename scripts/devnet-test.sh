@@ -31,7 +31,8 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 # ── Endpoints (the running node) ─────────────────────────────────────
 L1_RPC="${L1_RPC:-http://localhost:18645}"      # embedded chiado L1
-L2_RPC="${L2_RPC:-http://localhost:18688}"      # L2
+L2_RPC="${L2_RPC:-http://localhost:18688}"      # L2 mempool (rejects cross-chain txs)
+INGRESS_RPC="${INGRESS_RPC:-http://localhost:18699}"  # cross-chain ingress (L1-fronting)
 NODE_CONTAINER="${NODE_CONTAINER:-eez-node-chiado}"
 
 # ── Knobs ────────────────────────────────────────────────────────────
@@ -39,6 +40,11 @@ WAVE_COUNT="${EEZ_WAVE_COUNT:-5}"
 FILLER_PER_GAP="${EEZ_FILLER_PER_GAP:-2}"
 RECEIPT_WAIT_SECS="${EEZ_RECEIPT_WAIT_SECS:-300}"
 VALUE_INITIAL="${VALUE_INITIAL:-5}"
+# Blockscout for the L1 (chiado) the internal node tracks — used to
+# verify the deployed L1 contracts so their events (notably the
+# SetterWrapper `Wrapped` log carrying the cross-chain return value)
+# render decoded in the explorer. Best-effort; set empty to skip.
+BLOCKSCOUT_URL="${EEZ_BLOCKSCOUT_URL:-https://gnosis-chiado.blockscout.com}"
 
 # ── Keys (testnet only; match scripts/smoke-chiado.sh defaults) ──────
 # Operator = protocol deployer + proof signer (creates the proxies).
@@ -55,11 +61,17 @@ HH_ADDR_0=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
 # registry+target+rollupId) never collides with a prior run's
 # (CreateCollision). Override to pin a specific recipient.
 L2_RECIPIENT="${L2_RECIPIENT:-0x$(openssl rand -hex 20)}"
+echo "Sending to ${L2_RECIPIENT}"
 FILLER_RECIPIENT=0x2222222222222222222222222222222222222222
 
-# Snapshot of the composer log for the tally (docker logs, not a file).
+# Snapshot of the composer log for the tally. Reads NODE_LOG_FILE (a
+# native cargo-node log) when set, else `docker logs $NODE_CONTAINER`.
 NODE_LOG="$(mktemp /tmp/devnet-test-nodelog.XXXXXX)"
-refresh_log() { docker logs "$NODE_CONTAINER" >"$NODE_LOG" 2>&1 || true; }
+NODE_LOG_FILE="${NODE_LOG_FILE:-}"
+refresh_log() {
+    if [[ -n "$NODE_LOG_FILE" ]]; then cp "$NODE_LOG_FILE" "$NODE_LOG" 2>/dev/null || true
+    else docker logs "$NODE_CONTAINER" >"$NODE_LOG" 2>&1 || true; fi
+}
 cleanup() { rm -f "$NODE_LOG"; }
 trap cleanup EXIT
 
@@ -79,7 +91,7 @@ retry() {
 # ── Prereqs ──────────────────────────────────────────────────────────
 for t in cast forge jq docker; do command -v "$t" >/dev/null || { echo "$t not in PATH"; exit 1; }; done
 [[ -f "$REPO/deployments.env" ]] || { echo "deployments.env missing — run make deploy-protocol first"; exit 1; }
-docker inspect "$NODE_CONTAINER" >/dev/null 2>&1 || { echo "container '$NODE_CONTAINER' not found — is the node up?"; exit 1; }
+[[ -n "$NODE_LOG_FILE" ]] || docker inspect "$NODE_CONTAINER" >/dev/null 2>&1 || { echo "container '$NODE_CONTAINER' not found — is the node up?"; exit 1; }
 L2_UP=$(cast block-number --rpc-url "$L2_RPC" 2>/dev/null || echo "")
 [[ -n "$L2_UP" ]] || { echo "L2 RPC $L2_RPC not reachable"; exit 1; }
 L1_UP=$(cast block-number --rpc-url "$L1_RPC" 2>/dev/null || echo "")
@@ -116,6 +128,38 @@ SETTER_PROXY=$(echo "$SETTER_OUT" | grep -oE 'EEZ_VALUE_PROXY=0x[0-9a-fA-F]{40}'
 [[ -n "$SETTER_PROXY" ]] || { echo "setter proxy create failed"; echo "$SETTER_OUT" | tail -30; exit 1; }
 echo "    setter proxy  = $SETTER_PROXY"
 
+# Return-value path: SetterWrapper(setter proxy) on L1 calls the proxy
+# internally, decodes the (changed,newValue) the composer synthesizes
+# back, and emits it as `Wrapped`. Proves the cross-chain CONTRACT-CALL
+# return value surfaces in an L1 log.
+echo "==> deploying SetterWrapper(setter proxy) on internal L1"
+WRAP_OUT=$(forge script script/DeploySetterWrapperL1.s.sol:DeploySetterWrapperL1 \
+    --sig "run(address)" "$SETTER_PROXY" \
+    --rpc-url "$L1_RPC" --broadcast --private-key "$EEZ_OPERATOR_KEY" --skip-simulation 2>&1) || true
+SETTER_WRAPPER=$(echo "$WRAP_OUT" | grep -oE 'EEZ_SETTER_WRAPPER=0x[0-9a-fA-F]{40}' | head -1 | cut -d= -f2)
+[[ -n "$SETTER_WRAPPER" ]] || { echo "SetterWrapper deploy failed"; echo "$WRAP_OUT" | tail -30; exit 1; }
+echo "    setter wrapper = $SETTER_WRAPPER"
+
+# No-return setter: identical to Value but setValue returns nothing
+# (empty returnData). Guards the cross-chain contract-call path for the
+# empty-return case alongside the return-bearing Value.
+echo "==> deploying ValueNoRet($VALUE_INITIAL) on L2"
+VNR_OUT=$(forge script script/DeployValueNoRetL2.s.sol:DeployValueNoRetL2 \
+    --sig "run(uint256)" "$VALUE_INITIAL" \
+    --rpc-url "$L2_RPC" --broadcast --private-key "$HH_KEY_2" --gas-price 0 --skip-simulation 2>&1) || true
+EEZ_VALUE_NORET_ADDRESS=$(echo "$VNR_OUT" | grep -oE 'EEZ_VALUE_NORET_ADDRESS=0x[0-9a-fA-F]{40}' | head -1 | cut -d= -f2)
+[[ -n "$EEZ_VALUE_NORET_ADDRESS" ]] || { echo "ValueNoRet deploy failed"; echo "$VNR_OUT" | tail -20; exit 1; }
+echo "    ValueNoRet @ $EEZ_VALUE_NORET_ADDRESS"
+NRET_INITIAL="$VALUE_INITIAL"
+
+echo "==> createCrossChainProxy(target=ValueNoRet) on internal L1"
+NRET_OUT=$(forge script script/CreateValueProxy.s.sol:CreateValueProxy \
+    --sig "run(address,address,uint256)" "$EEZ_REGISTRY_ADDRESS" "$EEZ_VALUE_NORET_ADDRESS" "$EEZ_ROLLUP_ID" \
+    --rpc-url "$L1_RPC" --broadcast --private-key "$EEZ_OPERATOR_KEY" --skip-simulation 2>&1) || true
+NRET_PROXY=$(echo "$NRET_OUT" | grep -oE 'EEZ_VALUE_PROXY=0x[0-9a-fA-F]{40}' | head -1 | cut -d= -f2)
+[[ -n "$NRET_PROXY" ]] || { echo "no-return proxy create failed"; echo "$NRET_OUT" | tail -30; exit 1; }
+echo "    no-return proxy = $NRET_PROXY"
+
 echo "==> createCrossChainProxy(target=L2_RECIPIENT) on internal L1"
 DEPOSIT_OUT=$(forge script script/CreateValueProxy.s.sol:CreateValueProxy \
     --sig "run(address,address,uint256)" "$EEZ_REGISTRY_ADDRESS" "$L2_RECIPIENT" "$EEZ_ROLLUP_ID" \
@@ -123,11 +167,36 @@ DEPOSIT_OUT=$(forge script script/CreateValueProxy.s.sol:CreateValueProxy \
 DEPOSIT_PROXY=$(echo "$DEPOSIT_OUT" | grep -oE 'EEZ_VALUE_PROXY=0x[0-9a-fA-F]{40}' | head -1 | cut -d= -f2)
 [[ -n "$DEPOSIT_PROXY" ]] || { echo "deposit proxy create failed"; echo "$DEPOSIT_OUT" | tail -30; exit 1; }
 echo "    deposit proxy = $DEPOSIT_PROXY"
+
+# ── Verify L1 contracts on Blockscout (best-effort) so their events show
+#    up DECODED in the explorer — chiefly the SetterWrapper `Wrapped` log
+#    carrying the cross-chain return value. Verify failures are
+#    non-fatal: chiado's canonical Blockscout only sees these once the
+#    embedded L1 has propagated them. ──────────────────────────────────
+if [[ -n "$BLOCKSCOUT_URL" ]]; then
+    echo "==> verifying L1 contracts on Blockscout ($BLOCKSCOUT_URL)"
+    bs_verify() {  # <addr> <path:Name> [abi-encoded-ctor-args]
+        local addr="$1" target="$2" ctor="${3:-}" args=()
+        [[ -n "$ctor" ]] && args=(--constructor-args "$ctor")
+        if timeout 90 forge verify-contract "$addr" "$target" \
+                --verifier blockscout --verifier-url "${BLOCKSCOUT_URL%/}/api/" \
+                --chain-id "$L1_CHAIN_ID" "${args[@]}" --watch >/dev/null 2>&1; then
+            echo "    ✓ verified $target @ $addr"
+        else
+            echo "    ⚠ verify $target @ $addr failed/queued (non-fatal)"
+        fi
+    }
+    bs_verify "$SETTER_WRAPPER" "src/SetterWrapper.sol:SetterWrapper" \
+        "$(cast abi-encode 'constructor(address)' "$SETTER_PROXY")"
+    echo "    decoded Wrapped logs → ${BLOCKSCOUT_URL%/}/address/$SETTER_WRAPPER?tab=logs"
+fi
 cd "$REPO"
 
 # ── Waves + filler ───────────────────────────────────────────────────
 TOTAL_DEPOSIT_SUM=0
 LAST_SETTER_VALUE=""
+LAST_WRAP_VALUE=""
+LAST_NRET_VALUE=""
 ALL_USER_TX_HASHES=()
 TX_META=()
 refresh_log; LOG_LINES_BEFORE=$(wc -l < "$NODE_LOG")
@@ -135,62 +204,99 @@ refresh_log; LOG_LINES_BEFORE=$(wc -l < "$NODE_LOG")
 submit_wave() {
     local WAVE_ID=$1; shift
     local OPS="$*"
-    local NONCE_START n=0 GP=2000000000 PG=1500000000
-    NONCE_START=$(retry cast nonce "$USER_ADDR" --rpc-url "$L1_RPC")
-    local RAW_TXS=() OP_KINDS=() OP_ARGS=()
+    local GP=2000000000 PG=1500000000 GL=600000 count=0
+    # One `cast send --async` per op, straight to the cross-chain ingress
+    # (which holds it for the next Sync slot). --async returns the tx hash
+    # without blocking on a receipt (the tx settles later on L1). No
+    # --chain-id / --nonce: cast send fetches both from the ingress, and the
+    # ingress serves the sender's L1 nonce (the tx executes on L1) — the
+    # per-wave drain means nothing's in flight, so the fetched nonce is right.
+    local CS=(--rpc-url "$INGRESS_RPC" --private-key "$EEZ_USER_KEY"
+              --gas-limit "$GL" --gas-price "$GP" --priority-gas-price "$PG" --async)
     for OP in $OPS; do
-        local KIND="${OP%%:*}" ARG="${OP##*:}" NN=$((NONCE_START + n)) RAW=""
-        OP_KINDS+=("$KIND"); OP_ARGS+=("$ARG")
+        local KIND="${OP%%:*}" ARG="${OP##*:}" H=""
         case "$KIND" in
-            set) RAW=$(cast mktx --chain-id "$L1_CHAIN_ID" --private-key "$EEZ_USER_KEY" --nonce "$NN" \
-                    --gas-limit 600000 --gas-price "$GP" --priority-gas-price "$PG" \
-                    "$SETTER_PROXY" 'setValue(uint256)' "$ARG" 2>&1); LAST_SETTER_VALUE="$ARG" ;;
-            dep) RAW=$(cast mktx --chain-id "$L1_CHAIN_ID" --private-key "$EEZ_USER_KEY" --nonce "$NN" \
-                    --gas-limit 600000 --gas-price "$GP" --priority-gas-price "$PG" --value "$ARG" \
-                    "$DEPOSIT_PROXY" 2>&1); TOTAL_DEPOSIT_SUM=$((TOTAL_DEPOSIT_SUM + ARG)) ;;
+            # Direct setter: EOA → proxy.setValue (return-bearing Value).
+            set)  H=$(cast send "$SETTER_PROXY"   'setValue(uint256)'     "$ARG" "${CS[@]}" 2>&1)
+                  LAST_SETTER_VALUE="$ARG" ;;
+            # Return-value path: EOA → SetterWrapper.setViaProxy → proxy.setValue;
+            # the wrapper decodes the (changed,newValue) tuple and emits `Wrapped`.
+            # Also sets Value, so it counts as a Value-setter for convergence.
+            wrap) H=$(cast send "$SETTER_WRAPPER" 'setViaProxy(uint256)' "$ARG" "${CS[@]}" 2>&1)
+                  LAST_SETTER_VALUE="$ARG"; LAST_WRAP_VALUE="$ARG" ;;
+            # No-return contract call: EOA → proxy.setValue on ValueNoRet (empty returnData).
+            nret) H=$(cast send "$NRET_PROXY"     'setValue(uint256)'     "$ARG" "${CS[@]}" 2>&1)
+                  LAST_NRET_VALUE="$ARG" ;;
+            # Deposit: EOA → deposit proxy with value (ETH to the L2 recipient).
+            dep)  H=$(cast send "$DEPOSIT_PROXY"  --value "$ARG" "${CS[@]}" 2>&1)
+                  TOTAL_DEPOSIT_SUM=$((TOTAL_DEPOSIT_SUM + ARG)) ;;
         esac
-        [[ "$RAW" =~ ^0x[0-9a-fA-F]+$ ]] || { echo "    ✗ mktx failed: $RAW"; exit 1; }
-        RAW_TXS+=("$RAW"); n=$((n + 1))
+        [[ "$H" =~ ^0x[0-9a-fA-F]{64}$ ]] || { echo "    ✗ cast send ($KIND) failed: $H"; exit 1; }
+        ALL_USER_TX_HASHES+=("$H"); TX_META+=("$H $KIND $ARG")
+        count=$((count + 1))
     done
-    for i in "${!RAW_TXS[@]}"; do
-        local H; H=$(cast keccak "${RAW_TXS[$i]}")
-        ALL_USER_TX_HASHES+=("$H"); TX_META+=("$H ${OP_KINDS[$i]} ${OP_ARGS[$i]}")
-        curl -s -X POST "$L2_RPC" -H 'Content-Type: application/json' \
-            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"${RAW_TXS[$i]}\"],\"id\":$i}" >/dev/null
-    done
-    echo "    wave $WAVE_ID submitted: ${#RAW_TXS[@]} ops [$OPS]"
+    echo "    wave $WAVE_ID submitted: $count ops [$OPS]"
 }
 
 submit_filler() {
     local COUNT=$1 NONCE_START
     NONCE_START=$(retry cast nonce "$HH_ADDR_2" --rpc-url "$L2_RPC")
     for ((j=0; j<COUNT; j++)); do
-        local NN=$((NONCE_START + j)) RAW
-        RAW=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_2" --nonce "$NN" \
-            --gas-limit 21000 --gas-price 1000000000 --priority-gas-price 1000000000 \
-            --value 100000000 "$FILLER_RECIPIENT" 2>&1)
-        [[ "$RAW" =~ ^0x[0-9a-fA-F]+$ ]] || break
-        curl -s -X POST "$L2_RPC" -H 'Content-Type: application/json' \
-            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$RAW\"],\"id\":99}" >/dev/null
+        local NN=$((NONCE_START + j))
+        # L2-only transfer straight to the L2 mempool via cast send --async.
+        # --nonce is explicit: these fire back-to-back faster than the node's
+        # nonce advances, so cast send can't auto-fetch a fresh one each time.
+        cast send "$FILLER_RECIPIENT" --value 100000000 \
+            --rpc-url "$L2_RPC" --private-key "$HH_KEY_2" --nonce "$NN" \
+            --gas-limit 21000 --gas-price 1000000000 --priority-gas-price 1000000000 --async >/dev/null 2>&1 || true
         sleep 1
     done
     echo "    filler: $COUNT L2-only transfers submitted"
 }
 
+# Op kinds: set=direct Value setter, wrap=return-value path (Value via
+# SetterWrapper, emits Wrapped), nret=no-return setter (ValueNoRet),
+# dep=deposit. Value range 1-7 (set/wrap), ValueNoRet range 11-15 (nret)
+# so the two converged values are distinguishable.
+#
+# ONE cross-chain op per wave: each is a postBatch through the composer's
+# one-in-flight gate (~15-18s to settle on chiado), and the wave cycle is
+# ~22s — so each settles before the next is submitted. Firing several
+# cross-chain ops per wave overruns the gate and head-of-lines the rest
+# (a known load issue, separate from correctness). Default WAVE_COUNT=5
+# exercises wrap (return) + nret (no-return) + set + two deposits; the
+# verdict's per-kind checks no-op for kinds a shorter run didn't fire.
 WAVE_OPS=(
-    "set:1 dep:50000000000000 set:2"
-    "dep:80000000000000 set:3 dep:30000000000000"
-    "set:4 dep:100000000000000"
-    "dep:40000000000000 set:5"
-    "set:6 dep:60000000000000 set:7"
+    "wrap:2"
+    "dep:50000000000000"
+    "nret:11"
+    "dep:80000000000000"
+    "set:7"
 )
 echo
 echo "==> firing $WAVE_COUNT waves (cross-chain ops via L2 ingress; postBatches bundler-routed)"
 for ((w=0; w<WAVE_COUNT; w++)); do
     submit_wave "$((w+1))" ${WAVE_OPS[$((w % ${#WAVE_OPS[@]}))]}
-    sleep 12
     submit_filler "$FILLER_PER_GAP"
-    sleep 8
+    # Drain before the next wave: each cross-chain op is a postBatch through
+    # the composer's one-in-flight gate. Submitting the next op before this
+    # one settles piles them up — under sustained load the bundles get
+    # dropped (target block passes) and only the tail survives. Wait for
+    # every cross-chain op so far to confirm on L1 (or a per-wave cap), so
+    # each runs on an effectively-idle gate like the single-op path.
+    drain_deadline=$((SECONDS + 90))
+    while (( SECONDS < drain_deadline )); do
+        pending=0
+        for H in "${ALL_USER_TX_HASHES[@]}"; do
+            s=$(timeout 3 curl -s -X POST -H 'Content-Type: application/json' \
+                --data "{\"jsonrpc\":\"2.0\",\"method\":\"eth_getTransactionReceipt\",\"params\":[\"$H\"],\"id\":1}" \
+                "$L1_RPC" 2>/dev/null | jq -r '.result.status // "x"' 2>/dev/null)
+            [[ "$s" == "0x1" ]] || pending=$((pending+1))
+        done
+        (( pending == 0 )) && break
+        sleep 4
+    done
+    echo "    wave $((w+1)) drained (${pending:-?} still pending)"
 done
 
 # ── Wait for L1 user_tx receipts ─────────────────────────────────────
@@ -231,8 +337,13 @@ PB_LOGS=$(cast logs --address "$EEZ_REGISTRY_ADDRESS" --from-block "$EEZ_REGISTR
     "$BATCH_POSTED_TOPIC" --rpc-url "$L1_RPC" --json 2>/dev/null)
 SYS_ADDR_LC=$(echo "$HH_ADDR_0" | tr 'A-Z' 'a-z')
 HEAD_BN=$(cast block-number --rpc-url "$L2_RPC")
+# Only recent blocks hold this run's cross-chain Sync blocks; scanning from
+# genesis is O(L2 height) and grows every run on a long-lived rollup. A
+# 1500-block window (~25 min at 1s) covers a test; the L1↔L2 check below
+# has a backward-scan fallback if a match falls outside it.
+SYNC_SCAN_FROM=$(( HEAD_BN > 1500 ? HEAD_BN - 1500 : 1 ))
 SYNC_BLOCKS=()
-for ((BN=1; BN<=HEAD_BN; BN++)); do
+for ((BN=SYNC_SCAN_FROM; BN<=HEAD_BN; BN++)); do
     SYS=$(cast block "$BN" --rpc-url "$L2_RPC" --json --full 2>/dev/null | \
         jq --arg sa "$SYS_ADDR_LC" '[.transactions[]? | select(.from | ascii_downcase == $sa)] | length' 2>/dev/null || echo 0)
     [[ "$SYS" != "0" ]] && SYNC_BLOCKS+=("$BN")
@@ -252,40 +363,113 @@ echo
 echo "==> L1 vs L2 stateRoot reconciliation"
 L1_TRACKED=$(cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint256)(address,bytes32,uint256)' "$EEZ_ROLLUP_ID" \
     --rpc-url "$L1_RPC" 2>/dev/null | sed -n '2p' | tr -d '[:space:]')
-LAST_SETTLED=$(sed 's/\x1b\[[0-9;]*m//g' "$NODE_LOG" 2>/dev/null \
-    | grep "bundle outcome observed" | grep "settled=true" \
-    | grep -oE "sync_height=[0-9]+" | grep -oE "[0-9]+" | sort -n | tail -1 || true)
-[[ -z "$LAST_SETTLED" ]] && { [[ ${#SYNC_BLOCKS[@]} -gt 0 ]] && LAST_SETTLED="${SYNC_BLOCKS[-1]}" || LAST_SETTLED=0; }
-L2_AT_LAST_SETTLED=$(cast block "$LAST_SETTLED" --rpc-url "$L2_RPC" --json | jq -r '.stateRoot')
-echo "    L1 rollups($EEZ_ROLLUP_ID).stateRoot                    = $L1_TRACKED"
-echo "    L2 actual stateRoot at last settled height $LAST_SETTLED = $L2_AT_LAST_SETTLED"
-L1_L2_OK=0
-if [[ "${L1_TRACKED,,}" == "${L2_AT_LAST_SETTLED,,}" ]]; then
-    echo "    ✓ L1 stored stateRoot == L2 actual at last settled Sync height"; L1_L2_OK=1
+echo "    L1 rollups($EEZ_ROLLUP_ID).stateRoot = $L1_TRACKED"
+# L1's stored root is the `newState` of the LAST CONFIRMED postBatch, whose
+# `to_block` is an L2 Sync block — so it must equal the L2 state root at one
+# of our Sync blocks. Find that block instead of comparing at a single
+# height: height-agnostic, independent of any (racy) node-log "settled"
+# line, and tolerant of the newest Sync block's postBatch not yet landing.
+L1_L2_OK=0; MATCH_BN=""
+for ((idx=${#SYNC_BLOCKS[@]}-1; idx>=0; idx--)); do
+    R=$(cast block "${SYNC_BLOCKS[$idx]}" --rpc-url "$L2_RPC" --json 2>/dev/null | jq -r '.stateRoot')
+    [[ "${R,,}" == "${L1_TRACKED,,}" ]] && { MATCH_BN="${SYNC_BLOCKS[$idx]}"; L1_L2_OK=1; break; }
+done
+if (( ! L1_L2_OK )); then
+    # Fallback: bounded backward scan (the matching Sync block may lack a
+    # system tx, or a postBatch may still be landing a few blocks back).
+    H=$(cast block-number --rpc-url "$L2_RPC")
+    for ((BN=H; BN > H-300 && BN>0; BN--)); do
+        R=$(cast block "$BN" --rpc-url "$L2_RPC" --json 2>/dev/null | jq -r '.stateRoot')
+        [[ "${R,,}" == "${L1_TRACKED,,}" ]] && { MATCH_BN="$BN"; L1_L2_OK=1; break; }
+    done
+fi
+if (( L1_L2_OK )); then
+    echo "    ✓ L1 stored stateRoot == L2 actual at Sync block $MATCH_BN"
 else
-    echo "    ✗ L1 ≠ L2 at last settled Sync height"
+    echo "    ✗ L1 stored stateRoot matches no recent L2 block — possible divergence"
 fi
 
 # ── Semantic effect checks (confirmed view) ──────────────────────────
 echo
 echo "==> semantic effect verification"
-LAST_CONFIRMED_SETTER=""; CONFIRMED_DEPOSIT_SUM=0
+LAST_CONFIRMED_SETTER=""; LAST_CONFIRMED_NRET=""; CONFIRMED_DEPOSIT_SUM=0
+CC_CALL_TOTAL=0; CC_CALL_CONFIRMED=0; CC_CALL_REVERTED=0
 for META in "${TX_META[@]}"; do
     read -r MH MKIND MARG <<< "$META"
-    if [[ "$(receipt_status "$MH")" == "1" ]]; then
-        [[ "$MKIND" == "set" ]] && LAST_CONFIRMED_SETTER="$MARG"
-        [[ "$MKIND" == "dep" ]] && CONFIRMED_DEPOSIT_SUM=$((CONFIRMED_DEPOSIT_SUM + MARG))
+    ST=$(receipt_status "$MH")
+    # Regression guard: every cross-chain CONTRACT call (set/wrap/nret)
+    # must land status=1. A REVERTED one (0x0) is the RollingHashMismatch
+    # signature — and the L2 effect can still apply via the stateDelta, so
+    # value() alone would mask it. An unconfirmed ("missing") one also
+    # fails the guard (a stuck/non-included call is not a pass).
+    case "$MKIND" in
+        set|wrap|nret)
+            CC_CALL_TOTAL=$((CC_CALL_TOTAL+1))
+            if [[ "$ST" == "1" ]]; then CC_CALL_CONFIRMED=$((CC_CALL_CONFIRMED+1))
+            elif [[ "$ST" == "0x0" ]]; then CC_CALL_REVERTED=$((CC_CALL_REVERTED+1)); echo "    ✗ reverted cross-chain $MKIND tx $MH (RollingHashMismatch?)"
+            else echo "    ✗ unconfirmed cross-chain $MKIND tx $MH (status=$ST)"; fi ;;
+    esac
+    if [[ "$ST" == "1" ]]; then
+        case "$MKIND" in
+            set|wrap) LAST_CONFIRMED_SETTER="$MARG" ;;   # both set Value
+            nret) LAST_CONFIRMED_NRET="$MARG" ;;
+            dep) CONFIRMED_DEPOSIT_SUM=$((CONFIRMED_DEPOSIT_SUM + MARG)) ;;
+        esac
     fi
 done
-echo "    confirmed view: last setter=$LAST_CONFIRMED_SETTER, deposit sum=$CONFIRMED_DEPOSIT_SUM (submitted: last=$LAST_SETTER_VALUE, sum=$TOTAL_DEPOSIT_SUM)"
+echo "    confirmed view: setter=$LAST_CONFIRMED_SETTER no-ret=$LAST_CONFIRMED_NRET deposit_sum=$CONFIRMED_DEPOSIT_SUM"
 VV=$(cast call "$EEZ_VALUE_ADDRESS" 'value()(uint256)' --rpc-url "$L2_RPC" 2>/dev/null || echo "")
+NV=$(cast call "$EEZ_VALUE_NORET_ADDRESS" 'value()(uint256)' --rpc-url "$L2_RPC" 2>/dev/null || echo "")
 RR=$(cast balance "$L2_RECIPIENT" --rpc-url "$L2_RPC")
 EXPECTED_RR=$((RECIPIENT_BEFORE + CONFIRMED_DEPOSIT_SUM))
-SETTER_OK=0; DEPOSIT_OK=0
-[[ -n "$LAST_CONFIRMED_SETTER" && "$VV" == "$LAST_CONFIRMED_SETTER" ]] && SETTER_OK=1
-[[ "$RR" == "$EXPECTED_RR" ]] && DEPOSIT_OK=1
-echo "    L2 Value.value() = $VV  (last confirmed setter: $LAST_CONFIRMED_SETTER)"
-[[ "$SETTER_OK" == "1" ]] && echo "    ✓ setter converged" || echo "    ✗ setter mismatch"
+
+# (1) Every cross-chain contract call landed status=1 — the rolling-hash guard.
+CC_TX_OK=0; [[ "$CC_CALL_TOTAL" -gt 0 && "$CC_CALL_CONFIRMED" -eq "$CC_CALL_TOTAL" ]] && CC_TX_OK=1
+[[ "$CC_TX_OK" == "1" ]] \
+    && echo "    ✓ all $CC_CALL_TOTAL cross-chain contract calls landed status=1 (no RollingHashMismatch)" \
+    || echo "    ✗ only $CC_CALL_CONFIRMED/$CC_CALL_TOTAL cross-chain contract calls landed ($CC_CALL_REVERTED reverted, $((CC_CALL_TOTAL-CC_CALL_CONFIRMED-CC_CALL_REVERTED)) unconfirmed)"
+
+# (2) Return-bearing setter (Value) converged. N/A if no set/wrap fired.
+SETTER_OK=0
+if [[ -z "$LAST_SETTER_VALUE" ]]; then SETTER_OK=1; echo "    – no set/wrap ops this run (Value check N/A)"
+else
+    [[ "$VV" == "$LAST_CONFIRMED_SETTER" ]] && SETTER_OK=1
+    echo "    Value.value()      = $VV  (last confirmed set/wrap: $LAST_CONFIRMED_SETTER)"
+    [[ "$SETTER_OK" == "1" ]] && echo "    ✓ return setter converged" || echo "    ✗ return setter mismatch"
+fi
+
+# (3) No-return setter (ValueNoRet) converged. N/A if no nret fired.
+NRET_OK=0
+if [[ -z "$LAST_NRET_VALUE" ]]; then NRET_OK=1; echo "    – no nret ops this run (ValueNoRet check N/A)"
+else
+    [[ "$NV" == "$LAST_CONFIRMED_NRET" ]] && NRET_OK=1
+    echo "    ValueNoRet.value() = $NV  (last confirmed nret: $LAST_CONFIRMED_NRET)"
+    [[ "$NRET_OK" == "1" ]] && echo "    ✓ no-return setter converged" || echo "    ✗ no-return setter mismatch"
+fi
+
+# (4) Return VALUE surfaced on L1: the latest SetterWrapper `Wrapped` log
+#     must carry ok=true and newValue == the value last sent via wrap.
+WRAP_OK=0
+if [[ -n "$LAST_WRAP_VALUE" ]]; then
+    WDATA=$(cast logs 'Wrapped(uint256,bool,bool,uint256)' --address "$SETTER_WRAPPER" \
+        --from-block "$EEZ_REGISTRY_DEPLOY_BLOCK" --to-block latest --rpc-url "$L1_RPC" --json 2>/dev/null \
+        | jq -r '.[-1].data // empty' 2>/dev/null)
+    if [[ "${#WDATA}" -ge 258 ]]; then
+        W_OK=$(echo "${WDATA:66:64}" | sed 's/^0*//'); W_OK=$((16#${W_OK:-0}))      # word1: ok
+        W_NEW=$(echo "${WDATA:194:64}" | sed 's/^0*//'); W_NEW=$((16#${W_NEW:-0}))  # word3: newValue
+        [[ "$W_OK" == "1" && "$W_NEW" == "$LAST_WRAP_VALUE" ]] && WRAP_OK=1
+        echo "    Wrapped(last): ok=$W_OK newValue=$W_NEW  (expected newValue=$LAST_WRAP_VALUE)"
+    else
+        echo "    Wrapped: no decodable event found"
+    fi
+    [[ "$WRAP_OK" == "1" ]] && echo "    ✓ cross-chain return value surfaced on L1 (Wrapped)" \
+        || echo "    ✗ Wrapped event missing/incorrect"
+else
+    WRAP_OK=1  # no wrap ops this run → not applicable
+fi
+
+# (5) Deposits converged.
+DEPOSIT_OK=0; [[ "$RR" == "$EXPECTED_RR" ]] && DEPOSIT_OK=1
 echo "    L2 recipient balance = $RR  (expected: $EXPECTED_RR)"
 [[ "$DEPOSIT_OK" == "1" ]] && echo "    ✓ deposits converged" || echo "    ✗ deposit mismatch"
 
@@ -307,7 +491,7 @@ fi
 # ── Verdict ──────────────────────────────────────────────────────────
 echo
 ALL_OK=1
-for ok in "$ALL_PB_OK" "$L1_L2_OK" "$SETTER_OK" "$DEPOSIT_OK" "$DIV_OK"; do
+for ok in "$ALL_PB_OK" "$L1_L2_OK" "$CC_TX_OK" "$SETTER_OK" "$NRET_OK" "$WRAP_OK" "$DEPOSIT_OK" "$DIV_OK"; do
     [[ "$ok" == "1" ]] || ALL_OK=0
 done
 if [[ "$ALL_OK" == "1" ]]; then
