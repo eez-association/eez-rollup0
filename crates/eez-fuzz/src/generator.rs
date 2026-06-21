@@ -55,10 +55,28 @@ pub struct Dict {
     pub keys: Vec<PrivateKeySigner>,
 }
 
+/// Which chain is the *entry* (source) of the user tx — the byte the fuzzer
+/// flips to explore the two cross-chain directions.
+///
+/// - [`L1ToL2`](Direction::L1ToL2): the only direction the composer implements
+///   today — a user tx on L1 that hits an L1 proxy and dispatches into L2.
+/// - [`L2ToL1`](Direction::L2ToL1): the direction raised in review (an L2 tx
+///   that calls a proxy of an L1 contract). The composer has **no L2-as-entry
+///   settling path**; selecting this bit drives the harness onto that
+///   unimplemented path so a campaign can capture what actually happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Arbitrary)]
+pub enum Direction {
+    L1ToL2,
+    L2ToL1,
+}
+
 /// Structure-aware fuzz input: indices into the dict + typed leaves. Fixed
 /// width keeps libFuzzer mutations byte-stable (one byte → one choice).
 #[derive(Debug, Arbitrary)]
 pub struct FuzzTx {
+    /// Cross-chain direction selector (see [`Direction`]). First field so the
+    /// leading input byte toggles direction — a 1-bit coverage gradient.
+    pub direction: Direction,
     pub trigger_sel: u16,
     pub method_sel: u8,
     pub signer_sel: u8,

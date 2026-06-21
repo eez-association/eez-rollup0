@@ -25,11 +25,14 @@ fn corpus(target: &str) -> Vec<Vec<u8>> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replay_compose_corpus() {
-    let world = World::boot();
-    let dict = world.dict();
+    // One world per direction — the input's `Direction` bit picks the entry.
+    let l1 = World::boot();
+    let l1_dict = l1.dict();
+    let l2 = World::boot_l2_entry();
+    let l2_dict = l2.dict();
     let cases = corpus("compose");
     for data in &cases {
-        replay_compose(&world, &dict, data).await;
+        replay_compose(&l1, &l1_dict, &l2, &l2_dict, data).await;
     }
     assert!(!cases.is_empty(), "no committed compose corpus to replay");
 }

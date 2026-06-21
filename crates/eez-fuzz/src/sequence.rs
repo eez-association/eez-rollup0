@@ -628,6 +628,8 @@ mod tests {
 
     fn interact(trigger: u16, v: u128) -> Op {
         Op::Interact(FuzzTx {
+            // The op-sequence harness drives the L1-entry world.
+            direction: crate::Direction::L1ToL2,
             trigger_sel: trigger,
             method_sel: 0,
             signer_sel: 0,

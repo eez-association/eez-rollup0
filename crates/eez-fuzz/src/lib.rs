@@ -415,6 +415,12 @@ pub struct World {
     /// composer's claimed return data) is what catches "the cross-chain call
     /// never really ran" past a mock prover.
     pub value_l2: Address,
+    /// Which registered rollup is the composition *entry* (where the source tx
+    /// is simulated). `RollupId(0)` (L1) for the implemented L1→L2 direction;
+    /// `RollupId(L2_ROLLUP_ID)` for the L2→L1 direction built by
+    /// [`World::boot_l2_entry`]. `compose` passes this to `compose_transaction`
+    /// and `rollups` hands the entry client to whichever id matches.
+    pub entry_id: RollupId,
 }
 
 impl World {
@@ -483,6 +489,67 @@ impl World {
                 calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
             }],
             chain_id: reth_chainspec::DEV.chain.id(),
+            entry_id: RollupId(0),
+        }
+    }
+
+    /// **L2→L1 entry world** — the direction the composer does *not* implement.
+    ///
+    /// Same contracts as [`boot_nested`](World::boot_nested), but the roles are
+    /// reversed: the **L2** chain is the entry (a user tx originates there) and
+    /// **L1** is the follower target. The L2 trigger is `NestedValue`, whose
+    /// `setValue(v)` calls `innerProxy` — an L2-side `CrossChainProxy` for
+    /// `InnerValue`@L1 (rollup 0). So a source tx to `NestedValue.setValue` is
+    /// exactly "an L2 tx that calls a proxy of an L1 contract".
+    ///
+    /// The composer's `finalize` skips the entry rollup and CCM-verifies every
+    /// follower; here the follower is an `EvmL1Style` chain, which has no
+    /// `loadExecutionTable` / `executeIncomingCrossChainCall` system-tx path —
+    /// so this boot drives the harness straight onto the unimplemented path.
+    /// `value_l2` is repurposed as the L1 settle target (`InnerValue`@L1).
+    pub fn boot_l2_entry() -> Self {
+        // InnerValue is the first CREATE in the L1 boot → deterministic
+        // `DEPLOYER.create(0)`, which the L2 `innerProxy` targets.
+        let inner_value_l1 = DEPLOYER.create(0);
+        let (l2_provider, nested_value, eezl2) = boot_l2_world_nested(inner_value_l1);
+        let (l1_provider, eez, _proxy, _setter) = boot_l1_world_nested(nested_value);
+
+        let chain_spec = reth_chainspec::DEV.clone();
+        let evm_config = EthEvmConfig::new(chain_spec.clone());
+        // Entry = L2 (EvmL2Style): source sim runs here, reads
+        // `EEZL2.authorizedProxies` and detects `innerProxy`.
+        let entry = LocalChainClient::new_entry(
+            l2_provider.clone(),
+            evm_config.clone(),
+            chain_spec.clone(),
+            RollupId(L2_ROLLUP_ID),
+            eezl2,
+            eezl2,
+            ChainDialect::EvmL2Style,
+        );
+        // Follower = L1 (EvmL1Style): the dispatch target (rollup 0).
+        let follower = LocalChainClient::new_follower(
+            l1_provider,
+            evm_config,
+            chain_spec,
+            RollupId(0),
+            eez,
+            eez,
+            ChainDialect::EvmL1Style,
+        );
+        World {
+            entry,
+            follower,
+            eez,
+            eezl2,
+            l2_provider,
+            value_l2: inner_value_l1,
+            triggers: vec![Trigger {
+                address: nested_value,
+                calls: vec![CallSpec::from_sig("setValue(uint256)", 1)],
+            }],
+            chain_id: reth_chainspec::DEV.chain.id(),
+            entry_id: RollupId(L2_ROLLUP_ID),
         }
     }
 
@@ -496,16 +563,29 @@ impl World {
     }
 
     /// Rebuild the per-call rollups map (cheap: `Arc` clones + a 2-entry map).
+    ///
+    /// The per-rollup *config* is fixed by id (rollup 0 = L1/`EvmL1Style`,
+    /// rollup 1 = L2/`EvmL2Style`); only the *client* depends on direction —
+    /// the `EntryChainClient` (`self.entry`) is slotted under `self.entry_id`
+    /// and the follower client under the other id. For the L1→L2 boot this
+    /// reproduces the original map exactly.
     pub fn rollups(&self) -> HashMap<RollupId, Rollup<EvmProtocol>> {
         let entry_cc: Arc<dyn ChainClient<Protocol = EvmProtocol> + Send + Sync> =
             self.entry.clone();
         let follower_cc: Arc<dyn ChainClient<Protocol = EvmProtocol> + Send + Sync> =
             self.follower.clone();
+        let client_for = |id: RollupId| {
+            if id == self.entry_id {
+                entry_cc.clone()
+            } else {
+                follower_cc.clone()
+            }
+        };
         let mut m = HashMap::new();
         m.insert(
             RollupId(0),
             Rollup {
-                client: entry_cc,
+                client: client_for(RollupId(0)),
                 session: None,
                 config: target_cfg(self.eez, Address::ZERO, ChainDialect::EvmL1Style),
                 initial_state_root: [0u8; 32],
@@ -514,7 +594,7 @@ impl World {
         m.insert(
             RollupId(L2_ROLLUP_ID),
             Rollup {
-                client: follower_cc,
+                client: client_for(RollupId(L2_ROLLUP_ID)),
                 session: None,
                 config: target_cfg(self.eezl2, SYSTEM_ADDR, ChainDialect::EvmL2Style),
                 initial_state_root: [0u8; 32],
@@ -523,7 +603,9 @@ impl World {
         m
     }
 
-    /// Drive the function under test against the frozen world.
+    /// Drive the function under test against the frozen world, entering on
+    /// `self.entry_id` (L1 for the implemented direction, L2 for the
+    /// unimplemented L2→L1 direction).
     pub async fn compose(&self, raw_tx: &[u8]) -> CompositionResult<Composition<EvmProtocol>> {
         let entry_ec: Arc<dyn EntryChainClient<Protocol = EvmProtocol> + Send + Sync> =
             self.entry.clone();
@@ -531,9 +613,64 @@ impl World {
             &EvmProtocol,
             entry_ec.as_ref(),
             raw_tx,
-            RollupId(0),
+            self.entry_id,
             self.rollups(),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod direction_tests {
+    use super::*;
+
+    /// One synthetic `FuzzTx`, both directions resolved against the matching
+    /// world dict. Mirrors what the `compose` fuzz target does per input.
+    fn tx(direction: Direction) -> FuzzTx {
+        FuzzTx {
+            direction,
+            trigger_sel: 0,
+            method_sel: 0,
+            signer_sel: 0,
+            nonce: 0,
+            value: 0,
+            args: [7, 0, 0, 0],
+        }
+    }
+
+    /// Baseline: the implemented L1→L2 direction composes AND its L2 inbound
+    /// ratifies + settles the destination — proves the harness/oracle work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn l1_to_l2_composes_and_settles() {
+        let world = World::boot();
+        let (raw, expected) = tx(Direction::L1ToL2).resolve_and_sign(&world.dict());
+        let comp = world.compose(&raw).await.expect("L1→L2 must compose");
+        world.assert_executes_and_ratifies(&comp, Some(expected));
+    }
+
+    /// The direction under review (an L2 tx that calls a proxy of an L1
+    /// contract). Locks the CURRENT reality: the composer has no L2-as-entry
+    /// settling path, so dispatching the L2→L1 call drives the `EvmL1Style`
+    /// follower onto a path it can't honor and `compose` returns `Err`
+    /// (`target transaction 0 reverted`). This is the "ignored / reverts in L2"
+    /// case from review, now reproduced deterministically. The day the composer
+    /// grows real L2→L1 support, this test flips and tells us so.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn l2_to_l1_is_rejected_today() {
+        let world = World::boot_l2_entry();
+        let (raw, _expected) = tx(Direction::L2ToL1).resolve_and_sign(&world.dict());
+        let res = world.compose(&raw).await;
+        assert!(
+            res.is_err(),
+            "L2→L1 unexpectedly produced a composition — the direction may now \
+             be supported; revisit the oracle. Got: {res:?}",
+        );
+        // Pin the shape of the rejection so a *different* failure mode (e.g. a
+        // panic, or a silently-empty Ok) is caught as a regression.
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("reverted"),
+            "L2→L1 rejected, but not via the expected target-revert path: {msg}",
+        );
     }
 }
