@@ -94,6 +94,19 @@ pub fn boot<R>(
     (freeze(evm.db()), out)
 }
 
+/// Assert the frozen provider serves non-empty code at each address — the
+/// fixture's structural invariant, checked on every boot (so the revm-deploy →
+/// snapshot bridge is validated everywhere, with no standalone "world boots" test).
+fn assert_world_has_code(provider: &MockEthProvider, addrs: &[Address]) {
+    let state = provider.latest().expect("latest state");
+    for a in addrs {
+        assert!(
+            state.account_code(a).expect("account_code").is_some_and(|c| !c.is_empty()),
+            "fixture invariant: frozen world must serve code at {a}",
+        );
+    }
+}
+
 /// L2 follower world: `Value` (deployed first → deterministic address) + EEZL2.
 pub fn boot_l2_world() -> (MockEthProvider, Address, Address) {
     let (provider, (value, eezl2)) = boot(|send| {
@@ -112,6 +125,7 @@ pub fn boot_l2_world() -> (MockEthProvider, Address, Address) {
         ));
         (value, eezl2)
     });
+    assert_world_has_code(&provider, &[value, eezl2]);
     (provider, value, eezl2)
 }
 
@@ -228,6 +242,8 @@ pub fn call_output(r: ExecutionResult) -> Bytes {
 /// provider and `(eez, proxy, setter)`.
 pub fn boot_l1_world(value_l2: Address) -> (MockEthProvider, Address, Address, Address) {
     let (provider, (eez, proxy, setter)) = boot(|send| build_l1_world(send, value_l2));
+    assert_world_has_code(&provider, &[eez, setter]);
+    assert_ne!(proxy, Address::ZERO, "fixture invariant: proxy registered");
     (provider, eez, proxy, setter)
 }
 

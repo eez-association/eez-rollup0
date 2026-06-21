@@ -5,89 +5,10 @@
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::{Transaction, TxEnvelope};
 use alloy_eips::eip2718::Decodable2718;
-use alloy_primitives::{Address, B256, TxKind, U256};
+use alloy_primitives::{Address, B256, U256};
 use alloy_signer_local::PrivateKeySigner;
 use arbitrary::{Arbitrary, Unstructured};
 use eez_fuzz::*;
-use reth_storage_api::StateProviderFactory;
-use revm::context::ContextTr;
-use revm::context::TxEnv;
-use revm::context::result::{ExecutionResult, Output};
-use revm::database::{CacheDB, EmptyDB};
-use revm::state::AccountInfo;
-use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
-
-#[test]
-fn boot_l2_world_deploys_target() {
-    let (provider, value, eezl2) = boot_l2_world();
-    let state = provider.latest().expect("latest");
-    assert!(
-        state.account_code(&value).expect("code").is_some_and(|c| !c.is_empty()),
-        "L2 world serves Value code",
-    );
-    assert!(
-        state.account_code(&eezl2).expect("code").is_some_and(|c| !c.is_empty()),
-        "L2 world serves EEZL2 code",
-    );
-}
-
-#[test]
-fn bridge_deploy_snapshot_readback() {
-    // Fund the deployer in a fresh in-memory DB.
-    let mut cache = CacheDB::<EmptyDB>::default();
-    cache.insert_account_info(
-        DEPLOYER,
-        AccountInfo {
-            balance: U256::from(10u128).pow(U256::from(24u8)),
-            nonce: 0,
-            ..Default::default()
-        },
-    );
-
-    // Deploy `Value` via revm. Append the ABI-encoded `constructor(uint256)`.
-    let mut evm = Context::mainnet().with_db(cache).build_mainnet();
-    let mut data = creation_bytecode("contracts/out/Value.sol/Value.json").to_vec();
-    data.extend_from_slice(&B256::ZERO.0); // uint256 initial = 0
-    let tx = TxEnv {
-        caller: DEPLOYER,
-        kind: TxKind::Create,
-        data: data.into(),
-        gas_limit: 8_000_000,
-        nonce: 0,
-        chain_id: Some(1),
-        ..Default::default()
-    };
-    let value_addr = match evm.transact_commit(tx).expect("deploy tx") {
-        ExecutionResult::Success {
-            output: Output::Create(_, Some(addr)),
-            ..
-        } => addr,
-        other => panic!("deploy did not create a contract: {other:?}"),
-    };
-
-    let provider = freeze(evm.db());
-    let state = provider.latest().expect("latest state");
-    let code = state.account_code(&value_addr).expect("account_code");
-    assert!(
-        code.is_some_and(|c| !c.is_empty()),
-        "MockEthProvider must serve the deployed Value runtime code",
-    );
-}
-
-#[test]
-fn boot_l1_world_registers_proxy() {
-    let (provider, eez, proxy, setter) = boot_l1_world(VALUE_L2_ADDR);
-    let state = provider.latest().expect("latest");
-    assert!(
-        state.account_code(&eez).expect("code").is_some_and(|c| !c.is_empty()),
-        "frozen world serves EEZ code",
-    );
-    assert!(
-        state.account_code(&setter).expect("code").is_some_and(|c| !c.is_empty()),
-        "frozen world serves SetterWrapper code",
-    );
-    assert_ne!(proxy, Address::ZERO, "proxy registered");
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compose_setter_via_proxy() {
