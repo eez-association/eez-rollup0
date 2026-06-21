@@ -47,6 +47,10 @@ pub enum Op {
     /// Wrap a deployed value (by index) in an L1 proxy + `SetterWrapper` →
     /// grows the live trigger dict.
     RegisterProxy { value_idx: u16 },
+    /// Like `RegisterProxy` but with a `MultiSetterWrapper` that reaches the
+    /// proxy TWICE in one tx → the composer records two cross-chain entries
+    /// with the same `proxyEntryHash` (multi-entry / sequential-cursor path).
+    RegisterMultiCall { value_idx: u16 },
     /// Fire a user tx through a live trigger (the single-tx generator).
     Interact(FuzzTx),
     /// Build an L2→L1 relay: `InnerValue` on L1, an L2-side proxy for it
@@ -384,6 +388,38 @@ impl SeqWorld {
                     });
                     self.settle_targets.push(value);
                 }
+                Op::RegisterMultiCall { value_idx } => {
+                    if self.values.is_empty() {
+                        continue;
+                    }
+                    let value = self.values[(value_idx as usize) % self.values.len()];
+                    let proxy = Address::abi_decode(&call_output(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Call(self.eez),
+                        createCrossChainProxyCall {
+                            originalAddress: value,
+                            originalRollupId: U256::from(L2_ROLLUP_ID),
+                        }
+                        .abi_encode(),
+                    )))
+                    .expect("decode proxy");
+                    // MultiSetterWrapper reaches the proxy twice → two same-hash entries.
+                    let setter = created(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init(
+                            "contracts/out/MultiSetterWrapper.sol/MultiSetterWrapper.json",
+                            (proxy,).abi_encode_params(),
+                        ),
+                    ));
+                    self.dict.triggers.push(Trigger {
+                        address: setter,
+                        calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
+                    });
+                    self.settle_targets.push(value);
+                }
                 Op::DeployRelayToL1 => {
                     // L1 inner target.
                     let inner_l1 = created(run_tx(
@@ -464,5 +500,40 @@ impl SeqWorld {
         for (target, want) in &self.expected {
             assert_eq!(read_slot0(&self.l2, *target), *want, "cumulative: target {target}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interact(trigger: u16, v: u128) -> Op {
+        Op::Interact(FuzzTx {
+            trigger_sel: trigger,
+            method_sel: 0,
+            signer_sel: 0,
+            nonce: 0,
+            value: 0,
+            args: [v, 0, 0, 0],
+        })
+    }
+
+    /// `RegisterMultiCall`'s trigger reaches the proxy twice; the composer must
+    /// produce a multi-entry composition that still settles the target to `v`
+    /// (last write wins). Asserts it actually composed + settled (a compose
+    /// error would leave slot-0 at 0 and fail here, not silently skip).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multicall_op_settles_target() {
+        let base = SeqWorld::boot_base();
+        let mut w = SeqWorld::fork(&base);
+        w.run(Program {
+            ops: vec![Op::Deploy, Op::RegisterMultiCall { value_idx: 0 }, interact(0, 42)],
+        })
+        .await;
+        assert_eq!(
+            read_slot0(&w.l2, w.settle_targets[0]),
+            U256::from(42u64),
+            "multi-call trigger must compose + settle the target to v",
+        );
     }
 }
