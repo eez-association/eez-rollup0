@@ -51,5 +51,20 @@ thiserror.workspace   = true
 tokio.workspace       = true
 tracing.workspace     = true
 
+[dev-dependencies]
+# In-process reth provider for the compose_transaction e2e/fuzz harness:
+# deploy the cross-chain world in revm, snapshot into MockEthProvider, then
+# build LocalChainClient over it (see tests/compose_e2e.rs).
+reth-provider = { workspace = true, features = ["test-utils"] }
+# `testing` feature exposes eez-protocol test doubles if needed.
+eez-protocol = { workspace = true, features = ["testing"] }
+# read forge creation bytecode from contracts/out/*.json at runtime.
+serde_json.workspace = true
+# surface simulate_source_tx tracing in the e2e harness while diagnosing.
+tracing-subscriber.workspace = true
+# structure-aware raw_tx generator: derive Arbitrary over a typed fuzz input
+# and resolve dictionary indices into live proxies (see tests/compose_e2e.rs).
+arbitrary = { version = "1", features = ["derive"] }
+
 [lints]
 workspace = true
