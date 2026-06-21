@@ -82,3 +82,31 @@ sequence of ops (`deploy` / `register_proxy` / `user_tx`) over persistent state.
 - **Depth objective.** Feed the inspector's own counters (`proxy_lookups`, `recorded_count`,
   `frame_starts` LIFO depth) as a maximization objective = deepest *ratifying* dispatch (oracle-gated),
   plus overlay push/pop imbalance as the bug oracle. Edge coverage alone is flat across depth.
+
+## Status (tests/compose_e2e.rs)
+
+Implemented + green (`cargo test -p eez-composer --test compose_e2e`):
+- World boot (L1 EEZ+Rollup+proxy+SetterWrapper / L2 Value+EEZL2), frozen providers, production
+  `LocalChainClient`s; `compose_transaction` driven against them.
+- **Structure-aware generator** (`FuzzTx`): `Arbitrary` over dictionary indices
+  (trigger/method/signer) + typed leaves — address space restricted by construction.
+  `CallSpec.payable` gates `msg.value` (non-payable triggers must get value 0, else `EmptyCalls`).
+- **Execute+ratify oracle** (`assert_executes_and_ratifies`): replays the composition's own L2
+  payloads against the frozen bytecode — `executeIncomingCrossChainCall` checks rolling hash +
+  overlay pairing, so a no-revert ratifies the target. L1 source is a *structural* check only: the
+  composer emits the batch UNSIGNED and `EEZ.sol:435` reverts `InvalidProofSystemConfig` on it
+  (proof-signing is downstream; `SIGNER` has no key here).
+
+Findings / open edges (hit while building depth-2 nesting — `compose_nested_depth2_ratifies`, `#[ignore]`):
+- Composer rejects **same-rollup reentry** (`InvalidReentry`, `composition.rs:734`) — nesting must be
+  cross-rollup.
+- Cross-rollup L2→**entry**-rollup nesting then fails in the entry-overlay diff-apply:
+  `"SELFDESTRUCT mutation at 0x0: out of scope for overlay diff-apply"` — our contracts never
+  SELFDESTRUCT, so this is a real composer overlay edge worth a focused look.
+- Next step to make depth-2 green: target a **3rd non-entry rollup** (`RollupId(2)` follower) to avoid
+  the entry-overlay path.
+
+Not yet done:
+- Promote the in-tree deterministic seed loop (`fuzz_compose_dictionary`) to a real coverage-guided
+  `cargo-fuzz` target. Needs the World+generator extracted to a lib (tests/ can't be imported by a
+  fuzz crate) + `cargo install cargo-fuzz`.
