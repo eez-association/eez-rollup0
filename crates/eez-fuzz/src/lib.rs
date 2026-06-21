@@ -41,6 +41,9 @@ pub use generator::*;
 
 mod assertions;
 pub use assertions::*;
+
+mod sequence;
+pub use sequence::*;
 sol! {
     function registerRollup(address rollupContract, bytes32 initialState) external returns (uint256);
     function createCrossChainProxy(address originalAddress, uint256 originalRollupId) external returns (address);

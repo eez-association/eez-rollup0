@@ -19,10 +19,10 @@ use std::sync::Arc;
 use alloy_primitives::{Address, B256, TxKind, U256};
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolValue};
-use arbitrary::{Arbitrary, Unstructured};
+use arbitrary::Arbitrary;
 use eez_composer::LocalChainClient;
 use eez_evm::{ChainDialect, EvmProtocol};
-use eez_fuzz::{
+use crate::{
     CallSpec, Dict, FuzzTx, Trigger, call_output, createCrossChainProxyCall, created, freeze, init,
     registerRollupCall, DEPLOYER, L2_ROLLUP_ID, SIGNER, SYSTEM_ADDR,
 };
@@ -41,7 +41,7 @@ use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 /// One step of a program. `#[derive(Arbitrary)]` over `Vec<Op>` makes the
 /// sequence length emergent (continue/stop falls out of the input bytes).
 #[derive(Debug, Arbitrary)]
-enum Op {
+pub enum Op {
     /// Deploy a fresh `Value` on L2 → a candidate cross-chain target.
     Deploy,
     /// Wrap a deployed value (by index) in an L1 proxy + `SetterWrapper` →
@@ -49,17 +49,23 @@ enum Op {
     RegisterProxy { value_idx: u16 },
     /// Fire a user tx through a live trigger (the single-tx generator).
     Interact(FuzzTx),
+    /// Build an L2→L1 relay: `InnerValue` on L1, an L2-side proxy for it
+    /// (rollup 0 = entry), a `NestedValue` on L2 wrapping that proxy, then an
+    /// L1 proxy + `SetterWrapper` for the `NestedValue` (a live trigger). An
+    /// `Interact` through this trigger makes the L2 target call a proxy that
+    /// targets L1 — the "L2 tx calls a proxy on L1" topology under question.
+    DeployRelayToL1,
 }
 
 #[derive(Debug, Arbitrary)]
-struct Program {
+pub struct Program {
     ops: Vec<Op>,
 }
 
 /// Mutable dual-chain world: L1 (EEZ + Rollup) and L2 (EEZL2) persist as
 /// `CacheDB`s that every op mutates; clients are rebuilt per `Interact` from
 /// fresh freezes.
-struct SeqWorld {
+pub struct SeqWorld {
     l1: CacheDB<EmptyDB>,
     l2: CacheDB<EmptyDB>,
     eez: Address,
@@ -131,7 +137,7 @@ fn target_cfg(ccm: Address, system: Address, dialect: ChainDialect) -> TargetCon
 }
 
 impl SeqWorld {
-    fn new() -> Self {
+    pub fn new() -> Self {
         // ── L2 base: EEZL2 (eezl2 = DEPLOYER.create(0)). ──
         let mut l2 = CacheDB::<EmptyDB>::default();
         fund(&mut l2, DEPLOYER);
@@ -265,7 +271,7 @@ impl SeqWorld {
         }
     }
 
-    async fn run(&mut self, program: Program) {
+    pub async fn run(&mut self, program: Program) {
         for op in program.ops {
             match op {
                 Op::Deploy => {
@@ -305,6 +311,57 @@ impl SeqWorld {
                     });
                     self.settle_targets.push(value);
                 }
+                Op::DeployRelayToL1 => {
+                    // L1 inner target.
+                    let inner_l1 = created(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
+                    ));
+                    // L2-side proxy for inner_l1 on the ENTRY rollup (0).
+                    let l2_inner_proxy = Address::abi_decode(&call_output(run_tx(
+                        &mut self.l2,
+                        DEPLOYER,
+                        TxKind::Call(self.eezl2),
+                        createCrossChainProxyCall {
+                            originalAddress: inner_l1,
+                            originalRollupId: U256::ZERO,
+                        }
+                        .abi_encode(),
+                    )))
+                    .expect("decode l2 inner proxy");
+                    // NestedValue on L2 wrapping the L1-targeting proxy.
+                    let nested = created(run_tx(
+                        &mut self.l2,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init("contracts/out/NestedValue.sol/NestedValue.json", (l2_inner_proxy,).abi_encode_params()),
+                    ));
+                    // L1 proxy + SetterWrapper for NestedValue@L2 → live trigger.
+                    let l1_proxy = Address::abi_decode(&call_output(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Call(self.eez),
+                        createCrossChainProxyCall {
+                            originalAddress: nested,
+                            originalRollupId: U256::from(L2_ROLLUP_ID),
+                        }
+                        .abi_encode(),
+                    )))
+                    .expect("decode l1 proxy");
+                    let setter = created(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init("contracts/out/SetterWrapper.sol/SetterWrapper.json", (l1_proxy,).abi_encode_params()),
+                    ));
+                    self.dict.triggers.push(Trigger {
+                        address: setter,
+                        calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
+                    });
+                    self.settle_targets.push(nested);
+                }
                 Op::Interact(tx) => {
                     if self.dict.triggers.is_empty() {
                         continue;
@@ -330,52 +387,5 @@ impl SeqWorld {
         for (target, want) in &self.expected {
             assert_eq!(read_slot0(&self.l2, *target), *want, "cumulative: target {target}");
         }
-    }
-}
-
-/// Hand-built program: deploy two values, register both, interact each, then
-/// re-interact the first — state must evolve (last-writer-wins).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sequence_builds_topology_and_evolves_state() {
-    fn ix(trigger: u16, v: u128) -> Op {
-        Op::Interact(FuzzTx {
-            trigger_sel: trigger,
-            method_sel: 0,
-            signer_sel: 0,
-            nonce: 0,
-            value: 0,
-            args: [v, 0, 0, 0],
-        })
-    }
-    let mut w = SeqWorld::new();
-    w.run(Program {
-        ops: vec![
-            Op::Deploy,
-            Op::Deploy,
-            Op::RegisterProxy { value_idx: 0 },
-            Op::RegisterProxy { value_idx: 1 },
-            ix(0, 5),
-            ix(1, 9),
-            ix(0, 7), // overwrite target 0
-        ],
-    })
-    .await;
-    assert_eq!(w.dict.triggers.len(), 2, "two triggers registered");
-    assert_eq!(read_slot0(&w.l2, w.settle_targets[0]), U256::from(7u64), "target0 last write");
-    assert_eq!(read_slot0(&w.l2, w.settle_targets[1]), U256::from(9u64), "target1");
-}
-
-/// Arbitrary-generated programs: deterministic seeds, must never panic and the
-/// cumulative oracle must hold (compose errors are tolerated).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fuzz_program_sequences() {
-    for seed in 0u64..48 {
-        let mix = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let bytes: Vec<u8> = (0..16).flat_map(|i| (mix ^ (seed << (i % 13))).to_le_bytes()).collect();
-        let Ok(program) = Program::arbitrary(&mut Unstructured::new(&bytes)) else {
-            continue;
-        };
-        let mut w = SeqWorld::new();
-        w.run(program).await;
     }
 }

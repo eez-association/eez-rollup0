@@ -19,6 +19,13 @@ path = "fuzz_targets/compose.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "program"
+path = "fuzz_targets/program.rs"
+test = false
+doc = false
+bench = false
 # NOTE: intentionally NOT its own `[workspace]` — it's a member of the root
 # workspace (see root Cargo.toml `default-members`) so it shares the single
 # Cargo.lock. A separate workspace re-resolves deps and pulls duplicate
