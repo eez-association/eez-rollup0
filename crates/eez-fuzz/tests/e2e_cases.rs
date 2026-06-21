@@ -60,6 +60,15 @@ async fn settle_balance(ops: Vec<Op>, idx: usize) -> U256 {
     w.target_balance(idx)
 }
 
+/// Like [`settle`] but each step carries an explicit DIRECTION — for ports that
+/// enter on L2 (`*L2`). `target_value` reads the chain the target settles on.
+async fn settle_mixed(steps: Vec<(Op, Direction)>, idx: usize) -> U256 {
+    let base = SeqWorld::boot_base();
+    let mut w = SeqWorld::fork(&base);
+    w.run(Program::mixed(steps)).await;
+    w.target_value(idx)
+}
+
 // ─────────────────────────── passing (regression) ───────────────────────────
 
 /// `counter` — L1→L2 single deferred entry. The pre-registered base trigger
@@ -108,6 +117,19 @@ async fn revert_continue() {
         U256::from(8u64),
         "even settles to 8; odd reverts and leaves it"
     );
+}
+
+/// `RegisterProxy` in the L1→L2 direction (the bidirectional op's implemented
+/// side): deploy a `Value`, wrap it in an L1 proxy + `SetterWrapper`, settle it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn register_proxy_l1() {
+    // Deploy → pool idx 1; RegisterProxy registers trigger idx 1.
+    let p = vec![
+        Op::Deploy,
+        Op::RegisterProxy { value_idx: 1 },
+        interact(1, 5),
+    ];
+    assert_eq!(settle(p, 1).await, U256::from(5u64));
 }
 
 // ─────────────────────── expected-fail (composer gaps) ───────────────────────
@@ -183,15 +205,34 @@ async fn bridge() {
     );
 }
 
+/// `counterL2` (`*L2`) — the L2-as-entry direction: a user tx on L2 hits an L2
+/// proxy of an L1 `Value`. Expressed via `RegisterProxy` in the `L2ToL1`
+/// direction (the bidirectional op's mirror). EXPECTED FAIL: the composer has
+/// no L2-as-entry settling path, so `compose` returns `Err` (target reverted) —
+/// the harness exercises that path but can't settle it. Flips the day L2→L1
+/// lands (mirrors `lib.rs::l2_to_l1_is_rejected_today`).
+#[ignore = "composer gap: L2→L1 has no settling path (compose returns Err: target reverted)"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn counter_l2() {
+    let prog = vec![
+        (Op::RegisterProxy { value_idx: 0 }, Direction::L2ToL1),
+        (interact(1, 5), Direction::L2ToL1), // step dir ignored — derived from trigger
+    ];
+    assert_eq!(settle_mixed(prog, 1).await, U256::from(5u64));
+}
+
 // ───────────────────────── backlog (residual) ────────────────────────────────
 //
 // Implemented above as ops: bridge (`RegisterBridge`), deepNested/reentrant
-// (`DeployNested`), revertCounter (`RegisterForceRevert`). These still need a
-// new op and/or composer feature before they're a faithful `Program`:
+// (`DeployNested`), revertCounter (`RegisterForceRevert`), and *L2 via the
+// per-step `Direction` axis (`RegisterProxy` mirrored to `L2ToL1`). These two
+// still need a new op before they're a faithful `Program`:
 //
 //   nestedCallRevert  reverting reentrant → `LookupCall{failed}` fallback. Wants
 //                     a nested-leaf-reverts op (NestedValue over a RevertableValue).
 //   multi-call-nested multi-entry mix of pure + nested entries → a multi-call op
 //                     whose entries target a nested proxy.
-//   *L2 (counterL2,…) L2-as-entry. The lib world has `boot_l2_entry`, but SeqWorld
-//                     composes L1-entry only; wants an L2-entry SeqWorld + an op.
+//
+// Both are nesting variants behind the SAME wall `deep_nested`/`nested_counter`
+// already document, so they'd add `#[ignore]`s without new coverage until the
+// composer accepts same-rollup nesting.
