@@ -43,8 +43,9 @@ jobs:
       # eez-node binary that integration tests spawn via CARGO_BIN_EXE_).
       # Once this completes, clippy and both nextest runs read from cache.
       # Exclude the cargo-fuzz bin crate: it links libFuzzer and only builds
-      # under `cargo +nightly fuzz` (see the `fuzz` job). Its harness/oracle
-      # are still covered here via the eez-fuzz lib's integration tests.
+      # under `cargo +nightly fuzz`. Campaigns run manually/locally via
+      # crates/eez-fuzz/fuzz.sh, not in CI. The harness + oracle ARE covered
+      # here via the eez-fuzz lib + integration tests (e2e_cases, corpus_replay).
       - name: Build (tests + binaries)
         run: cargo nextest run --workspace --exclude eez-fuzz-fuzz --all-targets --no-run
       - name: Clippy
