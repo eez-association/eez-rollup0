@@ -22,5 +22,9 @@ case "$cmd" in
   repro) cargo +nightly fuzz run  "$T" --sanitizer none "${3:?artifact path}" ;;
   tmin)  cargo +nightly fuzz tmin "$T" --sanitizer none "${3:?artifact path}" ;;
   cov)   cargo +nightly fuzz coverage "$T" --sanitizer none ;;
-  *) echo "usage: $0 {run|cmin|repro|tmin|cov} [compose|program] ..."; exit 1 ;;
+  # Oracle mutation score: inject composer bugs, see which the harness catches.
+  # Appends a timestamped score line to fuzz/.mutation-score.log (the recursive
+  # scoreboard — watch it climb as blind spots close). No instrumented build.
+  mutants) python3 mutants.py ;;
+  *) echo "usage: $0 {run|cmin|repro|tmin|cov|mutants} [compose|program] ..."; exit 1 ;;
 esac

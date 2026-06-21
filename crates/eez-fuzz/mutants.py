@@ -77,7 +77,10 @@ MUTATIONS = [
      "            callCount: U256::ZERO,\n            returnData: { let mut __r = return_data.to_vec(); if let Some(__b) = __r.last_mut() { *__b = __b.wrapping_add(1); } __r.into() }, // MUTANT"),
 ]
 
-TEST = ["cargo", "test", "-p", "eez-fuzz", "--test", "corpus_replay"]
+# Score against the COMMITTED deterministic regression (curated e2e Program
+# cases + lib world tests) — not the untracked local corpus. This is what CI
+# guarantees, so the mutation score reflects the real, reproducible coverage.
+TEST = ["cargo", "test", "-p", "eez-fuzz", "--lib", "--test", "e2e_cases"]
 
 
 def classify(name, file, old, new):
@@ -102,8 +105,17 @@ def main():
         print(f"  {verdict:6}  {name:28} [{sub}]  ({time.time()-t:.0f}s)", flush=True)
     caught = sum(1 for v, *_ in results if v == "CAUGHT")
     scored = sum(1 for v, *_ in results if v in ("CAUGHT", "MISSED"))
+    missed = [n for v, n, _ in results if v == "MISSED"]
     print(f"\nmutation score: {caught}/{scored}" + (f" = {caught/scored:.0%}" if scored else ""))
-    print("MISSED (blind spots):", [n for v, n, _ in results if v == "MISSED"] or "none")
+    print("MISSED (blind spots):", missed or "none")
+
+    # Append to the recursive scoreboard — the score over time. Watch it climb
+    # as blind spots close (e.g. once the reentrant path ratifies).
+    import datetime
+    log = os.path.join(os.path.dirname(__file__), "fuzz", ".mutation-score.log")
+    stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    with open(log, "a") as f:
+        f.write(f"{stamp}  {caught}/{scored}  MISSED={missed}\n")
 
 
 if __name__ == "__main__":

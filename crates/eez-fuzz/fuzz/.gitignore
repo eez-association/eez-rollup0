@@ -1,6 +1,7 @@
 target/
 artifacts/
 coverage/
+.mutation-score.log
 # corpus/ IS tracked — the committed cases are both the fuzzer seed corpus AND
 # the CI regression set (replayed by tests/corpus_replay.rs). `fuzz.sh run`
 # extends it (new coverage → new files); `fuzz.sh cmin` + commit to curate.
