@@ -1,6 +1,6 @@
 //! Fuzz harness for `eez_protocol::compose_transaction`.
 //!
-//! Strategy (see `docs/FUZZ_TESTING.md`): boot the cross-chain world ONCE in
+//! Strategy: boot the cross-chain world ONCE in
 //! revm, freeze it into in-process `MockEthProvider`s, build the production
 //! `LocalChainClient`s over them, then fire many `raw_tx`s at the frozen world
 //! (`compose_transaction` is read-only against the providers, so the boot cost
@@ -28,7 +28,6 @@ use eez_protocol::{
 };
 use reth_evm_ethereum::EthEvmConfig;
 use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
-use reth_revm::database::StateProviderDatabase;
 use reth_storage_api::StateProviderFactory;
 use revm::context::ContextTr;
 use revm::context::TxEnv;
@@ -40,6 +39,8 @@ use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 mod generator;
 pub use generator::*;
 
+mod assertions;
+pub use assertions::*;
 sol! {
     function registerRollup(address rollupContract, bytes32 initialState) external returns (uint256);
     function createCrossChainProxy(address originalAddress, uint256 originalRollupId) external returns (address);
@@ -101,7 +102,10 @@ fn assert_world_has_code(provider: &MockEthProvider, addrs: &[Address]) {
     let state = provider.latest().expect("latest state");
     for a in addrs {
         assert!(
-            state.account_code(a).expect("account_code").is_some_and(|c| !c.is_empty()),
+            state
+                .account_code(a)
+                .expect("account_code")
+                .is_some_and(|c| !c.is_empty()),
             "fixture invariant: frozen world must serve code at {a}",
         );
     }
@@ -114,7 +118,10 @@ pub fn boot_l2_world() -> (MockEthProvider, Address, Address) {
         // and known before we build the L1 proxy that targets it.
         let value = created(send(
             TxKind::Create,
-            init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
+            init(
+                "contracts/out/Value.sol/Value.json",
+                (U256::ZERO,).abi_encode_params(),
+            ),
         ));
         let eezl2 = created(send(
             TxKind::Create,
@@ -159,7 +166,10 @@ pub fn boot_l2_world_nested(inner_value_l1: Address) -> (MockEthProvider, Addres
         // NestedValue wraps innerProxy — its setValue fires the depth-2 call.
         let nested = created(send(
             TxKind::Create,
-            init("contracts/out/NestedValue.sol/NestedValue.json", (inner_proxy,).abi_encode_params()),
+            init(
+                "contracts/out/NestedValue.sol/NestedValue.json",
+                (inner_proxy,).abi_encode_params(),
+            ),
         ));
         (nested, eezl2)
     });
@@ -174,7 +184,9 @@ pub fn creation_bytecode(artifact_rel: &str) -> Bytes {
     let json: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(&path).expect("open artifact"))
             .expect("parse artifact");
-    let obj = json["bytecode"]["object"].as_str().expect("bytecode.object");
+    let obj = json["bytecode"]["object"]
+        .as_str()
+        .expect("bytecode.object");
     Bytes::from(hex::decode(obj.trim_start_matches("0x")).expect("decode bytecode"))
 }
 
@@ -255,7 +267,10 @@ pub fn boot_l1_world_nested(nested_value: Address) -> (MockEthProvider, Address,
     let (provider, (eez, proxy, setter)) = boot(|send| {
         let _inner = created(send(
             TxKind::Create,
-            init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
+            init(
+                "contracts/out/Value.sol/Value.json",
+                (U256::ZERO,).abi_encode_params(),
+            ),
         ));
         build_l1_world(send, nested_value)
     });
@@ -269,7 +284,10 @@ fn build_l1_world(
     value_l2: Address,
 ) -> (Address, Address, Address) {
     // 1. EEZ registry (no constructor).
-    let eez = created(send(TxKind::Create, init("contracts/out/EEZ.sol/EEZ.json", Vec::new())));
+    let eez = created(send(
+        TxKind::Create,
+        init("contracts/out/EEZ.sol/EEZ.json", Vec::new()),
+    ));
 
     // 2. MockECDSAProofSystem(authorizedSigner).
     let mock_ps = created(send(
@@ -320,7 +338,10 @@ fn build_l1_world(
     // 6. SetterWrapper(proxy) — the L1 caller that reaches the proxy at depth>1.
     let setter = created(send(
         TxKind::Create,
-        init("contracts/out/SetterWrapper.sol/SetterWrapper.json", (proxy,).abi_encode_params()),
+        init(
+            "contracts/out/SetterWrapper.sol/SetterWrapper.json",
+            (proxy,).abi_encode_params(),
+        ),
     ));
 
     (eez, proxy, setter)
@@ -376,7 +397,7 @@ pub struct World {
     /// Dictionary of trigger contracts whose calls fire a cross-chain
     /// dispatch (today: the single `SetterWrapper`), each with its callable
     /// ABI. The fuzz generator draws from here — the "restrict the address
-    /// space" requirement (see `docs/FUZZ_TESTING.md`).
+    /// space" requirement (see the `compose` fuzz target).
     pub triggers: Vec<Trigger>,
     pub chain_id: u64,
     /// Frozen L2 state, retained so the execute+ratify oracle can replay the
@@ -470,7 +491,8 @@ impl World {
 
     /// Rebuild the per-call rollups map (cheap: `Arc` clones + a 2-entry map).
     pub fn rollups(&self) -> HashMap<RollupId, Rollup<EvmProtocol>> {
-        let entry_cc: Arc<dyn ChainClient<Protocol = EvmProtocol> + Send + Sync> = self.entry.clone();
+        let entry_cc: Arc<dyn ChainClient<Protocol = EvmProtocol> + Send + Sync> =
+            self.entry.clone();
         let follower_cc: Arc<dyn ChainClient<Protocol = EvmProtocol> + Send + Sync> =
             self.follower.clone();
         let mut m = HashMap::new();
@@ -499,151 +521,13 @@ impl World {
     pub async fn compose(&self, raw_tx: &[u8]) -> CompositionResult<Composition<EvmProtocol>> {
         let entry_ec: Arc<dyn EntryChainClient<Protocol = EvmProtocol> + Send + Sync> =
             self.entry.clone();
-        compose_transaction(&EvmProtocol, entry_ec.as_ref(), raw_tx, RollupId(0), self.rollups()).await
-    }
-
-    /// Execute + ratify oracle (see `docs/FUZZ_TESTING.md`): replay the
-    /// composition's OWN production payloads against the real frozen bytecode
-    /// and assert they apply without revert.
-    ///
-    /// - L2 target (the real overlay oracle): the arriving system tx runs
-    ///   `EEZL2.executeIncomingCrossChainCall`, which loads the table and
-    ///   checks the rolling hash + call counts against the real bytecode — a
-    ///   no-revert here ratifies the target. A broken overlay push/pop
-    ///   pairing in `SessionInspector` makes the source sim record wrong
-    ///   inner state/return-data, which surfaces here as a revert or
-    ///   `RollingHashMismatch`.
-    /// - L1 source: the composer emits the batch WITHOUT proofs — the
-    ///   downstream poster signs it (the rollup's ECDSA proof over `SIGNER`)
-    ///   before submitting, and `postVerifyAndExecuteOrSaveExecutionsFromBatch`
-    ///   reverts `InvalidProofSystemConfig` on an unsigned batch
-    ///   (`EEZ.sol:435`). That signature is downstream of the composer's
-    ///   overlay logic (and `SIGNER` has no key here), so the L1 side is a
-    ///   structural check; the L2 replay above is the ratification that
-    ///   exercises the overlay pairing.
-    /// - SETTLED state: when `expected_settled` is `Some`, after replaying the
-    ///   inbound we read `value_l2`'s slot-0 storage and assert it equals the
-    ///   value the generator INTENDED to set. This is the ground truth a mock
-    ///   prover can't fake — the composer's return data / rolling hash can look
-    ///   right while the destination contract never actually changed. The
-    ///   predicted value comes from the generator's own `set(x) -> x` model, so
-    ///   the oracle is not circular with the composer.
-    pub fn assert_executes_and_ratifies(
-        &self,
-        comp: &Composition<EvmProtocol>,
-        expected_settled: Option<U256>,
-    ) {
-        for target in &comp.targets {
-            if let Some(inbound) = &target.inbound_payload {
-                let (r, settled) = replay_inbound(
-                    &self.l2_provider,
-                    self.eezl2,
-                    inbound.clone(),
-                    target.inbound_value,
-                    self.value_l2,
-                );
-                assert!(r.is_success(), "L2 inbound execute+ratify reverted: {r:?}");
-                if let Some(expected) = expected_settled {
-                    assert_eq!(
-                        settled, expected,
-                        "settled {} slot-0 = {settled}, expected {expected} — the cross-chain \
-                         call did not really run (return data can look right past a mock prover)",
-                        self.value_l2,
-                    );
-                }
-            } else {
-                let r = replay_once(
-                    &self.l2_provider,
-                    SYSTEM_ADDR,
-                    self.eezl2,
-                    target.load_table_payload.clone(),
-                    U256::ZERO,
-                );
-                assert!(r.is_success(), "L2 loadExecutionTable reverted: {r:?}");
-            }
-        }
-
-        assert!(
-            comp.source.entry_payload.len() > 4,
-            "composer must emit a non-empty source entry-chain payload",
-        );
+        compose_transaction(
+            &EvmProtocol,
+            entry_ec.as_ref(),
+            raw_tx,
+            RollupId(0),
+            self.rollups(),
+        )
+        .await
     }
 }
-
-/// Replay the inbound system tx (`executeIncomingCrossChainCall`) against the
-/// frozen L2 state and read `settle_target`'s slot-0 storage from the committed
-/// DB — the actual destination-contract effect, not the composer's claim.
-pub fn replay_inbound(
-    provider: &MockEthProvider,
-    eezl2: Address,
-    inbound: Vec<u8>,
-    value: U256,
-    settle_target: Address,
-) -> (ExecutionResult, U256) {
-    let sp = provider.latest().expect("latest state");
-    let mut db = CacheDB::new(StateProviderDatabase::new(sp));
-    db.insert_account_info(
-        SYSTEM_ADDR,
-        AccountInfo {
-            balance: U256::from(10u128).pow(U256::from(24u8)),
-            nonce: 0,
-            ..Default::default()
-        },
-    );
-    let mut evm = Context::mainnet().with_db(db).build_mainnet();
-    let result = evm
-        .transact_commit(TxEnv {
-            caller: SYSTEM_ADDR,
-            kind: TxKind::Call(eezl2),
-            data: inbound.into(),
-            gas_limit: 16_000_000,
-            nonce: 0,
-            chain_id: Some(1),
-            value,
-            ..Default::default()
-        })
-        .expect("evm transact");
-    let settled = evm
-        .db()
-        .cache
-        .accounts
-        .get(&settle_target)
-        .and_then(|a| a.storage.get(&U256::ZERO).copied())
-        .unwrap_or(U256::ZERO);
-    (result, settled)
-}
-
-/// Apply one call tx against a frozen provider's state in revm and return the
-/// result. The caller is overlaid as a funded nonce-0 EOA so system/deployer
-/// senders need no prior funding or nonce bookkeeping.
-pub fn replay_once(
-    provider: &MockEthProvider,
-    caller: Address,
-    to: Address,
-    data: Vec<u8>,
-    value: U256,
-) -> ExecutionResult {
-    let sp = provider.latest().expect("latest state");
-    let mut db = CacheDB::new(StateProviderDatabase::new(sp));
-    db.insert_account_info(
-        caller,
-        AccountInfo {
-            balance: U256::from(10u128).pow(U256::from(24u8)),
-            nonce: 0,
-            ..Default::default()
-        },
-    );
-    let mut evm = Context::mainnet().with_db(db).build_mainnet();
-    evm.transact_commit(TxEnv {
-        caller,
-        kind: TxKind::Call(to),
-        data: data.into(),
-        gas_limit: 16_000_000,
-        nonce: 0,
-        chain_id: Some(1),
-        value,
-        ..Default::default()
-    })
-    .expect("evm transact")
-}
-

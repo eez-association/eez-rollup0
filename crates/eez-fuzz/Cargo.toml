@@ -4,7 +4,7 @@ version.workspace      = true
 edition.workspace      = true
 license.workspace      = true
 rust-version.workspace = true
-description            = "Fuzz harness for eez_protocol::compose_transaction — boots the cross-chain world in revm and drives a structure-aware raw_tx generator + execute/ratify oracle (see docs/FUZZ_TESTING.md)."
+description            = "Fuzz harness for eez_protocol::compose_transaction — boots the cross-chain world in revm and drives a structure-aware raw_tx generator + execute/ratify oracle."
 
 [dependencies]
 # Function under test + protocol/EVM types.

@@ -4,7 +4,7 @@
 //! into the live trigger dict, never a raw 20-byte address — so a mutation swaps
 //! which trigger/method/signer fires (the 256-bit-address-EQ-no-gradient problem
 //! never bites), and every input dispatches into the cross-chain path instead of
-//! no-op'ing. See `docs/FUZZ_TESTING.md`.
+//! no-op'ing.
 
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_eips::Encodable2718;
@@ -85,8 +85,19 @@ impl FuzzTx {
             let word = U256::from(self.args[i % self.args.len()]);
             input.extend_from_slice(&word.to_be_bytes::<32>());
         }
-        let tx_value = if call.payable { U256::from(self.value) } else { U256::ZERO };
-        let raw = sign_call(signer, dict.chain_id, self.nonce, trig.address, tx_value, input.into());
+        let tx_value = if call.payable {
+            U256::from(self.value)
+        } else {
+            U256::ZERO
+        };
+        let raw = sign_call(
+            signer,
+            dict.chain_id,
+            self.nonce,
+            trig.address,
+            tx_value,
+            input.into(),
+        );
         let predicted = U256::from(self.args[0]);
         (raw, predicted)
     }
