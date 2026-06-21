@@ -19,8 +19,7 @@
 
 use std::sync::OnceLock;
 
-use arbitrary::{Arbitrary, Unstructured};
-use eez_fuzz::{Program, SeqBase, SeqWorld};
+use eez_fuzz::{SeqBase, SeqWorld, replay_program};
 use libfuzzer_sys::fuzz_target;
 use tokio::runtime::Runtime;
 
@@ -40,10 +39,6 @@ fuzz_target!(|data: &[u8]| {
     // state accumulates within a program but not across — ~100x the throughput
     // of re-bootstrapping each input.
     let base = BASE.get_or_init(SeqWorld::boot_base);
-    let Ok(program) = Program::arbitrary(&mut Unstructured::new(data)) else {
-        return;
-    };
-    rt.block_on(async {
-        SeqWorld::fork(base).run(program).await;
-    });
+    // Same path CI's corpus-replay regression uses (see eez_fuzz::replay).
+    rt.block_on(replay_program(base, data));
 });

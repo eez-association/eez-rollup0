@@ -42,8 +42,7 @@
 
 use std::sync::OnceLock;
 
-use arbitrary::{Arbitrary, Unstructured};
-use eez_fuzz::{Dict, FuzzTx, World};
+use eez_fuzz::{Dict, World, replay_compose};
 use libfuzzer_sys::fuzz_target;
 use tokio::runtime::Runtime;
 
@@ -64,22 +63,6 @@ fuzz_target!(|data: &[u8]| {
         let dict = world.dict();
         (world, dict)
     });
-
-    let Ok(input) = FuzzTx::arbitrary(&mut Unstructured::new(data)) else {
-        return;
-    };
-    // The generator hands back the predicted settled value with the input, so
-    // the oracle checks the destination contract's real storage — not just
-    // "no revert" / the composer's claimed return data.
-    let (raw_tx, expected) = input.resolve_and_sign(dict);
-
-    rt.block_on(async {
-        // Compose *errors* (EmptyCalls, decode, etc.) are valid rejections, not
-        // crashes. Only a successful composition must execute + ratify + SETTLE
-        // — a panic inside the oracle (revert / RollingHashMismatch / wrong
-        // settled value) is the real finding.
-        if let Ok(comp) = world.compose(&raw_tx).await {
-            world.assert_executes_and_ratifies(&comp, Some(expected));
-        }
-    });
+    // Same path CI's corpus-replay regression uses (see eez_fuzz::replay).
+    rt.block_on(replay_compose(world, dict, data));
 });
