@@ -106,7 +106,19 @@ Findings / open edges (hit while building depth-2 nesting — `compose_nested_de
 - Next step to make depth-2 green: target a **3rd non-entry rollup** (`RollupId(2)` follower) to avoid
   the entry-overlay path.
 
+Coverage-guided fuzzing (`crates/eez-fuzz`):
+- Harness extracted to the `eez-fuzz` lib crate (World + generator + oracle, all `pub`) so both the
+  integration tests and the `cargo-fuzz` target share one boot.
+- `crates/eez-fuzz/fuzz` is the libFuzzer target (`compose`): arbitrary-decode → `FuzzTx` →
+  dictionary-restricted `raw_tx` → `compose` → `assert_executes_and_ratifies`. World + multi-thread
+  tokio runtime boot once via `OnceLock`. It's a root-workspace MEMBER (shares `Cargo.lock`; a
+  separate workspace re-resolves and pulls duplicate `alloy-eip7928`/`revm-state` that break
+  `reth-storage-api`) but excluded from `default-members` so normal builds skip it.
+- Run: `cd crates/eez-fuzz && cargo +nightly fuzz run compose --sanitizer none`
+  (`--sanitizer none` keeps libFuzzer coverage without ASan-instrumenting the whole reth tree).
+  Verified: ~1,400 exec/s, coverage-guided corpus growth, no crashes on the single-hop world.
+
 Not yet done:
-- Promote the in-tree deterministic seed loop (`fuzz_compose_dictionary`) to a real coverage-guided
-  `cargo-fuzz` target. Needs the World+generator extracted to a lib (tests/ can't be imported by a
-  fuzz crate) + `cargo install cargo-fuzz`.
+- Depth-2 nesting green (needs the 3rd-rollup target — see above).
+- Seed the libFuzzer dictionary with live proxy addresses + selectors (the `arbitrary` indexing
+  already restricts top-level targets; a `.dict` helps addresses buried in inner calldata).

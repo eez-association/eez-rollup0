@@ -1,0 +1,6 @@
+target/
+corpus/
+artifacts/
+coverage/
+# The root workspace Cargo.lock is authoritative (this is a workspace member).
+Cargo.lock
