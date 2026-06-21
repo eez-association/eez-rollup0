@@ -1,7 +1,9 @@
 target/
 artifacts/
 coverage/
-# corpus/ IS tracked: the committed cases are the CI regression set (replayed by
-# tests/corpus_replay.rs). Campaigns extend it; `cargo fuzz cmin` + commit to curate.
+# corpus/ IS tracked — the committed cases are the CI regression set (replayed
+# by tests/corpus_replay.rs). It does NOT collect campaign noise: `fuzz.sh run`
+# writes the live corpus OFF-TREE ($EEZ_FUZZ_SCRATCH); `fuzz.sh promote` folds
+# new finds in (minimized) so you `git add` + commit to EXTEND it deliberately.
 # The root workspace Cargo.lock is authoritative (this is a workspace member).
 Cargo.lock
