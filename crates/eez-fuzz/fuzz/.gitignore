@@ -1,7 +1,9 @@
 target/
 artifacts/
 coverage/
-# corpus/ IS tracked: the committed cases are the CI regression set (replayed by
-# tests/corpus_replay.rs). Campaigns extend it; `cargo fuzz cmin` + commit to curate.
+# The live campaign corpus is ignored, but the committed seed files under
+# corpus/ are tracked (already in the index) and ARE the CI regression set
+# (replayed by tests/corpus_replay.rs). Curate with `cargo fuzz cmin` + commit.
+corpus/
 # The root workspace Cargo.lock is authoritative (this is a workspace member).
 Cargo.lock
