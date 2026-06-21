@@ -152,9 +152,7 @@ fn main() -> eyre::Result<()> {
         // L1 source-tx simulation. Inline (not in `l1_embedded.rs`)
         // because the `NodeHandle` AddOns type resists a typed return.
         let embed_l1 = mode == Mode::Composer
-            && env::var("EEZ_L1_EMBEDDED")
-                .map(|v| v != "0" && !v.is_empty())
-                .unwrap_or(true);
+            && env::var("EEZ_L1_EMBEDDED").map_or(true, |v| v != "0" && !v.is_empty());
         // Shared L1-reth tokio runtime — built once, used by whichever
         // L1 path runs.
         let build_l1_runtime = || {
