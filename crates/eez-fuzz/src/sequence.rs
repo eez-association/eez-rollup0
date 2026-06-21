@@ -136,8 +136,43 @@ fn target_cfg(ccm: Address, system: Address, dialect: ChainDialect) -> TargetCon
     }
 }
 
+/// A booted-but-empty base world (EEZ+Rollup on L1, EEZL2 on L2). Boot ONCE
+/// and `fork` it per program — cloning the `CacheDB`s skips the expensive
+/// contract-deploy bootstrap, so the fuzzer runs ~100x faster than re-booting.
+pub struct SeqBase {
+    l1: CacheDB<EmptyDB>,
+    l2: CacheDB<EmptyDB>,
+    eez: Address,
+    eezl2: Address,
+}
+
 impl SeqWorld {
+    /// Fresh world per program — boots the base then forks it. Prefer
+    /// `boot_base` + `fork` in a campaign to amortize the bootstrap.
     pub fn new() -> Self {
+        Self::fork(&Self::boot_base())
+    }
+
+    /// Fork a fresh program world off a pre-booted base (cheap `CacheDB` clone).
+    pub fn fork(base: &SeqBase) -> Self {
+        SeqWorld {
+            l1: base.l1.clone(),
+            l2: base.l2.clone(),
+            eez: base.eez,
+            eezl2: base.eezl2,
+            values: Vec::new(),
+            dict: Dict {
+                chain_id: reth_chainspec::DEV.chain.id(),
+                triggers: Vec::new(),
+                keys: vec![PrivateKeySigner::from_bytes(&B256::repeat_byte(0x11)).expect("key")],
+            },
+            settle_targets: Vec::new(),
+            expected: HashMap::new(),
+        }
+    }
+
+    /// Bootstrap the base contracts once (the expensive part).
+    pub fn boot_base() -> SeqBase {
         // ── L2 base: EEZL2 (eezl2 = DEPLOYER.create(0)). ──
         let mut l2 = CacheDB::<EmptyDB>::default();
         fund(&mut l2, DEPLOYER);
@@ -197,20 +232,7 @@ impl SeqWorld {
         .expect("decode rollupId");
         assert_eq!(rid, U256::from(L2_ROLLUP_ID), "first registered rollup id");
 
-        SeqWorld {
-            l1,
-            l2,
-            eez,
-            eezl2,
-            values: Vec::new(),
-            dict: Dict {
-                chain_id: reth_chainspec::DEV.chain.id(),
-                triggers: Vec::new(),
-                keys: vec![PrivateKeySigner::from_bytes(&B256::repeat_byte(0x11)).expect("key")],
-            },
-            settle_targets: Vec::new(),
-            expected: HashMap::new(),
-        }
+        SeqBase { l1, l2, eez, eezl2 }
     }
 
     /// Build the production clients over the CURRENT frozen base + the rollups

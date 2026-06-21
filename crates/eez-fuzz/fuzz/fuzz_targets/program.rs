@@ -20,11 +20,12 @@
 use std::sync::OnceLock;
 
 use arbitrary::{Arbitrary, Unstructured};
-use eez_fuzz::{Program, SeqWorld};
+use eez_fuzz::{Program, SeqBase, SeqWorld};
 use libfuzzer_sys::fuzz_target;
 use tokio::runtime::Runtime;
 
 static RT: OnceLock<Runtime> = OnceLock::new();
+static BASE: OnceLock<SeqBase> = OnceLock::new();
 
 fuzz_target!(|data: &[u8]| {
     let rt = RT.get_or_init(|| {
@@ -35,11 +36,14 @@ fuzz_target!(|data: &[u8]| {
             .build()
             .expect("tokio runtime")
     });
+    // Boot the base contracts ONCE; fork (cheap CacheDB clone) per program so
+    // state accumulates within a program but not across — ~100x the throughput
+    // of re-bootstrapping each input.
+    let base = BASE.get_or_init(SeqWorld::boot_base);
     let Ok(program) = Program::arbitrary(&mut Unstructured::new(data)) else {
         return;
     };
-    // Fresh base per program — state accumulates within a program, not across.
     rt.block_on(async {
-        SeqWorld::new().run(program).await;
+        SeqWorld::fork(base).run(program).await;
     });
 });
