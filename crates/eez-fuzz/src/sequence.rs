@@ -123,6 +123,20 @@ fn read_slot0(cache: &CacheDB<EmptyDB>, addr: Address) -> U256 {
         .unwrap_or(U256::ZERO)
 }
 
+/// Like `call_output` but returns `None` on a reverted/failed CALL instead of
+/// panicking. Setup ops use this so a duplicate `createCrossChainProxy`
+/// (CREATE2 collision → revert) skips gracefully — the fuzzer should find
+/// COMPOSER bugs, not harness fragility.
+fn call_ok(r: ExecutionResult) -> Option<alloy_primitives::Bytes> {
+    match r {
+        ExecutionResult::Success {
+            output: revm::context::result::Output::Call(b),
+            ..
+        } => Some(b),
+        _ => None,
+    }
+}
+
 fn target_cfg(ccm: Address, system: Address, dialect: ChainDialect) -> TargetConfig<EvmProtocol> {
     TargetConfig {
         ccm_address: ccm,
@@ -144,6 +158,11 @@ pub struct SeqBase {
     l2: CacheDB<EmptyDB>,
     eez: Address,
     eezl2: Address,
+    /// A ready L1 trigger (`SetterWrapper`) + its L2 settle target (`Value`),
+    /// deployed ONCE in the base so a forked sequence can `Interact` from op 1
+    /// — every tx accumulates on the same already-deployed state, no redeploy.
+    setter: Address,
+    value: Address,
 }
 
 impl SeqWorld {
@@ -160,13 +179,18 @@ impl SeqWorld {
             l2: base.l2.clone(),
             eez: base.eez,
             eezl2: base.eezl2,
-            values: Vec::new(),
+            // The base trigger is live from op 1 — a sequence of bare `Interact`s
+            // accumulates on `base.value`'s state with no setup ops needed.
+            values: vec![base.value],
             dict: Dict {
                 chain_id: reth_chainspec::DEV.chain.id(),
-                triggers: Vec::new(),
+                triggers: vec![Trigger {
+                    address: base.setter,
+                    calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
+                }],
                 keys: vec![PrivateKeySigner::from_bytes(&B256::repeat_byte(0x11)).expect("key")],
             },
-            settle_targets: Vec::new(),
+            settle_targets: vec![base.value],
             expected: HashMap::new(),
         }
     }
@@ -232,7 +256,32 @@ impl SeqWorld {
         .expect("decode rollupId");
         assert_eq!(rid, U256::from(L2_ROLLUP_ID), "first registered rollup id");
 
-        SeqBase { l1, l2, eez, eezl2 }
+        // ── Ready trigger: Value@L2 + L1 proxy + SetterWrapper. ──
+        let value = created(run_tx(
+            &mut l2,
+            DEPLOYER,
+            TxKind::Create,
+            init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
+        ));
+        let proxy = Address::abi_decode(&call_output(run_tx(
+            &mut l1,
+            DEPLOYER,
+            TxKind::Call(eez),
+            createCrossChainProxyCall {
+                originalAddress: value,
+                originalRollupId: U256::from(L2_ROLLUP_ID),
+            }
+            .abi_encode(),
+        )))
+        .expect("decode base proxy");
+        let setter = created(run_tx(
+            &mut l1,
+            DEPLOYER,
+            TxKind::Create,
+            init("contracts/out/SetterWrapper.sol/SetterWrapper.json", (proxy,).abi_encode_params()),
+        ));
+
+        SeqBase { l1, l2, eez, eezl2, setter, value }
     }
 
     /// Build the production clients over the CURRENT frozen base + the rollups
@@ -310,7 +359,7 @@ impl SeqWorld {
                         continue;
                     }
                     let value = self.values[(value_idx as usize) % self.values.len()];
-                    let proxy = Address::abi_decode(&call_output(run_tx(
+                    let Some(out) = call_ok(run_tx(
                         &mut self.l1,
                         DEPLOYER,
                         TxKind::Call(self.eez),
@@ -319,8 +368,10 @@ impl SeqWorld {
                             originalRollupId: U256::from(L2_ROLLUP_ID),
                         }
                         .abi_encode(),
-                    )))
-                    .expect("decode proxy");
+                    )) else {
+                        continue; // already-registered proxy → CREATE2 collision → skip
+                    };
+                    let proxy = Address::abi_decode(&out).expect("decode proxy");
                     let setter = created(run_tx(
                         &mut self.l1,
                         DEPLOYER,
@@ -342,7 +393,7 @@ impl SeqWorld {
                         init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
                     ));
                     // L2-side proxy for inner_l1 on the ENTRY rollup (0).
-                    let l2_inner_proxy = Address::abi_decode(&call_output(run_tx(
+                    let Some(out) = call_ok(run_tx(
                         &mut self.l2,
                         DEPLOYER,
                         TxKind::Call(self.eezl2),
@@ -351,8 +402,10 @@ impl SeqWorld {
                             originalRollupId: U256::ZERO,
                         }
                         .abi_encode(),
-                    )))
-                    .expect("decode l2 inner proxy");
+                    )) else {
+                        continue;
+                    };
+                    let l2_inner_proxy = Address::abi_decode(&out).expect("decode l2 inner proxy");
                     // NestedValue on L2 wrapping the L1-targeting proxy.
                     let nested = created(run_tx(
                         &mut self.l2,
@@ -361,7 +414,7 @@ impl SeqWorld {
                         init("contracts/out/NestedValue.sol/NestedValue.json", (l2_inner_proxy,).abi_encode_params()),
                     ));
                     // L1 proxy + SetterWrapper for NestedValue@L2 → live trigger.
-                    let l1_proxy = Address::abi_decode(&call_output(run_tx(
+                    let Some(out) = call_ok(run_tx(
                         &mut self.l1,
                         DEPLOYER,
                         TxKind::Call(self.eez),
@@ -370,8 +423,10 @@ impl SeqWorld {
                             originalRollupId: U256::from(L2_ROLLUP_ID),
                         }
                         .abi_encode(),
-                    )))
-                    .expect("decode l1 proxy");
+                    )) else {
+                        continue;
+                    };
+                    let l1_proxy = Address::abi_decode(&out).expect("decode l1 proxy");
                     let setter = created(run_tx(
                         &mut self.l1,
                         DEPLOYER,
