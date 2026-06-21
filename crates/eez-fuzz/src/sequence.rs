@@ -47,10 +47,11 @@ pub enum Op {
     /// Wrap a deployed value (by index) in an L1 proxy + `SetterWrapper` →
     /// grows the live trigger dict.
     RegisterProxy { value_idx: u16 },
-    /// Like `RegisterProxy` but with a `MultiSetterWrapper` that reaches the
-    /// proxy TWICE in one tx → the composer records two cross-chain entries
-    /// with the same `proxyEntryHash` (multi-entry / sequential-cursor path).
-    RegisterMultiCall { value_idx: u16 },
+    /// Deploy a fresh `Value` reached via a `MultiSetterWrapper` that hits the
+    /// proxy TWICE in one tx → the composer records two cross-chain entries with
+    /// the same `proxyEntryHash` (multi-entry / sequential-cursor path).
+    /// Self-contained (deploys its own target).
+    RegisterMultiCall,
     /// Deploy a `RevertableValue` (reverts on odd args) reached via a try/catch
     /// `RevertTolerantWrapper` → an `Interact` with an odd arg drives the
     /// cross-chain natural-revert path (`CALL_END(success=false)`), the L2 state
@@ -405,11 +406,13 @@ impl SeqWorld {
                     self.settle_targets.push(value);
                     self.settle_revertable.push(false);
                 }
-                Op::RegisterMultiCall { value_idx } => {
-                    if self.values.is_empty() {
-                        continue;
-                    }
-                    let value = self.values[(value_idx as usize) % self.values.len()];
+                Op::RegisterMultiCall => {
+                    let value = created(run_tx(
+                        &mut self.l2,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
+                    ));
                     let proxy = Address::abi_decode(&call_output(run_tx(
                         &mut self.l1,
                         DEPLOYER,
@@ -643,11 +646,12 @@ mod tests {
         let base = SeqWorld::boot_base();
         let mut w = SeqWorld::fork(&base);
         w.run(Program {
-            ops: vec![Op::Deploy, Op::RegisterMultiCall { value_idx: 0 }, interact(0, 42)],
+            // Base trigger is index 0; the multi-call trigger registers at 1.
+            ops: vec![Op::RegisterMultiCall, interact(1, 42)],
         })
         .await;
         assert_eq!(
-            read_slot0(&w.l2, w.settle_targets[0]),
+            read_slot0(&w.l2, w.settle_targets[1]),
             U256::from(42u64),
             "multi-call trigger must compose + settle the target to v",
         );
@@ -661,11 +665,11 @@ mod tests {
         let base = SeqWorld::boot_base();
         let mut w = SeqWorld::fork(&base);
         w.run(Program {
-            ops: vec![Op::RegisterRevertTolerant, interact(0, 8), interact(0, 7)],
+            ops: vec![Op::RegisterRevertTolerant, interact(1, 8), interact(1, 7)],
         })
         .await;
         assert_eq!(
-            read_slot0(&w.l2, w.settle_targets[0]),
+            read_slot0(&w.l2, w.settle_targets[1]),
             U256::from(8u64),
             "even settles to 8; odd reverts and leaves the target unchanged",
         );
@@ -677,9 +681,9 @@ mod tests {
     async fn two_diff_op_settles_target() {
         let base = SeqWorld::boot_base();
         let mut w = SeqWorld::fork(&base);
-        w.run(Program { ops: vec![Op::RegisterTwoDiff, interact(0, 13)] }).await;
+        w.run(Program { ops: vec![Op::RegisterTwoDiff, interact(1, 13)] }).await;
         assert_eq!(
-            read_slot0(&w.l2, w.settle_targets[0]),
+            read_slot0(&w.l2, w.settle_targets[1]),
             U256::from(13u64),
             "two-diff: target A must compose + settle to v",
         );
