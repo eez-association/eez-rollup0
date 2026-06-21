@@ -127,16 +127,16 @@ async fn compose_is_deterministic() {
 /// overlay push/pop pairing surfaces as a compose error or an L2
 /// `RollingHashMismatch` revert in the oracle.
 ///
-/// TODO(nesting): `boot_nested` clears `InvalidReentry` (cross-rollup) but the
-/// compose then fails in the ENTRY-rollup overlay path:
-///   `Evm("overlay diff-apply failed: SELFDESTRUCT mutation at 0x0: out of
-///    scope for overlay diff-apply")`.
-/// Our contracts never SELFDESTRUCT, so this is the entry-overlay diff-apply
-/// rejecting the nested L2→L1 diff — a real composer edge worth a focused look
-/// (`eez-evm-inspector` overlay diff-apply). Next step to unblock the test:
-/// target a THIRD rollup (non-entry follower, `RollupId(2)`) instead of the
-/// entry rollup, which avoids the entry-overlay diff-apply path entirely.
-#[ignore = "entry-overlay diff-apply rejects the nested diff (SELFDESTRUCT@0x0); needs a 3rd-rollup target"]
+/// History (each layer found + cleared by this harness):
+/// 1. `InvalidReentry` — same-rollup reentry is rejected; made it cross-rollup.
+/// 2. `SELFDESTRUCT@0x0: out of scope for overlay diff-apply` — FIXED: the guard
+///    in `overlay.rs` misclassified EIP-161 empty-account cleanup (the touched
+///    zero address) as a real self-destruct (see that commit).
+/// 3. Now: the nested target sim reverts `RollingHashMismatch()` at depth-2 —
+///    i.e. the LIFO overlay push/pop pairing produces an inconsistent rolling
+///    hash. This is the exact bug class the harness targets; under
+///    investigation (composer overlay vs. nested-topology setup).
+#[ignore = "depth-2 nested target reverts RollingHashMismatch() — overlay-pairing lead under investigation"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compose_nested_depth2_ratifies() {
     let world = World::boot_nested();

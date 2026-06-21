@@ -211,7 +211,21 @@ where
                 | AccountStatus::DestroyedChanged
                 | AccountStatus::DestroyedAgain
         ) {
-            return Err(OverlayError::Selfdestruct { address: *addr });
+            // revm reuses the `Destroyed` status family for BOTH a real
+            // contract SELFDESTRUCT and EIP-161 empty-account cleanup (an
+            // empty account that was merely touched — e.g. the zero address
+            // surfaced by a nested cross-chain call). The latter carries no
+            // state to propagate, so it must NOT abort compose. Only fail
+            // loudly when the account actually HAD state before the overlay.
+            let had_state = before
+                .accounts
+                .get(addr)
+                .and_then(|a| a.account.as_ref())
+                .is_some_and(|p| !p.info.is_empty());
+            if had_state {
+                return Err(OverlayError::Selfdestruct { address: *addr });
+            }
+            continue;
         }
 
         // Filter: only apply for accounts the overlay actually modified.
