@@ -13,6 +13,24 @@ members = [
     "crates/eez-payload-codec",
     "crates/eez-protocol",
     "crates/eez-prover",
+    "crates/eez-fuzz/fuzz",
+]
+# The cargo-fuzz bin crate is a member (shares Cargo.lock) but excluded from
+# default builds — it only compiles under `cargo fuzz`, which sets the
+# sanitizer/coverage rustflags + a separate target triple dir.
+default-members = [
+    "crates/eez-composer",
+    "crates/eez-deriver",
+    "crates/eez-driver",
+    "crates/eez-evm",
+    "crates/eez-evm-inspector",
+    "crates/eez-fuzz",
+    "crates/eez-follower",
+    "crates/eez-l1",
+    "crates/eez-node",
+    "crates/eez-payload-codec",
+    "crates/eez-protocol",
+    "crates/eez-prover",
 ]
 
 [workspace.package]

@@ -1,0 +1,25 @@
+[package]
+name = "eez-fuzz-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+eez-fuzz = { path = ".." }
+
+[[bin]]
+name = "compose"
+path = "fuzz_targets/compose.rs"
+test = false
+doc = false
+bench = false
+# NOTE: intentionally NOT its own `[workspace]` — it's a member of the root
+# workspace (see root Cargo.toml `default-members`) so it shares the single
+# Cargo.lock. A separate workspace re-resolves deps and pulls duplicate
+# alloy-eip7928/revm-state versions that fail to compile reth-storage-api.
