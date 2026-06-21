@@ -56,6 +56,10 @@ pub enum Op {
     /// cross-chain natural-revert path (`CALL_END(success=false)`), the L2 state
     /// stays unchanged. Self-contained (deploys its own target).
     RegisterRevertTolerant,
+    /// Deploy a `TwoProxySetter` reaching two DIFFERENT proxies/targets in one
+    /// tx → the composer records two entries with different `proxyEntryHash`es
+    /// (the multi-call-two-diff shape). Self-contained (deploys both targets).
+    RegisterTwoDiff,
     /// Fire a user tx through a live trigger (the single-tx generator).
     Interact(FuzzTx),
     /// Build an L2→L1 relay: `InnerValue` on L1, an L2-side proxy for it
@@ -470,6 +474,59 @@ impl SeqWorld {
                     self.settle_targets.push(value);
                     self.settle_revertable.push(true);
                 }
+                Op::RegisterTwoDiff => {
+                    // Two distinct L2 Values + two proxies → different proxyEntryHashes.
+                    let value_a = created(run_tx(
+                        &mut self.l2,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
+                    ));
+                    let value_b = created(run_tx(
+                        &mut self.l2,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
+                    ));
+                    let proxy_a = Address::abi_decode(&call_output(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Call(self.eez),
+                        createCrossChainProxyCall {
+                            originalAddress: value_a,
+                            originalRollupId: U256::from(L2_ROLLUP_ID),
+                        }
+                        .abi_encode(),
+                    )))
+                    .expect("decode proxy a");
+                    let proxy_b = Address::abi_decode(&call_output(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Call(self.eez),
+                        createCrossChainProxyCall {
+                            originalAddress: value_b,
+                            originalRollupId: U256::from(L2_ROLLUP_ID),
+                        }
+                        .abi_encode(),
+                    )))
+                    .expect("decode proxy b");
+                    let setter = created(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init(
+                            "contracts/out/TwoProxySetter.sol/TwoProxySetter.json",
+                            (proxy_a, proxy_b).abi_encode_params(),
+                        ),
+                    ));
+                    self.dict.triggers.push(Trigger {
+                        address: setter,
+                        calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
+                    });
+                    // Oracle checks target A; the ratify replay covers both.
+                    self.settle_targets.push(value_a);
+                    self.settle_revertable.push(false);
+                }
                 Op::DeployRelayToL1 => {
                     // L1 inner target.
                     let inner_l1 = created(run_tx(
@@ -611,6 +668,20 @@ mod tests {
             read_slot0(&w.l2, w.settle_targets[0]),
             U256::from(8u64),
             "even settles to 8; odd reverts and leaves the target unchanged",
+        );
+    }
+
+    /// `RegisterTwoDiff`: one tx reaches two different proxies → two entries with
+    /// different `proxyEntryHash`es; target A must settle to `v`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_diff_op_settles_target() {
+        let base = SeqWorld::boot_base();
+        let mut w = SeqWorld::fork(&base);
+        w.run(Program { ops: vec![Op::RegisterTwoDiff, interact(0, 13)] }).await;
+        assert_eq!(
+            read_slot0(&w.l2, w.settle_targets[0]),
+            U256::from(13u64),
+            "two-diff: target A must compose + settle to v",
         );
     }
 }
