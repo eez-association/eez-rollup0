@@ -1,9 +1,12 @@
 target/
 artifacts/
 coverage/
-# The live campaign corpus is ignored, but the committed seed files under
-# corpus/ are tracked (already in the index) and ARE the CI regression set
-# (replayed by tests/corpus_replay.rs). Curate with `cargo fuzz cmin` + commit.
-corpus/
+# Repo-relative fallback for the off-tree live campaign corpus (fuzz.sh).
+.scratch-corpus/
+# corpus/ IS tracked — the committed cases are the CI regression set (replayed
+# by tests/corpus_replay.rs). It does NOT collect campaign noise: `fuzz.sh run`
+# writes the live corpus off-tree (under CARGO_TARGET_DIR, or $EEZ_FUZZ_SCRATCH,
+# else .scratch-corpus/); `fuzz.sh promote` folds new finds in (minimized) so
+# you `git add` + commit to EXTEND it deliberately.
 # The root workspace Cargo.lock is authoritative (this is a workspace member).
 Cargo.lock
