@@ -364,6 +364,12 @@ pub struct World {
     /// Frozen L2 state, retained so the execute+ratify oracle can replay the
     /// composition's L2 target payloads against the real bytecode.
     pub l2_provider: MockEthProvider,
+    /// The ultimate cross-chain target contract on L2 (`Value`) whose slot-0
+    /// `value` the settle path mutates — the SETTLED-state oracle reads it
+    /// back after replaying the inbound system tx. Checking storage (not the
+    /// composer's claimed return data) is what catches "the cross-chain call
+    /// never really ran" past a mock prover.
+    pub value_l2: Address,
 }
 
 impl World {
@@ -372,7 +378,7 @@ impl World {
     pub fn boot() -> Self {
         let (l2_provider, value, eezl2) = boot_l2_world();
         let (l1_provider, eez, _proxy, setter) = boot_l1_world(value);
-        Self::assemble(l1_provider, l2_provider, eez, eezl2, setter)
+        Self::assemble(l1_provider, l2_provider, eez, eezl2, setter, value)
     }
 
     /// Depth-2 world: L1 `SetterWrapper` → proxy(`NestedValue`@L2), and
@@ -385,7 +391,9 @@ impl World {
         let inner_value_l1 = DEPLOYER.create(0);
         let (l2_provider, nested_value, eezl2) = boot_l2_world_nested(inner_value_l1);
         let (l1_provider, eez, _proxy, setter) = boot_l1_world_nested(nested_value);
-        Self::assemble(l1_provider, l2_provider, eez, eezl2, setter)
+        // Settle target for the nested path is InnerValue@L1; the depth-2 test
+        // is ignored, so pass nested_value as a placeholder.
+        Self::assemble(l1_provider, l2_provider, eez, eezl2, setter, nested_value)
     }
 
     /// Build the production clients over frozen providers (shared by the
@@ -396,6 +404,7 @@ impl World {
         eez: Address,
         eezl2: Address,
         setter: Address,
+        settle_target: Address,
     ) -> Self {
         let chain_spec = reth_chainspec::DEV.clone();
         let evm_config = EthEvmConfig::new(chain_spec.clone());
@@ -423,6 +432,7 @@ impl World {
             eez,
             eezl2,
             l2_provider,
+            value_l2: settle_target,
             triggers: vec![Trigger {
                 address: setter,
                 calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
@@ -493,17 +503,36 @@ impl World {
     ///   overlay logic (and `SIGNER` has no key here), so the L1 side is a
     ///   structural check; the L2 replay above is the ratification that
     ///   exercises the overlay pairing.
-    pub fn assert_executes_and_ratifies(&self, comp: &Composition<EvmProtocol>) {
+    /// - SETTLED state: when `expected_settled` is `Some`, after replaying the
+    ///   inbound we read `value_l2`'s slot-0 storage and assert it equals the
+    ///   value the generator INTENDED to set. This is the ground truth a mock
+    ///   prover can't fake — the composer's return data / rolling hash can look
+    ///   right while the destination contract never actually changed. The
+    ///   predicted value comes from the generator's own `set(x) -> x` model, so
+    ///   the oracle is not circular with the composer.
+    pub fn assert_executes_and_ratifies(
+        &self,
+        comp: &Composition<EvmProtocol>,
+        expected_settled: Option<U256>,
+    ) {
         for target in &comp.targets {
             if let Some(inbound) = &target.inbound_payload {
-                let r = replay_once(
+                let (r, settled) = replay_inbound(
                     &self.l2_provider,
-                    SYSTEM_ADDR,
                     self.eezl2,
                     inbound.clone(),
                     target.inbound_value,
+                    self.value_l2,
                 );
                 assert!(r.is_success(), "L2 inbound execute+ratify reverted: {r:?}");
+                if let Some(expected) = expected_settled {
+                    assert_eq!(
+                        settled, expected,
+                        "settled {} slot-0 = {settled}, expected {expected} — the cross-chain \
+                         call did not really run (return data can look right past a mock prover)",
+                        self.value_l2,
+                    );
+                }
             } else {
                 let r = replay_once(
                     &self.l2_provider,
@@ -521,6 +550,49 @@ impl World {
             "composer must emit a non-empty source entry-chain payload",
         );
     }
+}
+
+/// Replay the inbound system tx (`executeIncomingCrossChainCall`) against the
+/// frozen L2 state and read `settle_target`'s slot-0 storage from the committed
+/// DB — the actual destination-contract effect, not the composer's claim.
+pub fn replay_inbound(
+    provider: &MockEthProvider,
+    eezl2: Address,
+    inbound: Vec<u8>,
+    value: U256,
+    settle_target: Address,
+) -> (ExecutionResult, U256) {
+    let sp = provider.latest().expect("latest state");
+    let mut db = CacheDB::new(StateProviderDatabase::new(sp));
+    db.insert_account_info(
+        SYSTEM_ADDR,
+        AccountInfo {
+            balance: U256::from(10u128).pow(U256::from(24u8)),
+            nonce: 0,
+            ..Default::default()
+        },
+    );
+    let mut evm = Context::mainnet().with_db(db).build_mainnet();
+    let result = evm
+        .transact_commit(TxEnv {
+            caller: SYSTEM_ADDR,
+            kind: TxKind::Call(eezl2),
+            data: inbound.into(),
+            gas_limit: 16_000_000,
+            nonce: 0,
+            chain_id: Some(1),
+            value,
+            ..Default::default()
+        })
+        .expect("evm transact");
+    let settled = evm
+        .db()
+        .cache
+        .accounts
+        .get(&settle_target)
+        .and_then(|a| a.storage.get(&U256::ZERO).copied())
+        .unwrap_or(U256::ZERO);
+    (result, settled)
 }
 
 /// Apply one call tx against a frozen provider's state in revm and return the
@@ -621,9 +693,13 @@ pub struct FuzzTx {
 }
 
 impl FuzzTx {
-    /// Resolve indices against `dict` and return signed EIP-2718 `raw_tx`
-    /// bytes — the input `simulate_source_tx` decodes.
-    pub fn resolve_and_sign(&self, dict: &Dict) -> Vec<u8> {
+    /// Resolve indices against `dict` and return the signed EIP-2718 `raw_tx`
+    /// bytes (what `simulate_source_tx` decodes) PLUS the predicted settled
+    /// value — the generator's own `set(x) -> x` model: `setViaProxy(v)` drives
+    /// `Value.value = v`, so the predicted slot-0 effect is the first arg `v`.
+    /// Handing the answer back with the input keeps the oracle independent of
+    /// the composer (no separate reference needed for the controlled world).
+    pub fn resolve_and_sign(&self, dict: &Dict) -> (Vec<u8>, U256) {
         let trig = &dict.triggers[(self.trigger_sel as usize) % dict.triggers.len()];
         let call = &trig.calls[(self.method_sel as usize) % trig.calls.len()];
         let signer = &dict.keys[(self.signer_sel as usize) % dict.keys.len()];
@@ -635,7 +711,9 @@ impl FuzzTx {
             input.extend_from_slice(&word.to_be_bytes::<32>());
         }
         let tx_value = if call.payable { U256::from(self.value) } else { U256::ZERO };
-        sign_call(signer, dict.chain_id, self.nonce, trig.address, tx_value, input.into())
+        let raw = sign_call(signer, dict.chain_id, self.nonce, trig.address, tx_value, input.into());
+        let predicted = U256::from(self.args[0]);
+        (raw, predicted)
     }
 }
 

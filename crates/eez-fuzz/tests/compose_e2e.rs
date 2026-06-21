@@ -99,7 +99,26 @@ async fn compose_setter_via_proxy() {
         1,
         "cross-chain call must produce exactly one target composition",
     );
-    world.assert_executes_and_ratifies(&composition);
+    // setViaProxy(42) → Value.value must settle to 42 (not just "no revert").
+    world.assert_executes_and_ratifies(&composition, Some(U256::from(42u64)));
+}
+
+/// Determinism: identical input → identical composition. Cheap, and a leaked
+/// `HashMap` iteration order (or other nondeterminism) into the actionable
+/// payloads would break replay/proof-binding downstream. Kept as a dedicated
+/// test rather than in the hot fuzz loop (it doubles compose cost per input).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compose_is_deterministic() {
+    let world = World::boot();
+    let raw_tx = sign_setter_call(world.triggers[0].address, 99, world.chain_id).await;
+    let a = world.compose(&raw_tx).await.expect("compose a");
+    let b = world.compose(&raw_tx).await.expect("compose b");
+    assert_eq!(a.source.entry_payload, b.source.entry_payload, "source payload deterministic");
+    assert_eq!(a.targets.len(), b.targets.len(), "target count deterministic");
+    for (ta, tb) in a.targets.iter().zip(&b.targets) {
+        assert_eq!(ta.inbound_payload, tb.inbound_payload, "inbound payload deterministic");
+        assert_eq!(ta.load_table_payload, tb.load_table_payload, "load payload deterministic");
+    }
 }
 
 /// Depth-2 nesting: the L2 target (`NestedValue`) itself fires a cross-rollup
@@ -132,7 +151,7 @@ async fn compose_nested_depth2_ratifies() {
         .sum();
     assert!(nested_actions > 0, "nested world must record a depth-2 nested action");
 
-    world.assert_executes_and_ratifies(&composition);
+    world.assert_executes_and_ratifies(&composition, None);
 }
 
 /// In-tree deterministic fuzz loop (a coverage-blind stand-in for the
@@ -150,7 +169,7 @@ async fn fuzz_compose_dictionary() {
         let Ok(input) = FuzzTx::arbitrary(&mut u) else {
             continue;
         };
-        let raw_tx = input.resolve_and_sign(&dict);
+        let (raw_tx, expected) = input.resolve_and_sign(&dict);
 
         let composition = world
             .compose(&raw_tx)
@@ -161,7 +180,7 @@ async fn fuzz_compose_dictionary() {
             1,
             "dictionary trigger must compose to one target (seed={seed})",
         );
-        world.assert_executes_and_ratifies(&composition);
+        world.assert_executes_and_ratifies(&composition, Some(expected));
     }
 }
 
@@ -195,7 +214,8 @@ fn generated_tx_decodes_recovers_and_targets_a_trigger() {
         value: 0,
         args: [42, 0, 0, 0],
     };
-    let raw = input.resolve_and_sign(&dict);
+    let (raw, predicted) = input.resolve_and_sign(&dict);
+    assert_eq!(predicted, U256::from(42u64), "generator predicts the set value");
     let env = TxEnvelope::decode_2718(&mut raw.as_slice()).expect("decode_2718");
 
     assert_eq!(env.to().expect("call"), dict.triggers[1].address);
@@ -211,7 +231,7 @@ fn arbitrary_indices_always_resolve_within_dict() {
     for seed in 0u8..32 {
         let bytes = [seed; 64];
         let input = FuzzTx::arbitrary(&mut Unstructured::new(&bytes)).expect("arbitrary");
-        let raw = input.resolve_and_sign(&dict);
+        let (raw, _) = input.resolve_and_sign(&dict);
         let env = TxEnvelope::decode_2718(&mut raw.as_slice()).expect("decode_2718");
         let to = env.to().expect("call");
         assert!(dict.triggers.iter().any(|t| t.address == to), "to={to} not a trigger");

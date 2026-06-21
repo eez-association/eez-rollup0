@@ -41,14 +41,18 @@ fuzz_target!(|data: &[u8]| {
     let Ok(input) = FuzzTx::arbitrary(&mut Unstructured::new(data)) else {
         return;
     };
-    let raw_tx = input.resolve_and_sign(dict);
+    // The generator hands back the predicted settled value with the input, so
+    // the oracle checks the destination contract's real storage — not just
+    // "no revert" / the composer's claimed return data.
+    let (raw_tx, expected) = input.resolve_and_sign(dict);
 
     rt.block_on(async {
         // Compose *errors* (EmptyCalls, decode, etc.) are valid rejections, not
-        // crashes. Only a successful composition must execute + ratify — a panic
-        // inside the oracle (revert / RollingHashMismatch) is the real finding.
+        // crashes. Only a successful composition must execute + ratify + SETTLE
+        // — a panic inside the oracle (revert / RollingHashMismatch / wrong
+        // settled value) is the real finding.
         if let Ok(comp) = world.compose(&raw_tx).await {
-            world.assert_executes_and_ratifies(&comp);
+            world.assert_executes_and_ratifies(&comp, Some(expected));
         }
     });
 });
