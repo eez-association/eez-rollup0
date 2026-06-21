@@ -117,13 +117,8 @@ fn boot_l2_world() -> (MockEthProvider, Address, Address) {
 /// + `NestedValue`(innerProxy). Returns `(provider, nested_value_addr, eezl2)`.
 /// Calling `NestedValue.setValue` fires a nested cross-chain call to
 /// `innerProxy`, so composing through it records dispatch at depth > 1.
-fn boot_l2_world_nested() -> (MockEthProvider, Address, Address) {
+fn boot_l2_world_nested(inner_value_l1: Address) -> (MockEthProvider, Address, Address) {
     let (provider, (nested, eezl2)) = boot(|send| {
-        // InnerValue (a plain `Value`) — the innermost target.
-        let inner_value = created(send(
-            TxKind::Create,
-            init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
-        ));
         // EEZL2 manager — must exist before we register a proxy on it.
         let eezl2 = created(send(
             TxKind::Create,
@@ -132,13 +127,15 @@ fn boot_l2_world_nested() -> (MockEthProvider, Address, Address) {
                 (U256::from(L2_ROLLUP_ID), SYSTEM_ADDR).abi_encode_params(),
             ),
         ));
-        // innerProxy = CrossChainProxy(InnerValue, L2) on EEZL2 — a self-rollup
-        // reentrant proxy the overlay inspector detects during L2 sim.
+        // innerProxy = CrossChainProxy(InnerValue@L1, rollup 0) on EEZL2 — a
+        // CROSS-rollup proxy (L2→L1). Same-rollup reentry is rejected by the
+        // composer (`InvalidReentry`), so the nested target lives on the entry
+        // rollup; the overlay inspector detects this proxy during L2 sim.
         let inner_proxy = Address::abi_decode(&call_output(send(
             TxKind::Call(eezl2),
             createCrossChainProxyCall {
-                originalAddress: inner_value,
-                originalRollupId: U256::from(L2_ROLLUP_ID),
+                originalAddress: inner_value_l1,
+                originalRollupId: U256::ZERO,
             }
             .abi_encode(),
         )))
@@ -293,7 +290,31 @@ fn call_output(r: ExecutionResult) -> Bytes {
 /// createCrossChainProxy(value_l2, L2) + SetterWrapper. Returns the frozen
 /// provider and `(eez, proxy, setter)`.
 fn boot_l1_world(value_l2: Address) -> (MockEthProvider, Address, Address, Address) {
+    let (provider, (eez, proxy, setter)) = boot(|send| build_l1_world(send, value_l2));
+    (provider, eez, proxy, setter)
+}
+
+/// L1 entry world for depth-2: deploys `InnerValue` (a `Value`) as the FIRST
+/// tx — so its address is the deterministic `DEPLOYER.create(0)` that the L2
+/// `innerProxy` targets — then the normal entry world pointing the L1 proxy
+/// at `nested_value`.
+fn boot_l1_world_nested(nested_value: Address) -> (MockEthProvider, Address, Address, Address) {
     let (provider, (eez, proxy, setter)) = boot(|send| {
+        let _inner = created(send(
+            TxKind::Create,
+            init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
+        ));
+        build_l1_world(send, nested_value)
+    });
+    (provider, eez, proxy, setter)
+}
+
+/// Deploy the entry-world contracts via `send` and register a cross-chain
+/// proxy for `value_l2`. Returns `(eez, proxy, setter)`.
+fn build_l1_world(
+    send: &mut dyn FnMut(TxKind, Vec<u8>) -> ExecutionResult,
+    value_l2: Address,
+) -> (Address, Address, Address) {
         // 1. EEZ registry (no constructor).
         let eez = created(send(TxKind::Create, init("contracts/out/EEZ.sol/EEZ.json", Vec::new())));
 
@@ -353,8 +374,6 @@ fn boot_l1_world(value_l2: Address) -> (MockEthProvider, Address, Address, Addre
         ));
 
         (eez, proxy, setter)
-    });
-    (provider, eez, proxy, setter)
 }
 
 #[test]
@@ -444,8 +463,11 @@ impl World {
     /// so composing fires cross-chain dispatch at depth > 1, exercising the
     /// LIFO overlay push/pop pairing.
     fn boot_nested() -> Self {
-        let (l2_provider, nested_value, eezl2) = boot_l2_world_nested();
-        let (l1_provider, eez, _proxy, setter) = boot_l1_world(nested_value);
+        // InnerValue is the first CREATE in the L1 boot, so its address is the
+        // deterministic `DEPLOYER.create(0)`; the L2 innerProxy targets it.
+        let inner_value_l1 = DEPLOYER.create(0);
+        let (l2_provider, nested_value, eezl2) = boot_l2_world_nested(inner_value_l1);
+        let (l1_provider, eez, _proxy, setter) = boot_l1_world_nested(nested_value);
         Self::assemble(l1_provider, l2_provider, eez, eezl2, setter)
     }
 
@@ -686,15 +708,20 @@ struct Dict {
 /// cross-chain call, so the composition records a nested action and the L2
 /// inbound replay processes it (`_consumeNestedAction` + rolling-hash check).
 /// A broken LIFO overlay push/pop pairing surfaces as a compose error or an
-/// L2 `RollingHashMismatch` revert in the oracle.
+/// L2 `RollingHashMismatch` revert in the oracle. The nesting is CROSS-rollup
+/// (L2→L1): same-rollup reentry is rejected by the composer (`InvalidReentry`),
+/// so `NestedValue`'s inner proxy targets `InnerValue` on the entry rollup.
 ///
-/// TODO(nesting): the current `boot_nested` registers the inner proxy as a
-/// SELF-rollup (L2→L2) call, which the composer rejects with `InvalidReentry`
-/// (`composition.rs:734` — same-chain non-entry self-dispatch is disallowed).
-/// Depth-2 must be CROSS-rollup (L2→L1): deploy `InnerValue` on L1 at a
-/// deterministic address and point `innerProxy` at it with `originalRollupId
-/// = 0`. Ignored until that topology lands.
-#[ignore = "needs cross-rollup nested topology; self-rollup reentry is rejected"]
+/// TODO(nesting): `boot_nested` clears `InvalidReentry` (cross-rollup) but the
+/// compose then fails in the ENTRY-rollup overlay path:
+///   `Evm("overlay diff-apply failed: SELFDESTRUCT mutation at 0x0: out of
+///    scope for overlay diff-apply")`.
+/// Our contracts never SELFDESTRUCT, so this is the entry-overlay diff-apply
+/// rejecting the nested L2→L1 diff — a real composer edge worth a focused look
+/// (`eez-evm-inspector` overlay diff-apply). Next step to unblock the test:
+/// target a THIRD rollup (non-entry follower, `RollupId(2)`) instead of the
+/// entry rollup, which avoids the entry-overlay diff-apply path entirely.
+#[ignore = "entry-overlay diff-apply rejects the nested diff (SELFDESTRUCT@0x0); needs a 3rd-rollup target"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compose_nested_depth2_ratifies() {
     let world = World::boot_nested();
