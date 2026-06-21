@@ -30,14 +30,14 @@
 use alloy_primitives::{Address, Bytes};
 use std::sync::{Arc, Mutex};
 
-use revm::Inspector;
 use revm::context_interface::{ContextTr, Host, JournalTr};
 use revm::database::{CacheState, State};
 use revm::interpreter::{
     CallInputs, CallOutcome, CallScheme, Gas, InstructionResult, InterpreterResult,
 };
+use revm::Inspector;
 
-use eez_evm::{EvmProtocol, ProxyInfo, decode_proxy_value, proxy_mapping_key};
+use eez_evm::{decode_proxy_value, proxy_mapping_key, EvmProtocol, ProxyInfo};
 use eez_protocol::{Dispatcher, ExecutorError, ProxyLookupConfig, RollupId};
 
 /// Bidirectional side-channel between source-sim and the overlay
@@ -760,11 +760,11 @@ mod tests {
     //! snapshot.
 
     use super::*;
-    use alloy_primitives::{U256, address};
+    use alloy_primitives::{address, U256};
     use eez_evm::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
-    use revm::MainContext;
     use revm::context::Context;
     use revm::database::{CacheDB, EmptyDB};
+    use revm::MainContext;
 
     const ROLLUPS_ADDR: Address = address!("0x1111111111111111111111111111111111111111");
     const PROXY_ADDR: Address = address!("0x2222222222222222222222222222222222222222");
