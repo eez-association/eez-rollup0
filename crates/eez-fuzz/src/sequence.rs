@@ -691,3 +691,19 @@ mod tests {
         );
     }
 }
+
+impl Program {
+    /// Construct a hand-written program — lets curated e2e-case ports reuse the
+    /// same `Op` vocabulary the fuzzer explores (the "one model, two uses" goal).
+    pub fn new(ops: Vec<Op>) -> Self {
+        Program { ops }
+    }
+}
+
+impl SeqWorld {
+    /// Slot-0 of the settle target at dict-trigger `idx` — for curated cases to
+    /// assert the destination contract's settled state directly.
+    pub fn target_value(&self, idx: usize) -> U256 {
+        read_slot0(&self.l2, self.settle_targets[idx])
+    }
+}
