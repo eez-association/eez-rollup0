@@ -42,10 +42,13 @@ jobs:
       # Build everything (workspace lib + integration test binaries + the
       # eez-node binary that integration tests spawn via CARGO_BIN_EXE_).
       # Once this completes, clippy and both nextest runs read from cache.
-      # Exclude the cargo-fuzz bin crate: it links libFuzzer and only builds
-      # under `cargo +nightly fuzz`. Campaigns run manually/locally via
-      # crates/eez-fuzz/fuzz.sh, not in CI. The harness + oracle ARE covered
-      # here via the eez-fuzz lib + integration tests (e2e_cases, corpus_replay).
+      # Optimization (not required): the cargo-fuzz bin crate builds fine on
+      # stable, but --all-targets would compile libFuzzer's C++ runtime and link
+      # two ~1GB binaries that CI never runs (campaigns are local, via
+      # crates/eez-fuzz/fuzz.sh). Excluding it just saves CI build time + disk.
+      # The harness + oracle ARE covered here via the eez-fuzz lib + integration
+      # tests (e2e_cases). Test steps don't need the exclude: the fuzz bins are
+      # `test = false`, so --lib / --test '*' never select them.
       - name: Build (tests + binaries)
         run: cargo nextest run --workspace --exclude eez-fuzz-fuzz --all-targets --no-run
       - name: Clippy
