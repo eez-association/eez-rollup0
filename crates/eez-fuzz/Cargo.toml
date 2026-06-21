@@ -1,0 +1,35 @@
+[package]
+name                   = "eez-fuzz"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+description            = "Fuzz harness for eez_protocol::compose_transaction — boots the cross-chain world in revm and drives a structure-aware raw_tx generator + execute/ratify oracle (see docs/FUZZ_TESTING.md)."
+
+[dependencies]
+# Function under test + protocol/EVM types.
+eez-composer.workspace = true
+eez-evm.workspace      = true
+eez-protocol.workspace = true
+
+# alloy
+alloy-consensus.workspace    = true
+alloy-eips.workspace         = true
+alloy-network.workspace      = true
+alloy-primitives.workspace   = true
+alloy-signer-local.workspace = true
+alloy-sol-types.workspace    = true
+
+# reth state + revm bridge: deploy the world in revm, freeze into
+# MockEthProvider, build LocalChainClient over it, replay payloads.
+reth-chainspec.workspace    = true
+reth-evm-ethereum.workspace = true
+reth-provider               = { workspace = true, features = ["test-utils"] }
+reth-revm.workspace         = true
+reth-storage-api.workspace  = true
+revm.workspace              = true
+
+tokio.workspace      = true
+serde_json.workspace = true
+# structure-aware generator: derive Arbitrary over a typed fuzz input.
+arbitrary = { version = "1", features = ["derive"] }

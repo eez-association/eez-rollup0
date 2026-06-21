@@ -6,6 +6,7 @@ members = [
     "crates/eez-driver",
     "crates/eez-evm",
     "crates/eez-evm-inspector",
+    "crates/eez-fuzz",
     "crates/eez-follower",
     "crates/eez-l1",
     "crates/eez-node",
