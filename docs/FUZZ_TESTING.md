@@ -91,11 +91,18 @@ Implemented + green (`cargo test -p eez-composer --test compose_e2e`):
 - **Structure-aware generator** (`FuzzTx`): `Arbitrary` over dictionary indices
   (trigger/method/signer) + typed leaves — address space restricted by construction.
   `CallSpec.payable` gates `msg.value` (non-payable triggers must get value 0, else `EmptyCalls`).
-- **Execute+ratify oracle** (`assert_executes_and_ratifies`): replays the composition's own L2
+- **Execute+ratify+SETTLE oracle** (`assert_executes_and_ratifies`): replays the composition's own L2
   payloads against the frozen bytecode — `executeIncomingCrossChainCall` checks rolling hash +
-  overlay pairing, so a no-revert ratifies the target. L1 source is a *structural* check only: the
-  composer emits the batch UNSIGNED and `EEZ.sol:435` reverts `InvalidProofSystemConfig` on it
-  (proof-signing is downstream; `SIGNER` has no key here).
+  overlay pairing, so a no-revert ratifies the target. CRUCIALLY it then reads `Value@L2` slot-0
+  storage back and asserts it equals the value the generator INTENDED to set. The composer's return
+  data / rolling hash can look right past a mock prover while the destination never changed — settled
+  storage is the ground truth. The predicted value comes from the generator's own `set(x) -> x` model
+  (`resolve_and_sign` returns `(raw_tx, expected)`), so the oracle is not circular with the composer.
+  Verified: settling really mutates the target (negative control expect-43/settle-42 fails as designed).
+  L1 source is a *structural* check only: the composer emits the batch UNSIGNED and `EEZ.sol:435`
+  reverts `InvalidProofSystemConfig` on it (proof-signing is downstream; `SIGNER` has no key here).
+- **Determinism** (`compose_is_deterministic`): identical input → identical payloads (catches leaked
+  `HashMap` order). Dedicated test, not in the hot fuzz loop.
 
 Findings / open edges (hit while building depth-2 nesting — `compose_nested_depth2_ratifies`, `#[ignore]`):
 - Composer rejects **same-rollup reentry** (`InvalidReentry`, `composition.rs:734`) — nesting must be
