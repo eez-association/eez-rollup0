@@ -47,6 +47,20 @@ pub enum Op {
     /// Wrap a deployed value (by index) in an L1 proxy + `SetterWrapper` →
     /// grows the live trigger dict.
     RegisterProxy { value_idx: u16 },
+    /// Deploy a fresh `Value` reached via a `MultiSetterWrapper` that hits the
+    /// proxy TWICE in one tx → the composer records two cross-chain entries with
+    /// the same `proxyEntryHash` (multi-entry / sequential-cursor path).
+    /// Self-contained (deploys its own target).
+    RegisterMultiCall,
+    /// Deploy a `RevertableValue` (reverts on odd args) reached via a try/catch
+    /// `RevertTolerantWrapper` → an `Interact` with an odd arg drives the
+    /// cross-chain natural-revert path (`CALL_END(success=false)`), the L2 state
+    /// stays unchanged. Self-contained (deploys its own target).
+    RegisterRevertTolerant,
+    /// Deploy a `TwoProxySetter` reaching two DIFFERENT proxies/targets in one
+    /// tx → the composer records two entries with different `proxyEntryHash`es
+    /// (the multi-call-two-diff shape). Self-contained (deploys both targets).
+    RegisterTwoDiff,
     /// Fire a user tx through a live trigger (the single-tx generator).
     Interact(FuzzTx),
     /// Build an L2→L1 relay: `InnerValue` on L1, an L2-side proxy for it
@@ -76,6 +90,10 @@ pub struct SeqWorld {
     dict: Dict,
     /// settle target (the L2 `Value`) per dict trigger, index-aligned.
     settle_targets: Vec<Address>,
+    /// Whether each trigger's target REVERTS on odd args (a `RevertableValue`),
+    /// index-aligned with `settle_targets` — so `Interact` predicts "unchanged"
+    /// for an odd arg instead of `arg`.
+    settle_revertable: Vec<bool>,
     /// Cumulative expected slot-0 per target (last-writer-wins).
     expected: HashMap<Address, U256>,
 }
@@ -190,7 +208,10 @@ impl SeqWorld {
                 }],
                 keys: vec![PrivateKeySigner::from_bytes(&B256::repeat_byte(0x11)).expect("key")],
             },
+            // Base trigger is pre-registered at index 0 (not revertable), so
+            // `settle_revertable` starts aligned with `settle_targets`.
             settle_targets: vec![base.value],
+            settle_revertable: vec![false],
             expected: HashMap::new(),
         }
     }
@@ -383,6 +404,131 @@ impl SeqWorld {
                         calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
                     });
                     self.settle_targets.push(value);
+                    self.settle_revertable.push(false);
+                }
+                Op::RegisterMultiCall => {
+                    let value = created(run_tx(
+                        &mut self.l2,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
+                    ));
+                    let proxy = Address::abi_decode(&call_output(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Call(self.eez),
+                        createCrossChainProxyCall {
+                            originalAddress: value,
+                            originalRollupId: U256::from(L2_ROLLUP_ID),
+                        }
+                        .abi_encode(),
+                    )))
+                    .expect("decode proxy");
+                    // MultiSetterWrapper reaches the proxy twice → two same-hash entries.
+                    let setter = created(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init(
+                            "contracts/out/MultiSetterWrapper.sol/MultiSetterWrapper.json",
+                            (proxy,).abi_encode_params(),
+                        ),
+                    ));
+                    self.dict.triggers.push(Trigger {
+                        address: setter,
+                        calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
+                    });
+                    self.settle_targets.push(value);
+                    self.settle_revertable.push(false);
+                }
+                Op::RegisterRevertTolerant => {
+                    // RevertableValue (reverts on odd) reached via a try/catch
+                    // wrapper that does NOT require success.
+                    let value = created(run_tx(
+                        &mut self.l2,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init("contracts/out/RevertableValue.sol/RevertableValue.json", Vec::new()),
+                    ));
+                    let proxy = Address::abi_decode(&call_output(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Call(self.eez),
+                        createCrossChainProxyCall {
+                            originalAddress: value,
+                            originalRollupId: U256::from(L2_ROLLUP_ID),
+                        }
+                        .abi_encode(),
+                    )))
+                    .expect("decode proxy");
+                    let setter = created(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init(
+                            "contracts/out/RevertTolerantWrapper.sol/RevertTolerantWrapper.json",
+                            (proxy,).abi_encode_params(),
+                        ),
+                    ));
+                    self.dict.triggers.push(Trigger {
+                        address: setter,
+                        calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
+                    });
+                    self.settle_targets.push(value);
+                    self.settle_revertable.push(true);
+                }
+                Op::RegisterTwoDiff => {
+                    // Two distinct L2 Values + two proxies → different proxyEntryHashes.
+                    let value_a = created(run_tx(
+                        &mut self.l2,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
+                    ));
+                    let value_b = created(run_tx(
+                        &mut self.l2,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
+                    ));
+                    let proxy_a = Address::abi_decode(&call_output(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Call(self.eez),
+                        createCrossChainProxyCall {
+                            originalAddress: value_a,
+                            originalRollupId: U256::from(L2_ROLLUP_ID),
+                        }
+                        .abi_encode(),
+                    )))
+                    .expect("decode proxy a");
+                    let proxy_b = Address::abi_decode(&call_output(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Call(self.eez),
+                        createCrossChainProxyCall {
+                            originalAddress: value_b,
+                            originalRollupId: U256::from(L2_ROLLUP_ID),
+                        }
+                        .abi_encode(),
+                    )))
+                    .expect("decode proxy b");
+                    let setter = created(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init(
+                            "contracts/out/TwoProxySetter.sol/TwoProxySetter.json",
+                            (proxy_a, proxy_b).abi_encode_params(),
+                        ),
+                    ));
+                    self.dict.triggers.push(Trigger {
+                        address: setter,
+                        calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
+                    });
+                    // Oracle checks target A; the ratify replay covers both.
+                    self.settle_targets.push(value_a);
+                    self.settle_revertable.push(false);
                 }
                 Op::DeployRelayToL1 => {
                     // L1 inner target.
@@ -438,6 +584,7 @@ impl SeqWorld {
                         calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
                     });
                     self.settle_targets.push(nested);
+                    self.settle_revertable.push(false);
                 }
                 Op::Interact(tx) => {
                     if self.dict.triggers.is_empty() {
@@ -445,7 +592,15 @@ impl SeqWorld {
                     }
                     let tidx = (tx.trigger_sel as usize) % self.dict.triggers.len();
                     let settle_target = self.settle_targets[tidx];
-                    let (raw, predicted) = tx.resolve_and_sign(&self.dict);
+                    let (raw, intended) = tx.resolve_and_sign(&self.dict);
+                    // Revertable target + odd arg → the cross-chain call reverts
+                    // and the try/catch wrapper continues, so the target keeps
+                    // its previous value rather than taking `intended`.
+                    let predicted = if self.settle_revertable[tidx] && intended.bit(0) {
+                        self.expected.get(&settle_target).copied().unwrap_or(U256::ZERO)
+                    } else {
+                        intended
+                    };
                     // Compose errors (EmptyCalls, decode, …) are valid rejections.
                     let Ok(comp) = self.compose(&raw).await else {
                         continue;
@@ -464,5 +619,73 @@ impl SeqWorld {
         for (target, want) in &self.expected {
             assert_eq!(read_slot0(&self.l2, *target), *want, "cumulative: target {target}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interact(trigger: u16, v: u128) -> Op {
+        Op::Interact(FuzzTx {
+            trigger_sel: trigger,
+            method_sel: 0,
+            signer_sel: 0,
+            nonce: 0,
+            value: 0,
+            args: [v, 0, 0, 0],
+        })
+    }
+
+    /// `RegisterMultiCall`'s trigger reaches the proxy twice; the composer must
+    /// produce a multi-entry composition that still settles the target to `v`
+    /// (last write wins). Asserts it actually composed + settled (a compose
+    /// error would leave slot-0 at 0 and fail here, not silently skip).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multicall_op_settles_target() {
+        let base = SeqWorld::boot_base();
+        let mut w = SeqWorld::fork(&base);
+        w.run(Program {
+            // Base trigger is index 0; the multi-call trigger registers at 1.
+            ops: vec![Op::RegisterMultiCall, interact(1, 42)],
+        })
+        .await;
+        assert_eq!(
+            read_slot0(&w.l2, w.settle_targets[1]),
+            U256::from(42u64),
+            "multi-call trigger must compose + settle the target to v",
+        );
+    }
+
+    /// `RegisterRevertTolerant`: an even arg settles the target; a following odd
+    /// arg drives the cross-chain revert through the try/catch wrapper and must
+    /// leave the target at its prior (even) value — never corrupt it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revert_tolerant_op_keeps_prior_on_revert() {
+        let base = SeqWorld::boot_base();
+        let mut w = SeqWorld::fork(&base);
+        w.run(Program {
+            ops: vec![Op::RegisterRevertTolerant, interact(1, 8), interact(1, 7)],
+        })
+        .await;
+        assert_eq!(
+            read_slot0(&w.l2, w.settle_targets[1]),
+            U256::from(8u64),
+            "even settles to 8; odd reverts and leaves the target unchanged",
+        );
+    }
+
+    /// `RegisterTwoDiff`: one tx reaches two different proxies → two entries with
+    /// different `proxyEntryHash`es; target A must settle to `v`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_diff_op_settles_target() {
+        let base = SeqWorld::boot_base();
+        let mut w = SeqWorld::fork(&base);
+        w.run(Program { ops: vec![Op::RegisterTwoDiff, interact(1, 13)] }).await;
+        assert_eq!(
+            read_slot0(&w.l2, w.settle_targets[1]),
+            U256::from(13u64),
+            "two-diff: target A must compose + settle to v",
+        );
     }
 }
