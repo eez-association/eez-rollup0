@@ -29,6 +29,19 @@ fn interact(trigger: u16, v: u128) -> Op {
     })
 }
 
+/// A value-bearing interact for a payable trigger (`bridge()`); `v` is wei.
+fn interact_value(trigger: u16, v: u64) -> Op {
+    Op::Interact(FuzzTx {
+        direction: Direction::L1ToL2,
+        trigger_sel: trigger,
+        method_sel: 0,
+        signer_sel: 0,
+        nonce: 0,
+        value: v,
+        args: [0, 0, 0, 0],
+    })
+}
+
 /// Boot a fresh world, run one curated program, return the settled slot-0 of the
 /// trigger at `idx` (so a compose/settle gap shows up as the unchanged value).
 async fn settle(ops: Vec<Op>, idx: usize) -> U256 {
@@ -36,6 +49,15 @@ async fn settle(ops: Vec<Op>, idx: usize) -> U256 {
     let mut w = SeqWorld::fork(&base);
     w.run(Program::new(ops)).await;
     w.target_value(idx)
+}
+
+/// Like [`settle`] but returns the target's settled L2 BALANCE — for `Skip`-mode
+/// triggers (a `bridge()` value transfer) whose effect isn't slot-0.
+async fn settle_balance(ops: Vec<Op>, idx: usize) -> U256 {
+    let base = SeqWorld::boot_base();
+    let mut w = SeqWorld::fork(&base);
+    w.run(Program::new(ops)).await;
+    w.target_balance(idx)
 }
 
 // ─────────────────────────── passing (regression) ───────────────────────────
@@ -57,21 +79,35 @@ async fn hello_world() {
 /// `multi-call-twice` — two deferred entries with the SAME `proxyEntryHash`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_call_twice() {
-    assert_eq!(settle(vec![Op::RegisterMultiCall, interact(1, 9)], 1).await, U256::from(9u64));
+    assert_eq!(
+        settle(vec![Op::RegisterMultiCall, interact(1, 9)], 1).await,
+        U256::from(9u64)
+    );
 }
 
 /// `multi-call-two-diff` — two deferred entries with DIFFERENT `proxyEntryHash`es.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multi_call_two_diff() {
-    assert_eq!(settle(vec![Op::RegisterTwoDiff, interact(1, 11)], 1).await, U256::from(11u64));
+    assert_eq!(
+        settle(vec![Op::RegisterTwoDiff, interact(1, 11)], 1).await,
+        U256::from(11u64)
+    );
 }
 
 /// `revertContinue` — a try/catch wrapper over a cross-chain call that reverts
 /// (odd arg) and CONTINUES; the target keeps its prior (even) value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revert_continue() {
-    let v = settle(vec![Op::RegisterRevertTolerant, interact(1, 8), interact(1, 7)], 1).await;
-    assert_eq!(v, U256::from(8u64), "even settles to 8; odd reverts and leaves it");
+    let v = settle(
+        vec![Op::RegisterRevertTolerant, interact(1, 8), interact(1, 7)],
+        1,
+    )
+    .await;
+    assert_eq!(
+        v,
+        U256::from(8u64),
+        "even settles to 8; odd reverts and leaves it"
+    );
 }
 
 // ─────────────────────── expected-fail (composer gaps) ───────────────────────
@@ -85,24 +121,77 @@ async fn revert_continue() {
 #[ignore = "composer gap: depth-2 nested compose reverts RollingHashMismatch (overlay pairing / InvalidReentry)"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nested_counter() {
-    assert_eq!(settle(vec![Op::DeployRelayToL1, interact(1, 4)], 1).await, U256::from(4u64));
+    assert_eq!(
+        settle(vec![Op::DeployRelayToL1, interact(1, 4)], 1).await,
+        U256::from(4u64)
+    );
 }
 
-// ───────────────────────── backlog (not yet expressible) ─────────────────────
+/// `deepNested` (depth-3) — now EXPRESSIBLE via the recursive `DeployNested` op
+/// (two levels of same-rollup self-referential nesting over a leaf). EXPECTED
+/// FAIL for the same composer reason as `nested_counter`; once same-rollup
+/// nesting composes, the fuzzer reaches depth-N by chaining `DeployNested`.
+#[ignore = "composer gap: same-rollup nested compose unimplemented (depth wall)"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deep_nested() {
+    // base trigger=0; DeployNested registers triggers at 1, 2 (the depth-2 top).
+    assert_eq!(
+        settle(vec![Op::DeployNested, Op::DeployNested, interact(2, 6)], 2).await,
+        U256::from(6u64)
+    );
+}
+
+/// `reentrant` (depth-3 cascade) — chaining three `DeployNested`s exercises the
+/// recursive overlay push/pop pairing the reentrant fixture stresses. EXPECTED
+/// FAIL on the same nesting wall; faithful self-reentrancy (a target reentering
+/// ITSELF) still wants a dedicated self-referential op.
+#[ignore = "composer gap: same-rollup nested compose unimplemented (depth wall)"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reentrant_deep() {
+    let p = vec![
+        Op::DeployNested,
+        Op::DeployNested,
+        Op::DeployNested,
+        interact(3, 9),
+    ];
+    assert_eq!(settle(p, 3).await, U256::from(9u64));
+}
+
+/// `revertCounter` (`revertSpan`) — the cross-chain `setValue` lands but runs in
+/// a self-call that always reverts, so its span must be force-discarded: the
+/// target MUST stay 0. If the composer instead commits the "successful" call,
+/// the value leaks (a soundness break) and this asserts it caught that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revert_counter() {
+    // ForceRevertWrapper registers at trigger 1; its target stays unchanged.
+    assert_eq!(
+        settle(vec![Op::RegisterForceRevert, interact(1, 7)], 1).await,
+        U256::ZERO
+    );
+}
+
+/// `bridge` — L1→L2 value transfer: `BridgeSender.bridge()` forwards `msg.value`
+/// to the L2 proxy, which lands on the L2 `BridgeReceiver`. The settled effect
+/// is the receiver's BALANCE.
+#[ignore = "composer gap: value-bearing cross-chain call not settled (no balance delivery)"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge() {
+    // Bridge registers at trigger 1; the receiver should receive the wei sent.
+    assert_eq!(
+        settle_balance(vec![Op::RegisterBridge, interact_value(1, 1000)], 1).await,
+        U256::from(1000u64)
+    );
+}
+
+// ───────────────────────── backlog (residual) ────────────────────────────────
 //
-// These `script/e2e` scenarios need a new `Op` and/or a composer feature before
-// they can be written as a `Program`. The e2e suite IS the op/feature backlog:
+// Implemented above as ops: bridge (`RegisterBridge`), deepNested/reentrant
+// (`DeployNested`), revertCounter (`RegisterForceRevert`). These still need a
+// new op and/or composer feature before they're a faithful `Program`:
 //
-//   bridge            value/etherDelta → a `Bridge` op (payable trigger + funded
-//                     signer) + a balance-based oracle (settled effect is ETH
-//                     balance, not slot-0).
-//   deepNested(3+)    arbitrary depth → recursive `DeployNested{inner_idx}` over a
-//                     unified target pool + same-rollup self-referential proxies.
-//   reentrant         4-hop cascading nested actions → a deep-chain op.
-//   revertCounter     `revertSpan` forced revert (succeeds, state rolled back,
-//                     rolling hash commits success) → a force-revert wrapper + oracle.
-//   nestedCallRevert  reverting reentrant → `LookupCall{failed}` fallback → a
-//                     nested+revert combo op.
-//   multi-call-nested multi-entry mix of pure + nested entries → multi-call + nest.
-//   *L2 (counterL2,…) L2-as-entry → drive the new direction-bit/L2-entry world via
-//                     an `Op` (the world exists; the op to select it does not yet).
+//   nestedCallRevert  reverting reentrant → `LookupCall{failed}` fallback. Wants
+//                     a nested-leaf-reverts op (NestedValue over a RevertableValue).
+//   multi-call-nested multi-entry mix of pure + nested entries → a multi-call op
+//                     whose entries target a nested proxy.
+//   *L2 (counterL2,…) L2-as-entry. The lib world has `boot_l2_entry`, but SeqWorld
+//                     composes L1-entry only; wants an L2-entry SeqWorld + an op.

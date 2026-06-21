@@ -16,16 +16,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::{
+    CallSpec, DEPLOYER, Dict, FuzzTx, L2_ROLLUP_ID, SIGNER, SYSTEM_ADDR, Trigger, call_output,
+    createCrossChainProxyCall, created, freeze, init, registerRollupCall,
+};
 use alloy_primitives::{Address, B256, TxKind, U256};
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolValue};
 use arbitrary::Arbitrary;
 use eez_composer::LocalChainClient;
 use eez_evm::{ChainDialect, EvmProtocol};
-use crate::{
-    CallSpec, Dict, FuzzTx, Trigger, call_output, createCrossChainProxyCall, created, freeze, init,
-    registerRollupCall, DEPLOYER, L2_ROLLUP_ID, SIGNER, SYSTEM_ADDR,
-};
 use eez_protocol::{
     ChainClient, Composition, CompositionResult, DEFAULT_CCM_GAS_LIMIT, EntryChainClient,
     ProxyLookupConfig, Rollup, RollupId, TargetConfig, compose_transaction,
@@ -37,6 +37,24 @@ use revm::context::result::ExecutionResult;
 use revm::database::{CacheDB, EmptyDB};
 use revm::state::AccountInfo;
 use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
+
+/// How a trigger's settled effect is predicted and checked. One per dict
+/// trigger, set when the `Register*`/`Deploy*` op wires it up.
+#[derive(Clone, Copy, Debug)]
+enum SettleMode {
+    /// slot-0 becomes the arg (`Value`, multi-call, two-diff, `NestedValue`).
+    SetsArg,
+    /// `RevertableValue`: reverts on odd args, so an odd arg leaves slot-0 at
+    /// its prior value (the try/catch wrapper continues) and an even arg sets it.
+    RevertOnOdd,
+    /// `ForceRevertWrapper` (`revertSpan`): the call succeeds then its span is
+    /// force-discarded, so slot-0 ALWAYS stays at its prior value.
+    AlwaysUnchanged,
+    /// Non-slot-0 effect (a `Bridge` value transfer settles as a balance). The
+    /// step composes + settles but the cumulative slot-0 oracle skips it; the
+    /// hand-written port test asserts the real effect.
+    Skip,
+}
 
 /// One step of a program. `#[derive(Arbitrary)]` over `Vec<Op>` makes the
 /// sequence length emergent (continue/stop falls out of the input bytes).
@@ -69,6 +87,22 @@ pub enum Op {
     /// `Interact` through this trigger makes the L2 target call a proxy that
     /// targets L1 — the "L2 tx calls a proxy on L1" topology under question.
     DeployRelayToL1,
+    /// Recursive deep-nesting: wrap the current chain top (or a fresh leaf
+    /// `Value`) in a `NestedValue` via a SAME-ROLLUP self-referential L2 proxy
+    /// (the `deepNested` e2e topology). Each `DeployNested` adds one level, so a
+    /// run of N of them + an `Interact` builds depth-N — emergent depth the
+    /// fuzzer can discover by chaining ops (address propagation).
+    DeployNested,
+    /// Deploy a `Value` reached via a `ForceRevertWrapper`: the cross-chain
+    /// `setValue` succeeds but runs inside a self-call that always reverts, so
+    /// its span must be force-discarded (`revertSpan`) — the target stays
+    /// UNCHANGED. Self-contained. (`revertCounter` e2e shape.)
+    RegisterForceRevert,
+    /// Deploy a `Bridge` (sender on L1 → L2 proxy → receiver on L2) and register
+    /// a payable `bridge()` trigger: an `Interact` forwards `msg.value` across
+    /// the chain. The settled effect is the receiver's BALANCE, not slot-0, so
+    /// the cumulative oracle skips it. Self-contained. (`bridge` e2e shape.)
+    RegisterBridge,
 }
 
 #[derive(Debug, Arbitrary)]
@@ -90,12 +124,15 @@ pub struct SeqWorld {
     dict: Dict,
     /// settle target (the L2 `Value`) per dict trigger, index-aligned.
     settle_targets: Vec<Address>,
-    /// Whether each trigger's target REVERTS on odd args (a `RevertableValue`),
-    /// index-aligned with `settle_targets` — so `Interact` predicts "unchanged"
-    /// for an odd arg instead of `arg`.
-    settle_revertable: Vec<bool>,
+    /// How each trigger's settled effect is predicted/checked, index-aligned
+    /// with `settle_targets`. Generalizes the original "revertable" bit so the
+    /// backlog ops (force-revert span, bridge value transfer) share one oracle.
+    settle_mode: Vec<SettleMode>,
     /// Cumulative expected slot-0 per target (last-writer-wins).
     expected: HashMap<Address, U256>,
+    /// Current top of the recursive nesting chain (`DeployNested`) — the L2
+    /// `NestedValue` a further `DeployNested` wraps. `None` until the first one.
+    nest_top: Option<Address>,
 }
 
 /// Fund an account in a cache so it can send txs.
@@ -112,8 +149,18 @@ fn fund(cache: &mut CacheDB<EmptyDB>, who: Address) {
 
 /// Run one tx against a persistent cache (nonce read from state, mutation
 /// committed back). Returns the result.
-fn run_tx(cache: &mut CacheDB<EmptyDB>, caller: Address, kind: TxKind, data: Vec<u8>) -> ExecutionResult {
-    let nonce = cache.cache.accounts.get(&caller).map(|a| a.info.nonce).unwrap_or(0);
+fn run_tx(
+    cache: &mut CacheDB<EmptyDB>,
+    caller: Address,
+    kind: TxKind,
+    data: Vec<u8>,
+) -> ExecutionResult {
+    let nonce = cache
+        .cache
+        .accounts
+        .get(&caller)
+        .map(|a| a.info.nonce)
+        .unwrap_or(0);
     let taken = std::mem::take(cache);
     let mut evm = Context::mainnet().with_db(taken).build_mainnet();
     let r = evm
@@ -209,10 +256,11 @@ impl SeqWorld {
                 keys: vec![PrivateKeySigner::from_bytes(&B256::repeat_byte(0x11)).expect("key")],
             },
             // Base trigger is pre-registered at index 0 (not revertable), so
-            // `settle_revertable` starts aligned with `settle_targets`.
+            // `settle_mode` starts aligned with `settle_targets`.
             settle_targets: vec![base.value],
-            settle_revertable: vec![false],
+            settle_mode: vec![SettleMode::SetsArg],
             expected: HashMap::new(),
+            nest_top: None,
         }
     }
 
@@ -282,7 +330,10 @@ impl SeqWorld {
             &mut l2,
             DEPLOYER,
             TxKind::Create,
-            init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
+            init(
+                "contracts/out/Value.sol/Value.json",
+                (U256::ZERO,).abi_encode_params(),
+            ),
         ));
         let proxy = Address::abi_decode(&call_output(run_tx(
             &mut l1,
@@ -299,10 +350,20 @@ impl SeqWorld {
             &mut l1,
             DEPLOYER,
             TxKind::Create,
-            init("contracts/out/SetterWrapper.sol/SetterWrapper.json", (proxy,).abi_encode_params()),
+            init(
+                "contracts/out/SetterWrapper.sol/SetterWrapper.json",
+                (proxy,).abi_encode_params(),
+            ),
         ));
 
-        SeqBase { l1, l2, eez, eezl2, setter, value }
+        SeqBase {
+            l1,
+            l2,
+            eez,
+            eezl2,
+            setter,
+            value,
+        }
     }
 
     /// Build the production clients over the CURRENT frozen base + the rollups
@@ -329,7 +390,8 @@ impl SeqWorld {
             ChainDialect::EvmL2Style,
         );
         let entry_cc: Arc<dyn ChainClient<Protocol = EvmProtocol> + Send + Sync> = entry.clone();
-        let follower_cc: Arc<dyn ChainClient<Protocol = EvmProtocol> + Send + Sync> = follower.clone();
+        let follower_cc: Arc<dyn ChainClient<Protocol = EvmProtocol> + Send + Sync> =
+            follower.clone();
         let mut rollups = HashMap::new();
         rollups.insert(
             RollupId(0),
@@ -358,7 +420,12 @@ impl SeqWorld {
     fn settle_l2(&mut self, comp: &Composition<EvmProtocol>) {
         for t in &comp.targets {
             if let Some(inbound) = &t.inbound_payload {
-                run_tx(&mut self.l2, SYSTEM_ADDR, TxKind::Call(self.eezl2), inbound.clone());
+                run_tx(
+                    &mut self.l2,
+                    SYSTEM_ADDR,
+                    TxKind::Call(self.eezl2),
+                    inbound.clone(),
+                );
             }
         }
     }
@@ -371,7 +438,10 @@ impl SeqWorld {
                         &mut self.l2,
                         DEPLOYER,
                         TxKind::Create,
-                        init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
+                        init(
+                            "contracts/out/Value.sol/Value.json",
+                            (U256::ZERO,).abi_encode_params(),
+                        ),
                     ));
                     self.values.push(v);
                 }
@@ -397,21 +467,27 @@ impl SeqWorld {
                         &mut self.l1,
                         DEPLOYER,
                         TxKind::Create,
-                        init("contracts/out/SetterWrapper.sol/SetterWrapper.json", (proxy,).abi_encode_params()),
+                        init(
+                            "contracts/out/SetterWrapper.sol/SetterWrapper.json",
+                            (proxy,).abi_encode_params(),
+                        ),
                     ));
                     self.dict.triggers.push(Trigger {
                         address: setter,
                         calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
                     });
                     self.settle_targets.push(value);
-                    self.settle_revertable.push(false);
+                    self.settle_mode.push(SettleMode::SetsArg);
                 }
                 Op::RegisterMultiCall => {
                     let value = created(run_tx(
                         &mut self.l2,
                         DEPLOYER,
                         TxKind::Create,
-                        init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
+                        init(
+                            "contracts/out/Value.sol/Value.json",
+                            (U256::ZERO,).abi_encode_params(),
+                        ),
                     ));
                     let proxy = Address::abi_decode(&call_output(run_tx(
                         &mut self.l1,
@@ -439,7 +515,7 @@ impl SeqWorld {
                         calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
                     });
                     self.settle_targets.push(value);
-                    self.settle_revertable.push(false);
+                    self.settle_mode.push(SettleMode::SetsArg);
                 }
                 Op::RegisterRevertTolerant => {
                     // RevertableValue (reverts on odd) reached via a try/catch
@@ -448,7 +524,10 @@ impl SeqWorld {
                         &mut self.l2,
                         DEPLOYER,
                         TxKind::Create,
-                        init("contracts/out/RevertableValue.sol/RevertableValue.json", Vec::new()),
+                        init(
+                            "contracts/out/RevertableValue.sol/RevertableValue.json",
+                            Vec::new(),
+                        ),
                     ));
                     let proxy = Address::abi_decode(&call_output(run_tx(
                         &mut self.l1,
@@ -475,7 +554,7 @@ impl SeqWorld {
                         calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
                     });
                     self.settle_targets.push(value);
-                    self.settle_revertable.push(true);
+                    self.settle_mode.push(SettleMode::RevertOnOdd);
                 }
                 Op::RegisterTwoDiff => {
                     // Two distinct L2 Values + two proxies → different proxyEntryHashes.
@@ -483,13 +562,19 @@ impl SeqWorld {
                         &mut self.l2,
                         DEPLOYER,
                         TxKind::Create,
-                        init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
+                        init(
+                            "contracts/out/Value.sol/Value.json",
+                            (U256::ZERO,).abi_encode_params(),
+                        ),
                     ));
                     let value_b = created(run_tx(
                         &mut self.l2,
                         DEPLOYER,
                         TxKind::Create,
-                        init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
+                        init(
+                            "contracts/out/Value.sol/Value.json",
+                            (U256::ZERO,).abi_encode_params(),
+                        ),
                     ));
                     let proxy_a = Address::abi_decode(&call_output(run_tx(
                         &mut self.l1,
@@ -528,7 +613,7 @@ impl SeqWorld {
                     });
                     // Oracle checks target A; the ratify replay covers both.
                     self.settle_targets.push(value_a);
-                    self.settle_revertable.push(false);
+                    self.settle_mode.push(SettleMode::SetsArg);
                 }
                 Op::DeployRelayToL1 => {
                     // L1 inner target.
@@ -536,7 +621,10 @@ impl SeqWorld {
                         &mut self.l1,
                         DEPLOYER,
                         TxKind::Create,
-                        init("contracts/out/Value.sol/Value.json", (U256::ZERO,).abi_encode_params()),
+                        init(
+                            "contracts/out/Value.sol/Value.json",
+                            (U256::ZERO,).abi_encode_params(),
+                        ),
                     ));
                     // L2-side proxy for inner_l1 on the ENTRY rollup (0).
                     let Some(out) = call_ok(run_tx(
@@ -557,7 +645,10 @@ impl SeqWorld {
                         &mut self.l2,
                         DEPLOYER,
                         TxKind::Create,
-                        init("contracts/out/NestedValue.sol/NestedValue.json", (l2_inner_proxy,).abi_encode_params()),
+                        init(
+                            "contracts/out/NestedValue.sol/NestedValue.json",
+                            (l2_inner_proxy,).abi_encode_params(),
+                        ),
                     ));
                     // L1 proxy + SetterWrapper for NestedValue@L2 → live trigger.
                     let Some(out) = call_ok(run_tx(
@@ -577,14 +668,166 @@ impl SeqWorld {
                         &mut self.l1,
                         DEPLOYER,
                         TxKind::Create,
-                        init("contracts/out/SetterWrapper.sol/SetterWrapper.json", (l1_proxy,).abi_encode_params()),
+                        init(
+                            "contracts/out/SetterWrapper.sol/SetterWrapper.json",
+                            (l1_proxy,).abi_encode_params(),
+                        ),
                     ));
                     self.dict.triggers.push(Trigger {
                         address: setter,
                         calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
                     });
                     self.settle_targets.push(nested);
-                    self.settle_revertable.push(false);
+                    self.settle_mode.push(SettleMode::SetsArg);
+                }
+                Op::DeployNested => {
+                    // Wrap the current chain top (or a fresh leaf Value) in a
+                    // NestedValue via a SAME-ROLLUP self-referential L2 proxy
+                    // (the deepNested e2e topology) → one more depth level.
+                    let inner = match self.nest_top {
+                        Some(top) => top,
+                        None => created(run_tx(
+                            &mut self.l2,
+                            DEPLOYER,
+                            TxKind::Create,
+                            init(
+                                "contracts/out/Value.sol/Value.json",
+                                (U256::ZERO,).abi_encode_params(),
+                            ),
+                        )),
+                    };
+                    // Self-referential L2 proxy for `inner` (originalRollupId = L2).
+                    let Some(out) = call_ok(run_tx(
+                        &mut self.l2,
+                        DEPLOYER,
+                        TxKind::Call(self.eezl2),
+                        createCrossChainProxyCall {
+                            originalAddress: inner,
+                            originalRollupId: U256::from(L2_ROLLUP_ID),
+                        }
+                        .abi_encode(),
+                    )) else {
+                        continue;
+                    };
+                    let inner_proxy = Address::abi_decode(&out).expect("decode inner proxy");
+                    let nested = created(run_tx(
+                        &mut self.l2,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init(
+                            "contracts/out/NestedValue.sol/NestedValue.json",
+                            (inner_proxy,).abi_encode_params(),
+                        ),
+                    ));
+                    // L1 trigger for the outermost NestedValue.
+                    let Some(out) = call_ok(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Call(self.eez),
+                        createCrossChainProxyCall {
+                            originalAddress: nested,
+                            originalRollupId: U256::from(L2_ROLLUP_ID),
+                        }
+                        .abi_encode(),
+                    )) else {
+                        continue;
+                    };
+                    let l1_proxy = Address::abi_decode(&out).expect("decode l1 proxy");
+                    let setter = created(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init(
+                            "contracts/out/SetterWrapper.sol/SetterWrapper.json",
+                            (l1_proxy,).abi_encode_params(),
+                        ),
+                    ));
+                    self.dict.triggers.push(Trigger {
+                        address: setter,
+                        calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
+                    });
+                    self.settle_targets.push(nested);
+                    self.settle_mode.push(SettleMode::SetsArg);
+                    self.nest_top = Some(nested);
+                }
+                Op::RegisterForceRevert => {
+                    // revertSpan shape: setValue lands cross-chain then its span
+                    // is force-discarded, so the target stays UNCHANGED.
+                    let value = created(run_tx(
+                        &mut self.l2,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init(
+                            "contracts/out/Value.sol/Value.json",
+                            (U256::ZERO,).abi_encode_params(),
+                        ),
+                    ));
+                    let Some(out) = call_ok(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Call(self.eez),
+                        createCrossChainProxyCall {
+                            originalAddress: value,
+                            originalRollupId: U256::from(L2_ROLLUP_ID),
+                        }
+                        .abi_encode(),
+                    )) else {
+                        continue;
+                    };
+                    let proxy = Address::abi_decode(&out).expect("decode proxy");
+                    let setter = created(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init(
+                            "contracts/out/ForceRevertWrapper.sol/ForceRevertWrapper.json",
+                            (proxy,).abi_encode_params(),
+                        ),
+                    ));
+                    self.dict.triggers.push(Trigger {
+                        address: setter,
+                        calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
+                    });
+                    self.settle_targets.push(value);
+                    self.settle_mode.push(SettleMode::AlwaysUnchanged);
+                }
+                Op::RegisterBridge => {
+                    // L1 BridgeSender → L2-proxy (value-bearing call) → L2
+                    // BridgeReceiver. Settled effect is the receiver's BALANCE.
+                    let receiver = created(run_tx(
+                        &mut self.l2,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init("contracts/out/Bridge.sol/BridgeReceiver.json", Vec::new()),
+                    ));
+                    let Some(out) = call_ok(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Call(self.eez),
+                        createCrossChainProxyCall {
+                            originalAddress: receiver,
+                            originalRollupId: U256::from(L2_ROLLUP_ID),
+                        }
+                        .abi_encode(),
+                    )) else {
+                        continue;
+                    };
+                    let l2_proxy = Address::abi_decode(&out).expect("decode bridge proxy");
+                    let sender = created(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init(
+                            "contracts/out/Bridge.sol/BridgeSender.json",
+                            (l2_proxy, receiver).abi_encode_params(),
+                        ),
+                    ));
+                    self.dict.triggers.push(Trigger {
+                        address: sender,
+                        calls: vec![CallSpec::payable_from_sig("bridge()", 0)],
+                    });
+                    self.settle_targets.push(receiver);
+                    self.settle_mode.push(SettleMode::Skip);
                 }
                 Op::Interact(tx) => {
                     if self.dict.triggers.is_empty() {
@@ -593,19 +836,30 @@ impl SeqWorld {
                     let tidx = (tx.trigger_sel as usize) % self.dict.triggers.len();
                     let settle_target = self.settle_targets[tidx];
                     let (raw, intended) = tx.resolve_and_sign(&self.dict);
-                    // Revertable target + odd arg → the cross-chain call reverts
-                    // and the try/catch wrapper continues, so the target keeps
-                    // its previous value rather than taking `intended`.
-                    let predicted = if self.settle_revertable[tidx] && intended.bit(0) {
-                        self.expected.get(&settle_target).copied().unwrap_or(U256::ZERO)
-                    } else {
-                        intended
+                    let prior = self
+                        .expected
+                        .get(&settle_target)
+                        .copied()
+                        .unwrap_or(U256::ZERO);
+                    // Predict the settled slot-0 from the trigger's mode: a
+                    // revertable target keeps `prior` on an odd (reverting) arg,
+                    // a force-revert span always keeps `prior`, otherwise the
+                    // target takes the intended arg.
+                    let predicted = match self.settle_mode[tidx] {
+                        SettleMode::RevertOnOdd if intended.bit(0) => prior,
+                        SettleMode::AlwaysUnchanged => prior,
+                        _ => intended,
                     };
                     // Compose errors (EmptyCalls, decode, …) are valid rejections.
                     let Ok(comp) = self.compose(&raw).await else {
                         continue;
                     };
                     self.settle_l2(&comp);
+                    // `Skip` targets settle a non-slot-0 effect (bridge balance);
+                    // the cumulative oracle ignores them, the port test checks them.
+                    if matches!(self.settle_mode[tidx], SettleMode::Skip) {
+                        continue;
+                    }
                     self.expected.insert(settle_target, predicted);
                     assert_eq!(
                         read_slot0(&self.l2, settle_target),
@@ -617,7 +871,11 @@ impl SeqWorld {
         }
         // Cumulative invariant: every target holds its last intended value.
         for (target, want) in &self.expected {
-            assert_eq!(read_slot0(&self.l2, *target), *want, "cumulative: target {target}");
+            assert_eq!(
+                read_slot0(&self.l2, *target),
+                *want,
+                "cumulative: target {target}"
+            );
         }
     }
 }
@@ -683,7 +941,10 @@ mod tests {
     async fn two_diff_op_settles_target() {
         let base = SeqWorld::boot_base();
         let mut w = SeqWorld::fork(&base);
-        w.run(Program { ops: vec![Op::RegisterTwoDiff, interact(1, 13)] }).await;
+        w.run(Program {
+            ops: vec![Op::RegisterTwoDiff, interact(1, 13)],
+        })
+        .await;
         assert_eq!(
             read_slot0(&w.l2, w.settle_targets[1]),
             U256::from(13u64),
@@ -705,5 +966,17 @@ impl SeqWorld {
     /// assert the destination contract's settled state directly.
     pub fn target_value(&self, idx: usize) -> U256 {
         read_slot0(&self.l2, self.settle_targets[idx])
+    }
+
+    /// L2 balance of the settle target at dict-trigger `idx` — for `Skip`-mode
+    /// triggers (e.g. `RegisterBridge`) whose settled effect is a value
+    /// transfer, not slot-0.
+    pub fn target_balance(&self, idx: usize) -> U256 {
+        self.l2
+            .cache
+            .accounts
+            .get(&self.settle_targets[idx])
+            .map(|a| a.info.balance)
+            .unwrap_or(U256::ZERO)
     }
 }

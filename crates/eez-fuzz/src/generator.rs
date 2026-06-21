@@ -29,12 +29,21 @@ impl CallSpec {
     /// A non-payable method from a canonical signature, e.g.
     /// `"setViaProxy(uint256)"`.
     pub fn from_sig(sig: &str, static_args: usize) -> Self {
+        Self {
+            payable: false,
+            ..Self::payable_from_sig(sig, static_args)
+        }
+    }
+
+    /// Like [`from_sig`](Self::from_sig) but `payable` — the generator may
+    /// attach `msg.value` (a value-bearing trigger like `bridge()`).
+    pub fn payable_from_sig(sig: &str, static_args: usize) -> Self {
         let mut selector = [0u8; 4];
         selector.copy_from_slice(&keccak256(sig.as_bytes())[..4]);
         Self {
             selector,
             static_args,
-            payable: false,
+            payable: true,
         }
     }
 }
