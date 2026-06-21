@@ -42,10 +42,13 @@ jobs:
       # Build everything (workspace lib + integration test binaries + the
       # eez-node binary that integration tests spawn via CARGO_BIN_EXE_).
       # Once this completes, clippy and both nextest runs read from cache.
+      # Exclude the cargo-fuzz bin crate: it links libFuzzer and only builds
+      # under `cargo +nightly fuzz` (see the `fuzz` job). Its harness/oracle
+      # are still covered here via the eez-fuzz lib's integration tests.
       - name: Build (tests + binaries)
-        run: cargo nextest run --workspace --all-targets --no-run
+        run: cargo nextest run --workspace --exclude eez-fuzz-fuzz --all-targets --no-run
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude eez-fuzz-fuzz --all-targets -- -D warnings
       - name: Build contracts (artifacts read by harness)
         working-directory: contracts
         run: forge build

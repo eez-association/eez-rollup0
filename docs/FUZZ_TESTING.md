@@ -121,9 +121,19 @@ Coverage-guided fuzzing (`crates/eez-fuzz`):
   tokio runtime boot once via `OnceLock`. It's a root-workspace MEMBER (shares `Cargo.lock`; a
   separate workspace re-resolves and pulls duplicate `alloy-eip7928`/`revm-state` that break
   `reth-storage-api`) but excluded from `default-members` so normal builds skip it.
-- Run: `cd crates/eez-fuzz && cargo +nightly fuzz run compose --sanitizer none`
-  (`--sanitizer none` keeps libFuzzer coverage without ASan-instrumenting the whole reth tree).
-  Verified: ~1,400 exec/s, coverage-guided corpus growth, no crashes on the single-hop world.
+## Using it
+
+- **Per-PR gate (CI):** `cargo test -p eez-fuzz` — the deterministic loop + oracle + generator tests.
+  CI runs this (via `--test '*'`); it does NOT run a fuzz campaign (the instrumented build is too
+  heavy). The `eez-fuzz-fuzz` bin is `--exclude`d from the workspace build/clippy steps.
+- **Campaigns (local only):** `crates/eez-fuzz/fuzz.sh`
+  - `./fuzz.sh run [-max_total_time=N]` — campaign (default 300s); grows + reuses `corpus/`.
+  - `./fuzz.sh repro <artifact>` — replay a crash; `tmin <artifact>` shrinks it; `cmin` minimizes
+    the corpus; `cov` is a coverage report.
+- **On a crash:** `repro`/`tmin` → promote the failing input to a `#[test]` in
+  `tests/compose_e2e.rs` (frozen regression, runs in CI) → fix → keep the input in `corpus/`.
+  `corpus/` + `artifacts/` are gitignored; commit crash inputs as regression tests, not the corpus.
+- Verified: ~1,400 exec/s, coverage-guided corpus growth, no crashes on the single-hop world.
 
 Not yet done:
 - Depth-2 nesting green (needs the 3rd-rollup target — see above).
