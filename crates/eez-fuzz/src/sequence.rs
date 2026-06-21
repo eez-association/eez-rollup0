@@ -51,6 +51,11 @@ pub enum Op {
     /// proxy TWICE in one tx → the composer records two cross-chain entries
     /// with the same `proxyEntryHash` (multi-entry / sequential-cursor path).
     RegisterMultiCall { value_idx: u16 },
+    /// Deploy a `RevertableValue` (reverts on odd args) reached via a try/catch
+    /// `RevertTolerantWrapper` → an `Interact` with an odd arg drives the
+    /// cross-chain natural-revert path (`CALL_END(success=false)`), the L2 state
+    /// stays unchanged. Self-contained (deploys its own target).
+    RegisterRevertTolerant,
     /// Fire a user tx through a live trigger (the single-tx generator).
     Interact(FuzzTx),
     /// Build an L2→L1 relay: `InnerValue` on L1, an L2-side proxy for it
@@ -80,6 +85,10 @@ pub struct SeqWorld {
     dict: Dict,
     /// settle target (the L2 `Value`) per dict trigger, index-aligned.
     settle_targets: Vec<Address>,
+    /// Whether each trigger's target REVERTS on odd args (a `RevertableValue`),
+    /// index-aligned with `settle_targets` — so `Interact` predicts "unchanged"
+    /// for an odd arg instead of `arg`.
+    settle_revertable: Vec<bool>,
     /// Cumulative expected slot-0 per target (last-writer-wins).
     expected: HashMap<Address, U256>,
 }
@@ -194,7 +203,10 @@ impl SeqWorld {
                 }],
                 keys: vec![PrivateKeySigner::from_bytes(&B256::repeat_byte(0x11)).expect("key")],
             },
+            // Base trigger is pre-registered at index 0 (not revertable), so
+            // `settle_revertable` starts aligned with `settle_targets`.
             settle_targets: vec![base.value],
+            settle_revertable: vec![false],
             expected: HashMap::new(),
         }
     }
@@ -387,6 +399,7 @@ impl SeqWorld {
                         calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
                     });
                     self.settle_targets.push(value);
+                    self.settle_revertable.push(false);
                 }
                 Op::RegisterMultiCall { value_idx } => {
                     if self.values.is_empty() {
@@ -419,6 +432,43 @@ impl SeqWorld {
                         calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
                     });
                     self.settle_targets.push(value);
+                    self.settle_revertable.push(false);
+                }
+                Op::RegisterRevertTolerant => {
+                    // RevertableValue (reverts on odd) reached via a try/catch
+                    // wrapper that does NOT require success.
+                    let value = created(run_tx(
+                        &mut self.l2,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init("contracts/out/RevertableValue.sol/RevertableValue.json", Vec::new()),
+                    ));
+                    let proxy = Address::abi_decode(&call_output(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Call(self.eez),
+                        createCrossChainProxyCall {
+                            originalAddress: value,
+                            originalRollupId: U256::from(L2_ROLLUP_ID),
+                        }
+                        .abi_encode(),
+                    )))
+                    .expect("decode proxy");
+                    let setter = created(run_tx(
+                        &mut self.l1,
+                        DEPLOYER,
+                        TxKind::Create,
+                        init(
+                            "contracts/out/RevertTolerantWrapper.sol/RevertTolerantWrapper.json",
+                            (proxy,).abi_encode_params(),
+                        ),
+                    ));
+                    self.dict.triggers.push(Trigger {
+                        address: setter,
+                        calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
+                    });
+                    self.settle_targets.push(value);
+                    self.settle_revertable.push(true);
                 }
                 Op::DeployRelayToL1 => {
                     // L1 inner target.
@@ -474,6 +524,7 @@ impl SeqWorld {
                         calls: vec![CallSpec::from_sig("setViaProxy(uint256)", 1)],
                     });
                     self.settle_targets.push(nested);
+                    self.settle_revertable.push(false);
                 }
                 Op::Interact(tx) => {
                     if self.dict.triggers.is_empty() {
@@ -481,7 +532,15 @@ impl SeqWorld {
                     }
                     let tidx = (tx.trigger_sel as usize) % self.dict.triggers.len();
                     let settle_target = self.settle_targets[tidx];
-                    let (raw, predicted) = tx.resolve_and_sign(&self.dict);
+                    let (raw, intended) = tx.resolve_and_sign(&self.dict);
+                    // Revertable target + odd arg → the cross-chain call reverts
+                    // and the try/catch wrapper continues, so the target keeps
+                    // its previous value rather than taking `intended`.
+                    let predicted = if self.settle_revertable[tidx] && intended.bit(0) {
+                        self.expected.get(&settle_target).copied().unwrap_or(U256::ZERO)
+                    } else {
+                        intended
+                    };
                     // Compose errors (EmptyCalls, decode, …) are valid rejections.
                     let Ok(comp) = self.compose(&raw).await else {
                         continue;
@@ -534,6 +593,24 @@ mod tests {
             read_slot0(&w.l2, w.settle_targets[0]),
             U256::from(42u64),
             "multi-call trigger must compose + settle the target to v",
+        );
+    }
+
+    /// `RegisterRevertTolerant`: an even arg settles the target; a following odd
+    /// arg drives the cross-chain revert through the try/catch wrapper and must
+    /// leave the target at its prior (even) value — never corrupt it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revert_tolerant_op_keeps_prior_on_revert() {
+        let base = SeqWorld::boot_base();
+        let mut w = SeqWorld::fork(&base);
+        w.run(Program {
+            ops: vec![Op::RegisterRevertTolerant, interact(0, 8), interact(0, 7)],
+        })
+        .await;
+        assert_eq!(
+            read_slot0(&w.l2, w.settle_targets[0]),
+            U256::from(8u64),
+            "even settles to 8; odd reverts and leaves the target unchanged",
         );
     }
 }
