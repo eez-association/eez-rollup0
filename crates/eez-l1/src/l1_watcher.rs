@@ -8,7 +8,11 @@
 //! Reorg detection walks back via `parent_hash` against a ring of recent
 //! canonical hashes (length ≤ `reorg_max_depth`). Past
 //! `reorg_max_depth`: halt with [`L1Error::ReorgTooDeep`]. Multi-block
-//! gaps between polls fill forward by the same walk.
+//! gaps between polls fill forward by the same walk. Catch-up gaps
+//! wider than `reorg_max_depth` verify the old tip is still canonical
+//! at its height before reseeding; a mismatch is a reorg across the
+//! gap — common ancestor is found against the ring and
+//! [`L1Event::Reorg`] is emitted, never swallowed (invariant 7).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -51,6 +55,9 @@ pub enum L1Event {
         block_number: u64,
         /// L1 block hash.
         block_hash: B256,
+        /// L1 block unix timestamp. Used by the Scheduler to anchor
+        /// the proof-window trigger (`L1_ts + proof_window_open`).
+        timestamp: u64,
     },
     /// Canonical L1 chain rewound. `common_ancestor_*` is the most
     /// recent block still in canon; everything strictly above it on
@@ -80,11 +87,25 @@ pub enum L1Event {
         /// the contract's state delta applied. `false` = loser
         /// (`ImmediateEntrySkipped`). Deriver reads this directly.
         state_applied: bool,
-        /// First `StateDelta.currentState`; diagnostics only —
-        /// `state_applied` is the authoritative winner/loser signal.
+        /// `L2ExecutionPerformed` events for our rollupId in the
+        /// postBatch's L1 block (counted per-block — deferred entries
+        /// emit from the bundled user_txs, not the postBatch tx). 0 =
+        /// nothing settled → Deriver skips the batch. Under partial
+        /// consumption (a reverting user_tx leaves its entry and the
+        /// rest unconsumed) this is the applied prefix: leading
+        /// immediate + consumed deferred entries.
+        settled_count: usize,
+        /// LAST applied entry's `newState` (log order) — L1's ACTUAL
+        /// stored root after this batch (a prefix endpoint under partial
+        /// consumption). The Deriver validates its replay endpoint
+        /// against THIS, never the claimed full-chain end.
+        settled_final_state: Option<B256>,
+        /// FIRST stateDelta's `currentState` for our rollup. Deriver
+        /// compares to local STF result at `from_block - 1` to catch
+        /// claimed-vs-derived divergence at the batch entry point.
         claimed_current_state: Option<B256>,
-        /// First `StateDelta.newState`; deriver compares to local STF
-        /// result at `to_block` to catch claimed-vs-derived divergence.
+        /// LAST stateDelta's `newState` for our rollup — the claimed
+        /// full-chain end. Diagnostics only; see `settled_final_state`.
         claimed_new_state: Option<B256>,
     },
     /// L1 finalized head advanced.
@@ -252,14 +273,30 @@ impl L1Watcher {
         let latest_number = latest.number;
         let latest_hash = latest.hash;
         let latest_parent = latest.parent_hash;
+        event!(
+            name: "eez.l1_watcher.poll.tick",
+            Level::INFO,
+            tick = tick_count,
+            latest_number,
+            tip = ?state.tip().map(|(n, _)| n),
+            "poll cycle: fetched latest L1 block",
+        );
 
         match state.tip() {
             // First poll — seed the ring with the latest, emit NewHead.
             None => {
+                event!(
+                    name: "eez.l1_watcher.poll.seed",
+                    Level::INFO,
+                    tick = tick_count,
+                    latest_number,
+                    "first poll: seeding canonical ring at latest L1 block",
+                );
                 state.push_canonical(latest_number, latest_hash);
                 self.emit(L1Event::NewHead {
                     block_number: latest_number,
                     block_hash: latest_hash,
+                    timestamp: latest.timestamp,
                 });
                 self.scan_batch_posted(provider, latest_number, latest_number, latest_hash)
                     .await?;
@@ -274,13 +311,14 @@ impl L1Watcher {
                 self.emit(L1Event::NewHead {
                     block_number: latest_number,
                     block_hash: latest_hash,
+                    timestamp: latest.timestamp,
                 });
                 self.scan_batch_posted(provider, latest_number, latest_number, latest_hash)
                     .await?;
             }
             // Either a reorg or a multi-block gap. Walk back via
             // parent_hash links until we hit a hash in our ring (common
-            // ancestor) or exceed reorg_max_depth (halt).
+            // ancestor) or exceed reorg_max_depth.
             Some(_) => {
                 let walked = walk_back_to_common(
                     provider,
@@ -289,16 +327,111 @@ impl L1Watcher {
                     state,
                 )
                 .await?;
-                let common = walked.ok_or(L1Error::ReorgTooDeep {
-                    walked: state.reorg_max_depth,
-                    max: state.reorg_max_depth,
-                })?;
-
                 let (old_tip_number, old_tip_hash) =
                     state.tip().expect("tip is Some in this branch");
+
+                let Some(common) = walked else {
+                    // Walk-back exhausted depth without a common
+                    // ancestor. Either the tip is far enough behind
+                    // latest that the walk never reached it (benign
+                    // catch-up) or it's within reorg_max_depth and
+                    // still unmatched (genuine deep reorg → halt).
+                    let depth = state.reorg_max_depth as u64;
+                    if latest_number > old_tip_number.saturating_add(depth) {
+                        // "Far behind" doesn't prove the old tip is
+                        // still canonical — swallowing a reorg across
+                        // the gap is the silent fallback invariant 7
+                        // forbids. Verify by height first.
+                        let at_old_height =
+                            fetch_block_by_tag(provider, BlockNumberOrTag::Number(old_tip_number))
+                                .await?;
+                        let reorged_across_gap = at_old_height.hash != old_tip_hash;
+                        let scan_from = if reorged_across_gap {
+                            // Old tip reorged out. Find the common
+                            // ancestor against the ring (bounded by
+                            // ≤ reorg_max_depth); none in bounds →
+                            // loud halt, not benign catch-up.
+                            let common = find_common_ancestor_by_height(provider, state)
+                                .await?
+                                .ok_or(L1Error::ReorgTooDeep {
+                                    walked: state.reorg_max_depth,
+                                    max: state.reorg_max_depth,
+                                })?;
+                            event!(
+                                name: "eez.l1_watcher.poll.catchup_reorg",
+                                Level::WARN,
+                                tick = tick_count,
+                                old_tip_number,
+                                old_tip_hash = %old_tip_hash,
+                                hash_at_old_height = %at_old_height.hash,
+                                common_ancestor_number = common.number,
+                                common_ancestor_hash = %common.hash,
+                                latest_number,
+                                "chain reorged across catch-up gap — old tip \
+                                 no longer canonical; emitting Reorg before \
+                                 reseed",
+                            );
+                            self.emit(L1Event::Reorg {
+                                common_ancestor_number: common.number,
+                                common_ancestor_hash: common.hash,
+                                old_head_hash: old_tip_hash,
+                                new_head_number: latest_number,
+                                new_head_hash: latest_hash,
+                            });
+                            common.number + 1
+                        } else {
+                            event!(
+                                name: "eez.l1_watcher.poll.catchup",
+                                Level::INFO,
+                                tick = tick_count,
+                                old_tip_number,
+                                latest_number,
+                                reorg_max_depth = state.reorg_max_depth,
+                                "tip is far behind latest beyond reorg_max_depth \
+                                 and still canonical — treating as catch-up, \
+                                 scanning BatchPosted and reseeding ring at \
+                                 latest",
+                            );
+                            old_tip_number + 1
+                        };
+                        self.scan_batch_posted(provider, scan_from, latest_number, latest_hash)
+                            .await?;
+                        // Ring lost continuity to the gap; reseed
+                        // at latest. (rewind_to(0) drops everything
+                        // above genesis; subsequent push_canonical
+                        // lands latest in an otherwise-empty ring.)
+                        event!(
+                            name: "eez.l1_watcher.ring.rewind",
+                            Level::WARN,
+                            tick = tick_count,
+                            old_tip_number,
+                            old_tip_hash = %old_tip_hash,
+                            new_tip_number = latest_number,
+                            new_tip_hash = %latest_hash,
+                            reorged_across_gap,
+                            "reseeding ring at latest — dropping all prior \
+                             ring entries",
+                        );
+                        state.rewind_to(0);
+                        state.push_canonical(latest_number, latest_hash);
+                        self.emit(L1Event::NewHead {
+                            block_number: latest_number,
+                            block_hash: latest_hash,
+                            timestamp: latest.timestamp,
+                        });
+                        return Ok(());
+                    }
+                    return Err(L1Error::ReorgTooDeep {
+                        walked: state.reorg_max_depth,
+                        max: state.reorg_max_depth,
+                    });
+                };
+
                 let was_reorg = old_tip_number > common.number || old_tip_hash != common.hash;
                 if was_reorg {
-                    state.rewind_to(common.number);
+                    // Reorg event first, then the ring rewind it
+                    // explains — every rewind below the old tip is
+                    // preceded by a Reorg emission.
                     self.emit(L1Event::Reorg {
                         common_ancestor_number: common.number,
                         common_ancestor_hash: common.hash,
@@ -306,6 +439,19 @@ impl L1Watcher {
                         new_head_number: latest_number,
                         new_head_hash: latest_hash,
                     });
+                    event!(
+                        name: "eez.l1_watcher.ring.rewind",
+                        Level::WARN,
+                        tick = tick_count,
+                        old_tip_number,
+                        old_tip_hash = %old_tip_hash,
+                        common_ancestor_number = common.number,
+                        common_ancestor_hash = %common.hash,
+                        new_head_number = latest_number,
+                        new_head_hash = %latest_hash,
+                        "reorg — rewinding ring to common ancestor",
+                    );
+                    state.rewind_to(common.number);
                 }
                 // Walk forward from common+1 to latest, emitting NewHead
                 // for each missed block and scanning its BatchPosted
@@ -340,27 +486,33 @@ impl L1Watcher {
         if from > to {
             return Ok(());
         }
-        // Collect (number, hash) for from..=to by walking back from
-        // (to, to_hash) via parent_hash.
+        // Collect (number, hash, timestamp) for from..=to by walking
+        // back from (to, to_hash) via parent_hash. We need each
+        // block's timestamp for downstream Scheduler trigger anchoring,
+        // so unlike the earlier hash-only walk, fetch every step.
         let span = usize::try_from(to - from + 1).unwrap_or(usize::MAX);
-        let mut collected: Vec<(u64, B256)> = Vec::with_capacity(span);
+        let mut collected: Vec<(u64, B256, u64)> = Vec::with_capacity(span);
         let mut cursor_hash = to_hash;
         let mut cursor_number = to;
-        for _ in 0..span {
-            collected.push((cursor_number, cursor_hash));
+        loop {
+            let block = fetch_block_by_hash(provider, cursor_hash).await?;
+            collected.push((cursor_number, cursor_hash, block.timestamp));
             if cursor_number == from {
                 break;
             }
-            let block = fetch_block_by_hash(provider, cursor_hash).await?;
             cursor_hash = block.parent_hash;
             cursor_number = block.number.saturating_sub(1);
+            if collected.len() >= span {
+                break;
+            }
         }
         // Emit oldest to newest.
-        for (n, h) in collected.iter().rev() {
+        for (n, h, ts) in collected.iter().rev() {
             state.push_canonical(*n, *h);
             self.emit(L1Event::NewHead {
                 block_number: *n,
                 block_hash: *h,
+                timestamp: *ts,
             });
         }
         Ok(())
@@ -377,6 +529,13 @@ impl L1Watcher {
         to: u64,
         _to_hash: B256,
     ) -> L1Result<()> {
+        event!(
+            name: "eez.l1_watcher.scan_batch_posted",
+            Level::INFO,
+            from,
+            to,
+            "scanning L1 range for BatchPosted logs",
+        );
         let scanned = crate::submitter::scan_batch_logs(
             provider,
             self.inner.config.eez,
@@ -385,6 +544,16 @@ impl L1Watcher {
             BlockNumberOrTag::Number(to),
         )
         .await?;
+        if !scanned.is_empty() {
+            event!(
+                name: "eez.l1_watcher.scan_batch_posted.found",
+                Level::INFO,
+                from,
+                to,
+                count = scanned.len(),
+                "emitting BatchPosted events to subscribers",
+            );
+        }
         for b in scanned {
             self.emit(L1Event::BatchPosted {
                 l1_block_number: b.l1_block_number,
@@ -394,6 +563,8 @@ impl L1Watcher {
                 rollup_count: b.rollup_count,
                 call_data: b.call_data,
                 state_applied: b.state_applied,
+                settled_count: b.settled_count,
+                settled_final_state: b.settled_final_state,
                 claimed_current_state: b.claimed_current_state,
                 claimed_new_state: b.claimed_new_state,
             });
@@ -406,7 +577,15 @@ impl L1Watcher {
         provider: &impl Provider,
         state: &mut WatcherState,
     ) -> L1Result<()> {
-        let finalized = fetch_block_by_tag(provider, BlockNumberOrTag::Finalized).await?;
+        // A freshly-launched embedded chiado L1 has no finalized block
+        // until lighthouse delivers an FCU carrying a finalized field.
+        // Treat "block(finalized) returned None" as "not yet available"
+        // — don't propagate it as a poll-cycle failure.
+        let finalized = match fetch_block_by_tag(provider, BlockNumberOrTag::Finalized).await {
+            Ok(b) => b,
+            Err(L1Error::Provider(msg)) if msg.contains("returned None") => return Ok(()),
+            Err(e) => return Err(e),
+        };
         if state.last_finalized_hash == Some(finalized.hash) {
             return Ok(());
         }
@@ -518,6 +697,27 @@ async fn walk_back_to_common(
     Ok(None)
 }
 
+/// Finds the most recent ring entry whose hash still matches the
+/// provider's canonical block at that height. Compares newest first,
+/// fetching by NUMBER (not hash) so the answer reflects the provider's
+/// CURRENT canonical chain — used when a catch-up gap is too wide for
+/// the parent-hash walk in [`walk_back_to_common`] to reach the ring.
+/// Bounded by the ring length (≤ `reorg_max_depth`). Returns `None` if
+/// every ring entry was reorged out (caller maps that to
+/// [`L1Error::ReorgTooDeep`]).
+async fn find_common_ancestor_by_height(
+    provider: &impl Provider,
+    state: &WatcherState,
+) -> L1Result<Option<CommonAncestor>> {
+    for &(number, hash) in state.recent.iter().rev() {
+        let canonical = fetch_block_by_tag(provider, BlockNumberOrTag::Number(number)).await?;
+        if canonical.hash == hash {
+            return Ok(Some(CommonAncestor { number, hash }));
+        }
+    }
+    Ok(None)
+}
+
 /// Minimal block-header snapshot the watcher needs. Avoids the full
 /// `alloy_rpc_types_eth::Block` type at every call site.
 #[derive(Debug, Clone, Copy)]
@@ -525,6 +725,9 @@ struct BlockSnapshot {
     number: u64,
     hash: B256,
     parent_hash: B256,
+    /// Unix timestamp from `block.header.timestamp`. Used by downstream
+    /// Schedulers to anchor proof-window triggers.
+    timestamp: u64,
 }
 
 async fn fetch_block_by_tag(
@@ -540,6 +743,7 @@ async fn fetch_block_by_tag(
         number: block.header.number,
         hash: block.header.hash,
         parent_hash: block.header.inner.parent_hash,
+        timestamp: block.header.inner.timestamp,
     })
 }
 
@@ -553,6 +757,7 @@ async fn fetch_block_by_hash(provider: &impl Provider, hash: B256) -> L1Result<B
         number: block.header.number,
         hash: block.header.hash,
         parent_hash: block.header.inner.parent_hash,
+        timestamp: block.header.inner.timestamp,
     })
 }
 

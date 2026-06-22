@@ -13,7 +13,7 @@ use std::{sync::Arc, time::Duration};
 use alloy_provider::RootProvider;
 use clap::Parser as _;
 use eez_deriver::Deriver;
-use eez_driver::{BlockCommitterHandle, Scheduler};
+use eez_driver::BlockCommitterHandle;
 use eez_l1::{
     L1CanonicalHead, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
     registry_deploy_block_from_env,
@@ -90,23 +90,33 @@ fn main() -> eyre::Result<()> {
         let l1_head = Arc::new(L1CanonicalHead::default());
         let submitter = Submitter::new(submitter_config);
         let l1_watcher = L1Watcher::spawn(l1_watcher_config);
+        // The branch's `Deriver` runs the cross-chain STF when given a
+        // `SystemTxContext`. This follower derives pure-user-tx batches
+        // only — `None` keeps the user-tx STF. On a cross-chain Sync
+        // block that path replays without the system txs and the
+        // deriver's per-block hash check fails LOUDLY (it does not
+        // silently corrupt). Wiring a follower-side `SystemTxContext`
+        // (as eez-node does in follower mode) is a follow-up.
         let deriver = Deriver::new(
             l1_watcher,
             block_committer.clone(),
             Arc::new(provider.clone()),
             submitter,
             chain_spec,
+            BLOCK_TIME.as_secs(),
             deploy_block,
             Arc::clone(&l1_head),
+            None,
         );
 
         if let Err(err) = deriver.catch_up().await {
             event!(
                 name: "eez.follower.deriver.boot_catch_up.failed",
-                Level::WARN,
+                Level::ERROR,
                 error = %err,
-                "boot-time catch_up failed; deriver.run() will retry post-subscribe",
+                "boot-time catch_up failed; refusing to start unsafe-head follower before L1 reconciliation",
             );
+            return Err(eyre::eyre!("boot-time deriver catch_up failed: {err}"));
         }
 
         let deriver_run = deriver.clone();
@@ -116,8 +126,7 @@ fn main() -> eyre::Result<()> {
 
         if let Some(sequencer_rpc) = ext.sequencer_rpc {
             let sequencer_rpc = RootProvider::new_http(sequencer_rpc);
-            let scheduler = Scheduler::interval(BLOCK_TIME);
-            let follower = Follower::new(block_committer, sequencer_rpc, provider, scheduler);
+            let follower = Follower::new(block_committer, sequencer_rpc, provider, BLOCK_TIME);
             event!(
                 name: "eez.follower.sequencer_rpc.spawned",
                 Level::INFO,

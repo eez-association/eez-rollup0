@@ -8,6 +8,7 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     process::{Child, Command, Stdio},
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -77,6 +78,7 @@ pub struct AnvilConfig {
     pub mnemonic: Option<&'static str>,
     pub hardfork: Option<&'static str>,
     pub gas_limit: Option<u64>,
+    pub genesis_timestamp: Option<u64>,
 }
 
 impl Default for AnvilConfig {
@@ -86,9 +88,12 @@ impl Default for AnvilConfig {
             mnemonic: None,
             hardfork: None,
             gas_limit: None,
+            genesis_timestamp: None,
         }
     }
 }
+
+const REORG_GENESIS_TIMESTAMP: u64 = 1_687_223_762;
 
 impl AnvilConfig {
     /// 1s block time, hardhat mnemonic, cancun hardfork, 30M gas.
@@ -100,6 +105,7 @@ impl AnvilConfig {
             mnemonic: Some(HARDHAT_MNEMONIC),
             hardfork: Some("cancun"),
             gas_limit: Some(30_000_000),
+            genesis_timestamp: Some(REORG_GENESIS_TIMESTAMP),
         }
     }
 }
@@ -128,6 +134,9 @@ impl Anvil {
         }
         if let Some(g) = cfg.gas_limit {
             cmd.args(["--gas-limit", &g.to_string()]);
+        }
+        if let Some(t) = cfg.genesis_timestamp {
+            cmd.args(["--timestamp", &t.to_string()]);
         }
         let child = cmd
             .stdout(Stdio::null())
@@ -286,9 +295,21 @@ impl Harness {
     ) -> Vec<(&'static str, String)> {
         vec![
             ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
+            // Harness tests provide their own external anvil L1.
+            ("EEZ_L1_EMBEDDED", "0".to_string()),
             ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
             ("EEZ_L1_POSTER_KEY", poster_key.to_string()),
+            ("EEZ_L1_CHAIN_ID", "31337".to_string()),
             ("EEZ_PROOF_SIGNER_KEY", ANVIL_KEY.to_string()),
+            ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
+            (
+                "EEZ_CCM_L2_ADDRESS",
+                "0x0000000000000000000000000000000000000000".to_string(),
+            ),
+            ("EEZ_L1_BLOCK_TIME_MS", "2000".to_string()),
+            ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
+            ("EEZ_PROOF_TIME_MS", "1000".to_string()),
+            ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
             (
                 "EEZ_REGISTRY_ADDRESS",
                 format!("{:#x}", self.dep.eez_address),
@@ -608,6 +629,8 @@ pub struct NodeHandle {
     pub http_port: u16,
 }
 
+static LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Default)]
 pub struct NodeConfig<'a> {
     /// Path to a custom genesis JSON. `None` uses `--chain dev`.
@@ -633,8 +656,11 @@ impl NodeHandle {
         env: &[(&'static str, String)],
     ) -> Result<Self> {
         let (log_path, log_tempdir) = if let Ok(d) = std::env::var("EEZ_TEST_LOG_DIR") {
-            let p =
-                std::path::PathBuf::from(d).join(format!("eez-node-{}.log", std::process::id()));
+            let suffix = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let p = std::path::PathBuf::from(d).join(format!(
+                "eez-node-{name}-{}-{suffix}.log",
+                std::process::id()
+            ));
             (p, None)
         } else {
             let td = tempfile::tempdir().context("log tempdir")?;
@@ -677,6 +703,7 @@ impl NodeHandle {
                 "--port",
                 &p2p_port.to_string(),
                 "--disable-discovery",
+                "--ipcdisable",
             ])
             .stderr(stderr)
             .env_clear()
@@ -745,7 +772,11 @@ impl NodeHandle {
     /// even if reorg detection regressed (some unrelated re-derivation
     /// path could re-converge state).
     pub fn assert_reorg_seen(&self) {
-        let patterns = ["reorg rolled out", "l1.reorg.retreated"];
+        let patterns = [
+            "reorg rolled out",
+            "l1.reorg.retreated",
+            "L1 reorg reported",
+        ];
         assert!(
             self.log_count_matching(&patterns).unwrap() > 0,
             "{} deriver missed the reorg",

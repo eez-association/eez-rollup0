@@ -34,10 +34,11 @@ source "$ENV_FILE"
 # `StateDelta.currentState` must match this value, so it has to equal
 # the L2 reth genesis state root.
 #
-# Default is reth `--chain dev`'s genesis state root (verified via
-# `eth_getBlockByNumber(0).stateRoot` on a fresh node). Override via
+# Pinned to our `genesis.json` which adds the SystemAccount predeposit
+# per Rollup-1.md §3.1 (1e13 ETH at `0xdead…dead`). Verified via
+# `eth_getBlockByNumber(0).stateRoot` on a fresh node. Override via
 # the env var when targeting a different L2 chain spec.
-EEZ_INITIAL_STATE_ROOT="${EEZ_INITIAL_STATE_ROOT:-0xf09d8f7da5bc5036f8dd9536c953e2212390a46fb3e553ece2b7d419131537b1}"
+EEZ_INITIAL_STATE_ROOT="${EEZ_INITIAL_STATE_ROOT:-0x5aab3b1dfa6fe9d89126e001b8fc4d9ed65c80174760e5019cb5b68b7467bd94}"
 
 # Derive addresses from keys.
 AUTHORIZED_SIGNER="$(cast wallet address --private-key "$EEZ_PROOF_SIGNER_KEY")"
@@ -75,7 +76,15 @@ extract_uint() {
 # message would be lost.
 run_forge() {
     local label="$1"; shift
-    if ! OUT="$(cd "$CONTRACTS" && "$@" 2>&1)"; then
+    local extra=()
+    # On flaky public RPCs (chiado endpoints), forge's pre-broadcast
+    # simulation refetches state at a block the RPC hasn't finalized
+    # yet → "block not found". Smokes set EEZ_DEPLOY_SKIP_SIMULATION=1
+    # to bypass that phase. Local dev L1 leaves it unset.
+    if [[ "${EEZ_DEPLOY_SKIP_SIMULATION:-0}" == "1" ]]; then
+        extra+=(--skip-simulation)
+    fi
+    if ! OUT="$(cd "$CONTRACTS" && "$@" "${extra[@]}" 2>&1)"; then
         echo "$OUT" >&2
         echo "deploy: $label failed (forge non-zero exit)" >&2
         exit 1
@@ -109,8 +118,8 @@ EEZ_ROLLUP_MANAGER_ADDRESS="$(extract ROLLUP_CONTRACT "$OUT")"
 [[ -n "$EEZ_ROLLUP_MANAGER_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture ROLLUP_CONTRACT address" >&2; exit 1; }
 echo "      rollupMgr  = $EEZ_ROLLUP_MANAGER_ADDRESS"
 
-# ── 4/4 RegisterRollup ──────────────────────────────────────────────
-echo "[4/4] RegisterRollup(initialState=$EEZ_INITIAL_STATE_ROOT)"
+# ── 4/5 RegisterRollup ──────────────────────────────────────────────
+echo "[4/5] RegisterRollup(initialState=$EEZ_INITIAL_STATE_ROOT)"
 run_forge "RegisterRollup" forge script script/RegisterRollup.s.sol:RegisterRollup \
     --sig "run(address,address,bytes32)" \
     "$EEZ_REGISTRY_ADDRESS" "$EEZ_ROLLUP_MANAGER_ADDRESS" "$EEZ_INITIAL_STATE_ROOT" \
@@ -118,6 +127,24 @@ run_forge "RegisterRollup" forge script script/RegisterRollup.s.sol:RegisterRoll
 EEZ_ROLLUP_ID="$(extract_uint L2_ROLLUP_ID "$OUT")"
 [[ -n "$EEZ_ROLLUP_ID" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture L2_ROLLUP_ID" >&2; exit 1; }
 echo "      rollupId   = $EEZ_ROLLUP_ID"
+
+# ── 5/5 DeployBridgeL1 ──────────────────────────────────────────────
+# Creates the L1 CrossChainProxy (representing the L2 BridgeReceiver
+# predeploy at `0x4200…0008`) and a user-facing BridgeSender. The
+# composer's first cross-chain smoke routes a deposit through these.
+EEZ_L2_BRIDGE_RECEIVER_DEFAULT="0x4200000000000000000000000000000000000008"
+EEZ_L2_BRIDGE_RECEIVER="${EEZ_L2_BRIDGE_RECEIVER:-$EEZ_L2_BRIDGE_RECEIVER_DEFAULT}"
+echo "[5/5] DeployBridgeL1(l2Dest=$EEZ_L2_BRIDGE_RECEIVER, rollupId=$EEZ_ROLLUP_ID)"
+EEZ_REGISTRY_ADDRESS="$EEZ_REGISTRY_ADDRESS" \
+EEZ_L2_BRIDGE_RECEIVER="$EEZ_L2_BRIDGE_RECEIVER" \
+EEZ_ROLLUP_ID="$EEZ_ROLLUP_ID" \
+run_forge "DeployBridgeL1" forge script script/DeployBridgeL1.s.sol:DeployBridgeL1 $RPC $KEY --broadcast
+EEZ_L1_L2_PROXY="$(extract L2_PROXY "$OUT")"
+EEZ_L1_BRIDGE_SENDER="$(extract BRIDGE_SENDER "$OUT")"
+[[ -n "$EEZ_L1_L2_PROXY"     ]] || { echo "$OUT" >&2; echo "deploy: failed to capture L2_PROXY" >&2; exit 1; }
+[[ -n "$EEZ_L1_BRIDGE_SENDER" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture BRIDGE_SENDER" >&2; exit 1; }
+echo "      L2 proxy   = $EEZ_L1_L2_PROXY"
+echo "      L1 bridge  = $EEZ_L1_BRIDGE_SENDER"
 
 # ── L2 genesis with deploy-aligned timestamp ────────────────────────
 # Reth's `--chain dev` prebaked genesis has timestamp = June 2023.
@@ -167,6 +194,19 @@ EEZ_MOCK_PROOF_SYSTEM_ADDRESS=$EEZ_MOCK_PROOF_SYSTEM_ADDRESS
 EEZ_ROLLUP_MANAGER_ADDRESS=$EEZ_ROLLUP_MANAGER_ADDRESS
 EEZ_ROLLUP_ID=$EEZ_ROLLUP_ID
 EEZ_L2_GENESIS_PATH=$GENESIS_OUT
+
+# L1 cross-chain bridge contracts (DeployBridgeL1).
+EEZ_L1_L2_PROXY=$EEZ_L1_L2_PROXY
+EEZ_L1_BRIDGE_SENDER=$EEZ_L1_BRIDGE_SENDER
+EEZ_L2_BRIDGE_RECEIVER=$EEZ_L2_BRIDGE_RECEIVER
+
+# L2 CCM-L2 (predeploy baked into genesis.json).
+EEZ_CCM_L2_ADDRESS=0x4200000000000000000000000000000000000007
+# Smoke deviation from Rollup-1.md §3: SystemAddress is a real funded
+# EOA (hardhat #0) so the L2 system tx can be signed normally — vanilla
+# reth doesn't support type-0x7E (OP-Stack deposit) txs. Replace with
+# 0xdead…dead + NodePrimitives extension when type-0x7E lands.
+EEZ_L2_SYSTEM_ADDRESS=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
 EOF
 
 echo

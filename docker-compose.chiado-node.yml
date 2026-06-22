@@ -1,0 +1,128 @@
+# Packaged chiado node: eez-node (embedded chiado L1 + L2 + composer) +
+# lighthouse (drives the embedded L1). Single-L1 topology — no standalone
+# tip-follower reth: the bundle target-block oracle falls back to the
+# embedded L1 (EEZ_L1_TARGET_RPC_URL unset), which tracks the canonical
+# tip in steady state. The one-time protocol deploy is done against an
+# external chiado RPC before `up` (see README / scripts/devnet-test.sh).
+#
+# Prereqs (one-time, see README):
+#   1. Download an L1 snapshot into ${L1_SNAPSHOT_DIR}:
+#        docker run --rm -v ${L1_SNAPSHOT_DIR}:/data \
+#          ghcr.io/gnosischain/reth_gnosis:v2.0.0 \
+#          download --chain chiado --minimal --datadir /data
+#   2. Create the shared JWT: openssl rand -hex 32 > ${JWT_FILE}
+#   3. Deploy the protocol on chiado and write deployments.env
+#        (make deploy-protocol against EEZ_L1_RPC_URL=<external chiado RPC>)
+#   4. Fill .env.chiado (keys + bundler) from .env.chiado.example
+#
+# Then: docker compose -f docker-compose.chiado-node.yml up
+#
+# Both services use host networking so lighthouse↔eez-node engine API and
+# the embedded L1 / lighthouse libp2p peering work without port mapping.
+
+services:
+  eez-node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: eez-node:local
+    container_name: eez-node-chiado
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # deployments.env (registry/proof-system/rollup-mgr/deploy-block, from
+    # the protocol deploy) + .env.chiado (keys + bundler URL).
+    env_file:
+      - ./deployments.env
+      - ./.env.chiado
+    environment:
+      # Embedded chiado L1 (reth_gnosis) — single L1 for the whole node.
+      EEZ_L1_EMBEDDED: "1"
+      EEZ_L1_CHAIN: chiado
+      EEZ_L1_CHAIN_ID: "10200"
+      EEZ_L1_HTTP_PORT: "18645"
+      # Embedded-L1 engine-API port. Override (L1_AUTH_PORT) if the host
+      # already runs a reth on 18551 (e.g. a standalone chiado-reth).
+      EEZ_L1_AUTH_PORT: "${L1_AUTH_PORT:-18551}"
+      EEZ_L1_P2P_PORT: "30544"
+      EEZ_L1_DATADIR: /l1
+      EEZ_L1_JWT_SECRET: /jwt/jwt.hex
+      EEZ_L1_RPC_URL: http://127.0.0.1:18645
+      # EEZ_L1_TARGET_RPC_URL intentionally unset → bundle target-block
+      # oracle falls back to the embedded L1 (config.rs build_target_provider).
+      EEZ_L1_ROLLUP_ID: "0"
+      # Cross-chain wiring.
+      EEZ_CCM_L2_ADDRESS: "0x4200000000000000000000000000000000000007"
+      EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS: "10200"
+      # Deterministic L1-anchored timings (must match any follower).
+      EEZ_L1_BLOCK_TIME_MS: "5000"
+      EEZ_L2_BLOCK_TIME_MS: "1000"
+      EEZ_PROOF_TIME_MS: "2000"
+      EEZ_SUBMISSION_SLACK_MS: "500"
+      # Don't freeze the sequencer when chiado bundles are slow to land.
+      EEZ_MAX_SPECULATIVE_DEPTH: "0"
+      # L2.
+      EEZ_L2_DATADIR: /l2
+      EEZ_L2_GENESIS_PATH: /app/genesis.json
+      EEZ_INITIAL_STATE_ROOT: "0x5aab3b1dfa6fe9d89126e001b8fc4d9ed65c80174760e5019cb5b68b7467bd94"
+    volumes:
+      - ${L1_SNAPSHOT_DIR:?set L1_SNAPSHOT_DIR (reth download target)}:/l1
+      - ${L2_DATA_DIR:?set L2_DATA_DIR}:/l2
+      - ${JWT_FILE:?set JWT_FILE}:/jwt/jwt.hex:ro
+      # Fresh-timestamp L2 genesis overriding the (stale) baked one, so the
+      # L1-anchored scheduler starts near grid-height 0 instead of racing
+      # millions of blocks. Root is timestamp-independent (matches the
+      # on-chain registration). Generate at deploy time: ts = now.
+      - ${FRESH_GENESIS:?set FRESH_GENESIS}:/app/genesis.json:ro
+    command:
+      - node
+      - --chain=/app/genesis.json
+      - --datadir=/l2
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=18688
+      - --http.api=eth,net,web3
+      - --authrpc.addr=127.0.0.1
+      - --authrpc.port=18684
+      - --port=30640
+      - --discovery.port=30640
+      - --discovery.v5.port=30641
+      - --ipcdisable
+      - --disable-discovery
+      - --engine.persistence-threshold=256
+      - --engine.memory-block-buffer-target=128
+    logging:
+      driver: "local"
+
+  lighthouse:
+    image: sigp/lighthouse:v8.1.2
+    container_name: eez-chiado-lighthouse
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      - eez-node
+    volumes:
+      - ${LIGHTHOUSE_DATA:?set LIGHTHOUSE_DATA}:/data
+      - ${JWT_FILE:?set JWT_FILE}:/jwt/jwt.hex:ro
+      - ${CHIADO_CONFIG_DIR:?set CHIADO_CONFIG_DIR}:/config-dir:ro
+    command:
+      - lighthouse
+      - beacon_node
+      - --testnet-dir=/config-dir
+      - --listen-address=0.0.0.0
+      - --port=9205
+      - --quic-port=9206
+      - --http
+      - --http-address=127.0.0.1
+      - --http-port=6152
+      - --execution-endpoints=http://127.0.0.1:${L1_AUTH_PORT:-18551}
+      - --jwt-secrets=/jwt/jwt.hex
+      - --datadir=/data
+      - --checkpoint-sync-url=https://checkpoint.chiadochain.net/
+      # Direct chiado peers — discovery alone is too sparse on a fresh
+      # lighthouse DB; without these the beacon head never advances (0
+      # peers) and the embedded EL stalls. Copied from docker-compose.chiado.yml.
+      - --libp2p-addresses=/ip4/57.131.40.177/tcp/9000/p2p/16Uiu2HAm6HQoX8sEJxr58GkuM9FPWkgLdCs71vz5qcu7hyisYRLS,/ip4/45.79.214.176/tcp/9000/p2p/16Uiu2HAm7jUXmkWrC5cTwSa9bVtzeAwUXu3MZZnhcsY5QTAiNmyL,/ip4/51.210.221.124/tcp/9500/p2p/16Uiu2HAmSnLLjZfkFCythED8tQS5kP4NJKBuMdd1FYE23ZymKwL6,/ip4/57.129.122.18/tcp/9000/p2p/16Uiu2HAmALSWURS5G4Qsmm7eFbH5oXxoFJEQuVdhAZ1MMcE9XjrU,/ip4/51.210.221.124/tcp/9100/p2p/16Uiu2HAmUhn8VR7HFY7SLPqbBhnTT1yfjKBJQKSodUkWsE5adNNu,/ip4/137.74.112.3/tcp/9000/p2p/16Uiu2HAm1merr7djndkMFf2TxacP53tA6rFoU4tXD5NNPGYz6RPa,/ip4/65.109.101.48/tcp/9000/p2p/16Uiu2HAm98ceLNE6X3mjVcsu6ZAaKZPPcqKmeofidTDy7UCHyTtY
+    logging:
+      driver: "local"

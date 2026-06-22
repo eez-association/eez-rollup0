@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use alloy_eips::{BlockNumHash, BlockNumberOrTag};
 use alloy_provider::{Provider, RootProvider};
-use eez_driver::{BlockCommitterHandle, ForkchoiceOutcome, Scheduler};
+use eez_driver::{BlockCommitterHandle, ForkchoiceOutcome};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_primitives_traits::SealedHeader;
 use reth_storage_api::{BlockIdReader, HeaderProvider};
@@ -58,7 +58,10 @@ pub(crate) struct Follower<P> {
     /// Local chain reader — resolves the current safe anchor and the
     /// candidate head's ancestry for the compatibility check.
     local: P,
-    scheduler: Scheduler,
+    /// Cadence for polling the sequencer RPC for new unsafe heads. The
+    /// branch's eez-driver has no lightweight scheduler type (slot-based
+    /// scheduling replaced it), so the follower drives its own interval.
+    poll_interval: Duration,
     last_head: Option<alloy_primitives::B256>,
 }
 
@@ -70,22 +73,23 @@ where
         committer: BlockCommitterHandle<EthEngineTypes>,
         sequencer_rpc: RootProvider,
         local: P,
-        scheduler: Scheduler,
+        poll_interval: Duration,
     ) -> Self {
         Self {
             committer,
             sequencer_rpc,
             local,
-            scheduler,
+            poll_interval,
             last_head: None,
         }
     }
 
     pub(crate) async fn run(mut self) {
+        let mut poll = tokio::time::interval(self.poll_interval);
         let mut fcu_interval = tokio::time::interval(FCU_REFRESH);
         loop {
             tokio::select! {
-                _ = self.scheduler.next() => {
+                _ = poll.tick() => {
                     if let Err(err) = self.advance().await {
                         event!(
                             name: "eez.follower.advance.failed",
@@ -218,13 +222,25 @@ where
         if candidate.number < safe_number {
             return Ok(SafeCompat::Conflicts);
         }
-        if candidate.number - safe_number > MAX_ANCESTRY_WALK {
-            return Ok(SafeCompat::Unverifiable);
+        if candidate.number - safe_number > MAX_ANCESTRY_WALK
+            && self
+                .local
+                .sealed_header(candidate.number)
+                .map_err(|e| {
+                    FollowerError::Provider(format!("sealed_header({}): {e}", candidate.number))
+                })?
+                .is_some_and(|local| local.hash() == candidate_hash)
+        {
+            return Ok(SafeCompat::Extends);
         }
 
         let mut cursor_hash = candidate.parent_hash;
         let mut cursor_number = candidate.number - 1;
+        let mut reads = 0;
         while cursor_number > safe_number {
+            if reads >= MAX_ANCESTRY_WALK {
+                return Ok(SafeCompat::Unverifiable);
+            }
             let Some(parent) = self
                 .local
                 .header(cursor_hash)
@@ -234,6 +250,7 @@ where
             };
             cursor_hash = parent.parent_hash;
             cursor_number -= 1;
+            reads += 1;
         }
         Ok(if cursor_hash == safe_hash {
             SafeCompat::Extends

@@ -1,4 +1,8 @@
 [submodule "sync-rollups-protocol"]
 	path = sync-rollups-protocol
 	url = https://github.com/eez-association/sync-rollups-protocol.git
-	branch = main
+	# Pinned by the recorded gitlink commit (fe7bf66), NOT branch-tracked.
+	# `branch = main` was removed so `git submodule update --remote` can't
+	# silently jump the protocol to upstream main (which has moved well past
+	# our tested commit). To intentionally upgrade: checkout the desired
+	# commit inside sync-rollups-protocol/ and commit the new gitlink.

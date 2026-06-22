@@ -40,6 +40,9 @@ pub(crate) enum ErrorKind {
     /// `BlockCommitter` actor task is gone (channel closed). The Sequencer
     /// can't recover; the caller (typically eez-node main) will log + exit.
     CommitterClosed,
+    /// `RollupTiming` env loading or validation failed (operator misconfig
+    /// at startup). The Sequencer refuses to start.
+    TimingConfig(String),
     /// Sequencer's snapshotted `parent_hash` no longer matches
     /// `last_header`. Caller retries next tick.
     StaleParent { expected: B256, actual: B256 },
@@ -72,6 +75,10 @@ impl DriverError {
 
     pub(crate) fn committer_closed() -> Self {
         Self::new(ErrorKind::CommitterClosed)
+    }
+
+    pub(crate) fn timing_config(detail: impl Into<String>) -> Self {
+        Self::new(ErrorKind::TimingConfig(detail.into()))
     }
 
     pub(crate) fn stale_parent(expected: B256, actual: B256) -> Self {
@@ -116,7 +123,14 @@ impl DriverError {
         matches!(self.kind, ErrorKind::CommitterClosed)
     }
 
-    /// Sequencer's snapshot was stale before the commit could run;
+    /// Returns true if [`RollupTiming`](crate::timing::RollupTiming)
+    /// env loading or validation failed at startup.
+    #[must_use]
+    pub fn is_timing_config(&self) -> bool {
+        matches!(self.kind, ErrorKind::TimingConfig(_))
+    }
+
+    /// Sequencer's snapshot was stale by the time the actor checked;
     /// caller should retry on the next tick.
     #[must_use]
     pub fn is_stale_parent(&self) -> bool {
@@ -157,6 +171,9 @@ impl fmt::Display for DriverError {
             ErrorKind::EngineRpc(msg) => write!(f, "engine-API transport error: {msg}"),
             ErrorKind::CommitterClosed => {
                 write!(f, "block committer actor task has exited")
+            }
+            ErrorKind::TimingConfig(detail) => {
+                write!(f, "RollupTiming misconfig: {detail}")
             }
             ErrorKind::StaleParent { expected, actual } => {
                 write!(
