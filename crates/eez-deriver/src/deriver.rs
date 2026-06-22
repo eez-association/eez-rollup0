@@ -173,10 +173,13 @@ where
     ///    L1 block is no longer canonical. This is the missed-reorg
     ///    case: block number + tx hash are not enough once the event
     ///    carrying the common ancestor was lost.
-    /// 2. [`Self::sync_batches`] re-scans L1 from the surviving anchor
-    ///    (full history when nothing survives) and reconciles whatever
-    ///    isn't indexed yet, then moves reth's safe head to match —
-    ///    forward after new batches, backward after a retreat.
+    /// 2. If the cursor retreated, [`Self::retreat_l2_to_cursor`]
+    ///    moves reth's safe/finalized/head anchors back before any
+    ///    replacement branch is replayed.
+    /// 3. [`Self::sync_batches_inner`] re-scans L1 from the surviving
+    ///    anchor (full history when nothing survives), reconciles
+    ///    whatever isn't indexed yet, then advances safe/finalized
+    ///    forward for new batches.
     ///
     /// Without phase 1, a forward-only rescan trusts a poisoned index:
     /// it stacks new-chain batches on top of rolled-out ones at the
@@ -186,12 +189,16 @@ where
     ///
     /// Same as [`Self::catch_up`].
     async fn recovery_resync(&self) -> DeriverResult<()> {
-        match self.revalidate_index_tail().await? {
-            Some(anchor_l1_block) => {
-                self.sync_batches(anchor_l1_block, self.inner.l1_head.cursor())
-                    .await
-            }
-            None => self.sync_batches(self.inner.deploy_block, 0).await,
+        let _guard = self.inner.committer.begin_reconcile().await;
+        let old_cursor = self.inner.l1_head.cursor();
+        let anchor = self.revalidate_index_tail().await?;
+        let cursor = self.inner.l1_head.cursor();
+        if cursor < old_cursor {
+            self.retreat_l2_to_cursor(cursor).await?;
+        }
+        match anchor {
+            Some(anchor_l1_block) => self.sync_batches_inner(anchor_l1_block, cursor).await,
+            None => self.sync_batches_inner(self.inner.deploy_block, 0).await,
         }
     }
 
@@ -200,7 +207,8 @@ where
     /// longer the canonical hash at that height. Returns the L1 block
     /// of the highest still-canonical indexed batch — the lower bound
     /// for the forward rescan — or `None` if the index is (or became)
-    /// empty.
+    /// empty. Caller holds the reconcile lock because this mutates the
+    /// shared cursor/index that Sequencer scheduling reads.
     async fn revalidate_index_tail(&self) -> DeriverResult<Option<u64>> {
         while let Some(tail) = self.inner.l1_head.last_indexed() {
             let canonical = self
@@ -240,8 +248,16 @@ where
     /// tx hash is already indexed are skipped entirely — their L2
     /// ranges are covered by `cumulative_start`.
     async fn sync_batches(&self, from_l1_block: u64, cumulative_start: u64) -> DeriverResult<()> {
-        // Acquire lock to prevent sequencing during the sync
         let _guard = self.inner.committer.begin_reconcile().await;
+        self.sync_batches_inner(from_l1_block, cumulative_start)
+            .await
+    }
+
+    async fn sync_batches_inner(
+        &self,
+        from_l1_block: u64,
+        cumulative_start: u64,
+    ) -> DeriverResult<()> {
         let local_head = self
             .inner
             .l2_provider
@@ -357,23 +373,17 @@ where
             self.inner.l1_head.append_many(new_batches);
         }
 
-        // Move reth's safe head to whatever L1 has confirmed — forward
-        // after a bulk replay, *backward* after a recovery tail audit
-        // dropped rolled-out batches. Live on_batch_posted
-        // advances safe on each new event; here we reconcile the safe
-        // head after a bulk pass so RPC clients see the right safe head
-        // before the next live event lands.
+        // Advance reth's safe head to whatever L1 has confirmed.
+        // Delivered reorgs and recovery tail audits retreat it before
+        // this forward scan runs.
         let old_safe_l2 = self.inner.safe_l2_block.load(Ordering::Acquire);
-        if cumulative_l2 != old_safe_l2 {
+        if cumulative_l2 > old_safe_l2 {
             let safe_header = self.l2_sealed_header_at(cumulative_l2)?;
             let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
             self.inner
                 .committer
-                .advance_safe_finalized(safe_header.clone(), finalized_hash)
+                .advance_safe_finalized(safe_header, finalized_hash)
                 .await?;
-            if cumulative_l2 < old_safe_l2 {
-                self.inner.committer.reorg_to(safe_header).await?;
-            }
             self.inner
                 .safe_l2_block
                 .store(cumulative_l2, Ordering::Release);
@@ -951,22 +961,7 @@ where
             return Ok(());
         }
 
-        let new_safe_header = self.l2_sealed_header_at(new_cursor)?;
-        let new_safe_hash = new_safe_header.hash();
-        let new_finalized = self.inner.l1_head.finalized_l2();
-        let new_finalized_hash = self.l2_hash_at(new_finalized)?;
-
-        // Order matters: retreat safe/finalized first while the old
-        // head is still canonical, then roll head back to the same
-        // surviving L2 block and repair the committer's parent mirror.
-        self.inner
-            .committer
-            .advance_safe_finalized(new_safe_header.clone(), new_finalized_hash)
-            .await?;
-        self.inner.committer.reorg_to(new_safe_header).await?;
-        self.inner
-            .safe_l2_block
-            .store(new_cursor, Ordering::Release);
+        let new_safe_hash = self.retreat_l2_to_cursor(new_cursor).await?;
 
         event!(
             name: "eez.deriver.l1.reorg.retreated",
@@ -982,6 +977,27 @@ where
             "L1 reorg rolled out confirmed batches; L2 head retreated to the surviving safe cursor",
         );
         Ok(())
+    }
+
+    /// Retreat reth's safe/finalized anchors and canonical head to the
+    /// current L1-derived cursor. Caller must hold the reconcile lock so
+    /// the Sequencer cannot extend the branch between the two
+    /// forkchoice updates.
+    async fn retreat_l2_to_cursor(&self, cursor: u64) -> DeriverResult<B256> {
+        let safe_header = self.l2_sealed_header_at(cursor)?;
+        let safe_hash = safe_header.hash();
+        let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
+
+        // Order matters: retreat safe/finalized first while the old
+        // head is still canonical, then roll head back to the same
+        // surviving L2 block and repair the committer's parent mirror.
+        self.inner
+            .committer
+            .advance_safe_finalized(safe_header.clone(), finalized_hash)
+            .await?;
+        self.inner.committer.reorg_to(safe_header).await?;
+        self.inner.safe_l2_block.store(cursor, Ordering::Release);
+        Ok(safe_hash)
     }
 
     async fn on_l1_finalized(&self, l1_finalized_block: u64) -> DeriverResult<()> {
