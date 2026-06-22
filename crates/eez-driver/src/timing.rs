@@ -356,7 +356,7 @@ mod tests {
         assert_eq!(t.k(), 6);
         assert_eq!(t.future_count(), 1);
         assert_eq!(t.live_count(), 4);
-        assert_eq!(t.proof_window_open(), Duration::from_millis(8_000));
+        assert_eq!(t.proof_window_open(), Duration::from_secs(8));
         assert_eq!(t.submission_deadline(), Duration::from_millis(11_900));
     }
 
