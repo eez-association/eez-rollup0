@@ -309,7 +309,7 @@ where
             // here would commit blocks that exist on no other node, so
             // bail *before* touching reth rather than after.
             if let Some(claimed_current) = batch.claimed_current_state {
-                let local_root = self.l2_sealed_header_at(cumulative_l2)?.state_root();
+                let local_root = self.l2_state_root_at(cumulative_l2)?;
                 if local_root != claimed_current {
                     event!(
                         name: "eez.deriver.catch_up.cursor.misaligned",
@@ -383,9 +383,6 @@ where
                 .safe_l2_block
                 .store(cumulative_l2, Ordering::Release);
         }
-
-        // Cursor + index now reflect L1; the Composer may build batches.
-        self.inner.l1_head.mark_initialized();
 
         if total_replayed > 0 {
             event!(
@@ -843,17 +840,7 @@ where
         // exist on no other node. Bail out; the run-loop resync
         // re-anchors the cursor from L1.
         if let Some(claimed_current) = claimed_current_state {
-            let local_root = self
-                .inner
-                .l2_provider
-                .sealed_header(last_indexed_l2)
-                .map_err(DeriverError::l2_provider)?
-                .ok_or_else(|| {
-                    DeriverError::l2_provider(format!(
-                        "local L2 header at {last_indexed_l2} missing"
-                    ))
-                })?
-                .state_root();
+            let local_root = self.l2_state_root_at(last_indexed_l2)?;
             if local_root != claimed_current {
                 event!(
                     name: "eez.deriver.cursor.misaligned",
@@ -1014,6 +1001,10 @@ where
 
     fn l2_hash_at(&self, l2_block: u64) -> DeriverResult<B256> {
         Ok(self.l2_sealed_header_at(l2_block)?.hash())
+    }
+
+    fn l2_state_root_at(&self, l2_block: u64) -> DeriverResult<B256> {
+        Ok(self.l2_sealed_header_at(l2_block)?.state_root())
     }
 
     /// Per-block reconciliation against a decoded batch beginning at

@@ -38,10 +38,10 @@ use crate::local::build_sync_block;
 use crate::optimistic::OptimisticallyIncluded;
 use crate::rollup::RollupState;
 
-/// Runtime config for the cross-chain execution path on Sync slots.
-/// `Composer::new` accepts `Option<Arc<CrossChainExecCtx>>`; `Some`
-/// means a wired `EvmComposer` and the keys/addresses needed to sign
-/// the L2 system txs that the composer's
+/// Runtime config for Sync-slot L1 submission. `Composer::new` accepts
+/// `Option<Arc<CrossChainExecCtx>>`; `Some` means the composer can emit
+/// `postBatch` transactions. When a wired `EvmComposer` is also present,
+/// this context additionally signs the L2 system txs that
 /// `simulate_and_resolve` returns as raw `(load_table_payload,
 /// execute_payload)` bytes.
 ///
@@ -177,11 +177,10 @@ struct Inner<L2: BlockReader> {
     /// `Composition<EvmProtocol>` (L2 destination effects + L1
     /// `ExecutionEntry`s).
     evm_composer: Option<eez_evm_inspector::EvmComposer>,
-    /// Runtime context (signer + L2 chain config) for wrapping the
-    /// composer's `(load_table_payload, execute_payload)` byte
-    /// outputs into signed L2 system txs. Must be `Some` whenever
-    /// `evm_composer` is `Some`; both come from the same `eez-node`
-    /// startup wiring step.
+    /// Runtime context for L1 postBatch submission. Must be `Some`
+    /// whenever `evm_composer` is `Some`; external-L1 composer mode can
+    /// also set it without an `EvmComposer` to emit minimal
+    /// leading-immediate batches.
     cc_exec_ctx: Option<Arc<CrossChainExecCtx>>,
     /// Handle to the `BlockCommitter` actor (the sole engine-API
     /// owner). Set once at startup via [`Composer::set_committer`]
@@ -479,8 +478,10 @@ where
     /// With a cross-chain `EvmComposer` wired, each drained tx runs
     /// through `simulate_and_resolve` and the rich Sync block + atomic L1
     /// bundle dispatch via `compose_via_evm_composer` (optimistic).
-    /// Without one (no embedded L1), the drained txs commit as ordinary
-    /// type-0x2 calls — the standalone build+commit fallback.
+    /// With only a `CrossChainExecCtx`, held L1 txs stay queued and the
+    /// slot emits a minimal leading-immediate `postBatch`. With neither,
+    /// the drained txs commit as ordinary type-0x2 calls — the
+    /// standalone build+commit fallback.
     async fn compose_sync_slot(
         &self,
         rollup_id: u64,
@@ -504,15 +505,6 @@ where
             );
             None
         })?;
-        if !rollup.l1_head.is_initialized() {
-            event!(
-                name: "eez.composer.sync_slot.deriver_not_ready",
-                Level::DEBUG,
-                rollup_id,
-                "deriver has not completed an L1 sync yet; skipping batch composition",
-            );
-            return None;
-        }
         let Some(pool) = rollup.held_pool.as_ref() else {
             event!(
                 name: "eez.composer.sync_slot.no_pool",

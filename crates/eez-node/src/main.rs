@@ -560,7 +560,7 @@ fn main() -> eyre::Result<()> {
             // pairs into signed legacy L2 system txs. External-L1
             // composer mode still needs the context so minimal
             // leading-immediate postBatches keep L1's state root in sync.
-            let cc_exec_ctx: Option<Arc<eez_composer::CrossChainExecCtx>> = {
+            let cc_exec_ctx: Arc<eez_composer::CrossChainExecCtx> = {
                 let system_key = env::var("EEZ_L2_SYSTEM_KEY").map_err(|_| {
                     eyre::eyre!("EEZ_L2_SYSTEM_KEY required in composer mode")
                 })?;
@@ -624,7 +624,7 @@ fn main() -> eyre::Result<()> {
                 // `eth_sendBundle` on relays that support it (rbuilder),
                 // ordered mempool submission on plain execution RPCs
                 // (dev reth, anvil) detected via JSON-RPC -32601.
-                Some(Arc::new(eez_composer::CrossChainExecCtx {
+                Arc::new(eez_composer::CrossChainExecCtx {
                     system_signer,
                     ccm_l2_address,
                     l2_chain_id: chain_spec.chain().id(),
@@ -637,21 +637,19 @@ fn main() -> eyre::Result<()> {
                     l1_post_batch_priority_fee,
                     mock_proof_system_address,
                     l2_rollup_id: l2_rollup_id_for_ctx,
-                }))
+                })
             };
             // Project the Arc<CrossChainExecCtx> into a SystemTxContext
             // BEFORE moving it into the Composer. The Deriver picks
             // this up further down to STF-reconstruct the same L2
             // system txs the composer produced.
-            let deriver_system_tx_cfg = cc_exec_ctx.as_ref().map(|ctx| {
-                eez_evm::system_tx::SystemTxContext {
-                    system_signer: ctx.system_signer.clone(),
-                    ccm_l2_address: ctx.ccm_l2_address,
-                    l2_chain_id: ctx.l2_chain_id,
-                    l2_gas_price: ctx.l2_gas_price,
-                    l2_gas_limit: ctx.l2_gas_limit,
-                    this_rollup_id: ctx.l2_rollup_id,
-                }
+            let deriver_system_tx_cfg = Some(eez_evm::system_tx::SystemTxContext {
+                system_signer: cc_exec_ctx.system_signer.clone(),
+                ccm_l2_address: cc_exec_ctx.ccm_l2_address,
+                l2_chain_id: cc_exec_ctx.l2_chain_id,
+                l2_gas_price: cc_exec_ctx.l2_gas_price,
+                l2_gas_limit: cc_exec_ctx.l2_gas_limit,
+                this_rollup_id: cc_exec_ctx.l2_rollup_id,
             });
             let composer = Composer::new(
                 rollups,
@@ -660,7 +658,7 @@ fn main() -> eyre::Result<()> {
                 l1_watcher.clone(),
                 evm_config,
                 evm_composer,
-                cc_exec_ctx,
+                Some(cc_exec_ctx),
             );
             let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
 
