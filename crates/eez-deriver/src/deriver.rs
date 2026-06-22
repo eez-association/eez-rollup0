@@ -205,9 +205,17 @@ where
             let batch_first_l2 = cumulative_l2 + 1;
             let batch_last_l2 = cumulative_l2 + decoded.block_count() as u64;
 
-            // Catch-up always replays — the deriver is the authority on L2
-            // chain state during boot. Skips would trust whatever's locally
-            // canonical, which can be a Sequencer-race-produced block.
+            // Reconcile against the local chain instead of force-replaying.
+            // On a restart reth already holds the blocks this node produced
+            // and posted; re-executing them tears the canonical chain down
+            // to the batch's first block and rebuilds it, which (a) is pure
+            // churn and (b) leaves reth's canonical head behind the safe
+            // anchor the Deriver then advances — every later FCU is rejected
+            // with "Safe block not found in canonical chain" and production
+            // wedges. `reconcile_batch_blocks` only replays blocks that are
+            // missing or whose txs differ from L1's batch (a real divergence
+            // / race), and `check_claimed_state` below still validates the
+            // claimed roots either way, so correctness is unchanged.
             // `settled_count` bounds the system-tx reconstruction to the
             // prefix L1 actually consumed (partial-consumption rule).
             total_replayed += self
@@ -217,7 +225,7 @@ where
                     batch.l1_block_number,
                     batch.tx_hash,
                     batch.settled_count,
-                    true,
+                    false,
                 )
                 .await?;
 
