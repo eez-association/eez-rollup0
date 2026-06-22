@@ -15,6 +15,7 @@ use eez_driver::ConfirmedHeadSource;
 #[derive(Debug, Clone, Copy)]
 pub struct BatchRecord {
     pub l1_block: u64,
+    pub l1_block_hash: B256,
     pub tx_hash: B256,
     pub last_l2_block: u64,
 }
@@ -126,17 +127,35 @@ impl L1CanonicalHead {
         self.cursor.store(max_l2, Ordering::Release);
     }
 
-    /// Drop indexed batches above `common_ancestor_number`; retreat
+    /// Snapshot indexed batch records. Used by the deriver to compare
+    /// recorded L1 block hashes against the current canonical chain
+    /// before applying an L1 reorg retreat.
+    ///
+    /// # Panics
+    ///
+    /// If the `batches` mutex is poisoned.
+    pub fn batch_records(&self) -> Vec<BatchRecord> {
+        self.batches.lock().unwrap().clone()
+    }
+
+    /// Drop indexed batches above `common_ancestor_number` or whose
+    /// recorded L1 block hash no longer matches canonical L1; retreat
     /// `cursor` (and `finalized_l2` if it would cross cursor).
     /// Returns `(new_cursor, new_finalized, dropped_count)`.
     ///
     /// # Panics
     ///
     /// If the `batches` mutex is poisoned.
-    pub fn retreat_on_l1_reorg(&self, common_ancestor_number: u64) -> (u64, u64, usize) {
+    pub fn retreat_on_l1_reorg(
+        &self,
+        common_ancestor_number: u64,
+        noncanonical_txs: &HashSet<B256>,
+    ) -> (u64, u64, usize) {
         let mut batches = self.batches.lock().unwrap();
         let original_len = batches.len();
-        batches.retain(|b| b.l1_block <= common_ancestor_number);
+        batches.retain(|b| {
+            b.l1_block <= common_ancestor_number && !noncanonical_txs.contains(&b.tx_hash)
+        });
         let dropped = original_len - batches.len();
         let new_cursor = batches.last().map_or(0, |b| b.last_l2_block);
         self.cursor.store(new_cursor, Ordering::Release);
@@ -184,6 +203,7 @@ mod tests {
     fn record(l1_block: u64, tx_byte: u8, last_l2_block: u64) -> BatchRecord {
         BatchRecord {
             l1_block,
+            l1_block_hash: B256::with_last_byte(l1_block as u8),
             tx_hash: B256::with_last_byte(tx_byte),
             last_l2_block,
         }
@@ -224,10 +244,25 @@ mod tests {
             record(102, 0xdd, 80),
         ]);
         head.set_finalized_l2(60);
-        let (new_cursor, new_finalized, dropped) = head.retreat_on_l1_reorg(100);
+        let (new_cursor, new_finalized, dropped) = head.retreat_on_l1_reorg(100, &HashSet::new());
         assert_eq!(new_cursor, 60); // both batches at L1=100 survive
         assert_eq!(new_finalized, 60);
         assert_eq!(dropped, 2);
+    }
+
+    #[test]
+    fn retreat_drops_same_number_noncanonical_hashes() {
+        let head = L1CanonicalHead::default();
+        head.append_many([
+            record(100, 0xaa, 50),
+            record(101, 0xbb, 60),
+            record(102, 0xcc, 70),
+        ]);
+        let noncanonical = HashSet::from([B256::with_last_byte(0xbb)]);
+        let (new_cursor, _new_finalized, dropped) = head.retreat_on_l1_reorg(101, &noncanonical);
+        assert_eq!(new_cursor, 50);
+        assert_eq!(dropped, 2);
+        assert!(!head.contains_l1_tx(&B256::with_last_byte(0xbb)));
     }
 
     #[test]

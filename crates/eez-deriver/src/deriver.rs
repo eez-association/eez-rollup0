@@ -6,10 +6,11 @@
 //! STF-replay pattern adapted from `based-rollup`'s `build_derived_block`
 //! at `/root/sync-rollups-composer/crates/based-rollup/src/driver/protocol_txs.rs:453`.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use alloy_eips::{Decodable2718, Encodable2718};
+use alloy_eips::{BlockNumberOrTag, Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT, BlockCommitterHandle, DeriveOutcome};
@@ -232,6 +233,7 @@ where
             if !known_tx_hashes.contains(&batch.tx_hash) {
                 new_batches.push(BatchRecord {
                     l1_block: batch.l1_block_number,
+                    l1_block_hash: batch.l1_block_hash,
                     tx_hash: batch.tx_hash,
                     last_l2_block: batch_last_l2,
                 });
@@ -538,6 +540,7 @@ where
         match event {
             L1Event::BatchPosted {
                 l1_block_number,
+                l1_block_hash,
                 tx_hash,
                 submitter,
                 call_data,
@@ -550,6 +553,7 @@ where
             } => {
                 self.on_batch_posted(
                     l1_block_number,
+                    l1_block_hash,
                     tx_hash,
                     submitter,
                     call_data,
@@ -584,6 +588,7 @@ where
     async fn on_batch_posted(
         &self,
         l1_block_number: u64,
+        l1_block_hash: B256,
         tx_hash: B256,
         submitter: Address,
         call_data: Bytes,
@@ -722,6 +727,7 @@ where
         self.inner.safe_l2_block.store(to_block, Ordering::Release);
         self.inner.l1_head.append(BatchRecord {
             l1_block: l1_block_number,
+            l1_block_hash,
             tx_hash,
             last_l2_block: to_block,
         });
@@ -760,10 +766,11 @@ where
         // L1CanonicalHead handles the cursor + finalized retreats
         // atomically; we just propagate to reth's safe head below.
         let old_cursor = self.inner.l1_head.cursor();
+        let noncanonical_txs = self.noncanonical_batch_txs(common_ancestor_number).await?;
         let (new_cursor, _new_finalized, dropped) = self
             .inner
             .l1_head
-            .retreat_on_l1_reorg(common_ancestor_number);
+            .retreat_on_l1_reorg(common_ancestor_number, &noncanonical_txs);
         if new_cursor >= old_cursor {
             // L1 reorg happened above where our batches live; nothing
             // for us to retreat.
@@ -774,6 +781,7 @@ where
                 old_head_hash = %old_head_hash,
                 new_head_number,
                 new_head_hash = %new_head_hash,
+                noncanonical_batches = noncanonical_txs.len(),
                 "L1 reorg above our batches; no L2 retreat needed",
             );
             return Ok(());
@@ -825,9 +833,72 @@ where
             old_cursor,
             new_cursor,
             dropped_batches = dropped,
+            noncanonical_batches = noncanonical_txs.len(),
             "L1 reorg rolled out confirmed batches; L2 head retreated to cursor's L2 hash",
         );
         Ok(())
+    }
+
+    async fn noncanonical_batch_txs(
+        &self,
+        common_ancestor_number: u64,
+    ) -> DeriverResult<HashSet<B256>> {
+        use alloy_provider::{Provider as _, ProviderBuilder};
+
+        let records = self.inner.l1_head.batch_records();
+        let mut noncanonical = HashSet::new();
+        let mut canonical_hashes = HashMap::new();
+        if records.is_empty() {
+            return Ok(noncanonical);
+        }
+
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(self.inner.submitter.rpc_url());
+        for record in records {
+            if record.l1_block > common_ancestor_number {
+                noncanonical.insert(record.tx_hash);
+                continue;
+            }
+
+            let canonical_hash = if let Some(hash) = canonical_hashes.get(&record.l1_block) {
+                *hash
+            } else {
+                let block = provider
+                    .get_block_by_number(BlockNumberOrTag::Number(record.l1_block))
+                    .await
+                    .map_err(|e| {
+                        DeriverError::l2_provider(format!(
+                            "get L1 block {} during reorg audit: {e}",
+                            record.l1_block
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        DeriverError::l2_provider(format!(
+                            "L1 block {} missing during reorg audit",
+                            record.l1_block
+                        ))
+                    })?;
+                let hash = block.header.hash;
+                canonical_hashes.insert(record.l1_block, hash);
+                hash
+            };
+
+            if canonical_hash != record.l1_block_hash {
+                event!(
+                    name: "eez.deriver.l1.reorg.batch_noncanonical",
+                    Level::WARN,
+                    l1_block_number = record.l1_block,
+                    recorded_hash = %record.l1_block_hash,
+                    canonical_hash = %canonical_hash,
+                    tx_hash = %record.tx_hash,
+                    last_l2_block = record.last_l2_block,
+                    "indexed batch's L1 block hash no longer matches canonical L1",
+                );
+                noncanonical.insert(record.tx_hash);
+            }
+        }
+        Ok(noncanonical)
     }
 
     async fn on_l1_finalized(&self, l1_finalized_block: u64) -> DeriverResult<()> {

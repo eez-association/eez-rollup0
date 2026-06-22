@@ -678,8 +678,8 @@ impl NodeHandle {
         env: &[(&'static str, String)],
     ) -> Result<Self> {
         let (log_path, log_tempdir) = if let Ok(d) = std::env::var("EEZ_TEST_LOG_DIR") {
-            let p =
-                std::path::PathBuf::from(d).join(format!("eez-node-{}.log", std::process::id()));
+            let p = std::path::PathBuf::from(d)
+                .join(format!("eez-node-{name}-{}.log", std::process::id()));
             (p, None)
         } else {
             let td = tempfile::tempdir().context("log tempdir")?;
@@ -810,12 +810,15 @@ impl NodeHandle {
         });
     }
 
-    /// Assert this node's deriver detected and retreated from the L1
-    /// reorg. Without this check the reorg test would silently pass
-    /// even if reorg detection regressed (some unrelated re-derivation
-    /// path could re-converge state).
+    /// Assert this node's deriver detected and handled the L1 reorg.
+    /// Some runs legitimately have no stale confirmed batch on one node,
+    /// in which case the correct deriver action is an explicit no-op.
     pub fn assert_reorg_seen(&self) {
-        let patterns = ["reorg rolled out", "l1.reorg.retreated"];
+        let patterns = [
+            "reorg rolled out",
+            "l1.reorg.retreated",
+            "L1 reorg above our batches",
+        ];
         assert!(
             self.log_count_matching(&patterns).unwrap() > 0,
             "{} deriver missed the reorg",
@@ -910,6 +913,18 @@ impl<'a> Chain<'a> {
             self.deploy_block,
         )
         .await
+    }
+
+    pub async fn latest_execution_block(&self) -> Result<Option<u64>> {
+        use alloy_rpc_types_eth::Filter;
+        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
+        let filter = Filter::new()
+            .address(self.eez_address)
+            .event_signature(IEEZ::L2ExecutionPerformed::SIGNATURE_HASH)
+            .topic1(B256::from(U256::from(self.rollup_id)))
+            .from_block(self.deploy_block);
+        let logs = provider.get_logs(&filter).await?;
+        Ok(logs.into_iter().filter_map(|log| log.block_number).max())
     }
 
     pub async fn entries_skipped(&self) -> Result<usize> {

@@ -212,6 +212,7 @@ impl Submitter {
             .into_iter()
             .map(|b| HistoricalBatch {
                 l1_block_number: b.l1_block_number,
+                l1_block_hash: b.l1_block_hash,
                 tx_hash: b.tx_hash,
                 submitter: b.submitter,
                 call_data: b.call_data,
@@ -230,6 +231,7 @@ impl Submitter {
 #[derive(Debug, Clone)]
 pub struct HistoricalBatch {
     pub l1_block_number: u64,
+    pub l1_block_hash: alloy_primitives::B256,
     pub tx_hash: alloy_primitives::B256,
     pub submitter: alloy_primitives::Address,
     pub call_data: alloy_primitives::Bytes,

@@ -269,14 +269,22 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
         .wait_for_batches(4, DEFAULT_TIMEOUT)
         .await
         .expect("pre-reorg: ≥4 combined batches");
+    let latest_execution_block = chain
+        .latest_execution_block()
+        .await
+        .unwrap()
+        .expect("pre-reorg: at least one settled execution");
+    let latest_l1_block = chain.block_number().await.unwrap();
+    let reorg_depth = latest_l1_block
+        .saturating_sub(latest_execution_block)
+        .saturating_add(2)
+        .max(3);
 
-    // Drop the most recent 3 L1 blocks. Composer's bundle-target window
-    // is `latest + 2`, so depth=3 is enough to roll back at least one
-    // landed `BatchPosted` and force both derivers to retreat. Note:
-    // anvil's reorg rewinds contract state too, so the contract's
-    // `batchesPosted` and `stateRoot` drop back to a pre-reorg value
-    // and only re-grow as composers repost.
-    harness.anvil.reorg(3).await.unwrap();
+    // Rewind through the latest settled execution block, not just a
+    // fixed number of blocks. The bundle-target window means a fixed
+    // depth can leave the newest confirmed batch exactly at the common
+    // ancestor, making the correct deriver action a no-op.
+    harness.anvil.reorg(reorg_depth).await.unwrap();
 
     // I4 — Liveness FIRST: wait for `batchesPosted` to climb past the
     // pre-reorg count. Without this, I3 below could trivially succeed
