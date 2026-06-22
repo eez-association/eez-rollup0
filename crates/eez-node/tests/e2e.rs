@@ -12,7 +12,7 @@ use alloy_primitives::{B256, U256};
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeConfig,
-    NodeHandle, override_env, reorg_genesis_path, reorg_genesis_state_root,
+    NodeHandle, override_env, reorg_genesis_path, reorg_genesis_state_root, wait_for,
     wait_for_node_caught_up,
 };
 
@@ -269,11 +269,11 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
         .wait_for_batches(4, DEFAULT_TIMEOUT)
         .await
         .expect("pre-reorg: ≥4 combined batches");
-    let latest_execution_block = chain
-        .latest_execution_block()
-        .await
-        .unwrap()
-        .expect("pre-reorg: at least one settled execution");
+    let latest_execution_block = wait_for(DEFAULT_TIMEOUT, || async {
+        chain.latest_execution_block().await
+    })
+    .await
+    .expect("pre-reorg: at least one settled execution");
     let latest_l1_block = chain.block_number().await.unwrap();
     let reorg_depth = latest_l1_block
         .saturating_sub(latest_execution_block)
