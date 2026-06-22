@@ -146,13 +146,10 @@ where
         self.inner.l1_head.cursor()
     }
 
-    /// Sync local state with L1's full confirmed batch history from the
+    /// Sync local state with L1's confirmed batch history from the
     /// registry deploy block: walks past `BatchPosted` in tx-order,
-    /// skips losers via `state_applied`, force-replays every block of
-    /// every winning batch (during boot the deriver is the authority on
-    /// L2 chain state — skips would trust whatever's locally canonical,
-    /// which can be a Sequencer-race-produced block), and populates
-    /// `L1CanonicalHead`.
+    /// skips losers via `state_applied`, STF-replays non-matching L2
+    /// blocks, and populates `L1CanonicalHead`.
     ///
     /// # Errors
     ///
@@ -163,19 +160,19 @@ where
     ///
     /// If the `batches` mutex is poisoned.
     pub async fn catch_up(&self) -> DeriverResult<()> {
-        self.sync_batches(self.inner.deploy_block, 0, true).await
+        self.sync_batches(self.inner.deploy_block, 0).await
     }
 
-    /// Reorg-aware re-sync — the single recovery path for every way the
-    /// event stream can betray us: a failed `BatchPosted`, a lagged
-    /// (dropped) event, a live `L1Event::Reorg`, or a reorg the deriver
-    /// never heard about (broadcast lag, or the boot window before
-    /// [`Self::run`] subscribes).
+    /// Reorg-aware recovery re-sync for gaps where the deriver cannot
+    /// trust its event stream: a failed `BatchPosted`, a lagged
+    /// (dropped) event, or the boot window before [`Self::run`]
+    /// subscribes.
     ///
     /// Two phases:
     /// 1. [`Self::revalidate_index_tail`] drops indexed batches whose
-    ///    L1 block is no longer canonical, retreating the cursor — the
-    ///    same effect a delivered Reorg event would have had.
+    ///    L1 block is no longer canonical. This is the missed-reorg
+    ///    case: block number + tx hash are not enough once the event
+    ///    carrying the common ancestor was lost.
     /// 2. [`Self::sync_batches`] re-scans L1 from the surviving anchor
     ///    (full history when nothing survives) and reconciles whatever
     ///    isn't indexed yet, then moves reth's safe head to match —
@@ -188,21 +185,22 @@ where
     /// # Errors
     ///
     /// Same as [`Self::catch_up`].
-    async fn resync(&self) -> DeriverResult<()> {
+    async fn recovery_resync(&self) -> DeriverResult<()> {
         match self.revalidate_index_tail().await? {
             Some(anchor_l1_block) => {
-                self.sync_batches(anchor_l1_block, self.inner.l1_head.cursor(), false)
+                self.sync_batches(anchor_l1_block, self.inner.l1_head.cursor())
                     .await
             }
-            None => self.sync_batches(self.inner.deploy_block, 0, true).await,
+            None => self.sync_batches(self.inner.deploy_block, 0).await,
         }
     }
 
-    /// Phase 1 of [`Self::resync`]: walk the index tail backward,
-    /// dropping batches whose recorded L1 block hash is no longer the
-    /// canonical hash at that height. Returns the L1 block of the
-    /// highest still-canonical indexed batch — the lower bound for the
-    /// forward rescan — or `None` if the index is (or became) empty.
+    /// Phase 1 of [`Self::recovery_resync`]: walk the index tail
+    /// backward, dropping batches whose recorded L1 block hash is no
+    /// longer the canonical hash at that height. Returns the L1 block
+    /// of the highest still-canonical indexed batch — the lower bound
+    /// for the forward rescan — or `None` if the index is (or became)
+    /// empty.
     async fn revalidate_index_tail(&self) -> DeriverResult<Option<u64>> {
         while let Some(tail) = self.inner.l1_head.last_indexed() {
             let canonical = self
@@ -234,19 +232,14 @@ where
         Ok(None)
     }
 
-    /// Shared body of [`Self::catch_up`] / [`Self::resync`]: scan
-    /// `BatchPosted` from `from_l1_block`, reconcile each not-yet-
+    /// Shared body of [`Self::catch_up`] / [`Self::recovery_resync`]:
+    /// scan `BatchPosted` from `from_l1_block`, reconcile each not-yet-
     /// indexed winner with L2-range accounting starting at
     /// `cumulative_start` (the L2 block confirmed just before the scan
     /// window), then advance the safe/finalized anchors. Batches whose
     /// tx hash is already indexed are skipped entirely — their L2
     /// ranges are covered by `cumulative_start`.
-    async fn sync_batches(
-        &self,
-        from_l1_block: u64,
-        cumulative_start: u64,
-        force_replay: bool,
-    ) -> DeriverResult<()> {
+    async fn sync_batches(&self, from_l1_block: u64, cumulative_start: u64) -> DeriverResult<()> {
         // Acquire lock to prevent sequencing during the sync
         let _guard = self.inner.committer.begin_reconcile().await;
         let local_head = self
@@ -260,7 +253,6 @@ where
             local_head,
             from_l1_block,
             cumulative_start,
-            force_replay,
             "starting batch scan to populate L1CanonicalHead and reconcile L2 chain",
         );
 
@@ -332,7 +324,6 @@ where
                     batch.l1_block_number,
                     batch.tx_hash,
                     batch.settled_count,
-                    force_replay,
                 )
                 .await?;
 
@@ -367,18 +358,22 @@ where
         }
 
         // Move reth's safe head to whatever L1 has confirmed — forward
-        // after a bulk replay, *backward* after the resync's anchor
-        // walk dropped rolled-out batches. Live on_batch_posted
+        // after a bulk replay, *backward* after a recovery tail audit
+        // dropped rolled-out batches. Live on_batch_posted
         // advances safe on each new event; here we reconcile the safe
         // head after a bulk pass so RPC clients see the right safe head
         // before the next live event lands.
-        if cumulative_l2 != self.inner.safe_l2_block.load(Ordering::Acquire) {
+        let old_safe_l2 = self.inner.safe_l2_block.load(Ordering::Acquire);
+        if cumulative_l2 != old_safe_l2 {
             let safe_header = self.l2_sealed_header_at(cumulative_l2)?;
             let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
             self.inner
                 .committer
-                .advance_safe_finalized(safe_header, finalized_hash)
+                .advance_safe_finalized(safe_header.clone(), finalized_hash)
                 .await?;
+            if cumulative_l2 < old_safe_l2 {
+                self.inner.committer.reorg_to(safe_header).await?;
+            }
             self.inner
                 .safe_l2_block
                 .store(cumulative_l2, Ordering::Release);
@@ -586,7 +581,7 @@ where
         // worse — it invalidates batches the boot scan already
         // indexed, and no Reorg event for it will ever arrive. The
         // reorg-aware resync handles both.
-        if let Err(err) = self.resync().await {
+        if let Err(err) = self.recovery_resync().await {
             event!(
                 name: "eez.deriver.resync.failed",
                 Level::ERROR,
@@ -652,13 +647,13 @@ where
         }
     }
 
-    /// Post-failure recovery: bounded [`Self::resync`] from the last
-    /// indexed batch. Returns `false` iff the committer is gone and the
-    /// event loop must exit. A failed resync is logged and retried
-    /// after the next L1 event — events keep arriving on every batch,
-    /// so recovery is re-attempted at batch cadence.
+    /// Post-failure recovery: bounded [`Self::recovery_resync`] from
+    /// the last indexed batch. Returns `false` iff the committer is
+    /// gone and the event loop must exit. A failed resync is logged and
+    /// retried after the next L1 event — events keep arriving on every
+    /// batch, so recovery is re-attempted at batch cadence.
     async fn try_recover(&self) -> bool {
-        match self.resync().await {
+        match self.recovery_resync().await {
             Ok(()) => {
                 event!(
                     name: "eez.deriver.resync.recovered",
@@ -866,7 +861,6 @@ where
                 l1_block_number,
                 tx_hash,
                 settled_count,
-                false,
             )
             .await?;
         event!(
@@ -932,22 +926,62 @@ where
         new_head_number: u64,
         new_head_hash: B256,
     ) -> DeriverResult<()> {
-        // The reorg-aware resync re-derives the retreat point itself
-        // (anchor walk against canonical L1), so a delivered Reorg
-        // event and one lost to broadcast lag take the same path. The
-        // walk also retreats reth's safe head (via sync_batches) and
-        // picks up the new chain's batches in the same pass — the
-        // watcher's follow-up BatchPosted events dedup by tx hash.
+        // Delivered Reorg events already carry the surviving canonical
+        // L1 ancestor. Hash-tail auditing is reserved for missed reorgs
+        // (broadcast lag / recovery), where that ancestor event was not
+        // delivered and number-only indexed batches may be stale.
+        let _guard = self.inner.committer.begin_reconcile().await;
+
+        let old_cursor = self.inner.l1_head.cursor();
+        let (new_cursor, _new_finalized, dropped) = self
+            .inner
+            .l1_head
+            .retreat_on_l1_reorg(common_ancestor_number);
+        if new_cursor >= old_cursor {
+            event!(
+                name: "eez.deriver.l1.reorg.noop",
+                Level::DEBUG,
+                common_ancestor_number,
+                old_head_hash = %old_head_hash,
+                new_head_number,
+                new_head_hash = %new_head_hash,
+                dropped_batches = dropped,
+                "L1 reorg reported above indexed batches; no L2 retreat needed",
+            );
+            return Ok(());
+        }
+
+        let new_safe_header = self.l2_sealed_header_at(new_cursor)?;
+        let new_safe_hash = new_safe_header.hash();
+        let new_finalized = self.inner.l1_head.finalized_l2();
+        let new_finalized_hash = self.l2_hash_at(new_finalized)?;
+
+        // Order matters: retreat safe/finalized first while the old
+        // head is still canonical, then roll head back to the same
+        // surviving L2 block and repair the committer's parent mirror.
+        self.inner
+            .committer
+            .advance_safe_finalized(new_safe_header.clone(), new_finalized_hash)
+            .await?;
+        self.inner.committer.reorg_to(new_safe_header).await?;
+        self.inner
+            .safe_l2_block
+            .store(new_cursor, Ordering::Release);
+
         event!(
-            name: "eez.deriver.l1.reorg",
+            name: "eez.deriver.l1.reorg.retreated",
             Level::WARN,
             common_ancestor_number,
             old_head_hash = %old_head_hash,
             new_head_number,
             new_head_hash = %new_head_hash,
-            "L1 reorg reported; re-anchoring the batch index from canonical L1",
+            old_cursor,
+            new_cursor,
+            dropped_batches = dropped,
+            new_safe_hash = %new_safe_hash,
+            "L1 reorg rolled out confirmed batches; L2 head retreated to the surviving safe cursor",
         );
-        self.resync().await
+        Ok(())
     }
 
     async fn on_l1_finalized(&self, l1_finalized_block: u64) -> DeriverResult<()> {
@@ -1027,7 +1061,6 @@ where
         l1_block_number: u64,
         tx_hash: B256,
         settled_count: usize,
-        force_replay: bool,
     ) -> DeriverResult<u64> {
         // Cross-chain path (skipped when `system_tx_cfg` is `None`):
         // reconstruct the system txs the composer produced, from either
@@ -1124,8 +1157,7 @@ where
 
         let mut tx_offset = 0usize;
         let mut replayed: u64 = 0;
-        let force_replay =
-            force_replay || !local_batch_boundary_matches(&self.inner.l2_provider, from_block)?;
+        let stale_boundary = !local_batch_boundary_matches(&self.inner.l2_provider, from_block)?;
         let last_index = decoded.block_tx_counts.len().saturating_sub(1);
         for (i, count) in decoded.block_tx_counts.iter().enumerate() {
             let l2_block = from_block + i as u64;
@@ -1150,12 +1182,12 @@ where
             } else {
                 user_txs.to_vec()
             };
-            let matched = if force_replay {
+            let matched = if stale_boundary {
                 false
             } else {
                 local_block_matches(&self.inner.l2_provider, l2_block, &block_txs)?
             };
-            let should_replay = force_replay || replayed > 0 || !matched;
+            let should_replay = stale_boundary || replayed > 0 || !matched;
             event!(
                 name: "eez.deriver.reconcile.block",
                 Level::DEBUG,
