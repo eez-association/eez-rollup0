@@ -1,0 +1,49 @@
+# eez-node runtime config. Start with:
+#   eez-node node --eez.config ./eez-node.toml ...
+#
+# mode = "standalone" | "follower" | "composer"
+# "sequencer" is accepted as an alias for "composer".
+mode = "follower"
+
+[l1]
+rpc_url = "http://127.0.0.1:8545"
+builder_rpc_url = "http://127.0.0.1:8645"
+target_rpc_url = "http://127.0.0.1:8545"
+chain_id = 31337
+embedded = false
+reorg_max_depth_blocks = 64
+
+[rollup]
+id = 1
+registry_address = "0x0000000000000000000000000000000000000000"
+registry_deploy_block = 123
+rollup_manager_address = "0x0000000000000000000000000000000000000000"
+mock_proof_system_address = "0x0000000000000000000000000000000000000000"
+expect_external_batches = false
+l1_rollup_id = 0
+
+[timing]
+l1_block_time_ms = 2000
+l2_block_time_ms = 1000
+proof_time_ms = 500
+submission_slack_ms = 100
+
+[follower]
+sequencer_rpc = "http://127.0.0.1:8745"
+
+[system_tx]
+ccm_l2_address = "0x4200000000000000000000000000000000000007"
+l2_system_address = "0x0000000000000000000000000000000000000000"
+
+[keys]
+l1_poster_key = "0x..."
+l2_system_key = "0x..."
+# Set only for mode = "composer".
+# proof_signer_key = "0x..."
+
+[ingress]
+cross_chain_proxy_addresses = []
+cross_chain_source_chain_ids = []
+
+[sequencer]
+max_speculative_depth = 64

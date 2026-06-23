@@ -12,8 +12,7 @@ use alloy_primitives::{B256, U256};
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeConfig,
-    NodeHandle, override_env, reorg_genesis_path, reorg_genesis_state_root,
-    wait_for_node_caught_up,
+    NodeHandle, reorg_genesis_path, reorg_genesis_state_root, wait_for_node_caught_up,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -102,13 +101,11 @@ async fn happy_case_builder_sustained() {
         "event-state consistency holds across restart",
     );
 
-    // Phase 3 — follower full-replay. Spawn a fresh-datadir node with
-    // sequencer + composer disabled; `Deriver::catch_up` must rebuild
-    // state from L1 events alone and land on a stateRoot the contract
-    // has attested.
-    let mut follower_env = env;
-    follower_env.push(("EEZ_SEQUENCER_DISABLED", "1".to_string()));
-    follower_env.push(("EEZ_COMPOSER_DISABLED", "1".to_string()));
+    // Phase 3 — follower full-replay. Spawn a fresh-datadir node in
+    // follower mode by keeping L1 env and omitting the proof signer;
+    // `Deriver::catch_up` must rebuild state from L1 events alone and
+    // land on a stateRoot the contract has attested.
+    let follower_env = harness.follower_env(None);
     let follower = NodeHandle::start("follower", &NodeConfig::default(), &follower_env)
         .await
         .unwrap();
@@ -118,13 +115,13 @@ async fn happy_case_builder_sustained() {
     follower.assert_no_process_death();
 }
 
-/// `EEZ_ROLLUP_ID=999` against a registry where only rollup 1 exists.
+/// `rollup.id=999` against a registry where only rollup 1 exists.
 /// `postAndVerifyBatch` reverts at the structural validation step.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failure_wrong_rollup_id() {
     let harness = Harness::fresh().await.unwrap();
     let chain = harness.chain();
-    let env = override_env(harness.env(), "EEZ_ROLLUP_ID", "999");
+    let env = harness.env_with_rollup_id(999);
     let datadir = tempfile::tempdir().unwrap();
     let _node = NodeHandle::spawn(datadir.path(), &env).unwrap();
 
@@ -184,14 +181,14 @@ async fn failure_l1_outage_recovery() {
 }
 
 /// `MockECDSAProofSystem` deployed with signer A; node started with
-/// `EEZ_PROOF_SIGNER_KEY` = B. Prover signs with B, on-chain
+/// `keys.proof_signer_key` = B. Prover signs with B, on-chain
 /// `verify()` recovers B ≠ A and returns false, `postAndVerifyBatch`
 /// reverts at the proof-verification step.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failure_prover_signer_mismatch() {
     let harness = Harness::fresh().await.unwrap();
     let chain = harness.chain();
-    let env = override_env(harness.env(), "EEZ_PROOF_SIGNER_KEY", ANVIL_KEY_1);
+    let env = harness.env_with_proof_signer(ANVIL_KEY_1);
     let datadir = tempfile::tempdir().unwrap();
     let _node = NodeHandle::spawn(datadir.path(), &env).unwrap();
 
@@ -218,11 +215,10 @@ async fn failure_prover_signer_mismatch() {
 /// **I1 — No process death.** Neither node logs `Fatal` /
 /// `UnexpectedStaticFile`. Without this every other check is moot.
 ///
-/// **I2 — Both derivers noticed the reorg.** Each node logged
-/// `reorg rolled out` / `l1.reorg.retreated` ≥ 1 time. Crucial because
+/// **I2 — Both nodes noticed the reorg.** Each node logged either the
+/// L1 watcher rewind or deriver retreat marker ≥ 1 time. Crucial because
 /// state convergence can happen via unrelated re-derivation paths; this
-/// is the only assertion that proves the deriver itself exercised its
-/// reorg-handling code.
+/// is the assertion that proves the reorg-handling path ran.
 ///
 /// **I3 — Each node saw and processed an L1-attested state.** For each
 /// composer independently: at some poll, `node.safe.stateRoot` appears
@@ -296,9 +292,9 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
         .await
         .expect("c2 did not catch up to contract post-reorg");
 
-    // I2 — Both derivers logged the retreat.
-    c1.assert_reorg_seen();
-    c2.assert_reorg_seen();
+    // I2 — Both nodes observed the reorg.
+    c1.wait_for_reorg_seen(DEFAULT_TIMEOUT).await.unwrap();
+    c2.wait_for_reorg_seen(DEFAULT_TIMEOUT).await.unwrap();
 
     // I1 — No process death.
     c1.assert_no_process_death();

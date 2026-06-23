@@ -69,10 +69,12 @@ pub struct Anvil {
 }
 
 /// Anvil configuration. `Anvil::spawn(port)` is the default (1s block,
-/// random mnemonic). The multi-composer reorg test uses
-/// [`AnvilConfig::for_reorg`] which matches the hardhat mnemonic (so we
-/// have predictable prefunded EOAs) and enables the cancun hardfork
-/// (required by `anvil_reorg`).
+/// random mnemonic). Tests pin the L1 genesis timestamp to match reth's
+/// dev genesis so the L1-anchored scheduler starts near the L2 chain
+/// instead of treating startup as a huge historical catch-up. The
+/// multi-composer reorg test uses [`AnvilConfig::for_reorg`] which matches
+/// the hardhat mnemonic (so we have predictable prefunded EOAs) and enables
+/// the cancun hardfork (required by `anvil_reorg`).
 pub struct AnvilConfig {
     pub block_time_secs: u64,
     pub mnemonic: Option<&'static str>,
@@ -88,12 +90,12 @@ impl Default for AnvilConfig {
             mnemonic: None,
             hardfork: None,
             gas_limit: None,
-            genesis_timestamp: None,
+            genesis_timestamp: Some(DEV_GENESIS_TIMESTAMP),
         }
     }
 }
 
-const REORG_GENESIS_TIMESTAMP: u64 = 1_687_223_762;
+const DEV_GENESIS_TIMESTAMP: u64 = 1_687_223_762;
 
 impl AnvilConfig {
     /// 1s block time, hardhat mnemonic, cancun hardfork, 30M gas.
@@ -105,7 +107,7 @@ impl AnvilConfig {
             mnemonic: Some(HARDHAT_MNEMONIC),
             hardfork: Some("cancun"),
             gas_limit: Some(30_000_000),
-            genesis_timestamp: Some(REORG_GENESIS_TIMESTAMP),
+            genesis_timestamp: Some(DEV_GENESIS_TIMESTAMP),
         }
     }
 }
@@ -259,6 +261,7 @@ pub struct Harness {
     pub anvil: Anvil,
     pub stub: BundleStub,
     pub dep: Deployment,
+    config_dir: tempfile::TempDir,
 }
 
 impl Harness {
@@ -273,7 +276,13 @@ impl Harness {
         let anvil = Anvil::spawn_with(free_port(), cfg).await?;
         let stub = BundleStub::spawn(free_port(), &anvil.rpc_url).await?;
         let dep = deploy_contracts_with_initial(&anvil.rpc_url, ANVIL_KEY, initial_state).await?;
-        Ok(Self { anvil, stub, dep })
+        let config_dir = tempfile::tempdir().context("config tempdir")?;
+        Ok(Self {
+            anvil,
+            stub,
+            dep,
+            config_dir,
+        })
     }
 
     pub fn chain(&self) -> Chain<'_> {
@@ -293,57 +302,58 @@ impl Harness {
         poster_key: &str,
         expect_external_batches: bool,
     ) -> Vec<(&'static str, String)> {
+        self.env_for_options(NodeTomlOptions {
+            poster_key,
+            proof_signer_key: Some(ANVIL_KEY),
+            rollup_id: self.dep.rollup_id,
+            expect_external_batches,
+            mode: "composer",
+            sequencer_rpc: None,
+        })
+    }
+
+    pub fn follower_env(&self, sequencer_rpc: Option<&str>) -> Vec<(&'static str, String)> {
+        self.env_for_options(NodeTomlOptions {
+            poster_key: ANVIL_KEY,
+            proof_signer_key: None,
+            rollup_id: self.dep.rollup_id,
+            expect_external_batches: true,
+            mode: "follower",
+            sequencer_rpc,
+        })
+    }
+
+    pub fn env_with_rollup_id(&self, rollup_id: u64) -> Vec<(&'static str, String)> {
+        self.env_for_options(NodeTomlOptions {
+            poster_key: ANVIL_KEY,
+            proof_signer_key: Some(ANVIL_KEY),
+            rollup_id,
+            expect_external_batches: false,
+            mode: "composer",
+            sequencer_rpc: None,
+        })
+    }
+
+    pub fn env_with_proof_signer(&self, proof_signer_key: &str) -> Vec<(&'static str, String)> {
+        self.env_for_options(NodeTomlOptions {
+            poster_key: ANVIL_KEY,
+            proof_signer_key: Some(proof_signer_key),
+            rollup_id: self.dep.rollup_id,
+            expect_external_batches: false,
+            mode: "composer",
+            sequencer_rpc: None,
+        })
+    }
+
+    fn env_for_options(&self, opts: NodeTomlOptions<'_>) -> Vec<(&'static str, String)> {
+        let config_path = self.write_node_config(opts);
         vec![
-            ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
-            // Harness tests provide their own external anvil L1.
-            ("EEZ_L1_EMBEDDED", "0".to_string()),
-            ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
-            ("EEZ_L1_POSTER_KEY", poster_key.to_string()),
-            ("EEZ_L1_CHAIN_ID", "31337".to_string()),
-            ("EEZ_PROOF_SIGNER_KEY", ANVIL_KEY.to_string()),
-            ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
             (
-                "EEZ_CCM_L2_ADDRESS",
-                "0x0000000000000000000000000000000000000000".to_string(),
-            ),
-            ("EEZ_L1_BLOCK_TIME_MS", "2000".to_string()),
-            ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
-            ("EEZ_PROOF_TIME_MS", "1000".to_string()),
-            ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
-            (
-                "EEZ_REGISTRY_ADDRESS",
-                format!("{:#x}", self.dep.eez_address),
-            ),
-            (
-                "EEZ_REGISTRY_DEPLOY_BLOCK",
-                self.dep.deploy_block.to_string(),
-            ),
-            (
-                "EEZ_MOCK_PROOF_SYSTEM_ADDRESS",
-                format!("{:#x}", self.dep.mock_ps_address),
-            ),
-            (
-                "EEZ_ROLLUP_MANAGER_ADDRESS",
-                format!("{:#x}", self.dep.rollup_manager_address),
-            ),
-            ("EEZ_ROLLUP_ID", self.dep.rollup_id.to_string()),
-            (
-                "EEZ_COMPOSER_INTERVAL_SECS",
-                if expect_external_batches {
-                    COMPOSER_INTERVAL_MULTI
-                } else {
-                    COMPOSER_INTERVAL_SINGLE
-                }
-                .as_secs()
-                .to_string(),
-            ),
-            (
-                "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES",
-                expect_external_batches.to_string(),
-            ),
-            (
-                "EEZ_L2_DATADIR",
-                "/tmp/unused-overridden-by-flag".to_string(),
+                "EEZ_CONFIG",
+                config_path
+                    .to_str()
+                    .expect("config path is utf-8")
+                    .to_string(),
             ),
             (
                 "RUST_LOG",
@@ -351,6 +361,79 @@ impl Harness {
             ),
         ]
     }
+
+    fn write_node_config(&self, opts: NodeTomlOptions<'_>) -> PathBuf {
+        let index = std::fs::read_dir(self.config_dir.path()).map_or(0, Iterator::count);
+        let path = self
+            .config_dir
+            .path()
+            .join(format!("{}-{}-{index}.toml", opts.mode, opts.rollup_id));
+        let proof_signer_key = opts
+            .proof_signer_key
+            .map(|key| format!("proof_signer_key = {key:?}\n"))
+            .unwrap_or_default();
+        let follower = opts
+            .sequencer_rpc
+            .map(|rpc| format!("\n[follower]\nsequencer_rpc = {rpc:?}\n"))
+            .unwrap_or_default();
+        let contents = format!(
+            r#"mode = {mode:?}
+
+[l1]
+rpc_url = {l1_rpc:?}
+builder_rpc_url = {builder_rpc:?}
+chain_id = 31337
+embedded = false
+
+[rollup]
+id = {rollup_id}
+registry_address = {registry:?}
+registry_deploy_block = {deploy_block}
+rollup_manager_address = {rollup_manager:?}
+mock_proof_system_address = {mock_ps:?}
+expect_external_batches = {expect_external_batches}
+
+[timing]
+l1_block_time_ms = 2000
+l2_block_time_ms = 1000
+proof_time_ms = 500
+submission_slack_ms = 100
+
+[system_tx]
+ccm_l2_address = "0x4200000000000000000000000000000000000007"
+l2_system_address = {system_address:?}
+
+[keys]
+l1_poster_key = {poster_key:?}
+{proof_signer_key}l2_system_key = {system_key:?}
+{follower}"#,
+            mode = opts.mode,
+            l1_rpc = self.anvil.rpc_url,
+            builder_rpc = self.stub.url,
+            rollup_id = opts.rollup_id,
+            registry = format!("{:#x}", self.dep.eez_address),
+            deploy_block = self.dep.deploy_block,
+            rollup_manager = format!("{:#x}", self.dep.rollup_manager_address),
+            mock_ps = format!("{:#x}", self.dep.mock_ps_address),
+            expect_external_batches = opts.expect_external_batches,
+            system_address = format!("{:#x}", ANVIL_ADDR),
+            poster_key = opts.poster_key,
+            proof_signer_key = proof_signer_key,
+            system_key = ANVIL_KEY,
+            follower = follower,
+        );
+        std::fs::write(&path, contents).expect("write node config");
+        path
+    }
+}
+
+struct NodeTomlOptions<'a> {
+    poster_key: &'a str,
+    proof_signer_key: Option<&'a str>,
+    rollup_id: u64,
+    expect_external_batches: bool,
+    mode: &'static str,
+    sequencer_rpc: Option<&'a str>,
 }
 
 pub struct Deployment {
@@ -767,21 +850,21 @@ impl NodeHandle {
         });
     }
 
-    /// Assert this node's deriver detected and retreated from the L1
-    /// reorg. Without this check the reorg test would silently pass
-    /// even if reorg detection regressed (some unrelated re-derivation
-    /// path could re-converge state).
-    pub fn assert_reorg_seen(&self) {
+    /// Wait until this node observes the L1 reorg. Without this check the
+    /// reorg test would silently pass even if reorg detection regressed
+    /// (some unrelated re-derivation path could re-converge state).
+    pub async fn wait_for_reorg_seen(&self, timeout: Duration) -> Result<()> {
         let patterns = [
             "reorg rolled out",
+            "rewinding ring to common ancestor",
             "l1.reorg.retreated",
             "L1 reorg reported",
         ];
-        assert!(
-            self.log_count_matching(&patterns).unwrap() > 0,
-            "{} deriver missed the reorg",
-            self.name,
-        );
+        wait_for(timeout, || async {
+            Ok((self.log_count_matching(&patterns)? > 0).then_some(()))
+        })
+        .await
+        .with_context(|| format!("{} deriver missed the reorg", self.name))
     }
 
     /// Assert this node never logged a fatal-class line (process death

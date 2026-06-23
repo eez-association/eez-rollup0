@@ -6,7 +6,6 @@ members = [
     "crates/eez-driver",
     "crates/eez-evm",
     "crates/eez-evm-inspector",
-    "crates/eez-follower",
     "crates/eez-l1",
     "crates/eez-node",
     "crates/eez-payload-codec",
@@ -31,6 +30,7 @@ tracing-subscriber = "0.3"
 thiserror          = "2"
 eyre               = "0.6"
 serde              = { version = "1", features = ["derive"] }
+toml               = "0.9"
 sha3               = "0.10"
 hex                = "0.4"
 
