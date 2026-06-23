@@ -554,12 +554,10 @@ fn main() -> eyre::Result<()> {
                     None
                 };
 
-            // CrossChainExecCtx: the L1 postBatch submission context.
-            // When EvmComposer is wired it also carries the signer/L2
-            // addresses needed to wrap `(load_table, execute)` calldata
-            // pairs into signed legacy L2 system txs. External-L1
-            // composer mode still needs the context so minimal
-            // leading-immediate postBatches keep L1's state root in sync.
+            // CrossChainExecCtx: the L1 postBatch submission context. When
+            // EvmComposer is wired it also signs the `(load_table, execute)`
+            // L2 system txs; external-L1 mode still needs it for minimal
+            // leading-immediate postBatches.
             let cc_exec_ctx: Arc<eez_composer::CrossChainExecCtx> = {
                 let system_key = env::var("EEZ_L2_SYSTEM_KEY").map_err(|_| {
                     eyre::eyre!("EEZ_L2_SYSTEM_KEY required in composer mode")

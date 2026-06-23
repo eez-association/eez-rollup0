@@ -141,16 +141,10 @@ where
     <T::BuiltPayload as BuiltPayload>::Primitives: Send + Sync + 'static,
     SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>: Send,
 {
-    /// Spawn the actor on the current tokio runtime. `safe_header` /
-    /// `finalized_hash` seed the forkchoice anchors until the Deriver
-    /// advances them via [`Self::advance_safe_finalized`]. They must
-    /// reference durable canonical blocks (persisted safe/finalized or
-    /// genesis) — never the speculative best header: a speculative
-    /// branch can be displaced by L1-derived replays, and an FCU
-    /// carrying a displaced hash is rejected by the engine as an
-    /// inconsistent forkchoice state. The full safe *header* (not just
-    /// its hash) is kept so a head demotion can also repair the
-    /// `last_header` parenting mirror.
+    /// Spawn the actor. `safe_header` / `finalized_hash` seed the forkchoice
+    /// anchors until the Deriver advances them; they must be durable canonical
+    /// blocks (persisted safe/finalized or genesis), never the speculative
+    /// head, which L1-derived replays can displace into a rejected FCU.
     #[must_use]
     pub fn spawn(
         initial_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
@@ -179,11 +173,9 @@ where
         }
     }
 
-    /// [`Self::spawn`] with the initial header and forkchoice anchors
-    /// read from `provider`: head from the local best block, safe /
-    /// finalized from reth's persisted forkchoice state (loaded into the
-    /// canonical in-memory state at node startup), falling back to
-    /// genesis when none has been recorded yet.
+    /// [`Self::spawn`] with anchors read from `provider`: head from the best
+    /// block, safe/finalized from reth's persisted forkchoice state, falling
+    /// back to genesis when none is recorded yet.
     ///
     /// # Errors
     ///
@@ -561,28 +553,15 @@ where
         }
     }
 
-    /// Sends `state` via FCU. If the engine rejects the triplet as an
-    /// inconsistent forkchoice state and the unsafe head is the suspect
-    /// (≠ safe), demote the unsafe head to the safe anchor and retry
-    /// once. The optimistically-adopted head can sit on a branch that
-    /// conflicts with the L1-derived anchors (e.g., taken from a stale
-    /// sequencer before its ancestry was locally verifiable); the safe
-    /// anchor itself always forms a consistent triplet, and the next
-    /// follower poll re-adopts a compatible head within a tick.
-    ///
-    /// `safe_header` must be the header whose hash is
-    /// `state.safe_block_hash`. Demotion rewrites **both** head mirrors
-    /// — `unsafe_head_hash` and `last_header` — to the safe anchor.
-    /// Leaving `last_header` on the rejected branch would wedge the
-    /// Sequencer permanently: it anchors every FCU+attrs on
-    /// `last_header`, so each tick would re-send the same inconsistent
-    /// triplet, and nothing else updates the mirror once production has
-    /// stopped.
+    /// Sends `state` via FCU; on an inconsistent-forkchoice rejection where
+    /// the unsafe head (≠ safe) is the suspect, demote it to the safe anchor
+    /// and retry once, rewriting both `unsafe_head_hash` and `last_header` so
+    /// later ticks don't re-send the same bad triplet. `safe_header`'s hash
+    /// must equal `state.safe_block_hash`.
     ///
     /// # Panics
     ///
-    /// If the `last_header` lock is poisoned (the actor is the only
-    /// writer; a poisoned lock means it already died).
+    /// If the `last_header` lock is poisoned.
     async fn forkchoice_or_demote_head(
         &mut self,
         mut state: ForkchoiceState,

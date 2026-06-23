@@ -15,9 +15,8 @@ use eez_driver::ConfirmedHeadSource;
 #[derive(Debug, Clone, Copy)]
 pub struct BatchRecord {
     pub l1_block: u64,
-    /// Hash of the L1 block the batch landed in. Lets the Deriver's
-    /// resync verify the record is still on the canonical L1 chain —
-    /// the only signal that survives a missed `L1Event::Reorg`.
+    /// Hash of the L1 block the batch landed in. Lets the Deriver's resync
+    /// verify the record is still canonical — survives a missed `L1Event::Reorg`.
     pub l1_block_hash: B256,
     pub tx_hash: B256,
     pub last_l2_block: u64,
@@ -63,10 +62,9 @@ impl L1CanonicalHead {
             .map_or(0, |b| b.last_l2_block)
     }
 
-    /// The most recently indexed batch, or `None` if the index is
-    /// empty. Anchor for the Deriver's bounded resync scan: its
-    /// `l1_block_hash` is checked against the canonical L1 chain and
-    /// its `l1_block` is the scan's lower bound.
+    /// The most recently indexed batch, or `None` if empty. Anchor for the
+    /// Deriver's resync: its `l1_block_hash` is canonicality-checked and its
+    /// `l1_block` is the scan's lower bound.
     ///
     /// # Panics
     ///

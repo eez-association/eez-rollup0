@@ -5,16 +5,11 @@
 //! reth to point unsafe head at the sequencer's latest block while that
 //! head remains compatible with the L1-derived anchors.
 //!
-//! Compatibility is enforced here, not delegated to reth: the engine
-//! only requires safe/finalized to be *known* headers, so it will
-//! happily canonicalize a head whose ancestry conflicts with our safe
-//! block (e.g., a sequencer that hasn't reconciled a winning batch yet
-//! serves `latest` from its stale, race-losing branch). Before every
-//! forkchoice update we walk the candidate's locally-known ancestry
-//! down to the safe height and reject proven conflicts. Unverifiable
-//! ancestry (blocks not yet synced) stays optimistic — refusing there
-//! would deadlock sync, since reth only fetches those blocks because of
-//! the FCU.
+//! Compatibility is enforced here, not by reth: the engine only requires
+//! safe/finalized to be *known*, so it would canonicalize a head whose
+//! ancestry conflicts with our safe block. Before each FCU we walk the
+//! candidate's local ancestry to the safe height and reject proven
+//! conflicts; unverifiable (unsynced) ancestry stays optimistic.
 
 use std::time::Duration;
 
@@ -32,10 +27,8 @@ use crate::error::FollowerError;
 /// engine view doesn't drift during quiet periods.
 const FCU_REFRESH: Duration = Duration::from_secs(1);
 
-/// Upper bound on the candidate→safe ancestry walk. Far above the
-/// sequencer's speculative-depth cap (64); a longer gap with fully
-/// local ancestry is treated as unverifiable rather than scanned
-/// unboundedly.
+/// Upper bound on the candidate→safe ancestry walk. Beyond this, a fully
+/// local gap is treated as unverifiable rather than scanned unboundedly.
 const MAX_ANCESTRY_WALK: u64 = 1024;
 
 /// Verdict of checking a candidate head against the local safe anchor.
@@ -185,13 +178,10 @@ where
         }
     }
 
-    /// Checks whether `candidate` (with hash `candidate_hash`) descends
-    /// from the current safe block by walking its `parent_hash` links
-    /// through locally-known headers down to the safe height.
-    ///
-    /// Steady state this is O(1): the candidate is one block ahead of
-    /// the previously synced chain, so the walk either resolves at the
-    /// first lookup or misses it (unverifiable).
+    /// Checks whether `candidate` descends from the current safe block by
+    /// walking `parent_hash` links through locally-known headers. Steady
+    /// state O(1): the candidate is one block ahead, so the first lookup
+    /// resolves or misses (unverifiable).
     fn check_extends_safe(
         &self,
         candidate: &alloy_consensus::Header,
