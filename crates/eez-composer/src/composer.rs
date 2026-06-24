@@ -41,8 +41,9 @@ use crate::rollup::RollupState;
 /// Runtime config for the cross-chain execution path on Sync slots.
 /// `Composer::new` accepts `Option<Arc<CrossChainExecCtx>>`; `Some`
 /// means a wired `EvmComposer` and the keys/addresses needed to sign
-/// the L2 system txs that the composer's `simulate_and_resolve` returns
-/// as raw `(load_table_payload, execute_payload)` bytes.
+/// the L2 system txs that the composer's
+/// `simulate_and_resolve` returns as raw `(load_table_payload,
+/// execute_payload)` bytes.
 ///
 /// Owned by `eez-node` at startup and shared via `Arc` because the
 /// `PrivateKeySigner` is bigger than two-line clone-cheap.
@@ -177,9 +178,10 @@ struct Inner<L2: BlockReader> {
     /// `ExecutionEntry`s).
     evm_composer: Option<eez_evm_inspector::EvmComposer>,
     /// Runtime context (signer + L2 chain config) for wrapping the
-    /// composer's `(load_table_payload, execute_payload)` byte outputs
-    /// into signed L2 system txs. Must be `Some` whenever `evm_composer`
-    /// is `Some`; both come from the same `eez-node` startup wiring step.
+    /// composer's `(load_table_payload, execute_payload)` byte
+    /// outputs into signed L2 system txs. Must be `Some` whenever
+    /// `evm_composer` is `Some`; both come from the same `eez-node`
+    /// startup wiring step.
     cc_exec_ctx: Option<Arc<CrossChainExecCtx>>,
     /// Handle to the `BlockCommitter` actor (the sole engine-API
     /// owner). Set once at startup via [`Composer::set_committer`]
