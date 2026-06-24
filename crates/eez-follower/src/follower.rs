@@ -7,9 +7,10 @@
 //!
 //! Compatibility is enforced here, not by reth: the engine only requires
 //! safe/finalized to be *known*, so it would canonicalize a head whose
-//! ancestry conflicts with our safe block. Before each FCU we walk the
-//! candidate's local ancestry to the safe height and reject proven
-//! conflicts; unverifiable (unsynced) ancestry stays optimistic.
+//! ancestry conflicts with our safe block. Before each FCU we accept heads
+//! already on the local canonical chain, otherwise walk the candidate's local
+//! ancestry to the safe height and reject proven conflicts; unverifiable
+//! (unsynced) ancestry stays optimistic.
 
 use std::time::Duration;
 
@@ -178,10 +179,10 @@ where
         }
     }
 
-    /// Checks whether `candidate` descends from the current safe block by
-    /// walking `parent_hash` links through locally-known headers. Steady
-    /// state O(1): the candidate is one block ahead, so the first lookup
-    /// resolves or misses (unverifiable).
+    /// Checks whether `candidate` descends from the current safe block. Steady
+    /// state O(1): if the candidate is already local canonical, the local
+    /// forkchoice invariant proves it extends safe; otherwise the first parent
+    /// lookup usually resolves or misses (unverifiable).
     fn check_extends_safe(
         &self,
         candidate: &alloy_consensus::Header,
@@ -212,14 +213,17 @@ where
         if candidate.number < safe_number {
             return Ok(SafeCompat::Conflicts);
         }
-        if candidate.number - safe_number > MAX_ANCESTRY_WALK
-            && self
-                .local
-                .sealed_header(candidate.number)
-                .map_err(|e| {
-                    FollowerError::Provider(format!("sealed_header({}): {e}", candidate.number))
-                })?
-                .is_some_and(|local| local.hash() == candidate_hash)
+
+        // If reth already has this exact block on its canonical chain, it must
+        // extend the local safe anchor. Otherwise, walk the candidate's explicit
+        // parent-hash chain below.
+        if self
+            .local
+            .sealed_header(candidate.number)
+            .map_err(|e| {
+                FollowerError::Provider(format!("sealed_header({}): {e}", candidate.number))
+            })?
+            .is_some_and(|local| local.hash() == candidate_hash)
         {
             return Ok(SafeCompat::Extends);
         }
