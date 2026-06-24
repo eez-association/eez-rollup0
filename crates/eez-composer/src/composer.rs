@@ -38,12 +38,11 @@ use crate::local::build_sync_block;
 use crate::optimistic::OptimisticallyIncluded;
 use crate::rollup::RollupState;
 
-/// Runtime config for Sync-slot L1 submission. `Composer::new` accepts
-/// `Option<Arc<CrossChainExecCtx>>`; `Some` means the composer can emit
-/// `postBatch` transactions. When a wired `EvmComposer` is also present,
-/// this context additionally signs the L2 system txs that
-/// `simulate_and_resolve` returns as raw `(load_table_payload,
-/// execute_payload)` bytes.
+/// Runtime config for the cross-chain execution path on Sync slots.
+/// `Composer::new` accepts `Option<Arc<CrossChainExecCtx>>`; `Some`
+/// means a wired `EvmComposer` and the keys/addresses needed to sign
+/// the L2 system txs that the composer's `simulate_and_resolve` returns
+/// as raw `(load_table_payload, execute_payload)` bytes.
 ///
 /// Owned by `eez-node` at startup and shared via `Arc` because the
 /// `PrivateKeySigner` is bigger than two-line clone-cheap.
@@ -177,10 +176,10 @@ struct Inner<L2: BlockReader> {
     /// `Composition<EvmProtocol>` (L2 destination effects + L1
     /// `ExecutionEntry`s).
     evm_composer: Option<eez_evm_inspector::EvmComposer>,
-    /// Runtime context for L1 postBatch submission. Must be `Some`
-    /// whenever `evm_composer` is `Some`; external-L1 composer mode can
-    /// also set it without an `EvmComposer` to emit minimal
-    /// leading-immediate batches.
+    /// Runtime context (signer + L2 chain config) for wrapping the
+    /// composer's `(load_table_payload, execute_payload)` byte outputs
+    /// into signed L2 system txs. Must be `Some` whenever `evm_composer`
+    /// is `Some`; both come from the same `eez-node` startup wiring step.
     cc_exec_ctx: Option<Arc<CrossChainExecCtx>>,
     /// Handle to the `BlockCommitter` actor (the sole engine-API
     /// owner). Set once at startup via [`Composer::set_committer`]
@@ -478,10 +477,8 @@ where
     /// With a cross-chain `EvmComposer` wired, each drained tx runs
     /// through `simulate_and_resolve` and the rich Sync block + atomic L1
     /// bundle dispatch via `compose_via_evm_composer` (optimistic).
-    /// With only a `CrossChainExecCtx`, held L1 txs stay queued and the
-    /// slot emits a minimal leading-immediate `postBatch`. With neither,
-    /// the drained txs commit as ordinary type-0x2 calls — the
-    /// standalone build+commit fallback.
+    /// Without one (no embedded L1), the drained txs commit as ordinary
+    /// type-0x2 calls — the standalone build+commit fallback.
     async fn compose_sync_slot(
         &self,
         rollup_id: u64,
@@ -544,14 +541,14 @@ where
         // failed Sync block has either committed (head ≥ height →
         // reorg it out) or permanently didn't (stale-parent bail —
         // nothing to roll back).
-        if self.inner.cc_exec_ctx.is_some() {
+        if self.inner.evm_composer.is_some() {
             if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
                 return self.recover_failed_batch(rollup_id, rollup, failed).await;
             }
         }
 
-        let blocked =
-            self.inner.cc_exec_ctx.is_some() && rollup.optimistic.blocking_height(cursor).is_some();
+        let blocked = self.inner.evm_composer.is_some()
+            && rollup.optimistic.blocking_height(cursor).is_some();
         if blocked {
             event!(
                 name: "eez.composer.sync_slot.bundle_in_flight",
@@ -617,7 +614,10 @@ where
         // Cross-chain path returns the already-built Sync block so we
         // don't redo the work here. Standalone / no-L1 path falls back
         // to constructing an empty Sync block from the drained raw_txs.
-        if let Some(ctx) = self.inner.cc_exec_ctx.as_ref() {
+        if let (Some(evm_composer), Some(ctx)) = (
+            self.inner.evm_composer.as_ref(),
+            self.inner.cc_exec_ctx.as_ref(),
+        ) {
             // Cross-chain mode is authoritative: `compose_via_evm_composer`
             // builds the Sync block, registers the drained txs in the
             // optimistic ledger, spawns the bundle observer, and
@@ -627,63 +627,12 @@ where
             // through to the `build_sync_block` branch below —
             // `drained` are L1 user txs (type-0x2 EOA calls targeting
             // CCM-L1), not L2 system txs.
-            if let Some(evm_composer) = self.inner.evm_composer.as_ref() {
-                return match self
-                    .compose_via_evm_composer(
-                        evm_composer,
-                        ctx,
-                        rollup_id,
-                        drained,
-                        &parent_header,
-                        timestamp,
-                        suggested_fee_recipient,
-                    )
-                    .await
-                {
-                    Ok(Some(built)) => {
-                        event!(
-                            name: "eez.composer.sync_slot.built",
-                            Level::INFO,
-                            rollup_id,
-                            tx_count = drained_count,
-                            parent_number,
-                            timestamp,
-                            "built Sync block carrying {{tx_count}} held tx(s)",
-                        );
-                        Some(built)
-                    }
-                    Ok(None) => None,
-                    Err(err) => {
-                        event!(
-                            name: "eez.composer.cc_compose.failed",
-                            Level::ERROR,
-                            rollup_id,
-                            error = %err,
-                            "cross-chain compose failed; Sequencer will commit an empty Sync block via fallback",
-                        );
-                        None
-                    }
-                };
-            }
-
-            if !drained.is_empty() {
-                event!(
-                    name: "eez.composer.sync_slot.no_evm_composer_held_txs",
-                    Level::WARN,
-                    rollup_id,
-                    tx_count = drained_count,
-                    "held L1 txs require EvmComposer; re-queueing and emitting minimal postBatch",
-                );
-                if let Some(pool) = rollup.held_pool.as_ref() {
-                    pool.push_front_batch(drained);
-                }
-            }
-
             return match self
-                .dispatch_minimal_postbatch(
+                .compose_via_evm_composer(
+                    evm_composer,
                     ctx,
                     rollup_id,
-                    rollup,
+                    drained,
                     &parent_header,
                     timestamp,
                     suggested_fee_recipient,
@@ -692,23 +641,24 @@ where
             {
                 Ok(Some(built)) => {
                     event!(
-                        name: "eez.composer.sync_slot.built_minimal",
+                        name: "eez.composer.sync_slot.built",
                         Level::INFO,
                         rollup_id,
+                        tx_count = drained_count,
                         parent_number,
                         timestamp,
-                        "built Sync block and dispatched minimal postBatch",
+                        "built Sync block carrying {{tx_count}} held tx(s)",
                     );
                     Some(built)
                 }
                 Ok(None) => None,
                 Err(err) => {
                     event!(
-                        name: "eez.composer.phase1.failed",
+                        name: "eez.composer.cc_compose.failed",
                         Level::ERROR,
                         rollup_id,
                         error = %err,
-                        "minimal postBatch dispatch failed; Sequencer will commit an empty Sync block via fallback",
+                        "cross-chain compose failed; Sequencer will commit an empty Sync block via fallback",
                     );
                     None
                 }
