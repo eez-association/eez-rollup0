@@ -712,10 +712,11 @@ fn main() -> eyre::Result<()> {
         if let Err(err) = deriver.catch_up().await {
             event!(
                 name: "eez.node.deriver.boot_catch_up.failed",
-                Level::WARN,
+                Level::ERROR,
                 error = %err,
-                "boot-time catch_up failed; deriver.run() will retry post-subscribe",
+                "boot-time catch_up failed; refusing to start L1-active tasks before reconciliation",
             );
+            return Err(eyre::eyre!("boot-time deriver catch_up failed: {err}"));
         }
         event!(
             name: "eez.node.deriver.spawned",

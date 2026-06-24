@@ -212,6 +212,7 @@ impl Submitter {
             .into_iter()
             .map(|b| HistoricalBatch {
                 l1_block_number: b.l1_block_number,
+                l1_block_hash: b.l1_block_hash,
                 tx_hash: b.tx_hash,
                 submitter: b.submitter,
                 call_data: b.call_data,
@@ -223,6 +224,21 @@ impl Submitter {
             })
             .collect())
     }
+
+    /// Hash of the canonical L1 block at `number`, or `None` if none. Used by
+    /// the Deriver's resync to check whether an indexed batch is still canonical.
+    ///
+    /// # Errors
+    ///
+    /// [`L1Error::Provider`] on RPC failure.
+    pub async fn canonical_l1_hash(&self, number: u64) -> L1Result<Option<alloy_primitives::B256>> {
+        let provider = self.inner.build_provider();
+        Ok(provider
+            .get_block_by_number(BlockNumberOrTag::Number(number))
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_block_by_number({number}): {e}")))?
+            .map(|b| b.header.hash))
+    }
 }
 
 /// One past `BatchPosted` event, with enough context for the Deriver
@@ -230,6 +246,9 @@ impl Submitter {
 #[derive(Debug, Clone)]
 pub struct HistoricalBatch {
     pub l1_block_number: u64,
+    /// Hash of the L1 block the batch landed in — canonicality probe
+    /// for the resync anchor walk.
+    pub l1_block_hash: alloy_primitives::B256,
     pub tx_hash: alloy_primitives::B256,
     pub submitter: alloy_primitives::Address,
     pub call_data: alloy_primitives::Bytes,
