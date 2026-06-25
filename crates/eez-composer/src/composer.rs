@@ -58,6 +58,13 @@ enum PostBatchOutcome {
     Deferred {
         batch: Box<eez_evm::EvmBatch>,
         public_inputs_hash: B256,
+        /// The L1-confirmed cursor snapshot the batch's OD-5 anchor was
+        /// computed from (`stateDeltas[0].currentState = state(posted)`).
+        /// MUST be threaded to `record_posted_window` so `from_block =
+        /// posted+1` derives from the SAME snapshot as the anchor — a
+        /// catch-up burst can advance the cursor between two reads,
+        /// desyncing them and breaking the prover's OD-5 anchor check.
+        posted: u64,
     },
 }
 
@@ -350,18 +357,24 @@ where
     /// `from_block = posted+1` matches the OD-5 batch boundary; `current_state`
     /// is the batch's first-entry `StateDelta.currentState` (the OD-5 anchor),
     /// both HINTS the prover re-derives from `abi_calldata`.
+    ///
+    /// CONSENSUS-CRITICAL: `posted` is passed in (the SAME cursor snapshot the
+    /// caller used to compute the OD-5 anchor `state(posted)`) — it is NOT
+    /// re-read from `l1_head.cursor()` here. A catch-up burst can advance the
+    /// cursor between two reads, so the anchor and `from_block` would desync
+    /// (anchor = `state(posted_early)` but `from_block = posted_late+1`),
+    /// breaking the prover's OD-5 anchor check and halting settlement.
     fn record_posted_window(
         &self,
-        rollup: &RollupState<L2>,
         rollup_id: u64,
         sync_height: u64,
         batch: &eez_evm::EvmBatch,
         public_inputs_hash: B256,
+        posted: u64,
     ) {
         let Some(windows) = self.inner.posted_windows.get() else {
             return;
         };
-        let posted = rollup.l1_head.cursor();
         let current_state = batch
             .inner
             .entries
@@ -1594,6 +1607,7 @@ where
             PostBatchOutcome::Deferred {
                 batch,
                 public_inputs_hash,
+                posted,
             } => {
                 // Real proof system: the post fires when the prover attests.
                 // The Sync block still commits now (L2 cadence is uncondi-
@@ -1639,11 +1653,11 @@ where
                 // Phase 1 (dark): record this window in the composer-driven
                 // ledger BEFORE `*batch` is moved into the deferred task.
                 self.record_posted_window(
-                    rollup,
                     rollup_id,
                     sync_height,
                     &batch,
                     public_inputs_hash,
+                    posted,
                 );
                 self.spawn_deferred_post(
                     rollup_id,
@@ -1749,6 +1763,7 @@ where
             PostBatchOutcome::Deferred {
                 batch,
                 public_inputs_hash,
+                posted,
             } => {
                 // Register the one-in-flight gate SYNCHRONOUSLY (placeholder
                 // hash, no survivors for an empty slot) so the next slot blocks
@@ -1771,11 +1786,11 @@ where
                 // Phase 1 (dark): record this window in the composer-driven
                 // ledger BEFORE `*batch` is moved into the deferred task.
                 self.record_posted_window(
-                    rollup,
                     rollup_id,
                     sync_height,
                     &batch,
                     public_inputs_hash,
+                    posted,
                 );
                 self.spawn_deferred_post(
                     rollup_id,
@@ -2079,6 +2094,13 @@ where
         // deriver's check_claimed_state agrees. `newState` = L2 at
         // sync_block-1 (`parent_header.state_root()`), lumping every
         // pre-sync block's effects into one stateDelta.
+        //
+        // CONSENSUS-CRITICAL: this single `posted` snapshot is the OD-5
+        // anchor's basis and is threaded out via `PostBatchOutcome::Deferred`
+        // to `record_posted_window`, which derives `from_block = posted+1`
+        // from it. A catch-up burst can advance `l1_head.cursor()` between
+        // two separate reads, so the anchor (`state(posted)`) and `from_block`
+        // MUST come from this ONE read — never re-read the cursor downstream.
         let posted = self
             .inner
             .rollups
@@ -2504,6 +2526,7 @@ where
             return Ok(PostBatchOutcome::Deferred {
                 batch: Box::new(batch),
                 public_inputs_hash,
+                posted,
             });
         }
 
