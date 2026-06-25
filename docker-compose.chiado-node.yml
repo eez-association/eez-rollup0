@@ -61,10 +61,14 @@ services:
       EEZ_SUBMISSION_SLACK_MS: "500"
       # Don't freeze the sequencer when chiado bundles are slow to land.
       EEZ_MAX_SPECULATIVE_DEPTH: "0"
+      # Multi-composer: tolerate + adopt batches posted by the competing
+      # composer instead of erroring "someone else is sequencing".
+      EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES: "true"
       # L2.
       EEZ_L2_DATADIR: /l2
       EEZ_L2_GENESIS_PATH: /app/genesis.json
-      EEZ_INITIAL_STATE_ROOT: "0x5aab3b1dfa6fe9d89126e001b8fc4d9ed65c80174760e5019cb5b68b7467bd94"
+      # EEZ_INITIAL_STATE_ROOT comes from deployments.env (deploy.sh writes it,
+      # matched to the genesis alloc) — the mounted genesis must produce that root.
     volumes:
       - ${L1_SNAPSHOT_DIR:?set L1_SNAPSHOT_DIR (reth download target)}:/l1
       - ${L2_DATA_DIR:?set L2_DATA_DIR}:/l2
