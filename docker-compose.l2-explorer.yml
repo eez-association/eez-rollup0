@@ -1,0 +1,112 @@
+# docker-compose.l2-explorer.yml — Independent Blockscout explorer for the eez-rollup0 L2
+#
+# Targets the LIVE eez L2 JSON-RPC running on the HOST at 127.0.0.1:18688 (chain id 1).
+#
+# The eez node binds its RPC on the host loopback/0.0.0.0:18688, and the host firewall
+# (ufw, INPUT policy DROP) blocks traffic from docker bridge subnets to host ports.
+# To reach the RPC without touching the firewall, the BACKEND runs network_mode: host
+# so it reaches the RPC via 127.0.0.1:18688 (loopback is exempt from the INPUT DROP) and
+# binds its own API on host port 4003. The DB publishes on host port 7433 so the
+# host-net backend connects via 127.0.0.1:7433. The frontend stays on the bridge.
+#
+# Ports 4001 (frontend) and 4003 (backend) are reused because they are the only ports
+# already opened for external access in BOTH ufw (INPUT) and the DOCKER-USER (FORWARD)
+# chain — they were provisioned as "L2 explorer frontend/backend" for the now-stopped
+# based-rollup explorers. Reusing them gives external reachability without any firewall
+# change. (4100/4101 work locally but are blocked to external clients by ufw/DOCKER-USER.)
+#
+# This stack is fully independent of the chiado node/lighthouse stack. Bring up with:
+#   docker compose -f docker-compose.l2-explorer.yml up -d
+#
+# Public URL (frontend): http://147.135.221.107:4001
+# Backend API:           http://147.135.221.107:4003/api/v2/...
+
+services:
+  l2eez-db:
+    image: postgres:16.6-alpine
+    container_name: l2eez-db
+    restart: unless-stopped
+    command: ["postgres", "-c", "max_connections=300"]
+    environment:
+      POSTGRES_DB: l2eez_blockscout
+      POSTGRES_USER: blockscout
+      POSTGRES_PASSWORD: blockscout
+    volumes:
+      - l2eez-db-data:/var/lib/postgresql/data
+    ports:
+      # Publish on host loopback so the host-net backend can reach it via 127.0.0.1:7433.
+      - "127.0.0.1:7433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blockscout -d l2eez_blockscout"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  l2eez-explorer:
+    image: blockscout/blockscout:7.0.2.commit.900ef697
+    container_name: l2eez-explorer
+    restart: unless-stopped
+    # Host networking: reach the L2 RPC at 127.0.0.1:18688 (loopback bypasses the ufw
+    # INPUT DROP that blocks docker-bridge -> host traffic) and bind the API on host :4003.
+    network_mode: host
+    command: >-
+      sh -c "bin/blockscout eval \"Elixir.Explorer.ReleaseTasks.create_and_migrate()\"
+      && bin/blockscout start"
+    environment:
+      DATABASE_URL: postgresql://blockscout:blockscout@127.0.0.1:7433/l2eez_blockscout
+      ETHEREUM_JSONRPC_VARIANT: geth
+      ETHEREUM_JSONRPC_HTTP_URL: http://127.0.0.1:18688
+      ETHEREUM_JSONRPC_TRACE_URL: http://127.0.0.1:18688
+      ECTO_USE_SSL: "false"
+      SECRET_KEY_BASE: "4e2wnN3WfYiy7XT7zVFEUdVRigm056SZc27YIxundAqgh7zZ5laQAXOgAC1nNpvI"
+      NETWORK: "eez Rollup"
+      SUBNETWORK: "L2"
+      COIN: "ETH"
+      COIN_NAME: "ETH"
+      # With host networking, this binds directly on host port 4003.
+      PORT: "4003"
+      DISABLE_EXCHANGE_RATES: "true"
+      INDEXER_DISABLE_PENDING_TRANSACTIONS_FETCHER: "true"
+      INDEXER_DISABLE_INTERNAL_TRANSACTIONS_FETCHER: "false"
+      INDEXER_DISABLE_BLOCK_REWARD_FETCHER: "true"
+      CHAIN_ID: "1"
+      API_V2_ENABLED: "true"
+      MIX_ENV: "prod"
+      POOL_SIZE: "50"
+      FIRST_BLOCK: "0"
+      # Public host: served behind the host nginx vhost l2.eez.dev (443 -> :4003).
+      BLOCKSCOUT_HOST: "l2.eez.dev"
+      API_URL: "https://l2.eez.dev"
+    depends_on:
+      l2eez-db:
+        condition: service_healthy
+
+  l2eez-frontend:
+    image: ghcr.io/blockscout/frontend:latest
+    container_name: l2eez-frontend
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_HOST: "l2.eez.dev"
+      NEXT_PUBLIC_API_PORT: "443"
+      NEXT_PUBLIC_API_PROTOCOL: https
+      NEXT_PUBLIC_API_WEBSOCKET_PROTOCOL: wss
+      NEXT_PUBLIC_STATS_API_HOST: ""
+      NEXT_PUBLIC_NETWORK_NAME: "eez Rollup L2"
+      NEXT_PUBLIC_NETWORK_SHORT_NAME: "L2"
+      NEXT_PUBLIC_NETWORK_ID: "1"
+      NEXT_PUBLIC_NETWORK_CURRENCY_NAME: "ETH"
+      NEXT_PUBLIC_NETWORK_CURRENCY_SYMBOL: "ETH"
+      NEXT_PUBLIC_NETWORK_CURRENCY_DECIMALS: "18"
+      NEXT_PUBLIC_IS_TESTNET: "true"
+      NEXT_PUBLIC_APP_HOST: "l2.eez.dev"
+      NEXT_PUBLIC_APP_PORT: "443"
+      NEXT_PUBLIC_APP_PROTOCOL: https
+      NEXT_PUBLIC_HOMEPAGE_CHARTS: "['daily_txs']"
+      NEXT_PUBLIC_VISUALIZE_API_HOST: ""
+    ports:
+      - "4001:3000"
+    depends_on:
+      - l2eez-explorer
+
+volumes:
+  l2eez-db-data:

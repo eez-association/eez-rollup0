@@ -1,26 +1,23 @@
 //! Per-chain dialect for entry encoding and CCM-verify batch construction.
 //!
-//! [`ChainDialect`] is the [`ChainProtocol::Dialect`](eez_protocol::ChainProtocol::Dialect)
+//! [`ChainDialect`] is the
+//! [`ChainProtocol::Dialect`](eez_protocol::ChainProtocol::Dialect)
 //! implementation for EVM chains. Two variants distinguish the two
 //! contract surfaces the protocol exposes:
 //!
-//! - [`EvmL2Style`](ChainDialect::EvmL2Style) — `CrossChainManagerL2`,
+//! - [`EvmL2Style`](ChainDialect::EvmL2Style) — `EEZL2`,
 //!   system-address-loaded `loadExecutionTable`.
 //! - [`EvmL1Style`](ChainDialect::EvmL1Style) — `EEZ.sol`,
-//!   permissionless `executeL1ToL2Call` / `executeL2TX`.
+//!   permissionless `executeCrossChainCall` / `executeL2TX`.
 //!
 //! Slot, ABI selection, and emission rules flow through
-//! `TargetConfig<EvmProtocol>`; `LocalChainClient` and inspectors never
-//! see `ChainDialect` directly.
+//! `TargetConfig<EvmProtocol>`; the runtime composer (Step 7) and
+//! inspectors never see `ChainDialect` directly.
 
-use alloy_sol_types::SolCall;
-use eez_protocol::{RecordedCall, RollupId};
+use eez_protocol::{ExecutedAction, RollupId};
 
-use crate::EvmProtocol;
 use crate::authorized_proxies::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
-use crate::types::{
-    ExecutionEntrySol, LookupCallSol, executeIncomingCrossChainCallCall, executeL1ToL2CallCall,
-};
+use crate::EvmProtocol;
 
 /// Selects the contract ABI and entry-emission rules for one rollup.
 ///
@@ -30,12 +27,12 @@ use crate::types::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ChainDialect {
-    /// L2 follower (`CrossChainManagerL2`): system-address-loaded
+    /// L2 follower (`EEZL2`): system-address-loaded
     /// `loadExecutionTable`. Default.
     #[default]
     EvmL2Style,
     /// L1 follower (`EEZ.sol`): permissionless
-    /// `executeL1ToL2Call` / `executeL2TX`.
+    /// `executeCrossChainCall` / `executeL2TX`.
     EvmL1Style,
 }
 
@@ -62,12 +59,12 @@ impl ChainDialect {
     /// `outer_root` cross-chain call.
     ///
     /// In the multi-prover protocol, both L1 and L2 dispatch via
-    /// the same `executeL1ToL2Call(sourceAddress, callData)`
+    /// the same `executeCrossChainCall(sourceAddress, callData)`
     /// entry point on the manager — invoked through the registered
     /// proxy. The composer's CCM-verify simulation forges the
     /// call from the proxy's address; this method returns the
     /// calldata for the outer ROUTING call (the proxy's `fallback`
-    /// receives `outer_root.calldata` as-is and forwards to the
+    /// receives `outer_root.data` as-is and forwards to the
     /// manager).
     ///
     /// `raw_tx` and `source_rollup_id` are accepted for trait
@@ -76,7 +73,7 @@ impl ChainDialect {
     #[must_use]
     pub fn encode_follower_trigger(
         &self,
-        call: &RecordedCall<EvmProtocol>,
+        call: &ExecutedAction<EvmProtocol>,
         _source_rollup_id: RollupId,
         _raw_tx: &[u8],
     ) -> Vec<u8> {
@@ -86,54 +83,14 @@ impl ChainDialect {
         // simulator's TargetTransaction sets `destination` to the
         // proxy address externally; here we just pass through the
         // outer call's calldata bytes.
-        call.calldata.to_vec()
+        call.data.to_vec()
     }
 }
 
-/// Stand-alone helper: encode `executeL1ToL2Call(sourceAddress,
-/// callData)` against a manager. Used for direct manager invocation
-/// (currently only by tests / Phase-2 paths); the production flow
-/// goes through the proxy fallback.
-#[must_use]
-pub fn encode_execute_cross_chain_call(
-    source_address: alloy_primitives::Address,
-    call_data: &[u8],
-) -> Vec<u8> {
-    executeL1ToL2CallCall {
-        sourceAddress: source_address,
-        callData: call_data.to_vec().into(),
-    }
-    .abi_encode()
-}
-
-/// Encode `EEZL2.executeIncomingCrossChainCall(...)` calldata — the
-/// L2-inbound delivery path, used by the composer's CCM-verify
-/// simulator and the L2 system tx it signs. The contract consumes
-/// `entries[0]` as the inbound call and enforces `msg.value == value`;
-/// the fields mirror the call's identity so the on-chain
-/// `crossChainCallHash` matches the entry's `proxyEntryHash`
-/// (`src/L2/EEZL2.sol:174-212`).
-#[must_use]
-pub fn encode_execute_incoming_cross_chain_call(
-    destination: alloy_primitives::Address,
-    value: alloy_primitives::U256,
-    data: &[u8],
-    source_address: alloy_primitives::Address,
-    source_rollup: u64,
-    entries: Vec<ExecutionEntrySol>,
-    lookup_calls: Vec<LookupCallSol>,
-) -> Vec<u8> {
-    executeIncomingCrossChainCallCall {
-        destination,
-        value,
-        data: data.to_vec().into(),
-        sourceAddress: source_address,
-        sourceRollup: alloy_primitives::U256::from(source_rollup),
-        entries,
-        _lookupCalls: lookup_calls,
-    }
-    .abi_encode()
-}
+// (Removed in the 5c51e02 bump: `encode_execute_cross_chain_call` /
+// `executeL1ToL2Call` — a stale direct-invocation helper whose selector never
+// matched the in-tree contracts; production always flows through the proxy
+// fallback. No in-tree consumers remained.)
 
 #[cfg(test)]
 mod tests {

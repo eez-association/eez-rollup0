@@ -1,0 +1,32 @@
+# eez-proverd (DEV) — runs the prover daemon containerized, mounting the
+# HOST-compiled eez-proverd + native-validate binaries. Host networking so
+# it reaches the composer's control feed (:50051) and the L2 RPC (:18688)
+# exactly like the bare-host process it replaces.
+#
+#   docker compose --env-file .env.chiado -f docker-compose.proverd.dev.yml build eez-proverd
+#   docker compose --env-file .env.chiado -f docker-compose.proverd.dev.yml up -d eez-proverd
+#
+# Requires EEZ_PROOF_SIGNER_KEY in the env (via --env-file .env.chiado).
+services:
+  eez-proverd:
+    build:
+      context: .
+      dockerfile: Dockerfile.proverd.dev
+    image: eez-proverd:dev
+    container_name: eez-proverd
+    network_mode: host
+    restart: "no"
+    environment:
+      - RUST_LOG=info,eez_proverd=debug
+      - EEZ_PROOF_SIGNER_KEY=${EEZ_PROOF_SIGNER_KEY}
+    volumes:
+      - ./target/release/eez-proverd:/usr/local/bin/eez-proverd:ro
+      - /home/ubuntu/zisk-eth-client/target/release/native-validate:/usr/local/bin/native-validate:ro
+      - ./configs/l2-chainconfig.json:/app/l2-chainconfig.json:ro
+    command:
+      - "--control-addr"
+      - "http://127.0.0.1:50051"
+      - "--validator-bin"
+      - "/usr/local/bin/native-validate"
+      - "--chain-config"
+      - "/app/l2-chainconfig.json"

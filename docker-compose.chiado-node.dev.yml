@@ -1,0 +1,49 @@
+# docker-compose.chiado-node.dev.yml — DEV overlay for the chiado node.
+#
+# Skips the slow cargo-chef image rebuild: builds a lightweight ubuntu:24.04 dev
+# image ONCE (Dockerfile.dev) and mounts the HOST-compiled
+# ./target/release/eez-node into it. Iterate with `cargo build --release -p
+# eez-node` + recreate — no `docker build`.
+#
+# ALWAYS pass WITH the base file (this overlay only patches the eez-node service):
+#
+#   # one-time (or after Dockerfile.dev / this file changes): build the dev image
+#   docker compose -f docker-compose.chiado-node.yml \
+#                  -f docker-compose.chiado-node.dev.yml build eez-node
+#
+#   # bring the stack up (eez-node uses the mounted host binary; lighthouse stock)
+#   docker compose -f docker-compose.chiado-node.yml \
+#                  -f docker-compose.chiado-node.dev.yml up -d
+#
+#   # iterate: recompile on the host (incremental, fast), then recreate the
+#   # container so the new binary inode is re-mounted (a plain `restart` keeps
+#   # the old inode after a relink — use --force-recreate):
+#   cargo build --release -p eez-node
+#   docker compose -f docker-compose.chiado-node.yml \
+#                  -f docker-compose.chiado-node.dev.yml up -d --force-recreate eez-node
+#
+# WHY: the prod image (debian:bookworm-slim, glibc 2.36) cannot run a binary
+# built against this host's glibc 2.39 — hence the ubuntu:24.04 dev image.
+services:
+  eez-node:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      target: runtime
+    image: eez-node:dev
+    environment:
+      # Outbound classifier proxy set (parsed ONCE at startup). P =
+      # computeCrossChainProxyAddress(L1_Value, MAINNET=0) changes per L1 Value
+      # deploy, so make it overridable for live outbound tests; defaults to the
+      # base value. Recreate eez-node after changing it.
+      EEZ_CROSS_CHAIN_PROXY_ADDRESSES: "${EEZ_OUTBOUND_PROXY:-0xDFCc51C3d6Ce4e8f135cA257752729E17afD5B65}"
+    # Appended to the base service's volumes (l1 snapshot / l2 datadir / jwt /
+    # fresh genesis). Host-compiled binary overrides the (absent) baked one.
+    # BUILD_PROFILE selects which host build to mount (default `release`). Use a
+    # faster-compiling profile to iterate, e.g. a `release-fast` (lto=false,
+    # codegen-units=16) added to Cargo.toml, or `debug`:
+    #   BUILD_PROFILE=release-fast cargo build --profile release-fast -p eez-node
+    #   BUILD_PROFILE=release-fast docker compose -f docker-compose.chiado-node.yml \
+    #       -f docker-compose.chiado-node.dev.yml up -d --force-recreate eez-node
+    volumes:
+      - ./target/${BUILD_PROFILE:-release}/eez-node:/usr/local/bin/eez-node:ro

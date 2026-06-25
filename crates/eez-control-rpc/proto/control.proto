@@ -1,0 +1,190 @@
+// Feed: composer → prover.
+//
+// The composer's embedded driver commits one L2 block per slot. For
+// EVERY committed block (Normal and Sync alike) it emits a `ControlEvent`
+// carrying everything the prover needs for that block: the routing
+// metadata, the execution `witness` (which the composer pulls from reth's
+// `eez_executionWitness` right after sealing — Pull-B), the block RLP, and,
+// for settling blocks, the finalized L1 `PostBatch`. There is no separate
+// witness feed and no join: one block → one self-contained event.
+//
+//   Normal block    → composition absent.
+//   Settling block  → composition present (carries the L1 `PostBatch`).
+
+syntax = "proto3";
+
+package control.v1;
+
+service ControlFeed {
+  // Server-stream: one event per committed block. With `from_block >= 1`
+  // the server replays its buffered events first (ring-buffered, bounded),
+  // then continues live — a reconnecting prover resumes without a gap. A
+  // subscriber that falls behind the live buffer is DISCONNECTED with
+  // `DATA_LOSS` instead of silently skipped: reconnect-with-replay turns
+  // the gap into recovery.
+  rpc Subscribe(SubscribeRequest) returns (stream ControlEvent);
+}
+
+message SubscribeRequest {
+  // Replay cursor. `0` = live-only (the proto3 default, so old clients —
+  // and an empty request — keep the previous behavior). `k >= 1` = replay
+  // buffered events with `block_number >= k` first, then live. "Everything
+  // buffered" = `1` (block 0 is genesis and is never published). A
+  // reconnecting prover sends `last_accepted + 1` to resume exactly where
+  // it left off.
+  uint64 from_block = 1;
+}
+
+message ControlEvent {
+  bytes  block_hash   = 1;  // 32B — identifies the block
+  uint64 block_number = 2;
+  bytes  parent_hash  = 3;
+  // Present for Sync blocks that carried a composition AND for Normal-shaped
+  // settling blocks (inbound-settlement / heartbeat closers) that carry only
+  // a `post_batch`; absent for non-settling Normal blocks.
+  Composition composition = 4;
+  // Pull-B: the block's execution witness + consensus RLP, pulled by the
+  // composer from reth's `eez_executionWitness` right after sealing. The
+  // prover re-executes `block` against `witness` and re-derives `block_hash`
+  // from the block RLP (the witness stays reth-originated; the composer only
+  // relays). Present for every block.
+  ExecutionWitness witness = 5;
+  bytes block = 6;  // consensus RLP (header + body)
+}
+
+// Minimal execution witness for one block. Structural mirror of the
+// `alloy_rpc_types_debug::ExecutionWitness` reth returns from
+// `eez_executionWitness` (kept local so control.proto needs no cross-package
+// import).
+message ExecutionWitness {
+  repeated bytes state   = 1;  // trie nodes touched by the block
+  repeated bytes codes   = 2;  // contract bytecodes accessed
+  repeated bytes keys    = 3;  // preimages of hashed account/slot keys
+  repeated bytes headers = 4;  // ancestor block headers (for BLOCKHASH)
+}
+
+message Composition {
+  // Removed: `included_user_txs` — self-reported by the composer (decoded from
+  // the block it sealed) and never consumed by the prover, which already has
+  // the full tx list in the witness `block` RLP and proves the state
+  // transition by re-execution. Reserved so the field number is never reused.
+  reserved 1;
+  reserved "included_user_txs";
+  // The finalized L1 settlement batch for this block. Absent only when
+  // settlement preparation failed or the tracker refused/diverged for a
+  // sealed Sync block (settlement wiring is always-on).
+  PostBatch post_batch = 2;
+}
+
+// The L1 settlement batch shipped to the prover: the authoritative ABI payload
+// plus a DECODED SUMMARY for visibility. The summary fields are observability
+// only — NEVER re-encode the batch from them; the prover decodes
+// `abi_calldata` to recompute the publicInputsHash byte-identically to L1.
+message PostBatch {
+  // Authoritative payload: ABI-encoded `EEZ.postAndVerifyBatch` calldata
+  // (proof-system carriers filled, `proofs[]` empty). The prover decodes THIS
+  // to recompute the `publicInputsHash`; the composer broadcasts it to L1 after
+  // filling `proofs[]` with the prover's attestation.
+  bytes abi_calldata = 1;
+
+  // ── decoded summary (observability; NOT authoritative) ──
+  uint64 rollup_id          = 2;  // StateDelta.rollupId — the L2 this settles
+  bytes  current_state      = 3;  // 32B — StateDelta.currentState (L1's committed root)
+  bytes  new_state          = 4;  // 32B — StateDelta.newState (this block's post-exec root)
+  uint32 entry_count        = 5;  // number of execution-table entries
+  bytes  public_inputs_hash = 6;  // 32B — the hash the composer computed; the prover cross-checks
+
+  // 32B — `blockhash(N)` for the batch's `blockNumber = N` (the recent-N
+  // anti-replay binding; N itself rides in-band in `abi_calldata`). REQUIRED
+  // for the prover's fold: `getTimestampAndBlockHash(N)` returns
+  // `(0, blockhash(N))` and the prover has no L1 view to read it. NOT a trust
+  // seam: a lied hash mismatches the on-chain fold and the batch can never
+  // land (self-DoS only).
+  bytes l1_block_hash = 7;
+}
+
+// Return path: prover → composer.
+//
+// Once the prover has the aggregated proof for one L1-slot window (the
+// `postBatch` unit — the N L2 blocks committed in that slot), it submits
+// it here. The composer — sole custodian of the L1 EOA — fills
+// `batch.proofs[]` with the prover's signature and broadcasts
+// `postAndVerifyBatch` (A.4); the L1 contract verifies the attestation.
+service ProofSink {
+  rpc SubmitSlotProof(SlotProof) returns (SubmitAck);
+}
+
+// The prover's SETTLEMENT attestation (A.3c) — submitted ONLY for windows
+// that closed with a finalized L1 postBatch (slot closers settle —
+// heartbeats included — whenever the root advanced; a root-unchanged closer
+// is skipped, and a window without a postBatch has nothing verifiable to say).
+//
+// Fields 2-5 carried the RETIRED legacy per-window attestation (a second
+// ECDSA signature over a window commitment of parent/final roots + the
+// block-hash chain, plus the never-read PublicInputs sub-message). The
+// composer logged and discarded it since Step 8 — the prover's window
+// verification lives in its REFUSAL gates (it never signs a settlement it
+// did not re-execute), and the one externally-verified statement is the
+// publicInputsHash signature below (Cluster 4, 2026-06-11).
+message SlotProof {
+  reserved 2, 3, 4, 5;
+  reserved "batch_commitment", "proof", "public_inputs", "block_hashes";
+
+  uint64 l1_slot_anchor   = 1;   // first L2 block number of the window (log correlation)
+  // A.3c — the L1 postBatch attestation. The prover recomputed the
+  // publicInputsHash over the finalized postBatch (control feed), gated the
+  // settlement chain / interiors / inbound outcome against its own
+  // re-execution, and ECDSA-signed the hash with the proof system's
+  // registered key. The composer fills `batch.proofs[]` with
+  // `post_batch_proof` and submits (A.4).
+  bytes public_inputs_hash = 6;  // the 32-byte hash the prover signed
+  bytes post_batch_proof   = 7;  // 65-byte ECDSA sig over public_inputs_hash
+}
+
+message SubmitAck {
+  bool accepted = 1;
+}
+
+// ── Composer-driven dispatch (composer → prover) ──────────────────────
+//
+// Inverts the pull model: instead of the prover self-picking `from_block`
+// (an in-memory, corruptible cursor that a re-anchor collision could drive
+// backward below the verified frontier), the COMPOSER — which knows what it
+// POSTED and, via the ProofStore, what is ATTESTED — dictates the next
+// unverified window. The prover becomes a stateless re-execution worker.
+// See docs/composer-driven-prover-design.md.
+//
+// Additive: a prover that ignores ProverDispatch still self-picks from_block,
+// so old/new provers interoperate; the driver only runs behind
+// EEZ_COMPOSER_DRIVEN in deferred-post deployments.
+service ProverDispatch {
+  // Server-stream of verify directives: the OLDEST posted-but-unattested
+  // window's range, in posted order. The prover Subscribes the ControlFeed
+  // for that range, re-executes, and attests via ProofSink. The composer
+  // advances to the next directive when the matching attestation lands.
+  rpc Dispatch(DispatchRequest) returns (stream VerifyRange);
+}
+
+message DispatchRequest {
+  // Log-correlation only (a reconnecting prover may echo its last epoch).
+  // The composer derives WHAT to dispatch from its own posted/attested
+  // ledger, never from a prover-asserted height.
+  uint64 prover_epoch = 1;
+}
+
+// One verify directive: a WHOLE posted batch span (`posted+1 .. sync_height`),
+// never an anchor-less sub-range (a non-settling sub-window binds to nothing
+// in OD-5). `from_block`/`to_block`/`rollup_id` route the prover.
+// `claimed_current_state` and `public_inputs_hash` are HINT/cross-check ONLY:
+// the prover recomputes both from the authoritative `PostBatch.abi_calldata`
+// it streams and signs ONLY its own recomputed hash. A lying directive is
+// caught by the OD-5 anchor re-execution; the verified frontier advances
+// EXCLUSIVELY via a content-keyed (publicInputsHash) ProofSink attestation,
+// never via a height the composer asserts.
+message VerifyRange {
+  uint64 from_block            = 1;  // batch boundary = posted+1 (OD-5 anchor block + 1)
+  uint64 to_block              = 2;  // sync_height — the settling block (carries composition)
+  uint64 rollup_id             = 3;
+  bytes  claimed_current_state = 4;  // 32B — == PostBatch.current_state; HINT/cross-check
+  bytes  public_inputs_hash    = 5;  // 32B — the ProofStore key the prover must reproduce + sign
+}

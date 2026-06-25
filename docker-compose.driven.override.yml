@@ -1,0 +1,80 @@
+# Composer-driven + deferred-post overlay.
+#
+# Layered ON TOP of docker-compose.chiado-node.yml. It (1) flips the node into
+# COMPOSER-DRIVEN dispatch (it streams the verify range to the prover instead of
+# the prover self-picking) and (2) adds the out-of-process eez-proverd, which
+# NATIVE-re-executes each settling window and ECDSA-attests it. In this mode the
+# node DEFERS each postBatch until the prover's attestation lands, then settles.
+#
+# PREREQUISITE — the protocol MUST be deployed with the REAL proof system:
+#     EEZ_PROOF_SYSTEM=real ./scripts/deploy.sh        # writes deployments.env
+# That writes EEZ_PROOF_SYSTEM_KIND=real into deployments.env, which puts the
+# node into deferred-post mode. With the dev MockECDSAProofSystem the node
+# self-signs synchronously and the prover's REAL signature would be rejected
+# on-chain — so the driven/deferred path requires the real ECDSAProofSystem.
+#
+# The node and the prover share EEZ_PROOF_SIGNER_KEY (from .env.chiado): its
+# address is the composer's attester AND the PS's registered authorizedSigner,
+# so the ProofSink accepts exactly the signatures the prover produces.
+#
+# Run:
+#   docker compose --env-file .env.chiado \
+#     -f docker-compose.chiado-node.yml \
+#     -f docker-compose.driven.override.yml up -d
+#
+# Build the prover image once (eez-proverd + native-validate, both from source):
+#   docker compose --env-file .env.chiado \
+#     -f docker-compose.chiado-node.yml \
+#     -f docker-compose.driven.override.yml build eez-proverd
+
+services:
+  eez-node:
+    environment:
+      # Expose the ProverDispatch service + drive the prover from the node's
+      # posted/attested ledger. (Deferred-post itself is switched on by
+      # EEZ_PROOF_SYSTEM_KIND=real, which comes from deployments.env.)
+      EEZ_COMPOSER_DRIVEN: "1"
+
+  eez-proverd:
+    build:
+      context: .
+      dockerfile: Dockerfile.proverd
+    image: eez-proverd:local
+    container_name: eez-proverd
+    # Host networking so it reaches the node's control feed (:50051) and the L2
+    # RPC (:18688) exactly like the node it attaches to.
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      - eez-node
+    # EEZ_PROOF_SIGNER_KEY (== the PS authorizedSigner == the node's attester).
+    env_file:
+      - ./.env.chiado
+    environment:
+      RUST_LOG: "info,eez_proverd=info"
+      # Take the verify range from the node's ProverDispatch stream.
+      EEZ_COMPOSER_DRIVEN: "1"
+      # The node's control feed: ProverDispatch (directives) + ProofSink (attest).
+      EEZ_CONTROL_RPC_URL: "http://127.0.0.1:50051"
+      # L2 archive for durable backfill of any replay-gap blocks (debug_* served
+      # on :18688 by the node's --http.api=...,debug).
+      EEZ_L2_RPC_URL: "http://127.0.0.1:18688"
+      # native-validate (stateless re-execution) + L2 chain-config, both baked
+      # into the image by Dockerfile.proverd.
+      EEZ_VALIDATOR_BIN: "/usr/local/bin/native-validate"
+      EEZ_CHAIN_CONFIG: "/app/l2-chainconfig.json"
+    # Override the image's `--help` default CMD with the real run. The signer
+    # (EEZ_PROOF_SIGNER_KEY), driven flag (EEZ_COMPOSER_DRIVEN) and L2 RPC
+    # (EEZ_L2_RPC_URL) come from the env above; these three pin the control
+    # endpoint + the baked-in validator/chain-config. (`command: []` does NOT
+    # clear the CMD in compose — it's silently ignored — so pass it explicitly.)
+    command:
+      - "--control-addr"
+      - "http://127.0.0.1:50051"
+      - "--validator-bin"
+      - "/usr/local/bin/native-validate"
+      - "--chain-config"
+      - "/app/l2-chainconfig.json"
+    logging:
+      driver: "local"

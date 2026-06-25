@@ -8,6 +8,7 @@ description            = "eez Rollup-0 node — vanilla reth driven by an eez se
 
 [dependencies]
 eez-composer.workspace      = true
+eez-control-rpc.workspace   = true
 eez-deriver.workspace       = true
 eez-driver.workspace        = true
 eez-evm.workspace           = true
@@ -45,13 +46,23 @@ alloy-consensus.workspace    = true
 alloy-eips.workspace         = true
 alloy-primitives.workspace   = true
 alloy-provider.workspace     = true
+alloy-rlp.workspace          = true
 alloy-signer-local.workspace = true
 reqwest.workspace            = true
+
+# control-plane feed: host the tonic ControlFeed server (prover-chain P2b).
+tonic = { workspace = true, features = ["server"] }
 
 # RPC ingress middleware (eth_sendRawTransaction override)
 jsonrpsee.workspace  = true
 serde_json.workspace = true
 tower.workspace      = true
+
+# B0 — the L1 RPC interceptor front (l1_interceptor): a transparent HTTP server
+# that forwards eth_* to the real L1 (reqwest) + intercepts eth_sendRawTransaction.
+hyper           = { version = "1.9", features = ["server", "http1"] }
+hyper-util      = { version = "0.1", features = ["tokio"] }
+http-body-util  = "0.1"
 
 # app
 clap.workspace               = true
@@ -61,6 +72,9 @@ mimalloc.workspace           = true
 tokio.workspace              = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
+# B0 interceptor: typed authorizedProxies eth_call (no hardcoded selectors).
+alloy-rpc-types-eth.workspace = true
+alloy-sol-types.workspace     = true
 
 [dev-dependencies]
 alloy-consensus.workspace = true

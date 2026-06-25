@@ -34,9 +34,32 @@ use tokio::sync::broadcast;
 use tracing::{Level, event};
 
 use crate::held_pool::HeldTx;
+use crate::ingress::Direction;
 use crate::local::build_sync_block;
 use crate::optimistic::OptimisticallyIncluded;
 use crate::rollup::RollupState;
+
+/// Outcome of `prepare_post_batch_raw`: either a ready-to-dispatch L1 tx
+/// (the synchronous mock-proof path) or a deferred settlement that must
+/// wait for the out-of-process prover's real attestation before it can be
+/// signed and posted.
+///
+/// `Ready` carries the fully-signed `postAndVerifyBatch` raw tx (EIP-2718).
+/// `Deferred` carries the assembled batch (with a placeholder/mock proof in
+/// `proofs[]` that `apply_proof` will overwrite) plus the recomputed
+/// `publicInputsHash` — the key under which the prover's signature lands in
+/// the shared `ProofStore`. Only produced when `Composer::deferred_post()`
+/// (i.e. `EEZ_PROOF_SYSTEM_KIND=real`, the real on-chain `ECDSAProofSystem`).
+enum PostBatchOutcome {
+    /// Synchronous path (mock proof system): the raw L1 tx is ready now.
+    Ready(Bytes),
+    /// Deferred path (real proof system): post fires when the prover's
+    /// attestation arrives in the `ProofStore`, keyed by `public_inputs_hash`.
+    Deferred {
+        batch: Box<eez_evm::EvmBatch>,
+        public_inputs_hash: B256,
+    },
+}
 
 /// Runtime config for the cross-chain execution path on Sync slots.
 /// `Composer::new` accepts `Option<Arc<CrossChainExecCtx>>`; `Some`
@@ -177,6 +200,20 @@ struct Inner<L2: BlockReader> {
     /// `Composition<EvmProtocol>` (L2 destination effects + L1
     /// `ExecutionEntry`s).
     evm_composer: Option<eez_evm_inspector::EvmComposer>,
+    /// L2 ENTRY client (`Role::Entry`, `EvmL2Style`) for OUTBOUND L2→L1
+    /// source simulation: the drain runs an L2→L1 user tx through
+    /// `simulate_and_resolve_recorded_for(L2, this, …)` to detect the
+    /// cross-chain call. DISTINCT from the L2 FOLLOWER in `rollups` — a
+    /// follower's `simulate_source_tx` errors `Unavailable`. `None` when the
+    /// embedded L1 / `EvmComposer` isn't wired. Consumed by the drain's
+    /// outbound branch.
+    l2_entry_client: Option<
+        std::sync::Arc<
+            dyn eez_protocol::executor::EntryChainClient<Protocol = eez_evm::EvmProtocol>
+                + Send
+                + Sync,
+        >,
+    >,
     /// Runtime context (signer + L2 chain config) for wrapping the
     /// composer's `(load_table_payload, execute_payload)` byte
     /// outputs into signed L2 system txs. Must be `Some` whenever
@@ -189,6 +226,30 @@ struct Inner<L2: BlockReader> {
     /// uses it to reorg the L2 head when an optimistically-committed
     /// Sync block's bundle fails on L1.
     committer: std::sync::OnceLock<BlockCommitterHandle<EthEngineTypes>>,
+    /// Prover-feed sink (P4-a): the settling block's `PostBatch`, keyed by the
+    /// Sync block NUMBER, for the witness task to ship on
+    /// `ControlEvent.composition`. Keyed by NUMBER not hash because the committer
+    /// rebuilds the block from attrs (`process_sequence`) so the committed hash
+    /// differs from the composer's predicted `built.header.hash()` — but the block
+    /// NUMBER is deterministic on both sides. `OnceLock`-set after construction
+    /// (`set_postbatch_sink`); `None` until wired (composer-mode only). The
+    /// `std::Mutex` is held only for the brief insert.
+    postbatch_sink: std::sync::OnceLock<
+        Arc<std::sync::Mutex<HashMap<u64, eez_control_rpc::v1::PostBatch>>>,
+    >,
+    /// Prover-feed RETURN store (P4-b-full): verified attestations the composer's
+    /// `ProofSink` records, keyed by publicInputsHash. Set ONLY in DEFERRED-POST
+    /// mode (`EEZ_PROOF_SYSTEM_KIND=real`): its presence switches the composer
+    /// from self-signing the mock to waiting for the prover's real signature.
+    /// `None` = synchronous mock post (unchanged).
+    proof_store: std::sync::OnceLock<crate::proof_sink::ProofStore>,
+    /// Composer-driven prover ledger (Phase 1, DARK). Each deferred post
+    /// records its `[posted+1 .. sync_height]` window here; the `ProofSink`
+    /// flips `attested` + advances the verified frontier when the matching
+    /// attestation lands. Set only alongside `proof_store` (deferred-post).
+    /// `None` = ledger off (no behavior change). Populated-but-not-driving in
+    /// Phase 1; the dispatch driver (Phase 2) reads it.
+    posted_windows: std::sync::OnceLock<crate::posted_windows::PostedWindows>,
 }
 
 impl<L2: BlockReader> std::fmt::Debug for Composer<L2> {
@@ -217,6 +278,13 @@ where
         evm_config: EthEvmConfig,
         evm_composer: Option<eez_evm_inspector::EvmComposer>,
         cc_exec_ctx: Option<Arc<CrossChainExecCtx>>,
+        l2_entry_client: Option<
+            std::sync::Arc<
+                dyn eez_protocol::executor::EntryChainClient<Protocol = eez_evm::EvmProtocol>
+                    + Send
+                    + Sync,
+            >,
+        >,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -226,10 +294,98 @@ where
                 l1_watcher,
                 evm_config,
                 evm_composer,
+                l2_entry_client,
                 cc_exec_ctx,
                 committer: std::sync::OnceLock::new(),
+                postbatch_sink: std::sync::OnceLock::new(),
+                proof_store: std::sync::OnceLock::new(),
+                posted_windows: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// Wire the prover-feed PostBatch sink (P4-a). The witness task
+    /// (eez-node) shares the same `Arc` and drains it to fill each settling
+    /// block's `ControlEvent.composition`. Called once at startup, before the
+    /// first Sync slot. No-op (silently ignored) if already set.
+    pub fn set_postbatch_sink(
+        &self,
+        sink: Arc<std::sync::Mutex<HashMap<u64, eez_control_rpc::v1::PostBatch>>>,
+    ) {
+        let _ = self.inner.postbatch_sink.set(sink);
+    }
+
+    /// Wire the prover-feed RETURN store (P4-b-full deferred post). Sharing the
+    /// same `ProofStore` the `ProofSink` fills, its presence puts the composer in
+    /// DEFERRED-POST mode: it builds + holds each settling batch and posts it only
+    /// once the prover's verified attestation lands (vs self-signing the mock).
+    /// Called once at startup. No-op if already set.
+    pub fn set_proof_store(&self, store: crate::proof_sink::ProofStore) {
+        let _ = self.inner.proof_store.set(store);
+    }
+
+    /// `true` when the composer is in deferred-post mode (a proof store is wired).
+    #[must_use]
+    pub fn deferred_post(&self) -> bool {
+        self.inner.proof_store.get().is_some()
+    }
+
+    /// Wire the composer-driven prover ledger (Phase 1). Sharing the same
+    /// [`PostedWindows`](crate::posted_windows::PostedWindows) the `ProofSink`
+    /// attests into, the composer records each deferred window it posts so the
+    /// frontier and the (Phase 2) dispatch driver have a single source of
+    /// truth. DARK in Phase 1 — recording only, no behavior change. Called
+    /// once at startup alongside [`set_proof_store`](Self::set_proof_store).
+    /// No-op if already set.
+    pub fn set_posted_windows(&self, windows: crate::posted_windows::PostedWindows) {
+        let _ = self.inner.posted_windows.set(windows);
+    }
+
+    /// Phase 1 (dark): record the just-deferred `[posted+1 .. sync_height]`
+    /// window in the composer-driven ledger, if wired. Recording ONLY — the
+    /// `ProofSink` flips `attested` + advances the verified frontier when the
+    /// prover's attestation lands (keyed by `public_inputs_hash`). No-op when
+    /// the ledger is off (synchronous mock post, or deferred-without-ledger).
+    /// `posted` is the L1-confirmed cursor the batch anchored to, so
+    /// `from_block = posted+1` matches the OD-5 batch boundary; `current_state`
+    /// is the batch's first-entry `StateDelta.currentState` (the OD-5 anchor),
+    /// both HINTS the prover re-derives from `abi_calldata`.
+    fn record_posted_window(
+        &self,
+        rollup: &RollupState<L2>,
+        rollup_id: u64,
+        sync_height: u64,
+        batch: &eez_evm::EvmBatch,
+        public_inputs_hash: B256,
+    ) {
+        let Some(windows) = self.inner.posted_windows.get() else {
+            return;
+        };
+        let posted = rollup.l1_head.cursor();
+        let current_state = batch
+            .inner
+            .entries
+            .first()
+            .and_then(|e| e.stateDeltas.first())
+            .map_or(B256::ZERO, |d| d.currentState);
+        windows.record_posted(crate::posted_windows::PostedWindow {
+            from_block: posted.saturating_add(1),
+            to_block: sync_height,
+            rollup_id,
+            public_inputs_hash,
+            current_state,
+            attested: false,
+            fast_forwarded: false,
+            pending_l1: false,
+        });
+    }
+
+    /// The attester address of the configured prover — the prover-feed
+    /// `ProofSink` verifies returned attestations recover to it. The vkey is
+    /// `bytes32(uint160(address))`, so the address is its low 20 bytes.
+    #[must_use]
+    pub fn prover_address(&self) -> Address {
+        Address::from_slice(&self.inner.prover.vkey()[12..])
     }
 
     /// Wire the `BlockCommitter` handle after the Sequencer spawns the
@@ -332,6 +488,23 @@ where
                         );
                     }
                 }
+                // Fix-1 (composer-driven): a confirmed batch advanced the L1
+                // cursor (the Deriver already appended it before this event
+                // fires). Advance the verified frontier to the cursor — every
+                // window at or below it SETTLED on L1, which required
+                // `ECDSAProofSystem.verify` (the attester's signature), so it is
+                // verified by transitivity THROUGH L1 even without a returned
+                // attestation. This stops the driven prover re-verifying
+                // confirmed windows (the live frontier-stall) and lets it skip a
+                // settled-but-ring-evicted gap. `mark_settled_on_l1` is monotone
+                // (reorg-safe). No-op when the ledger is off (self-sign). Fires
+                // on ANY confirmed batch (ours or external — the cursor advances
+                // by transitivity regardless of who posted).
+                if let Some(windows) = self.posted_windows.get() {
+                    for rollup in self.rollups.values() {
+                        windows.mark_settled_on_l1(rollup.l1_head.cursor());
+                    }
+                }
             }
             Ok(L1Event::Reorg {
                 common_ancestor_number,
@@ -348,6 +521,17 @@ where
                         .l1_head
                         .highest_l2_at_or_below_l1(*common_ancestor_number)
                         .unwrap_or(0);
+                    // Composer-driven REORG SAFETY (critical with competing
+                    // composers): demote any verified/pending window above the
+                    // retreated cursor back to dispatchable, so the reorged-out
+                    // range (possibly a COMPETITOR's batch that had advanced our
+                    // rollup, then itself reorged) is RE-VERIFIED before it can
+                    // re-settle — else monotone mark_settled_on_l1 leaves it
+                    // falsely resolved (a coverage hole). Same new_cursor basis as
+                    // the optimistic re-queue. Runs even when txs is empty below.
+                    if let Some(windows) = self.posted_windows.get() {
+                        windows.demote_above_cursor(new_cursor);
+                    }
                     let txs = rollup.optimistic.take_rolled_out(new_cursor);
                     if txs.is_empty() {
                         continue;
@@ -809,7 +993,7 @@ where
             let submitter = &self.inner.submitter;
             let mut keep: Vec<crate::HeldTx> = Vec::with_capacity(failed.txs.len());
             let mut dropped = 0usize;
-            let mut evicted_chains: Vec<(alloy_primitives::Address, u64)> = Vec::new();
+            let mut evicted_chains: Vec<(alloy_primitives::Address, Direction, u64)> = Vec::new();
             for mut tx in failed.txs {
                 if let Ok(true) = submitter.receipt_exists(tx.hash).await {
                     dropped += 1;
@@ -834,7 +1018,7 @@ where
                     tx.attempts += 1;
                     if tx.attempts >= MAX_BUNDLE_ATTEMPTS {
                         dropped += 1;
-                        evicted_chains.push((tx.sender, tx.nonce));
+                        evicted_chains.push((tx.sender, tx.direction, tx.nonce));
                         event!(
                             name: "eez.composer.recovery.poison_evicted",
                             Level::WARN,
@@ -858,9 +1042,10 @@ where
             // OTHER senders' chains as collateral — the exact cascade
             // that bricked a run's user EOA. Drop them from both the
             // keep list and the pool, loudly.
-            for (sender, nonce) in &evicted_chains {
+            for (sender, direction, nonce) in &evicted_chains {
                 keep.retain(|t| {
-                    let cascade = t.sender == *sender && t.nonce > *nonce;
+                    let cascade =
+                        t.sender == *sender && t.direction == *direction && t.nonce > *nonce;
                     if cascade {
                         dropped += 1;
                         event!(
@@ -876,7 +1061,7 @@ where
                     }
                     !cascade
                 });
-                for t in pool.drain_sender_above(*sender, *nonce) {
+                for t in pool.drain_sender_above(*sender, *direction, *nonce) {
                     dropped += 1;
                     event!(
                         name: "eez.composer.recovery.nonce_chain_evicted",
@@ -943,7 +1128,11 @@ where
             .state_by_block_hash(parent_hash)
             .map_err(|e| format!("state_by_block_hash({parent_hash}): {e}"))?;
         let system_address = ctx.system_signer.address();
-        let mut nonce = state
+        // SYSTEM_ADDRESS nonce at the Sync block's parent — the SAME point the
+        // deriver reads (system_address_nonce_at(from_block-1)). NOT advanced
+        // inline during the drain: the canonical build_cross_chain_sync_pairs
+        // assigns it two-phase post-drain so a mixed slot matches the deriver.
+        let nonce = state
             .account_nonce(&system_address)
             .map_err(|e| format!("account_nonce({system_address}): {e}"))?
             .unwrap_or(0);
@@ -997,7 +1186,19 @@ where
         let mut survivors: Vec<HeldTx> = Vec::with_capacity(drained.len());
         let mut survivor_comps: Vec<eez_protocol::Composition<eez_evm::EvmProtocol>> =
             Vec::with_capacity(drained.len());
-        let mut system_txs: Vec<Bytes> = Vec::with_capacity(drained.len() * 2);
+        // Cross-chain work STAGED in drain order; the SYSTEM_ADDRESS system txs +
+        // their nonces + the Sync-block order are assigned AFTER the drain by the
+        // canonical `build_cross_chain_sync_pairs` (NOT inline) so a MIXED slot's
+        // Sync block is byte-identical to the deriver's two-phase reconstruction.
+        // pending_out: each (outbound L1 settlement entry, its consuming user tx);
+        // pending_in: the inbound deferred target entries.
+        let mut pending_out: Vec<(eez_evm::types::ExecutionEntrySol, alloy_primitives::Bytes)> =
+            Vec::new();
+        let mut pending_in: Vec<eez_evm::types::ExecutionEntrySol> = Vec::new();
+        // OUTBOUND L1 settlement entries (proxyEntryHash==0 + non-empty
+        // l2ToL1Calls) accumulated for the postBatch splice (A2.3d). Empty for
+        // an inbound-only slot → no splice, byte-identical postBatch.
+        let mut outbound_entries: Vec<eez_evm::types::ExecutionEntrySol> = Vec::new();
         let mut poison: Vec<HeldTx> = Vec::new();
         // On a transient failure we abort the slot; this holds the error
         // string + the txs still needing re-queue (the failing tx + the
@@ -1006,6 +1207,106 @@ where
 
         let mut iter = drained.into_iter().enumerate();
         while let Some((idx, held)) = iter.next() {
+            // ── OUTBOUND L2→L1 arm (A2.3b) ──────────────────────────────
+            // Source-sim via the L2 ENTRY client (the follower's
+            // simulate_source_tx errors Unavailable). The L1 settlement
+            // entries land in `composition.targets[L1].batch`; lower each to a
+            // lean L2 deferred entry + its loadExecutionTable, and pair the
+            // load tx with the user tx (SyncPair). R1: zero L1 entries → POISON
+            // (never a silent survivor; never reaches build_inbound_system_txs).
+            if held.direction == Direction::Outbound {
+                let Some(l2_entry) = self.inner.l2_entry_client.as_deref() else {
+                    event!(
+                        name: "eez.composer.cc_compose.outbound_no_l2_entry",
+                        Level::WARN,
+                        rollup_id,
+                        tx_hash = %held.hash,
+                        "outbound tx but no L2 entry client wired (no embedded L1); evicting",
+                    );
+                    poison.push(held);
+                    continue;
+                };
+                match evm_composer
+                    .simulate_and_resolve_recorded_for(
+                        eez_protocol::RollupId(rollup_id),
+                        l2_entry,
+                        held.raw_tx.as_ref(),
+                    )
+                    .await
+                {
+                    Ok((composition, _recorded)) => {
+                        let l1_entries: Vec<eez_evm::types::ExecutionEntrySol> = composition
+                            .targets
+                            .iter()
+                            .flat_map(|t| t.batch.entries().iter().cloned())
+                            .collect();
+                        if l1_entries.is_empty() {
+                            event!(
+                                name: "eez.composer.cc_compose.outbound_no_entries",
+                                Level::WARN,
+                                rollup_id,
+                                tx_idx = idx,
+                                tx_hash = %held.hash,
+                                sender = %held.sender,
+                                nonce = held.nonce,
+                                "outbound tx produced no L1 settlement entry; evicting (resubmit required)",
+                            );
+                            poison.push(held);
+                            continue;
+                        }
+                        // STAGE each outbound L1 settlement entry with its
+                        // consuming user tx (this held tx's executeCrossChainCall).
+                        // The loadExecutionTable system tx + its two-phase nonce
+                        // are built post-drain by the canonical builder, in the
+                        // deriver-matching order — NOT inline in drain order.
+                        for oe in &l1_entries {
+                            pending_out.push((oe.clone(), held.raw_tx.clone()));
+                        }
+                        outbound_entries.extend(l1_entries);
+                        // Do NOT push the outbound composition to `survivor_comps`:
+                        // that list feeds `prepare_post_batch_raw`'s merge, which
+                        // splices each composition's `source.batch` (the ENTRY
+                        // chain's batch) into the postBatch. For an OUTBOUND call
+                        // the entry chain is OUR L2, so `source.batch` is the L2's
+                        // own entries (carrying the L2→L1 call as a
+                        // destinationRollupId=MAINNET(0) entry) — which must NOT
+                        // settle on L1. The L1 settlement entries are exactly
+                        // `outbound_entries` (the zk-poster `targets[L1].batch`),
+                        // spliced separately with destinationRollupId=rid. Merging
+                        // `source.batch` here double-counted the call AND
+                        // re-introduced a dest=0 entry the registry gate (correctly)
+                        // rejects. Inbound survivors still push their composition
+                        // below so their `source.batch` (the L1 deferred entries)
+                        // merges as before.
+                        survivors.push(held);
+                    }
+                    Err(e) if sim_error_is_poison(&e) => {
+                        event!(
+                            name: "eez.composer.cc_compose.outbound_poison",
+                            Level::WARN,
+                            rollup_id,
+                            tx_idx = idx,
+                            tx_hash = %held.hash,
+                            sender = %held.sender,
+                            nonce = held.nonce,
+                            error = %e,
+                            "outbound tx fails simulation deterministically; evicting",
+                        );
+                        poison.push(held);
+                    }
+                    Err(e) => {
+                        let mut rest = vec![held];
+                        rest.extend(iter.by_ref().map(|(_, h)| h));
+                        transient = Some((
+                            format!("simulate_and_resolve_recorded_for tx#{idx}: {e}"),
+                            rest,
+                        ));
+                        break;
+                    }
+                }
+                continue;
+            }
+
             match evm_composer
                 .simulate_and_resolve(held.raw_tx.as_ref())
                 .await
@@ -1016,36 +1317,22 @@ where
                         .iter()
                         .flat_map(|t| t.batch.entries().iter().cloned())
                         .collect();
-                    match eez_evm::system_tx::build_inbound_system_txs(
-                        &target_entries,
-                        &stf_cfg,
-                        nonce,
-                    ) {
-                        Ok(inbound_txs) => {
-                            let target_count = inbound_txs.len();
-                            nonce = nonce.saturating_add(target_count as u64);
-                            system_txs.extend(inbound_txs);
-                            event!(
-                                name: "eez.composer.cc_compose.tx",
-                                Level::INFO,
-                                rollup_id,
-                                tx_idx = idx,
-                                target_count,
-                                "simulate_and_resolve produced {{target_count}} target(s) for held tx #{{tx_idx}}",
-                            );
-                            survivor_comps.push(composition);
-                            survivors.push(held);
-                        }
-                        Err(e) => {
-                            // System-tx signing/encoding failure — not
-                            // this tx's fault. Abort the slot; retry next.
-                            let mut rest = vec![held];
-                            rest.extend(iter.by_ref().map(|(_, h)| h));
-                            transient =
-                                Some((format!("build_inbound_system_txs tx#{idx}: {e}"), rest));
-                            break;
-                        }
-                    }
+                    // STAGE the inbound deferred target entries; the
+                    // executeIncomingCrossChainCall delivery txs + their two-phase
+                    // nonces are built post-drain by the canonical builder (after
+                    // all outbound loads), matching the deriver's order.
+                    let target_count = target_entries.len();
+                    pending_in.extend(target_entries);
+                    event!(
+                        name: "eez.composer.cc_compose.tx",
+                        Level::INFO,
+                        rollup_id,
+                        tx_idx = idx,
+                        target_count,
+                        "simulate_and_resolve produced {{target_count}} target(s) for held tx #{{tx_idx}}",
+                    );
+                    survivor_comps.push(composition);
+                    survivors.push(held);
                 }
                 Err(e) if sim_error_is_poison(&e) => {
                     event!(
@@ -1076,7 +1363,7 @@ where
         // a sender's nonce N is evicted, N+1.. can never land.
         if let Some(pool) = rollup.held_pool.as_ref() {
             for tx in &poison {
-                for t in pool.drain_sender_above(tx.sender, tx.nonce) {
+                for t in pool.drain_sender_above(tx.sender, tx.direction, tx.nonce) {
                     event!(
                         name: "eez.composer.cc_compose.poison_chain_evicted",
                         Level::WARN,
@@ -1140,6 +1427,42 @@ where
                 .await;
         }
 
+        // ── Build the Sync block's cross-chain system txs via THE canonical
+        // builder — deriver-byte-identical two-phase SYSTEM_ADDRESS nonces
+        // (outbound loads N.., THEN inbound deliveries N+K..) + interleaved order
+        // [load,user,…,deliveries], independent of drain order (A2b). A failure
+        // is systemic (signing / nonce overflow) → re-queue survivors, degrade.
+        let pairs = match eez_evm::system_tx::build_cross_chain_sync_pairs(
+            &pending_out,
+            &pending_in,
+            &stf_cfg,
+            nonce,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                event!(
+                    name: "eez.composer.phase2.sync_pairs_failed",
+                    Level::WARN,
+                    rollup_id,
+                    error = %e,
+                    "build_cross_chain_sync_pairs failed; re-queueing survivors, degrading to minimal postBatch",
+                );
+                if let Some(pool) = rollup.held_pool.as_ref() {
+                    pool.push_front_batch(survivors);
+                }
+                return self
+                    .dispatch_minimal_postbatch(
+                        ctx,
+                        rollup_id,
+                        rollup,
+                        parent_header,
+                        timestamp,
+                        suggested_fee_recipient,
+                    )
+                    .await;
+            }
+        };
+
         // ── Build the rich Sync block + postBatch from survivors. A ──
         // ── build / prepare failure here is systemic (not one tx) →  ──
         // ── re-queue survivors and degrade to minimal.               ──
@@ -1149,7 +1472,7 @@ where
             parent_header,
             timestamp,
             suggested_fee_recipient,
-            &system_txs,
+            &eez_evm::system_tx::interleave_sync_block_txs(&pairs),
         ) {
             Ok(b) => b,
             Err(e) => {
@@ -1177,13 +1500,20 @@ where
         };
         let comp_refs: Vec<&eez_protocol::Composition<eez_evm::EvmProtocol>> =
             survivor_comps.iter().collect();
-        let postbatch_raw = match self
+        // Outbound user txs (the SyncPair user halves) travel in the sync-block
+        // DA slot — the deriver can't reconstruct them from the postBatch
+        // entries (only the system/load txs are). Empty for inbound-only.
+        let outbound_user_txs: Vec<Bytes> =
+            pairs.iter().filter_map(|p| p.user_tx.clone()).collect();
+        let outcome = match self
             .prepare_post_batch_raw(
                 ctx,
                 rollup_id,
                 &comp_refs,
                 parent_header,
                 built.header.state_root(),
+                &outbound_entries,
+                &outbound_user_txs,
             )
             .await
         {
@@ -1218,37 +1548,114 @@ where
 
         // ── Dispatch: rich bundle [postBatch, ...survivors], commit. ──
         let sync_height = built.header.number();
-        // keccak of the raw EIP-2718 envelope IS the typed tx's hash —
-        // recorded in the ledger so the finality audit can look up the
-        // postBatch receipt.
-        let post_batch_hash = alloy_primitives::keccak256(&postbatch_raw);
-        let mut bundle: Vec<Bytes> = Vec::with_capacity(1 + survivors.len());
-        bundle.push(postbatch_raw);
-        bundle.extend(survivors.iter().map(|h| h.raw_tx.clone()));
-        event!(
-            name: "eez.composer.bundle.dispatched",
-            Level::INFO,
-            rollup_id,
-            sync_height,
-            tx_count = bundle.len(),
-            entry_count = total_entries,
-            evicted_poison = poison.len(),
-            "rich bundle dispatched to background observer; committing Sync block optimistically",
-        );
-        rollup.optimistic.begin(
-            sync_height,
-            post_batch_hash,
-            parent_header.clone(),
-            survivors,
-        );
-        self.spawn_bundle_observer(
-            ctx,
-            rollup_id,
-            sync_height,
-            bundle,
-            built.header.state_root(),
-            Arc::clone(&rollup.optimistic),
-        );
+        match outcome {
+            PostBatchOutcome::Ready(postbatch_raw) => {
+                // keccak of the raw EIP-2718 envelope IS the typed tx's hash —
+                // recorded in the ledger so the finality audit can look up the
+                // postBatch receipt.
+                let post_batch_hash = alloy_primitives::keccak256(&postbatch_raw);
+                let mut bundle: Vec<Bytes> = Vec::with_capacity(1 + survivors.len());
+                bundle.push(postbatch_raw);
+                // Only INBOUND survivors ride the L1 bundle (L1-signed, execute
+                // on L1). Outbound survivors are L2-signed — they run in the L2
+                // sync block + travel in the DA slot, never the L1 bundle (an L2
+                // tx is invalid on L1). A2.3e.
+                bundle.extend(
+                    survivors
+                        .iter()
+                        .filter(|h| h.direction == Direction::Inbound)
+                        .map(|h| h.raw_tx.clone()),
+                );
+                event!(
+                    name: "eez.composer.bundle.dispatched",
+                    Level::INFO,
+                    rollup_id,
+                    sync_height,
+                    tx_count = bundle.len(),
+                    entry_count = total_entries,
+                    evicted_poison = poison.len(),
+                    "rich bundle dispatched to background observer; committing Sync block optimistically",
+                );
+                rollup.optimistic.begin(
+                    sync_height,
+                    post_batch_hash,
+                    parent_header.clone(),
+                    survivors,
+                );
+                self.spawn_bundle_observer(
+                    ctx,
+                    rollup_id,
+                    sync_height,
+                    bundle,
+                    built.header.state_root(),
+                    Arc::clone(&rollup.optimistic),
+                );
+            }
+            PostBatchOutcome::Deferred {
+                batch,
+                public_inputs_hash,
+            } => {
+                // Real proof system: the post fires when the prover attests.
+                // The Sync block still commits now (L2 cadence is uncondi-
+                // tional); the deferred task signs + dispatches the bundle
+                // once the attestation lands in the ProofStore.
+                //
+                // Register the one-in-flight gate SYNCHRONOUSLY here — exactly
+                // like the Ready arm above — BEFORE returning the committed
+                // block, with a placeholder postBatch hash the deferred task
+                // fills once it signs. This (a) holds the `survivors` in the
+                // ledger for recovery, and (b) closes `blocking_height` before
+                // the next Sync slot runs, so at most one deferred post is in
+                // flight per rollup. Without it, two settling slots within the
+                // ~30s proof window would both anchor `currentState` to the
+                // same frozen cursor and the second would revert
+                // StateRootMismatch on L1 (burning its user-tx nonces). The raw
+                // envelopes go to the task for the bundle; the owning `HeldTx`s
+                // stay in the ledger for `take_failed_for_recovery`.
+                // Bundle is inbound-only (outbound survivors run in the L2 block
+                // + DA, never the L1 bundle); the full `survivors` still go to
+                // the optimistic ledger below for recovery. A2.3e.
+                let survivor_raws: Vec<Bytes> = survivors
+                    .iter()
+                    .filter(|h| h.direction == Direction::Inbound)
+                    .map(|h| h.raw_tx.clone())
+                    .collect();
+                event!(
+                    name: "eez.composer.deferred.armed",
+                    Level::INFO,
+                    rollup_id,
+                    sync_height,
+                    entry_count = total_entries,
+                    evicted_poison = poison.len(),
+                    public_inputs_hash = %public_inputs_hash,
+                    "deferred post armed; gate closed, awaiting prover attestation; committing Sync block optimistically",
+                );
+                rollup.optimistic.begin(
+                    sync_height,
+                    B256::ZERO, // placeholder; spawn_deferred_post fills the real hash on sign
+                    parent_header.clone(),
+                    survivors,
+                );
+                // Phase 1 (dark): record this window in the composer-driven
+                // ledger BEFORE `*batch` is moved into the deferred task.
+                self.record_posted_window(
+                    rollup,
+                    rollup_id,
+                    sync_height,
+                    &batch,
+                    public_inputs_hash,
+                );
+                self.spawn_deferred_post(
+                    rollup_id,
+                    sync_height,
+                    *batch,
+                    public_inputs_hash,
+                    survivor_raws,
+                    built.header.state_root(),
+                    Arc::clone(&rollup.optimistic),
+                );
+            }
+        }
         Ok(Some(SyncSlotBlock {
             payload: built.payload,
             header: built.header,
@@ -1282,13 +1689,15 @@ where
         )
         .map_err(|e| format!("build_sync_block (empty): {e}"))?;
 
-        let minimal_postbatch_raw = match self
+        let outcome = match self
             .prepare_post_batch_raw(
                 ctx,
                 rollup_id,
                 &[], // no compositions → leading immediate only
                 parent_header,
                 empty_built.header.state_root(),
+                &[], // no outbound entries in a minimal postBatch
+                &[], // no outbound user txs in a minimal postBatch
             )
             .await
         {
@@ -1308,31 +1717,76 @@ where
             }
         };
         let sync_height = empty_built.header.number();
-        // keccak of the raw EIP-2718 envelope IS the typed tx's hash —
-        // recorded in the ledger so the finality audit can look up the
-        // postBatch receipt.
-        let post_batch_hash = alloy_primitives::keccak256(&minimal_postbatch_raw);
-        event!(
-            name: "eez.composer.phase1.bundle.dispatched",
-            Level::INFO,
-            rollup_id,
-            sync_height,
-            "minimal postBatch dispatched to background observer (leading immediate only)",
-        );
-        rollup.optimistic.begin(
-            sync_height,
-            post_batch_hash,
-            parent_header.clone(),
-            Vec::new(),
-        );
-        self.spawn_bundle_observer(
-            ctx,
-            rollup_id,
-            sync_height,
-            vec![minimal_postbatch_raw],
-            empty_built.header.state_root(),
-            Arc::clone(&rollup.optimistic),
-        );
+        match outcome {
+            PostBatchOutcome::Ready(minimal_postbatch_raw) => {
+                // keccak of the raw EIP-2718 envelope IS the typed tx's hash —
+                // recorded in the ledger so the finality audit can look up the
+                // postBatch receipt.
+                let post_batch_hash = alloy_primitives::keccak256(&minimal_postbatch_raw);
+                event!(
+                    name: "eez.composer.phase1.bundle.dispatched",
+                    Level::INFO,
+                    rollup_id,
+                    sync_height,
+                    "minimal postBatch dispatched to background observer (leading immediate only)",
+                );
+                rollup.optimistic.begin(
+                    sync_height,
+                    post_batch_hash,
+                    parent_header.clone(),
+                    Vec::new(),
+                );
+                self.spawn_bundle_observer(
+                    ctx,
+                    rollup_id,
+                    sync_height,
+                    vec![minimal_postbatch_raw],
+                    empty_built.header.state_root(),
+                    Arc::clone(&rollup.optimistic),
+                );
+            }
+            PostBatchOutcome::Deferred {
+                batch,
+                public_inputs_hash,
+            } => {
+                // Register the one-in-flight gate SYNCHRONOUSLY (placeholder
+                // hash, no survivors for an empty slot) so the next slot blocks
+                // until this deferred post resolves — see the rich arm + the
+                // `spawn_deferred_post` gate-invariant doc.
+                event!(
+                    name: "eez.composer.phase1.deferred.armed",
+                    Level::INFO,
+                    rollup_id,
+                    sync_height,
+                    public_inputs_hash = %public_inputs_hash,
+                    "minimal postBatch deferred; gate closed, awaiting prover attestation (leading immediate only)",
+                );
+                rollup.optimistic.begin(
+                    sync_height,
+                    B256::ZERO, // placeholder; spawn_deferred_post fills the real hash on sign
+                    parent_header.clone(),
+                    Vec::new(),
+                );
+                // Phase 1 (dark): record this window in the composer-driven
+                // ledger BEFORE `*batch` is moved into the deferred task.
+                self.record_posted_window(
+                    rollup,
+                    rollup_id,
+                    sync_height,
+                    &batch,
+                    public_inputs_hash,
+                );
+                self.spawn_deferred_post(
+                    rollup_id,
+                    sync_height,
+                    *batch,
+                    public_inputs_hash,
+                    Vec::new(),
+                    empty_built.header.state_root(),
+                    Arc::clone(&rollup.optimistic),
+                );
+            }
+        }
         Ok(Some(SyncSlotBlock {
             payload: empty_built.payload,
             header: empty_built.header,
@@ -1362,6 +1816,166 @@ where
             optimistic,
             submitter,
         ));
+    }
+
+    /// Deferred-post dispatch (real proof system). The settling block has
+    /// already committed; this task waits for the out-of-process prover to
+    /// attest the `publicInputsHash` — its ECDSA signature lands in the shared
+    /// `ProofStore` via `ProofSinkSvc::with_store` — then fills `batch.proofs[]`
+    /// with that real attestation (`apply_proof`), signs the `postAndVerifyBatch`
+    /// L1 tx via the shared `finalize_post_batch_tx` seam, and dispatches the
+    /// optimistic bundle exactly like the synchronous path.
+    ///
+    /// **Gate invariant (consensus-critical).** The caller has ALREADY
+    /// registered this height in the optimistic ledger (`optimistic.begin`,
+    /// SYNCHRONOUSLY at slot time, holding the `HeldTx` survivors for recovery)
+    /// — so the one-in-flight gate (`blocking_height`) is closed before the next
+    /// Sync slot runs and only ONE deferred post can be in flight per rollup.
+    /// Without that, two settling slots within the proof window would both
+    /// anchor `currentState` to the same frozen cursor and the second would
+    /// revert `StateRootMismatch` on L1 (burning its bundled user-tx nonces).
+    /// This task therefore NEVER calls `begin`; it only resolves the
+    /// pre-registered entry:
+    /// - success → `set_post_batch_hash` (real hash) + dispatch the observer,
+    ///   which marks it Settled/Failed;
+    /// - timeout / no-store / no-ctx / finalize-failure → `mark_failed`, so the
+    ///   next slot's `take_failed_for_recovery` reorgs the abandoned Sync block
+    ///   out and re-queues the survivors (and the gate reopens for
+    ///   re-derivation). Abandoning WITHOUT `mark_failed` would leave the entry
+    ///   Pending forever → permanent emission livelock.
+    ///
+    /// `survivor_raws` are just the raw user-tx envelopes for the bundle; the
+    /// owning `HeldTx`s live in the ledger entry (for recovery), mirroring the
+    /// synchronous path's dual use of `survivors`.
+    ///
+    /// The wait is bounded (~30s, 150 × 200ms): on Chiado the settling proof
+    /// window is ~2s, so an attestation should arrive well within budget.
+    fn spawn_deferred_post(
+        &self,
+        rollup_id: u64,
+        sync_height: u64,
+        mut batch: eez_evm::EvmBatch,
+        public_inputs_hash: B256,
+        survivor_raws: Vec<Bytes>,
+        expected_final_state: B256,
+        optimistic: Arc<OptimisticallyIncluded>,
+    ) {
+        // Clone the `Arc<Inner>` directly rather than `self.clone()`: the
+        // derived `Clone` carries a spurious `L2: Clone` bound, so `self.clone()`
+        // would clone the `&self` reference (which can't escape into the task).
+        let this = Self {
+            inner: Arc::clone(&self.inner),
+        };
+        let store = self.inner.proof_store.get().cloned();
+        tokio::spawn(async move {
+            let Some(store) = store else {
+                event!(
+                    name: "eez.composer.deferred.no_store",
+                    Level::ERROR,
+                    rollup_id,
+                    sync_height,
+                    "deferred post spawned without a proof store — abandoning; marking failed for recovery",
+                );
+                optimistic.mark_failed(sync_height);
+                return;
+            };
+
+            // Poll the ProofStore for the prover's attestation (keyed by the
+            // recomputed publicInputsHash). The ProofSink only records a
+            // signature AFTER it has verified ecrecover == the registered
+            // attester, so any entry here is already trustworthy.
+            let mut sig = None;
+            for _ in 0..150 {
+                if let Some(s) = store
+                    .lock()
+                    .ok()
+                    .and_then(|mut m| m.remove(&public_inputs_hash))
+                {
+                    sig = Some(s);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            let Some(sig) = sig else {
+                event!(
+                    name: "eez.composer.deferred.timeout",
+                    Level::ERROR,
+                    rollup_id,
+                    sync_height,
+                    public_inputs_hash = %public_inputs_hash,
+                    "deferred post timed out waiting for prover attestation — marking failed; next slot recovers",
+                );
+                optimistic.mark_failed(sync_height);
+                return;
+            };
+
+            // Fill the real attestation (= `proof_sink::apply_proof`): the mock
+            // signature placed in `proofs[]` at prepare time is overwritten by
+            // the prover's ECDSA signature over the publicInputsHash, which is
+            // what the on-chain `ECDSAProofSystem.verify` recovers.
+            batch.inner.proofs = vec![sig];
+
+            let Some(ctx) = this.inner.cc_exec_ctx.clone() else {
+                event!(
+                    name: "eez.composer.deferred.no_ctx",
+                    Level::ERROR,
+                    rollup_id,
+                    sync_height,
+                    "deferred post has no cross-chain exec ctx — abandoning; marking failed for recovery",
+                );
+                optimistic.mark_failed(sync_height);
+                return;
+            };
+
+            match this.finalize_post_batch_tx(&batch, ctx.as_ref()).await {
+                Ok(raw) => {
+                    let post_batch_hash = alloy_primitives::keccak256(&raw);
+                    let mut bundle: Vec<Bytes> = Vec::with_capacity(1 + survivor_raws.len());
+                    bundle.push(raw);
+                    bundle.extend(survivor_raws);
+                    event!(
+                        name: "eez.composer.deferred.dispatched",
+                        Level::INFO,
+                        rollup_id,
+                        sync_height,
+                        tx_count = bundle.len(),
+                        public_inputs_hash = %public_inputs_hash,
+                        "deferred post: prover attestation applied, dispatching bundle to background observer",
+                    );
+                    // Fill the real postBatch hash into the gate entry the caller
+                    // pre-registered at slot time; the observer (spawned next)
+                    // flips it Pending→Settled/Failed.
+                    optimistic.set_post_batch_hash(sync_height, post_batch_hash);
+                    // Composer-driven: this window is now ATTESTED + SUBMITTED to
+                    // L1 (the bundle is in flight). Mark it pending so the dispatch
+                    // STOPS re-issuing its directive (the prover already verified
+                    // it); it resolves on L1 confirm (mark_settled_on_l1) or is
+                    // demoted on an L1 reorg.
+                    if let Some(windows) = this.inner.posted_windows.get() {
+                        windows.mark_deferred_pending(public_inputs_hash);
+                    }
+                    this.spawn_bundle_observer(
+                        ctx.as_ref(),
+                        rollup_id,
+                        sync_height,
+                        bundle,
+                        expected_final_state,
+                        optimistic,
+                    );
+                }
+                Err(e) => {
+                    event!(
+                        name: "eez.composer.deferred.finalize_failed",
+                        Level::ERROR,
+                        rollup_id,
+                        sync_height,
+                        error = %e,
+                        "deferred post: finalize_post_batch_tx failed — marking failed; next slot recovers",
+                    );
+                    optimistic.mark_failed(sync_height);
+                }
+            }
+        });
     }
 
     /// Build + sign the L1 `postBatch` raw tx for a Sync slot's
@@ -1396,9 +2010,10 @@ where
         compositions: &[&eez_protocol::Composition<eez_evm::EvmProtocol>],
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         sync_block_state_root: B256,
-    ) -> Result<Bytes, String> {
-        use alloy_sol_types::SolCall;
-        use eez_evm::types::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
+        outbound_entries: &[eez_evm::types::ExecutionEntrySol],
+        outbound_user_txs: &[Bytes],
+    ) -> Result<PostBatchOutcome, String> {
+        use eez_evm::types::RollupIdWithProofSystemsSol;
 
         // Empty compositions is a VALID case: an empty HeldPool Sync
         // slot still emits a postBatch carrying just the leading
@@ -1473,13 +2088,137 @@ where
             }],
             proxyEntryHash: B256::ZERO,
             destinationRollupId: rollup_id_u256,
-            L2ToL1Calls: Vec::new(),
+            l2ToL1Calls: Vec::new(),
             expectedL1ToL2Calls: Vec::new(),
+            expectedLookups: Vec::new(),
             callCount: U256::ZERO,
             returnData: Bytes::new(),
             rollingHash: B256::ZERO,
         };
         batch.inner.entries.insert(0, immediate_entry);
+
+        // Splice OUTBOUND L2→L1 entries right after the leading anchor (the
+        // contiguous proxyEntryHash==0 run): [anchor | outbound_1..N | inbound
+        // deferred]. Each arrives with EMPTY stateDeltas (`build_l1_postbatch`
+        // emits them empty), so CREATE one chained settlement delta per entry —
+        // without it `_applyStateDeltas` no-ops and the L2 root is silently
+        // unsettled (CRITICAL-1). `currentState` is a placeholder fixed by the
+        // stitch below; `newState` = the user-tx-inclusive sync-block root.
+        // Empty for an inbound-only slot → byte-identical to before.
+        for (k, oe) in outbound_entries.iter().enumerate() {
+            let mut entry = oe.clone();
+            // An OUTBOUND L2→L1 settlement entry belongs to OUR rollup's
+            // settlement (the SOURCE rollup whose batch this is), so its
+            // destinationRollupId is `rid` — NOT MAINNET(0), the call's target.
+            // The composition groups the call under its target rollup
+            // (MAINNET=0), but the protocol's canonical structure requires the
+            // source rollup id: see `IntegrationTestBridge.t.sol` (an immediate
+            // entry with an L1-targeted `l2ToL1Call` sets
+            // `destinationRollupId = L2_ROLLUP_ID`), which is exactly what
+            // `EEZ.sol`'s `_validateStructure` membership-checks (MAINNET(0) can
+            // never be a registered member). Execution routes off each call's
+            // `sourceRollupId` (`EEZ.sol _processNCalls`), never the entry's
+            // destinationRollupId, so this is purely the settlement-attribution
+            // id. Without this, `assert_batch_registry_native` (correctly)
+            // rejects the dest=0 entry and the slot degrades to an empty batch
+            // → the cross-chain call never settles on L1.
+            entry.destinationRollupId = rollup_id_u256;
+            // OUTBOUND value-bearing withdrawal: the entry's l2ToL1Calls carry V
+            // (the value the user burned to SYSTEM_ADDRESS on L2). L1 execution
+            // sends V from the rollup's escrowed etherBalance to the L1 target
+            // (etherOut += V), so the settlement delta must DEBIT the rollup by V:
+            // etherDelta = -etherOut. Satisfies EEZ's invariant
+            // `totalEtherDelta == _entryEtherIn - etherOut` for an immediate
+            // (_entryEtherIn == 0): `-V == 0 - V`. `outbound_ether_out` recovers V
+            // (or 0 for a failed/value-free call, via the entry's rollingHash) —
+            // None = unsupported multi-call-with-value, which we reject rather than
+            // mis-book. Value-free (incl. multi-call): Some(0) -> etherDelta=0 ->
+            // byte-identical. The rollup must hold >= V (funded by a prior inbound
+            // deposit), else L1 reverts InsufficientRollupBalance.
+            let ether_out = eez_evm::entries::outbound_ether_out(&entry).ok_or_else(|| {
+                format!(
+                    "outbound entry {k}: multi-call value not supported \
+                     (callCount={}, l2ToL1Calls={})",
+                    entry.callCount,
+                    entry.l2ToL1Calls.len(),
+                )
+            })?;
+            let ether_delta = if ether_out.is_zero() {
+                alloy_primitives::I256::ZERO
+            } else {
+                -alloy_primitives::I256::try_from(ether_out).map_err(|e| {
+                    format!("outbound entry {k}: etherOut {ether_out} overflows I256: {e}")
+                })?
+            };
+            entry.stateDeltas = vec![eez_evm::types::StateDeltaSol {
+                rollupId: rollup_id_u256,
+                currentState: B256::ZERO,
+                newState: sync_block_state_root,
+                etherDelta: ether_delta,
+            }];
+            batch.inner.entries.insert(1 + k, entry);
+        }
+
+        // INBOUND deferred entries (proxyEntryHash != 0) arrive from the
+        // survivor composition's `source.batch` with EMPTY stateDeltas — the
+        // lean `build_l1_inbound_entry` shape defers the settlement delta to
+        // here (its own comment: "the settlement delta is attached
+        // downstream"). The anchor + outbound splices above each create one;
+        // the inbound deferred entry had none. Attach one chained settlement
+        // delta each — the inbound mirror of the outbound splice. WITHOUT it,
+        // the bundled user_tx's `executeCrossChainCall` consume runs
+        // `_applyStateDeltas([])` (a no-op): EEZ emits NO `L2ExecutionPerformed`
+        // for the consume, so the deriver's per-block `settled_count` (it
+        // counts that event, submitter.rs) misses it → `consumed_deferred = 0`
+        // → it truncates the inbound delivery and never re-derives the L2
+        // `executeIncomingCrossChainCall` system tx (the L2 call silently never
+        // lands; Value stays 0). `currentState` is a placeholder fixed by the
+        // stitch below; `newState` = the user-tx-inclusive sync-block root (the
+        // post-delivery L2 root, set as the chain terminus by the anchor logic
+        // below). No-op for an outbound-only slot (no proxyEntryHash != 0
+        // entries) → byte-identical.
+        // INBOUND value-bearing deposits. The lean on-chain inbound entry binds
+        // the user's msg.value ONLY inside its proxyEntryHash preimage (its
+        // l2ToL1Calls is empty). The POPULATED sidecar entry (targets[].batch —
+        // same proxyEntryHash, since for an L1-originated inbound both hash
+        // (rid, target, value, data, source, MAINNET=0)) carries the value
+        // explicitly in l2ToL1Calls[0].value. Map proxyEntryHash -> +value so the
+        // settlement delta below credits the rollup's L1 etherBalance by exactly
+        // the deposited V. This satisfies EEZ's per-entry invariant
+        // `totalEtherDelta == _entryEtherIn - etherOut` when the bundled L1 user tx
+        // consumes the entry: _entryEtherIn = V (the value the user sent), etherOut
+        // = 0 (a lean inbound entry has no l2ToL1Calls), so totalEtherDelta must be
+        // +V. Value-free inbound: value==0 → absent from the map → etherDelta=0 →
+        // byte-identical to before.
+        let inbound_ether: HashMap<B256, alloy_primitives::I256> = compositions
+            .iter()
+            .flat_map(|c| c.targets.iter())
+            .flat_map(|t| t.batch.entries().iter())
+            .filter_map(|e| {
+                let v = e.l2ToL1Calls.first()?.value;
+                if v.is_zero() {
+                    return None;
+                }
+                alloy_primitives::I256::try_from(v)
+                    .ok()
+                    .map(|d| (e.proxyEntryHash, d))
+            })
+            .collect();
+
+        for entry in &mut batch.inner.entries {
+            if entry.proxyEntryHash != B256::ZERO && entry.stateDeltas.is_empty() {
+                let ether_delta = inbound_ether
+                    .get(&entry.proxyEntryHash)
+                    .copied()
+                    .unwrap_or(alloy_primitives::I256::ZERO);
+                entry.stateDeltas = vec![eez_evm::types::StateDeltaSol {
+                    rollupId: rollup_id_u256,
+                    currentState: B256::ZERO,
+                    newState: sync_block_state_root,
+                    etherDelta: ether_delta,
+                }];
+            }
+        }
 
         // Stitch the per-rollup stateDelta chain across all entries
         // (leading immediate + N deferred cross-chain entries).
@@ -1505,11 +2244,25 @@ where
         // internally consistent (each curr = prior new); only the final
         // newState matters externally, so once every deferred entry
         // consumes, L1's stored stateRoot lands on L2's actual root.
-        if let Some(last_entry) = batch.inner.entries.last_mut() {
-            for delta in last_entry.stateDeltas.iter_mut().rev() {
-                if delta.rollupId == rollup_id_u256 {
-                    delta.newState = sync_block_state_root;
-                    break;
+        // Anchor the user-tx-inclusive root to the LAST OUTBOUND entry's delta
+        // (proxyEntryHash==0 + non-empty l2ToL1Calls) — its L2→L1 call settles
+        // IN this block. Else (inbound-only) anchor the last entry, whose
+        // deferred chain lands on the same root once consumed. (Q2: explicit
+        // last-outbound is future-proof for the mixed A2b batch, where
+        // `entries.last()` is an inbound deferred entry, not the outbound one.)
+        let anchor_idx = batch
+            .inner
+            .entries
+            .iter()
+            .rposition(|e| e.proxyEntryHash == B256::ZERO && !e.l2ToL1Calls.is_empty())
+            .or_else(|| batch.inner.entries.len().checked_sub(1));
+        if let Some(idx) = anchor_idx {
+            if let Some(anchor_entry) = batch.inner.entries.get_mut(idx) {
+                for delta in anchor_entry.stateDeltas.iter_mut().rev() {
+                    if delta.rollupId == rollup_id_u256 {
+                        delta.newState = sync_block_state_root;
+                        break;
+                    }
                 }
             }
         }
@@ -1518,7 +2271,13 @@ where
         // entry should be drained inline at EEZ.sol:386. The remaining
         // cross-chain entries have proxyEntryHash != 0 → queue for
         // deferred consumption via executeCrossChainCall.
-        batch.inner.transientExecutionEntryCount = U256::from(1);
+        // 1 leading anchor immediate + N outbound immediates (proxyEntryHash==0)
+        // drained inline; inbound deferred entries (proxyEntryHash != 0) queue
+        // for `executeCrossChainCall` consumption. N=0 for inbound-only → 1.
+        batch.inner.transientExecutionEntryCount = U256::from(1 + outbound_entries.len() as u64);
+        // Registry-id settlement gate (Phase E / C1) — refuse to settle a batch
+        // carrying any non-registry id. See `assert_batch_registry_native`.
+        assert_batch_registry_native(&batch, rollup_id_u256)?;
         batch.inner.proofSystems = vec![ctx.mock_proof_system_address];
         batch.inner.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
             rollupId: U256::from(ctx.l2_rollup_id),
@@ -1643,11 +2402,13 @@ where
         }
         blocks_rev.reverse();
         let mut blocks = blocks_rev;
-        // Sync block entry: empty per Rollup-1 §8.3 — system tx is
-        // reconstructed by the deriver from the postBatch's entries,
-        // not transported in callData. Holds for BOTH phases (empty
-        // Phase 1 Sync block and rich Phase 2 Sync block).
-        blocks.push(Vec::new());
+        // Sync block entry: the SYSTEM txs (exec_incoming / loadExecutionTable)
+        // are reconstructed by the deriver from the postBatch entries, NOT
+        // transported. The OUTBOUND user txs are NOT reconstructible (only the
+        // system tx is), so they travel HERE in callData; the deriver
+        // interleaves them with the reconstructed loads (A2.4). Inbound-only →
+        // empty, exactly as Rollup-1 §8.3 (A2.3e / Q3).
+        blocks.push(outbound_user_txs.iter().map(|b| b.to_vec()).collect());
         // L2-shape entries for system-tx reconstruction by external
         // followers. The L1 batch's `entries[]` carries the DEPOSIT-
         // shape entries (callCount=0, no L2ToL1Calls) for value-bearing
@@ -1660,25 +2421,100 @@ where
         // (only hashes it for proof binding, `EEZ.sol:596`), so this
         // is a follower-only DA channel.
         use alloy_sol_types::SolValue as _;
-        let l2_entries_bytes: Vec<Vec<u8>> = compositions
+        // The DA sidecar = the COMPLETE derivation entry set, in canonical order:
+        // OUTBOUND L1-shape settlement entries (proxyEntryHash==0, populated
+        // l2ToL1Calls — the deriver lowers them to loadExecutionTable) FIRST, THEN
+        // the inbound deferred entries (composition targets). The deriver ALWAYS
+        // uses this sidecar when non-empty (no on-chain fallback), so a MIXED slot
+        // no longer drops the outbound — the dominant A2b blocker (a non-empty
+        // inbound sidecar used to SUPPRESS the on-chain outbound). Single-direction
+        // is preserved: outbound-only → [outbound] (the deriver reconstructs the
+        // same loads it got from the on-chain fallback — it reads l2ToL1Calls[0] /
+        // returnData, NOT stateDeltas); inbound-only → [inbound] (unchanged).
+        let l2_entries_bytes: Vec<Vec<u8>> = outbound_entries
             .iter()
-            .flat_map(|c| c.targets.iter())
-            .flat_map(|t| t.batch.entries().iter())
             .map(eez_evm::types::ExecutionEntrySol::abi_encode)
+            .chain(
+                compositions
+                    .iter()
+                    .flat_map(|c| c.targets.iter())
+                    .flat_map(|t| t.batch.entries().iter())
+                    .map(eez_evm::types::ExecutionEntrySol::abi_encode),
+            )
             .collect();
         let payload = eez_payload_codec::encode(&blocks, &l2_entries_bytes)
             .map_err(|e| format!("eez_payload_codec::encode: {e}"))?;
         batch.inner.callData = alloy_primitives::Bytes::from(payload);
+
+        // Prover-feed (P4-a): hand the settling block's PostBatch to the witness
+        // task so it rides this Sync block's `ControlEvent.composition`. eez0's
+        // batch is TIMELESS (blockNumber=0) → no l1_block_hash. Best-effort —
+        // the sink is `None` outside composer-mode, and `build_post_batch_msg`
+        // clears `proofs[]` (the prover fills them after attesting).
+        if let Some(sink) = self.inner.postbatch_sink.get() {
+            let pb = crate::post_batch_msg::build_post_batch_msg(
+                &batch,
+                self.inner.prover.vkey(),
+                None,
+            );
+            if let Ok(mut map) = sink.lock() {
+                map.insert(sync_block_number, pb);
+            }
+        }
+
+        // Deferred path (real proof system): the postBatch can't be signed
+        // yet — its `proofs[]` must carry the prover's ECDSA attestation over
+        // the publicInputsHash, which arrives out-of-process AFTER this block
+        // commits. Recompute the hash now (the key the prover's signature
+        // lands under in the ProofStore) and hand the assembled batch to the
+        // caller, who spawns the deferred-dispatch task. KEEP the mock proof
+        // already set in `proofs[]` above — it's harmlessly overwritten by
+        // `apply_proof`, and `public_inputs_hashes` ignores `proofs[]`.
+        if self.deferred_post() {
+            let public_inputs_hash = eez_evm::public_inputs::public_inputs_hashes(
+                &batch,
+                self.inner.prover.vkey(),
+                None,
+            )
+            .map_err(|e| format!("public_inputs_hashes (deferred): {e}"))?
+            .first()
+            .copied()
+            .ok_or("public_inputs_hashes returned no hashes (deferred)")?;
+            return Ok(PostBatchOutcome::Deferred {
+                batch: Box::new(batch),
+                public_inputs_hash,
+            });
+        }
+
+        // Synchronous path (mock proof system): encode + sign via the shared
+        // seam now. The deferred path reuses the SAME seam after filling
+        // proofs[] from the prover's real attestation.
+        Ok(PostBatchOutcome::Ready(
+            self.finalize_post_batch_tx(&batch, ctx).await?,
+        ))
+    }
+
+    /// Encode the FILLED batch (entries + callData + `proofs[]` all set) as
+    /// `EEZ.postAndVerifyBatch` calldata and sign the L1 postBatch tx — the seam
+    /// the deferred post (P4-b-full) reuses: build the batch once, fill `proofs[]`
+    /// from the prover's attestation (`crate::proof_sink::apply_proof`) when it
+    /// arrives, then call this to produce the raw L1 tx.
+    async fn finalize_post_batch_tx(
+        &self,
+        batch: &eez_evm::EvmBatch,
+        ctx: &CrossChainExecCtx,
+    ) -> Result<Bytes, String> {
+        use alloy_sol_types::SolCall as _;
+        use eez_evm::types::postAndVerifyBatchCall;
 
         let calldata = postAndVerifyBatchCall {
             batch: batch.inner.clone(),
         }
         .abi_encode();
 
-        // EEZ registry address is per-deployment; read directly from
-        // env. Loud failure on absence/garbage (invariant 7) — a
-        // postBatch signed to Address::ZERO would silently no-op on
-        // L1 with nothing but WARN-level breadcrumbs.
+        // EEZ registry address is per-deployment; read directly from env. Loud
+        // failure on absence/garbage (invariant 7) — a postBatch signed to
+        // Address::ZERO would silently no-op on L1 with only WARN breadcrumbs.
         let eez_address = std::env::var("EEZ_REGISTRY_ADDRESS")
             .ok()
             .and_then(|s| s.parse::<Address>().ok())
@@ -1799,14 +2635,16 @@ async fn sign_post_batch_tx(
     let max_fee_per_gas = base_fee.saturating_mul(2).saturating_add(priority_fee);
 
     // Gas budget for postAndVerifyBatch: per-rollup verification +
-    // entry apply. 10M is plenty for a single-PS single-entry batch
-    // on the smoke; the dev chain's block gas limit is 30M.
-    // 4M leaves enough headroom under chiado's 17M block gas limit for
-    // the bundled user_txs to fit in the same block. Actual postBatch
-    // gas usage is ~500K for our smoke's entry counts; 4M is ~8x
-    // safety. Original 10M caused bundles to fail rbuilder's
-    // "bundle fits in block" check.
-    const POST_BATCH_GAS_LIMIT: u64 = 4_000_000;
+    // entry apply. Actual postBatch gas usage is ~500K-600K even for a
+    // wide catch-up span (measured 564600 for a ~13k-block span); 1.5M
+    // is ~2.5x safety and still well under chiado's 17M block gas limit.
+    //
+    // WHY LOWER THAN 4M (2026-06-24): EIP-1559 reserves gas_limit*maxFee
+    // upfront. At 4M*10gwei that reserve is ~0.04 xDAI; the poster ran
+    // OUT of affordable balance there (settlement froze with the poster
+    // at 0.0397). 1.5M cuts the reserve to ~0.015, so a low-balance
+    // poster can still post (the actual CHARGE is gas_used, unchanged).
+    const POST_BATCH_GAS_LIMIT: u64 = 1_500_000;
 
     let mut tx = TxEip1559 {
         chain_id,
@@ -1832,3 +2670,114 @@ async fn sign_post_batch_tx(
 // `_with_value`) moved into `eez_evm::system_tx` as part of the
 // composer↔deriver single-source-of-truth STF refactor. Call
 // `eez_evm::system_tx::build_inbound_system_txs(...)` from new code.
+
+/// Registry-id settlement gate (Phase E / C1, ported from based-rollup
+/// `composer-lib/post_batch_submitter.rs`): refuse to settle a batch carrying
+/// any id that isn't this rollup's configured registry id. A non-registry id
+/// reaching the settlement batch is a WIRING BUG — the L1 would misattribute
+/// the batch, and these ids fold into the `publicInputsHash`. Trivially passes
+/// today (single rollup, `chainId == registry == 1`); guards future
+/// multi-rollup / `chainId != registry` topologies.
+fn assert_batch_registry_native(batch: &eez_evm::EvmBatch, rid: U256) -> Result<(), String> {
+    for (i, entry) in batch.inner.entries.iter().enumerate() {
+        if entry.destinationRollupId != rid {
+            return Err(format!(
+                "entry[{i}].destinationRollupId = {} is not the configured registry id {rid} — \
+                 a non-registry id reached the settlement batch (composition must be registry-native)",
+                entry.destinationRollupId,
+            ));
+        }
+        for (j, call) in entry.l2ToL1Calls.iter().enumerate() {
+            if call.sourceRollupId != rid {
+                return Err(format!(
+                    "entry[{i}].l2ToL1Calls[{j}].sourceRollupId = {} is not the configured registry id {rid}",
+                    call.sourceRollupId,
+                ));
+            }
+        }
+    }
+    for (i, lookup) in batch.inner.l1ToL2lookupCalls.iter().enumerate() {
+        if lookup.destinationRollupId != rid {
+            return Err(format!(
+                "l1ToL2lookupCalls[{i}].destinationRollupId = {} is not the configured registry id {rid}",
+                lookup.destinationRollupId,
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eez_evm::types::{ExecutionEntrySol, L2ToL1CallSol, LookupCallSol};
+
+    fn entry_with(dest: u64, src: u64) -> ExecutionEntrySol {
+        ExecutionEntrySol {
+            stateDeltas: Vec::new(),
+            proxyEntryHash: B256::ZERO,
+            destinationRollupId: U256::from(dest),
+            l2ToL1Calls: vec![L2ToL1CallSol {
+                targetAddress: Address::ZERO,
+                value: U256::ZERO,
+                data: Bytes::new(),
+                sourceAddress: Address::ZERO,
+                sourceRollupId: U256::from(src),
+                revertSpan: U256::ZERO,
+            }],
+            expectedL1ToL2Calls: Vec::new(),
+            expectedLookups: Vec::new(),
+            callCount: U256::ZERO,
+            returnData: Bytes::new(),
+            rollingHash: B256::ZERO,
+        }
+    }
+
+    fn lookup_with(dest: u64) -> LookupCallSol {
+        LookupCallSol {
+            crossChainCallHash: B256::ZERO,
+            destinationRollupId: U256::from(dest),
+            returnData: Bytes::new(),
+            failed: false,
+            l2ToL1Calls: Vec::new(),
+            expectedL1ToL2Calls: Vec::new(),
+            expectedLookups: Vec::new(),
+            callCount: U256::ZERO,
+            rollingHash: B256::ZERO,
+            expectedStateRoots: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn registry_native_batch_passes() {
+        let rid = U256::from(1u64);
+        let mut batch = eez_evm::EvmBatch::default();
+        batch.inner.entries.push(entry_with(1, 1));
+        batch.inner.l1ToL2lookupCalls.push(lookup_with(1));
+        assert!(assert_batch_registry_native(&batch, rid).is_ok());
+    }
+
+    #[test]
+    fn foreign_entry_destination_id_rejected() {
+        let rid = U256::from(1u64);
+        let mut batch = eez_evm::EvmBatch::default();
+        batch.inner.entries.push(entry_with(2, 1));
+        assert!(assert_batch_registry_native(&batch, rid).is_err());
+    }
+
+    #[test]
+    fn foreign_call_source_id_rejected() {
+        let rid = U256::from(1u64);
+        let mut batch = eez_evm::EvmBatch::default();
+        batch.inner.entries.push(entry_with(1, 7));
+        assert!(assert_batch_registry_native(&batch, rid).is_err());
+    }
+
+    #[test]
+    fn foreign_lookup_destination_id_rejected() {
+        let rid = U256::from(1u64);
+        let mut batch = eez_evm::EvmBatch::default();
+        batch.inner.l1ToL2lookupCalls.push(lookup_with(9));
+        assert!(assert_batch_registry_native(&batch, rid).is_err());
+    }
+}

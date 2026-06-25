@@ -233,6 +233,7 @@ where
         schedule_rx: mpsc::Receiver<SlotEvent>,
         payload_builder: PayloadBuilderHandle<T>,
         timing: RollupTiming,
+        witness_tx: Option<mpsc::UnboundedSender<B256>>,
     ) -> DriverResult<Self>
     where
         P: BlockReader<Header = HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>,
@@ -244,7 +245,8 @@ where
             .sealed_header(best)
             .map_err(DriverError::provider)?
             .ok_or_else(|| DriverError::missing_header(best))?;
-        let committer = BlockCommitterHandle::spawn(last_header, to_engine, payload_builder);
+        let committer =
+            BlockCommitterHandle::spawn(last_header, to_engine, payload_builder, witness_tx);
         Ok(Self {
             attributes,
             schedule_rx,
@@ -673,9 +675,12 @@ where
         let block_number = built.header.number();
         let block_hash = built.header.hash();
         let block_timestamp = built.header.timestamp();
+        // Producer path: this is the freshly-PRODUCED Sync block, so feed the
+        // prover witness task (feed_witness = true). The follower/reconcile
+        // re-derive in eez-deriver passes false to avoid double-feeding.
         let _outcome = self
             .committer
-            .commit_derived(built.payload, built.header)
+            .commit_derived(built.payload, built.header, true)
             .await?;
 
         event!(

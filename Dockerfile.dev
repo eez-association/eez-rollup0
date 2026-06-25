@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1
+#
+# eez-node DEV runtime image — for fast iteration WITHOUT the slow cargo-chef
+# image rebuild. Pairs with docker-compose.chiado-node.dev.yml, which mounts
+# the HOST-compiled ./target/release/eez-node into /usr/local/bin/eez-node.
+#
+# WHY a separate dev image: the prod runtime (debian:bookworm-slim, glibc 2.36)
+# CANNOT run a binary compiled on this host (Ubuntu, glibc 2.39) — it fails with
+# "GLIBC_2.39 not found". This image uses ubuntu:24.04 to MATCH the host glibc,
+# so the locally-compiled binary runs unmodified. It carries ONLY ca-certificates
+# + the default L2 genesis + the entrypoint; the binary itself arrives via the
+# volume mount (it is intentionally NOT COPYed here).
+#
+# Build once (~15s):
+#   docker compose -f docker-compose.chiado-node.yml \
+#                  -f docker-compose.chiado-node.dev.yml build eez-node
+# Iterate (no image rebuild — host compile is incremental, then recreate):
+#   cargo build --release -p eez-node
+#   docker compose -f docker-compose.chiado-node.yml \
+#                  -f docker-compose.chiado-node.dev.yml up -d --force-recreate eez-node
+FROM ubuntu:24.04 AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+# Default L2 genesis. The chiado compose mounts a fresh-timestamp genesis over
+# this at /app/genesis.json, so this is just a self-contained fallback.
+COPY genesis.json /app/genesis.json
+# NB: the eez-node binary is NOT copied — docker-compose.chiado-node.dev.yml
+# volume-mounts the host-compiled ./target/release/eez-node onto
+# /usr/local/bin/eez-node (which is on PATH for this ENTRYPOINT).
+ENTRYPOINT ["eez-node"]
+CMD ["--help"]

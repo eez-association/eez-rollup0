@@ -45,6 +45,12 @@ reth-trie-common.workspace                = true
 # revm direct (overlay-channel paths in local/session.rs)
 revm.workspace = true
 
+# control-plane feed (composer → prover): the wire contract + the tonic
+# server + the ReceiverStream wrapper for server-streaming Subscribe.
+eez-control-rpc.workspace = true
+tonic.workspace           = true
+tokio-stream.workspace    = true
+
 # async + diagnostics
 async-trait.workspace = true
 thiserror.workspace   = true

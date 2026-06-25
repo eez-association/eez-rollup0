@@ -15,3 +15,15 @@ datadir/
 
 chiado-db*/
 data/
+# Chiado run secrets (funded keys)
+.env.chiado
+
+# Downloaded gnosis chiado consensus config (README one-time setup)
+configs/chiado/
+.cargo/config.toml
+
+# 2nd-composer + backup env files (contain private keys — never commit)
+.env.chiado-2
+.env.*.bak-*
+*.bak-*
+deployments.env.*-backup-*

@@ -134,6 +134,12 @@ fn build_network_rpc_args(cfg: &EmbeddedL1Config) -> Result<(NetworkArgs, RpcSer
         ..NetworkArgs::default()
     };
     network_args.discovery.port = cfg.p2p_port;
+    // discv5 binds a SEPARATE UDP port that is NOT derived from p2p_port — two
+    // embedded L1s on one host would both fall back to the DEFAULT discv5 port
+    // and collide ("discv5 … AddrInUse"). Remap it per-instance to p2p_port+1
+    // (a distinct UDP port from discv4's p2p_port). REQUIRED to run a second
+    // competing composer (its own embedded L1) on the same machine.
+    network_args.discovery.discv5_port = Some(cfg.p2p_port.saturating_add(1));
     let rpc_args = RpcServerArgs {
         http: true,
         ws: true,

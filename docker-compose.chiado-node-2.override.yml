@@ -1,0 +1,82 @@
+# Second competing composer on the SAME machine — port/name/volume remap.
+#
+# Layered AFTER docker-compose.chiado-node.yml (+ .dev.yml) to run a SECOND
+# eez-node + lighthouse that JOIN the already-deployed rollup and COMPETE with
+# the first. Everything that would collide with the first stack (container names,
+# every host port — both are host-networked, the L2 datadir) is remapped here.
+#
+# WHY a full `command:` restatement: docker compose MERGES `environment` but
+# REPLACES `command`. The L2 / lighthouse ports are LITERAL args in the base
+# command (not ${ENV}), so they MUST be restated with the offset values — setting
+# an env var alone does nothing.
+#
+# Run (own-L1 cross-chain competitor — needs EEZ_L1_EMBEDDED=1 in .env.chiado-2):
+#   BUILD_PROFILE=release-fast docker compose -p eez2 --env-file .env.chiado-2 \
+#     -f docker-compose.chiado-node.yml \
+#     -f docker-compose.chiado-node.dev.yml \
+#     -f docker-compose.chiado-node-2.override.yml \
+#     -f docker-compose.driven.override.yml \
+#     -f docker-compose.driven-2.override.yml up -d
+#
+# Port map (1st → 2nd):  L1 18645→18745  L1auth 18551→18651  L1p2p 30544→30644
+#   B0 18649→18749  L2 18688→18788  L2auth 18684→18784  L2p2p 30640→30740
+#   L2disc-v5 30641→30741  control 50051→50151  lh 9205→9305/9306  lh-http 6152→6252
+
+services:
+  eez-node:
+    container_name: eez-node-chiado-2
+    environment:
+      # Literal ports in the base `environment` block that must be offset.
+      EEZ_L1_HTTP_PORT: "18745"
+      EEZ_L1_AUTH_PORT: "${L1_AUTH_PORT:-18651}"
+      EEZ_L1_P2P_PORT: "30644"
+      EEZ_L1_RPC_URL: http://127.0.0.1:18745
+      # B0 L1→L2 interceptor — offset (or set empty in .env.chiado-2 to disable).
+      EEZ_L1_INTERCEPTOR_PORT: "18749"
+      # Control feed (ProverDispatch + ProofSink) — the 2nd prover attaches here.
+      EEZ_CONTROL_RPC_PORT: "50151"
+      # DISTINCT poster identity for the 2nd composer (its own funded EOA in
+      # .env.chiado-2). REQUIRED: the base service does `env_file: .env.chiado`
+      # which loads the 1st composer's EEZ_L1_POSTER_KEY straight into the
+      # container, and `--env-file .env.chiado-2` only feeds ${..} interpolation
+      # — it does NOT override a service `env_file`. Without this line the 2nd
+      # silently inherits the 1st's key and the two sign byte-identical, deduped
+      # postBatch txs (same key+nonce+deterministic batch → same hash) instead of
+      # competing as distinct identities. `environment:` overrides `env_file:`.
+      EEZ_L1_POSTER_KEY: ${EEZ_L1_POSTER_KEY:?set a distinct funded EEZ_L1_POSTER_KEY in .env.chiado-2}
+    command:
+      - node
+      - --chain=/app/genesis.json
+      - --datadir=/l2
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=18788
+      - --http.api=eth,net,web3,debug
+      - --authrpc.addr=127.0.0.1
+      - --authrpc.port=18784
+      - --port=30740
+      - --discovery.port=30740
+      - --discovery.v5.port=30741
+      - --ipcdisable
+      - --disable-discovery
+      - --engine.persistence-threshold=256
+      - --engine.memory-block-buffer-target=128
+
+  lighthouse:
+    container_name: eez-chiado-lighthouse-2
+    command:
+      - lighthouse
+      - beacon_node
+      - --testnet-dir=/config-dir
+      - --listen-address=0.0.0.0
+      - --port=9305
+      - --quic-port=9306
+      - --http
+      - --http-address=127.0.0.1
+      - --http-port=6252
+      # Follows the 2nd L1's engine-API port (L1_AUTH_PORT=18651 in .env.chiado-2).
+      - --execution-endpoints=http://127.0.0.1:${L1_AUTH_PORT:-18651}
+      - --jwt-secrets=/jwt/jwt.hex
+      - --datadir=/data
+      - --checkpoint-sync-url=https://checkpoint.chiadochain.net/
+      - --libp2p-addresses=/ip4/57.131.40.177/tcp/9000/p2p/16Uiu2HAm6HQoX8sEJxr58GkuM9FPWkgLdCs71vz5qcu7hyisYRLS,/ip4/45.79.214.176/tcp/9000/p2p/16Uiu2HAm7jUXmkWrC5cTwSa9bVtzeAwUXu3MZZnhcsY5QTAiNmyL,/ip4/51.210.221.124/tcp/9500/p2p/16Uiu2HAmSnLLjZfkFCythED8tQS5kP4NJKBuMdd1FYE23ZymKwL6,/ip4/57.129.122.18/tcp/9000/p2p/16Uiu2HAmALSWURS5G4Qsmm7eFbH5oXxoFJEQuVdhAZ1MMcE9XjrU,/ip4/51.210.221.124/tcp/9100/p2p/16Uiu2HAmUhn8VR7HFY7SLPqbBhnTT1yfjKBJQKSodUkWsE5adNNu,/ip4/137.74.112.3/tcp/9000/p2p/16Uiu2HAm1merr7djndkMFf2TxacP53tA6rFoU4tXD5NNPGYz6RPa,/ip4/65.109.101.48/tcp/9000/p2p/16Uiu2HAm98ceLNE6X3mjVcsu6ZAaKZPPcqKmeofidTDy7UCHyTtY

@@ -1,6 +1,7 @@
 //! Generic, long-lived cross-chain composer.
 //!
-//! [`Composer<P>`] is the stateful counterpart of [`compose_transaction`]:
+//! [`Composer<P>`] is the stateful counterpart of
+//! [`compose_transaction`](crate::compose::compose_transaction):
 //! same chain-agnostic orchestration, but holds the entry and follower
 //! clients for reuse across many source transactions. Chain families
 //! consume it via a type alias (e.g. `type Composer = composer::Composer<EvmProtocol>;`).
@@ -13,14 +14,18 @@
 //!    entry-chain client (required).
 //! 3. [`.rollup(id, client, cfg)`](ComposerBuilder::rollup) — register
 //!    each follower rollup (zero or more).
+//!
+//! 3b. [`.root_reader(client)`](ComposerBuilder::root_reader) — register
+//!     the committed-root reader (required exactly once).
+//!
 //! 4. [`.build()`](ComposerBuilder::build) — finalize. Returns a sealed,
 //!    immutable [`Composer<P>`].
 //! 5. [`simulate_and_resolve(raw_tx)`](Composer::simulate_and_resolve) —
 //!    **many times**, one per source tx.
 //!
-//! Registration errors (entry not set, follower with entry id, duplicate
-//! ids) surface from `build()`. Once built, the composer is immutable:
-//! no locks, no race-able state.
+//! Registration errors (entry not set, missing root reader, follower
+//! with entry id, duplicate ids) surface from `build()`. Once built,
+//! the composer is immutable: no locks, no race-able state.
 //!
 //! # Clone + thread-safety
 //!
@@ -31,7 +36,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::compose::compose_transaction;
+use crate::compose::compose_transaction_recorded;
 use crate::composition::Rollup;
 use crate::error::{ComposerError, ComposerErrorKind, ComposerResult};
 use crate::executor::{
@@ -39,7 +44,7 @@ use crate::executor::{
 };
 use crate::protocol::ChainProtocol;
 use crate::rollup_id::RollupId;
-use crate::types::Composition;
+use crate::types::{Composition, ExecutedAction};
 
 // ── Config ───────────────────────────────────────────────────────
 
@@ -55,12 +60,13 @@ pub const DEFAULT_CCM_GAS_LIMIT: u64 = 30_000_000;
 /// Constructed at `main.rs` startup from the rollup's role:
 /// - L1-style client (entry-as-L1 or follower-as-L1):
 ///   `contract_address = rollups_address`,
-///   `authorized_proxies_slot = 0` (`EEZ.authorizedProxies`, declared
-///   first on `EEZBase`).
+///   `authorized_proxies_slot = 0` (`EEZ.authorizedProxies` on EVM —
+///   inherited from `EEZBase` at slot 0).
 /// - L2-style client:
 ///   `contract_address = ccm_address`,
 ///   `authorized_proxies_slot = 0`
-///   (`CrossChainManagerL2.authorizedProxies`).
+///   (`EEZL2.authorizedProxies` on EVM — inherited from `EEZBase`
+///   at slot 0).
 ///
 /// Non-EVM chains supply their own slot index via their config.
 pub struct ProxyLookupConfig<P: ChainProtocol + ?Sized> {
@@ -126,6 +132,22 @@ pub struct TargetConfig<P: ChainProtocol + ?Sized> {
     /// Default = the chain family's default dialect (e.g. `EvmL2Style`
     /// preserves byte-identity for the existing 12 L1→L2 fixtures).
     pub dialect: P::Dialect,
+    /// Settlement policy: when `true`, this target's post-state root is
+    /// the root its own target execution session already
+    /// produced (the real, sealed root reported back over the wire),
+    /// so [`CompositionBuilder::finalize`](crate::composition::CompositionBuilder::finalize)
+    /// SKIPS the CCM-verify `simulate_transactions` pass and keeps the
+    /// recorded `post_state_root`. Intended for a remote target whose
+    /// client cannot serve `simulate_transactions` locally. No in-tree
+    /// client sets this today — the bidi-stream `RemoteL2Client` inbound
+    /// path was retired (inbound now settles as a prover-signed deferred
+    /// entry); retained for future remote targets.
+    /// `false` for in-process follower targets and the zk-poster
+    /// L1 target (the latter has its own skip path via
+    /// [`crate::ChainProtocol::dialect_is_zk_poster`]).
+    /// Default `false` — preserves the existing outbound (L2→L1) and
+    /// L1→L2-fixture behaviour.
+    pub settles_via_session_root: bool,
 }
 
 impl<P: ChainProtocol + ?Sized> Clone for TargetConfig<P> {
@@ -136,6 +158,7 @@ impl<P: ChainProtocol + ?Sized> Clone for TargetConfig<P> {
             ccm_gas_limit: self.ccm_gas_limit,
             proxy_lookup: self.proxy_lookup.clone(),
             dialect: self.dialect.clone(),
+            settles_via_session_root: self.settles_via_session_root,
         }
     }
 }
@@ -148,6 +171,7 @@ impl<P: ChainProtocol + ?Sized> std::fmt::Debug for TargetConfig<P> {
             .field("ccm_gas_limit", &self.ccm_gas_limit)
             .field("proxy_lookup", &self.proxy_lookup)
             .field("dialect", &self.dialect)
+            .field("settles_via_session_root", &self.settles_via_session_root)
             .finish()
     }
 }
@@ -163,6 +187,7 @@ where
             && self.ccm_gas_limit == other.ccm_gas_limit
             && self.proxy_lookup == other.proxy_lookup
             && self.dialect == other.dialect
+            && self.settles_via_session_root == other.settles_via_session_root
     }
 }
 
@@ -176,8 +201,8 @@ where
 /// Per-rollup attribution inputs for batch construction.
 ///
 /// [`ChainProtocol::build_batch`]
-/// consumes this to chain per-entry `stateDeltas` (invariant 6). Two
-/// sources of truth:
+/// consumes this to chain per-entry `stateDeltas` (upstream's invariant 6).
+/// Two sources of truth:
 ///
 /// - `initial_roots[rollup]` — the state root each rollup started at,
 ///   read from the entry chain once per
@@ -204,10 +229,6 @@ pub struct SourceAttribution<'a> {
     /// rollup's CCM-verify batch. Keyed by `RollupId`; each `Vec` is
     /// ordered by batch tx index.
     pub per_tx_roots_by_rollup: &'a HashMap<RollupId, Vec<[u8; 32]>>,
-    /// Entry rollup (typically L1) — the chain whose batch applies
-    /// `stateDeltas`. Follower batches carry none: their consumer
-    /// `executeIncomingCrossChainCall` doesn't call `_applyStateDeltas`.
-    pub entry_rollup_id: RollupId,
 }
 
 impl<P: ChainProtocol + ?Sized> TargetConfig<P> {
@@ -241,10 +262,10 @@ struct EntryRegistration<P: ChainProtocol + 'static> {
 
 struct RootReaderRegistration<P: ChainProtocol + 'static> {
     /// Held as `Arc<dyn CommittedRootReader>` so the composer can read
-    /// invariant-6 anchor roots in Phase 1 of `simulate_and_resolve`.
-    /// Implementations: a local L1 client (entry-when-L1 or follower-
-    /// when-L1-in-L2-as-entry) reading its own `EEZ.sol` storage,
-    /// or a gRPC client whose remote peer is L1.
+    /// upstream's invariant-6 anchor roots in Phase 1 of
+    /// `simulate_and_resolve`. Implementations: a local L1 client
+    /// (entry-when-L1 or follower-when-L1-in-L2-as-entry) reading its
+    /// own `EEZ.sol` storage, or a gRPC client whose remote peer is L1.
     client: Arc<dyn CommittedRootReader<Protocol = P> + Send + Sync>,
 }
 
@@ -263,7 +284,7 @@ struct ComposerInner<P: ChainProtocol + 'static> {
     entry: EntryRegistration<P>,
     /// Committed-root reader (`CommittedRootReader` trait object) used
     /// by Phase 1 of `simulate_and_resolve` to read each rollup's
-    /// invariant-6 anchor root. Required at registration; see
+    /// upstream-invariant-6 anchor root. Required at registration; see
     /// [`ComposerBuilder::root_reader`].
     root_reader: RootReaderRegistration<P>,
     /// All registered rollups (entry + followers). The entry is also
@@ -355,12 +376,12 @@ impl<P: ChainProtocol + 'static> ComposerBuilder<P> {
     ///
     /// The reader is the client connected to the chain hosting the
     /// canonical committed-root storage (L1 in this protocol). It serves
-    /// every rollup's invariant-6 anchor in Phase 1 of
+    /// every rollup's upstream-invariant-6 anchor in Phase 1 of
     /// [`Composer::simulate_and_resolve`] — INCLUDING the entry rollup's
-    /// own initial root. Recon-3 confirmed `EEZ.sol:1032` enforces
+    /// own initial root. The upstream protocol enforces
     /// `entry[i].currentState == rollups[id].stateRoot` for every delta
-    /// in `postBatch`, so chain headers (self-reports) are NOT correct
-    /// for this purpose.
+    /// in `postBatch` (see `EEZ.sol`), so chain headers (self-reports)
+    /// are NOT correct for this purpose.
     ///
     /// In the L1-as-entry topology, the entry client itself implements
     /// `CommittedRootReader` and may be wrapped in a second `Arc` here.
@@ -427,6 +448,9 @@ impl<P: ChainProtocol + 'static> ComposerBuilder<P> {
     ///   entry and follower (which the builder API can't catch
     ///   structurally — the entry-id slot would be overwritten by a
     ///   matching `rollup` call).
+    // The Err carries the full builder state back for diagnostics; build()
+    // runs once at startup, so the large variant never hits a hot path.
+    #[allow(clippy::result_large_err)]
     pub fn build(self) -> ComposerResult<Composer<P>> {
         if let Some(err) = self.deferred_error {
             return Err(err);
@@ -510,10 +534,64 @@ impl<P: ChainProtocol + 'static> Composer<P> {
     /// Returns [`ComposerErrorKind::Protocol`] if entry building or
     /// finalization fails.
     #[tracing::instrument(skip(self, raw_tx), fields(tx_len = raw_tx.len()))]
-    pub async fn simulate_and_resolve(&self, raw_tx: &[u8]) -> ComposerResult<Composition<P>> {
-        let entry_id = self.inner.entry_rollup_id;
-        let entry_reg = &self.inner.entry;
+    pub async fn simulate_and_resolve(&self, raw_tx: &[u8]) -> ComposerResult<Composition<P>>
+    where
+        P: crate::capabilities::SettlesOutbound + crate::capabilities::ConsumesInbound,
+    {
+        self.simulate_and_resolve_recorded(raw_tx)
+            .await
+            .map(|(composition, _recorded)| composition)
+    }
 
+    /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve) but
+    /// ALSO returns the builder's `recorded[..]` (preorder dispatched
+    /// cross-chain calls with resolved outcomes). Callers that need a
+    /// call's REAL `return_data` (e.g. the inbound L1→L2 delivery, which
+    /// builds the byte-locked `executeIncomingCrossChainCall` system tx)
+    /// use this; the [`Composition`] alone doesn't carry per-call return
+    /// data verbatim.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve).
+    pub async fn simulate_and_resolve_recorded(
+        &self,
+        raw_tx: &[u8],
+    ) -> ComposerResult<(Composition<P>, Vec<ExecutedAction<P>>)>
+    where
+        P: crate::capabilities::SettlesOutbound + crate::capabilities::ConsumesInbound,
+    {
+        // Default entry selection: the pinned entry rollup + its client.
+        // Per-composition entry selection (A1) goes through
+        // `simulate_and_resolve_recorded_for`.
+        self.simulate_and_resolve_recorded_for(
+            self.inner.entry_rollup_id,
+            self.inner.entry.client.as_ref(),
+            raw_tx,
+        )
+        .await
+    }
+
+    /// Same as [`simulate_and_resolve_recorded`](Self::simulate_and_resolve_recorded)
+    /// but with an explicitly-chosen entry: `entry_id` + the `entry_client`
+    /// that runs source simulation. Lets ONE composer compose either
+    /// direction — `(L1, L1 client)` for an inbound L1→L2 call, `(L2, L2
+    /// client)` for an outbound L2→L1 call — picked per tx by the drain.
+    /// The dispatch rollup map (Phase 1) is the composer's full
+    /// registration set, unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`simulate_and_resolve_recorded`](Self::simulate_and_resolve_recorded).
+    pub async fn simulate_and_resolve_recorded_for(
+        &self,
+        entry_id: RollupId,
+        entry_client: &(dyn EntryChainClient<Protocol = P> + Send + Sync),
+        raw_tx: &[u8],
+    ) -> ComposerResult<(Composition<P>, Vec<ExecutedAction<P>>)>
+    where
+        P: crate::capabilities::SettlesOutbound + crate::capabilities::ConsumesInbound,
+    {
         tracing::info!(
             name: "composer.simulate.start",
             %entry_id,
@@ -528,13 +606,13 @@ impl<P: ChainProtocol + 'static> Composer<P> {
         // - client: cheap Arc clone from the registration.
         // - session: None (lazy-open on first dispatch).
         // - initial_state_root: read via the registered
-        //   `CommittedRootReader`. Recon-3 (`EEZ.sol:1032`) confirmed
-        //   the protocol enforces `entry[i].currentState ==
-        //   rollups[id].stateRoot` for every delta in `postBatch`, so
-        //   ALL rollups (including the entry's own) read through the
-        //   committed-root reader — chain headers (self-reports via
+        //   `CommittedRootReader`. The upstream protocol enforces
+        //   `entry[i].currentState == rollups[id].stateRoot` for every
+        //   delta in `postBatch` (see `EEZ.sol`), so ALL rollups
+        //   (including the entry's own) read through the committed-root
+        //   reader — chain headers (self-reports via
         //   [`ChainClient::current_state_root`]) are NOT correct for
-        //   invariant-6 anchoring.
+        //   upstream-invariant-6 anchoring.
         let mut rollups: HashMap<RollupId, Rollup<P>> =
             HashMap::with_capacity(self.inner.rollups.len());
         for (rollup_id, reg) in &self.inner.rollups {
@@ -557,9 +635,11 @@ impl<P: ChainProtocol + 'static> Composer<P> {
 
         // Phase 2 — compose. Pass the entry client directly for
         // source simulation; pass the full rollup map for dispatch.
-        let composition = compose_transaction(
+        // `_recorded` carries the resolved per-call outcomes (return_data)
+        // the byte-locked inbound delivery needs.
+        let (composition, recorded) = compose_transaction_recorded(
             &self.inner.protocol,
-            entry_reg.client.as_ref(),
+            entry_client,
             raw_tx,
             entry_id,
             rollups,
@@ -569,23 +649,23 @@ impl<P: ChainProtocol + 'static> Composer<P> {
         tracing::info!(
             name: "composer.simulate.complete",
             target_count = composition.targets.len(),
+            recorded = recorded.len(),
             "composition complete"
         );
 
-        Ok(composition)
+        Ok((composition, recorded))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::TargetExecutionSession;
     use crate::composition::Dispatcher;
     use crate::error::{ExecutorResult, ProtocolResult};
     use crate::executor::{
-        ExecutionRequest, ExecutionResponse, TargetBatchSimulation, TargetTransaction,
+        ExecutionRequest, ExecutionResponse, TargetBatchSimulation, TargetExecutionSession,
+        TargetTransaction,
     };
-    use crate::types::RecordedCall;
     use serde::{Deserialize, Serialize};
 
     // ── Minimal FakeProtocol — enough to instantiate Composer<FakeProtocol> ──
@@ -595,6 +675,16 @@ mod tests {
 
     #[derive(Clone, Debug, Default, Serialize, Deserialize)]
     struct Placeholder;
+
+    impl crate::capabilities::SettlesOutbound for FakeProtocol {
+        fn build_settlement_batch(
+            &self,
+            _calls: &[crate::ExecutedAction<Self>],
+            _dst: crate::RollupId,
+        ) -> crate::error::ProtocolResult<Self::Batch> {
+            Err(crate::error::ProtocolErrorKind::Unsupported("test fake: no outbound settlement").into())
+        }
+    }
 
     impl ChainProtocol for FakeProtocol {
         type Address = [u8; 20];
@@ -607,7 +697,7 @@ mod tests {
 
         fn build_batch(
             &self,
-            _recorded: &[RecordedCall<Self>],
+            _recorded: &[ExecutedAction<Self>],
             _attribution: &crate::composer::SourceAttribution<'_>,
             _dialect: &Self::Dialect,
             _source_rollup_id: RollupId,
@@ -623,7 +713,7 @@ mod tests {
         }
         fn encode_follower_trigger(
             &self,
-            _call: &RecordedCall<Self>,
+            _call: &ExecutedAction<Self>,
             _source_rollup_id: RollupId,
             _raw_tx: &[u8],
             _dialect: &Self::Dialect,
@@ -651,6 +741,10 @@ mod tests {
         }
         fn decode_calldata(&self, bytes: &[u8]) -> ProtocolResult<Self::Calldata> {
             Ok(bytes.to_vec())
+        }
+        fn message_id(&self, m: &crate::message::Message<'_, Self>) -> [u8; 32] {
+            let _ = m;
+            [0u8; 32]
         }
     }
 
@@ -738,6 +832,7 @@ mod tests {
                 authorized_proxies_slot: 0,
             },
             dialect: (),
+            settles_via_session_root: false,
         }
     }
 
@@ -826,8 +921,8 @@ mod tests {
     // Dispatcher trait is used in the FakeClient impl — reference it
     // here so the import isn't flagged as unused by future editors.
     #[allow(dead_code, reason = "type-level reference to keep import live")]
-    fn _dispatcher_in_scope<P: ChainProtocol + 'static>()
-    -> std::marker::PhantomData<dyn Dispatcher<Protocol = P> + Send> {
+    fn _dispatcher_in_scope<P: ChainProtocol + 'static>(
+    ) -> std::marker::PhantomData<dyn Dispatcher<Protocol = P> + Send> {
         std::marker::PhantomData
     }
 

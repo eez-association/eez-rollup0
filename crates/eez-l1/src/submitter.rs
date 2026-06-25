@@ -21,8 +21,8 @@ use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::Filter;
 use alloy_sol_types::{SolCall, SolEvent};
 use eez_evm::types::{
-    BatchPosted, L2ExecutionPerformed, ProofSystemBatchPerVerificationEntriesSol,
-    postAndVerifyBatchCall,
+    BatchPosted, ExecutionConsumed, L2ExecutionPerformed,
+    ProofSystemBatchPerVerificationEntriesSol, postAndVerifyBatchCall,
 };
 use tracing::{Level, event};
 
@@ -31,17 +31,27 @@ use crate::error::{L1Error, L1Result};
 
 /// Wall-clock cap on the target-block + inclusion check.
 const TARGET_WAIT_BUDGET: Duration = Duration::from_secs(30);
-const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
-/// L1 block offset for [`BundleTarget::NextBlock`]. slack=2 (over the
-/// minimal latest+1) gives a one-block cushion for when our local
-/// `latest` is stale by the time the relay sees the bundle.
-const NEXT_BLOCK_SLACK: u64 = 2;
+/// L1 block offset for [`BundleTarget::NextBlock`] — the MINIMAL viable
+/// target, `latest + 1` (the next block to be built). A bundle must target a
+/// not-yet-built block; targeting the already-mined `latest` (offset 0) can
+/// never be included, so 1 is the floor.
+///
+/// There is NO slack cushion. The old `+2` traded a constant extra L1 block
+/// (~5s) of settlement latency to absorb a STALE local `latest`, but a synced
+/// embedded L1 reports the true tip (measured: the bundle landed EXACTLY at
+/// target, Δblocks=+0 every cycle), and the submitter's retry path already
+/// backstops the rare stale case — so the cushion was pure added latency.
+/// Removing it lets the settlement round-trip fit inside one 5s slot so the
+/// composer's one-in-flight gate can re-open every slot instead of every
+/// other (≈5s cadence instead of ≈10s).
+const NEXT_BLOCK_OFFSET: u64 = 1;
 
 /// Which L1 block the bundle should land in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BundleTarget {
-    /// Resolved to `latest + NEXT_BLOCK_SLACK` at send time.
+    /// Resolved to `latest + NEXT_BLOCK_OFFSET` (`latest + 1`) at send time.
     NextBlock,
     /// Caller-picked exact L1 block.
     Exact(u64),
@@ -146,7 +156,7 @@ impl Submitter {
                     .get_block_number()
                     .await
                     .map_err(|e| L1Error::Provider(format!("get_block_number: {e}")))?
-                    + NEXT_BLOCK_SLACK
+                    + NEXT_BLOCK_OFFSET
             }
         };
         let post_batch_envelope =
@@ -217,6 +227,7 @@ impl Submitter {
                 call_data: b.call_data,
                 state_applied: b.state_applied,
                 settled_count: b.settled_count,
+                consumed_count: b.consumed_count,
                 settled_final_state: b.settled_final_state,
                 claimed_current_state: b.claimed_current_state,
                 claimed_new_state: b.claimed_new_state,
@@ -239,6 +250,9 @@ pub struct HistoricalBatch {
     /// Entries that actually applied. See
     /// [`L1Event::BatchPosted::settled_count`].
     pub settled_count: usize,
+    /// DEFERRED (inbound) entries consumed = `ExecutionConsumed` count for
+    /// our rollupId. See [`L1Event::BatchPosted::consumed_count`].
+    pub consumed_count: usize,
     /// L1's actual stored root after this batch — the reconciliation
     /// endpoint. See [`L1Event::BatchPosted::settled_final_state`].
     pub settled_final_state: Option<alloy_primitives::B256>,
@@ -292,6 +306,28 @@ impl Inner {
             .map(|t| hex::encode_prefixed(t.as_ref()))
             .collect();
         let hex_refs: Vec<&str> = hexes.iter().map(String::as_str).collect();
+        // rbuilder-chiado DROPS 1-tx `eth_sendBundle` bundles but ingests
+        // bare raw txs and >=2-tx bundles (verified live 2026-06-23). A
+        // lone postBatch (whenever the held-tx pool is empty) is therefore
+        // submitted via `eth_sendRawTransaction` to the same relay; >=2-tx
+        // bundles keep the atomic `eth_sendBundle` path below. The relay
+        // also accepts `eth_sendRawTransaction` on dev RPCs (reth/anvil),
+        // so this one branch is correct on every backend.
+        if let [only] = hex_refs.as_slice() {
+            return match post_raw_transaction(
+                &self.http,
+                self.config.builder_rpc_url.as_str(),
+                only,
+            )
+            .await
+            {
+                Ok(()) => {
+                    self.observe(post_batch_hash, target_block, expected_final_state)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+        }
         match post_bundle(
             &self.http,
             self.config.builder_rpc_url.as_str(),
@@ -536,6 +572,66 @@ pub async fn post_bundle(
     Ok(())
 }
 
+/// POST a single raw tx via `eth_sendRawTransaction` to the builder relay.
+///
+/// rbuilder-chiado DROPS 1-tx `eth_sendBundle` bundles but ingests bare
+/// raw txs and >=2-tx bundles (verified live 2026-06-23: a lone postBatch
+/// in a 1-tx bundle is dropped even at 2x priority fee, while a 2-tx
+/// bundle and a bare `eth_sendRawTransaction` both land in the next
+/// block). So a lone postBatch — the bundle whenever the held-tx pool is
+/// empty — must be submitted as a raw tx, not a 1-tx bundle.
+///
+/// Idempotent across re-posts: the composer re-submits the same nonce
+/// every slot until it lands, so an "already known" / "nonce too low" /
+/// "replacement" reply is benign (the tx is already in the relay's pool);
+/// only a genuine rejection surfaces as an error. Inclusion is decided by
+/// the caller's `observe` poll, not this reply.
+///
+/// # Errors
+///
+/// - [`L1Error::Provider`] on transport (DNS, TCP, JSON decode) failure.
+/// - [`L1Error::Submission`] on a genuine relay-side rejection.
+pub async fn post_raw_transaction(
+    http: &reqwest::Client,
+    builder_rpc_url: &str,
+    raw_tx_hex: &str,
+) -> L1Result<()> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction",
+        "params": [raw_tx_hex],
+    });
+    let resp: serde_json::Value = http
+        .post(builder_rpc_url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| L1Error::Provider(format!("eth_sendRawTransaction POST: {e}")))?
+        .error_for_status()
+        .map_err(|e| L1Error::Submission(format!("eth_sendRawTransaction HTTP: {e}")))?
+        .json()
+        .await
+        .map_err(|e| L1Error::Provider(format!("eth_sendRawTransaction decode: {e}")))?;
+    event!(
+        name: "eez.submitter.rawtx.sent",
+        Level::INFO,
+        response = %resp,
+        "eth_sendRawTransaction response received",
+    );
+    if let Some(err) = resp.get("error") {
+        let msg = err.to_string().to_ascii_lowercase();
+        // Benign re-post echoes: the same nonce is already in the pool.
+        if msg.contains("known")
+            || msg.contains("nonce too low")
+            || msg.contains("already")
+            || msg.contains("replacement")
+        {
+            return Ok(());
+        }
+        return Err(L1Error::Submission(format!("eth_sendRawTransaction: {err}")));
+    }
+    Ok(())
+}
+
 fn dropped(tx_hash: TxHash, target_block: u64, reason: &'static str) -> SendOutcome {
     event!(
         name: "eez.submitter.bundle.dropped",
@@ -596,11 +692,34 @@ pub(crate) struct ScannedBatch {
     /// `L2ExecutionPerformed` events for our rollupId in the postBatch's
     /// L1 block (the applied prefix; 0 = skip). See `scan_batch_logs`.
     pub settled_count: usize,
+    /// `ExecutionConsumed` events for our rollupId in the postBatch's L1
+    /// block = the number of DEFERRED (inbound) entries actually consumed.
+    /// The AUTHORITATIVE consumed-deferred count (mirrors based-rollup's
+    /// per-entry ExecutionConsumed signal); used by the deriver instead of
+    /// `settled_count - (1 + outbound)`, which deflates if an outbound
+    /// immediate is skipped. See `scan_batch_logs`.
+    pub consumed_count: usize,
     /// LAST applied entry's `newState` — L1's actual post-batch root and
     /// the reconciliation endpoint.
     pub settled_final_state: Option<alloy_primitives::B256>,
     pub claimed_current_state: Option<alloy_primitives::B256>,
     pub claimed_new_state: Option<alloy_primitives::B256>,
+}
+
+/// Tally items by their (optional) L1 block number, dropping those without
+/// one. Counts `ExecutionConsumed` logs (already rollup-filtered at the RPC
+/// layer via `topic2`) per block — one per consumed inbound deferred entry,
+/// the authoritative `consumed_count`. Pure + iterator-shaped so the
+/// partial-consumption / skipped-immediate invariant is unit-testable
+/// without a live provider (see the tests below).
+fn tally_by_block(
+    blocks: impl IntoIterator<Item = Option<u64>>,
+) -> std::collections::HashMap<u64, usize> {
+    let mut by_block: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for bn in blocks.into_iter().flatten() {
+        *by_block.entry(bn).or_default() += 1;
+    }
+    by_block
 }
 
 /// Fetch every `BatchPosted` log in `[from_block, to_block]` and cross-
@@ -664,6 +783,26 @@ pub(crate) async fn scan_batch_logs(
         }
     }
 
+    // `ExecutionConsumed` events for our rollupId, per L1 block — the
+    // AUTHORITATIVE count of DEFERRED (inbound) entries consumed by their
+    // bundled user txs (EEZ.sol:903). Unlike `settled_count` (which folds
+    // the leading immediate + every outbound immediate + consumed deferred
+    // into one number, and so deflates if an outbound immediate is
+    // skipped), this is the direct per-entry consumption signal the deriver
+    // needs to truncate the inbound-delivery FIFO. rollupId is the SECOND
+    // indexed param of `ExecutionConsumed` ⇒ `topic2`.
+    let consumed_filter = Filter::new()
+        .address(eez)
+        .event_signature(ExecutionConsumed::SIGNATURE_HASH)
+        .topic2(alloy_primitives::U256::from(rollup_id))
+        .from_block(from_block)
+        .to_block(to_block);
+    let consumed_logs = provider
+        .get_logs(&consumed_filter)
+        .await
+        .map_err(|e| L1Error::Provider(format!("get_logs(ExecutionConsumed): {e}")))?;
+    let consumed_by_block = tally_by_block(consumed_logs.iter().map(|l| l.block_number));
+
     let mut out: Vec<ScannedBatch> = Vec::with_capacity(logs.len());
     for log in &logs {
         let l1_block_number = log
@@ -717,10 +856,84 @@ pub(crate) async fn scan_batch_logs(
             call_data: decoded.batch.callData,
             state_applied: winner_tx_hashes.contains(&tx_hash),
             settled_count: settled.map_or(0, Vec::len),
+            consumed_count: consumed_by_block
+                .get(&l1_block_number)
+                .copied()
+                .unwrap_or(0),
             settled_final_state: settled.and_then(|v| v.last().copied()),
             claimed_current_state,
             claimed_new_state,
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tally_by_block;
+
+    #[test]
+    fn tally_by_block_counts_per_block_and_drops_none() {
+        // Three ExecutionConsumed logs in block 10, one in 11, one with no
+        // block number (pending/dropped) — the last is ignored.
+        let blocks = [Some(10u64), Some(10), Some(10), Some(11), None];
+        let t = tally_by_block(blocks);
+        assert_eq!(t.get(&10).copied(), Some(3));
+        assert_eq!(t.get(&11).copied(), Some(1));
+        assert_eq!(
+            t.get(&12).copied(),
+            None,
+            "absent block ⇒ no entry (deriver reads 0)"
+        );
+        assert_eq!(t.values().sum::<usize>(), 4, "the None is not counted");
+    }
+
+    /// The crux of Change-4: under a SKIPPED outbound immediate, the
+    /// authoritative `ExecutionConsumed` count (`consumed_count`) stays
+    /// correct, whereas the legacy `settled_count - (1 + outbound)` formula
+    /// deflates by the skip and would truncate a real inbound delivery.
+    ///
+    /// Scenario — one batch in L1 block 7: 1 anchor + 2 outbound immediates
+    /// (ONE skipped) + 2 inbound deferred (BOTH consumed).
+    ///   * `L2ExecutionPerformed` fires for: anchor + the 1 settled outbound
+    ///     + the 2 consumed inbound = 4. The SKIPPED outbound emits NONE
+    ///     (it took the `ImmediateEntrySkipped` catch path), so
+    ///     `settled_count == 4` — deflated by the skip.
+    ///   * `ExecutionConsumed` fires once per consumed inbound deferred = 2.
+    ///     Neither the anchor nor any immediate emits it.
+    #[test]
+    fn consumed_count_survives_skipped_immediate_where_settled_subtraction_fails() {
+        let block = 7u64;
+        // The real counting helper over the rollup-filtered ExecutionConsumed
+        // logs (two, both in block 7).
+        let consumed_count = *tally_by_block([Some(block), Some(block)])
+            .get(&block)
+            .expect("block 7 present");
+        assert_eq!(
+            consumed_count, 2,
+            "ExecutionConsumed count = consumed inbound deferred"
+        );
+
+        // Model the skip-deflated settled_count and the static outbound count.
+        let settled_count_with_skip = 4usize; // anchor + 1 settled outbound + 2 inbound
+        let outbound_entries = 2usize; // 2 emitted, but only 1 settled
+
+        // Legacy formula (deriver.rs, pre-Change-4): deflates by the skip.
+        let legacy = settled_count_with_skip.saturating_sub(1 + outbound_entries);
+        assert_eq!(
+            legacy, 1,
+            "legacy `settled - (1 + outbound)` under-counts by the skip"
+        );
+
+        // Change-4: the deriver now truncates the inbound FIFO to
+        // `consumed_count` directly — correct, independent of outbound/skip.
+        assert_eq!(
+            consumed_count, 2,
+            "consumed_count is the true inbound-consumed count"
+        );
+        assert_ne!(
+            legacy, consumed_count,
+            "Change-4 fixes exactly this divergence: legacy would drop one real inbound delivery",
+        );
+    }
 }

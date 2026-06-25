@@ -124,6 +124,20 @@ impl OptimisticallyIncluded {
         );
     }
 
+    /// Update the postBatch tx hash of an existing entry. The deferred
+    /// post (real proof system) registers the gate entry SYNCHRONOUSLY at
+    /// slot time — before the proof arrives, so before the L1 tx can be
+    /// signed — with a placeholder hash; once the attestation lands and
+    /// the tx is signed, the dispatch task fills the real hash here so the
+    /// finality audit (`take_finalized`) can still locate the receipt.
+    /// No-op if the entry is gone (e.g. already recovered).
+    pub fn set_post_batch_hash(&self, sync_height: u64, post_batch_hash: TxHash) {
+        let mut map = self.by_sync_height.lock().unwrap();
+        if let Some(entry) = map.get_mut(&sync_height) {
+            entry.post_batch_hash = post_batch_hash;
+        }
+    }
+
     /// The lowest entry height above `cursor`, if any — the previous
     /// postBatch is not yet DERIVER-confirmed and the composer must
     /// skip emission this slot. Counts Pending, Settled, AND Failed
@@ -272,6 +286,7 @@ mod tests {
             attempts: 0,
             sender: alloy_primitives::Address::repeat_byte(tag),
             nonce: u64::from(tag),
+            direction: crate::ingress::Direction::Inbound,
         }
     }
 
@@ -336,6 +351,46 @@ mod tests {
         // observer will resolve it.
         assert_eq!(recovered.len(), 1);
         assert_eq!(pool.blocking_height(8), Some(15));
+    }
+
+    #[test]
+    fn deferred_gate_closes_at_slot_time_and_hash_is_filled_on_sign() {
+        let pool = OptimisticallyIncluded::new();
+        // Deferred post, slot time: register the gate with a PLACEHOLDER hash
+        // (the proof hasn't arrived, so the L1 tx isn't signed yet).
+        pool.begin(10, TxHash::ZERO, hdr(), vec![tx(1)]);
+        // The one-in-flight gate is closed IMMEDIATELY — the next Sync slot
+        // must skip emission even though the post hasn't been signed/sent.
+        assert_eq!(pool.blocking_height(5), Some(10));
+        // Proof arrives + tx signed: the dispatch task fills the real hash.
+        pool.set_post_batch_hash(10, pb_hash(0xa));
+        // Observer settles; the finality audit gets the REAL hash, not ZERO.
+        pool.mark_settled(10);
+        let finalized = pool.take_finalized(10);
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].1, pb_hash(0xa));
+        // set_post_batch_hash on an absent entry is a no-op (no resurrection).
+        pool.set_post_batch_hash(10, pb_hash(0xb));
+        assert!(pool.take_finalized(10).is_empty());
+    }
+
+    #[test]
+    fn deferred_timeout_marks_failed_for_recovery() {
+        let pool = OptimisticallyIncluded::new();
+        // Slot time: gate registered with survivors + a placeholder hash.
+        pool.begin(10, TxHash::ZERO, hdr(), vec![tx(1), tx(2)]);
+        // Proof never arrives within budget → the deferred task marks the
+        // pre-registered entry Failed (it does NOT call begin again).
+        pool.mark_failed(10);
+        // The gate stays closed until the next slot recovers it…
+        assert_eq!(pool.blocking_height(0), Some(10));
+        let batch = pool.take_failed_for_recovery(0).expect("failed entry");
+        assert_eq!(batch.sync_height, 10);
+        // …re-queueing the survivors held in the ledger (not dropped)…
+        assert_eq!(batch.txs.len(), 2);
+        // …and the placeholder hash survives (a never-sent tx has no receipt).
+        assert_eq!(batch.post_batch_hash, TxHash::ZERO);
+        assert_eq!(pool.blocking_height(0), None);
     }
 
     #[test]

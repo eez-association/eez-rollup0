@@ -28,16 +28,20 @@ use url::Url;
 
 use crate::error::{L1Error, L1Result};
 
-/// [`L1Watcher`] polling cadence. 2s gives prompt detection without
-/// burning RPC quota — half of gnosis's 5s L1 block time, a sixth of
-/// Ethereum mainnet's 12s.
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// [`L1Watcher`] polling cadence. 500ms detects a new L1 block (and thus a
+/// landed `BatchPosted`) within half a second of it being mined — this is on
+/// the settlement-gate critical path: only the deriver advancing the `posted`
+/// cursor (off a scanned `BatchPosted`) re-opens the composer's one-in-flight
+/// gate, so a slow scan delays the NEXT postBatch. The L1 here is the embedded
+/// node over loopback, so there is no RPC-quota cost to polling sub-block-time
+/// (gnosis blocks are 5s). Was 2s.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Every Nth poll tick we additionally call
 /// `eth_getBlockByNumber("finalized")` and emit a `Finalized` event if
-/// the result changed. 6 ticks × 2s = 12s — matches L1 mainnet block
+/// the result changed. 24 ticks × 500ms = 12s — matches L1 mainnet block
 /// time, fine-grained enough that consumers see finality move promptly.
-const FINALIZED_REFRESH_TICKS: u64 = 6;
+const FINALIZED_REFRESH_TICKS: u64 = 24;
 
 /// Broadcast channel capacity for [`L1Event`]s. 256 events ≈ several
 /// minutes of L1 activity — plenty for any subscriber that processes
@@ -45,6 +49,17 @@ const FINALIZED_REFRESH_TICKS: u64 = 6;
 /// events; downstream design must tolerate this (e.g., resync by
 /// reading on-chain state).
 const EVENT_BUFFER: usize = 256;
+
+/// Max L1 block span per `eth_getLogs(BatchPosted)` query. `eth_getLogs`
+/// providers cap the block range per request — reth rejects >100k with
+/// `-32602 "query exceeds max block range 100000"`, and many public RPCs
+/// cap far lower. A cold catch-up (embedded L1 synced to tip *before* the
+/// watcher's first poll) can span >100k blocks in one shot; an unchunked
+/// query is rejected, and because the rejection propagates before the
+/// catch-up branch can advance the ring, the same oversized range is
+/// retried every tick forever (tip never moves). 50k keeps a comfortable
+/// margin under reth's 100k while draining any gap in a few chunks.
+const MAX_BATCH_SCAN_RANGE: u64 = 50_000;
 
 /// Event emitted by the [`L1Watcher`].
 #[derive(Debug, Clone)]
@@ -95,6 +110,15 @@ pub enum L1Event {
         /// rest unconsumed) this is the applied prefix: leading
         /// immediate + consumed deferred entries.
         settled_count: usize,
+        /// `ExecutionConsumed` events for our rollupId in the postBatch's
+        /// L1 block = the number of DEFERRED (inbound) entries actually
+        /// consumed by their bundled user txs. The AUTHORITATIVE
+        /// consumed-deferred count: the Deriver truncates its inbound
+        /// delivery FIFO to THIS, NOT to `settled_count - (1 + outbound)`
+        /// — the latter deflates by one per skipped outbound immediate
+        /// (`ImmediateEntrySkipped`), wrongly dropping an inbound delivery.
+        /// Mirrors based-rollup's per-entry `ExecutionConsumed` signal.
+        consumed_count: usize,
         /// LAST applied entry's `newState` (log order) — L1's ACTUAL
         /// stored root after this batch (a prefix endpoint under partial
         /// consumption). The Deriver validates its replay endpoint
@@ -529,45 +553,65 @@ impl L1Watcher {
         to: u64,
         _to_hash: B256,
     ) -> L1Result<()> {
-        event!(
-            name: "eez.l1_watcher.scan_batch_posted",
-            Level::INFO,
-            from,
-            to,
-            "scanning L1 range for BatchPosted logs",
-        );
-        let scanned = crate::submitter::scan_batch_logs(
-            provider,
-            self.inner.config.eez,
-            self.inner.config.rollup_id,
-            from,
-            BlockNumberOrTag::Number(to),
-        )
-        .await?;
-        if !scanned.is_empty() {
+        // Walk `[from, to]` in chunks bounded by `MAX_BATCH_SCAN_RANGE` so a
+        // cold catch-up spanning >100k L1 blocks isn't rejected by the
+        // provider's `eth_getLogs` block-range cap. Re-emission of a chunk
+        // already delivered (if a later chunk errors and the whole scan is
+        // retried) is tolerated by consumers — reorg re-scans already re-emit
+        // BatchPosted, so the derivation path is idempotent by cursor.
+        let mut chunk_from = from;
+        while chunk_from <= to {
+            let chunk_to = chunk_from
+                .saturating_add(MAX_BATCH_SCAN_RANGE - 1)
+                .min(to);
             event!(
-                name: "eez.l1_watcher.scan_batch_posted.found",
+                name: "eez.l1_watcher.scan_batch_posted",
                 Level::INFO,
-                from,
-                to,
-                count = scanned.len(),
-                "emitting BatchPosted events to subscribers",
+                from = chunk_from,
+                to = chunk_to,
+                range_from = from,
+                range_to = to,
+                "scanning L1 range for BatchPosted logs",
             );
-        }
-        for b in scanned {
-            self.emit(L1Event::BatchPosted {
-                l1_block_number: b.l1_block_number,
-                l1_block_hash: b.l1_block_hash,
-                tx_hash: b.tx_hash,
-                submitter: b.submitter,
-                rollup_count: b.rollup_count,
-                call_data: b.call_data,
-                state_applied: b.state_applied,
-                settled_count: b.settled_count,
-                settled_final_state: b.settled_final_state,
-                claimed_current_state: b.claimed_current_state,
-                claimed_new_state: b.claimed_new_state,
-            });
+            let scanned = crate::submitter::scan_batch_logs(
+                provider,
+                self.inner.config.eez,
+                self.inner.config.rollup_id,
+                chunk_from,
+                BlockNumberOrTag::Number(chunk_to),
+            )
+            .await?;
+            if !scanned.is_empty() {
+                event!(
+                    name: "eez.l1_watcher.scan_batch_posted.found",
+                    Level::INFO,
+                    from = chunk_from,
+                    to = chunk_to,
+                    count = scanned.len(),
+                    "emitting BatchPosted events to subscribers",
+                );
+            }
+            for b in scanned {
+                self.emit(L1Event::BatchPosted {
+                    l1_block_number: b.l1_block_number,
+                    l1_block_hash: b.l1_block_hash,
+                    tx_hash: b.tx_hash,
+                    submitter: b.submitter,
+                    rollup_count: b.rollup_count,
+                    call_data: b.call_data,
+                    state_applied: b.state_applied,
+                    settled_count: b.settled_count,
+                    consumed_count: b.consumed_count,
+                    settled_final_state: b.settled_final_state,
+                    claimed_current_state: b.claimed_current_state,
+                    claimed_new_state: b.claimed_new_state,
+                });
+            }
+            // `to` may be u64::MAX-adjacent in theory; guard the increment.
+            if chunk_to == to {
+                break;
+            }
+            chunk_from = chunk_to + 1;
         }
         Ok(())
     }

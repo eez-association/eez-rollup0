@@ -37,10 +37,15 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 pub mod composer;
+pub mod control_feed;
 pub mod held_pool;
 pub mod ingress;
 pub mod local;
 pub mod optimistic;
+pub mod post_batch_msg;
+pub mod posted_windows;
+pub mod proof_sink;
+pub mod prover_dispatch;
 pub mod rollup;
 
 #[doc(inline)]
@@ -48,7 +53,7 @@ pub use composer::{Composer, CrossChainExecCtx};
 #[doc(inline)]
 pub use held_pool::{HeldPool, HeldTx};
 #[doc(inline)]
-pub use ingress::{Classification, IngressClassifier};
+pub use ingress::{Classification, Direction, IngressClassifier};
 
 #[doc(inline)]
 pub use local::{

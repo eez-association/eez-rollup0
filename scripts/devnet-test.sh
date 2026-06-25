@@ -29,9 +29,20 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Foundry nightly prints a "Warning: This is a nightly build..." banner to
+# stderr on every cast/forge call. With `2>&1`-captured command substitution
+# (e.g. NONCE_START=$(retry cast nonce ...)) that banner pollutes the captured
+# value and trips `set -u` arithmetic ("Warning: unbound variable"). Silence it.
+export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
+
 # ── Endpoints (the running node) ─────────────────────────────────────
 L1_RPC="${L1_RPC:-http://localhost:18645}"      # embedded chiado L1
 L2_RPC="${L2_RPC:-http://localhost:18688}"      # L2
+# Where cross-chain USER ops are SUBMITTED. Default = the L2 ingress
+# (:18688, chain-id-mismatch path). Set to the B0 L1 interceptor (:18649)
+# to exercise the production wallet-correct L1->L2 entry instead. Reads and
+# the L2-only filler always use L2_RPC; only this submit endpoint changes.
+SUBMIT_RPC="${SUBMIT_RPC:-$L2_RPC}"
 NODE_CONTAINER="${NODE_CONTAINER:-eez-node-chiado}"
 
 # ── Knobs ────────────────────────────────────────────────────────────
@@ -92,6 +103,7 @@ USER_ADDR=$(cast wallet address --private-key "$EEZ_USER_KEY")
 echo "==> devnet cross-chain test"
 echo "    L1 (internal) = $L1_RPC  (chain $L1_CHAIN_ID, head $L1_UP)"
 echo "    L2            = $L2_RPC  (chain $L2_CHAIN_ID, head $L2_UP)"
+echo "    submit via    = $SUBMIT_RPC  ($([ "$SUBMIT_RPC" = "$L2_RPC" ] && echo ':18688 chain-id hack' || echo 'B0 L1 interceptor'))"
 echo "    registry      = $EEZ_REGISTRY_ADDRESS  rollupId=$EEZ_ROLLUP_ID"
 echo "    waves=$WAVE_COUNT filler/gap=$FILLER_PER_GAP"
 
@@ -153,12 +165,17 @@ submit_wave() {
         RAW_TXS+=("$RAW"); n=$((n + 1))
     done
     for i in "${!RAW_TXS[@]}"; do
-        local H; H=$(cast keccak "${RAW_TXS[$i]}")
+        local H SUB_RESP; H=$(cast keccak "${RAW_TXS[$i]}")
         ALL_USER_TX_HASHES+=("$H"); TX_META+=("$H ${OP_KINDS[$i]} ${OP_ARGS[$i]}")
-        curl -s -X POST "$L2_RPC" -H 'Content-Type: application/json' \
-            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"${RAW_TXS[$i]}\"],\"id\":$i}" >/dev/null
+        SUB_RESP=$(curl -s -X POST "$SUBMIT_RPC" -H 'Content-Type: application/json' \
+            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"${RAW_TXS[$i]}\"],\"id\":$i}")
+        # B0/ingress returns the tx hash on a successful HOLD; surface any
+        # rejection (e.g. gate_and_hold nonce/balance) instead of swallowing it.
+        if echo "$SUB_RESP" | grep -q '"error"'; then
+            echo "    ✗ submit($SUBMIT_RPC) rejected ${OP_KINDS[$i]}:${OP_ARGS[$i]} → $SUB_RESP"
+        fi
     done
-    echo "    wave $WAVE_ID submitted: ${#RAW_TXS[@]} ops [$OPS]"
+    echo "    wave $WAVE_ID submitted: ${#RAW_TXS[@]} ops [$OPS] via $SUBMIT_RPC"
 }
 
 submit_filler() {

@@ -1,14 +1,28 @@
 //! Storage layout for the `authorizedProxies` mapping.
 //!
-//! Both EVM contracts (`EEZ.sol` on L1, `EEZL2.sol` on L2) declare
-//! `authorizedProxies` on the shared `EEZBase` parent, inherited first
-//! with no prior non-transient storage — so it sits at slot 0 of each
-//! ([`ROLLUPS_AUTHORIZED_PROXIES_SLOT`] / [`CCM_AUTHORIZED_PROXIES_SLOT`],
-//! both 0). `EEZ.sol` is the L1→L2 source side, `EEZL2.sol` the L2→L1.
+//! Two EVM contracts hold this mapping. Both inherit `authorizedProxies`
+//! from the shared abstract parent `EEZBase`, which declares it as its
+//! first (and only) non-transient storage slot — so the slot number is
+//! **0** on both children:
 //!
-//! The slot is a compile-time property of the storage layout; if the
-//! Solidity declaration order changes, update the constant and verify
-//! via `forge inspect <Contract> storage`.
+//! - **L1 `EEZ.sol`** — slot [`ROLLUPS_AUTHORIZED_PROXIES_SLOT`] (0).
+//!   Source side for L1→L2 composition. Full L1 layout:
+//!   `authorizedProxies` (0, from `EEZBase`), `rollups` (1),
+//!   `verificationByRollup` (2), `_transientExecutions` (3),
+//!   `_transientLookupCalls` (4).
+//! - **L2 `EEZL2.sol`** — slot [`CCM_AUTHORIZED_PROXIES_SLOT`] (0).
+//!   Source side for L2→L1 composition. Full L2 layout:
+//!   `authorizedProxies` (0, from `EEZBase`), `executions` (1),
+//!   `lookupCalls` (2), `lastLoadBlock` (3), `executionIndex` (4).
+//!   `ROLLUP_ID` and `SYSTEM_ADDRESS` are immutables (no storage slot).
+//!
+//! The two constants are equal (both 0) but kept distinct to document
+//! intent at call sites and to leave room for re-divergence if upstream
+//! ever moves either mapping off `EEZBase`.
+//!
+//! The slot is a compile-time property of the contract's storage
+//! layout. If the upstream Solidity declaration order changes, update
+//! the constant.
 //!
 //! Both constants are consumed at config build time as the
 //! `authorized_proxies_slot: u8` field on
@@ -16,22 +30,22 @@
 //! [`proxy_mapping_key`] / [`decode_proxy_value`] directly via the
 //! `u8` slot.
 
-use alloy_primitives::{Address, B256, U256, keccak256};
+use alloy_primitives::{keccak256, Address, B256, U256};
 use eez_protocol::RollupId;
 
 /// Storage slot of `authorizedProxies` on `EEZ.sol` (L1).
 ///
 /// Used by the entry-rollup proxy-lookup configuration. The mapping
-/// is inherited from `EEZBase` (first storage declaration there), so
-/// it occupies slot 0 of `EEZ.sol`. Verify with
-/// `forge inspect EEZ storage` from `sync-rollups-protocol/`.
+/// is declared on the abstract parent `EEZBase` as its first
+/// non-transient storage variable, so the slot is 0 on every
+/// `EEZBase` subclass — including `EEZ` (L1).
 pub const ROLLUPS_AUTHORIZED_PROXIES_SLOT: u8 = 0;
 
 /// Storage slot of `authorizedProxies` on `EEZL2.sol` (L2).
 ///
-/// Used by the follower-rollup proxy-lookup configuration. Inherited
-/// from `EEZBase` and occupies slot 0 of `EEZL2.sol`. Verify with
-/// `forge inspect EEZL2 storage` from `sync-rollups-protocol/`.
+/// Used by the follower-rollup proxy-lookup configuration. Same
+/// reasoning as [`ROLLUPS_AUTHORIZED_PROXIES_SLOT`] — inherited from
+/// `EEZBase` at slot 0.
 pub const CCM_AUTHORIZED_PROXIES_SLOT: u8 = 0;
 
 /// Information about a registered cross-chain proxy.
@@ -97,9 +111,8 @@ mod tests {
     #[test]
     fn slot_constants() {
         // Compile-time constants from the contracts' storage layout.
-        // Any change here must be paired with a matching change in
-        // the Solidity declaration order; re-verify via
-        // `forge inspect <Contract> storage` from sync-rollups-protocol/.
+        // Any change here must be paired with a matching change in the
+        // upstream Solidity declaration order.
         assert_eq!(ROLLUPS_AUTHORIZED_PROXIES_SLOT, 0);
         assert_eq!(CCM_AUTHORIZED_PROXIES_SLOT, 0);
     }

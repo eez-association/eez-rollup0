@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/eez-composer",
+    "crates/eez-control-rpc",
     "crates/eez-deriver",
     "crates/eez-driver",
     "crates/eez-evm",
@@ -12,6 +13,7 @@ members = [
     "crates/eez-payload-codec",
     "crates/eez-protocol",
     "crates/eez-prover",
+    "crates/eez-proverd",
 ]
 
 [workspace.package]
@@ -40,6 +42,17 @@ mimalloc           = "0.1"
 # CLI
 clap               = { version = "4", features = ["derive"] }
 
+# grpc — tonic control-plane (composer ↔ prover feed; prover-chain P2).
+# tonic 0.14 split codegen out: `tonic` runtime, `tonic-prost` prost glue,
+# `tonic-prost-build` the build-dep that runs protoc.
+tonic             = "0.14"
+tonic-prost       = "0.14"
+tonic-prost-build = "0.14"
+prost             = "0.14"
+# ReceiverStream wrapper: turns an mpsc Receiver into the outbound Stream
+# tonic's server-streaming RPC expects (control-feed Subscribe).
+tokio-stream      = "0.1"
+
 # reth — pinned to mediocregopher/partial-persistence-clean tip (contains the receipts-reorg truncation fix).
 reth-chain-state                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-chainspec                  = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
@@ -66,6 +79,7 @@ reth-provider                   = { git = "https://github.com/paradigmxyz/reth",
 reth-revm                       = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-storage-api                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-tasks                      = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-trie                       = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-trie-common                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 
 # reth_gnosis — Gnosis chain (chiado / gnosis mainnet) NodeBuilder.
@@ -95,6 +109,7 @@ alloy-primitives       = { version = "1", default-features = false }
 alloy-provider         = { version = "2", default-features = false, features = ["reqwest"] }
 alloy-rlp              = { version = "0.3", features = ["derive"] }
 alloy-rpc-client       = { version = "2", default-features = false }
+alloy-rpc-types-debug  = { version = "2", default-features = false }
 alloy-rpc-types-engine = { version = "2", default-features = false }
 alloy-rpc-types-eth    = { version = "2", default-features = false }
 alloy-signer           = { version = "2", default-features = false }
@@ -116,6 +131,7 @@ tower                  = { version = "0.5", features = ["util"] }
 
 # internal crates
 eez-composer       = { path = "crates/eez-composer" }
+eez-control-rpc    = { path = "crates/eez-control-rpc" }
 eez-deriver        = { path = "crates/eez-deriver" }
 eez-driver         = { path = "crates/eez-driver" }
 eez-evm            = { path = "crates/eez-evm" }
@@ -132,6 +148,23 @@ debug = 1
 
 [profile.dev]
 opt-level = 1
+
+# Fast-iteration profile for DEV: a release-grade binary that compiles in a
+# fraction of release's time. The slow parts of `release` are `lto="thin"` (a
+# serial cross-crate optimization pass over the whole reth dep graph) and
+# `codegen-units=1` (single-threaded codegen of the giant eez-node crate, wasting
+# 15 of 16 cores). `release-fast` drops both — parallel codegen across all cores,
+# no LTO, line-tables-only debug (small binary, fast link) — cutting an eez-node
+# rebuild from ~20min to a few minutes. Runtime is opt-level-2 (no LTO), plenty
+# for the L1-anchored scheduler (5s L1 / 1s L2 blocks are not a hot path).
+# Use: `cargo build --profile release-fast -p eez-node` +
+#      `BUILD_PROFILE=release-fast docker compose ... -f ...dev.yml up -d --force-recreate eez-node`
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+opt-level = 2
+debug = "line-tables-only"
 
 [workspace.lints.rust]
 ambiguous_negative_literals  = "warn"
@@ -187,3 +220,8 @@ clone_on_ref_ptr                 = "allow"
 # on_batch_posted 10, compose_via_evm_composer 8) need these params;
 # a refactor or dediacted crates would reduce some of this
 too_many_arguments               = "allow"
+# Ported crosschain core (based-rollup) carries no pedantic posture upstream;
+# these are idiom nits in the adopted code (a match-with-else in composition.rs,
+# an env-var `.map().unwrap_or()`), opted out here rather than diverging vendored files.
+single_match_else                = "allow"
+map_unwrap_or                    = "allow"

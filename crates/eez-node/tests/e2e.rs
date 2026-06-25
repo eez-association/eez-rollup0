@@ -249,6 +249,7 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     let genesis = reorg_genesis_path();
     let cfg = NodeConfig {
         genesis_path: Some(genesis.as_path()),
+        ..Default::default()
     };
     // Start both concurrently — sequential start lets c1 race alone
     // long enough to skew batch-race dynamics and (empirically) drop

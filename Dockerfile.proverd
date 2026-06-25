@@ -1,0 +1,84 @@
+# syntax=docker/dockerfile:1
+#
+# eez-proverd image. Builds TWO binaries from source, both plain cargo
+# (NO ZisK toolchain — the ZK guest is not needed for the mock proof
+# system; the prover does NATIVE re-execution via `native-validate` and
+# signs the attestation with EEZ_PROOF_SIGNER_KEY):
+#
+#   1. eez-proverd     — from this workspace (crates/), cargo-chef cached.
+#   2. native-validate — from OUR fork of zisk-eth-client
+#                        (eez-association/zisk-eth-client @ the pinned
+#                        commit below — NOT upstream 0xPolygonHermez,
+#                        which lacks native-validate + eez-public-inputs).
+#
+# Pin the fork commit; bump it deliberately and keep it in lockstep with
+# the protocol submodule (the guest + native-validate share the EEZ
+# batch-content commitment).
+
+# ── chef base: toolchain + system deps reth/mdbx/secp256k1 need ───────
+FROM rust:1.94-bookworm AS chef
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang libclang-dev pkg-config cmake libssl-dev git ca-certificates \
+        protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo install cargo-chef --locked
+WORKDIR /build
+
+# ── planner: dependency recipe from this workspace's manifests ────────
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ── builder: cook deps (cached), then build eez-proverd ──────────────
+FROM chef AS builder
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release -p eez-proverd \
+    && strip target/release/eez-proverd
+
+# ── validator: native-validate from OUR zisk-eth-client fork ─────────
+FROM rust:1.94-bookworm AS validator
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang libclang-dev pkg-config cmake libssl-dev git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+# OUR fork + the exact commit that carries native-validate + the EEZ
+# public-inputs commitment (guest parity). NOT on upstream.
+ARG ZISK_FORK_URL=https://github.com/eez-association/zisk-eth-client.git
+ARG ZISK_COMMIT=6e013d8
+# The fork's `[patch."…/stateless.git"]` points `stateless`/`tries` at a SIBLING
+# checkout (`../zisk-patch-stateless`), so clone that repo NEXT TO the fork (the
+# fork lands in /v, so the sibling resolves to /zisk-patch-stateless). It is the
+# CLEAN upstream 0xPolygonHermez branch (no local mods); pin the commit so the
+# image is reproducible. Without this the build fails: "failed to read
+# /zisk-patch-stateless/crates/stateless/Cargo.toml".
+# OUR fork of zisk-patch-stateless: the pinned commit (d46671c, "pair-roots
+# stateless validation + restored post-execution checks") is a LOCAL change that
+# never landed on upstream 0xPolygonHermez, and the host native-validate that
+# passed the driven E2E was built from it — so mirror it to eez-association
+# (c74759b == d46671c minus the CI workflow; build-identical). Clone the branch
+# explicitly (the commit is not on the default branch).
+ARG ZISK_PATCH_URL=https://github.com/eez-association/zisk-patch-stateless.git
+ARG ZISK_PATCH_BRANCH=zisk/ed189a5
+ARG ZISK_PATCH_COMMIT=c74759b
+RUN git clone --branch "$ZISK_PATCH_BRANCH" "$ZISK_PATCH_URL" /zisk-patch-stateless \
+    && git -C /zisk-patch-stateless checkout "$ZISK_PATCH_COMMIT"
+WORKDIR /v
+RUN git clone "$ZISK_FORK_URL" . \
+    && git checkout "$ZISK_COMMIT" \
+    && cargo build --release --bin native-validate \
+    && strip target/release/native-validate
+
+# ── runtime: slim image with both binaries + the L2 chain-config ─────
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder   /build/target/release/eez-proverd     /usr/local/bin/eez-proverd
+COPY --from=validator /v/target/release/native-validate     /usr/local/bin/native-validate
+# L2 chain-config (alloy ChainConfig; all forks at 0 for the eez-dev chain).
+COPY configs/l2-chainconfig.json /app/l2-chainconfig.json
+ENTRYPOINT ["eez-proverd"]
+CMD ["--help"]

@@ -28,6 +28,8 @@ use std::sync::Mutex;
 
 use alloy_primitives::{Address, Bytes, TxHash};
 
+use crate::ingress::Direction;
+
 /// A cross-chain transaction held between submission and Sync-slot
 /// composition.
 #[derive(Debug, Clone)]
@@ -56,6 +58,12 @@ pub struct HeldTx {
     pub sender: Address,
     /// The tx's L1 nonce.
     pub nonce: u64,
+    /// Cross-chain direction (which ingress signal matched). Today
+    /// always [`Direction::Inbound`] — the outbound (L2→L1) path is not
+    /// yet wired. A later step keys the per-sender nonce contiguity by
+    /// `(sender, direction)` so the L1-context (inbound) and L2-context
+    /// (outbound) nonce chains for the same EOA stay independent.
+    pub direction: Direction,
 }
 
 /// Per-rollup pool of held cross-chain transactions.
@@ -117,32 +125,43 @@ impl HeldPool {
         }
     }
 
-    /// Number of held txs from `sender`. With the contiguity invariant
-    /// (ingress validation + cascade eviction), the sender's next
-    /// valid nonce = on-chain nonce + this count.
+    /// Number of held txs from `sender` in `direction`. With the
+    /// contiguity invariant (ingress validation + cascade eviction), the
+    /// sender's next valid nonce IN THAT DIRECTION = on-chain nonce +
+    /// this count. Keyed by `(sender, direction)` so the inbound
+    /// (L1-context) and outbound (L2-context) nonce chains of one EOA
+    /// stay independent.
     #[must_use]
-    pub fn held_count_for(&self, sender: Address) -> usize {
+    pub fn held_count_for(&self, sender: Address, direction: Direction) -> usize {
         self.txs
             .lock()
             .expect("held_pool txs poisoned")
             .iter()
-            .filter(|t| t.sender == sender)
+            .filter(|t| t.sender == sender && t.direction == direction)
             .count()
     }
 
-    /// Remove and return every held tx from `sender` with a nonce
-    /// strictly above `nonce`. Called when a tx of that sender is
-    /// evicted: the higher nonces are gapped — invalid until the gap
-    /// fills, which eviction guarantees never happens — so leaving
-    /// them queued only poisons future bundles.
+    /// Remove and return every held tx from `sender` in `direction`
+    /// with a nonce strictly above `nonce`. Called when a tx of that
+    /// sender is evicted: the higher nonces are gapped — invalid until
+    /// the gap fills, which eviction guarantees never happens — so
+    /// leaving them queued only poisons future bundles. Keyed by
+    /// `direction`: an evicted outbound (L2-nonce) tx must NOT cascade
+    /// onto the same EOA's inbound (L1-nonce) chain, an independent
+    /// sequence.
     #[must_use]
-    pub fn drain_sender_above(&self, sender: Address, nonce: u64) -> Vec<HeldTx> {
+    pub fn drain_sender_above(
+        &self,
+        sender: Address,
+        direction: Direction,
+        nonce: u64,
+    ) -> Vec<HeldTx> {
         let mut txs = self.txs.lock().expect("held_pool txs poisoned");
         let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
         let mut drained = Vec::new();
         let mut kept = VecDeque::with_capacity(txs.len());
         for tx in txs.drain(..) {
-            if tx.sender == sender && tx.nonce > nonce {
+            if tx.sender == sender && tx.direction == direction && tx.nonce > nonce {
                 drained.push(tx);
             } else {
                 kept.push_back(tx);
@@ -239,7 +258,48 @@ mod tests {
             attempts: 0,
             sender: Address::repeat_byte(byte),
             nonce: u64::from(byte),
+            direction: Direction::Inbound,
         }
+    }
+
+    /// R8: the per-sender nonce contiguity is keyed by `(sender,
+    /// direction)`. Inbound (L1-context) and outbound (L2-context) nonce
+    /// chains of the SAME EOA are independent — counting and cascade
+    /// eviction in one direction must not touch the other.
+    #[test]
+    fn contiguity_is_isolated_per_direction() {
+        let pool = HeldPool::new();
+        let sender = Address::repeat_byte(0xEE);
+        let mk = |tag: u8, nonce: u64, direction: Direction| HeldTx {
+            raw_tx: Bytes::from(vec![tag; 4]),
+            hash: TxHash::from(B256::repeat_byte(tag)),
+            attempts: 0,
+            sender,
+            nonce,
+            direction,
+        };
+        // Same EOA: 2 inbound (nonce 5, 6) + 2 outbound (nonce 5, 6).
+        pool.push(mk(1, 5, Direction::Inbound));
+        pool.push(mk(2, 6, Direction::Inbound));
+        pool.push(mk(3, 5, Direction::Outbound));
+        pool.push(mk(4, 6, Direction::Outbound));
+
+        // Counting is per-direction.
+        assert_eq!(pool.held_count_for(sender, Direction::Inbound), 2);
+        assert_eq!(pool.held_count_for(sender, Direction::Outbound), 2);
+
+        // Evicting outbound above nonce 5 drains ONLY the outbound
+        // nonce-6 tx; the inbound chain is untouched.
+        let drained = pool.drain_sender_above(sender, Direction::Outbound, 5);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].nonce, 6);
+        assert_eq!(drained[0].direction, Direction::Outbound);
+        assert_eq!(
+            pool.held_count_for(sender, Direction::Inbound),
+            2,
+            "inbound chain must be untouched by an outbound eviction",
+        );
+        assert_eq!(pool.held_count_for(sender, Direction::Outbound), 1);
     }
 
     #[test]

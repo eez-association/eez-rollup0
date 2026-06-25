@@ -16,10 +16,12 @@
 //! | set | set | **composer** | reth + `L1Watcher` + Deriver + Sequencer (L1-anchored) + Composer umbrella |
 
 mod ingress;
+mod l1_interceptor;
 mod l1_embedded;
 
 use std::{collections::HashMap, env, str::FromStr, sync::Arc};
 
+use alloy_consensus::BlockHeader; // .number()/.parent_hash() on the witness block
 use alloy_primitives::{Address, B256};
 use alloy_signer_local::PrivateKeySigner;
 use eez_composer::{Composer, HeldPool, IngressClassifier, RollupConfig, RollupState};
@@ -36,6 +38,7 @@ use mimalloc::MiMalloc;
 use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
 use reth_node_builder::components::BasicPayloadServiceBuilder;
 use reth_node_ethereum::EthereumNode;
+use reth_storage_api::BlockReader; // `recovered_block` on the L2 provider (witness feed)
 use tokio::sync::mpsc;
 use tracing::{Level, event};
 
@@ -134,16 +137,31 @@ fn main() -> eyre::Result<()> {
         // `held_pool` Arc is shared with the umbrella so pushes and the
         // Sync-slot drain see one queue. Empty classifier = pass-through.
         let held_pool = Arc::new(HeldPool::new());
+        // The classifier now carries ONLY the inbound (foreign source chain id)
+        // signal. OUTBOUND is detected DYNAMICALLY at ingress via a live
+        // `authorizedProxies[to]` read on the L2 CCM (EEZ_CCM_L2_ADDRESS) — the
+        // static proxy set is gone (it silently drifted from the on-chain
+        // registry; a missing entry lost the L2→L1 effect unrecoverably).
         let classifier: Arc<IngressClassifier> = Arc::new(IngressClassifier::new(
-            parse_cross_chain_proxy_env().into_iter().collect(),
             parse_cross_chain_source_chain_ids_env().into_iter().collect(),
         ));
         if !classifier.is_empty() {
             event!(
                 name: "eez.node.ingress.classifier",
                 Level::INFO,
-                proxy_count = classifier.len(),
-                "ingress classifier configured with cross-chain proxy addresses",
+                source_chain_id_count = classifier.source_chain_id_count(),
+                "ingress classifier configured with inbound cross-chain source chain ids",
+            );
+        }
+        // The static outbound proxy env var is deprecated + ignored — warn if a
+        // deployment still sets it, so the operator removes it.
+        if std::env::var("EEZ_CROSS_CHAIN_PROXY_ADDRESSES").is_ok_and(|v| !v.is_empty()) {
+            event!(
+                name: "eez.node.ingress.deprecated_proxy_env",
+                Level::WARN,
+                "EEZ_CROSS_CHAIN_PROXY_ADDRESSES is DEPRECATED and IGNORED — outbound \
+                 cross-chain is detected dynamically via authorizedProxies on \
+                 EEZ_CCM_L2_ADDRESS; remove the env var",
             );
         }
 
@@ -242,6 +260,15 @@ fn main() -> eyre::Result<()> {
             None
         };
 
+        // In-process L2 state handle for the ingress OUTBOUND classifier. The
+        // node provider only exists AFTER launch, but `IngressLayer` is built
+        // BEFORE launch, so the handle is threaded in as a late-filled `OnceLock`
+        // and populated right after launch (below). This replaces the re-entrant
+        // HTTP self-call the outbound `authorizedProxies` read used to do.
+        let l2_state_cell: Arc<
+            std::sync::OnceLock<Arc<dyn reth_storage_api::StateProviderFactory + Send + Sync>>,
+        > = Arc::new(std::sync::OnceLock::new());
+
         // L2 reth, two modifications: (1) `EezPayloadBuilder` writes
         // `gas_limit`/`extra_data` from shared `eez-driver` constants so
         // deriver replay and sequencer builds yield identical headers;
@@ -257,6 +284,7 @@ fn main() -> eyre::Result<()> {
                     .with_rpc_middleware(ingress::IngressLayer::new(
                         Arc::clone(&held_pool),
                         Arc::clone(&classifier),
+                        Arc::clone(&l2_state_cell),
                     )),
             )
             .launch_with_debug_capabilities()
@@ -265,6 +293,12 @@ fn main() -> eyre::Result<()> {
         let chain_spec: Arc<_> = handle.node.chain_spec();
         let l2_genesis_timestamp = chain_spec.genesis().timestamp;
         let provider = handle.node.provider.clone();
+        // Populate the ingress classifier's in-process L2 state handle now that
+        // the node provider exists (the `OnceLock` the middleware reads). `set`
+        // can only Err if already set, which cannot happen here — ignore it.
+        let _ = l2_state_cell.set(
+            Arc::new(provider.clone()) as Arc<dyn reth_storage_api::StateProviderFactory + Send + Sync>
+        );
         let payload_builder_handle = handle.node.payload_builder_handle.clone();
         let beacon_engine_handle = handle.node.add_ons_handle.beacon_engine_handle.clone();
         let task_executor = handle.node.task_executor.clone();
@@ -319,6 +353,52 @@ fn main() -> eyre::Result<()> {
         // standalone mode it runs the produce loop; in follower it's
         // dropped (committer stays alive via the cloned handle); in
         // composer the L1-anchored schedule arrives via spawn_l1_anchored.
+        // Prover-feed witness channel (prover-chain P1): the committer emits
+        // each SEQUENCED block's (hash, number) here; a dedicated task
+        // re-executes it on parent state (block_execution_witness) for the
+        // proof feed. Composer mode only — buffered/logged until P2 (control-rpc)
+        // routes it to the prover.
+        // Prover-feed PostBatch sink (P4-a): the composer inserts each settling
+        // block's PostBatch keyed by the Sync block hash; the witness task drains
+        // it into ControlEvent.composition. Shared Arc, also handed to the composer.
+        let postbatch_sink: Arc<std::sync::Mutex<HashMap<u64, eez_control_rpc::v1::PostBatch>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        // Prover-feed RETURN store (P4-b-full): set ONLY in deferred-post mode
+        // (EEZ_PROOF_SYSTEM_KIND=real) — shared by the composer (waits for the
+        // attestation) + its ProofSink (records it). `None` = synchronous mock.
+        let proof_store: Option<eez_composer::proof_sink::ProofStore> =
+            (env::var("EEZ_PROOF_SYSTEM_KIND").as_deref() == Ok("real"))
+                .then(|| Arc::new(std::sync::Mutex::new(HashMap::new())));
+        // Composer-driven prover ledger (Phase 1, DARK): paired 1:1 with
+        // `proof_store` (deferred-post only). The composer records each posted
+        // `[posted+1 .. sync_height]` window; the ProofSink flips `attested` +
+        // advances the verified frontier on each verified attestation.
+        // Populated-but-not-driving in Phase 1 (the dispatch driver is Phase 2).
+        let posted_windows: Option<eez_composer::posted_windows::PostedWindows> =
+            proof_store
+                .as_ref()
+                .map(|_| eez_composer::posted_windows::PostedWindows::new());
+
+        let (witness_id_tx, witness_feed) = if mode == Mode::Composer {
+            let (tx, rx) = mpsc::unbounded_channel::<B256>();
+            // Replay ring sized to ~2 slots (K = L2 blocks per L1 slot) + slack,
+            // so a prover reconnecting within a slot rebuilds its window.
+            let publisher =
+                eez_composer::control_feed::ControlPublisher::new(u64::from(timing.k()));
+            (
+                Some(tx),
+                Some((
+                    rx,
+                    provider.clone(),
+                    chain_spec.clone(),
+                    publisher,
+                    Arc::clone(&postbatch_sink),
+                )),
+            )
+        } else {
+            (None, None)
+        };
+
         let mut sequencer = Sequencer::new(
             &provider,
             attributes,
@@ -326,6 +406,7 @@ fn main() -> eyre::Result<()> {
             schedule_rx,
             payload_builder_handle,
             timing,
+            witness_id_tx,
         )?;
         if mode != Mode::Standalone {
             let depth = env::var("EEZ_MAX_SPECULATIVE_DEPTH")
@@ -394,6 +475,17 @@ fn main() -> eyre::Result<()> {
             // up — it owns `LocalChainClient`s over L1 (entry) and L2
             // (follower). `None` without an embedded L1. Inlined because
             // the `FullNode` AddOns type resists a typed helper return.
+            //
+            // The L2 ENTRY client (for OUTBOUND source-sim, A2.3a) is built
+            // inside the same block — it needs the L2 provider/ccm — and
+            // declared here so it escapes to `Composer::new`.
+            let mut l2_entry_client: Option<
+                std::sync::Arc<
+                    dyn eez_protocol::executor::EntryChainClient<Protocol = eez_evm::EvmProtocol>
+                        + Send
+                        + Sync,
+                >,
+            > = None;
             let evm_composer: Option<eez_evm_inspector::EvmComposer> =
                 if let Some(l1_variant) = embedded_l1.as_ref() {
                     use eez_composer::{GnosisL1Adapter, LocalChainClient};
@@ -505,6 +597,26 @@ fn main() -> eyre::Result<()> {
                             + Sync,
                     > = l2_follower;
 
+                    // L2 ENTRY client (Role::Entry, EvmL2Style) — the SAME L2
+                    // provider as the follower, but able to source-sim (its
+                    // simulate_source_tx passes the Role gate; the follower's
+                    // errors Unavailable). Held for the drain's outbound branch
+                    // (A2.3b); P-1 validates its local source-sim root.
+                    let l2_entry: std::sync::Arc<
+                        dyn eez_protocol::executor::EntryChainClient<Protocol = EvmProtocol>
+                            + Send
+                            + Sync,
+                    > = LocalChainClient::new_entry(
+                        provider.clone(),
+                        evm_config.clone(),
+                        chain_spec.clone(),
+                        l2_rollup_id_typed,
+                        ccm_l2,
+                        ccm_l2,
+                        eez_evm::ChainDialect::EvmL2Style,
+                    );
+                    l2_entry_client = Some(l2_entry);
+
                     let entry_cfg = EvmTargetConfig {
                         ccm_address: eez_registry,
                         system_address: Address::ZERO, // entry has no system-tx CCM path
@@ -515,6 +627,7 @@ fn main() -> eyre::Result<()> {
                                 .proxy_lookup_slot(),
                         },
                         dialect: eez_evm::ChainDialect::EvmL1Style,
+                        settles_via_session_root: false,
                     };
                     let l2_follower_cfg = EvmTargetConfig {
                         ccm_address: ccm_l2,
@@ -526,6 +639,7 @@ fn main() -> eyre::Result<()> {
                                 .proxy_lookup_slot(),
                         },
                         dialect: eez_evm::ChainDialect::EvmL2Style,
+                        settles_via_session_root: false,
                     };
 
                     let composed = ProtocolComposer::<EvmProtocol>::builder(
@@ -665,6 +779,7 @@ fn main() -> eyre::Result<()> {
                 evm_config,
                 evm_composer,
                 cc_exec_ctx,
+                l2_entry_client,
             );
             let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
 
@@ -684,6 +799,16 @@ fn main() -> eyre::Result<()> {
             // slot-context recovery can roll back failed optimistic Sync
             // blocks — the actor stays the sole engine-API owner.
             composer.set_committer(sequencer.committer());
+            composer.set_postbatch_sink(Arc::clone(&postbatch_sink));
+            if let Some(store) = &proof_store {
+                composer.set_proof_store(Arc::clone(store)); // deferred-post mode
+            }
+            if let Some(windows) = &posted_windows {
+                // The frontier is seeded from the L1 cursor AFTER deriver.catch_up
+                // populates it (below), and follows the cursor at runtime via
+                // mark_settled_on_l1 in the composer's BatchPosted handler.
+                composer.set_posted_windows(windows.clone());
+            }
             (Some(sequencer), Some(composer), deriver_system_tx_cfg)
         } else {
             // Follower: drop the placeholder Sequencer (BlockCommitter
@@ -719,6 +844,22 @@ fn main() -> eyre::Result<()> {
                 "boot-time catch_up failed; deriver.run() will retry post-subscribe",
             );
         }
+        // Fix-1 (composer-driven) STARTUP SEED: now that catch_up has populated
+        // the L1 cursor, seed the verified frontier from it so a fresh/restarted
+        // node treats everything settled-on-L1 as verified-by-transitivity
+        // (prunes the stale in-flight ledger) instead of re-verifying from 0.
+        // reinit_from_cursor (DROPS swept windows) is the startup primitive; the
+        // runtime path uses mark_settled_on_l1 (RESOLVES, preserves in-flight).
+        if let Some(windows) = &posted_windows {
+            let cursor = l1_head.cursor();
+            windows.reinit_from_cursor(cursor);
+            event!(
+                name: "eez.node.posted_windows.seeded",
+                Level::INFO,
+                cursor,
+                "seeded the composer-driven verified frontier from the L1 cursor",
+            );
+        }
         event!(
             name: "eez.node.deriver.spawned",
             Level::INFO,
@@ -733,6 +874,10 @@ fn main() -> eyre::Result<()> {
 
         // ─── Composer-only: spawn Sequencer + umbrella ───────────────
         if let (Some(sequencer), Some(composer)) = (sequencer, umbrella) {
+            // The registered attester (vkey-derived) — the prover-feed ProofSink
+            // verifies returned attestations recover to it. Capture before the
+            // umbrella `composer` is moved into its run task below.
+            let attester = composer.prover_address();
             event!(name: "eez.node.sequencer.spawned", Level::INFO, mode = "composer", "spawning eez sequencer (L1-anchored)");
             task_executor.spawn_critical_task("eez-sequencer", async move {
                 sequencer.run().await;
@@ -742,6 +887,211 @@ fn main() -> eyre::Result<()> {
             task_executor.spawn_critical_task("eez-composer", async move {
                 composer.run().await;
             });
+
+            // B0 — the production L1->L2 entry. When EEZ_L1_INTERCEPTOR_PORT is
+            // set, host a transparent L1-RPC front: forward every eth_* to the
+            // real L1 (EEZ_L1_RPC_URL) so a wallet builds a correct L1 tx, and
+            // intercept eth_sendRawTransaction — an L1->L2 cross-chain call (a tx
+            // to an authorizedProxies-registered proxy on EEZ_REGISTRY_ADDRESS) is
+            // held in the SAME held_pool the composer drains. The wallet-correct
+            // replacement for the :18688 chain-id dev hack.
+            if let Some(port) = env::var("EEZ_L1_INTERCEPTOR_PORT")
+                .ok()
+                .and_then(|p| p.parse::<u16>().ok())
+            {
+                match (
+                    env::var("EEZ_L1_RPC_URL").ok(),
+                    env::var("EEZ_REGISTRY_ADDRESS")
+                        .ok()
+                        .and_then(|a| Address::from_str(&a).ok()),
+                ) {
+                    (Some(l1_url), Some(eez_l1)) => match l1_url.parse() {
+                        Ok(url) => {
+                            let provider = alloy_provider::RootProvider::new_http(url);
+                            let held_pool_i = Arc::clone(&held_pool);
+                            task_executor.spawn_critical_task("eez-l1-interceptor", async move {
+                                if let Err(e) = l1_interceptor::run_l1_interceptor(
+                                    port,
+                                    l1_url,
+                                    eez_l1,
+                                    held_pool_i,
+                                    provider,
+                                )
+                                .await
+                                {
+                                    event!(name: "eez.l1_interceptor.exited", Level::ERROR, error = %e, "L1 interceptor exited");
+                                }
+                            });
+                        }
+                        Err(e) => event!(
+                            name: "eez.l1_interceptor.bad_url", Level::WARN, error = %e,
+                            "EEZ_L1_RPC_URL malformed — L1 interceptor not started",
+                        ),
+                    },
+                    _ => event!(
+                        name: "eez.l1_interceptor.misconfigured", Level::WARN,
+                        "EEZ_L1_INTERCEPTOR_PORT set but EEZ_L1_RPC_URL / EEZ_REGISTRY_ADDRESS missing — L1 interceptor not started",
+                    ),
+                }
+            }
+
+            // Prover-feed (prover-chain P2): host the control-feed server and
+            // spawn the witness task that re-executes each sequenced block and
+            // publishes its self-contained ControlEvent (witness + block RLP).
+            if let Some((
+                mut witness_rx,
+                witness_provider,
+                witness_chain_spec,
+                publisher,
+                postbatch_sink,
+            )) = witness_feed
+            {
+                // Control-feed tonic server — the prover subscribes here (P3).
+                let control_port = env::var("EEZ_CONTROL_RPC_PORT")
+                    .ok()
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .unwrap_or(50051);
+                let control_addr: std::net::SocketAddr = format!("127.0.0.1:{control_port}")
+                    .parse()
+                    .expect("control-feed addr");
+                let svc = eez_composer::control_feed::ControlFeedSvc::new(Arc::clone(&publisher));
+                // Prover-feed RETURN path (P4-b): the ProofSink the prover submits
+                // its verified attestation to, hosted on the same endpoint.
+                // In deferred-post mode the ProofSink RECORDS verified attestations
+                // into the shared store (the composer drains them); otherwise it's
+                // verify-only (the mock self-posts).
+                let proof_sink = match (&proof_store, &posted_windows) {
+                    // Deferred-post + composer-driven ledger (Phase 1): record
+                    // the attestation AND advance the verified frontier.
+                    (Some(store), Some(windows)) => {
+                        eez_composer::proof_sink::ProofSinkSvc::with_store_and_windows(
+                            attester,
+                            Arc::clone(store),
+                            windows.clone(),
+                        )
+                    }
+                    // Deferred-post without the ledger (should not happen — they
+                    // are constructed as a pair — but keep the store path safe).
+                    (Some(store), None) => eez_composer::proof_sink::ProofSinkSvc::with_store(
+                        attester,
+                        Arc::clone(store),
+                    ),
+                    // Verify-only (the mock self-posts).
+                    (None, _) => eez_composer::proof_sink::ProofSinkSvc::new(attester),
+                };
+                // Composer-driven dispatch (Phase 2): stream VerifyRange
+                // directives from the posted/attested ledger. Gated on
+                // deferred-post (`posted_windows` present) AND EEZ_COMPOSER_DRIVEN
+                // — default off ⇒ provers self-drive `from_block` (full backward
+                // compat; old/new provers interoperate on the unchanged wire).
+                let composer_driven = env::var("EEZ_COMPOSER_DRIVEN")
+                    .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                    .unwrap_or(false);
+                let prover_dispatch = match (&posted_windows, composer_driven) {
+                    (Some(windows), true) => {
+                        event!(name: "eez.prover_dispatch.enabled", Level::INFO, %control_addr, "composer-driven prover dispatch ENABLED (EEZ_COMPOSER_DRIVEN); driving from the posted/attested ledger");
+                        Some(eez_control_rpc::v1::prover_dispatch_server::ProverDispatchServer::new(
+                            eez_composer::prover_dispatch::ProverDispatchSvc::new(windows.clone()),
+                        ))
+                    }
+                    _ => None,
+                };
+                task_executor.spawn_critical_task("eez-control-feed", async move {
+                    event!(name: "eez.control_feed.serving", Level::INFO, %control_addr, %attester, "serving control feed (composer → prover) + ProofSink (prover → composer)");
+                    if let Err(e) = tonic::transport::Server::builder()
+                        .add_service(
+                            eez_control_rpc::v1::control_feed_server::ControlFeedServer::new(svc),
+                        )
+                        .add_service(
+                            eez_control_rpc::v1::proof_sink_server::ProofSinkServer::new(proof_sink),
+                        )
+                        // Phase 2: present only when EEZ_COMPOSER_DRIVEN + deferred-post.
+                        .add_optional_service(prover_dispatch)
+                        .serve(control_addr)
+                        .await
+                    {
+                        event!(name: "eez.control_feed.server_exited", Level::ERROR, error = %e, "control-feed server exited");
+                    }
+                });
+
+                // Witness task: re-execute each sequenced block (off the actor
+                // loop) and publish its ControlEvent into the replay ring.
+                task_executor.spawn_critical_task("eez-witness-feed", async move {
+                    let evm_config = reth_evm_ethereum::EthEvmConfig::new(witness_chain_spec);
+                    while let Some(hash) = witness_rx.recv().await {
+                        let provider = witness_provider.clone();
+                        let evm_config = evm_config.clone();
+                        let sink = Arc::clone(&postbatch_sink);
+                        let built = tokio::task::spawn_blocking(
+                            move || -> eyre::Result<eez_control_rpc::v1::ControlEvent> {
+                                // The committer canonicalizes every PRODUCED block
+                                // (process_sequence + process_derive both head-FCU)
+                                // BEFORE emitting its hash here, so recovered_block
+                                // resolves on the first try.
+                                let block = provider
+                                    .recovered_block(
+                                        alloy_eips::BlockHashOrNumber::Hash(hash),
+                                        reth_storage_api::TransactionVariant::WithHash,
+                                    )
+                                    .map_err(|e| eyre::eyre!("fetch block {hash}: {e}"))?
+                                    .ok_or_else(|| eyre::eyre!("block {hash} not found"))?;
+                                let witness = eez_driver::witness::block_execution_witness(
+                                    &provider,
+                                    &evm_config,
+                                    &block,
+                                    eez_driver::witness::ExecutionWitnessMode::Canonical,
+                                )?;
+                                let block_number = block.header().number();
+                                let parent_hash = block.header().parent_hash();
+                                let block_rlp =
+                                    alloy_rlp::encode(block.into_sealed_block().into_block());
+                                Ok(eez_control_rpc::v1::ControlEvent {
+                                    block_hash: hash.to_vec(),
+                                    block_number,
+                                    parent_hash: parent_hash.to_vec(),
+                                    // Prover-feed (P4-a): a settling block carries
+                                    // its PostBatch here (drained from the composer
+                                    // sink, keyed by block NUMBER); Normal blocks
+                                    // leave composition absent.
+                                    composition: sink
+                                        .lock()
+                                        .ok()
+                                        .and_then(|mut m| m.remove(&block_number))
+                                        .map(|post_batch| eez_control_rpc::v1::Composition {
+                                            post_batch: Some(post_batch),
+                                        }),
+                                    witness: Some(eez_control_rpc::v1::ExecutionWitness {
+                                        state: witness.state.into_iter().map(|b| b.to_vec()).collect(),
+                                        codes: witness.codes.into_iter().map(|b| b.to_vec()).collect(),
+                                        keys: witness.keys.into_iter().map(|b| b.to_vec()).collect(),
+                                        headers: witness.headers.into_iter().map(|b| b.to_vec()).collect(),
+                                    }),
+                                    block: block_rlp,
+                                })
+                            },
+                        )
+                        .await;
+                        match built {
+                            Ok(Ok(event)) => {
+                                let n = event.block_number;
+                                // Bound the sink (the witness processes blocks in
+                                // order): drop any entry at/below this number. n's own
+                                // entry was already drained in the closure; anything
+                                // <= n that wasn't (a settling block whose witness
+                                // extraction failed, or one reorged out) would
+                                // otherwise leak forever.
+                                if let Ok(mut m) = postbatch_sink.lock() {
+                                    m.retain(|&k, _| k > n);
+                                }
+                                publisher.publish(event);
+                                event!(name: "eez.witness.published", Level::DEBUG, block_number = n, "control event published to prover feed");
+                            }
+                            Ok(Err(e)) => event!(name: "eez.witness.failed", Level::WARN, block_hash = %hash, error = %e, "witness extraction failed"),
+                            Err(e) => event!(name: "eez.witness.join_failed", Level::WARN, block_hash = %hash, error = %e, "witness task join failed"),
+                        }
+                    }
+                });
+            }
         }
 
         handle.wait_for_node_exit().await
@@ -793,20 +1143,6 @@ where
     }))
 }
 
-/// Parse `EEZ_CROSS_CHAIN_PROXY_ADDRESSES` (comma-separated hex
-/// addresses) into a `Vec<Address>`. Empty / unset / malformed → empty
-/// vec (the ingress classifier then becomes a passthrough).
-fn parse_cross_chain_proxy_env() -> Vec<Address> {
-    let Ok(raw) = env::var("EEZ_CROSS_CHAIN_PROXY_ADDRESSES") else {
-        return Vec::new();
-    };
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| Address::from_str(s).ok())
-        .collect()
-}
-
 /// Parse `EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS` (comma-separated u64s)
 /// into a `Vec<u64>`. Foreign source chain ids whose inbound txs we
 /// classify as cross-chain (i.e., a deposit-intent submitted to L2's
@@ -836,7 +1172,7 @@ fn read_l1_rollup_id() -> u64 {
 /// defaults so the smoke harness only overrides what it needs.
 ///
 ///   - `EEZ_L1_HTTP_PORT` — default `18545`
-///   - `EEZ_L1_AUTH_PORT` — default `18546`
+///   - `EEZ_L1_AUTH_PORT` — default `http_port + 2` (18547; http_port+1 is WS)
 ///   - `EEZ_L1_P2P_PORT`  — default `30444`
 ///   - `EEZ_L1_DATADIR`   — default `$TMPDIR/eez-l1-embedded` (ephemeral)
 ///   - `EEZ_L1_CHAIN_PATH` — L1 genesis JSON; unset → reth's `dev`
@@ -851,7 +1187,10 @@ fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
     let auth_port = env::var("EEZ_L1_AUTH_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(18546);
+        // `http_port` reserves http_port AND http_port+1 (WS = http+1, see
+        // l1_embedded::build_network_rpc_args); default auth to http+2 so it
+        // never collides with the implicit WS port.
+        .unwrap_or(http_port.saturating_add(2));
     let p2p_port = env::var("EEZ_L1_P2P_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())

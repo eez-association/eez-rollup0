@@ -1,39 +1,33 @@
 //! Narrow ECDSA signer for the postBatch poster's proof system.
 //!
-//! Produces the 65-byte `abi.encodePacked(r, s, v)` signature
-//! shape `ECDSAProofSystem.verify` (Phase 08 E1) expects. The
-//! digest is the raw `publicInputsHash` 32-byte value — no
-//! EIP-191 prefix, no domain separator. `s` is normalized to
-//! the canonical low half of `secp256k1_n` (the on-chain
-//! verifier rejects high-`s` for malleability); `v` is
-//! normalized to `{27, 28}`.
+//! Produces the 65-byte `abi.encodePacked(r, s, v)` signature shape
+//! the upstream `ECDSAProofSystem.verify` expects. The digest is the
+//! raw `publicInputsHash` 32-byte value — no EIP-191 prefix, no domain
+//! separator. `s` is normalized to the canonical low half of
+//! `secp256k1_n` (the on-chain verifier rejects high-`s` for
+//! malleability); `v` is normalized to `{27, 28}`.
 //!
 //! # Why `k256` direct (not `alloy-signer-local`)
 //!
-//! Per Codex v1 plan review: the surface is narrow — raw 32-byte
-//! digest in, canonical `(r, s, v)` bytes out, no EIP-191
-//! prefix. `alloy-signer-local` would pull in `Wallet` /
-//! transaction-signing abstractions the workspace doesn't
-//! otherwise use, and would obscure the bytes at the one place
-//! that MUST exactly match the Solidity verifier.
+//! Rationale: the surface is narrow — raw 32-byte digest in, canonical
+//! `(r, s, v)` bytes out, no EIP-191 prefix. `alloy-signer-local`
+//! would pull in `Wallet` / transaction-signing abstractions the
+//! workspace doesn't otherwise use, and would obscure the bytes at
+//! the one place that MUST exactly match the Solidity verifier.
 //!
-//! The pure-Rust round-trip test uses `alloy_primitives::Signature::recover_address_from_prehash`
-//! (which itself calls `k256::ecdsa::VerifyingKey`) as the
-//! oracle, so the byte-equality is checked end-to-end without
-//! anvil.
+//! The pure-Rust round-trip test uses
+//! `alloy_primitives::Signature::recover_address_from_prehash` (which
+//! itself calls `k256::ecdsa::VerifyingKey`) as the oracle, so the
+//! byte-equality is checked end-to-end without anvil.
 //!
 //! # Spec anchors
 //!
-//! - `deployments/devnet/contracts/ECDSAProofSystem.sol` (Phase
-//!   08 E1) — the on-chain verifier this signer is paired
-//!   with.
-//! - `docs/DERIVATION.md` §6e (post-`1061244`): "65-byte
-//!   `abi.encodePacked(r, s, v)` signature, `s` in the
-//!   canonical (low) half of `secp256k1_n`, `v` normalized to
-//!   `{27, 28}`".
-//! - `docs/plans/09-postbatch-poster.md` §D.
+//! Mirrors `ECDSAProofSystem.verify` (in-tree:
+//! `sync-rollups-protocol/src/proofSystems/ECDSAProofSystem.sol`).
+//! 65-byte `abi.encodePacked(r, s, v)` signature, `s` in the canonical
+//! (low) half of `secp256k1_n`, `v` normalized to `{27, 28}`.
 
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{Address, Bytes, B256};
 use k256::ecdsa::{RecoveryId, Signature as K256Signature, SigningKey};
 
 /// Narrow ECDSA signer over raw `B256` digests. Produces a
@@ -99,11 +93,11 @@ impl EcdsaProofSigner {
     }
 
     /// The address downstream verifiers will recover from
-    /// signatures this signer produces. For the dev devnet,
+    /// signatures this signer produces. On the upstream devnet,
     /// this is the value passed as `authorizedSigner` to
-    /// `DeployECDSAProofSystem` (Phase 08 E2); the on-chain
-    /// `ECDSAProofSystem` stores it as `signer()` and rejects
-    /// any signature whose ecrecover doesn't match.
+    /// `DeployECDSAProofSystem`; the on-chain `ECDSAProofSystem`
+    /// stores it as `signer()` and rejects any signature whose
+    /// ecrecover doesn't match.
     #[must_use]
     pub fn address(&self) -> Address {
         self.address
@@ -199,15 +193,17 @@ mod tests {
     use super::*;
     use alloy_primitives::Signature;
 
-    /// Dev key from `devnet-up.sh`'s `$PK_COMPOSER`.
+    /// Well-known Anvil dev account #1 private key — useful as a
+    /// deterministic test vector that matches any Foundry/Anvil/
+    /// Hardhat tooling.
     const SEQUENCER_KEY: [u8; 32] = [
         0x59, 0xc6, 0x99, 0x5e, 0x99, 0x8f, 0x97, 0xa5, 0xa0, 0x04, 0x49, 0x66, 0xf0, 0x94, 0x53,
         0x89, 0xdc, 0x9e, 0x86, 0xda, 0xe8, 0x8c, 0x7a, 0x84, 0x12, 0xf4, 0x60, 0x3b, 0x6b, 0x78,
         0x69, 0x0d,
     ];
-    /// Expected address for that key (matches
-    /// `cast wallet address --private-key 0x59...` and the
-    /// devnet's live `$SEQUENCER_ADDR`).
+    /// Expected address for that key — `0x70997970C51812dc3A010C7d01b50e0d17dc79C8`.
+    /// Matches `cast wallet address --private-key 0x59...` (the well-
+    /// known Anvil dev account #1).
     const SEQUENCER_ADDR: Address = Address::new([
         0x70, 0x99, 0x79, 0x70, 0xc5, 0x18, 0x12, 0xdc, 0x3a, 0x01, 0x0c, 0x7d, 0x01, 0xb5, 0x0e,
         0x0d, 0x17, 0xdc, 0x79, 0xc8,
@@ -220,13 +216,12 @@ mod tests {
     }
 
     #[test]
-    fn address_matches_devnet_sequencer_addr() {
+    fn address_matches_anvil_dev_account() {
         let signer =
             EcdsaProofSigner::from_private_key(B256::from(SEQUENCER_KEY)).expect("valid key");
         // Locks the address-derivation byte chain against the
-        // live devnet's $SEQUENCER_ADDR (the value
-        // DeployECDSAProofSystem.s.sol passes as the authorized
-        // signer for the on-chain verifier).
+        // well-known Anvil dev account #1 — the same value
+        // `cast wallet address --private-key 0x59...` produces.
         assert_eq!(signer.address(), SEQUENCER_ADDR);
     }
 

@@ -205,19 +205,26 @@ where
             let batch_first_l2 = cumulative_l2 + 1;
             let batch_last_l2 = cumulative_l2 + decoded.block_count() as u64;
 
-            // Catch-up always replays — the deriver is the authority on L2
-            // chain state during boot. Skips would trust whatever's locally
-            // canonical, which can be a Sequencer-race-produced block.
-            // `settled_count` bounds the system-tx reconstruction to the
-            // prefix L1 actually consumed (partial-consumption rule).
+            // Do NOT unconditionally force-replay: re-executing a block reth
+            // ALREADY holds canonically re-canonicalizes it via a head-FCU,
+            // which for an earlier block walks reth's head BACKWARD (e.g. 85→1)
+            // — wiping the bulk-catch-up chain and stranding the L1-derived
+            // FOLLOWER (committer head resets to ~2, then it can't read its own
+            // head to derive forward). `local_block_matches` already replays
+            // exactly the divergent suffix: a Sequencer-race block has a
+            // different tx-list → `matched=false` → replayed (and `replayed>0`
+            // cascades the rebuild to every later block on the new ancestry), so
+            // correctness is preserved without re-deriving already-correct
+            // blocks. `consumed_count` bounds the inbound system-tx
+            // reconstruction to the L1-consumed prefix (partial-consumption rule).
             total_replayed += self
                 .reconcile_batch_blocks(
                     batch_first_l2,
                     &decoded,
                     batch.l1_block_number,
                     batch.tx_hash,
-                    batch.settled_count,
-                    true,
+                    batch.consumed_count,
+                    false,
                 )
                 .await?;
 
@@ -316,33 +323,21 @@ where
             "execute_block: looking up parent header",
         );
 
-        let parent_header = self
-            .inner
-            .l2_provider
-            .sealed_header(parent_block_number)
-            .map_err(|e| {
-                event!(
-                    name: "eez.deriver.execute_block.parent_lookup_failed",
-                    Level::ERROR,
-                    parent_block_number,
-                    local_best,
-                    error = %e,
-                    "sealed_header() failed",
-                );
-                DeriverError::l2_provider(e)
-            })?
-            .ok_or_else(|| {
-                event!(
-                    name: "eez.deriver.execute_block.parent_missing",
-                    Level::ERROR,
-                    parent_block_number,
-                    local_best,
-                    "sealed_header() returned None — parent header is not in canonical chain",
-                );
-                DeriverError::l2_provider(format!(
-                    "local L2 header at parent block {parent_block_number} missing"
-                ))
-            })?;
+        // `sealed_header_or_head` falls back to the committer's in-memory
+        // canonical head when the DB-scoped provider lacks the (freshly-derived,
+        // unpersisted) parent — see its doc for why the follower needs this.
+        let parent_header = self.sealed_header_or_head(parent_block_number)?.ok_or_else(|| {
+            event!(
+                name: "eez.deriver.execute_block.parent_missing",
+                Level::ERROR,
+                parent_block_number,
+                local_best,
+                "parent header is neither in the DB nor the committer's canonical head",
+            );
+            DeriverError::l2_provider(format!(
+                "local L2 header at parent block {parent_block_number} missing"
+            ))
+        })?;
 
         let parent_hash = parent_header.hash();
         let timestamp = parent_header
@@ -419,6 +414,16 @@ where
                 )
             })?;
             builder.execute_transaction(recovered).map_err(|e| {
+                // DIAGNOSTIC (phase-1 divergence probe): surface the revm
+                // rejection that local_diverged_with_msg otherwise discards.
+                event!(
+                    name: "eez.deriver.execute_block.tx_rejected",
+                    Level::ERROR,
+                    block = parent_block_number + 1,
+                    tx_idx,
+                    error = %e,
+                    "execute_transaction REJECTED a re-derived tx",
+                );
                 DeriverError::local_diverged_with_msg(
                     parent_block_number + 1,
                     &format!("execute tx #{tx_idx}: {e}"),
@@ -450,7 +455,15 @@ where
         raw_txs: &[Vec<u8>],
     ) -> DeriverResult<DeriveOutcome> {
         let (payload, header) = self.execute_block(parent_block_number, raw_txs)?;
-        Ok(self.inner.committer.commit_derived(payload, header).await?)
+        // Follower / L1-reconcile re-derive — do NOT feed the prover witness task
+        // (feed_witness = false); the producer already fed this block at
+        // production time. Avoids double-feeding the same block_number.
+        let outcome = self
+            .inner
+            .committer
+            .commit_derived(payload, header, false)
+            .await?;
+        Ok(outcome)
     }
 
     /// Runs the deriver loop. Subscribes to the `L1Watcher`'s event
@@ -535,6 +548,7 @@ where
                 call_data,
                 state_applied,
                 settled_count,
+                consumed_count,
                 settled_final_state,
                 claimed_current_state,
                 claimed_new_state,
@@ -547,6 +561,7 @@ where
                     call_data,
                     state_applied,
                     settled_count,
+                    consumed_count,
                     settled_final_state,
                     claimed_current_state,
                     claimed_new_state,
@@ -581,6 +596,7 @@ where
         call_data: Bytes,
         state_applied: bool,
         settled_count: usize,
+        consumed_count: usize,
         settled_final_state: Option<B256>,
         claimed_current_state: Option<B256>,
         claimed_new_state: Option<B256>,
@@ -674,7 +690,7 @@ where
                 &decoded,
                 l1_block_number,
                 tx_hash,
-                settled_count,
+                consumed_count,
                 false,
             )
             .await?;
@@ -858,12 +874,47 @@ where
         Ok(())
     }
 
-    fn l2_hash_at(&self, l2_block: u64) -> DeriverResult<B256> {
-        Ok(self
+    /// Resolve the sealed header at `number`, falling back to the committer's
+    /// in-memory canonical head when the DB-scoped provider doesn't have it.
+    ///
+    /// A freshly-derived bulk-catch-up head lives in reth's in-memory canonical
+    /// window (unpersisted until the head advances past it), which
+    /// `l2_provider.sealed_header()` (DB-scoped) cannot see — the committer
+    /// mirrors that head on every commit. Without this fallback the L1-derived
+    /// FOLLOWER DEADLOCKS: it can't read its own freshly-derived catch-up head
+    /// to derive the next block, and the head never persists because it can't
+    /// advance past itself. (based-rollup never hit this — it derived
+    /// incrementally, giving each block time to persist before the next.)
+    /// Returns `None` only when `number` is neither in the DB nor the head.
+    fn sealed_header_or_head(
+        &self,
+        number: u64,
+    ) -> DeriverResult<Option<SealedHeader<alloy_consensus::Header>>> {
+        if let Some(h) = self
             .inner
             .l2_provider
-            .sealed_header(l2_block)
+            .sealed_header(number)
             .map_err(DeriverError::l2_provider)?
+        {
+            return Ok(Some(h));
+        }
+        let head = self.inner.committer.last_header();
+        if head.number() == number {
+            return Ok(Some(head));
+        }
+        event!(
+            name: "eez.deriver.sealed_header_or_head.miss",
+            Level::DEBUG,
+            requested = number,
+            committer_head = head.number(),
+            "header not in DB and != committer canonical head",
+        );
+        Ok(None)
+    }
+
+    fn l2_hash_at(&self, l2_block: u64) -> DeriverResult<B256> {
+        Ok(self
+            .sealed_header_or_head(l2_block)?
             .ok_or_else(|| {
                 DeriverError::l2_provider(format!("local L2 header at {l2_block} missing"))
             })?
@@ -889,7 +940,7 @@ where
         decoded: &eez_payload_codec::DecodedBatch,
         l1_block_number: u64,
         tx_hash: B256,
-        settled_count: usize,
+        consumed_count: usize,
         force_replay: bool,
     ) -> DeriverResult<u64> {
         // Cross-chain path (skipped when `system_tx_cfg` is `None`):
@@ -911,16 +962,27 @@ where
             cross_chain = self.inner.system_tx_cfg.is_some(),
             "reconcile_batch_blocks entered",
         );
+        // A4 outbound follower gate: the batch's OUTBOUND settlement entries,
+        // captured out of the cross-chain arm below so the Sync-block replay can
+        // cross-check them against the re-executed CrossChainCallExecuted logs.
+        // A4 outbound gate state, carried out of the `system_txs` match: the
+        // (outbound immediate entry, its paired SIGNED Sync-block user tx) pairs
+        // + this L2's rollup id. The gate authorizes each outbound settlement
+        // against the user tx the composer drained — NOT a re-executed log (the
+        // outbound user tx reverts in plain re-execution, emitting none). See
+        // `eez_evm::outbound_gate`.
+        let mut gate_outbound: Vec<(eez_evm::types::ExecutionEntrySol, Bytes)> = Vec::new();
+        let mut gate_l2_rollup_id: u64 = 0;
         let system_txs = match self.inner.system_tx_cfg.as_ref() {
             Some(cfg) => {
-                let mut entries = if decoded.l2_entries.is_empty() {
+                let entries = if decoded.l2_entries.is_empty() {
                     event!(
                         name: "eez.deriver.reconcile.fetch_entries",
                         Level::INFO,
                         tx_hash = %tx_hash,
                         "fetching postBatch entries via L1 RPC (codec v1 fallback)",
                     );
-                    self.fetch_post_batch_entries(tx_hash).await?
+                    self.fetch_post_batch_entries(tx_hash, l1_block_number).await?
                 } else {
                     use alloy_sol_types::SolValue as _;
                     let mut out = Vec::with_capacity(decoded.l2_entries.len());
@@ -939,51 +1001,151 @@ where
                 // consumes as a PREFIX, so only the consumed prefix's
                 // system txs may execute on L2 — rebuilding all of them
                 // would put L2 permanently ahead of L1's stored root.
-                // `settled_count` = leading immediate (1) + consumed
-                // deferred entries. retain() drops non-producing entries
-                // (incl. the immediate, which signs no system tx) so the
-                // truncate index counts deferred entries in both codec
-                // branches.
-                entries.retain(|e| !e.L2ToL1Calls.is_empty());
-                let consumed_deferred = settled_count.saturating_sub(1);
-                if entries.len() > consumed_deferred {
+                // `consumed_count` = the AUTHORITATIVE number of inbound
+                // deferred entries consumed (the `ExecutionConsumed` event
+                // count for our rollupId, EEZ.sol:903), counted DIRECTLY —
+                // never derived as `settled_count - (1 + outbound)`, which
+                // deflates by one per skipped outbound immediate
+                // (`ImmediateEntrySkipped`) and would wrongly drop an
+                // inbound delivery. Mirrors based-rollup's per-entry
+                // ExecutionConsumed signal.
+                // Partition the L1 entries by DIRECTION (discriminate on
+                // proxyEntryHash, NOT l2ToL1Calls-emptiness — an outbound entry
+                // has non-empty l2ToL1Calls and would be mis-lowered into a wrong
+                // executeIncomingCrossChainCall by build_inbound_system_txs, R1):
+                //   - OUTBOUND immediate: proxyEntryHash==0 + non-empty l2ToL1Calls
+                //   - INBOUND deferred:   proxyEntryHash != 0 + non-empty l2ToL1Calls
+                // The leading anchor (proxyEntryHash==0 + EMPTY l2ToL1Calls) signs
+                // no system tx → dropped by the emptiness filter.
+                let (outbound_entries, mut inbound_deferred): (
+                    Vec<eez_evm::types::ExecutionEntrySol>,
+                    Vec<eez_evm::types::ExecutionEntrySol>,
+                ) = entries
+                    .into_iter()
+                    .filter(|e| !e.l2ToL1Calls.is_empty())
+                    .partition(|e| e.proxyEntryHash == B256::ZERO);
+
+                // Carry this L2's rollup id out for the Sync-block A4 gate below
+                // (the pairs themselves are carried after `outbound_paired` is
+                // built — they need the Sync-block user txs).
+                gate_l2_rollup_id = cfg.this_rollup_id;
+
+                // Partial-consumption truncation for the INBOUND deferred FIFO.
+                // `consumed_count` is the ExecutionConsumed event count for our
+                // rollupId = exactly the number of inbound deferred entries
+                // consumed on L1 (the anchor + outbound immediates emit
+                // L2ExecutionPerformed, NOT ExecutionConsumed, so they're already
+                // excluded). Robust to a skipped outbound immediate — independent
+                // of outbound_entries.len() entirely.
+                let consumed_deferred = consumed_count;
+                if inbound_deferred.len() > consumed_deferred {
                     event!(
                         name: "eez.deriver.reconcile.partial_consumption",
                         Level::WARN,
                         tx_hash = %tx_hash,
-                        entries = entries.len(),
+                        entries = inbound_deferred.len(),
                         consumed_deferred,
                         "L1 consumed only a prefix of the batch's deferred entries; truncating system-tx reconstruction to match",
                     );
-                    entries.truncate(consumed_deferred);
+                    inbound_deferred.truncate(consumed_deferred);
                 }
-                event!(
-                    name: "eez.deriver.reconcile.system_txs_starting",
-                    Level::INFO,
-                    tx_hash = %tx_hash,
-                    entries = entries.len(),
-                    "computing nonce + signing system txs",
-                );
+
                 let starting_nonce = self.system_address_nonce_at(from_block - 1)?;
-                let signed =
-                    eez_evm::system_tx::build_inbound_system_txs(&entries, cfg, starting_nonce)
-                        .map_err(|e| {
-                            DeriverError::l2_provider(format!(
-                                "build_inbound_system_txs(tx={tx_hash}): {e}"
-                            ))
-                        })?;
+
+                // The Sync block's user txs (the LAST L2 block of this batch's
+                // range, Rollup-1 §1.3) — the K outbound `executeCrossChainCall`
+                // users that pair with the K outbound loads. The deriver pairs
+                // POSITIONALLY (i-th outbound entry ↔ i-th user tx); the composer's
+                // drain==splice==DA order guarantees the match.
+                let sync_user_count = decoded
+                    .block_tx_counts
+                    .last()
+                    .map_or(0, |c| usize::from(*c));
+                let user_start = decoded.transactions.len().saturating_sub(sync_user_count);
+                let outbound_paired: Vec<(eez_evm::types::ExecutionEntrySol, Bytes)> =
+                    outbound_entries
+                        .iter()
+                        .cloned()
+                        .zip(
+                            decoded.transactions[user_start..]
+                                .iter()
+                                .map(|t| Bytes::from(t.clone())),
+                        )
+                        .collect();
+
+                // Carry the (outbound entry, signed user tx) pairs out for the
+                // A4 gate — the positional pairing the composer's
+                // drain==splice==DA order guarantees.
+                gate_outbound = outbound_paired.clone();
+
+                // THE canonical builder — the SAME function the composer calls
+                // (eez_evm::system_tx), so the Sync block's system txs (two-phase
+                // SYSTEM_ADDRESS nonces: outbound loads N.., inbound N+K..) AND the
+                // interleaved order [load,user,…,deliveries] are byte-identical BY
+                // CONSTRUCTION. (Replaces the deriver's own system-first concat,
+                // which drifted from the composer's interleave and was L2-invalid
+                // for a mixed slot — the inbound delivery's loadExecutionTable
+                // self-clean wiped the outbound table before its user tx consumed
+                // it. A2b.)
+                let pairs = eez_evm::system_tx::build_cross_chain_sync_pairs(
+                    &outbound_paired,
+                    &inbound_deferred,
+                    cfg,
+                    starting_nonce,
+                )
+                .map_err(|e| {
+                    DeriverError::l2_provider(format!(
+                        "build_cross_chain_sync_pairs(tx={tx_hash}): {e}"
+                    ))
+                })?;
+
                 event!(
                     name: "eez.deriver.reconcile.system_txs_built",
                     Level::INFO,
                     tx_hash = %tx_hash,
-                    sys_tx_count = signed.len(),
+                    sys_tx_count = pairs.len(),
+                    outbound = outbound_entries.len(),
+                    inbound = inbound_deferred.len(),
                     starting_nonce,
-                    "built inbound system txs",
+                    "built outbound load + inbound delivery system txs",
                 );
-                signed
+                // The COMPLETE interleaved Sync-block tx list (loads + their user
+                // txs + deliveries) — the SAME bytes the composer commits.
+                eez_evm::system_tx::interleave_sync_block_txs(&pairs)
             }
             None => Vec::new(),
         };
+
+        // A4 — outbound L2->L1 follower gate (HARD). Authorize every outbound
+        // settlement entry against its paired, SIGNED Sync-block user tx (the one
+        // the composer drained + committed to DA) BEFORE replaying/committing any
+        // block of this batch. A phantom withdrawal — an entry with no real user
+        // tx behind it — cannot satisfy the signer/value/data/proxy-target binds:
+        // a composer can't forge a user's ECDSA signature. The deriver-side mirror
+        // of the prover's A3 gate (the SAME shared `eez_evm::outbound_gate` check,
+        // so the follower + prover can't drift); defense-in-depth for a follower
+        // that re-derives WITHOUT verifying the proof. Runs ONCE, before the loop,
+        // so an unauthorized batch is refused (return Err -> no phantom block is
+        // committed) rather than rewound after the fact.
+        if !gate_outbound.is_empty() {
+            let (g_entries, g_txs): (Vec<eez_evm::types::ExecutionEntrySol>, Vec<Bytes>) =
+                gate_outbound.iter().cloned().unzip();
+            if let Err(e) = eez_evm::outbound_gate::verify_outbound_authorized(
+                &g_entries,
+                &g_txs,
+                gate_l2_rollup_id,
+            ) {
+                event!(
+                    name: "eez.deriver.reconcile.outbound_gate",
+                    Level::ERROR,
+                    tx_hash = %tx_hash,
+                    from_block,
+                    error = %e,
+                    "A4 outbound gate REJECTED: an outbound settlement entry is not authorized by a signed user tx — refusing to derive this batch (phantom withdrawal)",
+                );
+                return Err(DeriverError::local_diverged(from_block));
+            }
+        }
 
         let mut tx_offset = 0usize;
         let mut replayed: u64 = 0;
@@ -1001,15 +1163,11 @@ where
             // there; earlier blocks stay user-tx-only.
             let is_sync_block = i == last_index;
             let block_txs: Vec<Vec<u8>> = if is_sync_block && !system_txs.is_empty() {
-                let mut combined: Vec<Vec<u8>> =
-                    Vec::with_capacity(system_txs.len() + user_txs.len());
-                for sys_tx in &system_txs {
-                    combined.push(sys_tx.to_vec());
-                }
-                for user_tx in user_txs {
-                    combined.push(user_tx.clone());
-                }
-                combined
+                // `system_txs` is now the COMPLETE interleaved Sync-block tx list
+                // (loads + their user txs + deliveries) built canonically via
+                // build_cross_chain_sync_pairs → interleave_sync_block_txs — the
+                // user txs are ALREADY in it; do NOT append user_txs again.
+                system_txs.iter().map(|b| b.to_vec()).collect()
             } else {
                 user_txs.to_vec()
             };
@@ -1050,19 +1208,44 @@ where
     async fn fetch_post_batch_entries(
         &self,
         tx_hash: B256,
+        l1_block_number: u64,
     ) -> DeriverResult<Vec<eez_evm::types::ExecutionEntrySol>> {
         use alloy_consensus::Transaction as _;
+        use alloy_eips::BlockNumberOrTag;
         use alloy_provider::{Provider as _, ProviderBuilder};
         use alloy_sol_types::SolCall;
 
         let provider = ProviderBuilder::new()
             .disable_recommended_fillers()
             .connect_http(self.inner.submitter.rpc_url());
-        let tx = provider
-            .get_transaction_by_hash(tx_hash)
+        // Fetch the postBatch tx from its L1 BLOCK (full-tx list), NOT via
+        // `eth_getTransactionByHash`. A snapshot-synced / pruned L1 — e.g. the
+        // embedded reth booted from a `--minimal` snapshot — has the BLOCK but
+        // not the historical `TransactionLookup` index, so a by-hash lookup
+        // returns None even though the block carries the tx. The block is always
+        // available (the `L1Watcher` already scanned it to surface this batch),
+        // so deriving the postBatch calldata from the block makes catch-up
+        // robust to a pruned/snapshot L1 with NO archive-node dependency — the
+        // core property that lets a wiped node re-derive purely from L1.
+        let block = provider
+            .get_block_by_number(BlockNumberOrTag::Number(l1_block_number))
+            .full()
             .await
-            .map_err(|e| DeriverError::l2_provider(format!("get_tx({tx_hash}): {e}")))?
-            .ok_or_else(|| DeriverError::l2_provider(format!("tx {tx_hash} not found on L1")))?;
+            .map_err(|e| {
+                DeriverError::l2_provider(format!("get_block({l1_block_number}): {e}"))
+            })?
+            .ok_or_else(|| {
+                DeriverError::l2_provider(format!("L1 block {l1_block_number} not found"))
+            })?;
+        let tx = block
+            .transactions
+            .txns()
+            .find(|t| *t.inner.tx_hash() == tx_hash)
+            .ok_or_else(|| {
+                DeriverError::l2_provider(format!(
+                    "postBatch tx {tx_hash} not in L1 block {l1_block_number}"
+                ))
+            })?;
         let input = tx.inner.input();
         let decoded = eez_evm::types::postAndVerifyBatchCall::abi_decode(input)
             .map_err(|e| DeriverError::l2_provider(format!("decode postBatch({tx_hash}): {e}")))?;
@@ -1077,16 +1260,11 @@ where
         let Some(cfg) = self.inner.system_tx_cfg.as_ref() else {
             return Ok(0);
         };
-        let parent_header = self
-            .inner
-            .l2_provider
-            .sealed_header(parent_block_number)
-            .map_err(DeriverError::l2_provider)?
-            .ok_or_else(|| {
-                DeriverError::l2_provider(format!(
-                    "local L2 header at parent {parent_block_number} missing"
-                ))
-            })?;
+        let parent_header = self.sealed_header_or_head(parent_block_number)?.ok_or_else(|| {
+            DeriverError::l2_provider(format!(
+                "local L2 header at parent {parent_block_number} missing"
+            ))
+        })?;
         let state = self
             .inner
             .l2_provider

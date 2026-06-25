@@ -1,20 +1,19 @@
 //! Two-stage `publicInputsHash` construction in Rust.
 //!
-//! Byte-for-byte mirror of the on-chain construction in
-//! `EEZ.sol:606-668` (`_verifyProofSystemBatch`). The composer
-//! produces these bytes off-chain, signs each per-PS digest with
-//! the proof system's authorized key, populates
-//! `ProofSystemBatchPerVerificationEntries.proofs[]`, and submits
-//! the batch. The on-chain rebuild then produces the SAME bytes —
-//! every proof verifies if and only if both sides agreed.
+//! Byte-for-byte mirror of the on-chain construction in upstream
+//! `EEZ.sol`'s `_verifyProofSystemBatch`. The composer finalizes the
+//! batch and computes these bytes; the PROVER independently recomputes
+//! and signs each per-PS digest (the composer holds no attester key);
+//! the composer's proof sink fills
+//! `ProofSystemBatchPerVerificationEntries.proofs[]` with the prover's
+//! signature and submits. The on-chain rebuild then produces the SAME
+//! bytes — every proof verifies if and only if both sides agreed.
 //!
-//! The byte-equality lock against the Solidity oracle lives at
-//! `crates/eez-evm/tests/public_inputs_hash_vectors.rs`,
-//! mirroring the `cross_chain_call_hash_vectors.rs` shape from D2.
-//! The Foundry generator script is
-//! `contracts/script/GenPublicInputsHashVectors.s.sol`.
+//! A future byte-equality lock against a Solidity oracle (analogous to
+//! `cross_chain_call_hash_vectors.rs`) belongs at
+//! `crates/eez-evm/tests/public_inputs_hash_vectors.rs`.
 //!
-//! # Construction (read off `EEZ.sol:606-668`)
+//! # Construction
 //!
 //! ```text
 //! // Step 1: per-entry / per-lookup-call atomic hashes.
@@ -65,22 +64,27 @@
 //! position-of-k-in-local-subset indexing — so the on-chain
 //! rebuild produces a byte-identical `publicInputsHash_k`. A
 //! naive `vkMatrix[r][k]` global index silently produces the
-//! wrong fold (caught in §A1 spec audit; see DERIVATION.md §6e).
+//! wrong fold.
 
-use alloy_primitives::{B256, Bytes, U256, keccak256};
-use alloy_sol_types::{SolValue, sol};
-use eez_protocol::{ProofPlan, ProofPlanInvariantError};
+use alloy_primitives::{keccak256, Bytes, B256, U256};
+use alloy_sol_types::{sol, SolValue};
+use eez_protocol::{
+    ProofPlan, ProofPlanInvariantError, RollupId, RollupProofAssignment, TimestampAndBlockHash,
+};
 
-use crate::EvmProtocol;
+use tracing::debug;
+
+use crate::batch::EvmBatch;
 use crate::types::{ExecutionEntrySol, LookupCallSol};
+use crate::EvmProtocol;
 
 // ── Per-element atomic hashes ─────────────────────────────────────
 
 /// `keccak256(abi.encode(entry))` — binds the full
 /// `ExecutionEntry` content (stateDeltas, proxyEntryHash,
 /// destinationRollupId, L2ToL1Calls, expectedL1ToL2Calls,
-/// callCount, returnData, rollingHash). Matches
-/// `EEZ.sol:619-621`.
+/// callCount, returnData, rollingHash). Matches `EEZ.sol`'s
+/// per-entry hashing.
 ///
 /// Uses `SolValue::abi_encode` (standalone encoding — the
 /// dynamic-struct offset that `abi.encode(structValue)`
@@ -91,8 +95,10 @@ pub fn entry_hash(entry: &ExecutionEntrySol) -> B256 {
 }
 
 /// `keccak256(abi.encode(lookupCall))` — same shape as
-/// [`entry_hash`] for `LookupCall` structs. Matches
-/// `EEZ.sol:624-626`.
+/// [`entry_hash`] for `LookupCall` structs. Matches `EEZ.sol`'s
+/// per-lookup hashing.
+///
+/// Internal fold step — integrators call [`public_inputs_hashes`].
 #[must_use]
 pub fn lookup_call_hash(lookup_call: &LookupCallSol) -> B256 {
     keccak256(SolValue::abi_encode(lookup_call))
@@ -106,7 +112,7 @@ pub fn lookup_call_hash(lookup_call: &LookupCallSol) -> B256 {
 ///
 /// `entry_hashes`, `lookup_call_hashes`, `blob_hashes` are the
 /// per-element atomic-hash arrays (produced by [`entry_hash`] /
-/// [`lookup_call_hash`] / `blobhash(batch.blobIndices[i])`).
+/// `lookup_call_hash` / `blobhash(batch.blobIndices[i])`).
 /// `call_data` is `batch.callData` raw bytes. `cross_ps` is the
 /// batch's `crossProofSystemInteractions` field (`bytes32(0)`
 /// for the single-PS phase).
@@ -142,7 +148,8 @@ sol! {
     /// Internal helper for the per-PS fold's `abi.encode` shape.
     /// Mirrors the positional encoding
     /// `abi.encode(acc, rollupId, vkey, blockHash, timestamp)`
-    /// EEZ.sol does at line 666.
+    /// that `EEZ.sol`'s `_verifyProofSystemBatch` performs in its
+    /// per-PS inner loop.
     struct PerPsFoldStep {
         bytes32 acc;
         uint256 rollupId;
@@ -178,13 +185,18 @@ fn position_of(k: u64, indices: &[u64]) -> Option<usize> {
 /// **Zero-attesters fall-through.** A global PS with zero
 /// attesting rollups is permitted by `EEZ.sol`'s
 /// `_validateStructure` (only `proofSystems[]` non-emptiness
-/// + each rollup's `proofSystemIndex[]` non-emptiness are
+/// plus each rollup's `proofSystemIndex[]` non-emptiness are
 /// enforced — `_validateStructure` does NOT require every
 /// global PS to be referenced by some rollup). The on-chain
 /// code still computes `publicInputsHash[k] = keccak(shared,
 /// bytes32(0))` for such a slot. This function mirrors that
 /// behavior: `acc` stays `bytes32(0)` if no rollup attests,
 /// and the function returns the resulting hash.
+///
+/// Internal fold step — integrators call [`public_inputs_hashes`] (or
+/// [`all_per_ps_hashes`]), which run `ProofPlan::check_invariants` first.
+/// This function assumes a validated plan: it indexes `per_rollup_context` /
+/// `vk_matrix` directly and would panic on a length mismatch.
 #[must_use]
 pub fn per_ps_public_inputs_hash(
     shared: B256,
@@ -224,9 +236,9 @@ pub fn per_ps_public_inputs_hash(
 /// batch.
 ///
 /// Returns `vec[k] = publicInputsHash[k]` parallel to
-/// `plan.proof_systems` (same length, same ordering). The §E
-/// submitter consumes this directly and feeds each hash to
-/// the corresponding signer.
+/// `plan.proof_systems` (same length, same ordering). The
+/// submitter consumes this directly and feeds each hash to the
+/// corresponding signer.
 ///
 /// # Errors
 ///
@@ -251,14 +263,102 @@ pub fn all_per_ps_hashes(
     let out: Vec<B256> = (0..plan.proof_systems.len() as u64)
         .map(|k| per_ps_public_inputs_hash(shared, plan, k))
         .collect();
+    // This is the ONE helper both composer and prover call, so logging here
+    // gives the publicInputsHash an audit trail on BOTH sides — an on-chain
+    // `InvalidProof`/hash-mismatch is then diagnosable from the logs.
+    debug!(
+        target: "eez::public_inputs",
+        shared = %shared,
+        entry_hashes = entry_hashes.len(),
+        lookup_call_hashes = lookup_call_hashes.len(),
+        proof_systems = plan.proof_systems.len(),
+        first_hash = ?out.first(),
+        "all_per_ps_hashes: computed publicInputsHash(es)",
+    );
     Ok(out)
+}
+
+/// Compute every per-PS `publicInputsHash` for a FINALIZED batch (proof-system
+/// carriers populated — `proofSystems`, `rollupIdsWithProofSystems`) given the
+/// single registered verification `vkey`.
+///
+/// This is the ONE place the `ProofPlan` is reconstructed from a batch, so the
+/// composer (which finalizes + submits) and the prover (which independently
+/// recomputes the hash from the batch it receives on the control feed) produce
+/// **byte-identical** hashes — the soundness invariant the on-chain
+/// `_verifyProofSystemBatch` enforces.
+///
+/// `per_rollup_context` mirrors the reference `Rollup.getTimestampAndBlockHash`
+/// for every rollup, keyed on `batch.inner.blockNumber`:
+/// - `blockNumber == 0` (timeless): `(0, 0)` — `l1_block_hash` must be `None`.
+/// - `blockNumber == N != 0` (bound): `(0, blockhash(N))` — the TIMESTAMP stays
+///   ZERO (`Rollup.sol` returns `(0, blockHash)` for a specific past block; a
+///   past timestamp is not recoverable on-chain — only the `.max` sentinel
+///   carries one, and we never operate it). `l1_block_hash` must be `Some`.
+///
+/// Any other combination is a wiring bug and errors out (fail-closed).
+/// Lookup-call and blob hashes are empty (the current L2→L1 scenario carries
+/// neither); when they appear they must be folded in on BOTH sides through this
+/// same helper.
+///
+/// # Errors
+/// Returns [`ProofPlanInvariantError`] if the reconstructed plan is malformed
+/// or the `(blockNumber, l1_block_hash)` pair is inconsistent.
+#[tracing::instrument(level = "debug", name = "public_inputs_hashes", skip_all, err)]
+pub fn public_inputs_hashes(
+    batch: &EvmBatch,
+    vkey: B256,
+    l1_block_hash: Option<B256>,
+) -> Result<Vec<B256>, ProofPlanInvariantError> {
+    let context = match (batch.inner.blockNumber, l1_block_hash) {
+        (0, None) => TimestampAndBlockHash { timestamp: [0u8; 32], block_hash: [0u8; 32] },
+        (n, Some(hash)) if n != 0 => {
+            TimestampAndBlockHash { timestamp: [0u8; 32], block_hash: hash.0 }
+        }
+        (n, h) => {
+            return Err(ProofPlanInvariantError::BlockContextMismatch {
+                block_number: n,
+                hash_supplied: h.is_some(),
+            })
+        }
+    };
+    let rollup_assignments: Vec<RollupProofAssignment> = batch
+        .inner
+        .rollupIdsWithProofSystems
+        .iter()
+        .map(|r| RollupProofAssignment {
+            rollup_id: RollupId(r.rollupId.to::<u64>()),
+            proof_system_index: r.proofSystemIndex.clone(),
+        })
+        .collect();
+    let per_rollup_context = vec![context; rollup_assignments.len()];
+    let vk_matrix: Vec<Vec<[u8; 32]>> = rollup_assignments
+        .iter()
+        .map(|a| vec![vkey.0; a.proof_system_index.len()])
+        .collect();
+    let plan = ProofPlan::<EvmProtocol> {
+        proof_systems: batch.inner.proofSystems.clone(),
+        rollup_assignments,
+        per_rollup_context,
+        vk_matrix,
+        cross_proof_system_interactions: batch.inner.crossProofSystemInteractions.0,
+    };
+    let entry_hashes: Vec<B256> = batch.inner.entries.iter().map(entry_hash).collect();
+    // The lookup calls MUST be folded in too: `EEZ._verifyProofSystemBatch` hashes
+    // `l1ToL2lookupCalls[]` into `sharedPublicInput` (EEZ.sol:584-587). Omitting them
+    // (passing `&[]`) is byte-identical for batches WITHOUT lookup calls (the success +
+    // settlement paths), but for a FAILED inbound — which carries a `LookupCall{failed}`
+    // that supplies the user's revert — the composer hash would diverge from the on-chain
+    // recompute and the prover's signature would fail `InvalidProof`. So derive them here.
+    let lookup_call_hashes: Vec<B256> =
+        batch.inner.l1ToL2lookupCalls.iter().map(lookup_call_hash).collect();
+    all_per_ps_hashes(&plan, &entry_hashes, &lookup_call_hashes, &[], &batch.inner.callData)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::address;
-    use eez_protocol::{RollupId, RollupProofAssignment, TimestampAndBlockHash};
 
     #[test]
     fn position_of_finds_existing() {
@@ -391,6 +491,80 @@ mod tests {
         assert!(matches!(
             err,
             ProofPlanInvariantError::VkMatrixOuterLength { .. }
+        ));
+    }
+
+    /// Minimal finalized batch (carriers filled) for `public_inputs_hashes`
+    /// context tests — one PS, one attesting rollup, no entries.
+    fn carrier_batch(block_number: u64) -> crate::batch::EvmBatch {
+        use crate::types::RollupIdWithProofSystemsSol;
+        let mut batch = crate::batch::EvmBatch::default();
+        batch.inner.blockNumber = block_number;
+        batch.inner.proofSystems = vec![address!("00000000000000000000000000000000000000aa")];
+        batch.inner.rollupIdsWithProofSystems =
+            vec![RollupIdWithProofSystemsSol { rollupId: U256::from(1), proofSystemIndex: vec![0] }];
+        batch
+    }
+
+    /// Bound-context fold cross-checked against the UPSTREAM test's own mirror
+    /// (`test/BlockNumberBinding.t.sol:_expectedPublicInputsHash`): for one PS
+    /// and one attesting rollup,
+    ///   `acc  = keccak256(abi.encode(bytes32(0), rid, vkey, blockHash, timestamp))`
+    ///   `hash = keccak256(abi.encodePacked(shared, acc))`
+    /// with timestamp == 0 for a specific bound block (`Rollup.sol` returns
+    /// `(0, blockhash(N))`). The expectation is HAND-ENCODED (five static
+    /// 32-byte words) — independent of the `PerPsFoldStep` sol! struct, so a
+    /// refactor that drifts the fold encoding fails here.
+    #[test]
+    fn bound_context_matches_upstream_fold_construction() {
+        let vkey = B256::repeat_byte(0x42);
+        let blockhash_n = B256::repeat_byte(0xab);
+        let batch = carrier_batch(1234);
+
+        let got = public_inputs_hashes(&batch, vkey, Some(blockhash_n)).unwrap()[0];
+
+        // shared over empty entries/lookups/blobs + empty callData + zero cross-PS.
+        let shared = shared_public_input(&[], &[], &[], &Bytes::new(), B256::ZERO);
+        // acc = keccak256(abi.encode(0, rid=1, vkey, blockhash(N), timestamp=0))
+        let mut step = [0u8; 160];
+        step[63] = 0x01; // uint256 rid = 1 (word 2, big-endian)
+        step[64..96].copy_from_slice(vkey.as_slice()); // word 3
+        step[96..128].copy_from_slice(blockhash_n.as_slice()); // word 4
+        // words 1 (acc) and 5 (timestamp) stay zero.
+        let acc = keccak256(step);
+        let mut packed = [0u8; 64];
+        packed[..32].copy_from_slice(shared.as_slice());
+        packed[32..].copy_from_slice(acc.as_slice());
+        assert_eq!(got, keccak256(packed), "fold must match the on-chain construction");
+    }
+
+    #[test]
+    fn timeless_and_bound_contexts_diverge() {
+        let vkey = B256::repeat_byte(0x42);
+        let timeless = public_inputs_hashes(&carrier_batch(0), vkey, None).unwrap()[0];
+        let bound =
+            public_inputs_hashes(&carrier_batch(7), vkey, Some(B256::repeat_byte(0xab))).unwrap()[0];
+        let bound_other =
+            public_inputs_hashes(&carrier_batch(7), vkey, Some(B256::repeat_byte(0xcd))).unwrap()[0];
+        assert_ne!(timeless, bound);
+        assert_ne!(bound, bound_other, "the hash must bind the BLOCK HASH value");
+    }
+
+    #[test]
+    fn inconsistent_block_context_is_refused() {
+        let vkey = B256::repeat_byte(0x42);
+        // Bound batch without the hash → fail-closed.
+        let err = public_inputs_hashes(&carrier_batch(7), vkey, None).unwrap_err();
+        assert!(matches!(
+            err,
+            ProofPlanInvariantError::BlockContextMismatch { block_number: 7, hash_supplied: false }
+        ));
+        // Timeless batch WITH a hash → also refused (wiring bug, not ignored).
+        let err =
+            public_inputs_hashes(&carrier_batch(0), vkey, Some(B256::repeat_byte(0x01))).unwrap_err();
+        assert!(matches!(
+            err,
+            ProofPlanInvariantError::BlockContextMismatch { block_number: 0, hash_supplied: true }
         ));
     }
 }

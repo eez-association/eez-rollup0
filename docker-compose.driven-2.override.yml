@@ -1,0 +1,26 @@
+# Second composer's eez-proverd — rename + repoint to the 2nd stack's endpoints.
+#
+# Layered AFTER docker-compose.driven.override.yml. The 2nd prover MUST attach to
+# the 2nd node's control feed (:50151) and backfill from the 2nd L2 archive
+# (:18788), NOT the first's — otherwise it attests the wrong stack's windows.
+# It signs with the SAME shared EEZ_PROOF_SIGNER_KEY (the one registered
+# authorizedSigner) and competes against the first via the same on-chain rollup.
+
+services:
+  eez-proverd:
+    container_name: eez-proverd-2
+    environment:
+      # The 2nd node's ProverDispatch + ProofSink (must match
+      # EEZ_CONTROL_RPC_PORT=50151 on eez-node-chiado-2).
+      EEZ_CONTROL_RPC_URL: "http://127.0.0.1:50151"
+      # Backfill from the 2nd L2 archive (debug_* on :18788).
+      EEZ_L2_RPC_URL: "http://127.0.0.1:18788"
+    # The --control-addr arg is ALSO set in the base driven override; restate the
+    # full command so it points at :50151 (compose replaces the command list).
+    command:
+      - "--control-addr"
+      - "http://127.0.0.1:50151"
+      - "--validator-bin"
+      - "/usr/local/bin/native-validate"
+      - "--chain-config"
+      - "/app/l2-chainconfig.json"

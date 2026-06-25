@@ -28,6 +28,13 @@ FROM chef AS builder
 COPY --from=planner /build/recipe.json recipe.json
 # Slow, cache-friendly layer: only re-runs when the dep graph changes.
 RUN cargo chef cook --release --recipe-path recipe.json
+# protoc for tonic-prost-build: eez-control-rpc/build.rs compiles
+# proto/control.proto (the composer→prover control feed). Installed AFTER the
+# cook layer — workspace members are stubbed during `cargo chef cook`, so the
+# proto build only runs in the final eez-node layer — which keeps the heavy
+# cooked-deps cache warm across this change.
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 # Workspace sources; only this layer rebuilds on first-party code changes.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates

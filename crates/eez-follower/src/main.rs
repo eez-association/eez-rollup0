@@ -86,6 +86,7 @@ fn main() -> eyre::Result<()> {
             initial_header,
             beacon_engine_handle,
             payload_builder_handle,
+            None, // follower validates derived blocks; no prover-feed witness
         );
 
         let l1_head = Arc::new(L1CanonicalHead::default());

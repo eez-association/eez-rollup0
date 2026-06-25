@@ -54,6 +54,27 @@ services:
       # Cross-chain wiring.
       EEZ_CCM_L2_ADDRESS: "0x4200000000000000000000000000000000000007"
       EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS: "10200"
+      # OUTBOUND (L2->L1) classifier: a tx whose `to` is in this set is held
+      # and composed as an outbound cross-chain call. P below =
+      # computeCrossChainProxyAddress(L1 Value 0xC795..899A, MAINNET=0) for the
+      # live outbound test (scripts/outbound-test-live.sh).
+      EEZ_CROSS_CHAIN_PROXY_ADDRESSES: "0xDFCc51C3d6Ce4e8f135cA257752729E17afD5B65"
+      # OUTBOUND admission now validates against L2, not L1: an outbound held
+      # tx is an L2 tx (to = an L2 cross-chain proxy) that EXECUTES ON L2 in
+      # the Sync block with the sender's L2 nonce + L2 balance — it is never
+      # submitted to L1, so its nonce/balance must be read from L2. The ingress
+      # gate reads them from EEZ_L2_RPC_URL; unset → default http://127.0.0.1:18688
+      # (the L2 RPC served just below, reachable in-container via network_mode:
+      # host). INBOUND admission is unchanged (validated against L1).
+      # EEZ_L2_RPC_URL: http://127.0.0.1:18688
+      # B0 — the wallet-correct L1->L2 interceptor front (forwards eth_* to the
+      # embedded chiado L1 on :18645, intercepts sendRawTransaction to an
+      # authorized L1 cross-chain proxy on EEZ_REGISTRY_ADDRESS). Point an L1
+      # wallet here instead of the :18688 chain-id hack.
+      # NOT 18646: in the embedded-L1 topology reth reserves http_port (18645)
+      # AND http_port+1 (18646 = WS, see l1_embedded.rs) — the interceptor must
+      # use a port clear of the embedded L1 (18645/46), its auth (18551) and L2.
+      EEZ_L1_INTERCEPTOR_PORT: "18649"
       # Deterministic L1-anchored timings (must match any follower).
       EEZ_L1_BLOCK_TIME_MS: "5000"
       EEZ_L2_BLOCK_TIME_MS: "1000"
@@ -64,7 +85,7 @@ services:
       # L2.
       EEZ_L2_DATADIR: /l2
       EEZ_L2_GENESIS_PATH: /app/genesis.json
-      EEZ_INITIAL_STATE_ROOT: "0x5aab3b1dfa6fe9d89126e001b8fc4d9ed65c80174760e5019cb5b68b7467bd94"
+      EEZ_INITIAL_STATE_ROOT: "0xdd37fe70238cd4ecb3f52e3f5d4d1bdff34f996160f1940a3ee6e00be8e5f3f2"
     volumes:
       - ${L1_SNAPSHOT_DIR:?set L1_SNAPSHOT_DIR (reth download target)}:/l1
       - ${L2_DATA_DIR:?set L2_DATA_DIR}:/l2
@@ -81,7 +102,9 @@ services:
       - --http
       - --http.addr=0.0.0.0
       - --http.port=18688
-      - --http.api=eth,net,web3
+      # `debug` enables debug_executionWitness + debug_getRawBlock on :18688,
+      # the L2 archive source eez-proverd durably backfills replay-gap blocks from.
+      - --http.api=eth,net,web3,debug
       - --authrpc.addr=127.0.0.1
       - --authrpc.port=18684
       - --port=30640
