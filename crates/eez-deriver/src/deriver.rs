@@ -146,10 +146,9 @@ where
         self.inner.l1_head.cursor()
     }
 
-    /// Sync local state with L1's confirmed batch history from the
-    /// registry deploy block: walks past `BatchPosted` in tx-order,
-    /// skips losers via `state_applied`, STF-replays non-matching L2
-    /// blocks, and populates `L1CanonicalHead`.
+    /// Sync local state with L1's confirmed batch history from the registry
+    /// deploy block onward, replaying non-matching L2 blocks and populating
+    /// `L1CanonicalHead`.
     ///
     /// # Errors
     ///
@@ -163,27 +162,10 @@ where
         self.sync_batches(self.inner.deploy_block, 0).await
     }
 
-    /// Reorg-aware recovery re-sync for gaps where the deriver cannot
-    /// trust its event stream: a failed `BatchPosted`, a lagged
-    /// (dropped) event, or the boot window before [`Self::run`]
-    /// subscribes.
-    ///
-    /// Two phases:
-    /// 1. [`Self::revalidate_index_tail`] drops indexed batches whose
-    ///    L1 block is no longer canonical. This is the missed-reorg
-    ///    case: block number + tx hash are not enough once the event
-    ///    carrying the common ancestor was lost.
-    /// 2. If the cursor retreated, [`Self::retreat_l2_to_cursor`]
-    ///    moves reth's safe/finalized/head anchors back before any
-    ///    replacement branch is replayed.
-    /// 3. [`Self::sync_batches_inner`] re-scans L1 from the surviving
-    ///    anchor (full history when nothing survives), reconciles
-    ///    whatever isn't indexed yet, then advances safe/finalized
-    ///    forward for new batches.
-    ///
-    /// Without phase 1, a forward-only rescan trusts a poisoned index:
-    /// it stacks new-chain batches on top of rolled-out ones at the
-    /// wrong L2 heights and replays blocks that exist on no other node.
+    /// Reorg-aware recovery re-sync for gaps the event stream can't be
+    /// trusted across (failed/dropped `BatchPosted`, or the boot window):
+    /// drops index entries no longer canonical on L1, retreats the L2
+    /// anchors if the cursor moved back, then re-scans L1 from the survivor.
     ///
     /// # Errors
     ///
@@ -202,13 +184,11 @@ where
         }
     }
 
-    /// Phase 1 of [`Self::recovery_resync`]: walk the index tail
-    /// backward, dropping batches whose recorded L1 block hash is no
-    /// longer the canonical hash at that height. Returns the L1 block
-    /// of the highest still-canonical indexed batch — the lower bound
-    /// for the forward rescan — or `None` if the index is (or became)
-    /// empty. Caller holds the reconcile lock because this mutates the
-    /// shared cursor/index that Sequencer scheduling reads.
+    /// Phase 1 of [`Self::recovery_resync`]: walk the index tail backward,
+    /// dropping batches whose recorded L1 hash is no longer canonical.
+    /// Returns the highest still-canonical batch's L1 block (the rescan
+    /// lower bound), or `None` if the index is empty. Caller holds the
+    /// reconcile lock.
     async fn revalidate_index_tail(&self) -> DeriverResult<Option<u64>> {
         while let Some(tail) = self.inner.l1_head.last_indexed() {
             let canonical = self
@@ -240,13 +220,10 @@ where
         Ok(None)
     }
 
-    /// Shared body of [`Self::catch_up`] / [`Self::recovery_resync`]:
-    /// scan `BatchPosted` from `from_l1_block`, reconcile each not-yet-
-    /// indexed winner with L2-range accounting starting at
-    /// `cumulative_start` (the L2 block confirmed just before the scan
-    /// window), then advance the safe/finalized anchors. Batches whose
-    /// tx hash is already indexed are skipped entirely — their L2
-    /// ranges are covered by `cumulative_start`.
+    /// Shared body of [`Self::catch_up`] / [`Self::recovery_resync`]: scan
+    /// `BatchPosted` from `from_l1_block`, reconcile not-yet-indexed winners
+    /// with L2-range accounting from `cumulative_start`, then advance the
+    /// safe/finalized anchors.
     async fn sync_batches(&self, from_l1_block: u64, cumulative_start: u64) -> DeriverResult<()> {
         let _guard = self.inner.committer.begin_reconcile().await;
         self.sync_batches_inner(from_l1_block, cumulative_start)
@@ -310,12 +287,10 @@ where
             let batch_first_l2 = cumulative_l2 + 1;
             let batch_last_l2 = cumulative_l2 + decoded.block_count() as u64;
 
-            // Cursor-alignment guard, same as on_batch_posted's: a
-            // winning batch's claimed `currentState` must equal our
-            // state root at the height we're about to stack it on. A
-            // mismatch means this scan is misaligned with L1 — replaying
-            // here would commit blocks that exist on no other node, so
-            // bail *before* touching reth rather than after.
+            // Cursor-alignment guard (as in on_batch_posted): the batch's
+            // claimed `currentState` must equal our state root here, else
+            // this scan is misaligned with L1 — bail before replaying onto
+            // blocks that exist on no other node.
             if let Some(claimed_current) = batch.claimed_current_state {
                 let local_root = self.l2_state_root_at(cumulative_l2)?;
                 if local_root != claimed_current {
@@ -619,10 +594,9 @@ where
                             );
                             return;
                         }
-                        // A dropped event would leave `last_indexed_l2`
-                        // permanently behind L1 — every later batch
-                        // would replay at the wrong heights. Re-anchor
-                        // from L1 before processing further events.
+                        // A dropped event leaves `last_indexed_l2` behind
+                        // L1, so later batches replay at the wrong heights —
+                        // re-anchor from L1 first.
                         event!(
                             name: "eez.deriver.event.failed",
                             Level::WARN,
@@ -657,11 +631,9 @@ where
         }
     }
 
-    /// Post-failure recovery: bounded [`Self::recovery_resync`] from
-    /// the last indexed batch. Returns `false` iff the committer is
-    /// gone and the event loop must exit. A failed resync is logged and
-    /// retried after the next L1 event — events keep arriving on every
-    /// batch, so recovery is re-attempted at batch cadence.
+    /// Post-failure recovery via [`Self::recovery_resync`]. Returns `false`
+    /// only when the committer is gone and the loop must exit; a failed
+    /// resync is logged and retried at the next L1 event.
     async fn try_recover(&self) -> bool {
         match self.recovery_resync().await {
             Ok(()) => {
@@ -837,13 +809,10 @@ where
         let from_block = last_indexed_l2 + 1;
         let to_block = last_indexed_l2 + block_count;
 
-        // Cursor-alignment guard: a winning batch's claimed
-        // `currentState` must equal our state root at the cursor
-        // height. A mismatch means the local index is misaligned with
-        // L1 (e.g., an earlier event was dropped) — replaying this
-        // batch's txs at our cursor heights would commit blocks that
-        // exist on no other node. Bail out; the run-loop resync
-        // re-anchors the cursor from L1.
+        // Cursor-alignment guard: the batch's claimed `currentState` must
+        // equal our state root at the cursor, else the local index is
+        // misaligned with L1 (e.g. a dropped event) — bail and let the
+        // run-loop resync re-anchor.
         if let Some(claimed_current) = claimed_current_state {
             let local_root = self.l2_state_root_at(last_indexed_l2)?;
             if local_root != claimed_current {
@@ -936,10 +905,8 @@ where
         new_head_number: u64,
         new_head_hash: B256,
     ) -> DeriverResult<()> {
-        // Delivered Reorg events already carry the surviving canonical
-        // L1 ancestor. Hash-tail auditing is reserved for missed reorgs
-        // (broadcast lag / recovery), where that ancestor event was not
-        // delivered and number-only indexed batches may be stale.
+        // Delivered Reorg events already carry the surviving canonical L1
+        // ancestor; hash-tail auditing is reserved for missed reorgs.
         let _guard = self.inner.committer.begin_reconcile().await;
 
         let old_cursor = self.inner.l1_head.cursor();
@@ -980,17 +947,15 @@ where
     }
 
     /// Retreat reth's safe/finalized anchors and canonical head to the
-    /// current L1-derived cursor. Caller must hold the reconcile lock so
-    /// the Sequencer cannot extend the branch between the two
-    /// forkchoice updates.
+    /// L1-derived cursor. Caller holds the reconcile lock so the Sequencer
+    /// can't extend the branch between the two forkchoice updates.
     async fn retreat_l2_to_cursor(&self, cursor: u64) -> DeriverResult<B256> {
         let safe_header = self.l2_sealed_header_at(cursor)?;
         let safe_hash = safe_header.hash();
         let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
 
-        // Order matters: retreat safe/finalized first while the old
-        // head is still canonical, then roll head back to the same
-        // surviving L2 block and repair the committer's parent mirror.
+        // Order matters: retreat safe/finalized first while the old head is
+        // still canonical, then roll head back and repair the parent mirror.
         self.inner
             .committer
             .advance_safe_finalized(safe_header.clone(), finalized_hash)

@@ -225,9 +225,8 @@ impl Submitter {
             .collect())
     }
 
-    /// Hash of the canonical L1 block at `number`, or `None` if L1 has
-    /// no block at that height. Used by the Deriver's resync to check
-    /// whether an indexed batch's L1 block is still canonical.
+    /// Hash of the canonical L1 block at `number`, or `None` if none. Used by
+    /// the Deriver's resync to check whether an indexed batch is still canonical.
     ///
     /// # Errors
     ///

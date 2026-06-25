@@ -301,6 +301,7 @@ struct RollupConfig {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_field_names)]
 struct TimingConfig {
     l1_block_time_ms: Option<u32>,
     l2_block_time_ms: Option<u32>,
@@ -323,6 +324,7 @@ struct SystemTxConfig {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_field_names)]
 struct KeysConfig {
     l1_poster_key: Option<String>,
     proof_signer_key: Option<String>,

@@ -5,11 +5,12 @@
 //! reth to point unsafe head at the sequencer's latest block while that
 //! head remains compatible with the L1-derived anchors.
 //!
-//! Compatibility is enforced here, not delegated to reth: the engine
-//! only requires safe/finalized to be known headers, so it can
-//! canonicalize a head whose ancestry conflicts with our safe block.
-//! Before every forkchoice update we walk the candidate's locally-known
-//! ancestry down to the safe height and reject proven conflicts.
+//! Compatibility is enforced here, not by reth: the engine only requires
+//! safe/finalized to be *known*, so it would canonicalize a head whose
+//! ancestry conflicts with our safe block. Before each FCU we accept heads
+//! already on the local canonical chain, otherwise walk the candidate's local
+//! ancestry to the safe height and reject proven conflicts; unverifiable
+//! (unsynced) ancestry stays optimistic.
 
 use std::time::Duration;
 
@@ -26,9 +27,8 @@ use tracing::{Level, event};
 /// engine view does not drift during quiet periods.
 const FCU_REFRESH: Duration = Duration::from_secs(1);
 
-/// Upper bound on the candidate-to-safe ancestry walk. Far above the
-/// sequencer's speculative-depth cap; a longer gap with fully local
-/// ancestry is treated as unverifiable rather than scanned unboundedly.
+/// Upper bound on the candidate→safe ancestry walk. Beyond this, a fully
+/// local gap is treated as unverifiable rather than scanned unboundedly.
 const MAX_ANCESTRY_WALK: u64 = 1024;
 
 #[derive(Debug, Error)]
@@ -190,13 +190,10 @@ where
         }
     }
 
-    /// Checks whether `candidate` (with hash `candidate_hash`) descends
-    /// from the current safe block by walking its `parent_hash` links
-    /// through locally-known headers down to the safe height.
-    ///
-    /// In steady state this is O(1): the candidate is one block ahead of
-    /// the previously synced chain, so the walk either resolves at the
-    /// first lookup or misses it.
+    /// Checks whether `candidate` descends from the current safe block. Steady
+    /// state O(1): if the candidate is already local canonical, the local
+    /// forkchoice invariant proves it extends safe; otherwise the first parent
+    /// lookup usually resolves or misses (unverifiable).
     fn check_extends_safe(
         &self,
         candidate: &alloy_consensus::Header,
@@ -226,14 +223,17 @@ where
         if candidate.number < safe_number {
             return Ok(SafeCompat::Conflicts);
         }
-        if candidate.number - safe_number > MAX_ANCESTRY_WALK
-            && self
-                .local
-                .sealed_header(candidate.number)
-                .map_err(|e| {
-                    FollowerError::Provider(format!("sealed_header({}): {e}", candidate.number))
-                })?
-                .is_some_and(|local| local.hash() == candidate_hash)
+
+        // If reth already has this exact block on its canonical chain, it must
+        // extend the local safe anchor. Otherwise, walk the candidate's explicit
+        // parent-hash chain below.
+        if self
+            .local
+            .sealed_header(candidate.number)
+            .map_err(|e| {
+                FollowerError::Provider(format!("sealed_header({}): {e}", candidate.number))
+            })?
+            .is_some_and(|local| local.hash() == candidate_hash)
         {
             return Ok(SafeCompat::Extends);
         }
