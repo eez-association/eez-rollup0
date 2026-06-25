@@ -917,7 +917,7 @@ where
         if new_cursor >= old_cursor {
             event!(
                 name: "eez.deriver.l1.reorg.noop",
-                Level::DEBUG,
+                Level::WARN,
                 common_ancestor_number,
                 old_head_hash = %old_head_hash,
                 new_head_number,
