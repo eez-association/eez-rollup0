@@ -165,7 +165,7 @@ async fn happy_case_builder_sustained() {
         .wait_for_l1_blocks(2, Duration::from_secs(15))
         .await
         .unwrap();
-    let _node = NodeHandle::spawn(datadir.path(), &env).unwrap();
+    let node = NodeHandle::spawn(datadir.path(), &env).unwrap();
 
     // After restart, the *only* check that doesn't depend on user txs hitting
     // the L2 (which the dev chain has none of) is forward progress on
@@ -199,8 +199,8 @@ async fn happy_case_builder_sustained() {
 
     // Phase 3 — follower full-replay. Spawn a fresh-datadir node with
     // sequencer + composer disabled; `Deriver::catch_up` must rebuild
-    // state from L1 events alone and land on a stateRoot the contract
-    // has attested.
+    // state from L1 events alone, land on a stateRoot the contract
+    // has attested, and agree with the restarted node's safe block hash.
     let mut follower_env = env;
     follower_env.push(("EEZ_SEQUENCER_DISABLED", "1".to_string()));
     follower_env.push(("EEZ_COMPOSER_DISABLED", "1".to_string()));
@@ -210,6 +210,9 @@ async fn happy_case_builder_sustained() {
     wait_for_node_caught_up(&follower, &chain, DEFAULT_TIMEOUT)
         .await
         .expect("follower did not catch up via L1 replay");
+    wait_for_safe_prefix_convergence(&[&node, &follower], n_after as u64, DEFAULT_TIMEOUT)
+        .await
+        .expect("restarted node and replay follower did not converge on safe block hashes");
     follower.assert_no_process_death();
 }
 
@@ -308,7 +311,7 @@ async fn failure_prover_signer_mismatch() {
 /// background collector sends real L2 state-changing txs so batches
 /// carry content (exercises receipt pruning, state-trie writes, and
 /// txpool reorg paths that empty batches skip). After ≥4 batches land
-/// we call `anvil_reorg(depth=3)` and verify four invariants:
+/// we call `anvil_reorg(depth=3)` and verify five invariants:
 ///
 /// **I1 — No process death.** Neither node logs `Fatal` /
 /// `UnexpectedStaticFile`. Without this every other check is moot.
@@ -329,7 +332,11 @@ async fn failure_prover_signer_mismatch() {
 /// honest restatement: "this node has imported a block whose stateRoot
 /// the contract has, at some point, attested as canonical."
 ///
-/// **I4 — Liveness.** Post-reorg batches landed (`batches_posted` grew
+/// **I4 — Same safe block hash.** The two nodes converge on an identical
+/// safe block hash after reorg recovery. This is stronger than stateRoot
+/// equality: empty or equivalent-state blocks can still diverge by hash.
+///
+/// **I5 — Liveness.** Post-reorg batches landed (`batches_posted` grew
 /// past the pre-reorg snapshot). Proves the chain didn't freeze on the
 /// rewound state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -373,7 +380,7 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     // and only re-grow as composers repost.
     harness.anvil.reorg(3).await.unwrap();
 
-    // I4 — Liveness FIRST: wait for `batchesPosted` to climb past the
+    // I5 — Liveness FIRST: wait for `batchesPosted` to climb past the
     // pre-reorg count. Without this, I3 below could trivially succeed
     // against the rewound state (a stale equality, not catch-up).
     chain
@@ -390,6 +397,11 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     wait_for_node_caught_up(&c2, &chain, DEFAULT_TIMEOUT)
         .await
         .expect("c2 did not catch up to contract post-reorg");
+
+    // I4 — The nodes agree on block hashes, not only state roots.
+    wait_for_safe_prefix_convergence(&[&c1, &c2], (pre_batches + 1) as u64, DEFAULT_TIMEOUT)
+        .await
+        .expect("composers did not converge on post-reorg safe block hashes");
 
     // I2 — Both derivers logged reorg handling.
     c1.assert_reorg_seen();
