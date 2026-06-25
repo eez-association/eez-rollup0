@@ -140,6 +140,7 @@ fn build_network_rpc_args(cfg: &EmbeddedL1Config) -> Result<(NetworkArgs, RpcSer
         http_port: cfg.http_port,
         ws_port,
         auth_port: cfg.auth_port,
+        ipcdisable: true,
         ..RpcServerArgs::default()
     };
     Ok((network_args, rpc_args))
