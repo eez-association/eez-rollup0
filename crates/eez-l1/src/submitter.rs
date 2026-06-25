@@ -816,6 +816,9 @@ mod tests {
     /// No settlement for our rollup in the block at all → unsettled.
     #[test]
     fn no_block_settlements_is_unsettled() {
-        assert_eq!(attribute_settlement(&[B256::repeat_byte(1)], None), (0, None));
+        assert_eq!(
+            attribute_settlement(&[B256::repeat_byte(1)], None),
+            (0, None)
+        );
     }
 }
