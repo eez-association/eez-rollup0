@@ -81,7 +81,20 @@ impl ControlPublisher {
     /// the window's first block.
     #[must_use]
     pub fn new(blocks_per_slot: u64) -> Arc<Self> {
-        let max_events = usize::try_from(2 * blocks_per_slot + 8).unwrap_or(usize::MAX).max(16);
+        // Floor the replay horizon high enough that a far-behind prover
+        // recovering a large from-genesis backlog still finds its directive's
+        // SETTLING event in the ring at (re)subscribe time. A settling
+        // composition is NEVER reconstructable by backfill (interior blocks
+        // carry composition=None — see `backfill_block`), so once the ring
+        // evicts a dispatched window's to_block before the prover subscribes,
+        // that window can never attest — the "streamed past the directive
+        // without a settling composition" stall. ~8k events (~57MB at the
+        // observed ~7KB/event, well under RING_MAX_BYTES) buys hours of horizon;
+        // steady state is unaffected (the ring merely retains more history, and
+        // RING_MAX_BYTES still bounds the memory).
+        let max_events = usize::try_from(2 * blocks_per_slot + 8)
+            .unwrap_or(usize::MAX)
+            .max(8_192);
         let (tx, _) = broadcast::channel(LIVE_CAPACITY);
         Arc::new(Self {
             ring: Mutex::new(Ring {
