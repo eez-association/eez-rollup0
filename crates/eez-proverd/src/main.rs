@@ -1497,41 +1497,63 @@ async fn main() -> eyre::Result<()> {
                                 );
                                 let t_backfill = Instant::now();
                                 let mut backfill_ok = true;
-                                for n in expected..got {
-                                    match backfill_block(url, n).await {
-                                        Ok(ev) => {
-                                            // Cross-chunk hash continuity for the
-                                            // FIRST backfilled block (n == expected):
-                                            // it must chain from the previous chunk's
-                                            // last hash. Subsequent backfilled blocks
-                                            // chain to each other via the intra-window
-                                            // guard once pushed.
-                                            if n == expected {
-                                                if let Some(prev_hash) =
-                                                    prev_chunk_last_hash.as_deref()
-                                                {
-                                                    if ev.parent_hash != prev_hash {
-                                                        error!(
-                                                            block = n,
-                                                            "cross-chunk block-hash break: first backfilled block's parent_hash != previous chunk's last block hash; dropping the batch",
-                                                        );
-                                                        backfill_ok = false;
-                                                        break;
-                                                    }
-                                                }
+                                'fill: for n in expected..got {
+                                    // Witness reconstruction over RPC transiently
+                                    // fails under L2-node load (MDBX read-tx
+                                    // timeout, a restarting/compacting node). A
+                                    // SINGLE flaky block must NOT discard the
+                                    // thousands already fetched and force a
+                                    // re-backfill from genesis — retry the block
+                                    // with backoff (giving the node a breather)
+                                    // before giving up on the whole batch.
+                                    let mut attempt = 0u32;
+                                    let ev = loop {
+                                        match backfill_block(url, n).await {
+                                            Ok(ev) => break ev,
+                                            Err(e) if attempt < 6 => {
+                                                attempt += 1;
+                                                warn!(
+                                                    block = n,
+                                                    attempt,
+                                                    error = %e,
+                                                    "backfill block failed — retrying with backoff (transient L2-archive error)",
+                                                );
+                                                tokio::time::sleep(
+                                                    std::time::Duration::from_millis(
+                                                        300u64 << attempt.min(5),
+                                                    ),
+                                                )
+                                                .await;
                                             }
-                                            window.push(ev);
+                                            Err(e) => {
+                                                error!(
+                                                    block = n,
+                                                    error = %e,
+                                                    "backfill FAILED after retries — dropping the batch (retry on replay); cursor NOT advanced",
+                                                );
+                                                backfill_ok = false;
+                                                break 'fill;
+                                            }
                                         }
-                                        Err(e) => {
-                                            error!(
-                                                block = n,
-                                                error = %e,
-                                                "backfill FAILED — dropping the batch (retry on replay); cursor NOT advanced",
-                                            );
-                                            backfill_ok = false;
-                                            break;
+                                    };
+                                    // Cross-chunk hash continuity for the FIRST
+                                    // backfilled block (n == expected): it must chain
+                                    // from the previous chunk's last hash. Subsequent
+                                    // backfilled blocks chain to each other via the
+                                    // intra-window guard once pushed.
+                                    if n == expected {
+                                        if let Some(prev_hash) = prev_chunk_last_hash.as_deref() {
+                                            if ev.parent_hash != prev_hash {
+                                                error!(
+                                                    block = n,
+                                                    "cross-chunk block-hash break: first backfilled block's parent_hash != previous chunk's last block hash; dropping the batch",
+                                                );
+                                                backfill_ok = false;
+                                                break 'fill;
+                                            }
                                         }
                                     }
+                                    window.push(ev);
                                 }
                                 if !backfill_ok {
                                     window.clear();
