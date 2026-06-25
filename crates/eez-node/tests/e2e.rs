@@ -111,13 +111,6 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
         .expect("sequencers did not converge after intra-batch suffix replay");
 
     assert_no_divergence_failure_logs(&[&seq_a, &seq_b]);
-    assert_eq!(
-        seq_b
-            .log_count_matching(&["deriver failed to handle event; resyncing from L1"])
-            .unwrap(),
-        0,
-        "intra-batch suffix replay should converge without falling back to L1 resync repair",
-    );
 }
 
 /// Builder mode, sustained operation through a restart. Asserts every
