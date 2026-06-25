@@ -1648,6 +1648,7 @@ where
                 self.spawn_deferred_post(
                     rollup_id,
                     sync_height,
+                    rollup.l1_head.cursor(),
                     *batch,
                     public_inputs_hash,
                     survivor_raws,
@@ -1779,6 +1780,7 @@ where
                 self.spawn_deferred_post(
                     rollup_id,
                     sync_height,
+                    rollup.l1_head.cursor(),
                     *batch,
                     public_inputs_hash,
                     Vec::new(),
@@ -1854,6 +1856,7 @@ where
         &self,
         rollup_id: u64,
         sync_height: u64,
+        posted: u64,
         mut batch: eez_evm::EvmBatch,
         public_inputs_hash: B256,
         survivor_raws: Vec<Bytes>,
@@ -1884,8 +1887,26 @@ where
             // recomputed publicInputsHash). The ProofSink only records a
             // signature AFTER it has verified ecrecover == the registered
             // attester, so any entry here is already trustworthy.
+            // Scale the attestation wait with the backlog width. A fixed 30s
+            // poll is fine in steady state (the prover attests a small window in
+            // seconds), but after a settlement freeze the prover must
+            // RECONSTRUCT the witnesses for a large `[posted+1 .. sync_height]`
+            // backlog from the L2 archive — two RPC round-trips per block
+            // (debug_executionWitness + debug_getRawBlock). Measured ~109ms/block
+            // and CLIMBING as the node fills (the native re-execution itself is
+            // ~0.25ms/block — the witness SOURCING dominates, not the prover).
+            // Abandoning before the backfill finishes means `posted` never
+            // advances and the next directive re-dictates from genesis — a
+            // bootstrap livelock. Budget ~400ms/block (≈3.7x the measured rate,
+            // headroom for the climb) + a 30s base, each poll 200ms; cap at 90min
+            // so a genuinely dead prover still recovers in bounded time. Once the
+            // first batch posts, `posted` jumps to the backlog tip and every
+            // later window is small (witness ships live) — the budget is only
+            // ever exercised on a cold bootstrap.
+            let backlog = sync_height.saturating_sub(posted);
+            let max_polls = (150u64 + backlog.saturating_mul(2)).min(27_000);
             let mut sig = None;
-            for _ in 0..150 {
+            for _ in 0..max_polls {
                 if let Some(s) = store
                     .lock()
                     .ok()
