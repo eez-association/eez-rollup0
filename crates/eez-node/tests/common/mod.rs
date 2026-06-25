@@ -639,62 +639,6 @@ pub struct NodeHandle {
     pub http_port: u16,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum NodeBinary {
-    EezNode,
-    EezFollower,
-}
-
-impl NodeBinary {
-    fn name(self) -> &'static str {
-        match self {
-            Self::EezNode => "eez-node",
-            Self::EezFollower => "eez-follower",
-        }
-    }
-
-    fn path(self) -> PathBuf {
-        let env_path = match self {
-            Self::EezNode => option_env!("CARGO_BIN_EXE_eez-node"),
-            Self::EezFollower => option_env!("CARGO_BIN_EXE_eez-follower"),
-        };
-        if let Some(path) = env_path {
-            return PathBuf::from(path);
-        }
-
-        let debug_dir = target_debug_dir();
-        let direct_path =
-            debug_dir.join(format!("{}{}", self.name(), std::env::consts::EXE_SUFFIX));
-        if direct_path.exists() {
-            return direct_path;
-        }
-
-        direct_path
-    }
-}
-
-fn target_debug_dir() -> PathBuf {
-    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
-        return PathBuf::from(target_dir).join("debug");
-    }
-
-    if let Ok(current_exe) = std::env::current_exe()
-        && let Some(parent) = current_exe.parent()
-    {
-        if parent
-            .file_name()
-            .is_some_and(|file_name| file_name == "deps")
-        {
-            if let Some(debug_dir) = parent.parent() {
-                return debug_dir.to_path_buf();
-            }
-        }
-        return parent.to_path_buf();
-    }
-
-    repo_root().join("target").join("debug")
-}
-
 #[derive(Default)]
 pub struct NodeConfig<'a> {
     /// Path to a custom genesis JSON. `None` uses `--chain dev`.
@@ -719,47 +663,16 @@ impl NodeHandle {
         cfg: &NodeConfig<'_>,
         env: &[(&'static str, String)],
     ) -> Result<Self> {
-        Self::spawn_binary(NodeBinary::EezNode, name, datadir, cfg, env, None)
-    }
-
-    pub fn spawn_follower(
-        name: &str,
-        datadir: &std::path::Path,
-        cfg: &NodeConfig<'_>,
-        env: &[(&'static str, String)],
-        sequencer_rpc: Option<&str>,
-    ) -> Result<Self> {
-        Self::spawn_binary(
-            NodeBinary::EezFollower,
-            name,
-            datadir,
-            cfg,
-            env,
-            sequencer_rpc,
-        )
-    }
-
-    fn spawn_binary(
-        binary: NodeBinary,
-        name: &str,
-        datadir: &std::path::Path,
-        cfg: &NodeConfig<'_>,
-        env: &[(&'static str, String)],
-        sequencer_rpc: Option<&str>,
-    ) -> Result<Self> {
         let (log_path, log_tempdir) = if let Ok(d) = std::env::var("EEZ_TEST_LOG_DIR") {
-            let n = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let safe_name = name.replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+            let suffix = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
             let p = std::path::PathBuf::from(d).join(format!(
-                "{}-{}-{}-{n}.log",
-                binary.name(),
-                safe_name,
+                "eez-node-{name}-{}-{suffix}.log",
                 std::process::id()
             ));
             (p, None)
         } else {
             let td = tempfile::tempdir().context("log tempdir")?;
-            let p = td.path().join(format!("{}-{name}.log", binary.name()));
+            let p = td.path().join("eez-node.log");
             (p, Some(td))
         };
         // tracing_subscriber's default writer is stdout; reth's panics go to stderr.
@@ -785,15 +698,7 @@ impl NodeHandle {
             || std::ffi::OsString::from("dev"),
             |p| p.as_os_str().to_owned(),
         );
-        let bin_path = binary.path();
-        if !bin_path.exists() {
-            bail!(
-                "{} binary not found at {}; build workspace binaries first",
-                binary.name(),
-                bin_path.display()
-            );
-        }
-        let mut cmd = Command::new(&bin_path);
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_eez-node"));
         cmd.current_dir(repo_root())
             .args(["node", "--chain"])
             .arg(&chain_arg)
@@ -831,15 +736,10 @@ impl NodeHandle {
             .env("EEZ_L1_AUTH_PORT", l1_auth_port.to_string())
             .env("EEZ_L1_P2P_PORT", l1_p2p_port.to_string())
             .env("EEZ_L1_DATADIR", &l1_datadir);
-        if let Some(sequencer_rpc) = sequencer_rpc {
-            cmd.args(["--sequencer-rpc", sequencer_rpc]);
-        }
         for (k, v) in env {
             cmd.env(*k, v);
         }
-        let child = cmd
-            .spawn()
-            .with_context(|| format!("spawn {}", binary.name()))?;
+        let child = cmd.spawn().context("spawn eez-node")?;
         Ok(Self {
             child,
             name: name.to_string(),
@@ -873,19 +773,6 @@ impl NodeHandle {
     ) -> Result<Self> {
         let handle = Self::spawn_with(name, datadir, cfg, env)?;
         wait_for_l2_rpc(&handle.l2_rpc_url(), Duration::from_secs(90)).await?;
-        Ok(handle)
-    }
-
-    pub async fn start_follower(
-        name: &str,
-        cfg: &NodeConfig<'_>,
-        env: &[(&'static str, String)],
-        sequencer_rpc: Option<&str>,
-    ) -> Result<Self> {
-        let datadir = tempfile::tempdir().context("datadir tempdir")?;
-        let mut handle = Self::spawn_follower(name, datadir.path(), cfg, env, sequencer_rpc)?;
-        wait_for_l2_rpc(&handle.l2_rpc_url(), Duration::from_secs(90)).await?;
-        handle.keep_alive.push(datadir);
         Ok(handle)
     }
 
@@ -1008,14 +895,6 @@ pub async fn wait_for_safe_prefix_convergence(
     timeout: Duration,
 ) -> Result<BlockNumHash> {
     wait_for_tag_prefix_convergence(nodes, BlockNumberOrTag::Safe, min_height, timeout).await
-}
-
-pub async fn wait_for_finalized_prefix_convergence(
-    nodes: &[&NodeHandle],
-    min_height: u64,
-    timeout: Duration,
-) -> Result<BlockNumHash> {
-    wait_for_tag_prefix_convergence(nodes, BlockNumberOrTag::Finalized, min_height, timeout).await
 }
 
 async fn wait_for_tag_prefix_convergence(

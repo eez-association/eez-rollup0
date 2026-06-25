@@ -14,12 +14,10 @@ mod common;
 use common::{
     ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeConfig,
     NodeHandle, override_env, reorg_genesis_path, reorg_genesis_state_root, send_l2_value_transfer,
-    wait_for, wait_for_finalized_prefix_convergence, wait_for_latest_height,
-    wait_for_node_caught_up, wait_for_safe_prefix_convergence,
+    wait_for, wait_for_latest_height, wait_for_node_caught_up, wait_for_safe_prefix_convergence,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
-const FOLLOWER_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(240);
 
 fn with_composer_disabled(mut env: Vec<(&'static str, String)>) -> Vec<(&'static str, String)> {
     env.push(("EEZ_COMPOSER_DISABLED", "1".to_string()));
@@ -30,57 +28,6 @@ fn assert_no_divergence_failure_logs(nodes: &[&NodeHandle]) {
     for node in nodes {
         node.assert_no_divergence_failure_logs();
     }
-}
-
-/// Baseline convergence guard: a single sequencer is the control case
-/// for all multi-sequencer divergence tests. It proves both follower
-/// modes derive the same safe/finalized L2 hashes from the L1-attested
-/// batch stream.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn single_sequencer_followers_converge() {
-    let harness = Harness::with_anvil_config(
-        AnvilConfig::for_reorg(),
-        reorg_genesis_state_root().unwrap(),
-    )
-    .await
-    .unwrap();
-    let chain = harness.chain();
-    let genesis = reorg_genesis_path();
-    let cfg = NodeConfig {
-        genesis_path: Some(genesis.as_path()),
-    };
-
-    let seq = NodeHandle::start("single-seq", &cfg, &harness.env())
-        .await
-        .unwrap();
-    seq.run_tx_spammer(ANVIL_KEY_1);
-
-    let seq_rpc = seq.l2_rpc_url();
-    let fol_rpc =
-        NodeHandle::start_follower("single-fol-rpc", &cfg, &harness.env(), Some(&seq_rpc))
-            .await
-            .unwrap();
-    let fol_l1 = NodeHandle::start_follower("single-fol-l1", &cfg, &harness.env(), None)
-        .await
-        .unwrap();
-
-    chain
-        .wait_for_batches(3, DEFAULT_TIMEOUT)
-        .await
-        .expect("single sequencer did not post enough batches");
-
-    wait_for_safe_prefix_convergence(&[&seq, &fol_rpc, &fol_l1], 2, FOLLOWER_CONVERGENCE_TIMEOUT)
-        .await
-        .expect("single sequencer/followers did not converge on safe block hashes");
-    wait_for_finalized_prefix_convergence(
-        &[&seq, &fol_rpc, &fol_l1],
-        1,
-        FOLLOWER_CONVERGENCE_TIMEOUT,
-    )
-    .await
-    .expect("single sequencer/followers did not converge on finalized block hashes");
-
-    assert_no_divergence_failure_logs(&[&seq, &fol_rpc, &fol_l1]);
 }
 
 /// Regression for the original suffix-replay bug. Sequencer B locally

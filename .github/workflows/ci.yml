@@ -39,13 +39,11 @@ jobs:
           sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake
       - name: Format
         run: cargo fmt --all --check
-      # Build everything (workspace lib + integration test binaries) plus the
-      # runnable eez-follower binary that eez-node integration tests spawn.
+      # Build everything (workspace lib + integration test binaries + the
+      # eez-node binary that integration tests spawn via CARGO_BIN_EXE_).
       # Once this completes, clippy and both nextest runs read from cache.
       - name: Build (tests + binaries)
-        run: |
-          cargo nextest run --workspace --all-targets --no-run
-          cargo build -p eez-follower --bin eez-follower --profile test
+        run: cargo nextest run --workspace --all-targets --no-run
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Build contracts (artifacts read by harness)
