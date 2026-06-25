@@ -570,33 +570,53 @@ fn dropped(tx_hash: TxHash, target_block: u64, reason: &'static str) -> SendOutc
     }
 }
 
-/// Both endpoints of our rollup's stateDelta chain in a batch: the
-/// FIRST delta's `currentState` (L1's pre-batch root) and the LAST
-/// delta's `newState` (post-batch root). Multi-entry batches chain
-/// per-rollup roots (`entry[k].currentState == entry[k-1].newState`),
-/// so the deriver validates L2's actual against both endpoints
-/// (`from_block - 1` and `to_block`).
-pub(crate) fn our_state_endpoints(
+/// Our rollup's stateDelta chain in a batch: the first delta's `currentState`
+/// (pre-batch root) and the ordered per-delta `newState` roots.
+pub(crate) fn our_state_chain(
     batch: &ProofSystemBatchPerVerificationEntriesSol,
     rollup_id: u64,
-) -> (
-    Option<alloy_primitives::B256>,
-    Option<alloy_primitives::B256>,
-) {
+) -> (Option<alloy_primitives::B256>, Vec<alloy_primitives::B256>) {
     let rid = U256::from(rollup_id);
     let mut first_curr: Option<alloy_primitives::B256> = None;
-    let mut last_new: Option<alloy_primitives::B256> = None;
+    let mut new_states: Vec<alloy_primitives::B256> = Vec::new();
     for entry in &batch.entries {
         for delta in &entry.stateDeltas {
             if delta.rollupId == rid {
                 if first_curr.is_none() {
                     first_curr = Some(delta.currentState);
                 }
-                last_new = Some(delta.newState);
+                new_states.push(delta.newState);
             }
         }
     }
-    (first_curr, last_new)
+    (first_curr, new_states)
+}
+
+/// How much of this batch L1 actually settled: matches the batch's claimed
+/// `newState` roots against the roots settled in its L1 block, returning the
+/// match count and the deepest match (the batch's true post-batch root), or
+/// `(0, None)` if none match — in which case the deriver skips the batch.
+///
+/// Matched per batch, not by taking the block's last settled root, because two
+/// postBatches for the same rollup can land in one L1 block: an empty `A→A`
+/// batch must not be judged against a rich `A→B` batch's `B` in that block.
+fn attribute_settlement(
+    claimed_chain: &[alloy_primitives::B256],
+    block_settled: Option<&std::collections::HashSet<alloy_primitives::B256>>,
+) -> (usize, Option<alloy_primitives::B256>) {
+    let Some(settled) = block_settled else {
+        return (0, None);
+    };
+    let count = claimed_chain
+        .iter()
+        .filter(|&&root| settled.contains(&root))
+        .count();
+    let final_state = claimed_chain
+        .iter()
+        .rev()
+        .find(|&&root| settled.contains(&root))
+        .copied();
+    (count, final_state)
 }
 
 /// One decoded `BatchPosted` log: winner flag plus the claimed state
@@ -612,11 +632,10 @@ pub(crate) struct ScannedBatch {
     pub rollup_count: alloy_primitives::U256,
     pub call_data: alloy_primitives::Bytes,
     pub state_applied: bool,
-    /// `L2ExecutionPerformed` events for our rollupId in the postBatch's
-    /// L1 block (the applied prefix; 0 = skip). See `scan_batch_logs`.
+    /// How many of this batch's claimed roots L1 settled (0 = skip). See
+    /// [`attribute_settlement`].
     pub settled_count: usize,
-    /// LAST applied entry's `newState` — L1's actual post-batch root and
-    /// the reconciliation endpoint.
+    /// Deepest claimed root L1 settled — this batch's actual post-batch endpoint.
     pub settled_final_state: Option<alloy_primitives::B256>,
     pub claimed_current_state: Option<alloy_primitives::B256>,
     pub claimed_new_state: Option<alloy_primitives::B256>,
@@ -660,17 +679,13 @@ pub(crate) async fn scan_batch_logs(
         .iter()
         .filter_map(|l| l.transaction_hash)
         .collect();
-    // `L2ExecutionPerformed.newState` roots per L1 block in log (=
-    // application) order. Indexed per-BLOCK, not per-tx: deferred
-    // entries emit from the bundled user_tx, not the postBatch tx.
-    //
-    // Partial consumption is legal — a batch claiming A→B→C→D may stop
-    // at any prefix (a reverting user_tx leaves its entry and everything
-    // after unconsumed). So the event COUNT = entries applied (leading
-    // immediate + consumed deferred prefix), and the LAST newState is
-    // L1's actual post-batch root — the only valid reconcile endpoint.
-    let mut settled_by_block: std::collections::HashMap<u64, Vec<alloy_primitives::B256>> =
-        std::collections::HashMap::new();
+    // `L2ExecutionPerformed.newState` roots L1 settled, per L1 block (per-block
+    // not per-tx: deferred entries emit from the bundled user_tx). Each batch is
+    // credited only its own subset later — see [`attribute_settlement`].
+    let mut settled_by_block: std::collections::HashMap<
+        u64,
+        std::collections::HashSet<alloy_primitives::B256>,
+    > = std::collections::HashMap::new();
     for l in &winner_logs {
         if let Some(bn) = l.block_number {
             let data = l.data().data.as_ref();
@@ -678,7 +693,7 @@ pub(crate) async fn scan_batch_logs(
                 settled_by_block
                     .entry(bn)
                     .or_default()
-                    .push(alloy_primitives::B256::from_slice(data));
+                    .insert(alloy_primitives::B256::from_slice(data));
             }
         }
     }
@@ -724,9 +739,10 @@ pub(crate) async fn scan_batch_logs(
             data: log.data().clone(),
         })
         .map_err(|e| L1Error::Provider(format!("decode BatchPosted({tx_hash}): {e}")))?;
-        let (claimed_current_state, claimed_new_state) =
-            our_state_endpoints(&decoded.batch, rollup_id);
-        let settled = settled_by_block.get(&l1_block_number);
+        let (claimed_current_state, claimed_chain) = our_state_chain(&decoded.batch, rollup_id);
+        let claimed_new_state = claimed_chain.last().copied();
+        let (settled_count, settled_final_state) =
+            attribute_settlement(&claimed_chain, settled_by_block.get(&l1_block_number));
         out.push(ScannedBatch {
             l1_block_number,
             l1_block_hash,
@@ -735,11 +751,74 @@ pub(crate) async fn scan_batch_logs(
             rollup_count: decoded_event.rollupCount,
             call_data: decoded.batch.callData,
             state_applied: winner_tx_hashes.contains(&tx_hash),
-            settled_count: settled.map_or(0, Vec::len),
-            settled_final_state: settled.and_then(|v| v.last().copied()),
+            settled_count,
+            settled_final_state,
             claimed_current_state,
             claimed_new_state,
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::attribute_settlement;
+    use alloy_primitives::B256;
+    use std::collections::HashSet;
+
+    fn settled(roots: &[B256]) -> HashSet<B256> {
+        roots.iter().copied().collect()
+    }
+
+    /// The bug this fix closes: idle `A→A` and rich `A→B` share an L1 block;
+    /// each gets its OWN root, not the block's last (`B`).
+    #[test]
+    fn same_block_batches_attributed_per_chain_not_block_last() {
+        let a = B256::repeat_byte(0xAA);
+        let b = B256::repeat_byte(0xBB);
+        let block = settled(&[a, b]);
+        assert_eq!(attribute_settlement(&[a], Some(&block)), (1, Some(a)));
+        assert_eq!(attribute_settlement(&[b], Some(&block)), (1, Some(b)));
+    }
+
+    /// A loser whose claimed root never settled → `(0, None)` ⇒ deriver skips it.
+    #[test]
+    fn unsettled_loser_is_skipped() {
+        let b = B256::repeat_byte(0xBB);
+        let y = B256::repeat_byte(0xCC);
+        assert_eq!(attribute_settlement(&[y], Some(&settled(&[b]))), (0, None));
+    }
+
+    /// Partial consumption: only a prefix settled → endpoint is the deepest
+    /// settled root, not the claimed end.
+    #[test]
+    fn partial_consumption_uses_deepest_settled_root() {
+        let b = B256::repeat_byte(0x0B);
+        let c = B256::repeat_byte(0x0C);
+        let d = B256::repeat_byte(0x0D);
+        assert_eq!(
+            attribute_settlement(&[b, c, d], Some(&settled(&[b, c]))),
+            (2, Some(c)),
+        );
+    }
+
+    /// Full consumption: the claimed end settled → it's the endpoint.
+    #[test]
+    fn full_consumption_uses_claimed_end() {
+        let b = B256::repeat_byte(0x0B);
+        let c = B256::repeat_byte(0x0C);
+        assert_eq!(
+            attribute_settlement(&[b, c], Some(&settled(&[b, c]))),
+            (2, Some(c)),
+        );
+    }
+
+    /// No settlement for our rollup in the block at all → unsettled.
+    #[test]
+    fn no_block_settlements_is_unsettled() {
+        assert_eq!(
+            attribute_settlement(&[B256::repeat_byte(1)], None),
+            (0, None)
+        );
+    }
 }
