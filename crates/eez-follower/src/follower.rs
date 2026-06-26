@@ -446,6 +446,21 @@ mod tests {
     }
 
     #[test]
+    fn candidate_directly_above_safe_checks_parent_hash() {
+        let safe_hash = hash(10);
+        let local = MockLocal::with_safe(10, safe_hash);
+
+        assert_eq!(
+            check_extends_safe(&local, &header(11, safe_hash), hash(11)).unwrap(),
+            SafeCompat::Extends
+        );
+        assert_eq!(
+            check_extends_safe(&local, &header(11, hash(99)), hash(11)).unwrap(),
+            SafeCompat::Conflicts
+        );
+    }
+
+    #[test]
     fn canonical_candidate_extends_without_parent_walk() {
         let mut local = MockLocal::with_safe(10, hash(10));
         let candidate = header(12, hash(99));
