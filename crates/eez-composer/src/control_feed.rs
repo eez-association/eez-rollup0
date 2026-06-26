@@ -248,14 +248,18 @@ mod tests {
 
     #[test]
     fn ring_keeps_newest_and_respects_event_cap() {
-        let p = ControlPublisher::new(4); // max_events = 16
-        for n in 1..=40 {
+        // `new(_)` floors max_events at 8_192 (the replay-horizon floor), so
+        // the cap is 8_192 regardless of blocks_per_slot. Publish past the
+        // floor to force eviction and assert the ring keeps the newest 8_192.
+        let p = ControlPublisher::new(4); // max_events floored to 8_192
+        let total = 8_192 + 24; // exceed the floor to trigger eviction
+        for n in 1..=total {
             p.publish(ev(n));
         }
         let snap = p.snapshot_from(1);
-        assert_eq!(snap.len(), 16);
-        assert_eq!(snap.first().unwrap().block_number, 25);
-        assert_eq!(snap.last().unwrap().block_number, 40);
+        assert_eq!(snap.len(), 8_192);
+        assert_eq!(snap.first().unwrap().block_number, total - 8_192 + 1);
+        assert_eq!(snap.last().unwrap().block_number, total);
     }
 
     #[test]
