@@ -30,6 +30,15 @@ pub const ANVIL_KEY_3: &str = "0x7c852118294e51e653712a81e05800f419141751be58f60
 pub const ANVIL_KEY_4: &str = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a";
 pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906");
 
+/// External anvil cadence used by composer-mode e2e tests. The node's
+/// `RollupTiming` requires `K = L1/L2 >= 2`; with 1s L2 blocks, anvil must
+/// mine every 2s and `EEZ_L1_BLOCK_TIME_MS` must match.
+pub const L1_BLOCK_TIME_SECS: u64 = 2;
+
+/// L2 genesis timestamp shared by the dev and reorg fixtures (`0x6490fdd2`).
+/// Aligning anvil to this avoids permanent catchup to wall-clock-height slots.
+pub const L2_GENESIS_TIMESTAMP: u64 = 0x6490_fdd2;
+
 /// Composer tick cadence for single-composer tests — max speed.
 pub const COMPOSER_INTERVAL_SINGLE: Duration = Duration::from_secs(1);
 /// Composer tick cadence for multi-composer contention — gives the
@@ -68,7 +77,7 @@ pub struct Anvil {
     pub rpc_url: String,
 }
 
-/// Anvil configuration. `Anvil::spawn(port)` is the default (1s block,
+/// Anvil configuration. `Anvil::spawn(port)` is the default (2s block,
 /// random mnemonic). Tests pin the L1 genesis timestamp to match reth's
 /// dev genesis so the L1-anchored scheduler starts near the L2 chain
 /// instead of treating startup as a huge historical catch-up. The
@@ -86,28 +95,26 @@ pub struct AnvilConfig {
 impl Default for AnvilConfig {
     fn default() -> Self {
         Self {
-            block_time_secs: 1,
+            block_time_secs: L1_BLOCK_TIME_SECS,
             mnemonic: None,
             hardfork: None,
             gas_limit: None,
-            genesis_timestamp: Some(DEV_GENESIS_TIMESTAMP),
+            genesis_timestamp: Some(L2_GENESIS_TIMESTAMP),
         }
     }
 }
 
-const DEV_GENESIS_TIMESTAMP: u64 = 1_687_223_762;
-
 impl AnvilConfig {
-    /// 1s block time, hardhat mnemonic, cancun hardfork, 30M gas.
-    /// (Chiado uses 5s; tests prefer speed over fidelity. 1s blocks +
+    /// 2s block time, hardhat mnemonic, cancun hardfork, 30M gas.
+    /// (Chiado uses 5s; tests prefer speed over fidelity. 2s blocks +
     /// cancun still permit `anvil_reorg`.)
     pub fn for_reorg() -> Self {
         Self {
-            block_time_secs: 1,
+            block_time_secs: L1_BLOCK_TIME_SECS,
             mnemonic: Some(HARDHAT_MNEMONIC),
             hardfork: Some("cancun"),
             gas_limit: Some(30_000_000),
-            genesis_timestamp: Some(DEV_GENESIS_TIMESTAMP),
+            genesis_timestamp: Some(L2_GENESIS_TIMESTAMP),
         }
     }
 }
@@ -762,6 +769,13 @@ impl NodeHandle {
         let http_port = free_port();
         let ws_port = free_port();
         let p2p_port = free_port();
+        let l1_http_port = free_port();
+        let mut l1_auth_port = free_port();
+        while l1_auth_port == l1_http_port || l1_auth_port == l1_http_port.saturating_add(1) {
+            l1_auth_port = free_port();
+        }
+        let l1_p2p_port = free_port();
+        let l1_datadir = datadir.join("embedded-l1");
         let chain_arg: std::ffi::OsString = cfg.genesis_path.map_or_else(
             || std::ffi::OsString::from("dev"),
             |p| p.as_os_str().to_owned(),
@@ -800,6 +814,10 @@ impl NodeHandle {
                 "CARGO_HOME",
                 std::env::var("CARGO_HOME").unwrap_or_default(),
             );
+        cmd.env("EEZ_L1_HTTP_PORT", l1_http_port.to_string())
+            .env("EEZ_L1_AUTH_PORT", l1_auth_port.to_string())
+            .env("EEZ_L1_P2P_PORT", l1_p2p_port.to_string())
+            .env("EEZ_L1_DATADIR", &l1_datadir);
         for (k, v) in env {
             cmd.env(*k, v);
         }
@@ -850,9 +868,11 @@ impl NodeHandle {
         });
     }
 
-    /// Wait until this node observes the L1 reorg. Without this check the
+    /// Wait until this node observes the L1 reorg. Some runs legitimately
+    /// have no stale confirmed batch on one node, in which case the
+    /// correct deriver action is an explicit no-op. Without this check the
     /// reorg test would silently pass even if reorg detection regressed
-    /// (some unrelated re-derivation path could re-converge state).
+    /// and some unrelated re-derivation path re-converged state.
     pub async fn wait_for_reorg_seen(&self, timeout: Duration) -> Result<()> {
         let patterns = [
             "reorg rolled out",
@@ -882,7 +902,7 @@ impl NodeHandle {
 
     /// Count lines in `log_path` matching ANY of `patterns` (substring
     /// match). Used by the multi-composer reorg test to assert
-    /// `reorg.retreated` > 0 on both composers AND zero `Fatal` /
+    /// reorg handling on both composers AND zero `Fatal` /
     /// `UnexpectedStaticFile` events.
     pub fn log_count_matching(&self, patterns: &[&str]) -> Result<usize> {
         let contents = std::fs::read_to_string(&self.log_path)
@@ -1026,8 +1046,8 @@ impl<'a> Chain<'a> {
 
 /// Wait until L1's `block_number >= target`. Lets tests assert "the
 /// composer had at least N opportunities to act" without arbitrary
-/// sleeps — at anvil's 1s block time, target = current + N is ~N
-/// seconds of real time but tied to L1 progress.
+/// sleeps — target = current + N is tied to L1 progress instead of wall-clock
+/// assumptions.
 pub async fn wait_for_l1_blocks(rpc_url: &str, target: u64, timeout: Duration) -> Result<u64> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     wait_for(timeout, || async {

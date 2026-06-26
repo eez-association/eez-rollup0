@@ -35,13 +35,13 @@ services:
       - beacon_node
       - --testnet-dir=/config-dir
       - --listen-address=0.0.0.0
-      # Ports moved off the user's existing chiado-lighthouse (9105/6052)
-      # to avoid AddrInUse on shared hosts.
-      - --port=9205
-      - --quic-port=9206
+      # Ports moved off both the host chiado-lighthouse (9105/6052) and the
+      # dockerized eez-node lighthouse (9205/9206/6152) to avoid AddrInUse.
+      - --port=9405
+      - --quic-port=9406
       - --http
       - --http-address=127.0.0.1
-      - --http-port=6152
+      - --http-port=6352
       - --execution-endpoints=http://127.0.0.1:${EEZ_L1_AUTH_PORT:-18551}
       - --jwt-secrets=/jwt/jwt.hex
       - --datadir=/data
