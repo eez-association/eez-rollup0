@@ -889,6 +889,13 @@ pub async fn wait_for_latest_height(
     .await
 }
 
+/// Wait until all nodes' safe tags have reached at least `min_height` and the
+/// nodes agree on the block hash at the common safe prefix height.
+///
+/// `min_height` is part of the test's contract: callers must choose a height
+/// above the stale/setup baseline for the scenario under test. Otherwise this
+/// helper could pass because every node still agrees on genesis or another old
+/// safe block, without proving the scenario actually advanced.
 pub async fn wait_for_safe_prefix_convergence(
     nodes: &[&NodeHandle],
     min_height: u64,
