@@ -138,6 +138,23 @@ pub fn build_batch(
                 if let Some(prev) = current_entry.take() {
                     entries.push(prev.finish());
                 }
+                // Entry-rollup / source==this batch: the outer is NEVER folded
+                // into `L2ToL1Calls` (callCount=0, rollingHash=0). On consume,
+                // `executeCrossChainCall` recomputes `rollingHash` by
+                // re-executing `L2ToL1Calls`, which holds only reentrant L2→L1
+                // children — not the top-level call, whose effect rides
+                // `stateDeltas` and whose return rides `returnData`. Folding it
+                // lets L1 re-execute the outer against a codeless target,
+                // dropping the return data; any return-bearing call then reverts
+                // `RollingHashMismatch` (origin/main fix, sync-rollups-protocol
+                // @fe7bf66 / `DEPOSIT_SPEC.md §8`). This is structural here: only
+                // calls SOURCED from this rollup reach `build_batch`'s TopLevel
+                // (`CallKind::classify` keys top-level on the source), so the
+                // outer is always an entry-rollup originating call. The TARGET
+                // batch's "keep the outer so `executeIncomingCrossChainCall`
+                // forwards on arrival" case is handled separately by
+                // `build_inbound_target_batch` (see `composition.rs` has_incoming
+                // short-circuit) — an incoming call is never top-level here.
                 let builder = EntryBuilder::new(call, *dialect);
                 entry_nested_number = 0;
                 current_entry = Some(builder);
@@ -1497,7 +1514,14 @@ mod tests {
     }
 
     #[test]
-    fn single_top_level_call_yields_one_entry() {
+    fn originating_call_omits_outer_from_l2_to_l1_calls() {
+        // L1's batch for an originating L1→L2 call (the entry consumed on
+        // the source chain via `executeCrossChainCall`): the top-level call
+        // is NOT folded — `l2ToL1Calls` empty, callCount=0, rollingHash=0.
+        // Only reentrant L2→L1 children fold; the effect rides the
+        // stateDelta and the return value (if any) is carried separately in
+        // `returnData`. (sync-rollups-protocol@fe7bf66 — a folded outer here
+        // makes `executeCrossChainCall` revert `RollingHashMismatch`.)
         let (init, ptx) = empty_attribution();
         let attr = SourceAttribution {
             initial_roots: &init,
@@ -1509,8 +1533,10 @@ mod tests {
         assert_eq!(batch.entries().len(), 1);
         // The TopLevel call is described by the entry's
         // `proxyEntryHash` + `returnData`; reentrant children land
-        // in `L2ToL1Calls`. No children here, so both arrays empty.
+        // in `l2ToL1Calls`. No children here, so both arrays empty.
         assert!(batch.entries()[0].l2ToL1Calls.is_empty());
+        // origin/main: the outer is omitted → callCount stays 0.
+        assert_eq!(batch.entries()[0].callCount, U256::ZERO);
         assert!(batch.entries()[0].expectedL1ToL2Calls.is_empty());
         assert!(batch.lookup_calls().is_empty());
         assert_ne!(batch.entries()[0].proxyEntryHash, B256::ZERO);
@@ -1520,6 +1546,11 @@ mod tests {
             U256::from(1),
             "destinationRollupId is the target chain of the outer call",
         );
+        // NOTE: in this branch's architecture `build_batch` leaves
+        // `stateDeltas` empty — the settling `R_{k-1}→R_k` delta is attached
+        // downstream by `prepare_post_batch`, not by `EntryBuilder` (origin/main
+        // populated it via `build_outer_state_deltas`, which our type model does
+        // not use), so we do not assert a stateDelta here.
     }
 
     #[test]

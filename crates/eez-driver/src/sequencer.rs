@@ -36,7 +36,7 @@ use reth_payload_primitives::{BuiltPayload, PayloadTypes};
 use reth_primitives_traits::{
     AlloyBlockHeader, HeaderTy, NodePrimitives, SealedHeader, SealedHeaderFor,
 };
-use reth_storage_api::BlockReader;
+use reth_storage_api::{BlockIdReader, BlockReader};
 use tracing::{Level, event};
 
 use tokio::sync::mpsc;
@@ -218,14 +218,10 @@ where
         + Sync
         + 'static,
 {
-    /// Constructs a sequencer by reading the current best block from
-    /// Construct a sequencer: read `provider`'s best block, spawn a
-    /// `BlockCommitter` seeded with that header.
-    ///
-    /// # Errors
-    ///
-    /// `provider` (lookup failure), `missing_header` (best block has no
-    /// header — brief startup race).
+    /// Constructs a sequencer by spawning a `BlockCommitter` seeded
+    /// from reth's current best head plus persisted safe/finalized
+    /// anchors. Sharing that handle with the Deriver keeps all engine
+    /// traffic serialized through one task.
     pub fn new<P>(
         provider: &P,
         attributes: EthAttributesBuilder<ChainSpec>,
@@ -236,17 +232,20 @@ where
         witness_tx: Option<mpsc::UnboundedSender<B256>>,
     ) -> DriverResult<Self>
     where
-        P: BlockReader<Header = HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>,
+        P: BlockReader<Header = HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>
+            + BlockIdReader,
     {
-        let best = provider
-            .best_block_number()
-            .map_err(DriverError::provider)?;
-        let last_header = provider
-            .sealed_header(best)
-            .map_err(DriverError::provider)?
-            .ok_or_else(|| DriverError::missing_header(best))?;
-        let committer =
-            BlockCommitterHandle::spawn(last_header, to_engine, payload_builder, witness_tx);
+        // main's reorg-aware boot: seed the committer from reth's best head
+        // plus the *persisted* safe/finalized forkchoice anchors (never the
+        // speculative best header, which L1-derived replays can displace).
+        // Graft our prover-feed `witness_tx` hook onto that factory so Sync
+        // blocks still feed the witness channel under the new anchor boot.
+        let committer = BlockCommitterHandle::spawn_from_provider(
+            provider,
+            to_engine,
+            payload_builder,
+            witness_tx,
+        )?;
         Ok(Self {
             attributes,
             schedule_rx,

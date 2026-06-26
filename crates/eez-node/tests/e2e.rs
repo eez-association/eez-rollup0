@@ -297,7 +297,7 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
         .await
         .expect("c2 did not catch up to contract post-reorg");
 
-    // I2 — Both derivers logged the retreat.
+    // I2 — Both derivers logged reorg handling.
     c1.assert_reorg_seen();
     c2.assert_reorg_seen();
 

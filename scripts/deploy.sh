@@ -14,8 +14,8 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-ENV_FILE="$REPO/.env"
-OUT_FILE="$REPO/deployments.env"
+ENV_FILE="${EEZ_ENV_FILE:-$REPO/.env}"
+OUT_FILE="${EEZ_DEPLOYMENTS_FILE:-$REPO/deployments.env}"
 
 # Timestamp marker — used at the end to find broadcast/ entries produced
 # by *this* run (vs stale ones from prior chain ids or earlier deploys).
@@ -36,11 +36,12 @@ source "$ENV_FILE"
 # `StateDelta.currentState` must match this value, so it has to equal
 # the L2 reth genesis state root.
 #
-# Pinned to our `genesis.json` which adds the SystemAccount predeposit
-# per Rollup-1.md §3.1 (1e13 ETH at `0xdead…dead`). Verified via
-# `eth_getBlockByNumber(0).stateRoot` on a fresh node. Override via
-# the env var when targeting a different L2 chain spec.
-EEZ_INITIAL_STATE_ROOT="${EEZ_INITIAL_STATE_ROOT:-0xdd37fe70238cd4ecb3f52e3f5d4d1bdff34f996160f1940a3ee6e00be8e5f3f2}"
+# Pinned to our `genesis.json` (SystemAccount predeposit per Rollup-1.md §3.1 +
+# the EIP-2935 history contract so empty blocks advance state). Recompute when
+# the alloc changes; override via the env var for a different L2 chain spec
+# (e.g. the live chiado deploy passes EEZ_INITIAL_STATE_ROOT=0x037cf8a5… for its
+# 2935-baked genesis).
+EEZ_INITIAL_STATE_ROOT="${EEZ_INITIAL_STATE_ROOT:-0x49ecae4742217e1f57d67acf2b9dcfa7fcae5ad7a841423c18ad0a9acd6e4eba}"
 
 # Derive addresses from keys.
 AUTHORIZED_SIGNER="$(cast wallet address --private-key "$EEZ_PROOF_SIGNER_KEY")"
@@ -173,7 +174,7 @@ echo "      L1 bridge  = $EEZ_L1_BRIDGE_SENDER"
 # Useless work. We write a per-deploy genesis with timestamp set to
 # the L1 block that confirmed RegisterRollup, so catch-up only
 # bridges deploy-time to now.
-GENESIS_OUT="$REPO/datadir/genesis.json"
+GENESIS_OUT="${EEZ_GENESIS_OUT:-$REPO/datadir/genesis.json}"
 mkdir -p "$REPO/datadir"
 DEPLOY_BLOCK_TS_HEX="$(cast block "$EEZ_REGISTRY_DEPLOY_BLOCK" --rpc-url "$EEZ_L1_RPC_URL" --json | jq -r '.timestamp')"
 [[ -n "$DEPLOY_BLOCK_TS_HEX" && "$DEPLOY_BLOCK_TS_HEX" != "null" ]] || {
@@ -195,7 +196,7 @@ g['config'].update({
     'petersburgBlock': 0, 'istanbulBlock': 0, 'muirGlacierBlock': 0,
     'berlinBlock': 0, 'londonBlock': 0, 'arrowGlacierBlock': 0,
     'grayGlacierBlock': 0, 'mergeNetsplitBlock': 0,
-    'shanghaiTime': 0, 'cancunTime': 0, 'pragueTime': 0,
+    'shanghaiTime': 0, 'cancunTime': 0, 'pragueTime': 0, 'osakaTime': 0,
     'terminalTotalDifficulty': 0, 'terminalTotalDifficultyPassed': True,
 })
 json.dump(g, open('$GENESIS_OUT', 'w'), indent=2)
@@ -217,6 +218,7 @@ EEZ_PROOF_SYSTEM_ADDRESS=$PROOF_SYSTEM_ADDRESS
 EEZ_MOCK_PROOF_SYSTEM_ADDRESS=$EEZ_MOCK_PROOF_SYSTEM_ADDRESS
 EEZ_ROLLUP_MANAGER_ADDRESS=$EEZ_ROLLUP_MANAGER_ADDRESS
 EEZ_ROLLUP_ID=$EEZ_ROLLUP_ID
+EEZ_INITIAL_STATE_ROOT=$EEZ_INITIAL_STATE_ROOT
 EEZ_L2_GENESIS_PATH=$GENESIS_OUT
 
 # L1 cross-chain bridge contracts (DeployBridgeL1).

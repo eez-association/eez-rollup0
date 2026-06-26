@@ -170,9 +170,7 @@ fn main() -> eyre::Result<()> {
         // L1 source-tx simulation. Inline (not in `l1_embedded.rs`)
         // because the `NodeHandle` AddOns type resists a typed return.
         let embed_l1 = mode == Mode::Composer
-            && env::var("EEZ_L1_EMBEDDED")
-                .map(|v| v != "0" && !v.is_empty())
-                .unwrap_or(true);
+            && env::var("EEZ_L1_EMBEDDED").map_or(true, |v| v != "0" && !v.is_empty());
         // Shared L1-reth tokio runtime — built once, used by whichever
         // L1 path runs.
         let build_l1_runtime = || {
@@ -839,10 +837,11 @@ fn main() -> eyre::Result<()> {
         if let Err(err) = deriver.catch_up().await {
             event!(
                 name: "eez.node.deriver.boot_catch_up.failed",
-                Level::WARN,
+                Level::ERROR,
                 error = %err,
-                "boot-time catch_up failed; deriver.run() will retry post-subscribe",
+                "boot-time catch_up failed; refusing to start L1-active tasks before reconciliation",
             );
+            return Err(eyre::eyre!("boot-time deriver catch_up failed: {err}"));
         }
         // Fix-1 (composer-driven) STARTUP SEED: now that catch_up has populated
         // the L1 cursor, seed the verified frontier from it so a fresh/restarted
