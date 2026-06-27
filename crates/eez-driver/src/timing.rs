@@ -236,21 +236,13 @@ impl RollupTiming {
     /// L2 head, the target sync-slot block height, and the per-trigger
     /// catchup budget.
     ///
-    /// `max_catchup_blocks` bounds a Catchup chunk: pass
-    /// [`MAX_BLOCKS_PER_CATCHUP`] when unconstrained, or the smaller
-    /// speculative-window room in based mode (see
-    /// [`Sequencer`](crate::Sequencer)). The chunk must reach its grid
-    /// terminal within this budget, else no postBatch is emitted and the
-    /// confirmed cursor can't advance.
+    /// `max_catchup_blocks` bounds a Catchup chunk to the K-grid; the
+    /// Sequencer always passes [`MAX_BLOCKS_PER_CATCHUP`] (catchup does not
+    /// enforce the speculative cap — that's steady-only).
     ///
-    /// Catchup vs. steady-state split: if closing the slot this trigger
-    /// would need more than `K` blocks, drop into Catchup; else produce
-    /// the slot suffix (Live + Future + 1 Sync).
-    ///
-    /// Returns [`SlotComposition::Idle`] when the head is at/past
-    /// `sync_slot_block`, or when `max_catchup_blocks` is too small to
-    /// reach a grid height above head (the speculative window is nearly
-    /// full — wait for L1 to confirm and reopen room).
+    /// Catchup if closing the slot needs > `K` blocks, else the slot suffix
+    /// (Live + Future + 1 Sync). [`SlotComposition::Idle`] when head ≥
+    /// `sync_slot_block`, or the budget can't reach a grid height above head.
     #[must_use]
     pub fn per_trigger_composition(
         self,
@@ -277,10 +269,9 @@ impl RollupTiming {
                     future,
                 }
             } else {
-                // Over-catch: snap the terminal to the K-grid so the
-                // deriver can re-derive it. Step back from the on-grid
-                // target by whole K's until it fits `max_catchup_blocks`
-                // — correct even if genesis isn't on an L1 slot boundary.
+                // Over-catch: snap the terminal to the K-grid (step back from
+                // the target by whole K's until it fits) so the deriver
+                // re-derives it — robust to a genesis off the slot boundary.
                 let gap = sync_slot_block - head_block;
                 let steps_back = gap.saturating_sub(max_catchup_blocks).div_ceil(k);
                 let snap = steps_back.saturating_mul(k);

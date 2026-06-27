@@ -589,9 +589,8 @@ where
             };
         }
 
-        // Catchup: structural-only. Skip the drain and emit a minimal
-        // postBatch (cross-chain stays pooled for the next Steady slot).
-        // No L1 wired -> None, and the Sequencer commits an empty Sync.
+        // Catchup: structural-only — skip the drain, emit a minimal postBatch
+        // (cross-chain stays pooled for the next Steady slot).
         if matches!(mode, SyncSlotMode::Catchup) {
             let (Some(_), Some(ctx)) = (
                 self.inner.evm_composer.as_ref(),
@@ -1753,13 +1752,9 @@ async fn observe_bundle_outcome(
     let outcome = submitter
         .send_bundle(&bundle, BundleTarget::NextBlock, Some(expected_final_state))
         .await;
-    // Under strict all-or-nothing bundles, `Included` ⟹ every tx
-    // succeeded ⟹ settled; the only failure is a drop (postBatch had no
-    // receipt by its target block), which can't distinguish relay bad
-    // luck from a would-revert tx. Poison is caught at compose time
-    // instead (see `compose_via_evm_composer`), so a drop reaching here
-    // is treated as bad luck and re-queued by slot-context recovery (which
-    // RECOMPOSES a fresh tx — rbuilder ignores re-sends of the same tx).
+    // Strict all-or-nothing: Included ⟹ settled; the only failure is a drop.
+    // Poison is caught at compose time, so a drop here is bad luck — recovery
+    // recomposes a FRESH tx next trigger (the builder ignores re-sends).
     let settled = matches!(
         outcome,
         Ok(SendOutcome::Included {

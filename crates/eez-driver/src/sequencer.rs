@@ -452,12 +452,9 @@ where
         sync_slot_timestamp: u64,
     ) -> DriverResult<()> {
         let head = self.committer.last_header().number();
-        // Catchup does NOT enforce the speculative cap. A dropped postBatch
-        // heals only by RECOMPOSING a fresh tx (rbuilder ignores re-sends of
-        // the same tx); the recompose needs the chain to keep advancing, but
-        // the cap freezes it to Idle → deadlock. The cap is a STEADY-state
-        // bound; catchup self-heals like cap=0 (validated). The steady (Slot)
-        // arm below still enforces it.
+        // Catchup ignores the speculative cap (a steady-state bound): a
+        // dropped pb heals by recomposing next trigger, which freezing to
+        // Idle would block. The steady (Slot) arm still enforces the cap.
         let comp = self.timing.per_trigger_composition(
             head,
             sync_slot_block_height,
@@ -491,10 +488,9 @@ where
                     }
                 }
 
-                // Terminal Sync block, parent-paced. `SyncSlotMode::Catchup`
-                // makes it structural-only (empty) — a behind block can't be
-                // ts-aligned with its postBatch, so cross-chain waits for the
-                // next Slot. docs/CATCHUP-SYNC-GRID-MISALIGNMENT.md
+                // Terminal Sync block, parent-paced. Empty
+                // (`SyncSlotMode::Catchup`): a behind block can't ts-align its
+                // postBatch, so cross-chain waits for the next Slot.
                 let last_header = self.committer.last_header();
                 let sync_ts = last_header
                     .timestamp()
@@ -567,10 +563,9 @@ where
                     .timestamp()
                     .saturating_add(self.timing.l2_block_time().as_secs());
                 if expected_sync_ts != sync_slot_timestamp {
-                    // Equal on-grid; a mismatch means the chain drifted
-                    // off-grid (should be unreachable post grid-fix). We
-                    // stamp with the parent-derived value so a recomputing
-                    // deriver can still reproduce the block.
+                    // Equal on-grid; a mismatch means off-grid drift. Stamp
+                    // the parent-derived (re-derivable) value so the deriver
+                    // can still reproduce the block.
                     event!(
                         name: "eez.sequencer.sync_slot.timestamp_mismatch",
                         Level::WARN,
@@ -581,10 +576,9 @@ where
                     );
                 }
 
-                // Cross-chain content hook: drain the pool into a prebuilt
-                // Sync block (None = empty, pool-driven commit). Pass
-                // `expected_sync_ts` (re-derivable), not the raw scheduler
-                // value — identical on-grid.
+                // Drain cross-chain into a prebuilt Sync block (None = empty,
+                // pool-driven). Pass expected_sync_ts (re-derivable), not the
+                // raw scheduler value.
                 let prebuilt = if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref()
                 {
                     let parent = crate::slot::ParentContext {
