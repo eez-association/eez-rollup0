@@ -272,11 +272,15 @@ impl RollupTiming {
                     future,
                 }
             } else {
-                // Over-catch: bring head up to `sync_slot_block` so the
-                // next trigger enters Slot mode.
+                // Over-catch: snap the terminal to the K-grid so the
+                // deriver can re-derive it. Step back from the on-grid
+                // target by whole K's until it fits the cap — correct
+                // even if genesis isn't on an L1 slot boundary.
                 let gap = sync_slot_block - head_block;
+                let steps_back = gap.saturating_sub(MAX_BLOCKS_PER_CATCHUP).div_ceil(k);
+                let terminal = sync_slot_block - steps_back * k;
                 SlotComposition::Catchup {
-                    live: gap.min(MAX_BLOCKS_PER_CATCHUP),
+                    live: terminal - head_block - 1,
                 }
             }
         } else {
@@ -299,8 +303,9 @@ pub enum SlotComposition {
     /// Already at or past the target sync slot. No blocks to produce
     /// this trigger.
     Idle,
-    /// Catchup: too far behind to close the slot. Produce `live` Live
-    /// blocks only; Future + Sync are deferred to the next trigger.
+    /// Catchup: `live` Live blocks then a terminal Sync block at the
+    /// grid-snapped height `head + live + 1`. No Future blocks; the Sync
+    /// block is structural-only (empty) — see [`SyncSlotMode`](crate::SyncSlotMode).
     Catchup { live: u64 },
     /// Steady-state: produce `live` Live blocks + `future` Future
     /// blocks + 1 Sync block (always implicit when this variant is
@@ -470,23 +475,86 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_catchup_one_slot_behind() {
-        // Sync at 12, head at 0: over-catch produces the full gap (12)
-        // so head reaches sync_slot and the next trigger is Slot mode.
+    fn mainnet_catchup_within_cap_lands_on_target() {
+        // Sync at 12 (on-grid, K=6), head at 0. gap=12 <= cap, so the
+        // catchup closes exactly at sync_slot: 11 Live + 1 Sync = 12
+        // blocks, terminal at 0 + 11 + 1 = 12 (on grid). Next trigger
+        // sees gap=K -> Slot mode.
         let c = mainnet().per_trigger_composition(0, 12);
-        assert_eq!(c, SlotComposition::Catchup { live: 12 });
+        assert_eq!(c, SlotComposition::Catchup { live: 11 });
     }
 
     #[test]
-    fn mainnet_catchup_clamped_to_cap() {
-        // Way behind: sync at 320, head at 0. Gap=320 → capped at
-        // MAX_BLOCKS_PER_CATCHUP = 300.
-        let c = mainnet().per_trigger_composition(0, 320);
+    fn mainnet_catchup_clamped_to_cap_snaps_to_grid() {
+        // Way behind: sync at 318 (=6*53, on-grid), head at 0. gap=318 >
+        // cap=300, so the terminal snaps back to the largest grid height
+        // that fits the cap: 318 - ceil((318-300)/6)*6 = 318 - 18 = 300.
+        // 299 Live + 1 Sync = 300 blocks (= cap), terminal at 300 (=6*50).
+        let head = 0u64;
+        let c = mainnet().per_trigger_composition(head, 318);
+        assert_eq!(c, SlotComposition::Catchup { live: 299 });
+        // Terminal is on-grid and the trigger fits the cap.
+        let SlotComposition::Catchup { live } = c else {
+            panic!("expected Catchup");
+        };
+        let terminal = head + live + 1;
+        let total_blocks = live + 1; // Live blocks + the Sync terminal
+        assert_eq!(terminal % u64::from(mainnet().k()), 0, "terminal on grid");
+        assert!(
+            total_blocks <= MAX_BLOCKS_PER_CATCHUP,
+            "fits per-trigger cap"
+        );
+    }
+
+    #[test]
+    fn catchup_terminal_always_on_grid_when_far_behind() {
+        // For a range of far-behind heads, the catchup terminal must land
+        // on the same K-grid as the (on-grid) sync_slot_block.
+        let t = mainnet();
+        let k = u64::from(t.k());
+        let sync_slot = 6_000u64; // on-grid (multiple of K=6)
+        for head in [0u64, 1, 5, 100, 137, 5_000, 5_699] {
+            let SlotComposition::Catchup { live } = t.per_trigger_composition(head, sync_slot)
+            else {
+                continue; // close enough for Slot mode
+            };
+            let terminal = head + live + 1;
+            assert_eq!(
+                terminal % k,
+                0,
+                "terminal {terminal} off-grid (head={head})"
+            );
+            assert!(terminal > head, "terminal must advance");
+            assert!(
+                terminal - head <= MAX_BLOCKS_PER_CATCHUP,
+                "trigger exceeds cap (head={head})"
+            );
+            assert!(terminal <= sync_slot, "terminal overshot target");
+        }
+    }
+
+    #[test]
+    fn catchup_grid_snap_respects_genesis_offset() {
+        // If genesis isn't on an L1 slot boundary, sync_slot_block carries
+        // a residue != 0 mod K. Stepping back from the target keeps the
+        // terminal on the SAME (offset) grid, not the 0-mod-K grid.
+        let t = mainnet();
+        let k = u64::from(t.k());
+        let head = 0u64;
+        let sync_slot = 317u64; // residue 5 mod 6 (offset grid)
+        let SlotComposition::Catchup { live } = t.per_trigger_composition(head, sync_slot) else {
+            panic!("expected Catchup for gap > cap");
+        };
+        let terminal = head + live + 1;
         assert_eq!(
-            c,
-            SlotComposition::Catchup {
-                live: MAX_BLOCKS_PER_CATCHUP
-            }
+            terminal % k,
+            sync_slot % k,
+            "terminal must share the target's grid residue"
+        );
+        assert_eq!(
+            (sync_slot - terminal) % k,
+            0,
+            "stepped back whole K-multiples"
         );
     }
 

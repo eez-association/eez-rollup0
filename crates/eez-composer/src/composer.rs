@@ -23,7 +23,9 @@ use std::sync::Arc;
 use alloy_eips::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use async_trait::async_trait;
-use eez_driver::{BlockCommitterHandle, ParentContext, SyncSlotBlock, SyncSlotComposer};
+use eez_driver::{
+    BlockCommitterHandle, ParentContext, SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
+};
 use eez_l1::{BundleTarget, L1Event, L1Watcher, SendOutcome, Submitter};
 use eez_prover::Prover;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -486,12 +488,14 @@ where
         rollup_id: u64,
         parent: ParentContext,
         timestamp: u64,
+        mode: SyncSlotMode,
     ) -> Option<SyncSlotBlock> {
         event!(
             name: "eez.composer.sync_slot.invoked",
             Level::INFO,
             rollup_id,
             timestamp,
+            mode = ?mode,
             "compose_sync_slot invoked",
         );
         let rollup = self.inner.rollups.get(&rollup_id).or_else(|| {
@@ -583,6 +587,38 @@ where
                     None
                 }
             };
+        }
+
+        // Catchup: structural-only. Skip the drain and emit a minimal
+        // postBatch (cross-chain stays pooled for the next Steady slot).
+        // No L1 wired -> None, and the Sequencer commits an empty Sync.
+        if matches!(mode, SyncSlotMode::Catchup) {
+            let (Some(_), Some(ctx)) = (
+                self.inner.evm_composer.as_ref(),
+                self.inner.cc_exec_ctx.as_ref(),
+            ) else {
+                return None;
+            };
+            return self
+                .dispatch_minimal_postbatch(
+                    ctx,
+                    rollup_id,
+                    rollup,
+                    &parent_header,
+                    timestamp,
+                    suggested_fee_recipient,
+                )
+                .await
+                .unwrap_or_else(|err| {
+                    event!(
+                        name: "eez.composer.catchup.minimal_failed",
+                        Level::ERROR,
+                        rollup_id,
+                        error = %err,
+                        "catchup minimal postBatch failed; Sequencer commits empty Sync",
+                    );
+                    None
+                });
         }
 
         let pool_len_before = pool.len();

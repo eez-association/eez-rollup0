@@ -161,17 +161,27 @@ pub struct ParentContext {
     pub header: SealedHeader<Header>,
 }
 
+/// How a Sync slot is being produced. Gates cross-chain content: only a
+/// caught-up [`Steady`](Self::Steady) block can settle its postBatch in the
+/// same L1 slot (same timestamp), so [`Catchup`](Self::Catchup) blocks are
+/// structural-only. See `docs/CATCHUP-SYNC-GRID-MISALIGNMENT.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SyncSlotMode {
+    /// Caught-up, aim-ahead slot — drains the cross-chain pool.
+    Steady,
+    /// Behind-the-wall-clock catchup — empty Sync block; cross-chain
+    /// waits for the next [`Steady`](Self::Steady) slot.
+    Catchup,
+}
+
 /// Per-Sync-slot block producer for cross-chain content.
 ///
 /// Called by the Sequencer before each Sync block. The production impl
 /// (`eez-composer::Composer`) drains its `HeldPool`, resolves each held
-/// tx via `eez_protocol::Composer::simulate_and_resolve` into type-0x7E
-/// system txs (Rollup-1 §5), builds the Sync block in-process (revm +
-/// reth-evm), and returns a [`SyncSlotBlock`]. `None` = no cross-chain
-/// content this slot → the Sequencer does a pool-driven Sync commit.
-///
-/// Lives in `eez-driver`, not `eez-composer`, so the Sequencer can call
-/// the umbrella without a dependency cycle.
+/// tx into system txs, builds the Sync block in-process, and returns it.
+/// `None` = no content → the Sequencer does a pool-driven Sync commit.
+/// `mode` gates the drain (see [`SyncSlotMode`]). Lives here, not in
+/// `eez-composer`, to avoid a dependency cycle.
 #[async_trait]
 pub trait SyncSlotComposer: Send + Sync + 'static {
     async fn compose_sync_slot(
@@ -179,6 +189,7 @@ pub trait SyncSlotComposer: Send + Sync + 'static {
         rollup_id: u64,
         parent: ParentContext,
         timestamp: u64,
+        mode: SyncSlotMode,
     ) -> Option<SyncSlotBlock>;
 }
 
@@ -194,6 +205,7 @@ impl SyncSlotComposer for NoCrossChainContent {
         _rollup_id: u64,
         _parent: ParentContext,
         _timestamp: u64,
+        _mode: SyncSlotMode,
     ) -> Option<SyncSlotBlock> {
         None
     }
