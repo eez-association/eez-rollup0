@@ -1758,7 +1758,8 @@ async fn observe_bundle_outcome(
     // receipt by its target block), which can't distinguish relay bad
     // luck from a would-revert tx. Poison is caught at compose time
     // instead (see `compose_via_evm_composer`), so a drop reaching here
-    // is treated as bad luck and re-queued by slot-context recovery.
+    // is treated as bad luck and re-queued by slot-context recovery (which
+    // RECOMPOSES a fresh tx — rbuilder ignores re-sends of the same tx).
     let settled = matches!(
         outcome,
         Ok(SendOutcome::Included {

@@ -452,10 +452,16 @@ where
         sync_slot_timestamp: u64,
     ) -> DriverResult<()> {
         let head = self.committer.last_header().number();
+        // Catchup does NOT enforce the speculative cap. A dropped postBatch
+        // heals only by RECOMPOSING a fresh tx (rbuilder ignores re-sends of
+        // the same tx); the recompose needs the chain to keep advancing, but
+        // the cap freezes it to Idle → deadlock. The cap is a STEADY-state
+        // bound; catchup self-heals like cap=0 (validated). The steady (Slot)
+        // arm below still enforces it.
         let comp = self.timing.per_trigger_composition(
             head,
             sync_slot_block_height,
-            self.catchup_budget(head),
+            crate::MAX_BLOCKS_PER_CATCHUP,
         );
 
         event!(
@@ -475,11 +481,6 @@ where
                 // produce that many Live blocks then the terminal Sync.
                 for _ in 0..live {
                     let last_header = self.committer.last_header();
-                    if self.speculative_limit_paused(last_header.number()) {
-                        // Return, don't break: a partial backfill would land the
-                        // terminal Sync off-grid. Next trigger recomputes it.
-                        return Ok(());
-                    }
                     match self.commit_one(SlotKind::Live, &last_header).await {
                         Ok(()) => {}
                         Err(err) if err.is_stale_parent() => {
@@ -495,9 +496,6 @@ where
                 // ts-aligned with its postBatch, so cross-chain waits for the
                 // next Slot. docs/CATCHUP-SYNC-GRID-MISALIGNMENT.md
                 let last_header = self.committer.last_header();
-                if self.speculative_limit_paused(last_header.number()) {
-                    return Ok(());
-                }
                 let sync_ts = last_header
                     .timestamp()
                     .saturating_add(self.timing.l2_block_time().as_secs());
@@ -549,6 +547,9 @@ where
                 }
                 for _ in 0..future {
                     let last_header = self.committer.last_header();
+                    if self.speculative_limit_paused(last_header.number()) {
+                        return Ok(()); // Defer remaining Future + Sync to next trigger.
+                    }
                     match self.commit_one(SlotKind::Future, &last_header).await {
                         Ok(()) => {}
                         Err(err) if err.is_stale_parent() => {
@@ -559,6 +560,9 @@ where
                     }
                 }
                 let last_header = self.committer.last_header();
+                if self.speculative_limit_paused(last_header.number()) {
+                    return Ok(()); // Defer the Sync (postBatch terminal) to next trigger.
+                }
                 let expected_sync_ts = last_header
                     .timestamp()
                     .saturating_add(self.timing.l2_block_time().as_secs());
@@ -619,25 +623,6 @@ where
             }
         }
         Ok(())
-    }
-
-    /// Per-trigger catchup block budget. The postBatch-size cap
-    /// ([`MAX_BLOCKS_PER_CATCHUP`](crate::MAX_BLOCKS_PER_CATCHUP)),
-    /// further bounded in based mode by the room left in the speculative
-    /// window (`confirmed + max_depth - head`). A catchup chunk must
-    /// reach its terminal before `speculative_limit_paused` trips —
-    /// otherwise no postBatch is emitted, the confirmed cursor never
-    /// advances, and the chain deadlocks. No cap = the full postBatch cap.
-    fn catchup_budget(&self, head: u64) -> u64 {
-        match &self.speculative_limit {
-            Some(limit) => limit
-                .source
-                .confirmed_head()
-                .saturating_add(limit.max_depth)
-                .saturating_sub(head)
-                .min(crate::MAX_BLOCKS_PER_CATCHUP),
-            None => crate::MAX_BLOCKS_PER_CATCHUP,
-        }
     }
 
     /// True if the speculative-depth limit is reached; logged at DEBUG.
