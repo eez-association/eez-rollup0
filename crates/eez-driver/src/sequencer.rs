@@ -452,9 +452,11 @@ where
         sync_slot_timestamp: u64,
     ) -> DriverResult<()> {
         let head = self.committer.last_header().number();
-        let comp = self
-            .timing
-            .per_trigger_composition(head, sync_slot_block_height);
+        let comp = self.timing.per_trigger_composition(
+            head,
+            sync_slot_block_height,
+            self.catchup_budget(head),
+        );
 
         event!(
             name: "eez.sequencer.sync_slot.composition",
@@ -474,7 +476,9 @@ where
                 for _ in 0..live {
                     let last_header = self.committer.last_header();
                     if self.speculative_limit_paused(last_header.number()) {
-                        break;
+                        // Return, don't break: a partial backfill would land the
+                        // terminal Sync off-grid. Next trigger recomputes it.
+                        return Ok(());
                     }
                     match self.commit_one(SlotKind::Live, &last_header).await {
                         Ok(()) => {}
@@ -615,6 +619,25 @@ where
             }
         }
         Ok(())
+    }
+
+    /// Per-trigger catchup block budget. The postBatch-size cap
+    /// ([`MAX_BLOCKS_PER_CATCHUP`](crate::MAX_BLOCKS_PER_CATCHUP)),
+    /// further bounded in based mode by the room left in the speculative
+    /// window (`confirmed + max_depth - head`). A catchup chunk must
+    /// reach its terminal before `speculative_limit_paused` trips —
+    /// otherwise no postBatch is emitted, the confirmed cursor never
+    /// advances, and the chain deadlocks. No cap = the full postBatch cap.
+    fn catchup_budget(&self, head: u64) -> u64 {
+        match &self.speculative_limit {
+            Some(limit) => limit
+                .source
+                .confirmed_head()
+                .saturating_add(limit.max_depth)
+                .saturating_sub(head)
+                .min(crate::MAX_BLOCKS_PER_CATCHUP),
+            None => crate::MAX_BLOCKS_PER_CATCHUP,
+        }
     }
 
     /// True if the speculative-depth limit is reached; logged at DEBUG.
