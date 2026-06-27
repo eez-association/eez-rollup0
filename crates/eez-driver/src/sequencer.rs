@@ -597,8 +597,19 @@ where
                     let parent = crate::slot::ParentContext {
                         header: last_header.clone(),
                     };
+                    // Produce the Sync block at `parent + L2_block_time`, NOT the
+                    // Scheduler-supplied `sync_slot_timestamp`. The DA carries no
+                    // per-block timestamps (eez-payload-codec: block_tx_counts +
+                    // txs only), so the Deriver and prover reconstruct every block
+                    // as `parent + L2_block_time` (deriver.rs `execute_block`). With
+                    // EIP-2935 committing block hashes into state, ANY Sync-block
+                    // timestamp that differs from the reconstruction is an
+                    // unrecoverable re-derivation poison (the block hash, hence the
+                    // next block's 2935 history write, diverges) — a permanent
+                    // settlement freeze. Keep production deterministic/block-count-
+                    // driven; the WARN above flags wall-clock drift for visibility.
                     composer
-                        .compose_sync_slot(*rollup_id, parent, sync_slot_timestamp)
+                        .compose_sync_slot(*rollup_id, parent, expected_sync_ts)
                         .await
                 } else {
                     None
