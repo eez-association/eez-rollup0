@@ -65,9 +65,13 @@ pub struct EmbeddedL1Config {
     /// Auth RPC port (engine API). Chiado mode: external lighthouse
     /// dials in here.
     pub auth_port: u16,
-    /// P2P + discovery port. Dev mode: disabled. Chiado mode: needed
-    /// for libp2p peering to chiado bootnodes.
+    /// P2P + discv4 discovery port. Dev mode: disabled. Chiado mode:
+    /// needed for libp2p peering to chiado bootnodes.
     pub p2p_port: u16,
+    /// discv5 UDP port. Separate from `p2p_port` so the embedded L1's
+    /// discv5 doesn't bind reth's default port and collide with another
+    /// node on the host.
+    pub discv5_port: u16,
     /// Path to JWT secret file. Required in chiado mode (shared with
     /// lighthouse via volume mount).
     pub jwtsecret: Option<PathBuf>,
@@ -134,6 +138,7 @@ fn build_network_rpc_args(cfg: &EmbeddedL1Config) -> Result<(NetworkArgs, RpcSer
         ..NetworkArgs::default()
     };
     network_args.discovery.port = cfg.p2p_port;
+    network_args.discovery.discv5_port = Some(cfg.discv5_port);
     let rpc_args = RpcServerArgs {
         http: true,
         ws: true,
