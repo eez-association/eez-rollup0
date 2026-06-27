@@ -858,7 +858,7 @@ fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
         .unwrap_or(30444);
     // discv5 UDP port — kept separate from p2p_port (discv4) and
     // configurable so it can dodge a default-port collision with other
-    // nodes on the host. Defaults to p2p_port + 1.
+    // nodes on the host. Defaults to p2p_port + 10.
     let discv5_port = env::var("EEZ_L1_DISCV5_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
