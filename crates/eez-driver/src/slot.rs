@@ -164,7 +164,7 @@ pub struct ParentContext {
 /// How a Sync slot is being produced. Gates cross-chain content: only a
 /// caught-up [`Steady`](Self::Steady) block can settle its postBatch in the
 /// same L1 slot (same timestamp), so [`Catchup`](Self::Catchup) blocks are
-/// structural-only. See `docs/CATCHUP-SYNC-GRID-MISALIGNMENT.md`.
+/// structural-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SyncSlotMode {
     /// Caught-up, aim-ahead slot — drains the cross-chain pool.
