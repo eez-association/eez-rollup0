@@ -60,7 +60,7 @@ pub struct FailedBatch {
     pub txs: Vec<HeldTx>,
     /// Drop on a skipped L1 slot — recovery won't count it toward
     /// poison-eviction. False for a genuine built-slot exclusion.
-    pub skip_miss: bool,
+    pub slot_skipped: bool,
 }
 
 /// Resolution state of one optimistically-committed Sync block's batch.
@@ -88,7 +88,7 @@ struct InFlight {
     parent: SealedHeader<alloy_consensus::Header>,
     resolution: Resolution,
     /// Set by `mark_failed` when the drop was a skipped-slot miss.
-    skip_miss: bool,
+    slot_skipped: bool,
 }
 
 /// Ledger of in-flight and settled-but-unfinalized optimistic batches.
@@ -125,7 +125,7 @@ impl OptimisticallyIncluded {
                 post_batch_hash,
                 parent,
                 resolution: Resolution::Pending,
-                skip_miss: false,
+                slot_skipped: false,
             },
         );
     }
@@ -174,14 +174,14 @@ impl OptimisticallyIncluded {
     /// the actual recovery (L2 reorg + re-push) happens in slot
     /// context via [`Self::take_failed_for_recovery`] — the observer
     /// task never mutates chain state. No-op if the entry is already
-    /// Settled (cursor confirmation wins) or gone. `skip_miss` marks a
+    /// Settled (cursor confirmation wins) or gone. `slot_skipped` marks a
     /// skipped-slot drop so recovery won't count it toward eviction.
-    pub fn mark_failed(&self, sync_height: u64, skip_miss: bool) {
+    pub fn mark_failed(&self, sync_height: u64, slot_skipped: bool) {
         let mut map = self.by_sync_height.lock().unwrap();
         if let Some(entry) = map.get_mut(&sync_height) {
             if entry.resolution == Resolution::Pending {
                 entry.resolution = Resolution::Failed;
-                entry.skip_miss = skip_miss;
+                entry.slot_skipped = slot_skipped;
             }
         }
     }
@@ -205,7 +205,7 @@ impl OptimisticallyIncluded {
             post_batch_hash: entry.post_batch_hash,
             parent: entry.parent,
             txs: entry.txs,
-            skip_miss: entry.skip_miss,
+            slot_skipped: entry.slot_skipped,
         })
     }
 
@@ -219,7 +219,7 @@ impl OptimisticallyIncluded {
                 post_batch_hash: batch.post_batch_hash,
                 parent: batch.parent,
                 resolution: Resolution::Failed,
-                skip_miss: batch.skip_miss,
+                slot_skipped: batch.slot_skipped,
             },
         );
     }
@@ -322,6 +322,18 @@ mod tests {
         // Recovery error path: reinsert keeps the gate closed.
         pool.reinsert_failed(batch);
         assert_eq!(pool.blocking_height(0), Some(10));
+    }
+
+    #[test]
+    fn failed_recovery_propagates_slot_skipped() {
+        let pool = OptimisticallyIncluded::new();
+        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
+        // A skipped-slot drop isn't the tx's fault; the flag must reach
+        // recovery so the caller requeues without poison-eviction.
+        pool.mark_failed(10, true);
+        let batch = pool.take_failed_for_recovery(0).expect("failed entry");
+        assert!(batch.slot_skipped);
+        assert_eq!(batch.txs.len(), 2);
     }
 
     #[test]

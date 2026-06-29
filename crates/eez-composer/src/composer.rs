@@ -855,9 +855,9 @@ where
             let mut keep: Vec<crate::HeldTx> = Vec::with_capacity(failed.txs.len());
             let mut dropped = 0usize;
             let mut evicted_chains: Vec<(alloy_primitives::Address, u64)> = Vec::new();
-            // Skip-miss: re-queue without counting toward poison-eviction
+            // slot_skipped: re-queue without counting toward poison-eviction
             // (a skipped slot heals via a fresh pin next tick).
-            let skip_miss = failed.skip_miss;
+            let slot_skipped = failed.slot_skipped;
             for mut tx in failed.txs {
                 if let Ok(true) = submitter.receipt_exists(tx.hash).await {
                     dropped += 1;
@@ -868,7 +868,7 @@ where
                         tx_hash = %tx.hash,
                         "user_tx already has an L1 receipt; not re-queueing (user must resubmit)",
                     );
-                } else if skip_miss {
+                } else if slot_skipped {
                     keep.push(tx);
                 } else {
                     // A relay drop on a BUILT slot did NOT burn the nonce
@@ -1811,16 +1811,15 @@ async fn observe_bundle_outcome(
     if settled {
         optimistic.mark_settled(sync_height);
     } else {
-        // Skip-miss (pinned slot skipped → block ts != pin) isn't the tx's
-        // fault; only a built-slot exclusion counts toward poison-eviction.
-        // NextBlock / lookup failure default to skip_miss (don't false-evict).
-        let skip_miss = match target {
+        // slot_skipped = pinned slot didn't land as pinned (block ts != pin, or
+        // unreadable) → not the tx's fault; requeue without poison-eviction.
+        let slot_skipped = match target {
             BundleTarget::Exact { block, timestamp } => {
                 submitter.block_timestamp(block).await.ok().flatten() != Some(timestamp)
             }
             BundleTarget::NextBlock => false,
         };
-        optimistic.mark_failed(sync_height, skip_miss);
+        optimistic.mark_failed(sync_height, slot_skipped);
     }
 }
 
