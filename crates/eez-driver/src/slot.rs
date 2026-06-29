@@ -180,6 +180,20 @@ pub trait SyncSlotComposer: Send + Sync + 'static {
         parent: ParentContext,
         timestamp: u64,
     ) -> Option<SyncSlotBlock>;
+
+    /// Recovery-only hook for the sequencer's speculative-depth cap.
+    ///
+    /// Called when the L2 head is already at the cap, so the normal Sync-slot path
+    /// cannot emit the terminal Sync block that would otherwise let settlement
+    /// advance. Implementations may clean up abandoned in-flight state or rewind a
+    /// local unverified tail, but must not build or submit a normal Sync block.
+    async fn recover_sync_slot_without_emission(
+        &self,
+        _rollup_id: u64,
+        _parent: ParentContext,
+    ) -> bool {
+        false
+    }
 }
 
 /// No-op [`SyncSlotComposer`] — used when no umbrella is wired

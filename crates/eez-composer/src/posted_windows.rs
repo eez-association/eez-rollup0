@@ -196,6 +196,28 @@ impl PostedWindows {
         self.notify.send_replace(tick);
     }
 
+    /// Drop a deferred window whose poster task abandoned before submitting to L1.
+    ///
+    /// This is distinct from `mark_fast_forwarded`: the window did not settle and
+    /// has no pending L1 tx, so a late prover attestation must not make it resolved
+    /// locally. The next sync slot rebuilds a fresh window from the current cursor.
+    pub fn abandon_unsubmitted(&self, to_block: u64) -> Option<PostedWindow> {
+        let (removed, tick) = {
+            let Ok(mut l) = self.inner.lock() else {
+                return None;
+            };
+            let removed = l.by_height.remove(&to_block)?;
+            if l.verified_frontier >= removed.to_block {
+                l.verified_frontier = l
+                    .verified_frontier
+                    .min(removed.from_block.saturating_sub(1));
+            }
+            (removed, l.bump())
+        };
+        self.notify.send_replace(tick);
+        Some(removed)
+    }
+
     /// Flip the window whose `public_inputs_hash` matches to attested and
     /// advance the verified frontier; returns the new frontier. Called by the
     /// ProofSink ONLY after `verify_attestation` passed — so the frontier
@@ -497,6 +519,22 @@ mod tests {
         // L1 confirms → cleared + frontier follows.
         assert_eq!(pw.mark_settled_on_l1(1, 90).frontier, 90);
         assert!(pw.next_to_dispatch().is_none());
+    }
+
+    #[test]
+    fn abandon_unsubmitted_drops_window_and_ignores_late_attestation() {
+        let pw = PostedWindows::new();
+        pw.reinit_from_cursor(10);
+        pw.record_posted(win(11, 20, 0xa));
+        assert_eq!(pw.mark_attested(B256::repeat_byte(0xa)), 20);
+
+        let removed = pw.abandon_unsubmitted(20).expect("window removed");
+        assert_eq!(removed.to_block, 20);
+        assert_eq!(pw.verified_frontier(), 10);
+        assert!(pw.next_to_dispatch().is_none());
+
+        assert_eq!(pw.mark_attested(B256::repeat_byte(0xa)), 10);
+        assert_eq!(pw.verified_frontier(), 10);
     }
 
     #[test]

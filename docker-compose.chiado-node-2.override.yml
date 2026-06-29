@@ -62,6 +62,7 @@ services:
       - --discovery.v5.port=30741
       - --ipcdisable
       - --disable-discovery
+      - --engine.state-root-fallback
       - --engine.persistence-threshold=256
       - --engine.memory-block-buffer-target=128
 

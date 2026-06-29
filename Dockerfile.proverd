@@ -42,27 +42,26 @@ RUN cargo build --release -p eez-proverd \
 # ── validator: native-validate from OUR zisk-eth-client fork ─────────
 FROM rust:1.94-bookworm AS validator
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        clang libclang-dev pkg-config cmake libssl-dev git ca-certificates \
+        clang libclang-dev pkg-config cmake libssl-dev git ca-certificates nasm \
     && rm -rf /var/lib/apt/lists/*
 # OUR fork + the exact commit that carries native-validate + the EEZ
 # public-inputs commitment (guest parity). NOT on upstream.
 ARG ZISK_FORK_URL=https://github.com/eez-association/zisk-eth-client.git
-ARG ZISK_COMMIT=6e013d8
+ARG ZISK_COMMIT=907ec9c233aacba0cf058b1f2fa1d11b483d5f3a
 # The fork's `[patch."…/stateless.git"]` points `stateless`/`tries` at a SIBLING
 # checkout (`../zisk-patch-stateless`), so clone that repo NEXT TO the fork (the
 # fork lands in /v, so the sibling resolves to /zisk-patch-stateless). It is the
 # CLEAN upstream 0xPolygonHermez branch (no local mods); pin the commit so the
 # image is reproducible. Without this the build fails: "failed to read
 # /zisk-patch-stateless/crates/stateless/Cargo.toml".
-# OUR fork of zisk-patch-stateless: the pinned commit (d46671c, "pair-roots
-# stateless validation + restored post-execution checks") is a LOCAL change that
-# never landed on upstream 0xPolygonHermez, and the host native-validate that
-# passed the driven E2E was built from it — so mirror it to eez-association
-# (c74759b == d46671c minus the CI workflow; build-identical). Clone the branch
-# explicitly (the commit is not on the default branch).
+# OUR fork of zisk-patch-stateless: the pinned commit carries pair-roots
+# stateless validation plus the EIP-2935 empty-block fix. Without that fix,
+# native-validate falls back to parent.state_root for empty Prague blocks and
+# rejects live L2 blocks whose only state transition is the recent-blockhash
+# system write.
 ARG ZISK_PATCH_URL=https://github.com/eez-association/zisk-patch-stateless.git
-ARG ZISK_PATCH_BRANCH=zisk/ed189a5
-ARG ZISK_PATCH_COMMIT=c74759b
+ARG ZISK_PATCH_BRANCH=eez-revm38
+ARG ZISK_PATCH_COMMIT=0849ad6e73cc176dee17bc34b0e85e94215feb90
 RUN git clone --branch "$ZISK_PATCH_BRANCH" "$ZISK_PATCH_URL" /zisk-patch-stateless \
     && git -C /zisk-patch-stateless checkout "$ZISK_PATCH_COMMIT"
 WORKDIR /v

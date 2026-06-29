@@ -462,6 +462,30 @@ where
         true
     }
 
+    fn abandon_unsubmitted_window(
+        &self,
+        rollup_id: u64,
+        sync_height: u64,
+        public_inputs_hash: B256,
+        reason: &'static str,
+    ) {
+        let Some(windows) = self.inner.posted_windows.get() else {
+            return;
+        };
+        if let Some(window) = windows.abandon_unsubmitted(sync_height) {
+            event!(
+                name: "eez.composer.posted_window.abandoned_unsubmitted",
+                Level::WARN,
+                rollup_id,
+                sync_height,
+                reason,
+                public_inputs_hash = %public_inputs_hash,
+                window_public_inputs_hash = %window.public_inputs_hash,
+                "removed deferred posted-window entry before L1 submission",
+            );
+        }
+    }
+
     fn abandon_oversized_inflight(
         &self,
         rollup_id: u64,
@@ -805,6 +829,74 @@ where
     /// bundle dispatch via `compose_via_evm_composer` (optimistic).
     /// Without one (no embedded L1), the drained txs commit as ordinary
     /// type-0x2 calls — the standalone build+commit fallback.
+    async fn recover_sync_slot_without_emission(
+        &self,
+        rollup_id: u64,
+        parent: ParentContext,
+    ) -> bool {
+        let parent_number = parent.header.number();
+        event!(
+            name: "eez.composer.sync_slot.recovery_only",
+            Level::WARN,
+            rollup_id,
+            parent_number,
+            "sync-slot recovery requested without Sync emission",
+        );
+        let Some(rollup) = self.inner.rollups.get(&rollup_id) else {
+            event!(
+                name: "eez.composer.sync_slot.recovery_unknown_rollup",
+                Level::ERROR,
+                rollup_id,
+                known_rollups = ?self.inner.rollups.keys().collect::<Vec<_>>(),
+                "recovery-only sync slot called for unknown rollup_id",
+            );
+            return false;
+        };
+        if self.inner.evm_composer.is_none() {
+            return false;
+        }
+
+        let cursor = rollup.l1_head.cursor();
+        rollup.optimistic.resolve_below_cursor(cursor);
+
+        let mut recovered = false;
+        if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
+            let sync_height = failed.sync_height;
+            event!(
+                name: "eez.composer.sync_slot.recovery_failed_batch",
+                Level::WARN,
+                rollup_id,
+                cursor,
+                parent_number,
+                sync_height,
+                "recovering failed optimistic batch while Sync emission is capped",
+            );
+            let _ = self.recover_failed_batch(rollup_id, rollup, failed).await;
+            recovered = true;
+        }
+
+        let cursor = rollup.l1_head.cursor();
+        match self
+            .try_rewind_unsettled_tail(rollup_id, rollup, cursor, parent_number)
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => recovered,
+            Err(err) => {
+                event!(
+                    name: "eez.composer.sync_slot.recovery_rewind_failed",
+                    Level::ERROR,
+                    rollup_id,
+                    cursor,
+                    parent_number,
+                    error = %err,
+                    "recovery-only sync slot failed to rewind local unverified tail",
+                );
+                recovered
+            }
+        }
+    }
+
     async fn compose_sync_slot(
         &self,
         rollup_id: u64,
@@ -1141,7 +1233,7 @@ where
             return Ok(false);
         };
         let gap = parent_number.saturating_sub(cursor);
-        if gap <= max_span {
+        if gap < max_span {
             return Ok(false);
         }
         let Some(committer) = self.inner.committer.get() else {
@@ -1169,7 +1261,7 @@ where
             max_span,
             "checking whether local unverified tail should be rewound to the L1 cursor",
         );
-        if gap <= max_span || observed_head <= cursor {
+        if gap < max_span || observed_head <= cursor {
             return Ok(false);
         }
         let target_header = rollup
@@ -2614,6 +2706,12 @@ where
                     sync_height,
                     "deferred post spawned without a proof store — abandoning; marking failed for recovery",
                 );
+                this.abandon_unsubmitted_window(
+                    rollup_id,
+                    sync_height,
+                    public_inputs_hash,
+                    "no_store",
+                );
                 optimistic.mark_failed(sync_height);
                 return;
             };
@@ -2665,6 +2763,12 @@ where
                         public_inputs_hash = %public_inputs_hash,
                         "deferred post abandoned by recovery before attestation arrived; dropping task",
                     );
+                    this.abandon_unsubmitted_window(
+                        rollup_id,
+                        sync_height,
+                        public_inputs_hash,
+                        "abandoned_before_attestation",
+                    );
                     return;
                 }
                 if let Some(s) = store
@@ -2686,6 +2790,12 @@ where
                     public_inputs_hash = %public_inputs_hash,
                     "deferred post timed out waiting for prover attestation — marking failed; next slot recovers",
                 );
+                this.abandon_unsubmitted_window(
+                    rollup_id,
+                    sync_height,
+                    public_inputs_hash,
+                    "timeout",
+                );
                 optimistic.mark_failed(sync_height);
                 return;
             };
@@ -2697,6 +2807,12 @@ where
                     sync_height,
                     public_inputs_hash = %public_inputs_hash,
                     "deferred proof arrived after recovery abandoned the window; not submitting stale postBatch",
+                );
+                this.abandon_unsubmitted_window(
+                    rollup_id,
+                    sync_height,
+                    public_inputs_hash,
+                    "late_proof_abandoned",
                 );
                 return;
             }
@@ -2714,6 +2830,12 @@ where
                     rollup_id,
                     sync_height,
                     "deferred post has no cross-chain exec ctx — abandoning; marking failed for recovery",
+                );
+                this.abandon_unsubmitted_window(
+                    rollup_id,
+                    sync_height,
+                    public_inputs_hash,
+                    "no_ctx",
                 );
                 optimistic.mark_failed(sync_height);
                 return;
@@ -2763,6 +2885,12 @@ where
                         sync_height,
                         error = %e,
                         "deferred post: finalize_post_batch_tx failed — marking failed; next slot recovers",
+                    );
+                    this.abandon_unsubmitted_window(
+                        rollup_id,
+                        sync_height,
+                        public_inputs_hash,
+                        "finalize_failed",
                     );
                     optimistic.mark_failed(sync_height);
                 }

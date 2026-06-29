@@ -488,7 +488,7 @@ where
                 let live_to_produce = live.min(max_live);
                 for _ in 0..live_to_produce {
                     let last_header = self.committer.last_header();
-                    if self.speculative_limit_paused(last_header.number()) {
+                    if self.speculative_limit_reserves_sync(last_header.number()) {
                         break;
                     }
                     match self.commit_one(SlotKind::Live, &last_header).await {
@@ -506,6 +506,11 @@ where
                 // l2_block_time — backfill catchup sets its own pace.
                 let last_header = self.committer.last_header();
                 if self.speculative_limit_paused(last_header.number()) {
+                    self.try_recover_sync_slot_without_emission(
+                        &last_header,
+                        "catchup.terminal_sync_at_cap",
+                    )
+                    .await;
                     return Ok(());
                 }
                 let sync_ts = last_header
@@ -550,6 +555,11 @@ where
                 for _ in 0..live {
                     let last_header = self.committer.last_header();
                     if self.speculative_limit_paused(last_header.number()) {
+                        self.try_recover_sync_slot_without_emission(
+                            &last_header,
+                            "slot.live_at_cap",
+                        )
+                        .await;
                         return Ok(()); // Defer Future + Sync to next trigger.
                     }
                     match self.commit_one(SlotKind::Live, &last_header).await {
@@ -573,6 +583,11 @@ where
                     }
                 }
                 let last_header = self.committer.last_header();
+                if self.speculative_limit_paused(last_header.number()) {
+                    self.try_recover_sync_slot_without_emission(&last_header, "slot.sync_at_cap")
+                        .await;
+                    return Ok(());
+                }
                 let expected_sync_ts = last_header
                     .timestamp()
                     .saturating_add(self.timing.l2_block_time().as_secs());
@@ -658,6 +673,54 @@ where
             return true;
         }
         false
+    }
+
+    /// True when one more Live block would consume the entire speculative
+    /// budget and leave no room for the terminal Sync block that can settle
+    /// the catch-up span.
+    fn speculative_limit_reserves_sync(&self, head_number: u64) -> bool {
+        let Some(limit) = &self.speculative_limit else {
+            return false;
+        };
+        let confirmed = limit.source.confirmed_head();
+        let speculative_depth = head_number.saturating_sub(confirmed);
+        if speculative_depth.saturating_add(1) >= limit.max_depth {
+            event!(
+                name: "eez.sequencer.speculative.reserve_sync",
+                Level::DEBUG,
+                head_number,
+                confirmed,
+                speculative_depth,
+                max_depth = limit.max_depth,
+                "stopping catch-up live backfill to reserve speculative budget for terminal Sync",
+            );
+            return true;
+        }
+        false
+    }
+
+    async fn try_recover_sync_slot_without_emission(
+        &self,
+        last_header: &SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+        reason: &'static str,
+    ) -> bool {
+        let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref() else {
+            return false;
+        };
+        event!(
+            name: "eez.sequencer.speculative.recover_sync_slot",
+            Level::WARN,
+            rollup_id,
+            reason,
+            head_number = last_header.number(),
+            "speculative cap reached; asking composer to recover without emitting a Sync block",
+        );
+        let parent = crate::slot::ParentContext {
+            header: last_header.clone(),
+        };
+        composer
+            .recover_sync_slot_without_emission(*rollup_id, parent)
+            .await
     }
 
     /// Commit a pre-built Sync block (from the cross-chain composer)
