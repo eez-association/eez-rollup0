@@ -389,7 +389,7 @@ mod tests {
         assert_eq!(t.k(), 6);
         assert_eq!(t.future_count(), 2);
         assert_eq!(t.live_count(), 3);
-        assert_eq!(t.proof_window_open(), Duration::from_millis(6_000));
+        assert_eq!(t.proof_window_open(), Duration::from_secs(6));
         assert_eq!(t.submission_deadline(), Duration::from_millis(10_500));
     }
 
@@ -418,7 +418,7 @@ mod tests {
         assert_eq!(t.future_count(), 1);
         assert_eq!(t.live_count(), 3);
         // +3s trigger: 200ms prove finishes 1.7s before the +5s slot.
-        assert_eq!(t.proof_window_open(), Duration::from_millis(3_000));
+        assert_eq!(t.proof_window_open(), Duration::from_secs(3));
     }
 
     #[test]
