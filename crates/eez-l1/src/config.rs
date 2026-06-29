@@ -78,9 +78,21 @@ impl SubmitterConfig {
             ),
             _ => None,
         };
+        // Builder relay endpoint. On chiado this is an external
+        // Flashbots-style relay set explicitly. On the embedded dev L1
+        // the node serves `eth_sendBundle` itself (see
+        // `eez-node::bundle_rpc`), so when unset we default the builder
+        // URL to the L1 RPC URL — the composer's bundle path then hits
+        // the embedded node directly and never degrades to mempool.
+        let rpc_url = parse_url(ENV_RPC_URL)?;
+        let builder_rpc_url = match env::var(ENV_BUILDER_RPC_URL) {
+            Ok(raw) if !raw.is_empty() => Url::parse(&raw)
+                .map_err(|e| L1Error::Config(format!("{ENV_BUILDER_RPC_URL}: {e}")))?,
+            _ => rpc_url.clone(),
+        };
         Ok(Self {
-            rpc_url: parse_url(ENV_RPC_URL)?,
-            builder_rpc_url: parse_url(ENV_BUILDER_RPC_URL)?,
+            rpc_url,
+            builder_rpc_url,
             target_rpc_url,
             poster: parse_key(ENV_POSTER_KEY)?,
             eez: parse_address(ENV_EEZ_ADDRESS)?,

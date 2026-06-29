@@ -15,6 +15,7 @@
 //! | set | unset | **follower** | reth + `L1Watcher` + Deriver (no Sequencer) |
 //! | set | set | **composer** | reth + `L1Watcher` + Deriver + Sequencer (L1-anchored) + Composer umbrella |
 
+mod bundle_rpc;
 mod ingress;
 mod l1_embedded;
 
@@ -191,6 +192,7 @@ fn main() -> eyre::Result<()> {
                         .with_database(db)
                         .with_launch_context(build_l1_runtime()?)
                         .node(EthereumNode::default())
+                        .extend_rpc_modules(bundle_rpc::install_dev_bundle_rpc)
                         .launch_with_debug_capabilities()
                         .await?;
                     event!(
