@@ -1462,6 +1462,20 @@ fn driven_effective_settlement(
     true
 }
 
+fn driven_past_target_can_backfill(
+    event_block: u64,
+    target_to_block: u64,
+    stream_tip: u64,
+    window_empty: bool,
+    backfill_enabled: bool,
+) -> bool {
+    event_block > target_to_block
+        && window_empty
+        && backfill_enabled
+        && stream_tip < target_to_block
+        && event_block != stream_tip.saturating_add(1)
+}
+
 /// Classify the settlement chain into the 3-way verdict the prover loop acts on.
 /// The OD-5 anchor is pre-checked against the RE-EXECUTED `batch_anchor_root`: a
 /// pure `first.currentState != batch_anchor_root` is the (retreatable)
@@ -1885,8 +1899,21 @@ async fn main() -> eyre::Result<()> {
                     // construction to_block is the settling block (is_sync) and the window
                     // closes + breaks there, so this fires only if that block carried NO
                     // composition (a composer bug) — fail-closed: refuse + re-request.
+                    // Exception: if the first replay event is already past to_block
+                    // because the composer's bounded ring evicted the historical target,
+                    // let the archive backfill path below reconstruct [stream_tip+1..to_block].
+                    // The directive PostBatch sidecar is then attached to that backfilled
+                    // target block by `driven_effective_settlement`.
                     if let Some(d) = &vr {
-                        if event.block_number > d.to_block {
+                        if event.block_number > d.to_block
+                            && !driven_past_target_can_backfill(
+                                event.block_number,
+                                d.to_block,
+                                stream_tip,
+                                window.is_empty(),
+                                l2_rpc_url.is_some(),
+                            )
+                        {
                             error!(
                                 got = event.block_number,
                                 to_block = d.to_block,
@@ -1968,7 +1995,10 @@ async fn main() -> eyre::Result<()> {
                             Some(url) if got > expected => {
                                 let chunk =
                                     u64::try_from(args.max_window.max(1)).unwrap_or(u64::MAX);
-                                let backfill_got = got.min(expected.saturating_add(chunk));
+                                let replay_upper = vr
+                                    .as_ref()
+                                    .map_or(got, |d| got.min(d.to_block.saturating_add(1)));
+                                let backfill_got = replay_upper.min(expected.saturating_add(chunk));
                                 warn!(
                                     expected,
                                     got,
@@ -2761,7 +2791,12 @@ mod tests {
     #[test]
     fn driven_settlement_ignores_non_target_postbatch_sidecar() {
         let mut event = control_event_with_postbatch(10);
-        assert!(!driven_effective_settlement(&mut event, true, Some(20)));
+        assert!(!driven_effective_settlement(
+            &mut event,
+            true,
+            Some(20),
+            None
+        ));
         assert!(
             event.composition.is_none(),
             "stale non-target sidecar must be stripped before validation"
@@ -2771,8 +2806,57 @@ mod tests {
     #[test]
     fn driven_settlement_accepts_target_postbatch_sidecar() {
         let mut event = control_event_with_postbatch(20);
-        assert!(driven_effective_settlement(&mut event, true, Some(20)));
+        assert!(driven_effective_settlement(
+            &mut event,
+            true,
+            Some(20),
+            None
+        ));
         assert!(event.composition.is_some());
+    }
+
+    #[test]
+    fn driven_settlement_attaches_directive_sidecar_to_backfilled_target() {
+        let mut event = eez_control_rpc::v1::ControlEvent {
+            block_number: 20,
+            composition: None,
+            ..Default::default()
+        };
+        let sidecar = eez_control_rpc::v1::PostBatch {
+            abi_calldata: vec![1, 2, 3],
+            ..Default::default()
+        };
+
+        assert!(driven_effective_settlement(
+            &mut event,
+            true,
+            Some(20),
+            Some(&sidecar),
+        ));
+        assert_eq!(
+            event
+                .composition
+                .and_then(|c| c.post_batch)
+                .expect("attached sidecar")
+                .abi_calldata,
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn driven_past_target_backfill_guard_only_allows_first_archive_gap() {
+        assert!(driven_past_target_can_backfill(
+            168_401, 70_934, 69_910, true, true
+        ));
+        assert!(!driven_past_target_can_backfill(
+            168_401, 70_934, 69_910, false, true
+        ));
+        assert!(!driven_past_target_can_backfill(
+            168_401, 70_934, 69_910, true, false
+        ));
+        assert!(!driven_past_target_can_backfill(
+            70_935, 70_934, 70_934, true, true
+        ));
     }
 
     #[test]
