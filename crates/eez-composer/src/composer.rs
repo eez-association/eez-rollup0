@@ -879,7 +879,29 @@ where
             .as_ref()
             .and_then(|_| rollup.optimistic.blocking_height(cursor));
         if let Some(blocking_height) = blocking_height {
-            self.abandon_oversized_inflight(rollup_id, rollup, cursor, blocking_height);
+            let abandoned =
+                self.abandon_oversized_inflight(rollup_id, rollup, cursor, blocking_height);
+            if abandoned {
+                match self
+                    .try_rewind_unsettled_tail(rollup_id, rollup, cursor, parent_number)
+                    .await
+                {
+                    Ok(true) => return None,
+                    Ok(false) => {}
+                    Err(err) => {
+                        event!(
+                            name: "eez.composer.patch_recovery.rewind_failed",
+                            Level::ERROR,
+                            rollup_id,
+                            cursor,
+                            parent_number,
+                            blocking_height,
+                            error = %err,
+                            "failed to rewind oversized unverified tail; committing empty Sync block and retrying next slot",
+                        );
+                    }
+                }
+            }
             event!(
                 name: "eez.composer.sync_slot.bundle_in_flight",
                 Level::INFO,
@@ -915,6 +937,24 @@ where
         }
 
         if self.inner.evm_composer.is_some() {
+            match self
+                .try_rewind_unsettled_tail(rollup_id, rollup, cursor, parent_number)
+                .await
+            {
+                Ok(true) => return None,
+                Ok(false) => {}
+                Err(err) => {
+                    event!(
+                        name: "eez.composer.patch_recovery.rewind_failed",
+                        Level::ERROR,
+                        rollup_id,
+                        cursor,
+                        parent_number,
+                        error = %err,
+                        "failed to rewind deep unverified tail; falling back to bounded patch scheduling",
+                    );
+                }
+            }
             match self
                 .try_schedule_patch_recovery(rollup_id, rollup, parent_number)
                 .await
@@ -1090,6 +1130,60 @@ where
         + 'static,
     <L2 as TransactionsProvider>::Transaction: Encodable2718,
 {
+    async fn try_rewind_unsettled_tail(
+        &self,
+        rollup_id: u64,
+        rollup: &RollupState<L2>,
+        cursor: u64,
+        parent_number: u64,
+    ) -> Result<bool, String> {
+        let Some(max_span) = self.inner.patch_recovery_max_span else {
+            return Ok(false);
+        };
+        let gap = parent_number.saturating_sub(cursor);
+        if gap <= max_span {
+            return Ok(false);
+        }
+        let Some(committer) = self.inner.committer.get() else {
+            return Err("committer handle not wired".to_owned());
+        };
+        if committer.last_header().number() <= cursor {
+            return Ok(false);
+        }
+
+        let _guard = committer.begin_reconcile().await;
+        // Re-check under the reconcile lock: the Deriver may have advanced the
+        // cursor or the Sequencer may have committed while this task waited.
+        let cursor = rollup.l1_head.cursor();
+        let head = committer.last_header();
+        let gap = head.number().saturating_sub(cursor);
+        if gap <= max_span || head.number() <= cursor {
+            return Ok(false);
+        }
+        let target_header = rollup
+            .l2_provider
+            .sealed_header(cursor)
+            .map_err(|e| format!("sealed_header({cursor}): {e}"))?
+            .ok_or_else(|| format!("local L2 header at cursor {cursor} missing"))?;
+
+        event!(
+            name: "eez.composer.patch_recovery.rewind_unsettled_tail",
+            Level::WARN,
+            rollup_id,
+            cursor,
+            head = head.number(),
+            gap,
+            max_span,
+            target_hash = %target_header.hash(),
+            "rewinding local unverified L2 tail to the L1 cursor so settlement can rebuild from small provable batches",
+        );
+        committer
+            .reorg_to(target_header)
+            .await
+            .map_err(|e| format!("reorg_to(cursor {cursor}): {e}"))?;
+        Ok(true)
+    }
+
     fn choose_patch_recovery_target(
         &self,
         rollup_id: u64,
