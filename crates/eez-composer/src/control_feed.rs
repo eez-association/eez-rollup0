@@ -38,6 +38,12 @@ const RING_MAX_BYTES: usize = 1024 * 1024 * 1024;
 /// Minimum replay horizon in events. At ~1 L2 block/s this retains about 36h
 /// of empty-block control history, bounded by `RING_MAX_BYTES` for busy blocks.
 const RING_MIN_EVENTS: usize = 131_072;
+/// Retain settling events separately from the ordinary per-block ring. Archive
+/// backfill can reconstruct ordinary blocks, but it cannot reconstruct the
+/// Sync block's `composition`, so a far-behind prover must still be able to
+/// replay that exact event after the regular ring has evicted it.
+const SETTLING_RETAINED_MAX_EVENTS: usize = RING_MIN_EVENTS;
+const SETTLING_RETAINED_MAX_BYTES: usize = 512 * 1024 * 1024;
 /// Capacity of the LIVE broadcast buffer. Small on purpose: it only
 /// covers transient subscriber slowness — a subscriber that overruns it
 /// is cut with `DATA_LOSS` and recovers via replay.
@@ -60,7 +66,9 @@ pub struct ControlPublisher {
 #[derive(Debug)]
 struct Ring {
     events: VecDeque<Arc<ControlEvent>>,
+    settling_events: BTreeMap<u64, Arc<ControlEvent>>,
     bytes: usize,
+    settling_bytes: usize,
     max_events: usize,
 }
 
@@ -100,7 +108,9 @@ impl ControlPublisher {
         Arc::new(Self {
             ring: Mutex::new(Ring {
                 events: VecDeque::with_capacity(max_events),
+                settling_events: BTreeMap::new(),
                 bytes: 0,
+                settling_bytes: 0,
                 max_events,
             }),
             tx,
@@ -115,13 +125,37 @@ impl ControlPublisher {
         let event = Arc::new(event);
         {
             let mut ring = self.ring.lock().expect("control ring poisoned");
-            ring.bytes += event_bytes(&event);
+            let bytes = event_bytes(&event);
+            let block_number = event.block_number;
+            let is_settling = event.composition.is_some();
+            ring.bytes += bytes;
             ring.events.push_back(Arc::clone(&event));
+            if is_settling {
+                if let Some(old) = ring
+                    .settling_events
+                    .insert(block_number, Arc::clone(&event))
+                {
+                    ring.settling_bytes = ring.settling_bytes.saturating_sub(event_bytes(&old));
+                }
+                ring.settling_bytes += bytes;
+            } else if let Some(old) = ring.settling_events.remove(&block_number) {
+                // A reorg can reproduce a previously-settling height as a normal
+                // block. Drop the stale retained composition for that height.
+                ring.settling_bytes = ring.settling_bytes.saturating_sub(event_bytes(&old));
+            }
             while ring.events.len() > ring.max_events
                 || (ring.bytes > RING_MAX_BYTES && ring.events.len() > 1)
             {
                 if let Some(evicted) = ring.events.pop_front() {
                     ring.bytes -= event_bytes(&evicted);
+                }
+            }
+            while ring.settling_events.len() > SETTLING_RETAINED_MAX_EVENTS
+                || (ring.settling_bytes > SETTLING_RETAINED_MAX_BYTES
+                    && ring.settling_events.len() > 1)
+            {
+                if let Some((_, evicted)) = ring.settling_events.pop_first() {
+                    ring.settling_bytes = ring.settling_bytes.saturating_sub(event_bytes(&evicted));
                 }
             }
         }
@@ -133,10 +167,11 @@ impl ControlPublisher {
     /// oldest first.
     fn snapshot_from(&self, from_block: u64) -> Vec<Arc<ControlEvent>> {
         let mut by_number = BTreeMap::new();
-        for ev in self
-            .ring
-            .lock()
-            .expect("control ring poisoned")
+        let ring = self.ring.lock().expect("control ring poisoned");
+        for ev in ring.settling_events.range(from_block..).map(|(_, ev)| ev) {
+            by_number.insert(ev.block_number, Arc::clone(ev));
+        }
+        for ev in ring
             .events
             .iter()
             .filter(|ev| ev.block_number >= from_block)
@@ -144,7 +179,9 @@ impl ControlPublisher {
             // Reorg recovery can re-produce the same height with a different
             // hash. Keep the newest ring entry for each height; replaying the
             // stale first entry splices old and new chains and makes the prover
-            // reject on parent-hash continuity.
+            // reject on parent-hash continuity. Ring entries overwrite retained
+            // settling entries at the same height because the ring is the newer
+            // canonical source while it still contains that height.
             by_number.insert(ev.block_number, Arc::clone(ev));
         }
         by_number.into_values().collect()
@@ -255,6 +292,22 @@ mod tests {
         }
     }
 
+    fn settling_ev(number: u64) -> ControlEvent {
+        let mut event = ev(number);
+        event.composition = Some(eez_control_rpc::v1::Composition {
+            post_batch: Some(eez_control_rpc::v1::PostBatch {
+                abi_calldata: vec![1, 2, 3],
+                rollup_id: 1,
+                current_state: vec![0x11; 32],
+                new_state: vec![0x22; 32],
+                entry_count: 1,
+                public_inputs_hash: vec![0x33; 32],
+                l1_block_hash: Vec::new(),
+            }),
+        });
+        event
+    }
+
     #[test]
     fn ring_keeps_newest_and_respects_event_cap() {
         // `new(_)` floors max_events at RING_MIN_EVENTS, regardless of
@@ -269,6 +322,27 @@ mod tests {
         let snap = p.snapshot_from(1);
         assert_eq!(snap.len(), RING_MIN_EVENTS);
         assert_eq!(snap.first().unwrap().block_number, total - min_events + 1);
+        assert_eq!(snap.last().unwrap().block_number, total);
+    }
+
+    #[test]
+    fn retained_settling_event_survives_ordinary_ring_eviction() {
+        let p = ControlPublisher::new(4);
+        let min_events = u64::try_from(RING_MIN_EVENTS).unwrap();
+        p.publish(settling_ev(10));
+        let total = 10 + min_events + 24;
+        for n in 11..=total {
+            p.publish(ev(n));
+        }
+
+        let snap = p.snapshot_from(1);
+        assert_eq!(snap.first().unwrap().block_number, 10);
+        assert!(snap.first().unwrap().composition.is_some());
+        assert_eq!(
+            snap[1].block_number,
+            total - min_events + 1,
+            "ordinary ring should still start at its eviction floor"
+        );
         assert_eq!(snap.last().unwrap().block_number, total);
     }
 

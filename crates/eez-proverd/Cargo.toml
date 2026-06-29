@@ -20,6 +20,7 @@ futures-util.workspace       = true
 # Serialize the ControlEvent witness to native-validate's witness.json +
 # parse the validator's verified-public-inputs JSON.
 serde_json.workspace         = true
+serde.workspace              = true
 hex.workspace                = true
 # Decode the settling block's PostBatch (control feed) + recompute the
 # publicInputsHash byte-for-byte to cross-check the composer's claim before

@@ -26,7 +26,8 @@
 //! a pure feed observer.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::path::Path;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,7 @@ use eez_evm::entries::decode_postbatch;
 use eez_evm::public_inputs::public_inputs_hashes;
 use eez_evm::signer::EcdsaProofSigner;
 use futures_util::{StreamExt, stream::FuturesUnordered};
+use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 /// Parse a 32-byte hex `B256` (the vkey arg).
@@ -175,6 +177,205 @@ struct Args {
     /// Bounded parallelism for archive replay-gap recovery.
     #[arg(long, env = "EEZ_BACKFILL_CONCURRENCY", default_value_t = 1)]
     backfill_concurrency: usize,
+}
+
+const DRIVEN_CHECKPOINT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DrivenCheckpoint {
+    version: u32,
+    rollup_id: u64,
+    from_block: u64,
+    to_block: u64,
+    public_inputs_hash: String,
+    claimed_current_state: String,
+    proved_to: u64,
+    batch_anchor_root: String,
+    prev_chunk_final_root: String,
+    prev_chunk_last_hash: String,
+}
+
+#[derive(Debug, Clone)]
+struct DrivenResume {
+    proved_to: u64,
+    batch_anchor_root: B256,
+    prev_chunk_final_root: B256,
+    prev_chunk_last_hash: Vec<u8>,
+}
+
+fn checkpoint_path(work_dir: &str) -> PathBuf {
+    Path::new(work_dir).join("driven-checkpoint.json")
+}
+
+fn hex_prefixed(bytes: &[u8]) -> String {
+    format!("0x{}", hex::encode(bytes))
+}
+
+fn decode_hex_field(field: &str, value: &str, expected_len: usize) -> eyre::Result<Vec<u8>> {
+    let raw = value.strip_prefix("0x").unwrap_or(value);
+    let bytes = hex::decode(raw).map_err(|e| eyre::eyre!("{field}: invalid hex: {e}"))?;
+    if bytes.len() != expected_len {
+        eyre::bail!(
+            "{field}: expected {expected_len} bytes, got {}",
+            bytes.len()
+        );
+    }
+    Ok(bytes)
+}
+
+fn decode_b256_field(field: &str, value: &str) -> eyre::Result<B256> {
+    Ok(B256::from_slice(&decode_hex_field(field, value, 32)?))
+}
+
+impl DrivenCheckpoint {
+    fn matches_directive(&self, d: &VerifyRange) -> bool {
+        self.version == DRIVEN_CHECKPOINT_VERSION
+            && self.rollup_id == d.rollup_id
+            && self.from_block == d.from_block
+            && self.to_block == d.to_block
+            && self.public_inputs_hash == hex_prefixed(&d.public_inputs_hash)
+            && self.claimed_current_state == hex_prefixed(&d.claimed_current_state)
+    }
+
+    fn decode_resume(&self) -> eyre::Result<DrivenResume> {
+        Ok(DrivenResume {
+            proved_to: self.proved_to,
+            batch_anchor_root: decode_b256_field("batch_anchor_root", &self.batch_anchor_root)?,
+            prev_chunk_final_root: decode_b256_field(
+                "prev_chunk_final_root",
+                &self.prev_chunk_final_root,
+            )?,
+            prev_chunk_last_hash: decode_hex_field(
+                "prev_chunk_last_hash",
+                &self.prev_chunk_last_hash,
+                32,
+            )?,
+        })
+    }
+}
+
+async fn remove_checkpoint_file(path: &Path) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => warn!(path = %path.display(), error = %e, "driven checkpoint cleanup failed"),
+    }
+}
+
+async fn load_driven_checkpoint(work_dir: &str, d: &VerifyRange) -> Option<DrivenResume> {
+    let path = checkpoint_path(work_dir);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "driven checkpoint read failed; replaying directive from the batch boundary",
+            );
+            return None;
+        }
+    };
+    let checkpoint: DrivenCheckpoint = match serde_json::from_slice(&bytes) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "driven checkpoint is corrupt; discarding",
+            );
+            remove_checkpoint_file(&path).await;
+            return None;
+        }
+    };
+    if !checkpoint.matches_directive(d) {
+        info!(
+            path = %path.display(),
+            checkpoint_from = checkpoint.from_block,
+            checkpoint_to = checkpoint.to_block,
+            directive_from = d.from_block,
+            directive_to = d.to_block,
+            "driven checkpoint belongs to a different directive; discarding",
+        );
+        remove_checkpoint_file(&path).await;
+        return None;
+    }
+    if checkpoint.proved_to < d.from_block || checkpoint.proved_to >= d.to_block {
+        warn!(
+            path = %path.display(),
+            proved_to = checkpoint.proved_to,
+            from_block = d.from_block,
+            to_block = d.to_block,
+            "driven checkpoint cursor is outside the directive body; discarding",
+        );
+        remove_checkpoint_file(&path).await;
+        return None;
+    }
+    match checkpoint.decode_resume() {
+        Ok(resume) => {
+            info!(
+                from_block = d.from_block,
+                to_block = d.to_block,
+                proved_to = resume.proved_to,
+                "driven: resuming directive from durable non-settling checkpoint",
+            );
+            Some(resume)
+        }
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "driven checkpoint failed validation; discarding",
+            );
+            remove_checkpoint_file(&path).await;
+            None
+        }
+    }
+}
+
+async fn save_driven_checkpoint(
+    work_dir: &str,
+    d: &VerifyRange,
+    proved_to: u64,
+    batch_anchor_root: B256,
+    prev_chunk_final_root: B256,
+    prev_chunk_last_hash: &[u8],
+) -> eyre::Result<()> {
+    if proved_to < d.from_block || proved_to >= d.to_block {
+        return Ok(());
+    }
+    let path = checkpoint_path(work_dir);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let checkpoint = DrivenCheckpoint {
+        version: DRIVEN_CHECKPOINT_VERSION,
+        rollup_id: d.rollup_id,
+        from_block: d.from_block,
+        to_block: d.to_block,
+        public_inputs_hash: hex_prefixed(&d.public_inputs_hash),
+        claimed_current_state: hex_prefixed(&d.claimed_current_state),
+        proved_to,
+        batch_anchor_root: hex_prefixed(batch_anchor_root.as_slice()),
+        prev_chunk_final_root: hex_prefixed(prev_chunk_final_root.as_slice()),
+        prev_chunk_last_hash: hex_prefixed(prev_chunk_last_hash),
+    };
+    let tmp = path.with_extension("json.tmp");
+    let json = serde_json::to_vec_pretty(&checkpoint)?;
+    tokio::fs::write(&tmp, json).await?;
+    tokio::fs::rename(&tmp, &path).await?;
+    info!(
+        path = %path.display(),
+        from_block = d.from_block,
+        to_block = d.to_block,
+        proved_to,
+        "driven: checkpointed accepted non-settling replay progress",
+    );
+    Ok(())
+}
+
+async fn clear_driven_checkpoint(work_dir: &str) {
+    remove_checkpoint_file(&checkpoint_path(work_dir)).await;
 }
 
 /// Serialize a control-feed witness to native-validate's `witness.json`
@@ -1561,11 +1762,20 @@ async fn main() -> eyre::Result<()> {
             }
         };
 
+        let driven_resume = match &vr {
+            Some(d) => load_driven_checkpoint(&args.work_dir, d).await,
+            None => None,
+        };
+
         // Phase 3: driven mode takes from_block from the directive (= posted+1,
-        // the OD-5 anchor block + 1); self-pick resumes from the settled cursor.
-        let from_block = match &vr {
-            Some(d) => d.from_block,
-            None => last_accepted + 1,
+        // the OD-5 anchor block + 1), unless the same directive has a durable
+        // non-settling checkpoint. In that case resume at proved_to+1 with the
+        // checkpointed telescope state below. Self-pick resumes from the settled
+        // cursor.
+        let from_block = match (&vr, &driven_resume) {
+            (Some(_), Some(resume)) => resume.proved_to.saturating_add(1),
+            (Some(d), None) => d.from_block,
+            (None, _) => last_accepted + 1,
         };
         let mut stream = match control.subscribe(SubscribeRequest { from_block }).await {
             Ok(s) => s.into_inner(),
@@ -1597,7 +1807,9 @@ async fn main() -> eyre::Result<()> {
         // driven start (last_accepted=0) with from_block>1 would backfill
         // [1..posted] = re-verify from genesis, exactly the [1..tip] replay the
         // composer-driven inversion exists to ELIMINATE.
-        let mut stream_tip: u64 = from_block.saturating_sub(1);
+        let mut stream_tip: u64 = driven_resume
+            .as_ref()
+            .map_or(from_block.saturating_sub(1), |resume| resume.proved_to);
         // OD-5 batch anchor (GAP-2): the RE-EXECUTED `state(posted)` — the parent
         // root of the FIRST validated chunk since the last settlement. The composer
         // posts ONE batch `[posted+1 .. sync_block]` anchored at `state(posted)`,
@@ -1611,11 +1823,15 @@ async fn main() -> eyre::Result<()> {
         // reconnect always replays from the batch boundary (`posted+1`), so it is
         // RE-DERIVED here from the re-streamed first chunk — never carried stale
         // across a restart.
-        let mut batch_anchor_root: Option<B256> = None;
+        let mut batch_anchor_root: Option<B256> = driven_resume
+            .as_ref()
+            .map(|resume| resume.batch_anchor_root);
         // The previous closed chunk's re-executed final root — the next chunk's
         // expected re-executed parent (state-root telescoping across chunks, which
         // the block-hash contiguity guard does NOT cover). Reset with the anchor.
-        let mut prev_chunk_final_root: Option<B256> = None;
+        let mut prev_chunk_final_root: Option<B256> = driven_resume
+            .as_ref()
+            .map(|resume| resume.prev_chunk_final_root);
         // The previous closed chunk's LAST block hash — the next chunk's first
         // event's expected `parent_hash`. The intra-window contiguity guard only
         // checks `parent_hash == tip.block_hash` for the 2nd+ event of a window
@@ -1625,7 +1841,9 @@ async fn main() -> eyre::Result<()> {
         // hash across the chunk boundary and assert contiguity, fail-closed. The
         // state-root telescope (`prev_chunk_final_root`) and this hash check are
         // complementary; both must hold. Empty across the FIRST chunk (None).
-        let mut prev_chunk_last_hash: Option<Vec<u8>> = None;
+        let mut prev_chunk_last_hash: Option<Vec<u8>> = driven_resume
+            .as_ref()
+            .map(|resume| resume.prev_chunk_last_hash.clone());
 
         // Storm guard: the (window_start, window_end) of the last window we ran
         // through native-validate. A re-verification churn in the composer's
@@ -1836,6 +2054,7 @@ async fn main() -> eyre::Result<()> {
                         let mut verified: Option<VerifiedWindow> = None;
                         // The publicInputsHash to sign IF every gate passes (attesting).
                         let mut attest_hash: Option<B256> = None;
+                        let mut proof_sink_accepted = false;
                         // Set ONLY when the settlement chain fails because the
                         // composer's claimed `state(posted)` anchor != the re-executed
                         // anchor (a stale resume cursor) — carries the claimed root so
@@ -2301,11 +2520,14 @@ async fn main() -> eyre::Result<()> {
                                         post_batch_proof: sig.to_vec(),
                                     };
                                     match submit_slot_proof(&proof_sink_url, proof).await {
-                                        Ok(true) => info!(
-                                            window_start,
-                                            %hash,
-                                            "✓ ATTESTED — signed publicInputsHash + ProofSink accepted",
-                                        ),
+                                        Ok(true) => {
+                                            proof_sink_accepted = true;
+                                            info!(
+                                                window_start,
+                                                %hash,
+                                                "✓ ATTESTED — signed publicInputsHash + ProofSink accepted",
+                                            );
+                                        }
                                         Ok(false) => warn!(
                                             window_start,
                                             "ProofSink did NOT accept the attestation"
@@ -2335,6 +2557,34 @@ async fn main() -> eyre::Result<()> {
                         if let Some(last) = window.last() {
                             prev_chunk_last_hash = Some(last.block_hash.clone());
                         }
+                        if driven && validating && !is_sync {
+                            if let Some(d) = &vr {
+                                if let (Some(anchor), Some(prev_final), Some(prev_hash)) = (
+                                    batch_anchor_root,
+                                    prev_chunk_final_root,
+                                    prev_chunk_last_hash.as_deref(),
+                                ) {
+                                    if let Err(e) = save_driven_checkpoint(
+                                        &args.work_dir,
+                                        d,
+                                        window_end,
+                                        anchor,
+                                        prev_final,
+                                        prev_hash,
+                                    )
+                                    .await
+                                    {
+                                        warn!(
+                                            error = %e,
+                                            from_block = d.from_block,
+                                            to_block = d.to_block,
+                                            proved_to = window_end,
+                                            "driven: failed to checkpoint accepted replay progress",
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         if is_sync {
                             // Phase 3 (driven): the composer dictated this frontier. The
                             // directive is satisfied iff this settling block IS its to_block;
@@ -2345,10 +2595,22 @@ async fn main() -> eyre::Result<()> {
                             if driven {
                                 let target = vr.as_ref().map(|d| d.to_block);
                                 if Some(window_end) == target {
-                                    info!(
-                                        window_end,
-                                        "driven: directive settled + attested — advancing the cursor; awaiting the next directive",
-                                    );
+                                    if proof_sink_accepted {
+                                        clear_driven_checkpoint(&args.work_dir).await;
+                                        info!(
+                                            window_end,
+                                            "driven: directive settled + attested — advancing the cursor; awaiting the next directive",
+                                        );
+                                    } else {
+                                        warn!(
+                                            window_end,
+                                            "driven: settling block verified but ProofSink did not accept an attestation; retaining checkpoint for retry",
+                                        );
+                                        info!(
+                                            window_end,
+                                            "driven: directive settling block verified without accepted attestation — advancing local cursor only; awaiting re-dispatch",
+                                        );
+                                    }
                                     last_accepted = window_end;
                                     consecutive_retreats = 0;
                                     // batch_anchor_root / prev_chunk_final_root are re-declared
