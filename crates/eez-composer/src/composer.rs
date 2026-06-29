@@ -23,7 +23,9 @@ use std::sync::Arc;
 use alloy_eips::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use async_trait::async_trait;
-use eez_driver::{BlockCommitterHandle, ParentContext, SyncSlotBlock, SyncSlotComposer};
+use eez_driver::{
+    BlockCommitterHandle, ParentContext, SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
+};
 use eez_l1::{BundleTarget, L1Event, L1Watcher, SendOutcome, Submitter};
 use eez_prover::Prover;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -486,12 +488,14 @@ where
         rollup_id: u64,
         parent: ParentContext,
         timestamp: u64,
+        mode: SyncSlotMode,
     ) -> Option<SyncSlotBlock> {
         event!(
             name: "eez.composer.sync_slot.invoked",
             Level::INFO,
             rollup_id,
             timestamp,
+            mode = ?mode,
             "compose_sync_slot invoked",
         );
         let rollup = self.inner.rollups.get(&rollup_id).or_else(|| {
@@ -583,6 +587,37 @@ where
                     None
                 }
             };
+        }
+
+        // Catchup: structural-only — skip the drain, emit a minimal postBatch
+        // (cross-chain stays pooled for the next Steady slot).
+        if matches!(mode, SyncSlotMode::Catchup) {
+            let (Some(_), Some(ctx)) = (
+                self.inner.evm_composer.as_ref(),
+                self.inner.cc_exec_ctx.as_ref(),
+            ) else {
+                return None;
+            };
+            return self
+                .dispatch_minimal_postbatch(
+                    ctx,
+                    rollup_id,
+                    rollup,
+                    &parent_header,
+                    timestamp,
+                    suggested_fee_recipient,
+                )
+                .await
+                .unwrap_or_else(|err| {
+                    event!(
+                        name: "eez.composer.catchup.minimal_failed",
+                        Level::ERROR,
+                        rollup_id,
+                        error = %err,
+                        "catchup minimal postBatch failed; Sequencer commits empty Sync",
+                    );
+                    None
+                });
         }
 
         let pool_len_before = pool.len();
@@ -1717,12 +1752,9 @@ async fn observe_bundle_outcome(
     let outcome = submitter
         .send_bundle(&bundle, BundleTarget::NextBlock, Some(expected_final_state))
         .await;
-    // Under strict all-or-nothing bundles, `Included` ⟹ every tx
-    // succeeded ⟹ settled; the only failure is a drop (postBatch had no
-    // receipt by its target block), which can't distinguish relay bad
-    // luck from a would-revert tx. Poison is caught at compose time
-    // instead (see `compose_via_evm_composer`), so a drop reaching here
-    // is treated as bad luck and re-queued by slot-context recovery.
+    // Strict all-or-nothing: Included ⟹ settled; the only failure is a drop.
+    // Poison is caught at compose time, so a drop here is bad luck — recovery
+    // recomposes a FRESH tx next trigger (the builder ignores re-sends).
     let settled = matches!(
         outcome,
         Ok(SendOutcome::Included {
