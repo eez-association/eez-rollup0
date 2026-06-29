@@ -934,7 +934,8 @@ fn read_l1_rollup_id() -> u64 {
 ///
 ///   - `EEZ_L1_HTTP_PORT` — default `18545`
 ///   - `EEZ_L1_AUTH_PORT` — default `18546`
-///   - `EEZ_L1_P2P_PORT`  — default `30444`
+///   - `EEZ_L1_P2P_PORT`  — default `30444` (P2P + discv4)
+///   - `EEZ_L1_DISCV5_PORT` — default `p2p_port + 10` (discv5 UDP)
 ///   - `EEZ_L1_DATADIR`   — default `$TMPDIR/eez-l1-embedded` (ephemeral)
 ///   - `EEZ_L1_CHAIN_PATH` — L1 genesis JSON; unset → reth's `dev`
 ///     chainspec (all forks at genesis, no funded accounts)
@@ -953,6 +954,13 @@ fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(30444);
+    // discv5 UDP port — kept separate from p2p_port (discv4) and
+    // configurable so it can dodge a default-port collision with other
+    // nodes on the host. Defaults to p2p_port + 10.
+    let discv5_port = env::var("EEZ_L1_DISCV5_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(p2p_port.wrapping_add(10));
     let datadir = env::var("EEZ_L1_DATADIR").map_or_else(
         |_| std::env::temp_dir().join("eez-l1-embedded"),
         std::path::PathBuf::from,
@@ -984,6 +992,7 @@ fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
         http_port,
         auth_port,
         p2p_port,
+        discv5_port,
         jwtsecret,
     })
 }
