@@ -41,10 +41,16 @@ const NEXT_BLOCK_SLACK: u64 = 2;
 /// Which L1 block the bundle should land in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BundleTarget {
-    /// Resolved to `latest + NEXT_BLOCK_SLACK` at send time.
+    /// Resolved to `latest + NEXT_BLOCK_SLACK` at send time. Unpinned —
+    /// used for off-cadence catch-up.
     NextBlock,
-    /// Caller-picked exact L1 block.
-    Exact(u64),
+    /// Land in exactly L1 block `block`, and only if its timestamp equals
+    /// `timestamp`. The timestamp pin makes the settlement slot match the
+    /// L2 Sync block's anchored slot by construction: a gnosis block's
+    /// timestamp IS its slot time, so a skipped slot (block lands a slot
+    /// late) won't match — the bundle drops instead of settling with a
+    /// drifted L2 timestamp.
+    Exact { block: u64, timestamp: u64 },
 }
 
 /// One bundle attempt's outcome. `Dropped` is the expected miss path —
@@ -138,8 +144,15 @@ impl Submitter {
                 "send_bundle called with no txs".to_string(),
             ));
         }
+        // Exact targets carry the L2 Sync block's anchored timestamp; pin
+        // the bundle to land only in a block at that exact time. NextBlock
+        // (catch-up) is off-cadence, so it stays unpinned.
+        let pin_timestamp = match target {
+            BundleTarget::Exact { timestamp, .. } => Some(timestamp),
+            BundleTarget::NextBlock => None,
+        };
         let target_block = match target {
-            BundleTarget::Exact(n) => n,
+            BundleTarget::Exact { block, .. } => block,
             BundleTarget::NextBlock => {
                 let target_provider = self.inner.build_target_provider();
                 target_provider
@@ -160,7 +173,13 @@ impl Submitter {
         // API degrade to ordered mempool submission inside
         // `dispatch_and_observe`.
         self.inner
-            .dispatch_and_observe(raw_txs, post_batch_hash, target_block, expected_final_state)
+            .dispatch_and_observe(
+                raw_txs,
+                post_batch_hash,
+                target_block,
+                pin_timestamp,
+                expected_final_state,
+            )
             .await
     }
 
@@ -239,6 +258,17 @@ impl Submitter {
             .map_err(|e| L1Error::Provider(format!("get_block_by_number({number}): {e}")))?
             .map(|b| b.header.hash))
     }
+
+    /// Timestamp of an L1 block on the target chain, or `None` if absent.
+    /// Distinguishes a skipped-slot drop from a genuine exclusion.
+    pub async fn block_timestamp(&self, number: u64) -> L1Result<Option<u64>> {
+        let provider = self.inner.build_target_provider();
+        Ok(provider
+            .get_block_by_number(BlockNumberOrTag::Number(number))
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_block_by_number({number}): {e}")))?
+            .map(|b| b.header.timestamp))
+    }
 }
 
 /// One past `BatchPosted` event, with enough context for the Deriver
@@ -304,6 +334,7 @@ impl Inner {
         raw_txs: &[alloy_primitives::Bytes],
         post_batch_hash: TxHash,
         target_block: u64,
+        pin_timestamp: Option<u64>,
         expected_final_state: Option<alloy_primitives::B256>,
     ) -> L1Result<SendOutcome> {
         let hexes: Vec<String> = raw_txs
@@ -316,6 +347,7 @@ impl Inner {
             self.config.builder_rpc_url.as_str(),
             &hex_refs,
             target_block,
+            pin_timestamp,
         )
         .await
         {
@@ -507,6 +539,7 @@ pub async fn post_bundle(
     builder_rpc_url: &str,
     raw_tx_hexes: &[&str],
     target_block: u64,
+    pin_timestamp: Option<u64>,
 ) -> L1Result<()> {
     // STRICT all-or-nothing: `revertingTxHashes`/`droppingTxHashes`
     // empty. Per rbuilder's order commit, txs execute in submitted order
@@ -517,12 +550,21 @@ pub async fn post_bundle(
     // mid-chain prefix root and desyncing the composer. Sim is in-order
     // too, so user_txs simulate after the postBatch — no whitelist
     // needed for a "pre-postBatch state" sim.
+    let mut bundle_params = serde_json::json!({
+        "txs": raw_tx_hexes,
+        "blockNumber": format!("0x{target_block:x}"),
+    });
+    if let Some(ts) = pin_timestamp {
+        // Pin inclusion to the exact L1 slot the L2 Sync block anchored
+        // to. The builder enforces min/maxTimestamp against block.timestamp
+        // (verified on chiado), so a skipped slot won't match and the
+        // bundle drops rather than settling with a drifted L2 timestamp.
+        bundle_params["minTimestamp"] = serde_json::json!(ts);
+        bundle_params["maxTimestamp"] = serde_json::json!(ts);
+    }
     let body = serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "eth_sendBundle",
-        "params": [{
-            "txs": raw_tx_hexes,
-            "blockNumber": format!("0x{target_block:x}"),
-        }],
+        "params": [bundle_params],
     });
     let resp: serde_json::Value = http
         .post(builder_rpc_url)
