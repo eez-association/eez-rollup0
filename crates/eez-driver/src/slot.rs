@@ -83,6 +83,9 @@ pub enum SlotEvent {
         /// Wall-clock unix timestamp the Sync block will advertise.
         /// = `L1.timestamp_of_anchor + L1_block_time`.
         timestamp: u64,
+        /// L1 block this slot is anchored to; the postBatch targets
+        /// `l1_head + 1` in steady state.
+        l1_head: u64,
     },
     /// Interval-mode tick — produce one Live block at this target
     /// wall-clock timestamp. Sequencer's greedy-backfill catches up
@@ -184,11 +187,16 @@ pub enum SyncSlotMode {
 /// `eez-composer`, to avoid a dependency cycle.
 #[async_trait]
 pub trait SyncSlotComposer: Send + Sync + 'static {
+    /// Compose a Sync slot. `target_l1_block`: `Some(n)` aims the postBatch
+    /// at exactly L1 block `n` (steady state, `l1_head + 1`); `None` aims the
+    /// next available block (catch-up). `mode` gates the drain: `Catchup`
+    /// blocks are empty (cross-chain waits for the next `Steady` slot).
     async fn compose_sync_slot(
         &self,
         rollup_id: u64,
         parent: ParentContext,
         timestamp: u64,
+        target_l1_block: Option<u64>,
         mode: SyncSlotMode,
     ) -> Option<SyncSlotBlock>;
 }
@@ -205,6 +213,7 @@ impl SyncSlotComposer for NoCrossChainContent {
         _rollup_id: u64,
         _parent: ParentContext,
         _timestamp: u64,
+        _target_l1_block: Option<u64>,
         _mode: SyncSlotMode,
     ) -> Option<SyncSlotBlock> {
         None
@@ -252,7 +261,7 @@ struct PendingSyncSlot {
     block_height: u64,
     /// Wall-clock unix timestamp the Sync block will advertise.
     timestamp: u64,
-    /// L1 block number of the anchoring head (logging only).
+    /// L1 block of the anchoring head; carried into [`SlotEvent::SyncSlot`].
     l1_head: u64,
     /// L1 block timestamp of the anchoring head (logging only).
     l1_timestamp: u64,
@@ -311,7 +320,12 @@ where
             // select branch wins doesn't stretch the deadline. ZERO when
             // disarmed — the branch is disabled, the future never polled.
             let trigger_wait = pending.map_or(Duration::ZERO, |p| {
-                Duration::from_secs(p.trigger_at.saturating_sub(now_unix()))
+                // Align the wake to the `trigger_at` instant in ms. A
+                // whole-second sleep wakes N seconds after the loop's
+                // fractional phase, firing the trigger ~0.8s late and
+                // eating the send-lead before the slot.
+                let trigger_at_ms = p.trigger_at.saturating_mul(1_000);
+                Duration::from_millis(trigger_at_ms.saturating_sub(now_unix_millis()))
             });
 
             tokio::select! {
@@ -370,6 +384,7 @@ where
                         .send(SlotEvent::SyncSlot {
                             block_height: fired.block_height,
                             timestamp: fired.timestamp,
+                            l1_head: fired.l1_head,
                         })
                         .await
                         .is_err()
@@ -409,4 +424,16 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Wall-clock unix time in milliseconds — the defer-on-lateness check
+/// needs sub-second precision that [`now_unix`] lacks.
+pub(crate) fn now_unix_millis() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
