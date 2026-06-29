@@ -358,7 +358,11 @@ where
             SlotEvent::SyncSlot {
                 block_height,
                 timestamp,
-            } => self.advance_sync_slot(block_height, timestamp).await,
+                l1_head,
+            } => {
+                self.advance_sync_slot(block_height, timestamp, l1_head)
+                    .await
+            }
             SlotEvent::LiveTick {
                 sync_slot_block_height,
             } => {
@@ -443,6 +447,21 @@ where
         }
     }
 
+    /// True if the bundle (ready at ~`now + proof_time`) can't reach the
+    /// relay by `sync_slot_timestamp − submission_slack`, i.e. it would miss
+    /// the immediate next L1 slot. Steady state has headroom; fires only on
+    /// a late trigger, where the slot is deferred.
+    fn sync_block_misses_l1_slot(&self, sync_slot_timestamp: u64) -> bool {
+        let proof_ms = u64::try_from(self.timing.proof_time().as_millis()).unwrap_or(u64::MAX);
+        let slack_ms =
+            u64::try_from(self.timing.submission_slack().as_millis()).unwrap_or(u64::MAX);
+        let ready_ms = crate::slot::now_unix_millis().saturating_add(proof_ms);
+        let deadline_ms = sync_slot_timestamp
+            .saturating_mul(1_000)
+            .saturating_sub(slack_ms);
+        ready_ms > deadline_ms
+    }
+
     /// L1-anchored handler: read current head, compute the per-trigger
     /// Live/Future/Sync split via
     /// [`RollupTiming::per_trigger_composition`], produce accordingly.
@@ -450,6 +469,7 @@ where
         &mut self,
         sync_slot_block_height: u64,
         sync_slot_timestamp: u64,
+        l1_head: u64,
     ) -> DriverResult<()> {
         let head = self.committer.last_header().number();
         // Catchup ignores the speculative cap (a steady-state bound): a
@@ -502,7 +522,8 @@ where
                         header: last_header.clone(),
                     };
                     composer
-                        .compose_sync_slot(*rollup_id, parent, sync_ts, SyncSlotMode::Catchup)
+                        // Catch-up: next-available L1 block (unpinned), empty.
+                        .compose_sync_slot(*rollup_id, parent, sync_ts, None, SyncSlotMode::Catchup)
                         .await
                 } else {
                     None
@@ -576,19 +597,34 @@ where
                     );
                 }
 
-                // Drain cross-chain into a prebuilt Sync block (None = empty,
-                // pool-driven). Pass expected_sync_ts (re-derivable), not the
-                // raw scheduler value.
-                let prebuilt = if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref()
-                {
+                // Defer-on-lateness: a late trigger that can't land the bundle
+                // in the next L1 slot commits an empty block and holds the pool
+                // (next slot covers it). Else drain into a prebuilt Sync block.
+                // Check against expected_sync_ts — the ts the bundle is pinned
+                // to below — so an off-grid trigger already past its pin defers
+                // instead of composing a bundle that can't make its slot.
+                let prebuilt = if self.sync_block_misses_l1_slot(expected_sync_ts) {
+                    event!(
+                        name: "eez.sequencer.sync_slot.deferred_late",
+                        Level::WARN,
+                        sync_slot_block_height,
+                        sync_slot_timestamp,
+                        l1_head,
+                        "trigger too late for the immediate L1 slot; committing an empty block and holding the pool — next slot's batch covers it",
+                    );
+                    None
+                } else if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref() {
                     let parent = crate::slot::ParentContext {
                         header: last_header.clone(),
                     };
                     composer
+                        // Steady: aim the immediate next L1 block, pinned to
+                        // expected_sync_ts (re-derivable; == the L1 slot ts on-grid).
                         .compose_sync_slot(
                             *rollup_id,
                             parent,
                             expected_sync_ts,
+                            Some(l1_head + 1),
                             SyncSlotMode::Steady,
                         )
                         .await
