@@ -876,21 +876,37 @@ where
         }
 
         let cursor = rollup.l1_head.cursor();
+        if let Some(blocking_height) = rollup.optimistic.blocking_height(cursor) {
+            let abandoned =
+                self.abandon_oversized_inflight(rollup_id, rollup, cursor, blocking_height);
+            event!(
+                name: "eez.composer.sync_slot.recovery_blocked",
+                Level::WARN,
+                rollup_id,
+                cursor,
+                parent_number,
+                blocking_height,
+                abandoned,
+                "cap recovery is waiting for the in-flight settlement gate to resolve before posting a historical patch",
+            );
+            return recovered || abandoned;
+        }
+
         match self
-            .try_rewind_unsettled_tail(rollup_id, rollup, cursor, parent_number)
+            .try_schedule_patch_recovery(rollup_id, rollup, parent_number)
             .await
         {
             Ok(true) => true,
             Ok(false) => recovered,
             Err(err) => {
                 event!(
-                    name: "eez.composer.sync_slot.recovery_rewind_failed",
+                    name: "eez.composer.patch_recovery.failed",
                     Level::ERROR,
                     rollup_id,
                     cursor,
                     parent_number,
                     error = %err,
-                    "recovery-only sync slot failed to rewind local unverified tail",
+                    "recovery-only sync slot failed to schedule bounded historical patch",
                 );
                 recovered
             }
@@ -974,25 +990,15 @@ where
             let abandoned =
                 self.abandon_oversized_inflight(rollup_id, rollup, cursor, blocking_height);
             if abandoned {
-                match self
-                    .try_rewind_unsettled_tail(rollup_id, rollup, cursor, parent_number)
-                    .await
-                {
-                    Ok(true) => return None,
-                    Ok(false) => {}
-                    Err(err) => {
-                        event!(
-                            name: "eez.composer.patch_recovery.rewind_failed",
-                            Level::ERROR,
-                            rollup_id,
-                            cursor,
-                            parent_number,
-                            blocking_height,
-                            error = %err,
-                            "failed to rewind oversized unverified tail; committing empty Sync block and retrying next slot",
-                        );
-                    }
-                }
+                event!(
+                    name: "eez.composer.patch_recovery.abandoned_gate",
+                    Level::WARN,
+                    rollup_id,
+                    cursor,
+                    parent_number,
+                    blocking_height,
+                    "oversized in-flight gate was abandoned; next capped slot will recover it without rewinding L2",
+                );
             }
             event!(
                 name: "eez.composer.sync_slot.bundle_in_flight",
@@ -1029,24 +1035,6 @@ where
         }
 
         if self.inner.evm_composer.is_some() {
-            match self
-                .try_rewind_unsettled_tail(rollup_id, rollup, cursor, parent_number)
-                .await
-            {
-                Ok(true) => return None,
-                Ok(false) => {}
-                Err(err) => {
-                    event!(
-                        name: "eez.composer.patch_recovery.rewind_failed",
-                        Level::ERROR,
-                        rollup_id,
-                        cursor,
-                        parent_number,
-                        error = %err,
-                        "failed to rewind deep unverified tail; falling back to bounded patch scheduling",
-                    );
-                }
-            }
             match self
                 .try_schedule_patch_recovery(rollup_id, rollup, parent_number)
                 .await
@@ -1222,74 +1210,6 @@ where
         + 'static,
     <L2 as TransactionsProvider>::Transaction: Encodable2718,
 {
-    async fn try_rewind_unsettled_tail(
-        &self,
-        rollup_id: u64,
-        rollup: &RollupState<L2>,
-        cursor: u64,
-        parent_number: u64,
-    ) -> Result<bool, String> {
-        let Some(max_span) = self.inner.patch_recovery_max_span else {
-            return Ok(false);
-        };
-        let gap = parent_number.saturating_sub(cursor);
-        if gap < max_span {
-            return Ok(false);
-        }
-        let Some(committer) = self.inner.committer.get() else {
-            return Err("committer handle not wired".to_owned());
-        };
-        let mirror_head_before = committer.last_header().number();
-
-        let _guard = committer.begin_reconcile().await;
-        // Re-check under the reconcile lock: the Deriver may have advanced the
-        // cursor or the Sequencer may have committed while this task waited.
-        let cursor = rollup.l1_head.cursor();
-        let head = committer.last_header();
-        let observed_head = parent_number.max(head.number());
-        let gap = observed_head.saturating_sub(cursor);
-        event!(
-            name: "eez.composer.patch_recovery.rewind_check",
-            Level::INFO,
-            rollup_id,
-            cursor,
-            parent_number,
-            mirror_head_before,
-            mirror_head = head.number(),
-            observed_head,
-            gap,
-            max_span,
-            "checking whether local unverified tail should be rewound to the L1 cursor",
-        );
-        if gap < max_span || observed_head <= cursor {
-            return Ok(false);
-        }
-        let target_header = rollup
-            .l2_provider
-            .sealed_header(cursor)
-            .map_err(|e| format!("sealed_header({cursor}): {e}"))?
-            .ok_or_else(|| format!("local L2 header at cursor {cursor} missing"))?;
-
-        event!(
-            name: "eez.composer.patch_recovery.rewind_unsettled_tail",
-            Level::WARN,
-            rollup_id,
-            cursor,
-            parent_number,
-            mirror_head = head.number(),
-            observed_head,
-            gap,
-            max_span,
-            target_hash = %target_header.hash(),
-            "rewinding local unverified L2 tail to the L1 cursor so settlement can rebuild from small provable batches",
-        );
-        committer
-            .reorg_to(target_header)
-            .await
-            .map_err(|e| format!("reorg_to(cursor {cursor}): {e}"))?;
-        Ok(true)
-    }
-
     fn choose_patch_recovery_target(
         &self,
         rollup_id: u64,
@@ -1376,7 +1296,7 @@ where
         };
         let cursor = rollup.l1_head.cursor();
         let gap = parent_number.saturating_sub(cursor);
-        if gap <= max_span {
+        if gap < max_span {
             return Ok(false);
         }
         let Some((target, parent_header, target_state_root)) =
