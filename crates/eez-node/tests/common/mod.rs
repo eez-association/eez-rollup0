@@ -30,14 +30,19 @@ pub const ANVIL_KEY_3: &str = "0x7c852118294e51e653712a81e05800f419141751be58f60
 pub const ANVIL_KEY_4: &str = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a";
 pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906");
 
-/// External anvil cadence used by composer-mode e2e tests. The node's
-/// `RollupTiming` requires `K = L1/L2 >= 2`; with 1s L2 blocks, anvil must
-/// mine every 2s and `EEZ_L1_BLOCK_TIME_MS` must match.
-pub const L1_BLOCK_TIME_SECS: u64 = 2;
+/// External anvil cadence for composer-mode e2e tests. K = L1/L2 = 3 (not 2):
+/// `RollupTiming::validate` needs proof+slack (1100ms) ≤ (K−1)·L2 = 2000ms.
+/// `EEZ_L1_BLOCK_TIME_MS` derives from this and must match the miner.
+pub const L1_BLOCK_TIME_SECS: u64 = 3;
 
-/// L2 genesis timestamp shared by the dev and reorg fixtures (`0x6490fdd2`).
-/// Aligning anvil to this avoids permanent catchup to wall-clock-height slots.
+/// L2 genesis timestamp for the reorg fixture (`0x6490fdd2`); `for_reorg`
+/// anvil aligns to it. The dev path stamps genesis at wall-clock `now`
+/// ([`Harness::fresh`]) — the lateness gate reads a backdated genesis as late.
 pub const L2_GENESIS_TIMESTAMP: u64 = 0x6490_fdd2;
+
+/// Carries the Harness's shared L2 genesis path to every node it spawns
+/// (sequencer, follower, restarts) so they build the same chain; → `--chain`.
+const TEST_L2_GENESIS_ENV: &str = "EEZ_TEST_L2_GENESIS_PATH";
 
 /// Composer tick cadence for single-composer tests — max speed.
 pub const COMPOSER_INTERVAL_SINGLE: Duration = Duration::from_secs(1);
@@ -77,13 +82,11 @@ pub struct Anvil {
     pub rpc_url: String,
 }
 
-/// Anvil configuration. `Anvil::spawn(port)` is the default (2s block,
-/// random mnemonic). Tests pin the L1 genesis timestamp to match reth's
-/// dev genesis so the L1-anchored scheduler starts near the L2 chain
-/// instead of treating startup as a huge historical catch-up. The
-/// multi-composer reorg test uses [`AnvilConfig::for_reorg`] which matches
-/// the hardhat mnemonic (so we have predictable prefunded EOAs) and enables
-/// the cancun hardfork (required by `anvil_reorg`).
+/// Anvil configuration. `Anvil::spawn(port)` is the default (3s block,
+/// random mnemonic). The multi-composer reorg test uses
+/// [`AnvilConfig::for_reorg`] which matches the hardhat mnemonic (so we
+/// have predictable prefunded EOAs) and enables the cancun hardfork
+/// (required by `anvil_reorg`).
 pub struct AnvilConfig {
     pub block_time_secs: u64,
     pub mnemonic: Option<&'static str>,
@@ -105,8 +108,8 @@ impl Default for AnvilConfig {
 }
 
 impl AnvilConfig {
-    /// 2s block time, hardhat mnemonic, cancun hardfork, 30M gas.
-    /// (Chiado uses 5s; tests prefer speed over fidelity. 2s blocks +
+    /// 3s block time, hardhat mnemonic, cancun hardfork, 30M gas.
+    /// (Chiado uses 5s; tests prefer speed over fidelity. 3s blocks +
     /// cancun still permit `anvil_reorg`.)
     pub fn for_reorg() -> Self {
         Self {
@@ -268,12 +271,25 @@ pub struct Harness {
     pub anvil: Anvil,
     pub stub: BundleStub,
     pub dep: Deployment,
+    /// Wall-clock-stamped dev genesis shared by every node via
+    /// [`TEST_L2_GENESIS_ENV`] (the tempdir keeps it alive). `None` on the
+    /// reorg path, which passes its own genesis.
+    l2_genesis: Option<(PathBuf, tempfile::TempDir)>,
 }
 
 impl Harness {
-    /// Default: dev-chain anvil + dev-genesis initial state.
+    /// Default: dev-chain anvil + dev-genesis initial state. Anvil + L2
+    /// genesis share one wall-clock `now` so the lateness gate doesn't fire.
     pub async fn fresh() -> Result<Self> {
-        Self::with_anvil_config(AnvilConfig::default(), dev_genesis_state_root()).await
+        let ts = now_unix_secs();
+        let (gpath, gdir) = write_dev_genesis_at(ts)?;
+        let cfg = AnvilConfig {
+            genesis_timestamp: Some(ts),
+            ..AnvilConfig::default()
+        };
+        let mut h = Self::with_anvil_config(cfg, dev_genesis_state_root()).await?;
+        h.l2_genesis = Some((gpath, gdir));
+        Ok(h)
     }
 
     /// Custom anvil config + explicit initial state root. Used by the
@@ -282,7 +298,12 @@ impl Harness {
         let anvil = Anvil::spawn_with(free_port(), cfg).await?;
         let stub = BundleStub::spawn(free_port(), &anvil.rpc_url).await?;
         let dep = deploy_contracts_with_initial(&anvil.rpc_url, ANVIL_KEY, initial_state).await?;
-        Ok(Self { anvil, stub, dep })
+        Ok(Self {
+            anvil,
+            stub,
+            dep,
+            l2_genesis: None,
+        })
     }
 
     pub fn chain(&self) -> Chain<'_> {
@@ -399,6 +420,13 @@ impl Harness {
                 "RUST_LOG",
                 std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
             ),
+            (
+                TEST_L2_GENESIS_ENV,
+                self.l2_genesis
+                    .as_ref()
+                    .map(|(p, _)| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ),
         ];
 
         if let Some(proof_signer_key) = opts.proof_signer_key {
@@ -447,6 +475,31 @@ sol! {
 /// emitting `ImmediateEntrySkipped` instead of `L2ExecutionPerformed`.
 pub fn dev_genesis_state_root() -> B256 {
     reth_chainspec::DEV.genesis_header().state_root
+}
+
+/// Wall-clock seconds for stamping test genesis + anvil, so the sequencer's
+/// defer-on-lateness gate doesn't read every trigger as late.
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs()
+}
+
+/// Reth's dev genesis with timestamp set to `ts`, written to a temp file for
+/// `--chain`. Same alloc as `--chain dev` → state root still equals
+/// [`dev_genesis_state_root`]. The tempdir must outlive nodes using the path.
+fn write_dev_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
+    let mut genesis: alloy_genesis::Genesis = reth_chainspec::DEV.genesis().clone();
+    genesis.timestamp = ts;
+    let dir = tempfile::tempdir().context("genesis tempdir")?;
+    let path = dir.path().join("genesis.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&genesis).context("serialize dev genesis")?,
+    )
+    .context("write dev genesis")?;
+    Ok((path, dir))
 }
 
 /// Path to the multi-composer reorg test's L2 genesis fixture. 23
@@ -752,10 +805,21 @@ impl NodeHandle {
         }
         let l1_p2p_port = free_port();
         let l1_datadir = datadir.join("embedded-l1");
-        let chain_arg: std::ffi::OsString = cfg.genesis_path.map_or_else(
-            || std::ffi::OsString::from("dev"),
-            |p| p.as_os_str().to_owned(),
-        );
+        // Genesis: an explicit genesis_path (reorg fixture) wins, else the
+        // Harness's shared wall-clock genesis (TEST_L2_GENESIS_ENV — same chain
+        // for sequencer/follower/restarts), else `--chain dev`. Wall-clock is
+        // required by the sequencer's defer-on-lateness gate.
+        let env_genesis = env
+            .iter()
+            .find(|(k, _)| *k == TEST_L2_GENESIS_ENV)
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(std::ffi::OsString::from);
+        let chain_arg: std::ffi::OsString = cfg
+            .genesis_path
+            .map(|p| p.as_os_str().to_owned())
+            .or(env_genesis)
+            .unwrap_or_else(|| std::ffi::OsString::from("dev"));
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_eez-node"));
         cmd.current_dir(repo_root())
             .args(["node", "--chain"])
@@ -795,6 +859,9 @@ impl NodeHandle {
             .env("EEZ_L1_P2P_PORT", l1_p2p_port.to_string())
             .env("EEZ_L1_DATADIR", &l1_datadir);
         for (k, v) in env {
+            if *k == TEST_L2_GENESIS_ENV {
+                continue; // test-only marker (consumed as --chain above)
+            }
             cmd.env(*k, v);
         }
         let child = cmd.spawn().context("spawn eez-node")?;

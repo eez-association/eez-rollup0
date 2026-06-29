@@ -488,8 +488,16 @@ where
         rollup_id: u64,
         parent: ParentContext,
         timestamp: u64,
+        target_l1_block: Option<u64>,
         mode: SyncSlotMode,
     ) -> Option<SyncSlotBlock> {
+        // Some(n) → aim L1 block n exactly, pinned to this Sync block's
+        // timestamp (a skipped L1 slot then drops the bundle instead of
+        // settling with a drifted L2 timestamp); None → next available
+        // (catch-up, unpinned).
+        let bundle_target = target_l1_block.map_or(BundleTarget::NextBlock, |block| {
+            BundleTarget::Exact { block, timestamp }
+        });
         event!(
             name: "eez.composer.sync_slot.invoked",
             Level::INFO,
@@ -606,6 +614,7 @@ where
                     &parent_header,
                     timestamp,
                     suggested_fee_recipient,
+                    bundle_target, // catch-up → NextBlock (unpinned)
                 )
                 .await
                 .unwrap_or_else(|err| {
@@ -673,6 +682,7 @@ where
                     &parent_header,
                     timestamp,
                     suggested_fee_recipient,
+                    bundle_target,
                 )
                 .await
             {
@@ -845,6 +855,9 @@ where
             let mut keep: Vec<crate::HeldTx> = Vec::with_capacity(failed.txs.len());
             let mut dropped = 0usize;
             let mut evicted_chains: Vec<(alloy_primitives::Address, u64)> = Vec::new();
+            // slot_skipped: re-queue without counting toward poison-eviction
+            // (a skipped slot heals via a fresh pin next tick).
+            let slot_skipped = failed.slot_skipped;
             for mut tx in failed.txs {
                 if let Ok(true) = submitter.receipt_exists(tx.hash).await {
                     dropped += 1;
@@ -855,16 +868,18 @@ where
                         tx_hash = %tx.hash,
                         "user_tx already has an L1 receipt; not re-queueing (user must resubmit)",
                     );
+                } else if slot_skipped {
+                    keep.push(tx);
                 } else {
-                    // A relay drop did NOT burn the nonce (the tx
-                    // never executed), so re-queue for a fresh
+                    // A relay drop on a BUILT slot did NOT burn the nonce
+                    // (the tx never executed), so re-queue for a fresh
                     // attempt. Poison is normally caught at compose
                     // time; this bounded retry only backstops poison
                     // the compose-time sim missed (rbuilder sims
                     // against a slightly different post-postBatch
-                    // state). After MAX_BUNDLE_ATTEMPTS consecutive
-                    // drops, evict loudly (with the nonce-cascade) so
-                    // a residual poison tx can't block the FIFO queue
+                    // state). After MAX_BUNDLE_ATTEMPTS such drops,
+                    // evict loudly (with the nonce-cascade) so a
+                    // residual poison tx can't block the FIFO queue
                     // forever. User resubmits.
                     tx.attempts += 1;
                     if tx.attempts >= MAX_BUNDLE_ATTEMPTS {
@@ -962,6 +977,7 @@ where
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         timestamp: u64,
         suggested_fee_recipient: Address,
+        bundle_target: BundleTarget,
     ) -> Result<Option<SyncSlotBlock>, String> {
         // Read SYSTEM_ADDRESS nonce at the parent state — the next
         // signed system tx must use this. We sign multiple txs per
@@ -1025,6 +1041,7 @@ where
                     parent_header,
                     timestamp,
                     suggested_fee_recipient,
+                    bundle_target,
                 )
                 .await;
         }
@@ -1149,6 +1166,7 @@ where
                     parent_header,
                     timestamp,
                     suggested_fee_recipient,
+                    bundle_target,
                 )
                 .await;
         }
@@ -1171,6 +1189,7 @@ where
                     parent_header,
                     timestamp,
                     suggested_fee_recipient,
+                    bundle_target,
                 )
                 .await;
         }
@@ -1206,6 +1225,7 @@ where
                         parent_header,
                         timestamp,
                         suggested_fee_recipient,
+                        bundle_target,
                     )
                     .await;
             }
@@ -1242,6 +1262,7 @@ where
                         parent_header,
                         timestamp,
                         suggested_fee_recipient,
+                        bundle_target,
                     )
                     .await;
             }
@@ -1283,6 +1304,7 @@ where
             bundle,
             built.header.state_root(),
             Arc::clone(&rollup.optimistic),
+            bundle_target,
         );
         Ok(Some(SyncSlotBlock {
             payload: built.payload,
@@ -1306,6 +1328,7 @@ where
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         timestamp: u64,
         suggested_fee_recipient: Address,
+        bundle_target: BundleTarget,
     ) -> Result<Option<SyncSlotBlock>, String> {
         let empty_built = build_sync_block(
             rollup.l2_provider.as_ref(),
@@ -1367,6 +1390,7 @@ where
             vec![minimal_postbatch_raw],
             empty_built.header.state_root(),
             Arc::clone(&rollup.optimistic),
+            bundle_target,
         );
         Ok(Some(SyncSlotBlock {
             payload: empty_built.payload,
@@ -1387,6 +1411,7 @@ where
         bundle: Vec<Bytes>,
         expected_final_state: B256,
         optimistic: Arc<OptimisticallyIncluded>,
+        target: BundleTarget,
     ) {
         let submitter = ctx.submitter.clone();
         tokio::spawn(observe_bundle_outcome(
@@ -1396,6 +1421,7 @@ where
             expected_final_state,
             optimistic,
             submitter,
+            target,
         ));
     }
 
@@ -1748,9 +1774,10 @@ async fn observe_bundle_outcome(
     expected_final_state: B256,
     optimistic: Arc<OptimisticallyIncluded>,
     submitter: Submitter,
+    target: BundleTarget,
 ) {
     let outcome = submitter
-        .send_bundle(&bundle, BundleTarget::NextBlock, Some(expected_final_state))
+        .send_bundle(&bundle, target, Some(expected_final_state))
         .await;
     // Strict all-or-nothing: Included ⟹ settled; the only failure is a drop.
     // Poison is caught at compose time, so a drop here is bad luck — recovery
@@ -1784,7 +1811,15 @@ async fn observe_bundle_outcome(
     if settled {
         optimistic.mark_settled(sync_height);
     } else {
-        optimistic.mark_failed(sync_height);
+        // slot_skipped = pinned slot didn't land as pinned (block ts != pin, or
+        // unreadable) → not the tx's fault; requeue without poison-eviction.
+        let slot_skipped = match target {
+            BundleTarget::Exact { block, timestamp } => {
+                submitter.block_timestamp(block).await.ok().flatten() != Some(timestamp)
+            }
+            BundleTarget::NextBlock => false,
+        };
+        optimistic.mark_failed(sync_height, slot_skipped);
     }
 }
 
