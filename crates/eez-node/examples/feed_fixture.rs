@@ -16,9 +16,8 @@ use eez_composer::posted_windows::{PostedWindow, PostedWindows};
 use eez_composer::proof_sink::ProofSinkSvc;
 use eez_composer::prover_dispatch::ProverDispatchSvc;
 use eez_control_rpc::v1::{
-    control_feed_server::ControlFeedServer, proof_sink_server::ProofSinkServer,
-    prover_dispatch_server::ProverDispatchServer, Composition, ControlEvent, ExecutionWitness,
-    PostBatch,
+    Composition, ControlEvent, ExecutionWitness, PostBatch, control_feed_server::ControlFeedServer,
+    proof_sink_server::ProofSinkServer, prover_dispatch_server::ProverDispatchServer,
 };
 
 /// 32-byte B256 from a fixture byte vec (pad/truncate defensively).
@@ -35,7 +34,10 @@ async fn main() -> eyre::Result<()> {
     let dir = std::env::args().nth(1).unwrap_or_else(|| {
         concat!(env!("CARGO_MANIFEST_DIR"), "/../eez-proverd/tests/fixtures").to_string()
     });
-    let n: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(13);
+    let n: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(13);
 
     let block = std::fs::read(format!("{dir}/block-{n}.rlp"))?;
     let wjson: serde_json::Value =
@@ -46,7 +48,9 @@ async fn main() -> eyre::Result<()> {
             .ok_or_else(|| eyre::eyre!("witness.{k} not an array"))?
             .iter()
             .map(|v| {
-                let s = v.as_str().ok_or_else(|| eyre::eyre!("non-string in witness.{k}"))?;
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| eyre::eyre!("non-string in witness.{k}"))?;
                 Ok(alloy_primitives::hex::decode(s.trim_start_matches("0x"))?)
             })
             .collect()
@@ -76,7 +80,12 @@ async fn main() -> eyre::Result<()> {
                 public_inputs_hash: dec("public_inputs_hash")?,
                 l1_block_hash: dec("l1_block_hash")?,
             };
-            (dec("block_hash")?, Some(Composition { post_batch: Some(pb) }))
+            (
+                dec("block_hash")?,
+                Some(Composition {
+                    post_batch: Some(pb),
+                }),
+            )
         }
         Err(_) => (vec![0u8; 32], None),
     };
@@ -137,7 +146,9 @@ async fn main() -> eyre::Result<()> {
         "feed_fixture: serving block #{n} (settling={settling}) + ProofSink + ProverDispatch on {addr}"
     );
     tonic::transport::Server::builder()
-        .add_service(ControlFeedServer::new(ControlFeedSvc::new(Arc::clone(&publisher))))
+        .add_service(ControlFeedServer::new(ControlFeedSvc::new(Arc::clone(
+            &publisher,
+        ))))
         .add_service(ProofSinkServer::new(proof_sink))
         .add_service(ProverDispatchServer::new(ProverDispatchSvc::new(windows)))
         .serve(addr)

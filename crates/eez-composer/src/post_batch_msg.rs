@@ -12,8 +12,8 @@
 use alloy_primitives::B256;
 use alloy_sol_types::SolCall;
 
-use eez_evm::types::postAndVerifyBatchCall;
 use eez_evm::EvmBatch;
+use eez_evm::types::postAndVerifyBatchCall;
 
 /// Lift an assembled [`EvmBatch`] + its L1 binding into the wire
 /// [`eez_control_rpc::v1::PostBatch`]. `l1_block_hash` is `Some(blockhash(N))`
@@ -31,13 +31,24 @@ pub fn build_post_batch_msg(
     // attesting, and recomputes the publicInputsHash from this exact encoding.
     let mut wire = batch.clone();
     wire.inner.proofs.clear();
-    let abi_calldata = postAndVerifyBatchCall { batch: wire.inner.clone() }.abi_encode();
+    let abi_calldata = postAndVerifyBatchCall {
+        batch: wire.inner.clone(),
+    }
+    .abi_encode();
 
     // Summary: first entry's StateDelta = (rollup, currentState R0); last =
     // newState R_N. The prover re-derives these from abi_calldata, so these are
     // observability only.
-    let first = batch.inner.entries.first().and_then(|e| e.stateDeltas.first());
-    let last = batch.inner.entries.last().and_then(|e| e.stateDeltas.last());
+    let first = batch
+        .inner
+        .entries
+        .first()
+        .and_then(|e| e.stateDeltas.first());
+    let last = batch
+        .inner
+        .entries
+        .last()
+        .and_then(|e| e.stateDeltas.last());
 
     // publicInputsHash the composer computed — the prover cross-checks against
     // its own recomputation (the prover's is canonical). On a malformed
@@ -47,17 +58,20 @@ pub fn build_post_batch_msg(
     // from abi_calldata and fail-closes regardless, but a silent zero is a
     // debugging trap. (Real settling batches always carry >=1 proof system, so
     // this Err never fires in normal single-rollup/timeless operation.)
-    let public_inputs_hash =
-        match eez_evm::public_inputs::public_inputs_hashes(batch, vkey, l1_block_hash) {
-            Ok(hs) => hs.first().copied().unwrap_or_default(),
-            Err(e) => {
-                tracing::error!(
-                    error = ?e,
-                    "build_post_batch_msg: publicInputsHash recompute FAILED; shipping zero (the prover will reject)"
-                );
-                B256::ZERO
-            }
-        };
+    let public_inputs_hash = match eez_evm::public_inputs::public_inputs_hashes(
+        batch,
+        vkey,
+        l1_block_hash,
+    ) {
+        Ok(hs) => hs.first().copied().unwrap_or_default(),
+        Err(e) => {
+            tracing::error!(
+                error = ?e,
+                "build_post_batch_msg: publicInputsHash recompute FAILED; shipping zero (the prover will reject)"
+            );
+            B256::ZERO
+        }
+    };
 
     eez_control_rpc::v1::PostBatch {
         abi_calldata,
@@ -79,7 +93,10 @@ mod tests {
         // eez0's current settlement is TIMELESS (blockNumber=0) → l1_block_hash None.
         let msg = build_post_batch_msg(&EvmBatch::default(), B256::ZERO, None);
         // An empty batch still encodes a valid postAndVerifyBatch call.
-        assert!(!msg.abi_calldata.is_empty(), "abi_calldata must encode the (empty) batch");
+        assert!(
+            !msg.abi_calldata.is_empty(),
+            "abi_calldata must encode the (empty) batch"
+        );
         assert_eq!(msg.entry_count, 0);
         assert_eq!(msg.rollup_id, 0);
         assert!(msg.current_state.is_empty());

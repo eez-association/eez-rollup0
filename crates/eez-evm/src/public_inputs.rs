@@ -66,17 +66,17 @@
 //! naive `vkMatrix[r][k]` global index silently produces the
 //! wrong fold.
 
-use alloy_primitives::{keccak256, Bytes, B256, U256};
-use alloy_sol_types::{sol, SolValue};
+use alloy_primitives::{B256, Bytes, U256, keccak256};
+use alloy_sol_types::{SolValue, sol};
 use eez_protocol::{
     ProofPlan, ProofPlanInvariantError, RollupId, RollupProofAssignment, TimestampAndBlockHash,
 };
 
 use tracing::debug;
 
+use crate::EvmProtocol;
 use crate::batch::EvmBatch;
 use crate::types::{ExecutionEntrySol, LookupCallSol};
-use crate::EvmProtocol;
 
 // ── Per-element atomic hashes ─────────────────────────────────────
 
@@ -311,15 +311,19 @@ pub fn public_inputs_hashes(
     l1_block_hash: Option<B256>,
 ) -> Result<Vec<B256>, ProofPlanInvariantError> {
     let context = match (batch.inner.blockNumber, l1_block_hash) {
-        (0, None) => TimestampAndBlockHash { timestamp: [0u8; 32], block_hash: [0u8; 32] },
-        (n, Some(hash)) if n != 0 => {
-            TimestampAndBlockHash { timestamp: [0u8; 32], block_hash: hash.0 }
-        }
+        (0, None) => TimestampAndBlockHash {
+            timestamp: [0u8; 32],
+            block_hash: [0u8; 32],
+        },
+        (n, Some(hash)) if n != 0 => TimestampAndBlockHash {
+            timestamp: [0u8; 32],
+            block_hash: hash.0,
+        },
         (n, h) => {
             return Err(ProofPlanInvariantError::BlockContextMismatch {
                 block_number: n,
                 hash_supplied: h.is_some(),
-            })
+            });
         }
     };
     let rollup_assignments: Vec<RollupProofAssignment> = batch
@@ -350,9 +354,19 @@ pub fn public_inputs_hashes(
     // settlement paths), but for a FAILED inbound — which carries a `LookupCall{failed}`
     // that supplies the user's revert — the composer hash would diverge from the on-chain
     // recompute and the prover's signature would fail `InvalidProof`. So derive them here.
-    let lookup_call_hashes: Vec<B256> =
-        batch.inner.l1ToL2lookupCalls.iter().map(lookup_call_hash).collect();
-    all_per_ps_hashes(&plan, &entry_hashes, &lookup_call_hashes, &[], &batch.inner.callData)
+    let lookup_call_hashes: Vec<B256> = batch
+        .inner
+        .l1ToL2lookupCalls
+        .iter()
+        .map(lookup_call_hash)
+        .collect();
+    all_per_ps_hashes(
+        &plan,
+        &entry_hashes,
+        &lookup_call_hashes,
+        &[],
+        &batch.inner.callData,
+    )
 }
 
 #[cfg(test)]
@@ -501,8 +515,10 @@ mod tests {
         let mut batch = crate::batch::EvmBatch::default();
         batch.inner.blockNumber = block_number;
         batch.inner.proofSystems = vec![address!("00000000000000000000000000000000000000aa")];
-        batch.inner.rollupIdsWithProofSystems =
-            vec![RollupIdWithProofSystemsSol { rollupId: U256::from(1), proofSystemIndex: vec![0] }];
+        batch.inner.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
+            rollupId: U256::from(1),
+            proofSystemIndex: vec![0],
+        }];
         batch
     }
 
@@ -535,19 +551,27 @@ mod tests {
         let mut packed = [0u8; 64];
         packed[..32].copy_from_slice(shared.as_slice());
         packed[32..].copy_from_slice(acc.as_slice());
-        assert_eq!(got, keccak256(packed), "fold must match the on-chain construction");
+        assert_eq!(
+            got,
+            keccak256(packed),
+            "fold must match the on-chain construction"
+        );
     }
 
     #[test]
     fn timeless_and_bound_contexts_diverge() {
         let vkey = B256::repeat_byte(0x42);
         let timeless = public_inputs_hashes(&carrier_batch(0), vkey, None).unwrap()[0];
-        let bound =
-            public_inputs_hashes(&carrier_batch(7), vkey, Some(B256::repeat_byte(0xab))).unwrap()[0];
+        let bound = public_inputs_hashes(&carrier_batch(7), vkey, Some(B256::repeat_byte(0xab)))
+            .unwrap()[0];
         let bound_other =
-            public_inputs_hashes(&carrier_batch(7), vkey, Some(B256::repeat_byte(0xcd))).unwrap()[0];
+            public_inputs_hashes(&carrier_batch(7), vkey, Some(B256::repeat_byte(0xcd))).unwrap()
+                [0];
         assert_ne!(timeless, bound);
-        assert_ne!(bound, bound_other, "the hash must bind the BLOCK HASH value");
+        assert_ne!(
+            bound, bound_other,
+            "the hash must bind the BLOCK HASH value"
+        );
     }
 
     #[test]
@@ -557,14 +581,20 @@ mod tests {
         let err = public_inputs_hashes(&carrier_batch(7), vkey, None).unwrap_err();
         assert!(matches!(
             err,
-            ProofPlanInvariantError::BlockContextMismatch { block_number: 7, hash_supplied: false }
+            ProofPlanInvariantError::BlockContextMismatch {
+                block_number: 7,
+                hash_supplied: false
+            }
         ));
         // Timeless batch WITH a hash → also refused (wiring bug, not ignored).
-        let err =
-            public_inputs_hashes(&carrier_batch(0), vkey, Some(B256::repeat_byte(0x01))).unwrap_err();
+        let err = public_inputs_hashes(&carrier_batch(0), vkey, Some(B256::repeat_byte(0x01)))
+            .unwrap_err();
         assert!(matches!(
             err,
-            ProofPlanInvariantError::BlockContextMismatch { block_number: 0, hash_supplied: true }
+            ProofPlanInvariantError::BlockContextMismatch {
+                block_number: 0,
+                hash_supplied: true
+            }
         ));
     }
 }

@@ -53,7 +53,7 @@ const MAINNET_ROLLUP_ID: u64 = 0;
 /// submodule; the `create2_matches_onchain_proxy` test recomputes a known
 /// proxy address to catch any drift after a contract/compiler bump.
 const PROXY_CREATION_CODE: &[u8] = &hex!(
-        "60e03461009557601f61045738819003918201601f19168301916001600160401b038311\
+    "60e03461009557601f61045738819003918201601f19168301916001600160401b038311\
         848410176100995780849260609460405283398101031261009557610047816100ad565b\
         906040610056602083016100ad565b9101519160805260a05260c0526040516103959081\
         6100c28239608051818181610140015281816102ac015261032f015260a05181505060c0\
@@ -164,9 +164,8 @@ pub fn verify_outbound_authorized(
         })?;
 
         let mut slice: &[u8] = raw.as_ref();
-        let tx = TransactionSigned::decode_2718(&mut slice).map_err(|e| {
-            format!("outbound entry {i}: paired user tx is undecodable: {e}")
-        })?;
+        let tx = TransactionSigned::decode_2718(&mut slice)
+            .map_err(|e| format!("outbound entry {i}: paired user tx is undecodable: {e}"))?;
         let value = tx.value();
         let data = tx.input().clone();
         let to = tx.to();
@@ -215,7 +214,8 @@ pub fn verify_outbound_authorized(
         //    today) yields a different proxy address and is rejected here. This
         //    ENFORCES the "target rollup = 0" invariant the prover would otherwise
         //    have to merely ASSUME (l2-to-l1-extension-plan.md:323).
-        let expected_proxy = compute_cross_chain_proxy_address(call.targetAddress, MAINNET_ROLLUP_ID);
+        let expected_proxy =
+            compute_cross_chain_proxy_address(call.targetAddress, MAINNET_ROLLUP_ID);
         if to != Some(expected_proxy) {
             return Err(format!(
                 "outbound entry {i}: paired user tx to {to:?} != cross-chain proxy {expected_proxy:#x} \

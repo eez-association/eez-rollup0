@@ -23,18 +23,21 @@
 //! Ported from based-rollup `composer-lib/src/control_feed.rs` (prover-chain
 //! P2b). The publisher is fed by the `eez-witness-feed` task (eez-node).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use eez_control_rpc::v1::{control_feed_server::ControlFeed, ControlEvent, SubscribeRequest};
+use eez_control_rpc::v1::{ControlEvent, SubscribeRequest, control_feed_server::ControlFeed};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, warn};
 
-/// Hard byte cap on the replay ring (witnesses of busy blocks are MBs;
-/// the ring must never become the composer's biggest allocation).
-const RING_MAX_BYTES: usize = 256 * 1024 * 1024;
+/// Hard byte cap on the replay ring (witnesses of busy blocks can be MBs;
+/// the ring must remain bounded even when the prover is down or far behind).
+const RING_MAX_BYTES: usize = 1024 * 1024 * 1024;
+/// Minimum replay horizon in events. At ~1 L2 block/s this retains about 36h
+/// of empty-block control history, bounded by `RING_MAX_BYTES` for busy blocks.
+const RING_MIN_EVENTS: usize = 131_072;
 /// Capacity of the LIVE broadcast buffer. Small on purpose: it only
 /// covers transient subscriber slowness — a subscriber that overruns it
 /// is cut with `DATA_LOSS` and recovers via replay.
@@ -82,19 +85,17 @@ impl ControlPublisher {
     #[must_use]
     pub fn new(blocks_per_slot: u64) -> Arc<Self> {
         // Floor the replay horizon high enough that a far-behind prover
-        // recovering a large from-genesis backlog still finds its directive's
-        // SETTLING event in the ring at (re)subscribe time. A settling
-        // composition is NEVER reconstructable by backfill (interior blocks
-        // carry composition=None — see `backfill_block`), so once the ring
-        // evicts a dispatched window's to_block before the prover subscribes,
-        // that window can never attest — the "streamed past the directive
-        // without a settling composition" stall. ~8k events (~57MB at the
-        // observed ~7KB/event, well under RING_MAX_BYTES) buys hours of horizon;
-        // steady state is unaffected (the ring merely retains more history, and
-        // RING_MAX_BYTES still bounds the memory).
+        // recovering a large backlog still finds its directive's SETTLING event
+        // in the ring at (re)subscribe time. A settling composition is NEVER
+        // reconstructable by archive backfill (interior blocks carry
+        // composition=None — see `backfill_block`), so once the ring evicts a
+        // dispatched window's to_block before the prover subscribes, that window
+        // can never attest. `RING_MIN_EVENTS` covers the observed 40k-50k block
+        // competition recovery window with headroom; `RING_MAX_BYTES` still
+        // bounds memory for busy blocks.
         let max_events = usize::try_from(2 * blocks_per_slot + 8)
             .unwrap_or(usize::MAX)
-            .max(8_192);
+            .max(RING_MIN_EVENTS);
         let (tx, _) = broadcast::channel(LIVE_CAPACITY);
         Arc::new(Self {
             ring: Mutex::new(Ring {
@@ -131,14 +132,22 @@ impl ControlPublisher {
     /// Snapshot of buffered events with `block_number >= from_block`,
     /// oldest first.
     fn snapshot_from(&self, from_block: u64) -> Vec<Arc<ControlEvent>> {
-        self.ring
+        let mut by_number = BTreeMap::new();
+        for ev in self
+            .ring
             .lock()
             .expect("control ring poisoned")
             .events
             .iter()
             .filter(|ev| ev.block_number >= from_block)
-            .cloned()
-            .collect()
+        {
+            // Reorg recovery can re-produce the same height with a different
+            // hash. Keep the newest ring entry for each height; replaying the
+            // stale first entry splices old and new chains and makes the prover
+            // reject on parent-hash continuity.
+            by_number.insert(ev.block_number, Arc::clone(ev));
+        }
+        by_number.into_values().collect()
     }
 
     fn subscribe_live(&self) -> broadcast::Receiver<Arc<ControlEvent>> {
@@ -248,17 +257,18 @@ mod tests {
 
     #[test]
     fn ring_keeps_newest_and_respects_event_cap() {
-        // `new(_)` floors max_events at 8_192 (the replay-horizon floor), so
-        // the cap is 8_192 regardless of blocks_per_slot. Publish past the
-        // floor to force eviction and assert the ring keeps the newest 8_192.
-        let p = ControlPublisher::new(4); // max_events floored to 8_192
-        let total = 8_192 + 24; // exceed the floor to trigger eviction
+        // `new(_)` floors max_events at RING_MIN_EVENTS, regardless of
+        // blocks_per_slot. Publish past the floor to force eviction and assert
+        // the ring keeps the newest RING_MIN_EVENTS.
+        let p = ControlPublisher::new(4);
+        let min_events = u64::try_from(RING_MIN_EVENTS).unwrap();
+        let total = min_events + 24;
         for n in 1..=total {
             p.publish(ev(n));
         }
         let snap = p.snapshot_from(1);
-        assert_eq!(snap.len(), 8_192);
-        assert_eq!(snap.first().unwrap().block_number, total - 8_192 + 1);
+        assert_eq!(snap.len(), RING_MIN_EVENTS);
+        assert_eq!(snap.first().unwrap().block_number, total - min_events + 1);
         assert_eq!(snap.last().unwrap().block_number, total);
     }
 
@@ -273,6 +283,31 @@ mod tests {
             snap.iter().map(|e| e.block_number).collect::<Vec<_>>(),
             vec![7, 8, 9, 10]
         );
+    }
+
+    #[test]
+    fn replay_snapshot_keeps_latest_reorg_reproduction() {
+        let p = ControlPublisher::new(4);
+        p.publish(ev(1));
+        p.publish(ev(2));
+        p.publish(ev(3));
+
+        let mut new_2 = ev(2);
+        new_2.block_hash = vec![22u8; 32];
+        new_2.parent_hash = ev(1).block_hash;
+        let mut new_3 = ev(3);
+        new_3.block_hash = vec![33u8; 32];
+        new_3.parent_hash = new_2.block_hash.clone();
+        p.publish(new_2);
+        p.publish(new_3);
+
+        let snap = p.snapshot_from(1);
+        assert_eq!(
+            snap.iter().map(|e| e.block_number).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(snap[1].block_hash, vec![22u8; 32]);
+        assert_eq!(snap[2].parent_hash, snap[1].block_hash);
     }
 
     #[tokio::test]
@@ -313,6 +348,10 @@ mod tests {
             watermark = e.block_number;
             delivered.push(e.block_number);
         }
-        assert_eq!(delivered, vec![1, 2], "overlap event must be delivered exactly once");
+        assert_eq!(
+            delivered,
+            vec![1, 2],
+            "overlap event must be delivered exactly once"
+        );
     }
 }

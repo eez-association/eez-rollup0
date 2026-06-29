@@ -26,7 +26,7 @@
 use alloy_consensus::{BlockHeader, Header};
 use alloy_rpc_types_debug::ExecutionWitness;
 use reth_ethereum_primitives::{Block, EthPrimitives};
-use reth_evm::{execute::Executor, ConfigureEvm};
+use reth_evm::{ConfigureEvm, execute::Executor};
 use reth_primitives_traits::RecoveredBlock;
 use reth_revm::{database::StateProviderDatabase, witness::ExecutionWitnessRecord};
 use reth_storage_api::{HeaderProvider, StateProviderFactory};
@@ -79,8 +79,9 @@ where
     // 1. Re-execute the exact canonical block on the parent state. The
     //    executor builds its own `State` over the parent provider; reads
     //    warm its cache → that cache is the exact access set.
-    let mut executor = evm_config
-        .batch_executor(StateProviderDatabase::new(provider.state_by_block_hash(parent_hash)?));
+    let mut executor = evm_config.batch_executor(StateProviderDatabase::new(
+        provider.state_by_block_hash(parent_hash)?,
+    ));
     executor.execute_one(block)?;
     let state = executor.into_state();
 

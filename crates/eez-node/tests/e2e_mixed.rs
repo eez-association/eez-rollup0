@@ -159,11 +159,19 @@ async fn mixed_inbound_outbound_same_slot_settles_and_follower_rederives() {
     let l1_value_addr = deploy_value(&l1.rpc_url, ANVIL_KEY, 0)
         .await
         .expect("deploy Value(0) on embedded L1");
-    assert_ne!(l1_value_addr, Address::ZERO, "L1 Value deploy returned zero");
+    assert_ne!(
+        l1_value_addr,
+        Address::ZERO,
+        "L1 Value deploy returned zero"
+    );
     let l1_v0 = read_value(&l1.rpc_url, l1_value_addr)
         .await
         .expect("read L1 Value.value() post-deploy");
-    assert_eq!(l1_v0, U256::ZERO, "fresh L1 Value(0) should read 0, got {l1_v0}");
+    assert_eq!(
+        l1_v0,
+        U256::ZERO,
+        "fresh L1 Value(0) should read 0, got {l1_v0}"
+    );
     eprintln!("[S2] OUTBOUND target: L1 Value @ {l1_value_addr:#x} value()={l1_v0}");
 
     // ── INBOUND target: deploy `Value(0)` on the node's L2 (anvil#2).
@@ -179,11 +187,19 @@ async fn mixed_inbound_outbound_same_slot_settles_and_follower_rederives() {
     let l2_value_addr = deploy_value(&l2_rpc, ANVIL_KEY_2, 0)
         .await
         .expect("deploy Value(0) on L2");
-    assert_ne!(l2_value_addr, Address::ZERO, "L2 Value deploy returned zero");
+    assert_ne!(
+        l2_value_addr,
+        Address::ZERO,
+        "L2 Value deploy returned zero"
+    );
     let l2_v0 = read_value(&l2_rpc, l2_value_addr)
         .await
         .expect("read L2 Value.value() post-deploy");
-    assert_eq!(l2_v0, U256::ZERO, "fresh L2 Value(0) should read 0, got {l2_v0}");
+    assert_eq!(
+        l2_v0,
+        U256::ZERO,
+        "fresh L2 Value(0) should read 0, got {l2_v0}"
+    );
     eprintln!("[S2] INBOUND target: L2 Value @ {l2_value_addr:#x} value()={l2_v0}");
 
     // ── OUTBOUND proxy on EEZL2 (0x42..07): createCrossChainProxy(L1Value,
@@ -280,11 +296,17 @@ async fn mixed_inbound_outbound_same_slot_settles_and_follower_rederives() {
     let reg_out_b = proxy_original_address(&l2_rpc_b, CCM_L2_ADDRESS, proxy_out)
         .await
         .expect("Phase B authorizedProxies(proxy_out)");
-    assert_eq!(reg_out_b, l1_value_addr, "outbound proxy registration lost across restart");
+    assert_eq!(
+        reg_out_b, l1_value_addr,
+        "outbound proxy registration lost across restart"
+    );
     let reg_in_b = proxy_original_address(&l1.rpc_url, dep.eez_address, proxy_in)
         .await
         .expect("Phase B authorizedProxies(proxy_in)");
-    assert_eq!(reg_in_b, l2_value_addr, "inbound proxy registration lost across restart");
+    assert_eq!(
+        reg_in_b, l2_value_addr,
+        "inbound proxy registration lost across restart"
+    );
 
     // ── Wait for the Phase-B composer to settle ≥1 anchor batch.
     let l1_chain = L1Chain::new(&l1.rpc_url, &dep);
@@ -299,7 +321,13 @@ async fn mixed_inbound_outbound_same_slot_settles_and_follower_rederives() {
     //   OUTBOUND: L2-chain-id, to = proxy_out, setValue(42), from anvil#3.
     //   INBOUND : L1-chain-id, to = proxy_in,  setValue(43), from anvil#4.
     let (out_res, in_res) = tokio::join!(
-        send_outbound_set_value(&l2_rpc_b, ANVIL_KEY_3, proxy_out, OUTBOUND_VALUE, U256::ZERO),
+        send_outbound_set_value(
+            &l2_rpc_b,
+            ANVIL_KEY_3,
+            proxy_out,
+            OUTBOUND_VALUE,
+            U256::ZERO
+        ),
         send_inbound_set_value(
             &l2_rpc_b,
             &l1.rpc_url, // L1 nonce source for the inbound (ingress gates on it)
@@ -322,11 +350,18 @@ async fn mixed_inbound_outbound_same_slot_settles_and_follower_rederives() {
     let both_settled = wait_for(SETTLE_TIMEOUT, || async {
         let l1v = read_value(&l1.rpc_url, l1_value_addr).await?;
         let l2v = read_value(&l2_rpc_b, l2_value_addr).await?;
-        Ok((l1v == U256::from(OUTBOUND_VALUE) && l2v == U256::from(INBOUND_VALUE)).then_some((l1v, l2v)))
+        Ok(
+            (l1v == U256::from(OUTBOUND_VALUE) && l2v == U256::from(INBOUND_VALUE))
+                .then_some((l1v, l2v)),
+        )
     })
     .await;
-    let l1_final = read_value(&l1.rpc_url, l1_value_addr).await.unwrap_or_default();
-    let l2_final = read_value(&l2_rpc_b, l2_value_addr).await.unwrap_or_default();
+    let l1_final = read_value(&l1.rpc_url, l1_value_addr)
+        .await
+        .unwrap_or_default();
+    let l2_final = read_value(&l2_rpc_b, l2_value_addr)
+        .await
+        .unwrap_or_default();
     assert!(
         both_settled.is_ok(),
         "MIXED slot did not settle BOTH legs: L1 Value = {l1_final} (expected {OUTBOUND_VALUE}), \
@@ -432,7 +467,9 @@ async fn mixed_inbound_outbound_same_slot_settles_and_follower_rederives() {
         e
     };
     assert!(
-        !follower_env.iter().any(|(k, _)| *k == "EEZ_PROOF_SIGNER_KEY"),
+        !follower_env
+            .iter()
+            .any(|(k, _)| *k == "EEZ_PROOF_SIGNER_KEY"),
         "follower env still carries EEZ_PROOF_SIGNER_KEY → would boot as composer",
     );
 
@@ -453,7 +490,8 @@ async fn mixed_inbound_outbound_same_slot_settles_and_follower_rederives() {
         .expect("follower L2 RPC did not come up");
 
     let follower_outcome = wait_for(FOLLOWER_TIMEOUT, || async {
-        if let Ok(Some(r)) = block_state_root_at(&follower.l2_rpc_url(), settled_block_number).await {
+        if let Ok(Some(r)) = block_state_root_at(&follower.l2_rpc_url(), settled_block_number).await
+        {
             if r == settled_root {
                 return Ok(Some(format!(
                     "height-pinned: block #{settled_block_number} root == settled root"
@@ -470,7 +508,9 @@ async fn mixed_inbound_outbound_same_slot_settles_and_follower_rederives() {
         }
         if let Ok(Some(root)) = safe_block_state_root(&follower.l2_rpc_url()).await {
             if root == settled_root {
-                return Ok(Some("safe-head: follower safe root == settled root".to_string()));
+                return Ok(Some(
+                    "safe-head: follower safe root == settled root".to_string(),
+                ));
             }
         }
         Ok(None)

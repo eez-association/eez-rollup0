@@ -17,11 +17,11 @@ use alloy_consensus::{Transaction, TxEnvelope};
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
-use reth_storage_api::{StateProvider, StateProviderFactory};
 use eez_composer::{Classification, Direction, HeldPool, HeldTx, IngressClassifier};
 use jsonrpsee::core::middleware::{Batch, Notification, RpcServiceT};
 use jsonrpsee::core::server::{MethodResponse, ResponsePayload};
 use jsonrpsee::types::{ErrorObject, Request};
+use reth_storage_api::{StateProvider, StateProviderFactory};
 use tower::Layer;
 use tracing::{Level, event};
 
@@ -338,7 +338,11 @@ fn is_authorized_proxy_l2(state: &dyn StateProviderFactory, ccm_l2: Address, to:
 /// This is the OLD `b4f1ecb` read (a re-entrant self-call); kept ONLY so outbound
 /// detection in that brief startup window is never WORSE than the prior baseline.
 /// In steady state the cell is set and this is never reached.
-async fn is_authorized_proxy_l2_http(provider: &RootProvider, ccm_l2: Address, to: Address) -> bool {
+async fn is_authorized_proxy_l2_http(
+    provider: &RootProvider,
+    ccm_l2: Address,
+    to: Address,
+) -> bool {
     let key = U256::from_be_bytes(
         eez_evm::authorized_proxies::proxy_mapping_key(
             to,
@@ -381,8 +385,7 @@ where
             // configured) OR outbound (the L2 CCM address is configured for the
             // dynamic `authorizedProxies` lookup). A plain L2 node (neither) is
             // a hot-path no-op.
-            if req.method.as_ref() != METHOD
-                || (classifier.is_empty() && ccm_l2_address.is_none())
+            if req.method.as_ref() != METHOD || (classifier.is_empty() && ccm_l2_address.is_none())
             {
                 return inner.call(req).await;
             }
@@ -580,15 +583,8 @@ mod tests {
         let signer = PrivateKeySigner::random();
         let (env, raw) = signed_tx(&signer, PROXY, 2);
 
-        let admission = gate_and_hold(
-            &env,
-            &raw,
-            Direction::Outbound,
-            &pool,
-            Some(&l1),
-            Some(&l2),
-        )
-        .await;
+        let admission =
+            gate_and_hold(&env, &raw, Direction::Outbound, &pool, Some(&l1), Some(&l2)).await;
         assert!(
             matches!(admission, Admission::Held(_)),
             "outbound tx with L2 nonce 2 must validate against L2 (nonce 2), not L1 (nonce 1)",
@@ -612,21 +608,16 @@ mod tests {
         let (env, raw) = signed_tx(&signer, PROXY, 2);
 
         // L2 slot deliberately fed the L1 provider (nonce 1).
-        let admission = gate_and_hold(
-            &env,
-            &raw,
-            Direction::Outbound,
-            &pool,
-            None,
-            Some(&l1),
-        )
-        .await;
+        let admission =
+            gate_and_hold(&env, &raw, Direction::Outbound, &pool, None, Some(&l1)).await;
         match admission {
             Admission::Rejected(msg) => assert!(
                 msg.contains("invalid nonce 2") && msg.contains("expected 1"),
                 "expected nonce-1 rejection, got: {msg}",
             ),
-            Admission::Held(_) => panic!("L2-nonce-2 tx must be rejected against a nonce-1 provider"),
+            Admission::Held(_) => {
+                panic!("L2-nonce-2 tx must be rejected against a nonce-1 provider")
+            }
         }
     }
 
@@ -642,15 +633,8 @@ mod tests {
         let signer = PrivateKeySigner::random();
         let (env, raw) = signed_tx(&signer, PROXY, 1);
 
-        let admission = gate_and_hold(
-            &env,
-            &raw,
-            Direction::Inbound,
-            &pool,
-            Some(&l1),
-            Some(&l2),
-        )
-        .await;
+        let admission =
+            gate_and_hold(&env, &raw, Direction::Inbound, &pool, Some(&l1), Some(&l2)).await;
         assert!(
             matches!(admission, Admission::Held(_)),
             "inbound tx with L1 nonce 1 must validate against L1, ignoring L2 nonce 2",

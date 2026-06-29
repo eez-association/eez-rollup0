@@ -451,7 +451,9 @@ async fn value_outbound_withdrawal_settles_on_l1_and_follower_rederives() {
          of M to SYSTEM_ADDRESS did not commit, so the rollup paid M out of its L1 reserve while \
          the L2 sender kept M (inflation). The lean outbound entry must make the consume succeed.",
     );
-    eprintln!("[S3b] ACCEPTANCE (c): WITHDRAW user tx L2 receipt status == success (burn committed) ✓");
+    eprintln!(
+        "[S3b] ACCEPTANCE (c): WITHDRAW user tx L2 receipt status == success (burn committed) ✓"
+    );
 
     // ── S3b acceptance (b) — L1 rollups[1].stateRoot == L2 safe root at a
     // withdraw-inclusive height. Pin it for the S4 follower comparison.

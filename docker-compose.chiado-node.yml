@@ -80,6 +80,9 @@ services:
       EEZ_L2_BLOCK_TIME_MS: "1000"
       EEZ_PROOF_TIME_MS: "2000"
       EEZ_SUBMISSION_SLACK_MS: "500"
+      # Competition tuning: default to the same bid as C2; override explicitly
+      # when testing fee-priority wins.
+      EEZ_L1_POSTBATCH_PRIORITY_FEE: "${EEZ_L1_POSTBATCH_PRIORITY_FEE:-10000000000}"
       # Don't freeze the sequencer when chiado bundles are slow to land.
       EEZ_MAX_SPECULATIVE_DEPTH: "0"
       # Multi-composer: tolerate + adopt batches posted by the competing
@@ -107,6 +110,7 @@ services:
       - node
       - --chain=/app/genesis.json
       - --datadir=/l2
+      - --db.read-transaction-timeout=0
       - --http
       - --http.addr=0.0.0.0
       - --http.port=18688

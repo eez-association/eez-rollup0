@@ -60,6 +60,10 @@ services:
       # L2 archive for durable backfill of any replay-gap blocks (debug_* served
       # on :18688 by the node's --http.api=...,debug).
       EEZ_L2_RPC_URL: "http://127.0.0.1:18688"
+      # Archive backfill is latency-bound when a large replay gap misses the
+      # control-feed ring; use bounded parallel RPCs while preserving ordered
+      # verification.
+      EEZ_BACKFILL_CONCURRENCY: "${EEZ_BACKFILL_CONCURRENCY:-8}"
       # native-validate (stateless re-execution) + L2 chain-config, both baked
       # into the image by Dockerfile.proverd.
       EEZ_VALIDATOR_BIN: "/usr/local/bin/native-validate"

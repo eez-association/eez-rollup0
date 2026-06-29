@@ -31,10 +31,10 @@ use alloy_sol_types::SolCall;
 use reth_ethereum_primitives::{Transaction, TransactionSigned};
 
 use crate::entries::{
-    build_l2_incoming_entry, build_l2_outbound_entry, encode_execute_incoming, IncomingEntry,
-    OutboundEntry,
+    IncomingEntry, OutboundEntry, build_l2_incoming_entry, build_l2_outbound_entry,
+    encode_execute_incoming,
 };
-use crate::types::{loadExecutionTableCall, ExecutionEntrySol, L2ExecutionEntrySol};
+use crate::types::{ExecutionEntrySol, L2ExecutionEntrySol, loadExecutionTableCall};
 use eez_protocol::RollupId;
 
 /// Per-follower configuration the system-tx builder needs. The
@@ -382,10 +382,10 @@ fn sign_legacy_system_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EvmBatch;
     use crate::entries::{decode_postbatch, encode_postbatch};
     use crate::types::{L2ToL1CallSol, RollupIdWithProofSystemsSol, StateDeltaSol};
-    use crate::EvmBatch;
-    use alloy_primitives::{address, B256, I256};
+    use alloy_primitives::{B256, I256, address};
 
     fn ctx() -> SystemTxContext {
         SystemTxContext {
@@ -499,7 +499,10 @@ mod tests {
             Some(user_tx),
             "pair[0] = outbound load + its user tx",
         );
-        assert_eq!(pairs[1].user_tx, None, "pair[1] = inbound delivery, no user tx");
+        assert_eq!(
+            pairs[1].user_tx, None,
+            "pair[1] = inbound delivery, no user tx"
+        );
         // Two-phase nonces: outbound load = N, inbound delivery = N+1.
         assert_eq!(nonce_of(&pairs[0].system_tx), n, "outbound load nonce = N");
         assert_eq!(
@@ -557,7 +560,8 @@ mod tests {
 
         // Outbound-only == build_outbound_load_table_txs at the same nonce.
         let out_pairs =
-            build_cross_chain_sync_pairs(&[(outbound_entry(), user.clone())], &[], &cfg, n).unwrap();
+            build_cross_chain_sync_pairs(&[(outbound_entry(), user.clone())], &[], &cfg, n)
+                .unwrap();
         let l2e = build_l2_outbound_entry(OutboundEntry {
             target: outbound_entry().l2ToL1Calls[0].targetAddress,
             source: outbound_entry().l2ToL1Calls[0].sourceAddress,
@@ -567,15 +571,22 @@ mod tests {
             return_data: outbound_entry().returnData.clone(),
             success: true,
         });
-        let direct_out = build_outbound_load_table_txs(std::slice::from_ref(&l2e), &cfg, n).unwrap();
+        let direct_out =
+            build_outbound_load_table_txs(std::slice::from_ref(&l2e), &cfg, n).unwrap();
         assert_eq!(out_pairs.len(), 1);
-        assert_eq!(out_pairs[0].system_tx, direct_out[0], "outbound-only byte-identical");
+        assert_eq!(
+            out_pairs[0].system_tx, direct_out[0],
+            "outbound-only byte-identical"
+        );
 
         // Inbound-only == build_inbound_system_txs at the same nonce.
         let in_pairs = build_cross_chain_sync_pairs(&[], &[inbound_entry()], &cfg, n).unwrap();
         let direct_in = build_inbound_system_txs(&[inbound_entry()], &cfg, n).unwrap();
         assert_eq!(in_pairs.len(), 1);
-        assert_eq!(in_pairs[0].system_tx, direct_in[0], "inbound-only byte-identical");
+        assert_eq!(
+            in_pairs[0].system_tx, direct_in[0],
+            "inbound-only byte-identical"
+        );
         assert!(in_pairs[0].user_tx.is_none());
     }
 
@@ -596,11 +607,13 @@ mod tests {
         .unwrap();
         let out_rt = round_tripped(&[outbound_entry()])[0].clone();
         let in_rt = round_tripped(&[inbound_entry()])[0].clone();
-        let rebuilt =
-            build_cross_chain_sync_pairs(&[(out_rt, user)], &[in_rt], &cfg, n).unwrap();
+        let rebuilt = build_cross_chain_sync_pairs(&[(out_rt, user)], &[in_rt], &cfg, n).unwrap();
         assert_eq!(emitted.len(), rebuilt.len());
         for (e, r) in emitted.iter().zip(&rebuilt) {
-            assert_eq!(e.system_tx, r.system_tx, "system tx byte-identical across round-trip");
+            assert_eq!(
+                e.system_tx, r.system_tx,
+                "system tx byte-identical across round-trip"
+            );
             assert_eq!(e.user_tx, r.user_tx);
         }
     }
@@ -655,7 +668,7 @@ mod tests {
     /// entry (the SyncPair per-pair load).
     #[test]
     fn outbound_load_table_emit_equals_deriver_rebuild() {
-        use crate::entries::{build_l2_outbound_entry, OutboundEntry};
+        use crate::entries::{OutboundEntry, build_l2_outbound_entry};
 
         let cfg = ctx();
         let nonce = 7u64;
@@ -669,8 +682,13 @@ mod tests {
             success: true,
         });
 
-        let emitted = build_outbound_load_table_txs(std::slice::from_ref(&entry), &cfg, nonce).unwrap();
-        assert_eq!(emitted.len(), 1, "one outbound entry → one loadExecutionTable tx");
+        let emitted =
+            build_outbound_load_table_txs(std::slice::from_ref(&entry), &cfg, nonce).unwrap();
+        assert_eq!(
+            emitted.len(),
+            1,
+            "one outbound entry → one loadExecutionTable tx"
+        );
 
         // Deriver rebuild: decode the entry back out of the loadExecutionTable
         // calldata and re-emit — must be byte-identical.
@@ -682,11 +700,17 @@ mod tests {
         let decoded =
             loadExecutionTableCall::abi_decode(&calldata).expect("loadExecutionTable round-trips");
         let rebuilt = build_outbound_load_table_txs(&decoded.entries, &cfg, nonce).unwrap();
-        assert_eq!(emitted, rebuilt, "composer-emit must equal deriver-rebuild byte-for-byte");
+        assert_eq!(
+            emitted, rebuilt,
+            "composer-emit must equal deriver-rebuild byte-for-byte"
+        );
 
         // Non-vacuous: the signed bytes vary with the nonce.
         let at99 = build_outbound_load_table_txs(&[entry], &cfg, 99).unwrap();
-        assert_ne!(emitted, at99, "different nonce must change the signed bytes");
+        assert_ne!(
+            emitted, at99,
+            "different nonce must change the signed bytes"
+        );
     }
 
     /// A2.2: the canonical Sync-block order interleaves each system tx with its
@@ -703,9 +727,18 @@ mod tests {
         let u3 = Bytes::from(vec![0xA3]);
 
         let out = interleave_sync_block_txs(&[
-            SyncPair { system_tx: s1.clone(), user_tx: Some(u1.clone()) },
-            SyncPair { system_tx: s2.clone(), user_tx: None },
-            SyncPair { system_tx: s3.clone(), user_tx: Some(u3.clone()) },
+            SyncPair {
+                system_tx: s1.clone(),
+                user_tx: Some(u1.clone()),
+            },
+            SyncPair {
+                system_tx: s2.clone(),
+                user_tx: None,
+            },
+            SyncPair {
+                system_tx: s3.clone(),
+                user_tx: Some(u3.clone()),
+            },
         ]);
         assert_eq!(
             out,
@@ -717,8 +750,14 @@ mod tests {
         let sys = [Bytes::from(vec![1]), Bytes::from(vec![2])];
         assert_eq!(
             interleave_sync_block_txs(&[
-                SyncPair { system_tx: sys[0].clone(), user_tx: None },
-                SyncPair { system_tx: sys[1].clone(), user_tx: None },
+                SyncPair {
+                    system_tx: sys[0].clone(),
+                    user_tx: None
+                },
+                SyncPair {
+                    system_tx: sys[1].clone(),
+                    user_tx: None
+                },
             ]),
             sys.to_vec(),
             "inbound (no user txs) reduces to the system-only order",

@@ -9,7 +9,7 @@
 //! RECOGNIZE it (an interior that is neither a placeholder nor a proven
 //! pair-end root is refused) — so it lives here, in the crate both depend on.
 
-use alloy_primitives::{keccak256, B256};
+use alloy_primitives::{B256, keccak256};
 
 /// Domain separator for INTERIM interior placeholder roots (Step 1, pre-P1).
 /// When per-pair roots are unavailable (pull failure, intra-tx boundary where

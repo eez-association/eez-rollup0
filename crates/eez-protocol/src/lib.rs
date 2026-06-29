@@ -8,13 +8,13 @@
 #![deny(missing_docs)]
 
 pub mod capabilities;
-pub mod message;
 pub mod checkpoint;
 pub mod compose;
 pub mod composer;
 pub mod composition;
 pub mod error;
 pub mod executor;
+pub mod message;
 pub mod proof_plan;
 pub mod protocol;
 pub mod rolling_hash;
@@ -31,13 +31,15 @@ pub mod testing;
 mod assertions;
 
 #[doc(inline)]
+pub use capabilities::{ConsumesInbound, SettlesOutbound};
+#[doc(inline)]
 pub use checkpoint::ExecutionCheckpoint;
 #[doc(inline)]
 pub use compose::{compose_transaction, compose_transaction_recorded};
 #[doc(inline)]
 pub use composer::{
-    Composer, ComposerBuilder, ProxyLookupConfig, SourceAttribution, TargetConfig,
-    DEFAULT_CCM_GAS_LIMIT,
+    Composer, ComposerBuilder, DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig, SourceAttribution,
+    TargetConfig,
 };
 #[doc(inline)]
 pub use composition::{CompositionBuilder, Dispatcher, Rollup};
@@ -53,14 +55,12 @@ pub use executor::{
     ProtocolCheckpoint, SessionSnapshot, TargetBatchSimulation, TargetExecutionSession,
     TargetTransaction, TargetVerificationContext,
 };
+pub use message::{Delivery, Message, MessageRole};
 #[doc(inline)]
 pub use proof_plan::{
     ProofPlan, ProofPlanInvariantError, ProofPlanResolver, RollupProofAssignment,
     TimestampAndBlockHash,
 };
-#[doc(inline)]
-pub use capabilities::{ConsumesInbound, SettlesOutbound};
-pub use message::{Delivery, Message, MessageRole};
 pub use protocol::ChainProtocol;
 #[doc(inline)]
 pub use rolling_hash::{
@@ -70,5 +70,5 @@ pub use rolling_hash::{
 pub use rollup_id::{ChainIdentity, RollupId};
 #[doc(inline)]
 pub use types::{
-    Composition, ExecutionOutcome, ExecutedAction, SourceComposition, StaticMeta, TargetComposition,
+    Composition, ExecutedAction, ExecutionOutcome, SourceComposition, StaticMeta, TargetComposition,
 };

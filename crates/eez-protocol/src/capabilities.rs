@@ -13,11 +13,11 @@
 //! that needs it bounds on the capability rather than calling a core method that
 //! returns an error for non-settlers.
 
+use crate::ChainProtocol;
 use crate::error::ProtocolResult;
 use crate::message::{Delivery, Message};
 use crate::rollup_id::RollupId;
 use crate::types::ExecutedAction;
-use crate::ChainProtocol;
 
 /// A chain that hosts the canonical proof and **settles L2→L1 calls targeting
 /// it** by posting an EXECUTING batch: each call becomes an IMMEDIATE entry
@@ -62,7 +62,11 @@ pub trait ConsumesInbound: ChainProtocol {
     /// on `d.success`: success → a deferred entry (`proxyEntryHash = H`) that
     /// returns `d.return_data`; failure → a settlement-only entry + a failed
     /// lookup keyed on `H` (so the caller's consume reverts with the bytes).
-    fn build_return(&self, m: &Message<'_, Self>, d: &Delivery<Self>) -> ProtocolResult<Self::Batch>;
+    fn build_return(
+        &self,
+        m: &Message<'_, Self>,
+        d: &Delivery<Self>,
+    ) -> ProtocolResult<Self::Batch>;
 
     /// Build a pure settlement-only batch (no call) carrying the settled
     /// rollup's root — one immediate entry, no `L2ToL1Calls`. Infallible: a

@@ -241,9 +241,8 @@ struct Inner<L2: BlockReader> {
     /// NUMBER is deterministic on both sides. `OnceLock`-set after construction
     /// (`set_postbatch_sink`); `None` until wired (composer-mode only). The
     /// `std::Mutex` is held only for the brief insert.
-    postbatch_sink: std::sync::OnceLock<
-        Arc<std::sync::Mutex<HashMap<u64, eez_control_rpc::v1::PostBatch>>>,
-    >,
+    postbatch_sink:
+        std::sync::OnceLock<Arc<std::sync::Mutex<HashMap<u64, eez_control_rpc::v1::PostBatch>>>>,
     /// Prover-feed RETURN store (P4-b-full): verified attestations the composer's
     /// `ProofSink` records, keyed by publicInputsHash. Set ONLY in DEFERRED-POST
     /// mode (`EEZ_PROOF_SYSTEM_KIND=real`): its presence switches the composer
@@ -349,7 +348,10 @@ where
     }
 
     /// Phase 1 (dark): record the just-deferred `[posted+1 .. sync_height]`
-    /// window in the composer-driven ledger, if wired. Recording ONLY — the
+    /// window in the composer-driven ledger, if wired. Returns `false` when the
+    /// L1 cursor advanced after the batch was prepared, making the batch's anchor
+    /// stale before it can be dispatched; the caller must fail the optimistic
+    /// entry so the next slot rebuilds from the fresh cursor. Recording ONLY — the
     /// `ProofSink` flips `attested` + advances the verified frontier when the
     /// prover's attestation lands (keyed by `public_inputs_hash`). No-op when
     /// the ledger is off (synchronous mock post, or deferred-without-ledger).
@@ -371,10 +373,34 @@ where
         batch: &eez_evm::EvmBatch,
         public_inputs_hash: B256,
         posted: u64,
-    ) {
+    ) -> bool {
         let Some(windows) = self.inner.posted_windows.get() else {
-            return;
+            return true;
         };
+        let Some(rollup) = self.inner.rollups.get(&rollup_id) else {
+            event!(
+                name: "eez.composer.posted_window.unknown_rollup",
+                Level::ERROR,
+                rollup_id,
+                sync_height,
+                "cannot record deferred window for unknown rollup",
+            );
+            return false;
+        };
+        let latest_cursor = rollup.l1_head.cursor();
+        if latest_cursor > posted {
+            event!(
+                name: "eez.composer.posted_window.stale_before_spawn",
+                Level::WARN,
+                rollup_id,
+                sync_height,
+                posted,
+                latest_cursor,
+                public_inputs_hash = %public_inputs_hash,
+                "L1 cursor advanced after postBatch preparation; refusing stale deferred window so the next slot rebuilds",
+            );
+            return false;
+        }
         let current_state = batch
             .inner
             .entries
@@ -391,6 +417,7 @@ where
             fast_forwarded: false,
             pending_l1: false,
         });
+        true
     }
 
     /// The attester address of the configured prover — the prover-feed
@@ -514,8 +541,24 @@ where
                 // on ANY confirmed batch (ours or external — the cursor advances
                 // by transitivity regardless of who posted).
                 if let Some(windows) = self.posted_windows.get() {
-                    for rollup in self.rollups.values() {
-                        windows.mark_settled_on_l1(rollup.l1_head.cursor());
+                    for (rollup_id, rollup) in &self.rollups {
+                        let cursor = rollup.l1_head.cursor();
+                        let update = windows.mark_settled_on_l1(*rollup_id, cursor);
+                        for stale in update.pruned_straddlers {
+                            if let Some(owner) = self.rollups.get(&stale.rollup_id) {
+                                owner.optimistic.mark_failed(stale.to_block);
+                            }
+                            event!(
+                                name: "eez.composer.posted_window.stale_l1_cursor",
+                                Level::WARN,
+                                rollup_id = stale.rollup_id,
+                                sync_height = stale.to_block,
+                                from_block = stale.from_block,
+                                l1_cursor = cursor,
+                                public_inputs_hash = %stale.public_inputs_hash,
+                                "posted window straddles an L1-confirmed cursor; marking optimistic entry failed for recovery",
+                            );
+                        }
                     }
                 }
             }
@@ -949,20 +992,60 @@ where
             // canonicalized this very batch from L1 between the
             // observer's verdict and this slot (a false-failure
             // verdict, or the bundle landing later than observed).
-            // Rolling back an L1-confirmed block would start a
-            // recovery-vs-deriver war — the deriver restores it, we
-            // roll it back again, and every postBatch in between
-            // anchors against the wrong root.
+            // In based competition, though, cursor height alone is not
+            // enough: another composer may have advanced the frontier
+            // with a different root. Only skip recovery if our own
+            // postBatch receipt reached the exact final root this
+            // optimistic block committed locally.
             if rollup.l1_head.cursor() >= sync_height {
-                event!(
-                    name: "eez.composer.recovery.stale_verdict",
-                    Level::WARN,
-                    rollup_id,
-                    sync_height,
-                    cursor = rollup.l1_head.cursor(),
-                    "failure verdict is stale — Deriver confirmed the batch from L1; dropping recovery",
-                );
-                return None;
+                match self
+                    .inner
+                    .submitter
+                    .receipt_reached_state(failed.post_batch_hash, failed.expected_final_state)
+                    .await
+                {
+                    Ok(true) => {
+                        event!(
+                            name: "eez.composer.recovery.stale_verdict",
+                            Level::WARN,
+                            rollup_id,
+                            sync_height,
+                            cursor = rollup.l1_head.cursor(),
+                            post_batch_hash = %failed.post_batch_hash,
+                            expected_final_state = %failed.expected_final_state,
+                            "failure verdict is stale — our postBatch settled the optimistic root; keeping block",
+                        );
+                        rollup.optimistic.reinsert_settled(failed);
+                        return None;
+                    }
+                    Ok(false) => {
+                        event!(
+                            name: "eez.composer.recovery.cursor_passed_different_root",
+                            Level::WARN,
+                            rollup_id,
+                            sync_height,
+                            cursor = rollup.l1_head.cursor(),
+                            post_batch_hash = %failed.post_batch_hash,
+                            expected_final_state = %failed.expected_final_state,
+                            "cursor passed failed Sync height, but this postBatch did not settle the optimistic root; recovering local block",
+                        );
+                    }
+                    Err(err) => {
+                        event!(
+                            name: "eez.composer.recovery.stale_verdict_check_failed",
+                            Level::ERROR,
+                            rollup_id,
+                            sync_height,
+                            cursor = rollup.l1_head.cursor(),
+                            post_batch_hash = %failed.post_batch_hash,
+                            expected_final_state = %failed.expected_final_state,
+                            error = %err,
+                            "could not verify failed postBatch root; keeping entry Failed for retry",
+                        );
+                        rollup.optimistic.reinsert_failed(failed);
+                        return None;
+                    }
+                }
             }
             let head = committer.last_header();
             if head.number() >= sync_height {
@@ -1103,6 +1186,208 @@ where
             }
         }
         None
+    }
+
+    /// Restart/persistence recovery for an optimistic rich Sync block
+    /// whose in-memory ledger entry was lost before slot-context
+    /// recovery ran. The invariant-7 postBatch guard detects the
+    /// symptom: a type-0x7E/SYSTEM_ADDRESS tx appears in an
+    /// unconfirmed intermediate range (`cursor+1..sync-1`). Since the
+    /// block is above the L1-confirmed cursor, it is unsafe local
+    /// history; roll back to the parent of the earliest offending block
+    /// and let the sequencer rebuild from there.
+    ///
+    /// This cannot requeue the original L1 user txs because the
+    /// volatile `HeldTx` records died with the process. It only removes
+    /// phantom L2 effects so settlement can resume; users resubmit
+    /// unlanded L1 txs normally.
+    async fn recover_untracked_system_tx_block(
+        &self,
+        rollup_id: u64,
+        rollup: &RollupState<L2>,
+        ctx: &CrossChainExecCtx,
+    ) -> bool {
+        let Some(committer) = self.inner.committer.get() else {
+            event!(
+                name: "eez.composer.recovery.untracked.no_committer",
+                Level::ERROR,
+                rollup_id,
+                "committer handle not wired; cannot recover untracked failed Sync block",
+            );
+            return false;
+        };
+
+        let _guard = committer.begin_reconcile().await;
+        let cursor = rollup.l1_head.cursor();
+        let head = committer.last_header();
+        if head.number() <= cursor {
+            return false;
+        }
+
+        let mut walk_hash = head.hash();
+        let mut walk_number = head.number();
+        let mut earliest_offending = None;
+
+        while walk_number > cursor {
+            let block = match rollup
+                .l2_provider
+                .find_block_by_hash(walk_hash, BlockSource::Any)
+            {
+                Ok(Some(block)) => block,
+                Ok(None) => {
+                    event!(
+                        name: "eez.composer.recovery.untracked.missing_block",
+                        Level::ERROR,
+                        rollup_id,
+                        cursor,
+                        head = head.number(),
+                        walk_number,
+                        walk_hash = %walk_hash,
+                        "cannot scan untracked optimistic range; block missing",
+                    );
+                    return false;
+                }
+                Err(err) => {
+                    event!(
+                        name: "eez.composer.recovery.untracked.block_read_failed",
+                        Level::ERROR,
+                        rollup_id,
+                        cursor,
+                        head = head.number(),
+                        walk_number,
+                        walk_hash = %walk_hash,
+                        error = %err,
+                        "cannot scan untracked optimistic range",
+                    );
+                    return false;
+                }
+            };
+
+            for enc in block
+                .body()
+                .transactions()
+                .iter()
+                .map(Encodable2718::encoded_2718)
+            {
+                let is_system = if enc.first() == Some(&0x7E) {
+                    true
+                } else {
+                    use alloy_eips::eip2718::Decodable2718 as _;
+                    use reth_primitives_traits::SignerRecoverable as _;
+                    let mut raw: &[u8] = enc.as_slice();
+                    let tx =
+                        match reth_ethereum_primitives::TransactionSigned::decode_2718(&mut raw) {
+                            Ok(tx) => tx,
+                            Err(err) => {
+                                event!(
+                                    name: "eez.composer.recovery.untracked.decode_failed",
+                                    Level::ERROR,
+                                    rollup_id,
+                                    cursor,
+                                    walk_number,
+                                    error = %err,
+                                    "cannot decode tx while scanning untracked optimistic range",
+                                );
+                                return false;
+                            }
+                        };
+                    match tx.recover_signer() {
+                        Ok(signer) => signer == ctx.system_signer.address(),
+                        Err(err) => {
+                            event!(
+                                name: "eez.composer.recovery.untracked.signer_failed",
+                                Level::ERROR,
+                                rollup_id,
+                                cursor,
+                                walk_number,
+                                error = %err,
+                                "cannot recover tx signer while scanning untracked optimistic range",
+                            );
+                            return false;
+                        }
+                    }
+                };
+                if is_system {
+                    earliest_offending = Some(walk_number);
+                }
+            }
+
+            walk_hash = block.header().parent_hash();
+            walk_number -= 1;
+        }
+
+        let Some(offending_height) = earliest_offending else {
+            return false;
+        };
+        let target_height = offending_height.saturating_sub(1);
+        if target_height < cursor {
+            event!(
+                name: "eez.composer.recovery.untracked.below_cursor",
+                Level::ERROR,
+                rollup_id,
+                cursor,
+                offending_height,
+                target_height,
+                "refusing to roll back below L1-confirmed cursor",
+            );
+            return false;
+        }
+
+        let target = match rollup.l2_provider.sealed_header(target_height) {
+            Ok(Some(header)) => header,
+            Ok(None) => {
+                event!(
+                    name: "eez.composer.recovery.untracked.target_missing",
+                    Level::ERROR,
+                    rollup_id,
+                    cursor,
+                    offending_height,
+                    target_height,
+                    "cannot recover untracked failed Sync block; target header missing",
+                );
+                return false;
+            }
+            Err(err) => {
+                event!(
+                    name: "eez.composer.recovery.untracked.target_read_failed",
+                    Level::ERROR,
+                    rollup_id,
+                    cursor,
+                    offending_height,
+                    target_height,
+                    error = %err,
+                    "cannot recover untracked failed Sync block; target read failed",
+                );
+                return false;
+            }
+        };
+
+        if let Err(err) = committer.reorg_to(target).await {
+            event!(
+                name: "eez.composer.recovery.untracked.reorg_failed",
+                Level::ERROR,
+                rollup_id,
+                cursor,
+                head = head.number(),
+                offending_height,
+                target_height,
+                error = %err,
+                "reorg_to failed while recovering untracked failed Sync block",
+            );
+            return false;
+        }
+
+        event!(
+            name: "eez.composer.recovery.untracked.rolled_back",
+            Level::WARN,
+            rollup_id,
+            cursor,
+            old_head = head.number(),
+            offending_height,
+            target_height,
+            "untracked failed Sync block recovered; unsafe local chain rolled back to parent",
+        );
+        true
     }
 
     /// For each drained held tx, call `EvmComposer::simulate_and_resolve`
@@ -1542,6 +1827,13 @@ where
                 if let Some(pool) = rollup.held_pool.as_ref() {
                     pool.push_front_batch(survivors);
                 }
+                if e.contains("un-recovered failed Sync block")
+                    && self
+                        .recover_untracked_system_tx_block(rollup_id, rollup, ctx)
+                        .await
+                {
+                    return Ok(None);
+                }
                 return self
                     .dispatch_minimal_postbatch(
                         ctx,
@@ -1592,6 +1884,7 @@ where
                 rollup.optimistic.begin(
                     sync_height,
                     post_batch_hash,
+                    built.header.state_root(),
                     parent_header.clone(),
                     survivors,
                 );
@@ -1647,28 +1940,33 @@ where
                 rollup.optimistic.begin(
                     sync_height,
                     B256::ZERO, // placeholder; spawn_deferred_post fills the real hash on sign
+                    built.header.state_root(),
                     parent_header.clone(),
                     survivors,
                 );
                 // Phase 1 (dark): record this window in the composer-driven
                 // ledger BEFORE `*batch` is moved into the deferred task.
-                self.record_posted_window(
+                let recorded = self.record_posted_window(
                     rollup_id,
                     sync_height,
                     &batch,
                     public_inputs_hash,
                     posted,
                 );
-                self.spawn_deferred_post(
-                    rollup_id,
-                    sync_height,
-                    rollup.l1_head.cursor(),
-                    *batch,
-                    public_inputs_hash,
-                    survivor_raws,
-                    built.header.state_root(),
-                    Arc::clone(&rollup.optimistic),
-                );
+                if recorded {
+                    self.spawn_deferred_post(
+                        rollup_id,
+                        sync_height,
+                        posted,
+                        *batch,
+                        public_inputs_hash,
+                        survivor_raws,
+                        built.header.state_root(),
+                        Arc::clone(&rollup.optimistic),
+                    );
+                } else {
+                    rollup.optimistic.mark_failed(sync_height);
+                }
             }
         }
         Ok(Some(SyncSlotBlock {
@@ -1725,6 +2023,13 @@ where
                     error = %err,
                     "minimal postBatch prepare failed; committing Sync block without emission — L1 catches up next slot",
                 );
+                if err.contains("un-recovered failed Sync block")
+                    && self
+                        .recover_untracked_system_tx_block(rollup_id, rollup, ctx)
+                        .await
+                {
+                    return Ok(None);
+                }
                 return Ok(Some(SyncSlotBlock {
                     payload: empty_built.payload,
                     header: empty_built.header,
@@ -1748,6 +2053,7 @@ where
                 rollup.optimistic.begin(
                     sync_height,
                     post_batch_hash,
+                    empty_built.header.state_root(),
                     parent_header.clone(),
                     Vec::new(),
                 );
@@ -1780,28 +2086,33 @@ where
                 rollup.optimistic.begin(
                     sync_height,
                     B256::ZERO, // placeholder; spawn_deferred_post fills the real hash on sign
+                    empty_built.header.state_root(),
                     parent_header.clone(),
                     Vec::new(),
                 );
                 // Phase 1 (dark): record this window in the composer-driven
                 // ledger BEFORE `*batch` is moved into the deferred task.
-                self.record_posted_window(
+                let recorded = self.record_posted_window(
                     rollup_id,
                     sync_height,
                     &batch,
                     public_inputs_hash,
                     posted,
                 );
-                self.spawn_deferred_post(
-                    rollup_id,
-                    sync_height,
-                    rollup.l1_head.cursor(),
-                    *batch,
-                    public_inputs_hash,
-                    Vec::new(),
-                    empty_built.header.state_root(),
-                    Arc::clone(&rollup.optimistic),
-                );
+                if recorded {
+                    self.spawn_deferred_post(
+                        rollup_id,
+                        sync_height,
+                        posted,
+                        *batch,
+                        public_inputs_hash,
+                        Vec::new(),
+                        empty_built.header.state_root(),
+                        Arc::clone(&rollup.optimistic),
+                    );
+                } else {
+                    rollup.optimistic.mark_failed(sync_height);
+                }
             }
         }
         Ok(Some(SyncSlotBlock {
@@ -1911,15 +2222,29 @@ where
             // and CLIMBING as the node fills (the native re-execution itself is
             // ~0.25ms/block — the witness SOURCING dominates, not the prover).
             // Abandoning before the backfill finishes means `posted` never
-            // advances and the next directive re-dictates from genesis — a
-            // bootstrap livelock. Budget ~400ms/block (≈3.7x the measured rate,
-            // headroom for the climb) + a 30s base, each poll 200ms; cap at 90min
-            // so a genuinely dead prover still recovers in bounded time. Once the
-            // first batch posts, `posted` jumps to the backlog tip and every
-            // later window is small (witness ships live) — the budget is only
-            // ever exercised on a cold bootstrap.
+            // advances and the next directive re-dictates a wider range from the
+            // frozen L1 cursor — a bootstrap livelock. Budget ~400ms/block
+            // (≈3.7x the measured rate, headroom for the climb) + a 30s base,
+            // each poll 200ms. The cap is intentionally hours, not minutes: once
+            // the first catch-up batch posts, `posted` jumps to the backlog tip
+            // and later windows are small; timing out a live prover before that
+            // only makes the next proof wider and slower.
             let backlog = sync_height.saturating_sub(posted);
-            let max_polls = (150u64 + backlog.saturating_mul(2)).min(27_000);
+            const DEFERRED_PROOF_POLL_MS: u64 = 200;
+            const MAX_DEFERRED_PROOF_POLLS: u64 = 144_000; // 8h
+            let uncapped_polls = 150u64.saturating_add(backlog.saturating_mul(2));
+            let max_polls = uncapped_polls.min(MAX_DEFERRED_PROOF_POLLS);
+            event!(
+                name: "eez.composer.deferred.wait_budget",
+                Level::INFO,
+                rollup_id,
+                sync_height,
+                posted,
+                backlog,
+                wait_secs = max_polls.saturating_mul(DEFERRED_PROOF_POLL_MS) / 1_000,
+                capped = max_polls < uncapped_polls,
+                "deferred post waiting for prover attestation",
+            );
             let mut sig = None;
             for _ in 0..max_polls {
                 if let Some(s) = store
@@ -1930,7 +2255,7 @@ where
                     sig = Some(s);
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(DEFERRED_PROOF_POLL_MS)).await;
             }
             let Some(sig) = sig else {
                 event!(
@@ -2495,11 +2820,8 @@ where
         // the sink is `None` outside composer-mode, and `build_post_batch_msg`
         // clears `proofs[]` (the prover fills them after attesting).
         if let Some(sink) = self.inner.postbatch_sink.get() {
-            let pb = crate::post_batch_msg::build_post_batch_msg(
-                &batch,
-                self.inner.prover.vkey(),
-                None,
-            );
+            let pb =
+                crate::post_batch_msg::build_post_batch_msg(&batch, self.inner.prover.vkey(), None);
             if let Ok(mut map) = sink.lock() {
                 map.insert(sync_block_number, pb);
             }

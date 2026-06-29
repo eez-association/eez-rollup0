@@ -38,8 +38,7 @@ use alloy_primitives::{Address, U256, address};
 mod common;
 use common::{
     ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4, ANVIL_KEY_5, CCM_L2_ADDRESS,
-    EmbeddedL1,
-    L1Chain, NodeConfig, NodeHandle, PLACEHOLDER_ADDRESS, block_state_root_at,
+    EmbeddedL1, L1Chain, NodeConfig, NodeHandle, PLACEHOLDER_ADDRESS, block_state_root_at,
     create_l2_cross_chain_proxy, cross_chain_env, deploy_contracts_with_initial,
     deploy_value_payable, eth_get_balance, fresh_cross_chain_genesis, l1_block_number,
     proxy_original_address, read_chain_id, read_value, remove_env, rollup_ether_balance,
@@ -430,8 +429,7 @@ async fn value_outbound_k2_two_withdrawals_settle_and_follower_rederives() {
     let withdrawn = wait_for(SETTLE_TIMEOUT, || async {
         let l1_bal = eth_get_balance(&l1.rpc_url, l1_value_addr).await?;
         let l1_val = read_value(&l1.rpc_url, l1_value_addr).await?;
-        let val_ok =
-            l1_val == U256::from(OUTBOUND_VALUE) || l1_val == U256::from(outbound_value_2);
+        let val_ok = l1_val == U256::from(OUTBOUND_VALUE) || l1_val == U256::from(outbound_value_2);
         Ok((l1_bal == total_out && val_ok).then_some(l1_bal))
     })
     .await;
@@ -479,7 +477,9 @@ async fn value_outbound_k2_two_withdrawals_settle_and_follower_rederives() {
              populated outbound entry); the lean shape must make the consume a no-op.",
         );
     }
-    eprintln!("[S3b] ACCEPTANCE (c): BOTH WITHDRAW user tx L2 receipts status == success (2 burns committed) ✓");
+    eprintln!(
+        "[S3b] ACCEPTANCE (c): BOTH WITHDRAW user tx L2 receipts status == success (2 burns committed) ✓"
+    );
 
     // ── S3b acceptance (b) — L1 rollups[1].stateRoot == L2 safe root at a
     // withdraw-inclusive height. Pin it for the S4 follower comparison.

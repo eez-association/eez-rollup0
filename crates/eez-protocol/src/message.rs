@@ -10,9 +10,9 @@
 //! into these roles: L1↔L2 and L2↔L2 differ only in which [`RollupId`] carries
 //! which role, never in code path.
 
+use crate::ChainProtocol;
 use crate::rollup_id::RollupId;
 use crate::types::ExecutedAction;
-use crate::ChainProtocol;
 
 /// The role a chain plays for ONE cross-chain message. Replaces the
 /// "inbound/outbound" axis: it is the PROVE-INBOUND / COMMIT-OUTBOUND split,

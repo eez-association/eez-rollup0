@@ -121,13 +121,9 @@ async fn s1_cross_chain_node_settles_anchor_batch() {
     // false`). Wait for several more auto-mined L1 blocks so the deploy
     // is buried deep enough to flush.
     let after_deploy = l1_block_number(&l1.rpc_url).await;
-    wait_for_l1_blocks(
-        &l1.rpc_url,
-        after_deploy + 6,
-        Duration::from_secs(120),
-    )
-    .await
-    .expect("embedded L1 did not advance to persist the deploy");
+    wait_for_l1_blocks(&l1.rpc_url, after_deploy + 6, Duration::from_secs(120))
+        .await
+        .expect("embedded L1 did not advance to persist the deploy");
 
     // ── Phase B — restart the node (same L2 datadir + same embedded L1
     // datadir/ports) with the REAL registry / proof system / deploy
@@ -209,8 +205,7 @@ const FOLLOWER_TIMEOUT: Duration = Duration::from_secs(180);
 /// outbound — it must mine as a normal L2 tx. Sent from anvil#4
 /// (`ANVIL_KEY_4`), an EOA used by no other phase of this test, so its
 /// L2 nonce can't collide.
-const NEGATIVE_CONTROL_RECIPIENT: Address =
-    address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906");
+const NEGATIVE_CONTROL_RECIPIENT: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906");
 
 /// S2+S3 — the full OUTBOUND (L2→L1) acceptance:
 ///
@@ -423,9 +418,10 @@ async fn s2_s3_s4_s5_outbound_set_value_settles_and_follower_rederives() {
         "proxy creator and outbound sender must be distinct EOAs",
     );
 
-    let tx_hash = send_outbound_set_value(&l2_rpc_b, ANVIL_KEY_3, proxy, OUTBOUND_VALUE, U256::ZERO)
-        .await
-        .expect("submit outbound setValue(42) to L2 ingress");
+    let tx_hash =
+        send_outbound_set_value(&l2_rpc_b, ANVIL_KEY_3, proxy, OUTBOUND_VALUE, U256::ZERO)
+            .await
+            .expect("submit outbound setValue(42) to L2 ingress");
     eprintln!(
         "[S3] outbound user tx submitted: chain_id={chain_id} to={proxy:#x} \
          data=setValue({OUTBOUND_VALUE}) hash={tx_hash:#x}"
@@ -484,9 +480,7 @@ async fn s2_s3_s4_s5_outbound_set_value_settles_and_follower_rederives() {
         let l1_root = state_root(&l1.rpc_url, dep.eez_address, dep.rollup_id).await?;
         let l2 = safe_block_number_and_root(&l2_rpc_b).await?;
         Ok(match l2 {
-            Some((num, root))
-                if root != alloy_primitives::B256::ZERO && root == l1_root =>
-            {
+            Some((num, root)) if root != alloy_primitives::B256::ZERO && root == l1_root => {
                 Some((l1_root, num, root))
             }
             _ => None,
@@ -644,7 +638,9 @@ async fn s2_s3_s4_s5_outbound_set_value_settles_and_follower_rederives() {
     // Sanity: the follower env must NOT carry a proof signer (else it boots
     // as a composer), and its L1 RPC must be the composer's embedded L1.
     assert!(
-        !follower_env.iter().any(|(k, _)| *k == "EEZ_PROOF_SIGNER_KEY"),
+        !follower_env
+            .iter()
+            .any(|(k, _)| *k == "EEZ_PROOF_SIGNER_KEY"),
         "follower env still carries EEZ_PROOF_SIGNER_KEY → would boot as composer",
     );
     let follower_l1_rpc = follower_env
@@ -700,8 +696,7 @@ async fn s2_s3_s4_s5_outbound_set_value_settles_and_follower_rederives() {
     // that is a HARD failure (a real divergence) — surfaced immediately.
     let follower_outcome = wait_for(FOLLOWER_TIMEOUT, || async {
         // (A) height-pinned
-        if let Ok(Some(r)) =
-            block_state_root_at(&follower.l2_rpc_url(), settled_block_number).await
+        if let Ok(Some(r)) = block_state_root_at(&follower.l2_rpc_url(), settled_block_number).await
         {
             if r == settled_root {
                 return Ok(Some(format!(

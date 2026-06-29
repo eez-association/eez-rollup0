@@ -16,6 +16,7 @@ eyre.workspace               = true
 tokio.workspace              = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
+futures-util.workspace       = true
 # Serialize the ControlEvent witness to native-validate's witness.json +
 # parse the validator's verified-public-inputs JSON.
 serde_json.workspace         = true

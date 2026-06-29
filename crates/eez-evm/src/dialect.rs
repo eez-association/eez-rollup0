@@ -16,8 +16,8 @@
 
 use eez_protocol::{ExecutedAction, RollupId};
 
-use crate::authorized_proxies::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
 use crate::EvmProtocol;
+use crate::authorized_proxies::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
 
 /// Selects the contract ABI and entry-emission rules for one rollup.
 ///

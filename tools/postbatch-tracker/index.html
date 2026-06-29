@@ -142,6 +142,9 @@
     <label>Chunk size (blocks)
       <input id="chunk" value="2000" />
     </label>
+    <label>Recent batches (Load)
+      <input id="recent" value="20" />
+    </label>
     <div class="actions">
       <button id="load">Load</button>
       <button id="auto" class="ghost">Auto</button>
@@ -187,6 +190,7 @@ const DEFAULTS = {
   registry: "",
   fromBlock: "0",
   chunk: "2000",
+  recent: "20",
 };
 
 const ABI = [
@@ -208,7 +212,7 @@ let l2rpcBase = ""; // L2 RPC (same-origin /l2rpc proxy) for resolving real L2 b
 
 const $ = (id) => document.getElementById(id);
 const els = {};
-for (const id of ["rpc","registry","fromBlock","chunk","chainId","head","autoState","load","auto",
+for (const id of ["rpc","registry","fromBlock","chunk","recent","chainId","head","autoState","load","auto",
   "sBatches","sStateUpd","sExec","sLast","status","rows","empty"]) els[id] = $(id);
 
 // hydrate config: server /config (from .env + deployments.env) is the source of
@@ -219,7 +223,7 @@ async function hydrate() {
   let serverCfg = {};
   try { serverCfg = await (await fetch("/config")).json(); } catch { /* file:// or no server */ }
   const useSaved = saved.registry && (!serverCfg.registry || saved.registry.toLowerCase() === serverCfg.registry.toLowerCase());
-  for (const k of ["rpc","registry","fromBlock","chunk"]) {
+  for (const k of ["rpc","registry","fromBlock","chunk","recent"]) {
     els[k].value = (useSaved ? saved[k] : undefined) ?? serverCfg[k] ?? saved[k] ?? DEFAULTS[k];
   }
   explorerBase = (serverCfg.explorer || "").replace(/\/+$/, "");
@@ -234,7 +238,7 @@ async function hydrate() {
 function saveCfg() {
   localStorage.setItem("eez-pbt", JSON.stringify({
     rpc: els.rpc.value, registry: els.registry.value,
-    fromBlock: els.fromBlock.value, chunk: els.chunk.value,
+    fromBlock: els.fromBlock.value, chunk: els.chunk.value, recent: els.recent.value,
   }));
 }
 
@@ -537,21 +541,36 @@ function getProvider() {
   return new ethers.JsonRpcProvider(url, undefined, { staticNetwork: true });
 }
 
-async function getLogsChunked(addr, fromB, toB, chunk) {
-  const out = [];
-  for (let start = fromB; start <= toB; start += chunk) {
-    const end = Math.min(start + chunk - 1, toB);
-    setStatus(`Scanning blocks ${start.toLocaleString()}–${end.toLocaleString()} … (${out.length} batches so far)`);
-    const logs = await provider.getLogs({ address: addr, topics: [BATCH_TOPIC], fromBlock: start, toBlock: end });
-    out.push(...logs);
-  }
+// Run `fn` over `items` with at most `limit` in flight at once. Preserves order.
+async function pmap(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
   return out;
+}
+
+async function getLogsChunked(addr, fromB, toB, chunk) {
+  const ranges = [];
+  for (let start = fromB; start <= toB; start += chunk) ranges.push([start, Math.min(start + chunk - 1, toB)]);
+  let done = 0;
+  const results = await pmap(ranges, 8, async ([start, end]) => {
+    const logs = await provider.getLogs({ address: addr, topics: [BATCH_TOPIC], fromBlock: start, toBlock: end });
+    setStatus(`Scanning blocks … (${++done}/${ranges.length} chunks)`);
+    return logs;
+  });
+  return results.flat();
 }
 
 // Decode the OTHER EEZ events that share the batch's transaction.
 function summarizeReceipt(receipt) {
   const s = { stateUpdated: [], l2exec: 0, consumed: 0, l2tx: 0, skipped: 0 };
-  for (const log of receipt.logs) {
+  for (const log of receipt?.logs ?? []) {
     if (log.address.toLowerCase() !== els.registry.value.trim().toLowerCase()) continue;
     let p; try { p = iface.parseLog(log); } catch { continue; }
     if (!p) continue;
@@ -622,13 +641,28 @@ function paintL2(list) {
   for (const e of list) { if (e.l2CellEl) e.l2CellEl.innerHTML = l2CellHtml(e); if (e.dec) e.dec.l2Range = e.l2Range; }
 }
 
-// Fetch + enrich + decode + L2-anchor every NEW batch in [fromB, toB].
-async function scanBatches(addr, fromB, toB, chunk) {
-  const logsRaw = await getLogsChunked(addr, fromB, toB, chunk);
+// Walk backwards from `head` in chunks until we've collected the newest `n`
+// BatchPosted logs (or run out of blocks). Avoids scanning the full history.
+async function recentLogs(addr, head, n, chunk, floor = 0) {
+  const out = [];
+  let end = head;
+  while (end >= floor && out.length < n) {
+    const start = Math.max(floor, end - chunk + 1);
+    setStatus(`Scanning recent blocks ${start.toLocaleString()}–${end.toLocaleString()} … (${out.length}/${n})`);
+    const logs = await provider.getLogs({ address: addr, topics: [BATCH_TOPIC], fromBlock: start, toBlock: end });
+    out.unshift(...logs);
+    end = start - 1;
+  }
+  return out.slice(-n); // newest n, in ascending block order
+}
+
+// Fetch + enrich + decode + L2-anchor a set of NEW batch logs.
+async function scanBatches(addr, logsRaw) {
   const logs = logsRaw.filter((l) => !seenLogs.has(logKey(l)));
   if (!logs.length) return [];
   for (const l of logs) seenLogs.add(logKey(l));
   setStatus(`Found ${logs.length} new batch(es). Fetching tx details…`);
+  let pendingFrom = Infinity; // lowest L1 block whose tx/receipt wasn't ready yet
 
   const blockCache = new Map();
   const blockTs = async (n) => {
@@ -636,25 +670,30 @@ async function scanBatches(addr, fromB, toB, chunk) {
     return blockCache.get(n);
   };
 
+  let done = 0;
+  const enriched = await pmap(logs, 12, async (log) => {
+    const [tx, receipt, ts] = await Promise.all([
+      provider.getTransaction(log.transactionHash),
+      provider.getTransactionReceipt(log.transactionHash),
+      blockTs(log.blockNumber),
+    ]);
+    const parsed = iface.parseLog(log);
+    setStatus(`Fetching tx details … (${++done}/${logs.length})`);
+    return { log, tx, receipt, ts, rollupCount: parsed.args.rollupCount.toString() };
+  });
+
   const all = [];
-  for (let i = 0; i < logs.length; i += 6) {
-    const slice = logs.slice(i, i + 6);
-    const enriched = await Promise.all(slice.map(async (log) => {
-      const [tx, receipt, ts] = await Promise.all([
-        provider.getTransaction(log.transactionHash),
-        provider.getTransactionReceipt(log.transactionHash),
-        blockTs(log.blockNumber),
-      ]);
-      const parsed = iface.parseLog(log);
-      return { log, tx, receipt, ts, rollupCount: parsed.args.rollupCount.toString() };
-    }));
-    for (const e of enriched) {
-      e.summary = summarizeReceipt(e.receipt);
-      e.dec = decodeBatch(e.tx);
-      e.blockCount = e.dec.batch ? callDataBlockCount(e.dec.batch.callData) : null;
-      all.push(e);
-    }
+  for (const e of enriched) {
+    // The tx/receipt may not be retrievable yet for a just-mined batch at the
+    // chain head (RPC race). Skip it for now and let a later scan pick it up,
+    // rather than caching an incomplete row that can never be reconciled.
+    if (!e.tx || !e.receipt) { seenLogs.delete(logKey(e.log)); pendingFrom = Math.min(pendingFrom, e.log.blockNumber); continue; }
+    e.summary = summarizeReceipt(e.receipt);
+    e.dec = decodeBatch(e.tx);
+    e.blockCount = e.dec.batch ? callDataBlockCount(e.dec.batch.callData) : null;
+    all.push(e);
   }
+  all.pendingFrom = pendingFrom;
 
   // Resolve real L2 block ranges via the L2 node by anchoring on each batch's first
   // user tx (reset-proof): tx → its L2 block; range = [block - firstTxOffset, +count-1].
@@ -679,7 +718,7 @@ function buildRow(e) {
   const summary = e.summary, dec = e.dec;
   totals.stateUpd += summary.stateUpdated.length;
   totals.exec += summary.consumed;
-  const ok = e.receipt.status === 1;
+  const ok = e.receipt ? e.receipt.status === 1 : null; // null = receipt not available yet (pending/head)
 
   const effects = [];
   if (summary.stateUpdated.length) effects.push(`<span class="chip">state×${summary.stateUpdated.length} [${[...new Set(summary.stateUpdated)].join(",")}]</span>`);
@@ -707,7 +746,7 @@ function buildRow(e) {
     <td class="mono">${hashCell(e.log.transactionHash, txUrl(e.log.transactionHash))}</td>
     <td class="mono">${e.tx?.from ? hashCell(e.tx.from, addrUrl(e.tx.from)) : "—"}</td>
     <td class="mono num">${e.rollupCount}</td>
-    <td><span class="tag ${ok?'ok':'fail'}">${ok?'success':'reverted'}</span></td>
+    <td><span class="tag ${ok==null?'':(ok?'ok':'fail')}">${ok==null?'pending':(ok?'success':'reverted')}</span></td>
     <td>${effects.join("") || '<span style="color:var(--muted)">—</span>'}</td>
     <td><button class="link-btn toggle" type="button">▸ decode</button></td>`;
   e.l2CellEl = tr.children[1]; // keep a handle so fillRanges/paintL2 can update it later
@@ -763,11 +802,22 @@ async function run({ incremental }) {
       totals.batches = 0; totals.stateUpd = 0; totals.exec = 0; totals.lastBlock = null;
     }
 
-    const fromB = incremental ? scanCursor + 1 : parseInt(els.fromBlock.value || "0", 10);
-    if (fromB > head) { setStatus(`Up to date at block ${head.toLocaleString()}.`); return; }
+    let logsRaw;
+    if (incremental) {
+      const fromB = scanCursor + 1;
+      if (fromB > head) { setStatus(`Up to date at block ${head.toLocaleString()}.`); return; }
+      logsRaw = await getLogsChunked(addr, fromB, head, chunk);
+    } else {
+      // Initial load: only the most recent N batches (cheap), not the whole history.
+      const n = Math.max(1, parseInt(els.recent?.value || "20", 10));
+      const floor = parseInt(els.fromBlock.value || "0", 10);
+      logsRaw = await recentLogs(addr, head, n, chunk, floor);
+    }
 
-    const all = await scanBatches(addr, fromB, head, chunk);
-    scanCursor = head;
+    const all = await scanBatches(addr, logsRaw);
+    // Don't advance the cursor past any batch whose tx/receipt wasn't ready yet —
+    // the next scan re-reads from there and finalizes it once the RPC catches up.
+    scanCursor = Math.min(head, (all.pendingFrom ?? Infinity) - 1);
 
     if (all.length) {
       for (const e of all) allBatches.push(e);

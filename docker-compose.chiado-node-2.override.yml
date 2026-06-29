@@ -31,6 +31,8 @@ services:
       EEZ_L1_AUTH_PORT: "${L1_AUTH_PORT:-18651}"
       EEZ_L1_P2P_PORT: "30644"
       EEZ_L1_RPC_URL: http://127.0.0.1:18745
+      # Keep C2 on the baseline bid even though the base C1 service bids higher.
+      EEZ_L1_POSTBATCH_PRIORITY_FEE: "${EEZ_L1_POSTBATCH_PRIORITY_FEE:-10000000000}"
       # B0 L1→L2 interceptor — offset (or set empty in .env.chiado-2 to disable).
       EEZ_L1_INTERCEPTOR_PORT: "18749"
       # Control feed (ProverDispatch + ProofSink) — the 2nd prover attaches here.
@@ -48,6 +50,7 @@ services:
       - node
       - --chain=/app/genesis.json
       - --datadir=/l2
+      - --db.read-transaction-timeout=0
       - --http
       - --http.addr=0.0.0.0
       - --http.port=18788

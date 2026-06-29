@@ -31,7 +31,11 @@ use std::process::Command;
 /// and return its `(stdout, stderr)` — native-validate prints the JSON summary
 /// to stdout (proverd parses it from there) and progress (`✓ WINDOW VALID`) to
 /// stderr.
-fn run_native_validate(validator_bin: &str, chain_config: &str, fixture_n: u64) -> (String, String) {
+fn run_native_validate(
+    validator_bin: &str,
+    chain_config: &str,
+    fixture_n: u64,
+) -> (String, String) {
     let manifest = env!("CARGO_MANIFEST_DIR");
     let fixtures = format!("{manifest}/tests/fixtures");
     let dir = std::env::temp_dir().join(format!("eez-nv-test-{fixture_n}"));
@@ -100,7 +104,9 @@ fn native_validate_accepts_the_captured_window() {
     let j: serde_json::Value =
         serde_json::from_str(summary.trim()).expect("summary line must be JSON");
     assert!(
-        j["final_state_root"].as_str().is_some_and(|s| s.starts_with("0x")),
+        j["final_state_root"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("0x")),
         "summary must carry a final_state_root: {summary}"
     );
     assert!(

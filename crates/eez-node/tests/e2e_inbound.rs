@@ -35,12 +35,12 @@ use alloy_primitives::{Address, U256, address};
 mod common;
 use common::{
     ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, EmbeddedL1, L1Chain, NodeConfig, NodeHandle,
-    PLACEHOLDER_ADDRESS, block_state_root_at, create_l2_cross_chain_proxy,
-    cross_chain_env, deploy_contracts_with_initial, deploy_value, fresh_cross_chain_genesis,
-    l1_block_number, proxy_original_address, read_chain_id, read_value, read_value_at_block,
-    remove_env,
-    safe_block_number_and_root, safe_block_state_root, send_inbound_set_value, state_root, wait_for,
-    wait_for_l1_blocks, wait_for_l2_rpc, wait_for_rpc_down, with_inbound_source_chain_ids,
+    PLACEHOLDER_ADDRESS, block_state_root_at, create_l2_cross_chain_proxy, cross_chain_env,
+    deploy_contracts_with_initial, deploy_value, fresh_cross_chain_genesis, l1_block_number,
+    proxy_original_address, read_chain_id, read_value, read_value_at_block, remove_env,
+    safe_block_number_and_root, safe_block_state_root, send_inbound_set_value, state_root,
+    wait_for, wait_for_l1_blocks, wait_for_l2_rpc, wait_for_rpc_down,
+    with_inbound_source_chain_ids,
 };
 
 /// Embedded reth bring-up + a fresh genesis materialization can take a
@@ -345,9 +345,7 @@ async fn inbound_set_value_settles_on_l2_and_follower_rederives() {
         let l1_root = state_root(&l1.rpc_url, dep.eez_address, dep.rollup_id).await?;
         let l2 = safe_block_number_and_root(&l2_rpc_b).await?;
         Ok(match l2 {
-            Some((num, root))
-                if root != alloy_primitives::B256::ZERO && root == l1_root =>
-            {
+            Some((num, root)) if root != alloy_primitives::B256::ZERO && root == l1_root => {
                 // DELIVERY-INCLUSIVE guard: the SAFE head lags the live
                 // delivery block, so an L1↔L2 match can land on a PRE-delivery
                 // anchor root (Value still 0). Pinning that root makes the S4
@@ -433,7 +431,9 @@ async fn inbound_set_value_settles_on_l2_and_follower_rederives() {
         e
     };
     assert!(
-        !follower_env.iter().any(|(k, _)| *k == "EEZ_PROOF_SIGNER_KEY"),
+        !follower_env
+            .iter()
+            .any(|(k, _)| *k == "EEZ_PROOF_SIGNER_KEY"),
         "follower env still carries EEZ_PROOF_SIGNER_KEY → would boot as composer",
     );
     let follower_l1_rpc = follower_env
@@ -475,8 +475,7 @@ async fn inbound_set_value_settles_on_l2_and_follower_rederives() {
     // Either proves byte-identical re-derivation. A height-pinned block
     // PRESENT but with a DIFFERENT root is a HARD failure (real divergence).
     let follower_outcome = wait_for(FOLLOWER_TIMEOUT, || async {
-        if let Ok(Some(r)) =
-            block_state_root_at(&follower.l2_rpc_url(), settled_block_number).await
+        if let Ok(Some(r)) = block_state_root_at(&follower.l2_rpc_url(), settled_block_number).await
         {
             if r == settled_root {
                 return Ok(Some(format!(

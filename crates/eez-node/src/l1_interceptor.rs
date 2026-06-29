@@ -268,7 +268,9 @@ async fn forward(ctx: &Ctx, body: Vec<u8>) -> Response<Full<HyperBytes>> {
             event!(name: "eez.l1_interceptor.upstream_error", Level::WARN, error = %e, "L1 upstream error");
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(Full::new(HyperBytes::from(format!("L1 upstream error: {e}"))))
+                .body(Full::new(HyperBytes::from(format!(
+                    "L1 upstream error: {e}"
+                ))))
                 .expect("valid response")
         }
     }
@@ -314,7 +316,10 @@ mod tests {
                                     .as_str()
                                     .or_else(|| j["params"][0]["data"].as_str())
                                     .unwrap_or("");
-                                if data.to_lowercase().ends_with(&hex::encode(PROXY.as_slice())) {
+                                if data
+                                    .to_lowercase()
+                                    .ends_with(&hex::encode(PROXY.as_slice()))
+                                {
                                     // ABI (address originalAddress=0x..dd, uint256
                                     // originalRollupId=1): two 32-byte words.
                                     format!(
@@ -402,13 +407,25 @@ mod tests {
 
         // (1) A plain eth_* is FORWARDED to L1.
         let r = rpc(&client, &front, "eth_chainId", serde_json::json!([])).await;
-        assert_eq!(r["result"], "0xforwarded", "non-tx method must be forwarded");
+        assert_eq!(
+            r["result"], "0xforwarded",
+            "non-tx method must be forwarded"
+        );
 
         // (2) A cross-chain tx (to the registered PROXY) is HELD (Inbound).
         let xchain = signed_tx_to(&signer, PROXY);
-        let r = rpc(&client, &front, "eth_sendRawTransaction", serde_json::json!([xchain])).await;
+        let r = rpc(
+            &client,
+            &front,
+            "eth_sendRawTransaction",
+            serde_json::json!([xchain]),
+        )
+        .await;
         let hash = r["result"].as_str().expect("held tx returns its hash");
-        assert!(hash.starts_with("0x") && hash.len() == 66, "expected a tx hash, got {hash}");
+        assert!(
+            hash.starts_with("0x") && hash.len() == 66,
+            "expected a tx hash, got {hash}"
+        );
         assert_eq!(
             held_pool.held_count_for(signer.address(), Direction::Inbound),
             1,
@@ -417,8 +434,17 @@ mod tests {
 
         // (3) A tx to a PLAIN (non-proxy) contract is FORWARDED, not held.
         let plain = signed_tx_to(&signer, PLAIN);
-        let r = rpc(&client, &front, "eth_sendRawTransaction", serde_json::json!([plain])).await;
-        assert_eq!(r["result"], "0xforwarded", "a non-cross-chain tx must be forwarded");
+        let r = rpc(
+            &client,
+            &front,
+            "eth_sendRawTransaction",
+            serde_json::json!([plain]),
+        )
+        .await;
+        assert_eq!(
+            r["result"], "0xforwarded",
+            "a non-cross-chain tx must be forwarded"
+        );
         assert_eq!(
             held_pool.held_count_for(signer.address(), Direction::Inbound),
             1,

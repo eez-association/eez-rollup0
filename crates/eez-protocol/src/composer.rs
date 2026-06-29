@@ -682,7 +682,10 @@ mod tests {
             _calls: &[crate::ExecutedAction<Self>],
             _dst: crate::RollupId,
         ) -> crate::error::ProtocolResult<Self::Batch> {
-            Err(crate::error::ProtocolErrorKind::Unsupported("test fake: no outbound settlement").into())
+            Err(
+                crate::error::ProtocolErrorKind::Unsupported("test fake: no outbound settlement")
+                    .into(),
+            )
         }
     }
 
@@ -921,8 +924,8 @@ mod tests {
     // Dispatcher trait is used in the FakeClient impl — reference it
     // here so the import isn't flagged as unused by future editors.
     #[allow(dead_code, reason = "type-level reference to keep import live")]
-    fn _dispatcher_in_scope<P: ChainProtocol + 'static>(
-    ) -> std::marker::PhantomData<dyn Dispatcher<Protocol = P> + Send> {
+    fn _dispatcher_in_scope<P: ChainProtocol + 'static>()
+    -> std::marker::PhantomData<dyn Dispatcher<Protocol = P> + Send> {
         std::marker::PhantomData
     }
 

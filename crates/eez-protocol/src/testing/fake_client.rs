@@ -358,7 +358,7 @@ impl<P: ChainProtocol + 'static> TargetExecutionSession for FakeChainSession<P> 
                             "FakeChainSession(rollup_id={}): checkpoint_factory not installed",
                             self.rollup_id,
                         ),
-                    )))
+                    )));
                 }
             }
         };
@@ -403,7 +403,7 @@ mod tests {
     use super::*;
     use crate::checkpoint::ExecutionCheckpoint;
     use crate::compose::compose_transaction;
-    use crate::composer::{ProxyLookupConfig, TargetConfig, DEFAULT_CCM_GAS_LIMIT};
+    use crate::composer::{DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig, TargetConfig};
     use crate::composition::Rollup;
     use crate::error::ProtocolResult;
     use crate::types::ExecutedAction;
@@ -499,7 +499,10 @@ mod tests {
         ) -> ProtocolResult<Self::Batch> {
             // SmokeProto's targets are never zk-poster, so finalize never calls
             // this. Honest typed error, never reached.
-            Err(crate::error::ProtocolErrorKind::Unsupported("SmokeProto does not settle outbound").into())
+            Err(
+                crate::error::ProtocolErrorKind::Unsupported("SmokeProto does not settle outbound")
+                    .into(),
+            )
         }
     }
 
@@ -516,7 +519,10 @@ mod tests {
             _m: &crate::message::Message<'_, Self>,
             _d: &crate::message::Delivery<Self>,
         ) -> ProtocolResult<Self::Batch> {
-            Err(crate::error::ProtocolErrorKind::Unsupported("SmokeProto does not consume inbound").into())
+            Err(
+                crate::error::ProtocolErrorKind::Unsupported("SmokeProto does not consume inbound")
+                    .into(),
+            )
         }
         fn build_settlement_only(&self, _settled: RollupId) -> Self::Batch {
             Vec::new()

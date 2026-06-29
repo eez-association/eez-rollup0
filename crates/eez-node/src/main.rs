@@ -16,8 +16,8 @@
 //! | set | set | **composer** | reth + `L1Watcher` + Deriver + Sequencer (L1-anchored) + Composer umbrella |
 
 mod ingress;
-mod l1_interceptor;
 mod l1_embedded;
+mod l1_interceptor;
 
 use std::{collections::HashMap, env, str::FromStr, sync::Arc};
 

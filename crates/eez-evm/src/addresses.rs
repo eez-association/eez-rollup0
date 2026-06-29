@@ -7,7 +7,7 @@
 //! tells user txs from system txs in a sealed block) need them, so they
 //! live here — one definition, no "keep these in sync" comments.
 
-use alloy_primitives::{address, Address};
+use alloy_primitives::{Address, address};
 
 /// The cross-chain messenger (`EEZL2`), pre-allocated at `0xeeee…eeee`
 /// in the `eez-dev` genesis. Every system tx targets it (its

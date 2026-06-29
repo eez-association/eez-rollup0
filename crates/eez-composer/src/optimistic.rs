@@ -17,11 +17,14 @@
 //!   the next Sync slot ([`OptimisticallyIncluded::take_failed_for_recovery`]),
 //!   serialized against the Sequencer and Deriver to close the
 //!   observer-vs-commit TOCTOU.
-//! - **Cursor-confirmed**: the Deriver's cursor passing the Sync height
-//!   proves settlement independently of the observer
-//!   ([`OptimisticallyIncluded::resolve_below_cursor`]); the
-//!   one-in-flight gate ([`OptimisticallyIncluded::blocking_height`])
-//!   holds emission until then.
+//! - **Cursor-confirmed**: for Pending entries only, the Deriver's
+//!   cursor passing the Sync height proves settlement independently of
+//!   the observer ([`OptimisticallyIncluded::resolve_below_cursor`]);
+//!   Failed entries still require root-aware slot-context recovery
+//!   because a competitor can advance the cursor with a different root.
+//!   The one-in-flight gate
+//!   ([`OptimisticallyIncluded::blocking_height`]) holds emission until
+//!   then.
 //!
 //! Keyed by L2 heights; the L1⇄L2 map is the Deriver-owned
 //! `L1CanonicalHead` batch index.
@@ -54,6 +57,11 @@ pub struct FailedBatch {
     /// EIP-2718 envelope) — preserved across reinsert so the finality
     /// audit can still locate the receipt.
     pub post_batch_hash: TxHash,
+    /// The L2 state root the postBatch had to settle for this
+    /// optimistic block to be real. A competing composer can advance
+    /// the L1 cursor past `sync_height` with a different root; height
+    /// alone is not confirmation.
+    pub expected_final_state: alloy_primitives::B256,
     /// The Sync block's parent — the reorg target if the block landed.
     pub parent: SealedHeader<alloy_consensus::Header>,
     /// The user txs whose effects the block carried.
@@ -65,14 +73,15 @@ pub struct FailedBatch {
 enum Resolution {
     /// Bundle submitted; outcome not yet known.
     Pending,
-    /// L1 settled (observer verdict or Deriver cursor confirmation).
+    /// L1 settled (observer verdict or Pending Deriver cursor confirmation).
     /// Retained until L1 finality for reorg recovery.
     Settled,
     /// Observer verdict: the bundle didn't land. Awaiting slot-context
     /// recovery (reorg + re-push) via
-    /// [`OptimisticallyIncluded::take_failed_for_recovery`]. The
-    /// Deriver's cursor reaching this height overrides to Settled — the
-    /// cursor is the stronger oracle.
+    /// [`OptimisticallyIncluded::take_failed_for_recovery`]. Deriver
+    /// cursor movement alone does not override this in based
+    /// competition; recovery verifies whether the failed postBatch
+    /// actually reached its expected final root.
     Failed,
 }
 
@@ -82,6 +91,8 @@ struct InFlight {
     /// Hash of the bundle's postBatch L1 tx — the finality audit
     /// checks its receipt before the entry is dropped.
     post_batch_hash: TxHash,
+    /// Expected final L2 state root for this optimistic block.
+    expected_final_state: alloy_primitives::B256,
     parent: SealedHeader<alloy_consensus::Header>,
     resolution: Resolution,
 }
@@ -109,6 +120,7 @@ impl OptimisticallyIncluded {
         &self,
         sync_height: u64,
         post_batch_hash: TxHash,
+        expected_final_state: alloy_primitives::B256,
         parent: SealedHeader<alloy_consensus::Header>,
         txs: Vec<HeldTx>,
     ) {
@@ -118,6 +130,7 @@ impl OptimisticallyIncluded {
             InFlight {
                 txs,
                 post_batch_hash,
+                expected_final_state,
                 parent,
                 resolution: Resolution::Pending,
             },
@@ -153,16 +166,17 @@ impl OptimisticallyIncluded {
         map.range(cursor + 1..).next().map(|(h, _)| *h)
     }
 
-    /// Flip Pending AND Failed entries at or below the Deriver's
-    /// cursor to Settled — the cursor only advances past a batch after
-    /// `check_claimed_state` accepted it, which is a stronger
-    /// settlement proof than the observer's log scan. A Failed verdict
-    /// is overridden here: a false-negative observation must not undo
-    /// a batch the Deriver confirmed.
+    /// Flip Pending entries at or below the Deriver's cursor to
+    /// Settled. Failed entries are deliberately NOT cursor-resolved:
+    /// in based competition a competitor can advance the cursor past
+    /// our failed optimistic height with a different state root. Those
+    /// failed entries must still go through recovery, where the actual
+    /// postBatch/final-root is checked before deciding whether a
+    /// failure verdict was stale.
     pub fn resolve_below_cursor(&self, cursor: u64) {
         let mut map = self.by_sync_height.lock().unwrap();
         for (_, entry) in map.range_mut(..=cursor) {
-            if entry.resolution != Resolution::Settled {
+            if entry.resolution == Resolution::Pending {
                 entry.resolution = Resolution::Settled;
             }
         }
@@ -192,23 +206,25 @@ impl OptimisticallyIncluded {
         }
     }
 
-    /// Extract the Failed entry above `cursor`, if any, for slot-
-    /// context recovery (at most one can exist — the gate blocks new
-    /// emission while any entry is unresolved). The caller performs
-    /// the reorg + re-push; on a recovery error it re-inserts via
-    /// [`Self::reinsert_failed`] so the gate stays closed and the next
-    /// slot retries.
+    /// Extract a Failed entry, if any, for slot-context recovery. This
+    /// intentionally scans all heights, not just `cursor + 1..`: a
+    /// competitor can advance the cursor past our failed optimistic
+    /// block without confirming our root, so recovery still has to
+    /// remove the local effects. The caller performs the reorg +
+    /// re-push; on a recovery error it re-inserts via
+    /// [`Self::reinsert_failed`] so the next slot retries.
     #[must_use]
-    pub fn take_failed_for_recovery(&self, cursor: u64) -> Option<FailedBatch> {
+    pub fn take_failed_for_recovery(&self, _cursor: u64) -> Option<FailedBatch> {
         let mut map = self.by_sync_height.lock().unwrap();
         let h = map
-            .range(cursor + 1..)
+            .iter()
             .find(|(_, e)| e.resolution == Resolution::Failed)
             .map(|(h, _)| *h)?;
         let entry = map.remove(&h)?;
         Some(FailedBatch {
             sync_height: h,
             post_batch_hash: entry.post_batch_hash,
+            expected_final_state: entry.expected_final_state,
             parent: entry.parent,
             txs: entry.txs,
         })
@@ -222,8 +238,26 @@ impl OptimisticallyIncluded {
             InFlight {
                 txs: batch.txs,
                 post_batch_hash: batch.post_batch_hash,
+                expected_final_state: batch.expected_final_state,
                 parent: batch.parent,
                 resolution: Resolution::Failed,
+            },
+        );
+    }
+
+    /// Put an extracted failed entry back as Settled after recovery
+    /// proves the failure verdict was stale. This preserves the normal
+    /// L1 reorg/finality audit behavior for the optimistic block.
+    pub fn reinsert_settled(&self, batch: FailedBatch) {
+        let mut map = self.by_sync_height.lock().unwrap();
+        map.insert(
+            batch.sync_height,
+            InFlight {
+                txs: batch.txs,
+                post_batch_hash: batch.post_batch_hash,
+                expected_final_state: batch.expected_final_state,
+                parent: batch.parent,
+                resolution: Resolution::Settled,
             },
         );
     }
@@ -299,10 +333,14 @@ mod tests {
         TxHash::repeat_byte(tag)
     }
 
+    fn root(tag: u8) -> B256 {
+        B256::repeat_byte(tag)
+    }
+
     #[test]
     fn gate_blocks_until_cursor_passes_even_when_settled() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+        pool.begin(10, pb_hash(0xa), root(0xa), hdr(), vec![tx(1)]);
         assert_eq!(pool.blocking_height(5), Some(10));
         // Observer settle-verdict does NOT re-open the gate…
         pool.mark_settled(10);
@@ -314,13 +352,14 @@ mod tests {
     #[test]
     fn failed_recovery_extracts_once_and_unblocks() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
+        pool.begin(10, pb_hash(0xa), root(0xa), hdr(), vec![tx(1), tx(2)]);
         pool.mark_failed(10);
         // Failed entry still blocks until recovered.
         assert_eq!(pool.blocking_height(0), Some(10));
         let batch = pool.take_failed_for_recovery(0).expect("failed entry");
         assert_eq!(batch.sync_height, 10);
         assert_eq!(batch.post_batch_hash, pb_hash(0xa));
+        assert_eq!(batch.expected_final_state, root(0xa));
         assert_eq!(batch.txs.len(), 2);
         assert!(pool.take_failed_for_recovery(0).is_none());
         assert_eq!(pool.blocking_height(0), None);
@@ -330,22 +369,39 @@ mod tests {
     }
 
     #[test]
-    fn cursor_resolution_overrides_false_failure() {
+    fn cursor_resolution_settles_pending_entries() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
-        pool.mark_failed(10);
-        // Deriver confirmed the batch — false-negative verdict overridden.
+        pool.begin(10, pb_hash(0xa), root(0xa), hdr(), vec![tx(1)]);
         pool.resolve_below_cursor(10);
         assert!(pool.take_failed_for_recovery(0).is_none());
+        assert_eq!(pool.blocking_height(10), None);
+        let finalized = pool.take_finalized(10);
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].0, 10);
+        assert_eq!(finalized[0].1, pb_hash(0xa));
+    }
+
+    #[test]
+    fn cursor_resolution_does_not_hide_failed_entry() {
+        let pool = OptimisticallyIncluded::new();
+        pool.begin(10, pb_hash(0xa), root(0xa), hdr(), vec![tx(1)]);
+        pool.mark_failed(10);
+        // A competitor can advance the cursor past this height with a
+        // different root. Recovery must still inspect the actual
+        // postBatch/final root before dropping the failure verdict.
+        pool.resolve_below_cursor(10);
+        let batch = pool.take_failed_for_recovery(10).expect("failed entry");
+        assert_eq!(batch.sync_height, 10);
+        assert_eq!(batch.expected_final_state, root(0xa));
         assert_eq!(pool.blocking_height(10), None);
     }
 
     #[test]
     fn rolled_out_recovers_only_settled() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+        pool.begin(10, pb_hash(0xa), root(0xa), hdr(), vec![tx(1)]);
         pool.mark_settled(10);
-        pool.begin(15, pb_hash(0xb), hdr(), vec![tx(2)]); // Pending — in-flight bundle
+        pool.begin(15, pb_hash(0xb), root(0xb), hdr(), vec![tx(2)]); // Pending — in-flight bundle
         let recovered = pool.take_rolled_out(8);
         // Only the settled batch's txs come back; the pending bundle's
         // observer will resolve it.
@@ -358,7 +414,7 @@ mod tests {
         let pool = OptimisticallyIncluded::new();
         // Deferred post, slot time: register the gate with a PLACEHOLDER hash
         // (the proof hasn't arrived, so the L1 tx isn't signed yet).
-        pool.begin(10, TxHash::ZERO, hdr(), vec![tx(1)]);
+        pool.begin(10, TxHash::ZERO, root(0xa), hdr(), vec![tx(1)]);
         // The one-in-flight gate is closed IMMEDIATELY — the next Sync slot
         // must skip emission even though the post hasn't been signed/sent.
         assert_eq!(pool.blocking_height(5), Some(10));
@@ -378,7 +434,7 @@ mod tests {
     fn deferred_timeout_marks_failed_for_recovery() {
         let pool = OptimisticallyIncluded::new();
         // Slot time: gate registered with survivors + a placeholder hash.
-        pool.begin(10, TxHash::ZERO, hdr(), vec![tx(1), tx(2)]);
+        pool.begin(10, TxHash::ZERO, root(0xa), hdr(), vec![tx(1), tx(2)]);
         // Proof never arrives within budget → the deferred task marks the
         // pre-registered entry Failed (it does NOT call begin again).
         pool.mark_failed(10);
@@ -396,9 +452,9 @@ mod tests {
     #[test]
     fn finalize_extracts_settled_for_audit() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+        pool.begin(10, pb_hash(0xa), root(0xa), hdr(), vec![tx(1)]);
         pool.mark_settled(10);
-        pool.begin(15, pb_hash(0xb), hdr(), vec![tx(2)]); // Pending — stays
+        pool.begin(15, pb_hash(0xb), root(0xb), hdr(), vec![tx(2)]); // Pending — stays
         let finalized = pool.take_finalized(12);
         // The settled entry is returned with its postBatch hash so the
         // caller can audit the receipt; the pending entry stays.

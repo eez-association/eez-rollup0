@@ -20,9 +20,7 @@
 //! `EEZ_COMPOSER_DRIVEN`. A prover that ignores `ProverDispatch` keeps
 //! self-picking `from_block`, so a mixed fleet interoperates.
 
-use eez_control_rpc::v1::{
-    prover_dispatch_server::ProverDispatch, DispatchRequest, VerifyRange,
-};
+use eez_control_rpc::v1::{DispatchRequest, VerifyRange, prover_dispatch_server::ProverDispatch};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};

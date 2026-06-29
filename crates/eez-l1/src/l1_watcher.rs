@@ -561,9 +561,7 @@ impl L1Watcher {
         // BatchPosted, so the derivation path is idempotent by cursor.
         let mut chunk_from = from;
         while chunk_from <= to {
-            let chunk_to = chunk_from
-                .saturating_add(MAX_BATCH_SCAN_RANGE - 1)
-                .min(to);
+            let chunk_to = chunk_from.saturating_add(MAX_BATCH_SCAN_RANGE - 1).min(to);
             event!(
                 name: "eez.l1_watcher.scan_batch_posted",
                 Level::INFO,

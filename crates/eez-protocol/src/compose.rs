@@ -52,7 +52,10 @@ use crate::types::{Composition, ExecutedAction};
 /// dispatch) or `finalize` (empty inputs, unknown target, invalid
 /// checkpoint, CCM failure).
 pub async fn compose_transaction<
-    P: ChainProtocol + crate::capabilities::SettlesOutbound + crate::capabilities::ConsumesInbound + 'static,
+    P: ChainProtocol
+        + crate::capabilities::SettlesOutbound
+        + crate::capabilities::ConsumesInbound
+        + 'static,
 >(
     protocol: &P,
     entry_client: &(dyn EntryChainClient<Protocol = P> + Send + Sync),
@@ -86,7 +89,10 @@ pub async fn compose_transaction<
     err,
 )]
 pub async fn compose_transaction_recorded<
-    P: ChainProtocol + crate::capabilities::SettlesOutbound + crate::capabilities::ConsumesInbound + 'static,
+    P: ChainProtocol
+        + crate::capabilities::SettlesOutbound
+        + crate::capabilities::ConsumesInbound
+        + 'static,
 >(
     protocol: &P,
     entry_client: &(dyn EntryChainClient<Protocol = P> + Send + Sync),

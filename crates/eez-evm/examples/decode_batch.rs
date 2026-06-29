@@ -1,7 +1,7 @@
 //! Temporary decoder for the block-1251 postBatch divergence probe.
-use alloy_primitives::{hex, B256};
+use alloy_primitives::{B256, hex};
 use alloy_sol_types::{SolCall, SolValue};
-use eez_evm::types::{postAndVerifyBatchCall, ExecutionEntrySol};
+use eez_evm::types::{ExecutionEntrySol, postAndVerifyBatchCall};
 
 fn dump_entry(label: &str, e: &ExecutionEntrySol) {
     println!("== {label} ==");
@@ -26,7 +26,10 @@ fn dump_entry(label: &str, e: &ExecutionEntrySol) {
             hex::encode(&c.data)
         );
     }
-    println!("  expectedL1ToL2Calls.len() = {}", e.expectedL1ToL2Calls.len());
+    println!(
+        "  expectedL1ToL2Calls.len() = {}",
+        e.expectedL1ToL2Calls.len()
+    );
     println!("  expectedLookups.len() = {}", e.expectedLookups.len());
     println!("  callCount = {}", e.callCount);
     println!("  returnData = 0x{}", hex::encode(&e.returnData));
@@ -53,7 +56,10 @@ fn main() {
 
     println!("== BATCH TOP-LEVEL ==");
     println!("entries.len() = {}", b.entries.len());
-    println!("transientExecutionEntryCount = {}", b.transientExecutionEntryCount);
+    println!(
+        "transientExecutionEntryCount = {}",
+        b.transientExecutionEntryCount
+    );
     println!("callData.len() = {}", b.callData.len());
     println!("proofs.len() = {}", b.proofs.len());
     println!();
@@ -71,8 +77,16 @@ fn main() {
     println!("transactions.len() = {}", d.transactions.len());
     println!("l2_entries.len() = {}", d.l2_entries.len());
     let from_block = 501u64;
-    for (idx, c) in d.block_tx_counts.iter().enumerate().filter(|(_, c)| **c > 0) {
-        println!("   block idx {idx} -> L2 block {} : {c} tx(s)", from_block + idx as u64);
+    for (idx, c) in d
+        .block_tx_counts
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c > 0)
+    {
+        println!(
+            "   block idx {idx} -> L2 block {} : {c} tx(s)",
+            from_block + idx as u64
+        );
     }
     println!();
 
@@ -96,14 +110,24 @@ fn main() {
         .into_iter()
         .filter(|e| !e.l2ToL1Calls.is_empty())
         .partition(|e| e.proxyEntryHash == B256::ZERO);
-    println!("outbound (proxyEntryHash==0, non-empty l2ToL1Calls) = {}", outbound.len());
-    println!("inbound (proxyEntryHash!=0, non-empty l2ToL1Calls) = {}", inbound.len());
+    println!(
+        "outbound (proxyEntryHash==0, non-empty l2ToL1Calls) = {}",
+        outbound.len()
+    );
+    println!(
+        "inbound (proxyEntryHash!=0, non-empty l2ToL1Calls) = {}",
+        inbound.len()
+    );
     let sync_user_count = d.block_tx_counts.last().map_or(0, |c| usize::from(*c));
     let user_start = d.transactions.len().saturating_sub(sync_user_count);
     println!("sync_user_count (last block tx count) = {sync_user_count}");
     println!("user_start index = {user_start}");
     for (i, t) in d.transactions[user_start..].iter().enumerate() {
-        println!("   sync user tx[{i}] (len {}) = 0x{}", t.len(), hex::encode(&t[..t.len().min(80)]));
+        println!(
+            "   sync user tx[{i}] (len {}) = 0x{}",
+            t.len(),
+            hex::encode(&t[..t.len().min(80)])
+        );
     }
     println!();
     println!("######## CLAIMED CHAIN (on-chain entries[] deltas, in order) ########");
@@ -124,7 +148,9 @@ fn main() {
     println!("######## DERIVER SyncPair RECONSTRUCTION (build_cross_chain_sync_pairs) ########");
     {
         use alloy_signer_local::PrivateKeySigner;
-        use eez_evm::system_tx::{build_cross_chain_sync_pairs, interleave_sync_block_txs, SystemTxContext};
+        use eez_evm::system_tx::{
+            SystemTxContext, build_cross_chain_sync_pairs, interleave_sync_block_txs,
+        };
         // Partition DA entries exactly like the deriver.
         let da_entries: Vec<ExecutionEntrySol> = d
             .l2_entries
@@ -142,14 +168,19 @@ fn main() {
         let outbound_paired: Vec<(ExecutionEntrySol, alloy_primitives::Bytes)> = da_outbound
             .iter()
             .cloned()
-            .zip(d.transactions[us..].iter().map(|t| alloy_primitives::Bytes::from(t.clone())))
+            .zip(
+                d.transactions[us..]
+                    .iter()
+                    .map(|t| alloy_primitives::Bytes::from(t.clone())),
+            )
             .collect();
         // The dev SYSTEM_ADDRESS key used on this devnet is the anvil index-0 key
         // unless overridden; we only need the SHAPE + nonce, so any key gives the
         // structure. Print BOTH the nonce assignment and the load-tx calldata
         // (which is key-INDEPENDENT).
         let cfg = SystemTxContext {
-            system_signer: PrivateKeySigner::from_bytes(&alloy_primitives::B256::with_last_byte(1)).unwrap(),
+            system_signer: PrivateKeySigner::from_bytes(&alloy_primitives::B256::with_last_byte(1))
+                .unwrap(),
             ccm_l2_address: alloy_primitives::address!("4200000000000000000000000000000000000007"),
             l2_chain_id: 1,
             l2_gas_price: 1_000_000_000,
@@ -157,9 +188,14 @@ fn main() {
             this_rollup_id: 1,
         };
         for start_nonce in [0u64, 1u64] {
-            let pairs = build_cross_chain_sync_pairs(&outbound_paired, &da_inbound, &cfg, start_nonce).unwrap();
+            let pairs =
+                build_cross_chain_sync_pairs(&outbound_paired, &da_inbound, &cfg, start_nonce)
+                    .unwrap();
             let txs = interleave_sync_block_txs(&pairs);
-            println!("-- starting_nonce={start_nonce}: {} sync-block txs --", txs.len());
+            println!(
+                "-- starting_nonce={start_nonce}: {} sync-block txs --",
+                txs.len()
+            );
             for (i, t) in txs.iter().enumerate() {
                 use alloy_consensus::Transaction as _;
                 use alloy_eips::eip2718::Decodable2718 as _;

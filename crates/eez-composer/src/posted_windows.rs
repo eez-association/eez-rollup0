@@ -95,6 +95,32 @@ impl Ledger {
         }
         self.verified_frontier
     }
+
+    /// Drop windows whose anchor is now below the L1-confirmed cursor. They can
+    /// never be proven or submitted as-is because their `currentState` belongs to
+    /// the pre-cursor root; the next slot must rebuild from `cursor + 1`.
+    fn prune_straddling_cursor(&mut self, rollup_id: u64, cursor: u64) -> Vec<PostedWindow> {
+        let mut pruned = Vec::new();
+        self.by_height.retain(|_, w| {
+            let stale = w.rollup_id == rollup_id && w.from_block <= cursor && w.to_block > cursor;
+            if stale {
+                pruned.push(w.clone());
+            }
+            !stale
+        });
+        pruned
+    }
+}
+
+/// Result of folding an L1-confirmed cursor into the posted-window ledger.
+#[derive(Debug, Clone)]
+pub struct L1SettleUpdate {
+    /// Highest contiguous verified/resolved `to_block` after the update.
+    pub frontier: u64,
+    /// Windows invalidated because their anchor is at or below the L1-confirmed
+    /// cursor while their target is above it. The composer should mark matching
+    /// optimistic entries failed so the next sync slot can rebuild promptly.
+    pub pruned_straddlers: Vec<PostedWindow>,
 }
 
 /// Shared posted/attested ledger. Writers: the composer ([`record_posted`])
@@ -124,7 +150,10 @@ impl PostedWindows {
     #[must_use]
     pub fn new() -> Self {
         let (notify, _rx) = tokio::sync::watch::channel(0u64);
-        Self { inner: Arc::new(Mutex::new(Ledger::default())), notify: Arc::new(notify) }
+        Self {
+            inner: Arc::new(Mutex::new(Ledger::default())),
+            notify: Arc::new(notify),
+        }
     }
 
     /// A receiver the dispatch driver `changed().await`s to wake on any ledger
@@ -225,20 +254,23 @@ impl PostedWindows {
     ///
     /// MONOTONE (only advances): the shared L1 cursor can RETREAT on an L1 reorg,
     /// and a non-monotone follow would pull the frontier backward + un-resolve
-    /// already-attested windows. The early-return guard is load-bearing for that.
-    /// Returns the new frontier. Runtime counterpart of the startup-only
+    /// already-attested windows. Even when the cursor is not above the current
+    /// attestation frontier, we still sweep pending flags and prune straddlers:
+    /// a same-block competitor can L1-confirm the exact frontier we already
+    /// learned from the ProofSink, making older-anchor wider windows dead.
+    /// Returns the new frontier plus any pruned stale windows. Runtime counterpart of the startup-only
     /// [`reinit_from_cursor`](Self::reinit_from_cursor) (which DROPS the swept
     /// windows — correct at startup, wrong mid-flight).
-    pub fn mark_settled_on_l1(&self, l1_cursor: u64) -> u64 {
-        let (frontier, tick) = {
+    pub fn mark_settled_on_l1(&self, rollup_id: u64, l1_cursor: u64) -> L1SettleUpdate {
+        let (frontier, pruned_straddlers, tick) = {
             let Ok(mut l) = self.inner.lock() else {
-                return 0;
+                return L1SettleUpdate {
+                    frontier: 0,
+                    pruned_straddlers: Vec::new(),
+                };
             };
-            if l1_cursor <= l.verified_frontier {
-                return l.verified_frontier; // monotone no-op (incl. reorg retreat)
-            }
             for w in l.by_height.values_mut() {
-                if w.to_block <= l1_cursor {
+                if w.rollup_id == rollup_id && w.to_block <= l1_cursor {
                     w.attested = true; // attested-by-transitivity through L1
                     w.pending_l1 = false; // confirmed → no longer in flight
                 }
@@ -251,15 +283,19 @@ impl PostedWindows {
             // After this, every remaining unresolved window shares the current
             // anchor (cursor+1), so next_to_dispatch's global-widest is the
             // in-flight batch.
-            l.by_height
-                .retain(|_, w| !(w.from_block <= l1_cursor && w.to_block > l1_cursor));
-            l.verified_frontier = l1_cursor;
+            let pruned_straddlers = l.prune_straddling_cursor(rollup_id, l1_cursor);
+            if l1_cursor > l.verified_frontier {
+                l.verified_frontier = l1_cursor;
+            }
             l.highest_posted = l.highest_posted.max(l1_cursor);
             let frontier = l.recompute_frontier();
-            (frontier, l.bump())
+            (frontier, pruned_straddlers, l.bump())
         };
         self.notify.send_replace(tick);
-        frontier
+        L1SettleUpdate {
+            frontier,
+            pruned_straddlers,
+        }
     }
 
     /// L1 REORG demotion (reorg safety): an L1 reorg retreated the cursor to
@@ -337,7 +373,11 @@ impl PostedWindows {
     #[must_use]
     pub fn next_to_dispatch(&self) -> Option<PostedWindow> {
         let l = self.inner.lock().ok()?;
-        l.by_height.values().rev().find(|w| !w.is_resolved()).cloned()
+        l.by_height
+            .values()
+            .rev()
+            .find(|w| !w.is_resolved())
+            .cloned()
     }
 
     #[must_use]
@@ -363,7 +403,8 @@ impl PostedWindows {
             };
             l.verified_frontier = cursor;
             l.highest_posted = l.highest_posted.max(cursor);
-            l.by_height.retain(|h, _| *h > cursor);
+            l.by_height
+                .retain(|h, w| *h > cursor && w.from_block > cursor);
             l.bump()
         };
         self.notify.send_replace(tick);
@@ -396,7 +437,10 @@ mod tests {
         pw.record_posted(win(57, 90, 0xc)); // [57..90] supersedes [57..65]
         // Only the WIDEST survives; the dispatch directs the prover at it.
         assert_eq!(pw.next_to_dispatch().unwrap().to_block, 90);
-        assert_eq!(pw.next_to_dispatch().unwrap().public_inputs_hash, B256::repeat_byte(0xc));
+        assert_eq!(
+            pw.next_to_dispatch().unwrap().public_inputs_hash,
+            B256::repeat_byte(0xc)
+        );
     }
 
     #[test]
@@ -429,7 +473,10 @@ mod tests {
         // Re-attesting the shared hash resolves [57..90] (the dispatched widest),
         // NOT a no-op on [57..60]. Old code marked the narrowest match → churn.
         pw.mark_attested(B256::repeat_byte(0xa));
-        assert!(pw.next_to_dispatch().is_none(), "widest must resolve, not churn");
+        assert!(
+            pw.next_to_dispatch().is_none(),
+            "widest must resolve, not churn"
+        );
         assert_eq!(pw.verified_frontier(), 90);
     }
 
@@ -442,7 +489,7 @@ mod tests {
         // Skipped by dispatch while pending L1.
         assert!(pw.next_to_dispatch().is_none());
         // L1 confirms → cleared + frontier follows.
-        assert_eq!(pw.mark_settled_on_l1(90), 90);
+        assert_eq!(pw.mark_settled_on_l1(1, 90).frontier, 90);
         assert!(pw.next_to_dispatch().is_none());
     }
 
@@ -451,7 +498,7 @@ mod tests {
         let pw = PostedWindows::new();
         pw.record_posted(win(1, 50, 0xa));
         pw.record_posted(win(51, 90, 0xb));
-        pw.mark_settled_on_l1(90); // both resolved-by-transitivity, frontier=90
+        pw.mark_settled_on_l1(1, 90); // both resolved-by-transitivity, frontier=90
         assert!(pw.next_to_dispatch().is_none());
         // L1 reorg retreats the cursor to 40 (a competing composer's batch rolled
         // out). Windows above 40 must be re-verified.
@@ -496,15 +543,17 @@ mod tests {
     }
 
     #[test]
-    fn reinit_from_cursor_drops_settled_and_seeds_frontier() {
+    fn reinit_from_cursor_drops_settled_and_straddling_and_seeds_frontier() {
         let pw = PostedWindows::new();
         pw.record_posted(win(1, 10, 0xa));
         pw.record_posted(win(11, 20, 0xb));
+        pw.record_posted(win(16, 30, 0xc));
         // Composer restart: cursor confirms [..15] settled on L1.
         pw.reinit_from_cursor(15);
         assert_eq!(pw.verified_frontier(), 15);
-        // The <=15 window is dropped; the >15 window remains to re-dispatch.
-        assert_eq!(pw.next_unverified().unwrap().to_block, 20);
+        // Windows <=15 and windows straddling 15 are stale; only a fresh
+        // cursor+1 anchor remains to re-dispatch.
+        assert_eq!(pw.next_unverified().unwrap().to_block, 30);
     }
 
     #[test]
@@ -517,13 +566,34 @@ mod tests {
         // attesting them (it fell behind / their composition was evicted): the
         // frontier follows the cursor by transitivity, and the swept windows are
         // RESOLVED (not dropped — unlike reinit) so dispatch skips to [21..30].
-        assert_eq!(pw.mark_settled_on_l1(20), 20);
+        assert_eq!(pw.mark_settled_on_l1(1, 20).frontier, 20);
         assert_eq!(pw.verified_frontier(), 20);
         assert_eq!(pw.next_unverified().unwrap().to_block, 30);
         // Monotone: a lower cursor (an L1 reorg retreat) is a no-op — never pulls
         // the frontier back or un-resolves an already-settled window.
-        assert_eq!(pw.mark_settled_on_l1(5), 20);
+        assert_eq!(pw.mark_settled_on_l1(1, 5).frontier, 20);
         assert_eq!(pw.verified_frontier(), 20);
         assert_eq!(pw.next_unverified().unwrap().to_block, 30);
+    }
+
+    #[test]
+    fn settled_on_l1_prunes_straddler_even_when_cursor_equals_attested_frontier() {
+        let pw = PostedWindows::new();
+        pw.record_posted(win(1, 10, 0xa));
+        pw.mark_attested(B256::repeat_byte(0xa));
+
+        // A relay drop before L1 settlement can require a same-anchor wider
+        // retry; do not treat the attested-only frontier as an L1 cursor.
+        pw.record_posted(win(1, 20, 0xb));
+        assert_eq!(pw.verified_frontier(), 10);
+        assert_eq!(pw.next_to_dispatch().unwrap().to_block, 20);
+
+        // Once L1 confirms cursor=10 (possibly via the competing composer), the
+        // wider [1..20] anchor is stale and must not be dispatched again.
+        let update = pw.mark_settled_on_l1(1, 10);
+        assert_eq!(update.frontier, 10);
+        assert_eq!(update.pruned_straddlers.len(), 1);
+        assert_eq!(update.pruned_straddlers[0].to_block, 20);
+        assert!(pw.next_to_dispatch().is_none());
     }
 }

@@ -30,7 +30,7 @@
 //! [`proxy_mapping_key`] / [`decode_proxy_value`] directly via the
 //! `u8` slot.
 
-use alloy_primitives::{keccak256, Address, B256, U256};
+use alloy_primitives::{Address, B256, U256, keccak256};
 use eez_protocol::RollupId;
 
 /// Storage slot of `authorizedProxies` on `EEZ.sol` (L1).

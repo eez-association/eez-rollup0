@@ -88,14 +88,14 @@ pub mod types;
 pub mod witness;
 
 use alloy_primitives::{Address, Bytes, U256};
-use eez_protocol::{
-    ChainProtocol, ConsumesInbound, Delivery, ExecutedAction, Message, ProtocolErrorKind,
-    ProtocolResult, SettlesOutbound,
-};
 /// Re-export `RollupId` so consumers of `entries::OutboundEntry` and the
 /// system-tx builders (e.g. the deriver) can name it without taking a direct
 /// dependency on `eez-protocol`.
 pub use eez_protocol::RollupId;
+use eez_protocol::{
+    ChainProtocol, ConsumesInbound, Delivery, ExecutedAction, Message, ProtocolErrorKind,
+    ProtocolResult, SettlesOutbound,
+};
 
 #[doc(inline)]
 pub use action::{compute_state_root_slot, cross_chain_call_hash};
@@ -103,8 +103,8 @@ pub use action::{compute_state_root_slot, cross_chain_call_hash};
 pub use addresses::{CCM_ADDRESS, SYSTEM_ADDRESS};
 #[doc(inline)]
 pub use authorized_proxies::{
-    decode_proxy_value, proxy_mapping_key, ProxyInfo, CCM_AUTHORIZED_PROXIES_SLOT,
-    ROLLUPS_AUTHORIZED_PROXIES_SLOT,
+    CCM_AUTHORIZED_PROXIES_SLOT, ProxyInfo, ROLLUPS_AUTHORIZED_PROXIES_SLOT, decode_proxy_value,
+    proxy_mapping_key,
 };
 #[doc(inline)]
 pub use batch::EvmBatch;
@@ -122,9 +122,7 @@ pub use signer::{EcdsaProofSigner, SignerError};
 #[doc(inline)]
 pub use proof_plan::{AlloyRollupReader, EvmProofPlanResolver, ResolverConfigError};
 #[doc(inline)]
-pub use public_inputs::{
-    all_per_ps_hashes, entry_hash, public_inputs_hashes, shared_public_input,
-};
+pub use public_inputs::{all_per_ps_hashes, entry_hash, public_inputs_hashes, shared_public_input};
 #[doc(inline)]
 pub use types::{
     ActionSol, ExecutionEntrySol, ExpectedL1ToL2CallSol, L2ToL1CallSol, LookupCallSol,
@@ -147,8 +145,7 @@ pub type EvmExecutedAction = ExecutedAction<EvmProtocol>;
 /// `EvmWitness` are `PartialEq` but NOT `Eq`. `EvmCheckpoint` is
 /// therefore `PartialEq`-only; downstream `Eq`-requiring containers
 /// (e.g. `HashSet<EvmCheckpoint>`) must wrap.
-pub type EvmCheckpoint =
-    eez_protocol::ExecutionCheckpoint<EvmOverlay, EvmWitness>;
+pub type EvmCheckpoint = eez_protocol::ExecutionCheckpoint<EvmOverlay, EvmWitness>;
 
 // ── EvmProtocol ─────────────────────────────────────────────────
 
@@ -231,10 +228,7 @@ impl ChainProtocol for EvmProtocol {
         Ok(Bytes::from(bytes.to_vec()))
     }
 
-    fn message_id(
-        &self,
-        m: &eez_protocol::message::Message<'_, Self>,
-    ) -> [u8; 32] {
+    fn message_id(&self, m: &eez_protocol::message::Message<'_, Self>) -> [u8; 32] {
         action::cross_chain_call_hash(
             m.to_rollup,
             *m.to_addr,
@@ -288,7 +282,11 @@ impl ConsumesInbound for EvmProtocol {
     // byte-lock oracle (`finalize_source_entry_matches_deferred_view`).
     // The FAILURE branch stays live: settlement-only entry + failed
     // LookupCall is a shape `build_batch` does not emit.
-    fn build_return(&self, m: &Message<'_, Self>, d: &Delivery<Self>) -> ProtocolResult<Self::Batch> {
+    fn build_return(
+        &self,
+        m: &Message<'_, Self>,
+        d: &Delivery<Self>,
+    ) -> ProtocolResult<Self::Batch> {
         let batch = if d.success {
             entries::build_l1_inbound_entry(
                 *m.to_addr,
@@ -348,10 +346,7 @@ mod tests {
         let proto = EvmProtocol;
         let batch = batch::EvmBatch::empty();
         let data = proto.encode_table_payload(&batch, &ChainDialect::EvmL1Style);
-        assert_eq!(
-            &data[..4],
-            &postAndVerifyBatchCall::SELECTOR
-        );
+        assert_eq!(&data[..4], &postAndVerifyBatchCall::SELECTOR);
     }
 
     #[test]
@@ -369,7 +364,7 @@ mod tests {
     #[test]
     fn message_id_is_the_six_field_hash() {
         use alloy_primitives::{Address, Bytes, U256};
-        use eez_protocol::{message::Message, RollupId};
+        use eez_protocol::{RollupId, message::Message};
         let to_addr = Address::from([0x11; 20]);
         let from_addr = Address::from([0x22; 20]);
         let value = U256::from(7u64);
@@ -386,7 +381,15 @@ mod tests {
         // 6-field cross-chain-call hash.
         assert_eq!(
             EvmProtocol.message_id(&m),
-            action::cross_chain_call_hash(RollupId(9), to_addr, value, &data, from_addr, RollupId(5)).0,
+            action::cross_chain_call_hash(
+                RollupId(9),
+                to_addr,
+                value,
+                &data,
+                from_addr,
+                RollupId(5)
+            )
+            .0,
         );
     }
 

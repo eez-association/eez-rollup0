@@ -30,8 +30,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use alloy_primitives::{Address, Bytes, Signature, B256};
-use eez_control_rpc::v1::{proof_sink_server::ProofSink, SlotProof, SubmitAck};
+use alloy_primitives::{Address, B256, Bytes, Signature};
+use eez_control_rpc::v1::{SlotProof, SubmitAck, proof_sink_server::ProofSink};
 use eez_evm::EvmBatch;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
@@ -53,7 +53,10 @@ pub fn verify_attestation(attester: Address, proof: &SlotProof) -> bool {
     }
     let hash = B256::from_slice(&proof.public_inputs_hash);
     let Ok(sig) = Signature::try_from(proof.post_batch_proof.as_slice()) else {
-        warn!(l1_slot_anchor = proof.l1_slot_anchor, "ProofSink: malformed 65-byte signature");
+        warn!(
+            l1_slot_anchor = proof.l1_slot_anchor,
+            "ProofSink: malformed 65-byte signature"
+        );
         return false;
     };
     match sig.recover_address_from_prehash(&hash) {
@@ -118,14 +121,22 @@ impl ProofSinkSvc {
     /// logged but not consumed (the mock self-signs the actual post).
     #[must_use]
     pub fn new(attester: Address) -> Self {
-        Self { attester, store: None, posted_windows: None }
+        Self {
+            attester,
+            store: None,
+            posted_windows: None,
+        }
     }
 
     /// Verify + RECORD into `store` for the deferred post (drained by
     /// [`apply_proof`]).
     #[must_use]
     pub fn with_store(attester: Address, store: ProofStore) -> Self {
-        Self { attester, store: Some(store), posted_windows: None }
+        Self {
+            attester,
+            store: Some(store),
+            posted_windows: None,
+        }
     }
 
     /// Verify + record into `store` (deferred post) AND advance the
@@ -136,7 +147,11 @@ impl ProofSinkSvc {
         store: ProofStore,
         posted_windows: PostedWindows,
     ) -> Self {
-        Self { attester, store: Some(store), posted_windows: Some(posted_windows) }
+        Self {
+            attester,
+            store: Some(store),
+            posted_windows: Some(posted_windows),
+        }
     }
 
     /// Verify the attestation and, if a store is wired, record it. Returns
@@ -177,7 +192,7 @@ impl ProofSink for ProofSinkSvc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{address, U256};
+    use alloy_primitives::{U256, address};
     use eez_evm::public_inputs::public_inputs_hashes;
     use eez_evm::signer::EcdsaProofSigner;
     use eez_evm::types::RollupIdWithProofSystemsSol;
@@ -196,8 +211,10 @@ mod tests {
         let mut batch = EvmBatch::default();
         batch.inner.blockNumber = 0;
         batch.inner.proofSystems = vec![address!("00000000000000000000000000000000000000aa")];
-        batch.inner.rollupIdsWithProofSystems =
-            vec![RollupIdWithProofSystemsSol { rollupId: U256::from(1), proofSystemIndex: vec![0] }];
+        batch.inner.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
+            rollupId: U256::from(1),
+            proofSystemIndex: vec![0],
+        }];
         batch
     }
 

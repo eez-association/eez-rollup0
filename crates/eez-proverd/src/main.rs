@@ -25,20 +25,22 @@
 //! `control.v1.ProofSink` return path. Without a `--validator-bin` the daemon is
 //! a pure feed observer.
 
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::B256;
-use std::collections::HashMap;
 use clap::Parser;
 use eez_control_rpc::v1::{
+    ControlEvent, DispatchRequest, ExecutionWitness, SlotProof, SubscribeRequest, VerifyRange,
     control_feed_client::ControlFeedClient, proof_sink_client::ProofSinkClient,
-    prover_dispatch_client::ProverDispatchClient, ControlEvent, DispatchRequest, ExecutionWitness,
-    SlotProof, SubscribeRequest, VerifyRange,
+    prover_dispatch_client::ProverDispatchClient,
 };
 use eez_evm::entries::decode_postbatch;
 use eez_evm::public_inputs::public_inputs_hashes;
 use eez_evm::signer::EcdsaProofSigner;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use tracing::{error, info, warn};
 
 /// Parse a 32-byte hex `B256` (the vkey arg).
@@ -129,7 +131,11 @@ struct Args {
     chain_config: Option<String>,
 
     /// Scratch dir for the per-window validator inputs.
-    #[arg(long, env = "EEZ_VALIDATOR_WORKDIR", default_value = "/tmp/eez-proverd")]
+    #[arg(
+        long,
+        env = "EEZ_VALIDATOR_WORKDIR",
+        default_value = "/tmp/eez-proverd"
+    )]
     work_dir: String,
 
     /// Max L2 blocks per window before forcing a validator pass (a window also
@@ -165,6 +171,10 @@ struct Args {
     /// and retries on the next replay (observer mode is unchanged).
     #[arg(long, env = "EEZ_L2_RPC_URL", default_value = "http://127.0.0.1:18688")]
     l2_rpc_url: Option<String>,
+
+    /// Bounded parallelism for archive replay-gap recovery.
+    #[arg(long, env = "EEZ_BACKFILL_CONCURRENCY", default_value_t = 1)]
+    backfill_concurrency: usize,
 }
 
 /// Serialize a control-feed witness to native-validate's `witness.json`
@@ -257,6 +267,154 @@ async fn backfill_block(l2_rpc_url: &str, n: u64) -> eyre::Result<ControlEvent> 
         }),
         block: raw_block.to_vec(),
     })
+}
+
+fn is_transient_backfill_error(err: &eyre::Report) -> bool {
+    let msg = format!("{err:?}").to_ascii_lowercase();
+    [
+        "-96000",
+        "read transaction has been timed out",
+        "error sending request",
+        "connection closed",
+        "connection reset",
+        "connection refused",
+        "broken pipe",
+        "operation timed out",
+        "request timed out",
+        "deadline",
+        "temporarily unavailable",
+        "transport error",
+    ]
+    .iter()
+    .any(|needle| msg.contains(needle))
+}
+
+async fn backfill_block_with_retries(
+    url: Arc<String>,
+    n: u64,
+    expected: u64,
+    got: u64,
+) -> eyre::Result<ControlEvent> {
+    let mut attempt = 0u32;
+    let block_started = Instant::now();
+    loop {
+        match backfill_block(&url, n).await {
+            Ok(ev) => {
+                if attempt > 0 {
+                    info!(
+                        block = n,
+                        attempts = attempt + 1,
+                        elapsed_secs = block_started.elapsed().as_secs(),
+                        "backfill block recovered after archive RPC retries",
+                    );
+                }
+                return Ok(ev);
+            }
+            Err(e) if is_transient_backfill_error(&e) => {
+                attempt += 1;
+                let delay_ms = (300u64 << attempt.min(6)).min(30_000);
+                warn!(
+                    block = n,
+                    attempt,
+                    elapsed_secs = block_started.elapsed().as_secs(),
+                    backfilled = n.saturating_sub(expected),
+                    remaining = got.saturating_sub(n),
+                    delay_ms,
+                    error = %e,
+                    "backfill block failed — retaining fetched history and retrying transient L2-archive error",
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+async fn backfill_task(
+    url: Arc<String>,
+    n: u64,
+    expected: u64,
+    got: u64,
+) -> (u64, eyre::Result<ControlEvent>) {
+    let result = backfill_block_with_retries(url, n, expected, got).await;
+    (n, result)
+}
+
+async fn backfill_gap_events(
+    url: &str,
+    expected: u64,
+    got: u64,
+    prev_chunk_last_hash: Option<&[u8]>,
+    concurrency: usize,
+) -> eyre::Result<Vec<ControlEvent>> {
+    let concurrency = concurrency.clamp(1, 64);
+    let total = got.saturating_sub(expected);
+    let url = Arc::new(url.to_owned());
+    let mut in_flight = FuturesUnordered::new();
+    let mut ready: BTreeMap<u64, ControlEvent> = BTreeMap::new();
+    let mut events: Vec<ControlEvent> = Vec::new();
+    let mut next_to_fetch = expected;
+    let mut next_to_emit = expected;
+
+    while next_to_fetch < got && in_flight.len() < concurrency {
+        let url = Arc::clone(&url);
+        let n = next_to_fetch;
+        in_flight.push(backfill_task(url, n, expected, got));
+        next_to_fetch += 1;
+    }
+
+    while next_to_emit < got {
+        let Some((n, result)) = in_flight.next().await else {
+            eyre::bail!("backfill worker set ended before block {next_to_emit}");
+        };
+        let ev = result.map_err(|e| {
+            eyre::eyre!("backfill FAILED on non-transient L2-archive error at block {n}: {e}")
+        })?;
+        ready.insert(n, ev);
+
+        while let Some(ev) = ready.remove(&next_to_emit) {
+            if next_to_emit == expected {
+                if let Some(prev_hash) = prev_chunk_last_hash {
+                    if ev.parent_hash != prev_hash {
+                        eyre::bail!(
+                            "cross-chunk block-hash break: first backfilled block's parent_hash != previous chunk's last block hash at block {next_to_emit}"
+                        );
+                    }
+                }
+            }
+            if let Some(tip) = events.last() {
+                if ev.parent_hash != tip.block_hash || ev.block_number != tip.block_number + 1 {
+                    eyre::bail!(
+                        "backfilled block {next_to_emit} does not extend previous backfilled tip"
+                    );
+                }
+            }
+            events.push(ev);
+            let done = next_to_emit.saturating_sub(expected) + 1;
+            if done == 1 || done % 100 == 0 || next_to_emit + 1 == got {
+                info!(
+                    from = expected,
+                    to = got - 1,
+                    current = next_to_emit,
+                    backfilled = done,
+                    total,
+                    remaining = total.saturating_sub(done),
+                    concurrency,
+                    "backfill progress",
+                );
+            }
+            next_to_emit += 1;
+
+            while next_to_fetch < got && in_flight.len() < concurrency {
+                let url = Arc::clone(&url);
+                let n = next_to_fetch;
+                in_flight.push(backfill_task(url, n, expected, got));
+                next_to_fetch += 1;
+            }
+        }
+    }
+
+    Ok(events)
 }
 
 /// The RE-EXECUTED facts native-validate returns for a window — what the
@@ -356,7 +514,10 @@ async fn validate_window(
     // positional hash pairing below explicit (the contiguity guard orders them).
     let n_validated = summary["blocks"].as_array().map_or(0, Vec::len);
     if n_validated != window.len() {
-        eyre::bail!("validator returned {n_validated} blocks, window has {}", window.len());
+        eyre::bail!(
+            "validator returned {n_validated} blocks, window has {}",
+            window.len()
+        );
     }
 
     // Each validator block hash MUST match the hash the composer claimed for
@@ -392,7 +553,11 @@ async fn validate_window(
     // parent/final/per-tx + placeholder recognition.
     let per_block_roots: Option<Vec<B256>> = summary["blocks"].as_array().and_then(|arr| {
         arr.iter()
-            .map(|b| b["state_root"].as_str().and_then(|s| s.parse::<B256>().ok()))
+            .map(|b| {
+                b["state_root"]
+                    .as_str()
+                    .and_then(|s| s.parse::<B256>().ok())
+            })
             .collect::<Option<Vec<_>>>()
     });
     // The Sync (last) block's per-tx re-executed data (re-derived, never composer
@@ -404,9 +569,11 @@ async fn validate_window(
             .filter_map(|s| s.parse::<B256>().ok())
             .collect::<Vec<_>>()
     });
-    let sync_tx_statuses = last_block["tx_statuses"]
-        .as_array()
-        .map(|arr| arr.iter().filter_map(serde_json::Value::as_bool).collect::<Vec<_>>());
+    let sync_tx_statuses = last_block["tx_statuses"].as_array().map(|arr| {
+        arr.iter()
+            .filter_map(serde_json::Value::as_bool)
+            .collect::<Vec<_>>()
+    });
     let settling = window.iter().any(|e| e.composition.is_some());
     info!(
         from,
@@ -417,6 +584,14 @@ async fn validate_window(
         %parent_state_root,
         "✓ native-validate accepted window (stateless re-execution OK)",
     );
+    if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+        warn!(
+            from,
+            to,
+            error = %e,
+            "validated window workdir cleanup failed",
+        );
+    }
     Ok(VerifiedWindow {
         parent_state_root,
         final_state_root,
@@ -482,7 +657,9 @@ fn verify_settlement_public_inputs(
     }
     let claimed = B256::from_slice(&pb.public_inputs_hash);
     if recomputed != claimed {
-        eyre::bail!("publicInputsHash mismatch: recomputed {recomputed} != composer-claimed {claimed}");
+        eyre::bail!(
+            "publicInputsHash mismatch: recomputed {recomputed} != composer-claimed {claimed}"
+        );
     }
     Ok(recomputed)
 }
@@ -545,7 +722,10 @@ fn system_txs_succeeded(system_flags: &[bool], statuses: Option<&[bool]>) -> boo
         );
         return false;
     }
-    system_flags.iter().zip(statuses).all(|(sys, ok)| !*sys || *ok)
+    system_flags
+        .iter()
+        .zip(statuses)
+        .all(|(sys, ok)| !*sys || *ok)
 }
 
 /// Re-derive ALL inbound L1→L2 calls (`DecodedInbound`: call args + returnData +
@@ -669,8 +849,10 @@ fn multi_inbound_outcome_gate(
     // `proxyEntryHash == 0`), so a mixed inbound+outbound batch gates the inbound
     // half only. (An outbound entry has non-empty l2ToL1Calls but proxyEntryHash
     // 0; the partition mirrors the deriver's `partition(|e| proxyEntryHash == 0)`.)
-    let deferred: Vec<&eez_evm::types::ExecutionEntrySol> =
-        entries.iter().filter(|e| e.proxyEntryHash != B256::ZERO).collect();
+    let deferred: Vec<&eez_evm::types::ExecutionEntrySol> = entries
+        .iter()
+        .filter(|e| e.proxyEntryHash != B256::ZERO)
+        .collect();
 
     // SUCCESS sealed inbounds in window/block order — positional bijection to the
     // deferred entries. FAILURE sealed inbounds — bijection to failed lookups.
@@ -768,8 +950,7 @@ fn outbound_user_txs_from_block(block_rlp: &[u8]) -> Vec<alloy_primitives::Bytes
         // every deployment (genesis predeploy). Using 0xeeee would misclassify
         // every system tx as a user tx and break the outbound pairing.
         let is_system = tx.recover_signer().is_ok_and(|signer| {
-            signer == eez_evm::SYSTEM_ADDRESS
-                && tx.to() == Some(eez_evm::outbound_gate::EEZL2_ADDR)
+            signer == eez_evm::SYSTEM_ADDRESS && tx.to() == Some(eez_evm::outbound_gate::EEZL2_ADDR)
         });
         if is_system {
             continue;
@@ -934,8 +1115,14 @@ fn verify_settlement_chain(
     let proven_root = |b: B256| -> bool {
         b == vw.parent_state_root
             || b == vw.final_state_root
-            || vw.per_block_roots.as_deref().is_some_and(|roots| roots.contains(&b))
-            || vw.sync_per_tx_roots.as_deref().is_some_and(|roots| roots.contains(&b))
+            || vw
+                .per_block_roots
+                .as_deref()
+                .is_some_and(|roots| roots.contains(&b))
+            || vw
+                .sync_per_tx_roots
+                .as_deref()
+                .is_some_and(|roots| roots.contains(&b))
     };
     let mut last_pos: Option<usize> = None;
     #[allow(clippy::needless_range_loop)]
@@ -978,7 +1165,9 @@ fn verify_settlement_chain(
             // the endpoint gates above were bypassed (they enforce r0 ==
             // batch_anchor_root and rn == final_state_root, and for a single-chunk
             // batch batch_anchor_root == parent_state_root). Defense in depth.
-            eyre::bail!("interior boundary {k} equals an endpoint that is not a proven re-executed root — replay re-arm hazard");
+            eyre::bail!(
+                "interior boundary {k} equals an endpoint that is not a proven re-executed root — replay re-arm hazard"
+            );
         }
         eyre::bail!(
             "interior boundary {k} ({boundary}) is neither a placeholder nor any re-executed root (parent / final / per-tx) — replay re-arm hazard"
@@ -1027,8 +1216,37 @@ fn batch_first_current_state(pb: &eez_control_rpc::v1::PostBatch) -> eyre::Resul
         .ok_or_else(|| eyre::eyre!("settlement batch has no entries"))?;
     match first.stateDeltas.as_slice() {
         [d] => Ok(d.currentState),
-        ds => eyre::bail!("entry 0 carries {} StateDeltas, expected exactly 1 (Position B)", ds.len()),
+        ds => eyre::bail!(
+            "entry 0 carries {} StateDeltas, expected exactly 1 (Position B)",
+            ds.len()
+        ),
     }
+}
+
+/// In driven mode the composer dictates exactly one posted window. Failed
+/// minimal Sync blocks remain canonical L2 blocks and their historical
+/// `PostBatch` sidecars can still be replayed from the control ring; they are
+/// not the current directive. Treat only the directive `to_block` as settling and
+/// strip older sidecars so the window validates across them like ordinary empty
+/// Sync blocks.
+fn driven_effective_settlement(
+    event: &mut eez_control_rpc::v1::ControlEvent,
+    driven: bool,
+    target_to_block: Option<u64>,
+) -> bool {
+    if event.composition.is_none() {
+        return false;
+    }
+    if driven && Some(event.block_number) != target_to_block {
+        warn!(
+            block_number = event.block_number,
+            ?target_to_block,
+            "driven: ignoring non-target PostBatch sidecar in replayed control event",
+        );
+        event.composition = None;
+        return false;
+    }
+    true
 }
 
 /// Classify the settlement chain into the 3-way verdict the prover loop acts on.
@@ -1052,7 +1270,10 @@ fn classify_settlement_chain(
 ) -> SettlementVerdict {
     if let Ok(r0) = batch_first_current_state(pb) {
         if r0 != batch_anchor_root {
-            return SettlementVerdict::AnchorMismatch { claimed_r0: r0, reexecuted: batch_anchor_root };
+            return SettlementVerdict::AnchorMismatch {
+                claimed_r0: r0,
+                reexecuted: batch_anchor_root,
+            };
         }
     }
     match verify_settlement_chain(pb, vw, batch_anchor_root, sync_block_rlp) {
@@ -1151,16 +1372,20 @@ async fn main() -> eyre::Result<()> {
         },
         None => None,
     };
-    let vkey = signer.as_ref().map_or(args.vkey, |s| vkey_from_address(s.address()));
+    let vkey = signer
+        .as_ref()
+        .map_or(args.vkey, |s| vkey_from_address(s.address()));
     let vkey_configured = vkey != B256::ZERO;
-    let proof_sink_url = args.proof_sink_url.clone().unwrap_or_else(|| args.control_addr.clone());
+    let proof_sink_url = args
+        .proof_sink_url
+        .clone()
+        .unwrap_or_else(|| args.control_addr.clone());
 
     // Durable-backfill endpoint. The arg defaults to the L2 RPC, so a normally
     // deployed prover RECOVERS replay gaps out of the box; an EXPLICIT empty
     // value (`--l2-rpc-url ""` / `EEZ_L2_RPC_URL=`) normalizes to None — the
     // fail-loud, no-backfill opt-out (observer mode is unchanged).
-    let l2_rpc_url: Option<String> =
-        args.l2_rpc_url.clone().filter(|u| !u.trim().is_empty());
+    let l2_rpc_url: Option<String> = args.l2_rpc_url.clone().filter(|u| !u.trim().is_empty());
 
     let validating = args.validator_bin.is_some() && args.chain_config.is_some();
     // Composer-driven dispatch (Phase 3): when set, the prover takes its verify
@@ -1169,7 +1394,12 @@ async fn main() -> eyre::Result<()> {
     // Default off ⇒ the self-pick path is byte-for-byte unchanged. Same parse as
     // eez-node's gate so the two agree.
     let driven = std::env::var("EEZ_COMPOSER_DRIVEN")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false);
     info!(
         control_addr = %args.control_addr,
@@ -1284,7 +1514,11 @@ async fn main() -> eyre::Result<()> {
         if consecutive_failures > 0 {
             let exp = consecutive_failures.min(6);
             let delay = Duration::from_millis(500u64 << exp).min(Duration::from_secs(30));
-            warn!(attempt = consecutive_failures, ?delay, "reconnecting to the composer");
+            warn!(
+                attempt = consecutive_failures,
+                ?delay,
+                "reconnecting to the composer"
+            );
             tokio::time::sleep(delay).await;
         }
 
@@ -1403,10 +1637,20 @@ async fn main() -> eyre::Result<()> {
         // composer's `mark_attested` (resolve the dispatched-widest window), which
         // removes the churn at its source.
         let mut last_validated_window: Option<(u64, u64)> = None;
+        // Archive backfill is fed through the same per-event path as live replay.
+        // On a large gap we queue at most one max_window chunk ahead of the
+        // already-received event, letting the normal close/validate path advance
+        // stream_tip before that event is retried.
+        let mut pending_events: VecDeque<ControlEvent> = VecDeque::new();
 
         loop {
-            match stream.message().await {
-                Ok(Some(event)) => {
+            let next_event = if let Some(event) = pending_events.pop_front() {
+                Ok(Some(event))
+            } else {
+                stream.message().await
+            };
+            match next_event {
+                Ok(Some(mut event)) => {
                     // Phase 3 (driven): never verify past the directive's to_block. By
                     // construction to_block is the settling block (is_sync) and the window
                     // closes + breaks there, so this fires only if that block carried NO
@@ -1486,90 +1730,60 @@ async fn main() -> eyre::Result<()> {
                                 consecutive_failures += 1;
                                 break;
                             }
-                            // Backfill ENABLED: reconstruct [expected ..= got-1] in
-                            // order from the L2 archive and seed the window with them.
+                            // Backfill ENABLED: reconstruct at most one validation chunk
+                            // in order from the L2 archive. The recovered events are put
+                            // in front of this already-received event so the existing
+                            // per-event max_window path validates the gap in bounded
+                            // chunks instead of one enormous native-validate window.
                             Some(url) if got > expected => {
+                                let chunk =
+                                    u64::try_from(args.max_window.max(1)).unwrap_or(u64::MAX);
+                                let backfill_got = got.min(expected.saturating_add(chunk));
                                 warn!(
                                     expected,
                                     got,
-                                    "replay gap — durably backfilling [{expected}..={}] from the L2 archive",
-                                    got - 1,
+                                    backfill_to = backfill_got - 1,
+                                    "replay gap — durably backfilling bounded chunk [{expected}..={}] from the L2 archive",
+                                    backfill_got - 1,
                                 );
                                 let t_backfill = Instant::now();
-                                let mut backfill_ok = true;
-                                'fill: for n in expected..got {
-                                    // Witness reconstruction over RPC transiently
-                                    // fails under L2-node load (MDBX read-tx
-                                    // timeout, a restarting/compacting node). A
-                                    // SINGLE flaky block must NOT discard the
-                                    // thousands already fetched and force a
-                                    // re-backfill from genesis — retry the block
-                                    // with backoff (giving the node a breather)
-                                    // before giving up on the whole batch.
-                                    let mut attempt = 0u32;
-                                    let ev = loop {
-                                        match backfill_block(url, n).await {
-                                            Ok(ev) => break ev,
-                                            Err(e) if attempt < 6 => {
-                                                attempt += 1;
-                                                warn!(
-                                                    block = n,
-                                                    attempt,
-                                                    error = %e,
-                                                    "backfill block failed — retrying with backoff (transient L2-archive error)",
-                                                );
-                                                tokio::time::sleep(
-                                                    std::time::Duration::from_millis(
-                                                        300u64 << attempt.min(5),
-                                                    ),
-                                                )
-                                                .await;
-                                            }
-                                            Err(e) => {
-                                                error!(
-                                                    block = n,
-                                                    error = %e,
-                                                    "backfill FAILED after retries — dropping the batch (retry on replay); cursor NOT advanced",
-                                                );
-                                                backfill_ok = false;
-                                                break 'fill;
-                                            }
-                                        }
-                                    };
-                                    // Cross-chunk hash continuity for the FIRST
-                                    // backfilled block (n == expected): it must chain
-                                    // from the previous chunk's last hash. Subsequent
-                                    // backfilled blocks chain to each other via the
-                                    // intra-window guard once pushed.
-                                    if n == expected {
-                                        if let Some(prev_hash) = prev_chunk_last_hash.as_deref() {
-                                            if ev.parent_hash != prev_hash {
-                                                error!(
-                                                    block = n,
-                                                    "cross-chunk block-hash break: first backfilled block's parent_hash != previous chunk's last block hash; dropping the batch",
-                                                );
-                                                backfill_ok = false;
-                                                break 'fill;
-                                            }
-                                        }
+                                let recovered = match backfill_gap_events(
+                                    url,
+                                    expected,
+                                    backfill_got,
+                                    prev_chunk_last_hash.as_deref(),
+                                    args.backfill_concurrency,
+                                )
+                                .await
+                                {
+                                    Ok(events) => events,
+                                    Err(e) => {
+                                        error!(
+                                            error = %e,
+                                            "backfill FAILED — dropping the batch; cursor NOT advanced",
+                                        );
+                                        window.clear();
+                                        consecutive_failures += 1;
+                                        break;
                                     }
-                                    window.push(ev);
-                                }
-                                if !backfill_ok {
-                                    window.clear();
-                                    consecutive_failures += 1;
-                                    break;
-                                }
+                                };
                                 let backfill_ms = t_backfill.elapsed().as_millis();
-                                let count = got - expected;
+                                let count = u64::try_from(recovered.len()).unwrap_or(u64::MAX);
                                 info!(
                                     backfilled = count,
                                     backfill_ms,
                                     per_block_ms = backfill_ms / u128::from(count.max(1)),
                                     from = expected,
-                                    to = got - 1,
-                                    "✓ replay gap backfilled from the L2 archive (debug_executionWitness per block)",
+                                    to = backfill_got - 1,
+                                    replay_gap_to = got - 1,
+                                    concurrency = args.backfill_concurrency.clamp(1, 64),
+                                    "✓ replay gap chunk backfilled from the L2 archive (debug_executionWitness per block)",
                                 );
+                                pending_events.push_front(event);
+                                for ev in recovered.into_iter().rev() {
+                                    pending_events.push_front(ev);
+                                }
+                                continue;
                             }
                             // `got < expected` (a stale replay below the cursor): the
                             // server replayed a block we already proved. Not a gap;
@@ -1590,13 +1804,19 @@ async fn main() -> eyre::Result<()> {
                             window.clear();
                         }
                     }
-                    let is_sync = event.composition.is_some();
+                    let is_sync = driven_effective_settlement(
+                        &mut event,
+                        driven,
+                        vr.as_ref().map(|d| d.to_block),
+                    );
                     window.push(event);
 
                     if is_sync || window.len() >= args.max_window {
                         // Window is non-empty after the push.
-                        let window_end =
-                            window.last().expect("window non-empty after push").block_number;
+                        let window_end = window
+                            .last()
+                            .expect("window non-empty after push")
+                            .block_number;
                         let window_start = window.first().map_or(window_end, |e| e.block_number);
                         // Storm guard (see `last_validated_window` decl): if this is
                         // an IDENTICAL re-send of the window we just validated, pace
@@ -1656,14 +1876,18 @@ async fn main() -> eyre::Result<()> {
                         // repeated root. Runs for settling AND non-settling windows.
                         if let Some(vw) = &verified {
                             if window_start > 0 {
-                                root_to_height.entry(vw.parent_state_root).or_insert(window_start - 1);
+                                root_to_height
+                                    .entry(vw.parent_state_root)
+                                    .or_insert(window_start - 1);
                             }
                             if let Some(roots) = &vw.per_block_roots {
                                 for (i, r) in roots.iter().enumerate() {
                                     root_to_height.entry(*r).or_insert(window_start + i as u64);
                                 }
                             }
-                            root_to_height.entry(vw.final_state_root).or_insert(window_end);
+                            root_to_height
+                                .entry(vw.final_state_root)
+                                .or_insert(window_end);
                         }
 
                         // GAP-2 OD-5 batch anchor — TELESCOPE across chunks. The
@@ -1701,10 +1925,9 @@ async fn main() -> eyre::Result<()> {
 
                         // Settlement publicInputsHash cross-check — the attester
                         // recomputes this byte-for-byte before signing.
-                        if let Some(pb) = window
-                            .iter()
-                            .find_map(|e| e.composition.as_ref().and_then(|c| c.post_batch.as_ref()))
-                        {
+                        if let Some(pb) = window.iter().find_map(|e| {
+                            e.composition.as_ref().and_then(|c| c.post_batch.as_ref())
+                        }) {
                             // Locate the composer's CONFIRMED posted height for the
                             // resume-cursor decision below: the cache height of the
                             // batch's claimed `current_state` (= state(posted)). A
@@ -1731,7 +1954,9 @@ async fn main() -> eyre::Result<()> {
                                     }
                                 }
                             } else {
-                                warn!("settling window but --vkey unset; publicInputsHash NOT verified");
+                                warn!(
+                                    "settling window but --vkey unset; publicInputsHash NOT verified"
+                                );
                             }
 
                             // (2b) Settlement-chain gate — checks the composer's
@@ -1752,12 +1977,20 @@ async fn main() -> eyre::Result<()> {
                                 // closed rather than silently anchoring at the local parent.
                                 match batch_anchor_root {
                                     Some(anchor) => {
-                                        match classify_settlement_chain(pb, vw, anchor, sync_block_rlp) {
+                                        match classify_settlement_chain(
+                                            pb,
+                                            vw,
+                                            anchor,
+                                            sync_block_rlp,
+                                        ) {
                                             SettlementVerdict::Ok => info!(
                                                 %anchor,
                                                 "✓ settlement chain telescopes R0(=state(posted))→…→R_N to the re-executed roots",
                                             ),
-                                            SettlementVerdict::AnchorMismatch { claimed_r0, reexecuted } => {
+                                            SettlementVerdict::AnchorMismatch {
+                                                claimed_r0,
+                                                reexecuted,
+                                            } => {
                                                 error!(
                                                     %claimed_r0,
                                                     %reexecuted,
@@ -2215,10 +2448,10 @@ async fn main() -> eyre::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{address, U256};
+    use alloy_primitives::{U256, address};
+    use eez_evm::EvmBatch;
     use eez_evm::entries::encode_postbatch;
     use eez_evm::types::RollupIdWithProofSystemsSol;
-    use eez_evm::EvmBatch;
 
     /// A minimal finalized PostBatch — one PS, one rollup, TIMELESS — mirroring
     /// eez-evm's `carrier_batch` test helper, with the publicInputsHash the
@@ -2227,8 +2460,10 @@ mod tests {
         let mut batch = EvmBatch::default();
         batch.inner.blockNumber = 0; // timeless
         batch.inner.proofSystems = vec![address!("00000000000000000000000000000000000000aa")];
-        batch.inner.rollupIdsWithProofSystems =
-            vec![RollupIdWithProofSystemsSol { rollupId: U256::from(1), proofSystemIndex: vec![0] }];
+        batch.inner.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
+            rollupId: U256::from(1),
+            proofSystemIndex: vec![0],
+        }];
         let claimed = public_inputs_hashes(&batch, vkey, None).unwrap()[0];
         eez_control_rpc::v1::PostBatch {
             abi_calldata: encode_postbatch(&batch),
@@ -2236,6 +2471,33 @@ mod tests {
             l1_block_hash: Vec::new(),
             ..Default::default()
         }
+    }
+
+    fn control_event_with_postbatch(block_number: u64) -> eez_control_rpc::v1::ControlEvent {
+        eez_control_rpc::v1::ControlEvent {
+            block_number,
+            composition: Some(eez_control_rpc::v1::Composition {
+                post_batch: Some(eez_control_rpc::v1::PostBatch::default()),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn driven_settlement_ignores_non_target_postbatch_sidecar() {
+        let mut event = control_event_with_postbatch(10);
+        assert!(!driven_effective_settlement(&mut event, true, Some(20)));
+        assert!(
+            event.composition.is_none(),
+            "stale non-target sidecar must be stripped before validation"
+        );
+    }
+
+    #[test]
+    fn driven_settlement_accepts_target_postbatch_sidecar() {
+        let mut event = control_event_with_postbatch(20);
+        assert!(driven_effective_settlement(&mut event, true, Some(20)));
+        assert!(event.composition.is_some());
     }
 
     #[test]
@@ -2447,8 +2709,10 @@ mod tests {
         // Only ONE deferred entry for two identical sealed inbounds → cardinality
         // mismatch (an unmatched delivery) → REFUSE (no hash-set collapse).
         let mut one_entry = EvmBatch::default();
-        one_entry.inner.entries =
-            vec![mi_immediate_entry(1), mi_deferred_entry(h, s.return_data.clone())];
+        one_entry.inner.entries = vec![
+            mi_immediate_entry(1),
+            mi_deferred_entry(h, s.return_data.clone()),
+        ];
         assert!(multi_inbound_outcome_gate(&one_entry, &[s.clone(), s]).is_err());
     }
 
@@ -2459,8 +2723,10 @@ mod tests {
         let s = mi_sealed(1, true);
         let h = mi_hash(&s, 1);
         let mut batch = EvmBatch::default();
-        batch.inner.entries =
-            vec![mi_immediate_entry(1), mi_deferred_entry(h, s.return_data.clone())];
+        batch.inner.entries = vec![
+            mi_immediate_entry(1),
+            mi_deferred_entry(h, s.return_data.clone()),
+        ];
         assert!(
             multi_inbound_outcome_gate(&batch, &[]).is_err(),
             "a deferred entry with no sealed inbound is a phantom delivery"
@@ -2491,8 +2757,10 @@ mod tests {
         let s = mi_sealed(3, true);
         let h = mi_hash(&s, 1);
         let mut batch = EvmBatch::default();
-        batch.inner.entries =
-            vec![mi_immediate_entry(1), mi_deferred_entry(h, s.return_data.clone())];
+        batch.inner.entries = vec![
+            mi_immediate_entry(1),
+            mi_deferred_entry(h, s.return_data.clone()),
+        ];
         assert!(
             multi_inbound_outcome_gate(&batch, &[s.clone(), s]).is_err(),
             "one deferred entry cannot back two sealed inbounds (no double-match)",
@@ -2507,8 +2775,10 @@ mod tests {
         let s = mi_sealed(1, true);
         let h = mi_hash(&s, 1);
         let mut batch = EvmBatch::default();
-        batch.inner.entries =
-            vec![mi_immediate_entry(1), mi_deferred_entry(h, s.return_data.clone())];
+        batch.inner.entries = vec![
+            mi_immediate_entry(1),
+            mi_deferred_entry(h, s.return_data.clone()),
+        ];
         // A leftover failed lookup with no backing sealed failure.
         batch.inner.l1ToL2lookupCalls = vec![eez_evm::types::LookupCallSol {
             crossChainCallHash: B256::repeat_byte(0xfe),
@@ -2875,12 +3145,13 @@ mod tests {
         // Validate the gate against a REAL settling PostBatch captured from a live
         // composer run (block 13, embedded in tests/fixtures/) — confirms the
         // recompute matches real composer output, not just synthetic carriers.
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/postbatch-13.json");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/postbatch-13.json"
+        );
         let raw = std::fs::read_to_string(path).expect("embedded fixture postbatch-13.json");
         let j: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let dec = |k: &str| {
-            hex::decode(j[k].as_str().unwrap().trim_start_matches("0x")).unwrap()
-        };
+        let dec = |k: &str| hex::decode(j[k].as_str().unwrap().trim_start_matches("0x")).unwrap();
         let pb = eez_control_rpc::v1::PostBatch {
             abi_calldata: dec("abi_calldata"),
             public_inputs_hash: dec("public_inputs_hash"),
@@ -2912,7 +3183,10 @@ mod tests {
     /// Decode the embedded real fixture's batch (block 13) — its entry +
     /// StateDelta are the well-formed template the chain helper clones.
     fn fixture_batch() -> EvmBatch {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/postbatch-13.json");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/postbatch-13.json"
+        );
         let raw = std::fs::read_to_string(path).expect("embedded fixture postbatch-13.json");
         let j: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let calldata =
@@ -2965,7 +3239,11 @@ mod tests {
 
     #[test]
     fn settlement_chain_endpoint_mismatch_fails_closed() {
-        let (a, b, c) = (B256::repeat_byte(0xa0), B256::repeat_byte(0xb0), B256::repeat_byte(0xc0));
+        let (a, b, c) = (
+            B256::repeat_byte(0xa0),
+            B256::repeat_byte(0xb0),
+            B256::repeat_byte(0xc0),
+        );
         let pb = post_batch_with_chain(&[(1, a, b)]);
         // The re-executed final root is C, not the claimed B → endpoint refused.
         assert!(verify_settlement_chain(&pb, &verified(a, c), a, b"").is_err());
@@ -2973,7 +3251,11 @@ mod tests {
 
     #[test]
     fn settlement_chain_parent_anchor_mismatch_fails_closed() {
-        let (a, b, x) = (B256::repeat_byte(0xa0), B256::repeat_byte(0xb0), B256::repeat_byte(0x11));
+        let (a, b, x) = (
+            B256::repeat_byte(0xa0),
+            B256::repeat_byte(0xb0),
+            B256::repeat_byte(0x11),
+        );
         let pb = post_batch_with_chain(&[(1, a, b)]);
         // The re-executed batch anchor is X, not the claimed R0=A → OD-5 refused.
         assert!(verify_settlement_chain(&pb, &verified(x, b), x, b"").is_err());
@@ -3023,8 +3305,11 @@ mod tests {
         // state(sync_block-1) = an intermediate re-executed root M that is
         // NEITHER r0 NOR rn but IS the validator's per-tx root. The collapsed
         // deferred boundaries are still rn (final_state_root). Both proven.
-        let (r0, m, rn) =
-            (B256::repeat_byte(0xa0), B256::repeat_byte(0x4d), B256::repeat_byte(0xb0));
+        let (r0, m, rn) = (
+            B256::repeat_byte(0xa0),
+            B256::repeat_byte(0x4d),
+            B256::repeat_byte(0xb0),
+        );
         let pb = post_batch_with_chain(&[
             (1, r0, m),  // immediate: r0 -> state(sync_block-1) = M
             (1, m, rn),  // inbound1: M -> final
@@ -3054,8 +3339,11 @@ mod tests {
         // happens to equal rn while the validator did NOT re-execute that boundary
         // as a real intermediate root. We force the hazard by making rn a value
         // the validator's re-execution does NOT corroborate as final.
-        let (r0, rn, x) =
-            (B256::repeat_byte(0xa0), B256::repeat_byte(0xb0), B256::repeat_byte(0xcc));
+        let (r0, rn, x) = (
+            B256::repeat_byte(0xa0),
+            B256::repeat_byte(0xb0),
+            B256::repeat_byte(0xcc),
+        );
         // Chain telescopes r0 -> X -> rn with an interior X that is NOT r0/rn and
         // NOT any proven root (no per-tx roots emitted) → refused.
         let pb = post_batch_with_chain(&[(1, r0, x), (1, x, rn)]);
@@ -3081,8 +3369,11 @@ mod tests {
         // Because B != final_state_root (C), B is NOT a proven root → the endpoint
         // gate already rejects rn=B != C; even if it slipped past, interior B is
         // not proven → refused. Either way: fail-closed.
-        let (r0, b, c) =
-            (B256::repeat_byte(0xa0), B256::repeat_byte(0xb0), B256::repeat_byte(0xc0));
+        let (r0, b, c) = (
+            B256::repeat_byte(0xa0),
+            B256::repeat_byte(0xb0),
+            B256::repeat_byte(0xc0),
+        );
         let pb = post_batch_with_chain(&[(1, r0, b), (1, b, b)]);
         let vw = VerifiedWindow {
             parent_state_root: r0,
@@ -3099,7 +3390,11 @@ mod tests {
 
     #[test]
     fn settlement_chain_multi_rollup_fails_closed() {
-        let (a, b, d) = (B256::repeat_byte(0xa0), B256::repeat_byte(0xb0), B256::repeat_byte(0xd0));
+        let (a, b, d) = (
+            B256::repeat_byte(0xa0),
+            B256::repeat_byte(0xb0),
+            B256::repeat_byte(0xd0),
+        );
         // Telescopes A->B->D but entry 1 settles a DIFFERENT rollup.
         let pb = post_batch_with_chain(&[(1, a, b), (2, b, d)]);
         assert!(verify_settlement_chain(&pb, &verified(a, d), a, b"").is_err());
@@ -3113,7 +3408,11 @@ mod tests {
 
     #[test]
     fn classify_anchor_mismatch_is_retreatable() {
-        let (a, b, x) = (B256::repeat_byte(0xa0), B256::repeat_byte(0xb0), B256::repeat_byte(0x11));
+        let (a, b, x) = (
+            B256::repeat_byte(0xa0),
+            B256::repeat_byte(0xb0),
+            B256::repeat_byte(0x11),
+        );
         let pb = post_batch_with_chain(&[(1, a, b)]);
         // Claimed R0 = A, but the RE-EXECUTED batch anchor is X (the resume cursor
         // is stale vs posted). This is the RETREATABLE OD-5 mismatch — and it must
@@ -3131,7 +3430,11 @@ mod tests {
 
     #[test]
     fn classify_endpoint_mismatch_is_hard_reject() {
-        let (a, b, c) = (B256::repeat_byte(0xa0), B256::repeat_byte(0xb0), B256::repeat_byte(0xc0));
+        let (a, b, c) = (
+            B256::repeat_byte(0xa0),
+            B256::repeat_byte(0xb0),
+            B256::repeat_byte(0xc0),
+        );
         let pb = post_batch_with_chain(&[(1, a, b)]);
         // Anchor AGREES (A == A) but the re-executed final root is C != claimed B.
         // An endpoint failure must NEVER be mistaken for a retreatable anchor
@@ -3184,7 +3487,10 @@ mod tests {
     fn cursor_move_advances_only_on_strict_increase() {
         // Steady state / the live window landing: located posted strictly above the
         // current cursor advances it (and the caller resets the telescope).
-        assert_eq!(settling_cursor_move(Some(100), 50), CursorMove::Advance(100));
+        assert_eq!(
+            settling_cursor_move(Some(100), 50),
+            CursorMove::Advance(100)
+        );
         assert_eq!(settling_cursor_move(Some(1), 0), CursorMove::Advance(1));
     }
 
@@ -3199,7 +3505,10 @@ mod tests {
 
     #[test]
     fn cursor_move_retreats_on_lower_cached_posted() {
-        assert_eq!(settling_cursor_move(Some(3000), 16735), CursorMove::Retreat(3000));
+        assert_eq!(
+            settling_cursor_move(Some(3000), 16735),
+            CursorMove::Retreat(3000)
+        );
     }
 
     #[test]
@@ -3222,40 +3531,64 @@ mod tests {
                 CursorMove::Retain => {} // pinned — correct
                 other => panic!("stale re-post must Retain, got {other:?}"),
             }
-            assert_eq!(last_accepted, 0, "cursor must stay pinned through the stuck state");
+            assert_eq!(
+                last_accepted, 0,
+                "cursor must stay pinned through the stuck state"
+            );
         }
         // The live window settles: posted advances to the live height.
         match settling_cursor_move(Some(18000), last_accepted) {
             CursorMove::Advance(h) => last_accepted = h,
             other => panic!("the settled live window must Advance, got {other:?}"),
         }
-        assert_eq!(last_accepted, 18000, "cursor advances exactly once, to the confirmed posted");
+        assert_eq!(
+            last_accepted, 18000,
+            "cursor advances exactly once, to the confirmed posted"
+        );
     }
 
     #[test]
     fn reanchor_precise_retreat_below_cursor() {
         // A wipe/reorg whose posted the prover already re-executed: retreat to the
         // CACHED height (replay [H+1..]), NOT a blunt genesis backfill.
-        assert_eq!(reanchor_move(Some(3000), 16735, 0, 4), ReanchorMove::Retreat(3000));
+        assert_eq!(
+            reanchor_move(Some(3000), 16735, 0, 4),
+            ReanchorMove::Retreat(3000)
+        );
     }
 
     #[test]
     fn reanchor_advance_above_cursor_is_the_stuck_to_steady_transition() {
         // The live window settled, posted moved genesis->H, but the telescope was
         // still genesis so OD-5 mismatched once: advance to the cached higher H.
-        assert_eq!(reanchor_move(Some(18000), 0, 0, 4), ReanchorMove::Advance(18000));
+        assert_eq!(
+            reanchor_move(Some(18000), 0, 0, 4),
+            ReanchorMove::Advance(18000)
+        );
     }
 
     #[test]
     fn reanchor_unlocatable_falls_to_bounded_genesis_then_self_disarms() {
         // Fabricated / below-horizon root: bounded retreat-to-genesis while budget
         // remains and the cursor is non-genesis ...
-        assert_eq!(reanchor_move(None, 16735, 0, 4), ReanchorMove::RetreatGenesis);
-        assert_eq!(reanchor_move(None, 16735, 3, 4), ReanchorMove::RetreatGenesis);
+        assert_eq!(
+            reanchor_move(None, 16735, 0, 4),
+            ReanchorMove::RetreatGenesis
+        );
+        assert_eq!(
+            reanchor_move(None, 16735, 3, 4),
+            ReanchorMove::RetreatGenesis
+        );
         // ... terminal self-disarm once already at genesis (no infinite loop) ...
-        assert_eq!(reanchor_move(None, 0, 0, 4), ReanchorMove::TerminalAtGenesis);
+        assert_eq!(
+            reanchor_move(None, 0, 0, 4),
+            ReanchorMove::TerminalAtGenesis
+        );
         // ... and terminal once the budget is exhausted at a non-genesis cursor.
-        assert_eq!(reanchor_move(None, 16735, 4, 4), ReanchorMove::BudgetExhausted);
+        assert_eq!(
+            reanchor_move(None, 16735, 4, 4),
+            ReanchorMove::BudgetExhausted
+        );
     }
 
     #[test]
@@ -3267,7 +3600,11 @@ mod tests {
         // the telescoped batch anchor (A) it passes. The on-chain chain telescopes
         // A -> M -> Rn (the interior boundary M is a real re-executed pair-end root,
         // exercised by the wide-batch interior test below).
-        let (a, m, rn) = (B256::repeat_byte(0xa0), B256::repeat_byte(0x4d), B256::repeat_byte(0xb0));
+        let (a, m, rn) = (
+            B256::repeat_byte(0xa0),
+            B256::repeat_byte(0x4d),
+            B256::repeat_byte(0xb0),
+        );
         let pb = post_batch_with_chain(&[(1, a, m), (1, m, rn)]);
         // The SETTLING chunk re-executes parent = M (its local parent), final = Rn.
         let settling = verified(m, rn);

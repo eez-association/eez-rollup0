@@ -117,7 +117,10 @@ mod tests {
             _calls: &[crate::ExecutedAction<Self>],
             _dst: crate::RollupId,
         ) -> crate::error::ProtocolResult<Self::Batch> {
-            Err(crate::error::ProtocolErrorKind::Unsupported("test fake: no outbound settlement").into())
+            Err(
+                crate::error::ProtocolErrorKind::Unsupported("test fake: no outbound settlement")
+                    .into(),
+            )
         }
     }
 

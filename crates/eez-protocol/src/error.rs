@@ -417,7 +417,9 @@ pub enum ComposerErrorKind {
     /// `simulate_and_resolve` call needs a `CommittedRootReader` to
     /// read invariant-6 anchor roots; the builder fails-fast at
     /// construction rather than at first dispatch.
-    #[error("composer build: no committed-root reader registered (call .root_reader(...) on the builder)")]
+    #[error(
+        "composer build: no committed-root reader registered (call .root_reader(...) on the builder)"
+    )]
     MissingRootReader,
 }
 

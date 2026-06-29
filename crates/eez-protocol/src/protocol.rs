@@ -69,7 +69,7 @@
 //! results across calls or mutate external state break this contract
 //! and produce nondeterministic compositions.
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
 #[allow(
     unused_imports,

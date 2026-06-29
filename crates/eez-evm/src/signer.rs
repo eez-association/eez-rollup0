@@ -27,7 +27,7 @@
 //! 65-byte `abi.encodePacked(r, s, v)` signature, `s` in the canonical
 //! (low) half of `secp256k1_n`, `v` normalized to `{27, 28}`.
 
-use alloy_primitives::{Address, Bytes, B256};
+use alloy_primitives::{Address, B256, Bytes};
 use k256::ecdsa::{RecoveryId, Signature as K256Signature, SigningKey};
 
 /// Narrow ECDSA signer over raw `B256` digests. Produces a

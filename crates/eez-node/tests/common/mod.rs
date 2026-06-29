@@ -494,7 +494,10 @@ pub fn cross_chain_env(
         ("EEZ_PROOF_SIGNER_KEY", ANVIL_KEY.to_string()),
         ("EEZ_REGISTRY_ADDRESS", format!("{registry:#x}")),
         ("EEZ_REGISTRY_DEPLOY_BLOCK", deploy_block.to_string()),
-        ("EEZ_MOCK_PROOF_SYSTEM_ADDRESS", format!("{proof_system:#x}")),
+        (
+            "EEZ_MOCK_PROOF_SYSTEM_ADDRESS",
+            format!("{proof_system:#x}"),
+        ),
         ("EEZ_ROLLUP_ID", rollup_id.to_string()),
         // SYNCHRONOUS mock proof system: the composer self-signs the
         // postBatch and submits immediately. The repo's `deployments.env`
@@ -508,10 +511,7 @@ pub fn cross_chain_env(
         // Cross-chain composer requirements (main.rs:461-674).
         ("EEZ_CCM_L2_ADDRESS", format!("{CCM_L2_ADDRESS:#x}")),
         ("EEZ_L2_SYSTEM_KEY", EEZ_L2_SYSTEM_KEY.to_string()),
-        (
-            "EEZ_L2_SYSTEM_ADDRESS",
-            format!("{EEZ_L2_SYSTEM_ADDR:#x}"),
-        ),
+        ("EEZ_L2_SYSTEM_ADDRESS", format!("{EEZ_L2_SYSTEM_ADDR:#x}")),
         // Valid timing (see env_for): K=2, proof_window_open = 1s.
         ("EEZ_L1_BLOCK_TIME_MS", "2000".to_string()),
         ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
@@ -875,8 +875,7 @@ pub fn fresh_dev_genesis() -> Result<FreshGenesis> {
 /// (embedded-L1) tests.
 pub fn fresh_cross_chain_genesis() -> Result<FreshGenesis> {
     let raw = std::fs::read_to_string(reorg_genesis_path()).context("read genesis.json")?;
-    let base: alloy_genesis::Genesis =
-        serde_json::from_str(&raw).context("parse genesis.json")?;
+    let base: alloy_genesis::Genesis = serde_json::from_str(&raw).context("parse genesis.json")?;
     fresh_genesis(&base)
 }
 
@@ -1241,11 +1240,7 @@ pub async fn eth_get_balance(rpc_url: &str, addr: Address) -> Result<U256> {
 /// otherwise the safe head (which lags the live delivery block) yields a
 /// PRE-delivery anchor root, and a follower re-deriving it never walks the
 /// inbound reconstruction (inbound=0).
-pub async fn read_value_at_block(
-    rpc_url: &str,
-    value_addr: Address,
-    number: u64,
-) -> Result<U256> {
+pub async fn read_value_at_block(rpc_url: &str, value_addr: Address, number: u64) -> Result<U256> {
     use alloy_eips::BlockId;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let value = IValue::new(value_addr, &provider);
@@ -1327,7 +1322,11 @@ pub async fn proxy_original_address(
 ) -> Result<Address> {
     let provider = ProviderBuilder::new().connect_http(l2_rpc_url.parse()?);
     let eez_l2 = IEEZL2::new(ccm_l2, &provider);
-    Ok(eez_l2.authorizedProxies(proxy).call().await?.originalAddress)
+    Ok(eez_l2
+        .authorizedProxies(proxy)
+        .call()
+        .await?
+        .originalAddress)
 }
 
 /// Build + sign + submit an OUTBOUND user tx: an EIP-1559 tx with
@@ -1936,10 +1935,7 @@ pub fn override_env(
 /// `override_env(..., "")` would NOT work: `env_var_os(..).is_some()`
 /// is true even for an empty value, so the node would still boot as a
 /// composer and spawn its OWN empty embedded L1.
-pub fn remove_env(
-    env: Vec<(&'static str, String)>,
-    key: &str,
-) -> Vec<(&'static str, String)> {
+pub fn remove_env(env: Vec<(&'static str, String)>, key: &str) -> Vec<(&'static str, String)> {
     env.into_iter().filter(|(k, _)| *k != key).collect()
 }
 
@@ -1981,14 +1977,10 @@ pub async fn wait_for_follower_caught_up(
             .await
             .ok()
             .flatten();
-        let attested = all_l2_execution_states(
-            &l1.rpc_url,
-            l1.eez_address,
-            l1.rollup_id,
-            l1.deploy_block,
-        )
-        .await
-        .unwrap_or_default();
+        let attested =
+            all_l2_execution_states(&l1.rpc_url, l1.eez_address, l1.rollup_id, l1.deploy_block)
+                .await
+                .unwrap_or_default();
         Ok(match node_root {
             Some(n) if n != B256::ZERO && attested.contains(&n) => Some(n),
             _ => None,

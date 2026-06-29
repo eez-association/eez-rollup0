@@ -441,9 +441,10 @@ impl<P: ChainProtocol + 'static> CompositionBuilder<P> {
                 continue;
             }
             if let Some(rollup) = self.rollups.get_mut(&rollup_id)
-                && let Some(session) = rollup.session.as_mut() {
-                    session.rollback(snap).await?;
-                }
+                && let Some(session) = rollup.session.as_mut()
+            {
+                session.rollback(snap).await?;
+            }
         }
         // Any other snapshots still keyed under bracketed indices are
         // dropped — the head idx's rollback already restores their
@@ -615,9 +616,9 @@ impl<P: ChainProtocol + 'static> CompositionBuilder<P> {
                     && let crate::types::ExecutionOutcome::Resolved {
                         post_state_root, ..
                     } = &mut last.outcome
-                    {
-                        *post_state_root = root;
-                    }
+                {
+                    *post_state_root = root;
+                }
                 tracing::debug!(
                     name: "composer.zk_poster_l1_postbatch",
                     %rollup_id,
@@ -655,9 +656,7 @@ impl<P: ChainProtocol + 'static> CompositionBuilder<P> {
             // on-chain entry is produced separately by the source/entry batch).
             // Otherwise the batch is genuinely empty (all reverted) → skip.
             if Self::is_batch_empty(protocol, &batch) {
-                let has_incoming = group_calls
-                    .iter()
-                    .any(|c| c.source_rollup_id != *rollup_id);
+                let has_incoming = group_calls.iter().any(|c| c.source_rollup_id != *rollup_id);
                 if !protocol.dialect_is_zk_poster(dialect) && has_incoming {
                     let inbound_batch =
                         protocol.build_inbound_target_batch(&group_calls, *rollup_id)?;
@@ -712,13 +711,11 @@ impl<P: ChainProtocol + 'static> CompositionBuilder<P> {
                     .rev()
                     .find(|r| r.target_rollup_id == *rollup_id)
                     .and_then(|r| r.outcome.post_state_root().copied())
-                    .ok_or_else(|| {
-                        ProtocolErrorKind::InvalidCheckpoint {
-                            reason: format!(
-                                "settles_via_session_root target {rollup_id} has no resolved \
+                    .ok_or_else(|| ProtocolErrorKind::InvalidCheckpoint {
+                        reason: format!(
+                            "settles_via_session_root target {rollup_id} has no resolved \
                                  post_state_root (close_call did not run?)"
-                            ),
-                        }
+                        ),
                     })?;
                 tracing::debug!(
                     name: "composer.session_root_settle",
@@ -770,9 +767,9 @@ impl<P: ChainProtocol + 'static> CompositionBuilder<P> {
                 && let crate::types::ExecutionOutcome::Resolved {
                     post_state_root, ..
                 } = &mut last.outcome
-                {
-                    *post_state_root = sim.final_state_root;
-                }
+            {
+                *post_state_root = sim.final_state_root;
+            }
 
             tracing::debug!(
                 name: "composer.ccm_verify",
@@ -896,7 +893,9 @@ impl<P: ChainProtocol + 'static> Dispatcher for CompositionBuilder<P> {
 
         // Phase 1 — open: lazy-open the session, snapshot it, push
         // `Pending` placeholder, capture slot index.
-        let idx = self.open_call(target_rollup_id, source_rollup_id, &req).await?;
+        let idx = self
+            .open_call(target_rollup_id, source_rollup_id, &req)
+            .await?;
 
         // Phase 2 — run execute on the lazy-opened session.
         let mut session = self
@@ -1068,7 +1067,7 @@ impl<P: ChainProtocol + 'static> Dispatcher for CompositionBuilder<P> {
 mod tests {
     use super::*;
     use crate::checkpoint::ExecutionCheckpoint;
-    use crate::composer::{ProxyLookupConfig, DEFAULT_CCM_GAS_LIMIT};
+    use crate::composer::{DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig};
     use crate::error::ProtocolResult;
     use crate::executor::{TargetBatchSimulation, TargetVerificationContext};
     use crate::types::ExecutionOutcome;
@@ -1088,7 +1087,10 @@ mod tests {
             _calls: &[crate::ExecutedAction<Self>],
             _dst: crate::RollupId,
         ) -> crate::error::ProtocolResult<Self::Batch> {
-            Err(crate::error::ProtocolErrorKind::Unsupported("test fake: no outbound settlement").into())
+            Err(
+                crate::error::ProtocolErrorKind::Unsupported("test fake: no outbound settlement")
+                    .into(),
+            )
         }
     }
 
@@ -1252,7 +1254,9 @@ mod tests {
         ) -> ExecutorResult<ExecutionResponse<Self::Protocol>> {
             // Nested dispatch back into the SAME rollup (caller = some
             // other id so the plain target==source guard does not fire).
-            dispatcher.open_call(self.own_rollup, RollupId(7), &req).await?;
+            dispatcher
+                .open_call(self.own_rollup, RollupId(7), &req)
+                .await?;
             unreachable!("the checked-out guard must refuse the cyclic open_call");
         }
         async fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
@@ -1285,7 +1289,9 @@ mod tests {
             &self,
         ) -> ExecutorResult<Box<dyn TargetExecutionSession<Protocol = FakeProtocol> + Send>>
         {
-            Ok(Box::new(ReentrantSession { own_rollup: self.rollup }))
+            Ok(Box::new(ReentrantSession {
+                own_rollup: self.rollup,
+            }))
         }
         async fn simulate_transactions(
             &self,
@@ -1472,10 +1478,15 @@ mod tests {
         let mut rollups2 = HashMap::new();
         rollups2.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups2.insert(RollupId(1), rollup_with_session([0x22; 32]));
-        let mut builder2 = CompositionBuilder::<FakeProtocol>::new(RollupId(0), rollups2)
-            .with_sessions(sessions);
+        let mut builder2 =
+            CompositionBuilder::<FakeProtocol>::new(RollupId(0), rollups2).with_sessions(sessions);
         assert!(
-            builder2.rollups.get(&RollupId(1)).expect("registered").session.is_some(),
+            builder2
+                .rollups
+                .get(&RollupId(1))
+                .expect("registered")
+                .session
+                .is_some(),
             "seeded session occupies the slot",
         );
 
@@ -1499,7 +1510,9 @@ mod tests {
         rollups.insert(
             RollupId(1),
             Rollup {
-                client: Arc::new(ReentrantClient { rollup: RollupId(1) }),
+                client: Arc::new(ReentrantClient {
+                    rollup: RollupId(1),
+                }),
                 session: None,
                 config: target_config(),
                 initial_state_root: [0u8; 32],
@@ -1510,7 +1523,10 @@ mod tests {
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
             .await
             .expect_err("cycle must be refused");
-        assert!(matches!(err.kind(), ExecutorErrorKind::InvalidReentry { .. }), "got: {err}");
+        assert!(
+            matches!(err.kind(), ExecutorErrorKind::InvalidReentry { .. }),
+            "got: {err}"
+        );
         // The outer session was put back despite the inner error.
         assert_eq!(builder.take_sessions().len(), 1, "outer session survives");
     }

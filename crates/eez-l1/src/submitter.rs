@@ -14,9 +14,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_consensus::Transaction;
+use alloy_consensus::{SignableTransaction, Transaction, TxEip1559};
+use alloy_eips::eip2718::Encodable2718;
 use alloy_eips::{BlockNumberOrTag, Decodable2718};
-use alloy_primitives::{TxHash, U256, hex};
+use alloy_network::TxSignerSync;
+use alloy_primitives::{Bytes, TxHash, TxKind, U256, hex};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::Filter;
 use alloy_sol_types::{SolCall, SolEvent};
@@ -195,6 +197,39 @@ impl Submitter {
             .is_some())
     }
 
+    /// `true` iff `tx_hash` has an L1 receipt and its inclusion block
+    /// advanced this rollup to `expected_final_state`.
+    ///
+    /// Used by optimistic recovery to distinguish a stale false-failure
+    /// verdict from a real competition loss: in based competition,
+    /// another composer may advance the L2 cursor past our Sync height
+    /// with a different state root, so cursor height alone is not
+    /// evidence that our local optimistic block settled.
+    ///
+    /// # Errors
+    ///
+    /// [`L1Error::Provider`] on RPC/log lookup failure.
+    pub async fn receipt_reached_state(
+        &self,
+        tx_hash: TxHash,
+        expected_final_state: alloy_primitives::B256,
+    ) -> L1Result<bool> {
+        let provider = self.inner.build_target_provider();
+        let Some(receipt) = provider
+            .get_transaction_receipt(tx_hash)
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_transaction_receipt: {e}")))?
+        else {
+            return Ok(false);
+        };
+        let l1_block = receipt
+            .block_number
+            .ok_or_else(|| L1Error::Provider("receipt present but block_number missing".into()))?;
+        self.inner
+            .settlement_in_block(&provider, l1_block, Some(expected_final_state))
+            .await
+    }
+
     /// Walks every past `BatchPosted` event from `deploy_block` to L1
     /// head and returns one [`HistoricalBatch`] per event, with enough
     /// metadata (L1 block, tx hash, submitter, raw `callData`) for the
@@ -325,22 +360,50 @@ impl Inner {
             .map(|t| hex::encode_prefixed(t.as_ref()))
             .collect();
         let hex_refs: Vec<&str> = hexes.iter().map(String::as_str).collect();
-        // rbuilder-chiado DROPS 1-tx `eth_sendBundle` bundles but ingests
-        // bare raw txs and >=2-tx bundles (verified live 2026-06-23). A
-        // lone postBatch (whenever the held-tx pool is empty) is therefore
-        // submitted via `eth_sendRawTransaction` to the same relay; >=2-tx
-        // bundles keep the atomic `eth_sendBundle` path below. The relay
-        // also accepts `eth_sendRawTransaction` on dev RPCs (reth/anvil),
-        // so this one branch is correct on every backend.
+        let post_batch_envelope =
+            alloy_consensus::TxEnvelope::decode_2718(&mut raw_txs[0].as_ref()).map_err(|e| {
+                L1Error::Submission(format!("send_bundle: decode postBatch envelope: {e}"))
+            })?;
+        // rbuilder-chiado DROPS 1-tx `eth_sendBundle` bundles but accepts
+        // >=2-tx bundles. A lone minimal postBatch therefore gets a harmless
+        // poster self-transfer appended, preserving target-block bundle
+        // semantics. Do NOT use bare eth_sendRawTransaction here: the relay can
+        // return a hash without propagating the tx publicly, and a raw mempool tx
+        // is not target-pinned, so `head > target` is not a proof of death.
         if let [only] = hex_refs.as_slice() {
-            return match post_raw_transaction(
+            let filler = self.sign_single_postbatch_filler(&post_batch_envelope)?;
+            let filler_hex = hex::encode_prefixed(filler.as_ref());
+            let padded = [*only, filler_hex.as_str()];
+            event!(
+                name: "eez.submitter.single_postbatch.padded",
+                Level::INFO,
+                target_block,
+                post_batch_hash = %post_batch_hash,
+                filler_nonce = post_batch_envelope.nonce().saturating_add(1),
+                "single postBatch padded with poster self-transfer for target-pinned bundle submission",
+            );
+            return match post_bundle(
                 &self.http,
                 self.config.builder_rpc_url.as_str(),
-                only,
+                &padded,
+                target_block,
             )
             .await
             {
                 Ok(()) => {
+                    self.observe(post_batch_hash, target_block, expected_final_state)
+                        .await
+                }
+                Err(L1Error::BundleRpcUnsupported) => {
+                    event!(
+                        name: "eez.submitter.single_postbatch.mempool_fallback",
+                        Level::INFO,
+                        target_block,
+                        post_batch_hash = %post_batch_hash,
+                        "relay has no eth_sendBundle; falling back to raw postBatch submission",
+                    );
+                    post_raw_transaction(&self.http, self.config.builder_rpc_url.as_str(), only)
+                        .await?;
                     self.observe(post_batch_hash, target_block, expected_final_state)
                         .await
                 }
@@ -486,6 +549,43 @@ impl Inner {
             }
             tokio::time::sleep(TARGET_POLL_INTERVAL).await;
         }
+    }
+
+    fn sign_single_postbatch_filler(
+        &self,
+        post_batch: &alloy_consensus::TxEnvelope,
+    ) -> L1Result<Bytes> {
+        let chain_id = post_batch.chain_id().ok_or_else(|| {
+            L1Error::Submission("postBatch tx has no chain_id; cannot sign filler".into())
+        })?;
+        let nonce = post_batch.nonce().checked_add(1).ok_or_else(|| {
+            L1Error::Submission("postBatch nonce overflow; cannot sign filler".into())
+        })?;
+        let max_fee_per_gas = post_batch.max_fee_per_gas();
+        let max_priority_fee_per_gas = post_batch
+            .max_priority_fee_per_gas()
+            .unwrap_or(max_fee_per_gas);
+        let poster = self.config.poster.address();
+        let mut tx = TxEip1559 {
+            chain_id,
+            nonce,
+            gas_limit: 21_000,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+            to: TxKind::Call(poster),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Bytes::new(),
+        };
+        let sig = self
+            .config
+            .poster
+            .sign_transaction_sync(&mut tx)
+            .map_err(|e| L1Error::Submission(format!("sign postBatch filler tx: {e}")))?;
+        let signed = tx.into_signed(sig);
+        let mut buf = Vec::with_capacity(128);
+        signed.encode_2718(&mut buf);
+        Ok(Bytes::from(buf))
     }
 
     /// Did L1's stored stateRoot for our rollup reach the claimed state
@@ -646,7 +746,9 @@ pub async fn post_raw_transaction(
         {
             return Ok(());
         }
-        return Err(L1Error::Submission(format!("eth_sendRawTransaction: {err}")));
+        return Err(L1Error::Submission(format!(
+            "eth_sendRawTransaction: {err}"
+        )));
     }
     Ok(())
 }

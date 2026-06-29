@@ -307,6 +307,23 @@ where
             if let Some(claimed_current) = batch.claimed_current_state {
                 let local_root = self.l2_state_root_at(cumulative_l2)?;
                 if local_root != claimed_current {
+                    if is_same_block_competition_loser(
+                        batch.state_applied,
+                        local_root,
+                        claimed_current,
+                    ) {
+                        event!(
+                            name: "eez.deriver.catch_up.batch.same_block_loser",
+                            Level::INFO,
+                            l1_block_number = batch.l1_block_number,
+                            tx_hash = %batch.tx_hash,
+                            cumulative_l2,
+                            local_root = %local_root,
+                            claimed_current = %claimed_current,
+                            "catch_up: postBatch did not apply in its own tx and its pre-state is stale; skipping same-block competition loser",
+                        );
+                        continue;
+                    }
                     event!(
                         name: "eez.deriver.catch_up.cursor.misaligned",
                         Level::ERROR,
@@ -428,18 +445,20 @@ where
         // `sealed_header_or_head` falls back to the committer's in-memory
         // canonical head when the DB-scoped provider lacks the (freshly-derived,
         // unpersisted) parent — see its doc for why the follower needs this.
-        let parent_header = self.sealed_header_or_head(parent_block_number)?.ok_or_else(|| {
-            event!(
-                name: "eez.deriver.execute_block.parent_missing",
-                Level::ERROR,
-                parent_block_number,
-                local_best,
-                "parent header is neither in the DB nor the committer's canonical head",
-            );
-            DeriverError::l2_provider(format!(
-                "local L2 header at parent block {parent_block_number} missing"
-            ))
-        })?;
+        let parent_header = self
+            .sealed_header_or_head(parent_block_number)?
+            .ok_or_else(|| {
+                event!(
+                    name: "eez.deriver.execute_block.parent_missing",
+                    Level::ERROR,
+                    parent_block_number,
+                    local_best,
+                    "parent header is neither in the DB nor the committer's canonical head",
+                );
+                DeriverError::l2_provider(format!(
+                    "local L2 header at parent block {parent_block_number} missing"
+                ))
+            })?;
 
         let parent_hash = parent_header.hash();
         let timestamp = parent_header
@@ -838,6 +857,20 @@ where
         if let Some(claimed_current) = claimed_current_state {
             let local_root = self.l2_state_root_at(last_indexed_l2)?;
             if local_root != claimed_current {
+                if is_same_block_competition_loser(state_applied, local_root, claimed_current) {
+                    event!(
+                        name: "eez.deriver.batch.same_block_loser",
+                        Level::INFO,
+                        l1_block_number,
+                        tx_hash = %tx_hash,
+                        submitter = %submitter,
+                        last_indexed_l2,
+                        local_root = %local_root,
+                        claimed_current = %claimed_current,
+                        "postBatch did not apply in its own tx and its pre-state is stale; skipping same-block competition loser",
+                    );
+                    return Ok(());
+                }
                 event!(
                     name: "eez.deriver.cursor.misaligned",
                     Level::ERROR,
@@ -1143,7 +1176,8 @@ where
                         tx_hash = %tx_hash,
                         "fetching postBatch entries via L1 RPC (codec v1 fallback)",
                     );
-                    self.fetch_post_batch_entries(tx_hash, l1_block_number).await?
+                    self.fetch_post_batch_entries(tx_hash, l1_block_number)
+                        .await?
                 } else {
                     use alloy_sol_types::SolValue as _;
                     let mut out = Vec::with_capacity(decoded.l2_entries.len());
@@ -1391,9 +1425,7 @@ where
             .get_block_by_number(BlockNumberOrTag::Number(l1_block_number))
             .full()
             .await
-            .map_err(|e| {
-                DeriverError::l2_provider(format!("get_block({l1_block_number}): {e}"))
-            })?
+            .map_err(|e| DeriverError::l2_provider(format!("get_block({l1_block_number}): {e}")))?
             .ok_or_else(|| {
                 DeriverError::l2_provider(format!("L1 block {l1_block_number} not found"))
             })?;
@@ -1420,11 +1452,13 @@ where
         let Some(cfg) = self.inner.system_tx_cfg.as_ref() else {
             return Ok(0);
         };
-        let parent_header = self.sealed_header_or_head(parent_block_number)?.ok_or_else(|| {
-            DeriverError::l2_provider(format!(
-                "local L2 header at parent {parent_block_number} missing"
-            ))
-        })?;
+        let parent_header = self
+            .sealed_header_or_head(parent_block_number)?
+            .ok_or_else(|| {
+                DeriverError::l2_provider(format!(
+                    "local L2 header at parent {parent_block_number} missing"
+                ))
+            })?;
         let state = self
             .inner
             .l2_provider
@@ -1512,6 +1546,18 @@ where
     }
 }
 
+/// A same-block competition loser can still have `settled_count > 0` because
+/// its claimed roots match the winning tx's `L2ExecutionPerformed` roots in the
+/// same L1 block. It must not be replayed after the winner has advanced the
+/// local cursor.
+fn is_same_block_competition_loser(
+    state_applied: bool,
+    local_root: B256,
+    claimed_current: B256,
+) -> bool {
+    !state_applied && local_root != claimed_current
+}
+
 /// `true` iff local reth has a block at `block_number` whose tx list
 /// matches `expected_txs`. `false` if the block is missing or has
 /// different txs — caller's signal to STF-replay this slot.
@@ -1569,4 +1615,34 @@ where
         .hash();
 
     Ok(local_block.header().parent_hash == expected_parent_hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_same_block_competition_loser;
+    use alloy_primitives::B256;
+
+    #[test]
+    fn stale_non_applied_batch_is_same_block_loser() {
+        assert!(is_same_block_competition_loser(
+            false,
+            B256::repeat_byte(0x22),
+            B256::repeat_byte(0x11),
+        ));
+    }
+
+    #[test]
+    fn deferred_path_with_matching_anchor_is_not_loser() {
+        let root = B256::repeat_byte(0x33);
+        assert!(!is_same_block_competition_loser(false, root, root));
+    }
+
+    #[test]
+    fn applied_batch_with_stale_anchor_remains_hard_misalignment() {
+        assert!(!is_same_block_competition_loser(
+            true,
+            B256::repeat_byte(0x44),
+            B256::repeat_byte(0x55),
+        ));
+    }
 }
