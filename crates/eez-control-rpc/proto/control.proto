@@ -176,15 +176,18 @@ message DispatchRequest {
 // never an anchor-less sub-range (a non-settling sub-window binds to nothing
 // in OD-5). `from_block`/`to_block`/`rollup_id` route the prover.
 // `claimed_current_state` and `public_inputs_hash` are HINT/cross-check ONLY:
-// the prover recomputes both from the authoritative `PostBatch.abi_calldata`
-// it streams and signs ONLY its own recomputed hash. A lying directive is
-// caught by the OD-5 anchor re-execution; the verified frontier advances
-// EXCLUSIVELY via a content-keyed (publicInputsHash) ProofSink attestation,
-// never via a height the composer asserts.
+// the prover recomputes both from the authoritative `PostBatch.abi_calldata`.
+// In normal live mode the sidecar also arrives on the settling ControlEvent;
+// for historical patch-recovery windows, the block event may be archive-
+// reconstructed, so the directive carries the same PostBatch sidecar directly.
+// A lying directive is caught by the OD-5 anchor re-execution; the verified
+// frontier advances EXCLUSIVELY via a content-keyed (publicInputsHash)
+// ProofSink attestation, never via a height the composer asserts.
 message VerifyRange {
   uint64 from_block            = 1;  // batch boundary = posted+1 (OD-5 anchor block + 1)
   uint64 to_block              = 2;  // sync_height — the settling block (carries composition)
   uint64 rollup_id             = 3;
   bytes  claimed_current_state = 4;  // 32B — == PostBatch.current_state; HINT/cross-check
   bytes  public_inputs_hash    = 5;  // 32B — the ProofStore key the prover must reproduce + sign
+  PostBatch post_batch         = 6;  // authoritative sidecar for the target settling block
 }

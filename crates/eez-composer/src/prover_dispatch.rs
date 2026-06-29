@@ -57,6 +57,7 @@ fn to_verify_range(w: &PostedWindow) -> VerifyRange {
         rollup_id: w.rollup_id,
         claimed_current_state: w.current_state.to_vec(),
         public_inputs_hash: w.public_inputs_hash.to_vec(),
+        post_batch: w.post_batch.clone(),
     }
 }
 
@@ -158,6 +159,7 @@ mod tests {
             rollup_id: 1,
             public_inputs_hash: B256::repeat_byte(hash),
             current_state: B256::repeat_byte(0x11),
+            post_batch: None,
             attested: false,
             fast_forwarded: false,
             pending_l1: false,
@@ -167,7 +169,12 @@ mod tests {
     #[tokio::test]
     async fn dispatches_widest_and_advances_on_attestation() {
         let windows = PostedWindows::new();
-        windows.record_posted(win(1, 10, 0xa));
+        let mut first = win(1, 10, 0xa);
+        first.post_batch = Some(eez_control_rpc::v1::PostBatch {
+            abi_calldata: vec![1, 2, 3],
+            ..Default::default()
+        });
+        windows.record_posted(first);
 
         let (tx, mut rx) = mpsc::channel(8);
         let driver = windows.clone();
@@ -179,6 +186,7 @@ mod tests {
         assert_eq!(d1.to_block, 10);
         assert_eq!(d1.public_inputs_hash, B256::repeat_byte(0xa).to_vec());
         assert_eq!(d1.claimed_current_state, B256::repeat_byte(0x11).to_vec());
+        assert_eq!(d1.post_batch.expect("sidecar").abi_calldata, vec![1, 2, 3]);
 
         // Post B, attest A → the driver advances to B (A left next_unverified).
         windows.record_posted(win(11, 20, 0xb));

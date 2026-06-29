@@ -156,6 +156,41 @@ impl std::fmt::Debug for CrossChainExecCtx {
 /// so it can't block the FIFO queue forever.
 pub const MAX_BUNDLE_ATTEMPTS: u32 = 3;
 
+/// Default maximum L2 width for one historical patch-recovery batch. A value of
+/// 0 in `EEZ_PATCH_RECOVERY_MAX_SPAN` disables automatic patch recovery.
+const DEFAULT_PATCH_RECOVERY_MAX_SPAN: u64 = 1024;
+
+fn patch_recovery_max_span_from_env() -> Option<u64> {
+    match std::env::var("EEZ_PATCH_RECOVERY_MAX_SPAN") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(span) => Some(span),
+            Err(err) => {
+                event!(
+                    name: "eez.composer.patch_recovery.bad_span_env",
+                    Level::WARN,
+                    value = %raw,
+                    error = %err,
+                    default = DEFAULT_PATCH_RECOVERY_MAX_SPAN,
+                    "invalid EEZ_PATCH_RECOVERY_MAX_SPAN; using default",
+                );
+                Some(DEFAULT_PATCH_RECOVERY_MAX_SPAN)
+            }
+        },
+        Err(std::env::VarError::NotPresent) => Some(DEFAULT_PATCH_RECOVERY_MAX_SPAN),
+        Err(err) => {
+            event!(
+                name: "eez.composer.patch_recovery.span_env_error",
+                Level::WARN,
+                error = %err,
+                default = DEFAULT_PATCH_RECOVERY_MAX_SPAN,
+                "could not read EEZ_PATCH_RECOVERY_MAX_SPAN; using default",
+            );
+            Some(DEFAULT_PATCH_RECOVERY_MAX_SPAN)
+        }
+    }
+}
+
 /// Classify a `simulate_and_resolve` failure. `true` = DETERMINISTIC:
 /// the composition is structurally invalid for this tx (no cross-chain
 /// call / revert / bad encoding), so the tx is poison and must be
@@ -256,6 +291,9 @@ struct Inner<L2: BlockReader> {
     /// `None` = ledger off (no behavior change). Populated-but-not-driving in
     /// Phase 1; the dispatch driver (Phase 2) reads it.
     posted_windows: std::sync::OnceLock<crate::posted_windows::PostedWindows>,
+    /// Maximum L2 width for one historical patch-recovery batch. `None` disables
+    /// automatic patch recovery.
+    patch_recovery_max_span: Option<u64>,
 }
 
 impl<L2: BlockReader> std::fmt::Debug for Composer<L2> {
@@ -306,6 +344,7 @@ where
                 postbatch_sink: std::sync::OnceLock::new(),
                 proof_store: std::sync::OnceLock::new(),
                 posted_windows: std::sync::OnceLock::new(),
+                patch_recovery_max_span: patch_recovery_max_span_from_env(),
             }),
         }
     }
@@ -401,6 +440,8 @@ where
             );
             return false;
         }
+        let post_batch =
+            crate::post_batch_msg::build_post_batch_msg(batch, self.inner.prover.vkey(), None);
         let current_state = batch
             .inner
             .entries
@@ -413,10 +454,53 @@ where
             rollup_id,
             public_inputs_hash,
             current_state,
+            post_batch: Some(post_batch),
             attested: false,
             fast_forwarded: false,
             pending_l1: false,
         });
+        true
+    }
+
+    fn abandon_oversized_inflight(
+        &self,
+        rollup_id: u64,
+        rollup: &RollupState<L2>,
+        cursor: u64,
+        sync_height: u64,
+    ) -> bool {
+        let Some(max_span) = self.inner.patch_recovery_max_span else {
+            return false;
+        };
+        let width = sync_height.saturating_sub(cursor);
+        if width <= max_span {
+            return false;
+        }
+        if let Some(windows) = self.inner.posted_windows.get() {
+            let frontier = windows.mark_fast_forwarded(sync_height);
+            event!(
+                name: "eez.composer.patch_recovery.fast_forwarded",
+                Level::WARN,
+                rollup_id,
+                cursor,
+                sync_height,
+                width,
+                max_span,
+                verified_frontier = frontier,
+                "oversized deferred window abandoned as a recovery coverage gap",
+            );
+        }
+        rollup.optimistic.mark_failed(sync_height);
+        event!(
+            name: "eez.composer.patch_recovery.abandon_inflight",
+            Level::WARN,
+            rollup_id,
+            cursor,
+            sync_height,
+            width,
+            max_span,
+            "marked oversized in-flight deferred post failed so slot-context recovery can reopen the gate",
+        );
         true
     }
 
@@ -789,15 +873,20 @@ where
             }
         }
 
-        let blocked = self.inner.evm_composer.is_some()
-            && rollup.optimistic.blocking_height(cursor).is_some();
-        if blocked {
+        let blocking_height = self
+            .inner
+            .evm_composer
+            .as_ref()
+            .and_then(|_| rollup.optimistic.blocking_height(cursor));
+        if let Some(blocking_height) = blocking_height {
+            self.abandon_oversized_inflight(rollup_id, rollup, cursor, blocking_height);
             event!(
                 name: "eez.composer.sync_slot.bundle_in_flight",
                 Level::INFO,
                 rollup_id,
                 cursor,
                 parent_number,
+                blocking_height,
                 "previous postBatch unresolved; committing Sync block without emission this slot",
             );
             return match build_sync_block(
@@ -823,6 +912,50 @@ where
                     None
                 }
             };
+        }
+
+        if self.inner.evm_composer.is_some() {
+            match self
+                .try_schedule_patch_recovery(rollup_id, rollup, parent_number)
+                .await
+            {
+                Ok(true) => {
+                    return match build_sync_block(
+                        rollup.l2_provider.as_ref(),
+                        &self.inner.evm_config,
+                        &parent_header,
+                        timestamp,
+                        suggested_fee_recipient,
+                        &[],
+                    ) {
+                        Ok(built) => Some(SyncSlotBlock {
+                            payload: built.payload,
+                            header: built.header,
+                        }),
+                        Err(err) => {
+                            event!(
+                                name: "eez.composer.sync_slot.build_failed",
+                                Level::ERROR,
+                                rollup_id,
+                                error = %err,
+                                "empty Sync block build failed after arming patch recovery; Sequencer fallback takes over",
+                            );
+                            None
+                        }
+                    };
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    event!(
+                        name: "eez.composer.patch_recovery.failed",
+                        Level::ERROR,
+                        rollup_id,
+                        parent_number,
+                        error = %err,
+                        "patch recovery scheduling failed; falling back to normal Sync composition",
+                    );
+                }
+            }
         }
 
         let pool_len_before = pool.len();
@@ -957,6 +1090,174 @@ where
         + 'static,
     <L2 as TransactionsProvider>::Transaction: Encodable2718,
 {
+    fn choose_patch_recovery_target(
+        &self,
+        rollup_id: u64,
+        rollup: &RollupState<L2>,
+        cursor: u64,
+        parent_number: u64,
+        max_span: u64,
+    ) -> Result<
+        Option<(
+            u64,
+            reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
+            B256,
+        )>,
+        String,
+    > {
+        let target_max = cursor.saturating_add(max_span).min(parent_number);
+        if target_max <= cursor {
+            return Ok(None);
+        }
+
+        for target in (cursor + 1..=target_max).rev() {
+            let target_header = rollup
+                .l2_provider
+                .sealed_header(target)
+                .map_err(|e| format!("sealed_header({target}): {e}"))?
+                .ok_or_else(|| format!("local L2 header at {target} missing"))?;
+            let block = rollup
+                .l2_provider
+                .find_block_by_hash(target_header.hash(), BlockSource::Any)
+                .map_err(|e| {
+                    format!(
+                        "l2_provider.find_block_by_hash({}, n={target}): {e}",
+                        target_header.hash()
+                    )
+                })?
+                .ok_or_else(|| format!("local L2 block at {target} missing"))?;
+            if block.body().transactions().iter().next().is_some() {
+                continue;
+            }
+            let parent = target.checked_sub(1).ok_or("patch target underflow")?;
+            let parent_header = rollup
+                .l2_provider
+                .sealed_header(parent)
+                .map_err(|e| format!("sealed_header({parent}): {e}"))?
+                .ok_or_else(|| format!("local L2 header at {parent} missing"))?;
+            event!(
+                name: "eez.composer.patch_recovery.target",
+                Level::INFO,
+                rollup_id,
+                cursor,
+                target,
+                max_span,
+                "selected empty historical block for bounded patch recovery",
+            );
+            return Ok(Some((target, parent_header, target_header.state_root())));
+        }
+
+        event!(
+            name: "eez.composer.patch_recovery.no_empty_target",
+            Level::WARN,
+            rollup_id,
+            cursor,
+            target_max,
+            max_span,
+            "no empty historical block found within patch span; normal composition remains blocked on proof",
+        );
+        Ok(None)
+    }
+
+    async fn try_schedule_patch_recovery(
+        &self,
+        rollup_id: u64,
+        rollup: &RollupState<L2>,
+        parent_number: u64,
+    ) -> Result<bool, String> {
+        let Some(max_span) = self.inner.patch_recovery_max_span else {
+            return Ok(false);
+        };
+        if !self.deferred_post() || self.inner.posted_windows.get().is_none() {
+            return Ok(false);
+        }
+        let Some(ctx) = self.inner.cc_exec_ctx.as_ref() else {
+            return Ok(false);
+        };
+        let cursor = rollup.l1_head.cursor();
+        let gap = parent_number.saturating_sub(cursor);
+        if gap <= max_span {
+            return Ok(false);
+        }
+        let Some((target, parent_header, target_state_root)) =
+            self.choose_patch_recovery_target(rollup_id, rollup, cursor, parent_number, max_span)?
+        else {
+            return Ok(false);
+        };
+
+        event!(
+            name: "eez.composer.patch_recovery.arm",
+            Level::WARN,
+            rollup_id,
+            cursor,
+            parent_number,
+            target,
+            gap,
+            patch_width = target.saturating_sub(cursor),
+            max_span,
+            "arming bounded historical patch batch instead of a current-tip giant batch",
+        );
+
+        match self
+            .prepare_post_batch_raw(
+                ctx,
+                rollup_id,
+                &[],
+                &parent_header,
+                target_state_root,
+                &[],
+                &[],
+            )
+            .await?
+        {
+            PostBatchOutcome::Deferred {
+                batch,
+                public_inputs_hash,
+                posted,
+            } => {
+                if posted != cursor {
+                    return Err(format!(
+                        "patch recovery cursor changed while preparing batch: started {cursor}, prepared {posted}"
+                    ));
+                }
+                rollup.optimistic.begin(
+                    target,
+                    B256::ZERO,
+                    target_state_root,
+                    parent_header,
+                    Vec::new(),
+                );
+                let recorded = self.record_posted_window(
+                    rollup_id,
+                    target,
+                    &batch,
+                    public_inputs_hash,
+                    posted,
+                );
+                if recorded {
+                    self.spawn_deferred_post(
+                        rollup_id,
+                        target,
+                        posted,
+                        *batch,
+                        public_inputs_hash,
+                        Vec::new(),
+                        target_state_root,
+                        Arc::clone(&rollup.optimistic),
+                    );
+                    Ok(true)
+                } else {
+                    rollup.optimistic.mark_failed(target);
+                    Ok(false)
+                }
+            }
+            PostBatchOutcome::Ready(_) => Err(
+                "patch recovery unexpectedly built a synchronous postBatch outside deferred mode"
+                    .to_owned(),
+            ),
+        }
+    }
+
     /// Recover a failed optimistic batch (slot context): reorg the L2
     /// head to the failed Sync block's parent if the block actually
     /// landed, then re-push its user_txs (skipping burned nonces).
@@ -2247,6 +2548,17 @@ where
             );
             let mut sig = None;
             for _ in 0..max_polls {
+                if !optimistic.is_pending(sync_height) {
+                    event!(
+                        name: "eez.composer.deferred.abandoned",
+                        Level::WARN,
+                        rollup_id,
+                        sync_height,
+                        public_inputs_hash = %public_inputs_hash,
+                        "deferred post abandoned by recovery before attestation arrived; dropping task",
+                    );
+                    return;
+                }
                 if let Some(s) = store
                     .lock()
                     .ok()
@@ -2269,6 +2581,17 @@ where
                 optimistic.mark_failed(sync_height);
                 return;
             };
+            if !optimistic.is_pending(sync_height) {
+                event!(
+                    name: "eez.composer.deferred.late_proof_abandoned",
+                    Level::WARN,
+                    rollup_id,
+                    sync_height,
+                    public_inputs_hash = %public_inputs_hash,
+                    "deferred proof arrived after recovery abandoned the window; not submitting stale postBatch",
+                );
+                return;
+            }
 
             // Fill the real attestation (= `proof_sink::apply_proof`): the mock
             // signature placed in `proofs[]` at prepare time is overwritten by

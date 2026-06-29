@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use alloy_primitives::B256;
+use eez_control_rpc::v1::PostBatch;
 
 /// One posted (deferred) settlement window.
 #[derive(Debug, Clone)]
@@ -36,6 +37,10 @@ pub struct PostedWindow {
     pub public_inputs_hash: B256,
     /// `== PostBatch.current_state` — the directive HINT / cross-check.
     pub current_state: B256,
+    /// Authoritative settlement sidecar for this posted window. Live control-feed
+    /// events also carry it, but historical patch-recovery windows are replayed
+    /// from archive block data and need the sidecar on the dispatch directive.
+    pub post_batch: Option<PostBatch>,
     /// Flipped true ONLY by a cryptographically-verified attestation.
     pub attested: bool,
     /// Set when the composer fast-forwarded past an unverifiable deep-gap
@@ -422,6 +427,7 @@ mod tests {
             rollup_id: 1,
             public_inputs_hash: B256::repeat_byte(hash),
             current_state: B256::ZERO,
+            post_batch: None,
             attested: false,
             fast_forwarded: false,
             pending_l1: false,

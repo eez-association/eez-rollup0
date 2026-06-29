@@ -206,6 +206,19 @@ impl OptimisticallyIncluded {
         }
     }
 
+    /// True only while the deferred-post task should keep waiting/submitting for
+    /// this Sync height. Recovery marks stale entries Failed or removes them; late
+    /// proofs for those windows must be dropped instead of submitting a stale
+    /// postBatch.
+    #[must_use]
+    pub fn is_pending(&self, sync_height: u64) -> bool {
+        let map = self.by_sync_height.lock().unwrap();
+        matches!(
+            map.get(&sync_height).map(|entry| entry.resolution),
+            Some(Resolution::Pending)
+        )
+    }
+
     /// Extract a Failed entry, if any, for slot-context recovery. This
     /// intentionally scans all heights, not just `cursor + 1..`: a
     /// competitor can advance the cursor past our failed optimistic
@@ -447,6 +460,19 @@ mod tests {
         // …and the placeholder hash survives (a never-sent tx has no receipt).
         assert_eq!(batch.post_batch_hash, TxHash::ZERO);
         assert_eq!(pool.blocking_height(0), None);
+    }
+
+    #[test]
+    fn is_pending_tracks_abandoned_deferred_entry() {
+        let pool = OptimisticallyIncluded::new();
+        pool.begin(10, TxHash::ZERO, root(0xa), hdr(), Vec::new());
+        assert!(pool.is_pending(10));
+
+        pool.mark_failed(10);
+        assert!(!pool.is_pending(10));
+
+        let _ = pool.take_failed_for_recovery(0).expect("failed entry");
+        assert!(!pool.is_pending(10));
     }
 
     #[test]

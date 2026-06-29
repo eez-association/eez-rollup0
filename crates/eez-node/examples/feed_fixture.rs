@@ -108,6 +108,7 @@ async fn main() -> eyre::Result<()> {
                 rollup_id: pb.rollup_id,
                 public_inputs_hash: b256_of(&pb.public_inputs_hash),
                 current_state: b256_of(&pb.current_state),
+                post_batch: Some(pb.clone()),
                 attested: false,
                 fast_forwarded: false,
                 pending_l1: false,

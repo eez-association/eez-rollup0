@@ -1434,7 +1434,19 @@ fn driven_effective_settlement(
     event: &mut eez_control_rpc::v1::ControlEvent,
     driven: bool,
     target_to_block: Option<u64>,
+    target_post_batch: Option<&eez_control_rpc::v1::PostBatch>,
 ) -> bool {
+    if driven && Some(event.block_number) == target_to_block && event.composition.is_none() {
+        if let Some(pb) = target_post_batch.cloned() {
+            event.composition = Some(eez_control_rpc::v1::Composition {
+                post_batch: Some(pb),
+            });
+            info!(
+                block_number = event.block_number,
+                "driven: attached directive PostBatch sidecar to archive-replayed target block",
+            );
+        }
+    }
     if event.composition.is_none() {
         return false;
     }
@@ -2026,6 +2038,7 @@ async fn main() -> eyre::Result<()> {
                         &mut event,
                         driven,
                         vr.as_ref().map(|d| d.to_block),
+                        vr.as_ref().and_then(|d| d.post_batch.as_ref()),
                     );
                     window.push(event);
 
