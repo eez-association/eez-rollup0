@@ -51,7 +51,6 @@ reqwest.workspace            = true
 
 # RPC ingress middleware (eth_sendRawTransaction override)
 jsonrpsee.workspace  = true
-serde.workspace      = true
 serde_json.workspace = true
 tower.workspace      = true
 
@@ -62,7 +61,6 @@ eyre.workspace               = true
 mimalloc.workspace           = true
 thiserror.workspace          = true
 tokio.workspace              = true
-toml.workspace               = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
 url.workspace                = true

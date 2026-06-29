@@ -268,7 +268,6 @@ pub struct Harness {
     pub anvil: Anvil,
     pub stub: BundleStub,
     pub dep: Deployment,
-    config_dir: tempfile::TempDir,
 }
 
 impl Harness {
@@ -283,13 +282,7 @@ impl Harness {
         let anvil = Anvil::spawn_with(free_port(), cfg).await?;
         let stub = BundleStub::spawn(free_port(), &anvil.rpc_url).await?;
         let dep = deploy_contracts_with_initial(&anvil.rpc_url, ANVIL_KEY, initial_state).await?;
-        let config_dir = tempfile::tempdir().context("config tempdir")?;
-        Ok(Self {
-            anvil,
-            stub,
-            dep,
-            config_dir,
-        })
+        Ok(Self { anvil, stub, dep })
     }
 
     pub fn chain(&self) -> Chain<'_> {
@@ -309,137 +302,120 @@ impl Harness {
         poster_key: &str,
         expect_external_batches: bool,
     ) -> Vec<(&'static str, String)> {
-        self.env_for_options(NodeTomlOptions {
+        self.env_for_options(NodeEnvOptions {
             poster_key,
             proof_signer_key: Some(ANVIL_KEY),
             rollup_id: self.dep.rollup_id,
             expect_external_batches,
-            mode: "composer",
             sequencer_rpc: None,
         })
     }
 
     pub fn follower_env(&self, sequencer_rpc: Option<&str>) -> Vec<(&'static str, String)> {
-        self.env_for_options(NodeTomlOptions {
+        self.env_for_options(NodeEnvOptions {
             poster_key: ANVIL_KEY,
             proof_signer_key: None,
             rollup_id: self.dep.rollup_id,
             expect_external_batches: true,
-            mode: "follower",
             sequencer_rpc,
         })
     }
 
     pub fn env_with_rollup_id(&self, rollup_id: u64) -> Vec<(&'static str, String)> {
-        self.env_for_options(NodeTomlOptions {
+        self.env_for_options(NodeEnvOptions {
             poster_key: ANVIL_KEY,
             proof_signer_key: Some(ANVIL_KEY),
             rollup_id,
             expect_external_batches: false,
-            mode: "composer",
             sequencer_rpc: None,
         })
     }
 
     pub fn env_with_proof_signer(&self, proof_signer_key: &str) -> Vec<(&'static str, String)> {
-        self.env_for_options(NodeTomlOptions {
+        self.env_for_options(NodeEnvOptions {
             poster_key: ANVIL_KEY,
             proof_signer_key: Some(proof_signer_key),
             rollup_id: self.dep.rollup_id,
             expect_external_batches: false,
-            mode: "composer",
             sequencer_rpc: None,
         })
     }
 
-    fn env_for_options(&self, opts: NodeTomlOptions<'_>) -> Vec<(&'static str, String)> {
-        let config_path = self.write_node_config(opts);
-        vec![
+    fn env_for_options(&self, opts: NodeEnvOptions<'_>) -> Vec<(&'static str, String)> {
+        let mut env = vec![
+            ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
+            ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
+            ("EEZ_L1_POSTER_KEY", opts.poster_key.to_string()),
+            ("EEZ_L1_CHAIN_ID", "31337".to_string()),
+            ("EEZ_L2_SYSTEM_ADDRESS", format!("{ANVIL_ADDR:#x}")),
+            ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
             (
-                "EEZ_CONFIG",
-                config_path
-                    .to_str()
-                    .expect("config path is utf-8")
-                    .to_string(),
+                "EEZ_CCM_L2_ADDRESS",
+                "0x4200000000000000000000000000000000000007".to_string(),
+            ),
+            (
+                "EEZ_L1_BLOCK_TIME_MS",
+                (L1_BLOCK_TIME_SECS * 1000).to_string(),
+            ),
+            ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
+            ("EEZ_PROOF_TIME_MS", "1000".to_string()),
+            ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
+            (
+                "EEZ_REGISTRY_ADDRESS",
+                format!("{:#x}", self.dep.eez_address),
+            ),
+            (
+                "EEZ_REGISTRY_DEPLOY_BLOCK",
+                self.dep.deploy_block.to_string(),
+            ),
+            (
+                "EEZ_MOCK_PROOF_SYSTEM_ADDRESS",
+                format!("{:#x}", self.dep.mock_ps_address),
+            ),
+            (
+                "EEZ_ROLLUP_MANAGER_ADDRESS",
+                format!("{:#x}", self.dep.rollup_manager_address),
+            ),
+            ("EEZ_ROLLUP_ID", opts.rollup_id.to_string()),
+            (
+                "EEZ_COMPOSER_INTERVAL_SECS",
+                if opts.expect_external_batches {
+                    COMPOSER_INTERVAL_MULTI
+                } else {
+                    COMPOSER_INTERVAL_SINGLE
+                }
+                .as_secs()
+                .to_string(),
+            ),
+            (
+                "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES",
+                opts.expect_external_batches.to_string(),
+            ),
+            (
+                "EEZ_L2_DATADIR",
+                "/tmp/unused-overridden-by-flag".to_string(),
             ),
             (
                 "RUST_LOG",
                 std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
             ),
-        ]
-    }
+        ];
 
-    fn write_node_config(&self, opts: NodeTomlOptions<'_>) -> PathBuf {
-        let index = std::fs::read_dir(self.config_dir.path()).map_or(0, Iterator::count);
-        let path = self
-            .config_dir
-            .path()
-            .join(format!("{}-{}-{index}.toml", opts.mode, opts.rollup_id));
-        let proof_signer_key = opts
-            .proof_signer_key
-            .map(|key| format!("proof_signer_key = {key:?}\n"))
-            .unwrap_or_default();
-        let follower = opts
-            .sequencer_rpc
-            .map(|rpc| format!("\n[follower]\nsequencer_rpc = {rpc:?}\n"))
-            .unwrap_or_default();
-        let contents = format!(
-            r#"mode = {mode:?}
-
-[l1]
-rpc_url = {l1_rpc:?}
-builder_rpc_url = {builder_rpc:?}
-chain_id = 31337
-embedded = false
-
-[rollup]
-id = {rollup_id}
-registry_address = {registry:?}
-registry_deploy_block = {deploy_block}
-rollup_manager_address = {rollup_manager:?}
-mock_proof_system_address = {mock_ps:?}
-expect_external_batches = {expect_external_batches}
-
-[timing]
-l1_block_time_ms = 2000
-l2_block_time_ms = 1000
-proof_time_ms = 500
-submission_slack_ms = 100
-
-[system_tx]
-ccm_l2_address = "0x4200000000000000000000000000000000000007"
-l2_system_address = {system_address:?}
-
-[keys]
-l1_poster_key = {poster_key:?}
-{proof_signer_key}l2_system_key = {system_key:?}
-{follower}"#,
-            mode = opts.mode,
-            l1_rpc = self.anvil.rpc_url,
-            builder_rpc = self.stub.url,
-            rollup_id = opts.rollup_id,
-            registry = format!("{:#x}", self.dep.eez_address),
-            deploy_block = self.dep.deploy_block,
-            rollup_manager = format!("{:#x}", self.dep.rollup_manager_address),
-            mock_ps = format!("{:#x}", self.dep.mock_ps_address),
-            expect_external_batches = opts.expect_external_batches,
-            system_address = format!("{:#x}", ANVIL_ADDR),
-            poster_key = opts.poster_key,
-            proof_signer_key = proof_signer_key,
-            system_key = ANVIL_KEY,
-            follower = follower,
-        );
-        std::fs::write(&path, contents).expect("write node config");
-        path
+        if let Some(proof_signer_key) = opts.proof_signer_key {
+            env.push(("EEZ_PROOF_SIGNER_KEY", proof_signer_key.to_string()));
+        }
+        if let Some(sequencer_rpc) = opts.sequencer_rpc {
+            env.push(("EEZ_SEQUENCER_RPC", sequencer_rpc.to_string()));
+        }
+        env
     }
 }
 
-struct NodeTomlOptions<'a> {
+struct NodeEnvOptions<'a> {
     poster_key: &'a str,
     proof_signer_key: Option<&'a str>,
     rollup_id: u64,
     expect_external_batches: bool,
-    mode: &'static str,
     sequencer_rpc: Option<&'a str>,
 }
 

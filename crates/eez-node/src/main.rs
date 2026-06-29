@@ -7,9 +7,7 @@
 //!
 //! # Modes
 //!
-//! With `--eez.config <path>` / `EEZ_CONFIG=<path>`, mode is read from
-//! TOML (`standalone`, `follower`, or `composer`). Without a config file,
-//! mode falls back to the legacy env-var presence rule:
+//! Mode is decided by env-var presence at startup:
 //!
 //! | `EEZ_L1_RPC_URL` | `EEZ_PROOF_SIGNER_KEY` | Mode | Stack |
 //! |---|---|---|---|
@@ -17,12 +15,11 @@
 //! | set | unset | **follower** | reth + `L1Watcher` + Deriver (no Sequencer) |
 //! | set | set | **composer** | reth + `L1Watcher` + Deriver + Sequencer (L1-anchored) + Composer umbrella |
 
-mod config;
 mod follower;
 mod ingress;
 mod l1_embedded;
 
-use std::{collections::HashMap, env, path::PathBuf, str::FromStr, sync::Arc};
+use std::{collections::HashMap, env, str::FromStr, sync::Arc};
 
 use alloy_primitives::{Address, B256};
 use alloy_provider::RootProvider;
@@ -98,16 +95,6 @@ impl Mode {
 /// eez-node-specific CLI arguments layered on top of reth's CLI.
 #[derive(clap::Args, Debug, Clone)]
 struct NodeExt {
-    /// Path to the eez-node TOML config file. When set, the file is the
-    /// source of truth for EEZ_* startup config.
-    #[arg(
-        id = "eez_config",
-        long = "eez.config",
-        alias = "eez-config",
-        env = "EEZ_CONFIG"
-    )]
-    eez_config: Option<PathBuf>,
-
     /// Sequencer JSON-RPC URL. In follower mode this enables the
     /// optional unsafe-head overlay; safe/finalized remain L1-derived.
     #[arg(long, env = "EEZ_SEQUENCER_RPC")]
@@ -144,24 +131,13 @@ fn main() -> eyre::Result<()> {
         }
     }
 
-    let loaded_config = config::find_config_path(&argv)
-        .as_deref()
-        .map(config::EezConfig::load)
-        .transpose()?;
-    let mode = if let Some(config) = loaded_config.as_ref() {
-        config.validate()?;
-        config.apply_env();
-        config.mode()
-    } else {
-        Mode::from_env()
-    };
+    let mode = Mode::from_env();
 
     Cli::<EthereumChainSpecParser, NodeExt>::try_parse_from(argv)?.run(async move |builder, ext| {
         event!(
             name: "eez.node.launching",
             Level::INFO,
             mode = mode.name(),
-            config = ?ext.eez_config,
             "launching eez-node",
         );
 
@@ -1008,7 +984,7 @@ fn warn_on_deprecated_env() {
                 name: "eez.node.env.deprecated",
                 Level::WARN,
                 env = name,
-                "env var is ignored; without EEZ_CONFIG, mode is derived from EEZ_L1_RPC_URL + EEZ_PROOF_SIGNER_KEY presence (see crate docs)."
+                "env var is ignored; mode is derived from EEZ_L1_RPC_URL + EEZ_PROOF_SIGNER_KEY presence (see crate docs)."
             );
         }
     }
