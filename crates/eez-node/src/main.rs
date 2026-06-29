@@ -836,8 +836,8 @@ fn read_l1_rollup_id() -> u64 {
 /// Build the [`EmbeddedL1Config`] from env; all vars optional, with dev
 /// defaults so the smoke harness only overrides what it needs.
 ///
-///   - `EEZ_L1_HTTP_PORT` — default `18545`
-///   - `EEZ_L1_AUTH_PORT` — default `18546`
+///   - `EEZ_L1_HTTP_PORT` — default `18545` (WS = http_port + 1)
+///   - `EEZ_L1_AUTH_PORT` — default `http_port + 6`
 ///   - `EEZ_L1_P2P_PORT`  — default `30444` (P2P + discv4)
 ///   - `EEZ_L1_DISCV5_PORT` — default `p2p_port + 10` (discv5 UDP)
 ///   - `EEZ_L1_DATADIR`   — default `$TMPDIR/eez-l1-embedded` (ephemeral)
@@ -850,10 +850,14 @@ fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(18545);
+    // Auth RPC port — kept clear of the WS port (which
+    // build_network_rpc_args derives as http_port + 1) and configurable
+    // so it can dodge a default-port collision with other nodes on the
+    // host. Defaults to http_port + 6.
     let auth_port = env::var("EEZ_L1_AUTH_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(18546);
+        .unwrap_or(http_port.wrapping_add(6));
     let p2p_port = env::var("EEZ_L1_P2P_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
