@@ -600,7 +600,10 @@ where
                 // Defer-on-lateness: a late trigger that can't land the bundle
                 // in the next L1 slot commits an empty block and holds the pool
                 // (next slot covers it). Else drain into a prebuilt Sync block.
-                let prebuilt = if self.sync_block_misses_l1_slot(sync_slot_timestamp) {
+                // Check against expected_sync_ts — the ts the bundle is pinned
+                // to below — so an off-grid trigger already past its pin defers
+                // instead of composing a bundle that can't make its slot.
+                let prebuilt = if self.sync_block_misses_l1_slot(expected_sync_ts) {
                     event!(
                         name: "eez.sequencer.sync_slot.deferred_late",
                         Level::WARN,
