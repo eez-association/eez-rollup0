@@ -1147,17 +1147,29 @@ where
         let Some(committer) = self.inner.committer.get() else {
             return Err("committer handle not wired".to_owned());
         };
-        if committer.last_header().number() <= cursor {
-            return Ok(false);
-        }
+        let mirror_head_before = committer.last_header().number();
 
         let _guard = committer.begin_reconcile().await;
         // Re-check under the reconcile lock: the Deriver may have advanced the
         // cursor or the Sequencer may have committed while this task waited.
         let cursor = rollup.l1_head.cursor();
         let head = committer.last_header();
-        let gap = head.number().saturating_sub(cursor);
-        if gap <= max_span || head.number() <= cursor {
+        let observed_head = parent_number.max(head.number());
+        let gap = observed_head.saturating_sub(cursor);
+        event!(
+            name: "eez.composer.patch_recovery.rewind_check",
+            Level::INFO,
+            rollup_id,
+            cursor,
+            parent_number,
+            mirror_head_before,
+            mirror_head = head.number(),
+            observed_head,
+            gap,
+            max_span,
+            "checking whether local unverified tail should be rewound to the L1 cursor",
+        );
+        if gap <= max_span || observed_head <= cursor {
             return Ok(false);
         }
         let target_header = rollup
@@ -1171,7 +1183,9 @@ where
             Level::WARN,
             rollup_id,
             cursor,
-            head = head.number(),
+            parent_number,
+            mirror_head = head.number(),
+            observed_head,
             gap,
             max_span,
             target_hash = %target_header.hash(),
