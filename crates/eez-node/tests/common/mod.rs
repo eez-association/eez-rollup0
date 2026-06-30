@@ -1213,3 +1213,419 @@ pub fn override_env(
     }
     env
 }
+
+// ─── Cross-chain devnet harness (embedded dev L1 as anchor) ───
+
+use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+use alloy_network::TxSignerSync;
+use alloy_network::eip2718::Encodable2718;
+
+/// reth `--chain dev` chain id. Different from the L2 fixture genesis chain id (1),
+/// so the ingress classifier can distinguish L1 source txs from L2-native ones.
+pub const DEV_CHAIN_ID: u64 = 1337;
+
+pub const FIRST_ROLLUP_ID: u64 = 1;
+
+/// CCM-L2 predeploy address — baked into the L2 fixture genesis. The
+/// composer materializes incoming cross-chain calls through it.
+pub const CCM_L2_ADDRESS: Address = address!("0x4200000000000000000000000000000000000007");
+
+sol! {
+    #[sol(rpc)]
+    interface IEEZProxy {
+        function createCrossChainProxy(address originalAddress, uint256 originalRollupId) external returns (address proxy);
+    }
+    #[sol(rpc)]
+    interface IValue {
+        function value() external view returns (uint256);
+        function setValue(uint256 v) external returns (bool changed, uint256 newValue);
+    }
+}
+
+/// L2 fixture genesis re-stamped to `ts` so the sequencer doesn't read a stale
+/// genesis as late. Timestamp is a header field, so `initialState` is unchanged.
+pub fn write_l2_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
+    let raw = std::fs::read_to_string(reorg_genesis_path()).context("read fixture genesis")?;
+    let mut genesis: alloy_genesis::Genesis =
+        serde_json::from_str(&raw).context("parse fixture genesis")?;
+    genesis.timestamp = ts;
+    let dir = tempfile::tempdir().context("l2 genesis tempdir")?;
+    let path = dir.path().join("l2-genesis.json");
+    std::fs::write(&path, serde_json::to_vec(&genesis)?).context("write l2 genesis")?;
+    Ok((path, dir))
+}
+
+fn signer_of(key: &str) -> Result<PrivateKeySigner> {
+    key.strip_prefix("0x")
+        .unwrap_or(key)
+        .parse()
+        .context("parse signer key")
+}
+
+pub fn signer_address(key: &str) -> Result<Address> {
+    Ok(signer_of(key)?.address())
+}
+
+/// Sign and submit one EIP-1559 tx; return its hash. `to == None` is a CREATE.
+#[allow(clippy::too_many_arguments)]
+pub async fn sign_send_raw(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    nonce: u64,
+    to: Option<Address>,
+    value: U256,
+    input: Vec<u8>,
+    gas_limit: u64,
+) -> Result<alloy_primitives::TxHash> {
+    let (hash, raw) = sign_eip1559(key, chain_id, nonce, to, value, input, gas_limit)?;
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    provider.send_raw_transaction(&raw).await?;
+    Ok(hash)
+}
+
+/// Sign an EIP-1559 tx locally (fixed dev fees), returning `(hash, raw)`.
+#[allow(clippy::too_many_arguments)]
+fn sign_eip1559(
+    key: &str,
+    chain_id: u64,
+    nonce: u64,
+    to: Option<Address>,
+    value: U256,
+    input: Vec<u8>,
+    gas_limit: u64,
+) -> Result<(alloy_primitives::TxHash, Vec<u8>)> {
+    let signer = signer_of(key)?;
+    let mut tx = TxEip1559 {
+        chain_id,
+        nonce,
+        gas_limit,
+        max_fee_per_gas: 2_000_000_000,
+        max_priority_fee_per_gas: 1_000_000_000,
+        to: to.map_or(alloy_primitives::TxKind::Create, alloy_primitives::TxKind::Call),
+        value,
+        access_list: alloy_rpc_types_eth::AccessList::default(),
+        input: input.into(),
+    };
+    let sig = signer.sign_transaction_sync(&mut tx)?;
+    let env = TxEnvelope::from(tx.into_signed(sig));
+    let hash = *env.tx_hash();
+    Ok((hash, env.encoded_2718()))
+}
+
+/// Send a cross-chain source tx to the L2 ingress. Signed with the L1 chain id
+/// but submitted to the L2 RPC; hash is computed locally (ingress response is
+/// non-standard for held txs).
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_to_l2_ingress(
+    l2_rpc: &str,
+    key: &str,
+    l1_chain_id: u64,
+    nonce: u64,
+    to: Address,
+    value: U256,
+    input: Vec<u8>,
+    gas_limit: u64,
+) -> Result<alloy_primitives::TxHash> {
+    let (hash, raw) = sign_eip1559(key, l1_chain_id, nonce, Some(to), value, input, gas_limit)?;
+    let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
+    let _ = provider.send_raw_transaction(&raw).await; // held by ingress
+    Ok(hash)
+}
+
+pub async fn pending_nonce(rpc_url: &str, key: &str) -> Result<u64> {
+    let addr = signer_of(key)?.address();
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(provider.get_transaction_count(addr).await?)
+}
+
+pub async fn deploy_raw(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    artifact_path: &std::path::Path,
+    constructor_args: Vec<u8>,
+) -> Result<Address> {
+    let artifact: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(artifact_path)
+            .with_context(|| format!("read {}", artifact_path.display()))?,
+    )?;
+    let bytecode_hex = artifact["bytecode"]["object"]
+        .as_str()
+        .ok_or_else(|| anyhow!("bytecode.object missing in {}", artifact_path.display()))?
+        .strip_prefix("0x")
+        .unwrap_or_default();
+    let mut data = hex::decode(bytecode_hex).context("decode bytecode")?;
+    data.extend_from_slice(&constructor_args);
+
+    let nonce = pending_nonce(rpc_url, key).await?;
+    let hash = sign_send_raw(rpc_url, key, chain_id, nonce, None, U256::ZERO, data, 6_000_000).await?;
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let receipt = wait_for(Duration::from_secs(60), || {
+        let provider = provider.clone();
+        async move { Ok(provider.get_transaction_receipt(hash).await?) }
+    })
+    .await?;
+    if !receipt.status() {
+        bail!("deploy of {} reverted", artifact_path.display());
+    }
+    receipt
+        .contract_address
+        .ok_or_else(|| anyhow!("no contract_address for {}", artifact_path.display()))
+}
+
+/// Deploy EEZ + MockECDSAProofSystem + Rollup on the embedded dev L1 and
+/// register the rollup. Addresses are deterministic (`CREATE(deployer, 0/1/2)`).
+pub async fn deploy_protocol_dev(
+    l1_rpc: &str,
+    key: &str,
+    initial_state: B256,
+) -> Result<Deployment> {
+    let signer = signer_of(key)?;
+    let signer_addr = signer.address();
+    let out = repo_root().join("contracts/out");
+
+    let eez_address = deploy_raw(l1_rpc, key, DEV_CHAIN_ID, &out.join("EEZ.sol/EEZ.json"), Vec::new()).await?;
+    let provider = ProviderBuilder::new().connect_http(l1_rpc.parse()?);
+    let deploy_block = provider.get_block_number().await?;
+
+    let mock_ps_address = deploy_raw(
+        l1_rpc,
+        key,
+        DEV_CHAIN_ID,
+        &out.join("MockECDSAProofSystem.sol/MockECDSAProofSystem.json"),
+        signer_addr.abi_encode(),
+    )
+    .await?;
+
+    let vkeys: Vec<B256> = vec![B256::from_slice(&{
+        let mut padded = [0u8; 32];
+        padded[12..].copy_from_slice(signer_addr.as_slice());
+        padded
+    })];
+    let rollup_manager_address = deploy_raw(
+        l1_rpc,
+        key,
+        DEV_CHAIN_ID,
+        &out.join("Rollup.sol/Rollup.json"),
+        (eez_address, signer_addr, U256::from(1u64), vec![mock_ps_address], vkeys).abi_encode_params(),
+    )
+    .await?;
+
+    // registerRollup — a CALL, locally signed.
+    let calldata = IEEZ::registerRollupCall {
+        rollupContract: rollup_manager_address,
+        initialState: initial_state,
+    }
+    .abi_encode();
+    let nonce = pending_nonce(l1_rpc, key).await?;
+    let hash = sign_send_raw(l1_rpc, key, DEV_CHAIN_ID, nonce, Some(eez_address), U256::ZERO, calldata, 1_000_000).await?;
+    let receipt = wait_for(Duration::from_secs(60), || {
+        let provider = provider.clone();
+        async move { Ok(provider.get_transaction_receipt(hash).await?) }
+    })
+    .await?;
+    if !receipt.status() {
+        bail!("registerRollup reverted");
+    }
+    let registry = IEEZ::new(eez_address, &provider);
+    let rollup_id: u64 = registry.rollupCounter().call().await?.try_into()?;
+
+    Ok(Deployment {
+        eez_address,
+        deploy_block,
+        mock_ps_address,
+        rollup_manager_address,
+        rollup_id,
+    })
+}
+
+/// Deploy `Value(initial)` on the L2. Uses the L2's own chain id — a CREATE
+/// with the L1 chain id would be classified as a cross-chain source tx and held.
+pub async fn deploy_value_l2(l2_rpc: &str, key: &str, initial: U256) -> Result<Address> {
+    let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
+    let l2_chain_id = provider.get_chain_id().await?;
+    let out = repo_root().join("contracts/out");
+    deploy_raw(l2_rpc, key, l2_chain_id, &out.join("Value.sol/Value.json"), initial.abi_encode()).await
+}
+
+/// `CREATE2` address matching `EEZBase.computeCrossChainProxyAddress`.
+pub fn predict_proxy_address(eez: Address, target: Address, rollup_id: u64) -> Result<Address> {
+    use alloy_primitives::keccak256;
+    let out = repo_root().join("contracts/out/CrossChainProxy.sol/CrossChainProxy.json");
+    let artifact: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).context("read CrossChainProxy artifact")?)?;
+    let creation_hex = artifact["bytecode"]["object"]
+        .as_str()
+        .ok_or_else(|| anyhow!("CrossChainProxy bytecode missing"))?
+        .strip_prefix("0x")
+        .unwrap_or_default();
+    let mut init_code = hex::decode(creation_hex).context("decode CrossChainProxy bytecode")?;
+    init_code.extend_from_slice(&(eez, target, U256::from(rollup_id)).abi_encode_params());
+
+    let mut salt_input = Vec::with_capacity(52);
+    salt_input.extend_from_slice(B256::from(U256::from(rollup_id)).as_slice());
+    salt_input.extend_from_slice(target.as_slice());
+    let salt = keccak256(&salt_input);
+
+    Ok(eez.create2(salt, keccak256(&init_code)))
+}
+
+/// Call `EEZ.createCrossChainProxy` on the L1 and return the deployed address.
+pub async fn create_cross_chain_proxy(
+    l1_rpc: &str,
+    key: &str,
+    eez: Address,
+    target: Address,
+    rollup_id: u64,
+) -> Result<Address> {
+    let predicted = predict_proxy_address(eez, target, rollup_id)?;
+    let calldata = IEEZProxy::createCrossChainProxyCall {
+        originalAddress: target,
+        originalRollupId: U256::from(rollup_id),
+    }
+    .abi_encode();
+    let nonce = pending_nonce(l1_rpc, key).await?;
+    let hash = sign_send_raw(l1_rpc, key, DEV_CHAIN_ID, nonce, Some(eez), U256::ZERO, calldata, 2_000_000).await?;
+    let provider = ProviderBuilder::new().connect_http(l1_rpc.parse()?);
+    let receipt = wait_for(Duration::from_secs(60), || {
+        let provider = provider.clone();
+        async move { Ok(provider.get_transaction_receipt(hash).await?) }
+    })
+    .await?;
+    if !receipt.status() {
+        bail!("createCrossChainProxy reverted");
+    }
+    let code = provider.get_code_at(predicted).await?;
+    if code.is_empty() {
+        bail!("proxy not deployed at predicted address {predicted:#x}");
+    }
+    Ok(predicted)
+}
+
+pub async fn l2_value(l2_rpc: &str, value_addr: Address) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
+    Ok(IValue::new(value_addr, &provider).value().call().await?)
+}
+
+/// ETH balance of `addr` on the L2.
+pub async fn l2_balance(l2_rpc: &str, addr: Address) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
+    Ok(provider.get_balance(addr).await?)
+}
+
+/// `None` if not yet mined, `Some(true)` if succeeded, `Some(false)` if reverted.
+pub async fn receipt_ok(rpc_url: &str, hash: alloy_primitives::TxHash) -> Result<Option<bool>> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(provider.get_transaction_receipt(hash).await?.map(|r| r.status()))
+}
+
+/// Precomputed config for the embedded-dev-L1 devnet.
+pub struct DevnetCfg {
+    pub l1_http_port: u16,
+    pub l1_auth_port: u16,
+    pub l1_p2p_port: u16,
+    pub eez_address: Address,
+    pub mock_ps_address: Address,
+    pub rollup_manager_address: Address,
+    pub rollup_id: u64,
+    pub initial_state: B256,
+    /// Deploys contracts and signs proofs. Must differ from `poster_key` so
+    /// composer batch txs never bump the deployer nonce (which would break
+    /// deterministic `CREATE(deployer, 0/1/2)` address prediction).
+    pub deployer_key: &'static str,
+    pub poster_key: &'static str,
+    pub l1_genesis: (PathBuf, tempfile::TempDir),
+    pub l2_genesis: (PathBuf, tempfile::TempDir),
+}
+
+impl DevnetCfg {
+    pub fn new() -> Result<Self> {
+        let deployer_key = ANVIL_KEY_1;
+        let poster_key = ANVIL_KEY;
+        let deployer = signer_of(deployer_key)?.address();
+        // Deploy order: EEZ(0), MockPS(1), Rollup(2).
+        let eez_address = deployer.create(0);
+        let mock_ps_address = deployer.create(1);
+        let rollup_manager_address = deployer.create(2);
+        let initial_state = reorg_genesis_state_root()?;
+        let ts = now_unix_secs();
+        // Avoid http and ws (= http + 1) ports.
+        let l1_http_port = free_port();
+        let mut l1_auth_port = free_port();
+        while l1_auth_port == l1_http_port || l1_auth_port == l1_http_port.saturating_add(1) {
+            l1_auth_port = free_port();
+        }
+        Ok(Self {
+            l1_http_port,
+            l1_auth_port,
+            l1_p2p_port: free_port(),
+            eez_address,
+            mock_ps_address,
+            rollup_manager_address,
+            rollup_id: FIRST_ROLLUP_ID,
+            initial_state,
+            deployer_key,
+            poster_key,
+            l1_genesis: write_dev_genesis_at(ts)?,
+            l2_genesis: write_l2_genesis_at(ts)?,
+        })
+    }
+
+    pub fn l1_rpc_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.l1_http_port)
+    }
+
+    /// Env vars for `eez-node`. `proxies` seeds the ingress classifier.
+    pub fn env(&self, proxies: &[Address]) -> Vec<(&'static str, String)> {
+        let mut env = vec![
+            ("EEZ_L1_EMBEDDED", "1".to_string()),
+            ("EEZ_L1_CHAIN", "dev".to_string()),
+            ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
+            ("EEZ_L1_RPC_URL", self.l1_rpc_url()),
+            ("EEZ_L1_HTTP_PORT", self.l1_http_port.to_string()),
+            ("EEZ_L1_AUTH_PORT", self.l1_auth_port.to_string()),
+            ("EEZ_L1_P2P_PORT", self.l1_p2p_port.to_string()),
+            ("EEZ_L1_CHAIN_PATH", self.l1_genesis.0.to_string_lossy().into_owned()),
+            ("EEZ_L1_POSTER_KEY", self.poster_key.to_string()),
+            // MockECDSA is constructed with the deployer address as the authorized signer.
+            ("EEZ_PROOF_SIGNER_KEY", self.deployer_key.to_string()),
+            ("EEZ_L2_SYSTEM_ADDRESS", format!("{ANVIL_ADDR:#x}")),
+            ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
+            ("EEZ_CCM_L2_ADDRESS", format!("{CCM_L2_ADDRESS:#x}")),
+            // K = 5: L1 5s, L2 1s.
+            ("EEZ_L1_BLOCK_TIME_MS", "5000".to_string()),
+            ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
+            ("EEZ_PROOF_TIME_MS", "1000".to_string()),
+            ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
+            ("EEZ_REGISTRY_ADDRESS", format!("{:#x}", self.eez_address)),
+            ("EEZ_REGISTRY_DEPLOY_BLOCK", "0".to_string()),
+            ("EEZ_MOCK_PROOF_SYSTEM_ADDRESS", format!("{:#x}", self.mock_ps_address)),
+            ("EEZ_ROLLUP_MANAGER_ADDRESS", format!("{:#x}", self.rollup_manager_address)),
+            ("EEZ_ROLLUP_ID", self.rollup_id.to_string()),
+            ("EEZ_COMPOSER_INTERVAL_SECS", "1".to_string()),
+            ("EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES", "false".to_string()),
+            ("EEZ_L2_DATADIR", "/tmp/unused-overridden-by-flag".to_string()),
+            // INFO on our crates so bundle events are visible for assertions.
+            (
+                "RUST_LOG",
+                std::env::var("EEZ_TEST_LOG")
+                    .unwrap_or_else(|_| "warn,eez_node=info,eez_l1=info".to_string()),
+            ),
+            (
+                TEST_L2_GENESIS_ENV,
+                self.l2_genesis.0.to_string_lossy().into_owned(),
+            ),
+        ];
+        if !proxies.is_empty() {
+            let joined = proxies
+                .iter()
+                .map(|p| format!("{p:#x}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            env.push(("EEZ_CROSS_CHAIN_PROXY_ADDRESSES", joined));
+            env.push(("EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS", DEV_CHAIN_ID.to_string()));
+        }
+        env
+    }
+}
