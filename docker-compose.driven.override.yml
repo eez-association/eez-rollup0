@@ -39,7 +39,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.proverd
-    image: eez-proverd:local
+    # Image source. Default `eez-proverd:local` = build locally. To run a
+    # CI-published image, set EEZ_PROVERD_IMAGE=ghcr.io/eez-association/
+    # eez-proverd:<tag> + EEZ_PULL_POLICY=always (see .env.ghcr.example).
+    image: ${EEZ_PROVERD_IMAGE:-eez-proverd:local}
+    pull_policy: ${EEZ_PULL_POLICY:-missing}
     container_name: eez-proverd
     # Host networking so it reaches the node's control feed (:50051) and the L2
     # RPC (:18688) exactly like the node it attaches to.

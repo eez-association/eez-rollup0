@@ -25,7 +25,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: eez-node:local
+    # Image source. Default `eez-node:local` = build locally (`docker compose build`).
+    # To run a CI-published image instead, set EEZ_NODE_IMAGE=ghcr.io/eez-association/
+    # eez-node:<tag> + EEZ_PULL_POLICY=always (see .env.ghcr.example). The .dev.yml
+    # overlay overrides this with eez-node:dev + a host-binary mount.
+    image: ${EEZ_NODE_IMAGE:-eez-node:local}
+    pull_policy: ${EEZ_PULL_POLICY:-missing}
     container_name: eez-node-chiado
     network_mode: host
     restart: unless-stopped
