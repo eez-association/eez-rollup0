@@ -146,17 +146,13 @@ impl std::fmt::Debug for CrossChainExecCtx {
     }
 }
 
-/// Relay-drop retries before a held user_tx is evicted as probable
-/// poison. Poison is normally caught at COMPOSE time (a tx whose
-/// `simulate_and_resolve` deterministically fails — e.g. a wrong-proxy
-/// tx → `EmptyCalls`, or a revert — is evicted before it can enter a
-/// bundle). Under strict all-or-nothing bundles a bundle that still
-/// DROPS is relay bad luck, so its txs are re-queued; this bound only
-/// backstops poison the compose-time sim view missed (rbuilder sims
-/// against a slightly different post-postBatch state). After this many
-/// consecutive drops the tx is evicted loudly (with the nonce-cascade)
-/// so it can't block the FIFO queue forever.
-pub const MAX_BUNDLE_ATTEMPTS: u32 = 3;
+/// Log once retries have crossed the old poison-eviction threshold.
+///
+/// A target-block miss or same-block competition loss is not evidence that a
+/// user transaction is bad. Recovery therefore keeps re-queueing unburned txs;
+/// this threshold is diagnostic only so live traces still surface unusual retry
+/// churn.
+pub const BUNDLE_ATTEMPT_WARN_THRESHOLD: u32 = 3;
 
 /// Default maximum L2 width for one historical patch-recovery batch. A value of
 /// 0 in `EEZ_PATCH_RECOVERY_MAX_SPAN` disables automatic patch recovery.
@@ -859,7 +855,12 @@ where
         }
 
         let cursor = rollup.l1_head.cursor();
-        rollup.optimistic.resolve_below_cursor(cursor);
+        if self
+            .recover_cursor_passed_pending(rollup_id, rollup, cursor)
+            .await
+        {
+            return true;
+        }
 
         let mut recovered = false;
         if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
@@ -977,7 +978,12 @@ where
         // While blocked the slot still gets its (empty) Sync block — L2
         // cadence is unconditional; the next postBatch covers it.
         let cursor = rollup.l1_head.cursor();
-        rollup.optimistic.resolve_below_cursor(cursor);
+        if self
+            .recover_cursor_passed_pending(rollup_id, rollup, cursor)
+            .await
+        {
+            return None;
+        }
 
         // ── Slot-context failure recovery ────────────────────────────
         // The observer task only RECORDS verdicts; the destructive
@@ -1123,15 +1129,9 @@ where
         }
 
         let pool_len_before = pool.len();
-        // Cap drain to 10 user_txs per bundle. A backlog spills into the
-        // next Sync slot instead of letting one slot grow without bound.
-        //
-        // rbuilder-chiado has shown partial-inclusion when bundles carry
-        // too many user_txs:
-        // postBatch lands, but only a prefix of the user_txs makes it
-        // into the block — the rest are silently excluded by rbuilder
-        // and effectively lost. Capping keeps every bundle's contents
-        // 100% atomic; a backlog spills into the next Sync slot.
+        // Cap the drain so a single rich Sync slot can carry a bounded backlog.
+        // Larger bundles are useful for mixed cross-chain stress tests; any
+        // relay-side partial-inclusion behavior must be caught by live checks.
         const MAX_USER_TXS_PER_BUNDLE: usize = 10;
         let drained = pool.pop_n(MAX_USER_TXS_PER_BUNDLE);
         // NOTE: do NOT early-exit on empty pool. Every unblocked Sync
@@ -1426,6 +1426,76 @@ where
         }
     }
 
+    /// A Pending entry at/below the shared L1 cursor is not automatically
+    /// settled in based competition: another composer may have advanced that
+    /// cursor with a different root. Verify the actual postBatch/root before
+    /// reopening the gate; otherwise recover the local optimistic block and
+    /// re-queue its held txs.
+    ///
+    /// Returns `true` when recovery was triggered and the caller should yield
+    /// this slot. Returns `false` when there was nothing cursor-passed, or all
+    /// cursor-passed entries were proven to have settled their exact root.
+    async fn recover_cursor_passed_pending(
+        &self,
+        rollup_id: u64,
+        rollup: &RollupState<L2>,
+        cursor: u64,
+    ) -> bool {
+        while let Some(pending) = rollup.optimistic.take_pending_at_or_below_cursor(cursor) {
+            let sync_height = pending.sync_height;
+            match self
+                .inner
+                .submitter
+                .receipt_reached_state(pending.post_batch_hash, pending.expected_final_state)
+                .await
+            {
+                Ok(true) => {
+                    event!(
+                        name: "eez.composer.cursor_passed_pending.settled",
+                        Level::INFO,
+                        rollup_id,
+                        cursor,
+                        sync_height,
+                        post_batch_hash = %pending.post_batch_hash,
+                        expected_final_state = %pending.expected_final_state,
+                        "cursor passed pending optimistic batch and its postBatch reached the expected root; marking settled",
+                    );
+                    rollup.optimistic.reinsert_settled(pending);
+                }
+                Ok(false) => {
+                    event!(
+                        name: "eez.composer.cursor_passed_pending.different_root",
+                        Level::WARN,
+                        rollup_id,
+                        cursor,
+                        sync_height,
+                        post_batch_hash = %pending.post_batch_hash,
+                        expected_final_state = %pending.expected_final_state,
+                        "cursor passed pending optimistic batch, but this postBatch did not settle the optimistic root; recovering local block",
+                    );
+                    let _ = self.recover_failed_batch(rollup_id, rollup, pending).await;
+                    return true;
+                }
+                Err(err) => {
+                    event!(
+                        name: "eez.composer.cursor_passed_pending.check_failed",
+                        Level::ERROR,
+                        rollup_id,
+                        cursor,
+                        sync_height,
+                        post_batch_hash = %pending.post_batch_hash,
+                        expected_final_state = %pending.expected_final_state,
+                        error = %err,
+                        "could not verify cursor-passed pending postBatch root; marking failed so slot-context recovery retries",
+                    );
+                    rollup.optimistic.reinsert_failed(pending);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Recover a failed optimistic batch (slot context): reorg the L2
     /// head to the failed Sync block's parent if the block actually
     /// landed, then re-push its user_txs (skipping burned nonces).
@@ -1553,12 +1623,12 @@ where
         // pool, ahead of anything submitted since, so user ordering is
         // preserved across retries. An included-but-reverted tx has a
         // burned nonce — re-bundling it would poison the next bundle's
-        // simulation.
+        // simulation. A pure bundle drop or competition loss does not burn
+        // the nonce and must not be treated as poison.
         if let Some(pool) = rollup.held_pool.as_ref() {
             let submitter = &self.inner.submitter;
             let mut keep: Vec<crate::HeldTx> = Vec::with_capacity(failed.txs.len());
             let mut dropped = 0usize;
-            let mut evicted_chains: Vec<(alloy_primitives::Address, Direction, u64)> = Vec::new();
             // slot_skipped: re-queue without counting toward poison-eviction
             // (a skipped slot heals via a fresh pin next tick).
             let slot_skipped = failed.slot_skipped;
@@ -1575,74 +1645,26 @@ where
                 } else if slot_skipped {
                     keep.push(tx);
                 } else {
-                    // A relay drop on a BUILT slot did NOT burn the nonce
-                    // (the tx never executed), so re-queue for a fresh
-                    // attempt. Poison is normally caught at compose
-                    // time; this bounded retry only backstops poison
-                    // the compose-time sim missed (rbuilder sims
-                    // against a slightly different post-postBatch
-                    // state). After MAX_BUNDLE_ATTEMPTS such drops,
-                    // evict loudly (with the nonce-cascade) so a
-                    // residual poison tx can't block the FIFO queue
-                    // forever. User resubmits.
+                    // A relay drop, target miss, or same-block competition
+                    // loss did NOT burn the nonce, so re-queue for a fresh
+                    // attempt. Compose-time poison and actual nonce burns are
+                    // evicted by their specific checks; retry count alone is
+                    // only a signal in a based competition fleet, where a
+                    // valid rich bundle can lose multiple consecutive slots.
                     tx.attempts += 1;
-                    if tx.attempts >= MAX_BUNDLE_ATTEMPTS {
-                        dropped += 1;
-                        evicted_chains.push((tx.sender, tx.direction, tx.nonce));
+                    if tx.attempts == BUNDLE_ATTEMPT_WARN_THRESHOLD {
                         event!(
-                            name: "eez.composer.recovery.poison_evicted",
+                            name: "eez.composer.recovery.retry_threshold",
                             Level::WARN,
                             rollup_id,
                             tx_hash = %tx.hash,
                             sender = %tx.sender,
                             nonce = tx.nonce,
                             attempts = tx.attempts,
-                            "user_tx evicted after MAX_BUNDLE_ATTEMPTS relay drops (likely poison the compose-time sim missed); resubmit required",
-                        );
-                    } else {
-                        keep.push(tx);
-                    }
-                }
-            }
-            // Nonce-chain cascade: evicting (sender, N) makes every
-            // same-sender tx with nonce > N permanently invalid (the
-            // gap never fills — the evicted nonce only lands if the
-            // user resubmits, which produces a NEW tx). Leaving them
-            // queued poisons every future bundle they ride and breaks
-            // OTHER senders' chains as collateral — the exact cascade
-            // that bricked a run's user EOA. Drop them from both the
-            // keep list and the pool, loudly.
-            for (sender, direction, nonce) in &evicted_chains {
-                keep.retain(|t| {
-                    let cascade =
-                        t.sender == *sender && t.direction == *direction && t.nonce > *nonce;
-                    if cascade {
-                        dropped += 1;
-                        event!(
-                            name: "eez.composer.recovery.nonce_chain_evicted",
-                            Level::WARN,
-                            rollup_id,
-                            tx_hash = %t.hash,
-                            sender = %t.sender,
-                            nonce = t.nonce,
-                            gap_at = nonce,
-                            "same-sender tx above an evicted nonce; gapped chain can never land — evicted (resubmit in order)",
+                            "user_tx has seen repeated bundle drops; keeping it queued because no nonce burn or compose-time poison was observed",
                         );
                     }
-                    !cascade
-                });
-                for t in pool.drain_sender_above(*sender, *direction, *nonce) {
-                    dropped += 1;
-                    event!(
-                        name: "eez.composer.recovery.nonce_chain_evicted",
-                        Level::WARN,
-                        rollup_id,
-                        tx_hash = %t.hash,
-                        sender = %t.sender,
-                        nonce = t.nonce,
-                        gap_at = nonce,
-                        "same-sender pooled tx above an evicted nonce; gapped chain can never land — evicted (resubmit in order)",
-                    );
+                    keep.push(tx);
                 }
             }
             let re_pushed = keep.len();
@@ -1989,6 +2011,25 @@ where
             // load tx with the user tx (SyncPair). R1: zero L1 entries → POISON
             // (never a silent survivor; never reaches build_inbound_system_txs).
             if held.direction == Direction::Outbound {
+                let current_nonce = state
+                    .account_nonce(&held.sender)
+                    .map_err(|e| format!("account_nonce({}): {e}", held.sender))?
+                    .unwrap_or(0);
+                if held.nonce < current_nonce {
+                    event!(
+                        name: "eez.composer.cc_compose.outbound_nonce_burned",
+                        Level::WARN,
+                        rollup_id,
+                        tx_idx = idx,
+                        tx_hash = %held.hash,
+                        sender = %held.sender,
+                        nonce = held.nonce,
+                        current_nonce,
+                        "outbound tx nonce is already below the L2 source account nonce; evicting stale held tx",
+                    );
+                    poison.push(held);
+                    continue;
+                }
                 let Some(l2_entry) = self.inner.l2_entry_client.as_deref() else {
                     event!(
                         name: "eez.composer.cc_compose.outbound_no_l2_entry",
@@ -3422,6 +3463,15 @@ where
             batch: batch.inner.clone(),
         }
         .abi_encode();
+        let gas_limit = estimate_post_batch_gas_limit(batch, calldata.len());
+        event!(
+            name: "eez.composer.postbatch.gas_budget",
+            Level::INFO,
+            entry_count = batch.inner.entries.len(),
+            calldata_bytes = calldata.len(),
+            gas_limit,
+            "computed postBatch gas limit",
+        );
 
         // EEZ registry address is per-deployment; read directly from env. Loud
         // failure on absence/garbage (invariant 7) — a postBatch signed to
@@ -3436,6 +3486,7 @@ where
             &ctx.l1_provider,
             eez_address,
             calldata,
+            gas_limit,
             ctx.l1_chain_id,
             ctx.l1_post_batch_priority_fee,
         )
@@ -3524,6 +3575,7 @@ async fn sign_post_batch_tx(
     provider: &alloy_provider::RootProvider,
     eez_address: Address,
     calldata: Vec<u8>,
+    gas_limit: u64,
     chain_id: u64,
     priority_fee: u128,
 ) -> Result<Bytes, String> {
@@ -3551,22 +3603,10 @@ async fn sign_post_batch_tx(
     let base_fee = u128::from(latest.header.base_fee_per_gas.unwrap_or(0));
     let max_fee_per_gas = base_fee.saturating_mul(2).saturating_add(priority_fee);
 
-    // Gas budget for postAndVerifyBatch: per-rollup verification +
-    // entry apply. Actual postBatch gas usage is ~500K-600K even for a
-    // wide catch-up span (measured 564600 for a ~13k-block span); 1.5M
-    // is ~2.5x safety and still well under chiado's 17M block gas limit.
-    //
-    // WHY LOWER THAN 4M (2026-06-24): EIP-1559 reserves gas_limit*maxFee
-    // upfront. At 4M*10gwei that reserve is ~0.04 xDAI; the poster ran
-    // OUT of affordable balance there (settlement froze with the poster
-    // at 0.0397). 1.5M cuts the reserve to ~0.015, so a low-balance
-    // poster can still post (the actual CHARGE is gas_used, unchanged).
-    const POST_BATCH_GAS_LIMIT: u64 = 1_500_000;
-
     let mut tx = TxEip1559 {
         chain_id,
         nonce,
-        gas_limit: POST_BATCH_GAS_LIMIT,
+        gas_limit,
         max_fee_per_gas,
         max_priority_fee_per_gas: priority_fee,
         to: TxKind::Call(eez_address),
@@ -3581,6 +3621,27 @@ async fn sign_post_batch_tx(
     let mut buf = Vec::with_capacity(512);
     signed.encode_2718(&mut buf);
     Ok(Bytes::from(buf))
+}
+
+/// Gas budget for `postAndVerifyBatch`.
+///
+/// A fixed 1.5M cap was enough for minimal and small cross-chain slots, but a
+/// `2 inbound + 2 outbound` batch has five settlement entries and was silently
+/// dropped by the Chiado builder during bundle simulation. Scale with entry
+/// count and calldata size while keeping the old 1.5M floor for low-balance
+/// posters on ordinary minimal batches.
+fn estimate_post_batch_gas_limit(batch: &eez_evm::EvmBatch, calldata_len: usize) -> u64 {
+    const MIN_POST_BATCH_GAS_LIMIT: u64 = 1_500_000;
+    const BASE_EXECUTION_GAS: u64 = 900_000;
+    const GAS_PER_SETTLEMENT_ENTRY: u64 = 300_000;
+    const MAX_POST_BATCH_GAS_LIMIT: u64 = 8_000_000;
+
+    let entry_count = batch.inner.entries.len() as u64;
+    let calldata_gas = (calldata_len as u64).saturating_mul(16);
+    BASE_EXECUTION_GAS
+        .saturating_add(entry_count.saturating_mul(GAS_PER_SETTLEMENT_ENTRY))
+        .saturating_add(calldata_gas)
+        .clamp(MIN_POST_BATCH_GAS_LIMIT, MAX_POST_BATCH_GAS_LIMIT)
 }
 
 // Legacy system-tx signing helpers (`sign_legacy_system_tx` /

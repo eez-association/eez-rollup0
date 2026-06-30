@@ -51,7 +51,7 @@ folded rolling hash, (d) reconstruct it deterministically in the deriver, and
 | Detection | `eez-protocol/src/composition.rs` | A user tx that makes N internally-invoked cross-chain calls records only the **single outer outcome** — the N nested calls are NOT separate `ExecutedAction`s. No trace-walking. |
 
 **Note** — N SEPARATE top-level cross-chain calls each in its OWN user tx
-already works (this is A2b's mixed batch: `MAX_USER_TXS_PER_BUNDLE=3`, one entry
+already works (this is A2b's mixed batch: `MAX_USER_TXS_PER_BUNDLE=10`, one entry
 per tx, `build_cross_chain_sync_pairs` iterates them). The gap is N calls
 **within ONE tx**.
 

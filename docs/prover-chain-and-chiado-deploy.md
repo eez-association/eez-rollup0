@@ -129,7 +129,7 @@ ProofSink: verified attestation from the registered prover` (attester
 missing `protobuf-compiler` (the tonic crates run `tonic-prost-build` in
 `build.rs`); without it the image build dies at `cargo build -p eez-node`
 (exit 101). Added AFTER the cook layer (cook stubs workspace members) to keep
-the dep cache warm. (2) `configs/l2-chainconfig.json` (chainId **1**, all forks
+the dep cache warm. (2) `configs/l2-chainconfig.json` (chainId **10201**, all forks
 at 0 — the L2 id, NOT the L1's 10200). Also: `.env.chiado` needed the real
 funded keys (it shipped `CHANGE_ME` stubs) and is now gitignored.
 

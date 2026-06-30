@@ -13,7 +13,7 @@
 #      (0x4200..07) — byte-identical to eez-evm/src/outbound_gate.rs
 #      `compute_cross_chain_proxy_address` (see explanation at EOF), then
 #      `createCrossChainProxy` so the proxy bytecode exists on L2;
-#   3. send the OUTBOUND user tx: an L2-chain-id (1) EIP-1559 tx,
+#   3. send the OUTBOUND user tx: an L2-chain-id EIP-1559 tx,
 #      `to = P`, `data = setValue(N)`, signed by a funded L2 EOA, POSTed
 #      to the L2 ingress (:18688) — the same shape `send_outbound_set_value`
 #      builds in the in-process test;
@@ -127,10 +127,9 @@ echo "    L2 CCM        = $CCM_L2_ADDRESS"
 echo "    target rollup = $MAINNET_ROLLUP_ID (MAINNET) ;  setValue($OUTBOUND_VALUE)"
 
 # ── Sanity: the outbound user tx MUST be signed for the L2 chain ─────
-# (e2e_outbound asserts chain_id == L2_CHAIN_ID before sending). The L2
-# fixture pins chainId 1; a tx signed for the L1 chain would be classified
-# INBOUND, not outbound.
-[[ "$L2_CHAIN_ID" == "1" ]] || echo "    note: L2 chainId=$L2_CHAIN_ID (expected 1); outbound tx will be signed for $L2_CHAIN_ID"
+# (e2e_outbound asserts chain_id == L2_CHAIN_ID before sending). A tx signed
+# for the L1 chain would be classified INBOUND, not outbound.
+echo "    outbound tx will be signed for L2 chainId=$L2_CHAIN_ID"
 
 # ── 1. Deploy the L1 Value TARGET on the embedded chiado L1 ──────────
 # Reuse DeployValueL2.s.sol (it is RPC-generic: `new Value(initial)`),
@@ -250,7 +249,7 @@ else
 fi
 
 # ── 3. Send the OUTBOUND user tx ─────────────────────────────────────
-# L2-chain-id (1), to=P, data=setValue(N), from the funded L2 EOA, POSTed
+# L2-chain-id, to=P, data=setValue(N), from the funded L2 EOA, POSTed
 # to the L2 ingress. cast mktx + raw eth_sendRawTransaction so we own the
 # hash for the receipt wait (the ingress HOLDS the tx; it returns the hash
 # on a successful hold, mirroring devnet-test.sh's submit path).

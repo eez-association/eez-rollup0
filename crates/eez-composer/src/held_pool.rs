@@ -41,14 +41,11 @@ pub struct HeldTx {
     /// [`HeldPool::by_hash`] for [`HeldPool::drain_matching`] lookups
     /// — avoids recomputing on every external-batch landing.
     pub hash: TxHash,
-    /// Failed-bundle attempts so far. Bundles are strict
-    /// all-or-nothing, so a deterministically-reverting tx fails every
-    /// bundle it joins — and from outside, a "tx reverts in builder
-    /// simulation" drop is indistinguishable from a "no builder slot"
-    /// drop. Recovery increments this on each re-queue and EVICTS the
-    /// tx (loud WARN, user resubmits) at
-    /// [`MAX_BUNDLE_ATTEMPTS`](crate::composer::MAX_BUNDLE_ATTEMPTS),
-    /// so one poison tx can't fail every postBatch forever.
+    /// Failed-bundle attempts so far. This is diagnostic only: in based
+    /// competition, a valid rich bundle can lose several target blocks to a
+    /// competing composer, so retry count alone is not evidence of poison.
+    /// Recovery evicts only on concrete evidence such as a burned nonce,
+    /// compose-time poison, or an actual receipt.
     pub attempts: u32,
     /// Recovered L1 sender. Together with `nonce`, lets the pool and
     /// the eviction path keep each sender's nonce chain CONTIGUOUS:
@@ -216,12 +213,9 @@ impl HeldPool {
         drained
     }
 
-    /// Drain up to `max` held txs (FIFO). Empirical fact about the
-    /// rbuilder-chiado relay: bundles containing more than ~3 user_txs
-    /// often have a subset silently dropped at inclusion time even
-    /// when the bundle itself lands. Capping bundle size keeps the
-    /// per-bundle inclusion atomic at the cost of more Sync slots to
-    /// drain a large pool.
+    /// Drain up to `max` held txs (FIFO). The caller chooses the live cap:
+    /// smaller caps reduce relay partial-inclusion risk, larger caps exercise
+    /// richer mixed cross-chain slots.
     pub fn pop_n(&self, max: usize) -> Vec<HeldTx> {
         let mut txs = self.txs.lock().expect("held_pool txs poisoned");
         let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");

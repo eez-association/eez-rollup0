@@ -175,6 +175,7 @@ echo "      L1 bridge  = $EEZ_L1_BRIDGE_SENDER"
 # the L1 block that confirmed RegisterRollup, so catch-up only
 # bridges deploy-time to now.
 GENESIS_OUT="${EEZ_GENESIS_OUT:-$REPO/datadir/genesis.json}"
+EEZ_L2_CHAIN_ID="${EEZ_L2_CHAIN_ID:-10201}"
 mkdir -p "$REPO/datadir"
 DEPLOY_BLOCK_TS_HEX="$(cast block "$EEZ_REGISTRY_DEPLOY_BLOCK" --rpc-url "$EEZ_L1_RPC_URL" --json | jq -r '.timestamp')"
 [[ -n "$DEPLOY_BLOCK_TS_HEX" && "$DEPLOY_BLOCK_TS_HEX" != "null" ]] || {
@@ -185,6 +186,7 @@ python3 -c "
 import json, sys
 g = json.load(open('$REPO/genesis.json'))
 g['timestamp'] = '$DEPLOY_BLOCK_TS_HEX'
+g['config']['chainId'] = int('$EEZ_L2_CHAIN_ID')
 # Mirror reth --chain dev's hardfork activation (all forks at genesis).
 # Without these the chain spec defaults to no-forks, the produced
 # blocks omit Cancun/Shanghai header fields, and the Deriver's STF
@@ -202,6 +204,7 @@ g['config'].update({
 json.dump(g, open('$GENESIS_OUT', 'w'), indent=2)
 " || { echo "deploy: failed to write $GENESIS_OUT" >&2; exit 1; }
 echo "      genesis.ts = $DEPLOY_BLOCK_TS_HEX ($(printf %d $DEPLOY_BLOCK_TS_HEX))"
+echo "      genesis.chainId = $EEZ_L2_CHAIN_ID"
 
 # ── Write deployments.env ───────────────────────────────────────────
 cat > "$OUT_FILE" <<EOF

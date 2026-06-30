@@ -1,6 +1,6 @@
 # docker-compose.l2-explorer.yml — Independent Blockscout explorer for the eez-rollup0 L2
 #
-# Targets the LIVE eez L2 JSON-RPC running on the HOST at 127.0.0.1:18688 (chain id 1).
+# Targets the LIVE eez L2 JSON-RPC running on the HOST at 127.0.0.1:18688 (chain id 10201).
 #
 # The eez node binds its RPC on the host loopback/0.0.0.0:18688, and the host firewall
 # (ufw, INPUT policy DROP) blocks traffic from docker bridge subnets to host ports.
@@ -69,7 +69,7 @@ services:
       INDEXER_DISABLE_PENDING_TRANSACTIONS_FETCHER: "true"
       INDEXER_DISABLE_INTERNAL_TRANSACTIONS_FETCHER: "false"
       INDEXER_DISABLE_BLOCK_REWARD_FETCHER: "true"
-      CHAIN_ID: "1"
+      CHAIN_ID: "10201"
       API_V2_ENABLED: "true"
       MIX_ENV: "prod"
       POOL_SIZE: "50"
@@ -93,7 +93,7 @@ services:
       NEXT_PUBLIC_STATS_API_HOST: ""
       NEXT_PUBLIC_NETWORK_NAME: "eez Rollup L2"
       NEXT_PUBLIC_NETWORK_SHORT_NAME: "L2"
-      NEXT_PUBLIC_NETWORK_ID: "1"
+      NEXT_PUBLIC_NETWORK_ID: "10201"
       NEXT_PUBLIC_NETWORK_CURRENCY_NAME: "ETH"
       NEXT_PUBLIC_NETWORK_CURRENCY_SYMBOL: "ETH"
       NEXT_PUBLIC_NETWORK_CURRENCY_DECIMALS: "18"

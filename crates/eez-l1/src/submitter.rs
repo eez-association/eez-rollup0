@@ -35,6 +35,12 @@ use crate::error::{L1Error, L1Result};
 const TARGET_WAIT_BUDGET: Duration = Duration::from_secs(30);
 const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Conservative boot/reorg catch-up scan width. Some RPCs cap `eth_getLogs` by
+/// result count, not only by block range; with two competing posters a block can
+/// carry multiple `BatchPosted` logs, so keep chunks well below a 20k-result
+/// ceiling.
+const MAX_SCAN_BATCHES_RANGE: u64 = 5_000;
+
 /// L1 block offset for [`BundleTarget::NextBlock`] — the MINIMAL viable
 /// target, `latest + 1` (the next block to be built). A bundle must target a
 /// not-yet-built block; targeting the already-mined `latest` (offset 0) can
@@ -264,17 +270,27 @@ impl Submitter {
     ///   malformed batch.
     pub async fn scan_batches(&self, deploy_block: u64) -> L1Result<Vec<HistoricalBatch>> {
         let provider = self.inner.build_provider();
-        let scanned = scan_batch_logs(
-            &provider,
-            self.inner.config.eez,
-            self.inner.config.rollup_id,
-            deploy_block,
-            BlockNumberOrTag::Latest,
-        )
-        .await?;
-        Ok(scanned
-            .into_iter()
-            .map(|b| HistoricalBatch {
+        let latest = provider
+            .get_block_number()
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_block_number: {e}")))?;
+        if deploy_block > latest {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        let mut from = deploy_block;
+        while from <= latest {
+            let to = from.saturating_add(MAX_SCAN_BATCHES_RANGE - 1).min(latest);
+            let scanned = scan_batch_logs(
+                &provider,
+                self.inner.config.eez,
+                self.inner.config.rollup_id,
+                from,
+                BlockNumberOrTag::Number(to),
+            )
+            .await?;
+            out.extend(scanned.into_iter().map(|b| HistoricalBatch {
                 l1_block_number: b.l1_block_number,
                 l1_block_hash: b.l1_block_hash,
                 tx_hash: b.tx_hash,
@@ -286,8 +302,13 @@ impl Submitter {
                 settled_final_state: b.settled_final_state,
                 claimed_current_state: b.claimed_current_state,
                 claimed_new_state: b.claimed_new_state,
-            })
-            .collect())
+            }));
+            if to == latest {
+                break;
+            }
+            from = to + 1;
+        }
+        Ok(out)
     }
 
     /// Hash of the canonical L1 block at `number`, or `None` if none. Used by

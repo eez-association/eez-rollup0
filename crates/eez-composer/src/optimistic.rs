@@ -17,14 +17,13 @@
 //!   the next Sync slot ([`OptimisticallyIncluded::take_failed_for_recovery`]),
 //!   serialized against the Sequencer and Deriver to close the
 //!   observer-vs-commit TOCTOU.
-//! - **Cursor-confirmed**: for Pending entries only, the Deriver's
-//!   cursor passing the Sync height proves settlement independently of
-//!   the observer ([`OptimisticallyIncluded::resolve_below_cursor`]);
-//!   Failed entries still require root-aware slot-context recovery
-//!   because a competitor can advance the cursor with a different root.
-//!   The one-in-flight gate
-//!   ([`OptimisticallyIncluded::blocking_height`]) holds emission until
-//!   then.
+//! - **Cursor-passed**: the Deriver cursor passing a Pending entry's
+//!   height is not proof that *our* optimistic root settled: in based
+//!   competition, another composer can advance the shared cursor with a
+//!   different root. Slot context extracts such entries with
+//!   [`OptimisticallyIncluded::take_pending_at_or_below_cursor`] and
+//!   verifies the actual postBatch/root before either settling or
+//!   recovering them.
 //!
 //! Keyed by L2 heights; the L1⇄L2 map is the Deriver-owned
 //! `L1CanonicalHead` batch index.
@@ -40,15 +39,11 @@ use crate::held_pool::HeldTx;
 /// A failed entry extracted for slot-context recovery.
 ///
 /// "Failed" here always means the bundle did not land (postBatch had no
-/// receipt by its target L1 block). Under strict all-or-nothing bundles
-/// a reverting tx is excluded → the whole bundle drops, so the outcome
-/// can't distinguish "relay bad luck" from "a tx would revert" — both
-/// look like a drop. Poison is therefore caught earlier, at compose
-/// time (a tx whose `simulate_and_resolve` deterministically fails is
-/// evicted before it can ever enter a bundle); a drop that reaches
-/// recovery is treated as bad luck and re-queued, with
-/// [`MAX_BUNDLE_ATTEMPTS`](crate::composer::MAX_BUNDLE_ATTEMPTS) as a
-/// backstop for poison the compose-time sim view missed.
+/// receipt by its target L1 block). Under based competition, this can
+/// simply mean another composer won the target block. Poison is therefore
+/// caught by evidence-bearing checks (compose-time simulation, burned nonces,
+/// receipts), not by retry count; a drop that reaches recovery is treated as
+/// bad luck and re-queued.
 #[derive(Debug)]
 pub struct FailedBatch {
     /// L2 height of the optimistically-committed Sync block.
@@ -158,34 +153,43 @@ impl OptimisticallyIncluded {
     }
 
     /// The lowest entry height above `cursor`, if any — the previous
-    /// postBatch is not yet DERIVER-confirmed and the composer must
-    /// skip emission this slot. Counts Pending, Settled, AND Failed
-    /// entries: an observer settle-verdict is NOT enough to re-open
-    /// the gate — only the Deriver's cursor passing the height proves
-    /// the next bundle would read a fresh `posted` cursor. (Failed
-    /// entries are extracted by `take_failed_for_recovery` before this
-    /// check; one still present means recovery didn't complete — stay
-    /// blocked.) Call after [`Self::resolve_below_cursor`].
+    /// postBatch is not yet cursor-covered and the composer must skip
+    /// emission this slot. Counts Pending, Settled, AND Failed entries
+    /// above the cursor: an observer settle-verdict is NOT enough to
+    /// re-open the gate — only the Deriver cursor passing the height
+    /// means the next bundle can read a fresh `posted` cursor.
+    ///
+    /// Entries at or below the cursor are handled before this check:
+    /// Pending entries are extracted for root-aware confirmation, and
+    /// Failed entries are extracted for recovery. A lingering entry at
+    /// or below the cursor therefore does not block here.
     #[must_use]
     pub fn blocking_height(&self, cursor: u64) -> Option<u64> {
         let map = self.by_sync_height.lock().unwrap();
         map.range(cursor + 1..).next().map(|(h, _)| *h)
     }
 
-    /// Flip Pending entries at or below the Deriver's cursor to
-    /// Settled. Failed entries are deliberately NOT cursor-resolved:
-    /// in based competition a competitor can advance the cursor past
-    /// our failed optimistic height with a different state root. Those
-    /// failed entries must still go through recovery, where the actual
-    /// postBatch/final-root is checked before deciding whether a
-    /// failure verdict was stale.
-    pub fn resolve_below_cursor(&self, cursor: u64) {
+    /// Extract one Pending entry whose height is at or below the
+    /// Deriver cursor. The caller must verify whether this entry's
+    /// postBatch reached its exact expected root; height alone is not
+    /// confirmation under based competition because another composer can
+    /// advance the shared cursor with a different root.
+    #[must_use]
+    pub fn take_pending_at_or_below_cursor(&self, cursor: u64) -> Option<FailedBatch> {
         let mut map = self.by_sync_height.lock().unwrap();
-        for (_, entry) in map.range_mut(..=cursor) {
-            if entry.resolution == Resolution::Pending {
-                entry.resolution = Resolution::Settled;
-            }
-        }
+        let h = map
+            .range(..=cursor)
+            .find(|(_, e)| e.resolution == Resolution::Pending)
+            .map(|(h, _)| *h)?;
+        let entry = map.remove(&h)?;
+        Some(FailedBatch {
+            sync_height: h,
+            post_batch_hash: entry.post_batch_hash,
+            expected_final_state: entry.expected_final_state,
+            parent: entry.parent,
+            txs: entry.txs,
+            slot_skipped: entry.slot_skipped,
+        })
     }
 
     /// Observer verdict: the bundle settled on L1. Entry is retained
@@ -393,12 +397,28 @@ mod tests {
     }
 
     #[test]
-    fn cursor_resolution_settles_pending_entries() {
+    fn cursor_passed_pending_is_extracted_for_root_check() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), root(0xa), hdr(), vec![tx(1)]);
-        pool.resolve_below_cursor(10);
+        let pending = pool
+            .take_pending_at_or_below_cursor(10)
+            .expect("cursor-passed pending entry");
+        assert_eq!(pending.sync_height, 10);
+        assert_eq!(pending.post_batch_hash, pb_hash(0xa));
+        assert_eq!(pending.expected_final_state, root(0xa));
+        assert_eq!(pending.txs.len(), 1);
         assert!(pool.take_failed_for_recovery(0).is_none());
         assert_eq!(pool.blocking_height(10), None);
+    }
+
+    #[test]
+    fn cursor_passed_pending_can_be_reinserted_as_settled_after_root_check() {
+        let pool = OptimisticallyIncluded::new();
+        pool.begin(10, pb_hash(0xa), root(0xa), hdr(), vec![tx(1)]);
+        let pending = pool
+            .take_pending_at_or_below_cursor(10)
+            .expect("cursor-passed pending entry");
+        pool.reinsert_settled(pending);
         let finalized = pool.take_finalized(10);
         assert_eq!(finalized.len(), 1);
         assert_eq!(finalized[0].0, 10);
@@ -418,29 +438,14 @@ mod tests {
     }
 
     #[test]
-    fn cursor_resolution_overrides_false_failure() {
-        let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), root(0xa), hdr(), vec![tx(1)]);
-        pool.mark_failed(10, false);
-        // Deriver confirmed the batch — false-negative verdict overridden.
-        pool.resolve_below_cursor(10);
-        assert!(pool.take_failed_for_recovery(0).is_none());
-        assert_eq!(pool.blocking_height(10), None);
-        let finalized = pool.take_finalized(10);
-        assert_eq!(finalized.len(), 1);
-        assert_eq!(finalized[0].0, 10);
-        assert_eq!(finalized[0].1, pb_hash(0xa));
-    }
-
-    #[test]
-    fn cursor_resolution_does_not_hide_failed_entry() {
+    fn cursor_passed_pending_extraction_does_not_hide_failed_entry() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), root(0xa), hdr(), vec![tx(1)]);
         pool.mark_failed(10, false);
         // A competitor can advance the cursor past this height with a
         // different root. Recovery must still inspect the actual
         // postBatch/final root before dropping the failure verdict.
-        pool.resolve_below_cursor(10);
+        assert!(pool.take_pending_at_or_below_cursor(10).is_none());
         let batch = pool.take_failed_for_recovery(10).expect("failed entry");
         assert_eq!(batch.sync_height, 10);
         assert_eq!(batch.expected_final_state, root(0xa));

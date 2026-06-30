@@ -5,7 +5,7 @@
 # union of scripts/devnet-test.sh (INBOUND) and scripts/outbound-test-live.sh
 # (OUTBOUND): it stands up BOTH targets/proxies, then submits ONE inbound
 # user tx AND ONE outbound user tx BACK-TO-BACK so the composer drains both
-# in the SAME per-slot `pop_n(MAX_USER_TXS_PER_BUNDLE=3)` → ONE mixed Sync
+# in the SAME per-slot `pop_n(MAX_USER_TXS_PER_BUNDLE=10)` → ONE mixed Sync
 # block (the on-chain analogue of crates/eez-node/tests/e2e_mixed.rs).
 #
 # What it proves (the live mirror of e2e_mixed's A2b acceptance):
@@ -20,7 +20,7 @@
 #      - inbound : L1-chain-id (10200) tx `to=L1_setter_proxy setValue(N1)`,
 #        signed by EEZ_USER_KEY (L1-funded), POSTed to the B0 interceptor
 #        :18649 — the wallet-correct L1→L2 front;
-#      - outbound: L2-chain-id (1) tx `to=P setValue(N2)`, signed by HH_KEY_2
+#      - outbound: L2-chain-id tx `to=P setValue(N2)`, signed by HH_KEY_2
 #        (L2-funded), POSTed to the L2 ingress :18688;
 #   3. verify BOTH settle with zero divergence:
 #      - L2 `Value.value() == N1` (inbound delivered on L2),
@@ -36,12 +36,12 @@
 #
 # ── HOW BOTH LAND IN ONE SYNC SLOT (the only non-obvious part) ────────
 # The composer holds cross-chain txs in a HeldPool and drains it ONCE per
-# Sync slot (~L1-anchored ~5s cadence) via `pop_n(MAX_USER_TXS_PER_BUNDLE=3)`
-# — up to 3 held txs are bundled into ONE compose_via_evm_composer call, i.e.
+# Sync slot (~L1-anchored ~5s cadence) via `pop_n(MAX_USER_TXS_PER_BUNDLE=10)`
+# — up to 10 held txs are bundled into ONE compose_via_evm_composer call, i.e.
 # ONE Sync block (eez-composer/src/composer.rs). Submitting the inbound and
 # outbound user txs BACK-TO-BACK (curl, curl — no sleep, ~hundreds of ms
 # apart) puts BOTH in the HeldPool well inside one ~5s slot, so the next
-# drain pops BOTH (2 <= 3) into the same block. This is exactly e2e_mixed.rs's
+# drain pops BOTH (2 <= 10) into the same block. This is exactly e2e_mixed.rs's
 # `tokio::join!` concurrent submit; here we just fire the two curls with no
 # gap. (If they ever straddle a slot boundary the PASS gate fails on the
 # "same sync_height" check, which is the correct, honest negative.)
@@ -67,7 +67,7 @@ export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
 
 # ── Endpoints (the running node) ─────────────────────────────────────
 L1_RPC="${L1_RPC:-http://localhost:18645}"          # embedded chiado L1 (chain 10200)
-L2_RPC="${L2_RPC:-http://localhost:18688}"          # L2 (chain 1)
+L2_RPC="${L2_RPC:-http://localhost:18688}"          # L2
 B0_RPC="${B0_RPC:-http://localhost:18649}"          # B0 L1→L2 interceptor (inbound front)
 # Where each direction's USER tx is submitted:
 #   - INBOUND  → B0 (:18649): the wallet-correct L1→L2 front. It forwards
@@ -86,6 +86,8 @@ NODE_CONTAINER="${NODE_CONTAINER:-eez-node-chiado}"
 # or vice-versa) is caught. INBOUND sets the L2 Value; OUTBOUND sets the L1.
 INBOUND_VALUE="${INBOUND_VALUE:-$(( (RANDOM % 400) + 100 ))}"
 OUTBOUND_VALUE="${OUTBOUND_VALUE:-$(( (RANDOM % 400) + 600 ))}"
+INBOUND_COUNT="${MIXED_INBOUND_COUNT:-1}"
+OUTBOUND_COUNT="${MIXED_OUTBOUND_COUNT:-1}"
 MAINNET_ROLLUP_ID="${MAINNET_ROLLUP_ID:-0}"          # outbound L1 target's rollup id
 VALUE_INITIAL="${VALUE_INITIAL:-0}"                  # fresh L2 Value() ctor arg
 SETTLE_WAIT_SECS="${MIXED_SETTLE_WAIT_SECS:-360}"
@@ -130,10 +132,22 @@ lc() { echo "$1" | tr 'A-Z' 'a-z' | tr -d '[:space:]'; }
 # strip a captured value's surrounding whitespace / ANSI.
 trim() { echo "$1" | tr -d '[:space:]'; }
 
+# Foundry may render large decimal returns as "31002 [3.1e4]"; comparisons
+# need the canonical integer token.
+first_field() { printf '%s\n' "$1" | awk 'NF { print $1; exit }'; }
+
+is_u16() { [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 10 )); }
+
 # ── Prereqs ──────────────────────────────────────────────────────────
 for t in cast forge jq docker curl; do command -v "$t" >/dev/null || { echo "$t not in PATH"; exit 1; }; done
 [[ -f "$REPO/deployments.env" ]] || { echo "deployments.env missing — run make deploy-protocol first"; exit 1; }
 docker inspect "$NODE_CONTAINER" >/dev/null 2>&1 || { echo "container '$NODE_CONTAINER' not found — is the node up?"; exit 1; }
+is_u16 "$INBOUND_COUNT" || { echo "MIXED_INBOUND_COUNT must be an integer in [1,10]"; exit 1; }
+is_u16 "$OUTBOUND_COUNT" || { echo "MIXED_OUTBOUND_COUNT must be an integer in [1,10]"; exit 1; }
+TOTAL_USER_TXS=$(( INBOUND_COUNT + OUTBOUND_COUNT ))
+(( TOTAL_USER_TXS <= 10 )) || { echo "mixed tx count exceeds composer bundle limit: $TOTAL_USER_TXS > 10"; exit 1; }
+FINAL_INBOUND_VALUE=$(( INBOUND_VALUE + INBOUND_COUNT - 1 ))
+FINAL_OUTBOUND_VALUE=$(( OUTBOUND_VALUE + OUTBOUND_COUNT - 1 ))
 L2_UP=$(cast block-number --rpc-url "$L2_RPC" 2>/dev/null || echo "")
 [[ -n "$L2_UP" ]] || { echo "L2 RPC $L2_RPC not reachable"; exit 1; }
 L1_UP=$(cast block-number --rpc-url "$L1_RPC" 2>/dev/null || echo "")
@@ -151,8 +165,8 @@ echo "    L1 (internal) = $L1_RPC  (chain $L1_CHAIN_ID, head $L1_UP)"
 echo "    L2            = $L2_RPC  (chain $L2_CHAIN_ID, head $L2_UP)"
 echo "    B0 inbound    = $B0_RPC  (L1→L2 interceptor front)"
 echo "    registry      = $EEZ_REGISTRY_ADDRESS  rollupId=$EEZ_ROLLUP_ID"
-echo "    inbound user  = $INBOUND_USER_ADDR (L1 nonce)  → L2 Value := $INBOUND_VALUE"
-echo "    outbound user = $HH_ADDR_2 (L2 nonce)  → L1 Value := $OUTBOUND_VALUE"
+echo "    inbound user  = $INBOUND_USER_ADDR (L1 nonce)  → $INBOUND_COUNT tx(s), L2 Value final := $FINAL_INBOUND_VALUE"
+echo "    outbound user = $HH_ADDR_2 (L2 nonce)  → $OUTBOUND_COUNT tx(s), L1 Value final := $FINAL_OUTBOUND_VALUE"
 echo "    inbound submit→$INBOUND_SUBMIT_RPC   outbound submit→$OUTBOUND_SUBMIT_RPC"
 
 [[ "$L1_CHAIN_ID" != "$L2_CHAIN_ID" ]] || { echo "L1 and L2 chain ids equal ($L1_CHAIN_ID) — inbound classifier cannot fire"; exit 1; }
@@ -271,40 +285,69 @@ fi
 # two curls with NO sleep so both are in the HeldPool inside one ~5s slot.
 
 echo
-echo "==> building both user txs"
-# INBOUND: L1-chain-id tx, to=L1 setter proxy, setValue(N1), nonce from L1.
+echo "==> building mixed user txs ($INBOUND_COUNT inbound + $OUTBOUND_COUNT outbound)"
+# INBOUND: L1-chain-id txs, to=L1 setter proxy, setValue(N), nonces from L1.
 INBOUND_NONCE=$(retry cast nonce "$INBOUND_USER_ADDR" --rpc-url "$L1_RPC")
-INBOUND_RAW=$(cast mktx --chain-id "$L1_CHAIN_ID" --private-key "$EEZ_USER_KEY" --nonce "$INBOUND_NONCE" \
-    --gas-limit 600000 --gas-price 2000000000 --priority-gas-price 1000000000 \
-    "$SETTER_PROXY" 'setValue(uint256)' "$INBOUND_VALUE" 2>&1) || true
-[[ "$INBOUND_RAW" =~ ^0x[0-9a-fA-F]+$ ]] || { echo "    ✗ inbound mktx failed: $INBOUND_RAW"; exit 1; }
-INBOUND_TX_HASH=$(cast keccak "$INBOUND_RAW")
-echo "    inbound  : nonce=$INBOUND_NONCE (L1) to=$SETTER_PROXY setValue($INBOUND_VALUE) hash=$INBOUND_TX_HASH"
+declare -a INBOUND_RAWS=()
+declare -a INBOUND_HASHES=()
+for (( i=0; i<INBOUND_COUNT; i++ )); do
+    VALUE=$(( INBOUND_VALUE + i ))
+    NONCE=$(( INBOUND_NONCE + i ))
+    RAW=$(cast mktx --chain-id "$L1_CHAIN_ID" --private-key "$EEZ_USER_KEY" --nonce "$NONCE" \
+        --gas-limit 600000 --gas-price 2000000000 --priority-gas-price 1000000000 \
+        "$SETTER_PROXY" 'setValue(uint256)' "$VALUE" 2>&1) || true
+    [[ "$RAW" =~ ^0x[0-9a-fA-F]+$ ]] || { echo "    ✗ inbound[$i] mktx failed: $RAW"; exit 1; }
+    HASH=$(cast keccak "$RAW")
+    INBOUND_RAWS+=("$RAW")
+    INBOUND_HASHES+=("$HASH")
+    echo "    inbound[$i] : nonce=$NONCE (L1) to=$SETTER_PROXY setValue($VALUE) hash=$HASH"
+done
 
-# OUTBOUND: L2-chain-id tx, to=P, setValue(N2), nonce from L2 (AFTER any
+# OUTBOUND: L2-chain-id txs, to=P, setValue(N), nonces from L2 (AFTER any
 # proxy-create mined — re-read here so it's the next free L2 nonce).
 OUTBOUND_NONCE=$(retry cast nonce "$HH_ADDR_2" --rpc-url "$L2_RPC")
-OUTBOUND_RAW=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_2" --nonce "$OUTBOUND_NONCE" \
-    --gas-limit 600000 --gas-price 1000000000 --priority-gas-price 1000000000 \
-    "$PROXY" 'setValue(uint256)' "$OUTBOUND_VALUE" 2>&1) || true
-[[ "$OUTBOUND_RAW" =~ ^0x[0-9a-fA-F]+$ ]] || { echo "    ✗ outbound mktx failed: $OUTBOUND_RAW"; exit 1; }
-OUTBOUND_TX_HASH=$(cast keccak "$OUTBOUND_RAW")
-echo "    outbound : nonce=$OUTBOUND_NONCE (L2) to=$PROXY setValue($OUTBOUND_VALUE) hash=$OUTBOUND_TX_HASH"
+declare -a OUTBOUND_RAWS=()
+declare -a OUTBOUND_HASHES=()
+for (( i=0; i<OUTBOUND_COUNT; i++ )); do
+    VALUE=$(( OUTBOUND_VALUE + i ))
+    NONCE=$(( OUTBOUND_NONCE + i ))
+    RAW=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_2" --nonce "$NONCE" \
+        --gas-limit 600000 --gas-price 1000000000 --priority-gas-price 1000000000 \
+        "$PROXY" 'setValue(uint256)' "$VALUE" 2>&1) || true
+    [[ "$RAW" =~ ^0x[0-9a-fA-F]+$ ]] || { echo "    ✗ outbound[$i] mktx failed: $RAW"; exit 1; }
+    HASH=$(cast keccak "$RAW")
+    OUTBOUND_RAWS+=("$RAW")
+    OUTBOUND_HASHES+=("$HASH")
+    echo "    outbound[$i]: nonce=$NONCE (L2) to=$PROXY setValue($VALUE) hash=$HASH"
+done
 
 # Mark the log so the "same Sync slot" search only looks at lines AFTER
 # submission (avoids matching a prior run's armed line).
 refresh_log; LOG_LINES_BEFORE=$(wc -l < "$NODE_LOG")
 
 echo
-echo "==> submitting BOTH user txs BACK-TO-BACK (no sleep) → one Sync slot"
-INBOUND_RESP=$(curl -s -X POST "$INBOUND_SUBMIT_RPC" -H 'Content-Type: application/json' \
-    -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$INBOUND_RAW\"],\"id\":1}")
-OUTBOUND_RESP=$(curl -s -X POST "$OUTBOUND_SUBMIT_RPC" -H 'Content-Type: application/json' \
-    -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$OUTBOUND_RAW\"],\"id\":2}")
-echo "$INBOUND_RESP"  | grep -q '"error"' && echo "    ✗ inbound submit rejected → $INBOUND_RESP"   || echo "    ✓ inbound  held ($INBOUND_SUBMIT_RPC)"
-echo "$OUTBOUND_RESP" | grep -q '"error"' && echo "    ✗ outbound submit rejected → $OUTBOUND_RESP" || echo "    ✓ outbound held ($OUTBOUND_SUBMIT_RPC)"
-if echo "$INBOUND_RESP" | grep -q '"error"' || echo "$OUTBOUND_RESP" | grep -q '"error"'; then
-    echo "    ✗ a leg was rejected at submit — cannot form a mixed slot"; exit 1
+echo "==> submitting $TOTAL_USER_TXS user txs BACK-TO-BACK (no sleep) → one Sync slot"
+SUBMIT_ERRORS=0
+REQ_ID=1
+for (( i=0; i<TOTAL_USER_TXS; i++ )); do
+    if (( i < INBOUND_COUNT )); then
+        RESP=$(curl -s -X POST "$INBOUND_SUBMIT_RPC" -H 'Content-Type: application/json' \
+            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"${INBOUND_RAWS[$i]}\"],\"id\":$REQ_ID}")
+        echo "$RESP" | grep -q '"error"' \
+            && { echo "    ✗ inbound[$i] submit rejected → $RESP"; SUBMIT_ERRORS=1; } \
+            || echo "    ✓ inbound[$i] held ($INBOUND_SUBMIT_RPC)"
+    else
+        j=$(( i - INBOUND_COUNT ))
+        RESP=$(curl -s -X POST "$OUTBOUND_SUBMIT_RPC" -H 'Content-Type: application/json' \
+            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"${OUTBOUND_RAWS[$j]}\"],\"id\":$REQ_ID}")
+        echo "$RESP" | grep -q '"error"' \
+            && { echo "    ✗ outbound[$j] submit rejected → $RESP"; SUBMIT_ERRORS=1; } \
+            || echo "    ✓ outbound[$j] held ($OUTBOUND_SUBMIT_RPC)"
+    fi
+    REQ_ID=$(( REQ_ID + 1 ))
+done
+if (( SUBMIT_ERRORS != 0 )); then
+    echo "    ✗ at least one leg was rejected at submit — cannot form a mixed slot"; exit 1
 fi
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -313,14 +356,16 @@ fi
 
 # ── (a) BOTH effects: L2 Value == N1 AND L1 Value == N2 ──────────────
 echo
-echo "==> waiting up to ${SETTLE_WAIT_SECS}s for BOTH legs: L2 Value==$INBOUND_VALUE AND L1 Value==$OUTBOUND_VALUE"
+echo "==> waiting up to ${SETTLE_WAIT_SECS}s for BOTH legs: L2 Value==$FINAL_INBOUND_VALUE AND L1 Value==$FINAL_OUTBOUND_VALUE"
 SETTLE_OK=0; wait_end=$(( SECONDS + SETTLE_WAIT_SECS )); last_line=""
 while (( SECONDS < wait_end )); do
-    L2VV=$(cast call "$L2_VALUE_ADDRESS" 'value()(uint256)' --rpc-url "$L2_RPC" 2>/dev/null || echo "")
-    L1VV=$(cast call "$L1_VALUE_ADDRESS" 'value()(uint256)' --rpc-url "$L1_RPC" 2>/dev/null || echo "")
-    line="    L2 Value=${L2VV:-?} (target $INBOUND_VALUE)  |  L1 Value=${L1VV:-?} (target $OUTBOUND_VALUE)  (elapsed ${SECONDS}s)"
+    L2VV_RAW=$(cast call "$L2_VALUE_ADDRESS" 'value()(uint256)' --rpc-url "$L2_RPC" 2>/dev/null || echo "")
+    L1VV_RAW=$(cast call "$L1_VALUE_ADDRESS" 'value()(uint256)' --rpc-url "$L1_RPC" 2>/dev/null || echo "")
+    L2VV=$(first_field "$L2VV_RAW")
+    L1VV=$(first_field "$L1VV_RAW")
+    line="    L2 Value=${L2VV_RAW:-?} (target $FINAL_INBOUND_VALUE)  |  L1 Value=${L1VV_RAW:-?} (target $FINAL_OUTBOUND_VALUE)  (elapsed ${SECONDS}s)"
     [[ "$line" != "$last_line" ]] && { echo "$line"; last_line="$line"; }
-    if [[ "$L2VV" == "$INBOUND_VALUE" && "$L1VV" == "$OUTBOUND_VALUE" ]]; then
+    if [[ "$L2VV" == "$FINAL_INBOUND_VALUE" && "$L1VV" == "$FINAL_OUTBOUND_VALUE" ]]; then
         SETTLE_OK=1; echo "    ✓ BOTH legs settled (L2 inbound + L1 outbound)"; break
     fi
     sleep 5
@@ -398,20 +443,23 @@ sed -i 's/\x1b\[[0-9;]*m//g' "$POST_LOG" 2>/dev/null || true
 
 SAME_SLOT_OK=0; MIXED_SYNC_HEIGHT=""
 
-# (i) composer: an armed/dispatched line carrying entry_count>=2.
-COMPOSER_LINE=$(grep -E 'eez\.composer\.(deferred\.armed|bundle\.dispatched)|deferred post armed|rich bundle dispatched' "$POST_LOG" 2>/dev/null \
-    | grep -E 'entry_count=[2-9]|entry_count=[0-9]{2,}' | head -1 || true)
+# (i) composer: a build/armed/dispatched line carrying enough held txs/entries.
+MIN_ENTRY_COUNT=$TOTAL_USER_TXS
+COMPOSER_LINE=$(grep -E 'eez\.composer\.(deferred\.armed|bundle\.dispatched)|deferred post armed|rich bundle dispatched|built Sync block carrying' "$POST_LOG" 2>/dev/null \
+    | awk -v min="$MIN_ENTRY_COUNT" '
+        match($0, /(entry_count|tx_count)=([0-9]+)/, m) && m[2] >= min { print; exit }
+    ' || true)
 if [[ -n "$COMPOSER_LINE" ]]; then
-    MIXED_SYNC_HEIGHT=$(echo "$COMPOSER_LINE" | grep -oE 'sync_height=[0-9]+' | grep -oE '[0-9]+' | head -1)
-    EC=$(echo "$COMPOSER_LINE" | grep -oE 'entry_count=[0-9]+' | grep -oE '[0-9]+' | head -1)
-    echo "    ✓ composer: ONE Sync slot armed with entry_count=$EC (>=2) at sync_height=${MIXED_SYNC_HEIGHT:-?}"
+    MIXED_SYNC_HEIGHT=$(echo "$COMPOSER_LINE" | grep -oE 'sync_height=[0-9]+' | grep -oE '[0-9]+' | head -1 || true)
+    EC=$(echo "$COMPOSER_LINE" | grep -oE '(entry_count|tx_count)=[0-9]+' | grep -oE '[0-9]+' | head -1 || true)
+    echo "    ✓ composer: ONE Sync slot carried count=$EC (>=$MIN_ENTRY_COUNT) at sync_height=${MIXED_SYNC_HEIGHT:-?}"
 else
-    echo "    ⚠ composer: no single armed/dispatched line with entry_count>=2 found post-submit"
+    echo "    ⚠ composer: no single build/armed/dispatched line with count>=$MIN_ENTRY_COUNT found post-submit"
 fi
 
 # (ii) deriver: one system_txs_built line with BOTH outbound>=1 AND inbound>=1.
 DERIVER_LINE=$(grep -E 'eez\.deriver\.reconcile\.system_txs_built|built outbound load \+ inbound delivery system txs' "$POST_LOG" 2>/dev/null \
-    | grep -E 'outbound=[1-9]' | grep -E 'inbound=[1-9]' | head -1 || true)
+    | awk -v ob="$OUTBOUND_COUNT" -v ib="$INBOUND_COUNT" 'match($0, /outbound=([0-9]+)/, o) && match($0, /inbound=([0-9]+)/, i) && o[1] >= ob && i[1] >= ib { print; exit }' || true)
 if [[ -n "$DERIVER_LINE" ]]; then
     OBC=$(echo "$DERIVER_LINE" | grep -oE 'outbound=[0-9]+' | grep -oE '[0-9]+' | head -1)
     IBC=$(echo "$DERIVER_LINE" | grep -oE 'inbound=[0-9]+'  | grep -oE '[0-9]+' | head -1)
@@ -437,8 +485,8 @@ for ok in "$SETTLE_OK" "$RECON_OK" "$DIV_OK" "$OUT_MARKERS_OK" "$SAME_SLOT_OK"; 
 done
 if [[ "$ALL_OK" == "1" ]]; then
     echo "==> MIXED TEST PASSED"
-    echo "    inbound : L2 Value @ $L2_VALUE_ADDRESS == $INBOUND_VALUE (delivered L1→L2)"
-    echo "    outbound: L1 Value @ $L1_VALUE_ADDRESS == $OUTBOUND_VALUE (executed L2→L1)"
+    echo "    inbound : L2 Value @ $L2_VALUE_ADDRESS == $FINAL_INBOUND_VALUE (delivered $INBOUND_COUNT L1→L2 txs)"
+    echo "    outbound: L1 Value @ $L1_VALUE_ADDRESS == $FINAL_OUTBOUND_VALUE (executed $OUTBOUND_COUNT L2→L1 txs)"
     echo "    both composed into Sync slot height ${MIXED_SYNC_HEIGHT:-<see deriver line>}; L1↔L2 roots reconciled; zero divergence"
     exit 0
 else

@@ -1000,7 +1000,7 @@ fn extract_inbounds(block_rlp: &[u8]) -> Vec<eez_evm::entries::DecodedInbound> {
 /// the composer assembles the postBatch's deferred entries and the Sync block's
 /// `executeIncomingCrossChainCall` deliveries from the SAME survivor set in ONE
 /// `compose_sync_slot` (`build_cross_chain_sync_pairs` + the postBatch share
-/// `pending_in`), and caps each bundle at `MAX_USER_TXS_PER_BUNDLE = 3` so a
+/// `pending_in`), and caps each bundle at `MAX_USER_TXS_PER_BUNDLE = 10` so a
 /// bundle is 100% atomic (a backlog spills to the next slot, never a partial
 /// post). So the window the prover RE-EXECUTES always seals exactly M deliveries
 /// for M deferred entries — an M:M bijection by construction. L1-runtime partial
