@@ -20,46 +20,58 @@ use eez_driver::{BlockCommitterHandle, ForkchoiceOutcome};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_primitives_traits::SealedHeader;
 use reth_storage_api::{BlockIdReader, HeaderProvider};
+use thiserror::Error;
 use tracing::{Level, event};
 
-use crate::error::FollowerError;
-
-/// Keepalive cadence — re-publish the current forkchoice state so reth's
-/// engine view doesn't drift during quiet periods.
+/// Keepalive cadence: re-publish the current forkchoice state so reth's
+/// engine view does not drift during quiet periods.
 const FCU_REFRESH: Duration = Duration::from_secs(1);
 
 /// Upper bound on the candidate→safe ancestry walk. Beyond this, a fully
 /// local gap is treated as unverifiable rather than scanned unboundedly.
 const MAX_ANCESTRY_WALK: u64 = 1024;
 
+#[derive(Debug, Error)]
+enum FollowerError {
+    /// Sequencer JSON-RPC transport or decode failure.
+    #[error("sequencer RPC error: {0}")]
+    Rpc(String),
+
+    /// Local chain provider failure while validating a candidate head.
+    #[error("local provider error: {0}")]
+    Provider(String),
+
+    /// Shared driver/committer error.
+    #[error("driver error: {0}")]
+    Driver(String),
+}
+
 /// Verdict of checking a candidate head against the local safe anchor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SafeCompat {
     /// The candidate provably descends from the safe block.
     Extends,
-    /// The candidate provably does NOT descend from the safe block.
+    /// The candidate provably does not descend from the safe block.
     Conflicts,
-    /// Ancestry is not locally known (not yet synced) — optimistic.
+    /// Ancestry is not locally known yet, so keep it optimistic.
     Unverifiable,
 }
 
 /// Polls the sequencer RPC for unsafe heads and routes every engine call
 /// through the shared [`BlockCommitterHandle`].
 #[derive(Debug)]
-pub(crate) struct Follower<P> {
+pub(crate) struct UnsafeHeadFollower<P> {
     committer: BlockCommitterHandle<EthEngineTypes>,
     sequencer_rpc: RootProvider,
-    /// Local chain reader — resolves the current safe anchor and the
+    /// Local chain reader: resolves the current safe anchor and the
     /// candidate head's ancestry for the compatibility check.
     local: P,
-    /// Cadence for polling the sequencer RPC for new unsafe heads. The
-    /// branch's eez-driver has no lightweight scheduler type (slot-based
-    /// scheduling replaced it), so the follower drives its own interval.
+    /// Cadence for polling the sequencer RPC for new unsafe heads.
     poll_interval: Duration,
     last_head: Option<alloy_primitives::B256>,
 }
 
-impl<P> Follower<P>
+impl<P> UnsafeHeadFollower<P>
 where
     P: HeaderProvider<Header = alloy_consensus::Header> + BlockIdReader,
 {
@@ -86,7 +98,7 @@ where
                 _ = poll.tick() => {
                     if let Err(err) = self.advance().await {
                         event!(
-                            name: "eez.follower.advance.failed",
+                            name: "eez.node.follower.advance.failed",
                             Level::WARN,
                             error = %err,
                             "sequencer unsafe-head advance failed; will retry",
@@ -96,7 +108,7 @@ where
                 _ = fcu_interval.tick() => {
                     if let Err(err) = self.committer.refresh_forkchoice().await {
                         event!(
-                            name: "eez.follower.fcu_refresh.failed",
+                            name: "eez.node.follower.fcu_refresh.failed",
                             Level::WARN,
                             error = %err,
                             "forkchoice refresh failed",
@@ -115,7 +127,7 @@ where
             .map_err(|e| FollowerError::Rpc(e.to_string()))?
         else {
             event!(
-                name: "eez.follower.block.not_yet_produced",
+                name: "eez.node.follower.block.not_yet_produced",
                 Level::DEBUG,
                 "sequencer reports no latest block yet",
             );
@@ -132,12 +144,11 @@ where
         // L1-derived safe anchor before they reach the engine.
         if check_extends_safe(&self.local, &block.header.inner, hash)? == SafeCompat::Conflicts {
             event!(
-                name: "eez.follower.head.conflicts_safe",
+                name: "eez.node.follower.head.conflicts_safe",
                 Level::WARN,
                 block.number = number,
                 block.hash = %hash,
-                "sequencer head does not descend from the L1-derived safe block (stale or \
-                 race-losing branch); skipping",
+                "sequencer head does not descend from the L1-derived safe block; skipping",
             );
             return Ok(());
         }
@@ -147,7 +158,7 @@ where
             Ok(ForkchoiceOutcome::Valid) => {
                 self.last_head = Some(hash);
                 event!(
-                    name: "eez.follower.head.advanced",
+                    name: "eez.node.follower.head.advanced",
                     Level::INFO,
                     block.number = number,
                     block.hash = %hash,
@@ -157,7 +168,7 @@ where
             }
             Ok(ForkchoiceOutcome::Syncing) => {
                 event!(
-                    name: "eez.follower.head.syncing",
+                    name: "eez.node.follower.head.syncing",
                     Level::INFO,
                     block.number = number,
                     block.hash = %hash,
@@ -167,11 +178,11 @@ where
             }
             Ok(ForkchoiceOutcome::InvalidState) => {
                 event!(
-                    name: "eez.follower.head.inconsistent",
+                    name: "eez.node.follower.head.inconsistent",
                     Level::WARN,
                     block.number = number,
                     block.hash = %hash,
-                    "sequencer head is incompatible with current L1-derived safe/finalized anchors; dropping unsafe head",
+                    "sequencer head is incompatible with current L1-derived anchors; dropping unsafe head",
                 );
                 Ok(())
             }
@@ -204,7 +215,7 @@ where
         hash: safe_hash,
     } = safe;
 
-    // A head at the safe height must BE the safe block; below it,
+    // A head at the safe height must be the safe block; below it,
     // it can never extend it.
     if candidate.number == safe_number {
         return Ok(if candidate_hash == safe_hash {
