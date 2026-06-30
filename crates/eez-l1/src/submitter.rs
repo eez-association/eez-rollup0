@@ -34,7 +34,7 @@ const TARGET_WAIT_BUDGET: Duration = Duration::from_secs(30);
 const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Initial block span for historical log scans. Wide catch-up gaps are
 /// split before hitting RPCs that reject long `eth_getLogs` ranges.
-const LOG_SCAN_CHUNK_BLOCKS: u64 = 2_000;
+pub const LOG_SCAN_CHUNK_BLOCKS: u64 = 2_000;
 
 /// L1 block offset for [`BundleTarget::NextBlock`]. slack=2 (over the
 /// minimal latest+1) gives a one-block cushion for when our local
@@ -897,12 +897,88 @@ async fn fetch_log_transaction(
 
 #[cfg(test)]
 mod tests {
-    use super::attribute_settlement;
+    use super::{LOG_SCAN_CHUNK_BLOCKS, attribute_settlement, initial_log_scan_ranges};
     use alloy_primitives::B256;
     use std::collections::HashSet;
 
     fn settled(roots: &[B256]) -> HashSet<B256> {
         roots.iter().copied().collect()
+    }
+
+    #[test]
+    fn initial_log_scan_ranges_stack_order() {
+        let c = LOG_SCAN_CHUNK_BLOCKS;
+        struct Case {
+            name: &'static str,
+            from: u64,
+            to: u64,
+            stored_stack: Vec<(u64, u64)>,
+            pop_order: Vec<(u64, u64)>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "single block",
+                from: 10,
+                to: 10,
+                stored_stack: vec![(10, 10)],
+                pop_order: vec![(10, 10)],
+            },
+            Case {
+                name: "exactly one chunk",
+                from: 1,
+                to: c,
+                stored_stack: vec![(1, c)],
+                pop_order: vec![(1, c)],
+            },
+            Case {
+                name: "one block past a chunk",
+                from: 1,
+                to: c + 1,
+                stored_stack: vec![(c + 1, c + 1), (1, c)],
+                pop_order: vec![(1, c), (c + 1, c + 1)],
+            },
+            Case {
+                name: "nonzero start exact chunks",
+                from: 10,
+                to: 10 + 2 * c - 1,
+                stored_stack: vec![(10 + c, 10 + 2 * c - 1), (10, 10 + c - 1)],
+                pop_order: vec![(10, 10 + c - 1), (10 + c, 10 + 2 * c - 1)],
+            },
+            Case {
+                name: "multiple chunks with partial tail",
+                from: 42,
+                to: 42 + 2 * c + 6,
+                stored_stack: vec![
+                    (42 + 2 * c, 42 + 2 * c + 6),
+                    (42 + c, 42 + 2 * c - 1),
+                    (42, 42 + c - 1),
+                ],
+                pop_order: vec![
+                    (42, 42 + c - 1),
+                    (42 + c, 42 + 2 * c - 1),
+                    (42 + 2 * c, 42 + 2 * c + 6),
+                ],
+            },
+            Case {
+                name: "near u64 max does not overflow",
+                from: u64::MAX - 1,
+                to: u64::MAX,
+                stored_stack: vec![(u64::MAX - 1, u64::MAX)],
+                pop_order: vec![(u64::MAX - 1, u64::MAX)],
+            },
+        ];
+
+        for case in cases {
+            let mut ranges = initial_log_scan_ranges(case.from, case.to);
+            assert_eq!(ranges, case.stored_stack, "{}", case.name);
+
+            let mut pop_order = Vec::new();
+            while let Some(range) = ranges.pop() {
+                pop_order.push(range);
+            }
+            assert_eq!(pop_order, case.pop_order, "{}", case.name);
+        }
     }
 
     /// The bug this fix closes: idle `A→A` and rich `A→B` share an L1 block;
