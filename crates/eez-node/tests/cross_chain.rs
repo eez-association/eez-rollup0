@@ -10,12 +10,14 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, U256, address};
 use alloy_sol_types::SolCall;
+use anyhow::bail;
 
 mod common;
 use common::{
-    ANVIL_KEY_2, ANVIL_KEY_3, DEV_CHAIN_ID, DevnetCfg, IValue, NodeHandle, create_cross_chain_proxy,
-    deploy_protocol_dev, deploy_value_l2, l2_balance, l2_value, pending_nonce, receipt_ok,
-    signer_address, state_root, submit_to_l2_ingress, wait_for, wait_for_l2_rpc,
+    ANVIL_KEY_2, ANVIL_KEY_3, DEV_CHAIN_ID, DevnetCfg, IValue, NodeHandle,
+    create_cross_chain_proxy, deploy_protocol_dev, deploy_value_l2, l2_balance, l2_value,
+    pending_nonce, receipt_ok, signer_address, state_root, submit_to_l2_ingress, wait_for,
+    wait_for_l2_rpc,
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(90);
@@ -42,21 +44,38 @@ async fn cross_chain_setter_deposit_over_bundle() {
     let dep = deploy_protocol_dev(&l1_rpc, cfg.deployer_key, cfg.initial_state)
         .await
         .expect("deploy protocol onto embedded L1");
-    assert_eq!(dep.eez_address, cfg.eez_address, "EEZ address deterministic");
+    assert_eq!(
+        dep.eez_address, cfg.eez_address,
+        "EEZ address deterministic"
+    );
     assert_eq!(dep.rollup_id, cfg.rollup_id, "first rollup id");
 
-    wait_for_l2_rpc(&node.l2_rpc_url(), SETUP_TIMEOUT).await.unwrap();
+    wait_for_l2_rpc(&node.l2_rpc_url(), SETUP_TIMEOUT)
+        .await
+        .unwrap();
     let value = deploy_value_l2(&node.l2_rpc_url(), value_deployer, U256::from(5u64))
         .await
         .expect("deploy Value on L2");
     assert_eq!(value, value_addr, "Value address deterministic");
 
-    let setter_proxy = create_cross_chain_proxy(&l1_rpc, cfg.deployer_key, cfg.eez_address, value_addr, cfg.rollup_id)
-        .await
-        .expect("create setter proxy");
-    let deposit_proxy = create_cross_chain_proxy(&l1_rpc, cfg.deployer_key, cfg.eez_address, recipient, cfg.rollup_id)
-        .await
-        .expect("create deposit proxy");
+    let setter_proxy = create_cross_chain_proxy(
+        &l1_rpc,
+        cfg.deployer_key,
+        cfg.eez_address,
+        value_addr,
+        cfg.rollup_id,
+    )
+    .await
+    .expect("create setter proxy");
+    let deposit_proxy = create_cross_chain_proxy(
+        &l1_rpc,
+        cfg.deployer_key,
+        cfg.eez_address,
+        recipient,
+        cfg.rollup_id,
+    )
+    .await
+    .expect("create deposit proxy");
 
     // L1-signed txs targeting proxies, POSTed to the L2 ingress.
     let user = ANVIL_KEY_2;
@@ -67,35 +86,68 @@ async fn cross_chain_setter_deposit_over_bundle() {
 
     let mut nonce = pending_nonce(&l1_rpc, user).await.unwrap();
     let mut hashes = Vec::new();
-    for i in 0..2 {
-        let set_call = IValue::setValueCall { v: U256::from(setters[i]) }.abi_encode();
+    for (set_v, dep_v) in setters.iter().zip(deposits.iter()) {
+        let set_call = IValue::setValueCall {
+            v: U256::from(*set_v),
+        }
+        .abi_encode();
         hashes.push(
-            submit_to_l2_ingress(&node.l2_rpc_url(), user, DEV_CHAIN_ID, nonce, setter_proxy, U256::ZERO, set_call, 600_000)
-                .await
-                .unwrap(),
+            submit_to_l2_ingress(
+                &node.l2_rpc_url(),
+                user,
+                DEV_CHAIN_ID,
+                nonce,
+                setter_proxy,
+                U256::ZERO,
+                set_call,
+                600_000,
+            )
+            .await
+            .unwrap(),
         );
         nonce += 1;
         hashes.push(
-            submit_to_l2_ingress(&node.l2_rpc_url(), user, DEV_CHAIN_ID, nonce, deposit_proxy, U256::from(deposits[i]), Vec::new(), 600_000)
-                .await
-                .unwrap(),
+            submit_to_l2_ingress(
+                &node.l2_rpc_url(),
+                user,
+                DEV_CHAIN_ID,
+                nonce,
+                deposit_proxy,
+                U256::from(*dep_v),
+                Vec::new(),
+                600_000,
+            )
+            .await
+            .unwrap(),
         );
         nonce += 1;
     }
 
+    // Each cross-chain op must land on L1 and succeed (a revert means the
+    // composer's bundle settled but the source tx itself failed).
     for h in &hashes {
         let h = *h;
         let l1 = l1_rpc.clone();
         wait_for(SETTLE_TIMEOUT, move || {
             let l1 = l1.clone();
-            async move { Ok(receipt_ok(&l1, h).await?.map(|ok| assert_ok(ok))) }
+            async move {
+                match receipt_ok(&l1, h).await? {
+                    Some(true) => Ok(Some(())),
+                    Some(false) => bail!("cross-chain user tx {h} reverted on L1"),
+                    None => Ok(None),
+                }
+            }
         })
         .await
         .expect("cross-chain user tx did not land on L1");
     }
 
     let final_value = l2_value(&node.l2_rpc_url(), value_addr).await.unwrap();
-    assert_eq!(final_value, U256::from(*setters.last().unwrap()), "setter converged");
+    assert_eq!(
+        final_value,
+        U256::from(*setters.last().unwrap()),
+        "setter converged"
+    );
 
     let recipient_after = l2_balance(&node.l2_rpc_url(), recipient).await.unwrap();
     assert_eq!(
@@ -134,8 +186,4 @@ async fn cross_chain_setter_deposit_over_bundle() {
         "composer must not fall back to eth_sendRawTransaction",
     );
     node.assert_no_process_death();
-}
-
-fn assert_ok(ok: bool) {
-    assert!(ok, "cross-chain user tx reverted on L1");
 }

@@ -1318,9 +1318,15 @@ fn sign_eip1559(
         chain_id,
         nonce,
         gas_limit,
-        max_fee_per_gas: 2_000_000_000,
+        // Generous fee cap so txs stay includable as the composer's batches push
+        // base fee up; the 1 gwei priority stays below the composer's postBatch
+        // tip, so postBatch still orders ahead of user txs within an L1 block.
+        max_fee_per_gas: 100_000_000_000,
         max_priority_fee_per_gas: 1_000_000_000,
-        to: to.map_or(alloy_primitives::TxKind::Create, alloy_primitives::TxKind::Call),
+        to: to.map_or(
+            alloy_primitives::TxKind::Create,
+            alloy_primitives::TxKind::Call,
+        ),
         value,
         access_list: alloy_rpc_types_eth::AccessList::default(),
         input: input.into(),
@@ -1377,7 +1383,17 @@ pub async fn deploy_raw(
     data.extend_from_slice(&constructor_args);
 
     let nonce = pending_nonce(rpc_url, key).await?;
-    let hash = sign_send_raw(rpc_url, key, chain_id, nonce, None, U256::ZERO, data, 6_000_000).await?;
+    let hash = sign_send_raw(
+        rpc_url,
+        key,
+        chain_id,
+        nonce,
+        None,
+        U256::ZERO,
+        data,
+        6_000_000,
+    )
+    .await?;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let receipt = wait_for(Duration::from_secs(60), || {
         let provider = provider.clone();
@@ -1403,7 +1419,14 @@ pub async fn deploy_protocol_dev(
     let signer_addr = signer.address();
     let out = repo_root().join("contracts/out");
 
-    let eez_address = deploy_raw(l1_rpc, key, DEV_CHAIN_ID, &out.join("EEZ.sol/EEZ.json"), Vec::new()).await?;
+    let eez_address = deploy_raw(
+        l1_rpc,
+        key,
+        DEV_CHAIN_ID,
+        &out.join("EEZ.sol/EEZ.json"),
+        Vec::new(),
+    )
+    .await?;
     let provider = ProviderBuilder::new().connect_http(l1_rpc.parse()?);
     let deploy_block = provider.get_block_number().await?;
 
@@ -1426,7 +1449,14 @@ pub async fn deploy_protocol_dev(
         key,
         DEV_CHAIN_ID,
         &out.join("Rollup.sol/Rollup.json"),
-        (eez_address, signer_addr, U256::from(1u64), vec![mock_ps_address], vkeys).abi_encode_params(),
+        (
+            eez_address,
+            signer_addr,
+            U256::from(1u64),
+            vec![mock_ps_address],
+            vkeys,
+        )
+            .abi_encode_params(),
     )
     .await?;
 
@@ -1437,7 +1467,17 @@ pub async fn deploy_protocol_dev(
     }
     .abi_encode();
     let nonce = pending_nonce(l1_rpc, key).await?;
-    let hash = sign_send_raw(l1_rpc, key, DEV_CHAIN_ID, nonce, Some(eez_address), U256::ZERO, calldata, 1_000_000).await?;
+    let hash = sign_send_raw(
+        l1_rpc,
+        key,
+        DEV_CHAIN_ID,
+        nonce,
+        Some(eez_address),
+        U256::ZERO,
+        calldata,
+        1_000_000,
+    )
+    .await?;
     let receipt = wait_for(Duration::from_secs(60), || {
         let provider = provider.clone();
         async move { Ok(provider.get_transaction_receipt(hash).await?) }
@@ -1464,7 +1504,14 @@ pub async fn deploy_value_l2(l2_rpc: &str, key: &str, initial: U256) -> Result<A
     let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
     let l2_chain_id = provider.get_chain_id().await?;
     let out = repo_root().join("contracts/out");
-    deploy_raw(l2_rpc, key, l2_chain_id, &out.join("Value.sol/Value.json"), initial.abi_encode()).await
+    deploy_raw(
+        l2_rpc,
+        key,
+        l2_chain_id,
+        &out.join("Value.sol/Value.json"),
+        initial.abi_encode(),
+    )
+    .await
 }
 
 /// Call `EEZ.createCrossChainProxy` on the L1 and return the deployed proxy
@@ -1485,7 +1532,17 @@ pub async fn create_cross_chain_proxy(
     }
     .abi_encode();
     let nonce = pending_nonce(l1_rpc, key).await?;
-    let hash = sign_send_raw(l1_rpc, key, DEV_CHAIN_ID, nonce, Some(eez), U256::ZERO, calldata, 2_000_000).await?;
+    let hash = sign_send_raw(
+        l1_rpc,
+        key,
+        DEV_CHAIN_ID,
+        nonce,
+        Some(eez),
+        U256::ZERO,
+        calldata,
+        2_000_000,
+    )
+    .await?;
     let provider = ProviderBuilder::new().connect_http(l1_rpc.parse()?);
     let receipt = wait_for(Duration::from_secs(60), || {
         let provider = provider.clone();
@@ -1521,7 +1578,10 @@ pub async fn l2_balance(l2_rpc: &str, addr: Address) -> Result<U256> {
 /// `None` if not yet mined, `Some(true)` if succeeded, `Some(false)` if reverted.
 pub async fn receipt_ok(rpc_url: &str, hash: alloy_primitives::TxHash) -> Result<Option<bool>> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    Ok(provider.get_transaction_receipt(hash).await?.map(|r| r.status()))
+    Ok(provider
+        .get_transaction_receipt(hash)
+        .await?
+        .map(|r| r.status()))
 }
 
 /// Precomputed config for the embedded-dev-L1 devnet.
@@ -1593,7 +1653,10 @@ impl DevnetCfg {
             ("EEZ_L1_HTTP_PORT", self.l1_http_port.to_string()),
             ("EEZ_L1_AUTH_PORT", self.l1_auth_port.to_string()),
             ("EEZ_L1_P2P_PORT", self.l1_p2p_port.to_string()),
-            ("EEZ_L1_CHAIN_PATH", self.l1_genesis.0.to_string_lossy().into_owned()),
+            (
+                "EEZ_L1_CHAIN_PATH",
+                self.l1_genesis.0.to_string_lossy().into_owned(),
+            ),
             ("EEZ_L1_POSTER_KEY", self.poster_key.to_string()),
             // MockECDSA is constructed with the deployer address as the authorized signer.
             ("EEZ_PROOF_SIGNER_KEY", self.deployer_key.to_string()),
@@ -1607,12 +1670,21 @@ impl DevnetCfg {
             ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
             ("EEZ_REGISTRY_ADDRESS", format!("{:#x}", self.eez_address)),
             ("EEZ_REGISTRY_DEPLOY_BLOCK", "0".to_string()),
-            ("EEZ_MOCK_PROOF_SYSTEM_ADDRESS", format!("{:#x}", self.mock_ps_address)),
-            ("EEZ_ROLLUP_MANAGER_ADDRESS", format!("{:#x}", self.rollup_manager_address)),
+            (
+                "EEZ_MOCK_PROOF_SYSTEM_ADDRESS",
+                format!("{:#x}", self.mock_ps_address),
+            ),
+            (
+                "EEZ_ROLLUP_MANAGER_ADDRESS",
+                format!("{:#x}", self.rollup_manager_address),
+            ),
             ("EEZ_ROLLUP_ID", self.rollup_id.to_string()),
             ("EEZ_COMPOSER_INTERVAL_SECS", "1".to_string()),
             ("EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES", "false".to_string()),
-            ("EEZ_L2_DATADIR", "/tmp/unused-overridden-by-flag".to_string()),
+            (
+                "EEZ_L2_DATADIR",
+                "/tmp/unused-overridden-by-flag".to_string(),
+            ),
             // INFO on our crates so bundle events are visible for assertions.
             (
                 "RUST_LOG",
