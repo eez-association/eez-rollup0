@@ -51,7 +51,8 @@ pub use sequencer::{ConfirmedHeadSource, EthAttributesBuilder, Sequencer};
 #[doc(inline)]
 pub use slot::{
     L1HeadInfo, L1HeadSource, NoCrossChainContent, ParentContext, SlotEvent, SlotKind,
-    SyncSlotBlock, SyncSlotComposer, SyncSlotComposerHandle, spawn_interval, spawn_l1_anchored,
+    SyncSlotBlock, SyncSlotComposer, SyncSlotComposerHandle, SyncSlotMode, spawn_interval,
+    spawn_l1_anchored,
 };
 #[doc(inline)]
 pub use submit::{BatchCandidate, BatchPolicy};

@@ -65,9 +65,13 @@ pub struct EmbeddedL1Config {
     /// Auth RPC port (engine API). Chiado mode: external lighthouse
     /// dials in here.
     pub auth_port: u16,
-    /// P2P + discovery port. Dev mode: disabled. Chiado mode: needed
-    /// for libp2p peering to chiado bootnodes.
+    /// P2P + discv4 discovery port. Dev mode: disabled. Chiado mode:
+    /// needed for libp2p peering to chiado bootnodes.
     pub p2p_port: u16,
+    /// discv5 UDP port. Separate from `p2p_port` so the embedded L1's
+    /// discv5 doesn't bind reth's default port and collide with another
+    /// node on the host.
+    pub discv5_port: u16,
     /// Path to JWT secret file. Required in chiado mode (shared with
     /// lighthouse via volume mount).
     pub jwtsecret: Option<PathBuf>,
@@ -134,12 +138,9 @@ fn build_network_rpc_args(cfg: &EmbeddedL1Config) -> Result<(NetworkArgs, RpcSer
         ..NetworkArgs::default()
     };
     network_args.discovery.port = cfg.p2p_port;
-    // discv5 binds a SEPARATE UDP port that is NOT derived from p2p_port — two
-    // embedded L1s on one host would both fall back to the DEFAULT discv5 port
-    // and collide ("discv5 … AddrInUse"). Remap it per-instance to p2p_port+1
-    // (a distinct UDP port from discv4's p2p_port). REQUIRED to run a second
-    // competing composer (its own embedded L1) on the same machine.
-    network_args.discovery.discv5_port = Some(cfg.p2p_port.saturating_add(1));
+    // discv5 binds a separate UDP port; keep it configurable so two embedded
+    // L1s on one host never collide on reth's default discv5 port.
+    network_args.discovery.discv5_port = Some(cfg.discv5_port);
     let rpc_args = RpcServerArgs {
         http: true,
         ws: true,

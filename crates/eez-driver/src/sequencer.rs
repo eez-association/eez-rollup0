@@ -43,7 +43,7 @@ use tokio::sync::mpsc;
 
 use crate::block_committer::BlockCommitterHandle;
 use crate::error::{DriverError, DriverResult};
-use crate::slot::{SlotEvent, SlotKind, SyncSlotComposerHandle};
+use crate::slot::{SlotEvent, SlotKind, SyncSlotComposerHandle, SyncSlotMode};
 use crate::submit::{BatchCandidate, BatchEmitter, BatchPolicy};
 use crate::timing::{RollupTiming, SlotComposition};
 
@@ -368,7 +368,11 @@ where
             SlotEvent::SyncSlot {
                 block_height,
                 timestamp,
-            } => self.advance_sync_slot(block_height, timestamp).await,
+                l1_head,
+            } => {
+                self.advance_sync_slot(block_height, timestamp, l1_head)
+                    .await
+            }
             SlotEvent::LiveTick {
                 sync_slot_block_height,
             } => {
@@ -453,6 +457,21 @@ where
         }
     }
 
+    /// True if the bundle (ready at ~`now + proof_time`) can't reach the
+    /// relay by `sync_slot_timestamp − submission_slack`, i.e. it would miss
+    /// the immediate next L1 slot. Steady state has headroom; fires only on
+    /// a late trigger, where the slot is deferred.
+    fn sync_block_misses_l1_slot(&self, sync_slot_timestamp: u64) -> bool {
+        let proof_ms = u64::try_from(self.timing.proof_time().as_millis()).unwrap_or(u64::MAX);
+        let slack_ms =
+            u64::try_from(self.timing.submission_slack().as_millis()).unwrap_or(u64::MAX);
+        let ready_ms = crate::slot::now_unix_millis().saturating_add(proof_ms);
+        let deadline_ms = sync_slot_timestamp
+            .saturating_mul(1_000)
+            .saturating_sub(slack_ms);
+        ready_ms > deadline_ms
+    }
+
     /// L1-anchored handler: read current head, compute the per-trigger
     /// Live/Future/Sync split via
     /// [`RollupTiming::per_trigger_composition`], produce accordingly.
@@ -460,11 +479,17 @@ where
         &mut self,
         sync_slot_block_height: u64,
         sync_slot_timestamp: u64,
+        l1_head: u64,
     ) -> DriverResult<()> {
         let head = self.committer.last_header().number();
-        let comp = self
-            .timing
-            .per_trigger_composition(head, sync_slot_block_height);
+        // Catchup ignores the speculative cap (a steady-state bound): a
+        // dropped pb heals by recomposing next trigger, which freezing to
+        // Idle would block. The steady (Slot) arm still enforces the cap.
+        let comp = self.timing.per_trigger_composition(
+            head,
+            sync_slot_block_height,
+            crate::MAX_BLOCKS_PER_CATCHUP,
+        );
 
         event!(
             name: "eez.sequencer.sync_slot.composition",
@@ -479,14 +504,9 @@ where
         match comp {
             SlotComposition::Idle => {}
             SlotComposition::Catchup { live } => {
-                // Behind wall clock: produce `live` Live blocks plus a
-                // terminal Sync block (the Sync block is what gates the
-                // postBatch — without it the trigger has no L1-canonical
-                // backing, invariant 1). Cap live+sync at
-                // MAX_BLOCKS_PER_CATCHUP so the L2 span fits one bundle.
-                let max_live = crate::MAX_BLOCKS_PER_CATCHUP.saturating_sub(1);
-                let live_to_produce = live.min(max_live);
-                for _ in 0..live_to_produce {
+                // `live` is grid-snapped + capped by per_trigger_composition;
+                // produce that many Live blocks then the terminal Sync.
+                for _ in 0..live {
                     let last_header = self.committer.last_header();
                     if self.speculative_limit_reserves_sync(last_header.number()) {
                         break;
@@ -501,9 +521,9 @@ where
                     }
                 }
 
-                // Terminal Sync block of the catchup trigger. No
-                // Scheduler-supplied timestamp here, so it's parent +
-                // l2_block_time — backfill catchup sets its own pace.
+                // Terminal Sync block, parent-paced. Empty
+                // (`SyncSlotMode::Catchup`): a behind block can't ts-align its
+                // postBatch, so cross-chain waits for the next Slot.
                 let last_header = self.committer.last_header();
                 if self.speculative_limit_paused(last_header.number()) {
                     self.try_recover_sync_slot_without_emission(
@@ -517,17 +537,14 @@ where
                     .timestamp()
                     .saturating_add(self.timing.l2_block_time().as_secs());
 
-                // Same cross-chain hook as Slot.Sync: a wired composer
-                // returns a prebuilt Sync block (and dispatches the L1
-                // bundle); otherwise fall back to a pool-driven Sync
-                // commit, which fires no postBatch.
                 let prebuilt = if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref()
                 {
                     let parent = crate::slot::ParentContext {
                         header: last_header.clone(),
                     };
                     composer
-                        .compose_sync_slot(*rollup_id, parent, sync_ts)
+                        // Catch-up: next-available L1 block (unpinned), empty.
+                        .compose_sync_slot(*rollup_id, parent, sync_ts, None, SyncSlotMode::Catchup)
                         .await
                 } else {
                     None
@@ -573,6 +590,9 @@ where
                 }
                 for _ in 0..future {
                     let last_header = self.committer.last_header();
+                    if self.speculative_limit_paused(last_header.number()) {
+                        return Ok(()); // Defer remaining Future + Sync to next trigger.
+                    }
                     match self.commit_one(SlotKind::Future, &last_header).await {
                         Ok(()) => {}
                         Err(err) if err.is_stale_parent() => {
@@ -592,6 +612,9 @@ where
                     .timestamp()
                     .saturating_add(self.timing.l2_block_time().as_secs());
                 if expected_sync_ts != sync_slot_timestamp {
+                    // Equal on-grid; a mismatch means off-grid drift. Stamp
+                    // the parent-derived (re-derivable) value so the deriver
+                    // can still reproduce the block.
                     event!(
                         name: "eez.sequencer.sync_slot.timestamp_mismatch",
                         Level::WARN,
@@ -602,13 +625,23 @@ where
                     );
                 }
 
-                // Cross-chain content hook: ask the composer for a
-                // pre-built Sync block carrying drained HeldPool system
-                // txs. None = no content this slot → pool-driven Sync
-                // commit. Some = commit its `ExecutionData` via the same
-                // engine-API tail the Deriver uses for L1-derived blocks.
-                let prebuilt = if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref()
-                {
+                // Defer-on-lateness: a late trigger that can't land the bundle
+                // in the next L1 slot commits an empty block and holds the pool
+                // (next slot covers it). Else drain into a prebuilt Sync block.
+                // Check against expected_sync_ts — the ts the bundle is pinned
+                // to below — so an off-grid trigger already past its pin defers
+                // instead of composing a bundle that can't make its slot.
+                let prebuilt = if self.sync_block_misses_l1_slot(expected_sync_ts) {
+                    event!(
+                        name: "eez.sequencer.sync_slot.deferred_late",
+                        Level::WARN,
+                        sync_slot_block_height,
+                        sync_slot_timestamp,
+                        l1_head,
+                        "trigger too late for the immediate L1 slot; committing an empty block and holding the pool — next slot's batch covers it",
+                    );
+                    None
+                } else if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref() {
                     let parent = crate::slot::ParentContext {
                         header: last_header.clone(),
                     };
@@ -624,7 +657,15 @@ where
                     // settlement freeze. Keep production deterministic/block-count-
                     // driven; the WARN above flags wall-clock drift for visibility.
                     composer
-                        .compose_sync_slot(*rollup_id, parent, expected_sync_ts)
+                        // Steady: aim the immediate next L1 block, pinned to
+                        // expected_sync_ts (re-derivable; == the L1 slot ts on-grid).
+                        .compose_sync_slot(
+                            *rollup_id,
+                            parent,
+                            expected_sync_ts,
+                            Some(l1_head + 1),
+                            SyncSlotMode::Steady,
+                        )
                         .await
                 } else {
                     None
@@ -763,7 +804,7 @@ where
             block.number = block_number,
             block.hash = %block_hash,
             block.timestamp = block_timestamp,
-            "produced block {{block.number}} hash={{block.hash}} ts={{block.timestamp}} kind={{slot.kind}}",
+            "produced block {block_number} hash={block_hash} ts={block_timestamp} kind={kind}",
         );
 
         if let Some(emitter) = self.batch_emitter.as_mut() {
@@ -808,7 +849,7 @@ where
             block.number = block_number,
             block.hash = %block_hash,
             block.timestamp = timestamp,
-            "produced block {{block.number}} hash={{block.hash}} ts={{block.timestamp}} kind={{slot.kind}}",
+            "produced block {block_number} hash={block_hash} ts={timestamp} kind={kind}",
         );
 
         if let Some(emitter) = self.batch_emitter.as_mut() {

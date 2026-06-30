@@ -6,7 +6,9 @@
 //! - `l2_block_time_ms` — L2 cadence (2 000 mainnet target, 2 500
 //!   chiado-slow, 1 000 chiado-fast).
 //! - `proof_time_ms` — worst-case prover wall-clock budget.
-//! - `submission_slack_ms` — relay propagation buffer (default 100 ms).
+//! - `submission_slack_ms` — how early the proven bundle must reach the
+//!   relay before the next L1 slot. With `proof_time`, sizes the Future
+//!   region (see [`Self::future_count`]). Default 100 ms.
 //!
 //! Derived helpers ([`Self::k`], [`Self::future_count`], [`Self::live_count`],
 //! [`Self::per_trigger_composition`]) compute the per-sync-slot block layout
@@ -25,11 +27,14 @@
 //!
 //! # Worked examples
 //!
-//! | Deployment | L1 (ms) | L2 (ms) | proof (ms) | K | future_count | live_count |
-//! |---|---|---|---|---|---|---|
-//! | mainnet    | 12 000  | 2 000   | 4 000      | 6 | 1            | 4          |
-//! | chiado-slow| 5 000   | 2 500   | 2 500      | 2 | 0            | 1          |
-//! | chiado-fast| 5 000   | 1 000   | 2 000      | 5 | 1            | 3          |
+//! `future = ceil((proof + slack) / L2) − 1`, `live = K − future − 1`,
+//! `trigger = L1 − (future + 1)·L2`:
+//!
+//! | Deployment  | L1 (ms) | L2 (ms) | proof | slack | K | future | live | trigger (ms) |
+//! |---|---|---|---|---|---|---|---|---|
+//! | mainnet     | 12 000  | 2 000   | 4 000 | 1 500 | 6 | 2      | 3    | 6 000        |
+//! | chiado      | 5 000   | 1 000   | 200   | 1 700 | 5 | 1      | 3    | 3 000        |
+//! | chiado-slow | 4 000   | 2 000   | 1 500 | 100   | 2 | 0      | 1    | 2 000        |
 
 use std::env;
 use std::num::ParseIntError;
@@ -167,14 +172,15 @@ impl RollupTiming {
                 self.proof_time_ms, self.submission_slack_ms, self.l1_block_time_ms,
             )));
         }
-        let max_proof = (k - 1) * self.l2_block_time_ms;
-        if self.proof_time_ms > max_proof {
+        let max_budget = (k - 1) * self.l2_block_time_ms;
+        if self.proof_time_ms.saturating_add(self.submission_slack_ms) > max_budget {
             return Err(DriverError::timing_config(format!(
-                "proof_time ({} ms) must be <= (K-1) * L2 block time ({} * {} = {} ms); else there is no room for Future blocks before Sync",
+                "proof_time ({} ms) + submission_slack ({} ms) must be <= (K-1) * L2 block time ({} * {} = {} ms); else there is no room for Future blocks before Sync",
                 self.proof_time_ms,
+                self.submission_slack_ms,
                 k - 1,
                 self.l2_block_time_ms,
-                max_proof,
+                max_budget,
             )));
         }
         Ok(())
@@ -198,16 +204,30 @@ impl RollupTiming {
         Duration::from_millis(self.proof_time_ms as u64)
     }
 
+    /// Relay-submission slack as a [`Duration`].
+    #[must_use]
+    pub const fn submission_slack(self) -> Duration {
+        Duration::from_millis(self.submission_slack_ms as u64)
+    }
+
     /// L2 blocks per sync slot. `K = L1_block_time / L2_block_time`.
     #[must_use]
     pub const fn k(self) -> u32 {
         self.l1_block_time_ms / self.l2_block_time_ms
     }
 
-    /// Future blocks per slot (proof-window padding ahead of Sync).
+    /// Future blocks per slot: `ceil((proof_time + submission_slack) / l2) − 1`.
+    /// Sized so the proven bundle reaches the relay `submission_slack` before
+    /// the next L1 slot, letting the postBatch target the immediate next block.
     #[must_use]
     pub const fn future_count(self) -> u32 {
-        (self.proof_time_ms / self.l2_block_time_ms).saturating_sub(1)
+        let budget_ms = self.proof_time_ms.saturating_add(self.submission_slack_ms);
+        // Manual ceil — div_ceil isn't const on the pinned toolchain.
+        let blocks = budget_ms
+            .saturating_add(self.l2_block_time_ms)
+            .saturating_sub(1)
+            / self.l2_block_time_ms;
+        blocks.saturating_sub(1)
     }
 
     /// Live blocks per slot — the L2 blocks already produced on
@@ -217,11 +237,14 @@ impl RollupTiming {
         self.k() - self.future_count() - 1
     }
 
-    /// Wall-clock offset from "L1 block N landed" at which the
-    /// Scheduler should fire so the prover has `proof_time` budget.
+    /// Wall-clock offset after the anchor L1 block at which the trigger
+    /// fires — the end of the Live region, `l1 − (future + 1)·l2`. Leaves
+    /// the prover `proof_time` and the relay `submission_slack` before the
+    /// next slot. Always whole seconds, so `.as_secs()` is lossless.
     #[must_use]
     pub const fn proof_window_open(self) -> Duration {
-        Duration::from_millis((self.l1_block_time_ms - self.proof_time_ms) as u64)
+        let reserved_ms = (self.future_count() + 1).saturating_mul(self.l2_block_time_ms);
+        Duration::from_millis(self.l1_block_time_ms.saturating_sub(reserved_ms) as u64)
     }
 
     /// Wall-clock offset from "L1 block N landed" by which the
@@ -233,26 +256,23 @@ impl RollupTiming {
     }
 
     /// Decide what to produce at a sync-slot trigger given the current
-    /// L2 head and the target sync-slot block height.
+    /// L2 head, the target sync-slot block height, and the per-trigger
+    /// catchup budget.
     ///
-    /// Catchup vs. steady-state split: if closing the slot in this
-    /// trigger would require more than `K` blocks, drop into Catchup
-    /// mode (Live-only, capped at [`MAX_BLOCKS_PER_CATCHUP`]); else
-    /// produce the slot suffix (Live + Future + 1 Sync).
+    /// `max_catchup_blocks` bounds a Catchup chunk to the K-grid; the
+    /// Sequencer always passes [`MAX_BLOCKS_PER_CATCHUP`] (catchup does not
+    /// enforce the speculative cap — that's steady-only).
     ///
-    /// Returns [`SlotComposition::Idle`] if the head is already at or
-    /// past `sync_slot_block` — a trigger should not produce that
-    /// outcome under normal flow; it indicates a late-firing trigger
-    /// or a recent reorg that overshot.
-    ///
-    /// **Catchup over-catch**: when behind, Catchup produces the full
-    /// `sync_slot_block - head_block` gap (capped at
-    /// [`MAX_BLOCKS_PER_CATCHUP`]) so head reaches `sync_slot_block` and
-    /// the next trigger sees `gap = K` → Slot mode. Stopping short (e.g.
-    /// at `live_region_end`) leaves `gap = K + future + 1` after every
-    /// Catchup — perpetually behind, never closing the slot.
+    /// Catchup if closing the slot needs > `K` blocks, else the slot suffix
+    /// (Live + Future + 1 Sync). [`SlotComposition::Idle`] when head ≥
+    /// `sync_slot_block`, or the budget can't reach a grid height above head.
     #[must_use]
-    pub fn per_trigger_composition(self, head_block: u64, sync_slot_block: u64) -> SlotComposition {
+    pub fn per_trigger_composition(
+        self,
+        head_block: u64,
+        sync_slot_block: u64,
+        max_catchup_blocks: u64,
+    ) -> SlotComposition {
         if head_block >= sync_slot_block {
             return SlotComposition::Idle;
         }
@@ -272,11 +292,19 @@ impl RollupTiming {
                     future,
                 }
             } else {
-                // Over-catch: bring head up to `sync_slot_block` so the
-                // next trigger enters Slot mode.
+                // Over-catch: snap the terminal to the K-grid (step back from
+                // the target by whole K's until it fits) so the deriver
+                // re-derives it — robust to a genesis off the slot boundary.
                 let gap = sync_slot_block - head_block;
-                SlotComposition::Catchup {
-                    live: gap.min(MAX_BLOCKS_PER_CATCHUP),
+                let steps_back = gap.saturating_sub(max_catchup_blocks).div_ceil(k);
+                let snap = steps_back.saturating_mul(k);
+                if snap >= sync_slot_block || sync_slot_block - snap <= head_block {
+                    // Budget can't reach a grid height above head; wait.
+                    SlotComposition::Idle
+                } else {
+                    SlotComposition::Catchup {
+                        live: sync_slot_block - snap - head_block - 1,
+                    }
                 }
             }
         } else {
@@ -299,8 +327,9 @@ pub enum SlotComposition {
     /// Already at or past the target sync slot. No blocks to produce
     /// this trigger.
     Idle,
-    /// Catchup: too far behind to close the slot. Produce `live` Live
-    /// blocks only; Future + Sync are deferred to the next trigger.
+    /// Catchup: `live` Live blocks then a terminal Sync block at the
+    /// grid-snapped height `head + live + 1`. No Future blocks; the Sync
+    /// block is structural-only (empty) — see [`SyncSlotMode`](crate::SyncSlotMode).
     Catchup { live: u64 },
     /// Steady-state: produce `live` Live blocks + `future` Future
     /// blocks + 1 Sync block (always implicit when this variant is
@@ -332,17 +361,21 @@ mod tests {
     use super::*;
 
     fn mainnet() -> RollupTiming {
-        RollupTiming::new(12_000, 2_000, 4_000, 100)
+        // proof+slack = 5500 → future = 2, live = 3, trigger = +6s.
+        RollupTiming::new(12_000, 2_000, 4_000, 1_500)
     }
 
     // K=2 devnet timing. Whole-second L2 only — sub-second cadence
     // trips `.as_secs()` truncation in the Scheduler (see `validate`).
     fn chiado_slow() -> RollupTiming {
-        RollupTiming::new(4_000, 2_000, 2_000, 100)
+        // proof+slack = 1600 → future = 0, live = 1.
+        RollupTiming::new(4_000, 2_000, 1_500, 100)
     }
 
+    // Real chiado deployment: proof+slack = 1900 → future = 1, live = 3,
+    // trigger = +3s, so the postBatch targets the immediate next L1 block.
     fn chiado_fast() -> RollupTiming {
-        RollupTiming::new(5_000, 1_000, 2_000, 100)
+        RollupTiming::new(5_000, 1_000, 200, 1_700)
     }
 
     #[test]
@@ -354,10 +387,10 @@ mod tests {
     fn mainnet_derived() {
         let t = mainnet();
         assert_eq!(t.k(), 6);
-        assert_eq!(t.future_count(), 1);
-        assert_eq!(t.live_count(), 4);
-        assert_eq!(t.proof_window_open(), Duration::from_secs(8));
-        assert_eq!(t.submission_deadline(), Duration::from_millis(11_900));
+        assert_eq!(t.future_count(), 2);
+        assert_eq!(t.live_count(), 3);
+        assert_eq!(t.proof_window_open(), Duration::from_secs(6));
+        assert_eq!(t.submission_deadline(), Duration::from_millis(10_500));
     }
 
     #[test]
@@ -384,6 +417,8 @@ mod tests {
         assert_eq!(t.k(), 5);
         assert_eq!(t.future_count(), 1);
         assert_eq!(t.live_count(), 3);
+        // +3s trigger: 200ms prove finishes 1.7s before the +5s slot.
+        assert_eq!(t.proof_window_open(), Duration::from_secs(3));
     }
 
     #[test]
@@ -425,8 +460,8 @@ mod tests {
     #[test]
     fn proof_time_must_fit_future_region() {
         // L1=4s, L2=2s, proof=3s, slack=100. K=2, (K-1)*L2 = 2s.
-        // Passes proof+slack check (3100 < 4000) but trips
-        // proof > (K-1)*L2 (3000 > 2000).
+        // Passes the proof+slack < L1 check (3100 < 4000) but trips
+        // proof+slack > (K-1)*L2 (3100 > 2000) → no room for Future blocks.
         let err = RollupTiming::new(4_000, 2_000, 3_000, 100)
             .validate()
             .expect_err("proof > (K-1)*L2 should be refused");
@@ -450,54 +485,166 @@ mod tests {
 
     #[test]
     fn mainnet_steady_state_at_live_region_end() {
-        // Sync slot at block 6. live_region_end = 6 - (1+1) = 4.
-        // Head = 4 → produce 0 Live + 1 Future + 1 Sync.
-        let c = mainnet().per_trigger_composition(4, 6);
-        assert_eq!(c, SlotComposition::Slot { live: 0, future: 1 });
+        // future=2 → live_region_end = 6 - (2+1) = 3. Head = 3 (live
+        // region full) → 0 Live + 2 Future + 1 Sync.
+        let c = mainnet().per_trigger_composition(3, 6, MAX_BLOCKS_PER_CATCHUP);
+        assert_eq!(c, SlotComposition::Slot { live: 0, future: 2 });
     }
 
     #[test]
     fn mainnet_steady_state_one_live_behind() {
-        let c = mainnet().per_trigger_composition(3, 6);
-        assert_eq!(c, SlotComposition::Slot { live: 1, future: 1 });
+        // future=2, live_region_end=3. Head=2 → 1 Live left + 2 Future + Sync.
+        let c = mainnet().per_trigger_composition(2, 6, MAX_BLOCKS_PER_CATCHUP);
+        assert_eq!(c, SlotComposition::Slot { live: 1, future: 2 });
     }
 
     #[test]
     fn mainnet_steady_state_start_of_slot() {
-        // Head = 0 → 4 Live + 1 Future + 1 Sync = 6 blocks (= K).
-        let c = mainnet().per_trigger_composition(0, 6);
-        assert_eq!(c, SlotComposition::Slot { live: 4, future: 1 });
+        // Head = 0 → 3 Live + 2 Future + 1 Sync = 6 blocks (= K).
+        let c = mainnet().per_trigger_composition(0, 6, MAX_BLOCKS_PER_CATCHUP);
+        assert_eq!(c, SlotComposition::Slot { live: 3, future: 2 });
     }
 
     #[test]
-    fn mainnet_catchup_one_slot_behind() {
-        // Sync at 12, head at 0: over-catch produces the full gap (12)
-        // so head reaches sync_slot and the next trigger is Slot mode.
-        let c = mainnet().per_trigger_composition(0, 12);
-        assert_eq!(c, SlotComposition::Catchup { live: 12 });
+    fn mainnet_catchup_within_cap_lands_on_target() {
+        // Sync at 12 (on-grid, K=6), head at 0. gap=12 <= cap, so the
+        // catchup closes exactly at sync_slot: 11 Live + 1 Sync = 12
+        // blocks, terminal at 0 + 11 + 1 = 12 (on grid). Next trigger
+        // sees gap=K -> Slot mode.
+        let c = mainnet().per_trigger_composition(0, 12, MAX_BLOCKS_PER_CATCHUP);
+        assert_eq!(c, SlotComposition::Catchup { live: 11 });
     }
 
     #[test]
-    fn mainnet_catchup_clamped_to_cap() {
-        // Way behind: sync at 320, head at 0. Gap=320 → capped at
-        // MAX_BLOCKS_PER_CATCHUP = 300.
-        let c = mainnet().per_trigger_composition(0, 320);
-        assert_eq!(
-            c,
-            SlotComposition::Catchup {
-                live: MAX_BLOCKS_PER_CATCHUP
-            }
+    fn mainnet_catchup_clamped_to_cap_snaps_to_grid() {
+        // Way behind: sync at 318 (=6*53, on-grid), head at 0. gap=318 >
+        // cap=300, so the terminal snaps back to the largest grid height
+        // that fits the cap: 318 - ceil((318-300)/6)*6 = 318 - 18 = 300.
+        // 299 Live + 1 Sync = 300 blocks (= cap), terminal at 300 (=6*50).
+        let head = 0u64;
+        let c = mainnet().per_trigger_composition(head, 318, MAX_BLOCKS_PER_CATCHUP);
+        assert_eq!(c, SlotComposition::Catchup { live: 299 });
+        // Terminal is on-grid and the trigger fits the cap.
+        let SlotComposition::Catchup { live } = c else {
+            panic!("expected Catchup");
+        };
+        let terminal = head + live + 1;
+        let total_blocks = live + 1; // Live blocks + the Sync terminal
+        assert_eq!(terminal % u64::from(mainnet().k()), 0, "terminal on grid");
+        assert!(
+            total_blocks <= MAX_BLOCKS_PER_CATCHUP,
+            "fits per-trigger cap"
         );
+    }
+
+    #[test]
+    fn catchup_terminal_always_on_grid_when_far_behind() {
+        // For a range of far-behind heads, the catchup terminal must land
+        // on the same K-grid as the (on-grid) sync_slot_block.
+        let t = mainnet();
+        let k = u64::from(t.k());
+        let sync_slot = 6_000u64; // on-grid (multiple of K=6)
+        for head in [0u64, 1, 5, 100, 137, 5_000, 5_699] {
+            let SlotComposition::Catchup { live } =
+                t.per_trigger_composition(head, sync_slot, MAX_BLOCKS_PER_CATCHUP)
+            else {
+                continue; // close enough for Slot mode
+            };
+            let terminal = head + live + 1;
+            assert_eq!(
+                terminal % k,
+                0,
+                "terminal {terminal} off-grid (head={head})"
+            );
+            assert!(terminal > head, "terminal must advance");
+            assert!(
+                terminal - head <= MAX_BLOCKS_PER_CATCHUP,
+                "trigger exceeds cap (head={head})"
+            );
+            assert!(terminal <= sync_slot, "terminal overshot target");
+        }
+    }
+
+    #[test]
+    fn catchup_grid_snap_respects_genesis_offset() {
+        // If genesis isn't on an L1 slot boundary, sync_slot_block carries
+        // a residue != 0 mod K. Stepping back from the target keeps the
+        // terminal on the SAME (offset) grid, not the 0-mod-K grid.
+        let t = mainnet();
+        let k = u64::from(t.k());
+        let head = 0u64;
+        let sync_slot = 317u64; // residue 5 mod 6 (offset grid)
+        let SlotComposition::Catchup { live } =
+            t.per_trigger_composition(head, sync_slot, MAX_BLOCKS_PER_CATCHUP)
+        else {
+            panic!("expected Catchup for gap > cap");
+        };
+        let terminal = head + live + 1;
+        assert_eq!(
+            terminal % k,
+            sync_slot % k,
+            "terminal must share the target's grid residue"
+        );
+        assert_eq!(
+            (sync_slot - terminal) % k,
+            0,
+            "stepped back whole K-multiples"
+        );
+    }
+
+    #[test]
+    fn catchup_budget_bounds_chunk_to_speculative_room() {
+        // based-mode: a small budget (the speculative window) caps the
+        // chunk well below MAX_BLOCKS_PER_CATCHUP. head=0, sync=6000,
+        // budget=64 -> terminal snaps to the largest grid height <= 64.
+        let t = mainnet();
+        let k = u64::from(t.k());
+        let SlotComposition::Catchup { live } = t.per_trigger_composition(0, 6_000, 64) else {
+            panic!("expected Catchup");
+        };
+        let terminal = live + 1;
+        assert!(terminal <= 64, "chunk {terminal} exceeds budget 64");
+        assert_eq!(terminal % k, 0, "terminal off-grid");
+        assert!(terminal > 0, "must advance");
+    }
+
+    #[test]
+    fn catchup_idle_when_budget_too_small() {
+        // Speculative window nearly full: budget 4 < K=6, so no grid
+        // height sits above head -> Idle (wait for L1 to confirm).
+        let t = mainnet();
+        assert_eq!(
+            t.per_trigger_composition(60, 6_000, 4),
+            SlotComposition::Idle
+        );
+    }
+
+    #[test]
+    fn catchup_chunk_never_exceeds_budget() {
+        // The chunk (live + Sync) must fit the budget for any budget >= K,
+        // so the terminal is reachable before the speculative pause trips.
+        let t = mainnet();
+        for budget in [6u64, 7, 64, 128, 299, 300] {
+            if let SlotComposition::Catchup { live } = t.per_trigger_composition(0, 10_000, budget)
+            {
+                let chunk = live + 1; // Live blocks + the Sync terminal
+                assert!(chunk <= budget, "chunk {chunk} > budget {budget}");
+            }
+        }
     }
 
     #[test]
     fn catchup_converges_to_slot_mode_next_trigger() {
         // After over-catch head = sync_slot = 12. Next trigger advances
-        // sync_slot by K to 18 → gap=6 fits Slot mode (live=4, future=1).
+        // sync_slot by K to 18 → gap=6 fits Slot mode (live=3, future=2).
         let head_after_catchup = 12u64;
         let sync_slot_after_trigger = 18u64;
-        let c = mainnet().per_trigger_composition(head_after_catchup, sync_slot_after_trigger);
-        assert_eq!(c, SlotComposition::Slot { live: 4, future: 1 });
+        let c = mainnet().per_trigger_composition(
+            head_after_catchup,
+            sync_slot_after_trigger,
+            MAX_BLOCKS_PER_CATCHUP,
+        );
+        assert_eq!(c, SlotComposition::Slot { live: 3, future: 2 });
     }
 
     #[test]
@@ -505,7 +652,7 @@ mod tests {
         // K=2, future_count=0. Sync at 2, head at 0. live_region_end=1.
         // live_to_produce=1, K-(future+1)=1. 1<=1 → steady-state.
         // Slot { live: 1, future: 0 } — 1 Live + 1 Sync.
-        let c = chiado_slow().per_trigger_composition(0, 2);
+        let c = chiado_slow().per_trigger_composition(0, 2, MAX_BLOCKS_PER_CATCHUP);
         assert_eq!(c, SlotComposition::Slot { live: 1, future: 0 });
     }
 
@@ -514,28 +661,28 @@ mod tests {
         // K=5, future_count=1. Sync at 5, head at 0. live_region_end=3,
         // live_to_produce=3, K-(future+1)=3. 3<=3 → steady-state.
         // Slot { live: 3, future: 1 } — 3 Live + 1 Future + 1 Sync.
-        let c = chiado_fast().per_trigger_composition(0, 5);
+        let c = chiado_fast().per_trigger_composition(0, 5, MAX_BLOCKS_PER_CATCHUP);
         assert_eq!(c, SlotComposition::Slot { live: 3, future: 1 });
     }
 
     #[test]
     fn idle_when_head_at_or_past_sync_slot() {
         assert_eq!(
-            mainnet().per_trigger_composition(6, 6),
+            mainnet().per_trigger_composition(6, 6, MAX_BLOCKS_PER_CATCHUP),
             SlotComposition::Idle
         );
         assert_eq!(
-            mainnet().per_trigger_composition(7, 6),
+            mainnet().per_trigger_composition(7, 6, MAX_BLOCKS_PER_CATCHUP),
             SlotComposition::Idle
         );
     }
 
     #[test]
     fn inside_future_region_produces_remainder() {
-        // Mainnet: sync at 6, future_count=1. live_region_end=4.
-        // Head=5 (1 block into Future region) → 0 Future remaining,
+        // Mainnet: sync at 6, future_count=2. live_region_end=3.
+        // Head=5 (2 blocks into the Future region) → 0 Future remaining,
         // just Sync. Slot { live: 0, future: 0 }.
-        let c = mainnet().per_trigger_composition(5, 6);
+        let c = mainnet().per_trigger_composition(5, 6, MAX_BLOCKS_PER_CATCHUP);
         assert_eq!(c, SlotComposition::Slot { live: 0, future: 0 });
     }
 }

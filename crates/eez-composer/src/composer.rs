@@ -23,7 +23,9 @@ use std::sync::Arc;
 use alloy_eips::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use async_trait::async_trait;
-use eez_driver::{BlockCommitterHandle, ParentContext, SyncSlotBlock, SyncSlotComposer};
+use eez_driver::{
+    BlockCommitterHandle, ParentContext, SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
+};
 use eez_l1::{BundleTarget, L1Event, L1Watcher, SendOutcome, Submitter};
 use eez_prover::Prover;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -514,7 +516,7 @@ where
                 "oversized deferred window abandoned as a recovery coverage gap",
             );
         }
-        rollup.optimistic.mark_failed(sync_height);
+        rollup.optimistic.mark_failed(sync_height, false);
         event!(
             name: "eez.composer.patch_recovery.abandon_inflight",
             Level::WARN,
@@ -654,7 +656,7 @@ where
                         let update = windows.mark_settled_on_l1(*rollup_id, cursor);
                         for stale in update.pruned_straddlers {
                             if let Some(owner) = self.rollups.get(&stale.rollup_id) {
-                                owner.optimistic.mark_failed(stale.to_block);
+                                owner.optimistic.mark_failed(stale.to_block, false);
                             }
                             event!(
                                 name: "eez.composer.posted_window.stale_l1_cursor",
@@ -918,12 +920,22 @@ where
         rollup_id: u64,
         parent: ParentContext,
         timestamp: u64,
+        target_l1_block: Option<u64>,
+        mode: SyncSlotMode,
     ) -> Option<SyncSlotBlock> {
+        // Some(n) → aim L1 block n exactly, pinned to this Sync block's
+        // timestamp (a skipped L1 slot then drops the bundle instead of
+        // settling with a drifted L2 timestamp); None → next available
+        // (catch-up, unpinned).
+        let bundle_target = target_l1_block.map_or(BundleTarget::NextBlock, |block| {
+            BundleTarget::Exact { block, timestamp }
+        });
         event!(
             name: "eez.composer.sync_slot.invoked",
             Level::INFO,
             rollup_id,
             timestamp,
+            mode = ?mode,
             "compose_sync_slot invoked",
         );
         let rollup = self.inner.rollups.get(&rollup_id).or_else(|| {
@@ -1078,14 +1090,49 @@ where
             }
         }
 
+        // Catchup: structural-only — skip the drain, emit a minimal postBatch
+        // (cross-chain stays pooled for the next Steady slot).
+        if matches!(mode, SyncSlotMode::Catchup) {
+            let (Some(_), Some(ctx)) = (
+                self.inner.evm_composer.as_ref(),
+                self.inner.cc_exec_ctx.as_ref(),
+            ) else {
+                return None;
+            };
+            return self
+                .dispatch_minimal_postbatch(
+                    ctx,
+                    rollup_id,
+                    rollup,
+                    &parent_header,
+                    timestamp,
+                    suggested_fee_recipient,
+                    bundle_target, // catch-up → NextBlock (unpinned)
+                )
+                .await
+                .unwrap_or_else(|err| {
+                    event!(
+                        name: "eez.composer.catchup.minimal_failed",
+                        Level::ERROR,
+                        rollup_id,
+                        error = %err,
+                        "catchup minimal postBatch failed; Sequencer commits empty Sync",
+                    );
+                    None
+                });
+        }
+
         let pool_len_before = pool.len();
-        // Cap drain to 3 user_txs per bundle. rbuilder-chiado has shown
-        // partial-inclusion when bundles carry more than ~3 user_txs:
+        // Cap drain to 10 user_txs per bundle. A backlog spills into the
+        // next Sync slot instead of letting one slot grow without bound.
+        //
+        // rbuilder-chiado has shown partial-inclusion when bundles carry
+        // too many user_txs:
         // postBatch lands, but only a prefix of the user_txs makes it
         // into the block — the rest are silently excluded by rbuilder
         // and effectively lost. Capping keeps every bundle's contents
         // 100% atomic; a backlog spills into the next Sync slot.
-        const MAX_USER_TXS_PER_BUNDLE: usize = 3;
+        const MAX_USER_TXS_PER_BUNDLE: usize = 10;
         let drained = pool.pop_n(MAX_USER_TXS_PER_BUNDLE);
         // NOTE: do NOT early-exit on empty pool. Every unblocked Sync
         // slot still emits a postBatch carrying the leading immediate
@@ -1131,6 +1178,7 @@ where
                     &parent_header,
                     timestamp,
                     suggested_fee_recipient,
+                    bundle_target,
                 )
                 .await
             {
@@ -1367,7 +1415,7 @@ where
                     );
                     Ok(true)
                 } else {
-                    rollup.optimistic.mark_failed(target);
+                    rollup.optimistic.mark_failed(target, false);
                     Ok(false)
                 }
             }
@@ -1511,6 +1559,9 @@ where
             let mut keep: Vec<crate::HeldTx> = Vec::with_capacity(failed.txs.len());
             let mut dropped = 0usize;
             let mut evicted_chains: Vec<(alloy_primitives::Address, Direction, u64)> = Vec::new();
+            // slot_skipped: re-queue without counting toward poison-eviction
+            // (a skipped slot heals via a fresh pin next tick).
+            let slot_skipped = failed.slot_skipped;
             for mut tx in failed.txs {
                 if let Ok(true) = submitter.receipt_exists(tx.hash).await {
                     dropped += 1;
@@ -1521,16 +1572,18 @@ where
                         tx_hash = %tx.hash,
                         "user_tx already has an L1 receipt; not re-queueing (user must resubmit)",
                     );
+                } else if slot_skipped {
+                    keep.push(tx);
                 } else {
-                    // A relay drop did NOT burn the nonce (the tx
-                    // never executed), so re-queue for a fresh
+                    // A relay drop on a BUILT slot did NOT burn the nonce
+                    // (the tx never executed), so re-queue for a fresh
                     // attempt. Poison is normally caught at compose
                     // time; this bounded retry only backstops poison
                     // the compose-time sim missed (rbuilder sims
                     // against a slightly different post-postBatch
-                    // state). After MAX_BUNDLE_ATTEMPTS consecutive
-                    // drops, evict loudly (with the nonce-cascade) so
-                    // a residual poison tx can't block the FIFO queue
+                    // state). After MAX_BUNDLE_ATTEMPTS such drops,
+                    // evict loudly (with the nonce-cascade) so a
+                    // residual poison tx can't block the FIFO queue
                     // forever. User resubmits.
                     tx.attempts += 1;
                     if tx.attempts >= MAX_BUNDLE_ATTEMPTS {
@@ -1831,6 +1884,7 @@ where
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         timestamp: u64,
         suggested_fee_recipient: Address,
+        bundle_target: BundleTarget,
     ) -> Result<Option<SyncSlotBlock>, String> {
         // Read SYSTEM_ADDRESS nonce at the parent state — the next
         // signed system tx must use this. We sign multiple txs per
@@ -1898,6 +1952,7 @@ where
                     parent_header,
                     timestamp,
                     suggested_fee_recipient,
+                    bundle_target,
                 )
                 .await;
         }
@@ -2120,6 +2175,7 @@ where
                     parent_header,
                     timestamp,
                     suggested_fee_recipient,
+                    bundle_target,
                 )
                 .await;
         }
@@ -2142,6 +2198,7 @@ where
                     parent_header,
                     timestamp,
                     suggested_fee_recipient,
+                    bundle_target,
                 )
                 .await;
         }
@@ -2177,6 +2234,7 @@ where
                         parent_header,
                         timestamp,
                         suggested_fee_recipient,
+                        bundle_target,
                     )
                     .await;
             }
@@ -2213,6 +2271,7 @@ where
                         parent_header,
                         timestamp,
                         suggested_fee_recipient,
+                        bundle_target,
                     )
                     .await;
             }
@@ -2263,6 +2322,7 @@ where
                         parent_header,
                         timestamp,
                         suggested_fee_recipient,
+                        bundle_target,
                     )
                     .await;
             }
@@ -2316,6 +2376,7 @@ where
                     bundle,
                     built.header.state_root(),
                     Arc::clone(&rollup.optimistic),
+                    bundle_target,
                 );
             }
             PostBatchOutcome::Deferred {
@@ -2386,7 +2447,7 @@ where
                         Arc::clone(&rollup.optimistic),
                     );
                 } else {
-                    rollup.optimistic.mark_failed(sync_height);
+                    rollup.optimistic.mark_failed(sync_height, false);
                 }
             }
         }
@@ -2412,6 +2473,7 @@ where
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         timestamp: u64,
         suggested_fee_recipient: Address,
+        bundle_target: BundleTarget,
     ) -> Result<Option<SyncSlotBlock>, String> {
         let empty_built = build_sync_block(
             rollup.l2_provider.as_ref(),
@@ -2485,6 +2547,7 @@ where
                     vec![minimal_postbatch_raw],
                     empty_built.header.state_root(),
                     Arc::clone(&rollup.optimistic),
+                    bundle_target,
                 );
             }
             PostBatchOutcome::Deferred {
@@ -2532,7 +2595,7 @@ where
                         Arc::clone(&rollup.optimistic),
                     );
                 } else {
-                    rollup.optimistic.mark_failed(sync_height);
+                    rollup.optimistic.mark_failed(sync_height, false);
                 }
             }
         }
@@ -2555,6 +2618,7 @@ where
         bundle: Vec<Bytes>,
         expected_final_state: B256,
         optimistic: Arc<OptimisticallyIncluded>,
+        target: BundleTarget,
     ) {
         let submitter = ctx.submitter.clone();
         tokio::spawn(observe_bundle_outcome(
@@ -2564,6 +2628,7 @@ where
             expected_final_state,
             optimistic,
             submitter,
+            target,
         ));
     }
 
@@ -2632,7 +2697,7 @@ where
                     public_inputs_hash,
                     "no_store",
                 );
-                optimistic.mark_failed(sync_height);
+                optimistic.mark_failed(sync_height, false);
                 return;
             };
 
@@ -2716,7 +2781,7 @@ where
                     public_inputs_hash,
                     "timeout",
                 );
-                optimistic.mark_failed(sync_height);
+                optimistic.mark_failed(sync_height, false);
                 return;
             };
             if !optimistic.is_pending(sync_height) {
@@ -2757,7 +2822,7 @@ where
                     public_inputs_hash,
                     "no_ctx",
                 );
-                optimistic.mark_failed(sync_height);
+                optimistic.mark_failed(sync_height, false);
                 return;
             };
 
@@ -2795,6 +2860,7 @@ where
                         bundle,
                         expected_final_state,
                         optimistic,
+                        BundleTarget::NextBlock,
                     );
                 }
                 Err(e) => {
@@ -2812,7 +2878,7 @@ where
                         public_inputs_hash,
                         "finalize_failed",
                     );
-                    optimistic.mark_failed(sync_height);
+                    optimistic.mark_failed(sync_height, false);
                 }
             }
         });
@@ -3394,16 +3460,14 @@ async fn observe_bundle_outcome(
     expected_final_state: B256,
     optimistic: Arc<OptimisticallyIncluded>,
     submitter: Submitter,
+    target: BundleTarget,
 ) {
     let outcome = submitter
-        .send_bundle(&bundle, BundleTarget::NextBlock, Some(expected_final_state))
+        .send_bundle(&bundle, target, Some(expected_final_state))
         .await;
-    // Under strict all-or-nothing bundles, `Included` ⟹ every tx
-    // succeeded ⟹ settled; the only failure is a drop (postBatch had no
-    // receipt by its target block), which can't distinguish relay bad
-    // luck from a would-revert tx. Poison is caught at compose time
-    // instead (see `compose_via_evm_composer`), so a drop reaching here
-    // is treated as bad luck and re-queued by slot-context recovery.
+    // Strict all-or-nothing: Included ⟹ settled; the only failure is a drop.
+    // Poison is caught at compose time, so a drop here is bad luck — recovery
+    // recomposes a FRESH tx next trigger (the builder ignores re-sends).
     let settled = matches!(
         outcome,
         Ok(SendOutcome::Included {
@@ -3433,7 +3497,15 @@ async fn observe_bundle_outcome(
     if settled {
         optimistic.mark_settled(sync_height);
     } else {
-        optimistic.mark_failed(sync_height);
+        // slot_skipped = pinned slot didn't land as pinned (block ts != pin, or
+        // unreadable) → not the tx's fault; requeue without poison-eviction.
+        let slot_skipped = match target {
+            BundleTarget::Exact { block, timestamp } => {
+                submitter.block_timestamp(block).await.ok().flatten() != Some(timestamp)
+            }
+            BundleTarget::NextBlock => false,
+        };
+        optimistic.mark_failed(sync_height, slot_skipped);
     }
 }
 

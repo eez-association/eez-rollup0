@@ -35,14 +35,19 @@ pub const ANVIL_KEY_4: &str = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f873
 pub const ANVIL_KEY_5: &str = "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906");
 
-/// External anvil cadence used by composer-mode e2e tests. The node's
-/// `RollupTiming` requires `K = L1/L2 >= 2`; with 1s L2 blocks, anvil must
-/// mine every 2s and `EEZ_L1_BLOCK_TIME_MS` must match.
-pub const L1_BLOCK_TIME_SECS: u64 = 2;
+/// External anvil cadence for composer-mode e2e tests. K = L1/L2 = 3 (not 2):
+/// `RollupTiming::validate` needs proof+slack (1100ms) ≤ (K−1)·L2 = 2000ms.
+/// `EEZ_L1_BLOCK_TIME_MS` derives from this and must match the miner.
+pub const L1_BLOCK_TIME_SECS: u64 = 3;
 
-/// L2 genesis timestamp shared by the dev and reorg fixtures (`0x6490fdd2`).
-/// Aligning anvil to this avoids permanent catchup to wall-clock-height slots.
+/// L2 genesis timestamp for the reorg fixture (`0x6490fdd2`); `for_reorg`
+/// anvil aligns to it. The dev path stamps genesis at wall-clock `now`
+/// ([`Harness::fresh`]) — the lateness gate reads a backdated genesis as late.
 pub const L2_GENESIS_TIMESTAMP: u64 = 0x6490_fdd2;
+
+/// Carries the Harness's shared L2 genesis path to every node it spawns
+/// (sequencer, follower, restarts) so they build the same chain; → `--chain`.
+const TEST_L2_GENESIS_ENV: &str = "EEZ_TEST_L2_GENESIS_PATH";
 
 /// Composer tick cadence for single-composer tests — max speed.
 pub const COMPOSER_INTERVAL_SINGLE: Duration = Duration::from_secs(1);
@@ -82,7 +87,7 @@ pub struct Anvil {
     pub rpc_url: String,
 }
 
-/// Anvil configuration. `Anvil::spawn(port)` is the default (2s block,
+/// Anvil configuration. `Anvil::spawn(port)` is the default (3s block,
 /// random mnemonic). The multi-composer reorg test uses
 /// [`AnvilConfig::for_reorg`] which matches the hardhat mnemonic (so we
 /// have predictable prefunded EOAs) and enables the cancun hardfork
@@ -108,8 +113,8 @@ impl Default for AnvilConfig {
 }
 
 impl AnvilConfig {
-    /// 2s block time, hardhat mnemonic, cancun hardfork, 30M gas.
-    /// (Chiado uses 5s; tests prefer speed over fidelity. 2s blocks +
+    /// 3s block time, hardhat mnemonic, cancun hardfork, 30M gas.
+    /// (Chiado uses 5s; tests prefer speed over fidelity. 3s blocks +
     /// cancun still permit `anvil_reorg`.)
     pub fn for_reorg() -> Self {
         Self {
@@ -271,12 +276,25 @@ pub struct Harness {
     pub anvil: Anvil,
     pub stub: BundleStub,
     pub dep: Deployment,
+    /// Wall-clock-stamped dev genesis shared by every node via
+    /// [`TEST_L2_GENESIS_ENV`] (the tempdir keeps it alive). `None` on the
+    /// reorg path, which passes its own genesis.
+    l2_genesis: Option<(PathBuf, tempfile::TempDir)>,
 }
 
 impl Harness {
-    /// Default: dev-chain anvil + dev-genesis initial state.
+    /// Default: dev-chain anvil + dev-genesis initial state. Anvil + L2
+    /// genesis share one wall-clock `now` so the lateness gate doesn't fire.
     pub async fn fresh() -> Result<Self> {
-        Self::with_anvil_config(AnvilConfig::default(), dev_genesis_state_root()).await
+        let ts = now_unix_secs();
+        let (gpath, gdir) = write_dev_genesis_at(ts)?;
+        let cfg = AnvilConfig {
+            genesis_timestamp: Some(ts),
+            ..AnvilConfig::default()
+        };
+        let mut h = Self::with_anvil_config(cfg, dev_genesis_state_root()).await?;
+        h.l2_genesis = Some((gpath, gdir));
+        Ok(h)
     }
 
     /// Custom anvil config + explicit initial state root. Used by the
@@ -285,7 +303,12 @@ impl Harness {
         let anvil = Anvil::spawn_with(free_port(), cfg).await?;
         let stub = BundleStub::spawn(free_port(), &anvil.rpc_url).await?;
         let dep = deploy_contracts_with_initial(&anvil.rpc_url, ANVIL_KEY, initial_state).await?;
-        Ok(Self { anvil, stub, dep })
+        Ok(Self {
+            anvil,
+            stub,
+            dep,
+            l2_genesis: None,
+        })
     }
 
     pub fn chain(&self) -> Chain<'_> {
@@ -305,29 +328,53 @@ impl Harness {
         poster_key: &str,
         expect_external_batches: bool,
     ) -> Vec<(&'static str, String)> {
-        vec![
-            // Existing (non-cross-chain) tests run the empty-batch composer
-            // against the EXTERNAL anvil — they must NOT launch the embedded
-            // L1 reth. Composer mode defaults `EEZ_L1_EMBEDDED` to true
-            // (main.rs:156-159); pin it off here. The cross-chain harness
-            // (`cross_chain_env`) sets `EEZ_L1_EMBEDDED=1` explicitly.
+        self.env_for_options(NodeEnvOptions {
+            poster_key,
+            proof_signer_key: Some(ANVIL_KEY),
+            rollup_id: self.dep.rollup_id,
+            expect_external_batches,
+            sequencer_rpc: None,
+        })
+    }
+
+    pub fn follower_env(&self, sequencer_rpc: Option<&str>) -> Vec<(&'static str, String)> {
+        self.env_for_options(NodeEnvOptions {
+            poster_key: ANVIL_KEY,
+            proof_signer_key: None,
+            rollup_id: self.dep.rollup_id,
+            expect_external_batches: true,
+            sequencer_rpc,
+        })
+    }
+
+    pub fn env_with_rollup_id(&self, rollup_id: u64) -> Vec<(&'static str, String)> {
+        self.env_for_options(NodeEnvOptions {
+            poster_key: ANVIL_KEY,
+            proof_signer_key: Some(ANVIL_KEY),
+            rollup_id,
+            expect_external_batches: false,
+            sequencer_rpc: None,
+        })
+    }
+
+    pub fn env_with_proof_signer(&self, proof_signer_key: &str) -> Vec<(&'static str, String)> {
+        self.env_for_options(NodeEnvOptions {
+            poster_key: ANVIL_KEY,
+            proof_signer_key: Some(proof_signer_key),
+            rollup_id: self.dep.rollup_id,
+            expect_external_batches: false,
+            sequencer_rpc: None,
+        })
+    }
+
+    fn env_for_options(&self, opts: NodeEnvOptions<'_>) -> Vec<(&'static str, String)> {
+        let mut env = vec![
+            // Non-cross-chain tests use the external anvil, not an embedded L1.
             ("EEZ_L1_EMBEDDED", "0".to_string()),
-            // Composer/follower mode reads `RollupTiming::from_env`
-            // (main.rs:290; required since the per-rollup-config refactor
-            // 364d95a). The 06-11 harness predates it. Pick a valid set
-            // (validate(): K = L1/L2 >= 2, L2 whole-seconds, proof+slack <
-            // L1, proof <= (K-1)*L2) that fires a sync-slot trigger ~1s
-            // after each anvil head: L1=2s, L2=1s, proof=1s, slack=100ms →
-            // K=2, proof_window_open = L1-proof = 1s.
-            ("EEZ_L1_BLOCK_TIME_MS", "2000".to_string()),
-            ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
-            ("EEZ_PROOF_TIME_MS", "1000".to_string()),
-            ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
             ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
             ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
-            ("EEZ_L1_POSTER_KEY", poster_key.to_string()),
+            ("EEZ_L1_POSTER_KEY", opts.poster_key.to_string()),
             ("EEZ_L1_CHAIN_ID", "31337".to_string()),
-            ("EEZ_PROOF_SIGNER_KEY", ANVIL_KEY.to_string()),
             ("EEZ_L2_SYSTEM_ADDRESS", format!("{ANVIL_ADDR:#x}")),
             ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
             (
@@ -357,10 +404,10 @@ impl Harness {
                 "EEZ_ROLLUP_MANAGER_ADDRESS",
                 format!("{:#x}", self.dep.rollup_manager_address),
             ),
-            ("EEZ_ROLLUP_ID", self.dep.rollup_id.to_string()),
+            ("EEZ_ROLLUP_ID", opts.rollup_id.to_string()),
             (
                 "EEZ_COMPOSER_INTERVAL_SECS",
-                if expect_external_batches {
+                if opts.expect_external_batches {
                     COMPOSER_INTERVAL_MULTI
                 } else {
                     COMPOSER_INTERVAL_SINGLE
@@ -370,7 +417,7 @@ impl Harness {
             ),
             (
                 "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES",
-                expect_external_batches.to_string(),
+                opts.expect_external_batches.to_string(),
             ),
             (
                 "EEZ_L2_DATADIR",
@@ -380,8 +427,31 @@ impl Harness {
                 "RUST_LOG",
                 std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
             ),
-        ]
+            (
+                TEST_L2_GENESIS_ENV,
+                self.l2_genesis
+                    .as_ref()
+                    .map(|(p, _)| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ),
+        ];
+
+        if let Some(proof_signer_key) = opts.proof_signer_key {
+            env.push(("EEZ_PROOF_SIGNER_KEY", proof_signer_key.to_string()));
+        }
+        if let Some(sequencer_rpc) = opts.sequencer_rpc {
+            env.push(("EEZ_SEQUENCER_RPC", sequencer_rpc.to_string()));
+        }
+        env
     }
+}
+
+struct NodeEnvOptions<'a> {
+    poster_key: &'a str,
+    proof_signer_key: Option<&'a str>,
+    rollup_id: u64,
+    expect_external_batches: bool,
+    sequencer_rpc: Option<&'a str>,
 }
 
 /// L2 system signer (== anvil/hardhat key #0). Used in cross-chain mode
@@ -409,6 +479,8 @@ pub struct EmbeddedL1 {
     pub auth_port: u16,
     /// P2P port (`EEZ_L1_P2P_PORT`).
     pub p2p_port: u16,
+    /// discv5 UDP port (`EEZ_L1_DISCV5_PORT`).
+    pub discv5_port: u16,
     /// Embedded-reth datadir (`EEZ_L1_DATADIR`). Persists across the
     /// Phase-A/Phase-B restart.
     pub datadir: PathBuf,
@@ -429,6 +501,10 @@ impl EmbeddedL1 {
         let http_port = free_port();
         let auth_port = free_port();
         let p2p_port = free_port();
+        let mut discv5_port = free_port();
+        while discv5_port == p2p_port {
+            discv5_port = free_port();
+        }
         let datadir = tempfile::Builder::new()
             .prefix("eez-l1-embedded-")
             .tempdir()
@@ -438,6 +514,7 @@ impl EmbeddedL1 {
             http_port,
             auth_port,
             p2p_port,
+            discv5_port,
             datadir: datadir.path().to_path_buf(),
             rpc_url,
             _datadir: datadir,
@@ -452,6 +529,7 @@ impl EmbeddedL1 {
             ("EEZ_L1_HTTP_PORT", self.http_port.to_string()),
             ("EEZ_L1_AUTH_PORT", self.auth_port.to_string()),
             ("EEZ_L1_P2P_PORT", self.p2p_port.to_string()),
+            ("EEZ_L1_DISCV5_PORT", self.discv5_port.to_string()),
             (
                 "EEZ_L1_DATADIR",
                 self.datadir.to_string_lossy().into_owned(),
@@ -778,6 +856,31 @@ sol! {
 /// emitting `ImmediateEntrySkipped` instead of `L2ExecutionPerformed`.
 pub fn dev_genesis_state_root() -> B256 {
     reth_chainspec::DEV.genesis_header().state_root
+}
+
+/// Wall-clock seconds for stamping test genesis + anvil, so the sequencer's
+/// defer-on-lateness gate doesn't read every trigger as late.
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs()
+}
+
+/// Reth's dev genesis with timestamp set to `ts`, written to a temp file for
+/// `--chain`. Same alloc as `--chain dev` → state root still equals
+/// [`dev_genesis_state_root`]. The tempdir must outlive nodes using the path.
+fn write_dev_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
+    let mut genesis: alloy_genesis::Genesis = reth_chainspec::DEV.genesis().clone();
+    genesis.timestamp = ts;
+    let dir = tempfile::tempdir().context("genesis tempdir")?;
+    let path = dir.path().join("genesis.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&genesis).context("serialize dev genesis")?,
+    )
+    .context("write dev genesis")?;
+    Ok((path, dir))
 }
 
 /// Path to the multi-composer reorg test's L2 genesis fixture. 23
@@ -1486,11 +1589,26 @@ impl NodeHandle {
             l1_auth_port = free_port();
         }
         let l1_p2p_port = free_port();
+        let mut l1_discv5_port = free_port();
+        while l1_discv5_port == l1_p2p_port {
+            l1_discv5_port = free_port();
+        }
         let l1_datadir = datadir.join("embedded-l1");
-        let chain_arg: std::ffi::OsString = cfg.genesis_path.map_or_else(
-            || std::ffi::OsString::from("dev"),
-            |p| p.as_os_str().to_owned(),
-        );
+        // Genesis: an explicit genesis_path (reorg fixture) wins, else the
+        // Harness's shared wall-clock genesis (TEST_L2_GENESIS_ENV — same chain
+        // for sequencer/follower/restarts), else `--chain dev`. Wall-clock is
+        // required by the sequencer's defer-on-lateness gate.
+        let env_genesis = env
+            .iter()
+            .find(|(k, _)| *k == TEST_L2_GENESIS_ENV)
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(std::ffi::OsString::from);
+        let chain_arg: std::ffi::OsString = cfg
+            .genesis_path
+            .map(|p| p.as_os_str().to_owned())
+            .or(env_genesis)
+            .unwrap_or_else(|| std::ffi::OsString::from("dev"));
         // Working dir: the repo root by default (so `dotenvy` loads the
         // repo's `.env` / `deployments.env`), or a fresh empty tempdir
         // when `clean_cwd` — see `NodeConfig::clean_cwd`. The tempdir must
@@ -1556,8 +1674,12 @@ impl NodeHandle {
         cmd.env("EEZ_L1_HTTP_PORT", l1_http_port.to_string())
             .env("EEZ_L1_AUTH_PORT", l1_auth_port.to_string())
             .env("EEZ_L1_P2P_PORT", l1_p2p_port.to_string())
+            .env("EEZ_L1_DISCV5_PORT", l1_discv5_port.to_string())
             .env("EEZ_L1_DATADIR", &l1_datadir);
         for (k, v) in env {
+            if *k == TEST_L2_GENESIS_ENV {
+                continue; // test-only marker (consumed as --chain above)
+            }
             cmd.env(*k, v);
         }
         // Point the node's OUTBOUND L2 provider at its OWN L2 RPC (this random
@@ -1615,20 +1737,23 @@ impl NodeHandle {
         });
     }
 
-    /// Assert this node's deriver detected and handled the L1 reorg.
-    /// Some runs legitimately have no stale confirmed batch on one node,
-    /// in which case the correct deriver action is an explicit no-op.
-    pub fn assert_reorg_seen(&self) {
+    /// Wait until this node observes the L1 reorg. Some runs legitimately
+    /// have no stale confirmed batch on one node, in which case the
+    /// correct deriver action is an explicit no-op. Without this check the
+    /// reorg test would silently pass even if reorg detection regressed
+    /// and some unrelated re-derivation path re-converged state.
+    pub async fn wait_for_reorg_seen(&self, timeout: Duration) -> Result<()> {
         let patterns = [
             "reorg rolled out",
+            "rewinding ring to common ancestor",
             "l1.reorg.retreated",
             "L1 reorg reported",
         ];
-        assert!(
-            self.log_count_matching(&patterns).unwrap() > 0,
-            "{} deriver missed the reorg",
-            self.name,
-        );
+        wait_for(timeout, || async {
+            Ok((self.log_count_matching(&patterns)? > 0).then_some(()))
+        })
+        .await
+        .with_context(|| format!("{} deriver missed the reorg", self.name))
     }
 
     /// Assert this node never logged a fatal-class line (process death
