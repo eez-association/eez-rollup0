@@ -119,12 +119,17 @@ async fn cross_chain_setter_deposit_over_bundle() {
     .await
     .expect("L1 stored stateRoot never matched L2 safe stateRoot");
 
+    // Match on the event message text, not the `name:` metadata — the default
+    // tracing fmt layer prints the message but not the event name.
     assert!(
-        node.log_count_matching(&["eez.node.l1_embedded.bundle.accepted"]).unwrap() > 0,
+        node.log_count_matching(&["eth_sendBundle: forwarded txs to pool in order"])
+            .unwrap()
+            > 0,
         "embedded dev L1 eth_sendBundle was exercised",
     );
     assert_eq!(
-        node.log_count_matching(&["eez.submitter.bundle.mempool_fallback"]).unwrap(),
+        node.log_count_matching(&["relay has no eth_sendBundle; submitting txs via mempool"])
+            .unwrap(),
         0,
         "composer must not fall back to eth_sendRawTransaction",
     );
