@@ -1121,6 +1121,11 @@ pub async fn count_events(
     Ok(logs.len())
 }
 
+/// Count `BatchPosted` events on the EEZ contract since `from_block`.
+pub async fn batches_posted(l1_rpc: &str, eez: Address, from_block: u64) -> Result<usize> {
+    count_events(l1_rpc, eez, IEEZ::BatchPosted::SIGNATURE_HASH, from_block).await
+}
+
 /// Return the `newState` of the latest `L2ExecutionPerformed` event
 /// emitted by `contract` for `rollup_id`, or `None` if none exist.
 /// Cross-checks the on-chain `stateRoot` against the per-batch event.
