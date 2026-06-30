@@ -492,6 +492,10 @@ fn now_unix_secs() -> u64 {
 fn write_dev_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
     let mut genesis: alloy_genesis::Genesis = reth_chainspec::DEV.genesis().clone();
     genesis.timestamp = ts;
+    // reth's DEV `ChainSpec` carries chain id 1337 on `ChainSpec.chain`, but
+    // the dev.json genesis config omits `chainId` — so a serialize/reparse
+    // round-trip would drop it and the node would serve chain id 0. Pin it.
+    genesis.config.chain_id = reth_chainspec::Chain::dev().id();
     let dir = tempfile::tempdir().context("genesis tempdir")?;
     let path = dir.path().join("genesis.json");
     std::fs::write(
@@ -530,10 +534,6 @@ pub async fn send_l2_value_transfer(
     to: Address,
     value: U256,
 ) -> Result<alloy_primitives::TxHash> {
-    use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
-    use alloy_network::TxSignerSync;
-    use alloy_network::eip2718::Encodable2718;
-
     let signer: PrivateKeySigner = signing_key
         .strip_prefix("0x")
         .unwrap_or(signing_key)
@@ -1280,7 +1280,7 @@ pub async fn sign_send_raw(
 ) -> Result<alloy_primitives::TxHash> {
     let (hash, raw) = sign_eip1559(key, chain_id, nonce, to, value, input, gas_limit)?;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    provider.send_raw_transaction(&raw).await?;
+    let _ = provider.send_raw_transaction(&raw).await?;
     Ok(hash)
 }
 
