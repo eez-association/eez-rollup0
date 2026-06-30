@@ -1229,6 +1229,7 @@ pub const CCM_L2_ADDRESS: Address = address!("0x42000000000000000000000000000000
 sol! {
     #[sol(rpc)]
     interface IEEZProxy {
+        event CrossChainProxyCreated(address indexed proxy, address indexed originalAddress, uint256 indexed originalRollupId);
         function createCrossChainProxy(address originalAddress, uint256 originalRollupId) external returns (address proxy);
     }
     #[sol(rpc)]
@@ -1466,29 +1467,11 @@ pub async fn deploy_value_l2(l2_rpc: &str, key: &str, initial: U256) -> Result<A
     deploy_raw(l2_rpc, key, l2_chain_id, &out.join("Value.sol/Value.json"), initial.abi_encode()).await
 }
 
-/// `CREATE2` address matching `EEZBase.computeCrossChainProxyAddress`.
-pub fn predict_proxy_address(eez: Address, target: Address, rollup_id: u64) -> Result<Address> {
-    use alloy_primitives::keccak256;
-    let out = repo_root().join("contracts/out/CrossChainProxy.sol/CrossChainProxy.json");
-    let artifact: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&out).context("read CrossChainProxy artifact")?)?;
-    let creation_hex = artifact["bytecode"]["object"]
-        .as_str()
-        .ok_or_else(|| anyhow!("CrossChainProxy bytecode missing"))?
-        .strip_prefix("0x")
-        .unwrap_or_default();
-    let mut init_code = hex::decode(creation_hex).context("decode CrossChainProxy bytecode")?;
-    init_code.extend_from_slice(&(eez, target, U256::from(rollup_id)).abi_encode_params());
-
-    let mut salt_input = Vec::with_capacity(52);
-    salt_input.extend_from_slice(B256::from(U256::from(rollup_id)).as_slice());
-    salt_input.extend_from_slice(target.as_slice());
-    let salt = keccak256(&salt_input);
-
-    Ok(eez.create2(salt, keccak256(&init_code)))
-}
-
-/// Call `EEZ.createCrossChainProxy` on the L1 and return the deployed address.
+/// Call `EEZ.createCrossChainProxy` on the L1 and return the deployed proxy
+/// address read from the `CrossChainProxyCreated` event. (We read it rather
+/// than predict it: the CREATE2 init code uses `type(CrossChainProxy).creationCode`
+/// embedded in EEZ, whose trailing solc metadata differs from the standalone
+/// artifact — so an off-chain prediction from the artifact wouldn't match.)
 pub async fn create_cross_chain_proxy(
     l1_rpc: &str,
     key: &str,
@@ -1496,7 +1479,6 @@ pub async fn create_cross_chain_proxy(
     target: Address,
     rollup_id: u64,
 ) -> Result<Address> {
-    let predicted = predict_proxy_address(eez, target, rollup_id)?;
     let calldata = IEEZProxy::createCrossChainProxyCall {
         originalAddress: target,
         originalRollupId: U256::from(rollup_id),
@@ -1513,11 +1495,16 @@ pub async fn create_cross_chain_proxy(
     if !receipt.status() {
         bail!("createCrossChainProxy reverted");
     }
-    let code = provider.get_code_at(predicted).await?;
-    if code.is_empty() {
-        bail!("proxy not deployed at predicted address {predicted:#x}");
-    }
-    Ok(predicted)
+    receipt
+        .inner
+        .logs()
+        .iter()
+        .find_map(|log| {
+            IEEZProxy::CrossChainProxyCreated::decode_log(&log.inner)
+                .ok()
+                .map(|e| e.proxy)
+        })
+        .ok_or_else(|| anyhow!("CrossChainProxyCreated event not found in receipt"))
 }
 
 pub async fn l2_value(l2_rpc: &str, value_addr: Address) -> Result<U256> {
@@ -1593,9 +1580,12 @@ impl DevnetCfg {
         format!("http://127.0.0.1:{}", self.l1_http_port)
     }
 
-    /// Env vars for `eez-node`. `proxies` seeds the ingress classifier.
-    pub fn env(&self, proxies: &[Address]) -> Vec<(&'static str, String)> {
-        let mut env = vec![
+    /// Env vars for `eez-node`. The ingress classifier routes our cross-chain
+    /// ops by source chain id (they're signed with the L1 chain id), so the
+    /// proxy-address route isn't needed and proxies don't have to be known
+    /// before boot.
+    pub fn env(&self) -> Vec<(&'static str, String)> {
+        vec![
             ("EEZ_L1_EMBEDDED", "1".to_string()),
             ("EEZ_L1_CHAIN", "dev".to_string()),
             ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
@@ -1633,16 +1623,7 @@ impl DevnetCfg {
                 TEST_L2_GENESIS_ENV,
                 self.l2_genesis.0.to_string_lossy().into_owned(),
             ),
-        ];
-        if !proxies.is_empty() {
-            let joined = proxies
-                .iter()
-                .map(|p| format!("{p:#x}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            env.push(("EEZ_CROSS_CHAIN_PROXY_ADDRESSES", joined));
-            env.push(("EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS", DEV_CHAIN_ID.to_string()));
-        }
-        env
+            ("EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS", DEV_CHAIN_ID.to_string()),
+        ]
     }
 }

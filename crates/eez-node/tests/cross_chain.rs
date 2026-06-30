@@ -14,8 +14,8 @@ use alloy_sol_types::SolCall;
 mod common;
 use common::{
     ANVIL_KEY_2, ANVIL_KEY_3, DEV_CHAIN_ID, DevnetCfg, IValue, NodeHandle, create_cross_chain_proxy,
-    deploy_protocol_dev, deploy_value_l2, l2_balance, l2_value, pending_nonce, predict_proxy_address,
-    receipt_ok, signer_address, state_root, submit_to_l2_ingress, wait_for, wait_for_l2_rpc,
+    deploy_protocol_dev, deploy_value_l2, l2_balance, l2_value, pending_nonce, receipt_ok,
+    signer_address, state_root, submit_to_l2_ingress, wait_for, wait_for_l2_rpc,
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(90);
@@ -27,15 +27,15 @@ async fn cross_chain_setter_deposit_over_bundle() {
     let cfg = DevnetCfg::new().unwrap();
     let l1_rpc = cfg.l1_rpc_url();
 
-    // Proxy addresses must be precomputed before boot so the classifier is pre-seeded.
+    // Value (setter target) is CREATE(deployer, 0); recipient (deposit target)
+    // is a fixed EOA. The proxies are created after boot — the classifier routes
+    // our ops by source chain id, so it needn't know the proxy addresses upfront.
     let value_deployer = ANVIL_KEY_3;
     let value_addr = signer_address(value_deployer).unwrap().create(0);
     let recipient: Address = address!("0x2222222222222222222222222222222222222222");
-    let setter_proxy = predict_proxy_address(cfg.eez_address, value_addr, cfg.rollup_id).unwrap();
-    let deposit_proxy = predict_proxy_address(cfg.eez_address, recipient, cfg.rollup_id).unwrap();
 
     let datadir = tempfile::tempdir().unwrap();
-    let env = cfg.env(&[setter_proxy, deposit_proxy]);
+    let env = cfg.env();
     let node = NodeHandle::spawn(datadir.path(), &env).unwrap();
 
     wait_for_l2_rpc(&l1_rpc, SETUP_TIMEOUT).await.unwrap();
@@ -51,14 +51,12 @@ async fn cross_chain_setter_deposit_over_bundle() {
         .expect("deploy Value on L2");
     assert_eq!(value, value_addr, "Value address deterministic");
 
-    let sp = create_cross_chain_proxy(&l1_rpc, cfg.deployer_key, cfg.eez_address, value_addr, cfg.rollup_id)
+    let setter_proxy = create_cross_chain_proxy(&l1_rpc, cfg.deployer_key, cfg.eez_address, value_addr, cfg.rollup_id)
         .await
         .expect("create setter proxy");
-    let dp = create_cross_chain_proxy(&l1_rpc, cfg.deployer_key, cfg.eez_address, recipient, cfg.rollup_id)
+    let deposit_proxy = create_cross_chain_proxy(&l1_rpc, cfg.deployer_key, cfg.eez_address, recipient, cfg.rollup_id)
         .await
         .expect("create deposit proxy");
-    assert_eq!(sp, setter_proxy, "setter proxy matches prediction");
-    assert_eq!(dp, deposit_proxy, "deposit proxy matches prediction");
 
     // L1-signed txs targeting proxies, POSTed to the L2 ingress.
     let user = ANVIL_KEY_2;
