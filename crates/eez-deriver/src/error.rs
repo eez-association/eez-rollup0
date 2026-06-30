@@ -26,6 +26,9 @@ pub(crate) enum ErrorKind {
     /// `call_data`. Usually indicates a contract that posted a payload
     /// in a version we don't speak.
     Codec(eez_payload_codec::CodecError),
+    /// L1 exposed a log/header but not all source data needed to decode
+    /// the corresponding batch yet. Startup may retry this narrowly.
+    SourceIncomplete(String),
     /// `BlockCommitter` actor task is gone; the deriver can't push
     /// safe-head advances any further.
     CommitterClosed,
@@ -43,6 +46,14 @@ pub(crate) enum ErrorKind {
 impl DeriverError {
     pub(crate) fn l2_provider(err: impl fmt::Display) -> Self {
         Self::new(ErrorKind::L2Provider(err.to_string()))
+    }
+
+    pub(crate) fn l1_scan(err: eez_l1::L1Error) -> Self {
+        if err.is_source_incomplete() {
+            Self::new(ErrorKind::SourceIncomplete(err.to_string()))
+        } else {
+            Self::l2_provider(format!("catch-up scan: {err}"))
+        }
     }
 
     pub(crate) fn committer_closed() -> Self {
@@ -80,6 +91,13 @@ impl DeriverError {
     #[must_use]
     pub fn is_codec(&self) -> bool {
         matches!(self.kind, ErrorKind::Codec(_))
+    }
+
+    /// Returns true if L1 is missing data for an otherwise-observed
+    /// canonical item and the caller may retry after the source catches up.
+    #[must_use]
+    pub fn is_source_incomplete(&self) -> bool {
+        matches!(self.kind, ErrorKind::SourceIncomplete(_))
     }
 
     /// Returns true if the `BlockCommitter` actor task has exited.
@@ -139,6 +157,7 @@ impl fmt::Display for DeriverError {
         match &self.kind {
             ErrorKind::L2Provider(msg) => write!(f, "L2 provider error: {msg}"),
             ErrorKind::Codec(err) => write!(f, "payload codec error: {err}"),
+            ErrorKind::SourceIncomplete(msg) => write!(f, "L1 source incomplete: {msg}"),
             ErrorKind::CommitterClosed => {
                 write!(f, "block committer actor task has exited")
             }

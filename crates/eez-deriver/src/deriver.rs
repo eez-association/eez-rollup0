@@ -254,7 +254,7 @@ where
             .submitter
             .scan_batches(from_l1_block)
             .await
-            .map_err(|e| DeriverError::l2_provider(format!("catch-up scan: {e}")))?;
+            .map_err(DeriverError::l1_scan)?;
 
         let known_tx_hashes = self.inner.l1_head.known_tx_hashes();
         let mut new_batches: Vec<BatchRecord> = Vec::new();

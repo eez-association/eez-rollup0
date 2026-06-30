@@ -767,10 +767,10 @@ pub(crate) async fn scan_batch_logs(
                     "get_tx({l1_block_number}#{tx_index} for {tx_hash}): {e}"
                 ))
             })?
-            .ok_or_else(|| {
-                L1Error::Provider(format!(
-                    "tx {tx_hash} (block {l1_block_number} idx {tx_index}) not found"
-                ))
+            .ok_or_else(|| L1Error::SourceIncomplete {
+                block: l1_block_number,
+                tx_hash,
+                detail: format!("block/index lookup returned null at tx index {tx_index}"),
             })?;
         let submitter = tx.inner.signer();
         let input = tx.inner.input();
