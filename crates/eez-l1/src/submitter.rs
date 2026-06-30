@@ -32,6 +32,9 @@ use crate::error::{L1Error, L1Result};
 /// Wall-clock cap on the target-block + inclusion check.
 const TARGET_WAIT_BUDGET: Duration = Duration::from_secs(30);
 const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Initial block span for historical log scans. Wide catch-up gaps are
+/// split before hitting RPCs that reject long `eth_getLogs` ranges.
+const LOG_SCAN_CHUNK_BLOCKS: u64 = 2_000;
 
 /// L1 block offset for [`BundleTarget::NextBlock`]. slack=2 (over the
 /// minimal latest+1) gives a one-block cushion for when our local
@@ -697,11 +700,73 @@ pub(crate) async fn scan_batch_logs(
     from_block: u64,
     to_block: BlockNumberOrTag,
 ) -> L1Result<Vec<ScannedBatch>> {
+    let to_block = match to_block {
+        BlockNumberOrTag::Number(n) => n,
+        tag => provider
+            .get_block_by_number(tag)
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_block_by_number({tag:?}): {e}")))?
+            .map(|b| b.header.number)
+            .ok_or_else(|| L1Error::Provider(format!("block({tag:?}) returned None")))?,
+    };
+    if from_block > to_block {
+        return Ok(Vec::new());
+    }
+
+    let mut ranges = initial_log_scan_ranges(from_block, to_block);
+    let mut out = Vec::new();
+    while let Some((from, to)) = ranges.pop() {
+        match scan_batch_logs_range(provider, eez, rollup_id, from, to).await {
+            Ok(mut scanned) => out.append(&mut scanned),
+            Err(err) if from < to => {
+                let mid = from + (to - from) / 2;
+                ranges.push((mid + 1, to));
+                ranges.push((from, mid));
+                event!(
+                    name: "eez.l1.scan_batch_logs.split",
+                    Level::WARN,
+                    from,
+                    to,
+                    mid,
+                    error = %err,
+                    "BatchPosted scan range failed; splitting and retrying smaller ranges",
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(out)
+}
+
+fn initial_log_scan_ranges(from_block: u64, to_block: u64) -> Vec<(u64, u64)> {
+    let mut ranges = Vec::new();
+    let mut from = from_block;
+    loop {
+        let to = from
+            .saturating_add(LOG_SCAN_CHUNK_BLOCKS.saturating_sub(1))
+            .min(to_block);
+        ranges.push((from, to));
+        if to == to_block {
+            break;
+        }
+        from = to + 1;
+    }
+    ranges.reverse();
+    ranges
+}
+
+async fn scan_batch_logs_range(
+    provider: &impl Provider,
+    eez: alloy_primitives::Address,
+    rollup_id: u64,
+    from_block: u64,
+    to_block: u64,
+) -> L1Result<Vec<ScannedBatch>> {
     let filter = Filter::new()
         .address(eez)
         .event_signature(BatchPosted::SIGNATURE_HASH)
         .from_block(from_block)
-        .to_block(to_block);
+        .to_block(BlockNumberOrTag::Number(to_block));
     let logs = provider
         .get_logs(&filter)
         .await
@@ -712,7 +777,7 @@ pub(crate) async fn scan_batch_logs(
         .event_signature(L2ExecutionPerformed::SIGNATURE_HASH)
         .topic1(alloy_primitives::U256::from(rollup_id))
         .from_block(from_block)
-        .to_block(to_block);
+        .to_block(BlockNumberOrTag::Number(to_block));
     let winner_logs = provider
         .get_logs(&winners_filter)
         .await
