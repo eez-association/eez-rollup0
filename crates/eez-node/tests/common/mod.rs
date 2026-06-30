@@ -492,10 +492,6 @@ fn now_unix_secs() -> u64 {
 fn write_dev_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
     let mut genesis: alloy_genesis::Genesis = reth_chainspec::DEV.genesis().clone();
     genesis.timestamp = ts;
-    // reth's DEV `ChainSpec` carries chain id 1337 on `ChainSpec.chain`, but
-    // the dev.json genesis config omits `chainId` — so a serialize/reparse
-    // round-trip would drop it and the node would serve chain id 0. Pin it.
-    genesis.config.chain_id = reth_chainspec::Chain::dev().id();
     let dir = tempfile::tempdir().context("genesis tempdir")?;
     let path = dir.path().join("genesis.json");
     std::fs::write(
@@ -1245,13 +1241,34 @@ sol! {
 /// L2 fixture genesis re-stamped to `ts` so the sequencer doesn't read a stale
 /// genesis as late. Timestamp is a header field, so `initialState` is unchanged.
 pub fn write_l2_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
+    write_fixture_genesis(ts, None, "l2-genesis.json")
+}
+
+/// L1 genesis for the embedded dev L1: the fixture genesis (all forks at 0,
+/// prefunded hardhat accounts) with the chain id overridden to [`DEV_CHAIN_ID`].
+/// reth's built-in dev.json carries no `config`, so serializing it would yield
+/// a forkless chain that can't mine EIP-1559 deploy txs — the fixture avoids that.
+pub fn write_l1_dev_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
+    write_fixture_genesis(ts, Some(DEV_CHAIN_ID), "l1-genesis.json")
+}
+
+/// Read the fixture genesis, re-stamp `ts`, optionally override the chain id,
+/// and write it to a fresh tempdir.
+fn write_fixture_genesis(
+    ts: u64,
+    chain_id: Option<u64>,
+    filename: &str,
+) -> Result<(PathBuf, tempfile::TempDir)> {
     let raw = std::fs::read_to_string(reorg_genesis_path()).context("read fixture genesis")?;
     let mut genesis: alloy_genesis::Genesis =
         serde_json::from_str(&raw).context("parse fixture genesis")?;
     genesis.timestamp = ts;
-    let dir = tempfile::tempdir().context("l2 genesis tempdir")?;
-    let path = dir.path().join("l2-genesis.json");
-    std::fs::write(&path, serde_json::to_vec(&genesis)?).context("write l2 genesis")?;
+    if let Some(id) = chain_id {
+        genesis.config.chain_id = id;
+    }
+    let dir = tempfile::tempdir().context("genesis tempdir")?;
+    let path = dir.path().join(filename);
+    std::fs::write(&path, serde_json::to_vec(&genesis)?).context("write genesis")?;
     Ok((path, dir))
 }
 
@@ -1567,7 +1584,7 @@ impl DevnetCfg {
             initial_state,
             deployer_key,
             poster_key,
-            l1_genesis: write_dev_genesis_at(ts)?,
+            l1_genesis: write_l1_dev_genesis_at(ts)?,
             l2_genesis: write_l2_genesis_at(ts)?,
         })
     }
