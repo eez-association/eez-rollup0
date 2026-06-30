@@ -16,7 +16,7 @@ mod common;
 use common::{
     ANVIL_KEY_2, ANVIL_KEY_3, DEV_CHAIN_ID, DevnetCfg, IValue, NodeHandle, batches_posted,
     create_cross_chain_proxy, deploy_protocol_dev, deploy_value_l2, l2_balance, l2_value,
-    pending_nonce, receipt_ok, signer_address, state_root, submit_to_l2_ingress, wait_for,
+    pending_nonce, receipt_ok, sign_send_raw, signer_address, state_root, wait_for,
     wait_for_l2_rpc,
 };
 
@@ -104,12 +104,12 @@ async fn cross_chain_setter_deposit_over_bundle() {
         }
         .abi_encode();
         hashes.push(
-            submit_to_l2_ingress(
+            sign_send_raw(
                 &node.l2_rpc_url(),
                 user,
                 DEV_CHAIN_ID,
                 l1_nonce,
-                setter_proxy,
+                Some(setter_proxy),
                 U256::ZERO,
                 set_call,
                 600_000,
@@ -119,12 +119,12 @@ async fn cross_chain_setter_deposit_over_bundle() {
         );
         l1_nonce += 1;
         hashes.push(
-            submit_to_l2_ingress(
+            sign_send_raw(
                 &node.l2_rpc_url(),
                 user,
                 DEV_CHAIN_ID,
                 l1_nonce,
-                deposit_proxy,
+                Some(deposit_proxy),
                 U256::from(*dep_v),
                 Vec::new(),
                 600_000,

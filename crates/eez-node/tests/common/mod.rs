@@ -1246,7 +1246,7 @@ sol! {
 
 /// L2 fixture genesis re-stamped to `ts` so the sequencer doesn't read a stale
 /// genesis as late. Timestamp is a header field, so `initialState` is unchanged.
-pub fn write_l2_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
+fn write_l2_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
     write_fixture_genesis(ts, None, "l2-genesis.json")
 }
 
@@ -1254,7 +1254,7 @@ pub fn write_l2_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
 /// prefunded hardhat accounts) with the chain id overridden to [`DEV_CHAIN_ID`].
 /// reth's built-in dev.json carries no `config`, so serializing it would yield
 /// a forkless chain that can't mine EIP-1559 deploy txs — the fixture avoids that.
-pub fn write_l1_dev_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
+fn write_l1_dev_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
     write_fixture_genesis(ts, Some(DEV_CHAIN_ID), "l1-genesis.json")
 }
 
@@ -1289,7 +1289,7 @@ pub fn signer_address(key: &str) -> Result<Address> {
     Ok(signer_of(key)?.address())
 }
 
-/// Sign and submit one EIP-1559 tx; return its hash. `to == None` is a CREATE.
+/// Sign and submit an EIP-1559 tx; return its hash. `to == None` is a CREATE.
 #[allow(clippy::too_many_arguments)]
 pub async fn sign_send_raw(
     rpc_url: &str,
@@ -1301,23 +1301,6 @@ pub async fn sign_send_raw(
     input: Vec<u8>,
     gas_limit: u64,
 ) -> Result<alloy_primitives::TxHash> {
-    let (hash, raw) = sign_eip1559(key, chain_id, nonce, to, value, input, gas_limit)?;
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let _ = provider.send_raw_transaction(&raw).await?;
-    Ok(hash)
-}
-
-/// Sign an EIP-1559 tx locally (fixed dev fees), returning `(hash, raw)`.
-#[allow(clippy::too_many_arguments)]
-fn sign_eip1559(
-    key: &str,
-    chain_id: u64,
-    nonce: u64,
-    to: Option<Address>,
-    value: U256,
-    input: Vec<u8>,
-    gas_limit: u64,
-) -> Result<(alloy_primitives::TxHash, Vec<u8>)> {
     let signer = signer_of(key)?;
     let mut tx = TxEip1559 {
         chain_id,
@@ -1339,26 +1322,8 @@ fn sign_eip1559(
     let sig = signer.sign_transaction_sync(&mut tx)?;
     let env = TxEnvelope::from(tx.into_signed(sig));
     let hash = *env.tx_hash();
-    Ok((hash, env.encoded_2718()))
-}
-
-/// Send a cross-chain source tx to the L2 ingress. Signed with the L1 chain id
-/// but submitted to the L2 RPC; hash is computed locally (ingress response is
-/// non-standard for held txs).
-#[allow(clippy::too_many_arguments)]
-pub async fn submit_to_l2_ingress(
-    l2_rpc: &str,
-    key: &str,
-    l1_chain_id: u64,
-    nonce: u64,
-    to: Address,
-    value: U256,
-    input: Vec<u8>,
-    gas_limit: u64,
-) -> Result<alloy_primitives::TxHash> {
-    let (hash, raw) = sign_eip1559(key, l1_chain_id, nonce, Some(to), value, input, gas_limit)?;
-    let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
-    let _ = provider.send_raw_transaction(&raw).await; // held by ingress
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let _ = provider.send_raw_transaction(&env.encoded_2718()).await?;
     Ok(hash)
 }
 
@@ -1368,7 +1333,7 @@ pub async fn pending_nonce(rpc_url: &str, key: &str) -> Result<u64> {
     Ok(provider.get_transaction_count(addr).await?)
 }
 
-pub async fn deploy_raw(
+async fn deploy_raw(
     rpc_url: &str,
     key: &str,
     chain_id: u64,
