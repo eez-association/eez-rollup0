@@ -821,22 +821,7 @@ async fn scan_batch_logs_range(
         let tx_index = log
             .transaction_index
             .ok_or_else(|| L1Error::Provider("BatchPosted log missing transaction_index".into()))?;
-        let tx = provider
-            .get_transaction_by_block_number_and_index(
-                BlockNumberOrTag::Number(l1_block_number),
-                tx_index as usize,
-            )
-            .await
-            .map_err(|e| {
-                L1Error::Provider(format!(
-                    "get_tx({l1_block_number}#{tx_index} for {tx_hash}): {e}"
-                ))
-            })?
-            .ok_or_else(|| L1Error::SourceIncomplete {
-                block: l1_block_number,
-                tx_hash,
-                detail: format!("block/index lookup returned null at tx index {tx_index}"),
-            })?;
+        let tx = fetch_log_transaction(provider, l1_block_number, tx_index, tx_hash).await?;
         let submitter = tx.inner.signer();
         let input = tx.inner.input();
         let decoded = postAndVerifyBatchCall::abi_decode(input)
@@ -865,6 +850,49 @@ async fn scan_batch_logs_range(
         });
     }
     Ok(out)
+}
+
+async fn fetch_log_transaction(
+    provider: &impl Provider,
+    l1_block_number: u64,
+    tx_index: u64,
+    tx_hash: alloy_primitives::B256,
+) -> L1Result<alloy_rpc_types_eth::Transaction> {
+    if let Some(tx) = provider
+        .get_transaction_by_block_number_and_index(
+            BlockNumberOrTag::Number(l1_block_number),
+            tx_index as usize,
+        )
+        .await
+        .map_err(|e| {
+            L1Error::Provider(format!(
+                "get_tx({l1_block_number}#{tx_index} for {tx_hash}): {e}"
+            ))
+        })?
+    {
+        return Ok(tx);
+    }
+
+    event!(
+        name: "eez.l1.scan_batch_logs.tx_by_index_missing",
+        Level::WARN,
+        l1_block_number,
+        tx_index,
+        tx_hash = %tx_hash,
+        "postBatch tx missing by block/index; retrying same provider by hash",
+    );
+
+    provider
+        .get_transaction_by_hash(tx_hash)
+        .await
+        .map_err(|e| L1Error::Provider(format!("get_tx({tx_hash}): {e}")))?
+        .ok_or_else(|| L1Error::SourceIncomplete {
+            block: l1_block_number,
+            tx_hash,
+            detail: format!(
+                "block/index lookup returned null at tx index {tx_index}; tx-hash lookup also returned null"
+            ),
+        })
 }
 
 #[cfg(test)]
