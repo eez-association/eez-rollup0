@@ -50,9 +50,9 @@ services:
     network_mode: host
     restart: unless-stopped
     volumes:
-      - ${DEVNET_DATA_DIR:?set DEVNET_DATA_DIR}/rbuilder-data:/data
-      - ${DEVNET_DATA_DIR:?}/metadata:/testnet:ro
-      - ${DEVNET_JWT_FILE:?set DEVNET_JWT_FILE}:/jwt/jwtsecret:ro
+      - ./data/rbuilder-data:/data
+      - ./data/metadata:/testnet:ro
+      - ./data/jwt/jwtsecret:/jwt/jwtsecret:ro
     # VERIFY: ports 28545/28546 must not collide with eez-node's 18545/18546.
     command:
       - node
@@ -78,9 +78,9 @@ services:
       builder-reth:
         condition: service_started
     volumes:
-      - ${DEVNET_DATA_DIR:?}/rbuilder-bn-data:/data
-      - ${DEVNET_DATA_DIR:?}/metadata:/testnet:ro
-      - ${DEVNET_JWT_FILE:?}:/jwt/jwtsecret:ro
+      - ./data/rbuilder-bn-data:/data
+      - ./data/metadata:/testnet:ro
+      - ./data/jwt/jwtsecret:/jwt/jwtsecret:ro
     command:
       - lighthouse
       - beacon_node
@@ -130,8 +130,8 @@ services:
       DEVNET_BUILDER_COINBASE_KEY: ${DEVNET_BUILDER_COINBASE_KEY:?}
       DEVNET_BUILDER_RELAY_KEY: ${DEVNET_BUILDER_RELAY_KEY:?}
     volumes:
-      - ${DEVNET_DATA_DIR:?}/rbuilder-data:/data
-      - ${DEVNET_DATA_DIR:?}/metadata:/testnet:ro
+      - ./data/rbuilder-data:/data
+      - ./data/metadata:/testnet:ro
       - ./config/rbuilder.toml:/config/rbuilder.toml:ro
     # VERIFY: rbuilder does not expand ${...} inside the TOML itself — if the
     # relay url / key envs don't interpolate, render the config or pass them

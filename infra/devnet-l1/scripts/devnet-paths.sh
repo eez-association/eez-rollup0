@@ -8,6 +8,15 @@ DEVNET_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 devnet_resolve_path() {
     local p="$1"
+    # Legacy .env used repo-root paths; normalize to infra/devnet-l1/data.
+    case "$p" in
+        ./infra/devnet-l1/data)
+            p="./data"
+            ;;
+        ./infra/devnet-l1/data/*)
+            p="./data/${p#./infra/devnet-l1/data/}"
+            ;;
+    esac
     if [[ "$p" == ./* ]]; then
         echo "$DEVNET_ROOT/${p#./}"
     else

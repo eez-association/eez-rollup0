@@ -14,6 +14,9 @@
 #
 # Run genesis generation first:  bash scripts/gen-genesis.sh
 # Then:  docker compose --env-file .env -f docker-compose.cl.yml up
+# Volume paths use ./data/... (relative to this compose file). gen-genesis.sh
+# writes there. Do NOT mount via DEVNET_DATA_DIR — compose resolves env paths
+# relative to infra/devnet-l1/, so repo-root-style paths double up and mount empty dirs.
 services:
   # One-shot: load genesis validator keystores into the VC datadir.
   # See scripts/validator-import.sh (handles generator layout + empty passphrase).
@@ -21,9 +24,9 @@ services:
     image: sigp/lighthouse:v8.1.2
     network_mode: host
     volumes:
-      - ${DEVNET_DATA_DIR:?set DEVNET_DATA_DIR}/validator-keys:/keys:ro
-      - ${DEVNET_DATA_DIR:?}/metadata:/testnet:ro
-      - ${DEVNET_DATA_DIR:?}/vc-data:/vc-data
+      - ./data/validator-keys:/keys:ro
+      - ./data/metadata:/testnet:ro
+      - ./data/vc-data:/vc-data
       - ./scripts/validator-import.sh:/validator-import.sh:ro
     entrypoint: ["/bin/sh", "/validator-import.sh"]
 
@@ -37,9 +40,9 @@ services:
       validator-import:
         condition: service_completed_successfully
     volumes:
-      - ${DEVNET_DATA_DIR:?}/bn-data:/data
-      - ${DEVNET_DATA_DIR:?}/metadata:/testnet:ro
-      - ${DEVNET_JWT_FILE:?set DEVNET_JWT_FILE}:/jwt/jwtsecret:ro
+      - ./data/bn-data:/data
+      - ./data/metadata:/testnet:ro
+      - ./data/jwt/jwtsecret:/jwt/jwtsecret:ro
     command:
       - lighthouse
       - beacon_node
@@ -73,8 +76,8 @@ services:
       beacon:
         condition: service_started
     volumes:
-      - ${DEVNET_DATA_DIR:?}/vc-data:/vc-data
-      - ${DEVNET_DATA_DIR:?}/metadata:/testnet:ro
+      - ./data/vc-data:/vc-data
+      - ./data/metadata:/testnet:ro
     command:
       - lighthouse
       - validator_client
