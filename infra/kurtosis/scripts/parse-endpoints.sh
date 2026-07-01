@@ -48,12 +48,12 @@ discover_builder_service() {
 # Execution JSON-RPC (8545), not engine-rpc (8551).
 parse_el_from_inspect() {
     echo "$INSPECT" | grep -E '[[:space:]]rpc: 8545/tcp' | head -1 \
-        | sed -n 's/.*->[[:space:]]*\(http:\/\/)*\([^[:space:]]*\).*/\2/p'
+        | sed -n 's/.*->[[:space:]]*\(http:\/\/\)*\([^[:space:]]*\).*/\2/p'
 }
 
 parse_builder_from_inspect() {
     echo "$INSPECT" | grep -E 'rbuilder-rpc:' | head -1 \
-        | sed -n 's/.*->[[:space:]]*\(http:\/\/)*\([^[:space:]]*\).*/\2/p'
+        | sed -n 's/.*->[[:space:]]*\(http:\/\/\)*\([^[:space:]]*\).*/\2/p'
 }
 
 el_raw=""
@@ -82,13 +82,41 @@ if [[ -z "$el_raw" ]]; then
 fi
 
 el_rpc="$(to_http "$el_raw")"
-builder_rpc="$(to_http "${builder_raw:-http://127.0.0.1:37000}")"
+# rbuilder's bundle endpoint (port id "rbuilder-rpc"/8645) publishes in the EL
+# range, NOT the mev range. If discovery failed, fall back to the EL host and
+# warn — a wrong builder URL silently drops every bundle, so make it loud.
+if [[ -z "$builder_raw" ]]; then
+    echo "note: rbuilder-rpc not auto-found; set EEZ_L1_BUILDER_RPC_URL by hand" >&2
+    echo "  (kurtosis port print $ENCLAVE el-5-reth-builder-lighthouse rbuilder-rpc)" >&2
+    builder_raw="$el_raw"
+fi
+builder_rpc="$(to_http "$builder_raw")"
 
-cat >"$OUT" <<EOF
-EEZ_L1_RPC_URL=$el_rpc
-EEZ_L1_TARGET_RPC_URL=$el_rpc
-EEZ_L1_BUILDER_RPC_URL=$builder_rpc
-EOF
+# Additional-services ports (published from public_port_start: 36000). Names
+# vary by ethereum-package version, so try `port print` then fall back to
+# grepping the inspect output. Empty is fine — reorg-scheduler.sh has its own
+# default and these are only used when disruptoor/dora are enabled.
+port_by_grep() {  # $1 = service-name regex, $2 = port-name
+    echo "$INSPECT" | grep -E "$1" -A6 | grep -E "[[:space:]]$2:" | head -1 \
+        | sed -n 's/.*->[[:space:]]*\(http:\/\/\)*\([^[:space:]]*\).*/\2/p'
+}
+
+disruptoor_raw=""
+disruptoor_raw="$(try_port disruptoor http || true)"
+[[ -n "$disruptoor_raw" ]] || disruptoor_raw="$(port_by_grep 'disruptoor' 'http' || true)"
+
+dora_raw=""
+dora_raw="$(try_port dora http || true)"
+[[ -n "$dora_raw" ]] || dora_raw="$(port_by_grep '(^|[[:space:]])dora' 'http' || true)"
+
+{
+    echo "EEZ_L1_RPC_URL=$el_rpc"
+    echo "EEZ_L1_TARGET_RPC_URL=$el_rpc"
+    echo "EEZ_L1_BUILDER_RPC_URL=$builder_rpc"
+    [[ -n "$disruptoor_raw" ]] && echo "EEZ_DISRUPTOOR_URL=$(to_http "$disruptoor_raw")"
+    [[ -n "$dora_raw" ]] && echo "EEZ_DORA_URL=$(to_http "$dora_raw")"
+} >"$OUT"
 
 echo "wrote $OUT"
 cat "$OUT"
+[[ -n "$disruptoor_raw" ]] || echo "note: disruptoor URL not auto-found; set EEZ_DISRUPTOOR_URL by hand (see 'kurtosis enclave inspect $ENCLAVE')" >&2

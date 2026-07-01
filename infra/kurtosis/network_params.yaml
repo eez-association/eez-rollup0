@@ -31,12 +31,22 @@ mev_params:
   mev_builder_subsidy: 1
 
 additional_services:
-  - spamoor
-  - disruptoor
+  - spamoor      # L1 blockspace load (tune throughput below)
+  - disruptoor   # reorg primitive; driven by scripts/reorg-scheduler.sh (needs --privileged)
+  - dora         # block/reorg explorer — confirm reorg depth visually
+  - forkmon      # fork-choice / reorg monitor across the 4 CL nodes
 
+# Disruptoor starts healthy (no partitions). scripts/reorg-scheduler.sh drives
+# it at runtime via the HTTP API (PUT /v1/state, POST /v1/state/clear), using:
+#   minority = participants 3,4   majority = participants 1,2   component = cl
+
+# L1 blockspace load. throughput = txs/block/spammer; 150 eoatx ≈ 5% of the
+# 60M gas limit — low on purpose to leave room for EEZ postBatch bundles.
+# Tuning math + live-adjust via the spamoor UI: see README "Spamoor".
 spamoor_params:
   spammers:
     - scenario: eoatx
+      name: baseline-load
       config:
         throughput: 150
 
@@ -47,3 +57,8 @@ port_publisher:
   mev:
     enabled: true
     public_port_start: 37000
+  # Exposes disruptoor HTTP API + dora + forkmon + spamoor UI to the host so
+  # reorg-scheduler.sh and parse-endpoints.sh can reach them.
+  additional_services:
+    enabled: true
+    public_port_start: 36000
