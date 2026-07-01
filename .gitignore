@@ -13,5 +13,9 @@ deployments.env
 # Default L2 datadir if it lands in the repo
 datadir/
 
+# Kurtosis devnet local config (may contain keys)
+infra/kurtosis/.env
+infra/kurtosis/endpoints.env
+
 chiado-db*/
 data/

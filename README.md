@@ -113,6 +113,8 @@ effect:
 EEZ_WAVE_COUNT=5 bash scripts/devnet-test.sh
 ```
 
+Kurtosis devnet (private L1 + rbuilder): see [infra/kurtosis/README.md](infra/kurtosis/README.md).
+
 ## Build, test, teardown
 
 ```bash

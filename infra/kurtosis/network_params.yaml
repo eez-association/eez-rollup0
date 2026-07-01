@@ -1,0 +1,48 @@
+# Kurtosis args for ethpandaops/ethereum-package (12s L1, reth-rbuilder, spamoor).
+# Launch: infra/kurtosis/scripts/kurtosis-up.sh
+
+participants:
+  - el_type: reth
+    el_image: ghcr.io/paradigmxyz/reth:latest
+    cl_type: lighthouse
+    cl_image: sigp/lighthouse:v8.1.2
+    count: 2
+  - el_type: reth
+    cl_type: lighthouse
+    count: 2
+
+network_params:
+  network_id: "eez7331"
+  seconds_per_slot: 12
+  slot_duration_ms: 12000
+  genesis_gaslimit: 60000000
+  min_validator_withdrawability_delay: 1
+  shard_committee_period: 1
+  deneb_fork_epoch: 0
+  electra_fork_epoch: 0
+
+mev_type: flashbots
+mev_params:
+  mev_builder_image: ethpandaops/reth-rbuilder:develop
+  mev_relay_image: ethpandaops/mev-boost-relay:main
+  mev_boost_image: ethpandaops/mev-boost:develop
+  mev_builder_cl_image: sigp/lighthouse:v8.1.2
+  mev_builder_subsidy: 1
+
+additional_services:
+  - spamoor
+  - disruptoor
+
+spamoor_params:
+  spammers:
+    - scenario: eoatx
+      config:
+        throughput: 150
+
+port_publisher:
+  el:
+    enabled: true
+    public_port_start: 32000
+  mev:
+    enabled: true
+    public_port_start: 37000
