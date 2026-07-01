@@ -52,6 +52,25 @@ else
     head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$DATA_DIR/jwt/jwtsecret"
 fi
 
+echo "==> verifying CL testnet artifacts"
+required=(
+    metadata/genesis.json
+    metadata/config.yaml
+    metadata/genesis.ssz
+    metadata/deposit_contract_block.txt
+    metadata/deposit_contract.txt
+)
+for rel in "${required[@]}"; do
+    if [[ ! -e "$DATA_DIR/$rel" ]]; then
+        echo "gen-genesis: missing $DATA_DIR/$rel — CL/EL generation likely failed" >&2
+        exit 1
+    fi
+done
+if [[ ! -d "$DATA_DIR/validator-keys/keys" ]] && ! compgen -G "$DATA_DIR/validator-keys/*/voting-keystore.json" >/dev/null; then
+    echo "gen-genesis: no validator keystores under $DATA_DIR/validator-keys/" >&2
+    exit 1
+fi
+
 echo
 echo "genesis ready:"
 echo "  EL genesis : $DATA_DIR/metadata/genesis.json"

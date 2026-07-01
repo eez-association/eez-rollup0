@@ -41,7 +41,10 @@ set -a
 # shellcheck disable=SC1090
 . "$ENV_FILE"
 set +a
-
+# shellcheck disable=SC1090
+source "$HERE/devnet-paths.sh"
+devnet_resolve_paths
+devnet_verify_cl_testnet_dir
 : "${EEZ_L1_CHAIN:?}"
 : "${EEZ_L1_CHAIN_PATH:?}"
 : "${EEZ_L1_JWT_SECRET:?}"

@@ -25,6 +25,10 @@ if [ -f "$ENV_FILE" ]; then
     # shellcheck disable=SC1090
     . "$ENV_FILE"
     set +a
+    # shellcheck disable=SC1090
+    source "$HERE/devnet-paths.sh"
+    devnet_resolve_paths
+    devnet_verify_cl_testnet_dir
 else
     echo "no $ENV_FILE — copy infra/devnet-l1/.env.example and edit it" >&2
     exit 1
