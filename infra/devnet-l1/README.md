@@ -62,6 +62,8 @@ in Docker; eez-node runs on the host.
 ```bash
 # 1. Generate matched EL+CL genesis, validator keys, and the shared JWT.
 bash infra/devnet-l1/scripts/gen-genesis.sh
+# (gen-genesis runs eth2-val-tools for validator keys too; if metadata/ already
+# exists but validator-keys/ is empty, run gen-validator-keys.sh instead.)
 
 # 2. Configure. Fund poster/proof keys from the mnemonic in config/values.env
 #    (index 0 is the prefunded deployer/faucet).
@@ -108,7 +110,9 @@ regenerate and wipe `EEZ_L1_DATADIR` + the compose `*-data` dirs.
 ```bash
 docker compose --env-file infra/devnet-l1/.env -f infra/devnet-l1/docker-compose.cl.yml down -v
 rm -rf infra/devnet-l1/data /tmp/eez-devnet-l1 /tmp/eez-devnet-l2
-bash infra/devnet-l1/scripts/gen-genesis.sh   # fresh genesis time
+bash infra/devnet-l1/scripts/gen-genesis.sh
+# (gen-genesis runs eth2-val-tools for validator keys too; if metadata/ already
+# exists but validator-keys/ is empty, run gen-validator-keys.sh instead.)   # fresh genesis time
 ```
 
 ## Status / caveats

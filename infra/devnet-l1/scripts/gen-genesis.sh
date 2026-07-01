@@ -36,13 +36,15 @@ echo "==> wiping previous genesis under $DATA_DIR"
 rm -rf "$DATA_DIR"
 mkdir -p "$DATA_DIR"
 
-echo "==> generating genesis with $GENESIS_GEN_IMAGE"
-# The generator ships default el/ + cl/ templates; we override inputs via
-# values.env mounted over its /config/values.env. 'all' = EL + CL + keys.
+echo "==> generating EL+CL genesis with $GENESIS_GEN_IMAGE"
+# 'all' = EL + CL genesis only (NOT validator keystores — see next step).
 docker run --rm \
     -v "$CONFIG_DIR/values.env:/config/values.env:ro" \
     -v "$DATA_DIR:/data" \
     "$GENESIS_GEN_IMAGE" all
+
+echo "==> generating validator keystores (eth2-val-tools in the same image)"
+bash "$HERE/gen-validator-keys.sh"
 
 echo "==> generating shared engine-API JWT"
 mkdir -p "$DATA_DIR/jwt"
@@ -66,8 +68,8 @@ for rel in "${required[@]}"; do
         exit 1
     fi
 done
-if [[ ! -d "$DATA_DIR/validator-keys/keys" ]] && ! compgen -G "$DATA_DIR/validator-keys/*/voting-keystore.json" >/dev/null; then
-    echo "gen-genesis: no validator keystores under $DATA_DIR/validator-keys/" >&2
+if [[ ! -d "$DATA_DIR/validator-keys/keys" ]]; then
+    echo "gen-genesis: missing $DATA_DIR/validator-keys/keys" >&2
     exit 1
 fi
 
