@@ -28,7 +28,7 @@ services:
       - ./data/metadata:/testnet:ro
       - ./data/vc-data:/vc-data
       - ./scripts/validator-import.sh:/validator-import.sh:ro
-    entrypoint: ["/bin/sh", "/validator-import.sh"]
+    entrypoint: ["/bin/bash", "/validator-import.sh"]
 
   beacon:
     image: sigp/lighthouse:v8.1.2
