@@ -250,8 +250,11 @@ pub fn build_batch(
 ///
 /// `calls` are the recorded calls targeting the L1 (i.e. `group_calls_for(L1)`
 /// in `finalize`). `destination_rollup_id` is the settled rollup the entry
-/// routes to (cosmetic for immediate entries — only queued entries past the
-/// transient prefix are routed via `verificationByRollup[destRid].queue`).
+/// routes to. It does NOT affect the inline drain's routing (immediates run via
+/// `attemptApplyImmediate`, not the queue), BUT it is load-bearing: `EEZ`'s
+/// `_validateStructure` requires every entry's `destinationRollupId ∈ batch`
+/// (and `MAINNET(0)` is rejected), so a wrong id reverts the whole batch — the
+/// composer rewrites it to `rid` and `assert_batch_registry_native` enforces it.
 ///
 /// `stateDeltas` (settling the L2 root) are attached downstream by
 /// `prepare_post_batch` — one chained `R_{k-1}→R_k` delta per entry; this

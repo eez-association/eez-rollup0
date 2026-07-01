@@ -144,10 +144,14 @@ pub fn build_inbound_system_txs(
 /// one-tx-per-entry shape. Each tx stages a single entry that the
 /// immediately-following user tx's `EEZL2.executeCrossChainCall` consumes,
 /// so the SyncPair block layout is `[load_1 | user_1 | load_2 | user_2 | …]`.
-/// `loadExecutionTable` self-cleans on every call (`EEZL2.sol:148-159`), so
-/// interleaving each load with its own user tx keeps every entry consumed
-/// before the next load wipes the table — a single batched table would not
-/// survive the per-pair self-clean.
+/// Per-outbound-load is a deliberate FAILURE-ISOLATION choice, NOT forced: a
+/// single `loadExecutionTable([all entries])` followed by N user txs also works
+/// (`executionIndex` is persistent storage walked across txs by each
+/// `_consumeAndExecute`, `EEZL2.sol:404-410`). But each `loadExecutionTable`
+/// wipes the table AND resets `executionIndex = 0` (`EEZL2.sol:148-161`), so
+/// one load per entry isolates a reverting/desync'd withdrawal — it can't
+/// cascade-desync the cursor for the rest. Given that choice, each load's user
+/// tx must run before the next load wipes the table → the interleaved order.
 ///
 /// `starting_nonce` is the SYSTEM_ADDRESS account nonce at the L2 parent
 /// block; advanced by one per emitted tx (callers don't thread nonces).
@@ -212,14 +216,14 @@ pub struct SyncPair {
 /// The canonical Sync-block tx order: each pair's system tx immediately
 /// followed by its user tx (if any) — `[s_1, u_1?, s_2, u_2?, …]`.
 ///
-/// INTERLEAVED, not system-first: an outbound `loadExecutionTable`
-/// self-cleans the table on every call (`EEZL2.sol:148-159`), so each
-/// load's user tx MUST run before the next load wipes it. Both
-/// `build_sync_block` (the composer) and the deriver's reconstruction
-/// build their tx list through THIS fn, so the order is identical by
-/// construction (no system-first vs interleaved drift → no `to_block`
-/// root divergence). For inbound (all `user_tx == None`) it reduces to
-/// `[system_txs…]`, byte-identical to the prior system-first layout.
+/// INTERLEAVED, not system-first: GIVEN the per-outbound-load failure-isolation
+/// choice (see `build_outbound_load_table_txs`), each `loadExecutionTable` wipes
+/// + resets the cursor (`EEZL2.sol:148-161`), so each load's user tx must run
+/// before the next load. Both `build_sync_block` (the composer) and the
+/// deriver's reconstruction build their tx list through THIS fn, so the order
+/// is identical by construction (no system-first vs interleaved drift → no
+/// `to_block` root divergence). For inbound (all `user_tx == None`) it reduces
+/// to `[system_txs…]`, byte-identical to the prior system-first layout.
 #[must_use]
 pub fn interleave_sync_block_txs(pairs: &[SyncPair]) -> Vec<Bytes> {
     let mut out: Vec<Bytes> = Vec::with_capacity(pairs.len() * 2);
@@ -241,8 +245,9 @@ pub fn interleave_sync_block_txs(pairs: &[SyncPair]) -> Vec<Bytes> {
 /// order with their own nonce sequencing — the source of the mixed-batch
 /// fork.)
 ///
-/// Canonical order (forced by `loadExecutionTable`'s per-call self-clean,
-/// `EEZL2.sol:148-159`, which `executeIncomingCrossChainCall` also triggers):
+/// Canonical order (given the per-outbound-load failure-isolation choice +
+/// `loadExecutionTable`'s table wipe + cursor reset, `EEZL2.sol:148-161`, which
+/// `executeIncomingCrossChainCall` also triggers):
 /// ALL outbound load+user pairs FIRST, THEN all inbound deliveries —
 /// `[load_0,user_0, …, load_{K-1},user_{K-1}, deliver_0, …, deliver_{M-1}]`.
 /// SYSTEM_ADDRESS nonces run strictly in that order from `starting_nonce`:

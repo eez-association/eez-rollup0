@@ -199,7 +199,6 @@ fn main() {
             for (i, t) in txs.iter().enumerate() {
                 use alloy_consensus::Transaction as _;
                 use alloy_eips::eip2718::Decodable2718 as _;
-                use reth_ethereum_primitives::TransactionSigned;
                 let mut s: &[u8] = t.as_ref();
                 let stx = TransactionSigned::decode_2718(&mut s).unwrap();
                 println!(
