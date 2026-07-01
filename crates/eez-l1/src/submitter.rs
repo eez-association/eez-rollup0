@@ -34,7 +34,7 @@ const TARGET_WAIT_BUDGET: Duration = Duration::from_secs(30);
 const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Initial block span for historical log scans. Wide catch-up gaps are
 /// split before hitting RPCs that reject long `eth_getLogs` ranges.
-pub const LOG_SCAN_CHUNK_BLOCKS: u64 = 2_000;
+const LOG_SCAN_CHUNK_BLOCKS: u64 = 100_000;
 
 /// L1 block offset for [`BundleTarget::NextBlock`]. slack=2 (over the
 /// minimal latest+1) gives a one-block cushion for when our local

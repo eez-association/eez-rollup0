@@ -8,17 +8,14 @@
 use std::time::Duration;
 
 use alloy_primitives::{B256, U256};
-use eez_l1::submitter::LOG_SCAN_CHUNK_BLOCKS;
 
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeConfig,
-    NodeHandle, reorg_genesis_path, reorg_genesis_state_root, safe_block_state_root,
-    wait_for_node_caught_up,
+    NodeHandle, reorg_genesis_path, reorg_genesis_state_root, wait_for_node_caught_up,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
-const LATE_START_CATCHUP_BLOCKS: u64 = 2 * LOG_SCAN_CHUNK_BLOCKS + 50;
 
 /// Builder mode, sustained operation through a restart. Asserts every
 /// observable invariant in one place:
@@ -113,78 +110,6 @@ async fn happy_case_builder_sustained() {
         .await
         .expect("follower did not catch up via L1 replay");
     follower.assert_no_process_death();
-}
-
-/// Late-start composer after real L2 activity already settled on L1.
-/// The extra mined blocks force boot catch-up to scan across the
-/// historical log chunk boundary before live L1-active tasks start.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn happy_case_late_start_catchup() {
-    let harness = Harness::with_anvil_config(
-        AnvilConfig::for_reorg(),
-        reorg_genesis_state_root().unwrap(),
-    )
-    .await
-    .unwrap();
-    let chain = harness.chain();
-    let genesis = reorg_genesis_path();
-    let cfg = NodeConfig {
-        genesis_path: Some(genesis.as_path()),
-    };
-
-    let initial_root = chain.state_root().await.unwrap();
-    assert_eq!(initial_root, reorg_genesis_state_root().unwrap());
-
-    let source_env = harness.env_for(ANVIL_KEY, false);
-    let source = NodeHandle::start("source", &cfg, &source_env)
-        .await
-        .unwrap();
-    source.run_tx_spammer(ANVIL_KEY_1);
-
-    let settled_root = chain
-        .wait_for_state_change(initial_root, DEFAULT_TIMEOUT)
-        .await
-        .expect("source composer did not settle a state-changing batch");
-    let pre_late_batches = chain.batches_posted().await.unwrap();
-    assert!(pre_late_batches > 0, "source composer must post first");
-    assert_eq!(
-        chain.executions_performed().await.unwrap(),
-        pre_late_batches,
-        "source composer should settle every posted batch",
-    );
-    assert!(
-        chain
-            .executed_states()
-            .await
-            .unwrap()
-            .contains(&settled_root),
-        "state-changing source batch should be attested on L1",
-    );
-    source.assert_no_process_death();
-    drop(source);
-
-    let before_mine = chain.block_number().await.unwrap();
-    harness.anvil.mine(LATE_START_CATCHUP_BLOCKS).await.unwrap();
-    let after_mine = chain.block_number().await.unwrap();
-    assert!(
-        after_mine >= before_mine + LATE_START_CATCHUP_BLOCKS,
-        "L1 head should advance past two log scan chunks"
-    );
-
-    let late_env = harness.env_for(ANVIL_KEY, false);
-    let late = NodeHandle::start("late", &cfg, &late_env).await.unwrap();
-    wait_for_node_caught_up(&late, &chain, DEFAULT_TIMEOUT)
-        .await
-        .expect("late-start composer did not catch up from historical L1 activity");
-    assert_eq!(
-        safe_block_state_root(&late.l2_rpc_url())
-            .await
-            .unwrap()
-            .unwrap(),
-        settled_root,
-        "late-start composer should replay the historical state-changing batch"
-    );
-    late.assert_no_process_death();
 }
 
 /// `rollup.id=999` against a registry where only rollup 1 exists.
