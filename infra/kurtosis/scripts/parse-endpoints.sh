@@ -12,18 +12,82 @@ INSPECT="$(kurtosis enclave inspect "$ENCLAVE")" || {
     exit 1
 }
 
-el_rpc="$(echo "$INSPECT" | grep -E 'el-1-.*rpc:' | head -1 | grep -oE 'http://127\.0\.0\.1:[0-9]+' || true)"
-[[ -z "$el_rpc" ]] && el_rpc="$(echo "$INSPECT" | grep -E 'el-.*rpc:' | head -1 | grep -oE 'http://127\.0\.0\.1:[0-9]+' || true)"
+to_http() {
+    local u="${1#"${1%%[![:space:]]*}"}"
+    u="${u%"${u##*[![:space:]]}"}"
+    [[ "$u" =~ ^https?:// ]] && echo "$u" || echo "http://$u"
+}
 
-builder_rpc="$(echo "$INSPECT" | grep -iE 'rbuilder|mev-builder' | grep -oE 'http://127\.0\.0\.1:[0-9]+' | head -1 || true)"
-[[ -z "$builder_rpc" ]] && builder_rpc="$(echo "$INSPECT" | grep -iE 'mev-' | grep -oE 'http://127\.0\.0\.1:[0-9]+' | head -1 || true)"
+# Prefer kurtosis port print (stable across inspect layout changes).
+try_port() {
+    kurtosis port print "$ENCLAVE" "$1" "$2" 2>/dev/null || return 1
+}
 
-[[ -n "$el_rpc" ]] || { echo "could not find EL RPC in inspect output" >&2; exit 1; }
+discover_el_service() {
+    echo "$INSPECT" | awk '
+        /^[=]* User Services/ { in_services=1; next }
+        in_services && /^[=]/ { exit }
+        in_services && /el-[0-9]+-reth/ {
+            match($0, /el-[0-9]+-reth[a-z0-9-]*/);
+            if (RSTART > 0) { print substr($0, RSTART, RLENGTH); exit }
+        }
+    '
+}
+
+discover_builder_service() {
+    echo "$INSPECT" | awk '
+        /^[=]* User Services/ { in_services=1; next }
+        in_services && /^[=]/ { exit }
+        in_services && /el-[0-9]+-reth-builder/ {
+            match($0, /el-[0-9]+-reth-builder[a-z0-9-]*/);
+            if (RSTART > 0) { print substr($0, RSTART, RLENGTH); exit }
+        }
+    '
+}
+
+# Execution JSON-RPC (8545), not engine-rpc (8551).
+parse_el_from_inspect() {
+    echo "$INSPECT" | grep -E '[[:space:]]rpc: 8545/tcp' | head -1 \
+        | sed -n 's/.*->[[:space:]]*\(http:\/\/)*\([^[:space:]]*\).*/\2/p'
+}
+
+parse_builder_from_inspect() {
+    echo "$INSPECT" | grep -E 'rbuilder-rpc:' | head -1 \
+        | sed -n 's/.*->[[:space:]]*\(http:\/\/)*\([^[:space:]]*\).*/\2/p'
+}
+
+el_raw=""
+for svc in el-1-reth-lighthouse "$(discover_el_service)"; do
+    [[ -n "$svc" ]] || continue
+    if el_raw="$(try_port "$svc" rpc)"; then
+        break
+    fi
+done
+[[ -n "$el_raw" ]] || el_raw="$(parse_el_from_inspect || true)"
+
+builder_raw=""
+for svc in el-5-reth-builder-lighthouse "$(discover_builder_service)"; do
+    [[ -n "$svc" ]] || continue
+    if builder_raw="$(try_port "$svc" rbuilder-rpc)"; then
+        break
+    fi
+done
+[[ -n "$builder_raw" ]] || builder_raw="$(parse_builder_from_inspect || true)"
+
+if [[ -z "$el_raw" ]]; then
+    echo "could not find EL RPC for enclave '$ENCLAVE'" >&2
+    echo "try: kurtosis port print $ENCLAVE el-1-reth-lighthouse rpc" >&2
+    echo "or:  kurtosis enclave inspect $ENCLAVE | grep -E 'rpc: 8545'" >&2
+    exit 1
+fi
+
+el_rpc="$(to_http "$el_raw")"
+builder_rpc="$(to_http "${builder_raw:-http://127.0.0.1:37000}")"
 
 cat >"$OUT" <<EOF
 EEZ_L1_RPC_URL=$el_rpc
 EEZ_L1_TARGET_RPC_URL=$el_rpc
-EEZ_L1_BUILDER_RPC_URL=${builder_rpc:-http://127.0.0.1:37000}
+EEZ_L1_BUILDER_RPC_URL=$builder_rpc
 EOF
 
 echo "wrote $OUT"
