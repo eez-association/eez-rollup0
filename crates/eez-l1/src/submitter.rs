@@ -743,27 +743,13 @@ async fn scan_next_batch_log_chunk(
     rollup_id: u64,
     chunks: &mut BatchLogChunks,
 ) -> L1Result<Option<Vec<ScannedBatch>>> {
-    while let Some((from, to)) = chunks.ranges.pop() {
-        match scan_batch_logs_range(provider, eez, rollup_id, from, to).await {
-            Ok(scanned) => return Ok(Some(scanned)),
-            Err(err) if from < to => {
-                let mid = from + (to - from) / 2;
-                chunks.ranges.push((mid + 1, to));
-                chunks.ranges.push((from, mid));
-                event!(
-                    name: "eez.l1.scan_batch_logs.split",
-                    Level::WARN,
-                    from,
-                    to,
-                    mid,
-                    error = %err,
-                    "BatchPosted scan range failed; splitting and retrying smaller ranges",
-                );
-            }
-            Err(err) => return Err(err),
-        }
-    }
-    Ok(None)
+    let Some((from, to)) = chunks.ranges.pop() else {
+        return Ok(None);
+    };
+
+    scan_batch_logs_range(provider, eez, rollup_id, from, to)
+        .await
+        .map(Some)
 }
 
 async fn scan_batch_logs_range(
