@@ -15,7 +15,8 @@
 # Run genesis generation first:  bash scripts/gen-genesis.sh
 # Then:  docker compose --env-file .env -f docker-compose.cl.yml up
 services:
-  # One-shot: import the generated validator keystores into the VC datadir.
+  # One-shot: load genesis validator keystores into the VC datadir.
+  # See scripts/validator-import.sh (handles generator layout + empty passphrase).
   validator-import:
     image: sigp/lighthouse:v8.1.2
     network_mode: host
@@ -23,16 +24,8 @@ services:
       - ${DEVNET_DATA_DIR:?set DEVNET_DATA_DIR}/validator-keys:/keys:ro
       - ${DEVNET_DATA_DIR:?}/metadata:/testnet:ro
       - ${DEVNET_DATA_DIR:?}/vc-data:/vc-data
-    entrypoint:
-      - lighthouse
-      - --testnet-dir=/testnet
-      - account
-      - validator
-      - import
-      - --directory=/keys/keys
-      - --datadir=/vc-data
-      - --reuse-password
-      - --stdin-inputs
+      - ./scripts/validator-import.sh:/validator-import.sh:ro
+    entrypoint: ["/bin/sh", "/validator-import.sh"]
 
   beacon:
     image: sigp/lighthouse:v8.1.2
