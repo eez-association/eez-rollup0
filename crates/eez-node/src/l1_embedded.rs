@@ -1,7 +1,11 @@
 //! Embedded L1 reth — config builder for the second `NodeBuilder` that
-//! composer mode launches alongside the L2 reth. Two modes:
+//! composer mode launches alongside the L2 reth. Three modes:
 //!   - **Dev** (vanilla EthereumNode, 5s auto-mine) — local smokes;
 //!     fast, deterministic, no beacon dependency. `EEZ_L1_CHAIN=dev`.
+//!   - **Devnet** (vanilla EthereumNode, CL-driven) — private PoS
+//!     devnet on a generated genesis, driven via engine-API by an
+//!     external lighthouse CL (beacon + validator). Real fork-choice,
+//!     so it can host MEV/rbuilder + reorg testing. `EEZ_L1_CHAIN=devnet`.
 //!   - **Chiado** (reth_gnosis::GnosisNode) — real chiado state from the
 //!     mounted datadir, driven via engine-API by an external lighthouse
 //!     CL. `EEZ_L1_CHAIN=chiado`.
@@ -35,13 +39,28 @@ pub enum L1ChainKind {
     /// `reth_gnosis::GnosisNode` loading the chiado preset; no
     /// auto-mine — engine API driven by an external lighthouse CL.
     Chiado,
+    /// Vanilla `EthereumNode` on a private PoS devnet genesis; no
+    /// auto-mine — engine API driven by an external lighthouse CL
+    /// (beacon + validator).
+    Devnet,
 }
 
 impl L1ChainKind {
     pub fn from_env() -> Self {
         match std::env::var("EEZ_L1_CHAIN").as_deref() {
             Ok("chiado") => Self::Chiado,
+            Ok("devnet") => Self::Devnet,
             _ => Self::Dev,
+        }
+    }
+
+    /// Short label for structured-logging `kind` fields. Single source
+    /// of truth for `main.rs`'s embedded-L1 launch events.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dev => "dev",
+            Self::Chiado => "chiado",
+            Self::Devnet => "devnet",
         }
     }
 }
@@ -122,6 +141,27 @@ pub fn build_chiado_node_config(cfg: &EmbeddedL1Config) -> Result<NodeConfig<Gno
     // Reth's async StateRootTask computes wrong roots for gnosis chains
     // in this reth pin (→ "incorrect state root" / SIGABRT on chiado
     // newPayload); force the legacy synchronous path (as the Dev L1 does).
+    node_cfg.engine.legacy_state_root_task_enabled = true;
+    Ok(node_cfg)
+}
+
+/// Build a reth `NodeConfig<ChainSpec>` for the private PoS devnet L1
+/// (vanilla `EthereumNode`). Used when `kind == Devnet`.
+pub fn build_devnet_node_config(cfg: &EmbeddedL1Config) -> Result<NodeConfig<ChainSpec>> {
+    let (network_args, mut rpc_args) = build_network_rpc_args(cfg)?;
+    // External lighthouse (docker/host) dials the engine API in — bind
+    // to all interfaces (JWT guards it), same as the chiado path.
+    rpc_args.auth_addr = "0.0.0.0".parse().expect("static addr");
+    rpc_args.auth_jwtsecret = cfg.jwtsecret.clone();
+    let mut node_cfg = NodeConfig::new(cfg.dev_chain_spec.clone())
+        .with_datadir_args(DatadirArgs {
+            datadir: cfg.datadir.clone().into(),
+            ..DatadirArgs::default()
+        })
+        .with_network(network_args)
+        .with_rpc(rpc_args);
+    // No `.dev()` / block_time: blocks are CL-driven via engine API.
+    // Synchronous state-root path for determinism (matches Dev/Chiado).
     node_cfg.engine.legacy_state_root_task_enabled = true;
     Ok(node_cfg)
 }

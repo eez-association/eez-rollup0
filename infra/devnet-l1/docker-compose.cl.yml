@@ -1,0 +1,94 @@
+# Lighthouse beacon node + validator client for the EEZ private PoS L1
+# devnet. Drives the embedded reth (EthereumNode) running inside eez-node
+# (composer mode, EEZ_L1_CHAIN=devnet) over the engine API.
+#
+# Mirrors docker-compose.chiado.yml (the proven external-CL-drives-embedded-
+# reth pattern), with two differences for a self-contained devnet:
+#   1. --testnet-dir points at OUR generated genesis (data/metadata), not a
+#      public testnet config; no --checkpoint-sync-url (genesis-synced).
+#   2. a validator client runs OUR generated genesis validators, so the
+#      chain actually produces + finalizes blocks (no external proposers).
+#
+# network_mode: host so lighthouse reaches eez-node's authrpc on the host
+# (default 127.0.0.1:18546, EEZ_L1_AUTH_PORT).
+#
+# Run genesis generation first:  bash scripts/gen-genesis.sh
+# Then:  docker compose --env-file .env -f docker-compose.cl.yml up
+services:
+  # One-shot: import the generated validator keystores into the VC datadir.
+  validator-import:
+    image: sigp/lighthouse:v8.1.2
+    network_mode: host
+    volumes:
+      - ${DEVNET_DATA_DIR:?set DEVNET_DATA_DIR}/validator-keys:/keys:ro
+      - ${DEVNET_DATA_DIR:?}/metadata:/testnet:ro
+      - ${DEVNET_DATA_DIR:?}/vc-data:/vc-data
+    entrypoint:
+      - lighthouse
+      - --testnet-dir=/testnet
+      - account
+      - validator
+      - import
+      - --directory=/keys/keys
+      - --datadir=/vc-data
+      - --reuse-password
+      - --stdin-inputs
+
+  beacon:
+    image: sigp/lighthouse:v8.1.2
+    container_name: eez-devnet-lighthouse-bn
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      validator-import:
+        condition: service_completed_successfully
+    volumes:
+      - ${DEVNET_DATA_DIR:?}/bn-data:/data
+      - ${DEVNET_DATA_DIR:?}/metadata:/testnet:ro
+      - ${DEVNET_JWT_FILE:?set DEVNET_JWT_FILE}:/jwt/jwtsecret:ro
+    command:
+      - lighthouse
+      - beacon_node
+      - --testnet-dir=/testnet
+      - --datadir=/data
+      - --listen-address=0.0.0.0
+      - --port=9400
+      - --quic-port=9401
+      - --http
+      - --http-address=127.0.0.1
+      - --http-port=5252
+      - --execution-endpoint=http://127.0.0.1:${EEZ_L1_AUTH_PORT:-18546}
+      - --jwt-secrets=/jwt/jwtsecret
+      # Single-node devnet: no peers to find. Allow zero-peer genesis start.
+      - --allow-insecure-genesis-sync
+      - --disable-packet-filter
+      # Propose blocks even with no peers (single beacon on this devnet).
+      - --subscribe-all-subnets
+      # Suggested fee recipient for locally-produced payloads.
+      - --suggested-fee-recipient=${DEVNET_FEE_RECIPIENT:-0x0000000000000000000000000000000000000000}
+    logging:
+      driver: "local"
+
+  validator:
+    image: sigp/lighthouse:v8.1.2
+    container_name: eez-devnet-lighthouse-vc
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      beacon:
+        condition: service_started
+    volumes:
+      - ${DEVNET_DATA_DIR:?}/vc-data:/vc-data
+      - ${DEVNET_DATA_DIR:?}/metadata:/testnet:ro
+    command:
+      - lighthouse
+      - validator_client
+      - --testnet-dir=/testnet
+      - --datadir=/vc-data
+      - --beacon-nodes=http://127.0.0.1:5252
+      - --suggested-fee-recipient=${DEVNET_FEE_RECIPIENT:-0x0000000000000000000000000000000000000000}
+      - --init-slashing-protection
+    logging:
+      driver: "local"
