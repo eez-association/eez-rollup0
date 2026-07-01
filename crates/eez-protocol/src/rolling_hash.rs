@@ -1,17 +1,19 @@
 //! Rolling-hash accumulators for the flat sequential protocol
-//! (invariant 6 commitment).
+//! (upstream's "invariant 6" commitment).
 //!
 //! Two distinct accumulators, one per on-chain fold site. The split is
-//! deliberate: the entry-level fold (`Rollups._processNCalls` /
-//! `_consumeNestedAction`) is **tagged** with a 1-byte
+//! deliberate: the entry-level fold (`EEZBase`'s `_rollingHash*`
+//! helpers, driven by `_processNCalls` / `_consumeNestedAction` on EEZ
+//! and EEZL2) is **tagged** with a 1-byte
 //! `CALL_BEGIN`/`CALL_END`/`NESTED_BEGIN`/`NESTED_END` discriminator
 //! and includes a per-event counter, while the static-subcall fold
-//! (`Rollups._processNLookupCalls` / `CrossChainManagerL2._processNLookupCalls`)
+//! (`EEZBase._processNLookupCalls`, shared by EEZ and EEZL2)
 //! is **untagged** and counter-less. Different on-chain byte layouts;
 //! making them different Rust types means a wrong fold is a type
 //! error rather than a fixture-time regression.
 //!
-//! # Byte layouts (verified against `sync-rollups-protocol@bc3bd66`)
+//! # Byte layouts (verified against the Solidity contracts in the
+//! `sync-rollups-protocol` submodule)
 //!
 //! Solidity uses `abi.encodePacked` everywhere; widths:
 //! - `bytes32` → 32 bytes
@@ -33,10 +35,10 @@
 //! Initial accumulator value for both is 32 bytes of zero
 //! (`bytes32(0)`).
 //!
-//! The on-chain sites this mirrors:
-//! - `sync-rollups-protocol/src/EEZ.sol:606,621,515,517` (entry fold)
-//! - `sync-rollups-protocol/src/CrossChainManagerL2.sol:296,307,234,236` (entry fold, L2)
-//! - `sync-rollups-protocol/src/EEZ.sol:818-826` (static subcall fold)
+//! The on-chain sites this mirrors (refs into the
+//! `sync-rollups-protocol` submodule):
+//! - `EEZBase.sol:305,311,317,323` — entry fold (shared by EEZ + EEZL2)
+//! - `EEZBase.sol:275` (`_processNLookupCalls`) — static subcall fold
 
 use sha3::{Digest, Keccak256};
 
@@ -57,8 +59,9 @@ pub const NESTED_END: u8 = 4;
 /// Tagged rolling-hash accumulator covering an entry's
 /// `entry.calls[]` + `entry.nestedActions[]` traversal.
 ///
-/// Mirrors the on-chain `_rollingHash` updated by
-/// `Rollups._processNCalls` / `_consumeNestedAction`. Used by the
+/// Mirrors the on-chain `_rollingHash` updated by `EEZBase`'s
+/// `_rollingHash*` helpers (driven by `_processNCalls` /
+/// `_consumeNestedAction` on EEZ/EEZL2). Used by the
 /// composer to derive `entry.rollingHash` per entry built.
 ///
 /// The accumulator is `bytes32(0)` initially and folds in four event
@@ -69,12 +72,12 @@ pub const NESTED_END: u8 = 4;
 ///
 /// `revertSpan` / `ContextResult` restoration: the on-chain
 /// `executeInContextAndRevert` revert payload carries the post-span values for
-/// `_rollingHash` / `_currentCallNumber` / `_lastNestedActionConsumed`
-/// (`EEZ.sol:625-645`); the outer flow restores all three. To
-/// model that off-chain, callers can snapshot the inner accumulator
-/// via [`current`](Self::current) before opening the span and write
-/// it back via [`restore`](Self::restore) after. There is no in-type
-/// span machinery — restore is a pure value swap.
+/// `_rollingHash` / `_currentCallNumber` / `_lastNestedActionConsumed`;
+/// the outer flow restores all three. To model that off-chain, callers
+/// can snapshot the inner accumulator via [`current`](Self::current)
+/// before opening the span and write it back via
+/// [`restore`](Self::restore) after. There is no in-type span
+/// machinery — restore is a pure value swap.
 #[derive(Debug, Clone)]
 pub struct EntryRollingHash {
     state: [u8; 32],
@@ -115,7 +118,7 @@ impl EntryRollingHash {
         h.update(self.state);
         h.update([CALL_BEGIN]);
         h.update(uint256_be(call_number));
-        self.state.copy_from_slice(h.finalize().as_slice());
+        self.state = h.finalize().into();
     }
 
     /// Append `keccak256(prev || CALL_END || callNumber || success || retData)`.
@@ -128,7 +131,7 @@ impl EntryRollingHash {
         h.update(uint256_be(call_number));
         h.update([u8::from(success)]);
         h.update(ret_data);
-        self.state.copy_from_slice(h.finalize().as_slice());
+        self.state = h.finalize().into();
     }
 
     /// Append `keccak256(prev || NESTED_BEGIN || nestedNumber)`.
@@ -137,7 +140,7 @@ impl EntryRollingHash {
         h.update(self.state);
         h.update([NESTED_BEGIN]);
         h.update(uint256_be(nested_number));
-        self.state.copy_from_slice(h.finalize().as_slice());
+        self.state = h.finalize().into();
     }
 
     /// Append `keccak256(prev || NESTED_END || nestedNumber)`.
@@ -146,13 +149,13 @@ impl EntryRollingHash {
         h.update(self.state);
         h.update([NESTED_END]);
         h.update(uint256_be(nested_number));
-        self.state.copy_from_slice(h.finalize().as_slice());
+        self.state = h.finalize().into();
     }
 }
 
 /// Untagged, counter-less rolling-hash accumulator for the
-/// static-subcall fold (`Rollups._processNLookupCalls` /
-/// `CrossChainManagerL2._processNLookupCalls`).
+/// static-subcall fold (`EEZBase._processNLookupCalls`, shared by EEZ
+/// and EEZL2).
 ///
 /// Distinct type from [`EntryRollingHash`] — the byte layout has no
 /// tag and no counter, so making this its own type prevents a wrong
@@ -191,7 +194,7 @@ impl StaticCallRollingHash {
         hasher.update(self.state);
         hasher.update([u8::from(success)]);
         hasher.update(ret_data);
-        self.state.copy_from_slice(hasher.finalize().as_slice());
+        self.state = hasher.finalize().into();
     }
 }
 

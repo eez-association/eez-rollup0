@@ -31,7 +31,7 @@ use crate::error::CompositionResult;
 use crate::executor::EntryChainClient;
 use crate::protocol::ChainProtocol;
 use crate::rollup_id::RollupId;
-use crate::types::Composition;
+use crate::types::{Composition, ExecutedAction};
 
 /// Run one cross-chain composition end-to-end.
 ///
@@ -51,21 +51,65 @@ use crate::types::Composition;
 /// surfaced by `simulate_source_tx` (decode / provider / EVM / per-call
 /// dispatch) or `finalize` (empty inputs, unknown target, invalid
 /// checkpoint, CCM failure).
-pub async fn compose_transaction<P: ChainProtocol + 'static>(
+pub async fn compose_transaction<
+    P: ChainProtocol
+        + crate::capabilities::SettlesOutbound
+        + crate::capabilities::ConsumesInbound
+        + 'static,
+>(
     protocol: &P,
     entry_client: &(dyn EntryChainClient<Protocol = P> + Send + Sync),
     raw_tx: &[u8],
     entry_id: RollupId,
     rollups: HashMap<RollupId, Rollup<P>>,
 ) -> CompositionResult<Composition<P>> {
+    compose_transaction_recorded(protocol, entry_client, raw_tx, entry_id, rollups)
+        .await
+        .map(|(composition, _recorded)| composition)
+}
+
+/// Same as [`compose_transaction`] but ALSO returns the builder's
+/// `recorded[..]` (the preorder list of dispatched cross-chain calls with
+/// their resolved outcomes) captured BEFORE `finalize` consumes the
+/// builder.
+///
+/// Callers that need a call's resolved `outcome` — e.g. the inbound L1→L2
+/// delivery, which builds the byte-locked `executeIncomingCrossChainCall`
+/// system tx from the L2 target's REAL `return_data` — use this; the
+/// [`Composition`] alone does not carry verbatim per-call return data.
+///
+/// # Errors
+///
+/// Same as [`compose_transaction`].
+#[tracing::instrument(
+    level = "debug",
+    name = "compose_transaction",
+    skip_all,
+    fields(entry = %entry_id, tx_len = raw_tx.len()),
+    err,
+)]
+pub async fn compose_transaction_recorded<
+    P: ChainProtocol
+        + crate::capabilities::SettlesOutbound
+        + crate::capabilities::ConsumesInbound
+        + 'static,
+>(
+    protocol: &P,
+    entry_client: &(dyn EntryChainClient<Protocol = P> + Send + Sync),
+    raw_tx: &[u8],
+    entry_id: RollupId,
+    rollups: HashMap<RollupId, Rollup<P>>,
+) -> CompositionResult<(Composition<P>, Vec<ExecutedAction<P>>)> {
     let mut builder = CompositionBuilder::new(entry_id, rollups);
     entry_client
         .simulate_source_tx(raw_tx.to_vec(), &mut builder)
         .await?;
-    builder.finalize(protocol, raw_tx).await
+    let recorded = builder.recorded().to_vec();
+    let composition = builder.finalize(protocol, raw_tx).await?;
+    Ok((composition, recorded))
 }
 
-// Integration tests live in tests/compose.rs. They exercise this
-// pipeline against a minimal chain-agnostic MockProtocol — the crate
-// can't depend on a concrete ChainProtocol impl, so the mock lives in
-// the test harness.
+// This pipeline is exercised by the in-crate `#[cfg(test)]` modules
+// (e.g. `composition`, `composer`) against minimal chain-agnostic
+// `FakeProtocol` impls — the crate can't depend on a concrete
+// `ChainProtocol`, so the fakes live in those test modules.

@@ -1,14 +1,14 @@
 //! The [`ChainProtocol`] trait — the extension point for chain-specific logic.
 //!
-//! EVM is the first implementation (in `eez-evm`). Non-EVM chains
-//! implement the same trait with their own types.
+//! EVM is the first implementation (in `eez-evm`, Step 5).
+//! Non-EVM chains implement the same trait with their own types.
 //!
 //! # Static dispatch by design
 //!
 //! [`ChainProtocol`] is intentionally not dyn-compatible: it has seven
 //! associated types (`Address`, `Value`, `Calldata`, `Batch`, `Overlay`,
 //! `Witness`, `Dialect`) and `Self` appears in argument positions via
-//! [`RecordedCall<Self>`]. Both independently block use as
+//! [`ExecutedAction<Self>`]. Both independently block use as
 //! `dyn ChainProtocol`.
 //!
 //! This is the right shape for what the trait encodes: the chain
@@ -22,7 +22,7 @@
 //! A new chain family contributes exactly one `impl ChainProtocol`:
 //!
 //! ```ignore
-//! use eez_protocol::{ChainProtocol, RecordedCall, RollupId, ProtocolResult};
+//! use eez_protocol::{ChainProtocol, ExecutedAction, RollupId, ProtocolResult};
 //! use eez_protocol::composer::SourceAttribution;
 //!
 //! /// Unit struct — state lives on CompositionBuilder, not here.
@@ -39,7 +39,7 @@
 //!
 //!     fn build_batch(
 //!         &self,
-//!         recorded: &[RecordedCall<Self>],
+//!         recorded: &[ExecutedAction<Self>],
 //!         attribution: &SourceAttribution<'_>,
 //!         dialect: &Self::Dialect,
 //!         source_rollup_id: RollupId,
@@ -77,7 +77,7 @@ use serde::{Serialize, de::DeserializeOwned};
 )]
 use crate::error::{ProtocolError, ProtocolErrorKind, ProtocolResult};
 use crate::rollup_id::RollupId;
-use crate::types::RecordedCall;
+use crate::types::ExecutedAction;
 
 /// Defines how a specific chain constructs cross-chain entries.
 ///
@@ -98,8 +98,8 @@ pub trait ChainProtocol: Send + Sync {
     /// Chain-specific calldata type (EVM: `Bytes`).
     type Calldata: Clone + std::fmt::Debug + Send + Sync;
     /// Chain-shaped batch destined for one rollup's table-loading
-    /// entry point — `EEZ.postVerifyAndExecuteOrSaveExecutionsFromBatch`
-    /// (L1-style) or `CrossChainManagerL2.loadExecutionTable`
+    /// entry point — `EEZ.postAndVerifyBatch`
+    /// (L1-style) or `EEZL2.loadExecutionTable`
     /// (L2-style) on EVM. Built by
     /// [`build_batch`](Self::build_batch); encoded into calldata by
     /// [`encode_postbatch`](Self::encode_postbatch) /
@@ -110,22 +110,22 @@ pub trait ChainProtocol: Send + Sync {
     type Batch: Clone + Send + Sync;
     /// Chain-specific state overlay (accumulated changes for gRPC continuation).
     type Overlay: Serialize + DeserializeOwned + Clone + Send;
-    /// Chain-specific state witness (for proving — zisk, etc.).
+    /// Chain-specific state witness (for proving).
     type Witness: Serialize + DeserializeOwned + Clone + Send;
     /// Per-chain dialect: ABI-selection + entry-emission rules.
     ///
     /// Captures the concrete differences between chain families
     /// (e.g. L1 `EEZ.executeL1ToL2Call` vs L2
-    /// `CrossChainManagerL2.executeIncomingCrossChainCall`) so that
-    /// generic orchestration code in `eez-protocol` can dispatch
-    /// to a single `encode_follower_trigger` method without naming
-    /// chain-specific types.
+    /// `EEZL2.executeIncomingCrossChainCall`) so that
+    /// generic orchestration code in `eez-protocol` can
+    /// dispatch to a single `encode_follower_trigger` method without
+    /// naming chain-specific types.
     ///
     /// Stored on [`crate::composer::TargetConfig`] so each rollup
     /// carries its own dialect without global mutable state. The
     /// concrete type lives in the chain-specific crate
-    /// (`eez-evm`), keeping `eez-protocol` free of EVM
-    /// imports.
+    /// (`eez-evm`), keeping `eez-protocol` free
+    /// of EVM imports.
     type Dialect: Clone + std::fmt::Debug + Send + Sync + 'static;
 
     // ── Protocol logic ──────────────────────────────────────────
@@ -151,24 +151,31 @@ pub trait ChainProtocol: Send + Sync {
     /// invalid call ordering, …).
     fn build_batch(
         &self,
-        recorded: &[RecordedCall<Self>],
+        recorded: &[ExecutedAction<Self>],
         attribution: &crate::composer::SourceAttribution<'_>,
         dialect: &Self::Dialect,
         source_rollup_id: RollupId,
         raw_tx: &[u8],
     ) -> ProtocolResult<Self::Batch>;
 
+    // The L1-side settle-outbound builder ("build_l1_postbatch") is NOT a core
+    // method — it is the [`SettlesOutbound`](crate::capabilities::SettlesOutbound)
+    // capability. Only chains that host the canonical proof + settle L2→L1 calls
+    // implement it; `CompositionBuilder::finalize` bounds on it. This keeps the
+    // core trait outbound-vendor-identical and makes "settles outbound" a
+    // compile-time fact rather than a default that errors for non-settlers.
+
     /// Encode `batch` as the L1-style ZK-batch poster's calldata
-    /// (`EEZ.postVerifyAndExecuteOrSaveExecutionsFromBatch` — single
+    /// (`EEZ.postAndVerifyBatch` — single
     /// struct arg). Under the multi-prover ABI, proofs live inside
     /// the batch struct itself (`batch.inner.proofs[]`); callers
     /// populate `proofs[]` before encoding — see
-    /// `eez_evm_inspector::post_batch_submitter` for the
-    /// canonical fill+encode+submit pipeline.
+    /// `composer-lib::post_batch_submitter` (`submit_with_proof`) for
+    /// the canonical fill+encode+submit pipeline.
     fn encode_postbatch(&self, batch: &Self::Batch) -> Vec<u8>;
 
     /// Encode `batch` as the L2-style table-loader's calldata
-    /// (`CrossChainManagerL2.loadExecutionTable` — system-address
+    /// (`EEZL2.loadExecutionTable` — system-address
     /// gated, no proof field).
     fn encode_load_table(&self, batch: &Self::Batch) -> Vec<u8>;
 
@@ -189,7 +196,7 @@ pub trait ChainProtocol: Send + Sync {
 
     /// Whether this dialect routes its table-loading payload through
     /// the canonical proof-bundle poster (e.g. EVM L1-style →
-    /// `EEZ.postVerifyAndExecuteOrSaveExecutionsFromBatch`). Drives
+    /// `EEZ.postAndVerifyBatch`). Drives
     /// [`encode_table_payload`](Self::encode_table_payload)'s
     /// dispatch.
     fn dialect_is_zk_poster(&self, dialect: &Self::Dialect) -> bool {
@@ -224,39 +231,18 @@ pub trait ChainProtocol: Send + Sync {
     /// it; current EVM dialects ignore it.
     fn encode_follower_trigger(
         &self,
-        call: &RecordedCall<Self>,
+        call: &ExecutedAction<Self>,
         source_rollup_id: RollupId,
         raw_tx: &[u8],
         dialect: &Self::Dialect,
     ) -> Vec<u8>;
-
-    /// Encode the **single fused** inbound-delivery system tx for a
-    /// follower rollup that is the target of an arriving cross-chain
-    /// call: `executeIncomingCrossChainCall(...)` atomically loads the
-    /// execution table AND consumes `entries[0]`
-    /// (`SYNC_ROLLUPS_PROTOCOL_SPEC.md §B / line 642`, `EEZL2.sol:174-212`).
-    ///
-    /// Used when the outer call is **arriving**
-    /// (`call.original_rollup_id == follower_rollup_id`); originating
-    /// calls use the 2-tx `loadExecutionTable` + `executeL1ToL2Call`
-    /// path. The default returns `None`; protocols with a fused entry
-    /// point override it.
-    fn encode_inbound_delivery(
-        &self,
-        outer: &RecordedCall<Self>,
-        batch: &Self::Batch,
-        dialect: &Self::Dialect,
-    ) -> Option<Vec<u8>> {
-        let _ = (outer, batch, dialect);
-        None
-    }
 
     // ── Transport encoding (for gRPC byte serialization) ────────
     //
     // Round-trip invariant: for every `x` of the appropriate type,
     // `decode_X(&encode_X(&x))` must return a value equal to `x`.
     // The gRPC transport (and any future wire format) relies on
-    // this — `ExecutionRequest` / `RecordedCall` fields cross the
+    // this — `ExecutionRequest` / `ExecutedAction` fields cross the
     // wire by encoding each chain-specific field individually.
     // Impls that add padding, timestamps, or other non-deterministic
     // decoration break this contract.
@@ -288,4 +274,16 @@ pub trait ChainProtocol: Send + Sync {
     /// Returns [`ProtocolErrorKind::InvalidEncoding`] if `bytes` cannot be
     /// parsed as valid calldata for this chain.
     fn decode_calldata(&self, bytes: &[u8]) -> ProtocolResult<Self::Calldata>;
+
+    /// The cross-chain message identity `H` — the single cross-layer join key.
+    ///
+    /// Both the PRODUCER and the CONSUMER of a message MUST derive `H` through
+    /// this one method (the layer-2 matching proof keys on it), so an
+    /// implementor cannot supply `H` out-of-band. Required: the hash preimage is
+    /// chain-specific.
+    ///
+    /// `m`'s rollup ids are REGISTRY ids (see [`Message`](crate::message::Message)):
+    /// `H` must be the identity BOTH chains agree on — the L1-registry-assigned
+    /// id, not a chain's native chain id.
+    fn message_id(&self, m: &crate::message::Message<'_, Self>) -> [u8; 32];
 }

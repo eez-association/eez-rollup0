@@ -1,8 +1,9 @@
 //! EVM state overlay — accumulated state changes equivalent to reth's `BundleState`.
 //!
-//! Used for gRPC continuation: the server reconstructs executor state from
-//! the overlay + a base block. Canonical ordering: accounts by address,
-//! storage by key.
+//! Realizes `ChainProtocol::Overlay`. Currently carried as an empty default
+//! on checkpoints — gRPC Execute is a probe; the upstream
+//! overlay-continuation (server-side state reconstruction) was not
+//! vendored. Canonical ordering: accounts by address, storage by key.
 
 use alloy_primitives::{Address, B256, Bytes, U256};
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,7 @@ pub struct EvmOverlay {
 /// Single account's state change.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AccountOverlay {
+    /// Address whose account state changed.
     pub address: Address,
     /// Account lifecycle status (mirrors revm's `AccountStatus`).
     pub status: AccountStatus,
@@ -37,6 +39,7 @@ pub struct AccountOverlay {
 /// Determines how the state DB interprets missing storage slots.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[repr(u8)]
+#[allow(missing_docs)]
 pub enum AccountStatus {
     LoadedNotExisting = 0,
     Loaded = 1,
@@ -49,6 +52,7 @@ pub enum AccountStatus {
 }
 
 impl AccountStatus {
+    /// `true` if the account was destroyed during execution.
     pub fn was_destroyed(self) -> bool {
         matches!(
             self,
@@ -60,8 +64,11 @@ impl AccountStatus {
 /// Account balance, nonce, and code hash.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AccountInfo {
+    /// Account balance in wei.
     pub balance: U256,
+    /// Account nonce.
     pub nonce: u64,
+    /// Hash of the account's deployed bytecode.
     pub code_hash: B256,
 }
 
@@ -69,6 +76,7 @@ pub struct AccountInfo {
 /// Both needed for correct state root computation and rollback.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StorageOverlay {
+    /// The storage slot key.
     pub key: U256,
     /// Value before any calls (or before wipe).
     pub previous_or_original: U256,
@@ -79,7 +87,9 @@ pub struct StorageOverlay {
 /// Contract bytecode.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContractCode {
+    /// Hash of the bytecode.
     pub code_hash: B256,
+    /// Raw bytecode bytes.
     pub code: Bytes,
 }
 
