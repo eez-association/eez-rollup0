@@ -6,7 +6,8 @@
 #   1. bash infra/devnet-l1/scripts/gen-genesis.sh
 #   2. docker compose --env-file infra/devnet-l1/.env \
 #        -f infra/devnet-l1/docker-compose.cl.yml up -d
-#   3. bash infra/devnet-l1/scripts/run-devnet-l1.sh   (this script)
+#   3. bash infra/devnet-l1/scripts/deploy-eez.sh      (writes deployments.env)
+#   4. bash infra/devnet-l1/scripts/run-devnet-l1.sh   (this script)
 #
 # The CL will sit at slot 0 until GENESIS_DELAY elapses, then start driving
 # the embedded EL via engine API. eez-node's embedded reth produces NO blocks
@@ -44,6 +45,24 @@ if [ ! -f "$EEZ_L1_JWT_SECRET" ]; then
     echo "JWT not found at $EEZ_L1_JWT_SECRET — run gen-genesis.sh first" >&2
     exit 1
 fi
+
+# deploy-eez.sh writes here (registry/proof-system/rollupId/deploy-block).
+# eez-node's own dotenvy::from_filename("deployments.env") only looks in
+# CWD ($REPO), not infra/devnet-l1/ — source explicitly so composer mode
+# has EEZ_REGISTRY_ADDRESS etc without colliding with a root-level
+# deployments.env from the Chiado/Dev workflow.
+DEPLOYMENTS_FILE="${DEVNET_DEPLOYMENTS_FILE:-infra/devnet-l1/deployments.env}"
+if [ -f "$DEPLOYMENTS_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$DEPLOYMENTS_FILE"
+    set +a
+else
+    echo "no $DEPLOYMENTS_FILE — run infra/devnet-l1/scripts/deploy-eez.sh first" >&2
+    exit 1
+fi
+: "${EEZ_REGISTRY_ADDRESS:?}"
+: "${EEZ_ROLLUP_ID:?}"
 
 : "${EEZ_L2_GENESIS_PATH:=./datadir/genesis.json}"
 L2_P2P_PORT="${EEZ_L2_P2P_PORT:-30640}"

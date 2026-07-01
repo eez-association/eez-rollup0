@@ -40,15 +40,17 @@ additional_services:
 # it at runtime via the HTTP API (PUT /v1/state, POST /v1/state/clear), using:
 #   minority = participants 3,4   majority = participants 1,2   component = cl
 
-# L1 blockspace load. throughput = txs/block/spammer; 150 eoatx ≈ 5% of the
-# 60M gas limit — low on purpose to leave room for EEZ postBatch bundles.
-# Tuning math + live-adjust via the spamoor UI: see README "Spamoor".
+# L1 blockspace load. throughput = txs/block/spammer; 850 eoatx ≈ 30% of the
+# 60M gas limit (21k gas/eoatx) — mid-range of the Phase-3 target band
+# (10-50%), leaving room for EEZ postBatch bundles. Tuning math + live-adjust
+# via the spamoor UI: see README "Spamoor". Re-run kurtosis-up.sh to apply a
+# static change, or use the spamoor web UI for live retuning without restart.
 spamoor_params:
   spammers:
     - scenario: eoatx
       name: baseline-load
       config:
-        throughput: 150
+        throughput: 850
 
 port_publisher:
   el:

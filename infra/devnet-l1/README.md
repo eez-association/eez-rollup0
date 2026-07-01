@@ -72,7 +72,13 @@ $EDITOR infra/devnet-l1/.env
 docker compose --env-file infra/devnet-l1/.env \
   -f infra/devnet-l1/docker-compose.cl.yml up -d
 
-# 4. Start eez-node with the embedded devnet L1 (separate terminal).
+# 4. Deploy the EEZ protocol contracts onto the embedded L1. This is NOT
+#    optional (unlike Chiado, there is no pre-existing chain to deploy
+#    against ahead of time) — see the script's header for why it needs a
+#    disposable bootstrap pass. Writes infra/devnet-l1/deployments.env.
+bash infra/devnet-l1/scripts/deploy-eez.sh
+
+# 5. Start eez-node with the embedded devnet L1 (separate terminal).
 bash infra/devnet-l1/scripts/run-devnet-l1.sh
 ```
 

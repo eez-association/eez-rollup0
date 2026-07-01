@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# Proves the Kurtosis reth-rbuilder honors eth_sendBundle timestamp pins
-# (minTimestamp/maxTimestamp) — the one behavior the Python builder-stub
-# can't verify and that EEZ's BundleTarget::Exact depends on for correct
-# slot settlement (see crates/eez-l1/src/submitter.rs::post_bundle).
+# Proves the rbuilder honors eth_sendBundle timestamp pins (minTimestamp/
+# maxTimestamp) — the one behavior the Python builder-stub can't verify and
+# that EEZ's BundleTarget::Exact depends on for correct slot settlement (see
+# crates/eez-l1/src/submitter.rs::post_bundle).
 #
 # Two probes, both a value-0 self-transfer from the funded poster key:
 #   POSITIVE — pin the CORRECT target-slot timestamp → the tx MUST land by
@@ -17,19 +17,28 @@
 # proposes builder blocks after ~epoch 4 (~25 min post-genesis) — before that
 # the POSITIVE probe fails for warmup reasons, not a real bug (script warns).
 #
-# Env (sourced from endpoints.env + .env, override as needed):
+# Env (sourced from .env by default, override via SMOKE_ENV_FILES):
 #   EEZ_L1_RPC_URL, EEZ_L1_BUILDER_RPC_URL, EEZ_L1_POSTER_KEY
 #   EEZ_L1_SLOT_SECONDS   seconds per slot        (default 12)
 #   RBUILDER_SMOKE_SLACK  target = head + slack    (default 3)
+#
+# Run after the MEV stack is up and past warmup:
+#   bash infra/devnet-l1/scripts/smoke-rbuilder.sh
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
-for f in "$REPO/infra/kurtosis/endpoints.env" "$REPO/infra/kurtosis/.env"; do
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/../../.." && pwd)"
+ENV_FILE="${DEVNET_ENV_FILE:-$REPO/infra/devnet-l1/.env}"
+SMOKE_ENV_FILES="${SMOKE_ENV_FILES-$ENV_FILE}"
+for f in $SMOKE_ENV_FILES; do
     # shellcheck disable=SC1090
     [[ -f "$f" ]] && { set -a; source "$f"; set +a; }
 done
 
-RPC="${EEZ_L1_RPC_URL:?set EEZ_L1_RPC_URL (run parse-endpoints.sh)}"
+: "${EEZ_L1_RPC_URL:=http://127.0.0.1:${EEZ_L1_HTTP_PORT:-18545}}"
+: "${EEZ_L1_SLOT_SECONDS:=$(( ${EEZ_L1_BLOCK_TIME_MS:-12000} / 1000 ))}"
+
+RPC="${EEZ_L1_RPC_URL:?set EEZ_L1_RPC_URL}"
 BUILDER="${EEZ_L1_BUILDER_RPC_URL:?set EEZ_L1_BUILDER_RPC_URL}"
 KEY="${EEZ_L1_POSTER_KEY:?set EEZ_L1_POSTER_KEY (a funded prefunded account)}"
 SLOT="${EEZ_L1_SLOT_SECONDS:-12}"
