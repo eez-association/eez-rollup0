@@ -26,9 +26,9 @@ pub(crate) enum ErrorKind {
     /// `call_data`. Usually indicates a contract that posted a payload
     /// in a version we don't speak.
     Codec(eez_payload_codec::CodecError),
-    /// L1 exposed a log/header but not all source data needed to decode
-    /// the corresponding batch yet. Startup may retry this narrowly.
-    SourceIncomplete(String),
+    /// L1 catch-up scan failed. Callers can inspect nested typed L1 errors
+    /// through helper methods without deriver re-encoding their meaning.
+    L1Scan(eez_l1::L1Error),
     /// `BlockCommitter` actor task is gone; the deriver can't push
     /// safe-head advances any further.
     CommitterClosed,
@@ -49,11 +49,7 @@ impl DeriverError {
     }
 
     pub(crate) fn l1_scan(err: eez_l1::L1Error) -> Self {
-        if err.is_source_incomplete() {
-            Self::new(ErrorKind::SourceIncomplete(err.to_string()))
-        } else {
-            Self::l2_provider(format!("catch-up scan: {err}"))
-        }
+        Self::new(ErrorKind::L1Scan(err))
     }
 
     pub(crate) fn committer_closed() -> Self {
@@ -97,7 +93,7 @@ impl DeriverError {
     /// canonical item and the caller may retry after the source catches up.
     #[must_use]
     pub fn is_source_incomplete(&self) -> bool {
-        matches!(self.kind, ErrorKind::SourceIncomplete(_))
+        matches!(&self.kind, ErrorKind::L1Scan(err) if err.is_source_incomplete())
     }
 
     /// Returns true if the `BlockCommitter` actor task has exited.
@@ -157,7 +153,7 @@ impl fmt::Display for DeriverError {
         match &self.kind {
             ErrorKind::L2Provider(msg) => write!(f, "L2 provider error: {msg}"),
             ErrorKind::Codec(err) => write!(f, "payload codec error: {err}"),
-            ErrorKind::SourceIncomplete(msg) => write!(f, "L1 source incomplete: {msg}"),
+            ErrorKind::L1Scan(err) => write!(f, "L1 catch-up scan error: {err}"),
             ErrorKind::CommitterClosed => {
                 write!(f, "block committer actor task has exited")
             }
