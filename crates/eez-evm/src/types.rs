@@ -232,6 +232,24 @@ sol! {
     event ExecutionConsumed(
         bytes32 indexed crossChainCallHash, uint256 indexed rollupId, uint256 indexed executionQueueIndex
     );
+
+    /// Emitted by `EEZL2.executeCrossChainCall` (`EEZL2.sol:200`, decl
+    /// `EEZBase.sol:97`) each time an OUTBOUND L2→L1 call is consumed on L2 —
+    /// `crossChainCallHash` (topic1) is `computeCrossChainCallHash(targetRollupId,
+    /// target, value, data, sourceAddress, ROLLUP_ID)` over the ACTUAL call
+    /// (source = the proxy's immediate caller, at ANY depth — so a wrapper
+    /// contract is the source). The outbound authorization gate matches each
+    /// settlement entry's computed hash against these topic1 values from the
+    /// re-executed Sync block: a phantom withdrawal has no matching event. INBOUND
+    /// delivery emits `IncomingCrossChainCallExecuted` instead, so filtering on
+    /// this topic0 isolates outbound consumptions.
+    event CrossChainCallExecuted(
+        bytes32 indexed crossChainCallHash,
+        address indexed proxy,
+        address sourceAddress,
+        bytes callData,
+        uint256 value
+    );
 }
 
 // L2 (`EEZL2`, IEEZL2) execution table types — a SEPARATE, leaner family
