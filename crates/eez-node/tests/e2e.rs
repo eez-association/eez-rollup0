@@ -13,7 +13,8 @@ use eez_l1::submitter::LOG_SCAN_CHUNK_BLOCKS;
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeConfig,
-    NodeHandle, reorg_genesis_path, reorg_genesis_state_root, wait_for_node_caught_up,
+    NodeHandle, reorg_genesis_path, reorg_genesis_state_root, safe_block_state_root,
+    wait_for_node_caught_up,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -43,10 +44,7 @@ async fn happy_case_builder_sustained() {
     let root_before;
     {
         let _node = NodeHandle::spawn(datadir.path(), &env).unwrap();
-        n_before = chain
-            .wait_for_batches(3, Duration::from_secs(60))
-            .await
-            .unwrap();
+        n_before = chain.wait_for_batches(3, DEFAULT_TIMEOUT).await.unwrap();
         assert_eq!(
             chain.executions_performed().await.unwrap(),
             n_before,
@@ -80,7 +78,7 @@ async fn happy_case_builder_sustained() {
     // posts a delta with currentState == newState and the contract dutifully
     // writes the same value. Correct, not a regression.
     let n_after = chain
-        .wait_for_batches(n_before + 1, Duration::from_secs(60))
+        .wait_for_batches(n_before + 1, DEFAULT_TIMEOUT)
         .await
         .expect("composer didn't post any new batch after restart");
     assert!(
@@ -178,11 +176,13 @@ async fn happy_case_late_start_catchup() {
     wait_for_node_caught_up(&late, &chain, DEFAULT_TIMEOUT)
         .await
         .expect("late-start composer did not catch up from historical L1 activity");
-    assert!(
-        late.log_count_matching(&["catch-up replay complete"])
+    assert_eq!(
+        safe_block_state_root(&late.l2_rpc_url())
+            .await
             .unwrap()
-            > 0,
-        "late-start composer should replay historical batches during boot"
+            .unwrap(),
+        settled_root,
+        "late-start composer should replay the historical state-changing batch"
     );
     late.assert_no_process_death();
 }
