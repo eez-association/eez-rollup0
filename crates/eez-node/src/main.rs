@@ -290,6 +290,9 @@ fn main() -> eyre::Result<()> {
         let l2_state_cell: Arc<
             std::sync::OnceLock<Arc<dyn reth_storage_api::StateProviderFactory + Send + Sync>>,
         > = Arc::new(std::sync::OnceLock::new());
+        let indirect_outbound_probe_cell: Arc<
+            std::sync::OnceLock<Arc<ingress::IndirectOutboundProbe>>,
+        > = Arc::new(std::sync::OnceLock::new());
 
         // L2 reth, two modifications: (1) `EezPayloadBuilder` writes
         // `gas_limit`/`extra_data` from shared `eez-driver` constants so
@@ -307,6 +310,7 @@ fn main() -> eyre::Result<()> {
                         Arc::clone(&held_pool),
                         Arc::clone(&classifier),
                         Arc::clone(&l2_state_cell),
+                        Arc::clone(&indirect_outbound_probe_cell),
                     )),
             )
             .launch_with_debug_capabilities()
@@ -695,6 +699,24 @@ fn main() -> eyre::Result<()> {
                     );
                     None
                 };
+
+            if let (Some(composer), Some(l2_entry)) =
+                (evm_composer.as_ref(), l2_entry_client.as_ref())
+            {
+                let _ = indirect_outbound_probe_cell.set(Arc::new(
+                    ingress::IndirectOutboundProbe::new(
+                        composer.clone(),
+                        Arc::clone(l2_entry),
+                        rollup_id,
+                    ),
+                ));
+                event!(
+                    name: "eez.node.ingress.indirect_outbound_probe.ready",
+                    Level::INFO,
+                    rollup_id,
+                    "indirect L2 outbound admission probe wired",
+                );
+            }
 
             // CrossChainExecCtx: signer + L2 addresses needed to wrap
             // EvmComposer's `(load_table, execute)` calldata pairs

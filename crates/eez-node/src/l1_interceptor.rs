@@ -23,6 +23,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::{Transaction, TxEnvelope};
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{Address, Bytes};
@@ -40,7 +41,9 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 use tracing::{Level, event};
 
-use crate::ingress::{Admission, gate_and_hold};
+use crate::ingress::{
+    Admission, gate_and_hold, is_reserved_system_sender, reserved_system_sender_error,
+};
 
 sol! {
     // EEZBase.authorizedProxies(address) public view returns ProxyInfo.
@@ -191,6 +194,26 @@ async fn intercept_send_raw(
 ) -> Option<Response<Full<HyperBytes>>> {
     let raw: Bytes = raw_hex.parse().ok()?;
     let envelope = TxEnvelope::decode_2718(&mut raw.as_ref()).ok()?;
+    let id = json.get("id").cloned().unwrap_or(Value::Null);
+    if let Ok(sender) = envelope.recover_signer() {
+        if is_reserved_system_sender(sender) {
+            let msg = reserved_system_sender_error(sender);
+            event!(
+                name: "eez.l1_interceptor.rejected",
+                Level::WARN,
+                reason = %msg,
+                "raw tx rejected at L1->L2 interceptor",
+            );
+            return Some(json_response(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32000, "message": msg },
+                    "id": id,
+                })
+                .to_string(),
+            ));
+        }
+    }
     let to = envelope.to()?;
 
     // Detect: is `to` an authorized L1 cross-chain proxy (an L1->L2 call)?
@@ -198,7 +221,6 @@ async fn intercept_send_raw(
         return None; // ordinary L1 tx — forward.
     }
 
-    let id = json.get("id").cloned().unwrap_or(Value::Null);
     // B0 is INBOUND-only (an L1→L2 call to an authorized L1 proxy), so it
     // always validates against L1 and never uses the L2 slot — pass `None`
     // for the outbound provider. Inbound admission is byte-unchanged.
@@ -281,12 +303,14 @@ mod tests {
     use super::*;
     use alloy_consensus::{SignableTransaction, TxEip1559};
     use alloy_network::TxSignerSync;
-    use alloy_primitives::{TxKind, U256, address, hex};
+    use alloy_primitives::{TxKind, U256, address, b256, hex};
     use alloy_signer_local::PrivateKeySigner;
 
     const EEZ_L1: Address = address!("00000000000000000000000000000000000000ee");
     const PROXY: Address = address!("00000000000000000000000000000000000000bb");
     const PLAIN: Address = address!("00000000000000000000000000000000000000cc");
+    const ANVIL0_KEY: alloy_primitives::B256 =
+        b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
 
     /// Minimal mock L1 JSON-RPC: `authorizedProxies(PROXY)` non-zero (zero for
     /// anything else), passes the admission gate (`getTransactionCount`=0,
@@ -449,6 +473,32 @@ mod tests {
             held_pool.held_count_for(signer.address(), Direction::Inbound),
             1,
             "a plain tx must NOT be held",
+        );
+
+        // (4) A raw tx signed by the reserved L2 SYSTEM_ADDRESS is rejected at
+        // the front and is neither forwarded to L1 nor held for composition.
+        let system_signer = PrivateKeySigner::from_bytes(&ANVIL0_KEY).unwrap();
+        assert_eq!(system_signer.address(), eez_evm::SYSTEM_ADDRESS);
+        let system_tx = signed_tx_to(&system_signer, PLAIN);
+        let r = rpc(
+            &client,
+            &front,
+            "eth_sendRawTransaction",
+            serde_json::json!([system_tx]),
+        )
+        .await;
+        assert_eq!(r["error"]["code"], -32000);
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("reserved system sender"),
+            "unexpected system-sender rejection: {r}",
+        );
+        assert_eq!(
+            held_pool.held_count_for(eez_evm::SYSTEM_ADDRESS, Direction::Inbound),
+            0,
+            "SYSTEM_ADDRESS tx must not be held",
         );
     }
 }

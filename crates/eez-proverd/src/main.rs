@@ -638,6 +638,9 @@ struct VerifiedWindow {
     /// The Sync block's per-tx re-executed receipt statuses, for the
     /// reverted-system-tx (#10) gate. `None` if the validator omits them.
     sync_tx_statuses: Option<Vec<bool>>,
+    /// The Sync block's re-executed outbound `CrossChainCallExecuted` topic1
+    /// hashes, filtered by native-validate to the EEZL2 emitter.
+    sync_outbound_call_hashes: Option<Vec<B256>>,
 }
 
 /// Stage the window's blocks + witnesses, run `native-validate --dir`, check
@@ -775,6 +778,12 @@ async fn validate_window(
             .filter_map(serde_json::Value::as_bool)
             .collect::<Vec<_>>()
     });
+    let sync_outbound_call_hashes = last_block["outbound_call_hashes"].as_array().map(|arr| {
+        arr.iter()
+            .filter_map(serde_json::Value::as_str)
+            .filter_map(|s| s.parse::<B256>().ok())
+            .collect::<Vec<_>>()
+    });
     let settling = window.iter().any(|e| e.composition.is_some());
     info!(
         from,
@@ -799,6 +808,7 @@ async fn validate_window(
         per_block_roots,
         sync_per_tx_roots,
         sync_tx_statuses,
+        sync_outbound_call_hashes,
     })
 }
 
@@ -872,9 +882,9 @@ fn verify_settlement_public_inputs(
 ///
 /// The target is `EEZL2_ADDR` (0x42..07, the real on-chain EEZL2 = `ccm_l2_address`
 /// in every deployment), NOT the stale `eez_evm::CCM_ADDRESS` (0xeeee..). Using
-/// 0xeeee misclassified every system tx as a user tx, silently defeating the
-/// interior-boundary + reverted-system-tx gates (they re-derive system flags from
-/// this) — the same stale-address footgun fixed in `outbound_user_txs_from_block`.
+/// 0xeeee misclassifies every system tx as a user tx, silently defeating the
+/// interior-boundary + reverted-system-tx gates that re-derive system flags from
+/// this block RLP.
 fn system_tx_flags_from_rlp(block_rlp: &[u8]) -> Vec<bool> {
     use alloy_consensus::Transaction as _;
     use alloy_rlp::Decodable as _;
@@ -1125,55 +1135,15 @@ fn multi_inbound_outcome_gate(
     Ok(())
 }
 
-/// The raw 2718-encoded USER txs of a sealed L2 block, in order — the Sync
-/// block's outbound `executeCrossChainCall` users. A USER tx is any tx that is
-/// NOT a SYSTEM tx (signer == `SYSTEM_ADDRESS` && to == the CCM); the
-/// interleaved Sync block is `[load(sys), user, …, delivery(sys), …]`, so its
-/// non-system txs are exactly the outbound users the i-th outbound entry pairs
-/// with. Undecodable RLP → empty (the gate then no-ops / fails closed on a
-/// phantom). Mirrors the deriver's `decoded.transactions[user_start..]` pairing.
-fn outbound_user_txs_from_block(block_rlp: &[u8]) -> Vec<alloy_primitives::Bytes> {
-    use alloy_consensus::Transaction as _;
-    use alloy_eips::eip2718::Encodable2718 as _;
-    use alloy_rlp::Decodable as _;
-    use reth_primitives_traits::SignerRecoverable as _;
-
-    let Ok(block) = reth_ethereum_primitives::Block::decode(&mut &block_rlp[..]) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for tx in &block.body.transactions {
-        // A SYSTEM tx targets the EEZL2 predeploy (loadExecutionTable /
-        // executeIncomingCrossChainCall) signed by SYSTEM_ADDRESS. NOTE: the
-        // target is EEZL2_ADDR (0x42..07, the real on-chain EEZL2 = the gate's
-        // CREATE2 deployer), NOT the stale `eez_evm::CCM_ADDRESS` (0xeeee..) — the
-        // system txs are sent to `ccm_l2_address` which resolves to 0x42..07 in
-        // every deployment (genesis predeploy). Using 0xeeee would misclassify
-        // every system tx as a user tx and break the outbound pairing.
-        let is_system = tx.recover_signer().is_ok_and(|signer| {
-            signer == eez_evm::SYSTEM_ADDRESS && tx.to() == Some(eez_evm::outbound_gate::EEZL2_ADDR)
-        });
-        if is_system {
-            continue;
-        }
-        let mut buf = Vec::new();
-        tx.encode_2718(&mut buf);
-        out.push(alloy_primitives::Bytes::from(buf));
-    }
-    out
-}
-
-/// Outbound authorization gate (A3): every outbound L2->L1 settlement entry must
-/// be authorized by its paired, SIGNED Sync-block user tx (signer / value / data
-/// / proxy-target binds — a composer can't forge the ECDSA signature). Thin
-/// wrapper over the SHARED `eez_evm::outbound_gate::verify_outbound_authorized`
-/// — the SAME check the deriver (A4) runs against the same DA tx-list, so the
-/// prover and the follower can never drift. `l2_rollup_id` is the rollup the
-/// settlement StateDelta advances (the batch's authoritative L2 id). See that
-/// module for the full soundness note (incl. why the old log model was wrong).
+/// Outbound authorization gate (A3): every outbound L2->L1 settlement entry
+/// must match a `CrossChainCallExecuted` hash observed during stateless
+/// re-execution of the Sync block. Thin wrapper over the SHARED
+/// `eez_evm::outbound_gate::verify_outbound_authorized` — the SAME check the
+/// deriver (A4) runs against its local replay receipts, so the prover and the
+/// follower cannot drift.
 fn verify_outbound_authorized(
     batch: &eez_evm::EvmBatch,
-    user_txs: &[alloy_primitives::Bytes],
+    observed_call_hashes: &[B256],
     l2_rollup_id: u64,
 ) -> eyre::Result<()> {
     // The outbound immediates only (proxyEntryHash == 0, non-empty calls), in DA
@@ -1185,8 +1155,12 @@ fn verify_outbound_authorized(
         .filter(|e| e.proxyEntryHash == B256::ZERO && !e.l2ToL1Calls.is_empty())
         .cloned()
         .collect();
-    eez_evm::outbound_gate::verify_outbound_authorized(&outbound, user_txs, l2_rollup_id)
-        .map_err(|e| eyre::eyre!("A3: {e}"))
+    eez_evm::outbound_gate::verify_outbound_authorized(
+        &outbound,
+        observed_call_hashes,
+        l2_rollup_id,
+    )
+    .map_err(|e| eyre::eyre!("A3: {e}"))
 }
 
 /// Settlement-chain gate (P3-full step 2b): the composer's CLAIMED StateDelta
@@ -2321,19 +2295,16 @@ async fn main() -> eyre::Result<()> {
                             }
 
                             // (2d) Outbound authorization gate (A3) — HARD. Authorize
-                            // every outbound L2->L1 settlement entry against its
-                            // paired, SIGNED Sync-block user tx (the non-system txs of
-                            // the window's last block), the SAME shared
-                            // `eez_evm::outbound_gate` check the deriver (A4) runs — so
-                            // the prover + the follower can't drift. No re-executed
-                            // log / guest commitment is involved (the outbound user tx
-                            // reverts in plain re-execution; see the gate module). The
-                            // user-tx EXTRACTION here is proven equal to A4's DA
-                            // pairing by `outbound_user_tx_extraction_matches_da_pairing`,
-                            // so A4's e2e_value_outbound validation transfers here.
-                            // A phantom/tampered outbound (no backing signed user tx)
-                            // => reject the window (fail closed): the prover refuses to
-                            // attest, so L1 will not settle it.
+                            // every outbound L2->L1 settlement entry against the
+                            // `CrossChainCallExecuted` hashes produced by stateless
+                            // re-executing the Sync block, using the SAME shared
+                            // `eez_evm::outbound_gate` check the deriver (A4) runs on
+                            // local replay receipts. This is what supports indirect
+                            // calls (L2 tx -> L2 contract -> proxy) without trusting
+                            // top-level tx fields. A phantom/tampered outbound (no
+                            // matching observed hash) => reject the window (fail
+                            // closed): the prover refuses to attest, so L1 will not
+                            // settle it.
                             if vkey_configured {
                                 match decode_postbatch(&pb.abi_calldata) {
                                     Ok(batch) => {
@@ -2350,31 +2321,40 @@ async fn main() -> eyre::Result<()> {
                                                 .first()
                                                 .and_then(|e| e.stateDeltas.first())
                                                 .map(|d| d.rollupId.to::<u64>());
-                                            let sync_block_rlp = window
-                                                .last()
-                                                .map_or(&[][..], |e| e.block.as_slice());
-                                            let user_txs =
-                                                outbound_user_txs_from_block(sync_block_rlp);
-                                            match l2_rollup_id {
-                                                Some(rid) => match verify_outbound_authorized(
-                                                    &batch, &user_txs, rid,
-                                                ) {
-                                                    Ok(()) => info!(
-                                                        "✓ outbound authorization gate — every outbound entry backed by a signed user tx",
-                                                    ),
-                                                    Err(e) => {
-                                                        error!(
-                                                            error = %e,
-                                                            "A3 outbound gate REJECTED: an outbound settlement entry is not authorized by a signed user tx (phantom/tampered withdrawal)",
-                                                        );
-                                                        window_ok = false;
+                                            match (
+                                                l2_rollup_id,
+                                                verified.as_ref().and_then(|vw| {
+                                                    vw.sync_outbound_call_hashes.as_deref()
+                                                }),
+                                            ) {
+                                                (Some(rid), Some(observed)) => {
+                                                    match verify_outbound_authorized(
+                                                        &batch, observed, rid,
+                                                    ) {
+                                                        Ok(()) => info!(
+                                                            observed_hashes = observed.len(),
+                                                            "✓ outbound authorization gate — every outbound entry matched a re-executed CrossChainCallExecuted hash",
+                                                        ),
+                                                        Err(e) => {
+                                                            error!(
+                                                                error = %e,
+                                                                "A3 outbound gate REJECTED: outbound settlement entry has no matching CrossChainCallExecuted hash (phantom/tampered withdrawal)",
+                                                            );
+                                                            window_ok = false;
+                                                        }
                                                     }
-                                                },
+                                                }
+                                                (Some(_), None) => {
+                                                    error!(
+                                                        "A3 outbound gate REJECTED: validator output omitted outbound_call_hashes for an outbound-bearing batch",
+                                                    );
+                                                    window_ok = false;
+                                                }
                                                 // An outbound-bearing settling batch MUST carry
                                                 // the settlement StateDelta on entry[0] (same
                                                 // anchor the 2b/2c gates bind to); its absence
                                                 // means a malformed batch — fail closed.
-                                                None => {
+                                                (None, _) => {
                                                     error!(
                                                         "A3 outbound gate REJECTED: outbound batch entry[0] carries no settlement StateDelta — cannot bind the L2 rollup id",
                                                     );
@@ -3157,163 +3137,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn outbound_gate_authorizes_via_signed_user_tx() {
-        use alloy_consensus::TxLegacy;
-        use alloy_eips::eip2718::Encodable2718 as _;
-        use alloy_network::TxSignerSync as _;
-        use alloy_primitives::{Address, Bytes, TxKind};
-        use alloy_signer_local::PrivateKeySigner;
+    fn outbound_entry(
+        source: alloy_primitives::Address,
+        target: alloy_primitives::Address,
+        value: U256,
+        data: alloy_primitives::Bytes,
+    ) -> eez_evm::types::ExecutionEntrySol {
         use eez_evm::types::{ExecutionEntrySol, L2ToL1CallSol};
-        use reth_ethereum_primitives::{Transaction, TransactionSigned};
 
-        let signer = PrivateKeySigner::random();
-        let source = signer.address();
-        let target = address!("dc64a140aa3e981100a9beca4e685f962f0cf6c9");
-        let proxy = eez_evm::outbound_gate::compute_cross_chain_proxy_address(target, 0);
-        let value = U256::from(7u64);
-        let data = vec![0x12u8, 0x34];
-        let l2 = 1u64;
-
-        let sign = |to: Address, value: U256, input: Vec<u8>, who: &PrivateKeySigner| -> Bytes {
-            let mut tx = TxLegacy {
-                chain_id: Some(1u64),
-                nonce: 0,
-                gas_price: 1,
-                gas_limit: 21_000,
-                to: TxKind::Call(to),
-                value,
-                input: input.into(),
-            };
-            let sig = who.sign_transaction_sync(&mut tx).expect("sign");
-            let signed = TransactionSigned::new_unhashed(Transaction::Legacy(tx), sig);
-            let mut b = Vec::new();
-            signed.encode_2718(&mut b);
-            Bytes::from(b)
-        };
-        let mk = |proxy_hash: B256, calls: Vec<L2ToL1CallSol>| ExecutionEntrySol {
-            stateDeltas: Vec::new(),
-            proxyEntryHash: proxy_hash,
-            destinationRollupId: U256::from(l2),
-            callCount: U256::from(calls.len() as u64),
-            l2ToL1Calls: calls,
-            expectedL1ToL2Calls: Vec::new(),
-            expectedLookups: Vec::new(),
-            returnData: Bytes::new(),
-            rollingHash: B256::ZERO,
-        };
-        let call = || L2ToL1CallSol {
-            targetAddress: target,
-            value,
-            data: Bytes::from(data.clone()),
-            sourceAddress: source,
-            sourceRollupId: U256::from(l2),
-            revertSpan: U256::ZERO,
-        };
-        // Layout: a leading anchor (proxyEntryHash 0, EMPTY calls — the wrapper's
-        // filter drops it) + the OUTBOUND settlement entry (proxyEntryHash 0, one
-        // call) + an inbound deferred (proxyEntryHash != 0 — dropped). Only the
-        // middle entry is gated, paired with `user_txs[0]`.
-        let mut batch = EvmBatch::default();
-        batch.inner.entries = vec![
-            mk(B256::ZERO, Vec::new()),
-            mk(B256::ZERO, vec![call()]),
-            mk(B256::repeat_byte(0x99), Vec::new()),
-        ];
-
-        let good = sign(proxy, value, data.clone(), &signer);
-        // Authorized by the genuine signed user tx → PASS.
-        assert!(verify_outbound_authorized(&batch, std::slice::from_ref(&good), l2).is_ok());
-        // No paired user tx → PHANTOM withdrawal → REJECT.
-        assert!(verify_outbound_authorized(&batch, &[], l2).is_err());
-        // A DIFFERENT EOA signed it → not the claimed source → REJECT.
-        let other = PrivateKeySigner::random();
-        let wrong = sign(proxy, value, data.clone(), &other);
-        assert!(verify_outbound_authorized(&batch, std::slice::from_ref(&wrong), l2).is_err());
-        // Tampered claim: entry says value 999 but the user signed 7 → REJECT.
-        let mut tampered = batch.clone();
-        tampered.inner.entries[1].l2ToL1Calls[0].value = U256::from(999u64);
-        assert!(verify_outbound_authorized(&tampered, std::slice::from_ref(&good), l2).is_err());
-    }
-
-    /// A3<->A4 EXTRACTION EQUIVALENCE: the outbound user txs
-    /// `outbound_user_txs_from_block` pulls from a sealed Sync block (the A3 path)
-    /// are EXACTLY the outbound user txs the deriver pairs from DA (the A4 path).
-    /// Built through the SAME shared builder both sides use
-    /// (`build_cross_chain_sync_pairs` -> `interleave_sync_block_txs`), this proves
-    /// A3's RLP extraction == A4's DA pairing — so A4's end-to-end validation
-    /// (e2e_value_outbound) transfers to A3, which is why BOTH gates can run HARD
-    /// without a separate prover-stack run. Also locks in the EEZL2_ADDR (NOT
-    /// stale CCM_ADDRESS=0xeeee) system-tx filter: a wrong address would leak the
-    /// load tx into the result and fail this assertion.
-    #[test]
-    fn outbound_user_tx_extraction_matches_da_pairing() {
-        use alloy_consensus::{Header, TxEip1559};
-        use alloy_eips::eip2718::{Decodable2718 as _, Encodable2718 as _};
-        use alloy_network::TxSignerSync as _;
-        use alloy_primitives::{Bytes, TxKind, b256};
-        use alloy_rlp::Encodable as _;
-        use alloy_signer_local::PrivateKeySigner;
-        use eez_evm::system_tx::{
-            SystemTxContext, build_cross_chain_sync_pairs, interleave_sync_block_txs,
-        };
-        use eez_evm::types::{ExecutionEntrySol, L2ToL1CallSol};
-        use reth_ethereum_primitives::{Block, BlockBody, Transaction, TransactionSigned};
-
-        // SYSTEM signer = the key for SYSTEM_ADDRESS (anvil#0), so the load tx
-        // recovers to SYSTEM_ADDRESS and the EEZL2_ADDR filter excludes it.
-        let system_signer = PrivateKeySigner::from_bytes(&b256!(
-            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-        ))
-        .unwrap();
-        assert_eq!(
-            system_signer.address(),
-            eez_evm::SYSTEM_ADDRESS,
-            "anvil#0 must be SYSTEM_ADDRESS"
-        );
-
-        let cfg = SystemTxContext {
-            system_signer,
-            ccm_l2_address: eez_evm::outbound_gate::EEZL2_ADDR,
-            l2_chain_id: 1,
-            l2_gas_price: 1,
-            l2_gas_limit: 2_000_000,
-            this_rollup_id: 1,
-        };
-
-        // The outbound user tx (an EOA -> the L2 outbound proxy for `target`).
-        let user_key = PrivateKeySigner::random();
-        let source = user_key.address();
-        let target = address!("dc64a140aa3e981100a9beca4e685f962f0cf6c9");
-        let proxy = eez_evm::outbound_gate::compute_cross_chain_proxy_address(target, 0);
-        let value = U256::from(123u64);
-        let data = vec![0xabu8, 0xcd, 0xef];
-
-        // PRODUCTION tx type: the composer's outbound user tx is EIP-1559
-        // (common/mod.rs::send_outbound_set_value). Exercising it here proves the
-        // RLP extraction + recover/value/input/to all handle the real tx envelope,
-        // not just legacy — the bit a synthetic legacy-only test would miss.
-        let user_tx: Bytes = {
-            let mut tx = TxEip1559 {
-                chain_id: 1u64,
-                nonce: 0,
-                gas_limit: 100_000,
-                max_fee_per_gas: 1,
-                max_priority_fee_per_gas: 0,
-                to: TxKind::Call(proxy),
-                value,
-                access_list: Default::default(),
-                input: data.clone().into(),
-            };
-            let sig = user_key.sign_transaction_sync(&mut tx).unwrap();
-            let signed = TransactionSigned::new_unhashed(Transaction::Eip1559(tx), sig);
-            let mut b = Vec::new();
-            signed.encode_2718(&mut b);
-            Bytes::from(b)
-        };
-
-        // The L1 outbound settlement entry (proxyEntryHash 0, the L2->L1 call).
-        let entry = ExecutionEntrySol {
+        ExecutionEntrySol {
             stateDeltas: Vec::new(),
             proxyEntryHash: B256::ZERO,
             destinationRollupId: U256::from(1),
@@ -3321,181 +3153,76 @@ mod tests {
             l2ToL1Calls: vec![L2ToL1CallSol {
                 targetAddress: target,
                 value,
-                data: Bytes::from(data.clone()),
+                data,
                 sourceAddress: source,
                 sourceRollupId: U256::from(1u64),
                 revertSpan: U256::ZERO,
             }],
             expectedL1ToL2Calls: Vec::new(),
             expectedLookups: Vec::new(),
-            returnData: Bytes::new(),
+            returnData: alloy_primitives::Bytes::new(),
             rollingHash: B256::ZERO,
-        };
-
-        // THE shared builder -> the canonical Sync-block tx list [load(sys), user].
-        let pairs =
-            build_cross_chain_sync_pairs(&[(entry, user_tx.clone())], &[], &cfg, 0).unwrap();
-        let sync_txs = interleave_sync_block_txs(&pairs);
-        assert!(sync_txs.len() >= 2, "at least load + user");
-
-        // Seal them into a Block RLP (what A3 reads from the window's last event).
-        let txs: Vec<TransactionSigned> = sync_txs
-            .iter()
-            .map(|b| TransactionSigned::decode_2718(&mut b.as_ref()).unwrap())
-            .collect();
-        let block = Block {
-            header: Header::default(),
-            body: BlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: None,
-            },
-        };
-        let mut rlp = Vec::new();
-        block.encode(&mut rlp);
-
-        // A3 extraction == the single outbound user tx A4 pairs from DA.
-        let extracted = outbound_user_txs_from_block(&rlp);
-        assert_eq!(
-            extracted,
-            vec![user_tx],
-            "A3 RLP extraction must equal the DA-paired outbound user tx"
-        );
+        }
     }
 
-    /// K>=2: TWO outbound immediates in ONE Sync slot. Exercises (P1.3) the
-    /// builder's multi-entry interleave (`[load0,user0,load1,user1]`, two-phase
-    /// SYSTEM_ADDRESS nonces) and the A3 extraction+gate over MULTIPLE entries
-    /// (each user tx pairs positionally with its entry, all binds hold), and
-    /// (P1.4) the composition determinism that A2b/A4 rely on: the SAME shared
-    /// builder fed the SAME inputs yields byte-identical Sync-block txs.
+    fn observed_for(entry: &eez_evm::types::ExecutionEntrySol) -> B256 {
+        let call = entry.l2ToL1Calls.first().expect("outbound call");
+        eez_evm::cross_chain_call_hash(
+            eez_protocol::RollupId(0),
+            call.targetAddress,
+            call.value,
+            &call.data,
+            call.sourceAddress,
+            eez_protocol::RollupId(1),
+        )
+    }
+
     #[test]
-    fn outbound_gate_k2_multiple_immediates_one_slot() {
-        use alloy_consensus::{Header, TxLegacy};
-        use alloy_eips::eip2718::{Decodable2718 as _, Encodable2718 as _};
-        use alloy_network::TxSignerSync as _;
-        use alloy_primitives::{Address, Bytes, TxKind, b256};
-        use alloy_rlp::Encodable as _;
-        use alloy_signer_local::PrivateKeySigner;
-        use eez_evm::system_tx::{
-            SystemTxContext, build_cross_chain_sync_pairs, interleave_sync_block_txs,
-        };
-        use eez_evm::types::{ExecutionEntrySol, L2ToL1CallSol};
-        use reth_ethereum_primitives::{Block, BlockBody, Transaction, TransactionSigned};
-
-        let system_signer = PrivateKeySigner::from_bytes(&b256!(
-            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-        ))
-        .unwrap();
-        let cfg = SystemTxContext {
-            system_signer,
-            ccm_l2_address: eez_evm::outbound_gate::EEZL2_ADDR,
-            l2_chain_id: 1,
-            l2_gas_price: 1,
-            l2_gas_limit: 2_000_000,
-            this_rollup_id: 1,
-        };
-
-        // Build one (outbound entry, signed user tx) for a distinct (target, EOA).
-        let mk_pair = |target: Address, value_wei: u64, data: Vec<u8>| {
-            let user_key = PrivateKeySigner::random();
-            let source = user_key.address();
-            let proxy = eez_evm::outbound_gate::compute_cross_chain_proxy_address(target, 0);
-            let value = U256::from(value_wei);
-            let user_tx: Bytes = {
-                let mut tx = TxLegacy {
-                    chain_id: Some(1u64),
-                    nonce: 0,
-                    gas_price: 1,
-                    gas_limit: 100_000,
-                    to: TxKind::Call(proxy),
-                    value,
-                    input: data.clone().into(),
-                };
-                let sig = user_key.sign_transaction_sync(&mut tx).unwrap();
-                let signed = TransactionSigned::new_unhashed(Transaction::Legacy(tx), sig);
-                let mut b = Vec::new();
-                signed.encode_2718(&mut b);
-                Bytes::from(b)
-            };
-            let entry = ExecutionEntrySol {
-                stateDeltas: Vec::new(),
-                proxyEntryHash: B256::ZERO,
-                destinationRollupId: U256::from(1),
-                callCount: U256::from(1u8),
-                l2ToL1Calls: vec![L2ToL1CallSol {
-                    targetAddress: target,
-                    value,
-                    data: Bytes::from(data),
-                    sourceAddress: source,
-                    sourceRollupId: U256::from(1u64),
-                    revertSpan: U256::ZERO,
-                }],
-                expectedL1ToL2Calls: Vec::new(),
-                expectedLookups: Vec::new(),
-                returnData: Bytes::new(),
-                rollingHash: B256::ZERO,
-            };
-            (entry, user_tx)
-        };
-
-        let p0 = mk_pair(
-            address!("dc64a140aa3e981100a9beca4e685f962f0cf6c9"),
-            111,
-            vec![0x01, 0x02],
+    fn outbound_gate_authorizes_via_observed_hash() {
+        let wrapper = address!("cccccccccccccccccccccccccccccccccccccccc");
+        let target = address!("dc64a140aa3e981100a9beca4e685f962f0cf6c9");
+        let entry = outbound_entry(
+            wrapper,
+            target,
+            U256::from(7u64),
+            alloy_primitives::Bytes::from(vec![0x12u8, 0x34]),
         );
-        let p1 = mk_pair(
-            address!("00000000000000000000000000000000000000bb"),
-            222,
-            vec![0x03, 0x04, 0x05],
+        let mut batch = EvmBatch::default();
+        batch.inner.entries = vec![entry.clone()];
+
+        assert!(verify_outbound_authorized(&batch, &[observed_for(&entry)], 1).is_ok());
+        assert!(verify_outbound_authorized(&batch, &[], 1).is_err());
+
+        let mut tampered = batch.clone();
+        tampered.inner.entries[0].l2ToL1Calls[0].value = U256::from(999u64);
+        assert!(verify_outbound_authorized(&tampered, &[observed_for(&entry)], 1).is_err());
+    }
+
+    #[test]
+    fn outbound_gate_k2_requires_one_observed_hash_per_entry() {
+        let source = address!("cccccccccccccccccccccccccccccccccccccccc");
+        let target = address!("dc64a140aa3e981100a9beca4e685f962f0cf6c9");
+        let entry0 = outbound_entry(
+            source,
+            target,
+            U256::from(111u64),
+            alloy_primitives::Bytes::from(vec![0x01, 0x02]),
         );
-        let outbound = vec![p0.clone(), p1.clone()];
-
-        // P1.4 — composition determinism: same inputs -> byte-identical Sync txs.
-        let pairs_a = build_cross_chain_sync_pairs(&outbound, &[], &cfg, 0).unwrap();
-        let pairs_b = build_cross_chain_sync_pairs(&outbound, &[], &cfg, 0).unwrap();
-        let sync_a = interleave_sync_block_txs(&pairs_a);
-        let sync_b = interleave_sync_block_txs(&pairs_b);
-        assert_eq!(sync_a, sync_b, "shared builder must be deterministic");
-        assert_eq!(sync_a.len(), 4, "K=2 -> [load0,user0,load1,user1]");
-
-        // Seal into a Block RLP (what A3 reads from the window's last event).
-        let txs: Vec<TransactionSigned> = sync_a
-            .iter()
-            .map(|b| TransactionSigned::decode_2718(&mut b.as_ref()).unwrap())
-            .collect();
-        let block = Block {
-            header: Header::default(),
-            body: BlockBody {
-                transactions: txs,
-                ommers: Vec::new(),
-                withdrawals: None,
-            },
-        };
-        let mut rlp = Vec::new();
-        block.encode(&mut rlp);
-
-        // P1.3 — A3 extraction recovers BOTH outbound user txs, IN ORDER.
-        let extracted = outbound_user_txs_from_block(&rlp);
-        assert_eq!(
-            extracted,
-            vec![p0.1.clone(), p1.1.clone()],
-            "K=2 extraction must equal the two DA-paired user txs, in slot order"
+        let entry1 = outbound_entry(
+            source,
+            target,
+            U256::from(222u64),
+            alloy_primitives::Bytes::from(vec![0x03, 0x04]),
         );
+        let mut batch = EvmBatch::default();
+        batch.inner.entries = vec![entry0.clone(), entry1.clone()];
 
-        // And the gate authorizes BOTH (each entry paired positionally with its tx).
-        let entries = vec![p0.0.clone(), p1.0.clone()];
+        let observed = vec![observed_for(&entry0), observed_for(&entry1)];
+        assert!(verify_outbound_authorized(&batch, &observed, 1).is_ok());
+        assert!(verify_outbound_authorized(&batch, &observed[..1], 1).is_err());
         assert!(
-            eez_evm::outbound_gate::verify_outbound_authorized(&entries, &extracted, 1).is_ok(),
-            "both K=2 outbound immediates must be authorized by their paired user txs"
-        );
-
-        // Swapping the two user txs breaks the per-entry binds -> reject (proves the
-        // pairing is positional, not set-membership).
-        let swapped = vec![p1.1.clone(), p0.1.clone()];
-        assert!(
-            eez_evm::outbound_gate::verify_outbound_authorized(&entries, &swapped, 1).is_err(),
-            "mispaired (swapped) user txs must be rejected"
+            verify_outbound_authorized(&batch, &[observed[1], observed[0]], 1).is_ok(),
+            "observed hashes are a multiset; receipt order need not match entry order"
         );
     }
 
@@ -3585,6 +3312,7 @@ mod tests {
             per_block_roots: None,
             sync_per_tx_roots: None,
             sync_tx_statuses: None,
+            sync_outbound_call_hashes: None,
         }
     }
 
@@ -3685,6 +3413,7 @@ mod tests {
             per_block_roots: Some(vec![r0, m, rn]), // [parent.., B_{m-1}=M, sync=rn]
             sync_per_tx_roots: None,
             sync_tx_statuses: None,
+            sync_outbound_call_hashes: None,
         };
         verify_settlement_chain(&pb, &vw, r0, b"")
             .expect("multi-block multi-inbound: M is a proven per-block root, rn is final → OK");
@@ -3712,6 +3441,7 @@ mod tests {
             per_block_roots: Some(vec![r0, rn]), // re-execution does NOT contain X
             sync_per_tx_roots: None,             // validator corroborates NO interior
             sync_tx_statuses: None,
+            sync_outbound_call_hashes: None,
         };
         assert!(
             verify_settlement_chain(&pb, &vw, r0, b"").is_err(),
@@ -3740,6 +3470,7 @@ mod tests {
             per_block_roots: Some(vec![r0, c]), // B is NOT a re-executed root
             sync_per_tx_roots: None,
             sync_tx_statuses: None,
+            sync_outbound_call_hashes: None,
         };
         assert!(
             verify_settlement_chain(&pb, &vw, r0, b"").is_err(),

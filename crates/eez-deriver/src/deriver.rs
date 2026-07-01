@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use alloy_consensus::TxReceipt;
 use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
@@ -29,6 +30,12 @@ use tokio::sync::broadcast;
 use tracing::{Level, event};
 
 use crate::error::{DeriverError, DeriverResult};
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ReconcileOutcome {
+    replayed: u64,
+    system_signed_txs: u64,
+}
 
 /// L1-derived L2 consensus engine. Cheaply [`Clone`]able.
 #[derive(Clone)]
@@ -259,6 +266,11 @@ where
         let known_tx_hashes = self.inner.l1_head.known_tx_hashes();
         let mut new_batches: Vec<BatchRecord> = Vec::new();
         let mut cumulative_l2: u64 = cumulative_start;
+        let mut system_nonce_cursor = if self.inner.system_tx_cfg.is_some() {
+            Some(self.system_address_nonce_at(cumulative_start)?)
+        } else {
+            None
+        };
         let mut total_replayed: u64 = 0;
         for batch in &historical {
             let decoded = eez_payload_codec::decode(batch.call_data.as_ref())?;
@@ -338,15 +350,22 @@ where
                 }
             }
 
-            total_replayed += self
+            let outcome = self
                 .reconcile_batch_blocks(
                     batch_first_l2,
                     &decoded,
                     batch.l1_block_number,
                     batch.tx_hash,
                     batch.consumed_count,
+                    system_nonce_cursor,
                 )
                 .await?;
+            total_replayed += outcome.replayed;
+            if let Some(cursor) = system_nonce_cursor.as_mut() {
+                *cursor = cursor
+                    .checked_add(outcome.system_signed_txs)
+                    .ok_or_else(|| DeriverError::l2_provider("SYSTEM_ADDRESS nonce overflow"))?;
+            }
 
             new_batches.push(BatchRecord {
                 l1_block: batch.l1_block_number,
@@ -425,7 +444,11 @@ where
         &self,
         parent_block_number: u64,
         raw_txs: &[Vec<u8>],
-    ) -> DeriverResult<(ExecutionData, SealedHeader<alloy_consensus::Header>)> {
+    ) -> DeriverResult<(
+        ExecutionData,
+        SealedHeader<alloy_consensus::Header>,
+        Vec<B256>,
+    )> {
         // Diagnostic: log parent context before touching reth so we can
         // pinpoint failing `state_by_block_hash` lookups.
         let local_best = self
@@ -556,10 +579,17 @@ where
             .finish(state_provider.as_ref(), None)
             .map_err(|e| DeriverError::l2_provider(format!("block builder finish failed: {e}")))?;
 
+        let outbound_call_hashes = eez_evm::outbound_gate::observed_outbound_call_hashes_from_logs(
+            outcome
+                .execution_result
+                .receipts
+                .iter()
+                .flat_map(|receipt| receipt.logs.iter()),
+        );
         let sealed_block = outcome.block.sealed_block().clone();
         let sealed_header = sealed_block.sealed_header().clone();
         let execution_data = <EthEngineTypes as PayloadTypes>::block_to_payload(sealed_block, None);
-        Ok((execution_data, sealed_header))
+        Ok((execution_data, sealed_header, outbound_call_hashes))
     }
 
     /// Build + commit one L1-derived L2 block via STF replay.
@@ -575,7 +605,7 @@ where
         parent_block_number: u64,
         raw_txs: &[Vec<u8>],
     ) -> DeriverResult<DeriveOutcome> {
-        let (payload, header) = self.execute_block(parent_block_number, raw_txs)?;
+        let (payload, header, _) = self.execute_block(parent_block_number, raw_txs)?;
         // Follower / L1-reconcile re-derive — do NOT feed the prover witness task
         // (feed_witness = false); the producer already fed this block at
         // production time. Avoids double-feeding the same block_number.
@@ -895,8 +925,10 @@ where
                 l1_block_number,
                 tx_hash,
                 consumed_count,
+                None,
             )
-            .await?;
+            .await?
+            .replayed;
         event!(
             name: "eez.deriver.reconcile.done",
             Level::DEBUG,
@@ -1136,7 +1168,8 @@ where
         l1_block_number: u64,
         tx_hash: B256,
         consumed_count: usize,
-    ) -> DeriverResult<u64> {
+        system_nonce_hint: Option<u64>,
+    ) -> DeriverResult<ReconcileOutcome> {
         // Cross-chain path (skipped when `system_tx_cfg` is `None`):
         // reconstruct the system txs the composer produced, from either
         // codec branch:
@@ -1156,17 +1189,16 @@ where
             cross_chain = self.inner.system_tx_cfg.is_some(),
             "reconcile_batch_blocks entered",
         );
-        // A4 outbound follower gate: the batch's OUTBOUND settlement entries,
-        // captured out of the cross-chain arm below so the Sync-block replay can
-        // cross-check them against the re-executed CrossChainCallExecuted logs.
-        // A4 outbound gate state, carried out of the `system_txs` match: the
-        // (outbound immediate entry, its paired SIGNED Sync-block user tx) pairs
-        // + this L2's rollup id. The gate authorizes each outbound settlement
-        // against the user tx the composer drained — NOT a re-executed log (the
-        // outbound user tx reverts in plain re-execution, emitting none). See
-        // `eez_evm::outbound_gate`.
-        let mut gate_outbound: Vec<(eez_evm::types::ExecutionEntrySol, Bytes)> = Vec::new();
+        // A4 outbound follower gate state, carried out of the `system_txs`
+        // match: the outbound immediate entries + this L2's rollup id. The gate
+        // authorizes each settlement entry against the
+        // `CrossChainCallExecuted` hashes emitted by the Sync block. Matched
+        // historical blocks use stored receipts; blocks that must be rebuilt use
+        // replay receipts. That is what supports indirect L2 tx -> contract ->
+        // proxy withdrawals without trusting top-level tx fields.
+        let mut gate_outbound: Vec<eez_evm::types::ExecutionEntrySol> = Vec::new();
         let mut gate_l2_rollup_id: u64 = 0;
+        let mut system_signed_txs: u64 = 0;
         let system_txs = match self.inner.system_tx_cfg.as_ref() {
             Some(cfg) => {
                 let entries = if decoded.l2_entries.is_empty() {
@@ -1245,102 +1277,86 @@ where
                     inbound_deferred.truncate(consumed_deferred);
                 }
 
-                let starting_nonce = self.system_address_nonce_at(from_block - 1)?;
+                if outbound_entries.is_empty() && inbound_deferred.is_empty() {
+                    event!(
+                        name: "eez.deriver.reconcile.no_system_txs",
+                        Level::DEBUG,
+                        tx_hash = %tx_hash,
+                        "batch has no executable cross-chain entries; skipping system nonce lookup",
+                    );
+                    Vec::new()
+                } else {
+                    let starting_nonce = match system_nonce_hint {
+                        Some(nonce) => nonce,
+                        None => self.system_address_nonce_at(from_block - 1)?,
+                    };
 
-                // The Sync block's user txs (the LAST L2 block of this batch's
-                // range, Rollup-1 §1.3) — the K outbound `executeCrossChainCall`
-                // users that pair with the K outbound loads. The deriver pairs
-                // POSITIONALLY (i-th outbound entry ↔ i-th user tx); the composer's
-                // drain==splice==DA order guarantees the match.
-                let sync_user_count = decoded
-                    .block_tx_counts
-                    .last()
-                    .map_or(0, |c| usize::from(*c));
-                let user_start = decoded.transactions.len().saturating_sub(sync_user_count);
-                let outbound_paired: Vec<(eez_evm::types::ExecutionEntrySol, Bytes)> =
-                    outbound_entries
-                        .iter()
-                        .cloned()
-                        .zip(
-                            decoded.transactions[user_start..]
-                                .iter()
-                                .map(|t| Bytes::from(t.clone())),
-                        )
-                        .collect();
+                    // The Sync block's user txs (the LAST L2 block of this batch's
+                    // range, Rollup-1 §1.3) — the K outbound `executeCrossChainCall`
+                    // users that pair with the K outbound loads. The deriver pairs
+                    // POSITIONALLY (i-th outbound entry ↔ i-th user tx); the composer's
+                    // drain==splice==DA order guarantees the match.
+                    let sync_user_count = decoded
+                        .block_tx_counts
+                        .last()
+                        .map_or(0, |c| usize::from(*c));
+                    let user_start = decoded.transactions.len().saturating_sub(sync_user_count);
+                    let outbound_paired: Vec<(eez_evm::types::ExecutionEntrySol, Bytes)> =
+                        outbound_entries
+                            .iter()
+                            .cloned()
+                            .zip(
+                                decoded.transactions[user_start..]
+                                    .iter()
+                                    .map(|t| Bytes::from(t.clone())),
+                            )
+                            .collect();
 
-                // Carry the (outbound entry, signed user tx) pairs out for the
-                // A4 gate — the positional pairing the composer's
-                // drain==splice==DA order guarantees.
-                gate_outbound = outbound_paired.clone();
+                    // Carry the outbound entries out for the A4 gate. The paired
+                    // signed tx bytes are still needed by the system-tx builder, but
+                    // the soundness check now binds to observed event hashes
+                    // instead of top-level tx fields.
+                    gate_outbound = outbound_entries.clone();
 
-                // THE canonical builder — the SAME function the composer calls
-                // (eez_evm::system_tx), so the Sync block's system txs (two-phase
-                // SYSTEM_ADDRESS nonces: outbound loads N.., inbound N+K..) AND the
-                // interleaved order [load,user,…,deliveries] are byte-identical BY
-                // CONSTRUCTION. (Replaces the deriver's own system-first concat,
-                // which drifted from the composer's interleave and was L2-invalid
-                // for a mixed slot — the inbound delivery's loadExecutionTable
-                // self-clean wiped the outbound table before its user tx consumed
-                // it. A2b.)
-                let pairs = eez_evm::system_tx::build_cross_chain_sync_pairs(
-                    &outbound_paired,
-                    &inbound_deferred,
-                    cfg,
-                    starting_nonce,
-                )
-                .map_err(|e| {
-                    DeriverError::l2_provider(format!(
-                        "build_cross_chain_sync_pairs(tx={tx_hash}): {e}"
-                    ))
-                })?;
+                    // THE canonical builder — the SAME function the composer calls
+                    // (eez_evm::system_tx), so the Sync block's system txs (two-phase
+                    // SYSTEM_ADDRESS nonces: outbound loads N.., inbound N+K..) AND the
+                    // interleaved order [load,user,…,deliveries] are byte-identical BY
+                    // CONSTRUCTION. (Replaces the deriver's own system-first concat,
+                    // which drifted from the composer's interleave and was L2-invalid
+                    // for a mixed slot — the inbound delivery's loadExecutionTable
+                    // self-clean wiped the outbound table before its user tx consumed
+                    // it. A2b.)
+                    let pairs = eez_evm::system_tx::build_cross_chain_sync_pairs(
+                        &outbound_paired,
+                        &inbound_deferred,
+                        cfg,
+                        starting_nonce,
+                    )
+                    .map_err(|e| {
+                        DeriverError::l2_provider(format!(
+                            "build_cross_chain_sync_pairs(tx={tx_hash}): {e}"
+                        ))
+                    })?;
 
-                event!(
-                    name: "eez.deriver.reconcile.system_txs_built",
-                    Level::INFO,
-                    tx_hash = %tx_hash,
-                    sys_tx_count = pairs.len(),
-                    outbound = outbound_entries.len(),
-                    inbound = inbound_deferred.len(),
-                    starting_nonce,
-                    "built outbound load + inbound delivery system txs",
-                );
-                // The COMPLETE interleaved Sync-block tx list (loads + their user
-                // txs + deliveries) — the SAME bytes the composer commits.
-                eez_evm::system_tx::interleave_sync_block_txs(&pairs)
+                    event!(
+                        name: "eez.deriver.reconcile.system_txs_built",
+                        Level::INFO,
+                        tx_hash = %tx_hash,
+                        sys_tx_count = pairs.len(),
+                        outbound = outbound_entries.len(),
+                        inbound = inbound_deferred.len(),
+                        starting_nonce,
+                        "built outbound load + inbound delivery system txs",
+                    );
+                    system_signed_txs = pairs.len() as u64;
+                    // The COMPLETE interleaved Sync-block tx list (loads + their user
+                    // txs + deliveries) — the SAME bytes the composer commits.
+                    eez_evm::system_tx::interleave_sync_block_txs(&pairs)
+                }
             }
             None => Vec::new(),
         };
-
-        // A4 — outbound L2->L1 follower gate (HARD). Authorize every outbound
-        // settlement entry against its paired, SIGNED Sync-block user tx (the one
-        // the composer drained + committed to DA) BEFORE replaying/committing any
-        // block of this batch. A phantom withdrawal — an entry with no real user
-        // tx behind it — cannot satisfy the signer/value/data/proxy-target binds:
-        // a composer can't forge a user's ECDSA signature. The deriver-side mirror
-        // of the prover's A3 gate (the SAME shared `eez_evm::outbound_gate` check,
-        // so the follower + prover can't drift); defense-in-depth for a follower
-        // that re-derives WITHOUT verifying the proof. Runs ONCE, before the loop,
-        // so an unauthorized batch is refused (return Err -> no phantom block is
-        // committed) rather than rewound after the fact.
-        if !gate_outbound.is_empty() {
-            let (g_entries, g_txs): (Vec<eez_evm::types::ExecutionEntrySol>, Vec<Bytes>) =
-                gate_outbound.iter().cloned().unzip();
-            if let Err(e) = eez_evm::outbound_gate::verify_outbound_authorized(
-                &g_entries,
-                &g_txs,
-                gate_l2_rollup_id,
-            ) {
-                event!(
-                    name: "eez.deriver.reconcile.outbound_gate",
-                    Level::ERROR,
-                    tx_hash = %tx_hash,
-                    from_block,
-                    error = %e,
-                    "A4 outbound gate REJECTED: an outbound settlement entry is not authorized by a signed user tx — refusing to derive this batch (phantom withdrawal)",
-                );
-                return Err(DeriverError::local_diverged(from_block));
-            }
-        }
 
         let mut tx_offset = 0usize;
         let mut replayed: u64 = 0;
@@ -1383,13 +1399,66 @@ where
                 replayed_so_far = replayed,
                 "reconciling batch block",
             );
+            let mut executed = None;
+            if is_sync_block && !gate_outbound.is_empty() {
+                let (observed, source) = if should_replay {
+                    let replayed_block = self.execute_block(l2_block - 1, &block_txs)?;
+                    let observed = replayed_block.2.clone();
+                    executed = Some(replayed_block);
+                    (observed, "replay")
+                } else {
+                    (
+                        self.observed_outbound_call_hashes_from_local_receipts(l2_block)?,
+                        "local_receipts",
+                    )
+                };
+                if let Err(e) = eez_evm::outbound_gate::verify_outbound_authorized(
+                    &gate_outbound,
+                    &observed,
+                    gate_l2_rollup_id,
+                ) {
+                    event!(
+                        name: "eez.deriver.reconcile.outbound_gate",
+                        Level::ERROR,
+                        tx_hash = %tx_hash,
+                        from_block,
+                        l2_block,
+                        outbound_entries = gate_outbound.len(),
+                        observed_hashes = observed.len(),
+                        source,
+                        error = %e,
+                        "A4 outbound gate REJECTED: settlement entry has no matching CrossChainCallExecuted hash in the Sync block",
+                    );
+                    return Err(DeriverError::local_diverged(from_block));
+                }
+                event!(
+                    name: "eez.deriver.reconcile.outbound_gate",
+                    Level::INFO,
+                    tx_hash = %tx_hash,
+                    l2_block,
+                    outbound_entries = gate_outbound.len(),
+                    observed_hashes = observed.len(),
+                    source,
+                    "A4 outbound gate accepted: every outbound entry matched a CrossChainCallExecuted hash",
+                );
+            }
             if !should_replay {
                 continue;
             }
-            self.replay_block(l2_block - 1, &block_txs).await?;
+            if let Some((payload, header, _)) = executed {
+                self.inner
+                    .committer
+                    .commit_derived(payload, header, false)
+                    .await?;
+            } else {
+                self.replay_block(l2_block - 1, &block_txs).await?;
+            }
             replayed += 1;
         }
-        Ok(replayed)
+        Ok(ReconcileOutcome {
+            replayed,
+            system_signed_txs,
+        })
     }
 
     /// Fetch a postBatch tx's `entries[]` directly from L1 (used by the
@@ -1442,6 +1511,27 @@ where
         let decoded = eez_evm::types::postAndVerifyBatchCall::abi_decode(input)
             .map_err(|e| DeriverError::l2_provider(format!("decode postBatch({tx_hash}): {e}")))?;
         Ok(decoded.batch.entries)
+    }
+
+    fn observed_outbound_call_hashes_from_local_receipts(
+        &self,
+        block_number: u64,
+    ) -> DeriverResult<Vec<B256>> {
+        let receipts = self
+            .inner
+            .l2_provider
+            .receipts_by_block(block_number.into())
+            .map_err(DeriverError::l2_provider)?
+            .ok_or_else(|| {
+                DeriverError::l2_provider(format!(
+                    "local L2 receipts at block {block_number} missing"
+                ))
+            })?;
+        Ok(
+            eez_evm::outbound_gate::observed_outbound_call_hashes_from_logs(
+                receipts.iter().flat_map(|receipt| receipt.logs()),
+            ),
+        )
     }
 
     /// SYSTEM_ADDRESS account nonce at the L2 parent block. Both

@@ -14,7 +14,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_consensus::{SignableTransaction, Transaction, TxEip1559};
+use alloy_consensus::transaction::SignerRecoverable;
+use alloy_consensus::{SignableTransaction, Transaction, TxEip1559, TxEnvelope};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_eips::{BlockNumberOrTag, Decodable2718};
 use alloy_network::TxSignerSync;
@@ -185,6 +186,7 @@ impl Submitter {
                 L1Error::Submission(format!("send_bundle: decode postBatch envelope: {e}"))
             })?;
         let post_batch_hash = *post_batch_envelope.tx_hash();
+        log_bundle_txs(raw_txs, target_block, pin_timestamp, expected_final_state);
         // One bundle, one target block. Atomic bundle semantics:
         // rbuilder either includes the whole bundle in `target_block`
         // in the specified order, or drops it. Relays without a bundle
@@ -564,6 +566,21 @@ impl Inner {
                 }
                 Ok(None) => match target_provider.get_block_number().await {
                     Ok(head) if head > target_block => {
+                        let target_timestamp = target_provider
+                            .get_block_by_number(BlockNumberOrTag::Number(target_block))
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|b| b.header.timestamp);
+                        event!(
+                            name: "eez.submitter.observe.target_passed",
+                            Level::WARN,
+                            tx_hash = %tx_hash,
+                            target_block,
+                            head,
+                            target_timestamp = ?target_timestamp,
+                            "target block passed without postBatch receipt",
+                        );
                         return Ok(dropped(
                             tx_hash,
                             target_block,
@@ -677,6 +694,53 @@ impl Inner {
     }
 }
 
+// Decode each signed envelope before submission so live bundle drops can be
+// tied to a concrete nonce/fee/gas/value tuple without dumping full raw txs.
+fn log_bundle_txs(
+    raw_txs: &[alloy_primitives::Bytes],
+    target_block: u64,
+    pin_timestamp: Option<u64>,
+    expected_final_state: Option<alloy_primitives::B256>,
+) {
+    for (tx_idx, raw) in raw_txs.iter().enumerate() {
+        match TxEnvelope::decode_2718(&mut raw.as_ref()) {
+            Ok(envelope) => {
+                let tx_hash = *envelope.tx_hash();
+                let sender = envelope.recover_signer().ok();
+                event!(
+                    name: "eez.submitter.bundle.tx",
+                    Level::INFO,
+                    target_block,
+                    pin_timestamp = ?pin_timestamp,
+                    expected_final_state = ?expected_final_state,
+                    tx_idx,
+                    tx_hash = %tx_hash,
+                    sender = ?sender,
+                    chain_id = ?envelope.chain_id(),
+                    nonce = envelope.nonce(),
+                    gas_limit = envelope.gas_limit(),
+                    max_fee_per_gas = envelope.max_fee_per_gas(),
+                    max_priority_fee_per_gas = ?envelope.max_priority_fee_per_gas(),
+                    value = %envelope.value(),
+                    to = ?envelope.to(),
+                    raw_len = raw.len(),
+                    "decoded bundle tx before eth_sendBundle",
+                );
+            }
+            Err(err) => event!(
+                name: "eez.submitter.bundle.tx_decode_failed",
+                Level::WARN,
+                target_block,
+                pin_timestamp = ?pin_timestamp,
+                tx_idx,
+                raw_len = raw.len(),
+                error = %err,
+                "failed to decode bundle tx before eth_sendBundle",
+            ),
+        }
+    }
+}
+
 /// POST a multi-tx bundle to a Flashbots-style `eth_sendBundle` relay.
 /// Returns `Ok(())` if the relay returns a successful JSON-RPC reply
 /// (any non-error `result` — most relays use `{"result": {"bundleHash":
@@ -739,6 +803,7 @@ pub async fn post_bundle(
         name: "eez.submitter.bundle.sent",
         Level::INFO,
         target_block,
+        pin_timestamp = ?pin_timestamp,
         tx_count = raw_tx_hexes.len(),
         response = %resp,
         "eth_sendBundle response received",

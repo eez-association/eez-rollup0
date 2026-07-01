@@ -47,7 +47,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # OUR fork + the exact commit that carries native-validate + the EEZ
 # public-inputs commitment (guest parity). NOT on upstream.
 ARG ZISK_FORK_URL=https://github.com/eez-association/zisk-eth-client.git
-ARG ZISK_COMMIT=907ec9c233aacba0cf058b1f2fa1d11b483d5f3a
+ARG ZISK_COMMIT=a2dd9ac41012e5991d5938bf096c0fd2885ab1e0
 # The fork's `[patch."…/stateless.git"]` points `stateless`/`tries` at a SIBLING
 # checkout (`../zisk-patch-stateless`), so clone that repo NEXT TO the fork (the
 # fork lands in /v, so the sibling resolves to /zisk-patch-stateless). It is the
@@ -61,7 +61,7 @@ ARG ZISK_COMMIT=907ec9c233aacba0cf058b1f2fa1d11b483d5f3a
 # system write.
 ARG ZISK_PATCH_URL=https://github.com/eez-association/zisk-patch-stateless.git
 ARG ZISK_PATCH_BRANCH=eez-revm38
-ARG ZISK_PATCH_COMMIT=0849ad6e73cc176dee17bc34b0e85e94215feb90
+ARG ZISK_PATCH_COMMIT=14fa34607d2ae2a9ce7edb3f0d1a50bc7ea8c474
 RUN git clone --branch "$ZISK_PATCH_BRANCH" "$ZISK_PATCH_URL" /zisk-patch-stateless \
     && git -C /zisk-patch-stateless checkout "$ZISK_PATCH_COMMIT"
 WORKDIR /v

@@ -1,0 +1,1441 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EEZ Rollup0 Rabby and Remix Connection Info</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-2: #eef3f7;
+      --text: #17202a;
+      --muted: #657384;
+      --line: #d8e0e8;
+      --blue: #235789;
+      --blue-2: #dfeefa;
+      --green: #167a4a;
+      --green-2: #def3e7;
+      --amber: #9a650d;
+      --amber-2: #fff0cf;
+      --red: #a43c3c;
+      --red-2: #fae2e2;
+      --shadow: 0 8px 28px rgba(23, 32, 42, 0.08);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        linear-gradient(180deg, #f9fbfd 0%, var(--bg) 42%, #eef3f7 100%);
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    .shell {
+      width: min(1240px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 28px 0 48px;
+    }
+
+    header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 20px;
+      align-items: end;
+      padding-bottom: 18px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: clamp(28px, 4vw, 44px);
+      line-height: 1.05;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      font-size: 22px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 0;
+      font-size: 16px;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 0.94em;
+    }
+
+    .topline {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .pill {
+      display: inline-flex;
+      min-height: 30px;
+      align-items: center;
+      gap: 7px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 5px 10px;
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .pill strong {
+      color: var(--text);
+      font-weight: 650;
+    }
+
+    .host-control {
+      display: grid;
+      gap: 8px;
+      width: min(360px, 100%);
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .host-control label {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .host-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+    }
+
+    input,
+    select {
+      min-width: 0;
+      height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 0 11px;
+      color: var(--text);
+      background: #fff;
+    }
+
+    select {
+      cursor: pointer;
+    }
+
+    .btn {
+      display: inline-flex;
+      min-height: 34px;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 7px 11px;
+      color: var(--text);
+      background: #fff;
+      cursor: pointer;
+      transition: transform 120ms ease, border-color 120ms ease, background 120ms ease;
+    }
+
+    .btn:hover {
+      transform: translateY(-1px);
+      border-color: #aebdcb;
+      background: #fbfdff;
+    }
+
+    .btn.primary {
+      border-color: #1f5d91;
+      background: var(--blue);
+      color: #fff;
+    }
+
+    .btn.ghost {
+      background: transparent;
+    }
+
+    .btn.small {
+      min-height: 30px;
+      padding: 5px 9px;
+      font-size: 13px;
+    }
+
+    main {
+      display: grid;
+      gap: 28px;
+      padding-top: 24px;
+    }
+
+    section {
+      display: grid;
+      gap: 14px;
+    }
+
+    .band {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .grid.three {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .endpoint {
+      display: grid;
+      gap: 12px;
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      background: #fff;
+    }
+
+    .endpoint-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: start;
+    }
+
+    .endpoint-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 24px;
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: var(--panel-2);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .tag.l2 {
+      background: var(--blue-2);
+      color: var(--blue);
+    }
+
+    .tag.l1 {
+      background: var(--green-2);
+      color: var(--green);
+    }
+
+    .tag.inbound {
+      background: var(--amber-2);
+      color: var(--amber);
+    }
+
+    .kv {
+      display: grid;
+      gap: 8px;
+    }
+
+    .kv-row {
+      display: grid;
+      grid-template-columns: 116px minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      min-width: 0;
+    }
+
+    .kv-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .value {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+      color: #182637;
+    }
+
+    .status {
+      min-height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 9px 10px;
+      background: #fbfcfe;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+
+    .status.ok {
+      border-color: #add9c0;
+      background: var(--green-2);
+      color: #165c38;
+    }
+
+    .status.warn {
+      border-color: #e5c47b;
+      background: var(--amber-2);
+      color: #684306;
+    }
+
+    .status.err {
+      border-color: #e2a2a2;
+      background: var(--red-2);
+      color: var(--red);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+
+    th,
+    td {
+      padding: 11px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      font-size: 14px;
+    }
+
+    th {
+      background: #f1f5f9;
+      color: #344357;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    td code {
+      display: block;
+      max-width: 440px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .split {
+      display: grid;
+      grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+      gap: 14px;
+    }
+
+    .steps {
+      display: grid;
+      gap: 10px;
+      margin: 0;
+      padding-left: 20px;
+      color: var(--text);
+      line-height: 1.55;
+    }
+
+    .steps li {
+      padding-left: 4px;
+    }
+
+    .form-grid {
+      display: grid;
+      gap: 12px;
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+    }
+
+    .field label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .inline-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .note {
+      border-left: 4px solid var(--blue);
+      padding: 12px 14px;
+      background: #edf6ff;
+      color: #27415c;
+      line-height: 1.5;
+    }
+
+    .note.warn {
+      border-left-color: var(--amber);
+      background: #fff7e4;
+      color: #6b4a12;
+    }
+
+    pre {
+      margin: 0;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #121820;
+      color: #e7edf4;
+      line-height: 1.45;
+      font-size: 13px;
+    }
+
+    .pre-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+
+    .command-grid {
+      display: grid;
+      gap: 12px;
+    }
+
+    .footer {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    @media (max-width: 920px) {
+      header,
+      .split,
+      .grid,
+      .grid.three {
+        grid-template-columns: 1fr;
+      }
+
+      .host-control {
+        width: 100%;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .shell {
+        width: min(100vw - 20px, 1240px);
+        padding-top: 16px;
+      }
+
+      .band {
+        padding: 14px;
+      }
+
+      .kv-row {
+        grid-template-columns: 1fr;
+      }
+
+      .value {
+        white-space: normal;
+        word-break: break-all;
+      }
+
+      table,
+      thead,
+      tbody,
+      th,
+      td,
+      tr {
+        display: block;
+      }
+
+      thead {
+        display: none;
+      }
+
+      tr {
+        border-bottom: 1px solid var(--line);
+      }
+
+      tr:last-child {
+        border-bottom: 0;
+      }
+
+      td {
+        border: 0;
+      }
+
+      td::before {
+        content: attr(data-label);
+        display: block;
+        margin-bottom: 4px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+        text-transform: uppercase;
+      }
+
+      td code {
+        max-width: none;
+        white-space: normal;
+        word-break: break-all;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div>
+        <h1>EEZ Rollup0 Public Connection Info</h1>
+        <p>Use this page for Rabby wallet, Remix, curl, and cast against the current two-composer Chiado deployment.</p>
+        <div class="topline">
+          <span class="pill"><strong>L2 chain ID</strong> 10201</span>
+          <span class="pill"><strong>L1 chain ID</strong> 10200</span>
+          <span class="pill"><strong>Rollup ID</strong> 1</span>
+          <span class="pill"><strong>Generated</strong> 2026-06-30T14:19:19Z</span>
+        </div>
+      </div>
+
+      <div class="host-control">
+        <label for="publicHost">Public host for composer RPCs</label>
+        <div class="host-row">
+          <input id="publicHost" spellcheck="false" autocomplete="off" value="147.135.221.107">
+          <button class="btn primary" id="applyHost" type="button">Apply</button>
+        </div>
+        <p>Only the four composer-facing ports are public. Embedded L1 RPCs on 18645 and 18745 are localhost-only.</p>
+      </div>
+    </header>
+
+    <main>
+      <section class="band">
+        <h2>Endpoints</h2>
+        <div id="endpointGrid" class="grid"></div>
+      </section>
+
+      <section class="band">
+        <h2>Bridge</h2>
+        <div class="grid">
+          <div class="endpoint">
+            <div class="endpoint-head">
+              <h3>L1 to L2 ETH</h3>
+              <span class="tag inbound">Inbound</span>
+            </div>
+            <div class="form-grid">
+              <div class="field">
+                <label for="bridgeInboundComposer">Composer</label>
+                <select id="bridgeInboundComposer">
+                  <option value="c1-l1-l2">C1 L1->L2 Entry</option>
+                  <option value="c2-l1-l2">C2 L1->L2 Entry</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="bridgeInboundRecipient">L2 recipient</label>
+                <input id="bridgeInboundRecipient" spellcheck="false" placeholder="Uses connected wallet if empty">
+              </div>
+              <div class="field">
+                <label for="bridgeAmount">Amount ETH</label>
+                <input id="bridgeAmount" inputmode="decimal" spellcheck="false" value="0.001">
+              </div>
+              <div class="kv">
+                <div class="kv-row">
+                  <span class="kv-label">L1 manager</span>
+                  <span class="value" title="0xd3a59fc70e96dac105bc1f3ea8d80bb68e299317">0xd3a59fc70e96dac105bc1f3ea8d80bb68e299317</span>
+                  <button class="btn small" data-copy="0xd3a59fc70e96dac105bc1f3ea8d80bb68e299317" type="button">Copy</button>
+                </div>
+              </div>
+              <div id="bridgeInboundStatus" class="status">Not submitted yet.</div>
+              <div class="inline-actions">
+                <button class="btn" id="checkInboundRecipient" type="button">Check Recipient</button>
+                <button class="btn" id="checkInboundProxy" type="button">Check Proxy</button>
+                <button class="btn primary" id="sendBridgeInbound" type="button">Bridge to L2</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="endpoint">
+            <div class="endpoint-head">
+              <h3>L2 to L1 ETH</h3>
+              <span class="tag l2">Outbound</span>
+            </div>
+            <div class="form-grid">
+              <div class="field">
+                <label for="bridgeOutboundComposer">Composer</label>
+                <select id="bridgeOutboundComposer">
+                  <option value="c1-l2">C1 L2</option>
+                  <option value="c2-l2">C2 L2</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="bridgeOutboundRecipient">L1 recipient</label>
+                <input id="bridgeOutboundRecipient" spellcheck="false" placeholder="Uses connected wallet if empty">
+              </div>
+              <div class="field">
+                <label for="bridgeOutboundAmount">Amount ETH</label>
+                <input id="bridgeOutboundAmount" inputmode="decimal" spellcheck="false" value="0.001">
+              </div>
+              <div class="kv">
+                <div class="kv-row">
+                  <span class="kv-label">L2 manager</span>
+                  <span class="value" title="0x4200000000000000000000000000000000000007">0x4200000000000000000000000000000000000007</span>
+                  <button class="btn small" data-copy="0x4200000000000000000000000000000000000007" type="button">Copy</button>
+                </div>
+              </div>
+              <div id="bridgeOutboundStatus" class="status">Not submitted yet.</div>
+              <div class="inline-actions">
+                <button class="btn" id="checkOutboundRecipient" type="button">Check Recipient</button>
+                <button class="btn" id="checkOutboundProxy" type="button">Check Proxy</button>
+                <button class="btn primary" id="sendBridgeOutbound" type="button">Bridge to L1</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="band">
+        <h2>Contracts And Accounts</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Network</th>
+              <th>Address</th>
+              <th>Purpose</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="addressRows"></tbody>
+        </table>
+      </section>
+
+      <section class="band">
+        <div class="pre-head">
+          <h2>Live Checks</h2>
+          <button class="btn primary" id="checkAll" type="button">Check All</button>
+        </div>
+        <div class="grid">
+          <div class="endpoint">
+            <div class="endpoint-head">
+              <h3>L1 Rollup Registry</h3>
+              <span class="tag l1">L1</span>
+            </div>
+            <p>Reads <code>rollups(1)</code> from the registry through the C1 L1->L2 Entry RPC.</p>
+            <div id="registryStatus" class="status">Not checked yet.</div>
+            <button class="btn" id="checkRegistry" type="button">Check Registry</button>
+          </div>
+          <div class="endpoint">
+            <div class="endpoint-head">
+              <h3>L2 Bridge Receiver</h3>
+              <span class="tag l2">L2</span>
+            </div>
+            <p>Reads the native ETH balance of the deployed L2 bridge receiver on both composers.</p>
+            <div id="bridgeReceiverStatus" class="status">Not checked yet.</div>
+            <button class="btn" id="checkBridgeReceiverLive" type="button">Check Receiver</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="band">
+        <h2>Command Fallbacks</h2>
+        <p>Use these from a terminal when you want direct RPC checks.</p>
+        <div class="command-grid" id="commandGrid"></div>
+      </section>
+
+      <section class="band">
+        <h2>Quick Rules</h2>
+        <div class="grid">
+          <div class="note">
+            L2, L2 contract reads, pure L2 transactions, and L2 to L1 outbound transactions use the L2 RPC ports:
+            C1 on <code>18688</code>, C2 on <code>18788</code>.
+          </div>
+          <div class="note">
+            L1 to L2 inbound transactions use the L1->L2 Entry RPCs:
+            C1 on <code>18649</code>, C2 on <code>18749</code>. They answer L1 chain ID <code>10200</code>.
+          </div>
+        </div>
+      </section>
+
+      <div class="footer">
+        <span>No private keys are embedded in this page.</span>
+        <span>Server: <code>python3 tools/server.py --port 18080</code>.</span>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const CONFIG = {
+      defaultPublicHost: "147.135.221.107",
+      l1Explorer: "https://gnosis-chiado.blockscout.com",
+      l1ChainId: 10200,
+      l2ChainId: 10201,
+      rollupId: 1,
+      registry: "0xd3a59fc70e96dac105bc1f3ea8d80bb68e299317",
+      rollupManager: "0xabf79bcbe2962b6a9d7cc3cebe3a9aa5ca48e4a8",
+      proofSystem: "0x1a683c952ed127e38ad723d9c59b528d26095125",
+      l1L2Proxy: "0x00ed26641960cfb50990f0d51151928c0585bfa3",
+      l1BridgeSender: "0x634cca30110850c5f431a6bff80f842a68dae668",
+      l2BridgeReceiver: "0x4200000000000000000000000000000000000008",
+      ccmL2: "0x4200000000000000000000000000000000000007",
+      l2SystemAddress: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      c1Poster: "0x2012fFb650168a8B5046eB58314aE195A60BF4E5",
+      c2Poster: "0x76B639503Ac1fEeD4f455A8c2F97C73Bb4Ac85Be",
+      proverAttester: "0xfB05940Aaf4eA8AA6d4628B75Fcd5E1176B5F003",
+      bridgeCallData: "0x",
+      l1ToL2GasLimit: 600000,
+      computeProxySelector: "0xb761ba7e",
+      createProxySelector: "0x2dd72120",
+      rollupsCallData: "0xb794e5a30000000000000000000000000000000000000000000000000000000000000001"
+    };
+
+    const PORTS = {
+      c1L2: 18688,
+      c1L1L2: 18649,
+      c2L2: 18788,
+      c2L1L2: 18749
+    };
+
+    const ADDRESS_ROWS = [
+      ["Registry", "L1 Chiado", CONFIG.registry, "Rollup registry. Read rollups(1) here."],
+      ["Rollup manager", "L1 Chiado", CONFIG.rollupManager, "Rollup contract registered in the registry."],
+      ["Proof system", "L1 Chiado", CONFIG.proofSystem, "Real proof system contract for verifier attestations."],
+      ["L1 to L2 proxy", "L1 Chiado", CONFIG.l1L2Proxy, "Bridge proxy used for inbound L1 to L2 messages."],
+      ["L1 bridge sender", "L1 Chiado", CONFIG.l1BridgeSender, "Wrapper contract; do not use it from the L1->L2 Entry RPC because that endpoint only holds direct proxy txs."],
+      ["L2 bridge receiver", "L2 10201", CONFIG.l2BridgeReceiver, "L2 predeploy receiving inbound bridge messages."],
+      ["CCM L2", "L2 10201", CONFIG.ccmL2, "L2 predeploy for cross-chain manager logic."],
+      ["L2 system address", "L2 10201", CONFIG.l2SystemAddress, "Funded system EOA used for L2 system transactions."],
+      ["C1 poster", "L1 Chiado", CONFIG.c1Poster, "Composer C1 L1 poster account address."],
+      ["C2 poster", "L1 Chiado", CONFIG.c2Poster, "Composer C2 L1 poster account address."],
+      ["Prover attester", "L1 Chiado", CONFIG.proverAttester, "Authorized proof attestation signer address."]
+    ];
+
+    const $ = (selector) => document.querySelector(selector);
+
+    function currentHost() {
+      return $("#publicHost").value.trim() || CONFIG.defaultPublicHost;
+    }
+
+    function endpointUrl(port) {
+      return `http://${currentHost()}:${port}`;
+    }
+
+    function endpointById(id) {
+      return endpoints().find((item) => item.id === id);
+    }
+
+    function endpoints() {
+      return [
+        {
+          id: "c1-l2",
+          title: "Composer C1 L2 RPC",
+          tag: "L2",
+          tagClass: "l2",
+          url: endpointUrl(PORTS.c1L2),
+          proxyPath: "/rpc/c1-l2",
+          chainId: CONFIG.l2ChainId,
+          walletName: "EEZ Rollup0 L2 C1",
+          nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+          explorerUrls: [],
+          walletAdd: true,
+          role: "Rabby/Remix L2 endpoint for C1. Use for L2 reads, L2 contract calls, pure L2 txs, and L2 to L1 outbound txs."
+        },
+        {
+          id: "c1-l1-l2",
+          title: "Composer C1 L1->L2 Entry RPC",
+          tag: "Inbound",
+          tagClass: "inbound",
+          url: endpointUrl(PORTS.c1L1L2),
+          proxyPath: "/rpc/c1-l1-l2",
+          chainId: CONFIG.l1ChainId,
+          walletName: "EEZ L1->L2 C1",
+          nativeCurrency: { name: "Chiado xDAI", symbol: "xDAI", decimals: 18 },
+          explorerUrls: [CONFIG.l1Explorer],
+          walletAdd: true,
+          role: "Wallet-correct L1->L2 entry for C1. It reports the L1 chain ID and captures cross-chain submissions."
+        },
+        {
+          id: "c2-l2",
+          title: "Composer C2 L2 RPC",
+          tag: "L2",
+          tagClass: "l2",
+          url: endpointUrl(PORTS.c2L2),
+          proxyPath: "/rpc/c2-l2",
+          chainId: CONFIG.l2ChainId,
+          walletName: "EEZ Rollup0 L2 C2",
+          nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+          explorerUrls: [],
+          walletAdd: true,
+          role: "Rabby/Remix L2 endpoint for C2. Use this when you want a transaction to enter through C2."
+        },
+        {
+          id: "c2-l1-l2",
+          title: "Composer C2 L1->L2 Entry RPC",
+          tag: "Inbound",
+          tagClass: "inbound",
+          url: endpointUrl(PORTS.c2L1L2),
+          proxyPath: "/rpc/c2-l1-l2",
+          chainId: CONFIG.l1ChainId,
+          walletName: "EEZ L1->L2 C2",
+          nativeCurrency: { name: "Chiado xDAI", symbol: "xDAI", decimals: 18 },
+          explorerUrls: [CONFIG.l1Explorer],
+          walletAdd: true,
+          role: "Wallet-correct L1->L2 entry for C2."
+        }
+      ];
+    }
+
+    function copyText(text, button) {
+      navigator.clipboard.writeText(text).then(() => {
+        const old = button.textContent;
+        button.textContent = "Copied";
+        setTimeout(() => button.textContent = old, 900);
+      }).catch(() => {
+        window.prompt("Copy this value", text);
+      });
+    }
+
+    function shortHex(hex) {
+      if (!hex || hex.length <= 18) return hex || "";
+      return `${hex.slice(0, 10)}...${hex.slice(-8)}`;
+    }
+
+    function toDec(hex) {
+      if (!hex) return "";
+      return BigInt(hex).toString(10);
+    }
+
+    function hexQuantity(value) {
+      return `0x${BigInt(value).toString(16)}`;
+    }
+
+    function parseEtherDecimal(raw) {
+      const value = raw.trim();
+      if (!/^[0-9]+(\.[0-9]{0,18})?$/.test(value)) {
+        throw new Error("Enter a decimal ETH amount with up to 18 decimals.");
+      }
+      const [whole, frac = ""] = value.split(".");
+      const padded = (frac + "0".repeat(18)).slice(0, 18);
+      return BigInt(whole) * 10n ** 18n + BigInt(padded || "0");
+    }
+
+    function formatEther(weiHex) {
+      const wei = BigInt(weiHex);
+      const base = 10n ** 18n;
+      const whole = wei / base;
+      const frac = wei % base;
+      if (frac === 0n) return `${whole.toString()} ETH`;
+      const fracText = frac.toString().padStart(18, "0").replace(/0+$/, "");
+      return `${whole.toString()}.${fracText} ETH`;
+    }
+
+    function isAddress(value) {
+      return /^0x[0-9a-fA-F]{40}$/.test(value);
+    }
+
+    function encodeAddress(value) {
+      if (!isAddress(value)) throw new Error("Enter a valid 0x address.");
+      return value.toLowerCase().replace(/^0x/, "").padStart(64, "0");
+    }
+
+    function encodeUint(value) {
+      return BigInt(value).toString(16).padStart(64, "0");
+    }
+
+    function encodeComputeProxy(address, rollupId) {
+      return `${CONFIG.computeProxySelector}${encodeAddress(address)}${encodeUint(rollupId)}`;
+    }
+
+    function encodeCreateProxy(address, rollupId) {
+      return `${CONFIG.createProxySelector}${encodeAddress(address)}${encodeUint(rollupId)}`;
+    }
+
+    function decodeAddress(result) {
+      const hex = result.replace(/^0x/, "");
+      if (hex.length < 64) throw new Error("short address response");
+      return `0x${hex.slice(24, 64)}`;
+    }
+
+    function servedOverHttp() {
+      return location.protocol === "http:" || location.protocol === "https:";
+    }
+
+    function endpointRpcUrl(ep) {
+      return servedOverHttp() && ep.proxyPath ? ep.proxyPath : ep.url;
+    }
+
+    function l1ReadRpcUrl() {
+      return servedOverHttp() ? "/rpc/c1-l1-l2" : endpointUrl(PORTS.c1L1L2);
+    }
+
+    async function rpc(url, method, params = []) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 6500);
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params }),
+          signal: controller.signal
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const payload = await res.json();
+        if (payload.error) throw new Error(payload.error.message || JSON.stringify(payload.error));
+        return payload.result;
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
+    function renderEndpoints() {
+      const grid = $("#endpointGrid");
+      grid.innerHTML = endpoints().map((ep) => `
+        <article class="endpoint">
+          <div class="endpoint-head">
+            <h3>${ep.title}</h3>
+            <span class="tag ${ep.tagClass}">${ep.tag}</span>
+          </div>
+          <p>${ep.role}</p>
+          <div class="kv">
+            <div class="kv-row">
+              <span class="kv-label">RPC URL</span>
+              <span class="value" title="${ep.url}">${ep.url}</span>
+              <button class="btn small" data-copy="${ep.url}" type="button">Copy</button>
+            </div>
+            <div class="kv-row">
+              <span class="kv-label">Chain ID</span>
+              <span class="value">${ep.chainId}</span>
+              <button class="btn small" data-copy="${ep.chainId}" type="button">Copy</button>
+            </div>
+          </div>
+          <div id="status-${ep.id}" class="status">Not checked yet.</div>
+          <div class="endpoint-actions">
+            <button class="btn" data-check-endpoint="${ep.id}" type="button">Check RPC</button>
+            ${ep.walletAdd ? `<button class="btn primary" data-add-rabby="${ep.id}" type="button">Add to Rabby</button>` : ""}
+          </div>
+        </article>
+      `).join("");
+    }
+
+    function renderAddresses() {
+      $("#addressRows").innerHTML = ADDRESS_ROWS.map(([name, network, address, purpose]) => `
+        <tr>
+          <td data-label="Name">${name}</td>
+          <td data-label="Network">${network}</td>
+          <td data-label="Address"><code title="${address}">${address}</code></td>
+          <td data-label="Purpose">${purpose}</td>
+          <td data-label="Copy"><button class="btn small" data-copy="${address}" type="button">Copy</button></td>
+        </tr>
+      `).join("");
+    }
+
+    function renderCommands() {
+      const host = currentHost();
+      const commands = [
+        ["Check C1 L2", `cast chain-id --rpc-url http://${host}:18688\ncast block-number --rpc-url http://${host}:18688\ncast block latest --rpc-url http://${host}:18688`],
+        ["Check C2 L2", `cast chain-id --rpc-url http://${host}:18788\ncast block-number --rpc-url http://${host}:18788\ncast block latest --rpc-url http://${host}:18788`],
+        ["Check L1->L2 Entry RPCs", `cast chain-id --rpc-url http://${host}:18649\ncast chain-id --rpc-url http://${host}:18749\ncast block-number --rpc-url http://${host}:18649\ncast block-number --rpc-url http://${host}:18749`],
+        ["Check L1 rollup state", `cast call ${CONFIG.registry} 'rollups(uint256)(address,bytes32,uint256)' 1 --rpc-url http://${host}:18649`],
+        ["Check bridge receiver", `cast balance ${CONFIG.l2BridgeReceiver} --rpc-url http://${host}:18688\ncast balance ${CONFIG.l2BridgeReceiver} --rpc-url http://${host}:18788`],
+        ["Compute L1->L2 proxy", `cast call ${CONFIG.registry} 'computeCrossChainProxyAddress(address,uint256)(address)' <L2_RECIPIENT> ${CONFIG.rollupId} --rpc-url http://${host}:18649`],
+        ["Compute L2->L1 proxy", `cast call ${CONFIG.ccmL2} 'computeCrossChainProxyAddress(address,uint256)(address)' <L1_RECIPIENT> 0 --rpc-url http://${host}:18688`],
+        ["curl JSON-RPC sample", `curl -sS -H 'content-type: application/json' \\\n  --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \\\n  http://${host}:18688`],
+        ["Run this page with RPC proxies", `python3 tools/server.py --port 18080\n# open http://${host}:18080/rabbit-remix-info.html`]
+      ];
+
+      $("#commandGrid").innerHTML = commands.map(([title, command], index) => `
+        <div>
+          <div class="pre-head">
+            <h3>${title}</h3>
+            <button class="btn small" data-copy="${escapeAttr(command)}" type="button">Copy</button>
+          </div>
+          <pre><code>${escapeHtml(command)}</code></pre>
+        </div>
+      `).join("");
+    }
+
+    function escapeHtml(text) {
+      return text
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+    }
+
+    function escapeAttr(text) {
+      return escapeHtml(text).replaceAll('"', "&quot;");
+    }
+
+    async function checkEndpoint(id) {
+      const ep = endpoints().find((item) => item.id === id);
+      const status = $(`#status-${id}`);
+      const url = endpointRpcUrl(ep);
+      status.className = "status";
+      status.textContent = "Checking...";
+      try {
+        const [chainIdHex, blockNumberHex, latest] = await Promise.all([
+          rpc(url, "eth_chainId"),
+          rpc(url, "eth_blockNumber"),
+          rpc(url, "eth_getBlockByNumber", ["latest", false])
+        ]);
+        const chainId = Number(BigInt(chainIdHex));
+        const blockNumber = toDec(blockNumberHex);
+        const root = latest && latest.stateRoot ? shortHex(latest.stateRoot) : "n/a";
+        const hash = latest && latest.hash ? shortHex(latest.hash) : "n/a";
+        const okChain = chainId === ep.chainId;
+        const mode = url === ep.url ? "direct" : "proxy";
+        status.className = okChain ? "status ok" : "status warn";
+        status.textContent = `${mode}: chainId ${chainId}, block ${blockNumber}, hash ${hash}, stateRoot ${root}${okChain ? "" : " (unexpected chain ID)"}`;
+      } catch (err) {
+        status.className = "status err";
+        status.textContent = `Check failed: ${err.message}. If this is not served by tools/server.py, use that server or the cast/curl fallback below.`;
+      }
+    }
+
+    function chainIdHex(chainId) {
+      return `0x${Number(chainId).toString(16)}`;
+    }
+
+    function walletParams(ep) {
+      const params = {
+        chainId: chainIdHex(ep.chainId),
+        chainName: ep.walletName || ep.title,
+        rpcUrls: [ep.url],
+        nativeCurrency: ep.nativeCurrency || { name: "Ether", symbol: "ETH", decimals: 18 }
+      };
+      if (ep.explorerUrls && ep.explorerUrls.length > 0) {
+        params.blockExplorerUrls = ep.explorerUrls;
+      }
+      return params;
+    }
+
+    async function addToRabby(id, button) {
+      const ep = endpoints().find((item) => item.id === id);
+      const status = $(`#status-${id}`);
+      if (!window.ethereum || !window.ethereum.request) {
+        status.className = "status warn";
+        status.textContent = "No injected wallet provider found. Open this page in a browser where Rabby is enabled.";
+        return;
+      }
+
+      const old = button.textContent;
+      button.disabled = true;
+      button.textContent = "Opening Rabby...";
+      try {
+        const params = walletParams(ep);
+        await window.ethereum.request({ method: "wallet_addEthereumChain", params: [params] });
+        try {
+          await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: params.chainId }] });
+        } catch (switchErr) {
+          console.warn("wallet_switchEthereumChain failed after add", switchErr);
+        }
+        status.className = "status ok";
+        status.textContent = `Rabby request sent for ${ep.walletName}. RPC URL: ${ep.url}`;
+      } catch (err) {
+        status.className = "status err";
+        status.textContent = `Rabby rejected the request: ${err.message || err}. If this chain ID already exists, edit its custom RPC URL manually.`;
+      } finally {
+        button.disabled = false;
+        button.textContent = old;
+      }
+    }
+
+    async function ensureWalletEndpoint(ep) {
+      if (!window.ethereum || !window.ethereum.request) {
+        throw new Error("No injected wallet provider found.");
+      }
+      const params = walletParams(ep);
+      try {
+        await window.ethereum.request({ method: "wallet_addEthereumChain", params: [params] });
+      } catch (err) {
+        if (err && err.code === 4001) throw err;
+        console.warn("wallet_addEthereumChain did not complete", err);
+      }
+      try {
+        await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: params.chainId }] });
+      } catch (err) {
+        if (err && err.code === 4001) throw err;
+        console.warn("wallet_switchEthereumChain did not complete", err);
+      }
+      const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+      if (!accounts || !accounts[0]) throw new Error("No wallet account selected.");
+      return accounts[0];
+    }
+
+    async function checkBridgeReceiver(statusSelector = "#bridgeInboundStatus") {
+      const status = $(statusSelector);
+      status.className = "status";
+      status.textContent = "Checking...";
+      try {
+        const c1 = await rpc(endpointRpcUrl(endpointById("c1-l2")), "eth_getBalance", [CONFIG.l2BridgeReceiver, "latest"]);
+        const c2 = await rpc(endpointRpcUrl(endpointById("c2-l2")), "eth_getBalance", [CONFIG.l2BridgeReceiver, "latest"]);
+        status.className = "status ok";
+        status.innerHTML = `L2 receiver balance<br>C1: ${formatEther(c1)}<br>C2: ${formatEther(c2)}`;
+      } catch (err) {
+        status.className = "status err";
+        status.textContent = `Receiver check failed: ${err.message || err}`;
+      }
+    }
+
+    async function checkBridgeReceiverLive() {
+      await checkBridgeReceiver("#bridgeReceiverStatus");
+    }
+
+    function inboundEndpoint() {
+      return endpointById($("#bridgeInboundComposer").value);
+    }
+
+    function inboundRecipient(from) {
+      const typed = $("#bridgeInboundRecipient").value.trim();
+      const recipient = typed || from;
+      if (!isAddress(recipient)) throw new Error("Enter a valid L2 recipient address.");
+      return recipient;
+    }
+
+    async function computeInboundProxy(ep, recipient) {
+      const result = await rpc(
+        endpointRpcUrl(ep),
+        "eth_call",
+        [{ to: CONFIG.registry, data: encodeComputeProxy(recipient, CONFIG.rollupId) }, "latest"]
+      );
+      return decodeAddress(result);
+    }
+
+    async function getL1ProxyCode(ep, proxy) {
+      return rpc(endpointRpcUrl(ep), "eth_getCode", [proxy, "latest"]);
+    }
+
+    async function checkInboundRecipient() {
+      const status = $("#bridgeInboundStatus");
+      status.className = "status";
+      status.textContent = "Checking...";
+      try {
+        const accounts = window.ethereum && window.ethereum.request
+          ? await window.ethereum.request({ method: "eth_accounts" })
+          : [];
+        const fallback = accounts && accounts[0] ? accounts[0] : "";
+        const recipient = inboundRecipient(fallback);
+        const c1 = await rpc(endpointRpcUrl(endpointById("c1-l2")), "eth_getBalance", [recipient, "latest"]);
+        const c2 = await rpc(endpointRpcUrl(endpointById("c2-l2")), "eth_getBalance", [recipient, "latest"]);
+        status.className = "status ok";
+        status.innerHTML = `L2 recipient ${recipient}<br>C1 balance ${formatEther(c1)}<br>C2 balance ${formatEther(c2)}`;
+      } catch (err) {
+        status.className = "status err";
+        status.textContent = `Recipient check failed: ${err.message || err}`;
+      }
+    }
+
+    async function checkInboundProxy() {
+      const status = $("#bridgeInboundStatus");
+      const ep = inboundEndpoint();
+      status.className = "status";
+      status.textContent = "Checking...";
+      try {
+        const accounts = window.ethereum && window.ethereum.request
+          ? await window.ethereum.request({ method: "eth_accounts" })
+          : [];
+        const fallback = accounts && accounts[0] ? accounts[0] : "";
+        const recipient = inboundRecipient(fallback);
+        const proxy = await computeInboundProxy(ep, recipient);
+        const code = await getL1ProxyCode(ep, proxy);
+        status.className = code === "0x" ? "status warn" : "status ok";
+        status.innerHTML = `L1 proxy for L2 recipient ${recipient}<br><code>${proxy}</code><br>${code === "0x" ? "Proxy not created yet. Bridge to L2 will create it first." : "Proxy exists."}`;
+      } catch (err) {
+        status.className = "status err";
+        status.textContent = `Proxy check failed: ${err.message || err}`;
+      }
+    }
+
+    async function ensureInboundProxy(ep, recipient, from, status) {
+      const proxy = await computeInboundProxy(ep, recipient);
+      const code = await getL1ProxyCode(ep, proxy);
+      if (code !== "0x") return proxy;
+
+      status.innerHTML = `Creating L1 proxy for L2 recipient ${recipient}<br><code>${proxy}</code>`;
+      const createHash = await window.ethereum.request({
+        method: "eth_sendTransaction",
+        params: [{
+          from,
+          to: CONFIG.registry,
+          value: "0x0",
+          data: encodeCreateProxy(recipient, CONFIG.rollupId)
+        }]
+      });
+      status.innerHTML = `Proxy create submitted<br><code>${createHash}</code><br>Waiting for proxy code...`;
+      for (let i = 0; i < 45; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const nextCode = await getL1ProxyCode(ep, proxy);
+        if (nextCode !== "0x") return proxy;
+      }
+      throw new Error("Proxy creation was submitted, but code did not appear before timeout.");
+    }
+
+    async function sendBridgeInbound() {
+      const status = $("#bridgeInboundStatus");
+      const button = $("#sendBridgeInbound");
+      const ep = inboundEndpoint();
+      status.className = "status";
+      status.textContent = "Opening Rabby...";
+      button.disabled = true;
+      try {
+        const amountWei = parseEtherDecimal($("#bridgeAmount").value);
+        if (amountWei <= 0n) throw new Error("Amount must be greater than zero.");
+        const from = await ensureWalletEndpoint(ep);
+        const recipient = inboundRecipient(from);
+        const proxy = await ensureInboundProxy(ep, recipient, from, status);
+        const hash = await window.ethereum.request({
+          method: "eth_sendTransaction",
+          params: [{
+            from,
+            to: proxy,
+            value: hexQuantity(amountWei),
+            gas: hexQuantity(CONFIG.l1ToL2GasLimit),
+            data: CONFIG.bridgeCallData
+          }]
+        });
+        status.className = "status ok";
+        status.innerHTML = `Submitted through ${ep.title}<br>recipient ${recipient}<br>proxy <code>${proxy}</code><br><code>${hash}</code>`;
+      } catch (err) {
+        status.className = "status err";
+        status.textContent = `Bridge submit failed: ${err.message || err}`;
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    function outboundEndpoint() {
+      return endpointById($("#bridgeOutboundComposer").value);
+    }
+
+    function outboundRecipient(from) {
+      const typed = $("#bridgeOutboundRecipient").value.trim();
+      const recipient = typed || from;
+      if (!isAddress(recipient)) throw new Error("Enter a valid L1 recipient address.");
+      return recipient;
+    }
+
+    async function computeOutboundProxy(ep, recipient) {
+      const result = await rpc(
+        endpointRpcUrl(ep),
+        "eth_call",
+        [{ to: CONFIG.ccmL2, data: encodeComputeProxy(recipient, 0) }, "latest"]
+      );
+      return decodeAddress(result);
+    }
+
+    async function getProxyCode(ep, proxy) {
+      return rpc(endpointRpcUrl(ep), "eth_getCode", [proxy, "latest"]);
+    }
+
+    async function checkOutboundProxy() {
+      const status = $("#bridgeOutboundStatus");
+      const ep = outboundEndpoint();
+      status.className = "status";
+      status.textContent = "Checking...";
+      try {
+        const accounts = window.ethereum && window.ethereum.request
+          ? await window.ethereum.request({ method: "eth_accounts" })
+          : [];
+        const fallback = accounts && accounts[0] ? accounts[0] : "";
+        const recipient = outboundRecipient(fallback);
+        const proxy = await computeOutboundProxy(ep, recipient);
+        const code = await getProxyCode(ep, proxy);
+        status.className = code === "0x" ? "status warn" : "status ok";
+        status.innerHTML = `L2 proxy for ${recipient}<br><code>${proxy}</code><br>${code === "0x" ? "Proxy not created yet. Bridge to L1 will create it first." : "Proxy exists."}`;
+      } catch (err) {
+        status.className = "status err";
+        status.textContent = `Proxy check failed: ${err.message || err}`;
+      }
+    }
+
+    async function checkOutboundRecipient() {
+      const status = $("#bridgeOutboundStatus");
+      status.className = "status";
+      status.textContent = "Checking...";
+      try {
+        const accounts = window.ethereum && window.ethereum.request
+          ? await window.ethereum.request({ method: "eth_accounts" })
+          : [];
+        const fallback = accounts && accounts[0] ? accounts[0] : "";
+        const recipient = outboundRecipient(fallback);
+        const balance = await rpc(l1ReadRpcUrl(), "eth_getBalance", [recipient, "latest"]);
+        status.className = "status ok";
+        status.innerHTML = `L1 recipient ${recipient}<br>balance ${formatEther(balance)}`;
+      } catch (err) {
+        status.className = "status err";
+        status.textContent = `Recipient check failed: ${err.message || err}`;
+      }
+    }
+
+    async function ensureOutboundProxy(ep, recipient, from, status) {
+      const proxy = await computeOutboundProxy(ep, recipient);
+      const code = await getProxyCode(ep, proxy);
+      if (code !== "0x") return proxy;
+
+      status.innerHTML = `Creating L2 proxy for ${recipient}<br><code>${proxy}</code>`;
+      const createHash = await window.ethereum.request({
+        method: "eth_sendTransaction",
+        params: [{
+          from,
+          to: CONFIG.ccmL2,
+          value: "0x0",
+          data: encodeCreateProxy(recipient, 0)
+        }]
+      });
+      status.innerHTML = `Proxy create submitted<br><code>${createHash}</code><br>Waiting for proxy code...`;
+      for (let i = 0; i < 45; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const nextCode = await getProxyCode(ep, proxy);
+        if (nextCode !== "0x") return proxy;
+      }
+      throw new Error("Proxy creation was submitted, but code did not appear before timeout.");
+    }
+
+    async function sendBridgeOutbound() {
+      const status = $("#bridgeOutboundStatus");
+      const button = $("#sendBridgeOutbound");
+      const ep = outboundEndpoint();
+      status.className = "status";
+      status.textContent = "Opening Rabby...";
+      button.disabled = true;
+      try {
+        const amountWei = parseEtherDecimal($("#bridgeOutboundAmount").value);
+        if (amountWei <= 0n) throw new Error("Amount must be greater than zero.");
+        const from = await ensureWalletEndpoint(ep);
+        const recipient = outboundRecipient(from);
+        const proxy = await ensureOutboundProxy(ep, recipient, from, status);
+        const hash = await window.ethereum.request({
+          method: "eth_sendTransaction",
+          params: [{
+            from,
+            to: proxy,
+            value: hexQuantity(amountWei),
+            data: "0x"
+          }]
+        });
+        status.className = "status ok";
+        status.innerHTML = `Submitted through ${ep.title}<br>recipient ${recipient}<br>proxy <code>${proxy}</code><br><code>${hash}</code>`;
+      } catch (err) {
+        status.className = "status err";
+        status.textContent = `Bridge submit failed: ${err.message || err}`;
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    function decodeRollup(result) {
+      const hex = result.replace(/^0x/, "");
+      if (hex.length < 192) throw new Error("short rollups() response");
+      const rollupContract = `0x${hex.slice(24, 64)}`;
+      const stateRoot = `0x${hex.slice(64, 128)}`;
+      const etherBalance = BigInt(`0x${hex.slice(128, 192)}`).toString(10);
+      return { rollupContract, stateRoot, etherBalance };
+    }
+
+    async function checkRegistry() {
+      const status = $("#registryStatus");
+      status.className = "status";
+      status.textContent = "Checking...";
+      try {
+        const result = await rpc(l1ReadRpcUrl(), "eth_call", [{ to: CONFIG.registry, data: CONFIG.rollupsCallData }, "latest"]);
+        const decoded = decodeRollup(result);
+        status.className = "status ok";
+        status.innerHTML = `rollupContract ${shortHex(decoded.rollupContract)}<br>stateRoot ${decoded.stateRoot}<br>etherBalance ${decoded.etherBalance}`;
+      } catch (err) {
+        status.className = "status err";
+        status.textContent = `Browser check failed: ${err.message}. Use the cast registry command below.`;
+      }
+    }
+
+    async function checkAll() {
+      const ids = endpoints().map((ep) => ep.id);
+      await Promise.allSettled(ids.map(checkEndpoint));
+      await Promise.allSettled([checkRegistry(), checkBridgeReceiverLive()]);
+    }
+
+    function rerender() {
+      localStorage.setItem("eezPublicHost", currentHost());
+      renderEndpoints();
+      renderCommands();
+    }
+
+    document.addEventListener("click", (event) => {
+      const copy = event.target.closest("[data-copy]");
+      if (copy) copyText(copy.dataset.copy, copy);
+
+      const check = event.target.closest("[data-check-endpoint]");
+      if (check) checkEndpoint(check.dataset.checkEndpoint);
+
+      const rabby = event.target.closest("[data-add-rabby]");
+      if (rabby) addToRabby(rabby.dataset.addRabby, rabby);
+    });
+
+    $("#applyHost").addEventListener("click", rerender);
+    $("#checkAll").addEventListener("click", checkAll);
+    $("#checkRegistry").addEventListener("click", checkRegistry);
+    $("#checkInboundRecipient").addEventListener("click", checkInboundRecipient);
+    $("#checkInboundProxy").addEventListener("click", checkInboundProxy);
+    $("#checkBridgeReceiverLive").addEventListener("click", checkBridgeReceiverLive);
+    $("#sendBridgeInbound").addEventListener("click", sendBridgeInbound);
+    $("#checkOutboundRecipient").addEventListener("click", checkOutboundRecipient);
+    $("#checkOutboundProxy").addEventListener("click", checkOutboundProxy);
+    $("#sendBridgeOutbound").addEventListener("click", sendBridgeOutbound);
+
+    const storedHost = localStorage.getItem("eezPublicHost");
+    if (storedHost) $("#publicHost").value = storedHost;
+    renderEndpoints();
+    renderAddresses();
+    renderCommands();
+  </script>
+</body>
+</html>

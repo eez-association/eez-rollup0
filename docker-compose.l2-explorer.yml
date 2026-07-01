@@ -74,9 +74,9 @@ services:
       MIX_ENV: "prod"
       POOL_SIZE: "50"
       FIRST_BLOCK: "0"
-      # Public host: served behind the host nginx vhost l2.eez.dev (443 -> :4003).
-      BLOCKSCOUT_HOST: "l2.eez.dev"
-      API_URL: "https://l2.eez.dev"
+      # Public host: use raw-IP URLs so the explorer works without DNS.
+      BLOCKSCOUT_HOST: "147.135.221.107"
+      API_URL: "http://147.135.221.107"
     depends_on:
       l2eez-db:
         condition: service_healthy
@@ -86,10 +86,10 @@ services:
     container_name: l2eez-frontend
     restart: unless-stopped
     environment:
-      NEXT_PUBLIC_API_HOST: "l2.eez.dev"
-      NEXT_PUBLIC_API_PORT: "443"
-      NEXT_PUBLIC_API_PROTOCOL: https
-      NEXT_PUBLIC_API_WEBSOCKET_PROTOCOL: wss
+      NEXT_PUBLIC_API_HOST: "147.135.221.107"
+      NEXT_PUBLIC_API_PORT: "80"
+      NEXT_PUBLIC_API_PROTOCOL: http
+      NEXT_PUBLIC_API_WEBSOCKET_PROTOCOL: ws
       NEXT_PUBLIC_STATS_API_HOST: ""
       NEXT_PUBLIC_NETWORK_NAME: "eez Rollup L2"
       NEXT_PUBLIC_NETWORK_SHORT_NAME: "L2"
@@ -98,9 +98,9 @@ services:
       NEXT_PUBLIC_NETWORK_CURRENCY_SYMBOL: "ETH"
       NEXT_PUBLIC_NETWORK_CURRENCY_DECIMALS: "18"
       NEXT_PUBLIC_IS_TESTNET: "true"
-      NEXT_PUBLIC_APP_HOST: "l2.eez.dev"
-      NEXT_PUBLIC_APP_PORT: "443"
-      NEXT_PUBLIC_APP_PROTOCOL: https
+      NEXT_PUBLIC_APP_HOST: "147.135.221.107"
+      NEXT_PUBLIC_APP_PORT: "80"
+      NEXT_PUBLIC_APP_PROTOCOL: http
       NEXT_PUBLIC_HOMEPAGE_CHARTS: "['daily_txs']"
       NEXT_PUBLIC_VISUALIZE_API_HOST: ""
     ports:

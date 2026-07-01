@@ -18,6 +18,8 @@ use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use eez_composer::{Classification, Direction, HeldPool, HeldTx, IngressClassifier};
+use eez_protocol::executor::EntryChainClient;
+use eez_protocol::rollup_id::RollupId;
 use jsonrpsee::core::middleware::{Batch, Notification, RpcServiceT};
 use jsonrpsee::core::server::{MethodResponse, ResponsePayload};
 use jsonrpsee::types::{ErrorObject, Request};
@@ -41,6 +43,85 @@ const MAX_RESPONSE_SIZE: usize = 1024;
 /// the `RpcServiceT` service must be `Send + Sync`.
 type L2StateCell = Arc<OnceLock<Arc<dyn StateProviderFactory + Send + Sync>>>;
 
+type IndirectOutboundProbeCell = Arc<OnceLock<Arc<IndirectOutboundProbe>>>;
+
+/// Late-filled admission probe for L2 transactions whose top-level `to` is not
+/// itself a registered proxy, but whose execution may call one indirectly.
+///
+/// The probe reuses the same EVM composer and L2 entry client used by Sync-slot
+/// composition. It is therefore an admission-only preview of the authoritative
+/// path: if source simulation records outbound target entries, the tx must be
+/// held for a Sync block; otherwise it remains a vanilla L2 tx.
+pub struct IndirectOutboundProbe {
+    composer: eez_evm_inspector::EvmComposer,
+    l2_entry: Arc<dyn EntryChainClient<Protocol = eez_evm::EvmProtocol> + Send + Sync>,
+    rollup_id: u64,
+}
+
+impl IndirectOutboundProbe {
+    #[must_use]
+    pub fn new(
+        composer: eez_evm_inspector::EvmComposer,
+        l2_entry: Arc<dyn EntryChainClient<Protocol = eez_evm::EvmProtocol> + Send + Sync>,
+        rollup_id: u64,
+    ) -> Self {
+        Self {
+            composer,
+            l2_entry,
+            rollup_id,
+        }
+    }
+
+    async fn detects_outbound(&self, raw_tx: &Bytes, tx_hash: B256) -> bool {
+        match self
+            .composer
+            .simulate_and_resolve_recorded_for(
+                RollupId(self.rollup_id),
+                self.l2_entry.as_ref(),
+                raw_tx.as_ref(),
+            )
+            .await
+        {
+            Ok((composition, recorded)) => {
+                let target_entries: usize = composition
+                    .targets
+                    .iter()
+                    .map(|target| target.batch.entries().len())
+                    .sum();
+                if target_entries == 0 {
+                    event!(
+                        name: "eez.ingress.outbound.indirect_probe.empty",
+                        Level::DEBUG,
+                        tx_hash = %tx_hash,
+                        recorded_actions = recorded.len(),
+                        "indirect outbound probe recorded no target entries; treating tx as vanilla L2",
+                    );
+                    return false;
+                }
+                event!(
+                    name: "eez.ingress.outbound.indirect_probe.accepted",
+                    Level::INFO,
+                    tx_hash = %tx_hash,
+                    recorded_actions = recorded.len(),
+                    target_entries,
+                    "indirect outbound probe found L1 settlement entries; holding tx for Sync slot",
+                );
+                true
+            }
+            Err(err) => {
+                event!(
+                    name: "eez.ingress.outbound.indirect_probe.miss",
+                    Level::DEBUG,
+                    tx_hash = %tx_hash,
+                    error = %err,
+                    "indirect outbound probe did not produce a composable outbound; treating tx as vanilla L2",
+                );
+                false
+            }
+        }
+    }
+}
+
 /// Reusable layer for the ingress middleware. Cheaply [`Clone`]able
 /// — both the `HeldPool` handle and the classifier are `Arc`s.
 #[derive(Clone)]
@@ -50,6 +131,10 @@ pub struct IngressLayer {
     /// In-process L2 state handle for the DYNAMIC outbound classification.
     /// Populated post-launch; read with `.get()` at classify time.
     l2_state: L2StateCell,
+    /// In-process source-simulation probe for indirect L2→L1 calls
+    /// (`L2 tx → L2 contract → registered proxy`). Populated only in
+    /// composer mode after the EVM composer and L2 entry client exist.
+    indirect_outbound_probe: IndirectOutboundProbeCell,
     /// L1 provider for INBOUND (L1→L2) admission validation. An inbound
     /// held tx is an L1 tx (executed on L1), so its nonce/balance are
     /// validated against the L1 tip. `None` ⇒ validation skipped
@@ -76,6 +161,7 @@ impl IngressLayer {
         held_pool: Arc<HeldPool>,
         classifier: Arc<IngressClassifier>,
         l2_state: L2StateCell,
+        indirect_outbound_probe: IndirectOutboundProbeCell,
     ) -> Self {
         // INBOUND admission reads the sender's nonce + balance from L1.
         // Prefer the canonical-tip RPC (the embedded node can lag 2-3
@@ -117,6 +203,7 @@ impl IngressLayer {
             held_pool,
             classifier,
             l2_state,
+            indirect_outbound_probe,
             l1_provider,
             l2_provider,
             ccm_l2_address,
@@ -135,6 +222,7 @@ impl<S> Layer<S> for IngressLayer {
             l2_provider: self.l2_provider.clone(),
             ccm_l2_address: self.ccm_l2_address,
             l2_state: self.l2_state.clone(),
+            indirect_outbound_probe: self.indirect_outbound_probe.clone(),
         }
     }
 }
@@ -148,23 +236,37 @@ pub struct IngressService<S> {
     l2_provider: Option<RootProvider>,
     ccm_l2_address: Option<Address>,
     l2_state: L2StateCell,
+    indirect_outbound_probe: IndirectOutboundProbeCell,
 }
 
-/// Reject an `eth_sendRawTransaction` at the door with a clear error —
-/// the cross-chain equivalent of a normal node's mempool admission
-/// checks. An invalid tx admitted to the held pool poisons entire
-/// all-or-nothing bundles and breaks bundle-mates' nonce chains, so
-/// rejection here is strictly kinder than the silent eviction later.
+/// Reject an `eth_sendRawTransaction` at the door with a clear error.
 fn reject(id: jsonrpsee::types::Id<'_>, msg: String) -> MethodResponse {
     event!(
-        name: "eez.ingress.cross_chain.rejected",
+        name: "eez.ingress.tx.rejected",
         Level::WARN,
         reason = %msg,
-        "cross-chain tx rejected at ingress",
+        "raw tx rejected at ingress",
     );
     let payload = ResponsePayload::<B256>::error(ErrorObject::owned(-32000, msg, None::<()>));
     MethodResponse::response(id, payload, MAX_RESPONSE_SIZE)
 }
+
+pub(crate) fn is_reserved_system_sender(sender: Address) -> bool {
+    sender == eez_evm::SYSTEM_ADDRESS
+}
+
+pub(crate) fn reserved_system_sender_error(sender: Address) -> String {
+    format!("reserved system sender {sender} cannot submit transactions through public RPC")
+}
+
+/// Conservative lower bound for an L1->L2 proxy consumption tx.
+///
+/// A plain ETH transfer to the proxy is not a 21k/60k L1 transfer once it is
+/// bundled: after `postBatch`, the proxy calls into EEZ to consume the deferred
+/// entry, apply state deltas, and emit execution events. Live Chiado traces show
+/// a simple value deposit uses ~112k gas; admitting a lower limit makes the
+/// builder simulation reject the whole `[postBatch, user_tx]` bundle forever.
+const MIN_INBOUND_CROSS_CHAIN_GAS_LIMIT: u64 = 150_000;
 
 /// Outcome of admitting an already-classified cross-chain `eth_sendRawTransaction`.
 pub enum Admission {
@@ -212,6 +314,16 @@ pub async fn gate_and_hold(
     let Ok(sender) = envelope.recover_signer() else {
         return Admission::Rejected("signature recovery failed".into());
     };
+    if is_reserved_system_sender(sender) {
+        return Admission::Rejected(reserved_system_sender_error(sender));
+    }
+    if direction == Direction::Inbound && envelope.gas_limit() < MIN_INBOUND_CROSS_CHAIN_GAS_LIMIT {
+        return Admission::Rejected(format!(
+            "inbound cross-chain tx gas limit {} is below minimum {}; set a higher gas limit for the L1 proxy consumption path",
+            envelope.gas_limit(),
+            MIN_INBOUND_CROSS_CHAIN_GAS_LIMIT,
+        ));
+    }
     let nonce = envelope.nonce();
     // Select the validation chain by direction: inbound rides an L1 tx
     // (L1 nonce/balance), outbound rides an L2 tx (L2 nonce/balance).
@@ -261,6 +373,12 @@ pub async fn gate_and_hold(
         tx_hash = %hash,
         sender = %sender,
         nonce,
+        chain_id = ?envelope.chain_id(),
+        to = ?envelope.to(),
+        gas_limit = envelope.gas_limit(),
+        max_fee_per_gas = envelope.max_fee_per_gas(),
+        max_priority_fee_per_gas = ?envelope.max_priority_fee_per_gas(),
+        value = %envelope.value(),
         ?direction,
         "cross-chain tx held for next Sync slot",
     );
@@ -379,14 +497,14 @@ where
         let l2_provider = self.l2_provider.clone();
         let ccm_l2_address = self.ccm_l2_address;
         let l2_state = self.l2_state.clone();
+        let indirect_outbound_probe = self.indirect_outbound_probe.clone();
         async move {
-            // Fast path: not our method, or cross-chain is OFF for this node.
+            // Fast path: not our method.
             // Cross-chain is ON if EITHER inbound (foreign source chain ids
             // configured) OR outbound (the L2 CCM address is configured for the
             // dynamic `authorizedProxies` lookup). A plain L2 node (neither) is
             // a hot-path no-op.
-            if req.method.as_ref() != METHOD || (classifier.is_empty() && ccm_l2_address.is_none())
-            {
+            if req.method.as_ref() != METHOD {
                 return inner.call(req).await;
             }
 
@@ -403,37 +521,59 @@ where
             let Ok(envelope) = TxEnvelope::decode_2718(&mut raw_tx.as_ref()) else {
                 return inner.call(req).await;
             };
+            if let Ok(sender) = envelope.recover_signer() {
+                if is_reserved_system_sender(sender) {
+                    return reject(req.id, reserved_system_sender_error(sender));
+                }
+            }
+
+            if classifier.is_empty() && ccm_l2_address.is_none() {
+                return inner.call(req).await;
+            }
             let to = envelope.to();
             let chain_id = envelope.chain_id();
+            let tx_hash: B256 = keccak256(raw_tx.as_ref());
 
             // Resolve the cross-chain direction (or None = vanilla L2):
             //   1. INBOUND — static, cheap: a foreign source chain id (an
             //      L1-bound raw tx POSTed to L2's RPC). Checked first so an
             //      inbound tx never pays the outbound L2 read.
-            //   2. OUTBOUND — DYNAMIC: `to` is a registered cross-chain proxy,
-            //      resolved by a live `authorizedProxies[to]` read on the L2
-            //      CCM (no static env list to drift). Only L2-native txs with a
-            //      `to` reach this (contract-creation + inbound skip it).
+            //   2. DIRECT OUTBOUND — DYNAMIC: `to` is a registered cross-chain
+            //      proxy, resolved by a live `authorizedProxies[to]` read on the
+            //      L2 CCM (no static env list to drift).
+            //   3. INDIRECT OUTBOUND — if the cheap top-level proxy lookup
+            //      misses, source-sim the tx through the same EVM composer used
+            //      by Sync-slot composition. If the simulation records target
+            //      entries, a nested proxy call exists and the tx must also be
+            //      held. Misses fall through to the standard L2 pool.
             let direction = if let Classification::CrossChain(d) = classifier.classify(chain_id) {
                 Some(d)
-            } else if let (Some(ccm), Some(addr)) = (ccm_l2_address, to) {
+            } else {
                 // DYNAMIC outbound: read `authorizedProxies[to]` IN-PROCESS against
                 // the node's OWN committed state (no HTTP self-call). The cell is
                 // populated post-launch; in the brief startup window before it is
                 // set, fall back to the old HTTP read so outbound detection is never
                 // worse than the prior baseline.
-                match l2_state.get() {
-                    Some(factory) => is_authorized_proxy_l2(factory.as_ref(), ccm, addr)
-                        .then_some(Direction::Outbound),
-                    None => match l2_provider.as_ref() {
-                        Some(l2p) => is_authorized_proxy_l2_http(l2p, ccm, addr)
-                            .await
-                            .then_some(Direction::Outbound),
-                        None => None,
+                let direct_outbound = match (ccm_l2_address, to) {
+                    (Some(ccm), Some(addr)) => match l2_state.get() {
+                        Some(factory) => is_authorized_proxy_l2(factory.as_ref(), ccm, addr),
+                        None => match l2_provider.as_ref() {
+                            Some(l2p) => is_authorized_proxy_l2_http(l2p, ccm, addr).await,
+                            None => false,
+                        },
                     },
+                    _ => false,
+                };
+                if direct_outbound {
+                    Some(Direction::Outbound)
+                } else if let Some(probe) = indirect_outbound_probe.get() {
+                    probe
+                        .detects_outbound(&raw_tx, tx_hash)
+                        .await
+                        .then_some(Direction::Outbound)
+                } else {
+                    None
                 }
-            } else {
-                None
             };
 
             match direction {
@@ -488,7 +628,7 @@ mod tests {
 
     use alloy_consensus::{SignableTransaction, TxEip1559};
     use alloy_network::TxSignerSync;
-    use alloy_primitives::{Address, TxKind, address};
+    use alloy_primitives::{TxKind, address, b256};
     use alloy_signer_local::PrivateKeySigner;
     use http_body_util::{BodyExt, Full};
     use hyper::body::Bytes as HyperBytes;
@@ -500,6 +640,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     const PROXY: Address = address!("00000000000000000000000000000000000000bb");
+    const ANVIL0_KEY: alloy_primitives::B256 =
+        b256!("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
 
     /// A minimal mock JSON-RPC node that answers `eth_getTransactionCount`
     /// and `eth_getBalance` with FIXED values, so a test can assert which
@@ -545,13 +687,22 @@ mod tests {
     }
 
     /// Sign an EIP-1559 tx to `to` with the given `nonce` (value 0, 1 gwei
-    /// fee, modest gas limit — well within the 1 ETH mock balance).
+    /// fee, gas limit above the inbound cross-chain minimum).
     fn signed_tx(signer: &PrivateKeySigner, to: Address, nonce: u64) -> (TxEnvelope, Bytes) {
+        signed_tx_with_gas(signer, to, nonce, 200_000)
+    }
+
+    fn signed_tx_with_gas(
+        signer: &PrivateKeySigner,
+        to: Address,
+        nonce: u64,
+        gas_limit: u64,
+    ) -> (TxEnvelope, Bytes) {
         use alloy_eips::eip2718::Encodable2718;
         let mut tx = TxEip1559 {
             chain_id: 31337,
             nonce,
-            gas_limit: 100_000,
+            gas_limit,
             max_fee_per_gas: 1_000_000_000,
             max_priority_fee_per_gas: 0,
             to: TxKind::Call(to),
@@ -569,6 +720,50 @@ mod tests {
     }
 
     const ONE_ETH: u128 = 1_000_000_000_000_000_000;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reserved_system_sender_is_rejected_before_hold() {
+        let pool = HeldPool::new();
+        let signer = PrivateKeySigner::from_bytes(&ANVIL0_KEY).unwrap();
+        assert_eq!(signer.address(), eez_evm::SYSTEM_ADDRESS);
+        let (env, raw) = signed_tx(&signer, PROXY, 0);
+
+        let admission = gate_and_hold(&env, &raw, Direction::Inbound, &pool, None, None).await;
+        match admission {
+            Admission::Rejected(msg) => assert!(
+                msg.contains("reserved system sender"),
+                "expected reserved-sender rejection, got: {msg}",
+            ),
+            Admission::Held(_) => panic!("SYSTEM_ADDRESS tx must not enter the held pool"),
+        }
+        assert_eq!(
+            pool.held_count_for(eez_evm::SYSTEM_ADDRESS, Direction::Inbound),
+            0,
+            "SYSTEM_ADDRESS tx must not be held",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_below_proxy_consumption_gas_floor_is_rejected() {
+        let pool = HeldPool::new();
+        let signer = PrivateKeySigner::random();
+        let (env, raw) =
+            signed_tx_with_gas(&signer, PROXY, 0, MIN_INBOUND_CROSS_CHAIN_GAS_LIMIT - 1);
+
+        let admission = gate_and_hold(&env, &raw, Direction::Inbound, &pool, None, None).await;
+        match admission {
+            Admission::Rejected(msg) => assert!(
+                msg.contains("below minimum"),
+                "expected gas-floor rejection, got: {msg}",
+            ),
+            Admission::Held(_) => panic!("low-gas inbound tx must not enter the held pool"),
+        }
+        assert_eq!(
+            pool.held_count_for(signer.address(), Direction::Inbound),
+            0,
+            "low-gas inbound tx must not be held",
+        );
+    }
 
     /// OUTBOUND validates against the L2 provider: an L2-nonce-2 tx is
     /// admitted when L2 reports nonce 2, even though the L1 provider

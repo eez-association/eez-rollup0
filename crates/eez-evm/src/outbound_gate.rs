@@ -51,16 +51,59 @@
 
 use std::collections::HashMap;
 
-use alloy_primitives::{B256, U256};
+use alloy_primitives::{Address, B256, Log, U256, address};
+use alloy_sol_types::SolEvent;
 use eez_protocol::RollupId;
 
 use crate::action::cross_chain_call_hash;
-use crate::types::ExecutionEntrySol;
+use crate::types::{CrossChainCallExecuted, ExecutionEntrySol};
+
+/// The EEZL2 predeploy address used by real L2 deployments.
+///
+/// This is the log emitter for outbound `CrossChainCallExecuted` events and
+/// the system-transaction target used by `loadExecutionTable` /
+/// `executeIncomingCrossChainCall`.
+pub const EEZL2_ADDR: Address = address!("4200000000000000000000000000000000000007");
+
+/// Topic0 for `CrossChainCallExecuted(bytes32,address,address,bytes,uint256)`.
+pub const CROSS_CHAIN_CALL_EXECUTED_TOPIC0: B256 = CrossChainCallExecuted::SIGNATURE_HASH;
 
 /// `RollupId(0)` — MAINNET. An L2->L1 outbound's L1 target lives on mainnet, so
 /// the `targetRollupId` field of its call hash is 0 (the L2 proxy's
 /// `originalRollupId`) — the value `EEZL2.executeCrossChainCall` recomputes.
 const MAINNET_ROLLUP_ID: RollupId = RollupId(0);
+
+/// Extract an outbound cross-chain call hash from a re-executed L2 receipt log.
+///
+/// Returns `Some(topic1)` only for logs emitted by [`EEZL2_ADDR`] with topic0
+/// equal to [`CROSS_CHAIN_CALL_EXECUTED_TOPIC0`]. Inbound deliveries emit a
+/// different event, and unrelated contracts cannot spoof the gate by emitting
+/// the same topic because the emitter address is part of the filter.
+#[must_use]
+pub fn observed_outbound_call_hash_from_log(log: &Log) -> Option<B256> {
+    if log.address != EEZL2_ADDR {
+        return None;
+    }
+    let topics = log.topics();
+    if topics.first().copied() != Some(CROSS_CHAIN_CALL_EXECUTED_TOPIC0) {
+        return None;
+    }
+    topics.get(1).copied()
+}
+
+/// Extract outbound call hashes from a stream of re-executed L2 receipt logs.
+///
+/// The returned values are the observed `crossChainCallHash` topic1 values in
+/// receipt/log order. Duplicates are preserved because the authorization gate
+/// treats them as a multiset.
+#[must_use]
+pub fn observed_outbound_call_hashes_from_logs<'a>(
+    logs: impl IntoIterator<Item = &'a Log>,
+) -> Vec<B256> {
+    logs.into_iter()
+        .filter_map(observed_outbound_call_hash_from_log)
+        .collect()
+}
 
 /// Verify every OUTBOUND settlement entry was actually originated on L2, by
 /// matching its recomputed cross-chain call hash against the
@@ -150,7 +193,7 @@ pub fn verify_outbound_authorized(
 mod tests {
     use super::*;
     use crate::types::L2ToL1CallSol;
-    use alloy_primitives::{Address, Bytes, address};
+    use alloy_primitives::{Bytes, address};
 
     fn entry(calls: Vec<L2ToL1CallSol>) -> ExecutionEntrySol {
         ExecutionEntrySol {
