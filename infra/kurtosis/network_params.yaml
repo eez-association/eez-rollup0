@@ -20,7 +20,7 @@ network_params:
   shard_committee_period: 1
   deneb_fork_epoch: 0
   electra_fork_epoch: 0
-  prefunded_accounts: '{"0xb9e79D19f651a941757b35830232E7EFC77E1c79": {"balance": "100ETH"}}'
+  prefunded_accounts: '{"0xb9e79D19f651a941757b35830232E7EFC77E1c79": {"balance": "1000000ETH"}}'
 
 mev_type: flashbots
 mev_params:
