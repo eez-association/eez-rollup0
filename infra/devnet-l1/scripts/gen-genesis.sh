@@ -51,9 +51,15 @@ if ! rm -rf "$DATA_DIR" 2>/dev/null; then
 fi
 mkdir -p "$DATA_DIR"
 
-echo "==> generating EL+CL genesis with $GENESIS_GEN_IMAGE"
+# Wall-clock genesis base time, computed on the HOST and passed as a plain
+# integer. The generator does genesis_time = GENESIS_TIMESTAMP + GENESIS_DELAY.
+# Must NOT be set via $(date +%s) inside values.env — that file is sourced
+# inside the container where the substitution mangles to a far-future value.
+GENESIS_TIMESTAMP="${GENESIS_TIMESTAMP:-$(date +%s)}"
+echo "==> generating EL+CL genesis with $GENESIS_GEN_IMAGE (GENESIS_TIMESTAMP=$GENESIS_TIMESTAMP)"
 # 'all' = EL + CL genesis only (NOT validator keystores — see next step).
 docker run --rm \
+    -e GENESIS_TIMESTAMP="$GENESIS_TIMESTAMP" \
     -v "$CONFIG_DIR/values.env:/config/values.env:ro" \
     -v "$DATA_DIR:/data" \
     "$GENESIS_GEN_IMAGE" all
