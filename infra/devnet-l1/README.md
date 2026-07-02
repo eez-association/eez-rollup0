@@ -90,9 +90,10 @@ bash infra/devnet-l1/scripts/run-devnet-l1.sh
 # L1 advancing = CL is driving the embedded EL (NOT auto-mine).
 watch -n2 cast block-number --rpc-url http://127.0.0.1:18545
 
-# eez-node log must show EvmComposer wired (cross-chain alive), NOT the
-# "embedded L1 not active; cross-chain EvmComposer disabled" branch:
-rg "embedded L1 reth \(EthereumNode\) ready|cross-chain composer" /path/to/eez-node.log
+# eez-node log must show the embedded L1 came up (readiness event) and
+# EvmComposer wired (cross-chain alive), NOT the "embedded L1 not active;
+# cross-chain EvmComposer disabled" branch:
+rg "embedded L1 reth \(devnet\) ready|eez.node.l1_embedded.ready|cross-chain composer" /path/to/eez-node.log
 
 # BatchPosted on the private L1 (needs protocol deployed + rollup registered):
 cast logs --from-block 0 --address "$EEZ_REGISTRY_ADDRESS" \
