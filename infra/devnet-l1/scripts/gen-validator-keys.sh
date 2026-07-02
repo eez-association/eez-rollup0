@@ -26,18 +26,30 @@ set +a
 NUM="${NUMBER_OF_VALIDATORS:-64}"
 MNEMONIC="${EL_AND_CL_MNEMONIC:?set EL_AND_CL_MNEMONIC in config/values.env}"
 
+rm -rf "$DATA_DIR/validator-keys"
 mkdir -p "$DATA_DIR/validator-keys"
 
 echo "==> generating $NUM validator keystores (indices 0..$((NUM - 1)))"
+# eth2-val-tools aborts with "output for assignments already exists" if any
+# of its output subdirs are present in --out-loc — and a pre-created,
+# bind-mounted /output dir trips that check. So generate into a FRESH
+# container-internal path (/tmp/vk, guaranteed not to exist) and copy the
+# result out to the mounted dir afterward. Mnemonic is passed via env
+# (VMNEMONIC) so spaces don't need quoting gymnastics through `sh -c`.
 docker run --rm \
-    --entrypoint eth2-val-tools \
+    --entrypoint sh \
+    -e VNUM="$NUM" \
+    -e VMNEMONIC="$MNEMONIC" \
     -v "$DATA_DIR/validator-keys:/output" \
-    "$GENESIS_GEN_IMAGE" \
-    keystores --insecure \
-    --out-loc="/output" \
-    --source-min="0" \
-    --source-max="$NUM" \
-    --source-mnemonic="$MNEMONIC"
+    "$GENESIS_GEN_IMAGE" -c '
+        set -e
+        eth2-val-tools keystores --insecure \
+            --out-loc=/tmp/vk \
+            --source-min=0 \
+            --source-max="$VNUM" \
+            --source-mnemonic="$VMNEMONIC"
+        cp -a /tmp/vk/. /output/
+    '
 
 # Written as root inside the container (bind mount) — reclaim so the host
 # user can read/rm these without sudo.
