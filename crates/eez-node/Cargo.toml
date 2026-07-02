@@ -48,10 +48,13 @@ alloy-provider.workspace     = true
 alloy-signer-local.workspace = true
 reqwest.workspace            = true
 
-# RPC ingress middleware (eth_sendRawTransaction override)
-jsonrpsee.workspace  = true
+# Cross-chain RPC fronts (transparent hyper proxy: forward every eth_* to the
+# source chain's node so cast/wallets read chainId/nonce/gas/receipt, intercept
+# eth_sendRawTransaction → HeldPool).
+hyper          = { version = "1.9", features = ["server", "http1"] }
+hyper-util     = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 serde_json.workspace = true
-tower.workspace      = true
 
 # app
 clap.workspace               = true
@@ -75,6 +78,11 @@ anyhow = "1"
 reth-chainspec.workspace = true
 serde_json = "1"
 tempfile = "3"
+
+[features]
+# TEST-ONLY passthrough to eez-composer/fault-inject (deriver-gate attack test).
+# NEVER enabled in normal/release builds. Revert: `git restore`.
+fault-inject = ["eez-composer/fault-inject"]
 
 [lints]
 workspace = true

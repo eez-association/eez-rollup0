@@ -22,7 +22,7 @@ use std::{collections::HashMap, env, str::FromStr, sync::Arc};
 
 use alloy_primitives::{Address, B256};
 use alloy_signer_local::PrivateKeySigner;
-use eez_composer::{Composer, HeldPool, IngressClassifier, RollupConfig, RollupState};
+use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
 use eez_deriver::Deriver;
 use eez_driver::{
     EthAttributesBuilder, RollupTiming, Sequencer, SlotEvent, SyncSlotComposerHandle,
@@ -129,23 +129,9 @@ fn main() -> eyre::Result<()> {
 
         warn_on_deprecated_env();
 
-        // Construct the HeldPool + IngressClassifier BEFORE reth launches
-        // — they attach as an `eth_sendRawTransaction` middleware, and the
-        // `held_pool` Arc is shared with the umbrella so pushes and the
-        // Sync-slot drain see one queue. Empty classifier = pass-through.
+        // The per-rollup HeldPool, shared with the umbrella composer so the
+        // cross-chain fronts' pushes and the Sync-slot drain see one queue.
         let held_pool = Arc::new(HeldPool::new());
-        let classifier: Arc<IngressClassifier> = Arc::new(IngressClassifier::new(
-            parse_cross_chain_proxy_env().into_iter().collect(),
-            parse_cross_chain_source_chain_ids_env().into_iter().collect(),
-        ));
-        if !classifier.is_empty() {
-            event!(
-                name: "eez.node.ingress.classifier",
-                Level::INFO,
-                proxy_count = classifier.len(),
-                "ingress classifier configured with cross-chain proxy addresses",
-            );
-        }
 
         // Launch the embedded L1 reth first in composer mode — its
         // `StateProviderFactory` backs `LocalChainClient::new_entry` for
@@ -240,23 +226,16 @@ fn main() -> eyre::Result<()> {
             None
         };
 
-        // L2 reth, two modifications: (1) `EezPayloadBuilder` writes
-        // `gas_limit`/`extra_data` from shared `eez-driver` constants so
-        // deriver replay and sequencer builds yield identical headers;
-        // (2) `IngressLayer` routes cross-chain user txs to the HeldPool.
+        // L2 reth. `EezPayloadBuilder` writes `gas_limit`/`extra_data` from
+        // shared `eez-driver` constants so deriver replay and sequencer builds
+        // yield identical headers.
         let handle = builder
             .with_types::<EthereumNode>()
             .with_components(
                 EthereumNode::components()
                     .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder)),
             )
-            .with_add_ons(
-                reth_node_ethereum::node::EthereumAddOns::default()
-                    .with_rpc_middleware(ingress::IngressLayer::new(
-                        Arc::clone(&held_pool),
-                        Arc::clone(&classifier),
-                    )),
-            )
+            .with_add_ons(reth_node_ethereum::node::EthereumAddOns::default())
             .launch_with_debug_capabilities()
             .await?;
 
@@ -392,6 +371,16 @@ fn main() -> eyre::Result<()> {
             // up — it owns `LocalChainClient`s over L1 (entry) and L2
             // (follower). `None` without an embedded L1. Inlined because
             // the `FullNode` AddOns type resists a typed helper return.
+            // L2 ENTRY client for OUTBOUND (L2→L1) source-sim — built inside the
+            // block below alongside the L2 follower, threaded into `Composer::new`.
+            // `None` without an embedded L1 (outbound txs then evict at compose).
+            let mut l2_entry_client: Option<
+                Arc<
+                    dyn eez_protocol::executor::EntryChainClient<Protocol = eez_evm::EvmProtocol>
+                        + Send
+                        + Sync,
+                >,
+            > = None;
             let evm_composer: Option<eez_evm_inspector::EvmComposer> =
                 if let Some(l1_variant) = embedded_l1.as_ref() {
                     use eez_composer::{GnosisL1Adapter, LocalChainClient};
@@ -503,6 +492,25 @@ fn main() -> eyre::Result<()> {
                             + Sync,
                     > = l2_follower;
 
+                    // L2 ENTRY client (follower's provider/dialect, but
+                    // Role::Entry) — the follower client errors `Unavailable` for
+                    // the outbound source-sim `simulate_and_resolve_recorded_for`.
+                    let l2_entry = LocalChainClient::new_entry(
+                        provider.clone(),
+                        evm_config.clone(),
+                        chain_spec.clone(),
+                        l2_rollup_id_typed,
+                        ccm_l2,
+                        ccm_l2,
+                        eez_evm::ChainDialect::EvmL2Style,
+                    );
+                    let l2_entry_view: std::sync::Arc<
+                        dyn eez_protocol::executor::EntryChainClient<Protocol = EvmProtocol>
+                            + Send
+                            + Sync,
+                    > = l2_entry;
+                    l2_entry_client = Some(l2_entry_view);
+
                     let entry_cfg = EvmTargetConfig {
                         ccm_address: eez_registry,
                         system_address: Address::ZERO, // entry has no system-tx CCM path
@@ -513,6 +521,7 @@ fn main() -> eyre::Result<()> {
                                 .proxy_lookup_slot(),
                         },
                         dialect: eez_evm::ChainDialect::EvmL1Style,
+                        settles_via_session_root: false,
                     };
                     let l2_follower_cfg = EvmTargetConfig {
                         ccm_address: ccm_l2,
@@ -524,6 +533,7 @@ fn main() -> eyre::Result<()> {
                                 .proxy_lookup_slot(),
                         },
                         dialect: eez_evm::ChainDialect::EvmL2Style,
+                        settles_via_session_root: false,
                     };
 
                     let composed = ProtocolComposer::<EvmProtocol>::builder(
@@ -663,6 +673,7 @@ fn main() -> eyre::Result<()> {
                 evm_config,
                 evm_composer,
                 cc_exec_ctx,
+                l2_entry_client,
             );
             let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
 
@@ -741,6 +752,47 @@ fn main() -> eyre::Result<()> {
             task_executor.spawn_critical_task("eez-composer", async move {
                 composer.run().await;
             });
+
+            // Cross-chain ingress fronts (see `run_cross_chain_front`) — one per
+            // SOURCE chain, sharing `held_pool`, gated on its port env (absent →
+            // no front for that chain):
+            //   L1 front (EEZ_L1_XCHAIN_PORT → EEZ_L1_RPC_URL): L1→L2 Inbound.
+            //   L2 front (EEZ_L2_XCHAIN_PORT → EEZ_L2_RPC_URL): L2→L1 Outbound.
+            for (port_env, url_env, direction, task) in [
+                (
+                    "EEZ_L1_XCHAIN_PORT",
+                    "EEZ_L1_RPC_URL",
+                    eez_composer::Direction::Inbound,
+                    "eez-l1-xchain-front",
+                ),
+                (
+                    "EEZ_L2_XCHAIN_PORT",
+                    "EEZ_L2_RPC_URL",
+                    eez_composer::Direction::Outbound,
+                    "eez-l2-xchain-front",
+                ),
+            ] {
+                let Some(port) = env::var(port_env).ok().and_then(|p| p.parse::<u16>().ok()) else {
+                    continue;
+                };
+                let Ok(url) = env::var(url_env) else {
+                    event!(name: "eez.xchain_front.no_upstream", Level::WARN, port_env, url_env, "cross-chain front port set but no upstream RPC; skipping");
+                    continue;
+                };
+                let Ok(parsed) = url.parse::<reqwest::Url>() else {
+                    event!(name: "eez.xchain_front.bad_upstream", Level::WARN, %url, "cross-chain front upstream RPC malformed; skipping");
+                    continue;
+                };
+                let pool = Arc::clone(&held_pool);
+                let provider = alloy_provider::RootProvider::new_http(parsed);
+                task_executor.spawn_critical_task(task, async move {
+                    if let Err(e) =
+                        ingress::run_cross_chain_front(port, url, direction, pool, provider).await
+                    {
+                        event!(name: "eez.xchain_front.exited", Level::ERROR, error = %e, "cross-chain front exited");
+                    }
+                });
+            }
         }
 
         handle.wait_for_node_exit().await
@@ -790,36 +842,6 @@ where
         l2_gas_limit: 2_000_000,
         this_rollup_id,
     }))
-}
-
-/// Parse `EEZ_CROSS_CHAIN_PROXY_ADDRESSES` (comma-separated hex
-/// addresses) into a `Vec<Address>`. Empty / unset / malformed → empty
-/// vec (the ingress classifier then becomes a passthrough).
-fn parse_cross_chain_proxy_env() -> Vec<Address> {
-    let Ok(raw) = env::var("EEZ_CROSS_CHAIN_PROXY_ADDRESSES") else {
-        return Vec::new();
-    };
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| Address::from_str(s).ok())
-        .collect()
-}
-
-/// Parse `EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS` (comma-separated u64s)
-/// into a `Vec<u64>`. Foreign source chain ids whose inbound txs we
-/// classify as cross-chain (i.e., a deposit-intent submitted to L2's
-/// RPC carrying L1's chainId). Empty / unset / malformed → empty vec;
-/// classifier still routes by `to ∈ proxy_set`.
-fn parse_cross_chain_source_chain_ids_env() -> Vec<u64> {
-    let Ok(raw) = env::var("EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS") else {
-        return Vec::new();
-    };
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse::<u64>().ok())
-        .collect()
 }
 
 /// Read the L1 rollup id from env. Defaults to `0` to match the bridge

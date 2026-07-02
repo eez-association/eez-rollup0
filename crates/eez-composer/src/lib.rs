@@ -48,7 +48,7 @@ pub use composer::{Composer, CrossChainExecCtx};
 #[doc(inline)]
 pub use held_pool::{HeldPool, HeldTx};
 #[doc(inline)]
-pub use ingress::{Classification, IngressClassifier};
+pub use ingress::Direction;
 
 #[doc(inline)]
 pub use local::{
