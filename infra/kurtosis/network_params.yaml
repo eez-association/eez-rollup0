@@ -9,6 +9,7 @@ participants:
     count: 2
   - el_type: reth
     cl_type: lighthouse
+    cl_image: sigp/lighthouse:v8.1.2
     count: 2
 
 network_params:

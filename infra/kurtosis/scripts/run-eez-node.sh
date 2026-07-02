@@ -24,6 +24,7 @@ source "$ENV_FILE"
 source "$REPO/deployments.env"
 set +a
 
+# ── Embedded L1 config (this is what makes it composer/cross-chain mode) ─────
 export EEZ_L1_EMBEDDED=1
 export EEZ_L1_CHAIN=devnet
 export EEZ_L1_CHAIN_PATH="$DATA_DIR/genesis.json"
