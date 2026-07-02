@@ -88,7 +88,7 @@ pub struct BatchLogChunks {
 }
 
 impl BatchLogChunks {
-    fn new(from_block: u64, to_block: u64) -> Self {
+    pub(crate) fn new(from_block: u64, to_block: u64) -> Self {
         let ranges = if from_block > to_block {
             Vec::new()
         } else {
@@ -684,42 +684,6 @@ pub struct ScannedBatch {
     pub claimed_new_state: Option<alloy_primitives::B256>,
 }
 
-/// Fetch every `BatchPosted` log in `[from_block, to_block]` and cross-
-/// reference each against `L2ExecutionPerformed` for our rollup — present
-/// ⇔ this batch's state delta applied (winner; losers emit `BatchPosted`
-/// only). For each, decode the originating tx for the submitter, callData
-/// and our rollup's claimed state roots. This drains the same chunked scan
-/// used by catch-up into a single `Vec` for live polling.
-pub(crate) async fn scan_batch_logs(
-    provider: &impl Provider,
-    eez: alloy_primitives::Address,
-    rollup_id: u64,
-    from_block: u64,
-    to_block: BlockNumberOrTag,
-) -> L1Result<Vec<ScannedBatch>> {
-    let to_block = match to_block {
-        BlockNumberOrTag::Number(n) => n,
-        tag => provider
-            .get_block_by_number(tag)
-            .await
-            .map_err(|e| L1Error::Provider(format!("get_block_by_number({tag:?}): {e}")))?
-            .map(|b| b.header.number)
-            .ok_or_else(|| L1Error::Provider(format!("block({tag:?}) returned None")))?,
-    };
-    if from_block > to_block {
-        return Ok(Vec::new());
-    }
-
-    let mut chunks = BatchLogChunks::new(from_block, to_block);
-    let mut out = Vec::new();
-    while let Some(mut scanned) =
-        scan_next_batch_log_chunk(provider, eez, rollup_id, &mut chunks).await?
-    {
-        out.append(&mut scanned);
-    }
-    Ok(out)
-}
-
 fn initial_log_scan_ranges(from_block: u64, to_block: u64) -> Vec<(u64, u64)> {
     let mut ranges = Vec::new();
     let mut from = from_block;
@@ -737,21 +701,26 @@ fn initial_log_scan_ranges(from_block: u64, to_block: u64) -> Vec<(u64, u64)> {
     ranges
 }
 
-async fn scan_next_batch_log_chunk(
+pub(crate) async fn scan_next_batch_log_chunk(
     provider: &impl Provider,
     eez: alloy_primitives::Address,
     rollup_id: u64,
     chunks: &mut BatchLogChunks,
 ) -> L1Result<Option<Vec<ScannedBatch>>> {
-    let Some((from, to)) = chunks.ranges.pop() else {
+    let Some(&(from, to)) = chunks.ranges.last() else {
         return Ok(None);
     };
 
-    scan_batch_logs_range(provider, eez, rollup_id, from, to)
-        .await
-        .map(Some)
+    let scanned = scan_batch_logs_range(provider, eez, rollup_id, from, to).await?;
+    chunks.ranges.pop();
+    Ok(Some(scanned))
 }
 
+/// Fetch every `BatchPosted` log in `[from_block, to_block]` and cross-
+/// reference each against `L2ExecutionPerformed` for our rollup — present
+/// ⇔ this batch's state delta applied (winner; losers emit `BatchPosted`
+/// only). For each, decode the originating tx for the submitter, callData
+/// and our rollup's claimed state roots.
 async fn scan_batch_logs_range(
     provider: &impl Provider,
     eez: alloy_primitives::Address,

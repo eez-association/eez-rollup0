@@ -27,6 +27,7 @@ use tracing::{Level, event};
 use url::Url;
 
 use crate::error::{L1Error, L1Result};
+use crate::submitter::{BatchLogChunks, ScannedBatch};
 
 /// [`L1Watcher`] polling cadence. 2s gives prompt detection without
 /// burning RPC quota — half of gnosis's 5s L1 block time, a sixth of
@@ -261,8 +262,9 @@ impl L1Watcher {
         }
     }
 
-    /// One poll cycle. Idempotent on retry: if it fails partway, the
-    /// next tick re-derives state from the on-chain view.
+    /// One poll cycle. Far-behind catch-up keeps its chunk cursor in
+    /// [`WatcherState`], so a transient scan failure retries the failed
+    /// tail instead of restarting from the stale ring tip.
     async fn poll_cycle(
         &self,
         provider: &impl Provider,
@@ -281,6 +283,14 @@ impl L1Watcher {
             tip = ?state.tip().map(|(n, _)| n),
             "poll cycle: fetched latest L1 block",
         );
+
+        if state.pending_catch_up.is_some()
+            && self
+                .resume_pending_catch_up(provider, state, tick_count)
+                .await?
+        {
+            return Ok(());
+        }
 
         match state.tip() {
             // First poll — seed the ring with the latest, emit NewHead.
@@ -346,7 +356,7 @@ impl L1Watcher {
                             fetch_block_by_tag(provider, BlockNumberOrTag::Number(old_tip_number))
                                 .await?;
                         let reorged_across_gap = at_old_height.hash != old_tip_hash;
-                        let scan_from = if reorged_across_gap {
+                        let (scan_from, pending_reorg) = if reorged_across_gap {
                             // Old tip reorged out. Find the common
                             // ancestor against the ring (bounded by
                             // ≤ reorg_max_depth); none in bounds →
@@ -367,18 +377,20 @@ impl L1Watcher {
                                 common_ancestor_number = common.number,
                                 common_ancestor_hash = %common.hash,
                                 latest_number,
-                                "chain reorged across catch-up gap — old tip \
-                                 no longer canonical; emitting Reorg before \
-                                 reseed",
+                                "chain reorged across catch-up gap — old tip no \
+                                 longer canonical; scanning BatchPosted before \
+                                 emitting Reorg and reseeding",
                             );
-                            self.emit(L1Event::Reorg {
-                                common_ancestor_number: common.number,
-                                common_ancestor_hash: common.hash,
-                                old_head_hash: old_tip_hash,
-                                new_head_number: latest_number,
-                                new_head_hash: latest_hash,
-                            });
-                            common.number + 1
+                            (
+                                common.number + 1,
+                                Some(PendingReorg {
+                                    common_ancestor_number: common.number,
+                                    common_ancestor_hash: common.hash,
+                                    old_head_hash: old_tip_hash,
+                                    new_head_number: latest_number,
+                                    new_head_hash: latest_hash,
+                                }),
+                            )
                         } else {
                             event!(
                                 name: "eez.l1_watcher.poll.catchup",
@@ -392,33 +404,33 @@ impl L1Watcher {
                                  scanning BatchPosted and reseeding ring at \
                                  latest",
                             );
-                            old_tip_number + 1
+                            (old_tip_number + 1, None)
                         };
-                        self.scan_batch_posted(provider, scan_from, latest_number, latest_hash)
-                            .await?;
-                        // Ring lost continuity to the gap; reseed
-                        // at latest. (rewind_to(0) drops everything
-                        // above genesis; subsequent push_canonical
-                        // lands latest in an otherwise-empty ring.)
                         event!(
-                            name: "eez.l1_watcher.ring.rewind",
-                            Level::WARN,
+                            name: "eez.l1_watcher.catch_up_scan.started",
+                            Level::INFO,
                             tick = tick_count,
+                            scan_from,
+                            scan_to = latest_number,
                             old_tip_number,
                             old_tip_hash = %old_tip_hash,
-                            new_tip_number = latest_number,
-                            new_tip_hash = %latest_hash,
                             reorged_across_gap,
-                            "reseeding ring at latest — dropping all prior \
-                             ring entries",
+                            "starting resumable far-behind BatchPosted scan",
                         );
-                        state.rewind_to(0);
-                        state.push_canonical(latest_number, latest_hash);
-                        self.emit(L1Event::NewHead {
-                            block_number: latest_number,
-                            block_hash: latest_hash,
-                            timestamp: latest.timestamp,
+                        state.pending_catch_up = Some(PendingCatchUpScan {
+                            old_tip_number,
+                            old_tip_hash,
+                            scan_from,
+                            target_number: latest_number,
+                            target_hash: latest_hash,
+                            target_timestamp: latest.timestamp,
+                            reorged_across_gap,
+                            pending_reorg,
+                            chunks: BatchLogChunks::new(scan_from, latest_number),
+                            scanned: Vec::new(),
                         });
+                        self.resume_pending_catch_up(provider, state, tick_count)
+                            .await?;
                         return Ok(());
                     }
                     return Err(L1Error::ReorgTooDeep {
@@ -518,10 +530,8 @@ impl L1Watcher {
         Ok(())
     }
 
-    /// Fetches `BatchPosted` logs in `[from, to]` via
-    /// [`scan_batch_logs`](crate::submitter::scan_batch_logs) (winner
-    /// tagging + tx decode) and emits one [`L1Event::BatchPosted`] per
-    /// log.
+    /// Fetches `BatchPosted` logs in `[from, to]` via the shared
+    /// chunked scanner and emits one [`L1Event::BatchPosted`] per log.
     async fn scan_batch_posted(
         &self,
         provider: &impl Provider,
@@ -536,14 +546,137 @@ impl L1Watcher {
             to,
             "scanning L1 range for BatchPosted logs",
         );
-        let scanned = crate::submitter::scan_batch_logs(
+        let mut chunks = BatchLogChunks::new(from, to);
+        while let Some(scanned) = self
+            .scan_next_batch_log_chunk(provider, &mut chunks)
+            .await?
+        {
+            self.emit_scanned_batches(from, to, scanned);
+        }
+        Ok(())
+    }
+
+    async fn resume_pending_catch_up(
+        &self,
+        provider: &impl Provider,
+        state: &mut WatcherState,
+        tick_count: u64,
+    ) -> L1Result<bool> {
+        let Some(pending) = state.pending_catch_up.as_ref() else {
+            return Ok(false);
+        };
+        if !catch_up_target_is_canonical(provider, pending.target_number, pending.target_hash)
+            .await?
+        {
+            let pending = state
+                .pending_catch_up
+                .take()
+                .expect("pending catch-up existed above");
+            event!(
+                name: "eez.l1_watcher.catch_up_scan.target_stale",
+                Level::WARN,
+                tick = tick_count,
+                target_number = pending.target_number,
+                target_hash = %pending.target_hash,
+                "catch-up scan target is no longer canonical; discarding scan progress",
+            );
+            return Ok(false);
+        }
+
+        loop {
+            let scanned = {
+                let pending = state
+                    .pending_catch_up
+                    .as_mut()
+                    .expect("pending catch-up exists while resuming");
+                self.scan_next_batch_log_chunk(provider, &mut pending.chunks)
+                    .await?
+            };
+            let Some(mut scanned) = scanned else {
+                break;
+            };
+            let pending = state
+                .pending_catch_up
+                .as_mut()
+                .expect("pending catch-up exists while collecting");
+            if !scanned.is_empty() {
+                event!(
+                    name: "eez.l1_watcher.catch_up_scan.chunk_found",
+                    Level::INFO,
+                    tick = tick_count,
+                    target_number = pending.target_number,
+                    count = scanned.len(),
+                    "queued BatchPosted events from catch-up scan chunk",
+                );
+            }
+            pending.scanned.append(&mut scanned);
+        }
+
+        let pending = state
+            .pending_catch_up
+            .take()
+            .expect("pending catch-up exists after scan completion");
+        if !catch_up_target_is_canonical(provider, pending.target_number, pending.target_hash)
+            .await?
+        {
+            event!(
+                name: "eez.l1_watcher.catch_up_scan.target_stale",
+                Level::WARN,
+                tick = tick_count,
+                target_number = pending.target_number,
+                target_hash = %pending.target_hash,
+                "catch-up scan target changed before completion; discarding scanned events",
+            );
+            return Ok(false);
+        }
+
+        if let Some(reorg) = pending.pending_reorg {
+            self.emit(L1Event::Reorg {
+                common_ancestor_number: reorg.common_ancestor_number,
+                common_ancestor_hash: reorg.common_ancestor_hash,
+                old_head_hash: reorg.old_head_hash,
+                new_head_number: reorg.new_head_number,
+                new_head_hash: reorg.new_head_hash,
+            });
+        }
+        self.emit_scanned_batches(pending.scan_from, pending.target_number, pending.scanned);
+
+        event!(
+            name: "eez.l1_watcher.ring.rewind",
+            Level::WARN,
+            tick = tick_count,
+            old_tip_number = pending.old_tip_number,
+            old_tip_hash = %pending.old_tip_hash,
+            new_tip_number = pending.target_number,
+            new_tip_hash = %pending.target_hash,
+            reorged_across_gap = pending.reorged_across_gap,
+            "reseeding ring at latest — dropping all prior ring entries",
+        );
+        state.rewind_to(0);
+        state.push_canonical(pending.target_number, pending.target_hash);
+        self.emit(L1Event::NewHead {
+            block_number: pending.target_number,
+            block_hash: pending.target_hash,
+            timestamp: pending.target_timestamp,
+        });
+        Ok(true)
+    }
+
+    async fn scan_next_batch_log_chunk(
+        &self,
+        provider: &impl Provider,
+        chunks: &mut BatchLogChunks,
+    ) -> L1Result<Option<Vec<ScannedBatch>>> {
+        crate::submitter::scan_next_batch_log_chunk(
             provider,
             self.inner.config.eez,
             self.inner.config.rollup_id,
-            from,
-            BlockNumberOrTag::Number(to),
+            chunks,
         )
-        .await?;
+        .await
+    }
+
+    fn emit_scanned_batches(&self, from: u64, to: u64, scanned: Vec<ScannedBatch>) {
         if !scanned.is_empty() {
             event!(
                 name: "eez.l1_watcher.scan_batch_posted.found",
@@ -569,7 +702,6 @@ impl L1Watcher {
                 claimed_new_state: b.claimed_new_state,
             });
         }
-        Ok(())
     }
 
     async fn refresh_finalized(
@@ -614,6 +746,7 @@ struct WatcherState {
     recent: VecDeque<(u64, B256)>,
     reorg_max_depth: usize,
     last_finalized_hash: Option<B256>,
+    pending_catch_up: Option<PendingCatchUpScan>,
 }
 
 impl WatcherState {
@@ -622,6 +755,7 @@ impl WatcherState {
             recent: VecDeque::with_capacity(reorg_max_depth),
             reorg_max_depth,
             last_finalized_hash: None,
+            pending_catch_up: None,
         }
     }
 
@@ -655,6 +789,29 @@ impl WatcherState {
             .find(|(_, h)| *h == hash)
             .map(|(n, _)| *n)
     }
+}
+
+#[derive(Debug)]
+struct PendingCatchUpScan {
+    old_tip_number: u64,
+    old_tip_hash: B256,
+    scan_from: u64,
+    target_number: u64,
+    target_hash: B256,
+    target_timestamp: u64,
+    reorged_across_gap: bool,
+    pending_reorg: Option<PendingReorg>,
+    chunks: BatchLogChunks,
+    scanned: Vec<ScannedBatch>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingReorg {
+    common_ancestor_number: u64,
+    common_ancestor_hash: B256,
+    old_head_hash: B256,
+    new_head_number: u64,
+    new_head_hash: B256,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -759,6 +916,19 @@ async fn fetch_block_by_hash(provider: &impl Provider, hash: B256) -> L1Result<B
         parent_hash: block.header.inner.parent_hash,
         timestamp: block.header.inner.timestamp,
     })
+}
+
+async fn catch_up_target_is_canonical(
+    provider: &impl Provider,
+    number: u64,
+    hash: B256,
+) -> L1Result<bool> {
+    Ok(
+        fetch_block_by_tag(provider, BlockNumberOrTag::Number(number))
+            .await?
+            .hash
+            == hash,
+    )
 }
 
 #[cfg(test)]

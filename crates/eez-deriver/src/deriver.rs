@@ -804,7 +804,7 @@ where
         // `_applyStateDeltas` fires in the postBatch tx itself. In the
         // DEFERRED-entry path (our setter / deposit flow) it fires later
         // inside the user_tx calling `executeCrossChainCall` — a
-        // different tx hash in the same L1 block — so `scan_batch_logs`
+        // different tx hash in the same L1 block — so the batch-log scanner
         // reports `state_applied=false`. The `settled_count` gate above
         // already confirmed something settled, so we still process.
         if !state_applied {
