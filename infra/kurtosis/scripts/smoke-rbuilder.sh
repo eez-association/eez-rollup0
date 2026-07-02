@@ -9,7 +9,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
-SMOKE_ENV_FILES="${SMOKE_ENV_FILES-$REPO/infra/kurtosis/endpoints.env $REPO/infra/kurtosis/.env}"
+# .env first, endpoints.env last so the real discovered Kurtosis RPC + rbuilder
+# ports win over .env's placeholders (same precedence as run-eez-node.sh).
+SMOKE_ENV_FILES="${SMOKE_ENV_FILES-$REPO/infra/kurtosis/.env $REPO/infra/kurtosis/endpoints.env}"
 for f in $SMOKE_ENV_FILES; do
     # shellcheck disable=SC1090
     [[ -f "$f" ]] && { set -a; source "$f"; set +a; }

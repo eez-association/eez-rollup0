@@ -166,7 +166,8 @@ fn main() -> eyre::Result<()> {
                 name: "eez.node.ingress.classifier",
                 Level::INFO,
                 proxy_count = classifier.len(),
-                "ingress classifier configured with cross-chain proxy addresses",
+                source_chain_id_count = classifier.source_chain_id_count(),
+                "ingress classifier configured (cross-chain by proxy address and/or source chainId)",
             );
         }
 
