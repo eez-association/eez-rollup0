@@ -32,9 +32,15 @@ export EEZ_L1_JWT_SECRET="$DATA_DIR/jwt/jwtsecret"
 export EEZ_L1_HTTP_PORT="${EEZ_L1_HTTP_PORT:-18545}"
 # Engine API port the follower beacon dials. NOT 18546 (reth WS = http_port+1).
 export EEZ_L1_AUTH_PORT="${EEZ_L1_AUTH_PORT:-18551}"
-# Dial our OWN embedded L1, not the Kurtosis EL endpoints.env pointed at.
+# Capture the Kurtosis EL (canonical chain, from endpoints.env) BEFORE repinning
+# reads to the embedded reth. The Submitter uses TARGET for bundle targeting,
+# receipt/inclusion checks — all of which must track the canonical chain where
+# rbuilder builds and blocks land. The embedded reth is CL-driven (produces no
+# blocks) and lags, so it must NOT be the target. Composer still reads L1 state
+# in-process from the embedded reth via EEZ_L1_RPC_URL.
+KURTOSIS_EL_RPC_URL="${EEZ_L1_RPC_URL:?run parse-endpoints.sh (Kurtosis EL RPC)}"
 export EEZ_L1_RPC_URL="http://127.0.0.1:${EEZ_L1_HTTP_PORT}"
-export EEZ_L1_TARGET_RPC_URL="$EEZ_L1_RPC_URL"
+export EEZ_L1_TARGET_RPC_URL="$KURTOSIS_EL_RPC_URL"
 export EEZ_L1_CHAIN_ID="${EEZ_L1_CHAIN_ID:-7331}"
 
 : "${EEZ_L1_BUILDER_RPC_URL:?run parse-endpoints.sh (rbuilder RPC) or set in .env}"
@@ -54,9 +60,10 @@ L2_DISCOVERY_V5_PORT="${EEZ_L2_DISCOVERY_V5_PORT:-$((L2_P2P_PORT + 1))}"
 
 echo "==> launching eez-node (EMBEDDED devnet L1, CL-driven, unified harness)"
 echo "    EL genesis  : $EEZ_L1_CHAIN_PATH"
-echo "    L1 RPC      : 127.0.0.1:${EEZ_L1_HTTP_PORT} (embedded reth)"
+echo "    L1 RPC      : 127.0.0.1:${EEZ_L1_HTTP_PORT} (embedded reth, in-process reads)"
+echo "    L1 target   : $EEZ_L1_TARGET_RPC_URL (Kurtosis EL — bundle target + receipts)"
 echo "    L1 engine   : 127.0.0.1:${EEZ_L1_AUTH_PORT} (follower beacon dials here)"
-echo "    builder RPC : $EEZ_L1_BUILDER_RPC_URL (Kurtosis rbuilder)"
+echo "    builder RPC : $EEZ_L1_BUILDER_RPC_URL (Kurtosis rbuilder eth_sendBundle)"
 
 exec cargo run -p eez-node -- node \
     --chain="$EEZ_L2_GENESIS_PATH" \
