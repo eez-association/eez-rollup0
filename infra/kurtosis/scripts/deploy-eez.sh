@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Deploy the EEZ contracts + L2 genesis onto the shared L1 via the live Kurtosis
+# EL RPC (endpoints.env), before eez-node starts. Writes deployments.env +
+# datadir/genesis.json.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -17,6 +20,8 @@ done
     exit 1
 }
 
+# .env first, endpoints.env appended second so its live Kurtosis EL RPC wins
+# over the .env placeholder (deploy runs before eez-node's own :18545 exists).
 cat "$ENV_FILE" >"$MERGED"
 [[ -f "$ENDPOINTS" ]] && cat "$ENDPOINTS" >>"$MERGED"
 echo "EEZ_GENESIS_OUT=$REPO/datadir/genesis.json" >>"$MERGED"

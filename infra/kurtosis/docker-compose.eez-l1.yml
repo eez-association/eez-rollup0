@@ -1,28 +1,7 @@
-# Follower Lighthouse beacon for the eez-node embedded-L1 pair (Pair A) in the
-# unified Kurtosis harness. BEACON ONLY — no validator client, no keys.
-#
-# Why beacon-only: every L1 block (including rbuilder's winning block via the
-# relay) is proposed by the Kurtosis validators (Pair B). This follower just
+# Pair A's follower beacon — BEACON ONLY (no validators). The Kurtosis
+# validators (Pair B) propose every block, incl. rbuilder's; this follower
 # receives them over CL P2P and drives eez-node's embedded reth via the engine
-# API, so eez-node executes the exact same blocks — and EvmComposer reads the
-# bundle-included L1 state in-process. If this had validators, half the slots
-# would be plain local payloads instead of rbuilder blocks.
-#
-# Networking:
-#   - Joins the enclave's Docker network (kt-<enclave>) so it can reach the
-#     Kurtosis CLs' P2P (the ENR from get-cl-bootnode.sh resolves there).
-#   - Reaches eez-node's authrpc on the HOST via host.docker.internal (eez-node
-#     runs on the host via `cargo run`, per run-eez-embedded.sh).
-#
-# Prereqs (in order):
-#   bash scripts/extract-genesis.sh     # -> eez-l1-data/{genesis.json,cl/,jwt}
-#   bash scripts/get-cl-bootnode.sh     # -> eez-l1-data/cl-bootnode.env
-# Run:
-#   docker compose --env-file infra/kurtosis/.env \
-#     --env-file infra/kurtosis/eez-l1-data/cl-bootnode.env \
-#     -f infra/kurtosis/docker-compose.eez-l1.yml up -d
-#
-# Volume paths are relative to infra/kurtosis/ (where this file lives).
+# API. Started by eez-up.sh; paths are relative to infra/kurtosis/.
 services:
   beacon:
     image: sigp/lighthouse:v8.1.2
@@ -46,18 +25,12 @@ services:
       - --http
       - --http-address=0.0.0.0
       - --http-port=5252
-      # eez-node's embedded reth authrpc on the host (EEZ_L1_AUTH_PORT=18551;
-      # NOT 18545+1=18546, which reth uses for its WS server).
+      # eez-node's embedded reth authrpc on the host (18551, not 18546 = reth WS).
       - --execution-endpoint=http://host.docker.internal:${EEZ_L1_AUTH_PORT:-18551}
       - --jwt-secrets=/jwt/jwtsecret
-      # Peer into the Kurtosis CL network so we follow the real head. Unlike the
-      # single-node infra/devnet-l1 beacon, this is NOT --allow-insecure-genesis-
-      # sync: it must find the Kurtosis CLs and sync from them.
-      #
-      # discv5 bans private-IP ENRs from its routing table, so on the enclave
-      # subnet discovery can't find the Kurtosis CLs. We DIAL them directly by
-      # libp2p multiaddr instead (same trick as docker-compose.chiado.yml). The
-      # ENR boot-node is kept too but is expected to be table-filtered out.
+      # discv5 bans private-IP ENRs, so we dial the Kurtosis CLs directly by
+      # libp2p multiaddr (same trick as docker-compose.chiado.yml); the ENR
+      # boot-node is kept but expected to be table-filtered out.
       - --boot-nodes=${EEZ_L1_CL_BOOTNODE:?set via infra/kurtosis/eez-l1-data/cl-bootnode.env (run get-cl-bootnode.sh)}
       - --libp2p-addresses=${EEZ_L1_CL_LIBP2P:?set via infra/kurtosis/eez-l1-data/cl-bootnode.env (run get-cl-bootnode.sh)}
       - --disable-packet-filter
@@ -68,8 +41,7 @@ services:
     logging:
       driver: "local"
 
-# The enclave's Docker network, created by kurtosis-up.sh. VERIFY the name with
-# `docker network ls | grep kt-` — it is kt-<enclave> (default kt-eez-devnet).
+# The enclave's Docker network, created by kurtosis-up.sh (kt-<enclave>).
 networks:
   enclave:
     name: kt-${KURTOSIS_ENCLAVE:-eez-devnet}

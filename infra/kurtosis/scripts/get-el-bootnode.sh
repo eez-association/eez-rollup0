@@ -1,17 +1,8 @@
 #!/usr/bin/env bash
-# Fetch a Kurtosis reth's enode so eez-node's EMBEDDED L1 reth can dial it
-# directly over RLPx (EEZ_L1_TRUSTED_PEERS) and backfill L1 history.
-#
-# Why this is needed: the follower CL fast-syncs to the chain tip and only
-# feeds eez-node's embedded reth the HEAD payloads via engine_newPayload — not
-# blocks 1..N. reth must backfill the gap over P2P, but discv5 bans the
-# private enclave IPs, so discovery finds nobody. A static enode peer fixes it.
-# On Linux the host can reach the enclave bridge IP (172.16.x) directly.
-#
-# Writes: infra/kurtosis/eez-l1-data/el-bootnode.env  ->  EEZ_L1_TRUSTED_PEERS=enode://...
-# which run-eez-embedded.sh sources and exports.
-#
-# Usage:  bash infra/kurtosis/scripts/get-el-bootnode.sh
+# Fetch a Kurtosis reth's enode so the embedded L1 reth can dial it over RLPx
+# (EEZ_L1_TRUSTED_PEERS) and backfill history — the follower CL only feeds it
+# HEAD payloads, not blocks 1..N, and discv5 bans the private enclave IPs.
+# Writes el-bootnode.env, sourced by run-eez-node.sh.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"

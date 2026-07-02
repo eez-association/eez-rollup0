@@ -13,6 +13,8 @@ participants:
 
 network_params:
   network_id: "7331"
+  # Must equal EEZ_L1_BLOCK_TIME_MS (12000) so the bundle timestamp pin lands
+  # on-grid: min==max==parent_ts+12 == the next slot's timestamp.
   seconds_per_slot: 12
   slot_duration_ms: 12000
   genesis_gaslimit: 60000000
@@ -24,27 +26,26 @@ network_params:
 
 mev_type: flashbots
 mev_params:
+  # Flashbots' in-process rbuilder (the reth-rbuilder crate); ethpandaops just
+  # publishes the image — Flashbots ships no reth-rbuilder image of its own.
   mev_builder_image: ethpandaops/reth-rbuilder:develop
   mev_relay_image: ethpandaops/mev-boost-relay:main
   mev_boost_image: ethpandaops/mev-boost:develop
   mev_builder_cl_image: sigp/lighthouse:v8.1.2
+  # 1 ETH/winning-block from the builder coinbase so rbuilder outbids local
+  # payloads and wins slots. Coinbase funded in prefunded_accounts above.
   mev_builder_subsidy: 1
 
 additional_services:
   - spamoor      # L1 blockspace load (tune throughput below)
   - disruptoor   # reorg primitive; driven by scripts/reorg-scheduler.sh (needs --privileged)
-  - dora         # block/reorg explorer — confirm reorg depth visually
-  - forkmon      # fork-choice / reorg monitor across the 4 CL nodes
+  - dora         # block/reorg explorer
+  - forkmon      # fork-choice monitor across the CL nodes
 
-# Disruptoor starts healthy (no partitions). scripts/reorg-scheduler.sh drives
-# it at runtime via the HTTP API (PUT /v1/state, POST /v1/state/clear), using:
-#   minority = participants 3,4   majority = participants 1,2   component = cl
+# reorg-scheduler.sh drives disruptoor at runtime (minority 3,4 | majority 1,2).
 
-# L1 blockspace load. throughput = txs/block/spammer; 850 eoatx ≈ 30% of the
-# 60M gas limit (21k gas/eoatx) — mid-range of the Phase-3 target band
-# (10-50%), leaving room for EEZ postBatch bundles. Tuning math + live-adjust
-# via the spamoor UI: see README "Spamoor". Re-run kurtosis-up.sh to apply a
-# static change, or use the spamoor web UI for live retuning without restart.
+# L1 load. throughput = txs/block/spammer; 850 eoatx ≈ 30% of the 60M gas limit,
+# leaving room for postBatch bundles. Retune live via the spamoor UI.
 spamoor_params:
   spammers:
     - scenario: eoatx
@@ -56,17 +57,14 @@ port_publisher:
   el:
     enabled: true
     public_port_start: 32000
-  # Publish CL beacon-API ports to the host so the unified harness can read a
-  # Kurtosis beacon's ENR (GET /eth/v1/node/identity) to boot the eez-node
-  # follower beacon into this CL P2P network. See scripts/get-cl-bootnode.sh.
+  # Publishes CL beacon APIs so get-cl-bootnode.sh can read a peer's ENR.
   cl:
     enabled: true
     public_port_start: 33000
   mev:
     enabled: true
     public_port_start: 37000
-  # Exposes disruptoor HTTP API + dora + forkmon + spamoor UI to the host so
-  # reorg-scheduler.sh and parse-endpoints.sh can reach them.
+  # Exposes disruptoor/dora/spamoor UIs so the scripts can reach them.
   additional_services:
     enabled: true
     public_port_start: 36000

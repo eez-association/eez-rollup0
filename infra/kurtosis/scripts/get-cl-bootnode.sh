@@ -1,14 +1,7 @@
 #!/usr/bin/env bash
-# Fetch a Kurtosis beacon node's ENR so the eez-node follower Lighthouse
-# (Pair A) can peer into the enclave's CL P2P network and follow the head that
-# Pair B's validators (incl. rbuilder's winning block) produce.
-#
-# Reads the beacon API GET /eth/v1/node/identity (.data.enr) on a published CL
-# HTTP port (needs port_publisher.cl enabled in network_params.yaml). Writes:
-#   infra/kurtosis/eez-l1-data/cl-bootnode.env  ->  EEZ_L1_CL_BOOTNODE=enr:...
-# which docker-compose.eez-l1.yml consumes as a second --env-file.
-#
-# Usage:  bash infra/kurtosis/scripts/get-cl-bootnode.sh
+# Read a Kurtosis beacon's ENR + libp2p multiaddr (GET /eth/v1/node/identity) so
+# the follower can peer into the enclave CL network. Writes cl-bootnode.env,
+# consumed by docker-compose.eez-l1.yml. Needs port_publisher.cl enabled.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"

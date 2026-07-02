@@ -1,32 +1,13 @@
 #!/usr/bin/env bash
-# Extract the SINGLE canonical genesis that ethereum-package generated for the
-# Kurtosis enclave, so eez-node's embedded reth + its follower Lighthouse
-# (Pair A) join the exact same L1 chain as the Kurtosis reth+lighthouse+rbuilder
-# nodes (Pair B). This is what makes the two pairs one devnet instead of two.
-#
-# Kurtosis owns the genesis here — we do NOT run our own ethereum-genesis-
-# generator (unlike infra/devnet-l1/gen-genesis.sh). That removes the
-# genesis-timestamp footguns and guarantees both pairs agree byte-for-byte.
-#
-# Outputs (under infra/kurtosis/eez-l1-data/):
-#   genesis.json          -> EL genesis  (eez-node EEZ_L1_CHAIN_PATH)
-#   cl/                    -> CL testnet-dir (lighthouse --testnet-dir):
-#                              config.yaml, genesis.ssz,
-#                              deposit_contract_block.txt, deposit_contract.txt
-#   jwt/jwtsecret          -> LOCAL engine-API JWT, shared only between Pair A's
-#                             reth and its follower CL (JWT is per EL-CL pair,
-#                             not chain-wide — Pair B has its own).
-#
-# Usage:  bash infra/kurtosis/scripts/extract-genesis.sh
+# Extract the canonical genesis ethereum-package generated for the enclave, so
+# Pair A joins the same chain as Pair B, and mint a local engine-API JWT shared
+# by Pair A's reth and its follower CL. Outputs under eez-l1-data/.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
 ENCLAVE="${KURTOSIS_ENCLAVE:-eez-devnet}"
 DEST="${EEZ_L1_DATA_DIR:-$REPO/infra/kurtosis/eez-l1-data}"
-# VERIFY: ethereum-package publishes the merged EL+CL genesis as this file
-# artifact. Confirm the name with `kurtosis files inspect <enclave>` /
-# `kurtosis enclave inspect <enclave>` (Files Artifacts section) and override
-# via KURTOSIS_GENESIS_ARTIFACT if it differs on the pinned package version.
+# Override if the package version names the genesis artifact differently.
 ARTIFACT="${KURTOSIS_GENESIS_ARTIFACT:-el_cl_genesis_data}"
 
 command -v kurtosis >/dev/null || { echo "kurtosis not found in PATH" >&2; exit 1; }
@@ -40,18 +21,12 @@ rm -rf "$DEST"
 mkdir -p "$RAW"
 
 echo "==> downloading '$ARTIFACT' from enclave '$ENCLAVE'"
-# `kurtosis files download <enclave> <artifact> <dest>` unpacks the artifact
-# tree into <dest>.
 kurtosis files download "$ENCLAVE" "$ARTIFACT" "$RAW"
 
-# The artifact layout varies by ethereum-package version (EL genesis is often
-# genesis.json at the root; per-client variants like besu.json/chainspec.json
-# may sit alongside). Locate the reth/geth EL genesis and the CL config
-# defensively rather than hard-coding paths. VERIFY the picks on first run.
+# Layout varies by package version, so locate the files defensively.
 echo "==> locating EL genesis + CL testnet-dir in the artifact"
 
-# EL genesis: prefer an exact genesis.json; fall back to the first *.json that
-# actually contains a "config" + "alloc" (an EL genesis, not a CL file).
+# EL genesis: prefer genesis.json; else the first *.json with "config"+"alloc".
 el_genesis=""
 if [[ -f "$RAW/genesis.json" ]]; then
     el_genesis="$RAW/genesis.json"

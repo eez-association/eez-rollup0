@@ -1,29 +1,11 @@
 #!/usr/bin/env bash
-#
-# Scheduled L1 reorgs for the Kurtosis devnet.
-#
-# Polls L1 block height and, at configured intervals, drives Disruptoor to
-# partition the consensus (CL) P2P network into a minority group and a
-# majority group. The minority builds an alternate fork for `depth` slots;
-# healing the partition lets fork-choice reorg the losing side out. After
-# each heal it walks parent hashes to report the reorg depth actually
-# observed (PoS reorg depth is attestation-weight dependent, so observed
-# depth is approximate — calibrate with the `shallow` schedule first).
-#
-# Requires: cast, curl. Disruptoor must be enabled in network_params.yaml
-# and reachable (run parse-endpoints.sh, or set EEZ_DISRUPTOOR_URL).
-#
-# Everything is env-overridable — no code edits needed to retune:
-#   EEZ_L1_RPC_URL           L1 execution RPC            (from endpoints.env)
-#   EEZ_DISRUPTOOR_URL       Disruptoor base URL         (from endpoints.env)
-#   EEZ_REORG_SCHEDULES      "name:depth:every ..."      (deepest match wins)
-#   EEZ_REORG_MINORITY       CL participant idxs, CSV    (default "3,4")
-#   EEZ_REORG_MAJORITY       CL participant idxs, CSV    (default "1,2")
-#   EEZ_REORG_COMPONENTS     partition components, CSV   (default "cl")
-#   EEZ_L1_SLOT_SECONDS      seconds per slot            (default 12)
-#   EEZ_REORG_HEAL_MARGIN_S  extra hold after depth      (default 6)
-#   EEZ_REORG_POLL_SECONDS   height poll interval        (default 4)
-#   EEZ_REORG_DRY_RUN=1      log intended actions, don't touch Disruptoor
+# Scheduled L1 reorgs: poll block height and, at configured intervals, drive
+# Disruptoor to partition the CL P2P network (minority vs majority); healing lets
+# fork-choice reorg the losing side out. Reports the observed depth after each
+# heal. Requires disruptoor enabled + reachable. All knobs are env-overridable:
+#   EEZ_REORG_SCHEDULES ("name:depth:every", deepest match wins), _MINORITY (3,4),
+#   _MAJORITY (1,2), _COMPONENTS (cl), _HEAL_MARGIN_S (6), _POLL_SECONDS (4),
+#   EEZ_L1_SLOT_SECONDS (12), EEZ_REORG_DRY_RUN=1 (log only).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -64,16 +46,8 @@ heal() {
 # Heal on any exit so we never leave the network partitioned.
 trap 'heal' EXIT INT TERM
 
-# NOTE on the request shape below: ethereum-package's static YAML config
-# (disruptoor_params.partitions) documents groups keyed by `participants`
-# (1-based node index) + a partition-level `components` list. Disruptoor's
-# own HTTP API docs show `groups` keyed by container `id` instead. It's
-# unconfirmed here whether the runtime PUT /v1/state endpoint accepts the
-# same participant-index shape as the static config, or requires resolved
-# container ids. `partition()` below logs the FULL response body on the
-# first real (non-dry-run) PUT — read it once to confirm disruptoor parsed
-# the partition as intended (no 400/422, and `GET /v1/state` afterward
-# shows the groups you expect) before trusting the schedule unattended.
+# The PUT /v1/state schema (participant index vs container id) can vary by
+# disruptoor version; a non-2xx is logged with the response body to debug.
 partition() {
     local name="$1"
     local body resp http_code

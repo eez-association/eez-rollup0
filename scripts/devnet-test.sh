@@ -1,38 +1,42 @@
 #!/usr/bin/env bash
 #
-# Cross-chain test driver for a RUNNING eez-node (the dockerized chiado
-# node from docker-compose.chiado-node.yml, or any eez-node serving the
-# RPCs below). Decoupled from node bring-up: it assumes the protocol is
-# already deployed (deployments.env present) and the node is up.
+# Cross-chain E2E test for the unified Kurtosis devnet (infra/kurtosis). Assumes
+# the devnet is up (run-eez-node.sh, teed to a log file) and the protocol is
+# deployed (deploy-eez.sh wrote $REPO/deployments.env). Decoupled from bring-up.
 #
-# Flow (mirrors scripts/smoke-chiado.sh steps 7-15, minus node launch):
-#   - deploy Value on L2, create setter + deposit CrossChainProxies on L1
-#   - fire $EEZ_WAVE_COUNT waves of cross-chain setter/deposit ops (+ L2
-#     filler) at the L2 ingress
+# Flow:
+#   - deploy Value on L2; create setter + deposit CrossChainProxies on L1
+#     (createCrossChainProxy is permissionless — any funded key works)
+#   - fire $EEZ_WAVE_COUNT waves of cross-chain setter/deposit ops (+ L2 filler)
+#     at the L2 ingress
 #   - wait for the L1 user_tx receipts, then tally:
 #       * per-PB analyzer (Sync blocks vs BatchPosted)
 #       * L1 rollups(id).stateRoot == L2 actual at last settled height
 #       * semantic effects (Value + recipient balance vs confirmed view)
 #       * zero state-root divergence events
 #
-# Post-deploy everything uses the node's OWN (internal) L1 — proxies,
-# reconcile and receipts all go to $L1_RPC (the embedded reth). Only the
-# one-time protocol deploy (make deploy-protocol, done before this) used
-# an external chiado RPC.
+# All L1 interaction targets the shared devnet chain (the Kurtosis EL RPC). The
+# composer reads its own embedded reth in-process, so proxies/receipts on the
+# shared chain are visible to it. The composer log is read from a FILE (the tee
+# target of run-eez-node.sh), NOT `docker logs` — eez-node runs on the host.
 #
-# Reads the composer log via `docker logs $NODE_CONTAINER` (the node runs
-# in a container now), not an on-disk file.
-#
-# Prereqs on the host: cast, forge, jq, docker; the sync-rollups-protocol
-# submodule initialised (forge compiles contracts/ + lib).
+# Prereqs: cast, forge, jq; sync-rollups-protocol submodule initialised. Sources
+# infra/kurtosis/{.env,endpoints.env} + deployments.env for URLs and keys.
 
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+K="$REPO/infra/kurtosis"
 
-# ── Endpoints (the running node) ─────────────────────────────────────
-L1_RPC="${L1_RPC:-http://localhost:18645}"      # embedded chiado L1
-L2_RPC="${L2_RPC:-http://localhost:18688}"      # L2
-NODE_CONTAINER="${NODE_CONTAINER:-eez-node-chiado}"
+set -a
+[[ -f "$K/.env" ]] && source "$K/.env"
+[[ -f "$K/endpoints.env" ]] && source "$K/endpoints.env"
+[[ -f "$REPO/deployments.env" ]] && source "$REPO/deployments.env"
+set +a
+
+# ── Endpoints ────────────────────────────────────────────────────────
+L1_RPC="${L1_RPC:-${EEZ_L1_RPC_URL:-http://127.0.0.1:18545}}"   # shared L1 (Kurtosis EL)
+L2_RPC="${L2_RPC:-http://127.0.0.1:18688}"                      # eez-node L2
+EEZ_NODE_LOG="${EEZ_NODE_LOG:-/tmp/eez-node.log}"               # run-eez-node.sh | tee target
 
 # ── Knobs ────────────────────────────────────────────────────────────
 WAVE_COUNT="${EEZ_WAVE_COUNT:-5}"
@@ -40,15 +44,18 @@ FILLER_PER_GAP="${EEZ_FILLER_PER_GAP:-2}"
 RECEIPT_WAIT_SECS="${EEZ_RECEIPT_WAIT_SECS:-300}"
 VALUE_INITIAL="${VALUE_INITIAL:-5}"
 
-# ── Keys (testnet only; match scripts/smoke-chiado.sh defaults) ──────
-# Operator = protocol deployer + proof signer (creates the proxies).
+# ── Keys ─────────────────────────────────────────────────────────────
+# Operator (creates L1 proxies) and user (sends cross-chain ops) are dedicated
+# test keys, funded on L1 at startup from the poster. Deliberately NOT the
+# poster/proof-signer keys — that would race the running eez-node's nonces.
 EEZ_OPERATOR_KEY="${EEZ_OPERATOR_KEY:-0x2248a31395af28e24349c8e566c19475a79cb610389204ab26bc585493e5cf27}"
-# User = sends cross-chain setter/deposit ops.
 EEZ_USER_KEY="${EEZ_USER_KEY:-0x3b7b012a74f1c18f714c38306339b6b4124f3a434bd816a1ee1fa5aeb5953efe}"
-# Hardhat key 2 = L2-only filler (prefunded in genesis).
+# Funds the two keys above on L1 (poster has a huge prefunded balance).
+EEZ_FUND_FROM_KEY="${EEZ_FUND_FROM_KEY:-${EEZ_L1_POSTER_KEY:?set EEZ_L1_POSTER_KEY (source infra/kurtosis/.env)}}"
+# Hardhat key 2 = L2-only filler; hardhat key 0 addr = L2 system signer (marks
+# Sync blocks). Both prefunded in the L2 genesis.
 HH_KEY_2=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
 HH_ADDR_2=0x3C44Cdddb6a900fa2b585dD299E03D12FA4293bC
-# Hardhat key 0 = L2 system signer; its address marks Sync blocks.
 HH_ADDR_0=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
 
 # Unique per run so the deterministic deposit-proxy address (derived from
@@ -57,11 +64,10 @@ HH_ADDR_0=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
 L2_RECIPIENT="${L2_RECIPIENT:-0x$(openssl rand -hex 20)}"
 FILLER_RECIPIENT=0x2222222222222222222222222222222222222222
 
-# Snapshot of the composer log for the tally (docker logs, not a file).
-NODE_LOG="$(mktemp /tmp/devnet-test-nodelog.XXXXXX)"
-refresh_log() { docker logs "$NODE_CONTAINER" >"$NODE_LOG" 2>&1 || true; }
-cleanup() { rm -f "$NODE_LOG"; }
-trap cleanup EXIT
+# The composer log is a live file appended by `run-eez-node.sh | tee`; read
+# it directly (it only grows). It is NOT ours — never delete it.
+NODE_LOG="$EEZ_NODE_LOG"
+refresh_log() { :; }
 
 # Run a read-only command with retries — survives transient RPC hiccups
 # (the node can saturate while the embedded L1 backfills) instead of
@@ -77,20 +83,30 @@ retry() {
 }
 
 # ── Prereqs ──────────────────────────────────────────────────────────
-for t in cast forge jq docker; do command -v "$t" >/dev/null || { echo "$t not in PATH"; exit 1; }; done
-[[ -f "$REPO/deployments.env" ]] || { echo "deployments.env missing — run make deploy-protocol first"; exit 1; }
-docker inspect "$NODE_CONTAINER" >/dev/null 2>&1 || { echo "container '$NODE_CONTAINER' not found — is the node up?"; exit 1; }
+for t in cast forge jq; do command -v "$t" >/dev/null || { echo "$t not in PATH"; exit 1; }; done
+[[ -f "$REPO/deployments.env" ]] || { echo "deployments.env missing — run deploy-eez.sh first"; exit 1; }
+[[ -n "${EEZ_REGISTRY_ADDRESS:-}" ]] || { echo "EEZ_REGISTRY_ADDRESS unset — deployments.env incomplete"; exit 1; }
+[[ -f "$EEZ_NODE_LOG" ]] || echo "WARN: composer log $EEZ_NODE_LOG missing — last-settled-height and divergence checks degrade to Sync-block heuristics. Set EEZ_NODE_LOG to run-eez-node.sh's tee target." >&2
 L2_UP=$(cast block-number --rpc-url "$L2_RPC" 2>/dev/null || echo "")
 [[ -n "$L2_UP" ]] || { echo "L2 RPC $L2_RPC not reachable"; exit 1; }
 L1_UP=$(cast block-number --rpc-url "$L1_RPC" 2>/dev/null || echo "")
 [[ -n "$L1_UP" ]] || { echo "L1 RPC $L1_RPC not reachable"; exit 1; }
 
-set -a; source "$REPO/deployments.env"; set +a
+# Fund the operator + user on L1 so they can pay gas on the shared chain.
+for k in "$EEZ_OPERATOR_KEY" "$EEZ_USER_KEY"; do
+    a=$(cast wallet address --private-key "$k")
+    if [[ "$(cast balance "$a" --rpc-url "$L1_RPC" 2>/dev/null || echo 0)" == "0" ]]; then
+        echo "==> funding $a on L1 (10 ETH from poster)"
+        cast send "$a" --value 10ether --private-key "$EEZ_FUND_FROM_KEY" --rpc-url "$L1_RPC" >/dev/null \
+            || { echo "failed to fund $a — is the poster funded on L1?"; exit 1; }
+    fi
+done
+
 L1_CHAIN_ID=$(cast chain-id --rpc-url "$L1_RPC")
 L2_CHAIN_ID=$(cast chain-id --rpc-url "$L2_RPC")
 USER_ADDR=$(cast wallet address --private-key "$EEZ_USER_KEY")
 echo "==> devnet cross-chain test"
-echo "    L1 (internal) = $L1_RPC  (chain $L1_CHAIN_ID, head $L1_UP)"
+echo "    L1 (shared)   = $L1_RPC  (chain $L1_CHAIN_ID, head $L1_UP)"
 echo "    L2            = $L2_RPC  (chain $L2_CHAIN_ID, head $L2_UP)"
 echo "    registry      = $EEZ_REGISTRY_ADDRESS  rollupId=$EEZ_ROLLUP_ID"
 echo "    waves=$WAVE_COUNT filler/gap=$FILLER_PER_GAP"
@@ -130,7 +146,7 @@ TOTAL_DEPOSIT_SUM=0
 LAST_SETTER_VALUE=""
 ALL_USER_TX_HASHES=()
 TX_META=()
-refresh_log; LOG_LINES_BEFORE=$(wc -l < "$NODE_LOG")
+refresh_log; LOG_LINES_BEFORE=$(wc -l < "$NODE_LOG" 2>/dev/null || echo 0)
 
 submit_wave() {
     local WAVE_ID=$1; shift
