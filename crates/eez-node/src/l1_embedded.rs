@@ -94,6 +94,12 @@ pub struct EmbeddedL1Config {
     /// Path to JWT secret file. Required in chiado mode (shared with
     /// lighthouse via volume mount).
     pub jwtsecret: Option<PathBuf>,
+    /// Static enode peers to always dial over RLPx. Bypasses discv5, which
+    /// bans private-IP ENRs — so this is how the embedded EL peers with
+    /// another EL on a private/enclave devnet (e.g. a Kurtosis reth) to
+    /// backfill history the CL's `newPayload` can't supply. Empty in dev
+    /// mode and standalone chiado. From `EEZ_L1_TRUSTED_PEERS`.
+    pub trusted_peers: Vec<String>,
 }
 
 /// Build a reth `NodeConfig<ChainSpec>` for the embedded L1 dev node
@@ -179,6 +185,20 @@ fn build_network_rpc_args(cfg: &EmbeddedL1Config) -> Result<(NetworkArgs, RpcSer
     };
     network_args.discovery.port = cfg.p2p_port;
     network_args.discovery.discv5_port = Some(cfg.discv5_port);
+    // Static RLPx peers (enodes). discv5 can't be used on a private enclave
+    // (it bans private-IP ENRs), so an embedded EL that joins the chain
+    // behind the tip backfills 1..N over RLPx from these explicit peers.
+    if !cfg.trusted_peers.is_empty() {
+        network_args.trusted_peers = cfg
+            .trusted_peers
+            .iter()
+            .map(|s| {
+                s.parse().map_err(|e| {
+                    eyre::eyre!("EEZ_L1_TRUSTED_PEERS entry '{s}' is not a valid enode: {e}")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+    }
     let rpc_args = RpcServerArgs {
         http: true,
         ws: true,

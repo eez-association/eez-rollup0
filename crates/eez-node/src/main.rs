@@ -980,6 +980,21 @@ fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
         .ok()
         .map(std::path::PathBuf::from);
 
+    // Static enode peers for the embedded L1 to dial directly over RLPx
+    // (no discv5). Needed on private devnets (e.g. Kurtosis) where the
+    // embedded EL joins behind the tip and must backfill history from a
+    // peer discovery can't find. Comma- or space-separated enode URLs.
+    let trusted_peers = env::var("EEZ_L1_TRUSTED_PEERS")
+        .ok()
+        .map(|s| {
+            s.split([',', ' '])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
     Ok(l1_embedded::EmbeddedL1Config {
         dev_chain_spec,
         kind,
@@ -989,6 +1004,7 @@ fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
         p2p_port,
         discv5_port,
         jwtsecret,
+        trusted_peers,
     })
 }
 

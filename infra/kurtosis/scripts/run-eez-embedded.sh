@@ -31,6 +31,9 @@ source "$ENV_FILE"
 # endpoints.env supplies EEZ_L1_BUILDER_RPC_URL (rbuilder) — keep that; we
 # override the plain L1 RPC below to point at eez-node's OWN embedded reth.
 [[ -f "$ENDPOINTS" ]] && source "$ENDPOINTS"
+# el-bootnode.env supplies EEZ_L1_TRUSTED_PEERS (a Kurtosis reth enode) so the
+# embedded L1 reth can backfill history over RLPx — see get-el-bootnode.sh.
+[[ -f "$DATA_DIR/el-bootnode.env" ]] && source "$DATA_DIR/el-bootnode.env"
 source "$REPO/deployments.env"
 set +a
 
