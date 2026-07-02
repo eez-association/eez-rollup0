@@ -39,10 +39,14 @@ test cross-chain *and* settlement together.
         └──────────────────────────────────────────────────┘
 ```
 
-Phase 2 inserts an rbuilder + mev-boost between eez-node's submitter and the
-EL; Phase 3 folds the whole thing into Kurtosis for spamoor + multi-node
-reorgs. Neither changes the Phase 1 code path — they attach to a node that,
-to them, is just a reth+CL pair.
+This harness deliberately stays MEV-free: it's the fast, Kurtosis-free inner
+loop for cross-chain (embedded L1 + a self-owned CL, no rbuilder/relay/spamoor,
+no ~25-min MEV warmup). For cross-chain **with** a real rbuilder + relay on one
+chain, use the **unified Kurtosis harness** (`infra/kurtosis/`, "Unified harness
+— two peered L1 pairs" in its README): it attaches eez-node's embedded EL as a
+follower to Kurtosis's already-working flashbots stack, so there's only one MEV
+path to maintain. Either way the Phase 1 code path here is unchanged — the
+builder, when present, just attaches to a node that to it is a reth+CL pair.
 
 ## What Phase 1 proves
 
@@ -128,6 +132,7 @@ bash infra/devnet-l1/scripts/gen-genesis.sh
   output layout (`metadata/`, `validator-keys/keys/`) should be confirmed
   against the pinned image and adjusted if the paths differ. Treat the first
   `up` as a bring-up/debug session, not a one-shot.
-- **Phase 1 has no rbuilder**: postBatch bundles degrade to ordered mempool
-  submission on the EL RPC. Adding the rbuilder (so `eth_sendBundle` is used)
-  is Phase 2.
+- **No rbuilder here (by design)**: postBatch bundles degrade to ordered
+  mempool submission on the EL RPC. For a real `eth_sendBundle` path, use the
+  unified Kurtosis harness (`infra/kurtosis/`) rather than adding a bespoke MEV
+  stack to this dir.

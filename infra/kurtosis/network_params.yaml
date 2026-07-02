@@ -56,6 +56,12 @@ port_publisher:
   el:
     enabled: true
     public_port_start: 32000
+  # Publish CL beacon-API ports to the host so the unified harness can read a
+  # Kurtosis beacon's ENR (GET /eth/v1/node/identity) to boot the eez-node
+  # follower beacon into this CL P2P network. See scripts/get-cl-bootnode.sh.
+  cl:
+    enabled: true
+    public_port_start: 33000
   mev:
     enabled: true
     public_port_start: 37000
