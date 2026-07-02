@@ -27,8 +27,6 @@
 //! serves is a vanilla `EthereumNode` (it would equally serve a
 //! `reth_gnosis::GnosisNode`).
 
-use alloy_consensus::BlockHeader;
-use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::B256;
 use jsonrpsee::core::server::RpcModule;
 use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
@@ -38,13 +36,13 @@ use reth_rpc_eth_api::{EthApiServer, FullEthApiServer};
 use serde::Deserialize;
 use tracing::{Level, event};
 
-/// Subset of the Flashbots `eth_sendBundle` request we honor. Remaining
-/// fields (`revertingTxHashes`, …) are accepted and ignored — a
-/// single-node dev chain has no proposer auction to enforce them against.
+/// Subset of the Flashbots `eth_sendBundle` request we honor. Extra
+/// fields (`minTimestamp`, `maxTimestamp`, `revertingTxHashes`, …) are
+/// accepted and ignored — a single-node dev chain has no proposer
+/// auction or block-pinning to enforce them against.
 ///
 /// Matches the body produced by `eez_l1::submitter::post_bundle`:
-/// `{ "txs": ["0x…", …], "blockNumber": "0x…", "minTimestamp": N,
-/// "maxTimestamp": N }` (the timestamp bounds are sent as JSON numbers).
+/// `{ "txs": ["0x…", …], "blockNumber": "0x…" }`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BundleParams {
@@ -56,10 +54,6 @@ pub struct BundleParams {
     /// the field deserializes; surfaced for logging.
     #[serde(default)]
     pub block_number: Option<String>,
-    #[serde(default)]
-    pub min_timestamp: Option<u64>,
-    #[serde(default)]
-    pub max_timestamp: Option<u64>,
 }
 
 /// `extend_rpc_modules` hook: register `eth_sendBundle` on the embedded
@@ -97,26 +91,6 @@ where
             ));
         }
 
-        // Enforce the inclusion-timestamp pin: the bundle may only land in
-        // a block whose timestamp is in [minTimestamp, maxTimestamp]. The
-        // next block is stamped strictly after the tip, so a window that
-        // closed at or before the tip can't be met — reject it, which the
-        // Submitter reads as a drop and retries next slot. A still-open
-        // window forwards; a not-yet-open one is already deferred upstream
-        // by the sequencer's lateness gate, so we don't hold here.
-        if let Some(max) = bundle.max_timestamp {
-            let tip_ts = EthApiServer::block_by_number(&*eth_api, BlockNumberOrTag::Latest, false)
-                .await?
-                .map_or(0, |b| b.header.timestamp());
-            if max <= tip_ts {
-                return Err(ErrorObject::owned(
-                    -32000,
-                    format!("eth_sendBundle: maxTimestamp {max} already passed (tip {tip_ts})"),
-                    None::<()>,
-                ));
-            }
-        }
-
         // Forward in submitted order. On a single-node dev chain with
         // no competing builder this yields postBatch-first inclusion
         // in the next block. A rejected tx fails the whole call (the
@@ -136,8 +110,6 @@ where
             Level::INFO,
             tx_count = bundle.txs.len(),
             target_block = bundle.block_number.as_deref().unwrap_or("next"),
-            min_timestamp = bundle.min_timestamp,
-            max_timestamp = bundle.max_timestamp,
             "embedded dev L1 eth_sendBundle: forwarded txs to pool in order",
         );
         // Flashbots-shaped reply. The `Submitter` only checks for a
