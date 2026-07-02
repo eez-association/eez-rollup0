@@ -39,6 +39,11 @@ docker run --rm \
     --source-max="$NUM" \
     --source-mnemonic="$MNEMONIC"
 
+# Written as root inside the container (bind mount) — reclaim so the host
+# user can read/rm these without sudo.
+docker run --rm -v "$DATA_DIR/validator-keys:/output" alpine:3 \
+    chown -R "$(id -u):$(id -g)" /output
+
 count="$(find "$DATA_DIR/validator-keys/keys" -name voting-keystore.json 2>/dev/null | wc -l | tr -d ' ')"
 if [[ "$count" -lt 1 ]]; then
     echo "gen-validator-keys: no voting-keystore.json under $DATA_DIR/validator-keys/keys" >&2

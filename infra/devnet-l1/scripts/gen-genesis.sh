@@ -32,8 +32,23 @@ if [ ! -f "$CONFIG_DIR/values.env" ]; then
     exit 1
 fi
 
+# The generator image writes as root inside the container, so everything
+# under $DATA_DIR ends up root-owned on the host (bind mount, not a
+# volume). Reclaim ownership after every docker run that touches it, so a
+# plain `rm -rf` works next time instead of failing with "Permission
+# denied" (docker run as root is the fix, not sudo on the host).
+reclaim_ownership() {
+    docker run --rm -v "$DATA_DIR:/data" alpine:3 \
+        chown -R "$(id -u):$(id -g)" /data
+}
+
 echo "==> wiping previous genesis under $DATA_DIR"
-rm -rf "$DATA_DIR"
+if ! rm -rf "$DATA_DIR" 2>/dev/null; then
+    echo "    previous run left root-owned files — reclaiming via docker, then retrying"
+    mkdir -p "$DATA_DIR"
+    reclaim_ownership
+    rm -rf "$DATA_DIR"
+fi
 mkdir -p "$DATA_DIR"
 
 echo "==> generating EL+CL genesis with $GENESIS_GEN_IMAGE"
@@ -42,9 +57,11 @@ docker run --rm \
     -v "$CONFIG_DIR/values.env:/config/values.env:ro" \
     -v "$DATA_DIR:/data" \
     "$GENESIS_GEN_IMAGE" all
+reclaim_ownership
 
 echo "==> generating validator keystores (eth2-val-tools in the same image)"
 bash "$HERE/gen-validator-keys.sh"
+reclaim_ownership
 
 echo "==> generating shared engine-API JWT"
 mkdir -p "$DATA_DIR/jwt"
