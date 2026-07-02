@@ -53,7 +53,13 @@ services:
       # Peer into the Kurtosis CL network so we follow the real head. Unlike the
       # single-node infra/devnet-l1 beacon, this is NOT --allow-insecure-genesis-
       # sync: it must find the Kurtosis CLs and sync from them.
+      #
+      # discv5 bans private-IP ENRs from its routing table, so on the enclave
+      # subnet discovery can't find the Kurtosis CLs. We DIAL them directly by
+      # libp2p multiaddr instead (same trick as docker-compose.chiado.yml). The
+      # ENR boot-node is kept too but is expected to be table-filtered out.
       - --boot-nodes=${EEZ_L1_CL_BOOTNODE:?set via infra/kurtosis/eez-l1-data/cl-bootnode.env (run get-cl-bootnode.sh)}
+      - --libp2p-addresses=${EEZ_L1_CL_LIBP2P:?set via infra/kurtosis/eez-l1-data/cl-bootnode.env (run get-cl-bootnode.sh)}
       - --disable-packet-filter
       - --subscribe-all-subnets
       - --suggested-fee-recipient=${DEVNET_FEE_RECIPIENT:-0x0000000000000000000000000000000000000000}

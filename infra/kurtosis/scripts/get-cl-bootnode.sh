@@ -58,14 +58,26 @@ identity="$(curl -fsS "$CL_HTTP/eth/v1/node/identity")" || {
 
 if command -v jq >/dev/null 2>&1; then
     enr="$(printf '%s' "$identity" | jq -r '.data.enr')"
+    # A directly-dialable libp2p multiaddr on the enclave network. Prefer a
+    # non-loopback ip4 tcp address (the CL's enclave container IP:9000).
+    libp2p="$(printf '%s' "$identity" | jq -r '.data.p2p_addresses[]' \
+        | grep -E '/ip4/' | grep '/tcp/' | grep -v '127.0.0.1' | head -1)"
 else
-    # jq-free extraction of "enr":"enr:-..."
+    # jq-free extraction.
     enr="$(printf '%s' "$identity" | grep -o '"enr"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"(enr:[^"]*)".*/\1/')"
+    libp2p="$(printf '%s' "$identity" | grep -oE '/ip4/[0-9.]+/tcp/[0-9]+/p2p/[A-Za-z0-9]+' | grep -v '/ip4/127\.0\.0\.1/' | head -1)"
 fi
 [[ "$enr" == enr:* ]] || { echo "did not get a valid ENR (got: ${enr:-empty})" >&2; exit 1; }
+[[ "$libp2p" == /ip4/* ]] || { echo "did not get a dialable libp2p multiaddr (got: ${libp2p:-empty})" >&2; exit 1; }
 
 mkdir -p "$DEST"
-printf 'EEZ_L1_CL_BOOTNODE=%s\n' "$enr" > "$OUT"
+# discv5 bans private-IP ENRs from the routing table, so on a private enclave
+# the follower must DIAL peers directly by multiaddr (--libp2p-addresses); the
+# ENR is kept for reference / in case discovery is ever usable.
+{
+    printf 'EEZ_L1_CL_BOOTNODE=%s\n' "$enr"
+    printf 'EEZ_L1_CL_LIBP2P=%s\n' "$libp2p"
+} > "$OUT"
 
 echo "wrote $OUT"
 cat "$OUT"
