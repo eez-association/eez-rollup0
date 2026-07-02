@@ -31,6 +31,7 @@ reth-node-api.workspace                   = true
 reth-node-builder.workspace               = true
 reth-node-core.workspace                  = true
 reth-node-ethereum.workspace              = true
+reth-primitives-traits.workspace          = true
 reth-storage-api.workspace                = true
 reth-tasks.workspace                      = true
 reth-transaction-pool.workspace           = true
@@ -61,9 +62,11 @@ clap.workspace               = true
 dotenvy.workspace            = true
 eyre.workspace               = true
 mimalloc.workspace           = true
+thiserror.workspace          = true
 tokio.workspace              = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
+url.workspace                = true
 
 [dev-dependencies]
 alloy-consensus.workspace = true

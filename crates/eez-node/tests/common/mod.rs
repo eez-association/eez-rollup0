@@ -323,12 +323,51 @@ impl Harness {
         poster_key: &str,
         expect_external_batches: bool,
     ) -> Vec<(&'static str, String)> {
-        vec![
+        self.env_for_options(NodeEnvOptions {
+            poster_key,
+            proof_signer_key: Some(ANVIL_KEY),
+            rollup_id: self.dep.rollup_id,
+            expect_external_batches,
+            sequencer_rpc: None,
+        })
+    }
+
+    pub fn follower_env(&self, sequencer_rpc: Option<&str>) -> Vec<(&'static str, String)> {
+        self.env_for_options(NodeEnvOptions {
+            poster_key: ANVIL_KEY,
+            proof_signer_key: None,
+            rollup_id: self.dep.rollup_id,
+            expect_external_batches: true,
+            sequencer_rpc,
+        })
+    }
+
+    pub fn env_with_rollup_id(&self, rollup_id: u64) -> Vec<(&'static str, String)> {
+        self.env_for_options(NodeEnvOptions {
+            poster_key: ANVIL_KEY,
+            proof_signer_key: Some(ANVIL_KEY),
+            rollup_id,
+            expect_external_batches: false,
+            sequencer_rpc: None,
+        })
+    }
+
+    pub fn env_with_proof_signer(&self, proof_signer_key: &str) -> Vec<(&'static str, String)> {
+        self.env_for_options(NodeEnvOptions {
+            poster_key: ANVIL_KEY,
+            proof_signer_key: Some(proof_signer_key),
+            rollup_id: self.dep.rollup_id,
+            expect_external_batches: false,
+            sequencer_rpc: None,
+        })
+    }
+
+    fn env_for_options(&self, opts: NodeEnvOptions<'_>) -> Vec<(&'static str, String)> {
+        let mut env = vec![
             ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
             ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
-            ("EEZ_L1_POSTER_KEY", poster_key.to_string()),
+            ("EEZ_L1_POSTER_KEY", opts.poster_key.to_string()),
             ("EEZ_L1_CHAIN_ID", "31337".to_string()),
-            ("EEZ_PROOF_SIGNER_KEY", ANVIL_KEY.to_string()),
             ("EEZ_L2_SYSTEM_ADDRESS", format!("{ANVIL_ADDR:#x}")),
             ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
             (
@@ -358,10 +397,10 @@ impl Harness {
                 "EEZ_ROLLUP_MANAGER_ADDRESS",
                 format!("{:#x}", self.dep.rollup_manager_address),
             ),
-            ("EEZ_ROLLUP_ID", self.dep.rollup_id.to_string()),
+            ("EEZ_ROLLUP_ID", opts.rollup_id.to_string()),
             (
                 "EEZ_COMPOSER_INTERVAL_SECS",
-                if expect_external_batches {
+                if opts.expect_external_batches {
                     COMPOSER_INTERVAL_MULTI
                 } else {
                     COMPOSER_INTERVAL_SINGLE
@@ -371,7 +410,7 @@ impl Harness {
             ),
             (
                 "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES",
-                expect_external_batches.to_string(),
+                opts.expect_external_batches.to_string(),
             ),
             (
                 "EEZ_L2_DATADIR",
@@ -388,8 +427,24 @@ impl Harness {
                     .map(|(p, _)| p.to_string_lossy().into_owned())
                     .unwrap_or_default(),
             ),
-        ]
+        ];
+
+        if let Some(proof_signer_key) = opts.proof_signer_key {
+            env.push(("EEZ_PROOF_SIGNER_KEY", proof_signer_key.to_string()));
+        }
+        if let Some(sequencer_rpc) = opts.sequencer_rpc {
+            env.push(("EEZ_SEQUENCER_RPC", sequencer_rpc.to_string()));
+        }
+        env
     }
+}
+
+struct NodeEnvOptions<'a> {
+    poster_key: &'a str,
+    proof_signer_key: Option<&'a str>,
+    rollup_id: u64,
+    expect_external_batches: bool,
+    sequencer_rpc: Option<&'a str>,
 }
 
 pub struct Deployment {
@@ -856,20 +911,23 @@ impl NodeHandle {
         });
     }
 
-    /// Assert this node's deriver detected and handled the L1 reorg.
-    /// Some runs legitimately have no stale confirmed batch on one node,
-    /// in which case the correct deriver action is an explicit no-op.
-    pub fn assert_reorg_seen(&self) {
+    /// Wait until this node observes the L1 reorg. Some runs legitimately
+    /// have no stale confirmed batch on one node, in which case the
+    /// correct deriver action is an explicit no-op. Without this check the
+    /// reorg test would silently pass even if reorg detection regressed
+    /// and some unrelated re-derivation path re-converged state.
+    pub async fn wait_for_reorg_seen(&self, timeout: Duration) -> Result<()> {
         let patterns = [
             "reorg rolled out",
+            "rewinding ring to common ancestor",
             "l1.reorg.retreated",
             "L1 reorg reported",
         ];
-        assert!(
-            self.log_count_matching(&patterns).unwrap() > 0,
-            "{} deriver missed the reorg",
-            self.name,
-        );
+        wait_for(timeout, || async {
+            Ok((self.log_count_matching(&patterns)? > 0).then_some(()))
+        })
+        .await
+        .with_context(|| format!("{} deriver missed the reorg", self.name))
     }
 
     /// Assert this node never logged a fatal-class line (process death

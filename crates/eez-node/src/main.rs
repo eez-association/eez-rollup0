@@ -15,13 +15,16 @@
 //! | set | unset | **follower** | reth + `L1Watcher` + Deriver (no Sequencer) |
 //! | set | set | **composer** | reth + `L1Watcher` + Deriver + Sequencer (L1-anchored) + Composer umbrella |
 
+mod follower;
 mod ingress;
 mod l1_embedded;
 
 use std::{collections::HashMap, env, str::FromStr, sync::Arc};
 
 use alloy_primitives::{Address, B256};
+use alloy_provider::RootProvider;
 use alloy_signer_local::PrivateKeySigner;
+use clap::Parser as _;
 use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
 use eez_deriver::Deriver;
 use eez_driver::{
@@ -39,6 +42,8 @@ use reth_node_ethereum::EthereumNode;
 use tokio::sync::mpsc;
 use tracing::{Level, event};
 
+use follower::UnsafeHeadFollower;
+
 mod payload;
 use payload::EezPayloadBuilder;
 
@@ -47,7 +52,7 @@ use payload::EezPayloadBuilder;
 static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
+pub(crate) enum Mode {
     Standalone,
     Follower,
     Composer,
@@ -78,13 +83,22 @@ impl Mode {
         }
     }
 
-    const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Standalone => "standalone",
             Self::Follower => "follower",
             Self::Composer => "composer",
         }
     }
+}
+
+/// eez-node-specific CLI arguments layered on top of reth's CLI.
+#[derive(clap::Args, Debug, Clone)]
+struct NodeExt {
+    /// Sequencer JSON-RPC URL. In follower mode this enables the
+    /// optional unsafe-head overlay; safe/finalized remain L1-derived.
+    #[arg(long, env = "EEZ_SEQUENCER_RPC")]
+    sequencer_rpc: Option<url::Url>,
 }
 
 // Bootstrap wiring is linear; splitting it across helpers fragments the
@@ -103,8 +117,6 @@ fn main() -> eyre::Result<()> {
         }
     }
 
-    let mode = Mode::from_env();
-
     // The optimistic composer + Deriver roll the L2 head back to a
     // canonical ancestor; by Engine API spec an FCU to an ancestor is a
     // no-op, which would freeze payload builds. These flags opt into
@@ -119,7 +131,9 @@ fn main() -> eyre::Result<()> {
         }
     }
 
-    Cli::<EthereumChainSpecParser>::try_parse_args_from(argv)?.run(async move |builder, _ext| {
+    let mode = Mode::from_env();
+
+    Cli::<EthereumChainSpecParser, NodeExt>::try_parse_from(argv)?.run(async move |builder, ext| {
         event!(
             name: "eez.node.launching",
             Level::INFO,
@@ -128,6 +142,11 @@ fn main() -> eyre::Result<()> {
         );
 
         warn_on_deprecated_env();
+        if mode != Mode::Follower && ext.sequencer_rpc.is_some() {
+            return Err(eyre::eyre!(
+                "follower sequencer RPC can only be set in follower mode",
+            ));
+        }
 
         // The per-rollup HeldPool, shared with the umbrella composer so the
         // cross-chain fronts' pushes and the Sync-slot drain see one queue.
@@ -138,7 +157,12 @@ fn main() -> eyre::Result<()> {
         // L1 source-tx simulation. Inline (not in `l1_embedded.rs`)
         // because the `NodeHandle` AddOns type resists a typed return.
         let embed_l1 = mode == Mode::Composer
-            && env::var("EEZ_L1_EMBEDDED").map_or(true, |v| v != "0" && !v.is_empty());
+            && env::var("EEZ_L1_EMBEDDED").map_or(true, |v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "" | "0" | "false" | "no" | "off"
+                )
+            });
         // Shared L1-reth tokio runtime — built once, used by whichever
         // L1 path runs.
         let build_l1_runtime = || {
@@ -326,7 +350,11 @@ fn main() -> eyre::Result<()> {
         }
 
         // ─── L1 stack (follower + composer) ──────────────────────────
-        let submitter_config = SubmitterConfig::from_env()?;
+        let submitter_config = if mode == Mode::Follower {
+            SubmitterConfig::from_env_read_only()?
+        } else {
+            SubmitterConfig::from_env()?
+        };
         let rollup_config = RollupConfig::from_env()?;
         let l1_watcher_config = L1WatcherConfig::from_env()?;
 
@@ -701,6 +729,12 @@ fn main() -> eyre::Result<()> {
             // way the composer does; None → pure-user-tx batches only.
             drop(sequencer);
             let follower_system_tx_cfg = build_follower_system_tx_cfg(&chain_spec)?;
+            event!(
+                name: "eez.node.follower.system_tx_cfg",
+                Level::INFO,
+                enabled = follower_system_tx_cfg.is_some(),
+                "cross-chain system tx reconstruction config loaded",
+            );
             (None, None, follower_system_tx_cfg)
         };
 
@@ -710,7 +744,7 @@ fn main() -> eyre::Result<()> {
         let l2_block_time_secs = timing.l2_block_time().as_secs();
         let deriver = Deriver::new(
             l1_watcher.clone(),
-            block_committer,
+            block_committer.clone(),
             Arc::new(provider.clone()),
             submitter.clone(),
             chain_spec,
@@ -721,6 +755,15 @@ fn main() -> eyre::Result<()> {
         );
 
         if let Err(err) = deriver.catch_up().await {
+            if mode == Mode::Follower {
+                event!(
+                    name: "eez.node.deriver.boot_catch_up.failed",
+                    Level::ERROR,
+                    error = %err,
+                    "boot-time catch_up failed; refusing to start follower before reconciliation",
+                );
+                return Err(eyre::eyre!("boot-time deriver catch_up failed: {err}"));
+            }
             event!(
                 name: "eez.node.deriver.boot_catch_up.failed",
                 Level::ERROR,
@@ -740,6 +783,35 @@ fn main() -> eyre::Result<()> {
         task_executor.spawn_critical_task("eez-deriver", async move {
             deriver_run.run().await;
         });
+
+        // Follower-only: optional sequencer-RPC unsafe-head overlay.
+        // L1 replay always boots first, so safe/finalized anchors are
+        // reconciled before the overlay can move unsafe head.
+        if mode == Mode::Follower {
+            if let Some(sequencer_rpc) = ext.sequencer_rpc {
+                let sequencer_rpc = RootProvider::new_http(sequencer_rpc);
+                let follower = UnsafeHeadFollower::new(
+                    block_committer,
+                    sequencer_rpc,
+                    provider,
+                    timing.l2_block_time(),
+                );
+                event!(
+                    name: "eez.node.follower.sequencer_rpc.spawned",
+                    Level::INFO,
+                    "spawning sequencer-RPC unsafe-head follower",
+                );
+                task_executor.spawn_critical_task("eez-node-follower-unsafe-head", async move {
+                    follower.run().await;
+                });
+            } else {
+                event!(
+                    name: "eez.node.follower.l1_derived_only",
+                    Level::INFO,
+                    "EEZ_SEQUENCER_RPC not set; running L1-derived-only follower",
+                );
+            }
+        }
 
         // ─── Composer-only: spawn Sequencer + umbrella ───────────────
         if let (Some(sequencer), Some(composer)) = (sequencer, umbrella) {
@@ -817,15 +889,17 @@ fn build_follower_system_tx_cfg<ChainSpec>(
 where
     ChainSpec: reth_chainspec::EthChainSpec,
 {
-    let Ok(system_key) = env::var("EEZ_L2_SYSTEM_KEY") else {
-        return Ok(None);
+    let system_key = match env::var("EEZ_L2_SYSTEM_KEY") {
+        Ok(system_key) => system_key,
+        Err(env::VarError::NotPresent) => return Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(eyre::eyre!("EEZ_L2_SYSTEM_KEY contains non-UTF-8 bytes"));
+        }
     };
-    let Ok(ccm_l2_str) = env::var("EEZ_CCM_L2_ADDRESS") else {
-        return Ok(None);
-    };
-    let Ok(rollup_id_str) = env::var("EEZ_ROLLUP_ID") else {
-        return Ok(None);
-    };
+    let ccm_l2_str = env::var("EEZ_CCM_L2_ADDRESS")
+        .map_err(|_| eyre::eyre!("EEZ_CCM_L2_ADDRESS required when EEZ_L2_SYSTEM_KEY is set"))?;
+    let rollup_id_str = env::var("EEZ_ROLLUP_ID")
+        .map_err(|_| eyre::eyre!("EEZ_ROLLUP_ID required when EEZ_L2_SYSTEM_KEY is set"))?;
 
     let system_signer =
         PrivateKeySigner::from_bytes(&B256::from_str(system_key.trim_start_matches("0x"))?)?;
