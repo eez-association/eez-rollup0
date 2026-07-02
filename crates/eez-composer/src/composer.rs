@@ -1143,6 +1143,29 @@ where
                             poison.push(held);
                             continue;
                         }
+                        // Block multicall outbound (not supported yet) on the axis
+                        // `reject_multicall` does NOT cover: ONE tx producing MULTIPLE
+                        // settlement entries (a contract making >1 cross-chain call).
+                        // reject_multicall guards >1 call WITHIN one entry
+                        // (`l2ToL1Calls.len() > 1`); this guards >1 entry from one tx.
+                        // The pairing below gives every entry the SAME signed
+                        // `held.raw_tx`, so >1 entry would put that nonce-bearing tx in
+                        // the Sync block more than once (`interleave_sync_block_txs`) →
+                        // build/replay failure. Evict loudly until grouped multicall
+                        // lands (docs/multicall-design.md).
+                        if l1_entries.len() > 1 {
+                            event!(
+                                name: "eez.composer.cc_compose.outbound_multicall_unsupported",
+                                Level::WARN,
+                                rollup_id,
+                                tx_idx = idx,
+                                tx_hash = %held.hash,
+                                entries = l1_entries.len(),
+                                "outbound tx made multiple cross-chain calls (multicall); not supported yet — evicting (resubmit required)",
+                            );
+                            poison.push(held);
+                            continue;
+                        }
                         for oe in &l1_entries {
                             pending_out.push((oe.clone(), held.raw_tx.clone()));
                         }
