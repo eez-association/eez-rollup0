@@ -368,6 +368,7 @@ impl Harness {
             ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
             ("EEZ_L1_POSTER_KEY", opts.poster_key.to_string()),
             ("EEZ_L1_CHAIN_ID", "31337".to_string()),
+            ("EEZ_L1_CHAIN", "testing".to_string()),
             ("EEZ_L2_SYSTEM_ADDRESS", format!("{ANVIL_ADDR:#x}")),
             ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
             (
