@@ -1036,6 +1036,10 @@ mod tests {
     /// index) is returned directly; one missing by index falls back to
     /// the by-hash lookup; missing by BOTH lookups classifies as
     /// `SourceIncomplete` (retryable) rather than a fatal provider error.
+    ///
+    /// The mock is a method-agnostic FIFO, so this pins response
+    /// consumption counts and the fallback/classification behavior —
+    /// not which RPC method each lookup used.
     #[tokio::test]
     async fn tx_lookup_falls_back_by_hash_then_classifies_source_incomplete() {
         let asserter = Asserter::new();

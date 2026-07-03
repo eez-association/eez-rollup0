@@ -53,7 +53,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 const BOOT_CATCH_UP_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
-/// After this many source-incomplete boot retries (~3.5 min at the
+/// After this many source-incomplete boot retries (~3 min at the
 /// backoff schedule) the retry log escalates WARN → ERROR: the L1
 /// source may never serve this history (e.g. pruned txs behind a
 /// still-indexed log), and an operator should look. Retrying continues
