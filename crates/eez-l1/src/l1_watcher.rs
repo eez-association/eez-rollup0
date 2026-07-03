@@ -380,11 +380,21 @@ impl L1Watcher {
                     // Still-canonical catch-up: advance ONE chunk per
                     // tick. Progress commits via the ring tip, so a
                     // failed chunk costs nothing — the next tick
-                    // recomputes the same range from the tip. Batches
-                    // in already-emitted chunks that later reorg are
-                    // retracted the same way as in near-tip operation
-                    // (Reorg event + deriver resync; re-delivered
-                    // batches are deduped downstream by tx hash).
+                    // recomputes the same range from the tip.
+                    //
+                    // Reorg tolerance while catching up is boundary-only:
+                    // the reseed below leaves ONE ring entry. A reorg
+                    // above the boundary needs no retraction — the next
+                    // chunk re-scans canonical logs, and re-delivered
+                    // batches dedup downstream by tx hash. A reorg that
+                    // invalidates the boundary itself exceeds the ring
+                    // and halts loudly with ReorgTooDeep. Mid-catch-up
+                    // boundaries sit ≥ LOG_SCAN_CHUNK_BLOCKS below the
+                    // live tip, out of real reorg reach, so only the
+                    // final (at-latest) boundary is exposed — the same
+                    // window as any post-reseed single-entry ring.
+                    // Seeding several ancestors to restore near-tip
+                    // tolerance across catch-up is tracked as follow-up.
                     let scan_from = old_tip_number + 1;
                     let chunk_to = scan_from
                         .saturating_add(crate::submitter::LOG_SCAN_CHUNK_BLOCKS - 1)
