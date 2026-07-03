@@ -72,6 +72,7 @@ eyre.workspace               = true
 mimalloc.workspace           = true
 thiserror.workspace          = true
 tokio.workspace              = true
+tokio-stream.workspace       = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
 # B0 interceptor: typed authorizedProxies eth_call (no hardcoded selectors).

@@ -9,11 +9,15 @@
 //!
 //! Mode is decided by env-var presence at startup:
 //!
-//! | `EEZ_L1_RPC_URL` | `EEZ_PROOF_SIGNER_KEY` | Mode | Stack |
+//! | `EEZ_L1_RPC_URL` | `EEZ_PROOF_SIGNER_KEY` (or `EEZ_PROOF_SIGNER_ADDRESS`) | Mode | Stack |
 //! |---|---|---|---|
 //! | unset | — | **standalone** | reth + Sequencer (interval Scheduler, Live blocks only) |
 //! | set | unset | **follower** | reth + `L1Watcher` + Deriver (no Sequencer) |
 //! | set | set | **composer** | reth + `L1Watcher` + Deriver + Sequencer (L1-anchored) + Composer umbrella |
+//!
+//! `EEZ_PROOF_SIGNER_ADDRESS` (address-only composer, split-prover topology)
+//! is accepted only in deferred-post mode (`EEZ_PROOF_SYSTEM_KIND=real`):
+//! the attester key lives solely on the remote `eez-proverd`.
 
 mod follower;
 mod ingress;
@@ -78,7 +82,11 @@ enum EmbeddedL1<Dev, Chiado> {
 impl Mode {
     fn from_env() -> Self {
         let l1_enabled = env::var_os("EEZ_L1_RPC_URL").is_some();
-        let proof_signer_set = env::var_os("EEZ_PROOF_SIGNER_KEY").is_some();
+        // Composer identity: the signer KEY, or (split-prover topology,
+        // deferred-post only) just the attester ADDRESS — the key then
+        // lives solely on the remote eez-proverd.
+        let proof_signer_set = env::var_os("EEZ_PROOF_SIGNER_KEY").is_some()
+            || env::var_os("EEZ_PROOF_SIGNER_ADDRESS").is_some();
         match (l1_enabled, proof_signer_set) {
             (false, _) => Self::Standalone,
             (true, false) => Self::Follower,
@@ -474,12 +482,63 @@ fn main() -> eyre::Result<()> {
         // would spawn a second actor with its own reconcile lock + head
         // mirror, splitting the serialization domain.
         let (sequencer, umbrella, system_tx_cfg) = if mode == Mode::Composer {
-            let proof_signer_key = env::var("EEZ_PROOF_SIGNER_KEY")
-                .map_err(|_| eyre::eyre!("EEZ_PROOF_SIGNER_KEY required in composer mode"))?;
-            let proof_signer = PrivateKeySigner::from_bytes(&B256::from_str(
-                proof_signer_key.trim_start_matches("0x"),
-            )?)?;
-            let prover = Arc::new(MockEcdsaProver::new(proof_signer));
+            let prover: Arc<dyn eez_prover::Prover> = if let Ok(proof_signer_key) =
+                env::var("EEZ_PROOF_SIGNER_KEY")
+            {
+                let proof_signer = PrivateKeySigner::from_bytes(&B256::from_str(
+                    proof_signer_key.trim_start_matches("0x"),
+                )?)?;
+                // The key takes precedence, but if BOTH are set they must
+                // agree — a stale key silently overriding the declared
+                // attester would stall settlement undetectably.
+                if let Ok(declared_raw) = env::var("EEZ_PROOF_SIGNER_ADDRESS") {
+                    let declared = Address::from_str(declared_raw.trim_start_matches("0x"))?;
+                    eyre::ensure!(
+                        declared == proof_signer.address(),
+                        "EEZ_PROOF_SIGNER_ADDRESS ({declared}) does not match \
+                         EEZ_PROOF_SIGNER_KEY's address ({}); remove one or fix the mismatch",
+                        proof_signer.address()
+                    );
+                }
+                Arc::new(MockEcdsaProver::new(proof_signer))
+            } else {
+                // Address-only composer (split-prover topology): the node
+                // holds just the registered attester address; the signing
+                // key lives only on the remote eez-proverd. Sound ONLY in
+                // deferred-post mode, where prove()'s output is a local
+                // placeholder overwritten by the remote attestation before
+                // L1 submission — with the synchronous mock proof system
+                // the placeholder WOULD be the on-chain proof, so bail.
+                let attester_raw = env::var("EEZ_PROOF_SIGNER_ADDRESS").map_err(|_| {
+                    eyre::eyre!(
+                        "EEZ_PROOF_SIGNER_KEY or EEZ_PROOF_SIGNER_ADDRESS required in composer mode"
+                    )
+                })?;
+                eyre::ensure!(
+                    proof_store.is_some(),
+                    "EEZ_PROOF_SIGNER_ADDRESS (address-only composer) requires deferred-post \
+                     mode (EEZ_PROOF_SYSTEM_KIND=real); the mock proof system self-signs and \
+                     needs EEZ_PROOF_SIGNER_KEY"
+                );
+                let attester = Address::from_str(attester_raw.trim_start_matches("0x"))?;
+                let address_only = eez_prover::AddressOnlyProver::new(attester);
+                // Keeps the soundness backstop honest: the placeholder proof
+                // must NOT recover to the attester, so a placeholder leaking
+                // to L1 fails verification instead of forging an attestation.
+                eyre::ensure!(
+                    attester != address_only.placeholder_address(),
+                    "EEZ_PROOF_SIGNER_ADDRESS equals the well-known placeholder key's address \
+                     ({attester}); it cannot be the registered attester"
+                );
+                event!(
+                    name: "eez.node.composer.address_only",
+                    Level::INFO,
+                    %attester,
+                    "composer running ADDRESS-ONLY (EEZ_PROOF_SIGNER_ADDRESS); \
+                     attestations come exclusively from the remote prover"
+                );
+                Arc::new(address_only)
+            };
             let rollup_id = rollup_config.rollup_id;
             // Share the SAME HeldPool the ingress middleware pushes into
             // (the `Option<Arc<HeldPool>>` leaves room for per-rollup
@@ -1044,9 +1103,28 @@ fn main() -> eyre::Result<()> {
                     .ok()
                     .and_then(|s| s.parse::<u16>().ok())
                     .unwrap_or(50051);
-                let control_addr: std::net::SocketAddr = format!("127.0.0.1:{control_port}")
-                    .parse()
-                    .expect("control-feed addr");
+                // Bind interface. Default loopback: the feed is plaintext gRPC
+                // with no auth — the ProofSink is ecrecover-gated, but the
+                // block+witness stream is readable and DoS-able by anyone who
+                // can reach the port. Widen only onto a link you trust
+                // end-to-end (e.g. a WireGuard address for a remote proverd).
+                let control_host =
+                    env::var("EEZ_CONTROL_RPC_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+                let control_ip: std::net::IpAddr = control_host.parse().map_err(|e| {
+                    eyre::eyre!(
+                        "EEZ_CONTROL_RPC_ADDR must be an IP literal (IPv4 or IPv6), got {control_host:?}: {e}"
+                    )
+                })?;
+                let control_addr = std::net::SocketAddr::new(control_ip, control_port);
+                // Bind EAGERLY and fatally: without this endpoint a deferred-post
+                // composer sequences but can never settle (the prover has nothing
+                // to dial), and a background-task bind failure only logs. Failing
+                // the launch instead turns the container restart policy into the
+                // retry loop — e.g. for the boot race where the VPN interface
+                // EEZ_CONTROL_RPC_ADDR points at is not up yet.
+                let control_listener = std::net::TcpListener::bind(control_addr)
+                    .map_err(|e| eyre::eyre!("control-feed bind {control_addr} failed: {e}"))?;
+                control_listener.set_nonblocking(true)?;
                 let svc = eez_composer::control_feed::ControlFeedSvc::new(Arc::clone(&publisher));
                 // Prover-feed RETURN path (P4-b): the ProofSink the prover submits
                 // its verified attestation to, hosted on the same endpoint.
@@ -1091,6 +1169,15 @@ fn main() -> eyre::Result<()> {
                 };
                 task_executor.spawn_critical_task("eez-control-feed", async move {
                     event!(name: "eez.control_feed.serving", Level::INFO, %control_addr, %attester, "serving control feed (composer → prover) + ProofSink (prover → composer)");
+                    // The listener was bound (fatally) in the launch path above;
+                    // here it is only registered with the runtime and served.
+                    let incoming = match tokio::net::TcpListener::from_std(control_listener) {
+                        Ok(listener) => tokio_stream::wrappers::TcpListenerStream::new(listener),
+                        Err(e) => {
+                            event!(name: "eez.control_feed.server_exited", Level::ERROR, error = %e, "control-feed listener registration failed");
+                            return;
+                        }
+                    };
                     if let Err(e) = tonic::transport::Server::builder()
                         .add_service(
                             eez_control_rpc::v1::control_feed_server::ControlFeedServer::new(svc),
@@ -1100,7 +1187,7 @@ fn main() -> eyre::Result<()> {
                         )
                         // Phase 2: present only when EEZ_COMPOSER_DRIVEN + deferred-post.
                         .add_optional_service(prover_dispatch)
-                        .serve(control_addr)
+                        .serve_with_incoming(incoming)
                         .await
                     {
                         event!(name: "eez.control_feed.server_exited", Level::ERROR, error = %e, "control-feed server exited");
@@ -1345,7 +1432,7 @@ fn warn_on_deprecated_env() {
                 name: "eez.node.env.deprecated",
                 Level::WARN,
                 env = name,
-                "env var is ignored; mode is derived from EEZ_L1_RPC_URL + EEZ_PROOF_SIGNER_KEY presence (see crate docs)."
+                "env var is ignored; mode is derived from EEZ_L1_RPC_URL + EEZ_PROOF_SIGNER_KEY/EEZ_PROOF_SIGNER_ADDRESS presence (see crate docs)."
             );
         }
     }

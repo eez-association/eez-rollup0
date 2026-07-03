@@ -1,0 +1,40 @@
+# COMPOSER side of a remote-prover split: driven dispatch ON, control feed
+# bound on a reachable interface, and NO local eez-proverd (the prover runs
+# on another machine via docker-compose.proverd.remote.yml).
+#
+# Use INSTEAD of docker-compose.driven.override.yml (which colocates the
+# prover and points it at 127.0.0.1):
+#
+#   EEZ_CONTROL_RPC_ADDR=<this host's WireGuard/VPN IP> \
+#   docker compose --env-file .env.chiado \
+#     -f docker-compose.chiado-node.yml \
+#     -f docker-compose.remote-prover.override.yml up -d
+#
+# SIGNER — pair this with the ADDRESS-ONLY composer: .env.chiado sets
+# EEZ_PROOF_SIGNER_ADDRESS (the registered authorizedSigner address) and
+# does NOT set EEZ_PROOF_SIGNER_KEY; the key lives only on the prover
+# machine. Requires deferred-post (EEZ_PROOF_SYSTEM_KIND=real) — the node
+# refuses address-only mode otherwise.
+#
+# SECURITY — the control feed (:50051) is plaintext gRPC with no auth/TLS
+# (tonic is built without the tls feature, so https cannot work at all).
+# Attestations cannot be forged (the ProofSink ecrecovers against the
+# registered attester), but the full L2 block+witness stream is readable
+# and the endpoint is DoS-able by anyone who can reach the port. The L2
+# debug RPC (:18688, already 0.0.0.0) has the same exposure. Bind the feed
+# to a VPN address (NOT 0.0.0.0) and keep both ports firewalled from the
+# public internet; the prover machine reaches them over the VPN.
+services:
+  eez-node:
+    environment:
+      # Composer-driven dispatch (stream verify ranges to the prover);
+      # deferred-post itself comes from EEZ_PROOF_SYSTEM_KIND=real in
+      # deployments.env, exactly as in docker-compose.driven.override.yml.
+      EEZ_COMPOSER_DRIVEN: "1"
+      # Interface the control feed binds (main.rs; default 127.0.0.1).
+      # Set to this host's VPN IP so only VPN peers can reach the feed.
+      # Must be an IP literal (IPv4 or IPv6) — the node refuses hostnames.
+      EEZ_CONTROL_RPC_ADDR: "${EEZ_CONTROL_RPC_ADDR:?set EEZ_CONTROL_RPC_ADDR to the interface the remote prover reaches, e.g. this host's WireGuard IP}"
+      # Keep the port in lockstep with EEZ_CONTROL_RPC_PORT on the prover
+      # side (docker-compose.proverd.remote.yml exposes the same knob).
+      EEZ_CONTROL_RPC_PORT: "${EEZ_CONTROL_RPC_PORT:-50051}"
