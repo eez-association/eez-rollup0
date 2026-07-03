@@ -999,10 +999,78 @@ mod tests {
         );
     }
 
-    use super::{BatchLogChunks, scan_next_batch_log_chunk};
+    use super::{BatchLogChunks, fetch_log_transaction, scan_next_batch_log_chunk};
+    use crate::error::L1Error;
     use alloy_primitives::Address;
     use alloy_provider::ProviderBuilder;
     use alloy_transport::mock::Asserter;
+
+    /// A minimal, serializable RPC transaction for mocked provider
+    /// responses. The signature is a fixed test vector — none of the
+    /// scan paths validate it.
+    fn mock_rpc_transaction() -> alloy_rpc_types_eth::Transaction {
+        use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy, transaction::Recovered};
+        let tx = TxLegacy {
+            chain_id: Some(1),
+            nonce: 0,
+            gas_price: 1,
+            gas_limit: 21_000,
+            to: alloy_primitives::TxKind::Call(Address::ZERO),
+            value: alloy_primitives::U256::ZERO,
+            input: alloy_primitives::Bytes::new(),
+        };
+        let signed = tx.into_signed(alloy_primitives::Signature::test_signature());
+        alloy_rpc_types_eth::Transaction {
+            inner: Recovered::new_unchecked(TxEnvelope::Legacy(signed), Address::ZERO),
+            block_hash: None,
+            block_number: None,
+            block_timestamp: None,
+            transaction_index: None,
+            effective_gas_price: None,
+        }
+    }
+
+    /// The boot-crash fix's linchpin: a tx the L1 serves by (block,
+    /// index) is returned directly; one missing by index falls back to
+    /// the by-hash lookup; missing by BOTH lookups classifies as
+    /// `SourceIncomplete` (retryable) rather than a fatal provider error.
+    #[tokio::test]
+    async fn tx_lookup_falls_back_by_hash_then_classifies_source_incomplete() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let tx_hash = B256::with_last_byte(0x51);
+
+        // (a) by-(block, index) hit: returned directly, no fallback call.
+        asserter.push_success(&mock_rpc_transaction());
+        fetch_log_transaction(&provider, 14, 0, tx_hash)
+            .await
+            .expect("index lookup hit");
+
+        // (b) index lookup null → by-hash fallback hit.
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&mock_rpc_transaction());
+        fetch_log_transaction(&provider, 14, 0, tx_hash)
+            .await
+            .expect("hash fallback hit");
+
+        // (c) both lookups null → retryable SourceIncomplete carrying
+        // the block and tx hash context.
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::Value::Null);
+        let err = fetch_log_transaction(&provider, 14, 7, tx_hash)
+            .await
+            .expect_err("both lookups null must not yield a tx");
+        assert!(err.is_source_incomplete(), "unexpected error: {err}");
+        match err {
+            L1Error::SourceIncomplete {
+                block, tx_hash: h, ..
+            } => {
+                assert_eq!(block, 14);
+                assert_eq!(h, tx_hash);
+            }
+            other => panic!("expected SourceIncomplete, got {other}"),
+        }
+    }
 
     /// A failed chunk scan must NOT consume the range: the same range is
     /// retried on the next call. A successful scan consumes exactly the
