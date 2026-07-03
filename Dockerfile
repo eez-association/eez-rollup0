@@ -25,6 +25,18 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # ── builder: cook deps (cached), then build eez-node ─────────────────
 FROM chef AS builder
+# Release-profile knobs, overridable at build time. Defaults MATCH Cargo.toml's
+# [profile.release] (lto=thin / codegen-units=1 / debug=1), so a plain
+# `docker build` still produces the optimized production binary. The Kurtosis
+# devnet build (infra/kurtosis/up.sh) overrides these for a much faster compile
+# (parallel codegen, no LTO, no debug info) — fine for a test node. Applied to
+# BOTH the cook and build steps so cargo-chef's cache stays consistent.
+ARG CARGO_PROFILE_RELEASE_LTO=thin
+ARG CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+ARG CARGO_PROFILE_RELEASE_DEBUG=1
+ENV CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO} \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_PROFILE_RELEASE_CODEGEN_UNITS} \
+    CARGO_PROFILE_RELEASE_DEBUG=${CARGO_PROFILE_RELEASE_DEBUG}
 COPY --from=planner /build/recipe.json recipe.json
 # Slow, cache-friendly layer: only re-runs when the dep graph changes.
 RUN cargo chef cook --release --recipe-path recipe.json

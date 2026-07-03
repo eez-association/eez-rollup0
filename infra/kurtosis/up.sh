@@ -43,8 +43,20 @@ DEPLOY_IMAGE="$(yv deploy_image)";  DEPLOY_IMAGE="${DEPLOY_IMAGE:-eez-deploy:dev
 export DOCKER_BUILDKIT=1
 
 if [[ "${EEZ_SKIP_NODE_BUILD:-0}" != "1" ]]; then
-    echo "==> building $NODE_IMAGE (repo Dockerfile; first build is slow — reth tree)"
-    docker build -t "$NODE_IMAGE" "$REPO"
+    echo "==> building $NODE_IMAGE (repo Dockerfile, fast devnet profile)"
+    # Fast profile for a test node: parallel codegen + no LTO + no debug info.
+    # Cuts the final compile from Cargo.toml's production release profile
+    # (codegen-units=1, lto=thin) by a lot, and shrinks disk use. Set
+    # EEZ_OPTIMIZED_BUILD=1 to build the full optimized binary instead.
+    node_build_args=()
+    if [[ "${EEZ_OPTIMIZED_BUILD:-0}" != "1" ]]; then
+        node_build_args=(
+            --build-arg CARGO_PROFILE_RELEASE_LTO=false
+            --build-arg CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+            --build-arg CARGO_PROFILE_RELEASE_DEBUG=0
+        )
+    fi
+    docker build "${node_build_args[@]}" -t "$NODE_IMAGE" "$REPO"
 fi
 
 if [[ "${EEZ_SKIP_DEPLOY_BUILD:-0}" != "1" ]]; then
