@@ -16,6 +16,7 @@ datadir/
 # Kurtosis devnet local config (may contain keys)
 infra/kurtosis/.env
 infra/kurtosis/endpoints.env
+infra/kurtosis/args.yaml
 
 chiado-db*/
 data/

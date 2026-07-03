@@ -8,17 +8,14 @@
 #   EEZ_L1_SLOT_SECONDS (12), EEZ_REORG_DRY_RUN=1 (log only).
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 
-# Load endpoints + local env if present (best-effort; env already-set wins).
-for f in "$REPO/infra/kurtosis/endpoints.env" "$REPO/infra/kurtosis/.env"; do
-    if [[ -f "$f" ]]; then
-        # shellcheck disable=SC1090
-        set -a; source "$f"; set +a
-    fi
-done
+# Discover the L1 RPC + disruptoor URL from the running enclave (env already-set
+# wins). See enclave-env.sh — uses `kurtosis port print`, no scraping.
+# shellcheck disable=SC1091
+source "$HERE/enclave-env.sh"
 
-L1_RPC="${EEZ_L1_RPC_URL:?set EEZ_L1_RPC_URL (run parse-endpoints.sh)}"
+L1_RPC="${EEZ_L1_RPC_URL:?could not resolve EEZ_L1_RPC_URL — is the '$ENCLAVE' enclave up? (kurtosis port print $ENCLAVE el-1-reth-lighthouse rpc)}"
 DISRUPTOOR="${EEZ_DISRUPTOOR_URL:-http://127.0.0.1:36000}"
 SCHEDULES="${EEZ_REORG_SCHEDULES:-shallow:1:20 medium:5:100 deep:15:1000}"
 MINORITY="${EEZ_REORG_MINORITY:-3,4}"
@@ -136,7 +133,7 @@ best_match() {
 log "watching $L1_RPC | disruptoor=$DISRUPTOOR | schedules='$SCHEDULES' | dry_run=$DRY_RUN"
 if [[ "$DRY_RUN" != 1 ]] && ! curl -fsS "$DISRUPTOOR/v1/healthz" -o /dev/null; then
     log "WARN disruptoor healthz check failed at $DISRUPTOOR — partitions will likely fail later."
-    log "  verify EEZ_DISRUPTOOR_URL (see 'kurtosis enclave inspect' if parse-endpoints.sh missed it)."
+    log "  verify EEZ_DISRUPTOOR_URL (kurtosis port print ${ENCLAVE:-eez-devnet} disruptoor http)."
 fi
 last_handled=-1
 while true; do

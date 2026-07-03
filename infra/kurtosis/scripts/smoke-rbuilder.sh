@@ -3,21 +3,18 @@
 # maxTimestamp), which EEZ's BundleTarget::Exact relies on for slot settlement.
 # Two probes from the poster key: POSITIVE pins the correct slot timestamp (must
 # land); NEGATIVE pins an impossible past timestamp (must NOT land — the real
-# enforcement test). Run after MEV warmup (~block 130). Sources endpoints.env +
-# .env; override via SMOKE_ENV_FILES / RBUILDER_SMOKE_SLACK (default 3).
+# enforcement test). Run after MEV warmup (~block 130). Discovers the enclave's
+# RPC / rbuilder / poster key via enclave-env.sh; override RBUILDER_SMOKE_SLACK
+# (default 3) or export any EEZ_* var first to win over discovery.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="$(cd "$HERE/../../.." && pwd)"
-# .env first, endpoints.env last so the real discovered Kurtosis RPC + rbuilder
-# ports win over .env's placeholders (same precedence as run-eez-node.sh).
-SMOKE_ENV_FILES="${SMOKE_ENV_FILES-$REPO/infra/kurtosis/.env $REPO/infra/kurtosis/endpoints.env}"
-for f in $SMOKE_ENV_FILES; do
-    # shellcheck disable=SC1090
-    [[ -f "$f" ]] && { set -a; source "$f"; set +a; }
-done
+# Discover the Kurtosis EL RPC + rbuilder RPC + poster key from the running
+# enclave (env already-set wins). See enclave-env.sh — uses `kurtosis port
+# print`, no scraping.
+# shellcheck disable=SC1091
+source "$HERE/enclave-env.sh"
 
-: "${EEZ_L1_RPC_URL:=http://127.0.0.1:${EEZ_L1_HTTP_PORT:-18545}}"
 : "${EEZ_L1_SLOT_SECONDS:=$(( ${EEZ_L1_BLOCK_TIME_MS:-12000} / 1000 ))}"
 
 RPC="${EEZ_L1_RPC_URL:?set EEZ_L1_RPC_URL}"

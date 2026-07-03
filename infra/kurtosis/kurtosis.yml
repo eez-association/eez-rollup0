@@ -1,0 +1,4 @@
+# Kurtosis package manifest. Makes infra/kurtosis a runnable package:
+#   cd infra/kurtosis && kurtosis run . --args-file args.yaml
+# main.star imports ethpandaops/ethereum-package at run time (auto-fetched).
+name: github.com/eez-association/eez-rollup0/infra/kurtosis

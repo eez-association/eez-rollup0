@@ -1,0 +1,115 @@
+# Copy to args.yaml (gitignored) and fill in the two keys under `eez:`.
+# Run:  cd infra/kurtosis && bash up.sh        (or: kurtosis run . --args-file args.yaml)
+#
+# Two top-level blocks:
+#   ethereum_package:  passed verbatim to ethpandaops/ethereum-package (Pair B).
+#   eez:               config for Pair A (eez-node + follower) and the deploy step.
+
+# ─────────────────────────────────────────────────────────────────────────
+ethereum_package:
+  participants:
+    - el_type: reth
+      el_image: ghcr.io/paradigmxyz/reth:latest
+      cl_type: lighthouse
+      cl_image: sigp/lighthouse:v8.1.2
+      count: 2
+    - el_type: reth
+      cl_type: lighthouse
+      cl_image: sigp/lighthouse:v8.1.2
+      count: 2
+
+  network_params:
+    network_id: "7331"
+    # Must equal eez.l1_block_time_ms (12000) so the bundle timestamp pin lands
+    # on-grid: min==max==parent_ts+12 == the next slot's timestamp.
+    seconds_per_slot: 12
+    slot_duration_ms: 12000
+    genesis_gaslimit: 60000000
+    min_validator_withdrawability_delay: 1
+    shard_committee_period: 1
+    deneb_fork_epoch: 0
+    electra_fork_epoch: 0
+    # rbuilder coinbase, funded so mev_builder_subsidy can pay out.
+    prefunded_accounts: '{"0xb9e79D19f651a941757b35830232E7EFC77E1c79": {"balance": "1000000ETH"}}'
+
+  mev_type: flashbots
+  mev_params:
+    mev_builder_image: ethpandaops/reth-rbuilder:develop
+    mev_relay_image: ethpandaops/mev-boost-relay:main
+    mev_boost_image: ethpandaops/mev-boost:develop
+    mev_builder_cl_image: sigp/lighthouse:v8.1.2
+    # 1 ETH/winning-block from the coinbase so rbuilder outbids local payloads.
+    mev_builder_subsidy: 1
+
+  additional_services:
+    - spamoor      # L1 blockspace load
+    - disruptoor   # reorg primitive (scripts/reorg-scheduler.sh; needs --privileged)
+    - assertoor    # asserts reorg/liveness bounds (see assertoor_params below)
+    - dora         # block/reorg explorer
+    - forkmon      # fork-choice monitor
+
+  # Automated network-health assertions. run_stability_check enforces reorg
+  # depth <= 2 and <= 2 reorgs/epoch — a BASELINE/LOAD-phase guard that catches
+  # UNINTENDED reorgs. It will (correctly) flag the deep reorgs you induce with
+  # scripts/reorg-scheduler.sh, so in that adversarial phase ignore it and assert
+  # on eez-node recovery instead (scripts/devnet-test.sh). UI: kurtosis port
+  # print eez-devnet assertoor http.
+  assertoor_params:
+    run_stability_check: true
+    run_block_proposal_check: true
+
+  spamoor_params:
+    spammers:
+      # Execution-gas load (~30% of the 60M limit), leaving room for postBatch.
+      - scenario: eoatx
+        name: baseline-load
+        config:
+          throughput: 850
+      # Blob load (EIP-4844). Uses the SEPARATE blob-gas market, so it adds
+      # realism without eating the execution gas postBatch bundles need. Bump
+      # throughput to stress the blob-fee market. (blob-combined also accepts
+      # blob-specific knobs; add them once you've confirmed them for your image.)
+      - scenario: blob-combined
+        name: blob-load
+        config:
+          throughput: 3
+          max_pending: 6
+          max_wallets: 20
+
+# ─────────────────────────────────────────────────────────────────────────
+eez:
+  # ── Images ──────────────────────────────────────────────────────────
+  # eez-node is BUILT locally from the repo Dockerfile by `up.sh`, tagged with
+  # this value. Release-image pull support will be added later; when it is,
+  # point this at a published tag instead (and skip the build):
+  #   eez_node_image: ghcr.io/eez-association/eez-node:v1.2.3
+  eez_node_image: eez-node:dev
+  # Glue image, also built by up.sh from infra/kurtosis/deploy.Dockerfile.
+  deploy_image: eez-deploy:dev
+  follower_image: sigp/lighthouse:v8.1.2
+
+  # ── Keys (FILL THESE IN) ────────────────────────────────────────────
+  # Prefunded ethereum-package mnemonic accounts at UNUSED indices (1, 2, 4, 5);
+  # avoid 0 (builder coinbase), 3 (tx_fuzz), 12 (deployer), 13 (spamoor). See
+  # README "Keys" for the `cast wallet private-key` invocation.
+  poster_key: "0xCHANGE_ME"
+  proof_signer_key: "0xCHANGE_ME"
+
+  # ── Timing (l1_block_time_ms MUST match network_params.seconds_per_slot) ─
+  l1_block_time_ms: 12000
+  l2_block_time_ms: 2000
+  proof_time_ms: 4000
+  submission_slack_ms: 1500
+
+  fee_recipient: "0x0000000000000000000000000000000000000000"
+
+  # ── L2 (eez-node's own rollup reth) ─────────────────────────────────
+  l2_system_key: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+  l2_system_address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+  ccm_l2_address: "0x4200000000000000000000000000000000000007"
+  # MUST include the L1 chainId (network_id) or every op is treated as L2-only
+  # and batches settle empty.
+  cross_chain_source_chain_ids: "7331"
+
+  # ── Optional overrides ──────────────────────────────────────────────
+  # builder_rpc_url: "http://el-5-reth-builder-lighthouse:8645"  # auto-detected

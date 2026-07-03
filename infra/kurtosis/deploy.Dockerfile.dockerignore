@@ -1,0 +1,18 @@
+# BuildKit uses this instead of the root .dockerignore when building with
+#   -f infra/kurtosis/deploy.Dockerfile
+# The root ignore excludes sync-rollups-protocol/ + contracts/out, but the
+# deploy image NEEDS them (contracts/foundry.toml libs point at the submodule).
+# So we keep those and only drop the genuinely heavy / irrelevant paths.
+.git/
+target/
+chiado-db/
+data/
+datadir/
+crates/
+prompts/
+explanations/
+*.bak
+*.log
+.env
+.env.*
+contracts/broadcast/
