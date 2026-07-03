@@ -53,12 +53,6 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 const BOOT_CATCH_UP_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
-/// After this many source-incomplete boot retries (~3 min at the
-/// backoff schedule) the retry log escalates WARN → ERROR: the L1
-/// source may never serve this history (e.g. pruned txs behind a
-/// still-indexed log), and an operator should look. Retrying continues
-/// either way — a syncing L1 can legitimately take longer.
-const BOOT_CATCH_UP_ESCALATE_ATTEMPTS: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -759,27 +753,15 @@ fn main() -> eyre::Result<()> {
                 Ok(()) => break,
                 Err(err) if err.is_source_incomplete() => {
                     catch_up_attempts += 1;
-                    if catch_up_attempts >= BOOT_CATCH_UP_ESCALATE_ATTEMPTS {
-                        event!(
-                            name: "eez.node.deriver.boot_catch_up.source_incomplete",
-                            Level::ERROR,
-                            mode = mode.name(),
-                            attempts = catch_up_attempts,
-                            retry_delay_secs = catch_up_retry_delay.as_secs(),
-                            error = %err,
-                            "boot-time catch_up still cannot read all L1 source data; the source may be unable to serve this history — still retrying",
-                        );
-                    } else {
-                        event!(
-                            name: "eez.node.deriver.boot_catch_up.source_incomplete",
-                            Level::WARN,
-                            mode = mode.name(),
-                            attempts = catch_up_attempts,
-                            retry_delay_secs = catch_up_retry_delay.as_secs(),
-                            error = %err,
-                            "boot-time catch_up could not read all L1 source data yet; retrying before starting L1-active tasks",
-                        );
-                    }
+                    event!(
+                        name: "eez.node.deriver.boot_catch_up.source_incomplete",
+                        Level::WARN,
+                        mode = mode.name(),
+                        attempts = catch_up_attempts,
+                        retry_delay_secs = catch_up_retry_delay.as_secs(),
+                        error = %err,
+                        "boot-time catch_up could not read all L1 source data yet; retrying before starting L1-active tasks",
+                    );
                     tokio::time::sleep(catch_up_retry_delay).await;
                     catch_up_retry_delay = Duration::from_secs(
                         catch_up_retry_delay
