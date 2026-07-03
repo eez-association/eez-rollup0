@@ -301,7 +301,7 @@ impl L1Watcher {
                     block_hash: latest_hash,
                     timestamp: latest.timestamp,
                 });
-                self.scan_batch_posted(provider, latest_number, latest_number, latest_hash)
+                self.scan_batch_posted(provider, latest_number, latest_number)
                     .await?;
             }
             // No change since last poll.
@@ -316,7 +316,7 @@ impl L1Watcher {
                     block_hash: latest_hash,
                     timestamp: latest.timestamp,
                 });
-                self.scan_batch_posted(provider, latest_number, latest_number, latest_hash)
+                self.scan_batch_posted(provider, latest_number, latest_number)
                     .await?;
             }
             // Either a reorg or a multi-block gap. Walk back via
@@ -434,9 +434,12 @@ impl L1Watcher {
                         )
                         .await?;
                         self.emit_scanned_batches(scan_from, chunk_to, scanned);
+                        // INFO, not WARN: fires once per chunk during
+                        // routine catch-up progress; the reorg reseed
+                        // below keeps its WARN.
                         event!(
                             name: "eez.l1_watcher.ring.rewind",
-                            Level::WARN,
+                            Level::INFO,
                             tick = tick_count,
                             old_tip_number,
                             old_tip_hash = %old_tip_hash,
@@ -492,7 +495,7 @@ impl L1Watcher {
                 let scan_from = common.number + 1;
                 self.fill_forward(provider, scan_from, latest_number, latest_hash, state)
                     .await?;
-                self.scan_batch_posted(provider, scan_from, latest_number, latest_hash)
+                self.scan_batch_posted(provider, scan_from, latest_number)
                     .await?;
             }
         }
@@ -558,7 +561,6 @@ impl L1Watcher {
         provider: &impl Provider,
         from: u64,
         to: u64,
-        _to_hash: B256,
     ) -> L1Result<()> {
         event!(
             name: "eez.l1_watcher.scan_batch_posted",

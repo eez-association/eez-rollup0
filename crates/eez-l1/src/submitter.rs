@@ -258,7 +258,9 @@ impl Submitter {
     ///
     /// # Errors
     ///
-    /// [`L1Error::Provider`] on RPC failure (log fetch, tx fetch).
+    /// - [`L1Error::Provider`] on RPC failure (log fetch, tx fetch).
+    /// - [`L1Error::SourceIncomplete`] when a canonical batch tx is not
+    ///   served by the L1 source yet — retryable once the source syncs.
     pub async fn next_batch_log_chunk(
         &self,
         chunks: &mut BatchLogChunks,
@@ -863,8 +865,14 @@ async fn fetch_log_transaction(
 
 #[cfg(test)]
 mod tests {
-    use super::{LOG_SCAN_CHUNK_BLOCKS, attribute_settlement, initial_log_scan_ranges};
-    use alloy_primitives::B256;
+    use super::{
+        BatchLogChunks, LOG_SCAN_CHUNK_BLOCKS, attribute_settlement, fetch_log_transaction,
+        initial_log_scan_ranges, scan_next_batch_log_chunk,
+    };
+    use crate::error::L1Error;
+    use alloy_primitives::{Address, B256};
+    use alloy_provider::ProviderBuilder;
+    use alloy_transport::mock::Asserter;
     use std::collections::HashSet;
 
     fn settled(roots: &[B256]) -> HashSet<B256> {
@@ -998,12 +1006,6 @@ mod tests {
             (0, None)
         );
     }
-
-    use super::{BatchLogChunks, fetch_log_transaction, scan_next_batch_log_chunk};
-    use crate::error::L1Error;
-    use alloy_primitives::Address;
-    use alloy_provider::ProviderBuilder;
-    use alloy_transport::mock::Asserter;
 
     /// A minimal, serializable RPC transaction for mocked provider
     /// responses. The signature is a fixed test vector — none of the

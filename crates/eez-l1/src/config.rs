@@ -41,7 +41,7 @@ pub struct SubmitterConfig {
     pub poster: PrivateKeySigner,
     /// Deployed `EEZ` (rollups registry) address.
     pub eez: Address,
-    /// Our rollup's id. Used by `scan_batches` to filter the
+    /// Our rollup's id. Used by the batch-log scanner to filter the
     /// `L2ExecutionPerformed(rollupId indexed, ...)` event topic so
     /// each historical batch is tagged winner / loser.
     pub rollup_id: u64,

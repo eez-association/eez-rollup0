@@ -771,18 +771,10 @@ fn main() -> eyre::Result<()> {
                     );
                 }
                 Err(err) => {
-                    if mode == Mode::Follower {
-                        event!(
-                            name: "eez.node.deriver.boot_catch_up.failed",
-                            Level::ERROR,
-                            error = %err,
-                            "boot-time catch_up failed; refusing to start follower before reconciliation",
-                        );
-                        return Err(eyre::eyre!("boot-time deriver catch_up failed: {err}"));
-                    }
                     event!(
                         name: "eez.node.deriver.boot_catch_up.failed",
                         Level::ERROR,
+                        mode = mode.name(),
                         error = %err,
                         "boot-time catch_up failed; refusing to start L1-active tasks before reconciliation",
                     );

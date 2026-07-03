@@ -193,18 +193,6 @@ impl Anvil {
         Ok(())
     }
 
-    /// Mine `blocks` L1 blocks immediately. Used by catch-up tests that need
-    /// a wide historical range without waiting for wall-clock block time.
-    pub async fn mine(&self, blocks: u64) -> Result<()> {
-        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
-        let _: serde_json::Value = provider
-            .client()
-            .request("anvil_mine", (format!("0x{blocks:x}"),))
-            .await
-            .context("anvil_mine")?;
-        Ok(())
-    }
-
     /// `anvil_reorg` — drops the most recent `depth` L1 blocks. Requires
     /// the cancun hardfork (see [`AnvilConfig::for_reorg`]). The empty
     /// array is the optional list of replacement txs (we use none —
