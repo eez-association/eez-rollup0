@@ -27,7 +27,7 @@ use tracing::{Level, event};
 use url::Url;
 
 use crate::error::{L1Error, L1Result};
-use crate::submitter::{BatchLogChunks, ScannedBatch};
+use crate::submitter::ScannedBatch;
 
 /// [`L1Watcher`] polling cadence. 2s gives prompt detection without
 /// burning RPC quota — half of gnosis's 5s L1 block time, a sixth of
@@ -262,9 +262,10 @@ impl L1Watcher {
         }
     }
 
-    /// One poll cycle. Far-behind catch-up keeps its chunk cursor in
-    /// [`WatcherState`], so a transient scan failure retries the failed
-    /// tail instead of restarting from the stale ring tip.
+    /// One poll cycle. Idempotent on retry: far-behind catch-up advances
+    /// the ring one scanned chunk at a time, so a transient failure
+    /// costs at most one chunk and the next tick resumes from the ring
+    /// tip.
     async fn poll_cycle(
         &self,
         provider: &impl Provider,
@@ -283,14 +284,6 @@ impl L1Watcher {
             tip = ?state.tip().map(|(n, _)| n),
             "poll cycle: fetched latest L1 block",
         );
-
-        if state.pending_catch_up.is_some()
-            && self
-                .resume_pending_catch_up(provider, state, tick_count)
-                .await?
-        {
-            return Ok(());
-        }
 
         match state.tip() {
             // First poll — seed the ring with the latest, emit NewHead.
@@ -356,7 +349,7 @@ impl L1Watcher {
                             fetch_block_by_tag(provider, BlockNumberOrTag::Number(old_tip_number))
                                 .await?;
                         let reorged_across_gap = at_old_height.hash != old_tip_hash;
-                        let (scan_from, pending_reorg) = if reorged_across_gap {
+                        if reorged_across_gap {
                             // Old tip reorged out. Find the common
                             // ancestor against the ring (bounded by
                             // ≤ reorg_max_depth); none in bounds →
@@ -378,59 +371,87 @@ impl L1Watcher {
                                 common_ancestor_hash = %common.hash,
                                 latest_number,
                                 "chain reorged across catch-up gap — old tip no \
-                                 longer canonical; scanning BatchPosted before \
-                                 emitting Reorg and reseeding",
+                                 longer canonical; emitting Reorg and reseeding \
+                                 at the ancestor before chunked catch-up",
                             );
-                            (
-                                common.number + 1,
-                                Some(PendingReorg {
-                                    common_ancestor_number: common.number,
-                                    common_ancestor_hash: common.hash,
-                                    old_head_hash: old_tip_hash,
-                                    new_head_number: latest_number,
-                                    new_head_hash: latest_hash,
-                                }),
-                            )
+                            self.emit(L1Event::Reorg {
+                                common_ancestor_number: common.number,
+                                common_ancestor_hash: common.hash,
+                                old_head_hash: old_tip_hash,
+                                new_head_number: latest_number,
+                                new_head_hash: latest_hash,
+                            });
+                            // Reseed at the ancestor so later ticks (and
+                            // any chunk failure) re-enter as a plain,
+                            // still-canonical catch-up — the Reorg is
+                            // never re-emitted.
+                            state.rewind_to(0);
+                            state.push_canonical(common.number, common.hash);
+                            return Ok(());
+                        }
+
+                        // Still-canonical catch-up: advance ONE chunk per
+                        // tick. Progress commits via the ring tip, so a
+                        // failed chunk costs nothing — the next tick
+                        // recomputes the same range from the tip. Batches
+                        // in already-emitted chunks that later reorg are
+                        // retracted the same way as in near-tip operation
+                        // (Reorg event + deriver resync; re-delivered
+                        // batches are deduped downstream by tx hash).
+                        let scan_from = old_tip_number + 1;
+                        let chunk_to = scan_from
+                            .saturating_add(crate::submitter::LOG_SCAN_CHUNK_BLOCKS - 1)
+                            .min(latest_number);
+                        let boundary = if chunk_to == latest_number {
+                            BlockSnapshot {
+                                number: latest_number,
+                                hash: latest_hash,
+                                parent_hash: latest_parent,
+                                timestamp: latest.timestamp,
+                            }
                         } else {
-                            event!(
-                                name: "eez.l1_watcher.poll.catchup",
-                                Level::INFO,
-                                tick = tick_count,
-                                old_tip_number,
-                                latest_number,
-                                reorg_max_depth = state.reorg_max_depth,
-                                "tip is far behind latest beyond reorg_max_depth \
-                                 and still canonical — treating as catch-up, \
-                                 scanning BatchPosted and reseeding ring at \
-                                 latest",
-                            );
-                            (old_tip_number + 1, None)
+                            fetch_block_by_tag(provider, BlockNumberOrTag::Number(chunk_to)).await?
                         };
                         event!(
-                            name: "eez.l1_watcher.catch_up_scan.started",
+                            name: "eez.l1_watcher.poll.catchup",
                             Level::INFO,
                             tick = tick_count,
+                            old_tip_number,
                             scan_from,
-                            scan_to = latest_number,
+                            chunk_to,
+                            latest_number,
+                            reorg_max_depth = state.reorg_max_depth,
+                            "tip is far behind latest — scanning one \
+                             BatchPosted chunk and reseeding ring at the \
+                             chunk boundary",
+                        );
+                        let scanned = crate::submitter::scan_batch_logs_range(
+                            provider,
+                            self.inner.config.eez,
+                            self.inner.config.rollup_id,
+                            scan_from,
+                            chunk_to,
+                        )
+                        .await?;
+                        self.emit_scanned_batches(scan_from, chunk_to, scanned);
+                        event!(
+                            name: "eez.l1_watcher.ring.rewind",
+                            Level::WARN,
+                            tick = tick_count,
                             old_tip_number,
                             old_tip_hash = %old_tip_hash,
-                            reorged_across_gap,
-                            "starting resumable far-behind BatchPosted scan",
+                            new_tip_number = boundary.number,
+                            new_tip_hash = %boundary.hash,
+                            "reseeding ring at chunk boundary — dropping all \
+                             prior ring entries",
                         );
-                        state.pending_catch_up = Some(PendingCatchUpScan {
-                            old_tip_number,
-                            old_tip_hash,
-                            scan_from,
-                            target_number: latest_number,
-                            target_hash: latest_hash,
-                            target_timestamp: latest.timestamp,
-                            reorged_across_gap,
-                            pending_reorg,
-                            chunks: BatchLogChunks::new(scan_from, latest_number),
-                            scanned: Vec::new(),
+                        state.rewind_to(0);
+                        state.push_canonical(boundary.number, boundary.hash);
+                        self.emit(L1Event::NewHead {
+                            block_number: boundary.number,
+                            block_hash: boundary.hash,
+                            timestamp: boundary.timestamp,
                         });
-                        self.resume_pending_catch_up(provider, state, tick_count)
-                            .await?;
                         return Ok(());
                     }
                     return Err(L1Error::ReorgTooDeep {
@@ -530,8 +551,8 @@ impl L1Watcher {
         Ok(())
     }
 
-    /// Fetches `BatchPosted` logs in `[from, to]` via the shared
-    /// chunked scanner and emits one [`L1Event::BatchPosted`] per log.
+    /// Fetches `BatchPosted` logs in `[from, to]` (winner tagging +
+    /// tx decode) and emits one [`L1Event::BatchPosted`] per log.
     async fn scan_batch_posted(
         &self,
         provider: &impl Provider,
@@ -546,134 +567,16 @@ impl L1Watcher {
             to,
             "scanning L1 range for BatchPosted logs",
         );
-        let mut chunks = BatchLogChunks::new(from, to);
-        while let Some(scanned) = self
-            .scan_next_batch_log_chunk(provider, &mut chunks)
-            .await?
-        {
-            self.emit_scanned_batches(from, to, scanned);
-        }
-        Ok(())
-    }
-
-    async fn resume_pending_catch_up(
-        &self,
-        provider: &impl Provider,
-        state: &mut WatcherState,
-        tick_count: u64,
-    ) -> L1Result<bool> {
-        let Some(pending) = state.pending_catch_up.as_ref() else {
-            return Ok(false);
-        };
-        if !catch_up_target_is_canonical(provider, pending.target_number, pending.target_hash)
-            .await?
-        {
-            let pending = state
-                .pending_catch_up
-                .take()
-                .expect("pending catch-up existed above");
-            event!(
-                name: "eez.l1_watcher.catch_up_scan.target_stale",
-                Level::WARN,
-                tick = tick_count,
-                target_number = pending.target_number,
-                target_hash = %pending.target_hash,
-                "catch-up scan target is no longer canonical; discarding scan progress",
-            );
-            return Ok(false);
-        }
-
-        loop {
-            let scanned = {
-                let pending = state
-                    .pending_catch_up
-                    .as_mut()
-                    .expect("pending catch-up exists while resuming");
-                self.scan_next_batch_log_chunk(provider, &mut pending.chunks)
-                    .await?
-            };
-            let Some(mut scanned) = scanned else {
-                break;
-            };
-            let pending = state
-                .pending_catch_up
-                .as_mut()
-                .expect("pending catch-up exists while collecting");
-            if !scanned.is_empty() {
-                event!(
-                    name: "eez.l1_watcher.catch_up_scan.chunk_found",
-                    Level::INFO,
-                    tick = tick_count,
-                    target_number = pending.target_number,
-                    count = scanned.len(),
-                    "queued BatchPosted events from catch-up scan chunk",
-                );
-            }
-            pending.scanned.append(&mut scanned);
-        }
-
-        let pending = state
-            .pending_catch_up
-            .take()
-            .expect("pending catch-up exists after scan completion");
-        if !catch_up_target_is_canonical(provider, pending.target_number, pending.target_hash)
-            .await?
-        {
-            event!(
-                name: "eez.l1_watcher.catch_up_scan.target_stale",
-                Level::WARN,
-                tick = tick_count,
-                target_number = pending.target_number,
-                target_hash = %pending.target_hash,
-                "catch-up scan target changed before completion; discarding scanned events",
-            );
-            return Ok(false);
-        }
-
-        if let Some(reorg) = pending.pending_reorg {
-            self.emit(L1Event::Reorg {
-                common_ancestor_number: reorg.common_ancestor_number,
-                common_ancestor_hash: reorg.common_ancestor_hash,
-                old_head_hash: reorg.old_head_hash,
-                new_head_number: reorg.new_head_number,
-                new_head_hash: reorg.new_head_hash,
-            });
-        }
-        self.emit_scanned_batches(pending.scan_from, pending.target_number, pending.scanned);
-
-        event!(
-            name: "eez.l1_watcher.ring.rewind",
-            Level::WARN,
-            tick = tick_count,
-            old_tip_number = pending.old_tip_number,
-            old_tip_hash = %pending.old_tip_hash,
-            new_tip_number = pending.target_number,
-            new_tip_hash = %pending.target_hash,
-            reorged_across_gap = pending.reorged_across_gap,
-            "reseeding ring at latest — dropping all prior ring entries",
-        );
-        state.rewind_to(0);
-        state.push_canonical(pending.target_number, pending.target_hash);
-        self.emit(L1Event::NewHead {
-            block_number: pending.target_number,
-            block_hash: pending.target_hash,
-            timestamp: pending.target_timestamp,
-        });
-        Ok(true)
-    }
-
-    async fn scan_next_batch_log_chunk(
-        &self,
-        provider: &impl Provider,
-        chunks: &mut BatchLogChunks,
-    ) -> L1Result<Option<Vec<ScannedBatch>>> {
-        crate::submitter::scan_next_batch_log_chunk(
+        let scanned = crate::submitter::scan_batch_logs_range(
             provider,
             self.inner.config.eez,
             self.inner.config.rollup_id,
-            chunks,
+            from,
+            to,
         )
-        .await
+        .await?;
+        self.emit_scanned_batches(from, to, scanned);
+        Ok(())
     }
 
     fn emit_scanned_batches(&self, from: u64, to: u64, scanned: Vec<ScannedBatch>) {
@@ -746,7 +649,6 @@ struct WatcherState {
     recent: VecDeque<(u64, B256)>,
     reorg_max_depth: usize,
     last_finalized_hash: Option<B256>,
-    pending_catch_up: Option<PendingCatchUpScan>,
 }
 
 impl WatcherState {
@@ -755,7 +657,6 @@ impl WatcherState {
             recent: VecDeque::with_capacity(reorg_max_depth),
             reorg_max_depth,
             last_finalized_hash: None,
-            pending_catch_up: None,
         }
     }
 
@@ -789,29 +690,6 @@ impl WatcherState {
             .find(|(_, h)| *h == hash)
             .map(|(n, _)| *n)
     }
-}
-
-#[derive(Debug)]
-struct PendingCatchUpScan {
-    old_tip_number: u64,
-    old_tip_hash: B256,
-    scan_from: u64,
-    target_number: u64,
-    target_hash: B256,
-    target_timestamp: u64,
-    reorged_across_gap: bool,
-    pending_reorg: Option<PendingReorg>,
-    chunks: BatchLogChunks,
-    scanned: Vec<ScannedBatch>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PendingReorg {
-    common_ancestor_number: u64,
-    common_ancestor_hash: B256,
-    old_head_hash: B256,
-    new_head_number: u64,
-    new_head_hash: B256,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -918,22 +796,291 @@ async fn fetch_block_by_hash(provider: &impl Provider, hash: B256) -> L1Result<B
     })
 }
 
-async fn catch_up_target_is_canonical(
-    provider: &impl Provider,
-    number: u64,
-    hash: B256,
-) -> L1Result<bool> {
-    Ok(
-        fetch_block_by_tag(provider, BlockNumberOrTag::Number(number))
-            .await?
-            .hash
-            == hash,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use alloy_transport::mock::Asserter;
+
+    fn test_watcher() -> (L1Watcher, broadcast::Receiver<L1Event>) {
+        let (event_tx, rx) = broadcast::channel(256);
+        let watcher = L1Watcher {
+            inner: std::sync::Arc::new(Inner {
+                config: L1WatcherConfig {
+                    rpc_url: "http://127.0.0.1:0".parse().expect("static url"),
+                    eez: alloy_primitives::Address::ZERO,
+                    rollup_id: 1,
+                    reorg_max_depth: 3,
+                },
+                event_tx,
+            }),
+        };
+        (watcher, rx)
+    }
+
+    fn mock_block(number: u64, hash: B256, parent: B256, ts: u64) -> alloy_rpc_types_eth::Block {
+        let mut b: alloy_rpc_types_eth::Block = alloy_rpc_types_eth::Block::default();
+        b.header.hash = hash;
+        b.header.inner.number = number;
+        b.header.inner.parent_hash = parent;
+        b.header.inner.timestamp = ts;
+        b
+    }
+
+    /// Far-behind catch-up advances the ring ONE chunk per poll cycle and
+    /// emits NewHead at the chunk boundary — not at the far target.
+    #[tokio::test]
+    async fn far_behind_catch_up_steps_one_chunk_per_tick() {
+        let (watcher, mut rx) = test_watcher();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let tip_hash = B256::with_last_byte(0xAA);
+        let latest_hash = B256::with_last_byte(0xBB);
+        let latest_parent = B256::with_last_byte(0xB0);
+        let boundary_hash = B256::with_last_byte(0xCC);
+        let mut state = WatcherState::new(3);
+        state.push_canonical(10, tip_hash);
+
+        // ── Tick 1: latest=200_000, tip=10 → far behind. Expect ONE chunk
+        // [11, 100_010] then ring reseed at the boundary.
+        // Call order: latest, 3× walk-back by hash, block #10 (canonical
+        // check), block #100_010 (chunk boundary), 2× get_logs.
+        asserter.push_success(&mock_block(200_000, latest_hash, latest_parent, 5_000));
+        asserter.push_success(&mock_block(
+            199_999,
+            latest_parent,
+            B256::with_last_byte(1),
+            4_999,
+        ));
+        asserter.push_success(&mock_block(
+            199_998,
+            B256::with_last_byte(1),
+            B256::with_last_byte(2),
+            4_998,
+        ));
+        asserter.push_success(&mock_block(
+            199_997,
+            B256::with_last_byte(2),
+            B256::with_last_byte(3),
+            4_997,
+        ));
+        asserter.push_success(&mock_block(10, tip_hash, B256::with_last_byte(9), 10));
+        asserter.push_success(&mock_block(
+            100_010,
+            boundary_hash,
+            B256::with_last_byte(4),
+            3_000,
+        ));
+        asserter.push_success(&serde_json::json!([])); // BatchPosted logs
+        asserter.push_success(&serde_json::json!([])); // winner logs
+
+        watcher
+            .poll_cycle(&provider, &mut state, 1)
+            .await
+            .expect("chunk step succeeds");
+
+        assert_eq!(
+            state.tip(),
+            Some((100_010, boundary_hash)),
+            "ring reseeds at chunk boundary"
+        );
+        match rx.try_recv().expect("one event emitted") {
+            L1Event::NewHead {
+                block_number,
+                block_hash,
+                timestamp,
+            } => {
+                assert_eq!(block_number, 100_010);
+                assert_eq!(block_hash, boundary_hash);
+                assert_eq!(timestamp, 3_000);
+            }
+            other => panic!("expected NewHead at boundary, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no further events on tick 1");
+
+        // ── Tick 2: same latest → final chunk [100_011, 200_000]. Boundary
+        // == latest, so no extra boundary fetch (shortcut path).
+        asserter.push_success(&mock_block(200_000, latest_hash, latest_parent, 5_000));
+        asserter.push_success(&mock_block(
+            199_999,
+            latest_parent,
+            B256::with_last_byte(1),
+            4_999,
+        ));
+        asserter.push_success(&mock_block(
+            199_998,
+            B256::with_last_byte(1),
+            B256::with_last_byte(2),
+            4_998,
+        ));
+        asserter.push_success(&mock_block(
+            199_997,
+            B256::with_last_byte(2),
+            B256::with_last_byte(3),
+            4_997,
+        ));
+        asserter.push_success(&mock_block(
+            100_010,
+            boundary_hash,
+            B256::with_last_byte(4),
+            3_000,
+        ));
+        asserter.push_success(&serde_json::json!([]));
+        asserter.push_success(&serde_json::json!([]));
+
+        watcher
+            .poll_cycle(&provider, &mut state, 2)
+            .await
+            .expect("final chunk succeeds");
+
+        assert_eq!(
+            state.tip(),
+            Some((200_000, latest_hash)),
+            "ring reaches latest"
+        );
+        match rx.try_recv().expect("one event emitted") {
+            L1Event::NewHead {
+                block_number,
+                block_hash,
+                ..
+            } => {
+                assert_eq!(block_number, 200_000);
+                assert_eq!(block_hash, latest_hash);
+            }
+            other => panic!("expected NewHead at latest, got {other:?}"),
+        }
+    }
+
+    /// A failed chunk scan advances nothing: ring tip unchanged, zero
+    /// events emitted. The next tick retries the same range for free.
+    #[tokio::test]
+    async fn far_behind_chunk_failure_advances_nothing() {
+        let (watcher, mut rx) = test_watcher();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let tip_hash = B256::with_last_byte(0xAA);
+        let mut state = WatcherState::new(3);
+        state.push_canonical(10, tip_hash);
+
+        asserter.push_success(&mock_block(
+            200_000,
+            B256::with_last_byte(0xBB),
+            B256::with_last_byte(0xB0),
+            5_000,
+        ));
+        asserter.push_success(&mock_block(
+            199_999,
+            B256::with_last_byte(0xB0),
+            B256::with_last_byte(1),
+            4_999,
+        ));
+        asserter.push_success(&mock_block(
+            199_998,
+            B256::with_last_byte(1),
+            B256::with_last_byte(2),
+            4_998,
+        ));
+        asserter.push_success(&mock_block(
+            199_997,
+            B256::with_last_byte(2),
+            B256::with_last_byte(3),
+            4_997,
+        ));
+        asserter.push_success(&mock_block(10, tip_hash, B256::with_last_byte(9), 10));
+        asserter.push_success(&mock_block(
+            100_010,
+            B256::with_last_byte(0xCC),
+            B256::with_last_byte(4),
+            3_000,
+        ));
+        asserter.push_failure_msg("injected: range scan failed"); // first get_logs
+
+        watcher
+            .poll_cycle(&provider, &mut state, 1)
+            .await
+            .expect_err("injected failure must propagate");
+
+        assert_eq!(
+            state.tip(),
+            Some((10, tip_hash)),
+            "tip unchanged on failure"
+        );
+        assert!(rx.try_recv().is_err(), "no events leaked on failure");
+    }
+
+    /// Old tip reorged out across the gap: the reorg tick emits exactly
+    /// one Reorg, reseeds the ring at the common ancestor, and scans
+    /// nothing — chunking resumes from the ancestor on later ticks.
+    #[tokio::test]
+    async fn far_behind_reorged_gap_emits_reorg_and_reseeds_at_ancestor() {
+        let (watcher, mut rx) = test_watcher();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let stale_tip_hash = B256::with_last_byte(0xAA);
+        let ancestor_hash = B256::with_last_byte(0x99);
+        let replaced_hash = B256::with_last_byte(0xDD);
+        let mut state = WatcherState::new(3);
+        state.push_canonical(9, ancestor_hash);
+        state.push_canonical(10, stale_tip_hash);
+
+        // latest, 3× walk-back, block #10 (≠ ring → reorged), then
+        // find_common_ancestor_by_height: #10 (mismatch), #9 (match).
+        asserter.push_success(&mock_block(
+            200_000,
+            B256::with_last_byte(0xBB),
+            B256::with_last_byte(0xB0),
+            5_000,
+        ));
+        asserter.push_success(&mock_block(
+            199_999,
+            B256::with_last_byte(0xB0),
+            B256::with_last_byte(1),
+            4_999,
+        ));
+        asserter.push_success(&mock_block(
+            199_998,
+            B256::with_last_byte(1),
+            B256::with_last_byte(2),
+            4_998,
+        ));
+        asserter.push_success(&mock_block(
+            199_997,
+            B256::with_last_byte(2),
+            B256::with_last_byte(3),
+            4_997,
+        ));
+        asserter.push_success(&mock_block(10, replaced_hash, B256::with_last_byte(9), 10));
+        asserter.push_success(&mock_block(10, replaced_hash, B256::with_last_byte(9), 10));
+        asserter.push_success(&mock_block(9, ancestor_hash, B256::with_last_byte(8), 9));
+
+        watcher
+            .poll_cycle(&provider, &mut state, 1)
+            .await
+            .expect("reorg tick succeeds");
+
+        assert_eq!(
+            state.tip(),
+            Some((9, ancestor_hash)),
+            "ring reseeds at ancestor"
+        );
+        match rx.try_recv().expect("one event emitted") {
+            L1Event::Reorg {
+                common_ancestor_number,
+                common_ancestor_hash,
+                old_head_hash,
+                ..
+            } => {
+                assert_eq!(common_ancestor_number, 9);
+                assert_eq!(common_ancestor_hash, ancestor_hash);
+                assert_eq!(old_head_hash, stale_tip_hash);
+            }
+            other => panic!("expected Reorg, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "reorg tick emits nothing else");
+    }
 
     #[test]
     fn watcher_state_seeds_empty() {

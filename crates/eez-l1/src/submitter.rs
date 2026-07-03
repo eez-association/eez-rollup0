@@ -88,7 +88,7 @@ pub struct BatchLogChunks {
 }
 
 impl BatchLogChunks {
-    pub(crate) fn new(from_block: u64, to_block: u64) -> Self {
+    fn new(from_block: u64, to_block: u64) -> Self {
         let ranges = if from_block > to_block {
             Vec::new()
         } else {
@@ -701,7 +701,7 @@ fn initial_log_scan_ranges(from_block: u64, to_block: u64) -> Vec<(u64, u64)> {
     ranges
 }
 
-pub(crate) async fn scan_next_batch_log_chunk(
+async fn scan_next_batch_log_chunk(
     provider: &impl Provider,
     eez: alloy_primitives::Address,
     rollup_id: u64,
