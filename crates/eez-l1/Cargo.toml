@@ -32,5 +32,8 @@ tokio.workspace       = true
 tracing.workspace     = true
 url.workspace         = true
 
+[dev-dependencies]
+alloy-transport = { version = "2", default-features = false }
+
 [lints]
 workspace = true

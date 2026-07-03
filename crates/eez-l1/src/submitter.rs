@@ -34,7 +34,7 @@ const TARGET_WAIT_BUDGET: Duration = Duration::from_secs(30);
 const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Initial block span for historical log scans. Wide catch-up gaps are
 /// split before hitting RPCs that reject long `eth_getLogs` ranges.
-const LOG_SCAN_CHUNK_BLOCKS: u64 = 100_000;
+pub(crate) const LOG_SCAN_CHUNK_BLOCKS: u64 = 100_000;
 
 /// L1 block offset for [`BundleTarget::NextBlock`]. slack=2 (over the
 /// minimal latest+1) gives a one-block cushion for when our local
@@ -721,7 +721,7 @@ pub(crate) async fn scan_next_batch_log_chunk(
 /// ⇔ this batch's state delta applied (winner; losers emit `BatchPosted`
 /// only). For each, decode the originating tx for the submitter, callData
 /// and our rollup's claimed state roots.
-async fn scan_batch_logs_range(
+pub(crate) async fn scan_batch_logs_range(
     provider: &impl Provider,
     eez: alloy_primitives::Address,
     rollup_id: u64,
@@ -996,6 +996,55 @@ mod tests {
         assert_eq!(
             attribute_settlement(&[B256::repeat_byte(1)], None),
             (0, None)
+        );
+    }
+
+    use super::{BatchLogChunks, scan_next_batch_log_chunk};
+    use alloy_primitives::Address;
+    use alloy_provider::ProviderBuilder;
+    use alloy_transport::mock::Asserter;
+
+    /// A failed chunk scan must NOT consume the range: the same range is
+    /// retried on the next call. A successful scan consumes exactly the
+    /// oldest range. This is the invariant the watcher's per-chunk
+    /// catch-up (and the deriver's retry loop) rely on.
+    #[tokio::test]
+    async fn failed_chunk_scan_preserves_range() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        // Two ranges: [(0, 99_999), (100_000, 150_000)] stored reversed.
+        let mut chunks = BatchLogChunks::new(0, 150_000);
+        assert_eq!(chunks.ranges.len(), 2);
+
+        // First get_logs of the oldest chunk fails.
+        asserter.push_failure_msg("injected: range scan failed");
+        let err = scan_next_batch_log_chunk(&provider, Address::ZERO, 1, &mut chunks)
+            .await
+            .expect_err("injected failure must propagate");
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+        // Range NOT consumed.
+        assert_eq!(chunks.ranges.len(), 2);
+        assert_eq!(
+            *chunks.ranges.last().expect("oldest range intact"),
+            (0, 99_999)
+        );
+
+        // Retry succeeds (BatchPosted logs + winners logs, both empty).
+        asserter.push_success(&serde_json::json!([]));
+        asserter.push_success(&serde_json::json!([]));
+        let scanned = scan_next_batch_log_chunk(&provider, Address::ZERO, 1, &mut chunks)
+            .await
+            .expect("retry succeeds")
+            .expect("chunk yielded");
+        assert!(scanned.is_empty());
+        // Exactly the oldest range consumed; newer range still queued.
+        assert_eq!(chunks.ranges.len(), 1);
+        assert_eq!(
+            *chunks.ranges.last().expect("tail range"),
+            (100_000, 150_000)
         );
     }
 }
