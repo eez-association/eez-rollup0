@@ -174,9 +174,9 @@ def run(plan, args):
     )
 
     # ── 5. Follower beacon (no validators) — drives eez-node's embedded reth ─
-    # discv5 still bans private-IP ENRs by default, so --disable-packet-filter
-    # + an explicit boot ENR / libp2p multiaddr (both from cl_context) let it
-    # peer into the enclave CL net. No scraping — these come from the output API.
+    # Peers into Pair B's CL network using the same flags ethereum-package's own
+    # CLs use (--enable-private-discovery is the load-bearing one — see below).
+    # All boot ENRs / peer-ids come from the output API, no scraping.
     plan.add_service(
         name = "eez-follower",
         config = ServiceConfig(
@@ -198,6 +198,7 @@ def run(plan, args):
                 "--boot-nodes=" + ",".join(cl_enrs),
                 "--libp2p-addresses=" + ",".join(cl_multiaddrs),
                 "--trusted-peers=" + ",".join(cl_peer_ids),
+                "--enable-private-discovery",
                 "--disable-packet-filter",
                 "--subscribe-all-subnets",
                 "--listen-address=0.0.0.0",
