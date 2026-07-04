@@ -199,6 +199,7 @@ def run(plan, args):
                 "--jwt-secrets=/jwt/jwtsecret",
                 "--boot-nodes=" + l1_cl.enr,
                 "--libp2p-addresses=" + l1_cl.multiaddr,
+                "--trusted-peers=" + l1_cl.peer_id,
                 "--disable-packet-filter",
                 "--subscribe-all-subnets",
                 "--listen-address=0.0.0.0",
