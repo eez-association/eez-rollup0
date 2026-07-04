@@ -53,10 +53,8 @@ def run(plan, args):
     # The reference L1 node = first participant (el-1 / cl-1): a validator-backed
     # reth+lighthouse pair on Pair B's chain. Distinct from eez-node's EMBEDDED
     # L1 reth — this is the external L1 the embedded one syncs against. Its enode
-    # seeds the embedded reth's RLPx backfill; its CL ENR/multiaddr seed the
-    # follower's discovery — both straight from the output API, no scraping.
+    # seeds the embedded reth's RLPx backfill — straight from the output API.
     l1_el = participants[0].el_context
-    l1_cl = participants[0].cl_context
 
     # rbuilder lives on the participant whose service name carries "builder".
     builder_el = None
@@ -197,9 +195,9 @@ def run(plan, args):
                 "--datadir=/data",
                 "--execution-endpoint=http://eez-node:{}".format(EMBEDDED_L1_ENGINE_PORT),
                 "--jwt-secrets=/jwt/jwtsecret",
-                "--boot-nodes=" + l1_cl.enr,
-                "--libp2p-addresses=" + l1_cl.multiaddr,
-                "--trusted-peers=" + l1_cl.peer_id,
+                "--boot-nodes=" + ",".join(cl_enrs),
+                "--libp2p-addresses=" + ",".join(cl_multiaddrs),
+                "--trusted-peers=" + ",".join(cl_peer_ids),
                 "--disable-packet-filter",
                 "--subscribe-all-subnets",
                 "--listen-address=0.0.0.0",
