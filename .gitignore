@@ -15,3 +15,5 @@ datadir/
 
 chiado-db*/
 data/
+chiado-l1*/
+*sandbox/

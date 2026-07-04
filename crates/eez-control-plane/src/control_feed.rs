@@ -1,0 +1,431 @@
+//! Control-plane feed server (composer → prover).
+//!
+//! The embedded driver publishes one [`ControlEvent`] per committed block
+//! through a [`ControlPublisher`], which (a) appends it to a bounded
+//! replay ring and (b) fans it out on a `broadcast` channel.
+//! `ControlFeedSvc` serves `control.v1.ControlFeed`: a subscriber with
+//! `from_block >= 1` first receives the buffered events (`block_number >=
+//! from_block`, in order), then the live stream — so a reconnecting
+//! prover resumes without a gap.
+//!
+//! Ordering is race-free by construction:
+//! - the publisher pushes to the ring BEFORE broadcasting (single
+//!   producer — the driver loop is sequential), so everything ever
+//!   broadcast is already in the ring;
+//! - a subscriber subscribes to the broadcast FIRST, then snapshots the
+//!   ring: an event published in between appears in both and is deduped
+//!   by the strictly-increasing `block_number` watermark.
+//!
+//! A subscriber that falls behind the live buffer is DISCONNECTED with
+//! `DATA_LOSS` instead of silently skipped (the old `Lagged → continue`):
+//! the prover reconnects with replay, turning the gap into recovery.
+//!
+//! Ported from based-rollup `composer-lib/src/control_feed.rs` (prover-chain
+//! P2b). The publisher is fed by the `eez-witness-feed` task (eez-node).
+
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex};
+
+use eez_control_rpc::v1::{ControlEvent, SubscribeRequest, control_feed_server::ControlFeed};
+use tokio::sync::{broadcast, mpsc};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
+use tracing::{debug, warn};
+
+/// Hard byte cap on the replay ring (witnesses of busy blocks can be MBs;
+/// the ring must remain bounded even when the prover is down or far behind).
+const RING_MAX_BYTES: usize = 1024 * 1024 * 1024;
+/// Minimum replay horizon in events. At ~1 L2 block/s this retains about 36h
+/// of empty-block control history, bounded by `RING_MAX_BYTES` for busy blocks.
+const RING_MIN_EVENTS: usize = 131_072;
+/// Retain settling events separately from the ordinary per-block ring. Archive
+/// backfill can reconstruct ordinary blocks, but it cannot reconstruct the
+/// Sync block's `composition`, so a far-behind prover must still be able to
+/// replay that exact event after the regular ring has evicted it.
+const SETTLING_RETAINED_MAX_EVENTS: usize = RING_MIN_EVENTS;
+const SETTLING_RETAINED_MAX_BYTES: usize = 512 * 1024 * 1024;
+/// Capacity of the LIVE broadcast buffer. Small on purpose: it only
+/// covers transient subscriber slowness — a subscriber that overruns it
+/// is cut with `DATA_LOSS` and recovers via replay.
+const LIVE_CAPACITY: usize = 64;
+/// Per-subscriber outbound queue (tonic boundary).
+const SUBSCRIBER_QUEUE: usize = 64;
+
+/// Publisher + bounded replay ring for the control feed.
+///
+/// The driver owns one and calls [`publish`](Self::publish) per committed
+/// block; `ControlFeedSvc` shares it to serve replays. Events are stored
+/// as `Arc` so the ring, the broadcast buffer, and every subscriber share
+/// one allocation.
+#[derive(Debug)]
+pub struct ControlPublisher {
+    ring: Mutex<Ring>,
+    tx: broadcast::Sender<Arc<ControlEvent>>,
+}
+
+#[derive(Debug)]
+struct Ring {
+    events: VecDeque<Arc<ControlEvent>>,
+    settling_events: BTreeMap<u64, Arc<ControlEvent>>,
+    bytes: usize,
+    settling_bytes: usize,
+    max_events: usize,
+}
+
+fn event_bytes(ev: &ControlEvent) -> usize {
+    let witness = ev.witness.as_ref().map_or(0, |w| {
+        w.state
+            .iter()
+            .chain(&w.codes)
+            .chain(&w.keys)
+            .chain(&w.headers)
+            .map(Vec::len)
+            .sum()
+    });
+    witness + ev.block.len()
+}
+
+impl ControlPublisher {
+    /// `blocks_per_slot` sizes the replay horizon: the ring holds at
+    /// least the last two full slots plus reconnect slack, so a prover
+    /// that reconnects within a slot or two can rebuild its window from
+    /// the window's first block.
+    #[must_use]
+    pub fn new(blocks_per_slot: u64) -> Arc<Self> {
+        // Floor the replay horizon high enough that a far-behind prover
+        // recovering a large backlog still finds its directive's SETTLING event
+        // in the ring at (re)subscribe time. A settling composition is NEVER
+        // reconstructable by archive backfill (interior blocks carry
+        // composition=None — see `backfill_block`), so once the ring evicts a
+        // dispatched window's to_block before the prover subscribes, that window
+        // can never attest. `RING_MIN_EVENTS` covers the observed 40k-50k block
+        // competition recovery window with headroom; `RING_MAX_BYTES` still
+        // bounds memory for busy blocks.
+        let max_events = usize::try_from(2 * blocks_per_slot + 8)
+            .unwrap_or(usize::MAX)
+            .max(RING_MIN_EVENTS);
+        let (tx, _) = broadcast::channel(LIVE_CAPACITY);
+        Arc::new(Self {
+            ring: Mutex::new(Ring {
+                events: VecDeque::with_capacity(max_events),
+                settling_events: BTreeMap::new(),
+                bytes: 0,
+                settling_bytes: 0,
+                max_events,
+            }),
+            tx,
+        })
+    }
+
+    /// Publish one committed block's event: ring first (unconditional —
+    /// an event must be replayable even if no subscriber is connected
+    /// yet; `broadcast::send` with zero receivers DROPS the value), then
+    /// the live fan-out.
+    pub fn publish(&self, event: ControlEvent) {
+        let event = Arc::new(event);
+        {
+            let mut ring = self.ring.lock().expect("control ring poisoned");
+            let bytes = event_bytes(&event);
+            let block_number = event.block_number;
+            let is_settling = event.composition.is_some();
+            ring.bytes += bytes;
+            ring.events.push_back(Arc::clone(&event));
+            if is_settling {
+                if let Some(old) = ring
+                    .settling_events
+                    .insert(block_number, Arc::clone(&event))
+                {
+                    ring.settling_bytes = ring.settling_bytes.saturating_sub(event_bytes(&old));
+                }
+                ring.settling_bytes += bytes;
+            } else if let Some(old) = ring.settling_events.remove(&block_number) {
+                // A reorg can reproduce a previously-settling height as a normal
+                // block. Drop the stale retained composition for that height.
+                ring.settling_bytes = ring.settling_bytes.saturating_sub(event_bytes(&old));
+            }
+            while ring.events.len() > ring.max_events
+                || (ring.bytes > RING_MAX_BYTES && ring.events.len() > 1)
+            {
+                if let Some(evicted) = ring.events.pop_front() {
+                    ring.bytes -= event_bytes(&evicted);
+                }
+            }
+            while ring.settling_events.len() > SETTLING_RETAINED_MAX_EVENTS
+                || (ring.settling_bytes > SETTLING_RETAINED_MAX_BYTES
+                    && ring.settling_events.len() > 1)
+            {
+                if let Some((_, evicted)) = ring.settling_events.pop_first() {
+                    ring.settling_bytes = ring.settling_bytes.saturating_sub(event_bytes(&evicted));
+                }
+            }
+        }
+        // No receivers → Err; fine — the event is already in the ring.
+        let _ = self.tx.send(event);
+    }
+
+    /// Snapshot of buffered events with `block_number >= from_block`,
+    /// oldest first.
+    fn snapshot_from(&self, from_block: u64) -> Vec<Arc<ControlEvent>> {
+        let mut by_number = BTreeMap::new();
+        let ring = self.ring.lock().expect("control ring poisoned");
+        for ev in ring.settling_events.range(from_block..).map(|(_, ev)| ev) {
+            by_number.insert(ev.block_number, Arc::clone(ev));
+        }
+        for ev in ring
+            .events
+            .iter()
+            .filter(|ev| ev.block_number >= from_block)
+        {
+            // Reorg recovery can re-produce the same height with a different
+            // hash. Keep the newest ring entry for each height; replaying the
+            // stale first entry splices old and new chains and makes the prover
+            // reject on parent-hash continuity. Ring entries overwrite retained
+            // settling entries at the same height because the ring is the newer
+            // canonical source while it still contains that height.
+            by_number.insert(ev.block_number, Arc::clone(ev));
+        }
+        by_number.into_values().collect()
+    }
+
+    fn subscribe_live(&self) -> broadcast::Receiver<Arc<ControlEvent>> {
+        self.tx.subscribe()
+    }
+}
+
+/// Serves `control.v1.ControlFeed`: replay (per `from_block`) + live.
+#[derive(Clone, Debug)]
+pub struct ControlFeedSvc {
+    publisher: Arc<ControlPublisher>,
+}
+
+impl ControlFeedSvc {
+    #[must_use]
+    pub fn new(publisher: Arc<ControlPublisher>) -> Self {
+        Self { publisher }
+    }
+}
+
+#[tonic::async_trait]
+impl ControlFeed for ControlFeedSvc {
+    type SubscribeStream = ReceiverStream<Result<ControlEvent, Status>>;
+
+    async fn subscribe(
+        &self,
+        req: Request<SubscribeRequest>,
+    ) -> Result<Response<Self::SubscribeStream>, Status> {
+        let from_block = req.into_inner().from_block;
+        // Subscribe FIRST, snapshot SECOND: an event published in between
+        // appears in both and is deduped by the watermark below. (The
+        // reverse order would *skip* such an event.)
+        let mut rx = self.publisher.subscribe_live();
+        let replay = if from_block == 0 {
+            Vec::new() // live-only (old-client behavior)
+        } else {
+            self.publisher.snapshot_from(from_block)
+        };
+        debug!(from_block, replay = replay.len(), "control feed subscriber");
+
+        let (out_tx, out_rx) = mpsc::channel(SUBSCRIBER_QUEUE);
+        tokio::spawn(async move {
+            // Strictly-increasing block-number watermark dedups duplicates on
+            // BOTH the replay and the live path. The driver normally emits
+            // strictly increasing numbers, but a reorg re-production can put a
+            // number in the ring twice; skipping `<= watermark` keeps a
+            // reconnecting prover's window contiguous (a repeated number would
+            // break its parent_hash/number check and churn the window).
+            let mut watermark: u64 = 0;
+            for ev in replay {
+                if ev.block_number <= watermark {
+                    continue;
+                }
+                watermark = ev.block_number;
+                if out_tx.send(Ok((*ev).clone())).await.is_err() {
+                    return;
+                }
+            }
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        if ev.block_number <= watermark {
+                            continue; // replay/live overlap duplicate
+                        }
+                        watermark = ev.block_number;
+                        if out_tx.send(Ok((*ev).clone())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // Fell behind the live buffer: cut the stream so
+                        // the subscriber reconnects WITH REPLAY instead of
+                        // silently continuing past a hole (the prover's
+                        // window would reset mid-slot and the OD-5 gate
+                        // would refuse every later settlement).
+                        warn!(missed = n, "control feed subscriber lagged; disconnecting");
+                        let _ = out_tx
+                            .send(Err(Status::data_loss(format!(
+                                "subscriber lagged {n} events behind the live buffer; \
+                                 reconnect with from_block to replay"
+                            ))))
+                            .await;
+                        return;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(out_rx)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(number: u64) -> ControlEvent {
+        ControlEvent {
+            block_hash: vec![u8::try_from(number % 256).unwrap(); 32],
+            block_number: number,
+            parent_hash: vec![u8::try_from((number - 1) % 256).unwrap(); 32],
+            composition: None,
+            witness: None,
+            block: vec![0u8; 8],
+        }
+    }
+
+    fn settling_ev(number: u64) -> ControlEvent {
+        let mut event = ev(number);
+        event.composition = Some(eez_control_rpc::v1::Composition {
+            post_batch: Some(eez_control_rpc::v1::PostBatch {
+                abi_calldata: vec![1, 2, 3],
+                rollup_id: 1,
+                current_state: vec![0x11; 32],
+                new_state: vec![0x22; 32],
+                entry_count: 1,
+                public_inputs_hash: vec![0x33; 32],
+                l1_block_hash: Vec::new(),
+            }),
+        });
+        event
+    }
+
+    #[test]
+    fn ring_keeps_newest_and_respects_event_cap() {
+        // `new(_)` floors max_events at RING_MIN_EVENTS, regardless of
+        // blocks_per_slot. Publish past the floor to force eviction and assert
+        // the ring keeps the newest RING_MIN_EVENTS.
+        let p = ControlPublisher::new(4);
+        let min_events = u64::try_from(RING_MIN_EVENTS).unwrap();
+        let total = min_events + 24;
+        for n in 1..=total {
+            p.publish(ev(n));
+        }
+        let snap = p.snapshot_from(1);
+        assert_eq!(snap.len(), RING_MIN_EVENTS);
+        assert_eq!(snap.first().unwrap().block_number, total - min_events + 1);
+        assert_eq!(snap.last().unwrap().block_number, total);
+    }
+
+    #[test]
+    fn retained_settling_event_survives_ordinary_ring_eviction() {
+        let p = ControlPublisher::new(4);
+        let min_events = u64::try_from(RING_MIN_EVENTS).unwrap();
+        p.publish(settling_ev(10));
+        let total = 10 + min_events + 24;
+        for n in 11..=total {
+            p.publish(ev(n));
+        }
+
+        let snap = p.snapshot_from(1);
+        assert_eq!(snap.first().unwrap().block_number, 10);
+        assert!(snap.first().unwrap().composition.is_some());
+        assert_eq!(
+            snap[1].block_number,
+            total - min_events + 1,
+            "ordinary ring should still start at its eviction floor"
+        );
+        assert_eq!(snap.last().unwrap().block_number, total);
+    }
+
+    #[test]
+    fn snapshot_filters_by_from_block() {
+        let p = ControlPublisher::new(4);
+        for n in 1..=10 {
+            p.publish(ev(n));
+        }
+        let snap = p.snapshot_from(7);
+        assert_eq!(
+            snap.iter().map(|e| e.block_number).collect::<Vec<_>>(),
+            vec![7, 8, 9, 10]
+        );
+    }
+
+    #[test]
+    fn replay_snapshot_keeps_latest_reorg_reproduction() {
+        let p = ControlPublisher::new(4);
+        p.publish(ev(1));
+        p.publish(ev(2));
+        p.publish(ev(3));
+
+        let mut new_2 = ev(2);
+        new_2.block_hash = vec![22u8; 32];
+        new_2.parent_hash = ev(1).block_hash;
+        let mut new_3 = ev(3);
+        new_3.block_hash = vec![33u8; 32];
+        new_3.parent_hash = new_2.block_hash.clone();
+        p.publish(new_2);
+        p.publish(new_3);
+
+        let snap = p.snapshot_from(1);
+        assert_eq!(
+            snap.iter().map(|e| e.block_number).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(snap[1].block_hash, vec![22u8; 32]);
+        assert_eq!(snap[2].parent_hash, snap[1].block_hash);
+    }
+
+    #[tokio::test]
+    async fn publish_without_subscribers_is_replayable() {
+        // The old broadcast-only feed DROPPED events sent with zero
+        // receivers; the ring must retain them for late subscribers.
+        let p = ControlPublisher::new(4);
+        p.publish(ev(1));
+        p.publish(ev(2));
+        assert_eq!(p.snapshot_from(1).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn live_after_replay_dedups_overlap() {
+        // Simulate the subscribe-then-snapshot overlap: an event that is
+        // both in the snapshot AND in the live receiver must reach the
+        // subscriber once.
+        let p = ControlPublisher::new(4);
+        p.publish(ev(1));
+        let rx = p.subscribe_live();
+        p.publish(ev(2)); // lands in BOTH the ring and rx
+        let snapshot = p.snapshot_from(1);
+        assert_eq!(snapshot.len(), 2);
+
+        // Replay phase.
+        let mut watermark = 0u64;
+        let mut delivered: Vec<u64> = Vec::new();
+        for e in snapshot {
+            watermark = e.block_number;
+            delivered.push(e.block_number);
+        }
+        // Live phase.
+        let mut rx = rx;
+        while let Ok(e) = rx.try_recv() {
+            if e.block_number <= watermark {
+                continue;
+            }
+            watermark = e.block_number;
+            delivered.push(e.block_number);
+        }
+        assert_eq!(
+            delivered,
+            vec![1, 2],
+            "overlap event must be delivered exactly once"
+        );
+    }
+}

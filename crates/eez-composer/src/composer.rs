@@ -41,6 +41,35 @@ use crate::local::build_sync_block;
 use crate::optimistic::OptimisticallyIncluded;
 use crate::rollup::RollupState;
 
+/// Outcome of `prepare_post_batch_raw`: either a ready-to-dispatch L1 tx
+/// (the synchronous mock-proof path) or a deferred settlement that must
+/// wait for the out-of-process prover's real attestation before it can be
+/// signed and posted.
+///
+/// `Ready` carries the fully-signed `postAndVerifyBatch` raw tx (EIP-2718).
+/// `Deferred` carries the assembled batch (with a placeholder/mock proof in
+/// `proofs[]` that `apply_proof` will overwrite) plus the recomputed
+/// `publicInputsHash` — the key under which the prover's signature lands in
+/// the shared `ProofStore`. Only produced when `Composer::deferred_post()`
+/// (i.e. `EEZ_PROOF_SYSTEM_KIND=real`, the real on-chain `ECDSAProofSystem`).
+enum PostBatchOutcome {
+    /// Synchronous path (mock proof system): the raw L1 tx is ready now.
+    Ready(Bytes),
+    /// Deferred path (real proof system): post fires when the prover's
+    /// attestation arrives in the `ProofStore`, keyed by `public_inputs_hash`.
+    Deferred {
+        batch: Box<eez_evm::EvmBatch>,
+        public_inputs_hash: B256,
+        /// The L1-confirmed cursor snapshot the batch's OD-5 anchor was
+        /// computed from (`stateDeltas[0].currentState = state(posted)`).
+        /// MUST be threaded to `record_posted_window` so `from_block =
+        /// posted+1` derives from the SAME snapshot as the anchor — a
+        /// catch-up burst can advance the cursor between two reads,
+        /// desyncing them and breaking the prover's OD-5 anchor check.
+        posted: u64,
+    },
+}
+
 /// Runtime config for the cross-chain execution path on Sync slots.
 /// `Composer::new` accepts `Option<Arc<CrossChainExecCtx>>`; `Some`
 /// means a wired `EvmComposer` and the keys/addresses needed to sign
@@ -219,6 +248,25 @@ struct Inner<L2: BlockReader> {
     /// uses it to reorg the L2 head when an optimistically-committed
     /// Sync block's bundle fails on L1.
     committer: std::sync::OnceLock<BlockCommitterHandle<EthEngineTypes>>,
+    /// Prover-feed PostBatch sink (P4-a): the composer inserts each settling
+    /// block's `PostBatch` keyed by Sync-block NUMBER; the witness task (eez-node)
+    /// drains it into `ControlEvent.composition`. Keyed by NUMBER — deterministic
+    /// on both sides — not hash (the committer rebuilds the block, changing its
+    /// hash). `OnceLock`-set after construction; `None` outside composer mode.
+    postbatch_sink:
+        std::sync::OnceLock<Arc<std::sync::Mutex<HashMap<u64, eez_control_rpc::v1::PostBatch>>>>,
+    /// Prover-feed RETURN store (P4-b-full): verified attestations the composer's
+    /// `ProofSink` records, keyed by publicInputsHash. Set ONLY in DEFERRED-POST
+    /// mode (`EEZ_PROOF_SYSTEM_KIND=real`): its presence switches the composer
+    /// from self-signing the mock to waiting for the prover's real signature.
+    /// `None` = synchronous mock post (unchanged).
+    proof_store: std::sync::OnceLock<eez_control_plane::proof_sink::ProofStore>,
+    /// Composer-driven prover ledger (Phase 1). Each deferred post records its
+    /// `[posted+1 .. sync_height]` window here; the `ProofSink` flips `attested`
+    /// + advances the verified frontier when the matching attestation lands. Set
+    /// only alongside `proof_store` (deferred-post). `None` = ledger off (no
+    /// behavior change).
+    posted_windows: std::sync::OnceLock<eez_control_plane::posted_windows::PostedWindows>,
 }
 
 impl<L2: BlockReader> std::fmt::Debug for Composer<L2> {
@@ -266,6 +314,9 @@ where
                 cc_exec_ctx,
                 l2_entry_client,
                 committer: std::sync::OnceLock::new(),
+                postbatch_sink: std::sync::OnceLock::new(),
+                proof_store: std::sync::OnceLock::new(),
+                posted_windows: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -276,6 +327,154 @@ where
     /// bundle failure. Second and later calls are no-ops.
     pub fn set_committer(&self, handle: BlockCommitterHandle<EthEngineTypes>) {
         let _ = self.inner.committer.set(handle);
+    }
+
+    /// Wire the prover-feed PostBatch sink (P4-a). The witness task (eez-node)
+    /// shares the same `Arc` and drains it to fill each settling block's
+    /// `ControlEvent.composition`. Called once at startup; later calls no-op.
+    pub fn set_postbatch_sink(
+        &self,
+        sink: Arc<std::sync::Mutex<HashMap<u64, eez_control_rpc::v1::PostBatch>>>,
+    ) {
+        let _ = self.inner.postbatch_sink.set(sink);
+    }
+
+    /// The registered attester address = the prover's ECDSA address, recovered
+    /// from its vkey (`bytes32(uint160(address))`). The node hands this to the
+    /// `ProofSink` so it can check each attestation recovers to this signer.
+    #[must_use]
+    pub fn prover_address(&self) -> alloy_primitives::Address {
+        alloy_primitives::Address::from_slice(&self.inner.prover.vkey()[12..])
+    }
+
+    /// Wire the prover-feed RETURN store (P4-b-full deferred post). Sharing the
+    /// same `ProofStore` the `ProofSink` fills, its presence puts the composer in
+    /// DEFERRED-POST mode: it builds + holds each settling batch and posts it only
+    /// once the prover's verified attestation lands (vs self-signing the mock).
+    /// Called once at startup. No-op if already set.
+    pub fn set_proof_store(&self, store: eez_control_plane::proof_sink::ProofStore) {
+        let _ = self.inner.proof_store.set(store);
+    }
+
+    /// `true` when the composer is in deferred-post mode (a proof store is wired).
+    #[must_use]
+    pub fn deferred_post(&self) -> bool {
+        self.inner.proof_store.get().is_some()
+    }
+
+    /// Wire the composer-driven prover ledger. Sharing the same
+    /// [`PostedWindows`](eez_control_plane::posted_windows::PostedWindows) the `ProofSink`
+    /// attests into, the composer records each deferred window it posts so the
+    /// frontier and the dispatch driver have a single source of truth. Called
+    /// once at startup alongside [`set_proof_store`](Self::set_proof_store).
+    /// No-op if already set.
+    pub fn set_posted_windows(&self, windows: eez_control_plane::posted_windows::PostedWindows) {
+        let _ = self.inner.posted_windows.set(windows);
+    }
+
+    /// Record the just-deferred `[posted+1 .. sync_height]` window in the
+    /// composer-driven ledger, if wired. Returns `false` when the L1 cursor
+    /// advanced after the batch was prepared, making the batch's anchor stale
+    /// before it can be dispatched; the caller must fail the optimistic entry so
+    /// the next slot rebuilds from the fresh cursor. Recording ONLY — the
+    /// `ProofSink` flips `attested` + advances the verified frontier when the
+    /// prover's attestation lands (keyed by `public_inputs_hash`). No-op when the
+    /// ledger is off. `current_state` is the batch's first-entry
+    /// `StateDelta.currentState` (the OD-5 anchor), a hint the prover re-derives
+    /// from `abi_calldata`.
+    ///
+    /// CONSENSUS-CRITICAL: `posted` is passed in (the SAME cursor snapshot the
+    /// caller used to compute the OD-5 anchor `state(posted)`) — it is NOT
+    /// re-read from `l1_head.cursor()` here. A catch-up burst can advance the
+    /// cursor between two reads, so the anchor and `from_block` would desync
+    /// (anchor = `state(posted_early)` but `from_block = posted_late+1`),
+    /// breaking the prover's OD-5 anchor check and halting settlement.
+    fn record_posted_window(
+        &self,
+        rollup_id: u64,
+        sync_height: u64,
+        batch: &eez_evm::EvmBatch,
+        public_inputs_hash: B256,
+        posted: u64,
+    ) -> bool {
+        let Some(windows) = self.inner.posted_windows.get() else {
+            return true;
+        };
+        let Some(rollup) = self.inner.rollups.get(&rollup_id) else {
+            event!(
+                name: "eez.composer.posted_window.unknown_rollup",
+                Level::ERROR,
+                rollup_id,
+                sync_height,
+                "cannot record deferred window for unknown rollup",
+            );
+            return false;
+        };
+        let latest_cursor = rollup.l1_head.cursor();
+        if latest_cursor > posted {
+            event!(
+                name: "eez.composer.posted_window.stale_before_spawn",
+                Level::WARN,
+                rollup_id,
+                sync_height,
+                posted,
+                latest_cursor,
+                public_inputs_hash = %public_inputs_hash,
+                "L1 cursor advanced after postBatch preparation; refusing stale deferred window so the next slot rebuilds",
+            );
+            return false;
+        }
+        let post_batch = eez_control_plane::post_batch_msg::build_post_batch_msg(
+            batch,
+            self.inner.prover.vkey(),
+            None,
+        );
+        let current_state = batch
+            .inner
+            .entries
+            .first()
+            .and_then(|e| e.stateDeltas.first())
+            .map_or(B256::ZERO, |d| d.currentState);
+        windows.record_posted(eez_control_plane::posted_windows::PostedWindow {
+            from_block: posted.saturating_add(1),
+            to_block: sync_height,
+            rollup_id,
+            public_inputs_hash,
+            current_state,
+            post_batch: Some(post_batch),
+            attested: false,
+            fast_forwarded: false,
+            pending_l1: false,
+        });
+        true
+    }
+
+    /// Remove a deferred posted-window entry that never reached L1 submission
+    /// (the deferred task abandoned it — timeout, no store/ctx, finalize
+    /// failure, or recovery raced ahead). Keyed by `sync_height` (== `to_block`).
+    /// No-op when the ledger is off.
+    fn abandon_unsubmitted_window(
+        &self,
+        rollup_id: u64,
+        sync_height: u64,
+        public_inputs_hash: B256,
+        reason: &'static str,
+    ) {
+        let Some(windows) = self.inner.posted_windows.get() else {
+            return;
+        };
+        if let Some(window) = windows.abandon_unsubmitted(sync_height) {
+            event!(
+                name: "eez.composer.posted_window.abandoned_unsubmitted",
+                Level::WARN,
+                rollup_id,
+                sync_height,
+                reason,
+                public_inputs_hash = %public_inputs_hash,
+                window_public_inputs_hash = %window.public_inputs_hash,
+                "removed deferred posted-window entry before L1 submission",
+            );
+        }
     }
 
     /// Run loop. Drains the `L1Watcher` broadcast: logs own/external
@@ -370,6 +569,38 @@ where
                         );
                     }
                 }
+                // Composer-driven: a confirmed batch advanced the L1 cursor (the
+                // Deriver already appended it before this event fires). Advance
+                // the verified frontier to the cursor — every window at or below
+                // it SETTLED on L1, which required `ECDSAProofSystem.verify` (the
+                // attester's signature), so it is verified by transitivity THROUGH
+                // L1 even without a returned attestation. This stops the driven
+                // prover re-verifying confirmed windows and lets it skip a
+                // settled-but-ring-evicted gap. `mark_settled_on_l1` is monotone
+                // (reorg-safe). No-op when the ledger is off (self-sign). Fires on
+                // ANY confirmed batch (ours or external — the cursor advances by
+                // transitivity regardless of who posted).
+                if let Some(windows) = self.posted_windows.get() {
+                    for (rollup_id, rollup) in &self.rollups {
+                        let cursor = rollup.l1_head.cursor();
+                        let update = windows.mark_settled_on_l1(*rollup_id, cursor);
+                        for stale in update.pruned_straddlers {
+                            if let Some(owner) = self.rollups.get(&stale.rollup_id) {
+                                owner.optimistic.mark_failed(stale.to_block, false);
+                            }
+                            event!(
+                                name: "eez.composer.posted_window.stale_l1_cursor",
+                                Level::WARN,
+                                rollup_id = stale.rollup_id,
+                                sync_height = stale.to_block,
+                                from_block = stale.from_block,
+                                l1_cursor = cursor,
+                                public_inputs_hash = %stale.public_inputs_hash,
+                                "posted window straddles an L1-confirmed cursor; marking optimistic entry failed for recovery",
+                            );
+                        }
+                    }
+                }
             }
             Ok(L1Event::Reorg {
                 common_ancestor_number,
@@ -386,6 +617,15 @@ where
                         .l1_head
                         .highest_l2_at_or_below_l1(*common_ancestor_number)
                         .unwrap_or(0);
+                    // Composer-driven REORG SAFETY: demote any verified/pending
+                    // window above the retreated cursor back to dispatchable, so
+                    // the reorged-out range is RE-VERIFIED before it can re-settle
+                    // — else monotone `mark_settled_on_l1` leaves it falsely
+                    // resolved (a coverage hole). Same `new_cursor` basis as the
+                    // optimistic re-queue; runs even when `txs` is empty below.
+                    if let Some(windows) = self.posted_windows.get() {
+                        windows.demote_above_cursor(new_cursor);
+                    }
                     let txs = rollup.optimistic.take_rolled_out(new_cursor);
                     if txs.is_empty() {
                         continue;
@@ -1452,7 +1692,7 @@ where
         // (only the system/load txs are). Empty for inbound-only.
         let outbound_user_txs: Vec<Bytes> =
             pairs.iter().filter_map(|p| p.user_tx.clone()).collect();
-        let postbatch_raw = match self
+        let outcome = match self
             .prepare_post_batch_raw(
                 ctx,
                 rollup_id,
@@ -1464,7 +1704,7 @@ where
             )
             .await
         {
-            Ok(r) => r,
+            Ok(o) => o,
             Err(e) => {
                 event!(
                     name: "eez.composer.phase2.prepare_failed",
@@ -1496,46 +1736,118 @@ where
 
         // ── Dispatch: rich bundle [postBatch, ...survivors], commit. ──
         let sync_height = built.header.number();
-        // keccak of the raw EIP-2718 envelope IS the typed tx's hash —
-        // recorded in the ledger so the finality audit can look up the
-        // postBatch receipt.
-        let post_batch_hash = alloy_primitives::keccak256(&postbatch_raw);
-        let mut bundle: Vec<Bytes> = Vec::with_capacity(1 + survivors.len());
-        bundle.push(postbatch_raw);
-        // Only INBOUND survivors ride the L1 bundle (L1-signed, execute on L1).
-        // Outbound survivors are L2-signed — they run in the L2 Sync block + DA,
-        // never the L1 bundle (an L2 tx is invalid on L1).
-        bundle.extend(
-            survivors
-                .iter()
-                .filter(|h| h.direction == Direction::Inbound)
-                .map(|h| h.raw_tx.clone()),
-        );
-        event!(
-            name: "eez.composer.bundle.dispatched",
-            Level::INFO,
-            rollup_id,
-            sync_height,
-            tx_count = bundle.len(),
-            entry_count = total_entries,
-            evicted_poison = poison.len(),
-            "rich bundle dispatched to background observer; committing Sync block optimistically",
-        );
-        rollup.optimistic.begin(
-            sync_height,
-            post_batch_hash,
-            parent_header.clone(),
-            survivors,
-        );
-        self.spawn_bundle_observer(
-            ctx,
-            rollup_id,
-            sync_height,
-            bundle,
-            built.header.state_root(),
-            Arc::clone(&rollup.optimistic),
-            bundle_target,
-        );
+        match outcome {
+            PostBatchOutcome::Ready(postbatch_raw) => {
+                // keccak of the raw EIP-2718 envelope IS the typed tx's hash —
+                // recorded in the ledger so the finality audit can look up the
+                // postBatch receipt.
+                let post_batch_hash = alloy_primitives::keccak256(&postbatch_raw);
+                let mut bundle: Vec<Bytes> = Vec::with_capacity(1 + survivors.len());
+                bundle.push(postbatch_raw);
+                // Only INBOUND survivors ride the L1 bundle (L1-signed, execute on
+                // L1). Outbound survivors are L2-signed — they run in the L2 Sync
+                // block + DA, never the L1 bundle (an L2 tx is invalid on L1).
+                bundle.extend(
+                    survivors
+                        .iter()
+                        .filter(|h| h.direction == Direction::Inbound)
+                        .map(|h| h.raw_tx.clone()),
+                );
+                event!(
+                    name: "eez.composer.bundle.dispatched",
+                    Level::INFO,
+                    rollup_id,
+                    sync_height,
+                    tx_count = bundle.len(),
+                    entry_count = total_entries,
+                    evicted_poison = poison.len(),
+                    "rich bundle dispatched to background observer; committing Sync block optimistically",
+                );
+                rollup.optimistic.begin(
+                    sync_height,
+                    post_batch_hash,
+                    parent_header.clone(),
+                    survivors,
+                );
+                self.spawn_bundle_observer(
+                    ctx,
+                    rollup_id,
+                    sync_height,
+                    bundle,
+                    built.header.state_root(),
+                    Arc::clone(&rollup.optimistic),
+                    bundle_target,
+                );
+            }
+            PostBatchOutcome::Deferred {
+                batch,
+                public_inputs_hash,
+                posted,
+            } => {
+                // Real proof system: the post fires when the prover attests. The
+                // Sync block still commits now (L2 cadence is unconditional); the
+                // deferred task signs + dispatches the bundle once the attestation
+                // lands in the ProofStore.
+                //
+                // Register the one-in-flight gate SYNCHRONOUSLY here — exactly like
+                // the Ready arm — BEFORE returning the committed block, with a
+                // placeholder postBatch hash the deferred task fills once it signs.
+                // This (a) holds the `survivors` in the ledger for recovery, and
+                // (b) closes `blocking_height` before the next Sync slot runs, so
+                // at most one deferred post is in flight per rollup. Without it, two
+                // settling slots within the proof window would both anchor
+                // `currentState` to the same frozen cursor and the second would
+                // revert StateRootMismatch on L1. The raw envelopes go to the task
+                // for the bundle; the owning `HeldTx`s stay in the ledger for
+                // `take_failed_for_recovery`. Bundle is inbound-only (outbound
+                // survivors run in the L2 block + DA, never the L1 bundle); the
+                // full `survivors` still go to the optimistic ledger for recovery.
+                let survivor_raws: Vec<Bytes> = survivors
+                    .iter()
+                    .filter(|h| h.direction == Direction::Inbound)
+                    .map(|h| h.raw_tx.clone())
+                    .collect();
+                event!(
+                    name: "eez.composer.deferred.armed",
+                    Level::INFO,
+                    rollup_id,
+                    sync_height,
+                    entry_count = total_entries,
+                    evicted_poison = poison.len(),
+                    public_inputs_hash = %public_inputs_hash,
+                    "deferred post armed; gate closed, awaiting prover attestation; committing Sync block optimistically",
+                );
+                rollup.optimistic.begin(
+                    sync_height,
+                    B256::ZERO, // placeholder; spawn_deferred_post fills the real hash on sign
+                    parent_header.clone(),
+                    survivors,
+                );
+                // Record this window in the composer-driven ledger BEFORE `*batch`
+                // is moved into the deferred task.
+                let recorded = self.record_posted_window(
+                    rollup_id,
+                    sync_height,
+                    &batch,
+                    public_inputs_hash,
+                    posted,
+                );
+                if recorded {
+                    self.spawn_deferred_post(
+                        rollup_id,
+                        sync_height,
+                        posted,
+                        *batch,
+                        public_inputs_hash,
+                        survivor_raws,
+                        built.header.state_root(),
+                        Arc::clone(&rollup.optimistic),
+                    );
+                } else {
+                    rollup.optimistic.mark_failed(sync_height, false);
+                }
+            }
+        }
         Ok(Some(SyncSlotBlock {
             payload: built.payload,
             header: built.header,
@@ -1570,7 +1882,7 @@ where
         )
         .map_err(|e| format!("build_sync_block (empty): {e}"))?;
 
-        let minimal_postbatch_raw = match self
+        let outcome = match self
             .prepare_post_batch_raw(
                 ctx,
                 rollup_id,
@@ -1582,7 +1894,7 @@ where
             )
             .await
         {
-            Ok(raw) => raw,
+            Ok(o) => o,
             Err(err) => {
                 event!(
                     name: "eez.composer.phase1.prepare_failed",
@@ -1598,32 +1910,83 @@ where
             }
         };
         let sync_height = empty_built.header.number();
-        // keccak of the raw EIP-2718 envelope IS the typed tx's hash —
-        // recorded in the ledger so the finality audit can look up the
-        // postBatch receipt.
-        let post_batch_hash = alloy_primitives::keccak256(&minimal_postbatch_raw);
-        event!(
-            name: "eez.composer.phase1.bundle.dispatched",
-            Level::INFO,
-            rollup_id,
-            sync_height,
-            "minimal postBatch dispatched to background observer (leading immediate only)",
-        );
-        rollup.optimistic.begin(
-            sync_height,
-            post_batch_hash,
-            parent_header.clone(),
-            Vec::new(),
-        );
-        self.spawn_bundle_observer(
-            ctx,
-            rollup_id,
-            sync_height,
-            vec![minimal_postbatch_raw],
-            empty_built.header.state_root(),
-            Arc::clone(&rollup.optimistic),
-            bundle_target,
-        );
+        match outcome {
+            PostBatchOutcome::Ready(minimal_postbatch_raw) => {
+                // keccak of the raw EIP-2718 envelope IS the typed tx's hash —
+                // recorded in the ledger so the finality audit can look up the
+                // postBatch receipt.
+                let post_batch_hash = alloy_primitives::keccak256(&minimal_postbatch_raw);
+                event!(
+                    name: "eez.composer.phase1.bundle.dispatched",
+                    Level::INFO,
+                    rollup_id,
+                    sync_height,
+                    "minimal postBatch dispatched to background observer (leading immediate only)",
+                );
+                rollup.optimistic.begin(
+                    sync_height,
+                    post_batch_hash,
+                    parent_header.clone(),
+                    Vec::new(),
+                );
+                self.spawn_bundle_observer(
+                    ctx,
+                    rollup_id,
+                    sync_height,
+                    vec![minimal_postbatch_raw],
+                    empty_built.header.state_root(),
+                    Arc::clone(&rollup.optimistic),
+                    bundle_target,
+                );
+            }
+            PostBatchOutcome::Deferred {
+                batch,
+                public_inputs_hash,
+                posted,
+            } => {
+                // Register the one-in-flight gate SYNCHRONOUSLY (placeholder hash,
+                // no survivors for an empty slot) so the next slot blocks until
+                // this deferred post resolves — see the rich arm + the
+                // `spawn_deferred_post` gate-invariant doc.
+                event!(
+                    name: "eez.composer.phase1.deferred.armed",
+                    Level::INFO,
+                    rollup_id,
+                    sync_height,
+                    public_inputs_hash = %public_inputs_hash,
+                    "minimal postBatch deferred; gate closed, awaiting prover attestation (leading immediate only)",
+                );
+                rollup.optimistic.begin(
+                    sync_height,
+                    B256::ZERO, // placeholder; spawn_deferred_post fills the real hash on sign
+                    parent_header.clone(),
+                    Vec::new(),
+                );
+                // Record this window in the composer-driven ledger BEFORE `*batch`
+                // is moved into the deferred task.
+                let recorded = self.record_posted_window(
+                    rollup_id,
+                    sync_height,
+                    &batch,
+                    public_inputs_hash,
+                    posted,
+                );
+                if recorded {
+                    self.spawn_deferred_post(
+                        rollup_id,
+                        sync_height,
+                        posted,
+                        *batch,
+                        public_inputs_hash,
+                        Vec::new(),
+                        empty_built.header.state_root(),
+                        Arc::clone(&rollup.optimistic),
+                    );
+                } else {
+                    rollup.optimistic.mark_failed(sync_height, false);
+                }
+            }
+        }
         Ok(Some(SyncSlotBlock {
             payload: empty_built.payload,
             header: empty_built.header,
@@ -1655,6 +2018,240 @@ where
             submitter,
             target,
         ));
+    }
+
+    /// Deferred-post dispatch (real proof system). The settling block has
+    /// already committed; this task waits for the out-of-process prover to
+    /// attest the `publicInputsHash` — its ECDSA signature lands in the shared
+    /// `ProofStore` via `ProofSinkSvc::with_store` — then fills `batch.proofs[]`
+    /// with that real attestation, signs the `postAndVerifyBatch` L1 tx via the
+    /// shared `finalize_post_batch_tx` seam, and dispatches the optimistic bundle
+    /// exactly like the synchronous path.
+    ///
+    /// **Gate invariant (consensus-critical).** The caller has ALREADY registered
+    /// this height in the optimistic ledger (`optimistic.begin`, SYNCHRONOUSLY at
+    /// slot time, holding the `HeldTx` survivors for recovery) — so the
+    /// one-in-flight gate (`blocking_height`) is closed before the next Sync slot
+    /// runs and only ONE deferred post can be in flight per rollup. This task
+    /// therefore NEVER calls `begin`; it only resolves the pre-registered entry:
+    /// - success → `set_post_batch_hash` (real hash) + dispatch the observer,
+    ///   which marks it Settled/Failed;
+    /// - timeout / no-store / no-ctx / finalize-failure → `mark_failed`, so the
+    ///   next slot's `take_failed_for_recovery` reorgs the abandoned Sync block
+    ///   out and re-queues the survivors. Abandoning WITHOUT `mark_failed` would
+    ///   leave the entry Pending forever → permanent emission livelock.
+    ///
+    /// `survivor_raws` are just the raw user-tx envelopes for the bundle; the
+    /// owning `HeldTx`s live in the ledger entry (for recovery).
+    ///
+    /// The wait is bounded and scales with the backlog width so a settlement-
+    /// freeze catch-up burst does not time out mid-backfill.
+    fn spawn_deferred_post(
+        &self,
+        rollup_id: u64,
+        sync_height: u64,
+        posted: u64,
+        mut batch: eez_evm::EvmBatch,
+        public_inputs_hash: B256,
+        survivor_raws: Vec<Bytes>,
+        expected_final_state: B256,
+        optimistic: Arc<OptimisticallyIncluded>,
+    ) {
+        // Clone the `Arc<Inner>` directly rather than `self.clone()`: the derived
+        // `Clone` carries a spurious `L2: Clone` bound, so `self.clone()` would
+        // clone the `&self` reference (which can't escape into the task).
+        let this = Self {
+            inner: Arc::clone(&self.inner),
+        };
+        let store = self.inner.proof_store.get().cloned();
+        tokio::spawn(async move {
+            let Some(store) = store else {
+                event!(
+                    name: "eez.composer.deferred.no_store",
+                    Level::ERROR,
+                    rollup_id,
+                    sync_height,
+                    "deferred post spawned without a proof store — abandoning; marking failed for recovery",
+                );
+                this.abandon_unsubmitted_window(
+                    rollup_id,
+                    sync_height,
+                    public_inputs_hash,
+                    "no_store",
+                );
+                optimistic.mark_failed(sync_height, false);
+                return;
+            };
+
+            // Poll the ProofStore for the prover's attestation (keyed by the
+            // recomputed publicInputsHash). The ProofSink only records a signature
+            // AFTER it has verified ecrecover == the registered attester, so any
+            // entry here is already trustworthy. Scale the wait with the backlog
+            // width: after a settlement freeze the prover must RECONSTRUCT the
+            // witnesses for a large `[posted+1 .. sync_height]` backlog from the L2
+            // archive, and timing out before the backfill finishes would livelock
+            // (`posted` never advances). Budget a 30s base + ~400ms/block, each
+            // poll 200ms, capped at 8h.
+            let backlog = sync_height.saturating_sub(posted);
+            const DEFERRED_PROOF_POLL_MS: u64 = 200;
+            const MAX_DEFERRED_PROOF_POLLS: u64 = 144_000; // 8h
+            let uncapped_polls = 150u64.saturating_add(backlog.saturating_mul(2));
+            let max_polls = uncapped_polls.min(MAX_DEFERRED_PROOF_POLLS);
+            event!(
+                name: "eez.composer.deferred.wait_budget",
+                Level::INFO,
+                rollup_id,
+                sync_height,
+                posted,
+                backlog,
+                wait_secs = max_polls.saturating_mul(DEFERRED_PROOF_POLL_MS) / 1_000,
+                capped = max_polls < uncapped_polls,
+                "deferred post waiting for prover attestation",
+            );
+            let mut sig = None;
+            for _ in 0..max_polls {
+                if !optimistic.is_pending(sync_height) {
+                    event!(
+                        name: "eez.composer.deferred.abandoned",
+                        Level::WARN,
+                        rollup_id,
+                        sync_height,
+                        public_inputs_hash = %public_inputs_hash,
+                        "deferred post abandoned by recovery before attestation arrived; dropping task",
+                    );
+                    this.abandon_unsubmitted_window(
+                        rollup_id,
+                        sync_height,
+                        public_inputs_hash,
+                        "abandoned_before_attestation",
+                    );
+                    return;
+                }
+                if let Some(s) = store
+                    .lock()
+                    .ok()
+                    .and_then(|mut m| m.remove(&public_inputs_hash))
+                {
+                    sig = Some(s);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(DEFERRED_PROOF_POLL_MS)).await;
+            }
+            let Some(sig) = sig else {
+                event!(
+                    name: "eez.composer.deferred.timeout",
+                    Level::ERROR,
+                    rollup_id,
+                    sync_height,
+                    public_inputs_hash = %public_inputs_hash,
+                    "deferred post timed out waiting for prover attestation — marking failed; next slot recovers",
+                );
+                this.abandon_unsubmitted_window(
+                    rollup_id,
+                    sync_height,
+                    public_inputs_hash,
+                    "timeout",
+                );
+                optimistic.mark_failed(sync_height, false);
+                return;
+            };
+            if !optimistic.is_pending(sync_height) {
+                event!(
+                    name: "eez.composer.deferred.late_proof_abandoned",
+                    Level::WARN,
+                    rollup_id,
+                    sync_height,
+                    public_inputs_hash = %public_inputs_hash,
+                    "deferred proof arrived after recovery abandoned the window; not submitting stale postBatch",
+                );
+                this.abandon_unsubmitted_window(
+                    rollup_id,
+                    sync_height,
+                    public_inputs_hash,
+                    "late_proof_abandoned",
+                );
+                return;
+            }
+
+            // Fill the real attestation: the mock signature placed in `proofs[]` at
+            // prepare time is overwritten by the prover's ECDSA signature over the
+            // publicInputsHash, which is what the on-chain `ECDSAProofSystem.verify`
+            // recovers.
+            batch.inner.proofs = vec![sig];
+
+            let Some(ctx) = this.inner.cc_exec_ctx.clone() else {
+                event!(
+                    name: "eez.composer.deferred.no_ctx",
+                    Level::ERROR,
+                    rollup_id,
+                    sync_height,
+                    "deferred post has no cross-chain exec ctx — abandoning; marking failed for recovery",
+                );
+                this.abandon_unsubmitted_window(
+                    rollup_id,
+                    sync_height,
+                    public_inputs_hash,
+                    "no_ctx",
+                );
+                optimistic.mark_failed(sync_height, false);
+                return;
+            };
+
+            match this.finalize_post_batch_tx(&batch, ctx.as_ref()).await {
+                Ok(raw) => {
+                    let post_batch_hash = alloy_primitives::keccak256(&raw);
+                    let mut bundle: Vec<Bytes> = Vec::with_capacity(1 + survivor_raws.len());
+                    bundle.push(raw);
+                    bundle.extend(survivor_raws);
+                    event!(
+                        name: "eez.composer.deferred.dispatched",
+                        Level::INFO,
+                        rollup_id,
+                        sync_height,
+                        tx_count = bundle.len(),
+                        public_inputs_hash = %public_inputs_hash,
+                        "deferred post: prover attestation applied, dispatching bundle to background observer",
+                    );
+                    // Fill the real postBatch hash into the gate entry the caller
+                    // pre-registered at slot time; the observer (spawned next) flips
+                    // it Pending→Settled/Failed.
+                    optimistic.set_post_batch_hash(sync_height, post_batch_hash);
+                    // Composer-driven: this window is now ATTESTED + SUBMITTED to L1
+                    // (the bundle is in flight). Mark it pending so the dispatch
+                    // STOPS re-issuing its directive; it resolves on L1 confirm
+                    // (mark_settled_on_l1) or is demoted on an L1 reorg.
+                    if let Some(windows) = this.inner.posted_windows.get() {
+                        windows.mark_deferred_pending(public_inputs_hash);
+                    }
+                    this.spawn_bundle_observer(
+                        ctx.as_ref(),
+                        rollup_id,
+                        sync_height,
+                        bundle,
+                        expected_final_state,
+                        optimistic,
+                        BundleTarget::NextBlock,
+                    );
+                }
+                Err(e) => {
+                    event!(
+                        name: "eez.composer.deferred.finalize_failed",
+                        Level::ERROR,
+                        rollup_id,
+                        sync_height,
+                        error = %e,
+                        "deferred post: finalize_post_batch_tx failed — marking failed; next slot recovers",
+                    );
+                    this.abandon_unsubmitted_window(
+                        rollup_id,
+                        sync_height,
+                        public_inputs_hash,
+                        "finalize_failed",
+                    );
+                    optimistic.mark_failed(sync_height, false);
+                }
+            }
+        });
     }
 
     /// Build + sign the L1 `postBatch` raw tx for a Sync slot's
@@ -1691,9 +2288,8 @@ where
         sync_block_state_root: B256,
         outbound_entries: &[eez_evm::types::ExecutionEntrySol],
         outbound_user_txs: &[Bytes],
-    ) -> Result<Bytes, String> {
-        use alloy_sol_types::SolCall;
-        use eez_evm::types::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
+    ) -> Result<PostBatchOutcome, String> {
+        use eez_evm::types::RollupIdWithProofSystemsSol;
 
         // Empty compositions is a VALID case: an empty HeldPool Sync
         // slot still emits a postBatch carrying just the leading
@@ -2044,6 +2640,69 @@ where
         let payload = eez_payload_codec::encode(&blocks, &l2_entries_bytes)
             .map_err(|e| format!("eez_payload_codec::encode: {e}"))?;
         batch.inner.callData = alloy_primitives::Bytes::from(payload);
+
+        // Prover-feed (P4-a): hand the settling block's PostBatch to the witness
+        // task so it rides this Sync block's `ControlEvent.composition`. Keyed by
+        // the Sync block NUMBER (deterministic on both sides). Best-effort — the
+        // sink is `None` outside composer-mode, and `build_post_batch_msg` clears
+        // `proofs[]` (the prover fills them after attesting).
+        if let Some(sink) = self.inner.postbatch_sink.get() {
+            let pb = eez_control_plane::post_batch_msg::build_post_batch_msg(
+                &batch,
+                self.inner.prover.vkey(),
+                None,
+            );
+            if let Ok(mut map) = sink.lock() {
+                map.insert(sync_block_number, pb);
+            }
+        }
+
+        // Deferred path (real proof system): the postBatch can't be signed yet —
+        // its `proofs[]` must carry the prover's ECDSA attestation over the
+        // publicInputsHash, which arrives out-of-process AFTER this block commits.
+        // Recompute the hash now (the key the prover's signature lands under in the
+        // ProofStore) and hand the assembled batch to the caller, who spawns the
+        // deferred-dispatch task. KEEP the mock proof already set in `proofs[]`
+        // above — it's harmlessly overwritten by the attestation, and
+        // `public_inputs_hashes` ignores `proofs[]`. FAIL CLOSED: any error or an
+        // empty result returns Err (never a zero hash).
+        if self.deferred_post() {
+            let public_inputs_hash = eez_evm::public_inputs::public_inputs_hashes(
+                &batch,
+                self.inner.prover.vkey(),
+                None,
+            )
+            .map_err(|e| format!("public_inputs_hashes (deferred): {e}"))?
+            .first()
+            .copied()
+            .ok_or("public_inputs_hashes returned no hashes (deferred)")?;
+            return Ok(PostBatchOutcome::Deferred {
+                batch: Box::new(batch),
+                public_inputs_hash,
+                posted,
+            });
+        }
+
+        // Synchronous path (mock proof system): encode + sign via the shared seam
+        // now. The deferred path reuses the SAME seam after filling proofs[] from
+        // the prover's real attestation.
+        Ok(PostBatchOutcome::Ready(
+            self.finalize_post_batch_tx(&batch, ctx).await?,
+        ))
+    }
+
+    /// Encode the FILLED batch (entries + callData + `proofs[]` all set) as
+    /// `EEZ.postAndVerifyBatch` calldata and sign the L1 postBatch tx — the seam
+    /// the deferred post reuses: build the batch once, fill `proofs[]` from the
+    /// prover's attestation when it arrives, then call this to produce the raw L1
+    /// tx.
+    async fn finalize_post_batch_tx(
+        &self,
+        batch: &eez_evm::EvmBatch,
+        ctx: &CrossChainExecCtx,
+    ) -> Result<Bytes, String> {
+        use alloy_sol_types::SolCall as _;
+        use eez_evm::types::postAndVerifyBatchCall;
 
         let calldata = postAndVerifyBatchCall {
             batch: batch.inner.clone(),

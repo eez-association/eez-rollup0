@@ -13,6 +13,7 @@
 FROM rust:1.94-bookworm AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
         clang libclang-dev pkg-config cmake libssl-dev git ca-certificates \
+        protobuf-compiler \
     && rm -rf /var/lib/apt/lists/* \
     && cargo install cargo-chef --locked
 WORKDIR /build
@@ -31,7 +32,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # Workspace sources; only this layer rebuilds on first-party code changes.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release -p eez-node \
+RUN cargo build --release -p eez-node --features fault-inject \
     && strip target/release/eez-node
 
 # ── runtime: slim image with just the binary + L2 genesis ────────────

@@ -11,18 +11,26 @@ description            = "Engine-API consumer that drives a reth node to produce
 reth-chainspec.workspace                  = true
 reth-engine-primitives.workspace          = true
 reth-ethereum-engine-primitives.workspace = true
+reth-ethereum-primitives.workspace        = true
+reth-evm.workspace                        = true
 reth-payload-builder.workspace            = true
 reth-payload-primitives.workspace         = true
 reth-primitives-traits.workspace          = true
+# `witness` feature gates ExecutionWitnessRecord::into_execution_witness,
+# used by the per-block witness re-exec (witness.rs, prover feed).
+reth-revm                                 = { workspace = true, features = ["witness"] }
 reth-storage-api.workspace                = true
+reth-trie.workspace                       = true
 
 # alloy
 alloy-consensus.workspace        = true
 alloy-primitives.workspace       = true
+alloy-rpc-types-debug.workspace  = true
 alloy-rpc-types-engine.workspace = true
 
 # async + diagnostics
 async-trait.workspace = true
+eyre.workspace        = true
 tokio.workspace       = true
 tracing.workspace     = true
 

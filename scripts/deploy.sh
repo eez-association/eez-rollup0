@@ -103,13 +103,30 @@ EEZ_REGISTRY_DEPLOY_BLOCK="$(cast block-number --rpc-url "$EEZ_L1_RPC_URL")"
 echo "      EEZ        = $EEZ_REGISTRY_ADDRESS"
 echo "      deployBlock= $EEZ_REGISTRY_DEPLOY_BLOCK"
 
-# ── 2/4 DeployMockECDSAProofSystem ──────────────────────────────────
-echo "[2/4] DeployMockECDSAProofSystem(authorizedSigner=$AUTHORIZED_SIGNER)"
-run_forge "DeployMockECDSAProofSystem" forge script script/DeployMockECDSAProofSystem.s.sol:DeployMockECDSAProofSystem \
-    --sig "run(address)" "$AUTHORIZED_SIGNER" $RPC $KEY --broadcast
-EEZ_MOCK_PROOF_SYSTEM_ADDRESS="$(extract MOCK_PS "$OUT")"
-[[ -n "$EEZ_MOCK_PROOF_SYSTEM_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture MOCK_PS address" >&2; exit 1; }
-echo "      MOCK_PS    = $EEZ_MOCK_PROOF_SYSTEM_ADDRESS"
+# ── 2/4 Proof system ────────────────────────────────────────────────
+# EEZ_PROOF_SYSTEM=mock (dev: recovers over a FIXED digest) | real (the
+# ECDSAProofSystem that recovers over the ACTUAL publicInputsHash — the
+# out-of-process prover `eez-proverd` signs exactly that).
+EEZ_PROOF_SYSTEM="${EEZ_PROOF_SYSTEM:-mock}"
+if [[ "$EEZ_PROOF_SYSTEM" == "real" ]]; then
+    echo "[2/4] DeployECDSAProofSystem (REAL — owner=$OWNER signer=$AUTHORIZED_SIGNER)"
+    run_forge "DeployECDSAProofSystem" forge script script/DeployECDSAProofSystem.s.sol:DeployECDSAProofSystem \
+        --sig "run(address,address)" "$OWNER" "$AUTHORIZED_SIGNER" $RPC $KEY --broadcast
+    PROOF_SYSTEM_ADDRESS="$(extract ECDSA_PS "$OUT")"
+    [[ -n "$PROOF_SYSTEM_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture ECDSA_PS address" >&2; exit 1; }
+elif [[ "$EEZ_PROOF_SYSTEM" == "mock" ]]; then
+    echo "[2/4] DeployMockECDSAProofSystem(authorizedSigner=$AUTHORIZED_SIGNER)"
+    run_forge "DeployMockECDSAProofSystem" forge script script/DeployMockECDSAProofSystem.s.sol:DeployMockECDSAProofSystem \
+        --sig "run(address)" "$AUTHORIZED_SIGNER" $RPC $KEY --broadcast
+    PROOF_SYSTEM_ADDRESS="$(extract MOCK_PS "$OUT")"
+    [[ -n "$PROOF_SYSTEM_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture MOCK_PS address" >&2; exit 1; }
+else
+    echo "deploy: EEZ_PROOF_SYSTEM must be 'mock' or 'real', got '$EEZ_PROOF_SYSTEM'" >&2; exit 1
+fi
+# The composer still reads EEZ_MOCK_PROOF_SYSTEM_ADDRESS today; point it at the
+# selected proof system (Phase 2 switches the composer to EEZ_PROOF_SYSTEM_ADDRESS).
+EEZ_MOCK_PROOF_SYSTEM_ADDRESS="$PROOF_SYSTEM_ADDRESS"
+echo "      proofSystem= $PROOF_SYSTEM_ADDRESS ($EEZ_PROOF_SYSTEM)"
 
 # ── 3/4 DeployRollup ────────────────────────────────────────────────
 echo "[3/4] DeployRollup"
@@ -193,6 +210,11 @@ cat > "$OUT_FILE" <<EOF
 
 EEZ_REGISTRY_ADDRESS=$EEZ_REGISTRY_ADDRESS
 EEZ_REGISTRY_DEPLOY_BLOCK=$EEZ_REGISTRY_DEPLOY_BLOCK
+# The rollup's registered proof system ($EEZ_PROOF_SYSTEM). Phase 2 reads
+# EEZ_PROOF_SYSTEM_ADDRESS; EEZ_MOCK_PROOF_SYSTEM_ADDRESS is the same value for
+# backward-compat with the current composer wiring.
+EEZ_PROOF_SYSTEM_KIND=$EEZ_PROOF_SYSTEM
+EEZ_PROOF_SYSTEM_ADDRESS=$PROOF_SYSTEM_ADDRESS
 EEZ_MOCK_PROOF_SYSTEM_ADDRESS=$EEZ_MOCK_PROOF_SYSTEM_ADDRESS
 EEZ_ROLLUP_MANAGER_ADDRESS=$EEZ_ROLLUP_MANAGER_ADDRESS
 EEZ_ROLLUP_ID=$EEZ_ROLLUP_ID

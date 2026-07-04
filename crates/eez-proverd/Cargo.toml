@@ -1,0 +1,56 @@
+[package]
+name                   = "eez-proverd"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+description            = "Out-of-process prover daemon: subscribes to the composer control feed (prover-chain P3 scaffold; 6-axis gates + ECDSA attestation + ZisK are the focused port)."
+
+[dependencies]
+# Generated client stubs for the composer's per-block control feed.
+eez-control-rpc.workspace = true
+
+# `env` for #[arg(env = ...)] on the control-feed endpoint.
+clap                         = { workspace = true, features = ["env"] }
+eyre.workspace               = true
+tokio.workspace              = true
+tracing.workspace            = true
+tracing-subscriber.workspace = true
+futures-util.workspace       = true
+# Serialize the ControlEvent witness to native-validate's witness.json +
+# parse the validator's verified-public-inputs JSON.
+serde_json.workspace         = true
+serde.workspace              = true
+hex.workspace                = true
+# Decode the settling block's PostBatch (control feed) + recompute the
+# publicInputsHash byte-for-byte to cross-check the composer's claim before
+# attesting (decode_postbatch + public_inputs_hashes).
+eez-evm.workspace            = true
+# `RollupId` for the inbound outcome gate's cross-chain call-hash binding.
+eez-protocol.workspace       = true
+alloy-primitives.workspace   = true
+# Re-derive the Sync block's per-tx SYSTEM flags + pair-end positions from its
+# OWN RLP (signer == SYSTEM_ADDRESS && target == CCM), for the interior-boundary
+# + reverted-system-tx (#10) settlement gates.
+reth-ethereum-primitives.workspace = true
+reth-primitives-traits.workspace   = true
+alloy-consensus.workspace          = true
+alloy-rlp.workspace                = true
+# 2718-encode the Sync block's user txs to feed the A3 outbound gate.
+alloy-eips.workspace               = true
+# Durable block backfill from the L2 node's archive state: a minimal HTTP
+# JSON-RPC client (`debug_executionWitness` + `debug_getRawBlock`) used to
+# reconstruct ControlEvents for blocks the composer's bounded replay ring
+# evicted — so the prover NEVER fast-forwards its cursor past unproven blocks.
+alloy-rpc-client       = { workspace = true, features = ["reqwest"] }
+# The reth `debug_executionWitness` result type — `state/codes/keys/headers`
+# `Vec<Bytes>`, maps 1:1 onto the proto `ExecutionWitness` (repeated bytes).
+alloy-rpc-types-debug.workspace    = true
+
+[dev-dependencies]
+# Sign synthetic user txs for the A3 outbound-gate unit test.
+alloy-network.workspace      = true
+alloy-signer-local.workspace = true
+
+[lints]
+workspace = true

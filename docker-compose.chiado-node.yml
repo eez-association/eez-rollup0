@@ -53,12 +53,17 @@ services:
       EEZ_L1_ROLLUP_ID: "0"
       # Cross-chain wiring.
       EEZ_CCM_L2_ADDRESS: "0x4200000000000000000000000000000000000007"
-      EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS: "10200"
+      # Transparent cross-chain fronts (replace the retired chainId hack):
+      #   L1 front :18999 → embedded L1 (Inbound L1→L2)
+      #   L2 front :18998 → L2 (Outbound L2→L1)
+      EEZ_L2_RPC_URL: "http://127.0.0.1:18688"
+      EEZ_L1_XCHAIN_PORT: "18999"
+      EEZ_L2_XCHAIN_PORT: "18998"
       # Deterministic L1-anchored timings (must match any follower).
       EEZ_L1_BLOCK_TIME_MS: "5000"
       EEZ_L2_BLOCK_TIME_MS: "1000"
-      EEZ_PROOF_TIME_MS: "2000"
-      EEZ_SUBMISSION_SLACK_MS: "500"
+      EEZ_PROOF_TIME_MS: "500"
+      EEZ_SUBMISSION_SLACK_MS: "1300"
       # Don't freeze the sequencer when chiado bundles are slow to land.
       EEZ_MAX_SPECULATIVE_DEPTH: "0"
       # Multi-composer: tolerate + adopt batches posted by the competing
@@ -123,7 +128,7 @@ services:
       - --execution-endpoints=http://127.0.0.1:${L1_AUTH_PORT:-18551}
       - --jwt-secrets=/jwt/jwt.hex
       - --datadir=/data
-      - --checkpoint-sync-url=https://checkpoint.chiadochain.net/
+      - --checkpoint-sync-url=http://37.27.238.19:6052
       # Direct chiado peers — discovery alone is too sparse on a fresh
       # lighthouse DB; without these the beacon head never advances (0
       # peers) and the embedded EL stalls. Copied from docker-compose.chiado.yml.

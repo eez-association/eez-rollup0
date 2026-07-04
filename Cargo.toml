@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/eez-composer",
+    "crates/eez-control-plane",
+    "crates/eez-control-rpc",
     "crates/eez-deriver",
     "crates/eez-driver",
     "crates/eez-evm",
@@ -11,6 +13,7 @@ members = [
     "crates/eez-payload-codec",
     "crates/eez-protocol",
     "crates/eez-prover",
+    "crates/eez-proverd",
 ]
 
 [workspace.package]
@@ -39,6 +42,16 @@ mimalloc           = "0.1"
 # CLI
 clap               = { version = "4", features = ["derive"] }
 
+# grpc — tonic control-plane (composer ↔ prover control feed).
+# tonic 0.14 splits codegen out: `tonic` runtime, `tonic-prost` prost glue,
+# `tonic-prost-build` the build-dep that runs protoc.
+tonic             = "0.14"
+tonic-prost       = "0.14"
+tonic-prost-build = "0.14"
+prost             = "0.14"
+# Stream adapter for tonic's server-streaming Subscribe RPC.
+tokio-stream      = "0.1"
+
 # reth — pinned to mediocregopher/partial-persistence-clean tip (contains the receipts-reorg truncation fix).
 reth-chain-state                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-chainspec                  = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
@@ -66,6 +79,7 @@ reth-revm                       = { git = "https://github.com/paradigmxyz/reth",
 reth-rpc-eth-api                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-storage-api                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-tasks                      = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-trie                       = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-trie-common                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 
 # reth_gnosis — Gnosis chain (chiado / gnosis mainnet) NodeBuilder.
@@ -95,6 +109,7 @@ alloy-primitives       = { version = "1", default-features = false }
 alloy-provider         = { version = "2", default-features = false, features = ["reqwest"] }
 alloy-rlp              = { version = "0.3", features = ["derive"] }
 alloy-rpc-client       = { version = "2", default-features = false }
+alloy-rpc-types-debug  = { version = "2", default-features = false }
 alloy-rpc-types-engine = { version = "2", default-features = false }
 alloy-rpc-types-eth    = { version = "2", default-features = false }
 alloy-signer           = { version = "2", default-features = false }
@@ -116,6 +131,8 @@ tower                  = { version = "0.5", features = ["util"] }
 
 # internal crates
 eez-composer       = { path = "crates/eez-composer" }
+eez-control-plane  = { path = "crates/eez-control-plane" }
+eez-control-rpc    = { path = "crates/eez-control-rpc" }
 eez-deriver        = { path = "crates/eez-deriver" }
 eez-driver         = { path = "crates/eez-driver" }
 eez-evm            = { path = "crates/eez-evm" }

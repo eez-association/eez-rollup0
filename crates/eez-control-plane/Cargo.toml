@@ -1,0 +1,25 @@
+[package]
+name                   = "eez-control-plane"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+description            = "Composer↔prover control plane — tonic ControlFeed/ProofSink/ProverDispatch services, PostedWindows ledger, postBatch message builder."
+
+[dependencies]
+# Internal — control-plane wire contract + the EVM ABI/batch types.
+eez-control-rpc.workspace = true
+eez-evm.workspace         = true
+
+# alloy
+alloy-primitives.workspace = true
+alloy-sol-types.workspace  = true
+
+# grpc + async + streaming for the tonic control-plane services.
+tokio.workspace        = true
+tokio-stream.workspace = true
+tonic.workspace        = true
+tracing.workspace      = true
+
+[lints]
+workspace = true

@@ -229,13 +229,20 @@ where
         schedule_rx: mpsc::Receiver<SlotEvent>,
         payload_builder: PayloadBuilderHandle<T>,
         timing: RollupTiming,
+        // Prover witness feed (`None` outside composer mode); handed to the
+        // committer so produced/live blocks trigger the out-of-loop re-exec.
+        witness_tx: Option<mpsc::UnboundedSender<B256>>,
     ) -> DriverResult<Self>
     where
         P: BlockReader<Header = HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>
             + BlockIdReader,
     {
-        let committer =
-            BlockCommitterHandle::spawn_from_provider(provider, to_engine, payload_builder)?;
+        let committer = BlockCommitterHandle::spawn_from_provider(
+            provider,
+            to_engine,
+            payload_builder,
+            witness_tx,
+        )?;
         Ok(Self {
             attributes,
             schedule_rx,
@@ -704,7 +711,7 @@ where
         let block_timestamp = built.header.timestamp();
         let _outcome = self
             .committer
-            .commit_derived(built.payload, built.header)
+            .commit_derived(built.payload, built.header, true)
             .await?;
 
         event!(

@@ -547,7 +547,13 @@ where
         raw_txs: &[Vec<u8>],
     ) -> DeriverResult<DeriveOutcome> {
         let (payload, header) = self.execute_block(parent_block_number, raw_txs)?;
-        Ok(self.inner.committer.commit_derived(payload, header).await?)
+        // feed_witness=false: an L1-reconcile / follower re-derive must NOT
+        // re-feed the prover — the composer already fed this block on produce.
+        Ok(self
+            .inner
+            .committer
+            .commit_derived(payload, header, false)
+            .await?)
     }
 
     /// Runs the deriver loop. Subscribes to the `L1Watcher`'s event

@@ -8,6 +8,7 @@ description            = "Composer umbrella — owns per-rollup Sequencer/Schedu
 
 [dependencies]
 # Internal — protocol, EVM port + inspector, and the existing umbrella siblings
+eez-control-plane.workspace  = true
 eez-driver.workspace         = true
 eez-evm.workspace            = true
 eez-evm-inspector.workspace  = true
@@ -15,6 +16,10 @@ eez-l1.workspace             = true
 eez-payload-codec.workspace  = true
 eez-protocol.workspace       = true
 eez-prover.workspace         = true
+
+# control-plane wire contract: composer.rs holds a postBatch sink typed as
+# `eez_control_rpc::v1::PostBatch`.
+eez-control-rpc.workspace    = true
 
 # gnosis — chiado L1 header type for GnosisL1Adapter
 gnosis-primitives.workspace = true

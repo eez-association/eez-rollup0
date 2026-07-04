@@ -1,0 +1,18 @@
+[package]
+name                   = "eez-control-rpc"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+description            = "Wire contract for the composer → prover control feed (tonic/protobuf)."
+
+[dependencies]
+# tonic 0.14 split: "server" (the composer hosts the feed) + "channel" (the
+# prover connects).
+tonic       = { workspace = true, features = ["server", "channel"] }
+tonic-prost = { workspace = true }
+prost       = { workspace = true }
+
+[build-dependencies]
+# Compiles `proto/control.proto`. Needs `protoc` on PATH.
+tonic-prost-build = { workspace = true }
