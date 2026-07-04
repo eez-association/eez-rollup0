@@ -161,7 +161,6 @@ def run(plan, args):
         config = ServiceConfig(
             image = eez.get("eez_node_image", "eez-node:dev"),
             ports = {
-                "l1-rpc": PortSpec(number = EMBEDDED_L1_RPC_PORT, transport_protocol = "TCP", application_protocol = "http"),
                 "l1-engine": PortSpec(number = EMBEDDED_L1_ENGINE_PORT, transport_protocol = "TCP"),
                 "l2-rpc": PortSpec(number = L2_RPC_PORT, transport_protocol = "TCP", application_protocol = "http"),
             },
