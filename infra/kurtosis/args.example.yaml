@@ -60,21 +60,10 @@ ethereum_package:
 
   spamoor_params:
     spammers:
-      # Execution-gas load (~30% of the 60M limit), leaving room for postBatch.
       - scenario: eoatx
         name: baseline-load
         config:
-          throughput: 850
-      # Blob load (EIP-4844). Uses the SEPARATE blob-gas market, so it adds
-      # realism without eating the execution gas postBatch bundles need. Bump
-      # throughput to stress the blob-fee market. (blob-combined also accepts
-      # blob-specific knobs; add them once you've confirmed them for your image.)
-      - scenario: blob-combined
-        name: blob-load
-        config:
-          throughput: 3
-          max_pending: 6
-          max_wallets: 20
+          throughput: 30
 
 # ─────────────────────────────────────────────────────────────────────────
 eez:
