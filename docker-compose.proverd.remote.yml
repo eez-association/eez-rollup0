@@ -1,19 +1,33 @@
-# eez-proverd on a REMOTE machine (the composer runs elsewhere with
-# docker-compose.remote-prover.override.yml). Mirrors the eez-proverd
-# service of docker-compose.driven.override.yml minus the colocation
-# assumptions: no depends_on, endpoints pointed at the composer host, and
-# NO .env.chiado env_file — the prover needs ONLY EEZ_PROOF_SIGNER_KEY;
-# the L1 poster key must not leave the composer machine.
+# eez-proverd on a REMOTE machine, REVERSE transport: this daemon LISTENS
+# (EEZ_CONTROL_LISTEN_ADDR) and the composer dials in from its outbound-only
+# host (EEZ_CONTROL_DIAL_ADDR on the node, see
+# docker-compose.remote-prover.override.yml). No .env.chiado here — the
+# prover needs ONLY EEZ_PROOF_SIGNER_KEY; the L1 poster key must not leave
+# the composer machine. See docs/reverse-control-transport-design.md.
 #
-# The prover is a pure dial-out client (it listens on nothing) and
-# reconnects forever with capped exponential backoff, so composer
-# restarts and WAN blips are survivable.
+# SECURITY — the listener is the transport's front door. Without the
+# source-IP allowlist anyone could stream this daemon windows to attest (a
+# signing oracle for the registered key). EEZ_ALLOWED_COMPOSER_IPS is
+# REQUIRED (the daemon refuses to start without it) and must be the
+# composer's PUBLIC IP as seen from here. It is only meaningful for a
+# stable, non-shared source IP — front a CGNAT/shared-IP composer with a
+# per-peer tunnel instead.
+#
+# VALIDATOR REQUIRED — reverse mode assumes a validating prover (an
+# untrusted composer must never be attested without stateless re-execution).
+# The daemon bails unless EEZ_VALIDATOR_BIN + EEZ_CHAIN_CONFIG are set.
+#
+# BACKFILL DISABLED — EEZ_L2_RPC_URL is EXPLICITLY empty (the composer's L2
+# archive is unreachable here). The composer's replay ring covers ordinary
+# reconnects; an outage beyond the ring's horizon fails loud until history
+# is re-served (accepted Level-1 limitation).
 #
 # Fill in (env or a small .env file):
-#   EEZ_COMPOSER_HOST=<composer's VPN/LAN IP>     # e.g. its WireGuard IP
-#   EEZ_PROOF_SIGNER_KEY=<the shared registered signer key>
+#   EEZ_ALLOWED_COMPOSER_IPS=<composer's public IP>
+#   EEZ_PROOF_SIGNER_KEY=<the registered signer key — must derive the PS's
+#                         authorizedSigner address>
 #
-# Run (on the prover machine, from a checkout of this repo):
+# Run (from a checkout of this repo on the prover machine):
 #   docker compose -f docker-compose.proverd.remote.yml build eez-proverd
 #   docker compose -f docker-compose.proverd.remote.yml up -d
 services:
@@ -21,13 +35,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.proverd
-    # Or run a CI-published image: EEZ_PROVERD_IMAGE=ghcr.io/eez-association/
-    # eez-proverd:<tag> + EEZ_PULL_POLICY=always (see .env.ghcr.example).
     image: ${EEZ_PROVERD_IMAGE:-eez-proverd:local}
     pull_policy: ${EEZ_PULL_POLICY:-missing}
     container_name: eez-proverd
-    # Host networking so the container can dial the composer over a host
-    # VPN interface (WireGuard) without NAT/DNS indirection.
+    # Host networking: the listener binds the host interface directly (the
+    # machine is expected to be reachable on EEZ_CONTROL_LISTEN_PORT, e.g.
+    # via DMZ or a router forward).
     network_mode: host
     restart: unless-stopped
     stop_grace_period: 30s
@@ -35,26 +48,24 @@ services:
       RUST_LOG: "info,eez_proverd=info"
       # Take the verify range from the composer's ProverDispatch stream.
       EEZ_COMPOSER_DRIVEN: "1"
-      # The composer's control feed: ControlFeed + ProverDispatch + ProofSink.
-      # Must be plain http:// — the gRPC channel has no TLS support as built.
-      EEZ_CONTROL_RPC_URL: "http://${EEZ_COMPOSER_HOST:?set EEZ_COMPOSER_HOST to the composer's VPN/LAN IP}:${EEZ_CONTROL_RPC_PORT:-50051}"
-      # The composer's L2 archive RPC (debug_*) for durable backfill of
-      # replay-gap blocks. Backfill pays 2 RPC round trips per block, so
-      # keep the parallelism up over a WAN link.
-      EEZ_L2_RPC_URL: "http://${EEZ_COMPOSER_HOST}:18688"
-      EEZ_BACKFILL_CONCURRENCY: "${EEZ_BACKFILL_CONCURRENCY:-8}"
+      # REVERSE transport: listen here; the composer dials in.
+      EEZ_CONTROL_LISTEN_ADDR: "0.0.0.0:${EEZ_CONTROL_LISTEN_PORT:-50051}"
+      # REQUIRED source-IP allowlist (comma-separated) — the composer's
+      # public IP(s) as seen from this machine.
+      EEZ_ALLOWED_COMPOSER_IPS: "${EEZ_ALLOWED_COMPOSER_IPS:?set EEZ_ALLOWED_COMPOSER_IPS to the composer's public IP}"
+      # Backfill disabled (see header) — explicit empty, not omitted.
+      EEZ_L2_RPC_URL: ""
       # The one secret the prover needs: the registered proof signer
       # (== the proof system's authorizedSigner == the node's attester).
-      EEZ_PROOF_SIGNER_KEY: "${EEZ_PROOF_SIGNER_KEY:?set EEZ_PROOF_SIGNER_KEY (the shared registered signer key)}"
+      EEZ_PROOF_SIGNER_KEY: "${EEZ_PROOF_SIGNER_KEY:?set EEZ_PROOF_SIGNER_KEY (the registered signer key)}"
       # native-validate (stateless re-execution) + L2 chain-config, both
-      # baked into the image by Dockerfile.proverd.
+      # baked into the image by Dockerfile.proverd. MANDATORY in reverse mode.
       EEZ_VALIDATOR_BIN: "/usr/local/bin/native-validate"
       EEZ_CHAIN_CONFIG: "/app/l2-chainconfig.json"
     # Override the image's `--help` default CMD (`command: []` is silently
-    # ignored by compose, so pass the real run explicitly).
+    # ignored by compose, so pass the real run explicitly). The control
+    # endpoint comes from EEZ_CONTROL_LISTEN_ADDR above (no --control-addr).
     command:
-      - "--control-addr"
-      - "http://${EEZ_COMPOSER_HOST}:${EEZ_CONTROL_RPC_PORT:-50051}"
       - "--validator-bin"
       - "/usr/local/bin/native-validate"
       - "--chain-config"

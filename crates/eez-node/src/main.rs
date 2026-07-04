@@ -19,6 +19,7 @@
 //! is accepted only in deferred-post mode (`EEZ_PROOF_SYSTEM_KIND=real`):
 //! the attester key lives solely on the remote `eez-proverd`.
 
+mod control_transport;
 mod follower;
 mod ingress;
 mod l1_embedded;
@@ -1099,32 +1100,86 @@ fn main() -> eyre::Result<()> {
             )) = witness_feed
             {
                 // Control-feed tonic server — the prover subscribes here (P3).
+                // Two transports (control_transport.rs): LISTEN (default; the
+                // prover dials us) or DIAL (EEZ_CONTROL_DIAL_ADDR; WE dial an
+                // outbound-only composer topology's listening prover). The
+                // composer is the gRPC server on the connection either way.
                 let control_port = env::var("EEZ_CONTROL_RPC_PORT")
                     .ok()
                     .and_then(|s| s.parse::<u16>().ok())
                     .unwrap_or(50051);
-                // Bind interface. Default loopback: the feed is plaintext gRPC
-                // with no auth — the ProofSink is ecrecover-gated, but the
-                // block+witness stream is readable and DoS-able by anyone who
-                // can reach the port. Widen only onto a link you trust
-                // end-to-end (e.g. a WireGuard address for a remote proverd).
-                let control_host =
-                    env::var("EEZ_CONTROL_RPC_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-                let control_ip: std::net::IpAddr = control_host.parse().map_err(|e| {
-                    eyre::eyre!(
-                        "EEZ_CONTROL_RPC_ADDR must be an IP literal (IPv4 or IPv6), got {control_host:?}: {e}"
+                // Empty ⇒ unset for both knobs, so a wrapper that exports them
+                // blank (a common compose/CI pattern) falls back rather than
+                // bailing.
+                let non_empty = |k: &str| env::var(k).ok().filter(|s| !s.trim().is_empty());
+                let control_dial_addr = non_empty("EEZ_CONTROL_DIAL_ADDR");
+                let control_rpc_addr = non_empty("EEZ_CONTROL_RPC_ADDR");
+                let (control_transport, control_endpoint_desc) = if let Some(dial) =
+                    control_dial_addr
+                {
+                    eyre::ensure!(
+                        control_rpc_addr.is_none(),
+                        "EEZ_CONTROL_DIAL_ADDR and EEZ_CONTROL_RPC_ADDR are mutually exclusive: \
+                         dial OUT to a listening prover, or bind an interface for the prover to \
+                         dial in — not both"
+                    );
+                    // IP literal only (no DNS, by design). Accept host:port or a
+                    // bare host (defaulting to EEZ_CONTROL_RPC_PORT).
+                    let dial_addr: std::net::SocketAddr = dial
+                        .parse()
+                        .or_else(|_| {
+                            dial.parse::<std::net::IpAddr>()
+                                .map(|ip| std::net::SocketAddr::new(ip, control_port))
+                        })
+                        .map_err(|e| {
+                            eyre::eyre!(
+                                "EEZ_CONTROL_DIAL_ADDR must be an IP literal, optionally with :port \
+                                 (no DNS), got {dial:?}: {e}"
+                            )
+                        })?;
+                    let (conn_tx, conn_rx) = mpsc::channel(1);
+                    event!(
+                        name: "eez.control_feed.reverse_dialing",
+                        Level::INFO,
+                        %dial_addr,
+                        "REVERSE control transport: dialing the prover (composer stays outbound-only)"
+                    );
+                    task_executor.spawn_critical_task(
+                        "eez-control-dial",
+                        control_transport::dial_loop(dial_addr, conn_tx),
+                    );
+                    (
+                        control_transport::ControlTransport::Dial(conn_rx),
+                        format!("dial://{dial_addr}"),
                     )
-                })?;
-                let control_addr = std::net::SocketAddr::new(control_ip, control_port);
-                // Bind EAGERLY and fatally: without this endpoint a deferred-post
-                // composer sequences but can never settle (the prover has nothing
-                // to dial), and a background-task bind failure only logs. Failing
-                // the launch instead turns the container restart policy into the
-                // retry loop — e.g. for the boot race where the VPN interface
-                // EEZ_CONTROL_RPC_ADDR points at is not up yet.
-                let control_listener = std::net::TcpListener::bind(control_addr)
-                    .map_err(|e| eyre::eyre!("control-feed bind {control_addr} failed: {e}"))?;
-                control_listener.set_nonblocking(true)?;
+                } else {
+                    // Bind interface. Default loopback: the feed is plaintext gRPC
+                    // with no auth — the ProofSink is ecrecover-gated, but the
+                    // block+witness stream is readable and DoS-able by anyone who
+                    // can reach the port. Widen only onto a link you trust
+                    // end-to-end (e.g. a WireGuard address for a remote proverd).
+                    let control_host =
+                        control_rpc_addr.unwrap_or_else(|| "127.0.0.1".to_string());
+                    let control_ip: std::net::IpAddr = control_host.parse().map_err(|e| {
+                        eyre::eyre!(
+                            "EEZ_CONTROL_RPC_ADDR must be an IP literal (IPv4 or IPv6), got {control_host:?}: {e}"
+                        )
+                    })?;
+                    let control_addr = std::net::SocketAddr::new(control_ip, control_port);
+                    // Bind EAGERLY and fatally: without this endpoint a deferred-post
+                    // composer sequences but can never settle (the prover has nothing
+                    // to dial), and a background-task bind failure only logs. Failing
+                    // the launch instead turns the container restart policy into the
+                    // retry loop — e.g. for the boot race where the VPN interface
+                    // EEZ_CONTROL_RPC_ADDR points at is not up yet.
+                    let control_listener = std::net::TcpListener::bind(control_addr)
+                        .map_err(|e| eyre::eyre!("control-feed bind {control_addr} failed: {e}"))?;
+                    control_listener.set_nonblocking(true)?;
+                    (
+                        control_transport::ControlTransport::Listen(control_listener),
+                        format!("listen://{control_addr}"),
+                    )
+                };
                 let svc = eez_composer::control_feed::ControlFeedSvc::new(Arc::clone(&publisher));
                 // Prover-feed RETURN path (P4-b): the ProofSink the prover submits
                 // its verified attestation to, hosted on the same endpoint.
@@ -1160,7 +1215,7 @@ fn main() -> eyre::Result<()> {
                     .unwrap_or(false);
                 let prover_dispatch = match (&posted_windows, composer_driven) {
                     (Some(windows), true) => {
-                        event!(name: "eez.prover_dispatch.enabled", Level::INFO, %control_addr, "composer-driven prover dispatch ENABLED (EEZ_COMPOSER_DRIVEN); driving from the posted/attested ledger");
+                        event!(name: "eez.prover_dispatch.enabled", Level::INFO, control_endpoint = %control_endpoint_desc, "composer-driven prover dispatch ENABLED (EEZ_COMPOSER_DRIVEN); driving from the posted/attested ledger");
                         Some(eez_control_rpc::v1::prover_dispatch_server::ProverDispatchServer::new(
                             eez_composer::prover_dispatch::ProverDispatchSvc::new(windows.clone()),
                         ))
@@ -1168,17 +1223,22 @@ fn main() -> eyre::Result<()> {
                     _ => None,
                 };
                 task_executor.spawn_critical_task("eez-control-feed", async move {
-                    event!(name: "eez.control_feed.serving", Level::INFO, %control_addr, %attester, "serving control feed (composer → prover) + ProofSink (prover → composer)");
-                    // The listener was bound (fatally) in the launch path above;
-                    // here it is only registered with the runtime and served.
-                    let incoming = match tokio::net::TcpListener::from_std(control_listener) {
-                        Ok(listener) => tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    event!(name: "eez.control_feed.serving", Level::INFO, control_endpoint = %control_endpoint_desc, %attester, "serving control feed (composer → prover) + ProofSink (prover → composer)");
+                    // Listen mode: the listener was bound (fatally) in the launch
+                    // path; here it is only registered with the runtime. Dial
+                    // mode: connections arrive from the dial loop.
+                    let incoming = match control_transport::incoming(control_transport) {
+                        Ok(incoming) => incoming,
                         Err(e) => {
-                            event!(name: "eez.control_feed.server_exited", Level::ERROR, error = %e, "control-feed listener registration failed");
-                            return;
+                            panic!("control-feed listener registration failed: {e}");
                         }
                     };
                     if let Err(e) = tonic::transport::Server::builder()
+                        // Detect a silently-dead peer (prover power loss, no RST)
+                        // so dial mode tears the connection down + redials instead
+                        // of streaming into a black hole; harmless in listen mode.
+                        .http2_keepalive_interval(Some(std::time::Duration::from_secs(30)))
+                        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
                         .add_service(
                             eez_control_rpc::v1::control_feed_server::ControlFeedServer::new(svc),
                         )
@@ -1190,7 +1250,12 @@ fn main() -> eyre::Result<()> {
                         .serve_with_incoming(incoming)
                         .await
                     {
-                        event!(name: "eez.control_feed.server_exited", Level::ERROR, error = %e, "control-feed server exited");
+                        // The control-feed server only returns on a fatal server
+                        // error (not per-connection). A deferred-post composer
+                        // that loses its feed can never settle, so fail the node
+                        // and let the restart policy retry rather than sequence
+                        // silently. (spawn_critical_task shuts down only on PANIC.)
+                        panic!("control-feed server exited: {e}");
                     }
                 });
 

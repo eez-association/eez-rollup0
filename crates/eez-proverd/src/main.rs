@@ -43,6 +43,7 @@ use eez_evm::public_inputs::public_inputs_hashes;
 use eez_evm::signer::EcdsaProofSigner;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
+use tonic::transport::{Channel, Endpoint, Uri};
 use tracing::{error, info, warn};
 
 /// Parse a 32-byte hex `B256` (the vkey arg).
@@ -59,13 +60,148 @@ fn vkey_from_address(addr: alloy_primitives::Address) -> B256 {
     B256::from(bytes)
 }
 
-/// Submit a signed attestation to the composer's `ProofSink` (connect-per-submit;
+/// How the daemon reaches the composer's control services (feed, dispatch,
+/// sink). `Dial` is the normal mode: connect per use to the composer's URL
+/// (behavior unchanged). `Reverse` inverts the TRANSPORT for topologies where
+/// the composer host is outbound-only — the COMPOSER dials us, and every
+/// client multiplexes over the accepted connection's channel. The wire
+/// protocol (who is gRPC client/server per RPC) is identical either way.
+/// See docs/reverse-control-transport-design.md.
+#[derive(Clone)]
+enum ComposerConn {
+    Dial(String),
+    Reverse(ReverseHub),
+}
+
+impl ComposerConn {
+    async fn channel(&self) -> eyre::Result<Channel> {
+        match self {
+            Self::Dial(url) => Endpoint::from_shared(url.clone())
+                .map_err(|e| eyre::eyre!("invalid control endpoint {url}: {e}"))?
+                .connect()
+                .await
+                .map_err(|e| eyre::eyre!("control connect {url}: {e}")),
+            Self::Reverse(hub) => hub.channel().await,
+        }
+    }
+}
+
+impl std::fmt::Display for ComposerConn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dial(url) => write!(f, "dial://{url}"),
+            Self::Reverse(_) => write!(f, "reverse://(composer dials in)"),
+        }
+    }
+}
+
+/// Reverse-transport hub: holds the channel built over the composer's most
+/// recent dial-in. When that connection dies, calls on the stale channel fail
+/// fast and the caller's existing backoff loop retries; the composer's redial
+/// replaces the channel here (last-wins, §7.1 — safe for the distinct-IP
+/// topology Level 1 targets).
+#[derive(Clone)]
+struct ReverseHub {
+    current: tokio::sync::watch::Receiver<Option<Channel>>,
+}
+
+impl ReverseHub {
+    fn spawn(listener: tokio::net::TcpListener, allowed: Vec<std::net::IpAddr>) -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        tokio::spawn(run_reverse_listener(listener, allowed, tx));
+        Self { current: rx }
+    }
+
+    /// The current channel, or wait for the composer's first dial-in.
+    async fn channel(&self) -> eyre::Result<Channel> {
+        let mut rx = self.current.clone();
+        loop {
+            if let Some(ch) = rx.borrow().clone() {
+                return Ok(ch);
+            }
+            info!("reverse control: waiting for the composer to dial in");
+            rx.changed()
+                .await
+                .map_err(|_| eyre::eyre!("reverse control listener task exited"))?;
+        }
+    }
+}
+
+/// Normalize a peer address for the allowlist: a dual-stack `[::]` listener
+/// reports an IPv4 peer as `::ffff:a.b.c.d`, which must compare equal to a
+/// plain `a.b.c.d` allowlist entry.
+fn canonical_ip(addr: std::net::SocketAddr) -> std::net::IpAddr {
+    match addr.ip() {
+        std::net::IpAddr::V6(v6) => v6.to_canonical(),
+        ip => ip,
+    }
+}
+
+/// Accept loop for the reverse transport. Source-IP allowlisting is the
+/// admission control here (availability, not signature safety — see
+/// docs/reverse-control-transport-design.md §2): an unfiltered listener would
+/// let anyone stream the daemon windows to attest.
+async fn run_reverse_listener(
+    listener: tokio::net::TcpListener,
+    allowed: Vec<std::net::IpAddr>,
+    tx: tokio::sync::watch::Sender<Option<Channel>>,
+) {
+    loop {
+        let (sock, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                warn!(error = %e, "reverse control accept failed");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        if !allowed.contains(&canonical_ip(peer)) {
+            warn!(%peer, "reverse control: dropping connection from non-allowlisted source");
+            continue;
+        }
+        let _ = sock.set_nodelay(true);
+        // One-shot connector: the channel consumes the just-accepted socket
+        // exactly once. Any internal reconnect attempt fails (NotConnected);
+        // the composer's redial replaces the whole channel here instead.
+        let slot = Arc::new(std::sync::Mutex::new(Some(sock)));
+        let connector = tower::service_fn(move |_: Uri| {
+            let sock = slot.lock().expect("reverse slot lock poisoned").take();
+            async move {
+                sock.map(hyper_util::rt::TokioIo::new).ok_or_else(|| {
+                    std::io::Error::new(
+                        ErrorKind::NotConnected,
+                        "reverse control socket already consumed",
+                    )
+                })
+            }
+        });
+        match Endpoint::from_static("http://composer.reverse")
+            // Detect a dead composer link (power loss, no RST) instead of
+            // hanging on a black-hole channel until the next dial-in.
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(true)
+            .connect_with_connector(connector)
+            .await
+        {
+            Ok(ch) => {
+                info!(%peer, "reverse control: composer connected");
+                tx.send_replace(Some(ch));
+            }
+            Err(e) => warn!(%peer, error = %e, "reverse control: channel setup failed"),
+        }
+    }
+}
+
+/// Submit a signed attestation to the composer's `ProofSink` (channel-per-submit;
 /// settlements are infrequent). The composer fills `batch.proofs[]` with the
 /// 65-byte signature and posts the batch to L1. Returns the ack's `accepted`.
-async fn submit_slot_proof(url: &str, proof: SlotProof) -> eyre::Result<bool> {
-    let mut client = ProofSinkClient::connect(url.to_string())
+async fn submit_slot_proof(conn: &ComposerConn, proof: SlotProof) -> eyre::Result<bool> {
+    let channel = conn
+        .channel()
         .await
-        .map_err(|e| eyre::eyre!("ProofSink connect {url}: {e}"))?;
+        .map_err(|e| eyre::eyre!("ProofSink connect {conn}: {e}"))?;
+    let mut client = ProofSinkClient::new(channel);
     let ack = client
         .submit_slot_proof(proof)
         .await
@@ -82,9 +218,12 @@ async fn submit_slot_proof(url: &str, proof: SlotProof) -> eyre::Result<bool> {
 /// stream drops), so a dropped/failed iteration simply re-receives the SAME
 /// oldest-unverified window next time — no directive is ever lost. Returns `None`
 /// on any connect/stream error (logged); the caller backs off + retries.
-async fn dispatch_one(control_addr: &str, prover_epoch: u64) -> Option<VerifyRange> {
-    let mut client = match ProverDispatchClient::connect(control_addr.to_string()).await {
-        Ok(c) => c,
+/// (Reverse transport: "fresh connection" degrades to a fresh STREAM on the
+/// shared channel — the composer's dispatch_loop semantics are per-stream, so
+/// the contract holds; see the design doc.)
+async fn dispatch_one(conn: &ComposerConn, prover_epoch: u64) -> Option<VerifyRange> {
+    let mut client = match conn.channel().await {
+        Ok(ch) => ProverDispatchClient::new(ch),
         Err(e) => {
             warn!(error = %e, "ProverDispatch connect failed");
             return None;
@@ -177,6 +316,21 @@ struct Args {
     /// Bounded parallelism for archive replay-gap recovery.
     #[arg(long, env = "EEZ_BACKFILL_CONCURRENCY", default_value_t = 1)]
     backfill_concurrency: usize,
+
+    /// REVERSE control transport (outbound-only composer host): LISTEN here
+    /// and let the composer dial us (`EEZ_CONTROL_DIAL_ADDR` on the node).
+    /// Feed, dispatch and sink then multiplex over the accepted connection.
+    /// Overrides `--control-addr`/`EEZ_CONTROL_RPC_URL`. Requires
+    /// `--allowed-composer-ips` and a validator (see startup checks).
+    #[arg(long, env = "EEZ_CONTROL_LISTEN_ADDR")]
+    control_listen_addr: Option<std::net::SocketAddr>,
+
+    /// Source-IP allowlist for `--control-listen-addr` (comma-separated).
+    /// REQUIRED with it: an unfiltered listener would let anyone stream the
+    /// daemon windows to attest. Only meaningful for stable, non-shared peer
+    /// IPs (front CGNAT/shared-IP composers with a per-peer tunnel).
+    #[arg(long, env = "EEZ_ALLOWED_COMPOSER_IPS", value_delimiter = ',')]
+    allowed_composer_ips: Vec<std::net::IpAddr>,
 }
 
 const DRIVEN_CHECKPOINT_VERSION: u32 = 1;
@@ -1577,16 +1731,70 @@ async fn main() -> eyre::Result<()> {
         .as_ref()
         .map_or(args.vkey, |s| vkey_from_address(s.address()));
     let vkey_configured = vkey != B256::ZERO;
-    let proof_sink_url = args
-        .proof_sink_url
-        .clone()
-        .unwrap_or_else(|| args.control_addr.clone());
 
     // Durable-backfill endpoint. The arg defaults to the L2 RPC, so a normally
     // deployed prover RECOVERS replay gaps out of the box; an EXPLICIT empty
     // value (`--l2-rpc-url ""` / `EEZ_L2_RPC_URL=`) normalizes to None — the
     // fail-loud, no-backfill opt-out (observer mode is unchanged).
     let l2_rpc_url: Option<String> = args.l2_rpc_url.clone().filter(|u| !u.trim().is_empty());
+    // Empty ⇒ unset, so a blank EEZ_PROOF_SINK_URL doesn't trip the reverse-mode
+    // conflict bail or override the dial-mode default.
+    let proof_sink_url: Option<String> =
+        args.proof_sink_url.clone().filter(|u| !u.trim().is_empty());
+
+    // Transport selection: reverse (listen for the composer's dial-in) or the
+    // normal dial mode. See docs/reverse-control-transport-design.md.
+    let (conn, sink_conn) = match args.control_listen_addr {
+        Some(listen) => {
+            // Reverse mode requires: a source-IP allowlist (an unfiltered
+            // listener is an attestation oracle), a validator (an untrusted
+            // composer must never be attested un-re-executed — §2), and no
+            // separate sink URL (the sink shares the reverse channel).
+            eyre::ensure!(
+                !args.allowed_composer_ips.is_empty(),
+                "reverse mode (EEZ_CONTROL_LISTEN_ADDR) requires EEZ_ALLOWED_COMPOSER_IPS — \
+                 an unfiltered listener would let anyone feed the daemon windows to attest"
+            );
+            eyre::ensure!(
+                args.validator_bin.is_some() && args.chain_config.is_some(),
+                "reverse mode (EEZ_CONTROL_LISTEN_ADDR) requires a validator \
+                 (EEZ_VALIDATOR_BIN + EEZ_CHAIN_CONFIG): an untrusted composer must never be \
+                 attested without stateless re-execution"
+            );
+            eyre::ensure!(
+                proof_sink_url.is_none(),
+                "EEZ_PROOF_SINK_URL conflicts with EEZ_CONTROL_LISTEN_ADDR (the ProofSink \
+                 shares the reverse channel)"
+            );
+            if l2_rpc_url.is_some() {
+                warn!(
+                    "EEZ_L2_RPC_URL is set in reverse mode but points at the composer's archive \
+                     (unreachable here); set it empty to disable backfill explicitly. A replay \
+                     gap beyond the composer's ring will then fail-loud until history is re-served."
+                );
+            }
+            let listener = tokio::net::TcpListener::bind(listen)
+                .await
+                .map_err(|e| eyre::eyre!("reverse control listen bind {listen}: {e}"))?;
+            info!(
+                %listen,
+                allowed = ?args.allowed_composer_ips,
+                "REVERSE control transport: listening for the composer to dial in",
+            );
+            let hub = ReverseHub::spawn(listener, args.allowed_composer_ips.clone());
+            let conn = ComposerConn::Reverse(hub);
+            (conn.clone(), conn)
+        }
+        None => {
+            let conn = ComposerConn::Dial(args.control_addr.clone());
+            // proof_sink_url defaults to the control endpoint (unchanged).
+            let sink = match &proof_sink_url {
+                Some(url) => ComposerConn::Dial(url.clone()),
+                None => conn.clone(),
+            };
+            (conn, sink)
+        }
+    };
 
     let validating = args.validator_bin.is_some() && args.chain_config.is_some();
     // Composer-driven dispatch (Phase 3): when set, the prover takes its verify
@@ -1603,7 +1811,7 @@ async fn main() -> eyre::Result<()> {
         })
         .unwrap_or(false);
     info!(
-        control_addr = %args.control_addr,
+        control = %conn,
         validating,
         vkey_configured,
         attesting = signer.is_some(),
@@ -1621,7 +1829,7 @@ async fn main() -> eyre::Result<()> {
     if let Some(s) = &signer {
         info!(
             attester = %s.address(),
-            proof_sink = %proof_sink_url,
+            proof_sink = %sink_conn,
             "ATTESTING — will SIGN + submit the publicInputsHash of each fully-verified settling window",
         );
     }
@@ -1730,7 +1938,7 @@ async fn main() -> eyre::Result<()> {
         // the bounded re-request counter ONLY on a NEW directive boundary (the
         // composer re-emits the same `from_block` on a non-attested re-request).
         let vr: Option<VerifyRange> = if driven {
-            match dispatch_one(&args.control_addr, prover_epoch).await {
+            match dispatch_one(&conn, prover_epoch).await {
                 Some(d) => {
                     if last_vr_from != Some(d.from_block) {
                         driven_rerequest = 0;
@@ -1753,8 +1961,8 @@ async fn main() -> eyre::Result<()> {
             None
         };
 
-        let mut control = match ControlFeedClient::connect(args.control_addr.clone()).await {
-            Ok(c) => c,
+        let mut control = match conn.channel().await {
+            Ok(ch) => ControlFeedClient::new(ch),
             Err(e) => {
                 warn!(error = %e, "control feed connect failed");
                 consecutive_failures += 1;
@@ -2542,7 +2750,7 @@ async fn main() -> eyre::Result<()> {
                                         public_inputs_hash: hash.to_vec(),
                                         post_batch_proof: sig.to_vec(),
                                     };
-                                    match submit_slot_proof(&proof_sink_url, proof).await {
+                                    match submit_slot_proof(&sink_conn, proof).await {
                                         Ok(true) => {
                                             proof_sink_accepted = true;
                                             info!(
@@ -2737,6 +2945,53 @@ mod tests {
     use eez_evm::EvmBatch;
     use eez_evm::entries::encode_postbatch;
     use eez_evm::types::RollupIdWithProofSystemsSol;
+
+    /// The allowlist must match an IPv4-mapped IPv6 peer (`::ffff:a.b.c.d`,
+    /// as a dual-stack `[::]` listener reports it) against a plain IPv4
+    /// allowlist entry — the case the loopback E2E (IPv4 listener) cannot
+    /// reach.
+    #[test]
+    fn allowlist_canonicalizes_ipv4_mapped_ipv6() {
+        let v4: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let mapped: std::net::SocketAddr = "[::ffff:203.0.113.7]:40000".parse().unwrap();
+        assert_eq!(canonical_ip(mapped), v4, "mapped peer canonicalizes to IPv4");
+
+        let plain: std::net::SocketAddr = "203.0.113.7:40000".parse().unwrap();
+        assert_eq!(canonical_ip(plain), v4, "plain IPv4 peer is unchanged");
+
+        // A genuine IPv6 peer is left intact (not spuriously matched).
+        let v6: std::net::SocketAddr = "[2001:db8::1]:40000".parse().unwrap();
+        assert_eq!(canonical_ip(v6), "2001:db8::1".parse::<std::net::IpAddr>().unwrap());
+    }
+
+    /// The reverse connector yields the accepted socket exactly once; a second
+    /// call (tonic's internal reconnect) fails with `NotConnected` rather than
+    /// re-handing a consumed socket or panicking.
+    #[tokio::test]
+    async fn reverse_connector_is_one_shot() {
+        use tower::Service;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (_accepted, _) = listener.accept().await.unwrap();
+
+        let slot = Arc::new(std::sync::Mutex::new(Some(sock)));
+        let mut connector = tower::service_fn(move |_: Uri| {
+            let sock = slot.lock().expect("lock").take();
+            async move {
+                sock.map(hyper_util::rt::TokioIo::new).ok_or_else(|| {
+                    std::io::Error::new(ErrorKind::NotConnected, "already consumed")
+                })
+            }
+        });
+
+        let uri: Uri = "http://composer.reverse".parse().unwrap();
+        assert!(connector.call(uri.clone()).await.is_ok(), "first call yields the socket");
+        let second = connector.call(uri).await;
+        assert!(second.is_err(), "second call is NotConnected");
+        assert_eq!(second.err().unwrap().kind(), ErrorKind::NotConnected);
+    }
 
     /// A minimal finalized PostBatch — one PS, one rollup, TIMELESS — mirroring
     /// eez-evm's `carrier_batch` test helper, with the publicInputsHash the

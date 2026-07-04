@@ -1,11 +1,12 @@
-# COMPOSER side of a remote-prover split: driven dispatch ON, control feed
-# bound on a reachable interface, and NO local eez-proverd (the prover runs
-# on another machine via docker-compose.proverd.remote.yml).
+# COMPOSER side of a remote-prover split with an OUTBOUND-ONLY composer:
+# driven dispatch ON, control transport REVERSED (the composer DIALS the
+# prover machine; nothing listens here beyond loopback), and NO local
+# eez-proverd (it runs remotely via docker-compose.proverd.remote.yml, in
+# listen mode). See docs/reverse-control-transport-design.md.
 #
-# Use INSTEAD of docker-compose.driven.override.yml (which colocates the
-# prover and points it at 127.0.0.1):
+# Use INSTEAD of docker-compose.driven.override.yml:
 #
-#   EEZ_CONTROL_RPC_ADDR=<this host's WireGuard/VPN IP> \
+#   EEZ_CONTROL_DIAL_ADDR=<prover-ip:50051> \
 #   docker compose --env-file .env.chiado \
 #     -f docker-compose.chiado-node.yml \
 #     -f docker-compose.remote-prover.override.yml up -d
@@ -16,14 +17,12 @@
 # machine. Requires deferred-post (EEZ_PROOF_SYSTEM_KIND=real) — the node
 # refuses address-only mode otherwise.
 #
-# SECURITY — the control feed (:50051) is plaintext gRPC with no auth/TLS
-# (tonic is built without the tls feature, so https cannot work at all).
-# Attestations cannot be forged (the ProofSink ecrecovers against the
-# registered attester), but the full L2 block+witness stream is readable
-# and the endpoint is DoS-able by anyone who can reach the port. The L2
-# debug RPC (:18688, already 0.0.0.0) has the same exposure. Bind the feed
-# to a VPN address (NOT 0.0.0.0) and keep both ports firewalled from the
-# public internet; the prover machine reaches them over the VPN.
+# TRANSPORT — EEZ_CONTROL_DIAL_ADDR inverts only who opens the TCP socket
+# (control_transport.rs): the composer redials with capped backoff forever,
+# and the wire protocol is unchanged. This composer host needs NO inbound
+# ports for the rollup. The prover machine must be reachable (e.g. DMZ) and
+# MUST allowlist this host's public IP (EEZ_ALLOWED_COMPOSER_IPS) — its
+# listener is otherwise an attestation oracle. IP literal only (no DNS).
 services:
   eez-node:
     environment:
@@ -31,10 +30,7 @@ services:
       # deferred-post itself comes from EEZ_PROOF_SYSTEM_KIND=real in
       # deployments.env, exactly as in docker-compose.driven.override.yml.
       EEZ_COMPOSER_DRIVEN: "1"
-      # Interface the control feed binds (main.rs; default 127.0.0.1).
-      # Set to this host's VPN IP so only VPN peers can reach the feed.
-      # Must be an IP literal (IPv4 or IPv6) — the node refuses hostnames.
-      EEZ_CONTROL_RPC_ADDR: "${EEZ_CONTROL_RPC_ADDR:?set EEZ_CONTROL_RPC_ADDR to the interface the remote prover reaches, e.g. this host's WireGuard IP}"
-      # Keep the port in lockstep with EEZ_CONTROL_RPC_PORT on the prover
-      # side (docker-compose.proverd.remote.yml exposes the same knob).
-      EEZ_CONTROL_RPC_PORT: "${EEZ_CONTROL_RPC_PORT:-50051}"
+      # The remote prover's listener (ip:port, or bare ip → default port).
+      # The composer dials OUT to it — mutually exclusive with
+      # EEZ_CONTROL_RPC_ADDR (listen mode); startup bails if both are set.
+      EEZ_CONTROL_DIAL_ADDR: "${EEZ_CONTROL_DIAL_ADDR:?set EEZ_CONTROL_DIAL_ADDR to the remote prover's ip:port, e.g. 203.0.113.9:50051}"

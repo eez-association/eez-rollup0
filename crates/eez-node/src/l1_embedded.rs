@@ -148,6 +148,14 @@ fn build_network_rpc_args(cfg: &EmbeddedL1Config) -> Result<(NetworkArgs, RpcSer
         ws_port,
         auth_port: cfg.auth_port,
         ipcdisable: true,
+        // The L1 watcher drains multi-10k-block BatchPosted gaps in a single
+        // eth_getLogs scan (MAX_BATCH_SCAN_RANGE = 50k). The shared registry
+        // emits ~3 logs/block, so reth's default 20k max-logs-per-response
+        // (and 100k max-blocks-per-filter) cap rejects those chunks and the
+        // watcher spins on an idle gap. 0 = unlimited — safe here: this is our
+        // OWN embedded catch-up L1, and the wide scans are drained once.
+        rpc_max_logs_per_response: 0u64.into(),
+        rpc_max_blocks_per_filter: 0u64.into(),
         ..RpcServerArgs::default()
     };
     Ok((network_args, rpc_args))
