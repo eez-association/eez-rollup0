@@ -56,6 +56,15 @@ def run(plan, args):
     # seeds the embedded reth's RLPx backfill — straight from the output API.
     l1_el = participants[0].el_context
 
+    # Give the follower EVERY Pair B beacon node, not just the first. With discv5
+    # enabled on the private enclave (--enable-private-discovery below) it can
+    # discover them, and a multi-peer mesh is what keeps block gossip flowing —
+    # a single peer stalls after the initial sync handshake. Flags are
+    # comma-delimited lists of these.
+    cl_enrs = [p.cl_context.enr for p in participants]
+    cl_multiaddrs = [p.cl_context.multiaddr for p in participants]
+    cl_peer_ids = [p.cl_context.peer_id for p in participants]
+
     # rbuilder lives on the participant whose service name carries "builder".
     builder_el = None
     for p in participants:
