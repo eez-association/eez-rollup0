@@ -63,7 +63,9 @@ pub async fn gate_and_hold(
     };
     let nonce = envelope.nonce();
     if let Some(provider) = validation_provider {
-        let on_chain = match provider.get_transaction_count(sender).await {
+        // `pending`, not `latest`: count a same-sender tx already in the source
+        // mempool, else a correctly-nonced cross-chain tx collides with it.
+        let on_chain = match provider.get_transaction_count(sender).pending().await {
             Ok(n) => n,
             Err(e) => return Admission::Rejected(format!("source-chain nonce lookup failed: {e}")),
         };
@@ -233,6 +235,21 @@ async fn handle(
         && let Some(resp) = intercept_send_raw(&ctx, raw_hex, &json).await
     {
         return Ok(resp);
+    }
+    // A JSON-RPC batch array would bypass the single-tx intercept and forward a
+    // bundled cross-chain tx straight to the mempool; reject any batch carrying
+    // `eth_sendRawTransaction` (read-only batches still forward transparently).
+    if let Ok(Value::Array(items)) = serde_json::from_slice::<Value>(&body_bytes)
+        && items
+            .iter()
+            .any(|it| it.get("method").and_then(Value::as_str) == Some("eth_sendRawTransaction"))
+    {
+        let resp = serde_json::json!({
+            "jsonrpc": "2.0",
+            "error": { "code": -32600, "message": "send cross-chain eth_sendRawTransaction singly, not in a JSON-RPC batch" },
+            "id": Value::Null,
+        });
+        return Ok(json_response(resp.to_string()));
     }
     Ok(forward(&ctx, body_bytes.to_vec()).await)
 }

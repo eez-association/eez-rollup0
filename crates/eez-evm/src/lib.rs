@@ -120,7 +120,7 @@ pub use signer::{EcdsaProofSigner, SignerError};
 // helpers + the proof-plan resolver, re-exported so they're discoverable at the
 // root rather than only by module path.
 #[doc(inline)]
-pub use proof_plan::{AlloyRollupReader, EvmProofPlanResolver, ResolverConfigError};
+pub use proof_plan::{AlloyRollupReader, EvmProofPlanResolver, IEEZReader, ResolverConfigError};
 #[doc(inline)]
 pub use public_inputs::{all_per_ps_hashes, entry_hash, public_inputs_hashes, shared_public_input};
 #[doc(inline)]

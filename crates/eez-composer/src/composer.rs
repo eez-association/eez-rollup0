@@ -156,6 +156,21 @@ fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
     }
 }
 
+/// L1-confirmed escrow (`rollups(rid).etherBalance`) an outbound withdrawal draws
+/// down. `None` on any read failure, so the caller fails open (skips the precheck).
+async fn read_rollup_escrow(provider: &alloy_provider::RootProvider, rid: u64) -> Option<U256> {
+    let eez = std::env::var("EEZ_REGISTRY_ADDRESS")
+        .ok()?
+        .parse::<Address>()
+        .ok()?;
+    eez_evm::IEEZReader::new(eez, provider)
+        .rollups(U256::from(rid))
+        .call()
+        .await
+        .ok()
+        .map(|r| r.etherBalance)
+}
+
 /// Composer umbrella. Cheaply [`Clone`]able (`Arc<Inner>`).
 #[derive(Clone)]
 pub struct Composer<L2: BlockReader> {
@@ -1093,6 +1108,9 @@ where
         let mut pending_out: Vec<(eez_evm::types::ExecutionEntrySol, Bytes)> = Vec::new();
         let mut pending_in: Vec<eez_evm::types::ExecutionEntrySol> = Vec::new();
         let mut outbound_entries: Vec<eez_evm::types::ExecutionEntrySol> = Vec::new();
+        // Escrow drawn down per outbound withdrawal (read once, lazily) so several
+        // in one slot can't collectively over-drain. `None` = not yet read.
+        let mut escrow_remaining: Option<U256> = None;
         let mut poison: Vec<HeldTx> = Vec::new();
         // On a transient failure we abort the slot; this holds the error
         // string + the txs still needing re-queue (the failing tx + the
@@ -1165,6 +1183,38 @@ where
                             );
                             poison.push(held);
                             continue;
+                        }
+                        // Evict a withdrawal that would exceed the rollup's L1 escrow —
+                        // it would revert on-chain and drop the whole bundle. Fail-open.
+                        let rid_u256 = U256::from(rollup_id);
+                        let need: U256 = l1_entries[0]
+                            .stateDeltas
+                            .iter()
+                            .filter(|d| d.rollupId == rid_u256 && d.etherDelta.is_negative())
+                            .map(|d| d.etherDelta.unsigned_abs())
+                            .fold(U256::ZERO, |acc, v| acc + v);
+                        if need > U256::ZERO {
+                            if escrow_remaining.is_none() {
+                                escrow_remaining =
+                                    read_rollup_escrow(&ctx.l1_provider, rollup_id).await;
+                            }
+                            if let Some(avail) = escrow_remaining {
+                                if need > avail {
+                                    event!(
+                                        name: "eez.composer.cc_compose.outbound_over_escrow",
+                                        Level::WARN,
+                                        rollup_id,
+                                        tx_idx = idx,
+                                        tx_hash = %held.hash,
+                                        need = %need,
+                                        escrow = %avail,
+                                        "outbound withdrawal exceeds L1 rollup escrow; evicting at compose time (would revert InsufficientRollupBalance on L1 — resubmit required)",
+                                    );
+                                    poison.push(held);
+                                    continue;
+                                }
+                                escrow_remaining = Some(avail - need);
+                            }
                         }
                         for oe in &l1_entries {
                             pending_out.push((oe.clone(), held.raw_tx.clone()));

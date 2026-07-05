@@ -233,6 +233,8 @@ async fn failure_prover_signer_mismatch() {
 /// **I4 — Liveness.** Post-reorg batches landed (`batches_posted` grew
 /// past the pre-reorg snapshot). Proves the chain didn't freeze on the
 /// rewound state.
+// Known-failing pending a fix: after an L1 reorg re-grows the chain, defer-on-lateness
+// holds the pool every slot so the composer never reposts (fail-closed, reorg-path only).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn happy_case_two_composers_l1_reorg_recovers() {
     let harness = Harness::with_anvil_config(
