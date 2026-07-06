@@ -40,7 +40,12 @@ pub(crate) enum ErrorKind {
     /// at `l2_block` has different content than the batch says it
     /// should. Real reorg/replay is a follow-up; today this halts the
     /// deriver loudly.
-    LocalDiverged { l2_block: u64 },
+    LocalDiverged {
+        l2_block: u64,
+        /// Why the divergence was raised (gate failure, prefix mismatch,
+        /// replay error). Surfaced in `Display` — silent failures are bugs.
+        detail: Option<String>,
+    },
 }
 
 impl DeriverError {
@@ -61,13 +66,17 @@ impl DeriverError {
     }
 
     pub(crate) fn local_diverged(l2_block: u64) -> Self {
-        Self::new(ErrorKind::LocalDiverged { l2_block })
+        Self::new(ErrorKind::LocalDiverged {
+            l2_block,
+            detail: None,
+        })
     }
 
-    pub(crate) fn local_diverged_with_msg(l2_block: u64, _msg: &str) -> Self {
-        // For now the variant only carries l2_block; the message is
-        // logged at the call site so the error type stays narrow.
-        Self::new(ErrorKind::LocalDiverged { l2_block })
+    pub(crate) fn local_diverged_with_msg(l2_block: u64, msg: &str) -> Self {
+        Self::new(ErrorKind::LocalDiverged {
+            l2_block,
+            detail: Some(msg.to_string()),
+        })
     }
 
     fn new(kind: ErrorKind) -> Self {
@@ -160,12 +169,16 @@ impl fmt::Display for DeriverError {
             ErrorKind::InvalidForkchoice(detail) => {
                 write!(f, "engine rejected safe/finalized FCU: {detail}")
             }
-            ErrorKind::LocalDiverged { l2_block } => {
+            ErrorKind::LocalDiverged { l2_block, detail } => {
                 write!(
                     f,
                     "local L2 block {l2_block} diverged from L1-confirmed batch; \
                      the on-chain claimed newState doesn't match local STF output"
-                )
+                )?;
+                if let Some(detail) = detail {
+                    write!(f, " ({detail})")?;
+                }
+                Ok(())
             }
         }
     }

@@ -24,17 +24,12 @@
 //!
 //! # Spec anchors
 //!
-//! - `docs/DERIVATION.md` §6e (`publicInputsHash` fold — the
-//!   plan this resolver feeds).
-//! - `docs/plans/09-postbatch-poster.md` §B2 (this step).
-//! - `sync-rollups-protocol@0864392`:
-//!   - `src/EEZ.sol:111-129` (rollups mapping storage layout).
-//!   - `src/EEZ.sol:486-555` (`_validateStructure` — the
-//!     on-chain invariant floor).
-//!   - `src/rollupContract/Rollup.sol:110-126`
-//!     (`checkProofSystemsAndGetVkeys`).
-//!   - `src/rollupContract/Rollup.sol:133-135`
-//!     (`getTimestampAndBlockHash` stub).
+//! Mirrors the `sync-rollups-protocol` Solidity contracts (in-tree
+//! submodule at `sync-rollups-protocol`): `EEZ.sol`'s
+//! `rollups` storage getter +
+//! `_validateStructure` invariants, and `Rollup.sol`'s
+//! `checkProofSystemsAndGetVkeys` + `getTimestampAndBlockHash`
+//! views.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -78,7 +73,7 @@ sol! {
             view
             returns (bytes32[] memory vkeys);
 
-        function getTimestampAndBlockHash()
+        function getTimestampAndBlockHash(uint64 blockNumber)
             external
             view
             returns (uint256 timestamp, bytes32 blockHash);
@@ -192,8 +187,14 @@ impl RollupReader for AlloyRollupReader {
         rollup_contract: Address,
     ) -> ExecutorResult<TimestampAndBlockHash> {
         let rollup_view = IRollupReader::new(rollup_contract, self.provider.as_ref());
+        // DORMANT-SURFACE CAVEAT: this resolver reads the TIMELESS context
+        // (blockNumber=0 → "(0, bytes32(0))"). The LIVE pipeline no longer
+        // uses it — batches bind a recent N (`prepare_post_batch`) and both
+        // sides fold `(0, blockhash(N))` via `public_inputs_hashes`. A future
+        // consumer of this resolver must thread the batch's N here (the call
+        // reverts past the 256-block window, mirroring on-chain semantics).
         let resp = rollup_view
-            .getTimestampAndBlockHash()
+            .getTimestampAndBlockHash(0)
             .call()
             .await
             .map_err(|e| {
@@ -218,9 +219,9 @@ impl RollupReader for AlloyRollupReader {
 /// on-chain reads. `resolve()` is stateless from the caller's
 /// perspective.
 ///
-/// For the single-PS devnet flow (Phase 09 §F), `candidates` is
-/// `[ECDSA_PS]`; Phase 10+ multi-PS quorums pass a larger sorted
-/// candidate set.
+/// For the single-PS devnet flow, `candidates` is `[ECDSA_PS]`;
+/// a future multi-PS quorum mode passes a larger sorted candidate
+/// set.
 #[derive(Debug, Clone)]
 pub struct EvmProofPlanResolver<R: RollupReader> {
     reader: R,
@@ -306,7 +307,7 @@ impl<R: RollupReader> ProofPlanResolver<EvmProtocol> for EvmProofPlanResolver<R>
         if sorted.is_empty() {
             return Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
                 "ProofPlanResolver::resolve: touched set is empty (postBatch \
-                 requires at least one rollup per EEZ.sol:490)"
+                 requires at least one rollup per EEZ.sol)"
                     .into(),
             )));
         }
@@ -323,7 +324,7 @@ impl<R: RollupReader> ProofPlanResolver<EvmProtocol> for EvmProofPlanResolver<R>
         // For the single-PS-uniform case (every touched rollup
         // attests with the full candidate set), each rollup's
         // local index list is [0..ps_count) regardless of rollup.
-        // Phase 10+ multi-PS quorums where rollups attest with
+        // A future multi-PS quorum mode where rollups attest with
         // subsets would compute this per-rollup from the manager's
         // allowed set; that's a separate resolver mode.
         let uniform_index: Vec<u64> = (0..ps_count as u64).collect();
@@ -378,7 +379,8 @@ impl<R: RollupReader> ProofPlanResolver<EvmProtocol> for EvmProofPlanResolver<R>
         // structural floor (`_validateStructure`). A malformed
         // plan here is a resolver bug, NOT a provider failure —
         // surface it as `Decode` so callers don't conflate this
-        // with an `eth_call` revert. Fail loud per `invariant 7`.
+        // with an `eth_call` revert. Fail loud per upstream's
+        // invariant 7.
         plan.check_invariants().map_err(|e| {
             ExecutorError::from(ExecutorErrorKind::Decode(format!(
                 "EvmProofPlanResolver produced an invariant-violating plan: {e}"
@@ -416,6 +418,7 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    #[allow(dead_code, reason = "reserved for future call-count assertions")]
     struct CallCounts {
         rollup_contract: usize,
         check_proof_systems: usize,

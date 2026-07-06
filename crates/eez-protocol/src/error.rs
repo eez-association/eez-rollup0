@@ -13,6 +13,7 @@
 //!       ├─ ComposerErrorKind::Executor(ExecutorError)
 //!       ├─ ComposerErrorKind::AlreadyRegistered { .. }     ← lifecycle
 //!       ├─ ComposerErrorKind::Misconfigured   { .. }       ← lifecycle
+//!       ├─ ComposerErrorKind::MissingRootReader            ← lifecycle
 //!       └─ ComposerErrorKind::LockPoisoned    { .. }       ← internal bug
 //!
 //!   CompositionError             ← public face of compose_transaction
@@ -22,11 +23,13 @@
 //!   ProtocolError                ← pure protocol logic (entries, validation)
 //!       └─ ProtocolErrorKind     EmptyCalls | InvalidCheckpoint
 //!                                | UnknownTarget | InvalidEncoding
+//!                                | Unsupported
 //!
 //!   ExecutorError                ← target-chain client/session failures
 //!       └─ ExecutorErrorKind     Unavailable | Provider | Evm | Transport
 //!                                | Encoding | Serde | Missing
 //!                                | TargetTransactionReverted | Decode
+//!                                | EmptyBatch | InvalidReentry
 //! ```
 //!
 //! [`ComposerError`] flattens across the composition layer: the
@@ -141,6 +144,13 @@ pub enum ProtocolErrorKind {
     /// calldata) failed.
     #[error("invalid encoding: {0}")]
     InvalidEncoding(String),
+    /// A protocol capability was invoked that this chain family does not
+    /// implement — e.g. a
+    /// [`SettlesOutbound::build_settlement_batch`](crate::capabilities::SettlesOutbound::build_settlement_batch)
+    /// impl that cannot actually settle outbound. Today only the
+    /// in-tree test fakes construct this variant.
+    #[error("unsupported protocol operation: {0}")]
+    Unsupported(&'static str),
 }
 
 /// Shorthand for protocol results.
@@ -234,9 +244,9 @@ pub enum ExecutorErrorKind {
     Decode(String),
     /// A batch simulation was asked to run with zero transactions.
     /// Distinct from a successful batch with zero post-state change —
-    /// this signals the caller passed an empty slice, which invariant 7
-    /// (no silent failures) says must be a loud error rather than a
-    /// synthesized zero root.
+    /// this signals the caller passed an empty slice, which the
+    /// upstream protocol's "invariant 7" (no silent failures) says
+    /// must be a loud error rather than a synthesized zero root.
     #[error("batch simulation requires at least one transaction")]
     EmptyBatch,
     /// A nested dispatch attempted to route back to the same non-entry

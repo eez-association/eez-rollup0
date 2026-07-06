@@ -414,20 +414,20 @@ impl TargetExecutionSession for LocalExecutionSession {
             let inspector = factory.build(dispatcher, handle);
             self.execute_internal_with_inspector(
                 inspector,
-                &req.destination,
-                &req.calldata,
+                &req.target_address,
+                &req.data,
                 &req.value,
                 &req.source_address,
-                req.source_rollup,
+                req.source_rollup_id,
             )?
         } else {
             let _ = dispatcher;
             self.execute_internal(
-                &req.destination,
-                &req.calldata,
+                &req.target_address,
+                &req.data,
                 &req.value,
                 &req.source_address,
-                req.source_rollup,
+                req.source_rollup_id,
             )?
         };
 
