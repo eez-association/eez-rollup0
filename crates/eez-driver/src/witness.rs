@@ -8,8 +8,9 @@
 //!
 //! Mirrors `reth_engine_tree`'s invalid-block witness hook
 //! (`re_execute_block`) and `DebugApi::debug_execution_witness_for_block`.
-//! Uses `ExecutionWitnessMode::Canonical` → the minimal witness (sorted,
-//! deduped, no empty nodes).
+//! The node's prover feed defaults to `ExecutionWitnessMode::Legacy`
+//! (ZisK's `native-validate` needs it for outbound/cross-chain blocks);
+//! `Canonical` is the minimal witness (sorted, deduped, no empty nodes).
 //!
 //! Why re-execute instead of capturing during the build: the witness must
 //! be **exact** (the prover requires a minimal witness), and only an
