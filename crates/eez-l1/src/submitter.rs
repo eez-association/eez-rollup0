@@ -32,6 +32,9 @@ use crate::error::{L1Error, L1Result};
 /// Wall-clock cap on the target-block + inclusion check.
 const TARGET_WAIT_BUDGET: Duration = Duration::from_secs(30);
 const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Initial block span for historical log scans. Wide catch-up gaps are
+/// split before hitting RPCs that reject long `eth_getLogs` ranges.
+pub(crate) const LOG_SCAN_CHUNK_BLOCKS: u64 = 100_000;
 
 /// L1 block offset for [`BundleTarget::NextBlock`]. slack=2 (over the
 /// minimal latest+1) gives a one-block cushion for when our local
@@ -74,6 +77,37 @@ pub enum SendOutcome {
 #[derive(Clone)]
 pub struct Submitter {
     inner: Arc<Inner>,
+}
+
+/// Stateful `BatchPosted` log chunks. The submitter owns chunk boundaries;
+/// callers consume chunks and decide when to commit their own progress.
+#[derive(Debug)]
+pub struct BatchLogChunks {
+    to_block: u64,
+    ranges: Vec<(u64, u64)>,
+}
+
+impl BatchLogChunks {
+    fn new(from_block: u64, to_block: u64) -> Self {
+        let ranges = if from_block > to_block {
+            Vec::new()
+        } else {
+            initial_log_scan_ranges(from_block, to_block)
+        };
+        Self { to_block, ranges }
+    }
+
+    /// L1 block these chunks were bounded to when created.
+    #[must_use]
+    pub const fn to_block(&self) -> u64 {
+        self.to_block
+    }
+
+    /// Returns true when no scan chunks remain.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
 }
 
 struct Inner {
@@ -204,44 +238,41 @@ impl Submitter {
             .is_some())
     }
 
-    /// Walks every past `BatchPosted` event from `deploy_block` to L1
-    /// head and returns one [`HistoricalBatch`] per event, with enough
-    /// metadata (L1 block, tx hash, submitter, raw `callData`) for the
-    /// Deriver's catch-up + reorg-walkback paths to replay them.
+    /// Creates bounded `BatchPosted` log chunks from `from_block` to the
+    /// current L1 head. Call [`Self::next_batch_log_chunk`] to consume it.
     ///
-    /// Called once at deriver startup (catch-up) and on L1 reorg
-    /// (walkback); not on the per-tick hot path.
+    /// # Errors
+    ///
+    /// [`L1Error::Provider`] on RPC failure.
+    pub async fn batch_log_chunks(&self, from_block: u64) -> L1Result<BatchLogChunks> {
+        let provider = self.inner.build_provider();
+        let latest = provider
+            .get_block_number()
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_block_number: {e}")))?;
+        Ok(BatchLogChunks::new(from_block, latest))
+    }
+
+    /// Scans and returns the next `BatchPosted` log chunk, or `None` when
+    /// the chunks are exhausted.
     ///
     /// # Errors
     ///
     /// - [`L1Error::Provider`] on RPC failure (log fetch, tx fetch).
-    /// - [`L1Error::Codec`] only if `block_count` is later called on a
-    ///   malformed batch.
-    pub async fn scan_batches(&self, deploy_block: u64) -> L1Result<Vec<HistoricalBatch>> {
+    /// - [`L1Error::SourceIncomplete`] when a canonical batch tx is not
+    ///   served by the L1 source yet — retryable once the source syncs.
+    pub async fn next_batch_log_chunk(
+        &self,
+        chunks: &mut BatchLogChunks,
+    ) -> L1Result<Option<Vec<ScannedBatch>>> {
         let provider = self.inner.build_provider();
-        let scanned = scan_batch_logs(
+        scan_next_batch_log_chunk(
             &provider,
             self.inner.config.eez,
             self.inner.config.rollup_id,
-            deploy_block,
-            BlockNumberOrTag::Latest,
+            chunks,
         )
-        .await?;
-        Ok(scanned
-            .into_iter()
-            .map(|b| HistoricalBatch {
-                l1_block_number: b.l1_block_number,
-                l1_block_hash: b.l1_block_hash,
-                tx_hash: b.tx_hash,
-                submitter: b.submitter,
-                call_data: b.call_data,
-                state_applied: b.state_applied,
-                settled_count: b.settled_count,
-                settled_final_state: b.settled_final_state,
-                claimed_current_state: b.claimed_current_state,
-                claimed_new_state: b.claimed_new_state,
-            })
-            .collect())
+        .await
     }
 
     /// Hash of the canonical L1 block at `number`, or `None` if none. Used by
@@ -269,35 +300,6 @@ impl Submitter {
             .map_err(|e| L1Error::Provider(format!("get_block_by_number({number}): {e}")))?
             .map(|b| b.header.timestamp))
     }
-}
-
-/// One past `BatchPosted` event, with enough context for the Deriver
-/// to replay (or skip) it during catch-up.
-#[derive(Debug, Clone)]
-pub struct HistoricalBatch {
-    pub l1_block_number: u64,
-    /// Hash of the L1 block the batch landed in — canonicality probe
-    /// for the resync anchor walk.
-    pub l1_block_hash: alloy_primitives::B256,
-    pub tx_hash: alloy_primitives::B256,
-    pub submitter: alloy_primitives::Address,
-    pub call_data: alloy_primitives::Bytes,
-    /// Winner flag: same L1 tx emitted `L2ExecutionPerformed`.
-    /// See [`L1Event::BatchPosted::state_applied`].
-    pub state_applied: bool,
-    /// Entries that actually applied. See
-    /// [`L1Event::BatchPosted::settled_count`].
-    pub settled_count: usize,
-    /// L1's actual stored root after this batch — the reconciliation
-    /// endpoint. See [`L1Event::BatchPosted::settled_final_state`].
-    pub settled_final_state: Option<alloy_primitives::B256>,
-    /// FIRST stateDelta's `currentState` for our rollup — L1's
-    /// pre-batch stored root (Deriver compares to L2's actual at
-    /// `from_block - 1`).
-    pub claimed_current_state: Option<alloy_primitives::B256>,
-    /// LAST stateDelta's `newState` — the composer's claimed full-chain
-    /// endpoint. Diagnostics only; reconcile against `settled_final_state`.
-    pub claimed_new_state: Option<alloy_primitives::B256>,
 }
 
 impl Inner {
@@ -662,12 +664,13 @@ fn attribute_settlement(
 }
 
 /// One decoded `BatchPosted` log: winner flag plus the claimed state
-/// roots from our rollup's `StateDelta`. Produced by [`scan_batch_logs`];
-/// the Deriver's catch-up scan and the live
-/// [`L1Watcher`](crate::L1Watcher) poll each project it into their own
-/// type.
-pub(crate) struct ScannedBatch {
+/// roots from our rollup's `StateDelta`. The Deriver's catch-up scan and
+/// the live [`L1Watcher`](crate::L1Watcher) poll consume the same shape.
+#[derive(Debug, Clone)]
+pub struct ScannedBatch {
     pub l1_block_number: u64,
+    /// Hash of the L1 block the batch landed in — canonicality probe
+    /// for the resync anchor walk.
     pub l1_block_hash: alloy_primitives::B256,
     pub tx_hash: alloy_primitives::B256,
     pub submitter: alloy_primitives::Address,
@@ -683,25 +686,55 @@ pub(crate) struct ScannedBatch {
     pub claimed_new_state: Option<alloy_primitives::B256>,
 }
 
+fn initial_log_scan_ranges(from_block: u64, to_block: u64) -> Vec<(u64, u64)> {
+    let mut ranges = Vec::new();
+    let mut from = from_block;
+    loop {
+        let to = from
+            .saturating_add(LOG_SCAN_CHUNK_BLOCKS.saturating_sub(1))
+            .min(to_block);
+        ranges.push((from, to));
+        if to == to_block {
+            break;
+        }
+        from = to + 1;
+    }
+    ranges.reverse();
+    ranges
+}
+
+async fn scan_next_batch_log_chunk(
+    provider: &impl Provider,
+    eez: alloy_primitives::Address,
+    rollup_id: u64,
+    chunks: &mut BatchLogChunks,
+) -> L1Result<Option<Vec<ScannedBatch>>> {
+    let Some(&(from, to)) = chunks.ranges.last() else {
+        return Ok(None);
+    };
+
+    let scanned = scan_batch_logs_range(provider, eez, rollup_id, from, to).await?;
+    chunks.ranges.pop();
+    Ok(Some(scanned))
+}
+
 /// Fetch every `BatchPosted` log in `[from_block, to_block]` and cross-
 /// reference each against `L2ExecutionPerformed` for our rollup — present
 /// ⇔ this batch's state delta applied (winner; losers emit `BatchPosted`
 /// only). For each, decode the originating tx for the submitter, callData
-/// and our rollup's claimed state roots. Shared by
-/// [`Submitter::scan_batches`] (catch-up) and
-/// [`L1Watcher::scan_batch_posted`](crate::L1Watcher) (live poll).
-pub(crate) async fn scan_batch_logs(
+/// and our rollup's claimed state roots.
+pub(crate) async fn scan_batch_logs_range(
     provider: &impl Provider,
     eez: alloy_primitives::Address,
     rollup_id: u64,
     from_block: u64,
-    to_block: BlockNumberOrTag,
+    to_block: u64,
 ) -> L1Result<Vec<ScannedBatch>> {
     let filter = Filter::new()
         .address(eez)
         .event_signature(BatchPosted::SIGNATURE_HASH)
         .from_block(from_block)
-        .to_block(to_block);
+        .to_block(BlockNumberOrTag::Number(to_block));
     let logs = provider
         .get_logs(&filter)
         .await
@@ -712,7 +745,7 @@ pub(crate) async fn scan_batch_logs(
         .event_signature(L2ExecutionPerformed::SIGNATURE_HASH)
         .topic1(alloy_primitives::U256::from(rollup_id))
         .from_block(from_block)
-        .to_block(to_block);
+        .to_block(BlockNumberOrTag::Number(to_block));
     let winner_logs = provider
         .get_logs(&winners_filter)
         .await
@@ -756,22 +789,7 @@ pub(crate) async fn scan_batch_logs(
         let tx_index = log
             .transaction_index
             .ok_or_else(|| L1Error::Provider("BatchPosted log missing transaction_index".into()))?;
-        let tx = provider
-            .get_transaction_by_block_number_and_index(
-                BlockNumberOrTag::Number(l1_block_number),
-                tx_index as usize,
-            )
-            .await
-            .map_err(|e| {
-                L1Error::Provider(format!(
-                    "get_tx({l1_block_number}#{tx_index} for {tx_hash}): {e}"
-                ))
-            })?
-            .ok_or_else(|| {
-                L1Error::Provider(format!(
-                    "tx {tx_hash} (block {l1_block_number} idx {tx_index}) not found"
-                ))
-            })?;
+        let tx = fetch_log_transaction(provider, l1_block_number, tx_index, tx_hash).await?;
         let submitter = tx.inner.signer();
         let input = tx.inner.input();
         let decoded = postAndVerifyBatchCall::abi_decode(input)
@@ -802,14 +820,139 @@ pub(crate) async fn scan_batch_logs(
     Ok(out)
 }
 
+async fn fetch_log_transaction(
+    provider: &impl Provider,
+    l1_block_number: u64,
+    tx_index: u64,
+    tx_hash: alloy_primitives::B256,
+) -> L1Result<alloy_rpc_types_eth::Transaction> {
+    if let Some(tx) = provider
+        .get_transaction_by_block_number_and_index(
+            BlockNumberOrTag::Number(l1_block_number),
+            tx_index as usize,
+        )
+        .await
+        .map_err(|e| {
+            L1Error::Provider(format!(
+                "get_tx({l1_block_number}#{tx_index} for {tx_hash}): {e}"
+            ))
+        })?
+    {
+        return Ok(tx);
+    }
+
+    event!(
+        name: "eez.l1.scan_batch_logs.tx_by_index_missing",
+        Level::WARN,
+        l1_block_number,
+        tx_index,
+        tx_hash = %tx_hash,
+        "postBatch tx missing by block/index; retrying same provider by hash",
+    );
+
+    provider
+        .get_transaction_by_hash(tx_hash)
+        .await
+        .map_err(|e| L1Error::Provider(format!("get_tx({tx_hash}): {e}")))?
+        .ok_or_else(|| L1Error::SourceIncomplete {
+            block: l1_block_number,
+            tx_hash,
+            detail: format!(
+                "block/index lookup returned null at tx index {tx_index}; tx-hash lookup also returned null"
+            ),
+        })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::attribute_settlement;
-    use alloy_primitives::B256;
+    use super::{
+        BatchLogChunks, LOG_SCAN_CHUNK_BLOCKS, attribute_settlement, fetch_log_transaction,
+        initial_log_scan_ranges, scan_next_batch_log_chunk,
+    };
+    use crate::error::L1Error;
+    use alloy_primitives::{Address, B256};
+    use alloy_provider::ProviderBuilder;
+    use alloy_transport::mock::Asserter;
     use std::collections::HashSet;
 
     fn settled(roots: &[B256]) -> HashSet<B256> {
         roots.iter().copied().collect()
+    }
+
+    #[test]
+    fn initial_log_scan_ranges_stack_order() {
+        let c = LOG_SCAN_CHUNK_BLOCKS;
+        struct Case {
+            name: &'static str,
+            from: u64,
+            to: u64,
+            stored_stack: Vec<(u64, u64)>,
+            pop_order: Vec<(u64, u64)>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "single block",
+                from: 10,
+                to: 10,
+                stored_stack: vec![(10, 10)],
+                pop_order: vec![(10, 10)],
+            },
+            Case {
+                name: "exactly one chunk",
+                from: 1,
+                to: c,
+                stored_stack: vec![(1, c)],
+                pop_order: vec![(1, c)],
+            },
+            Case {
+                name: "one block past a chunk",
+                from: 1,
+                to: c + 1,
+                stored_stack: vec![(c + 1, c + 1), (1, c)],
+                pop_order: vec![(1, c), (c + 1, c + 1)],
+            },
+            Case {
+                name: "nonzero start exact chunks",
+                from: 10,
+                to: 10 + 2 * c - 1,
+                stored_stack: vec![(10 + c, 10 + 2 * c - 1), (10, 10 + c - 1)],
+                pop_order: vec![(10, 10 + c - 1), (10 + c, 10 + 2 * c - 1)],
+            },
+            Case {
+                name: "multiple chunks with partial tail",
+                from: 42,
+                to: 42 + 2 * c + 6,
+                stored_stack: vec![
+                    (42 + 2 * c, 42 + 2 * c + 6),
+                    (42 + c, 42 + 2 * c - 1),
+                    (42, 42 + c - 1),
+                ],
+                pop_order: vec![
+                    (42, 42 + c - 1),
+                    (42 + c, 42 + 2 * c - 1),
+                    (42 + 2 * c, 42 + 2 * c + 6),
+                ],
+            },
+            Case {
+                name: "near u64 max does not overflow",
+                from: u64::MAX - 1,
+                to: u64::MAX,
+                stored_stack: vec![(u64::MAX - 1, u64::MAX)],
+                pop_order: vec![(u64::MAX - 1, u64::MAX)],
+            },
+        ];
+
+        for case in cases {
+            let mut ranges = initial_log_scan_ranges(case.from, case.to);
+            assert_eq!(ranges, case.stored_stack, "{}", case.name);
+
+            let mut pop_order = Vec::new();
+            while let Some(range) = ranges.pop() {
+                pop_order.push(range);
+            }
+            assert_eq!(pop_order, case.pop_order, "{}", case.name);
+        }
     }
 
     /// The bug this fix closes: idle `A→A` and rich `A→B` share an L1 block;
@@ -861,6 +1004,121 @@ mod tests {
         assert_eq!(
             attribute_settlement(&[B256::repeat_byte(1)], None),
             (0, None)
+        );
+    }
+
+    /// A minimal, serializable RPC transaction for mocked provider
+    /// responses. The signature is a fixed test vector — none of the
+    /// scan paths validate it.
+    fn mock_rpc_transaction() -> alloy_rpc_types_eth::Transaction {
+        use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy, transaction::Recovered};
+        let tx = TxLegacy {
+            chain_id: Some(1),
+            nonce: 0,
+            gas_price: 1,
+            gas_limit: 21_000,
+            to: alloy_primitives::TxKind::Call(Address::ZERO),
+            value: alloy_primitives::U256::ZERO,
+            input: alloy_primitives::Bytes::new(),
+        };
+        let signed = tx.into_signed(alloy_primitives::Signature::test_signature());
+        alloy_rpc_types_eth::Transaction {
+            inner: Recovered::new_unchecked(TxEnvelope::Legacy(signed), Address::ZERO),
+            block_hash: None,
+            block_number: None,
+            block_timestamp: None,
+            transaction_index: None,
+            effective_gas_price: None,
+        }
+    }
+
+    /// The boot-crash fix's linchpin: a tx the L1 serves by (block,
+    /// index) is returned directly; one missing by index falls back to
+    /// the by-hash lookup; missing by BOTH lookups classifies as
+    /// `SourceIncomplete` (retryable) rather than a fatal provider error.
+    ///
+    /// The mock is a method-agnostic FIFO, so this pins response
+    /// consumption counts and the fallback/classification behavior —
+    /// not which RPC method each lookup used.
+    #[tokio::test]
+    async fn tx_lookup_falls_back_by_hash_then_classifies_source_incomplete() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let tx_hash = B256::with_last_byte(0x51);
+
+        // (a) by-(block, index) hit: returned directly, no fallback call.
+        asserter.push_success(&mock_rpc_transaction());
+        fetch_log_transaction(&provider, 14, 0, tx_hash)
+            .await
+            .expect("index lookup hit");
+
+        // (b) index lookup null → by-hash fallback hit.
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&mock_rpc_transaction());
+        fetch_log_transaction(&provider, 14, 0, tx_hash)
+            .await
+            .expect("hash fallback hit");
+
+        // (c) both lookups null → retryable SourceIncomplete carrying
+        // the block and tx hash context.
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::Value::Null);
+        let err = fetch_log_transaction(&provider, 14, 7, tx_hash)
+            .await
+            .expect_err("both lookups null must not yield a tx");
+        assert!(err.is_source_incomplete(), "unexpected error: {err}");
+        match err {
+            L1Error::SourceIncomplete {
+                block, tx_hash: h, ..
+            } => {
+                assert_eq!(block, 14);
+                assert_eq!(h, tx_hash);
+            }
+            other => panic!("expected SourceIncomplete, got {other}"),
+        }
+    }
+
+    /// A failed chunk scan must NOT consume the range: the same range is
+    /// retried on the next call. A successful scan consumes exactly the
+    /// oldest range. This is the invariant the watcher's per-chunk
+    /// catch-up (and the deriver's retry loop) rely on.
+    #[tokio::test]
+    async fn failed_chunk_scan_preserves_range() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        // Two ranges: [(0, 99_999), (100_000, 150_000)] stored reversed.
+        let mut chunks = BatchLogChunks::new(0, 150_000);
+        assert_eq!(chunks.ranges.len(), 2);
+
+        // First get_logs of the oldest chunk fails.
+        asserter.push_failure_msg("injected: range scan failed");
+        let err = scan_next_batch_log_chunk(&provider, Address::ZERO, 1, &mut chunks)
+            .await
+            .expect_err("injected failure must propagate");
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+        // Range NOT consumed.
+        assert_eq!(chunks.ranges.len(), 2);
+        assert_eq!(
+            *chunks.ranges.last().expect("oldest range intact"),
+            (0, 99_999)
+        );
+
+        // Retry succeeds (BatchPosted logs + winners logs, both empty).
+        asserter.push_success(&serde_json::json!([]));
+        asserter.push_success(&serde_json::json!([]));
+        let scanned = scan_next_batch_log_chunk(&provider, Address::ZERO, 1, &mut chunks)
+            .await
+            .expect("retry succeeds")
+            .expect("chunk yielded");
+        assert!(scanned.is_empty());
+        // Exactly the oldest range consumed; newer range still queued.
+        assert_eq!(chunks.ranges.len(), 1);
+        assert_eq!(
+            *chunks.ranges.last().expect("tail range"),
+            (100_000, 150_000)
         );
     }
 }

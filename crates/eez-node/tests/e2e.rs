@@ -41,10 +41,7 @@ async fn happy_case_builder_sustained() {
     let root_before;
     {
         let _node = NodeHandle::spawn(datadir.path(), &env).unwrap();
-        n_before = chain
-            .wait_for_batches(3, Duration::from_secs(60))
-            .await
-            .unwrap();
+        n_before = chain.wait_for_batches(3, DEFAULT_TIMEOUT).await.unwrap();
         assert_eq!(
             chain.executions_performed().await.unwrap(),
             n_before,
@@ -78,7 +75,7 @@ async fn happy_case_builder_sustained() {
     // posts a delta with currentState == newState and the contract dutifully
     // writes the same value. Correct, not a regression.
     let n_after = chain
-        .wait_for_batches(n_before + 1, Duration::from_secs(60))
+        .wait_for_batches(n_before + 1, DEFAULT_TIMEOUT)
         .await
         .expect("composer didn't post any new batch after restart");
     assert!(
