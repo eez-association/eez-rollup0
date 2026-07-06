@@ -415,11 +415,13 @@ fn witness_to_json(w: &ExecutionWitness) -> String {
 /// (`parent_hash == tip.block_hash && number == tip.number+1`) accepts it.
 ///
 /// VALIDATION-TIME CHECK (not a compile-time guarantee): the composer builds
-/// its witness with `ExecutionWitnessMode::Canonical` (the minimized v2
-/// format; see `eez-driver/src/witness.rs`). reth's `debug_executionWitness`
-/// must serve the SAME mode for the re-executed witness to match what the
-/// validator expects. If reth's default differs, pass a mode param here; this
-/// is flagged at deploy time, not blocked at compile time.
+/// its witness with `ExecutionWitnessMode::Legacy` by default (ZisK's
+/// `native-validate` needs it for outbound/cross-chain blocks; see
+/// `eez-driver/src/witness.rs`). reth's `debug_executionWitness` must serve
+/// a format the validator accepts for the backfilled witness too — a
+/// backfilled OUTBOUND block re-executed from a too-minimal RPC witness
+/// would still fail the validator. If reth's default differs, pass a mode
+/// param here; this is flagged at deploy time, not blocked at compile time.
 async fn backfill_block(l2_rpc_url: &str, n: u64) -> eyre::Result<ControlEvent> {
     use alloy_rpc_client::RpcClient;
 

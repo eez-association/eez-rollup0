@@ -1072,14 +1072,17 @@ fn main() -> eyre::Result<()> {
                 // and publish its ControlEvent into the replay ring.
                 task_executor.spawn_critical_task("eez-witness-feed", async move {
                     let evm_config = reth_evm_ethereum::EthEvmConfig::new(witness_chain_spec);
-                    // Witness format: ZisK's `native-validate` expects the LEGACY
+                    // Witness format: ZisK's `native-validate` REQUIRES the LEGACY
                     // format for complex (outbound / cross-chain) blocks — the minimal
                     // Canonical witness omits MPT nodes its re-execution walks
-                    // ("Unresolved node access" panic). `EEZ_WITNESS_MODE=legacy`
-                    // selects it; default canonical preserves prior behavior.
+                    // ("MPT: Unresolved node access" panic), which fail-closes the
+                    // prover on every outbound-bearing window and stalls deferred-post
+                    // settlement (reproduced live on Chiado). Legacy is therefore the
+                    // DEFAULT; `EEZ_WITNESS_MODE=canonical` opts back into the
+                    // minimized v2 format for validators that accept it.
                     let witness_legacy = std::env::var("EEZ_WITNESS_MODE")
-                        .map(|s| s.eq_ignore_ascii_case("legacy"))
-                        .unwrap_or(false);
+                        .map(|s| !s.eq_ignore_ascii_case("canonical"))
+                        .unwrap_or(true);
                     while let Some(hash) = witness_rx.recv().await {
                         let provider = witness_provider.clone();
                         let evm_config = evm_config.clone();
