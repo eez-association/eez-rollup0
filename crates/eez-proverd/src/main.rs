@@ -1163,6 +1163,150 @@ fn verify_outbound_authorized(
     .map_err(|e| eyre::eyre!("A3: {e}"))
 }
 
+/// Kind of a settlement entry / Sync-block effect. `Anchor` is the leading no-op
+/// immediate (`proxyEntryHash == 0` AND empty `l2ToL1Calls`) — it commits no
+/// value effect, so the STRICT gate skips it. `Outbound` (L2->L1) and `Inbound`
+/// (L1->L2) are the value-bearing effects that must each match a re-executed
+/// Sync-block pair-end root, in order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SettlementKind {
+    Anchor,
+    Outbound,
+    Inbound,
+}
+
+/// STRICT exact-prefix-root gate flag (Step 1). DEFAULT OFF: only "1" / "true"
+/// (case-insensitive) turns it on. When unset the settlement gate is byte-for-
+/// byte its prior behavior; when set, the strict effect-matching runs IN ADDITION
+/// to every existing check. Read once per verdict.
+fn strict_settlement_roots_enabled() -> bool {
+    std::env::var("EEZ_STRICT_SETTLEMENT_ROOTS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Classify one L1 batch entry by kind. `proxyEntryHash != 0` => deferred INBOUND;
+/// `proxyEntryHash == 0` with non-empty `l2ToL1Calls` => immediate OUTBOUND;
+/// `proxyEntryHash == 0` with EMPTY `l2ToL1Calls` => the leading no-op ANCHOR.
+fn classify_settlement_entry(e: &eez_evm::types::ExecutionEntrySol) -> SettlementKind {
+    if e.proxyEntryHash != B256::ZERO {
+        SettlementKind::Inbound
+    } else if !e.l2ToL1Calls.is_empty() {
+        SettlementKind::Outbound
+    } else {
+        SettlementKind::Anchor
+    }
+}
+
+/// Ordered Sync-block effects (kind + EXACT prefix/post root), derived purely
+/// from the re-executed per-tx system flags and per-tx roots. Each pair-end
+/// position (`pair_end_positions`) is one effect: a SYSTEM tx at the pair end is
+/// a standalone INBOUND delivery; otherwise the pair ends on a USER tx (OUTBOUND
+/// or plain). Returns `None` if any pair-end position has no per-tx root (count
+/// drift) — the caller then fails closed.
+fn settlement_effects_from_sync(
+    system_flags: &[bool],
+    per_tx_roots: &[B256],
+) -> Option<Vec<(SettlementKind, B256)>> {
+    pair_end_positions(system_flags)
+        .into_iter()
+        .map(|p| {
+            let kind = if system_flags[p] {
+                SettlementKind::Inbound
+            } else {
+                SettlementKind::Outbound
+            };
+            per_tx_roots.get(p).copied().map(|root| (kind, root))
+        })
+        .collect()
+}
+
+/// STRICT exact-prefix-root check (Step 1, the soundness core). Pure so tests
+/// drive it directly without touching the process-global env flag. Skips leading/
+/// interior no-op ANCHOR entries, then requires the value-bearing effect entries
+/// to correspond 1:1 AND IN ORDER to `effects`:
+/// - counts match (a phantom entry or a dropped effect fails closed);
+/// - `entry.kind == effects[i].kind` (an OUTBOUND may not masquerade as the
+///   position of a LATER INBOUND, and vice-versa);
+/// - `entry.newState == effects[i].post_root` EXACTLY (no jump to a later root
+///   that already folds an unrealized mint);
+/// - `entry.currentState == prev effect's post_root` (or `pre_sync_root` for the
+///   first effect) — enforces the prefix ordering.
+fn strict_settlement_check(
+    entries: &[(SettlementKind, B256, B256)],
+    effects: &[(SettlementKind, B256)],
+    pre_sync_root: B256,
+) -> eyre::Result<()> {
+    let effect_entries: Vec<&(SettlementKind, B256, B256)> = entries
+        .iter()
+        .filter(|(k, _, _)| *k != SettlementKind::Anchor)
+        .collect();
+    if effect_entries.len() != effects.len() {
+        eyre::bail!(
+            "strict: {} value-bearing entries but {} re-executed effects (count mismatch)",
+            effect_entries.len(),
+            effects.len(),
+        );
+    }
+    let mut prev = pre_sync_root;
+    for (i, ((ek, cur, new), (fk, post))) in effect_entries.iter().zip(effects).enumerate() {
+        if ek != fk {
+            eyre::bail!("strict: entry {i} kind {ek:?} != effect kind {fk:?} (kind mismatch)");
+        }
+        if *cur != prev {
+            eyre::bail!(
+                "strict: entry {i} currentState {cur} != previous prefix root {prev} (out of order)"
+            );
+        }
+        if *new != *post {
+            eyre::bail!(
+                "strict: entry {i} newState {new} != exact effect prefix root {post} (jump-to-later-root)"
+            );
+        }
+        prev = *post;
+    }
+    Ok(())
+}
+
+/// The whole STRICT gate as a pure fn (derive effects, fail-closed on missing
+/// roots, then exact-prefix-match). Called by `verify_settlement_chain` only when
+/// `EEZ_STRICT_SETTLEMENT_ROOTS` is on; unit-tested directly.
+///
+/// Fail-closed: if the validator emitted NO per-tx roots (`per_tx_roots == None`)
+/// yet the batch carries any value-bearing/cross-chain entry, refuse — the exact
+/// prefix root cannot be pinned.
+fn strict_settlement_gate(
+    classified: &[(SettlementKind, B256, B256)],
+    system_flags: &[bool],
+    per_tx_roots: Option<&[B256]>,
+    batch_anchor_root: B256,
+) -> eyre::Result<()> {
+    let has_effect_entry = classified
+        .iter()
+        .any(|(k, _, _)| *k != SettlementKind::Anchor);
+    let effects = match per_tx_roots {
+        Some(per_tx) => settlement_effects_from_sync(system_flags, per_tx).ok_or_else(|| {
+            eyre::eyre!("strict: a pair-end position lacks a re-executed per-tx root (count drift)")
+        })?,
+        None => {
+            if has_effect_entry {
+                eyre::bail!(
+                    "strict: batch carries value-bearing/cross-chain entries but the validator emitted no per-tx roots — cannot pin exact prefix roots (fail-closed)"
+                );
+            }
+            Vec::new()
+        }
+    };
+    // pre-Sync-block root = the leading ANCHOR's newState (= state(sync_block-1));
+    // absent an anchor, the batch anchor (a single-block settling window's
+    // state(sync_block-1) == state(posted) == batch_anchor_root).
+    let pre_sync_root = match classified.first() {
+        Some((SettlementKind::Anchor, _, new)) => *new,
+        _ => batch_anchor_root,
+    };
+    strict_settlement_check(classified, &effects, pre_sync_root)
+}
+
 /// Settlement-chain gate (P3-full step 2b): the composer's CLAIMED StateDelta
 /// chain (Position B — exactly one delta per entry) must telescope from the
 /// RE-EXECUTED BATCH-ANCHOR root to the RE-EXECUTED final root:
@@ -1353,6 +1497,28 @@ fn verify_settlement_chain(
     // sealed system tx would pass the calldata-derived gates vacuously.
     if !system_txs_succeeded(&system_flags, vw.sync_tx_statuses.as_deref()) {
         eyre::bail!("a SYSTEM tx in the settled block REVERTED (or per-tx status count drift)");
+    }
+
+    // ── STRICT exact-prefix-root effect matching (Step 1, opt-in) ─────────
+    // Behind `EEZ_STRICT_SETTLEMENT_ROOTS` (DEFAULT OFF). When ON it runs IN
+    // ADDITION to every check above: each settlement entry after the leading
+    // anchor must commit the EXACT prefix root of the matching Sync-block effect,
+    // kind-matched and in order. This closes the jump-to-final-root hole where a
+    // malicious composer settles an OUTBOUND entry whose committed root already
+    // folds a LATER, unrealized INBOUND mint. When OFF, behavior is byte-for-byte
+    // the prior gate.
+    if strict_settlement_roots_enabled() {
+        let classified: Vec<(SettlementKind, B256, B256)> = chain
+            .iter()
+            .zip(entries.iter())
+            .map(|(d, e)| (classify_settlement_entry(e), d.currentState, d.newState))
+            .collect();
+        strict_settlement_gate(
+            &classified,
+            &system_flags,
+            vw.sync_per_tx_roots.as_deref(),
+            batch_anchor_root,
+        )?;
     }
     Ok(())
 }
@@ -3732,6 +3898,229 @@ mod tests {
             .expect("real fixture chain must verify against its re-executed roots");
     }
 
+    // ── ANTI-HALT SEAM (Step 3): the composer's strict batch vs the prover's
+    //    INDEPENDENT re-derivation ────────────────────────────────────────
+    //
+    // The one thing the cross-crate unit tests cannot cover: does the composer's
+    // mid-block-captured prefix root equal the root native-validate INDEPENDENTLY
+    // re-derives from the COMMITTED Sync block? A test that fed the composer's own
+    // captured roots back in as the prover's roots would be CIRCULAR. Here the
+    // prover's roots come ONLY from native-validate re-executing the committed
+    // block RLP — a different binary, a different code path from the composer's
+    // forward capture. Feeding those roots to the SAME strict logic
+    // `verify_settlement_chain` runs under the flag (`strict_settlement_gate`;
+    // driven directly to avoid the process-global env-flag race with the other
+    // settlement tests) and asserting the honest batch is ACCEPTED is the
+    // non-circular seam proof: had the composer's prefix roots diverged from
+    // native-validate's, the gate would reject → no attestation → the rollup halts.
+    //
+    // GATED: skips (passes) unless `EEZ_VALIDATOR_BIN` + `EEZ_CHAIN_CONFIG` are set
+    // (CI has no ZisK toolchain), mirroring `tests/native_validate.rs`. With a
+    // strict mixed/value fixture dir in `EEZ_STRICT_FIXTURE_DIR` (block-<n>.rlp,
+    // witness-<n>.json, postbatch-<n>.json from a `EEZ_STRICT_SETTLEMENT_ROOTS=1`
+    // composer run, `EEZ_STRICT_FIXTURE_N` = n) it also exercises REAL prefix roots
+    // + the attack shape; without it, it runs the committed block-13 window (a
+    // 0-effect settlement — proves the strict path accepts an honest committed
+    // batch end-to-end via native-validate, but not multi-effect prefix roots).
+
+    /// Stage `block-<n>.rlp` + `witness-<n>.json` from `fixture_dir` at window
+    /// index 0, run `native-validate <cfg> --dir`, and parse its JSON summary — an
+    /// INDEPENDENT re-execution of the committed block (NOT the composer's capture).
+    fn seam_run_native_validate(
+        validator_bin: &str,
+        chain_config: &str,
+        fixture_dir: &str,
+        n: u64,
+    ) -> serde_json::Value {
+        let dir = std::env::temp_dir().join(format!("eez-seam-nv-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir seam staging dir");
+        std::fs::copy(
+            format!("{fixture_dir}/block-{n}.rlp"),
+            dir.join("block-0.rlp"),
+        )
+        .expect("stage block rlp");
+        std::fs::copy(
+            format!("{fixture_dir}/witness-{n}.json"),
+            dir.join("witness-0.json"),
+        )
+        .expect("stage witness json");
+        let out = std::process::Command::new(validator_bin)
+            .arg(chain_config)
+            .arg("--dir")
+            .arg(&dir)
+            .output()
+            .expect("spawn native-validate");
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            out.status.success(),
+            "native-validate REJECTED the committed window (exit {:?}).\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            out.status.code(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let line = stdout
+            .lines()
+            .rev()
+            .find(|l| l.trim_start().starts_with('{'))
+            .expect("native-validate JSON summary line");
+        serde_json::from_str(line).expect("parse native-validate JSON summary")
+    }
+
+    /// Build a `VerifiedWindow` from native-validate's summary — every root is the
+    /// validator's INDEPENDENT re-execution output, never a composer claim.
+    fn seam_window_from_summary(summary: &serde_json::Value) -> VerifiedWindow {
+        let parse = |s: &str| s.parse::<B256>().expect("root hex");
+        let blocks = summary["blocks"].as_array().expect("blocks[]");
+        let last = &blocks[blocks.len() - 1];
+        VerifiedWindow {
+            parent_state_root: parse(summary["parent_state_root"].as_str().unwrap()),
+            final_state_root: parse(summary["final_state_root"].as_str().unwrap()),
+            per_block_roots: blocks
+                .iter()
+                .map(|b| b["state_root"].as_str().map(parse))
+                .collect(),
+            sync_per_tx_roots: last["pair_roots"].as_array().map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(parse)
+                    .collect::<Vec<_>>()
+            }),
+            sync_tx_statuses: last["tx_statuses"].as_array().map(|a| {
+                a.iter().filter_map(serde_json::Value::as_bool).collect()
+            }),
+            sync_outbound_call_hashes: last["outbound_call_hashes"].as_array().map(|a| {
+                a.iter().filter_map(|v| v.as_str()).map(parse).collect()
+            }),
+        }
+    }
+
+    /// The classified (kind, currentState, newState) entries the strict gate maps —
+    /// exactly what `verify_settlement_chain` builds internally.
+    fn seam_classify(pb: &eez_control_rpc::v1::PostBatch) -> Vec<(SettlementKind, B256, B256)> {
+        let batch = decode_postbatch(&pb.abi_calldata).expect("decode postbatch");
+        batch
+            .inner
+            .entries
+            .iter()
+            .map(|e| {
+                let d = &e.stateDeltas[0];
+                (classify_settlement_entry(e), d.currentState, d.newState)
+            })
+            .collect()
+    }
+
+    fn seam_load_postbatch(fixture_dir: &str, n: u64) -> (eez_control_rpc::v1::PostBatch, B256) {
+        let raw = std::fs::read_to_string(format!("{fixture_dir}/postbatch-{n}.json"))
+            .expect("postbatch json");
+        let j: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let dec = |k: &str| hex::decode(j[k].as_str().unwrap().trim_start_matches("0x")).unwrap();
+        let pb = eez_control_rpc::v1::PostBatch {
+            abi_calldata: dec("abi_calldata"),
+            ..Default::default()
+        };
+        let anchor = B256::from_slice(&dec("current_state")); // state(posted)
+        (pb, anchor)
+    }
+
+    #[test]
+    fn seam_strict_gate_accepts_honest_batch_against_native_validate() {
+        let (Ok(validator_bin), Ok(chain_config)) = (
+            std::env::var("EEZ_VALIDATOR_BIN"),
+            std::env::var("EEZ_CHAIN_CONFIG"),
+        ) else {
+            eprintln!(
+                "SKIP seam_strict_gate_accepts_honest_batch_against_native_validate: \
+                 set EEZ_VALIDATOR_BIN + EEZ_CHAIN_CONFIG (ZisK native-validate) to run the \
+                 anti-halt seam. NOTE: without it the composer↔prover prefix-root seam is \
+                 UNVERIFIED — do NOT flip EEZ_STRICT_SETTLEMENT_ROOTS on live until this runs green."
+            );
+            return;
+        };
+
+        // A strict mixed/value fixture (real cross-chain effects) if provided,
+        // else the committed block-13 window (0-effect honest settlement).
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let (fixture_dir, n, rich) = match (
+            std::env::var("EEZ_STRICT_FIXTURE_DIR"),
+            std::env::var("EEZ_STRICT_FIXTURE_N"),
+        ) {
+            (Ok(d), Ok(n)) => (d, n.parse::<u64>().expect("EEZ_STRICT_FIXTURE_N u64"), true),
+            _ => (format!("{manifest}/tests/fixtures"), 13, false),
+        };
+
+        // INDEPENDENT re-derivation: native-validate re-executes the committed block.
+        let summary = seam_run_native_validate(&validator_bin, &chain_config, &fixture_dir, n);
+        let vw = seam_window_from_summary(&summary);
+        let (pb, batch_anchor_root) = seam_load_postbatch(&fixture_dir, n);
+        let block_rlp =
+            std::fs::read(format!("{fixture_dir}/block-{n}.rlp")).expect("block rlp");
+        let system_flags = system_tx_flags_from_rlp(&block_rlp);
+        let classified = seam_classify(&pb);
+
+        // THE SEAM: the composer's PostBatch prefix roots (in `classified`) vs the
+        // prover's INDEPENDENT pair_roots (in `vw.sync_per_tx_roots`), run through
+        // the SAME strict logic the real gate uses under the flag.
+        strict_settlement_gate(
+            &classified,
+            &system_flags,
+            vw.sync_per_tx_roots.as_deref(),
+            batch_anchor_root,
+        )
+        .expect(
+            "ANTI-HALT SEAM BROKEN: the composer's strict prefix roots do NOT match \
+             native-validate's independently re-derived roots — flipping the flag would HALT \
+             the rollup (no attestation for an honest batch)",
+        );
+
+        // Sanity: the full gate (endpoints + telescope) also accepts the honest
+        // batch (flag-agnostic path — the strict core is asserted race-free above).
+        verify_settlement_chain(&pb, &vw, batch_anchor_root, &block_rlp).expect(
+            "verify_settlement_chain rejected the honest committed batch against \
+             native-validate's re-derived roots",
+        );
+
+        if rich {
+            // A real multi-effect fixture MUST exercise prefix roots (distinct
+            // interior roots), else it is not the seam we care about.
+            let effects = pair_end_positions(&system_flags).len();
+            assert!(
+                effects >= 1,
+                "EEZ_STRICT_FIXTURE_DIR window has no cross-chain effects — not a strict seam fixture"
+            );
+
+            // ATTACK SHAPE (non-circular): tamper the FIRST effect entry to commit
+            // the FINAL root (the jump-to-later-root the vuln exploits). Fed the
+            // SAME independent native-validate roots, the strict gate MUST reject.
+            let mut tampered = classified.clone();
+            if let Some(first_effect) = tampered.iter_mut().find(|(k, _, _)| *k != SettlementKind::Anchor) {
+                first_effect.2 = vw.final_state_root; // newState := final root
+            }
+            assert!(
+                strict_settlement_gate(
+                    &tampered,
+                    &system_flags,
+                    vw.sync_per_tx_roots.as_deref(),
+                    batch_anchor_root,
+                )
+                .is_err(),
+                "strict gate FAILED to reject the jump-to-final-root attack shape against \
+                 native-validate's roots — the guardrail is INEFFECTIVE"
+            );
+            eprintln!(
+                "SEAM OK (rich): {effects} cross-chain effect(s) — honest strict batch ACCEPTED, \
+                 attack shape REJECTED, both against native-validate's independent roots."
+            );
+        } else {
+            eprintln!(
+                "SEAM OK (block-13, 0 effects): honest committed settlement ACCEPTED via \
+                 native-validate. NOTE: no multi-effect prefix roots exercised — supply \
+                 EEZ_STRICT_FIXTURE_DIR (a EEZ_STRICT_SETTLEMENT_ROOTS=1 mixed/value composer \
+                 fixture) to prove interior prefix roots."
+            );
+        }
+    }
+
     // ── pure helpers (RLP-derived gates, step 2b-3) ──────────────────────
 
     #[test]
@@ -3743,6 +4132,103 @@ mod tests {
         assert_eq!(pair_end_positions(&[true, false]), vec![1]); // system+user = one pair
         assert_eq!(pair_end_positions(&[true]), vec![0]); // standalone system delivery
         assert_eq!(pair_end_positions(&[true, false, false]), vec![1, 2]);
+    }
+
+    // ── STRICT exact-prefix-root gate (Step 1) ───────────────────────────
+
+    #[test]
+    fn strict_rejects_attack_shape() {
+        // Effects (L2 order): [Inbound->R1, Outbound->R2].
+        // Entries: [anchor Rposted->R0, outbound R0->R2, inbound R2->R2].
+        // The outbound entry commits R2 (a LATER root that already folds the
+        // inbound mint) not R1, AND the entry kinds are OUT OF ORDER vs effects
+        // (entry #0 is Outbound but effect #0 is Inbound). Reject.
+        let (rposted, r0, r1, r2) = (
+            B256::repeat_byte(0x0f),
+            B256::repeat_byte(0xa0),
+            B256::repeat_byte(0xb1),
+            B256::repeat_byte(0xb2),
+        );
+        let entries = [
+            (SettlementKind::Anchor, rposted, r0),
+            (SettlementKind::Outbound, r0, r2),
+            (SettlementKind::Inbound, r2, r2),
+        ];
+        let effects = [(SettlementKind::Inbound, r1), (SettlementKind::Outbound, r2)];
+        // pre_sync_root = anchor.newState = R0.
+        assert!(strict_settlement_check(&entries, &effects, r0).is_err());
+    }
+
+    #[test]
+    fn strict_rejects_composer_collapse() {
+        // Effects: [Outbound->R1, Inbound->R2].
+        // Entries (no leading anchor): [outbound R0->R2, inbound R2->R2].
+        // The outbound must commit its OWN prefix root R1 (R0->R1), but instead
+        // jumps to R2. Reject.
+        let (r0, r1, r2) = (
+            B256::repeat_byte(0xa0),
+            B256::repeat_byte(0xb1),
+            B256::repeat_byte(0xb2),
+        );
+        let entries = [
+            (SettlementKind::Outbound, r0, r2),
+            (SettlementKind::Inbound, r2, r2),
+        ];
+        let effects = [(SettlementKind::Outbound, r1), (SettlementKind::Inbound, r2)];
+        assert!(strict_settlement_check(&entries, &effects, r0).is_err());
+    }
+
+    #[test]
+    fn strict_accepts_exact_prefix_chain() {
+        // Effects: [Outbound->R1, Inbound->R2].
+        // Entries: [anchor Rposted->R0, outbound R0->R1, inbound R1->R2].
+        // Each entry commits the EXACT prefix root of its effect, kind-matched
+        // and in order. Accept.
+        let (rposted, r0, r1, r2) = (
+            B256::repeat_byte(0x0f),
+            B256::repeat_byte(0xa0),
+            B256::repeat_byte(0xb1),
+            B256::repeat_byte(0xb2),
+        );
+        let entries = [
+            (SettlementKind::Anchor, rposted, r0),
+            (SettlementKind::Outbound, r0, r1),
+            (SettlementKind::Inbound, r1, r2),
+        ];
+        let effects = [(SettlementKind::Outbound, r1), (SettlementKind::Inbound, r2)];
+        strict_settlement_check(&entries, &effects, r0)
+            .expect("exact-prefix, kind-matched, in-order chain must accept");
+    }
+
+    #[test]
+    fn strict_rejects_missing_per_tx_roots_with_effect_entries() {
+        // No re-executed per-tx roots but a value-bearing (Outbound) entry → the
+        // exact prefix root can't be pinned → fail closed.
+        let (r0, r2) = (B256::repeat_byte(0xa0), B256::repeat_byte(0xb2));
+        let with_effect = [(SettlementKind::Outbound, r0, r2)];
+        assert!(strict_settlement_gate(&with_effect, &[], None, r0).is_err());
+        // An anchor-only batch (no value effects) with no per-tx roots is fine —
+        // there is nothing to pin.
+        let anchor_only = [(SettlementKind::Anchor, r0, r0)];
+        strict_settlement_gate(&anchor_only, &[], None, r0)
+            .expect("anchor-only batch with no effects must pass strict");
+    }
+
+    #[test]
+    fn strict_effect_kind_derivation() {
+        let (ra, rb) = (B256::repeat_byte(0x11), B256::repeat_byte(0x22));
+        // A standalone SYSTEM tx (not followed by a user) is an INBOUND delivery.
+        assert_eq!(
+            settlement_effects_from_sync(&[true], &[ra]),
+            Some(vec![(SettlementKind::Inbound, ra)]),
+        );
+        // A SYSTEM+USER pair ends on the user tx → one OUTBOUND effect at pos 1.
+        assert_eq!(
+            settlement_effects_from_sync(&[true, false], &[ra, rb]),
+            Some(vec![(SettlementKind::Outbound, rb)]),
+        );
+        // A pair-end position with no per-tx root → None (fail-closed).
+        assert_eq!(settlement_effects_from_sync(&[false], &[]), None);
     }
 
     #[test]

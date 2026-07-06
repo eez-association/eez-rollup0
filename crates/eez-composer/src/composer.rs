@@ -41,6 +41,72 @@ use crate::local::build_sync_block;
 use crate::optimistic::OptimisticallyIncluded;
 use crate::rollup::RollupState;
 
+/// STRICT exact-prefix-root settlement flag (security fix, Step 2 — the composer
+/// half). DEFAULT OFF: only "1" / "true" (case-insensitive) turns it on — the
+/// SAME `EEZ_STRICT_SETTLEMENT_ROOTS` variable the prover gate reads. OFF ⇒ every
+/// cross-chain settlement entry collapses its `newState` to the final Sync-block
+/// root (byte-identical to prior behavior). ON ⇒ each entry commits the EXACT
+/// per-effect PREFIX root, so an honest mixed batch passes the prover's strict
+/// gate and the jump-to-final-root attack shape fails it.
+fn strict_settlement_roots_enabled() -> bool {
+    std::env::var("EEZ_STRICT_SETTLEMENT_ROOTS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Chain each per-rollup `stateDelta` so `entries[k].currentState ==
+/// entries[k-1].newState` for that rollup, PRESERVING each rollup's FIRST
+/// `currentState` (the chain anchor). EEZ.sol's `_applyStateDeltas` enforces the
+/// same chain on L1 (`StateRootMismatch` revert). Pure — unit-tested independently
+/// of the async prepare path.
+fn stitch_state_delta_chain(entries: &mut [eez_evm::types::ExecutionEntrySol]) {
+    let mut running_roots: HashMap<U256, B256> = HashMap::new();
+    for entry in entries.iter_mut() {
+        for delta in &mut entry.stateDeltas {
+            if let Some(prev_new) = running_roots.get(&delta.rollupId).copied() {
+                delta.currentState = prev_new;
+            }
+            running_roots.insert(delta.rollupId, delta.newState);
+        }
+    }
+}
+
+/// STRICT settlement (security fix, Step 2): overwrite each NON-anchor entry's
+/// OUR-rollup `newState` with the EXACT per-effect PREFIX root captured during
+/// Sync-block execution, in effect order. `entries[0]` is the leading anchor
+/// (skipped); `entries[1..]` are the cross-chain effect entries in L2 effect order
+/// (outbound then inbound — the same order the Sync block executes and the prover
+/// re-derives). The subsequent [`stitch_state_delta_chain`] then chains each
+/// `currentState` to the previous effect's prefix root (the anchor's `newState` =
+/// state(sync_block-1) seeds the first effect).
+///
+/// # Errors
+/// Count mismatch between non-anchor entries and captured prefix roots — the
+/// caller fails safe (degrades to a minimal batch) rather than emit a mis-rooted
+/// settlement.
+fn apply_strict_effect_prefix_roots(
+    entries: &mut [eez_evm::types::ExecutionEntrySol],
+    rollup_id: U256,
+    effect_prefix_roots: &[B256],
+) -> Result<(), String> {
+    let effect_entries = entries.len().saturating_sub(1);
+    if effect_entries != effect_prefix_roots.len() {
+        return Err(format!(
+            "strict settlement: {effect_entries} cross-chain entries but {} captured \
+             effect prefix roots (count mismatch — refusing to emit a mis-rooted batch)",
+            effect_prefix_roots.len(),
+        ));
+    }
+    for (entry, &post_root) in entries.iter_mut().skip(1).zip(effect_prefix_roots) {
+        for delta in &mut entry.stateDeltas {
+            if delta.rollupId == rollup_id {
+                delta.newState = post_root;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Outcome of `prepare_post_batch_raw`: either a ready-to-dispatch L1 tx
 /// (the synchronous mock-proof path) or a deferred settlement that must
 /// wait for the out-of-process prover's real attestation before it can be
@@ -1034,6 +1100,7 @@ where
                 timestamp,
                 suggested_fee_recipient,
                 &[],
+                false, // empty Sync block — no cross-chain effects to capture
             ) {
                 Ok(built) => Some(SyncSlotBlock {
                     payload: built.payload,
@@ -1065,6 +1132,7 @@ where
                         timestamp,
                         suggested_fee_recipient,
                         &[],
+                        false, // empty Sync block — no cross-chain effects to capture
                     ) {
                         Ok(built) => Some(SyncSlotBlock {
                             payload: built.payload,
@@ -1216,6 +1284,7 @@ where
             timestamp,
             suggested_fee_recipient,
             &drained_raw_txs,
+            false, // vanilla fallback Sync block — no strict prefix-root capture
         ) {
             Ok(built) => {
                 event!(
@@ -1375,6 +1444,7 @@ where
                 target_state_root,
                 &[],
                 &[],
+                &[], // patch-recovery batch → no cross-chain effect prefix roots
             )
             .await?
         {
@@ -2291,6 +2361,7 @@ where
             timestamp,
             suggested_fee_recipient,
             &eez_evm::system_tx::interleave_sync_block_txs(&pairs),
+            strict_settlement_roots_enabled(),
         ) {
             Ok(b) => b,
             Err(e) => {
@@ -2333,6 +2404,7 @@ where
                 built.header.state_root(),
                 &outbound_entries,
                 &outbound_user_txs,
+                &built.pair_end_roots,
             )
             .await
         {
@@ -2522,7 +2594,8 @@ where
             parent_header,
             timestamp,
             suggested_fee_recipient,
-            &[], // no system_txs — empty Sync block
+            &[],   // no system_txs — empty Sync block
+            false, // no cross-chain effects to capture
         )
         .map_err(|e| format!("build_sync_block (empty): {e}"))?;
 
@@ -2535,6 +2608,7 @@ where
                 empty_built.header.state_root(),
                 &[], // no outbound entries in a minimal postBatch
                 &[], // no outbound user txs in a minimal postBatch
+                &[], // no cross-chain effects → no prefix roots
             )
             .await
         {
@@ -2959,6 +3033,7 @@ where
         sync_block_state_root: B256,
         outbound_entries: &[eez_evm::types::ExecutionEntrySol],
         outbound_user_txs: &[Bytes],
+        effect_prefix_roots: &[B256],
     ) -> Result<PostBatchOutcome, String> {
         use eez_evm::types::RollupIdWithProofSystemsSol;
 
@@ -3174,6 +3249,29 @@ where
             }
         }
 
+        // ── STRICT exact-prefix-root assignment (security fix, Step 2) ────────
+        // `effect_prefix_roots` is non-empty ONLY when `EEZ_STRICT_SETTLEMENT_ROOTS`
+        // is ON and this slot carries cross-chain effects. Each captured root is the
+        // cumulative Sync-block post-state root AFTER one L2 cross-chain effect, in
+        // effect order. The batch's non-anchor entries (`entries[1..]`) are the
+        // cross-chain effect entries in the SAME order — outbound entries first,
+        // then inbound deferred entries — which is exactly the Sync block's
+        // execution order (`build_cross_chain_sync_pairs`) and the positional
+        // bijection the prover's inbound-outcome gate already relies on. Assign each
+        // entry's OUR-rollup delta its EXACT prefix root as `newState`; the stitch
+        // below then chains `currentState` = the previous effect's prefix root (and
+        // the anchor's `newState` = state(sync_block-1) for the first effect). When
+        // OFF (`effect_prefix_roots` empty) this block is skipped and every entry
+        // keeps its collapsed `newState = sync_block_state_root` — byte-identical.
+        let strict = !effect_prefix_roots.is_empty();
+        if strict {
+            apply_strict_effect_prefix_roots(
+                &mut batch.inner.entries,
+                rollup_id_u256,
+                effect_prefix_roots,
+            )?;
+        }
+
         // Stitch the per-rollup stateDelta chain across all entries
         // (leading immediate + N deferred cross-chain entries).
         // EEZ.sol's `_applyStateDeltas` enforces
@@ -3182,15 +3280,7 @@ where
         // running-root map preserves each rollup's first
         // `currentState` (= the chain anchor) and chains subsequent
         // entries to the prior delta's `newState`.
-        let mut running_roots: HashMap<U256, B256> = HashMap::new();
-        for entry in &mut batch.inner.entries {
-            for delta in &mut entry.stateDeltas {
-                if let Some(prev_new) = running_roots.get(&delta.rollupId).copied() {
-                    delta.currentState = prev_new;
-                }
-                running_roots.insert(delta.rollupId, delta.newState);
-            }
-        }
+        stitch_state_delta_chain(&mut batch.inner.entries);
 
         // Anchor the LAST entry's `newState` for OUR rollup to the
         // locally-built Sync block's actual root (`sync_block_state_root`).
@@ -3204,18 +3294,27 @@ where
         // deferred chain lands on the same root once consumed. (Q2: explicit
         // last-outbound is future-proof for the mixed A2b batch, where
         // `entries.last()` is an inbound deferred entry, not the outbound one.)
-        let anchor_idx = batch
-            .inner
-            .entries
-            .iter()
-            .rposition(|e| e.proxyEntryHash == B256::ZERO && !e.l2ToL1Calls.is_empty())
-            .or_else(|| batch.inner.entries.len().checked_sub(1));
-        if let Some(idx) = anchor_idx {
-            if let Some(anchor_entry) = batch.inner.entries.get_mut(idx) {
-                for delta in anchor_entry.stateDeltas.iter_mut().rev() {
-                    if delta.rollupId == rollup_id_u256 {
-                        delta.newState = sync_block_state_root;
-                        break;
+        //
+        // STRICT mode SKIPS this collapse: each entry already carries its EXACT
+        // per-effect prefix root, and the LAST effect's prefix root IS the final
+        // Sync-block root — so the chain already terminates correctly. Forcing the
+        // last-OUTBOUND entry to the final root here would re-introduce the very
+        // jump-to-final-root the strict gate rejects (an outbound mid-chain effect
+        // must NOT commit a later inbound mint's root).
+        if !strict {
+            let anchor_idx = batch
+                .inner
+                .entries
+                .iter()
+                .rposition(|e| e.proxyEntryHash == B256::ZERO && !e.l2ToL1Calls.is_empty())
+                .or_else(|| batch.inner.entries.len().checked_sub(1));
+            if let Some(idx) = anchor_idx {
+                if let Some(anchor_entry) = batch.inner.entries.get_mut(idx) {
+                    for delta in anchor_entry.stateDeltas.iter_mut().rev() {
+                        if delta.rollupId == rollup_id_u256 {
+                            delta.newState = sync_block_state_root;
+                            break;
+                        }
                     }
                 }
             }
@@ -3757,5 +3856,144 @@ mod tests {
         let mut batch = eez_evm::EvmBatch::default();
         batch.inner.l1ToL2lookupCalls.push(lookup_with(9));
         assert!(assert_batch_registry_native(&batch, rid).is_err());
+    }
+
+    // ── STRICT exact-prefix-root settlement (security fix, Step 2) ────────
+
+    use eez_evm::types::StateDeltaSol;
+
+    /// One entry carrying a single placeholder settlement delta for `rollup`
+    /// (`currentState` = ZERO placeholder, `newState` = the collapsed final root),
+    /// exactly as the splices in `prepare_post_batch_raw` leave a cross-chain entry
+    /// before the stitch. `outbound` ⇒ proxyEntryHash 0 + a call (an OUTBOUND
+    /// immediate); otherwise a deferred INBOUND (proxyEntryHash != 0).
+    fn cc_entry(rollup: u64, outbound: bool, collapsed_new: B256) -> ExecutionEntrySol {
+        let mut e = if outbound {
+            entry_with(rollup, rollup) // proxyEntryHash 0, non-empty l2ToL1Calls
+        } else {
+            let mut inb = entry_with(rollup, rollup);
+            inb.proxyEntryHash = B256::repeat_byte(0xEE); // deferred inbound
+            inb.l2ToL1Calls = Vec::new();
+            inb
+        };
+        e.stateDeltas = vec![StateDeltaSol {
+            rollupId: U256::from(rollup),
+            currentState: B256::ZERO,
+            newState: collapsed_new,
+            etherDelta: alloy_primitives::I256::ZERO,
+        }];
+        e
+    }
+
+    /// The leading no-op anchor: `currentState` = state(posted), `newState` =
+    /// state(sync_block-1). proxyEntryHash 0, EMPTY l2ToL1Calls.
+    fn anchor_entry(rollup: u64, posted: B256, pre_sync: B256) -> ExecutionEntrySol {
+        ExecutionEntrySol {
+            stateDeltas: vec![StateDeltaSol {
+                rollupId: U256::from(rollup),
+                currentState: posted,
+                newState: pre_sync,
+                etherDelta: alloy_primitives::I256::ZERO,
+            }],
+            proxyEntryHash: B256::ZERO,
+            destinationRollupId: U256::from(rollup),
+            l2ToL1Calls: Vec::new(),
+            expectedL1ToL2Calls: Vec::new(),
+            expectedLookups: Vec::new(),
+            callCount: U256::ZERO,
+            returnData: Bytes::new(),
+            rollingHash: B256::ZERO,
+        }
+    }
+
+    /// TEST 5: with the flag ON, a MIXED (outbound + inbound) batch's generated
+    /// state deltas use per-effect PREFIX roots (distinct interior roots), NOT the
+    /// final Sync-block root on every cross-chain entry — and the chain telescopes
+    /// exactly as the prover's strict gate expects (kind order + exact prefix
+    /// roots + `currentState` == previous effect's post-root).
+    #[test]
+    fn strict_mixed_batch_uses_distinct_prefix_roots() {
+        let rid = 1u64;
+        let posted = B256::repeat_byte(0x0f);
+        let pre_sync = B256::repeat_byte(0xa0); // state(sync_block-1)
+        let r_out = B256::repeat_byte(0xb1); // outbound effect prefix root
+        let r_final = B256::repeat_byte(0xb2); // inbound effect = final root
+        // Effect order (L2): [Outbound, Inbound] — batch order is the same.
+        let mut entries = vec![
+            anchor_entry(rid, posted, pre_sync),
+            cc_entry(rid, true, r_final),  // placeholder collapse to final
+            cc_entry(rid, false, r_final), // placeholder collapse to final
+        ];
+        let effect_prefix_roots = [r_out, r_final];
+
+        apply_strict_effect_prefix_roots(&mut entries, U256::from(rid), &effect_prefix_roots)
+            .expect("count matches (2 effect entries, 2 roots)");
+        stitch_state_delta_chain(&mut entries);
+
+        let d = |i: usize| &entries[i].stateDeltas[0];
+        // Anchor endpoints preserved.
+        assert_eq!(d(0).currentState, posted);
+        assert_eq!(d(0).newState, pre_sync);
+        // Outbound effect: EXACT prefix root, NOT the final root.
+        assert_eq!(d(1).currentState, pre_sync, "first effect chains off the anchor");
+        assert_eq!(d(1).newState, r_out);
+        assert_ne!(d(1).newState, r_final, "outbound must NOT jump to the final root");
+        // Inbound effect: chains off the outbound prefix, terminates at the final root.
+        assert_eq!(d(2).currentState, r_out);
+        assert_eq!(d(2).newState, r_final);
+        // Interior roots are distinct (no collapse).
+        assert_ne!(d(1).newState, d(2).newState);
+        // Mirror the prover's strict gate: newState[i] == effect_prefix_roots[i],
+        // currentState[i] == previous effect post-root (pre_sync for the first).
+        let mut prev = pre_sync;
+        for (i, &post) in effect_prefix_roots.iter().enumerate() {
+            let delta = &entries[i + 1].stateDeltas[0];
+            assert_eq!(delta.currentState, prev);
+            assert_eq!(delta.newState, post);
+            prev = post;
+        }
+    }
+
+    /// Flag OFF (empty prefix roots): the stitch alone leaves every cross-chain
+    /// entry collapsed to the final Sync-block root — byte-identical to the prior
+    /// behavior. (`prepare_post_batch_raw` skips `apply_strict_effect_prefix_roots`
+    /// entirely when `effect_prefix_roots` is empty.)
+    #[test]
+    fn flag_off_collapses_to_final_root() {
+        let rid = 1u64;
+        let posted = B256::repeat_byte(0x0f);
+        let pre_sync = B256::repeat_byte(0xa0);
+        let r_final = B256::repeat_byte(0xb2);
+        let mut entries = vec![
+            anchor_entry(rid, posted, pre_sync),
+            cc_entry(rid, true, r_final),
+            cc_entry(rid, false, r_final),
+        ];
+        // No strict assignment (flag off) — only the stitch runs.
+        stitch_state_delta_chain(&mut entries);
+        assert_eq!(entries[1].stateDeltas[0].newState, r_final);
+        assert_eq!(entries[2].stateDeltas[0].newState, r_final);
+        assert_eq!(entries[1].stateDeltas[0].currentState, pre_sync);
+        assert_eq!(entries[2].stateDeltas[0].currentState, r_final);
+    }
+
+    /// Fail-safe: a count mismatch between non-anchor entries and captured prefix
+    /// roots is refused (the caller degrades to a minimal batch), never emitting a
+    /// mis-rooted settlement.
+    #[test]
+    fn strict_count_mismatch_refused() {
+        let rid = 1u64;
+        let posted = B256::repeat_byte(0x0f);
+        let pre_sync = B256::repeat_byte(0xa0);
+        let r_final = B256::repeat_byte(0xb2);
+        let mut entries = vec![
+            anchor_entry(rid, posted, pre_sync),
+            cc_entry(rid, true, r_final),
+            cc_entry(rid, false, r_final),
+        ];
+        // 2 effect entries but only 1 captured root → refuse.
+        assert!(
+            apply_strict_effect_prefix_roots(&mut entries, U256::from(rid), &[r_final]).is_err()
+        );
     }
 }
