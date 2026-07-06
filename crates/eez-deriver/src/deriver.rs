@@ -13,7 +13,7 @@ use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT, BlockCommitterHandle, DeriveOutcome};
-use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Watcher, Submitter};
+use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Watcher, ScannedBatch, Submitter};
 use reth_chainspec::{ChainSpec, EthereumHardforks};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_ethereum_primitives::TransactionSigned;
@@ -147,9 +147,10 @@ where
         self.inner.l1_head.cursor()
     }
 
-    /// Sync local state with L1's confirmed batch history from the registry
-    /// deploy block onward, replaying non-matching L2 blocks and populating
-    /// `L1CanonicalHead`.
+    /// Reorg-aware catch-up from the latest canonical L1 batch already
+    /// indexed locally, or from the registry deploy block if the index is
+    /// empty. Scans historical `BatchPosted` events in chunks, replaying
+    /// non-matching L2 blocks and populating `L1CanonicalHead`.
     ///
     /// # Errors
     ///
@@ -160,18 +161,6 @@ where
     ///
     /// If the `batches` mutex is poisoned.
     pub async fn catch_up(&self) -> DeriverResult<()> {
-        self.sync_batches(self.inner.deploy_block, 0).await
-    }
-
-    /// Reorg-aware recovery re-sync for gaps the event stream can't be
-    /// trusted across (failed/dropped `BatchPosted`, or the boot window):
-    /// drops index entries no longer canonical on L1, retreats the L2
-    /// anchors if the cursor moved back, then re-scans L1 from the survivor.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::catch_up`].
-    async fn recovery_resync(&self) -> DeriverResult<()> {
         let _guard = self.inner.committer.begin_reconcile().await;
         let old_cursor = self.inner.l1_head.cursor();
         let anchor = self.revalidate_index_tail().await?;
@@ -185,7 +174,7 @@ where
         }
     }
 
-    /// Phase 1 of [`Self::recovery_resync`]: walk the index tail backward,
+    /// Phase 1 of [`Self::catch_up`]: walk the index tail backward,
     /// dropping batches whose recorded L1 hash is no longer canonical.
     /// Returns the highest still-canonical batch's L1 block (the rescan
     /// lower bound), or `None` if the index is empty. Caller holds the
@@ -221,16 +210,10 @@ where
         Ok(None)
     }
 
-    /// Shared body of [`Self::catch_up`] / [`Self::recovery_resync`]: scan
-    /// `BatchPosted` from `from_l1_block`, reconcile not-yet-indexed winners
-    /// with L2-range accounting from `cumulative_start`, then advance the
-    /// safe/finalized anchors.
-    async fn sync_batches(&self, from_l1_block: u64, cumulative_start: u64) -> DeriverResult<()> {
-        let _guard = self.inner.committer.begin_reconcile().await;
-        self.sync_batches_inner(from_l1_block, cumulative_start)
-            .await
-    }
-
+    /// Scan `BatchPosted` from `from_l1_block`, reconciling and committing
+    /// each successful L1 chunk before fetching the next. If a later chunk
+    /// reports an incomplete source, the next catch-up retry can resume from
+    /// the latest canonical batch already indexed in [`L1CanonicalHead`].
     async fn sync_batches_inner(
         &self,
         from_l1_block: u64,
@@ -241,27 +224,76 @@ where
             .l2_provider
             .best_block_number()
             .map_err(DeriverError::l2_provider)?;
+        let mut chunks = self
+            .inner
+            .submitter
+            .batch_log_chunks(from_l1_block)
+            .await
+            .map_err(DeriverError::l1_scan)?;
+        let to_l1_block = chunks.to_block();
         event!(
             name: "eez.deriver.catch_up.start",
             Level::INFO,
             local_head,
             from_l1_block,
+            to_l1_block,
             cumulative_start,
             "starting batch scan to populate L1CanonicalHead and reconcile L2 chain",
         );
 
-        let historical = self
+        if chunks.is_empty() {
+            event!(
+                name: "eez.deriver.catch_up.noop",
+                Level::DEBUG,
+                cursor = cumulative_start,
+                "scan completed without replaying any blocks",
+            );
+            return Ok(());
+        }
+
+        let mut cumulative_l2 = cumulative_start;
+        let mut total_replayed: u64 = 0;
+        while let Some(scanned_batches) = self
             .inner
             .submitter
-            .scan_batches(from_l1_block)
+            .next_batch_log_chunk(&mut chunks)
             .await
-            .map_err(|e| DeriverError::l2_provider(format!("catch-up scan: {e}")))?;
+            .map_err(DeriverError::l1_scan)?
+        {
+            total_replayed += self
+                .reconcile_scanned_batches(&scanned_batches, &mut cumulative_l2)
+                .await?;
+        }
 
+        if total_replayed > 0 {
+            event!(
+                name: "eez.deriver.catch_up.done",
+                Level::INFO,
+                local_head,
+                replayed = total_replayed,
+                cursor = cumulative_l2,
+                "catch-up replay complete",
+            );
+        } else {
+            event!(
+                name: "eez.deriver.catch_up.noop",
+                Level::DEBUG,
+                cursor = cumulative_l2,
+                "scan completed without replaying any blocks",
+            );
+        }
+        Ok(())
+    }
+
+    async fn reconcile_scanned_batches(
+        &self,
+        scanned_batches: &[ScannedBatch],
+        cumulative_l2: &mut u64,
+    ) -> DeriverResult<u64> {
         let known_tx_hashes = self.inner.l1_head.known_tx_hashes();
         let mut new_batches: Vec<BatchRecord> = Vec::new();
-        let mut cumulative_l2: u64 = cumulative_start;
         let mut total_replayed: u64 = 0;
-        for batch in &historical {
+        for batch in scanned_batches {
             let decoded = eez_payload_codec::decode(batch.call_data.as_ref())?;
 
             // `settled_count == 0` = nothing applied on L1 (the claimed
@@ -285,22 +317,22 @@ where
                 continue;
             }
 
-            let batch_first_l2 = cumulative_l2 + 1;
-            let batch_last_l2 = cumulative_l2 + decoded.block_count() as u64;
+            let batch_first_l2 = *cumulative_l2 + 1;
+            let batch_last_l2 = *cumulative_l2 + decoded.block_count() as u64;
 
             // Cursor-alignment guard (as in on_batch_posted): the batch's
             // claimed `currentState` must equal our state root here, else
             // this scan is misaligned with L1 — bail before replaying onto
             // blocks that exist on no other node.
             if let Some(claimed_current) = batch.claimed_current_state {
-                let local_root = self.l2_state_root_at(cumulative_l2)?;
+                let local_root = self.l2_state_root_at(*cumulative_l2)?;
                 if local_root != claimed_current {
                     event!(
                         name: "eez.deriver.catch_up.cursor.misaligned",
                         Level::ERROR,
                         l1_block_number = batch.l1_block_number,
                         tx_hash = %batch.tx_hash,
-                        cumulative_l2,
+                        cumulative_l2 = *cumulative_l2,
                         local_root = %local_root,
                         claimed_current = %claimed_current,
                         "batch currentState does not match local state root at the scan cursor; refusing to replay",
@@ -339,7 +371,7 @@ where
                 batch.l1_block_number,
                 batch.tx_hash,
             )?;
-            cumulative_l2 = batch_last_l2;
+            *cumulative_l2 = batch_last_l2;
         }
 
         // Index every batch we walked (de-duped against startup
@@ -353,8 +385,8 @@ where
         // Delivered reorgs and recovery tail audits retreat it before
         // this forward scan runs.
         let old_safe_l2 = self.inner.safe_l2_block.load(Ordering::Acquire);
-        if cumulative_l2 > old_safe_l2 {
-            let safe_header = self.l2_sealed_header_at(cumulative_l2)?;
+        if *cumulative_l2 > old_safe_l2 {
+            let safe_header = self.l2_sealed_header_at(*cumulative_l2)?;
             let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
             self.inner
                 .committer
@@ -362,27 +394,10 @@ where
                 .await?;
             self.inner
                 .safe_l2_block
-                .store(cumulative_l2, Ordering::Release);
+                .store(*cumulative_l2, Ordering::Release);
         }
 
-        if total_replayed > 0 {
-            event!(
-                name: "eez.deriver.catch_up.done",
-                Level::INFO,
-                local_head,
-                replayed = total_replayed,
-                cursor = cumulative_l2,
-                "catch-up replay complete",
-            );
-        } else {
-            event!(
-                name: "eez.deriver.catch_up.noop",
-                Level::DEBUG,
-                cursor = cumulative_l2,
-                "scan completed without replaying any blocks",
-            );
-        }
-        Ok(())
+        Ok(total_replayed)
     }
 
     /// STF-replay `raw_txs` on top of `parent_block_number`. Timestamp
@@ -571,9 +586,9 @@ where
         // Batches that landed in that window are visible neither in
         // the boot scan nor in live events; a reorg in that window is
         // worse — it invalidates batches the boot scan already
-        // indexed, and no Reorg event for it will ever arrive. The
-        // reorg-aware resync handles both.
-        if let Err(err) = self.recovery_resync().await {
+        // indexed, and no Reorg event for it will ever arrive. Reorg-aware
+        // catch_up handles both.
+        if let Err(err) = self.catch_up().await {
             event!(
                 name: "eez.deriver.resync.failed",
                 Level::ERROR,
@@ -638,11 +653,11 @@ where
         }
     }
 
-    /// Post-failure recovery via [`Self::recovery_resync`]. Returns `false`
-    /// only when the committer is gone and the loop must exit; a failed
-    /// resync is logged and retried at the next L1 event.
+    /// Post-failure recovery via [`Self::catch_up`]. Returns `false` only
+    /// when the committer is gone and the loop must exit; a failed resync is
+    /// logged and retried at the next L1 event.
     async fn try_recover(&self) -> bool {
-        match self.recovery_resync().await {
+        match self.catch_up().await {
             Ok(()) => {
                 event!(
                     name: "eez.deriver.resync.recovered",
@@ -796,7 +811,7 @@ where
         // `_applyStateDeltas` fires in the postBatch tx itself. In the
         // DEFERRED-entry path (our setter / deposit flow) it fires later
         // inside the user_tx calling `executeCrossChainCall` — a
-        // different tx hash in the same L1 block — so `scan_batch_logs`
+        // different tx hash in the same L1 block — so the batch-log scanner
         // reports `state_applied=false`. The `settled_count` gate above
         // already confirmed something settled, so we still process.
         if !state_applied {
