@@ -183,13 +183,20 @@ def run(plan, args):
     )
 
     # ── 5. Follower beacon (no validators) — drives eez-node's embedded reth ─
-    # Peers into Pair B's CL network using the same flags ethereum-package's own
-    # CLs use (--enable-private-discovery is the load-bearing one — see below).
-    # All boot ENRs / peer-ids come from the output API, no scraping.
+    # Flags MATCH ethereum-package's own lighthouse beacon nodes so the follower
+    # behaves like a first-class Pair B peer. The critical set for a private
+    # enclave: --enable-private-discovery (accept private-IP ENRs) PLUS a valid,
+    # advertised ENR (--enr-address/--enr-*-port + --disable-enr-auto-update).
+    # Without the advertised ENR the follower's own ENR has ip4:None, Pair B's
+    # nodes can't score it, and grafting it into the beacon_block gossip mesh
+    # becomes a COIN FLIP — which is why it sometimes tracked the chain and
+    # sometimes stalled at head ~1 with block:"empty". Kurtosis substitutes the
+    # container's real IP for FOLLOWER_IP via private_ip_address_placeholder.
     plan.add_service(
         name = "eez-follower",
         config = ServiceConfig(
             image = eez.get("follower_image", "sigp/lighthouse:v8.1.2"),
+            private_ip_address_placeholder = "FOLLOWER_IP",
             ports = {
                 "http": PortSpec(number = 5252, transport_protocol = "TCP", application_protocol = "http"),
             },
@@ -209,6 +216,10 @@ def run(plan, args):
                 "--trusted-peers=" + ",".join(cl_peer_ids),
                 "--enable-private-discovery",
                 "--disable-packet-filter",
+                "--disable-enr-auto-update",
+                "--enr-address=FOLLOWER_IP",
+                "--enr-udp-port=9000",
+                "--enr-tcp-port=9000",
                 "--subscribe-all-subnets",
                 "--listen-address=0.0.0.0",
                 "--port=9000",
