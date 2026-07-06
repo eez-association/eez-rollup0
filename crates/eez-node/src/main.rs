@@ -20,7 +20,7 @@ mod follower;
 mod ingress;
 mod l1_embedded;
 
-use std::{collections::HashMap, env, str::FromStr, sync::Arc};
+use std::{collections::HashMap, env, str::FromStr, sync::Arc, time::Duration};
 
 use alloy_primitives::{Address, B256};
 use alloy_provider::RootProvider;
@@ -51,6 +51,9 @@ use payload::EezPayloadBuilder;
 /// Per M-MIMALLOC-APPS — meaningful win on allocation-heavy workloads.
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+const BOOT_CATCH_UP_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
+const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -774,23 +777,41 @@ fn main() -> eyre::Result<()> {
             system_tx_cfg,
         );
 
-        if let Err(err) = deriver.catch_up().await {
-            if mode == Mode::Follower {
-                event!(
-                    name: "eez.node.deriver.boot_catch_up.failed",
-                    Level::ERROR,
-                    error = %err,
-                    "boot-time catch_up failed; refusing to start follower before reconciliation",
-                );
-                return Err(eyre::eyre!("boot-time deriver catch_up failed: {err}"));
+        let mut catch_up_retry_delay = BOOT_CATCH_UP_INITIAL_RETRY_DELAY;
+        let mut catch_up_attempts = 0_u64;
+        loop {
+            match deriver.catch_up().await {
+                Ok(()) => break,
+                Err(err) if err.is_source_incomplete() => {
+                    catch_up_attempts += 1;
+                    event!(
+                        name: "eez.node.deriver.boot_catch_up.source_incomplete",
+                        Level::WARN,
+                        mode = mode.name(),
+                        attempts = catch_up_attempts,
+                        retry_delay_secs = catch_up_retry_delay.as_secs(),
+                        error = %err,
+                        "boot-time catch_up could not read all L1 source data yet; retrying before starting L1-active tasks",
+                    );
+                    tokio::time::sleep(catch_up_retry_delay).await;
+                    catch_up_retry_delay = Duration::from_secs(
+                        catch_up_retry_delay
+                            .as_secs()
+                            .saturating_mul(2)
+                            .min(BOOT_CATCH_UP_MAX_RETRY_DELAY.as_secs()),
+                    );
+                }
+                Err(err) => {
+                    event!(
+                        name: "eez.node.deriver.boot_catch_up.failed",
+                        Level::ERROR,
+                        mode = mode.name(),
+                        error = %err,
+                        "boot-time catch_up failed; refusing to start L1-active tasks before reconciliation",
+                    );
+                    return Err(eyre::eyre!("boot-time deriver catch_up failed: {err}"));
+                }
             }
-            event!(
-                name: "eez.node.deriver.boot_catch_up.failed",
-                Level::ERROR,
-                error = %err,
-                "boot-time catch_up failed; refusing to start L1-active tasks before reconciliation",
-            );
-            return Err(eyre::eyre!("boot-time deriver catch_up failed: {err}"));
         }
         event!(
             name: "eez.node.deriver.spawned",
