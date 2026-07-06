@@ -3,9 +3,15 @@
 # Disruptoor to partition the CL P2P network (minority vs majority); healing lets
 # fork-choice reorg the losing side out. Reports the observed depth after each
 # heal. Requires disruptoor enabled + reachable. All knobs are env-overridable:
-#   EEZ_REORG_SCHEDULES ("name:depth:every", deepest match wins), _MINORITY (3,4),
-#   _MAJORITY (1,2), _COMPONENTS (cl), _HEAL_MARGIN_S (6), _POLL_SECONDS (4),
-#   EEZ_L1_SLOT_SECONDS (12), EEZ_REORG_DRY_RUN=1 (log only).
+#   EEZ_REORG_SCHEDULES ("name:depth:every", deepest match wins),
+#   _MAJORITY / _MINORITY (comma-separated Kurtosis service names — the two CL
+#   groups to split; see defaults below), _SCOPE (cl_p2p), _HEAL_MARGIN_S (6),
+#   _POLL_SECONDS (4), EEZ_L1_SLOT_SECONDS (12), EEZ_REORG_DRY_RUN=1 (log only).
+#
+# Disruptoor wire format (v1 /v1/state): groups are LABEL-MATCH selectors
+# (com.kurtosistech.id = service name), and the layer field is "scope"
+# (cl_p2p/el_p2p), NOT the older "components". Older index/participant-based
+# bodies are rejected with `unknown field "components"`.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -18,9 +24,18 @@ source "$HERE/enclave-env.sh"
 L1_RPC="${EEZ_L1_RPC_URL:?could not resolve EEZ_L1_RPC_URL — is the '$ENCLAVE' enclave up? (kurtosis port print $ENCLAVE el-1-reth-lighthouse rpc)}"
 DISRUPTOOR="${EEZ_DISRUPTOOR_URL:-http://127.0.0.1:36000}"
 SCHEDULES="${EEZ_REORG_SCHEDULES:-shallow:1:20 medium:5:100 deep:15:1000}"
-MINORITY="${EEZ_REORG_MINORITY:-3,4}"
-MAJORITY="${EEZ_REORG_MAJORITY:-1,2}"
-COMPONENTS="${EEZ_REORG_COMPONENTS:-cl}"
+# The two CL groups to split, as comma-separated Kurtosis service names
+# (matched on the com.kurtosistech.id label). Defaults: MAJORITY = validators
+# 1,2,3 + the builder CL (the heavier, winning side); MINORITY = validator 4 +
+# the eez-node follower. Putting the follower in the LOSING minority is
+# deliberate — on heal, fork-choice discards the minority branch, so eez-node's
+# embedded reth actually experiences the L1 reorg (the thing we're testing).
+# Every CL must be in one group, or an ungrouped node bridges the split and no
+# fork forms.
+MAJORITY="${EEZ_REORG_MAJORITY:-cl-1-lighthouse-reth,cl-2-lighthouse-reth,cl-3-lighthouse-reth,cl-5-lighthouse-reth-builder}"
+MINORITY="${EEZ_REORG_MINORITY:-cl-4-lighthouse-reth,eez-follower}"
+# Which P2P layer(s) disruptoor cuts. cl_p2p induces CL forks (el_p2p also valid).
+SCOPE="${EEZ_REORG_SCOPE:-cl_p2p}"
 SLOT_SECONDS="${EEZ_L1_SLOT_SECONDS:-12}"
 HEAL_MARGIN_S="${EEZ_REORG_HEAL_MARGIN_S:-6}"
 POLL_SECONDS="${EEZ_REORG_POLL_SECONDS:-4}"
@@ -32,13 +47,19 @@ done
 
 log() { echo "$(date -u +%H:%M:%S) reorg-scheduler: $*"; }
 
-# CSV "3,4" -> JSON array "[3,4]"
-csv_to_json_array() { echo "[${1}]"; }
+# CSV "a,b" -> JSON array of strings '["a","b"]'  (also handles a single item)
+csv_to_json_strs() {
+    local s="$1"
+    echo "[\"${s//,/\",\"}\"]"
+}
 
+# Heal = clear all partitions by PUTting an empty state (confirmed on this
+# disruptoor version; the older POST /v1/state/clear may not exist).
 heal() {
     [[ "$DRY_RUN" == 1 ]] && { log "[dry-run] would clear partition"; return 0; }
-    curl -fsS -X POST "$DISRUPTOOR/v1/state/clear" -o /dev/null \
-        || log "WARN clear failed (is disruptoor up at $DISRUPTOOR?)"
+    curl -fsS -X PUT "$DISRUPTOOR/v1/state" -H 'Content-Type: application/json' \
+        -d '{"partitions":[]}' -o /dev/null \
+        || log "WARN heal failed (is disruptoor up at $DISRUPTOOR?)"
 }
 # Heal on any exit so we never leave the network partitioned.
 trap 'heal' EXIT INT TERM
@@ -49,7 +70,7 @@ partition() {
     local name="$1"
     local body resp http_code
     body="$(cat <<JSON
-{"partitions":[{"name":"$name","groups":[{"participants":$(csv_to_json_array "$MAJORITY")},{"participants":$(csv_to_json_array "$MINORITY")}],"components":$(csv_to_json_array "\"${COMPONENTS//,/\",\"}\"")}]}
+{"partitions":[{"name":"$name","scope":$(csv_to_json_strs "$SCOPE"),"groups":[{"com.kurtosistech.id":$(csv_to_json_strs "$MAJORITY")},{"com.kurtosistech.id":$(csv_to_json_strs "$MINORITY")}]}]}
 JSON
 )"
     if [[ "$DRY_RUN" == 1 ]]; then
@@ -91,7 +112,7 @@ observed_depth() {
 
 trigger_reorg() {
     local name="$1" depth="$2" anchor="$3"
-    log "trigger '$name' depth=$depth at L1 height=$anchor (partition ${MAJORITY} | ${MINORITY} on ${COMPONENTS})"
+    log "trigger '$name' depth=$depth at L1 height=$anchor (partition [${MAJORITY}] | [${MINORITY}] on ${SCOPE})"
 
     # Snapshot hashes for the window we expect to be rewritten.
     local snap="" h hh
