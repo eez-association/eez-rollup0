@@ -27,7 +27,7 @@ use tracing::{Level, event};
 use url::Url;
 
 use crate::error::{L1Error, L1Result};
-use crate::submitter::ScannedBatch;
+use crate::scan::ScannedBatch;
 
 /// [`L1Watcher`] polling cadence. 2s gives prompt detection without
 /// burning RPC quota — half of gnosis's 5s L1 block time, a sixth of
@@ -397,7 +397,7 @@ impl L1Watcher {
                     // tolerance across catch-up is tracked as follow-up.
                     let scan_from = old_tip_number + 1;
                     let chunk_to = scan_from
-                        .saturating_add(crate::submitter::LOG_SCAN_CHUNK_BLOCKS - 1)
+                        .saturating_add(crate::scan::LOG_SCAN_CHUNK_BLOCKS - 1)
                         .min(latest_number);
                     let boundary = if chunk_to == latest_number {
                         BlockSnapshot {
@@ -422,7 +422,7 @@ impl L1Watcher {
                          BatchPosted chunk and reseeding ring at the \
                          chunk boundary",
                     );
-                    let scanned = crate::submitter::scan_batch_logs_range(
+                    let scanned = crate::scan::scan_batch_logs_range(
                         provider,
                         self.inner.config.eez,
                         self.inner.config.rollup_id,
@@ -581,7 +581,7 @@ impl L1Watcher {
             to,
             "scanning L1 range for BatchPosted logs",
         );
-        let scanned = crate::submitter::scan_batch_logs_range(
+        let scanned = crate::scan::scan_batch_logs_range(
             provider,
             self.inner.config.eez,
             self.inner.config.rollup_id,
