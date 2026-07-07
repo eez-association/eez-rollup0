@@ -1194,7 +1194,7 @@ where
                                 event!(name: "eez.composer.cc_compose.outbound_ether_out_missing", Level::WARN, rollup_id, tx_idx = idx, tx_hash = %held.hash, "outbound tx is missing ether out entry, likely malformed; evicting");
                                 poison.push(held);
                                 continue;
-                            },
+                            }
                         };
                         if need > U256::ZERO {
                             if escrow_remaining.is_none() {
