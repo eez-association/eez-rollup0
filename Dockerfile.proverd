@@ -51,8 +51,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=eez-proverd-target,target=/build/target,sharing=locked \
     cargo build --release -p eez-proverd \
-    && cp target/release/eez-proverd /build/eez-proverd \
-    && strip /build/eez-proverd
+    && cp target/release/eez-proverd /build/eez-proverd
 
 # ── validator: native-validate from OUR zisk-eth-client fork ─────────
 FROM rust:1.94-bookworm AS validator

@@ -48,8 +48,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=eez-node-target,target=/build/target,sharing=locked \
     cargo build --release -p eez-node --features fault-inject \
-    && cp target/release/eez-node /build/eez-node \
-    && strip /build/eez-node
+    && cp target/release/eez-node /build/eez-node
 
 # ── runtime: slim image with just the binary + L2 genesis ────────────
 FROM debian:bookworm-slim AS runtime
