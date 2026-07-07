@@ -1186,7 +1186,6 @@ where
                         }
                         // Evict a withdrawal that would exceed the rollup's L1 escrow —
                         // it would revert on-chain and drop the whole bundle. Fail-open.
-                        let rid_u256 = U256::from(rollup_id);
                         let need = eez_evm::entries::outbound_ether_out(&l1_entries[0])
                             .unwrap_or(U256::ZERO);
                         if need > U256::ZERO {
