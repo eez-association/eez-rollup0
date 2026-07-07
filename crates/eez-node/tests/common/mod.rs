@@ -1584,6 +1584,41 @@ pub async fn debug_revert_reason(rpc_url: &str, hash: alloy_primitives::TxHash) 
     }
 }
 
+/// TEMP DIAGNOSTIC: dump every tx receipt in `block` — index, from, to,
+/// status (true=ok/false=reverted), gas_used. Lets us see whether the
+/// postBatch (from=poster, to=EEZ) succeeded and which user txs reverted,
+/// without needing the `debug` RPC namespace.
+pub async fn dump_block_receipts(rpc_url: &str, block: u64) -> String {
+    use alloy_consensus::Transaction as _;
+    use alloy_rpc_types_eth::BlockNumberOrTag;
+    let provider = match ProviderBuilder::new().connect_http(rpc_url.parse().unwrap()) {
+        p => p,
+    };
+    let mut out = format!("block {block} receipts:\n");
+    let blk = match provider
+        .get_block_by_number(BlockNumberOrTag::Number(block))
+        .full()
+        .await
+    {
+        Ok(Some(b)) => b,
+        Ok(None) => return format!("{out}  <block {block} not found>"),
+        Err(e) => return format!("{out}  <get_block error: {e}>"),
+    };
+    for (i, tx) in blk.transactions.txns().enumerate() {
+        let hash = *tx.inner.tx_hash();
+        let (status, gas) = match provider.get_transaction_receipt(hash).await {
+            Ok(Some(r)) => (Some(r.status()), Some(r.gas_used)),
+            _ => (None, None),
+        };
+        out.push_str(&format!(
+            "  [{i}] hash={hash} from={} to={:?} status={status:?} gas_used={gas:?}\n",
+            tx.inner.signer(),
+            tx.to(),
+        ));
+    }
+    out
+}
+
 /// Precomputed config for the embedded-dev-L1 devnet.
 pub struct DevnetCfg {
     pub l1_http_port: u16,

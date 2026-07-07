@@ -158,11 +158,14 @@ async fn cross_chain_setter_deposit_over_bundle() {
             // landed in, and dump the postBatch tx's receipt, so we can see
             // (a) why executeCrossChainCall reverted and (b) whether the
             // postBatch and this user tx shared an L1 block.
-            let reason = common::debug_revert_reason(&l1_rpc, h).await;
             let blk = common::tx_block_number(&l1_rpc, h).await;
+            let receipts = match blk {
+                Some(b) => common::dump_block_receipts(&l1_rpc, b).await,
+                None => "<no block>".to_string(),
+            };
             eprintln!(
                 "DIAG: cross-chain user tx {h} reverted on L1\n  \
-                 landed_in_block={blk:?}\n  revert_reason={reason:?}"
+                 landed_in_block={blk:?}\n{receipts}"
             );
             panic!("cross-chain user tx {h} reverted on L1 (see DIAG above)");
         }
