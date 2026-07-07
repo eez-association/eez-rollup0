@@ -70,6 +70,19 @@ RUN git clone "$ZISK_FORK_URL" . \
     && cargo build --release --bin native-validate \
     && strip target/release/native-validate
 
+# ── chaincfg: derive the validator ChainConfig from the canonical genesis ──
+# native-validate wants a bare alloy `ChainConfig` (genesis.json's `.config`
+# field), NOT the full genesis: ChainConfig is #[serde(default)] with no
+# deny_unknown_fields, so the full file would silently parse as chainId 0
+# with every fork off. Extract at build time so genesis.json stays the
+# single source of truth. Separate stage on purpose: adding jq to the chef
+# apt layer would bust both images' cooked-dependency caches.
+FROM debian:bookworm-slim AS chaincfg
+RUN apt-get update && apt-get install -y --no-install-recommends jq \
+    && rm -rf /var/lib/apt/lists/*
+COPY genesis.json /genesis.json
+RUN jq .config /genesis.json > /l2-chainconfig.json
+
 # ── runtime: slim image with both binaries + the L2 chain-config ─────
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -78,6 +91,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder   /build/target/release/eez-proverd     /usr/local/bin/eez-proverd
 COPY --from=validator /v/target/release/native-validate     /usr/local/bin/native-validate
 # L2 chain-config (alloy ChainConfig; all forks at 0 for the eez-dev chain).
-COPY configs/l2-chainconfig.json /app/l2-chainconfig.json
+COPY --from=chaincfg /l2-chainconfig.json /app/l2-chainconfig.json
 ENTRYPOINT ["eez-proverd"]
 CMD ["--help"]
