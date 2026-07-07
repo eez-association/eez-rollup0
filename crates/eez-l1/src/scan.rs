@@ -62,6 +62,13 @@ pub struct ScannedBatch {
     pub submitter: Address,
     pub rollup_count: U256,
     pub call_data: Bytes,
+    /// The originating postBatch tx's full input (the `postAndVerifyBatch`
+    /// calldata), captured from the tx fetched by (block, index). Carried
+    /// so the Deriver's reconcile fallback decodes `batch.entries`
+    /// from these bytes instead of re-fetching the tx by hash — that lookup
+    /// fails on a pruned or still-resyncing embedded L1 and crashed boot
+    /// catch_up on restart-after-post.
+    pub post_batch_input: Bytes,
     pub state_applied: bool,
     /// How many of this batch's claimed roots L1 settled (0 = skip). See
     /// [`attribute_settlement`].
@@ -193,6 +200,7 @@ pub(crate) async fn scan_batch_logs_range(
             submitter,
             rollup_count: decoded_event.rollupCount,
             call_data: decoded.batch.callData,
+            post_batch_input: input.clone(),
             state_applied: winner_tx_hashes.contains(&tx_hash),
             settled_count,
             settled_final_state,
