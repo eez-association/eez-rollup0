@@ -1185,14 +1185,15 @@ where
                             continue;
                         }
                         // Evict a withdrawal that would exceed the rollup's L1 escrow —
-                        // it would revert on-chain and drop the whole bundle. Fail-open.
-                        let rid_u256 = U256::from(rollup_id);
-                        let need: U256 = l1_entries[0]
-                            .stateDeltas
-                            .iter()
-                            .filter(|d| d.rollupId == rid_u256 && d.etherDelta.is_negative())
-                            .map(|d| d.etherDelta.unsigned_abs())
-                            .fold(U256::ZERO, |acc, v| acc + v);
+                        // it would revert on-chain and drop the whole bundle.
+                        // "ether out" is the amount of Ether being withdrawn in this outbound settlement entry.
+                        // If missing, the entry is malformed and must be evicted.
+                        let Some(need) = eez_evm::entries::outbound_ether_out(&l1_entries[0])
+                        else {
+                            event!(name: "eez.composer.cc_compose.outbound_ether_out_missing", Level::WARN, rollup_id, tx_idx = idx, tx_hash = %held.hash, "outbound tx is missing ether out entry, likely malformed; evicting");
+                            poison.push(held);
+                            continue;
+                        };
                         if need > U256::ZERO {
                             if escrow_remaining.is_none() {
                                 escrow_remaining =
