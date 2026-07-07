@@ -33,7 +33,11 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ── builder: cook deps (cached), then build eez-proverd ──────────────
 FROM chef AS builder
 COPY --from=planner /build/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+# Cook with the SAME package selection as the build below: resolver=2
+# feature-unifies per selected package, so a plain workspace cook produces
+# ~80 dep variants eez-proverd never uses while missing the ones it does —
+# those deps silently recompiled in the source layer on every code change.
+RUN cargo chef cook --release -p eez-proverd --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo build --release -p eez-proverd \
