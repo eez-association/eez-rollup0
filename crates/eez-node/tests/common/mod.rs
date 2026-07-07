@@ -1618,7 +1618,7 @@ impl DevnetCfg {
     pub fn env(&self) -> Vec<(&'static str, String)> {
         vec![
             ("EEZ_L1_EMBEDDED", "1".to_string()),
-            ("EEZ_L1_CHAIN", "dev".to_string()),
+            ("EEZ_L1_CHAIN", "testing".to_string()),
             ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_RPC_URL", self.l1_rpc_url()),
             ("EEZ_L1_HTTP_PORT", self.l1_http_port.to_string()),
