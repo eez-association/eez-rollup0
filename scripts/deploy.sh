@@ -29,29 +29,33 @@ source "$ENV_FILE"
 : "${EEZ_L1_POSTER_KEY:?EEZ_L1_POSTER_KEY not set in .env}"
 : "${EEZ_PROOF_SIGNER_KEY:?EEZ_PROOF_SIGNER_KEY not set in .env}"
 
-# Genesis state root for the rollup — what the contract stores as
-# `rollups[rid].stateRoot` at RegisterRollup time. The first batch's
-# `StateDelta.currentState` must match this value, so it has to equal
-# the L2 reth genesis state root.
-#
-# Pinned to our `genesis.json` (SystemAccount predeposit per Rollup-1.md §3.1 +
-# the EIP-2935 history contract so empty blocks advance state). Recompute when
-# the alloc changes; override via the env var for a different L2 chain spec.
-EEZ_INITIAL_STATE_ROOT="${EEZ_INITIAL_STATE_ROOT:-0x49ecae4742217e1f57d67acf2b9dcfa7fcae5ad7a841423c18ad0a9acd6e4eba}"
+# L2 genesis state root (must equal reth's genesis root, else the first batch
+# reverts). No default: require it from .env, or derive from EEZ_L2_RPC_URL.
+if [[ -z "${EEZ_INITIAL_STATE_ROOT:-}" && -n "${EEZ_L2_RPC_URL:-}" ]]; then
+    EEZ_INITIAL_STATE_ROOT="$(cast block 0 --rpc-url "$EEZ_L2_RPC_URL" --json 2>/dev/null \
+        | python3 -c 'import sys,json; print(json.load(sys.stdin).get("stateRoot",""))' 2>/dev/null)"
+    [[ -n "$EEZ_INITIAL_STATE_ROOT" ]] \
+        && echo "deploy: derived genesis state root from L2 node $EEZ_L2_RPC_URL"
+fi
+: "${EEZ_INITIAL_STATE_ROOT:?not set — put the L2 genesis state root in .env (cast block 0 <L2-rpc> .stateRoot) or set EEZ_L2_RPC_URL so deploy can derive it}"
+
+# Deploy/own key, decoupled from the composer's poster so posting can't advance
+# the deployer's nonce or shift the CREATE addresses. Defaults to the poster.
+EEZ_DEPLOY_KEY="${EEZ_DEPLOY_KEY:-$EEZ_L1_POSTER_KEY}"
 
 # Derive addresses from keys.
 AUTHORIZED_SIGNER="$(cast wallet address --private-key "$EEZ_PROOF_SIGNER_KEY")"
-OWNER="$(cast wallet address --private-key "$EEZ_L1_POSTER_KEY")"
+OWNER="$(cast wallet address --private-key "$EEZ_DEPLOY_KEY")"
 
 echo "deploy: RPC                  = $EEZ_L1_RPC_URL"
-echo "deploy: poster / owner       = $OWNER"
+echo "deploy: deployer / owner     = $OWNER"
 echo "deploy: authorized signer    = $AUTHORIZED_SIGNER"
 echo "deploy: initial state root   = $EEZ_INITIAL_STATE_ROOT"
 echo
 
 CONTRACTS="$REPO/contracts"
 RPC="--rpc-url $EEZ_L1_RPC_URL"
-KEY="--private-key $EEZ_L1_POSTER_KEY"
+KEY="--private-key $EEZ_DEPLOY_KEY"
 
 # Each Foundry deploy script logs `KEY=VALUE` lines via `console.log`.
 # `forge script --silent` still emits these via the script's stdout

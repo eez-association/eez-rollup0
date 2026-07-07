@@ -14,25 +14,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_consensus::Transaction;
 use alloy_eips::{BlockNumberOrTag, Decodable2718};
 use alloy_primitives::{TxHash, U256, hex};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::Filter;
-use alloy_sol_types::{SolCall, SolEvent};
-use eez_evm::types::{
-    BatchPosted, L2ExecutionPerformed, ProofSystemBatchPerVerificationEntriesSol,
-    postAndVerifyBatchCall,
-};
+use alloy_sol_types::SolEvent;
+use eez_evm::types::L2ExecutionPerformed;
 use tracing::{Level, event};
 
 use crate::config::SubmitterConfig;
 use crate::error::{L1Error, L1Result};
+use crate::scan::{BatchLogChunks, ScannedBatch, scan_next_batch_log_chunk};
 
 /// Wall-clock cap on the target-block + inclusion check.
 const TARGET_WAIT_BUDGET: Duration = Duration::from_secs(30);
 const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
 /// L1 block offset for [`BundleTarget::NextBlock`]. slack=2 (over the
 /// minimal latest+1) gives a one-block cushion for when our local
 /// `latest` is stale by the time the relay sees the bundle.
@@ -204,44 +200,41 @@ impl Submitter {
             .is_some())
     }
 
-    /// Walks every past `BatchPosted` event from `deploy_block` to L1
-    /// head and returns one [`HistoricalBatch`] per event, with enough
-    /// metadata (L1 block, tx hash, submitter, raw `callData`) for the
-    /// Deriver's catch-up + reorg-walkback paths to replay them.
+    /// Creates bounded `BatchPosted` log chunks from `from_block` to the
+    /// current L1 head. Call [`Self::next_batch_log_chunk`] to consume it.
     ///
-    /// Called once at deriver startup (catch-up) and on L1 reorg
-    /// (walkback); not on the per-tick hot path.
+    /// # Errors
+    ///
+    /// [`L1Error::Provider`] on RPC failure.
+    pub async fn batch_log_chunks(&self, from_block: u64) -> L1Result<BatchLogChunks> {
+        let provider = self.inner.build_provider();
+        let latest = provider
+            .get_block_number()
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_block_number: {e}")))?;
+        Ok(BatchLogChunks::new(from_block, latest))
+    }
+
+    /// Scans and returns the next `BatchPosted` log chunk, or `None` when
+    /// the chunks are exhausted.
     ///
     /// # Errors
     ///
     /// - [`L1Error::Provider`] on RPC failure (log fetch, tx fetch).
-    /// - [`L1Error::Codec`] only if `block_count` is later called on a
-    ///   malformed batch.
-    pub async fn scan_batches(&self, deploy_block: u64) -> L1Result<Vec<HistoricalBatch>> {
+    /// - [`L1Error::SourceIncomplete`] when a canonical batch tx is not
+    ///   served by the L1 source yet — retryable once the source syncs.
+    pub async fn next_batch_log_chunk(
+        &self,
+        chunks: &mut BatchLogChunks,
+    ) -> L1Result<Option<Vec<ScannedBatch>>> {
         let provider = self.inner.build_provider();
-        let scanned = scan_batch_logs(
+        scan_next_batch_log_chunk(
             &provider,
             self.inner.config.eez,
             self.inner.config.rollup_id,
-            deploy_block,
-            BlockNumberOrTag::Latest,
+            chunks,
         )
-        .await?;
-        Ok(scanned
-            .into_iter()
-            .map(|b| HistoricalBatch {
-                l1_block_number: b.l1_block_number,
-                l1_block_hash: b.l1_block_hash,
-                tx_hash: b.tx_hash,
-                submitter: b.submitter,
-                call_data: b.call_data,
-                state_applied: b.state_applied,
-                settled_count: b.settled_count,
-                settled_final_state: b.settled_final_state,
-                claimed_current_state: b.claimed_current_state,
-                claimed_new_state: b.claimed_new_state,
-            })
-            .collect())
+        .await
     }
 
     /// Hash of the canonical L1 block at `number`, or `None` if none. Used by
@@ -269,35 +262,6 @@ impl Submitter {
             .map_err(|e| L1Error::Provider(format!("get_block_by_number({number}): {e}")))?
             .map(|b| b.header.timestamp))
     }
-}
-
-/// One past `BatchPosted` event, with enough context for the Deriver
-/// to replay (or skip) it during catch-up.
-#[derive(Debug, Clone)]
-pub struct HistoricalBatch {
-    pub l1_block_number: u64,
-    /// Hash of the L1 block the batch landed in — canonicality probe
-    /// for the resync anchor walk.
-    pub l1_block_hash: alloy_primitives::B256,
-    pub tx_hash: alloy_primitives::B256,
-    pub submitter: alloy_primitives::Address,
-    pub call_data: alloy_primitives::Bytes,
-    /// Winner flag: same L1 tx emitted `L2ExecutionPerformed`.
-    /// See [`L1Event::BatchPosted::state_applied`].
-    pub state_applied: bool,
-    /// Entries that actually applied. See
-    /// [`L1Event::BatchPosted::settled_count`].
-    pub settled_count: usize,
-    /// L1's actual stored root after this batch — the reconciliation
-    /// endpoint. See [`L1Event::BatchPosted::settled_final_state`].
-    pub settled_final_state: Option<alloy_primitives::B256>,
-    /// FIRST stateDelta's `currentState` for our rollup — L1's
-    /// pre-batch stored root (Deriver compares to L2's actual at
-    /// `from_block - 1`).
-    pub claimed_current_state: Option<alloy_primitives::B256>,
-    /// LAST stateDelta's `newState` — the composer's claimed full-chain
-    /// endpoint. Diagnostics only; reconcile against `settled_final_state`.
-    pub claimed_new_state: Option<alloy_primitives::B256>,
 }
 
 impl Inner {
@@ -609,258 +573,5 @@ fn dropped(tx_hash: TxHash, target_block: u64, reason: &'static str) -> SendOutc
     SendOutcome::Dropped {
         tx_hash,
         target_block,
-    }
-}
-
-/// Our rollup's stateDelta chain in a batch: the first delta's `currentState`
-/// (pre-batch root) and the ordered per-delta `newState` roots.
-pub(crate) fn our_state_chain(
-    batch: &ProofSystemBatchPerVerificationEntriesSol,
-    rollup_id: u64,
-) -> (Option<alloy_primitives::B256>, Vec<alloy_primitives::B256>) {
-    let rid = U256::from(rollup_id);
-    let mut first_curr: Option<alloy_primitives::B256> = None;
-    let mut new_states: Vec<alloy_primitives::B256> = Vec::new();
-    for entry in &batch.entries {
-        for delta in &entry.stateDeltas {
-            if delta.rollupId == rid {
-                if first_curr.is_none() {
-                    first_curr = Some(delta.currentState);
-                }
-                new_states.push(delta.newState);
-            }
-        }
-    }
-    (first_curr, new_states)
-}
-
-/// How much of this batch L1 actually settled: matches the batch's claimed
-/// `newState` roots against the roots settled in its L1 block, returning the
-/// match count and the deepest match (the batch's true post-batch root), or
-/// `(0, None)` if none match — in which case the deriver skips the batch.
-///
-/// Matched per batch, not by taking the block's last settled root, because two
-/// postBatches for the same rollup can land in one L1 block: an empty `A→A`
-/// batch must not be judged against a rich `A→B` batch's `B` in that block.
-fn attribute_settlement(
-    claimed_chain: &[alloy_primitives::B256],
-    block_settled: Option<&std::collections::HashSet<alloy_primitives::B256>>,
-) -> (usize, Option<alloy_primitives::B256>) {
-    let Some(settled) = block_settled else {
-        return (0, None);
-    };
-    let count = claimed_chain
-        .iter()
-        .filter(|&&root| settled.contains(&root))
-        .count();
-    let final_state = claimed_chain
-        .iter()
-        .rev()
-        .find(|&&root| settled.contains(&root))
-        .copied();
-    (count, final_state)
-}
-
-/// One decoded `BatchPosted` log: winner flag plus the claimed state
-/// roots from our rollup's `StateDelta`. Produced by [`scan_batch_logs`];
-/// the Deriver's catch-up scan and the live
-/// [`L1Watcher`](crate::L1Watcher) poll each project it into their own
-/// type.
-pub(crate) struct ScannedBatch {
-    pub l1_block_number: u64,
-    pub l1_block_hash: alloy_primitives::B256,
-    pub tx_hash: alloy_primitives::B256,
-    pub submitter: alloy_primitives::Address,
-    pub rollup_count: alloy_primitives::U256,
-    pub call_data: alloy_primitives::Bytes,
-    pub state_applied: bool,
-    /// How many of this batch's claimed roots L1 settled (0 = skip). See
-    /// [`attribute_settlement`].
-    pub settled_count: usize,
-    /// Deepest claimed root L1 settled — this batch's actual post-batch endpoint.
-    pub settled_final_state: Option<alloy_primitives::B256>,
-    pub claimed_current_state: Option<alloy_primitives::B256>,
-    pub claimed_new_state: Option<alloy_primitives::B256>,
-}
-
-/// Fetch every `BatchPosted` log in `[from_block, to_block]` and cross-
-/// reference each against `L2ExecutionPerformed` for our rollup — present
-/// ⇔ this batch's state delta applied (winner; losers emit `BatchPosted`
-/// only). For each, decode the originating tx for the submitter, callData
-/// and our rollup's claimed state roots. Shared by
-/// [`Submitter::scan_batches`] (catch-up) and
-/// [`L1Watcher::scan_batch_posted`](crate::L1Watcher) (live poll).
-pub(crate) async fn scan_batch_logs(
-    provider: &impl Provider,
-    eez: alloy_primitives::Address,
-    rollup_id: u64,
-    from_block: u64,
-    to_block: BlockNumberOrTag,
-) -> L1Result<Vec<ScannedBatch>> {
-    let filter = Filter::new()
-        .address(eez)
-        .event_signature(BatchPosted::SIGNATURE_HASH)
-        .from_block(from_block)
-        .to_block(to_block);
-    let logs = provider
-        .get_logs(&filter)
-        .await
-        .map_err(|e| L1Error::Provider(format!("get_logs(BatchPosted): {e}")))?;
-
-    let winners_filter = Filter::new()
-        .address(eez)
-        .event_signature(L2ExecutionPerformed::SIGNATURE_HASH)
-        .topic1(alloy_primitives::U256::from(rollup_id))
-        .from_block(from_block)
-        .to_block(to_block);
-    let winner_logs = provider
-        .get_logs(&winners_filter)
-        .await
-        .map_err(|e| L1Error::Provider(format!("get_logs(L2ExecutionPerformed): {e}")))?;
-    let winner_tx_hashes: std::collections::HashSet<alloy_primitives::B256> = winner_logs
-        .iter()
-        .filter_map(|l| l.transaction_hash)
-        .collect();
-    // `L2ExecutionPerformed.newState` roots L1 settled, per L1 block (per-block
-    // not per-tx: deferred entries emit from the bundled user_tx). Each batch is
-    // credited only its own subset later — see [`attribute_settlement`].
-    let mut settled_by_block: std::collections::HashMap<
-        u64,
-        std::collections::HashSet<alloy_primitives::B256>,
-    > = std::collections::HashMap::new();
-    for l in &winner_logs {
-        if let Some(bn) = l.block_number {
-            let data = l.data().data.as_ref();
-            if data.len() == 32 {
-                settled_by_block
-                    .entry(bn)
-                    .or_default()
-                    .insert(alloy_primitives::B256::from_slice(data));
-            }
-        }
-    }
-
-    let mut out: Vec<ScannedBatch> = Vec::with_capacity(logs.len());
-    for log in &logs {
-        let l1_block_number = log
-            .block_number
-            .ok_or_else(|| L1Error::Provider("BatchPosted log missing block_number".into()))?;
-        let l1_block_hash = log
-            .block_hash
-            .ok_or_else(|| L1Error::Provider("BatchPosted log missing block_hash".into()))?;
-        let tx_hash = log
-            .transaction_hash
-            .ok_or_else(|| L1Error::Provider("BatchPosted log missing tx_hash".into()))?;
-        // Fetch the postBatch tx by (block, index), NOT by hash.
-        // Helps use pruned nodes.
-        let tx_index = log
-            .transaction_index
-            .ok_or_else(|| L1Error::Provider("BatchPosted log missing transaction_index".into()))?;
-        let tx = provider
-            .get_transaction_by_block_number_and_index(
-                BlockNumberOrTag::Number(l1_block_number),
-                tx_index as usize,
-            )
-            .await
-            .map_err(|e| {
-                L1Error::Provider(format!(
-                    "get_tx({l1_block_number}#{tx_index} for {tx_hash}): {e}"
-                ))
-            })?
-            .ok_or_else(|| {
-                L1Error::Provider(format!(
-                    "tx {tx_hash} (block {l1_block_number} idx {tx_index}) not found"
-                ))
-            })?;
-        let submitter = tx.inner.signer();
-        let input = tx.inner.input();
-        let decoded = postAndVerifyBatchCall::abi_decode(input)
-            .map_err(|e| L1Error::Provider(format!("decode postBatch({tx_hash}): {e}")))?;
-        let decoded_event = BatchPosted::decode_log(&alloy_primitives::Log {
-            address: log.address(),
-            data: log.data().clone(),
-        })
-        .map_err(|e| L1Error::Provider(format!("decode BatchPosted({tx_hash}): {e}")))?;
-        let (claimed_current_state, claimed_chain) = our_state_chain(&decoded.batch, rollup_id);
-        let claimed_new_state = claimed_chain.last().copied();
-        let (settled_count, settled_final_state) =
-            attribute_settlement(&claimed_chain, settled_by_block.get(&l1_block_number));
-        out.push(ScannedBatch {
-            l1_block_number,
-            l1_block_hash,
-            tx_hash,
-            submitter,
-            rollup_count: decoded_event.rollupCount,
-            call_data: decoded.batch.callData,
-            state_applied: winner_tx_hashes.contains(&tx_hash),
-            settled_count,
-            settled_final_state,
-            claimed_current_state,
-            claimed_new_state,
-        });
-    }
-    Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::attribute_settlement;
-    use alloy_primitives::B256;
-    use std::collections::HashSet;
-
-    fn settled(roots: &[B256]) -> HashSet<B256> {
-        roots.iter().copied().collect()
-    }
-
-    /// The bug this fix closes: idle `A→A` and rich `A→B` share an L1 block;
-    /// each gets its OWN root, not the block's last (`B`).
-    #[test]
-    fn same_block_batches_attributed_per_chain_not_block_last() {
-        let a = B256::repeat_byte(0xAA);
-        let b = B256::repeat_byte(0xBB);
-        let block = settled(&[a, b]);
-        assert_eq!(attribute_settlement(&[a], Some(&block)), (1, Some(a)));
-        assert_eq!(attribute_settlement(&[b], Some(&block)), (1, Some(b)));
-    }
-
-    /// A loser whose claimed root never settled → `(0, None)` ⇒ deriver skips it.
-    #[test]
-    fn unsettled_loser_is_skipped() {
-        let b = B256::repeat_byte(0xBB);
-        let y = B256::repeat_byte(0xCC);
-        assert_eq!(attribute_settlement(&[y], Some(&settled(&[b]))), (0, None));
-    }
-
-    /// Partial consumption: only a prefix settled → endpoint is the deepest
-    /// settled root, not the claimed end.
-    #[test]
-    fn partial_consumption_uses_deepest_settled_root() {
-        let b = B256::repeat_byte(0x0B);
-        let c = B256::repeat_byte(0x0C);
-        let d = B256::repeat_byte(0x0D);
-        assert_eq!(
-            attribute_settlement(&[b, c, d], Some(&settled(&[b, c]))),
-            (2, Some(c)),
-        );
-    }
-
-    /// Full consumption: the claimed end settled → it's the endpoint.
-    #[test]
-    fn full_consumption_uses_claimed_end() {
-        let b = B256::repeat_byte(0x0B);
-        let c = B256::repeat_byte(0x0C);
-        assert_eq!(
-            attribute_settlement(&[b, c], Some(&settled(&[b, c]))),
-            (2, Some(c)),
-        );
-    }
-
-    /// No settlement for our rollup in the block at all → unsettled.
-    #[test]
-    fn no_block_settlements_is_unsettled() {
-        assert_eq!(
-            attribute_settlement(&[B256::repeat_byte(1)], None),
-            (0, None)
-        );
     }
 }

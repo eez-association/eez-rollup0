@@ -643,8 +643,9 @@ mod tests {
                 .collect(),
             proxyEntryHash: B256::ZERO,
             destinationRollupId: U256::from(dest),
-            L2ToL1Calls: Vec::new(),
+            l2ToL1Calls: Vec::new(),
             expectedL1ToL2Calls: Vec::new(),
+            expectedLookups: Vec::new(),
             callCount: U256::ZERO,
             returnData: Bytes::new(),
             rollingHash: B256::ZERO,
@@ -657,10 +658,12 @@ mod tests {
             destinationRollupId: U256::from(dest),
             returnData: Bytes::new(),
             failed: false,
-            callNumber: 0,
-            lastNestedActionConsumed: 0,
-            calls: Vec::new(),
+            l2ToL1Calls: Vec::new(),
+            expectedL1ToL2Calls: Vec::new(),
+            expectedLookups: Vec::new(),
+            callCount: U256::ZERO,
             rollingHash: B256::ZERO,
+            expectedStateRoots: Vec::new(),
         }
     }
 

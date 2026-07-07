@@ -43,6 +43,8 @@ pub enum L1ChainKind {
     /// auto-mine — engine API driven by an external lighthouse CL
     /// (beacon + validator).
     Devnet,
+    /// Same as `Dev`, plus the non-atomic mock bundle RPC. CI only.
+    Testing,
 }
 
 impl L1ChainKind {
@@ -50,6 +52,7 @@ impl L1ChainKind {
         match std::env::var("EEZ_L1_CHAIN").as_deref() {
             Ok("chiado") => Self::Chiado,
             Ok("devnet") => Self::Devnet,
+            Ok("testing") => Self::Testing,
             _ => Self::Dev,
         }
     }

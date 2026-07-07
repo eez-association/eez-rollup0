@@ -27,16 +27,13 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 K="$REPO/infra/kurtosis"
 
-set -a
-[[ -f "$K/.env" ]] && source "$K/.env"
-[[ -f "$K/endpoints.env" ]] && source "$K/endpoints.env"
-[[ -f "$REPO/deployments.env" ]] && source "$REPO/deployments.env"
-set +a
-
-# ── Endpoints ────────────────────────────────────────────────────────
-L1_RPC="${L1_RPC:-${EEZ_L1_RPC_URL:-http://127.0.0.1:18545}}"   # shared L1 (Kurtosis EL)
-L2_RPC="${L2_RPC:-http://127.0.0.1:18688}"                      # eez-node L2
-EEZ_NODE_LOG="${EEZ_NODE_LOG:-/tmp/eez-node.log}"               # run-eez-node.sh | tee target
+# ── Endpoints (the running node) ─────────────────────────────────────
+L1_RPC="${L1_RPC:-http://localhost:18645}"      # embedded chiado L1
+L2_RPC="${L2_RPC:-http://localhost:18688}"      # L2
+# Inbound cc txs go to the L1 cross-chain front (EEZ_L1_XCHAIN_PORT), not the raw
+# L2 RPC, so the node classifies them Inbound and holds them for composition.
+XCHAIN_L1="${XCHAIN_L1:-http://localhost:18999}"
+NODE_CONTAINER="${NODE_CONTAINER:-eez-node-chiado}"
 
 # ── Knobs ────────────────────────────────────────────────────────────
 WAVE_COUNT="${EEZ_WAVE_COUNT:-5}"
@@ -171,7 +168,7 @@ submit_wave() {
     for i in "${!RAW_TXS[@]}"; do
         local H; H=$(cast keccak "${RAW_TXS[$i]}")
         ALL_USER_TX_HASHES+=("$H"); TX_META+=("$H ${OP_KINDS[$i]} ${OP_ARGS[$i]}")
-        curl -s -X POST "$L2_RPC" -H 'Content-Type: application/json' \
+        curl -s -X POST "$XCHAIN_L1" -H 'Content-Type: application/json' \
             -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"${RAW_TXS[$i]}\"],\"id\":$i}" >/dev/null
     done
     echo "    wave $WAVE_ID submitted: ${#RAW_TXS[@]} ops [$OPS]"
