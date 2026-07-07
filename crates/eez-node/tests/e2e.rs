@@ -135,12 +135,16 @@ async fn happy_case_builder_sustained() {
     // Phase 1 — sustained operation under the first node.
     let n_before;
     let root_before;
+    let pre_restart_latest;
     {
-        let _node = NodeHandle::spawn(datadir.path(), &env).unwrap();
+        let node_before_restart = NodeHandle::spawn(datadir.path(), &env).unwrap();
         n_before = chain
             .wait_for_batches(3, Duration::from_secs(60))
             .await
             .unwrap();
+        pre_restart_latest = wait_for_latest_height(&node_before_restart, 1, DEFAULT_TIMEOUT)
+            .await
+            .expect("pre-restart node did not produce L2 blocks");
         assert_eq!(
             chain.executions_performed().await.unwrap(),
             n_before,
@@ -181,6 +185,10 @@ async fn happy_case_builder_sustained() {
         n_after > n_before,
         "BatchPosted grew ({n_before} → {n_after})"
     );
+    let post_restart_target_height = pre_restart_latest.number + 1;
+    wait_for_latest_height(&node, post_restart_target_height, DEFAULT_TIMEOUT)
+        .await
+        .expect("restarted node did not advance L2 height after restart");
     assert_eq!(
         chain.executions_performed().await.unwrap(),
         n_after,
@@ -209,9 +217,13 @@ async fn happy_case_builder_sustained() {
     wait_for_node_caught_up(&follower, &chain, DEFAULT_TIMEOUT)
         .await
         .expect("follower did not catch up via L1 replay");
-    wait_for_safe_prefix_convergence(&[&node, &follower], n_after as u64, DEFAULT_TIMEOUT)
-        .await
-        .expect("restarted node and replay follower did not converge on safe block hashes");
+    wait_for_safe_prefix_convergence(
+        &[&node, &follower],
+        post_restart_target_height,
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("restarted node and replay follower did not converge on safe block hashes");
     follower.assert_no_process_death();
 }
 
@@ -369,6 +381,12 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
         .wait_for_batches(4, DEFAULT_TIMEOUT)
         .await
         .expect("pre-reorg: ≥4 combined batches");
+    let (c1_pre_reorg_latest, c2_pre_reorg_latest) = tokio::try_join!(
+        wait_for_latest_height(&c1, 1, DEFAULT_TIMEOUT),
+        wait_for_latest_height(&c2, 1, DEFAULT_TIMEOUT),
+    )
+    .expect("pre-reorg: both composers should have produced L2 blocks");
+    let post_reorg_target_height = c1_pre_reorg_latest.number.min(c2_pre_reorg_latest.number) + 1;
 
     // Drop the most recent 3 L1 blocks. Composer's bundle-target window
     // is `latest + 2`, so depth=3 is enough to roll back at least one
@@ -385,6 +403,11 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
         .wait_for_batches(pre_batches + 1, DEFAULT_TIMEOUT)
         .await
         .expect("no batches landed after reorg");
+    tokio::try_join!(
+        wait_for_latest_height(&c1, post_reorg_target_height, DEFAULT_TIMEOUT),
+        wait_for_latest_height(&c2, post_reorg_target_height, DEFAULT_TIMEOUT),
+    )
+    .expect("composers did not advance L2 height after reorg");
 
     // I3 — Each node independently catches up to the (now-advancing)
     // contract: at some poll, `node.safe.stateRoot == contract.stateRoot`
@@ -397,7 +420,7 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
         .expect("c2 did not catch up to contract post-reorg");
 
     // I4 — The nodes agree on block hashes, not only state roots.
-    wait_for_safe_prefix_convergence(&[&c1, &c2], (pre_batches + 1) as u64, DEFAULT_TIMEOUT)
+    wait_for_safe_prefix_convergence(&[&c1, &c2], post_reorg_target_height, DEFAULT_TIMEOUT)
         .await
         .expect("composers did not converge on post-reorg safe block hashes");
 
