@@ -40,6 +40,7 @@ const WAVE_DEPOSITS: &[u128] = &[
 async fn cross_chain_setter_deposit_over_bundle() {
     let cfg = DevnetCfg::new().unwrap();
     let l1_rpc = cfg.l1_rpc_url();
+    let l1_xchain = cfg.l1_xchain_url();
 
     // Value (setter target) is CREATE(deployer, 0); recipient (deposit target)
     // is a fixed EOA. The proxies are created after boot — the classifier routes
@@ -93,8 +94,9 @@ async fn cross_chain_setter_deposit_over_bundle() {
     let recipient_before = l2_balance(&node.l2_rpc_url(), recipient).await.unwrap();
     let deposit_sum: u128 = WAVE_DEPOSITS.iter().sum();
 
-    // Three waves: each wave submits one setter + one deposit op to the L2
-    // ingress (L1-signed, routed to the cross-chain path by source chain id).
+    // Three waves: each wave submits one setter + one deposit op to the L1
+    // cross-chain front (L1-signed; the front is fixed `Inbound` and holds
+    // the tx for the next Sync slot instead of forwarding it to the L1 mempool).
     let mut l1_nonce = pending_nonce(&l1_rpc, user).await.unwrap();
     let mut hashes = Vec::new();
 
@@ -105,7 +107,7 @@ async fn cross_chain_setter_deposit_over_bundle() {
         .abi_encode();
         hashes.push(
             sign_send_raw(
-                &node.l2_rpc_url(),
+                &l1_xchain,
                 user,
                 DEV_CHAIN_ID,
                 l1_nonce,
@@ -120,7 +122,7 @@ async fn cross_chain_setter_deposit_over_bundle() {
         l1_nonce += 1;
         hashes.push(
             sign_send_raw(
-                &node.l2_rpc_url(),
+                &l1_xchain,
                 user,
                 DEV_CHAIN_ID,
                 l1_nonce,

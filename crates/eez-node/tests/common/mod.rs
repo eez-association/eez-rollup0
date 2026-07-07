@@ -1560,6 +1560,7 @@ pub struct DevnetCfg {
     pub l1_http_port: u16,
     pub l1_auth_port: u16,
     pub l1_p2p_port: u16,
+    pub l1_xchain_port: u16,
     pub eez_address: Address,
     pub mock_ps_address: Address,
     pub rollup_manager_address: Address,
@@ -1595,6 +1596,7 @@ impl DevnetCfg {
             l1_http_port,
             l1_auth_port,
             l1_p2p_port: free_port(),
+            l1_xchain_port: free_port(),
             eez_address,
             mock_ps_address,
             rollup_manager_address,
@@ -1611,16 +1613,25 @@ impl DevnetCfg {
         format!("http://127.0.0.1:{}", self.l1_http_port)
     }
 
-    /// Env vars for `eez-node`. The ingress classifier routes our cross-chain
-    /// ops by source chain id (they're signed with the L1 chain id), so the
-    /// proxy-address route isn't needed and proxies don't have to be known
-    /// before boot.
+    /// L1 cross-chain front: a transparent proxy in front of the embedded L1
+    /// RPC that intercepts `eth_sendRawTransaction` and holds the tx for the
+    /// next Sync slot instead of forwarding it to the L1 mempool. Inbound
+    /// (L1→L2) cross-chain ops must be submitted here, not to `l1_rpc_url()`.
+    pub fn l1_xchain_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.l1_xchain_port)
+    }
+
+    /// Env vars for `eez-node`. Inbound cross-chain ops are classified by
+    /// which front they're submitted to (the L1 front is fixed `Inbound`),
+    /// so proxies don't have to be known before boot.
     pub fn env(&self) -> Vec<(&'static str, String)> {
         vec![
             ("EEZ_L1_EMBEDDED", "1".to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
             ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_RPC_URL", self.l1_rpc_url()),
+            ("EEZ_L1_BUILDER_RPC_URL", self.l1_rpc_url()),
+            ("EEZ_L1_XCHAIN_PORT", self.l1_xchain_port.to_string()),
             ("EEZ_L1_HTTP_PORT", self.l1_http_port.to_string()),
             ("EEZ_L1_AUTH_PORT", self.l1_auth_port.to_string()),
             ("EEZ_L1_P2P_PORT", self.l1_p2p_port.to_string()),
@@ -1666,7 +1677,6 @@ impl DevnetCfg {
                 TEST_L2_GENESIS_ENV,
                 self.l2_genesis.0.to_string_lossy().into_owned(),
             ),
-            ("EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS", DEV_CHAIN_ID.to_string()),
         ]
     }
 }
