@@ -1555,6 +1555,35 @@ pub async fn receipt_ok(rpc_url: &str, hash: alloy_primitives::TxHash) -> Result
         .map(|r| r.status()))
 }
 
+/// TEMP DIAGNOSTIC: L1 block a tx landed in (`None` if no receipt yet).
+pub async fn tx_block_number(rpc_url: &str, hash: alloy_primitives::TxHash) -> Option<u64> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse().ok()?);
+    provider
+        .get_transaction_receipt(hash)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.block_number)
+}
+
+/// TEMP DIAGNOSTIC: revert reason for a reverted tx via `debug_traceTransaction`
+/// with the callTracer. Returns the raw JSON trace as a string (the revert
+/// reason / output field is embedded); best-effort — errors are stringified.
+pub async fn debug_revert_reason(rpc_url: &str, hash: alloy_primitives::TxHash) -> String {
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "debug_traceTransaction",
+        "params": [format!("{hash:?}"), { "tracer": "callTracer" }],
+    });
+    match client.post(rpc_url).json(&body).send().await {
+        Ok(resp) => match resp.text().await {
+            Ok(t) => t,
+            Err(e) => format!("<trace body read error: {e}>"),
+        },
+        Err(e) => format!("<debug_traceTransaction error: {e}>"),
+    }
+}
+
 /// Precomputed config for the embedded-dev-L1 devnet.
 pub struct DevnetCfg {
     pub l1_http_port: u16,

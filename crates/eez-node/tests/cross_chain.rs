@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, U256, address};
 use alloy_sol_types::SolCall;
-use anyhow::bail;
 
 mod common;
 use common::{
@@ -142,18 +141,31 @@ async fn cross_chain_setter_deposit_over_bundle() {
     for h in &hashes {
         let h = *h;
         let l1 = l1_rpc.clone();
-        wait_for(SETTLE_TIMEOUT, move || {
+        let outcome = wait_for(SETTLE_TIMEOUT, move || {
             let l1 = l1.clone();
             async move {
                 match receipt_ok(&l1, h).await? {
-                    Some(true) => Ok(Some(())),
-                    Some(false) => bail!("cross-chain user tx {h} reverted on L1"),
+                    Some(true) => Ok(Some(true)),
+                    Some(false) => Ok(Some(false)),
                     None => Ok(None),
                 }
             }
         })
         .await
         .expect("cross-chain user tx did not land on L1");
+        if !outcome {
+            // TEMP DIAGNOSTIC: pull the revert reason + the block the tx
+            // landed in, and dump the postBatch tx's receipt, so we can see
+            // (a) why executeCrossChainCall reverted and (b) whether the
+            // postBatch and this user tx shared an L1 block.
+            let reason = common::debug_revert_reason(&l1_rpc, h).await;
+            let blk = common::tx_block_number(&l1_rpc, h).await;
+            eprintln!(
+                "DIAG: cross-chain user tx {h} reverted on L1\n  \
+                 landed_in_block={blk:?}\n  revert_reason={reason:?}"
+            );
+            panic!("cross-chain user tx {h} reverted on L1 (see DIAG above)");
+        }
     }
 
     let final_value = l2_value(&node.l2_rpc_url(), value_addr).await.unwrap();
