@@ -27,14 +27,18 @@
 //!
 //!   EntryChainClient : ChainClient    entry rollup only
 //!       │
-//!       ├─ simulate_source_tx       runs source simulation, dispatching
-//!       │                           every detected proxy call through
-//!       │                           a borrowed Dispatcher
-//!       └─ stored_target_state_root reads what the entry-chain contract
-//!                                   believes about a target rollup's
-//!                                   state root (for entry building)
+//!       └─ simulate_source_tx       runs source simulation, dispatching
+//!                                   every detected proxy call through
+//!                                   a borrowed Dispatcher
 //!
-//!   TargetExecutionSession      one per source tx per rollup
+//!   CommittedRootReader : ChainClient   committed-root host (L1) only
+//!       │
+//!       └─ stored_target_state_root reads `EEZ.rollups[id].stateRoot`
+//!                                   (the invariant-6 anchor); registered
+//!                                   via `ComposerBuilder::root_reader`
+//!
+//!   TargetExecutionSession      one per builder; the slot drain may
+//!                               chain it across source txs (F1)
 //!       │
 //!       ├─ execute              one call, owned by the builder
 //!       └─ take_checkpoint      drain accumulated state
@@ -68,18 +72,18 @@ use crate::types::ExecutionOutcome;
 /// Request for a single cross-chain execution on the target chain.
 #[derive(Debug, Clone)]
 pub struct ExecutionRequest<P: ChainProtocol + ?Sized> {
-    /// Contract the target-chain call lands on.
-    pub destination: P::Address,
-    /// Encoded calldata for the target-chain call.
-    pub calldata: P::Calldata,
-    /// Native value sent with the call.
+    /// Contract the target-chain call lands on. Spec: `Action.targetAddress`.
+    pub target_address: P::Address,
+    /// Encoded calldata for the target-chain call. Spec: `Action.data`.
+    pub data: P::Calldata,
+    /// Native value sent with the call. Spec: `Action.value`.
     pub value: P::Value,
     /// Original caller on the source chain — becomes `msg.sender` in the
-    /// target invocation.
+    /// target invocation. Spec: `Action.sourceAddress`.
     pub source_address: P::Address,
     /// Rollup ID of the source chain; used for routing and action-hash
-    /// derivation.
-    pub source_rollup: RollupId,
+    /// derivation. Spec: `Action.sourceRollupId`.
+    pub source_rollup_id: RollupId,
 }
 
 /// Full executor response: lean outcome + checkpoint for continuation/proving.
@@ -163,7 +167,7 @@ impl<P: ChainProtocol + ?Sized> std::fmt::Debug for TargetTransaction<P> {
 /// fields are populated so consumers that only need the terminal root
 /// (legacy CCM-verify overwrite path) can keep using `final_state_root`
 /// while nested-composition attribution consumes `per_tx_roots` for
-/// per-entry state-delta chaining (invariant 6).
+/// per-entry state-delta chaining (upstream's invariant 6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetBatchSimulation {
     /// State root after all batch transactions committed in order.
@@ -194,7 +198,10 @@ pub struct TargetVerificationContext<P: ChainProtocol + ?Sized> {
 /// Stateful execution session driving target-chain calls during
 /// source simulation.
 ///
-/// One session per source transaction. Accumulates state across calls;
+/// One session per builder, lazily opened; the slot drain may chain a
+/// live session across consecutive source txs in the same slot (F1 —
+/// see [`CompositionBuilder::with_sessions`](crate::composition::CompositionBuilder::with_sessions));
+/// sessions never outlive their slot. Accumulates state across calls;
 /// `&mut self` on every method reflects that.
 ///
 /// `Send` only (source simulation is single-threaded). No `'static`
@@ -264,9 +271,8 @@ pub trait TargetExecutionSession: Send {
     async fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()>;
 
     /// Retrieve the accumulated witness/overlay checkpoint after all
-    /// calls — the zk-prover-facing handoff distinct from the
-    /// rollback snapshot above. Returns `None` if no calls have been
-    /// executed.
+    /// calls — the prover-facing handoff distinct from the rollback
+    /// snapshot above. Returns `None` if no calls have been executed.
     async fn take_checkpoint(&mut self) -> Option<ProtocolCheckpoint<Self::Protocol>>;
 }
 
@@ -294,7 +300,7 @@ pub trait ChainClient: Send + Sync + 'static {
 
     /// Read this chain's own latest block-header `stateRoot`.
     ///
-    /// Orthogonal to invariant-6 anchoring (which uses
+    /// Orthogonal to upstream-invariant-6 anchoring (which uses
     /// [`CommittedRootReader::stored_target_state_root`] against L1's
     /// canonical storage). Used for diagnostics and health checks.
     ///
@@ -306,7 +312,9 @@ pub trait ChainClient: Send + Sync + 'static {
     /// (e.g. a remote gRPC peer that does not expose this).
     async fn current_state_root(&self) -> ExecutorResult<[u8; 32]>;
 
-    /// Create a fresh stateful execution session for one source transaction.
+    /// Create a fresh stateful execution session. The slot drain may
+    /// keep the returned session alive across consecutive source txs
+    /// in the same slot (F1); it never outlives its slot.
     ///
     /// # Errors
     ///
@@ -374,8 +382,8 @@ pub trait EntryChainClient: ChainClient {
 /// Implemented only by clients connected to the chain that hosts the
 /// canonical committed-root storage. In this protocol that is L1's
 /// `EEZ.sol` — `rollups[id].stateRoot` is the value
-/// `postVerifyAndExecuteOrSaveExecutionsFromBatch` will check
-/// `entry[i].stateDeltas[j].currentState` against (invariant 6).
+/// `postAndVerifyBatch` will check
+/// `entry[i].stateDeltas[j].currentState` against (upstream's invariant 6).
 ///
 /// Implementations:
 /// - Local L1 client (whether registered as entry or as a follower in
@@ -387,17 +395,17 @@ pub trait EntryChainClient: ChainClient {
 /// [`std::sync::Arc<dyn CommittedRootReader>`] via [`ComposerBuilder::root_reader`](crate::composer::ComposerBuilder::root_reader);
 /// [`Composer::simulate_and_resolve`](crate::composer::Composer::simulate_and_resolve) Phase 1 reads ALL rollups'
 /// initial roots through this reader, including the entry rollup's
-/// own. The protocol expects committed roots — `EEZ.sol:1032`
-/// reverts `StateRootMismatch(rollupId)` inside `_applyStateDeltas`
-/// for every delta in a batch — not chain-header self-reports.
+/// own. The protocol expects committed roots — `EEZ.sol`'s
+/// `_applyStateDeltas` reverts `StateRootMismatch(rollupId)` for every
+/// delta in a batch — not chain-header self-reports.
 #[async_trait::async_trait]
 pub trait CommittedRootReader: ChainClient {
     /// Read what the canonical committed-root storage currently has
     /// for `rollup_id`. For this protocol that is
     /// `EEZ.rollups(rollup_id).stateRoot` on L1.
     ///
-    /// This is the invariant-6 anchor —
-    /// `postVerifyAndExecuteOrSaveExecutionsFromBatch` enforces the
+    /// This is the upstream-invariant-6 anchor —
+    /// `postAndVerifyBatch` enforces the
     /// returned value matches each delta's `currentState` for every
     /// state delta in the batch.
     ///

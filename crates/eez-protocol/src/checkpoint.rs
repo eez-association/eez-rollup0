@@ -5,8 +5,9 @@
 //! (the state a call read — what it needed to see). Each chain
 //! implementation provides its own types:
 //!
-//! - EVM: `EvmOverlay` + `EvmWitness` (wrapping alloy's `ExecutionWitness`)
-//! - Non-EVM: custom types implementing [`Serialize`] + [`DeserializeOwned`](serde::de::DeserializeOwned)
+//! - EVM: `EvmOverlay` + `EvmWitness`, defined in `eez-evm`
+//!   (Step 5).
+//! - Non-EVM: custom types implementing [`Serialize`] + [`DeserializeOwned`](serde::de::DeserializeOwned).
 //!
 //! # Why two layers
 //!
@@ -14,11 +15,13 @@
 //! post-call state from the pre-call base — but not the witness,
 //! which is strictly larger.
 //!
-//! A zisk proof wants the **witness** — every storage slot, code
-//! byte, and account the call touched — so the prover can replay the
-//! call without chain state access. Phase 2 integration populates
-//! `witness` via `WitnessRecordingDB`; today it's `None` outside
-//! that build.
+//! A ZK prover wants the **witness** — every storage slot, code byte,
+//! and account the call touched — so the prover can replay the call
+//! without chain state access. The proving path bypasses this field:
+//! the prover consumes witnesses from the composer control feed (reth
+//! `eez_executionWitness` pull), so `witness` is `None` at every
+//! in-tree construction site; the slot remains for chains that ship
+//! witnesses through the checkpoint.
 //!
 //! Keeping them separate means a gRPC-only deployment never pays for
 //! witness recording, and a proving build never ships witness data
@@ -30,10 +33,11 @@ use serde::{Deserialize, Serialize};
 ///
 /// - `overlay`: accumulated state changes (always present). Used for gRPC
 ///   continuation — the server reconstructs state from overlay + base block.
-/// - `witness`: state access data for proving (optional). Required by the
-///   zisk prover to replay execution without chain state access.
-///   Populated in Phase 2 via `WitnessRecordingDB`; today it's always
-///   `None` outside that build.
+/// - `witness`: state access data for proving (optional). The proving
+///   path bypasses it — witnesses ride the composer control feed (reth
+///   `eez_executionWitness` pull) — so it is `None` at every in-tree
+///   construction site; the slot remains for chains that ship
+///   witnesses through the checkpoint.
 ///
 /// Constraint: targets 32-byte-root protocols. Chains with different hash
 /// sizes would need a different checkpoint type.

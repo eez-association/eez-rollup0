@@ -406,7 +406,7 @@ mod tests {
     use crate::composer::{DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig, TargetConfig};
     use crate::composition::Rollup;
     use crate::error::ProtocolResult;
-    use crate::types::RecordedCall;
+    use crate::types::ExecutedAction;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -428,7 +428,7 @@ mod tests {
 
         fn build_batch(
             &self,
-            recorded: &[RecordedCall<Self>],
+            recorded: &[ExecutedAction<Self>],
             _attribution: &crate::composer::SourceAttribution<'_>,
             _dialect: &Self::Dialect,
             _source_rollup_id: RollupId,
@@ -447,7 +447,7 @@ mod tests {
         }
         fn encode_follower_trigger(
             &self,
-            _: &RecordedCall<Self>,
+            _: &ExecutedAction<Self>,
             _: RollupId,
             _: &[u8],
             (): &Self::Dialect,
@@ -476,6 +476,66 @@ mod tests {
         fn decode_calldata(&self, b: &[u8]) -> ProtocolResult<Self::Calldata> {
             Ok(b.to_vec())
         }
+        fn message_id(&self, m: &crate::message::Message<'_, Self>) -> [u8; 32] {
+            // A deterministic fake identity over the 6 fields — enough for tests
+            // that need distinct ids; not the EVM keccak preimage.
+            use sha3::{Digest, Keccak256};
+            let mut h = Keccak256::new();
+            h.update(m.from_rollup.0.to_be_bytes());
+            h.update(m.from_addr);
+            h.update(m.to_rollup.0.to_be_bytes());
+            h.update(m.to_addr);
+            h.update(m.value.to_be_bytes());
+            h.update(m.data);
+            h.finalize().into()
+        }
+    }
+
+    impl crate::capabilities::SettlesOutbound for SmokeProto {
+        fn build_settlement_batch(
+            &self,
+            _calls: &[ExecutedAction<Self>],
+            _dst: RollupId,
+        ) -> ProtocolResult<Self::Batch> {
+            // SmokeProto's targets are never zk-poster, so finalize never calls
+            // this. Honest typed error, never reached.
+            Err(
+                crate::error::ProtocolErrorKind::Unsupported("SmokeProto does not settle outbound")
+                    .into(),
+            )
+        }
+    }
+
+    impl crate::capabilities::ConsumesInbound for SmokeProto {
+        fn encode_delivery(
+            &self,
+            _m: &crate::message::Message<'_, Self>,
+            _d: &crate::message::Delivery<Self>,
+        ) -> Vec<u8> {
+            Vec::new()
+        }
+        fn build_return(
+            &self,
+            _m: &crate::message::Message<'_, Self>,
+            _d: &crate::message::Delivery<Self>,
+        ) -> ProtocolResult<Self::Batch> {
+            Err(
+                crate::error::ProtocolErrorKind::Unsupported("SmokeProto does not consume inbound")
+                    .into(),
+            )
+        }
+        fn build_settlement_only(&self, _settled: RollupId) -> Self::Batch {
+            Vec::new()
+        }
+        fn build_inbound_target_batch(
+            &self,
+            _calls: &[ExecutedAction<Self>],
+            _target_rollup_id: RollupId,
+        ) -> ProtocolResult<Self::Batch> {
+            // SmokeProto's `batch_is_empty` is the default (false), so finalize
+            // never enters the inbound branch for it; never reached.
+            Ok(Vec::new())
+        }
     }
 
     fn outcome(post: [u8; 32]) -> ExecutionOutcome {
@@ -497,6 +557,7 @@ mod tests {
                 contract_address: [0; 20],
                 authorized_proxies_slot: 0,
             },
+            settles_via_session_root: false,
             dialect: (),
         }
     }
@@ -540,15 +601,15 @@ mod tests {
                 .with_simulate_source_hook(move |_raw, dispatcher| {
                     let _follower = Arc::clone(&follower_for_hook);
                     let req = ExecutionRequest {
-                        destination: [0xAB; 20],
-                        calldata: vec![],
+                        target_address: [0xAB; 20],
+                        data: vec![],
                         value: 0,
                         source_address: [0; 20],
-                        source_rollup: entry_id,
+                        source_rollup_id: entry_id,
                     };
                     // The real inspector bridges sync → async via a
                     // scoped OS thread + `Handle::block_on` (see
-                    // `eez-evm-inspector`). Mirror that here so
+                    // `eez-evm-composer`). Mirror that here so
                     // the hook can invoke the async dispatcher from a
                     // sync closure without deadlocking the outer
                     // tokio multi-thread test runtime.

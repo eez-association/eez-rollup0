@@ -1,7 +1,7 @@
 //! Batch-scoped proof-system resolution.
 //!
 //! Under the multi-prover protocol, every batch destined for L1's
-//! `EEZ.postVerifyAndExecuteOrSaveExecutionsFromBatch` carries:
+//! `EEZ.postAndVerifyBatch` carries:
 //!
 //! - a batch-wide ordered `proofSystems[]` (strictly increasing by
 //!   address),
@@ -32,12 +32,10 @@
 //!
 //! # Spec anchors
 //!
-//! - [`docs/DERIVATION.md`](../../docs/DERIVATION.md) §6e
-//!   (Posting — the publicInputsHash fold).
-//! - [`INVARIANTS.md`](../../INVARIANTS.md) Inv 3 (Real-time
-//!   proofs / proof-system pluggable).
-//! - `sync-rollups-protocol@0864392 src/EEZ.sol:606-668` — the
-//!   on-chain construction this trait is shaped to feed.
+//! The shapes here mirror the upstream `sync-rollups-protocol`
+//! Solidity contracts (not vendored in this repo); the
+//! `publicInputsHash` fold and on-chain `_validateStructure` are
+//! the construction this trait is shaped to feed.
 
 use async_trait::async_trait;
 
@@ -67,7 +65,8 @@ pub struct RollupProofAssignment {
 
 /// Per-rollup `(timestamp, blockHash)` pair fetched once from
 /// each manager's `getTimestampAndBlockHash()`. Folded into the
-/// per-PS `publicInputsHash` accumulator (§6e of DERIVATION.md).
+/// per-PS `publicInputsHash` accumulator (upstream's posting
+/// algorithm).
 ///
 /// Wire shape `[u8; 32]` is the natural input to a chain's
 /// `abi.encode`-equivalent fold. The reference `Rollup.sol` stub
@@ -100,8 +99,8 @@ impl Default for TimestampAndBlockHash {
 /// Maps directly to the on-chain
 /// `ProofSystemBatchPerVerificationEntries` struct's
 /// proof-related fields. Consumed by the
-/// `publicInputsHash`-computing layer (Phase 09 §C) +
-/// signer-driven proof population layer (Phase 09 §E).
+/// `publicInputsHash`-computing layer + the signer-driven
+/// proof-population layer (both upstream-specified).
 ///
 /// Generic over `P: ChainProtocol` so the address type (`P::
 /// Address`) stays chain-specific. The `vk_matrix` is jagged:
@@ -121,8 +120,7 @@ where
     pub rollup_assignments: Vec<RollupProofAssignment>,
     /// Per-rollup `(timestamp, blockHash)` parallel to
     /// `rollup_assignments`. Each entry was fetched once via the
-    /// manager's view function ahead of the per-PS loop, per
-    /// `EEZ.sol:642-651`.
+    /// manager's view function ahead of the per-PS loop.
     pub per_rollup_context: Vec<TimestampAndBlockHash>,
     /// Jagged vkey matrix. `vk_matrix[r][j]` is the vkey rollup
     /// `r`'s manager returned for the PS at
@@ -186,19 +184,19 @@ where
 pub enum ProofPlanInvariantError {
     /// `proof_systems` was empty. The on-chain
     /// `_validateStructure` rejects this with
-    /// `InvalidProofSystemConfig` (`EEZ.sol:488`).
+    /// `InvalidProofSystemConfig`.
     #[error("proof_systems is empty")]
     EmptyProofSystems,
     /// `rollup_assignments` was empty. The on-chain
     /// `_validateStructure` rejects this with
-    /// `InvalidProofSystemConfig` (`EEZ.sol:490`).
+    /// `InvalidProofSystemConfig`.
     #[error("rollup_assignments is empty")]
     EmptyRollupAssignments,
     /// `proof_systems` was not strictly increasing. The
     /// chain-agnostic validator can't check for the zero
     /// "address" (the `P::Address` type's zero is
     /// chain-specific); EVM-side impls additionally reject
-    /// `address(0)` per `EEZ.sol:500`.
+    /// `address(0)`.
     #[error("proof_systems not strictly increasing at index {index}")]
     ProofSystemsNotSorted {
         /// Position of the first non-increasing entry.
@@ -220,7 +218,7 @@ pub enum ProofPlanInvariantError {
     },
     /// A `rollup_assignments[r].proof_system_index` was empty.
     /// The on-chain check rejects this with
-    /// `InvalidProofSystemConfig` (`EEZ.sol:517`).
+    /// `InvalidProofSystemConfig`.
     #[error("rollup_assignments[{rollup_idx}].proof_system_index is empty")]
     EmptyProofSystemIndex {
         /// Index into `rollup_assignments` of the offending row.
@@ -284,6 +282,19 @@ pub enum ProofPlanInvariantError {
         /// Actual length found.
         got: usize,
     },
+    /// The batch's `blockNumber` and the supplied L1 block hash disagree.
+    /// A bound batch (`blockNumber != 0`) needs `blockhash(N)` to reproduce
+    /// the on-chain `getTimestampAndBlockHash` fold; a timeless batch
+    /// (`blockNumber == 0`) must not carry one.
+    #[error(
+        "blockNumber/block-hash mismatch: blockNumber={block_number}, hash supplied={hash_supplied}"
+    )]
+    BlockContextMismatch {
+        /// The batch's `blockNumber` field.
+        block_number: u64,
+        /// Whether an L1 block hash was supplied alongside it.
+        hash_supplied: bool,
+    },
 }
 
 impl<P: ChainProtocol + ?Sized> ProofPlan<P>
@@ -293,9 +304,8 @@ where
     /// Walk every structural invariant a well-formed `ProofPlan`
     /// must satisfy, returning the first violation. Resolvers
     /// SHOULD call this on their output before returning;
-    /// downstream consumers (the publicInputsHash computation in
-    /// Phase 09 §C) may rely on the invariants without
-    /// re-checking.
+    /// downstream consumers (the publicInputsHash compute layer)
+    /// may rely on the invariants without re-checking.
     ///
     /// `P::Address: Ord` so we can verify strict-increasing
     /// ordering on `proof_systems`.
@@ -304,9 +314,8 @@ where
     ///
     /// Returns the first [`ProofPlanInvariantError`] encountered.
     pub fn check_invariants(&self) -> Result<(), ProofPlanInvariantError> {
-        // Non-emptiness: matches on-chain `_validateStructure`
-        // (`EEZ.sol:488`, `EEZ.sol:490`). A batch with zero PSes
-        // or zero rollups is rejected loudly.
+        // Non-emptiness: matches on-chain `_validateStructure`.
+        // A batch with zero PSes or zero rollups is rejected loudly.
         if self.proof_systems.is_empty() {
             return Err(ProofPlanInvariantError::EmptyProofSystems);
         }
@@ -408,6 +417,19 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
     struct Empty;
 
+    impl crate::capabilities::SettlesOutbound for Proto {
+        fn build_settlement_batch(
+            &self,
+            _calls: &[crate::ExecutedAction<Self>],
+            _dst: crate::RollupId,
+        ) -> crate::error::ProtocolResult<Self::Batch> {
+            Err(
+                crate::error::ProtocolErrorKind::Unsupported("test fake: no outbound settlement")
+                    .into(),
+            )
+        }
+    }
+
     impl ChainProtocol for Proto {
         type Address = u64;
         type Value = u64;
@@ -419,7 +441,7 @@ mod tests {
 
         fn build_batch(
             &self,
-            _recorded: &[crate::types::RecordedCall<Self>],
+            _recorded: &[crate::types::ExecutedAction<Self>],
             _attribution: &crate::composer::SourceAttribution<'_>,
             _dialect: &Self::Dialect,
             _src: RollupId,
@@ -435,7 +457,7 @@ mod tests {
         }
         fn encode_follower_trigger(
             &self,
-            _: &crate::types::RecordedCall<Self>,
+            _: &crate::types::ExecutedAction<Self>,
             _: RollupId,
             _: &[u8],
             (): &Self::Dialect,
@@ -463,6 +485,10 @@ mod tests {
         }
         fn decode_calldata(&self, b: &[u8]) -> crate::error::ProtocolResult<Vec<u8>> {
             Ok(b.to_vec())
+        }
+        fn message_id(&self, m: &crate::message::Message<'_, Self>) -> [u8; 32] {
+            let _ = m;
+            [0u8; 32]
         }
     }
 

@@ -35,12 +35,15 @@ pub enum L1ChainKind {
     /// `reth_gnosis::GnosisNode` loading the chiado preset; no
     /// auto-mine — engine API driven by an external lighthouse CL.
     Chiado,
+    /// Same as `Dev`, plus the non-atomic mock bundle RPC. CI only.
+    Testing,
 }
 
 impl L1ChainKind {
     pub fn from_env() -> Self {
         match std::env::var("EEZ_L1_CHAIN").as_deref() {
             Ok("chiado") => Self::Chiado,
+            Ok("testing") => Self::Testing,
             _ => Self::Dev,
         }
     }
