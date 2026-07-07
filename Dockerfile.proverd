@@ -31,17 +31,28 @@ COPY crates ./crates
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ── builder: cook deps (cached), then build eez-proverd ──────────────
+# Cache-mount setup mirrors Dockerfile (see the comment there): same
+# mounts on cook and build, registry/git subdirs only, binary cp'd out
+# of the mount. Target id is per-image — eez-proverd resolves different
+# dep feature sets than eez-node, and a shared target would thrash.
 FROM chef AS builder
 COPY --from=planner /build/recipe.json recipe.json
 # Cook with the SAME package selection as the build below: resolver=2
 # feature-unifies per selected package, so a plain workspace cook produces
 # ~80 dep variants eez-proverd never uses while missing the ones it does —
 # those deps silently recompiled in the source layer on every code change.
-RUN cargo chef cook --release -p eez-proverd --recipe-path recipe.json
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=eez-proverd-target,target=/build/target,sharing=locked \
+    cargo chef cook --release -p eez-proverd --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release -p eez-proverd \
-    && strip target/release/eez-proverd
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=eez-proverd-target,target=/build/target,sharing=locked \
+    cargo build --release -p eez-proverd \
+    && cp target/release/eez-proverd /build/eez-proverd \
+    && strip /build/eez-proverd
 
 # ── validator: native-validate from OUR zisk-eth-client fork ─────────
 FROM rust:1.94-bookworm AS validator
@@ -92,7 +103,7 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder   /build/target/release/eez-proverd     /usr/local/bin/eez-proverd
+COPY --from=builder   /build/eez-proverd                    /usr/local/bin/eez-proverd
 COPY --from=validator /v/target/release/native-validate     /usr/local/bin/native-validate
 # L2 chain-config (alloy ChainConfig; all forks at 0 for the eez-dev chain).
 COPY --from=chaincfg /l2-chainconfig.json /app/l2-chainconfig.json
