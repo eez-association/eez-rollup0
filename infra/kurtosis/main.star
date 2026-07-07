@@ -10,11 +10,10 @@
 #           beacon-only follower Lighthouse that drives eez-node's embedded reth
 #           over the engine API.
 #
-# Everything talks over the enclave's internal DNS on fixed ports, so the old
-# host-side scrape/bridge scripts (parse-endpoints, extract-genesis,
-# get-cl-bootnode, get-el-bootnode, host.docker.internal) are gone: the enclave
-# EL's enode, the CL's ENR/multiaddr, and the genesis artifact all come straight
-# from ethereum-package's run() output.
+# Everything talks over the enclave's internal DNS on fixed ports: the EL
+# enode, the CL ENRs/multiaddrs, and the genesis artifact all come straight
+# from ethereum-package's run() output, so nothing needs to be scraped off the
+# host.
 #
 # Usage:  kurtosis run . --args-file args.yaml     (see args.example.yaml)
 
@@ -44,7 +43,7 @@ def run(plan, args):
     proof_signer_key = eez.get("proof_signer_key", "")
     if poster_key in ["", "0xCHANGE_ME"] or proof_signer_key in ["", "0xCHANGE_ME"]:
         fail("set eez.poster_key and eez.proof_signer_key in the args file " +
-             "(copy args.example.yaml → args.yaml; see the 'Keys' section of the README)")
+             "(bash infra/kurtosis/up.sh derives both automatically on first run)")
 
     # ── 1. Pair B: the whole L1 / MEV / load stack ──────────────────────
     eth = ethereum_package.run(plan, eth_args)
@@ -183,15 +182,13 @@ def run(plan, args):
     )
 
     # ── 5. Follower beacon (no validators) — drives eez-node's embedded reth ─
-    # Flags MATCH ethereum-package's own lighthouse beacon nodes so the follower
-    # behaves like a first-class Pair B peer. The critical set for a private
-    # enclave: --enable-private-discovery (accept private-IP ENRs) PLUS a valid,
-    # advertised ENR (--enr-address/--enr-*-port + --disable-enr-auto-update).
-    # Without the advertised ENR the follower's own ENR has ip4:None, Pair B's
-    # nodes can't score it, and grafting it into the beacon_block gossip mesh
-    # becomes a COIN FLIP — which is why it sometimes tracked the chain and
-    # sometimes stalled at head ~1 with block:"empty". Kurtosis substitutes the
-    # container's real IP for FOLLOWER_IP via private_ip_address_placeholder.
+    # Flags mirror ethereum-package's own lighthouse nodes so the follower is a
+    # first-class Pair B peer on the private enclave: --enable-private-discovery
+    # (accept private-IP ENRs) + a stable advertised ENR (--enr-address/-*-port,
+    # auto-update off). The advertised ENR is required: without an IP in its ENR
+    # peers can't score the follower and won't reliably graft it into the
+    # block-gossip mesh. Kurtosis fills FOLLOWER_IP with the container IP via
+    # private_ip_address_placeholder.
     plan.add_service(
         name = "eez-follower",
         config = ServiceConfig(

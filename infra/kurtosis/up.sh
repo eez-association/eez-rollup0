@@ -20,23 +20,41 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 ENCLAVE="${KURTOSIS_ENCLAVE:-eez-devnet}"
 ARGS_FILE="${1:-$HERE/args.yaml}"
+# ethereum-package's standard prefunded dev mnemonic. Indices 1/2 are unused by
+# the package itself (0=builder coinbase, 3=tx_fuzz, 12=deployer, 13=spamoor).
+DEV_MNEMONIC="giant issue aisle success illegal bike spike question tent bar rely arctic volcano long crawl hungry vocal artwork sniff fantasy very lucky have athlete"
 
 command -v kurtosis >/dev/null || { echo "kurtosis not found in PATH" >&2; exit 1; }
 command -v docker   >/dev/null || { echo "docker not found in PATH" >&2; exit 1; }
 
+# First run: create args.yaml from the example so there's nothing to hand-copy.
 if [[ ! -f "$ARGS_FILE" ]]; then
-    cat >&2 <<EOF
-missing args file: $ARGS_FILE
-  cp $HERE/args.example.yaml $HERE/args.yaml
-  \$EDITOR $HERE/args.yaml   # set eez.poster_key / eez.proof_signer_key
-EOF
-    exit 1
+    echo "==> $ARGS_FILE not found, creating it from args.example.yaml"
+    cp "$HERE/args.example.yaml" "$ARGS_FILE"
 fi
 
 # Flat "key: value" lookup out of the args file (strips quotes + comments) so the
 # images we build are tagged exactly as main.star will reference them.
 yv() { grep -E "^[[:space:]]*$1:" "$ARGS_FILE" | head -1 \
         | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//'; }
+
+# First run: derive the poster/proof-signer keys from the dev mnemonic instead
+# of asking for a manual `cast wallet private-key` + paste step.
+for pair in "poster_key:1" "proof_signer_key:2"; do
+    key="${pair%%:*}"; index="${pair##*:}"
+    if [[ "$(yv "$key")" == "0xCHANGE_ME" ]]; then
+        command -v cast >/dev/null || {
+            echo "cast not found in PATH — needed to auto-derive eez.$key." >&2
+            echo "Install foundry, or set eez.$key in $ARGS_FILE by hand." >&2
+            exit 1
+        }
+        derived="$(cast wallet private-key --mnemonic "$DEV_MNEMONIC" --mnemonic-index "$index")"
+        sed -i.bak -E "s|^([[:space:]]*${key}:).*|\\1 \"${derived}\"|" "$ARGS_FILE"
+        rm -f "$ARGS_FILE.bak"
+        echo "==> derived eez.$key from the dev mnemonic (index $index)"
+    fi
+done
+
 NODE_IMAGE="$(yv eez_node_image)";  NODE_IMAGE="${NODE_IMAGE:-eez-node:dev}"
 DEPLOY_IMAGE="$(yv deploy_image)";  DEPLOY_IMAGE="${DEPLOY_IMAGE:-eez-deploy:dev}"
 

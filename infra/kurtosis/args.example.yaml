@@ -1,5 +1,6 @@
-# Copy to args.yaml (gitignored) and fill in the two keys under `eez:`.
-# Run:  cd infra/kurtosis && bash up.sh        (or: kurtosis run . --args-file args.yaml)
+# Template for args.yaml (gitignored). `up.sh` copies this to args.yaml and
+# fills in eez.poster_key / eez.proof_signer_key automatically on first run —
+# edit args.yaml directly afterward, this file is just the starting point.
 #
 # Two top-level blocks:
 #   ethereum_package:  passed verbatim to ethpandaops/ethereum-package (Pair B).
@@ -77,10 +78,10 @@ eez:
   deploy_image: eez-deploy:dev
   follower_image: sigp/lighthouse:v8.1.2
 
-  # ── Keys (FILL THESE IN) ────────────────────────────────────────────
-  # Prefunded ethereum-package mnemonic accounts at UNUSED indices (1, 2, 4, 5);
-  # avoid 0 (builder coinbase), 3 (tx_fuzz), 12 (deployer), 13 (spamoor). See
-  # README "Keys" for the `cast wallet private-key` invocation.
+  # ── Keys ────────────────────────────────────────────────────────────
+  # up.sh derives both from ethereum-package's prefunded dev mnemonic
+  # (indices 1, 2) the first time it sees "0xCHANGE_ME" here. Set them by
+  # hand instead to use different funded accounts.
   poster_key: "0xCHANGE_ME"
   proof_signer_key: "0xCHANGE_ME"
 
