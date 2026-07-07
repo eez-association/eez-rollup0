@@ -678,7 +678,7 @@ pub struct ScannedBatch {
     pub call_data: alloy_primitives::Bytes,
     /// The originating postBatch tx's full input (the `postAndVerifyBatch`
     /// calldata), captured from the tx fetched by (block, index). Carried
-    /// so the Deriver's codec-v1 reconcile fallback decodes `batch.entries`
+    /// so the Deriver's reconcile fallback decodes `batch.entries`
     /// from these bytes instead of re-fetching the tx by hash — that lookup
     /// fails on a pruned or still-resyncing embedded L1 and crashed boot
     /// catch_up on restart-after-post.

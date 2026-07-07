@@ -86,7 +86,7 @@ pub enum L1Event {
         call_data: Bytes,
         /// The originating postBatch tx's full `postAndVerifyBatch` input,
         /// captured from the tx fetched by (block, index) during the scan.
-        /// The Deriver's codec-v1 reconcile fallback decodes `batch.entries`
+        /// The Deriver's reconcile fallback decodes `batch.entries`
         /// from these bytes instead of re-fetching the tx by hash (which
         /// fails on a pruned or still-resyncing embedded L1).
         post_batch_input: Bytes,

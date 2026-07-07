@@ -1103,7 +1103,7 @@ where
         let sync_block_txs: Option<Vec<Vec<u8>>> = match self.inner.system_tx_cfg.as_ref() {
             Some(cfg) => {
                 let mut entries = if decoded.l2_entries.is_empty() {
-                    // codec-v1 fallback: decode the on-chain `batch.entries[]`
+                    // decode the on-chain `batch.entries[]`
                     // from the postBatch tx input captured during the scan
                     // (tx fetched by (block, index), pruning-robust). No
                     // re-fetch by tx hash here — that lookup fails on a pruned
