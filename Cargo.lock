@@ -3152,7 +3152,6 @@ dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
  "alloy-primitives",
- "alloy-provider",
  "alloy-rpc-types-engine",
  "alloy-sol-types",
  "eez-driver",
