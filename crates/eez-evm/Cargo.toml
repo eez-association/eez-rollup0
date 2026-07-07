@@ -29,12 +29,16 @@ alloy-contract.workspace = true
 k256.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 # signed L2 system txs (system_tx module)
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-signer-local.workspace = true
 reth-ethereum-primitives.workspace = true
+# outbound gate: recover the signer of the paired user tx (SignedTransaction)
+reth-primitives-traits.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
 tokio = { workspace = true }
+eez-payload-codec.workspace = true

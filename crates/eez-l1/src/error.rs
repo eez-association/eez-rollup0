@@ -1,5 +1,6 @@
 //! Error type for L1 interactions. `thiserror`-derived; small surface.
 
+use alloy_primitives::B256;
 use thiserror::Error;
 
 /// Convenience [`Result`] alias.
@@ -14,6 +15,15 @@ pub enum L1Error {
     /// Anything that went wrong talking to L1 (RPC transport, contract call decode).
     #[error("L1 provider error: {0}")]
     Provider(String),
+    /// L1 exposed canonical metadata but not all data needed to decode
+    /// or replay it yet. This is expected while a local L1 source is
+    /// warming up and should be retried by boot reconciliation.
+    #[error("L1 source incomplete at block {block}: tx {tx_hash} unavailable ({detail})")]
+    SourceIncomplete {
+        block: u64,
+        tx_hash: B256,
+        detail: String,
+    },
     /// postBatch tx didn't land or reverted on-chain.
     #[error("postBatch submission failed: {0}")]
     Submission(String),
@@ -48,4 +58,13 @@ pub enum L1Error {
         "L1 reorg too deep: walked {walked} blocks without finding a common ancestor (max {max})"
     )]
     ReorgTooDeep { walked: usize, max: usize },
+}
+
+impl L1Error {
+    /// Returns true when the L1 source may simply need more time to
+    /// expose already-observed canonical data.
+    #[must_use]
+    pub const fn is_source_incomplete(&self) -> bool {
+        matches!(self, Self::SourceIncomplete { .. })
+    }
 }

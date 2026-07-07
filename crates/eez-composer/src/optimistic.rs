@@ -282,6 +282,7 @@ mod tests {
             attempts: 0,
             sender: alloy_primitives::Address::repeat_byte(tag),
             nonce: u64::from(tag),
+            direction: crate::ingress::Direction::Inbound,
         }
     }
 
