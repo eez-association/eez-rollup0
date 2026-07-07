@@ -1584,6 +1584,47 @@ pub async fn debug_revert_reason(rpc_url: &str, hash: alloy_primitives::TxHash) 
     }
 }
 
+/// TEMP DIAGNOSTIC: hash of the first tx in `block` (the postBatch, in a
+/// settlement bundle), or `None` if the block is empty / unavailable.
+pub async fn first_tx_in_block(rpc_url: &str, block: u64) -> Option<alloy_primitives::TxHash> {
+    use alloy_rpc_types_eth::BlockNumberOrTag;
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse().ok()?);
+    let blk = provider
+        .get_block_by_number(BlockNumberOrTag::Number(block))
+        .full()
+        .await
+        .ok()??;
+    blk.transactions.txns().next().map(|tx| *tx.inner.tx_hash())
+}
+
+/// TEMP DIAGNOSTIC: replay a tx via `eth_call` at `at_block` and return the
+/// raw JSON-RPC response (revert data lives in `error.data`). Exact for the
+/// FIRST tx in a block (its pre-state == parent's post-state). No `debug`
+/// namespace needed. Fetches the tx via `eth_getTransactionByHash` first.
+pub async fn replay_revert(rpc_url: &str, hash: alloy_primitives::TxHash, at_block: u64) -> String {
+    let client = reqwest::Client::new();
+    let get = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "eth_getTransactionByHash",
+        "params": [format!("{hash:?}")],
+    });
+    let tx: serde_json::Value = match client.post(rpc_url).json(&get).send().await {
+        Ok(r) => r.json().await.unwrap_or(serde_json::Value::Null),
+        Err(e) => return format!("<getTx error: {e}>"),
+    };
+    let t = &tx["result"];
+    let call = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "eth_call",
+        "params": [{
+            "from": t["from"], "to": t["to"], "input": t["input"],
+            "value": t["value"], "gas": t["gas"],
+        }, format!("0x{at_block:x}")],
+    });
+    match client.post(rpc_url).json(&call).send().await {
+        Ok(r) => r.text().await.unwrap_or_else(|e| format!("<call body: {e}>")),
+        Err(e) => format!("<eth_call error: {e}>"),
+    }
+}
+
 /// TEMP DIAGNOSTIC: dump every tx receipt in `block` — index, from, to,
 /// status (true=ok/false=reverted), gas_used. Lets us see whether the
 /// postBatch (from=poster, to=EEZ) succeeded and which user txs reverted,

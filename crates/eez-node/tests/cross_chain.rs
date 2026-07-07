@@ -163,9 +163,24 @@ async fn cross_chain_setter_deposit_over_bundle() {
                 Some(b) => common::dump_block_receipts(&l1_rpc, b).await,
                 None => "<no block>".to_string(),
             };
+            // The postBatch is the FIRST tx in the block; replay it at the
+            // parent block to get its exact revert reason.
+            let pb_replay = match blk {
+                Some(b) => {
+                    let pb = common::first_tx_in_block(&l1_rpc, b).await;
+                    match pb {
+                        Some(pb_hash) => {
+                            common::replay_revert(&l1_rpc, pb_hash, b - 1).await
+                        }
+                        None => "<no first tx>".to_string(),
+                    }
+                }
+                None => "<no block>".to_string(),
+            };
             eprintln!(
                 "DIAG: cross-chain user tx {h} reverted on L1\n  \
-                 landed_in_block={blk:?}\n{receipts}"
+                 landed_in_block={blk:?}\n{receipts}\n  \
+                 postBatch replay (revert data in error.data):\n  {pb_replay}"
             );
             panic!("cross-chain user tx {h} reverted on L1 (see DIAG above)");
         }
