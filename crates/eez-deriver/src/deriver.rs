@@ -345,6 +345,7 @@ where
                 .reconcile_batch_blocks(
                     batch_first_l2,
                     &decoded,
+                    batch.post_batch_input.clone(),
                     batch.l1_block_number,
                     batch.tx_hash,
                     batch.settled_count,
@@ -690,6 +691,7 @@ where
                 tx_hash,
                 submitter,
                 call_data,
+                post_batch_input,
                 state_applied,
                 settled_count,
                 settled_final_state,
@@ -703,6 +705,7 @@ where
                     tx_hash,
                     submitter,
                     call_data,
+                    post_batch_input,
                     state_applied,
                     settled_count,
                     settled_final_state,
@@ -739,6 +742,7 @@ where
         tx_hash: B256,
         submitter: Address,
         call_data: Bytes,
+        post_batch_input: Bytes,
         state_applied: bool,
         settled_count: usize,
         settled_final_state: Option<B256>,
@@ -853,6 +857,7 @@ where
             .reconcile_batch_blocks(
                 from_block,
                 &decoded,
+                post_batch_input,
                 l1_block_number,
                 tx_hash,
                 settled_count,
@@ -1055,6 +1060,7 @@ where
         &self,
         from_block: u64,
         decoded: &eez_payload_codec::DecodedBatch,
+        post_batch_input: Bytes,
         l1_block_number: u64,
         tx_hash: B256,
         settled_count: usize,
@@ -1097,13 +1103,28 @@ where
         let sync_block_txs: Option<Vec<Vec<u8>>> = match self.inner.system_tx_cfg.as_ref() {
             Some(cfg) => {
                 let mut entries = if decoded.l2_entries.is_empty() {
+                    // codec-v1 fallback: decode the on-chain `batch.entries[]`
+                    // from the postBatch tx input captured during the scan
+                    // (tx fetched by (block, index), pruning-robust). No
+                    // re-fetch by tx hash here — that lookup fails on a pruned
+                    // or still-resyncing embedded L1 and crashed boot catch_up
+                    // on restart-after-post.
+                    use alloy_sol_types::SolCall as _;
+                    let call =
+                        eez_evm::types::postAndVerifyBatchCall::abi_decode(&post_batch_input)
+                            .map_err(|e| {
+                                DeriverError::l2_provider(format!(
+                                    "decode postBatch({tx_hash}): {e}"
+                                ))
+                            })?;
                     event!(
-                        name: "eez.deriver.reconcile.fetch_entries",
+                        name: "eez.deriver.reconcile.fallback_entries",
                         Level::INFO,
                         tx_hash = %tx_hash,
-                        "fetching postBatch entries via L1 RPC (codec v1 fallback)",
+                        entries = call.batch.entries.len(),
+                        "decoding scanned on-chain postBatch entries (codec v1 fallback)",
                     );
-                    self.fetch_post_batch_entries(tx_hash).await?
+                    call.batch.entries
                 } else {
                     use alloy_sol_types::SolValue as _;
                     let mut out = Vec::with_capacity(decoded.l2_entries.len());
@@ -1305,35 +1326,6 @@ where
                 DeriverError::l2_provider(format!("local receipts for Sync block {block} missing"))
             })?;
         Ok(extract_outbound_call_hashes(&receipts, ccm_l2))
-    }
-
-    /// Fetch a postBatch tx's `entries[]` directly from L1 (used by the
-    /// codec-v1 fallback when `decoded.l2_entries` is empty).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DeriverError::l2_provider`] (reused as a transport
-    /// error bucket) on RPC failure or ABI decode failure.
-    async fn fetch_post_batch_entries(
-        &self,
-        tx_hash: B256,
-    ) -> DeriverResult<Vec<eez_evm::types::ExecutionEntrySol>> {
-        use alloy_consensus::Transaction as _;
-        use alloy_provider::{Provider as _, ProviderBuilder};
-        use alloy_sol_types::SolCall;
-
-        let provider = ProviderBuilder::new()
-            .disable_recommended_fillers()
-            .connect_http(self.inner.submitter.rpc_url());
-        let tx = provider
-            .get_transaction_by_hash(tx_hash)
-            .await
-            .map_err(|e| DeriverError::l2_provider(format!("get_tx({tx_hash}): {e}")))?
-            .ok_or_else(|| DeriverError::l2_provider(format!("tx {tx_hash} not found on L1")))?;
-        let input = tx.inner.input();
-        let decoded = eez_evm::types::postAndVerifyBatchCall::abi_decode(input)
-            .map_err(|e| DeriverError::l2_provider(format!("decode postBatch({tx_hash}): {e}")))?;
-        Ok(decoded.batch.entries)
     }
 
     /// SYSTEM_ADDRESS account nonce at the L2 parent block. Both

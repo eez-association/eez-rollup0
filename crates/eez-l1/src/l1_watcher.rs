@@ -84,6 +84,12 @@ pub enum L1Event {
         /// `rollupCount` indexed param from the event.
         rollup_count: U256,
         call_data: Bytes,
+        /// The originating postBatch tx's full `postAndVerifyBatch` input,
+        /// captured from the tx fetched by (block, index) during the scan.
+        /// The Deriver's codec-v1 reconcile fallback decodes `batch.entries`
+        /// from these bytes instead of re-fetching the tx by hash (which
+        /// fails on a pruned or still-resyncing embedded L1).
+        post_batch_input: Bytes,
         /// `true` iff the same L1 tx emitted `L2ExecutionPerformed` —
         /// the contract's state delta applied. `false` = loser
         /// (`ImmediateEntrySkipped`). Deriver reads this directly.
@@ -612,6 +618,7 @@ impl L1Watcher {
                 submitter: b.submitter,
                 rollup_count: b.rollup_count,
                 call_data: b.call_data,
+                post_batch_input: b.post_batch_input,
                 state_applied: b.state_applied,
                 settled_count: b.settled_count,
                 settled_final_state: b.settled_final_state,
