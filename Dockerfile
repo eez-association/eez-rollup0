@@ -13,9 +13,15 @@
 FROM rust:1.94-bookworm AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
         clang libclang-dev pkg-config cmake libssl-dev git ca-certificates \
-        protobuf-compiler \
+        protobuf-compiler mold \
     && rm -rf /var/lib/apt/lists/* \
     && cargo install cargo-chef --locked
+# mold cuts the final link from tens of seconds (single-threaded bfd on a
+# reth-sized symbol table) to a few. Set here so cook and build see the
+# SAME flags — RUSTFLAGS is part of cargo's fingerprint, and a mismatch
+# between the two RUNs would rebuild deps in the hot source layer.
+# Docker-only on purpose: host builds keep the default linker.
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 WORKDIR /build
 
 # ── planner: compute the dependency recipe from manifests ────────────

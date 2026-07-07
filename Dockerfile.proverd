@@ -19,9 +19,12 @@
 FROM rust:1.94-bookworm AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
         clang libclang-dev pkg-config cmake libssl-dev git ca-certificates \
-        protobuf-compiler \
+        protobuf-compiler mold \
     && rm -rf /var/lib/apt/lists/* \
     && cargo install cargo-chef --locked
+# mold for fast final links; same flags for cook and build (fingerprint
+# consistency) — see the matching comment in Dockerfile.
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 WORKDIR /build
 
 # ── planner: dependency recipe from this workspace's manifests ────────
