@@ -64,7 +64,9 @@ ethereum_package:
       - scenario: eoatx
         name: baseline-load
         config:
-          throughput: 30
+          # Keep low until BatchPosted is climbing. High throughput competes
+          # with postBatch for blockspace and makes rbuilder simulation slower.
+          throughput: 5
 
 # ─────────────────────────────────────────────────────────────────────────
 eez:
@@ -87,12 +89,16 @@ eez:
 
   # ── Timing (l1_block_time_ms MUST match network_params.seconds_per_slot) ─
   l1_block_time_ms: 12000
-  l2_block_time_ms: 2000
+  # K=1 during bootstrap so L2 cannot outrun L1 while the first postBatch
+  # settles. After BatchPosted is climbing reliably, try 2000 (K=6, mainnet-shaped).
+  l2_block_time_ms: 12000
   # Kurtosis rbuilder needs a longer lead time than the in-process dev relay:
   # 4000 can miss rbuilder's intake; 7000 leaves too little Steady window at
   # the 12s/2s cadence. 5000 keeps 1.5s slack without changing block cadence.
   proof_time_ms: 5000
   submission_slack_ms: 1500
+  # Match chiado-node: do not freeze the sequencer when bundles are slow.
+  max_speculative_depth: 0
 
   fee_recipient: "0x0000000000000000000000000000000000000000"
 
