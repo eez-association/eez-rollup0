@@ -428,8 +428,23 @@ fn main() -> eyre::Result<()> {
         let rollup_config = RollupConfig::from_env()?;
         let l1_watcher_config = L1WatcherConfig::from_env()?;
 
+        // Mirrors `Submitter::build_target_provider`: the scheduler must
+        // anchor off the same L1 view the Submitter lands against, not the
+        // embedded reth `l1_watcher` uses. On a split deployment (Kurtosis)
+        // the embedded reth lags the canonical tip, so anchoring off it
+        // predicts an already-built target block — the relay drops the
+        // bundle and `observe` reports it Dropped, forever.
+        let scheduler_l1_target_rpc_url = submitter_config
+            .target_rpc_url
+            .clone()
+            .unwrap_or_else(|| submitter_config.rpc_url.clone());
+
         let submitter = Submitter::new(submitter_config);
-        let l1_watcher = L1Watcher::spawn(l1_watcher_config);
+        let l1_watcher = L1Watcher::spawn(l1_watcher_config.clone());
+        let scheduler_l1_watcher = L1Watcher::spawn(L1WatcherConfig {
+            rpc_url: scheduler_l1_target_rpc_url,
+            ..l1_watcher_config
+        });
 
         // Composer-only: build the umbrella, then attach it to the
         // Sequencer built above (swapping in the L1-anchored schedule via
@@ -779,8 +794,10 @@ fn main() -> eyre::Result<()> {
             // actor, shared with the Deriver) — swap in the L1-anchored
             // schedule + composer hooks. Speculative depth already
             // applied above.
+            //
+            // `scheduler_l1_watcher`, not `l1_watcher` — see where it's built.
             let schedule_rx = spawn_l1_anchored(
-                L1HeadStream::from_watcher(&l1_watcher),
+                L1HeadStream::from_watcher(&scheduler_l1_watcher),
                 timing,
                 l2_genesis_timestamp,
             );
