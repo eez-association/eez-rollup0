@@ -306,6 +306,15 @@ impl Inner {
             .map(|t| hex::encode_prefixed(t.as_ref()))
             .collect();
         let hex_refs: Vec<&str> = hexes.iter().map(String::as_str).collect();
+        event!(
+            name: "eez.submitter.bundle.dispatching",
+            Level::INFO,
+            target_block,
+            pin_timestamp,
+            tx_count = raw_txs.len(),
+            post_batch_hash = %post_batch_hash,
+            "dispatching bundle to builder",
+        );
         match post_bundle(
             &self.http,
             self.config.builder_rpc_url.as_str(),

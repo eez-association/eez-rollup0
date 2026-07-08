@@ -45,7 +45,7 @@ else
 fi
 if [[ -n "$KEY" ]]; then
     echo "probe_sender=$(cast wallet address --private-key "$KEY" 2>/dev/null || echo unknown)"
-    if [[ -n "$POSTER_KEY" && "$KEY" == "$POSTER_KEY" ]]; then
+    if [[ "${EEZ_DIAG_SEND_PROBE:-0}" == "1" && -n "$POSTER_KEY" && "$KEY" == "$POSTER_KEY" ]]; then
         echo "warning=active probe is using the EEZ poster key; this can consume the postBatch nonce and perturb eez-node"
         echo "warning=set EEZ_DIAG_PROBE_KEY to a separate funded dev key for clean active probes"
     fi
@@ -157,8 +157,10 @@ builder_log="$(kurtosis service logs "$E" "${KURTOSIS_BUILDER_SERVICE:-el-5-reth
 
 if [[ -n "${last_target:-}" ]]; then
     section "rbuilder target-block lines"
+    prev_target=$(( last_target > 0 ? last_target - 1 : 0 ))
+    next_target=$(( last_target + 1 ))
     printf '%s\n' "$builder_log" \
-        | grep -E "block=${last_target}|slot=${last_target}|block ${last_target}|slot ${last_target}|target.?block.?${last_target}" \
+        | grep -E "block=(${prev_target}|${last_target}|${next_target})|slot=(${prev_target}|${last_target}|${next_target})|block (${prev_target}|${last_target}|${next_target})|slot (${prev_target}|${last_target}|${next_target})|target.?block.?${last_target}" \
         | tail -120 || true
 fi
 
@@ -183,7 +185,12 @@ for svc in \
 do
     if kurtosis service logs "$E" "$svc" >/tmp/eez-diag-svc.log 2>/dev/null; then
         echo "-- $svc --"
-        grep -iE 'builder|bid|payload|relay|registration|validator|error|warn|mev|boost|header|getPayload' /tmp/eez-diag-svc.log \
-            | tail -80 || true
+        if [[ -n "${last_target:-}" ]]; then
+            grep -iE "slot[= ](${last_target}|$((last_target + 1)))|block(Number)?[= ](${last_target}|$((last_target + 1)))|past slot|builder|bid|payload|relay|registration|validator|error|warn|mev|boost|header|getPayload" /tmp/eez-diag-svc.log \
+                | tail -100 || true
+        else
+            grep -iE 'builder|bid|payload|relay|registration|validator|error|warn|mev|boost|header|getPayload' /tmp/eez-diag-svc.log \
+                | tail -80 || true
+        fi
     fi
 done
