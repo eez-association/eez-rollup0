@@ -602,6 +602,17 @@ pub async fn block_number_at(
     Ok(block.map(|b| b.header.number))
 }
 
+/// Block number and hash at a named tag (`latest`, `safe`, `finalized`, …).
+/// `None` when no block exists at that tag yet.
+pub async fn block_number_and_hash_at(
+    rpc_url: &str,
+    tag: alloy_rpc_types_eth::BlockNumberOrTag,
+) -> Result<Option<(u64, B256)>> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let block = provider.get_block_by_number(tag).await?;
+    Ok(block.map(|b| (b.header.number, b.header.hash)))
+}
+
 /// Deploy `EEZ` + `MockECDSAProofSystem` + `Rollup`, then register the rollup.
 /// Pure alloy — reads compiled foundry artifacts and sends each deploy
 /// as an in-process tx. Mirrors `sync-rollups-composer`'s

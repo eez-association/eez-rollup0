@@ -8,12 +8,13 @@
 use std::time::Duration;
 
 use alloy_primitives::{B256, U256};
+use alloy_rpc_types_eth::BlockNumberOrTag;
 
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeConfig,
-    NodeHandle, reorg_genesis_path, reorg_genesis_state_root, safe_block_state_root,
-    wait_for_node_caught_up,
+    NodeHandle, block_number_and_hash_at, reorg_genesis_path, reorg_genesis_state_root,
+    safe_block_state_root, wait_for_node_caught_up,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -344,8 +345,8 @@ async fn happy_case_follower_l1_derived() {
 /// Asserts BOTH paths:
 ///   - safe head: still reaches a contract-attested stateRoot (the L1
 ///     deriver is authoritative).
-///   - unsafe head: the follower polls the sequencer RPC and records an
-///     FCU outcome while the process is still alive.
+///   - latest head: the follower's public head stays on the sequencer's
+///     chain while the safe head remains contract-attested.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn happy_case_follower_sequencer_rpc() {
     let harness = Harness::fresh().await.unwrap();
@@ -353,17 +354,16 @@ async fn happy_case_follower_sequencer_rpc() {
     let seq = NodeHandle::start("seq", &NodeConfig::default(), &harness.env())
         .await
         .unwrap();
+
+    let seq_rpc = seq.l2_rpc_url();
+    let follower = spawn_follower("follower", &harness, Some(&seq_rpc))
+        .await
+        .unwrap();
+
     chain
         .wait_for_batches(2, DEFAULT_TIMEOUT)
         .await
         .expect("sequencer landed batches");
-
-    let seq_rpc = seq.l2_rpc_url();
-    let follower_env =
-        common::override_env(harness.follower_env(Some(&seq_rpc)), "RUST_LOG", "info");
-    let follower = NodeHandle::start("follower", &NodeConfig::default(), &follower_env)
-        .await
-        .unwrap();
     wait_for_node_caught_up(&follower, &chain, DEFAULT_TIMEOUT)
         .await
         .expect("follower did not catch up via L1 replay");
@@ -374,22 +374,37 @@ async fn happy_case_follower_sequencer_rpc() {
         .expect("follower has a safe block");
     assert_ne!(follower_safe, B256::ZERO, "follower safe is genesis");
 
-    // The unsafe-head overlay reports its FCU outcome before teardown,
-    // avoiding a timing assumption that `latest` must still be above
-    // `safe` by the time the test samples JSON-RPC tags.
-    let unsafe_head_patterns = [
-        "follower advanced unsafe head to sequencer block",
-        "reth accepted sequencer head as a sync target",
-    ];
+    // Assert the follower's public head directly over JSON-RPC instead
+    // of relying on process logs: it must be a real sequencer block,
+    // and the safe head must not outrun it.
     common::wait_for(DEFAULT_TIMEOUT, || {
-        std::future::ready(
-            follower
-                .log_count_matching(&unsafe_head_patterns)
-                .map(|n| (n > 0).then_some(())),
-        )
+        let seq_rpc = seq_rpc.clone();
+        let follower_rpc = follower.l2_rpc_url();
+        async move {
+            let Some((latest_number, latest_hash)) =
+                block_number_and_hash_at(&follower_rpc, BlockNumberOrTag::Latest).await?
+            else {
+                return Ok(None);
+            };
+            let Some((safe_number, _)) =
+                block_number_and_hash_at(&follower_rpc, BlockNumberOrTag::Safe).await?
+            else {
+                return Ok(None);
+            };
+            let Some((_, seq_hash)) =
+                block_number_and_hash_at(&seq_rpc, BlockNumberOrTag::Number(latest_number)).await?
+            else {
+                return Ok(None);
+            };
+
+            Ok(
+                (latest_number > 0 && latest_number >= safe_number && latest_hash == seq_hash)
+                    .then_some(()),
+            )
+        }
     })
     .await
-    .expect("sequencer-RPC unsafe-head follower never reported an FCU outcome");
+    .expect("follower latest block never matched the sequencer chain");
 
     follower.assert_no_process_death();
     seq.assert_no_process_death();
