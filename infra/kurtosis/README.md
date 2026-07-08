@@ -69,8 +69,6 @@ follower → the follower feeds it to the embedded reth via `engine_newPayload`
   RPC / disruptoor / builder URLs for the host-side helper scripts below.
 - [`scripts/reorg-scheduler.sh`](scripts/reorg-scheduler.sh) — drives
   scheduled L1 reorgs via disruptoor.
-- [`scripts/test-rbuilder-bundle-inclusion.sh`](scripts/test-rbuilder-bundle-inclusion.sh)
-  — sends a live bundle to rbuilder and fails unless the tx lands on L1.
 - [`scripts/smoke-rbuilder.sh`](scripts/smoke-rbuilder.sh) — checks that
   rbuilder honors the bundle timestamp pin.
 
@@ -146,15 +144,11 @@ cast logs --from-block "$EEZ_REGISTRY_DEPLOY_BLOCK" --address "$EEZ_REGISTRY_ADD
 
 # rbuilder timestamp-pin check:
 bash infra/kurtosis/scripts/smoke-rbuilder.sh
-
-# direct rbuilder bundle inclusion check:
-bash infra/kurtosis/scripts/test-rbuilder-bundle-inclusion.sh
 ```
 
-`smoke-rbuilder.sh`, `test-rbuilder-bundle-inclusion.sh`, and
-`reorg-scheduler.sh` auto-discover RPC / builder / disruptoor URLs via
-[`scripts/enclave-env.sh`](scripts/enclave-env.sh) (`kurtosis port print` +
-keys from `args.yaml`).
+`smoke-rbuilder.sh` and `reorg-scheduler.sh` auto-discover RPC / builder /
+disruptoor URLs via [`scripts/enclave-env.sh`](scripts/enclave-env.sh)
+(`kurtosis port print` + keys from `args.yaml`).
 
 ## Full cross-chain end-to-end test
 
