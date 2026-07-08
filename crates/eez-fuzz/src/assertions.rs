@@ -103,32 +103,23 @@ impl World {
         expected_settled: Option<U256>,
     ) {
         for target in &comp.targets {
-            if let Some(inbound) = &target.inbound_payload {
-                let (r, settled) = replay_inbound(
-                    &self.l2_provider,
-                    self.eezl2,
-                    inbound.clone(),
-                    target.inbound_value,
+            // Replay the settling system tx (`executeIncomingCrossChainCall`,
+            // which self-loads the execution table) and read the destination's
+            // real settled slot-0.
+            let (r, settled) = replay_settle(
+                &self.l2_provider,
+                self.eezl2,
+                target.execute_payload.clone(),
+                self.value_l2,
+            );
+            assert!(r.is_success(), "L2 inbound execute+ratify reverted: {r:?}");
+            if let Some(expected) = expected_settled {
+                assert_eq!(
+                    settled, expected,
+                    "settled {} slot-0 = {settled}, expected {expected} — the cross-chain \
+                     call did not really run (return data can look right past a mock prover)",
                     self.value_l2,
                 );
-                assert!(r.is_success(), "L2 inbound execute+ratify reverted: {r:?}");
-                if let Some(expected) = expected_settled {
-                    assert_eq!(
-                        settled, expected,
-                        "settled {} slot-0 = {settled}, expected {expected} — the cross-chain \
-                         call did not really run (return data can look right past a mock prover)",
-                        self.value_l2,
-                    );
-                }
-            } else {
-                let r = replay_once(
-                    &self.l2_provider,
-                    SYSTEM_ADDR,
-                    self.eezl2,
-                    target.load_table_payload.clone(),
-                    U256::ZERO,
-                );
-                assert!(r.is_success(), "L2 loadExecutionTable reverted: {r:?}");
             }
         }
 
@@ -139,14 +130,14 @@ impl World {
     }
 }
 
-/// Replay the inbound system tx (`executeIncomingCrossChainCall`) against the
-/// frozen L2 state and read `settle_target`'s slot-0 storage from the committed
-/// DB — the actual destination-contract effect, not the composer's claim.
-pub fn replay_inbound(
+/// Replay the settling system tx (`executeIncomingCrossChainCall`, which
+/// self-loads the execution table) against the frozen L2 state and read
+/// `settle_target`'s slot-0 storage from the committed DB — the actual
+/// destination-contract effect, not the composer's claim.
+pub fn replay_settle(
     provider: &MockEthProvider,
     eezl2: Address,
-    inbound: Vec<u8>,
-    value: U256,
+    execute: Vec<u8>,
     settle_target: Address,
 ) -> (ExecutionResult, U256) {
     let sp = provider.latest().expect("latest state");
@@ -164,14 +155,13 @@ pub fn replay_inbound(
         .transact_commit(TxEnv {
             caller: SYSTEM_ADDR,
             kind: TxKind::Call(eezl2),
-            data: inbound.into(),
+            data: execute.into(),
             gas_limit: 16_000_000,
             nonce: 0,
             chain_id: Some(1),
-            value,
             ..Default::default()
         })
-        .expect("evm transact");
+        .expect("evm transact exec");
     let settled = evm
         .db()
         .cache
@@ -180,38 +170,4 @@ pub fn replay_inbound(
         .and_then(|a| a.storage.get(&U256::ZERO).copied())
         .unwrap_or(U256::ZERO);
     (result, settled)
-}
-
-/// Apply one call tx against a frozen provider's state in revm and return the
-/// result. The caller is overlaid as a funded nonce-0 EOA so system/deployer
-/// senders need no prior funding or nonce bookkeeping.
-pub fn replay_once(
-    provider: &MockEthProvider,
-    caller: Address,
-    to: Address,
-    data: Vec<u8>,
-    value: U256,
-) -> ExecutionResult {
-    let sp = provider.latest().expect("latest state");
-    let mut db = CacheDB::new(StateProviderDatabase::new(sp));
-    db.insert_account_info(
-        caller,
-        AccountInfo {
-            balance: U256::from(10u128).pow(U256::from(24u8)),
-            nonce: 0,
-            ..Default::default()
-        },
-    );
-    let mut evm = Context::mainnet().with_db(db).build_mainnet();
-    evm.transact_commit(TxEnv {
-        caller,
-        kind: TxKind::Call(to),
-        data: data.into(),
-        gas_limit: 16_000_000,
-        nonce: 0,
-        chain_id: Some(1),
-        value,
-        ..Default::default()
-    })
-    .expect("evm transact")
 }

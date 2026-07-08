@@ -364,6 +364,9 @@ fn target_cfg(ccm: Address, system: Address, dialect: ChainDialect) -> TargetCon
             authorized_proxies_slot: dialect.proxy_lookup_slot(),
         },
         dialect,
+        // In-process follower targets settle by replaying the CCM-verify txs,
+        // not by trusting a remote session root.
+        settles_via_session_root: false,
     }
 }
 

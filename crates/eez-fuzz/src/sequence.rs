@@ -13,7 +13,7 @@
 //! mutable L2 base, then asserts the destination `Value` holds the value the
 //! generator intended — cumulative, last-writer-wins per target.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{
@@ -146,6 +146,9 @@ pub struct SeqWorld {
     trigger_dir: Vec<Direction>,
     /// Cumulative expected slot-0 per target (last-writer-wins).
     expected: HashMap<Address, U256>,
+    /// Settle targets that live on L1 (reached via an `L2ToL1` trigger), so the
+    /// cumulative oracle reads their slot-0 from the L1 base, not L2.
+    l1_settled: HashSet<Address>,
     /// Current top of the recursive nesting chain (`DeployNested`) — the L2
     /// `NestedValue` a further `DeployNested` wraps. `None` until the first one.
     nest_top: Option<Address>,
@@ -228,6 +231,9 @@ fn target_cfg(ccm: Address, system: Address, dialect: ChainDialect) -> TargetCon
             authorized_proxies_slot: dialect.proxy_lookup_slot(),
         },
         dialect,
+        // In-process follower targets settle by replaying the CCM-verify txs,
+        // not by trusting a remote session root.
+        settles_via_session_root: false,
     }
 }
 
@@ -277,6 +283,7 @@ impl SeqWorld {
             settle_mode: vec![SettleMode::SetsArg],
             trigger_dir: vec![Direction::L1ToL2],
             expected: HashMap::new(),
+            l1_settled: HashSet::new(),
             nest_top: None,
         }
     }
@@ -461,18 +468,26 @@ impl SeqWorld {
         compose_transaction(&EvmProtocol, entry_ec.as_ref(), raw, entry_id, rollups).await
     }
 
-    /// Settle a composition's L2 inbound back into the mutable L2 base so the
-    /// next step sees the effect.
-    fn settle_l2(&mut self, comp: &Composition<EvmProtocol>) {
+    /// Settle a composition's targets back into the mutable base so the next
+    /// step sees the effect. Replays the system tx the deriver would
+    /// (`executeIncomingCrossChainCall`, which self-loads the execution table)
+    /// against the chain each target lives on — L2 for an L1→L2 inbound target,
+    /// L1 for an L2→L1 outbound target — so the oracle works in both directions.
+    fn settle(&mut self, comp: &Composition<EvmProtocol>) {
         for t in &comp.targets {
-            if let Some(inbound) = &t.inbound_payload {
-                run_tx(
-                    &mut self.l2,
-                    SYSTEM_ADDR,
-                    TxKind::Call(self.eezl2),
-                    inbound.clone(),
-                );
-            }
+            let (cache, ccm) = if t.rollup_id == RollupId(L2_ROLLUP_ID) {
+                (&mut self.l2, self.eezl2)
+            } else {
+                (&mut self.l1, self.eez)
+            };
+            // Load the execution table into the CCM (`loadExecutionTable`).
+            run_tx(cache, SYSTEM_ADDR, TxKind::Call(ccm), t.load_table_payload.clone());
+            // TODO(PR#21 follow-up): `execute_payload` is the outer call's raw
+            // calldata and must be delivered to the TARGET PROXY (its fallback
+            // forwards to the CCM), not to `ccm` — main split settlement this way
+            // in the 5c51e02 bump. The harness needs to thread the proxy address
+            // through `TargetComposition` (or decode it from the batch) before
+            // this settles; until then the destination contract is not updated.
         }
     }
 
@@ -959,36 +974,32 @@ impl SeqWorld {
                     let Ok(comp) = self.compose(&raw, tdir).await else {
                         continue;
                     };
-                    // L2→L1 settles on L1, which this L2-target-centric oracle
-                    // doesn't model yet — so we EXERCISE compose on that direction
-                    // (driving the unimplemented path) but skip the settle/assert.
-                    // Today compose returns Err above, so this is belt-and-braces
-                    // for the day L2→L1 starts composing.
-                    if matches!(tdir, Direction::L2ToL1) {
-                        continue;
-                    }
-                    self.settle_l2(&comp);
+                    self.settle(&comp);
                     // `Skip` targets settle a non-slot-0 effect (bridge balance);
                     // the cumulative oracle ignores them, the port test checks them.
                     if matches!(self.settle_mode[tidx], SettleMode::Skip) {
                         continue;
                     }
+                    // The target lives on L1 for an L2→L1 trigger, else on L2;
+                    // record which so the cumulative check reads the right chain.
+                    let on_l1 = matches!(tdir, Direction::L2ToL1);
+                    if on_l1 {
+                        self.l1_settled.insert(settle_target);
+                    }
                     self.expected.insert(settle_target, predicted);
+                    let got = read_slot0(if on_l1 { &self.l1 } else { &self.l2 }, settle_target);
                     assert_eq!(
-                        read_slot0(&self.l2, settle_target),
-                        predicted,
+                        got, predicted,
                         "Interact: target {settle_target} settled wrong value",
                     );
                 }
             }
         }
-        // Cumulative invariant: every target holds its last intended value.
+        // Cumulative invariant: every target holds its last intended value,
+        // read from the chain it settles on (L1 for L2→L1 targets, else L2).
         for (target, want) in &self.expected {
-            assert_eq!(
-                read_slot0(&self.l2, *target),
-                *want,
-                "cumulative: target {target}"
-            );
+            let cache = if self.l1_settled.contains(target) { &self.l1 } else { &self.l2 };
+            assert_eq!(read_slot0(cache, *target), *want, "cumulative: target {target}");
         }
     }
 }
