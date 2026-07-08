@@ -13,13 +13,33 @@ source "$HERE/enclave-env.sh"
 
 DEV_MNEMONIC="giant issue aisle success illegal bike spike question tent bar rely arctic volcano long crawl hungry vocal artwork sniff fantasy very lucky have athlete"
 
-RPC="${EEZ_L1_RPC_URL:?set EEZ_L1_RPC_URL}"
-BUILDER="${EEZ_L1_BUILDER_RPC_URL:?set EEZ_L1_BUILDER_RPC_URL}"
-POSTER_KEY="${EEZ_L1_POSTER_KEY:?set EEZ_L1_POSTER_KEY}"
+RPC="${EEZ_L1_RPC_URL:-${L1_RPC:-}}"
+BUILDER="${EEZ_L1_BUILDER_RPC_URL:-${BUILDER_RPC:-}}"
+POSTER_KEY="${EEZ_L1_POSTER_KEY:-}"
 SLOT_SECONDS="${EEZ_L1_SLOT_SECONDS:-$(( ${EEZ_L1_BLOCK_TIME_MS:-12000} / 1000 ))}"
 SLACK="${EEZ_BUNDLE_TEST_SLACK:-3}"
 ATTEMPTS="${EEZ_BUNDLE_TEST_ATTEMPTS:-3}"
 WARMUP_BLOCK="${EEZ_MEV_WARMUP_BLOCK:-132}"
+
+require_value() {
+    local name="$1" value="$2" hint="$3"
+    if [[ -n "$value" ]]; then
+        return
+    fi
+
+    echo "bundle-inclusion: could not resolve $name" >&2
+    echo "  enclave: ${ENCLAVE:-eez-devnet}" >&2
+    echo "  $hint" >&2
+    echo "  inspect: kurtosis enclave inspect ${ENCLAVE:-eez-devnet}" >&2
+    exit 1
+}
+
+require_value "EEZ_L1_RPC_URL" "$RPC" \
+    "tried: kurtosis port print ${ENCLAVE:-eez-devnet} ${KURTOSIS_L1_SERVICE:-el-1-reth-lighthouse} ${KURTOSIS_L1_RPC_PORT:-rpc}"
+require_value "EEZ_L1_BUILDER_RPC_URL" "$BUILDER" \
+    "tried: kurtosis port print ${ENCLAVE:-eez-devnet} ${KURTOSIS_BUILDER_SERVICE:-el-5-reth-builder-lighthouse} ${KURTOSIS_BUILDER_RPC_PORT:-rbuilder-rpc}"
+require_value "EEZ_L1_POSTER_KEY" "$POSTER_KEY" \
+    "tried: poster_key in ${KURTOSIS_ARGS_FILE:-$HERE/../args.yaml}; override with EEZ_L1_POSTER_KEY=0x..."
 
 TEST_KEY="${EEZ_BUNDLE_TEST_KEY:-$(cast wallet private-key \
     --mnemonic "$DEV_MNEMONIC" \
