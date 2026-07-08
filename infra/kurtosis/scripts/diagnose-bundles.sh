@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Snapshot the EEZ Kurtosis bundle path:
 #   eez-node submitter -> rbuilder eth_sendBundle -> relay/mev-boost -> L1 block.
-# This is intentionally read-only. It helps distinguish:
+# By default this is read-only. Set EEZ_DIAG_SEND_PROBE=1 to submit one
+# harmless 0-value control bundle from the poster key to itself. It helps
+# distinguish:
 #   - no bundle submission
 #   - bundle accepted by RPC but dropped before inclusion
 #   - rbuilder simulation/timestamp rejection
@@ -15,6 +17,9 @@ source "$HERE/enclave-env.sh"
 E="${KURTOSIS_ENCLAVE:-eez-devnet}"
 RPC="${EEZ_L1_RPC_URL:?set EEZ_L1_RPC_URL}"
 BUILDER="${EEZ_L1_BUILDER_RPC_URL:?set EEZ_L1_BUILDER_RPC_URL}"
+KEY="${EEZ_L1_POSTER_KEY:-}"
+SLOT_SECONDS="${EEZ_L1_SLOT_SECONDS:-12}"
+PROBE_SLACK="${EEZ_DIAG_PROBE_SLACK:-3}"
 
 need() {
     command -v "$1" >/dev/null || {
@@ -32,6 +37,16 @@ section "endpoints"
 echo "enclave=$E"
 echo "l1_rpc=$RPC"
 echo "builder_rpc=$BUILDER"
+if [[ -n "$KEY" ]]; then
+    echo "poster=$(cast wallet address --private-key "$KEY" 2>/dev/null || echo unknown)"
+else
+    echo "poster=unset (active probe disabled unless EEZ_L1_POSTER_KEY is set)"
+fi
+
+section "service hints"
+kurtosis enclave inspect "$E" 2>/dev/null \
+    | grep -iE 'builder|relay|boost|lighthouse|reth|eez-node' \
+    | head -120 || true
 
 section "heads"
 head_1="$(cast block-number --rpc-url "$RPC" 2>/dev/null || true)"
@@ -47,6 +62,46 @@ section "builder rpc probe"
 probe='{"jsonrpc":"2.0","id":1,"method":"eth_sendBundle","params":[{"txs":[],"blockNumber":"0x1"}]}'
 curl -sS "$BUILDER" -H 'Content-Type: application/json' -d "$probe" || true
 echo
+
+if [[ "${EEZ_DIAG_SEND_PROBE:-0}" == "1" ]]; then
+    section "active control bundle"
+    if [[ -z "$KEY" ]]; then
+        echo "EEZ_DIAG_SEND_PROBE=1 requires EEZ_L1_POSTER_KEY/poster_key in args.yaml"
+    else
+        addr="$(cast wallet address --private-key "$KEY")"
+        bal="$(cast balance "$addr" --rpc-url "$RPC" 2>/dev/null || echo 0)"
+        echo "from=$addr balance=$bal"
+        if [[ "$bal" == "0" ]]; then
+            echo "poster has zero balance; cannot send active probe"
+        else
+            probe_head="$(cast block-number --rpc-url "$RPC")"
+            target=$(( probe_head + PROBE_SLACK ))
+            raw="$(cast mktx "$addr" --value 0 --private-key "$KEY" --rpc-url "$RPC")"
+            hash="$(cast keccak "$raw")"
+            body="$(printf '{"jsonrpc":"2.0","id":1,"method":"eth_sendBundle","params":[{"txs":["%s"],"blockNumber":"0x%x"}]}' "$raw" "$target")"
+            echo "tx_hash=$hash target_block=$target slack=$PROBE_SLACK"
+            echo "send_response=$(curl -sS "$BUILDER" -H 'Content-Type: application/json' -d "$body" || true)"
+            waited=0
+            max_wait=$(( SLOT_SECONDS * (PROBE_SLACK + 6) ))
+            while (( $(cast block-number --rpc-url "$RPC") <= target + 1 )); do
+                sleep 2
+                waited=$(( waited + 2 ))
+                if (( waited > max_wait )); then
+                    echo "timed out waiting for L1 to pass target+1"
+                    break
+                fi
+            done
+            if cast receipt "$hash" --rpc-url "$RPC" >/dev/null 2>&1; then
+                echo "control_bundle=LANDED"
+                cast receipt "$hash" --rpc-url "$RPC" | sed -n '1,40p'
+            else
+                echo "control_bundle=DID_NOT_LAND"
+                echo "target_block_summary:"
+                cast block "$target" --rpc-url "$RPC" 2>/dev/null | sed -n '1,80p' || true
+            fi
+        fi
+    fi
+fi
 
 section "recent eez-node bundle lines"
 node_log="$(kurtosis service logs "$E" eez-node 2>/dev/null || true)"
