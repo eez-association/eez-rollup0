@@ -50,11 +50,12 @@ for t in cast forge jq curl kurtosis; do command -v "$t" >/dev/null || { echo "$
 # rollups(id).stateRoot live. The composer's embedded reth mirrors it in-process,
 # so anything created here is visible to composition. NOT the embedded reth.
 _port() { kurtosis port print "$ENCLAVE" "$1" "$2" 2>/dev/null || true; }
-: "${L1:=http://$(_port el-1-reth-lighthouse rpc)}"
-: "${L2:=http://$(_port eez-node l2-rpc)}"
-: "${L1F:=http://$(_port eez-node l1-xchain)}"
-: "${L2F:=http://$(_port eez-node l2-xchain)}"
-[[ "$L1" != "http://" && "$L2" != "http://" && "$L1F" != "http://" && "$L2F" != "http://" ]] \
+_http() { case "$1" in http*) echo "$1";; "") echo "";; *) echo "http://$1";; esac; }
+: "${L1:=$(_http "$(_port el-1-reth-lighthouse rpc)")}"
+: "${L2:=$(_http "$(_port eez-node l2-rpc)")}"
+: "${L1F:=$(_http "$(_port eez-node l1-xchain)")}"
+: "${L2F:=$(_http "$(_port eez-node l2-xchain)")}"
+[[ -n "$L1" && -n "$L2" && -n "$L1F" && -n "$L2F" ]] \
     || { echo "could not resolve enclave ports — is '$ENCLAVE' up? (kurtosis enclave inspect $ENCLAVE)"; exit 1; }
 
 NODE_LOG="${EEZ_NODE_LOG:-$LOG_DIR/wave-$MODE-node.log}"

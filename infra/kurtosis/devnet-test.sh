@@ -37,12 +37,13 @@ for t in cast forge jq curl kurtosis; do command -v "$t" >/dev/null || { echo "$
 # discovery step. Already-exported vars win (e.g. to point at a different
 # enclave without re-deriving everything).
 _port() { kurtosis port print "$ENCLAVE" "$1" "$2" 2>/dev/null || true; }
-: "${L1_RPC:=http://$(_port el-1-reth-lighthouse rpc)}"      # shared L1 (el-1)
-: "${L2_RPC:=http://$(_port eez-node l2-rpc)}"
+_http() { case "$1" in http*) echo "$1";; "") echo "";; *) echo "http://$1";; esac; }
+: "${L1_RPC:=$(_http "$(_port el-1-reth-lighthouse rpc)")}"      # shared L1 (el-1)
+: "${L2_RPC:=$(_http "$(_port eez-node l2-rpc)")}"
 # Inbound cc txs go to the L1 cross-chain front, not the raw L2 RPC, so the node
 # classifies them Inbound and holds them for composition.
-: "${XCHAIN_L1:=http://$(_port eez-node l1-xchain)}"
-[[ "$L1_RPC" != "http://" && "$L2_RPC" != "http://" && "$XCHAIN_L1" != "http://" ]] \
+: "${XCHAIN_L1:=$(_http "$(_port eez-node l1-xchain)")}"
+[[ -n "$L1_RPC" && -n "$L2_RPC" && -n "$XCHAIN_L1" ]] \
     || { echo "could not resolve enclave ports — is '$ENCLAVE' up? (kurtosis enclave inspect $ENCLAVE)"; exit 1; }
 
 # ── Knobs ────────────────────────────────────────────────────────────
