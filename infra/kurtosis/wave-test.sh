@@ -133,6 +133,17 @@ L2_UP=$(cast block-number --rpc-url "$L2" 2>/dev/null || echo "")
 [[ -n "$L2_UP" ]] || { echo "L2 RPC $L2 not reachable"; exit 1; }
 echo "    L1=$L1_UP L2=$L2_UP"
 
+# ── MEV warmup gate ──────────────────────────────────────────────────
+# The flashbots relay only starts proposing rbuilder blocks after ~4 epochs;
+# before that every pinned postBatch bundle drops by construction. Wait it
+# out. Override/skip with EEZ_MEV_WARMUP_BLOCK=0.
+MEV_WARMUP_BLOCK="${EEZ_MEV_WARMUP_BLOCK:-132}"
+if (( L1_UP < MEV_WARMUP_BLOCK )); then
+    echo "==> waiting for MEV warmup: L1 head $L1_UP < $MEV_WARMUP_BLOCK (~4 epochs; relay proposes builder blocks only after warmup)"
+    while (( $(cast block-number --rpc-url "$L1") < MEV_WARMUP_BLOCK )); do sleep 12; done
+    echo "    warmup complete (head $(cast block-number --rpc-url "$L1"))"
+fi
+
 # ── Fund L1-side actors from the poster ──────────────────────────────
 for k in "${L1_FUNDED_KEYS[@]}"; do
     a=$(cast wallet address --private-key "$k")

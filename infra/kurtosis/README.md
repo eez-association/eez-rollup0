@@ -156,6 +156,14 @@ entirely self-contained: each resolves its own endpoints via
 `kurtosis files download`, so there's no separate discovery step — just bring
 the enclave up and run the script.
 
+Both harnesses **wait for MEV warmup** before firing waves: the flashbots
+relay only proposes rbuilder blocks after ~4 epochs (validator registrations
+propagate), so until L1 head ≥ `EEZ_MEV_WARMUP_BLOCK` (default 132) every
+pinned postBatch bundle is dropped by construction — the proposer falls back
+to a locally-built block that never saw the bundle. Set
+`EEZ_MEV_WARMUP_BLOCK=0` to skip the gate (e.g. re-running against a warm
+enclave).
+
 - [`infra/kurtosis/devnet-test.sh`](devnet-test.sh) — **inbound-only** (L1→L2).
   Deploys Value on L2, creates setter + deposit CrossChainProxies on the shared
   L1, fires setter/deposit waves at the **L1 front**, and asserts L1

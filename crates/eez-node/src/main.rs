@@ -696,14 +696,22 @@ fn main() -> eyre::Result<()> {
                         eyre::eyre!("EEZ_CCM_L2_ADDRESS required (set by deploy.sh)")
                     })?,
                 )?;
-                // L1 RPC URL: the embedded L1's HTTP port (so the
-                // composer's L1-forwarding round-trips back into our
-                // own L1 reth). Same value as `EEZ_L1_RPC_URL` for
-                // embedded mode.
-                let l1_rpc_url: reqwest::Url = env::var("EEZ_L1_RPC_URL")
-                    .map_err(|_| eyre::eyre!("EEZ_L1_RPC_URL required for L1 forwarding"))?
+                // Provider for the exec ctx's L1 reads: postBatch nonce +
+                // base fee (`sign_post_batch_tx`) and the escrow read. Like
+                // the scheduler and Submitter, these must reflect the chain
+                // the bundle actually lands on — on a split deployment
+                // (Kurtosis) the embedded reth lags the canonical tip, and a
+                // stale nonce/base fee fails rbuilder's bundle simulation,
+                // dropping every bundle. Prefer EEZ_L1_TARGET_RPC_URL (the
+                // canonical EL); fall back to EEZ_L1_RPC_URL when unset
+                // (single-node dev, where they're the same chain view).
+                let l1_rpc_url: reqwest::Url = env::var("EEZ_L1_TARGET_RPC_URL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| env::var("EEZ_L1_RPC_URL").ok())
+                    .ok_or_else(|| eyre::eyre!("EEZ_L1_RPC_URL required for L1 reads"))?
                     .parse()
-                    .map_err(|e| eyre::eyre!("EEZ_L1_RPC_URL malformed: {e}"))?;
+                    .map_err(|e| eyre::eyre!("EEZ_L1_(TARGET_)RPC_URL malformed: {e}"))?;
                 let l1_provider = alloy_provider::RootProvider::new_http(l1_rpc_url.clone());
                 let l1_poster_key = env::var("EEZ_L1_POSTER_KEY").map_err(|_| {
                     eyre::eyre!("EEZ_L1_POSTER_KEY required for L1 postBatch signing")

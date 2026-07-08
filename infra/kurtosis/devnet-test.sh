@@ -122,6 +122,20 @@ for k in "$EEZ_OPERATOR_KEY" "$EEZ_USER_KEY"; do
     fi
 done
 
+# ── MEV warmup gate ──────────────────────────────────────────────────
+# The flashbots relay only starts proposing rbuilder blocks after ~4 epochs
+# (validator registrations propagate); before that EVERY pinned postBatch
+# bundle is dropped by construction — the proposer falls back to a local
+# block that never saw the bundle. Waiting here turns a guaranteed-red run
+# into a green one. Override/skip with EEZ_MEV_WARMUP_BLOCK=0.
+MEV_WARMUP_BLOCK="${EEZ_MEV_WARMUP_BLOCK:-132}"
+head_now=$(cast block-number --rpc-url "$L1_RPC")
+if (( head_now < MEV_WARMUP_BLOCK )); then
+    echo "==> waiting for MEV warmup: L1 head $head_now < $MEV_WARMUP_BLOCK (~4 epochs; relay proposes builder blocks only after warmup)"
+    while (( $(cast block-number --rpc-url "$L1_RPC") < MEV_WARMUP_BLOCK )); do sleep 12; done
+    echo "    warmup complete (head $(cast block-number --rpc-url "$L1_RPC"))"
+fi
+
 L1_CHAIN_ID=$(cast chain-id --rpc-url "$L1_RPC")
 L2_CHAIN_ID=$(cast chain-id --rpc-url "$L2_RPC")
 USER_ADDR=$(cast wallet address --private-key "$EEZ_USER_KEY")
