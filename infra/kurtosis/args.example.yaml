@@ -115,4 +115,6 @@ eez:
   cross_chain_source_chain_ids: "7331"
 
   # ── Optional overrides ──────────────────────────────────────────────
+  # Route bundle submission through the relay so mev-boost can see bids.
+  relay_url: "http://mev-relay-api:9062"
   # builder_rpc_url: "http://el-5-reth-builder-lighthouse:8645"  # auto-detected

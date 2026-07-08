@@ -39,6 +39,9 @@ L2_XCHAIN_PORT = 18998
 # EL range, not the standard 8545 JSON-RPC.
 RBUILDER_RPC_PORT = 8645
 
+# mev-relay API HTTP port inside the enclave.
+MEV_RELAY_API_PORT = 9062
+
 # L2 genesis state root for the repo's ../../genesis.json, needed by
 # scripts/deploy.sh's RegisterRollup call (step 3 below) BEFORE eez-node's L2
 # reth (step 4) exists to query it from. The root depends only on `alloc`
@@ -95,6 +98,10 @@ def run(plan, args):
                  "set eez.builder_rpc_url explicitly")
         builder_rpc = "http://{}:{}".format(builder_el.dns_name, RBUILDER_RPC_PORT)
 
+    relay_rpc = eez.get("relay_url", "")
+    if relay_rpc == "":
+        relay_rpc = "http://mev-relay-api:{}".format(MEV_RELAY_API_PORT)
+
     chain_id = str(eth_args.get("network_params", {}).get("network_id", "7331"))
 
     # ── 2. Mint the engine-API JWT shared by embedded reth <-> follower ──
@@ -102,16 +109,11 @@ def run(plan, args):
     jwt = plan.run_sh(
         description = "mint engine-API JWT (embedded reth <-> follower)",
         image = "alpine:3.20",
-        # 32 bytes as 64 hex chars, no newline. tr -dc / head -c are busybox-safe.
         run = "mkdir -p /jwt && tr -dc 'a-f0-9' < /dev/urandom | head -c 64 > /jwt/jwtsecret",
         store = [StoreSpec(src = "/jwt/jwtsecret", name = "eez-jwt")],
     )
 
     # ── 3. Deploy EEZ contracts + build the L2 genesis on the live L1 ────
-    # scripts/deploy.sh (baked into the deploy image) deploys the registry +
-    # proof system + rollup, then writes a timestamp-aligned L2 genesis. Both
-    # outputs land in /out and are captured as the "eez-deployments" artifact.
-    # deploy.sh already retries the L1 RPC until it answers, so no extra wait.
     deploy = plan.run_sh(
         description = "deploy EEZ contracts + generate L2 genesis on the shared L1",
         image = eez.get("deploy_image", "eez-deploy:dev"),
@@ -129,9 +131,6 @@ def run(plan, args):
     )
 
     # ── 4. eez-node (embedded L1 + composer + L2) ───────────────────────
-    # The deployments artifact is mounted at the SAME /out path used at deploy
-    # time, so the absolute paths written into deployments.env (notably
-    # EEZ_L2_GENESIS_PATH=/out/l2-genesis.json) resolve unchanged.
     eez_env = {
         "EEZ_L1_EMBEDDED": "1",
         "EEZ_L1_CHAIN": "devnet",
@@ -140,33 +139,22 @@ def run(plan, args):
         "EEZ_L1_HTTP_PORT": str(EMBEDDED_L1_RPC_PORT),
         "EEZ_L1_AUTH_PORT": str(EMBEDDED_L1_ENGINE_PORT),
         "EEZ_L1_CHAIN_ID": chain_id,
-        # Composer reads L1 state in-process from the embedded reth.
         "EEZ_L1_RPC_URL": "http://127.0.0.1:{}".format(EMBEDDED_L1_RPC_PORT),
-        # Submitter targets the CANONICAL EL (where rbuilder builds and blocks
-        # land) for bundle targeting + receipts — NOT the lagging embedded reth.
         "EEZ_L1_TARGET_RPC_URL": l1_el.rpc_http_url,
         "EEZ_L1_BUILDER_RPC_URL": builder_rpc,
-        # Embedded reth backfills 1..N over RLPx from this enode (the follower
-        # feeds it only HEAD payloads). enode carries the real enclave IP.
+        "EEZ_L1_RELAY_RPC_URL": relay_rpc,
         "EEZ_L1_TRUSTED_PEERS": l1_el.enode,
         "EEZ_L1_BLOCK_TIME_MS": str(eez.get("l1_block_time_ms", 12000)),
         "EEZ_L2_BLOCK_TIME_MS": str(eez.get("l2_block_time_ms", 4000)),
         "EEZ_PROOF_TIME_MS": str(eez.get("proof_time_ms", 5000)),
         "EEZ_SUBMISSION_SLACK_MS": str(eez.get("submission_slack_ms", 1500)),
-        # Match docker-compose.chiado-node.yml: do not freeze the sequencer when
-        # bundles are slow to land on the split-L1 Kurtosis topology.
         "EEZ_MAX_SPECULATIVE_DEPTH": str(eez.get("max_speculative_depth", 0)),
         "DEVNET_FEE_RECIPIENT": eez.get("fee_recipient", "0x0000000000000000000000000000000000000000"),
         "EEZ_L1_POSTER_KEY": poster_key,
         "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
         "EEZ_L2_DATADIR": "/data/l2",
         "EEZ_L2_HTTP_PORT": str(L2_RPC_PORT),
-        # Upstream for the L2 (Outbound) cross-chain front. The L1 front reuses
-        # EEZ_L1_RPC_URL (embedded L1) above; the L2 front needs the rollup RPC.
         "EEZ_L2_RPC_URL": "http://127.0.0.1:{}".format(L2_RPC_PORT),
-        # Launch BOTH cross-chain fronts (absent env → that front is skipped).
-        # Published below so the host harness (devnet-test.sh / wave harness)
-        # can submit Inbound ops to the L1 front and Outbound ops to the L2 front.
         "EEZ_L1_XCHAIN_PORT": str(L1_XCHAIN_PORT),
         "EEZ_L2_XCHAIN_PORT": str(L2_XCHAIN_PORT),
         "EEZ_L2_AUTH_PORT": str(L2_ENGINE_PORT),
@@ -174,8 +162,6 @@ def run(plan, args):
         "EEZ_L2_SYSTEM_KEY": eez.get("l2_system_key", "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"),
         "EEZ_L2_SYSTEM_ADDRESS": eez.get("l2_system_address", "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
         "EEZ_CCM_L2_ADDRESS": eez.get("ccm_l2_address", "0x4200000000000000000000000000000000000007"),
-        # MUST include the L1 chainId or every op classifies as L2-only and
-        # batches settle empty.
         "EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS": eez.get("cross_chain_source_chain_ids", chain_id),
     }
 
@@ -213,13 +199,6 @@ def run(plan, args):
     )
 
     # ── 5. Follower beacon (no validators) — drives eez-node's embedded reth ─
-    # Flags mirror ethereum-package's own lighthouse nodes so the follower is a
-    # first-class Pair B peer on the private enclave: --enable-private-discovery
-    # (accept private-IP ENRs) + a stable advertised ENR (--enr-address/-*-port,
-    # auto-update off). The advertised ENR is required: without an IP in its ENR
-    # peers can't score the follower and won't reliably graft it into the
-    # block-gossip mesh. Kurtosis fills FOLLOWER_IP with the container IP via
-    # private_ip_address_placeholder.
     plan.add_service(
         name = "eez-follower",
         config = ServiceConfig(
