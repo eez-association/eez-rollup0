@@ -98,7 +98,7 @@ FROM debian:bookworm-slim AS chaincfg
 RUN apt-get update && apt-get install -y --no-install-recommends jq \
     && rm -rf /var/lib/apt/lists/*
 COPY genesis.json /genesis.json
-RUN jq .config /genesis.json > /l2-chainconfig.json
+RUN jq -e .config /genesis.json > /l2-chainconfig.json
 
 # ── runtime: slim image with both binaries + the L2 chain-config ─────
 FROM debian:bookworm-slim AS runtime
