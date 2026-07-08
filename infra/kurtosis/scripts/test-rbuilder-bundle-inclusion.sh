@@ -35,9 +35,9 @@ require_value() {
 }
 
 require_value "EEZ_L1_RPC_URL" "$RPC" \
-    "tried: kurtosis port print ${ENCLAVE:-eez-devnet} ${KURTOSIS_L1_SERVICE:-el-1-reth-lighthouse} ${KURTOSIS_L1_RPC_PORT:-rpc}"
+    "tried configured service plus discovered non-builder el-* services with port ${KURTOSIS_L1_RPC_PORT:-rpc}"
 require_value "EEZ_L1_BUILDER_RPC_URL" "$BUILDER" \
-    "tried: kurtosis port print ${ENCLAVE:-eez-devnet} ${KURTOSIS_BUILDER_SERVICE:-el-5-reth-builder-lighthouse} ${KURTOSIS_BUILDER_RPC_PORT:-rbuilder-rpc}"
+    "tried configured service plus discovered builder/rbuilder services with ports ${KURTOSIS_BUILDER_RPC_PORT:-rbuilder-rpc}, rpc, http"
 require_value "EEZ_L1_POSTER_KEY" "$POSTER_KEY" \
     "tried: poster_key in ${KURTOSIS_ARGS_FILE:-$HERE/../args.yaml}; override with EEZ_L1_POSTER_KEY=0x..."
 
