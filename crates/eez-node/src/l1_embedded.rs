@@ -56,16 +56,6 @@ impl L1ChainKind {
             _ => Self::Dev,
         }
     }
-
-    /// Short label for structured-logging `kind` fields. Single source
-    /// of truth for `main.rs`'s embedded-L1 launch events.
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Dev => "dev",
-            Self::Chiado => "chiado",
-            Self::Devnet => "devnet",
-        }
-    }
 }
 
 /// Config knobs for the embedded L1 launch. All read from env in

@@ -27,6 +27,13 @@ EMBEDDED_L1_ENGINE_PORT = 18551   # embedded L1 reth authrpc — the follower di
 L2_RPC_PORT = 18688               # eez-node's L2 rollup reth JSON-RPC
 L2_ENGINE_PORT = 18684            # L2 engine (driven in-process)
 L2_P2P_PORT = 30640
+# Cross-chain ingress fronts (main.rs `run_cross_chain_front`, bind 0.0.0.0).
+# One per SOURCE chain; each forwards eth_* to its upstream RPC and intercepts
+# sendRawTransaction into the held pool for composition:
+#   L1 front (→ EEZ_L1_RPC_URL, the embedded L1): L1→L2 Inbound.
+#   L2 front (→ EEZ_L2_RPC_URL, the L2 rollup):    L2→L1 Outbound.
+L1_XCHAIN_PORT = 18999
+L2_XCHAIN_PORT = 18998
 
 # rbuilder's bundle endpoint ("rbuilder-rpc") is 8645 inside the enclave — the
 # EL range, not the standard 8545 JSON-RPC.
@@ -140,6 +147,14 @@ def run(plan, args):
         "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
         "EEZ_L2_DATADIR": "/data/l2",
         "EEZ_L2_HTTP_PORT": str(L2_RPC_PORT),
+        # Upstream for the L2 (Outbound) cross-chain front. The L1 front reuses
+        # EEZ_L1_RPC_URL (embedded L1) above; the L2 front needs the rollup RPC.
+        "EEZ_L2_RPC_URL": "http://127.0.0.1:{}".format(L2_RPC_PORT),
+        # Launch BOTH cross-chain fronts (absent env → that front is skipped).
+        # Published below so the host harness (devnet-test.sh / wave harness)
+        # can submit Inbound ops to the L1 front and Outbound ops to the L2 front.
+        "EEZ_L1_XCHAIN_PORT": str(L1_XCHAIN_PORT),
+        "EEZ_L2_XCHAIN_PORT": str(L2_XCHAIN_PORT),
         "EEZ_L2_AUTH_PORT": str(L2_ENGINE_PORT),
         "EEZ_L2_P2P_PORT": str(L2_P2P_PORT),
         "EEZ_L2_SYSTEM_KEY": eez.get("l2_system_key", "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"),
@@ -169,6 +184,8 @@ def run(plan, args):
             ports = {
                 "l1-engine": PortSpec(number = EMBEDDED_L1_ENGINE_PORT, transport_protocol = "TCP"),
                 "l2-rpc": PortSpec(number = L2_RPC_PORT, transport_protocol = "TCP", application_protocol = "http"),
+                "l1-xchain": PortSpec(number = L1_XCHAIN_PORT, transport_protocol = "TCP", application_protocol = "http"),
+                "l2-xchain": PortSpec(number = L2_XCHAIN_PORT, transport_protocol = "TCP", application_protocol = "http"),
             },
             files = {
                 "/out": deploy.files_artifacts[0],

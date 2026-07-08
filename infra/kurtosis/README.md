@@ -150,27 +150,36 @@ disruptoor URLs via [`scripts/enclave-env.sh`](scripts/enclave-env.sh)
 
 ## Full cross-chain end-to-end test
 
-[`scripts/devnet-test.sh`](../../scripts/devnet-test.sh) deploys a contract on
-L2, fires cross-chain setter/deposit waves, and asserts that L1
-`rollups(id).stateRoot` matches L2's actual state root with zero divergence.
+Two harnesses attach to the running enclave (they launch nothing) and are
+entirely self-contained: each resolves its own endpoints via
+`kurtosis port print` and its own protocol deployment via
+`kurtosis files download`, so there's no separate discovery step — just bring
+the enclave up and run the script.
 
-```bash
-E=eez-devnet
+- [`infra/kurtosis/devnet-test.sh`](devnet-test.sh) — **inbound-only** (L1→L2).
+  Deploys Value on L2, creates setter + deposit CrossChainProxies on the shared
+  L1, fires setter/deposit waves at the **L1 front**, and asserts L1
+  `rollups(id).stateRoot` matches L2's actual state root with zero divergence.
 
-kurtosis files download $E eez-deployments /tmp/dep
-cp /tmp/dep/deployments.env deployments.env
+  ```bash
+  bash infra/kurtosis/devnet-test.sh
+  ```
 
-source infra/kurtosis/scripts/enclave-env.sh
-printf 'EEZ_L1_RPC_URL=%s\n' "$EEZ_L1_RPC_URL" > infra/kurtosis/endpoints.env
-export L2_RPC="http://$(kurtosis port print $E eez-node l2-rpc)"
+- [`infra/kurtosis/wave-test.sh`](wave-test.sh) — the comprehensive harness.
+  `EEZ_WAVE_MODE` = `inbound` | `outbound` | `mixed` | `mixed-pure` exercises
+  L1→L2 **and** L2→L1 (via the L2 front), direct + wrapper, with the wave loop
+  and assertions in [`wave-lib.sh`](wave-lib.sh).
 
-kurtosis service logs -f $E eez-node > /tmp/eez-node.log 2>&1 &
-LOGPID=$!
+  ```bash
+  EEZ_WAVE_MODE=mixed EEZ_WAVE_COUNT=3 bash infra/kurtosis/wave-test.sh
+  ```
 
-bash scripts/devnet-test.sh
-
-kill $LOGPID 2>/dev/null
-```
+`devnet-test.sh` reads the composer log via `kurtosis service logs eez-devnet
+eez-node` (a snapshot it refreshes itself; set `KURTOSIS_ENCLAVE` if you named
+the enclave something else). `wave-test.sh` defers log handling to
+`wave-lib.sh`; set `EEZ_NODE_LOG` to point it at a log file if you tee one
+yourself. Cross-chain ops go to the fronts published by eez-node: `l1-xchain`
+(Inbound) and `l2-xchain` (Outbound).
 
 ## Configuration
 
@@ -193,6 +202,8 @@ schedule can never drift between them.
 | `el-5-reth-builder-lighthouse` | `rbuilder-rpc` | 8645 | `eth_sendBundle` target |
 | `eez-node` | `l2-rpc` | 18688 | L2 rollup JSON-RPC |
 | `eez-node` | `l1-engine` | 18551 | Engine API (follower dials this) |
+| `eez-node` | `l1-xchain` | 18999 | Cross-chain **Inbound** front (L1→L2); submit inbound ops here |
+| `eez-node` | `l2-xchain` | 18998 | Cross-chain **Outbound** front (L2→L1); submit outbound ops here |
 | `spamoor` | `http` | — | Load UI |
 | `disruptoor` | `http` | — | Reorg primitive API |
 | `assertoor` | `http` | — | Health assertions |
@@ -278,8 +289,8 @@ Suggested progression for exercising the pipeline end to end:
 6. **Bundle starvation** — push spamoor load high enough that relay block
    validation exceeds the slot time, so bundles miss their target block;
    confirm the composer retries cleanly instead of stalling.
-7. **Concurrent submission + reorg** — run `devnet-test.sh` while
-   `reorg-scheduler.sh` is active, so a batch is in flight when its target
-   block reorgs.
+7. **Concurrent submission + reorg** — run `infra/kurtosis/devnet-test.sh`
+   while `reorg-scheduler.sh` is active, so a batch is in flight when its
+   target block reorgs.
 8. **Soak** — leave spamoor and the reorg scheduler running for an extended
    period; confirm no divergence accumulates over many cycles.
