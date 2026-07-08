@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Snapshot the EEZ Kurtosis bundle path:
 #   eez-node submitter -> rbuilder eth_sendBundle -> relay/mev-boost -> L1 block.
-# By default this is read-only. Set EEZ_DIAG_SEND_PROBE=1 to submit one
-# harmless 0-value control bundle from the poster key to itself. It helps
+# By default this is read-only. Set EEZ_DIAG_SEND_PROBE=1 to submit harmless
+# 0-value control bundles from the poster key to itself. It helps
 # distinguish:
 #   - no bundle submission
 #   - bundle accepted by RPC but dropped before inclusion
@@ -74,31 +74,48 @@ if [[ "${EEZ_DIAG_SEND_PROBE:-0}" == "1" ]]; then
         if [[ "$bal" == "0" ]]; then
             echo "poster has zero balance; cannot send active probe"
         else
+            send_control_bundle() {
+                local label="$1" target="$2" pin_ts="${3:-}"
+                local raw hash body waited max_wait
+                raw="$(cast mktx "$addr" --value 0 --private-key "$KEY" --rpc-url "$RPC")"
+                hash="$(cast keccak "$raw")"
+                if [[ -n "$pin_ts" ]]; then
+                    body="$(printf '{"jsonrpc":"2.0","id":1,"method":"eth_sendBundle","params":[{"txs":["%s"],"blockNumber":"0x%x","minTimestamp":%s,"maxTimestamp":%s}]}' "$raw" "$target" "$pin_ts" "$pin_ts")"
+                    echo "$label tx_hash=$hash target_block=$target pin_timestamp=$pin_ts slack=$PROBE_SLACK"
+                else
+                    body="$(printf '{"jsonrpc":"2.0","id":1,"method":"eth_sendBundle","params":[{"txs":["%s"],"blockNumber":"0x%x"}]}' "$raw" "$target")"
+                    echo "$label tx_hash=$hash target_block=$target slack=$PROBE_SLACK"
+                fi
+                echo "$label send_response=$(curl -sS "$BUILDER" -H 'Content-Type: application/json' -d "$body" || true)"
+                waited=0
+                max_wait=$(( SLOT_SECONDS * (PROBE_SLACK + 6) ))
+                while (( $(cast block-number --rpc-url "$RPC") <= target + 1 )); do
+                    sleep 2
+                    waited=$(( waited + 2 ))
+                    if (( waited > max_wait )); then
+                        echo "$label timed out waiting for L1 to pass target+1"
+                        break
+                    fi
+                done
+                if cast receipt "$hash" --rpc-url "$RPC" >/dev/null 2>&1; then
+                    echo "$label=LANDED"
+                    cast receipt "$hash" --rpc-url "$RPC" | sed -n '1,40p'
+                else
+                    echo "$label=DID_NOT_LAND"
+                    echo "$label target_block_summary:"
+                    cast block "$target" --rpc-url "$RPC" 2>/dev/null | sed -n '1,80p' || true
+                fi
+            }
+
             probe_head="$(cast block-number --rpc-url "$RPC")"
             target=$(( probe_head + PROBE_SLACK ))
-            raw="$(cast mktx "$addr" --value 0 --private-key "$KEY" --rpc-url "$RPC")"
-            hash="$(cast keccak "$raw")"
-            body="$(printf '{"jsonrpc":"2.0","id":1,"method":"eth_sendBundle","params":[{"txs":["%s"],"blockNumber":"0x%x"}]}' "$raw" "$target")"
-            echo "tx_hash=$hash target_block=$target slack=$PROBE_SLACK"
-            echo "send_response=$(curl -sS "$BUILDER" -H 'Content-Type: application/json' -d "$body" || true)"
-            waited=0
-            max_wait=$(( SLOT_SECONDS * (PROBE_SLACK + 6) ))
-            while (( $(cast block-number --rpc-url "$RPC") <= target + 1 )); do
-                sleep 2
-                waited=$(( waited + 2 ))
-                if (( waited > max_wait )); then
-                    echo "timed out waiting for L1 to pass target+1"
-                    break
-                fi
-            done
-            if cast receipt "$hash" --rpc-url "$RPC" >/dev/null 2>&1; then
-                echo "control_bundle=LANDED"
-                cast receipt "$hash" --rpc-url "$RPC" | sed -n '1,40p'
-            else
-                echo "control_bundle=DID_NOT_LAND"
-                echo "target_block_summary:"
-                cast block "$target" --rpc-url "$RPC" 2>/dev/null | sed -n '1,80p' || true
-            fi
+            send_control_bundle "control_unpinned" "$target"
+
+            pinned_head="$(cast block-number --rpc-url "$RPC")"
+            pinned_target=$(( pinned_head + PROBE_SLACK ))
+            head_ts="$(cast block "$pinned_head" --field timestamp --rpc-url "$RPC")"
+            pinned_ts=$(( head_ts + PROBE_SLACK * SLOT_SECONDS ))
+            send_control_bundle "control_pinned" "$pinned_target" "$pinned_ts"
         fi
     fi
 fi
@@ -106,7 +123,7 @@ fi
 section "recent eez-node bundle lines"
 node_log="$(kurtosis service logs "$E" eez-node 2>/dev/null || true)"
 printf '%s\n' "$node_log" \
-    | grep -iE 'eth_sendBundle response received|bundle outcome observed|bundle dropped|bundle observation exceeding|advanced L2 safe head' \
+    | grep -iE 'compose_sync_slot invoked|eth_sendBundle response received|bundle outcome observed|bundle dropped|bundle observation exceeding|advanced L2 safe head' \
     | tail -80 || true
 
 last_hash="$(printf '%s\n' "$node_log" \
@@ -126,16 +143,37 @@ if [[ -n "$last_hash" ]]; then
     cast receipt "$last_hash" --rpc-url "$RPC" 2>/dev/null || echo "no receipt on canonical L1"
 fi
 
+builder_log="$(kurtosis service logs "$E" "${KURTOSIS_BUILDER_SERVICE:-el-5-reth-builder-lighthouse}" 2>/dev/null || true)"
+
+if [[ -n "${last_target:-}" ]]; then
+    section "rbuilder target-block lines"
+    printf '%s\n' "$builder_log" \
+        | grep -E "block=${last_target}|slot=${last_target}|block ${last_target}|slot ${last_target}|target.?block.?${last_target}" \
+        | tail -120 || true
+fi
+
 section "rbuilder logs"
-kurtosis service logs "$E" "${KURTOSIS_BUILDER_SERVICE:-el-5-reth-builder-lighthouse}" 2>/dev/null \
+printf '%s\n' "$builder_log" \
     | grep -iE 'bundle|sendBundle|simulation|simulate|revert|reject|error|timestamp|IncorrectTimestamp|payload|bid' \
     | tail -160 || true
 
 section "likely mev relay / boost logs"
-for svc in mev-boost-relay mev-boost cl-5-lighthouse-builder; do
+for svc in \
+    mev-relay-api \
+    mev-relay-housekeeper \
+    mev-boost-1-lighthouse-reth \
+    mev-boost-2-lighthouse-reth \
+    mev-boost-3-lighthouse-reth \
+    mev-boost-4-lighthouse-reth \
+    cl-1-lighthouse-reth \
+    cl-2-lighthouse-reth \
+    cl-3-lighthouse-reth \
+    cl-4-lighthouse-reth \
+    cl-5-lighthouse-reth-builder
+do
     if kurtosis service logs "$E" "$svc" >/tmp/eez-diag-svc.log 2>/dev/null; then
         echo "-- $svc --"
-        grep -iE 'builder|bid|payload|relay|registration|validator|error|warn' /tmp/eez-diag-svc.log \
+        grep -iE 'builder|bid|payload|relay|registration|validator|error|warn|mev|boost|header|getPayload' /tmp/eez-diag-svc.log \
             | tail -80 || true
     fi
 done
