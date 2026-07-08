@@ -1,0 +1,20 @@
+# The Dockerfile only needs Cargo.{toml,lock}, crates/, genesis.json.
+# Everything else (esp. the 20 GB chiado snapshot + target/) must stay out
+# of the build context or `docker build` ships it to the daemon.
+.git/
+target/
+chiado-db/
+data/
+datadir/
+sync-rollups-protocol/
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+prompts/
+explanations/
+docs/
+*.bak
+.env
+.env.*
+!.env.chiado.example
+*.log

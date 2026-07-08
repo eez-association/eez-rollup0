@@ -10,17 +10,21 @@
 //! engine-API client is reth's stable contract for "consensus that isn't a
 //! real `PoS` CL."
 //!
-//! Stage 1 surface (this crate today):
+//! ## Surface (Stage 4)
 //!
-//! - [`Scheduler`] fires a [`ProposalRequest`] on a fixed wall-clock interval.
-//! - [`Sequencer`] consumes those requests, builds payload attributes, drives
-//!   reth's engine, and tracks the head.
+//! - [`slot`] — `SlotKind`, `SlotEvent`, `L1HeadSource`, plus
+//!   [`spawn_interval`] (standalone-mode) and [`spawn_l1_anchored`]
+//!   (production). Defines the protocol between Schedulers and
+//!   Sequencers.
+//! - [`Sequencer`] consumes [`SlotEvent`]s, builds payload attributes,
+//!   drives reth's engine, tracks head, emits [`BatchCandidate`]s.
+//! - [`RollupTiming`] + [`SlotComposition`] — per-rollup wall-clock
+//!   timing config and per-trigger Live/Future/Sync split.
+//! - [`submit`] — `BatchCandidate` schema and emission policy.
 //!
-//! Later stages will add: L1-triggered safe-head updates and reorgs (stage 3),
-//! batch pre-building with future timestamps (stage 4), and composer-driven
-//! cross-chain block contents (stage 4). The Stage-1 module layout already
-//! places those seams where they belong — the [`Scheduler`] is the entry
-//! point for non-tick events, and the [`Sequencer`] is where head state lives.
+//! Composition with `eez-l1` + `eez-composer`: this crate has zero L1
+//! dependencies; L1 wiring crosses the [`L1HeadSource`] trait boundary
+//! (impl lives in `eez-l1::L1HeadStream`).
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
@@ -32,14 +36,24 @@ pub const BUILDER_GAS_LIMIT: u64 = 30_000_000;
 
 pub mod block_committer;
 pub mod error;
-pub mod scheduler;
 pub mod sequencer;
+pub mod slot;
+pub mod submit;
+pub mod timing;
 
 #[doc(inline)]
 pub use block_committer::{BlockCommitterHandle, CommitOutcome, DeriveOutcome, ForkchoiceOutcome};
 #[doc(inline)]
 pub use error::{DriverError, DriverResult};
 #[doc(inline)]
-pub use scheduler::{ProposalRequest, Scheduler, SlotKind};
-#[doc(inline)]
 pub use sequencer::{ConfirmedHeadSource, EthAttributesBuilder, Sequencer};
+#[doc(inline)]
+pub use slot::{
+    L1HeadInfo, L1HeadSource, NoCrossChainContent, ParentContext, SlotEvent, SlotKind,
+    SyncSlotBlock, SyncSlotComposer, SyncSlotComposerHandle, SyncSlotMode, spawn_interval,
+    spawn_l1_anchored,
+};
+#[doc(inline)]
+pub use submit::{BatchCandidate, BatchPolicy};
+#[doc(inline)]
+pub use timing::{MAX_BLOCKS_PER_CATCHUP, RollupTiming, SlotComposition};

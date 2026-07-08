@@ -1,0 +1,61 @@
+[package]
+name                   = "eez-composer"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+description            = "Composer umbrella — owns per-rollup Sequencer/Scheduler/HeldPool maps and the shared Aggregator/Submitter/Prover."
+
+[dependencies]
+# Internal — protocol, EVM port + inspector, and the existing umbrella siblings
+eez-driver.workspace         = true
+eez-evm.workspace            = true
+eez-evm-inspector.workspace  = true
+eez-l1.workspace             = true
+eez-payload-codec.workspace  = true
+eez-protocol.workspace       = true
+eez-prover.workspace         = true
+
+# gnosis — chiado L1 header type for GnosisL1Adapter
+gnosis-primitives.workspace = true
+
+# alloy
+alloy-consensus.workspace        = true
+alloy-eips.workspace             = true
+alloy-network.workspace          = true
+alloy-primitives.workspace       = true
+alloy-provider.workspace         = true
+alloy-rpc-types-engine.workspace = true
+alloy-signer-local.workspace     = true
+alloy-sol-types.workspace        = true
+
+# reth (state + revm + chainspec + evm + trie for LocalChainClient + sessions,
+# engine-primitives + payload-primitives for build_sync_block → ExecutionData)
+reth-chainspec.workspace                  = true
+reth-ethereum-engine-primitives.workspace = true
+reth-ethereum-primitives.workspace        = true
+reth-evm.workspace                        = true
+reth-evm-ethereum.workspace               = true
+reth-payload-primitives.workspace         = true
+reth-primitives-traits.workspace          = true
+reth-revm.workspace                       = true
+reth-storage-api.workspace                = true
+reth-trie-common.workspace                = true
+
+# revm direct (overlay-channel paths in local/session.rs)
+revm.workspace = true
+
+# async + diagnostics
+async-trait.workspace = true
+thiserror.workspace   = true
+tokio.workspace       = true
+tracing.workspace     = true
+
+[features]
+# TEST-ONLY (deriver-gate attack test): inject a corrupted OUTBOUND settlement
+# entry into postBatch so a live node exercises verify_outbound_authorized's
+# reject path. NEVER enabled in normal/release builds. Revert: `git restore`.
+fault-inject = []
+
+[lints]
+workspace = true

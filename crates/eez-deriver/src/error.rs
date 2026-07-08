@@ -26,6 +26,9 @@ pub(crate) enum ErrorKind {
     /// `call_data`. Usually indicates a contract that posted a payload
     /// in a version we don't speak.
     Codec(eez_payload_codec::CodecError),
+    /// L1 catch-up scan failed. Callers can inspect nested typed L1 errors
+    /// through helper methods without deriver re-encoding their meaning.
+    L1Scan(eez_l1::L1Error),
     /// `BlockCommitter` actor task is gone; the deriver can't push
     /// safe-head advances any further.
     CommitterClosed,
@@ -37,12 +40,21 @@ pub(crate) enum ErrorKind {
     /// at `l2_block` has different content than the batch says it
     /// should. Real reorg/replay is a follow-up; today this halts the
     /// deriver loudly.
-    LocalDiverged { l2_block: u64 },
+    LocalDiverged {
+        l2_block: u64,
+        /// Why the divergence was raised (gate failure, prefix mismatch,
+        /// replay error). Surfaced in `Display` — silent failures are bugs.
+        detail: Option<String>,
+    },
 }
 
 impl DeriverError {
     pub(crate) fn l2_provider(err: impl fmt::Display) -> Self {
         Self::new(ErrorKind::L2Provider(err.to_string()))
+    }
+
+    pub(crate) fn l1_scan(err: eez_l1::L1Error) -> Self {
+        Self::new(ErrorKind::L1Scan(err))
     }
 
     pub(crate) fn committer_closed() -> Self {
@@ -54,13 +66,17 @@ impl DeriverError {
     }
 
     pub(crate) fn local_diverged(l2_block: u64) -> Self {
-        Self::new(ErrorKind::LocalDiverged { l2_block })
+        Self::new(ErrorKind::LocalDiverged {
+            l2_block,
+            detail: None,
+        })
     }
 
-    pub(crate) fn local_diverged_with_msg(l2_block: u64, _msg: &str) -> Self {
-        // For now the variant only carries l2_block; the message is
-        // logged at the call site so the error type stays narrow.
-        Self::new(ErrorKind::LocalDiverged { l2_block })
+    pub(crate) fn local_diverged_with_msg(l2_block: u64, msg: &str) -> Self {
+        Self::new(ErrorKind::LocalDiverged {
+            l2_block,
+            detail: Some(msg.to_string()),
+        })
     }
 
     fn new(kind: ErrorKind) -> Self {
@@ -80,6 +96,13 @@ impl DeriverError {
     #[must_use]
     pub fn is_codec(&self) -> bool {
         matches!(self.kind, ErrorKind::Codec(_))
+    }
+
+    /// Returns true if L1 is missing data for an otherwise-observed
+    /// canonical item and the caller may retry after the source catches up.
+    #[must_use]
+    pub fn is_source_incomplete(&self) -> bool {
+        matches!(&self.kind, ErrorKind::L1Scan(err) if err.is_source_incomplete())
     }
 
     /// Returns true if the `BlockCommitter` actor task has exited.
@@ -139,18 +162,23 @@ impl fmt::Display for DeriverError {
         match &self.kind {
             ErrorKind::L2Provider(msg) => write!(f, "L2 provider error: {msg}"),
             ErrorKind::Codec(err) => write!(f, "payload codec error: {err}"),
+            ErrorKind::L1Scan(err) => write!(f, "L1 catch-up scan error: {err}"),
             ErrorKind::CommitterClosed => {
                 write!(f, "block committer actor task has exited")
             }
             ErrorKind::InvalidForkchoice(detail) => {
                 write!(f, "engine rejected safe/finalized FCU: {detail}")
             }
-            ErrorKind::LocalDiverged { l2_block } => {
+            ErrorKind::LocalDiverged { l2_block, detail } => {
                 write!(
                     f,
                     "local L2 block {l2_block} diverged from L1-confirmed batch; \
                      the on-chain claimed newState doesn't match local STF output"
-                )
+                )?;
+                if let Some(detail) = detail {
+                    write!(f, " ({detail})")?;
+                }
+                Ok(())
             }
         }
     }

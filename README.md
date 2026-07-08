@@ -1,58 +1,123 @@
 # eez-rollup0
 
-L2 rollup node with a custom sequencer driving a near-vanilla reth via the engine API.
+An L2 rollup where L1 and L2 can call into each other as part of the same
+flow. Three components do the work: a **sequencer** produces L2 blocks (it
+drives a stock [reth](https://github.com/paradigmxyz/reth) node), a
+**composer** posts those blocks to the `EEZ` contract on L1, and a
+**deriver** can rebuild the whole L2 chain from L1 alone. The supported L1 is
+Gnosis **Chiado** (a testnet).
 
-## Status
+## What it does
 
-Stages 1 and 2 done — `eez-node` produces L2 blocks every 2s and posts contiguous batches to `EEZ.postAndVerifyBatch` on the configured L1 every minute. Batches carry only L2 user txs in stage 2; cross-chain entries arrive in stage 4.
+- **Produces L2 blocks** on a schedule tied to L1: ordinary blocks most of
+  the time, plus one special **Sync block** per L1 block that carries the
+  cross-chain work.
+- **Routes cross-chain calls.** A transaction aimed at a cross-chain proxy
+  (or sent from L1) is held aside, simulated, and packed into the next Sync
+  block. The matching L1 call (`postBatch`) and the user's L1 transactions
+  are submitted together so they all land in the *same* L1 block — all or
+  nothing.
+- **Commits first, repairs if needed.** The Sync block is added to L2 right
+  away; the L1 submission is watched in the background, and if it doesn't make
+  it onto L1 the L2 block is rolled back. L1 is the source of truth — L2 only
+  keeps what L1 confirms.
+- **Can be re-derived from L1.** A **follower** rebuilds the identical L2
+  chain just by reading L1 (the `BatchPosted` events) and re-running the same
+  transactions — no need to trust the sequencer.
 
-## Run
+Proofs are a mock for now (`MockECDSAProofSystem`, an ECDSA-signature
+stand-in). The `EEZ` contract enforces the chain of state roots itself, so
+the mock is enough to test liveness and consistency — real validity proofs
+come later.
+
+## Run a chiado L2 (Docker)
+
+Runs two containers: `eez-node` (which embeds a Chiado L1 node alongside the
+L2 + composer) and a **lighthouse** consensus client that drives the L1.
+There's no separate L1 node to run. Cross-chain batches are submitted to
+Chiado's block builder; the L1 block to aim them at is read from the embedded
+L1 once it has caught up to the chain tip.
+
+### One-time setup
 
 ```bash
 git submodule update --init --recursive
 
-cp .env.example .env                 # fill in L1 RPC, poster + proof-signer keys, datadir
-make deploy-protocol                 # deploys EEZ + MockECDSAProofSystem + Rollup manager + creates rollupId
-                                     # paste each printed address into .env
-make run-node                        # spawns sequencer + composer (composer drives the submitter)
+# 1. Build the node image (~30 min cold; cargo-chef caches the reth deps).
+docker build -t eez-node:local .
+
+# 2. Download a minimal chiado L1 snapshot (skips syncing from genesis).
+mkdir -p data
+docker run --rm -v "$PWD/data/chiado-l1:/data" \
+  ghcr.io/gnosischain/reth_gnosis:v2.0.0 \
+  download --chain chiado --minimal --datadir /data
+
+# 3. Shared engine-API JWT for eez-node <-> lighthouse.
+openssl rand -hex 32 > data/jwt.hex
+
+# 4. Chiado consensus config (config.yaml, bootnodes, deploy_block.txt).
+git clone https://github.com/gnosischain/configs.git /tmp/gnosis-configs
+mkdir -p configs && cp -r /tmp/gnosis-configs/chiado configs/chiado
+
+# 5. Fund the operator/poster keys with xDAI (https://faucet.chiadochain.net).
 ```
 
-Run without `.env` (sequencer-only smoke test):
+### Deploy the protocol (once, against a fully-synced chiado RPC)
+
+The embedded L1 is still syncing at this point, so run the deploy against a
+Chiado RPC that's already at the chain tip — the public endpoint, or a
+standalone chiado-reth.
 
 ```bash
-cargo run -p eez-node -- node --chain dev --datadir /tmp/eez-rollup0-data
+cp .env.example .env
+#   EEZ_L1_RPC_URL=<tip chiado RPC>   EEZ_L1_POSTER_KEY=<operator key>
+#   EEZ_PROOF_SIGNER_KEY=<operator key>   (its address becomes the proof system's authorizedSigner)
+EEZ_DEPLOY_SKIP_SIMULATION=1 make deploy-protocol
+
+cp datadir/genesis.json ./data/genesis-fresh.json
 ```
 
-Logs you should see: `eez.sequencer.block.produced` every 2s; `eez.composer.batch.posted` every 60s when L1 config is present.
+This deploys EEZ + MockECDSAProofSystem + the rollup manager, registers the
+rollup, deploys the L1 bridge contracts, and writes **`deployments.env`**
+(registry, proof system, rollup id, deploy block, bridge + CCM-L2 addresses)
+plus the L2 **`datadir/genesis.json`** whose timestamp is pinned to the deploy
+block. The container loads `deployments.env` automatically; `.env.chiado`'s
+`FRESH_GENESIS` points at that genesis (default `./datadir/genesis.json`), so
+**deploy must run before `up`** — there is no separate genesis-creation step.
+(Set `EEZ_BLOCKSCOUT_URL` first to also verify the contracts on Blockscout —
+opt-in.)
 
-### Follower
-
-Runs a reth node with the PR #5 L1 watcher + deriver. L1 `BatchPosted` events are decoded, reconciled against local blocks, replayed into reth when needed, and used to advance the FCU `safe` / `finalized` anchors. The follower can also poll a sequencer RPC for a faster unsafe `head`; that RPC head is only accepted while compatible with the L1-derived anchors.
-
-L1 config is mandatory: `EEZ_L1_RPC_URL`, `EEZ_REGISTRY_ADDRESS`, `EEZ_ROLLUP_ID`, and `EEZ_REGISTRY_DEPLOY_BLOCK` must be set. `EEZ_L1_POSTER_KEY` is optional for the follower because it only reads from L1. Start the sequencer first if you want sequencer-RPC unsafe head, and grab its enode URL from the startup log.
+### Configure and start
 
 ```bash
-cargo run -p eez-follower -- node --chain dev \
-  --datadir /tmp/eez-follower-data \
-  --trusted-peers <enode-from-sequencer-startup-log> \
-  --sequencer-rpc http://127.0.0.1:8545 \
-  --http --http.port 8645 \
-  --port 30403 --authrpc.port 8651 \
-  --disable-discovery
+cp .env.chiado.example .env.chiado    # host paths + funded keys + bundler URL
+docker compose --env-file .env.chiado -f docker-compose.chiado-node.yml up
 ```
 
-To run L1-derived-only, omit `--sequencer-rpc` and peer flags. In that mode the head advances from L1 batches rather than the sequencer RPC.
+The embedded L1 checkpoint-syncs (lighthouse, ~5 min) and catches up past the
+deploy block; then the L2 sequencer + composer run. Health checks:
 
-Logs you should see: `eez.deriver.catch_up.start` on boot, `eez.deriver.safe.advanced` as L1 batches are accepted, `eez.deriver.finalized.advanced` as L1 finality catches up, and, when sequencer RPC is enabled, `eez.follower.head.advanced`, `.head.syncing`, or `.head.inconsistent` for unsafe-head polling. Confirm convergence with `cast block-number`, `cast block safe`, and `cast block finalized` against the follower RPC.
+```bash
+cast block-number --rpc-url http://localhost:18645   # embedded chiado L1 climbing
+cast block-number --rpc-url http://localhost:18688   # L2 producing
+```
 
-## Roadmap
+### Exercise it
 
-### Done
+Deploys a `Value` test contract and its cross-chain proxies, fires several
+rounds of cross-chain setter/deposit calls at the running node, then checks
+that L1 and L2 agree on the state root and that the calls actually took
+effect:
 
-- [x] **Stage 1** — sequenced reth (Sequencer + Scheduler; engine-API consumer loop)
-- [x] **Stage 2** — postBatch submission (upstream `EEZ.sol` + `MockECDSAProofSystem` + `eez-payload-codec` + `eez-prover` + `eez-l1::{Composer, Submitter}`; stateless, restart-safe, reorg-safe)
+```bash
+EEZ_WAVE_COUNT=5 bash scripts/devnet-test.sh
+```
 
-### To do
+## Build, test, teardown
 
-- [ ] **Stage 3** — fuller follower hardening (follower binary now runs L1-derived safe/finalized and optional sequencer-RPC unsafe head; remaining work includes deeper recovery behavior and production-grade validation)
-- [ ] **Stage 4** — cross-chain composer (sync blocks with system txs, proof, full L1↔L2)
+```bash
+cargo build --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace                  # Rust; `cd contracts && forge test` for Solidity
+bash scripts/teardown-chiado.sh         # stop node + lighthouse, release the L1 datadir
+```

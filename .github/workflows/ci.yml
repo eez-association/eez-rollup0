@@ -44,8 +44,6 @@ jobs:
       # Once this completes, clippy and both nextest runs read from cache.
       - name: Build (tests + binaries)
         run: cargo nextest run --workspace --all-targets --no-run
-      - name: Build workspace binaries
-        run: cargo build --workspace --bins
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Build contracts (artifacts read by harness)
