@@ -88,7 +88,10 @@ eez:
   # ── Timing (l1_block_time_ms MUST match network_params.seconds_per_slot) ─
   l1_block_time_ms: 12000
   l2_block_time_ms: 2000
-  proof_time_ms: 4000
+  # Kurtosis rbuilder needs a longer lead time than the in-process dev relay:
+  # with 4s proof budget the exact head+1 bundle can arrive after rbuilder's
+  # order intake for that slot, so it is accepted by RPC but never considered.
+  proof_time_ms: 7000
   submission_slack_ms: 1500
 
   fee_recipient: "0x0000000000000000000000000000000000000000"

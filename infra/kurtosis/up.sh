@@ -55,6 +55,21 @@ for pair in "poster_key:1" "proof_signer_key:2"; do
     fi
 done
 
+# Migrate the original Kurtosis timing preset. With a 4s proof budget the
+# scheduler fires ~6s before the pinned head+1 slot; under rbuilder + relay +
+# spamoor load the bundle can be accepted by eth_sendBundle but miss rbuilder's
+# order intake, leaving bundle_count=0 until the target block passes. Treat the
+# old template values as uncustomized and widen the lead time for existing
+# args.yaml files too.
+if [[ "$(yv l1_block_time_ms)" == "12000" \
+   && "$(yv l2_block_time_ms)" == "2000" \
+   && "$(yv proof_time_ms)" == "4000" \
+   && "$(yv submission_slack_ms)" == "1500" ]]; then
+    sed -i.bak -E "s|^([[:space:]]*proof_time_ms:).*|\\1 7000|" "$ARGS_FILE"
+    rm -f "$ARGS_FILE.bak"
+    echo "==> migrated eez.proof_time_ms from 4000 to 7000 for rbuilder bundle lead time"
+fi
+
 NODE_IMAGE="$(yv eez_node_image)";  NODE_IMAGE="${NODE_IMAGE:-eez-node:dev}"
 DEPLOY_IMAGE="$(yv deploy_image)";  DEPLOY_IMAGE="${DEPLOY_IMAGE:-eez-deploy:dev}"
 

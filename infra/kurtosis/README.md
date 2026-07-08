@@ -90,7 +90,10 @@ That's the whole bring-up. On first run it will:
 3. build the `eez-node` and `eez-deploy` images,
 4. run `kurtosis run` to bring up both pairs in one enclave.
 
-Later runs reuse `args.yaml` as-is and just rebuild the images.
+Later runs reuse `args.yaml` and just rebuild the images. `up.sh` will migrate
+the original uncustomized Kurtosis timing preset (`proof_time_ms: 4000`) to
+`proof_time_ms: 7000`, which gives rbuilder enough lead time for pinned
+`head+1` bundles under devnet load.
 
 **Env knobs** (all optional):
 
