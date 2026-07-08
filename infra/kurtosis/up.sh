@@ -39,7 +39,11 @@ yv() { grep -E "^[[:space:]]*$1:" "$ARGS_FILE" | head -1 \
         | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//'; }
 
 # First run: derive the poster/proof-signer keys from the dev mnemonic instead
-# of asking for a manual `cast wallet private-key` + paste step.
+# of asking for a manual `cast wallet private-key` + paste step. Also derive
+# their ADDRESSES and register them in network_params.prefunded_accounts so
+# genesis actually gives them a balance — without this, postBatch simulation
+# fails "insufficient funds" and every bundle gets silently dropped by rbuilder.
+DERIVED_ADDRS=()
 for pair in "poster_key:1" "proof_signer_key:2"; do
     key="${pair%%:*}"; index="${pair##*:}"
     if [[ "$(yv "$key")" == "0xCHANGE_ME" ]]; then
@@ -49,60 +53,67 @@ for pair in "poster_key:1" "proof_signer_key:2"; do
             exit 1
         }
         derived="$(cast wallet private-key --mnemonic "$DEV_MNEMONIC" --mnemonic-index "$index")"
+        derived_addr="$(cast wallet address --private-key "$derived")"
         sed -i.bak -E "s|^([[:space:]]*${key}:).*|\\1 \"${derived}\"|" "$ARGS_FILE"
         rm -f "$ARGS_FILE.bak"
-        echo "==> derived eez.$key from the dev mnemonic (index $index)"
+        echo "==> derived eez.$key from the dev mnemonic (index $index) -> $derived_addr"
+        DERIVED_ADDRS+=("$derived_addr")
     fi
 done
 
-# Migrate superseded uncustomized timing presets. NOTE: l2_block_time_ms
-# MUST divide l1_block_time_ms evenly with K = l1/l2 >= 2 (RollupTiming::validate()
-# refuses K < 2 at eez-node startup) — 12000/12000 (K=1) is INVALID, do not use it.
-if [[ "$(yv l1_block_time_ms)" == "12000" \
-   && "$(yv l2_block_time_ms)" == "2000" \
-   && "$(yv proof_time_ms)" == "5000" \
-   && "$(yv submission_slack_ms)" == "1500" ]]; then
-    sed -i.bak -E "s|^([[:space:]]*l2_block_time_ms:).*|\\1 4000|" "$ARGS_FILE"
-    rm -f "$ARGS_FILE.bak"
-    echo "==> migrated eez.l2_block_time_ms from 2000 to 4000 (bootstrap K=3)"
+# Make sure the derived addresses are present in network_params.prefunded_accounts.
+# Uses python3+pyyaml if available (safe structural edit); falls back to a plain
+# warning + manual instructions if python/pyyaml isn't present, rather than risking
+# a corrupt YAML file via sed on a nested map.
+if [[ "${#DERIVED_ADDRS[@]}" -gt 0 ]]; then
+    if command -v python3 >/dev/null && python3 -c "import yaml" >/dev/null 2>&1; then
+        python3 - "$ARGS_FILE" "${DERIVED_ADDRS[@]}" <<'PYEOF'
+import sys, yaml
+
+args_file = sys.argv[1]
+addrs = sys.argv[2:]
+
+with open(args_file) as f:
+    data = yaml.safe_load(f) or {}
+
+np = data.setdefault("network_params", {})
+pf = np.get("prefunded_accounts")
+
+if isinstance(pf, str):
+    import json
+    pf = json.loads(pf) if pf.strip() else {}
+elif pf is None:
+    pf = {}
+
+changed = False
+for addr in addrs:
+    if addr not in pf:
+        pf[addr] = {"balance": "1000ETH"}
+        changed = True
+
+np["prefunded_accounts"] = pf
+
+if changed:
+    with open(args_file, "w") as f:
+        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+    print(f"==> added {len(addrs)} derived address(es) to network_params.prefunded_accounts")
+else:
+    print("==> derived addresses already present in network_params.prefunded_accounts")
+PYEOF
+    else
+        echo "⚠️  python3/pyyaml not found — cannot auto-inject prefunded_accounts." >&2
+        echo "    Add these addresses to network_params.prefunded_accounts in $ARGS_FILE manually:" >&2
+        for addr in "${DERIVED_ADDRS[@]}"; do
+            echo "      \"$addr\": { balance: \"1000ETH\" }" >&2
+        done
+        echo "    Without this, postBatch simulation will fail with insufficient funds" >&2
+        echo "    and eez-node bundles will be dropped on every target block." >&2
+    fi
 fi
 
-# The 5000ms proof budget gives rbuilder enough lead without changing block cadence.
-if [[ "$(yv l1_block_time_ms)" == "12000" \
-   && "$(yv l2_block_time_ms)" == "2000" \
-   && "$(yv proof_time_ms)" == "4000" \
-   && "$(yv submission_slack_ms)" == "1500" ]]; then
-    sed -i.bak -E \
-        -e "s|^([[:space:]]*proof_time_ms:).*|\\1 5000|" \
-        -e "s|^([[:space:]]*l2_block_time_ms:).*|\\1 4000|" \
-        "$ARGS_FILE"
-    rm -f "$ARGS_FILE.bak"
-    echo "==> migrated eez.proof_time_ms 4000→5000 and l2_block_time_ms 2000→4000"
-fi
-
-if [[ "$(yv l1_block_time_ms)" == "12000" \
-   && "$(yv l2_block_time_ms)" == "2000" \
-   && "$(yv proof_time_ms)" == "7000" \
-   && "$(yv submission_slack_ms)" == "1500" ]]; then
-    sed -i.bak -E \
-        -e "s|^([[:space:]]*proof_time_ms:).*|\\1 5000|" \
-        -e "s|^([[:space:]]*l2_block_time_ms:).*|\\1 4000|" \
-        "$ARGS_FILE"
-    rm -f "$ARGS_FILE.bak"
-    echo "==> migrated eez.proof_time_ms 7000→5000 and l2_block_time_ms 2000→4000"
-fi
-
-# Undo the incorrect (invalid, K=1) 12000/12000 preset from an earlier version
-# of this script — RollupTiming::validate() rejects K < 2 and eez-node refuses
-# to start on it.
-if [[ "$(yv l1_block_time_ms)" == "12000" \
-   && "$(yv l2_block_time_ms)" == "12000" \
-   && "$(yv proof_time_ms)" == "5000" \
-   && "$(yv submission_slack_ms)" == "1500" ]]; then
-    sed -i.bak -E "s|^([[:space:]]*l2_block_time_ms:).*|\\1 4000|" "$ARGS_FILE"
-    rm -f "$ARGS_FILE.bak"
-    echo "==> fixed eez.l2_block_time_ms from 12000 (INVALID K=1) to 4000 (K=3)"
-fi
+# l2_block_time_ms MUST divide l1_block_time_ms evenly with K = l1/l2 >= 2
+# (RollupTiming::validate() refuses K < 2 at eez-node startup). The default
+# preset (l1=12000, l2=2000) gives K=6, which is valid — no migration needed.
 
 NODE_IMAGE="$(yv eez_node_image)";  NODE_IMAGE="${NODE_IMAGE:-eez-node:dev}"
 DEPLOY_IMAGE="$(yv deploy_image)";  DEPLOY_IMAGE="${DEPLOY_IMAGE:-eez-deploy:dev}"
