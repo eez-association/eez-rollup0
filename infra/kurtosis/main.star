@@ -39,6 +39,16 @@ L2_XCHAIN_PORT = 18998
 # EL range, not the standard 8545 JSON-RPC.
 RBUILDER_RPC_PORT = 8645
 
+# L2 genesis state root for the repo's ../../genesis.json, needed by
+# scripts/deploy.sh's RegisterRollup call (step 3 below) BEFORE eez-node's L2
+# reth (step 4) exists to query it from. The root depends only on `alloc`
+# (the initial account state) — NOT on `timestamp` or the fork-activation
+# fields deploy.sh rewrites afterward — so it's safe to precompute once and
+# hardcode. Derived by booting a throwaway standalone eez-node against
+# genesis.json and reading block 0's stateRoot via eth_getBlockByNumber.
+# Recompute and update this if genesis.json's `alloc` ever changes.
+L2_GENESIS_STATE_ROOT = "0xd381d828f650845aa890778c74ad2de245f5b3f2a24763f243e19a6bafb4fec5"
+
 
 def run(plan, args):
     eth_args = args["ethereum_package"]
@@ -111,6 +121,7 @@ def run(plan, args):
             "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
             "EEZ_DEPLOYMENTS_FILE": "/out/deployments.env",
             "EEZ_GENESIS_OUT": "/out/l2-genesis.json",
+            "EEZ_INITIAL_STATE_ROOT": L2_GENESIS_STATE_ROOT,
         },
         run = "mkdir -p /out && bash /repo/scripts/deploy.sh",
         store = [StoreSpec(src = "/out", name = "eez-deployments")],
