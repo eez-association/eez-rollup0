@@ -8,19 +8,12 @@ description            = "L1 RPC client + Submitter task that posts L2 batches t
 
 [dependencies]
 eez-driver.workspace        = true
+eez-evm.workspace           = true
 eez-payload-codec.workspace = true
-eez-prover.workspace        = true
 
-# reth — needed for the L2 BlockReader bounds (the Submitter reads the
-# local L2 directly to assemble batch payloads; lifting this through a
-# trait wasn't worth the extra abstraction for stage 2).
-reth-primitives-traits.workspace = true
-reth-storage-api.workspace       = true
-
-# alloy — alloy-contract is pulled in transitively via eez-prover.
+# alloy
 alloy-consensus.workspace     = true
 alloy-eips.workspace          = true
-alloy-network.workspace       = true
 alloy-primitives.workspace    = true
 alloy-provider.workspace      = true
 alloy-rpc-types-eth.workspace = true
@@ -32,11 +25,15 @@ reqwest.workspace    = true
 serde_json.workspace = true
 
 # async + diagnostics
-fail.workspace      = true
-thiserror.workspace = true
-tokio.workspace     = true
-tracing.workspace   = true
-url.workspace       = true
+async-trait.workspace = true
+fail.workspace        = true
+thiserror.workspace   = true
+tokio.workspace       = true
+tracing.workspace     = true
+url.workspace         = true
+
+[dev-dependencies]
+alloy-transport = { version = "2", default-features = false }
 
 [lints]
 workspace = true

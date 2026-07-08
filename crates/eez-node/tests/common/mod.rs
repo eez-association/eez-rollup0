@@ -8,6 +8,7 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     process::{Child, Command, Stdio},
+    sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -28,6 +29,20 @@ pub const ANVIL_KEY_2: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870f
 pub const ANVIL_KEY_3: &str = "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6";
 pub const ANVIL_KEY_4: &str = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a";
 pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906");
+
+/// External anvil cadence for composer-mode e2e tests. K = L1/L2 = 3 (not 2):
+/// `RollupTiming::validate` needs proof+slack (1100ms) ≤ (K−1)·L2 = 2000ms.
+/// `EEZ_L1_BLOCK_TIME_MS` derives from this and must match the miner.
+pub const L1_BLOCK_TIME_SECS: u64 = 3;
+
+/// L2 genesis timestamp for the reorg fixture (`0x6490fdd2`); `for_reorg`
+/// anvil aligns to it. The dev path stamps genesis at wall-clock `now`
+/// ([`Harness::fresh`]) — the lateness gate reads a backdated genesis as late.
+pub const L2_GENESIS_TIMESTAMP: u64 = 0x6490_fdd2;
+
+/// Carries the Harness's shared L2 genesis path to every node it spawns
+/// (sequencer, follower, restarts) so they build the same chain; → `--chain`.
+const TEST_L2_GENESIS_ENV: &str = "EEZ_TEST_L2_GENESIS_PATH";
 
 /// Composer tick cadence for single-composer tests — max speed.
 pub const COMPOSER_INTERVAL_SINGLE: Duration = Duration::from_secs(1);
@@ -67,7 +82,7 @@ pub struct Anvil {
     pub rpc_url: String,
 }
 
-/// Anvil configuration. `Anvil::spawn(port)` is the default (1s block,
+/// Anvil configuration. `Anvil::spawn(port)` is the default (3s block,
 /// random mnemonic). The multi-composer reorg test uses
 /// [`AnvilConfig::for_reorg`] which matches the hardhat mnemonic (so we
 /// have predictable prefunded EOAs) and enables the cancun hardfork
@@ -77,29 +92,32 @@ pub struct AnvilConfig {
     pub mnemonic: Option<&'static str>,
     pub hardfork: Option<&'static str>,
     pub gas_limit: Option<u64>,
+    pub genesis_timestamp: Option<u64>,
 }
 
 impl Default for AnvilConfig {
     fn default() -> Self {
         Self {
-            block_time_secs: 1,
+            block_time_secs: L1_BLOCK_TIME_SECS,
             mnemonic: None,
             hardfork: None,
             gas_limit: None,
+            genesis_timestamp: Some(L2_GENESIS_TIMESTAMP),
         }
     }
 }
 
 impl AnvilConfig {
-    /// 1s block time, hardhat mnemonic, cancun hardfork, 30M gas.
-    /// (Chiado uses 5s; tests prefer speed over fidelity. 1s blocks +
+    /// 3s block time, hardhat mnemonic, cancun hardfork, 30M gas.
+    /// (Chiado uses 5s; tests prefer speed over fidelity. 3s blocks +
     /// cancun still permit `anvil_reorg`.)
     pub fn for_reorg() -> Self {
         Self {
-            block_time_secs: 1,
+            block_time_secs: L1_BLOCK_TIME_SECS,
             mnemonic: Some(HARDHAT_MNEMONIC),
             hardfork: Some("cancun"),
             gas_limit: Some(30_000_000),
+            genesis_timestamp: Some(L2_GENESIS_TIMESTAMP),
         }
     }
 }
@@ -128,6 +146,9 @@ impl Anvil {
         }
         if let Some(g) = cfg.gas_limit {
             cmd.args(["--gas-limit", &g.to_string()]);
+        }
+        if let Some(t) = cfg.genesis_timestamp {
+            cmd.args(["--timestamp", &t.to_string()]);
         }
         let child = cmd
             .stdout(Stdio::null())
@@ -250,12 +271,25 @@ pub struct Harness {
     pub anvil: Anvil,
     pub stub: BundleStub,
     pub dep: Deployment,
+    /// Wall-clock-stamped dev genesis shared by every node via
+    /// [`TEST_L2_GENESIS_ENV`] (the tempdir keeps it alive). `None` on the
+    /// reorg path, which passes its own genesis.
+    l2_genesis: Option<(PathBuf, tempfile::TempDir)>,
 }
 
 impl Harness {
-    /// Default: dev-chain anvil + dev-genesis initial state.
+    /// Default: dev-chain anvil + dev-genesis initial state. Anvil + L2
+    /// genesis share one wall-clock `now` so the lateness gate doesn't fire.
     pub async fn fresh() -> Result<Self> {
-        Self::with_anvil_config(AnvilConfig::default(), dev_genesis_state_root()).await
+        let ts = now_unix_secs();
+        let (gpath, gdir) = write_dev_genesis_at(ts)?;
+        let cfg = AnvilConfig {
+            genesis_timestamp: Some(ts),
+            ..AnvilConfig::default()
+        };
+        let mut h = Self::with_anvil_config(cfg, dev_genesis_state_root()).await?;
+        h.l2_genesis = Some((gpath, gdir));
+        Ok(h)
     }
 
     /// Custom anvil config + explicit initial state root. Used by the
@@ -264,7 +298,12 @@ impl Harness {
         let anvil = Anvil::spawn_with(free_port(), cfg).await?;
         let stub = BundleStub::spawn(free_port(), &anvil.rpc_url).await?;
         let dep = deploy_contracts_with_initial(&anvil.rpc_url, ANVIL_KEY, initial_state).await?;
-        Ok(Self { anvil, stub, dep })
+        Ok(Self {
+            anvil,
+            stub,
+            dep,
+            l2_genesis: None,
+        })
     }
 
     pub fn chain(&self) -> Chain<'_> {
@@ -284,11 +323,65 @@ impl Harness {
         poster_key: &str,
         expect_external_batches: bool,
     ) -> Vec<(&'static str, String)> {
-        vec![
+        self.env_for_options(NodeEnvOptions {
+            poster_key,
+            proof_signer_key: Some(ANVIL_KEY),
+            rollup_id: self.dep.rollup_id,
+            expect_external_batches,
+            sequencer_rpc: None,
+        })
+    }
+
+    pub fn follower_env(&self, sequencer_rpc: Option<&str>) -> Vec<(&'static str, String)> {
+        self.env_for_options(NodeEnvOptions {
+            poster_key: ANVIL_KEY,
+            proof_signer_key: None,
+            rollup_id: self.dep.rollup_id,
+            expect_external_batches: true,
+            sequencer_rpc,
+        })
+    }
+
+    pub fn env_with_rollup_id(&self, rollup_id: u64) -> Vec<(&'static str, String)> {
+        self.env_for_options(NodeEnvOptions {
+            poster_key: ANVIL_KEY,
+            proof_signer_key: Some(ANVIL_KEY),
+            rollup_id,
+            expect_external_batches: false,
+            sequencer_rpc: None,
+        })
+    }
+
+    pub fn env_with_proof_signer(&self, proof_signer_key: &str) -> Vec<(&'static str, String)> {
+        self.env_for_options(NodeEnvOptions {
+            poster_key: ANVIL_KEY,
+            proof_signer_key: Some(proof_signer_key),
+            rollup_id: self.dep.rollup_id,
+            expect_external_batches: false,
+            sequencer_rpc: None,
+        })
+    }
+
+    fn env_for_options(&self, opts: NodeEnvOptions<'_>) -> Vec<(&'static str, String)> {
+        let mut env = vec![
             ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
             ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
-            ("EEZ_L1_POSTER_KEY", poster_key.to_string()),
-            ("EEZ_PROOF_SIGNER_KEY", ANVIL_KEY.to_string()),
+            ("EEZ_L1_POSTER_KEY", opts.poster_key.to_string()),
+            ("EEZ_L1_CHAIN_ID", "31337".to_string()),
+            ("EEZ_L1_CHAIN", "testing".to_string()),
+            ("EEZ_L2_SYSTEM_ADDRESS", format!("{ANVIL_ADDR:#x}")),
+            ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
+            (
+                "EEZ_CCM_L2_ADDRESS",
+                "0x4200000000000000000000000000000000000007".to_string(),
+            ),
+            (
+                "EEZ_L1_BLOCK_TIME_MS",
+                (L1_BLOCK_TIME_SECS * 1000).to_string(),
+            ),
+            ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
+            ("EEZ_PROOF_TIME_MS", "1000".to_string()),
+            ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
             (
                 "EEZ_REGISTRY_ADDRESS",
                 format!("{:#x}", self.dep.eez_address),
@@ -305,10 +398,10 @@ impl Harness {
                 "EEZ_ROLLUP_MANAGER_ADDRESS",
                 format!("{:#x}", self.dep.rollup_manager_address),
             ),
-            ("EEZ_ROLLUP_ID", self.dep.rollup_id.to_string()),
+            ("EEZ_ROLLUP_ID", opts.rollup_id.to_string()),
             (
                 "EEZ_COMPOSER_INTERVAL_SECS",
-                if expect_external_batches {
+                if opts.expect_external_batches {
                     COMPOSER_INTERVAL_MULTI
                 } else {
                     COMPOSER_INTERVAL_SINGLE
@@ -318,7 +411,7 @@ impl Harness {
             ),
             (
                 "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES",
-                expect_external_batches.to_string(),
+                opts.expect_external_batches.to_string(),
             ),
             (
                 "EEZ_L2_DATADIR",
@@ -328,8 +421,31 @@ impl Harness {
                 "RUST_LOG",
                 std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
             ),
-        ]
+            (
+                TEST_L2_GENESIS_ENV,
+                self.l2_genesis
+                    .as_ref()
+                    .map(|(p, _)| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ),
+        ];
+
+        if let Some(proof_signer_key) = opts.proof_signer_key {
+            env.push(("EEZ_PROOF_SIGNER_KEY", proof_signer_key.to_string()));
+        }
+        if let Some(sequencer_rpc) = opts.sequencer_rpc {
+            env.push(("EEZ_SEQUENCER_RPC", sequencer_rpc.to_string()));
+        }
+        env
     }
+}
+
+struct NodeEnvOptions<'a> {
+    poster_key: &'a str,
+    proof_signer_key: Option<&'a str>,
+    rollup_id: u64,
+    expect_external_batches: bool,
+    sequencer_rpc: Option<&'a str>,
 }
 
 pub struct Deployment {
@@ -360,6 +476,31 @@ sol! {
 /// emitting `ImmediateEntrySkipped` instead of `L2ExecutionPerformed`.
 pub fn dev_genesis_state_root() -> B256 {
     reth_chainspec::DEV.genesis_header().state_root
+}
+
+/// Wall-clock seconds for stamping test genesis + anvil, so the sequencer's
+/// defer-on-lateness gate doesn't read every trigger as late.
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs()
+}
+
+/// Reth's dev genesis with timestamp set to `ts`, written to a temp file for
+/// `--chain`. Same alloc as `--chain dev` → state root still equals
+/// [`dev_genesis_state_root`]. The tempdir must outlive nodes using the path.
+fn write_dev_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
+    let mut genesis: alloy_genesis::Genesis = reth_chainspec::DEV.genesis().clone();
+    genesis.timestamp = ts;
+    let dir = tempfile::tempdir().context("genesis tempdir")?;
+    let path = dir.path().join("genesis.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&genesis).context("serialize dev genesis")?,
+    )
+    .context("write dev genesis")?;
+    Ok((path, dir))
 }
 
 /// Path to the multi-composer reorg test's L2 genesis fixture. 23
@@ -459,6 +600,17 @@ pub async fn block_number_at(
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let block = provider.get_block_by_number(tag).await?;
     Ok(block.map(|b| b.header.number))
+}
+
+/// Block number and hash at a named tag (`latest`, `safe`, `finalized`, …).
+/// `None` when no block exists at that tag yet.
+pub async fn block_number_and_hash_at(
+    rpc_url: &str,
+    tag: alloy_rpc_types_eth::BlockNumberOrTag,
+) -> Result<Option<(u64, B256)>> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let block = provider.get_block_by_number(tag).await?;
+    Ok(block.map(|b| (b.header.number, b.header.hash)))
 }
 
 /// Deploy `EEZ` + `MockECDSAProofSystem` + `Rollup`, then register the rollup.
@@ -619,20 +771,12 @@ pub struct NodeHandle {
     pub http_port: u16,
 }
 
-/// Which workspace binary to spawn.
-#[derive(Default, Clone, Copy)]
-pub enum NodeBinary {
-    #[default]
-    EezNode,
-    EezFollower,
-}
+static LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Default)]
 pub struct NodeConfig<'a> {
     /// Path to a custom genesis JSON. `None` uses `--chain dev`.
     pub genesis_path: Option<&'a std::path::Path>,
-    /// Which binary to launch (defaults to `eez-node`).
-    pub binary: NodeBinary,
 }
 
 impl NodeHandle {
@@ -654,8 +798,11 @@ impl NodeHandle {
         env: &[(&'static str, String)],
     ) -> Result<Self> {
         let (log_path, log_tempdir) = if let Ok(d) = std::env::var("EEZ_TEST_LOG_DIR") {
-            let p =
-                std::path::PathBuf::from(d).join(format!("{}-{}.log", name, std::process::id()));
+            let suffix = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let p = std::path::PathBuf::from(d).join(format!(
+                "eez-node-{name}-{}-{suffix}.log",
+                std::process::id()
+            ));
             (p, None)
         } else {
             let td = tempfile::tempdir().context("log tempdir")?;
@@ -674,21 +821,29 @@ impl NodeHandle {
         let http_port = free_port();
         let ws_port = free_port();
         let p2p_port = free_port();
-        let chain_arg: std::ffi::OsString = cfg.genesis_path.map_or_else(
-            || std::ffi::OsString::from("dev"),
-            |p| p.as_os_str().to_owned(),
-        );
-        // Only the same-package binary gets a stable `CARGO_BIN_EXE_*`
-        // env var at test-compile time. The follower binary lives in a
-        // sibling crate; cargo builds it as part of `--workspace
-        // --all-targets`, so it sits next to `eez-node` in `target/`.
-        let bin: PathBuf = match cfg.binary {
-            NodeBinary::EezNode => PathBuf::from(env!("CARGO_BIN_EXE_eez-node")),
-            NodeBinary::EezFollower => {
-                PathBuf::from(env!("CARGO_BIN_EXE_eez-node")).with_file_name("eez-follower")
-            }
-        };
-        let mut cmd = Command::new(&bin);
+        let l1_http_port = free_port();
+        let mut l1_auth_port = free_port();
+        while l1_auth_port == l1_http_port || l1_auth_port == l1_http_port.saturating_add(1) {
+            l1_auth_port = free_port();
+        }
+        let l1_p2p_port = free_port();
+        let l1_datadir = datadir.join("embedded-l1");
+        // Genesis: an explicit genesis_path (reorg fixture) wins, else the
+        // Harness's shared wall-clock genesis (TEST_L2_GENESIS_ENV — same chain
+        // for sequencer/follower/restarts), else `--chain dev`. Wall-clock is
+        // required by the sequencer's defer-on-lateness gate.
+        let env_genesis = env
+            .iter()
+            .find(|(k, _)| *k == TEST_L2_GENESIS_ENV)
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(std::ffi::OsString::from);
+        let chain_arg: std::ffi::OsString = cfg
+            .genesis_path
+            .map(|p| p.as_os_str().to_owned())
+            .or(env_genesis)
+            .unwrap_or_else(|| std::ffi::OsString::from("dev"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_eez-node"));
         cmd.current_dir(repo_root())
             .args(["node", "--chain"])
             .arg(&chain_arg)
@@ -722,7 +877,14 @@ impl NodeHandle {
                 "CARGO_HOME",
                 std::env::var("CARGO_HOME").unwrap_or_default(),
             );
+        cmd.env("EEZ_L1_HTTP_PORT", l1_http_port.to_string())
+            .env("EEZ_L1_AUTH_PORT", l1_auth_port.to_string())
+            .env("EEZ_L1_P2P_PORT", l1_p2p_port.to_string())
+            .env("EEZ_L1_DATADIR", &l1_datadir);
         for (k, v) in env {
+            if *k == TEST_L2_GENESIS_ENV {
+                continue; // test-only marker (consumed as --chain above)
+            }
             cmd.env(*k, v);
         }
         let child = cmd.spawn().context("spawn eez-node")?;
@@ -772,17 +934,23 @@ impl NodeHandle {
         });
     }
 
-    /// Assert this node's deriver detected and retreated from the L1
-    /// reorg. Without this check the reorg test would silently pass
-    /// even if reorg detection regressed (some unrelated re-derivation
-    /// path could re-converge state).
-    pub fn assert_reorg_seen(&self) {
-        let patterns = ["reorg rolled out", "l1.reorg.retreated"];
-        assert!(
-            self.log_count_matching(&patterns).unwrap() > 0,
-            "{} deriver missed the reorg",
-            self.name,
-        );
+    /// Wait until this node observes the L1 reorg. Some runs legitimately
+    /// have no stale confirmed batch on one node, in which case the
+    /// correct deriver action is an explicit no-op. Without this check the
+    /// reorg test would silently pass even if reorg detection regressed
+    /// and some unrelated re-derivation path re-converged state.
+    pub async fn wait_for_reorg_seen(&self, timeout: Duration) -> Result<()> {
+        let patterns = [
+            "reorg rolled out",
+            "rewinding ring to common ancestor",
+            "l1.reorg.retreated",
+            "L1 reorg reported",
+        ];
+        wait_for(timeout, || async {
+            Ok((self.log_count_matching(&patterns)? > 0).then_some(()))
+        })
+        .await
+        .with_context(|| format!("{} deriver missed the reorg", self.name))
     }
 
     /// Assert this node never logged a fatal-class line (process death
@@ -800,7 +968,7 @@ impl NodeHandle {
 
     /// Count lines in `log_path` matching ANY of `patterns` (substring
     /// match). Used by the multi-composer reorg test to assert
-    /// `reorg.retreated` > 0 on both composers AND zero `Fatal` /
+    /// reorg handling on both composers AND zero `Fatal` /
     /// `UnexpectedStaticFile` events.
     pub fn log_count_matching(&self, patterns: &[&str]) -> Result<usize> {
         let contents = std::fs::read_to_string(&self.log_path)
@@ -944,8 +1112,8 @@ impl<'a> Chain<'a> {
 
 /// Wait until L1's `block_number >= target`. Lets tests assert "the
 /// composer had at least N opportunities to act" without arbitrary
-/// sleeps — at anvil's 1s block time, target = current + N is ~N
-/// seconds of real time but tied to L1 progress.
+/// sleeps — target = current + N is tied to L1 progress instead of wall-clock
+/// assumptions.
 pub async fn wait_for_l1_blocks(rpc_url: &str, target: u64, timeout: Duration) -> Result<u64> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     wait_for(timeout, || async {
@@ -1105,24 +1273,5 @@ pub fn override_env(
             *v = value.to_string();
         }
     }
-    env
-}
-
-/// Set or append `(key, value)`. Unlike [`override_env`], inserts when
-/// the key isn't already present — used for follower-only env vars
-/// like `EEZ_SEQUENCER_RPC` that the standard `Harness::env()` doesn't
-/// produce.
-pub fn with_env(
-    mut env: Vec<(&'static str, String)>,
-    key: &'static str,
-    value: &str,
-) -> Vec<(&'static str, String)> {
-    for (k, v) in &mut env {
-        if *k == key {
-            *v = value.to_string();
-            return env;
-        }
-    }
-    env.push((key, value.to_string()));
     env
 }
