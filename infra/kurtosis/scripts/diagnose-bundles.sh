@@ -17,7 +17,8 @@ source "$HERE/enclave-env.sh"
 E="${KURTOSIS_ENCLAVE:-eez-devnet}"
 RPC="${EEZ_L1_RPC_URL:?set EEZ_L1_RPC_URL}"
 BUILDER="${EEZ_L1_BUILDER_RPC_URL:?set EEZ_L1_BUILDER_RPC_URL}"
-KEY="${EEZ_L1_POSTER_KEY:-}"
+POSTER_KEY="${EEZ_L1_POSTER_KEY:-}"
+KEY="${EEZ_DIAG_PROBE_KEY:-${POSTER_KEY:-}}"
 SLOT_SECONDS="${EEZ_L1_SLOT_SECONDS:-12}"
 PROBE_SLACK="${EEZ_DIAG_PROBE_SLACK:-3}"
 
@@ -37,10 +38,19 @@ section "endpoints"
 echo "enclave=$E"
 echo "l1_rpc=$RPC"
 echo "builder_rpc=$BUILDER"
-if [[ -n "$KEY" ]]; then
-    echo "poster=$(cast wallet address --private-key "$KEY" 2>/dev/null || echo unknown)"
+if [[ -n "$POSTER_KEY" ]]; then
+    echo "poster=$(cast wallet address --private-key "$POSTER_KEY" 2>/dev/null || echo unknown)"
 else
-    echo "poster=unset (active probe disabled unless EEZ_L1_POSTER_KEY is set)"
+    echo "poster=unset"
+fi
+if [[ -n "$KEY" ]]; then
+    echo "probe_sender=$(cast wallet address --private-key "$KEY" 2>/dev/null || echo unknown)"
+    if [[ -n "$POSTER_KEY" && "$KEY" == "$POSTER_KEY" ]]; then
+        echo "warning=active probe is using the EEZ poster key; this can consume the postBatch nonce and perturb eez-node"
+        echo "warning=set EEZ_DIAG_PROBE_KEY to a separate funded dev key for clean active probes"
+    fi
+else
+    echo "probe_sender=unset (active probe disabled unless EEZ_DIAG_PROBE_KEY or EEZ_L1_POSTER_KEY is set)"
 fi
 
 section "service hints"
