@@ -7,7 +7,6 @@ members = [
     "crates/eez-evm",
     "crates/eez-evm-inspector",
     "crates/eez-fuzz",
-    "crates/eez-follower",
     "crates/eez-l1",
     "crates/eez-node",
     "crates/eez-payload-codec",
@@ -25,7 +24,6 @@ default-members = [
     "crates/eez-evm",
     "crates/eez-evm-inspector",
     "crates/eez-fuzz",
-    "crates/eez-follower",
     "crates/eez-l1",
     "crates/eez-node",
     "crates/eez-payload-codec",
@@ -83,6 +81,7 @@ reth-transaction-pool           = { git = "https://github.com/paradigmxyz/reth",
 reth-primitives-traits          = { version = "0.3.1", default-features = false }
 reth-provider                   = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-revm                       = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-rpc-eth-api                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-storage-api                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-tasks                      = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-trie-common                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
@@ -201,6 +200,8 @@ needless_pass_by_value           = "allow"
 if_then_some_else_none           = "allow"
 type_complexity                  = "allow"
 match_single_binding             = "allow"
+single_match_else                = "allow"
+map_unwrap_or                    = "allow"
 clone_on_ref_ptr                 = "allow"
 # constructors / handlers (Deriver::new wires 9 deps,
 # on_batch_posted 10, compose_via_evm_composer 8) need these params;

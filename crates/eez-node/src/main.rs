@@ -15,14 +15,18 @@
 //! | set | unset | **follower** | reth + `L1Watcher` + Deriver (no Sequencer) |
 //! | set | set | **composer** | reth + `L1Watcher` + Deriver + Sequencer (L1-anchored) + Composer umbrella |
 
+mod bundle_rpc;
+mod follower;
 mod ingress;
 mod l1_embedded;
 
-use std::{collections::HashMap, env, str::FromStr, sync::Arc};
+use std::{collections::HashMap, env, str::FromStr, sync::Arc, time::Duration};
 
 use alloy_primitives::{Address, B256};
+use alloy_provider::RootProvider;
 use alloy_signer_local::PrivateKeySigner;
-use eez_composer::{Composer, HeldPool, IngressClassifier, RollupConfig, RollupState};
+use clap::Parser as _;
+use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
 use eez_deriver::Deriver;
 use eez_driver::{
     EthAttributesBuilder, RollupTiming, Sequencer, SlotEvent, SyncSlotComposerHandle,
@@ -39,6 +43,8 @@ use reth_node_ethereum::EthereumNode;
 use tokio::sync::mpsc;
 use tracing::{Level, event};
 
+use follower::UnsafeHeadFollower;
+
 mod payload;
 use payload::EezPayloadBuilder;
 
@@ -46,8 +52,11 @@ use payload::EezPayloadBuilder;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+const BOOT_CATCH_UP_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
+const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
+pub(crate) enum Mode {
     Standalone,
     Follower,
     Composer,
@@ -78,13 +87,22 @@ impl Mode {
         }
     }
 
-    const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Standalone => "standalone",
             Self::Follower => "follower",
             Self::Composer => "composer",
         }
     }
+}
+
+/// eez-node-specific CLI arguments layered on top of reth's CLI.
+#[derive(clap::Args, Debug, Clone)]
+struct NodeExt {
+    /// Sequencer JSON-RPC URL. In follower mode this enables the
+    /// optional unsafe-head overlay; safe/finalized remain L1-derived.
+    #[arg(long, env = "EEZ_SEQUENCER_RPC")]
+    sequencer_rpc: Option<url::Url>,
 }
 
 // Bootstrap wiring is linear; splitting it across helpers fragments the
@@ -103,8 +121,6 @@ fn main() -> eyre::Result<()> {
         }
     }
 
-    let mode = Mode::from_env();
-
     // The optimistic composer + Deriver roll the L2 head back to a
     // canonical ancestor; by Engine API spec an FCU to an ancestor is a
     // no-op, which would freeze payload builds. These flags opt into
@@ -119,7 +135,9 @@ fn main() -> eyre::Result<()> {
         }
     }
 
-    Cli::<EthereumChainSpecParser>::try_parse_args_from(argv)?.run(async move |builder, _ext| {
+    let mode = Mode::from_env();
+
+    Cli::<EthereumChainSpecParser, NodeExt>::try_parse_from(argv)?.run(async move |builder, ext| {
         event!(
             name: "eez.node.launching",
             Level::INFO,
@@ -128,33 +146,27 @@ fn main() -> eyre::Result<()> {
         );
 
         warn_on_deprecated_env();
-
-        // Construct the HeldPool + IngressClassifier BEFORE reth launches
-        // — they attach as an `eth_sendRawTransaction` middleware, and the
-        // `held_pool` Arc is shared with the umbrella so pushes and the
-        // Sync-slot drain see one queue. Empty classifier = pass-through.
-        let held_pool = Arc::new(HeldPool::new());
-        let classifier: Arc<IngressClassifier> = Arc::new(IngressClassifier::new(
-            parse_cross_chain_proxy_env().into_iter().collect(),
-            parse_cross_chain_source_chain_ids_env().into_iter().collect(),
-        ));
-        if !classifier.is_empty() {
-            event!(
-                name: "eez.node.ingress.classifier",
-                Level::INFO,
-                proxy_count = classifier.len(),
-                "ingress classifier configured with cross-chain proxy addresses",
-            );
+        if mode != Mode::Follower && ext.sequencer_rpc.is_some() {
+            return Err(eyre::eyre!(
+                "follower sequencer RPC can only be set in follower mode",
+            ));
         }
+
+        // The per-rollup HeldPool, shared with the umbrella composer so the
+        // cross-chain fronts' pushes and the Sync-slot drain see one queue.
+        let held_pool = Arc::new(HeldPool::new());
 
         // Launch the embedded L1 reth first in composer mode — its
         // `StateProviderFactory` backs `LocalChainClient::new_entry` for
         // L1 source-tx simulation. Inline (not in `l1_embedded.rs`)
         // because the `NodeHandle` AddOns type resists a typed return.
         let embed_l1 = mode == Mode::Composer
-            && env::var("EEZ_L1_EMBEDDED")
-                .map(|v| v != "0" && !v.is_empty())
-                .unwrap_or(true);
+            && env::var("EEZ_L1_EMBEDDED").map_or(true, |v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "" | "0" | "false" | "no" | "off"
+                )
+            });
         // Shared L1-reth tokio runtime — built once, used by whichever
         // L1 path runs.
         let build_l1_runtime = || {
@@ -204,6 +216,36 @@ fn main() -> eyre::Result<()> {
                     );
                     Some(EmbeddedL1::Dev(l1_handle))
                 }
+                l1_embedded::L1ChainKind::Testing => {
+                    let node_cfg = l1_embedded::build_dev_node_config(&l1_cfg)?;
+                    let db = reth_db::init_db(
+                        node_cfg.datadir().db(),
+                        reth_db::mdbx::DatabaseArguments::default(),
+                    )
+                    .map_err(|e| eyre::eyre!("L1 embedded init_db: {e}"))?;
+                    event!(
+                        name: "eez.node.l1_embedded.launching",
+                        Level::INFO,
+                        kind = "testing",
+                        http_port = l1_cfg.http_port,
+                        "launching embedded L1 reth (testing)",
+                    );
+                    let l1_handle = reth_node_builder::NodeBuilder::new(node_cfg)
+                        .with_database(db)
+                        .with_launch_context(build_l1_runtime()?)
+                        .node(EthereumNode::default())
+                        .extend_rpc_modules(bundle_rpc::install_dev_bundle_rpc)
+                        .launch_with_debug_capabilities()
+                        .await?;
+                    event!(
+                        name: "eez.node.l1_embedded.ready",
+                        Level::INFO,
+                        kind = "testing",
+                        l1_chain_id = %l1_handle.node.chain_spec().chain(),
+                        "embedded L1 reth (testing) ready",
+                    );
+                    Some(EmbeddedL1::Dev(l1_handle))
+                }
                 l1_embedded::L1ChainKind::Chiado => {
                     let node_cfg = l1_embedded::build_chiado_node_config(&l1_cfg)?;
                     let db = reth_db::init_db(
@@ -242,23 +284,16 @@ fn main() -> eyre::Result<()> {
             None
         };
 
-        // L2 reth, two modifications: (1) `EezPayloadBuilder` writes
-        // `gas_limit`/`extra_data` from shared `eez-driver` constants so
-        // deriver replay and sequencer builds yield identical headers;
-        // (2) `IngressLayer` routes cross-chain user txs to the HeldPool.
+        // L2 reth. `EezPayloadBuilder` writes `gas_limit`/`extra_data` from
+        // shared `eez-driver` constants so deriver replay and sequencer builds
+        // yield identical headers.
         let handle = builder
             .with_types::<EthereumNode>()
             .with_components(
                 EthereumNode::components()
                     .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder)),
             )
-            .with_add_ons(
-                reth_node_ethereum::node::EthereumAddOns::default()
-                    .with_rpc_middleware(ingress::IngressLayer::new(
-                        Arc::clone(&held_pool),
-                        Arc::clone(&classifier),
-                    )),
-            )
+            .with_add_ons(reth_node_ethereum::node::EthereumAddOns::default())
             .launch_with_debug_capabilities()
             .await?;
 
@@ -349,7 +384,11 @@ fn main() -> eyre::Result<()> {
         }
 
         // ─── L1 stack (follower + composer) ──────────────────────────
-        let submitter_config = SubmitterConfig::from_env()?;
+        let submitter_config = if mode == Mode::Follower {
+            SubmitterConfig::from_env_read_only()?
+        } else {
+            SubmitterConfig::from_env()?
+        };
         let rollup_config = RollupConfig::from_env()?;
         let l1_watcher_config = L1WatcherConfig::from_env()?;
 
@@ -394,6 +433,16 @@ fn main() -> eyre::Result<()> {
             // up — it owns `LocalChainClient`s over L1 (entry) and L2
             // (follower). `None` without an embedded L1. Inlined because
             // the `FullNode` AddOns type resists a typed helper return.
+            // L2 ENTRY client for OUTBOUND (L2→L1) source-sim — built inside the
+            // block below alongside the L2 follower, threaded into `Composer::new`.
+            // `None` without an embedded L1 (outbound txs then evict at compose).
+            let mut l2_entry_client: Option<
+                Arc<
+                    dyn eez_protocol::executor::EntryChainClient<Protocol = eez_evm::EvmProtocol>
+                        + Send
+                        + Sync,
+                >,
+            > = None;
             let evm_composer: Option<eez_evm_inspector::EvmComposer> =
                 if let Some(l1_variant) = embedded_l1.as_ref() {
                     use eez_composer::{GnosisL1Adapter, LocalChainClient};
@@ -505,6 +554,25 @@ fn main() -> eyre::Result<()> {
                             + Sync,
                     > = l2_follower;
 
+                    // L2 ENTRY client (follower's provider/dialect, but
+                    // Role::Entry) — the follower client errors `Unavailable` for
+                    // the outbound source-sim `simulate_and_resolve_recorded_for`.
+                    let l2_entry = LocalChainClient::new_entry(
+                        provider.clone(),
+                        evm_config.clone(),
+                        chain_spec.clone(),
+                        l2_rollup_id_typed,
+                        ccm_l2,
+                        ccm_l2,
+                        eez_evm::ChainDialect::EvmL2Style,
+                    );
+                    let l2_entry_view: std::sync::Arc<
+                        dyn eez_protocol::executor::EntryChainClient<Protocol = EvmProtocol>
+                            + Send
+                            + Sync,
+                    > = l2_entry;
+                    l2_entry_client = Some(l2_entry_view);
+
                     let entry_cfg = EvmTargetConfig {
                         ccm_address: eez_registry,
                         system_address: Address::ZERO, // entry has no system-tx CCM path
@@ -515,6 +583,7 @@ fn main() -> eyre::Result<()> {
                                 .proxy_lookup_slot(),
                         },
                         dialect: eez_evm::ChainDialect::EvmL1Style,
+                        settles_via_session_root: false,
                     };
                     let l2_follower_cfg = EvmTargetConfig {
                         ccm_address: ccm_l2,
@@ -526,6 +595,7 @@ fn main() -> eyre::Result<()> {
                                 .proxy_lookup_slot(),
                         },
                         dialect: eez_evm::ChainDialect::EvmL2Style,
+                        settles_via_session_root: false,
                     };
 
                     let composed = ProtocolComposer::<EvmProtocol>::builder(
@@ -665,6 +735,7 @@ fn main() -> eyre::Result<()> {
                 evm_config,
                 evm_composer,
                 cc_exec_ctx,
+                l2_entry_client,
             );
             let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
 
@@ -692,6 +763,12 @@ fn main() -> eyre::Result<()> {
             // way the composer does; None → pure-user-tx batches only.
             drop(sequencer);
             let follower_system_tx_cfg = build_follower_system_tx_cfg(&chain_spec)?;
+            event!(
+                name: "eez.node.follower.system_tx_cfg",
+                Level::INFO,
+                enabled = follower_system_tx_cfg.is_some(),
+                "cross-chain system tx reconstruction config loaded",
+            );
             (None, None, follower_system_tx_cfg)
         };
 
@@ -701,7 +778,7 @@ fn main() -> eyre::Result<()> {
         let l2_block_time_secs = timing.l2_block_time().as_secs();
         let deriver = Deriver::new(
             l1_watcher.clone(),
-            block_committer,
+            block_committer.clone(),
             Arc::new(provider.clone()),
             submitter.clone(),
             chain_spec,
@@ -711,13 +788,41 @@ fn main() -> eyre::Result<()> {
             system_tx_cfg,
         );
 
-        if let Err(err) = deriver.catch_up().await {
-            event!(
-                name: "eez.node.deriver.boot_catch_up.failed",
-                Level::WARN,
-                error = %err,
-                "boot-time catch_up failed; deriver.run() will retry post-subscribe",
-            );
+        let mut catch_up_retry_delay = BOOT_CATCH_UP_INITIAL_RETRY_DELAY;
+        let mut catch_up_attempts = 0_u64;
+        loop {
+            match deriver.catch_up().await {
+                Ok(()) => break,
+                Err(err) if err.is_source_incomplete() => {
+                    catch_up_attempts += 1;
+                    event!(
+                        name: "eez.node.deriver.boot_catch_up.source_incomplete",
+                        Level::WARN,
+                        mode = mode.name(),
+                        attempts = catch_up_attempts,
+                        retry_delay_secs = catch_up_retry_delay.as_secs(),
+                        error = %err,
+                        "boot-time catch_up could not read all L1 source data yet; retrying before starting L1-active tasks",
+                    );
+                    tokio::time::sleep(catch_up_retry_delay).await;
+                    catch_up_retry_delay = Duration::from_secs(
+                        catch_up_retry_delay
+                            .as_secs()
+                            .saturating_mul(2)
+                            .min(BOOT_CATCH_UP_MAX_RETRY_DELAY.as_secs()),
+                    );
+                }
+                Err(err) => {
+                    event!(
+                        name: "eez.node.deriver.boot_catch_up.failed",
+                        Level::ERROR,
+                        mode = mode.name(),
+                        error = %err,
+                        "boot-time catch_up failed; refusing to start L1-active tasks before reconciliation",
+                    );
+                    return Err(eyre::eyre!("boot-time deriver catch_up failed: {err}"));
+                }
+            }
         }
         event!(
             name: "eez.node.deriver.spawned",
@@ -731,6 +836,35 @@ fn main() -> eyre::Result<()> {
             deriver_run.run().await;
         });
 
+        // Follower-only: optional sequencer-RPC unsafe-head overlay.
+        // L1 replay always boots first, so safe/finalized anchors are
+        // reconciled before the overlay can move unsafe head.
+        if mode == Mode::Follower {
+            if let Some(sequencer_rpc) = ext.sequencer_rpc {
+                let sequencer_rpc = RootProvider::new_http(sequencer_rpc);
+                let follower = UnsafeHeadFollower::new(
+                    block_committer,
+                    sequencer_rpc,
+                    provider,
+                    timing.l2_block_time(),
+                );
+                event!(
+                    name: "eez.node.follower.sequencer_rpc.spawned",
+                    Level::INFO,
+                    "spawning sequencer-RPC unsafe-head follower",
+                );
+                task_executor.spawn_critical_task("eez-node-follower-unsafe-head", async move {
+                    follower.run().await;
+                });
+            } else {
+                event!(
+                    name: "eez.node.follower.l1_derived_only",
+                    Level::INFO,
+                    "EEZ_SEQUENCER_RPC not set; running L1-derived-only follower",
+                );
+            }
+        }
+
         // ─── Composer-only: spawn Sequencer + umbrella ───────────────
         if let (Some(sequencer), Some(composer)) = (sequencer, umbrella) {
             event!(name: "eez.node.sequencer.spawned", Level::INFO, mode = "composer", "spawning eez sequencer (L1-anchored)");
@@ -742,6 +876,47 @@ fn main() -> eyre::Result<()> {
             task_executor.spawn_critical_task("eez-composer", async move {
                 composer.run().await;
             });
+
+            // Cross-chain ingress fronts (see `run_cross_chain_front`) — one per
+            // SOURCE chain, sharing `held_pool`, gated on its port env (absent →
+            // no front for that chain):
+            //   L1 front (EEZ_L1_XCHAIN_PORT → EEZ_L1_RPC_URL): L1→L2 Inbound.
+            //   L2 front (EEZ_L2_XCHAIN_PORT → EEZ_L2_RPC_URL): L2→L1 Outbound.
+            for (port_env, url_env, direction, task) in [
+                (
+                    "EEZ_L1_XCHAIN_PORT",
+                    "EEZ_L1_RPC_URL",
+                    eez_composer::Direction::Inbound,
+                    "eez-l1-xchain-front",
+                ),
+                (
+                    "EEZ_L2_XCHAIN_PORT",
+                    "EEZ_L2_RPC_URL",
+                    eez_composer::Direction::Outbound,
+                    "eez-l2-xchain-front",
+                ),
+            ] {
+                let Some(port) = env::var(port_env).ok().and_then(|p| p.parse::<u16>().ok()) else {
+                    continue;
+                };
+                let Ok(url) = env::var(url_env) else {
+                    event!(name: "eez.xchain_front.no_upstream", Level::WARN, port_env, url_env, "cross-chain front port set but no upstream RPC; skipping");
+                    continue;
+                };
+                let Ok(parsed) = url.parse::<reqwest::Url>() else {
+                    event!(name: "eez.xchain_front.bad_upstream", Level::WARN, %url, "cross-chain front upstream RPC malformed; skipping");
+                    continue;
+                };
+                let pool = Arc::clone(&held_pool);
+                let provider = alloy_provider::RootProvider::new_http(parsed);
+                task_executor.spawn_critical_task(task, async move {
+                    if let Err(e) =
+                        ingress::run_cross_chain_front(port, url, direction, pool, provider).await
+                    {
+                        event!(name: "eez.xchain_front.exited", Level::ERROR, error = %e, "cross-chain front exited");
+                    }
+                });
+            }
         }
 
         handle.wait_for_node_exit().await
@@ -766,15 +941,17 @@ fn build_follower_system_tx_cfg<ChainSpec>(
 where
     ChainSpec: reth_chainspec::EthChainSpec,
 {
-    let Ok(system_key) = env::var("EEZ_L2_SYSTEM_KEY") else {
-        return Ok(None);
+    let system_key = match env::var("EEZ_L2_SYSTEM_KEY") {
+        Ok(system_key) => system_key,
+        Err(env::VarError::NotPresent) => return Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(eyre::eyre!("EEZ_L2_SYSTEM_KEY contains non-UTF-8 bytes"));
+        }
     };
-    let Ok(ccm_l2_str) = env::var("EEZ_CCM_L2_ADDRESS") else {
-        return Ok(None);
-    };
-    let Ok(rollup_id_str) = env::var("EEZ_ROLLUP_ID") else {
-        return Ok(None);
-    };
+    let ccm_l2_str = env::var("EEZ_CCM_L2_ADDRESS")
+        .map_err(|_| eyre::eyre!("EEZ_CCM_L2_ADDRESS required when EEZ_L2_SYSTEM_KEY is set"))?;
+    let rollup_id_str = env::var("EEZ_ROLLUP_ID")
+        .map_err(|_| eyre::eyre!("EEZ_ROLLUP_ID required when EEZ_L2_SYSTEM_KEY is set"))?;
 
     let system_signer =
         PrivateKeySigner::from_bytes(&B256::from_str(system_key.trim_start_matches("0x"))?)?;
@@ -793,36 +970,6 @@ where
     }))
 }
 
-/// Parse `EEZ_CROSS_CHAIN_PROXY_ADDRESSES` (comma-separated hex
-/// addresses) into a `Vec<Address>`. Empty / unset / malformed → empty
-/// vec (the ingress classifier then becomes a passthrough).
-fn parse_cross_chain_proxy_env() -> Vec<Address> {
-    let Ok(raw) = env::var("EEZ_CROSS_CHAIN_PROXY_ADDRESSES") else {
-        return Vec::new();
-    };
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| Address::from_str(s).ok())
-        .collect()
-}
-
-/// Parse `EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS` (comma-separated u64s)
-/// into a `Vec<u64>`. Foreign source chain ids whose inbound txs we
-/// classify as cross-chain (i.e., a deposit-intent submitted to L2's
-/// RPC carrying L1's chainId). Empty / unset / malformed → empty vec;
-/// classifier still routes by `to ∈ proxy_set`.
-fn parse_cross_chain_source_chain_ids_env() -> Vec<u64> {
-    let Ok(raw) = env::var("EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS") else {
-        return Vec::new();
-    };
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse::<u64>().ok())
-        .collect()
-}
-
 /// Read the L1 rollup id from env. Defaults to `0` to match the bridge
 /// E2E fixture's `MAINNET_ROLLUP_ID`.
 fn read_l1_rollup_id() -> u64 {
@@ -835,9 +982,10 @@ fn read_l1_rollup_id() -> u64 {
 /// Build the [`EmbeddedL1Config`] from env; all vars optional, with dev
 /// defaults so the smoke harness only overrides what it needs.
 ///
-///   - `EEZ_L1_HTTP_PORT` — default `18545`
-///   - `EEZ_L1_AUTH_PORT` — default `18546`
-///   - `EEZ_L1_P2P_PORT`  — default `30444`
+///   - `EEZ_L1_HTTP_PORT` — default `18545` (WS = http_port + 1)
+///   - `EEZ_L1_AUTH_PORT` — default `http_port + 6`
+///   - `EEZ_L1_P2P_PORT`  — default `30444` (P2P + discv4)
+///   - `EEZ_L1_DISCV5_PORT` — default `p2p_port + 10` (discv5 UDP)
 ///   - `EEZ_L1_DATADIR`   — default `$TMPDIR/eez-l1-embedded` (ephemeral)
 ///   - `EEZ_L1_CHAIN_PATH` — L1 genesis JSON; unset → reth's `dev`
 ///     chainspec (all forks at genesis, no funded accounts)
@@ -848,14 +996,25 @@ fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(18545);
+    // Auth RPC port — kept clear of the WS port (which
+    // build_network_rpc_args derives as http_port + 1) and configurable
+    // so it can dodge a default-port collision with other nodes on the
+    // host. Defaults to http_port + 6.
     let auth_port = env::var("EEZ_L1_AUTH_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(18546);
+        .unwrap_or(http_port.wrapping_add(6));
     let p2p_port = env::var("EEZ_L1_P2P_PORT")
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(30444);
+    // discv5 UDP port — kept separate from p2p_port (discv4) and
+    // configurable so it can dodge a default-port collision with other
+    // nodes on the host. Defaults to p2p_port + 10.
+    let discv5_port = env::var("EEZ_L1_DISCV5_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(p2p_port.wrapping_add(10));
     let datadir = env::var("EEZ_L1_DATADIR").map_or_else(
         |_| std::env::temp_dir().join("eez-l1-embedded"),
         std::path::PathBuf::from,
@@ -887,6 +1046,7 @@ fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
         http_port,
         auth_port,
         p2p_port,
+        discv5_port,
         jwtsecret,
     })
 }

@@ -35,12 +35,15 @@ pub enum L1ChainKind {
     /// `reth_gnosis::GnosisNode` loading the chiado preset; no
     /// auto-mine — engine API driven by an external lighthouse CL.
     Chiado,
+    /// Same as `Dev`, plus the non-atomic mock bundle RPC. CI only.
+    Testing,
 }
 
 impl L1ChainKind {
     pub fn from_env() -> Self {
         match std::env::var("EEZ_L1_CHAIN").as_deref() {
             Ok("chiado") => Self::Chiado,
+            Ok("testing") => Self::Testing,
             _ => Self::Dev,
         }
     }
@@ -65,9 +68,13 @@ pub struct EmbeddedL1Config {
     /// Auth RPC port (engine API). Chiado mode: external lighthouse
     /// dials in here.
     pub auth_port: u16,
-    /// P2P + discovery port. Dev mode: disabled. Chiado mode: needed
-    /// for libp2p peering to chiado bootnodes.
+    /// P2P + discv4 discovery port. Dev mode: disabled. Chiado mode:
+    /// needed for libp2p peering to chiado bootnodes.
     pub p2p_port: u16,
+    /// discv5 UDP port. Separate from `p2p_port` so the embedded L1's
+    /// discv5 doesn't bind reth's default port and collide with another
+    /// node on the host.
+    pub discv5_port: u16,
     /// Path to JWT secret file. Required in chiado mode (shared with
     /// lighthouse via volume mount).
     pub jwtsecret: Option<PathBuf>,
@@ -134,12 +141,14 @@ fn build_network_rpc_args(cfg: &EmbeddedL1Config) -> Result<(NetworkArgs, RpcSer
         ..NetworkArgs::default()
     };
     network_args.discovery.port = cfg.p2p_port;
+    network_args.discovery.discv5_port = Some(cfg.discv5_port);
     let rpc_args = RpcServerArgs {
         http: true,
         ws: true,
         http_port: cfg.http_port,
         ws_port,
         auth_port: cfg.auth_port,
+        ipcdisable: true,
         ..RpcServerArgs::default()
     };
     Ok((network_args, rpc_args))

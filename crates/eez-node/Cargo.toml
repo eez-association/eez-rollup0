@@ -31,6 +31,8 @@ reth-node-api.workspace                   = true
 reth-node-builder.workspace               = true
 reth-node-core.workspace                  = true
 reth-node-ethereum.workspace              = true
+reth-primitives-traits.workspace          = true
+reth-rpc-eth-api.workspace                = true
 reth-storage-api.workspace                = true
 reth-tasks.workspace                      = true
 reth-transaction-pool.workspace           = true
@@ -48,19 +50,27 @@ alloy-provider.workspace     = true
 alloy-signer-local.workspace = true
 reqwest.workspace            = true
 
-# RPC ingress middleware (eth_sendRawTransaction override)
+# Cross-chain RPC fronts (transparent hyper proxy: forward every eth_* to the
+# source chain's node so cast/wallets read chainId/nonce/gas/receipt, intercept
+# eth_sendRawTransaction → HeldPool).
+hyper          = { version = "1.9", features = ["server", "http1"] }
+hyper-util     = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+# Embedded dev-L1 in-process eth_sendBundle module (bundle_rpc, #30).
 jsonrpsee.workspace  = true
+serde.workspace      = true
 serde_json.workspace = true
-tower.workspace      = true
 
 # app
 clap.workspace               = true
 dotenvy.workspace            = true
 eyre.workspace               = true
 mimalloc.workspace           = true
+thiserror.workspace          = true
 tokio.workspace              = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
+url.workspace                = true
 
 [dev-dependencies]
 alloy-consensus.workspace = true
@@ -75,6 +85,11 @@ anyhow = "1"
 reth-chainspec.workspace = true
 serde_json = "1"
 tempfile = "3"
+
+[features]
+# TEST-ONLY passthrough to eez-composer/fault-inject (deriver-gate attack test).
+# NEVER enabled in normal/release builds. Revert: `git restore`.
+fault-inject = ["eez-composer/fault-inject"]
 
 [lints]
 workspace = true

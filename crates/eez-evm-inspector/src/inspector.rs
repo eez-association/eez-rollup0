@@ -531,11 +531,11 @@ where
         };
 
         let req = eez_protocol::ExecutionRequest {
-            destination: info.original_address,
-            calldata: calldata.clone(),
+            target_address: info.original_address,
+            data: calldata.clone(),
             value: call_value,
             source_address: inputs.caller,
-            source_rollup: self.caller_rollup_id,
+            source_rollup_id: self.caller_rollup_id,
         };
         // Bridge sync Inspector::call → async Dispatcher::dispatch_call.
         //
