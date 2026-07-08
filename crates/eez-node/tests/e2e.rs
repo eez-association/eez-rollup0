@@ -246,7 +246,6 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     let genesis = reorg_genesis_path();
     let cfg = NodeConfig {
         genesis_path: Some(genesis.as_path()),
-        ..NodeConfig::default()
     };
     // Start both concurrently — sequential start lets c1 race alone
     // long enough to skew batch-race dynamics and (empirically) drop
@@ -374,9 +373,8 @@ async fn happy_case_follower_sequencer_rpc() {
         .expect("follower has a safe block");
     assert_ne!(follower_safe, B256::ZERO, "follower safe is genesis");
 
-    // Assert the follower's public head directly over JSON-RPC instead
-    // of relying on process logs: it must be a real sequencer block,
-    // and the safe head must not outrun it.
+    // The follower's public head must be a real sequencer block, and
+    // the safe head must not outrun it.
     common::wait_for(DEFAULT_TIMEOUT, || {
         let seq_rpc = seq_rpc.clone();
         let follower_rpc = follower.l2_rpc_url();
@@ -397,10 +395,11 @@ async fn happy_case_follower_sequencer_rpc() {
                 return Ok(None);
             };
 
-            Ok(
-                (latest_number > 0 && latest_number >= safe_number && latest_hash == seq_hash)
-                    .then_some(()),
-            )
+            Ok((latest_number > 0
+                && safe_number > 0
+                && latest_number >= safe_number
+                && latest_hash == seq_hash)
+                .then_some(()))
         }
     })
     .await
@@ -425,11 +424,9 @@ async fn happy_case_follower_l1_reorg_recovers() {
     let genesis = reorg_genesis_path();
     let seq_cfg = NodeConfig {
         genesis_path: Some(genesis.as_path()),
-        ..NodeConfig::default()
     };
     let follower_cfg = NodeConfig {
         genesis_path: Some(genesis.as_path()),
-        ..NodeConfig::default()
     };
     let seq_env = harness.env();
     let follower_env = harness.follower_env(None);
