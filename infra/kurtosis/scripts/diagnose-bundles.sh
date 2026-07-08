@@ -133,7 +133,7 @@ fi
 section "recent eez-node bundle lines"
 node_log="$(kurtosis service logs "$E" eez-node 2>/dev/null || true)"
 printf '%s\n' "$node_log" \
-    | grep -iE 'compose_sync_slot invoked|eth_sendBundle response received|bundle outcome observed|bundle dropped|bundle observation exceeding|advanced L2 safe head' \
+    | grep -iE 'compose_sync_slot invoked|dispatching bundle to builder|eth_sendBundle response received|bundle outcome observed|bundle dropped|bundle observation exceeding|advanced L2 safe head' \
     | tail -80 || true
 
 last_hash="$(printf '%s\n' "$node_log" \
