@@ -150,7 +150,7 @@ def run(plan, args):
         # feeds it only HEAD payloads). enode carries the real enclave IP.
         "EEZ_L1_TRUSTED_PEERS": l1_el.enode,
         "EEZ_L1_BLOCK_TIME_MS": str(eez.get("l1_block_time_ms", 12000)),
-        "EEZ_L2_BLOCK_TIME_MS": str(eez.get("l2_block_time_ms", 12000)),
+        "EEZ_L2_BLOCK_TIME_MS": str(eez.get("l2_block_time_ms", 4000)),
         "EEZ_PROOF_TIME_MS": str(eez.get("proof_time_ms", 5000)),
         "EEZ_SUBMISSION_SLACK_MS": str(eez.get("submission_slack_ms", 1500)),
         # Match docker-compose.chiado-node.yml: do not freeze the sequencer when

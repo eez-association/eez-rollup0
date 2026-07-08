@@ -89,9 +89,13 @@ eez:
 
   # ── Timing (l1_block_time_ms MUST match network_params.seconds_per_slot) ─
   l1_block_time_ms: 12000
-  # K=1 during bootstrap so L2 cannot outrun L1 while the first postBatch
-  # settles. After BatchPosted is climbing reliably, try 2000 (K=6, mainnet-shaped).
-  l2_block_time_ms: 12000
+  # K=3 during bootstrap (validate() requires K >= 2 — 12000 here would be K=1
+  # and eez-node refuses to start). Halves the L2-ahead-of-L1 race ratio vs the
+  # mainnet-shaped 2000 (K=6), reducing how far sync_block_number can run ahead
+  # of the L1-confirmed cursor while the first postBatch settles (e.g. during
+  # MEV/relay warmup, see README "Chiado vs Kurtosis"). After BatchPosted is
+  # climbing reliably, try 2000 (K=6) on a fresh enclave.
+  l2_block_time_ms: 4000
   # Kurtosis rbuilder needs a longer lead time than the in-process dev relay:
   # 4000 can miss rbuilder's intake; 7000 leaves too little Steady window at
   # the 12s/2s cadence. 5000 keeps 1.5s slack without changing block cadence.

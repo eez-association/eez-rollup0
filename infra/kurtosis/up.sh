@@ -55,14 +55,16 @@ for pair in "poster_key:1" "proof_signer_key:2"; do
     fi
 done
 
-# Migrate superseded uncustomized timing presets.
+# Migrate superseded uncustomized timing presets. NOTE: l2_block_time_ms
+# MUST divide l1_block_time_ms evenly with K = l1/l2 >= 2 (RollupTiming::validate()
+# refuses K < 2 at eez-node startup) — 12000/12000 (K=1) is INVALID, do not use it.
 if [[ "$(yv l1_block_time_ms)" == "12000" \
    && "$(yv l2_block_time_ms)" == "2000" \
    && "$(yv proof_time_ms)" == "5000" \
    && "$(yv submission_slack_ms)" == "1500" ]]; then
-    sed -i.bak -E "s|^([[:space:]]*l2_block_time_ms:).*|\\1 12000|" "$ARGS_FILE"
+    sed -i.bak -E "s|^([[:space:]]*l2_block_time_ms:).*|\\1 4000|" "$ARGS_FILE"
     rm -f "$ARGS_FILE.bak"
-    echo "==> migrated eez.l2_block_time_ms from 2000 to 12000 (bootstrap K=1)"
+    echo "==> migrated eez.l2_block_time_ms from 2000 to 4000 (bootstrap K=3)"
 fi
 
 # The 5000ms proof budget gives rbuilder enough lead without changing block cadence.
@@ -72,10 +74,10 @@ if [[ "$(yv l1_block_time_ms)" == "12000" \
    && "$(yv submission_slack_ms)" == "1500" ]]; then
     sed -i.bak -E \
         -e "s|^([[:space:]]*proof_time_ms:).*|\\1 5000|" \
-        -e "s|^([[:space:]]*l2_block_time_ms:).*|\\1 12000|" \
+        -e "s|^([[:space:]]*l2_block_time_ms:).*|\\1 4000|" \
         "$ARGS_FILE"
     rm -f "$ARGS_FILE.bak"
-    echo "==> migrated eez.proof_time_ms 4000→5000 and l2_block_time_ms 2000→12000"
+    echo "==> migrated eez.proof_time_ms 4000→5000 and l2_block_time_ms 2000→4000"
 fi
 
 if [[ "$(yv l1_block_time_ms)" == "12000" \
@@ -84,10 +86,22 @@ if [[ "$(yv l1_block_time_ms)" == "12000" \
    && "$(yv submission_slack_ms)" == "1500" ]]; then
     sed -i.bak -E \
         -e "s|^([[:space:]]*proof_time_ms:).*|\\1 5000|" \
-        -e "s|^([[:space:]]*l2_block_time_ms:).*|\\1 12000|" \
+        -e "s|^([[:space:]]*l2_block_time_ms:).*|\\1 4000|" \
         "$ARGS_FILE"
     rm -f "$ARGS_FILE.bak"
-    echo "==> migrated eez.proof_time_ms 7000→5000 and l2_block_time_ms 2000→12000"
+    echo "==> migrated eez.proof_time_ms 7000→5000 and l2_block_time_ms 2000→4000"
+fi
+
+# Undo the incorrect (invalid, K=1) 12000/12000 preset from an earlier version
+# of this script — RollupTiming::validate() rejects K < 2 and eez-node refuses
+# to start on it.
+if [[ "$(yv l1_block_time_ms)" == "12000" \
+   && "$(yv l2_block_time_ms)" == "12000" \
+   && "$(yv proof_time_ms)" == "5000" \
+   && "$(yv submission_slack_ms)" == "1500" ]]; then
+    sed -i.bak -E "s|^([[:space:]]*l2_block_time_ms:).*|\\1 4000|" "$ARGS_FILE"
+    rm -f "$ARGS_FILE.bak"
+    echo "==> fixed eez.l2_block_time_ms from 12000 (INVALID K=1) to 4000 (K=3)"
 fi
 
 NODE_IMAGE="$(yv eez_node_image)";  NODE_IMAGE="${NODE_IMAGE:-eez-node:dev}"
