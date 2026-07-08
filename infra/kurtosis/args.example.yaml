@@ -100,7 +100,7 @@ eez:
   # 4000 can miss rbuilder's intake; 7000 leaves too little Steady window at
   # the 12s/2s cadence. 5000 keeps 1.5s slack without changing block cadence.
   proof_time_ms: 5000
-  submission_slack_ms: 1500
+  submission_slack_ms: 2500
   # Match chiado-node: do not freeze the sequencer when bundles are slow.
   max_speculative_depth: 0
 

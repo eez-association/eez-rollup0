@@ -147,7 +147,7 @@ def run(plan, args):
         "EEZ_L1_BLOCK_TIME_MS": str(eez.get("l1_block_time_ms", 12000)),
         "EEZ_L2_BLOCK_TIME_MS": str(eez.get("l2_block_time_ms", 4000)),
         "EEZ_PROOF_TIME_MS": str(eez.get("proof_time_ms", 5000)),
-        "EEZ_SUBMISSION_SLACK_MS": str(eez.get("submission_slack_ms", 1500)),
+        "EEZ_SUBMISSION_SLACK_MS": str(eez.get("submission_slack_ms", 2500)),
         "EEZ_MAX_SPECULATIVE_DEPTH": str(eez.get("max_speculative_depth", 0)),
         "DEVNET_FEE_RECIPIENT": eez.get("fee_recipient", "0x0000000000000000000000000000000000000000"),
         "EEZ_L1_POSTER_KEY": poster_key,
