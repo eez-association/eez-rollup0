@@ -580,16 +580,6 @@ pub async fn wait_for_l2_rpc(rpc_url: &str, timeout: Duration) -> Result<()> {
     .await
 }
 
-/// Read the `stateRoot` of the latest `safe` block on the L2 at `rpc_url`.
-/// Returns `Ok(None)` while the L2 hasn't yet adopted any safe block
-/// (genesis L1 derivation pending).
-pub async fn safe_block_state_root(rpc_url: &str) -> Result<Option<B256>> {
-    use alloy_rpc_types_eth::BlockNumberOrTag;
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let block = provider.get_block_by_number(BlockNumberOrTag::Safe).await?;
-    Ok(block.map(|b| b.header.state_root))
-}
-
 /// Block number and hash at a named tag (`latest`, `safe`, `finalized`, …).
 /// `None` when no block exists at that tag yet.
 pub async fn block_number_and_hash_at(
@@ -1200,10 +1190,16 @@ pub async fn wait_for_safe_state(
     timeout: Duration,
 ) -> Result<()> {
     wait_for(timeout, || async {
-        let node_root = safe_block_state_root(&node.l2_rpc_url())
-            .await
-            .ok()
-            .flatten();
+        let node_root = async {
+            let provider = ProviderBuilder::new().connect_http(node.l2_rpc_url().parse()?);
+            let block = provider
+                .get_block_by_number(alloy_rpc_types_eth::BlockNumberOrTag::Safe)
+                .await?;
+            Ok::<Option<B256>, anyhow::Error>(block.map(|b| b.header.state_root))
+        }
+        .await
+        .ok()
+        .flatten();
         let attested = chain.executed_states().await.unwrap_or_default();
         Ok(match node_root {
             Some(n) if n != B256::ZERO && n != genesis_root && attested.contains(&n) => Some(()),

@@ -14,8 +14,8 @@ mod common;
 use common::{
     ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeConfig,
     NodeHandle, block_number_and_hash_at, override_env, reorg_genesis_path,
-    reorg_genesis_state_root, safe_block_state_root, wait_for_new_attested_safe_block,
-    wait_for_safe_chain_contains, wait_for_safe_state,
+    reorg_genesis_state_root, wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
+    wait_for_safe_state,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -383,12 +383,6 @@ async fn happy_case_follower_sequencer_rpc() {
     wait_for_safe_state(&follower, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("follower did not catch up via L1 replay");
-
-    let follower_safe = safe_block_state_root(&follower.l2_rpc_url())
-        .await
-        .unwrap()
-        .expect("follower has a safe block");
-    assert_ne!(follower_safe, B256::ZERO, "follower safe is genesis");
 
     // The follower's public head must be a real sequencer block, and
     // the safe head must not outrun it.
