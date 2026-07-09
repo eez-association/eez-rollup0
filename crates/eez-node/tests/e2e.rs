@@ -336,6 +336,22 @@ async fn happy_case_follower_l1_derived() {
         .await
         .expect("follower did not catch up via L1 replay");
 
+    let (safe_number, safe_hash) =
+        block_number_and_hash_at(&follower.l2_rpc_url(), BlockNumberOrTag::Safe)
+            .await
+            .unwrap()
+            .expect("follower has a safe block");
+    assert!(safe_number > 0, "follower safe is genesis");
+    let (_, seq_hash) =
+        block_number_and_hash_at(&seq.l2_rpc_url(), BlockNumberOrTag::Number(safe_number))
+            .await
+            .unwrap()
+            .expect("sequencer has the follower safe block");
+    assert_eq!(
+        safe_hash, seq_hash,
+        "follower safe block hash must match sequencer at block {safe_number}",
+    );
+
     follower.assert_no_process_death();
     seq.assert_no_process_death();
 }
