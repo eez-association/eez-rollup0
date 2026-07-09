@@ -13,8 +13,9 @@ use alloy_rpc_types_eth::BlockNumberOrTag;
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeConfig,
-    NodeHandle, block_number_and_hash_at, block_number_hash_state_root_at, override_env,
-    reorg_genesis_path, reorg_genesis_state_root, safe_block_state_root, wait_for_safe_state,
+    NodeHandle, block_number_and_hash_at, override_env, reorg_genesis_path,
+    reorg_genesis_state_root, safe_block_state_root, wait_for_new_attested_safe_block,
+    wait_for_safe_chain_contains, wait_for_safe_state,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -313,58 +314,6 @@ async fn spawn_follower(
     let env = harness.follower_env(seq_rpc);
     let cfg = NodeConfig::default();
     NodeHandle::start(name, &cfg, &env).await
-}
-
-async fn wait_for_new_attested_safe_block(
-    node: &NodeHandle,
-    chain: &common::Chain<'_>,
-    previous_states: &[B256],
-    timeout: Duration,
-) -> anyhow::Result<(u64, B256)> {
-    common::wait_for(timeout, || {
-        let rpc = node.l2_rpc_url();
-        async move {
-            let Some((number, hash, root)) =
-                block_number_hash_state_root_at(&rpc, BlockNumberOrTag::Safe).await?
-            else {
-                return Ok(None);
-            };
-            if number == 0 || root == B256::ZERO || previous_states.contains(&root) {
-                return Ok(None);
-            }
-            let attested = chain.executed_states().await?;
-            Ok(attested.contains(&root).then_some((number, hash)))
-        }
-    })
-    .await
-}
-
-async fn wait_for_safe_chain_contains(
-    node: &NodeHandle,
-    number: u64,
-    hash: B256,
-    timeout: Duration,
-) -> anyhow::Result<()> {
-    common::wait_for(timeout, || {
-        let rpc = node.l2_rpc_url();
-        async move {
-            let Some((safe_number, _)) =
-                block_number_and_hash_at(&rpc, BlockNumberOrTag::Safe).await?
-            else {
-                return Ok(None);
-            };
-            if safe_number < number {
-                return Ok(None);
-            }
-            let Some((_, actual_hash)) =
-                block_number_and_hash_at(&rpc, BlockNumberOrTag::Number(number)).await?
-            else {
-                return Ok(None);
-            };
-            Ok((actual_hash == hash).then_some(()))
-        }
-    })
-    .await
 }
 
 /// Unified `eez-node` in follower mode, L1-derived only (no
