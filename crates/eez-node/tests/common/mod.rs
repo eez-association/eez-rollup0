@@ -1197,17 +1197,6 @@ pub async fn all_l2_execution_states(
         .collect()
 }
 
-/// Wait until `node.safe.stateRoot` appears in the contract's
-/// `L2ExecutionPerformed` history for this `Chain`. Thin wrapper over
-/// [`wait_for_safe_state`] with no genesis exclusion (passes the zero root).
-pub async fn wait_for_node_caught_up(
-    node: &NodeHandle,
-    chain: &Chain<'_>,
-    timeout: Duration,
-) -> Result<()> {
-    wait_for_safe_state(node, chain, B256::ZERO, timeout).await
-}
-
 /// Wait until the node's safe `stateRoot` appears in the contract's
 /// `L2ExecutionPerformed` history for this `Chain` and differs from
 /// `genesis_root`. The attestation set grows monotonically, so this doesn't
@@ -1240,7 +1229,7 @@ pub async fn wait_for_safe_state(
 /// beyond. Used to prove a late-joining follower replayed the *entire*
 /// pre-existing backlog, not just the first few batches: `wait_for_safe_state`
 /// only proves *some* attested non-genesis block landed, this proves depth.
-pub async fn wait_for_safe_block(
+pub async fn wait_for_min_safe_block(
     node: &NodeHandle,
     min_block: u64,
     timeout: Duration,

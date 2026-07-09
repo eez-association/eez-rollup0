@@ -13,9 +13,8 @@ use alloy_rpc_types_eth::BlockNumberOrTag;
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeConfig,
-    NodeHandle, block_number_and_hash_at, block_number_at, override_env, reorg_genesis_path,
-    reorg_genesis_state_root, safe_block_state_root, wait_for_node_caught_up, wait_for_safe_block,
-    wait_for_safe_state,
+    NodeHandle, block_number_and_hash_at, override_env, reorg_genesis_path,
+    reorg_genesis_state_root, safe_block_state_root, wait_for_min_safe_block, wait_for_safe_state,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -109,7 +108,7 @@ async fn happy_case_builder_sustained() {
     let follower = NodeHandle::start("follower", &NodeConfig::default(), &follower_env)
         .await
         .unwrap();
-    wait_for_node_caught_up(&follower, &chain, DEFAULT_TIMEOUT)
+    wait_for_safe_state(&follower, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("follower did not catch up via L1 replay");
     follower.assert_no_process_death();
@@ -287,10 +286,10 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     // I3 — Each node independently catches up to the (now-advancing)
     // contract: at some poll, `node.safe.stateRoot == contract.stateRoot`
     // sampled back-to-back. The two nodes don't have to coincide.
-    wait_for_node_caught_up(&c1, &chain, DEFAULT_TIMEOUT)
+    wait_for_safe_state(&c1, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("c1 did not catch up to contract post-reorg");
-    wait_for_node_caught_up(&c2, &chain, DEFAULT_TIMEOUT)
+    wait_for_safe_state(&c2, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("c2 did not catch up to contract post-reorg");
 
@@ -333,7 +332,7 @@ async fn happy_case_follower_l1_derived() {
         .expect("sequencer landed batches");
 
     let follower = spawn_follower("follower", &harness, None).await.unwrap();
-    wait_for_node_caught_up(&follower, &chain, DEFAULT_TIMEOUT)
+    wait_for_safe_state(&follower, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("follower did not catch up via L1 replay");
 
@@ -364,7 +363,7 @@ async fn happy_case_follower_sequencer_rpc() {
         .wait_for_batches(2, DEFAULT_TIMEOUT)
         .await
         .expect("sequencer landed batches");
-    wait_for_node_caught_up(&follower, &chain, DEFAULT_TIMEOUT)
+    wait_for_safe_state(&follower, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("follower did not catch up via L1 replay");
 
@@ -447,7 +446,7 @@ async fn happy_case_follower_l1_reorg_recovers() {
         .wait_for_batches(pre_batches + 1, DEFAULT_TIMEOUT)
         .await
         .expect("no batches landed after reorg");
-    wait_for_node_caught_up(&follower, &chain, DEFAULT_TIMEOUT)
+    wait_for_safe_state(&follower, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("follower did not catch up post-reorg");
 
@@ -477,10 +476,10 @@ async fn happy_case_follower_cross_safe_parity() {
         spawn_follower("f_seq", &harness, Some(&seq_rpc)),
     )
     .unwrap();
-    wait_for_node_caught_up(&f_l1, &chain, DEFAULT_TIMEOUT)
+    wait_for_safe_state(&f_l1, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("f_l1 did not catch up");
-    wait_for_node_caught_up(&f_seq, &chain, DEFAULT_TIMEOUT)
+    wait_for_safe_state(&f_seq, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("f_seq did not catch up");
 
@@ -627,26 +626,39 @@ async fn happy_case_follower_deep_backfill_late_join() {
     // Snapshot how deep the backlog is at join time: the sequencer's
     // L1-derived safe height is exactly the history the follower must
     // replay.
-    let backlog_depth = block_number_at(&seq.l2_rpc_url(), BlockNumberOrTag::Safe)
-        .await
-        .unwrap()
-        .expect("sequencer has a safe block");
+    let (backlog_depth, backlog_hash) =
+        block_number_and_hash_at(&seq.l2_rpc_url(), BlockNumberOrTag::Safe)
+            .await
+            .unwrap()
+            .expect("sequencer has a safe block");
 
     // Fresh follower joins late; its boot catch-up must replay everything.
     let follower = spawn_follower("follower", &harness, None).await.unwrap();
 
-    wait_for_node_caught_up(&follower, &chain, DEFAULT_TIMEOUT)
+    wait_for_safe_state(&follower, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("late-joining follower did not backfill into an attested stateRoot");
 
     // Prove catch-up replayed the *entire* pre-existing backlog, not just
     // the first batch: the follower's safe head must climb to the depth the
     // chain already had when it joined (which also implies it is past genesis).
-    wait_for_safe_block(&follower, backlog_depth, DEFAULT_TIMEOUT)
+    wait_for_min_safe_block(&follower, backlog_depth, DEFAULT_TIMEOUT)
         .await
         .unwrap_or_else(|_| {
             panic!("follower did not replay full backlog to block {backlog_depth}")
         });
+
+    let (_, follower_backlog_hash) = block_number_and_hash_at(
+        &follower.l2_rpc_url(),
+        BlockNumberOrTag::Number(backlog_depth),
+    )
+    .await
+    .unwrap()
+    .expect("follower has the backlog block");
+    assert_eq!(
+        follower_backlog_hash, backlog_hash,
+        "follower backlog block hash must match sequencer at block {backlog_depth}",
+    );
 
     follower.assert_no_process_death();
     seq.assert_no_process_death();
