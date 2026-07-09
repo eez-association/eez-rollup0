@@ -3248,6 +3248,50 @@ mod tests {
     }
 
     #[test]
+    fn effect_prefix_roots_reject_reordered_effect_kinds() {
+        let (a, pre, outbound, inbound) = (
+            B256::repeat_byte(0xa0),
+            B256::repeat_byte(0x10),
+            B256::repeat_byte(0x20),
+            B256::repeat_byte(0x30),
+        );
+        let entries = vec![
+            (SettlementKind::Anchor, a, pre),
+            (SettlementKind::Inbound, pre, inbound),
+            (SettlementKind::Outbound, inbound, outbound),
+        ];
+        let system_flags = [true, false, true];
+        let per_tx_roots = [B256::repeat_byte(0x01), outbound, inbound];
+
+        assert!(
+            verify_effect_prefix_roots(&entries, &system_flags, Some(&per_tx_roots), a).is_err(),
+            "settlement entries must match the re-executed effect kind order"
+        );
+    }
+
+    #[test]
+    fn effect_prefix_roots_reject_reordered_prefix_roots() {
+        let (a, pre, outbound, inbound) = (
+            B256::repeat_byte(0xa0),
+            B256::repeat_byte(0x10),
+            B256::repeat_byte(0x20),
+            B256::repeat_byte(0x30),
+        );
+        let entries = vec![
+            (SettlementKind::Anchor, a, pre),
+            (SettlementKind::Outbound, pre, inbound),
+            (SettlementKind::Inbound, inbound, outbound),
+        ];
+        let system_flags = [true, false, true];
+        let per_tx_roots = [B256::repeat_byte(0x01), outbound, inbound];
+
+        assert!(
+            verify_effect_prefix_roots(&entries, &system_flags, Some(&per_tx_roots), a).is_err(),
+            "each settlement entry must use its exact re-executed prefix root, not a later root"
+        );
+    }
+
+    #[test]
     fn effect_prefix_roots_require_native_per_tx_roots_for_effects() {
         let (a, pre, outbound) = (
             B256::repeat_byte(0xa0),
