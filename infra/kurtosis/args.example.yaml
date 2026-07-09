@@ -1,12 +1,9 @@
-# Template for args.yaml (gitignored). `up.sh` copies this to args.yaml and
-# fills in eez.poster_key / eez.proof_signer_key automatically on first run —
-# edit args.yaml directly afterward, this file is just the starting point.
+# Template for args.yaml (gitignored).
+# up.sh copies this on first run and fills poster_key/proof_signer_key.
 #
-# Two top-level blocks:
-#   ethereum_package:  passed verbatim to ethpandaops/ethereum-package (Pair B).
-#   eez:               config for Pair A (eez-node + follower) and the deploy step.
-
-# ─────────────────────────────────────────────────────────────────────────
+# Blocks:
+#   ethereum_package: passed to ethpandaops/ethereum-package for the shared L1.
+#   eez: EEZ images, keys, timing, and L2 config.
 ethereum_package:
   participants:
     - el_type: reth
@@ -21,8 +18,7 @@ ethereum_package:
 
   network_params:
     network_id: "7331"
-    # Must equal eez.l1_block_time_ms (12000) so the bundle timestamp pin lands
-    # on-grid: min==max==parent_ts+12 == the next slot's timestamp.
+    # Must match eez.l1_block_time_ms.
     seconds_per_slot: 12
     slot_duration_ms: 12000
     genesis_gaslimit: 60000000
@@ -30,7 +26,7 @@ ethereum_package:
     shard_committee_period: 1
     deneb_fork_epoch: 0
     electra_fork_epoch: 0
-    # rbuilder coinbase, funded so mev_builder_subsidy can pay out.
+    # Builder coinbase.
     prefunded_accounts: '{"0xb9e79D19f651a941757b35830232E7EFC77E1c79": {"balance": "1000000ETH"}}'
 
   mev_type: flashbots
@@ -39,22 +35,16 @@ ethereum_package:
     mev_relay_image: ethpandaops/mev-boost-relay:main
     mev_boost_image: ethpandaops/mev-boost:develop
     mev_builder_cl_image: sigp/lighthouse:v8.1.2
-    # 1 ETH/winning-block from the coinbase so rbuilder outbids local payloads.
     mev_builder_subsidy: 1
 
   additional_services:
-    - spamoor      # L1 blockspace load
-    - disruptoor   # reorg primitive (scripts/reorg-scheduler.sh; needs --privileged)
-    - assertoor    # asserts reorg/liveness bounds (see assertoor_params below)
-    - dora         # block/reorg explorer
-    - forkmon      # fork-choice monitor
+    - spamoor      # L1 load
+    - disruptoor   # reorg primitive
+    - assertoor
+    - dora
+    - forkmon
 
-  # Automated network-health assertions. run_stability_check enforces reorg
-  # depth <= 2 and <= 2 reorgs/epoch — a BASELINE/LOAD-phase guard that catches
-  # UNINTENDED reorgs. It will (correctly) flag the deep reorgs you induce with
-  # scripts/reorg-scheduler.sh, so in that adversarial phase ignore it and assert
-  # on eez-node recovery instead (scripts/devnet-test.sh). UI: kurtosis port
-  # print eez-devnet assertoor http.
+  # Flags unintended reorgs during baseline/load runs.
   assertoor_params:
     run_stability_check: true
     run_block_proposal_check: true
@@ -64,57 +54,35 @@ ethereum_package:
       - scenario: eoatx
         name: baseline-load
         config:
-          # Keep low until BatchPosted is climbing. High throughput competes
-          # with postBatch for blockspace and makes rbuilder simulation slower.
-          throughput: 5
+          throughput: 30
 
-# ─────────────────────────────────────────────────────────────────────────
 eez:
-  # ── Images ──────────────────────────────────────────────────────────
-  # eez-node is BUILT locally from the repo Dockerfile by `up.sh`, tagged with
-  # this value. Release-image pull support will be added later; when it is,
-  # point this at a published tag instead (and skip the build):
-  #   eez_node_image: ghcr.io/eez-association/eez-node:v1.2.3
+  # Images built locally by up.sh.
   eez_node_image: eez-node:dev
-  # Glue image, also built by up.sh from infra/kurtosis/deploy.Dockerfile.
   deploy_image: eez-deploy:dev
   follower_image: sigp/lighthouse:v8.1.2
 
-  # ── Keys ────────────────────────────────────────────────────────────
-  # up.sh derives both from ethereum-package's prefunded dev mnemonic
-  # (indices 1, 2) the first time it sees "0xCHANGE_ME" here. Set them by
-  # hand instead to use different funded accounts.
+  # Derived from the dev mnemonic on first run.
   poster_key: "0xCHANGE_ME"
   proof_signer_key: "0xCHANGE_ME"
 
-  # ── Timing (l1_block_time_ms MUST match network_params.seconds_per_slot) ─
+  # L2 time must divide L1 time with K >= 2.
   l1_block_time_ms: 12000
-  # K=3 during bootstrap (validate() requires K >= 2 — 12000 here would be K=1
-  # and eez-node refuses to start). Halves the L2-ahead-of-L1 race ratio vs the
-  # mainnet-shaped 2000 (K=6), reducing how far sync_block_number can run ahead
-  # of the L1-confirmed cursor while the first postBatch settles (e.g. during
-  # MEV/relay warmup, see README "Chiado vs Kurtosis"). After BatchPosted is
-  # climbing reliably, try 2000 (K=6) on a fresh enclave.
-  l2_block_time_ms: 4000
-  # Kurtosis rbuilder needs a longer lead time than the in-process dev relay:
-  # 4000 can miss rbuilder's intake; 7000 leaves too little Steady window at
-  # the 12s/2s cadence. 5000 keeps 1.5s slack without changing block cadence.
+  l2_block_time_ms: 2000
   proof_time_ms: 5000
   submission_slack_ms: 2500
-  # Match chiado-node: do not freeze the sequencer when bundles are slow.
   max_speculative_depth: 0
 
+  # Fee recipient.
   fee_recipient: "0x0000000000000000000000000000000000000000"
 
-  # ── L2 (eez-node's own rollup reth) ─────────────────────────────────
+  # L2 (eez-node's own rollup reth).
   l2_system_key: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
   l2_system_address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
   ccm_l2_address: "0x4200000000000000000000000000000000000007"
-  # MUST include the L1 chainId (network_id) or every op is treated as L2-only
-  # and batches settle empty.
+  # Must include network_params.network_id.
   cross_chain_source_chain_ids: "7331"
 
-  # ── Optional overrides ──────────────────────────────────────────────
+  # Optional overrides.
   # Route bundle submission through the relay so mev-boost can see bids.
   relay_url: "http://mev-relay-api:9062"
-  # builder_rpc_url: "http://el-5-reth-builder-lighthouse:8645"  # auto-detected

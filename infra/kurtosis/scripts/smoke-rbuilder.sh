@@ -1,17 +1,11 @@
 #!/usr/bin/env bash
-# Proves rbuilder honors eth_sendBundle timestamp pins (minTimestamp ==
-# maxTimestamp), which EEZ's BundleTarget::Exact relies on for slot settlement.
-# Two probes from the poster key: POSITIVE pins the correct slot timestamp (must
-# land); NEGATIVE pins an impossible past timestamp (must NOT land — the real
-# enforcement test). Run after MEV warmup (~block 130). Discovers the enclave's
-# RPC / rbuilder / poster key via enclave-env.sh; override RBUILDER_SMOKE_SLACK
-# (default 3) or export any EEZ_* var first to win over discovery.
+# rbuilder timestamp-pin smoke test for a running Kurtosis devnet.
+#
+# Sends one valid and one invalid eth_sendBundle timestamp-pinned control bundle
+# from the poster key. Run after MEV warmup.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Discover the Kurtosis EL RPC + rbuilder RPC + poster key from the running
-# enclave (env already-set wins). See enclave-env.sh — uses `kurtosis port
-# print`, no scraping.
 # shellcheck disable=SC1091
 source "$HERE/enclave-env.sh"
 

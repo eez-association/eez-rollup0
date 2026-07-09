@@ -1,48 +1,59 @@
 #!/usr/bin/env bash
-# Bring up the WHOLE EEZ cross-chain devnet in one enclave: Pair B
-# (ethereum-package: L1 + rbuilder + relay + spamoor) AND Pair A (eez-node +
-# follower). Builds the local images, then `kurtosis run`. One command.
-#
-# eez-node is BUILT from the repo Dockerfile (tagged per eez.eez_node_image in
-# the args file, default eez-node:dev). Release-image pull support will be added
-# later; until then everything is built locally.
+# Build local images and run the whole EEZ Kurtosis devnet.
 #
 # Usage:
-#   bash infra/kurtosis/up.sh [args-file]        # default: args.yaml
+#   bash infra/kurtosis/up.sh [args-file]    # default: infra/kurtosis/args.yaml
 #
 # Env knobs:
-#   EEZ_SKIP_NODE_BUILD=1    reuse an existing eez-node image (skip the slow build)
+#   EEZ_SKIP_NODE_BUILD=1    reuse an existing eez-node image
 #   EEZ_SKIP_DEPLOY_BUILD=1  reuse an existing eez-deploy image
-#   KURTOSIS_ENCLAVE=name    enclave name (default: eez-devnet)
+#   EEZ_OPTIMIZED_BUILD=1    build eez-node in release mode
+#   KURTOSIS_ENCLAVE=name    enclave name, default eez-devnet
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 ENCLAVE="${KURTOSIS_ENCLAVE:-eez-devnet}"
 ARGS_FILE="${1:-$HERE/args.yaml}"
-# ethereum-package's standard prefunded dev mnemonic. Indices 1/2 are unused by
-# the package itself (0=builder coinbase, 3=tx_fuzz, 12=deployer, 13=spamoor).
+# ethereum-package dev mnemonic.
 DEV_MNEMONIC="giant issue aisle success illegal bike spike question tent bar rely arctic volcano long crawl hungry vocal artwork sniff fantasy very lucky have athlete"
 
 command -v kurtosis >/dev/null || { echo "kurtosis not found in PATH" >&2; exit 1; }
 command -v docker   >/dev/null || { echo "docker not found in PATH" >&2; exit 1; }
 
-# First run: create args.yaml from the example so there's nothing to hand-copy.
+PROTOCOL_DIR="$REPO/sync-rollups-protocol"
+
+# Fail before building images if the protocol submodule is missing or stale.
+if [[ ! -d "$PROTOCOL_DIR/.git" && ! -f "$PROTOCOL_DIR/.git" ]]; then
+    echo "sync-rollups-protocol submodule is not initialized." >&2
+    echo "Run: git submodule update --init --recursive sync-rollups-protocol" >&2
+    exit 1
+fi
+
+if ! grep -q "ExpectedLookup\\[\\] expectedLookups" "$PROTOCOL_DIR/src/interfaces/IEEZ.sol" 2>/dev/null \
+    || ! grep -q "expectedStateRoots" "$PROTOCOL_DIR/src/interfaces/IEEZ.sol" 2>/dev/null
+then
+    echo "sync-rollups-protocol is too old for this eez-node checkout." >&2
+    echo "Missing postAndVerifyBatch ABI fields expected by this checkout." >&2
+    echo "Run: git submodule update --init --recursive sync-rollups-protocol" >&2
+    echo "Current submodule status:" >&2
+    git -C "$REPO" submodule status sync-rollups-protocol >&2 || true
+    exit 1
+fi
+
+echo "==> protocol submodule: $(git -C "$PROTOCOL_DIR" rev-parse --short HEAD)"
+
+# First run: create args.yaml from the example.
 if [[ ! -f "$ARGS_FILE" ]]; then
     echo "==> $ARGS_FILE not found, creating it from args.example.yaml"
     cp "$HERE/args.example.yaml" "$ARGS_FILE"
 fi
 
-# Flat "key: value" lookup out of the args file (strips quotes + comments) so the
-# images we build are tagged exactly as main.star will reference them.
+# Flat key lookup for this simple args template.
 yv() { grep -E "^[[:space:]]*$1:" "$ARGS_FILE" | head -1 \
         | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//'; }
 
-# First run: derive the poster/proof-signer keys from the dev mnemonic instead
-# of asking for a manual `cast wallet private-key` + paste step. Also derive
-# their ADDRESSES and register them in network_params.prefunded_accounts so
-# genesis actually gives them a balance — without this, postBatch simulation
-# fails "insufficient funds" and every bundle gets silently dropped by rbuilder.
+# Derive dev keys and fund them in the L1 genesis config.
 DERIVED_ADDRS=()
 for pair in "poster_key:1" "proof_signer_key:2"; do
     key="${pair%%:*}"; index="${pair##*:}"
@@ -61,10 +72,7 @@ for pair in "poster_key:1" "proof_signer_key:2"; do
     fi
 done
 
-# Make sure the derived addresses are present in network_params.prefunded_accounts.
-# Uses python3+pyyaml if available (safe structural edit); falls back to a plain
-# warning + manual instructions if python/pyyaml isn't present, rather than risking
-# a corrupt YAML file via sed on a nested map.
+# Prefer structural YAML edits when pyyaml is available.
 if [[ "${#DERIVED_ADDRS[@]}" -gt 0 ]]; then
     if command -v python3 >/dev/null && python3 -c "import yaml" >/dev/null 2>&1; then
         python3 - "$ARGS_FILE" "${DERIVED_ADDRS[@]}" <<'PYEOF'
@@ -111,10 +119,6 @@ PYEOF
     fi
 fi
 
-# l2_block_time_ms MUST divide l1_block_time_ms evenly with K = l1/l2 >= 2
-# (RollupTiming::validate() refuses K < 2 at eez-node startup). The default
-# preset (l1=12000, l2=2000) gives K=6, which is valid — no migration needed.
-
 NODE_IMAGE="$(yv eez_node_image)";  NODE_IMAGE="${NODE_IMAGE:-eez-node:dev}"
 DEPLOY_IMAGE="$(yv deploy_image)";  DEPLOY_IMAGE="${DEPLOY_IMAGE:-eez-deploy:dev}"
 
@@ -122,10 +126,7 @@ export DOCKER_BUILDKIT=1
 
 if [[ "${EEZ_SKIP_NODE_BUILD:-0}" != "1" ]]; then
     echo "==> building $NODE_IMAGE (repo Dockerfile, fast devnet profile)"
-    # Fast profile for a test node: parallel codegen + no LTO + no debug info.
-    # Cuts the final compile from Cargo.toml's production release profile
-    # (codegen-units=1, lto=thin) by a lot, and shrinks disk use. Set
-    # EEZ_OPTIMIZED_BUILD=1 to build the full optimized binary instead.
+    # Fast local build; set EEZ_OPTIMIZED_BUILD=1 for the full release profile.
     node_build_args=()
     if [[ "${EEZ_OPTIMIZED_BUILD:-0}" != "1" ]]; then
         node_build_args=(
@@ -140,10 +141,12 @@ fi
 if [[ "${EEZ_SKIP_DEPLOY_BUILD:-0}" != "1" ]]; then
     echo "==> building $DEPLOY_IMAGE (foundry + contracts)"
     docker build -f "$HERE/deploy.Dockerfile" -t "$DEPLOY_IMAGE" "$REPO"
+else
+    echo "==> reusing $DEPLOY_IMAGE (EEZ_SKIP_DEPLOY_BUILD=1)"
 fi
 
 echo "==> kurtosis run (enclave: $ENCLAVE)"
-# --privileged: disruptoor needs it for the CL P2P partition (reorg-scheduler.sh).
+# disruptoor needs privileged mode for P2P partitions.
 kurtosis run --privileged --enclave "$ENCLAVE" "$HERE" --args-file "$ARGS_FILE"
 
 cat <<EOF

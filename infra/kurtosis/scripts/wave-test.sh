@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Cross-chain wave test for a running Kurtosis devnet.
 #
 # Comprehensive cross-chain WAVE test harness — KURTOSIS devnet edition.
 #
@@ -41,12 +42,7 @@ WAVES="${EEZ_WAVE_COUNT:-3}"
 
 for t in cast forge jq curl kurtosis; do command -v "$t" >/dev/null || { echo "$t not in PATH"; exit 1; }; done
 
-# ── Endpoints — resolved straight from the running enclave, no separate
-# discovery step. Already-exported vars win (e.g. to point at a different
-# enclave without re-deriving everything).
-# L1 = the CANONICAL shared chain (el-1 reth) where proxies/targets/receipts and
-# rollups(id).stateRoot live. The composer's embedded reth mirrors it in-process,
-# so anything created here is visible to composition. NOT the embedded reth.
+# L1 is the canonical shared chain; fronts are published by eez-node.
 _port() { kurtosis port print "$ENCLAVE" "$1" "$2" 2>/dev/null || true; }
 _http() { case "$1" in http*) echo "$1";; "") echo "";; *) echo "http://$1";; esac; }
 : "${L1:=$(_http "$(_port el-1-reth-lighthouse rpc)")}"
@@ -60,9 +56,7 @@ NODE_LOG="${EEZ_NODE_LOG:-$LOG_DIR/wave-$MODE-node.log}"
 DEPLOY_DIR="$(mktemp -d /tmp/eez-deployments.XXXXXX)"
 trap 'rm -rf "$DEPLOY_DIR"' EXIT
 
-# ── Protocol deployment (registry/rollup id/CCM/…) ────────────────────
-# Prefer an already-placed $REPO/deployments.env; otherwise pull the artifact
-# fresh from the enclave so there's no separate "download it yourself" step.
+# Pull the deployment artifact from the enclave by default.
 if [[ "${EEZ_USE_LOCAL_DEPLOYMENTS:-0}" == "1" && -f "$REPO/deployments.env" ]]; then
     set -a; source "$REPO/deployments.env"; set +a
 else
@@ -72,20 +66,15 @@ else
 fi
 [[ -n "${EEZ_REGISTRY_ADDRESS:-}" ]] || { echo "EEZ_REGISTRY_ADDRESS unset — deployments.env incomplete"; exit 1; }
 
-# ── Keys ─────────────────────────────────────────────────────────────
-# The standard hardhat mnemonic accounts are prefunded on the L2 genesis (all
-# of them), but on the KURTOSIS canonical L1 only the poster is funded, so the
-# L1-side actors below are funded from the poster at startup (see funding step).
-# The poster/proof-signer are the node's own keys — this harness never posts.
+# Hardhat accounts are funded on L2; L1 actors are funded from the poster below.
 HH_KEY_0=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80   # deployer/owner (L1 targets/proxies/wrapper)
 HH_KEY_2=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a   # L2 contract deployer / L2 proxy creator
-# Cross-chain users (distinct EOAs so per-direction nonce chains don't collide):
+# Distinct users avoid per-direction nonce collisions.
 HH_KEY_IN=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d   # #1 inbound user  (submits to L1 front → L1 gas → funded from poster)
 HH_ADDR_IN=0x70997970C51812dc3A010C7d01b50e0d17dc79C8
 HH_KEY_OUT=0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6  # #3 outbound user (submits to L2 front → L2 tx → funded on L2 genesis)
 HH_ADDR_OUT=0x90F79bf6EB2c4f870365E785982E1f101E93b906
-# Pure-L2 filler user = the L2-deployer key (acct #2), idle at wave time so its
-# pure-L2 tx can't collide with a pooled cross-chain tx's L2 nonce.
+# Pure-L2 filler user.
 HH_KEY_PURE=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a  # #2 (L2 deployer, idle at wave time)
 
 # EOAs funded on L1 from the poster so they can pay gas on the shared chain.
@@ -208,7 +197,7 @@ create_l2_proxy() { # <target_on_L1> → proxy addr
 }
 
 echo "==> creating cross-chain proxies for the active mode"
-if [[ "$MODE" == inbound || "$MODE" == mixed || "$MODE" == mixed-pure || "$MODE" == adversarial ]]; then
+if [[ "$MODE" == inbound || "$MODE" == mixed || "$MODE" == mixed-pure ]]; then
     IN_VALUE_PROXY=$(create_l1_proxy "$L2_VALUE")
     IN_NORET_PROXY=$(create_l1_proxy "$L2_VALUE_NORET")
     IN_DEP_PROXY=$(create_l1_proxy "$L2_DEP_RECIPIENT")

@@ -1,56 +1,28 @@
+# EEZ cross-chain devnet Kurtosis package.
 #
-# EEZ cross-chain devnet — single self-contained Kurtosis package.
+# Runs both halves of the harness in one enclave:
+#   Pair B: ethereum-package L1, rbuilder, relay, mev-boost, spamoor,
+#           disruptoor, and observability services.
+#   Pair A: eez-node with embedded L1, composer, L2, cross-chain fronts,
+#           plus a follower Lighthouse for the embedded L1 Engine API.
 #
-# Runs BOTH halves of the harness inside one enclave:
-#
-#   Pair B  ethpandaops/ethereum-package: reth+lighthouse validators, rbuilder,
-#           relay, mev-boost, spamoor, disruptoor. Generates the ONE shared
-#           genesis (artifact "el_cl_genesis_data").
-#   Pair A  eez-node (embedded L1 reth + composer + sequencer + L2) and a
-#           beacon-only follower Lighthouse that drives eez-node's embedded reth
-#           over the engine API.
-#
-# Everything talks over the enclave's internal DNS on fixed ports: the EL
-# enode, the CL ENRs/multiaddrs, and the genesis artifact all come straight
-# from ethereum-package's run() output, so nothing needs to be scraped off the
-# host.
-#
-# Usage:  kurtosis run . --args-file args.yaml     (see args.example.yaml)
+# Usage: kurtosis run . --args-file args.yaml
 
 ethereum_package = import_module("github.com/ethpandaops/ethereum-package/main.star")
 
-# Fixed in-enclave ports for Pair A (host publishing is handled by Kurtosis).
-# EMBEDDED_L1_* are the reth compiled INTO eez-node (its own L1 node); L2_* are
-# eez-node's rollup reth. Both live in the one eez-node process/service.
-EMBEDDED_L1_RPC_PORT = 18545      # embedded L1 reth JSON-RPC (composer reads in-process)
-EMBEDDED_L1_ENGINE_PORT = 18551   # embedded L1 reth authrpc — the follower dials this
-L2_RPC_PORT = 18688               # eez-node's L2 rollup reth JSON-RPC
-L2_ENGINE_PORT = 18684            # L2 engine (driven in-process)
+# Pair A fixed ports inside the enclave.
+EMBEDDED_L1_RPC_PORT = 18545
+EMBEDDED_L1_ENGINE_PORT = 18551
+L2_RPC_PORT = 18688
+L2_ENGINE_PORT = 18684
 L2_P2P_PORT = 30640
-# Cross-chain ingress fronts (main.rs `run_cross_chain_front`, bind 0.0.0.0).
-# One per SOURCE chain; each forwards eth_* to its upstream RPC and intercepts
-# sendRawTransaction into the held pool for composition:
-#   L1 front (→ EEZ_L1_RPC_URL, the embedded L1): L1→L2 Inbound.
-#   L2 front (→ EEZ_L2_RPC_URL, the L2 rollup):    L2→L1 Outbound.
 L1_XCHAIN_PORT = 18999
 L2_XCHAIN_PORT = 18998
-
-# Use the normal EL JSON-RPC port. rbuilder enables the flashbots API on 8545.
-# The 8645 rbuilder-rpc port accepts calls but bundles are not entering the
-# builder order pool.
+# rbuilder exposes eth_sendBundle on the normal EL RPC port.
 BUILDER_FLASHBOTS_RPC_PORT = 8545
-
-# mev-relay API HTTP port inside the enclave.
 MEV_RELAY_API_PORT = 9062
 
-# L2 genesis state root for the repo's ../../genesis.json, needed by
-# scripts/deploy.sh's RegisterRollup call (step 3 below) BEFORE eez-node's L2
-# reth (step 4) exists to query it from. The root depends only on `alloc`
-# (the initial account state) — NOT on `timestamp` or the fork-activation
-# fields deploy.sh rewrites afterward — so it's safe to precompute once and
-# hardcode. Derived by booting a throwaway standalone eez-node against
-# genesis.json and reading block 0's stateRoot via eth_getBlockByNumber.
-# Recompute and update this if genesis.json's `alloc` ever changes.
+# L2 genesis state root for genesis.json. Recompute if genesis alloc changes.
 L2_GENESIS_STATE_ROOT = "0xd381d828f650845aa890778c74ad2de245f5b3f2a24763f243e19a6bafb4fec5"
 
 
@@ -58,34 +30,24 @@ def run(plan, args):
     eth_args = args["ethereum_package"]
     eez = args.get("eez", {})
 
-    # Fail early with a clear message if the keys weren't filled in (rather than
-    # a cryptic KeyError deep in the deploy step).
     poster_key = eez.get("poster_key", "")
     proof_signer_key = eez.get("proof_signer_key", "")
     if poster_key in ["", "0xCHANGE_ME"] or proof_signer_key in ["", "0xCHANGE_ME"]:
         fail("set eez.poster_key and eez.proof_signer_key in the args file " +
              "(bash infra/kurtosis/up.sh derives both automatically on first run)")
 
-    # ── 1. Pair B: the whole L1 / MEV / load stack ──────────────────────
+    # Pair B: canonical L1, validators, MEV stack, and load/reorg services.
     eth = ethereum_package.run(plan, eth_args)
 
     participants = eth.all_participants
-    # The reference L1 node = first participant (el-1 / cl-1): a validator-backed
-    # reth+lighthouse pair on Pair B's chain. Distinct from eez-node's EMBEDDED
-    # L1 reth — this is the external L1 the embedded one syncs against. Its enode
-    # seeds the embedded reth's RLPx backfill — straight from the output API.
     l1_el = participants[0].el_context
 
-    # Give the follower EVERY Pair B beacon node, not just the first. With discv5
-    # enabled on the private enclave (--enable-private-discovery below) it can
-    # discover them, and a multi-peer mesh is what keeps block gossip flowing —
-    # a single peer stalls after the initial sync handshake. Flags are
-    # comma-delimited lists of these.
+    # Feed the follower all Pair B beacon peers for stable block gossip.
     cl_enrs = [p.cl_context.enr for p in participants]
     cl_multiaddrs = [p.cl_context.multiaddr for p in participants]
     cl_peer_ids = [p.cl_context.peer_id for p in participants]
 
-    # rbuilder lives on the participant whose service name carries "builder".
+    # Find the rbuilder participant.
     builder_el = None
     for p in participants:
         if "builder" in p.el_context.service_name:
@@ -105,8 +67,7 @@ def run(plan, args):
 
     chain_id = str(eth_args.get("network_params", {}).get("network_id", "7331"))
 
-    # ── 2. Mint the engine-API JWT shared by embedded reth <-> follower ──
-    # Independent of Pair B's JWT: it only guards the Pair-A engine channel.
+    # Pair A engine API JWT.
     jwt = plan.run_sh(
         description = "mint engine-API JWT (embedded reth <-> follower)",
         image = "alpine:3.20",
@@ -114,7 +75,7 @@ def run(plan, args):
         store = [StoreSpec(src = "/jwt/jwtsecret", name = "eez-jwt")],
     )
 
-    # ── 3. Deploy EEZ contracts + build the L2 genesis on the live L1 ────
+    # Deploy protocol contracts and emit /out/deployments.env + /out/l2-genesis.json.
     deploy = plan.run_sh(
         description = "deploy EEZ contracts + generate L2 genesis on the shared L1",
         image = eez.get("deploy_image", "eez-deploy:dev"),
@@ -131,7 +92,7 @@ def run(plan, args):
         wait = "900s",
     )
 
-    # ── 4. eez-node (embedded L1 + composer + L2) ───────────────────────
+    # eez-node: embedded L1, composer, L2, and cross-chain fronts.
     eez_env = {
         "EEZ_L1_EMBEDDED": "1",
         "EEZ_L1_CHAIN": "devnet",
@@ -146,7 +107,7 @@ def run(plan, args):
         "EEZ_L1_RELAY_RPC_URL": relay_rpc,
         "EEZ_L1_TRUSTED_PEERS": l1_el.enode,
         "EEZ_L1_BLOCK_TIME_MS": str(eez.get("l1_block_time_ms", 12000)),
-        "EEZ_L2_BLOCK_TIME_MS": str(eez.get("l2_block_time_ms", 4000)),
+        "EEZ_L2_BLOCK_TIME_MS": str(eez.get("l2_block_time_ms", 2000)),
         "EEZ_PROOF_TIME_MS": str(eez.get("proof_time_ms", 5000)),
         "EEZ_SUBMISSION_SLACK_MS": str(eez.get("submission_slack_ms", 2500)),
         "EEZ_MAX_SPECULATIVE_DEPTH": str(eez.get("max_speculative_depth", 0)),
@@ -167,7 +128,12 @@ def run(plan, args):
     }
 
     node_cmd = " ".join([
+        "set -eu;",
+        "echo 'eez-node: sourcing /out/deployments.env';",
+        "test -f /out/deployments.env;",
+        "grep -E '^(EEZ_REGISTRY_ADDRESS|EEZ_REGISTRY_DEPLOY_BLOCK|EEZ_ROLLUP_ID|EEZ_INITIAL_STATE_ROOT|EEZ_L1_L2_PROXY|EEZ_L1_BRIDGE_SENDER)=' /out/deployments.env;",
         "set -a; . /out/deployments.env; set +a;",
+        "echo \"eez-node: loaded EEZ_REGISTRY_ADDRESS=$EEZ_REGISTRY_ADDRESS EEZ_ROLLUP_ID=$EEZ_ROLLUP_ID EEZ_INITIAL_STATE_ROOT=$EEZ_INITIAL_STATE_ROOT\";",
         "exec eez-node node",
         "--chain=/out/l2-genesis.json",
         "--datadir=$EEZ_L2_DATADIR",
@@ -178,6 +144,7 @@ def run(plan, args):
         "--ipcdisable --disable-discovery",
     ])
 
+    # Follower beacon drives eez-node's embedded reth over the engine API.
     plan.add_service(
         name = "eez-node",
         config = ServiceConfig(
@@ -199,7 +166,6 @@ def run(plan, args):
         ),
     )
 
-    # ── 5. Follower beacon (no validators) — drives eez-node's embedded reth ─
     plan.add_service(
         name = "eez-follower",
         config = ServiceConfig(

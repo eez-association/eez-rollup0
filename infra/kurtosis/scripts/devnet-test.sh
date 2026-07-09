@@ -33,15 +33,12 @@ ENCLAVE="${KURTOSIS_ENCLAVE:-eez-devnet}"
 
 for t in cast forge jq curl kurtosis; do command -v "$t" >/dev/null || { echo "$t not in PATH"; exit 1; }; done
 
-# ── Endpoints — resolved straight from the running enclave, no separate
-# discovery step. Already-exported vars win (e.g. to point at a different
-# enclave without re-deriving everything).
+# Endpoints resolve from the running enclave; exported vars override.
 _port() { kurtosis port print "$ENCLAVE" "$1" "$2" 2>/dev/null || true; }
 _http() { case "$1" in http*) echo "$1";; "") echo "";; *) echo "http://$1";; esac; }
 : "${L1_RPC:=$(_http "$(_port el-1-reth-lighthouse rpc)")}"      # shared L1 (el-1)
 : "${L2_RPC:=$(_http "$(_port eez-node l2-rpc)")}"
-# Inbound cc txs go to the L1 cross-chain front, not the raw L2 RPC, so the node
-# classifies them Inbound and holds them for composition.
+# Inbound cross-chain txs go to the L1 front.
 : "${XCHAIN_L1:=$(_http "$(_port eez-node l1-xchain)")}"
 [[ -n "$L1_RPC" && -n "$L2_RPC" && -n "$XCHAIN_L1" ]] \
     || { echo "could not resolve enclave ports — is '$ENCLAVE' up? (kurtosis enclave inspect $ENCLAVE)"; exit 1; }
@@ -52,31 +49,24 @@ FILLER_PER_GAP="${EEZ_FILLER_PER_GAP:-2}"
 RECEIPT_WAIT_SECS="${EEZ_RECEIPT_WAIT_SECS:-300}"
 VALUE_INITIAL="${VALUE_INITIAL:-5}"
 
-# ── Keys ─────────────────────────────────────────────────────────────
-# Operator (creates L1 proxies) and user (sends cross-chain ops) are dedicated
-# test keys, funded on L1 at startup from the poster. Deliberately NOT the
-# poster/proof-signer keys — that would race the running eez-node's nonces.
+# Dedicated test keys avoid racing the node's poster nonce.
 EEZ_OPERATOR_KEY="${EEZ_OPERATOR_KEY:-0x2248a31395af28e24349c8e566c19475a79cb610389204ab26bc585493e5cf27}"
 EEZ_USER_KEY="${EEZ_USER_KEY:-0x3b7b012a74f1c18f714c38306339b6b4124f3a434bd816a1ee1fa5aeb5953efe}"
-# Funds the two keys above on L1 (poster has a huge prefunded balance). Read
-# straight out of args.yaml — the same file `up.sh` filled in on first run.
+# Fund test keys from the poster.
 _yaml() { grep -E "^[[:space:]]*$1:" "$K/args.yaml" 2>/dev/null | head -1 \
     | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//'; }
 EEZ_FUND_FROM_KEY="${EEZ_FUND_FROM_KEY:-${EEZ_L1_POSTER_KEY:-$(_yaml poster_key)}}"
 [[ -n "$EEZ_FUND_FROM_KEY" ]] || { echo "could not resolve the poster key — set EEZ_L1_POSTER_KEY or check $K/args.yaml"; exit 1; }
-# Hardhat key 2 = L2-only filler (prefunded in the L2 genesis); hardhat key 0
-# addr = L2 system signer (marks Sync blocks).
+# L2 filler key and system signer address.
 HH_KEY_2=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
 HH_ADDR_2=0x3C44Cdddb6a900fa2b585dD299E03D12FA4293bC
 HH_ADDR_0=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
 
-# Unique per run so the deterministic deposit-proxy address (derived from
-# registry+target+rollupId) never collides with a prior run's (CreateCollision).
+# Unique recipient avoids proxy create collisions across runs.
 L2_RECIPIENT="${L2_RECIPIENT:-0x$(openssl rand -hex 20)}"
 FILLER_RECIPIENT=0x2222222222222222222222222222222222222222
 
-# Snapshot of the composer log for the tally, via kurtosis (eez-node runs in
-# the enclave). It's a snapshot file we own — refreshed on demand, cleaned up.
+# Snapshot eez-node logs for assertions.
 NODE_LOG="$(mktemp /tmp/devnet-test-nodelog.XXXXXX)"
 DEPLOY_DIR="$(mktemp -d /tmp/eez-deployments.XXXXXX)"
 refresh_log() { kurtosis service logs "$ENCLAVE" eez-node >"$NODE_LOG" 2>&1 || true; }
