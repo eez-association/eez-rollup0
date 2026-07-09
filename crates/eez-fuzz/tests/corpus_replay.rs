@@ -11,7 +11,9 @@ use eez_fuzz::{SeqWorld, World, replay_compose, replay_program};
 
 /// Read every committed corpus file for a target.
 fn corpus(target: &str) -> Vec<Vec<u8>> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus").join(target);
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fuzz/corpus")
+        .join(target);
     let Ok(entries) = fs::read_dir(&dir) else {
         return Vec::new();
     };

@@ -25,13 +25,7 @@ use crate::{Dict, Direction, FuzzTx, Program, SeqBase, SeqWorld, World};
 ///   replace the accept-`Err` arm with the full L1-side oracle (assert the
 ///   composition settles the L1 destination, `InnerValue@L1` slot-0, to
 ///   `expected`), and flip `l2_to_l1_is_rejected_today` to assert success.
-pub async fn replay_compose(
-    l1: &World,
-    l1_dict: &Dict,
-    l2: &World,
-    l2_dict: &Dict,
-    data: &[u8],
-) {
+pub async fn replay_compose(l1: &World, l1_dict: &Dict, l2: &World, l2_dict: &Dict, data: &[u8]) {
     let Ok(input) = FuzzTx::arbitrary(&mut Unstructured::new(data)) else {
         return;
     };

@@ -19,7 +19,7 @@
 
 use std::sync::OnceLock;
 
-use eez_fuzz::{SeqBase, SeqWorld, replay_program};
+use eez_fuzz::{replay_program, SeqBase, SeqWorld};
 use libfuzzer_sys::fuzz_target;
 use tokio::runtime::Runtime;
 

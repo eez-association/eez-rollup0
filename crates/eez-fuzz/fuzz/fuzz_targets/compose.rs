@@ -47,7 +47,7 @@
 
 use std::sync::OnceLock;
 
-use eez_fuzz::{Dict, World, replay_compose};
+use eez_fuzz::{replay_compose, Dict, World};
 use libfuzzer_sys::fuzz_target;
 use tokio::runtime::Runtime;
 
