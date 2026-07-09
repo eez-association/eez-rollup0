@@ -70,6 +70,17 @@ enum PostBatchOutcome {
     },
 }
 
+const STALE_SYSTEM_BLOCK_PREFIX: &str = "intermediate block ";
+const STALE_SYSTEM_BLOCK_MARKER: &str = " carries type-0x7E system txs";
+const STALE_SYSTEM_REORG_ATTEMPTS: u8 = 3;
+const STALE_SYSTEM_REORG_RETRY_MS: u64 = 250;
+
+fn stale_system_block_from_prepare_error(err: &str) -> Option<u64> {
+    let rest = err.strip_prefix(STALE_SYSTEM_BLOCK_PREFIX)?;
+    let (block, _) = rest.split_once(STALE_SYSTEM_BLOCK_MARKER)?;
+    block.parse().ok()
+}
+
 /// Runtime config for the cross-chain execution path on Sync slots.
 /// `Composer::new` accepts `Option<Arc<CrossChainExecCtx>>`; `Some`
 /// means a wired `EvmComposer` and the keys/addresses needed to sign
@@ -146,17 +157,13 @@ impl std::fmt::Debug for CrossChainExecCtx {
     }
 }
 
-/// Relay-drop retries before a held user_tx is evicted as probable
-/// poison. Poison is normally caught at COMPOSE time (a tx whose
-/// `simulate_and_resolve` deterministically fails — e.g. a wrong-proxy
-/// tx → `EmptyCalls`, or a revert — is evicted before it can enter a
-/// bundle). Under strict all-or-nothing bundles a bundle that still
-/// DROPS is relay bad luck, so its txs are re-queued; this bound only
-/// backstops poison the compose-time sim view missed (rbuilder sims
-/// against a slightly different post-postBatch state). After this many
-/// consecutive drops the tx is evicted loudly (with the nonce-cascade)
-/// so it can't block the FIFO queue forever.
-pub const MAX_BUNDLE_ATTEMPTS: u32 = 3;
+/// Log once retries have crossed the old poison-eviction threshold.
+///
+/// A target-block miss or same-block competition loss is not evidence that a
+/// user transaction is bad. Recovery therefore keeps re-queueing unburned txs;
+/// this threshold is diagnostic only so live traces still surface unusual retry
+/// churn.
+pub const BUNDLE_ATTEMPT_WARN_THRESHOLD: u32 = 3;
 
 /// Classify a `simulate_and_resolve` failure. `true` = DETERMINISTIC:
 /// the composition is structurally invalid for this tx (no cross-chain
@@ -449,9 +456,9 @@ where
         true
     }
 
-    /// Remove a deferred posted-window entry that never reached L1 submission
-    /// (the deferred task abandoned it — timeout, no store/ctx, finalize
-    /// failure, or recovery raced ahead). Keyed by `sync_height` (== `to_block`).
+    /// Remove a deferred posted-window entry that did not settle on L1 (the
+    /// deferred task abandoned it before submission, or slot-context recovery
+    /// proved the submitted bundle failed). Keyed by `sync_height` (== `to_block`).
     /// No-op when the ledger is off.
     fn abandon_unsubmitted_window(
         &self,
@@ -472,7 +479,28 @@ where
                 reason,
                 public_inputs_hash = %public_inputs_hash,
                 window_public_inputs_hash = %window.public_inputs_hash,
-                "removed deferred posted-window entry before L1 submission",
+                "removed deferred posted-window entry that did not settle on L1",
+            );
+        }
+    }
+
+    /// Remove the posted-window entry for a failed deferred post after the
+    /// recovery path has established that the L1 cursor did not confirm it.
+    fn abandon_failed_posted_window(&self, rollup_id: u64, sync_height: u64, reason: &'static str) {
+        let Some(windows) = self.inner.posted_windows.get() else {
+            return;
+        };
+        if let Some(window) = windows.abandon_unsubmitted(sync_height) {
+            event!(
+                name: "eez.composer.posted_window.abandoned_failed",
+                Level::WARN,
+                rollup_id,
+                sync_height,
+                reason,
+                public_inputs_hash = %window.public_inputs_hash,
+                attested = window.attested,
+                pending_l1 = window.pending_l1,
+                "removed deferred posted-window entry after failed L1 settlement",
             );
         }
     }
@@ -1049,6 +1077,148 @@ where
         + 'static,
     <L2 as TransactionsProvider>::Transaction: Encodable2718,
 {
+    /// Recover a stale optimistic Sync block that survived a node restart after
+    /// its L1 bundle failed. No optimistic ledger entry exists after restart, so
+    /// the normal [`Self::recover_failed_batch`] path cannot fire; the
+    /// postBatch-prep system-tx guard detects the stale block in the batch range
+    /// and this helper reorgs the L2 head back to its parent.
+    async fn recover_stale_system_block(
+        &self,
+        rollup_id: u64,
+        rollup: &RollupState<L2>,
+        stale_block: u64,
+    ) -> bool {
+        let Some(committer) = self.inner.committer.get() else {
+            event!(
+                name: "eez.composer.recovery.stale_system.no_committer",
+                Level::ERROR,
+                rollup_id,
+                stale_block,
+                "committer handle not wired; cannot recover stale system Sync block",
+            );
+            return false;
+        };
+        if stale_block == 0 {
+            event!(
+                name: "eez.composer.recovery.stale_system.bad_block",
+                Level::ERROR,
+                rollup_id,
+                stale_block,
+                "cannot recover stale system Sync block at genesis",
+            );
+            return false;
+        }
+
+        let _guard = committer.begin_reconcile().await;
+        let cursor = rollup.l1_head.cursor();
+        if cursor >= stale_block {
+            event!(
+                name: "eez.composer.recovery.stale_system.cursor_confirmed",
+                Level::WARN,
+                rollup_id,
+                stale_block,
+                cursor,
+                "system Sync block is at or below the L1 cursor; not rolling back",
+            );
+            return false;
+        }
+        let head = committer.last_header();
+        if head.number() < stale_block {
+            event!(
+                name: "eez.composer.recovery.stale_system.already_recovered",
+                Level::INFO,
+                rollup_id,
+                stale_block,
+                head = head.number(),
+                "L2 head is already below the stale system Sync block",
+            );
+            return true;
+        }
+
+        let parent_number = stale_block - 1;
+        let parent = match rollup.l2_provider.sealed_header(parent_number) {
+            Ok(Some(header)) => header,
+            Ok(None) => {
+                event!(
+                    name: "eez.composer.recovery.stale_system.parent_missing",
+                    Level::ERROR,
+                    rollup_id,
+                    stale_block,
+                    parent_number,
+                    "cannot recover stale system Sync block: parent header missing",
+                );
+                return false;
+            }
+            Err(err) => {
+                event!(
+                    name: "eez.composer.recovery.stale_system.parent_read_failed",
+                    Level::ERROR,
+                    rollup_id,
+                    stale_block,
+                    parent_number,
+                    error = %err,
+                    "cannot recover stale system Sync block: parent header read failed",
+                );
+                return false;
+            }
+        };
+
+        for attempt in 1..=STALE_SYSTEM_REORG_ATTEMPTS {
+            match committer.reorg_to(parent.clone()).await {
+                Ok(()) => {
+                    event!(
+                        name: "eez.composer.recovery.stale_system.rolled_back",
+                        Level::WARN,
+                        rollup_id,
+                        stale_block,
+                        parent_number,
+                        parent_hash = %parent.hash(),
+                        cursor,
+                        previous_head = head.number(),
+                        attempt,
+                        "rolled back stale optimistic system Sync block after restart",
+                    );
+                    return true;
+                }
+                Err(err) => {
+                    let last_attempt = attempt == STALE_SYSTEM_REORG_ATTEMPTS;
+                    if last_attempt {
+                        event!(
+                            name: "eez.composer.recovery.stale_system.reorg_failed",
+                            Level::ERROR,
+                            rollup_id,
+                            stale_block,
+                            parent_number,
+                            parent_hash = %parent.hash(),
+                            attempt,
+                            attempts = STALE_SYSTEM_REORG_ATTEMPTS,
+                            error = %err,
+                            "reorg_to failed while recovering stale system Sync block",
+                        );
+                        return false;
+                    }
+                    event!(
+                        name: "eez.composer.recovery.stale_system.reorg_failed",
+                        Level::WARN,
+                        rollup_id,
+                        stale_block,
+                        parent_number,
+                        parent_hash = %parent.hash(),
+                        attempt,
+                        attempts = STALE_SYSTEM_REORG_ATTEMPTS,
+                        error = %err,
+                        "reorg_to failed while recovering stale system Sync block",
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        STALE_SYSTEM_REORG_RETRY_MS,
+                    ))
+                    .await;
+                }
+            }
+        }
+        false
+    }
+
     /// Recover a failed optimistic batch (slot context): reorg the L2
     /// head to the failed Sync block's parent if the block actually
     /// landed, then re-push its user_txs (skipping burned nonces).
@@ -1121,6 +1291,7 @@ where
                     head = head.number(),
                     "bundle failed on L1; optimistic Sync block rolled back to parent",
                 );
+                self.abandon_failed_posted_window(rollup_id, sync_height, "rolled_back_failed_l1");
             } else {
                 event!(
                     name: "eez.composer.recovery.not_committed",
@@ -1130,6 +1301,7 @@ where
                     head = head.number(),
                     "failed Sync block never became canonical; nothing to roll back",
                 );
+                self.abandon_failed_posted_window(rollup_id, sync_height, "failed_not_committed");
             }
         }
         // Re-push user_txs whose nonce survived — to the FRONT of the
@@ -1141,7 +1313,6 @@ where
             let submitter = &self.inner.submitter;
             let mut keep: Vec<crate::HeldTx> = Vec::with_capacity(failed.txs.len());
             let mut dropped = 0usize;
-            let mut evicted_chains: Vec<(alloy_primitives::Address, Direction, u64)> = Vec::new();
             // slot_skipped: re-queue without counting toward poison-eviction
             // (a skipped slot heals via a fresh pin next tick).
             let slot_skipped = failed.slot_skipped;
@@ -1158,74 +1329,26 @@ where
                 } else if slot_skipped {
                     keep.push(tx);
                 } else {
-                    // A relay drop on a BUILT slot did NOT burn the nonce
-                    // (the tx never executed), so re-queue for a fresh
-                    // attempt. Poison is normally caught at compose
-                    // time; this bounded retry only backstops poison
-                    // the compose-time sim missed (rbuilder sims
-                    // against a slightly different post-postBatch
-                    // state). After MAX_BUNDLE_ATTEMPTS such drops,
-                    // evict loudly (with the nonce-cascade) so a
-                    // residual poison tx can't block the FIFO queue
-                    // forever. User resubmits.
+                    // A relay drop, target miss, or same-block competition
+                    // loss did NOT burn the nonce, so re-queue for a fresh
+                    // attempt. Compose-time poison and actual nonce burns are
+                    // evicted by their specific checks; retry count alone is
+                    // only a signal in a based competition fleet, where a
+                    // valid rich bundle can lose multiple consecutive slots.
                     tx.attempts += 1;
-                    if tx.attempts >= MAX_BUNDLE_ATTEMPTS {
-                        dropped += 1;
-                        evicted_chains.push((tx.sender, tx.direction, tx.nonce));
+                    if tx.attempts == BUNDLE_ATTEMPT_WARN_THRESHOLD {
                         event!(
-                            name: "eez.composer.recovery.poison_evicted",
+                            name: "eez.composer.recovery.retry_threshold",
                             Level::WARN,
                             rollup_id,
                             tx_hash = %tx.hash,
                             sender = %tx.sender,
                             nonce = tx.nonce,
                             attempts = tx.attempts,
-                            "user_tx evicted after MAX_BUNDLE_ATTEMPTS relay drops (likely poison the compose-time sim missed); resubmit required",
-                        );
-                    } else {
-                        keep.push(tx);
-                    }
-                }
-            }
-            // Nonce-chain cascade: evicting (sender, N) makes every
-            // same-sender tx with nonce > N permanently invalid (the
-            // gap never fills — the evicted nonce only lands if the
-            // user resubmits, which produces a NEW tx). Leaving them
-            // queued poisons every future bundle they ride and breaks
-            // OTHER senders' chains as collateral — the exact cascade
-            // that bricked a run's user EOA. Drop them from both the
-            // keep list and the pool, loudly.
-            for (sender, direction, nonce) in &evicted_chains {
-                keep.retain(|t| {
-                    let cascade =
-                        t.sender == *sender && t.direction == *direction && t.nonce > *nonce;
-                    if cascade {
-                        dropped += 1;
-                        event!(
-                            name: "eez.composer.recovery.nonce_chain_evicted",
-                            Level::WARN,
-                            rollup_id,
-                            tx_hash = %t.hash,
-                            sender = %t.sender,
-                            nonce = t.nonce,
-                            gap_at = nonce,
-                            "same-sender tx above an evicted nonce; gapped chain can never land — evicted (resubmit in order)",
+                            "user_tx has seen repeated bundle drops; keeping it queued because no nonce burn or compose-time poison was observed",
                         );
                     }
-                    !cascade
-                });
-                for t in pool.drain_sender_above(*sender, *direction, *nonce) {
-                    dropped += 1;
-                    event!(
-                        name: "eez.composer.recovery.nonce_chain_evicted",
-                        Level::WARN,
-                        rollup_id,
-                        tx_hash = %t.hash,
-                        sender = %t.sender,
-                        nonce = t.nonce,
-                        gap_at = nonce,
-                        "same-sender pooled tx above an evicted nonce; gapped chain can never land — evicted (resubmit in order)",
-                    );
+                    keep.push(tx);
                 }
             }
             let re_pushed = keep.len();
@@ -1897,6 +2020,22 @@ where
         {
             Ok(o) => o,
             Err(err) => {
+                if let Some(stale_block) = stale_system_block_from_prepare_error(&err) {
+                    let recovered = self
+                        .recover_stale_system_block(rollup_id, rollup, stale_block)
+                        .await;
+                    if !recovered {
+                        event!(
+                            name: "eez.composer.recovery.stale_system.retry_later",
+                            Level::WARN,
+                            rollup_id,
+                            stale_block,
+                            error = %err,
+                            "stale system Sync block still unrecovered; yielding slot without appending another Sync block",
+                        );
+                    }
+                    return Ok(None);
+                }
                 event!(
                     name: "eez.composer.phase1.prepare_failed",
                     Level::ERROR,
@@ -2906,3 +3045,16 @@ async fn sign_post_batch_tx(
 // `_with_value`) moved into `eez_evm::system_tx` as part of the
 // composer↔deriver single-source-of-truth STF refactor. Call
 // `eez_evm::system_tx::build_inbound_system_txs(...)` from new code.
+
+#[cfg(test)]
+mod tests {
+    use super::stale_system_block_from_prepare_error;
+
+    #[test]
+    fn parses_stale_system_block_prepare_error() {
+        let err = "intermediate block 70305 carries type-0x7E system txs — \
+                   un-recovered failed Sync block in range; emission blocked until recovery";
+        assert_eq!(stale_system_block_from_prepare_error(err), Some(70305));
+        assert_eq!(stale_system_block_from_prepare_error("other error"), None);
+    }
+}

@@ -25,7 +25,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: eez-node:local
+    image: ${EEZ_NODE_IMAGE:-eez-node:local}
+    pull_policy: ${EEZ_PULL_POLICY:-missing}
     container_name: eez-node-chiado
     network_mode: host
     restart: unless-stopped
@@ -66,6 +67,9 @@ services:
       EEZ_SUBMISSION_SLACK_MS: "1300"
       # Don't freeze the sequencer when chiado bundles are slow to land.
       EEZ_MAX_SPECULATIVE_DEPTH: "0"
+      # Kept for parity with the real-proof/proverd source deployment; current
+      # code enters composer-driven dispatch when the real proof store is wired.
+      EEZ_COMPOSER_DRIVEN: "1"
       # Multi-composer: tolerate + adopt batches posted by the competing
       # composer instead of erroring "someone else is sequencing".
       EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES: "true"
@@ -90,7 +94,9 @@ services:
       - --http
       - --http.addr=0.0.0.0
       - --http.port=18688
-      - --http.api=eth,net,web3
+      # `debug` enables debug_executionWitness + debug_getRawBlock for
+      # eez-proverd replay-gap backfill after reconnects/restarts.
+      - --http.api=eth,net,web3,debug
       - --authrpc.addr=127.0.0.1
       - --authrpc.port=18684
       - --port=30640

@@ -522,6 +522,25 @@ mod tests {
     }
 
     #[test]
+    fn failed_pending_l1_window_can_be_abandoned_after_recovery() {
+        let pw = PostedWindows::new();
+        pw.reinit_from_cursor(10);
+        pw.record_posted(win(11, 20, 0xc));
+        assert_eq!(pw.mark_attested(B256::repeat_byte(0xc)), 20);
+        pw.mark_deferred_pending(B256::repeat_byte(0xc)); // bundle submitted
+        assert!(pw.next_to_dispatch().is_none());
+
+        let removed = pw.abandon_unsubmitted(20).expect("window removed");
+        assert_eq!(removed.to_block, 20);
+        assert!(removed.attested);
+        assert!(removed.pending_l1);
+        assert_eq!(pw.verified_frontier(), 10);
+        assert!(pw.next_to_dispatch().is_none());
+
+        assert_eq!(pw.mark_attested(B256::repeat_byte(0xc)), 10);
+    }
+
+    #[test]
     fn abandon_unsubmitted_drops_window_and_ignores_late_attestation() {
         let pw = PostedWindows::new();
         pw.reinit_from_cursor(10);

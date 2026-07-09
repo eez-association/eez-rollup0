@@ -8,6 +8,7 @@ contracts/broadcast/
 
 # Local config (contains private keys) + machine-written deploy outputs
 .env
+.env.chiado
 deployments.env
 
 # Default L2 datadir if it lands in the repo

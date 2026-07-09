@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EEZ RPC Info</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7fa;
+      --panel: #ffffff;
+      --line: #d8e0e8;
+      --text: #16202a;
+      --muted: #657384;
+      --blue: #235789;
+      --green: #167a4a;
+      --red: #a43c3c;
+      --amber: #9a650d;
+      --code: #eef3f7;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); }
+    .shell { width: min(1180px, calc(100vw - 32px)); margin: 0 auto; padding: 26px 0 42px; }
+    header { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: end; padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+    h1 { margin: 0 0 6px; font-size: 30px; line-height: 1.1; letter-spacing: 0; }
+    h2 { margin: 0 0 12px; font-size: 18px; letter-spacing: 0; }
+    p { margin: 0; color: var(--muted); line-height: 1.5; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    main { display: grid; gap: 22px; padding-top: 22px; }
+    section { display: grid; gap: 12px; }
+    .toolbar { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+    button { border: 1px solid var(--line); border-radius: 7px; padding: 8px 12px; background: #fff; color: var(--text); cursor: pointer; font: inherit; }
+    button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+    button:hover { border-color: #aebdcb; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .card { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 14px; min-width: 0; }
+    .endpoint { display: grid; gap: 10px; }
+    .endpoint-head { display: flex; justify-content: space-between; gap: 10px; align-items: start; }
+    .name { font-weight: 700; }
+    .role { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    .url { overflow-wrap: anywhere; border-radius: 7px; background: var(--code); padding: 8px; font-size: 12px; }
+    .status { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--muted); }
+    .status.ok { color: var(--green); }
+    .status.err { color: var(--red); }
+    .pill { display: inline-flex; align-items: center; min-height: 26px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 999px; background: #fff; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .kv { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 8px 12px; }
+    .kv div:nth-child(odd) { color: var(--muted); }
+    .kv div:nth-child(even) { overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    pre { margin: 0; padding: 12px; overflow: auto; border-radius: 8px; background: #111827; color: #e5edf7; font-size: 12px; line-height: 1.45; }
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .warn { color: var(--amber); }
+    @media (max-width: 860px) {
+      header { grid-template-columns: 1fr; align-items: start; }
+      .grid, .grid.four { grid-template-columns: 1fr; }
+      .kv { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div>
+        <h1>EEZ RPC Info</h1>
+        <p>Current local Docker topology: raw L1, raw L2, inbound L1-to-L2 front, outbound L2-to-L1 front.</p>
+      </div>
+      <div class="toolbar">
+        <button id="refresh">Refresh</button>
+        <button id="checks" class="primary">Run Checks</button>
+      </div>
+    </header>
+
+    <main>
+      <section>
+        <h2>Endpoints</h2>
+        <div class="grid four" id="endpoints"></div>
+      </section>
+
+      <section>
+        <h2>Deployment</h2>
+        <div class="card kv" id="deployment"></div>
+      </section>
+
+      <section>
+        <h2>Commands</h2>
+        <div class="toolbar" style="justify-content:flex-start">
+          <button data-copy="commands">Copy</button>
+          <span class="pill">host: <span id="hostLabel"></span></span>
+        </div>
+        <pre id="commands"></pre>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const endpointMeta = {
+      l1: {
+        title: "Raw L1",
+        role: "Chiado execution RPC used for L1 reads and deployment checks.",
+      },
+      l2: {
+        title: "Raw L2",
+        role: "EEZ L2 RPC for L2 reads, pure L2 txs, and contract calls.",
+      },
+      inbound: {
+        title: "Inbound Front",
+        role: "Submit L1-to-L2 cross-chain txs here. It reports the L1 chain ID.",
+      },
+      outbound: {
+        title: "Outbound Front",
+        role: "Submit L2-to-L1 cross-chain txs here. It reports the L2 chain ID.",
+      },
+    };
+
+    const deploymentLabels = {
+      EEZ_REGISTRY_ADDRESS: "Registry",
+      EEZ_REGISTRY_DEPLOY_BLOCK: "Deploy block",
+      EEZ_PROOF_SYSTEM_KIND: "Proof system kind",
+      EEZ_PROOF_SYSTEM_ADDRESS: "Proof system",
+      EEZ_ROLLUP_MANAGER_ADDRESS: "Rollup manager",
+      EEZ_ROLLUP_ID: "Rollup ID",
+      EEZ_INITIAL_STATE_ROOT: "Initial state root",
+      EEZ_L1_L2_PROXY: "L1 inbound proxy",
+      EEZ_L1_BRIDGE_SENDER: "L1 bridge sender",
+      EEZ_L2_BRIDGE_RECEIVER: "L2 bridge receiver",
+      EEZ_CCM_L2_ADDRESS: "L2 CCM",
+      EEZ_L2_SYSTEM_ADDRESS: "L2 system signer",
+    };
+
+    let config = { targets: {}, deployment: {}, ports: {}, explorer: "" };
+
+    const $ = (id) => document.getElementById(id);
+
+    function rpcUrl(name) {
+      return `/rpc/${name}`;
+    }
+
+    async function rpc(name, method, params = []) {
+      const response = await fetch(rpcUrl(name), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      });
+      const payload = await response.json();
+      if (payload.error) throw new Error(payload.error.message || JSON.stringify(payload.error));
+      return payload.result;
+    }
+
+    function shortHex(value) {
+      if (!value || value.length < 18) return value || "";
+      return `${value.slice(0, 10)}...${value.slice(-8)}`;
+    }
+
+    function renderEndpoints() {
+      const wrap = $("endpoints");
+      wrap.innerHTML = "";
+      for (const name of ["l1", "l2", "inbound", "outbound"]) {
+        const meta = endpointMeta[name];
+        const card = document.createElement("div");
+        card.className = "card endpoint";
+        card.innerHTML = `
+          <div class="endpoint-head">
+            <div>
+              <div class="name">${meta.title}</div>
+              <div class="role">${meta.role}</div>
+            </div>
+            <button data-copy-url="${name}">Copy</button>
+          </div>
+          <div class="url">${config.targets[name] || ""}</div>
+          <div class="status" id="status-${name}">not checked</div>
+        `;
+        wrap.appendChild(card);
+      }
+    }
+
+    function renderDeployment() {
+      const wrap = $("deployment");
+      wrap.innerHTML = "";
+      for (const [key, label] of Object.entries(deploymentLabels)) {
+        const k = document.createElement("div");
+        k.textContent = label;
+        const v = document.createElement("div");
+        const value = config.deployment[key] || "";
+        if (key.endsWith("_ADDRESS") || key.endsWith("_PROXY") || key.endsWith("_SENDER") || key.endsWith("_RECEIVER")) {
+          const explorer = config.explorer && value ? `${config.explorer.replace(/\/$/, "")}/address/${value}` : "";
+          v.innerHTML = explorer ? `<a href="${explorer}" target="_blank" rel="noreferrer">${value}</a>` : value || "unset";
+        } else {
+          v.textContent = value || "unset";
+        }
+        wrap.append(k, v);
+      }
+    }
+
+    function renderCommands() {
+      const host = location.hostname || "localhost";
+      $("hostLabel").textContent = host;
+      const registry = config.deployment.EEZ_REGISTRY_ADDRESS || "<registry>";
+      const rollupId = config.deployment.EEZ_ROLLUP_ID || "1";
+      $("commands").textContent = [
+        `cast chain-id --rpc-url http://${host}:18645`,
+        `cast block-number --rpc-url http://${host}:18645`,
+        `cast chain-id --rpc-url http://${host}:18688`,
+        `cast block-number --rpc-url http://${host}:18688`,
+        `cast chain-id --rpc-url http://${host}:18999`,
+        `cast chain-id --rpc-url http://${host}:18998`,
+        `cast call ${registry} 'rollups(uint256)(address,bytes32,uint256)' ${rollupId} --rpc-url http://${host}:18645`,
+        `curl -sS -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' http://${host}:18688`,
+      ].join("\n");
+    }
+
+    async function loadConfig() {
+      const response = await fetch("/config");
+      config = await response.json();
+      renderEndpoints();
+      renderDeployment();
+      renderCommands();
+    }
+
+    async function runChecks() {
+      for (const name of ["l1", "l2", "inbound", "outbound"]) {
+        const status = $(`status-${name}`);
+        status.textContent = "checking...";
+        status.className = "status";
+        try {
+          const [chainId, blockNumber, client] = await Promise.all([
+            rpc(name, "eth_chainId"),
+            rpc(name, "eth_blockNumber"),
+            rpc(name, "web3_clientVersion").catch(() => ""),
+          ]);
+          status.textContent = `ok chain=${parseInt(chainId, 16)} block=${parseInt(blockNumber, 16)} ${shortHex(client)}`;
+          status.className = "status ok";
+        } catch (error) {
+          status.textContent = `error ${error.message}`;
+          status.className = "status err";
+        }
+      }
+    }
+
+    document.addEventListener("click", async (event) => {
+      const copyUrl = event.target.getAttribute("data-copy-url");
+      const copyBlock = event.target.getAttribute("data-copy");
+      if (copyUrl) await navigator.clipboard.writeText(config.targets[copyUrl] || "");
+      if (copyBlock) await navigator.clipboard.writeText($(copyBlock).textContent);
+    });
+
+    $("refresh").addEventListener("click", loadConfig);
+    $("checks").addEventListener("click", runChecks);
+
+    loadConfig().then(runChecks).catch((error) => {
+      $("endpoints").innerHTML = `<div class="card warn">Unable to load /config: ${error.message}</div>`;
+    });
+  </script>
+</body>
+</html>

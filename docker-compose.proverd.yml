@@ -1,0 +1,43 @@
+# Colocated eez-proverd for the real-proof/deferred-post Chiado stack.
+#
+# Usage:
+#   docker compose --env-file .env.chiado \
+#     -f docker-compose.chiado-node.yml \
+#     -f docker-compose.proverd.yml up -d
+#
+# Requires:
+#   - deployments.env from `EEZ_PROOF_SYSTEM=real make deploy-protocol`
+#   - .env.chiado with EEZ_PROOF_SIGNER_KEY matching the deployed proof system
+#   - docker-compose.chiado-node.yml exposing debug on the L2 RPC
+services:
+  eez-proverd:
+    build:
+      context: .
+      dockerfile: Dockerfile.proverd
+    image: ${EEZ_PROVERD_IMAGE:-eez-proverd:local}
+    pull_policy: ${EEZ_PULL_POLICY:-missing}
+    container_name: eez-proverd
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      - eez-node
+    env_file:
+      - ./.env.chiado
+    environment:
+      RUST_LOG: "info,eez_proverd=info"
+      EEZ_COMPOSER_DRIVEN: "1"
+      EEZ_CONTROL_RPC_URL: "http://127.0.0.1:${EEZ_CONTROL_RPC_PORT:-50051}"
+      EEZ_L2_RPC_URL: "http://127.0.0.1:18688"
+      EEZ_BACKFILL_CONCURRENCY: "${EEZ_BACKFILL_CONCURRENCY:-8}"
+      EEZ_VALIDATOR_BIN: "/usr/local/bin/native-validate"
+      EEZ_CHAIN_CONFIG: "/app/l2-chainconfig.json"
+    command:
+      - "--control-addr"
+      - "http://127.0.0.1:${EEZ_CONTROL_RPC_PORT:-50051}"
+      - "--validator-bin"
+      - "/usr/local/bin/native-validate"
+      - "--chain-config"
+      - "/app/l2-chainconfig.json"
+    logging:
+      driver: "local"

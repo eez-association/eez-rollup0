@@ -16,6 +16,7 @@
 //! | set | set | **composer** | reth + `L1Watcher` + Deriver + Sequencer (L1-anchored) + Composer umbrella |
 
 mod bundle_rpc;
+mod eez_witness_rpc;
 mod follower;
 mod ingress;
 mod l1_embedded;
@@ -296,6 +297,7 @@ fn main() -> eyre::Result<()> {
                     .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder)),
             )
             .with_add_ons(reth_node_ethereum::node::EthereumAddOns::default())
+            .extend_rpc_modules(eez_witness_rpc::install_augmented_witness_rpc)
             .launch_with_debug_capabilities()
             .await?;
 

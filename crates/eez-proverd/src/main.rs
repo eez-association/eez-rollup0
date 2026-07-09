@@ -47,7 +47,7 @@ use eez_evm::public_inputs::public_inputs_hashes;
 use eez_evm::signer::EcdsaProofSigner;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Parse a 32-byte hex `B256` (the vkey arg).
 fn parse_b256(s: &str) -> Result<B256, String> {
@@ -169,7 +169,7 @@ struct Args {
     proof_sink_url: Option<String>,
 
     /// The L2 node's HTTP JSON-RPC endpoint, used to DURABLY BACKFILL blocks the
-    /// composer's bounded replay ring already evicted (`debug_executionWitness` +
+    /// composer's bounded replay ring already evicted (`eez_executionWitnessAugmented` +
     /// `debug_getRawBlock` against archive state). On a replay gap the prover
     /// reconstructs the missing `[cursor+1 .. live-1]` ControlEvents from here
     /// rather than fast-forwarding past unproven blocks. When unset (`None`), the
@@ -400,11 +400,15 @@ fn witness_to_json(w: &ExecutionWitness) -> String {
 /// DURABLE BACKFILL — reconstruct the [`ControlEvent`] for block `n` directly
 /// from the L2 node's ARCHIVE state when the composer's bounded replay ring
 /// already evicted it (a disconnect that outlasted the ring horizon, or a
-/// stuck prover whose `posted << tip`). Issues two reth debug JSON-RPC calls:
+/// stuck prover whose `posted << tip`). Issues one EEZ-specific witness call
+/// plus one reth debug JSON-RPC call:
 ///
-///   - `debug_executionWitness(n)` → the block's minimal execution witness.
-///     reth returns `{state,codes,keys,headers}` (`Vec<Bytes>`), the exact
-///     structural mirror of the proto `ExecutionWitness` — mapped 1:1.
+///   - `eez_executionWitnessAugmented(n)` → the block's augmented execution
+///     witness. It returns `{state,codes,keys,headers}` (`Vec<Bytes>`), the
+///     exact structural mirror of the proto `ExecutionWitness` — mapped 1:1.
+///     This must be the same producer path used by the live node feed; stock
+///     `debug_executionWitness` only proves parent->final and can miss MPT
+///     nodes required by EEZ's intermediate per-tx root validation.
 ///   - `debug_getRawBlock(n)` → the consensus RLP (header + body), the same
 ///     bytes the live witness task RLP-encodes.
 ///
@@ -414,14 +418,10 @@ fn witness_to_json(w: &ExecutionWitness) -> String {
 /// event, so the on-disk inputs are byte-identical and the contiguity guard
 /// (`parent_hash == tip.block_hash && number == tip.number+1`) accepts it.
 ///
-/// VALIDATION-TIME CHECK (not a compile-time guarantee): the composer builds
-/// its witness with `ExecutionWitnessMode::Legacy` by default (ZisK's
-/// `native-validate` needs it for outbound/cross-chain blocks; see
-/// `eez-driver/src/witness.rs`). reth's `debug_executionWitness` must serve
-/// a format the validator accepts for the backfilled witness too — a
-/// backfilled OUTBOUND block re-executed from a too-minimal RPC witness
-/// would still fail the validator. If reth's default differs, pass a mode
-/// param here; this is flagged at deploy time, not blocked at compile time.
+/// VALIDATION-TIME CHECK (not a compile-time guarantee): this method must be
+/// served by an EEZ node that has `eez_executionWitnessAugmented` installed.
+/// A stock reth archive node is intentionally rejected for durable backfill,
+/// because it cannot serve the intermediate-root proof material.
 async fn backfill_block(l2_rpc_url: &str, n: u64) -> eyre::Result<ControlEvent> {
     use alloy_rpc_client::RpcClient;
 
@@ -432,12 +432,12 @@ async fn backfill_block(l2_rpc_url: &str, n: u64) -> eyre::Result<ControlEvent> 
     // reth debug RPC takes the block number as a hex QUANTITY string.
     let block_hex = format!("0x{n:x}");
 
-    // 1. Execution witness (alloy's ExecutionWitness deserializes the result;
-    //    its fields are the structural mirror of the proto type).
+    // 1. Augmented execution witness (alloy's ExecutionWitness deserializes
+    //    the result; its fields are the structural mirror of the proto type).
     let witness: alloy_rpc_types_debug::ExecutionWitness = client
-        .request("debug_executionWitness", (block_hex.clone(),))
+        .request("eez_executionWitnessAugmented", (block_hex.clone(),))
         .await
-        .map_err(|e| eyre::eyre!("debug_executionWitness({n}): {e}"))?;
+        .map_err(|e| eyre::eyre!("eez_executionWitnessAugmented({n}): {e}"))?;
 
     // 2. Raw consensus RLP (header + body) — the SAME bytes the live witness
     //    task ships in `ControlEvent.block`.
@@ -474,6 +474,44 @@ async fn backfill_block(l2_rpc_url: &str, n: u64) -> eyre::Result<ControlEvent> 
         }),
         block: raw_block.to_vec(),
     })
+}
+
+async fn probe_augmented_witness_rpc(l2_rpc_url: &str) -> eyre::Result<()> {
+    use alloy_rpc_client::RpcClient;
+
+    let url = l2_rpc_url
+        .parse()
+        .map_err(|e| eyre::eyre!("invalid --l2-rpc-url {l2_rpc_url:?}: {e}"))?;
+    let client = RpcClient::new_http(url);
+
+    let probe: Result<alloy_rpc_types_debug::ExecutionWitness, _> = client
+        .request("eez_executionWitnessAugmented", ("0x0",))
+        .await;
+    match probe {
+        Ok(_) => {
+            info!(l2_rpc_url, "augmented witness RPC probe succeeded",);
+            Ok(())
+        }
+        Err(err) => {
+            if let Some(resp) = err.as_error_resp() {
+                if resp.code == -32601 {
+                    eyre::bail!(
+                        "L2 RPC {l2_rpc_url} does not expose eez_executionWitnessAugmented; \
+                         durable backfill cannot use stock debug_executionWitness safely"
+                    );
+                }
+                debug!(
+                    l2_rpc_url,
+                    code = resp.code,
+                    message = %resp.message,
+                    "augmented witness RPC probe reached the method; non-success response is acceptable",
+                );
+                return Ok(());
+            }
+
+            eyre::bail!("augmented witness RPC probe could not reach L2 RPC {l2_rpc_url}: {err}")
+        }
+    }
 }
 
 fn is_transient_backfill_error(err: &eyre::Report) -> bool {
@@ -1483,11 +1521,15 @@ async fn main() -> eyre::Result<()> {
              DISABLED; settling windows pass through ungated"
         );
     }
+    if let Some(url) = &l2_rpc_url {
+        probe_augmented_witness_rpc(url).await?;
+    }
+
     match &l2_rpc_url {
         Some(url) => info!(
             l2_rpc_url = %url,
             "durable backfill ENABLED — replay gaps are reconstructed from L2 archive state \
-             (debug_executionWitness + debug_getRawBlock), never fast-forwarded past",
+             (eez_executionWitnessAugmented + debug_getRawBlock), never fast-forwarded past",
         ),
         None => warn!(
             "durable backfill DISABLED (--l2-rpc-url empty): a replay gap is fail-loud and the \
@@ -1701,7 +1743,7 @@ async fn main() -> eyre::Result<()> {
                     // [stream_tip+1 .. event-1] (a disconnect outlasting the
                     // ring horizon, or a stuck prover whose posted << tip). The
                     // missing blocks are DURABLY BACKFILLED from the L2 archive
-                    // (debug_executionWitness + debug_getRawBlock) and pushed into
+                    // (eez_executionWitnessAugmented + debug_getRawBlock) and pushed into
                     // the window BEFORE the live event, so the contiguity guard
                     // below passes and `stream_tip` stays anchored at the TRUE
                     // proved tip. NEVER fast-forward past unproven blocks — that
@@ -1773,7 +1815,7 @@ async fn main() -> eyre::Result<()> {
                                     to = backfill_got - 1,
                                     replay_gap_to = got - 1,
                                     concurrency = args.backfill_concurrency.clamp(1, 64),
-                                    "✓ replay gap chunk backfilled from the L2 archive (debug_executionWitness per block)",
+                                    "✓ replay gap chunk backfilled from the L2 archive (eez_executionWitnessAugmented per block)",
                                 );
                                 pending_events.push_front(event);
                                 for ev in recovered.into_iter().rev() {

@@ -1,0 +1,877 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>EEZ PostBatch Tracker</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #121722;
+    --panel-2: #161c29;
+    --border: #232c3d;
+    --text: #d7dee9;
+    --muted: #7d8aa0;
+    --accent: #5db0ff;
+    --green: #3fd07a;
+    --red: #ff6b6b;
+    --amber: #ffc24b;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    padding: 16px 22px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    background: linear-gradient(180deg, var(--panel), var(--bg));
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .spacer { flex: 1; }
+  .pill {
+    font: 12px var(--mono); color: var(--muted);
+    background: var(--panel-2); border: 1px solid var(--border);
+    padding: 4px 9px; border-radius: 999px;
+  }
+  .pill b { color: var(--text); font-weight: 600; }
+  main { padding: 18px 22px; }
+  .config {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 10px 16px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px 16px; margin-bottom: 16px;
+  }
+  .config label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  .config input {
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    border-radius: 7px; padding: 7px 9px; font: 12px var(--mono); width: 100%;
+  }
+  .config input:focus { outline: none; border-color: var(--accent); }
+  .actions { display: flex; gap: 8px; align-items: end; }
+  button {
+    background: var(--accent); color: #04101f; border: none; cursor: pointer;
+    font-weight: 600; font-size: 13px; padding: 8px 16px; border-radius: 7px;
+  }
+  button.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  button:disabled { opacity: .5; cursor: default; }
+  .stats { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .stat {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 16px; min-width: 120px;
+  }
+  .stat .n { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stat .l { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  #status { font-size: 12px; color: var(--muted); margin-bottom: 10px; min-height: 16px; }
+  #status.err { color: var(--red); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th {
+    text-align: left; color: var(--muted); font-weight: 600; font-size: 11px;
+    text-transform: uppercase; letter-spacing: .5px; padding: 8px 10px;
+    border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg);
+  }
+  tbody td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tbody tr:hover { background: var(--panel); }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .num { font-variant-numeric: tabular-nums; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .tag {
+    display: inline-block; font: 11px var(--mono); padding: 1px 7px; border-radius: 999px;
+    border: 1px solid var(--border);
+  }
+  .tag.ok { color: var(--green); border-color: #1f4d33; background: #102018; }
+  .tag.fail { color: var(--red); border-color: #5a2630; background: #210f12; }
+  .tag.in { color: var(--accent); border-color: #1d3a59; background: #0f1b2a; }
+  .tag.out { color: var(--amber); border-color: #5a4a1f; background: #211c0f; }
+  .tag.l2l2 { color: #c89bff; border-color: #41306a; background: #170f25; }
+  .chip {
+    display: inline-block; font: 11px var(--mono); color: var(--muted);
+    background: var(--panel-2); border: 1px solid var(--border);
+    padding: 1px 6px; border-radius: 5px; margin: 1px 3px 1px 0;
+  }
+  .empty { color: var(--muted); padding: 30px; text-align: center; }
+  .hash { cursor: pointer; }
+  .link-btn {
+    background: transparent; color: var(--accent); border: 1px solid var(--border);
+    padding: 3px 9px; border-radius: 6px; font: 12px var(--mono); cursor: pointer; font-weight: 500;
+  }
+  .link-btn:hover { border-color: var(--accent); }
+  tr.detail td { background: #0d1119; padding: 12px 14px; }
+  .detail-chips { margin-bottom: 10px; }
+  .section-title {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--accent);
+    margin: 16px 0 6px; font-weight: 600;
+  }
+  .muted { color: var(--muted); }
+  /* Nested key/value + record tables in the decode panel */
+  table.kv { border-collapse: collapse; font: 11.5px/1.45 var(--mono); margin: 2px 0; }
+  table.kv th, table.kv td {
+    border: 1px solid var(--border); padding: 3px 8px; text-align: left;
+    vertical-align: top; background: var(--bg);
+  }
+  table.kv th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+  table.kv td { color: var(--text); }
+  table.kv .chip { margin: 1px 2px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>EEZ PostBatch Tracker</h1>
+    <div class="sub">L1 <code>BatchPosted</code> events on the EEZ registry</div>
+  </div>
+  <div class="spacer"></div>
+  <div class="pill">chain <b id="chainId">—</b></div>
+  <div class="pill">head <b id="head">—</b></div>
+  <div class="pill" id="autoPill">auto-refresh <b id="autoState">off</b></div>
+</header>
+
+<main>
+  <div class="config">
+    <label>L1 RPC URL
+      <input id="rpc" placeholder="http://host:port" />
+    </label>
+    <label>Registry address (EEZ)
+      <input id="registry" placeholder="0x..." />
+    </label>
+    <label>Deploy block
+      <input id="fromBlock" placeholder="0" />
+    </label>
+    <label>Chunk size (blocks)
+      <input id="chunk" value="2000" />
+    </label>
+    <label>Recent batches (Load)
+      <input id="recent" value="20" />
+    </label>
+    <div class="actions">
+      <button id="load">Load</button>
+      <button id="auto" class="ghost">Auto</button>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="n num" id="sBatches">—</div><div class="l">Batches</div></div>
+    <div class="stat"><div class="n num" id="sStateUpd">—</div><div class="l">State updates</div></div>
+    <div class="stat"><div class="n num" id="sExec">—</div><div class="l">Entries consumed</div></div>
+    <div class="stat"><div class="n num" id="sLast">—</div><div class="l">Last batch block</div></div>
+  </div>
+
+  <div id="status"></div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>L1 block</th>
+        <th>L2 blocks</th>
+        <th>Time</th>
+        <th>Tx</th>
+        <th>Submitter</th>
+        <th>Rollups</th>
+        <th>Status</th>
+        <th>Effects (same tx)</th>
+        <th>Batch payload</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="empty" class="empty" style="display:none">No batches found in range.</div>
+</main>
+
+<script type="module">
+import { ethers } from "https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.4/ethers.min.js";
+
+// ---- Defaults. serve.py fills registry/fromBlock from .env + deployments.env
+// (fetched from /config below) and rpc points at its same-origin "/rpc" CORS
+// proxy. These literals are only a fallback when /config isn't available. ----
+const DEFAULTS = {
+  rpc: "/rpc",
+  registry: "",
+  fromBlock: "0",
+  chunk: "2000",
+  recent: "20",
+};
+
+const ABI = [
+  "event BatchPosted(uint256 indexed rollupCount)",
+  "event StateUpdated(uint256 indexed rollupId, bytes32 newStateRoot)",
+  "event L2ExecutionPerformed(uint256 indexed rollupId, bytes32 newState)",
+  "event ExecutionConsumed(bytes32 indexed crossChainCallHash, uint256 indexed rollupId, uint256 indexed executionQueueIndex)",
+  "event L2TXExecuted(uint256 indexed rollupId, uint256 indexed executionQueueIndex)",
+  "event ImmediateEntrySkipped(uint256 indexed transientIdx, bytes revertData)",
+];
+const iface = new ethers.Interface(ABI);
+const BATCH_TOPIC = iface.getEvent("BatchPosted").topicHash;
+
+// Full contract ABI (served by serve.py from the Foundry artifact), used to
+// decode the postAndVerifyBatch calldata. Null until /abi is fetched.
+let txIface = null;
+let explorerBase = "";
+let l2rpcBase = ""; // L2 RPC (same-origin /l2rpc proxy) for resolving real L2 block numbers
+
+const $ = (id) => document.getElementById(id);
+const els = {};
+for (const id of ["rpc","registry","fromBlock","chunk","recent","chainId","head","autoState","load","auto",
+  "sBatches","sStateUpd","sExec","sLast","status","rows","empty"]) els[id] = $(id);
+
+// hydrate config: server /config (from .env + deployments.env) is the source of
+// truth; localStorage only holds manual edits the user made for that same
+// registry, so switching deployments doesn't get masked by stale values.
+const saved = JSON.parse(localStorage.getItem("eez-pbt") || "{}");
+async function hydrate() {
+  let serverCfg = {};
+  try { serverCfg = await (await fetch("/config")).json(); } catch { /* file:// or no server */ }
+  const useSaved = saved.registry && (!serverCfg.registry || saved.registry.toLowerCase() === serverCfg.registry.toLowerCase());
+  for (const k of ["rpc","registry","fromBlock","chunk","recent"]) {
+    els[k].value = (useSaved ? saved[k] : undefined) ?? serverCfg[k] ?? saved[k] ?? DEFAULTS[k];
+  }
+  explorerBase = (serverCfg.explorer || "").replace(/\/+$/, "");
+  l2rpcBase = serverCfg.l2rpc || "";
+  // Load the full ABI so we can decode postAndVerifyBatch calldata.
+  try {
+    const abi = await (await fetch("/abi")).json();
+    if (Array.isArray(abi) && abi.length) txIface = new ethers.Interface(abi);
+  } catch { /* decode just stays unavailable */ }
+}
+
+function saveCfg() {
+  localStorage.setItem("eez-pbt", JSON.stringify({
+    rpc: els.rpc.value, registry: els.registry.value,
+    fromBlock: els.fromBlock.value, chunk: els.chunk.value, recent: els.recent.value,
+  }));
+}
+
+function setStatus(msg, isErr=false) { els.status.textContent = msg; els.status.className = isErr ? "err" : ""; }
+const short = (h) => h.slice(0,10) + "…" + h.slice(-8);
+const copy = (t) => navigator.clipboard?.writeText(t);
+function fmtTime(ts) {
+  const d = new Date(ts*1000);
+  const ago = (Date.now()/1000 - ts);
+  let rel;
+  if (ago < 90) rel = Math.round(ago)+"s ago";
+  else if (ago < 5400) rel = Math.round(ago/60)+"m ago";
+  else if (ago < 129600) rel = Math.round(ago/3600)+"h ago";
+  else rel = Math.round(ago/86400)+"d ago";
+  return `<div>${d.toLocaleString()}</div><div style="color:var(--muted);font-size:11px">${rel}</div>`;
+}
+
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+const txUrl = (h) => explorerBase ? `${explorerBase}/tx/${h}` : null;
+const addrUrl = (a) => explorerBase ? `${explorerBase}/address/${a}` : null;
+
+// Render a hash either as an explorer link (if we have one) or a copy-on-click span.
+function hashCell(value, url) {
+  if (url) return `<a href="${url}" target="_blank" rel="noopener" title="open in explorer">${short(value)}</a>`;
+  return `<span class="hash" data-copy="${value}" title="click to copy">${short(value)}</span>`;
+}
+
+// BigInt-safe pretty JSON.
+const jsonStringify = (o) => JSON.stringify(o, (_k, v) => typeof v === "bigint" ? v.toString() : v, 2);
+
+// Walk a ParamType + decoded value into a plain object using POSITIONAL access.
+// ethers' Result.toObject() breaks on field names that collide with array
+// methods (e.g. "entries" → Array.prototype.entries), so we recurse by index.
+function plain(pt, v) {
+  if (pt.baseType === "array") {
+    const out = [];
+    for (let i = 0; i < v.length; i++) out.push(plain(pt.arrayChildren, v[i]));
+    return out;
+  }
+  if (pt.baseType === "tuple") {
+    const o = {};
+    pt.components.forEach((c, i) => { o[c.name || `_${i}`] = plain(c, v[i]); });
+    return o;
+  }
+  return v; // primitive (bigint / string / bool / address / bytes)
+}
+
+// Decode postAndVerifyBatch(ProofSystemBatchPerVerificationEntries) calldata.
+function decodeBatch(tx) {
+  if (!tx?.data || tx.data === "0x") return { error: "no calldata" };
+  if (!txIface) return { error: "ABI not loaded (decode unavailable)" };
+  let desc;
+  try { desc = txIface.parseTransaction({ data: tx.data, value: tx.value ?? 0n }); }
+  catch (e) { return { error: "could not decode: " + (e.shortMessage || e.message) }; }
+  if (!desc) return { error: "unknown function selector " + tx.data.slice(0, 10) };
+  const b = plain(desc.fragment.inputs[0], desc.args[0]); // the batch struct, as a plain object
+  const summary = {
+    fn: desc.name,
+    entries: b.entries?.length ?? 0,
+    transientExecutionEntryCount: String(b.transientExecutionEntryCount ?? ""),
+    l1ToL2lookupCalls: b.l1ToL2lookupCalls?.length ?? 0,
+    transientLookupCallCount: String(b.transientLookupCallCount ?? ""),
+    proofSystems: b.proofSystems ?? [],
+    rollupIds: (b.rollupIdsWithProofSystems ?? []).map((r) => String(r.rollupId)),
+    blockNumber: String(b.blockNumber ?? ""),
+    blobIndices: (b.blobIndices ?? []).map((x) => String(x)),
+    proofs: b.proofs?.length ?? 0,
+    callDataBytes: b.callData ? (b.callData.length - 2) / 2 : 0,
+  };
+  return { summary, batch: b };
+}
+
+// Cheap count of L2 blocks a batch covers (length of callData's blockTxCounts),
+// without parsing the transactions. Returns null if callData can't be decoded.
+function callDataBlockCount(hex) {
+  if (!hex || hex === "0x") return 0;
+  try { const rlp = ethers.decodeRlp("0x" + hex.slice(4)); return Array.isArray(rlp) && rlp[0] ? rlp[0].length : 0; }
+  catch { return null; }
+}
+
+// Reconstruct a byte string from an RLP "Vec<u8>" (alloy encodes it as a list
+// of single-byte integers, so ethers.decodeRlp yields an array of "0x.." bytes).
+const bytesFromRlpList = (a) => "0x" + a.map((e) => e === "0x" ? "00" : e.slice(2).padStart(2, "0")).join("");
+const rlpInt = (x) => x === "0x" ? 0 : parseInt(x, 16);
+
+// Light anchor for L2-block resolution: the first user tx's hash + which block
+// offset (within the batch) it sits in. Avoids the heavier full callData decode.
+function callDataAnchor(hex) {
+  if (!hex || hex === "0x") return null;
+  try {
+    const rlp = ethers.decodeRlp("0x" + hex.slice(4));
+    const counts = rlp[0] || [], txs = rlp[1] || [];
+    if (!txs.length) return null;
+    const firstOffset = counts.findIndex((c) => rlpInt(c) > 0);
+    const t = ethers.Transaction.from(bytesFromRlpList(txs[0]));
+    return { hash: t.hash, firstOffset: firstOffset < 0 ? 0 : firstOffset };
+  } catch { return null; }
+}
+
+// Resolve L2 block numbers for a set of tx hashes via the L2 node (one JSON-RPC
+// batch). Returns Map(hash -> L2 block number | null). Empty if no L2 RPC.
+async function l2TxBlocks(hashes) {
+  const map = new Map();
+  if (!l2rpcBase || !hashes.length) return map;
+  const url = l2rpcBase.startsWith("/") ? new URL(l2rpcBase, window.location.origin).href : l2rpcBase;
+  const body = hashes.map((h, i) => ({ jsonrpc: "2.0", id: i, method: "eth_getTransactionByHash", params: [h] }));
+  try {
+    const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const arr = await res.json();
+    for (const r of (Array.isArray(arr) ? arr : [])) {
+      const h = hashes[r.id];
+      map.set(h, r.result && r.result.blockNumber != null ? Number(r.result.blockNumber) : null);
+    }
+  } catch { /* L2 RPC unreachable — ranges just stay unresolved */ }
+  return map;
+}
+
+// Decode the batch's `callData` DA sidecar:  tag(0x00) ‖ RLP([blockTxCounts, transactions, l2Entries]).
+//   blockTxCounts: u16 per L2 block ‖ transactions: raw EIP-2718 signed txs ‖ l2Entries: ABI-encoded ExecutionEntry.
+function decodeCallData(hex) {
+  if (!hex || hex === "0x") return { note: "empty" };
+  const tag = hex.slice(2, 4);
+  let rlp;
+  try { rlp = ethers.decodeRlp("0x" + hex.slice(4)); }
+  catch (e) { return { error: "RLP decode failed: " + (e.shortMessage || e.message), tag }; }
+  if (!Array.isArray(rlp) || rlp.length < 3) return { error: "unexpected RLP shape", tag };
+
+  const blockTxCounts = rlp[0].map(rlpInt);
+  const transactions = rlp[1].map((rt) => {
+    const raw = bytesFromRlpList(rt);
+    try {
+      const t = ethers.Transaction.from(raw);
+      return { type: t.type, from: t.from, to: t.to, nonce: t.nonce, value: t.value, gasLimit: t.gasLimit, dataBytes: (t.data.length - 2) / 2, hash: t.hash };
+    } catch (e) { return { error: e.shortMessage || e.message, rawBytes: (raw.length - 2) / 2 }; }
+  });
+
+  // l2Entries are ABI-encoded ExecutionEntry — decode with the same ParamType the batch uses.
+  let entryPT = null;
+  try { entryPT = txIface.getFunction("postAndVerifyBatch").inputs[0].components.find((c) => c.name === "entries").arrayChildren; } catch {}
+  const coder = ethers.AbiCoder.defaultAbiCoder();
+  const l2Entries = rlp[2].map((re) => {
+    const raw = bytesFromRlpList(re);
+    if (!entryPT) return { rawBytes: (raw.length - 2) / 2, note: "ABI unavailable" };
+    try { return plain(entryPT, coder.decode([entryPT], raw)[0]); }
+    catch (e) { return { error: e.shortMessage || e.message, rawBytes: (raw.length - 2) / 2 }; }
+  });
+
+  return { tag, blockTxCounts, transactions, l2Entries };
+}
+
+// ---- Generic "pretty" renderer: turns any plain (BigInt-aware) value into nested HTML tables. ----
+const isHex = (s) => typeof s === "string" && /^0x[0-9a-fA-F]*$/.test(s);
+function renderScalar(v) {
+  if (v === null || v === undefined) return '<span class="muted">—</span>';
+  if (typeof v === "boolean") return `<span class="tag ${v ? 'ok' : 'fail'}">${v}</span>`;
+  if (typeof v === "bigint" || typeof v === "number") return `<span class="num mono">${v.toString()}</span>`;
+  if (isHex(v)) {
+    const bytes = (v.length - 2) / 2;
+    const disp = v.length > 22 ? short(v) : v;
+    return `<span class="hash mono" data-copy="${v}" title="${v} (${bytes}B) — click to copy">${disp}</span>`;
+  }
+  return esc(String(v));
+}
+function isPlainObj(v) { return v && typeof v === "object" && !Array.isArray(v) && typeof v !== "bigint"; }
+function renderValue(v) {
+  if (Array.isArray(v)) {
+    if (v.length === 0) return '<span class="muted">[ ] empty</span>';
+    if (v.every((x) => !isPlainObj(x) && !Array.isArray(x))) // array of scalars
+      return v.map((x) => `<span class="chip">${renderScalar(x)}</span>`).join(" ");
+    // array of objects → one table, columns = union of keys
+    const cols = [...new Set(v.flatMap((o) => isPlainObj(o) ? Object.keys(o) : ["value"]))];
+    const head = `<tr><th>#</th>${cols.map((c) => `<th>${esc(c)}</th>`).join("")}</tr>`;
+    const body = v.map((o, i) => {
+      const cells = cols.map((c) => `<td>${renderValue(isPlainObj(o) ? o[c] : (c === "value" ? o : undefined))}</td>`).join("");
+      return `<tr><td class="muted num">${i}</td>${cells}</tr>`;
+    }).join("");
+    return `<table class="kv">${head}${body}</table>`;
+  }
+  if (isPlainObj(v)) {
+    const rows = Object.entries(v).map(([k, val]) => `<tr><th>${esc(k)}</th><td>${renderValue(val)}</td></tr>`).join("");
+    return `<table class="kv">${rows}</table>`;
+  }
+  return renderScalar(v);
+}
+
+// ---- Cross-chain call extraction + direction classification. ----
+const ZERO32 = "0x" + "0".repeat(64);
+const rollupName = (r) => r === undefined || r === null ? "?" : (Number(r) === 0 ? "L1" : `L2#${Number(r)}`);
+function dirTag(src, dst) {
+  const s = src === undefined ? null : Number(src), d = dst === undefined ? null : Number(dst);
+  if (s === 0 && d !== 0) return { tag: "L1→L2", cls: "in" };
+  if (s !== 0 && d === 0) return { tag: "L2→L1", cls: "out" };
+  if (s !== 0 && d !== 0 && s !== d) return { tag: "L2→L2", cls: "l2l2" };
+  if (s === 0 && d === 0) return { tag: "L1→L1", cls: "" };
+  return { tag: "cross", cls: "" };
+}
+
+// Collect every cross-chain call with a resolved (source→destination) direction.
+//  - entries[i].l2ToL1Calls : calls executed ON L1 (destination = L1 / rollup 0).
+//  - entries[i] with proxyEntryHash != 0 : an inbound call DELIVERED to destinationRollupId;
+//    the call body lives only in the callData mirror (matched by proxyEntryHash).
+function crossChainCalls(batch, cd) {
+  const out = [];
+  const mirrors = (cd && cd.l2Entries) || [];
+  (batch.entries || []).forEach((e, ei) => {
+    (e.l2ToL1Calls || []).forEach((c, ci) => {
+      out.push({ src: c.sourceRollupId, dst: 0n, from: c.sourceAddress, to: c.targetAddress,
+        value: c.value, data: c.data, where: `entry[${ei}].l2ToL1Calls[${ci}]` });
+    });
+    if (e.proxyEntryHash && e.proxyEntryHash !== ZERO32) {
+      const m = mirrors.find((x) => x.proxyEntryHash === e.proxyEntryHash);
+      const c = m && m.l2ToL1Calls && m.l2ToL1Calls[0];
+      out.push({ src: c ? c.sourceRollupId : undefined, dst: e.destinationRollupId,
+        from: c ? c.sourceAddress : undefined, to: c ? c.targetAddress : undefined,
+        value: c ? c.value : undefined, data: c ? c.data : undefined,
+        proxyEntryHash: e.proxyEntryHash, where: `entry[${ei}] ⇒ callData.l2Entries mirror` });
+    }
+  });
+  return out;
+}
+function renderXChain(list) {
+  if (!list.length) return '<span class="muted">none</span>';
+  const rows = list.map((c) => {
+    const d = dirTag(c.src, c.dst);
+    const sel = c.data && c.data.length >= 10 ? c.data.slice(0, 10) : "—";
+    const dataCell = c.data
+      ? `<span class="mono hash" data-copy="${c.data}" title="${esc(c.data)}">${sel}</span> <span class="muted">(${(c.data.length - 2) / 2}B)</span>`
+      : '<span class="muted">(in mirror)</span>';
+    return `<tr>
+      <td><span class="tag ${d.cls}">${d.tag}</span></td>
+      <td>${c.from ? renderScalar(c.from) : '<span class="muted">?</span>'} <span class="muted">@${rollupName(c.src)}</span></td>
+      <td>${c.to ? renderScalar(c.to) : '<span class="muted">?</span>'} <span class="muted">@${rollupName(c.dst)}</span></td>
+      <td>${c.value !== undefined ? renderScalar(c.value) : '<span class="muted">—</span>'}</td>
+      <td>${dataCell}</td>
+      <td class="muted mono">${esc(c.where)}</td>
+    </tr>`;
+  }).join("");
+  return `<table class="kv"><tr><th>direction</th><th>from</th><th>to</th><th>value</th><th>data</th><th>source</th></tr>${rows}</table>`;
+}
+
+// Build the full expandable detail: summary chips + decoded callData + the batch struct.
+function renderDetail(dec) {
+  if (!dec.summary) return `<div class="detail-chips"><span class="chip" style="color:var(--amber)">${esc(dec.error)}</span></div>`;
+  const s = dec.summary;
+  const chips = [
+    `entries ${s.entries}`, `transient ${s.transientExecutionEntryCount}`,
+    s.l1ToL2lookupCalls ? `lookups ${s.l1ToL2lookupCalls}` : "",
+    `PS ${s.proofSystems.length}`, `rollups [${s.rollupIds.join(",")}]`,
+    `blk ${s.blockNumber}`, s.blobIndices.length ? `blobs [${s.blobIndices.join(",")}]` : "",
+    `calldata ${s.callDataBytes}B`,
+  ].filter(Boolean).map((t) => `<span class="chip">${esc(t)}</span>`).join("");
+
+  const cd = decodeCallData(dec.batch.callData);
+  let cdHtml;
+  if (cd.note === "empty") cdHtml = '<span class="muted">empty</span>';
+  else if (cd.error) cdHtml = `<span class="chip" style="color:var(--amber)">${esc(cd.error)}</span>`;
+  else {
+    // When the range is known (resolved via L2 node, or verified-inferred by
+    // contiguity), label blocks by real L2 number; otherwise by offset in the batch.
+    const known = dec.l2Range && (dec.l2Range.anchored || dec.l2Range.inferred);
+    const base = known ? dec.l2Range.start : null;
+    const how = dec.l2Range && dec.l2Range.anchored ? "resolved via L2 node" : "inferred by contiguity";
+    const nonEmptyCounts = cd.blockTxCounts
+      .map((n, i) => (base != null ? { "L2 block": base + i, txs: n } : { "offset in batch": i, txs: n }))
+      .filter((x) => x.txs > 0);
+    const rangeTxt = base != null
+      ? `L2 #${base}${cd.blockTxCounts.length > 1 ? `–#${base + cd.blockTxCounts.length - 1}` : ""} (${how})`
+      : `${cd.blockTxCounts.length} blocks · absolute L2 numbers need the L2 node`;
+    cdHtml = `
+      <table class="kv">
+        <tr><th>tag</th><td>${renderScalar("0x" + cd.tag)}</td></tr>
+        <tr><th>L2 blocks</th><td>${esc(rangeTxt)} · ${cd.transactions.length} user txs total</td></tr>
+        <tr><th>blocks with txs</th><td>${nonEmptyCounts.length ? renderValue(nonEmptyCounts) : '<span class="muted">all empty</span>'}</td></tr>
+        <tr><th>transactions</th><td>${renderValue(cd.transactions)}</td></tr>
+        <tr><th>l2Entries</th><td>${renderValue(cd.l2Entries)}</td></tr>
+      </table>`;
+  }
+
+  const xc = crossChainCalls(dec.batch, cd.error ? null : cd);
+  const xcCounts = xc.reduce((m, c) => { const t = dirTag(c.src, c.dst).tag; m[t] = (m[t] || 0) + 1; return m; }, {});
+  const xcLabel = Object.entries(xcCounts).map(([k, n]) => `${k} ×${n}`).join("  ") || "none";
+
+  return `
+    <div class="detail-chips">${chips}</div>
+    <div class="section-title">cross-chain calls — ${esc(xcLabel)}</div>
+    ${renderXChain(xc)}
+    <div class="section-title">callData — decoded DA payload</div>
+    ${cdHtml}
+    <div class="section-title">postAndVerifyBatch — full batch struct</div>
+    ${renderValue(dec.batch)}`;
+}
+
+let provider = null;
+let busy = false;
+
+function getProvider() {
+  let url = els.rpc.value.trim();
+  // ethers needs an absolute URL; resolve same-origin proxy paths like "/rpc".
+  if (url.startsWith("/")) url = new URL(url, window.location.origin).href;
+  return new ethers.JsonRpcProvider(url, undefined, { staticNetwork: true });
+}
+
+// Run `fn` over `items` with at most `limit` in flight at once. Preserves order.
+async function pmap(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
+async function getLogsChunked(addr, fromB, toB, chunk) {
+  const ranges = [];
+  for (let start = fromB; start <= toB; start += chunk) ranges.push([start, Math.min(start + chunk - 1, toB)]);
+  let done = 0;
+  const results = await pmap(ranges, 8, async ([start, end]) => {
+    const logs = await provider.getLogs({ address: addr, topics: [BATCH_TOPIC], fromBlock: start, toBlock: end });
+    setStatus(`Scanning blocks … (${++done}/${ranges.length} chunks)`);
+    return logs;
+  });
+  return results.flat();
+}
+
+// Decode the OTHER EEZ events that share the batch's transaction.
+function summarizeReceipt(receipt) {
+  const s = { stateUpdated: [], l2exec: 0, consumed: 0, l2tx: 0, skipped: 0 };
+  for (const log of receipt?.logs ?? []) {
+    if (log.address.toLowerCase() !== els.registry.value.trim().toLowerCase()) continue;
+    let p; try { p = iface.parseLog(log); } catch { continue; }
+    if (!p) continue;
+    switch (p.name) {
+      case "StateUpdated": s.stateUpdated.push(p.args.rollupId.toString()); break;
+      case "L2ExecutionPerformed": s.l2exec++; break;
+      case "ExecutionConsumed": s.consumed++; break;
+      case "L2TXExecuted": s.l2tx++; break;
+      case "ImmediateEntrySkipped": s.skipped++; break;
+    }
+  }
+  return s;
+}
+
+// Ordering key for batches: (L1 block, tx index, log index). s = +1 asc, -1 desc.
+const ordKey = (e) => [e.log.blockNumber, e.log.transactionIndex, e.log.index ?? e.log.logIndex ?? 0];
+const cmp = (a, b, s) => { const ka = ordKey(a), kb = ordKey(b); for (let i = 0; i < 3; i++) if (ka[i] !== kb[i]) return s * (ka[i] - kb[i]); return 0; };
+const logKey = (log) => `${log.blockNumber}:${log.transactionIndex}:${log.index ?? log.logIndex ?? 0}`;
+
+// Incremental state across refreshes.
+let scanCursor = null;            // highest L1 block already scanned (inclusive)
+const seenLogs = new Set();        // de-dup across the rescan boundary
+const allBatches = [];             // every batch ever scanned (for range fill + repaint)
+const totals = { batches: 0, stateUpd: 0, exec: 0, lastBlock: null };
+
+// Fill L2 ranges for batches BETWEEN two anchored batches by contiguity
+// (batch[i].start = batch[i-1].end + 1), but only when verified: the block counts
+// in the gap must exactly bridge the two anchors' L2 blocks (else a re-post sits in
+// between → leave unresolved). Anchored ranges are kept; inferred ones recomputed.
+function fillRanges(list) {
+  const asc = [...list].sort((a, b) => cmp(a, b, 1));
+  for (const e of asc) if (e.l2Range && !e.l2Range.anchored) e.l2Range = null; // reset inferred
+  for (let i = 0; i < asc.length; i++) {
+    if (!(asc[i].l2Range && asc[i].l2Range.anchored)) continue;
+    let j = i + 1;
+    while (j < asc.length && !(asc[j].l2Range && asc[j].l2Range.anchored)) j++;
+    if (j >= asc.length) break;
+    const A = asc[i], B = asc[j];
+    let sumBetween = 0, ok = true;
+    for (let k = i + 1; k < j; k++) { if (asc[k].blockCount == null) { ok = false; break; } sumBetween += asc[k].blockCount; }
+    if (!ok) continue;
+    if (B.l2Range.start === A.l2Range.end + 1 + sumBetween) { // consistent → fill the gap
+      let cur = A.l2Range.end + 1;
+      for (let k = i + 1; k < j; k++) { const n = asc[k].blockCount; asc[k].l2Range = { start: cur, end: cur + n - 1, inferred: true }; cur += n; }
+    }
+  }
+}
+
+// Render the L2-blocks cell for one batch (resolved / inferred / count-only).
+function l2CellHtml(e) {
+  if (e.blockCount == null) return '<span class="muted" title="callData could not be decoded">?</span>';
+  const r = e.l2Range;
+  const sub = `<div style="color:var(--muted);font-size:11px">${e.blockCount} blocks</div>`;
+  if (r && r.anchored) {
+    const txt = r.start === r.end ? `${r.start}` : `${r.start}–${r.end}`;
+    return `<span class="mono num" title="resolved via L2 node (anchored by a user tx)">${txt}</span>${sub}`;
+  }
+  if (r && r.inferred) {
+    const txt = r.start === r.end ? `${r.start}` : `${r.start}–${r.end}`;
+    return `<span class="mono num" style="color:var(--muted)" title="inferred by contiguity between two anchored batches (verified: gap counts match)">≈${txt}</span>${sub}`;
+  }
+  const why = l2rpcBase ? "no L2 tx anchor and not between two anchored batches" : "L2 RPC not configured";
+  return `<span class="mono num" title="L2 block count (exact); ${why}">${e.blockCount}</span>${sub}`;
+}
+
+// Repaint every L2 cell (cheap) after a fill; also refresh dec.l2Range for the detail panel.
+function paintL2(list) {
+  for (const e of list) { if (e.l2CellEl) e.l2CellEl.innerHTML = l2CellHtml(e); if (e.dec) e.dec.l2Range = e.l2Range; }
+}
+
+// Walk backwards from `head` in chunks until we've collected the newest `n`
+// BatchPosted logs (or run out of blocks). Avoids scanning the full history.
+async function recentLogs(addr, head, n, chunk, floor = 0) {
+  const out = [];
+  let end = head;
+  while (end >= floor && out.length < n) {
+    const start = Math.max(floor, end - chunk + 1);
+    setStatus(`Scanning recent blocks ${start.toLocaleString()}–${end.toLocaleString()} … (${out.length}/${n})`);
+    const logs = await provider.getLogs({ address: addr, topics: [BATCH_TOPIC], fromBlock: start, toBlock: end });
+    out.unshift(...logs);
+    end = start - 1;
+  }
+  return out.slice(-n); // newest n, in ascending block order
+}
+
+// Fetch + enrich + decode + L2-anchor a set of NEW batch logs.
+async function scanBatches(addr, logsRaw) {
+  const logs = logsRaw.filter((l) => !seenLogs.has(logKey(l)));
+  if (!logs.length) return [];
+  for (const l of logs) seenLogs.add(logKey(l));
+  setStatus(`Found ${logs.length} new batch(es). Fetching tx details…`);
+  let pendingFrom = Infinity; // lowest L1 block whose tx/receipt wasn't ready yet
+
+  const blockCache = new Map();
+  const blockTs = async (n) => {
+    if (!blockCache.has(n)) blockCache.set(n, (await provider.getBlock(n))?.timestamp ?? 0);
+    return blockCache.get(n);
+  };
+
+  let done = 0;
+  const enriched = await pmap(logs, 12, async (log) => {
+    const [tx, receipt, ts] = await Promise.all([
+      provider.getTransaction(log.transactionHash),
+      provider.getTransactionReceipt(log.transactionHash),
+      blockTs(log.blockNumber),
+    ]);
+    const parsed = iface.parseLog(log);
+    setStatus(`Fetching tx details … (${++done}/${logs.length})`);
+    return { log, tx, receipt, ts, rollupCount: parsed.args.rollupCount.toString() };
+  });
+
+  const all = [];
+  for (const e of enriched) {
+    // The tx/receipt may not be retrievable yet for a just-mined batch at the
+    // chain head (RPC race). Skip it for now and let a later scan pick it up,
+    // rather than caching an incomplete row that can never be reconciled.
+    if (!e.tx || !e.receipt) { seenLogs.delete(logKey(e.log)); pendingFrom = Math.min(pendingFrom, e.log.blockNumber); continue; }
+    e.summary = summarizeReceipt(e.receipt);
+    e.dec = decodeBatch(e.tx);
+    e.blockCount = e.dec.batch ? callDataBlockCount(e.dec.batch.callData) : null;
+    all.push(e);
+  }
+  all.pendingFrom = pendingFrom;
+
+  // Resolve real L2 block ranges via the L2 node by anchoring on each batch's first
+  // user tx (reset-proof): tx → its L2 block; range = [block - firstTxOffset, +count-1].
+  if (l2rpcBase) {
+    for (const e of all) e._anchor = e.dec.batch ? callDataAnchor(e.dec.batch.callData) : null;
+    const hashes = [...new Set(all.filter((e) => e._anchor).map((e) => e._anchor.hash))];
+    if (hashes.length) {
+      setStatus(`Resolving L2 blocks for ${hashes.length} anchored batch(es)…`);
+      const blockMap = await l2TxBlocks(hashes);
+      for (const e of all) {
+        const a = e._anchor; if (!a || e.blockCount == null) continue;
+        const b = blockMap.get(a.hash);
+        if (b != null) e.l2Range = { start: b - a.firstOffset, end: b - a.firstOffset + e.blockCount - 1, anchored: true };
+      }
+    }
+  }
+  return all;
+}
+
+// Build the <tr> + detail <tr> for one batch and tally its stats into `totals`.
+function buildRow(e) {
+  const summary = e.summary, dec = e.dec;
+  totals.stateUpd += summary.stateUpdated.length;
+  totals.exec += summary.consumed;
+  const ok = e.receipt ? e.receipt.status === 1 : null; // null = receipt not available yet (pending/head)
+
+  const effects = [];
+  if (summary.stateUpdated.length) effects.push(`<span class="chip">state×${summary.stateUpdated.length} [${[...new Set(summary.stateUpdated)].join(",")}]</span>`);
+  if (summary.consumed)  effects.push(`<span class="chip">consumed×${summary.consumed}</span>`);
+  if (summary.l2exec)    effects.push(`<span class="chip">l2exec×${summary.l2exec}</span>`);
+  if (summary.l2tx)      effects.push(`<span class="chip">l2tx×${summary.l2tx}</span>`);
+  if (summary.skipped)   effects.push(`<span class="chip" style="color:var(--amber)">skipped×${summary.skipped}</span>`);
+
+  if (dec.batch) {
+    let toL1 = 0, inbound = 0;
+    for (const en of dec.batch.entries) {
+      for (const c of (en.l2ToL1Calls || [])) if (Number(c.sourceRollupId) !== 0) toL1++;
+      if (en.proxyEntryHash && en.proxyEntryHash !== ZERO32) inbound++;
+    }
+    if (toL1) effects.push(`<span class="chip" style="color:var(--amber)">L2→L1 ×${toL1}</span>`);
+    if (inbound) effects.push(`<span class="chip" style="color:var(--accent)">→L2 ×${inbound}</span>`);
+  }
+  dec.l2Range = e.l2Range; // let the detail panel label callData blocks with real L2 numbers
+
+  const tr = document.createElement("tr");
+  tr.innerHTML = `
+    <td class="mono num">${e.log.blockNumber.toLocaleString()}</td>
+    <td>${l2CellHtml(e)}</td>
+    <td>${fmtTime(e.ts)}</td>
+    <td class="mono">${hashCell(e.log.transactionHash, txUrl(e.log.transactionHash))}</td>
+    <td class="mono">${e.tx?.from ? hashCell(e.tx.from, addrUrl(e.tx.from)) : "—"}</td>
+    <td class="mono num">${e.rollupCount}</td>
+    <td><span class="tag ${ok==null?'':(ok?'ok':'fail')}">${ok==null?'pending':(ok?'success':'reverted')}</span></td>
+    <td>${effects.join("") || '<span style="color:var(--muted)">—</span>'}</td>
+    <td><button class="link-btn toggle" type="button">▸ decode</button></td>`;
+  e.l2CellEl = tr.children[1]; // keep a handle so fillRanges/paintL2 can update it later
+
+  const detail = document.createElement("tr");
+  detail.className = "detail";
+  detail.style.display = "none";
+  const cell = document.createElement("td");
+  cell.colSpan = 9;
+  detail.appendChild(cell);
+
+  const btn = tr.querySelector(".toggle");
+  let built = false;
+  btn.onclick = () => {
+    if (!built) { cell.innerHTML = renderDetail(dec); built = true; }
+    const open = detail.style.display === "none";
+    detail.style.display = open ? "table-row" : "none";
+    btn.textContent = (open ? "▾" : "▸") + " decode";
+  };
+  return { tr, detail };
+}
+
+function refreshStats() {
+  els.sBatches.textContent = totals.batches.toLocaleString();
+  els.sStateUpd.textContent = totals.stateUpd.toLocaleString();
+  els.sExec.textContent = totals.exec.toLocaleString();
+  els.sLast.textContent = totals.lastBlock != null ? totals.lastBlock.toLocaleString() : "—";
+  els.empty.style.display = totals.batches ? "none" : "block";
+}
+
+// Full (re)load: clears the table and scans from the configured start block.
+async function load() { return run({ incremental: false }); }
+// Incremental: scans only blocks newer than the last scan and prepends them.
+async function refresh() { return run({ incremental: scanCursor != null }); }
+
+async function run({ incremental }) {
+  if (busy) return;
+  busy = true; els.load.disabled = true;
+  try {
+    provider = getProvider();
+    const net = await provider.getNetwork();
+    els.chainId.textContent = net.chainId.toString();
+    const head = await provider.getBlockNumber();
+    els.head.textContent = head.toLocaleString();
+
+    const addr = els.registry.value.trim();
+    const chunk = Math.max(1, parseInt(els.chunk.value || "2000", 10));
+
+    if (!incremental) {
+      saveCfg();
+      els.rows.innerHTML = ""; els.empty.style.display = "none";
+      seenLogs.clear(); scanCursor = null; allBatches.length = 0;
+      totals.batches = 0; totals.stateUpd = 0; totals.exec = 0; totals.lastBlock = null;
+    }
+
+    let logsRaw;
+    if (incremental) {
+      const fromB = scanCursor + 1;
+      if (fromB > head) { setStatus(`Up to date at block ${head.toLocaleString()}.`); return; }
+      logsRaw = await getLogsChunked(addr, fromB, head, chunk);
+    } else {
+      // Initial load: only the most recent N batches (cheap), not the whole history.
+      const n = Math.max(1, parseInt(els.recent?.value || "20", 10));
+      const floor = parseInt(els.fromBlock.value || "0", 10);
+      logsRaw = await recentLogs(addr, head, n, chunk, floor);
+    }
+
+    const all = await scanBatches(addr, logsRaw);
+    // Don't advance the cursor past any batch whose tx/receipt wasn't ready yet —
+    // the next scan re-reads from there and finalizes it once the RPC catches up.
+    scanCursor = Math.min(head, (all.pendingFrom ?? Infinity) - 1);
+
+    if (all.length) {
+      for (const e of all) allBatches.push(e);
+      // Render newest-first; prepend on incremental so new batches land on top.
+      const frag = document.createDocumentFragment();
+      for (const e of [...all].sort((a, b) => cmp(a, b, -1))) {
+        const { tr, detail } = buildRow(e);
+        frag.appendChild(tr); frag.appendChild(detail);
+      }
+      if (incremental) els.rows.insertBefore(frag, els.rows.firstChild);
+      else els.rows.appendChild(frag);
+
+      totals.batches += all.length;
+      totals.lastBlock = Math.max(totals.lastBlock ?? 0, ...all.map((e) => e.log.blockNumber));
+
+      // Fill verified contiguity ranges across ALL batches, then repaint cells —
+      // a newly-arrived anchor can resolve gaps among previously-rendered rows.
+      fillRanges(allBatches);
+      paintL2(allBatches);
+    }
+    refreshStats();
+    const when = new Date().toLocaleTimeString();
+    setStatus(all.length
+      ? `${incremental ? "+" : ""}${all.length} batch(es) ${incremental ? "added" : "loaded"} · ${totals.batches} total up to block ${head.toLocaleString()} · ${when}`
+      : `No new batches · ${totals.batches} total up to block ${head.toLocaleString()} · ${when}`);
+  } catch (err) {
+    console.error(err);
+    setStatus("Error: " + (err.shortMessage || err.message || String(err)), true);
+  } finally {
+    busy = false; els.load.disabled = false;
+  }
+}
+
+let autoTimer = null;
+function toggleAuto() {
+  if (autoTimer) {
+    clearInterval(autoTimer); autoTimer = null;
+    els.autoState.textContent = "off"; els.auto.textContent = "Auto";
+  } else {
+    autoTimer = setInterval(refresh, 5000);   // incremental poll every 5s
+    els.autoState.textContent = "5s"; els.auto.textContent = "Stop";
+    refresh();
+  }
+}
+
+// Delegated copy for hashes shown without an explorer link.
+els.rows.addEventListener("click", (ev) => {
+  const t = ev.target.closest("[data-copy]");
+  if (t) copy(t.getAttribute("data-copy"));
+});
+
+els.load.onclick = load;
+els.auto.onclick = toggleAuto;
+hydrate().then(load);
+</script>
+</body>
+</html>

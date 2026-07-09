@@ -25,12 +25,15 @@
 //! site in the committer are the next steps (prover-chain P1).
 
 use alloy_consensus::{BlockHeader, Header};
+use alloy_primitives::{B256, Bytes, U256, keccak256};
 use alloy_rpc_types_debug::ExecutionWitness;
 use reth_ethereum_primitives::{Block, EthPrimitives};
 use reth_evm::{ConfigureEvm, execute::Executor};
 use reth_primitives_traits::RecoveredBlock;
 use reth_revm::{database::StateProviderDatabase, witness::ExecutionWitnessRecord};
 use reth_storage_api::{HeaderProvider, StateProviderFactory};
+use reth_trie::{HashedPostState, HashedStorage};
+use std::collections::HashSet;
 use tracing::{debug, trace};
 // Re-exported so the prover-feed binary can pick a mode without depending on reth-trie.
 pub use reth_trie::ExecutionWitnessMode;
@@ -48,16 +51,25 @@ pub fn witness_mode_from_str(s: &str) -> eyre::Result<ExecutionWitnessMode> {
     }
 }
 
-/// Re-execute `block` on its parent state and produce its exact, minimal
-/// execution witness (trie nodes + contract codes + key preimages +
-/// ancestor headers).
+/// Re-execute `block` on its parent state and produce its execution witness
+/// (trie nodes + contract codes + key preimages + ancestor headers).
+///
+/// The endpoint witness is augmented with a removals-first closure over every
+/// touched storage slot. EEZ's prover recomputes intermediate per-transaction
+/// state roots, not only the final block root. A parent->final witness can be
+/// sufficient for whole-block stateless execution while still missing sibling
+/// nodes needed to collapse a storage trie after an intermediate deletion. The
+/// extra closure supplies those content-addressed nodes without changing the
+/// consumer: validators still compute roots independently and reject corrupted
+/// or unrelated nodes by hash mismatch.
 ///
 /// `provider` must expose the block's parent state. When the parent is an
 /// in-memory (not-yet-persisted) block, the memory-overlay provider folds
 /// the parent's `TrieInput` in internally — no manual `TrieInput` needed.
 ///
 /// The block's txs are executed exactly as committed, so the recorded
-/// access set is exact (never a superset).
+/// access set is exact; the removal-closure augmentation is intentionally a
+/// proof superset for intermediate roots.
 pub fn block_execution_witness<P, E>(
     provider: &P,
     evm_config: &E,
@@ -88,21 +100,93 @@ where
 
     // 2. Record the access set (cheap: cache walk, no trie).
     let record = ExecutionWitnessRecord::from_executed_state(&state, mode);
+    let (removal_state, removal_accounts, removal_slots) = touched_storage_removal_state(&record)?;
 
     // 3. One batched trie pass against the parent → trie nodes + headers.
     //    Re-open the parent provider (the first was consumed by the executor).
     let state_provider = provider.state_by_block_hash(parent_hash)?;
-    let witness =
+    let mut witness =
         record.into_execution_witness(state_provider.as_ref(), provider, block_number, mode)?;
+    let endpoint_state_nodes = witness.state.len();
+
+    // 4. EEZ-specific augmentation: ask reth's trie witness builder for the
+    //    removals-first witness of every touched storage slot. This triggers
+    //    reth's existing blinded-sibling proof requests for branch collapse
+    //    cases that are invisible in the final post-state witness.
+    let extra_state_nodes = if removal_slots == 0 {
+        0
+    } else {
+        let extra_state = state_provider.as_ref().witness(
+            Default::default(),
+            removal_state,
+            ExecutionWitnessMode::Legacy,
+        )?;
+        extend_unique_by_hash(&mut witness.state, extra_state)
+    };
 
     debug!(
         target: "eez::witness",
         block_number,
         state_nodes = witness.state.len(),
+        endpoint_state_nodes,
+        removal_accounts,
+        removal_slots,
+        extra_state_nodes,
         codes = witness.codes.len(),
         keys = witness.keys.len(),
         headers = witness.headers.len(),
-        "block_execution_witness: generated minimal witness",
+        "block_execution_witness: generated augmented witness",
     );
     Ok(witness)
+}
+
+fn touched_storage_removal_state(
+    record: &ExecutionWitnessRecord,
+) -> eyre::Result<(HashedPostState, usize, usize)> {
+    let mut state = HashedPostState::with_capacity(record.hashed_state.storages.len());
+    let mut account_count = 0usize;
+    let mut slot_count = 0usize;
+
+    for (&hashed_address, storage) in &record.hashed_state.storages {
+        if storage.storage.is_empty() {
+            continue;
+        }
+
+        let account = record
+            .hashed_state
+            .accounts
+            .get(&hashed_address)
+            .cloned()
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "execution witness record has storage changes for {hashed_address} \
+                     but no matching account entry"
+                )
+            })?;
+        state.accounts.insert(hashed_address, account);
+        account_count += 1;
+
+        let mut removals = HashedStorage::default();
+        for &hashed_slot in storage.storage.keys() {
+            removals.storage.insert(hashed_slot, U256::ZERO);
+            slot_count += 1;
+        }
+        state.storages.insert(hashed_address, removals);
+    }
+
+    Ok((state, account_count, slot_count))
+}
+
+fn extend_unique_by_hash(target: &mut Vec<Bytes>, extra: impl IntoIterator<Item = Bytes>) -> usize {
+    let mut seen: HashSet<B256> = target.iter().map(|node| keccak256(node)).collect();
+    let mut added = 0usize;
+
+    for node in extra {
+        if seen.insert(keccak256(&node)) {
+            target.push(node);
+            added += 1;
+        }
+    }
+
+    added
 }

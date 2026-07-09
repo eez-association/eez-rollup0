@@ -1,0 +1,881 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inbound Witness Root Cause Analysis</title>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --ink: #17202a;
+      --muted: #52606d;
+      --line: #d9dee5;
+      --accent: #0f766e;
+      --accent-2: #7c3aed;
+      --warn: #b45309;
+      --danger: #b91c1c;
+      --ok: #047857;
+      --code-bg: #101827;
+      --code-ink: #e5eef8;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 15px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    header {
+      background: #17202a;
+      color: #f8fafc;
+      padding: 36px 28px 30px;
+      border-bottom: 5px solid var(--accent);
+    }
+
+    header .wrap,
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: clamp(28px, 4vw, 44px);
+      line-height: 1.05;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      font-size: 22px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 22px 0 10px;
+      font-size: 16px;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0 0 12px;
+    }
+
+    main {
+      padding: 24px 18px 56px;
+    }
+
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 22px;
+      margin: 0 0 18px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+
+    .lede {
+      max-width: 940px;
+      color: #dbe7f3;
+      font-size: 17px;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 18px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid rgba(255, 255, 255, 0.28);
+      border-radius: 999px;
+      padding: 5px 10px;
+      color: #ecfeff;
+      background: rgba(255, 255, 255, 0.08);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .grid {
+      display: grid;
+      gap: 14px;
+    }
+
+    .grid.cols-2 {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .grid.cols-3 {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    @media (max-width: 820px) {
+      .grid.cols-2,
+      .grid.cols-3 {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .finding {
+      border-left: 4px solid var(--accent);
+      padding: 12px 14px;
+      background: #f0fdfa;
+      border-radius: 6px;
+    }
+
+    .finding.warn {
+      border-left-color: var(--warn);
+      background: #fff7ed;
+    }
+
+    .finding.danger {
+      border-left-color: var(--danger);
+      background: #fef2f2;
+    }
+
+    .finding strong {
+      display: block;
+      margin-bottom: 5px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0 0;
+      font-size: 14px;
+    }
+
+    th,
+    td {
+      border: 1px solid var(--line);
+      padding: 9px 10px;
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th {
+      background: #eef2f7;
+      color: #243244;
+      font-weight: 650;
+    }
+
+    code,
+    pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+    }
+
+    code {
+      background: #eef2f7;
+      padding: 1px 4px;
+      border-radius: 4px;
+    }
+
+    pre {
+      margin: 12px 0 0;
+      padding: 14px;
+      color: var(--code-ink);
+      background: var(--code-bg);
+      border-radius: 7px;
+      overflow-x: auto;
+      white-space: pre;
+    }
+
+    .diagram {
+      margin-top: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfe;
+      overflow: auto;
+    }
+
+    .diagram svg {
+      display: block;
+      width: 100%;
+      min-width: 760px;
+      height: auto;
+    }
+
+    .svg-title {
+      font: 700 16px system-ui, sans-serif;
+      fill: #17202a;
+    }
+
+    .svg-label {
+      font: 600 13px system-ui, sans-serif;
+      fill: #17202a;
+    }
+
+    .svg-small {
+      font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      fill: #3d4b5c;
+    }
+
+    .box {
+      fill: #ffffff;
+      stroke: #c9d2df;
+      stroke-width: 1.4;
+      rx: 8;
+    }
+
+    .box-accent {
+      fill: #ecfdf5;
+      stroke: #0f766e;
+    }
+
+    .box-warn {
+      fill: #fff7ed;
+      stroke: #b45309;
+    }
+
+    .box-danger {
+      fill: #fef2f2;
+      stroke: #b91c1c;
+    }
+
+    .box-violet {
+      fill: #f5f3ff;
+      stroke: #7c3aed;
+    }
+
+    .arrow {
+      stroke: #52606d;
+      stroke-width: 1.8;
+      marker-end: url(#arrow);
+      fill: none;
+    }
+
+    .arrow-danger {
+      stroke: #b91c1c;
+      stroke-width: 2.2;
+      marker-end: url(#arrow-danger);
+      fill: none;
+      stroke-dasharray: 6 5;
+    }
+
+    .arrow2 {
+      stroke: #52606d;
+      stroke-width: 1.8;
+      marker-end: url(#arrow2);
+      fill: none;
+    }
+
+    .arrow-danger2 {
+      stroke: #b91c1c;
+      stroke-width: 2.2;
+      marker-end: url(#arrow-danger2);
+      fill: none;
+      stroke-dasharray: 6 5;
+    }
+
+    .arrow3 {
+      stroke: #52606d;
+      stroke-width: 1.8;
+      marker-end: url(#arrow3);
+      fill: none;
+    }
+
+    .tag {
+      display: inline-block;
+      border-radius: 5px;
+      padding: 2px 6px;
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .tag.ok {
+      color: #065f46;
+      background: #d1fae5;
+    }
+
+    .tag.warn {
+      color: #92400e;
+      background: #ffedd5;
+    }
+
+    .tag.danger {
+      color: #991b1b;
+      background: #fee2e2;
+    }
+
+    .note {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    ul {
+      margin: 8px 0 0 20px;
+      padding: 0;
+    }
+
+    li {
+      margin: 5px 0;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <h1>Inbound Witness Root Cause Analysis</h1>
+      <p class="lede">
+        Evidence report for the native validation failure observed on the
+        <code>edu/latest-plus-fixes</code> deployment while testing inbound
+        cross-chain calls. The core finding is that a block-level endpoint
+        witness is insufficient for proving intermediate per-transaction
+        state roots.
+      </p>
+      <div class="meta">
+        <span class="pill">Branch: edu/latest-plus-fixes</span>
+        <span class="pill">Port baseline: feat/crosschain-on-main</span>
+        <span class="pill">Failure block: 44190</span>
+        <span class="pill">Date: 2026-07-08</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section>
+      <h2>Conclusion</h2>
+      <div class="grid cols-3">
+        <div class="finding">
+          <strong>Root cause established</strong>
+          The witness proves the parent root to the final block root. The
+          validator also needs roots after individual cross-chain transactions.
+          Those intermediate trie transitions can require nodes that are not
+          present in the final endpoint witness.
+        </div>
+        <div class="finding warn">
+          <strong>Failure trigger established</strong>
+          In block <code>44190</code>, transaction 2 deletes a persistent
+          <code>executions</code> storage slot and transaction 3 recreates it.
+          The final witness does not include the child node needed for the
+          intermediate delete/collapse root.
+        </div>
+        <div class="finding danger">
+          <strong>Patch requirement</strong>
+          We must keep per-crosschain state roots. The safe direction is an
+          augmented witness that includes trie proofs for each required
+          transaction boundary, while the prover still computes the roots.
+        </div>
+      </div>
+
+      <div class="diagram" aria-label="Current validation pipeline diagram">
+        <svg viewBox="0 0 1040 330" role="img">
+          <defs>
+            <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L0,6 L9,3 z" fill="#52606d"></path>
+            </marker>
+            <marker id="arrow-danger" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L0,6 L9,3 z" fill="#b91c1c"></path>
+            </marker>
+          </defs>
+          <text x="28" y="34" class="svg-title">Current path and exact failure point</text>
+
+          <rect x="34" y="72" width="160" height="74" class="box box-accent"></rect>
+          <text x="54" y="100" class="svg-label">L2 block 44190</text>
+          <text x="54" y="122" class="svg-small">3 inbound txs</text>
+
+          <path d="M194 109 H256" class="arrow"></path>
+
+          <rect x="260" y="72" width="190" height="74" class="box"></rect>
+          <text x="282" y="99" class="svg-label">Reth witness</text>
+          <text x="282" y="121" class="svg-small">parent root -> final root</text>
+
+          <path d="M450 109 H512" class="arrow"></path>
+
+          <rect x="516" y="72" width="190" height="74" class="box box-accent"></rect>
+          <text x="538" y="99" class="svg-label">Final-root probe</text>
+          <text x="538" y="121" class="svg-small">native-validate: OK</text>
+
+          <path d="M611 146 V196" class="arrow"></path>
+
+          <rect x="504" y="198" width="216" height="76" class="box box-danger"></rect>
+          <text x="526" y="226" class="svg-label">Pair-root validation</text>
+          <text x="526" y="248" class="svg-small">fails at intermediate root</text>
+
+          <path d="M720 236 H780" class="arrow-danger"></path>
+
+          <rect x="784" y="198" width="220" height="76" class="box box-danger"></rect>
+          <text x="806" y="226" class="svg-label">MPT unresolved node</text>
+          <text x="806" y="248" class="svg-small">missing hash 0x2728...</text>
+        </svg>
+      </div>
+    </section>
+
+    <section>
+      <h2>Observed Failure</h2>
+      <table>
+        <tr>
+          <th>Field</th>
+          <th>Value</th>
+        </tr>
+        <tr>
+          <td>Block number</td>
+          <td><code>44190</code> (<code>0xac9e</code>)</td>
+        </tr>
+        <tr>
+          <td>Block hash</td>
+          <td><code>0xed5ca947ceaf2bdf6b66af84109241f4de0765cdfaa0e3223a96af33ba600a2e</code></td>
+        </tr>
+        <tr>
+          <td>Inputs staged</td>
+          <td>
+            <code>/tmp/eez-failing-44190/l2-chainconfig.json</code><br>
+            <code>/tmp/eez-failing-44190/block-44190.rlp</code><br>
+            <code>/tmp/eez-failing-44190/witness-44190.json</code>
+          </td>
+        </tr>
+        <tr>
+          <td>Native validator result</td>
+          <td>Final-root-only validation passes. Pair-root validation fails with <code>MPT: Unresolved node access</code>.</td>
+        </tr>
+      </table>
+
+      <pre>/home/edu/.cache/zisk-swap-build/target/release/native-validate \
+  /tmp/eez-failing-44190/l2-chainconfig.json \
+  /tmp/eez-failing-44190/block-44190.rlp \
+  /tmp/eez-failing-44190/witness-44190.json
+
+chain_id = 1
+  [PROBE] final-root-only validation: OK (block_hash 0xed5c...)
+thread 'main' (2) panicked at .../zeth-mpt/src/mpt/node.rs:260:44:
+MPT: Unresolved node access</pre>
+
+      <h3>Transactions in the Failing Block</h3>
+      <table>
+        <tr>
+          <th>Index</th>
+          <th>Transaction hash</th>
+          <th>Target</th>
+          <th>Selector</th>
+        </tr>
+        <tr>
+          <td>1</td>
+          <td><code>0xce5ce0a85165b163729ce662c0d78f8db4697348f44fcb5d51aab651ccd351b0</code></td>
+          <td><code>0x4200000000000000000000000000000000000007</code></td>
+          <td><code>0xeb494246</code></td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td><code>0xcc8e24684cb1ba45e3111a34d3c0da6f93d57d75eb84f6bab1a1ce48f9533de2</code></td>
+          <td><code>0x4200000000000000000000000000000000000007</code></td>
+          <td><code>0xeb494246</code></td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td><code>0x3db2ae4015d7043f7d41b5c7726b2471c1ecb8ea6db4fec12fadfcf3368248f9</code></td>
+          <td><code>0x4200000000000000000000000000000000000007</code></td>
+          <td><code>0xeb494246</code></td>
+        </tr>
+      </table>
+      <p class="note">The selector is <code>executeIncomingCrossChainCall</code>.</p>
+    </section>
+
+    <section>
+      <h2>Contract Storage Evidence</h2>
+      <p>
+        The failing path is persistent contract storage, not transient storage.
+        <code>EEZL2.sol</code> reloads the execution table during each inbound
+        call by deleting and repopulating persistent arrays.
+      </p>
+
+      <pre>sync-rollups-protocol/src/L2/EEZL2.sol
+
+33: ExecutionEntry[] public executions;
+37: LookupCall[] public lookupCalls;
+40: uint256 public lastLoadBlock;
+43: uint256 public executionIndex;
+
+148: function _loadExecutionTable(...) internal {
+149:     delete executions;
+150:     delete lookupCalls;
+151:     executionIndex = 0;
+154:     executions.push(entries[i]);
+157:     lookupCalls.push(_lookupCalls[i]);
+159:     lastLoadBlock = block.number;
+}
+
+227: function executeIncomingCrossChainCall(...) external payable onlySystemAddress
+250:     _loadExecutionTable(entries, _lookupCalls);</pre>
+
+      <p>
+        Local storage layout documentation confirms <code>executions</code> is
+        at slot <code>1</code>, followed by <code>lookupCalls</code>,
+        <code>lastLoadBlock</code>, and <code>executionIndex</code>.
+      </p>
+
+      <pre>crates/eez-evm/src/authorized_proxies.rs
+
+15: L2 `EEZL2.sol` storage:
+16: `authorizedProxies` (0), `executions` (1),
+17: `lookupCalls` (2), `lastLoadBlock` (3), `executionIndex` (4).</pre>
+
+      <table>
+        <tr>
+          <th>Computed key</th>
+          <th>Meaning</th>
+        </tr>
+        <tr>
+          <td><code>keccak256(slot 1) = 0xb10e2d527612073b26eecdfd717e6a320cf44b4afac2b0732d9fcbe2b7fa0cf6</code></td>
+          <td>Base storage key for the dynamic <code>executions</code> array.</td>
+        </tr>
+        <tr>
+          <td><code>0xb10e2d527612073b26eecdfd717e6a320cf44b4afac2b0732d9fcbe2b7fa0cfb</code></td>
+          <td>Array element storage within <code>executions</code> (<code>base + 5</code>).</td>
+        </tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>Transaction-Level State Change</h2>
+      <p>
+        RPC traces showed real persistent <code>SSTORE</code> operations on the
+        failing slot. There are transient opcodes in the transactions, but the
+        unresolved trie path is tied to persistent storage.
+      </p>
+
+      <table>
+        <tr>
+          <th>Tx</th>
+          <th>Slot <code>0xb10e...0cfb</code></th>
+          <th>Slot <code>0xb10e...0cf6</code></th>
+          <th>Evidence</th>
+        </tr>
+        <tr>
+          <td>1</td>
+          <td>Absent before and after</td>
+          <td><code>0x5c4a...</code> to <code>0x3631...</code></td>
+          <td><code>debug_traceTransaction</code> prestate diff</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td><code>0x...81</code> before, absent after</td>
+          <td><code>0x3631...</code> to <code>0x4a5a...</code></td>
+          <td><code>SSTORE key 0xb10e...0cfb value 0x0</code></td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>Absent before, <code>0x...81</code> after</td>
+          <td><code>0x4a5a...</code> to <code>0xb780...</code></td>
+          <td><code>SSTORE key 0xb10e...0cfb value 0x81</code></td>
+        </tr>
+      </table>
+
+      <div class="diagram" aria-label="Intermediate root schema">
+        <svg viewBox="0 0 1040 360" role="img">
+          <defs>
+            <marker id="arrow2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L0,6 L9,3 z" fill="#52606d"></path>
+            </marker>
+            <marker id="arrow-danger2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L0,6 L9,3 z" fill="#b91c1c"></path>
+            </marker>
+          </defs>
+          <text x="28" y="34" class="svg-title">State-root schema for block 44190</text>
+
+          <rect x="40" y="86" width="116" height="62" class="box"></rect>
+          <text x="72" y="112" class="svg-label">R0</text>
+          <text x="60" y="132" class="svg-small">parent</text>
+
+          <path d="M156 117 H234" class="arrow2"></path>
+          <rect x="238" y="86" width="116" height="62" class="box box-accent"></rect>
+          <text x="270" y="112" class="svg-label">R1</text>
+          <text x="250" y="132" class="svg-small">after tx1</text>
+
+          <path d="M354 117 H432" class="arrow2"></path>
+          <rect x="436" y="86" width="116" height="62" class="box box-danger"></rect>
+          <text x="468" y="112" class="svg-label">R2</text>
+          <text x="448" y="132" class="svg-small">after tx2</text>
+
+          <path d="M552 117 H630" class="arrow2"></path>
+          <rect x="634" y="86" width="116" height="62" class="box box-accent"></rect>
+          <text x="666" y="112" class="svg-label">R3</text>
+          <text x="646" y="132" class="svg-small">after tx3</text>
+
+          <path d="M98 164 C180 250, 590 250, 692 164" class="arrow2"></path>
+          <text x="304" y="255" class="svg-label">endpoint witness proves R0 -> R3</text>
+
+          <path d="M494 148 V220" class="arrow-danger2"></path>
+          <rect x="374" y="222" width="240" height="74" class="box box-danger"></rect>
+          <text x="396" y="250" class="svg-label">Missing intermediate proof</text>
+          <text x="396" y="272" class="svg-small">delete/collapse needs node 0x2728...</text>
+        </svg>
+      </div>
+    </section>
+
+    <section>
+      <h2>Witness Evidence</h2>
+      <p>
+        The captured witness contains the relevant account and storage keys,
+        but it does not contain every trie node required to recompute the
+        intermediate delete/collapse root.
+      </p>
+
+      <table>
+        <tr>
+          <th>Witness component</th>
+          <th>Count</th>
+        </tr>
+        <tr>
+          <td><code>state</code></td>
+          <td><code>61</code></td>
+        </tr>
+        <tr>
+          <td><code>keys</code></td>
+          <td><code>35</code></td>
+        </tr>
+        <tr>
+          <td><code>codes</code></td>
+          <td><code>5</code></td>
+        </tr>
+        <tr>
+          <td><code>headers</code></td>
+          <td><code>1</code></td>
+        </tr>
+      </table>
+
+      <pre>Witness key preimages include:
+0x4200000000000000000000000000000000000007
+0xb10e2d527612073b26eecdfd717e6a320cf44b4afac2b0732d9fcbe2b7fa0cfb
+0xb10e2d527612073b26eecdfd717e6a320cf44b4afac2b0732d9fcbe2b7fa0cf6
+
+keccak(0x4200000000000000000000000000000000000007)
+  = 0x8164e714b6c7193e564d082ec2a5f0644e6d7eeca16c5a25cc19c8de3928b19c
+
+keccak(0xb10e...0cfb)
+  = 0xdc87d541e7563f7326faaad804b757103e4778479268dcf2932ef7d4addff3d5
+
+keccak(0xb10e...0cf6)
+  = 0xb5d9d894133a730aa651ef62d26b0ffa846233c74177a591a4a896adfda97d22</pre>
+
+      <h3>Missing Node Preimage</h3>
+      <p>
+        Witness state node index <code>31</code> references child digest
+        <code>0x2728f1ab4cb000e1b855b6cc5b4ca1f3e7b9751fc3996144c1bf5f224bf6aee5</code>.
+        Hashing every returned <code>state[]</code> node finds the parent node
+        hash, but not the child digest. That is the concrete missing preimage.
+      </p>
+
+      <pre>state[31] references:
+0x2728f1ab4cb000e1b855b6cc5b4ca1f3e7b9751fc3996144c1bf5f224bf6aee5
+
+keccak(state[31])
+  = 0x9e59ea78022cee337cae45fa3d72a7d7e6931482509eed7ef4748060e2af04f8
+
+Hashing every state[] node:
+  found     0x9e59ea78022cee337cae45fa3d72a7d7e6931482509eed7ef4748060e2af04f8
+  not found 0x2728f1ab4cb000e1b855b6cc5b4ca1f3e7b9751fc3996144c1bf5f224bf6aee5</pre>
+    </section>
+
+    <section>
+      <h2>What Was Ruled Out</h2>
+      <div class="grid cols-2">
+        <div class="finding">
+          <strong>Not a malformed captured witness</strong>
+          Regenerating the block witness through reth produced the same class
+          of result: enough for the endpoint root, insufficient for the
+          intermediate root.
+        </div>
+        <div class="finding">
+          <strong>Not Legacy vs Canonical alone</strong>
+          Legacy returned <code>state=61 keys=35 codes=5 headers=1</code>.
+          Canonical returned <code>state=60 keys=35 codes=4 headers=1</code>.
+          Neither included the <code>0x2728...</code> node preimage.
+        </div>
+        <div class="finding">
+          <strong>Not missing key preimages</strong>
+          The witness contains the account and storage key preimages that map
+          to the affected path.
+        </div>
+        <div class="finding">
+          <strong>Not an EIP-1153 transient-root issue</strong>
+          The failing trace is persistent <code>SSTORE</code> on the
+          <code>executions</code> array path. Transient opcodes are present but
+          are not the unresolved trie node.
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Code Path Evidence</h2>
+      <p>
+        The live node currently builds and publishes a single per-block
+        execution witness using the same endpoint-witness model as reth's
+        <code>debug_executionWitness</code>.
+      </p>
+
+      <pre>crates/eez-driver/src/witness.rs
+
+61: pub fn block_execution_witness(...)
+86: executor.execute_one(block)?;
+90: let record = ExecutionWitnessRecord::from_executed_state(&state, mode);
+96: record.into_execution_witness(state_provider.as_ref(), provider, block_number, mode)?;
+
+crates/eez-node/src/main.rs
+
+1104: ExecutionWitnessMode::Legacy
+1108: eez_driver::witness::block_execution_witness(...)</pre>
+
+      <p>
+        Proverd durable backfill still asks the L2 RPC for
+        <code>debug_executionWitness</code>. If live publication is fixed but
+        backfill remains endpoint-only, a backfilled inbound block can still
+        fail pair-root validation.
+      </p>
+
+      <pre>crates/eez-proverd/src/main.rs
+
+405: debug_executionWitness(n) -> the block's minimal execution witness
+438: client.request("debug_executionWitness", (block_hex.clone(),))</pre>
+    </section>
+
+    <section>
+      <h2>Branch Comparison</h2>
+      <p>
+        The available evidence does not show that
+        <code>feat/crosschain-on-main</code> is immune to this failure. The
+        ZisK pins are the same, and the failure is in the witness contract
+        required by pair-root validation, not in a branch-local formatting
+        difference.
+      </p>
+
+      <table>
+        <tr>
+          <th>Area</th>
+          <th>feat/crosschain-on-main</th>
+          <th>edu/latest-plus-fixes</th>
+          <th>Impact</th>
+        </tr>
+        <tr>
+          <td>ZisK commits in <code>Dockerfile.proverd</code></td>
+          <td><code>ZISK_COMMIT=a2dd9ac...</code><br><code>ZISK_PATCH_COMMIT=14fa346...</code></td>
+          <td>Same commits</td>
+          <td>Same validator behavior expected for this witness shape.</td>
+        </tr>
+        <tr>
+          <td>Witness mode</td>
+          <td>Canonical in the old node feed path</td>
+          <td>Legacy by default unless <code>EEZ_WITNESS_MODE=canonical</code></td>
+          <td>Both regenerated modes missed the required intermediate node.</td>
+        </tr>
+        <tr>
+          <td>Composer-driven prover path</td>
+          <td>Gated behind <code>EEZ_COMPOSER_DRIVEN</code>, default off</td>
+          <td>Prover dispatch active when a posted ledger exists; proverd composer-driven mode always on</td>
+          <td>Current branch more directly exercises this real prover path.</td>
+        </tr>
+      </table>
+
+      <p class="note">
+        Not established: a direct reproduction on <code>feat/crosschain-on-main</code>
+        with the same multi-inbound delete/recreate block pattern has not been
+        run yet.
+      </p>
+    </section>
+
+    <section>
+      <h2>Recommended Fix Direction</h2>
+      <p>
+        Keep per-crosschain roots as a prover-computed invariant. Do not trust
+        composer-supplied roots and do not remove intermediate validation. The
+        fix should make the witness large enough to prove every required
+        transaction boundary.
+      </p>
+
+      <div class="diagram" aria-label="Augmented witness schema">
+        <svg viewBox="0 0 1040 390" role="img">
+          <defs>
+            <marker id="arrow3" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L0,6 L9,3 z" fill="#52606d"></path>
+            </marker>
+          </defs>
+          <text x="28" y="34" class="svg-title">Augmented witness schema</text>
+
+          <rect x="42" y="72" width="170" height="74" class="box"></rect>
+          <text x="64" y="100" class="svg-label">Re-execute block</text>
+          <text x="64" y="122" class="svg-small">tx by tx on parent</text>
+
+          <path d="M212 109 H272" class="arrow3"></path>
+
+          <rect x="276" y="72" width="178" height="74" class="box box-violet"></rect>
+          <text x="296" y="100" class="svg-label">Boundary states</text>
+          <text x="296" y="122" class="svg-small">R1, R2, R3 ...</text>
+
+          <path d="M454 109 H514" class="arrow3"></path>
+
+          <rect x="518" y="72" width="198" height="74" class="box box-accent"></rect>
+          <text x="540" y="100" class="svg-label">Trie witnesses</text>
+          <text x="540" y="122" class="svg-small">for each required root</text>
+
+          <path d="M716 109 H776" class="arrow3"></path>
+
+          <rect x="780" y="72" width="210" height="74" class="box box-accent"></rect>
+          <text x="802" y="100" class="svg-label">Union + dedup</text>
+          <text x="802" y="122" class="svg-small">state, keys, codes, headers</text>
+
+          <rect x="120" y="214" width="230" height="84" class="box box-accent"></rect>
+          <text x="142" y="242" class="svg-label">Prover input unchanged</text>
+          <text x="142" y="264" class="svg-small">same block RLP</text>
+          <text x="142" y="284" class="svg-small">same ExecutionWitness shape</text>
+
+          <path d="M780 146 C735 206, 475 206, 350 256" class="arrow3"></path>
+
+          <rect x="424" y="214" width="240" height="84" class="box box-accent"></rect>
+          <text x="446" y="242" class="svg-label">Native validator</text>
+          <text x="446" y="264" class="svg-small">computes final root</text>
+          <text x="446" y="284" class="svg-small">computes boundary roots</text>
+
+          <path d="M350 256 H424" class="arrow3"></path>
+
+          <rect x="738" y="214" width="238" height="84" class="box box-accent"></rect>
+          <text x="760" y="242" class="svg-label">Soundness property</text>
+          <text x="760" y="264" class="svg-small">extra nodes are hash-bound</text>
+          <text x="760" y="284" class="svg-small">wrong extras fail or are ignored</text>
+
+          <path d="M664 256 H738" class="arrow3"></path>
+        </svg>
+      </div>
+
+      <h3>Implementation Shape To Validate</h3>
+      <ul>
+        <li>Re-execute the block transaction by transaction on the parent state.</li>
+        <li>After each transaction that must have a proven root, merge cumulative transitions.</li>
+        <li>Build a trie witness for that cumulative <code>HashedPostState</code> against the same parent root.</li>
+        <li>Union and deduplicate trie nodes, codes, keys, and headers into one augmented <code>ExecutionWitness</code>.</li>
+        <li>Publish the augmented witness from the live node feed.</li>
+        <li>Update proverd durable backfill so it cannot fetch only the endpoint witness from <code>debug_executionWitness</code>.</li>
+      </ul>
+
+      <h3>First Proof Before Wiring</h3>
+      <p>
+        Build a one-off augmented witness for block <code>44190</code> and run
+        the current <code>native-validate</code> binary unchanged. Passing this
+        test would prove the witness-contract fix for the observed failure
+        before changing the production flow.
+      </p>
+    </section>
+
+    <section>
+      <h2>Open Items</h2>
+      <ul>
+        <li>The exact struct member represented by <code>executions[base + 5]</code> was not decoded. It is not needed for the root-cause conclusion.</li>
+        <li>The direct same-pattern reproduction on <code>feat/crosschain-on-main</code> has not been run.</li>
+        <li>The performance cost of proving every transaction boundary versus only crosschain boundary transactions has not been measured.</li>
+        <li>The durable backfill API design is still open: either expose an EEZ-specific augmented witness endpoint or make proverd reconstruct the augmented witness locally.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>
