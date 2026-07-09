@@ -35,9 +35,10 @@ L2_P2P_PORT = 30640
 L1_XCHAIN_PORT = 18999
 L2_XCHAIN_PORT = 18998
 
-# rbuilder's bundle endpoint ("rbuilder-rpc") is 8645 inside the enclave — the
-# EL range, not the standard 8545 JSON-RPC.
-RBUILDER_RPC_PORT = 8645
+# Use the normal EL JSON-RPC port. rbuilder enables the flashbots API on 8545.
+# The 8645 rbuilder-rpc port accepts calls but bundles are not entering the
+# builder order pool.
+BUILDER_FLASHBOTS_RPC_PORT = 8545
 
 # mev-relay API HTTP port inside the enclave.
 MEV_RELAY_API_PORT = 9062
@@ -96,7 +97,7 @@ def run(plan, args):
         if builder_el == None:
             fail("no rbuilder participant found (service name containing 'builder'); " +
                  "set eez.builder_rpc_url explicitly")
-        builder_rpc = "http://{}:{}".format(builder_el.dns_name, RBUILDER_RPC_PORT)
+        builder_rpc = "http://{}:{}".format(builder_el.dns_name, BUILDER_FLASHBOTS_RPC_PORT)
 
     relay_rpc = eez.get("relay_url", "")
     if relay_rpc == "":
