@@ -582,24 +582,12 @@ pub async fn wait_for_l2_rpc(rpc_url: &str, timeout: Duration) -> Result<()> {
 
 /// Read the `stateRoot` of the latest `safe` block on the L2 at `rpc_url`.
 /// Returns `Ok(None)` while the L2 hasn't yet adopted any safe block
-/// (genesis L1 derivation pending). Used by the multi-composer reorg
-/// test to verify both composers settle on the same canonical L2 head.
+/// (genesis L1 derivation pending).
 pub async fn safe_block_state_root(rpc_url: &str) -> Result<Option<B256>> {
     use alloy_rpc_types_eth::BlockNumberOrTag;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let block = provider.get_block_by_number(BlockNumberOrTag::Safe).await?;
     Ok(block.map(|b| b.header.state_root))
-}
-
-/// Block number at a named tag (`latest`, `safe`, `finalized`, …).
-/// `None` when no block exists at that tag yet.
-pub async fn block_number_at(
-    rpc_url: &str,
-    tag: alloy_rpc_types_eth::BlockNumberOrTag,
-) -> Result<Option<u64>> {
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let block = provider.get_block_by_number(tag).await?;
-    Ok(block.map(|b| b.header.number))
 }
 
 /// Block number and hash at a named tag (`latest`, `safe`, `finalized`, …).
@@ -611,6 +599,17 @@ pub async fn block_number_and_hash_at(
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let block = provider.get_block_by_number(tag).await?;
     Ok(block.map(|b| (b.header.number, b.header.hash)))
+}
+
+/// Block number, hash, and state root at a named tag.
+/// `None` when no block exists at that tag yet.
+pub async fn block_number_hash_state_root_at(
+    rpc_url: &str,
+    tag: alloy_rpc_types_eth::BlockNumberOrTag,
+) -> Result<Option<(u64, B256, B256)>> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let block = provider.get_block_by_number(tag).await?;
+    Ok(block.map(|b| (b.header.number, b.header.hash, b.header.state_root)))
 }
 
 /// Deploy `EEZ` + `MockECDSAProofSystem` + `Rollup`, then register the rollup.
@@ -1219,31 +1218,6 @@ pub async fn wait_for_safe_state(
         let attested = chain.executed_states().await.unwrap_or_default();
         Ok(match node_root {
             Some(n) if n != B256::ZERO && n != genesis_root && attested.contains(&n) => Some(()),
-            _ => None,
-        })
-    })
-    .await
-}
-
-/// Wait until `node`'s safe head reaches block height `min_block` or
-/// beyond. Used to prove a late-joining follower replayed the *entire*
-/// pre-existing backlog, not just the first few batches: `wait_for_safe_state`
-/// only proves *some* attested non-genesis block landed, this proves depth.
-pub async fn wait_for_min_safe_block(
-    node: &NodeHandle,
-    min_block: u64,
-    timeout: Duration,
-) -> Result<()> {
-    wait_for(timeout, || async {
-        let n = block_number_at(
-            &node.l2_rpc_url(),
-            alloy_rpc_types_eth::BlockNumberOrTag::Safe,
-        )
-        .await
-        .ok()
-        .flatten();
-        Ok(match n {
-            Some(b) if b >= min_block => Some(()),
             _ => None,
         })
     })

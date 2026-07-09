@@ -13,8 +13,8 @@ use alloy_rpc_types_eth::BlockNumberOrTag;
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeConfig,
-    NodeHandle, block_number_and_hash_at, override_env, reorg_genesis_path,
-    reorg_genesis_state_root, safe_block_state_root, wait_for_min_safe_block, wait_for_safe_state,
+    NodeHandle, block_number_and_hash_at, block_number_hash_state_root_at, override_env,
+    reorg_genesis_path, reorg_genesis_state_root, safe_block_state_root, wait_for_safe_state,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -219,15 +219,10 @@ async fn failure_prover_signer_mismatch() {
 /// state convergence can happen via unrelated re-derivation paths; this
 /// is the assertion that proves the reorg-handling path ran.
 ///
-/// **I3 — Each node saw and processed an L1-attested state.** For each
-/// composer independently: at some poll, `node.safe.stateRoot` appears
-/// in the set of all `newState` values the contract has emitted via
-/// `L2ExecutionPerformed`. The two nodes don't have to coincide, and
-/// we don't require equality with the *current* contract head — the
-/// contract is a moving target while composers keep posting, so
-/// instant-equality is timing-fragile. The set-membership check is the
-/// honest restatement: "this node has imported a block whose stateRoot
-/// the contract has, at some point, attested as canonical."
+/// **I3 — Both nodes imported the same post-reorg safe block.** Once
+/// one node reaches a safe block whose state root is newly attested after
+/// the reorg, the other node's safe chain must contain that exact
+/// `(number, hash)`.
 ///
 /// **I4 — Liveness.** Post-reorg batches landed (`batches_posted` grew
 /// past the pre-reorg snapshot). Proves the chain didn't freeze on the
@@ -266,6 +261,7 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
         .wait_for_batches(4, DEFAULT_TIMEOUT)
         .await
         .expect("pre-reorg: ≥4 combined batches");
+    let pre_reorg_states = chain.executed_states().await.unwrap();
 
     // Drop the most recent 3 L1 blocks. Composer's bundle-target window
     // is `latest + 2`, so depth=3 is enough to roll back at least one
@@ -283,15 +279,19 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
         .await
         .expect("no batches landed after reorg");
 
-    // I3 — Each node independently catches up to the (now-advancing)
-    // contract: at some poll, `node.safe.stateRoot == contract.stateRoot`
-    // sampled back-to-back. The two nodes don't have to coincide.
-    wait_for_safe_state(&c1, &chain, B256::ZERO, DEFAULT_TIMEOUT)
-        .await
-        .expect("c1 did not catch up to contract post-reorg");
-    wait_for_safe_state(&c2, &chain, B256::ZERO, DEFAULT_TIMEOUT)
-        .await
-        .expect("c2 did not catch up to contract post-reorg");
+    // I3 — Both nodes import the same post-reorg safe block.
+    let (post_reorg_safe_number, post_reorg_safe_hash) =
+        wait_for_new_attested_safe_block(&c1, &chain, &pre_reorg_states, DEFAULT_TIMEOUT)
+            .await
+            .expect("c1 did not import a newly attested post-reorg safe block");
+    wait_for_safe_chain_contains(
+        &c2,
+        post_reorg_safe_number,
+        post_reorg_safe_hash,
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("c2 did not import c1's post-reorg safe block");
 
     // I2 — Both nodes observed the reorg.
     c1.wait_for_reorg_seen(DEFAULT_TIMEOUT).await.unwrap();
@@ -313,6 +313,58 @@ async fn spawn_follower(
     let env = harness.follower_env(seq_rpc);
     let cfg = NodeConfig::default();
     NodeHandle::start(name, &cfg, &env).await
+}
+
+async fn wait_for_new_attested_safe_block(
+    node: &NodeHandle,
+    chain: &common::Chain<'_>,
+    previous_states: &[B256],
+    timeout: Duration,
+) -> anyhow::Result<(u64, B256)> {
+    common::wait_for(timeout, || {
+        let rpc = node.l2_rpc_url();
+        async move {
+            let Some((number, hash, root)) =
+                block_number_hash_state_root_at(&rpc, BlockNumberOrTag::Safe).await?
+            else {
+                return Ok(None);
+            };
+            if number == 0 || root == B256::ZERO || previous_states.contains(&root) {
+                return Ok(None);
+            }
+            let attested = chain.executed_states().await?;
+            Ok(attested.contains(&root).then_some((number, hash)))
+        }
+    })
+    .await
+}
+
+async fn wait_for_safe_chain_contains(
+    node: &NodeHandle,
+    number: u64,
+    hash: B256,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    common::wait_for(timeout, || {
+        let rpc = node.l2_rpc_url();
+        async move {
+            let Some((safe_number, _)) =
+                block_number_and_hash_at(&rpc, BlockNumberOrTag::Safe).await?
+            else {
+                return Ok(None);
+            };
+            if safe_number < number {
+                return Ok(None);
+            }
+            let Some((_, actual_hash)) =
+                block_number_and_hash_at(&rpc, BlockNumberOrTag::Number(number)).await?
+            else {
+                return Ok(None);
+            };
+            Ok((actual_hash == hash).then_some(()))
+        }
+    })
+    .await
 }
 
 /// Unified `eez-node` in follower mode, L1-derived only (no
@@ -413,13 +465,13 @@ async fn happy_case_follower_sequencer_rpc() {
 
             Ok((latest_number > 0
                 && safe_number > 0
-                && latest_number >= safe_number
+                && latest_number > safe_number
                 && latest_hash == seq_hash)
                 .then_some(()))
         }
     })
     .await
-    .expect("follower latest block never matched the sequencer chain");
+    .expect("follower latest block never advanced past safe on the sequencer chain");
 
     follower.assert_no_process_death();
     seq.assert_no_process_death();
@@ -457,14 +509,24 @@ async fn happy_case_follower_l1_reorg_recovers() {
         .wait_for_batches(2, DEFAULT_TIMEOUT)
         .await
         .expect("pre-reorg batches");
+    let pre_reorg_states = chain.executed_states().await.unwrap();
     harness.anvil.reorg(3).await.unwrap();
     chain
         .wait_for_batches(pre_batches + 1, DEFAULT_TIMEOUT)
         .await
         .expect("no batches landed after reorg");
-    wait_for_safe_state(&follower, &chain, B256::ZERO, DEFAULT_TIMEOUT)
-        .await
-        .expect("follower did not catch up post-reorg");
+    let (post_reorg_safe_number, post_reorg_safe_hash) =
+        wait_for_new_attested_safe_block(&seq, &chain, &pre_reorg_states, DEFAULT_TIMEOUT)
+            .await
+            .expect("sequencer did not import the post-reorg safe block");
+    wait_for_safe_chain_contains(
+        &follower,
+        post_reorg_safe_number,
+        post_reorg_safe_hash,
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("follower did not import the sequencer's post-reorg safe block");
 
     follower.wait_for_reorg_seen(DEFAULT_TIMEOUT).await.unwrap();
     follower.assert_no_process_death();
@@ -499,26 +561,37 @@ async fn happy_case_follower_cross_safe_parity() {
         .await
         .expect("f_seq did not catch up");
 
-    // The actual parity claim: poll both followers' safe.stateRoot
-    // until they agree at the same instant. The contract keeps
-    // advancing, so we can't compare at arbitrary moments — we wait
-    // for a tick where both followers' safe heads coincide.
-    common::wait_for(DEFAULT_TIMEOUT, || async {
-        let a = safe_block_state_root(&f_l1.l2_rpc_url())
-            .await
-            .ok()
-            .flatten();
-        let b = safe_block_state_root(&f_seq.l2_rpc_url())
-            .await
-            .ok()
-            .flatten();
-        Ok(match (a, b) {
-            (Some(x), Some(y)) if x == y && x != B256::ZERO => Some(()),
-            _ => None,
-        })
+    // The actual parity claim: poll both followers until their safe block
+    // number and hash agree at the same instant, then verify that block is
+    // on the sequencer's chain.
+    common::wait_for(DEFAULT_TIMEOUT, || {
+        let f_l1_rpc = f_l1.l2_rpc_url();
+        let f_seq_rpc = f_seq.l2_rpc_url();
+        let seq_rpc = seq_rpc.clone();
+        async move {
+            let Some((l1_number, l1_hash)) =
+                block_number_and_hash_at(&f_l1_rpc, BlockNumberOrTag::Safe).await?
+            else {
+                return Ok(None);
+            };
+            let Some((seq_follower_number, seq_follower_hash)) =
+                block_number_and_hash_at(&f_seq_rpc, BlockNumberOrTag::Safe).await?
+            else {
+                return Ok(None);
+            };
+            if l1_number == 0 || (l1_number, l1_hash) != (seq_follower_number, seq_follower_hash) {
+                return Ok(None);
+            }
+            let Some((_, sequencer_hash)) =
+                block_number_and_hash_at(&seq_rpc, BlockNumberOrTag::Number(l1_number)).await?
+            else {
+                return Ok(None);
+            };
+            Ok((l1_hash == sequencer_hash).then_some(()))
+        }
     })
     .await
-    .expect("followers never agreed on safe head");
+    .expect("followers never agreed on a sequencer safe block");
 
     f_l1.assert_no_process_death();
     f_seq.assert_no_process_death();
@@ -619,9 +692,8 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
 /// Every other test starts the follower after ~2 batches; this is the only
 /// one that exercises catch-up at non-trivial depth (the "spin up a new RPC
 /// node long after genesis" path). Asserts the follower's safe head reaches a
-/// non-genesis contract-attested stateRoot *and* climbs to the full backlog
-/// depth the chain already had at join time — proving it replayed the entire
-/// history.
+/// non-genesis contract-attested stateRoot and includes the exact sequencer
+/// block hash at the backlog depth captured at join time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn happy_case_follower_deep_backfill_late_join() {
     let harness = Harness::fresh().await.unwrap();
@@ -656,25 +728,13 @@ async fn happy_case_follower_deep_backfill_late_join() {
         .expect("late-joining follower did not backfill into an attested stateRoot");
 
     // Prove catch-up replayed the *entire* pre-existing backlog, not just
-    // the first batch: the follower's safe head must climb to the depth the
-    // chain already had when it joined (which also implies it is past genesis).
-    wait_for_min_safe_block(&follower, backlog_depth, DEFAULT_TIMEOUT)
+    // the first batch: the follower's safe chain must include the sequencer's
+    // exact block at the depth the chain already had when it joined.
+    wait_for_safe_chain_contains(&follower, backlog_depth, backlog_hash, DEFAULT_TIMEOUT)
         .await
         .unwrap_or_else(|_| {
             panic!("follower did not replay full backlog to block {backlog_depth}")
         });
-
-    let (_, follower_backlog_hash) = block_number_and_hash_at(
-        &follower.l2_rpc_url(),
-        BlockNumberOrTag::Number(backlog_depth),
-    )
-    .await
-    .unwrap()
-    .expect("follower has the backlog block");
-    assert_eq!(
-        follower_backlog_hash, backlog_hash,
-        "follower backlog block hash must match sequencer at block {backlog_depth}",
-    );
 
     follower.assert_no_process_death();
     seq.assert_no_process_death();
