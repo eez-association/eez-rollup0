@@ -56,6 +56,11 @@ jobs:
       - name: Build contracts (artifacts read by harness)
         working-directory: contracts
         run: forge build
+      # The eez-fuzz harness also loads the protocol predeploys (EEZL2, …) from
+      # the submodule's own out/ dir, so build them too.
+      - name: Build protocol contracts (submodule, artifacts read by harness)
+        working-directory: sync-rollups-protocol
+        run: forge build
       # Both nextest runs read from the cache populated by the build step.
       # Lib tests parallelise across cores; integration tests serialise to
       # one runner-wide reth+anvil set at a time (memory-bounded).
