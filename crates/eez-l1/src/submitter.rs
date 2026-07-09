@@ -210,7 +210,7 @@ impl Submitter {
     ///
     /// [`L1Error::Provider`] on RPC failure.
     pub async fn batch_log_chunks(&self, from_block: u64) -> L1Result<BatchLogChunks> {
-        let provider = self.inner.build_provider();
+        let provider = self.inner.build_target_provider();
         let latest = provider
             .get_block_number()
             .await
@@ -230,9 +230,11 @@ impl Submitter {
         &self,
         chunks: &mut BatchLogChunks,
     ) -> L1Result<Option<Vec<ScannedBatch>>> {
-        let provider = self.inner.build_provider();
+        let log_provider = self.inner.build_target_provider();
+        let tx_provider = self.inner.build_provider();
         scan_next_batch_log_chunk(
-            &provider,
+            &log_provider,
+            &tx_provider,
             self.inner.config.eez,
             self.inner.config.rollup_id,
             chunks,
@@ -247,7 +249,7 @@ impl Submitter {
     ///
     /// [`L1Error::Provider`] on RPC failure.
     pub async fn canonical_l1_hash(&self, number: u64) -> L1Result<Option<alloy_primitives::B256>> {
-        let provider = self.inner.build_provider();
+        let provider = self.inner.build_target_provider();
         Ok(provider
             .get_block_by_number(BlockNumberOrTag::Number(number))
             .await
@@ -269,16 +271,16 @@ impl Submitter {
 
 impl Inner {
     fn build_provider(&self) -> impl Provider + use<> {
-        // No wallet: writes go through the builder relay, reads
-        // don't need signing. Pre-sim sets `from` explicitly.
+        // No wallet: writes go through the builder relay, reads don't need
+        // signing. Historical catch-up uses this embedded node for transaction
+        // bodies when possible to avoid spending public RPC quota on tx fetches.
         ProviderBuilder::new()
             .disable_recommended_fillers()
             .connect_http(self.config.rpc_url.clone())
     }
 
-    /// Provider used ONLY for target-block discovery on
-    /// `BundleTarget::NextBlock`. Falls back to the main RPC when no
-    /// override URL is set. See `SubmitterConfig::target_rpc_url`.
+    /// Canonical/read provider. Falls back to the main RPC when no override
+    /// URL is set. See `SubmitterConfig::target_rpc_url`.
     fn build_target_provider(&self) -> impl Provider + use<> {
         let url = self
             .config

@@ -430,6 +430,7 @@ impl L1Watcher {
                     );
                     let scanned = crate::scan::scan_batch_logs_range(
                         provider,
+                        provider,
                         self.inner.config.eez,
                         self.inner.config.rollup_id,
                         scan_from,
@@ -588,6 +589,7 @@ impl L1Watcher {
             "scanning L1 range for BatchPosted logs",
         );
         let scanned = crate::scan::scan_batch_logs_range(
+            provider,
             provider,
             self.inner.config.eez,
             self.inner.config.rollup_id,

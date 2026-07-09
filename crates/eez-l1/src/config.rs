@@ -31,11 +31,10 @@ pub struct SubmitterConfig {
     /// L1 builder relay accepting `eth_sendBundle`. All postBatch txs
     /// go here; `rpc_url` is used for reads only.
     pub builder_rpc_url: Url,
-    /// Optional RPC used ONLY for `BundleTarget::NextBlock` target-block
-    /// calculation. The embedded L1 can lag the canonical tip by 2-3
-    /// blocks, so `target = local.latest + slack` lands already-past and
-    /// the bundler drops it; point this at a tip-following node to pick
-    /// an unproposed future block. `None` → falls back to `rpc_url`.
+    /// Optional canonical/read RPC. The embedded L1 can lag the canonical tip
+    /// and may not retain old receipts, so this endpoint is used for
+    /// target-block calculation, bundle observation, historical batch scans,
+    /// and L1 reorg canonicality probes. `None` → falls back to `rpc_url`.
     pub target_rpc_url: Option<Url>,
     /// EOA that signs L1 txs (pays gas).
     pub poster: PrivateKeySigner,

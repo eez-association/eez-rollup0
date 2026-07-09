@@ -64,7 +64,16 @@ impl L1Error {
     /// Returns true when the L1 source may simply need more time to
     /// expose already-observed canonical data.
     #[must_use]
-    pub const fn is_source_incomplete(&self) -> bool {
-        matches!(self, Self::SourceIncomplete { .. })
+    pub fn is_source_incomplete(&self) -> bool {
+        match self {
+            Self::SourceIncomplete { .. } => true,
+            // Public/canonical L1 read endpoints can throttle historical
+            // catch-up scans. Treat this as retryable so boot reconciliation
+            // backs off instead of crash-looping and amplifying the throttle.
+            Self::Provider(msg) => {
+                msg.contains("HTTP error 429") || msg.contains("Too Many Requests")
+            }
+            _ => false,
+        }
     }
 }

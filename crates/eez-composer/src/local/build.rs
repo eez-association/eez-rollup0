@@ -14,13 +14,13 @@ use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT};
 use reth_chainspec::EthereumHardforks;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_ethereum_primitives::TransactionSigned;
-use reth_evm::{ConfigureEvm, NextBlockEnvAttributes, execute::BlockBuilder};
+use reth_evm::{ConfigureEvm, Evm, NextBlockEnvAttributes, execute::BlockBuilder};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_payload_primitives::PayloadTypes;
 use reth_primitives_traits::{SealedHeader, SignedTransaction};
 use reth_revm::database::StateProviderDatabase;
 use reth_storage_api::StateProviderFactory;
-use revm::database::State;
+use revm::database::{State, states::bundle_state::BundleRetention};
 use thiserror::Error;
 
 /// Errors raised by [`build_sync_block`].
@@ -53,6 +53,10 @@ pub struct BuiltSyncBlock {
     pub payload: ExecutionData,
     /// Sealed header of the new block (cursor mirror in the committer).
     pub header: SealedHeader<Header>,
+    /// Cumulative post-state root after each cross-chain effect in L2 execution
+    /// order. A standalone SYSTEM tx is an inbound effect; a SYSTEM+USER pair
+    /// ends at the USER tx for an outbound effect. Empty when capture is disabled.
+    pub pair_end_roots: Vec<B256>,
 }
 
 /// Build a Sync block on top of `parent`, executing `system_txs` (raw
@@ -75,6 +79,7 @@ pub fn build_sync_block<P>(
     timestamp: u64,
     suggested_fee_recipient: Address,
     system_txs: &[Bytes],
+    capture_effect_roots: bool,
 ) -> Result<BuiltSyncBlock, BuildError>
 where
     P: StateProviderFactory,
@@ -120,6 +125,31 @@ where
         .apply_pre_execution_changes()
         .map_err(|e| BuildError::Builder(format!("apply_pre_execution_changes: {e}")))?;
 
+    let pair_end_set: std::collections::BTreeSet<usize> = if capture_effect_roots {
+        use alloy_consensus::Transaction as _;
+        use reth_primitives_traits::SignerRecoverable as _;
+
+        let is_system: Vec<bool> = system_txs
+            .iter()
+            .map(|tx_bytes| {
+                TransactionSigned::decode_2718(&mut tx_bytes.as_ref())
+                    .ok()
+                    .is_some_and(|tx| {
+                        tx.recover_signer().is_ok_and(|signer| {
+                            signer == eez_evm::SYSTEM_ADDRESS
+                                && tx.to() == Some(eez_evm::outbound_gate::EEZL2_ADDR)
+                        })
+                    })
+            })
+            .collect();
+        (0..is_system.len())
+            .filter(|&i| !is_system[i] || is_system.get(i + 1).copied().unwrap_or(true))
+            .collect()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let mut pair_end_roots = Vec::new();
+
     for (idx, tx_bytes) in system_txs.iter().enumerate() {
         let tx = TransactionSigned::decode_2718(&mut tx_bytes.as_ref()).map_err(|e| {
             BuildError::DecodeTx {
@@ -135,6 +165,16 @@ where
                 idx,
                 msg: e.to_string(),
             })?;
+
+        if capture_effect_roots && pair_end_set.contains(&idx) {
+            let state_db_mut = builder.evm_mut().db_mut();
+            state_db_mut.merge_transitions(BundleRetention::Reverts);
+            let hashed = state_provider.hashed_post_state(&state_db_mut.bundle_state);
+            let root = state_provider.state_root(hashed).map_err(|e| {
+                BuildError::Builder(format!("intermediate state_root after tx {idx}: {e}"))
+            })?;
+            pair_end_roots.push(root);
+        }
     }
 
     let outcome = builder
@@ -143,5 +183,9 @@ where
     let sealed_block = outcome.block.sealed_block().clone();
     let header = sealed_block.sealed_header().clone();
     let payload = <EthEngineTypes as PayloadTypes>::block_to_payload(sealed_block, None);
-    Ok(BuiltSyncBlock { payload, header })
+    Ok(BuiltSyncBlock {
+        payload,
+        header,
+        pair_end_roots,
+    })
 }

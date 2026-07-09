@@ -97,7 +97,8 @@ fn initial_log_scan_ranges(from_block: u64, to_block: u64) -> Vec<(u64, u64)> {
 }
 
 pub(crate) async fn scan_next_batch_log_chunk(
-    provider: &impl Provider,
+    log_provider: &impl Provider,
+    tx_provider: &impl Provider,
     eez: Address,
     rollup_id: u64,
     chunks: &mut BatchLogChunks,
@@ -106,7 +107,8 @@ pub(crate) async fn scan_next_batch_log_chunk(
         return Ok(None);
     };
 
-    let scanned = scan_batch_logs_range(provider, eez, rollup_id, from, to).await?;
+    let scanned =
+        scan_batch_logs_range(log_provider, tx_provider, eez, rollup_id, from, to).await?;
     chunks.ranges.pop();
     Ok(Some(scanned))
 }
@@ -117,7 +119,8 @@ pub(crate) async fn scan_next_batch_log_chunk(
 /// only). For each, decode the originating tx for the submitter, callData
 /// and our rollup's claimed state roots.
 pub(crate) async fn scan_batch_logs_range(
-    provider: &impl Provider,
+    log_provider: &impl Provider,
+    tx_provider: &impl Provider,
     eez: Address,
     rollup_id: u64,
     from_block: u64,
@@ -128,7 +131,7 @@ pub(crate) async fn scan_batch_logs_range(
         .event_signature(BatchPosted::SIGNATURE_HASH)
         .from_block(from_block)
         .to_block(BlockNumberOrTag::Number(to_block));
-    let logs = provider
+    let logs = log_provider
         .get_logs(&filter)
         .await
         .map_err(|e| L1Error::Provider(format!("get_logs(BatchPosted): {e}")))?;
@@ -139,7 +142,7 @@ pub(crate) async fn scan_batch_logs_range(
         .topic1(U256::from(rollup_id))
         .from_block(from_block)
         .to_block(BlockNumberOrTag::Number(to_block));
-    let winner_logs = provider
+    let winner_logs = log_provider
         .get_logs(&winners_filter)
         .await
         .map_err(|e| L1Error::Provider(format!("get_logs(L2ExecutionPerformed): {e}")))?;
@@ -179,7 +182,14 @@ pub(crate) async fn scan_batch_logs_range(
         let tx_index = log
             .transaction_index
             .ok_or_else(|| L1Error::Provider("BatchPosted log missing transaction_index".into()))?;
-        let tx = fetch_log_transaction(provider, l1_block_number, tx_index, tx_hash).await?;
+        let tx = fetch_log_transaction_with_fallback(
+            tx_provider,
+            log_provider,
+            l1_block_number,
+            tx_index,
+            tx_hash,
+        )
+        .await?;
         let submitter = tx.inner.signer();
         let input = tx.inner.input();
         let decoded = postAndVerifyBatchCall::abi_decode(input)
@@ -260,12 +270,63 @@ fn attribute_settlement(
     (count, final_state)
 }
 
+#[cfg(test)]
 async fn fetch_log_transaction(
     provider: &impl Provider,
     l1_block_number: u64,
     tx_index: u64,
     tx_hash: B256,
 ) -> L1Result<alloy_rpc_types_eth::Transaction> {
+    fetch_log_transaction_from_provider(provider, l1_block_number, tx_index, tx_hash)
+        .await?
+        .ok_or_else(|| source_incomplete_tx(l1_block_number, tx_index, tx_hash))
+}
+
+async fn fetch_log_transaction_with_fallback(
+    primary_provider: &impl Provider,
+    fallback_provider: &impl Provider,
+    l1_block_number: u64,
+    tx_index: u64,
+    tx_hash: B256,
+) -> L1Result<alloy_rpc_types_eth::Transaction> {
+    match fetch_log_transaction_from_provider(primary_provider, l1_block_number, tx_index, tx_hash)
+        .await
+    {
+        Ok(Some(tx)) => return Ok(tx),
+        Ok(None) => {
+            event!(
+                name: "eez.l1.scan_batch_logs.primary_tx_missing",
+                Level::WARN,
+                l1_block_number,
+                tx_index,
+                tx_hash = %tx_hash,
+                "postBatch tx missing from primary tx source; retrying canonical log source",
+            );
+        }
+        Err(err) => {
+            event!(
+                name: "eez.l1.scan_batch_logs.primary_tx_error",
+                Level::WARN,
+                l1_block_number,
+                tx_index,
+                tx_hash = %tx_hash,
+                error = %err,
+                "primary tx source failed; retrying canonical log source",
+            );
+        }
+    }
+
+    fetch_log_transaction_from_provider(fallback_provider, l1_block_number, tx_index, tx_hash)
+        .await?
+        .ok_or_else(|| source_incomplete_tx(l1_block_number, tx_index, tx_hash))
+}
+
+async fn fetch_log_transaction_from_provider(
+    provider: &impl Provider,
+    l1_block_number: u64,
+    tx_index: u64,
+    tx_hash: B256,
+) -> L1Result<Option<alloy_rpc_types_eth::Transaction>> {
     if let Some(tx) = provider
         .get_transaction_by_block_number_and_index(
             BlockNumberOrTag::Number(l1_block_number),
@@ -278,7 +339,7 @@ async fn fetch_log_transaction(
             ))
         })?
     {
-        return Ok(tx);
+        return Ok(Some(tx));
     }
 
     event!(
@@ -290,17 +351,20 @@ async fn fetch_log_transaction(
         "postBatch tx missing by block/index; retrying same provider by hash",
     );
 
-    provider
+    Ok(provider
         .get_transaction_by_hash(tx_hash)
         .await
-        .map_err(|e| L1Error::Provider(format!("get_tx({tx_hash}): {e}")))?
-        .ok_or_else(|| L1Error::SourceIncomplete {
-            block: l1_block_number,
-            tx_hash,
-            detail: format!(
-                "block/index lookup returned null at tx index {tx_index}; tx-hash lookup also returned null"
-            ),
-        })
+        .map_err(|e| L1Error::Provider(format!("get_tx({tx_hash}): {e}")))?)
+}
+
+fn source_incomplete_tx(l1_block_number: u64, tx_index: u64, tx_hash: B256) -> L1Error {
+    L1Error::SourceIncomplete {
+        block: l1_block_number,
+        tx_hash,
+        detail: format!(
+            "block/index lookup returned null at tx index {tx_index}; tx-hash lookup also returned null"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -532,7 +596,7 @@ mod tests {
 
         // First get_logs of the oldest chunk fails.
         asserter.push_failure_msg("injected: range scan failed");
-        let err = scan_next_batch_log_chunk(&provider, Address::ZERO, 1, &mut chunks)
+        let err = scan_next_batch_log_chunk(&provider, &provider, Address::ZERO, 1, &mut chunks)
             .await
             .expect_err("injected failure must propagate");
         assert!(
@@ -549,10 +613,11 @@ mod tests {
         // Retry succeeds (BatchPosted logs + winners logs, both empty).
         asserter.push_success(&serde_json::json!([]));
         asserter.push_success(&serde_json::json!([]));
-        let scanned = scan_next_batch_log_chunk(&provider, Address::ZERO, 1, &mut chunks)
-            .await
-            .expect("retry succeeds")
-            .expect("chunk yielded");
+        let scanned =
+            scan_next_batch_log_chunk(&provider, &provider, Address::ZERO, 1, &mut chunks)
+                .await
+                .expect("retry succeeds")
+                .expect("chunk yielded");
         assert!(scanned.is_empty());
         // Exactly the oldest range consumed; newer range still queued.
         assert_eq!(chunks.ranges.len(), 1);

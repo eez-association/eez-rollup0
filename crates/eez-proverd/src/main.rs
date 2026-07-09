@@ -983,6 +983,100 @@ fn system_txs_succeeded(system_flags: &[bool], statuses: Option<&[bool]>) -> boo
         .all(|(sys, ok)| !*sys || *ok)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettlementKind {
+    Anchor,
+    Outbound,
+    Inbound,
+}
+
+fn classify_settlement_entry(e: &eez_evm::types::ExecutionEntrySol) -> SettlementKind {
+    if e.proxyEntryHash != B256::ZERO {
+        SettlementKind::Inbound
+    } else if !e.l2ToL1Calls.is_empty() {
+        SettlementKind::Outbound
+    } else {
+        SettlementKind::Anchor
+    }
+}
+
+fn settlement_effects_from_sync(
+    system_flags: &[bool],
+    per_tx_roots: &[B256],
+) -> Option<Vec<(SettlementKind, B256)>> {
+    pair_end_positions(system_flags)
+        .into_iter()
+        .map(|p| {
+            let kind = if system_flags[p] {
+                SettlementKind::Inbound
+            } else {
+                SettlementKind::Outbound
+            };
+            per_tx_roots.get(p).copied().map(|root| (kind, root))
+        })
+        .collect()
+}
+
+fn verify_effect_prefix_roots(
+    entries: &[(SettlementKind, B256, B256)],
+    system_flags: &[bool],
+    per_tx_roots: Option<&[B256]>,
+    batch_anchor_root: B256,
+) -> eyre::Result<()> {
+    let effect_entries: Vec<&(SettlementKind, B256, B256)> = entries
+        .iter()
+        .filter(|(kind, _, _)| *kind != SettlementKind::Anchor)
+        .collect();
+    let effects = match per_tx_roots {
+        Some(per_tx) => settlement_effects_from_sync(system_flags, per_tx).ok_or_else(|| {
+            eyre::eyre!("effect-prefix: a pair-end position lacks a re-executed per-tx root")
+        })?,
+        None => {
+            if !effect_entries.is_empty() {
+                eyre::bail!(
+                    "effect-prefix: batch has value-bearing entries but validator emitted no per-tx roots"
+                );
+            }
+            Vec::new()
+        }
+    };
+
+    if effect_entries.len() != effects.len() {
+        eyre::bail!(
+            "effect-prefix: {} value-bearing entries but {} re-executed effects",
+            effect_entries.len(),
+            effects.len(),
+        );
+    }
+
+    let mut previous_root = match entries.first() {
+        Some((SettlementKind::Anchor, _, new)) => *new,
+        _ => batch_anchor_root,
+    };
+    for (idx, ((entry_kind, current_root, new_root), (effect_kind, effect_root))) in
+        effect_entries.iter().zip(effects).enumerate()
+    {
+        if entry_kind != &effect_kind {
+            eyre::bail!(
+                "effect-prefix: entry {idx} kind {entry_kind:?} != re-executed effect kind {effect_kind:?}"
+            );
+        }
+        if *current_root != previous_root {
+            eyre::bail!(
+                "effect-prefix: entry {idx} currentState {current_root} != previous prefix root {previous_root}"
+            );
+        }
+        if *new_root != effect_root {
+            eyre::bail!(
+                "effect-prefix: entry {idx} newState {new_root} != exact effect prefix root {effect_root}"
+            );
+        }
+        previous_root = effect_root;
+    }
+
+    Ok(())
+}
+
 /// Re-derive ALL inbound L1→L2 calls (`DecodedInbound`: call args + returnData +
 /// success) from a sealed block's `executeIncomingCrossChainCall` system txs.
 /// Every field is REAL, not a composer claim: the block only sealed because
@@ -1398,6 +1492,18 @@ fn verify_settlement_chain(
     if !system_txs_succeeded(&system_flags, vw.sync_tx_statuses.as_deref()) {
         eyre::bail!("a SYSTEM tx in the settled block REVERTED (or per-tx status count drift)");
     }
+
+    let classified: Vec<(SettlementKind, B256, B256)> = chain
+        .iter()
+        .zip(entries.iter())
+        .map(|(d, e)| (classify_settlement_entry(e), d.currentState, d.newState))
+        .collect();
+    verify_effect_prefix_roots(
+        &classified,
+        &system_flags,
+        vw.sync_per_tx_roots.as_deref(),
+        batch_anchor_root,
+    )?;
     Ok(())
 }
 
@@ -3097,6 +3203,68 @@ mod tests {
         assert!(!system_txs_succeeded(&[true, false], Some(&[false, true]))); // SYSTEM reverted
         assert!(system_txs_succeeded(&[false], Some(&[false]))); // a USER revert is fine
         assert!(!system_txs_succeeded(&[true, true], Some(&[true]))); // status count drift
+    }
+
+    #[test]
+    fn effect_prefix_roots_accept_exact_chain() {
+        let (a, pre, outbound, inbound) = (
+            B256::repeat_byte(0xa0),
+            B256::repeat_byte(0x10),
+            B256::repeat_byte(0x20),
+            B256::repeat_byte(0x30),
+        );
+        let entries = vec![
+            (SettlementKind::Anchor, a, pre),
+            (SettlementKind::Outbound, pre, outbound),
+            (SettlementKind::Inbound, outbound, inbound),
+        ];
+        let system_flags = [true, false, true];
+        let per_tx_roots = [B256::repeat_byte(0x01), outbound, inbound];
+
+        verify_effect_prefix_roots(&entries, &system_flags, Some(&per_tx_roots), a)
+            .expect("exact outbound/inbound prefix chain must pass");
+    }
+
+    #[test]
+    fn effect_prefix_roots_reject_jump_to_final_root() {
+        let (a, pre, outbound, final_root) = (
+            B256::repeat_byte(0xa0),
+            B256::repeat_byte(0x10),
+            B256::repeat_byte(0x20),
+            B256::repeat_byte(0x30),
+        );
+        let entries = vec![
+            (SettlementKind::Anchor, a, pre),
+            (SettlementKind::Outbound, pre, final_root),
+            (SettlementKind::Inbound, final_root, final_root),
+        ];
+        let system_flags = [true, false, true];
+        let per_tx_roots = [B256::repeat_byte(0x01), outbound, final_root];
+
+        assert!(
+            verify_effect_prefix_roots(&entries, &system_flags, Some(&per_tx_roots), a).is_err(),
+            "outbound entry must not settle against a later/final root"
+        );
+    }
+
+    #[test]
+    fn effect_prefix_roots_require_native_per_tx_roots_for_effects() {
+        let (a, pre, outbound) = (
+            B256::repeat_byte(0xa0),
+            B256::repeat_byte(0x10),
+            B256::repeat_byte(0x20),
+        );
+        let entries = vec![
+            (SettlementKind::Anchor, a, pre),
+            (SettlementKind::Outbound, pre, outbound),
+        ];
+
+        assert!(
+            verify_effect_prefix_roots(&entries, &[], None, a).is_err(),
+            "effect-bearing settlement requires re-executed per-tx roots"
+        );
+        verify_effect_prefix_roots(&[(SettlementKind::Anchor, a, pre)], &[], None, a)
+            .expect("anchor-only settlement does not need per-tx roots");
     }
 
     #[test]

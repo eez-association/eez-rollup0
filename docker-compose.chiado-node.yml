@@ -49,8 +49,10 @@ services:
       EEZ_L1_DATADIR: /l1
       EEZ_L1_JWT_SECRET: /jwt/jwt.hex
       EEZ_L1_RPC_URL: http://127.0.0.1:18645
-      # EEZ_L1_TARGET_RPC_URL intentionally unset → bundle target-block
-      # oracle falls back to the embedded L1 (config.rs build_target_provider).
+      # Canonical/read RPC for tip selection, bundle observation and historical
+      # catch-up scans. The embedded L1 snapshot may not retain receipts for the
+      # registry deploy range, so boot replay must not depend on it for getLogs.
+      EEZ_L1_TARGET_RPC_URL: "${EEZ_L1_TARGET_RPC_URL:-https://rpc.chiado.gnosis.gateway.fm}"
       EEZ_L1_ROLLUP_ID: "0"
       # Cross-chain wiring.
       EEZ_CCM_L2_ADDRESS: "0x4200000000000000000000000000000000000007"

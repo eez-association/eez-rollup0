@@ -81,6 +81,53 @@ fn stale_system_block_from_prepare_error(err: &str) -> Option<u64> {
     block.parse().ok()
 }
 
+fn stitch_state_delta_chain(entries: &mut [eez_evm::types::ExecutionEntrySol]) {
+    let mut running_roots: HashMap<U256, B256> = HashMap::new();
+    for entry in entries {
+        for delta in &mut entry.stateDeltas {
+            if let Some(prev_new) = running_roots.get(&delta.rollupId).copied() {
+                delta.currentState = prev_new;
+            }
+            running_roots.insert(delta.rollupId, delta.newState);
+        }
+    }
+}
+
+fn apply_effect_prefix_roots(
+    entries: &mut [eez_evm::types::ExecutionEntrySol],
+    rollup_id: U256,
+    effect_prefix_roots: &[B256],
+) -> Result<(), String> {
+    let effect_entries = entries.len().saturating_sub(1);
+    if effect_entries != effect_prefix_roots.len() {
+        return Err(format!(
+            "settlement root mismatch: {effect_entries} cross-chain entries but {} captured \
+             effect prefix roots",
+            effect_prefix_roots.len(),
+        ));
+    }
+    for (idx, (entry, &post_root)) in entries
+        .iter_mut()
+        .skip(1)
+        .zip(effect_prefix_roots)
+        .enumerate()
+    {
+        let mut updated = false;
+        for delta in &mut entry.stateDeltas {
+            if delta.rollupId == rollup_id {
+                delta.newState = post_root;
+                updated = true;
+            }
+        }
+        if !updated {
+            return Err(format!(
+                "settlement root mismatch: effect entry {idx} has no StateDelta for rollup {rollup_id}",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Runtime config for the cross-chain execution path on Sync slots.
 /// `Composer::new` accepts `Option<Arc<CrossChainExecCtx>>`; `Some`
 /// means a wired `EvmComposer` and the keys/addresses needed to sign
@@ -883,6 +930,7 @@ where
                 timestamp,
                 suggested_fee_recipient,
                 &[],
+                false,
             ) {
                 Ok(built) => Some(SyncSlotBlock {
                     payload: built.payload,
@@ -1035,6 +1083,7 @@ where
             timestamp,
             suggested_fee_recipient,
             &drained_raw_txs,
+            false,
         ) {
             Ok(built) => {
                 event!(
@@ -1783,6 +1832,7 @@ where
             timestamp,
             suggested_fee_recipient,
             &eez_evm::system_tx::interleave_sync_block_txs(&pairs),
+            true,
         ) {
             Ok(b) => b,
             Err(e) => {
@@ -1825,6 +1875,7 @@ where
                 built.header.state_root(),
                 &outbound_entries,
                 &outbound_user_txs,
+                &built.pair_end_roots,
             )
             .await
         {
@@ -2003,6 +2054,7 @@ where
             timestamp,
             suggested_fee_recipient,
             &[], // no system_txs — empty Sync block
+            false,
         )
         .map_err(|e| format!("build_sync_block (empty): {e}"))?;
 
@@ -2015,6 +2067,7 @@ where
                 empty_built.header.state_root(),
                 &[], // no outbound entries
                 &[], // no outbound user txs
+                &[], // no cross-chain effect roots
             )
             .await
         {
@@ -2428,6 +2481,7 @@ where
         sync_block_state_root: B256,
         outbound_entries: &[eez_evm::types::ExecutionEntrySol],
         outbound_user_txs: &[Bytes],
+        effect_prefix_roots: &[B256],
     ) -> Result<PostBatchOutcome, String> {
         use eez_evm::types::RollupIdWithProofSystemsSol;
 
@@ -2581,38 +2635,34 @@ where
             }];
         }
 
+        let has_effect_entries = batch.inner.entries.len() > 1;
+        if has_effect_entries || !effect_prefix_roots.is_empty() {
+            apply_effect_prefix_roots(
+                &mut batch.inner.entries,
+                rollup_id_u256,
+                effect_prefix_roots,
+            )?;
+        }
+
+        // Anchor-only batches have no per-effect root. They settle directly to the
+        // built Sync block's final root. Effect-bearing batches are already rooted
+        // per entry, and the last captured effect root is the final Sync-block root.
+        if !has_effect_entries {
+            if let Some(anchor_entry) = batch.inner.entries.last_mut() {
+                for delta in anchor_entry.stateDeltas.iter_mut().rev() {
+                    if delta.rollupId == rollup_id_u256 {
+                        delta.newState = sync_block_state_root;
+                        break;
+                    }
+                }
+            }
+        }
+
         // Stitch the per-rollup stateDelta chain: EEZ.sol `_applyStateDeltas`
         // enforces `config.stateRoot == delta.currentState` then sets it to
         // `newState`, so each entry's `currentState` must chain to the prior
         // entry's `newState` (the anchor keeps its own first `currentState`).
-        let mut running_roots: HashMap<U256, B256> = HashMap::new();
-        for entry in &mut batch.inner.entries {
-            for delta in &mut entry.stateDeltas {
-                if let Some(prev_new) = running_roots.get(&delta.rollupId).copied() {
-                    delta.currentState = prev_new;
-                }
-                running_roots.insert(delta.rollupId, delta.newState);
-            }
-        }
-
-        // Anchor the real root to the LAST OUTBOUND entry (its L2→L1 call settles
-        // IN this block); fall back to the last entry for inbound-only. Explicit
-        // last-outbound matters for a MIXED batch, where `entries.last()` is an
-        // inbound deferred entry, not the outbound one.
-        let anchor_idx = batch
-            .inner
-            .entries
-            .iter()
-            .rposition(|e| e.proxyEntryHash == B256::ZERO && !e.l2ToL1Calls.is_empty())
-            .or_else(|| batch.inner.entries.len().checked_sub(1));
-        if let Some(anchor_entry) = anchor_idx.and_then(|idx| batch.inner.entries.get_mut(idx)) {
-            for delta in anchor_entry.stateDeltas.iter_mut().rev() {
-                if delta.rollupId == rollup_id_u256 {
-                    delta.newState = sync_block_state_root;
-                    break;
-                }
-            }
-        }
+        stitch_state_delta_chain(&mut batch.inner.entries);
 
         // The contract drains the leading contiguous `proxyEntryHash==0` run
         // inline (`EEZ.sol:387`): 1 anchor immediate + N outbound immediates.
