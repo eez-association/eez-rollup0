@@ -18,7 +18,7 @@
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
-use alloy_primitives::{B256, Bytes, b256};
+use alloy_primitives::{Address, B256, Bytes, b256};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
@@ -123,6 +123,62 @@ impl Prover for MockEcdsaProver {
     }
 }
 
+/// Prover identity without the attester private key.
+///
+/// This is for split composer/prover deployments: the composer needs the
+/// registered attester address to build the batch metadata, while the real
+/// signature is produced later by `eez-proverd` and returned through ProofSink.
+/// The placeholder proof is intentionally signed by a fixed public key, so it
+/// cannot verify as the configured attester if it ever leaks to L1.
+#[derive(Debug, Clone)]
+pub struct AddressOnlyProver {
+    attester: Address,
+    placeholder: PrivateKeySigner,
+}
+
+impl AddressOnlyProver {
+    #[must_use]
+    pub fn new(attester: Address) -> Self {
+        let placeholder = PrivateKeySigner::from_bytes(&B256::with_last_byte(1))
+            .expect("1 is a valid secp256k1 scalar");
+        Self {
+            attester,
+            placeholder,
+        }
+    }
+
+    #[must_use]
+    pub const fn address(&self) -> Address {
+        self.attester
+    }
+
+    #[must_use]
+    pub fn placeholder_address(&self) -> Address {
+        self.placeholder.address()
+    }
+}
+
+#[async_trait]
+impl Prover for AddressOnlyProver {
+    async fn prove(&self, _ctx: ProvingContext) -> ProverResult<Bytes> {
+        let sig = self
+            .placeholder
+            .sign_hash_sync(&MOCK_PROVER_DIGEST)
+            .map_err(|e| ProverError::Signer(e.to_string()))?;
+        let mut out = [0u8; 65];
+        out[..32].copy_from_slice(&sig.r().to_be_bytes::<32>());
+        out[32..64].copy_from_slice(&sig.s().to_be_bytes::<32>());
+        out[64] = u8::from(sig.v()) + 27;
+        Ok(Bytes::copy_from_slice(&out))
+    }
+
+    fn vkey(&self) -> B256 {
+        let mut bytes = [0u8; 32];
+        bytes[12..].copy_from_slice(self.attester.as_slice());
+        B256::from(bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +213,29 @@ mod tests {
             recovered, signer_addr,
             "ECDSA sig over MOCK_PROVER_DIGEST must recover the signer",
         );
+    }
+
+    #[tokio::test]
+    async fn address_only_placeholder_does_not_recover_to_attester() {
+        let attester = Address::from_str("0xfB05940Aaf4eA8AA6d4628B75Fcd5E1176B5F003").unwrap();
+        let prover = AddressOnlyProver::new(attester);
+
+        let mut expected_vkey = [0u8; 32];
+        expected_vkey[12..].copy_from_slice(attester.as_slice());
+        assert_eq!(prover.vkey(), B256::from(expected_vkey));
+        assert_eq!(prover.address(), attester);
+
+        let proof = prover.prove(ProvingContext).await.unwrap();
+        assert_eq!(proof.len(), 65);
+        let sig = Signature::new(
+            U256::from_be_slice(&proof[..32]),
+            U256::from_be_slice(&proof[32..64]),
+            proof[64] == 28,
+        );
+        let recovered = sig
+            .recover_address_from_prehash(&MOCK_PROVER_DIGEST)
+            .unwrap();
+        assert_eq!(recovered, prover.placeholder_address());
+        assert_ne!(recovered, attester);
     }
 }

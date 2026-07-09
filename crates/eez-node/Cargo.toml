@@ -20,6 +20,7 @@ eez-prover.workspace        = true
 
 # grpc — host the composer→prover control feed + ProofSink (tonic server).
 tonic.workspace             = true
+tokio-stream.workspace      = true
 
 # reth
 reth-chainspec.workspace                  = true

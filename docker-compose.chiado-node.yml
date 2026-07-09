@@ -72,6 +72,8 @@ services:
       # Kept for parity with the real-proof/proverd source deployment; current
       # code enters composer-driven dispatch when the real proof store is wired.
       EEZ_COMPOSER_DRIVEN: "1"
+      # Reverse control transport: composer opens the TCP connection to proverd.
+      EEZ_CONTROL_DIAL_ADDR: "${EEZ_CONTROL_DIAL_ADDR:-127.0.0.1:${EEZ_CONTROL_RPC_PORT:-50051}}"
       # Multi-composer: tolerate + adopt batches posted by the competing
       # composer instead of erroring "someone else is sequencing".
       EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES: "true"

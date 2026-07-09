@@ -26,11 +26,11 @@
 //! fail-closed settlement gates that consume the window's `composition.post_batch`
 //! + the validator's `pair_roots`/`tx_statuses`/`batch_commitment`, the
 //! publicInputsHash recompute (`eez-evm`), the ECDSA attestation, and the
-//! `control.v1.ProofSink` return path. Without a `--validator-bin` the daemon is
-//! a pure feed observer.
+//! `control.v1.ProofSink` return path.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::ErrorKind;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -47,6 +47,7 @@ use eez_evm::public_inputs::public_inputs_hashes;
 use eez_evm::signer::EcdsaProofSigner;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
+use tonic::transport::{Channel, Endpoint, Uri};
 use tracing::{debug, error, info, warn};
 
 /// Parse a 32-byte hex `B256` (the vkey arg).
@@ -63,13 +64,83 @@ fn vkey_from_address(addr: alloy_primitives::Address) -> B256 {
     B256::from(bytes)
 }
 
+#[derive(Clone)]
+struct ReverseHub {
+    current: tokio::sync::watch::Receiver<Option<Channel>>,
+}
+
+impl ReverseHub {
+    fn spawn(listener: tokio::net::TcpListener) -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        tokio::spawn(reverse_accept_loop(listener, tx));
+        Self { current: rx }
+    }
+
+    async fn channel(&self) -> eyre::Result<Channel> {
+        let mut rx = self.current.clone();
+        loop {
+            if let Some(channel) = rx.borrow().clone() {
+                return Ok(channel);
+            }
+            info!("reverse control: waiting for composer connection");
+            rx.changed()
+                .await
+                .map_err(|_| eyre::eyre!("reverse control listener exited"))?;
+        }
+    }
+}
+
+async fn reverse_accept_loop(
+    listener: tokio::net::TcpListener,
+    tx: tokio::sync::watch::Sender<Option<Channel>>,
+) {
+    loop {
+        let (sock, peer) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                warn!(error = %e, "reverse control accept failed");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let _ = sock.set_nodelay(true);
+        let slot = Arc::new(std::sync::Mutex::new(Some(sock)));
+        let connector = tower::service_fn(move |_: Uri| {
+            let sock = slot.lock().expect("reverse socket slot poisoned").take();
+            async move {
+                sock.map(hyper_util::rt::TokioIo::new).ok_or_else(|| {
+                    std::io::Error::new(
+                        ErrorKind::NotConnected,
+                        "reverse control socket already consumed",
+                    )
+                })
+            }
+        });
+        match Endpoint::from_static("http://composer.reverse")
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(true)
+            .connect_with_connector(connector)
+            .await
+        {
+            Ok(channel) => {
+                info!(%peer, "reverse control: composer connected");
+                tx.send_replace(Some(channel));
+            }
+            Err(e) => warn!(%peer, error = %e, "reverse control channel setup failed"),
+        }
+    }
+}
+
 /// Submit a signed attestation to the composer's `ProofSink` (connect-per-submit;
 /// settlements are infrequent). The composer fills `batch.proofs[]` with the
 /// 65-byte signature and posts the batch to L1. Returns the ack's `accepted`.
-async fn submit_slot_proof(url: &str, proof: SlotProof) -> eyre::Result<bool> {
-    let mut client = ProofSinkClient::connect(url.to_string())
+async fn submit_slot_proof(conn: &ReverseHub, proof: SlotProof) -> eyre::Result<bool> {
+    let channel = conn
+        .channel()
         .await
-        .map_err(|e| eyre::eyre!("ProofSink connect {url}: {e}"))?;
+        .map_err(|e| eyre::eyre!("ProofSink connect reverse://composer-dial-in: {e}"))?;
+    let mut client = ProofSinkClient::new(channel);
     let ack = client
         .submit_slot_proof(proof)
         .await
@@ -86,8 +157,8 @@ async fn submit_slot_proof(url: &str, proof: SlotProof) -> eyre::Result<bool> {
 /// stream drops), so a dropped/failed iteration simply re-receives the SAME
 /// oldest-unverified window next time — no directive is ever lost. Returns `None`
 /// on any connect/stream error (logged); the caller backs off + retries.
-async fn dispatch_one(control_addr: &str, prover_epoch: u64) -> Option<VerifyRange> {
-    let mut client = match ProverDispatchClient::connect(control_addr.to_string()).await {
+async fn dispatch_one(conn: &ReverseHub, prover_epoch: u64) -> Option<VerifyRange> {
+    let mut client = match conn.channel().await.map(ProverDispatchClient::new) {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "ProverDispatch connect failed");
@@ -117,17 +188,14 @@ async fn dispatch_one(control_addr: &str, prover_epoch: u64) -> Option<VerifyRan
 #[derive(Parser, Debug)]
 #[command(name = "eez-proverd", about = "EEZ out-of-process prover daemon (P3)")]
 struct Args {
-    /// Composer control-feed endpoint (gRPC). The ProofSink return path shares
-    /// the same endpoint once the attestation is wired.
-    #[arg(
-        long,
-        env = "EEZ_CONTROL_RPC_URL",
-        default_value = "http://127.0.0.1:50051"
-    )]
-    control_addr: String,
+    /// Reverse transport listener. The composer opens the TCP connection to
+    /// this address and proverd reuses that accepted socket for ControlFeed,
+    /// ProverDispatch, and ProofSink.
+    #[arg(long, env = "EEZ_CONTROL_LISTEN_ADDR", default_value = "0.0.0.0:50051")]
+    control_listen_addr: SocketAddr,
 
-    /// Path to the ZisK stateless validator (`native-validate`). When unset,
-    /// the daemon only OBSERVES the feed (no stateless re-execution).
+    /// Path to the ZisK stateless validator (`native-validate`).
+    /// Required alongside `--chain-config`.
     #[arg(long, env = "EEZ_VALIDATOR_BIN")]
     validator_bin: Option<String>,
 
@@ -163,18 +231,13 @@ struct Args {
     #[arg(long, env = "EEZ_PROOF_SIGNER_KEY", value_parser = parse_b256)]
     signer_key: Option<B256>,
 
-    /// The `ProofSink` endpoint (gRPC) to submit attestations to. Defaults to the
-    /// control-feed endpoint (the same composer).
-    #[arg(long, env = "EEZ_PROOF_SINK_URL")]
-    proof_sink_url: Option<String>,
-
     /// The L2 node's HTTP JSON-RPC endpoint, used to DURABLY BACKFILL blocks the
     /// composer's bounded replay ring already evicted (`eez_executionWitnessAugmented` +
     /// `debug_getRawBlock` against archive state). On a replay gap the prover
     /// reconstructs the missing `[cursor+1 .. live-1]` ControlEvents from here
-    /// rather than fast-forwarding past unproven blocks. When unset (`None`), the
-    /// daemon keeps the fail-loud, no-backfill behavior — a gap drops the batch
-    /// and retries on the next replay (observer mode is unchanged).
+    /// rather than fast-forwarding past unproven blocks. When explicitly unset
+    /// (`None`), the daemon keeps the fail-loud, no-backfill behavior — a gap
+    /// drops the batch and retries on the next replay.
     #[arg(long, env = "EEZ_L2_RPC_URL", default_value = "http://127.0.0.1:18688")]
     l2_rpc_url: Option<String>,
 
@@ -1562,14 +1625,12 @@ fn driven_past_target_can_backfill(
 async fn main() -> eyre::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
-    // A validator needs BOTH halves — fail loud rather than silently downgrading
-    // to a non-validating observer.
-    match (args.validator_bin.is_some(), args.chain_config.is_some()) {
-        (true, true) | (false, false) => {}
-        _ => eyre::bail!(
-            "--validator-bin and --chain-config (EEZ_VALIDATOR_BIN / EEZ_CHAIN_CONFIG) must be set together, or neither"
-        ),
-    }
+    // Reverse control is only useful for a real prover: fail loud instead of
+    // silently running a non-validating observer.
+    eyre::ensure!(
+        args.validator_bin.is_some() && args.chain_config.is_some(),
+        "--validator-bin and --chain-config (EEZ_VALIDATOR_BIN / EEZ_CHAIN_CONFIG) are required"
+    );
     // Attesting mode: a signer key turns the daemon from "validate + log" into
     // "validate + SIGN + submit". The gate vkey is the attester's OWN address, so
     // the hash the prover recomputes-and-signs can't drift from the key it signs
@@ -1585,22 +1646,26 @@ async fn main() -> eyre::Result<()> {
         .as_ref()
         .map_or(args.vkey, |s| vkey_from_address(s.address()));
     let vkey_configured = vkey != B256::ZERO;
-    let proof_sink_url = args
-        .proof_sink_url
-        .clone()
-        .unwrap_or_else(|| args.control_addr.clone());
 
     // Durable-backfill endpoint. The arg defaults to the L2 RPC, so a normally
     // deployed prover RECOVERS replay gaps out of the box; an EXPLICIT empty
     // value (`--l2-rpc-url ""` / `EEZ_L2_RPC_URL=`) normalizes to None — the
-    // fail-loud, no-backfill opt-out (observer mode is unchanged).
+    // fail-loud, no-backfill opt-out.
     let l2_rpc_url: Option<String> = args.l2_rpc_url.clone().filter(|u| !u.trim().is_empty());
+    let listener = tokio::net::TcpListener::bind(args.control_listen_addr)
+        .await
+        .map_err(|e| eyre::eyre!("reverse control bind {}: {e}", args.control_listen_addr))?;
+    info!(
+        listen = %args.control_listen_addr,
+        "reverse control transport enabled; accepting composer dial-in from any peer",
+    );
+    let conn = ReverseHub::spawn(listener);
+    let validating = true;
 
-    let validating = args.validator_bin.is_some() && args.chain_config.is_some();
     // The prover is always composer-driven: it takes its verify range from the
     // composer's ProverDispatch stream (the oldest posted-but-unverified window).
     info!(
-        control_addr = %args.control_addr,
+        control = "reverse://composer-dial-in",
         validating,
         vkey_configured,
         attesting = signer.is_some(),
@@ -1617,7 +1682,7 @@ async fn main() -> eyre::Result<()> {
     if let Some(s) = &signer {
         info!(
             attester = %s.address(),
-            proof_sink = %proof_sink_url,
+            proof_sink = "reverse://composer-dial-in",
             "ATTESTING — will SIGN + submit the publicInputsHash of each fully-verified settling window",
         );
     }
@@ -1664,7 +1729,7 @@ async fn main() -> eyre::Result<()> {
         // subscribing. A fresh dispatch connection per iteration keeps the prover
         // stateless; on any failure we `continue` and the next iteration re-receives
         // the SAME oldest-unverified window.
-        let vr: VerifyRange = match dispatch_one(&args.control_addr, prover_epoch).await {
+        let vr: VerifyRange = match dispatch_one(&conn, prover_epoch).await {
             Some(d) => {
                 info!(
                     from_block = d.from_block,
@@ -1680,7 +1745,7 @@ async fn main() -> eyre::Result<()> {
             }
         };
 
-        let mut control = match ControlFeedClient::connect(args.control_addr.clone()).await {
+        let mut control = match conn.channel().await.map(ControlFeedClient::new) {
             Ok(c) => c,
             Err(e) => {
                 warn!(error = %e, "control feed connect failed");
@@ -2272,7 +2337,7 @@ async fn main() -> eyre::Result<()> {
                                         public_inputs_hash: hash.to_vec(),
                                         post_batch_proof: sig.to_vec(),
                                     };
-                                    match submit_slot_proof(&proof_sink_url, proof).await {
+                                    match submit_slot_proof(&conn, proof).await {
                                         Ok(true) => {
                                             proof_sink_accepted = true;
                                             info!(

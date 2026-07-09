@@ -27,14 +27,14 @@ services:
     environment:
       RUST_LOG: "info,eez_proverd=info"
       EEZ_COMPOSER_DRIVEN: "1"
-      EEZ_CONTROL_RPC_URL: "http://127.0.0.1:${EEZ_CONTROL_RPC_PORT:-50051}"
+      EEZ_CONTROL_LISTEN_ADDR: "${EEZ_CONTROL_LISTEN_ADDR:-0.0.0.0:${EEZ_CONTROL_RPC_PORT:-50051}}"
       EEZ_L2_RPC_URL: "http://127.0.0.1:18688"
       EEZ_BACKFILL_CONCURRENCY: "${EEZ_BACKFILL_CONCURRENCY:-8}"
       EEZ_VALIDATOR_BIN: "/usr/local/bin/native-validate"
       EEZ_CHAIN_CONFIG: "/app/l2-chainconfig.json"
     command:
-      - "--control-addr"
-      - "http://127.0.0.1:${EEZ_CONTROL_RPC_PORT:-50051}"
+      - "--control-listen-addr"
+      - "${EEZ_CONTROL_LISTEN_ADDR:-0.0.0.0:${EEZ_CONTROL_RPC_PORT:-50051}}"
       - "--validator-bin"
       - "/usr/local/bin/native-validate"
       - "--chain-config"

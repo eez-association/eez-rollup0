@@ -46,6 +46,9 @@ alloy-rpc-client       = { workspace = true, features = ["reqwest"] }
 # The reth `debug_executionWitness` result type — `state/codes/keys/headers`
 # `Vec<Bytes>`, maps 1:1 onto the proto `ExecutionWitness` (repeated bytes).
 alloy-rpc-types-debug.workspace    = true
+tonic.workspace                    = true
+tower.workspace                    = true
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [dev-dependencies]
 # Sign synthetic user txs for the A3 outbound-gate unit test.
