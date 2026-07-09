@@ -1197,15 +1197,18 @@ pub async fn all_l2_execution_states(
         .collect()
 }
 
-/// Wait until `node.safe.stateRoot` appears in the contract's
-/// `L2ExecutionPerformed` history for this `Chain`. The attestation
-/// set grows monotonically, so this doesn't race the contract's
-/// advancing head: any past attestation matching the node's current
-/// safe head proves the node imported a block the contract has, at
-/// some point, declared canonical.
-pub async fn wait_for_node_caught_up(
+/// Wait until the node's safe `stateRoot` appears in the contract's
+/// `L2ExecutionPerformed` history for this `Chain` and differs from
+/// `genesis_root`. The attestation set grows monotonically, so this doesn't
+/// race the contract's advancing head: any past attestation matching the
+/// node's current safe head proves the node imported a block the contract
+/// has, at some point, declared canonical. Excluding `genesis_root` stops a
+/// node stuck at genesis from trivially passing by matching an empty-block
+/// attestation whose `newState` equals the registered initial state.
+pub async fn wait_for_safe_state(
     node: &NodeHandle,
     chain: &Chain<'_>,
+    genesis_root: B256,
     timeout: Duration,
 ) -> Result<()> {
     wait_for(timeout, || async {
@@ -1215,7 +1218,32 @@ pub async fn wait_for_node_caught_up(
             .flatten();
         let attested = chain.executed_states().await.unwrap_or_default();
         Ok(match node_root {
-            Some(n) if n != B256::ZERO && attested.contains(&n) => Some(()),
+            Some(n) if n != B256::ZERO && n != genesis_root && attested.contains(&n) => Some(()),
+            _ => None,
+        })
+    })
+    .await
+}
+
+/// Wait until `node`'s safe head reaches block height `min_block` or
+/// beyond. Used to prove a late-joining follower replayed the *entire*
+/// pre-existing backlog, not just the first few batches: `wait_for_safe_state`
+/// only proves *some* attested non-genesis block landed, this proves depth.
+pub async fn wait_for_min_safe_block(
+    node: &NodeHandle,
+    min_block: u64,
+    timeout: Duration,
+) -> Result<()> {
+    wait_for(timeout, || async {
+        let n = block_number_at(
+            &node.l2_rpc_url(),
+            alloy_rpc_types_eth::BlockNumberOrTag::Safe,
+        )
+        .await
+        .ok()
+        .flatten();
+        Ok(match n {
+            Some(b) if b >= min_block => Some(()),
             _ => None,
         })
     })

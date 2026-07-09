@@ -13,8 +13,8 @@ use alloy_rpc_types_eth::BlockNumberOrTag;
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeConfig,
-    NodeHandle, block_number_and_hash_at, reorg_genesis_path, reorg_genesis_state_root,
-    safe_block_state_root, wait_for_node_caught_up,
+    NodeHandle, block_number_and_hash_at, override_env, reorg_genesis_path,
+    reorg_genesis_state_root, safe_block_state_root, wait_for_min_safe_block, wait_for_safe_state,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -108,7 +108,7 @@ async fn happy_case_builder_sustained() {
     let follower = NodeHandle::start("follower", &NodeConfig::default(), &follower_env)
         .await
         .unwrap();
-    wait_for_node_caught_up(&follower, &chain, DEFAULT_TIMEOUT)
+    wait_for_safe_state(&follower, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("follower did not catch up via L1 replay");
     follower.assert_no_process_death();
@@ -286,10 +286,10 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     // I3 — Each node independently catches up to the (now-advancing)
     // contract: at some poll, `node.safe.stateRoot == contract.stateRoot`
     // sampled back-to-back. The two nodes don't have to coincide.
-    wait_for_node_caught_up(&c1, &chain, DEFAULT_TIMEOUT)
+    wait_for_safe_state(&c1, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("c1 did not catch up to contract post-reorg");
-    wait_for_node_caught_up(&c2, &chain, DEFAULT_TIMEOUT)
+    wait_for_safe_state(&c2, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("c2 did not catch up to contract post-reorg");
 
@@ -332,7 +332,7 @@ async fn happy_case_follower_l1_derived() {
         .expect("sequencer landed batches");
 
     let follower = spawn_follower("follower", &harness, None).await.unwrap();
-    wait_for_node_caught_up(&follower, &chain, DEFAULT_TIMEOUT)
+    wait_for_safe_state(&follower, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("follower did not catch up via L1 replay");
 
@@ -363,7 +363,7 @@ async fn happy_case_follower_sequencer_rpc() {
         .wait_for_batches(2, DEFAULT_TIMEOUT)
         .await
         .expect("sequencer landed batches");
-    wait_for_node_caught_up(&follower, &chain, DEFAULT_TIMEOUT)
+    wait_for_safe_state(&follower, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("follower did not catch up via L1 replay");
 
@@ -446,7 +446,7 @@ async fn happy_case_follower_l1_reorg_recovers() {
         .wait_for_batches(pre_batches + 1, DEFAULT_TIMEOUT)
         .await
         .expect("no batches landed after reorg");
-    wait_for_node_caught_up(&follower, &chain, DEFAULT_TIMEOUT)
+    wait_for_safe_state(&follower, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("follower did not catch up post-reorg");
 
@@ -476,10 +476,10 @@ async fn happy_case_follower_cross_safe_parity() {
         spawn_follower("f_seq", &harness, Some(&seq_rpc)),
     )
     .unwrap();
-    wait_for_node_caught_up(&f_l1, &chain, DEFAULT_TIMEOUT)
+    wait_for_safe_state(&f_l1, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("f_l1 did not catch up");
-    wait_for_node_caught_up(&f_seq, &chain, DEFAULT_TIMEOUT)
+    wait_for_safe_state(&f_seq, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("f_seq did not catch up");
 
@@ -506,5 +506,160 @@ async fn happy_case_follower_cross_safe_parity() {
 
     f_l1.assert_no_process_death();
     f_seq.assert_no_process_death();
+    seq.assert_no_process_death();
+}
+
+/// Unified `eez-node` follower with `EEZ_SEQUENCER_RPC` pointing at a
+/// *rogue* source: a separate `eez-node` on `--chain dev` (block production
+/// on, composer off) serving a different chain as its `latest`, while the
+/// honest sequencer posts the real batches to L1. The only follower test
+/// where the unsafe source disagrees with L1 — so the only one that proves
+/// the deriver is authoritative rather than merely agreeing with an honest
+/// source.
+/// Asserts:
+///   - safe head reaches a non-genesis contract-attested stateRoot
+///     (membership excludes the rogue's chain; non-genesis excludes a
+///     trivial stuck-at-genesis pass).
+///   - the unsafe poll actually processed a rogue head: the follower logs
+///     that reth accepted the (body-less, cross-genesis) head as a sync
+///     target, so broken wiring can't silently downgrade this to
+///     L1-derived-only.
+///   - no process death.
+///
+/// Different-genesis (not a same-chain fork) is deliberate: the follower
+/// never fetches the rogue's bodies (no peers — discovery is disabled), so
+/// reth sees an unknown head and answers `SYNCING`, which the committer
+/// accepts — the deriver advances safe regardless.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
+    let harness = Harness::with_anvil_config(
+        AnvilConfig::for_reorg(),
+        reorg_genesis_state_root().unwrap(),
+    )
+    .await
+    .unwrap();
+    let chain = harness.chain();
+    let genesis = reorg_genesis_path();
+
+    // Honest sequencer: real genesis, composer on, real txs so attested
+    // states move past genesis.
+    let seq_cfg = NodeConfig {
+        genesis_path: Some(genesis.as_path()),
+    };
+    let seq = NodeHandle::start("seq", &seq_cfg, &harness.env())
+        .await
+        .unwrap();
+    seq.run_tx_spammer(ANVIL_KEY_1);
+
+    // Rogue source: a *different* chain (`--chain dev`) that never posts to
+    // L1 (composer off) and never converges on the real chain — it only
+    // feeds the follower divergent unsafe heads.
+    let mut rogue_env = harness.env();
+    rogue_env.push(("EEZ_COMPOSER_DISABLED", "1".to_string()));
+    let rogue = NodeHandle::start("rogue", &NodeConfig::default(), &rogue_env)
+        .await
+        .unwrap();
+
+    // Follower: real genesis + L1 deriver, unsafe head pointed at the
+    // rogue. `eez_node::follower=info` surfaces the per-head outcome events.
+    let follower_env = override_env(
+        harness.follower_env(Some(&rogue.l2_rpc_url())),
+        "RUST_LOG",
+        "warn,eez_node::follower=info",
+    );
+    let follower_cfg = NodeConfig {
+        genesis_path: Some(genesis.as_path()),
+    };
+    let follower = NodeHandle::start("follower", &follower_cfg, &follower_env)
+        .await
+        .unwrap();
+
+    // Safe head reaches a real (non-genesis) attested stateRoot despite the rogue.
+    wait_for_safe_state(
+        &follower,
+        &chain,
+        reorg_genesis_state_root().unwrap(),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("follower safe head did not reach a non-genesis attested stateRoot while on the rogue");
+
+    // Proof the rogue path actually ran (not silently downgraded to L1-derived).
+    assert!(
+        follower
+            .log_count_matching(&["reth accepted sequencer head as a sync target"])
+            .unwrap()
+            > 0,
+        "follower never processed a rogue unsafe head",
+    );
+
+    follower.assert_no_process_death();
+    seq.assert_no_process_death();
+}
+
+/// Unified `eez-node` follower joining late against a deep backlog: the
+/// sequencer posts 4 batches *before* the follower exists, so its boot
+/// `catch_up` must replay the whole history in one pass (`scan_batches`).
+/// Every other test starts the follower after ~2 batches; this is the only
+/// one that exercises catch-up at non-trivial depth (the "spin up a new RPC
+/// node long after genesis" path). Asserts the follower's safe head reaches a
+/// non-genesis contract-attested stateRoot *and* climbs to the full backlog
+/// depth the chain already had at join time — proving it replayed the entire
+/// history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn happy_case_follower_deep_backfill_late_join() {
+    let harness = Harness::fresh().await.unwrap();
+    let chain = harness.chain();
+
+    // Honest sequencer with real txs, building a deep backlog on L1.
+    let seq = NodeHandle::start("seq", &NodeConfig::default(), &harness.env())
+        .await
+        .unwrap();
+    seq.run_tx_spammer(ANVIL_KEY_1);
+
+    // Pile up history BEFORE the follower exists.
+    chain
+        .wait_for_batches(4, DEFAULT_TIMEOUT)
+        .await
+        .expect("sequencer did not build a deep backlog");
+
+    // Snapshot how deep the backlog is at join time: the sequencer's
+    // L1-derived safe height is exactly the history the follower must
+    // replay.
+    let (backlog_depth, backlog_hash) =
+        block_number_and_hash_at(&seq.l2_rpc_url(), BlockNumberOrTag::Safe)
+            .await
+            .unwrap()
+            .expect("sequencer has a safe block");
+
+    // Fresh follower joins late; its boot catch-up must replay everything.
+    let follower = spawn_follower("follower", &harness, None).await.unwrap();
+
+    wait_for_safe_state(&follower, &chain, B256::ZERO, DEFAULT_TIMEOUT)
+        .await
+        .expect("late-joining follower did not backfill into an attested stateRoot");
+
+    // Prove catch-up replayed the *entire* pre-existing backlog, not just
+    // the first batch: the follower's safe head must climb to the depth the
+    // chain already had when it joined (which also implies it is past genesis).
+    wait_for_min_safe_block(&follower, backlog_depth, DEFAULT_TIMEOUT)
+        .await
+        .unwrap_or_else(|_| {
+            panic!("follower did not replay full backlog to block {backlog_depth}")
+        });
+
+    let (_, follower_backlog_hash) = block_number_and_hash_at(
+        &follower.l2_rpc_url(),
+        BlockNumberOrTag::Number(backlog_depth),
+    )
+    .await
+    .unwrap()
+    .expect("follower has the backlog block");
+    assert_eq!(
+        follower_backlog_hash, backlog_hash,
+        "follower backlog block hash must match sequencer at block {backlog_depth}",
+    );
+
+    follower.assert_no_process_death();
     seq.assert_no_process_death();
 }
