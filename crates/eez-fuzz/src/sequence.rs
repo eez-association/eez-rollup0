@@ -25,6 +25,8 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolValue};
 use arbitrary::Arbitrary;
 use eez_composer::LocalChainClient;
+use eez_evm::entries::encode_execute_incoming;
+use eez_evm::types::loadExecutionTableCall;
 use eez_evm::{ChainDialect, EvmProtocol};
 use eez_protocol::{
     ChainClient, Composition, CompositionResult, DEFAULT_CCM_GAS_LIMIT, EntryChainClient,
@@ -174,6 +176,18 @@ fn run_tx(
     kind: TxKind,
     data: Vec<u8>,
 ) -> ExecutionResult {
+    run_tx_value(cache, caller, kind, data, U256::ZERO)
+}
+
+/// Like [`run_tx`] but with an explicit `msg.value` — the inbound settlement tx
+/// (`executeIncomingCrossChainCall`) enforces `msg.value == value`.
+fn run_tx_value(
+    cache: &mut CacheDB<EmptyDB>,
+    caller: Address,
+    kind: TxKind,
+    data: Vec<u8>,
+    value: U256,
+) -> ExecutionResult {
     let nonce = cache
         .cache
         .accounts
@@ -190,6 +204,7 @@ fn run_tx(
             gas_limit: 16_000_000,
             nonce,
             chain_id: Some(1),
+            value,
             ..Default::default()
         })
         .expect("tx execution");
@@ -468,26 +483,48 @@ impl SeqWorld {
         compose_transaction(&EvmProtocol, entry_ec.as_ref(), raw, entry_id, rollups).await
     }
 
-    /// Settle a composition's targets back into the mutable base so the next
-    /// step sees the effect. Replays the system tx the deriver would
-    /// (`executeIncomingCrossChainCall`, which self-loads the execution table)
-    /// against the chain each target lives on — L2 for an L1→L2 inbound target,
-    /// L1 for an L2→L1 outbound target — so the oracle works in both directions.
+    /// Settle a composition's L1→L2 inbound entries back into the mutable L2
+    /// base so the next step sees the effect. Mirrors the deriver's
+    /// [`build_inbound_system_txs`](eez_evm::system_tx): for each L1 deferred
+    /// entry destined for L2, run the self-contained
+    /// `EEZL2.executeIncomingCrossChainCall` (it self-loads the execution table
+    /// AND delivers the call through the lazily-created source proxy in ONE
+    /// system tx — no separate proxy address to thread). Entries for other
+    /// rollups (an L2→L1 outbound settles on L1 via a different path) are
+    /// skipped.
     fn settle(&mut self, comp: &Composition<EvmProtocol>) {
         for t in &comp.targets {
-            let (cache, ccm) = if t.rollup_id == RollupId(L2_ROLLUP_ID) {
-                (&mut self.l2, self.eezl2)
-            } else {
-                (&mut self.l1, self.eez)
+            // Only L1→L2 inbound (an L2 target) settles here; an L2→L1 outbound
+            // settles on L1 via a different (load + user-tx) path.
+            if t.rollup_id != RollupId(L2_ROLLUP_ID) {
+                continue;
+            }
+            // The target's `load_table_payload` is `loadExecutionTable(entries)`;
+            // each entry's `incomingCalls[0]` is the inbound call. Rebuild the
+            // self-contained `executeIncomingCrossChainCall` from it (self-loads
+            // the table + delivers via the lazily-created source proxy).
+            let Ok(decoded) = loadExecutionTableCall::abi_decode(&t.load_table_payload) else {
+                continue;
             };
-            // Load the execution table into the CCM (`loadExecutionTable`).
-            run_tx(cache, SYSTEM_ADDR, TxKind::Call(ccm), t.load_table_payload.clone());
-            // TODO(PR#21 follow-up): `execute_payload` is the outer call's raw
-            // calldata and must be delivered to the TARGET PROXY (its fallback
-            // forwards to the CCM), not to `ccm` — main split settlement this way
-            // in the 5c51e02 bump. The harness needs to thread the proxy address
-            // through `TargetComposition` (or decode it from the batch) before
-            // this settles; until then the destination contract is not updated.
+            for entry in decoded.entries {
+                let Some(call) = entry.incomingCalls.first() else {
+                    continue;
+                };
+                let target = call.targetAddress;
+                let value = call.value;
+                let data = call.data.clone();
+                let source = call.sourceAddress;
+                let src_rollup = RollupId(u64::try_from(call.sourceRollupId).unwrap_or(u64::MAX));
+                let calldata =
+                    encode_execute_incoming(target, value, data, source, src_rollup, entry.clone());
+                run_tx_value(
+                    &mut self.l2,
+                    SYSTEM_ADDR,
+                    TxKind::Call(self.eezl2),
+                    calldata,
+                    value,
+                );
+            }
         }
     }
 
@@ -998,8 +1035,16 @@ impl SeqWorld {
         // Cumulative invariant: every target holds its last intended value,
         // read from the chain it settles on (L1 for L2→L1 targets, else L2).
         for (target, want) in &self.expected {
-            let cache = if self.l1_settled.contains(target) { &self.l1 } else { &self.l2 };
-            assert_eq!(read_slot0(cache, *target), *want, "cumulative: target {target}");
+            let cache = if self.l1_settled.contains(target) {
+                &self.l1
+            } else {
+                &self.l2
+            };
+            assert_eq!(
+                read_slot0(cache, *target),
+                *want,
+                "cumulative: target {target}"
+            );
         }
     }
 }

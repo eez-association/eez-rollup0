@@ -56,8 +56,11 @@
 //! state (one replay + a storage read; the decisive correctness check).
 
 use alloy_primitives::{Address, TxKind, U256};
+use alloy_sol_types::SolCall;
 use eez_evm::EvmProtocol;
-use eez_protocol::Composition;
+use eez_evm::entries::encode_execute_incoming;
+use eez_evm::types::loadExecutionTableCall;
+use eez_protocol::{Composition, RollupId};
 use reth_provider::test_utils::MockEthProvider;
 use reth_revm::database::StateProviderDatabase;
 use reth_storage_api::StateProviderFactory;
@@ -103,23 +106,41 @@ impl World {
         expected_settled: Option<U256>,
     ) {
         for target in &comp.targets {
-            // Replay the settling system tx (`executeIncomingCrossChainCall`,
-            // which self-loads the execution table) and read the destination's
-            // real settled slot-0.
-            let (r, settled) = replay_settle(
-                &self.l2_provider,
-                self.eezl2,
-                target.execute_payload.clone(),
-                self.value_l2,
-            );
-            assert!(r.is_success(), "L2 inbound execute+ratify reverted: {r:?}");
-            if let Some(expected) = expected_settled {
-                assert_eq!(
-                    settled, expected,
-                    "settled {} slot-0 = {settled}, expected {expected} — the cross-chain \
-                     call did not really run (return data can look right past a mock prover)",
+            // Rebuild the self-contained `executeIncomingCrossChainCall` from the
+            // target's `loadExecutionTable` entries (`incomingCalls[0]`), replay
+            // it (self-loads the table + delivers via the lazily-created source
+            // proxy), and read the destination's real settled slot-0.
+            let decoded = loadExecutionTableCall::abi_decode(&target.load_table_payload)
+                .expect("target load_table_payload decodes as loadExecutionTable");
+            for entry in decoded.entries {
+                let Some(call) = entry.incomingCalls.first() else {
+                    continue;
+                };
+                let src_rollup = RollupId(u64::try_from(call.sourceRollupId).unwrap_or(u64::MAX));
+                let calldata = encode_execute_incoming(
+                    call.targetAddress,
+                    call.value,
+                    call.data.clone(),
+                    call.sourceAddress,
+                    src_rollup,
+                    entry.clone(),
+                );
+                let (r, settled) = replay_settle(
+                    &self.l2_provider,
+                    self.eezl2,
+                    calldata,
+                    call.value,
                     self.value_l2,
                 );
+                assert!(r.is_success(), "L2 inbound execute+ratify reverted: {r:?}");
+                if let Some(expected) = expected_settled {
+                    assert_eq!(
+                        settled, expected,
+                        "settled {} slot-0 = {settled}, expected {expected} — the cross-chain \
+                         call did not really run (return data can look right past a mock prover)",
+                        self.value_l2,
+                    );
+                }
             }
         }
 
@@ -138,6 +159,7 @@ pub fn replay_settle(
     provider: &MockEthProvider,
     eezl2: Address,
     execute: Vec<u8>,
+    value: U256,
     settle_target: Address,
 ) -> (ExecutionResult, U256) {
     let sp = provider.latest().expect("latest state");
@@ -159,6 +181,7 @@ pub fn replay_settle(
             gas_limit: 16_000_000,
             nonce: 0,
             chain_id: Some(1),
+            value,
             ..Default::default()
         })
         .expect("evm transact exec");

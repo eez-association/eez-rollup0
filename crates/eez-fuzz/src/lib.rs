@@ -652,28 +652,24 @@ mod direction_tests {
     }
 
     /// The direction under review (an L2 tx that calls a proxy of an L1
-    /// contract). Locks the CURRENT reality: the composer has no L2-as-entry
-    /// settling path, so dispatching the L2→L1 call drives the `EvmL1Style`
-    /// follower onto a path it can't honor and `compose` returns `Err`
-    /// (`target transaction 0 reverted`). This is the "ignored / reverts in L2"
-    /// case from review, now reproduced deterministically. The day the composer
-    /// grows real L2→L1 support, this test flips and tells us so.
+    /// contract). Main enabled real L2→L1 outbound cross-chain support (the
+    /// `deb/crosschain-v1` work), so — exactly as the old rejection test
+    /// predicted it eventually would — `compose` now SUCCEEDS on the L2-entry
+    /// world and emits a non-empty composition (an L1 target for the outbound
+    /// call). Full settled-state assertion for the L2→L1 direction settles on
+    /// L1 via the outbound (load + user-tx) path, a follow-up beyond this
+    /// L1→L2-centric oracle.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn l2_to_l1_is_rejected_today() {
+    async fn l2_to_l1_composes() {
         let world = World::boot_l2_entry();
         let (raw, _expected) = tx(Direction::L2ToL1).resolve_and_sign(&world.dict());
-        let res = world.compose(&raw).await;
+        let comp = world
+            .compose(&raw)
+            .await
+            .expect("L2→L1 must compose now that main enabled the direction");
         assert!(
-            res.is_err(),
-            "L2→L1 unexpectedly produced a composition — the direction may now \
-             be supported; revisit the oracle. Got: {res:?}",
-        );
-        // Pin the shape of the rejection so a *different* failure mode (e.g. a
-        // panic, or a silently-empty Ok) is caught as a regression.
-        let msg = format!("{}", res.unwrap_err());
-        assert!(
-            msg.contains("reverted"),
-            "L2→L1 rejected, but not via the expected target-revert path: {msg}",
+            !comp.targets.is_empty(),
+            "L2→L1 composition must emit at least one target",
         );
     }
 }
