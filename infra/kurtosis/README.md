@@ -133,8 +133,11 @@ kurtosis service logs $E eez-node | grep -i latest_number | tail
 # cross-chain composer alive:
 kurtosis service logs $E eez-node | grep -i "cross-chain EvmComposer constructed"
 
+# node loaded the generated deployment from /out/deployments.env:
+kurtosis service logs $E eez-node | grep -iE "sourcing /out/deployments.env|loaded EEZ_REGISTRY_ADDRESS|eez_registry=" | tail
+
 # settlement landing (allow a couple minutes after startup for MEV warmup):
-kurtosis service logs $E eez-node | grep -iE "advanced L2 safe head" | tail
+kurtosis service logs $E eez-node | grep -iE "bundle outcome observed|settled=true|advanced L2 safe head" | tail
 
 # count settled batches:
 kurtosis files download $E eez-deployments /tmp/dep && set -a && . /tmp/dep/deployments.env && set +a
@@ -166,29 +169,26 @@ to a locally-built block that never saw the bundle. Set
 `EEZ_MEV_WARMUP_BLOCK=0` to skip the gate (e.g. re-running against a warm
 enclave).
 
-- [`infra/kurtosis/devnet-test.sh`](devnet-test.sh) — **inbound-only** (L1→L2).
+- [`infra/kurtosis/scripts/devnet-test.sh`](scripts/devnet-test.sh) — **inbound-only** (L1→L2).
   Deploys Value on L2, creates setter + deposit CrossChainProxies on the shared
   L1, fires setter/deposit waves at the **L1 front**, and asserts L1
   `rollups(id).stateRoot` matches L2's actual state root with zero divergence.
 
   ```bash
-  bash infra/kurtosis/devnet-test.sh
+  bash infra/kurtosis/scripts/devnet-test.sh
   ```
 
-- [`infra/kurtosis/wave-test.sh`](wave-test.sh) — the comprehensive harness.
+- [`infra/kurtosis/scripts/wave-test.sh`](scripts/wave-test.sh) — the comprehensive harness.
   `EEZ_WAVE_MODE` = `inbound` | `outbound` | `mixed` | `mixed-pure` exercises
-  L1→L2 **and** L2→L1 (via the L2 front), direct + wrapper, with the wave loop
-  and assertions in [`wave-lib.sh`](wave-lib.sh).
+  L1→L2 **and** L2→L1 (via the L2 front), direct + wrapper.
 
   ```bash
-  EEZ_WAVE_MODE=mixed EEZ_WAVE_COUNT=3 bash infra/kurtosis/wave-test.sh
+  EEZ_WAVE_MODE=mixed EEZ_WAVE_COUNT=3 bash infra/kurtosis/scripts/wave-test.sh
   ```
 
 `devnet-test.sh` reads the composer log via `kurtosis service logs eez-devnet
 eez-node` (a snapshot it refreshes itself; set `KURTOSIS_ENCLAVE` if you named
-the enclave something else). `wave-test.sh` defers log handling to
-`wave-lib.sh`; set `EEZ_NODE_LOG` to point it at a log file if you tee one
-yourself. Cross-chain ops go to the fronts published by eez-node: `l1-xchain`
+the enclave something else). Cross-chain ops go to the fronts published by eez-node: `l1-xchain`
 (Inbound) and `l2-xchain` (Outbound).
 
 ## Configuration
@@ -299,7 +299,7 @@ Suggested progression for exercising the pipeline end to end:
 6. **Bundle starvation** — push spamoor load high enough that relay block
    validation exceeds the slot time, so bundles miss their target block;
    confirm the composer retries cleanly instead of stalling.
-7. **Concurrent submission + reorg** — run `infra/kurtosis/devnet-test.sh`
+7. **Concurrent submission + reorg** — run `infra/kurtosis/scripts/devnet-test.sh`
    while `reorg-scheduler.sh` is active, so a batch is in flight when its
    target block reorgs.
 8. **Soak** — leave spamoor and the reorg scheduler running for an extended

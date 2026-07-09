@@ -27,7 +27,7 @@
 # PATH; sync-rollups-protocol submodule initialised.
 
 set -euo pipefail
-K="$(cd "$(dirname "$0")" && pwd)"          # infra/kurtosis
+K="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="$(cd "$K/../.." && pwd)"
 ENCLAVE="${KURTOSIS_ENCLAVE:-eez-devnet}"
 
@@ -98,7 +98,7 @@ retry() {
 # Prefer an already-placed $REPO/deployments.env (e.g. hand-copied, or cached
 # by CI); otherwise pull the artifact fresh from the enclave so there's no
 # separate "download it yourself first" step.
-if [[ -f "$REPO/deployments.env" ]]; then
+if [[ "${EEZ_USE_LOCAL_DEPLOYMENTS:-0}" == "1" && -f "$REPO/deployments.env" ]]; then
     set -a; source "$REPO/deployments.env"; set +a
 else
     kurtosis files download "$ENCLAVE" eez-deployments "$DEPLOY_DIR" >/dev/null 2>&1 \
