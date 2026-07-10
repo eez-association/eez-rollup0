@@ -12,10 +12,10 @@ use alloy_rpc_types_eth::BlockNumberOrTag;
 
 mod common;
 use common::{
-    ANVIL_ADDR, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_4, AnvilConfig, Harness, NodeConfig,
-    NodeHandle, block_number_and_hash_at, override_env, reorg_genesis_path,
-    reorg_genesis_state_root, wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
-    wait_for_safe_state,
+    ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
+    AnvilConfig, Harness, NodeConfig, NodeHandle, block_number_and_hash_at, override_env,
+    reorg_genesis_path, reorg_genesis_state_root, send_l2_value_transfer_confirmed,
+    wait_for_new_attested_safe_block, wait_for_safe_chain_contains, wait_for_safe_state,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -271,6 +271,15 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     // `batchesPosted` and `stateRoot` drop back to a pre-reorg value
     // and only re-grow as composers repost.
     harness.anvil.reorg(3).await.unwrap();
+    send_l2_value_transfer_confirmed(
+        &c1.l2_rpc_url(),
+        ANVIL_KEY_3,
+        ANVIL_ADDR_3,
+        U256::from(1u64),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("post-reorg L2 tx did not land on c1");
 
     // I4 — Liveness FIRST: wait for `batchesPosted` to climb past the
     // pre-reorg count. Without this, I3 below could trivially succeed
@@ -467,6 +476,15 @@ async fn happy_case_follower_l1_reorg_recovers() {
         .expect("pre-reorg batches");
     let pre_reorg_states = chain.executed_states().await.unwrap();
     harness.anvil.reorg(3).await.unwrap();
+    send_l2_value_transfer_confirmed(
+        &seq.l2_rpc_url(),
+        ANVIL_KEY_3,
+        ANVIL_ADDR_3,
+        U256::from(1u64),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("post-reorg L2 tx did not land on sequencer");
     chain
         .wait_for_batches(pre_batches + 1, DEFAULT_TIMEOUT)
         .await
@@ -609,11 +627,13 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
         .unwrap();
     seq.run_tx_spammer(ANVIL_KEY_1);
 
-    // Rogue source: a *different* chain (`--chain dev`) that never posts to
-    // L1 (composer off) and never converges on the real chain — it only
-    // feeds the follower divergent unsafe heads.
-    let mut rogue_env = harness.env();
-    rogue_env.push(("EEZ_COMPOSER_DISABLED", "1".to_string()));
+    // Rogue source: a standalone *different* chain (`--chain dev`) with no L1
+    // env, so it cannot post batches and never converges on the real chain.
+    // It only feeds the follower divergent unsafe heads.
+    let rogue_env = vec![(
+        "RUST_LOG",
+        std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
+    )];
     let rogue = NodeHandle::start("rogue", &NodeConfig::default(), &rogue_env)
         .await
         .unwrap();

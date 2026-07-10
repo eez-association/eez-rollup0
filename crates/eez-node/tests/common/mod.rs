@@ -570,6 +570,30 @@ pub async fn send_l2_value_transfer(
     Ok(hash)
 }
 
+/// Send one L2 value transfer and wait for its receipt. Use this when a test
+/// needs to prove a later L1 attestation includes a fresh L2 state transition.
+pub async fn send_l2_value_transfer_confirmed(
+    rpc_url: &str,
+    signing_key: &str,
+    to: Address,
+    value: U256,
+    timeout: Duration,
+) -> Result<alloy_primitives::TxHash> {
+    let hash = send_l2_value_transfer(rpc_url, signing_key, to, value).await?;
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    wait_for(timeout, || async {
+        let Some(receipt) = provider.get_transaction_receipt(hash).await? else {
+            return Ok(None);
+        };
+        if !receipt.status() {
+            bail!("L2 value transfer reverted: {hash}");
+        }
+        Ok(Some(()))
+    })
+    .await?;
+    Ok(hash)
+}
+
 /// Wait until `eth_blockNumber` responds at `rpc_url`. Used to confirm a
 /// just-spawned eez-node's L2 RPC is up before we send txs at it.
 pub async fn wait_for_l2_rpc(rpc_url: &str, timeout: Duration) -> Result<()> {
