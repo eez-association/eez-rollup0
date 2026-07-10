@@ -198,16 +198,42 @@ the enclave something else). Cross-chain ops go to the fronts published by eez-n
 
 ## Configuration
 
-Everything is in [`args.example.yaml`](args.example.yaml), two blocks:
+[`args.example.yaml`](args.example.yaml) is the template. On the first run,
+`up.sh` copies it to the gitignored `infra/kurtosis/args.yaml`. Edit that file
+for local deployments:
 
-- **`ethereum_package:`** — participants, `mev_type`/`mev_params`,
-  `spamoor_params`, `additional_services`. Passed straight to the package.
-- **`eez:`** — Pair A's image tags, poster/proof-signer keys, timing
-  (`l1_block_time_ms` must match `network_params.seconds_per_slot`), and L2
-  genesis config.
+```yaml
+ethereum_package:
+  network_params:
+    seconds_per_slot: 12
 
-Both pairs boot from the same generated genesis, so slot cadence and fork
-schedule can never drift between them.
+eez:
+  l1_block_time_ms: 12000
+  l2_block_time_ms: 2000
+  proof_time_ms: 6000
+  builder_rpc_url: "http://custom-builder:8545"
+  relay_url: "http://custom-relay:9062"
+```
+
+`ethereum_package:` configures the shared L1; `eez:` configures `eez-node`.
+Keep `l1_block_time_ms` equal to `seconds_per_slot * 1000`. Do not edit `.env`:
+[`main.star`](main.star) maps `eez:` settings to the container environment.
+After changing the configuration, recreate the enclave:
+
+```bash
+bash infra/kurtosis/down.sh
+bash infra/kurtosis/up.sh infra/kurtosis/args.yaml
+```
+
+To expose another node variable, add it to `eez_env` in `main.star`, add the
+corresponding setting to `args.example.yaml`, and recreate the enclave:
+
+```python
+"EEZ_SOME_VARIABLE": str(eez.get("some_variable", "default-value")),
+```
+
+Shell variables documented under **Run** or in the helper scripts control the
+host-side commands, not the running `eez-node` container.
 
 **Published ports** (host access via `kurtosis port print eez-devnet <service> <port-id>`):
 
