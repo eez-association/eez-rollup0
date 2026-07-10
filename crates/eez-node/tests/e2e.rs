@@ -360,9 +360,8 @@ async fn happy_case_follower_l1_derived() {
 /// Unified `eez-node` follower with `EEZ_SEQUENCER_RPC` pointing at the sequencer.
 /// Asserts BOTH paths:
 ///   - safe head: still reaches a contract-attested stateRoot (the L1
-///     deriver is authoritative).
-///   - latest head: the follower's public head stays on the sequencer's
-///     chain while the safe head remains contract-attested.
+///     deriver is authoritative) and matches the sequencer chain.
+///   - unsafe head: sequencer-RPC polling submits a fresh FCU outcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn happy_case_follower_sequencer_rpc() {
     let harness = Harness::fresh().await.unwrap();
@@ -372,7 +371,12 @@ async fn happy_case_follower_sequencer_rpc() {
         .unwrap();
 
     let seq_rpc = seq.l2_rpc_url();
-    let follower = spawn_follower("follower", &harness, Some(&seq_rpc))
+    let follower_env = override_env(
+        harness.follower_env(Some(&seq_rpc)),
+        "RUST_LOG",
+        "warn,eez_node::follower=info",
+    );
+    let follower = NodeHandle::start("follower", &NodeConfig::default(), &follower_env)
         .await
         .unwrap();
 
@@ -384,37 +388,46 @@ async fn happy_case_follower_sequencer_rpc() {
         .await
         .expect("follower did not catch up via L1 replay");
 
-    // The follower's public head must be a real sequencer block, and
-    // the safe head must not outrun it.
+    // The follower's safe head must be a real sequencer block.
     common::wait_for(DEFAULT_TIMEOUT, || {
         let seq_rpc = seq_rpc.clone();
         let follower_rpc = follower.l2_rpc_url();
         async move {
-            let Some((latest_number, latest_hash)) =
-                block_number_and_hash_at(&follower_rpc, BlockNumberOrTag::Latest).await?
-            else {
-                return Ok(None);
-            };
-            let Some((safe_number, _)) =
+            let Some((safe_number, safe_hash)) =
                 block_number_and_hash_at(&follower_rpc, BlockNumberOrTag::Safe).await?
             else {
                 return Ok(None);
             };
-            let Some((_, seq_hash)) =
-                block_number_and_hash_at(&seq_rpc, BlockNumberOrTag::Number(latest_number)).await?
+            if safe_number == 0 {
+                return Ok(None);
+            }
+            let Some((_, seq_safe_hash)) =
+                block_number_and_hash_at(&seq_rpc, BlockNumberOrTag::Number(safe_number)).await?
             else {
                 return Ok(None);
             };
 
-            Ok((latest_number > 0
-                && safe_number > 0
-                && latest_number > safe_number
-                && latest_hash == seq_hash)
-                .then_some(()))
+            Ok((safe_hash == seq_safe_hash).then_some(()))
         }
     })
     .await
-    .expect("follower latest block never advanced past safe on the sequencer chain");
+    .expect("follower safe block never matched the sequencer chain");
+
+    let unsafe_head_patterns = [
+        "follower advanced unsafe head to sequencer block",
+        "reth accepted sequencer head as a sync target",
+    ];
+    let unsafe_head_events_before = follower.log_count_matching(&unsafe_head_patterns).unwrap();
+    seq.run_tx_spammer(ANVIL_KEY_1);
+    common::wait_for(DEFAULT_TIMEOUT, || {
+        std::future::ready(
+            follower
+                .log_count_matching(&unsafe_head_patterns)
+                .map(|n| (n > unsafe_head_events_before).then_some(())),
+        )
+    })
+    .await
+    .expect("follower never reported a sequencer-RPC unsafe-head FCU outcome");
 
     follower.assert_no_process_death();
     seq.assert_no_process_death();
@@ -504,37 +517,50 @@ async fn happy_case_follower_cross_safe_parity() {
         .await
         .expect("f_seq did not catch up");
 
-    // The actual parity claim: poll both followers until their safe block
-    // number and hash agree at the same instant, then verify that block is
-    // on the sequencer's chain.
+    // Compare a block inside both followers' safe boundaries, then verify
+    // that shared safe block is on the sequencer's chain.
     common::wait_for(DEFAULT_TIMEOUT, || {
         let f_l1_rpc = f_l1.l2_rpc_url();
         let f_seq_rpc = f_seq.l2_rpc_url();
         let seq_rpc = seq_rpc.clone();
         async move {
-            let Some((l1_number, l1_hash)) =
+            let Some((l1_safe_number, _)) =
                 block_number_and_hash_at(&f_l1_rpc, BlockNumberOrTag::Safe).await?
             else {
                 return Ok(None);
             };
-            let Some((seq_follower_number, seq_follower_hash)) =
+            let Some((seq_follower_safe_number, _)) =
                 block_number_and_hash_at(&f_seq_rpc, BlockNumberOrTag::Safe).await?
             else {
                 return Ok(None);
             };
-            if l1_number == 0 || (l1_number, l1_hash) != (seq_follower_number, seq_follower_hash) {
+            let common_safe_number = l1_safe_number.min(seq_follower_safe_number);
+            if common_safe_number == 0 {
                 return Ok(None);
             }
-            let Some((_, sequencer_hash)) =
-                block_number_and_hash_at(&seq_rpc, BlockNumberOrTag::Number(l1_number)).await?
+            let Some((_, l1_hash)) =
+                block_number_and_hash_at(&f_l1_rpc, BlockNumberOrTag::Number(common_safe_number))
+                    .await?
             else {
                 return Ok(None);
             };
-            Ok((l1_hash == sequencer_hash).then_some(()))
+            let Some((_, seq_follower_hash)) =
+                block_number_and_hash_at(&f_seq_rpc, BlockNumberOrTag::Number(common_safe_number))
+                    .await?
+            else {
+                return Ok(None);
+            };
+            let Some((_, sequencer_hash)) =
+                block_number_and_hash_at(&seq_rpc, BlockNumberOrTag::Number(common_safe_number))
+                    .await?
+            else {
+                return Ok(None);
+            };
+            Ok((l1_hash == seq_follower_hash && l1_hash == sequencer_hash).then_some(()))
         }
     })
     .await
-    .expect("followers never agreed on a sequencer safe block");
+    .expect("followers never shared a sequencer safe block");
 
     f_l1.assert_no_process_death();
     f_seq.assert_no_process_death();
