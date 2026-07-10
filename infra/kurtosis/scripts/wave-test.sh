@@ -88,9 +88,10 @@ EEZ_CCM_L2_PREDEPLOY="${EEZ_CCM_L2_ADDRESS:-0x4200000000000000000000000000000000
 SYS_ADDR="${EEZ_L2_SYSTEM_ADDRESS:-0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266}"
 MAINNET_RID="${EEZ_L1_ROLLUP_ID:-0}"   # L1's rollup id (outbound proxy target)
 
-# Deposit/withdraw recipient EOAs (not in genesis alloc → start at 0).
-L2_DEP_RECIPIENT=0x2222222222222222222222222222222222222222   # inbound deposit lands here on L2
-L1_WD_RECIPIENT=0x3333333333333333333333333333333333333333   # outbound withdraw lands here on L1
+# Deposit/withdraw recipient EOAs. Random by default to avoid deterministic
+# proxy collisions across repeated runs on the same enclave.
+L2_DEP_RECIPIENT="${L2_DEP_RECIPIENT:-0x$(openssl rand -hex 20)}"
+L1_WD_RECIPIENT="${L1_WD_RECIPIENT:-0x$(openssl rand -hex 20)}"
 
 echo "════════════════════════════════════════════════════════════════"
 echo " WAVE TEST (kurtosis) — mode=$MODE waves=$WAVES"
@@ -196,6 +197,8 @@ if [[ "$MODE" == inbound || "$MODE" == mixed || "$MODE" == mixed-pure ]]; then
     IN_VALUE_PROXY=$(create_l1_proxy "$L2_VALUE")
     IN_NORET_PROXY=$(create_l1_proxy "$L2_VALUE_NORET")
     IN_DEP_PROXY=$(create_l1_proxy "$L2_DEP_RECIPIENT")
+    [[ -n "$IN_VALUE_PROXY" && -n "$IN_NORET_PROXY" && -n "$IN_DEP_PROXY" ]] \
+        || { echo "inbound proxy creation failed"; exit 1; }
     echo "    inbound proxies: setter=$IN_VALUE_PROXY noret=$IN_NORET_PROXY deposit=$IN_DEP_PROXY"
     # Inbound wrapper on L1 over the setter proxy.
     IN_WRAPPER=$(forge_deploy "$L1" "$HH_KEY_0" DeploySetterWrapperL1.s.sol:DeploySetterWrapperL1 'run(address)' "$IN_VALUE_PROXY" | grab EEZ_SETTER_WRAPPER)
@@ -205,6 +208,8 @@ if [[ "$MODE" == outbound || "$MODE" == mixed || "$MODE" == mixed-pure ]]; then
     OUT_VALUE_PROXY=$(create_l2_proxy "$L1_VALUE")
     OUT_NORET_PROXY=$(create_l2_proxy "$L1_VALUE_NORET")
     OUT_WD_PROXY=$(create_l2_proxy "$L1_WD_RECIPIENT")
+    [[ -n "$OUT_VALUE_PROXY" && -n "$OUT_NORET_PROXY" && -n "$OUT_WD_PROXY" ]] \
+        || { echo "outbound proxy creation failed"; exit 1; }
     echo "    outbound proxies: setter=$OUT_VALUE_PROXY noret=$OUT_NORET_PROXY withdraw=$OUT_WD_PROXY"
     # Outbound wrapper on L2 over the outbound setter proxy.
     OUT_WRAPPER=$(forge_deploy "$L2" "$HH_KEY_2" DeploySetterWrapperL1.s.sol:DeploySetterWrapperL1 'run(address)' "$OUT_VALUE_PROXY" | grab EEZ_SETTER_WRAPPER)
