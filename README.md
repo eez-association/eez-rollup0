@@ -130,14 +130,27 @@ excess beyond ~3, which is lost tx inclusion, so measure before bumping.
 
 ### Exercise it
 
-Deploys a `Value` test contract and its cross-chain proxies, fires several
-rounds of cross-chain setter/deposit calls at the running node, then checks
-that L1 and L2 agree on the state root and that the calls actually took
-effect:
+`scripts/xchain-test.sh` is the cross-chain test driver (new-format successor to
+`devnet-test.sh`). It deploys fresh targets/proxies/wrappers, drives the ingress
+fronts through **both directions × all op types** (`setValue` / `setValueNoRet` /
+`deposit` / `withdraw`) × **direct + wrapper**, then checks L1↔L2 reconciliation +
+semantic effects and reports pipeline metrics (N+1 next-slot hit-rate,
+consecutive-L1-slot landing, bundle drops/evictions, divergence). Every run mints
+recipients + senders fresh, so re-runs never collide with stale state.
 
 ```bash
-EEZ_WAVE_COUNT=5 bash scripts/devnet-test.sh
+# MATRIX (default): waves of the full cross-chain matrix + pure-L2 + poison
+EEZ_WAVE_COUNT=5 bash scripts/xchain-test.sh
+
+# LOAD: high volume from distinct fresh senders, optionally paced + node restart
+EEZ_MODE=load EEZ_IN_N=100 EEZ_OUT_N=100 bash scripts/xchain-test.sh            # burst
+EEZ_MODE=load EEZ_IN_N=100 EEZ_OUT_N=100 EEZ_PACE_N=10 EEZ_PACE_INTERVAL=10 \
+  bash scripts/xchain-test.sh                                                  # ~1 tx/s
+EEZ_RESTART=1 EEZ_MODE=load ... bash scripts/xchain-test.sh                    # restart mid-run
 ```
+
+(`scripts/devnet-test.sh` is the earlier, simpler driver — setter+deposit only,
+raw-RPC — kept for reference.)
 
 ## Build, test, teardown
 

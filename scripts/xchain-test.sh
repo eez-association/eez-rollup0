@@ -195,7 +195,9 @@ else
   for _ in $(seq 1 "$NEED"); do SND+=("$(cast wallet new 2>/dev/null|awk '/Private key/{print $3}')"); done
   SI=0; PK=""; nextk(){ PK="${SND[$SI]:?matrix sender pool exhausted; raise NEED}"; SI=$((SI+1)); }
   echo "==> funding $NEED fresh matrix senders (L1+L2)"; fund_pool "$OP" "$L1" 30000000000000000 "${SND[@]}"; fund_pool "$HH_KEY_2" "$L2" 30000000000000000 "${SND[@]}"
-  DEP_AMT=1000000000000000; WD_AMT=1000000000000000; PREFUND=50000000000000000; EXP_DEP=0 EXP_WD=0
+  # PREFUND must fit the sender's funding (0.03) minus gas — it's just withdrawal
+  # liquidity (needs only >= total withdrawals = WAVES*WD_AMT).
+  DEP_AMT=1000000000000000; WD_AMT=1000000000000000; PREFUND=10000000000000000; EXP_DEP=0 EXP_WD=0
   PURE_RECIP=$(rand_addr); POISON_ADDR=$(rand_addr)
   # prefund L1 withdrawal liquidity via one inbound deposit (fresh sender @ nonce 0)
   nextk; submit_front "$L1F" "$PK" 0 "$L1_CID" 2000000 "$PREFUND" "$IN_DEP_PROXY" "" >/dev/null; EXP_DEP=$((EXP_DEP+PREFUND))
