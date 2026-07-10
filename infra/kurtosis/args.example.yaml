@@ -86,3 +86,10 @@ eez:
   # Optional overrides.
   # Route bundle submission through the relay so mev-boost can see bids.
   relay_url: "http://mev-relay-api:9062"
+
+  # spamoor-eez: cross-chain load daemon. See spamoor-plugins/eez-rollup/README.md.
+  spamoor_eez:
+    enabled: true
+    image: "ethpandaops/spamoor:master"
+    # inbound_private_key: "0xCHANGE_ME"  # defaults to poster_key above
+    # startup_spammer_config: "./spamoor-plugins/eez-rollup/startup-spammers.yaml"  # unset = no spammers until added via the web UI

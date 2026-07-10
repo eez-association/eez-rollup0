@@ -1,0 +1,50 @@
+# Reference template for the spamoor-eez daemon's startup spammers.
+#
+# NOT loaded by default — the daemon boots with no startup spammers because
+# the cross-chain scenario needs proxy addresses that don't exist until after
+# deploy. To bake these in on a fresh enclave: copy this to a gitignored
+# startup-spammers.yaml, fill in the REPLACE_ME values (proxy addresses from
+# wave-test.sh's create_l1_proxy/create_l2_proxy, a funded L2 key), and set
+# eez.spamoor_eez.startup_spammer_config to its path in args.yaml. Otherwise,
+# add spammers live via the daemon web UI.
+#
+# The daemon's --rpchost is the l1-xchain front, so the native (inbound) pool
+# is the L1 side; outbound entries build their own L2 pool from outbound_rpc.
+#
+# This shows the recommended two-spammer setup (independent inbound + outbound)
+# plus an adversarial spammer. Enable/disable per run by including/removing
+# entries or toggling them in the UI. Do NOT put an L1-baseline eoatx spammer
+# here — plain L1 load is already produced by ethereum_package's own spamoor
+# (args.example.yaml spamoor_params), and this daemon only reaches the fronts.
+
+- scenario: eez-xchain
+  name: "EEZ Inbound (L1->L2)"
+  config:
+    mode: inbound
+    throughput: 20
+    max_pending: 200
+    max_wallets: 40
+    inbound_proxy: "REPLACE_ME" # L1 CrossChainProxy from create_l1_proxy
+
+- scenario: eez-xchain
+  name: "EEZ Outbound (L2->L1)"
+  config:
+    mode: outbound
+    throughput: 20
+    max_pending: 200
+    max_wallets: 40
+    outbound_rpc: "http://eez-node:18998" # l2-xchain front
+    outbound_private_key: "REPLACE_ME" # funded L2 key
+    outbound_proxy: "REPLACE_ME" # L2 CrossChainProxy from create_l2_proxy
+
+# Adversarial spammer (DDoS-resilience). Run alongside the healthy ones and
+# watch whether their inclusion rate degrades. attack: garbage-calldata | revert.
+- scenario: eez-xchain
+  name: "EEZ Attack (garbage inbound)"
+  config:
+    attack: garbage-calldata
+    mode: inbound
+    throughput: 40
+    max_pending: 400
+    max_wallets: 40
+    inbound_proxy: "REPLACE_ME" # a pre-created L1 proxy to hammer
