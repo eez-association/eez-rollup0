@@ -205,4 +205,51 @@ def run(plan, args):
         ),
     )
 
+    # spamoor-eez: cross-chain load daemon, reaching eez-node's fronts (unlike
+    # ethereum_package's own `spamoor`, which is Pair B L1-only). See
+    # spamoor-plugins/eez-rollup/README.md.
+    spamoor_eez = eez.get("spamoor_eez", {})
+    if spamoor_eez.get("enabled", True):
+        plugin_files = plan.upload_files(
+            src = "./spamoor-plugins/eez-rollup",
+            name = "eez-xchain-plugin",
+        )
+
+        # -h is the l1-xchain front; assumes it serves full JSON-RPC, not just
+        # eth_sendRawTransaction — unverified until a live run (see README).
+        daemon_key = spamoor_eez.get("inbound_private_key", poster_key)
+        daemon_args = [
+            "exec spamoor-daemon",
+            "--port=8080",
+            "-h http://eez-node:{}".format(L1_XCHAIN_PORT),
+            "-p " + daemon_key,
+            "--plugin=/plugins/eez-rollup",
+        ]
+
+        service_files = {"/plugins/eez-rollup": plugin_files}
+
+        # No startup spammers by default — the scenario needs proxy addresses
+        # that don't exist until after deploy; add one via the web UI, or
+        # point this at a filled-in copy of startup-spammers.example.yaml.
+        spammer_config_path = spamoor_eez.get("startup_spammer_config", "")
+        if spammer_config_path != "":
+            service_files["/config"] = plan.upload_files(
+                src = spammer_config_path,
+                name = "eez-xchain-spammer-config",
+            )
+            daemon_args.append("--startup-spammer=/config/" + spammer_config_path.split("/")[-1])
+
+        plan.add_service(
+            name = "spamoor-eez",
+            config = ServiceConfig(
+                image = spamoor_eez.get("image", "ethpandaops/spamoor:master"),
+                ports = {
+                    "http": PortSpec(number = 8080, transport_protocol = "TCP", application_protocol = "http"),
+                },
+                files = service_files,
+                entrypoint = ["/bin/sh", "-c"],
+                cmd = [" ".join(daemon_args)],
+            ),
+        )
+
     plan.print("EEZ cross-chain devnet up: Pair B (ethereum-package) + Pair A (eez-node + follower), chain_id=" + chain_id)
