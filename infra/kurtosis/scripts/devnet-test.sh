@@ -52,11 +52,11 @@ VALUE_INITIAL="${VALUE_INITIAL:-5}"
 # Dedicated test keys avoid racing the node's poster nonce.
 EEZ_OPERATOR_KEY="${EEZ_OPERATOR_KEY:-0x2248a31395af28e24349c8e566c19475a79cb610389204ab26bc585493e5cf27}"
 EEZ_USER_KEY="${EEZ_USER_KEY:-0x3b7b012a74f1c18f714c38306339b6b4124f3a434bd816a1ee1fa5aeb5953efe}"
-# Fund test keys from the poster.
+# Fund test keys from a non-poster key to avoid racing eez-node's poster nonce.
 _yaml() { grep -E "^[[:space:]]*$1:" "$K/args.yaml" 2>/dev/null | head -1 \
     | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//'; }
-EEZ_FUND_FROM_KEY="${EEZ_FUND_FROM_KEY:-${EEZ_L1_POSTER_KEY:-$(_yaml poster_key)}}"
-[[ -n "$EEZ_FUND_FROM_KEY" ]] || { echo "could not resolve the poster key — set EEZ_L1_POSTER_KEY or check $K/args.yaml"; exit 1; }
+EEZ_FUND_FROM_KEY="${EEZ_FUND_FROM_KEY:-${EEZ_PROOF_SIGNER_KEY:-$(_yaml proof_signer_key)}}"
+[[ -n "$EEZ_FUND_FROM_KEY" ]] || { echo "could not resolve a funding key — set EEZ_FUND_FROM_KEY or check $K/args.yaml"; exit 1; }
 # L2 filler key and system signer address.
 HH_KEY_2=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
 HH_ADDR_2=0x3C44Cdddb6a900fa2b585dD299E03D12FA4293bC
@@ -102,29 +102,22 @@ L2_UP=$(cast block-number --rpc-url "$L2_RPC" 2>/dev/null || echo "")
 L1_UP=$(cast block-number --rpc-url "$L1_RPC" 2>/dev/null || echo "")
 [[ -n "$L1_UP" ]] || { echo "L1 RPC $L1_RPC not reachable"; exit 1; }
 
+fund_l1() {
+    local to="$1" from_addr nonce
+    from_addr=$(cast wallet address --private-key "$EEZ_FUND_FROM_KEY")
+    nonce=$(retry cast nonce "$from_addr" --rpc-url "$L1_RPC")
+    cast send "$to" --value 10ether --private-key "$EEZ_FUND_FROM_KEY" --nonce "$nonce" \
+        --gas-price 2000000000 --priority-gas-price 1500000000 --rpc-url "$L1_RPC" >/dev/null
+}
+
 # Fund the operator + user on L1 so they can pay gas on the shared chain.
 for k in "$EEZ_OPERATOR_KEY" "$EEZ_USER_KEY"; do
     a=$(cast wallet address --private-key "$k")
     if [[ "$(cast balance "$a" --rpc-url "$L1_RPC" 2>/dev/null || echo 0)" == "0" ]]; then
-        echo "==> funding $a on L1 (10 ETH from poster)"
-        cast send "$a" --value 10ether --private-key "$EEZ_FUND_FROM_KEY" --rpc-url "$L1_RPC" >/dev/null \
-            || { echo "failed to fund $a — is the poster funded on L1?"; exit 1; }
+        echo "==> funding $a on L1 (10 ETH)"
+        fund_l1 "$a" || { echo "failed to fund $a — is the funding key funded on L1?"; exit 1; }
     fi
 done
-
-# ── MEV warmup gate ──────────────────────────────────────────────────
-# The flashbots relay only starts proposing rbuilder blocks after ~4 epochs
-# (validator registrations propagate); before that EVERY pinned postBatch
-# bundle is dropped by construction — the proposer falls back to a local
-# block that never saw the bundle. Waiting here turns a guaranteed-red run
-# into a green one. Override/skip with EEZ_MEV_WARMUP_BLOCK=0.
-MEV_WARMUP_BLOCK="${EEZ_MEV_WARMUP_BLOCK:-132}"
-head_now=$(cast block-number --rpc-url "$L1_RPC")
-if (( head_now < MEV_WARMUP_BLOCK )); then
-    echo "==> waiting for MEV warmup: L1 head $head_now < $MEV_WARMUP_BLOCK (~4 epochs; relay proposes builder blocks only after warmup)"
-    while (( $(cast block-number --rpc-url "$L1_RPC") < MEV_WARMUP_BLOCK )); do sleep 12; done
-    echo "    warmup complete (head $(cast block-number --rpc-url "$L1_RPC"))"
-fi
 
 L1_CHAIN_ID=$(cast chain-id --rpc-url "$L1_RPC")
 L2_CHAIN_ID=$(cast chain-id --rpc-url "$L2_RPC")
@@ -196,10 +189,23 @@ submit_wave() {
     for i in "${!RAW_TXS[@]}"; do
         local H; H=$(cast keccak "${RAW_TXS[$i]}")
         ALL_USER_TX_HASHES+=("$H"); TX_META+=("$H ${OP_KINDS[$i]} ${OP_ARGS[$i]}")
-        curl -s -X POST "$XCHAIN_L1" -H 'Content-Type: application/json' \
-            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"${RAW_TXS[$i]}\"],\"id\":$i}" >/dev/null
+        local resp
+        resp=$(curl -s -X POST "$XCHAIN_L1" -H 'Content-Type: application/json' \
+            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"${RAW_TXS[$i]}\"],\"id\":$i}")
+        if grep -q '"error"' <<<"$resp"; then
+            echo "    ✗ front rejected tx: $resp" >&2
+            exit 1
+        fi
     done
     echo "    wave $WAVE_ID submitted: ${#RAW_TXS[@]} ops [$OPS]"
+    local want=$((NONCE_START + n)) wait_end=$((SECONDS + RECEIPT_WAIT_SECS)) got
+    while (( SECONDS < wait_end )); do
+        got=$(retry cast nonce "$USER_ADDR" --rpc-url "$L1_RPC")
+        (( got >= want )) && return 0
+        sleep 5
+    done
+    echo "    ✗ timed out waiting for inbound sender nonce >= $want" >&2
+    exit 1
 }
 
 submit_filler() {

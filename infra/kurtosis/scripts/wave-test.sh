@@ -66,24 +66,23 @@ else
 fi
 [[ -n "${EEZ_REGISTRY_ADDRESS:-}" ]] || { echo "EEZ_REGISTRY_ADDRESS unset — deployments.env incomplete"; exit 1; }
 
-# Hardhat accounts are funded on L2; L1 actors are funded from the poster below.
+# Hardhat accounts are funded on L2; L1 actors are funded below.
 HH_KEY_0=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80   # deployer/owner (L1 targets/proxies/wrapper)
 HH_KEY_2=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a   # L2 contract deployer / L2 proxy creator
 # Distinct users avoid per-direction nonce collisions.
-HH_KEY_IN=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d   # #1 inbound user  (submits to L1 front → L1 gas → funded from poster)
+HH_KEY_IN=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d   # #1 inbound user
 HH_ADDR_IN=0x70997970C51812dc3A010C7d01b50e0d17dc79C8
 HH_KEY_OUT=0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6  # #3 outbound user (submits to L2 front → L2 tx → funded on L2 genesis)
 HH_ADDR_OUT=0x90F79bf6EB2c4f870365E785982E1f101E93b906
 # Pure-L2 filler user.
 HH_KEY_PURE=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a  # #2 (L2 deployer, idle at wave time)
 
-# EOAs funded on L1 from the poster so they can pay gas on the shared chain.
-# Read straight out of args.yaml — the same file `up.sh` filled in on first run.
+# EOAs funded on L1 so they can pay gas on the shared chain.
 L1_FUNDED_KEYS=("$HH_KEY_0" "$HH_KEY_IN")
 _yaml() { grep -E "^[[:space:]]*$1:" "$K/args.yaml" 2>/dev/null | head -1 \
     | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//'; }
-FUND_FROM_KEY="${EEZ_L1_POSTER_KEY:-$(_yaml poster_key)}"
-[[ -n "$FUND_FROM_KEY" ]] || { echo "could not resolve the poster key — set EEZ_L1_POSTER_KEY or check $K/args.yaml"; exit 1; }
+FUND_FROM_KEY="${EEZ_FUND_FROM_KEY:-${EEZ_PROOF_SIGNER_KEY:-$(_yaml proof_signer_key)}}"
+[[ -n "$FUND_FROM_KEY" ]] || { echo "could not resolve a funding key — set EEZ_FUND_FROM_KEY or check $K/args.yaml"; exit 1; }
 
 EEZ_CCM_L2_PREDEPLOY="${EEZ_CCM_L2_ADDRESS:-0x4200000000000000000000000000000000000007}"
 SYS_ADDR="${EEZ_L2_SYSTEM_ADDRESS:-0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266}"
@@ -120,24 +119,20 @@ L2_UP=$(cast block-number --rpc-url "$L2" 2>/dev/null || echo "")
 [[ -n "$L2_UP" ]] || { echo "L2 RPC $L2 not reachable"; exit 1; }
 echo "    L1=$L1_UP L2=$L2_UP"
 
-# ── MEV warmup gate ──────────────────────────────────────────────────
-# The flashbots relay only starts proposing rbuilder blocks after ~4 epochs;
-# before that every pinned postBatch bundle drops by construction. Wait it
-# out. Override/skip with EEZ_MEV_WARMUP_BLOCK=0.
-MEV_WARMUP_BLOCK="${EEZ_MEV_WARMUP_BLOCK:-132}"
-if (( L1_UP < MEV_WARMUP_BLOCK )); then
-    echo "==> waiting for MEV warmup: L1 head $L1_UP < $MEV_WARMUP_BLOCK (~4 epochs; relay proposes builder blocks only after warmup)"
-    while (( $(cast block-number --rpc-url "$L1") < MEV_WARMUP_BLOCK )); do sleep 12; done
-    echo "    warmup complete (head $(cast block-number --rpc-url "$L1"))"
-fi
+fund_l1() {
+    local to="$1" from_addr nonce
+    from_addr=$(cast wallet address --private-key "$FUND_FROM_KEY")
+    nonce=$(retry cast nonce "$from_addr" --rpc-url "$L1")
+    cast send "$to" --value 10ether --private-key "$FUND_FROM_KEY" --nonce "$nonce" \
+        --gas-price 2000000000 --priority-gas-price 1500000000 --rpc-url "$L1" >/dev/null
+}
 
-# ── Fund L1-side actors from the poster ──────────────────────────────
+# ── Fund L1-side actors ──────────────────────────────────────────────
 for k in "${L1_FUNDED_KEYS[@]}"; do
     a=$(cast wallet address --private-key "$k")
     if [[ "$(cast balance "$a" --rpc-url "$L1" 2>/dev/null || echo 0)" == "0" ]]; then
-        echo "==> funding $a on L1 (10 ETH from poster)"
-        cast send "$a" --value 10ether --private-key "$FUND_FROM_KEY" --rpc-url "$L1" >/dev/null \
-            || { echo "failed to fund $a — is the poster funded on L1?"; exit 1; }
+        echo "==> funding $a on L1 (10 ETH)"
+        fund_l1 "$a" || { echo "failed to fund $a — is the funding key funded on L1?"; exit 1; }
     fi
 done
 
@@ -237,6 +232,18 @@ receipt_status() {
     [[ "$st" == "0x1" ]] && echo "1" || echo "${st:-missing}"
 }
 
+wait_nonce_at_least() {
+    local rpc="$1" addr="$2" want="$3" label="$4"
+    local wait_end=$(( SECONDS + RECEIPT_WAIT_SECS )) got
+    while (( SECONDS < wait_end )); do
+        got=$(retry cast nonce "$addr" --rpc-url "$rpc")
+        (( got >= want )) && return 0
+        sleep 5
+    done
+    echo "    ✗ timed out waiting for $label nonce >= $want" >&2
+    return 1
+}
+
 # send_front <front_url> <raw_tx> — eth_sendRawTransaction to a cross-chain
 # front; fails loud if the admission gate rejects (invariant 7 is LOUD).
 send_front() {
@@ -272,6 +279,7 @@ run_waves() {
         PURE_ADDR=$(cast wallet address --private-key "$HH_KEY_PURE")
         PURE_NONCE=$(retry cast nonce "$PURE_ADDR" --rpc-url "$L2")
     fi
+    local IN_WAVE_TARGET=0 OUT_WAVE_TARGET=0
 
     # Per-tx metadata for the confirmed-view tally: "hash|side|kind|arg".
     # side=in|out; kind=set|noret|wrap|dep|wd.
@@ -351,6 +359,7 @@ run_waves() {
             mk_and_send in noret $((200 + w))
             mk_and_send in dep   $((w * 10000000000000))          # w * 1e13 wei
             mk_and_send in wrap  $((300 + w))
+            IN_WAVE_TARGET="$IN_NONCE"
             echo "    inbound: 4 ops via L1 front (set/noret/dep/wrap)"
         fi
         if (( do_out )); then
@@ -358,9 +367,18 @@ run_waves() {
             mk_and_send out noret $((500 + w))
             mk_and_send out wd    $((w * 20000000000000))         # w * 2e13 wei
             mk_and_send out wrap  $((600 + w))
+            OUT_WAVE_TARGET="$OUT_NONCE"
             echo "    outbound: 4 ops via L2 front (set/noret/wd/wrap)"
         fi
         (( do_pure )) && { submit_pure_filler "$FILLER_PER_GAP"; echo "    pure: $FILLER_PER_GAP L2 filler txs"; }
+        if (( w < WAVES )); then
+            if (( do_in )); then
+                wait_nonce_at_least "$L1" "$HH_ADDR_IN" "$IN_WAVE_TARGET" "inbound sender" || exit 1
+            fi
+            if (( do_out )); then
+                wait_nonce_at_least "$L2" "$HH_ADDR_OUT" "$OUT_WAVE_TARGET" "outbound sender" || exit 1
+            fi
+        fi
         sleep "$WAVE_GAP_SECS"
     done
 
@@ -478,8 +496,7 @@ run_waves() {
         echo "    ✗ $DIVERGED state-root divergence event(s)"; ok_all=0
     fi
 
-    # Dropped-bundle telemetry (informational: steady drops after warmup are
-    # the bug this harness exists to catch; a handful from skipped slots is normal).
+    # Dropped-bundle telemetry.
     local DROPS
     DROPS=$(grep -c "bundle dropped" "$NODE_LOG" 2>/dev/null || true); DROPS=${DROPS:-0}
     echo "    ℹ dropped-bundle log lines: $DROPS"
