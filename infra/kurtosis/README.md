@@ -30,7 +30,7 @@ the composer settles against real L1 state, in-process.
   │  │  rbuilder ◄─┐     ▼                                │   │  │ embedded L1 reth   │  │        │
   │  │  (el-5)     │   mev-boost-relay ◄── mev-boost      │   │  │  :18545 rpc         │  │        │
   │  │   ▲         │                                       │   │  │  :18551 engine(JWT)│  │        │
-  │  │   │ eth_sendBundle (http://el-5…:8645)              │   │  └───┼───────────────┘  │        │
+  │  │   │ eth_sendBundle (http://el-5…:8545)              │   │  └───┼───────────────┘  │        │
   │  │   └─────────┼───────────────────────────────────────┼───┤  ┌───┴──────────────┐  │        │
   │  │  spamoor (L1 load)   disruptoor (reorgs)            │   │  │ EvmComposer       │  │        │
   │  │                        block gossips over CL P2P ───┼──►│  │ (in-process reads)│  │        │
@@ -71,11 +71,20 @@ follower → the follower feeds it to the embedded reth via `engine_newPayload`
   scheduled L1 reorgs via disruptoor.
 - [`scripts/smoke-rbuilder.sh`](scripts/smoke-rbuilder.sh) — checks that
   rbuilder honors the bundle timestamp pin.
+- [`scripts/devnet-test.sh`](scripts/devnet-test.sh) — inbound-only L1→L2
+  end-to-end harness.
+- [`scripts/wave-test.sh`](scripts/wave-test.sh) — inbound, outbound, and mixed
+  cross-chain wave harness.
 
 ## Prereqs
 
-`kurtosis`, `docker`, `cast` (from [Foundry](https://getfoundry.sh)). Works on
-macOS or Linux.
+For bring-up: `kurtosis`, `docker`, and `cast` (from
+[Foundry](https://getfoundry.sh)), plus an initialized and current
+`sync-rollups-protocol` submodule. `up.sh` checks the submodule before building
+and prints the update command if it is missing or incompatible.
+
+The end-to-end harnesses additionally require `forge`, `jq`, `curl`, and
+`openssl`. Works on macOS or Linux.
 
 ## Run
 
@@ -90,9 +99,9 @@ That's the whole bring-up. On first run it will:
 3. build the `eez-node` and `eez-deploy` images,
 4. run `kurtosis run` to bring up both pairs in one enclave.
 
-Later runs reuse `args.yaml` and just rebuild the images. `up.sh` migrates
-superseded uncustomized timing presets to `proof_time_ms: 5000` while keeping
-the 12s L1 / 2s L2 cadence unchanged.
+Later runs reuse `args.yaml` and rebuild the images unless a build is skipped
+with one of the knobs below. The default cadence is 12s L1 / 2s L2 with
+`proof_time_ms: 5000`.
 
 **Env knobs** (all optional):
 
@@ -161,13 +170,9 @@ entirely self-contained: each resolves its own endpoints via
 `kurtosis files download`, so there's no separate discovery step — just bring
 the enclave up and run the script.
 
-Both harnesses **wait for MEV warmup** before firing waves: the flashbots
-relay only proposes rbuilder blocks after ~4 epochs (validator registrations
-propagate), so until L1 head ≥ `EEZ_MEV_WARMUP_BLOCK` (default 132) every
-pinned postBatch bundle is dropped by construction — the proposer falls back
-to a locally-built block that never saw the bundle. Set
-`EEZ_MEV_WARMUP_BLOCK=0` to skip the gate (e.g. re-running against a warm
-enclave).
+Run them after the enclave is producing and settling blocks. Unlike the
+rbuilder smoke test, these harnesses do not wait for a fixed MEV warmup height;
+they proceed against the current chain and use bounded receipt/nonce waits.
 
 - [`infra/kurtosis/scripts/devnet-test.sh`](scripts/devnet-test.sh) — **inbound-only** (L1→L2).
   Deploys Value on L2, creates setter + deposit CrossChainProxies on the shared
@@ -209,7 +214,7 @@ schedule can never drift between them.
 | Service | Port id | In-container | Notes |
 |---------|---------|--------------|-------|
 | `el-1-reth-lighthouse` | `rpc` | 8545 | Canonical L1 JSON-RPC |
-| `el-5-reth-builder-lighthouse` | `rbuilder-rpc` | 8645 | `eth_sendBundle` target |
+| `el-5-reth-builder-lighthouse` | `rpc` | 8545 | `eth_sendBundle` target |
 | `eez-node` | `l2-rpc` | 18688 | L2 rollup JSON-RPC |
 | `eez-node` | `l1-engine` | 18551 | Engine API (follower dials this) |
 | `eez-node` | `l1-xchain` | 18999 | Cross-chain **Inbound** front (L1→L2); submit inbound ops here |
