@@ -666,14 +666,21 @@ where
         }
 
         let pool_len_before = pool.len();
-        // Cap drain to 3 user_txs per bundle. rbuilder-chiado has shown
+        // Cap drain to N user_txs per bundle. rbuilder-chiado has shown
         // partial-inclusion when bundles carry more than ~3 user_txs:
         // postBatch lands, but only a prefix of the user_txs makes it
         // into the block — the rest are silently excluded by rbuilder
         // and effectively lost. Capping keeps every bundle's contents
-        // 100% atomic; a backlog spills into the next Sync slot.
-        const MAX_USER_TXS_PER_BUNDLE: usize = 3;
-        let drained = pool.pop_n(MAX_USER_TXS_PER_BUNDLE);
+        // 100% atomic; a backlog spills into the next Sync slot. 3 is the
+        // safe default; raise EEZ_MAX_USER_TXS_PER_BUNDLE only against a
+        // builder proven to include larger bundles atomically (measure the
+        // never-mined count first — a wrong bump silently loses user_txs).
+        let max_user_txs = std::env::var("EEZ_MAX_USER_TXS_PER_BUNDLE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(3);
+        let drained = pool.pop_n(max_user_txs);
         // NOTE: do NOT early-exit on empty pool. Every unblocked Sync
         // slot still emits a postBatch carrying the leading immediate
         // entry (which advances L1's stored stateRoot to the L2
