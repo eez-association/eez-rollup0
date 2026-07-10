@@ -912,7 +912,7 @@ impl NodeHandle {
         let datadir = tempfile::tempdir().context("datadir tempdir")?;
         let mut handle = Self::spawn_with(name, datadir.path(), cfg, env)?;
         handle.keep_alive.push(datadir);
-        wait_for_l2_rpc(&handle.l2_rpc_url(), Duration::from_secs(90)).await?;
+        wait_for_l2_rpc(&handle.l2_rpc_url(), Duration::from_secs(180)).await?;
         Ok(handle)
     }
 

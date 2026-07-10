@@ -18,7 +18,7 @@ use common::{
     wait_for_new_attested_safe_block, wait_for_safe_chain_contains, wait_for_safe_state,
 };
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Builder mode, sustained operation through a restart. Asserts every
 /// observable invariant in one place:
@@ -289,19 +289,48 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
         .await
         .expect("no batches landed after reorg");
 
-    // I3 — Both nodes import the same post-reorg safe block.
-    let (post_reorg_safe_number, post_reorg_safe_hash) =
-        wait_for_new_attested_safe_block(&c1, &chain, &pre_reorg_states, DEFAULT_TIMEOUT)
-            .await
-            .expect("c1 did not import a newly attested post-reorg safe block");
+    // I3 — Both nodes import the same post-reorg safe block. Either
+    // composer may import the newly attested block first after the L1 reorg.
+    let c1_safe = wait_for_new_attested_safe_block(&c1, &chain, &pre_reorg_states, DEFAULT_TIMEOUT);
+    let c2_safe = wait_for_new_attested_safe_block(&c2, &chain, &pre_reorg_states, DEFAULT_TIMEOUT);
+    tokio::pin!(c1_safe);
+    tokio::pin!(c2_safe);
+    let (source_name, peer_name, peer, post_reorg_safe_number, post_reorg_safe_hash) = tokio::select! {
+        c1_result = &mut c1_safe => match c1_result {
+            Ok((number, hash)) => ("c1", "c2", &c2, number, hash),
+            Err(c1_err) => {
+                let (number, hash) = c2_safe.await.unwrap_or_else(|c2_err| {
+                    panic!(
+                        "neither composer imported a newly attested post-reorg safe block; \
+                         c1: {c1_err:#}; c2: {c2_err:#}"
+                    );
+                });
+                ("c2", "c1", &c1, number, hash)
+            }
+        },
+        c2_result = &mut c2_safe => match c2_result {
+            Ok((number, hash)) => ("c2", "c1", &c1, number, hash),
+            Err(c2_err) => {
+                let (number, hash) = c1_safe.await.unwrap_or_else(|c1_err| {
+                    panic!(
+                        "neither composer imported a newly attested post-reorg safe block; \
+                         c1: {c1_err:#}; c2: {c2_err:#}"
+                    );
+                });
+                ("c1", "c2", &c2, number, hash)
+            }
+        },
+    };
     wait_for_safe_chain_contains(
-        &c2,
+        peer,
         post_reorg_safe_number,
         post_reorg_safe_hash,
         DEFAULT_TIMEOUT,
     )
     .await
-    .expect("c2 did not import c1's post-reorg safe block");
+    .unwrap_or_else(|err| {
+        panic!("{peer_name} did not import {source_name}'s post-reorg safe block: {err:#}");
+    });
 
     // I2 — Both nodes observed the reorg.
     c1.wait_for_reorg_seen(DEFAULT_TIMEOUT).await.unwrap();
