@@ -40,7 +40,7 @@ mkdir -p "$LOG_DIR"
 MODE="${EEZ_WAVE_MODE:-mixed}"
 WAVES="${EEZ_WAVE_COUNT:-3}"
 
-for t in cast forge jq curl kurtosis; do command -v "$t" >/dev/null || { echo "$t not in PATH"; exit 1; }; done
+for t in cast forge jq curl kurtosis openssl; do command -v "$t" >/dev/null || { echo "$t not in PATH"; exit 1; }; done
 
 # L1 is the canonical shared chain; fronts are published by eez-node.
 _port() { kurtosis port print "$ENCLAVE" "$1" "$2" 2>/dev/null || true; }
@@ -69,13 +69,14 @@ fi
 # Hardhat accounts are funded on L2; L1 actors are funded below.
 HH_KEY_0=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80   # deployer/owner (L1 targets/proxies/wrapper)
 HH_KEY_2=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a   # L2 contract deployer / L2 proxy creator
-# Distinct users avoid per-direction nonce collisions.
-HH_KEY_IN=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d   # #1 inbound user
-HH_ADDR_IN=0x70997970C51812dc3A010C7d01b50e0d17dc79C8
-HH_KEY_OUT=0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6  # #3 outbound user (submits to L2 front → L2 tx → funded on L2 genesis)
-HH_ADDR_OUT=0x90F79bf6EB2c4f870365E785982E1f101E93b906
+# Fresh users avoid stale held-pool nonce state from earlier interrupted runs.
+HH_KEY_IN="${EEZ_WAVE_IN_KEY:-0x$(openssl rand -hex 32)}"
+HH_ADDR_IN=$(cast wallet address --private-key "$HH_KEY_IN")
+HH_KEY_OUT="${EEZ_WAVE_OUT_KEY:-0x$(openssl rand -hex 32)}"
+HH_ADDR_OUT=$(cast wallet address --private-key "$HH_KEY_OUT")
 # Pure-L2 filler user.
 HH_KEY_PURE=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a  # #2 (L2 deployer, idle at wave time)
+HH_KEY_2_ADDR=$(cast wallet address --private-key "$HH_KEY_2")
 
 # EOAs funded on L1 so they can pay gas on the shared chain.
 L1_FUNDED_KEYS=("$HH_KEY_0" "$HH_KEY_IN")
@@ -101,6 +102,7 @@ echo "    L2           = $L2"
 echo "    L1 front     = $L1F   (Inbound)"
 echo "    L2 front     = $L2F   (Outbound)"
 echo "    registry     = $EEZ_REGISTRY_ADDRESS  rollupId=${EEZ_ROLLUP_ID:-?}"
+echo "    users        = inbound:$HH_ADDR_IN outbound:$HH_ADDR_OUT"
 
 # Retry a read-only command (survives transient RPC hiccups under load).
 retry() {
@@ -120,12 +122,25 @@ L2_UP=$(cast block-number --rpc-url "$L2" 2>/dev/null || echo "")
 [[ -n "$L2_UP" ]] || { echo "L2 RPC $L2 not reachable"; exit 1; }
 echo "    L1=$L1_UP L2=$L2_UP"
 
+gas_price_for() { # <rpc> -> wei
+    local gp
+    gp=$(cast gas-price --rpc-url "$1" 2>/dev/null || echo 1000000000)
+    echo "${EEZ_TEST_GAS_PRICE_WEI:-$gp}"
+}
+
 fund_l1() {
     local to="$1" from_addr nonce
     from_addr=$(cast wallet address --private-key "$FUND_FROM_KEY")
     nonce=$(retry cast nonce "$from_addr" --rpc-url "$L1")
     cast send "$to" --value 10ether --private-key "$FUND_FROM_KEY" --nonce "$nonce" \
-        --gas-price 2000000000 --priority-gas-price 1500000000 --rpc-url "$L1" >/dev/null
+        --gas-price "$(gas_price_for "$L1")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1500000000}" --rpc-url "$L1" >/dev/null
+}
+
+fund_l2() {
+    local to="$1" nonce
+    nonce=$(retry cast nonce "$HH_KEY_2_ADDR" --rpc-url "$L2")
+    cast send "$to" --value 10ether --private-key "$HH_KEY_2" --nonce "$nonce" \
+        --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" --rpc-url "$L2" >/dev/null
 }
 
 # ── Fund L1-side actors ──────────────────────────────────────────────
@@ -137,10 +152,16 @@ for k in "${L1_FUNDED_KEYS[@]}"; do
     fi
 done
 
+if [[ "$(cast balance "$HH_ADDR_OUT" --rpc-url "$L2" 2>/dev/null || echo 0)" == "0" ]]; then
+    echo "==> funding $HH_ADDR_OUT on L2 (10 ETH)"
+    fund_l2 "$HH_ADDR_OUT" || { echo "failed to fund $HH_ADDR_OUT on L2"; exit 1; }
+fi
+
 forge_deploy() { # <rpc> <key> <script:contract> <sig> <args...>  → echoes forge stdout
-    local rpc="$1" key="$2" sc="$3" sig="$4"; shift 4
+    local rpc="$1" key="$2" sc="$3" sig="$4" gas_price; shift 4
+    gas_price=$(gas_price_for "$rpc")
     (cd "$REPO/contracts" && forge script "script/$sc" --sig "$sig" "$@" \
-        --rpc-url "$rpc" --broadcast --private-key "$key" --gas-price 1000000000 --skip-simulation 2>&1)
+        --rpc-url "$rpc" --broadcast --private-key "$key" --gas-price "$gas_price" --skip-simulation 2>&1)
 }
 grab() { grep -oE "$1=0x[0-9a-fA-F]{40}" | head -1 | cut -d= -f2; }
 
@@ -162,8 +183,6 @@ fi
 
 L1_CHAIN_ID=$(cast chain-id --rpc-url "$L1")
 L2_CHAIN_ID=$(cast chain-id --rpc-url "$L2")
-HH_KEY_2_ADDR=$(cast wallet address --private-key "$HH_KEY_2")
-
 # ── Helpers: create an L1 (inbound) proxy and an L2 (outbound) proxy ──
 # L1 proxy = createCrossChainProxy(target_on_L2, rid=EEZ_ROLLUP_ID) on the L1 EEZ.
 create_l1_proxy() { # <target_on_L2> → proxy addr
@@ -179,7 +198,7 @@ create_l2_proxy() { # <target_on_L1> → proxy addr
     if [[ "$code" == "0x" || -z "$code" ]]; then
         nonce=$(cast nonce "$HH_KEY_2_ADDR" --rpc-url "$L2")
         raw=$(cast mktx --rpc-url "$L2" --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_2" --nonce "$nonce" \
-            --gas-limit 1500000 --gas-price 1000000000 \
+            --gas-limit 1500000 --gas-price "$(gas_price_for "$L2")" \
             "$EEZ_CCM_L2_PREDEPLOY" 'createCrossChainProxy(address,uint256)' "$tgt" "$MAINNET_RID")
         curl -s -X POST "$L2" -H 'Content-Type: application/json' \
             -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"],\"id\":1}" >/dev/null
@@ -296,7 +315,9 @@ run_waves() {
     #   out set/noret/wrap/wd  → L2-signed tx via the L2 front
     mk_and_send() {
         local side="$1" kind="$2" arg="$3" raw="" hash
-        local GP=2000000000 PG=1500000000    # L1-side fees (devnet basefee ~floor)
+        local GP PG
+        GP=$(gas_price_for "$L1")
+        PG="${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1500000000}"
         case "$side:$kind" in
             in:set)   raw=$(cast mktx --chain-id "$L1_CHAIN_ID" --private-key "$HH_KEY_IN" --nonce "$IN_NONCE" \
                         --gas-limit 600000 --gas-price "$GP" --priority-gas-price "$PG" \
@@ -311,16 +332,16 @@ run_waves() {
                         --gas-limit 600000 --gas-price "$GP" --priority-gas-price "$PG" --value "$arg" \
                         "$IN_DEP_PROXY") ;;
             out:set)   raw=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_OUT" --nonce "$OUT_NONCE" \
-                        --gas-limit 600000 --gas-price 1000000000 --priority-gas-price 1000000000 \
+                        --gas-limit 600000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" \
                         "$OUT_VALUE_PROXY" 'setValue(uint256)' "$arg") ;;
             out:noret) raw=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_OUT" --nonce "$OUT_NONCE" \
-                        --gas-limit 600000 --gas-price 1000000000 --priority-gas-price 1000000000 \
+                        --gas-limit 600000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" \
                         "$OUT_NORET_PROXY" 'setValue(uint256)' "$arg") ;;
             out:wrap)  raw=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_OUT" --nonce "$OUT_NONCE" \
-                        --gas-limit 800000 --gas-price 1000000000 --priority-gas-price 1000000000 \
+                        --gas-limit 800000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" \
                         "$OUT_WRAPPER" 'setViaProxy(uint256)' "$arg") ;;
             out:wd)    raw=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_OUT" --nonce "$OUT_NONCE" \
-                        --gas-limit 600000 --gas-price 1000000000 --priority-gas-price 1000000000 --value "$arg" \
+                        --gas-limit 600000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" --value "$arg" \
                         "$OUT_WD_PROXY") ;;
             *) echo "wave-test: bad op $side:$kind"; exit 1 ;;
         esac
@@ -340,7 +361,7 @@ run_waves() {
         local count="$1" j raw
         for ((j=0; j<count; j++)); do
             raw=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_PURE" --nonce "$PURE_NONCE" \
-                --gas-limit 21000 --gas-price 1000000000 --priority-gas-price 1000000000 \
+                --gas-limit 21000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" \
                 --value 100000000 "$PURE_RECIPIENT" 2>&1)
             [[ "$raw" =~ ^0x[0-9a-fA-F]+$ ]] || break
             curl -s -X POST "$L2" -H 'Content-Type: application/json' \
