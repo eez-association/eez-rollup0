@@ -93,18 +93,22 @@ submit_front(){ # <front> <key> <nonce> <cid> <gas> <value> <to> <sig|""> [args.
 onchain_nonce(){ cast nonce "$(cast wallet address --private-key "$1")" --rpc-url "$2" 2>/dev/null || echo 0; }
 # Robust pool funding: async submit + verify-count + re-fund nonce-gap stragglers.
 fund_pool(){ # <funder_key> <rpc> <amount> <key...>
-  local fk="$1" rpc="$2" amt="$3"; shift 3; local keys=("$@") faddr n0 i attempt funded miss
-  faddr=$(cast wallet address --private-key "$fk"); n0=$(cast nonce "$faddr" --rpc-url "$rpc"); i=0
-  for k in "${keys[@]}"; do cast send "$(cast wallet address --private-key "$k")" --value "$amt" --private-key "$fk" --rpc-url "$rpc" --nonce "$((n0+i))" --gas-price 2000000000 --priority-gas-price 1500000000 --async >/dev/null 2>&1; i=$((i+1)); done
-  for attempt in $(seq 1 50); do
-    funded=0; miss=()
-    for j in "${!keys[@]}"; do [[ "$(python3 -c "print(int($(cast balance "$(cast wallet address --private-key "${keys[$j]}")" --rpc-url "$rpc" 2>/dev/null||echo 0))>=$amt)")" == True ]] && funded=$((funded+1)) || miss+=("$j"); done
-    [[ "$funded" -eq "${#keys[@]}" ]] && { echo "    funded $funded/${#keys[@]}"; return 0; }
-    if [[ "$attempt" -ge 6 && "${#miss[@]}" -gt 0 ]]; then n0=$(cast nonce "$faddr" --rpc-url "$rpc"); i=0
-      for j in "${miss[@]}"; do cast send "$(cast wallet address --private-key "${keys[$j]}")" --value "$amt" --private-key "$fk" --rpc-url "$rpc" --nonce "$((n0+i))" --gas-price 2000000000 --priority-gas-price 1500000000 --async >/dev/null 2>&1; i=$((i+1)); done; fi
-    sleep 4
-  done
-  echo "    ⚠ funded $funded/${#keys[@]}"; }
+  local fk="$1" rpc="$2" amt="$3"; shift 3; local keys=("$@") faddr n0 i sent=0 BATCH="${EEZ_FUND_BATCH:-12}"
+  faddr=$(cast wallet address --private-key "$fk")
+  # Batch to stay under reth's per-account pending-tx limit: submit BATCH, wait
+  # for them to MINE (funder nonce advances), then the next batch. Firing all
+  # 100 from one funder at once exceeds the limit → excess rejected → nonce gap
+  # → the whole pool stalls (the bug this replaces).
+  while [[ "$sent" -lt "${#keys[@]}" ]]; do
+    n0=$(cast nonce "$faddr" --rpc-url "$rpc"); i=0
+    while [[ "$i" -lt "$BATCH" && $((sent+i)) -lt "${#keys[@]}" ]]; do
+      cast send "$(cast wallet address --private-key "${keys[$((sent+i))]}")" --value "$amt" --private-key "$fk" --rpc-url "$rpc" --nonce "$((n0+i))" --gas-price 2000000000 --priority-gas-price 1500000000 --async >/dev/null 2>&1
+      i=$((i+1))
+    done
+    local ok=0; for _ in $(seq 1 45); do [[ "$(cast nonce "$faddr" --rpc-url "$rpc" 2>/dev/null||echo "$n0")" -ge "$((n0+i))" ]] && { ok=1; break; }; sleep 2; done
+    [[ "$ok" == 1 ]] || { echo "    ⚠ batch stalled at $sent/${#keys[@]} (funder txs not mining — node not including mempool?)"; return 1; }
+    sent=$((sent+i)); echo "    funded $sent/${#keys[@]}"
+  done; return 0; }
 
 fdep(){ local rpc="$1" key="$2" sc="$3" sig="$4"; shift 4; local addr n0
   addr=$(cast wallet address --private-key "$key"); n0=$(cast nonce "$addr" --rpc-url "$rpc" 2>/dev/null); n0=${n0:-0}
