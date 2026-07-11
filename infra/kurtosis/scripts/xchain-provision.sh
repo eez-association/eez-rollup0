@@ -22,7 +22,7 @@ export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 K="$(cd "$HERE/.." && pwd)"
-REPO="$(cd "$K/.." && pwd)"
+REPO="$(cd "$K/../.." && pwd)"
 ENCLAVE="${KURTOSIS_ENCLAVE:-eez-devnet}"
 CACHE="$REPO/datadir/xchain-provision.env"
 mkdir -p "$REPO/datadir"
