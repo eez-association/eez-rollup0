@@ -216,10 +216,10 @@ def run(plan, args):
         )
 
         # -h is the l1-xchain front; assumes it serves full JSON-RPC, not just
-        # eth_sendRawTransaction — unverified until a live run (see README).
+        # eth_sendRawTransaction.
         daemon_key = spamoor_eez.get("inbound_private_key", poster_key)
         daemon_args = [
-            "exec spamoor-daemon",
+            "exec /app/spamoor-daemon",
             "--port=8080",
             "-h http://eez-node:{}".format(L1_XCHAIN_PORT),
             "-p " + daemon_key,
