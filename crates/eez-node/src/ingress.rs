@@ -62,6 +62,7 @@ pub async fn gate_and_hold(
         return Admission::Rejected("signature recovery failed".into());
     };
     let nonce = envelope.nonce();
+    let hash: B256 = keccak256(raw_tx.as_ref());
     if let Some(provider) = validation_provider {
         // `pending`, not `latest`: count a same-sender tx already in the source
         // mempool, else a correctly-nonced cross-chain tx collides with it.
@@ -69,13 +70,6 @@ pub async fn gate_and_hold(
             Ok(n) => n,
             Err(e) => return Admission::Rejected(format!("source-chain nonce lookup failed: {e}")),
         };
-        let held = held_pool.held_count_for(sender, direction) as u64;
-        let expected = on_chain + held;
-        if nonce != expected {
-            return Admission::Rejected(format!(
-                "invalid nonce {nonce} for {sender}: expected {expected} (on-chain {on_chain} + {held} held)"
-            ));
-        }
         let balance = match provider.get_balance(sender).await {
             Ok(b) => b,
             Err(e) => {
@@ -89,9 +83,31 @@ pub async fn gate_and_hold(
                 "insufficient balance for {sender}: have {balance}, need {cost} (value + gas_limit * max_fee)"
             ));
         }
+        let held_tx = HeldTx {
+            raw_tx: raw_tx.clone(),
+            hash,
+            attempts: 0,
+            sender,
+            nonce,
+            direction,
+        };
+        if let Err(expected) = held_pool.push_contiguous(held_tx, on_chain) {
+            return Admission::Rejected(format!(
+                "invalid nonce {nonce} for {sender}: expected {expected} after atomic held-pool check (on-chain {on_chain})"
+            ));
+        }
+        event!(
+            name: "eez.ingress.cross_chain.push",
+            Level::INFO,
+            tx_hash = %hash,
+            sender = %sender,
+            nonce,
+            direction = ?direction,
+            "cross-chain tx held for next Sync slot",
+        );
+        return Admission::Held(hash);
     }
     // keccak256 of the EIP-2718 envelope — the canonical tx hash for legacy and typed txs alike.
-    let hash: B256 = keccak256(raw_tx.as_ref());
     event!(
         name: "eez.ingress.cross_chain.push",
         Level::INFO,
