@@ -128,19 +128,32 @@ gas_price_for() { # <rpc> -> wei
     echo "${EEZ_TEST_GAS_PRICE_WEI:-$gp}"
 }
 
+# priority_fee_for <max_fee_wei> -> wei
+# Caps the priority fee to the live max fee (gas_price_for) for the same
+# chain — priority > max fee is rejected by the RPC. A fixed default can't
+# work across both chains: a quiet/idle L2 can sit at a live gas price of a
+# few wei, well below any single hardcoded constant.
+priority_fee_for() {
+    local pg="${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}"
+    (( pg > $1 )) && pg=$1
+    echo "$pg"
+}
+
 fund_l1() {
-    local to="$1" from_addr nonce
+    local to="$1" from_addr nonce gp
     from_addr=$(cast wallet address --private-key "$FUND_FROM_KEY")
     nonce=$(retry cast nonce "$from_addr" --rpc-url "$L1")
+    gp=$(gas_price_for "$L1")
     cast send "$to" --value 10ether --private-key "$FUND_FROM_KEY" --nonce "$nonce" \
-        --gas-price "$(gas_price_for "$L1")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1500000000}" --rpc-url "$L1" >/dev/null
+        --gas-price "$gp" --priority-gas-price "$(priority_fee_for "$gp")" --rpc-url "$L1" >/dev/null
 }
 
 fund_l2() {
-    local to="$1" nonce
+    local to="$1" nonce gp
     nonce=$(retry cast nonce "$HH_KEY_2_ADDR" --rpc-url "$L2")
+    gp=$(gas_price_for "$L2")
     cast send "$to" --value 10ether --private-key "$HH_KEY_2" --nonce "$nonce" \
-        --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" --rpc-url "$L2" >/dev/null
+        --gas-price "$gp" --priority-gas-price "$(priority_fee_for "$gp")" --rpc-url "$L2" >/dev/null
 }
 
 # ── Fund L1-side actors ──────────────────────────────────────────────
@@ -315,9 +328,9 @@ run_waves() {
     #   out set/noret/wrap/wd  → L2-signed tx via the L2 front
     mk_and_send() {
         local side="$1" kind="$2" arg="$3" raw="" hash
-        local GP PG
-        GP=$(gas_price_for "$L1")
-        PG="${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1500000000}"
+        local GP PG GP2 PG2
+        GP=$(gas_price_for "$L1"); PG=$(priority_fee_for "$GP")
+        GP2=$(gas_price_for "$L2"); PG2=$(priority_fee_for "$GP2")
         case "$side:$kind" in
             in:set)   raw=$(cast mktx --chain-id "$L1_CHAIN_ID" --private-key "$HH_KEY_IN" --nonce "$IN_NONCE" \
                         --gas-limit 600000 --gas-price "$GP" --priority-gas-price "$PG" \
@@ -332,16 +345,16 @@ run_waves() {
                         --gas-limit 600000 --gas-price "$GP" --priority-gas-price "$PG" --value "$arg" \
                         "$IN_DEP_PROXY") ;;
             out:set)   raw=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_OUT" --nonce "$OUT_NONCE" \
-                        --gas-limit 600000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" \
+                        --gas-limit 600000 --gas-price "$GP2" --priority-gas-price "$PG2" \
                         "$OUT_VALUE_PROXY" 'setValue(uint256)' "$arg") ;;
             out:noret) raw=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_OUT" --nonce "$OUT_NONCE" \
-                        --gas-limit 600000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" \
+                        --gas-limit 600000 --gas-price "$GP2" --priority-gas-price "$PG2" \
                         "$OUT_NORET_PROXY" 'setValue(uint256)' "$arg") ;;
             out:wrap)  raw=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_OUT" --nonce "$OUT_NONCE" \
-                        --gas-limit 800000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" \
+                        --gas-limit 800000 --gas-price "$GP2" --priority-gas-price "$PG2" \
                         "$OUT_WRAPPER" 'setViaProxy(uint256)' "$arg") ;;
             out:wd)    raw=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_OUT" --nonce "$OUT_NONCE" \
-                        --gas-limit 600000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" --value "$arg" \
+                        --gas-limit 600000 --gas-price "$GP2" --priority-gas-price "$PG2" --value "$arg" \
                         "$OUT_WD_PROXY") ;;
             *) echo "wave-test: bad op $side:$kind"; exit 1 ;;
         esac
@@ -358,10 +371,11 @@ run_waves() {
     }
 
     submit_pure_filler() {
-        local count="$1" j raw
+        local count="$1" j raw gp
+        gp=$(gas_price_for "$L2")
         for ((j=0; j<count; j++)); do
             raw=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_PURE" --nonce "$PURE_NONCE" \
-                --gas-limit 21000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" \
+                --gas-limit 21000 --gas-price "$gp" --priority-gas-price "$(priority_fee_for "$gp")" \
                 --value 100000000 "$PURE_RECIPIENT" 2>&1)
             [[ "$raw" =~ ^0x[0-9a-fA-F]+$ ]] || break
             curl -s -X POST "$L2" -H 'Content-Type: application/json' \
