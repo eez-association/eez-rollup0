@@ -92,42 +92,13 @@ impl HeldPool {
     /// Append `tx` to the pool. Idempotent on duplicate hash (later
     /// `push` of an already-held hash is a no-op).
     pub fn push(&self, tx: HeldTx) {
-        let mut txs = self.txs.lock().expect("held_pool txs poisoned");
         let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
         if by_hash.contains_key(&tx.hash) {
             return;
         }
-        by_hash.insert(tx.hash, txs.len());
-        txs.push_back(tx);
-    }
-
-    /// Atomically validate and append one transaction in a sender/direction
-    /// nonce chain.
-    ///
-    /// Provider reads in the ingress front are asynchronous. Computing
-    /// `held_count_for` there and calling `push` later lets concurrent requests
-    /// validate against the same queue snapshot. Keeping the final check and
-    /// insertion under one lock prevents a gapped chain from being admitted.
-    ///
-    /// Returns the expected nonce when `tx.nonce` is not the next contiguous
-    /// nonce. Duplicate hashes remain idempotent.
-    pub fn push_contiguous(&self, tx: HeldTx, on_chain_nonce: u64) -> Result<(), u64> {
         let mut txs = self.txs.lock().expect("held_pool txs poisoned");
-        let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
-        if by_hash.contains_key(&tx.hash) {
-            return Ok(());
-        }
-        let held = txs
-            .iter()
-            .filter(|held| held.sender == tx.sender && held.direction == tx.direction)
-            .count() as u64;
-        let expected = on_chain_nonce.saturating_add(held);
-        if tx.nonce != expected {
-            return Err(expected);
-        }
         by_hash.insert(tx.hash, txs.len());
         txs.push_back(tx);
-        Ok(())
     }
 
     /// Re-queue recovered txs at the FRONT of the pool, preserving
@@ -308,26 +279,6 @@ mod tests {
         pool.push(tx(1));
         pool.push(tx(1));
         assert_eq!(pool.len(), 1);
-    }
-
-    #[test]
-    fn push_contiguous_rejects_gap_and_accepts_next_nonce() {
-        let pool = HeldPool::new();
-        let sender = Address::repeat_byte(9);
-        let mk = |nonce: u64, hash_byte: u8| HeldTx {
-            raw_tx: Bytes::from(vec![hash_byte; 4]),
-            hash: TxHash::from(B256::repeat_byte(hash_byte)),
-            attempts: 0,
-            sender,
-            nonce,
-            direction: Direction::Outbound,
-        };
-
-        assert_eq!(pool.push_contiguous(mk(3, 3), 2), Err(2));
-        assert!(pool.is_empty());
-        assert_eq!(pool.push_contiguous(mk(2, 2), 2), Ok(()));
-        assert_eq!(pool.push_contiguous(mk(3, 3), 2), Ok(()));
-        assert_eq!(pool.len(), 2);
     }
 
     #[test]
