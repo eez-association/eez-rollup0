@@ -37,5 +37,9 @@ COPY genesis.json ./genesis.json
 # arrive via env vars from the Kurtosis run_sh task, so an empty file suffices.
 RUN touch /repo/.env
 
+# Pre-fetch solc 0.8.34 (pinned in contracts/foundry.toml) and warm the build
+# cache
+RUN cd /repo/contracts && forge build
+
 ENTRYPOINT ["/bin/bash", "-c"]
 CMD ["bash /repo/scripts/deploy.sh"]
