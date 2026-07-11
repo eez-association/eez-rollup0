@@ -25,6 +25,13 @@ const (
 	attackRevert  = "revert"           // valid selector the target lacks — cross-chain revert path
 )
 
+// Default enclave-internal endpoints (see infra/kurtosis/main.star ports).
+const (
+	defaultInboundFront  = "http://eez-node:18999" // L1 xchain front
+	defaultOutboundRPC   = "http://eez-node:18688" // normal L2 RPC (funding + receipts)
+	defaultOutboundFront = "http://eez-node:18998" // L2 xchain front
+)
+
 // ScenarioOptions configures the eez-xchain scenario. See infra/kurtosis's
 // scripts/wave-test.sh for the reference op semantics this mirrors.
 type ScenarioOptions struct {
@@ -43,23 +50,23 @@ type ScenarioOptions struct {
 	InboundWeight  uint64 `yaml:"inbound_weight"`
 	OutboundWeight uint64 `yaml:"outbound_weight"`
 
-	MaxPending  uint64  `yaml:"max_pending"`
-	MaxWallets  uint64  `yaml:"max_wallets"`
-	Rebroadcast uint64  `yaml:"rebroadcast"`
-	BaseFee     float64 `yaml:"base_fee"`
-	TipFee      float64 `yaml:"tip_fee"`
-	BaseFeeWei  string  `yaml:"base_fee_wei"`
-	TipFeeWei   string  `yaml:"tip_fee_wei"`
-	GasLimit    uint64  `yaml:"gas_limit"`
-	Timeout     string  `yaml:"timeout"`
+	MaxPending uint64  `yaml:"max_pending"`
+	MaxWallets uint64  `yaml:"max_wallets"`
+	BaseFee    float64 `yaml:"base_fee"`
+	TipFee     float64 `yaml:"tip_fee"`
+	BaseFeeWei string  `yaml:"base_fee_wei"`
+	TipFeeWei  string  `yaml:"tip_fee_wei"`
+	GasLimit   uint64  `yaml:"gas_limit"`
+	Timeout    string  `yaml:"timeout"`
 
-	// Outbound (L2->L1) side. The native WalletPool spamoor hands this
-	// scenario via Init() is bound to whichever chain --rpchost was launched
-	// against (we run with --rpchost at eez-node's l1-xchain front, so that
-	// pool is the INBOUND side). The L2 rollup has a distinct chain id, which
-	// spamoor's single-chain-id pool can't share — buildChainPool (common.go)
-	// builds the outbound pool from these instead.
+	// Endpoints (default to the enclave-internal eez-node ports). Wallets are
+	// funded over the NORMAL chain RPC — the inbound pool over the daemon's
+	// --rpchost, the outbound pool over OutboundRPC — because a front holds
+	// every send and would deadlock funding. Only the cross-chain tx itself is
+	// POSTed to InboundFront / OutboundFront.
+	InboundFront       string `yaml:"inbound_front"`
 	OutboundRPC        string `yaml:"outbound_rpc"`
+	OutboundFront      string `yaml:"outbound_front"`
 	OutboundPrivateKey string `yaml:"outbound_private_key"`
 
 	// Pre-created cross-chain proxies. This scenario drives load against them —
@@ -80,11 +87,13 @@ var ScenarioDefaultOptions = ScenarioOptions{
 	// Mode/weights left unset here on purpose: applyModeShorthand() only
 	// fills them in when both are still zero, so it can tell "not
 	// configured" apart from an explicit inbound_weight/outbound_weight.
-	Rebroadcast: 1,
-	BaseFee:     20,
-	TipFee:      2,
-	GasLimit:    600000,
-	ValueMax:    1_000_000,
+	BaseFee:       20,
+	TipFee:        2,
+	GasLimit:      600000,
+	ValueMax:      1_000_000,
+	InboundFront:  defaultInboundFront,
+	OutboundRPC:   defaultOutboundRPC,
+	OutboundFront: defaultOutboundFront,
 }
 
 var ScenarioDescriptor = scenario.Descriptor{
@@ -98,12 +107,14 @@ type Scenario struct {
 	options ScenarioOptions
 	logger  *logrus.Entry
 
-	inboundPool  *spamoor.WalletPool // native pool from spamoor, bound to --rpchost (the L1 front)
-	outboundPool *spamoor.WalletPool // built by buildChainPool, bound to OutboundRPC (the L2 front)
+	inboundPool  *spamoor.WalletPool // native pool from spamoor, funds over the daemon --rpchost (normal L1 RPC)
+	outboundPool *spamoor.WalletPool // built by buildChainPool, funds over OutboundRPC (normal L2 RPC)
 
 	numWallets    uint64
 	inboundProxy  common.Address
 	outboundProxy common.Address
+	inboundFront  string // where inbound cross-chain txs are POSTed
+	outboundFront string // where outbound cross-chain txs are POSTed
 
 	setValueSelector []byte
 	// revertSelector is a 4-byte selector for a function the target Value
@@ -128,14 +139,15 @@ func (s *Scenario) Flags(flags *pflag.FlagSet) error {
 	flags.Uint64Var(&s.options.OutboundWeight, "outbound-weight", ScenarioDefaultOptions.OutboundWeight, "Relative weight of outbound (L2->L1) ops (overrides --mode)")
 	flags.Uint64Var(&s.options.MaxPending, "max-pending", ScenarioDefaultOptions.MaxPending, "Maximum number of pending transactions")
 	flags.Uint64Var(&s.options.MaxWallets, "max-wallets", ScenarioDefaultOptions.MaxWallets, "Maximum number of child wallets to use per side")
-	flags.Uint64Var(&s.options.Rebroadcast, "rebroadcast", ScenarioDefaultOptions.Rebroadcast, "Enable reliable rebroadcast system")
 	flags.Float64Var(&s.options.BaseFee, "basefee", ScenarioDefaultOptions.BaseFee, "Max fee per gas (gwei)")
 	flags.Float64Var(&s.options.TipFee, "tipfee", ScenarioDefaultOptions.TipFee, "Max tip per gas (gwei)")
 	flags.StringVar(&s.options.BaseFeeWei, "basefee-wei", "", "Max fee per gas in wei (overrides --basefee for L2 sub-gwei fees)")
 	flags.StringVar(&s.options.TipFeeWei, "tipfee-wei", "", "Max tip per gas in wei (overrides --tipfee for L2 sub-gwei fees)")
 	flags.Uint64Var(&s.options.GasLimit, "gas-limit", ScenarioDefaultOptions.GasLimit, "Gas limit for cross-chain proxy calls")
 	flags.StringVar(&s.options.Timeout, "timeout", ScenarioDefaultOptions.Timeout, "Timeout for the scenario (e.g. '1h') - empty means no timeout")
-	flags.StringVar(&s.options.OutboundRPC, "outbound-rpc", "", "RPC/front URL for the outbound (L2->L1) side, e.g. eez-node's l2-xchain front")
+	flags.StringVar(&s.options.InboundFront, "inbound-front", ScenarioDefaultOptions.InboundFront, "L1 cross-chain front URL where inbound txs are submitted (held)")
+	flags.StringVar(&s.options.OutboundRPC, "outbound-rpc", ScenarioDefaultOptions.OutboundRPC, "NORMAL L2 RPC for the outbound wallet pool (funding + receipts) — NOT the front")
+	flags.StringVar(&s.options.OutboundFront, "outbound-front", ScenarioDefaultOptions.OutboundFront, "L2 cross-chain front URL where outbound txs are submitted (held)")
 	flags.StringVar(&s.options.OutboundPrivateKey, "outbound-private-key", "", "Funded private key for the outbound-side wallet pool (L2 chain)")
 	flags.StringVar(&s.options.InboundProxy, "inbound-proxy", "", "Address of the pre-created L1 CrossChainProxy to target")
 	flags.StringVar(&s.options.OutboundProxy, "outbound-proxy", "", "Address of the pre-created L2 CrossChainProxy to target")
@@ -161,6 +173,17 @@ func (s *Scenario) Init(options *scenario.Options) error {
 
 	applyModeShorthand(&s.options)
 
+	// Backfill endpoints if a config explicitly blanked them.
+	if s.options.InboundFront == "" {
+		s.options.InboundFront = defaultInboundFront
+	}
+	if s.options.OutboundRPC == "" {
+		s.options.OutboundRPC = defaultOutboundRPC
+	}
+	if s.options.OutboundFront == "" {
+		s.options.OutboundFront = defaultOutboundFront
+	}
+
 	if s.options.InboundWeight == 0 && s.options.OutboundWeight == 0 {
 		return fmt.Errorf("at least one of inbound_weight/outbound_weight must be non-zero (or set mode: inbound|outbound|mixed)")
 	}
@@ -170,16 +193,13 @@ func (s *Scenario) Init(options *scenario.Options) error {
 
 	// Each side's config/pool is only required if that side actually has
 	// weight — inbound-only and outbound-only runs shouldn't need to supply
-	// the other direction's RPC/key/proxy at all.
+	// the other direction's key/proxy at all.
 	if s.options.InboundWeight > 0 && s.options.InboundProxy == "" {
 		return fmt.Errorf("inbound_proxy is required when inbound_weight > 0 — this scenario drives load against a pre-created cross-chain proxy, it does not provision one (see infra/kurtosis/scripts/wave-test.sh create_l1_proxy)")
 	}
 	if s.options.OutboundWeight > 0 {
-		if s.options.OutboundRPC == "" {
-			return fmt.Errorf("outbound_rpc is required when outbound_weight > 0 (the L2->L1 front, e.g. eez-node's l2-xchain endpoint)")
-		}
 		if s.options.OutboundPrivateKey == "" {
-			return fmt.Errorf("outbound_private_key is required when outbound_weight > 0 (funded private key for the outbound/L2 wallet pool)")
+			return fmt.Errorf("outbound_private_key is required when outbound_weight > 0 (funded L2 key for the outbound wallet pool; must NOT be an eez-node system key)")
 		}
 		if s.options.OutboundProxy == "" {
 			return fmt.Errorf("outbound_proxy is required when outbound_weight > 0 — this scenario drives load against a pre-created cross-chain proxy, it does not provision one (see infra/kurtosis/scripts/wave-test.sh create_l2_proxy)")
@@ -189,11 +209,14 @@ func (s *Scenario) Init(options *scenario.Options) error {
 	s.setValueSelector = crypto.Keccak256([]byte("setValue(uint256)"))[:4]
 	s.revertSelector = crypto.Keccak256([]byte("eezFuzzNoSuchFunction()"))[:4]
 	s.numWallets = walletCount(s.options.MaxWallets, s.options.TotalCount, s.options.Throughput)
+	s.inboundFront = s.options.InboundFront
+	s.outboundFront = s.options.OutboundFront
 
 	if s.options.InboundWeight > 0 {
 		s.inboundProxy = common.HexToAddress(s.options.InboundProxy)
 		// The native (inbound) pool is prepared by spamoor's runner after
-		// Init returns; we only size it here.
+		// Init returns; we only size it here. It funds over the daemon's
+		// --rpchost, which main.star points at the normal L1 RPC.
 		s.inboundPool.SetWalletCount(s.numWallets)
 	}
 
@@ -274,19 +297,18 @@ func (s *Scenario) Run(ctx context.Context) error {
 		ProcessNextTxFn: func(ctx context.Context, params *scenario.ProcessNextTxParams) error {
 			inbound := (params.TxIdx % totalWeight) < s.options.InboundWeight
 
-			pool, target, side := s.outboundPool, s.outboundProxy, "outbound"
+			pool, target, front, side := s.outboundPool, s.outboundProxy, s.outboundFront, "outbound"
 			if inbound {
-				pool, target, side = s.inboundPool, s.inboundProxy, "inbound"
+				pool, target, front, side = s.inboundPool, s.inboundProxy, s.inboundFront, "inbound"
 			}
 
-			receiptChan, tx, client, wallet, err := submitCall(ctx, pool, target, uint256.NewInt(0), s.buildCalldata(), callSpec{
-				baseFee:     s.options.BaseFee,
-				tipFee:      s.options.TipFee,
-				baseFeeWei:  s.options.BaseFeeWei,
-				tipFeeWei:   s.options.TipFeeWei,
-				gasLimit:    s.options.GasLimit,
-				rebroadcast: s.options.Rebroadcast > 0,
-				logName:     ScenarioName,
+			tx, client, wallet, err := submitCall(ctx, pool, front, target, uint256.NewInt(0), s.buildCalldata(), callSpec{
+				baseFee:    s.options.BaseFee,
+				tipFee:     s.options.TipFee,
+				baseFeeWei: s.options.BaseFeeWei,
+				tipFeeWei:  s.options.TipFeeWei,
+				gasLimit:   s.options.GasLimit,
+				logName:    ScenarioName,
 			}, s.logger, params.TxIdx)
 
 			logger := s.logger.WithField("side", side)
@@ -326,11 +348,15 @@ func (s *Scenario) Run(ctx context.Context) error {
 				return err
 			}
 
-			// A reverted tx still yields a receipt; status isn't inspected —
-			// for attacks reverting is the point, and healthy setValue against
-			// a live proxy is expected to succeed anyway.
-			_, err = receiptChan.Wait(ctx)
-			return err
+			if s.options.Attack != attackNone {
+				// Adversarial: the tx is expected to be poison-evicted at compose
+				// time (no cross-chain effect) and never mine, so there is no
+				// receipt to await — successful admission is the observable.
+				return nil
+			}
+
+			// Well-formed: wait for the held tx to land (source-chain receipt).
+			return waitInclusion(ctx, front, tx.Hash(), defaultInclusionTimeout)
 		},
 	})
 }

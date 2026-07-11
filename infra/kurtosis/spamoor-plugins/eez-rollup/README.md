@@ -68,9 +68,9 @@ disable the other. This also matches spamoor's own idiom (its built-in
     throughput: 20            # independent dial — tune live in the UI
     max_pending: 200
     max_wallets: 40
-    outbound_rpc: "http://eez-node:18998"   # l2-xchain front
-    outbound_private_key: "0x..."           # funded L2 key
+    outbound_private_key: "0x..."           # funded L2 key (NOT an eez-node system key)
     outbound_proxy: "0x..."                 # from create_l2_proxy (wave-test.sh)
+    # outbound_rpc (normal L2 RPC) / outbound_front (L2 front) default to eez-node's :18688 / :18998
 ```
 
 An inbound-only spammer needs none of the `outbound_*` fields, and vice
@@ -95,7 +95,8 @@ side can throttle the other. It must supply both sides' config
 | `inbound_weight` / `outbound_weight` | Explicit mix ratio; overrides `mode` if either is non-zero. In a single-direction spammer only one is non-zero, so only that side's config is required. |
 | `throughput` | Cross-chain txs/slot (rate). Runs forever unless `total_count` is set. Split across directions by weight. |
 | `total_count` | Hard cap: send exactly this many txs (split by weight), then stop. `0` = unlimited. Set either/both of `throughput`/`total_count`. |
-| `outbound_rpc` / `outbound_private_key` | Required iff `outbound_weight > 0` — the L2 rollup has a distinct chain id from L1 (see `infra/kurtosis/genesis.json` vs the L1 `network_id`), so spamoor's single-chain-id client pool can't hold both; the plugin builds a second pool itself from these. |
+| `outbound_private_key` | Required iff `outbound_weight > 0` — funded L2 key for the outbound wallet pool (the L2 rollup has a distinct chain id from L1, so spamoor's single-chain-id client pool can't cover both; the plugin builds a second pool from this). Must **not** be an eez-node system key. |
+| `inbound_front` / `outbound_rpc` / `outbound_front` | Endpoints, defaulted to eez-node's `:18999` / `:18688` / `:18998`. Wallets are funded over the **normal** chain RPC (daemon `--rpchost` for inbound, `outbound_rpc` for outbound); only the cross-chain tx itself is POSTed to the front. A front can't fund wallets — it holds every `eth_sendRawTransaction`, mining none. Rarely need overriding. |
 | `inbound_proxy` / `outbound_proxy` | Pre-created proxy addresses (see above). Required per the corresponding non-zero weight. |
 | `value_max` | Upper bound for the random `setValue()` argument (well-formed load only; `0` sends a fixed `1`). |
 | `base_fee` / `tip_fee` / `base_fee_wei` / `tip_fee_wei` | Same fee knobs as native scenarios — use the `_wei` variants for L2's sub-gwei fees if needed. |

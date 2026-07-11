@@ -8,8 +8,10 @@
 # eez.spamoor_eez.startup_spammer_config to its path in args.yaml. Otherwise,
 # add spammers live via the daemon web UI.
 #
-# The daemon's --rpchost is the l1-xchain front, so the native (inbound) pool
-# is the L1 side; outbound entries build their own L2 pool from outbound_rpc.
+# The daemon's --rpchost is the NORMAL L1 RPC (wallets are funded there); the
+# cross-chain txs themselves are POSTed to the fronts. inbound_front (L1),
+# outbound_rpc (normal L2, for funding) and outbound_front (L2) all default to
+# the enclave-internal eez-node ports, so they're omitted below.
 #
 # This shows the recommended two-spammer setup (independent inbound + outbound)
 # plus an adversarial spammer. Enable/disable per run by including/removing
@@ -33,9 +35,9 @@
     throughput: 20
     max_pending: 200
     max_wallets: 40
-    outbound_rpc: "http://eez-node:18998" # l2-xchain front
-    outbound_private_key: "REPLACE_ME" # funded L2 key
+    outbound_private_key: "REPLACE_ME" # funded L2 key (NOT an eez-node system key)
     outbound_proxy: "REPLACE_ME" # L2 CrossChainProxy from create_l2_proxy
+    # outbound_rpc / outbound_front default to eez-node's :18688 / :18998 — override only if changed
 
 # Adversarial spammer (DDoS-resilience). Run alongside the healthy ones and
 # watch whether their inclusion rate degrades. attack: garbage-calldata | revert.

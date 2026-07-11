@@ -215,13 +215,17 @@ def run(plan, args):
             name = "eez-xchain-plugin",
         )
 
-        # -h is the l1-xchain front; assumes it serves full JSON-RPC, not just
-        # eth_sendRawTransaction.
+        # -h is the NORMAL L1 RPC (not the xchain front): spamoor funds its
+        # child wallets with plain transfers over --rpchost, and a front holds
+        # every send (mining none), which would deadlock wallet preparation. The
+        # plugin POSTs only the cross-chain scenario txs to the fronts (see the
+        # eez-xchain inbound_front / outbound_front options, defaulted to the
+        # eez-node :18999/:18998 ports).
         daemon_key = spamoor_eez.get("inbound_private_key", poster_key)
         daemon_args = [
             "exec /app/spamoor-daemon",
             "--port=8080",
-            "-h http://eez-node:{}".format(L1_XCHAIN_PORT),
+            "-h {}".format(l1_el.rpc_http_url),
             "-p " + daemon_key,
             "--plugin=/plugins/eez-rollup",
         ]
