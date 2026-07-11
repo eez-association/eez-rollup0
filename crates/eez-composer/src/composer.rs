@@ -1135,6 +1135,32 @@ where
 
         let mut iter = drained.into_iter().enumerate();
         while let Some((idx, held)) = iter.next() {
+            // A deterministic failure at nonce N makes every later nonce from
+            // the same sender/direction unexecutable until N is resubmitted.
+            // `drain_sender_above` below only sees transactions still in the
+            // shared pool; transactions from this same `pop_n` drain are no
+            // longer there. Cascade inside the drain as well, before staging
+            // any composition data, or a survivor at N+1 will make
+            // build_sync_block fail forever with "nonce too high".
+            if let Some(gap) = poison.iter().find(|failed| {
+                failed.sender == held.sender
+                    && failed.direction == held.direction
+                    && held.nonce > failed.nonce
+            }) {
+                event!(
+                    name: "eez.composer.cc_compose.poison_chain_evicted",
+                    Level::WARN,
+                    rollup_id,
+                    tx_idx = idx,
+                    tx_hash = %held.hash,
+                    sender = %held.sender,
+                    nonce = held.nonce,
+                    gap_at = gap.nonce,
+                    "same-drain tx above an evicted poison nonce; gapped chain can't land — evicted (resubmit in order)",
+                );
+                poison.push(held);
+                continue;
+            }
             // ── OUTBOUND (L2→L1) arm. Source-sim runs against the L2 ENTRY client
             // (the L2 follower errors `Unavailable`). Stage each (settlement entry,
             // its user tx); the load tx is built post-drain by the canonical
