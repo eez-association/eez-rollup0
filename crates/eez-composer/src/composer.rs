@@ -666,14 +666,21 @@ where
         }
 
         let pool_len_before = pool.len();
-        // Cap drain to 3 user_txs per bundle. rbuilder-chiado has shown
+        // Cap drain to N user_txs per bundle. rbuilder-chiado has shown
         // partial-inclusion when bundles carry more than ~3 user_txs:
         // postBatch lands, but only a prefix of the user_txs makes it
         // into the block — the rest are silently excluded by rbuilder
         // and effectively lost. Capping keeps every bundle's contents
-        // 100% atomic; a backlog spills into the next Sync slot.
-        const MAX_USER_TXS_PER_BUNDLE: usize = 3;
-        let drained = pool.pop_n(MAX_USER_TXS_PER_BUNDLE);
+        // 100% atomic; a backlog spills into the next Sync slot. 3 is the
+        // safe default; raise EEZ_MAX_USER_TXS_PER_BUNDLE only against a
+        // builder proven to include larger bundles atomically (measure the
+        // never-mined count first — a wrong bump silently loses user_txs).
+        let max_user_txs = std::env::var("EEZ_MAX_USER_TXS_PER_BUNDLE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(3);
+        let drained = pool.pop_n(max_user_txs);
         // NOTE: do NOT early-exit on empty pool. Every unblocked Sync
         // slot still emits a postBatch carrying the leading immediate
         // entry (which advances L1's stored stateRoot to the L2
@@ -1185,14 +1192,15 @@ where
                             continue;
                         }
                         // Evict a withdrawal that would exceed the rollup's L1 escrow —
-                        // it would revert on-chain and drop the whole bundle. Fail-open.
-                        let rid_u256 = U256::from(rollup_id);
-                        let need: U256 = l1_entries[0]
-                            .stateDeltas
-                            .iter()
-                            .filter(|d| d.rollupId == rid_u256 && d.etherDelta.is_negative())
-                            .map(|d| d.etherDelta.unsigned_abs())
-                            .fold(U256::ZERO, |acc, v| acc + v);
+                        // it would revert on-chain and drop the whole bundle.
+                        // "ether out" is the amount of Ether being withdrawn in this outbound settlement entry.
+                        // If missing, the entry is malformed and must be evicted.
+                        let Some(need) = eez_evm::entries::outbound_ether_out(&l1_entries[0])
+                        else {
+                            event!(name: "eez.composer.cc_compose.outbound_ether_out_missing", Level::WARN, rollup_id, tx_idx = idx, tx_hash = %held.hash, "outbound tx is missing ether out entry, likely malformed; evicting");
+                            poison.push(held);
+                            continue;
+                        };
                         if need > U256::ZERO {
                             if escrow_remaining.is_none() {
                                 escrow_remaining =
