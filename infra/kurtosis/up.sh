@@ -54,8 +54,12 @@ yv() { grep -E "^[[:space:]]*$1:" "$ARGS_FILE" | head -1 \
         | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//'; }
 
 # Derive dev keys and fund them in the L1 genesis config.
+# inbound_private_key (index 3) is the spamoor-eez daemon's inbound wallet-pool
+# root — kept OFF the batch poster (index 1) so cross-chain load can't contend
+# with batch posting. It lives under eez.spamoor_eez but yv/sed match by the
+# unique key name regardless of nesting.
 DERIVED_ADDRS=()
-for pair in "poster_key:1" "proof_signer_key:2"; do
+for pair in "poster_key:1" "proof_signer_key:2" "inbound_private_key:3"; do
     key="${pair%%:*}"; index="${pair##*:}"
     if [[ "$(yv "$key")" == "0xCHANGE_ME" ]]; then
         command -v cast >/dev/null || {

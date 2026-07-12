@@ -1,0 +1,38 @@
+# eez-xchain spammer intent file. Copy to a gitignored `spammers.yaml`, edit,
+# then run: bash infra/kurtosis/scripts/spammers.sh up
+#
+# Declare which spammers you want and how fast; spammers.sh provisions the
+# proxies/wrappers and outbound key and fills them in — you never list an
+# address or key here.
+#
+# Fields: name, enabled, mode (inbound|outbound|mixed), throughput (txs/L2 slot),
+# ops (subset of set,noret,value,wrapper; default set), attack ('',
+# garbage-calldata, revert), max_wallets, max_pending, value_max.
+#
+# Drain rate: throughput above what the chain settles just grows a backlog (not
+# an error); `spammers.sh verify` measures the real rate.
+
+spammers:
+  # Full cross-chain surface, one dial per direction.
+  - name: inbound
+    enabled: true
+    mode: inbound
+    throughput: 3
+    ops: [set, noret, value, wrapper]
+    max_wallets: 20
+
+  - name: outbound
+    enabled: true
+    mode: outbound
+    throughput: 3
+    ops: [set, noret, value, wrapper]
+    max_wallets: 20
+
+  # Adversarial (DDoS-resilience). Run alongside a healthy entry and watch
+  # whether its confirm rate holds. attack: garbage-calldata | revert.
+  - name: attack-garbage
+    enabled: false
+    mode: inbound
+    attack: garbage-calldata
+    throughput: 20
+    max_wallets: 20
