@@ -570,6 +570,30 @@ pub async fn send_l2_value_transfer(
     Ok(hash)
 }
 
+/// Send one L2 value transfer and wait for its receipt. Use this when a test
+/// needs to prove a later L1 attestation includes a fresh L2 state transition.
+pub async fn send_l2_value_transfer_confirmed(
+    rpc_url: &str,
+    signing_key: &str,
+    to: Address,
+    value: U256,
+    timeout: Duration,
+) -> Result<alloy_primitives::TxHash> {
+    let hash = send_l2_value_transfer(rpc_url, signing_key, to, value).await?;
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    wait_for(timeout, || async {
+        let Some(receipt) = provider.get_transaction_receipt(hash).await? else {
+            return Ok(None);
+        };
+        if !receipt.status() {
+            bail!("L2 value transfer reverted: {hash}");
+        }
+        Ok(Some(()))
+    })
+    .await?;
+    Ok(hash)
+}
+
 /// Wait until `eth_blockNumber` responds at `rpc_url`. Used to confirm a
 /// just-spawned eez-node's L2 RPC is up before we send txs at it.
 pub async fn wait_for_l2_rpc(rpc_url: &str, timeout: Duration) -> Result<()> {
@@ -580,15 +604,15 @@ pub async fn wait_for_l2_rpc(rpc_url: &str, timeout: Duration) -> Result<()> {
     .await
 }
 
-/// Read the `stateRoot` of the latest `safe` block on the L2 at `rpc_url`.
-/// Returns `Ok(None)` while the L2 hasn't yet adopted any safe block
-/// (genesis L1 derivation pending). Used by the multi-composer reorg
-/// test to verify both composers settle on the same canonical L2 head.
-pub async fn safe_block_state_root(rpc_url: &str) -> Result<Option<B256>> {
-    use alloy_rpc_types_eth::BlockNumberOrTag;
+/// Block number and hash at a named tag (`latest`, `safe`, `finalized`, …).
+/// `None` when no block exists at that tag yet.
+pub async fn block_number_and_hash_at(
+    rpc_url: &str,
+    tag: alloy_rpc_types_eth::BlockNumberOrTag,
+) -> Result<Option<(u64, B256)>> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let block = provider.get_block_by_number(BlockNumberOrTag::Safe).await?;
-    Ok(block.map(|b| b.header.state_root))
+    let block = provider.get_block_by_number(tag).await?;
+    Ok(block.map(|b| (b.header.number, b.header.hash)))
 }
 
 /// Deploy `EEZ` + `MockECDSAProofSystem` + `Rollup`, then register the rollup.
@@ -888,7 +912,7 @@ impl NodeHandle {
         let datadir = tempfile::tempdir().context("datadir tempdir")?;
         let mut handle = Self::spawn_with(name, datadir.path(), cfg, env)?;
         handle.keep_alive.push(datadir);
-        wait_for_l2_rpc(&handle.l2_rpc_url(), Duration::from_secs(90)).await?;
+        wait_for_l2_rpc(&handle.l2_rpc_url(), Duration::from_secs(180)).await?;
         Ok(handle)
     }
 
@@ -1175,27 +1199,101 @@ pub async fn all_l2_execution_states(
         .collect()
 }
 
-/// Wait until `node.safe.stateRoot` appears in the contract's
-/// `L2ExecutionPerformed` history for this `Chain`. The attestation
-/// set grows monotonically, so this doesn't race the contract's
-/// advancing head: any past attestation matching the node's current
-/// safe head proves the node imported a block the contract has, at
-/// some point, declared canonical.
-pub async fn wait_for_node_caught_up(
+/// Wait until the node's safe `stateRoot` appears in the contract's
+/// `L2ExecutionPerformed` history for this `Chain` and differs from
+/// `genesis_root`. The attestation set grows monotonically, so this doesn't
+/// race the contract's advancing head: any past attestation matching the
+/// node's current safe head proves the node imported a block the contract
+/// has, at some point, declared canonical. Excluding `genesis_root` stops a
+/// node stuck at genesis from trivially passing by matching an empty-block
+/// attestation whose `newState` equals the registered initial state.
+pub async fn wait_for_safe_state(
     node: &NodeHandle,
     chain: &Chain<'_>,
+    genesis_root: B256,
     timeout: Duration,
 ) -> Result<()> {
     wait_for(timeout, || async {
-        let node_root = safe_block_state_root(&node.l2_rpc_url())
-            .await
-            .ok()
-            .flatten();
+        let node_root = async {
+            let provider = ProviderBuilder::new().connect_http(node.l2_rpc_url().parse()?);
+            let block = provider
+                .get_block_by_number(alloy_rpc_types_eth::BlockNumberOrTag::Safe)
+                .await?;
+            Ok::<Option<B256>, anyhow::Error>(block.map(|b| b.header.state_root))
+        }
+        .await
+        .ok()
+        .flatten();
         let attested = chain.executed_states().await.unwrap_or_default();
         Ok(match node_root {
-            Some(n) if n != B256::ZERO && attested.contains(&n) => Some(()),
+            Some(n) if n != B256::ZERO && n != genesis_root && attested.contains(&n) => Some(()),
             _ => None,
         })
+    })
+    .await
+}
+
+/// Wait until `node`'s safe block carries a state root that was not attested
+/// before the scenario and is now present in the contract's execution history.
+/// Returns that safe block's `(number, hash)` so peers can be checked against
+/// the exact block, not just a repeated state root.
+pub async fn wait_for_new_attested_safe_block(
+    node: &NodeHandle,
+    chain: &Chain<'_>,
+    previous_states: &[B256],
+    timeout: Duration,
+) -> Result<(u64, B256)> {
+    wait_for(timeout, || {
+        let rpc = node.l2_rpc_url();
+        async move {
+            let provider = ProviderBuilder::new().connect_http(rpc.parse()?);
+            let Some(block) = provider
+                .get_block_by_number(alloy_rpc_types_eth::BlockNumberOrTag::Safe)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let number = block.header.number;
+            let hash = block.header.hash;
+            let root = block.header.state_root;
+            if number == 0 || root == B256::ZERO || previous_states.contains(&root) {
+                return Ok(None);
+            }
+            let attested = chain.executed_states().await?;
+            Ok(attested.contains(&root).then_some((number, hash)))
+        }
+    })
+    .await
+}
+
+/// Wait until `node`'s safe chain includes `hash` at `number`.
+pub async fn wait_for_safe_chain_contains(
+    node: &NodeHandle,
+    number: u64,
+    hash: B256,
+    timeout: Duration,
+) -> Result<()> {
+    wait_for(timeout, || {
+        let rpc = node.l2_rpc_url();
+        async move {
+            let Some((safe_number, _)) =
+                block_number_and_hash_at(&rpc, alloy_rpc_types_eth::BlockNumberOrTag::Safe).await?
+            else {
+                return Ok(None);
+            };
+            if safe_number < number {
+                return Ok(None);
+            }
+            let Some((_, actual_hash)) = block_number_and_hash_at(
+                &rpc,
+                alloy_rpc_types_eth::BlockNumberOrTag::Number(number),
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            Ok((actual_hash == hash).then_some(()))
+        }
     })
     .await
 }

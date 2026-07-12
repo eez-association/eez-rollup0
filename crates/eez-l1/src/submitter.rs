@@ -92,7 +92,16 @@ impl Submitter {
         Self {
             inner: Arc::new(Inner {
                 config,
-                http: reqwest::Client::new(),
+                // Bounded timeout so a hanging/unreachable builder relay cannot
+                // stall the one-in-flight gate forever: a timed-out `eth_sendBundle`
+                // returns Err, which `observe_bundle_outcome` treats as a drop →
+                // the gate reopens and the next slot retries. `Client::new()` has
+                // NO timeout, so a relay that accepts the TCP connection but never
+                // responds freezes posting permanently (cursor stuck at 0).
+                http: reqwest::Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new()),
             }),
         }
     }
@@ -163,6 +172,18 @@ impl Submitter {
                 L1Error::Submission(format!("send_bundle: decode postBatch envelope: {e}"))
             })?;
         let post_batch_hash = *post_batch_envelope.tx_hash();
+        // Dispatch breadcrumb: correlate this postBatch tx to the L1 block we
+        // aim it at. `SendOutcome::Included` later carries the ACTUAL inclusion
+        // block, so joining on tx_hash gives the N+1 next-slot targeting hit-rate.
+        event!(
+            name: "eez.submitter.bundle.dispatch",
+            Level::INFO,
+            tx_hash = %post_batch_hash,
+            target_block,
+            exact = matches!(target, BundleTarget::Exact { .. }),
+            tx_count = raw_txs.len(),
+            "dispatching bundle to builder",
+        );
         // One bundle, one target block. Atomic bundle semantics:
         // rbuilder either includes the whole bundle in `target_block`
         // in the specified order, or drops it. Relays without a bundle
