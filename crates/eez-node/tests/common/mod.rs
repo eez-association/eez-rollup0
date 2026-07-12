@@ -878,7 +878,9 @@ impl NodeHandle {
         cmd.env("EEZ_L1_HTTP_PORT", l1_http_port.to_string())
             .env("EEZ_L1_AUTH_PORT", l1_auth_port.to_string())
             .env("EEZ_L1_P2P_PORT", l1_p2p_port.to_string())
-            .env("EEZ_L1_DATADIR", &l1_datadir);
+            .env("EEZ_L1_DATADIR", &l1_datadir)
+            // May be overridden below when a test uses another L2 upstream.
+            .env("EEZ_L2_RPC_URL", format!("http://127.0.0.1:{http_port}"));
         for (k, v) in env {
             if *k == TEST_L2_GENESIS_ENV {
                 continue; // test-only marker (consumed as --chain above)
@@ -1320,14 +1322,12 @@ use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_network::TxSignerSync;
 use alloy_network::eip2718::Encodable2718;
 
-/// reth `--chain dev` chain id. Different from the L2 fixture genesis chain id (1),
-/// so the ingress classifier can distinguish L1 source txs from L2-native ones.
+/// Chain ID used by the embedded dev L1.
 pub const DEV_CHAIN_ID: u64 = 1337;
 
 pub const FIRST_ROLLUP_ID: u64 = 1;
 
-/// CCM-L2 predeploy address — baked into the L2 fixture genesis. The
-/// composer materializes incoming cross-chain calls through it.
+/// CCM-L2 predeploy address in the L2 fixture genesis.
 pub const CCM_L2_ADDRESS: Address = address!("0x4200000000000000000000000000000000000007");
 
 sol! {
@@ -1337,9 +1337,22 @@ sol! {
         function createCrossChainProxy(address originalAddress, uint256 originalRollupId) external returns (address proxy);
     }
     #[sol(rpc)]
+    interface ICCML2Proxy {
+        function createCrossChainProxy(address originalAddress, uint256 originalRollupId) external returns (address proxy);
+        function computeCrossChainProxyAddress(address originalAddress, uint256 originalRollupId) external view returns (address proxy);
+    }
+    #[sol(rpc)]
     interface IValue {
         function value() external view returns (uint256);
         function setValue(uint256 v) external returns (bool changed, uint256 newValue);
+    }
+    #[sol(rpc)]
+    interface IValueNoRet {
+        function value() external view returns (uint256);
+        function setValue(uint256 v) external;
+    }
+    interface ISetterWrapper {
+        function setViaProxy(uint256 v) external;
     }
 }
 
@@ -1388,9 +1401,9 @@ pub fn signer_address(key: &str) -> Result<Address> {
     Ok(signer_of(key)?.address())
 }
 
-/// Sign and submit an EIP-1559 tx; return its hash. `to == None` is a CREATE.
+/// Sign and submit an EIP-1559 transaction. `to == None` is a CREATE.
 #[allow(clippy::too_many_arguments)]
-pub async fn sign_send_raw(
+pub async fn sign_and_send(
     rpc_url: &str,
     key: &str,
     chain_id: u64,
@@ -1452,7 +1465,7 @@ async fn deploy_raw(
     data.extend_from_slice(&constructor_args);
 
     let nonce = pending_nonce(rpc_url, key).await?;
-    let hash = sign_send_raw(
+    let hash = sign_and_send(
         rpc_url,
         key,
         chain_id,
@@ -1536,7 +1549,7 @@ pub async fn deploy_protocol_dev(
     }
     .abi_encode();
     let nonce = pending_nonce(l1_rpc, key).await?;
-    let hash = sign_send_raw(
+    let hash = sign_and_send(
         l1_rpc,
         key,
         DEV_CHAIN_ID,
@@ -1567,8 +1580,7 @@ pub async fn deploy_protocol_dev(
     })
 }
 
-/// Deploy `Value(initial)` on the L2. Uses the L2's own chain id — a CREATE
-/// with the L1 chain id would be classified as a cross-chain source tx and held.
+/// Deploy `Value(initial)` on L2.
 pub async fn deploy_value_l2(l2_rpc: &str, key: &str, initial: U256) -> Result<Address> {
     let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
     let l2_chain_id = provider.get_chain_id().await?;
@@ -1581,6 +1593,102 @@ pub async fn deploy_value_l2(l2_rpc: &str, key: &str, initial: U256) -> Result<A
         initial.abi_encode(),
     )
     .await
+}
+
+/// Deploy `Value(initial)` on the embedded dev L1.
+pub async fn deploy_value_l1(l1_rpc: &str, key: &str, initial: U256) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        l1_rpc,
+        key,
+        DEV_CHAIN_ID,
+        &out.join("Value.sol/Value.json"),
+        initial.abi_encode(),
+    )
+    .await
+}
+
+pub async fn deploy_value_no_ret(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    initial: U256,
+) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("ValueNoRet.sol/ValueNoRet.json"),
+        initial.abi_encode(),
+    )
+    .await
+}
+
+pub async fn deploy_setter_wrapper(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    proxy: Address,
+) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("SetterWrapper.sol/SetterWrapper.json"),
+        proxy.abi_encode(),
+    )
+    .await
+}
+
+pub async fn value_no_ret(rpc_url: &str, value_addr: Address) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(IValueNoRet::new(value_addr, &provider)
+        .value()
+        .call()
+        .await?)
+}
+
+/// Create an outbound proxy through the CCM-L2 predeploy.
+pub async fn create_l2_cross_chain_proxy(
+    l2_rpc: &str,
+    key: &str,
+    target: Address,
+    original_rollup_id: u64,
+) -> Result<Address> {
+    let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
+    let ccm = ICCML2Proxy::new(CCM_L2_ADDRESS, &provider);
+    let proxy = ccm
+        .computeCrossChainProxyAddress(target, U256::from(original_rollup_id))
+        .call()
+        .await?;
+    let chain_id = provider.get_chain_id().await?;
+    let nonce = pending_nonce(l2_rpc, key).await?;
+    let hash = sign_and_send(
+        l2_rpc,
+        key,
+        chain_id,
+        nonce,
+        Some(CCM_L2_ADDRESS),
+        U256::ZERO,
+        ICCML2Proxy::createCrossChainProxyCall {
+            originalAddress: target,
+            originalRollupId: U256::from(original_rollup_id),
+        }
+        .abi_encode(),
+        1_500_000,
+    )
+    .await?;
+    let receipt = wait_for(Duration::from_secs(60), || {
+        let provider = provider.clone();
+        async move { Ok(provider.get_transaction_receipt(hash).await?) }
+    })
+    .await?;
+    if !receipt.status() {
+        bail!("create L2 cross-chain proxy reverted");
+    }
+    Ok(proxy)
 }
 
 /// Call `EEZ.createCrossChainProxy` on the L1 and return the deployed proxy
@@ -1601,7 +1709,7 @@ pub async fn create_cross_chain_proxy(
     }
     .abi_encode();
     let nonce = pending_nonce(l1_rpc, key).await?;
-    let hash = sign_send_raw(
+    let hash = sign_and_send(
         l1_rpc,
         key,
         DEV_CHAIN_ID,
@@ -1638,13 +1746,11 @@ pub async fn l2_value(l2_rpc: &str, value_addr: Address) -> Result<U256> {
     Ok(IValue::new(value_addr, &provider).value().call().await?)
 }
 
-/// ETH balance of `addr` on the L2.
 pub async fn l2_balance(l2_rpc: &str, addr: Address) -> Result<U256> {
     let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
     Ok(provider.get_balance(addr).await?)
 }
 
-/// `None` if not yet mined, `Some(true)` if succeeded, `Some(false)` if reverted.
 pub async fn receipt_ok(rpc_url: &str, hash: alloy_primitives::TxHash) -> Result<Option<bool>> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     Ok(provider
@@ -1653,109 +1759,12 @@ pub async fn receipt_ok(rpc_url: &str, hash: alloy_primitives::TxHash) -> Result
         .map(|r| r.status()))
 }
 
-/// TEMP DIAGNOSTIC: L1 block a tx landed in (`None` if no receipt yet).
-pub async fn tx_block_number(rpc_url: &str, hash: alloy_primitives::TxHash) -> Option<u64> {
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse().ok()?);
-    provider
-        .get_transaction_receipt(hash)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|r| r.block_number)
-}
-
-/// TEMP DIAGNOSTIC: revert reason for a reverted tx via `debug_traceTransaction`
-/// with the callTracer. Returns the raw JSON trace as a string (the revert
-/// reason / output field is embedded); best-effort — errors are stringified.
-pub async fn debug_revert_reason(rpc_url: &str, hash: alloy_primitives::TxHash) -> String {
-    let client = reqwest::Client::new();
-    let body = serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "debug_traceTransaction",
-        "params": [format!("{hash:?}"), { "tracer": "callTracer" }],
-    });
-    match client.post(rpc_url).json(&body).send().await {
-        Ok(resp) => match resp.text().await {
-            Ok(t) => t,
-            Err(e) => format!("<trace body read error: {e}>"),
-        },
-        Err(e) => format!("<debug_traceTransaction error: {e}>"),
-    }
-}
-
-/// TEMP DIAGNOSTIC: hash of the first tx in `block` (the postBatch, in a
-/// settlement bundle), or `None` if the block is empty / unavailable.
-pub async fn first_tx_in_block(rpc_url: &str, block: u64) -> Option<alloy_primitives::TxHash> {
-    use alloy_rpc_types_eth::BlockNumberOrTag;
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse().ok()?);
-    let blk = provider
-        .get_block_by_number(BlockNumberOrTag::Number(block))
-        .full()
-        .await
-        .ok()??;
-    blk.transactions.txns().next().map(|tx| *tx.inner.tx_hash())
-}
-
-/// TEMP DIAGNOSTIC: replay a tx via `eth_call` at `at_block` and return the
-/// raw JSON-RPC response (revert data lives in `error.data`). Exact for the
-/// FIRST tx in a block (its pre-state == parent's post-state). No `debug`
-/// namespace needed. Fetches the tx via `eth_getTransactionByHash` first.
-pub async fn replay_revert(rpc_url: &str, hash: alloy_primitives::TxHash, at_block: u64) -> String {
-    let client = reqwest::Client::new();
-    let get = serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "eth_getTransactionByHash",
-        "params": [format!("{hash:?}")],
-    });
-    let tx: serde_json::Value = match client.post(rpc_url).json(&get).send().await {
-        Ok(r) => r.json().await.unwrap_or(serde_json::Value::Null),
-        Err(e) => return format!("<getTx error: {e}>"),
-    };
-    let t = &tx["result"];
-    let call = serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "eth_call",
-        "params": [{
-            "from": t["from"], "to": t["to"], "input": t["input"],
-            "value": t["value"], "gas": t["gas"],
-        }, format!("0x{at_block:x}")],
-    });
-    match client.post(rpc_url).json(&call).send().await {
-        Ok(r) => r.text().await.unwrap_or_else(|e| format!("<call body: {e}>")),
-        Err(e) => format!("<eth_call error: {e}>"),
-    }
-}
-
-/// TEMP DIAGNOSTIC: dump every tx receipt in `block` — index, from, to,
-/// status (true=ok/false=reverted), gas_used. Lets us see whether the
-/// postBatch (from=poster, to=EEZ) succeeded and which user txs reverted,
-/// without needing the `debug` RPC namespace.
-pub async fn dump_block_receipts(rpc_url: &str, block: u64) -> String {
-    use alloy_consensus::Transaction as _;
-    use alloy_rpc_types_eth::BlockNumberOrTag;
-    let provider = match ProviderBuilder::new().connect_http(rpc_url.parse().unwrap()) {
-        p => p,
-    };
-    let mut out = format!("block {block} receipts:\n");
-    let blk = match provider
-        .get_block_by_number(BlockNumberOrTag::Number(block))
-        .full()
-        .await
-    {
-        Ok(Some(b)) => b,
-        Ok(None) => return format!("{out}  <block {block} not found>"),
-        Err(e) => return format!("{out}  <get_block error: {e}>"),
-    };
-    for (i, tx) in blk.transactions.txns().enumerate() {
-        let hash = *tx.inner.tx_hash();
-        let (status, gas) = match provider.get_transaction_receipt(hash).await {
-            Ok(Some(r)) => (Some(r.status()), Some(r.gas_used)),
-            _ => (None, None),
-        };
-        out.push_str(&format!(
-            "  [{i}] hash={hash} from={} to={:?} status={status:?} gas_used={gas:?}\n",
-            tx.inner.signer(),
-            tx.to(),
-        ));
-    }
-    out
+pub async fn safe_block_state_root(rpc_url: &str) -> Result<Option<B256>> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(provider
+        .get_block_by_number(alloy_rpc_types_eth::BlockNumberOrTag::Safe)
+        .await?
+        .map(|block| block.header.state_root))
 }
 
 /// Precomputed config for the embedded-dev-L1 devnet.
@@ -1764,6 +1773,7 @@ pub struct DevnetCfg {
     pub l1_auth_port: u16,
     pub l1_p2p_port: u16,
     pub l1_xchain_port: u16,
+    pub l2_xchain_port: u16,
     pub eez_address: Address,
     pub mock_ps_address: Address,
     pub rollup_manager_address: Address,
@@ -1800,6 +1810,7 @@ impl DevnetCfg {
             l1_auth_port,
             l1_p2p_port: free_port(),
             l1_xchain_port: free_port(),
+            l2_xchain_port: free_port(),
             eez_address,
             mock_ps_address,
             rollup_manager_address,
@@ -1824,9 +1835,12 @@ impl DevnetCfg {
         format!("http://127.0.0.1:{}", self.l1_xchain_port)
     }
 
-    /// Env vars for `eez-node`. Inbound cross-chain ops are classified by
-    /// which front they're submitted to (the L1 front is fixed `Inbound`),
-    /// so proxies don't have to be known before boot.
+    /// L2 cross-chain front for outbound L2→L1 transactions.
+    pub fn l2_xchain_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.l2_xchain_port)
+    }
+
+    /// Environment for the embedded-L1 composer test node.
     pub fn env(&self) -> Vec<(&'static str, String)> {
         vec![
             ("EEZ_L1_EMBEDDED", "1".to_string()),
@@ -1835,6 +1849,7 @@ impl DevnetCfg {
             ("EEZ_L1_RPC_URL", self.l1_rpc_url()),
             ("EEZ_L1_BUILDER_RPC_URL", self.l1_rpc_url()),
             ("EEZ_L1_XCHAIN_PORT", self.l1_xchain_port.to_string()),
+            ("EEZ_L2_XCHAIN_PORT", self.l2_xchain_port.to_string()),
             ("EEZ_L1_HTTP_PORT", self.l1_http_port.to_string()),
             ("EEZ_L1_AUTH_PORT", self.l1_auth_port.to_string()),
             ("EEZ_L1_P2P_PORT", self.l1_p2p_port.to_string()),

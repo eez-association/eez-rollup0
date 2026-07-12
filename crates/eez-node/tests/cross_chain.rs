@@ -1,28 +1,23 @@
-//! Cross-chain L1→L2 smoke — Rust port of `scripts/devnet-test.sh`.
-//!
-//! Uses the embedded dev L1 as the anchor (not a separate anvil): source-tx
-//! simulation reads the embedded L1's in-process state, so proxies created
-//! on a separate anvil would be invisible to it. As a side effect,
-//! `EEZ_L1_BUILDER_RPC_URL` defaults to the embedded L1 and bundles flow
-//! through `bundle_rpc.rs` — which is what this test exercises.
+//! Bidirectional cross-chain wave test over the embedded dev L1.
 
 use std::time::Duration;
 
 use alloy_primitives::{Address, U256, address};
+use alloy_provider::Provider;
 use alloy_sol_types::SolCall;
 
 mod common;
 use common::{
-    ANVIL_KEY_2, ANVIL_KEY_3, DEV_CHAIN_ID, DevnetCfg, IValue, NodeHandle, batches_posted,
-    create_cross_chain_proxy, deploy_protocol_dev, deploy_value_l2, l2_balance, l2_value,
-    pending_nonce, receipt_ok, sign_send_raw, signer_address, state_root, wait_for,
-    wait_for_l2_rpc,
+    ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4, DEV_CHAIN_ID, DevnetCfg, ISetterWrapper, IValue,
+    IValueNoRet, NodeHandle, batches_posted, create_cross_chain_proxy, create_l2_cross_chain_proxy,
+    deploy_protocol_dev, deploy_setter_wrapper, deploy_value_l1, deploy_value_l2,
+    deploy_value_no_ret, l2_balance, l2_value, pending_nonce, receipt_ok, sign_and_send,
+    signer_address, state_root, value_no_ret, wait_for, wait_for_l2_rpc,
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(90);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// One setter + one deposit per wave; last setter value wins.
 const WAVE_SETTERS: &[u64] = &[7, 11, 17];
 const WAVE_DEPOSITS: &[u128] = &[
     1_000_000_000_000_000,
@@ -30,23 +25,18 @@ const WAVE_DEPOSITS: &[u128] = &[
     3_000_000_000_000_000,
 ];
 
-/// Cross-chain setter + deposit over `eth_sendBundle` on the embedded dev L1.
-///
-/// Fires three waves of setter+deposit ops, then verifies: all L1 receipts
-/// succeed, semantic effects converge, L1 stateRoot matches L2 safe stateRoot,
-/// ≥N BatchPosted events, and zero divergence events.
+/// Runs mixed waves with direct, no-return, wrapper, and value-transfer calls.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cross_chain_setter_deposit_over_bundle() {
+async fn mixed_cross_chain_wave_matrix_over_bundle() {
     let cfg = DevnetCfg::new().unwrap();
     let l1_rpc = cfg.l1_rpc_url();
     let l1_xchain = cfg.l1_xchain_url();
+    let l2_xchain = cfg.l2_xchain_url();
 
-    // Value (setter target) is CREATE(deployer, 0); recipient (deposit target)
-    // is a fixed EOA. The proxies are created after boot — the classifier routes
-    // our ops by source chain id, so it needn't know the proxy addresses upfront.
     let value_deployer = ANVIL_KEY_3;
     let value_addr = signer_address(value_deployer).unwrap().create(0);
     let recipient: Address = address!("0x2222222222222222222222222222222222222222");
+    let withdrawal_recipient: Address = address!("0x3333333333333333333333333333333333333333");
 
     let datadir = tempfile::tempdir().unwrap();
     let env = cfg.env();
@@ -69,6 +59,25 @@ async fn cross_chain_setter_deposit_over_bundle() {
         .await
         .expect("deploy Value on L2");
     assert_eq!(value, value_addr, "Value address deterministic");
+    let l2_chain_id = alloy_provider::ProviderBuilder::new()
+        .connect_http(node.l2_rpc_url().parse().unwrap())
+        .get_chain_id()
+        .await
+        .unwrap();
+    let inbound_no_ret = deploy_value_no_ret(
+        &node.l2_rpc_url(),
+        value_deployer,
+        l2_chain_id,
+        U256::from(5u64),
+    )
+    .await
+    .expect("deploy inbound ValueNoRet on L2");
+    let outbound_value = deploy_value_l1(&l1_rpc, ANVIL_KEY_3, U256::from(5u64))
+        .await
+        .expect("deploy outbound Value on L1");
+    let outbound_no_ret = deploy_value_no_ret(&l1_rpc, ANVIL_KEY_3, DEV_CHAIN_ID, U256::from(5u64))
+        .await
+        .expect("deploy outbound ValueNoRet on L1");
 
     let setter_proxy = create_cross_chain_proxy(
         &l1_rpc,
@@ -88,26 +97,63 @@ async fn cross_chain_setter_deposit_over_bundle() {
     )
     .await
     .expect("create deposit proxy");
+    let inbound_no_ret_proxy = create_cross_chain_proxy(
+        &l1_rpc,
+        cfg.deployer_key,
+        cfg.eez_address,
+        inbound_no_ret,
+        cfg.rollup_id,
+    )
+    .await
+    .expect("create inbound no-return proxy");
+    let inbound_wrapper = deploy_setter_wrapper(&l1_rpc, ANVIL_KEY_3, DEV_CHAIN_ID, setter_proxy)
+        .await
+        .expect("deploy inbound wrapper on L1");
+    let outbound_proxy =
+        create_l2_cross_chain_proxy(&node.l2_rpc_url(), value_deployer, outbound_value, 0)
+            .await
+            .expect("create outbound setter proxy on L2");
+    let outbound_no_ret_proxy =
+        create_l2_cross_chain_proxy(&node.l2_rpc_url(), value_deployer, outbound_no_ret, 0)
+            .await
+            .expect("create outbound no-return proxy on L2");
+    let withdrawal_proxy =
+        create_l2_cross_chain_proxy(&node.l2_rpc_url(), value_deployer, withdrawal_recipient, 0)
+            .await
+            .expect("create withdrawal proxy on L2");
+    let outbound_wrapper = deploy_setter_wrapper(
+        &node.l2_rpc_url(),
+        value_deployer,
+        l2_chain_id,
+        outbound_proxy,
+    )
+    .await
+    .expect("deploy outbound wrapper on L2");
 
-    let user = ANVIL_KEY_2;
+    let inbound_user = ANVIL_KEY_2;
+    let outbound_user = ANVIL_KEY_4;
     let recipient_before = l2_balance(&node.l2_rpc_url(), recipient).await.unwrap();
+    let withdrawal_before = l2_balance(&l1_rpc, withdrawal_recipient).await.unwrap();
     let deposit_sum: u128 = WAVE_DEPOSITS.iter().sum();
 
-    // Three waves: each wave submits one setter + one deposit op to the L1
-    // cross-chain front (L1-signed; the front is fixed `Inbound` and holds
-    // the tx for the next Sync slot instead of forwarding it to the L1 mempool).
-    let mut l1_nonce = pending_nonce(&l1_rpc, user).await.unwrap();
-    let mut hashes = Vec::new();
+    let mut l1_nonce = pending_nonce(&l1_rpc, inbound_user).await.unwrap();
+    let mut l2_nonce = pending_nonce(&node.l2_rpc_url(), outbound_user)
+        .await
+        .unwrap();
+    let mut inbound_hashes = Vec::new();
+    let mut outbound_hashes = Vec::new();
 
+    // L1-signed calls enter through the inbound front; L2-signed calls use the
+    // outbound front. Each front holds the transaction for cross-chain composition.
     for (set_v, dep_v) in WAVE_SETTERS.iter().zip(WAVE_DEPOSITS.iter()) {
         let set_call = IValue::setValueCall {
             v: U256::from(*set_v),
         }
         .abi_encode();
-        hashes.push(
-            sign_send_raw(
+        inbound_hashes.push(
+            sign_and_send(
                 &l1_xchain,
-                user,
+                inbound_user,
                 DEV_CHAIN_ID,
                 l1_nonce,
                 Some(setter_proxy),
@@ -119,10 +165,10 @@ async fn cross_chain_setter_deposit_over_bundle() {
             .unwrap(),
         );
         l1_nonce += 1;
-        hashes.push(
-            sign_send_raw(
+        inbound_hashes.push(
+            sign_and_send(
                 &l1_xchain,
-                user,
+                inbound_user,
                 DEV_CHAIN_ID,
                 l1_nonce,
                 Some(deposit_proxy),
@@ -134,11 +180,87 @@ async fn cross_chain_setter_deposit_over_bundle() {
             .unwrap(),
         );
         l1_nonce += 1;
+        for (to, input, value) in [
+            (
+                inbound_no_ret_proxy,
+                IValueNoRet::setValueCall {
+                    v: U256::from(*set_v + 200),
+                }
+                .abi_encode(),
+                U256::ZERO,
+            ),
+            (
+                inbound_wrapper,
+                ISetterWrapper::setViaProxyCall {
+                    v: U256::from(*set_v + 100),
+                }
+                .abi_encode(),
+                U256::ZERO,
+            ),
+        ] {
+            inbound_hashes.push(
+                sign_and_send(
+                    &l1_xchain,
+                    inbound_user,
+                    DEV_CHAIN_ID,
+                    l1_nonce,
+                    Some(to),
+                    value,
+                    input,
+                    900_000,
+                )
+                .await
+                .unwrap(),
+            );
+            l1_nonce += 1;
+        }
+
+        for (to, input, value) in [
+            (
+                outbound_proxy,
+                IValue::setValueCall {
+                    v: U256::from(*set_v),
+                }
+                .abi_encode(),
+                U256::ZERO,
+            ),
+            (
+                outbound_no_ret_proxy,
+                IValueNoRet::setValueCall {
+                    v: U256::from(*set_v + 200),
+                }
+                .abi_encode(),
+                U256::ZERO,
+            ),
+            (withdrawal_proxy, Vec::new(), U256::from(*dep_v)),
+            (
+                outbound_wrapper,
+                ISetterWrapper::setViaProxyCall {
+                    v: U256::from(*set_v + 100),
+                }
+                .abi_encode(),
+                U256::ZERO,
+            ),
+        ] {
+            outbound_hashes.push(
+                sign_and_send(
+                    &l2_xchain,
+                    outbound_user,
+                    l2_chain_id,
+                    l2_nonce,
+                    Some(to),
+                    value,
+                    input,
+                    900_000,
+                )
+                .await
+                .unwrap(),
+            );
+            l2_nonce += 1;
+        }
     }
 
-    // Each cross-chain op must land on L1 and succeed (a revert means the
-    // composer's bundle settled but the source tx itself failed).
-    for h in &hashes {
+    for h in &inbound_hashes {
         let h = *h;
         let l1 = l1_rpc.clone();
         let outcome = wait_for(SETTLE_TIMEOUT, move || {
@@ -153,44 +275,45 @@ async fn cross_chain_setter_deposit_over_bundle() {
         })
         .await
         .expect("cross-chain user tx did not land on L1");
-        if !outcome {
-            // TEMP DIAGNOSTIC: pull the revert reason + the block the tx
-            // landed in, and dump the postBatch tx's receipt, so we can see
-            // (a) why executeCrossChainCall reverted and (b) whether the
-            // postBatch and this user tx shared an L1 block.
-            let blk = common::tx_block_number(&l1_rpc, h).await;
-            let receipts = match blk {
-                Some(b) => common::dump_block_receipts(&l1_rpc, b).await,
-                None => "<no block>".to_string(),
-            };
-            // The postBatch is the FIRST tx in the block; replay it at the
-            // parent block to get its exact revert reason.
-            let pb_replay = match blk {
-                Some(b) => {
-                    let pb = common::first_tx_in_block(&l1_rpc, b).await;
-                    match pb {
-                        Some(pb_hash) => {
-                            common::replay_revert(&l1_rpc, pb_hash, b - 1).await
-                        }
-                        None => "<no first tx>".to_string(),
-                    }
-                }
-                None => "<no block>".to_string(),
-            };
-            eprintln!(
-                "DIAG: cross-chain user tx {h} reverted on L1\n  \
-                 landed_in_block={blk:?}\n{receipts}\n  \
-                 postBatch replay (revert data in error.data):\n  {pb_replay}"
-            );
-            panic!("cross-chain user tx {h} reverted on L1 (see DIAG above)");
-        }
+        assert!(outcome, "inbound source tx {h} reverted on L1");
+    }
+    for h in &outbound_hashes {
+        let h = *h;
+        wait_for(SETTLE_TIMEOUT, || {
+            let l2_rpc = node.l2_rpc_url();
+            async move { Ok(receipt_ok(&l2_rpc, h).await?.filter(|ok| *ok)) }
+        })
+        .await
+        .expect("outbound source tx did not settle successfully on L2");
     }
 
     let final_value = l2_value(&node.l2_rpc_url(), value_addr).await.unwrap();
     assert_eq!(
         final_value,
-        U256::from(*WAVE_SETTERS.last().unwrap()),
-        "setter converged",
+        U256::from(*WAVE_SETTERS.last().unwrap() + 100),
+        "inbound wrapper setter converged",
+    );
+    wait_for(SETTLE_TIMEOUT, || {
+        let l1_rpc = l1_rpc.clone();
+        async move {
+            Ok((l2_value(&l1_rpc, outbound_value).await?
+                == U256::from(*WAVE_SETTERS.last().unwrap() + 100))
+            .then_some(()))
+        }
+    })
+    .await
+    .expect("outbound setter did not converge on L1");
+    assert_eq!(
+        value_no_ret(&node.l2_rpc_url(), inbound_no_ret)
+            .await
+            .unwrap(),
+        U256::from(*WAVE_SETTERS.last().unwrap() + 200),
+        "inbound no-return setter converged",
+    );
+    assert_eq!(
+        value_no_ret(&l1_rpc, outbound_no_ret).await.unwrap(),
+        U256::from(*WAVE_SETTERS.last().unwrap() + 200),
+        "outbound no-return setter converged",
     );
 
     let recipient_after = l2_balance(&node.l2_rpc_url(), recipient).await.unwrap();
@@ -199,9 +322,13 @@ async fn cross_chain_setter_deposit_over_bundle() {
         recipient_before + U256::from(deposit_sum),
         "deposits converged",
     );
+    assert_eq!(
+        l2_balance(&l1_rpc, withdrawal_recipient).await.unwrap(),
+        withdrawal_before + U256::from(deposit_sum),
+        "withdrawals converged on L1",
+    );
 
-    // Polled because the composer keeps posting batches; the two roots can
-    // differ momentarily between posts.
+    // Roots can differ between settlement and safe-head advancement.
     let l2_rpc = node.l2_rpc_url();
     let (eez, rollup_id) = (cfg.eez_address, cfg.rollup_id);
     wait_for(SETTLE_TIMEOUT, || {
@@ -232,9 +359,16 @@ async fn cross_chain_setter_deposit_over_bundle() {
         0,
         "zero state-root divergence events",
     );
+    assert_eq!(
+        node.log_count_matching(&["user_tx evicted after"]).unwrap()
+            + node
+                .log_count_matching(&["same-sender", "evicted"])
+                .unwrap(),
+        0,
+        "all non-poison wave transactions must settle without eviction",
+    );
 
-    // Match on the event message text, not the `name:` metadata — the default
-    // tracing fmt layer prints the message but not the event name.
+    // The default tracing layer prints the message but not the event name.
     assert!(
         node.log_count_matching(&["eth_sendBundle: forwarded txs to pool in order"])
             .unwrap()
