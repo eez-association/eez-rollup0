@@ -19,6 +19,14 @@
 # here — plain L1 load is already produced by ethereum_package's own spamoor
 # (args.example.yaml spamoor_params), and this daemon only reaches the fronts.
 
+# Note: filling these REPLACE_ME values by hand is the manual path. The easy
+# path is `bash infra/kurtosis/scripts/spammers.sh up`, which provisions every
+# address/key and injects them for you — see the plugin README.
+#
+# `ops` selects which cross-chain op kinds each spammer cycles through
+# (set/noret/value/wrapper). Only the proxies/wrapper for the listed ops are
+# required; omit ops for setter-only (then only *_proxy is needed).
+
 - scenario: eez-xchain
   name: "EEZ Inbound (L1->L2)"
   config:
@@ -26,7 +34,11 @@
     throughput: 20
     max_pending: 200
     max_wallets: 40
-    inbound_proxy: "REPLACE_ME" # L1 CrossChainProxy from create_l1_proxy
+    ops: [set, noret, value, wrapper]
+    inbound_proxy: "REPLACE_ME"         # L1 setter CrossChainProxy (op: set)
+    inbound_noret_proxy: "REPLACE_ME"   # L1 ValueNoRet CrossChainProxy (op: noret)
+    inbound_deposit_proxy: "REPLACE_ME" # L1 recipient proxy for value transfers (op: value)
+    inbound_wrapper: "REPLACE_ME"       # L1 wrapper over the setter proxy (op: wrapper)
 
 - scenario: eez-xchain
   name: "EEZ Outbound (L2->L1)"
@@ -35,8 +47,12 @@
     throughput: 20
     max_pending: 200
     max_wallets: 40
-    outbound_private_key: "REPLACE_ME" # funded L2 key (NOT an eez-node system key)
-    outbound_proxy: "REPLACE_ME" # L2 CrossChainProxy from create_l2_proxy
+    ops: [set, noret, value, wrapper]
+    outbound_private_key: "REPLACE_ME"      # funded L2 key (NOT an eez-node system key)
+    outbound_proxy: "REPLACE_ME"            # L2 setter CrossChainProxy (op: set)
+    outbound_noret_proxy: "REPLACE_ME"      # L2 ValueNoRet CrossChainProxy (op: noret)
+    outbound_withdraw_proxy: "REPLACE_ME"   # L2 recipient proxy for value transfers (op: value)
+    outbound_wrapper: "REPLACE_ME"          # L2 wrapper over the setter proxy (op: wrapper)
     # outbound_rpc / outbound_front default to eez-node's :18688 / :18998 — override only if changed
 
 # Adversarial spammer (DDoS-resilience). Run alongside the healthy ones and

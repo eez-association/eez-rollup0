@@ -205,23 +205,27 @@ def run(plan, args):
         ),
     )
 
-    # spamoor-eez: cross-chain load daemon, reaching eez-node's fronts (unlike
-    # ethereum_package's own `spamoor`, which is Pair B L1-only). See
-    # spamoor-plugins/eez-rollup/README.md.
+    # spamoor-eez: cross-chain load daemon reaching eez-node's fronts (unlike
+    # ethereum_package's L1-only spamoor). See spamoor-plugins/README.md.
     spamoor_eez = eez.get("spamoor_eez", {})
-    if spamoor_eez.get("enabled", True):
+    enabled = spamoor_eez.get("enabled", True)
+    # -p is the INBOUND pool's root wallet: a dedicated funded key, never the
+    # batch poster (spamoor would contend on its nonces). up.sh derives/prefunds
+    # one on a fresh args.yaml; skip the daemon if unset rather than fall back.
+    daemon_key = spamoor_eez.get("inbound_private_key", "")
+    if enabled and daemon_key in ["", "0xCHANGE_ME"]:
+        plan.print("skipping spamoor-eez: set eez.spamoor_eez.inbound_private_key to a dedicated funded key (up.sh derives one on a fresh args.yaml)")
+        enabled = False
+    if enabled:
+        # Uploaded contents are mounted at /plugins/eez-rollup below — that
+        # container path (not this host path) drives the Yaegi import name.
         plugin_files = plan.upload_files(
-            src = "./spamoor-plugins/eez-rollup",
+            src = "./spamoor-plugins",
             name = "eez-xchain-plugin",
         )
 
-        # -h is the NORMAL L1 RPC (not the xchain front): spamoor funds its
-        # child wallets with plain transfers over --rpchost, and a front holds
-        # every send (mining none), which would deadlock wallet preparation. The
-        # plugin POSTs only the cross-chain scenario txs to the fronts (see the
-        # eez-xchain inbound_front / outbound_front options, defaulted to the
-        # eez-node :18999/:18998 ports).
-        daemon_key = spamoor_eez.get("inbound_private_key", poster_key)
+        # -h is the NORMAL L1 RPC, not a front: spamoor funds child wallets over
+        # it (a front holds every send). Only scenario txs go to the fronts.
         daemon_args = [
             "exec /app/spamoor-daemon",
             "--port=8080",

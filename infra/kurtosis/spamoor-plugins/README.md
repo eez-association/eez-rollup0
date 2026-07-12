@@ -2,8 +2,49 @@
 
 A [spamoor](https://github.com/ethpandaops/spamoor) plugin (Yaegi-interpreted,
 no build step) providing the `eez-xchain` scenario: continuous inbound
-(L1→L2) and/or outbound (L2→L1) cross-chain `setValue` load against the EEZ
-devnet, run alongside the existing L1-only `eoatx` baseline.
+(L1→L2) and/or outbound (L2→L1) cross-chain load against the EEZ devnet, run
+alongside the existing L1-only `eoatx` baseline.
+
+Each spammer cycles through one or more **op kinds** (the `ops` config),
+mirroring the operations `wave-test.sh` fires:
+
+| op | call | target |
+|---|---|---|
+| `set` (default) | `setValue(uint256)` | setter `CrossChainProxy` |
+| `noret` | `setValue(uint256)` | `ValueNoRet` `CrossChainProxy` |
+| `value` | plain value transfer | recipient proxy (deposit inbound / withdraw outbound) |
+| `wrapper` | `setViaProxy(uint256)` | wrapper contract over the setter proxy |
+
+Omit `ops` for the original setter-only load; set `ops: [set, noret, value,
+wrapper]` to exercise the full cross-chain surface. Two `attack` modes
+(`garbage-calldata`, `revert`) send malformed traffic for DDoS-resilience
+testing.
+
+## Quick start (recommended): `spammers.sh`
+
+You declare which spammers you want in an intent file; the orchestrator does
+everything else — provisions the proxies/wrappers, funds a dedicated outbound
+key, injects them per-spammer, and starts them via the daemon API. You never
+copy a proxy address or a private key.
+
+```bash
+# 1. bring the enclave up (once):
+bash infra/kurtosis/up.sh
+
+# 2. declare intent (edit the copy it creates on first run):
+#    infra/kurtosis/spamoor-plugins/spammers.yaml
+# 3. provision + start every enabled spammer:
+bash infra/kurtosis/scripts/spammers.sh up
+
+# inspect / sanity-check / tear down:
+bash infra/kurtosis/scripts/spammers.sh status
+bash infra/kurtosis/scripts/spammers.sh verify
+bash infra/kurtosis/scripts/spammers.sh down
+```
+
+Requires `kurtosis`, `curl`, `jq`, `cast`, and `python3` with `pyyaml`
+(`pip install pyyaml`) on the host. The rest of this doc covers the manual path
+and the config reference the orchestrator fills in for you.
 
 Runs inside the enclave as the `spamoor-eez` service (`infra/kurtosis/main.star`),
 in `spamoor-daemon` mode so throughput is adjustable live via its web UI
@@ -25,9 +66,12 @@ same way `infra/kurtosis/scripts/wave-test.sh` does:
   `computeCrossChainProxyAddress` + `createCrossChainProxy` on the L2 CCM
   predeploy (`EEZ_CCM_L2_ADDRESS`).
 
-Easiest path: run `wave-test.sh` once (any mode) against the enclave, then
-reuse the proxy addresses it printed (`inbound proxies: setter=...`,
-`outbound proxies: setter=...`).
+Easiest path: don't do this by hand — `spammers.sh up` runs
+`infra/kurtosis/scripts/xchain-provision.sh`, which creates the full set
+(setter, noret, deposit/withdraw, wrapper per direction) idempotently, funds a
+dedicated outbound key, and caches everything to
+`datadir/xchain-provision.env`. Only reach for the manual steps above if you're
+wiring a `startup-spammers.yaml` by hand.
 
 ## Adding the cross-chain spammer
 
@@ -92,12 +136,16 @@ side can throttle the other. It must supply both sides' config
 |---|---|
 | `attack` | `""` (well-formed setValue), `garbage-calldata`, or `revert` — adversarial mode for DDoS-resilience testing. Run as a separate spammer (see below). |
 | `mode` | `inbound`, `outbound`, or `mixed` (1:1) — shorthand for the weight pair below. |
+| `ops` | Op kinds to cycle through per direction: any of `set`, `noret`, `value`, `wrapper`. Empty = `[set]` (setter-only). Only the proxies/wrapper for the listed ops are required. Ignored when `attack` is set. |
 | `inbound_weight` / `outbound_weight` | Explicit mix ratio; overrides `mode` if either is non-zero. In a single-direction spammer only one is non-zero, so only that side's config is required. |
 | `throughput` | Cross-chain txs/slot (rate). Runs forever unless `total_count` is set. Split across directions by weight. |
 | `total_count` | Hard cap: send exactly this many txs (split by weight), then stop. `0` = unlimited. Set either/both of `throughput`/`total_count`. |
 | `outbound_private_key` | Required iff `outbound_weight > 0` — funded L2 key for the outbound wallet pool (the L2 rollup has a distinct chain id from L1, so spamoor's single-chain-id client pool can't cover both; the plugin builds a second pool from this). Must **not** be an eez-node system key. |
 | `inbound_front` / `outbound_rpc` / `outbound_front` | Endpoints, defaulted to eez-node's `:18999` / `:18688` / `:18998`. Wallets are funded over the **normal** chain RPC (daemon `--rpchost` for inbound, `outbound_rpc` for outbound); only the cross-chain tx itself is POSTed to the front. A front can't fund wallets — it holds every `eth_sendRawTransaction`, mining none. Rarely need overriding. |
-| `inbound_proxy` / `outbound_proxy` | Pre-created proxy addresses (see above). Required per the corresponding non-zero weight. |
+| `inbound_proxy` / `outbound_proxy` | Pre-created **setter** proxy per direction (op `set`). Required when that direction has weight and `set` is in `ops`. |
+| `inbound_noret_proxy` / `outbound_noret_proxy` | Pre-created **ValueNoRet** proxy (op `noret`). |
+| `inbound_deposit_proxy` / `outbound_withdraw_proxy` | Pre-created recipient proxy for **value transfers** (op `value`): deposit inbound, withdraw outbound. |
+| `inbound_wrapper` / `outbound_wrapper` | Pre-created **wrapper** contract over the setter proxy (op `wrapper`). |
 | `value_max` | Upper bound for the random `setValue()` argument (well-formed load only; `0` sends a fixed `1`). |
 | `base_fee` / `tip_fee` / `base_fee_wei` / `tip_fee_wei` | Same fee knobs as native scenarios — use the `_wei` variants for L2's sub-gwei fees if needed. |
 
