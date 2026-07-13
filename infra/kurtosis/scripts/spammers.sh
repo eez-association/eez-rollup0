@@ -107,21 +107,34 @@ PASSTHROUGH = ["throughput", "total_count", "attack", "max_wallets", "max_pendin
                "gas_limit", "timeout", "log_txs"]
 
 out = []
+seen = set()
 for e in spammers:
     if not isinstance(e, dict) or not e.get("enabled", True):
         continue
     name = e.get("name")
-    if not name:
-        sys.stderr.write("a spammer entry is missing 'name'\n"); sys.exit(4)
+    if not isinstance(name, str) or not name.strip():
+        sys.stderr.write("a spammer entry has a missing or invalid 'name'\n"); sys.exit(4)
     mode = e.get("mode")
     if mode not in ("inbound", "outbound"):
         sys.stderr.write("spammer %r: mode selects the source chain and must be inbound or outbound; ops selects transaction types\n" % name); sys.exit(5)
+    identity = (mode, name)
+    if identity in seen:
+        sys.stderr.write("duplicate enabled spammer %r for %s\n" % (name, mode)); sys.exit(7)
+    seen.add(identity)
+
+    for k in ("throughput", "total_count", "max_wallets", "max_pending", "value_max", "gas_limit"):
+        if e.get(k) is not None and (isinstance(e[k], bool) or not isinstance(e[k], int) or e[k] < 0):
+            sys.stderr.write("spammer %r: %s must be a non-negative integer\n" % (name, k)); sys.exit(8)
+    if e.get("throughput", 10) == 0 and e.get("total_count", 0) == 0:
+        sys.stderr.write("spammer %r: throughput and total_count cannot both be zero\n" % name); sys.exit(9)
 
     cfg = {"mode": mode}
     for k in PASSTHROUGH:
         if e.get(k) is not None:
             cfg[k] = e[k]
     ops = ["set"] if e.get("attack") else (e.get("ops") or ["set"])
+    if not isinstance(ops, list):
+        sys.stderr.write("spammer %r: ops must be a list\n" % name); sys.exit(10)
     if e.get("ops"):
         cfg["ops"] = e["ops"]
 

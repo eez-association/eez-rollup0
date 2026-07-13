@@ -25,18 +25,51 @@ import (
 const perWalletFundingEth = 5
 
 // walletLocker preserves per-wallet nonce order at the front.
-type walletLocker struct{ mu sync.Map }
+type walletSubmitState struct {
+	mu          sync.Mutex
+	nextNonce   uint64
+	initialized bool
+}
 
-func (w *walletLocker) acquire(addr common.Address) func() {
-	v, _ := w.mu.LoadOrStore(addr, &sync.Mutex{})
-	m := v.(*sync.Mutex)
-	m.Lock()
-	return func() { m.Unlock() }
+type walletLocker struct{ states sync.Map }
+
+func (w *walletLocker) acquire(addr common.Address) (*walletSubmitState, func()) {
+	v, _ := w.states.LoadOrStore(addr, &walletSubmitState{})
+	state := v.(*walletSubmitState)
+	state.mu.Lock()
+	return state, func() { state.mu.Unlock() }
+}
+
+func (s *walletSubmitState) current(fallback uint64) uint64 {
+	if !s.initialized {
+		s.nextNonce = fallback
+		s.initialized = true
+	}
+	return s.nextNonce
+}
+
+func (s *walletSubmitState) setNext(next uint64) {
+	s.nextNonce = next
+	s.initialized = true
+}
+
+func advanceSpamoorNonce(wallet *spamoor.Wallet, next uint64) {
+	for wallet.GetNonce() < next {
+		wallet.GetNextNonce()
+	}
 }
 
 const defaultInclusionTimeout = 5 * time.Minute
 
-var httpClient = &http.Client{Timeout: 30 * time.Second}
+var httpClient = newHTTPClient()
+
+func newHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = 100
+	transport.MaxIdleConnsPerHost = 100
+	transport.IdleConnTimeout = 90 * time.Second
+	return &http.Client{Transport: transport, Timeout: 30 * time.Second}
+}
 
 // walletCount auto-sizes the child-wallet pool.
 func walletCount(maxWallets, totalCount, throughput uint64) uint64 {
@@ -44,7 +77,7 @@ func walletCount(maxWallets, totalCount, throughput uint64) uint64 {
 		return maxWallets
 	}
 	const autoMax = 50
-	n := throughput * 10
+	n := saturatingMul10(throughput)
 	if c := totalCount / 50; c > n { // ~1 wallet per 50 txs
 		n = c
 	}
@@ -55,6 +88,14 @@ func walletCount(maxWallets, totalCount, throughput uint64) uint64 {
 		return autoMax
 	}
 	return n
+}
+
+func saturatingMul10(value uint64) uint64 {
+	const maxUint64 = ^uint64(0)
+	if value > maxUint64/10 {
+		return maxUint64
+	}
+	return value * 10
 }
 
 type callSpec struct {
@@ -79,7 +120,7 @@ func submitCall(ctx context.Context, locks *walletLocker, pool *spamoor.WalletPo
 	}
 
 	// Hold the lock until the front accepts or rejects this nonce.
-	release := locks.acquire(wallet.GetAddress())
+	state, release := locks.acquire(wallet.GetAddress())
 	defer release()
 
 	client := pool.GetClient(spamoor.WithClientSelectionMode(spamoor.SelectClientByIndex, int(txIdx)))
@@ -109,28 +150,45 @@ func submitCall(ctx context.Context, locks *walletLocker, pool *spamoor.WalletPo
 		return nil, client, wallet, fmt.Errorf("failed to build tx: %w", err)
 	}
 
-	// Sign the current nonce and advance it only after admission.
-	nonce := wallet.GetNonce()
-	tx, err := wallet.ReplaceDynamicFeeTx(txData, nonce)
-	if err != nil {
-		return nil, client, wallet, fmt.Errorf("failed to sign tx: %w", err)
-	}
+	tx, err := submitToFront(ctx, state, wallet, frontURL, txData, logger)
+	return tx, client, wallet, err
+}
 
-	if err := sendRawTxToFront(ctx, frontURL, tx); err != nil {
-		if expected, ok := frontExpectedNonce(err.Error()); ok && nonce < expected {
-			// Reconcile local state after an ambiguous response or restart.
-			for wallet.GetNonce() < expected {
-				wallet.GetNextNonce()
-			}
-			return tx, client, wallet, fmt.Errorf("front already holds nonce %d; advanced local next nonce to %d: %w", nonce, expected, err)
+func submitToFront(ctx context.Context, state *walletSubmitState, wallet *spamoor.Wallet, frontURL string, txData *types.DynamicFeeTx, logger *logrus.Entry) (*types.Transaction, error) {
+	var tx *types.Transaction
+	for attempt := 0; attempt < 2; attempt++ {
+		nonce := state.current(wallet.GetNonce())
+		var err error
+		tx, err = wallet.ReplaceDynamicFeeTx(txData, nonce)
+		if err != nil {
+			return nil, fmt.Errorf("failed to sign tx: %w", err)
 		}
-		return tx, client, wallet, fmt.Errorf("front submit: %w", err)
+
+		if err = sendRawTxToFront(ctx, frontURL, tx); err != nil {
+			expected, ok := frontExpectedNonce(err.Error())
+			if !ok || expected == nonce {
+				return tx, fmt.Errorf("front submit: %w", err)
+			}
+
+			state.setNext(expected)
+			advanceSpamoorNonce(wallet, expected)
+			if attempt == 0 {
+				logger.WithFields(logrus.Fields{
+					"wallet": wallet.GetAddress().Hex(),
+					"nonce":  nonce,
+				}).Debugf("front expected nonce %d; retrying", expected)
+				continue
+			}
+			return tx, fmt.Errorf("front nonce changed again after reconciliation (sent %d, expected %d): %w", nonce, expected, err)
+		}
+
+		state.setNext(nonce + 1)
+		advanceSpamoorNonce(wallet, nonce+1)
+		wallet.IncrementSubmittedTxCount()
+		return tx, nil
 	}
 
-	// Record the admitted transaction in Spamoor's local state.
-	wallet.GetNextNonce()
-	wallet.IncrementSubmittedTxCount()
-	return tx, client, wallet, nil
+	return tx, fmt.Errorf("front nonce reconciliation exhausted")
 }
 
 // Match the front's nonce-contiguity rejection.

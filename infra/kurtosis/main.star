@@ -21,6 +21,7 @@ L2_XCHAIN_PORT = 18998
 # rbuilder exposes eth_sendBundle on its dedicated RPC port.
 BUILDER_FLASHBOTS_RPC_PORT = 8645
 MEV_RELAY_API_PORT = 9062
+SPAMOOR_IMAGE = "ethpandaops/spamoor@sha256:24818bf7ab76696b2dccb0c59cb419cce358cf1b4326a545012b031afd11658b"
 
 # L2 genesis state root for genesis.json. Recompute if genesis alloc changes.
 L2_GENESIS_STATE_ROOT = "0xd381d828f650845aa890778c74ad2de245f5b3f2a24763f243e19a6bafb4fec5"
@@ -245,7 +246,7 @@ def run(plan, args):
         plan.add_service(
             name = "spamoor-eez-inbound",
             config = ServiceConfig(
-                image = spamoor_eez.get("image", "ethpandaops/spamoor:master"),
+                image = spamoor_eez.get("image", SPAMOOR_IMAGE),
                 ports = {
                     "http": PortSpec(number = 8080, transport_protocol = "TCP", application_protocol = "http"),
                 },
@@ -275,7 +276,7 @@ def run(plan, args):
         plan.add_service(
             name = "spamoor-eez-outbound",
             config = ServiceConfig(
-                image = spamoor_eez.get("image", "ethpandaops/spamoor:master"),
+                image = spamoor_eez.get("image", SPAMOOR_IMAGE),
                 ports = {
                     "http": PortSpec(number = 8080, transport_protocol = "TCP", application_protocol = "http"),
                 },

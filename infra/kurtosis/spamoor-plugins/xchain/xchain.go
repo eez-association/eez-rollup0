@@ -3,6 +3,8 @@ package xchain
 import (
 	"context"
 	"fmt"
+	"math"
+	"math/big"
 	"math/rand"
 	"strings"
 	"time"
@@ -37,6 +39,7 @@ const (
 const (
 	defaultInboundFront  = "http://eez-node:18999" // L1 xchain front
 	defaultOutboundFront = "http://eez-node:18998" // L2 xchain front
+	minWrapperGasLimit   = 800_000
 )
 
 const valueWei = 10_000_000_000_000 // 1e13 wei
@@ -174,6 +177,9 @@ func (s *Scenario) Flags(flags *pflag.FlagSet) error {
 }
 
 func (s *Scenario) Init(options *scenario.Options) error {
+	if options == nil || options.WalletPool == nil {
+		return fmt.Errorf("wallet pool is required")
+	}
 	if options.Config != "" {
 		if err := scenario.ParseAndValidateConfig(&ScenarioDescriptor, options.Config, &s.options, s.logger); err != nil {
 			return err
@@ -206,6 +212,9 @@ func (s *Scenario) Init(options *scenario.Options) error {
 
 	if s.options.TotalCount == 0 && s.options.Throughput == 0 {
 		return fmt.Errorf("neither total_count nor throughput is set, must define at least one (see --help for flags)")
+	}
+	if err := validateTransactionOptions(&s.options); err != nil {
+		return err
 	}
 
 	s.setValueSelector = crypto.Keccak256([]byte("setValue(uint256)"))[:4]
@@ -255,6 +264,36 @@ func (s *Scenario) Init(options *scenario.Options) error {
 	return nil
 }
 
+func validateTransactionOptions(opts *ScenarioOptions) error {
+	if opts.GasLimit == 0 {
+		return fmt.Errorf("gas_limit must be greater than zero")
+	}
+	if math.IsNaN(opts.BaseFee) || math.IsInf(opts.BaseFee, 0) || opts.BaseFee < 0 {
+		return fmt.Errorf("base_fee must be a finite non-negative number")
+	}
+	if math.IsNaN(opts.TipFee) || math.IsInf(opts.TipFee, 0) || opts.TipFee < 0 {
+		return fmt.Errorf("tip_fee must be a finite non-negative number")
+	}
+	for field, value := range map[string]string{
+		"base_fee_wei": opts.BaseFeeWei,
+		"tip_fee_wei":  opts.TipFeeWei,
+	} {
+		if value == "" {
+			continue
+		}
+		parsed, ok := new(big.Int).SetString(value, 10)
+		if !ok || parsed.Sign() < 0 {
+			return fmt.Errorf("%s must be a non-negative base-10 integer", field)
+		}
+	}
+	if opts.Timeout != "" {
+		if _, err := time.ParseDuration(opts.Timeout); err != nil {
+			return fmt.Errorf("invalid timeout value: %v", err)
+		}
+	}
+	return nil
+}
+
 // resolveDirection maps a scenario to one source-chain daemon.
 func resolveDirection(opts *ScenarioOptions) error {
 	if opts.InboundWeight > 0 && opts.OutboundWeight > 0 {
@@ -265,15 +304,9 @@ func resolveDirection(opts *ScenarioOptions) error {
 		if opts.OutboundWeight > 0 {
 			return fmt.Errorf("mode inbound conflicts with outbound_weight")
 		}
-		if opts.InboundWeight == 0 {
-			opts.InboundWeight = 1
-		}
 	case "outbound":
 		if opts.InboundWeight > 0 {
 			return fmt.Errorf("mode outbound conflicts with inbound_weight")
-		}
-		if opts.OutboundWeight == 0 {
-			opts.OutboundWeight = 1
 		}
 	case "":
 		switch {
@@ -286,6 +319,11 @@ func resolveDirection(opts *ScenarioOptions) error {
 		}
 	default:
 		return fmt.Errorf("invalid mode %q (mode selects inbound or outbound source chain; ops selects transaction types)", opts.Mode)
+	}
+	if opts.Mode == "inbound" {
+		opts.InboundWeight, opts.OutboundWeight = 1, 0
+	} else {
+		opts.InboundWeight, opts.OutboundWeight = 0, 1
 	}
 	return nil
 }
@@ -339,25 +377,28 @@ func setAddr(dst *common.Address, hexAddr, field, op string) error {
 	if !common.IsHexAddress(hexAddr) {
 		return fmt.Errorf("%s is not a valid address: %q", field, hexAddr)
 	}
-	*dst = common.HexToAddress(hexAddr)
+	address := common.HexToAddress(hexAddr)
+	if address == (common.Address{}) {
+		return fmt.Errorf("%s cannot be the zero address", field)
+	}
+	*dst = address
 	return nil
 }
 
 func (s *Scenario) Run(ctx context.Context) error {
-	s.logger.Infof("starting scenario: %s (attack=%q, ops=%v, inbound=%d outbound=%d)", ScenarioName, s.options.Attack, s.ops, s.options.InboundWeight, s.options.OutboundWeight)
-	defer s.logger.Infof("scenario %s finished", ScenarioName)
-
-	// Default max pending to ~10 per wallet.
 	maxPending := s.options.MaxPending
 	if maxPending == 0 {
-		maxPending = s.options.Throughput * 10
+		maxPending = saturatingMul10(s.options.Throughput)
 		if maxPending == 0 {
 			maxPending = 4000 // pure total_count run with no throughput cap
 		}
-		if walletCap := s.numWallets * 10; walletCap > 0 && maxPending > walletCap {
+		if walletCap := saturatingMul10(s.numWallets); walletCap > 0 && maxPending > walletCap {
 			maxPending = walletCap
 		}
 	}
+
+	s.logger.Infof("starting scenario: %s (mode=%s attack=%q ops=%v throughput=%d total_count=%d max_pending=%d wallets=%d)", ScenarioName, s.options.Mode, s.options.Attack, s.ops, s.options.Throughput, s.options.TotalCount, maxPending, s.numWallets)
+	defer s.logger.Infof("scenario %s finished", ScenarioName)
 
 	var timeout time.Duration
 	if s.options.Timeout != "" {
@@ -391,16 +432,16 @@ func (s *Scenario) Run(ctx context.Context) error {
 				pool, front, side = s.inboundPool, s.inboundFront, "inbound"
 			}
 
-			// Round-robin the enabled ops.
-			op := s.ops[params.TxIdx%uint64(len(s.ops))]
+			op := s.ops[operationIndex(params.TxIdx, s.numWallets, uint64(len(s.ops)))]
 			target, value, calldata := s.resolveTx(side, op)
+			gasLimit := gasLimitForOp(s.options.GasLimit, op)
 
 			tx, client, wallet, err := submitCall(ctx, &s.submitLocks, pool, front, target, value, calldata, callSpec{
 				baseFee:    s.options.BaseFee,
 				tipFee:     s.options.TipFee,
 				baseFeeWei: s.options.BaseFeeWei,
 				tipFeeWei:  s.options.TipFeeWei,
-				gasLimit:   s.options.GasLimit,
+				gasLimit:   gasLimit,
 			}, s.logger, params.TxIdx)
 
 			logger := s.logger.WithField("side", side).WithField("op", op)
@@ -448,6 +489,20 @@ func (s *Scenario) Run(ctx context.Context) error {
 	})
 }
 
+func operationIndex(txIdx, wallets, operations uint64) uint64 {
+	if wallets == 0 || operations == 0 {
+		return 0
+	}
+	return (txIdx%wallets + txIdx/wallets) % operations
+}
+
+func gasLimitForOp(configured uint64, op string) uint64 {
+	if op == opWrapper && configured < minWrapperGasLimit {
+		return minWrapperGasLimit
+	}
+	return configured
+}
+
 // resolveTx maps a direction+op to (target, value, calldata). Attacks always
 // hit the setter proxy with malformed calldata.
 func (s *Scenario) resolveTx(side, op string) (common.Address, *uint256.Int, []byte) {
@@ -475,7 +530,7 @@ func (s *Scenario) resolveTx(side, op string) (common.Address, *uint256.Int, []b
 // randValue returns the random setter argument (1..value_max; 0 => fixed 1).
 func (s *Scenario) randValue() uint64 {
 	if s.options.ValueMax > 0 {
-		return uint64(rand.Intn(int(s.options.ValueMax))) + 1
+		return rand.Uint64()%s.options.ValueMax + 1
 	}
 	return 1
 }

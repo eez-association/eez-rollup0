@@ -17,15 +17,19 @@ spammers:
     enabled: true
     mode: inbound
     throughput: 3
+    total_count: 0
     ops: [set, noret, value, wrapper]
     max_wallets: 20
+    max_pending: 30
 
   - name: outbound
     enabled: true
     mode: outbound
     throughput: 3
+    total_count: 0
     ops: [set, noret, value, wrapper]
     max_wallets: 20
+    max_pending: 30
 
   # Adversarial (DDoS-resilience). Run alongside a healthy entry and watch
   # whether its confirm rate holds. attack: garbage-calldata | revert.
