@@ -17,9 +17,11 @@
 # The plugin's `ops` config selects which of these each spammer actually uses.
 #
 # Env knobs:
-#   KURTOSIS_ENCLAVE     enclave name (default eez-devnet)
-#   EEZ_OUT_FUND_ETH     L2 funding for the outbound key       (default 600;
-#                        covers the auto-sized 50-wallet pool at 5 ETH each)
+#   KURTOSIS_ENCLAVE          enclave name (default eez-devnet)
+#   EEZ_L1_DEPLOYER_FUND_ETH  L1 top-up for the deployer key    (default 100)
+#   EEZ_INBOUND_FUND_ETH      L1 top-up for the inbound daemon key (default 300)
+#   EEZ_OUT_FUND_ETH          L2 funding for the outbound key   (default 600;
+#                             covers the auto-sized 50-wallet pool at 5 ETH each)
 #   EEZ_TEST_PRIORITY_GAS_PRICE_WEI  priority fee cap (default 1; L2 is sub-gwei)
 set -euo pipefail
 export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
@@ -53,7 +55,14 @@ set -a; source "$DEPLOY_DIR/deployments.env"; set +a
 # ── Keys (mirrors wave-test.sh) ──────────────────────────────────────────────
 HH_KEY_0=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80   # L1 deployer/owner
 HH_KEY_2=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a   # L2 deployer
+HH_KEY_0_ADDR=$(cast wallet address --private-key "$HH_KEY_0")
 HH_KEY_2_ADDR=$(cast wallet address --private-key "$HH_KEY_2")
+# L1 funding source for the deployer (genesis-prefunded); used only if it's short.
+FUND_FROM_KEY="${EEZ_FUND_FROM_KEY:-${EEZ_PROOF_SIGNER_KEY:-$(grep -E '^[[:space:]]*proof_signer_key:' "$K/args.yaml" 2>/dev/null | grep -oE '0x[0-9a-fA-F]{64}' | head -1)}}"
+# The spamoor-eez daemon's -p key roots the INBOUND child-wallet pool and funds
+# it over L1. up.sh is meant to prefund it in genesis, but that can silently not
+# take (pyyaml fallback / stale args.yaml), so top it up here too.
+INBOUND_DAEMON_KEY="${EEZ_INBOUND_PRIVATE_KEY:-$(grep -E '^[[:space:]]*inbound_private_key:' "$K/args.yaml" 2>/dev/null | grep -oE '0x[0-9a-fA-F]{64}' | head -1)}"
 
 EEZ_CCM_L2_PREDEPLOY="${EEZ_CCM_L2_ADDRESS:-0x4200000000000000000000000000000000000007}"
 MAINNET_RID="${EEZ_L1_ROLLUP_ID:-0}"
@@ -64,6 +73,23 @@ L2_CHAIN_ID=$(cast chain-id --rpc-url "$L2")
 gas_price_for() { local gp; gp=$(cast gas-price --rpc-url "$1" 2>/dev/null || echo 1000000000); echo "${EEZ_TEST_GAS_PRICE_WEI:-$gp}"; }
 priority_fee_for() { local pg="${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1}"; (( pg > $1 )) && pg=$1; echo "$pg"; }
 retry() { local n=0 max=6 out rc; while :; do out=$("$@" 2>&1); rc=$?; (( rc==0 )) && { printf '%s' "$out"; return 0; }; (( ++n>=max )) && { echo "retry '$*' failed: $out" >&2; return "$rc"; }; sleep 3; done; }
+
+# fund_to <addr> <target_eth> <rpc> <from_key> — idempotent top-up; only sends a
+# shortfall, and only then needs the funding key.
+fund_to() {
+    local addr="$1" want_eth="$2" rpc="$3" fkey="$4" have want gp nonce faddr
+    have=$(retry cast balance "$addr" --rpc-url "$rpc")
+    want=$(cast to-wei "$want_eth" ether)
+    # wei values exceed 64-bit; compare as big ints via python3 (bash would overflow).
+    if python3 -c "import sys; sys.exit(0 if int('$have') >= int('$want') else 1)"; then
+        echo "    $addr already funded ($have wei on $rpc)"; return 0
+    fi
+    [[ -n "$fkey" ]] || { echo "    cannot fund $addr on $rpc — no funding key (set EEZ_FUND_FROM_KEY or proof_signer_key in args.yaml)" >&2; return 1; }
+    gp=$(gas_price_for "$rpc"); faddr=$(cast wallet address --private-key "$fkey"); nonce=$(retry cast nonce "$faddr" --rpc-url "$rpc")
+    echo "    funding $addr with ${want_eth} ETH on $rpc"
+    cast send "$addr" --value "${want_eth}ether" --private-key "$fkey" --nonce "$nonce" \
+        --gas-price "$gp" --priority-gas-price "$(priority_fee_for "$gp")" --rpc-url "$rpc" >/dev/null
+}
 
 forge_deploy() { local rpc="$1" key="$2" sc="$3" sig="$4" gp; shift 4; gp=$(gas_price_for "$rpc")
     (cd "$REPO/contracts" && forge script "script/$sc" --sig "$sig" "$@" --rpc-url "$rpc" --broadcast --private-key "$key" --gas-price "$gp" --skip-simulation 2>&1); }
@@ -109,6 +135,11 @@ if [[ -f "$CACHE" ]]; then
 fi
 
 if [[ ! -f "$CACHE" ]]; then
+    # The L1 deployer/proxy-creator (HH_KEY_0) isn't prefunded on L1 by default;
+    # top it up first, else the L1 deploys fail with "gas required exceeds allowance".
+    echo "==> funding L1 deployer $HH_KEY_0_ADDR"
+    fund_to "$HH_KEY_0_ADDR" "${EEZ_L1_DEPLOYER_FUND_ETH:-100}" "$L1" "$FUND_FROM_KEY" || exit 1
+
     echo "==> deploying targets (Value + ValueNoRet on both chains)"
     L2_VALUE=$(forge_deploy "$L2" "$HH_KEY_2" DeployValueL2.s.sol:DeployValueL2 'run(uint256)' 0 | grab EEZ_VALUE_ADDRESS)
     L1_VALUE=$(forge_deploy "$L1" "$HH_KEY_0" DeployValueL2.s.sol:DeployValueL2 'run(uint256)' 0 | grab EEZ_VALUE_ADDRESS)
@@ -169,20 +200,11 @@ if [[ ! -f "$CACHE" ]]; then
     echo "==> cached provisioning -> $CACHE"
 fi
 
-# ── Fund the dedicated keys up to target (idempotent: only tops up shortfalls) ─
-fund_to() { # <addr> <target_eth> <rpc> <from_key>
-    local addr="$1" want_eth="$2" rpc="$3" fkey="$4" have want gp nonce faddr
-    have=$(retry cast balance "$addr" --rpc-url "$rpc")
-    want=$(cast to-wei "$want_eth" ether)
-    # wei values exceed 64-bit; compare as big ints via python3 (bash would overflow).
-    if python3 -c "import sys; sys.exit(0 if int('$have') >= int('$want') else 1)"; then
-        echo "    $addr already funded ($have wei on $rpc)"; return 0
-    fi
-    gp=$(gas_price_for "$rpc"); faddr=$(cast wallet address --private-key "$fkey"); nonce=$(retry cast nonce "$faddr" --rpc-url "$rpc")
-    echo "    funding $addr with ${want_eth} ETH on $rpc"
-    cast send "$addr" --value "${want_eth}ether" --private-key "$fkey" --nonce "$nonce" \
-        --gas-price "$gp" --priority-gas-price "$(priority_fee_for "$gp")" --rpc-url "$rpc" >/dev/null
-}
+if [[ -n "$INBOUND_DAEMON_KEY" ]]; then
+    IN_DAEMON_ADDR=$(cast wallet address --private-key "$INBOUND_DAEMON_KEY")
+    echo "==> funding inbound daemon key $IN_DAEMON_ADDR on L1"
+    fund_to "$IN_DAEMON_ADDR" "${EEZ_INBOUND_FUND_ETH:-300}" "$L1" "$FUND_FROM_KEY" || exit 1
+fi
 
 echo "==> funding outbound key on L2"
 fund_to "$OUT_ADDR" "${EEZ_OUT_FUND_ETH:-600}" "$L2" "$HH_KEY_2"

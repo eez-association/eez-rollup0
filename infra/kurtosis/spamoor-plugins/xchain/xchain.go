@@ -15,6 +15,7 @@ import (
 
 	"github.com/ethpandaops/spamoor/scenario"
 	"github.com/ethpandaops/spamoor/spamoor"
+	"github.com/ethpandaops/spamoor/utils"
 )
 
 // Attack modes send malformed traffic for DDoS-resilience testing.
@@ -257,8 +258,12 @@ func (s *Scenario) Init(options *scenario.Options) error {
 			return err
 		}
 		s.inTargets = t
-		// Native pool: spamoor's runner funds it after Init; we only size it.
+		// Native pool: spamoor's runner funds it after Init using these refill
+		// settings, which default to zero (no refill) if left unset.
 		s.inboundPool.SetWalletCount(s.numWallets)
+		s.inboundPool.SetRefillAmount(utils.EtherToWei(uint256.NewInt(perWalletFundingEth)))
+		s.inboundPool.SetRefillBalance(utils.EtherToWei(uint256.NewInt(1)))
+		s.inboundPool.SetRefillInterval(600)
 	}
 
 	if s.options.OutboundWeight > 0 {
