@@ -283,7 +283,7 @@ func (s *Scenario) Init(options *scenario.Options) error {
 			return err
 		}
 		s.outTargets = t
-		pool, err := buildChainPool(s.logger, "outbound", s.options.OutboundRPC, s.options.OutboundPrivateKey, s.numWallets)
+		pool, err := buildChainPool(s.inboundPool.GetContext(), s.logger, "outbound", s.options.OutboundRPC, s.options.OutboundPrivateKey, s.numWallets)
 		if err != nil {
 			return fmt.Errorf("failed to init outbound (L2) pool: %w", err)
 		}
