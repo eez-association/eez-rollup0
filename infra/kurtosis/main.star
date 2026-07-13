@@ -205,18 +205,19 @@ def run(plan, args):
         ),
     )
 
-    # spamoor-eez: cross-chain load daemon reaching eez-node's fronts (unlike
-    # ethereum_package's L1-only spamoor). See spamoor-plugins/README.md.
+    # Keep inbound and outbound wallet pools in separate daemons.
     spamoor_eez = eez.get("spamoor_eez", {})
     enabled = spamoor_eez.get("enabled", True)
-    # -p is the INBOUND pool's root wallet: a dedicated funded key, never the
-    # batch poster (spamoor would contend on its nonces). up.sh derives/prefunds
-    # one on a fresh args.yaml; skip the daemon if unset rather than fall back.
-    daemon_key = spamoor_eez.get("inbound_private_key", "")
-    if enabled and daemon_key in ["", "0xCHANGE_ME"]:
-        plan.print("skipping spamoor-eez: set eez.spamoor_eez.inbound_private_key to a dedicated funded key (up.sh derives one on a fresh args.yaml)")
-        enabled = False
-    if enabled:
+    inbound_key = spamoor_eez.get("inbound_private_key", "")
+    outbound_key = spamoor_eez.get("outbound_private_key", "")
+    inbound_enabled = enabled and inbound_key not in ["", "0xCHANGE_ME"]
+    outbound_enabled = enabled and outbound_key not in ["", "0xCHANGE_ME"]
+    if enabled and not inbound_enabled:
+        plan.print("skipping spamoor-eez-inbound: set eez.spamoor_eez.inbound_private_key (up.sh derives it automatically)")
+    if enabled and not outbound_enabled:
+        plan.print("skipping spamoor-eez-outbound: set eez.spamoor_eez.outbound_private_key (up.sh derives it automatically)")
+
+    if inbound_enabled or outbound_enabled:
         # Uploaded contents are mounted at /plugins/eez-rollup below — that
         # container path (not this host path) drives the Yaegi import name.
         plugin_files = plan.upload_files(
@@ -224,39 +225,63 @@ def run(plan, args):
             name = "eez-xchain-plugin",
         )
 
-        # -h is the NORMAL L1 RPC, not a front: spamoor funds child wallets over
-        # it (a front holds every send). Only scenario txs go to the fronts.
-        daemon_args = [
-            "exec /app/spamoor-daemon",
+    if inbound_enabled:
+        inbound_args = [
+            "/app/spamoor-daemon",
             "--port=8080",
             "-h {}".format(l1_el.rpc_http_url),
-            "-p " + daemon_key,
+            "-p " + inbound_key,
             "--plugin=/plugins/eez-rollup",
         ]
-
-        service_files = {"/plugins/eez-rollup": plugin_files}
-
-        # No startup spammers by default — the scenario needs proxy addresses
-        # that don't exist until after deploy; add one via the web UI, or
-        # point this at a filled-in copy of startup-spammers.example.yaml.
-        spammer_config_path = spamoor_eez.get("startup_spammer_config", "")
-        if spammer_config_path != "":
-            service_files["/config"] = plan.upload_files(
-                src = spammer_config_path,
-                name = "eez-xchain-spammer-config",
+        inbound_files = {"/plugins/eez-rollup": plugin_files}
+        inbound_startup = spamoor_eez.get("inbound_startup_spammer_config", "")
+        if inbound_startup != "":
+            inbound_files["/config"] = plan.upload_files(
+                src = inbound_startup,
+                name = "eez-inbound-spammer-config",
             )
-            daemon_args.append("--startup-spammer=/config/" + spammer_config_path.split("/")[-1])
+            inbound_args.append("--startup-spammer=/config/" + inbound_startup.split("/")[-1])
 
         plan.add_service(
-            name = "spamoor-eez",
+            name = "spamoor-eez-inbound",
             config = ServiceConfig(
                 image = spamoor_eez.get("image", "ethpandaops/spamoor:master"),
                 ports = {
                     "http": PortSpec(number = 8080, transport_protocol = "TCP", application_protocol = "http"),
                 },
-                files = service_files,
+                files = inbound_files,
                 entrypoint = ["/bin/sh", "-c"],
-                cmd = [" ".join(daemon_args)],
+                cmd = ["while ! " + " ".join(inbound_args) + "; do echo 'spamoor inbound startup failed; retrying in 2s'; sleep 2; done"],
+            ),
+        )
+
+    if outbound_enabled:
+        outbound_args = [
+            "/app/spamoor-daemon",
+            "--port=8080",
+            "-h http://eez-node:{}".format(L2_RPC_PORT),
+            "-p " + outbound_key,
+            "--plugin=/plugins/eez-rollup",
+        ]
+        outbound_files = {"/plugins/eez-rollup": plugin_files}
+        outbound_startup = spamoor_eez.get("outbound_startup_spammer_config", "")
+        if outbound_startup != "":
+            outbound_files["/config"] = plan.upload_files(
+                src = outbound_startup,
+                name = "eez-outbound-spammer-config",
+            )
+            outbound_args.append("--startup-spammer=/config/" + outbound_startup.split("/")[-1])
+
+        plan.add_service(
+            name = "spamoor-eez-outbound",
+            config = ServiceConfig(
+                image = spamoor_eez.get("image", "ethpandaops/spamoor:master"),
+                ports = {
+                    "http": PortSpec(number = 8080, transport_protocol = "TCP", application_protocol = "http"),
+                },
+                files = outbound_files,
+                entrypoint = ["/bin/sh", "-c"],
+                cmd = ["while ! " + " ".join(outbound_args) + "; do echo 'spamoor outbound startup failed; retrying in 2s'; sleep 2; done"],
             ),
         )
 

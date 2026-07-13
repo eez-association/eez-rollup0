@@ -2,10 +2,9 @@
 # then run: bash infra/kurtosis/scripts/spammers.sh up
 #
 # Declare which spammers you want and how fast; spammers.sh provisions the
-# proxies/wrappers and outbound key and fills them in — you never list an
-# address or key here.
+# proxies/wrappers and fills them in — you never list an address or key here.
 #
-# Fields: name, enabled, mode (inbound|outbound|mixed), throughput (txs/L2 slot),
+# Fields: name, enabled, mode (inbound|outbound), throughput (txs/slot),
 # ops (subset of set,noret,value,wrapper; default set), attack ('',
 # garbage-calldata, revert), max_wallets, max_pending, value_max.
 #

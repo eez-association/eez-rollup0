@@ -87,13 +87,14 @@ eez:
   # Route bundle submission through the relay so mev-boost can see bids.
   relay_url: "http://mev-relay-api:9062"
 
-  # spamoor-eez: cross-chain load daemon. See spamoor-plugins/README.md.
+  # One cross-chain load daemon per source chain. See spamoor-plugins/README.md.
   spamoor_eez:
     enabled: true
     image: "ethpandaops/spamoor:master"
-    # Dedicated inbound (L1) wallet-pool root for the daemon, kept OFF the batch
-    # poster so spamoor can't contend with batch posting. up.sh derives this
-    # from the dev mnemonic (index 3) and prefunds it on first run. Leave as
-    # 0xCHANGE_ME; up.sh fills it in (blank/CHANGE_ME skips the daemon).
+    # Dedicated roots for the L1/inbound and L2/outbound daemons. up.sh derives
+    # indices 3 and 4; genesis prefunds inbound on L1, while spammers.sh funds
+    # outbound on L2 before creating scenarios.
     inbound_private_key: "0xCHANGE_ME"
-    # startup_spammer_config: "./spamoor-plugins/startup-spammers.yaml"  # unset = no spammers until added via the web UI / spammers.sh
+    outbound_private_key: "0xCHANGE_ME"
+    # inbound_startup_spammer_config: "./spamoor-plugins/startup-spammers-inbound.yaml"
+    # outbound_startup_spammer_config: "./spamoor-plugins/startup-spammers-outbound.yaml"

@@ -3,8 +3,8 @@
 # spammers can be started without running the whole wave-test harness.
 #
 # Idempotent: creates the targets, cross-chain proxies, and wrappers per
-# direction plus a dedicated funded outbound (L2) key, then caches every
-# address/key to
+# direction, then funds the configured outbound daemon root on L2 and caches
+# the provisioned addresses to
 #   $REPO/datadir/xchain-provision.env
 # Re-running reuses whatever already exists (proxies with code on-chain, keys
 # already funded) and only fills the gaps. Intended to be sourced by
@@ -20,7 +20,7 @@
 #   KURTOSIS_ENCLAVE          enclave name (default eez-devnet)
 #   EEZ_L1_DEPLOYER_FUND_ETH  L1 top-up for the deployer key    (default 100)
 #   EEZ_INBOUND_FUND_ETH      L1 top-up for the inbound daemon key (default 300)
-#   EEZ_OUT_FUND_ETH          L2 funding for the outbound key   (default 600;
+#   EEZ_OUT_FUND_ETH          L2 target for the outbound daemon root (default 600;
 #                             covers the auto-sized 50-wallet pool at 5 ETH each)
 #   EEZ_TEST_PRIORITY_GAS_PRICE_WEI  priority fee cap (default 1; L2 is sub-gwei)
 set -euo pipefail
@@ -59,10 +59,15 @@ HH_KEY_0_ADDR=$(cast wallet address --private-key "$HH_KEY_0")
 HH_KEY_2_ADDR=$(cast wallet address --private-key "$HH_KEY_2")
 # L1 funding source for the deployer (genesis-prefunded); used only if it's short.
 FUND_FROM_KEY="${EEZ_FUND_FROM_KEY:-${EEZ_PROOF_SIGNER_KEY:-$(grep -E '^[[:space:]]*proof_signer_key:' "$K/args.yaml" 2>/dev/null | grep -oE '0x[0-9a-fA-F]{64}' | head -1)}}"
-# The spamoor-eez daemon's -p key roots the INBOUND child-wallet pool and funds
+# The spamoor-eez-inbound daemon's -p key roots the inbound child-wallet pool and funds
 # it over L1. up.sh is meant to prefund it in genesis, but that can silently not
 # take (pyyaml fallback / stale args.yaml), so top it up here too.
 INBOUND_DAEMON_KEY="${EEZ_INBOUND_PRIVATE_KEY:-$(grep -E '^[[:space:]]*inbound_private_key:' "$K/args.yaml" 2>/dev/null | grep -oE '0x[0-9a-fA-F]{64}' | head -1)}"
+# The outbound daemon owns the L2 wallet pool. Unlike the old embedded pool,
+# its key is stable configuration derived by up.sh, not a secret in the cache.
+OUTBOUND_DAEMON_KEY="${EEZ_OUTBOUND_PRIVATE_KEY:-$(grep -E '^[[:space:]]*outbound_private_key:' "$K/args.yaml" 2>/dev/null | grep -oE '0x[0-9a-fA-F]{64}' | head -1)}"
+[[ -n "$OUTBOUND_DAEMON_KEY" ]] || { echo "outbound_private_key missing in $K/args.yaml — re-run infra/kurtosis/up.sh or set EEZ_OUTBOUND_PRIVATE_KEY" >&2; exit 1; }
+OUTBOUND_DAEMON_ADDR=$(cast wallet address --private-key "$OUTBOUND_DAEMON_KEY")
 
 EEZ_CCM_L2_PREDEPLOY="${EEZ_CCM_L2_ADDRESS:-0x4200000000000000000000000000000000000007}"
 MAINNET_RID="${EEZ_L1_ROLLUP_ID:-0}"
@@ -77,7 +82,7 @@ retry() { local n=0 max=6 out rc; while :; do out=$("$@" 2>&1); rc=$?; (( rc==0 
 # fund_to <addr> <target_eth> <rpc> <from_key> — idempotent top-up; only sends a
 # shortfall, and only then needs the funding key.
 fund_to() {
-    local addr="$1" want_eth="$2" rpc="$3" fkey="$4" have want gp nonce faddr
+    local addr="$1" want_eth="$2" rpc="$3" fkey="$4" have want shortfall gp nonce faddr
     have=$(retry cast balance "$addr" --rpc-url "$rpc")
     want=$(cast to-wei "$want_eth" ether)
     # wei values exceed 64-bit; compare as big ints via python3 (bash would overflow).
@@ -85,9 +90,10 @@ fund_to() {
         echo "    $addr already funded ($have wei on $rpc)"; return 0
     fi
     [[ -n "$fkey" ]] || { echo "    cannot fund $addr on $rpc — no funding key (set EEZ_FUND_FROM_KEY or proof_signer_key in args.yaml)" >&2; return 1; }
+    shortfall=$(python3 -c "print(int('$want') - int('$have'))")
     gp=$(gas_price_for "$rpc"); faddr=$(cast wallet address --private-key "$fkey"); nonce=$(retry cast nonce "$faddr" --rpc-url "$rpc")
-    echo "    funding $addr with ${want_eth} ETH on $rpc"
-    cast send "$addr" --value "${want_eth}ether" --private-key "$fkey" --nonce "$nonce" \
+    echo "    topping up $addr by $shortfall wei to ${want_eth} ETH on $rpc"
+    cast send "$addr" --value "$shortfall" --private-key "$fkey" --nonce "$nonce" \
         --gas-price "$gp" --priority-gas-price "$(priority_fee_for "$gp")" --rpc-url "$rpc" >/dev/null
 }
 
@@ -177,11 +183,6 @@ if [[ ! -f "$CACHE" ]]; then
     OUTBOUND_WRAPPER=$(create_l2_wrapper "$OUTBOUND_PROXY")
     has_code "$OUTBOUND_WRAPPER" "$L2" || { echo "outbound wrapper creation failed (${OUTBOUND_WRAPPER:-empty})" >&2; exit 1; }
 
-    # Dedicated outbound key: the plugin builds the L2 pool from it, so it's
-    # funded on L2 below, cached, and must NOT be the eez-node system key. (The
-    # inbound pool's root is the daemon's -p key, prefunded via up.sh/main.star.)
-    OUT_KEY=0x$(openssl rand -hex 32); OUT_ADDR=$(cast wallet address --private-key "$OUT_KEY")
-
     {
         echo "# eez-xchain provisioning cache — sourced by spammers.sh. Do not edit by hand."
         echo "INBOUND_PROXY=$INBOUND_PROXY"
@@ -194,11 +195,14 @@ if [[ ! -f "$CACHE" ]]; then
         echo "OUTBOUND_WRAPPER=$OUTBOUND_WRAPPER"
         echo "L2_DEP_RECIPIENT=$L2_DEP_RECIPIENT"
         echo "L1_WD_RECIPIENT=$L1_WD_RECIPIENT"
-        echo "OUT_KEY=$OUT_KEY"
-        echo "OUT_ADDR=$OUT_ADDR"
+        echo "OUT_ADDR=$OUTBOUND_DAEMON_ADDR"
     } > "$CACHE"
     echo "==> cached provisioning -> $CACHE"
 fi
+
+# A legacy cache may name the old random embedded-pool key. The two-daemon
+# design always funds the configured outbound daemon root instead.
+OUT_ADDR="$OUTBOUND_DAEMON_ADDR"
 
 if [[ -n "$INBOUND_DAEMON_KEY" ]]; then
     IN_DAEMON_ADDR=$(cast wallet address --private-key "$INBOUND_DAEMON_KEY")
@@ -206,13 +210,13 @@ if [[ -n "$INBOUND_DAEMON_KEY" ]]; then
     fund_to "$IN_DAEMON_ADDR" "${EEZ_INBOUND_FUND_ETH:-300}" "$L1" "$FUND_FROM_KEY" || exit 1
 fi
 
-echo "==> funding outbound key on L2"
+echo "==> funding outbound daemon root on L2"
 fund_to "$OUT_ADDR" "${EEZ_OUT_FUND_ETH:-600}" "$L2" "$HH_KEY_2"
 
 echo
 echo "==> provisioning complete"
 echo "    inbound  (L1->L2): setter=$INBOUND_PROXY noret=$INBOUND_NORET_PROXY deposit=$INBOUND_DEP_PROXY wrapper=$INBOUND_WRAPPER"
 echo "    outbound (L2->L1): setter=$OUTBOUND_PROXY noret=$OUTBOUND_NORET_PROXY withdraw=$OUTBOUND_WD_PROXY wrapper=$OUTBOUND_WRAPPER"
-echo "    outbound key addr= $OUT_ADDR (L2, outbound pool root)"
-echo "    inbound pool root= spamoor-eez daemon -p key (set at bring-up; not provisioned here)"
+echo "    outbound pool root= $OUT_ADDR (spamoor-eez-outbound, L2)"
+echo "    inbound pool root= spamoor-eez-inbound -p key (L1)"
 echo "    cache            = $CACHE"

@@ -76,12 +76,13 @@ follower → the follower feeds it to the embedded reth via `engine_newPayload`
 - [`scripts/wave-test.sh`](scripts/wave-test.sh) — inbound, outbound, and mixed
   cross-chain wave harness.
 - [`scripts/xchain-provision.sh`](scripts/xchain-provision.sh) — idempotently
-  creates the cross-chain proxies/wrappers and a funded outbound key the
+  creates the cross-chain proxies/wrappers and funds the outbound daemon root the
   `eez-xchain` spamoor scenario drives; caches them to
   `datadir/xchain-provision.env`.
 - [`scripts/spammers.sh`](scripts/spammers.sh) — one-command orchestrator for
   **continuous** cross-chain load: reads an intent file, provisions (above),
-  and starts the spammers via the `spamoor-eez` daemon. See
+  and routes spammers to independent `spamoor-eez-inbound` (L1) and
+  `spamoor-eez-outbound` (L2) daemons. See
   [`spamoor-plugins/README.md`](spamoor-plugins/README.md).
 
 ## Prereqs
