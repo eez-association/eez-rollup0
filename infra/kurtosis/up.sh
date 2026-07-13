@@ -56,10 +56,16 @@ yv() { grep -E "^[[:space:]]*$1:" "$ARGS_FILE" | head -1 \
 # Migrate args.yaml files created before the outbound daemon existed.
 if ! grep -qE '^[[:space:]]*outbound_private_key:' "$ARGS_FILE"; then
     if grep -qE '^[[:space:]]*inbound_private_key:' "$ARGS_FILE"; then
-        sed -i.bak -E '/^[[:space:]]*inbound_private_key:/a\
-    outbound_private_key: "0xCHANGE_ME"
-' "$ARGS_FILE"
-        rm -f "$ARGS_FILE.bak"
+        tmp_args="$(mktemp "${ARGS_FILE}.tmp.XXXXXX")"
+        awk '
+            { print }
+            /^[[:space:]]*inbound_private_key:/ && !inserted {
+                match($0, /[^[:space:]]/)
+                print substr($0, 1, RSTART - 1) "outbound_private_key: \"0xCHANGE_ME\""
+                inserted = 1
+            }
+        ' "$ARGS_FILE" > "$tmp_args"
+        mv "$tmp_args" "$ARGS_FILE"
     else
         {
             echo
