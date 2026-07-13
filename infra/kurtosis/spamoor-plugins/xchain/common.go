@@ -48,7 +48,7 @@ func (w *walletLocker) acquire(addr common.Address) func() {
 	v, _ := w.mu.LoadOrStore(addr, &sync.Mutex{})
 	m := v.(*sync.Mutex)
 	m.Lock()
-	return m.Unlock
+	return func() { m.Unlock() }
 }
 
 // Well-formed cross-chain inclusion is observed at up to ~4 min under load.
