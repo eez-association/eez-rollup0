@@ -53,13 +53,29 @@ fi
 yv() { grep -E "^[[:space:]]*$1:" "$ARGS_FILE" | head -1 \
         | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//'; }
 
-# Derive dev keys and fund them in the L1 genesis config.
-# inbound_private_key (index 3) is the spamoor-eez daemon's inbound wallet-pool
-# root — kept OFF the batch poster (index 1) so cross-chain load can't contend
-# with batch posting. It lives under eez.spamoor_eez but yv/sed match by the
-# unique key name regardless of nesting.
+# Migrate args.yaml files created before the outbound daemon existed.
+if ! grep -qE '^[[:space:]]*outbound_private_key:' "$ARGS_FILE"; then
+    if grep -qE '^[[:space:]]*inbound_private_key:' "$ARGS_FILE"; then
+        sed -i.bak -E '/^[[:space:]]*inbound_private_key:/a\
+    outbound_private_key: "0xCHANGE_ME"
+' "$ARGS_FILE"
+        rm -f "$ARGS_FILE.bak"
+    else
+        {
+            echo
+            echo "  spamoor_eez:"
+            echo "    enabled: true"
+            echo "    image: \"ethpandaops/spamoor:master\""
+            echo "    inbound_private_key: \"0xCHANGE_ME\""
+            echo "    outbound_private_key: \"0xCHANGE_ME\""
+        } >> "$ARGS_FILE"
+    fi
+    echo "==> added eez.spamoor_eez.outbound_private_key to existing args.yaml"
+fi
+
+# Derive separate daemon keys and fund them in the L1 genesis config.
 DERIVED_ADDRS=()
-for pair in "poster_key:1" "proof_signer_key:2" "inbound_private_key:3"; do
+for pair in "poster_key:1" "proof_signer_key:2" "inbound_private_key:3" "outbound_private_key:4"; do
     key="${pair%%:*}"; index="${pair##*:}"
     if [[ "$(yv "$key")" == "0xCHANGE_ME" ]]; then
         command -v cast >/dev/null || {

@@ -25,9 +25,7 @@ const (
 	attackRevert  = "revert"           // valid selector the target lacks
 )
 
-// Cross-chain op kinds, selected per-tx from the `ops` list (mirrors wave-test.sh):
-// set/noret = setValue on the setter/ValueNoRet proxy; value = transfer to the
-// deposit(in)/withdraw(out) proxy; wrapper = setViaProxy on the wrapper.
+// Cross-chain operation types supported by both directions.
 const (
 	opSet     = "set"
 	opNoRet   = "noret"
@@ -38,26 +36,19 @@ const (
 // Default enclave-internal endpoints (see infra/kurtosis/main.star ports).
 const (
 	defaultInboundFront  = "http://eez-node:18999" // L1 xchain front
-	defaultOutboundRPC   = "http://eez-node:18688" // normal L2 RPC (funding + receipts)
 	defaultOutboundFront = "http://eez-node:18998" // L2 xchain front
 )
 
-// valueWei is the amount sent per `value` op (deposit/withdraw); tiny so a
-// child wallet's ~5 ETH float covers many of them.
 const valueWei = 10_000_000_000_000 // 1e13 wei
 
-// ScenarioOptions configures the eez-xchain scenario. See infra/kurtosis's
-// scripts/wave-test.sh for the reference op semantics this mirrors.
+// ScenarioOptions configures the eez-xchain scenario.
 type ScenarioOptions struct {
 	Attack string `yaml:"attack"` // when set, ops are ignored (malformed setter calls)
 
-	// TotalCount stops after exactly N txs (0 = run forever); Throughput is the
-	// per-slot rate. At least one must be set.
 	TotalCount uint64 `yaml:"total_count"`
 	Throughput uint64 `yaml:"throughput"`
 
-	// Mode is shorthand for the weight pair — inbound|outbound|mixed. Ignored if
-	// either weight is set explicitly.
+	// Mode selects the source chain; Ops selects transaction types.
 	Mode           string `yaml:"mode"`
 	InboundWeight  uint64 `yaml:"inbound_weight"`
 	OutboundWeight uint64 `yaml:"outbound_weight"`
@@ -74,13 +65,8 @@ type ScenarioOptions struct {
 	GasLimit   uint64  `yaml:"gas_limit"`
 	Timeout    string  `yaml:"timeout"`
 
-	// Endpoints, default to the enclave-internal eez-node ports. Wallets fund
-	// over the NORMAL RPC (a front holds every send); only the cross-chain tx
-	// is POSTed to a front.
-	InboundFront       string `yaml:"inbound_front"`
-	OutboundRPC        string `yaml:"outbound_rpc"`
-	OutboundFront      string `yaml:"outbound_front"`
-	OutboundPrivateKey string `yaml:"outbound_private_key"`
+	InboundFront  string `yaml:"inbound_front"`
+	OutboundFront string `yaml:"outbound_front"`
 
 	// Pre-created cross-chain resources per direction (from xchain-provision.sh,
 	// not this scenario). Only the ones the configured ops use are required:
@@ -102,15 +88,13 @@ type ScenarioOptions struct {
 var ScenarioName = "eez-xchain"
 
 var ScenarioDefaultOptions = ScenarioOptions{
-	Attack:     attackNone,
-	Throughput: 10,
-	// Mode/weights left zero so applyModeShorthand can tell unset from explicit.
+	Attack:        attackNone,
+	Throughput:    10,
 	BaseFee:       20,
 	TipFee:        2,
 	GasLimit:      600000,
 	ValueMax:      1_000_000,
 	InboundFront:  defaultInboundFront,
-	OutboundRPC:   defaultOutboundRPC,
 	OutboundFront: defaultOutboundFront,
 }
 
@@ -133,8 +117,8 @@ type Scenario struct {
 	options ScenarioOptions
 	logger  *logrus.Entry
 
-	inboundPool  *spamoor.WalletPool // spamoor's native pool (L1, funds over daemon --rpchost)
-	outboundPool *spamoor.WalletPool // built by buildChainPool (L2, funds over OutboundRPC)
+	inboundPool  *spamoor.WalletPool // native pool of the L1-bound inbound daemon
+	outboundPool *spamoor.WalletPool // native pool of the L2-bound outbound daemon
 
 	numWallets    uint64
 	inboundFront  string
@@ -160,11 +144,11 @@ func newScenario(logger logrus.FieldLogger) scenario.Scenario {
 
 func (s *Scenario) Flags(flags *pflag.FlagSet) error {
 	flags.StringVar(&s.options.Attack, "attack", ScenarioDefaultOptions.Attack, "Adversarial mode: '' (well-formed), 'garbage-calldata', or 'revert' — run as a separate spammer for DDoS-resilience testing")
-	flags.Uint64VarP(&s.options.TotalCount, "count", "c", ScenarioDefaultOptions.TotalCount, "Total number of cross-chain transactions to send, then stop (0 = unlimited, split inbound/outbound by weight)")
-	flags.Uint64VarP(&s.options.Throughput, "throughput", "t", ScenarioDefaultOptions.Throughput, "Cross-chain transactions to send per slot (split inbound/outbound by weight)")
-	flags.StringVar(&s.options.Mode, "mode", "mixed", "Shorthand for inbound-weight/outbound-weight: 'inbound', 'outbound', or 'mixed' (1:1). Ignored if either weight is set explicitly.")
-	flags.Uint64Var(&s.options.InboundWeight, "inbound-weight", ScenarioDefaultOptions.InboundWeight, "Relative weight of inbound (L1->L2) ops (overrides --mode)")
-	flags.Uint64Var(&s.options.OutboundWeight, "outbound-weight", ScenarioDefaultOptions.OutboundWeight, "Relative weight of outbound (L2->L1) ops (overrides --mode)")
+	flags.Uint64VarP(&s.options.TotalCount, "count", "c", ScenarioDefaultOptions.TotalCount, "Total number of cross-chain transactions to send, then stop (0 = unlimited)")
+	flags.Uint64VarP(&s.options.Throughput, "throughput", "t", ScenarioDefaultOptions.Throughput, "Cross-chain transactions to send per slot")
+	flags.StringVar(&s.options.Mode, "mode", ScenarioDefaultOptions.Mode, "Required source direction: 'inbound' on the L1 daemon or 'outbound' on the L2 daemon")
+	flags.Uint64Var(&s.options.InboundWeight, "inbound-weight", ScenarioDefaultOptions.InboundWeight, "Legacy alias for inbound mode; cannot be combined with outbound mode or weight")
+	flags.Uint64Var(&s.options.OutboundWeight, "outbound-weight", ScenarioDefaultOptions.OutboundWeight, "Legacy alias for outbound mode; cannot be combined with inbound mode or weight")
 	flags.StringSliceVar(&s.options.Ops, "ops", nil, "Cross-chain op kinds to cycle through per direction: set,noret,value,wrapper (default set)")
 	flags.Uint64Var(&s.options.MaxPending, "max-pending", ScenarioDefaultOptions.MaxPending, "Maximum number of pending transactions")
 	flags.Uint64Var(&s.options.MaxWallets, "max-wallets", ScenarioDefaultOptions.MaxWallets, "Maximum number of child wallets to use per side")
@@ -175,9 +159,7 @@ func (s *Scenario) Flags(flags *pflag.FlagSet) error {
 	flags.Uint64Var(&s.options.GasLimit, "gas-limit", ScenarioDefaultOptions.GasLimit, "Gas limit for cross-chain proxy calls")
 	flags.StringVar(&s.options.Timeout, "timeout", ScenarioDefaultOptions.Timeout, "Timeout for the scenario (e.g. '1h') - empty means no timeout")
 	flags.StringVar(&s.options.InboundFront, "inbound-front", ScenarioDefaultOptions.InboundFront, "L1 cross-chain front URL where inbound txs are submitted (held)")
-	flags.StringVar(&s.options.OutboundRPC, "outbound-rpc", ScenarioDefaultOptions.OutboundRPC, "NORMAL L2 RPC for the outbound wallet pool (funding + receipts) — NOT the front")
 	flags.StringVar(&s.options.OutboundFront, "outbound-front", ScenarioDefaultOptions.OutboundFront, "L2 cross-chain front URL where outbound txs are submitted (held)")
-	flags.StringVar(&s.options.OutboundPrivateKey, "outbound-private-key", "", "Funded private key for the outbound-side wallet pool (L2 chain)")
 	flags.StringVar(&s.options.InboundProxy, "inbound-proxy", "", "Pre-created L1 setter CrossChainProxy (op: set)")
 	flags.StringVar(&s.options.InboundNoRetProxy, "inbound-noret-proxy", "", "Pre-created L1 ValueNoRet CrossChainProxy (op: noret)")
 	flags.StringVar(&s.options.InboundDepositProxy, "inbound-deposit-proxy", "", "Pre-created L1 recipient CrossChainProxy for value transfers (op: value)")
@@ -192,8 +174,6 @@ func (s *Scenario) Flags(flags *pflag.FlagSet) error {
 }
 
 func (s *Scenario) Init(options *scenario.Options) error {
-	s.inboundPool = options.WalletPool
-
 	if options.Config != "" {
 		if err := scenario.ParseAndValidateConfig(&ScenarioDescriptor, options.Config, &s.options, s.logger); err != nil {
 			return err
@@ -206,14 +186,9 @@ func (s *Scenario) Init(options *scenario.Options) error {
 		return fmt.Errorf("invalid attack %q (want '', %q or %q)", s.options.Attack, attackGarbage, attackRevert)
 	}
 
-	// Catch a mistyped mode here (else it silently leaves both weights zero).
-	switch s.options.Mode {
-	case "", "inbound", "outbound", "mixed":
-	default:
-		return fmt.Errorf("invalid mode %q (want inbound|outbound|mixed, or set inbound_weight/outbound_weight explicitly)", s.options.Mode)
+	if err := resolveDirection(&s.options); err != nil {
+		return err
 	}
-
-	applyModeShorthand(&s.options)
 
 	ops, err := resolveOps(s.options.Ops, s.options.Attack)
 	if err != nil {
@@ -225,16 +200,10 @@ func (s *Scenario) Init(options *scenario.Options) error {
 	if s.options.InboundFront == "" {
 		s.options.InboundFront = defaultInboundFront
 	}
-	if s.options.OutboundRPC == "" {
-		s.options.OutboundRPC = defaultOutboundRPC
-	}
 	if s.options.OutboundFront == "" {
 		s.options.OutboundFront = defaultOutboundFront
 	}
 
-	if s.options.InboundWeight == 0 && s.options.OutboundWeight == 0 {
-		return fmt.Errorf("at least one of inbound_weight/outbound_weight must be non-zero (or set mode: inbound|outbound|mixed)")
-	}
 	if s.options.TotalCount == 0 && s.options.Throughput == 0 {
 		return fmt.Errorf("neither total_count nor throughput is set, must define at least one (see --help for flags)")
 	}
@@ -246,7 +215,15 @@ func (s *Scenario) Init(options *scenario.Options) error {
 	s.inboundFront = s.options.InboundFront
 	s.outboundFront = s.options.OutboundFront
 
-	// Each side is set up only if it has weight.
+	// Spamoor prepares and funds the daemon-native pool after Init.
+	pool := options.WalletPool
+	// Isolate child wallets when a daemon runs multiple spammers.
+	pool.SetWalletSeed(fmt.Sprintf("%s-%d", ScenarioName, pool.GetSpammerID()))
+	pool.SetWalletCount(s.numWallets)
+	pool.SetRefillAmount(utils.EtherToWei(uint256.NewInt(perWalletFundingEth)))
+	pool.SetRefillBalance(utils.EtherToWei(uint256.NewInt(1)))
+	pool.SetRefillInterval(600)
+
 	if s.options.InboundWeight > 0 {
 		t, err := s.resolveTargets(map[string]opAddr{
 			opSet:     {s.options.InboundProxy, "inbound_proxy"},
@@ -258,21 +235,10 @@ func (s *Scenario) Init(options *scenario.Options) error {
 			return err
 		}
 		s.inTargets = t
-		// Native pool: spamoor's runner funds it after Init using these refill
-		// settings, which default to zero (no refill) if left unset.
-		s.inboundPool.SetWalletCount(s.numWallets)
-		s.inboundPool.SetRefillAmount(utils.EtherToWei(uint256.NewInt(perWalletFundingEth)))
-		s.inboundPool.SetRefillBalance(utils.EtherToWei(uint256.NewInt(1)))
-		s.inboundPool.SetRefillInterval(600)
+		s.inboundPool = pool
 	}
 
 	if s.options.OutboundWeight > 0 {
-		if s.options.OutboundPrivateKey == "" {
-			return fmt.Errorf("outbound_private_key is required when outbound_weight > 0 (funded L2 key for the outbound wallet pool; must NOT be an eez-node system key)")
-		}
-		if err := validateOutboundKey(s.options.OutboundPrivateKey); err != nil {
-			return err
-		}
 		t, err := s.resolveTargets(map[string]opAddr{
 			opSet:     {s.options.OutboundProxy, "outbound_proxy"},
 			opNoRet:   {s.options.OutboundNoRetProxy, "outbound_noret_proxy"},
@@ -283,33 +249,48 @@ func (s *Scenario) Init(options *scenario.Options) error {
 			return err
 		}
 		s.outTargets = t
-		pool, err := buildChainPool(s.inboundPool.GetContext(), s.logger, "outbound", s.options.OutboundRPC, s.options.OutboundPrivateKey, s.numWallets)
-		if err != nil {
-			return fmt.Errorf("failed to init outbound (L2) pool: %w", err)
-		}
 		s.outboundPool = pool
 	}
 
 	return nil
 }
 
-// applyModeShorthand maps mode to the weight pair; explicit weights win.
-func applyModeShorthand(opts *ScenarioOptions) {
-	if opts.InboundWeight != 0 || opts.OutboundWeight != 0 {
-		return
+// resolveDirection maps a scenario to one source-chain daemon.
+func resolveDirection(opts *ScenarioOptions) error {
+	if opts.InboundWeight > 0 && opts.OutboundWeight > 0 {
+		return fmt.Errorf("one spammer cannot use both source chains; run inbound and outbound spammers separately (each supports all ops)")
 	}
 	switch opts.Mode {
 	case "inbound":
-		opts.InboundWeight, opts.OutboundWeight = 1, 0
+		if opts.OutboundWeight > 0 {
+			return fmt.Errorf("mode inbound conflicts with outbound_weight")
+		}
+		if opts.InboundWeight == 0 {
+			opts.InboundWeight = 1
+		}
 	case "outbound":
-		opts.InboundWeight, opts.OutboundWeight = 0, 1
-	case "mixed", "":
-		opts.InboundWeight, opts.OutboundWeight = 1, 1
+		if opts.InboundWeight > 0 {
+			return fmt.Errorf("mode outbound conflicts with inbound_weight")
+		}
+		if opts.OutboundWeight == 0 {
+			opts.OutboundWeight = 1
+		}
+	case "":
+		switch {
+		case opts.InboundWeight > 0:
+			opts.Mode = "inbound"
+		case opts.OutboundWeight > 0:
+			opts.Mode = "outbound"
+		default:
+			return fmt.Errorf("set mode to inbound or outbound")
+		}
+	default:
+		return fmt.Errorf("invalid mode %q (mode selects inbound or outbound source chain; ops selects transaction types)", opts.Mode)
 	}
+	return nil
 }
 
-// resolveOps validates and dedups the op list, defaulting to [set] (also for
-// attacks, where ops are irrelevant).
+// resolveOps validates and deduplicates the operation list.
 func resolveOps(ops []string, attack string) ([]string, error) {
 	if attack != attackNone {
 		return []string{opSet}, nil
@@ -389,10 +370,7 @@ func (s *Scenario) Run(ctx context.Context) error {
 
 	totalWeight := s.options.InboundWeight + s.options.OutboundWeight
 
-	// RunTransactionScenario uses WalletPool only for per-block throughput
-	// stats — point it at an active pool (outbound if inbound is disabled) so
-	// single-direction runs don't report an empty one. Each op still picks its
-	// own pool in ProcessNextTxFn below.
+	// Use the active pool for Spamoor's per-block statistics.
 	statsPool := s.inboundPool
 	if s.options.InboundWeight == 0 {
 		statsPool = s.outboundPool

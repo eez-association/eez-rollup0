@@ -18,7 +18,8 @@ infra/kurtosis/.env
 infra/kurtosis/endpoints.env
 infra/kurtosis/args.yaml
 infra/kurtosis/spamoor-plugins/spammers.yaml
-infra/kurtosis/spamoor-plugins/startup-spammers.yaml
+infra/kurtosis/spamoor-plugins/startup-spammers-inbound.yaml
+infra/kurtosis/spamoor-plugins/startup-spammers-outbound.yaml
 
 data/
 chiado-*/

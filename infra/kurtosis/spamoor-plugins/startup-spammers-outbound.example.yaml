@@ -1,0 +1,18 @@
+# Optional startup config for spamoor-eez-outbound only.
+# The recommended path is spammers.sh, which provisions and injects addresses.
+# If using this file, copy it to startup-spammers-outbound.yaml, fill in the
+# addresses, and set eez.spamoor_eez.outbound_startup_spammer_config.
+# The daemon root key and normal L2 RPC come from main.star, not scenario YAML.
+
+- scenario: eez-xchain
+  name: "EEZ Outbound (L2->L1)"
+  config:
+    mode: outbound
+    throughput: 20
+    max_pending: 200
+    max_wallets: 40
+    ops: [set, noret, value, wrapper]
+    outbound_proxy: "REPLACE_ME"
+    outbound_noret_proxy: "REPLACE_ME"
+    outbound_withdraw_proxy: "REPLACE_ME"
+    outbound_wrapper: "REPLACE_ME"

@@ -1,0 +1,28 @@
+# Optional startup config for spamoor-eez-inbound only.
+# The recommended path is spammers.sh, which provisions and injects addresses.
+# If using this file, copy it to startup-spammers-inbound.yaml, fill in the
+# addresses, and set eez.spamoor_eez.inbound_startup_spammer_config.
+
+- scenario: eez-xchain
+  name: "EEZ Inbound (L1->L2)"
+  config:
+    mode: inbound
+    throughput: 20
+    max_pending: 200
+    max_wallets: 40
+    ops: [set, noret, value, wrapper]
+    inbound_proxy: "REPLACE_ME"
+    inbound_noret_proxy: "REPLACE_ME"
+    inbound_deposit_proxy: "REPLACE_ME"
+    inbound_wrapper: "REPLACE_ME"
+
+# Optional adversarial entry on the same L1-bound daemon.
+- scenario: eez-xchain
+  name: "EEZ Attack (garbage inbound)"
+  config:
+    mode: inbound
+    attack: garbage-calldata
+    throughput: 40
+    max_pending: 400
+    max_wallets: 40
+    inbound_proxy: "REPLACE_ME"
