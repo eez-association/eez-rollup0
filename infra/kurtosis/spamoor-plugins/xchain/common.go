@@ -175,6 +175,16 @@ func submitCall(ctx context.Context, locks *walletLocker, pool *spamoor.WalletPo
 		return nil, nil, nil, scenario.ErrNoWallet
 	}
 
+	// A still-unfunded wallet (funding tx submitted but not yet confirmed) must
+	// not reach BuildDynamicFeeTx below: that call reserves a nonce unconditionally,
+	// and MarkSkippedNonce can't reclaim it for a wallet with zero confirmed txs
+	// (spamoor no-ops if nonce >= confirmedTxCount) — the front would then be
+	// stuck expecting a nonce this wallet can never resend. Skip its turn instead;
+	// the pool round-robins back to it once funded, with nonce untouched.
+	if wallet.GetBalance().Sign() == 0 {
+		return nil, nil, wallet, fmt.Errorf("wallet not yet funded, skipping this turn")
+	}
+
 	// Hold the wallet lock across nonce assignment and the POST so its nonces
 	// reach the front in order. Released before the caller's waitInclusion.
 	release := locks.acquire(wallet.GetAddress())
