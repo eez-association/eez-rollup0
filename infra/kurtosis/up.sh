@@ -17,6 +17,7 @@ ENCLAVE="${KURTOSIS_ENCLAVE:-eez-devnet}"
 ARGS_FILE="${1:-$HERE/args.yaml}"
 # ethereum-package dev mnemonic.
 DEV_MNEMONIC="giant issue aisle success illegal bike spike question tent bar rely arctic volcano long crawl hungry vocal artwork sniff fantasy very lucky have athlete"
+SPAMOOR_IMAGE="ethpandaops/spamoor@sha256:24818bf7ab76696b2dccb0c59cb419cce358cf1b4326a545012b031afd11658b"
 
 command -v kurtosis >/dev/null || { echo "kurtosis not found in PATH" >&2; exit 1; }
 command -v docker   >/dev/null || { echo "docker not found in PATH" >&2; exit 1; }
@@ -49,6 +50,20 @@ if [[ ! -f "$ARGS_FILE" ]]; then
     cp "$HERE/args.example.yaml" "$ARGS_FILE"
 fi
 
+if grep -qE '^[[:space:]]*image:[[:space:]]*"?ethpandaops/spamoor:master"?[[:space:]]*$' "$ARGS_FILE"; then
+    tmp_args="$(mktemp "${ARGS_FILE}.tmp.XXXXXX")"
+    awk -v image="$SPAMOOR_IMAGE" '
+        /^[[:space:]]*image:[[:space:]]*"?ethpandaops\/spamoor:master"?[[:space:]]*$/ {
+            match($0, /[^[:space:]]/)
+            print substr($0, 1, RSTART - 1) "image: \"" image "\""
+            next
+        }
+        { print }
+    ' "$ARGS_FILE" > "$tmp_args"
+    mv "$tmp_args" "$ARGS_FILE"
+    echo "==> pinned spamoor image to the tested e214fd1 build"
+fi
+
 # Flat key lookup for this simple args template.
 yv() { grep -E "^[[:space:]]*$1:" "$ARGS_FILE" | head -1 \
         | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//'; }
@@ -67,16 +82,16 @@ if ! grep -qE '^[[:space:]]*outbound_private_key:' "$ARGS_FILE"; then
         ' "$ARGS_FILE" > "$tmp_args"
         mv "$tmp_args" "$ARGS_FILE"
     else
-        {
-            echo
-            echo "  spamoor_eez:"
-            echo "    enabled: true"
-            echo "    image: \"ethpandaops/spamoor:master\""
-            echo "    inbound_private_key: \"0xCHANGE_ME\""
-            echo "    outbound_private_key: \"0xCHANGE_ME\""
-        } >> "$ARGS_FILE"
+        echo "cannot migrate $ARGS_FILE: inbound_private_key is missing." >&2
+        echo "Add the spamoor_eez block from infra/kurtosis/args.example.yaml." >&2
+        exit 1
     fi
     echo "==> added eez.spamoor_eez.outbound_private_key to existing args.yaml"
+fi
+
+if command -v python3 >/dev/null && python3 -c "import yaml" >/dev/null 2>&1; then
+    python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "$ARGS_FILE" \
+        || { echo "$ARGS_FILE is not valid YAML" >&2; exit 1; }
 fi
 
 # Derive separate daemon keys and fund them in the L1 genesis config.
