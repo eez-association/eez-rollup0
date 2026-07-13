@@ -80,9 +80,7 @@ func walletCount(maxWallets, totalCount, throughput uint64) uint64 {
 // buildChainPool builds a standalone pool bound to one chain. `rpc` must be the
 // NORMAL RPC, never a front — child wallets fund over it, and a front holds
 // every send, so funding would deadlock.
-func buildChainPool(logger logrus.FieldLogger, poolName, rpc, privkey string, wallets uint64) (*spamoor.WalletPool, error) {
-	ctx := context.Background() // pool lifetime == process lifetime
-
+func buildChainPool(ctx context.Context, logger logrus.FieldLogger, poolName, rpc, privkey string, wallets uint64) (*spamoor.WalletPool, error) {
 	clients := spamoor.NewClientPool(ctx, logger.WithField("pool", poolName))
 	if err := clients.InitClients([]*spamoor.ClientOptions{{RpcHost: rpc}}); err != nil {
 		return nil, fmt.Errorf("init client pool: %w", err)
@@ -120,33 +118,121 @@ func buildChainPool(logger logrus.FieldLogger, poolName, rpc, privkey string, wa
 	pool.SetRefillAmount(utils.EtherToWei(uint256.NewInt(perWalletFundingEth)))
 	pool.SetRefillBalance(utils.EtherToWei(uint256.NewInt(1)))
 	pool.SetRefillInterval(600)
-	if err := prepareWalletsWithRetry(pool, logger.WithField("pool", poolName)); err != nil {
+	recovered, err := prepareWalletsWithRetry(ctx, pool, logger.WithField("pool", poolName))
+	if err != nil {
 		return nil, fmt.Errorf("prepare wallets (funding %d child wallets from root %s over %s): %w — if this is 'txpool is full', the %s mempool is saturated (throttle other spammers or lower throughput/max_wallets and retry); if 'insufficient funds', top up the root key via xchain-provision.sh",
 			wallets, rootWallet.GetWallet().GetAddress().Hex(), rpc, err, poolName)
+	}
+	if recovered {
+		// Spamoor starts its native refill loop only when PrepareWallets reaches
+		// the end. A partial-funding error returns before that point, so keep the
+		// recovered pool supplied with an equivalent context-bound loop.
+		go maintainWalletFunding(ctx, pool, logger.WithField("pool", poolName))
 	}
 
 	return pool, nil
 }
 
-// prepareWalletsWithRetry funds child wallets, retrying on a transiently-full
-// mempool ("txpool is full") that clears as blocks drain. PrepareWallets is
-// idempotent, so retries only top up wallets still short; other errors return
-// immediately.
-func prepareWalletsWithRetry(pool *spamoor.WalletPool, logger logrus.FieldLogger) error {
+// prepareWalletsWithRetry funds child wallets and explicitly repairs a partial
+// PrepareWallets result after a transiently-full mempool. It reports whether
+// the caller must provide the refill watcher that Spamoor did not start.
+func prepareWalletsWithRetry(ctx context.Context, pool *spamoor.WalletPool, logger logrus.FieldLogger) (bool, error) {
 	const attempts = 6
-	var err error
+	err := pool.PrepareWallets()
+	if err == nil {
+		return false, nil
+	}
+	if !isTransientFundingErr(err) {
+		return false, err
+	}
+
+	// PrepareWallets installs childWallets before it sends their funding txs.
+	// Consequently, calling it again after a partial send failure is a no-op.
+	// Refresh and fund the still-short wallets explicitly, one at a time, to
+	// avoid filling the RPC txpool again.
 	for i := 0; i < attempts; i++ {
-		if err = pool.PrepareWallets(); err == nil {
-			return nil
+		delay := time.Duration(5*(i+1)) * time.Second
+		logger.Warnf("wallet funding was incomplete (recovery attempt %d/%d in %s): %v", i+1, attempts, delay, err)
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(delay):
+		}
+
+		if err = fundShortWallets(ctx, pool); err == nil {
+			return true, nil
 		}
 		if !isTransientFundingErr(err) {
-			return err
+			return false, err
 		}
-		delay := time.Duration(5*(i+1)) * time.Second
-		logger.Warnf("wallet funding hit a transient mempool error (attempt %d/%d), retrying in %s: %v", i+1, attempts, delay, err)
-		time.Sleep(delay)
 	}
-	return err
+	return false, err
+}
+
+// maintainWalletFunding replaces Spamoor's native refill watcher only on the
+// partial-funding recovery path, where PrepareWallets returned before starting
+// that watcher. It stops with the spammer context.
+func maintainWalletFunding(ctx context.Context, pool *spamoor.WalletPool, logger logrus.FieldLogger) {
+	const normalInterval = 10 * time.Minute
+	const retryInterval = time.Minute
+	timer := time.NewTimer(normalInterval)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			interval := normalInterval
+			if err := fundShortWallets(ctx, pool); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				logger.Warnf("could not check and refill recovered child wallets: %v", err)
+				interval = retryInterval
+			}
+			timer.Reset(interval)
+		}
+	}
+}
+
+// fundShortWallets refreshes every child from the normal RPC and tops up only
+// those below the configured 1 ETH working threshold. Requests are sent one by
+// one: this is a recovery path entered specifically because a bulk funding send
+// filled the txpool.
+func fundShortWallets(ctx context.Context, pool *spamoor.WalletPool) error {
+	client := pool.GetClient(spamoor.WithClientSelectionMode(spamoor.SelectClientByIndex, 0))
+	if client == nil {
+		return scenario.ErrNoClients
+	}
+
+	threshold := utils.EtherToWei(uint256.NewInt(1))
+	refill := utils.EtherToWei(uint256.NewInt(perWalletFundingEth))
+	for _, wallet := range pool.GetAllWallets() {
+		if err := client.UpdateWallet(ctx, wallet); err != nil {
+			return fmt.Errorf("refresh child wallet %s: %w", wallet.GetAddress().Hex(), err)
+		}
+		balance, overflow := uint256.FromBig(wallet.GetBalance())
+		if overflow {
+			return fmt.Errorf("child wallet %s balance overflows uint256", wallet.GetAddress().Hex())
+		}
+		if balance.Cmp(threshold) >= 0 {
+			continue
+		}
+
+		amount := new(uint256.Int).Set(refill)
+		if needed := new(uint256.Int).Sub(threshold, balance); needed.Cmp(amount) > 0 {
+			amount = needed
+		}
+		if err := pool.FundAddresses([]*spamoor.FundingRequest{{
+			Wallet:  wallet,
+			Amount:  amount,
+			IsEmpty: wallet.GetNonce() == 0 && wallet.GetBalance().Sign() == 0,
+		}}); err != nil {
+			return fmt.Errorf("fund child wallet %s: %w", wallet.GetAddress().Hex(), err)
+		}
+	}
+	return nil
 }
 
 // isTransientFundingErr matches mempool-pressure errors that clear as blocks
@@ -217,21 +303,34 @@ func submitCall(ctx context.Context, locks *walletLocker, pool *spamoor.WalletPo
 		return nil, client, wallet, fmt.Errorf("failed to build tx: %w", err)
 	}
 
-	tx, err := wallet.BuildDynamicFeeTx(txData)
+	// Do not reserve a nonce until the front accepts the transaction. Spamoor's
+	// MarkSkippedNonce cannot reclaim a freshly reserved nonce when the wallet's
+	// confirmed nonce is still zero, which previously produced nonce 1 while the
+	// front correctly expected nonce 0. The per-wallet lock makes this explicit
+	// peek/sign/submit/advance sequence safe.
+	nonce := wallet.GetNonce()
+	tx, err := wallet.ReplaceDynamicFeeTx(txData, nonce)
 	if err != nil {
 		return nil, client, wallet, fmt.Errorf("failed to sign tx: %w", err)
 	}
 
 	if err := sendRawTxToFront(ctx, frontURL, tx); err != nil {
-		if frontRejectAlreadyHeld(err.Error(), tx.Nonce()) {
-			// Already admitted: keep the nonce consumed (skipping breaks
-			// contiguity) and report success so the caller awaits the receipt.
-			return tx, client, wallet, nil
+		if expected, ok := frontExpectedNonce(err.Error()); ok && nonce < expected {
+			// The front already holds earlier nonces, usually after an ambiguous
+			// HTTP result or a spammer restart. Catch local accounting up, but do
+			// not pretend this newly-built hash was admitted and await it forever.
+			for wallet.GetNonce() < expected {
+				wallet.GetNextNonce()
+			}
+			return tx, client, wallet, fmt.Errorf("front already holds nonce %d; advanced local next nonce to %d: %w", nonce, expected, err)
 		}
-		// Genuine rejection: release the nonce to keep the chain contiguous.
-		wallet.MarkSkippedNonce(tx.Nonce())
 		return tx, client, wallet, fmt.Errorf("front submit: %w", err)
 	}
+
+	// Admission succeeded, so consume exactly the nonce we just signed and make
+	// the custom front submission visible to Spamoor's block statistics.
+	wallet.GetNextNonce()
+	wallet.IncrementSubmittedTxCount()
 	return tx, client, wallet, nil
 }
 
@@ -240,18 +339,18 @@ func submitCall(ctx context.Context, locks *walletLocker, pool *spamoor.WalletPo
 // "expected N") avoids reading an unrelated rejection as a resubmit.
 var reFrontHeldNonce = regexp.MustCompile(`expected (\d+) \(on-chain \d+ \+ \d+ held\)`)
 
-// frontRejectAlreadyHeld reports whether a rejection is that contiguity error
-// for a nonce already admitted (below the expected next) — a benign resubmit.
-func frontRejectAlreadyHeld(errMsg string, txNonce uint64) bool {
+// frontExpectedNonce extracts the front's next contiguous nonce from an
+// admission rejection.
+func frontExpectedNonce(errMsg string) (uint64, bool) {
 	m := reFrontHeldNonce.FindStringSubmatch(errMsg)
 	if m == nil {
-		return false
+		return 0, false
 	}
 	expected, err := strconv.ParseUint(m[1], 10, 64)
 	if err != nil {
-		return false
+		return 0, false
 	}
-	return txNonce < expected
+	return expected, true
 }
 
 // sendRawTxToFront POSTs a signed tx to a cross-chain front. A JSON-RPC "error"
@@ -269,11 +368,20 @@ func sendRawTxToFront(ctx context.Context, frontURL string, tx *types.Transactio
 	if e, ok := resp["error"]; ok && len(e) > 0 && string(e) != "null" {
 		return fmt.Errorf("front rejected: %s", string(e))
 	}
+	var result string
+	if r, ok := resp["result"]; !ok || len(r) == 0 || string(r) == "null" {
+		return fmt.Errorf("front returned no transaction hash")
+	} else if err := json.Unmarshal(r, &result); err != nil {
+		return fmt.Errorf("decode front transaction hash: %w", err)
+	}
+	if !strings.EqualFold(result, tx.Hash().Hex()) {
+		return fmt.Errorf("front returned transaction hash %q, want %s", result, tx.Hash().Hex())
+	}
 	return nil
 }
 
 // waitInclusion polls the front (which forwards reads to the source chain) for
-// tx's receipt until it appears or timeout. Status is not inspected.
+// tx's successful receipt until it appears or timeout.
 func waitInclusion(ctx context.Context, frontURL string, hash common.Hash, timeout time.Duration) error {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -283,6 +391,20 @@ func waitInclusion(ctx context.Context, frontURL string, hash common.Hash, timeo
 	for {
 		if resp, err := rpcPost(cctx, frontURL, body); err == nil {
 			if r, ok := resp["result"]; ok && len(r) > 0 && string(r) != "null" {
+				var receipt struct {
+					Status string `json:"status"`
+				}
+				if err := json.Unmarshal(r, &receipt); err != nil {
+					return fmt.Errorf("decode receipt for %s: %w", hash.Hex(), err)
+				}
+				statusText := strings.TrimPrefix(strings.ToLower(receipt.Status), "0x")
+				status, err := strconv.ParseUint(statusText, 16, 64)
+				if err != nil {
+					return fmt.Errorf("decode receipt status %q for %s: %w", receipt.Status, hash.Hex(), err)
+				}
+				if status != types.ReceiptStatusSuccessful {
+					return fmt.Errorf("transaction %s was included but reverted", hash.Hex())
+				}
 				return nil
 			}
 		}
@@ -309,6 +431,9 @@ func rpcPost(ctx context.Context, url, body string) (map[string]json.RawMessage,
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("rpc returned HTTP %s: %s", resp.Status, string(data))
 	}
 	var out map[string]json.RawMessage
 	if err := json.Unmarshal(data, &out); err != nil {
