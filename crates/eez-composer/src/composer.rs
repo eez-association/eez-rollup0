@@ -25,9 +25,10 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use async_trait::async_trait;
 use eez_driver::{
     BlockCommitterHandle, ParentContext, SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
+    witness::{ExecutionWitnessMode, block_witness},
 };
 use eez_l1::{BundleTarget, L1Event, L1Watcher, SendOutcome, Submitter};
-use eez_prover::Prover;
+use eez_prover::{BlockWitness, Prover};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
@@ -37,7 +38,7 @@ use tracing::{Level, event};
 
 use crate::held_pool::HeldTx;
 use crate::ingress::Direction;
-use crate::local::build_sync_block;
+use crate::local::{build_sync_block, sync_block_pair_roots};
 use crate::optimistic::OptimisticallyIncluded;
 use crate::rollup::RollupState;
 
@@ -219,6 +220,9 @@ struct Inner<L2: BlockReader> {
     /// uses it to reorg the L2 head when an optimistically-committed
     /// Sync block's bundle fails on L1.
     committer: std::sync::OnceLock<BlockCommitterHandle<EthEngineTypes>>,
+    /// Per-block witnesses for [`eez_prover::ProvingContext::blocks`]. Set only
+    /// in remote-prover mode; `None` (mock) leaves `blocks` empty.
+    witness_source: std::sync::OnceLock<Arc<dyn eez_prover::ProvingWitnessSource>>,
 }
 
 impl<L2: BlockReader> std::fmt::Debug for Composer<L2> {
@@ -266,8 +270,14 @@ where
                 cc_exec_ctx,
                 l2_entry_client,
                 committer: std::sync::OnceLock::new(),
+                witness_source: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// Wire the proving-witness source (remote-prover mode only). Later calls no-op.
+    pub fn set_witness_source(&self, src: Arc<dyn eez_prover::ProvingWitnessSource>) {
+        let _ = self.inner.witness_source.set(src);
     }
 
     /// Wire the `BlockCommitter` handle after the Sequencer spawns the
@@ -666,15 +676,10 @@ where
         }
 
         let pool_len_before = pool.len();
-        // Cap drain to N user_txs per bundle. rbuilder-chiado has shown
-        // partial-inclusion when bundles carry more than ~3 user_txs:
-        // postBatch lands, but only a prefix of the user_txs makes it
-        // into the block — the rest are silently excluded by rbuilder
-        // and effectively lost. Capping keeps every bundle's contents
-        // 100% atomic; a backlog spills into the next Sync slot. 3 is the
-        // safe default; raise EEZ_MAX_USER_TXS_PER_BUNDLE only against a
-        // builder proven to include larger bundles atomically (measure the
-        // never-mined count first — a wrong bump silently loses user_txs).
+        // Cap user_txs per bundle. A bundle is all-or-nothing, so if one tx
+        // can't be included at build time the whole bundle drops and re-queues;
+        // a smaller bundle bounds how many good txs a single drop takes down.
+        // Overflow drains over later slots. 3 is a default, not a builder limit.
         let max_user_txs = std::env::var("EEZ_MAX_USER_TXS_PER_BUNDLE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -1420,13 +1425,14 @@ where
         // ── Build the rich Sync block + postBatch from survivors. A ──
         // ── build / prepare failure here is systemic (not one tx) →  ──
         // ── re-queue survivors and degrade to minimal.               ──
+        let sync_txs = eez_evm::system_tx::interleave_sync_block_txs(&pairs);
         let built = match build_sync_block(
             rollup.l2_provider.as_ref(),
             &self.inner.evm_config,
             parent_header,
             timestamp,
             suggested_fee_recipient,
-            &eez_evm::system_tx::interleave_sync_block_txs(&pairs),
+            &sync_txs,
         ) {
             Ok(b) => b,
             Err(e) => {
@@ -1436,6 +1442,43 @@ where
                     rollup_id,
                     error = %e,
                     "build_sync_block failed; re-queueing survivors, degrading to minimal postBatch",
+                );
+                if let Some(pool) = rollup.held_pool.as_ref() {
+                    pool.push_front_batch(survivors);
+                }
+                return self
+                    .dispatch_minimal_postbatch(
+                        ctx,
+                        rollup_id,
+                        rollup,
+                        parent_header,
+                        timestamp,
+                        suggested_fee_recipient,
+                        bundle_target,
+                    )
+                    .await;
+            }
+        };
+        // Per-effect intermediate L2 roots: the prover requires each entry's
+        // `newState` to be its own effect's root, not the final Sync-block root.
+        // Failure here is systemic (like build/prepare) → degrade.
+        let pair_roots = match sync_block_pair_roots(
+            rollup.l2_provider.as_ref(),
+            &self.inner.evm_config,
+            parent_header,
+            timestamp,
+            suggested_fee_recipient,
+            &sync_txs,
+            ctx.ccm_l2_address,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                event!(
+                    name: "eez.composer.phase2.pair_roots_failed",
+                    Level::WARN,
+                    rollup_id,
+                    error = %e,
+                    "sync_block_pair_roots failed; re-queueing survivors, degrading to minimal postBatch",
                 );
                 if let Some(pool) = rollup.held_pool.as_ref() {
                     pool.push_front_batch(survivors);
@@ -1467,6 +1510,8 @@ where
                 &comp_refs,
                 parent_header,
                 built.header.state_root(),
+                &built.block,
+                &pair_roots,
                 &outbound_entries,
                 &outbound_user_txs,
             )
@@ -1585,6 +1630,8 @@ where
                 &[], // no compositions → leading immediate only
                 parent_header,
                 empty_built.header.state_root(),
+                &empty_built.block,
+                &[], // no cross-chain effects → no per-effect roots
                 &[], // no outbound entries
                 &[], // no outbound user txs
             )
@@ -1665,6 +1712,28 @@ where
         ));
     }
 
+    /// Witness for the window's endpoint — the just-built Sync block. It isn't
+    /// committed yet (the Sequencer applies the payload afterward), so no store
+    /// or provider can serve it; re-execute it on its parent's state via the
+    /// same augmented path the node uses at commit. Remote-prover mode only.
+    ///
+    /// # Errors
+    ///
+    /// `String` if re-execution / witness augmentation fails.
+    fn endpoint_witness(
+        &self,
+        l2_provider: &L2,
+        block: &reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>,
+    ) -> Result<BlockWitness, String> {
+        block_witness(
+            l2_provider,
+            &self.inner.evm_config,
+            block,
+            ExecutionWitnessMode::Legacy,
+        )
+        .map_err(|e| format!("endpoint witness (block {}): {e}", block.header().number()))
+    }
+
     /// Build + sign the L1 `postBatch` raw tx for a Sync slot's
     /// compositions, covering blocks `posted+1..=parent+1` (intermediate
     /// blocks + the new Sync block at `parent+1`, always the range's last
@@ -1682,9 +1751,9 @@ where
     /// stitches the merged entries so `entries[k].currentState ==
     /// entries[k-1].newState` per rollup; EEZ.sol's `_applyStateDeltas`
     /// enforces the chain on L1 (`StateRootMismatch` revert) regardless of
-    /// proof system. `sync_block_state_root` (the locally-built Sync
-    /// block's actual root — rich for Phase 2, empty for Phase 1) anchors
-    /// the last entry's `newState` for our rollup.
+    /// proof system. Each effect entry's `newState` is its per-effect root from
+    /// `pair_roots` (required by the prover's `verify_effect_prefix_roots`); the
+    /// last is the final Sync-block root. `sync_block_state_root` is telemetry only.
     ///
     /// # Errors
     ///
@@ -1697,6 +1766,8 @@ where
         compositions: &[&eez_protocol::Composition<eez_evm::EvmProtocol>],
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         sync_block_state_root: B256,
+        sync_block: &reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>,
+        pair_roots: &[B256],
         outbound_entries: &[eez_evm::types::ExecutionEntrySol],
         outbound_user_txs: &[Bytes],
     ) -> Result<Bytes, String> {
@@ -1709,13 +1780,6 @@ where
         // progression. We build the batch from scratch (no per-tx
         // batch to merge from); only the leading immediate entry +
         // proof-system metadata go in.
-
-        let proof = self
-            .inner
-            .prover
-            .prove(eez_prover::ProvingContext)
-            .await
-            .map_err(|e| format!("prover.prove: {e}"))?;
 
         // Take the first composition's batch as the template, then
         // merge every later composition's entries + lookupCalls into
@@ -1819,7 +1883,12 @@ where
         // `_applyStateDeltas` no-ops and the L2 root never settles. Direction by
         // `proxyEntryHash`: outbound (== 0) → `-V` (via `outbound_ether_out`; None =
         // multi-call-with-value, unsupported → reject); inbound (!= 0) → `+V` deposit.
-        // Value-free → 0. `currentState` is a placeholder fixed by the stitch below.
+        // Value-free → 0.
+        // `newState` = effect `k`'s per-effect root `pair_roots[k]`; entries are
+        // ordered `[outbound… | inbound…]`, matching the Sync block's pair-ends.
+        // The prover requires this exact per-entry value. `currentState` is fixed
+        // by the stitch below.
+        let mut effect_k = 0usize;
         for entry in &mut batch.inner.entries {
             if !entry.stateDeltas.is_empty() {
                 continue;
@@ -1845,18 +1914,34 @@ where
                     .copied()
                     .unwrap_or(alloy_primitives::I256::ZERO)
             };
+            let new_state = *pair_roots.get(effect_k).ok_or_else(|| {
+                format!(
+                    "settlement stitch: effect entry {effect_k} has no per-effect root \
+                     (only {} pair-end roots — pair-end/entry misalignment)",
+                    pair_roots.len(),
+                )
+            })?;
             entry.stateDeltas = vec![eez_evm::types::StateDeltaSol {
                 rollupId: rollup_id_u256,
                 currentState: B256::ZERO,
-                newState: sync_block_state_root,
+                newState: new_state,
                 etherDelta: ether_delta,
             }];
+            effect_k += 1;
+        }
+        if effect_k != pair_roots.len() {
+            return Err(format!(
+                "settlement stitch: {effect_k} effect entries but {} per-effect roots \
+                 (pair-end/entry misalignment)",
+                pair_roots.len(),
+            ));
         }
 
         // Stitch the per-rollup stateDelta chain: EEZ.sol `_applyStateDeltas`
         // enforces `config.stateRoot == delta.currentState` then sets it to
         // `newState`, so each entry's `currentState` must chain to the prior
-        // entry's `newState` (the anchor keeps its own first `currentState`).
+        // entry's `newState`. This chains `pre_sync → R_0 → … → R_last (final
+        // root)`, satisfying both EEZ.sol and the prover's effect-prefix gate.
         let mut running_roots: HashMap<U256, B256> = HashMap::new();
         for entry in &mut batch.inner.entries {
             for delta in &mut entry.stateDeltas {
@@ -1867,21 +1952,18 @@ where
             }
         }
 
-        // Anchor the real root to the LAST OUTBOUND entry (its L2→L1 call settles
-        // IN this block); fall back to the last entry for inbound-only. Explicit
-        // last-outbound matters for a MIXED batch, where `entries.last()` is an
-        // inbound deferred entry, not the outbound one.
-        let anchor_idx = batch
-            .inner
-            .entries
-            .iter()
-            .rposition(|e| e.proxyEntryHash == B256::ZERO && !e.l2ToL1Calls.is_empty())
-            .or_else(|| batch.inner.entries.len().checked_sub(1));
-        if let Some(anchor_entry) = anchor_idx.and_then(|idx| batch.inner.entries.get_mut(idx)) {
-            for delta in anchor_entry.stateDeltas.iter_mut().rev() {
-                if delta.rollupId == rollup_id_u256 {
-                    delta.newState = sync_block_state_root;
-                    break;
+        // Anchor-only batch (no effects): the immediate is the last entry, so it
+        // must carry the final root. An empty Sync block still mutates state
+        // (EIP-2935 / EIP-4788 system writes), so `parent.stateRoot` differs from
+        // the re-executed final root and the endpoint gate would fail. With
+        // effects, the last effect's root already is the final root.
+        if pair_roots.is_empty() {
+            if let Some(last) = batch.inner.entries.last_mut() {
+                for delta in last.stateDeltas.iter_mut().rev() {
+                    if delta.rollupId == rollup_id_u256 {
+                        delta.newState = sync_block_state_root;
+                        break;
+                    }
                 }
             }
         }
@@ -1900,7 +1982,6 @@ where
             rollupId: U256::from(ctx.l2_rollup_id),
             proofSystemIndex: vec![0u64],
         }];
-        batch.inner.proofs = vec![proof];
         // Encode the full L2 block range this batch covers, not just the
         // Sync block: the composer accumulates K-1 intermediate Live
         // blocks between Sync slots (Rollup-1 §1.3) and the deriver must
@@ -2052,6 +2133,46 @@ where
         let payload = eez_payload_codec::encode(&blocks, &l2_entries_bytes)
             .map_err(|e| format!("eez_payload_codec::encode: {e}"))?;
         batch.inner.callData = alloy_primitives::Bytes::from(payload);
+
+        // Prove the assembled window (proofs[] empty — not part of the
+        // publicInputsHash). Mock ignores the context; a remote prover re-executes
+        // `blocks`. Settlement path, off block production.
+        let blocks = match self.inner.witness_source.get() {
+            // Remote-prover mode. Intermediate blocks `[from..sync)` are committed
+            // (served by the witness store); the just-built endpoint isn't, so
+            // capture it here from the in-memory block.
+            Some(src) => {
+                let l2_provider = &self
+                    .inner
+                    .rollups
+                    .get(&rollup_id)
+                    .ok_or_else(|| format!("unknown rollup_id {rollup_id}"))?
+                    .l2_provider;
+                let mut ws = (from..sync_block_number)
+                    .map(|n| src.block_witness(n))
+                    .collect::<Result<Vec<_>, String>>()
+                    .map_err(|e| format!("witness_source: {e}"))?;
+                ws.push(self.endpoint_witness(l2_provider.as_ref(), sync_block)?);
+                ws
+            }
+            // Mock mode: the mock prover ignores per-block witnesses.
+            None => Vec::new(),
+        };
+        let proving_ctx = eez_prover::ProvingContext {
+            rollup_id,
+            from_block: from,
+            to_block: sync_block_number,
+            batch: batch.clone(),
+            blocks,
+            l1_block_hash: None, // timeless batch (blockNumber 0)
+        };
+        let proof = self
+            .inner
+            .prover
+            .prove(proving_ctx)
+            .await
+            .map_err(|e| format!("prover.prove: {e}"))?;
+        batch.inner.proofs = vec![proof];
 
         let calldata = postAndVerifyBatchCall {
             batch: batch.inner.clone(),
