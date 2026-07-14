@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use alloy_eips::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_provider::Provider as _;
 use async_trait::async_trait;
 use eez_driver::{
     BlockCommitterHandle, ParentContext, SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
@@ -169,6 +170,43 @@ async fn read_rollup_escrow(provider: &alloy_provider::RootProvider, rid: u64) -
         .await
         .ok()
         .map(|r| r.etherBalance)
+}
+
+async fn inbound_source_nonce_advanced(
+    ctx: &CrossChainExecCtx,
+    tx: &HeldTx,
+) -> Result<bool, String> {
+    if tx.direction != Direction::Inbound {
+        return Ok(false);
+    }
+    let on_chain = ctx
+        .l1_provider
+        .get_transaction_count(tx.sender)
+        .pending()
+        .await
+        .map_err(|e| format!("source-chain nonce lookup failed: {e}"))?;
+    Ok(on_chain > tx.nonce)
+}
+
+fn poison_gap_for(gaps: &[(Address, Direction, u64)], tx: &HeldTx) -> Option<u64> {
+    gaps.iter()
+        .filter(|(sender, direction, nonce)| {
+            tx.sender == *sender && tx.direction == *direction && tx.nonce > *nonce
+        })
+        .map(|(_, _, nonce)| *nonce)
+        .min()
+}
+
+fn push_poison_root(
+    poison: &mut Vec<HeldTx>,
+    poison_gaps: &mut Vec<(Address, Direction, u64)>,
+    tx: HeldTx,
+) {
+    let gap = (tx.sender, tx.direction, tx.nonce);
+    if !poison_gaps.contains(&gap) {
+        poison_gaps.push(gap);
+    }
+    poison.push(tx);
 }
 
 /// Composer umbrella. Cheaply [`Clone`]able (`Arc<Inner>`).
@@ -400,9 +438,7 @@ where
                         "L1 reorg rolled out optimistic batches; re-queueing their user_txs",
                     );
                     if let Some(pool) = rollup.held_pool.as_ref() {
-                        for tx in txs {
-                            pool.push(tx);
-                        }
+                        pool.push_front_batch(txs);
                     }
                 }
             }
@@ -432,6 +468,9 @@ where
                         for (sync_height, post_batch_hash, txs) in finalized {
                             match submitter.receipt_exists(post_batch_hash).await {
                                 Ok(true) => {
+                                    if let Some(pool) = held_pool.as_ref() {
+                                        pool.release_in_flight_batch(&txs);
+                                    }
                                     event!(
                                         name: "eez.composer.finality_audit.ok",
                                         Level::DEBUG,
@@ -473,6 +512,9 @@ where
                                         error = %err,
                                         "finality-audit receipt lookup failed; ledger entry dropped UNAUDITED",
                                     );
+                                    if let Some(pool) = held_pool.as_ref() {
+                                        pool.release_in_flight_batch(&txs);
+                                    }
                                 }
                             }
                         }
@@ -581,7 +623,10 @@ where
         // While blocked the slot still gets its (empty) Sync block — L2
         // cadence is unconditional; the next postBatch covers it.
         let cursor = rollup.l1_head.cursor();
-        rollup.optimistic.resolve_below_cursor(cursor);
+        let newly_settled = rollup.optimistic.resolve_below_cursor(cursor);
+        if !newly_settled.is_empty() {
+            pool.release_in_flight_batch(&newly_settled);
+        }
 
         // ── Slot-context failure recovery ────────────────────────────
         // The observer task only RECORDS verdicts; the destructive
@@ -725,7 +770,7 @@ where
                     evm_composer,
                     ctx,
                     rollup_id,
-                    drained,
+                    drained.clone(),
                     &parent_header,
                     timestamp,
                     suggested_fee_recipient,
@@ -754,13 +799,14 @@ where
                         error = %err,
                         "cross-chain compose failed; Sequencer will commit an empty Sync block via fallback",
                     );
+                    pool.push_front_batch(drained);
                     None
                 }
             };
         }
 
         let drained_raw_txs: Vec<Bytes> = drained.iter().map(|h| h.raw_tx.clone()).collect();
-        match build_sync_block(
+        let fallback = match build_sync_block(
             rollup.l2_provider.as_ref(),
             &self.inner.evm_config,
             &parent_header,
@@ -794,7 +840,9 @@ where
                 );
                 None
             }
-        }
+        };
+        pool.release_in_flight_batch(&drained);
+        fallback
     }
 }
 
@@ -849,6 +897,9 @@ where
             // roll it back again, and every postBatch in between
             // anchors against the wrong root.
             if rollup.l1_head.cursor() >= sync_height {
+                if let Some(pool) = rollup.held_pool.as_ref() {
+                    pool.release_in_flight_batch(&failed.txs);
+                }
                 event!(
                     name: "eez.composer.recovery.stale_verdict",
                     Level::WARN,
@@ -900,6 +951,7 @@ where
         if let Some(pool) = rollup.held_pool.as_ref() {
             let submitter = &self.inner.submitter;
             let mut keep: Vec<crate::HeldTx> = Vec::with_capacity(failed.txs.len());
+            let mut release: Vec<crate::HeldTx> = Vec::new();
             let mut dropped = 0usize;
             let mut evicted_chains: Vec<(alloy_primitives::Address, Direction, u64)> = Vec::new();
             // slot_skipped: re-queue without counting toward poison-eviction
@@ -908,6 +960,7 @@ where
             for mut tx in failed.txs {
                 if let Ok(true) = submitter.receipt_exists(tx.hash).await {
                     dropped += 1;
+                    release.push(tx.clone());
                     event!(
                         name: "eez.composer.recovery.nonce_burned",
                         Level::WARN,
@@ -931,6 +984,7 @@ where
                     tx.attempts += 1;
                     if tx.attempts >= MAX_BUNDLE_ATTEMPTS {
                         dropped += 1;
+                        release.push(tx.clone());
                         evicted_chains.push((tx.sender, tx.direction, tx.nonce));
                         event!(
                             name: "eez.composer.recovery.poison_evicted",
@@ -961,6 +1015,7 @@ where
                         t.sender == *sender && t.direction == *direction && t.nonce > *nonce;
                     if cascade {
                         dropped += 1;
+                        release.push(t.clone());
                         event!(
                             name: "eez.composer.recovery.nonce_chain_evicted",
                             Level::WARN,
@@ -989,6 +1044,7 @@ where
                 }
             }
             let re_pushed = keep.len();
+            pool.release_in_flight_batch(&release);
             pool.push_front_batch(keep);
             if re_pushed > 0 || dropped > 0 {
                 event!(
@@ -1112,6 +1168,8 @@ where
         // in one slot can't collectively over-drain. `None` = not yet read.
         let mut escrow_remaining: Option<U256> = None;
         let mut poison: Vec<HeldTx> = Vec::new();
+        let mut poison_gaps: Vec<(Address, Direction, u64)> = Vec::new();
+        let mut stale: Vec<HeldTx> = Vec::new();
         // On a transient failure we abort the slot; this holds the error
         // string + the txs still needing re-queue (the failing tx + the
         // unprocessed remainder; survivors are added below).
@@ -1119,6 +1177,47 @@ where
 
         let mut iter = drained.into_iter().enumerate();
         while let Some((idx, held)) = iter.next() {
+            if let Some(gap_at) = poison_gap_for(&poison_gaps, &held) {
+                event!(
+                    name: "eez.composer.cc_compose.poison_chain_evicted",
+                    Level::WARN,
+                    rollup_id,
+                    tx_idx = idx,
+                    tx_hash = %held.hash,
+                    sender = %held.sender,
+                    nonce = held.nonce,
+                    gap_at,
+                    "same-sender tx above an evicted poison nonce in the same drain; evicted (resubmit in order)",
+                );
+                poison.push(held);
+                continue;
+            }
+            match inbound_source_nonce_advanced(ctx, &held).await {
+                Ok(true) => {
+                    event!(
+                        name: "eez.composer.cc_compose.stale_nonce_evicted",
+                        Level::WARN,
+                        rollup_id,
+                        tx_idx = idx,
+                        tx_hash = %held.hash,
+                        sender = %held.sender,
+                        nonce = held.nonce,
+                        "inbound held tx nonce is already below source-chain pending nonce; evicting stale tx",
+                    );
+                    stale.push(held);
+                    continue;
+                }
+                Ok(false) => {}
+                Err(err) => event!(
+                    name: "eez.composer.cc_compose.source_nonce_check_failed",
+                    Level::WARN,
+                    rollup_id,
+                    tx_idx = idx,
+                    tx_hash = %held.hash,
+                    error = %err,
+                    "source-chain nonce preflight failed; proceeding with simulation",
+                ),
+            }
             // ── OUTBOUND (L2→L1) arm. Source-sim runs against the L2 ENTRY client
             // (the L2 follower errors `Unavailable`). Stage each (settlement entry,
             // its user tx); the load tx is built post-drain by the canonical
@@ -1132,7 +1231,7 @@ where
                         tx_hash = %held.hash,
                         "outbound tx but no L2 entry client wired (no embedded L1); evicting",
                     );
-                    poison.push(held);
+                    push_poison_root(&mut poison, &mut poison_gaps, held);
                     continue;
                 };
                 match evm_composer
@@ -1158,7 +1257,7 @@ where
                                 tx_hash = %held.hash,
                                 "outbound tx produced no L1 settlement entry; evicting (resubmit required)",
                             );
-                            poison.push(held);
+                            push_poison_root(&mut poison, &mut poison_gaps, held);
                             continue;
                         }
                         // Block multicall outbound (not supported yet) on the axis
@@ -1181,7 +1280,7 @@ where
                                 entries = l1_entries.len(),
                                 "outbound tx made multiple cross-chain calls (multicall); not supported yet — evicting (resubmit required)",
                             );
-                            poison.push(held);
+                            push_poison_root(&mut poison, &mut poison_gaps, held);
                             continue;
                         }
                         // Evict a withdrawal that would exceed the rollup's L1 escrow —
@@ -1191,7 +1290,7 @@ where
                         let Some(need) = eez_evm::entries::outbound_ether_out(&l1_entries[0])
                         else {
                             event!(name: "eez.composer.cc_compose.outbound_ether_out_missing", Level::WARN, rollup_id, tx_idx = idx, tx_hash = %held.hash, "outbound tx is missing ether out entry, likely malformed; evicting");
-                            poison.push(held);
+                            push_poison_root(&mut poison, &mut poison_gaps, held);
                             continue;
                         };
                         if need > U256::ZERO {
@@ -1211,7 +1310,7 @@ where
                                         escrow = %avail,
                                         "outbound withdrawal exceeds L1 rollup escrow; evicting at compose time (would revert InsufficientRollupBalance on L1 — resubmit required)",
                                     );
-                                    poison.push(held);
+                                    push_poison_root(&mut poison, &mut poison_gaps, held);
                                     continue;
                                 }
                                 escrow_remaining = Some(avail - need);
@@ -1237,7 +1336,7 @@ where
                             error = %e,
                             "outbound tx fails simulation deterministically; evicting",
                         );
-                        poison.push(held);
+                        push_poison_root(&mut poison, &mut poison_gaps, held);
                     }
                     Err(e) => {
                         let mut rest = vec![held];
@@ -1289,7 +1388,7 @@ where
                         error = %e,
                         "held tx fails simulation deterministically (e.g. wrong proxy → EmptyCalls, or revert); evicting — it can never compose, resubmit required",
                     );
-                    poison.push(held);
+                    push_poison_root(&mut poison, &mut poison_gaps, held);
                 }
                 Err(e) => {
                     // Transient (provider / transport / unavailable) —
@@ -1319,6 +1418,8 @@ where
                     );
                 }
             }
+            pool.release_in_flight_batch(&poison);
+            pool.release_in_flight_batch(&stale);
         }
 
         // ── Transient abort: re-queue survivors + remainder, minimal. ──
@@ -1334,6 +1435,25 @@ where
             if let Some(pool) = rollup.held_pool.as_ref() {
                 let mut requeue = survivors;
                 requeue.extend(rest);
+                let mut cascade_evicted = Vec::new();
+                requeue.retain(|tx| {
+                    let Some(gap_at) = poison_gap_for(&poison_gaps, tx) else {
+                        return true;
+                    };
+                    event!(
+                        name: "eez.composer.cc_compose.poison_chain_evicted",
+                        Level::WARN,
+                        rollup_id,
+                        tx_hash = %tx.hash,
+                        sender = %tx.sender,
+                        nonce = tx.nonce,
+                        gap_at,
+                        "same-sender unprocessed tx above an evicted poison nonce; evicted instead of re-queued (resubmit in order)",
+                    );
+                    cascade_evicted.push(tx.clone());
+                    false
+                });
+                pool.release_in_flight_batch(&cascade_evicted);
                 pool.push_front_batch(requeue);
             }
             return self
@@ -1352,12 +1472,13 @@ where
         // Every held tx was poison (evicted) → nothing to compose. Still
         // emit a minimal postBatch so L1 keeps tracking L2's progression.
         if survivors.is_empty() {
+            let evicted = poison.len() + stale.len();
             event!(
                 name: "eez.composer.phase2.all_poison",
                 Level::WARN,
                 rollup_id,
-                evicted = poison.len(),
-                "all held txs failed simulation deterministically; emitting minimal postBatch",
+                evicted,
+                "all held txs were stale or failed simulation deterministically; emitting minimal postBatch",
             );
             return self
                 .dispatch_minimal_postbatch(
@@ -1520,6 +1641,7 @@ where
             tx_count = bundle.len(),
             entry_count = total_entries,
             evicted_poison = poison.len(),
+            evicted_stale = stale.len(),
             "rich bundle dispatched to background observer; committing Sync block optimistically",
         );
         rollup.optimistic.begin(
@@ -2247,3 +2369,58 @@ async fn sign_post_batch_tx(
 // `_with_value`) moved into `eez_evm::system_tx` as part of the
 // composer↔deriver single-source-of-truth STF refactor. Call
 // `eez_evm::system_tx::build_inbound_system_txs(...)` from new code.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::TxHash;
+
+    fn held(sender: Address, direction: Direction, nonce: u64, hash_byte: u8) -> HeldTx {
+        HeldTx {
+            raw_tx: Bytes::from(vec![hash_byte; 4]),
+            hash: TxHash::repeat_byte(hash_byte),
+            attempts: 0,
+            sender,
+            nonce,
+            direction,
+        }
+    }
+
+    #[test]
+    fn poison_gap_matches_only_same_chain_higher_nonce() {
+        let sender = Address::repeat_byte(0xa);
+        let other = Address::repeat_byte(0xb);
+        let gaps = vec![(sender, Direction::Inbound, 3)];
+
+        assert_eq!(
+            poison_gap_for(&gaps, &held(sender, Direction::Inbound, 4, 1)),
+            Some(3)
+        );
+        assert_eq!(
+            poison_gap_for(&gaps, &held(sender, Direction::Inbound, 3, 2)),
+            None
+        );
+        assert_eq!(
+            poison_gap_for(&gaps, &held(sender, Direction::Outbound, 4, 3)),
+            None
+        );
+        assert_eq!(
+            poison_gap_for(&gaps, &held(other, Direction::Inbound, 4, 4)),
+            None
+        );
+    }
+
+    #[test]
+    fn push_poison_root_records_gap_once() {
+        let sender = Address::repeat_byte(0xc);
+        let tx = held(sender, Direction::Inbound, 7, 1);
+        let mut poison = Vec::new();
+        let mut gaps = Vec::new();
+
+        push_poison_root(&mut poison, &mut gaps, tx.clone());
+        push_poison_root(&mut poison, &mut gaps, tx);
+
+        assert_eq!(poison.len(), 2);
+        assert_eq!(gaps, vec![(sender, Direction::Inbound, 7)]);
+    }
+}

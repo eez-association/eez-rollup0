@@ -26,6 +26,7 @@ use alloy_provider::{Provider as _, RootProvider};
 use eez_composer::{Direction, HeldPool, HeldTx};
 use http_body_util::{BodyExt as _, Full};
 use hyper::body::Bytes as HyperBytes;
+use hyper::header::CONTENT_LENGTH;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -33,6 +34,8 @@ use hyper_util::rt::TokioIo;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tracing::{Level, event};
+
+const MAX_BODY: usize = 10 * 1024 * 1024;
 
 /// Outcome of the admission gate.
 #[derive(Debug)]
@@ -47,10 +50,10 @@ pub enum Admission {
 /// SOURCE chain (`validation_provider`), and push into `held_pool` with
 /// `direction`.
 ///
-/// The nonce must be contiguous with the sender's held chain for this direction
-/// (`on_chain + held_count_for(sender, direction)`): a gapped held tx would
-/// poison the all-or-nothing bundle and break bundle-mates' chains. `None`
-/// provider skips validation (dev / no-RPC).
+/// The nonce must be contiguous with the sender's queued plus in-flight chain
+/// for this direction (`on_chain + reserved_count_for(sender, direction)`): a
+/// gapped held tx would poison the all-or-nothing bundle and break
+/// bundle-mates' chains. `None` provider skips validation (dev / no-RPC).
 pub async fn gate_and_hold(
     envelope: &TxEnvelope,
     raw_tx: &Bytes,
@@ -63,19 +66,6 @@ pub async fn gate_and_hold(
     };
     let nonce = envelope.nonce();
     if let Some(provider) = validation_provider {
-        // `pending`, not `latest`: count a same-sender tx already in the source
-        // mempool, else a correctly-nonced cross-chain tx collides with it.
-        let on_chain = match provider.get_transaction_count(sender).pending().await {
-            Ok(n) => n,
-            Err(e) => return Admission::Rejected(format!("source-chain nonce lookup failed: {e}")),
-        };
-        let held = held_pool.held_count_for(sender, direction) as u64;
-        let expected = on_chain + held;
-        if nonce != expected {
-            return Admission::Rejected(format!(
-                "invalid nonce {nonce} for {sender}: expected {expected} (on-chain {on_chain} + {held} held)"
-            ));
-        }
         let balance = match provider.get_balance(sender).await {
             Ok(b) => b,
             Err(e) => {
@@ -92,6 +82,28 @@ pub async fn gate_and_hold(
     }
     // keccak256 of the EIP-2718 envelope — the canonical tx hash for legacy and typed txs alike.
     let hash: B256 = keccak256(raw_tx.as_ref());
+    let tx = HeldTx {
+        raw_tx: raw_tx.clone(),
+        hash,
+        attempts: 0,
+        sender,
+        nonce,
+        direction,
+    };
+    if let Some(provider) = validation_provider {
+        let on_chain = match provider.get_transaction_count(sender).pending().await {
+            Ok(n) => n,
+            Err(e) => return Admission::Rejected(format!("source-chain nonce lookup failed: {e}")),
+        };
+        if let Err(err) = held_pool.push_contiguous(tx, on_chain) {
+            return Admission::Rejected(format!(
+                "invalid nonce {nonce} for {sender}: expected {} (on-chain {} + {} queued/in-flight)",
+                err.expected, err.on_chain, err.reserved
+            ));
+        }
+    } else {
+        held_pool.push(tx);
+    }
     event!(
         name: "eez.ingress.cross_chain.push",
         Level::INFO,
@@ -101,14 +113,6 @@ pub async fn gate_and_hold(
         direction = ?direction,
         "cross-chain tx held for next Sync slot",
     );
-    held_pool.push(HeldTx {
-        raw_tx: raw_tx.clone(),
-        hash,
-        attempts: 0,
-        sender,
-        nonce,
-        direction,
-    });
     Admission::Held(hash)
 }
 
@@ -189,6 +193,73 @@ fn json_response(body: String) -> Response<Full<HyperBytes>> {
         .expect("valid response")
 }
 
+fn rpc_error(id: Value, code: i64, message: &str) -> Response<Full<HyperBytes>> {
+    json_response(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "error": { "code": code, "message": message },
+            "id": id,
+        })
+        .to_string(),
+    )
+}
+
+fn body_too_large() -> Response<Full<HyperBytes>> {
+    Response::builder()
+        .status(StatusCode::PAYLOAD_TOO_LARGE)
+        .body(Full::new(HyperBytes::from("request body too large")))
+        .expect("valid response")
+}
+
+async fn collect_body_limited(
+    mut body: hyper::body::Incoming,
+    max: usize,
+) -> Result<Result<HyperBytes, ()>, hyper::Error> {
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if data.len() > max.saturating_sub(out.len()) {
+            return Ok(Err(()));
+        }
+        out.extend_from_slice(&data);
+    }
+    Ok(Ok(HyperBytes::from(out)))
+}
+
+fn content_length_exceeds(req: &Request<hyper::body::Incoming>, max: usize) -> bool {
+    req.headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|len| len > max)
+}
+
+fn batch_has_send_raw(json: &Value) -> bool {
+    matches!(json, Value::Array(items) if items.iter().any(|it| {
+        it.get("method").and_then(Value::as_str) == Some("eth_sendRawTransaction")
+    }))
+}
+
+fn all_forwarded_methods_are_eth(json: &Value) -> bool {
+    let method_allowed = |value: &Value| {
+        value
+            .get("method")
+            .and_then(Value::as_str)
+            .is_some_and(|method| method.starts_with("eth_"))
+    };
+    match json {
+        Value::Object(_) => method_allowed(json),
+        Value::Array(items) if !items.is_empty() => items.iter().all(|item| {
+            method_allowed(item)
+                && item.get("method").and_then(Value::as_str) != Some("eth_sendRawTransaction")
+        }),
+        _ => false,
+    }
+}
+
 async fn handle(
     req: Request<hyper::body::Incoming>,
     ctx: Ctx,
@@ -209,25 +280,38 @@ async fn handle(
             .expect("valid response"));
     }
 
-    const MAX_BODY: usize = 10 * 1024 * 1024;
-    let body_bytes = match req.collect().await {
-        Ok(c) => c.to_bytes(),
+    if content_length_exceeds(&req, MAX_BODY) {
+        return Ok(body_too_large());
+    }
+
+    let body_bytes = match collect_body_limited(req.into_body(), MAX_BODY).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(())) => return Ok(body_too_large()),
         Err(e) => {
             event!(name: "eez.xchain_front.body_read_failed", Level::DEBUG, error = %e, "read body failed");
             return Ok(forward(&ctx, Vec::new()).await);
         }
     };
-    if body_bytes.len() > MAX_BODY {
-        return Ok(Response::builder()
-            .status(StatusCode::PAYLOAD_TOO_LARGE)
-            .body(Full::new(HyperBytes::from("request body too large")))
-            .expect("valid response"));
+
+    let json = match serde_json::from_slice::<Value>(&body_bytes) {
+        Ok(json) => json,
+        Err(_) => return Ok(rpc_error(Value::Null, -32700, "parse error")),
+    };
+
+    // A JSON-RPC batch array would bypass the single-tx intercept and forward a
+    // bundled cross-chain tx straight to the mempool; reject any batch carrying
+    // `eth_sendRawTransaction`.
+    if batch_has_send_raw(&json) {
+        return Ok(rpc_error(
+            Value::Null,
+            -32600,
+            "send cross-chain eth_sendRawTransaction singly, not in a JSON-RPC batch",
+        ));
     }
 
-    // Intercept a single `eth_sendRawTransaction`; batches and every other
-    // method fall through to the transparent forward.
-    if let Ok(json) = serde_json::from_slice::<Value>(&body_bytes)
-        && json.get("method").and_then(Value::as_str) == Some("eth_sendRawTransaction")
+    // Intercept a single `eth_sendRawTransaction`. Undecodable tx bytes fall
+    // through so the upstream RPC produces the standard JSON-RPC error.
+    if json.get("method").and_then(Value::as_str) == Some("eth_sendRawTransaction")
         && let Some(raw_hex) = json
             .get("params")
             .and_then(|p| p.get(0))
@@ -236,20 +320,14 @@ async fn handle(
     {
         return Ok(resp);
     }
-    // A JSON-RPC batch array would bypass the single-tx intercept and forward a
-    // bundled cross-chain tx straight to the mempool; reject any batch carrying
-    // `eth_sendRawTransaction` (read-only batches still forward transparently).
-    if let Ok(Value::Array(items)) = serde_json::from_slice::<Value>(&body_bytes)
-        && items
-            .iter()
-            .any(|it| it.get("method").and_then(Value::as_str) == Some("eth_sendRawTransaction"))
-    {
-        let resp = serde_json::json!({
-            "jsonrpc": "2.0",
-            "error": { "code": -32600, "message": "send cross-chain eth_sendRawTransaction singly, not in a JSON-RPC batch" },
-            "id": Value::Null,
-        });
-        return Ok(json_response(resp.to_string()));
+
+    if !all_forwarded_methods_are_eth(&json) {
+        let id = json.get("id").cloned().unwrap_or(Value::Null);
+        return Ok(rpc_error(
+            id,
+            -32601,
+            "cross-chain front forwards only eth_* JSON-RPC methods",
+        ));
     }
     Ok(forward(&ctx, body_bytes.to_vec()).await)
 }
@@ -315,5 +393,124 @@ async fn forward(ctx: &Ctx, body: Vec<u8>) -> Response<Full<HyperBytes>> {
                 .body(Full::new(HyperBytes::from(format!("upstream error: {e}"))))
                 .expect("valid response")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_consensus::{SignableTransaction, TxEip1559};
+    use alloy_network::TxSignerSync;
+    use alloy_network::eip2718::Encodable2718;
+    use alloy_primitives::{Address, TxKind};
+    use alloy_provider::ProviderBuilder;
+    use alloy_provider::mock::Asserter;
+    use alloy_rpc_types_eth::AccessList;
+    use alloy_signer_local::PrivateKeySigner;
+    use serde_json::json;
+
+    use super::*;
+
+    fn signed_transfer(signer: &PrivateKeySigner, nonce: u64, value: u64) -> (TxEnvelope, Bytes) {
+        let mut tx = TxEip1559 {
+            chain_id: 1,
+            nonce,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(Address::repeat_byte(0x42)),
+            value: U256::from(value),
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        };
+        let sig = signer.sign_transaction_sync(&mut tx).unwrap();
+        let envelope = TxEnvelope::from(tx.into_signed(sig));
+        let raw = Bytes::from(envelope.encoded_2718());
+        (envelope, raw)
+    }
+
+    #[tokio::test]
+    async fn gate_counts_in_flight_nonce_reservations() {
+        let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap();
+        let (first, first_raw) = signed_transfer(&signer, 0, 1);
+        let (same_nonce, same_nonce_raw) = signed_transfer(&signer, 0, 2);
+        let pool = HeldPool::new();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
+
+        for _ in 0..2 {
+            asserter.push_success(&U256::from(1_000_000u64));
+            asserter.push_success(&0_u64);
+        }
+
+        assert!(matches!(
+            gate_and_hold(
+                &first,
+                &first_raw,
+                Direction::Inbound,
+                &pool,
+                Some(&provider),
+            )
+            .await,
+            Admission::Held(_)
+        ));
+
+        let drained = pool.pop_n(1);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(pool.len(), 0);
+        assert_eq!(
+            pool.reserved_count_for(signer.address(), Direction::Inbound),
+            1
+        );
+
+        let rejected = gate_and_hold(
+            &same_nonce,
+            &same_nonce_raw,
+            Direction::Inbound,
+            &pool,
+            Some(&provider),
+        )
+        .await;
+        let Admission::Rejected(message) = rejected else {
+            panic!("same nonce should be rejected while first tx is in flight");
+        };
+        assert!(message.contains("expected 1"));
+        assert!(message.contains("queued/in-flight"));
+    }
+
+    #[test]
+    fn batch_send_raw_is_not_forwardable() {
+        let body = json!([
+            {"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1},
+            {"jsonrpc": "2.0", "method": "eth_sendRawTransaction", "params": ["0xdead"], "id": 2}
+        ]);
+        assert!(batch_has_send_raw(&body));
+        assert!(
+            !all_forwarded_methods_are_eth(&body),
+            "sendRaw batches must be rejected before forwarding"
+        );
+    }
+
+    #[test]
+    fn only_eth_methods_are_forwardable() {
+        assert!(all_forwarded_methods_are_eth(&json!({
+            "jsonrpc": "2.0",
+            "method": "eth_chainId",
+            "params": [],
+            "id": 1
+        })));
+        assert!(all_forwarded_methods_are_eth(&json!([
+            {"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1},
+            {"jsonrpc": "2.0", "method": "eth_getBalance", "params": ["0x0000000000000000000000000000000000000000", "latest"], "id": 2}
+        ])));
+        assert!(!all_forwarded_methods_are_eth(&json!({
+            "jsonrpc": "2.0",
+            "method": "web3_clientVersion",
+            "params": [],
+            "id": 1
+        })));
+        assert!(!all_forwarded_methods_are_eth(&json!([
+            {"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1},
+            {"jsonrpc": "2.0", "method": "admin_peers", "params": [], "id": 2}
+        ])));
     }
 }

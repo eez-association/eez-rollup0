@@ -896,15 +896,7 @@ fn main() -> eyre::Result<()> {
                     "eez-l2-xchain-front",
                 ),
             ] {
-                let Some(port) = env::var(port_env).ok().and_then(|p| p.parse::<u16>().ok()) else {
-                    continue;
-                };
-                let Ok(url) = env::var(url_env) else {
-                    event!(name: "eez.xchain_front.no_upstream", Level::WARN, port_env, url_env, "cross-chain front port set but no upstream RPC; skipping");
-                    continue;
-                };
-                let Ok(parsed) = url.parse::<reqwest::Url>() else {
-                    event!(name: "eez.xchain_front.bad_upstream", Level::WARN, %url, "cross-chain front upstream RPC malformed; skipping");
+                let Some((port, url, parsed)) = read_xchain_front_config(port_env, url_env)? else {
                     continue;
                 };
                 let pool = Arc::clone(&held_pool);
@@ -977,6 +969,44 @@ fn read_l1_rollup_id() -> u64 {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0)
+}
+
+fn read_xchain_front_config(
+    port_env: &str,
+    url_env: &str,
+) -> eyre::Result<Option<(u16, String, reqwest::Url)>> {
+    let port = match env::var(port_env) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(err) => return Err(eyre::eyre!("{port_env} is not valid unicode: {err}")),
+    };
+    let url = match env::var(url_env) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(err) => return Err(eyre::eyre!("{url_env} is not valid unicode: {err}")),
+    };
+    parse_xchain_front_config(port_env, url_env, port.as_deref(), url.as_deref())
+}
+
+fn parse_xchain_front_config(
+    port_env: &str,
+    url_env: &str,
+    port: Option<&str>,
+    url: Option<&str>,
+) -> eyre::Result<Option<(u16, String, reqwest::Url)>> {
+    let Some(port_raw) = port else {
+        return Ok(None);
+    };
+    let port = port_raw
+        .parse::<u16>()
+        .map_err(|err| eyre::eyre!("{port_env}={port_raw:?} malformed: {err}"))?;
+    let Some(url_raw) = url else {
+        return Err(eyre::eyre!("{port_env} is set but {url_env} is missing"));
+    };
+    let parsed = url_raw
+        .parse::<reqwest::Url>()
+        .map_err(|err| eyre::eyre!("{url_env}={url_raw:?} malformed: {err}"))?;
+    Ok(Some((port, url_raw.to_string(), parsed)))
 }
 
 /// Build the [`EmbeddedL1Config`] from env; all vars optional, with dev
@@ -1065,5 +1095,54 @@ fn warn_on_deprecated_env() {
                 "env var is ignored; mode is derived from EEZ_L1_RPC_URL + EEZ_PROOF_SIGNER_KEY presence (see crate docs)."
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xchain_front_absent_port_disables_front() {
+        let parsed = parse_xchain_front_config("PORT", "URL", None, Some("http://127.0.0.1:8545"))
+            .expect("absent port is allowed");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn xchain_front_malformed_port_fails_fast() {
+        let err =
+            parse_xchain_front_config("PORT", "URL", Some("not-a-port"), Some("http://127.0.0.1"))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("PORT=\"not-a-port\" malformed"));
+    }
+
+    #[test]
+    fn xchain_front_missing_upstream_fails_fast() {
+        let err = parse_xchain_front_config("PORT", "URL", Some("8546"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("PORT is set but URL is missing"));
+    }
+
+    #[test]
+    fn xchain_front_malformed_upstream_fails_fast() {
+        let err = parse_xchain_front_config("PORT", "URL", Some("8546"), Some("not a url"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("URL=\"not a url\" malformed"));
+    }
+
+    #[test]
+    fn xchain_front_valid_config_is_returned() {
+        let (port, url, parsed) =
+            parse_xchain_front_config("PORT", "URL", Some("8546"), Some("http://127.0.0.1:8545"))
+                .expect("valid config")
+                .expect("front enabled");
+
+        assert_eq!(port, 8546);
+        assert_eq!(url, "http://127.0.0.1:8545");
+        assert_eq!(parsed.as_str(), "http://127.0.0.1:8545/");
     }
 }

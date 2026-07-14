@@ -9,19 +9,20 @@
 //!
 //! Held-pool drain semantics:
 //!
-//! - [`HeldPool::pop_all`] — empties the pool. Called by the umbrella
-//!   on Sync-slot trigger after the composer's batch is built and the
-//!   bundle is queued for submission. Cross-chain reorg recovery
-//!   (re-injecting pre-composed txs after L1 reorg or bundle drop)
-//!   replays into the pool via [`HeldPool::push`].
+//! - [`HeldPool::pop_all`] — empties the queued pool and reserves the
+//!   drained nonces as in-flight. Called by the umbrella on Sync-slot
+//!   trigger after the composer's batch is built and the bundle is
+//!   queued for submission. Cross-chain reorg recovery (re-injecting
+//!   pre-composed txs after L1 reorg or bundle drop) replays into the
+//!   pool via [`HeldPool::push_front_batch`].
 //! - [`HeldPool::drain_matching`] — removes txs whose hashes appear
 //!   in `consumed`. Called when an external composer's batch lands
 //!   that included some of our held txs (the case-(c) recovery in
 //!   §5.4.9 — those txs are already on-chain, don't re-compose them).
 //!
-//! Concurrency: `Mutex<VecDeque>` keeps the implementation simple.
-//! Held-pool operations are infrequent (per sync slot, per L1 event)
-//! and never hot-path; a finer-grained lock split is premature.
+//! Concurrency: one `Mutex<PoolState>` keeps queue membership, hash
+//! dedupe, and in-flight nonce reservations atomic. Held-pool operations
+//! are infrequent (per sync slot, per L1 event) and never hot-path.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
@@ -37,9 +38,9 @@ pub struct HeldTx {
     /// RLP-encoded source transaction (signed envelope). Handed to
     /// `EvmComposer::simulate_and_resolve` verbatim.
     pub raw_tx: Bytes,
-    /// Cached hash of the signed envelope. Indexed by
-    /// [`HeldPool::by_hash`] for [`HeldPool::drain_matching`] lookups
-    /// — avoids recomputing on every external-batch landing.
+    /// Cached hash of the signed envelope. Indexed for
+    /// [`HeldPool::drain_matching`] lookups — avoids recomputing on
+    /// every external-batch landing.
     pub hash: TxHash,
     /// Failed-bundle attempts so far. Bundles are strict
     /// all-or-nothing, so a deterministically-reverting tx fails every
@@ -65,6 +66,101 @@ pub struct HeldTx {
     pub direction: Direction,
 }
 
+/// Outcome of inserting a held tx.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldInsert {
+    /// The tx was newly inserted into the queued pool.
+    Inserted,
+    /// The tx hash was already queued or in flight; no state changed.
+    Duplicate,
+}
+
+/// A nonce-contiguity admission failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NonceAdmissionError {
+    pub expected: u64,
+    pub on_chain: u64,
+    pub reserved: u64,
+}
+
+#[derive(Debug, Default)]
+struct PoolState {
+    txs: VecDeque<HeldTx>,
+    by_hash: HashMap<TxHash, usize>,
+    in_flight_hashes: HashSet<TxHash>,
+    in_flight_counts: HashMap<(Address, Direction), usize>,
+}
+
+impl PoolState {
+    fn rebuild_index(&mut self) {
+        self.by_hash.clear();
+        for (i, tx) in self.txs.iter().enumerate() {
+            self.by_hash.insert(tx.hash, i);
+        }
+    }
+
+    fn queued_count_for(&self, sender: Address, direction: Direction) -> usize {
+        self.txs
+            .iter()
+            .filter(|t| t.sender == sender && t.direction == direction)
+            .count()
+    }
+
+    fn reserved_count_for(&self, sender: Address, direction: Direction) -> usize {
+        self.queued_count_for(sender, direction)
+            + self
+                .in_flight_counts
+                .get(&(sender, direction))
+                .copied()
+                .unwrap_or(0)
+    }
+
+    fn contains_hash(&self, hash: TxHash) -> bool {
+        self.by_hash.contains_key(&hash) || self.in_flight_hashes.contains(&hash)
+    }
+
+    fn push_back(&mut self, tx: HeldTx) -> HoldInsert {
+        if self.contains_hash(tx.hash) {
+            return HoldInsert::Duplicate;
+        }
+        self.by_hash.insert(tx.hash, self.txs.len());
+        self.txs.push_back(tx);
+        HoldInsert::Inserted
+    }
+
+    fn push_front_recovered(&mut self, tx: HeldTx) -> HoldInsert {
+        self.release_in_flight(&tx);
+        if self.by_hash.contains_key(&tx.hash) {
+            return HoldInsert::Duplicate;
+        }
+        self.txs.push_front(tx);
+        self.rebuild_index();
+        HoldInsert::Inserted
+    }
+
+    fn mark_in_flight(&mut self, tx: &HeldTx) {
+        if self.in_flight_hashes.insert(tx.hash) {
+            *self
+                .in_flight_counts
+                .entry((tx.sender, tx.direction))
+                .or_insert(0) += 1;
+        }
+    }
+
+    fn release_in_flight(&mut self, tx: &HeldTx) {
+        if !self.in_flight_hashes.remove(&tx.hash) {
+            return;
+        }
+        let key = (tx.sender, tx.direction);
+        if let Some(count) = self.in_flight_counts.get_mut(&key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.in_flight_counts.remove(&key);
+            }
+        }
+    }
+}
+
 /// Per-rollup pool of held cross-chain transactions.
 ///
 /// Stored as `Option<HeldPool>` on
@@ -74,12 +170,7 @@ pub struct HeldTx {
 /// chain).
 #[derive(Debug, Default)]
 pub struct HeldPool {
-    /// Insertion-ordered queue. The composer drains in FIFO order so
-    /// sync-slot inclusion order matches submission order.
-    txs: Mutex<VecDeque<HeldTx>>,
-    /// `tx_hash → index in `txs`` lookup for `drain_matching`. Kept
-    /// in sync with `txs` mutations.
-    by_hash: Mutex<HashMap<TxHash, usize>>,
+    state: Mutex<PoolState>,
 }
 
 impl HeldPool {
@@ -92,13 +183,33 @@ impl HeldPool {
     /// Append `tx` to the pool. Idempotent on duplicate hash (later
     /// `push` of an already-held hash is a no-op).
     pub fn push(&self, tx: HeldTx) {
-        let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
-        if by_hash.contains_key(&tx.hash) {
-            return;
+        self.state
+            .lock()
+            .expect("held_pool mutex poisoned")
+            .push_back(tx);
+    }
+
+    /// Append `tx` only if it is contiguous with queued + in-flight txs for
+    /// `(sender, direction)`. Duplicate hashes are accepted as idempotent.
+    pub fn push_contiguous(
+        &self,
+        tx: HeldTx,
+        on_chain: u64,
+    ) -> Result<HoldInsert, NonceAdmissionError> {
+        let mut state = self.state.lock().expect("held_pool mutex poisoned");
+        if state.contains_hash(tx.hash) {
+            return Ok(HoldInsert::Duplicate);
         }
-        let mut txs = self.txs.lock().expect("held_pool txs poisoned");
-        by_hash.insert(tx.hash, txs.len());
-        txs.push_back(tx);
+        let reserved = state.reserved_count_for(tx.sender, tx.direction) as u64;
+        let expected = on_chain.saturating_add(reserved);
+        if tx.nonce != expected {
+            return Err(NonceAdmissionError {
+                expected,
+                on_chain,
+                reserved,
+            });
+        }
+        Ok(state.push_back(tx))
     }
 
     /// Re-queue recovered txs at the FRONT of the pool, preserving
@@ -108,34 +219,38 @@ impl HeldPool {
     /// executing before the retried setValue(1)). Duplicate hashes are
     /// skipped.
     pub fn push_front_batch(&self, recovered: Vec<HeldTx>) {
-        let mut txs = self.txs.lock().expect("held_pool txs poisoned");
-        let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
+        let mut state = self.state.lock().expect("held_pool mutex poisoned");
         for tx in recovered.into_iter().rev() {
-            if by_hash.contains_key(&tx.hash) {
-                continue;
-            }
-            by_hash.insert(tx.hash, 0);
-            txs.push_front(tx);
-        }
-        // Rebuild the index — every position shifted.
-        by_hash.clear();
-        for (i, tx) in txs.iter().enumerate() {
-            by_hash.insert(tx.hash, i);
+            state.push_front_recovered(tx);
         }
     }
 
-    /// Number of held txs from `sender` on the `direction` nonce chain.
-    /// With the contiguity invariant (ingress validation + cascade
-    /// eviction), the sender's next valid nonce in that chain =
-    /// on-chain nonce + this count.
+    /// Number of queued txs from `sender` on the `direction` nonce chain.
     #[must_use]
     pub fn held_count_for(&self, sender: Address, direction: Direction) -> usize {
-        self.txs
+        self.state
             .lock()
-            .expect("held_pool txs poisoned")
-            .iter()
-            .filter(|t| t.sender == sender && t.direction == direction)
-            .count()
+            .expect("held_pool mutex poisoned")
+            .queued_count_for(sender, direction)
+    }
+
+    /// Number of queued plus in-flight txs from `sender` on the `direction`
+    /// nonce chain.
+    #[must_use]
+    pub fn reserved_count_for(&self, sender: Address, direction: Direction) -> usize {
+        self.state
+            .lock()
+            .expect("held_pool mutex poisoned")
+            .reserved_count_for(sender, direction)
+    }
+
+    /// Release txs that were drained into an optimistic bundle and are now
+    /// known not to need nonce reservation anymore.
+    pub fn release_in_flight_batch(&self, txs: &[HeldTx]) {
+        let mut state = self.state.lock().expect("held_pool mutex poisoned");
+        for tx in txs {
+            state.release_in_flight(tx);
+        }
     }
 
     /// Remove and return every held tx from `sender` on the `direction` nonce
@@ -150,22 +265,18 @@ impl HeldPool {
         direction: Direction,
         nonce: u64,
     ) -> Vec<HeldTx> {
-        let mut txs = self.txs.lock().expect("held_pool txs poisoned");
-        let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
+        let mut state = self.state.lock().expect("held_pool mutex poisoned");
         let mut drained = Vec::new();
-        let mut kept = VecDeque::with_capacity(txs.len());
-        for tx in txs.drain(..) {
+        let mut kept = VecDeque::with_capacity(state.txs.len());
+        for tx in state.txs.drain(..) {
             if tx.sender == sender && tx.direction == direction && tx.nonce > nonce {
                 drained.push(tx);
             } else {
                 kept.push_back(tx);
             }
         }
-        *txs = kept;
-        by_hash.clear();
-        for (i, tx) in txs.iter().enumerate() {
-            by_hash.insert(tx.hash, i);
-        }
+        state.txs = kept;
+        state.rebuild_index();
         drained
     }
 
@@ -178,24 +289,19 @@ impl HeldPool {
         if consumed.is_empty() {
             return Vec::new();
         }
-        let mut txs = self.txs.lock().expect("held_pool txs poisoned");
-        let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
+        let mut state = self.state.lock().expect("held_pool mutex poisoned");
         let consumed_set: HashSet<&TxHash> = consumed.iter().collect();
         let mut drained = Vec::new();
-        let mut kept = VecDeque::with_capacity(txs.len());
-        for tx in txs.drain(..) {
+        let mut kept = VecDeque::with_capacity(state.txs.len());
+        for tx in state.txs.drain(..) {
             if consumed_set.contains(&tx.hash) {
                 drained.push(tx);
             } else {
                 kept.push_back(tx);
             }
         }
-        *txs = kept;
-        // Rebuild the index — keys shifted by the partition.
-        by_hash.clear();
-        for (i, tx) in txs.iter().enumerate() {
-            by_hash.insert(tx.hash, i);
-        }
+        state.txs = kept;
+        state.rebuild_index();
         drained
     }
 
@@ -203,35 +309,56 @@ impl HeldPool {
     /// composer is about to produce system_txs from them. Empty after
     /// this call; recovery paths re-`push` if needed.
     pub fn pop_all(&self) -> Vec<HeldTx> {
-        let mut txs = self.txs.lock().expect("held_pool txs poisoned");
-        let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
-        let drained: Vec<HeldTx> = txs.drain(..).collect();
-        by_hash.clear();
+        let mut state = self.state.lock().expect("held_pool mutex poisoned");
+        let drained: Vec<HeldTx> = state.txs.drain(..).collect();
+        state.by_hash.clear();
+        for tx in &drained {
+            state.mark_in_flight(tx);
+        }
         drained
     }
 
-    /// Drain up to `max` held txs (FIFO). Empirical fact about the
+    /// Drain up to `max` held txs with per-sender fairness. Empirical fact about the
     /// rbuilder-chiado relay: bundles containing more than ~3 user_txs
     /// often have a subset silently dropped at inclusion time even
     /// when the bundle itself lands. Capping bundle size keeps the
     /// per-bundle inclusion atomic at the cost of more Sync slots to
     /// drain a large pool.
     pub fn pop_n(&self, max: usize) -> Vec<HeldTx> {
-        let mut txs = self.txs.lock().expect("held_pool txs poisoned");
-        let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
-        let n = max.min(txs.len());
-        let drained: Vec<HeldTx> = txs.drain(..n).collect();
-        // Rebuild index for the txs that remain.
-        by_hash.clear();
-        for (i, tx) in txs.iter().enumerate() {
-            by_hash.insert(tx.hash, i);
+        let mut state = self.state.lock().expect("held_pool mutex poisoned");
+        let mut drained = Vec::new();
+        while drained.len() < max && !state.txs.is_empty() {
+            let mut seen = HashSet::new();
+            let mut kept = VecDeque::with_capacity(state.txs.len());
+            let start_len = state.txs.len();
+            let mut made_progress = false;
+            for _ in 0..start_len {
+                let tx = state.txs.pop_front().expect("bounded by start_len");
+                let key = (tx.sender, tx.direction);
+                if drained.len() < max && seen.insert(key) {
+                    state.mark_in_flight(&tx);
+                    drained.push(tx);
+                    made_progress = true;
+                } else {
+                    kept.push_back(tx);
+                }
+            }
+            state.txs = kept;
+            if !made_progress {
+                break;
+            }
         }
+        state.rebuild_index();
         drained
     }
 
     /// Number of currently-held txs.
     pub fn len(&self) -> usize {
-        self.txs.lock().expect("held_pool txs poisoned").len()
+        self.state
+            .lock()
+            .expect("held_pool mutex poisoned")
+            .txs
+            .len()
     }
 
     /// True iff the pool is empty.
@@ -338,5 +465,85 @@ mod tests {
         let drained = pool.drain_matching(&[]);
         assert!(drained.is_empty());
         assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn contiguous_push_is_atomic_against_duplicate_nonce() {
+        let pool = HeldPool::new();
+        let sender = Address::repeat_byte(9);
+        let mk = |nonce: u64, h: u8| HeldTx {
+            raw_tx: Bytes::from(vec![h; 4]),
+            hash: TxHash::from(B256::repeat_byte(h)),
+            attempts: 0,
+            sender,
+            nonce,
+            direction: Direction::Inbound,
+        };
+
+        assert_eq!(
+            pool.push_contiguous(mk(0, 1), 0).unwrap(),
+            HoldInsert::Inserted
+        );
+        let err = pool.push_contiguous(mk(0, 2), 0).unwrap_err();
+        assert_eq!(err.expected, 1);
+        assert_eq!(err.on_chain, 0);
+        assert_eq!(err.reserved, 1);
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn contiguous_push_counts_in_flight_reservations() {
+        let pool = HeldPool::new();
+        let sender = Address::repeat_byte(0xa);
+        let mk = |nonce: u64, h: u8| HeldTx {
+            raw_tx: Bytes::from(vec![h; 4]),
+            hash: TxHash::from(B256::repeat_byte(h)),
+            attempts: 0,
+            sender,
+            nonce,
+            direction: Direction::Inbound,
+        };
+
+        pool.push_contiguous(mk(0, 1), 0).unwrap();
+        let drained = pool.pop_n(1);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(pool.held_count_for(sender, Direction::Inbound), 0);
+        assert_eq!(pool.reserved_count_for(sender, Direction::Inbound), 1);
+
+        pool.push_contiguous(mk(1, 2), 0).unwrap();
+        assert_eq!(pool.reserved_count_for(sender, Direction::Inbound), 2);
+        pool.release_in_flight_batch(&drained);
+        assert_eq!(pool.reserved_count_for(sender, Direction::Inbound), 1);
+    }
+
+    #[test]
+    fn pop_n_is_fair_across_sender_direction_chains() {
+        let pool = HeldPool::new();
+        let sender_a = Address::repeat_byte(0xa);
+        let sender_b = Address::repeat_byte(0xb);
+        let mk = |sender: Address, nonce: u64, h: u8| HeldTx {
+            raw_tx: Bytes::from(vec![h; 4]),
+            hash: TxHash::from(B256::repeat_byte(h)),
+            attempts: 0,
+            sender,
+            nonce,
+            direction: Direction::Inbound,
+        };
+
+        pool.push(mk(sender_a, 0, 1));
+        pool.push(mk(sender_a, 1, 2));
+        pool.push(mk(sender_a, 2, 3));
+        pool.push(mk(sender_b, 0, 4));
+
+        let drained = pool.pop_n(3);
+        let hashes: Vec<_> = drained.iter().map(|tx| tx.hash).collect();
+        assert_eq!(
+            hashes,
+            vec![
+                TxHash::from(B256::repeat_byte(1)),
+                TxHash::from(B256::repeat_byte(4)),
+                TxHash::from(B256::repeat_byte(2)),
+            ]
+        );
     }
 }
