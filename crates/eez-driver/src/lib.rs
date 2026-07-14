@@ -40,6 +40,7 @@ pub mod sequencer;
 pub mod slot;
 pub mod submit;
 pub mod timing;
+pub mod witness;
 
 #[doc(inline)]
 pub use block_committer::{BlockCommitterHandle, CommitOutcome, DeriveOutcome, ForkchoiceOutcome};

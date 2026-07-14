@@ -84,6 +84,10 @@ enum CommitCommand<T: PayloadTypes> {
     Derive {
         payload: <T as PayloadTypes>::ExecutionData,
         header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+        /// Emit this block to the prover witness feed. TRUE only for a PRODUCED
+        /// Sync block (`commit_one_prebuilt`); FALSE for a follower / L1-reconcile
+        /// re-derive, so the prover is never double-fed the same block.
+        feed_witness: bool,
         response: oneshot::Sender<DriverResult<DeriveOutcome>>,
     },
     /// Roll the canonical head back to `target_header`. Used by the
@@ -152,6 +156,7 @@ where
         finalized_hash: B256,
         to_engine: ConsensusEngineHandle<T>,
         payload_builder: PayloadBuilderHandle<T>,
+        witness_tx: Option<mpsc::UnboundedSender<B256>>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(COMMAND_BUFFER);
         let initial_hash = initial_header.hash();
@@ -164,6 +169,7 @@ where
             unsafe_head_hash: initial_hash,
             safe_header,
             finalized_hash,
+            witness_tx,
         };
         tokio::spawn(actor.run());
         Self {
@@ -185,6 +191,7 @@ where
         provider: &P,
         to_engine: ConsensusEngineHandle<T>,
         payload_builder: PayloadBuilderHandle<T>,
+        witness_tx: Option<mpsc::UnboundedSender<B256>>,
     ) -> DriverResult<Self>
     where
         <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives,
@@ -229,6 +236,7 @@ where
             finalized_hash,
             to_engine,
             payload_builder,
+            witness_tx,
         ))
     }
 
@@ -430,12 +438,14 @@ where
         &self,
         payload: <T as PayloadTypes>::ExecutionData,
         header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+        feed_witness: bool,
     ) -> DriverResult<DeriveOutcome> {
         let (response_tx, response_rx) = oneshot::channel();
         self.sender
             .send(CommitCommand::Derive {
                 payload,
                 header,
+                feed_witness,
                 response: response_tx,
             })
             .await
@@ -460,6 +470,15 @@ struct Actor<T: PayloadTypes> {
     /// head demotion can rewrite `last_header` to a valid parent.
     safe_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
     finalized_hash: B256,
+    /// Prover-feed trigger (prover-chain P1): after a PRODUCED block
+    /// canonicalizes, the actor hands its hash here so the out-of-loop witness
+    /// task can re-execute it on parent state for the proof feed. `None` outside
+    /// composer mode. The heavy re-exec is NOT done inline — that would stall the
+    /// actor loop; only the trigger is emitted. Fired by `process_sequence` (live
+    /// blocks) and by `process_derive` ONLY when `feed_witness` is set (a produced
+    /// Sync block via `commit_one_prebuilt`); a follower / L1-reconcile re-derive
+    /// passes `feed_witness=false` so the prover isn't double-fed the same block.
+    witness_tx: Option<mpsc::UnboundedSender<B256>>,
 }
 
 impl<T> Actor<T>
@@ -494,9 +513,10 @@ where
                 CommitCommand::Derive {
                     payload,
                     header,
+                    feed_witness,
                     response,
                 } => {
-                    let result = self.process_derive(payload, header).await;
+                    let result = self.process_derive(payload, header, feed_witness).await;
                     let _ = response.send(result);
                 }
                 CommitCommand::ReorgTo {
@@ -649,6 +669,7 @@ where
         &mut self,
         payload: <T as PayloadTypes>::ExecutionData,
         header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+        feed_witness: bool,
     ) -> DriverResult<DeriveOutcome> {
         let block_hash = payload.block_hash();
         let block_number = payload.block_number();
@@ -678,6 +699,19 @@ where
         // Mirror the new head into the shared `RwLock`.
         self.unsafe_head_hash = block_hash;
         *self.last_header.write().unwrap() = header;
+
+        // Prover-feed (prover-chain P1): a PRODUCED Sync/settling block reaches
+        // canonicalization via this path (commit_one_prebuilt → commit_derived),
+        // not process_sequence. Emit ONLY when the caller is the producer
+        // (`feed_witness`) — a follower / L1-reconcile re-derive passes
+        // `feed_witness=false` so the prover isn't double-fed the same block.
+        // The block is already canonical (the FCU above), so the witness task's
+        // `recovered_block(hash)` resolves on the first try.
+        if feed_witness {
+            if let Some(tx) = &self.witness_tx {
+                let _ = tx.send(block_hash);
+            }
+        }
 
         Ok(DeriveOutcome {
             block_hash,
@@ -724,8 +758,30 @@ where
             return Err(DriverError::invalid_payload(format!("{np:?}")));
         }
 
+        // Canonicalize the just-built block immediately (head-FCU, mirroring
+        // process_derive) so it is queryable BEFORE we emit to the prover feed.
+        // Without this the block is only `new_payload`'d here and becomes canonical
+        // at the NEXT slot's opening FCU, so a `recovered_block(hash)` in the
+        // witness task would transiently miss it.
+        let mut state = self.forkchoice_state();
+        state.head_block_hash = header.hash();
+        let fcu = self
+            .to_engine
+            .fork_choice_updated(state, None)
+            .await
+            .map_err(DriverError::engine_rpc)?;
+        if !fcu.is_valid() {
+            return Err(DriverError::invalid_forkchoice(format!("{fcu:?}")));
+        }
+
         self.unsafe_head_hash = header.hash();
         *self.last_header.write().unwrap() = header.clone();
+        // Prover-feed trigger (prover-chain P1): the block is now canonical, so
+        // the witness task's `recovered_block(hash)` resolves on the first try.
+        // Best-effort — a closed/lagging channel just drops it.
+        if let Some(tx) = &self.witness_tx {
+            let _ = tx.send(header.hash());
+        }
         Ok(CommitOutcome { header })
     }
 }
