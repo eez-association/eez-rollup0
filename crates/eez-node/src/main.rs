@@ -19,6 +19,7 @@ mod bundle_rpc;
 mod follower;
 mod ingress;
 mod l1_embedded;
+mod witness_source;
 
 use std::{collections::HashMap, env, str::FromStr, sync::Arc, time::Duration};
 
@@ -354,6 +355,18 @@ fn main() -> eyre::Result<()> {
         // standalone mode it runs the produce loop; in follower it's
         // dropped (committer stays alive via the cloned handle); in
         // composer the L1-anchored schedule arrives via spawn_l1_anchored.
+        // Remote-prover composer mode: the committer emits each committed block's
+        // hash here; a capture task re-executes it while parent state is fresh and
+        // stores the witness for the composer. `None` otherwise. Created here to
+        // thread `witness_tx` into the committer at spawn.
+        let (witness_tx, witness_rx, witness_store) =
+            if mode == Mode::Composer && env::var_os("EEZ_PROVER_URL").is_some() {
+                let (tx, rx) = mpsc::unbounded_channel::<B256>();
+                (Some(tx), Some(rx), Some(witness_source::new_store()))
+            } else {
+                (None, None, None)
+            };
+
         let mut sequencer = Sequencer::new(
             &provider,
             attributes,
@@ -361,6 +374,7 @@ fn main() -> eyre::Result<()> {
             schedule_rx,
             payload_builder_handle,
             timing,
+            witness_tx,
         )?;
         if mode != Mode::Standalone {
             let depth = env::var("EEZ_MAX_SPECULATIVE_DEPTH")
@@ -407,7 +421,15 @@ fn main() -> eyre::Result<()> {
             let proof_signer = PrivateKeySigner::from_bytes(&B256::from_str(
                 proof_signer_key.trim_start_matches("0x"),
             )?)?;
-            let prover = Arc::new(MockEcdsaProver::new(proof_signer));
+            // Remote-prover mode (EEZ_PROVER_URL): dial eez-proverd, verifying its
+            // attestations against the attester address. Mock is the default.
+            let prover: Arc<dyn eez_prover::Prover> = match env::var("EEZ_PROVER_URL") {
+                Ok(url) => Arc::new(eez_prover_client::RemoteProver::new(
+                    url,
+                    proof_signer.address(),
+                )),
+                Err(_) => Arc::new(MockEcdsaProver::new(proof_signer)),
+            };
             let rollup_id = rollup_config.rollup_id;
             // Share the SAME HeldPool the ingress middleware pushes into
             // (the `Option<Arc<HeldPool>>` leaves room for per-rollup
@@ -727,6 +749,29 @@ fn main() -> eyre::Result<()> {
                     this_rollup_id: ctx.l2_rollup_id,
                 }
             });
+            // Remote-prover mode: spawn the commit-time witness capture and back the
+            // composer's witness source with its store. Capturing at commit (parent
+            // state still fresh) is why this works on a non-archival node. Spawned
+            // before `evm_config` is moved into `Composer::new` below.
+            let witness_source = match (witness_rx, witness_store) {
+                (Some(rx), Some(store)) => {
+                    let cap_provider = provider.clone();
+                    let cap_evm = evm_config.clone();
+                    let ws_provider = provider.clone();
+                    let ws_evm = evm_config.clone();
+                    let cap_store = Arc::clone(&store);
+                    task_executor.spawn_critical_task("eez-witness-capture", async move {
+                        witness_source::run_capture(rx, cap_store, cap_provider, cap_evm).await;
+                    });
+                    // Hybrid: read the store, else re-exec on demand the newest block
+                    // the async capture hasn't drained yet (state still retained; fast
+                    // for near-empty blocks).
+                    Some(Arc::new(witness_source::NodeWitnessSource::new(
+                        store, ws_provider, ws_evm,
+                    )) as Arc<dyn eez_prover::ProvingWitnessSource>)
+                }
+                _ => None,
+            };
             let composer = Composer::new(
                 rollups,
                 prover,
@@ -737,6 +782,9 @@ fn main() -> eyre::Result<()> {
                 cc_exec_ctx,
                 l2_entry_client,
             );
+            if let Some(ws) = witness_source {
+                composer.set_witness_source(ws);
+            }
             let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
 
             // Reuse the same Sequencer (and its single BlockCommitter
