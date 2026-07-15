@@ -145,10 +145,12 @@ impl HeldPool {
         Self::default()
     }
 
-    /// Append `tx` only if it extends the contiguous queued + in-flight nonce
-    /// chain for `(sender, direction)`. Reservations below `on_chain` have
-    /// already landed and do not advance the expected nonce a second time.
-    /// Duplicate hashes are accepted as idempotent.
+    /// Admit `tx` into the contiguous queued + in-flight nonce chain for
+    /// `(sender, direction)`. A new hash at an existing queued nonce replaces
+    /// that transaction and evicts its higher queued suffix. In-flight nonces
+    /// cannot be replaced. Reservations below `on_chain` have already landed
+    /// and do not advance the expected nonce a second time. Duplicate hashes
+    /// are accepted as idempotent.
     pub fn push_contiguous(
         &self,
         tx: HeldTx,
@@ -158,13 +160,64 @@ impl HeldPool {
         if state.by_hash.contains(&tx.hash) || state.in_flight.contains_key(&tx.hash) {
             return Ok(HoldInsert::Duplicate);
         }
-        let Some(expected) = state.next_expected_nonce(tx.sender, tx.direction, on_chain) else {
+
+        let target_sender = tx.sender;
+        let target_direction = tx.direction;
+        let target_nonce = tx.nonce;
+        let same_chain = |sender: Address, direction: Direction| {
+            sender == target_sender && direction == target_direction
+        };
+        let queued_match = state.txs.iter().position(|queued| {
+            same_chain(queued.sender, queued.direction) && queued.nonce == target_nonce
+        });
+
+        if target_nonce < on_chain {
+            let expected = state
+                .next_expected_nonce(target_sender, target_direction, on_chain)
+                .unwrap_or(u64::MAX);
+            return Err(NonceAdmissionError { expected, on_chain });
+        }
+
+        if let Some(queued_idx) = queued_match {
+            let replacement_hash = tx.hash;
+            let previous_hash = state.txs[queued_idx].hash;
+            state.txs[queued_idx] = tx;
+            let mut evicted_hashes = Vec::new();
+            state.txs.retain(|queued| {
+                let evict =
+                    same_chain(queued.sender, queued.direction) && queued.nonce > target_nonce;
+                if evict {
+                    evicted_hashes.push(queued.hash);
+                }
+                !evict
+            });
+            state.by_hash.remove(&previous_hash);
+            for hash in &evicted_hashes {
+                state.by_hash.remove(hash);
+            }
+            state.by_hash.insert(replacement_hash);
+            return Ok(HoldInsert::Inserted);
+        }
+
+        if state.in_flight.values().any(|(sender, direction, nonce)| {
+            same_chain(*sender, *direction) && *nonce == target_nonce
+        }) {
+            return Err(NonceAdmissionError {
+                expected: state
+                    .next_expected_nonce(target_sender, target_direction, on_chain)
+                    .unwrap_or(u64::MAX),
+                on_chain,
+            });
+        }
+
+        let Some(expected) = state.next_expected_nonce(target_sender, target_direction, on_chain)
+        else {
             return Err(NonceAdmissionError {
                 expected: u64::MAX,
                 on_chain,
             });
         };
-        if tx.nonce != expected {
+        if target_nonce != expected {
             return Err(NonceAdmissionError { expected, on_chain });
         }
         state.by_hash.insert(tx.hash);
@@ -327,12 +380,29 @@ mod tests {
     #[test]
     fn push_dedupes_by_hash() {
         let pool = HeldPool::new();
-        insert(&pool, tx(1), 1);
+        let original = tx(1);
+        insert(&pool, original.clone(), 1);
         assert_eq!(
-            pool.push_contiguous(tx(1), 1).unwrap(),
+            pool.push_contiguous(original.clone(), 1).unwrap(),
             HoldInsert::Duplicate
         );
         assert_eq!(pool.len(), 1);
+
+        let drained = pool.pop_all();
+        assert_eq!(
+            pool.push_contiguous(original.clone(), 1).unwrap(),
+            HoldInsert::Duplicate
+        );
+        let mut replacement = original;
+        replacement.hash = TxHash::from(B256::repeat_byte(9));
+        assert_eq!(
+            pool.push_contiguous(replacement, 1).unwrap_err(),
+            NonceAdmissionError {
+                expected: 2,
+                on_chain: 1
+            }
+        );
+        pool.release_in_flight_batch(&drained);
     }
 
     #[test]
@@ -376,7 +446,61 @@ mod tests {
     }
 
     #[test]
-    fn contiguous_push_is_atomic_against_duplicate_nonce() {
+    fn queued_nonce_replacement_preserves_position_and_evicts_only_its_suffix() {
+        let pool = HeldPool::new();
+        let sender = Address::repeat_byte(9);
+        let other_sender = Address::repeat_byte(8);
+        let mk = |sender: Address, nonce: u64, direction: Direction, h: u8| HeldTx {
+            raw_tx: Bytes::from(vec![h; 4]),
+            hash: TxHash::from(B256::repeat_byte(h)),
+            attempts: 0,
+            sender,
+            nonce,
+            direction,
+        };
+
+        insert(&pool, mk(sender, 0, Direction::Inbound, 1), 0);
+        insert(&pool, mk(other_sender, 0, Direction::Inbound, 10), 0);
+        insert(&pool, mk(sender, 1, Direction::Inbound, 2), 0);
+        insert(&pool, mk(sender, 0, Direction::Outbound, 20), 0);
+        insert(&pool, mk(sender, 2, Direction::Inbound, 3), 0);
+        insert(&pool, mk(other_sender, 1, Direction::Inbound, 11), 0);
+        insert(&pool, mk(sender, 1, Direction::Outbound, 21), 0);
+
+        assert_eq!(
+            pool.push_contiguous(mk(sender, 1, Direction::Inbound, 9), 0)
+                .unwrap(),
+            HoldInsert::Inserted
+        );
+        assert_eq!(
+            pool.push_contiguous(mk(sender, 2, Direction::Inbound, 3), 0)
+                .unwrap(),
+            HoldInsert::Inserted,
+            "the evicted suffix hash must be removed from the dedupe index"
+        );
+        assert_eq!(
+            pool.push_contiguous(mk(sender, 1, Direction::Inbound, 2), 0)
+                .unwrap(),
+            HoldInsert::Inserted,
+            "the original hash must be reusable after replacement"
+        );
+
+        let hashes: Vec<_> = pool.pop_all().iter().map(|tx| tx.hash).collect();
+        assert_eq!(
+            hashes,
+            vec![
+                TxHash::from(B256::repeat_byte(1)),
+                TxHash::from(B256::repeat_byte(10)),
+                TxHash::from(B256::repeat_byte(2)),
+                TxHash::from(B256::repeat_byte(20)),
+                TxHash::from(B256::repeat_byte(11)),
+                TxHash::from(B256::repeat_byte(21)),
+            ]
+        );
+    }
+
+    #[test]
+    fn queued_replacement_allows_lower_in_flight_but_not_in_flight_nonce() {
         let pool = HeldPool::new();
         let sender = Address::repeat_byte(9);
         let mk = |nonce: u64, h: u8| HeldTx {
@@ -387,20 +511,32 @@ mod tests {
             nonce,
             direction: Direction::Inbound,
         };
+        for nonce in 0..=2 {
+            insert(&pool, mk(nonce, nonce as u8 + 1), 0);
+        }
+        let drained = pool.pop_n(1);
+        assert_eq!(drained[0].nonce, 0);
 
         assert_eq!(
-            pool.push_contiguous(mk(0, 1), 0).unwrap(),
+            pool.push_contiguous(mk(1, 9), 0).unwrap(),
             HoldInsert::Inserted
         );
-        let err = pool.push_contiguous(mk(0, 2), 0).unwrap_err();
         assert_eq!(
-            err,
+            pool.push_contiguous(mk(0, 8), 0).unwrap_err(),
             NonceAdmissionError {
-                expected: 1,
+                expected: 2,
                 on_chain: 0
             }
         );
-        assert_eq!(pool.len(), 1);
+        assert_eq!(
+            pool.push_contiguous(mk(2, 7), 0).unwrap(),
+            HoldInsert::Inserted
+        );
+
+        let queued = pool.pop_all();
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].hash, TxHash::from(B256::repeat_byte(9)));
+        assert_eq!(queued[1].hash, TxHash::from(B256::repeat_byte(7)));
     }
 
     #[test]
@@ -447,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn contiguous_push_caps_exhausted_nonce_space_at_max() {
+    fn max_nonce_can_be_replaced_while_queued_but_not_in_flight() {
         let pool = HeldPool::new();
         let sender = Address::repeat_byte(0xd);
         let mk = |h: u8| HeldTx {
@@ -461,7 +597,13 @@ mod tests {
 
         insert(&pool, mk(1), u64::MAX);
         assert_eq!(
-            pool.push_contiguous(mk(2), u64::MAX).unwrap_err(),
+            pool.push_contiguous(mk(2), u64::MAX).unwrap(),
+            HoldInsert::Inserted
+        );
+        let drained = pool.pop_all();
+        assert_eq!(drained[0].hash, TxHash::from(B256::repeat_byte(2)));
+        assert_eq!(
+            pool.push_contiguous(mk(3), u64::MAX).unwrap_err(),
             NonceAdmissionError {
                 expected: u64::MAX,
                 on_chain: u64::MAX

@@ -50,9 +50,10 @@ pub enum Admission {
 /// SOURCE chain (`validation_provider`), and push into `held_pool` with
 /// `direction`.
 ///
-/// The nonce must be the first unreserved nonce at or above the source-chain
-/// nonce for this direction: a gapped held tx would poison the all-or-nothing
-/// bundle and break bundle-mates' chains.
+/// A new nonce must be the first unreserved nonce at or above the source-chain
+/// nonce for this direction. An existing queued nonce may be replaced, which
+/// also evicts its higher queued suffix. A gapped held tx would poison the
+/// all-or-nothing bundle and break bundle-mates' chains.
 pub async fn gate_and_hold(
     envelope: &TxEnvelope,
     raw_tx: &Bytes,
@@ -465,8 +466,8 @@ mod tests {
         let Admission::Rejected(message) = rejected else {
             panic!("same nonce should be rejected while first tx is in flight");
         };
-        assert!(message.contains("nonce 1"), "{message}");
-        assert!(message.contains("next unreserved nonce"), "{message}");
+        assert!(message.contains("invalid nonce 0"), "{message}");
+        assert!(message.contains("next unreserved nonce 1"), "{message}");
 
         let rejected =
             gate_and_hold(&gapped, &gapped_raw, Direction::Inbound, &pool, &provider).await;
@@ -479,6 +480,55 @@ mod tests {
             gate_and_hold(&next, &next_raw, Direction::Inbound, &pool, &provider).await,
             Admission::Held(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn gate_replaces_queued_nonce_and_evicts_higher_suffix() {
+        let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap();
+        let (original, original_raw) = signed_transfer(&signer, 0, 1);
+        let (suffix, suffix_raw) = signed_transfer(&signer, 1, 2);
+        let (replacement, replacement_raw) = signed_transfer(&signer, 0, 3);
+        let pool = HeldPool::new();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
+
+        for _ in 0..3 {
+            asserter.push_success(&U256::from(1_000_000u64));
+            asserter.push_success(&0_u64);
+        }
+
+        let Admission::Held(original_hash) = gate_and_hold(
+            &original,
+            &original_raw,
+            Direction::Inbound,
+            &pool,
+            &provider,
+        )
+        .await
+        else {
+            panic!("original transaction should be held");
+        };
+        assert!(matches!(
+            gate_and_hold(&suffix, &suffix_raw, Direction::Inbound, &pool, &provider,).await,
+            Admission::Held(_)
+        ));
+        let Admission::Held(replacement_hash) = gate_and_hold(
+            &replacement,
+            &replacement_raw,
+            Direction::Inbound,
+            &pool,
+            &provider,
+        )
+        .await
+        else {
+            panic!("replacement transaction should be held");
+        };
+
+        assert_ne!(original_hash, replacement_hash);
+        let queued = pool.pop_all();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].hash, replacement_hash);
+        assert_eq!(queued[0].nonce, 0);
     }
 
     #[test]
