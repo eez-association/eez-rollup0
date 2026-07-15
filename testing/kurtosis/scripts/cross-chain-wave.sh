@@ -53,7 +53,6 @@ fi
 [[ -n "${EEZ_REGISTRY_ADDRESS:-}" ]] || { echo "EEZ_REGISTRY_ADDRESS unset — deployments.env incomplete"; exit 1; }
 
 # Hardhat accounts are funded on L2; L1 actors are funded below.
-HH_KEY_0=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80   # deployer/owner (L1 targets/proxies/wrapper)
 HH_KEY_2=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a   # L2 contract deployer / L2 proxy creator
 # Fresh users avoid stale held-pool nonce state from earlier interrupted runs.
 HH_KEY_IN="${EEZ_WAVE_IN_KEY:-0x$(openssl rand -hex 32)}"
@@ -65,11 +64,12 @@ HH_KEY_PURE=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a  
 HH_KEY_2_ADDR=$(cast wallet address --private-key "$HH_KEY_2")
 
 # EOAs funded on L1 so they can pay gas on the shared chain.
-L1_FUNDED_KEYS=("$HH_KEY_0" "$HH_KEY_IN")
+L1_FUNDED_KEYS=("$HH_KEY_IN")
 _yaml() { grep -E "^[[:space:]]*$1:" "${KURTOSIS_ARGS_FILE:-$K/args.yaml}" 2>/dev/null | head -1 \
     | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//'; }
 FUND_FROM_KEY="${EEZ_FUND_FROM_KEY:-${EEZ_PROOF_SIGNER_KEY:-$(_yaml proof_signer_key)}}"
 [[ -n "$FUND_FROM_KEY" ]] || { echo "could not resolve a funding key — set EEZ_FUND_FROM_KEY or check $K/args.yaml"; exit 1; }
+L1_SETUP_KEY="${EEZ_L1_SETUP_KEY:-$FUND_FROM_KEY}"
 
 EEZ_CCM_L2_PREDEPLOY="${EEZ_CCM_L2_ADDRESS:-0x4200000000000000000000000000000000000007}"
 SYS_ADDR="${EEZ_L2_SYSTEM_ADDRESS:-0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266}"
@@ -153,10 +153,14 @@ if [[ "$(cast balance "$HH_ADDR_OUT" --rpc-url "$L2" 2>/dev/null || echo 0)" == 
 fi
 
 forge_deploy() { # <rpc> <key> <script:contract> <sig> <args...>  → echoes forge stdout
-    local rpc="$1" key="$2" sc="$3" sig="$4" gas_price; shift 4
+    local rpc="$1" key="$2" sc="$3" sig="$4" gas_price out; shift 4
     gas_price=$(gas_price_for "$rpc")
-    (cd "$REPO/contracts" && forge script "script/$sc" --sig "$sig" "$@" \
-        --rpc-url "$rpc" --broadcast --private-key "$key" --gas-price "$gas_price" --skip-simulation 2>&1)
+    if ! out=$(cd "$REPO/contracts" && forge script "script/$sc" --sig "$sig" "$@" \
+        --rpc-url "$rpc" --broadcast --private-key "$key" --gas-price "$gas_price" --skip-simulation 2>&1); then
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
+    printf '%s\n' "$out"
 }
 grab() { grep -oE "$1=0x[0-9a-fA-F]{40}" | head -1 | cut -d= -f2; }
 
@@ -170,8 +174,8 @@ echo "    L2 Value=$L2_VALUE  ValueNoRet=$L2_VALUE_NORET"
 # ── Deploy L1 outbound targets (Value + ValueNoRet on L1) ────────────
 if [[ "$MODE" == outbound || "$MODE" == mixed || "$MODE" == mixed-pure ]]; then
     echo "==> deploying L1 outbound targets (Value, ValueNoRet on L1)"
-    L1_VALUE=$(forge_deploy "$L1" "$HH_KEY_0" DeployValueL2.s.sol:DeployValueL2 'run(uint256)' 0 | grab EEZ_VALUE_ADDRESS)
-    L1_VALUE_NORET=$(forge_deploy "$L1" "$HH_KEY_0" DeployValueNoRetL2.s.sol:DeployValueNoRetL2 'run(uint256)' 0 | grab EEZ_VALUE_NORET_ADDRESS)
+    L1_VALUE=$(forge_deploy "$L1" "$L1_SETUP_KEY" DeployValueL2.s.sol:DeployValueL2 'run(uint256)' 0 | grab EEZ_VALUE_ADDRESS)
+    L1_VALUE_NORET=$(forge_deploy "$L1" "$L1_SETUP_KEY" DeployValueNoRetL2.s.sol:DeployValueNoRetL2 'run(uint256)' 0 | grab EEZ_VALUE_NORET_ADDRESS)
     [[ -n "$L1_VALUE" && -n "$L1_VALUE_NORET" ]] || { echo "L1 target deploy failed"; exit 1; }
     echo "    L1 Value=$L1_VALUE  ValueNoRet=$L1_VALUE_NORET"
 fi
@@ -181,7 +185,7 @@ L2_CHAIN_ID=$(cast chain-id --rpc-url "$L2")
 # ── Helpers: create an L1 (inbound) proxy and an L2 (outbound) proxy ──
 # L1 proxy = createCrossChainProxy(target_on_L2, rid=EEZ_ROLLUP_ID) on the L1 EEZ.
 create_l1_proxy() { # <target_on_L2> → proxy addr
-    forge_deploy "$L1" "$HH_KEY_0" CreateValueProxy.s.sol:CreateValueProxy \
+    forge_deploy "$L1" "$L1_SETUP_KEY" CreateValueProxy.s.sol:CreateValueProxy \
         'run(address,address,uint256)' "$EEZ_REGISTRY_ADDRESS" "$1" "$EEZ_ROLLUP_ID" | grab EEZ_VALUE_PROXY
 }
 # L2 proxy = computeCrossChainProxyAddress(target_on_L1, MAINNET) then
@@ -215,7 +219,7 @@ if [[ "$MODE" == inbound || "$MODE" == mixed || "$MODE" == mixed-pure ]]; then
         || { echo "inbound proxy creation failed"; exit 1; }
     echo "    inbound proxies: setter=$IN_VALUE_PROXY noret=$IN_NORET_PROXY deposit=$IN_DEP_PROXY"
     # Inbound wrapper on L1 over the setter proxy.
-    IN_WRAPPER=$(forge_deploy "$L1" "$HH_KEY_0" DeploySetterWrapperL1.s.sol:DeploySetterWrapperL1 'run(address)' "$IN_VALUE_PROXY" | grab EEZ_SETTER_WRAPPER)
+    IN_WRAPPER=$(forge_deploy "$L1" "$L1_SETUP_KEY" DeploySetterWrapperL1.s.sol:DeploySetterWrapperL1 'run(address)' "$IN_VALUE_PROXY" | grab EEZ_SETTER_WRAPPER)
     echo "    inbound wrapper (L1) = $IN_WRAPPER"
 fi
 if [[ "$MODE" == outbound || "$MODE" == mixed || "$MODE" == mixed-pure ]]; then
