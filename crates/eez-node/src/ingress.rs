@@ -52,33 +52,30 @@ pub enum Admission {
 ///
 /// The nonce must be the first unreserved nonce at or above the source-chain
 /// nonce for this direction: a gapped held tx would poison the all-or-nothing
-/// bundle and break bundle-mates' chains. `None` provider skips validation
-/// (dev / no-RPC).
+/// bundle and break bundle-mates' chains.
 pub async fn gate_and_hold(
     envelope: &TxEnvelope,
     raw_tx: &Bytes,
     direction: Direction,
     held_pool: &HeldPool,
-    validation_provider: Option<&RootProvider>,
+    validation_provider: &RootProvider,
 ) -> Admission {
     let Ok(sender) = envelope.recover_signer() else {
         return Admission::Rejected("signature recovery failed".into());
     };
     let nonce = envelope.nonce();
-    if let Some(provider) = validation_provider {
-        let balance = match provider.get_balance(sender).await {
-            Ok(b) => b,
-            Err(e) => {
-                return Admission::Rejected(format!("source-chain balance lookup failed: {e}"));
-            }
-        };
-        let cost = U256::from(envelope.value())
-            + U256::from(envelope.gas_limit()) * U256::from(envelope.max_fee_per_gas());
-        if balance < cost {
-            return Admission::Rejected(format!(
-                "insufficient balance for {sender}: have {balance}, need {cost} (value + gas_limit * max_fee)"
-            ));
+    let balance = match validation_provider.get_balance(sender).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Admission::Rejected(format!("source-chain balance lookup failed: {e}"));
         }
+    };
+    let cost = U256::from(envelope.value())
+        + U256::from(envelope.gas_limit()) * U256::from(envelope.max_fee_per_gas());
+    if balance < cost {
+        return Admission::Rejected(format!(
+            "insufficient balance for {sender}: have {balance}, need {cost} (value + gas_limit * max_fee)"
+        ));
     }
     // keccak256 of the EIP-2718 envelope — the canonical tx hash for legacy and typed txs alike.
     let hash: B256 = keccak256(raw_tx.as_ref());
@@ -90,19 +87,19 @@ pub async fn gate_and_hold(
         nonce,
         direction,
     };
-    if let Some(provider) = validation_provider {
-        let on_chain = match provider.get_transaction_count(sender).pending().await {
-            Ok(n) => n,
-            Err(e) => return Admission::Rejected(format!("source-chain nonce lookup failed: {e}")),
-        };
-        if let Err(err) = held_pool.push_contiguous(tx, on_chain) {
-            return Admission::Rejected(format!(
-                "invalid nonce {nonce} for {sender}: expected next unreserved nonce {} (source-chain nonce {})",
-                err.expected, err.on_chain
-            ));
-        }
-    } else {
-        held_pool.push(tx);
+    let on_chain = match validation_provider
+        .get_transaction_count(sender)
+        .pending()
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => return Admission::Rejected(format!("source-chain nonce lookup failed: {e}")),
+    };
+    if let Err(err) = held_pool.push_contiguous(tx, on_chain) {
+        return Admission::Rejected(format!(
+            "invalid nonce {nonce} for {sender}: expected next unreserved nonce {} (source-chain nonce {})",
+            err.expected, err.on_chain
+        ));
     }
     event!(
         name: "eez.ingress.cross_chain.push",
@@ -347,7 +344,7 @@ async fn intercept_send_raw(
         &raw,
         ctx.direction,
         &ctx.held_pool,
-        Some(&ctx.validation_provider),
+        &ctx.validation_provider,
     )
     .await
     {
@@ -449,14 +446,7 @@ mod tests {
         asserter.push_success(&1_u64);
 
         assert!(matches!(
-            gate_and_hold(
-                &first,
-                &first_raw,
-                Direction::Inbound,
-                &pool,
-                Some(&provider),
-            )
-            .await,
+            gate_and_hold(&first, &first_raw, Direction::Inbound, &pool, &provider,).await,
             Admission::Held(_)
         ));
 
@@ -469,7 +459,7 @@ mod tests {
             &same_nonce_raw,
             Direction::Inbound,
             &pool,
-            Some(&provider),
+            &provider,
         )
         .await;
         let Admission::Rejected(message) = rejected else {
@@ -478,21 +468,15 @@ mod tests {
         assert!(message.contains("nonce 1"), "{message}");
         assert!(message.contains("next unreserved nonce"), "{message}");
 
-        let rejected = gate_and_hold(
-            &gapped,
-            &gapped_raw,
-            Direction::Inbound,
-            &pool,
-            Some(&provider),
-        )
-        .await;
+        let rejected =
+            gate_and_hold(&gapped, &gapped_raw, Direction::Inbound, &pool, &provider).await;
         let Admission::Rejected(message) = rejected else {
             panic!("nonce 2 must not be admitted while nonce 1 is unreserved");
         };
         assert!(message.contains("nonce 1"), "{message}");
 
         assert!(matches!(
-            gate_and_hold(&next, &next_raw, Direction::Inbound, &pool, Some(&provider),).await,
+            gate_and_hold(&next, &next_raw, Direction::Inbound, &pool, &provider).await,
             Admission::Held(_)
         ));
     }

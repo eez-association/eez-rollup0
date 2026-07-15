@@ -38,7 +38,7 @@ use tracing::{Level, event};
 
 use crate::held_pool::HeldTx;
 use crate::ingress::Direction;
-use crate::local::{BuildError, build_sync_block};
+use crate::local::build_sync_block;
 use crate::optimistic::OptimisticallyIncluded;
 use crate::rollup::RollupState;
 
@@ -207,23 +207,6 @@ fn push_poison_root(
         poison_gaps.push(gap);
     }
     poison.push(tx);
-}
-
-fn remove_failed_nonce_chain(
-    candidates: &mut Vec<HeldTx>,
-    failed_idx: usize,
-) -> Option<(HeldTx, Vec<HeldTx>)> {
-    let root = candidates.get(failed_idx)?.clone();
-    let mut evicted = Vec::new();
-    candidates.retain(|tx| {
-        let remove =
-            tx.sender == root.sender && tx.direction == root.direction && tx.nonce >= root.nonce;
-        if remove {
-            evicted.push(tx.clone());
-        }
-        !remove
-    });
-    Some((root, evicted))
 }
 
 /// Composer umbrella. Cheaply [`Clone`]able (`Arc<Inner>`).
@@ -568,16 +551,14 @@ where
         + 'static,
     <L2 as TransactionsProvider>::Transaction: Encodable2718,
 {
-    /// Drain `rollup_id`'s `HeldPool`, build the Sync block carrying the
-    /// drained txs, and hand it back for the Sequencer to commit.
-    /// Returns `None` (→ vanilla pool-driven Sync commit) when the rollup
-    /// is unknown, has no `HeldPool`, or the pool is empty this slot.
+    /// Drain `rollup_id`'s cross-chain `HeldPool`, compose its transactions,
+    /// and hand the resulting Sync block back for the Sequencer to commit.
+    /// Returns `None` (→ vanilla pool-driven Sync commit) when cross-chain
+    /// composition is unavailable or cannot produce a block this slot.
     ///
-    /// With a cross-chain `EvmComposer` wired, each drained tx runs
-    /// through `simulate_and_resolve` and the rich Sync block + atomic L1
-    /// bundle dispatch via `compose_via_evm_composer` (optimistic).
-    /// Without one (no embedded L1), the drained txs commit as ordinary
-    /// type-0x2 calls — the standalone build+commit fallback.
+    /// Each drained tx runs through `simulate_and_resolve` and the rich Sync
+    /// block + atomic L1 bundle dispatch via `compose_via_evm_composer`
+    /// (optimistic). Held transactions are never executed directly on L2.
     async fn compose_sync_slot(
         &self,
         rollup_id: u64,
@@ -620,6 +601,21 @@ where
             );
             return None;
         };
+        let (Some(evm_composer), Some(ctx)) = (
+            self.inner.evm_composer.as_ref(),
+            self.inner.cc_exec_ctx.as_ref(),
+        ) else {
+            if !pool.is_empty() {
+                event!(
+                    name: "eez.composer.sync_slot.cross_chain_unavailable",
+                    Level::ERROR,
+                    rollup_id,
+                    tx_count = pool.len(),
+                    "cross-chain composition is unavailable; retaining held transactions",
+                );
+            }
+            return None;
+        };
         // Use the Sequencer-supplied parent header directly (it reflects
         // the just-committed block via `last_header`'s mirror); a
         // best-block re-lookup can race reth's provider-index and build
@@ -653,14 +649,11 @@ where
         // failed Sync block has either committed (head ≥ height →
         // reorg it out) or permanently didn't (stale-parent bail —
         // nothing to roll back).
-        if self.inner.evm_composer.is_some() {
-            if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
-                return self.recover_failed_batch(rollup_id, rollup, failed).await;
-            }
+        if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
+            return self.recover_failed_batch(rollup_id, rollup, failed).await;
         }
 
-        let blocked = self.inner.evm_composer.is_some()
-            && rollup.optimistic.blocking_height(cursor).is_some();
+        let blocked = rollup.optimistic.blocking_height(cursor).is_some();
         if blocked {
             event!(
                 name: "eez.composer.sync_slot.bundle_in_flight",
@@ -698,12 +691,6 @@ where
         // Catchup: structural-only — skip the drain, emit a minimal postBatch
         // (cross-chain stays pooled for the next Steady slot).
         if matches!(mode, SyncSlotMode::Catchup) {
-            let (Some(_), Some(ctx)) = (
-                self.inner.evm_composer.as_ref(),
-                self.inner.cc_exec_ctx.as_ref(),
-            ) else {
-                return None;
-            };
             return self
                 .dispatch_minimal_postbatch(
                     ctx,
@@ -758,137 +745,53 @@ where
             "drained held pool at Sync slot",
         );
 
-        // If the EvmComposer + exec ctx are wired, route each held L1
-        // raw_tx through `simulate_and_resolve` to detect cross-chain
-        // proxy calls. The cross-chain path also builds the Sync block
+        // Route each held source-chain transaction through
+        // `simulate_and_resolve`. The cross-chain path also builds the Sync block
         // locally (via reth-evm) and stamps that block's state root
         // into each postBatch's stateDelta.newState before sending —
         // so the deriver's `check_claimed_state` validates against the
         // same root reth will produce when it ingests the payload.
         //
-        // Cross-chain path returns the already-built Sync block so we
-        // don't redo the work here. Without it, the standalone fallback
-        // executes the drained transactions as ordinary type-0x2 calls.
-        if let (Some(evm_composer), Some(ctx)) = (
-            self.inner.evm_composer.as_ref(),
-            self.inner.cc_exec_ctx.as_ref(),
-        ) {
-            // Cross-chain mode is authoritative: `compose_via_evm_composer`
-            // builds the Sync block, registers the drained txs in the
-            // optimistic ledger, spawns the bundle observer, and
-            // returns the block for IMMEDIATE commit — L1 settlement
-            // is observed in the background and reconciled
-            // retroactively (re-push + reorg on failure). Do NOT fall
-            // through to the `build_sync_block` branch below —
-            // `drained` are L1 user txs (type-0x2 EOA calls targeting
-            // CCM-L1), not L2 system txs.
-            return match self
-                .compose_via_evm_composer(
-                    evm_composer,
-                    ctx,
-                    rollup_id,
-                    drained.clone(),
-                    &parent_header,
-                    timestamp,
-                    suggested_fee_recipient,
-                    bundle_target,
-                )
-                .await
-            {
-                Ok(Some(built)) => {
-                    event!(
-                        name: "eez.composer.sync_slot.built",
-                        Level::INFO,
-                        rollup_id,
-                        tx_count = drained_count,
-                        parent_number,
-                        timestamp,
-                        "built Sync block carrying {{tx_count}} held tx(s)",
-                    );
-                    Some(built)
-                }
-                Ok(None) => None,
-                Err(err) => {
-                    event!(
-                        name: "eez.composer.cc_compose.failed",
-                        Level::ERROR,
-                        rollup_id,
-                        error = %err,
-                        "cross-chain compose failed; Sequencer will commit an empty Sync block via fallback",
-                    );
-                    pool.push_front_batch(drained);
-                    None
-                }
-            };
-        }
-
-        let mut candidates = drained;
-        loop {
-            let raw_txs: Vec<Bytes> = candidates.iter().map(|tx| tx.raw_tx.clone()).collect();
-            match build_sync_block(
-                rollup.l2_provider.as_ref(),
-                &self.inner.evm_config,
+        // This path is authoritative: it builds the Sync block, registers the
+        // drained txs in the optimistic ledger, and observes L1 settlement in
+        // the background. The source transactions themselves are not generic
+        // L2 block inputs.
+        match self
+            .compose_via_evm_composer(
+                evm_composer,
+                ctx,
+                rollup_id,
+                drained.clone(),
                 &parent_header,
                 timestamp,
                 suggested_fee_recipient,
-                &raw_txs,
-            ) {
-                Ok(built) => {
-                    event!(
-                        name: "eez.composer.sync_slot.built",
-                        Level::INFO,
-                        rollup_id,
-                        tx_count = candidates.len(),
-                        parent_number,
-                        timestamp,
-                        "built Sync block (fallback) carrying {{tx_count}} held tx(s)",
-                    );
-                    pool.release_in_flight_batch(&candidates);
-                    return Some(SyncSlotBlock {
-                        payload: built.payload,
-                        header: built.header,
-                    });
-                }
-                Err(err) => {
-                    let failed_idx = match &err {
-                        BuildError::DecodeTx { idx, .. }
-                        | BuildError::RecoverSigner { idx }
-                        | BuildError::ExecuteTx { idx, .. } => Some(*idx),
-                        BuildError::Provider(_) | BuildError::Builder(_) => None,
-                    };
-                    if let Some(failed_idx) = failed_idx
-                        && let Some((root, evicted)) =
-                            remove_failed_nonce_chain(&mut candidates, failed_idx)
-                    {
-                        let queued_evicted =
-                            pool.evict_nonce_chain_from(root.sender, root.direction, root.nonce);
-                        event!(
-                            name: "eez.composer.sync_slot.tx_evicted",
-                            Level::WARN,
-                            rollup_id,
-                            tx_hash = %root.hash,
-                            sender = %root.sender,
-                            nonce = root.nonce,
-                            direction = ?root.direction,
-                            error = %err,
-                            batch_evicted = evicted.len(),
-                            queued_evicted = queued_evicted.len(),
-                            "standalone Sync block rejected a transaction; evicting its nonce chain and retrying",
-                        );
-                        continue;
-                    }
-
-                    event!(
-                        name: "eez.composer.sync_slot.build_failed",
-                        Level::ERROR,
-                        rollup_id,
-                        tx_count = candidates.len(),
-                        error = %err,
-                        "standalone Sync block build failed systemically; retaining held txs and falling back to vanilla Sync block",
-                    );
-                    pool.push_front_batch(candidates);
-                    return None;
-                }
+                bundle_target,
+            )
+            .await
+        {
+            Ok(Some(built)) => {
+                event!(
+                    name: "eez.composer.sync_slot.built",
+                    Level::INFO,
+                    rollup_id,
+                    tx_count = drained_count,
+                    parent_number,
+                    timestamp,
+                    "built Sync block carrying {{tx_count}} held tx(s)",
+                );
+                Some(built)
+            }
+            Ok(None) => None,
+            Err(err) => {
+                event!(
+                    name: "eez.composer.cc_compose.failed",
+                    Level::ERROR,
+                    rollup_id,
+                    error = %err,
+                    "cross-chain compose failed; retaining held transactions while Sequencer commits a fallback Sync block",
+                );
+                pool.push_front_batch(drained);
+                None
             }
         }
     }
@@ -1077,7 +980,7 @@ where
                     }
                     !cascade
                 });
-                for t in pool.drain_sender_above(*sender, *direction, *nonce) {
+                for t in pool.evict_nonce_chain_from(*sender, *direction, *nonce) {
                     dropped += 1;
                     event!(
                         name: "eez.composer.recovery.nonce_chain_evicted",
@@ -1453,7 +1356,7 @@ where
         // a sender's nonce N is evicted, N+1.. can never land.
         if let Some(pool) = rollup.held_pool.as_ref() {
             for tx in &poison {
-                for t in pool.drain_sender_above(tx.sender, tx.direction, tx.nonce) {
+                for t in pool.evict_nonce_chain_from(tx.sender, tx.direction, tx.nonce) {
                     event!(
                         name: "eez.composer.cc_compose.poison_chain_evicted",
                         Level::WARN,
@@ -1466,7 +1369,6 @@ where
                     );
                 }
             }
-            pool.release_in_flight_batch(&poison);
             pool.release_in_flight_batch(&stale);
         }
 
@@ -2481,34 +2383,5 @@ mod tests {
 
         assert_eq!(poison.len(), 2);
         assert_eq!(gaps, vec![(sender, Direction::Inbound, 7)]);
-    }
-
-    #[test]
-    fn failed_standalone_tx_removes_only_its_nonce_chain_suffix() {
-        let sender = Address::repeat_byte(0xd);
-        let other = Address::repeat_byte(0xe);
-        let mut candidates = vec![
-            held(sender, Direction::Inbound, 0, 1),
-            held(other, Direction::Inbound, 0, 2),
-            held(sender, Direction::Inbound, 1, 3),
-            held(sender, Direction::Outbound, 1, 4),
-            held(sender, Direction::Inbound, 2, 5),
-        ];
-
-        let (root, evicted) = remove_failed_nonce_chain(&mut candidates, 2).unwrap();
-
-        assert_eq!(root.hash, TxHash::repeat_byte(3));
-        assert_eq!(
-            evicted.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
-            vec![TxHash::repeat_byte(3), TxHash::repeat_byte(5)]
-        );
-        assert_eq!(
-            candidates.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
-            vec![
-                TxHash::repeat_byte(1),
-                TxHash::repeat_byte(2),
-                TxHash::repeat_byte(4)
-            ]
-        );
     }
 }

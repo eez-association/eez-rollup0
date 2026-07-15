@@ -401,7 +401,8 @@ fn main() -> eyre::Result<()> {
         // BlockCommitter actor is the one the Deriver shares; rebuilding
         // would spawn a second actor with its own reconcile lock + head
         // mirror, splitting the serialization domain.
-        let (sequencer, umbrella, system_tx_cfg) = if mode == Mode::Composer {
+        let (sequencer, umbrella, system_tx_cfg, cross_chain_composer_wired) =
+            if mode == Mode::Composer {
             let proof_signer_key = env::var("EEZ_PROOF_SIGNER_KEY")
                 .map_err(|_| eyre::eyre!("EEZ_PROOF_SIGNER_KEY required in composer mode"))?;
             let proof_signer = PrivateKeySigner::from_bytes(&B256::from_str(
@@ -435,7 +436,8 @@ fn main() -> eyre::Result<()> {
             // the `FullNode` AddOns type resists a typed helper return.
             // L2 ENTRY client for OUTBOUND (L2→L1) source-sim — built inside the
             // block below alongside the L2 follower, threaded into `Composer::new`.
-            // `None` without an embedded L1 (outbound txs then evict at compose).
+            // `None` without an embedded L1; cross-chain fronts are rejected at
+            // startup in that configuration.
             let mut l2_entry_client: Option<
                 Arc<
                     dyn eez_protocol::executor::EntryChainClient<Protocol = eez_evm::EvmProtocol>
@@ -727,6 +729,8 @@ fn main() -> eyre::Result<()> {
                     this_rollup_id: ctx.l2_rollup_id,
                 }
             });
+            let cross_chain_composer_wired =
+                evm_composer.is_some() && cc_exec_ctx.is_some();
             let composer = Composer::new(
                 rollups,
                 prover,
@@ -755,7 +759,12 @@ fn main() -> eyre::Result<()> {
             // slot-context recovery can roll back failed optimistic Sync
             // blocks — the actor stays the sole engine-API owner.
             composer.set_committer(sequencer.committer());
-            (Some(sequencer), Some(composer), deriver_system_tx_cfg)
+            (
+                Some(sequencer),
+                Some(composer),
+                deriver_system_tx_cfg,
+                cross_chain_composer_wired,
+            )
         } else {
             // Follower: drop the placeholder Sequencer (BlockCommitter
             // survives via the cloned handle). Build a SystemTxContext
@@ -769,8 +778,18 @@ fn main() -> eyre::Result<()> {
                 enabled = follower_system_tx_cfg.is_some(),
                 "cross-chain system tx reconstruction config loaded",
             );
-            (None, None, follower_system_tx_cfg)
+            (None, None, follower_system_tx_cfg, false)
         };
+
+        if mode == Mode::Composer {
+            for port_env in ["EEZ_L1_XCHAIN_PORT", "EEZ_L2_XCHAIN_PORT"] {
+                require_xchain_composer_wiring(
+                    port_env,
+                    env::var_os(port_env).is_some(),
+                    cross_chain_composer_wired,
+                )?;
+            }
+        }
 
         // Deriver: drives BlockCommitter from L1Events (follower +
         // composer). A wired `SystemTxContext` makes it reconstruct the
@@ -1009,6 +1028,19 @@ fn parse_xchain_front_config(
     Ok(Some((port, url_raw.to_string(), parsed)))
 }
 
+fn require_xchain_composer_wiring(
+    port_env: &str,
+    front_enabled: bool,
+    composer_wired: bool,
+) -> eyre::Result<()> {
+    if front_enabled && !composer_wired {
+        return Err(eyre::eyre!(
+            "{port_env} enables cross-chain ingress, but the cross-chain composer is unavailable; configure embedded L1 composition or unset {port_env}"
+        ));
+    }
+    Ok(())
+}
+
 /// Build the [`EmbeddedL1Config`] from env; all vars optional, with dev
 /// defaults so the smoke harness only overrides what it needs.
 ///
@@ -1144,5 +1176,16 @@ mod tests {
         assert_eq!(port, 8546);
         assert_eq!(url, "http://127.0.0.1:8545");
         assert_eq!(parsed.as_str(), "http://127.0.0.1:8545/");
+    }
+
+    #[test]
+    fn xchain_front_requires_composer_wiring() {
+        let err = require_xchain_composer_wiring("PORT", true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("PORT enables cross-chain ingress"));
+
+        require_xchain_composer_wiring("PORT", true, true).unwrap();
+        require_xchain_composer_wiring("PORT", false, false).unwrap();
     }
 }
