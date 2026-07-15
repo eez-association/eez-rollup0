@@ -15,10 +15,11 @@ and observability services. Larger topologies belong in scheduled soak tests.
 1. Render `ci-args.yaml` with commit-specific candidate image tags.
 2. Build the node and deployment images.
 3. Start the reduced network and wait for rbuilder warmup.
-4. Check timestamp bounds and atomic rejection at the builder.
-5. Run a healthy mixed bidirectional wave after the rejected bundle.
-6. Check composer bundle receipts for all-or-none, ordered inclusion.
-7. Save a JSON result and service logs, then remove the enclave.
+4. Run the single cross-chain wave harness in `inbound`, `outbound`, and
+   `mixed` modes.
+5. Check convergence, settlement, L1/L2 state roots, and the L2 safe head in
+   each mode.
+6. Save a JSON result and service logs, then remove the enclave.
 
 The workflow runs this package for relevant pull requests on a GitHub-hosted
 Ubuntu runner. It installs and starts Kurtosis, uploads
@@ -48,6 +49,5 @@ Useful overrides:
 - `ci-args.yaml`: reduced topology and private test keys.
 - `run-ci.sh`: CI lifecycle entry point.
 - `start.sh` and `stop.sh`: local lifecycle helpers.
-- `scripts/verify-production-path.sh`: invariant entry point.
-- `scripts/assert-*.sh`: focused builder and receipt checks.
-- `scripts/cross-chain-wave.sh`: mixed cross-chain workload.
+- `scripts/verify-production-path.sh`: runs the wave harness in all three modes.
+- `scripts/cross-chain-wave.sh`: inbound, outbound, and mixed cross-chain workload.
