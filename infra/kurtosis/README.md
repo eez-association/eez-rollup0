@@ -30,7 +30,7 @@ the composer settles against real L1 state, in-process.
   │  │  rbuilder ◄─┐     ▼                                │   │  │ embedded L1 reth   │  │        │
   │  │  (el-5)     │   mev-boost-relay ◄── mev-boost      │   │  │  :18545 rpc         │  │        │
   │  │   ▲         │                                       │   │  │  :18551 engine(JWT)│  │        │
-  │  │   │ eth_sendBundle (http://el-5…:8545)              │   │  └───┼───────────────┘  │        │
+  │  │   │ eth_sendBundle (http://el-5…:8645)              │   │  └───┼───────────────┘  │        │
   │  │   └─────────┼───────────────────────────────────────┼───┤  ┌───┴──────────────┐  │        │
   │  │  spamoor (L1 load)   disruptoor (reorgs)            │   │  │ EvmComposer       │  │        │
   │  │                        block gossips over CL P2P ───┼──►│  │ (in-process reads)│  │        │
@@ -240,7 +240,7 @@ host-side commands, not the running `eez-node` container.
 | Service | Port id | In-container | Notes |
 |---------|---------|--------------|-------|
 | `el-1-reth-lighthouse` | `rpc` | 8545 | Canonical L1 JSON-RPC |
-| `el-5-reth-builder-lighthouse` | `rpc` | 8545 | `eth_sendBundle` target |
+| `el-5-reth-builder-lighthouse` | `rbuilder-rpc` | 8645 | `eth_sendBundle` target |
 | `eez-node` | `l2-rpc` | 18688 | L2 rollup JSON-RPC |
 | `eez-node` | `l1-engine` | 18551 | Engine API (follower dials this) |
 | `eez-node` | `l1-xchain` | 18999 | Cross-chain **Inbound** front (L1→L2); submit inbound ops here |

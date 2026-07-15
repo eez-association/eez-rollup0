@@ -18,8 +18,8 @@ L2_ENGINE_PORT = 18684
 L2_P2P_PORT = 30640
 L1_XCHAIN_PORT = 18999
 L2_XCHAIN_PORT = 18998
-# rbuilder exposes eth_sendBundle on the normal EL RPC port.
-BUILDER_FLASHBOTS_RPC_PORT = 8545
+# rbuilder exposes eth_sendBundle on its dedicated RPC port.
+BUILDER_FLASHBOTS_RPC_PORT = 8645
 MEV_RELAY_API_PORT = 9062
 
 # L2 genesis state root for genesis.json. Recompute if genesis alloc changes.
