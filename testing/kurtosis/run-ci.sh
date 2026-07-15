@@ -40,21 +40,32 @@ trap cleanup EXIT
 bash "$HERE/start.sh" "$KURTOSIS_ARGS_FILE"
 
 # Wait until the canonical L1 and candidate L2 RPCs answer.
+http_url() {
+    case "$1" in
+        "") printf '\n' ;;
+        http://* | https://*) printf '%s\n' "$1" ;;
+        *) printf 'http://%s\n' "$1" ;;
+    esac
+}
+
 deadline=$((SECONDS + ${EEZ_CI_READY_TIMEOUT_SECS:-900}))
 while (( SECONDS < deadline )); do
-    l1="$(kurtosis port print "$KURTOSIS_ENCLAVE" el-1-reth-lighthouse rpc 2>/dev/null || true)"
-    l2="$(kurtosis port print "$KURTOSIS_ENCLAVE" eez-node l2-rpc 2>/dev/null || true)"
+    l1="$(http_url "$(kurtosis port print "$KURTOSIS_ENCLAVE" el-1-reth-lighthouse rpc 2>/dev/null || true)")"
+    l2="$(http_url "$(kurtosis port print "$KURTOSIS_ENCLAVE" eez-node l2-rpc 2>/dev/null || true)")"
     if [[ -n "$l1" && -n "$l2" ]] \
-        && cast block-number --rpc-url "http://$l1" >/dev/null 2>&1 \
-        && cast block-number --rpc-url "http://$l2" >/dev/null 2>&1; then
+        && cast block-number --rpc-url "$l1" >/dev/null 2>&1 \
+        && cast block-number --rpc-url "$l2" >/dev/null 2>&1; then
         break
     fi
     sleep 5
 done
-(( SECONDS < deadline )) || { echo "CI network did not become RPC-ready" >&2; exit 1; }
+(( SECONDS < deadline )) || {
+    echo "CI network did not become RPC-ready (l1=$l1, l2=$l2)" >&2
+    exit 1
+}
 
 warmup_block="${EEZ_CI_BUILDER_WARMUP_BLOCK:-130}"
-while (( $(cast block-number --rpc-url "http://$l1") < warmup_block )); do
+while (( $(cast block-number --rpc-url "$l1") < warmup_block )); do
     (( SECONDS < deadline )) || { echo "builder did not warm up before block $warmup_block" >&2; exit 1; }
     sleep 5
 done

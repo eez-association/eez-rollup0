@@ -17,6 +17,11 @@ done
 kurtosis service logs "$ENCLAVE" eez-node 2>&1 \
     | sed 's/\x1b\[[0-9;]*m//g' >"$LOG_FILE"
 
+if grep -q 'relay has no eth_sendBundle; submitting txs via mempool' "$LOG_FILE"; then
+    echo "atomic assertion: composer used mempool fallback instead of rbuilder" >&2
+    exit 1
+fi
+
 mapfile -t dispatches < <(
     grep 'bundle_tx_hashes=' "$LOG_FILE" \
         | while IFS= read -r line; do

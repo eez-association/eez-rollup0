@@ -15,7 +15,7 @@ _ee_yaml() {
 }
 
 : "${EEZ_L1_RPC_URL:=$(_ee_http "$(_ee_port el-1-reth-lighthouse rpc)")}"
-: "${EEZ_L1_BUILDER_RPC_URL:=$(_ee_http "$(_ee_port "${KURTOSIS_BUILDER_SERVICE:-el-2-reth-builder-lighthouse}" rpc)")}"
+: "${EEZ_L1_BUILDER_RPC_URL:=$(_ee_http "$(_ee_port "${KURTOSIS_BUILDER_SERVICE:-el-2-reth-builder-lighthouse}" rbuilder-rpc)")}"
 : "${EEZ_L1_POSTER_KEY:=$(_ee_yaml poster_key)}"
 : "${EEZ_PROOF_SIGNER_KEY:=$(_ee_yaml proof_signer_key)}"
 : "${EEZ_BUNDLE_PROBE_KEY:=$(_ee_yaml probe_key)}"
