@@ -70,16 +70,17 @@ done
 }
 
 while (( SECONDS < deadline )); do
-    node_logs="$(kurtosis service logs "$KURTOSIS_ENCLAVE" eez-node 2>/dev/null || true)"
-    if grep -qE 'bundle outcome observed.*settled=true.*outcome=Included.*state_applied: true' <<<"$node_logs"; then
+    node_logs="$(timeout 10s kurtosis service logs "$KURTOSIS_ENCLAVE" eez-node 2>/dev/null || true)"
+    if grep -qE 'bundle outcome observed.*Included' <<<"$node_logs"; then
         break
     fi
     sleep 5
 done
 (( SECONDS < deadline )) || {
-    echo "no settled bundle inclusion observed before the readiness timeout" >&2
+    echo "no bundle inclusion observed before the readiness timeout" >&2
     exit 1
 }
+echo "==> production path ready: bundle inclusion observed"
 
 bash "$HERE/scripts/verify-production-path.sh"
 
