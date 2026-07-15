@@ -108,10 +108,17 @@ L2_UP=$(cast block-number --rpc-url "$L2" 2>/dev/null || echo "")
 [[ -n "$L2_UP" ]] || { echo "L2 RPC $L2 not reachable"; exit 1; }
 echo "    L1=$L1_UP L2=$L2_UP"
 
-gas_price_for() { # <rpc> -> wei
-    local gp
-    gp=$(cast gas-price --rpc-url "$1" 2>/dev/null || echo 1000000000)
-    echo "${EEZ_TEST_GAS_PRICE_WEI:-$gp}"
+PRIORITY_GAS_PRICE="${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1}"
+
+gas_price_for() { # <rpc> -> max fee in wei
+    local rpc="$1" gp base_hex base minimum
+    gp=$(cast gas-price --rpc-url "$rpc" 2>/dev/null || echo 1000000000)
+    gp="${EEZ_TEST_GAS_PRICE_WEI:-$gp}"
+    base_hex=$(cast block latest --field baseFeePerGas --rpc-url "$rpc" 2>/dev/null || echo 0)
+    base=$(cast to-dec "$base_hex" 2>/dev/null || echo 0)
+    minimum=$((2 * base + PRIORITY_GAS_PRICE))
+    (( gp < minimum )) && gp="$minimum"
+    echo "$gp"
 }
 
 fund_l1() {
@@ -119,14 +126,16 @@ fund_l1() {
     from_addr=$(cast wallet address --private-key "$FUND_FROM_KEY")
     nonce=$(retry cast nonce "$from_addr" --rpc-url "$L1")
     cast send "$to" --value 10ether --private-key "$FUND_FROM_KEY" --nonce "$nonce" \
-        --gas-price "$(gas_price_for "$L1")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1500000000}" --rpc-url "$L1" >/dev/null
+        --gas-price "$(gas_price_for "$L1")" \
+        --priority-gas-price "$PRIORITY_GAS_PRICE" --rpc-url "$L1" >/dev/null
 }
 
 fund_l2() {
     local to="$1" nonce
     nonce=$(retry cast nonce "$HH_KEY_2_ADDR" --rpc-url "$L2")
     cast send "$to" --value 10ether --private-key "$HH_KEY_2" --nonce "$nonce" \
-        --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" --rpc-url "$L2" >/dev/null
+        --gas-price "$(gas_price_for "$L2")" \
+        --priority-gas-price "$PRIORITY_GAS_PRICE" --rpc-url "$L2" >/dev/null
 }
 
 # ── Fund L1-side actors ──────────────────────────────────────────────
@@ -303,7 +312,7 @@ run_waves() {
         local side="$1" kind="$2" arg="$3" raw="" hash
         local GP PG
         GP=$(gas_price_for "$L1")
-        PG="${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1500000000}"
+        PG="$PRIORITY_GAS_PRICE"
         case "$side:$kind" in
             in:set)   raw=$(cast mktx --chain-id "$L1_CHAIN_ID" --private-key "$HH_KEY_IN" --nonce "$IN_NONCE" \
                         --gas-limit 600000 --gas-price "$GP" --priority-gas-price "$PG" \
@@ -318,16 +327,16 @@ run_waves() {
                         --gas-limit 600000 --gas-price "$GP" --priority-gas-price "$PG" --value "$arg" \
                         "$IN_DEP_PROXY") ;;
             out:set)   raw=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_OUT" --nonce "$OUT_NONCE" \
-                        --gas-limit 600000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" \
+                        --gas-limit 600000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "$PRIORITY_GAS_PRICE" \
                         "$OUT_VALUE_PROXY" 'setValue(uint256)' "$arg") ;;
             out:noret) raw=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_OUT" --nonce "$OUT_NONCE" \
-                        --gas-limit 600000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" \
+                        --gas-limit 600000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "$PRIORITY_GAS_PRICE" \
                         "$OUT_NORET_PROXY" 'setValue(uint256)' "$arg") ;;
             out:wrap)  raw=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_OUT" --nonce "$OUT_NONCE" \
-                        --gas-limit 800000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" \
+                        --gas-limit 800000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "$PRIORITY_GAS_PRICE" \
                         "$OUT_WRAPPER" 'setViaProxy(uint256)' "$arg") ;;
             out:wd)    raw=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_OUT" --nonce "$OUT_NONCE" \
-                        --gas-limit 600000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" --value "$arg" \
+                        --gas-limit 600000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "$PRIORITY_GAS_PRICE" --value "$arg" \
                         "$OUT_WD_PROXY") ;;
             *) echo "cross-chain wave: bad op $side:$kind"; exit 1 ;;
         esac
@@ -347,7 +356,7 @@ run_waves() {
         local count="$1" j raw
         for ((j=0; j<count; j++)); do
             raw=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_PURE" --nonce "$PURE_NONCE" \
-                --gas-limit 21000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1000000000}" \
+                --gas-limit 21000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "$PRIORITY_GAS_PRICE" \
                 --value 100000000 "$PURE_RECIPIENT" 2>&1)
             [[ "$raw" =~ ^0x[0-9a-fA-F]+$ ]] || break
             curl -s -X POST "$L2" -H 'Content-Type: application/json' \
@@ -493,20 +502,32 @@ run_waves() {
         echo "    ✗ no L2ExecutionPerformed event found"; ok_all=0
     fi
 
-    # L1's stored state root == L2's actual root at the last SETTLED Sync height.
-    local LAST_SETTLED L1_TRACKED L2_ROOT L2_SAFE
+    # L1's stored state root must converge with the current L2 safe block.
+    local LAST_SETTLED="" L1_TRACKED="" L1_RECHECK="" L2_ROOT="" L2_SAFE=0 SAFE_BLOCK=""
+    local root_deadline=$((SECONDS + ${EEZ_STATE_ROOT_WAIT_SECS:-30})) root_matched=0
     LAST_SETTLED=$(strip_ansi <"$NODE_LOG" | grep "bundle outcome observed" | grep "settled=true" \
         | grep -oE "sync_height=[0-9]+" | grep -oE "[0-9]+" | sort -n | tail -1 || true)
     if [[ -n "$LAST_SETTLED" ]]; then
-        L1_TRACKED=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint256)(address,bytes32,uint256)' \
-            "$EEZ_ROLLUP_ID" --rpc-url "$L1" | sed -n '2p' | tr -d '[:space:]')
-        L2_ROOT=$(cast block "$LAST_SETTLED" --rpc-url "$L2" --json | jq -r '.stateRoot')
-        if [[ "${L1_TRACKED,,}" == "${L2_ROOT,,}" ]]; then
-            echo "    ✓ L1 rollups($EEZ_ROLLUP_ID).stateRoot == L2 root at settled height $LAST_SETTLED"
+        while (( SECONDS < root_deadline )); do
+            L1_TRACKED=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint256)(address,bytes32,uint256)' \
+                "$EEZ_ROLLUP_ID" --rpc-url "$L1" | sed -n '2p' | tr -d '[:space:]')
+            SAFE_BLOCK=$(retry cast block safe --rpc-url "$L2" --json)
+            L2_SAFE=$(jq -r '.number' <<<"$SAFE_BLOCK" | xargs cast to-dec)
+            L2_ROOT=$(jq -r '.stateRoot' <<<"$SAFE_BLOCK")
+            L1_RECHECK=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint256)(address,bytes32,uint256)' \
+                "$EEZ_ROLLUP_ID" --rpc-url "$L1" | sed -n '2p' | tr -d '[:space:]')
+            if [[ "${L1_TRACKED,,}" == "${L1_RECHECK,,}" \
+                && "${L1_RECHECK,,}" == "${L2_ROOT,,}" ]]; then
+                root_matched=1
+                break
+            fi
+            sleep 1
+        done
+        if (( root_matched )); then
+            echo "    ✓ L1 rollups($EEZ_ROLLUP_ID).stateRoot == L2 safe root at height $L2_SAFE"
         else
-            echo "    ✗ L1 stateRoot $L1_TRACKED != L2 $L2_ROOT at height $LAST_SETTLED"; ok_all=0
+            echo "    ✗ L1 stateRoot $L1_RECHECK != L2 safe root $L2_ROOT at height $L2_SAFE"; ok_all=0
         fi
-        L2_SAFE=$(cast block safe --rpc-url "$L2" --json | jq -r '.number' | xargs cast to-dec)
         if (( L2_SAFE >= LAST_SETTLED )); then
             echo "    ✓ L2 safe head reached settled height: $L2_SAFE"
         else

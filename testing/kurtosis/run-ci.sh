@@ -4,7 +4,12 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-export KURTOSIS_ENCLAVE="${KURTOSIS_ENCLAVE:-eez-pr-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}}"
+if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
+    default_enclave="eez-pr-$GITHUB_RUN_ID-${GITHUB_RUN_ATTEMPT:-1}"
+else
+    default_enclave="eez-local-$(date +%s)-$$"
+fi
+export KURTOSIS_ENCLAVE="${KURTOSIS_ENCLAVE:-$default_enclave}"
 export KURTOSIS_BUILDER_SERVICE="${KURTOSIS_BUILDER_SERVICE:-el-2-reth-builder-lighthouse}"
 export KURTOSIS_PRIVILEGED=0
 
