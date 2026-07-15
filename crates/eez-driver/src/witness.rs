@@ -188,7 +188,7 @@ fn touched_storage_removal_state(
             .hashed_state
             .accounts
             .get(&hashed_address)
-            .cloned()
+            .copied()
             .ok_or_else(|| {
                 eyre::eyre!(
                     "execution witness record has storage changes for {hashed_address} \
@@ -210,7 +210,7 @@ fn touched_storage_removal_state(
 }
 
 fn extend_unique_by_hash(target: &mut Vec<Bytes>, extra: impl IntoIterator<Item = Bytes>) -> usize {
-    let mut seen: HashSet<B256> = target.iter().map(|node| keccak256(node)).collect();
+    let mut seen: HashSet<B256> = target.iter().map(keccak256).collect();
     let mut added = 0usize;
 
     for node in extra {

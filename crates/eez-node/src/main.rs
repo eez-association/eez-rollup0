@@ -7,13 +7,15 @@
 //!
 //! # Modes
 //!
-//! Mode is decided by env-var presence at startup:
+//! Mode is decided by env-var presence at startup. "Can attest" =
+//! `EEZ_PROVER_URL` (remote prover; composer needs only `EEZ_ATTESTER_ADDRESS`,
+//! never the key) OR `EEZ_PROOF_SIGNER_KEY` (local mock signer):
 //!
-//! | `EEZ_L1_RPC_URL` | `EEZ_PROOF_SIGNER_KEY` | Mode | Stack |
+//! | `EEZ_L1_RPC_URL` | can attest | Mode | Stack |
 //! |---|---|---|---|
 //! | unset | — | **standalone** | reth + Sequencer (interval Scheduler, Live blocks only) |
-//! | set | unset | **follower** | reth + `L1Watcher` + Deriver (no Sequencer) |
-//! | set | set | **composer** | reth + `L1Watcher` + Deriver + Sequencer (L1-anchored) + Composer umbrella |
+//! | set | no | **follower** | reth + `L1Watcher` + Deriver (no Sequencer) |
+//! | set | yes | **composer** | reth + `L1Watcher` + Deriver + Sequencer (L1-anchored) + Composer umbrella |
 
 mod bundle_rpc;
 mod follower;
@@ -80,8 +82,14 @@ enum EmbeddedL1<Dev, Chiado> {
 impl Mode {
     fn from_env() -> Self {
         let l1_enabled = env::var_os("EEZ_L1_RPC_URL").is_some();
-        let proof_signer_set = env::var_os("EEZ_PROOF_SIGNER_KEY").is_some();
-        match (l1_enabled, proof_signer_set) {
+        // A composer needs an attestation source: a remote prover
+        // (`EEZ_PROVER_URL`, which holds the key remotely — the composer only
+        // needs `EEZ_ATTESTER_ADDRESS`) or a local mock signer
+        // (`EEZ_PROOF_SIGNER_KEY`). Either presence marks composer mode; a
+        // follower has L1 but neither.
+        let can_attest = env::var_os("EEZ_PROVER_URL").is_some()
+            || env::var_os("EEZ_PROOF_SIGNER_KEY").is_some();
+        match (l1_enabled, can_attest) {
             (false, _) => Self::Standalone,
             (true, false) => Self::Follower,
             (true, true) => Self::Composer,
@@ -416,19 +424,28 @@ fn main() -> eyre::Result<()> {
         // would spawn a second actor with its own reconcile lock + head
         // mirror, splitting the serialization domain.
         let (sequencer, umbrella, system_tx_cfg) = if mode == Mode::Composer {
-            let proof_signer_key = env::var("EEZ_PROOF_SIGNER_KEY")
-                .map_err(|_| eyre::eyre!("EEZ_PROOF_SIGNER_KEY required in composer mode"))?;
-            let proof_signer = PrivateKeySigner::from_bytes(&B256::from_str(
-                proof_signer_key.trim_start_matches("0x"),
-            )?)?;
-            // Remote-prover mode (EEZ_PROVER_URL): dial eez-proverd, verifying its
-            // attestations against the attester address. Mock is the default.
+            // Attestation source. Remote mode (`EEZ_PROVER_URL`) holds NO signing
+            // key in the composer: it dials eez-proverd and only VERIFIES that each
+            // attestation recovers to the configured attester address (the on-chain
+            // proof-system check is authoritative; this is a fail-fast).
             let prover: Arc<dyn eez_prover::Prover> = match env::var("EEZ_PROVER_URL") {
-                Ok(url) => Arc::new(eez_prover_client::RemoteProver::new(
-                    url,
-                    proof_signer.address(),
-                )),
-                Err(_) => Arc::new(MockEcdsaProver::new(proof_signer)),
+                Ok(url) => {
+                    let attester = env::var("EEZ_ATTESTER_ADDRESS").map_err(|_| {
+                        eyre::eyre!("EEZ_ATTESTER_ADDRESS required in remote-prover mode")
+                    })?;
+                    let attester = Address::from_str(attester.trim())
+                        .map_err(|e| eyre::eyre!("EEZ_ATTESTER_ADDRESS: {e}"))?;
+                    Arc::new(eez_prover_client::RemoteProver::new(url, attester))
+                }
+                Err(_) => {
+                    let key = env::var("EEZ_PROOF_SIGNER_KEY").map_err(|_| {
+                        eyre::eyre!("EEZ_PROOF_SIGNER_KEY required in mock-prover mode")
+                    })?;
+                    let signer = PrivateKeySigner::from_bytes(&B256::from_str(
+                        key.trim_start_matches("0x"),
+                    )?)?;
+                    Arc::new(MockEcdsaProver::new(signer))
+                }
             };
             let rollup_id = rollup_config.rollup_id;
             // Share the SAME HeldPool the ingress middleware pushes into
@@ -1110,7 +1127,7 @@ fn warn_on_deprecated_env() {
                 name: "eez.node.env.deprecated",
                 Level::WARN,
                 env = name,
-                "env var is ignored; mode is derived from EEZ_L1_RPC_URL + EEZ_PROOF_SIGNER_KEY presence (see crate docs)."
+                "env var is ignored; mode is derived from EEZ_L1_RPC_URL + (EEZ_PROVER_URL | EEZ_PROOF_SIGNER_KEY) presence (see crate docs)."
             );
         }
     }

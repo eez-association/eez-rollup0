@@ -327,7 +327,6 @@ pub(crate) fn system_tx_flags_from_rlp(block_rlp: &[u8], ccm_l2_address: Address
 /// Pair-end classification over per-tx system flags: position `i` ends a pair
 /// iff tx `i` is a USER tx, or a SYSTEM tx NOT followed by a user tx (a
 /// standalone inbound delivery).
-
 /// (#10) `true` iff no SYSTEM tx in the block REVERTED, per the validator's
 /// re-executed receipt statuses. A reverted-but-sealed system tx passes every
 /// calldata-derived gate vacuously (the inbound result is read from CALLDATA),
@@ -904,7 +903,6 @@ mod tests {
             abi_calldata: encode_postbatch(&batch),
             public_inputs_hash: claimed.to_vec(),
             l1_block_hash: Vec::new(),
-            ..Default::default()
         }
     }
 
@@ -1311,7 +1309,6 @@ mod tests {
             abi_calldata: dec("abi_calldata"),
             public_inputs_hash: dec("public_inputs_hash"),
             l1_block_hash: dec("l1_block_hash"), // 0x → empty → timeless
-            ..Default::default()
         };
         // MockEcdsaProver vkey = bytes32(uint160(authorizedSigner = hardhat #0)).
         let vkey: B256 = "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
