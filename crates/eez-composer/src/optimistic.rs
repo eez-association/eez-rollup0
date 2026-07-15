@@ -87,13 +87,11 @@ struct InFlight {
     post_batch_hash: TxHash,
     parent: SealedHeader<alloy_consensus::Header>,
     resolution: Resolution,
-    /// Whether the held pool's in-flight nonce reservation has already
-    /// been released for this entry. This is independent from
-    /// `resolution`: the observer can mark an entry Settled before the
-    /// Deriver cursor catches up, but nonce admission must release only
-    /// when the cursor/finality path makes it safe to accept follow-up
-    /// nonces.
-    nonce_reservation_released: bool,
+    /// Whether the Deriver cursor has confirmed this entry. This is
+    /// independent from `resolution`: the observer can mark an entry
+    /// Settled first, while cursor confirmation owns the held pool's
+    /// one-time in-flight cleanup.
+    cursor_confirmed: bool,
     /// Set by `mark_failed` when the drop was a skipped-slot miss.
     slot_skipped: bool,
 }
@@ -132,7 +130,7 @@ impl OptimisticallyIncluded {
                 post_batch_hash,
                 parent,
                 resolution: Resolution::Pending,
-                nonce_reservation_released: false,
+                cursor_confirmed: false,
                 slot_skipped: false,
             },
         );
@@ -162,17 +160,17 @@ impl OptimisticallyIncluded {
     /// the held pool can release their in-flight nonce reservations.
     pub fn resolve_below_cursor(&self, cursor: u64) -> Vec<HeldTx> {
         let mut map = self.by_sync_height.lock().unwrap();
-        let mut newly_settled = Vec::new();
+        let mut newly_cursor_confirmed = Vec::new();
         for (_, entry) in map.range_mut(..=cursor) {
             if entry.resolution != Resolution::Settled {
                 entry.resolution = Resolution::Settled;
             }
-            if !entry.nonce_reservation_released {
-                newly_settled.extend(entry.txs.iter().cloned());
-                entry.nonce_reservation_released = true;
+            if !entry.cursor_confirmed {
+                newly_cursor_confirmed.extend(entry.txs.iter().cloned());
+                entry.cursor_confirmed = true;
             }
         }
-        newly_settled
+        newly_cursor_confirmed
     }
 
     /// Observer verdict: the bundle settled on L1. Entry is retained
@@ -234,7 +232,7 @@ impl OptimisticallyIncluded {
                 post_batch_hash: batch.post_batch_hash,
                 parent: batch.parent,
                 resolution: Resolution::Failed,
-                nonce_reservation_released: false,
+                cursor_confirmed: false,
                 slot_skipped: batch.slot_skipped,
             },
         );

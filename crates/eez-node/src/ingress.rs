@@ -50,10 +50,10 @@ pub enum Admission {
 /// SOURCE chain (`validation_provider`), and push into `held_pool` with
 /// `direction`.
 ///
-/// The nonce must be contiguous with the sender's queued plus in-flight chain
-/// for this direction (`on_chain + reserved_count_for(sender, direction)`): a
-/// gapped held tx would poison the all-or-nothing bundle and break
-/// bundle-mates' chains. `None` provider skips validation (dev / no-RPC).
+/// The nonce must be the first unreserved nonce at or above the source-chain
+/// nonce for this direction: a gapped held tx would poison the all-or-nothing
+/// bundle and break bundle-mates' chains. `None` provider skips validation
+/// (dev / no-RPC).
 pub async fn gate_and_hold(
     envelope: &TxEnvelope,
     raw_tx: &Bytes,
@@ -97,8 +97,8 @@ pub async fn gate_and_hold(
         };
         if let Err(err) = held_pool.push_contiguous(tx, on_chain) {
             return Admission::Rejected(format!(
-                "invalid nonce {nonce} for {sender}: expected {} (on-chain {} + {} queued/in-flight)",
-                err.expected, err.on_chain, err.reserved
+                "invalid nonce {nonce} for {sender}: expected next unreserved nonce {} (source-chain nonce {})",
+                err.expected, err.on_chain
             ));
         }
     } else {
@@ -429,10 +429,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gate_counts_in_flight_nonce_reservations() {
+    async fn gate_handles_landed_but_not_derived_reservation() {
         let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap();
         let (first, first_raw) = signed_transfer(&signer, 0, 1);
         let (same_nonce, same_nonce_raw) = signed_transfer(&signer, 0, 2);
+        let (next, next_raw) = signed_transfer(&signer, 1, 3);
+        let (gapped, gapped_raw) = signed_transfer(&signer, 2, 4);
         let pool = HeldPool::new();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
@@ -441,6 +443,10 @@ mod tests {
             asserter.push_success(&U256::from(1_000_000u64));
             asserter.push_success(&0_u64);
         }
+        asserter.push_success(&U256::from(1_000_000u64));
+        asserter.push_success(&1_u64);
+        asserter.push_success(&U256::from(1_000_000u64));
+        asserter.push_success(&1_u64);
 
         assert!(matches!(
             gate_and_hold(
@@ -457,10 +463,6 @@ mod tests {
         let drained = pool.pop_n(1);
         assert_eq!(drained.len(), 1);
         assert_eq!(pool.len(), 0);
-        assert_eq!(
-            pool.reserved_count_for(signer.address(), Direction::Inbound),
-            1
-        );
 
         let rejected = gate_and_hold(
             &same_nonce,
@@ -473,8 +475,26 @@ mod tests {
         let Admission::Rejected(message) = rejected else {
             panic!("same nonce should be rejected while first tx is in flight");
         };
-        assert!(message.contains("expected 1"));
-        assert!(message.contains("queued/in-flight"));
+        assert!(message.contains("nonce 1"), "{message}");
+        assert!(message.contains("next unreserved nonce"), "{message}");
+
+        let rejected = gate_and_hold(
+            &gapped,
+            &gapped_raw,
+            Direction::Inbound,
+            &pool,
+            Some(&provider),
+        )
+        .await;
+        let Admission::Rejected(message) = rejected else {
+            panic!("nonce 2 must not be admitted while nonce 1 is unreserved");
+        };
+        assert!(message.contains("nonce 1"), "{message}");
+
+        assert!(matches!(
+            gate_and_hold(&next, &next_raw, Direction::Inbound, &pool, Some(&provider),).await,
+            Admission::Held(_)
+        ));
     }
 
     #[test]

@@ -80,15 +80,13 @@ pub enum HoldInsert {
 pub struct NonceAdmissionError {
     pub expected: u64,
     pub on_chain: u64,
-    pub reserved: u64,
 }
 
 #[derive(Debug, Default)]
 struct PoolState {
     txs: VecDeque<HeldTx>,
     by_hash: HashMap<TxHash, usize>,
-    in_flight_hashes: HashSet<TxHash>,
-    in_flight_counts: HashMap<(Address, Direction), usize>,
+    in_flight: HashMap<TxHash, (Address, Direction, u64)>,
 }
 
 impl PoolState {
@@ -106,17 +104,33 @@ impl PoolState {
             .count()
     }
 
-    fn reserved_count_for(&self, sender: Address, direction: Direction) -> usize {
-        self.queued_count_for(sender, direction)
-            + self
-                .in_flight_counts
-                .get(&(sender, direction))
-                .copied()
-                .unwrap_or(0)
+    fn next_expected_nonce(
+        &self,
+        sender: Address,
+        direction: Direction,
+        on_chain: u64,
+    ) -> Option<u64> {
+        let reserved: HashSet<u64> = self
+            .txs
+            .iter()
+            .filter(|tx| tx.sender == sender && tx.direction == direction)
+            .map(|tx| tx.nonce)
+            .chain(
+                self.in_flight
+                    .values()
+                    .filter(|(s, d, _)| *s == sender && *d == direction)
+                    .map(|(_, _, nonce)| *nonce),
+            )
+            .collect();
+        let mut expected = on_chain;
+        while reserved.contains(&expected) {
+            expected = expected.checked_add(1)?;
+        }
+        Some(expected)
     }
 
     fn contains_hash(&self, hash: TxHash) -> bool {
-        self.by_hash.contains_key(&hash) || self.in_flight_hashes.contains(&hash)
+        self.by_hash.contains_key(&hash) || self.in_flight.contains_key(&hash)
     }
 
     fn push_back(&mut self, tx: HeldTx) -> HoldInsert {
@@ -139,25 +153,13 @@ impl PoolState {
     }
 
     fn mark_in_flight(&mut self, tx: &HeldTx) {
-        if self.in_flight_hashes.insert(tx.hash) {
-            *self
-                .in_flight_counts
-                .entry((tx.sender, tx.direction))
-                .or_insert(0) += 1;
-        }
+        self.in_flight
+            .entry(tx.hash)
+            .or_insert((tx.sender, tx.direction, tx.nonce));
     }
 
     fn release_in_flight(&mut self, tx: &HeldTx) {
-        if !self.in_flight_hashes.remove(&tx.hash) {
-            return;
-        }
-        let key = (tx.sender, tx.direction);
-        if let Some(count) = self.in_flight_counts.get_mut(&key) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.in_flight_counts.remove(&key);
-            }
-        }
+        self.in_flight.remove(&tx.hash);
     }
 }
 
@@ -180,8 +182,9 @@ impl HeldPool {
         Self::default()
     }
 
-    /// Append `tx` to the pool. Idempotent on duplicate hash (later
-    /// `push` of an already-held hash is a no-op).
+    /// Append `tx` to the pool without source-chain nonce validation.
+    /// Idempotent on duplicate hash. Production ingress supplies a provider
+    /// and uses [`Self::push_contiguous`]; this path supports dev/no-RPC use.
     pub fn push(&self, tx: HeldTx) {
         self.state
             .lock()
@@ -189,8 +192,10 @@ impl HeldPool {
             .push_back(tx);
     }
 
-    /// Append `tx` only if it is contiguous with queued + in-flight txs for
-    /// `(sender, direction)`. Duplicate hashes are accepted as idempotent.
+    /// Append `tx` only if it extends the contiguous queued + in-flight nonce
+    /// chain for `(sender, direction)`. Reservations below `on_chain` have
+    /// already landed and do not advance the expected nonce a second time.
+    /// Duplicate hashes are accepted as idempotent.
     pub fn push_contiguous(
         &self,
         tx: HeldTx,
@@ -200,14 +205,14 @@ impl HeldPool {
         if state.contains_hash(tx.hash) {
             return Ok(HoldInsert::Duplicate);
         }
-        let reserved = state.reserved_count_for(tx.sender, tx.direction) as u64;
-        let expected = on_chain.saturating_add(reserved);
-        if tx.nonce != expected {
+        let Some(expected) = state.next_expected_nonce(tx.sender, tx.direction, on_chain) else {
             return Err(NonceAdmissionError {
-                expected,
+                expected: u64::MAX,
                 on_chain,
-                reserved,
             });
+        };
+        if tx.nonce != expected {
+            return Err(NonceAdmissionError { expected, on_chain });
         }
         Ok(state.push_back(tx))
     }
@@ -234,16 +239,6 @@ impl HeldPool {
             .queued_count_for(sender, direction)
     }
 
-    /// Number of queued plus in-flight txs from `sender` on the `direction`
-    /// nonce chain.
-    #[must_use]
-    pub fn reserved_count_for(&self, sender: Address, direction: Direction) -> usize {
-        self.state
-            .lock()
-            .expect("held_pool mutex poisoned")
-            .reserved_count_for(sender, direction)
-    }
-
     /// Release txs that were drained into an optimistic bundle and are now
     /// known not to need nonce reservation anymore.
     pub fn release_in_flight_batch(&self, txs: &[HeldTx]) {
@@ -251,6 +246,34 @@ impl HeldPool {
         for tx in txs {
             state.release_in_flight(tx);
         }
+    }
+
+    /// Atomically evict every queued and in-flight reservation at or above
+    /// `nonce` in one sender/direction chain. Returns queued transactions that
+    /// were removed; callers already own any matching in-flight transactions.
+    #[must_use]
+    pub fn evict_nonce_chain_from(
+        &self,
+        sender: Address,
+        direction: Direction,
+        nonce: u64,
+    ) -> Vec<HeldTx> {
+        let mut state = self.state.lock().expect("held_pool mutex poisoned");
+        let mut evicted = Vec::new();
+        let mut kept = VecDeque::with_capacity(state.txs.len());
+        for tx in state.txs.drain(..) {
+            if tx.sender == sender && tx.direction == direction && tx.nonce >= nonce {
+                evicted.push(tx);
+            } else {
+                kept.push_back(tx);
+            }
+        }
+        state.txs = kept;
+        state
+            .in_flight
+            .retain(|_, (s, d, n)| !(*s == sender && *d == direction && *n >= nonce));
+        state.rebuild_index();
+        evicted
     }
 
     /// Remove and return every held tx from `sender` on the `direction` nonce
@@ -372,6 +395,13 @@ mod tests {
     use super::*;
     use alloy_primitives::B256;
 
+    fn insert(pool: &HeldPool, tx: HeldTx, on_chain: u64) {
+        assert_eq!(
+            pool.push_contiguous(tx, on_chain).unwrap(),
+            HoldInsert::Inserted
+        );
+    }
+
     fn tx(byte: u8) -> HeldTx {
         tx_dir(byte, Direction::Inbound)
     }
@@ -390,9 +420,9 @@ mod tests {
     #[test]
     fn push_then_pop_returns_fifo() {
         let pool = HeldPool::new();
-        pool.push(tx(1));
-        pool.push(tx(2));
-        pool.push(tx(3));
+        insert(&pool, tx(1), 1);
+        insert(&pool, tx(2), 2);
+        insert(&pool, tx(3), 3);
         let drained = pool.pop_all();
         assert_eq!(drained.len(), 3);
         assert_eq!(drained[0].hash, TxHash::from(B256::repeat_byte(1)));
@@ -403,17 +433,20 @@ mod tests {
     #[test]
     fn push_dedupes_by_hash() {
         let pool = HeldPool::new();
-        pool.push(tx(1));
-        pool.push(tx(1));
+        insert(&pool, tx(1), 1);
+        assert_eq!(
+            pool.push_contiguous(tx(1), 1).unwrap(),
+            HoldInsert::Duplicate
+        );
         assert_eq!(pool.len(), 1);
     }
 
     #[test]
     fn drain_matching_removes_only_listed() {
         let pool = HeldPool::new();
-        pool.push(tx(1));
-        pool.push(tx(2));
-        pool.push(tx(3));
+        insert(&pool, tx(1), 1);
+        insert(&pool, tx(2), 2);
+        insert(&pool, tx(3), 3);
         let drained = pool.drain_matching(&[TxHash::from(B256::repeat_byte(2))]);
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].hash, TxHash::from(B256::repeat_byte(2)));
@@ -425,7 +458,7 @@ mod tests {
 
     #[test]
     fn contiguity_is_isolated_per_direction() {
-        // Same EOA, two independent nonce chains. Counting / draining one
+        // Same EOA, two independent nonce chains. Admission / draining one
         // direction must never touch the other.
         let pool = HeldPool::new();
         let sender = Address::repeat_byte(7);
@@ -437,10 +470,10 @@ mod tests {
             nonce,
             direction: dir,
         };
-        pool.push(mk(0, Direction::Inbound, 1));
-        pool.push(mk(1, Direction::Inbound, 2));
-        pool.push(mk(0, Direction::Outbound, 3));
-        pool.push(mk(1, Direction::Outbound, 4));
+        insert(&pool, mk(0, Direction::Inbound, 1), 0);
+        insert(&pool, mk(1, Direction::Inbound, 2), 0);
+        insert(&pool, mk(0, Direction::Outbound, 3), 0);
+        insert(&pool, mk(1, Direction::Outbound, 4), 0);
 
         assert_eq!(pool.held_count_for(sender, Direction::Inbound), 2);
         assert_eq!(pool.held_count_for(sender, Direction::Outbound), 2);
@@ -461,7 +494,7 @@ mod tests {
     #[test]
     fn drain_matching_empty_is_noop() {
         let pool = HeldPool::new();
-        pool.push(tx(1));
+        insert(&pool, tx(1), 1);
         let drained = pool.drain_matching(&[]);
         assert!(drained.is_empty());
         assert_eq!(pool.len(), 1);
@@ -485,14 +518,18 @@ mod tests {
             HoldInsert::Inserted
         );
         let err = pool.push_contiguous(mk(0, 2), 0).unwrap_err();
-        assert_eq!(err.expected, 1);
-        assert_eq!(err.on_chain, 0);
-        assert_eq!(err.reserved, 1);
+        assert_eq!(
+            err,
+            NonceAdmissionError {
+                expected: 1,
+                on_chain: 0
+            }
+        );
         assert_eq!(pool.len(), 1);
     }
 
     #[test]
-    fn contiguous_push_counts_in_flight_reservations() {
+    fn contiguous_push_handles_landed_but_not_derived_reservation() {
         let pool = HeldPool::new();
         let sender = Address::repeat_byte(0xa);
         let mk = |nonce: u64, h: u8| HeldTx {
@@ -508,12 +545,106 @@ mod tests {
         let drained = pool.pop_n(1);
         assert_eq!(drained.len(), 1);
         assert_eq!(pool.held_count_for(sender, Direction::Inbound), 0);
-        assert_eq!(pool.reserved_count_for(sender, Direction::Inbound), 1);
 
-        pool.push_contiguous(mk(1, 2), 0).unwrap();
-        assert_eq!(pool.reserved_count_for(sender, Direction::Inbound), 2);
+        // Before landing, nonce 0 is supplied by the in-flight reservation.
+        assert_eq!(
+            pool.push_contiguous(mk(1, 2), 0).unwrap(),
+            HoldInsert::Inserted
+        );
+
+        // Once nonce 0 lands, the source-chain nonce advances to 1 while the
+        // reservation remains until Deriver confirmation. It must not be
+        // counted a second time; queued nonce 1 makes nonce 2 the next value.
+        assert_eq!(
+            pool.push_contiguous(mk(2, 3), 1).unwrap(),
+            HoldInsert::Inserted
+        );
+        let err = pool.push_contiguous(mk(4, 4), 1).unwrap_err();
+        assert_eq!(
+            err,
+            NonceAdmissionError {
+                expected: 3,
+                on_chain: 1
+            }
+        );
+
         pool.release_in_flight_batch(&drained);
-        assert_eq!(pool.reserved_count_for(sender, Direction::Inbound), 1);
+    }
+
+    #[test]
+    fn contiguous_push_fills_an_existing_reserved_gap() {
+        let pool = HeldPool::new();
+        let sender = Address::repeat_byte(0xb);
+        let mk = |nonce: u64, h: u8| HeldTx {
+            raw_tx: Bytes::from(vec![h; 4]),
+            hash: TxHash::from(B256::repeat_byte(h)),
+            attempts: 0,
+            sender,
+            nonce,
+            direction: Direction::Outbound,
+        };
+
+        pool.push(mk(2, 1));
+        assert_eq!(
+            pool.push_contiguous(mk(1, 2), 1).unwrap(),
+            HoldInsert::Inserted
+        );
+    }
+
+    #[test]
+    fn contiguous_push_caps_exhausted_nonce_space_at_max() {
+        let pool = HeldPool::new();
+        let sender = Address::repeat_byte(0xd);
+        let mk = |h: u8| HeldTx {
+            raw_tx: Bytes::from(vec![h; 4]),
+            hash: TxHash::from(B256::repeat_byte(h)),
+            attempts: 0,
+            sender,
+            nonce: u64::MAX,
+            direction: Direction::Inbound,
+        };
+
+        insert(&pool, mk(1), u64::MAX);
+        assert_eq!(
+            pool.push_contiguous(mk(2), u64::MAX).unwrap_err(),
+            NonceAdmissionError {
+                expected: u64::MAX,
+                on_chain: u64::MAX
+            }
+        );
+    }
+
+    #[test]
+    fn nonce_chain_eviction_removes_queued_and_in_flight_suffix_atomically() {
+        let pool = HeldPool::new();
+        let sender = Address::repeat_byte(0xe);
+        let mk = |nonce: u64, h: u8| HeldTx {
+            raw_tx: Bytes::from(vec![h; 4]),
+            hash: TxHash::from(B256::repeat_byte(h)),
+            attempts: 0,
+            sender,
+            nonce,
+            direction: Direction::Inbound,
+        };
+        for nonce in 0..=3 {
+            insert(&pool, mk(nonce, nonce as u8 + 1), 0);
+        }
+        let drained = pool.pop_n(3);
+        assert_eq!(
+            drained.iter().map(|tx| tx.nonce).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        let queued = pool.evict_nonce_chain_from(sender, Direction::Inbound, 1);
+
+        assert_eq!(
+            queued.iter().map(|tx| tx.nonce).collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(
+            pool.push_contiguous(mk(1, 5), 0).unwrap(),
+            HoldInsert::Inserted
+        );
     }
 
     #[test]
@@ -530,10 +661,10 @@ mod tests {
             direction: Direction::Inbound,
         };
 
-        pool.push(mk(sender_a, 0, 1));
-        pool.push(mk(sender_a, 1, 2));
-        pool.push(mk(sender_a, 2, 3));
-        pool.push(mk(sender_b, 0, 4));
+        insert(&pool, mk(sender_a, 0, 1), 0);
+        insert(&pool, mk(sender_a, 1, 2), 0);
+        insert(&pool, mk(sender_a, 2, 3), 0);
+        insert(&pool, mk(sender_b, 0, 4), 0);
 
         let drained = pool.pop_n(3);
         let hashes: Vec<_> = drained.iter().map(|tx| tx.hash).collect();

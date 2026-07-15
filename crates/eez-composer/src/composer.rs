@@ -38,7 +38,7 @@ use tracing::{Level, event};
 
 use crate::held_pool::HeldTx;
 use crate::ingress::Direction;
-use crate::local::build_sync_block;
+use crate::local::{BuildError, build_sync_block};
 use crate::optimistic::OptimisticallyIncluded;
 use crate::rollup::RollupState;
 
@@ -207,6 +207,23 @@ fn push_poison_root(
         poison_gaps.push(gap);
     }
     poison.push(tx);
+}
+
+fn remove_failed_nonce_chain(
+    candidates: &mut Vec<HeldTx>,
+    failed_idx: usize,
+) -> Option<(HeldTx, Vec<HeldTx>)> {
+    let root = candidates.get(failed_idx)?.clone();
+    let mut evicted = Vec::new();
+    candidates.retain(|tx| {
+        let remove =
+            tx.sender == root.sender && tx.direction == root.direction && tx.nonce >= root.nonce;
+        if remove {
+            evicted.push(tx.clone());
+        }
+        !remove
+    });
+    Some((root, evicted))
 }
 
 /// Composer umbrella. Cheaply [`Clone`]able (`Arc<Inner>`).
@@ -623,9 +640,9 @@ where
         // While blocked the slot still gets its (empty) Sync block — L2
         // cadence is unconditional; the next postBatch covers it.
         let cursor = rollup.l1_head.cursor();
-        let newly_settled = rollup.optimistic.resolve_below_cursor(cursor);
-        if !newly_settled.is_empty() {
-            pool.release_in_flight_batch(&newly_settled);
+        let newly_cursor_confirmed = rollup.optimistic.resolve_below_cursor(cursor);
+        if !newly_cursor_confirmed.is_empty() {
+            pool.release_in_flight_batch(&newly_cursor_confirmed);
         }
 
         // ── Slot-context failure recovery ────────────────────────────
@@ -750,8 +767,8 @@ where
         // same root reth will produce when it ingests the payload.
         //
         // Cross-chain path returns the already-built Sync block so we
-        // don't redo the work here. Standalone / no-L1 path falls back
-        // to constructing an empty Sync block from the drained raw_txs.
+        // don't redo the work here. Without it, the standalone fallback
+        // executes the drained transactions as ordinary type-0x2 calls.
         if let (Some(evm_composer), Some(ctx)) = (
             self.inner.evm_composer.as_ref(),
             self.inner.cc_exec_ctx.as_ref(),
@@ -805,44 +822,75 @@ where
             };
         }
 
-        let drained_raw_txs: Vec<Bytes> = drained.iter().map(|h| h.raw_tx.clone()).collect();
-        let fallback = match build_sync_block(
-            rollup.l2_provider.as_ref(),
-            &self.inner.evm_config,
-            &parent_header,
-            timestamp,
-            suggested_fee_recipient,
-            &drained_raw_txs,
-        ) {
-            Ok(built) => {
-                event!(
-                    name: "eez.composer.sync_slot.built",
-                    Level::INFO,
-                    rollup_id,
-                    tx_count = drained_count,
-                    parent_number,
-                    timestamp,
-                    "built Sync block (fallback) carrying {{tx_count}} held tx(s)",
-                );
-                Some(SyncSlotBlock {
-                    payload: built.payload,
-                    header: built.header,
-                })
+        let mut candidates = drained;
+        loop {
+            let raw_txs: Vec<Bytes> = candidates.iter().map(|tx| tx.raw_tx.clone()).collect();
+            match build_sync_block(
+                rollup.l2_provider.as_ref(),
+                &self.inner.evm_config,
+                &parent_header,
+                timestamp,
+                suggested_fee_recipient,
+                &raw_txs,
+            ) {
+                Ok(built) => {
+                    event!(
+                        name: "eez.composer.sync_slot.built",
+                        Level::INFO,
+                        rollup_id,
+                        tx_count = candidates.len(),
+                        parent_number,
+                        timestamp,
+                        "built Sync block (fallback) carrying {{tx_count}} held tx(s)",
+                    );
+                    pool.release_in_flight_batch(&candidates);
+                    return Some(SyncSlotBlock {
+                        payload: built.payload,
+                        header: built.header,
+                    });
+                }
+                Err(err) => {
+                    let failed_idx = match &err {
+                        BuildError::DecodeTx { idx, .. }
+                        | BuildError::RecoverSigner { idx }
+                        | BuildError::ExecuteTx { idx, .. } => Some(*idx),
+                        BuildError::Provider(_) | BuildError::Builder(_) => None,
+                    };
+                    if let Some(failed_idx) = failed_idx
+                        && let Some((root, evicted)) =
+                            remove_failed_nonce_chain(&mut candidates, failed_idx)
+                    {
+                        let queued_evicted =
+                            pool.evict_nonce_chain_from(root.sender, root.direction, root.nonce);
+                        event!(
+                            name: "eez.composer.sync_slot.tx_evicted",
+                            Level::WARN,
+                            rollup_id,
+                            tx_hash = %root.hash,
+                            sender = %root.sender,
+                            nonce = root.nonce,
+                            direction = ?root.direction,
+                            error = %err,
+                            batch_evicted = evicted.len(),
+                            queued_evicted = queued_evicted.len(),
+                            "standalone Sync block rejected a transaction; evicting its nonce chain and retrying",
+                        );
+                        continue;
+                    }
+
+                    event!(
+                        name: "eez.composer.sync_slot.build_failed",
+                        Level::ERROR,
+                        rollup_id,
+                        tx_count = candidates.len(),
+                        error = %err,
+                        "standalone Sync block build failed systemically; retaining held txs and falling back to vanilla Sync block",
+                    );
+                    pool.push_front_batch(candidates);
+                    return None;
+                }
             }
-            Err(err) => {
-                event!(
-                    name: "eez.composer.sync_slot.build_failed",
-                    Level::ERROR,
-                    rollup_id,
-                    tx_count = drained_count,
-                    error = %err,
-                    "build_sync_block failed; dropping held txs and falling back to vanilla Sync block",
-                );
-                None
-            }
-        };
-        pool.release_in_flight_batch(&drained);
-        fallback
+        }
     }
 }
 
@@ -1683,15 +1731,26 @@ where
         suggested_fee_recipient: Address,
         bundle_target: BundleTarget,
     ) -> Result<Option<SyncSlotBlock>, String> {
-        let empty_built = build_sync_block(
+        let empty_built = match build_sync_block(
             rollup.l2_provider.as_ref(),
             &self.inner.evm_config,
             parent_header,
             timestamp,
             suggested_fee_recipient,
             &[], // no system_txs — empty Sync block
-        )
-        .map_err(|e| format!("build_sync_block (empty): {e}"))?;
+        ) {
+            Ok(built) => built,
+            Err(err) => {
+                event!(
+                    name: "eez.composer.phase1.build_failed",
+                    Level::ERROR,
+                    rollup_id,
+                    error = %err,
+                    "minimal Sync block build failed; Sequencer's commit_one fallback takes over",
+                );
+                return Ok(None);
+            }
+        };
 
         let minimal_postbatch_raw = match self
             .prepare_post_batch_raw(
@@ -2422,5 +2481,34 @@ mod tests {
 
         assert_eq!(poison.len(), 2);
         assert_eq!(gaps, vec![(sender, Direction::Inbound, 7)]);
+    }
+
+    #[test]
+    fn failed_standalone_tx_removes_only_its_nonce_chain_suffix() {
+        let sender = Address::repeat_byte(0xd);
+        let other = Address::repeat_byte(0xe);
+        let mut candidates = vec![
+            held(sender, Direction::Inbound, 0, 1),
+            held(other, Direction::Inbound, 0, 2),
+            held(sender, Direction::Inbound, 1, 3),
+            held(sender, Direction::Outbound, 1, 4),
+            held(sender, Direction::Inbound, 2, 5),
+        ];
+
+        let (root, evicted) = remove_failed_nonce_chain(&mut candidates, 2).unwrap();
+
+        assert_eq!(root.hash, TxHash::repeat_byte(3));
+        assert_eq!(
+            evicted.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
+            vec![TxHash::repeat_byte(3), TxHash::repeat_byte(5)]
+        );
+        assert_eq!(
+            candidates.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
+            vec![
+                TxHash::repeat_byte(1),
+                TxHash::repeat_byte(2),
+                TxHash::repeat_byte(4)
+            ]
+        );
     }
 }
