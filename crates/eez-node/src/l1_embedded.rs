@@ -1,10 +1,13 @@
 //! Embedded L1 reth — config builder for the second `NodeBuilder` that
-//! composer mode launches alongside the L2 reth. Two modes:
+//! composer mode launches alongside the L2 reth. Runtime modes:
 //!   - **Dev** (vanilla EthereumNode, 5s auto-mine) — local smokes;
 //!     fast, deterministic, no beacon dependency. `EEZ_L1_CHAIN=dev`.
+//!   - **Devnet** (vanilla EthereumNode, CL-driven) — private PoS L1.
+//!     `EEZ_L1_CHAIN=devnet`.
 //!   - **Chiado** (reth_gnosis::GnosisNode) — real chiado state from the
 //!     mounted datadir, driven via engine-API by an external lighthouse
 //!     CL. `EEZ_L1_CHAIN=chiado`.
+//!   - **Testing** — dev mode with the mock bundle RPC.
 //!
 //! The `NodeBuilder` launch is inline in [`crate::main`] — the
 //! nested-generic `NodeHandle` AddOns types resist a typed helper.
@@ -35,6 +38,8 @@ pub enum L1ChainKind {
     /// `reth_gnosis::GnosisNode` loading the chiado preset; no
     /// auto-mine — engine API driven by an external lighthouse CL.
     Chiado,
+    /// Private PoS Ethereum node driven by an external consensus client.
+    Devnet,
     /// Same as `Dev`, plus the non-atomic mock bundle RPC. CI only.
     Testing,
 }
@@ -43,6 +48,7 @@ impl L1ChainKind {
     pub fn from_env() -> Self {
         match std::env::var("EEZ_L1_CHAIN").as_deref() {
             Ok("chiado") => Self::Chiado,
+            Ok("devnet") => Self::Devnet,
             Ok("testing") => Self::Testing,
             _ => Self::Dev,
         }
@@ -78,6 +84,8 @@ pub struct EmbeddedL1Config {
     /// Path to JWT secret file. Required in chiado mode (shared with
     /// lighthouse via volume mount).
     pub jwtsecret: Option<PathBuf>,
+    /// Static execution peers for private networks.
+    pub trusted_peers: Vec<String>,
 }
 
 /// Build a reth `NodeConfig<ChainSpec>` for the embedded L1 dev node
@@ -129,6 +137,22 @@ pub fn build_chiado_node_config(cfg: &EmbeddedL1Config) -> Result<NodeConfig<Gno
     Ok(node_cfg)
 }
 
+/// Build a private L1 driven by an external consensus client.
+pub fn build_devnet_node_config(cfg: &EmbeddedL1Config) -> Result<NodeConfig<ChainSpec>> {
+    let (network_args, mut rpc_args) = build_network_rpc_args(cfg)?;
+    rpc_args.auth_addr = "0.0.0.0".parse().expect("static addr");
+    rpc_args.auth_jwtsecret = cfg.jwtsecret.clone();
+    let mut node_cfg = NodeConfig::new(cfg.dev_chain_spec.clone())
+        .with_datadir_args(DatadirArgs {
+            datadir: cfg.datadir.clone().into(),
+            ..DatadirArgs::default()
+        })
+        .with_network(network_args)
+        .with_rpc(rpc_args);
+    node_cfg.engine.legacy_state_root_task_enabled = true;
+    Ok(node_cfg)
+}
+
 fn build_network_rpc_args(cfg: &EmbeddedL1Config) -> Result<(NetworkArgs, RpcServerArgs)> {
     let ws_port = cfg.http_port.checked_add(1).ok_or_else(|| {
         eyre::eyre!(
@@ -142,6 +166,17 @@ fn build_network_rpc_args(cfg: &EmbeddedL1Config) -> Result<(NetworkArgs, RpcSer
     };
     network_args.discovery.port = cfg.p2p_port;
     network_args.discovery.discv5_port = Some(cfg.discv5_port);
+    if !cfg.trusted_peers.is_empty() {
+        network_args.trusted_peers = cfg
+            .trusted_peers
+            .iter()
+            .map(|peer| {
+                peer.parse().map_err(|err| {
+                    eyre::eyre!("EEZ_L1_TRUSTED_PEERS entry '{peer}' is not a valid enode: {err}")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+    }
     let rpc_args = RpcServerArgs {
         http: true,
         ws: true,

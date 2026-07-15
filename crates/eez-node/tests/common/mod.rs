@@ -1017,6 +1017,16 @@ impl NodeHandle {
             .filter(|line| patterns.iter().any(|p| line.contains(p)))
             .count())
     }
+
+    /// Count log lines containing every supplied substring.
+    pub fn log_count_matching_all(&self, patterns: &[&str]) -> Result<usize> {
+        let contents = std::fs::read_to_string(&self.log_path)
+            .with_context(|| format!("read log {}", self.log_path.display()))?;
+        Ok(contents
+            .lines()
+            .filter(|line| patterns.iter().all(|p| line.contains(p)))
+            .count())
+    }
 }
 
 impl Drop for NodeHandle {
@@ -2031,4 +2041,171 @@ impl DevnetCfg {
             ),
         ]
     }
+}
+
+pub const CC_SETUP_TIMEOUT: Duration = Duration::from_secs(90);
+pub const CC_SETTLE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Separate deployer keeps target CREATE nonces deterministic.
+pub const CC_TARGET_DEPLOYER: &str = ANVIL_KEY_3;
+pub const CC_INBOUND_USER: &str = ANVIL_KEY_2;
+pub const CC_OUTBOUND_USER: &str = ANVIL_KEY_4;
+/// Valid key without genesis funding.
+pub const UNFUNDED_KEY: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+/// Shared cross-chain integration fixture.
+pub struct CrossChainWorld {
+    pub node: NodeHandle,
+    pub cfg: DevnetCfg,
+    pub dep: Deployment,
+    pub l2_chain_id: u64,
+    pub value_l2: Address,
+    pub inbound_no_ret: Address,
+    pub outbound_value: Address,
+    pub outbound_no_ret: Address,
+    pub recipient: Address,
+    pub withdrawal_recipient: Address,
+    pub setter_proxy: Address,
+    pub deposit_proxy: Address,
+    pub inbound_no_ret_proxy: Address,
+    pub inbound_wrapper: Address,
+    pub outbound_proxy: Address,
+    pub outbound_no_ret_proxy: Address,
+    pub withdrawal_proxy: Address,
+    pub outbound_wrapper: Address,
+    _datadir: tempfile::TempDir,
+}
+
+impl CrossChainWorld {
+    pub fn l1_rpc(&self) -> String {
+        self.cfg.l1_rpc_url()
+    }
+    pub fn l1_xchain(&self) -> String {
+        self.cfg.l1_xchain_url()
+    }
+    pub fn l2_xchain(&self) -> String {
+        self.cfg.l2_xchain_url()
+    }
+    pub fn l2_rpc(&self) -> String {
+        self.node.l2_rpc_url()
+    }
+}
+
+/// Start the shared cross-chain fixture.
+pub async fn setup_cross_chain() -> Result<CrossChainWorld> {
+    setup_cross_chain_with_env(&[]).await
+}
+
+/// Start the fixture with additional node environment variables.
+pub async fn setup_cross_chain_with_env(
+    extra_env: &[(&'static str, String)],
+) -> Result<CrossChainWorld> {
+    let cfg = DevnetCfg::new()?;
+    let datadir = tempfile::tempdir()?;
+    let mut env = cfg.env();
+    env.extend_from_slice(extra_env);
+    let node = NodeHandle::spawn(datadir.path(), &env)?;
+
+    let recipient: Address = address!("0x2222222222222222222222222222222222222222");
+    let withdrawal_recipient: Address = address!("0x3333333333333333333333333333333333333333");
+
+    wait_for_l2_rpc(&cfg.l1_rpc_url(), CC_SETUP_TIMEOUT).await?;
+    let dep = deploy_protocol_dev(&cfg.l1_rpc_url(), cfg.deployer_key, cfg.initial_state).await?;
+    if dep.eez_address != cfg.eez_address {
+        bail!("EEZ address not deterministic");
+    }
+    if dep.rollup_id != cfg.rollup_id {
+        bail!(
+            "unexpected rollup id: deployed {}, expected {}",
+            dep.rollup_id,
+            cfg.rollup_id
+        );
+    }
+
+    wait_for_l2_rpc(&node.l2_rpc_url(), CC_SETUP_TIMEOUT).await?;
+    let l2_rpc = node.l2_rpc_url();
+    let l2_chain_id = ProviderBuilder::new()
+        .connect_http(l2_rpc.parse()?)
+        .get_chain_id()
+        .await?;
+
+    let value_l2 = deploy_value_l2(&l2_rpc, CC_TARGET_DEPLOYER, U256::from(5u64)).await?;
+    let expected_value = signer_address(CC_TARGET_DEPLOYER)?.create(0);
+    if value_l2 != expected_value {
+        bail!("Value address not deterministic");
+    }
+    let inbound_no_ret =
+        deploy_value_no_ret(&l2_rpc, CC_TARGET_DEPLOYER, l2_chain_id, U256::from(5u64)).await?;
+    let outbound_value =
+        deploy_value_l1(&cfg.l1_rpc_url(), CC_TARGET_DEPLOYER, U256::from(5u64)).await?;
+    let outbound_no_ret = deploy_value_no_ret(
+        &cfg.l1_rpc_url(),
+        CC_TARGET_DEPLOYER,
+        DEV_CHAIN_ID,
+        U256::from(5u64),
+    )
+    .await?;
+
+    let setter_proxy = create_cross_chain_proxy(
+        &cfg.l1_rpc_url(),
+        cfg.deployer_key,
+        cfg.eez_address,
+        value_l2,
+        cfg.rollup_id,
+    )
+    .await?;
+    let deposit_proxy = create_cross_chain_proxy(
+        &cfg.l1_rpc_url(),
+        cfg.deployer_key,
+        cfg.eez_address,
+        recipient,
+        cfg.rollup_id,
+    )
+    .await?;
+    let inbound_no_ret_proxy = create_cross_chain_proxy(
+        &cfg.l1_rpc_url(),
+        cfg.deployer_key,
+        cfg.eez_address,
+        inbound_no_ret,
+        cfg.rollup_id,
+    )
+    .await?;
+    let inbound_wrapper = deploy_setter_wrapper(
+        &cfg.l1_rpc_url(),
+        CC_TARGET_DEPLOYER,
+        DEV_CHAIN_ID,
+        setter_proxy,
+    )
+    .await?;
+
+    let outbound_proxy =
+        create_l2_cross_chain_proxy(&l2_rpc, CC_TARGET_DEPLOYER, outbound_value, 0).await?;
+    let outbound_no_ret_proxy =
+        create_l2_cross_chain_proxy(&l2_rpc, CC_TARGET_DEPLOYER, outbound_no_ret, 0).await?;
+    let withdrawal_proxy =
+        create_l2_cross_chain_proxy(&l2_rpc, CC_TARGET_DEPLOYER, withdrawal_recipient, 0).await?;
+    let outbound_wrapper =
+        deploy_setter_wrapper(&l2_rpc, CC_TARGET_DEPLOYER, l2_chain_id, outbound_proxy).await?;
+
+    Ok(CrossChainWorld {
+        node,
+        cfg,
+        dep,
+        l2_chain_id,
+        value_l2,
+        inbound_no_ret,
+        outbound_value,
+        outbound_no_ret,
+        recipient,
+        withdrawal_recipient,
+        setter_proxy,
+        deposit_proxy,
+        inbound_no_ret_proxy,
+        inbound_wrapper,
+        outbound_proxy,
+        outbound_no_ret_proxy,
+        withdrawal_proxy,
+        outbound_wrapper,
+        _datadir: datadir,
+    })
 }

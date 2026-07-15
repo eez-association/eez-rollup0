@@ -1,0 +1,101 @@
+name: Kurtosis E2E
+
+on:
+  pull_request:
+    branches: [main, chetna/cross-chain-test]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-path-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$BASE_SHA" "$GITHUB_SHA" -- \
+            Cargo.toml Cargo.lock Dockerfile contracts crates \
+            testing/kurtosis .github/workflows/kurtosis-e2e.yml; then
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  production_path:
+    name: Kurtosis E2E
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      KURTOSIS_ENCLAVE: eez-pr-${{ github.run_id }}-${{ github.run_attempt }}
+      EEZ_NODE_IMAGE: eez-node:ci-${{ github.sha }}
+      EEZ_DEPLOY_IMAGE: eez-deploy:ci-${{ github.sha }}
+      EEZ_CI_RESULT_DIR: ${{ github.workspace }}/artifacts/production-path-ci
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
+      - name: Install Kurtosis
+        run: |
+          echo "deb [trusted=yes] https://sdk.kurtosis.com/kurtosis-cli-release-artifacts/ /" | sudo tee /etc/apt/sources.list.d/kurtosis.list
+          sudo apt-get update
+          sudo apt-get install -y kurtosis-cli jq openssl
+          kurtosis engine start
+      - name: Run production-path test
+        run: bash testing/kurtosis/run-ci.sh
+      - name: Stop production-path network
+        if: always()
+        run: bash testing/kurtosis/stop.sh
+      - name: Upload production-path diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: production-path-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/production-path-ci
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Remove candidate images
+        if: always()
+        run: docker image rm "$EEZ_NODE_IMAGE" "$EEZ_DEPLOY_IMAGE" || true
+
+  required-check:
+    name: Kurtosis E2E Gate
+    needs: [changes, production_path]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RELEVANT: ${{ needs.changes.outputs.relevant }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          RESULT: ${{ needs.production_path.result }}
+        run: |
+          if [[ "$CHANGES_RESULT" != "success" ]]; then
+            echo "Could not determine whether production-path files changed." >&2
+            exit 1
+          elif [[ "$RELEVANT" != "true" ]]; then
+            echo "No production-path files changed; atomic E2E not required."
+          elif [[ "$RESULT" != "success" ]]; then
+            echo "Production-path atomic E2E result: $RESULT" >&2
+            exit 1
+          fi

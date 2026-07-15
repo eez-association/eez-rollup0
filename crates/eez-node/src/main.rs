@@ -205,7 +205,6 @@ fn main() -> eyre::Result<()> {
                         .with_database(db)
                         .with_launch_context(build_l1_runtime()?)
                         .node(EthereumNode::default())
-                        .extend_rpc_modules(bundle_rpc::install_dev_bundle_rpc)
                         .launch_with_debug_capabilities()
                         .await?;
                     event!(
@@ -214,6 +213,36 @@ fn main() -> eyre::Result<()> {
                         kind = "dev",
                         l1_chain_id = %l1_handle.node.chain_spec().chain(),
                         "embedded L1 reth (dev) ready",
+                    );
+                    Some(EmbeddedL1::Dev(l1_handle))
+                }
+                l1_embedded::L1ChainKind::Devnet => {
+                    let node_cfg = l1_embedded::build_devnet_node_config(&l1_cfg)?;
+                    let db = reth_db::init_db(
+                        node_cfg.datadir().db(),
+                        reth_db::mdbx::DatabaseArguments::default(),
+                    )
+                    .map_err(|e| eyre::eyre!("L1 embedded init_db: {e}"))?;
+                    event!(
+                        name: "eez.node.l1_embedded.launching",
+                        Level::INFO,
+                        kind = "devnet",
+                        http_port = l1_cfg.http_port,
+                        auth_port = l1_cfg.auth_port,
+                        "launching embedded L1 reth (devnet); external consensus client must connect to authrpc",
+                    );
+                    let l1_handle = reth_node_builder::NodeBuilder::new(node_cfg)
+                        .with_database(db)
+                        .with_launch_context(build_l1_runtime()?)
+                        .node(EthereumNode::default())
+                        .launch_with_debug_capabilities()
+                        .await?;
+                    event!(
+                        name: "eez.node.l1_embedded.ready",
+                        Level::INFO,
+                        kind = "devnet",
+                        l1_chain_id = %l1_handle.node.chain_spec().chain(),
+                        "embedded L1 reth (devnet) ready",
                     );
                     Some(EmbeddedL1::Dev(l1_handle))
                 }
@@ -393,8 +422,21 @@ fn main() -> eyre::Result<()> {
         let rollup_config = RollupConfig::from_env()?;
         let l1_watcher_config = L1WatcherConfig::from_env()?;
 
+        // Target bundles from the builder's canonical L1 view.
+        let scheduler_l1_rpc_url = submitter_config
+            .target_rpc_url
+            .clone()
+            .unwrap_or_else(|| submitter_config.rpc_url.clone());
         let submitter = Submitter::new(submitter_config);
-        let l1_watcher = L1Watcher::spawn(l1_watcher_config);
+        let l1_watcher = L1Watcher::spawn(l1_watcher_config.clone());
+        let scheduler_l1_watcher = if scheduler_l1_rpc_url == l1_watcher_config.rpc_url {
+            l1_watcher.clone()
+        } else {
+            L1Watcher::spawn(L1WatcherConfig {
+                rpc_url: scheduler_l1_rpc_url,
+                ..l1_watcher_config
+            })
+        };
 
         // Composer-only: build the umbrella, then attach it to the
         // Sequencer built above (swapping in the L1-anchored schedule via
@@ -646,14 +688,14 @@ fn main() -> eyre::Result<()> {
                         eyre::eyre!("EEZ_CCM_L2_ADDRESS required (set by deploy.sh)")
                     })?,
                 )?;
-                // L1 RPC URL: the embedded L1's HTTP port (so the
-                // composer's L1-forwarding round-trips back into our
-                // own L1 reth). Same value as `EEZ_L1_RPC_URL` for
-                // embedded mode.
-                let l1_rpc_url: reqwest::Url = env::var("EEZ_L1_RPC_URL")
-                    .map_err(|_| eyre::eyre!("EEZ_L1_RPC_URL required for L1 forwarding"))?
+                // Match signing and escrow reads to the builder's L1 view.
+                let l1_rpc_url: reqwest::Url = env::var("EEZ_L1_TARGET_RPC_URL")
+                    .ok()
+                    .filter(|url| !url.trim().is_empty())
+                    .or_else(|| env::var("EEZ_L1_RPC_URL").ok())
+                    .ok_or_else(|| eyre::eyre!("EEZ_L1_RPC_URL required for L1 reads"))?
                     .parse()
-                    .map_err(|e| eyre::eyre!("EEZ_L1_RPC_URL malformed: {e}"))?;
+                    .map_err(|e| eyre::eyre!("EEZ_L1_(TARGET_)RPC_URL malformed: {e}"))?;
                 let l1_provider = alloy_provider::RootProvider::new_http(l1_rpc_url.clone());
                 let l1_poster_key = env::var("EEZ_L1_POSTER_KEY").map_err(|_| {
                     eyre::eyre!("EEZ_L1_POSTER_KEY required for L1 postBatch signing")
@@ -745,7 +787,7 @@ fn main() -> eyre::Result<()> {
             // schedule + composer hooks. Speculative depth already
             // applied above.
             let schedule_rx = spawn_l1_anchored(
-                L1HeadStream::from_watcher(&l1_watcher),
+                L1HeadStream::from_watcher(&scheduler_l1_watcher),
                 timing,
                 l2_genesis_timestamp,
             );
@@ -1040,6 +1082,18 @@ fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
         .ok()
         .map(std::path::PathBuf::from);
 
+    let trusted_peers = env::var("EEZ_L1_TRUSTED_PEERS")
+        .ok()
+        .map(|peers| {
+            peers
+                .split([',', ' '])
+                .map(str::trim)
+                .filter(|peer| !peer.is_empty())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
     Ok(l1_embedded::EmbeddedL1Config {
         dev_chain_spec,
         kind,
@@ -1049,6 +1103,7 @@ fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
         p2p_port,
         discv5_port,
         jwtsecret,
+        trusted_peers,
     })
 }
 
