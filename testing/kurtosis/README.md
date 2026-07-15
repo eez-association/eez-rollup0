@@ -14,7 +14,7 @@ and observability services. Larger topologies belong in scheduled soak tests.
 
 1. Render `ci-args.yaml` with commit-specific candidate image tags.
 2. Build the node and deployment images.
-3. Start the reduced network and wait for rbuilder warmup.
+3. Start the reduced network and wait for a settled bundle inclusion.
 4. Run the single cross-chain wave harness in `inbound`, `outbound`, and
    `mixed` modes.
 5. Check convergence, settlement, L1/L2 state roots, and the L2 safe head in
@@ -41,7 +41,6 @@ Useful overrides:
 - `EEZ_SKIP_NODE_BUILD=1`, `EEZ_SKIP_DEPLOY_BUILD=1`: reuse images.
 - `EEZ_CI_RESULT_DIR`: result and diagnostic directory.
 - `EEZ_CI_READY_TIMEOUT_SECS`: RPC readiness timeout.
-- `EEZ_CI_BUILDER_WARMUP_BLOCK`: first builder probe block.
 
 ## Layout
 
