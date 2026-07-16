@@ -1,13 +1,14 @@
 //! Cross-chain integration and nonce-gap regression tests.
 
-use alloy_primitives::{TxHash, U256};
+use alloy_primitives::{TxHash, U256, address};
 use alloy_sol_types::SolCall;
 
 mod common;
 use common::{
-    DEV_CHAIN_ID, INBOUND_USER, ISetterWrapper, IValue, IValueNoRet, OUTBOUND_USER, SETTLE_TIMEOUT,
-    batches_posted, l2_balance, l2_value, pending_nonce, receipt_ok, setup_cross_chain,
-    sign_and_send, state_root, value_no_ret, wait_for,
+    ANVIL_KEY_2, DEV_CHAIN_ID, INBOUND_USER, ISetterWrapper, IValue, IValueNoRet, OUTBOUND_USER,
+    SETTLE_TIMEOUT, UNFUNDED_KEY, batches_posted, l2_balance, l2_value, pending_nonce, receipt_ok,
+    setup_cross_chain, setup_cross_chain_with_env, sign_and_send, state_root, value_no_ret,
+    wait_for,
 };
 
 const WAVE_SETTERS: &[u64] = &[7, 11, 17];
@@ -335,5 +336,811 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
         0,
         "composer must not fall back to eth_sendRawTransaction",
     );
+    w.node.assert_no_process_death();
+}
+
+/// Positive outbound value is poison while the fresh rollup escrow is empty.
+const POISON_WITHDRAWAL_WEI: u128 = 1_000_000_000_000_000; // 0.001 ETH
+
+/// Evicts same-drain dependants without blocking unrelated traffic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "red until the same-drain dependent-poison cascade fix lands"]
+async fn same_drain_poison_does_not_orphan_higher_nonce() {
+    let w = setup_cross_chain().await.unwrap();
+
+    let mut out_nonce = pending_nonce(&w.l2_rpc(), OUTBOUND_USER).await.unwrap();
+    let poison_hash = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        out_nonce,
+        Some(w.withdrawal_proxy),
+        U256::from(POISON_WITHDRAWAL_WEI),
+        Vec::new(),
+        900_000,
+    )
+    .await
+    .unwrap();
+    out_nonce += 1;
+    let orphan_hash = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        out_nonce,
+        Some(w.outbound_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(42u64),
+        }
+        .abi_encode(),
+        900_000,
+    )
+    .await
+    .unwrap();
+
+    let in_nonce = pending_nonce(&w.l1_rpc(), INBOUND_USER).await.unwrap();
+    let unrelated_hash = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        in_nonce,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(77u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await
+    .unwrap();
+
+    wait_for(SETTLE_TIMEOUT, || {
+        let l1 = w.l1_rpc();
+        async move { Ok(receipt_ok(&l1, unrelated_hash).await?.filter(|ok| *ok)) }
+    })
+    .await
+    .expect("unrelated inbound tx never settled — composer stalled on the gapped chain");
+    wait_for(SETTLE_TIMEOUT, || {
+        let (l2, value) = (w.l2_rpc(), w.value_l2);
+        async move { Ok((l2_value(&l2, value).await? == U256::from(77u64)).then_some(())) }
+    })
+    .await
+    .expect("unrelated inbound setter effect never landed on L2");
+
+    // Require explicit eviction; a missing receipt alone can also mean stalled.
+    let orphan_hash_text = orphan_hash.to_string();
+    wait_for(SETTLE_TIMEOUT, || async {
+        Ok((w
+            .node
+            .log_count_matching_all(&[orphan_hash_text.as_str(), "gapped chain can't land"])?
+            > 0)
+        .then_some(()))
+    })
+    .await
+    .expect("nonce N+1 was never explicitly evicted as dependent poison");
+
+    assert!(
+        receipt_ok(&w.l2_rpc(), poison_hash)
+            .await
+            .unwrap()
+            .is_none(),
+        "poison withdrawal must never settle",
+    );
+    assert!(
+        receipt_ok(&w.l2_rpc(), orphan_hash)
+            .await
+            .unwrap()
+            .is_none(),
+        "orphaned nonce N+1 must be cascade-evicted, never settle",
+    );
+
+    // The sender can reuse the evicted nonces after cleanup.
+    let replacement_n = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        out_nonce - 1,
+        Some(w.outbound_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(101u64),
+        }
+        .abi_encode(),
+        900_000,
+    )
+    .await
+    .expect("corrected replacement at nonce N must be admitted after cascade cleanup");
+    let replacement_n1 = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        out_nonce,
+        Some(w.outbound_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(102u64),
+        }
+        .abi_encode(),
+        900_000,
+    )
+    .await
+    .expect("corrected replacement at nonce N+1 must be admitted contiguously");
+    for (hash, label) in [
+        (replacement_n, "replacement nonce N"),
+        (replacement_n1, "replacement nonce N+1"),
+    ] {
+        wait_for(SETTLE_TIMEOUT, || {
+            let l2 = w.l2_rpc();
+            async move { Ok(receipt_ok(&l2, hash).await?.filter(|ok| *ok)) }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{label} did not settle after poison-chain cleanup"));
+    }
+
+    w.node.assert_no_process_death();
+}
+
+/// Keeps inbound and outbound nonce chains independent for one sender.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "red until the same-drain dependent-poison cascade fix lands"]
+async fn poison_cascade_is_direction_scoped() {
+    let w = setup_cross_chain().await.unwrap();
+    let user = OUTBOUND_USER;
+
+    let mut out_nonce = pending_nonce(&w.l2_rpc(), user).await.unwrap();
+    let poison_hash = sign_and_send(
+        &w.l2_xchain(),
+        user,
+        w.l2_chain_id,
+        out_nonce,
+        Some(w.withdrawal_proxy),
+        U256::from(POISON_WITHDRAWAL_WEI),
+        Vec::new(),
+        900_000,
+    )
+    .await
+    .unwrap();
+    out_nonce += 1;
+    let orphan_hash = sign_and_send(
+        &w.l2_xchain(),
+        user,
+        w.l2_chain_id,
+        out_nonce,
+        Some(w.outbound_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(9u64),
+        }
+        .abi_encode(),
+        900_000,
+    )
+    .await
+    .unwrap();
+
+    let in_nonce = pending_nonce(&w.l1_rpc(), user).await.unwrap();
+    let inbound_hash = sign_and_send(
+        &w.l1_xchain(),
+        user,
+        DEV_CHAIN_ID,
+        in_nonce,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(123u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await
+    .unwrap();
+
+    wait_for(SETTLE_TIMEOUT, || {
+        let l1 = w.l1_rpc();
+        async move { Ok(receipt_ok(&l1, inbound_hash).await?.filter(|ok| *ok)) }
+    })
+    .await
+    .expect(
+        "same-EOA inbound tx never settled — outbound poison wrongly cascaded across directions",
+    );
+    wait_for(SETTLE_TIMEOUT, || {
+        let (l2, value) = (w.l2_rpc(), w.value_l2);
+        async move { Ok((l2_value(&l2, value).await? == U256::from(123u64)).then_some(())) }
+    })
+    .await
+    .expect("inbound setter effect never landed on L2");
+
+    assert!(
+        receipt_ok(&w.l2_rpc(), poison_hash)
+            .await
+            .unwrap()
+            .is_none(),
+        "poison withdrawal must never settle",
+    );
+    assert!(
+        receipt_ok(&w.l2_rpc(), orphan_hash)
+            .await
+            .unwrap()
+            .is_none(),
+        "orphaned outbound nonce N+1 must be cascade-evicted",
+    );
+    w.node.assert_no_process_death();
+}
+
+/// Cascades across the local drain and the remaining shared pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "red until the same-drain dependent-poison cascade fix lands"]
+async fn poison_cascade_spans_drain_cap() {
+    let w = setup_cross_chain_with_env(&[("EEZ_MAX_USER_TXS_PER_BUNDLE", "2".to_string())])
+        .await
+        .unwrap();
+    let user = OUTBOUND_USER;
+    let mut nonce = pending_nonce(&w.l2_rpc(), user).await.unwrap();
+    let poison = sign_and_send(
+        &w.l2_xchain(),
+        user,
+        w.l2_chain_id,
+        nonce,
+        Some(w.withdrawal_proxy),
+        U256::from(POISON_WITHDRAWAL_WEI),
+        Vec::new(),
+        900_000,
+    )
+    .await
+    .unwrap();
+    nonce += 1;
+    let local_orphan = sign_and_send(
+        &w.l2_xchain(),
+        user,
+        w.l2_chain_id,
+        nonce,
+        Some(w.outbound_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(1u64),
+        }
+        .abi_encode(),
+        900_000,
+    )
+    .await
+    .unwrap();
+    nonce += 1;
+    let pool_orphan = sign_and_send(
+        &w.l2_xchain(),
+        user,
+        w.l2_chain_id,
+        nonce,
+        Some(w.outbound_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(2u64),
+        }
+        .abi_encode(),
+        900_000,
+    )
+    .await
+    .unwrap();
+
+    let in_nonce = pending_nonce(&w.l1_rpc(), INBOUND_USER).await.unwrap();
+    let unrelated = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        in_nonce,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(55u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await
+    .unwrap();
+
+    wait_for(SETTLE_TIMEOUT, || {
+        let l1 = w.l1_rpc();
+        async move { Ok(receipt_ok(&l1, unrelated).await?.filter(|ok| *ok)) }
+    })
+    .await
+    .expect("unrelated tx never settled — cascade failed to clear local and/or pool orphans");
+    for (h, label) in [
+        (poison, "poison N"),
+        (local_orphan, "local orphan N+1"),
+        (pool_orphan, "pool orphan N+2"),
+    ] {
+        assert!(
+            receipt_ok(&w.l2_rpc(), h).await.unwrap().is_none(),
+            "{label} must be evicted, never settle",
+        );
+    }
+    w.node.assert_no_process_death();
+}
+
+/// Preserves unrelated sender traffic in an interleaved drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "red until the same-drain dependent-poison cascade fix lands"]
+async fn interleaved_senders_poison_isolation() {
+    let w = setup_cross_chain().await.unwrap();
+    let a = OUTBOUND_USER; // poison chain
+    let b = ANVIL_KEY_2; // clean, must survive the same drain
+
+    let mut an = pending_nonce(&w.l2_rpc(), a).await.unwrap();
+    let a_poison = sign_and_send(
+        &w.l2_xchain(),
+        a,
+        w.l2_chain_id,
+        an,
+        Some(w.withdrawal_proxy),
+        U256::from(POISON_WITHDRAWAL_WEI),
+        Vec::new(),
+        900_000,
+    )
+    .await
+    .unwrap();
+    an += 1;
+    let bn = pending_nonce(&w.l2_rpc(), b).await.unwrap();
+    let b_hash = sign_and_send(
+        &w.l2_xchain(),
+        b,
+        w.l2_chain_id,
+        bn,
+        Some(w.outbound_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(33u64),
+        }
+        .abi_encode(),
+        900_000,
+    )
+    .await
+    .unwrap();
+    let a_orphan = sign_and_send(
+        &w.l2_xchain(),
+        a,
+        w.l2_chain_id,
+        an,
+        Some(w.outbound_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(44u64),
+        }
+        .abi_encode(),
+        900_000,
+    )
+    .await
+    .unwrap();
+
+    wait_for(SETTLE_TIMEOUT, || {
+        let l2 = w.l2_rpc();
+        async move { Ok(receipt_ok(&l2, b_hash).await?.filter(|ok| *ok)) }
+    })
+    .await
+    .expect("unrelated sender B's tx was dropped with A's broken chain");
+    assert!(
+        receipt_ok(&w.l2_rpc(), a_poison).await.unwrap().is_none(),
+        "A poison must be evicted",
+    );
+    assert!(
+        receipt_ok(&w.l2_rpc(), a_orphan).await.unwrap().is_none(),
+        "A orphan must be evicted",
+    );
+    w.node.assert_no_process_death();
+}
+
+/// Recovers when a plain L1 transaction consumes a held inbound nonce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "timing-dependent until the compose step has a deterministic test seam"]
+async fn inbound_dos_same_nonce_before_postbatch() {
+    let w = setup_cross_chain().await.unwrap();
+    let attacker = INBOUND_USER;
+
+    let n = pending_nonce(&w.l1_rpc(), attacker).await.unwrap();
+    let _held = sign_and_send(
+        &w.l1_xchain(),
+        attacker,
+        DEV_CHAIN_ID,
+        n,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(5u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await
+    .unwrap();
+    let self_addr = common::signer_address(attacker).unwrap();
+    let plain = sign_and_send(
+        &w.l1_rpc(),
+        attacker,
+        DEV_CHAIN_ID,
+        n,
+        Some(self_addr),
+        U256::ZERO,
+        Vec::new(),
+        21_000,
+    )
+    .await
+    .expect("plain L1 transaction must win nonce N for this test to be valid");
+    wait_for(SETTLE_TIMEOUT, || {
+        let l1 = w.l1_rpc();
+        async move { Ok(receipt_ok(&l1, plain).await?.filter(|ok| *ok)) }
+    })
+    .await
+    .expect("plain L1 transaction did not consume nonce N");
+
+    let out_nonce = pending_nonce(&w.l2_rpc(), OUTBOUND_USER).await.unwrap();
+    let unrelated = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        out_nonce,
+        Some(w.outbound_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(88u64),
+        }
+        .abi_encode(),
+        900_000,
+    )
+    .await
+    .unwrap();
+    wait_for(SETTLE_TIMEOUT, || {
+        let l2 = w.l2_rpc();
+        async move { Ok(receipt_ok(&l2, unrelated).await?.filter(|ok| *ok)) }
+    })
+    .await
+    .expect("unrelated tx never settled — composer stalled on the stranded held tx");
+    w.node.assert_no_process_death();
+}
+
+/// Manual reproducer for adjacent-nonce admission races.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual race reproducer only; replace with a deterministic pre-insert barrier before enabling in CI"]
+async fn concurrent_adjacent_nonce_admission_no_gap() {
+    let w = setup_cross_chain().await.unwrap();
+    let n = pending_nonce(&w.l2_rpc(), OUTBOUND_USER).await.unwrap();
+    let mk = |nonce: u64, v: u64| {
+        let (front, proxy, cid) = (w.l2_xchain(), w.outbound_proxy, w.l2_chain_id);
+        async move {
+            sign_and_send(
+                &front,
+                OUTBOUND_USER,
+                cid,
+                nonce,
+                Some(proxy),
+                U256::ZERO,
+                IValue::setValueCall { v: U256::from(v) }.abi_encode(),
+                900_000,
+            )
+            .await
+        }
+    };
+    let first = tokio::spawn(mk(n, 1));
+    tokio::task::yield_now().await;
+    let second = mk(n + 1, 2).await;
+    let first = first.await.expect("nonce N submission task panicked");
+    assert!(
+        first.is_ok() && second.is_ok(),
+        "adjacent-nonce admission raced with insertion (first={:?}, second={:?})",
+        first.err(),
+        second.err(),
+    );
+    w.node.assert_no_process_death();
+}
+
+/// Applies escrow limits cumulatively within one drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full-process edge test; enable in the dedicated cross-chain lane after the fixture is slimmed"]
+async fn cumulative_escrow_evicts_second_withdrawal() {
+    let w = setup_cross_chain().await.unwrap();
+    let deposit = 3_000_000_000_000_000u128; // 0.003 ETH
+    let in_nonce = pending_nonce(&w.l1_rpc(), INBOUND_USER).await.unwrap();
+    let dep_hash = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        in_nonce,
+        Some(w.deposit_proxy),
+        U256::from(deposit),
+        Vec::new(),
+        600_000,
+    )
+    .await
+    .unwrap();
+    wait_for(SETTLE_TIMEOUT, || {
+        let l1 = w.l1_rpc();
+        async move { Ok(receipt_ok(&l1, dep_hash).await?.filter(|ok| *ok)) }
+    })
+    .await
+    .expect("deposit did not settle");
+
+    let w1 = 2_000_000_000_000_000u128;
+    let w2 = 2_000_000_000_000_000u128;
+    let recip_before = l2_balance(&w.l1_rpc(), w.withdrawal_recipient)
+        .await
+        .unwrap();
+    let mut on = pending_nonce(&w.l2_rpc(), OUTBOUND_USER).await.unwrap();
+    let h1 = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        on,
+        Some(w.withdrawal_proxy),
+        U256::from(w1),
+        Vec::new(),
+        900_000,
+    )
+    .await
+    .unwrap();
+    on += 1;
+    let h2 = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        on,
+        Some(w.withdrawal_proxy),
+        U256::from(w2),
+        Vec::new(),
+        900_000,
+    )
+    .await
+    .unwrap();
+
+    wait_for(SETTLE_TIMEOUT, || {
+        let l2 = w.l2_rpc();
+        async move { Ok(receipt_ok(&l2, h1).await?.filter(|ok| *ok)) }
+    })
+    .await
+    .expect("first withdrawal did not settle");
+    wait_for(SETTLE_TIMEOUT, || {
+        let (l1, before) = (w.l1_rpc(), recip_before);
+        async move {
+            Ok(
+                (l2_balance(&l1, w.withdrawal_recipient).await? == before + U256::from(w1))
+                    .then_some(()),
+            )
+        }
+    })
+    .await
+    .expect("recipient did not gain exactly the first withdrawal");
+    // Confirm classification before relying on receipt absence.
+    wait_for(SETTLE_TIMEOUT, || async {
+        Ok((w
+            .node
+            .log_count_matching(&["outbound withdrawal exceeds L1 rollup escrow; evicting"])?
+            > 0)
+        .then_some(()))
+    })
+    .await
+    .expect("second withdrawal was never classified as over-escrow poison");
+    assert!(
+        receipt_ok(&w.l2_rpc(), h2).await.unwrap().is_none(),
+        "second withdrawal exceeded remaining escrow and must be evicted",
+    );
+    w.node.assert_no_process_death();
+}
+
+/// Evicts a pure transaction misdirected to a cross-chain front.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full-process edge test; enable in the dedicated cross-chain lane after the fixture is slimmed"]
+async fn misdirected_pure_tx_is_evicted_not_stalled() {
+    let w = setup_cross_chain().await.unwrap();
+    let stray_to = address!("0x4444444444444444444444444444444444444444");
+    let on = pending_nonce(&w.l2_rpc(), OUTBOUND_USER).await.unwrap();
+    let stray = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        on,
+        Some(stray_to),
+        U256::from(1u64),
+        Vec::new(),
+        100_000,
+    )
+    .await
+    .unwrap();
+    let in_nonce = pending_nonce(&w.l1_rpc(), INBOUND_USER).await.unwrap();
+    let legit = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        in_nonce,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(66u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await
+    .unwrap();
+    wait_for(SETTLE_TIMEOUT, || {
+        let l1 = w.l1_rpc();
+        async move { Ok(receipt_ok(&l1, legit).await?.filter(|ok| *ok)) }
+    })
+    .await
+    .expect("legit cross-chain tx never settled after a misdirected pure tx");
+    wait_for(SETTLE_TIMEOUT, || {
+        let (l2, target) = (w.l2_rpc(), w.value_l2);
+        async move { Ok((l2_value(&l2, target).await? == U256::from(66u64)).then_some(())) }
+    })
+    .await
+    .expect("legit cross-chain effect did not land after a misdirected pure tx");
+    wait_for(SETTLE_TIMEOUT, || async {
+        Ok((w.node.log_count_matching(&[
+            "outbound tx produced no L1 settlement entry; evicting",
+            "outbound tx fails simulation deterministically; evicting",
+        ])? > 0)
+            .then_some(()))
+    })
+    .await
+    .expect("misdirected pure transaction was never classified as poison");
+    assert!(
+        receipt_ok(&w.l2_rpc(), stray).await.unwrap().is_none(),
+        "misdirected pure transaction must be evicted, not mined",
+    );
+    w.node.assert_no_process_death();
+}
+
+/// Replaces a held transaction when the same sender submits the same nonce
+/// again before the pool drains. The most recently admitted transaction wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "red until same-nonce held transaction replacement is supported"]
+async fn same_nonce_latest_transaction_replaces_held_transaction() {
+    let w = setup_cross_chain().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+
+    // Start immediately after a completed drain to leave a full Sync interval
+    // for both same-nonce submissions to reach the held pool.
+    let batches_before = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
+        .await
+        .unwrap();
+    wait_for(SETTLE_TIMEOUT, || {
+        let l1_rpc = l1_rpc.clone();
+        async move {
+            let batches = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block).await?;
+            Ok((batches > batches_before).then_some(()))
+        }
+    })
+    .await
+    .expect("no completed bundle observed before replacement test");
+
+    let nonce = pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
+    let first = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        nonce,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(111u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await
+    .expect("initial nonce-N transaction must be admitted");
+    let replacement = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        nonce,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(222u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await
+    .expect("latest nonce-N transaction must replace the held transaction");
+    assert_ne!(first, replacement, "replacement must have a distinct hash");
+
+    assert_all_transactions_succeeded(&l1_rpc, &[replacement], "replacement").await;
+    wait_for(SETTLE_TIMEOUT, || {
+        let l2_rpc = w.l2_rpc();
+        async move {
+            Ok((l2_value(&l2_rpc, w.value_l2).await? == U256::from(222u64)).then_some(()))
+        }
+    })
+    .await
+    .expect("replacement effect did not reach L2");
+    assert!(
+        receipt_ok(&l1_rpc, first).await.unwrap().is_none(),
+        "superseded nonce-N transaction must not land",
+    );
+    w.node.assert_no_process_death();
+}
+
+/// Rejects consumed, gapped, and underfunded transactions at ingress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full-process edge test; enable in the dedicated cross-chain lane after the fixture is slimmed"]
+async fn ingress_front_admission_guards() {
+    let w = setup_cross_chain().await.unwrap();
+
+    // Already-consumed nonce.
+    let n = pending_nonce(&w.l1_rpc(), INBOUND_USER).await.unwrap();
+    let self_addr = common::signer_address(INBOUND_USER).unwrap();
+    let plain = sign_and_send(
+        &w.l1_rpc(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        n,
+        Some(self_addr),
+        U256::ZERO,
+        Vec::new(),
+        21_000,
+    )
+    .await
+    .unwrap();
+    wait_for(SETTLE_TIMEOUT, || {
+        let l1 = w.l1_rpc();
+        async move { Ok(receipt_ok(&l1, plain).await?.filter(|ok| *ok)) }
+    })
+    .await
+    .expect("plain L1 tx did not confirm");
+    let consumed = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        n,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(1u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await;
+    assert!(
+        consumed.is_err(),
+        "front admitted a cross-chain tx at an already-consumed nonce",
+    );
+
+    // Gapped nonce.
+    let cur = pending_nonce(&w.l1_rpc(), INBOUND_USER).await.unwrap();
+    let gapped = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        cur + 2,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(2u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await;
+    assert!(
+        gapped.is_err(),
+        "front admitted a gapped nonce (on_chain + 2 with nothing held)",
+    );
+
+    // Insufficient balance.
+    let broke = sign_and_send(
+        &w.l2_xchain(),
+        UNFUNDED_KEY,
+        w.l2_chain_id,
+        0,
+        Some(w.withdrawal_proxy),
+        U256::from(1_000_000_000_000_000u128),
+        Vec::new(),
+        900_000,
+    )
+    .await;
+    assert!(
+        broke.is_err(),
+        "front admitted an outbound tx from a zero-balance sender",
+    );
+
     w.node.assert_no_process_death();
 }
