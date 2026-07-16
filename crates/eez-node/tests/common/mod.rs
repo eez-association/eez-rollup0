@@ -600,6 +600,18 @@ pub async fn wait_for_l2_rpc(rpc_url: &str, timeout: Duration) -> Result<()> {
     .await
 }
 
+/// Read the `stateRoot` of the latest `safe` block on the L2 at `rpc_url`.
+/// Returns `Ok(None)` while the L2 hasn't yet adopted any safe block
+/// (genesis L1 derivation pending). Used by the multi-composer reorg
+/// test to verify both composers settle on the same canonical L2 head.
+pub async fn safe_block_state_root(rpc_url: &str) -> Result<Option<B256>> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let block = provider
+        .get_block_by_number(alloy_rpc_types_eth::BlockNumberOrTag::Safe)
+        .await?;
+    Ok(block.map(|b| b.header.state_root))
+}
+
 /// Block number and hash at a named tag (`latest`, `safe`, `finalized`, …).
 /// `None` when no block exists at that tag yet.
 pub async fn block_number_and_hash_at(
@@ -1757,14 +1769,6 @@ pub async fn receipt_ok(rpc_url: &str, hash: alloy_primitives::TxHash) -> Result
         .get_transaction_receipt(hash)
         .await?
         .map(|r| r.status()))
-}
-
-pub async fn safe_block_state_root(rpc_url: &str) -> Result<Option<B256>> {
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    Ok(provider
-        .get_block_by_number(alloy_rpc_types_eth::BlockNumberOrTag::Safe)
-        .await?
-        .map(|block| block.header.state_root))
 }
 
 /// Precomputed config for the embedded-dev-L1 devnet.
