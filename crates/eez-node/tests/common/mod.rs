@@ -14,7 +14,7 @@ use std::{
 
 use alloy_primitives::{Address, B256, U256, address, hex};
 use alloy_provider::{Provider, ProviderBuilder};
-use alloy_rpc_types_eth::TransactionRequest;
+use alloy_rpc_types_eth::{BlockNumHash, BlockNumberOrTag, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent, SolValue, sol};
 use anyhow::{Context, Result, anyhow, bail};
@@ -49,6 +49,8 @@ pub const COMPOSER_INTERVAL_SINGLE: Duration = Duration::from_secs(1);
 /// Composer tick cadence for multi-composer contention — gives the
 /// deriver time to re-sync between ticks (1-tick-per-2-blocks ratio).
 pub const COMPOSER_INTERVAL_MULTI: Duration = Duration::from_secs(2);
+
+static LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -781,8 +783,6 @@ pub struct NodeHandle {
     pub http_port: u16,
 }
 
-static LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
 #[derive(Default)]
 pub struct NodeConfig<'a> {
     /// Path to a custom genesis JSON. `None` uses `--chain dev`.
@@ -920,8 +920,18 @@ impl NodeHandle {
         env: &[(&'static str, String)],
     ) -> Result<Self> {
         let datadir = tempfile::tempdir().context("datadir tempdir")?;
-        let mut handle = Self::spawn_with(name, datadir.path(), cfg, env)?;
+        let mut handle = Self::start_with_datadir(name, datadir.path(), cfg, env).await?;
         handle.keep_alive.push(datadir);
+        Ok(handle)
+    }
+
+    pub async fn start_with_datadir(
+        name: &str,
+        datadir: &std::path::Path,
+        cfg: &NodeConfig<'_>,
+        env: &[(&'static str, String)],
+    ) -> Result<Self> {
+        let handle = Self::spawn_with(name, datadir, cfg, env)?;
         wait_for_l2_rpc(&handle.l2_rpc_url(), Duration::from_secs(180)).await?;
         Ok(handle)
     }
@@ -978,6 +988,23 @@ impl NodeHandle {
         );
     }
 
+    pub fn assert_no_divergence_failure_logs(&self) {
+        let patterns = [
+            "Fatal",
+            "UnexpectedStaticFile",
+            "eez.deriver.state.diverged",
+            "local L2 state root differs",
+            "engine rejected safe/finalized FCU",
+            "payload builder returned no payload",
+        ];
+        assert_eq!(
+            self.log_count_matching(&patterns).unwrap(),
+            0,
+            "{} logged a divergence/fatal-class failure",
+            self.name,
+        );
+    }
+
     /// Count lines in `log_path` matching ANY of `patterns` (substring
     /// match). Used by the multi-composer reorg test to assert
     /// reorg handling on both composers AND zero `Fatal` /
@@ -997,6 +1024,84 @@ impl Drop for NodeHandle {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+pub async fn l2_block_by_tag(rpc_url: &str, tag: BlockNumberOrTag) -> Result<Option<BlockNumHash>> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let block = provider.get_block_by_number(tag).await?;
+    Ok(block.map(|b| BlockNumHash::new(b.header.number, b.header.hash)))
+}
+
+pub async fn l2_block_by_number(rpc_url: &str, number: u64) -> Result<Option<BlockNumHash>> {
+    l2_block_by_tag(rpc_url, BlockNumberOrTag::Number(number)).await
+}
+
+pub async fn latest_block_snapshot(node: &NodeHandle) -> Result<Option<BlockNumHash>> {
+    l2_block_by_tag(&node.l2_rpc_url(), BlockNumberOrTag::Latest).await
+}
+
+pub async fn wait_for_latest_height(
+    node: &NodeHandle,
+    min_height: u64,
+    timeout: Duration,
+) -> Result<BlockNumHash> {
+    wait_for(timeout, || async {
+        let latest = latest_block_snapshot(node).await?;
+        Ok(latest.filter(|b| b.number >= min_height))
+    })
+    .await
+}
+
+/// Wait until all nodes' safe tags have reached at least `min_height` and the
+/// nodes agree on the block hash at the common safe prefix height.
+///
+/// `min_height` is part of the test's contract: callers must choose a height
+/// above the stale/setup baseline for the scenario under test. Otherwise this
+/// helper could pass because every node still agrees on genesis or another old
+/// safe block, without proving the scenario actually advanced.
+pub async fn wait_for_safe_prefix_convergence(
+    nodes: &[&NodeHandle],
+    min_height: u64,
+    timeout: Duration,
+) -> Result<BlockNumHash> {
+    wait_for_tag_prefix_convergence(nodes, BlockNumberOrTag::Safe, min_height, timeout).await
+}
+
+async fn wait_for_tag_prefix_convergence(
+    nodes: &[&NodeHandle],
+    tag: BlockNumberOrTag,
+    min_height: u64,
+    timeout: Duration,
+) -> Result<BlockNumHash> {
+    wait_for(timeout, || async {
+        let mut tag_blocks = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let Some(block) = l2_block_by_tag(&node.l2_rpc_url(), tag).await? else {
+                return Ok(None);
+            };
+            tag_blocks.push(block);
+        }
+
+        let target = tag_blocks
+            .iter()
+            .map(|b| b.number)
+            .min()
+            .unwrap_or_default();
+        if target < min_height {
+            return Ok(None);
+        }
+
+        let mut blocks = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let Some(block) = l2_block_by_number(&node.l2_rpc_url(), target).await? else {
+                return Ok(None);
+            };
+            blocks.push(block);
+        }
+        let first = blocks[0];
+        Ok(blocks.iter().all(|b| b.hash == first.hash).then_some(first))
+    })
+    .await
 }
 
 pub async fn wait_for<F, Fut, T>(timeout: Duration, mut f: F) -> Result<T>
@@ -1212,6 +1317,31 @@ pub async fn all_l2_execution_states(
                 .map_err(Into::into)
         })
         .collect()
+}
+
+/// Wait until `node.safe.stateRoot` appears in the contract's
+/// `L2ExecutionPerformed` history for this `Chain`. The attestation
+/// set grows monotonically, so this doesn't race the contract's
+/// advancing head: any past attestation matching the node's current
+/// safe head proves the node imported a block the contract has, at
+/// some point, declared canonical.
+pub async fn wait_for_node_caught_up(
+    node: &NodeHandle,
+    chain: &Chain<'_>,
+    timeout: Duration,
+) -> Result<()> {
+    wait_for(timeout, || async {
+        let node_root = safe_block_state_root(&node.l2_rpc_url())
+            .await
+            .ok()
+            .flatten();
+        let attested = chain.executed_states().await.unwrap_or_default();
+        Ok(match node_root {
+            Some(n) if n != B256::ZERO && attested.contains(&n) => Some(()),
+            _ => None,
+        })
+    })
+    .await
 }
 
 /// Wait until the node's safe `stateRoot` appears in the contract's

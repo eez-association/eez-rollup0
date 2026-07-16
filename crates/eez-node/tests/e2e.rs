@@ -8,17 +8,114 @@
 use std::time::Duration;
 
 use alloy_primitives::{B256, U256};
+use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::BlockNumberOrTag;
 
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
     AnvilConfig, Harness, NodeConfig, NodeHandle, block_number_and_hash_at, override_env,
-    reorg_genesis_path, reorg_genesis_state_root, send_l2_value_transfer_confirmed,
-    wait_for_new_attested_safe_block, wait_for_safe_chain_contains, wait_for_safe_state,
+    reorg_genesis_path, reorg_genesis_state_root, send_l2_value_transfer,
+    send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
+    wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
+    wait_for_safe_prefix_convergence, wait_for_safe_state,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn with_composer_disabled(mut env: Vec<(&'static str, String)>) -> Vec<(&'static str, String)> {
+    env.push(("EEZ_COMPOSER_DISABLED", "1".to_string()));
+    env
+}
+
+fn assert_no_divergence_failure_logs(nodes: &[&NodeHandle]) {
+    for node in nodes {
+        node.assert_no_divergence_failure_logs();
+    }
+}
+
+/// Regression for the original suffix-replay bug. Sequencer B locally
+/// builds empty blocks on its own ancestry. Sequencer A builds one L2
+/// tx followed by empty blocks, then posts them as a single multi-block
+/// batch. B must replay the mismatched tx block and every later block
+/// in the same batch, even when those later tx lists match.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_sequencer_intra_batch_suffix_replay_converges() {
+    let harness = Harness::with_anvil_config(
+        AnvilConfig::for_reorg(),
+        reorg_genesis_state_root().unwrap(),
+    )
+    .await
+    .unwrap();
+    let chain = harness.chain();
+    let genesis = reorg_genesis_path();
+    let cfg = NodeConfig {
+        genesis_path: Some(genesis.as_path()),
+    };
+
+    let primary_dir = tempfile::tempdir().unwrap();
+    let mirror_dir = tempfile::tempdir().unwrap();
+    let seq_a_env_disabled = with_composer_disabled(harness.env_for(ANVIL_KEY, true));
+    let seq_b_env = with_composer_disabled(harness.env_for(ANVIL_KEY_4, true));
+
+    let seq_a = NodeHandle::start_with_datadir(
+        "intra-seq-a-stage",
+        primary_dir.path(),
+        &cfg,
+        &seq_a_env_disabled,
+    )
+    .await
+    .unwrap();
+    let seq_b = NodeHandle::start_with_datadir("intra-seq-b", mirror_dir.path(), &cfg, &seq_b_env)
+        .await
+        .unwrap();
+
+    let seq_a_rpc = seq_a.l2_rpc_url();
+    let seq_a_provider = ProviderBuilder::new().connect_http(seq_a_rpc.parse().unwrap());
+    let tx_hash = send_l2_value_transfer(&seq_a_rpc, ANVIL_KEY_1, ANVIL_ADDR, U256::from(1u64))
+        .await
+        .expect("submit L2 tx to sequencer A");
+    let receipt = wait_for(DEFAULT_TIMEOUT, || async {
+        Ok(seq_a_provider.get_transaction_receipt(tx_hash).await?)
+    })
+    .await
+    .unwrap_or_else(|err| panic!("wait for L2 tx {tx_hash} inclusion: {err:#}"));
+    assert!(receipt.status(), "L2 tx {tx_hash} reverted");
+    let included_block = receipt
+        .block_number
+        .unwrap_or_else(|| panic!("included L2 tx {tx_hash} missing block_number"));
+    assert!(
+        included_block > 0,
+        "L2 tx {tx_hash} must not be included in genesis"
+    );
+    let target = included_block + 3;
+    wait_for_latest_height(&seq_a, target, DEFAULT_TIMEOUT)
+        .await
+        .expect("sequencer A did not stage enough local blocks");
+    wait_for_latest_height(&seq_b, target, DEFAULT_TIMEOUT)
+        .await
+        .expect("sequencer B did not stage enough local blocks");
+
+    drop(seq_a);
+    let seq_a = NodeHandle::start_with_datadir(
+        "intra-seq-a-compose",
+        primary_dir.path(),
+        &cfg,
+        &harness.env_for(ANVIL_KEY, true),
+    )
+    .await
+    .unwrap();
+
+    chain
+        .wait_for_batches(1, DEFAULT_TIMEOUT)
+        .await
+        .expect("sequencer A did not post staged multi-block batch");
+    wait_for_safe_prefix_convergence(&[&seq_a, &seq_b], target, DEFAULT_TIMEOUT)
+        .await
+        .expect("sequencers did not converge after intra-batch suffix replay");
+
+    assert_no_divergence_failure_logs(&[&seq_a, &seq_b]);
+}
 
 /// Builder mode, sustained operation through a restart. Asserts every
 /// observable invariant in one place:
@@ -42,9 +139,13 @@ async fn happy_case_builder_sustained() {
     // Phase 1 — sustained operation under the first node.
     let n_before;
     let root_before;
+    let pre_restart_latest;
     {
-        let _node = NodeHandle::spawn(datadir.path(), &env).unwrap();
+        let node_before_restart = NodeHandle::spawn(datadir.path(), &env).unwrap();
         n_before = chain.wait_for_batches(3, DEFAULT_TIMEOUT).await.unwrap();
+        pre_restart_latest = wait_for_latest_height(&node_before_restart, 1, DEFAULT_TIMEOUT)
+            .await
+            .expect("pre-restart node did not produce L2 blocks");
         assert_eq!(
             chain.executions_performed().await.unwrap(),
             n_before,
@@ -69,7 +170,7 @@ async fn happy_case_builder_sustained() {
         .wait_for_l1_blocks(2, Duration::from_secs(15))
         .await
         .unwrap();
-    let _node = NodeHandle::spawn(datadir.path(), &env).unwrap();
+    let node = NodeHandle::spawn(datadir.path(), &env).unwrap();
 
     // After restart, the *only* check that doesn't depend on user txs hitting
     // the L2 (which the dev chain has none of) is forward progress on
@@ -85,6 +186,10 @@ async fn happy_case_builder_sustained() {
         n_after > n_before,
         "BatchPosted grew ({n_before} → {n_after})"
     );
+    let post_restart_target_height = pre_restart_latest.number + 1;
+    wait_for_latest_height(&node, post_restart_target_height, DEFAULT_TIMEOUT)
+        .await
+        .expect("restarted node did not advance L2 height after restart");
     assert_eq!(
         chain.executions_performed().await.unwrap(),
         n_after,
@@ -104,7 +209,8 @@ async fn happy_case_builder_sustained() {
     // Phase 3 — follower full-replay. Spawn a fresh-datadir node in
     // follower mode by keeping L1 env and omitting the proof signer;
     // `Deriver::catch_up` must rebuild state from L1 events alone and
-    // land on a stateRoot the contract has attested.
+    // land on a stateRoot the contract has attested, and agree with the
+    // restarted node's safe block hash.
     let follower_env = harness.follower_env(None);
     let follower = NodeHandle::start("follower", &NodeConfig::default(), &follower_env)
         .await
@@ -112,6 +218,13 @@ async fn happy_case_builder_sustained() {
     wait_for_safe_state(&follower, &chain, B256::ZERO, DEFAULT_TIMEOUT)
         .await
         .expect("follower did not catch up via L1 replay");
+    wait_for_safe_prefix_convergence(
+        &[&node, &follower],
+        post_restart_target_height,
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("restarted node and replay follower did not converge on safe block hashes");
     follower.assert_no_process_death();
 }
 
@@ -210,7 +323,7 @@ async fn failure_prover_signer_mismatch() {
 /// background collector sends real L2 state-changing txs so batches
 /// carry content (exercises receipt pruning, state-trie writes, and
 /// txpool reorg paths that empty batches skip). After ≥4 batches land
-/// we call `anvil_reorg(depth=3)` and verify four invariants:
+/// we call `anvil_reorg(depth=3)` and verify five invariants:
 ///
 /// **I1 — No process death.** Neither node logs `Fatal` /
 /// `UnexpectedStaticFile`. Without this every other check is moot.
@@ -225,7 +338,11 @@ async fn failure_prover_signer_mismatch() {
 /// the reorg, the other node's safe chain must contain that exact
 /// `(number, hash)`.
 ///
-/// **I4 — Liveness.** Post-reorg batches landed (`batches_posted` grew
+/// **I4 — Same safe block hash.** The two nodes converge on an identical
+/// safe block hash after reorg recovery. This is stronger than stateRoot
+/// equality: empty or equivalent-state blocks can still diverge by hash.
+///
+/// **I5 — Liveness.** Post-reorg batches landed (`batches_posted` grew
 /// past the pre-reorg snapshot). Proves the chain didn't freeze on the
 /// rewound state.
 // Known-failing pending a fix: after an L1 reorg re-grows the chain, defer-on-lateness
@@ -262,6 +379,12 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
         .wait_for_batches(4, DEFAULT_TIMEOUT)
         .await
         .expect("pre-reorg: ≥4 combined batches");
+    let (c1_pre_reorg_latest, c2_pre_reorg_latest) = tokio::try_join!(
+        wait_for_latest_height(&c1, 1, DEFAULT_TIMEOUT),
+        wait_for_latest_height(&c2, 1, DEFAULT_TIMEOUT),
+    )
+    .expect("pre-reorg: both composers should have produced L2 blocks");
+    let post_reorg_target_height = c1_pre_reorg_latest.number.min(c2_pre_reorg_latest.number) + 1;
     let pre_reorg_states = chain.executed_states().await.unwrap();
 
     // Drop the most recent 3 L1 blocks. Composer's bundle-target window
@@ -281,13 +404,18 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     .await
     .expect("post-reorg L2 tx did not land on c1");
 
-    // I4 — Liveness FIRST: wait for `batchesPosted` to climb past the
+    // I5 — Liveness FIRST: wait for `batchesPosted` to climb past the
     // pre-reorg count. Without this, I3 below could trivially succeed
     // against the rewound state (a stale equality, not catch-up).
     chain
         .wait_for_batches(pre_batches + 1, DEFAULT_TIMEOUT)
         .await
         .expect("no batches landed after reorg");
+    tokio::try_join!(
+        wait_for_latest_height(&c1, post_reorg_target_height, DEFAULT_TIMEOUT),
+        wait_for_latest_height(&c2, post_reorg_target_height, DEFAULT_TIMEOUT),
+    )
+    .expect("composers did not advance L2 height after reorg");
 
     // I3 — Both nodes import the same post-reorg safe block. Either
     // composer may import the newly attested block first after the L1 reorg.
@@ -331,6 +459,11 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     .unwrap_or_else(|err| {
         panic!("{peer_name} did not import {source_name}'s post-reorg safe block: {err:#}");
     });
+
+    // I4 — The nodes agree on block hashes, not only state roots.
+    wait_for_safe_prefix_convergence(&[&c1, &c2], post_reorg_target_height, DEFAULT_TIMEOUT)
+        .await
+        .expect("composers did not converge on post-reorg safe block hashes");
 
     // I2 — Both nodes observed the reorg.
     c1.wait_for_reorg_seen(DEFAULT_TIMEOUT).await.unwrap();
