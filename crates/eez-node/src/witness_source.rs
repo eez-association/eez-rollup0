@@ -1,56 +1,190 @@
-//! Commit-time witness capture for the composer-controlled prover (remote mode).
+//! Persistent per-block witness store for the composer-controlled prover
+//! (remote mode).
 //!
-//! The block committer emits each PRODUCED block's hash the instant it commits
-//! canonically. [`run_capture`] re-executes that block RIGHT THEN — while its
-//! parent state is still retained — and stores the augmented execution witness in
-//! a [`WitnessStore`] keyed by block number. [`NodeWitnessSource`] (the composer's
-//! [`ProvingWitnessSource`]) fills the committed part of
-//! [`eez_prover::ProvingContext::blocks`] from the store, with an on-demand
-//! re-exec fallback for the newest committed blocks the capture task hasn't
-//! drained yet (their parent state is still fresh).
+//! At commit, the committer feeds each produced block's hash to [`run_capture`],
+//! which re-executes it (parent state still fresh) and persists the augmented
+//! witness. [`NodeWitnessSource`] serves the committed window of
+//! [`eez_prover::ProvingContext::blocks`] from the store, re-execing on demand
+//! only for the newest blocks not yet drained.
 //!
-//! Capturing at commit — rather than regenerating everything on demand at
-//! settlement — is what keeps this sound on a non-archival node: by settlement
-//! time an older block's parent state is pruned, so its witness must already be
-//! stored (captured when the state was fresh). The settlement window's ENDPOINT —
-//! the Sync block the composer just built but has NOT committed — is not served
-//! here at all: no store or provider can serve an uncommitted block, so the
-//! composer captures that one directly from its in-memory block (eez-composer's
-//! `endpoint_witness`). In mock mode no store/task is wired and `blocks` stays
-//! empty.
+//! Persistent (mdbx), not RAM: the node is non-archival, so by settlement time an
+//! older block's parent state is pruned — a RAM store lost on restart couldn't
+//! re-derive it, stalling a restart with an unsettled backlog. Dedicated env
+//! (never reth's node DB; path `EEZ_WITNESS_DB_PATH`), keyed by block number.
+//!
+//! Purge floor = L1-FINALIZED (not merely-posted) L2 height: an L1 reorg could
+//! roll a posted batch out and need its witness back. The endpoint (uncommitted
+//! Sync block) is captured by the composer's `endpoint_witness`, not here.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::Arc;
 
 use alloy_consensus::Header;
 use alloy_eips::BlockHashOrNumber;
-use alloy_primitives::B256;
+use alloy_primitives::{B256, Bytes};
+use alloy_rpc_types_debug::ExecutionWitness;
 use eez_driver::witness::{ExecutionWitnessMode, block_witness};
 use eez_prover::{BlockWitness, ProvingWitnessSource};
 use reth_ethereum_primitives::{Block, EthPrimitives};
 use reth_evm::ConfigureEvm;
+use reth_libmdbx::{DatabaseFlags, Environment, Geometry, WriteFlags};
 use reth_storage_api::{BlockReader, HeaderProvider, StateProviderFactory, TransactionVariant};
 use tokio::sync::mpsc;
 use tracing::{Level, event};
 
-/// Per-block augmented witnesses, keyed by L2 block number. Written by
-/// [`run_capture`] at commit-time, read by [`NodeWitnessSource`].
-pub type WitnessStore = Arc<Mutex<BTreeMap<u64, BlockWitness>>>;
+const GIGABYTE: usize = 1024 * 1024 * 1024;
+/// mdbx reserves this as sparse virtual address space (no preallocation) and
+/// grows the file lazily, so a generous cap just means "never `MAP_FULL`".
+const MAP_MAX_BYTES: usize = 256 * GIGABYTE;
+const GROWTH_STEP: isize = 1024 * 1024 * 1024;
 
-/// Retain at most this many blocks behind the newest captured one (bounds memory;
-/// far more than any settlement window `[posted+1 .. sync]`).
-const RETAIN_BEHIND_TIP: u64 = 4096;
-
-/// Fresh empty [`WitnessStore`].
-#[must_use]
-pub fn new_store() -> WitnessStore {
-    Arc::new(Mutex::new(BTreeMap::new()))
+/// Persistent witness store: a dedicated mdbx env keyed by block number
+/// (big-endian, so key order == numeric order → ordered purge). Cheap `Arc`
+/// clone; mdbx MVCC needs no extra lock.
+pub struct WitnessDb {
+    env: Environment,
 }
 
-/// The composer's [`ProvingWitnessSource`]: reads a pre-captured witness from the
-/// shared [`WitnessStore`]. A miss ("not captured yet") is a transient capture
-/// lag, not a hard failure — the composer defers the Sync slot and retries next
-/// trigger; the witness is soundly built at commit (fresh state), just a beat late.
+impl std::fmt::Debug for WitnessDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WitnessDb").finish_non_exhaustive()
+    }
+}
+
+impl WitnessDb {
+    /// Open (creating if absent) the witness env at `path`.
+    ///
+    /// # Errors
+    /// Filesystem or mdbx open failures.
+    pub fn open(path: &Path) -> eyre::Result<Self> {
+        std::fs::create_dir_all(path)?;
+        let mut builder = Environment::builder();
+        builder.set_geometry(Geometry {
+            size: Some(0..MAP_MAX_BYTES),
+            growth_step: Some(GROWTH_STEP),
+            shrink_threshold: None,
+            page_size: None,
+        });
+        let env = builder
+            .open(path)
+            .map_err(|e| eyre::eyre!("open witness env at {}: {e}", path.display()))?;
+        let txn = env.begin_rw_txn()?;
+        txn.create_db(None, DatabaseFlags::empty())?; // default (unnamed) table
+        txn.commit()?;
+        Ok(Self { env })
+    }
+
+    /// Persist `bw` under its block number (overwrites on reorg re-capture).
+    ///
+    /// # Errors
+    /// Serialization or mdbx write failures.
+    pub fn put(&self, number: u64, bw: &BlockWitness) -> eyre::Result<()> {
+        let bytes = postcard::to_allocvec(&StoredWitness::from(bw))
+            .map_err(|e| eyre::eyre!("encode witness {number}: {e}"))?;
+        let txn = self.env.begin_rw_txn()?;
+        let db = txn.open_db(None)?;
+        txn.put(db.dbi(), number.to_be_bytes(), &bytes, WriteFlags::UPSERT)?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Read the witness at `number`, or `None` if absent.
+    ///
+    /// # Errors
+    /// mdbx read or deserialization failures.
+    pub fn get(&self, number: u64) -> eyre::Result<Option<BlockWitness>> {
+        let txn = self.env.begin_ro_txn()?;
+        let db = txn.open_db(None)?;
+        let raw: Option<Vec<u8>> = txn.get(db.dbi(), &number.to_be_bytes())?;
+        match raw {
+            Some(bytes) => {
+                let stored: StoredWitness = postcard::from_bytes(&bytes)
+                    .map_err(|e| eyre::eyre!("decode witness {number}: {e}"))?;
+                Ok(Some(stored.into()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Delete every witness with block number `< below`, returning the count.
+    /// Call with the L1-FINALIZED L2 height — those blocks can't need re-settlement.
+    ///
+    /// # Errors
+    /// mdbx write failures.
+    pub fn purge_settled(&self, below: u64) -> eyre::Result<usize> {
+        let below_be = below.to_be_bytes();
+        let txn = self.env.begin_rw_txn()?;
+        let db = txn.open_db(None)?;
+        // Collect-then-delete in one txn: mdbx cursor-during-delete is subtle.
+        let mut doomed: Vec<[u8; 8]> = Vec::new();
+        {
+            let mut cursor = txn.cursor(db.dbi())?;
+            let mut entry: Option<([u8; 8], ())> = cursor.first()?;
+            while let Some((key, ())) = entry {
+                if key >= below_be {
+                    break; // ordered keys → the rest are all >= floor
+                }
+                doomed.push(key);
+                entry = cursor.next()?;
+            }
+        }
+        for key in &doomed {
+            txn.del(db.dbi(), key, None)?;
+        }
+        txn.commit()?;
+        Ok(doomed.len())
+    }
+}
+
+/// On-disk mirror of [`BlockWitness`] (postcard). Scalars are raw bytes to avoid
+/// depending on alloy's optional `serde` feature; `ExecutionWitness` self-serdes.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredWitness {
+    number: u64,
+    hash: [u8; 32],
+    parent_hash: [u8; 32],
+    rlp: Vec<u8>,
+    witness: ExecutionWitness,
+}
+
+impl From<&BlockWitness> for StoredWitness {
+    fn from(b: &BlockWitness) -> Self {
+        Self {
+            number: b.number,
+            hash: b.hash.0,
+            parent_hash: b.parent_hash.0,
+            rlp: b.rlp.to_vec(),
+            witness: b.witness.clone(),
+        }
+    }
+}
+
+impl From<StoredWitness> for BlockWitness {
+    fn from(s: StoredWitness) -> Self {
+        Self {
+            number: s.number,
+            hash: B256::from(s.hash),
+            parent_hash: B256::from(s.parent_hash),
+            rlp: Bytes::from(s.rlp),
+            witness: s.witness,
+        }
+    }
+}
+
+/// Shared handle to the persistent witness store.
+pub type WitnessStore = Arc<WitnessDb>;
+
+/// Open the dedicated witness environment at `path`.
+///
+/// # Errors
+/// See [`WitnessDb::open`].
+pub fn new_store(path: &Path) -> eyre::Result<WitnessStore> {
+    Ok(Arc::new(WitnessDb::open(path)?))
+}
+
+/// The composer's [`ProvingWitnessSource`]: reads a captured witness from the
+/// persistent store, falling back to on-demand re-exec for the newest blocks the
+/// capture task hasn't drained yet (parent state still fresh).
 #[derive(Clone)]
 pub struct NodeWitnessSource<P, E> {
     store: WitnessStore,
@@ -59,11 +193,6 @@ pub struct NodeWitnessSource<P, E> {
 }
 
 impl<P, E> NodeWitnessSource<P, E> {
-    /// Read pre-captured witnesses from `store`, falling back to an on-demand
-    /// re-exec (`provider`/`evm_config`) on a miss — the newest blocks the
-    /// commit-time capture task hasn't drained yet, whose parent state is still
-    /// retained (so the re-exec is sound). Older blocks (state since pruned) are
-    /// served from the store, captured when their state was fresh.
     #[must_use]
     pub const fn new(store: WitnessStore, provider: P, evm_config: E) -> Self {
         Self {
@@ -90,17 +219,20 @@ where
     E: ConfigureEvm<Primitives = EthPrimitives> + Send + Sync,
 {
     fn block_witness(&self, number: u64) -> Result<BlockWitness, String> {
-        if let Some(bw) = self
-            .store
-            .lock()
-            .map_err(|_| "witness store poisoned".to_string())?
-            .get(&number)
-            .cloned()
-        {
-            return Ok(bw);
+        match self.store.get(number) {
+            Ok(Some(bw)) => return Ok(bw),
+            Ok(None) => {} // not captured yet → re-exec fallback below
+            Err(e) => {
+                // Unexpected; fall back to re-exec rather than fail the slot.
+                event!(
+                    name: "eez.node.witness_store.read_failed",
+                    Level::WARN,
+                    number,
+                    error = %e,
+                    "witness store read failed; falling back to on-demand re-exec",
+                );
+            }
         }
-        // Store miss: the capture task hasn't drained this (newest) block yet.
-        // Its parent state is still retained, so re-execute on the spot.
         build_block_witness(
             &self.provider,
             &self.evm_config,
@@ -109,8 +241,8 @@ where
     }
 }
 
-/// Re-execute one committed block (by hash) on its parent state and build its
-/// augmented [`BlockWitness`]. Blocking (trie walk) — call under `spawn_blocking`.
+/// Re-execute a committed block on its parent state → augmented witness.
+/// Blocking (trie walk); call under `spawn_blocking`.
 fn build_block_witness<P, E>(
     provider: &P,
     evm_config: &E,
@@ -124,21 +256,21 @@ where
         .recovered_block(id, TransactionVariant::WithHash)
         .map_err(|e| format!("fetch block {id:?}: {e}"))?
         .ok_or_else(|| format!("witness for block {id:?} not captured yet"))?;
-    // `Legacy` + the removal-closure augmentation: carries the intermediate-per-tx
-    // -root nodes the prover's re-execution needs (the MPT completeness fix).
+    // Legacy + removal-closure augmentation: the intermediate-per-tx-root nodes
+    // the prover's re-execution needs (MPT completeness fix).
     block_witness(provider, evm_config, &block, ExecutionWitnessMode::Legacy)
         .map_err(|e| format!("witness for block {id:?}: {e}"))
 }
 
-/// Drain committed-block hashes from the committer's witness feed, capture each
-/// block's augmented witness AT COMMIT (parent state still fresh), and store it —
-/// bounding the store to the last [`RETAIN_BEHIND_TIP`] blocks. Runs until the
-/// channel closes.
-pub async fn run_capture<P, E>(
+/// Drain committed-block hashes, capture each block's witness at commit (parent
+/// state fresh), persist it, and purge everything the L1 has FINALIZED
+/// (`settled_floor`). Runs until the channel closes.
+pub async fn run_capture<P, E, F>(
     mut rx: mpsc::UnboundedReceiver<B256>,
     store: WitnessStore,
     provider: P,
     evm_config: E,
+    settled_floor: F,
 ) where
     P: BlockReader<Block = Block>
         + StateProviderFactory
@@ -148,6 +280,7 @@ pub async fn run_capture<P, E>(
         + Sync
         + 'static,
     E: ConfigureEvm<Primitives = EthPrimitives> + Clone + Send + Sync + 'static,
+    F: Fn() -> u64 + Send + 'static,
 {
     while let Some(hash) = rx.recv().await {
         let provider = provider.clone();
@@ -159,16 +292,30 @@ pub async fn run_capture<P, E>(
         match built {
             Ok(Ok(bw)) => {
                 let number = bw.number;
-                if let Ok(mut m) = store.lock() {
-                    m.insert(number, bw);
-                    let cutoff = number.saturating_sub(RETAIN_BEHIND_TIP);
-                    while let Some((&low, _)) = m.iter().next() {
-                        if low < cutoff {
-                            m.remove(&low);
-                        } else {
-                            break;
-                        }
-                    }
+                if let Err(e) = store.put(number, &bw) {
+                    event!(
+                        name: "eez.node.witness_capture.persist_failed",
+                        Level::ERROR,
+                        number,
+                        error = %e,
+                        "persisting captured witness failed",
+                    );
+                }
+                // Drop finalized witnesses; cheap when nothing is below the floor.
+                match store.purge_settled(settled_floor()) {
+                    Ok(n) if n > 0 => event!(
+                        name: "eez.node.witness_store.purged",
+                        Level::DEBUG,
+                        removed = n,
+                        "purged finalized witnesses",
+                    ),
+                    Ok(_) => {}
+                    Err(e) => event!(
+                        name: "eez.node.witness_store.purge_failed",
+                        Level::WARN,
+                        error = %e,
+                        "purging finalized witnesses failed",
+                    ),
                 }
             }
             Ok(Err(e)) => event!(
@@ -186,5 +333,69 @@ pub async fn run_capture<P, E>(
                 "witness capture task panicked",
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StoredWitness, WitnessDb};
+    use alloy_primitives::{B256, Bytes};
+    use alloy_rpc_types_debug::ExecutionWitness;
+    use eez_prover::BlockWitness;
+
+    fn sample(number: u64) -> BlockWitness {
+        BlockWitness {
+            number,
+            hash: B256::repeat_byte(number as u8),
+            parent_hash: B256::repeat_byte(number.wrapping_sub(1) as u8),
+            rlp: Bytes::from(vec![number as u8; 4]),
+            witness: ExecutionWitness {
+                state: vec![Bytes::from(vec![1, 2, 3])],
+                codes: vec![],
+                keys: vec![],
+                headers: vec![],
+                ..Default::default()
+            },
+        }
+    }
+
+    /// put → get round-trips through postcard, survives a close+reopen
+    /// (restart), and `purge_settled` removes exactly the below-floor prefix.
+    #[test]
+    fn persist_get_purge_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in [10u64, 11, 12] {
+            let db = WitnessDb::open(dir.path()).unwrap();
+            db.put(n, &sample(n)).unwrap();
+        } // each `db` drops → env closed; reopening below == a restart
+
+        let db = WitnessDb::open(dir.path()).unwrap();
+        // Reads survive restart.
+        let got = db.get(11).unwrap().expect("11 present after restart");
+        assert_eq!(got.number, 11);
+        assert_eq!(got.rlp, Bytes::from(vec![11u8; 4]));
+        assert!(db.get(99).unwrap().is_none());
+
+        // Purge < 12 removes 10 and 11, keeps 12.
+        assert_eq!(db.purge_settled(12).unwrap(), 2);
+        assert!(db.get(10).unwrap().is_none());
+        assert!(db.get(11).unwrap().is_none());
+        assert!(db.get(12).unwrap().is_some());
+        // Idempotent: nothing left below the floor.
+        assert_eq!(db.purge_settled(12).unwrap(), 0);
+    }
+
+    #[test]
+    fn stored_witness_roundtrip() {
+        let bw = sample(7);
+        let bytes = postcard::to_allocvec(&StoredWitness::from(&bw)).unwrap();
+        let back: BlockWitness = postcard::from_bytes::<StoredWitness>(&bytes)
+            .unwrap()
+            .into();
+        assert_eq!(back.number, bw.number);
+        assert_eq!(back.hash, bw.hash);
+        assert_eq!(back.parent_hash, bw.parent_hash);
+        assert_eq!(back.rlp, bw.rlp);
+        assert_eq!(back.witness.state, bw.witness.state);
     }
 }

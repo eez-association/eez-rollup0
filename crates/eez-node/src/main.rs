@@ -370,7 +370,17 @@ fn main() -> eyre::Result<()> {
         let (witness_tx, witness_rx, witness_store) =
             if mode == Mode::Composer && env::var_os("EEZ_PROVER_URL").is_some() {
                 let (tx, rx) = mpsc::unbounded_channel::<B256>();
-                (Some(tx), Some(rx), Some(witness_source::new_store()))
+                // Dedicated mdbx env (never reth's node DB); path env-configurable.
+                let witness_db_path =
+                    env::var("EEZ_WITNESS_DB_PATH").unwrap_or_else(|_| "eez-witnesses".to_owned());
+                let store = witness_source::new_store(std::path::Path::new(&witness_db_path))?;
+                event!(
+                    name: "eez.node.witness_store.opened",
+                    Level::INFO,
+                    path = %witness_db_path,
+                    "persistent witness store opened",
+                );
+                (Some(tx), Some(rx), Some(store))
             } else {
                 (None, None, None)
             };
@@ -777,8 +787,17 @@ fn main() -> eyre::Result<()> {
                     let ws_provider = provider.clone();
                     let ws_evm = evm_config.clone();
                     let cap_store = Arc::clone(&store);
+                    // Purge floor = L1-FINALIZED height (a reorg could un-settle a posted batch).
+                    let cap_l1_head = Arc::clone(&l1_head);
                     task_executor.spawn_critical_task("eez-witness-capture", async move {
-                        witness_source::run_capture(rx, cap_store, cap_provider, cap_evm).await;
+                        witness_source::run_capture(
+                            rx,
+                            cap_store,
+                            cap_provider,
+                            cap_evm,
+                            move || cap_l1_head.finalized_l2(),
+                        )
+                        .await;
                     });
                     // Hybrid: read the store, else re-exec on demand the newest block
                     // the async capture hasn't drained yet (state still retained; fast

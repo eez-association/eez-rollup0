@@ -37,6 +37,8 @@ reth-rpc-eth-api.workspace                = true
 reth-storage-api.workspace                = true
 reth-tasks.workspace                      = true
 reth-transaction-pool.workspace           = true
+# Persistent witness store: dedicated mdbx env, separate from reth's node DB.
+reth-libmdbx.workspace                    = true
 
 # Gnosis (chiado) L1 — provided when EEZ_L1_EMBEDDED=1 and the smoke
 # targets chiado; the L1 NodeBuilder uses these.
@@ -48,6 +50,7 @@ alloy-consensus.workspace    = true
 alloy-eips.workspace         = true
 alloy-primitives.workspace   = true
 alloy-rlp.workspace          = true
+alloy-rpc-types-debug.workspace = true
 alloy-provider.workspace     = true
 alloy-signer-local.workspace = true
 reqwest.workspace            = true
@@ -62,6 +65,8 @@ http-body-util = "0.1"
 jsonrpsee.workspace  = true
 serde.workspace      = true
 serde_json.workspace = true
+# Witness-store value codec (compact binary).
+postcard.workspace   = true
 
 # app
 clap.workspace               = true
