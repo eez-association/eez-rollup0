@@ -167,24 +167,11 @@ impl Submitter {
                     + NEXT_BLOCK_SLACK
             }
         };
-        // Expose the bundle order to the receipt-level CI oracle.
-        let bundle_tx_hashes = raw_txs
-            .iter()
-            .enumerate()
-            .map(|(index, raw)| {
-                alloy_consensus::TxEnvelope::decode_2718(&mut raw.as_ref())
-                    .map(|tx| *tx.tx_hash())
-                    .map_err(|e| {
-                        L1Error::Submission(format!("send_bundle: decode transaction {index}: {e}"))
-                    })
-            })
-            .collect::<L1Result<Vec<_>>>()?;
-        let post_batch_hash = bundle_tx_hashes[0];
-        let bundle_tx_hashes = bundle_tx_hashes
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
+        let post_batch_envelope =
+            alloy_consensus::TxEnvelope::decode_2718(&mut raw_txs[0].as_ref()).map_err(|e| {
+                L1Error::Submission(format!("send_bundle: decode postBatch envelope: {e}"))
+            })?;
+        let post_batch_hash = *post_batch_envelope.tx_hash();
         // Dispatch breadcrumb: correlate this postBatch tx to the L1 block we
         // aim it at. `SendOutcome::Included` later carries the ACTUAL inclusion
         // block, so joining on tx_hash gives the N+1 next-slot targeting hit-rate.
@@ -195,7 +182,6 @@ impl Submitter {
             target_block,
             exact = matches!(target, BundleTarget::Exact { .. }),
             tx_count = raw_txs.len(),
-            bundle_tx_hashes = %bundle_tx_hashes,
             "dispatching bundle to builder",
         );
         // One bundle, one target block. Atomic bundle semantics:
