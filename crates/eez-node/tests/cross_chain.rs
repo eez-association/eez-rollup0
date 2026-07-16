@@ -5,10 +5,10 @@ use alloy_sol_types::SolCall;
 
 mod common;
 use common::{
-    ANVIL_KEY_2, CC_INBOUND_USER, CC_OUTBOUND_USER, CC_SETTLE_TIMEOUT, DEV_CHAIN_ID,
-    ISetterWrapper, IValue, IValueNoRet, UNFUNDED_KEY, batches_posted, l2_balance, l2_value,
-    pending_nonce, receipt_ok, setup_cross_chain, setup_cross_chain_with_env, sign_and_send,
-    state_root, value_no_ret, wait_for,
+    ANVIL_KEY_2, DEV_CHAIN_ID, INBOUND_USER, ISetterWrapper, IValue, IValueNoRet, OUTBOUND_USER,
+    SETTLE_TIMEOUT, UNFUNDED_KEY, batches_posted, l2_balance, l2_value, pending_nonce, receipt_ok,
+    setup_cross_chain, setup_cross_chain_with_env, sign_and_send, state_root, value_no_ret,
+    wait_for,
 };
 
 const WAVE_SETTERS: &[u64] = &[7, 11, 17];
@@ -24,7 +24,7 @@ async fn assert_all_transactions_succeeded(rpc_url: &str, hashes: &[TxHash], lab
     assert!(!hashes.is_empty(), "no {label} transactions were submitted");
     for &hash in hashes {
         let rpc_url = rpc_url.to_owned();
-        let status = wait_for(CC_SETTLE_TIMEOUT, move || {
+        let status = wait_for(SETTLE_TIMEOUT, move || {
             let rpc_url = rpc_url.clone();
             async move { receipt_ok(&rpc_url, hash).await }
         })
@@ -43,9 +43,9 @@ async fn minimal_bidirectional_cross_chain_smoke() {
 
     let inbound = sign_and_send(
         &w.l1_xchain(),
-        CC_INBOUND_USER,
+        INBOUND_USER,
         DEV_CHAIN_ID,
-        pending_nonce(&l1_rpc, CC_INBOUND_USER).await.unwrap(),
+        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
         Some(w.setter_proxy),
         U256::ZERO,
         IValue::setValueCall {
@@ -58,9 +58,9 @@ async fn minimal_bidirectional_cross_chain_smoke() {
     .expect("inbound smoke transaction must be admitted");
     let outbound = sign_and_send(
         &w.l2_xchain(),
-        CC_OUTBOUND_USER,
+        OUTBOUND_USER,
         w.l2_chain_id,
-        pending_nonce(&l2_rpc, CC_OUTBOUND_USER).await.unwrap(),
+        pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
         Some(w.outbound_proxy),
         U256::ZERO,
         IValue::setValueCall {
@@ -75,13 +75,13 @@ async fn minimal_bidirectional_cross_chain_smoke() {
     assert_all_transactions_succeeded(&l1_rpc, &[inbound], "inbound smoke").await;
     assert_all_transactions_succeeded(&l2_rpc, &[outbound], "outbound smoke").await;
 
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let l2_rpc = l2_rpc.clone();
         async move { Ok((l2_value(&l2_rpc, w.value_l2).await? == U256::from(41u64)).then_some(())) }
     })
     .await
     .expect("inbound smoke effect did not reach L2");
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let l1_rpc = l1_rpc.clone();
         async move {
             Ok((l2_value(&l1_rpc, w.outbound_value).await? == U256::from(43u64)).then_some(()))
@@ -91,7 +91,7 @@ async fn minimal_bidirectional_cross_chain_smoke() {
     .expect("outbound smoke effect did not reach L1");
 
     let (eez, rollup_id) = (w.cfg.eez_address, w.cfg.rollup_id);
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let (l1_rpc, l2_rpc) = (l1_rpc.clone(), l2_rpc.clone());
         async move {
             let l1_root = state_root(&l1_rpc, eez, rollup_id).await?;
@@ -135,8 +135,8 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
     let withdrawal_before = l2_balance(&l1_rpc, w.withdrawal_recipient).await.unwrap();
     let deposit_sum: u128 = WAVE_DEPOSITS.iter().sum();
 
-    let mut l1_nonce = pending_nonce(&l1_rpc, CC_INBOUND_USER).await.unwrap();
-    let mut l2_nonce = pending_nonce(&l2_rpc, CC_OUTBOUND_USER).await.unwrap();
+    let mut l1_nonce = pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
+    let mut l2_nonce = pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
     let mut inbound_hashes = Vec::new();
     let mut outbound_hashes = Vec::new();
 
@@ -156,7 +156,7 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
         inbound_hashes.push(
             sign_and_send(
                 &l1_xchain,
-                CC_INBOUND_USER,
+                INBOUND_USER,
                 DEV_CHAIN_ID,
                 l1_nonce,
                 Some(w.setter_proxy),
@@ -171,7 +171,7 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
         inbound_hashes.push(
             sign_and_send(
                 &l1_xchain,
-                CC_INBOUND_USER,
+                INBOUND_USER,
                 DEV_CHAIN_ID,
                 l1_nonce,
                 Some(w.deposit_proxy),
@@ -190,7 +190,7 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
             inbound_hashes.push(
                 sign_and_send(
                     &l1_xchain,
-                    CC_INBOUND_USER,
+                    INBOUND_USER,
                     DEV_CHAIN_ID,
                     l1_nonce,
                     Some(to),
@@ -213,7 +213,7 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
             outbound_hashes.push(
                 sign_and_send(
                     &l2_xchain,
-                    CC_OUTBOUND_USER,
+                    OUTBOUND_USER,
                     w.l2_chain_id,
                     l2_nonce,
                     Some(to),
@@ -249,7 +249,7 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
         U256::from(*WAVE_SETTERS.last().unwrap() + 100),
         "inbound wrapper setter converged",
     );
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let l1_rpc = l1_rpc.clone();
         async move {
             Ok((l2_value(&l1_rpc, w.outbound_value).await?
@@ -283,7 +283,7 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
     );
 
     let (eez, rollup_id) = (w.cfg.eez_address, w.cfg.rollup_id);
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let (l1_rpc, l2_rpc) = (l1_rpc.clone(), l2_rpc.clone());
         async move {
             let l1_root = state_root(&l1_rpc, eez, rollup_id).await?;
@@ -348,10 +348,10 @@ const POISON_WITHDRAWAL_WEI: u128 = 1_000_000_000_000_000; // 0.001 ETH
 async fn same_drain_poison_does_not_orphan_higher_nonce() {
     let w = setup_cross_chain().await.unwrap();
 
-    let mut out_nonce = pending_nonce(&w.l2_rpc(), CC_OUTBOUND_USER).await.unwrap();
+    let mut out_nonce = pending_nonce(&w.l2_rpc(), OUTBOUND_USER).await.unwrap();
     let poison_hash = sign_and_send(
         &w.l2_xchain(),
-        CC_OUTBOUND_USER,
+        OUTBOUND_USER,
         w.l2_chain_id,
         out_nonce,
         Some(w.withdrawal_proxy),
@@ -364,7 +364,7 @@ async fn same_drain_poison_does_not_orphan_higher_nonce() {
     out_nonce += 1;
     let orphan_hash = sign_and_send(
         &w.l2_xchain(),
-        CC_OUTBOUND_USER,
+        OUTBOUND_USER,
         w.l2_chain_id,
         out_nonce,
         Some(w.outbound_proxy),
@@ -378,10 +378,10 @@ async fn same_drain_poison_does_not_orphan_higher_nonce() {
     .await
     .unwrap();
 
-    let in_nonce = pending_nonce(&w.l1_rpc(), CC_INBOUND_USER).await.unwrap();
+    let in_nonce = pending_nonce(&w.l1_rpc(), INBOUND_USER).await.unwrap();
     let unrelated_hash = sign_and_send(
         &w.l1_xchain(),
-        CC_INBOUND_USER,
+        INBOUND_USER,
         DEV_CHAIN_ID,
         in_nonce,
         Some(w.setter_proxy),
@@ -395,13 +395,13 @@ async fn same_drain_poison_does_not_orphan_higher_nonce() {
     .await
     .unwrap();
 
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let l1 = w.l1_rpc();
         async move { Ok(receipt_ok(&l1, unrelated_hash).await?.filter(|ok| *ok)) }
     })
     .await
     .expect("unrelated inbound tx never settled — composer stalled on the gapped chain");
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let (l2, value) = (w.l2_rpc(), w.value_l2);
         async move { Ok((l2_value(&l2, value).await? == U256::from(77u64)).then_some(())) }
     })
@@ -410,7 +410,7 @@ async fn same_drain_poison_does_not_orphan_higher_nonce() {
 
     // Require explicit eviction; a missing receipt alone can also mean stalled.
     let orphan_hash_text = orphan_hash.to_string();
-    wait_for(CC_SETTLE_TIMEOUT, || async {
+    wait_for(SETTLE_TIMEOUT, || async {
         Ok((w
             .node
             .log_count_matching_all(&[orphan_hash_text.as_str(), "gapped chain can't land"])?
@@ -438,7 +438,7 @@ async fn same_drain_poison_does_not_orphan_higher_nonce() {
     // The sender can reuse the evicted nonces after cleanup.
     let replacement_n = sign_and_send(
         &w.l2_xchain(),
-        CC_OUTBOUND_USER,
+        OUTBOUND_USER,
         w.l2_chain_id,
         out_nonce - 1,
         Some(w.outbound_proxy),
@@ -453,7 +453,7 @@ async fn same_drain_poison_does_not_orphan_higher_nonce() {
     .expect("corrected replacement at nonce N must be admitted after cascade cleanup");
     let replacement_n1 = sign_and_send(
         &w.l2_xchain(),
-        CC_OUTBOUND_USER,
+        OUTBOUND_USER,
         w.l2_chain_id,
         out_nonce,
         Some(w.outbound_proxy),
@@ -470,7 +470,7 @@ async fn same_drain_poison_does_not_orphan_higher_nonce() {
         (replacement_n, "replacement nonce N"),
         (replacement_n1, "replacement nonce N+1"),
     ] {
-        wait_for(CC_SETTLE_TIMEOUT, || {
+        wait_for(SETTLE_TIMEOUT, || {
             let l2 = w.l2_rpc();
             async move { Ok(receipt_ok(&l2, hash).await?.filter(|ok| *ok)) }
         })
@@ -486,7 +486,7 @@ async fn same_drain_poison_does_not_orphan_higher_nonce() {
 #[ignore = "red until the same-drain dependent-poison cascade fix lands"]
 async fn poison_cascade_is_direction_scoped() {
     let w = setup_cross_chain().await.unwrap();
-    let user = CC_OUTBOUND_USER;
+    let user = OUTBOUND_USER;
 
     let mut out_nonce = pending_nonce(&w.l2_rpc(), user).await.unwrap();
     let poison_hash = sign_and_send(
@@ -535,7 +535,7 @@ async fn poison_cascade_is_direction_scoped() {
     .await
     .unwrap();
 
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let l1 = w.l1_rpc();
         async move { Ok(receipt_ok(&l1, inbound_hash).await?.filter(|ok| *ok)) }
     })
@@ -543,7 +543,7 @@ async fn poison_cascade_is_direction_scoped() {
     .expect(
         "same-EOA inbound tx never settled — outbound poison wrongly cascaded across directions",
     );
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let (l2, value) = (w.l2_rpc(), w.value_l2);
         async move { Ok((l2_value(&l2, value).await? == U256::from(123u64)).then_some(())) }
     })
@@ -574,7 +574,7 @@ async fn poison_cascade_spans_drain_cap() {
     let w = setup_cross_chain_with_env(&[("EEZ_MAX_USER_TXS_PER_BUNDLE", "2".to_string())])
         .await
         .unwrap();
-    let user = CC_OUTBOUND_USER;
+    let user = OUTBOUND_USER;
     let mut nonce = pending_nonce(&w.l2_rpc(), user).await.unwrap();
     let poison = sign_and_send(
         &w.l2_xchain(),
@@ -621,10 +621,10 @@ async fn poison_cascade_spans_drain_cap() {
     .await
     .unwrap();
 
-    let in_nonce = pending_nonce(&w.l1_rpc(), CC_INBOUND_USER).await.unwrap();
+    let in_nonce = pending_nonce(&w.l1_rpc(), INBOUND_USER).await.unwrap();
     let unrelated = sign_and_send(
         &w.l1_xchain(),
-        CC_INBOUND_USER,
+        INBOUND_USER,
         DEV_CHAIN_ID,
         in_nonce,
         Some(w.setter_proxy),
@@ -638,7 +638,7 @@ async fn poison_cascade_spans_drain_cap() {
     .await
     .unwrap();
 
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let l1 = w.l1_rpc();
         async move { Ok(receipt_ok(&l1, unrelated).await?.filter(|ok| *ok)) }
     })
@@ -662,7 +662,7 @@ async fn poison_cascade_spans_drain_cap() {
 #[ignore = "red until the same-drain dependent-poison cascade fix lands"]
 async fn interleaved_senders_poison_isolation() {
     let w = setup_cross_chain().await.unwrap();
-    let a = CC_OUTBOUND_USER; // poison chain
+    let a = OUTBOUND_USER; // poison chain
     let b = ANVIL_KEY_2; // clean, must survive the same drain
 
     let mut an = pending_nonce(&w.l2_rpc(), a).await.unwrap();
@@ -711,7 +711,7 @@ async fn interleaved_senders_poison_isolation() {
     .await
     .unwrap();
 
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let l2 = w.l2_rpc();
         async move { Ok(receipt_ok(&l2, b_hash).await?.filter(|ok| *ok)) }
     })
@@ -733,7 +733,7 @@ async fn interleaved_senders_poison_isolation() {
 #[ignore = "timing-dependent until the compose step has a deterministic test seam"]
 async fn inbound_dos_same_nonce_before_postbatch() {
     let w = setup_cross_chain().await.unwrap();
-    let attacker = CC_INBOUND_USER;
+    let attacker = INBOUND_USER;
 
     let n = pending_nonce(&w.l1_rpc(), attacker).await.unwrap();
     let _held = sign_and_send(
@@ -764,17 +764,17 @@ async fn inbound_dos_same_nonce_before_postbatch() {
     )
     .await
     .expect("plain L1 transaction must win nonce N for this test to be valid");
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let l1 = w.l1_rpc();
         async move { Ok(receipt_ok(&l1, plain).await?.filter(|ok| *ok)) }
     })
     .await
     .expect("plain L1 transaction did not consume nonce N");
 
-    let out_nonce = pending_nonce(&w.l2_rpc(), CC_OUTBOUND_USER).await.unwrap();
+    let out_nonce = pending_nonce(&w.l2_rpc(), OUTBOUND_USER).await.unwrap();
     let unrelated = sign_and_send(
         &w.l2_xchain(),
-        CC_OUTBOUND_USER,
+        OUTBOUND_USER,
         w.l2_chain_id,
         out_nonce,
         Some(w.outbound_proxy),
@@ -787,7 +787,7 @@ async fn inbound_dos_same_nonce_before_postbatch() {
     )
     .await
     .unwrap();
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let l2 = w.l2_rpc();
         async move { Ok(receipt_ok(&l2, unrelated).await?.filter(|ok| *ok)) }
     })
@@ -801,13 +801,13 @@ async fn inbound_dos_same_nonce_before_postbatch() {
 #[ignore = "manual race reproducer only; replace with a deterministic pre-insert barrier before enabling in CI"]
 async fn concurrent_adjacent_nonce_admission_no_gap() {
     let w = setup_cross_chain().await.unwrap();
-    let n = pending_nonce(&w.l2_rpc(), CC_OUTBOUND_USER).await.unwrap();
+    let n = pending_nonce(&w.l2_rpc(), OUTBOUND_USER).await.unwrap();
     let mk = |nonce: u64, v: u64| {
         let (front, proxy, cid) = (w.l2_xchain(), w.outbound_proxy, w.l2_chain_id);
         async move {
             sign_and_send(
                 &front,
-                CC_OUTBOUND_USER,
+                OUTBOUND_USER,
                 cid,
                 nonce,
                 Some(proxy),
@@ -837,10 +837,10 @@ async fn concurrent_adjacent_nonce_admission_no_gap() {
 async fn cumulative_escrow_evicts_second_withdrawal() {
     let w = setup_cross_chain().await.unwrap();
     let deposit = 3_000_000_000_000_000u128; // 0.003 ETH
-    let in_nonce = pending_nonce(&w.l1_rpc(), CC_INBOUND_USER).await.unwrap();
+    let in_nonce = pending_nonce(&w.l1_rpc(), INBOUND_USER).await.unwrap();
     let dep_hash = sign_and_send(
         &w.l1_xchain(),
-        CC_INBOUND_USER,
+        INBOUND_USER,
         DEV_CHAIN_ID,
         in_nonce,
         Some(w.deposit_proxy),
@@ -850,7 +850,7 @@ async fn cumulative_escrow_evicts_second_withdrawal() {
     )
     .await
     .unwrap();
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let l1 = w.l1_rpc();
         async move { Ok(receipt_ok(&l1, dep_hash).await?.filter(|ok| *ok)) }
     })
@@ -862,10 +862,10 @@ async fn cumulative_escrow_evicts_second_withdrawal() {
     let recip_before = l2_balance(&w.l1_rpc(), w.withdrawal_recipient)
         .await
         .unwrap();
-    let mut on = pending_nonce(&w.l2_rpc(), CC_OUTBOUND_USER).await.unwrap();
+    let mut on = pending_nonce(&w.l2_rpc(), OUTBOUND_USER).await.unwrap();
     let h1 = sign_and_send(
         &w.l2_xchain(),
-        CC_OUTBOUND_USER,
+        OUTBOUND_USER,
         w.l2_chain_id,
         on,
         Some(w.withdrawal_proxy),
@@ -878,7 +878,7 @@ async fn cumulative_escrow_evicts_second_withdrawal() {
     on += 1;
     let h2 = sign_and_send(
         &w.l2_xchain(),
-        CC_OUTBOUND_USER,
+        OUTBOUND_USER,
         w.l2_chain_id,
         on,
         Some(w.withdrawal_proxy),
@@ -889,13 +889,13 @@ async fn cumulative_escrow_evicts_second_withdrawal() {
     .await
     .unwrap();
 
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let l2 = w.l2_rpc();
         async move { Ok(receipt_ok(&l2, h1).await?.filter(|ok| *ok)) }
     })
     .await
     .expect("first withdrawal did not settle");
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let (l1, before) = (w.l1_rpc(), recip_before);
         async move {
             Ok(
@@ -907,7 +907,7 @@ async fn cumulative_escrow_evicts_second_withdrawal() {
     .await
     .expect("recipient did not gain exactly the first withdrawal");
     // Confirm classification before relying on receipt absence.
-    wait_for(CC_SETTLE_TIMEOUT, || async {
+    wait_for(SETTLE_TIMEOUT, || async {
         Ok((w
             .node
             .log_count_matching(&["outbound withdrawal exceeds L1 rollup escrow; evicting"])?
@@ -929,10 +929,10 @@ async fn cumulative_escrow_evicts_second_withdrawal() {
 async fn misdirected_pure_tx_is_evicted_not_stalled() {
     let w = setup_cross_chain().await.unwrap();
     let stray_to = address!("0x4444444444444444444444444444444444444444");
-    let on = pending_nonce(&w.l2_rpc(), CC_OUTBOUND_USER).await.unwrap();
+    let on = pending_nonce(&w.l2_rpc(), OUTBOUND_USER).await.unwrap();
     let stray = sign_and_send(
         &w.l2_xchain(),
-        CC_OUTBOUND_USER,
+        OUTBOUND_USER,
         w.l2_chain_id,
         on,
         Some(stray_to),
@@ -942,10 +942,10 @@ async fn misdirected_pure_tx_is_evicted_not_stalled() {
     )
     .await
     .unwrap();
-    let in_nonce = pending_nonce(&w.l1_rpc(), CC_INBOUND_USER).await.unwrap();
+    let in_nonce = pending_nonce(&w.l1_rpc(), INBOUND_USER).await.unwrap();
     let legit = sign_and_send(
         &w.l1_xchain(),
-        CC_INBOUND_USER,
+        INBOUND_USER,
         DEV_CHAIN_ID,
         in_nonce,
         Some(w.setter_proxy),
@@ -958,19 +958,19 @@ async fn misdirected_pure_tx_is_evicted_not_stalled() {
     )
     .await
     .unwrap();
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let l1 = w.l1_rpc();
         async move { Ok(receipt_ok(&l1, legit).await?.filter(|ok| *ok)) }
     })
     .await
     .expect("legit cross-chain tx never settled after a misdirected pure tx");
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let (l2, target) = (w.l2_rpc(), w.value_l2);
         async move { Ok((l2_value(&l2, target).await? == U256::from(66u64)).then_some(())) }
     })
     .await
     .expect("legit cross-chain effect did not land after a misdirected pure tx");
-    wait_for(CC_SETTLE_TIMEOUT, || async {
+    wait_for(SETTLE_TIMEOUT, || async {
         Ok((w.node.log_count_matching(&[
             "outbound tx produced no L1 settlement entry; evicting",
             "outbound tx fails simulation deterministically; evicting",
@@ -999,7 +999,7 @@ async fn same_nonce_latest_transaction_replaces_held_transaction() {
     let batches_before = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
         .await
         .unwrap();
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let l1_rpc = l1_rpc.clone();
         async move {
             let batches = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block).await?;
@@ -1009,10 +1009,10 @@ async fn same_nonce_latest_transaction_replaces_held_transaction() {
     .await
     .expect("no completed bundle observed before replacement test");
 
-    let nonce = pending_nonce(&l1_rpc, CC_INBOUND_USER).await.unwrap();
+    let nonce = pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
     let first = sign_and_send(
         &w.l1_xchain(),
-        CC_INBOUND_USER,
+        INBOUND_USER,
         DEV_CHAIN_ID,
         nonce,
         Some(w.setter_proxy),
@@ -1027,7 +1027,7 @@ async fn same_nonce_latest_transaction_replaces_held_transaction() {
     .expect("initial nonce-N transaction must be admitted");
     let replacement = sign_and_send(
         &w.l1_xchain(),
-        CC_INBOUND_USER,
+        INBOUND_USER,
         DEV_CHAIN_ID,
         nonce,
         Some(w.setter_proxy),
@@ -1043,7 +1043,7 @@ async fn same_nonce_latest_transaction_replaces_held_transaction() {
     assert_ne!(first, replacement, "replacement must have a distinct hash");
 
     assert_all_transactions_succeeded(&l1_rpc, &[replacement], "replacement").await;
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let l2_rpc = w.l2_rpc();
         async move {
             Ok((l2_value(&l2_rpc, w.value_l2).await? == U256::from(222u64)).then_some(()))
@@ -1065,11 +1065,11 @@ async fn ingress_front_admission_guards() {
     let w = setup_cross_chain().await.unwrap();
 
     // Already-consumed nonce.
-    let n = pending_nonce(&w.l1_rpc(), CC_INBOUND_USER).await.unwrap();
-    let self_addr = common::signer_address(CC_INBOUND_USER).unwrap();
+    let n = pending_nonce(&w.l1_rpc(), INBOUND_USER).await.unwrap();
+    let self_addr = common::signer_address(INBOUND_USER).unwrap();
     let plain = sign_and_send(
         &w.l1_rpc(),
-        CC_INBOUND_USER,
+        INBOUND_USER,
         DEV_CHAIN_ID,
         n,
         Some(self_addr),
@@ -1079,7 +1079,7 @@ async fn ingress_front_admission_guards() {
     )
     .await
     .unwrap();
-    wait_for(CC_SETTLE_TIMEOUT, || {
+    wait_for(SETTLE_TIMEOUT, || {
         let l1 = w.l1_rpc();
         async move { Ok(receipt_ok(&l1, plain).await?.filter(|ok| *ok)) }
     })
@@ -1087,7 +1087,7 @@ async fn ingress_front_admission_guards() {
     .expect("plain L1 tx did not confirm");
     let consumed = sign_and_send(
         &w.l1_xchain(),
-        CC_INBOUND_USER,
+        INBOUND_USER,
         DEV_CHAIN_ID,
         n,
         Some(w.setter_proxy),
@@ -1105,10 +1105,10 @@ async fn ingress_front_admission_guards() {
     );
 
     // Gapped nonce.
-    let cur = pending_nonce(&w.l1_rpc(), CC_INBOUND_USER).await.unwrap();
+    let cur = pending_nonce(&w.l1_rpc(), INBOUND_USER).await.unwrap();
     let gapped = sign_and_send(
         &w.l1_xchain(),
-        CC_INBOUND_USER,
+        INBOUND_USER,
         DEV_CHAIN_ID,
         cur + 2,
         Some(w.setter_proxy),

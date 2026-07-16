@@ -11,7 +11,6 @@ L2_P2P_PORT = 30640
 L1_XCHAIN_PORT = 18999
 L2_XCHAIN_PORT = 18998
 BUILDER_FLASHBOTS_RPC_PORT = 8645
-MEV_RELAY_API_PORT = 9062
 
 # L2 genesis state root for genesis.json. Recompute if genesis alloc changes.
 L2_GENESIS_STATE_ROOT = "0xd381d828f650845aa890778c74ad2de245f5b3f2a24763f243e19a6bafb4fec5"
@@ -52,10 +51,6 @@ def run(plan, args):
                  "set eez.builder_rpc_url explicitly")
         builder_rpc = "http://{}:{}".format(builder_el.dns_name, BUILDER_FLASHBOTS_RPC_PORT)
 
-    relay_rpc = eez.get("relay_url", "")
-    if relay_rpc == "":
-        relay_rpc = "http://mev-relay-api:{}".format(MEV_RELAY_API_PORT)
-
     chain_id = str(eth_args.get("network_params", {}).get("network_id", "7331"))
 
     # Pair A engine API JWT.
@@ -95,14 +90,12 @@ def run(plan, args):
         "EEZ_L1_RPC_URL": "http://127.0.0.1:{}".format(EMBEDDED_L1_RPC_PORT),
         "EEZ_L1_TARGET_RPC_URL": l1_el.rpc_http_url,
         "EEZ_L1_BUILDER_RPC_URL": builder_rpc,
-        "EEZ_L1_RELAY_RPC_URL": relay_rpc,
         "EEZ_L1_TRUSTED_PEERS": l1_el.enode,
         "EEZ_L1_BLOCK_TIME_MS": str(eez.get("l1_block_time_ms", 12000)),
         "EEZ_L2_BLOCK_TIME_MS": str(eez.get("l2_block_time_ms", 2000)),
         "EEZ_PROOF_TIME_MS": str(eez.get("proof_time_ms", 5000)),
         "EEZ_SUBMISSION_SLACK_MS": str(eez.get("submission_slack_ms", 2500)),
         "EEZ_MAX_SPECULATIVE_DEPTH": str(eez.get("max_speculative_depth", 0)),
-        "DEVNET_FEE_RECIPIENT": eez.get("fee_recipient", "0x0000000000000000000000000000000000000000"),
         "EEZ_L1_POSTER_KEY": poster_key,
         "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
         "EEZ_L2_DATADIR": "/data/l2",
@@ -115,7 +108,6 @@ def run(plan, args):
         "EEZ_L2_SYSTEM_KEY": eez.get("l2_system_key", "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"),
         "EEZ_L2_SYSTEM_ADDRESS": eez.get("l2_system_address", "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
         "EEZ_CCM_L2_ADDRESS": eez.get("ccm_l2_address", "0x4200000000000000000000000000000000000007"),
-        "EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS": eez.get("cross_chain_source_chain_ids", chain_id),
     }
 
     node_cmd = " ".join([
