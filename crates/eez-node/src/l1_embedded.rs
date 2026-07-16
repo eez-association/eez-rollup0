@@ -17,6 +17,7 @@ use std::{path::PathBuf, sync::Arc};
 use eyre::Result;
 use reth_chainspec::ChainSpec;
 use reth_gnosis::spec::{chains::CHIADO_GENESIS, gnosis_spec::GnosisChainSpec};
+use reth_network_peers::TrustedPeer;
 use reth_node_core::{
     args::{DatadirArgs, NetworkArgs, RpcServerArgs},
     node_config::NodeConfig,
@@ -59,9 +60,8 @@ impl L1ChainKind {
 /// `eez-node::main`; defaults match a no-config-needed dev workflow.
 #[derive(Debug, Clone)]
 pub struct EmbeddedL1Config {
-    /// L1 dev chain spec (genesis + hardforks). Used when
-    /// `kind == Dev`; ignored when `kind == Chiado` (chiado loads its
-    /// own GnosisChainSpec from the bundled preset).
+    /// L1 dev chain spec (genesis + hardforks). Used by Dev, Testing, and
+    /// Devnet; ignored by Chiado (which loads its own GnosisChainSpec).
     pub dev_chain_spec: Arc<ChainSpec>,
     /// Which L1 chain the embedded node serves.
     pub kind: L1ChainKind,
@@ -71,25 +71,25 @@ pub struct EmbeddedL1Config {
     pub datadir: PathBuf,
     /// HTTP RPC port (so smoke harnesses + `cast` can POST txs to L1).
     pub http_port: u16,
-    /// Auth RPC port (engine API). Chiado mode: external lighthouse
+    /// Auth RPC port (engine API). Chiado/Devnet mode: external lighthouse
     /// dials in here.
     pub auth_port: u16,
-    /// P2P + discv4 discovery port. Dev mode: disabled. Chiado mode:
-    /// needed for libp2p peering to chiado bootnodes.
+    /// P2P + discv4 discovery port. Dev mode: disabled. Chiado/Devnet mode:
+    /// needed for libp2p peering.
     pub p2p_port: u16,
     /// discv5 UDP port. Separate from `p2p_port` so the embedded L1's
     /// discv5 doesn't bind reth's default port and collide with another
     /// node on the host.
     pub discv5_port: u16,
-    /// Path to JWT secret file. Required in chiado mode (shared with
+    /// Path to JWT secret file. Required in chiado/devnet mode (shared with
     /// lighthouse via volume mount).
     pub jwtsecret: Option<PathBuf>,
     /// Static execution peers for private networks.
-    pub trusted_peers: Vec<String>,
+    pub trusted_peers: Vec<TrustedPeer>,
 }
 
 /// Build a reth `NodeConfig<ChainSpec>` for the embedded L1 dev node
-/// (vanilla EthereumNode). Used only when `kind == Dev`.
+/// (vanilla EthereumNode). Used when `kind == Dev` or `Testing`.
 pub fn build_dev_node_config(cfg: &EmbeddedL1Config) -> Result<NodeConfig<ChainSpec>> {
     let (network_args, rpc_args) = build_network_rpc_args(cfg)?;
     let mut node_cfg = NodeConfig::new(cfg.dev_chain_spec.clone())
@@ -166,17 +166,7 @@ fn build_network_rpc_args(cfg: &EmbeddedL1Config) -> Result<(NetworkArgs, RpcSer
     };
     network_args.discovery.port = cfg.p2p_port;
     network_args.discovery.discv5_port = Some(cfg.discv5_port);
-    if !cfg.trusted_peers.is_empty() {
-        network_args.trusted_peers = cfg
-            .trusted_peers
-            .iter()
-            .map(|peer| {
-                peer.parse().map_err(|err| {
-                    eyre::eyre!("EEZ_L1_TRUSTED_PEERS entry '{peer}' is not a valid enode: {err}")
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-    }
+    network_args.trusted_peers = cfg.trusted_peers.clone();
     let rpc_args = RpcServerArgs {
         http: true,
         ws: true,

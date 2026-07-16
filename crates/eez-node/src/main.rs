@@ -422,21 +422,8 @@ fn main() -> eyre::Result<()> {
         let rollup_config = RollupConfig::from_env()?;
         let l1_watcher_config = L1WatcherConfig::from_env()?;
 
-        // Target bundles from the builder's canonical L1 view.
-        let scheduler_l1_rpc_url = submitter_config
-            .target_rpc_url
-            .clone()
-            .unwrap_or_else(|| submitter_config.rpc_url.clone());
         let submitter = Submitter::new(submitter_config);
-        let l1_watcher = L1Watcher::spawn(l1_watcher_config.clone());
-        let scheduler_l1_watcher = if scheduler_l1_rpc_url == l1_watcher_config.rpc_url {
-            l1_watcher.clone()
-        } else {
-            L1Watcher::spawn(L1WatcherConfig {
-                rpc_url: scheduler_l1_rpc_url,
-                ..l1_watcher_config
-            })
-        };
+        let l1_watcher = L1Watcher::spawn(l1_watcher_config);
 
         // Composer-only: build the umbrella, then attach it to the
         // Sequencer built above (swapping in the L1-anchored schedule via
@@ -688,15 +675,15 @@ fn main() -> eyre::Result<()> {
                         eyre::eyre!("EEZ_CCM_L2_ADDRESS required (set by deploy.sh)")
                     })?,
                 )?;
-                // Match signing and escrow reads to the builder's L1 view.
-                let l1_rpc_url: reqwest::Url = env::var("EEZ_L1_TARGET_RPC_URL")
-                    .ok()
-                    .filter(|url| !url.trim().is_empty())
-                    .or_else(|| env::var("EEZ_L1_RPC_URL").ok())
-                    .ok_or_else(|| eyre::eyre!("EEZ_L1_RPC_URL required for L1 reads"))?
+                // L1 RPC URL: the embedded L1's HTTP port (so the
+                // composer's L1-forwarding round-trips back into our
+                // own L1 reth). Same value as `EEZ_L1_RPC_URL` for
+                // embedded mode.
+                let l1_rpc_url: reqwest::Url = env::var("EEZ_L1_RPC_URL")
+                    .map_err(|_| eyre::eyre!("EEZ_L1_RPC_URL required for L1 forwarding"))?
                     .parse()
-                    .map_err(|e| eyre::eyre!("EEZ_L1_(TARGET_)RPC_URL malformed: {e}"))?;
-                let l1_provider = alloy_provider::RootProvider::new_http(l1_rpc_url.clone());
+                    .map_err(|e| eyre::eyre!("EEZ_L1_RPC_URL malformed: {e}"))?;
+                let l1_provider = alloy_provider::RootProvider::new_http(l1_rpc_url);
                 let l1_poster_key = env::var("EEZ_L1_POSTER_KEY").map_err(|_| {
                     eyre::eyre!("EEZ_L1_POSTER_KEY required for L1 postBatch signing")
                 })?;
@@ -787,7 +774,7 @@ fn main() -> eyre::Result<()> {
             // schedule + composer hooks. Speculative depth already
             // applied above.
             let schedule_rx = spawn_l1_anchored(
-                L1HeadStream::from_watcher(&scheduler_l1_watcher),
+                L1HeadStream::from_watcher(&l1_watcher),
                 timing,
                 l2_genesis_timestamp,
             );
@@ -1071,12 +1058,13 @@ fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
     let dev_chain_spec = EthereumChainSpecParser::parse(&chain_arg)
         .map_err(|e| eyre::eyre!("EEZ_L1_CHAIN_PATH={chain_arg}: {e}"))?;
 
-    // L1 chain selector: `dev` (vanilla EthereumNode, auto-mine 5s)
-    // vs `chiado` (reth_gnosis::GnosisNode, real chiado state). The
-    // `dev_chain_spec` is only consumed by the dev path.
+    // L1 chain selector: `dev` (vanilla EthereumNode, auto-mine 5s),
+    // `devnet` (EthereumNode + external CL), vs `chiado`
+    // (reth_gnosis::GnosisNode, real chiado state). The
+    // `dev_chain_spec` is consumed by dev/testing/devnet paths.
     let kind = l1_embedded::L1ChainKind::from_env();
 
-    // JWT secret path — required for chiado (lighthouse engine API
+    // JWT secret path — required for chiado/devnet (lighthouse engine API
     // auth); optional for dev mode (no external CL).
     let jwtsecret = env::var("EEZ_L1_JWT_SECRET")
         .ok()
@@ -1089,9 +1077,10 @@ fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
                 .split([',', ' '])
                 .map(str::trim)
                 .filter(|peer| !peer.is_empty())
-                .map(String::from)
-                .collect::<Vec<_>>()
+                .map(str::parse)
+                .collect::<Result<Vec<_>, _>>()
         })
+        .transpose()?
         .unwrap_or_default();
 
     Ok(l1_embedded::EmbeddedL1Config {
