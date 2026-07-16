@@ -292,9 +292,8 @@ async fn handle(
         }
     };
 
-    let json = match serde_json::from_slice::<Value>(&body_bytes) {
-        Ok(json) => json,
-        Err(_) => return Ok(rpc_error(Value::Null, -32700, "parse error")),
+    let Ok(json) = serde_json::from_slice::<Value>(&body_bytes) else {
+        return Ok(rpc_error(Value::Null, -32700, "parse error"));
     };
 
     // A JSON-RPC batch array would bypass the single-tx intercept and forward a
