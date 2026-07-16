@@ -980,7 +980,7 @@ where
                     }
                     !cascade
                 });
-                for t in pool.evict_nonce_chain_from(*sender, *direction, *nonce) {
+                for t in pool.drain_sender_above(*sender, *direction, *nonce) {
                     dropped += 1;
                     event!(
                         name: "eez.composer.recovery.nonce_chain_evicted",
@@ -1356,7 +1356,7 @@ where
         // a sender's nonce N is evicted, N+1.. can never land.
         if let Some(pool) = rollup.held_pool.as_ref() {
             for tx in &poison {
-                for t in pool.evict_nonce_chain_from(tx.sender, tx.direction, tx.nonce) {
+                for t in pool.drain_sender_above(tx.sender, tx.direction, tx.nonce) {
                     event!(
                         name: "eez.composer.cc_compose.poison_chain_evicted",
                         Level::WARN,

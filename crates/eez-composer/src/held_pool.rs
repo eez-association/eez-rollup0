@@ -251,7 +251,7 @@ impl HeldPool {
     /// `nonce` in one sender/direction chain. Returns queued transactions that
     /// were removed; callers already own any matching in-flight transactions.
     #[must_use]
-    pub fn evict_nonce_chain_from(
+    pub fn drain_sender_above(
         &self,
         sender: Address,
         direction: Direction,
@@ -279,45 +279,18 @@ impl HeldPool {
     /// Drain every queued transaction and reserve its nonce as in-flight.
     /// Recovery paths can return the batch with [`Self::push_front_batch`].
     pub fn pop_all(&self) -> Vec<HeldTx> {
-        let mut state = self.state.lock().expect("held_pool mutex poisoned");
-        let drained: Vec<HeldTx> = state.txs.drain(..).collect();
-        state.by_hash.clear();
-        for tx in &drained {
-            state.mark_in_flight(tx);
-        }
-        drained
+        self.pop_n(usize::MAX)
     }
 
-    /// Drain up to `max` held txs with per-sender fairness. Empirical fact about the
-    /// rbuilder-chiado relay: bundles containing more than ~3 user_txs
-    /// often have a subset silently dropped at inclusion time even
-    /// when the bundle itself lands. Capping bundle size keeps the
-    /// per-bundle inclusion atomic at the cost of more Sync slots to
-    /// drain a large pool.
+    /// Drain up to `max` held txs in FIFO order and reserve their nonces as
+    /// in-flight.
     pub fn pop_n(&self, max: usize) -> Vec<HeldTx> {
         let mut state = self.state.lock().expect("held_pool mutex poisoned");
-        let mut drained = Vec::new();
-        while drained.len() < max && !state.txs.is_empty() {
-            let mut seen = HashSet::new();
-            let mut kept = VecDeque::with_capacity(state.txs.len());
-            let start_len = state.txs.len();
-            let mut made_progress = false;
-            for _ in 0..start_len {
-                let tx = state.txs.pop_front().expect("bounded by start_len");
-                let key = (tx.sender, tx.direction);
-                if drained.len() < max && seen.insert(key) {
-                    state.by_hash.remove(&tx.hash);
-                    state.mark_in_flight(&tx);
-                    drained.push(tx);
-                    made_progress = true;
-                } else {
-                    kept.push_back(tx);
-                }
-            }
-            state.txs = kept;
-            if !made_progress {
-                break;
-            }
+        let count = max.min(state.txs.len());
+        let drained: Vec<_> = state.txs.drain(..count).collect();
+        for tx in &drained {
+            state.by_hash.remove(&tx.hash);
+            state.mark_in_flight(tx);
         }
         drained
     }
@@ -424,7 +397,7 @@ mod tests {
         insert(&pool, mk(0, Direction::Outbound, 3), 0);
         insert(&pool, mk(1, Direction::Outbound, 4), 0);
 
-        let evicted = pool.evict_nonce_chain_from(sender, Direction::Outbound, 1);
+        let evicted = pool.drain_sender_above(sender, Direction::Outbound, 1);
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].nonce, 1);
         assert_eq!(evicted[0].direction, Direction::Outbound);
@@ -632,7 +605,7 @@ mod tests {
             vec![0, 1, 2]
         );
 
-        let queued = pool.evict_nonce_chain_from(sender, Direction::Inbound, 1);
+        let queued = pool.drain_sender_above(sender, Direction::Inbound, 1);
 
         assert_eq!(
             queued.iter().map(|tx| tx.nonce).collect::<Vec<_>>(),
@@ -645,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn pop_n_is_fair_across_sender_direction_chains() {
+    fn pop_n_drains_fifo_prefix() {
         let pool = HeldPool::new();
         let sender_a = Address::repeat_byte(0xa);
         let sender_b = Address::repeat_byte(0xb);
@@ -669,9 +642,10 @@ mod tests {
             hashes,
             vec![
                 TxHash::from(B256::repeat_byte(1)),
-                TxHash::from(B256::repeat_byte(4)),
                 TxHash::from(B256::repeat_byte(2)),
+                TxHash::from(B256::repeat_byte(3)),
             ]
         );
+        assert_eq!(pool.pop_all()[0].hash, TxHash::from(B256::repeat_byte(4)));
     }
 }
