@@ -390,7 +390,7 @@ run_waves() {
         if (( do_out )); then
             mk_and_send out set   $((400 + w))
             mk_and_send out noret $((500 + w))
-            mk_and_send out wd    $((w * 20000000000000))         # w * 2e13 wei
+            mk_and_send out wd    $((w * 5000000000000))          # w * 5e12 wei
             mk_and_send out wrap  $((600 + w))
             OUT_WAVE_TARGET="$OUT_NONCE"
             echo "    outbound: 4 ops via L2 front (set/noret/wd/wrap)"
@@ -408,8 +408,7 @@ run_waves() {
     done
 
     # ── Wait for inclusion ─────────────────────────────────────────────
-    # inbound → L1 receipts, outbound → L2 receipts; evictions count as
-    # resolved (the harness then judges convergence on the CONFIRMED view).
+    # inbound → L1 receipts, outbound → L2 receipts.
     local total=$(( ${#IN_HASHES[@]} + ${#OUT_HASHES[@]} ))
     echo
     echo "==> waiting up to ${RECEIPT_WAIT_SECS}s for $total cross-chain inclusions"
@@ -425,6 +424,10 @@ run_waves() {
         (( confirmed >= total )) && { echo "    all confirmed"; break; }
         sleep 5
     done
+    if (( confirmed != total )); then
+        echo "    ✗ only $confirmed/$total cross-chain transactions succeeded" >&2
+        exit 1
+    fi
     echo "    settling 15s..."; sleep 15
     refresh_node_log
 
