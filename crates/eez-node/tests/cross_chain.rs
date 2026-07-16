@@ -1,6 +1,6 @@
 //! Cross-chain integration and nonce-gap regression tests.
 
-use alloy_primitives::{U256, address};
+use alloy_primitives::{TxHash, U256, address};
 use alloy_sol_types::SolCall;
 
 mod common;
@@ -17,6 +17,22 @@ const WAVE_DEPOSITS: &[u128] = &[
     2_000_000_000_000_000,
     3_000_000_000_000_000,
 ];
+
+/// The embedded bundle path preserves order but is not atomic like rbuilder,
+/// so every submitted valid transaction must be verified independently.
+async fn assert_all_transactions_succeeded(rpc_url: &str, hashes: &[TxHash], label: &str) {
+    assert!(!hashes.is_empty(), "no {label} transactions were submitted");
+    for &hash in hashes {
+        let rpc_url = rpc_url.to_owned();
+        let status = wait_for(CC_SETTLE_TIMEOUT, move || {
+            let rpc_url = rpc_url.clone();
+            async move { receipt_ok(&rpc_url, hash).await }
+        })
+        .await
+        .unwrap_or_else(|err| panic!("{label} transaction {hash} did not land: {err:#}"));
+        assert!(status, "{label} transaction {hash} reverted");
+    }
+}
 
 /// Runs one transaction in each direction through the full node pipeline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -56,18 +72,8 @@ async fn minimal_bidirectional_cross_chain_smoke() {
     .await
     .expect("outbound smoke transaction must be admitted");
 
-    wait_for(CC_SETTLE_TIMEOUT, || {
-        let l1_rpc = l1_rpc.clone();
-        async move { Ok(receipt_ok(&l1_rpc, inbound).await?.filter(|ok| *ok)) }
-    })
-    .await
-    .expect("inbound smoke transaction did not settle on L1");
-    wait_for(CC_SETTLE_TIMEOUT, || {
-        let l2_rpc = l2_rpc.clone();
-        async move { Ok(receipt_ok(&l2_rpc, outbound).await?.filter(|ok| *ok)) }
-    })
-    .await
-    .expect("outbound smoke transaction did not settle on L2");
+    assert_all_transactions_succeeded(&l1_rpc, &[inbound], "inbound smoke").await;
+    assert_all_transactions_succeeded(&l2_rpc, &[outbound], "outbound smoke").await;
 
     wait_for(CC_SETTLE_TIMEOUT, || {
         let l2_rpc = l2_rpc.clone();
@@ -222,32 +228,20 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
         }
     }
 
-    for h in &inbound_hashes {
-        let h = *h;
-        let l1 = l1_rpc.clone();
-        let outcome = wait_for(CC_SETTLE_TIMEOUT, move || {
-            let l1 = l1.clone();
-            async move {
-                match receipt_ok(&l1, h).await? {
-                    Some(true) => Ok(Some(true)),
-                    Some(false) => Ok(Some(false)),
-                    None => Ok(None),
-                }
-            }
-        })
-        .await
-        .expect("cross-chain user tx did not land on L1");
-        assert!(outcome, "inbound source tx {h} reverted on L1");
-    }
-    for h in &outbound_hashes {
-        let h = *h;
-        wait_for(CC_SETTLE_TIMEOUT, || {
-            let l2_rpc = l2_rpc.clone();
-            async move { Ok(receipt_ok(&l2_rpc, h).await?.filter(|ok| *ok)) }
-        })
-        .await
-        .expect("outbound source tx did not settle successfully on L2");
-    }
+    let expected_per_direction = WAVE_SETTERS.len() * 4;
+    assert_eq!(
+        inbound_hashes.len(),
+        expected_per_direction,
+        "every inbound wave operation must be submitted",
+    );
+    assert_eq!(
+        outbound_hashes.len(),
+        expected_per_direction,
+        "every outbound wave operation must be submitted",
+    );
+
+    assert_all_transactions_succeeded(&l1_rpc, &inbound_hashes, "inbound wave").await;
+    assert_all_transactions_succeeded(&l2_rpc, &outbound_hashes, "outbound wave").await;
 
     let final_value = l2_value(&l2_rpc, w.value_l2).await.unwrap();
     assert_eq!(
