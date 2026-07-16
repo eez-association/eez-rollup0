@@ -986,6 +986,78 @@ async fn misdirected_pure_tx_is_evicted_not_stalled() {
     w.node.assert_no_process_death();
 }
 
+/// Replaces a held transaction when the same sender submits the same nonce
+/// again before the pool drains. The most recently admitted transaction wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "red until same-nonce held transaction replacement is supported"]
+async fn same_nonce_latest_transaction_replaces_held_transaction() {
+    let w = setup_cross_chain().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+
+    // Start immediately after a completed drain to leave a full Sync interval
+    // for both same-nonce submissions to reach the held pool.
+    let batches_before = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
+        .await
+        .unwrap();
+    wait_for(CC_SETTLE_TIMEOUT, || {
+        let l1_rpc = l1_rpc.clone();
+        async move {
+            let batches = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block).await?;
+            Ok((batches > batches_before).then_some(()))
+        }
+    })
+    .await
+    .expect("no completed bundle observed before replacement test");
+
+    let nonce = pending_nonce(&l1_rpc, CC_INBOUND_USER).await.unwrap();
+    let first = sign_and_send(
+        &w.l1_xchain(),
+        CC_INBOUND_USER,
+        DEV_CHAIN_ID,
+        nonce,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(111u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await
+    .expect("initial nonce-N transaction must be admitted");
+    let replacement = sign_and_send(
+        &w.l1_xchain(),
+        CC_INBOUND_USER,
+        DEV_CHAIN_ID,
+        nonce,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(222u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await
+    .expect("latest nonce-N transaction must replace the held transaction");
+    assert_ne!(first, replacement, "replacement must have a distinct hash");
+
+    assert_all_transactions_succeeded(&l1_rpc, &[replacement], "replacement").await;
+    wait_for(CC_SETTLE_TIMEOUT, || {
+        let l2_rpc = w.l2_rpc();
+        async move {
+            Ok((l2_value(&l2_rpc, w.value_l2).await? == U256::from(222u64)).then_some(()))
+        }
+    })
+    .await
+    .expect("replacement effect did not reach L2");
+    assert!(
+        receipt_ok(&l1_rpc, first).await.unwrap().is_none(),
+        "superseded nonce-N transaction must not land",
+    );
+    w.node.assert_no_process_death();
+}
+
 /// Rejects consumed, gapped, and underfunded transactions at ingress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full-process edge test; enable in the dedicated cross-chain lane after the fixture is slimmed"]
