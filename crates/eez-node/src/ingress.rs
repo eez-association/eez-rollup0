@@ -288,7 +288,10 @@ async fn handle(
         Ok(Err(())) => return Ok(body_too_large()),
         Err(e) => {
             event!(name: "eez.xchain_front.body_read_failed", Level::DEBUG, error = %e, "read body failed");
-            return Ok(forward(&ctx, Vec::new()).await);
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(HyperBytes::from("read body failed")))
+                .expect("valid response"));
         }
     };
 
