@@ -1839,7 +1839,6 @@ pub async fn create_cross_chain_proxy(
         2_000_000,
     )
     .await?;
-    let provider = ProviderBuilder::new().connect_http(l1_rpc.parse()?);
     let receipt = wait_for_successful_receipt(l1_rpc, hash, "createCrossChainProxy").await?;
     receipt
         .inner
