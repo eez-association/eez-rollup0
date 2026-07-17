@@ -401,8 +401,7 @@ fn main() -> eyre::Result<()> {
         // BlockCommitter actor is the one the Deriver shares; rebuilding
         // would spawn a second actor with its own reconcile lock + head
         // mirror, splitting the serialization domain.
-        let (sequencer, umbrella, system_tx_cfg, cross_chain_composer_wired) =
-            if mode == Mode::Composer {
+        let composer_setup = if mode == Mode::Composer {
             let proof_signer_key = env::var("EEZ_PROOF_SIGNER_KEY")
                 .map_err(|_| eyre::eyre!("EEZ_PROOF_SIGNER_KEY required in composer mode"))?;
             let proof_signer = PrivateKeySigner::from_bytes(&B256::from_str(
@@ -410,6 +409,13 @@ fn main() -> eyre::Result<()> {
             )?)?;
             let prover = Arc::new(MockEcdsaProver::new(proof_signer));
             let rollup_id = rollup_config.rollup_id;
+            let l1_source_chain_id = match embedded_l1.as_ref() {
+                Some(EmbeddedL1::Dev(l1_handle)) => l1_handle.node.chain_spec().chain().id(),
+                Some(EmbeddedL1::Chiado(chiado_handle)) => {
+                    chiado_handle.node.chain_spec().inner.chain().id()
+                }
+                None => read_l1_chain_id()?,
+            };
             // Share the SAME HeldPool the ingress middleware pushes into
             // (the `Option<Arc<HeldPool>>` leaves room for per-rollup
             // pools under one ingress layer later).
@@ -676,14 +682,6 @@ fn main() -> eyre::Result<()> {
                     .ok_or_else(|| {
                         eyre::eyre!("EEZ_ROLLUP_ID required for L1 postBatch rollupIdsWithProofSystems[]")
                     })?;
-                // L1 chainId queried from the provider would be more
-                // robust, but pulling it out of env keeps the ctx
-                // construction sync. Embedded reth `--chain dev` is
-                // chainId=1337; smoke harness sets this explicitly.
-                let l1_chain_id: u64 = env::var("EEZ_L1_CHAIN_ID")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1337);
                 // 10 gwei comfortably exceeds the smoke user_tx's
                 // 2-gwei priority fee, so dev-reth's payload builder
                 // orders postBatch ahead of the user_tx within the
@@ -707,7 +705,7 @@ fn main() -> eyre::Result<()> {
                     l1_provider,
                     submitter: submitter.clone(),
                     l1_poster_signer,
-                    l1_chain_id,
+                    l1_chain_id: l1_source_chain_id,
                     l1_post_batch_priority_fee,
                     mock_proof_system_address,
                     l2_rollup_id: l2_rollup_id_for_ctx,
@@ -764,6 +762,7 @@ fn main() -> eyre::Result<()> {
                 Some(composer),
                 deriver_system_tx_cfg,
                 cross_chain_composer_wired,
+                Some(l1_source_chain_id),
             )
         } else {
             // Follower: drop the placeholder Sequencer (BlockCommitter
@@ -778,8 +777,10 @@ fn main() -> eyre::Result<()> {
                 enabled = follower_system_tx_cfg.is_some(),
                 "cross-chain system tx reconstruction config loaded",
             );
-            (None, None, follower_system_tx_cfg, false)
+            (None, None, follower_system_tx_cfg, false, None)
         };
+        let (sequencer, umbrella, system_tx_cfg, cross_chain_composer_wired, l1_source_chain_id) =
+            composer_setup;
 
         if mode == Mode::Composer {
             for port_env in ["EEZ_L1_XCHAIN_PORT", "EEZ_L2_XCHAIN_PORT"] {
@@ -795,6 +796,7 @@ fn main() -> eyre::Result<()> {
         // composer). A wired `SystemTxContext` makes it reconstruct the
         // same L2 system txs the composer produced (single-source STF).
         let l2_block_time_secs = timing.l2_block_time().as_secs();
+        let l2_source_chain_id = chain_spec.chain().id();
         let deriver = Deriver::new(
             l1_watcher.clone(),
             block_committer.clone(),
@@ -901,28 +903,26 @@ fn main() -> eyre::Result<()> {
             // no front for that chain):
             //   L1 front (EEZ_L1_XCHAIN_PORT → EEZ_L1_RPC_URL): L1→L2 Inbound.
             //   L2 front (EEZ_L2_XCHAIN_PORT → EEZ_L2_RPC_URL): L2→L1 Outbound.
-            for (port_env, url_env, direction, task) in [
-                (
-                    "EEZ_L1_XCHAIN_PORT",
-                    "EEZ_L1_RPC_URL",
-                    eez_composer::Direction::Inbound,
-                    "eez-l1-xchain-front",
-                ),
-                (
-                    "EEZ_L2_XCHAIN_PORT",
-                    "EEZ_L2_RPC_URL",
-                    eez_composer::Direction::Outbound,
-                    "eez-l2-xchain-front",
-                ),
-            ] {
-                let Some((port, url, parsed)) = read_xchain_front_config(port_env, url_env)? else {
+            let l1_source_chain_id =
+                l1_source_chain_id.expect("composer mode sets L1 source chain id");
+            for spec in xchain_front_specs(l1_source_chain_id, l2_source_chain_id) {
+                let Some((port, url, parsed)) =
+                    read_xchain_front_config(spec.port_env, spec.url_env)?
+                else {
                     continue;
                 };
                 let pool = Arc::clone(&held_pool);
                 let provider = alloy_provider::RootProvider::new_http(parsed);
-                task_executor.spawn_critical_task(task, async move {
-                    if let Err(e) =
-                        ingress::run_cross_chain_front(port, url, direction, pool, provider).await
+                task_executor.spawn_critical_task(spec.task, async move {
+                    if let Err(e) = ingress::run_cross_chain_front(
+                        port,
+                        url,
+                        spec.direction,
+                        pool,
+                        provider,
+                        spec.expected_source_chain_id,
+                    )
+                    .await
                     {
                         event!(name: "eez.xchain_front.exited", Level::ERROR, error = %e, "cross-chain front exited");
                     }
@@ -988,6 +988,44 @@ fn read_l1_rollup_id() -> u64 {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0)
+}
+
+fn read_l1_chain_id() -> eyre::Result<u64> {
+    match env::var("EEZ_L1_CHAIN_ID") {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|err| eyre::eyre!("EEZ_L1_CHAIN_ID={value:?} malformed: {err}")),
+        Err(env::VarError::NotPresent) => Ok(1337),
+        Err(err) => Err(eyre::eyre!("EEZ_L1_CHAIN_ID is not valid unicode: {err}")),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct XchainFrontSpec {
+    port_env: &'static str,
+    url_env: &'static str,
+    direction: eez_composer::Direction,
+    task: &'static str,
+    expected_source_chain_id: u64,
+}
+
+fn xchain_front_specs(l1_chain_id: u64, l2_chain_id: u64) -> [XchainFrontSpec; 2] {
+    [
+        XchainFrontSpec {
+            port_env: "EEZ_L1_XCHAIN_PORT",
+            url_env: "EEZ_L1_RPC_URL",
+            direction: eez_composer::Direction::Inbound,
+            task: "eez-l1-xchain-front",
+            expected_source_chain_id: l1_chain_id,
+        },
+        XchainFrontSpec {
+            port_env: "EEZ_L2_XCHAIN_PORT",
+            url_env: "EEZ_L2_RPC_URL",
+            direction: eez_composer::Direction::Outbound,
+            task: "eez-l2-xchain-front",
+            expected_source_chain_id: l2_chain_id,
+        },
+    ]
 }
 
 fn read_xchain_front_config(
@@ -1187,5 +1225,18 @@ mod tests {
 
         require_xchain_composer_wiring("PORT", true, true).unwrap();
         require_xchain_composer_wiring("PORT", false, false).unwrap();
+    }
+
+    #[test]
+    fn xchain_front_specs_assign_source_chain_ids() {
+        let specs = xchain_front_specs(31_337, 90_210);
+
+        assert_eq!(specs[0].port_env, "EEZ_L1_XCHAIN_PORT");
+        assert_eq!(specs[0].direction, eez_composer::Direction::Inbound);
+        assert_eq!(specs[0].expected_source_chain_id, 31_337);
+
+        assert_eq!(specs[1].port_env, "EEZ_L2_XCHAIN_PORT");
+        assert_eq!(specs[1].direction, eez_composer::Direction::Outbound);
+        assert_eq!(specs[1].expected_source_chain_id, 90_210);
     }
 }

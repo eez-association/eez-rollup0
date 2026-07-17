@@ -59,8 +59,13 @@ pub async fn gate_and_hold(
     raw_tx: &Bytes,
     direction: Direction,
     held_pool: &HeldPool,
+    expected_source_chain_id: u64,
     validation_provider: Option<&RootProvider>,
 ) -> Admission {
+    let cost = match validate_front_envelope(envelope, direction, expected_source_chain_id) {
+        Ok(cost) => cost,
+        Err(msg) => return Admission::Rejected(msg),
+    };
     let Ok(sender) = envelope.recover_signer() else {
         return Admission::Rejected("signature recovery failed".into());
     };
@@ -85,8 +90,6 @@ pub async fn gate_and_hold(
                 return Admission::Rejected(format!("source-chain balance lookup failed: {e}"));
             }
         };
-        let cost = U256::from(envelope.value())
-            + U256::from(envelope.gas_limit()) * U256::from(envelope.max_fee_per_gas());
         if balance < cost {
             return Admission::Rejected(format!(
                 "insufficient balance for {sender}: have {balance}, need {cost} (value + gas_limit * max_fee)"
@@ -115,6 +118,36 @@ pub async fn gate_and_hold(
     Admission::Held(hash)
 }
 
+fn validate_front_envelope(
+    envelope: &TxEnvelope,
+    direction: Direction,
+    expected_source_chain_id: u64,
+) -> Result<U256, String> {
+    if matches!(envelope, TxEnvelope::Eip4844(_)) {
+        return Err(
+            "EIP-4844 blob transactions are unsupported by the cross-chain front pipeline".into(),
+        );
+    }
+    let Some(chain_id) = envelope.chain_id() else {
+        return Err(
+            "missing source-chain id; replay-unprotected legacy transactions are not accepted by cross-chain fronts"
+                .into(),
+        );
+    };
+    if chain_id != expected_source_chain_id {
+        return Err(format!(
+            "wrong source-chain id {chain_id} for {direction:?} front: expected {expected_source_chain_id}"
+        ));
+    }
+    let gas_cost = U256::from(envelope.gas_limit())
+        .checked_mul(U256::from(envelope.max_fee_per_gas()))
+        .ok_or_else(|| "upfront cost overflow: gas_limit * max_fee_per_gas".to_string())?;
+    envelope
+        .value()
+        .checked_add(gas_cost)
+        .ok_or_else(|| "upfront cost overflow: value + gas_limit * max_fee_per_gas".to_string())
+}
+
 /// Shared, cheaply-clonable per-connection context.
 #[derive(Clone)]
 struct Ctx {
@@ -123,6 +156,7 @@ struct Ctx {
     direction: Direction,
     held_pool: Arc<HeldPool>,
     validation_provider: RootProvider,
+    expected_source_chain_id: u64,
 }
 
 /// Run a transparent cross-chain front on `port`, forwarding every `eth_*` to
@@ -137,6 +171,7 @@ pub async fn run_cross_chain_front(
     direction: Direction,
     held_pool: Arc<HeldPool>,
     validation_provider: RootProvider,
+    expected_source_chain_id: u64,
 ) -> eyre::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
@@ -149,6 +184,7 @@ pub async fn run_cross_chain_front(
         %port,
         %upstream_rpc_url,
         direction = ?direction,
+        expected_source_chain_id,
         "cross-chain front listening (forward eth_* to source chain; intercept sendRawTransaction)",
     );
     let ctx = Ctx {
@@ -157,6 +193,7 @@ pub async fn run_cross_chain_front(
         direction,
         held_pool,
         validation_provider,
+        expected_source_chain_id,
     };
     loop {
         let (stream, _peer) = match listener.accept().await {
@@ -348,6 +385,7 @@ async fn intercept_send_raw(
         &raw,
         ctx.direction,
         &ctx.held_pool,
+        ctx.expected_source_chain_id,
         Some(&ctx.validation_provider),
     )
     .await
@@ -399,9 +437,149 @@ async fn forward(ctx: &Ctx, body: Vec<u8>) -> Response<Full<HyperBytes>> {
 
 #[cfg(test)]
 mod tests {
+    use alloy_consensus::{SignableTransaction, TxEip1559, TxEip4844, TxLegacy};
+    use alloy_network::{TxSignerSync, eip2718::Encodable2718};
+    use alloy_primitives::{Address, TxKind};
+    use alloy_signer_local::PrivateKeySigner;
     use serde_json::json;
 
     use super::*;
+
+    fn test_signer() -> PrivateKeySigner {
+        PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).expect("valid signer")
+    }
+
+    fn signed_eip1559(
+        chain_id: u64,
+        value: U256,
+        gas_limit: u64,
+        max_fee_per_gas: u128,
+    ) -> (PrivateKeySigner, TxEnvelope, Bytes) {
+        let signer = test_signer();
+        let mut tx = TxEip1559 {
+            chain_id,
+            nonce: 0,
+            gas_limit,
+            max_fee_per_gas,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(Address::ZERO),
+            value,
+            access_list: alloy_eips::eip2930::AccessList::default(),
+            input: Bytes::default(),
+        };
+        let sig = signer.sign_transaction_sync(&mut tx).expect("tx signs");
+        let envelope = TxEnvelope::from(tx.into_signed(sig));
+        let raw = Bytes::from(envelope.encoded_2718());
+        (signer, envelope, raw)
+    }
+
+    fn signed_legacy(chain_id: Option<u64>) -> (PrivateKeySigner, TxEnvelope, Bytes) {
+        let signer = test_signer();
+        let mut tx = TxLegacy {
+            chain_id,
+            nonce: 0,
+            gas_price: 1,
+            gas_limit: 21_000,
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            input: Bytes::default(),
+        };
+        let sig = signer.sign_transaction_sync(&mut tx).expect("tx signs");
+        let envelope = TxEnvelope::from(tx.into_signed(sig));
+        let raw = Bytes::from(envelope.encoded_2718());
+        (signer, envelope, raw)
+    }
+
+    fn signed_blob(chain_id: u64) -> (PrivateKeySigner, TxEnvelope, Bytes) {
+        let signer = test_signer();
+        let mut tx = TxEip4844 {
+            chain_id,
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: Address::ZERO,
+            value: U256::ZERO,
+            access_list: alloy_eips::eip2930::AccessList::default(),
+            blob_versioned_hashes: vec![B256::with_last_byte(2)],
+            max_fee_per_blob_gas: 1,
+            input: Bytes::default(),
+        };
+        let sig = signer.sign_transaction_sync(&mut tx).expect("tx signs");
+        let envelope = TxEnvelope::from(tx.into_signed(sig));
+        let raw = Bytes::from(envelope.encoded_2718());
+        (signer, envelope, raw)
+    }
+
+    fn rejection(admission: Admission) -> String {
+        match admission {
+            Admission::Rejected(msg) => msg,
+            Admission::Held(hash) => panic!("expected rejection, got held tx {hash}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn matching_source_chain_id_is_accepted() {
+        let (signer, envelope, raw) = signed_eip1559(31337, U256::ZERO, 21_000, 1);
+        let pool = HeldPool::new();
+
+        let admission =
+            gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, None).await;
+
+        assert!(matches!(admission, Admission::Held(_)));
+        assert_eq!(pool.held_count_for(signer.address(), Direction::Inbound), 1);
+    }
+
+    #[tokio::test]
+    async fn wrong_source_chain_id_is_rejected_without_pool_mutation() {
+        let (signer, envelope, raw) = signed_eip1559(1, U256::ZERO, 21_000, 1);
+        let pool = HeldPool::new();
+
+        let msg =
+            rejection(gate_and_hold(&envelope, &raw, Direction::Outbound, &pool, 2, None).await);
+
+        assert!(msg.contains("wrong source-chain id 1"));
+        assert_eq!(
+            pool.held_count_for(signer.address(), Direction::Outbound),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_source_chain_id_is_rejected() {
+        let (signer, envelope, raw) = signed_legacy(None);
+        let pool = HeldPool::new();
+
+        let msg =
+            rejection(gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, None).await);
+
+        assert!(msg.contains("missing source-chain id"));
+        assert_eq!(pool.held_count_for(signer.address(), Direction::Inbound), 0);
+    }
+
+    #[tokio::test]
+    async fn blob_envelope_is_rejected() {
+        let (signer, envelope, raw) = signed_blob(31337);
+        let pool = HeldPool::new();
+
+        let msg =
+            rejection(gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, None).await);
+
+        assert!(msg.contains("EIP-4844 blob transactions are unsupported"));
+        assert_eq!(pool.held_count_for(signer.address(), Direction::Inbound), 0);
+    }
+
+    #[tokio::test]
+    async fn upfront_cost_overflow_is_rejected() {
+        let (signer, envelope, raw) = signed_eip1559(31337, U256::MAX, 1, 1);
+        let pool = HeldPool::new();
+
+        let msg =
+            rejection(gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, None).await);
+
+        assert!(msg.contains("upfront cost overflow"));
+        assert_eq!(pool.held_count_for(signer.address(), Direction::Inbound), 0);
+    }
 
     #[test]
     fn batch_send_raw_is_not_forwardable() {
