@@ -1,7 +1,5 @@
 //! Embedded L1 reth — config builder for the second `NodeBuilder` that
 //! composer mode launches alongside the L2 reth. Runtime modes:
-//!   - **Dev** (vanilla EthereumNode, 5s auto-mine) — local smokes;
-//!     fast, deterministic, no beacon dependency. `EEZ_L1_CHAIN=dev`.
 //!   - **Devnet** (vanilla EthereumNode, CL-driven) — private PoS L1.
 //!     `EEZ_L1_CHAIN=devnet`.
 //!   - **Chiado** (reth_gnosis::GnosisNode) — real chiado state from the
@@ -23,25 +21,22 @@ use reth_node_core::{
     node_config::NodeConfig,
 };
 
-/// Block time for the dev embedded L1. 5s gives the composer a wide
+/// Block time for the testing embedded L1. 5s gives the composer a wide
 /// window to land `postBatch + user_tx` in the same L1 block (invariant
 /// 4's atomicity requirement); a 1s window lets dev-reth's auto-mine
 /// split the two `send_raw_transaction` roundtrips across blocks.
-pub const DEV_L1_BLOCK_TIME: std::time::Duration = std::time::Duration::from_secs(5);
+pub const TESTING_L1_BLOCK_TIME: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Which L1 chain the embedded L1 NodeBuilder should serve. Selected
-/// by `EEZ_L1_CHAIN` env at startup; defaults to `Dev` for backwards-
-/// compatibility with existing smokes.
+/// by `EEZ_L1_CHAIN` env at startup; defaults to `Testing`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum L1ChainKind {
-    /// Vanilla `EthereumNode` in dev mode (5s auto-mine, --chain dev).
-    Dev,
     /// `reth_gnosis::GnosisNode` loading the chiado preset; no
     /// auto-mine — engine API driven by an external lighthouse CL.
     Chiado,
     /// Private PoS Ethereum node driven by an external consensus client.
     Devnet,
-    /// Same as `Dev`, plus the non-atomic mock bundle RPC. CI only.
+    /// Vanilla `EthereumNode` in dev mode (5s auto-mine, --chain dev) with the non-atomic mock bundle RPC.
     Testing,
 }
 
@@ -50,18 +45,17 @@ impl L1ChainKind {
         match std::env::var("EEZ_L1_CHAIN").as_deref() {
             Ok("chiado") => Self::Chiado,
             Ok("devnet") => Self::Devnet,
-            Ok("testing") => Self::Testing,
-            _ => Self::Dev,
+            _ => Self::Testing,
         }
     }
 }
 
 /// Config knobs for the embedded L1 launch. All read from env in
-/// `eez-node::main`; defaults match a no-config-needed dev workflow.
+/// `eez-node::main`; defaults match a no-config-needed testing workflow.
 #[derive(Debug, Clone)]
 pub struct EmbeddedL1Config {
-    /// L1 dev chain spec (genesis + hardforks). Used by Dev, Testing, and
-    /// Devnet; ignored by Chiado (which loads its own GnosisChainSpec).
+    /// L1 dev chain spec (genesis + hardforks). Used by Testing and Devnet;
+    /// ignored by Chiado (which loads its own GnosisChainSpec).
     pub dev_chain_spec: Arc<ChainSpec>,
     /// Which L1 chain the embedded node serves.
     pub kind: L1ChainKind,
@@ -74,7 +68,7 @@ pub struct EmbeddedL1Config {
     /// Auth RPC port (engine API). Chiado/Devnet mode: external lighthouse
     /// dials in here.
     pub auth_port: u16,
-    /// P2P + discv4 discovery port. Dev mode: disabled. Chiado/Devnet mode:
+    /// P2P + discv4 discovery port. Testing mode: disabled. Chiado/Devnet mode:
     /// needed for libp2p peering.
     pub p2p_port: u16,
     /// discv5 UDP port. Separate from `p2p_port` so the embedded L1's
@@ -88,9 +82,9 @@ pub struct EmbeddedL1Config {
     pub trusted_peers: Vec<TrustedPeer>,
 }
 
-/// Build a reth `NodeConfig<ChainSpec>` for the embedded L1 dev node
-/// (vanilla EthereumNode). Used when `kind == Dev` or `Testing`.
-pub fn build_dev_node_config(cfg: &EmbeddedL1Config) -> Result<NodeConfig<ChainSpec>> {
+/// Build a reth `NodeConfig<ChainSpec>` for the embedded L1 testing node
+/// (vanilla EthereumNode in dev mode).
+pub fn build_testing_node_config(cfg: &EmbeddedL1Config) -> Result<NodeConfig<ChainSpec>> {
     let (network_args, rpc_args) = build_network_rpc_args(cfg)?;
     let mut node_cfg = NodeConfig::new(cfg.dev_chain_spec.clone())
         .with_datadir_args(DatadirArgs {
@@ -100,7 +94,7 @@ pub fn build_dev_node_config(cfg: &EmbeddedL1Config) -> Result<NodeConfig<ChainS
         .with_network(network_args)
         .with_rpc(rpc_args)
         .dev();
-    node_cfg.dev.block_time = Some(DEV_L1_BLOCK_TIME);
+    node_cfg.dev.block_time = Some(TESTING_L1_BLOCK_TIME);
     // Synchronous state-root path for dev determinism.
     node_cfg.engine.legacy_state_root_task_enabled = true;
     Ok(node_cfg)
@@ -132,7 +126,7 @@ pub fn build_chiado_node_config(cfg: &EmbeddedL1Config) -> Result<NodeConfig<Gno
         .with_rpc(rpc_args);
     // Reth's async StateRootTask computes wrong roots for gnosis chains
     // in this reth pin (→ "incorrect state root" / SIGABRT on chiado
-    // newPayload); force the legacy synchronous path (as the Dev L1 does).
+    // newPayload); force the legacy synchronous path (as the Testing L1 does).
     node_cfg.engine.legacy_state_root_task_enabled = true;
     Ok(node_cfg)
 }
