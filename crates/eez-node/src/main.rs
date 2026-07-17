@@ -65,14 +65,14 @@ pub(crate) enum Mode {
 /// Embedded L1 reth handle — owned by `main` for the node lifetime so
 /// the L1 stays alive (drop tears it down). Generic over both variants'
 /// `NodeHandle` params because the AddOns type differs between
-/// EthereumNode (Dev) and GnosisNode (Chiado).
+/// EthereumNode (Devnet/Testing) and GnosisNode (Chiado).
 ///
 /// Downstream matches `.as_ref()` for the chain_spec / provider /
 /// evm_config to build the cross-chain composer; the Chiado provider
 /// goes through `eez_composer::GnosisL1Adapter` to translate
 /// `GnosisHeader → alloy_consensus::Header` on each read.
-enum EmbeddedL1<Dev, Chiado> {
-    Dev(Dev),
+enum EmbeddedL1<Ethereum, Chiado> {
+    Ethereum(Ethereum),
     Chiado(Chiado),
 }
 
@@ -180,42 +180,14 @@ fn main() -> eyre::Result<()> {
             .build()
             .map_err(|e| eyre::eyre!("L1 embedded RuntimeBuilder: {e}"))
         };
-        // Dev = vanilla EthereumNode (5s auto-mine); Chiado =
-        // reth_gnosis::GnosisNode + external CL, its provider wrapped by
-        // `GnosisL1Adapter` for the alloy-Header bound. Returns an
-        // `EmbeddedL1` owning the NodeHandle so the L1 outlives the node.
+        // Testing = vanilla EthereumNode (5s auto-mine); Devnet = vanilla
+        // EthereumNode + external CL; Chiado = reth_gnosis::GnosisNode +
+        // external CL, its provider wrapped by `GnosisL1Adapter` for the
+        // alloy-Header bound. Returns an `EmbeddedL1` owning the NodeHandle so
+        // the L1 outlives the node.
         let embedded_l1: Option<EmbeddedL1<_, _>> = if embed_l1 {
             let l1_cfg = build_embedded_l1_config()?;
             match l1_cfg.kind {
-                l1_embedded::L1ChainKind::Dev => {
-                    let node_cfg = l1_embedded::build_dev_node_config(&l1_cfg)?;
-                    let db = reth_db::init_db(
-                        node_cfg.datadir().db(),
-                        reth_db::mdbx::DatabaseArguments::default(),
-                    )
-                    .map_err(|e| eyre::eyre!("L1 embedded init_db: {e}"))?;
-                    event!(
-                        name: "eez.node.l1_embedded.launching",
-                        Level::INFO,
-                        kind = "dev",
-                        http_port = l1_cfg.http_port,
-                        "launching embedded L1 reth (dev)",
-                    );
-                    let l1_handle = reth_node_builder::NodeBuilder::new(node_cfg)
-                        .with_database(db)
-                        .with_launch_context(build_l1_runtime()?)
-                        .node(EthereumNode::default())
-                        .launch_with_debug_capabilities()
-                        .await?;
-                    event!(
-                        name: "eez.node.l1_embedded.ready",
-                        Level::INFO,
-                        kind = "dev",
-                        l1_chain_id = %l1_handle.node.chain_spec().chain(),
-                        "embedded L1 reth (dev) ready",
-                    );
-                    Some(EmbeddedL1::Dev(l1_handle))
-                }
                 l1_embedded::L1ChainKind::Devnet => {
                     let node_cfg = l1_embedded::build_devnet_node_config(&l1_cfg)?;
                     let db = reth_db::init_db(
@@ -244,10 +216,10 @@ fn main() -> eyre::Result<()> {
                         l1_chain_id = %l1_handle.node.chain_spec().chain(),
                         "embedded L1 reth (devnet) ready",
                     );
-                    Some(EmbeddedL1::Dev(l1_handle))
+                    Some(EmbeddedL1::Ethereum(l1_handle))
                 }
                 l1_embedded::L1ChainKind::Testing => {
-                    let node_cfg = l1_embedded::build_dev_node_config(&l1_cfg)?;
+                    let node_cfg = l1_embedded::build_testing_node_config(&l1_cfg)?;
                     let db = reth_db::init_db(
                         node_cfg.datadir().db(),
                         reth_db::mdbx::DatabaseArguments::default(),
@@ -274,7 +246,7 @@ fn main() -> eyre::Result<()> {
                         l1_chain_id = %l1_handle.node.chain_spec().chain(),
                         "embedded L1 reth (testing) ready",
                     );
-                    Some(EmbeddedL1::Dev(l1_handle))
+                    Some(EmbeddedL1::Ethereum(l1_handle))
                 }
                 l1_embedded::L1ChainKind::Chiado => {
                     let node_cfg = l1_embedded::build_chiado_node_config(&l1_cfg)?;
@@ -510,14 +482,14 @@ fn main() -> eyre::Result<()> {
                     let l1_rollup_id = RollupId(l1_rollup_id_u64);
                     let l2_rollup_id_typed = RollupId(rollup_id);
 
-                    // L1 entry differs per kind: Dev uses the native
+                    // L1 entry differs per kind: Devnet/Testing use the native
                     // provider + EvmConfig; Chiado wraps it in
                     // `GnosisL1Adapter` and builds a fresh `EthEvmConfig`
                     // over the chiado ChainSpec (source-sim needs only
                     // revm, not GnosisNode's AuRa paths). Both yield the
                     // same erased views, so composition is identical.
                     let (entry_client_view, root_reader_view) = match l1_variant {
-                        EmbeddedL1::Dev(l1_handle) => {
+                        EmbeddedL1::Ethereum(l1_handle) => {
                             let l1_chain_spec = l1_handle.node.chain_spec();
                             let l1_provider = l1_handle.node.provider.clone();
                             let l1_evm_config = l1_handle.node.evm_config.clone();
@@ -1016,7 +988,7 @@ fn read_l1_rollup_id() -> u64 {
         .unwrap_or(0)
 }
 
-/// Build the [`EmbeddedL1Config`] from env; all vars optional, with dev
+/// Build the [`EmbeddedL1Config`] from env; all vars optional, with testing
 /// defaults so the smoke harness only overrides what it needs.
 ///
 ///   - `EEZ_L1_HTTP_PORT` — default `18545` (WS = http_port + 1)
@@ -1065,14 +1037,14 @@ fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
     let dev_chain_spec = EthereumChainSpecParser::parse(&chain_arg)
         .map_err(|e| eyre::eyre!("EEZ_L1_CHAIN_PATH={chain_arg}: {e}"))?;
 
-    // L1 chain selector: `dev` (vanilla EthereumNode, auto-mine 5s),
-    // `devnet` (EthereumNode + external CL), vs `chiado`
+    // L1 chain selector: `testing` (vanilla EthereumNode, auto-mine 5s),
+    // `devnet` (EthereumNode + external CL), or `chiado`
     // (reth_gnosis::GnosisNode, real chiado state). The
-    // `dev_chain_spec` is consumed by dev/testing/devnet paths.
+    // `dev_chain_spec` is consumed by testing/devnet paths.
     let kind = l1_embedded::L1ChainKind::from_env();
 
     // JWT secret path — required for chiado/devnet (lighthouse engine API
-    // auth); optional for dev mode (no external CL).
+    // auth); optional for testing mode (no external CL).
     let jwtsecret = env::var("EEZ_L1_JWT_SECRET")
         .ok()
         .map(std::path::PathBuf::from);

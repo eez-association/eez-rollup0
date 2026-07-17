@@ -5,7 +5,8 @@
 //!   - **Chiado** (reth_gnosis::GnosisNode) — real chiado state from the
 //!     mounted datadir, driven via engine-API by an external lighthouse
 //!     CL. `EEZ_L1_CHAIN=chiado`.
-//!   - **Testing** — dev mode with the mock bundle RPC.
+//!   - **Testing** (vanilla EthereumNode, 5s auto-mine) — dev mode with the
+//!     non-atomic mock bundle RPC; the default. `EEZ_L1_CHAIN=testing`.
 //!
 //! The `NodeBuilder` launch is inline in [`crate::main`] — the
 //! nested-generic `NodeHandle` AddOns types resist a typed helper.
