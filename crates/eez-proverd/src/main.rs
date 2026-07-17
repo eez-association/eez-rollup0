@@ -160,7 +160,11 @@ impl Prover for ProveSvc {
         // 4. Inbound N:N bijection (sealed deliveries vs deferred carriers).
         let sealed: Vec<_> = staged
             .iter()
-            .flat_map(|b| gates::extract_inbounds(&b.rlp))
+            .map(|b| gates::extract_inbounds(&b.rlp))
+            .collect::<eyre::Result<Vec<_>>>()
+            .map_err(|e| Status::invalid_argument(format!("decode inbound block: {e}")))?
+            .into_iter()
+            .flatten()
             .collect();
         gates::multi_inbound_outcome_gate(&batch, &sealed)
             .map_err(|e| Status::failed_precondition(format!("inbound-outcome gate: {e}")))?;
@@ -234,7 +238,13 @@ async fn main() -> eyre::Result<()> {
         }),
     };
     Server::builder()
-        .add_service(ProverServer::new(svc))
+        .add_service(
+            // Match the client's raised caps: a busy block's witness can exceed
+            // tonic's 4 MiB default → `ResourceExhausted`.
+            ProverServer::new(svc)
+                .max_decoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES),
+        )
         .serve(args.listen_addr)
         .await?;
     Ok(())

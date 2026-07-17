@@ -4,7 +4,7 @@
 //! (`main.rs`) drives these. Never sign a window these gates reject.
 
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, B256};
 use eez_control_rpc::v1::ExecutionWitness;
@@ -58,6 +58,16 @@ pub(crate) struct VerifiedWindow {
     pub(crate) sync_outbound_call_hashes: Option<Vec<B256>>,
 }
 
+/// Wall-clock cap on the native-validate subprocess (env
+/// `EEZ_VALIDATOR_TIMEOUT_SECS`, default 300s). Generous — it catches a HANG,
+/// not slow-but-progressing validation.
+fn validator_timeout() -> Duration {
+    std::env::var("EEZ_VALIDATOR_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map_or(Duration::from_secs(300), Duration::from_secs)
+}
+
 /// Stage the window's blocks + witnesses, run `native-validate --dir`, check
 /// each verified block hash matches the composer-claimed one, and return the
 /// re-executed roots/per-tx data. Errors = the validator rejected the window
@@ -92,13 +102,25 @@ pub(crate) async fn validate_window(
     let stage_ms = t_stage.elapsed().as_millis();
 
     let t_exec = Instant::now();
-    let out = tokio::process::Command::new(validator_bin)
+    // Bound the subprocess: proving sits on the block-production path, so a hung
+    // validator must not wedge the composer. `kill_on_drop` means the timeout
+    // dropping the future SIGKILLs the child.
+    let child = tokio::process::Command::new(validator_bin)
         .arg(chain_config)
         .arg("--dir")
         .arg(&dir)
-        .output()
-        .await
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| eyre::eyre!("spawn {validator_bin}: {e}"))?;
+    let timeout = validator_timeout();
+    let out = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| {
+            eyre::eyre!("native-validate timed out after {timeout:?} for window {from}-{to}")
+        })?
+        .map_err(|e| eyre::eyre!("native-validate wait {validator_bin}: {e}"))?;
     let exec_ms = t_exec.elapsed().as_millis();
     info!(
         from,
@@ -193,6 +215,16 @@ pub(crate) async fn validate_window(
             .filter_map(serde_json::Value::as_bool)
             .collect::<Vec<_>>()
     });
+    // Enforce the invariant at the boundary: a settling window MUST carry per-tx
+    // statuses, or the reverted-system-tx gate can't run. Fail-closed here (with
+    // a clear message) so downstream can assume presence; the gate also refuses
+    // on `None` as a backstop.
+    if sync_tx_statuses.is_none() {
+        eyre::bail!(
+            "validator emitted no tx_statuses for the settling block (window {from}-{to}) — \
+             cannot run the reverted-system-tx gate"
+        );
+    }
     let sync_outbound_call_hashes = last_block["outbound_call_hashes"].as_array().map(|arr| {
         arr.iter()
             .filter_map(serde_json::Value::as_str)
@@ -297,23 +329,25 @@ pub(crate) fn verify_settlement_public_inputs(
 
 /// Per-tx SYSTEM flags of a block, re-derived from its OWN RLP (signer ==
 /// `SYSTEM_ADDRESS` && target == the EEZL2 predeploy). Shared by the pair-end
-/// classification + the reverted-system-tx (#10) gate. Undecodable RLP → empty
-/// (an empty block then passes both gates vacuously).
+/// classification + the reverted-system-tx (#10) gate. Undecodable RLP is an
+/// ERROR (fail-closed): an empty tx set would pass both gates vacuously.
 ///
 /// The target is `ccm_l2_address` — the deployment's on-chain EEZL2 predeploy
 /// (runtime config, `EEZ_CCM_L2_ADDRESS`), NOT the stale `eez_evm::CCM_ADDRESS`
 /// (0xeeee..). Using 0xeeee misclassifies every system tx as a user tx, silently
 /// defeating the interior-boundary + reverted-system-tx gates that re-derive
 /// system flags from this block RLP.
-pub(crate) fn system_tx_flags_from_rlp(block_rlp: &[u8], ccm_l2_address: Address) -> Vec<bool> {
+pub(crate) fn system_tx_flags_from_rlp(
+    block_rlp: &[u8],
+    ccm_l2_address: Address,
+) -> eyre::Result<Vec<bool>> {
     use alloy_consensus::Transaction as _;
     use alloy_rlp::Decodable as _;
     use reth_primitives_traits::SignerRecoverable as _;
 
-    let Ok(block) = reth_ethereum_primitives::Block::decode(&mut &block_rlp[..]) else {
-        return Vec::new();
-    };
-    block
+    let block = reth_ethereum_primitives::Block::decode(&mut &block_rlp[..])
+        .map_err(|e| eyre::eyre!("decode sync block RLP for system-tx flags: {e}"))?;
+    Ok(block
         .body
         .transactions
         .iter()
@@ -321,7 +355,7 @@ pub(crate) fn system_tx_flags_from_rlp(block_rlp: &[u8], ccm_l2_address: Address
             tx.recover_signer()
                 .is_ok_and(|signer| is_system_tx(signer, tx.to(), ccm_l2_address))
         })
-        .collect()
+        .collect())
 }
 
 /// Pair-end classification over per-tx system flags: position `i` ends a pair
@@ -330,18 +364,22 @@ pub(crate) fn system_tx_flags_from_rlp(block_rlp: &[u8], ccm_l2_address: Address
 /// (#10) `true` iff no SYSTEM tx in the block REVERTED, per the validator's
 /// re-executed receipt statuses. A reverted-but-sealed system tx passes every
 /// calldata-derived gate vacuously (the inbound result is read from CALLDATA),
-/// so it must be caught here. `statuses = None` (older validator) skips with a
-/// warning; a status count shorter than the tx count refuses (drift).
+/// so it must be caught here. Fail-closed: `statuses = None` REFUSES the window
+/// (the current validator always emits statuses; a missing list would otherwise
+/// silently disable a mandatory gate), and a count shorter than the tx count
+/// refuses too (drift).
 pub(crate) fn system_txs_succeeded(system_flags: &[bool], statuses: Option<&[bool]>) -> bool {
     let Some(statuses) = statuses else {
-        warn!("validator emitted no per-tx statuses — the reverted-system-tx gate is SKIPPED");
-        return true;
+        warn!(
+            "validator emitted no per-tx statuses — REFUSING the window (mandatory gate cannot run)"
+        );
+        return false;
     };
-    if statuses.len() < system_flags.len() {
+    if statuses.len() != system_flags.len() {
         warn!(
             flags = system_flags.len(),
             statuses = statuses.len(),
-            "per-tx statuses shorter than the block's tx count — refusing (count drift)"
+            "per-tx status count != the block's tx count — refusing (count drift)"
         );
         return false;
     }
@@ -456,19 +494,21 @@ pub(crate) fn verify_effect_prefix_roots(
 /// double-match / unmatched). A `find_map` (first-only) would leave every
 /// delivery past the first completely ungated, so the gate consumes the whole
 /// vector.
-pub(crate) fn extract_inbounds(block_rlp: &[u8]) -> Vec<eez_evm::entries::DecodedInbound> {
+pub(crate) fn extract_inbounds(
+    block_rlp: &[u8],
+) -> eyre::Result<Vec<eez_evm::entries::DecodedInbound>> {
     use alloy_consensus::Transaction as _;
     use alloy_rlp::Decodable as _;
 
-    let Ok(block) = reth_ethereum_primitives::Block::decode(&mut &block_rlp[..]) else {
-        return Vec::new();
-    };
-    block
+    // Fail-closed: an undecodable block must REJECT, not read as zero inbounds.
+    let block = reth_ethereum_primitives::Block::decode(&mut &block_rlp[..])
+        .map_err(|e| eyre::eyre!("decode block RLP for inbound extraction: {e}"))?;
+    Ok(block
         .body
         .transactions
         .iter()
         .filter_map(|tx| eez_evm::entries::decode_inbound(tx.input()))
-        .collect()
+        .collect())
 }
 
 /// Multi-delivery inbound bijection gate (GAP-3): the N:N inbound outcome gate —
@@ -769,7 +809,7 @@ pub(crate) fn verify_settlement_chain(
     // validator's per-tx roots onto the pair-end positions (both re-derived,
     // never composer claims). A position without a root (count drift) collapses
     // the whole map to None → real interiors refused.
-    let system_flags = system_tx_flags_from_rlp(sync_block_rlp, ccm_l2_address);
+    let system_flags = system_tx_flags_from_rlp(sync_block_rlp, ccm_l2_address)?;
     let pair_end_roots: Option<Vec<B256>> = vw.sync_per_tx_roots.as_ref().and_then(|per_tx| {
         pair_end_positions(&system_flags)
             .iter()
@@ -1371,13 +1411,28 @@ mod tests {
         }
     }
 
+    /// A decodable, empty (0-tx) sync-block RLP — the realistic stand-in for the
+    /// settling block in chain-logic tests (they inject roots synthetically; the
+    /// block itself carries no system txs). The committed empty fixture, so the
+    /// fail-closed RLP decode in `system_tx_flags_from_rlp` sees a valid block.
+    fn empty_block_rlp() -> Vec<u8> {
+        std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/block-13.rlp"
+        ))
+        .expect("block-13.rlp fixture")
+    }
+
     fn verified(parent: B256, final_root: B256) -> VerifiedWindow {
         VerifiedWindow {
             parent_state_root: parent,
             final_state_root: final_root,
             per_block_roots: None,
             sync_per_tx_roots: None,
-            sync_tx_statuses: None,
+            // Empty sync block → 0 txs → 0 statuses. A real settling window always
+            // carries statuses; `None` is rejected at the validate_window boundary,
+            // so it is not a valid VerifiedWindow input here.
+            sync_tx_statuses: Some(vec![]),
             sync_outbound_call_hashes: None,
         }
     }
@@ -1387,7 +1442,7 @@ mod tests {
         let (a, b) = (B256::repeat_byte(0xa0), B256::repeat_byte(0xb0));
         let pb = post_batch_with_chain(&[(1, a, b)]);
         // Single-chunk batch: the batch anchor == the chunk's re-executed parent A.
-        verify_settlement_chain(&pb, &verified(a, b), a, b"", TEST_CCM_L2)
+        verify_settlement_chain(&pb, &verified(a, b), a, &empty_block_rlp(), TEST_CCM_L2)
             .expect("R0==anchor, R_N==final → OK");
     }
 
@@ -1400,7 +1455,10 @@ mod tests {
         );
         let pb = post_batch_with_chain(&[(1, a, b)]);
         // The re-executed final root is C, not the claimed B → endpoint refused.
-        assert!(verify_settlement_chain(&pb, &verified(a, c), a, b"", TEST_CCM_L2).is_err());
+        assert!(
+            verify_settlement_chain(&pb, &verified(a, c), a, &empty_block_rlp(), TEST_CCM_L2)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1412,7 +1470,10 @@ mod tests {
         );
         let pb = post_batch_with_chain(&[(1, a, b)]);
         // The re-executed batch anchor is X, not the claimed R0=A → OD-5 refused.
-        assert!(verify_settlement_chain(&pb, &verified(x, b), x, b"", TEST_CCM_L2).is_err());
+        assert!(
+            verify_settlement_chain(&pb, &verified(x, b), x, &empty_block_rlp(), TEST_CCM_L2)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1425,7 +1486,10 @@ mod tests {
         );
         // e0: A->B, e1: C->D (C != B → the chain doesn't telescope). Endpoints OK.
         let pb = post_batch_with_chain(&[(1, a, b), (1, c, d)]);
-        assert!(verify_settlement_chain(&pb, &verified(a, d), a, b"", TEST_CCM_L2).is_err());
+        assert!(
+            verify_settlement_chain(&pb, &verified(a, d), a, &empty_block_rlp(), TEST_CCM_L2)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1449,7 +1513,7 @@ mod tests {
             (1, rn, rn), // inbound3: collapsed onto the final root
         ]);
         // Single-block settling window: parent_state_root == r0, final == rn.
-        verify_settlement_chain(&pb, &verified(r0, rn), r0, b"", TEST_CCM_L2)
+        verify_settlement_chain(&pb, &verified(r0, rn), r0, &empty_block_rlp(), TEST_CCM_L2)
             .expect("multi-inbound collapse: interiors equal proven endpoints → OK");
     }
 
@@ -1479,10 +1543,13 @@ mod tests {
             final_state_root: rn,
             per_block_roots: Some(vec![r0, m, rn]), // [parent.., B_{m-1}=M, sync=rn]
             sync_per_tx_roots: None,
-            sync_tx_statuses: None,
+            // Empty sync block → 0 txs → 0 statuses. A real settling window always
+            // carries statuses; `None` is rejected at the validate_window boundary,
+            // so it is not a valid VerifiedWindow input here.
+            sync_tx_statuses: Some(vec![]),
             sync_outbound_call_hashes: None,
         };
-        verify_settlement_chain(&pb, &vw, r0, b"", TEST_CCM_L2)
+        verify_settlement_chain(&pb, &vw, r0, &empty_block_rlp(), TEST_CCM_L2)
             .expect("multi-block multi-inbound: M is a proven per-block root, rn is final → OK");
     }
 
@@ -1507,11 +1574,14 @@ mod tests {
             final_state_root: rn,
             per_block_roots: Some(vec![r0, rn]), // re-execution does NOT contain X
             sync_per_tx_roots: None,             // validator corroborates NO interior
-            sync_tx_statuses: None,
+            // Empty sync block → 0 txs → 0 statuses. A real settling window always
+            // carries statuses; `None` is rejected at the validate_window boundary,
+            // so it is not a valid VerifiedWindow input here.
+            sync_tx_statuses: Some(vec![]),
             sync_outbound_call_hashes: None,
         };
         assert!(
-            verify_settlement_chain(&pb, &vw, r0, b"", TEST_CCM_L2).is_err(),
+            verify_settlement_chain(&pb, &vw, r0, &empty_block_rlp(), TEST_CCM_L2).is_err(),
             "a fabricated interior X (no proven root, no placeholder) must be refused"
         );
     }
@@ -1536,11 +1606,14 @@ mod tests {
             final_state_root: c, // re-execution says the final root is C, not B
             per_block_roots: Some(vec![r0, c]), // B is NOT a re-executed root
             sync_per_tx_roots: None,
-            sync_tx_statuses: None,
+            // Empty sync block → 0 txs → 0 statuses. A real settling window always
+            // carries statuses; `None` is rejected at the validate_window boundary,
+            // so it is not a valid VerifiedWindow input here.
+            sync_tx_statuses: Some(vec![]),
             sync_outbound_call_hashes: None,
         };
         assert!(
-            verify_settlement_chain(&pb, &vw, r0, b"", TEST_CCM_L2).is_err(),
+            verify_settlement_chain(&pb, &vw, r0, &empty_block_rlp(), TEST_CCM_L2).is_err(),
             "interior B coinciding with a CLAIMED-but-unproven endpoint must be refused"
         );
     }
@@ -1554,7 +1627,10 @@ mod tests {
         );
         // Telescopes A->B->D but entry 1 settles a DIFFERENT rollup.
         let pb = post_batch_with_chain(&[(1, a, b), (2, b, d)]);
-        assert!(verify_settlement_chain(&pb, &verified(a, d), a, b"", TEST_CCM_L2).is_err());
+        assert!(
+            verify_settlement_chain(&pb, &verified(a, d), a, &empty_block_rlp(), TEST_CCM_L2)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1576,7 +1652,7 @@ mod tests {
         let settling = verified(m, rn);
         // OLD behavior (anchor = the settling chunk's local parent M) would reject:
         assert!(
-            verify_settlement_chain(&pb, &settling, m, b"", TEST_CCM_L2).is_err(),
+            verify_settlement_chain(&pb, &settling, m, &empty_block_rlp(), TEST_CCM_L2).is_err(),
             "anchoring at the settling chunk's local parent M must reject R0=A (the pre-GAP-2 false reject)"
         );
         // The interior boundary M telescopes to R0=A via interim_interior_root, so
@@ -1584,7 +1660,7 @@ mod tests {
         let interim = eez_evm::settlement::interim_interior_root(a, 1);
         let pb2 = post_batch_with_chain(&[(1, a, interim), (1, interim, rn)]);
         // GAP-2: anchoring at the TELESCOPED batch anchor A accepts the wide batch.
-        verify_settlement_chain(&pb2, &settling, a, b"", TEST_CCM_L2)
+        verify_settlement_chain(&pb2, &settling, a, &empty_block_rlp(), TEST_CCM_L2)
             .expect("telescoped batch anchor A accepts a batch spanning > max_window");
     }
 
@@ -1623,7 +1699,7 @@ mod tests {
 
     #[test]
     fn reverted_system_tx_gate() {
-        assert!(system_txs_succeeded(&[true], None)); // no statuses → SKIP (true)
+        assert!(!system_txs_succeeded(&[true], None)); // no statuses → REFUSE (fail-closed)
         assert!(system_txs_succeeded(&[true, false], Some(&[true, true]))); // all ok
         assert!(!system_txs_succeeded(&[true, false], Some(&[false, true]))); // SYSTEM reverted
         assert!(system_txs_succeeded(&[false], Some(&[false]))); // a USER revert is fine
@@ -1743,7 +1819,11 @@ mod tests {
             "/tests/fixtures/block-13.rlp"
         ))
         .expect("block-13.rlp");
-        // The captured settling block (13) carries no transactions.
-        assert!(system_tx_flags_from_rlp(&block_rlp, TEST_CCM_L2).is_empty());
+        // The captured settling block (13) decodes and carries no transactions.
+        assert!(
+            system_tx_flags_from_rlp(&block_rlp, TEST_CCM_L2)
+                .expect("valid fixture block decodes")
+                .is_empty()
+        );
     }
 }
