@@ -892,6 +892,31 @@ where
             rollup.optimistic.reinsert_failed(failed);
             return None;
         };
+        let mut landed = Vec::new();
+        let mut receipt_error = None;
+        for tx in &failed.txs {
+            match self.inner.submitter.receipt_exists(tx.hash).await {
+                Ok(true) => landed.push(tx.hash),
+                Ok(false) => {}
+                Err(err) => {
+                    receipt_error = Some((tx.hash, err));
+                    break;
+                }
+            }
+        }
+        if let Some((tx_hash, err)) = receipt_error {
+            event!(
+                name: "eez.composer.recovery.receipt_check_failed",
+                Level::WARN,
+                rollup_id,
+                sync_height,
+                tx_hash = %tx_hash,
+                error = %err,
+                "user receipt lookup failed; retaining failed batch for retry",
+            );
+            rollup.optimistic.reinsert_failed(failed);
+            return None;
+        }
         // Reorg only if the failed block (or descendants) actually
         // became canonical. Rich Sync blocks carry unsettled
         // cross-chain effects; empty (minimal-path) blocks are
@@ -959,7 +984,6 @@ where
         // burned nonce — re-bundling it would poison the next bundle's
         // simulation.
         if let Some(pool) = rollup.held_pool.as_ref() {
-            let submitter = &self.inner.submitter;
             let mut keep: Vec<crate::HeldTx> = Vec::with_capacity(failed.txs.len());
             let mut release: Vec<crate::HeldTx> = Vec::new();
             let mut dropped = 0usize;
@@ -968,7 +992,7 @@ where
             // (a skipped slot heals via a fresh pin next tick).
             let slot_skipped = failed.slot_skipped;
             for mut tx in failed.txs {
-                if let Ok(true) = submitter.receipt_exists(tx.hash).await {
+                if landed.contains(&tx.hash) {
                     dropped += 1;
                     release.push(tx.clone());
                     event!(

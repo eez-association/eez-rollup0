@@ -340,6 +340,26 @@ mod tests {
     }
 
     #[test]
+    fn reinserted_failure_preserves_nonce_reservations() {
+        let held_pool = crate::HeldPool::new();
+        let original = tx(1);
+        held_pool.push_contiguous(original.clone(), 1).unwrap();
+        let reserved = held_pool.pop_n(1);
+
+        let optimistic = OptimisticallyIncluded::new();
+        optimistic.begin(10, pb_hash(0xa), hdr(), reserved);
+        optimistic.mark_failed(10, false);
+        let failed = optimistic.take_failed_for_recovery(0).unwrap();
+        optimistic.reinsert_failed(failed);
+
+        let mut replacement = original;
+        replacement.hash = TxHash::repeat_byte(0xff);
+        replacement.raw_tx = alloy_primitives::Bytes::from(vec![0xff; 4]);
+        assert!(held_pool.push_contiguous(replacement, 1).is_err());
+        assert_eq!(optimistic.blocking_height(0), Some(10));
+    }
+
+    #[test]
     fn failed_recovery_propagates_slot_skipped() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
