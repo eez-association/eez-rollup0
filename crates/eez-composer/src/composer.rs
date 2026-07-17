@@ -32,7 +32,9 @@ use eez_prover::Prover;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
-use reth_storage_api::{BlockReader, BlockSource, StateProviderFactory, TransactionsProvider};
+use reth_storage_api::{
+    BlockReader, BlockSource, StateProvider, StateProviderFactory, TransactionsProvider,
+};
 use tokio::sync::broadcast;
 use tracing::{Level, event};
 
@@ -172,20 +174,75 @@ async fn read_rollup_escrow(provider: &alloy_provider::RootProvider, rid: u64) -
         .map(|r| r.etherBalance)
 }
 
-async fn inbound_source_nonce_advanced(
+/// Read canonical L1 nonces for inbound senders.
+async fn inbound_source_nonces_for_drain(
     ctx: &CrossChainExecCtx,
-    tx: &HeldTx,
-) -> Result<bool, String> {
-    if tx.direction != Direction::Inbound {
-        return Ok(false);
+    rollup_id: u64,
+    drained: &[HeldTx],
+) -> HashMap<(Address, Direction), u64> {
+    let mut source_nonces = HashMap::new();
+    for tx in drained {
+        let key = (tx.sender, tx.direction);
+        if tx.direction != Direction::Inbound || source_nonces.contains_key(&key) {
+            continue;
+        }
+        match ctx.l1_provider.get_transaction_count(tx.sender).await {
+            Ok(nonce) => {
+                source_nonces.insert(key, nonce);
+            }
+            Err(err) => event!(
+                name: "eez.composer.cc_compose.source_nonce_check_failed",
+                Level::WARN,
+                rollup_id,
+                sender = %tx.sender,
+                direction = ?tx.direction,
+                error = %err,
+                "canonical source-chain nonce preflight failed; proceeding with simulation",
+            ),
+        }
     }
-    let on_chain = ctx
-        .l1_provider
-        .get_transaction_count(tx.sender)
-        .pending()
-        .await
-        .map_err(|e| format!("source-chain nonce lookup failed: {e}"))?;
-    Ok(on_chain > tx.nonce)
+    source_nonces
+}
+
+/// Read outbound nonces from the Sync block's parent state.
+fn outbound_source_nonces_for_drain(
+    parent_state: &dyn StateProvider,
+    rollup_id: u64,
+    drained: &[HeldTx],
+) -> HashMap<(Address, Direction), u64> {
+    let mut source_nonces = HashMap::new();
+    for tx in drained {
+        let key = (tx.sender, tx.direction);
+        if tx.direction != Direction::Outbound || source_nonces.contains_key(&key) {
+            continue;
+        }
+        match parent_state.account_nonce(&tx.sender) {
+            Ok(nonce) => {
+                source_nonces.insert(key, nonce.unwrap_or(0));
+            }
+            Err(err) => event!(
+                name: "eez.composer.cc_compose.source_nonce_check_failed",
+                Level::WARN,
+                rollup_id,
+                sender = %tx.sender,
+                direction = ?tx.direction,
+                error = %err,
+                "parent-state source nonce preflight failed; proceeding with simulation",
+            ),
+        }
+    }
+    source_nonces
+}
+
+fn partition_stale(
+    drained: Vec<HeldTx>,
+    source_nonces: &HashMap<(Address, Direction), u64>,
+) -> (Vec<HeldTx>, Vec<HeldTx>) {
+    drained.into_iter().partition(|tx| {
+        source_nonces
+            .get(&(tx.sender, tx.direction))
+            .is_none_or(|source_nonce| *source_nonce <= tx.nonce)
+    })
 }
 
 fn poison_gap_for(gaps: &[(Address, Direction, u64)], tx: &HeldTx) -> Option<u64> {
@@ -783,6 +840,8 @@ where
             }
             Ok(None) => None,
             Err(err) => {
+                // Errors occur before drain classification, so requeueing the
+                // complete original batch is safe.
                 event!(
                     name: "eez.composer.cc_compose.failed",
                     Level::ERROR,
@@ -962,6 +1021,7 @@ where
             // keep list and the pool, loudly.
             for (sender, direction, nonce) in &evicted_chains {
                 keep.retain(|t| {
+                    // The root is already in `release`; remove only its suffix here.
                     let cascade =
                         t.sender == *sender && t.direction == *direction && t.nonce > *nonce;
                     if cascade {
@@ -980,7 +1040,7 @@ where
                     }
                     !cascade
                 });
-                for t in pool.drain_sender_above(*sender, *direction, *nonce) {
+                for t in pool.evict_chain_at_or_above(*sender, *direction, *nonce) {
                     dropped += 1;
                     event!(
                         name: "eez.composer.recovery.nonce_chain_evicted",
@@ -1023,6 +1083,9 @@ where
     /// (`crates/based-rollup/src/composer_rpc/l1_to_l2/...`); we do
     /// the wrapping internally because our composer + bundler live in
     /// the same process.
+    ///
+    /// # Errors
+    /// Returns errors only before drain classification begins.
     async fn compose_via_evm_composer(
         &self,
         evm_composer: &eez_evm_inspector::EvmComposer,
@@ -1103,6 +1166,28 @@ where
                 .await;
         }
 
+        let outbound_source_nonces =
+            outbound_source_nonces_for_drain(state.as_ref(), rollup_id, &drained);
+        drop(state);
+        let mut source_nonces = inbound_source_nonces_for_drain(ctx, rollup_id, &drained).await;
+        source_nonces.extend(outbound_source_nonces);
+        let (drained, stale) = partition_stale(drained, &source_nonces);
+        for tx in &stale {
+            event!(
+                name: "eez.composer.cc_compose.stale_nonce_evicted",
+                Level::WARN,
+                rollup_id,
+                tx_hash = %tx.hash,
+                sender = %tx.sender,
+                nonce = tx.nonce,
+                direction = ?tx.direction,
+                "held tx nonce is below its canonical source-chain nonce; evicting stale tx",
+            );
+        }
+        if let Some(pool) = rollup.held_pool.as_ref() {
+            pool.release_in_flight_batch(&stale);
+        }
+
         let mut survivors: Vec<HeldTx> = Vec::with_capacity(drained.len());
         // Inbound survivors' compositions (their `source.batch` = the L1
         // deferred entries) feed `prepare_post_batch_raw`'s merge.
@@ -1120,7 +1205,6 @@ where
         let mut escrow_remaining: Option<U256> = None;
         let mut poison: Vec<HeldTx> = Vec::new();
         let mut poison_gaps: Vec<(Address, Direction, u64)> = Vec::new();
-        let mut stale: Vec<HeldTx> = Vec::new();
         // On a transient failure we abort the slot; this holds the error
         // string + the txs still needing re-queue (the failing tx + the
         // unprocessed remainder; survivors are added below).
@@ -1142,32 +1226,6 @@ where
                 );
                 poison.push(held);
                 continue;
-            }
-            match inbound_source_nonce_advanced(ctx, &held).await {
-                Ok(true) => {
-                    event!(
-                        name: "eez.composer.cc_compose.stale_nonce_evicted",
-                        Level::WARN,
-                        rollup_id,
-                        tx_idx = idx,
-                        tx_hash = %held.hash,
-                        sender = %held.sender,
-                        nonce = held.nonce,
-                        "inbound held tx nonce is already below source-chain pending nonce; evicting stale tx",
-                    );
-                    stale.push(held);
-                    continue;
-                }
-                Ok(false) => {}
-                Err(err) => event!(
-                    name: "eez.composer.cc_compose.source_nonce_check_failed",
-                    Level::WARN,
-                    rollup_id,
-                    tx_idx = idx,
-                    tx_hash = %held.hash,
-                    error = %err,
-                    "source-chain nonce preflight failed; proceeding with simulation",
-                ),
             }
             // ── OUTBOUND (L2→L1) arm. Source-sim runs against the L2 ENTRY client
             // (the L2 follower errors `Unavailable`). Stage each (settlement entry,
@@ -1356,7 +1414,8 @@ where
         // a sender's nonce N is evicted, N+1.. can never land.
         if let Some(pool) = rollup.held_pool.as_ref() {
             for tx in &poison {
-                for t in pool.drain_sender_above(tx.sender, tx.direction, tx.nonce) {
+                // Inclusive eviction releases the poison root's reservation too.
+                for t in pool.evict_chain_at_or_above(tx.sender, tx.direction, tx.nonce) {
                     event!(
                         name: "eez.composer.cc_compose.poison_chain_evicted",
                         Level::WARN,
@@ -1369,7 +1428,6 @@ where
                     );
                 }
             }
-            pool.release_in_flight_batch(&stale);
         }
 
         // ── Transient abort: re-queue survivors + remainder, minimal. ──
@@ -2383,5 +2441,54 @@ mod tests {
 
         assert_eq!(poison.len(), 2);
         assert_eq!(gaps, vec![(sender, Direction::Inbound, 7)]);
+    }
+
+    #[test]
+    fn stale_partition_is_canonical_directional_and_ordered() {
+        let sender = Address::repeat_byte(0xd);
+        let other = Address::repeat_byte(0xe);
+        let drained = vec![
+            held(sender, Direction::Inbound, 1, 1),
+            held(sender, Direction::Inbound, 3, 3),
+            held(sender, Direction::Outbound, 2, 2),
+            held(sender, Direction::Outbound, 4, 4),
+            held(other, Direction::Inbound, 0, 5),
+            held(sender, Direction::Inbound, 2, 6),
+        ];
+        let source_nonces = HashMap::from([
+            ((sender, Direction::Inbound), 3),
+            ((sender, Direction::Outbound), 3),
+        ]);
+
+        let (fresh, stale) = partition_stale(drained, &source_nonces);
+
+        assert_eq!(
+            fresh.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
+            vec![
+                TxHash::repeat_byte(3),
+                TxHash::repeat_byte(4),
+                TxHash::repeat_byte(5),
+            ]
+        );
+        assert_eq!(
+            stale.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
+            vec![
+                TxHash::repeat_byte(1),
+                TxHash::repeat_byte(2),
+                TxHash::repeat_byte(6),
+            ]
+        );
+    }
+
+    #[test]
+    fn stale_partition_fails_open_without_a_source_nonce() {
+        let tx = held(Address::repeat_byte(0xf), Direction::Outbound, 9, 1);
+        let (fresh, stale) = partition_stale(vec![tx.clone()], &HashMap::new());
+        assert_eq!(fresh[0].hash, tx.hash);
+        assert!(stale.is_empty());
+
+        let (fresh, stale) = partition_stale(Vec::new(), &HashMap::new());
+        assert!(fresh.is_empty());
+        assert!(stale.is_empty());
     }
 }

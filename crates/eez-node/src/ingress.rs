@@ -62,6 +62,7 @@ pub async fn gate_and_hold(
         return Admission::Rejected("signature recovery failed".into());
     };
     let nonce = envelope.nonce();
+    // This checks one transaction; simulation enforces cumulative affordability.
     let balance = match validation_provider.get_balance(sender).await {
         Ok(b) => b,
         Err(e) => {
@@ -85,6 +86,7 @@ pub async fn gate_and_hold(
         nonce,
         direction,
     };
+    // Pending state prevents collisions with source-chain mempool transactions.
     let on_chain = match validation_provider
         .get_transaction_count(sender)
         .pending()

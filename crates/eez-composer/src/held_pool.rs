@@ -24,6 +24,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 use alloy_primitives::{Address, Bytes, TxHash};
+use tracing::{Level, event};
 
 use crate::ingress::Direction;
 
@@ -225,15 +226,50 @@ impl HeldPool {
         Ok(HoldInsert::Inserted)
     }
 
-    /// Re-queue recovered txs at the FRONT of the pool, preserving
-    /// their relative order. Recovery from a failed bundle must put
-    /// the txs AHEAD of anything submitted since — appending to the
-    /// tail re-orders user transactions across retries (setValue(2)
-    /// executing before the retried setValue(1)). Duplicate hashes are
-    /// skipped.
+    /// Re-queue recovered txs at the front, unless a newer queued replacement
+    /// owns that nonce; then discard the recovered root and suffix.
     pub fn push_front_batch(&self, recovered: Vec<HeldTx>) {
         let mut state = self.state.lock().expect("held_pool mutex poisoned");
+        let mut replacement_roots: HashMap<(Address, Direction), (u64, TxHash)> = HashMap::new();
+        for tx in &recovered {
+            let replacement = state.txs.iter().find(|queued| {
+                queued.sender == tx.sender
+                    && queued.direction == tx.direction
+                    && queued.nonce == tx.nonce
+                    && queued.hash != tx.hash
+            });
+            if let Some(replacement) = replacement {
+                replacement_roots
+                    .entry((tx.sender, tx.direction))
+                    .and_modify(|(nonce, hash)| {
+                        if tx.nonce < *nonce {
+                            *nonce = tx.nonce;
+                            *hash = replacement.hash;
+                        }
+                    })
+                    .or_insert((tx.nonce, replacement.hash));
+            }
+        }
+
         for tx in recovered.into_iter().rev() {
+            if let Some(&(conflict_nonce, replacement_hash)) =
+                replacement_roots.get(&(tx.sender, tx.direction))
+                && tx.nonce >= conflict_nonce
+            {
+                state.release_in_flight(&tx);
+                event!(
+                    name: "eez.held_pool.recovery_conflict",
+                    Level::WARN,
+                    recovered_hash = %tx.hash,
+                    replacement_hash = %replacement_hash,
+                    sender = %tx.sender,
+                    direction = ?tx.direction,
+                    nonce = tx.nonce,
+                    conflict_nonce,
+                    "newer queued replacement wins; discarding recovered nonce-chain suffix",
+                );
+                continue;
+            }
             state.push_front_recovered(tx);
         }
     }
@@ -251,7 +287,7 @@ impl HeldPool {
     /// `nonce` in one sender/direction chain. Returns queued transactions that
     /// were removed; callers already own any matching in-flight transactions.
     #[must_use]
-    pub fn drain_sender_above(
+    pub fn evict_chain_at_or_above(
         &self,
         sender: Address,
         direction: Direction,
@@ -397,7 +433,7 @@ mod tests {
         insert(&pool, mk(0, Direction::Outbound, 3), 0);
         insert(&pool, mk(1, Direction::Outbound, 4), 0);
 
-        let evicted = pool.drain_sender_above(sender, Direction::Outbound, 1);
+        let evicted = pool.evict_chain_at_or_above(sender, Direction::Outbound, 1);
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].nonce, 1);
         assert_eq!(evicted[0].direction, Direction::Outbound);
@@ -605,16 +641,72 @@ mod tests {
             vec![0, 1, 2]
         );
 
-        let queued = pool.drain_sender_above(sender, Direction::Inbound, 1);
+        let queued = pool.evict_chain_at_or_above(sender, Direction::Inbound, 1);
 
         assert_eq!(
             queued.iter().map(|tx| tx.nonce).collect::<Vec<_>>(),
             vec![3]
         );
+        assert!(
+            !pool
+                .state
+                .lock()
+                .unwrap()
+                .in_flight
+                .values()
+                .any(|(s, d, nonce)| { *s == sender && *d == Direction::Inbound && *nonce >= 1 }),
+            "inclusive eviction must release the root's own reservation"
+        );
         assert_eq!(
             pool.push_contiguous(mk(1, 5), 0).unwrap(),
             HoldInsert::Inserted
         );
+    }
+
+    #[test]
+    fn recovery_preserves_newer_replacement_and_discards_old_suffix() {
+        let pool = HeldPool::new();
+        let sender = Address::repeat_byte(0xf);
+        let mk = |nonce: u64, h: u8| HeldTx {
+            raw_tx: Bytes::from(vec![h; 4]),
+            hash: TxHash::from(B256::repeat_byte(h)),
+            attempts: 0,
+            sender,
+            nonce,
+            direction: Direction::Inbound,
+        };
+        let old_root = mk(0, 1);
+        let old_suffix = mk(1, 2);
+        insert(&pool, old_root.clone(), 0);
+        insert(&pool, old_suffix.clone(), 0);
+        let old_batch = pool.pop_n(2);
+
+        pool.release_in_flight_batch(&old_batch);
+        let replacement = mk(0, 9);
+        insert(&pool, replacement.clone(), 0);
+        pool.push_front_batch(old_batch);
+
+        let state = pool.state.lock().unwrap();
+        assert_eq!(state.txs.len(), 1);
+        assert_eq!(state.txs[0].hash, replacement.hash);
+        assert!(!state.in_flight.contains_key(&old_root.hash));
+        assert!(!state.in_flight.contains_key(&old_suffix.hash));
+    }
+
+    #[test]
+    fn same_hash_recovery_is_idempotent() {
+        let pool = HeldPool::new();
+        let original = tx(1);
+        insert(&pool, original.clone(), 1);
+        let drained = pool.pop_n(1);
+
+        pool.push_front_batch(drained.clone());
+        pool.push_front_batch(drained);
+
+        let state = pool.state.lock().unwrap();
+        assert_eq!(state.txs.len(), 1);
+        assert_eq!(state.txs[0].hash, original.hash);
+        assert!(state.in_flight.is_empty());
     }
 
     #[test]
