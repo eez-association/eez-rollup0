@@ -134,12 +134,19 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
     let withdrawal_before = l2_balance(&l1_rpc, w.withdrawal_recipient).await.unwrap();
     let deposit_sum: u128 = WAVE_DEPOSITS.iter().sum();
 
-    let mut l1_nonce = pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
-    let mut l2_nonce = pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
     let mut inbound_hashes = Vec::new();
     let mut outbound_hashes = Vec::new();
 
     for (set_v, dep_v) in WAVE_SETTERS.iter().zip(WAVE_DEPOSITS.iter()) {
+        // Let each wave settle before deriving the next source nonces. A compose
+        // tick removes transactions from the held pool before they land on the
+        // source chain, so incrementing one cached nonce across multiple waves
+        // races the ingress gate's `on_chain + held` validation.
+        let mut l1_nonce = pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
+        let mut l2_nonce = pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
+        let inbound_wave_start = inbound_hashes.len();
+        let outbound_wave_start = outbound_hashes.len();
+
         let set_input = IValue::setValueCall {
             v: U256::from(*set_v),
         }
@@ -225,6 +232,19 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
             );
             l2_nonce += 1;
         }
+
+        assert_all_transactions_succeeded(
+            &l1_rpc,
+            &inbound_hashes[inbound_wave_start..],
+            "inbound wave",
+        )
+        .await;
+        assert_all_transactions_succeeded(
+            &l2_rpc,
+            &outbound_hashes[outbound_wave_start..],
+            "outbound wave",
+        )
+        .await;
     }
 
     let expected_per_direction = WAVE_SETTERS.len() * 4;
@@ -238,9 +258,6 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
         expected_per_direction,
         "every outbound wave operation must be submitted",
     );
-
-    assert_all_transactions_succeeded(&l1_rpc, &inbound_hashes, "inbound wave").await;
-    assert_all_transactions_succeeded(&l2_rpc, &outbound_hashes, "outbound wave").await;
 
     let final_value = l2_value(&l2_rpc, w.value_l2).await.unwrap();
     assert_eq!(
