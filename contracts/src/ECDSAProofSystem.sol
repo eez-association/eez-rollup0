@@ -63,6 +63,15 @@ contract ECDSAProofSystem is IProofSystem {
             v := byte(0, calldataload(add(proof.offset, 64)))
         }
 
+        // Reject high-`s` (malleable) signatures: EIP-2 canonical form requires
+        // `s <= secp256k1_n/2`. The off-chain signer already emits low-`s` (see
+        // eez-evm/src/signer.rs, which documents this verifier enforcing it), so
+        // a malleated twin of a valid attestation must not also verify. Constant
+        // is secp256k1_n/2 (OpenZeppelin ECDSA `_HALF_N`).
+        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {
+            return false;
+        }
+
         // `ecrecover` returns address(0) on any malformed (r, s, v); `signer`
         // is non-zero per the constructor revert, so those are all rejected.
         address recovered = ecrecover(publicInputsHash, v, r, s);

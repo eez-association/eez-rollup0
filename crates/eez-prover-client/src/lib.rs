@@ -108,9 +108,13 @@ impl Prover for RemoteProver {
         let chunks = chunks_for(&ctx);
         let n_blocks = chunks.len().saturating_sub(1);
 
+        // Raise the message-size cap on both directions: a single block's witness
+        // can exceed tonic's 4 MiB default → `ResourceExhausted`. Server matches.
         let mut client = ProverClient::connect(self.inner.url.clone())
             .await
-            .map_err(|e| ProverError::Backend(format!("connect {}: {e}", self.inner.url)))?;
+            .map_err(|e| ProverError::Backend(format!("connect {}: {e}", self.inner.url)))?
+            .max_encoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES)
+            .max_decoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES);
         let resp = client
             .prove(tokio_stream::iter(chunks))
             .await
@@ -158,9 +162,8 @@ impl Prover for RemoteProver {
     }
 
     fn vkey(&self) -> B256 {
-        let mut bytes = [0u8; 32];
-        bytes[12..].copy_from_slice(self.inner.attester.as_slice());
-        B256::from(bytes)
+        // Left-zero-pad the 20-byte attester into a B256 (the registry vkey).
+        self.inner.attester.into_word()
     }
 }
 

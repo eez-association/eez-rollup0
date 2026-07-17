@@ -13,3 +13,7 @@ mod generated;
 
 /// Tonic-generated protobuf module for the `prove.v1` package.
 pub use generated::v1;
+
+/// Max size of a single `Prove` gRPC message, applied to BOTH the client
+/// (encode) and server (decode).
+pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024 * 1024;

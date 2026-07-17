@@ -354,7 +354,6 @@ mod tests {
                 codes: vec![],
                 keys: vec![],
                 headers: vec![],
-                ..Default::default()
             },
         }
     }

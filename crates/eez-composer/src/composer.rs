@@ -1712,28 +1712,6 @@ where
         ));
     }
 
-    /// Witness for the window's endpoint — the just-built Sync block. It isn't
-    /// committed yet (the Sequencer applies the payload afterward), so no store
-    /// or provider can serve it; re-execute it on its parent's state via the
-    /// same augmented path the node uses at commit. Remote-prover mode only.
-    ///
-    /// # Errors
-    ///
-    /// `String` if re-execution / witness augmentation fails.
-    fn endpoint_witness(
-        &self,
-        l2_provider: &L2,
-        block: &reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>,
-    ) -> Result<BlockWitness, String> {
-        block_witness(
-            l2_provider,
-            &self.inner.evm_config,
-            block,
-            ExecutionWitnessMode::Legacy,
-        )
-        .map_err(|e| format!("endpoint witness (block {}): {e}", block.header().number()))
-    }
-
     /// Build + sign the L1 `postBatch` raw tx for a Sync slot's
     /// compositions, covering blocks `posted+1..=parent+1` (intermediate
     /// blocks + the new Sync block at `parent+1`, always the range's last
@@ -2142,18 +2120,46 @@ where
             // (served by the witness store); the just-built endpoint isn't, so
             // capture it here from the in-memory block.
             Some(src) => {
-                let l2_provider = &self
-                    .inner
-                    .rollups
-                    .get(&rollup_id)
-                    .ok_or_else(|| format!("unknown rollup_id {rollup_id}"))?
-                    .l2_provider;
-                let mut ws = (from..sync_block_number)
-                    .map(|n| src.block_witness(n))
-                    .collect::<Result<Vec<_>, String>>()
-                    .map_err(|e| format!("witness_source: {e}"))?;
-                ws.push(self.endpoint_witness(l2_provider.as_ref(), sync_block)?);
-                ws
+                // Witness generation is a CPU-heavy trie walk / re-exec. Run it on
+                // the blocking pool so it can't stall async worker threads on the
+                // settlement path. (Store hits are cheap; the rare store miss and
+                // the endpoint capture are the heavy parts.)
+                let src = Arc::clone(src);
+                let l2_provider = Arc::clone(
+                    &self
+                        .inner
+                        .rollups
+                        .get(&rollup_id)
+                        .ok_or_else(|| format!("unknown rollup_id {rollup_id}"))?
+                        .l2_provider,
+                );
+                let evm_config = self.inner.evm_config.clone();
+                let endpoint = sync_block.clone();
+                tokio::task::spawn_blocking(move || -> Result<Vec<BlockWitness>, String> {
+                    let mut ws = (from..sync_block_number)
+                        .map(|n| src.block_witness(n))
+                        .collect::<Result<Vec<_>, String>>()
+                        .map_err(|e| format!("witness_source: {e}"))?;
+                    // Endpoint (the just-built, uncommitted Sync block) is captured
+                    // in-memory — no store or provider can serve an uncommitted block.
+                    ws.push(
+                        block_witness(
+                            l2_provider.as_ref(),
+                            &evm_config,
+                            &endpoint,
+                            ExecutionWitnessMode::Legacy,
+                        )
+                        .map_err(|e| {
+                            format!(
+                                "endpoint witness (block {}): {e}",
+                                endpoint.header().number()
+                            )
+                        })?,
+                    );
+                    Ok(ws)
+                })
+                .await
+                .map_err(|e| format!("witness spawn_blocking join: {e}"))??
             }
             // Mock mode: the mock prover ignores per-block witnesses.
             None => Vec::new(),
