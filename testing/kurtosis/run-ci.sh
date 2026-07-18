@@ -84,4 +84,7 @@ echo "==> production path ready: bundle inclusion observed"
 
 bash "$HERE/scripts/verify-production-path.sh"
 
+# Run one protocol scenario through the same live production path.
+bash "$HERE/scripts/run-protocol-e2e.sh"
+
 echo "production-path CI PASS"

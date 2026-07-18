@@ -34,7 +34,7 @@ jobs:
         run: |
           echo "deb [trusted=yes] https://sdk.kurtosis.com/kurtosis-cli-release-artifacts/ /" | sudo tee /etc/apt/sources.list.d/kurtosis.list
           sudo apt-get update
-          sudo apt-get install -y kurtosis-cli jq openssl
+          sudo apt-get install -y kurtosis-cli bc jq openssl
           kurtosis engine start
       - name: Run Enclave
         run: bash testing/kurtosis/run-ci.sh

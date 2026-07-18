@@ -21,17 +21,27 @@ and observability services. Larger topologies belong in scheduled soak tests.
    each mode.
 6. Save a JSON result and service logs, then remove the enclave.
 
+The same enclave also runs the node-compatible protocol `counter` scenario as
+a network smoke test. The complete protocol scenario suite runs separately in
+Anvil mode.
+
 The workflow runs this package for relevant pull requests on a GitHub-hosted
 Ubuntu runner. It installs and starts Kurtosis, uploads
 `artifacts/production-path-ci`, and has a separate unconditional cleanup step.
 
 ## Run on a CI-equivalent host
 
-The host needs Docker, Kurtosis, Foundry, `jq`, `curl`, `openssl`, and the
+The host needs Docker, Kurtosis, Foundry, `bc`, `jq`, `curl`, `openssl`, and the
 initialized `sync-rollups-protocol` submodule.
 
 ```bash
 bash testing/kurtosis/run-ci.sh
+```
+
+Against an enclave that is already running:
+
+```bash
+bash testing/kurtosis/scripts/run-protocol-e2e.sh
 ```
 
 Useful overrides:
@@ -50,3 +60,5 @@ Useful overrides:
 - `start.sh` and `stop.sh`: local lifecycle helpers.
 - `scripts/verify-production-path.sh`: runs the wave harness in all three modes.
 - `scripts/cross-chain-wave.sh`: inbound, outbound, and mixed cross-chain workload.
+- `scripts/run-protocol-e2e.sh`: runs the pinned protocol scenario through the
+  composer fronts and applies the corrected legacy L2-table verifier.

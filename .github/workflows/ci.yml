@@ -75,6 +75,40 @@ jobs:
         working-directory: contracts
         run: forge build
 
+  protocol-anvil-e2e:
+    name: Protocol E2E Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out protocol E2E branch
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: eez-association/eez-core-protocol
+          ref: 44d70fd2e982319b73fe686542df71077ab5cf6b
+          path: protocol-e2e-next
+          persist-credentials: false
+          submodules: recursive
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
+      - name: Build protocol contracts
+        working-directory: protocol-e2e-next
+        run: forge build
+      - name: Run all protocol Anvil E2E scenarios
+        working-directory: protocol-e2e-next
+        env:
+          MAX_PARALLEL: 4
+        run: bash script/e2e/shared/run-all-parallel.sh
+      - name: Upload protocol E2E logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: protocol-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            protocol-e2e-next/tmp/e2e-parallel/*.log
+            protocol-e2e-next/tmp/e2e-failures/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
   embedded-e2e:
     name: Embedded E2E Tests
     runs-on: ubuntu-latest
