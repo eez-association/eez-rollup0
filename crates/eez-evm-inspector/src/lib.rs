@@ -31,7 +31,3 @@ pub use inspector::{
     new_overlay_channel,
 };
 pub use overlay::{OverlayError, apply_overlay_diff, clone_state};
-
-// Re-export protocol types so callers can `use eez_evm_inspector::*`
-// without reaching into the protocol crate for everyday composition needs.
-pub use eez_protocol::{ComposerError, ComposerResult, DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig};

@@ -150,7 +150,7 @@ pub fn build_batch(
                 // outer is always an entry-rollup originating call. The TARGET
                 // batch's "keep the outer so `executeIncomingCrossChainCall`
                 // forwards on arrival" case is handled separately by
-                // `build_inbound_target_batch` (see `composition.rs` has_incoming
+                // `build_l1_inbound_sidecar` (see `composition.rs` has_incoming
                 // short-circuit) — an incoming call is never top-level here.
                 let builder = EntryBuilder::new(call, *dialect);
                 entry_nested_number = 0;
@@ -646,7 +646,7 @@ pub fn build_l1_inbound_entry(
 ///
 /// One entry per INCOMING call in `calls` (`target_rollup_id == this`, source on
 /// another rollup). Every per-entry field is taken from the SAME recorded call
-/// the on-chain [`EntryBuilder`] uses (`target_rollup_id`, `source_rollup_id`,
+/// the on-chain `EntryBuilder` uses (`target_rollup_id`, `source_rollup_id`,
 /// addresses, value, data, return data) so the sidecar's `proxyEntryHash` binds
 /// the SAME cross-chain call as the on-chain entry; only `l2ToL1Calls` /
 /// `callCount` differ. The `build_inbound_system_txs` consumer reuses
@@ -1195,22 +1195,6 @@ impl EntryBuilder {
         }
     }
 
-    #[allow(dead_code, reason = "kept for future entry-builder reuse")]
-    fn append_call(&mut self, call: &ExecutedAction, call_number: u64) {
-        let success = call.outcome.is_success();
-        let return_data: &[u8] = call.outcome.return_data().unwrap_or(&[]);
-        self.rolling.call_begin(call_number);
-        self.rolling.call_end(call_number, success, return_data);
-        self.l2_to_l1_calls.push(L2ToL1CallSol {
-            targetAddress: call.target_address,
-            value: call.value,
-            data: call.data.clone(),
-            sourceAddress: call.source_address,
-            sourceRollupId: U256::from(call.source_rollup_id.0),
-            revertSpan: U256::from(call.revert_span.unwrap_or(0)),
-        });
-    }
-
     fn append_nested(&mut self, call: &ExecutedAction, nested_number: u64) {
         let hash = cross_chain_call_hash(
             call.target_rollup_id,
@@ -1247,52 +1231,6 @@ impl EntryBuilder {
             returnData: self.return_data,
             rollingHash: B256::from(self.rolling.current()),
         }
-    }
-}
-
-/// Build a top-level `LookupCallSol` for a NestedFailed / Static call.
-///
-/// NOTE (5c51e02 redesign, D3): upstream moved NESTED lookups INTO the entry
-/// (`expectedLookups`, keyed by execution-context cursors) — a top-level
-/// `LookupCallSol` in `l1ToL2lookupCalls` is now ONLY for genuinely top-level
-/// lookups. Emitting a nested failed/static call here would mis-consume on the
-/// new contract. The `build_batch` D3 guard refuses such compositions before
-/// they reach this, so this builder is currently exercised by unit tests only;
-/// the entry-scoped emission is the deferred feature. The cursor key
-/// (`callNumber`/`lastNestedActionConsumed`) is gone — top-level match is by
-/// hash + (empty) state-root pins.
-#[allow(
-    dead_code,
-    reason = "D3: the build_batch caller is gated off until \
-    entry-scoped lookup emission is built; kept as that builder's basis + the \
-    unit-test target"
-)]
-fn lookup_call_sol(call: &ExecutedAction, failed: bool) -> LookupCallSol {
-    let hash = cross_chain_call_hash(
-        call.target_rollup_id,
-        call.target_address,
-        call.value,
-        &call.data,
-        call.source_address,
-        call.source_rollup_id,
-    );
-    let return_data: Bytes = call
-        .outcome
-        .return_data()
-        .map(<[u8]>::to_vec)
-        .unwrap_or_default()
-        .into();
-    LookupCallSol {
-        crossChainCallHash: hash,
-        destinationRollupId: U256::from(call.target_rollup_id.0),
-        returnData: return_data,
-        failed,
-        l2ToL1Calls: Vec::new(),
-        expectedL1ToL2Calls: Vec::new(),
-        expectedLookups: Vec::new(),
-        callCount: U256::ZERO,
-        rollingHash: B256::ZERO,
-        expectedStateRoots: Vec::new(),
     }
 }
 
@@ -1560,8 +1498,8 @@ mod tests {
         };
         let batch = build_batch(&[], &attr, &ChainDialect::EvmL1Style, RollupId(1), &[])
             .expect("build_batch ok");
-        assert!(batch.entries().is_empty());
-        assert!(batch.lookup_calls().is_empty());
+        assert!(batch.inner.entries.is_empty());
+        assert!(batch.inner.l1ToL2lookupCalls.is_empty());
         assert!(batch.is_empty());
     }
 
@@ -1582,19 +1520,19 @@ mod tests {
         let calls = vec![record(RollupId(1), RollupId(0), true)];
         let batch = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[])
             .expect("build_batch ok");
-        assert_eq!(batch.entries().len(), 1);
+        assert_eq!(batch.inner.entries.len(), 1);
         // The TopLevel call is described by the entry's
         // `proxyEntryHash` + `returnData`; reentrant children land
         // in `l2ToL1Calls`. No children here, so both arrays empty.
-        assert!(batch.entries()[0].l2ToL1Calls.is_empty());
+        assert!(batch.inner.entries[0].l2ToL1Calls.is_empty());
         // origin/main: the outer is omitted → callCount stays 0.
-        assert_eq!(batch.entries()[0].callCount, U256::ZERO);
-        assert!(batch.entries()[0].expectedL1ToL2Calls.is_empty());
-        assert!(batch.lookup_calls().is_empty());
-        assert_ne!(batch.entries()[0].proxyEntryHash, B256::ZERO);
-        assert_eq!(batch.entries()[0].rollingHash, B256::ZERO);
+        assert_eq!(batch.inner.entries[0].callCount, U256::ZERO);
+        assert!(batch.inner.entries[0].expectedL1ToL2Calls.is_empty());
+        assert!(batch.inner.l1ToL2lookupCalls.is_empty());
+        assert_ne!(batch.inner.entries[0].proxyEntryHash, B256::ZERO);
+        assert_eq!(batch.inner.entries[0].rollingHash, B256::ZERO);
         assert_eq!(
-            batch.entries()[0].destinationRollupId,
+            batch.inner.entries[0].destinationRollupId,
             U256::from(1),
             "destinationRollupId is the target chain of the outer call",
         );
@@ -1612,14 +1550,14 @@ mod tests {
         let calls = vec![record(RollupId(0), RollupId(1), true)];
         let batch = build_l1_postbatch(&calls, RollupId(1));
 
-        assert_eq!(batch.entries().len(), 1);
+        assert_eq!(batch.inner.entries.len(), 1);
         assert_eq!(
-            batch.transient_execution_entry_count(),
+            batch.inner.transientExecutionEntryCount,
             U256::from(1),
             "immediate: transientExecutionEntryCount covers the entry",
         );
 
-        let e = &batch.entries()[0];
+        let e = &batch.inner.entries[0];
         // Immediate/system-driven → proxyEntryHash == 0 (the L2 DEFERRED mirror
         // carries the non-zero call hash instead — see single_top_level above).
         assert_eq!(e.proxyEntryHash, B256::ZERO);
@@ -1907,8 +1845,8 @@ mod tests {
         let calls = vec![record(RollupId(1), RollupId(0), true)];
         let batch = build_batch(&calls, &attr, &ChainDialect::EvmL2Style, RollupId(1), &[])
             .expect("build_batch ok");
-        assert!(batch.entries().is_empty());
-        assert!(batch.lookup_calls().is_empty());
+        assert!(batch.inner.entries.is_empty());
+        assert!(batch.inner.l1ToL2lookupCalls.is_empty());
     }
 
     #[test]
@@ -1924,13 +1862,13 @@ mod tests {
         ];
         let batch = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[])
             .expect("build_batch ok");
-        assert_eq!(batch.entries().len(), 1);
+        assert_eq!(batch.inner.entries.len(), 1);
         assert_eq!(
-            batch.entries()[0].expectedL1ToL2Calls.len(),
+            batch.inner.entries[0].expectedL1ToL2Calls.len(),
             1,
             "nested-success child must land in expectedL1ToL2Calls",
         );
-        assert!(batch.lookup_calls().is_empty());
+        assert!(batch.inner.l1ToL2lookupCalls.is_empty());
     }
 
     #[test]
@@ -1957,28 +1895,13 @@ mod tests {
     }
 
     #[test]
-    fn lookup_call_sol_shape_is_top_level_5c51e02() {
-        // The builder itself (now exercised only by this test per D3) emits the
-        // new top-level LookupCall shape: hash-keyed, empty pins, degenerate
-        // reverted-lookup mini-entry.
-        let c = record(RollupId(0), RollupId(1), false);
-        let l = lookup_call_sol(&c, true);
-        assert!(l.failed);
-        assert!(l.expectedStateRoots.is_empty());
-        assert!(l.l2ToL1Calls.is_empty() && l.expectedL1ToL2Calls.is_empty());
-        assert!(l.expectedLookups.is_empty());
-        assert_eq!(l.callCount, U256::ZERO);
-        assert_eq!(l.rollingHash, B256::ZERO);
-    }
-
-    #[test]
     fn build_l1_postbatch_skips_reverted_calls() {
         // Review fix (2nd adaptation review): a reverted top-level L2→L1 call
         // produces NO executing L1 entry — symmetric with build_batch's empty
         // return, so an outbound failure settles nothing inconsistent.
         let ok = build_l1_postbatch(&[record(RollupId(0), RollupId(1), true)], RollupId(1));
         assert_eq!(
-            ok.entries().len(),
+            ok.inner.entries.len(),
             1,
             "successful L2→L1 call → one immediate entry"
         );
@@ -1998,7 +1921,7 @@ mod tests {
             RollupId(1),
         );
         assert_eq!(
-            mixed.entries().len(),
+            mixed.inner.entries.len(),
             1,
             "mixed batch keeps only the successful entry"
         );

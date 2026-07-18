@@ -18,7 +18,7 @@
 //!    `crossProofSystemInteractions` from the plan. For Phase 09
 //!    blobs/callData stay empty (`blobIndices = []`, `callData = b""`,
 //!    `crossProofSystemInteractions = bytes32(0)`).
-//! 4. **publicInputsHash[k] construction** — call
+//! 4. **publicInputsHash\[k\] construction** — call
 //!    [`all_per_ps_hashes`] (§C) to compute one digest per PS.
 //! 5. **Per-PS signature** — for the single ECDSA proof system in this
 //!    phase, sign every per-PS digest with the configured
@@ -387,9 +387,13 @@ where
         populate_proof_carriers(&mut batch, &plan);
 
         // 4. Compute per-PS publicInputsHash[k].
-        let entry_hashes: Vec<B256> = batch.entries().iter().map(entry_hash).collect();
-        let lookup_call_hashes: Vec<B256> =
-            batch.lookup_calls().iter().map(lookup_call_hash).collect();
+        let entry_hashes: Vec<B256> = batch.inner.entries.iter().map(entry_hash).collect();
+        let lookup_call_hashes: Vec<B256> = batch
+            .inner
+            .l1ToL2lookupCalls
+            .iter()
+            .map(lookup_call_hash)
+            .collect();
         // Phase 09: no blob carriers in the smoke payload. The
         // shared-hash construction folds an empty blob-hashes array
         // here; matches the on-chain `blobhash(blobIndices[i])` walk
@@ -401,7 +405,7 @@ where
             &entry_hashes,
             &lookup_call_hashes,
             &blob_hashes,
-            batch.call_data(),
+            &batch.inner.callData,
         )
         .map_err(PostBatchError::PlanInvariants)?;
 
@@ -498,14 +502,14 @@ where
 /// batch sail past the resolver into a confusing registry-miss).
 fn extract_touched_rollups(batch: &EvmBatch) -> Result<BTreeSet<RollupId>, PostBatchError> {
     let mut touched = BTreeSet::new();
-    for entry in batch.entries() {
+    for entry in &batch.inner.entries {
         // `destinationRollupId` is the routing target; always present.
         touched.insert(RollupId(u256_to_u64_checked(entry.destinationRollupId)?));
         for delta in &entry.stateDeltas {
             touched.insert(RollupId(u256_to_u64_checked(delta.rollupId)?));
         }
     }
-    for lookup in batch.lookup_calls() {
+    for lookup in &batch.inner.l1ToL2lookupCalls {
         touched.insert(RollupId(u256_to_u64_checked(lookup.destinationRollupId)?));
     }
     Ok(touched)

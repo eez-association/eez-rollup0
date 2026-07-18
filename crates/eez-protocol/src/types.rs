@@ -221,7 +221,7 @@ pub struct TargetComposition {
     pub execute_payload: Vec<u8>,
 }
 
-/// Output of [`compose_transaction`](crate::compose_transaction) —
+/// Output of [`CompositionBuilder::finalize`](crate::CompositionBuilder::finalize) —
 /// everything needed for all chains.
 ///
 /// Symmetric: the source side and every target side both carry entries

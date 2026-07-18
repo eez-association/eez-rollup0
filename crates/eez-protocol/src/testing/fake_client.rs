@@ -6,8 +6,6 @@
 //! - [`with_session_outcomes`](FakeChainClient::with_session_outcomes)
 //!   — the queue of `ExecutionOutcome`s the spawned session returns,
 //!   one per call.
-//! - [`with_simulate_transactions_results`](FakeChainClient::with_simulate_transactions_results)
-//!   — CCM-verify batch results, one per call.
 //! - [`with_simulate_source_hook`](FakeChainClient::with_simulate_source_hook)
 //!   — the closure that drives `simulate_source_tx` (entry-only).
 //! - [`with_stored_root`](FakeChainClient::with_stored_root) — seed one
@@ -20,8 +18,6 @@
 //!
 //! - [`dispatched_outcomes`](FakeChainClient::dispatched_outcomes) —
 //!   one entry per `session.execute` call.
-//! - [`simulated_batches`](FakeChainClient::simulated_batches) — one
-//!   entry per `simulate_transactions` call.
 //!
 //! # Default behavior
 //!
@@ -38,8 +34,7 @@ use crate::checkpoint::ExecutionCheckpoint;
 use crate::composition::CompositionBuilder;
 use crate::error::{ExecutorError, ExecutorErrorKind, ExecutorResult};
 use crate::executor::{
-    ChainClient, EntryChainClient, ExecutionRequest, ExecutionResponse, TargetBatchSimulation,
-    TargetExecutionSession, TargetTransaction,
+    ChainClient, EntryChainClient, ExecutionRequest, ExecutionResponse, TargetExecutionSession,
 };
 use crate::rollup_id::RollupId;
 use crate::types::ExecutionOutcome;
@@ -78,12 +73,8 @@ pub struct FakeChainClient {
     checkpoint_factory: Arc<Mutex<Option<CheckpointFactory>>>,
 
     // Client-only scripted queues.
-    simulate_transactions_results: Mutex<VecDeque<ExecutorResult<TargetBatchSimulation>>>,
     simulate_source_hook: Mutex<Option<SimulateSourceHook>>,
     stored_roots: Mutex<HashMap<RollupId, [u8; 32]>>,
-
-    // Client-side recorders.
-    simulated_batches: Mutex<Vec<Vec<TargetTransaction>>>,
 }
 
 impl std::fmt::Debug for FakeChainClient {
@@ -115,10 +106,8 @@ impl FakeChainClient {
             session_outcomes: Arc::new(Mutex::new(VecDeque::new())),
             dispatched_outcomes: Arc::new(Mutex::new(Vec::new())),
             checkpoint_factory: Arc::new(Mutex::new(None)),
-            simulate_transactions_results: Mutex::new(VecDeque::new()),
             simulate_source_hook: Mutex::new(None),
             stored_roots: Mutex::new(HashMap::new()),
-            simulated_batches: Mutex::new(Vec::new()),
         }
     }
 
@@ -130,21 +119,6 @@ impl FakeChainClient {
     ) -> Self {
         *self.session_outcomes.lock().expect("fake mutex poisoned") =
             outcomes.into_iter().collect();
-        self
-    }
-
-    /// Seed the `simulate_transactions` result queue.
-    #[must_use]
-    pub fn with_simulate_transactions_results<
-        I: IntoIterator<Item = ExecutorResult<TargetBatchSimulation>>,
-    >(
-        self,
-        results: I,
-    ) -> Self {
-        *self
-            .simulate_transactions_results
-            .lock()
-            .expect("fake mutex poisoned") = results.into_iter().collect();
         self
     }
 
@@ -194,15 +168,6 @@ impl FakeChainClient {
             .clone()
     }
 
-    /// Snapshot of batches passed to `simulate_transactions`.
-    #[must_use]
-    pub fn simulated_batches(&self) -> Vec<Vec<TargetTransaction>> {
-        self.simulated_batches
-            .lock()
-            .expect("fake mutex poisoned")
-            .clone()
-    }
-
     fn unavailable(&self, what: &str) -> ExecutorError {
         ExecutorError::from(ExecutorErrorKind::Unavailable(format!(
             "FakeChainClient({:?}, rollup_id={}): {} not scripted",
@@ -234,21 +199,6 @@ impl ChainClient for FakeChainClient {
             checkpoint_factory: Arc::clone(&self.checkpoint_factory),
             rollup_id: self.rollup_id,
         }))
-    }
-
-    async fn simulate_transactions(
-        &self,
-        txs: &[TargetTransaction],
-    ) -> ExecutorResult<TargetBatchSimulation> {
-        self.simulated_batches
-            .lock()
-            .expect("fake mutex poisoned")
-            .push(txs.to_vec());
-        self.simulate_transactions_results
-            .lock()
-            .expect("fake mutex poisoned")
-            .pop_front()
-            .unwrap_or_else(|| Err(self.unavailable("simulate_transactions")))
     }
 
     async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
@@ -394,8 +344,7 @@ mod tests {
     //! correctly and the recorder surfaces what the session saw.
 
     use super::*;
-    use crate::compose::compose_transaction;
-    use crate::composer::{DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig, TargetConfig};
+    use crate::composer::{ProxyLookupConfig, TargetConfig};
     use crate::composition::Rollup;
     use crate::dialect::ChainDialect;
     use crate::overlay::EvmOverlay;
@@ -413,14 +362,10 @@ mod tests {
 
     fn target_cfg() -> TargetConfig {
         TargetConfig {
-            ccm_address: Address::ZERO,
-            system_address: Address::ZERO,
-            ccm_gas_limit: DEFAULT_CCM_GAS_LIMIT,
             proxy_lookup: ProxyLookupConfig {
                 contract_address: Address::ZERO,
                 authorized_proxies_slot: 0,
             },
-            settles_via_session_root: false,
             dialect: ChainDialect::EvmL2Style,
         }
     }
@@ -432,8 +377,7 @@ mod tests {
 
         // Follower fake: session returns one outcome. The entry→target
         // call is INCOMING from the target's perspective, so finalize
-        // takes the inbound DA-sidecar branch — no CCM-verify
-        // `simulate_transactions` runs for this shape.
+        // takes the inbound DA-sidecar branch.
         let follower_post = [0x22; 32];
         let follower = Arc::new(
             FakeChainClient::new_follower(target_id)
@@ -505,24 +449,25 @@ mod tests {
             },
         );
 
-        let composition = compose_transaction(entry.as_ref(), &[], entry_id, rollups)
+        let mut builder = CompositionBuilder::new(entry_id, rollups);
+        entry
+            .simulate_source_tx(Vec::new(), &mut builder)
             .await
-            .expect("compose");
+            .expect("source sim");
+        let composition = builder.finalize(&[]).await.expect("finalize");
 
         // Entry batch carries the top-level call as one deferred entry.
-        assert_eq!(composition.source.batch.entries().len(), 1);
+        assert_eq!(composition.source.batch.inner.entries.len(), 1);
 
         // The target composition carries the inbound DA-sidecar entry.
         assert_eq!(composition.targets.len(), 1);
         assert_eq!(composition.targets[0].rollup_id, target_id);
-        assert_eq!(composition.targets[0].batch.entries().len(), 1);
+        assert_eq!(composition.targets[0].batch.inner.entries.len(), 1);
 
-        // Follower saw exactly one dispatched outcome; the inbound
-        // sidecar branch never calls `simulate_transactions`.
+        // Follower saw exactly one dispatched outcome.
         let seen = follower_recorder.dispatched_outcomes();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].post_state_root(), Some(&follower_post));
-        assert!(follower_recorder.simulated_batches().is_empty());
     }
 
     #[tokio::test]

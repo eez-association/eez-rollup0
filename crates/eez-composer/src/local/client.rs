@@ -32,12 +32,11 @@ use reth_storage_api::{BlockNumReader, HeaderProvider, StateProvider, StateProvi
 use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
 use eez_protocol::{
     ChainClient, CommittedRootReader, CompositionBuilder, EntryChainClient, ExecutorError,
-    ExecutorErrorKind, ExecutorResult, ProxyLookupConfig, RollupId, TargetBatchSimulation,
-    TargetExecutionSession, TargetTransaction,
+    ExecutorErrorKind, ExecutorResult, ProxyLookupConfig, RollupId, TargetExecutionSession,
 };
 
 use super::provider::{ChainProvider, HeaderReader};
-use super::session::{LocalExecutionSession, simulate_local_transactions};
+use super::session::LocalExecutionSession;
 
 /// Discriminates how this client operates within the composition.
 ///
@@ -333,13 +332,6 @@ where
             self.overlay_channel.clone(),
         )?;
         Ok(Box::new(session))
-    }
-
-    async fn simulate_transactions(
-        &self,
-        txs: &[TargetTransaction],
-    ) -> ExecutorResult<TargetBatchSimulation> {
-        simulate_local_transactions(&self.provider, txs)
     }
 
     /// Read the latest block header's `stateRoot` from this chain's

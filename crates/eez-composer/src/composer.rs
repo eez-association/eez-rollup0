@@ -289,10 +289,10 @@ struct Inner<L2: BlockReader> {
     /// per-Sync-slot block via reth-evm `BlockBuilder`.
     evm_config: EthEvmConfig,
     /// Cross-chain composer: per-tx `simulate_and_resolve` orchestrator
-    /// generic over `EvmProtocol`. `None` when L1 isn't wired (e.g.
+    /// `None` when L1 isn't wired (e.g.
     /// standalone / follower modes). When `Some`, `compose_sync_slot`
     /// dispatches each held tx through it to get the
-    /// `Composition<EvmProtocol>` (L2 destination effects + L1
+    /// `Composition` (L2 destination effects + L1
     /// `ExecutionEntry`s).
     evm_composer: Option<eez_protocol::Composer>,
     /// Runtime context (signer + L2 chain config) for wrapping the
@@ -1282,7 +1282,7 @@ where
                         let l1_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = composition
                             .targets
                             .iter()
-                            .flat_map(|t| t.batch.entries().iter().cloned())
+                            .flat_map(|t| t.batch.inner.entries.iter().cloned())
                             .collect();
                         if l1_entries.is_empty() {
                             event!(
@@ -1397,7 +1397,7 @@ where
                     let target_entries: Vec<_> = composition
                         .targets
                         .iter()
-                        .flat_map(|t| t.batch.entries().iter().cloned())
+                        .flat_map(|t| t.batch.inner.entries.iter().cloned())
                         .collect();
                     let target_count = target_entries.len();
                     pending_in.extend(target_entries);
@@ -1687,7 +1687,7 @@ where
         };
         let total_entries: usize = comp_refs
             .iter()
-            .map(|c| c.source.batch.entries().len())
+            .map(|c| c.source.batch.inner.entries.len())
             .sum();
 
         // ── Dispatch: rich bundle [postBatch, ...survivors], commit. ──
@@ -1925,7 +1925,7 @@ where
             for c in &compositions[1..] {
                 b.inner
                     .entries
-                    .extend(c.source.batch.entries().iter().cloned());
+                    .extend(c.source.batch.inner.entries.iter().cloned());
                 b.inner
                     .l1ToL2lookupCalls
                     .extend(c.source.batch.inner.l1ToL2lookupCalls.iter().cloned());
@@ -1999,7 +1999,7 @@ where
         let inbound_ether: HashMap<B256, alloy_primitives::I256> = compositions
             .iter()
             .flat_map(|c| c.targets.iter())
-            .flat_map(|t| t.batch.entries().iter())
+            .flat_map(|t| t.batch.inner.entries.iter())
             .filter_map(|e| {
                 let v = e.l2ToL1Calls.first()?.value;
                 if v.is_zero() {
@@ -2274,7 +2274,7 @@ where
                 compositions
                     .iter()
                     .flat_map(|c| c.targets.iter())
-                    .flat_map(|t| t.batch.entries().iter())
+                    .flat_map(|t| t.batch.inner.entries.iter())
                     .map(eez_protocol::abi::ExecutionEntrySol::abi_encode),
             )
             .collect();

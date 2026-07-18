@@ -3,13 +3,10 @@
 //! [`LocalExecutionSession`] accumulates target-chain state across
 //! calls within one source transaction. It drives a direct call to the
 //! destination contract with the proxy address as `msg.sender`
-//! (CREATE2-derived); CCM verification happens in a separate batch
-//! simulation coordinated by [`crate::composer::local::LocalChainClient`].
+//! (CREATE2-derived).
 //!
-//! Also hosts [`simulate_local_transactions`] — the CCM-verify batch
-//! simulator on a fresh state — and the reth helpers
-//! ([`open_chain_state`], [`disable_checks`], [`compute_state_root`])
-//! shared between the two paths.
+//! Also hosts the reth helpers
+//! ([`disable_checks`], [`compute_state_root`]).
 
 use alloy_primitives::{Address, B256, Bytes, U256};
 
@@ -24,7 +21,7 @@ use revm::database::CacheState;
 
 use eez_protocol::{
     CompositionBuilder, ExecutionRequest, ExecutionResponse, ExecutorError, ExecutorErrorKind,
-    ExecutorResult, RollupId, TargetBatchSimulation, TargetExecutionSession, TargetTransaction,
+    ExecutorResult, RollupId, TargetExecutionSession,
 };
 
 use super::provider::ChainProvider;
@@ -37,7 +34,7 @@ pub(super) const DIRECT_CALL_GAS_LIMIT: u64 = 30_000_000;
 ///
 /// Opened by `LocalChainClient::begin_execution_session` (the
 /// `ChainClient` trait method, not an inherent fn); owned by the
-/// `CompositionBuilder` through a `Rollup<P>.session` slot for the
+/// `CompositionBuilder` through a `Rollup.session` slot for the
 /// lifetime of one composition.
 ///
 /// ## Limitation: direct call, not full CCM path
@@ -45,10 +42,7 @@ pub(super) const DIRECT_CALL_GAS_LIMIT: u64 = 30_000_000;
 /// The session calls the destination contract directly with the proxy
 /// address as `msg.sender` (computed via CREATE2). This gives the
 /// source simulation synchronous return data, but it does not reproduce
-/// the full `executeIncomingCrossChainCall` path. The composer later
-/// runs a separate CCM batch simulation (via
-/// [`TargetBatchSimulation`]) and patches the terminal source-entry
-/// `newState` with that final root.
+/// the full `executeIncomingCrossChainCall` path.
 pub struct LocalExecutionSession {
     evm_config: EthEvmConfig,
     state: State<StateProviderDatabase<reth_storage_api::StateProviderBox>>,
@@ -477,102 +471,6 @@ impl TargetExecutionSession for LocalExecutionSession {
             witness: None,
         })
     }
-}
-
-/// Batch-simulate CCM-verify transactions (`loadExecutionTable` +
-/// `executeIncomingCrossChainCall`) on a fresh target state.
-pub(super) fn simulate_local_transactions(
-    target: &ChainProvider,
-    txs: &[TargetTransaction],
-) -> ExecutorResult<TargetBatchSimulation> {
-    tracing::debug!(batch_size = txs.len(), "simulating target tx batch");
-    if txs.is_empty() {
-        return Err(ExecutorErrorKind::EmptyBatch.into());
-    }
-    let (_target_header, target_state, mut evm_env) = open_chain_state(target)?;
-    disable_checks(&mut evm_env);
-
-    let db = StateProviderDatabase::new(target_state.as_ref() as &dyn StateProvider);
-    let mut state = State::builder()
-        .with_database(db)
-        .with_bundle_update()
-        .build();
-    let chain_id = evm_env.cfg_env.chain_id;
-
-    let mut per_tx_roots: Vec<[u8; 32]> = Vec::with_capacity(txs.len());
-
-    for (index, tx) in txs.iter().enumerate() {
-        let tx_env = revm::context::TxEnv {
-            caller: tx.caller,
-            gas_limit: tx.gas_limit,
-            kind: alloy_primitives::TxKind::Call(tx.destination),
-            data: tx.calldata.clone(),
-            value: tx.value,
-            chain_id: Some(chain_id),
-            ..Default::default()
-        };
-
-        let mut evm = target.evm_config.evm_with_env(&mut state, evm_env.clone());
-        let result = evm.transact(tx_env).map_err(evm_err)?;
-        if !result.result.is_success() {
-            let return_data = result
-                .result
-                .output()
-                .map(|bytes| bytes.to_vec())
-                .unwrap_or_default();
-            return Err(ExecutorErrorKind::TargetTransactionReverted { index, return_data }.into());
-        }
-
-        tracing::trace!(
-            tx = index,
-            gas = result.result.tx_gas_used(),
-            "target batch tx simulated"
-        );
-        state.commit(result.state);
-
-        // Capture cumulative post-state root after this tx. revm's
-        // `merge_transitions` is idempotent under an empty pending
-        // queue (no-op) and folds this commit's changes into the bundle
-        // on first call; the resulting hashed post-state covers every
-        // tx committed so far. See `states/state.rs::merge_transitions`
-        // in revm-database.
-        let root = compute_state_root(&mut state, target_state.as_ref() as &dyn StateProvider)?;
-        per_tx_roots.push(root.0);
-    }
-
-    // `per_tx_roots` is non-empty here: we returned early on `txs.is_empty`
-    // and every successful tx pushes exactly one root.
-    let final_state_root = *per_tx_roots
-        .last()
-        .expect("per_tx_roots is non-empty after the non-empty-batch guard above");
-
-    tracing::debug!(
-        final_state_root = ?final_state_root,
-        txs = txs.len(),
-        "target batch simulation complete");
-
-    Ok(TargetBatchSimulation {
-        final_state_root,
-        per_tx_roots,
-    })
-}
-
-pub(super) fn open_chain_state(
-    chain: &ChainProvider,
-) -> ExecutorResult<(
-    alloy_consensus::Header,
-    reth_storage_api::StateProviderBox,
-    reth_evm::EvmEnvFor<EthEvmConfig>,
-)> {
-    let num = chain.provider.best_block_number().map_err(provider_err)?;
-    let header = chain
-        .headers
-        .header_by_number(num)
-        .map_err(provider_err)?
-        .ok_or_else(|| ExecutorError::provider("no header"))?;
-    let state = chain.provider.latest().map_err(provider_err)?;
-    let evm_env = chain.evm_config.evm_env(&header).map_err(evm_err)?;
-    Ok((header, state, evm_env))
 }
 
 /// Restore the caller's nonce in `changes` to its pre-tx (`original_info`)

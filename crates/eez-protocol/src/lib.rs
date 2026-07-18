@@ -33,9 +33,9 @@
 //!
 //! # Where to start reading
 //!
-//! - [`compose_transaction`] runs one cross-chain composition
-//!   end-to-end; [`Composer`] is its long-lived, client-caching
-//!   counterpart.
+//! - [`Composer::simulate_and_resolve`] runs one cross-chain
+//!   composition end-to-end over the long-lived, client-caching
+//!   [`Composer`].
 //! - For the ABI boundary, [`entries::build_batch`] walks the preorder
 //!   `recorded[..]` slice and materializes an [`EvmBatch`]; the
 //!   per-dialect encoders (`encode_postbatch` / `encode_load_table`)
@@ -48,7 +48,6 @@ pub mod addresses;
 pub mod authorized_proxies;
 pub mod batch;
 pub mod checkpoint;
-pub mod compose;
 pub mod composer;
 pub mod composition;
 pub mod dialect;
@@ -91,12 +90,7 @@ pub use batch::EvmBatch;
 #[doc(inline)]
 pub use checkpoint::ExecutionCheckpoint;
 #[doc(inline)]
-pub use compose::{compose_transaction, compose_transaction_recorded};
-#[doc(inline)]
-pub use composer::{
-    Composer, ComposerBuilder, DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig, SourceAttribution,
-    TargetConfig,
-};
+pub use composer::{Composer, ComposerBuilder, ProxyLookupConfig, SourceAttribution, TargetConfig};
 #[doc(inline)]
 pub use composition::{CompositionBuilder, Rollup};
 #[doc(inline)]
@@ -110,8 +104,7 @@ pub use error::{
 #[doc(inline)]
 pub use executor::{
     ChainClient, CommittedRootReader, EntryChainClient, ExecutionRequest, ExecutionResponse,
-    SessionSnapshot, TargetBatchSimulation, TargetExecutionSession, TargetTransaction,
-    TargetVerificationContext,
+    SessionSnapshot, TargetExecutionSession,
 };
 #[doc(inline)]
 pub use overlay::{

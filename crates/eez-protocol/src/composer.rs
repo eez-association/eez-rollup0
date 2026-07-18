@@ -1,9 +1,8 @@
 //! Long-lived cross-chain composer.
 //!
-//! [`Composer`] is the stateful counterpart of
-//! [`compose_transaction`](crate::compose::compose_transaction):
-//! same orchestration, but holds the entry and follower
-//! clients for reuse across many source transactions.
+//! [`Composer`] holds the entry and follower
+//! clients for reuse across many source transactions and runs one
+//! [`CompositionBuilder`] pass per source tx.
 //!
 //! # Lifecycle
 //!
@@ -37,21 +36,14 @@ use std::sync::Arc;
 
 use alloy_primitives::Address;
 
-use crate::compose::compose_transaction_recorded;
-use crate::composition::Rollup;
+use crate::composition::{CompositionBuilder, Rollup};
 use crate::dialect::ChainDialect;
 use crate::error::{ComposerError, ComposerErrorKind, ComposerResult};
-use crate::executor::{
-    ChainClient, CommittedRootReader, EntryChainClient, TargetVerificationContext,
-};
+use crate::executor::{ChainClient, CommittedRootReader, EntryChainClient};
 use crate::rollup_id::RollupId;
 use crate::types::{Composition, ExecutedAction};
 
 // ── Config ───────────────────────────────────────────────────────
-
-/// Default gas limit for CCM-verification system txs. Generous so
-/// worst-case CCM execute paths on dev chains succeed.
-pub const DEFAULT_CCM_GAS_LIMIT: u64 = 30_000_000;
 
 /// Combined proxy-lookup configuration for a registered rollup.
 ///
@@ -80,42 +72,19 @@ pub struct ProxyLookupConfig {
 
 /// Per-rollup static configuration.
 ///
-/// Holds CCM contract address, system address, gas limit, and proxy
-/// lookup for one rollup (entry or follower). Passed to
+/// Holds the proxy lookup and ABI dialect for one rollup (entry or
+/// follower). Passed to
 /// [`ComposerBuilder::entry`] / [`ComposerBuilder::rollup`] alongside
 /// the client.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetConfig {
-    /// Address of the CCM entrypoint on this chain.
-    pub ccm_address: Address,
-    /// System address authorized to call CCM on this chain.
-    pub system_address: Address,
-    /// Gas limit for each of the two CCM-verification system txs.
-    /// Default: [`DEFAULT_CCM_GAS_LIMIT`].
-    pub ccm_gas_limit: u64,
     /// Proxy-lookup configuration for this rollup.
     pub proxy_lookup: ProxyLookupConfig,
-    /// ABI dialect: selects entry-encoding and CCM-verify
+    /// ABI dialect: selects entry-encoding and
     /// batch shape (L1-style vs L2-style).
     /// Default = `EvmL2Style`
     /// (preserves byte-identity for the existing 12 L1→L2 fixtures).
     pub dialect: ChainDialect,
-    /// Settlement policy: when `true`, this target's post-state root is
-    /// the root its own target execution session already
-    /// produced (the real, sealed root reported back over the wire),
-    /// so [`CompositionBuilder::finalize`](crate::composition::CompositionBuilder::finalize)
-    /// SKIPS the CCM-verify `simulate_transactions` pass and keeps the
-    /// recorded `post_state_root`. Intended for a remote target whose
-    /// client cannot serve `simulate_transactions` locally. No in-tree
-    /// client sets this today — the bidi-stream `RemoteL2Client` inbound
-    /// path was retired (inbound now settles as a prover-signed deferred
-    /// entry); retained for future remote targets.
-    /// `false` for in-process follower targets and the zk-poster
-    /// L1 target (the latter has its own skip path via
-    /// [`crate::dialect::ChainDialect::is_zk_poster`]).
-    /// Default `false` — preserves the existing outbound (L2→L1) and
-    /// L1→L2-fixture behaviour.
-    pub settles_via_session_root: bool,
 }
 
 /// Per-rollup attribution inputs for batch construction.
@@ -127,11 +96,9 @@ pub struct TargetConfig {
 /// - `initial_roots[rollup]` — the state root each rollup started at,
 ///   read from the entry chain once per
 ///   [`Composer::simulate_and_resolve`](Composer::simulate_and_resolve).
-/// - `per_tx_roots_by_rollup[rollup]` — cumulative post-state roots
-///   after each transaction in that rollup's CCM-verify batch
-///   (`loadExecutionTable` + `executeIncomingCrossChainCall`). Supplied
-///   by [`CompositionBuilder::finalize`](crate::composition::CompositionBuilder::finalize)
-///   from each per-rollup `simulate_transactions` return value.
+/// - `per_tx_roots_by_rollup[rollup]` — the post-state roots
+///   `finalize` attributed per rollup (zk-poster settlement root or
+///   inbound delivery root).
 ///
 /// References (no ownership) so the builder materializes each map once
 /// per composition and hands borrowed handles to the batch builder.
@@ -151,43 +118,7 @@ pub struct SourceAttribution<'a> {
     pub per_tx_roots_by_rollup: &'a HashMap<RollupId, Vec<[u8; 32]>>,
 }
 
-impl TargetConfig {
-    /// Project this config into a [`TargetVerificationContext`].
-    ///
-    /// `ccm_address` maps to `entrypoint_address` — just renamed per
-    /// context. This helper is the single authoritative rename site.
-    #[must_use]
-    pub fn verification_context(&self) -> TargetVerificationContext {
-        TargetVerificationContext {
-            system_address: self.system_address,
-            entrypoint_address: self.ccm_address,
-            gas_limit: self.ccm_gas_limit,
-        }
-    }
-}
-
 // ── Composer ─────────────────────────────────────────────────────
-
-struct EntryRegistration {
-    /// Defensive invariant: stored at registration so future debug
-    /// helpers can assert consistency with `ComposerInner.entry_rollup_id`.
-    #[allow(dead_code, reason = "invariant capture for future debug diagnostics")]
-    rollup_id: RollupId,
-    /// Held as `Arc<dyn EntryChainClient>` so the composer can call
-    /// `simulate_source_tx` without an Any-downcast. Also coerced to
-    /// `Arc<dyn ChainClient>` and inserted into the `rollups` map for
-    /// uniform dispatch.
-    client: Arc<dyn EntryChainClient + Send + Sync>,
-}
-
-struct RootReaderRegistration {
-    /// Held as `Arc<dyn CommittedRootReader>` so the composer can read
-    /// upstream's invariant-6 anchor roots in Phase 1 of
-    /// `simulate_and_resolve`. Implementations: a local L1 client
-    /// (entry-when-L1 or follower-when-L1-in-L2-as-entry) reading its
-    /// own `EEZ.sol` storage, or a gRPC client whose remote peer is L1.
-    client: Arc<dyn CommittedRootReader + Send + Sync>,
-}
 
 struct RegisteredRollup {
     client: Arc<dyn ChainClient + Send + Sync>,
@@ -199,17 +130,21 @@ struct ComposerInner {
     entry_rollup_id: RollupId,
     /// Entry-specific client handle (`EntryChainClient` trait object),
     /// distinct from the `rollups` map which holds the same client
-    /// coerced to `ChainClient`.
-    entry: EntryRegistration,
+    /// coerced to `ChainClient`. Held so the composer can call
+    /// `simulate_source_tx` without an Any-downcast.
+    entry: Arc<dyn EntryChainClient + Send + Sync>,
     /// Committed-root reader (`CommittedRootReader` trait object) used
     /// by Phase 1 of `simulate_and_resolve` to read each rollup's
     /// upstream-invariant-6 anchor root. Required at registration; see
-    /// [`ComposerBuilder::root_reader`].
-    root_reader: RootReaderRegistration,
+    /// [`ComposerBuilder::root_reader`]. Implementations: a local L1
+    /// client (entry-when-L1 or follower-when-L1-in-L2-as-entry)
+    /// reading its own `EEZ.sol` storage, or a gRPC client whose
+    /// remote peer is L1.
+    root_reader: Arc<dyn CommittedRootReader + Send + Sync>,
     /// All registered rollups (entry + followers). The entry is also
     /// in this map via trait upcast — composition orchestration uses
     /// it uniformly.
-    rollups: HashMap<RollupId, Arc<RegisteredRollup>>,
+    rollups: HashMap<RollupId, RegisteredRollup>,
 }
 
 /// Mutable accumulator for a [`Composer`].
@@ -221,9 +156,9 @@ struct ComposerInner {
 /// race-able state.
 pub struct ComposerBuilder {
     entry_rollup_id: RollupId,
-    entry: Option<EntryRegistration>,
-    root_reader: Option<RootReaderRegistration>,
-    rollups: HashMap<RollupId, Arc<RegisteredRollup>>,
+    entry: Option<Arc<dyn EntryChainClient + Send + Sync>>,
+    root_reader: Option<Arc<dyn CommittedRootReader + Send + Sync>>,
+    rollups: HashMap<RollupId, RegisteredRollup>,
     /// Latched error — set by [`rollup`](Self::rollup) when called with
     /// an id that conflicts with the entry rollup or with a previously
     /// registered follower. Surfaced from [`build`](Self::build) so
@@ -276,15 +211,12 @@ impl ComposerBuilder {
         let chain_client: Arc<dyn ChainClient + Send + Sync> = client;
         self.rollups.insert(
             self.entry_rollup_id,
-            Arc::new(RegisteredRollup {
+            RegisteredRollup {
                 client: chain_client,
                 config,
-            }),
+            },
         );
-        self.entry = Some(EntryRegistration {
-            rollup_id: self.entry_rollup_id,
-            client: entry_client_for_slot,
-        });
+        self.entry = Some(entry_client_for_slot);
         self
     }
 
@@ -308,7 +240,7 @@ impl ComposerBuilder {
     /// Calling twice replaces the previous reader.
     #[must_use]
     pub fn root_reader(mut self, client: Arc<dyn CommittedRootReader + Send + Sync>) -> Self {
-        self.root_reader = Some(RootReaderRegistration { client });
+        self.root_reader = Some(client);
         self
     }
 
@@ -349,7 +281,7 @@ impl ComposerBuilder {
             return self;
         }
         self.rollups
-            .insert(rollup_id, Arc::new(RegisteredRollup { client, config }));
+            .insert(rollup_id, RegisteredRollup { client, config });
         self
     }
 
@@ -441,40 +373,27 @@ impl Composer {
     /// finalization fails.
     #[tracing::instrument(skip(self, raw_tx), fields(tx_len = raw_tx.len()))]
     pub async fn simulate_and_resolve(&self, raw_tx: &[u8]) -> ComposerResult<Composition> {
-        self.simulate_and_resolve_recorded(raw_tx)
-            .await
-            .map(|(composition, _recorded)| composition)
-    }
-
-    /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve) but
-    /// ALSO returns the builder's `recorded[..]` (preorder dispatched
-    /// cross-chain calls with resolved outcomes). Callers that need a
-    /// call's REAL `return_data` (e.g. the inbound L1→L2 delivery, which
-    /// builds the byte-locked `executeIncomingCrossChainCall` system tx)
-    /// use this; the [`Composition`] alone doesn't carry per-call return
-    /// data verbatim.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve).
-    pub async fn simulate_and_resolve_recorded(
-        &self,
-        raw_tx: &[u8],
-    ) -> ComposerResult<(Composition, Vec<ExecutedAction>)> {
         // Default entry selection: the pinned entry rollup + its client.
         // Per-composition entry selection (A1) goes through
         // `simulate_and_resolve_recorded_for`.
         self.simulate_and_resolve_recorded_for(
             self.inner.entry_rollup_id,
-            self.inner.entry.client.as_ref(),
+            self.inner.entry.as_ref(),
             raw_tx,
         )
         .await
+        .map(|(composition, _recorded)| composition)
     }
 
-    /// Same as [`simulate_and_resolve_recorded`](Self::simulate_and_resolve_recorded)
-    /// but with an explicitly-chosen entry: `entry_id` + the `entry_client`
-    /// that runs source simulation. Lets ONE composer compose either
+    /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve) but
+    /// with an explicitly-chosen entry — `entry_id` + the `entry_client`
+    /// that runs source simulation — and ALSO returning the builder's
+    /// `recorded[..]` (preorder dispatched cross-chain calls with
+    /// resolved outcomes). Callers that need a
+    /// call's REAL `return_data` (e.g. the inbound L1→L2 delivery, which
+    /// builds the byte-locked `executeIncomingCrossChainCall` system tx)
+    /// use this; the [`Composition`] alone doesn't carry per-call return
+    /// data verbatim. The explicit entry lets ONE composer compose either
     /// direction — `(L1, L1 client)` for an inbound L1→L2 call, `(L2, L2
     /// client)` for an outbound L2→L1 call — picked per tx by the drain.
     /// The dispatch rollup map (Phase 1) is the composer's full
@@ -482,7 +401,7 @@ impl Composer {
     ///
     /// # Errors
     ///
-    /// Same as [`simulate_and_resolve_recorded`](Self::simulate_and_resolve_recorded).
+    /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve).
     pub async fn simulate_and_resolve_recorded_for(
         &self,
         entry_id: RollupId,
@@ -516,7 +435,6 @@ impl Composer {
             let initial_state_root = self
                 .inner
                 .root_reader
-                .client
                 .stored_target_state_root(*rollup_id)
                 .await?;
             rollups.insert(
@@ -530,12 +448,18 @@ impl Composer {
             );
         }
 
-        // Phase 2 — compose. Pass the entry client directly for
-        // source simulation; pass the full rollup map for dispatch.
-        // `_recorded` carries the resolved per-call outcomes (return_data)
-        // the byte-locked inbound delivery needs.
-        let (composition, recorded) =
-            compose_transaction_recorded(entry_client, raw_tx, entry_id, rollups).await?;
+        // Phase 2 — compose: drive source simulation (which dispatches
+        // every detected proxy call back into the builder), then
+        // finalize. `recorded` carries the resolved per-call outcomes
+        // (return_data) the byte-locked inbound delivery needs,
+        // captured BEFORE `finalize` consumes the builder.
+        let mut builder = CompositionBuilder::new(entry_id, rollups);
+        entry_client
+            .simulate_source_tx(raw_tx.to_vec(), &mut builder)
+            .await
+            .map_err(crate::error::CompositionError::from)?;
+        let recorded = builder.recorded().to_vec();
+        let composition = builder.finalize(raw_tx).await?;
 
         tracing::info!(
             name: "composer.simulate.complete",
@@ -551,9 +475,9 @@ impl Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::composition::CompositionBuilder;
+
     use crate::error::ExecutorResult;
-    use crate::executor::{TargetBatchSimulation, TargetExecutionSession, TargetTransaction};
+    use crate::executor::TargetExecutionSession;
 
     struct FakeClient;
 
@@ -566,12 +490,6 @@ mod tests {
             &self,
         ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
             unimplemented!("composer misconfigured-state tests never open a session")
-        }
-        async fn simulate_transactions(
-            &self,
-            _txs: &[TargetTransaction],
-        ) -> ExecutorResult<TargetBatchSimulation> {
-            unimplemented!("composer misconfigured-state tests never simulate a batch")
         }
     }
 
@@ -613,12 +531,6 @@ mod tests {
         ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
             unimplemented!("composer misconfigured-state tests never open a session")
         }
-        async fn simulate_transactions(
-            &self,
-            _txs: &[TargetTransaction],
-        ) -> ExecutorResult<TargetBatchSimulation> {
-            unimplemented!("composer misconfigured-state tests never simulate a batch")
-        }
     }
 
     fn builder() -> ComposerBuilder {
@@ -627,15 +539,11 @@ mod tests {
 
     fn target_config() -> TargetConfig {
         TargetConfig {
-            ccm_address: Address::ZERO,
-            system_address: Address::ZERO,
-            ccm_gas_limit: DEFAULT_CCM_GAS_LIMIT,
             proxy_lookup: ProxyLookupConfig {
                 contract_address: Address::ZERO,
                 authorized_proxies_slot: 0,
             },
             dialect: ChainDialect::EvmL2Style,
-            settles_via_session_root: false,
         }
     }
 

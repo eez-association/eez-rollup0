@@ -405,7 +405,6 @@ mod tests {
     use super::*;
     use alloy_primitives::address;
     use std::collections::HashMap;
-    use std::sync::Mutex;
 
     /// In-memory fake `RollupReader` for tests. Holds:
     /// - registry: rollup_id → manager address (Address::ZERO ⇒
@@ -418,24 +417,11 @@ mod tests {
         registry: HashMap<u64, Address>,
         vkeys: HashMap<(Address, Address), Option<[u8; 32]>>,
         context: HashMap<Address, TimestampAndBlockHash>,
-        // Pull a record of how many times each method was called
-        // so tests can assert the resolver doesn't issue redundant
-        // reads.
-        calls: Mutex<CallCounts>,
-    }
-
-    #[derive(Debug, Default)]
-    #[allow(dead_code, reason = "reserved for future call-count assertions")]
-    struct CallCounts {
-        rollup_contract: usize,
-        check_proof_systems: usize,
-        timestamp_and_block_hash: usize,
     }
 
     #[async_trait]
     impl RollupReader for FakeReader {
         async fn rollup_contract(&self, rid: RollupId) -> ExecutorResult<Address> {
-            self.calls.lock().unwrap().rollup_contract += 1;
             Ok(self.registry.get(&rid.0).copied().unwrap_or(Address::ZERO))
         }
 
@@ -444,7 +430,6 @@ mod tests {
             rollup_contract: Address,
             candidates: &[Address],
         ) -> ExecutorResult<Vec<[u8; 32]>> {
-            self.calls.lock().unwrap().check_proof_systems += 1;
             let mut out = Vec::with_capacity(candidates.len());
             for ps in candidates {
                 match self.vkeys.get(&(rollup_contract, *ps)) {
@@ -463,7 +448,6 @@ mod tests {
             &self,
             rollup_contract: Address,
         ) -> ExecutorResult<TimestampAndBlockHash> {
-            self.calls.lock().unwrap().timestamp_and_block_hash += 1;
             Ok(self
                 .context
                 .get(&rollup_contract)

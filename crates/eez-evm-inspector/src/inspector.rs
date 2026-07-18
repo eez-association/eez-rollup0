@@ -24,8 +24,8 @@
 //! (multi-tx composition). Reading through revm's journal captures
 //! both; a pre-tx storage snapshot would not.
 //!
-//! [`Dispatcher`]: eez_protocol::Dispatcher
-//! [`Dispatcher::dispatch_call`]: eez_protocol::Dispatcher::dispatch_call
+//! [`Dispatcher`]: eez_protocol::CompositionBuilder
+//! [`Dispatcher::dispatch_call`]: eez_protocol::CompositionBuilder::dispatch_call
 
 use alloy_primitives::{Address, Bytes};
 use std::sync::{Arc, Mutex};
@@ -173,7 +173,7 @@ impl OverlayChannel {
 
     /// Drain the accumulated per-tx roots. Called by source-sim at
     /// end of `simulate_source_tx`; forwarded to
-    /// `Dispatcher::set_extra_per_tx_roots(entry_id, roots)` so
+    /// `CompositionBuilder::set_extra_per_tx_roots(entry_id, roots)` so
     /// `finalize` can populate `per_tx_roots_by_rollup[entry]` —
     /// otherwise nested calls attributed to the entry rollup
     /// (`reentrantCrossChainCalls`-style deep alternation) hit
@@ -273,7 +273,7 @@ fn lookup_authorized_proxy_live<CTX: ContextTr + Host>(
 }
 
 /// EVM inspector that detects proxy calls and dispatches them through
-/// a borrowed [`Dispatcher`].
+/// the borrowed [`CompositionBuilder`].
 ///
 /// After the EVM pass, the caller consults `take_error()` to surface
 /// any dispatch failure; the dispatcher already holds the recorded calls.
@@ -284,9 +284,9 @@ fn lookup_authorized_proxy_live<CTX: ContextTr + Host>(
 /// dispatcher's recorded-call count. On `call_end`, the popped value
 /// pairs with the current count to compute `(start, span)` for any
 /// reverted frame, and the bracket is forwarded to
-/// [`Dispatcher::annotate_revert_span`]. `recorded[..]` is preorder
+/// [`CompositionBuilder::annotate_revert_span`](eez_protocol::CompositionBuilder::annotate_revert_span). `recorded[..]` is preorder
 /// by construction — every call's slot index is fixed at
-/// `Dispatcher::open_call` time, BEFORE the session recurses — so
+/// `CompositionBuilder::open_call` time, BEFORE the session recurses — so
 /// `span = end - start` is exactly the on-chain `revertSpan` for the
 /// bracketed top-level call.
 pub struct SessionInspector<'a> {
@@ -298,7 +298,7 @@ pub struct SessionInspector<'a> {
     dispatcher: &'a mut CompositionBuilder,
     /// Rollup id of the chain this inspector is running on — the
     /// `caller_id` passed to `dispatch_call` so the resulting
-    /// [`RecordedCall.caller_rollup_id`](eez_protocol::RecordedCall::caller_rollup_id)
+    /// [`RecordedCall.caller_rollup_id`](eez_protocol::ExecutedAction::caller_rollup_id)
     /// is correct for nested action-hash emission.
     caller_rollup_id: RollupId,
     /// First target execution error, if any.
@@ -306,7 +306,7 @@ pub struct SessionInspector<'a> {
     call_depth: usize,
     proxy_lookups: usize,
     /// Tokio runtime handle for bridging the sync `Inspector::call` hook
-    /// to the async `Dispatcher::dispatch_call`.
+    /// to the async `CompositionBuilder::dispatch_call`.
     handle: tokio::runtime::Handle,
     /// Bidirectional side-channel between source-sim and the entry
     /// rollup's overlay session.
@@ -314,11 +314,11 @@ pub struct SessionInspector<'a> {
     /// Per-EVM-frame snapshot of the dispatcher's recorded-call count
     /// at the entry of `Inspector::call`. On `Inspector::call_end`,
     /// the popped value pairs with the current count to bracket the
-    /// range of [`eez_protocol::RecordedCall`]s dispatched
+    /// range of [`eez_protocol::ExecutedAction`]s dispatched
     /// inside this frame. If the frame's outcome is
     /// `InstructionResult::Revert` AND the range is non-empty, the
     /// inspector forwards `(start, span)` to
-    /// [`Dispatcher::annotate_revert_span`].
+    /// [`CompositionBuilder::annotate_revert_span`](eez_protocol::CompositionBuilder::annotate_revert_span).
     frame_starts: Vec<usize>,
 }
 
@@ -405,7 +405,7 @@ impl SessionInspectorFactory {
 
     /// Build an inspector. Used by both the source-sim path and the
     /// target-session path. The inspector observes proxy CALLs and
-    /// dispatches each through the supplied [`Dispatcher`]; nested
+    /// dispatches each through the supplied [`CompositionBuilder`]; nested
     /// dispatches (a target-session inspector handing a callback
     /// back to the composer) are recorded as preorder children of
     /// the outer call by virtue of the dispatcher's `open_call`
@@ -430,7 +430,7 @@ impl<'a> SessionInspector<'a> {
     /// Create a new inspector instance.
     ///
     /// Used by the source-simulation path where every detected proxy
-    /// call dispatches through the supplied [`Dispatcher`] and is
+    /// call dispatches through the supplied [`CompositionBuilder`] and is
     /// recorded into the composition's preorder `recorded[..]` slice.
     ///
     /// - `proxy_lookup`: the (contract, slot) pair to read
@@ -537,7 +537,7 @@ where
             source_address: inputs.caller,
             source_rollup_id: self.caller_rollup_id,
         };
-        // Bridge sync Inspector::call → async Dispatcher::dispatch_call.
+        // Bridge sync Inspector::call → async CompositionBuilder::dispatch_call.
         //
         // Uses `tokio::task::block_in_place` to release the worker
         // thread from tokio's runtime context for the duration of the
