@@ -496,7 +496,9 @@ fn main() -> eyre::Result<()> {
             let evm_composer: Option<eez_protocol::Composer> =
                 if let Some(l1_variant) = embedded_l1.as_ref() {
                     use eez_composer::{GnosisL1Adapter, LocalChainClient};
-                    use eez_protocol::{ProxyLookupConfig, TargetConfig};
+                    use eez_protocol::{
+                        DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig, TargetConfig,
+                    };
                     use eez_protocol::Composer as ProtocolComposer;
                     use eez_protocol::rollup_id::RollupId;
 
@@ -506,6 +508,10 @@ fn main() -> eyre::Result<()> {
                     let ccm_l2: Address = Address::from_str(&env::var("EEZ_CCM_L2_ADDRESS").map_err(
                         |_| eyre::eyre!("EEZ_CCM_L2_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
                     )?)?;
+                    let l2_system_address: Address = env::var("EEZ_L2_SYSTEM_ADDRESS")
+                        .ok()
+                        .and_then(|s| Address::from_str(&s).ok())
+                        .unwrap_or(Address::ZERO);
                     let l1_rollup_id_u64 = read_l1_rollup_id();
                     let l1_rollup_id = RollupId(l1_rollup_id_u64);
                     let l2_rollup_id_typed = RollupId(rollup_id);
@@ -617,20 +623,28 @@ fn main() -> eyre::Result<()> {
                     l2_entry_client = Some(l2_entry_view);
 
                     let entry_cfg = TargetConfig {
+                        ccm_address: eez_registry,
+                        system_address: Address::ZERO, // entry has no system-tx CCM path
+                        ccm_gas_limit: DEFAULT_CCM_GAS_LIMIT,
                         proxy_lookup: ProxyLookupConfig {
                             contract_address: eez_registry,
                             authorized_proxies_slot: eez_protocol::ChainDialect::EvmL1Style
                                 .proxy_lookup_slot(),
                         },
                         dialect: eez_protocol::ChainDialect::EvmL1Style,
+                        settles_via_session_root: false,
                     };
                     let l2_follower_cfg = TargetConfig {
+                        ccm_address: ccm_l2,
+                        system_address: l2_system_address,
+                        ccm_gas_limit: DEFAULT_CCM_GAS_LIMIT,
                         proxy_lookup: ProxyLookupConfig {
                             contract_address: ccm_l2,
                             authorized_proxies_slot: eez_protocol::ChainDialect::EvmL2Style
                                 .proxy_lookup_slot(),
                         },
                         dialect: eez_protocol::ChainDialect::EvmL2Style,
+                        settles_via_session_root: false,
                     };
 
                     let composed = ProtocolComposer::builder(l1_rollup_id)

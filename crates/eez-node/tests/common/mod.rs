@@ -371,6 +371,7 @@ impl Harness {
             ("EEZ_L1_POSTER_KEY", opts.poster_key.to_string()),
             ("EEZ_L1_CHAIN_ID", "31337".to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
+            ("EEZ_L2_SYSTEM_ADDRESS", format!("{ANVIL_ADDR:#x}")),
             ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
             (
                 "EEZ_CCM_L2_ADDRESS",
@@ -1993,6 +1994,7 @@ impl DevnetCfg {
             ("EEZ_L1_POSTER_KEY", self.poster_key.to_string()),
             // MockECDSA is constructed with the deployer address as the authorized signer.
             ("EEZ_PROOF_SIGNER_KEY", self.deployer_key.to_string()),
+            ("EEZ_L2_SYSTEM_ADDRESS", format!("{ANVIL_ADDR:#x}")),
             ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
             ("EEZ_CCM_L2_ADDRESS", format!("{CCM_L2_ADDRESS:#x}")),
             // K = 5: L1 5s, L2 1s.

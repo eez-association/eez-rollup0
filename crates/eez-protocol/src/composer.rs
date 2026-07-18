@@ -39,11 +39,17 @@ use alloy_primitives::Address;
 use crate::composition::{CompositionBuilder, Rollup};
 use crate::dialect::ChainDialect;
 use crate::error::{ComposerError, ComposerErrorKind, ComposerResult};
-use crate::executor::{ChainClient, CommittedRootReader, EntryChainClient};
+use crate::executor::{
+    ChainClient, CommittedRootReader, EntryChainClient, TargetVerificationContext,
+};
 use crate::rollup_id::RollupId;
 use crate::types::{Composition, ExecutedAction};
 
 // ── Config ───────────────────────────────────────────────────────
+
+/// Default gas limit for CCM-verification system txs. Generous so
+/// worst-case CCM execute paths on dev chains succeed.
+pub const DEFAULT_CCM_GAS_LIMIT: u64 = 30_000_000;
 
 /// Combined proxy-lookup configuration for a registered rollup.
 ///
@@ -72,19 +78,42 @@ pub struct ProxyLookupConfig {
 
 /// Per-rollup static configuration.
 ///
-/// Holds the proxy lookup and ABI dialect for one rollup (entry or
-/// follower). Passed to
+/// Holds CCM contract address, system address, gas limit, and proxy
+/// lookup for one rollup (entry or follower). Passed to
 /// [`ComposerBuilder::entry`] / [`ComposerBuilder::rollup`] alongside
 /// the client.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetConfig {
+    /// Address of the CCM entrypoint on this chain.
+    pub ccm_address: Address,
+    /// System address authorized to call CCM on this chain.
+    pub system_address: Address,
+    /// Gas limit for each of the two CCM-verification system txs.
+    /// Default: [`DEFAULT_CCM_GAS_LIMIT`].
+    pub ccm_gas_limit: u64,
     /// Proxy-lookup configuration for this rollup.
     pub proxy_lookup: ProxyLookupConfig,
-    /// ABI dialect: selects entry-encoding and
+    /// ABI dialect: selects entry-encoding and CCM-verify
     /// batch shape (L1-style vs L2-style).
     /// Default = `EvmL2Style`
     /// (preserves byte-identity for the existing 12 L1→L2 fixtures).
     pub dialect: ChainDialect,
+    /// Settlement policy: when `true`, this target's post-state root is
+    /// the root its own target execution session already
+    /// produced (the real, sealed root reported back over the wire),
+    /// so [`CompositionBuilder::finalize`](crate::composition::CompositionBuilder::finalize)
+    /// SKIPS the CCM-verify `simulate_transactions` pass and keeps the
+    /// recorded `post_state_root`. Intended for a remote target whose
+    /// client cannot serve `simulate_transactions` locally. No in-tree
+    /// client sets this today — the bidi-stream `RemoteL2Client` inbound
+    /// path was retired (inbound now settles as a prover-signed deferred
+    /// entry); retained for future remote targets.
+    /// `false` for in-process follower targets and the zk-poster
+    /// L1 target (the latter has its own skip path via
+    /// [`crate::dialect::ChainDialect::is_zk_poster`]).
+    /// Default `false` — preserves the existing outbound (L2→L1) and
+    /// L1→L2-fixture behaviour.
+    pub settles_via_session_root: bool,
 }
 
 /// Per-rollup attribution inputs for batch construction.
@@ -96,9 +125,11 @@ pub struct TargetConfig {
 /// - `initial_roots[rollup]` — the state root each rollup started at,
 ///   read from the entry chain once per
 ///   [`Composer::simulate_and_resolve`](Composer::simulate_and_resolve).
-/// - `per_tx_roots_by_rollup[rollup]` — the post-state roots
-///   `finalize` attributed per rollup (zk-poster settlement root or
-///   inbound delivery root).
+/// - `per_tx_roots_by_rollup[rollup]` — cumulative post-state roots
+///   after each transaction in that rollup's CCM-verify batch
+///   (`loadExecutionTable` + `executeIncomingCrossChainCall`). Supplied
+///   by [`CompositionBuilder::finalize`](crate::composition::CompositionBuilder::finalize)
+///   from each per-rollup `simulate_transactions` return value.
 ///
 /// References (no ownership) so the builder materializes each map once
 /// per composition and hands borrowed handles to the batch builder.
@@ -116,6 +147,21 @@ pub struct SourceAttribution<'a> {
     /// rollup's CCM-verify batch. Keyed by `RollupId`; each `Vec` is
     /// ordered by batch tx index.
     pub per_tx_roots_by_rollup: &'a HashMap<RollupId, Vec<[u8; 32]>>,
+}
+
+impl TargetConfig {
+    /// Project this config into a [`TargetVerificationContext`].
+    ///
+    /// `ccm_address` maps to `entrypoint_address` — just renamed per
+    /// context. This helper is the single authoritative rename site.
+    #[must_use]
+    pub fn verification_context(&self) -> TargetVerificationContext {
+        TargetVerificationContext {
+            system_address: self.system_address,
+            entrypoint_address: self.ccm_address,
+            gas_limit: self.ccm_gas_limit,
+        }
+    }
 }
 
 // ── Composer ─────────────────────────────────────────────────────
@@ -477,7 +523,7 @@ mod tests {
     use super::*;
 
     use crate::error::ExecutorResult;
-    use crate::executor::TargetExecutionSession;
+    use crate::executor::{TargetBatchSimulation, TargetExecutionSession, TargetTransaction};
 
     struct FakeClient;
 
@@ -490,6 +536,12 @@ mod tests {
             &self,
         ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
             unimplemented!("composer misconfigured-state tests never open a session")
+        }
+        async fn simulate_transactions(
+            &self,
+            _txs: &[TargetTransaction],
+        ) -> ExecutorResult<TargetBatchSimulation> {
+            unimplemented!("composer misconfigured-state tests never simulate a batch")
         }
     }
 
@@ -531,6 +583,12 @@ mod tests {
         ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
             unimplemented!("composer misconfigured-state tests never open a session")
         }
+        async fn simulate_transactions(
+            &self,
+            _txs: &[TargetTransaction],
+        ) -> ExecutorResult<TargetBatchSimulation> {
+            unimplemented!("composer misconfigured-state tests never simulate a batch")
+        }
     }
 
     fn builder() -> ComposerBuilder {
@@ -539,11 +597,15 @@ mod tests {
 
     fn target_config() -> TargetConfig {
         TargetConfig {
+            ccm_address: Address::ZERO,
+            system_address: Address::ZERO,
+            ccm_gas_limit: DEFAULT_CCM_GAS_LIMIT,
             proxy_lookup: ProxyLookupConfig {
                 contract_address: Address::ZERO,
                 authorized_proxies_slot: 0,
             },
             dialect: ChainDialect::EvmL2Style,
+            settles_via_session_root: false,
         }
     }
 

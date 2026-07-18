@@ -90,7 +90,10 @@ pub use batch::EvmBatch;
 #[doc(inline)]
 pub use checkpoint::ExecutionCheckpoint;
 #[doc(inline)]
-pub use composer::{Composer, ComposerBuilder, ProxyLookupConfig, SourceAttribution, TargetConfig};
+pub use composer::{
+    Composer, ComposerBuilder, DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig, SourceAttribution,
+    TargetConfig,
+};
 #[doc(inline)]
 pub use composition::{CompositionBuilder, Rollup};
 #[doc(inline)]
@@ -104,7 +107,8 @@ pub use error::{
 #[doc(inline)]
 pub use executor::{
     ChainClient, CommittedRootReader, EntryChainClient, ExecutionRequest, ExecutionResponse,
-    SessionSnapshot, TargetExecutionSession,
+    SessionSnapshot, TargetBatchSimulation, TargetExecutionSession, TargetTransaction,
+    TargetVerificationContext,
 };
 #[doc(inline)]
 pub use overlay::{

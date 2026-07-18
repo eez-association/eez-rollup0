@@ -5,7 +5,7 @@
 //! [`EntryChainClient`] (extends `ChainClient`; only the rollup
 //! designated as composition entry implements it). Nested cross-chain
 //! dispatch goes through the borrowed
-//! [`CompositionBuilder`].
+//! [`CompositionBuilder`](crate::composition::CompositionBuilder).
 //!
 //! All three traits are `#[async_trait]` — one heap allocation per call
 //! in exchange for dyn-compatibility. Native `async fn in trait` is
@@ -18,9 +18,11 @@
 //! ```text
 //!   ChainClient                every registered rollup
 //!       │
-//!       └─ begin_execution_session  opens a stateful session for one
-//!                                   source transaction's worth of
-//!                                   cross-chain calls
+//!       ├─ begin_execution_session  opens a stateful session for one
+//!       │                           source transaction's worth of
+//!       │                           cross-chain calls
+//!       └─ simulate_transactions    atomic batch sim for CCM-verify
+//!                                   (loadExecutionTable + execute*)
 //!
 //!   EntryChainClient : ChainClient    entry rollup only
 //!       │
@@ -97,6 +99,59 @@ impl std::fmt::Debug for ExecutionResponse {
             .field("checkpoint", &"<ExecutionCheckpoint>")
             .finish()
     }
+}
+
+/// One target-chain transaction for batch simulation.
+///
+/// This is owned rather than borrowed so it maps cleanly to future transport
+/// implementations. Local reth-backed clients can still execute it in-process.
+#[derive(Debug, Clone)]
+pub struct TargetTransaction {
+    /// Address to set as `msg.sender` in the simulation.
+    pub caller: Address,
+    /// Contract the call lands on.
+    pub destination: Address,
+    /// Encoded calldata.
+    pub calldata: Bytes,
+    /// Native value attached to the call.
+    pub value: U256,
+    /// Maximum gas this transaction may consume.
+    pub gas_limit: u64,
+}
+
+/// Result of simulating an ordered target-chain transaction batch.
+///
+/// `per_tx_roots[i]` is the cumulative post-state root after transaction
+/// `i` committed. `final_state_root` equals `per_tx_roots.last()`. Both
+/// fields are populated so consumers that only need the terminal root
+/// (legacy CCM-verify overwrite path) can keep using `final_state_root`
+/// while nested-composition attribution consumes `per_tx_roots` for
+/// per-entry state-delta chaining (upstream's invariant 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetBatchSimulation {
+    /// State root after all batch transactions committed in order.
+    pub final_state_root: [u8; 32],
+    /// Cumulative post-state root after each transaction in the batch.
+    /// `per_tx_roots[i]` is the state root once `txs[0..=i]` are
+    /// committed. Empty batches are rejected with
+    /// [`ExecutorErrorKind::EmptyBatch`],
+    /// so this vector is always non-empty when `simulate_transactions`
+    /// returns `Ok`.
+    pub per_tx_roots: Vec<[u8; 32]>,
+}
+
+/// Inputs for the CCM-verification system transactions
+/// (`loadExecutionTable` + `executeIncomingCrossChainCall`) that
+/// [`CompositionBuilder::finalize`](crate::composition::CompositionBuilder::finalize)
+/// runs when a target plan opts in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetVerificationContext {
+    /// Caller for the two system txs (target chain's configured system address).
+    pub system_address: Address,
+    /// Destination for the two system txs (target chain's CCM entrypoint).
+    pub entrypoint_address: Address,
+    /// Gas limit for each system tx.
+    pub gas_limit: u64,
 }
 
 /// Stateful execution session driving target-chain calls during
@@ -222,6 +277,22 @@ pub trait ChainClient: Send + Sync + 'static {
     async fn begin_execution_session(
         &self,
     ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>>;
+
+    /// Simulate an ordered batch of target-chain transactions on a fresh
+    /// target state. Implementations must commit each successful transaction
+    /// in order and return the final state root.
+    ///
+    /// # Errors
+    ///
+    /// Returns any [`ExecutorError`] depending on impl — local surfaces
+    /// [`ExecutorErrorKind::TargetTransactionReverted`] (contract-level
+    /// revert) or [`ExecutorErrorKind::Evm`] (internal execution
+    /// failure); gRPC surfaces [`ExecutorErrorKind::Transport`] /
+    /// [`ExecutorErrorKind::Serde`].
+    async fn simulate_transactions(
+        &self,
+        txs: &[TargetTransaction],
+    ) -> ExecutorResult<TargetBatchSimulation>;
 }
 
 /// Source-simulation capability. Supertrait of [`ChainClient`].
