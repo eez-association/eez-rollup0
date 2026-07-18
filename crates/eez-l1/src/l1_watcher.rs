@@ -26,6 +26,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tracing::{Level, event};
 use url::Url;
 
+use crate::config::{parse_address, parse_u64, parse_url};
 use crate::error::{L1Error, L1Result};
 use crate::scan::ScannedBatch;
 
@@ -148,24 +149,10 @@ impl L1WatcherConfig {
     /// malformed value.
     pub fn from_env() -> L1Result<Self> {
         use std::env;
-        use std::str::FromStr;
 
-        let rpc_url_raw = env::var("EEZ_L1_RPC_URL")
-            .map_err(|_| L1Error::Config("EEZ_L1_RPC_URL is required (see .env.example)".into()))?;
-        let rpc_url = Url::parse(&rpc_url_raw)
-            .map_err(|e| L1Error::Config(format!("EEZ_L1_RPC_URL: {e}")))?;
-
-        let eez_raw = env::var("EEZ_REGISTRY_ADDRESS").map_err(|_| {
-            L1Error::Config("EEZ_REGISTRY_ADDRESS is required (see .env.example)".into())
-        })?;
-        let eez = Address::from_str(&eez_raw)
-            .map_err(|e| L1Error::Config(format!("EEZ_REGISTRY_ADDRESS: {e}")))?;
-
-        let rollup_id_raw = env::var("EEZ_ROLLUP_ID")
-            .map_err(|_| L1Error::Config("EEZ_ROLLUP_ID is required (see .env.example)".into()))?;
-        let rollup_id = rollup_id_raw
-            .parse::<u64>()
-            .map_err(|e| L1Error::Config(format!("EEZ_ROLLUP_ID: {e}")))?;
+        let rpc_url = parse_url("EEZ_L1_RPC_URL")?;
+        let eez = parse_address("EEZ_REGISTRY_ADDRESS")?;
+        let rollup_id = parse_u64("EEZ_ROLLUP_ID")?;
 
         let reorg_max_depth = match env::var("EEZ_L1_REORG_MAX_DEPTH_BLOCKS") {
             Ok(v) => v

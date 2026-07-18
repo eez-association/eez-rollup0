@@ -29,6 +29,7 @@ use alloy_primitives::{Address, B256};
 use alloy_provider::RootProvider;
 use alloy_signer_local::PrivateKeySigner;
 use clap::Parser as _;
+use eez_composer::composer::CrossChainWiring;
 use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
 use eez_deriver::Deriver;
 use eez_driver::{
@@ -321,10 +322,6 @@ fn main() -> eyre::Result<()> {
                 rx
             }
             Mode::Composer => {
-                let submitter_config = SubmitterConfig::from_env()?;
-                let _ = submitter_config; // validated by Composer block below
-                let l1_watcher_config_preview = L1WatcherConfig::from_env()?;
-                let _ = l1_watcher_config_preview; // validated below
                 // Placeholder for schedule_rx; replaced inside the composer
                 // arm with the real L1-anchored schedule (spawn_l1_anchored).
                 let (_drop_tx, drop_rx) = mpsc::channel::<SlotEvent>(1);
@@ -439,7 +436,6 @@ fn main() -> eyre::Result<()> {
             let held_pool_for_rollup = Some(Arc::clone(&held_pool));
             let rollup_state = RollupState {
                 config: rollup_config.clone(),
-                timing,
                 l2_provider: Arc::new(provider.clone()),
                 l1_head: Arc::clone(&l1_head),
                 held_pool: held_pool_for_rollup,
@@ -453,13 +449,20 @@ fn main() -> eyre::Result<()> {
             // when reth ingests them via newPayload.
             let evm_config = reth_evm_ethereum::EthEvmConfig::new(chain_spec.clone());
 
+            // EEZ registry address — shared by the cross-chain composer
+            // wiring below and the `CrossChainExecCtx` (postBatch target
+            // + escrow precheck).
+            let eez_registry: Address = Address::from_str(&env::var("EEZ_REGISTRY_ADDRESS").map_err(
+                |_| eyre::eyre!("EEZ_REGISTRY_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
+            )?)?;
+
             // Build the cross-chain composer when the embedded L1 is
             // up — it owns `LocalChainClient`s over L1 (entry) and L2
             // (follower). `None` without an embedded L1. Inlined because
             // the `FullNode` AddOns type resists a typed helper return.
             // L2 ENTRY client for OUTBOUND (L2→L1) source-sim — built inside the
-            // block below alongside the L2 follower, threaded into `Composer::new`.
-            // `None` without an embedded L1 (outbound txs then evict at compose).
+            // block below alongside the L2 follower, threaded into `Composer::new`
+            // via `CrossChainWiring`. `None` without an embedded L1.
             let mut l2_entry_client: Option<
                 Arc<
                     dyn eez_protocol::executor::EntryChainClient
@@ -474,9 +477,6 @@ fn main() -> eyre::Result<()> {
                     use eez_protocol::Composer as ProtocolComposer;
                     use eez_protocol::rollup_id::RollupId;
 
-                    let eez_registry: Address = Address::from_str(&env::var("EEZ_REGISTRY_ADDRESS").map_err(
-                        |_| eyre::eyre!("EEZ_REGISTRY_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
-                    )?)?;
                     let ccm_l2: Address = Address::from_str(&env::var("EEZ_CCM_L2_ADDRESS").map_err(
                         |_| eyre::eyre!("EEZ_CCM_L2_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
                     )?)?;
@@ -674,12 +674,6 @@ fn main() -> eyre::Result<()> {
                         )
                     })?,
                 )?;
-                let l2_rollup_id_for_ctx: u64 = env::var("EEZ_ROLLUP_ID")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| {
-                        eyre::eyre!("EEZ_ROLLUP_ID required for L1 postBatch rollupIdsWithProofSystems[]")
-                    })?;
                 // L1 chainId queried from the provider would be more
                 // robust, but pulling it out of env keeps the ctx
                 // construction sync. Embedded reth `--chain dev` is
@@ -714,7 +708,8 @@ fn main() -> eyre::Result<()> {
                     l1_chain_id,
                     l1_post_batch_priority_fee,
                     ecdsa_proof_system_address,
-                    l2_rollup_id: l2_rollup_id_for_ctx,
+                    l2_rollup_id: rollup_id,
+                    eez_registry,
                 }))
             } else {
                 None
@@ -765,15 +760,25 @@ fn main() -> eyre::Result<()> {
                 }
                 _ => None,
             };
+            // All three cross-chain pieces are wired together by the
+            // embedded-L1 branch above, or not at all.
+            let cross_chain = match (evm_composer, cc_exec_ctx, l2_entry_client) {
+                (Some(composer), Some(exec_ctx), Some(l2_entry_client)) => {
+                    Some(CrossChainWiring {
+                        composer,
+                        exec_ctx,
+                        l2_entry_client,
+                    })
+                }
+                _ => None,
+            };
             let composer = Composer::new(
                 rollups,
                 prover,
                 submitter.clone(),
                 l1_watcher.clone(),
                 evm_config,
-                evm_composer,
-                cc_exec_ctx,
-                l2_entry_client,
+                cross_chain,
             );
             if let Some(ws) = witness_source {
                 composer.set_witness_source(ws);

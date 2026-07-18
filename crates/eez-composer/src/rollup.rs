@@ -3,15 +3,13 @@
 //! [`RollupConfig`] is the immutable, env-derived knobs for one rollup
 //! (its id, proof system address, mode flag). [`RollupState`] adds the
 //! runtime references the umbrella reads while building batches: the
-//! local L2 provider, the L1-confirmed cursor, the per-rollup
-//! [`RollupTiming`](eez_driver::RollupTiming).
+//! local L2 provider, the L1-confirmed cursor.
 //!
 //! Single-rollup-in-`HashMap<RollupId, _>` from day one (S4.2 has one
 //! entry; stage-N grows to N entries without restructuring).
 
 use std::sync::Arc;
 
-use eez_driver::RollupTiming;
 use eez_l1::{L1CanonicalHead, L1Error, L1Result};
 
 use crate::held_pool::HeldPool;
@@ -93,7 +91,6 @@ impl RollupConfig {
 #[derive(Debug)]
 pub struct RollupState<L2> {
     pub config: RollupConfig,
-    pub timing: RollupTiming,
     pub l2_provider: Arc<L2>,
     pub l1_head: Arc<L1CanonicalHead>,
     /// Per-rollup cross-chain held-tx pool. `None` for rollups that

@@ -120,11 +120,11 @@ fn require(name: &str) -> L1Result<String> {
     env::var(name).map_err(|_| L1Error::Config(format!("{name} is required (see .env.example)")))
 }
 
-fn parse_url(name: &str) -> L1Result<Url> {
+pub(crate) fn parse_url(name: &str) -> L1Result<Url> {
     Url::parse(&require(name)?).map_err(|e| L1Error::Config(format!("{name}: {e}")))
 }
 
-fn parse_address(name: &str) -> L1Result<Address> {
+pub(crate) fn parse_address(name: &str) -> L1Result<Address> {
     Address::from_str(&require(name)?).map_err(|e| L1Error::Config(format!("{name}: {e}")))
 }
 
@@ -157,7 +157,7 @@ fn dummy_key(name: &str) -> L1Result<PrivateKeySigner> {
         .map_err(|e| L1Error::Config(format!("dummy {name}: {e}")))
 }
 
-fn parse_u64(name: &str) -> L1Result<u64> {
+pub(crate) fn parse_u64(name: &str) -> L1Result<u64> {
     require(name)?
         .parse::<u64>()
         .map_err(|e| L1Error::Config(format!("{name}: {e}")))
