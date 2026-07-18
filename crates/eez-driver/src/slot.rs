@@ -201,25 +201,6 @@ pub trait SyncSlotComposer: Send + Sync + 'static {
     ) -> Option<SyncSlotBlock>;
 }
 
-/// No-op [`SyncSlotComposer`] — used when no umbrella is wired
-/// (standalone-mode dev) or when the per-rollup `HeldPool` is absent.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoCrossChainContent;
-
-#[async_trait]
-impl SyncSlotComposer for NoCrossChainContent {
-    async fn compose_sync_slot(
-        &self,
-        _rollup_id: u64,
-        _parent: ParentContext,
-        _timestamp: u64,
-        _target_l1_block: Option<u64>,
-        _mode: SyncSlotMode,
-    ) -> Option<SyncSlotBlock> {
-        None
-    }
-}
-
 /// Cheap clone-able handle for a [`SyncSlotComposer`].
 pub type SyncSlotComposerHandle = Arc<dyn SyncSlotComposer>;
 

@@ -3212,7 +3212,6 @@ dependencies = [
  "alloy-transport",
  "async-trait",
  "eez-driver",
- "eez-payload-codec",
  "eez-protocol",
  "fail",
  "reqwest 0.12.28",

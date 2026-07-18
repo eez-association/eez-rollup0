@@ -230,13 +230,6 @@ impl RollupTiming {
         blocks.saturating_sub(1)
     }
 
-    /// Live blocks per slot — the L2 blocks already produced on
-    /// wall-clock cadence by the time the trigger fires.
-    #[must_use]
-    pub const fn live_count(self) -> u32 {
-        self.k() - self.future_count() - 1
-    }
-
     /// Wall-clock offset after the anchor L1 block at which the trigger
     /// fires — the end of the Live region, `l1 − (future + 1)·l2`. Leaves
     /// the prover `proof_time` and the relay `submission_slack` before the
@@ -245,14 +238,6 @@ impl RollupTiming {
     pub const fn proof_window_open(self) -> Duration {
         let reserved_ms = (self.future_count() + 1).saturating_mul(self.l2_block_time_ms);
         Duration::from_millis(self.l1_block_time_ms.saturating_sub(reserved_ms) as u64)
-    }
-
-    /// Wall-clock offset from "L1 block N landed" by which the
-    /// postBatch bundle must reach the relay
-    /// (`L1_block_time - submission_slack`).
-    #[must_use]
-    pub const fn submission_deadline(self) -> Duration {
-        Duration::from_millis((self.l1_block_time_ms - self.submission_slack_ms) as u64)
     }
 
     /// Decide what to produce at a sync-slot trigger given the current
@@ -353,6 +338,19 @@ fn parse_env_or(name: &str, default: u32) -> DriverResult<u32> {
         Err(env::VarError::NotUnicode(_)) => Err(DriverError::timing_config(format!(
             "{name} contains non-UTF-8 bytes"
         ))),
+    }
+}
+
+/// Derived-timing views kept for the test oracles below — production
+/// callers use `proof_time` / `submission_slack` directly.
+#[cfg(test)]
+impl RollupTiming {
+    const fn live_count(self) -> u32 {
+        self.k() - self.future_count() - 1
+    }
+
+    const fn submission_deadline(self) -> Duration {
+        Duration::from_millis((self.l1_block_time_ms - self.submission_slack_ms) as u64)
     }
 }
 
