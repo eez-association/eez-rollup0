@@ -40,12 +40,5 @@ serde_json.workspace = true
 hex.workspace = true
 eez-payload-codec.workspace = true
 
-[features]
-# Exposes `eez_protocol::testing::FakeChainClient` for downstream test
-# code. Off by default — library consumers never need it; test
-# consumers add `features = ["testing"]` to their dev-dependency on
-# this crate.
-testing = []
-
 [lints]
 workspace = true

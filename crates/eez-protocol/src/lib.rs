@@ -67,13 +67,6 @@ pub mod system_tx;
 pub mod types;
 pub mod witness;
 
-/// Test doubles (`FakeChainClient` / `FakeChainSession`) for unit-testing
-/// against the `ChainClient` traits. Gated by the `testing` feature so
-/// consumers opt in via `features = ["testing"]`; visible to this crate's own
-/// tests without the flag.
-#[cfg(any(test, feature = "testing"))]
-pub mod testing;
-
 mod assertions;
 
 #[doc(inline)]
