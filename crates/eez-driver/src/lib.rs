@@ -45,11 +45,11 @@ pub use block_committer::{BlockCommitterHandle, CommitOutcome, DeriveOutcome, Fo
 #[doc(inline)]
 pub use error::{DriverError, DriverResult};
 #[doc(inline)]
-pub use sequencer::{ConfirmedHeadSource, EthAttributesBuilder, Sequencer};
+pub use sequencer::{EthAttributesBuilder, Sequencer};
 #[doc(inline)]
 pub use slot::{
-    L1HeadInfo, L1HeadSource, ParentContext, SlotEvent, SlotKind, SyncSlotBlock, SyncSlotComposer,
-    SyncSlotComposerHandle, SyncSlotMode, spawn_interval, spawn_l1_anchored,
+    ParentContext, SlotEvent, SlotKind, SyncSlotBlock, SyncSlotComposer, SyncSlotComposerHandle,
+    SyncSlotMode, spawn_interval, spawn_l1_anchored,
 };
 #[doc(inline)]
 #[doc(inline)]

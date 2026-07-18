@@ -399,7 +399,7 @@ fn main() -> eyre::Result<()> {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(64);
             if depth != 0 {
-                sequencer = sequencer.with_speculative_limit(depth, Arc::clone(&l1_head) as _);
+                sequencer = sequencer.with_speculative_limit(depth, Arc::clone(&l1_head));
             }
         }
 
