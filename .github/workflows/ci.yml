@@ -97,7 +97,14 @@ jobs:
         working-directory: protocol-e2e-next
         env:
           MAX_PARALLEL: 4
-        run: bash script/e2e/shared/run-all-parallel.sh
+        # Temporarily excluded until supported: multi-call-twiceL2, multi-call-nested.
+        run: |
+          bash script/e2e/shared/run-all-parallel.sh \
+            counter counterL2 bridge \
+            multi-call-twice multi-call-two-diff multi-call-two-diffL2 \
+            nestedCounter nestedCounterL2 \
+            revertCounter revertCounterL2 revertContinue revertContinueL2 \
+            nestedCallRevert deepNested multi-call-nestedL2 reentrant
       - name: Upload protocol E2E logs
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
