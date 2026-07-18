@@ -1,0 +1,44 @@
+name: Protocol E2E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: Protocol E2E (local)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
+
+      - name: Build protocol contracts
+        working-directory: sync-rollups-protocol
+        run: forge build
+
+      - name: Run protocol E2E suite
+        working-directory: sync-rollups-protocol
+        env:
+          MAX_PARALLEL: 4
+        run: bash script/e2e/shared/run-all-parallel.sh
+
+      - name: Upload E2E logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: protocol-e2e-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: sync-rollups-protocol/tmp/e2e-parallel/*.log
+          if-no-files-found: warn
+          retention-days: 7
