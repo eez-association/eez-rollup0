@@ -668,7 +668,7 @@ where
             }
         }
         let sim = match sim {
-            Ok(response) => response.outcome,
+            Ok(outcome) => outcome,
             Err(e) => {
                 tracing::error!(error = %e, "target execution failed");
                 self.record_error(e);

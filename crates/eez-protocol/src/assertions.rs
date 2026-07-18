@@ -16,7 +16,7 @@
 
 use crate::composer::Composer;
 use crate::composition::{CompositionBuilder, Rollup};
-use crate::executor::{ExecutionRequest, ExecutionResponse};
+use crate::executor::ExecutionRequest;
 use crate::rollup_id::RollupId;
 use crate::types::{Composition, ExecutedAction, SourceComposition, TargetComposition};
 
@@ -41,7 +41,6 @@ const fn assert_thread_safety_bounds() {
     // Per-composition data types — must be Send to cross .await.
     assert_send::<ExecutedAction>();
     assert_send::<ExecutionRequest>();
-    assert_send::<ExecutionResponse>();
     assert_send::<SourceComposition>();
     assert_send::<TargetComposition>();
     assert_send::<Composition>();
