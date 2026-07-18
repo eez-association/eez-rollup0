@@ -62,11 +62,6 @@ pub mod types;
 mod assertions;
 
 #[doc(inline)]
-pub use abi::{
-    ActionSol, ExecutionEntrySol, ExpectedL1ToL2CallSol, L2ToL1CallSol, LookupCallSol,
-    ProofSystemBatchPerVerificationEntriesSol, RollupIdWithProofSystemsSol, StateDeltaSol,
-};
-#[doc(inline)]
 pub use action::{compute_state_root_slot, cross_chain_call_hash};
 #[doc(inline)]
 pub use addresses::{CCM_ADDRESS, SYSTEM_ADDRESS};
@@ -105,14 +100,12 @@ pub use proof_plan::{
 #[doc(inline)]
 pub use public_inputs::{all_per_ps_hashes, entry_hash, public_inputs_hashes, shared_public_input};
 #[doc(inline)]
-pub use rolling_hash::{
-    CALL_BEGIN, CALL_END, EntryRollingHash, NESTED_BEGIN, NESTED_END, StaticCallRollingHash,
-};
+pub use rolling_hash::{EntryRollingHash, StaticCallRollingHash};
 #[doc(inline)]
-pub use rollup_id::{ChainIdentity, RollupId};
+pub use rollup_id::RollupId;
 #[doc(inline)]
 pub use signer::{EcdsaProofSigner, SignerError};
 #[doc(inline)]
 pub use types::{
-    Composition, ExecutedAction, ExecutionOutcome, SourceComposition, StaticMeta, TargetComposition,
+    Composition, ExecutedAction, ExecutionOutcome, SourceComposition, TargetComposition,
 };

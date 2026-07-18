@@ -611,8 +611,7 @@ impl CompositionBuilder {
                 .expect("plan_order from rollups map");
             let dialect = &rollup.config.dialect;
             let load_table_payload = entries::encode_table_payload(&batch, dialect);
-            let execute_payload =
-                dialect.encode_follower_trigger(outer_root, self.entry_rollup_id, raw_tx);
+            let execute_payload = dialect.encode_follower_trigger(outer_root);
             target_compositions.push(TargetComposition {
                 rollup_id: *rollup_id,
                 batch,
@@ -791,7 +790,6 @@ impl CompositionBuilder {
             value: req.value,
             outcome: crate::types::ExecutionOutcome::Pending,
             revert_span: None,
-            static_meta: None,
         });
         self.pending_snapshots.insert(idx, snap);
         Ok(idx)
@@ -1236,7 +1234,6 @@ mod tests {
             value: U256::ZERO,
             outcome: sample_outcome([0u8; 32]),
             revert_span: None,
-            static_meta: None,
         });
 
         let err = builder.finalize(&[]).await.expect_err("should fail");

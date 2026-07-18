@@ -12,7 +12,7 @@
 //! `TargetConfig`; the runtime composer (Step 7) and
 //! inspectors never see `ChainDialect` directly.
 
-use crate::{ExecutedAction, RollupId};
+use crate::ExecutedAction;
 
 use crate::authorized_proxies::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
 
@@ -73,15 +73,8 @@ impl ChainDialect {
     /// receives `outer_root.data` as-is and forwards to the
     /// manager).
     ///
-    /// `raw_tx` and `source_rollup_id` are accepted but unused —
-    /// the proxy fallback only needs the original calldata.
     #[must_use]
-    pub fn encode_follower_trigger(
-        &self,
-        call: &ExecutedAction,
-        _source_rollup_id: RollupId,
-        _raw_tx: &[u8],
-    ) -> Vec<u8> {
+    pub fn encode_follower_trigger(&self, call: &ExecutedAction) -> Vec<u8> {
         let _ = self;
         // Both dialects route through the proxy's fallback, which
         // forwards the original calldata to the manager. The

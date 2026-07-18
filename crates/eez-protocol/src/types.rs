@@ -80,28 +80,7 @@ pub struct ExecutedAction {
     /// when the inspector observes the frame returning with
     /// `InstructionResult::Revert`.
     pub revert_span: Option<u32>,
-    /// Static-context metadata, populated by the inspector when this
-    /// call was observed inside a `STATICCALL` frame (read-only
-    /// reentry). Routes the call into the batch's
-    /// `l1ToL2lookupCalls[]` queue (renamed from the prior protocol's
-    /// `staticCalls[]`) instead of the entry's flat `L2ToL1Calls[]`
-    /// list. `None` for normal (mutating) calls.
-    pub static_meta: Option<StaticMeta>,
 }
-
-/// Inspector-time metadata for cross-chain calls observed inside a
-/// static-execution context (the proxy detects `STATICCALL` reentry
-/// via a `tstore` self-call).
-///
-/// The full `LookupCall` payload (cross-chain call hash, return data,
-/// callNumber, lastNestedActionConsumed, sub-calls, rollingHash) is
-/// materialized by the unified flat emitter from this marker plus the
-/// recorded outcome and the entry-level rolling-hash counters.
-/// (`LookupCall` was named `StaticCall` in the pre-multi-prover
-/// protocol — same shape, renamed upstream.)
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct StaticMeta;
 
 /// Lifecycle outcome of a recorded call.
 ///
