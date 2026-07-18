@@ -28,9 +28,9 @@
 //!
 //! # Where to start reading
 //!
-//! - [`Composer::simulate_and_resolve`] runs one cross-chain
-//!   composition end-to-end over the long-lived, client-caching
-//!   [`Composer`].
+//! - [`CompositionBuilder`] runs one cross-chain composition
+//!   end-to-end: source simulation dispatches into it, `finalize`
+//!   emits the [`Composition`].
 //! - For the ABI boundary, [`entries::build_batch`] walks the preorder
 //!   `recorded[..]` slice and materializes an [`EvmBatch`]; the
 //!   per-dialect encoders (`encode_postbatch` / `encode_load_table`)
@@ -73,7 +73,7 @@ pub use authorized_proxies::{
 #[doc(inline)]
 pub use batch::EvmBatch;
 #[doc(inline)]
-pub use composer::{Composer, ComposerBuilder, ProxyLookupConfig, SourceAttribution, TargetConfig};
+pub use composer::{ProxyLookupConfig, SourceAttribution, TargetConfig};
 #[doc(inline)]
 pub use composition::{CompositionBuilder, Rollup};
 #[doc(inline)]

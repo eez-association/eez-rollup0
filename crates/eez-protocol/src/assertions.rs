@@ -14,23 +14,18 @@
 //! - Per-composition data types cross `.await` boundaries inside the
 //!   composition pipeline and must be [`Send`].
 
-use crate::composer::Composer;
 use crate::composition::{CompositionBuilder, Rollup};
 use crate::executor::ExecutionRequest;
 use crate::rollup_id::RollupId;
 use crate::types::{Composition, ExecutedAction, SourceComposition, TargetComposition};
 
 const fn assert_send<T: Send>() {}
-const fn assert_send_sync<T: Send + Sync>() {}
 
 #[allow(
     dead_code,
     reason = "compile-time static assertion — body is type-checked at definition time"
 )]
 const fn assert_thread_safety_bounds() {
-    // `Composer` — top-level shared handle, must be Send + Sync.
-    assert_send_sync::<Composer>();
-
     // Per-composition owned types — cross `.await` inside the
     // composition pipeline (dispatch → session.execute → finalize →
     // simulate_transactions). Each holds `dyn _ + Send` trait objects;
