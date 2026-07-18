@@ -23,7 +23,7 @@
 //! Held-pool operations are infrequent (per sync slot, per L1 event)
 //! and never hot-path; a finer-grained lock split is premature.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
 
 use alloy_primitives::{Address, Bytes, TxHash};
@@ -37,9 +37,9 @@ pub struct HeldTx {
     /// RLP-encoded source transaction (signed envelope). Handed to
     /// `EvmComposer::simulate_and_resolve` verbatim.
     pub raw_tx: Bytes,
-    /// Cached hash of the signed envelope. Indexed by
-    /// [`HeldPool::by_hash`] for [`HeldPool::drain_matching`] lookups
-    /// — avoids recomputing on every external-batch landing.
+    /// Cached hash of the signed envelope. Used for `push` dedupe and
+    /// [`HeldPool::drain_matching`] lookups — avoids recomputing on
+    /// every external-batch landing.
     pub hash: TxHash,
     /// Failed-bundle attempts so far. Bundles are strict
     /// all-or-nothing, so a deterministically-reverting tx fails every
@@ -77,9 +77,6 @@ pub struct HeldPool {
     /// Insertion-ordered queue. The composer drains in FIFO order so
     /// sync-slot inclusion order matches submission order.
     txs: Mutex<VecDeque<HeldTx>>,
-    /// `tx_hash → index in `txs`` lookup for `drain_matching`. Kept
-    /// in sync with `txs` mutations.
-    by_hash: Mutex<HashMap<TxHash, usize>>,
 }
 
 impl HeldPool {
@@ -92,12 +89,10 @@ impl HeldPool {
     /// Append `tx` to the pool. Idempotent on duplicate hash (later
     /// `push` of an already-held hash is a no-op).
     pub fn push(&self, tx: HeldTx) {
-        let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
-        if by_hash.contains_key(&tx.hash) {
+        let mut txs = self.txs.lock().expect("held_pool txs poisoned");
+        if txs.iter().any(|held| held.hash == tx.hash) {
             return;
         }
-        let mut txs = self.txs.lock().expect("held_pool txs poisoned");
-        by_hash.insert(tx.hash, txs.len());
         txs.push_back(tx);
     }
 
@@ -109,18 +104,11 @@ impl HeldPool {
     /// skipped.
     pub fn push_front_batch(&self, recovered: Vec<HeldTx>) {
         let mut txs = self.txs.lock().expect("held_pool txs poisoned");
-        let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
         for tx in recovered.into_iter().rev() {
-            if by_hash.contains_key(&tx.hash) {
+            if txs.iter().any(|held| held.hash == tx.hash) {
                 continue;
             }
-            by_hash.insert(tx.hash, 0);
             txs.push_front(tx);
-        }
-        // Rebuild the index — every position shifted.
-        by_hash.clear();
-        for (i, tx) in txs.iter().enumerate() {
-            by_hash.insert(tx.hash, i);
         }
     }
 
@@ -151,7 +139,6 @@ impl HeldPool {
         nonce: u64,
     ) -> Vec<HeldTx> {
         let mut txs = self.txs.lock().expect("held_pool txs poisoned");
-        let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
         let mut drained = Vec::new();
         let mut kept = VecDeque::with_capacity(txs.len());
         for tx in txs.drain(..) {
@@ -162,10 +149,6 @@ impl HeldPool {
             }
         }
         *txs = kept;
-        by_hash.clear();
-        for (i, tx) in txs.iter().enumerate() {
-            by_hash.insert(tx.hash, i);
-        }
         drained
     }
 
@@ -179,7 +162,6 @@ impl HeldPool {
             return Vec::new();
         }
         let mut txs = self.txs.lock().expect("held_pool txs poisoned");
-        let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
         let consumed_set: HashSet<&TxHash> = consumed.iter().collect();
         let mut drained = Vec::new();
         let mut kept = VecDeque::with_capacity(txs.len());
@@ -191,11 +173,6 @@ impl HeldPool {
             }
         }
         *txs = kept;
-        // Rebuild the index — keys shifted by the partition.
-        by_hash.clear();
-        for (i, tx) in txs.iter().enumerate() {
-            by_hash.insert(tx.hash, i);
-        }
         drained
     }
 
@@ -204,10 +181,7 @@ impl HeldPool {
     /// this call; recovery paths re-`push` if needed.
     pub fn pop_all(&self) -> Vec<HeldTx> {
         let mut txs = self.txs.lock().expect("held_pool txs poisoned");
-        let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
-        let drained: Vec<HeldTx> = txs.drain(..).collect();
-        by_hash.clear();
-        drained
+        txs.drain(..).collect()
     }
 
     /// Drain up to `max` held txs (FIFO). Empirical fact about the
@@ -218,15 +192,8 @@ impl HeldPool {
     /// drain a large pool.
     pub fn pop_n(&self, max: usize) -> Vec<HeldTx> {
         let mut txs = self.txs.lock().expect("held_pool txs poisoned");
-        let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
         let n = max.min(txs.len());
-        let drained: Vec<HeldTx> = txs.drain(..n).collect();
-        // Rebuild index for the txs that remain.
-        by_hash.clear();
-        for (i, tx) in txs.iter().enumerate() {
-            by_hash.insert(tx.hash, i);
-        }
-        drained
+        txs.drain(..n).collect()
     }
 
     /// Number of currently-held txs.
@@ -279,6 +246,20 @@ mod tests {
         pool.push(tx(1));
         pool.push(tx(1));
         assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn push_front_batch_dedupes_and_preserves_order() {
+        let pool = HeldPool::new();
+        pool.push(tx(1));
+        pool.push(tx(2));
+        // tx(1) is already held → skipped; tx(3) goes to the front.
+        pool.push_front_batch(vec![tx(3), tx(1)]);
+        let drained = pool.pop_all();
+        assert_eq!(drained.len(), 3);
+        assert_eq!(drained[0].hash, TxHash::from(B256::repeat_byte(3)));
+        assert_eq!(drained[1].hash, TxHash::from(B256::repeat_byte(1)));
+        assert_eq!(drained[2].hash, TxHash::from(B256::repeat_byte(2)));
     }
 
     #[test]
