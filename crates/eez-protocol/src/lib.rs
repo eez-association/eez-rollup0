@@ -26,11 +26,6 @@
 //! - **Settlement root.** Before signing, the prover checks the settlement
 //!   `StateDelta.newState` against the root reth actually produced for the block.
 //!
-//! The submit pipeline an integrator wires: resolve a `ProofPlan`
-//! ([`proof_resolver::ProofPlanResolver`]) → [`entries::build_batch`] →
-//! [`public_inputs::public_inputs_hashes`] → sign each digest with
-//! [`EcdsaProofSigner`] → fill `batch.proofs[]` → [`entries::encode_postbatch`].
-//!
 //! # Where to start reading
 //!
 //! - [`Composer::simulate_and_resolve`] runs one cross-chain
@@ -56,7 +51,6 @@ pub mod executor;
 pub mod outbound_gate;
 pub mod overlay;
 pub mod proof_plan;
-pub mod proof_resolver;
 pub mod public_inputs;
 pub mod rolling_hash;
 pub mod rollup_id;
@@ -67,6 +61,11 @@ pub mod types;
 
 mod assertions;
 
+#[doc(inline)]
+pub use abi::{
+    ActionSol, ExecutionEntrySol, ExpectedL1ToL2CallSol, L2ToL1CallSol, LookupCallSol,
+    ProofSystemBatchPerVerificationEntriesSol, RollupIdWithProofSystemsSol, StateDeltaSol,
+};
 #[doc(inline)]
 pub use action::{compute_state_root_slot, cross_chain_call_hash};
 #[doc(inline)]
@@ -102,18 +101,6 @@ pub use overlay::{
 #[doc(inline)]
 pub use proof_plan::{
     ProofPlan, ProofPlanInvariantError, RollupProofAssignment, TimestampAndBlockHash,
-};
-// The submit/prover surface (see the crate-level "Soundness model"): the hash
-// helpers + the proof-plan resolver, re-exported so they're discoverable at the
-// root rather than only by module path.
-#[doc(inline)]
-pub use abi::{
-    ActionSol, ExecutionEntrySol, ExpectedL1ToL2CallSol, L2ToL1CallSol, LookupCallSol,
-    ProofSystemBatchPerVerificationEntriesSol, RollupIdWithProofSystemsSol, StateDeltaSol,
-};
-#[doc(inline)]
-pub use proof_resolver::{
-    AlloyRollupReader, IEEZReader, ProofPlanResolver, ResolverConfigError, RollupReader,
 };
 #[doc(inline)]
 pub use public_inputs::{all_per_ps_hashes, entry_hash, public_inputs_hashes, shared_public_input};
