@@ -164,6 +164,21 @@ fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
     }
 }
 
+alloy_sol_types::sol! {
+    /// Storage getter for `EEZ.rollups[rollupId]` (auto-generated
+    /// from `mapping(uint256 => RollupConfig) public rollups`).
+    /// Returns three fields in declaration order: `rollupContract`,
+    /// `stateRoot`, `etherBalance` — only `rollupContract` is
+    /// consumed here.
+    #[sol(rpc)]
+    interface IEEZReader {
+        function rollups(uint256 rollupId)
+            external
+            view
+            returns (address rollupContract, bytes32 stateRoot, uint256 etherBalance);
+    }
+}
+
 /// L1-confirmed escrow (`rollups(rid).etherBalance`) an outbound withdrawal draws
 /// down. `None` on any read failure, so the caller fails open (skips the precheck).
 async fn read_rollup_escrow(provider: &alloy_provider::RootProvider, rid: u64) -> Option<U256> {
@@ -171,7 +186,7 @@ async fn read_rollup_escrow(provider: &alloy_provider::RootProvider, rid: u64) -
         .ok()?
         .parse::<Address>()
         .ok()?;
-    eez_protocol::IEEZReader::new(eez, provider)
+    IEEZReader::new(eez, provider)
         .rollups(U256::from(rid))
         .call()
         .await
