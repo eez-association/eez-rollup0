@@ -11,7 +11,6 @@
 
 use std::sync::Arc;
 
-use alloy_primitives::Address;
 use eez_driver::RollupTiming;
 use eez_l1::{L1CanonicalHead, L1Error, L1Result};
 
@@ -49,7 +48,7 @@ impl RollupConfig {
     /// Returns [`L1Error::Config`] for any missing required var or
     /// malformed value.
     pub fn from_env() -> L1Result<Self> {
-        use std::{env, str::FromStr};
+        use std::env;
 
         let rollup_id = env::var("EEZ_ROLLUP_ID")
             .map_err(|_| L1Error::Config("EEZ_ROLLUP_ID is required".into()))?
