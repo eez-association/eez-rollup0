@@ -47,7 +47,6 @@ pub mod action;
 pub mod addresses;
 pub mod authorized_proxies;
 pub mod batch;
-pub mod checkpoint;
 pub mod composer;
 pub mod composition;
 pub mod dialect;
@@ -65,7 +64,6 @@ pub mod settlement;
 pub mod signer;
 pub mod system_tx;
 pub mod types;
-pub mod witness;
 
 mod assertions;
 
@@ -81,8 +79,6 @@ pub use authorized_proxies::{
 #[doc(inline)]
 pub use batch::EvmBatch;
 #[doc(inline)]
-pub use checkpoint::ExecutionCheckpoint;
-#[doc(inline)]
 pub use composer::{Composer, ComposerBuilder, ProxyLookupConfig, SourceAttribution, TargetConfig};
 #[doc(inline)]
 pub use composition::{CompositionBuilder, Rollup};
@@ -96,8 +92,8 @@ pub use error::{
 };
 #[doc(inline)]
 pub use executor::{
-    ChainClient, CommittedRootReader, EntryChainClient, ExecutionRequest, ExecutionResponse,
-    SessionSnapshot, TargetExecutionSession,
+    ChainClient, CommittedRootReader, EntryChainClient, ExecutionRequest, SessionSnapshot,
+    TargetExecutionSession,
 };
 #[doc(inline)]
 pub use overlay::{
@@ -133,5 +129,3 @@ pub use signer::{EcdsaProofSigner, SignerError};
 pub use types::{
     Composition, ExecutedAction, ExecutionOutcome, SourceComposition, StaticMeta, TargetComposition,
 };
-#[doc(inline)]
-pub use witness::EvmWitness;

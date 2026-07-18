@@ -77,9 +77,11 @@ use crate::entries;
 use crate::error::{
     CompositionResult, ExecutorError, ExecutorErrorKind, ExecutorResult, ProtocolErrorKind,
 };
-use crate::executor::{ChainClient, ExecutionRequest, ExecutionResponse, TargetExecutionSession};
+use crate::executor::{ChainClient, ExecutionRequest, TargetExecutionSession};
 use crate::rollup_id::RollupId;
-use crate::types::{Composition, ExecutedAction, SourceComposition, TargetComposition};
+use crate::types::{
+    Composition, ExecutedAction, ExecutionOutcome, SourceComposition, TargetComposition,
+};
 
 // Avoid a protocol → composer layering cycle: TargetConfig lives in
 // `composer.rs`, but this module reads `config.verification_context`
@@ -661,7 +663,7 @@ impl CompositionBuilder {
         target_rollup_id: RollupId,
         source_rollup_id: RollupId,
         req: ExecutionRequest,
-    ) -> ExecutorResult<ExecutionResponse> {
+    ) -> ExecutorResult<ExecutionOutcome> {
         // Drain any pending rollbacks queued by the previous frame's
         // `annotate_revert_span` / `close_call`. This is the next
         // async point — synchronous lifecycle methods cannot call
@@ -699,7 +701,7 @@ impl CompositionBuilder {
         // and push their own `ExecutedAction`s at indices `idx + 1, ..`.
         // The vec is preorder by construction.
         self.checked_out.insert(target_rollup_id);
-        let response_res = session.execute(req, self).await;
+        let outcome_res = session.execute(req, self).await;
 
         // Put the session back even on error; revert handling is
         // post-close via `annotate_revert_span`.
@@ -709,21 +711,21 @@ impl CompositionBuilder {
             .expect("rollup not removable")
             .session = Some(session);
 
-        let response = response_res?;
+        let outcome = outcome_res?;
 
         // Phase 3 — close: resolve the slot with the real outcome.
-        self.close_call(idx, response.outcome.clone(), None);
+        self.close_call(idx, outcome.clone(), None);
 
         tracing::debug!(
             name: "composer.dispatch_call",
             %target_rollup_id,
             %source_rollup_id,
-            success = response.outcome.is_success(),
-            gas = response.outcome.gas_used().unwrap_or(0),
+            success = outcome.is_success(),
+            gas = outcome.gas_used().unwrap_or(0),
             "dispatched cross-chain call"
         );
 
-        Ok(response)
+        Ok(outcome)
     }
 
     /// Push a `Pending` placeholder for a new call and return its
@@ -897,11 +899,8 @@ impl CompositionBuilder {
 mod tests {
     use super::*;
     use crate::action::cross_chain_call_hash;
-    use crate::checkpoint::ExecutionCheckpoint;
     use crate::composer::ProxyLookupConfig;
     use crate::dialect::ChainDialect;
-    use crate::overlay::EvmOverlay;
-    use crate::types::ExecutionOutcome;
     use alloy_primitives::{Address, Bytes, U256};
 
     // ── Mock ChainClient (spawns a canned session) ──────────────────
@@ -940,7 +939,7 @@ mod tests {
             &mut self,
             req: ExecutionRequest,
             dispatcher: &mut CompositionBuilder,
-        ) -> ExecutorResult<ExecutionResponse> {
+        ) -> ExecutorResult<ExecutionOutcome> {
             // Nested dispatch back into the SAME rollup (caller = some
             // other id so the plain target==source guard does not fire).
             dispatcher
@@ -956,9 +955,6 @@ mod tests {
             _snapshot: crate::executor::SessionSnapshot,
         ) -> ExecutorResult<()> {
             Ok(())
-        }
-        async fn take_checkpoint(&mut self) -> Option<ExecutionCheckpoint> {
-            None
         }
     }
 
@@ -992,20 +988,8 @@ mod tests {
             &mut self,
             _req: ExecutionRequest,
             _dispatcher: &mut CompositionBuilder,
-        ) -> ExecutorResult<ExecutionResponse> {
-            Ok(ExecutionResponse {
-                outcome: self.outcome.clone(),
-                checkpoint: ExecutionCheckpoint {
-                    version: 1,
-                    chain_id: 1,
-                    base_block_number: 0,
-                    base_block_hash: [0u8; 32],
-                    base_state_root: [0u8; 32],
-                    current_root: [0u8; 32],
-                    overlay: EvmOverlay::default(),
-                    witness: None,
-                },
-            })
+        ) -> ExecutorResult<ExecutionOutcome> {
+            Ok(self.outcome.clone())
         }
 
         async fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
@@ -1017,10 +1001,6 @@ mod tests {
             _snap: crate::executor::SessionSnapshot,
         ) -> ExecutorResult<()> {
             Ok(())
-        }
-
-        async fn take_checkpoint(&mut self) -> Option<ExecutionCheckpoint> {
-            None
         }
     }
 
@@ -1084,7 +1064,7 @@ mod tests {
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
             .await
             .expect("dispatch");
-        assert_eq!(response.outcome.post_state_root(), Some(&[0x11u8; 32]));
+        assert_eq!(response.post_state_root(), Some(&[0x11u8; 32]));
         assert_eq!(builder.recorded.len(), 1);
         assert_eq!(builder.recorded[0].target_rollup_id, RollupId(1));
         assert_eq!(builder.recorded[0].source_rollup_id, RollupId(0));
@@ -1426,7 +1406,7 @@ mod tests {
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
             .await
             .expect("dispatch");
-        assert!(resp.outcome.is_success());
+        assert!(resp.is_success());
         assert_eq!(builder.recorded.len(), 2);
         assert!(crate::assertions::is_preorder(
             &builder.recorded,

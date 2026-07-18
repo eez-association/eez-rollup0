@@ -37,8 +37,7 @@
 //!   TargetExecutionSession      one per builder; the slot drain may
 //!                               chain it across source txs (F1)
 //!       │
-//!       ├─ execute              one call, owned by the builder
-//!       └─ take_checkpoint      drain accumulated state
+//!       └─ execute              one call, owned by the builder
 //! ```
 //!
 //! Follower clients (gRPC peers, non-entry local clients) implement
@@ -48,7 +47,6 @@
 
 use alloy_primitives::{Address, Bytes, U256};
 
-use crate::checkpoint::ExecutionCheckpoint;
 use crate::composition::CompositionBuilder;
 use crate::error::ExecutorResult;
 #[allow(
@@ -76,29 +74,6 @@ pub struct ExecutionRequest {
     pub source_rollup_id: RollupId,
 }
 
-/// Full executor response: lean outcome + checkpoint for continuation/proving.
-#[derive(Clone)]
-pub struct ExecutionResponse {
-    /// Lean result used to synthesize the source-side call's return
-    /// value for the source transaction that triggered it.
-    pub outcome: ExecutionOutcome,
-    /// Accumulated state (overlay + optional witness) for continuation
-    /// across calls and for proof-system handoff.
-    pub checkpoint: ExecutionCheckpoint,
-}
-
-// Manual Debug — intentional: print a placeholder for `checkpoint` —
-// real checkpoints are large (overlay + witness state) and would
-// flood logs.
-impl std::fmt::Debug for ExecutionResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExecutionResponse")
-            .field("outcome", &self.outcome)
-            .field("checkpoint", &"<ExecutionCheckpoint>")
-            .finish()
-    }
-}
-
 /// Stateful execution session driving target-chain calls during
 /// source simulation.
 ///
@@ -122,7 +97,7 @@ pub trait TargetExecutionSession: Send {
     ///
     /// `dispatcher` is consumed by nested cross-chain dispatch.
     ///
-    /// Returns outcome (for source simulation) + checkpoint (for continuation).
+    /// Returns the outcome for source simulation.
     ///
     /// # Errors
     ///
@@ -135,7 +110,7 @@ pub trait TargetExecutionSession: Send {
         &mut self,
         req: ExecutionRequest,
         dispatcher: &mut CompositionBuilder,
-    ) -> ExecutorResult<ExecutionResponse>;
+    ) -> ExecutorResult<ExecutionOutcome>;
 
     /// Capture an opaque snapshot of the session's current state. The
     /// returned box is fed back to [`rollback`](Self::rollback) to
@@ -170,11 +145,6 @@ pub trait TargetExecutionSession: Send {
     /// Returns [`ExecutorErrorKind::Decode`] if the snapshot's
     /// concrete type does not match this session's snapshot shape.
     async fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()>;
-
-    /// Retrieve the accumulated witness/overlay checkpoint after all
-    /// calls — the prover-facing handoff distinct from the rollback
-    /// snapshot above. Returns `None` if no calls have been executed.
-    async fn take_checkpoint(&mut self) -> Option<ExecutionCheckpoint>;
 }
 
 /// Type-erased session snapshot. Each [`TargetExecutionSession`] impl

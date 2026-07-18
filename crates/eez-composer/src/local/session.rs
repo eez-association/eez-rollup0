@@ -20,7 +20,7 @@ use revm::DatabaseCommit;
 use revm::database::CacheState;
 
 use eez_protocol::{
-    CompositionBuilder, ExecutionRequest, ExecutionResponse, ExecutorError, ExecutorErrorKind,
+    CompositionBuilder, ExecutionOutcome, ExecutionRequest, ExecutorError, ExecutorErrorKind,
     ExecutorResult, RollupId, TargetExecutionSession,
 };
 
@@ -389,7 +389,7 @@ impl TargetExecutionSession for LocalExecutionSession {
         &mut self,
         req: ExecutionRequest,
         dispatcher: &mut CompositionBuilder,
-    ) -> ExecutorResult<ExecutionResponse> {
+    ) -> ExecutorResult<ExecutionOutcome> {
         // Pitfall #3 invariant: this method runs SYNCHRONOUSLY under
         // the caller's `Handle::block_on`. Do NOT introduce a real
         // `.await` on I/O here or in `execute_internal*` — the target-
@@ -422,23 +422,7 @@ impl TargetExecutionSession for LocalExecutionSession {
             )?
         };
 
-        let pre = outcome.pre_state_root().copied().unwrap_or([0u8; 32]);
-        let post = outcome.post_state_root().copied().unwrap_or([0u8; 32]);
-        let checkpoint = eez_protocol::ExecutionCheckpoint {
-            version: 1,
-            chain_id: self.chain_id,
-            base_block_number: 0,
-            base_block_hash: [0u8; 32],
-            base_state_root: pre,
-            current_root: post,
-            overlay: eez_protocol::EvmOverlay::default(),
-            witness: None,
-        };
-
-        Ok(ExecutionResponse {
-            outcome,
-            checkpoint,
-        })
+        Ok(outcome)
     }
 
     async fn checkpoint(&mut self) -> ExecutorResult<eez_protocol::SessionSnapshot> {
@@ -456,20 +440,6 @@ impl TargetExecutionSession for LocalExecutionSession {
         })?;
         self.current_root = revm::primitives::B256::from(root);
         Ok(())
-    }
-
-    /// Placeholder checkpoint until overlay/witness recording is implemented.
-    async fn take_checkpoint(&mut self) -> Option<eez_protocol::ExecutionCheckpoint> {
-        Some(eez_protocol::ExecutionCheckpoint {
-            version: 1,
-            chain_id: self.chain_id,
-            base_block_number: 0,
-            base_block_hash: [0u8; 32],
-            base_state_root: [0u8; 32],
-            current_root: self.current_root.0,
-            overlay: eez_protocol::EvmOverlay::default(),
-            witness: None,
-        })
     }
 }
 
