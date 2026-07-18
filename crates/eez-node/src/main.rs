@@ -492,7 +492,7 @@ fn main() -> eyre::Result<()> {
             // via `CrossChainWiring`. `None` without an embedded L1.
             let mut l2_entry_client: Option<
                 Arc<
-                    dyn eez_protocol::executor::EntryChainClient
+                    dyn eez_protocol::executor::ChainClient
                         + Send
                         + Sync,
                 >,
@@ -532,12 +532,12 @@ fn main() -> eyre::Result<()> {
                                 eez_protocol::ChainDialect::EvmL1Style,
                             );
                             let entry_view: std::sync::Arc<
-                                dyn eez_protocol::executor::EntryChainClient
+                                dyn eez_protocol::executor::ChainClient
                                     + Send
                                     + Sync,
                             > = entry_client.clone();
                             let root_view: std::sync::Arc<
-                                dyn eez_protocol::executor::CommittedRootReader
+                                dyn eez_protocol::executor::ChainClient
                                     + Send
                                     + Sync,
                             > = entry_client.clone();
@@ -567,12 +567,12 @@ fn main() -> eyre::Result<()> {
                                 eez_protocol::ChainDialect::EvmL1Style,
                             );
                             let entry_view: std::sync::Arc<
-                                dyn eez_protocol::executor::EntryChainClient
+                                dyn eez_protocol::executor::ChainClient
                                     + Send
                                     + Sync,
                             > = entry_client.clone();
                             let root_view: std::sync::Arc<
-                                dyn eez_protocol::executor::CommittedRootReader
+                                dyn eez_protocol::executor::ChainClient
                                     + Send
                                     + Sync,
                             > = entry_client.clone();
@@ -611,7 +611,7 @@ fn main() -> eyre::Result<()> {
                         eez_protocol::ChainDialect::EvmL2Style,
                     );
                     let l2_entry_view: std::sync::Arc<
-                        dyn eez_protocol::executor::EntryChainClient
+                        dyn eez_protocol::executor::ChainClient
                             + Send
                             + Sync,
                     > = l2_entry;

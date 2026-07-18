@@ -39,7 +39,7 @@ use alloy_primitives::Address;
 use crate::composition::{CompositionBuilder, Rollup};
 use crate::dialect::ChainDialect;
 use crate::error::{ComposerError, ComposerErrorKind, ComposerResult};
-use crate::executor::{ChainClient, CommittedRootReader, EntryChainClient};
+use crate::executor::ChainClient;
 use crate::rollup_id::RollupId;
 use crate::types::{Composition, ExecutedAction};
 
@@ -132,7 +132,7 @@ struct ComposerInner {
     /// distinct from the `rollups` map which holds the same client
     /// coerced to `ChainClient`. Held so the composer can call
     /// `simulate_source_tx` without an Any-downcast.
-    entry: Arc<dyn EntryChainClient + Send + Sync>,
+    entry: Arc<dyn ChainClient + Send + Sync>,
     /// Committed-root reader (`CommittedRootReader` trait object) used
     /// by Phase 1 of `simulate_and_resolve` to read each rollup's
     /// upstream-invariant-6 anchor root. Required at registration; see
@@ -140,7 +140,7 @@ struct ComposerInner {
     /// client (entry-when-L1 or follower-when-L1-in-L2-as-entry)
     /// reading its own `EEZ.sol` storage, or a gRPC client whose
     /// remote peer is L1.
-    root_reader: Arc<dyn CommittedRootReader + Send + Sync>,
+    root_reader: Arc<dyn ChainClient + Send + Sync>,
     /// All registered rollups (entry + followers). The entry is also
     /// in this map via trait upcast — composition orchestration uses
     /// it uniformly.
@@ -156,8 +156,8 @@ struct ComposerInner {
 /// race-able state.
 pub struct ComposerBuilder {
     entry_rollup_id: RollupId,
-    entry: Option<Arc<dyn EntryChainClient + Send + Sync>>,
-    root_reader: Option<Arc<dyn CommittedRootReader + Send + Sync>>,
+    entry: Option<Arc<dyn ChainClient + Send + Sync>>,
+    root_reader: Option<Arc<dyn ChainClient + Send + Sync>>,
     rollups: HashMap<RollupId, RegisteredRollup>,
     /// Latched error — set by [`rollup`](Self::rollup) when called with
     /// an id that conflicts with the entry rollup or with a previously
@@ -204,19 +204,17 @@ impl ComposerBuilder {
     #[must_use]
     pub fn entry(
         mut self,
-        client: Arc<dyn EntryChainClient + Send + Sync>,
+        client: Arc<dyn ChainClient + Send + Sync>,
         config: TargetConfig,
     ) -> Self {
-        let entry_client_for_slot = Arc::clone(&client);
-        let chain_client: Arc<dyn ChainClient + Send + Sync> = client;
         self.rollups.insert(
             self.entry_rollup_id,
             RegisteredRollup {
-                client: chain_client,
+                client: Arc::clone(&client),
                 config,
             },
         );
-        self.entry = Some(entry_client_for_slot);
+        self.entry = Some(client);
         self
     }
 
@@ -239,7 +237,7 @@ impl ComposerBuilder {
     ///
     /// Calling twice replaces the previous reader.
     #[must_use]
-    pub fn root_reader(mut self, client: Arc<dyn CommittedRootReader + Send + Sync>) -> Self {
+    pub fn root_reader(mut self, client: Arc<dyn ChainClient + Send + Sync>) -> Self {
         self.root_reader = Some(client);
         self
     }
@@ -405,7 +403,7 @@ impl Composer {
     pub async fn simulate_and_resolve_recorded_for(
         &self,
         entry_id: RollupId,
-        entry_client: &(dyn EntryChainClient + Send + Sync),
+        entry_client: &(dyn ChainClient + Send + Sync),
         raw_tx: &[u8],
     ) -> ComposerResult<(Composition, Vec<ExecutedAction>)> {
         tracing::info!(
@@ -491,10 +489,6 @@ mod tests {
         ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
             unimplemented!("composer misconfigured-state tests never open a session")
         }
-    }
-
-    #[async_trait::async_trait]
-    impl EntryChainClient for FakeClient {
         async fn simulate_source_tx(
             &self,
             _raw_tx: Vec<u8>,
@@ -505,20 +499,13 @@ mod tests {
             // actually seals inside simulate_and_resolve.
             Ok(())
         }
-    }
-
-    #[async_trait::async_trait]
-    impl CommittedRootReader for FakeClient {
         async fn stored_target_state_root(&self, _rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
             Ok([0u8; 32])
         }
     }
 
-    // A standalone ChainClient-only follower fake — ensures
-    // register_rollup accepts a type that does NOT impl
-    // EntryChainClient (the trait-object erasure is what the bound
-    // requires; no upcast from dyn ChainClient to dyn EntryChainClient
-    // is possible).
+    // A follower fake that keeps the default role-refusal impls of
+    // simulate_source_tx / stored_target_state_root.
     struct FakeFollowerClient;
 
     #[async_trait::async_trait]
@@ -547,11 +534,11 @@ mod tests {
         }
     }
 
-    fn entry_arc() -> Arc<dyn EntryChainClient + Send + Sync> {
+    fn entry_arc() -> Arc<dyn ChainClient + Send + Sync> {
         Arc::new(FakeClient)
     }
 
-    fn root_reader_arc() -> Arc<dyn CommittedRootReader + Send + Sync> {
+    fn root_reader_arc() -> Arc<dyn ChainClient + Send + Sync> {
         Arc::new(FakeClient)
     }
 
