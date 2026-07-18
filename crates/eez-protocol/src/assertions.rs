@@ -99,7 +99,6 @@ mod tests {
             value: U256::ZERO,
             outcome: ExecutionOutcome::Pending,
             revert_span: None,
-            static_meta: None,
         }
     }
 
