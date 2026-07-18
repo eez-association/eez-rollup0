@@ -132,11 +132,25 @@ impl std::fmt::Debug for CrossChainExecCtx {
 /// The cross-chain compose dependencies, wired together (all-or-
 /// nothing) by `eez-node` startup when the embedded L1 is up.
 pub struct CrossChainWiring {
-    /// Cross-chain composer: per-tx `simulate_and_resolve`
-    /// orchestrator. `compose_sync_slot` dispatches each held tx
-    /// through it to get the `Composition` (L2 destination effects +
-    /// L1 `ExecutionEntry`s).
-    pub composer: eez_protocol::Composer,
+    /// Rollup id of the pinned (L1) entry chain.
+    pub entry_rollup_id: eez_protocol::RollupId,
+    /// Entry-chain (L1) client — runs source simulation for INBOUND
+    /// (L1→L2) txs.
+    pub entry_client: Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+    /// Committed-root reader: serves every rollup's upstream-
+    /// invariant-6 anchor root (`EEZ.rollups[id].stateRoot`) —
+    /// chain headers are NOT correct for this purpose.
+    pub root_reader: Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+    /// All registered rollups (entry + followers): client + config,
+    /// keyed by rollup id. The per-tx dispatch map is built from this
+    /// on every composition.
+    pub rollups: HashMap<
+        eez_protocol::RollupId,
+        (
+            Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+            eez_protocol::TargetConfig,
+        ),
+    >,
     /// Runtime context (signer + L2 chain config) for wrapping the
     /// composer's `(load_table_payload, execute_payload)` byte
     /// outputs into signed L2 system txs.
@@ -146,6 +160,108 @@ pub struct CrossChainWiring {
     /// must run against an L2 entry (the L2 follower's `ChainClient`
     /// errors `Unavailable` for source sim).
     pub l2_entry_client: Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+}
+
+impl CrossChainWiring {
+    /// Detect cross-chain proxy calls for one source tx against the
+    /// pinned (L1) entry and return the final
+    /// [`eez_protocol::Composition`].
+    ///
+    /// # Errors
+    ///
+    /// Surfaces simulation, dispatch, and finalization failures as
+    /// [`eez_protocol::ComposerError`].
+    pub async fn simulate_and_resolve(
+        &self,
+        raw_tx: &[u8],
+    ) -> eez_protocol::ComposerResult<eez_protocol::Composition> {
+        self.simulate_and_resolve_recorded_for(self.entry_rollup_id, &*self.entry_client, raw_tx)
+            .await
+            .map(|(composition, _recorded)| composition)
+    }
+
+    /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve) but
+    /// with an explicitly-chosen entry — `entry_id` + the `entry_client`
+    /// that runs source simulation — and ALSO returning the builder's
+    /// `recorded[..]` (preorder dispatched cross-chain calls with
+    /// resolved outcomes). The explicit entry lets one wiring compose
+    /// either direction — `(L1, L1 client)` for an inbound L1→L2 call,
+    /// `(L2, L2 client)` for an outbound L2→L1 call — picked per tx by
+    /// the drain.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve).
+    pub async fn simulate_and_resolve_recorded_for(
+        &self,
+        entry_id: eez_protocol::RollupId,
+        entry_client: &(dyn eez_protocol::executor::ChainClient + Send + Sync),
+        raw_tx: &[u8],
+    ) -> eez_protocol::ComposerResult<(eez_protocol::Composition, Vec<eez_protocol::ExecutedAction>)>
+    {
+        use eez_protocol::composition::Rollup;
+
+        event!(
+            name: "composer.simulate.start",
+            Level::INFO,
+            entry_id = entry_id.0,
+            tx_len = raw_tx.len(),
+            rollup_count = self.rollups.len(),
+            "simulate_and_resolve: starting composition pipeline"
+        );
+
+        // Phase 1 — assemble per-rollup state for the builder.
+        //
+        // For each rollup (including the entry):
+        // - client: cheap Arc clone from the registration.
+        // - session: None (lazy-open on first dispatch).
+        // - initial_state_root: read via the committed-root reader. The
+        //   upstream protocol enforces `entry[i].currentState ==
+        //   rollups[id].stateRoot` for every delta in `postBatch` (see
+        //   `EEZ.sol`), so ALL rollups (including the entry's own) read
+        //   through the committed-root reader — chain headers
+        //   (self-reports) are NOT correct for upstream-invariant-6
+        //   anchoring.
+        let mut rollups = HashMap::with_capacity(self.rollups.len());
+        for (rollup_id, (client, config)) in &self.rollups {
+            let initial_state_root = self
+                .root_reader
+                .stored_target_state_root(*rollup_id)
+                .await?;
+            rollups.insert(
+                *rollup_id,
+                Rollup {
+                    client: Arc::clone(client),
+                    session: None,
+                    config: config.clone(),
+                    initial_state_root,
+                },
+            );
+        }
+
+        // Phase 2 — compose: drive source simulation (which dispatches
+        // every detected proxy call back into the builder), then
+        // finalize. `recorded` carries the resolved per-call outcomes
+        // (return_data) the byte-locked inbound delivery needs,
+        // captured BEFORE `finalize` consumes the builder.
+        let mut builder = eez_protocol::CompositionBuilder::new(entry_id, rollups);
+        entry_client
+            .simulate_source_tx(raw_tx.to_vec(), &mut builder)
+            .await
+            .map_err(eez_protocol::CompositionError::from)?;
+        let recorded = builder.recorded().to_vec();
+        let composition = builder.finalize(raw_tx).await?;
+
+        event!(
+            name: "composer.simulate.complete",
+            Level::INFO,
+            target_count = composition.targets.len(),
+            recorded = recorded.len(),
+            "composition complete"
+        );
+
+        Ok((composition, recorded))
+    }
 }
 
 impl std::fmt::Debug for CrossChainWiring {
@@ -1199,7 +1315,7 @@ where
         suggested_fee_recipient: Address,
         bundle_target: BundleTarget,
     ) -> Result<Option<SyncSlotBlock>, String> {
-        let evm_composer = &cc.composer;
+        let evm_composer = cc;
         let ctx = cc.exec_ctx.as_ref();
         // Read SYSTEM_ADDRESS nonce at the parent state — the next
         // signed system tx must use this. We sign multiple txs per

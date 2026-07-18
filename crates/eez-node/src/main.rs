@@ -470,12 +470,23 @@ fn main() -> eyre::Result<()> {
                         + Sync,
                 >,
             > = None;
-            let evm_composer: Option<eez_protocol::Composer> =
+            type WiringParts = (
+                eez_protocol::RollupId,
+                Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+                Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+                std::collections::HashMap<
+                    eez_protocol::RollupId,
+                    (
+                        Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+                        eez_protocol::TargetConfig,
+                    ),
+                >,
+            );
+            let evm_composer: Option<WiringParts> =
                 if let Some(l1_variant) = embedded_l1.as_ref() {
                     use eez_composer::{GnosisL1Adapter, LocalChainClient};
-                    use eez_protocol::{ProxyLookupConfig, TargetConfig};
-                    use eez_protocol::Composer as ProtocolComposer;
                     use eez_protocol::rollup_id::RollupId;
+                    use eez_protocol::{ProxyLookupConfig, TargetConfig};
 
                     let ccm_l2: Address = Address::from_str(&env::var("EEZ_CCM_L2_ADDRESS").map_err(
                         |_| eyre::eyre!("EEZ_CCM_L2_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
@@ -601,12 +612,16 @@ fn main() -> eyre::Result<()> {
                         dialect: eez_protocol::ChainDialect::EvmL2Style,
                     };
 
-                    let composed = ProtocolComposer::builder(l1_rollup_id)
-                        .entry(entry_client_view, entry_cfg)
-                    .root_reader(root_reader_view)
-                    .rollup(l2_rollup_id_typed, l2_follower_view, l2_follower_cfg)
-                    .build()
-                    .map_err(|e| eyre::eyre!("cross-chain composer build failed: {e}"))?;
+                    let mut wired_rollups = std::collections::HashMap::new();
+                    wired_rollups
+                        .insert(l1_rollup_id, (Arc::clone(&entry_client_view), entry_cfg));
+                    wired_rollups.insert(l2_rollup_id_typed, (l2_follower_view, l2_follower_cfg));
+                    let composed = (
+                        l1_rollup_id,
+                        entry_client_view,
+                        root_reader_view,
+                        wired_rollups,
+                    );
                     event!(
                         name: "eez.node.evm_composer.ready",
                         Level::INFO,
@@ -757,13 +772,18 @@ fn main() -> eyre::Result<()> {
             // All three cross-chain pieces are wired together by the
             // embedded-L1 branch above, or not at all.
             let cross_chain = match (evm_composer, cc_exec_ctx, l2_entry_client) {
-                (Some(composer), Some(exec_ctx), Some(l2_entry_client)) => {
-                    Some(CrossChainWiring {
-                        composer,
-                        exec_ctx,
-                        l2_entry_client,
-                    })
-                }
+                (
+                    Some((entry_rollup_id, entry_client, root_reader, wired_rollups)),
+                    Some(exec_ctx),
+                    Some(l2_entry_client),
+                ) => Some(CrossChainWiring {
+                    entry_rollup_id,
+                    entry_client,
+                    root_reader,
+                    rollups: wired_rollups,
+                    exec_ctx,
+                    l2_entry_client,
+                }),
                 _ => None,
             };
             let composer = Composer::new(
