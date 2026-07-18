@@ -6,7 +6,7 @@
 //! which runs the Foundry script
 //! `contracts/script/GenPublicInputsHashVectors.s.sol`) and
 //! asserts that the Rust mirror in
-//! [`eez_evm::public_inputs`] produces byte-identical
+//! [`eez_protocol::public_inputs`] produces byte-identical
 //! shared + per-PS hashes for every vector.
 //!
 //! Vectors are flattened — they carry per-element hashes
@@ -28,8 +28,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use alloy_primitives::{B256, Bytes, U256, hex};
-use eez_evm::EvmProtocol;
-use eez_evm::public_inputs::{per_ps_public_inputs_hash, shared_public_input};
+use eez_protocol::public_inputs::{per_ps_public_inputs_hash, shared_public_input};
 use eez_protocol::{ProofPlan, RollupId, RollupProofAssignment, TimestampAndBlockHash};
 use serde::Deserialize;
 
@@ -101,7 +100,7 @@ fn parse_timestamp(s: &str) -> [u8; 32] {
     v.to_be_bytes::<32>()
 }
 
-fn build_plan(v: &Vector) -> ProofPlan<EvmProtocol> {
+fn build_plan(v: &Vector) -> ProofPlan {
     let proof_system_count = v.proof_system_count as usize;
     // Vectors don't carry proof-system addresses themselves —
     // the publicInputsHash construction doesn't depend on them

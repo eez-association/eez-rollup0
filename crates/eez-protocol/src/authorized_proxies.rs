@@ -26,12 +26,12 @@
 //!
 //! Both constants are consumed at config build time as the
 //! `authorized_proxies_slot: u8` field on
-//! [`eez_protocol::ProxyLookupConfig`]. The inspector reads
+//! [`crate::ProxyLookupConfig`]. The inspector reads
 //! [`proxy_mapping_key`] / [`decode_proxy_value`] directly via the
 //! `u8` slot.
 
+use crate::RollupId;
 use alloy_primitives::{Address, B256, U256, keccak256};
-use eez_protocol::RollupId;
 
 /// Storage slot of `authorizedProxies` on `EEZ.sol` (L1).
 ///

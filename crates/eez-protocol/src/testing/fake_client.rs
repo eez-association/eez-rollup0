@@ -13,7 +13,7 @@
 //! - [`with_stored_root`](FakeChainClient::with_stored_root) — seed one
 //!   `stored_target_state_root` lookup result (entry-only).
 //! - [`with_checkpoint_factory`](FakeChainClient::with_checkpoint_factory)
-//!   — how the spawned session synthesizes its `ExecutionCheckpoint<P>`.
+//!   — how the spawned session synthesizes its `ExecutionCheckpoint`.
 //!   Required for any test that calls `session.execute(...)`.
 //!
 //! # Assertions
@@ -34,13 +34,13 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use crate::composition::Dispatcher;
+use crate::checkpoint::ExecutionCheckpoint;
+use crate::composition::CompositionBuilder;
 use crate::error::{ExecutorError, ExecutorErrorKind, ExecutorResult};
 use crate::executor::{
-    ChainClient, EntryChainClient, ExecutionRequest, ExecutionResponse, ProtocolCheckpoint,
-    TargetBatchSimulation, TargetExecutionSession, TargetTransaction,
+    ChainClient, EntryChainClient, ExecutionRequest, ExecutionResponse, TargetBatchSimulation,
+    TargetExecutionSession, TargetTransaction,
 };
-use crate::protocol::ChainProtocol;
 use crate::rollup_id::RollupId;
 use crate::types::ExecutionOutcome;
 
@@ -58,16 +58,15 @@ pub enum FakeRole {
     Follower,
 }
 
-type SimulateSourceHook<P> = Box<
-    dyn FnMut(Vec<u8>, &mut (dyn Dispatcher<Protocol = P> + Send)) -> ExecutorResult<()> + Send,
->;
+type SimulateSourceHook =
+    Box<dyn FnMut(Vec<u8>, &mut CompositionBuilder) -> ExecutorResult<()> + Send>;
 
-type CheckpointFactory<P> = Box<dyn FnMut() -> ProtocolCheckpoint<P> + Send>;
+type CheckpointFactory = Box<dyn FnMut() -> ExecutionCheckpoint + Send>;
 
 /// Canonical test double for `ChainClient` + `EntryChainClient`.
 ///
 /// See module docs for the scripted-hook and assertion surface.
-pub struct FakeChainClient<P: ChainProtocol + 'static> {
+pub struct FakeChainClient {
     rollup_id: RollupId,
     role: FakeRole,
 
@@ -76,18 +75,18 @@ pub struct FakeChainClient<P: ChainProtocol + 'static> {
     // client observes dispatched_outcomes after the composition runs.
     session_outcomes: Arc<Mutex<VecDeque<ExecutionOutcome>>>,
     dispatched_outcomes: Arc<Mutex<Vec<ExecutionOutcome>>>,
-    checkpoint_factory: Arc<Mutex<Option<CheckpointFactory<P>>>>,
+    checkpoint_factory: Arc<Mutex<Option<CheckpointFactory>>>,
 
     // Client-only scripted queues.
     simulate_transactions_results: Mutex<VecDeque<ExecutorResult<TargetBatchSimulation>>>,
-    simulate_source_hook: Mutex<Option<SimulateSourceHook<P>>>,
+    simulate_source_hook: Mutex<Option<SimulateSourceHook>>,
     stored_roots: Mutex<HashMap<RollupId, [u8; 32]>>,
 
     // Client-side recorders.
-    simulated_batches: Mutex<Vec<Vec<TargetTransaction<P>>>>,
+    simulated_batches: Mutex<Vec<Vec<TargetTransaction>>>,
 }
 
-impl<P: ChainProtocol + 'static> std::fmt::Debug for FakeChainClient<P> {
+impl std::fmt::Debug for FakeChainClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FakeChainClient")
             .field("rollup_id", &self.rollup_id)
@@ -96,7 +95,7 @@ impl<P: ChainProtocol + 'static> std::fmt::Debug for FakeChainClient<P> {
     }
 }
 
-impl<P: ChainProtocol + 'static> FakeChainClient<P> {
+impl FakeChainClient {
     /// Build an entry-role fake.
     #[must_use]
     pub fn new_entry(rollup_id: RollupId) -> Self {
@@ -152,9 +151,7 @@ impl<P: ChainProtocol + 'static> FakeChainClient<P> {
     /// Install the `simulate_source_tx` hook (entry-only).
     #[must_use]
     pub fn with_simulate_source_hook<
-        F: FnMut(Vec<u8>, &mut (dyn Dispatcher<Protocol = P> + Send)) -> ExecutorResult<()>
-            + Send
-            + 'static,
+        F: FnMut(Vec<u8>, &mut CompositionBuilder) -> ExecutorResult<()> + Send + 'static,
     >(
         self,
         hook: F,
@@ -179,7 +176,7 @@ impl<P: ChainProtocol + 'static> FakeChainClient<P> {
     /// Install the checkpoint factory. Required for any test that
     /// drives `session.execute(...)`.
     #[must_use]
-    pub fn with_checkpoint_factory<F: FnMut() -> ProtocolCheckpoint<P> + Send + 'static>(
+    pub fn with_checkpoint_factory<F: FnMut() -> ExecutionCheckpoint + Send + 'static>(
         self,
         factory: F,
     ) -> Self {
@@ -199,7 +196,7 @@ impl<P: ChainProtocol + 'static> FakeChainClient<P> {
 
     /// Snapshot of batches passed to `simulate_transactions`.
     #[must_use]
-    pub fn simulated_batches(&self) -> Vec<Vec<TargetTransaction<P>>> {
+    pub fn simulated_batches(&self) -> Vec<Vec<TargetTransaction>> {
         self.simulated_batches
             .lock()
             .expect("fake mutex poisoned")
@@ -227,12 +224,10 @@ impl<P: ChainProtocol + 'static> FakeChainClient<P> {
 }
 
 #[async_trait]
-impl<P: ChainProtocol + 'static> ChainClient for FakeChainClient<P> {
-    type Protocol = P;
-
+impl ChainClient for FakeChainClient {
     async fn begin_execution_session(
         &self,
-    ) -> ExecutorResult<Box<dyn TargetExecutionSession<Protocol = P> + Send>> {
+    ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
         Ok(Box::new(FakeChainSession {
             outcomes: Arc::clone(&self.session_outcomes),
             dispatched_outcomes: Arc::clone(&self.dispatched_outcomes),
@@ -243,7 +238,7 @@ impl<P: ChainProtocol + 'static> ChainClient for FakeChainClient<P> {
 
     async fn simulate_transactions(
         &self,
-        txs: &[TargetTransaction<P>],
+        txs: &[TargetTransaction],
     ) -> ExecutorResult<TargetBatchSimulation> {
         self.simulated_batches
             .lock()
@@ -271,11 +266,11 @@ impl<P: ChainProtocol + 'static> ChainClient for FakeChainClient<P> {
 }
 
 #[async_trait]
-impl<P: ChainProtocol + 'static> EntryChainClient for FakeChainClient<P> {
+impl EntryChainClient for FakeChainClient {
     async fn simulate_source_tx(
         &self,
         raw_tx: Vec<u8>,
-        dispatcher: &mut (dyn Dispatcher<Protocol = Self::Protocol> + Send),
+        dispatcher: &mut CompositionBuilder,
     ) -> ExecutorResult<()> {
         self.require_entry("simulate_source_tx")?;
         let mut guard = self
@@ -290,7 +285,7 @@ impl<P: ChainProtocol + 'static> EntryChainClient for FakeChainClient<P> {
 }
 
 #[async_trait]
-impl<P: ChainProtocol + 'static> crate::executor::CommittedRootReader for FakeChainClient<P> {
+impl crate::executor::CommittedRootReader for FakeChainClient {
     async fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
         self.require_entry("stored_target_state_root")?;
         self.stored_roots
@@ -309,14 +304,14 @@ impl<P: ChainProtocol + 'static> crate::executor::CommittedRootReader for FakeCh
 /// Pops one outcome from the client's shared queue per
 /// [`execute`](Self::execute) call and invokes the checkpoint factory
 /// to synthesize the response.
-pub struct FakeChainSession<P: ChainProtocol + 'static> {
+pub struct FakeChainSession {
     outcomes: Arc<Mutex<VecDeque<ExecutionOutcome>>>,
     dispatched_outcomes: Arc<Mutex<Vec<ExecutionOutcome>>>,
-    checkpoint_factory: Arc<Mutex<Option<CheckpointFactory<P>>>>,
+    checkpoint_factory: Arc<Mutex<Option<CheckpointFactory>>>,
     rollup_id: RollupId,
 }
 
-impl<P: ChainProtocol + 'static> std::fmt::Debug for FakeChainSession<P> {
+impl std::fmt::Debug for FakeChainSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FakeChainSession")
             .field("rollup_id", &self.rollup_id)
@@ -325,14 +320,12 @@ impl<P: ChainProtocol + 'static> std::fmt::Debug for FakeChainSession<P> {
 }
 
 #[async_trait]
-impl<P: ChainProtocol + 'static> TargetExecutionSession for FakeChainSession<P> {
-    type Protocol = P;
-
+impl TargetExecutionSession for FakeChainSession {
     async fn execute(
         &mut self,
-        _req: ExecutionRequest<Self::Protocol>,
-        _dispatcher: &mut (dyn Dispatcher<Protocol = Self::Protocol> + Send),
-    ) -> ExecutorResult<ExecutionResponse<Self::Protocol>> {
+        _req: ExecutionRequest,
+        _dispatcher: &mut CompositionBuilder,
+    ) -> ExecutorResult<ExecutionResponse> {
         let outcome = {
             let mut q = self.outcomes.lock().expect("fake mutex poisoned");
             q.pop_front().ok_or_else(|| {
@@ -386,7 +379,7 @@ impl<P: ChainProtocol + 'static> TargetExecutionSession for FakeChainSession<P> 
         Ok(())
     }
 
-    async fn take_checkpoint(&mut self) -> Option<ProtocolCheckpoint<Self::Protocol>> {
+    async fn take_checkpoint(&mut self) -> Option<ExecutionCheckpoint> {
         // Return an ad-hoc checkpoint via the factory; `None` if
         // unset. Most tests don't exercise this path.
         let mut guard = self.checkpoint_factory.lock().expect("fake mutex poisoned");
@@ -401,142 +394,12 @@ mod tests {
     //! correctly and the recorder surfaces what the session saw.
 
     use super::*;
-    use crate::checkpoint::ExecutionCheckpoint;
     use crate::compose::compose_transaction;
     use crate::composer::{DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig, TargetConfig};
     use crate::composition::Rollup;
-    use crate::error::ProtocolResult;
-    use crate::types::ExecutedAction;
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug, Clone, Copy, Default)]
-    struct SmokeProto;
-
-    #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-    struct SmokeState;
-
-    impl ChainProtocol for SmokeProto {
-        type Address = [u8; 20];
-        type Value = u128;
-        type Calldata = Vec<u8>;
-        // Batch = per-call post_state_roots so tests can inspect what
-        // landed in the final composition.
-        type Batch = Vec<[u8; 32]>;
-        type Overlay = SmokeState;
-        type Witness = SmokeState;
-        type Dialect = ();
-
-        fn build_batch(
-            &self,
-            recorded: &[ExecutedAction<Self>],
-            _attribution: &crate::composer::SourceAttribution<'_>,
-            _dialect: &Self::Dialect,
-            _source_rollup_id: RollupId,
-            _raw_tx: &[u8],
-        ) -> ProtocolResult<Self::Batch> {
-            Ok(recorded
-                .iter()
-                .map(|c| c.outcome.post_state_root().copied().unwrap_or([0u8; 32]))
-                .collect())
-        }
-        fn encode_postbatch(&self, _batch: &Self::Batch) -> Vec<u8> {
-            vec![]
-        }
-        fn encode_load_table(&self, _batch: &Self::Batch) -> Vec<u8> {
-            vec![]
-        }
-        fn encode_follower_trigger(
-            &self,
-            _: &ExecutedAction<Self>,
-            _: RollupId,
-            _: &[u8],
-            (): &Self::Dialect,
-        ) -> Vec<u8> {
-            vec![]
-        }
-        fn encode_address(&self, a: &Self::Address) -> Vec<u8> {
-            a.to_vec()
-        }
-        fn decode_address(&self, b: &[u8]) -> ProtocolResult<Self::Address> {
-            b.try_into().map_err(|_e| {
-                crate::error::ProtocolErrorKind::InvalidEncoding("addr".into()).into()
-            })
-        }
-        fn encode_value(&self, v: &Self::Value) -> Vec<u8> {
-            v.to_be_bytes().to_vec()
-        }
-        fn decode_value(&self, b: &[u8]) -> ProtocolResult<Self::Value> {
-            b.try_into()
-                .map(u128::from_be_bytes)
-                .map_err(|_e| crate::error::ProtocolErrorKind::InvalidEncoding("val".into()).into())
-        }
-        fn encode_calldata(&self, d: &Self::Calldata) -> Vec<u8> {
-            d.clone()
-        }
-        fn decode_calldata(&self, b: &[u8]) -> ProtocolResult<Self::Calldata> {
-            Ok(b.to_vec())
-        }
-        fn message_id(&self, m: &crate::message::Message<'_, Self>) -> [u8; 32] {
-            // A deterministic fake identity over the 6 fields — enough for tests
-            // that need distinct ids; not the EVM keccak preimage.
-            use sha3::{Digest, Keccak256};
-            let mut h = Keccak256::new();
-            h.update(m.from_rollup.0.to_be_bytes());
-            h.update(m.from_addr);
-            h.update(m.to_rollup.0.to_be_bytes());
-            h.update(m.to_addr);
-            h.update(m.value.to_be_bytes());
-            h.update(m.data);
-            h.finalize().into()
-        }
-    }
-
-    impl crate::capabilities::SettlesOutbound for SmokeProto {
-        fn build_settlement_batch(
-            &self,
-            _calls: &[ExecutedAction<Self>],
-            _dst: RollupId,
-        ) -> ProtocolResult<Self::Batch> {
-            // SmokeProto's targets are never zk-poster, so finalize never calls
-            // this. Honest typed error, never reached.
-            Err(
-                crate::error::ProtocolErrorKind::Unsupported("SmokeProto does not settle outbound")
-                    .into(),
-            )
-        }
-    }
-
-    impl crate::capabilities::ConsumesInbound for SmokeProto {
-        fn encode_delivery(
-            &self,
-            _m: &crate::message::Message<'_, Self>,
-            _d: &crate::message::Delivery<Self>,
-        ) -> Vec<u8> {
-            Vec::new()
-        }
-        fn build_return(
-            &self,
-            _m: &crate::message::Message<'_, Self>,
-            _d: &crate::message::Delivery<Self>,
-        ) -> ProtocolResult<Self::Batch> {
-            Err(
-                crate::error::ProtocolErrorKind::Unsupported("SmokeProto does not consume inbound")
-                    .into(),
-            )
-        }
-        fn build_settlement_only(&self, _settled: RollupId) -> Self::Batch {
-            Vec::new()
-        }
-        fn build_inbound_target_batch(
-            &self,
-            _calls: &[ExecutedAction<Self>],
-            _target_rollup_id: RollupId,
-        ) -> ProtocolResult<Self::Batch> {
-            // SmokeProto's `batch_is_empty` is the default (false), so finalize
-            // never enters the inbound branch for it; never reached.
-            Ok(Vec::new())
-        }
-    }
+    use crate::dialect::ChainDialect;
+    use crate::overlay::EvmOverlay;
+    use alloy_primitives::{Address, Bytes, U256};
 
     fn outcome(post: [u8; 32]) -> ExecutionOutcome {
         ExecutionOutcome::Resolved {
@@ -548,17 +411,17 @@ mod tests {
         }
     }
 
-    fn target_cfg() -> TargetConfig<SmokeProto> {
+    fn target_cfg() -> TargetConfig {
         TargetConfig {
-            ccm_address: [0; 20],
-            system_address: [0; 20],
+            ccm_address: Address::ZERO,
+            system_address: Address::ZERO,
             ccm_gas_limit: DEFAULT_CCM_GAS_LIMIT,
             proxy_lookup: ProxyLookupConfig {
-                contract_address: [0; 20],
+                contract_address: Address::ZERO,
                 authorized_proxies_slot: 0,
             },
             settles_via_session_root: false,
-            dialect: (),
+            dialect: ChainDialect::EvmL2Style,
         }
     }
 
@@ -567,17 +430,14 @@ mod tests {
         let entry_id = RollupId(0);
         let target_id = RollupId(1);
 
-        // Follower fake: session returns one outcome; CCM-verify batch
-        // returns a matching final root so the terminal post_state_root
-        // patching is observable (and idempotent with the test assertion).
+        // Follower fake: session returns one outcome. The entry→target
+        // call is INCOMING from the target's perspective, so finalize
+        // takes the inbound DA-sidecar branch — no CCM-verify
+        // `simulate_transactions` runs for this shape.
         let follower_post = [0x22; 32];
         let follower = Arc::new(
-            FakeChainClient::<SmokeProto>::new_follower(target_id)
+            FakeChainClient::new_follower(target_id)
                 .with_session_outcomes(vec![outcome(follower_post)])
-                .with_simulate_transactions_results(vec![Ok(TargetBatchSimulation {
-                    final_state_root: follower_post,
-                    per_tx_roots: vec![follower_post, follower_post],
-                })])
                 .with_checkpoint_factory(move || ExecutionCheckpoint {
                     version: 1,
                     chain_id: 1,
@@ -585,7 +445,7 @@ mod tests {
                     base_block_hash: [0; 32],
                     base_state_root: [0; 32],
                     current_root: follower_post,
-                    overlay: SmokeState,
+                    overlay: EvmOverlay::default(),
                     witness: None,
                 }),
         );
@@ -593,23 +453,21 @@ mod tests {
 
         // Entry fake: hook dispatches one call to the follower, the
         // composition pipeline routes it through the shared dispatcher.
-        let follower_for_hook = Arc::clone(&follower);
         let entry = Arc::new(
-            FakeChainClient::<SmokeProto>::new_entry(entry_id)
+            FakeChainClient::new_entry(entry_id)
                 .with_stored_root(target_id, [0; 32])
                 .with_stored_root(entry_id, [0; 32])
                 .with_simulate_source_hook(move |_raw, dispatcher| {
-                    let _follower = Arc::clone(&follower_for_hook);
                     let req = ExecutionRequest {
-                        target_address: [0xAB; 20],
-                        data: vec![],
-                        value: 0,
-                        source_address: [0; 20],
+                        target_address: Address::repeat_byte(0xAB),
+                        data: Bytes::new(),
+                        value: U256::ZERO,
+                        source_address: Address::ZERO,
                         source_rollup_id: entry_id,
                     };
                     // The real inspector bridges sync → async via a
-                    // scoped OS thread + `Handle::block_on` (see
-                    // `eez-evm-composer`). Mirror that here so
+                    // scoped OS thread + `Handle::block_on`. Mirror
+                    // that here so
                     // the hook can invoke the async dispatcher from a
                     // sync closure without deadlocking the outer
                     // tokio multi-thread test runtime.
@@ -627,8 +485,7 @@ mod tests {
 
         // Build the rollup map the composer would hand to the builder.
         let mut rollups = HashMap::new();
-        let entry_as_chain: Arc<dyn ChainClient<Protocol = SmokeProto> + Send + Sync> =
-            Arc::clone(&entry) as Arc<_>;
+        let entry_as_chain: Arc<dyn ChainClient + Send + Sync> = Arc::clone(&entry) as Arc<_>;
         rollups.insert(
             entry_id,
             Rollup {
@@ -648,30 +505,30 @@ mod tests {
             },
         );
 
-        let composition = compose_transaction(&SmokeProto, entry.as_ref(), &[], entry_id, rollups)
+        let composition = compose_transaction(entry.as_ref(), &[], entry_id, rollups)
             .await
             .expect("compose");
 
-        // Source batch carries the dispatched call's post_state_root.
-        assert_eq!(composition.source.batch.len(), 1);
-        assert_eq!(composition.source.batch[0], follower_post);
+        // Entry batch carries the top-level call as one deferred entry.
+        assert_eq!(composition.source.batch.entries().len(), 1);
 
-        // Follower saw exactly one dispatched outcome + one CCM batch.
+        // The target composition carries the inbound DA-sidecar entry.
+        assert_eq!(composition.targets.len(), 1);
+        assert_eq!(composition.targets[0].rollup_id, target_id);
+        assert_eq!(composition.targets[0].batch.entries().len(), 1);
+
+        // Follower saw exactly one dispatched outcome; the inbound
+        // sidecar branch never calls `simulate_transactions`.
         let seen = follower_recorder.dispatched_outcomes();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].post_state_root(), Some(&follower_post));
-        assert_eq!(follower_recorder.simulated_batches().len(), 1);
-        assert_eq!(
-            follower_recorder.simulated_batches()[0].len(),
-            2,
-            "CCM verify submits a 2-tx load + execute batch"
-        );
+        assert!(follower_recorder.simulated_batches().is_empty());
     }
 
     #[tokio::test]
     async fn follower_fake_refuses_entry_methods() {
         use crate::executor::CommittedRootReader;
-        let follower = FakeChainClient::<SmokeProto>::new_follower(RollupId(1));
+        let follower = FakeChainClient::new_follower(RollupId(1));
         let err = CommittedRootReader::stored_target_state_root(&follower, RollupId(0))
             .await
             .expect_err("follower must reject entry-only methods");

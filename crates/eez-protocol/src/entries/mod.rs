@@ -13,22 +13,21 @@
 //! downstream (`prepare_post_batch` fills the carriers; the proof sink
 //! fills `proofs[]` with the prover's signature).
 
+use crate::{ExecutedAction, ProtocolResult, RollupId, rolling_hash::EntryRollingHash};
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_sol_types::SolCall;
-use eez_protocol::{ExecutedAction, ProtocolResult, RollupId, rolling_hash::EntryRollingHash};
 
 use tracing::{debug, trace};
 
-use crate::EvmProtocol;
-use crate::action::cross_chain_call_hash;
-use crate::batch::EvmBatch;
-use crate::dialect::ChainDialect;
-use crate::types::{
+use crate::abi::{
     CrossChainCallSol, ExecutionEntrySol, ExpectedL1ToL2CallSol, ExpectedLookupSol,
     ExpectedOutgoingCrossChainCallSol, L2ExecutionEntrySol, L2ExpectedLookupSol, L2LookupCallSol,
     L2ToL1CallSol, LookupCallSol, ProofSystemBatchPerVerificationEntriesSol, StateDeltaSol,
     loadExecutionTableCall, postAndVerifyBatchCall,
 };
+use crate::action::cross_chain_call_hash;
+use crate::batch::EvmBatch;
+use crate::dialect::ChainDialect;
 
 /// Classification of a single [`ExecutedAction`] within an entry's
 /// flat call window. Drives [`build_batch`]'s emission decision.
@@ -55,7 +54,7 @@ pub enum CallKind {
 impl CallKind {
     /// Classify a recorded call relative to `source_id` (the rollup
     /// whose batch is being built).
-    fn classify(call: &ExecutedAction<EvmProtocol>, source_id: RollupId) -> Self {
+    fn classify(call: &ExecutedAction, source_id: RollupId) -> Self {
         if call.static_meta.is_some() {
             return Self::Static;
         }
@@ -86,13 +85,13 @@ impl CallKind {
 ///
 /// # Errors
 ///
-/// Returns [`eez_protocol::ProtocolErrorKind::InvalidEncoding`]
+/// Returns [`crate::ProtocolErrorKind::InvalidEncoding`]
 /// if a call's outcome is `Pending` (composition lifecycle bug — every
 /// call should be resolved before entering finalize).
 #[tracing::instrument(level = "debug", name = "build_batch", skip_all, fields(source = %source_rollup_id), err)]
 pub fn build_batch(
-    recorded: &[ExecutedAction<EvmProtocol>],
-    attribution: &eez_protocol::SourceAttribution<'_>,
+    recorded: &[ExecutedAction],
+    attribution: &crate::SourceAttribution<'_>,
     dialect: &ChainDialect,
     source_rollup_id: RollupId,
     raw_tx: &[u8],
@@ -105,7 +104,7 @@ pub fn build_batch(
     // stateless re-execution + custom-dialect entry shapes.
     let _ = (attribution, raw_tx);
 
-    let group: Vec<&ExecutedAction<EvmProtocol>> = recorded
+    let group: Vec<&ExecutedAction> = recorded
         .iter()
         .filter(|c| {
             c.source_rollup_id == source_rollup_id || c.target_rollup_id == source_rollup_id
@@ -174,13 +173,13 @@ pub fn build_batch(
             // needs a depth-2 outbound try/catch path no harness exercises) — but
             // gated so a future trigger errors instead of silently corrupting.
             CallKind::NestedFailed => {
-                return Err(eez_protocol::ProtocolErrorKind::Unsupported(
+                return Err(crate::ProtocolErrorKind::Unsupported(
                     "nested failed cross-chain lookup: entry-scoped emission (5c51e02) not built",
                 )
                 .into());
             }
             CallKind::Static => {
-                return Err(eez_protocol::ProtocolErrorKind::Unsupported(
+                return Err(crate::ProtocolErrorKind::Unsupported(
                     "static cross-chain lookup: entry-scoped emission (5c51e02) not built",
                 )
                 .into());
@@ -261,10 +260,7 @@ pub fn build_batch(
 /// builder emits them empty.
 #[must_use]
 #[tracing::instrument(level = "debug", name = "build_l1_postbatch", skip_all, fields(dest = %destination_rollup_id, calls = calls.len()))]
-pub fn build_l1_postbatch(
-    calls: &[ExecutedAction<EvmProtocol>],
-    destination_rollup_id: RollupId,
-) -> EvmBatch {
+pub fn build_l1_postbatch(calls: &[ExecutedAction], destination_rollup_id: RollupId) -> EvmBatch {
     let mut entries: Vec<ExecutionEntrySol> = Vec::with_capacity(calls.len());
 
     for call in calls {
@@ -658,10 +654,7 @@ pub fn build_l1_inbound_entry(
 /// `executeIncomingCrossChainCall` `sourceRollup` arg, so the value is
 /// self-consistent on delivery.
 #[must_use]
-pub fn build_l1_inbound_sidecar(
-    calls: &[ExecutedAction<EvmProtocol>],
-    target_rollup_id: RollupId,
-) -> EvmBatch {
+pub fn build_l1_inbound_sidecar(calls: &[ExecutedAction], target_rollup_id: RollupId) -> EvmBatch {
     let mut entries: Vec<ExecutionEntrySol> = Vec::new();
 
     for call in calls {
@@ -899,7 +892,7 @@ pub fn encode_execute_incoming(
     source_rollup_id: RollupId,
     entry: L2ExecutionEntrySol,
 ) -> Vec<u8> {
-    use crate::types::executeIncomingCrossChainCallCall;
+    use crate::abi::executeIncomingCrossChainCallCall;
     executeIncomingCrossChainCallCall {
         destination,
         value,
@@ -915,7 +908,7 @@ pub fn encode_execute_incoming(
 /// The `executeIncomingCrossChainCall` 4-byte selector, DERIVED from the ABI
 /// (`SolCall::SELECTOR`) — never hardcoded. Marks an inbound (L1→L2) system tx.
 pub const EXECUTE_INCOMING_SELECTOR: [u8; 4] =
-    crate::types::executeIncomingCrossChainCallCall::SELECTOR;
+    crate::abi::executeIncomingCrossChainCallCall::SELECTOR;
 
 /// Decode the inbound return value `Y` (the entry's `returnData`) from an
 /// `executeIncomingCrossChainCall` calldata. `None` if the calldata isn't that
@@ -925,7 +918,7 @@ pub const EXECUTE_INCOMING_SELECTOR: [u8; 4] =
 /// `publicInputsHash`).
 #[must_use]
 pub fn decode_inbound_return_data(calldata: &[u8]) -> Option<Bytes> {
-    crate::types::executeIncomingCrossChainCallCall::abi_decode(calldata)
+    crate::abi::executeIncomingCrossChainCallCall::abi_decode(calldata)
         .ok()?
         .entries
         .into_iter()
@@ -969,7 +962,7 @@ pub struct DecodedInbound {
 /// user will never consume, which would grief them into `ExecutionNotFound`).
 #[must_use]
 pub fn decode_inbound(calldata: &[u8]) -> Option<DecodedInbound> {
-    let call = crate::types::executeIncomingCrossChainCallCall::abi_decode(calldata).ok()?;
+    let call = crate::abi::executeIncomingCrossChainCallCall::abi_decode(calldata).ok()?;
     let target = call.destination;
     let value = call.value;
     let data = call.data;
@@ -1021,6 +1014,20 @@ pub fn encode_postbatch(batch: &EvmBatch) -> Vec<u8> {
 pub fn decode_postbatch(calldata: &[u8]) -> alloy_sol_types::Result<EvmBatch> {
     let call = postAndVerifyBatchCall::abi_decode(calldata)?;
     Ok(EvmBatch { inner: call.batch })
+}
+
+/// Encode the table-loading payload for the rollup whose
+/// `dialect` is supplied. Dispatches between
+/// [`encode_postbatch`] (L1-style) and
+/// [`encode_load_table`] (L2-style) so
+/// callers don't have to peek at the dialect themselves.
+#[must_use]
+pub fn encode_table_payload(batch: &EvmBatch, dialect: &ChainDialect) -> Vec<u8> {
+    if dialect.is_zk_poster() {
+        encode_postbatch(batch)
+    } else {
+        encode_load_table(batch)
+    }
 }
 
 /// Encode `batch` as `EEZL2.loadExecutionTable` calldata — LOWERING the
@@ -1162,7 +1169,7 @@ struct EntryBuilder {
 }
 
 impl EntryBuilder {
-    fn new(outer: &ExecutedAction<EvmProtocol>, _dialect: ChainDialect) -> Self {
+    fn new(outer: &ExecutedAction, _dialect: ChainDialect) -> Self {
         let proxy_entry_hash = cross_chain_call_hash(
             outer.target_rollup_id,
             outer.target_address,
@@ -1172,10 +1179,10 @@ impl EntryBuilder {
             outer.source_rollup_id,
         );
         let return_data: Bytes = match &outer.outcome {
-            eez_protocol::ExecutionOutcome::Resolved { return_data, .. } => {
+            crate::ExecutionOutcome::Resolved { return_data, .. } => {
                 Bytes::from(return_data.clone())
             }
-            eez_protocol::ExecutionOutcome::Pending => Bytes::new(),
+            crate::ExecutionOutcome::Pending => Bytes::new(),
         };
         Self {
             proxy_entry_hash,
@@ -1189,7 +1196,7 @@ impl EntryBuilder {
     }
 
     #[allow(dead_code, reason = "kept for future entry-builder reuse")]
-    fn append_call(&mut self, call: &ExecutedAction<EvmProtocol>, call_number: u64) {
+    fn append_call(&mut self, call: &ExecutedAction, call_number: u64) {
         let success = call.outcome.is_success();
         let return_data: &[u8] = call.outcome.return_data().unwrap_or(&[]);
         self.rolling.call_begin(call_number);
@@ -1204,7 +1211,7 @@ impl EntryBuilder {
         });
     }
 
-    fn append_nested(&mut self, call: &ExecutedAction<EvmProtocol>, nested_number: u64) {
+    fn append_nested(&mut self, call: &ExecutedAction, nested_number: u64) {
         let hash = cross_chain_call_hash(
             call.target_rollup_id,
             call.target_address,
@@ -1260,7 +1267,7 @@ impl EntryBuilder {
     entry-scoped lookup emission is built; kept as that builder's basis + the \
     unit-test target"
 )]
-fn lookup_call_sol(call: &ExecutedAction<EvmProtocol>, failed: bool) -> LookupCallSol {
+fn lookup_call_sol(call: &ExecutedAction, failed: bool) -> LookupCallSol {
     let hash = cross_chain_call_hash(
         call.target_rollup_id,
         call.target_address,
@@ -1292,9 +1299,9 @@ fn lookup_call_sol(call: &ExecutedAction<EvmProtocol>, failed: bool) -> LookupCa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ExecutionOutcome, SourceAttribution};
     use alloy_primitives::address;
     use alloy_sol_types::SolValue;
-    use eez_protocol::{ExecutionOutcome, SourceAttribution};
     use std::collections::HashMap;
 
     /// A2.1a: the OUTBOUND L2 deferred entry's `proxyEntryHash` must byte-match
@@ -1389,11 +1396,7 @@ mod tests {
         assert_eq!(failed.callCount, U256::ZERO);
     }
 
-    fn record(
-        target: RollupId,
-        caller_rollup: RollupId,
-        success: bool,
-    ) -> ExecutedAction<EvmProtocol> {
+    fn record(target: RollupId, caller_rollup: RollupId, success: bool) -> ExecutedAction {
         ExecutedAction {
             target_address: address!("00000000000000000000000000000000000000aa"),
             target_rollup_id: target,
@@ -1766,7 +1769,7 @@ mod tests {
             src_id,
             entry.clone(),
         );
-        use crate::types::executeIncomingCrossChainCallCall;
+        use crate::abi::executeIncomingCrossChainCallCall;
         let decoded = executeIncomingCrossChainCallCall::abi_decode(&calldata)
             .expect("decode executeIncomingCrossChainCall");
         assert_eq!(decoded.destination, counter);
@@ -2026,5 +2029,31 @@ mod tests {
         let batch = EvmBatch::empty();
         let data = encode_load_table(&batch);
         assert_eq!(&data[..4], &loadExecutionTableCall::SELECTOR);
+    }
+
+    #[test]
+    fn table_payload_l1_style_emits_post_verify_and_execute_or_save() {
+        let batch = EvmBatch::empty();
+        let data = encode_table_payload(&batch, &ChainDialect::EvmL1Style);
+        assert_eq!(&data[..4], &postAndVerifyBatchCall::SELECTOR);
+    }
+
+    #[test]
+    #[allow(
+        non_snake_case,
+        reason = "fn name mirrors the Solidity selector for grep"
+    )]
+    fn table_payload_l2_style_emits_loadExecutionTable() {
+        let batch = EvmBatch::empty();
+        let data = encode_table_payload(&batch, &ChainDialect::EvmL2Style);
+        assert_eq!(&data[..4], &loadExecutionTableCall::SELECTOR);
+    }
+
+    #[test]
+    fn table_payload_dialects_differ() {
+        let batch = EvmBatch::empty();
+        let l1 = encode_table_payload(&batch, &ChainDialect::EvmL1Style);
+        let l2 = encode_table_payload(&batch, &ChainDialect::EvmL2Style);
+        assert_ne!(&l1[..4], &l2[..4]);
     }
 }

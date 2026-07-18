@@ -6,7 +6,7 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::Filter;
 use alloy_sol_types::{SolCall, SolEvent};
-use eez_evm::types::{
+use eez_protocol::abi::{
     BatchPosted, L2ExecutionPerformed, ProofSystemBatchPerVerificationEntriesSol,
     postAndVerifyBatchCall,
 };

@@ -21,7 +21,6 @@ pub use build::{BuildError, BuiltSyncBlock, build_sync_block, sync_block_pair_ro
 #[doc(inline)]
 pub use client::LocalChainClient;
 #[doc(inline)]
-pub use eez_evm_inspector::EvmComposer;
 #[doc(inline)]
 pub use gnosis_adapter::GnosisL1Adapter;
 // `Role` + `LocalExecutionSession` are implementation details of

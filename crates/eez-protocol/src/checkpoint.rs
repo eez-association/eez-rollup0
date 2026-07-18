@@ -1,13 +1,8 @@
 //! Execution checkpoint — two-layer design for continuation + proving.
 //!
-//! [`ExecutionCheckpoint<O, W>`] is generic over the **overlay** `O`
-//! (the mutations a call made — what changed) and the **witness** `W`
-//! (the state a call read — what it needed to see). Each chain
-//! implementation provides its own types:
-//!
-//! - EVM: `EvmOverlay` + `EvmWitness`, defined in `eez-evm`
-//!   (Step 5).
-//! - Non-EVM: custom types implementing [`Serialize`] + [`DeserializeOwned`](serde::de::DeserializeOwned).
+//! [`ExecutionCheckpoint`] carries the **overlay** (the mutations a call
+//! made — what changed) and the **witness** (the state a call read —
+//! what it needed to see).
 //!
 //! # Why two layers
 //!
@@ -20,14 +15,16 @@
 //! without chain state access. The proving path bypasses this field:
 //! the prover consumes witnesses from the composer control feed (reth
 //! `eez_executionWitness` pull), so `witness` is `None` at every
-//! in-tree construction site; the slot remains for chains that ship
-//! witnesses through the checkpoint.
+//! in-tree construction site.
 //!
 //! Keeping them separate means a gRPC-only deployment never pays for
 //! witness recording, and a proving build never ships witness data
 //! over the wire as overlay.
 
 use serde::{Deserialize, Serialize};
+
+use crate::overlay::EvmOverlay;
+use crate::witness::EvmWitness;
 
 /// Two-layer execution checkpoint.
 ///
@@ -36,13 +33,12 @@ use serde::{Deserialize, Serialize};
 /// - `witness`: state access data for proving (optional). The proving
 ///   path bypasses it — witnesses ride the composer control feed (reth
 ///   `eez_executionWitness` pull) — so it is `None` at every in-tree
-///   construction site; the slot remains for chains that ship
-///   witnesses through the checkpoint.
+///   construction site.
 ///
-/// Constraint: targets 32-byte-root protocols. Chains with different hash
-/// sizes would need a different checkpoint type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionCheckpoint<O, W> {
+/// `PartialEq`-only (not `Eq`): `EvmOverlay` / `EvmWitness` are
+/// `PartialEq`-only. `Eq`-requiring containers must wrap.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionCheckpoint {
     /// Schema version for forward compatibility.
     pub version: u32,
     /// Chain ID of the target chain.
@@ -55,8 +51,8 @@ pub struct ExecutionCheckpoint<O, W> {
     pub base_state_root: [u8; 32],
     /// State root after all accumulated calls. Reconstruction MUST match this.
     pub current_root: [u8; 32],
-    /// Accumulated state changes (chain-specific format).
-    pub overlay: O,
-    /// State access witness for proving (chain-specific). None for gRPC-only use.
-    pub witness: Option<W>,
+    /// Accumulated state changes.
+    pub overlay: EvmOverlay,
+    /// State access witness for proving. None for gRPC-only use.
+    pub witness: Option<EvmWitness>,
 }

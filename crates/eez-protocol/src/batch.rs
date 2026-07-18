@@ -18,7 +18,7 @@
 
 use alloy_primitives::{B256, Bytes, U256};
 
-use crate::types::{ExecutionEntrySol, LookupCallSol, ProofSystemBatchPerVerificationEntriesSol};
+use crate::abi::{ExecutionEntrySol, LookupCallSol, ProofSystemBatchPerVerificationEntriesSol};
 
 /// EVM realization of `ChainProtocol::Batch` — a thin wrapper around
 /// the on-chain `ProofSystemBatchPerVerificationEntriesSol`.

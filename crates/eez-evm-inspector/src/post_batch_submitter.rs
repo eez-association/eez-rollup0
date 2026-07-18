@@ -27,7 +27,7 @@
 //!    swaps this loop for a `BatchProofProducer` trait so different
 //!    PSes can emit different proof shapes.)
 //! 6. **L1 submission** — encode calldata via
-//!    [`EvmProtocol::encode_postbatch`] (proofs ride inside the
+//!    [`entries::encode_postbatch`] (proofs ride inside the
 //!    batch struct under the multi-prover ABI), fetch the
 //!    poster's `pending` nonce explicitly via
 //!    `eth_getTransactionCount(addr, "pending")`, build a single
@@ -55,12 +55,12 @@
 //!   - `src/EEZ.sol:486-555` (`_validateStructure`).
 //!   - `src/EEZ.sol:606-668` (`_verifyProofSystemBatch`).
 //!
-//! [`EvmBatch`]: eez_evm::EvmBatch
-//! [`ProofPlanResolver::resolve`]: eez_protocol::ProofPlanResolver::resolve
+//! [`EvmBatch`]: eez_protocol::EvmBatch
+//! [`ProofPlanResolver::resolve`]: eez_protocol::proof_resolver::ProofPlanResolver::resolve
 //! [`ProofPlan`]: eez_protocol::ProofPlan
-//! [`all_per_ps_hashes`]: eez_evm::public_inputs::all_per_ps_hashes
-//! [`EvmProtocol::encode_postbatch`]: eez_evm::EvmProtocol::encode_postbatch
-//! [`EcdsaProofSigner`]: eez_evm::signer::EcdsaProofSigner
+//! [`all_per_ps_hashes`]: eez_protocol::public_inputs::all_per_ps_hashes
+//! [`entries::encode_postbatch`]: eez_protocol::entries::encode_postbatch
+//! [`EcdsaProofSigner`]: eez_protocol::signer::EcdsaProofSigner
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -70,14 +70,13 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::{Log, TransactionReceipt, TransactionRequest};
 use alloy_sol_types::{SolEvent, sol};
-use eez_evm::public_inputs::{all_per_ps_hashes, entry_hash, lookup_call_hash};
-use eez_evm::signer::{EcdsaProofSigner, SignerError};
-use eez_evm::{EvmBatch, EvmProtocol};
-use eez_protocol::{
-    ChainProtocol, ExecutorError, ProofPlan, ProofPlanInvariantError, ProofPlanResolver, RollupId,
-};
+use eez_protocol::EvmBatch;
+use eez_protocol::proof_resolver::{ProofPlanResolver, RollupReader};
+use eez_protocol::public_inputs::{all_per_ps_hashes, entry_hash, lookup_call_hash};
+use eez_protocol::signer::{EcdsaProofSigner, SignerError};
+use eez_protocol::{ExecutorError, ProofPlan, ProofPlanInvariantError, RollupId};
 
-use eez_evm::types::RollupIdWithProofSystemsSol;
+use eez_protocol::abi::RollupIdWithProofSystemsSol;
 
 // ── Event bindings ─────────────────────────────────────────────────
 
@@ -287,11 +286,11 @@ pub enum PostBatchError {
 #[derive(Debug, Clone)]
 pub struct PostBatchSubmitter<R, P>
 where
-    R: ProofPlanResolver<EvmProtocol>,
+    R: RollupReader,
     P: Provider<Ethereum>,
 {
     provider: P,
-    resolver: R,
+    resolver: ProofPlanResolver<R>,
     proof_signer: EcdsaProofSigner,
     eez_address: Address,
     poster_address: Address,
@@ -309,7 +308,7 @@ pub const DEFAULT_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl<R, P> PostBatchSubmitter<R, P>
 where
-    R: ProofPlanResolver<EvmProtocol>,
+    R: RollupReader,
     P: Provider<Ethereum>,
 {
     /// Build a submitter. `poster_address` must match the wallet the
@@ -318,7 +317,7 @@ where
     /// `WalletFiller` finds the matching signer.
     pub fn new(
         provider: P,
-        resolver: R,
+        resolver: ProofPlanResolver<R>,
         proof_signer: EcdsaProofSigner,
         eez_address: Address,
         poster_address: Address,
@@ -421,7 +420,7 @@ where
         // 6. Encode calldata + submit. Proofs ride inside the batch
         // struct under the multi-prover ABI; trait takes the batch
         // alone.
-        let calldata = EvmProtocol.encode_postbatch(&batch);
+        let calldata = eez_protocol::entries::encode_postbatch(&batch);
 
         // Explicit pending-nonce fetch. Disables alloy's NonceFiller
         // for this submission (it skips when `nonce` is already set
@@ -530,7 +529,7 @@ fn u256_to_u64_checked(v: U256) -> Result<u64, PostBatchError> {
 /// `blobIndices`, and `callData` untouched — those were populated by
 /// `build_batch` (and `blobIndices`/`callData` stay empty in Phase
 /// 09).
-fn populate_proof_carriers(batch: &mut EvmBatch, plan: &ProofPlan<EvmProtocol>) {
+fn populate_proof_carriers(batch: &mut EvmBatch, plan: &ProofPlan) {
     batch.inner.proofSystems = plan.proof_systems.clone();
     batch.inner.rollupIdsWithProofSystems = plan
         .rollup_assignments
@@ -625,7 +624,7 @@ fn decode_outcome_from_logs(
 mod tests {
     use super::*;
     use alloy_primitives::I256;
-    use eez_evm::types::{
+    use eez_protocol::abi::{
         ExecutionEntrySol, LookupCallSol, ProofSystemBatchPerVerificationEntriesSol, StateDeltaSol,
     };
     use eez_protocol::{RollupProofAssignment, TimestampAndBlockHash};
@@ -740,7 +739,7 @@ mod tests {
         let ps_addr = Address::from_slice(&[0u8; 20]);
         // populate_proof_carriers does NOT validate — that's the
         // resolver's job. We just check the field-by-field copy.
-        let plan = ProofPlan::<EvmProtocol> {
+        let plan = ProofPlan {
             proof_systems: vec![ps_addr],
             rollup_assignments: vec![RollupProofAssignment {
                 rollup_id: RollupId(1),

@@ -171,7 +171,7 @@ async fn read_rollup_escrow(provider: &alloy_provider::RootProvider, rid: u64) -
         .ok()?
         .parse::<Address>()
         .ok()?;
-    eez_evm::IEEZReader::new(eez, provider)
+    eez_protocol::IEEZReader::new(eez, provider)
         .rollups(U256::from(rid))
         .call()
         .await
@@ -294,7 +294,7 @@ struct Inner<L2: BlockReader> {
     /// dispatches each held tx through it to get the
     /// `Composition<EvmProtocol>` (L2 destination effects + L1
     /// `ExecutionEntry`s).
-    evm_composer: Option<eez_evm_inspector::EvmComposer>,
+    evm_composer: Option<eez_protocol::Composer>,
     /// Runtime context (signer + L2 chain config) for wrapping the
     /// composer's `(load_table_payload, execute_payload)` byte
     /// outputs into signed L2 system txs. Must be `Some` whenever
@@ -306,13 +306,7 @@ struct Inner<L2: BlockReader> {
     /// must run against an L2 entry (the L2 follower's `ChainClient`
     /// errors `Unavailable` for source sim). `None` when no embedded L1
     /// is wired (inbound-only / standalone) — outbound txs then evict.
-    l2_entry_client: Option<
-        Arc<
-            dyn eez_protocol::executor::EntryChainClient<Protocol = eez_evm::EvmProtocol>
-                + Send
-                + Sync,
-        >,
-    >,
+    l2_entry_client: Option<Arc<dyn eez_protocol::executor::EntryChainClient + Send + Sync>>,
     /// Handle to the `BlockCommitter` actor (the sole engine-API
     /// owner). Set once at startup via [`Composer::set_committer`]
     /// after the Sequencer spawns the actor. The bundle-observer task
@@ -348,15 +342,9 @@ where
         submitter: Submitter,
         l1_watcher: L1Watcher,
         evm_config: EthEvmConfig,
-        evm_composer: Option<eez_evm_inspector::EvmComposer>,
+        evm_composer: Option<eez_protocol::Composer>,
         cc_exec_ctx: Option<Arc<CrossChainExecCtx>>,
-        l2_entry_client: Option<
-            Arc<
-                dyn eez_protocol::executor::EntryChainClient<Protocol = eez_evm::EvmProtocol>
-                    + Send
-                    + Sync,
-            >,
-        >,
+        l2_entry_client: Option<Arc<dyn eez_protocol::executor::EntryChainClient + Send + Sync>>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -1128,7 +1116,7 @@ where
     /// Returns errors only before drain classification begins.
     async fn compose_via_evm_composer(
         &self,
-        evm_composer: &eez_evm_inspector::EvmComposer,
+        evm_composer: &eez_protocol::Composer,
         ctx: &CrossChainExecCtx,
         rollup_id: u64,
         drained: Vec<HeldTx>,
@@ -1159,7 +1147,7 @@ where
             .map_err(|e| format!("account_nonce({system_address}): {e}"))?
             .unwrap_or(0);
 
-        let stf_cfg = eez_evm::system_tx::SystemTxContext {
+        let stf_cfg = eez_protocol::system_tx::SystemTxContext {
             system_signer: ctx.system_signer.clone(),
             ccm_l2_address: ctx.ccm_l2_address,
             l2_chain_id: ctx.l2_chain_id,
@@ -1231,15 +1219,14 @@ where
         let mut survivors: Vec<HeldTx> = Vec::with_capacity(drained.len());
         // Inbound survivors' compositions (their `source.batch` = the L1
         // deferred entries) feed `prepare_post_batch_raw`'s merge.
-        let mut survivor_comps: Vec<eez_protocol::Composition<eez_evm::EvmProtocol>> =
-            Vec::with_capacity(drained.len());
+        let mut survivor_comps: Vec<eez_protocol::Composition> = Vec::with_capacity(drained.len());
         // Staged, not built inline: system txs are built ONCE post-drain via the
         // canonical `build_cross_chain_sync_pairs` (matches the deriver). pending_out
         // = (outbound settlement entry, its user tx); pending_in = inbound targets;
         // outbound_entries = the settlement entries spliced into the postBatch.
-        let mut pending_out: Vec<(eez_evm::types::ExecutionEntrySol, Bytes)> = Vec::new();
-        let mut pending_in: Vec<eez_evm::types::ExecutionEntrySol> = Vec::new();
-        let mut outbound_entries: Vec<eez_evm::types::ExecutionEntrySol> = Vec::new();
+        let mut pending_out: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)> = Vec::new();
+        let mut pending_in: Vec<eez_protocol::abi::ExecutionEntrySol> = Vec::new();
+        let mut outbound_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = Vec::new();
         // Escrow drawn down per outbound withdrawal (read once, lazily) so several
         // in one slot can't collectively over-drain. `None` = not yet read.
         let mut escrow_remaining: Option<U256> = None;
@@ -1292,7 +1279,7 @@ where
                     .await
                 {
                     Ok((composition, _recorded)) => {
-                        let l1_entries: Vec<eez_evm::types::ExecutionEntrySol> = composition
+                        let l1_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = composition
                             .targets
                             .iter()
                             .flat_map(|t| t.batch.entries().iter().cloned())
@@ -1336,7 +1323,7 @@ where
                         // it would revert on-chain and drop the whole bundle.
                         // "ether out" is the amount of Ether being withdrawn in this outbound settlement entry.
                         // If missing, the entry is malformed and must be evicted.
-                        let Some(need) = eez_evm::entries::outbound_ether_out(&l1_entries[0])
+                        let Some(need) = eez_protocol::entries::outbound_ether_out(&l1_entries[0])
                         else {
                             event!(name: "eez.composer.cc_compose.outbound_ether_out_missing", Level::WARN, rollup_id, tx_idx = idx, tx_hash = %held.hash, "outbound tx is missing ether out entry, likely malformed; evicting");
                             push_poison_root(&mut poison, &mut poison_gaps, held);
@@ -1547,7 +1534,7 @@ where
         // [load,user,…,deliveries]. Handles inbound / outbound / mixed
         // uniformly. A failure is systemic (signing / nonce overflow) →
         // re-queue survivors, degrade to minimal.
-        let pairs = match eez_evm::system_tx::build_cross_chain_sync_pairs(
+        let pairs = match eez_protocol::system_tx::build_cross_chain_sync_pairs(
             &pending_out,
             &pending_in,
             &stf_cfg,
@@ -1582,7 +1569,7 @@ where
         // ── Build the rich Sync block + postBatch from survivors. A ──
         // ── build / prepare failure here is systemic (not one tx) →  ──
         // ── re-queue survivors and degrade to minimal.               ──
-        let sync_txs = eez_evm::system_tx::interleave_sync_block_txs(&pairs);
+        let sync_txs = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
         let built = match build_sync_block(
             rollup.l2_provider.as_ref(),
             &self.inner.evm_config,
@@ -1653,8 +1640,7 @@ where
                     .await;
             }
         };
-        let comp_refs: Vec<&eez_protocol::Composition<eez_evm::EvmProtocol>> =
-            survivor_comps.iter().collect();
+        let comp_refs: Vec<&eez_protocol::Composition> = survivor_comps.iter().collect();
         // Outbound user txs (the SyncPair user halves) travel in the sync-block
         // DA slot — the deriver can't reconstruct them from the postBatch entries
         // (only the system/load txs are). Empty for inbound-only.
@@ -1910,16 +1896,16 @@ where
         &self,
         ctx: &CrossChainExecCtx,
         rollup_id: u64,
-        compositions: &[&eez_protocol::Composition<eez_evm::EvmProtocol>],
+        compositions: &[&eez_protocol::Composition],
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         sync_block_state_root: B256,
         sync_block: &reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>,
         pair_roots: &[B256],
-        outbound_entries: &[eez_evm::types::ExecutionEntrySol],
+        outbound_entries: &[eez_protocol::abi::ExecutionEntrySol],
         outbound_user_txs: &[Bytes],
     ) -> Result<Bytes, String> {
         use alloy_sol_types::SolCall;
-        use eez_evm::types::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
+        use eez_protocol::abi::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
 
         // Empty compositions is a VALID case: an empty HeldPool Sync
         // slot still emits a postBatch carrying just the leading
@@ -1933,7 +1919,7 @@ where
         // it. Empty compositions → build a fresh empty batch shell;
         // the leading immediate entry below is the entire payload.
         let mut batch = if compositions.is_empty() {
-            eez_evm::EvmBatch::default()
+            eez_protocol::EvmBatch::default()
         } else {
             let mut b = compositions[0].source.batch.clone();
             for c in &compositions[1..] {
@@ -1978,8 +1964,8 @@ where
         };
         let pre_sync_state_root = parent_header.state_root();
         let rollup_id_u256 = U256::from(rollup_id);
-        let immediate_entry = eez_evm::types::ExecutionEntrySol {
-            stateDeltas: vec![eez_evm::types::StateDeltaSol {
+        let immediate_entry = eez_protocol::abi::ExecutionEntrySol {
+            stateDeltas: vec![eez_protocol::abi::StateDeltaSol {
                 rollupId: rollup_id_u256,
                 currentState: pre_state_root,
                 newState: pre_sync_state_root,
@@ -2043,7 +2029,7 @@ where
                 continue;
             }
             let ether_delta = if entry.proxyEntryHash == B256::ZERO {
-                let v = eez_evm::entries::outbound_ether_out(entry).ok_or_else(|| {
+                let v = eez_protocol::entries::outbound_ether_out(entry).ok_or_else(|| {
                     format!(
                         "outbound entry: multi-call value not supported \
                          (callCount={}, l2ToL1Calls={})",
@@ -2070,7 +2056,7 @@ where
                     pair_roots.len(),
                 )
             })?;
-            entry.stateDeltas = vec![eez_evm::types::StateDeltaSol {
+            entry.stateDeltas = vec![eez_protocol::abi::StateDeltaSol {
                 rollupId: rollup_id_u256,
                 currentState: B256::ZERO,
                 newState: new_state,
@@ -2283,13 +2269,13 @@ where
         // inbound deferred entries — outbound-first matches the deriver's prefix split.
         let l2_entries_bytes: Vec<Vec<u8>> = outbound_entries
             .iter()
-            .map(eez_evm::types::ExecutionEntrySol::abi_encode)
+            .map(eez_protocol::abi::ExecutionEntrySol::abi_encode)
             .chain(
                 compositions
                     .iter()
                     .flat_map(|c| c.targets.iter())
                     .flat_map(|t| t.batch.entries().iter())
-                    .map(eez_evm::types::ExecutionEntrySol::abi_encode),
+                    .map(eez_protocol::abi::ExecutionEntrySol::abi_encode),
             )
             .collect();
         let payload = eez_payload_codec::encode(&blocks, &l2_entries_bytes)
@@ -2394,7 +2380,7 @@ where
 /// that isn't this rollup's registry id — a wiring bug (e.g. an outbound entry
 /// whose `dest` stayed at the call's MAINNET(0) target) that L1 would misattribute
 /// and that folds into the `publicInputsHash`. Guards the outbound `dest=rid` rewrite.
-fn assert_batch_registry_native(batch: &eez_evm::EvmBatch, rid: U256) -> Result<(), String> {
+fn assert_batch_registry_native(batch: &eez_protocol::EvmBatch, rid: U256) -> Result<(), String> {
     for (i, entry) in batch.inner.entries.iter().enumerate() {
         if entry.destinationRollupId != rid {
             return Err(format!(
@@ -2562,9 +2548,9 @@ async fn sign_post_batch_tx(
 }
 
 // Legacy system-tx signing helpers (`sign_legacy_system_tx` /
-// `_with_value`) moved into `eez_evm::system_tx` as part of the
+// `_with_value`) moved into `eez_protocol::system_tx` as part of the
 // composer↔deriver single-source-of-truth STF refactor. Call
-// `eez_evm::system_tx::build_inbound_system_txs(...)` from new code.
+// `eez_protocol::system_tx::build_inbound_system_txs(...)` from new code.
 
 #[cfg(test)]
 mod tests {

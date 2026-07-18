@@ -11,7 +11,7 @@
 //!
 //! A future byte-equality lock against a Solidity oracle (analogous to
 //! `cross_chain_call_hash_vectors.rs`) belongs at
-//! `crates/eez-evm/tests/public_inputs_hash_vectors.rs`.
+//! `crates/eez-protocol/tests/public_inputs_hash_vectors.rs`.
 //!
 //! # Construction
 //!
@@ -66,17 +66,16 @@
 //! naive `vkMatrix[r][k]` global index silently produces the
 //! wrong fold.
 
-use alloy_primitives::{B256, Bytes, U256, keccak256};
-use alloy_sol_types::{SolValue, sol};
-use eez_protocol::{
+use crate::{
     ProofPlan, ProofPlanInvariantError, RollupId, RollupProofAssignment, TimestampAndBlockHash,
 };
+use alloy_primitives::{B256, Bytes, U256, keccak256};
+use alloy_sol_types::{SolValue, sol};
 
 use tracing::debug;
 
-use crate::EvmProtocol;
+use crate::abi::{ExecutionEntrySol, LookupCallSol};
 use crate::batch::EvmBatch;
-use crate::types::{ExecutionEntrySol, LookupCallSol};
 
 // ── Per-element atomic hashes ─────────────────────────────────────
 
@@ -198,11 +197,7 @@ fn position_of(k: u64, indices: &[u64]) -> Option<usize> {
 /// This function assumes a validated plan: it indexes `per_rollup_context` /
 /// `vk_matrix` directly and would panic on a length mismatch.
 #[must_use]
-pub fn per_ps_public_inputs_hash(
-    shared: B256,
-    plan: &ProofPlan<EvmProtocol>,
-    ps_index_in_global: u64,
-) -> B256 {
+pub fn per_ps_public_inputs_hash(shared: B256, plan: &ProofPlan, ps_index_in_global: u64) -> B256 {
     let mut acc = B256::ZERO;
     for (r, assignment) in plan.rollup_assignments.iter().enumerate() {
         let Some(j) = position_of(ps_index_in_global, &assignment.proof_system_index) else {
@@ -246,7 +241,7 @@ pub fn per_ps_public_inputs_hash(
 /// Callers SHOULD have run `plan.check_invariants()` already;
 /// this is belt-and-suspenders.
 pub fn all_per_ps_hashes(
-    plan: &ProofPlan<EvmProtocol>,
+    plan: &ProofPlan,
     entry_hashes: &[B256],
     lookup_call_hashes: &[B256],
     blob_hashes: &[B256],
@@ -340,7 +335,7 @@ pub fn public_inputs_hashes(
         .iter()
         .map(|a| vec![vkey.0; a.proof_system_index.len()])
         .collect();
-    let plan = ProofPlan::<EvmProtocol> {
+    let plan = ProofPlan {
         proof_systems: batch.inner.proofSystems.clone(),
         rollup_assignments,
         per_rollup_context,
@@ -403,7 +398,7 @@ mod tests {
         }
     }
 
-    fn singleton_plan() -> ProofPlan<EvmProtocol> {
+    fn singleton_plan() -> ProofPlan {
         ProofPlan {
             proof_systems: vec![address!("00000000000000000000000000000000000000aa")],
             rollup_assignments: vec![RollupProofAssignment {
@@ -419,7 +414,7 @@ mod tests {
     #[test]
     fn per_ps_hash_with_zero_attesters_uses_zero_acc() {
         // Build a plan where PS 0 attests nothing.
-        let plan = ProofPlan::<EvmProtocol> {
+        let plan = ProofPlan {
             proof_systems: vec![
                 address!("00000000000000000000000000000000000000aa"),
                 address!("00000000000000000000000000000000000000bb"),
@@ -511,7 +506,7 @@ mod tests {
     /// Minimal finalized batch (carriers filled) for `public_inputs_hashes`
     /// context tests — one PS, one attesting rollup, no entries.
     fn carrier_batch(block_number: u64) -> crate::batch::EvmBatch {
-        use crate::types::RollupIdWithProofSystemsSol;
+        use crate::abi::RollupIdWithProofSystemsSol;
         let mut batch = crate::batch::EvmBatch::default();
         batch.inner.blockNumber = block_number;
         batch.inner.proofSystems = vec![address!("00000000000000000000000000000000000000aa")];

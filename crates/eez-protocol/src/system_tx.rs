@@ -30,12 +30,12 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolCall;
 use reth_ethereum_primitives::{Transaction, TransactionSigned};
 
+use crate::RollupId;
+use crate::abi::{ExecutionEntrySol, L2ExecutionEntrySol, loadExecutionTableCall};
 use crate::entries::{
     IncomingEntry, OutboundEntry, build_l2_incoming_entry, build_l2_outbound_entry,
     encode_execute_incoming,
 };
-use crate::types::{ExecutionEntrySol, L2ExecutionEntrySol, loadExecutionTableCall};
-use eez_protocol::RollupId;
 
 /// Per-follower configuration the system-tx builder needs. The
 /// composer and deriver each build one from their own startup config.
@@ -87,7 +87,7 @@ pub fn build_inbound_system_txs(
     let mut out: Vec<Bytes> = Vec::new();
     for entry in entries {
         // `destinationRollupId` is `uint256` on-chain; rollup ids fit
-        // in u64 by construction (`eez_protocol::RollupId`).
+        // in u64 by construction (`crate::RollupId`).
         let dest_rollup = u64::try_from(entry.destinationRollupId).unwrap_or(u64::MAX);
         if dest_rollup != cfg.this_rollup_id {
             continue;
@@ -388,8 +388,8 @@ fn sign_legacy_system_tx(
 mod tests {
     use super::*;
     use crate::EvmBatch;
+    use crate::abi::{L2ToL1CallSol, RollupIdWithProofSystemsSol, StateDeltaSol};
     use crate::entries::{decode_postbatch, encode_postbatch};
-    use crate::types::{L2ToL1CallSol, RollupIdWithProofSystemsSol, StateDeltaSol};
     use alloy_primitives::{B256, I256, address};
 
     fn ctx() -> SystemTxContext {

@@ -5,7 +5,7 @@
 //! (regenerated via `scripts/regen-action-hash-vectors.sh`, which runs
 //! the Foundry script `contracts/script/GenActionHashVectors.s.sol`)
 //! and asserts that the Rust
-//! [`eez_evm::action::cross_chain_call_hash`] function produces
+//! [`eez_protocol::action::cross_chain_call_hash`] function produces
 //! byte-identical hashes for every vector. The hash bytes are
 //! unchanged from the prior protocol (the 6-field `abi.encode`
 //! preimage is identical); only the function name rotated to mirror
@@ -24,8 +24,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use alloy_primitives::{Address, B256, Bytes, U256, hex};
-use eez_evm::action::cross_chain_call_hash;
 use eez_protocol::RollupId;
+use eez_protocol::action::cross_chain_call_hash;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]

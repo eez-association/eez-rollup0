@@ -4,22 +4,41 @@ version.workspace      = true
 edition.workspace      = true
 license.workspace      = true
 rust-version.workspace = true
-description            = "Chain-agnostic cross-chain composition: protocol traits, generic composer, checkpoint format."
+description            = "The eez cross-chain protocol: Solidity ABI + entry building, composition engine, composer, checkpoint format, proof signing."
 
 [dependencies]
 async-trait.workspace = true
 thiserror.workspace   = true
 serde.workspace       = true
-# Logging in the generic Composer. Runtime-agnostic — doesn't pull tokio.
 tracing.workspace     = true
-# Pure-Rust keccak-256 for the rolling-hash accumulators. Keeps
-# this crate's zero-alloy/reth dependency surface intact.
+# Pure-Rust keccak-256 for the rolling-hash accumulators.
 sha3.workspace        = true
+
+alloy-primitives.workspace = true
+alloy-sol-types.workspace  = true
+# On-chain reads for the proof-plan resolver (`EEZ.rollups`,
+# `Rollup.checkProofSystemsAndGetVkeys`,
+# `IRollupContract.getTimestampAndBlockHash`).
+alloy-network.workspace        = true
+alloy-provider.workspace       = true
+alloy-rpc-client.workspace     = true
+alloy-transport-http.workspace = true
+alloy-contract.workspace       = true
+# narrow ECDSA signing for the postBatch poster's proof system
+k256.workspace = true
+# signed L2 system txs (system_tx module)
+alloy-consensus.workspace    = true
+alloy-eips.workspace         = true
+alloy-signer-local.workspace = true
+reth-ethereum-primitives.workspace = true
+# outbound gate: recover the signer of the paired user tx (SignedTransaction)
+reth-primitives-traits.workspace = true
 
 [dev-dependencies]
 tokio        = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json.workspace = true
 hex.workspace = true
+eez-payload-codec.workspace = true
 
 [features]
 # Exposes `eez_protocol::testing::FakeChainClient` for downstream test

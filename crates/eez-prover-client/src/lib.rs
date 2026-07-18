@@ -63,7 +63,7 @@ impl RemoteProver {
 fn chunks_for(ctx: &ProvingContext) -> Vec<ProveChunk> {
     // The authoritative on-chain payload (proofs[] empty — the proof isn't part
     // of the publicInputsHash). The prover decodes THIS to recompute the hash.
-    let abi_calldata = eez_evm::types::postAndVerifyBatchCall {
+    let abi_calldata = eez_protocol::abi::postAndVerifyBatchCall {
         batch: ctx.batch.inner.clone(),
     }
     .abi_encode();

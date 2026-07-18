@@ -37,8 +37,8 @@ use revm::interpreter::{
     CallInputs, CallOutcome, CallScheme, Gas, InstructionResult, InterpreterResult,
 };
 
-use eez_evm::{EvmProtocol, ProxyInfo, decode_proxy_value, proxy_mapping_key};
-use eez_protocol::{Dispatcher, ExecutorError, ProxyLookupConfig, RollupId};
+use eez_protocol::{CompositionBuilder, ExecutorError, ProxyLookupConfig, RollupId};
+use eez_protocol::{ProxyInfo, decode_proxy_value, proxy_mapping_key};
 
 /// Bidirectional side-channel between source-sim and the overlay
 /// session opened on the entry rollup.
@@ -292,10 +292,10 @@ fn lookup_authorized_proxy_live<CTX: ContextTr + Host>(
 pub struct SessionInspector<'a> {
     /// Combined proxy-lookup configuration: the contract address to
     /// read and which slot to read from.
-    proxy_lookup: ProxyLookupConfig<EvmProtocol>,
+    proxy_lookup: ProxyLookupConfig,
     /// Dispatch surface — composer or gRPC stub — that routes detected
     /// calls to their target rollups by id.
-    dispatcher: &'a mut (dyn Dispatcher<Protocol = EvmProtocol> + Send),
+    dispatcher: &'a mut CompositionBuilder,
     /// Rollup id of the chain this inspector is running on — the
     /// `caller_id` passed to `dispatch_call` so the resulting
     /// [`RecordedCall.caller_rollup_id`](eez_protocol::RecordedCall::caller_rollup_id)
@@ -347,7 +347,7 @@ impl std::fmt::Debug for SessionInspector<'_> {
 pub struct SessionInspectorFactory {
     /// `(contract_address, slot)` discriminator for this chain's
     /// `authorizedProxies`. Derived from role at client construction.
-    proxy_lookup: ProxyLookupConfig<EvmProtocol>,
+    proxy_lookup: ProxyLookupConfig,
     /// Rollup id of the chain this factory belongs to — becomes the
     /// `caller_id` on every call dispatched through inspectors it
     /// builds.
@@ -370,7 +370,7 @@ impl SessionInspectorFactory {
     /// [`with_overlay_channel`](Self::with_overlay_channel) to install
     /// one.
     #[must_use]
-    pub fn new(proxy_lookup: ProxyLookupConfig<EvmProtocol>, caller_rollup_id: RollupId) -> Self {
+    pub fn new(proxy_lookup: ProxyLookupConfig, caller_rollup_id: RollupId) -> Self {
         Self {
             proxy_lookup,
             caller_rollup_id,
@@ -393,7 +393,7 @@ impl SessionInspectorFactory {
 
     /// Configuration this factory was built with.
     #[must_use]
-    pub fn proxy_lookup(&self) -> &ProxyLookupConfig<EvmProtocol> {
+    pub fn proxy_lookup(&self) -> &ProxyLookupConfig {
         &self.proxy_lookup
     }
 
@@ -412,7 +412,7 @@ impl SessionInspectorFactory {
     /// timing.
     pub fn build<'a>(
         &self,
-        dispatcher: &'a mut (dyn Dispatcher<Protocol = EvmProtocol> + Send),
+        dispatcher: &'a mut CompositionBuilder,
         handle: tokio::runtime::Handle,
     ) -> SessionInspector<'a> {
         let mut insp = SessionInspector::new(
@@ -441,8 +441,8 @@ impl<'a> SessionInspector<'a> {
     ///   `caller_id` on each dispatched call.
     /// - `handle`: tokio runtime handle for the sync→async bridge.
     pub fn new(
-        proxy_lookup: ProxyLookupConfig<EvmProtocol>,
-        dispatcher: &'a mut (dyn Dispatcher<Protocol = EvmProtocol> + Send),
+        proxy_lookup: ProxyLookupConfig,
+        dispatcher: &'a mut CompositionBuilder,
         caller_rollup_id: RollupId,
         handle: tokio::runtime::Handle,
     ) -> Self {
@@ -761,7 +761,7 @@ mod tests {
 
     use super::*;
     use alloy_primitives::{U256, address};
-    use eez_evm::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
+    use eez_protocol::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
     use revm::MainContext;
     use revm::context::Context;
     use revm::database::{CacheDB, EmptyDB};
@@ -895,7 +895,7 @@ mod tests {
         // ProxyLookupConfig with source_contract=EEZ routes to slot 0
         // (authorizedProxies declared on EEZBase, first storage slot
         // of every child).
-        let config = ProxyLookupConfig::<EvmProtocol> {
+        let config = ProxyLookupConfig {
             contract_address: ROLLUPS_ADDR,
             authorized_proxies_slot: ROLLUPS_AUTHORIZED_PROXIES_SLOT,
         };
@@ -930,7 +930,7 @@ mod tests {
         // (authorizedProxies on EEZBase, first storage slot). Same
         // value as the L1 path today — kept distinct so the two
         // constants diverging later breaks loudly.
-        let config = ProxyLookupConfig::<EvmProtocol> {
+        let config = ProxyLookupConfig {
             contract_address: ROLLUPS_ADDR,
             authorized_proxies_slot: CCM_AUTHORIZED_PROXIES_SLOT,
         };
