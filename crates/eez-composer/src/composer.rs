@@ -1282,7 +1282,7 @@ where
                         let l1_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = composition
                             .targets
                             .iter()
-                            .flat_map(|t| t.batch.inner.entries.iter().cloned())
+                            .flat_map(|t| t.batch.entries.iter().cloned())
                             .collect();
                         if l1_entries.is_empty() {
                             event!(
@@ -1397,7 +1397,7 @@ where
                     let target_entries: Vec<_> = composition
                         .targets
                         .iter()
-                        .flat_map(|t| t.batch.inner.entries.iter().cloned())
+                        .flat_map(|t| t.batch.entries.iter().cloned())
                         .collect();
                     let target_count = target_entries.len();
                     pending_in.extend(target_entries);
@@ -1685,10 +1685,7 @@ where
                     .await;
             }
         };
-        let total_entries: usize = comp_refs
-            .iter()
-            .map(|c| c.source.batch.inner.entries.len())
-            .sum();
+        let total_entries: usize = comp_refs.iter().map(|c| c.source.batch.entries.len()).sum();
 
         // ── Dispatch: rich bundle [postBatch, ...survivors], commit. ──
         let sync_height = built.header.number();
@@ -1923,12 +1920,9 @@ where
         } else {
             let mut b = compositions[0].source.batch.clone();
             for c in &compositions[1..] {
-                b.inner
-                    .entries
-                    .extend(c.source.batch.inner.entries.iter().cloned());
-                b.inner
-                    .l1ToL2lookupCalls
-                    .extend(c.source.batch.inner.l1ToL2lookupCalls.iter().cloned());
+                b.entries.extend(c.source.batch.entries.iter().cloned());
+                b.l1ToL2lookupCalls
+                    .extend(c.source.batch.l1ToL2lookupCalls.iter().cloned());
             }
             b
         };
@@ -1980,7 +1974,7 @@ where
             returnData: Bytes::new(),
             rollingHash: B256::ZERO,
         };
-        batch.inner.entries.insert(0, immediate_entry);
+        batch.entries.insert(0, immediate_entry);
 
         // Splice OUTBOUND settlement entries after the leading anchor (delta
         // attached below). The contract drains the contiguous `proxyEntryHash==0`
@@ -1990,7 +1984,7 @@ where
         for (k, oe) in outbound_entries.iter().enumerate() {
             let mut entry = oe.clone();
             entry.destinationRollupId = rollup_id_u256;
-            batch.inner.entries.insert(1 + k, entry);
+            batch.entries.insert(1 + k, entry);
         }
 
         // Deposit value for inbound deferred entries: the lean on-chain entry binds
@@ -1999,7 +1993,7 @@ where
         let inbound_ether: HashMap<B256, alloy_primitives::I256> = compositions
             .iter()
             .flat_map(|c| c.targets.iter())
-            .flat_map(|t| t.batch.inner.entries.iter())
+            .flat_map(|t| t.batch.entries.iter())
             .filter_map(|e| {
                 let v = e.l2ToL1Calls.first()?.value;
                 if v.is_zero() {
@@ -2022,7 +2016,7 @@ where
         // The prover requires this exact per-entry value. `currentState` is fixed
         // by the stitch below.
         let mut effect_k = 0usize;
-        for entry in &mut batch.inner.entries {
+        for entry in &mut batch.entries {
             // Skip entries that already carry a delta (the anchor); fill only the
             // cross-chain effect entries, which arrive empty.
             if !entry.stateDeltas.is_empty() {
@@ -2078,7 +2072,7 @@ where
         // entry's `newState`. This chains `pre_sync → R_0 → … → R_last (final
         // root)`, satisfying both EEZ.sol and the prover's effect-prefix gate.
         let mut running_roots: HashMap<U256, B256> = HashMap::new();
-        for entry in &mut batch.inner.entries {
+        for entry in &mut batch.entries {
             for delta in &mut entry.stateDeltas {
                 if let Some(prev_new) = running_roots.get(&delta.rollupId).copied() {
                     delta.currentState = prev_new;
@@ -2093,7 +2087,7 @@ where
         // the re-executed final root and the endpoint gate would fail. With
         // effects, the last effect's root already is the final root.
         if pair_roots.is_empty() {
-            if let Some(last) = batch.inner.entries.last_mut() {
+            if let Some(last) = batch.entries.last_mut() {
                 for delta in last.stateDeltas.iter_mut().rev() {
                     if delta.rollupId == rollup_id_u256 {
                         delta.newState = sync_block_state_root;
@@ -2107,7 +2101,6 @@ where
         // this (gates.rs); assert locally so a stitch bug fails fast here.
         debug_assert_eq!(
             batch
-                .inner
                 .entries
                 .last()
                 .and_then(|e| e.stateDeltas.last())
@@ -2120,13 +2113,13 @@ where
         // inline (`EEZ.sol:387`): 1 anchor immediate + N outbound immediates.
         // Inbound deferred entries (proxyEntryHash != 0) queue for
         // `executeCrossChainCall` consumption. N=0 for inbound-only → 1.
-        batch.inner.transientExecutionEntryCount = U256::from(1 + outbound_entries.len() as u64);
+        batch.transientExecutionEntryCount = U256::from(1 + outbound_entries.len() as u64);
 
         // Registry-id settlement gate: refuse a batch carrying any non-registry
         // destinationRollupId (e.g. an un-rewritten MAINNET(0) outbound entry).
         assert_batch_registry_native(&batch, rollup_id_u256)?;
-        batch.inner.proofSystems = vec![ctx.ecdsa_proof_system_address];
-        batch.inner.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
+        batch.proofSystems = vec![ctx.ecdsa_proof_system_address];
+        batch.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
             rollupId: U256::from(ctx.l2_rollup_id),
             proofSystemIndex: vec![0u64],
         }];
@@ -2274,13 +2267,13 @@ where
                 compositions
                     .iter()
                     .flat_map(|c| c.targets.iter())
-                    .flat_map(|t| t.batch.inner.entries.iter())
+                    .flat_map(|t| t.batch.entries.iter())
                     .map(eez_protocol::abi::ExecutionEntrySol::abi_encode),
             )
             .collect();
         let payload = eez_payload_codec::encode(&blocks, &l2_entries_bytes)
             .map_err(|e| format!("eez_payload_codec::encode: {e}"))?;
-        batch.inner.callData = alloy_primitives::Bytes::from(payload);
+        batch.callData = alloy_primitives::Bytes::from(payload);
 
         // Prove the assembled window (proofs[] empty — not part of the
         // publicInputsHash). Mock ignores the context; a remote prover re-executes
@@ -2348,10 +2341,10 @@ where
             .prove(proving_ctx)
             .await
             .map_err(|e| format!("prover.prove: {e}"))?;
-        batch.inner.proofs = vec![proof];
+        batch.proofs = vec![proof];
 
         let calldata = postAndVerifyBatchCall {
-            batch: batch.inner.clone(),
+            batch: batch.clone(),
         }
         .abi_encode();
 
@@ -2381,7 +2374,7 @@ where
 /// whose `dest` stayed at the call's MAINNET(0) target) that L1 would misattribute
 /// and that folds into the `publicInputsHash`. Guards the outbound `dest=rid` rewrite.
 fn assert_batch_registry_native(batch: &eez_protocol::EvmBatch, rid: U256) -> Result<(), String> {
-    for (i, entry) in batch.inner.entries.iter().enumerate() {
+    for (i, entry) in batch.entries.iter().enumerate() {
         if entry.destinationRollupId != rid {
             return Err(format!(
                 "entry[{i}].destinationRollupId = {} is not the configured registry id {rid} — \
@@ -2398,7 +2391,7 @@ fn assert_batch_registry_native(batch: &eez_protocol::EvmBatch, rid: U256) -> Re
             }
         }
     }
-    for (i, lookup) in batch.inner.l1ToL2lookupCalls.iter().enumerate() {
+    for (i, lookup) in batch.l1ToL2lookupCalls.iter().enumerate() {
         if lookup.destinationRollupId != rid {
             return Err(format!(
                 "l1ToL2lookupCalls[{i}].destinationRollupId = {} is not the configured registry id {rid}",

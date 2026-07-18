@@ -29,7 +29,7 @@
 //! The submit pipeline an integrator wires: resolve a `ProofPlan`
 //! ([`proof_resolver::ProofPlanResolver`]) → [`entries::build_batch`] →
 //! [`public_inputs::public_inputs_hashes`] → sign each digest with
-//! [`EcdsaProofSigner`] → fill `batch.inner.proofs[]` → [`entries::encode_postbatch`].
+//! [`EcdsaProofSigner`] → fill `batch.proofs[]` → [`entries::encode_postbatch`].
 //!
 //! # Where to start reading
 //!

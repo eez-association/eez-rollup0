@@ -433,16 +433,17 @@ mod tests {
     }
 
     fn round_tripped(entries: &[ExecutionEntrySol]) -> Vec<ExecutionEntrySol> {
-        let mut batch = EvmBatch::default();
-        batch.inner.entries = entries.to_vec();
-        batch.inner.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
+        let mut batch = EvmBatch {
+            entries: entries.to_vec(),
+            ..Default::default()
+        };
+        batch.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
             rollupId: U256::from(1),
             proofSystemIndex: vec![0],
         }];
         let calldata = encode_postbatch(&batch);
         decode_postbatch(&calldata)
             .expect("postBatch round-trips")
-            .inner
             .entries
     }
 

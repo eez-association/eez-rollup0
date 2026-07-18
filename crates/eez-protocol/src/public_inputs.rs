@@ -284,7 +284,7 @@ pub fn all_per_ps_hashes(
 /// `_verifyProofSystemBatch` enforces.
 ///
 /// `per_rollup_context` mirrors the reference `Rollup.getTimestampAndBlockHash`
-/// for every rollup, keyed on `batch.inner.blockNumber`:
+/// for every rollup, keyed on `batch.blockNumber`:
 /// - `blockNumber == 0` (timeless): `(0, 0)` — `l1_block_hash` must be `None`.
 /// - `blockNumber == N != 0` (bound): `(0, blockhash(N))` — the TIMESTAMP stays
 ///   ZERO (`Rollup.sol` returns `(0, blockHash)` for a specific past block; a
@@ -305,7 +305,7 @@ pub fn public_inputs_hashes(
     vkey: B256,
     l1_block_hash: Option<B256>,
 ) -> Result<Vec<B256>, ProofPlanInvariantError> {
-    let context = match (batch.inner.blockNumber, l1_block_hash) {
+    let context = match (batch.blockNumber, l1_block_hash) {
         (0, None) => TimestampAndBlockHash {
             timestamp: [0u8; 32],
             block_hash: [0u8; 32],
@@ -322,7 +322,6 @@ pub fn public_inputs_hashes(
         }
     };
     let rollup_assignments: Vec<RollupProofAssignment> = batch
-        .inner
         .rollupIdsWithProofSystems
         .iter()
         .map(|r| RollupProofAssignment {
@@ -336,13 +335,13 @@ pub fn public_inputs_hashes(
         .map(|a| vec![vkey.0; a.proof_system_index.len()])
         .collect();
     let plan = ProofPlan {
-        proof_systems: batch.inner.proofSystems.clone(),
+        proof_systems: batch.proofSystems.clone(),
         rollup_assignments,
         per_rollup_context,
         vk_matrix,
-        cross_proof_system_interactions: batch.inner.crossProofSystemInteractions.0,
+        cross_proof_system_interactions: batch.crossProofSystemInteractions.0,
     };
-    let entry_hashes: Vec<B256> = batch.inner.entries.iter().map(entry_hash).collect();
+    let entry_hashes: Vec<B256> = batch.entries.iter().map(entry_hash).collect();
     // The lookup calls MUST be folded in too: `EEZ._verifyProofSystemBatch` hashes
     // `l1ToL2lookupCalls[]` into `sharedPublicInput` (EEZ.sol:584-587). Omitting them
     // (passing `&[]`) is byte-identical for batches WITHOUT lookup calls (the success +
@@ -350,7 +349,6 @@ pub fn public_inputs_hashes(
     // that supplies the user's revert — the composer hash would diverge from the on-chain
     // recompute and the prover's signature would fail `InvalidProof`. So derive them here.
     let lookup_call_hashes: Vec<B256> = batch
-        .inner
         .l1ToL2lookupCalls
         .iter()
         .map(lookup_call_hash)
@@ -360,7 +358,7 @@ pub fn public_inputs_hashes(
         &entry_hashes,
         &lookup_call_hashes,
         &[],
-        &batch.inner.callData,
+        &batch.callData,
     )
 }
 
@@ -507,10 +505,12 @@ mod tests {
     /// context tests — one PS, one attesting rollup, no entries.
     fn carrier_batch(block_number: u64) -> crate::batch::EvmBatch {
         use crate::abi::RollupIdWithProofSystemsSol;
-        let mut batch = crate::batch::EvmBatch::default();
-        batch.inner.blockNumber = block_number;
-        batch.inner.proofSystems = vec![address!("00000000000000000000000000000000000000aa")];
-        batch.inner.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
+        let mut batch = crate::batch::EvmBatch {
+            blockNumber: block_number,
+            proofSystems: vec![address!("00000000000000000000000000000000000000aa")],
+            ..Default::default()
+        };
+        batch.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
             rollupId: U256::from(1),
             proofSystemIndex: vec![0],
         }];

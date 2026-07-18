@@ -457,12 +457,12 @@ mod tests {
         let composition = builder.finalize(&[]).await.expect("finalize");
 
         // Entry batch carries the top-level call as one deferred entry.
-        assert_eq!(composition.source.batch.inner.entries.len(), 1);
+        assert_eq!(composition.source.batch.entries.len(), 1);
 
         // The target composition carries the inbound DA-sidecar entry.
         assert_eq!(composition.targets.len(), 1);
         assert_eq!(composition.targets[0].rollup_id, target_id);
-        assert_eq!(composition.targets[0].batch.inner.entries.len(), 1);
+        assert_eq!(composition.targets[0].batch.entries.len(), 1);
 
         // Follower saw exactly one dispatched outcome.
         let seen = follower_recorder.dispatched_outcomes();

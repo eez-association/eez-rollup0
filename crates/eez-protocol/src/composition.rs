@@ -1217,7 +1217,7 @@ mod tests {
         // The sidecar entry mirrors the recorded call: callCount 1, the
         // call in l2ToL1Calls[0], proxyEntryHash bound to the same
         // 6-field preimage the on-chain entry uses.
-        let entries = &composition.targets[0].batch.inner.entries;
+        let entries = &composition.targets[0].batch.entries;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].callCount, U256::from(1u8));
         assert_eq!(entries[0].l2ToL1Calls.len(), 1);
@@ -1238,7 +1238,7 @@ mod tests {
         );
 
         // The entry batch carries the top-level call as one deferred entry.
-        assert_eq!(composition.source.batch.inner.entries.len(), 1);
+        assert_eq!(composition.source.batch.entries.len(), 1);
     }
 
     #[tokio::test]

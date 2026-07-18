@@ -13,7 +13,7 @@
 //!    `Rollup.checkProofSystemsAndGetVkeys`, and
 //!    `IRollupContract.getTimestampAndBlockHash` for each touched
 //!    rollup. Returns a validated [`ProofPlan`].
-//! 3. **Proof-carrier population** — mutate `batch.inner` to carry
+//! 3. **Proof-carrier population** — mutate the batch to carry
 //!    `proofSystems`, `rollupIdsWithProofSystems`, and
 //!    `crossProofSystemInteractions` from the plan. For Phase 09
 //!    blobs/callData stay empty (`blobIndices = []`, `callData = b""`,
@@ -23,7 +23,7 @@
 //! 5. **Per-PS signature** — for the single ECDSA proof system in this
 //!    phase, sign every per-PS digest with the configured
 //!    [`EcdsaProofSigner`] (§D). Append each 65-byte signature to
-//!    `batch.inner.proofs[]` parallel to `proofSystems[]`. (Phase 10+
+//!    `batch.proofs[]` parallel to `proofSystems[]`. (Phase 10+
 //!    swaps this loop for a `BatchProofProducer` trait so different
 //!    PSes can emit different proof shapes.)
 //! 6. **L1 submission** — encode calldata via
@@ -150,14 +150,14 @@ pub enum PostBatchError {
         /// The offending uint256 value.
         value: U256,
     },
-    /// `batch.inner.blobIndices` was non-empty. Phase 09 doesn't wire
+    /// `batch.blobIndices` was non-empty. Phase 09 doesn't wire
     /// the blob carrier path — `submit` always passes an empty
     /// `blob_hashes` slice to `all_per_ps_hashes`, so a non-empty
     /// `blobIndices` would silently mismatch the on-chain
     /// `blobhash(blobIndices[i])` fold. Refuse the submission instead.
     /// Phase 10+ wires the blob carrier path end-to-end.
     #[error(
-        "post_batch: batch.inner.blobIndices has {len} entries; \
+        "post_batch: batch.blobIndices has {len} entries; \
          Phase 09 submitter requires blobIndices == [] (blob carrier \
          path is deferred to Phase 10+)"
     )]
@@ -355,9 +355,9 @@ where
         //    input batch would silently mismatch the on-chain
         //    `blobhash(blobIndices[i])` fold against our empty
         //    `blob_hashes` slice.
-        if !batch.inner.blobIndices.is_empty() {
+        if !batch.blobIndices.is_empty() {
             return Err(PostBatchError::UnsupportedBlobIndices {
-                len: batch.inner.blobIndices.len(),
+                len: batch.blobIndices.len(),
             });
         }
 
@@ -387,9 +387,8 @@ where
         populate_proof_carriers(&mut batch, &plan);
 
         // 4. Compute per-PS publicInputsHash[k].
-        let entry_hashes: Vec<B256> = batch.inner.entries.iter().map(entry_hash).collect();
+        let entry_hashes: Vec<B256> = batch.entries.iter().map(entry_hash).collect();
         let lookup_call_hashes: Vec<B256> = batch
-            .inner
             .l1ToL2lookupCalls
             .iter()
             .map(lookup_call_hash)
@@ -405,7 +404,7 @@ where
             &entry_hashes,
             &lookup_call_hashes,
             &blob_hashes,
-            &batch.inner.callData,
+            &batch.callData,
         )
         .map_err(PostBatchError::PlanInvariants)?;
 
@@ -419,7 +418,7 @@ where
                 .map_err(|source| PostBatchError::Sign { ps_index, source })?;
             proofs.push(sig);
         }
-        batch.inner.proofs = proofs;
+        batch.proofs = proofs;
 
         // 6. Encode calldata + submit. Proofs ride inside the batch
         // struct under the multi-prover ABI; trait takes the batch
@@ -502,14 +501,14 @@ where
 /// batch sail past the resolver into a confusing registry-miss).
 fn extract_touched_rollups(batch: &EvmBatch) -> Result<BTreeSet<RollupId>, PostBatchError> {
     let mut touched = BTreeSet::new();
-    for entry in &batch.inner.entries {
+    for entry in &batch.entries {
         // `destinationRollupId` is the routing target; always present.
         touched.insert(RollupId(u256_to_u64_checked(entry.destinationRollupId)?));
         for delta in &entry.stateDeltas {
             touched.insert(RollupId(u256_to_u64_checked(delta.rollupId)?));
         }
     }
-    for lookup in &batch.inner.l1ToL2lookupCalls {
+    for lookup in &batch.l1ToL2lookupCalls {
         touched.insert(RollupId(u256_to_u64_checked(lookup.destinationRollupId)?));
     }
     Ok(touched)
@@ -527,15 +526,15 @@ fn u256_to_u64_checked(v: U256) -> Result<u64, PostBatchError> {
         })
 }
 
-/// Mutate `batch.inner` to carry the resolved plan's proof-system
+/// Mutate `batch` to carry the resolved plan's proof-system
 /// fields. Leaves `entries`, `l1ToL2lookupCalls`,
 /// `transientExecutionEntryCount`, `transientLookupCallCount`,
 /// `blobIndices`, and `callData` untouched — those were populated by
 /// `build_batch` (and `blobIndices`/`callData` stay empty in Phase
 /// 09).
 fn populate_proof_carriers(batch: &mut EvmBatch, plan: &ProofPlan) {
-    batch.inner.proofSystems = plan.proof_systems.clone();
-    batch.inner.rollupIdsWithProofSystems = plan
+    batch.proofSystems = plan.proof_systems.clone();
+    batch.rollupIdsWithProofSystems = plan
         .rollup_assignments
         .iter()
         .map(|a| RollupIdWithProofSystemsSol {
@@ -543,7 +542,7 @@ fn populate_proof_carriers(batch: &mut EvmBatch, plan: &ProofPlan) {
             proofSystemIndex: a.proof_system_index.clone(),
         })
         .collect();
-    batch.inner.crossProofSystemInteractions = B256::from(plan.cross_proof_system_interactions);
+    batch.crossProofSystemInteractions = B256::from(plan.cross_proof_system_interactions);
 }
 
 /// Parse the receipt logs into a [`PostBatchOutcome`]. Filters logs
@@ -628,9 +627,7 @@ fn decode_outcome_from_logs(
 mod tests {
     use super::*;
     use alloy_primitives::I256;
-    use eez_protocol::abi::{
-        ExecutionEntrySol, LookupCallSol, ProofSystemBatchPerVerificationEntriesSol, StateDeltaSol,
-    };
+    use eez_protocol::abi::{ExecutionEntrySol, LookupCallSol, StateDeltaSol};
     use eez_protocol::{RollupProofAssignment, TimestampAndBlockHash};
 
     fn entry_with(dest: u64, delta_rids: &[u64]) -> ExecutionEntrySol {
@@ -672,19 +669,17 @@ mod tests {
 
     fn make_batch(entries: Vec<ExecutionEntrySol>, lookups: Vec<LookupCallSol>) -> EvmBatch {
         EvmBatch {
-            inner: ProofSystemBatchPerVerificationEntriesSol {
-                entries,
-                l1ToL2lookupCalls: lookups,
-                transientExecutionEntryCount: U256::ZERO,
-                transientLookupCallCount: U256::ZERO,
-                proofSystems: Vec::new(),
-                rollupIdsWithProofSystems: Vec::new(),
-                crossProofSystemInteractions: B256::ZERO,
-                blobIndices: Vec::new(),
-                callData: Bytes::new(),
-                proofs: Vec::new(),
-                blockNumber: 0,
-            },
+            entries,
+            l1ToL2lookupCalls: lookups,
+            transientExecutionEntryCount: U256::ZERO,
+            transientLookupCallCount: U256::ZERO,
+            proofSystems: Vec::new(),
+            rollupIdsWithProofSystems: Vec::new(),
+            crossProofSystemInteractions: B256::ZERO,
+            blobIndices: Vec::new(),
+            callData: Bytes::new(),
+            proofs: Vec::new(),
+            blockNumber: 0,
         }
     }
 
@@ -757,17 +752,17 @@ mod tests {
             cross_proof_system_interactions: [0u8; 32],
         };
         populate_proof_carriers(&mut batch, &plan);
-        assert_eq!(batch.inner.proofSystems, vec![ps_addr]);
-        assert_eq!(batch.inner.rollupIdsWithProofSystems.len(), 1);
+        assert_eq!(batch.proofSystems, vec![ps_addr]);
+        assert_eq!(batch.rollupIdsWithProofSystems.len(), 1);
         assert_eq!(
-            batch.inner.rollupIdsWithProofSystems[0].rollupId,
+            batch.rollupIdsWithProofSystems[0].rollupId,
             U256::from(1u64)
         );
         assert_eq!(
-            batch.inner.rollupIdsWithProofSystems[0].proofSystemIndex,
+            batch.rollupIdsWithProofSystems[0].proofSystemIndex,
             vec![0u64]
         );
-        assert_eq!(batch.inner.crossProofSystemInteractions, B256::ZERO);
+        assert_eq!(batch.crossProofSystemInteractions, B256::ZERO);
     }
 
     // ── Selector lock (regression test for §F1 first-run bug) ───────
