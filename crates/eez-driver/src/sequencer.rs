@@ -72,16 +72,10 @@ fn log_stale_parent(phase: &str) {
     );
 }
 
-/// L1-confirmed L2 head height. `eez_l1::L1CanonicalHead`
-/// implements this; the Sequencer uses it to bound speculative depth.
-pub trait ConfirmedHeadSource: Send + Sync + 'static {
-    /// Highest L2 block confirmed by an L1-landed batch.
-    fn confirmed_head(&self) -> u64;
-}
-
 struct SpeculativeLimit {
     max_depth: u64,
-    source: Arc<dyn ConfirmedHeadSource>,
+    /// L1-confirmed L2 head cursor bounding speculative depth.
+    source: Arc<eez_l1::L1CanonicalHead>,
 }
 
 impl fmt::Debug for SpeculativeLimit {
@@ -285,7 +279,7 @@ where
     pub fn with_speculative_limit(
         mut self,
         max_depth: u64,
-        source: Arc<dyn ConfirmedHeadSource>,
+        source: Arc<eez_l1::L1CanonicalHead>,
     ) -> Self {
         self.speculative_limit = Some(SpeculativeLimit { max_depth, source });
         self
@@ -646,7 +640,7 @@ where
         let Some(limit) = &self.speculative_limit else {
             return false;
         };
-        let confirmed = limit.source.confirmed_head();
+        let confirmed = limit.source.cursor();
         let speculative_depth = head_number.saturating_sub(confirmed);
         if speculative_depth >= limit.max_depth {
             event!(

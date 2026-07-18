@@ -33,7 +33,7 @@ pub use error::{L1Error, L1Result};
 #[doc(inline)]
 pub use l1_canonical_head::{BatchRecord, L1CanonicalHead};
 #[doc(inline)]
-pub use l1_head_stream::L1HeadStream;
+pub use l1_head_stream::{L1HeadInfo, L1HeadStream};
 #[doc(inline)]
 pub use l1_watcher::{L1Event, L1Watcher, L1WatcherConfig};
 #[doc(inline)]
