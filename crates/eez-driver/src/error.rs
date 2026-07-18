@@ -9,7 +9,6 @@
 //! the backtrace once, at the construction site closest to the failure.
 
 use core::fmt;
-use std::backtrace::Backtrace;
 
 use alloy_primitives::B256;
 
@@ -17,9 +16,9 @@ use alloy_primitives::B256;
 pub type DriverResult<T> = Result<T, DriverError>;
 
 /// Error returned by [`Sequencer`](crate::Sequencer) operations.
+#[derive(Debug)]
 pub struct DriverError {
     kind: ErrorKind,
-    backtrace: Backtrace,
 }
 
 #[derive(Debug)]
@@ -86,34 +85,13 @@ impl DriverError {
     }
 
     fn new(kind: ErrorKind) -> Self {
-        Self {
-            kind,
-            backtrace: Backtrace::capture(),
-        }
-    }
-
-    /// Returns true if the error came from the underlying state provider.
-    #[must_use]
-    pub fn is_provider(&self) -> bool {
-        matches!(self.kind, ErrorKind::Provider(_))
-    }
-
-    /// Returns true if the expected head header was missing on startup.
-    #[must_use]
-    pub fn is_missing_header(&self) -> bool {
-        matches!(self.kind, ErrorKind::MissingHeader { .. })
+        Self { kind }
     }
 
     /// Returns true if the engine rejected a forkchoice update.
     #[must_use]
     pub fn is_invalid_forkchoice(&self) -> bool {
         matches!(self.kind, ErrorKind::InvalidForkchoice(_))
-    }
-
-    /// Returns true if the engine rejected a built payload.
-    #[must_use]
-    pub fn is_invalid_payload(&self) -> bool {
-        matches!(self.kind, ErrorKind::InvalidPayload(_))
     }
 
     /// Returns true if the `BlockCommitter` actor task has exited and
@@ -123,32 +101,11 @@ impl DriverError {
         matches!(self.kind, ErrorKind::CommitterClosed)
     }
 
-    /// Returns true if [`RollupTiming`](crate::timing::RollupTiming)
-    /// env loading or validation failed at startup.
-    #[must_use]
-    pub fn is_timing_config(&self) -> bool {
-        matches!(self.kind, ErrorKind::TimingConfig(_))
-    }
-
     /// Sequencer's snapshot was stale by the time the actor checked;
     /// caller should retry on the next tick.
     #[must_use]
     pub fn is_stale_parent(&self) -> bool {
         matches!(self.kind, ErrorKind::StaleParent { .. })
-    }
-
-    /// Returns the captured backtrace for diagnostics.
-    pub fn backtrace(&self) -> &Backtrace {
-        &self.backtrace
-    }
-}
-
-impl fmt::Debug for DriverError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DriverError")
-            .field("kind", &self.kind)
-            .field("backtrace", &"<captured>")
-            .finish()
     }
 }
 

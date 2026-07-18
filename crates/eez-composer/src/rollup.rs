@@ -24,8 +24,6 @@ pub struct RollupConfig {
     /// `rollupId` returned by `EEZ.registerRollup` for this L2.
     pub rollup_id: u64,
     /// Deployed proof-system address — the `IProofSystem` instance this
-    /// rollup attests with.
-    pub proof_system: Address,
     /// L1 block where `EEZ` was deployed. Lower bound for the startup
     /// `BatchPosted` log scan that seeds the L1-confirmed cursor.
     ///
@@ -57,11 +55,6 @@ impl RollupConfig {
             .map_err(|_| L1Error::Config("EEZ_ROLLUP_ID is required".into()))?
             .parse::<u64>()
             .map_err(|e| L1Error::Config(format!("EEZ_ROLLUP_ID: {e}")))?;
-        let proof_system =
-            Address::from_str(&env::var("EEZ_ECDSA_PROOF_SYSTEM_ADDRESS").map_err(|_| {
-                L1Error::Config("EEZ_ECDSA_PROOF_SYSTEM_ADDRESS is required".into())
-            })?)
-            .map_err(|e| L1Error::Config(format!("EEZ_ECDSA_PROOF_SYSTEM_ADDRESS: {e}")))?;
         let deploy_block = env::var("EEZ_REGISTRY_DEPLOY_BLOCK")
             .map_err(|_| L1Error::Config("EEZ_REGISTRY_DEPLOY_BLOCK is required".into()))?
             .parse::<u64>()
@@ -86,7 +79,6 @@ impl RollupConfig {
 
         Ok(Self {
             rollup_id,
-            proof_system,
             deploy_block,
             expect_external_batches,
         })

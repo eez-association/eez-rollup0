@@ -196,7 +196,11 @@ fn main() -> eyre::Result<()> {
         let embedded_l1: Option<EmbeddedL1<_, _>> = if embed_l1 {
             let l1_cfg = build_embedded_l1_config()?;
             match l1_cfg.kind {
-                l1_embedded::L1ChainKind::Dev => {
+                l1_embedded::L1ChainKind::Dev | l1_embedded::L1ChainKind::Testing => {
+                    let kind = match l1_cfg.kind {
+                        l1_embedded::L1ChainKind::Dev => "dev",
+                        _ => "testing",
+                    };
                     let node_cfg = l1_embedded::build_dev_node_config(&l1_cfg)?;
                     let db = reth_db::init_db(
                         node_cfg.datadir().db(),
@@ -206,9 +210,9 @@ fn main() -> eyre::Result<()> {
                     event!(
                         name: "eez.node.l1_embedded.launching",
                         Level::INFO,
-                        kind = "dev",
+                        kind,
                         http_port = l1_cfg.http_port,
-                        "launching embedded L1 reth (dev)",
+                        "launching embedded L1 reth ({kind})",
                     );
                     let l1_handle = reth_node_builder::NodeBuilder::new(node_cfg)
                         .with_database(db)
@@ -220,39 +224,9 @@ fn main() -> eyre::Result<()> {
                     event!(
                         name: "eez.node.l1_embedded.ready",
                         Level::INFO,
-                        kind = "dev",
+                        kind,
                         l1_chain_id = %l1_handle.node.chain_spec().chain(),
-                        "embedded L1 reth (dev) ready",
-                    );
-                    Some(EmbeddedL1::Dev(l1_handle))
-                }
-                l1_embedded::L1ChainKind::Testing => {
-                    let node_cfg = l1_embedded::build_dev_node_config(&l1_cfg)?;
-                    let db = reth_db::init_db(
-                        node_cfg.datadir().db(),
-                        reth_db::mdbx::DatabaseArguments::default(),
-                    )
-                    .map_err(|e| eyre::eyre!("L1 embedded init_db: {e}"))?;
-                    event!(
-                        name: "eez.node.l1_embedded.launching",
-                        Level::INFO,
-                        kind = "testing",
-                        http_port = l1_cfg.http_port,
-                        "launching embedded L1 reth (testing)",
-                    );
-                    let l1_handle = reth_node_builder::NodeBuilder::new(node_cfg)
-                        .with_database(db)
-                        .with_launch_context(build_l1_runtime()?)
-                        .node(EthereumNode::default())
-                        .extend_rpc_modules(bundle_rpc::install_dev_bundle_rpc)
-                        .launch_with_debug_capabilities()
-                        .await?;
-                    event!(
-                        name: "eez.node.l1_embedded.ready",
-                        Level::INFO,
-                        kind = "testing",
-                        l1_chain_id = %l1_handle.node.chain_spec().chain(),
-                        "embedded L1 reth (testing) ready",
+                        "embedded L1 reth ({kind}) ready",
                     );
                     Some(EmbeddedL1::Dev(l1_handle))
                 }

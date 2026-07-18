@@ -9,7 +9,6 @@ description            = "L1 RPC client + Submitter task that posts L2 batches t
 [dependencies]
 eez-driver.workspace        = true
 eez-protocol.workspace      = true
-eez-payload-codec.workspace = true
 
 # alloy
 alloy-consensus.workspace     = true

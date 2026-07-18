@@ -17,7 +17,6 @@
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
-pub mod aggregator;
 pub mod config;
 pub mod error;
 pub mod l1_canonical_head;
@@ -27,9 +26,8 @@ pub mod scan;
 pub mod submitter;
 
 #[doc(inline)]
-pub use aggregator::SubmitTrigger;
 #[doc(inline)]
-pub use config::{SubmitterConfig, registry_deploy_block_from_env};
+pub use config::SubmitterConfig;
 #[doc(inline)]
 pub use error::{L1Error, L1Result};
 #[doc(inline)]
