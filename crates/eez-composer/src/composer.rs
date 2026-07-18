@@ -145,7 +145,7 @@ pub struct CrossChainWiring {
     /// outbound tx originates on this L2, so its `simulate_and_resolve`
     /// must run against an L2 entry (the L2 follower's `ChainClient`
     /// errors `Unavailable` for source sim).
-    pub l2_entry_client: Arc<dyn eez_protocol::executor::EntryChainClient + Send + Sync>,
+    pub l2_entry_client: Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
 }
 
 impl std::fmt::Debug for CrossChainWiring {

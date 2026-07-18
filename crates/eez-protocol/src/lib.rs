@@ -85,10 +85,7 @@ pub use error::{
     ProtocolErrorKind, ProtocolResult,
 };
 #[doc(inline)]
-pub use executor::{
-    ChainClient, CommittedRootReader, EntryChainClient, ExecutionRequest, SessionSnapshot,
-    TargetExecutionSession,
-};
+pub use executor::{ChainClient, ExecutionRequest, SessionSnapshot, TargetExecutionSession};
 #[doc(inline)]
 pub use overlay::{
     AccountInfo, AccountOverlay, AccountStatus, ContractCode, EvmOverlay, StorageOverlay,

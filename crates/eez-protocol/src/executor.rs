@@ -1,49 +1,19 @@
 //! Chain-client and execution-session interfaces.
 //!
-//! The composer talks to every registered rollup through two traits:
-//! the uniform [`ChainClient`] (all rollups) and the entry-only
-//! [`EntryChainClient`] (extends `ChainClient`; only the rollup
-//! designated as composition entry implements it). Nested cross-chain
+//! The composer talks to every registered rollup through one trait,
+//! [`ChainClient`]. Role-specific operations (`simulate_source_tx` for
+//! the entry rollup, `stored_target_state_root` for the committed-root
+//! host) have default implementations that refuse with
+//! [`ExecutorErrorKind::Unavailable`], so a misregistered client fails
+//! loudly at the first role-specific call. Nested cross-chain
 //! dispatch goes through the borrowed
 //! [`CompositionBuilder`].
 //!
-//! All three traits are `#[async_trait]` — one heap allocation per call
+//! Both traits are `#[async_trait]` — one heap allocation per call
 //! in exchange for dyn-compatibility. Native `async fn in trait` is
 //! not dyn-compatible today, and the composer stores clients as trait
 //! objects so transports (local reth, gRPC peer, test fake) can swap
 //! without upstream changes.
-//!
-//! # Capability split
-//!
-//! ```text
-//!   ChainClient                every registered rollup
-//!       │
-//!       └─ begin_execution_session  opens a stateful session for one
-//!                                   source transaction's worth of
-//!                                   cross-chain calls
-//!
-//!   EntryChainClient : ChainClient    entry rollup only
-//!       │
-//!       └─ simulate_source_tx       runs source simulation, dispatching
-//!                                   every detected proxy call through
-//!                                   a borrowed CompositionBuilder
-//!
-//!   CommittedRootReader : ChainClient   committed-root host (L1) only
-//!       │
-//!       └─ stored_target_state_root reads `EEZ.rollups[id].stateRoot`
-//!                                   (the invariant-6 anchor); registered
-//!                                   via `ComposerBuilder::root_reader`
-//!
-//!   TargetExecutionSession      one per builder; the slot drain may
-//!                               chain it across source txs (F1)
-//!       │
-//!       └─ execute              one call, owned by the builder
-//! ```
-//!
-//! Follower clients (gRPC peers, non-entry local clients) implement
-//! `ChainClient` only. Attempting to register a non-entry client via
-//! [`ComposerBuilder::entry`](crate::composer::ComposerBuilder::entry)
-//! fails to compile because the bound requires `EntryChainClient`.
 
 use alloy_primitives::{Address, Bytes, U256};
 
@@ -156,10 +126,9 @@ pub type SessionSnapshot = Box<dyn std::any::Any + Send>;
 
 /// Uniform chain-client interface every registered rollup satisfies.
 ///
-/// `Composer` talks to every rollup through this trait. The entry rollup
-/// additionally implements [`EntryChainClient`] (source-sim capability);
-/// the chain hosting the canonical committed-root storage (L1 in this
-/// protocol) additionally implements [`CommittedRootReader`].
+/// `Composer` talks to every rollup through this trait. Role-specific
+/// methods (`simulate_source_tx`, `stored_target_state_root`) default
+/// to a loud [`ExecutorErrorKind::Unavailable`] refusal.
 ///
 /// Stored as `Arc<dyn ChainClient + Send + Sync>` in the composer's
 /// rollup map.
@@ -168,8 +137,9 @@ pub trait ChainClient: Send + Sync + 'static {
     /// Read this chain's own latest block-header `stateRoot`.
     ///
     /// Orthogonal to upstream-invariant-6 anchoring (which uses
-    /// [`CommittedRootReader::stored_target_state_root`] against L1's
-    /// canonical storage). Used for diagnostics and health checks.
+    /// [`stored_target_state_root`](Self::stored_target_state_root)
+    /// against L1's canonical storage). Used for diagnostics and
+    /// health checks.
     ///
     /// # Errors
     ///
@@ -192,24 +162,12 @@ pub trait ChainClient: Send + Sync + 'static {
     async fn begin_execution_session(
         &self,
     ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>>;
-}
 
-/// Source-simulation capability. Supertrait of [`ChainClient`].
-///
-/// Implemented only by the client for the rollup registered as the
-/// composition entry point (via [`ComposerBuilder::entry`](crate::composer::ComposerBuilder::entry)).
-/// Follower clients implement [`ChainClient`] only; gRPC peers
-/// structurally cannot serve source simulation (the inspector runs
-/// in-process against live EVM state), so the split mirrors the wire
-/// reality.
-///
-/// Stored as `Arc<dyn EntryChainClient + Send + Sync>` in the
-/// composer's `entry` slot. Trait upcasting (Rust 1.86+)
-/// re-registers it as `Arc<dyn ChainClient>` in the rollup map.
-#[async_trait::async_trait]
-pub trait EntryChainClient: ChainClient {
     /// Simulate a source-chain transaction, dispatching every detected
-    /// cross-chain proxy call through `dispatcher`.
+    /// cross-chain proxy call through `dispatcher`. Entry-role clients
+    /// only; the default refuses with
+    /// [`ExecutorErrorKind::Unavailable`] so follower registrations
+    /// fail loudly if they ever reach source simulation.
     ///
     /// Takes `raw_tx: Vec<u8>` (owned) so the impl can decode without
     /// holding a borrow on the caller's buffer across async boundaries.
@@ -225,48 +183,29 @@ pub trait EntryChainClient: ChainClient {
         &self,
         raw_tx: Vec<u8>,
         dispatcher: &mut CompositionBuilder,
-    ) -> ExecutorResult<()>;
-}
+    ) -> ExecutorResult<()> {
+        let _ = (raw_tx, dispatcher);
+        Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
+            "simulate_source_tx: not an entry-role client".into(),
+        )))
+    }
 
-/// Committed-state-root reader capability. Supertrait of [`ChainClient`].
-///
-/// Implemented only by clients connected to the chain that hosts the
-/// canonical committed-root storage. In this protocol that is L1's
-/// `EEZ.sol` — `rollups[id].stateRoot` is the value
-/// `postAndVerifyBatch` will check
-/// `entry[i].stateDeltas[j].currentState` against (upstream's invariant 6).
-///
-/// Implementations:
-/// - Local L1 client (whether registered as entry or as a follower in
-///   L2-as-entry topology) — reads its own EVM storage.
-/// - gRPC client whose remote peer is L1 — wires through a
-///   `GetStateRoot` RPC.
-///
-/// `Composer::builder` requires exactly one
-/// [`std::sync::Arc<dyn CommittedRootReader>`] via [`ComposerBuilder::root_reader`](crate::composer::ComposerBuilder::root_reader);
-/// [`Composer::simulate_and_resolve`](crate::composer::Composer::simulate_and_resolve) Phase 1 reads ALL rollups'
-/// initial roots through this reader, including the entry rollup's
-/// own. The protocol expects committed roots — `EEZ.sol`'s
-/// `_applyStateDeltas` reverts `StateRootMismatch(rollupId)` for every
-/// delta in a batch — not chain-header self-reports.
-#[async_trait::async_trait]
-pub trait CommittedRootReader: ChainClient {
     /// Read what the canonical committed-root storage currently has
-    /// for `rollup_id`. For this protocol that is
-    /// `EEZ.rollups(rollup_id).stateRoot` on L1.
-    ///
-    /// This is the upstream-invariant-6 anchor —
-    /// `postAndVerifyBatch` enforces the
-    /// returned value matches each delta's `currentState` for every
-    /// state delta in the batch.
+    /// for `rollup_id` — `EEZ.rollups(rollup_id).stateRoot` on L1, the
+    /// upstream-invariant-6 anchor `postAndVerifyBatch` enforces
+    /// against each delta's `currentState`. Only clients connected to
+    /// the chain hosting that storage implement this; the default
+    /// refuses with [`ExecutorErrorKind::Unavailable`].
     ///
     /// # Errors
     ///
     /// Returns [`ExecutorErrorKind::Provider`] if the underlying state
-    /// provider is inaccessible; [`ExecutorErrorKind::Transport`] for
-    /// gRPC implementations; [`ExecutorErrorKind::Unavailable`] if the
-    /// implementation cannot serve this capability (e.g. a non-L1
-    /// node — though in practice such an impl would not be wrapped as
-    /// `Arc<dyn CommittedRootReader>` in the first place).
-    async fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]>;
+    /// provider is inaccessible; [`ExecutorErrorKind::Unavailable`] if
+    /// the client does not host the committed-root storage.
+    async fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
+        let _ = rollup_id;
+        Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
+            "stored_target_state_root: client does not host the committed-root storage".into(),
+        )))
+    }
 }

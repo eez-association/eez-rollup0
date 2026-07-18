@@ -31,8 +31,8 @@ use reth_storage_api::{BlockNumReader, HeaderProvider, StateProvider, StateProvi
 
 use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
 use eez_protocol::{
-    ChainClient, CommittedRootReader, CompositionBuilder, EntryChainClient, ExecutorError,
-    ExecutorErrorKind, ExecutorResult, ProxyLookupConfig, RollupId, TargetExecutionSession,
+    ChainClient, CompositionBuilder, ExecutorError, ExecutorErrorKind, ExecutorResult,
+    ProxyLookupConfig, RollupId, TargetExecutionSession,
 };
 
 use super::provider::{ChainProvider, HeaderReader};
@@ -351,21 +351,7 @@ where
             })?;
         Ok(header.state_root.0)
     }
-}
 
-#[async_trait::async_trait]
-impl<Provider, EvmConfig> EntryChainClient for LocalChainClient<Provider, EvmConfig>
-where
-    Provider: StateProviderFactory
-        + HeaderProvider<Header = alloy_consensus::Header>
-        + BlockNumReader
-        + HeaderReader
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    EvmConfig: ConfigureEvm<Primitives = EthPrimitives> + Clone + Send + Sync + 'static,
-{
     async fn simulate_source_tx(
         &self,
         raw_tx: Vec<u8>,
@@ -523,40 +509,26 @@ where
 
         Ok(())
     }
-}
 
-/// `CommittedRootReader` impl — only meaningful when this client is
-/// connected to the chain hosting the canonical committed-root storage
-/// (L1's `EEZ.sol` in this protocol).
-///
-/// Today's L1-as-entry topology has the entry client itself serve this
-/// role; the same `Arc<LocalChainClient<...>>` is erased to BOTH
-/// `Arc<dyn EntryChainClient>` (for `.entry(...)`) AND
-/// `Arc<dyn CommittedRootReader>` (for `.root_reader(...)`) at the
-/// builder seam in `main.rs`.
-///
-/// L2-as-entry topology will need a follower variant: when this is a
-/// L1 follower client, it must implement this trait honestly. That
-/// honestly serves committed-root reads only when the client's dialect
-/// is `EvmL1Style` — that's the only chain whose `dispatch_address`
-/// points to a `EEZ.sol`-shaped contract whose storage layout
-/// `compute_state_root_slot` assumes. Both entry and follower roles
-/// can serve when L1-style: the entry case covers L1-as-entry single-binary;
-/// the follower case covers L1-as-follower in L2-as-entry topology.
-/// Non-L1 clients return `Unavailable` so misregistration fails loudly.
-#[async_trait::async_trait]
-impl<Provider, EvmConfig> CommittedRootReader for LocalChainClient<Provider, EvmConfig>
-where
-    Provider: StateProviderFactory
-        + HeaderProvider<Header = alloy_consensus::Header>
-        + BlockNumReader
-        + HeaderReader
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    EvmConfig: ConfigureEvm<Primitives = EthPrimitives> + Clone + Send + Sync + 'static,
-{
+    /// Committed-root reads — only meaningful when this client is
+    /// connected to the chain hosting the canonical committed-root storage
+    /// (L1's `EEZ.sol` in this protocol).
+    ///
+    /// Today's L1-as-entry topology has the entry client itself serve this
+    /// role; the same `Arc<LocalChainClient<...>>` is erased to BOTH
+    /// `Arc<dyn EntryChainClient>` (for `.entry(...)`) AND
+    /// `Arc<dyn CommittedRootReader>` (for `.root_reader(...)`) at the
+    /// builder seam in `main.rs`.
+    ///
+    /// L2-as-entry topology will need a follower variant: when this is a
+    /// L1 follower client, it must implement this trait honestly. That
+    /// honestly serves committed-root reads only when the client's dialect
+    /// is `EvmL1Style` — that's the only chain whose `dispatch_address`
+    /// points to a `EEZ.sol`-shaped contract whose storage layout
+    /// `compute_state_root_slot` assumes. Both entry and follower roles
+    /// can serve when L1-style: the entry case covers L1-as-entry single-binary;
+    /// the follower case covers L1-as-follower in L2-as-entry topology.
+    /// Non-L1 clients return `Unavailable` so misregistration fails loudly.
     async fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
         // Only L1-style clients honestly serve committed-root reads —
         // the storage-slot math `compute_state_root_slot` assumes the
