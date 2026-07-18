@@ -519,13 +519,11 @@ fn main() -> eyre::Result<()> {
                     // same erased views, so composition is identical.
                     let (entry_client_view, root_reader_view) = match l1_variant {
                         EmbeddedL1::Ethereum(l1_handle) => {
-                            let l1_chain_spec = l1_handle.node.chain_spec();
                             let l1_provider = l1_handle.node.provider.clone();
                             let l1_evm_config = l1_handle.node.evm_config.clone();
                             let entry_client = LocalChainClient::new_entry(
                                 l1_provider,
                                 l1_evm_config,
-                                l1_chain_spec,
                                 l1_rollup_id,
                                 eez_registry,
                                 eez_registry,
@@ -546,8 +544,7 @@ fn main() -> eyre::Result<()> {
                         EmbeddedL1::Chiado(chiado_handle) => {
                             // `GnosisChainSpec.inner` is the standard
                             // reth `ChainSpec` (via `#[deref]`); wrap it
-                            // fresh as `Arc<ChainSpec>` for both the
-                            // LocalChainClient chain_spec slot and the
+                            // fresh as `Arc<ChainSpec>` for the
                             // standard `EthEvmConfig` simulation envs.
                             let gnosis_chain_spec = chiado_handle.node.chain_spec();
                             let l1_chain_spec: Arc<reth_chainspec::ChainSpec> =
@@ -560,7 +557,6 @@ fn main() -> eyre::Result<()> {
                             let entry_client = LocalChainClient::new_entry(
                                 l1_provider,
                                 l1_evm_config,
-                                l1_chain_spec,
                                 l1_rollup_id,
                                 eez_registry,
                                 eez_registry,
@@ -586,7 +582,6 @@ fn main() -> eyre::Result<()> {
                     let l2_follower = LocalChainClient::new_follower(
                         provider.clone(),
                         evm_config.clone(),
-                        chain_spec.clone(),
                         l2_rollup_id_typed,
                         ccm_l2,
                         ccm_l2,
@@ -604,7 +599,6 @@ fn main() -> eyre::Result<()> {
                     let l2_entry = LocalChainClient::new_entry(
                         provider.clone(),
                         evm_config.clone(),
-                        chain_spec.clone(),
                         l2_rollup_id_typed,
                         ccm_l2,
                         ccm_l2,
