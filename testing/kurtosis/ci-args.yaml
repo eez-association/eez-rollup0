@@ -1,0 +1,46 @@
+# Reduced production-path profile for pull requests.
+ethereum_package:
+  participants:
+    - el_type: reth
+      el_image: ghcr.io/paradigmxyz/reth:latest
+      cl_type: lighthouse
+      cl_image: sigp/lighthouse:v8.1.2
+      count: 1
+
+  network_params:
+    network_id: "7331"
+    seconds_per_slot: 4
+    slot_duration_ms: 4000
+    genesis_gaslimit: 60000000
+    min_validator_withdrawability_delay: 1
+    shard_committee_period: 1
+    deneb_fork_epoch: 0
+    electra_fork_epoch: 0
+    prefunded_accounts: '{"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266": {"balance": "1000000ETH"}, "0x70997970C51812dc3A010C7d01b50e0d17dc79C8": {"balance": "1000000ETH"}, "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC": {"balance": "1000000ETH"}, "0xb9e79D19f651a941757b35830232E7EFC77E1c79": {"balance": "1000000ETH"}}'
+
+  mev_type: flashbots
+  mev_params:
+    mev_builder_image: ethpandaops/reth-rbuilder:develop
+    mev_relay_image: ethpandaops/mev-boost-relay:main
+    mev_boost_image: ethpandaops/mev-boost:develop
+    mev_builder_cl_image: sigp/lighthouse:v8.1.2
+    mev_builder_subsidy: 1
+
+eez:
+  eez_node_image: eez-node:ci
+  deploy_image: eez-deploy:ci
+  follower_image: sigp/lighthouse:v8.1.2
+
+  # Deterministic private-network keys only; never use these on a public chain.
+  poster_key: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+  proof_signer_key: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+  l1_block_time_ms: 4000
+  l2_block_time_ms: 1000
+  proof_time_ms: 1000
+  submission_slack_ms: 500
+  max_speculative_depth: 0
+
+  fee_recipient: "0x0000000000000000000000000000000000000000"
+  l2_system_key: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+  l2_system_address: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+  ccm_l2_address: "0x4200000000000000000000000000000000000007"
