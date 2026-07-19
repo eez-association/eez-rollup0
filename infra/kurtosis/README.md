@@ -350,8 +350,10 @@ EEZ_REORG_SCHEDULES="shallow:1:20 medium:5:100 deep:15:1000" \
 ```
 
 Other knobs: `EEZ_REORG_MAJORITY` / `EEZ_REORG_MINORITY` (comma-separated
-service names), `EEZ_REORG_MIN_HOLD_S` (floor on how long the partition holds
-before healing). The script always heals on exit, so Ctrl-C is safe.
+service names), `EEZ_REORG_TIMEOUT_S` (maximum wait for the losing side to
+reach the configured depth), `EEZ_L1_MINORITY_RPC_URL` (normally auto-discovered),
+and `EEZ_REORG_POLL_SECONDS`. The script observes the losing chain rather than
+estimating depth from elapsed time, and always heals on exit, so Ctrl-C is safe.
 
 To leave it running on an always-on box, detach it with `nohup`, `tmux`, or a
 systemd unit.

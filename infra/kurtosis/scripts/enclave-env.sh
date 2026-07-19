@@ -22,10 +22,11 @@ _ee_yaml() {
 }
 
 : "${EEZ_L1_RPC_URL:=$(_ee_http "$(_ee_port el-1-reth-lighthouse rpc)")}"
+: "${EEZ_L1_MINORITY_RPC_URL:=$(_ee_http "$(_ee_port eez-node l1-rpc)")}"
 : "${EEZ_L1_BUILDER_RPC_URL:=$(_ee_http "$(_ee_port el-5-reth-builder-lighthouse rbuilder-rpc)")}"
 : "${EEZ_DISRUPTOOR_URL:=$(_ee_http "$(_ee_port disruptoor http)")}"
 : "${EEZ_L1_POSTER_KEY:=$(_ee_yaml poster_key)}"
 : "${EEZ_PROOF_SIGNER_KEY:=$(_ee_yaml proof_signer_key)}"
 
-export EEZ_L1_RPC_URL EEZ_L1_BUILDER_RPC_URL EEZ_DISRUPTOOR_URL \
+export EEZ_L1_RPC_URL EEZ_L1_MINORITY_RPC_URL EEZ_L1_BUILDER_RPC_URL EEZ_DISRUPTOOR_URL \
        EEZ_L1_POSTER_KEY EEZ_PROOF_SIGNER_KEY
