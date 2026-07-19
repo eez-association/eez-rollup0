@@ -27,12 +27,6 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 K="$REPO/infra/kurtosis"
 
-# Load the generated deployment values and the local Kurtosis keys/endpoints.
-[[ -f "$K/.env" ]] && { set -a; source "$K/.env"; set +a; }
-[[ -f "$K/endpoints.env" ]] && { set -a; source "$K/endpoints.env"; set +a; }
-[[ -f "$REPO/deployments.env" ]] || { echo "deployments.env missing — run deploy-eez.sh first"; exit 1; }
-set -a; source "$REPO/deployments.env"; set +a
-
 # ── Endpoints (the running node) ─────────────────────────────────────
 L1_RPC="${L1_RPC:-http://localhost:18645}"      # embedded chiado L1
 L2_RPC="${L2_RPC:-http://localhost:18688}"      # L2
@@ -53,8 +47,8 @@ VALUE_INITIAL="${VALUE_INITIAL:-5}"
 # poster/proof-signer keys — that would race the running eez-node's nonces.
 EEZ_OPERATOR_KEY="${EEZ_OPERATOR_KEY:-0x2248a31395af28e24349c8e566c19475a79cb610389204ab26bc585493e5cf27}"
 EEZ_USER_KEY="${EEZ_USER_KEY:-0x3b7b012a74f1c18f714c38306339b6b4124f3a434bd816a1ee1fa5aeb5953efe}"
-# Funds the two keys above without racing the poster's live transaction nonce.
-EEZ_FUND_FROM_KEY="${EEZ_FUND_FROM_KEY:-${EEZ_PROOF_SIGNER_KEY:?set EEZ_PROOF_SIGNER_KEY (source infra/kurtosis/.env)}}"
+# Funds the two keys above on L1 (poster has a huge prefunded balance).
+EEZ_FUND_FROM_KEY="${EEZ_FUND_FROM_KEY:-${EEZ_L1_POSTER_KEY:?set EEZ_L1_POSTER_KEY (source infra/kurtosis/.env)}}"
 # Hardhat key 2 = L2-only filler; hardhat key 0 addr = L2 system signer (marks
 # Sync blocks). Both prefunded in the L2 genesis.
 HH_KEY_2=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
@@ -69,12 +63,8 @@ FILLER_RECIPIENT=0x2222222222222222222222222222222222222222
 
 # The composer log is a live file appended by `run-eez-node.sh | tee`; read
 # it directly (it only grows). It is NOT ours — never delete it.
-NODE_LOG="${EEZ_NODE_LOG:-}"
+NODE_LOG="$EEZ_NODE_LOG"
 refresh_log() { :; }
-new_log() {
-    [[ -n "$NODE_LOG" && -f "$NODE_LOG" ]] || return 0
-    tail -n "+$((LOG_LINES_BEFORE + 1))" "$NODE_LOG"
-}
 
 # Run a read-only command with retries — survives transient RPC hiccups
 # (the node can saturate while the embedded L1 backfills) instead of
@@ -91,8 +81,9 @@ retry() {
 
 # ── Prereqs ──────────────────────────────────────────────────────────
 for t in cast forge jq; do command -v "$t" >/dev/null || { echo "$t not in PATH"; exit 1; }; done
+[[ -f "$REPO/deployments.env" ]] || { echo "deployments.env missing — run deploy-eez.sh first"; exit 1; }
 [[ -n "${EEZ_REGISTRY_ADDRESS:-}" ]] || { echo "EEZ_REGISTRY_ADDRESS unset — deployments.env incomplete"; exit 1; }
-[[ -n "$NODE_LOG" && -f "$NODE_LOG" ]] || echo "WARN: composer log unavailable — last-settled-height and divergence checks degrade to Sync-block heuristics. Set EEZ_NODE_LOG to run-eez-node.sh's tee target." >&2
+[[ -f "$EEZ_NODE_LOG" ]] || echo "WARN: composer log $EEZ_NODE_LOG missing — last-settled-height and divergence checks degrade to Sync-block heuristics. Set EEZ_NODE_LOG to run-eez-node.sh's tee target." >&2
 L2_UP=$(cast block-number --rpc-url "$L2_RPC" 2>/dev/null || echo "")
 [[ -n "$L2_UP" ]] || { echo "L2 RPC $L2_RPC not reachable"; exit 1; }
 L1_UP=$(cast block-number --rpc-url "$L1_RPC" 2>/dev/null || echo "")
@@ -101,11 +92,10 @@ L1_UP=$(cast block-number --rpc-url "$L1_RPC" 2>/dev/null || echo "")
 # Fund the operator + user on L1 so they can pay gas on the shared chain.
 for k in "$EEZ_OPERATOR_KEY" "$EEZ_USER_KEY"; do
     a=$(cast wallet address --private-key "$k")
-    balance="$(cast balance "$a" --rpc-url "$L1_RPC" 2>/dev/null || echo 0)"
-    if [[ "$balance" =~ ^[0-9]+$ ]] && (( balance < 1000000000000000000 )); then
-        echo "==> funding $a on L1 (10 ETH from dedicated funding key)"
+    if [[ "$(cast balance "$a" --rpc-url "$L1_RPC" 2>/dev/null || echo 0)" == "0" ]]; then
+        echo "==> funding $a on L1 (10 ETH from poster)"
         cast send "$a" --value 10ether --private-key "$EEZ_FUND_FROM_KEY" --rpc-url "$L1_RPC" >/dev/null \
-            || { echo "failed to fund $a — is the funding key funded on L1?"; exit 1; }
+            || { echo "failed to fund $a — is the poster funded on L1?"; exit 1; }
     fi
 done
 
@@ -153,12 +143,7 @@ TOTAL_DEPOSIT_SUM=0
 LAST_SETTER_VALUE=""
 ALL_USER_TX_HASHES=()
 TX_META=()
-refresh_log
-if [[ -n "$NODE_LOG" && -f "$NODE_LOG" ]]; then
-    LOG_LINES_BEFORE=$(wc -l < "$NODE_LOG")
-else
-    LOG_LINES_BEFORE=0
-fi
+refresh_log; LOG_LINES_BEFORE=$(wc -l < "$NODE_LOG" 2>/dev/null || echo 0)
 
 submit_wave() {
     local WAVE_ID=$1; shift
@@ -233,7 +218,7 @@ receipt_status() {
     st=$(echo "$r" | jq -r '.result.status // "missing"' 2>/dev/null)
     [[ "$st" == "0x1" ]] && echo "1" || echo "${st:-missing}"
 }
-evicted_count() { refresh_log; new_log | grep -c "evicted after repeated failed bundles" || true; }
+evicted_count() { refresh_log; grep -c "evicted after repeated failed bundles" "$NODE_LOG" 2>/dev/null || true; }
 wait_end=$(( SECONDS + RECEIPT_WAIT_SECS )); last_status_line=""
 while (( SECONDS < wait_end )); do
     all=1; confirmed=0
@@ -255,19 +240,19 @@ echo
 echo "==> per-PB analyzer"
 BATCH_POSTED_TOPIC=0xd6f8d71ce42a799b91f399271f4b0e91f85eb87fac7bb2cedd4b3a52fad36182
 L1_TIP=$(cast block-number --rpc-url "$L1_RPC")
-PB_LOGS=$(cast logs --address "$EEZ_REGISTRY_ADDRESS" --from-block "$L1_UP" --to-block latest \
+PB_LOGS=$(cast logs --address "$EEZ_REGISTRY_ADDRESS" --from-block "$EEZ_REGISTRY_DEPLOY_BLOCK" --to-block latest \
     "$BATCH_POSTED_TOPIC" --rpc-url "$L1_RPC" --json 2>/dev/null)
 SYS_ADDR_LC=$(echo "$HH_ADDR_0" | tr 'A-Z' 'a-z')
 HEAD_BN=$(cast block-number --rpc-url "$L2_RPC")
 SYNC_BLOCKS=()
-for ((BN=L2_UP + 1; BN<=HEAD_BN; BN++)); do
+for ((BN=1; BN<=HEAD_BN; BN++)); do
     SYS=$(cast block "$BN" --rpc-url "$L2_RPC" --json --full 2>/dev/null | \
         jq --arg sa "$SYS_ADDR_LC" '[.transactions[]? | select(.from | ascii_downcase == $sa)] | length' 2>/dev/null || echo 0)
     [[ "$SYS" != "0" ]] && SYNC_BLOCKS+=("$BN")
 done
 PB_COUNT=$(echo "$PB_LOGS" | jq 'length' 2>/dev/null || echo 0)
 echo "    Sync blocks (L2): ${#SYNC_BLOCKS[@]} → ${SYNC_BLOCKS[*]:-none}"
-echo "    PBs on L1: $PB_COUNT (scanned this run: $L1_UP..$L1_TIP)"
+echo "    PBs on L1: $PB_COUNT (scanned $EEZ_REGISTRY_DEPLOY_BLOCK..$L1_TIP)"
 ALL_PB_OK=1
 if [[ "$PB_COUNT" -ge "$WAVE_COUNT" ]]; then
     echo "    ✓ ≥$WAVE_COUNT postBatches landed"
@@ -280,7 +265,7 @@ echo
 echo "==> L1 vs L2 stateRoot reconciliation"
 L1_TRACKED=$(cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint256)(address,bytes32,uint256)' "$EEZ_ROLLUP_ID" \
     --rpc-url "$L1_RPC" 2>/dev/null | sed -n '2p' | tr -d '[:space:]')
-LAST_SETTLED=$(new_log | sed 's/\x1b\[[0-9;]*m//g' \
+LAST_SETTLED=$(sed 's/\x1b\[[0-9;]*m//g' "$NODE_LOG" 2>/dev/null \
     | grep "bundle outcome observed" | grep "settled=true" \
     | grep -oE "sync_height=[0-9]+" | grep -oE "[0-9]+" | sort -n | tail -1 || true)
 [[ -z "$LAST_SETTLED" ]] && { [[ ${#SYNC_BLOCKS[@]} -gt 0 ]] && LAST_SETTLED="${SYNC_BLOCKS[-1]}" || LAST_SETTLED=0; }
@@ -319,7 +304,7 @@ echo "    L2 recipient balance = $RR  (expected: $EXPECTED_RR)"
 
 # ── Divergence check ─────────────────────────────────────────────────
 echo
-count_in() { local n; n=$(new_log | grep -c "$1" || true); echo "${n:-0}"; }
+count_in() { local n; n=$(grep -c "$1" "$NODE_LOG" 2>/dev/null || true); echo "${n:-0}"; }
 DIVERGED_LEGACY=$(count_in "local L2 state root differs"); DIVERGED_LEGACY=${DIVERGED_LEGACY:-0}
 DIVERGED_DERIVER=$(count_in "diverged from L1-confirmed batch"); DIVERGED_DERIVER=${DIVERGED_DERIVER:-0}
 DIV_OK=0

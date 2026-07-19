@@ -125,12 +125,10 @@ addrs = sys.argv[2:]
 with open(args_file) as f:
     data = yaml.safe_load(f) or {}
 
-eth = data.setdefault("ethereum_package", {})
-np = eth.setdefault("network_params", {})
+np = data.setdefault("network_params", {})
 pf = np.get("prefunded_accounts")
-pf_was_string = isinstance(pf, str)
 
-if pf_was_string:
+if isinstance(pf, str):
     import json
     pf = json.loads(pf) if pf.strip() else {}
 elif pf is None:
@@ -142,7 +140,7 @@ for addr in addrs:
         pf[addr] = {"balance": "1000ETH"}
         changed = True
 
-np["prefunded_accounts"] = json.dumps(pf) if pf_was_string else pf
+np["prefunded_accounts"] = pf
 
 if changed:
     with open(args_file, "w") as f:
@@ -153,7 +151,7 @@ else:
 PYEOF
     else
         echo "⚠️  python3/pyyaml not found — cannot auto-inject prefunded_accounts." >&2
-        echo "    Add these addresses to ethereum_package.network_params.prefunded_accounts in $ARGS_FILE manually:" >&2
+        echo "    Add these addresses to network_params.prefunded_accounts in $ARGS_FILE manually:" >&2
         for addr in "${DERIVED_ADDRS[@]}"; do
             echo "      \"$addr\": { balance: \"1000ETH\" }" >&2
         done
