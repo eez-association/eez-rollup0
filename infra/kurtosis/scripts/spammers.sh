@@ -7,6 +7,7 @@
 #
 # Usage:
 #   bash infra/kurtosis/scripts/spammers.sh up       # provision + start enabled spammers
+#   bash infra/kurtosis/scripts/spammers.sh restart  # apply edits from spammers.yaml
 #   bash infra/kurtosis/scripts/spammers.sh down     # stop + remove the spammers this tool started
 #   bash infra/kurtosis/scripts/spammers.sh status   # list eez-xchain spammers and their state
 #   bash infra/kurtosis/scripts/spammers.sh verify    # sanity-check: statuses + L1/L2 blockspace utilization
@@ -283,9 +284,10 @@ usage() {
 
 case "${1:-}" in
     up)      cmd_up ;;
+    restart) cmd_down; cmd_up ;;
     down)    cmd_down ;;
     status)  cmd_status ;;
     verify)  cmd_verify ;;
     ""|-h|--help|help) usage ;;
-    *) die "unknown command '$1' (want up|down|status|verify)" ;;
+    *) die "unknown command '$1' (want up|restart|down|status|verify)" ;;
 esac

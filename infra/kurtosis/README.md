@@ -95,7 +95,61 @@ and prints the update command if it is missing or incompatible.
 The end-to-end harnesses additionally require `forge`, `jq`, `curl`, and
 `openssl`. Works on macOS or Linux.
 
-## Run
+## Quick start
+
+For a configurable first run, create the two gitignored local config files:
+
+```bash
+# First time only; do not overwrite these files after editing them.
+cp infra/kurtosis/args.example.yaml infra/kurtosis/args.yaml
+cp infra/kurtosis/spamoor-plugins/spammers.example.yaml \
+  infra/kurtosis/spamoor-plugins/spammers.yaml
+```
+
+Edit `args.yaml` for enclave services, node settings, timings, the bundle cap,
+and `ethereum_package.spamoor_params` (ordinary L1 load). Then start the
+enclave:
+
+```bash
+bash infra/kurtosis/up.sh infra/kurtosis/args.yaml
+```
+
+Edit `spammers.yaml` for continuous inbound/outbound cross-chain load, then
+start it:
+
+```bash
+bash infra/kurtosis/scripts/spammers.sh up
+bash infra/kurtosis/scripts/spammers.sh verify
+```
+
+### Apply configuration changes
+
+`args.yaml` is read only when services are created. After editing it, recreate
+the enclave. This starts a fresh chain. If only configuration changed, reuse
+the existing images:
+
+```bash
+bash infra/kurtosis/down.sh
+EEZ_SKIP_NODE_BUILD=1 EEZ_SKIP_DEPLOY_BUILD=1 \
+  bash infra/kurtosis/up.sh infra/kurtosis/args.yaml
+```
+
+Recreating the enclave also removes its cross-chain Spamoor scenarios. Restore
+them after the new enclave is ready:
+
+```bash
+bash infra/kurtosis/scripts/spammers.sh up
+bash infra/kurtosis/scripts/spammers.sh verify
+```
+
+If only `spammers.yaml` changed, keep the enclave running and recreate just the
+managed workloads:
+
+```bash
+bash infra/kurtosis/scripts/spammers.sh restart
+```
+
+For an unmodified default run, no manual copies are needed:
 
 ```bash
 bash infra/kurtosis/up.sh
@@ -207,9 +261,10 @@ the enclave something else). Cross-chain ops go to the fronts published by eez-n
 
 ## Configuration
 
-[`args.example.yaml`](args.example.yaml) is the template. On the first run,
-`up.sh` copies it to the gitignored `infra/kurtosis/args.yaml`. Edit that file
-for local deployments:
+[`args.example.yaml`](args.example.yaml) is the committed template. On the
+first run, `up.sh` copies it to the gitignored `infra/kurtosis/args.yaml`.
+Later template changes do not overwrite an existing local file. Edit
+`args.yaml` for local deployments:
 
 ```yaml
 ethereum_package:
@@ -220,6 +275,7 @@ eez:
   l1_block_time_ms: 12000
   l2_block_time_ms: 2000
   proof_time_ms: 6000
+  max_user_txs_per_bundle: 10
   builder_rpc_url: "http://custom-builder:8545"
   relay_url: "http://custom-relay:9062"
 ```
@@ -227,15 +283,12 @@ eez:
 `ethereum_package:` configures the shared L1; `eez:` configures `eez-node`.
 Keep `l1_block_time_ms` equal to `seconds_per_slot * 1000`. Do not edit `.env`:
 [`main.star`](main.star) maps `eez:` settings to the container environment.
-After changing the configuration, recreate the enclave:
+`max_user_txs_per_bundle` controls how many held cross-chain user transactions
+the composer drains into each `postBatch` bundle. `args.yaml` is not
+hot-reloaded; use **Apply configuration changes** above after editing it.
 
-```bash
-bash infra/kurtosis/down.sh
-bash infra/kurtosis/up.sh infra/kurtosis/args.yaml
-```
-
-To expose another node variable, add it to `eez_env` in `main.star`, add the
-corresponding setting to `args.example.yaml`, and recreate the enclave:
+To expose another node variable, add a readable setting to `eez_env` in
+`main.star` and `args.example.yaml`:
 
 ```python
 "EEZ_SOME_VARIABLE": str(eez.get("some_variable", "default-value")),
