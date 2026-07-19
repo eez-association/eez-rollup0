@@ -72,6 +72,8 @@ eez:
   proof_time_ms: 5000
   submission_slack_ms: 2500
   max_speculative_depth: 0
+  # Maximum cross-chain user transactions drained into one postBatch bundle.
+  max_user_txs_per_bundle: 10
 
   # Fee recipient.
   fee_recipient: "0x0000000000000000000000000000000000000000"

@@ -33,14 +33,17 @@ API. You never copy a proxy address or private key.
 # 1. bring the enclave up (once):
 bash infra/kurtosis/up.sh
 
-# 2. declare intent (edit the copy it creates on first run):
-#    infra/kurtosis/spamoor-plugins/spammers.yaml
+# 2. first time only: create and edit the workload config:
+cp infra/kurtosis/spamoor-plugins/spammers.example.yaml \
+  infra/kurtosis/spamoor-plugins/spammers.yaml
+
 # 3. provision + start every enabled spammer:
 bash infra/kurtosis/scripts/spammers.sh up
 
-# inspect / sanity-check / tear down:
+# inspect / sanity-check / apply config edits / tear down:
 bash infra/kurtosis/scripts/spammers.sh status
 bash infra/kurtosis/scripts/spammers.sh verify
+bash infra/kurtosis/scripts/spammers.sh restart
 bash infra/kurtosis/scripts/spammers.sh down
 ```
 
