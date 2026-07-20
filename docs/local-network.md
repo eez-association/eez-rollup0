@@ -67,6 +67,32 @@ log); a stale nonce is rejected at the front with the expected/held
 counts; killing `tmux` session `eez-net` and re-running the node command
 (without wiping datadirs) resumes from the L1-derived cursor.
 
+## Test protocol
+
+What to run, for how long, and what must hold. Every tier ends with
+`scripts/local-net.sh verdict`, which prints a fixed RESULTS block and
+exits 0/1 — that block (plus the failing log excerpt, if any) is what you
+paste back into the PR/issue.
+
+| Tier | Command(s) | Duration | Matrix | Pass criteria |
+|---|---|---|---|---|
+| 0 — suites | `cargo test --workspace --exclude eez-node`; `cargo test -p eez-node -- --test-threads=4`; submodule `forge test` | ~10 min | all unit/e2e/Solidity tests | zero failures (a single heavy-e2e timeout under parallel load is a known flake — rerun it isolated before calling it a regression) |
+| 1 — smoke | `up`, `deploy`, `wave`, `verdict` | ~5 min | 1 wave: inbound setter + inbound deposit + outbound setter + outbound withdrawal via the fronts | `wave` converges <150s; verdict PASS |
+| 2 — soak | tier 1, then repeat `wave` ×3, add 1 poison tx (front-held tx to a non-proxy address) and a few plain L2 transfers | ~15 min | both directions × {setter, value transfer} ×3 + poison + pure-L2 | all wave convergences; poison never mines and logs an eviction; verdict PASS with evictions == poison count |
+| 3 — durability | tier 2, plus `follower`, then kill tmux `eez-net` and re-run the node command on the same datadirs | ~30 min | derivation + crash recovery | follower reaches an identical block hash at the common safe height and stays in lockstep; restarted composer resumes from the L1-derived cursor and verdict still PASS |
+
+Verdict criteria (checked automatically): state divergence = 0,
+`ImmediateEntrySkipped` = 0, bundle drops = 0, exact L1↔L2 state-root
+reconcile, N+1 next-slot bundle hit-rate ≥ 90% (healthy runs sit at
+~100%; the target is deliberately below that to absorb slot boundaries).
+Evictions are reported but only fail review if they exceed the poison
+txs you sent.
+
+Reporting back: paste the VERDICT block verbatim, plus L2/L1 head heights
+from `status` and, on any FAIL, the matching lines from
+`$EEZ_NET_DIR/composer.log` (grep `diverged|evict|Fatal`). CI can gate on
+the exit code alone.
+
 ## Gotchas
 
 - **dotenvy walks ancestor directories for `.env`.** A stray file with

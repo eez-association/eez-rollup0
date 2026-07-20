@@ -227,6 +227,52 @@ status() {
     echo "divergence log lines: $(grep -cE 'diverged from L1-confirmed|local L2 state root differs' "$NET/composer.log" 2>/dev/null || echo 0)"
 }
 
+verdict() {
+    # Machine-checkable session verdict from the composer log + chain
+    # state. Prints a fixed RESULTS block and exits 0 (PASS) / 1 (FAIL).
+    # Criteria: 0 divergence, 0 skipped entries, 0 bundle drops, exact
+    # L1↔L2 root reconcile, N+1 next-slot hit-rate ≥ 90%.
+    local metrics l1r l2r skipped from recon
+    metrics=$(sed -r 's/\x1b\[[0-9;]*[mK]//g' "$NET/composer.log" | python3 -c '
+import re, sys
+log = sys.stdin.read()
+tgt = {}
+for l in log.splitlines():
+    if "dispatching bundle to builder" in l:
+        h = re.search(r"tx_hash=(0x[0-9a-f]{64})", l); b = re.search(r"target_block=(\d+)", l)
+        if h and b: tgt[h.group(1)] = int(b.group(1))
+hit = chk = 0
+for l in log.splitlines():
+    if "bundle outcome observed" in l and "Included" in l:
+        h = re.search(r"tx_hash: (0x[0-9a-f]{64})", l); b = re.search(r"l1_block: (\d+)", l)
+        if h and b and h.group(1) in tgt:
+            chk += 1; hit += int(b.group(1)) == tgt[h.group(1)]
+drops = log.count("target block passed without inclusion")
+evict = log.count("evicting")
+div = len(re.findall(r"diverged from L1-confirmed|local L2 state root differs", log))
+rate = 100 if not chk else round(100 * hit / chk)
+print(f"{hit} {chk} {rate} {drops} {evict} {div}")')
+    read -r hit chk rate drops evict div <<< "$metrics"
+    from=$(grep EEZ_REGISTRY_DEPLOY_BLOCK "$NET/deployments.env" 2>/dev/null | cut -d= -f2); from=${from:-1}
+    skipped=$(cast logs --rpc-url $L1 --from-block "$from" --address $EEZ_ADDR 'ImmediateEntrySkipped(uint256,bytes)' 2>/dev/null | grep -c blockNumber || true)
+    l1r=$(cast call $EEZ_ADDR 'rollups(uint256)(address,bytes32,uint256)' 1 --rpc-url $L1 2>/dev/null | sed -n 2p | tr -d '[:space:]')
+    l2r=$(cast block safe --rpc-url $L2 --json 2>/dev/null | jq -r '.stateRoot // empty')
+    recon=$([[ -n "$l1r" && "${l1r,,}" == "${l2r,,}" ]] && echo PASS || echo FAIL)
+    echo "════════════════ LOCAL-NET VERDICT ════════════════"
+    echo "  N+1 next-slot hit-rate : $hit/$chk (${rate}%)   [≥90% required]"
+    echo "  bundle drops           : $drops                 [0 required]"
+    echo "  evictions              : $evict                 [poison-only expected]"
+    echo "  state divergence       : $div                   [0 required]"
+    echo "  ImmediateEntrySkipped  : $skipped               [0 required]"
+    echo "  L1↔L2 root reconcile   : $recon                 [exact match required]"
+    echo "═══════════════════════════════════════════════════"
+    if [[ "$div" == 0 && "$skipped" == 0 && "$drops" == 0 && "$recon" == PASS && "$rate" -ge 90 ]]; then
+        echo "✓ PASS"; exit 0
+    else
+        echo "✗ FAIL — see $NET/composer.log"; exit 1
+    fi
+}
+
 down() {
     tmux kill-session -t eez-net 2>/dev/null || true
     tmux kill-session -t eez-follower 2>/dev/null || true
@@ -234,6 +280,6 @@ down() {
 }
 
 case "${1:-}" in
-    up|deploy|wave|follower|status|down) "$1" ;;
+    up|deploy|wave|follower|status|verdict|down) "$1" ;;
     *) sed -n '3,20p' "$0"; exit 1 ;;
 esac
