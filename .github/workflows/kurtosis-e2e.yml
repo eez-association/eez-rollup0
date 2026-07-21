@@ -2,7 +2,7 @@ name: Kurtosis E2E
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, chetna/tests]
   workflow_dispatch:
 
 permissions:
