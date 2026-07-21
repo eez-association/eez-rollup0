@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, chetna/tests]
   workflow_dispatch:
 
 permissions:
