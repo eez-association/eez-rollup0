@@ -514,8 +514,20 @@ run_waves() {
     # Pin the L1 read to the l1_block that settled this sync_height (same log
     # line) instead of "latest" — the L1 tip keeps advancing while this runs,
     # so a live read can race ahead of the log-derived height.
-    local LAST_SETTLED_LINE LAST_SETTLED LAST_SETTLED_L1_BLOCK L1_TRACKED L2_ROOT
-    LAST_SETTLED_LINE=$(strip_ansi <"$NODE_LOG" | grep "bundle outcome observed" | grep "settled=true" | tail -1 || true)
+    local CLEAN_LOG LAST_MATCH_LINENO LAST_SETTLED_LINE LAST_SETTLED LAST_SETTLED_L1_BLOCK L1_TRACKED L2_ROOT
+    CLEAN_LOG=$(strip_ansi <"$NODE_LOG")
+    LAST_MATCH_LINENO=$(echo "$CLEAN_LOG" | grep -n "bundle outcome observed" | grep "settled=true" \
+        | tail -1 | cut -d: -f1 || true)
+    # `kurtosis service logs` hard-wraps long lines, which can split a numeric
+    # field (e.g. "l1_block: 1201") across two physical lines. Join the
+    # matched line with its continuation before extracting fields; harmless
+    # if it wasn't actually wrapped since the field regexes stop at the first
+    # non-digit.
+    if [[ -n "$LAST_MATCH_LINENO" ]]; then
+        LAST_SETTLED_LINE=$(echo "$CLEAN_LOG" | sed -n "${LAST_MATCH_LINENO}p;$((LAST_MATCH_LINENO+1))p" | tr -d '\n')
+    else
+        LAST_SETTLED_LINE=""
+    fi
     LAST_SETTLED=$(echo "$LAST_SETTLED_LINE" | grep -oE "sync_height=[0-9]+" | head -1 | grep -oE "[0-9]+" || true)
     LAST_SETTLED_L1_BLOCK=$(echo "$LAST_SETTLED_LINE" | grep -oE "l1_block: [0-9]+" | head -1 | grep -oE "[0-9]+" || true)
     if [[ -n "$LAST_SETTLED" ]]; then

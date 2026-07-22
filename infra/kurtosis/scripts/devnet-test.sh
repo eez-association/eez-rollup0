@@ -302,8 +302,19 @@ fi
 echo
 echo "==> L1 vs L2 stateRoot reconciliation"
 refresh_log
-LAST_SETTLED_LINE=$(sed 's/\x1b\[[0-9;]*m//g' "$NODE_LOG" 2>/dev/null \
-    | grep "bundle outcome observed" | grep "settled=true" | tail -1 || true)
+CLEAN_LOG=$(sed 's/\x1b\[[0-9;]*m//g' "$NODE_LOG" 2>/dev/null || true)
+LAST_MATCH_LINENO=$(echo "$CLEAN_LOG" | grep -n "bundle outcome observed" | grep "settled=true" \
+    | tail -1 | cut -d: -f1 || true)
+# `kurtosis service logs` hard-wraps long lines, which can split a numeric
+# field (e.g. "l1_block: 1201") across two physical lines. Join the matched
+# line with its continuation before extracting fields so a wrap boundary
+# can't truncate a value; harmless if the line wasn't actually wrapped since
+# the field regexes below stop at the first non-digit.
+if [[ -n "$LAST_MATCH_LINENO" ]]; then
+    LAST_SETTLED_LINE=$(echo "$CLEAN_LOG" | sed -n "${LAST_MATCH_LINENO}p;$((LAST_MATCH_LINENO+1))p" | tr -d '\n')
+else
+    LAST_SETTLED_LINE=""
+fi
 LAST_SETTLED=$(echo "$LAST_SETTLED_LINE" | grep -oE "sync_height=[0-9]+" | head -1 | grep -oE "[0-9]+" || true)
 LAST_SETTLED_L1_BLOCK=$(echo "$LAST_SETTLED_LINE" | grep -oE "l1_block: [0-9]+" | head -1 | grep -oE "[0-9]+" || true)
 [[ -z "$LAST_SETTLED" ]] && { [[ ${#SYNC_BLOCKS[@]} -gt 0 ]] && LAST_SETTLED="${SYNC_BLOCKS[-1]}" || LAST_SETTLED=0; }
