@@ -515,11 +515,9 @@ run_waves() {
     # line) instead of "latest" — the L1 tip keeps advancing while this runs,
     # so a live read can race ahead of the log-derived height.
     local LAST_SETTLED_LINE LAST_SETTLED LAST_SETTLED_L1_BLOCK L1_TRACKED L2_ROOT
-    LAST_SETTLED_LINE=$(strip_ansi <"$NODE_LOG" | grep "bundle outcome observed" | grep "settled=true" \
-        | awk '{ if (match($0, /sync_height=[0-9]+/)) print substr($0, RSTART+12, RLENGTH-12)"\t"$0 }' \
-        | sort -n -k1,1 | tail -1 | cut -f2- || true)
-    LAST_SETTLED=$(echo "$LAST_SETTLED_LINE" | grep -oE "sync_height=[0-9]+" | grep -oE "[0-9]+" || true)
-    LAST_SETTLED_L1_BLOCK=$(echo "$LAST_SETTLED_LINE" | grep -oE "l1_block: [0-9]+" | grep -oE "[0-9]+" || true)
+    LAST_SETTLED_LINE=$(strip_ansi <"$NODE_LOG" | grep "bundle outcome observed" | grep "settled=true" | tail -1 || true)
+    LAST_SETTLED=$(echo "$LAST_SETTLED_LINE" | grep -oE "sync_height=[0-9]+" | head -1 | grep -oE "[0-9]+" || true)
+    LAST_SETTLED_L1_BLOCK=$(echo "$LAST_SETTLED_LINE" | grep -oE "l1_block: [0-9]+" | head -1 | grep -oE "[0-9]+" || true)
     if [[ -n "$LAST_SETTLED" ]]; then
         if [[ -n "$LAST_SETTLED_L1_BLOCK" ]]; then
             L1_TRACKED=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint256)(address,bytes32,uint256)' \

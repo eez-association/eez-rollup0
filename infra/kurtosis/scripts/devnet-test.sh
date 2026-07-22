@@ -303,11 +303,9 @@ echo
 echo "==> L1 vs L2 stateRoot reconciliation"
 refresh_log
 LAST_SETTLED_LINE=$(sed 's/\x1b\[[0-9;]*m//g' "$NODE_LOG" 2>/dev/null \
-    | grep "bundle outcome observed" | grep "settled=true" \
-    | awk '{ if (match($0, /sync_height=[0-9]+/)) print substr($0, RSTART+12, RLENGTH-12)"\t"$0 }' \
-    | sort -n -k1,1 | tail -1 | cut -f2- || true)
-LAST_SETTLED=$(echo "$LAST_SETTLED_LINE" | grep -oE "sync_height=[0-9]+" | grep -oE "[0-9]+" || true)
-LAST_SETTLED_L1_BLOCK=$(echo "$LAST_SETTLED_LINE" | grep -oE "l1_block: [0-9]+" | grep -oE "[0-9]+" || true)
+    | grep "bundle outcome observed" | grep "settled=true" | tail -1 || true)
+LAST_SETTLED=$(echo "$LAST_SETTLED_LINE" | grep -oE "sync_height=[0-9]+" | head -1 | grep -oE "[0-9]+" || true)
+LAST_SETTLED_L1_BLOCK=$(echo "$LAST_SETTLED_LINE" | grep -oE "l1_block: [0-9]+" | head -1 | grep -oE "[0-9]+" || true)
 [[ -z "$LAST_SETTLED" ]] && { [[ ${#SYNC_BLOCKS[@]} -gt 0 ]] && LAST_SETTLED="${SYNC_BLOCKS[-1]}" || LAST_SETTLED=0; }
 if [[ -n "$LAST_SETTLED_L1_BLOCK" ]]; then
     L1_TRACKED=$(cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint256)(address,bytes32,uint256)' "$EEZ_ROLLUP_ID" \
