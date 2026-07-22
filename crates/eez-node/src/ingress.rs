@@ -47,51 +47,60 @@ pub enum Admission {
 /// SOURCE chain (`validation_provider`), and push into `held_pool` with
 /// `direction`.
 ///
-/// The nonce must be contiguous with the sender's held chain for this direction
-/// (`on_chain + held_count_for(sender, direction)`): a gapped held tx would
-/// poison the all-or-nothing bundle and break bundle-mates' chains. `None`
-/// provider skips validation (dev / no-RPC).
+/// A new nonce must be the first unreserved nonce at or above the source-chain
+/// nonce for this direction. An existing queued nonce may be replaced, which
+/// also evicts its higher queued suffix. A gapped held tx would poison the
+/// all-or-nothing bundle and break bundle-mates' chains.
 pub async fn gate_and_hold(
     envelope: &TxEnvelope,
     raw_tx: &Bytes,
     direction: Direction,
     held_pool: &HeldPool,
-    validation_provider: Option<&RootProvider>,
+    validation_provider: &RootProvider,
 ) -> Admission {
     let Ok(sender) = envelope.recover_signer() else {
         return Admission::Rejected("signature recovery failed".into());
     };
     let nonce = envelope.nonce();
-    if let Some(provider) = validation_provider {
-        // `pending`, not `latest`: count a same-sender tx already in the source
-        // mempool, else a correctly-nonced cross-chain tx collides with it.
-        let on_chain = match provider.get_transaction_count(sender).pending().await {
-            Ok(n) => n,
-            Err(e) => return Admission::Rejected(format!("source-chain nonce lookup failed: {e}")),
-        };
-        let held = held_pool.held_count_for(sender, direction) as u64;
-        let expected = on_chain + held;
-        if nonce != expected {
-            return Admission::Rejected(format!(
-                "invalid nonce {nonce} for {sender}: expected {expected} (on-chain {on_chain} + {held} held)"
-            ));
+    // This checks one transaction; simulation enforces cumulative affordability.
+    let balance = match validation_provider.get_balance(sender).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Admission::Rejected(format!("source-chain balance lookup failed: {e}"));
         }
-        let balance = match provider.get_balance(sender).await {
-            Ok(b) => b,
-            Err(e) => {
-                return Admission::Rejected(format!("source-chain balance lookup failed: {e}"));
-            }
-        };
-        let cost = U256::from(envelope.value())
-            + U256::from(envelope.gas_limit()) * U256::from(envelope.max_fee_per_gas());
-        if balance < cost {
-            return Admission::Rejected(format!(
-                "insufficient balance for {sender}: have {balance}, need {cost} (value + gas_limit * max_fee)"
-            ));
-        }
+    };
+    let cost = U256::from(envelope.value())
+        + U256::from(envelope.gas_limit()) * U256::from(envelope.max_fee_per_gas());
+    if balance < cost {
+        return Admission::Rejected(format!(
+            "insufficient balance for {sender}: have {balance}, need {cost} (value + gas_limit * max_fee)"
+        ));
     }
     // keccak256 of the EIP-2718 envelope — the canonical tx hash for legacy and typed txs alike.
     let hash: B256 = keccak256(raw_tx.as_ref());
+    let tx = HeldTx {
+        raw_tx: raw_tx.clone(),
+        hash,
+        attempts: 0,
+        sender,
+        nonce,
+        direction,
+    };
+    // Pending state prevents collisions with source-chain mempool transactions.
+    let on_chain = match validation_provider
+        .get_transaction_count(sender)
+        .pending()
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => return Admission::Rejected(format!("source-chain nonce lookup failed: {e}")),
+    };
+    if let Err(err) = held_pool.push_contiguous(tx, on_chain) {
+        return Admission::Rejected(format!(
+            "invalid nonce {nonce} for {sender}: expected next unreserved nonce {} (source-chain nonce {})",
+            err.expected, err.on_chain
+        ));
+    }
     event!(
         name: "eez.ingress.cross_chain.push",
         Level::INFO,
@@ -101,14 +110,6 @@ pub async fn gate_and_hold(
         direction = ?direction,
         "cross-chain tx held for next Sync slot",
     );
-    held_pool.push(HeldTx {
-        raw_tx: raw_tx.clone(),
-        hash,
-        attempts: 0,
-        sender,
-        nonce,
-        direction,
-    });
     Admission::Held(hash)
 }
 
@@ -269,7 +270,7 @@ async fn intercept_send_raw(
         &raw,
         ctx.direction,
         &ctx.held_pool,
-        Some(&ctx.validation_provider),
+        &ctx.validation_provider,
     )
     .await
     {
@@ -315,5 +316,141 @@ async fn forward(ctx: &Ctx, body: Vec<u8>) -> Response<Full<HyperBytes>> {
                 .body(Full::new(HyperBytes::from(format!("upstream error: {e}"))))
                 .expect("valid response")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::{SignableTransaction, TxEip1559};
+    use alloy_network::TxSignerSync;
+    use alloy_network::eip2718::Encodable2718;
+    use alloy_primitives::{Address, TxKind};
+    use alloy_provider::ProviderBuilder;
+    use alloy_provider::mock::Asserter;
+    use alloy_rpc_types_eth::AccessList;
+    use alloy_signer_local::PrivateKeySigner;
+
+    fn signed_transfer(signer: &PrivateKeySigner, nonce: u64, value: u64) -> (TxEnvelope, Bytes) {
+        let mut tx = TxEip1559 {
+            chain_id: 1,
+            nonce,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(Address::repeat_byte(0x42)),
+            value: U256::from(value),
+            access_list: AccessList::default(),
+            input: Bytes::new(),
+        };
+        let sig = signer.sign_transaction_sync(&mut tx).unwrap();
+        let envelope = TxEnvelope::from(tx.into_signed(sig));
+        let raw = Bytes::from(envelope.encoded_2718());
+        (envelope, raw)
+    }
+
+    #[tokio::test]
+    async fn gate_handles_landed_but_not_derived_reservation() {
+        let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap();
+        let (first, first_raw) = signed_transfer(&signer, 0, 1);
+        let (same_nonce, same_nonce_raw) = signed_transfer(&signer, 0, 2);
+        let (next, next_raw) = signed_transfer(&signer, 1, 3);
+        let (gapped, gapped_raw) = signed_transfer(&signer, 2, 4);
+        let pool = HeldPool::new();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
+
+        for _ in 0..2 {
+            asserter.push_success(&U256::from(1_000_000u64));
+            asserter.push_success(&0_u64);
+        }
+        asserter.push_success(&U256::from(1_000_000u64));
+        asserter.push_success(&1_u64);
+        asserter.push_success(&U256::from(1_000_000u64));
+        asserter.push_success(&1_u64);
+
+        assert!(matches!(
+            gate_and_hold(&first, &first_raw, Direction::Inbound, &pool, &provider,).await,
+            Admission::Held(_)
+        ));
+
+        let drained = pool.pop_n(1);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(pool.len(), 0);
+
+        let rejected = gate_and_hold(
+            &same_nonce,
+            &same_nonce_raw,
+            Direction::Inbound,
+            &pool,
+            &provider,
+        )
+        .await;
+        let Admission::Rejected(message) = rejected else {
+            panic!("same nonce should be rejected while first tx is in flight");
+        };
+        assert!(message.contains("invalid nonce 0"), "{message}");
+        assert!(message.contains("next unreserved nonce 1"), "{message}");
+
+        let rejected =
+            gate_and_hold(&gapped, &gapped_raw, Direction::Inbound, &pool, &provider).await;
+        let Admission::Rejected(message) = rejected else {
+            panic!("nonce 2 must not be admitted while nonce 1 is unreserved");
+        };
+        assert!(message.contains("nonce 1"), "{message}");
+
+        assert!(matches!(
+            gate_and_hold(&next, &next_raw, Direction::Inbound, &pool, &provider).await,
+            Admission::Held(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn gate_replaces_queued_nonce_and_evicts_higher_suffix() {
+        let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap();
+        let (original, original_raw) = signed_transfer(&signer, 0, 1);
+        let (suffix, suffix_raw) = signed_transfer(&signer, 1, 2);
+        let (replacement, replacement_raw) = signed_transfer(&signer, 0, 3);
+        let pool = HeldPool::new();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
+
+        for _ in 0..3 {
+            asserter.push_success(&U256::from(1_000_000u64));
+            asserter.push_success(&0_u64);
+        }
+
+        let Admission::Held(original_hash) = gate_and_hold(
+            &original,
+            &original_raw,
+            Direction::Inbound,
+            &pool,
+            &provider,
+        )
+        .await
+        else {
+            panic!("original transaction should be held");
+        };
+        assert!(matches!(
+            gate_and_hold(&suffix, &suffix_raw, Direction::Inbound, &pool, &provider,).await,
+            Admission::Held(_)
+        ));
+        let Admission::Held(replacement_hash) = gate_and_hold(
+            &replacement,
+            &replacement_raw,
+            Direction::Inbound,
+            &pool,
+            &provider,
+        )
+        .await
+        else {
+            panic!("replacement transaction should be held");
+        };
+
+        assert_ne!(original_hash, replacement_hash);
+        let queued = pool.pop_all();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].hash, replacement_hash);
+        assert_eq!(queued[0].nonce, 0);
     }
 }
