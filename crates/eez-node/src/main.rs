@@ -366,8 +366,8 @@ fn main() -> eyre::Result<()> {
         // Remote-prover composer mode: the committer emits each committed block's
         // hash here; a capture task re-executes it while parent state is fresh and
         // stores the witness for the composer. `None` otherwise. Created here to
-        // thread `witness_tx` into the committer at spawn.
-        let (witness_tx, witness_rx, witness_store) =
+        // thread `witness_sender` into the committer at spawn.
+        let (witness_sender, witness_rx, witness_store) =
             if mode == Mode::Composer && env::var_os("EEZ_PROVER_URL").is_some() {
                 let (tx, rx) = mpsc::unbounded_channel::<B256>();
                 // Dedicated mdbx env (never reth's node DB); path env-configurable.
@@ -392,7 +392,7 @@ fn main() -> eyre::Result<()> {
             schedule_rx,
             payload_builder_handle,
             timing,
-            witness_tx,
+            witness_sender,
         )?;
         if mode != Mode::Standalone {
             let depth = env::var("EEZ_MAX_SPECULATIVE_DEPTH")

@@ -156,7 +156,7 @@ where
         finalized_hash: B256,
         to_engine: ConsensusEngineHandle<T>,
         payload_builder: PayloadBuilderHandle<T>,
-        witness_tx: Option<mpsc::UnboundedSender<B256>>,
+        witness_sender: Option<mpsc::UnboundedSender<B256>>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(COMMAND_BUFFER);
         let initial_hash = initial_header.hash();
@@ -169,7 +169,7 @@ where
             unsafe_head_hash: initial_hash,
             safe_header,
             finalized_hash,
-            witness_tx,
+            witness_sender,
         };
         tokio::spawn(actor.run());
         Self {
@@ -191,7 +191,7 @@ where
         provider: &P,
         to_engine: ConsensusEngineHandle<T>,
         payload_builder: PayloadBuilderHandle<T>,
-        witness_tx: Option<mpsc::UnboundedSender<B256>>,
+        witness_sender: Option<mpsc::UnboundedSender<B256>>,
     ) -> DriverResult<Self>
     where
         <T::BuiltPayload as BuiltPayload>::Primitives: NodePrimitives,
@@ -236,7 +236,7 @@ where
             finalized_hash,
             to_engine,
             payload_builder,
-            witness_tx,
+            witness_sender,
         ))
     }
 
@@ -478,7 +478,7 @@ struct Actor<T: PayloadTypes> {
     /// blocks) and by `process_derive` ONLY when `feed_witness` is set (a produced
     /// Sync block via `commit_one_prebuilt`); a follower / L1-reconcile re-derive
     /// passes `feed_witness=false` so the prover isn't double-fed the same block.
-    witness_tx: Option<mpsc::UnboundedSender<B256>>,
+    witness_sender: Option<mpsc::UnboundedSender<B256>>,
 }
 
 impl<T> Actor<T>
@@ -708,8 +708,8 @@ where
         // The block is already canonical (the FCU above), so the witness task's
         // `recovered_block(hash)` resolves on the first try.
         if feed_witness {
-            if let Some(tx) = &self.witness_tx {
-                let _ = tx.send(block_hash);
+            if let Some(sender) = &self.witness_sender {
+                let _ = sender.send(block_hash);
             }
         }
 
@@ -779,8 +779,8 @@ where
         // Prover-feed trigger (prover-chain P1): the block is now canonical, so
         // the witness task's `recovered_block(hash)` resolves on the first try.
         // Best-effort — a closed/lagging channel just drops it.
-        if let Some(tx) = &self.witness_tx {
-            let _ = tx.send(header.hash());
+        if let Some(sender) = &self.witness_sender {
+            let _ = sender.send(header.hash());
         }
         Ok(CommitOutcome { header })
     }

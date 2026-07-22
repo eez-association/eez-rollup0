@@ -229,7 +229,7 @@ where
         schedule_rx: mpsc::Receiver<SlotEvent>,
         payload_builder: PayloadBuilderHandle<T>,
         timing: RollupTiming,
-        witness_tx: Option<mpsc::UnboundedSender<B256>>,
+        witness_sender: Option<mpsc::UnboundedSender<B256>>,
     ) -> DriverResult<Self>
     where
         P: BlockReader<Header = HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>
@@ -242,7 +242,7 @@ where
             provider,
             to_engine,
             payload_builder,
-            witness_tx,
+            witness_sender,
         )?;
         Ok(Self {
             attributes,

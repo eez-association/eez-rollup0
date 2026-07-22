@@ -1868,6 +1868,8 @@ where
         // by the stitch below.
         let mut effect_k = 0usize;
         for entry in &mut batch.inner.entries {
+            // Skip entries that already carry a delta (the anchor); fill only the
+            // cross-chain effect entries, which arrive empty.
             if !entry.stateDeltas.is_empty() {
                 continue;
             }
@@ -1945,6 +1947,19 @@ where
                 }
             }
         }
+
+        // The chain must end at the Sync block's final root. The prover enforces
+        // this (gates.rs); assert locally so a stitch bug fails fast here.
+        debug_assert_eq!(
+            batch
+                .inner
+                .entries
+                .last()
+                .and_then(|e| e.stateDeltas.last())
+                .map(|d| d.newState),
+            Some(sync_block_state_root),
+            "settlement chain must end at the Sync-block state root",
+        );
 
         // The contract drains the leading contiguous `proxyEntryHash==0` run
         // inline (`EEZ.sol:387`): 1 anchor immediate + N outbound immediates.
@@ -2115,7 +2130,7 @@ where
         // Prove the assembled window (proofs[] empty — not part of the
         // publicInputsHash). Mock ignores the context; a remote prover re-executes
         // `blocks`. Settlement path, off block production.
-        let blocks = match self.inner.witness_source.get() {
+        let block_witnesses = match self.inner.witness_source.get() {
             // Remote-prover mode. Intermediate blocks `[from..sync)` are committed
             // (served by the witness store); the just-built endpoint isn't, so
             // capture it here from the in-memory block.
@@ -2134,7 +2149,7 @@ where
                         .l2_provider,
                 );
                 let evm_config = self.inner.evm_config.clone();
-                let endpoint = sync_block.clone();
+                let terminal_block = sync_block.clone();
                 tokio::task::spawn_blocking(move || -> Result<Vec<BlockWitness>, String> {
                     let mut ws = (from..sync_block_number)
                         .map(|n| src.block_witness(n))
@@ -2146,13 +2161,13 @@ where
                         block_witness(
                             l2_provider.as_ref(),
                             &evm_config,
-                            &endpoint,
+                            &terminal_block,
                             ExecutionWitnessMode::Legacy,
                         )
                         .map_err(|e| {
                             format!(
-                                "endpoint witness (block {}): {e}",
-                                endpoint.header().number()
+                                "terminal-block witness (block {}): {e}",
+                                terminal_block.header().number()
                             )
                         })?,
                     );
@@ -2169,7 +2184,7 @@ where
             from_block: from,
             to_block: sync_block_number,
             batch: batch.clone(),
-            blocks,
+            blocks: block_witnesses,
             l1_block_hash: None, // timeless batch (blockNumber 0)
         };
         let proof = self

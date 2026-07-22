@@ -19,10 +19,6 @@
 //! but lives in reth's engine tree (a deep fork). Re-executing the
 //! canonical block here is `debug_executionWitness`'s own approach and is
 //! cheap for small L2 blocks.
-//!
-//! Lifted verbatim from based-rollup `reth-node/src/witness.rs` (the
-//! in-process witness re-exec). The fold into a control plane + the call
-//! site in the committer are the next steps (prover-chain P1).
 
 use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::{B256, Bytes, U256, keccak256};
