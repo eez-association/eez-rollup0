@@ -316,7 +316,7 @@ else
     LAST_SETTLED_LINE=""
 fi
 LAST_SETTLED=$(echo "$LAST_SETTLED_LINE" | grep -oE "sync_height=[0-9]+" | head -1 | grep -oE "[0-9]+" || true)
-LAST_SETTLED_L1_BLOCK=$(echo "$LAST_SETTLED_LINE" | grep -oE "l1_block: [0-9]+" | head -1 | grep -oE "[0-9]+" || true)
+LAST_SETTLED_L1_BLOCK=$(echo "$LAST_SETTLED_LINE" | grep -oE "l1_block: [0-9]+" | head -1 | sed 's/^l1_block: //' || true)
 [[ -z "$LAST_SETTLED" ]] && { [[ ${#SYNC_BLOCKS[@]} -gt 0 ]] && LAST_SETTLED="${SYNC_BLOCKS[-1]}" || LAST_SETTLED=0; }
 if [[ -n "$LAST_SETTLED_L1_BLOCK" ]]; then
     L1_TRACKED=$(cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint256)(address,bytes32,uint256)' "$EEZ_ROLLUP_ID" \

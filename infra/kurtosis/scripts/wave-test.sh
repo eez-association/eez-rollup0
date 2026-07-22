@@ -529,7 +529,7 @@ run_waves() {
         LAST_SETTLED_LINE=""
     fi
     LAST_SETTLED=$(echo "$LAST_SETTLED_LINE" | grep -oE "sync_height=[0-9]+" | head -1 | grep -oE "[0-9]+" || true)
-    LAST_SETTLED_L1_BLOCK=$(echo "$LAST_SETTLED_LINE" | grep -oE "l1_block: [0-9]+" | head -1 | grep -oE "[0-9]+" || true)
+    LAST_SETTLED_L1_BLOCK=$(echo "$LAST_SETTLED_LINE" | grep -oE "l1_block: [0-9]+" | head -1 | sed 's/^l1_block: //' || true)
     if [[ -n "$LAST_SETTLED" ]]; then
         if [[ -n "$LAST_SETTLED_L1_BLOCK" ]]; then
             L1_TRACKED=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint256)(address,bytes32,uint256)' \
