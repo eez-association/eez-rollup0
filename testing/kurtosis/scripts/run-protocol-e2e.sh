@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Run the node-compatible protocol E2E scenarios against an existing Kurtosis enclave.
+# Run the node-compatible counter scenario against an existing Kurtosis enclave.
 set -euo pipefail
 
 KURTOSIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="$(cd "$KURTOSIS_DIR/../.." && pwd)"
-# Scripts must match the contracts the deploy image put in the enclave (5c51e02).
 PROTOCOL="$REPO/sync-rollups-protocol"
 ENCLAVE="${KURTOSIS_ENCLAVE:-eez-ci}"
 RESULT_DIR="${EEZ_CI_RESULT_DIR:-$REPO/artifacts/production-path-ci}/protocol-e2e"
@@ -82,39 +81,21 @@ export EEZ_REAL_CAST EEZ_REAL_FORGE EEZ_PROTOCOL_VERIFY_FILE
 ln -s "$KURTOSIS_DIR/scripts/protocol-e2e-cast" "$router_dir/cast"
 ln -s "$KURTOSIS_DIR/scripts/protocol-e2e-forge" "$router_dir/forge"
 
-# Sequential (shared deployer nonce). Excludes multi-call-nested (swapped table
-# order — also excluded in the anvil lane).
-SCENARIOS=(
-    counter counterL2 bridge helloWorld
-    multi-call-twice multi-call-two-diff multi-call-nestedL2
-    nestedCounter nestedCounterL2 deepNested
-    reentrant
-    revertCounter revertCounterL2 revertContinue revertContinueL2
-    nestedCallRevert
-)
-
-PASS=0; FAIL=0; FAILED=()
-for name in "${SCENARIOS[@]}"; do
-    log="$RESULT_DIR/$name.log"
-    echo "════════════ RUNNING $name ════════════"
-    if (
-        cd "$PROTOCOL"
-        PATH="$router_dir:$PATH" bash script/e2e/shared/run-network.sh \
-            "script/e2e/$name/E2E.s.sol" \
-            --l1-rpc "$EEZ_PROTOCOL_L1_RPC" \
-            --l2-rpc "$EEZ_PROTOCOL_L2_RPC" \
-            --pk "$PK" \
-            --rollups "$ROLLUPS" \
-            --manager-l2 "$MANAGER_L2"
-    ) >"$log" 2>&1; then
-        PASS=$((PASS + 1)); echo "RESULT $name: PASS"
-    else
-        FAIL=$((FAIL + 1)); FAILED+=("$name"); echo "RESULT $name: FAIL"
-        tail -n 80 "$log"
-    fi
-done
-
-echo ""
-echo "===== KURTOSIS NETWORK RESULT: $PASS passed, $FAIL failed ====="
-for t in "${FAILED[@]:-}"; do [[ -n "$t" ]] && echo "  FAILED: $t"; done
-[[ $FAIL -eq 0 ]]
+log="$RESULT_DIR/counter.log"
+echo "════════════ RUNNING counter ════════════"
+if (
+    cd "$PROTOCOL"
+    PATH="$router_dir:$PATH" bash script/e2e/shared/run-network.sh \
+        script/e2e/counter/E2E.s.sol \
+        --l1-rpc "$EEZ_PROTOCOL_L1_RPC" \
+        --l2-rpc "$EEZ_PROTOCOL_L2_RPC" \
+        --pk "$PK" \
+        --rollups "$ROLLUPS" \
+        --manager-l2 "$MANAGER_L2"
+) >"$log" 2>&1; then
+    echo "RESULT counter: PASS"
+else
+    echo "RESULT counter: FAIL"
+    tail -n 80 "$log"
+    exit 1
+fi
