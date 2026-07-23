@@ -94,12 +94,16 @@ pub struct CrossChainExecCtx {
     /// the L1 block. Default: 10 gwei (well above the smoke's
     /// `cast mktx --gas-price 2 gwei` user_tx).
     pub l1_post_batch_priority_fee: u128,
-    /// MockECDSAProofSystem address on L1, embedded in
-    /// `batch.proofSystems[0]`. The on-chain `EEZ.postAndVerifyBatch`
-    /// iterates `proofSystems[]` and calls `verify` on each — the
-    /// mock accepts any 65-byte ECDSA sig over its fixed
-    /// `MOCK_PROVER_DIGEST` from the configured signer.
-    pub mock_proof_system_address: Address,
+    /// Address of the rollup's on-chain proof-system contract, embedded
+    /// in `batch.proofSystems[0]`; `EEZ.postAndVerifyBatch` iterates
+    /// `proofSystems[]` and calls `verify` on each. The composer-
+    /// controlled-prover deploy (`deploy-real.sh`) registers the real
+    /// `ECDSAProofSystem`: `ECDSA.recover(publicInputsHash, proof) ==
+    /// signer`, binding the attestation to the batch's real
+    /// `publicInputsHash` (proverd signs that exact hash). The mock
+    /// deploy (`deploy.sh`) instead registers `MockECDSAProofSystem`,
+    /// which ignores `publicInputsHash` and checks a fixed digest.
+    pub ecdsa_proof_system_address: Address,
     /// L2 rollup id, embedded in
     /// `batch.rollupIdsWithProofSystems[0].rollupId` so the L1
     /// registry routes the per-rollup state delta correctly.
@@ -1970,7 +1974,7 @@ where
         // Registry-id settlement gate: refuse a batch carrying any non-registry
         // destinationRollupId (e.g. an un-rewritten MAINNET(0) outbound entry).
         assert_batch_registry_native(&batch, rollup_id_u256)?;
-        batch.inner.proofSystems = vec![ctx.mock_proof_system_address];
+        batch.inner.proofSystems = vec![ctx.ecdsa_proof_system_address];
         batch.inner.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
             rollupId: U256::from(ctx.l2_rollup_id),
             proofSystemIndex: vec![0u64],

@@ -710,10 +710,10 @@ fn main() -> eyre::Result<()> {
                 let l1_poster_signer = PrivateKeySigner::from_bytes(&B256::from_str(
                     l1_poster_key.trim_start_matches("0x"),
                 )?)?;
-                let mock_proof_system_address: Address = Address::from_str(
-                    &env::var("EEZ_MOCK_PROOF_SYSTEM_ADDRESS").map_err(|_| {
+                let ecdsa_proof_system_address: Address = Address::from_str(
+                    &env::var("EEZ_ECDSA_PROOF_SYSTEM_ADDRESS").map_err(|_| {
                         eyre::eyre!(
-                            "EEZ_MOCK_PROOF_SYSTEM_ADDRESS required for L1 postBatch \
+                            "EEZ_ECDSA_PROOF_SYSTEM_ADDRESS required for L1 postBatch \
                              proofSystems[0]"
                         )
                     })?,
@@ -757,7 +757,7 @@ fn main() -> eyre::Result<()> {
                     l1_poster_signer,
                     l1_chain_id,
                     l1_post_batch_priority_fee,
-                    mock_proof_system_address,
+                    ecdsa_proof_system_address,
                     l2_rollup_id: l2_rollup_id_for_ctx,
                 }))
             } else {
