@@ -220,7 +220,31 @@ where
 {
     fn block_witness(&self, number: u64) -> Result<BlockWitness, String> {
         match self.store.get(number) {
-            Ok(Some(bw)) => return Ok(bw),
+            // Reorg guard: the store is keyed by block number, so a witness
+            // captured before a reorg can be stale. Trust the hit only if its
+            // hash matches the current canonical block; otherwise fall through to
+            // re-exec the canonical block by number.
+            Ok(Some(bw)) => match self.provider.block_hash(number) {
+                Ok(Some(canon)) if canon == bw.hash => return Ok(bw),
+                Ok(_) => {
+                    event!(
+                        name: "eez.node.witness_store.stale_reorg",
+                        Level::WARN,
+                        number,
+                        stored = %bw.hash,
+                        "stored witness hash != canonical block; re-executing (reorg)",
+                    );
+                }
+                Err(e) => {
+                    event!(
+                        name: "eez.node.witness_store.canon_hash_failed",
+                        Level::WARN,
+                        number,
+                        error = %e,
+                        "canonical hash lookup failed; re-executing on-demand",
+                    );
+                }
+            },
             Ok(None) => {} // not captured yet → re-exec fallback below
             Err(e) => {
                 // Unexpected; fall back to re-exec rather than fail the slot.

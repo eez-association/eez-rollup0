@@ -123,32 +123,13 @@ impl Prover for RemoteProver {
             })?
             .into_inner();
 
-        if resp.signature.len() != 65 {
-            return Err(ProverError::Backend(format!(
-                "attestation is {} bytes, expected 65 (r||s||v)",
-                resp.signature.len()
-            )));
-        }
-        if resp.public_inputs_hash.len() != 32 {
-            return Err(ProverError::Backend(format!(
-                "publicInputsHash is {} bytes, expected 32",
-                resp.public_inputs_hash.len()
-            )));
-        }
         // Fail-closed: the attestation must recover to the REGISTERED attester
         // over the hash the prover signed. A wrong prover cannot forge it.
-        let hash = B256::from_slice(&resp.public_inputs_hash);
-        let sig = Signature::try_from(resp.signature.as_slice())
-            .map_err(|e| ProverError::Backend(format!("malformed attestation signature: {e}")))?;
-        let recovered = sig
-            .recover_address_from_prehash(&hash)
-            .map_err(|e| ProverError::Backend(format!("attestation recover failed: {e}")))?;
-        if recovered != self.inner.attester {
-            return Err(ProverError::Backend(format!(
-                "attestation signer {recovered} != registered attester {}",
-                self.inner.attester
-            )));
-        }
+        let hash = verify_attestation(
+            &resp.signature,
+            &resp.public_inputs_hash,
+            self.inner.attester,
+        )?;
         event!(
             name: "eez.prover_client.attested",
             Level::INFO,
@@ -165,6 +146,44 @@ impl Prover for RemoteProver {
         // Left-zero-pad the 20-byte attester into a B256 (the registry vkey).
         self.inner.attester.into_word()
     }
+}
+
+/// Verify a prover attestation: the 65-byte signature must recover to `attester`
+/// over the 32-byte `public_inputs_hash`. Returns the bound hash on success.
+///
+/// # Errors
+///
+/// [`ProverError::Backend`] on a wrong-length signature or hash, a malformed
+/// signature, or a signer that isn't the registered attester.
+fn verify_attestation(
+    signature: &[u8],
+    public_inputs_hash: &[u8],
+    attester: Address,
+) -> ProverResult<B256> {
+    if signature.len() != 65 {
+        return Err(ProverError::Backend(format!(
+            "attestation is {} bytes, expected 65 (r||s||v)",
+            signature.len()
+        )));
+    }
+    if public_inputs_hash.len() != 32 {
+        return Err(ProverError::Backend(format!(
+            "publicInputsHash is {} bytes, expected 32",
+            public_inputs_hash.len()
+        )));
+    }
+    let hash = B256::from_slice(public_inputs_hash);
+    let sig = Signature::try_from(signature)
+        .map_err(|e| ProverError::Backend(format!("malformed attestation signature: {e}")))?;
+    let recovered = sig
+        .recover_address_from_prehash(&hash)
+        .map_err(|e| ProverError::Backend(format!("attestation recover failed: {e}")))?;
+    if recovered != attester {
+        return Err(ProverError::Backend(format!(
+            "attestation signer {recovered} != registered attester {attester}"
+        )));
+    }
+    Ok(hash)
 }
 
 #[cfg(test)]
@@ -264,5 +283,57 @@ mod tests {
             matches!(err, ProverError::Backend(_)),
             "wrong-signer attestation must fail closed, got {err:?}"
         );
+    }
+
+    /// Pack a signature the way the prover does (r||s||v, v+27).
+    fn sign_65(signer: &PrivateKeySigner, hash: B256) -> Vec<u8> {
+        let sig = signer.sign_hash_sync(&hash).unwrap();
+        let mut out = [0u8; 65];
+        out[..32].copy_from_slice(&sig.r().to_be_bytes::<32>());
+        out[32..64].copy_from_slice(&sig.s().to_be_bytes::<32>());
+        out[64] = u8::from(sig.v()) + 27;
+        out.to_vec()
+    }
+
+    #[test]
+    fn verify_attestation_accepts_valid() {
+        let key = test_key();
+        let hash = B256::repeat_byte(0x7c);
+        let sig = sign_65(&key, hash);
+        assert_eq!(
+            verify_attestation(&sig, hash.as_slice(), key.address()).unwrap(),
+            hash
+        );
+    }
+
+    #[test]
+    fn verify_attestation_rejects_wrong_signer() {
+        let key = test_key();
+        let hash = B256::repeat_byte(0x7c);
+        let sig = sign_65(&key, hash);
+        let wrong = address!("0x00000000000000000000000000000000000000ff");
+        assert!(verify_attestation(&sig, hash.as_slice(), wrong).is_err());
+    }
+
+    #[test]
+    fn verify_attestation_rejects_bad_signature_length() {
+        let hash = B256::repeat_byte(0x7c);
+        assert!(verify_attestation(&[0u8; 64], hash.as_slice(), test_key().address()).is_err());
+    }
+
+    #[test]
+    fn verify_attestation_rejects_bad_hash_length() {
+        let key = test_key();
+        let hash = B256::repeat_byte(0x7c);
+        let sig = sign_65(&key, hash);
+        assert!(verify_attestation(&sig, &[0u8; 31], key.address()).is_err());
+    }
+
+    #[test]
+    fn verify_attestation_rejects_malformed_signature() {
+        let hash = B256::repeat_byte(0x7c);
+        // 65 bytes but not a valid signature over `hash` → recover fails or the
+        // recovered address won't be the attester.
+        assert!(verify_attestation(&[0u8; 65], hash.as_slice(), test_key().address()).is_err());
     }
 }

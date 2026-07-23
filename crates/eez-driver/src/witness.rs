@@ -128,7 +128,8 @@ where
 
     // 2. Record the access set (cheap: cache walk, no trie).
     let record = ExecutionWitnessRecord::from_executed_state(&state, mode);
-    let (removal_state, removal_accounts, removal_slots) = touched_storage_removal_state(&record)?;
+    let (account_removal_state, removal_accounts) = touched_account_removal_state(&record);
+    let (storage_removal_state, removal_slots) = touched_storage_removal_state(&record)?;
 
     // 3. One batched trie pass against the parent → trie nodes + headers.
     //    Re-open the parent provider (the first was consumed by the executor).
@@ -137,20 +138,33 @@ where
         record.into_execution_witness(state_provider.as_ref(), provider, block_number, mode)?;
     let endpoint_state_nodes = witness.state.len();
 
-    // 4. EEZ-specific augmentation: ask reth's trie witness builder for the
-    //    removals-first witness of every touched storage slot. This triggers
-    //    reth's existing blinded-sibling proof requests for branch collapse
-    //    cases that are invisible in the final post-state witness.
-    let extra_state_nodes = if removal_slots == 0 {
-        0
-    } else {
-        let extra_state = state_provider.as_ref().witness(
+    // 4. EEZ-specific augmentation: two removals-first witness passes emit the
+    //    trie collapse siblings the prover's sparse trie needs but the final
+    //    post-state witness omits.
+    //    (a) account-collapse: an account deleted mid-block and re-funded before
+    //        block end (EIP-6780 CREATE2+SELFDESTRUCT+refund) shows a present
+    //        end-state that masks the deletion, so stage every touched account as
+    //        a removal to force the sibling.
+    //    (b) storage-collapse: a slot cleared mid-block needs its branch sibling.
+    //    Separate passes: staging an account as removed discards its storage
+    //    trie, which would suppress (b). Both are content-addressed → superset-safe.
+    let mut extra_state_nodes = 0usize;
+    if removal_accounts > 0 {
+        let extra = state_provider.as_ref().witness(
             Default::default(),
-            removal_state,
+            account_removal_state,
             ExecutionWitnessMode::Legacy,
         )?;
-        extend_unique_by_hash(&mut witness.state, extra_state)
-    };
+        extra_state_nodes += extend_unique_by_hash(&mut witness.state, extra);
+    }
+    if removal_slots > 0 {
+        let extra = state_provider.as_ref().witness(
+            Default::default(),
+            storage_removal_state,
+            ExecutionWitnessMode::Legacy,
+        )?;
+        extra_state_nodes += extend_unique_by_hash(&mut witness.state, extra);
+    }
 
     debug!(
         target: "eez::witness",
@@ -168,11 +182,24 @@ where
     Ok(witness)
 }
 
+/// Every touched account staged as a removal (`None`), so reth fetches the
+/// account-trie collapse siblings even for accounts whose end-state is present
+/// (deleted mid-block then re-funded). Returns the state and the account count.
+fn touched_account_removal_state(record: &ExecutionWitnessRecord) -> (HashedPostState, usize) {
+    let mut state = HashedPostState::default();
+    for &hashed_address in record.hashed_state.accounts.keys() {
+        state.accounts.insert(hashed_address, None);
+    }
+    let count = state.accounts.len();
+    (state, count)
+}
+
+/// Every touched storage slot staged as removed, account kept present, so reth
+/// fetches the storage-trie collapse siblings. Returns the state and slot count.
 fn touched_storage_removal_state(
     record: &ExecutionWitnessRecord,
-) -> eyre::Result<(HashedPostState, usize, usize)> {
+) -> eyre::Result<(HashedPostState, usize)> {
     let mut state = HashedPostState::with_capacity(record.hashed_state.storages.len());
-    let mut account_count = 0usize;
     let mut slot_count = 0usize;
 
     for (&hashed_address, storage) in &record.hashed_state.storages {
@@ -192,7 +219,6 @@ fn touched_storage_removal_state(
                 )
             })?;
         state.accounts.insert(hashed_address, account);
-        account_count += 1;
 
         let mut removals = HashedStorage::default();
         for &hashed_slot in storage.storage.keys() {
@@ -202,7 +228,7 @@ fn touched_storage_removal_state(
         state.storages.insert(hashed_address, removals);
     }
 
-    Ok((state, account_count, slot_count))
+    Ok((state, slot_count))
 }
 
 fn extend_unique_by_hash(target: &mut Vec<Bytes>, extra: impl IntoIterator<Item = Bytes>) -> usize {
@@ -221,8 +247,58 @@ fn extend_unique_by_hash(target: &mut Vec<Bytes>, extra: impl IntoIterator<Item 
 
 #[cfg(test)]
 mod tests {
-    use super::extend_unique_by_hash;
-    use alloy_primitives::Bytes;
+    use super::{
+        B256, Bytes, ExecutionWitnessRecord, HashedPostState, HashedStorage, U256,
+        extend_unique_by_hash, touched_account_removal_state, touched_storage_removal_state,
+    };
+
+    /// Every touched account is staged as a removal (`None`) — including one whose
+    /// end-state is present (the delete-then-refund case) — so reth fetches the
+    /// account-collapse siblings.
+    #[test]
+    fn account_removal_stages_all_as_none() {
+        let present = B256::repeat_byte(0x11); // present end-state (masks mid-block delete)
+        let destroyed = B256::repeat_byte(0x22); // destroyed end-state
+        let mut hashed_state = HashedPostState::default();
+        hashed_state
+            .accounts
+            .insert(present, Some(Default::default()));
+        hashed_state.accounts.insert(destroyed, None);
+        let record = ExecutionWitnessRecord {
+            hashed_state,
+            ..Default::default()
+        };
+
+        let (state, count) = touched_account_removal_state(&record);
+        assert_eq!(count, 2);
+        assert!(matches!(state.accounts.get(&present), Some(None)));
+        assert!(matches!(state.accounts.get(&destroyed), Some(None)));
+    }
+
+    /// Storage removals keep the account present (so reth processes its storage
+    /// trie) and stage each touched slot as zero.
+    #[test]
+    fn storage_removal_stages_slots_zero_account_present() {
+        let addr = B256::repeat_byte(0x11);
+        let (s1, s2) = (B256::repeat_byte(0xaa), B256::repeat_byte(0xbb));
+        let mut hashed_state = HashedPostState::default();
+        hashed_state.accounts.insert(addr, Some(Default::default()));
+        let mut storage = HashedStorage::default();
+        storage.storage.insert(s1, U256::from(5));
+        storage.storage.insert(s2, U256::from(7));
+        hashed_state.storages.insert(addr, storage);
+        let record = ExecutionWitnessRecord {
+            hashed_state,
+            ..Default::default()
+        };
+
+        let (state, slots) = touched_storage_removal_state(&record).unwrap();
+        assert_eq!(slots, 2);
+        assert!(matches!(state.accounts.get(&addr), Some(Some(_)))); // account kept present
+        let st = state.storages.get(&addr).unwrap();
+        assert_eq!(st.storage.get(&s1), Some(&U256::ZERO));
+        assert_eq!(st.storage.get(&s2), Some(&U256::ZERO));
+    }
 
     /// The removal-closure augmentation dedups by node hash: only genuinely new
     /// nodes are appended, and the reported count matches.

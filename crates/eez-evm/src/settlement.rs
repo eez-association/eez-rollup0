@@ -53,3 +53,29 @@ pub fn pair_end_positions(is_system: &[bool]) -> Vec<usize> {
         .filter(|&i| !is_system[i] || is_system.get(i + 1).copied().unwrap_or(true))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::pair_end_positions;
+
+    /// A pair ends at every user (non-system) tx, at a system tx followed by a
+    /// system tx, and at the last tx regardless. A system tx followed by a user
+    /// tx is NOT a pair end — it pairs with that user tx.
+    #[test]
+    fn pair_end_positions_cases() {
+        assert_eq!(pair_end_positions(&[]), Vec::<usize>::new());
+        // all user txs → each ends its own pair
+        assert_eq!(pair_end_positions(&[false, false, false]), vec![0, 1, 2]);
+        // system → user: only the user (index 1) ends the pair
+        assert_eq!(pair_end_positions(&[true, false]), vec![1]);
+        // system → system: the first system is a standalone pair end; the last
+        // tx is always a pair end
+        assert_eq!(pair_end_positions(&[true, true]), vec![0, 1]);
+        // user then trailing system (last) → both are pair ends
+        assert_eq!(pair_end_positions(&[false, true]), vec![0, 1]);
+        // two outbound [load|user] pairs → ends at each user
+        assert_eq!(pair_end_positions(&[true, false, true, false]), vec![1, 3]);
+        // a lone system tx (also the last) → pair end
+        assert_eq!(pair_end_positions(&[true]), vec![0]);
+    }
+}
