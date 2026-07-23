@@ -210,12 +210,9 @@ impl HeldPool {
         drained
     }
 
-    /// Drain up to `max` held txs (FIFO). Empirical fact about the
-    /// rbuilder-chiado relay: bundles containing more than ~3 user_txs
-    /// often have a subset silently dropped at inclusion time even
-    /// when the bundle itself lands. Capping bundle size keeps the
-    /// per-bundle inclusion atomic at the cost of more Sync slots to
-    /// drain a large pool.
+    /// Drain up to `max` held txs (FIFO). A bundle is all-or-nothing, so one
+    /// un-includable tx drops the whole bundle; capping bounds how many good txs
+    /// that takes down, at the cost of more Sync slots to drain a large pool.
     pub fn pop_n(&self, max: usize) -> Vec<HeldTx> {
         let mut txs = self.txs.lock().expect("held_pool txs poisoned");
         let mut by_hash = self.by_hash.lock().expect("held_pool by_hash poisoned");
