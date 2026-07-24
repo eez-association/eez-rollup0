@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/eez-composer",
+    "crates/eez-control-rpc",
     "crates/eez-deriver",
     "crates/eez-driver",
     "crates/eez-evm",
@@ -11,6 +12,8 @@ members = [
     "crates/eez-payload-codec",
     "crates/eez-protocol",
     "crates/eez-prover",
+    "crates/eez-prover-client",
+    "crates/eez-proverd",
 ]
 
 [workspace.package]
@@ -32,6 +35,23 @@ eyre               = "0.6"
 serde              = { version = "1", features = ["derive"] }
 sha3               = "0.10"
 hex                = "0.4"
+
+# grpc — eez-control-rpc `Prove` wire (composer[client] ↔ proverd[server], Model B).
+# tonic 0.14 splits codegen out: tonic runtime, tonic-prost glue, tonic-prost-build (build-dep).
+tonic                 = "0.14"
+tonic-prost           = "0.14"
+tonic-prost-build     = "0.14"
+prost                 = "0.14"
+tokio-stream          = "0.1"
+# compact binary serialization for the persistent witness store's values
+postcard              = { version = "1", features = ["use-std"] }
+# reth `debug_executionWitness` result shape — mirrors the proto ExecutionWitness.
+alloy-rpc-types-debug = { version = "2", default-features = false }
+
+# prover-port crates (composer-controlled prover, Model B)
+eez-control-rpc    = { path = "crates/eez-control-rpc" }
+eez-prover-client  = { path = "crates/eez-prover-client" }
+eez-proverd        = { path = "crates/eez-proverd" }
 
 # allocator for the binary
 mimalloc           = "0.1"
@@ -66,7 +86,11 @@ reth-revm                       = { git = "https://github.com/paradigmxyz/reth",
 reth-rpc-eth-api                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-storage-api                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-tasks                      = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-trie                       = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-trie-common                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+# libmdbx (reth's own mdbx binding) — backs the persistent witness store in a
+# DEDICATED env (never reth's node DB). Same rev so we don't link a 2nd mdbx build.
+reth-libmdbx                    = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 
 # reth_gnosis — Gnosis chain (chiado / gnosis mainnet) NodeBuilder.
 # Pinned to the rollup0-fd59fd22 branch which is the reth_gnosis

@@ -19,9 +19,11 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use alloy_primitives::{B256, Bytes, b256};
+use alloy_rpc_types_debug::ExecutionWitness;
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
+use eez_evm::EvmBatch;
 use thiserror::Error;
 
 /// Result alias.
@@ -33,16 +35,66 @@ pub enum ProverError {
     /// Underlying signer rejected the digest.
     #[error("signer error: {0}")]
     Signer(String),
+    /// The proving backend (remote daemon, witness source, …) failed.
+    #[error("prover backend: {0}")]
+    Backend(String),
 }
 
-/// Inputs the prover needs to produce a proof.
+/// One settling-window block the prover re-executes: its consensus RLP plus
+/// the exact (augmented) execution witness that re-execution needs.
+#[derive(Debug, Clone)]
+pub struct BlockWitness {
+    /// L2 block number.
+    pub number: u64,
+    /// The block hash the composer sealed — the prover cross-checks its own
+    /// re-derived hash against this.
+    pub hash: B256,
+    /// Parent hash — lets the prover chain contiguity across the window.
+    pub parent_hash: B256,
+    /// Consensus RLP (header + body).
+    pub rlp: Bytes,
+    /// Minimal execution witness (`state`/`codes`/`keys`/`headers`), augmented
+    /// with the removal-closure nodes intermediate per-tx roots need.
+    pub witness: ExecutionWitness,
+}
+
+/// Inputs the prover needs to prove one posted settlement window.
 ///
-/// Unit-shaped in stage 2 — [`MockEcdsaProver`] signs a fixed digest and
-/// needs nothing else. A real prover will reshape this to carry calldata
-/// and chain context (prev state root, prev tip hash, …) once that
-/// design lands.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ProvingContext;
+/// The composer fills this and calls [`Prover::prove`]; the whole window's
+/// block data travels in-band ([`blocks`](Self::blocks)) so the prover is a
+/// stateless function of its input — no feed, no cursor, no backfill.
+/// [`MockEcdsaProver`] ignores every field (it signs a fixed digest), so a
+/// mock-mode composer may leave [`blocks`](Self::blocks) empty.
+#[derive(Debug, Clone, Default)]
+pub struct ProvingContext {
+    /// The L2 this window settles.
+    pub rollup_id: u64,
+    /// First block of the window: `posted + 1` (the OD-5 anchor block + 1).
+    pub from_block: u64,
+    /// Last (settling) block of the window: the Sync height.
+    pub to_block: u64,
+    /// The authoritative postBatch payload (proof carriers filled, `proofs[]`
+    /// empty). The prover recomputes the `publicInputsHash` from this.
+    pub batch: EvmBatch,
+    /// Every window block's RLP + augmented witness, in block order.
+    pub blocks: Vec<BlockWitness>,
+    /// `blockhash(N)` for a block-bound batch's `blockNumber = N`; `None` for a
+    /// timeless (0) batch.
+    pub l1_block_hash: Option<B256>,
+}
+
+/// Produces the [`BlockWitness`] for a committed L2 block — the seam by which
+/// the composer fills [`ProvingContext::blocks`] without owning the reth
+/// provider itself. `eez-node` backs this with the node's provider +
+/// `eez_driver::witness`; the composer only calls it.
+pub trait ProvingWitnessSource: Send + Sync + std::fmt::Debug {
+    /// Build the RLP + augmented witness for block `number`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if the block is missing or witness generation fails.
+    fn block_witness(&self, number: u64) -> Result<BlockWitness, String>;
+}
 
 /// Turns proving context into `proof` bytes the matching on-chain
 /// `IProofSystem.verify` accepts.
@@ -142,7 +194,7 @@ mod tests {
         let prover = MockEcdsaProver::new(key.clone());
         let signer_addr = key.address();
 
-        let proof = prover.prove(ProvingContext).await.unwrap();
+        let proof = prover.prove(ProvingContext::default()).await.unwrap();
         assert_eq!(proof.len(), 65, "proof must be r||s||v");
         let v = proof[64];
         assert!(v == 27 || v == 28, "v must be 27 or 28, got {v}");

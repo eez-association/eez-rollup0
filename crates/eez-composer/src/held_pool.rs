@@ -292,8 +292,9 @@ impl HeldPool {
         self.pop_n(usize::MAX)
     }
 
-    /// Drain up to `max` held txs in FIFO order and reserve their nonces as
-    /// in-flight.
+    /// Drain up to `max` held txs (FIFO). A bundle is all-or-nothing, so one
+    /// un-includable tx drops the whole bundle; capping bounds how many good txs
+    /// that takes down, at the cost of more Sync slots to drain a large pool.
     pub fn pop_n(&self, max: usize) -> Vec<HeldTx> {
         let mut state = self.state.lock().expect("held_pool mutex poisoned");
         let count = max.min(state.txs.len());

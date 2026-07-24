@@ -13,5 +13,5 @@ deployments.env
 # Default L2 datadir if it lands in the repo
 datadir/
 
-chiado-db*/
 data/
+chiado-*/

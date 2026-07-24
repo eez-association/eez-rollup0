@@ -229,13 +229,21 @@ where
         schedule_rx: mpsc::Receiver<SlotEvent>,
         payload_builder: PayloadBuilderHandle<T>,
         timing: RollupTiming,
+        witness_sender: Option<mpsc::UnboundedSender<B256>>,
     ) -> DriverResult<Self>
     where
         P: BlockReader<Header = HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>
             + BlockIdReader,
     {
-        let committer =
-            BlockCommitterHandle::spawn_from_provider(provider, to_engine, payload_builder)?;
+        // Prover-feed (prover-chain P1): thread the witness channel into the
+        // committer so each PRODUCED block's hash is emitted at canonical commit
+        // for the out-of-loop capture task. `None` outside remote-prover mode.
+        let committer = BlockCommitterHandle::spawn_from_provider(
+            provider,
+            to_engine,
+            payload_builder,
+            witness_sender,
+        )?;
         Ok(Self {
             attributes,
             schedule_rx,
@@ -704,7 +712,9 @@ where
         let block_timestamp = built.header.timestamp();
         let _outcome = self
             .committer
-            .commit_derived(built.payload, built.header)
+            // feed_witness=true: this is a PRODUCED Sync block — emit it to the
+            // prover witness-capture feed (the follower/deriver passes false).
+            .commit_derived(built.payload, built.header, true)
             .await?;
 
         event!(
