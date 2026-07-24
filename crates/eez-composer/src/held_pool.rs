@@ -60,15 +60,6 @@ pub struct HeldTx {
     pub direction: Direction,
 }
 
-/// Outcome of inserting a held tx.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HoldInsert {
-    /// The tx was newly inserted into the queued pool.
-    Inserted,
-    /// The tx hash was already queued or in flight; no state changed.
-    Duplicate,
-}
-
 /// A nonce-contiguity admission failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NonceAdmissionError {
@@ -148,18 +139,13 @@ impl HeldPool {
 
     /// Admit `tx` into the contiguous queued + in-flight nonce chain for
     /// `(sender, direction)`. A new hash at an existing queued nonce replaces
-    /// that transaction and evicts its higher queued suffix. In-flight nonces
-    /// cannot be replaced. Reservations below `on_chain` have already landed
-    /// and do not advance the expected nonce a second time. Duplicate hashes
-    /// are accepted as idempotent.
-    pub fn push_contiguous(
-        &self,
-        tx: HeldTx,
-        on_chain: u64,
-    ) -> Result<HoldInsert, NonceAdmissionError> {
+    /// that transaction in place. In-flight nonces cannot be replaced.
+    /// Reservations below `on_chain` have already landed and do not advance
+    /// the expected nonce a second time. Duplicate hashes are idempotent.
+    pub fn push_contiguous(&self, tx: HeldTx, on_chain: u64) -> Result<(), NonceAdmissionError> {
         let mut state = self.state.lock().expect("held_pool mutex poisoned");
         if state.by_hash.contains(&tx.hash) || state.in_flight.contains_key(&tx.hash) {
-            return Ok(HoldInsert::Duplicate);
+            return Ok(());
         }
 
         let target_sender = tx.sender;
@@ -183,21 +169,9 @@ impl HeldPool {
             let replacement_hash = tx.hash;
             let previous_hash = state.txs[queued_idx].hash;
             state.txs[queued_idx] = tx;
-            let mut evicted_hashes = Vec::new();
-            state.txs.retain(|queued| {
-                let evict =
-                    same_chain(queued.sender, queued.direction) && queued.nonce > target_nonce;
-                if evict {
-                    evicted_hashes.push(queued.hash);
-                }
-                !evict
-            });
             state.by_hash.remove(&previous_hash);
-            for hash in &evicted_hashes {
-                state.by_hash.remove(hash);
-            }
             state.by_hash.insert(replacement_hash);
-            return Ok(HoldInsert::Inserted);
+            return Ok(());
         }
 
         if state.in_flight.values().any(|(sender, direction, nonce)| {
@@ -223,7 +197,7 @@ impl HeldPool {
         }
         state.by_hash.insert(tx.hash);
         state.txs.push_back(tx);
-        Ok(HoldInsert::Inserted)
+        Ok(())
     }
 
     /// Re-queue recovered txs at the front, unless a newer queued replacement
@@ -352,10 +326,7 @@ mod tests {
     use alloy_primitives::B256;
 
     fn insert(pool: &HeldPool, tx: HeldTx, on_chain: u64) {
-        assert_eq!(
-            pool.push_contiguous(tx, on_chain).unwrap(),
-            HoldInsert::Inserted
-        );
+        pool.push_contiguous(tx, on_chain).unwrap();
     }
 
     fn tx(byte: u8) -> HeldTx {
@@ -391,17 +362,11 @@ mod tests {
         let pool = HeldPool::new();
         let original = tx(1);
         insert(&pool, original.clone(), 1);
-        assert_eq!(
-            pool.push_contiguous(original.clone(), 1).unwrap(),
-            HoldInsert::Duplicate
-        );
+        pool.push_contiguous(original.clone(), 1).unwrap();
         assert_eq!(pool.len(), 1);
 
         let drained = pool.pop_all();
-        assert_eq!(
-            pool.push_contiguous(original.clone(), 1).unwrap(),
-            HoldInsert::Duplicate
-        );
+        pool.push_contiguous(original.clone(), 1).unwrap();
         let mut replacement = original;
         replacement.hash = TxHash::from(B256::repeat_byte(9));
         assert_eq!(
@@ -455,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_nonce_replacement_preserves_position_and_evicts_only_its_suffix() {
+    fn queued_nonce_replacement_preserves_position_and_suffix() {
         let pool = HeldPool::new();
         let sender = Address::repeat_byte(9);
         let other_sender = Address::repeat_byte(8);
@@ -476,23 +441,8 @@ mod tests {
         insert(&pool, mk(other_sender, 1, Direction::Inbound, 11), 0);
         insert(&pool, mk(sender, 1, Direction::Outbound, 21), 0);
 
-        assert_eq!(
-            pool.push_contiguous(mk(sender, 1, Direction::Inbound, 9), 0)
-                .unwrap(),
-            HoldInsert::Inserted
-        );
-        assert_eq!(
-            pool.push_contiguous(mk(sender, 2, Direction::Inbound, 3), 0)
-                .unwrap(),
-            HoldInsert::Inserted,
-            "the evicted suffix hash must be removed from the dedupe index"
-        );
-        assert_eq!(
-            pool.push_contiguous(mk(sender, 1, Direction::Inbound, 2), 0)
-                .unwrap(),
-            HoldInsert::Inserted,
-            "the original hash must be reusable after replacement"
-        );
+        pool.push_contiguous(mk(sender, 1, Direction::Inbound, 9), 0)
+            .unwrap();
 
         let hashes: Vec<_> = pool.pop_all().iter().map(|tx| tx.hash).collect();
         assert_eq!(
@@ -500,8 +450,9 @@ mod tests {
             vec![
                 TxHash::from(B256::repeat_byte(1)),
                 TxHash::from(B256::repeat_byte(10)),
-                TxHash::from(B256::repeat_byte(2)),
+                TxHash::from(B256::repeat_byte(9)),
                 TxHash::from(B256::repeat_byte(20)),
+                TxHash::from(B256::repeat_byte(3)),
                 TxHash::from(B256::repeat_byte(11)),
                 TxHash::from(B256::repeat_byte(21)),
             ]
@@ -526,21 +477,15 @@ mod tests {
         let drained = pool.pop_n(1);
         assert_eq!(drained[0].nonce, 0);
 
-        assert_eq!(
-            pool.push_contiguous(mk(1, 9), 0).unwrap(),
-            HoldInsert::Inserted
-        );
+        pool.push_contiguous(mk(1, 9), 0).unwrap();
         assert_eq!(
             pool.push_contiguous(mk(0, 8), 0).unwrap_err(),
             NonceAdmissionError {
-                expected: 2,
+                expected: 3,
                 on_chain: 0
             }
         );
-        assert_eq!(
-            pool.push_contiguous(mk(2, 7), 0).unwrap(),
-            HoldInsert::Inserted
-        );
+        pool.push_contiguous(mk(2, 7), 0).unwrap();
 
         let queued = pool.pop_all();
         assert_eq!(queued.len(), 2);
@@ -567,18 +512,12 @@ mod tests {
         assert!(pool.is_empty());
 
         // Before landing, nonce 0 is supplied by the in-flight reservation.
-        assert_eq!(
-            pool.push_contiguous(mk(1, 2), 0).unwrap(),
-            HoldInsert::Inserted
-        );
+        pool.push_contiguous(mk(1, 2), 0).unwrap();
 
         // Once nonce 0 lands, the source-chain nonce advances to 1 while the
         // reservation remains until Deriver confirmation. It must not be
         // counted a second time; queued nonce 1 makes nonce 2 the next value.
-        assert_eq!(
-            pool.push_contiguous(mk(2, 3), 1).unwrap(),
-            HoldInsert::Inserted
-        );
+        pool.push_contiguous(mk(2, 3), 1).unwrap();
         let err = pool.push_contiguous(mk(4, 4), 1).unwrap_err();
         assert_eq!(
             err,
@@ -605,10 +544,7 @@ mod tests {
         };
 
         insert(&pool, mk(1), u64::MAX);
-        assert_eq!(
-            pool.push_contiguous(mk(2), u64::MAX).unwrap(),
-            HoldInsert::Inserted
-        );
+        pool.push_contiguous(mk(2), u64::MAX).unwrap();
         let drained = pool.pop_all();
         assert_eq!(drained[0].hash, TxHash::from(B256::repeat_byte(2)));
         assert_eq!(
@@ -657,10 +593,7 @@ mod tests {
                 .any(|(s, d, nonce)| { *s == sender && *d == Direction::Inbound && *nonce >= 1 }),
             "inclusive eviction must release the root's own reservation"
         );
-        assert_eq!(
-            pool.push_contiguous(mk(1, 5), 0).unwrap(),
-            HoldInsert::Inserted
-        );
+        pool.push_contiguous(mk(1, 5), 0).unwrap();
     }
 
     #[test]

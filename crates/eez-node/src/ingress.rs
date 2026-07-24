@@ -48,9 +48,9 @@ pub enum Admission {
 /// `direction`.
 ///
 /// A new nonce must be the first unreserved nonce at or above the source-chain
-/// nonce for this direction. An existing queued nonce may be replaced, which
-/// also evicts its higher queued suffix. A gapped held tx would poison the
-/// all-or-nothing bundle and break bundle-mates' chains.
+/// nonce for this direction. An existing queued nonce may be replaced in
+/// place. A gapped held tx would poison the all-or-nothing bundle and break
+/// bundle-mates' chains.
 pub async fn gate_and_hold(
     envelope: &TxEnvelope,
     raw_tx: &Bytes,
@@ -406,7 +406,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gate_replaces_queued_nonce_and_evicts_higher_suffix() {
+    async fn gate_replaces_queued_nonce_and_preserves_higher_suffix() {
         let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap();
         let (original, original_raw) = signed_transfer(&signer, 0, 1);
         let (suffix, suffix_raw) = signed_transfer(&signer, 1, 2);
@@ -431,10 +431,11 @@ mod tests {
         else {
             panic!("original transaction should be held");
         };
-        assert!(matches!(
-            gate_and_hold(&suffix, &suffix_raw, Direction::Inbound, &pool, &provider,).await,
-            Admission::Held(_)
-        ));
+        let Admission::Held(suffix_hash) =
+            gate_and_hold(&suffix, &suffix_raw, Direction::Inbound, &pool, &provider).await
+        else {
+            panic!("suffix transaction should be held");
+        };
         let Admission::Held(replacement_hash) = gate_and_hold(
             &replacement,
             &replacement_raw,
@@ -449,8 +450,10 @@ mod tests {
 
         assert_ne!(original_hash, replacement_hash);
         let queued = pool.pop_all();
-        assert_eq!(queued.len(), 1);
+        assert_eq!(queued.len(), 2);
         assert_eq!(queued[0].hash, replacement_hash);
         assert_eq!(queued[0].nonce, 0);
+        assert_eq!(queued[1].hash, suffix_hash);
+        assert_eq!(queued[1].nonce, 1);
     }
 }
