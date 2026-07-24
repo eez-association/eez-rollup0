@@ -444,7 +444,14 @@ mod tests {
         pool.push_contiguous(mk(sender, 1, Direction::Inbound, 9), 0)
             .unwrap();
 
-        let hashes: Vec<_> = pool.pop_all().iter().map(|tx| tx.hash).collect();
+        let drained = pool.pop_all();
+        assert!(drained.iter().any(|tx| {
+            tx.sender == sender
+                && tx.direction == Direction::Outbound
+                && tx.nonce == 1
+                && tx.hash == TxHash::from(B256::repeat_byte(21))
+        }));
+        let hashes: Vec<_> = drained.iter().map(|tx| tx.hash).collect();
         assert_eq!(
             hashes,
             vec![

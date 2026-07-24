@@ -331,6 +331,44 @@ mod tests {
     use alloy_rpc_types_eth::AccessList;
     use alloy_signer_local::PrivateKeySigner;
 
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    async fn wait_for_front(port: u16) {
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("cross-chain front did not bind to port {port}");
+    }
+
+    async fn send_raw(port: u16, raw: &Bytes, id: u64) -> Value {
+        reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}"))
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "eth_sendRawTransaction",
+                "params": [format!("{raw:#x}")],
+                "id": id,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
     fn signed_transfer(signer: &PrivateKeySigner, nonce: u64, value: u64) -> (TxEnvelope, Bytes) {
         let mut tx = TxEip1559 {
             chain_id: 1,
@@ -455,5 +493,73 @@ mod tests {
         assert_eq!(queued[0].nonce, 0);
         assert_eq!(queued[1].hash, suffix_hash);
         assert_eq!(queued[1].nonce, 1);
+    }
+
+    #[tokio::test]
+    async fn real_http_fronts_route_directions_and_preserve_replacement_suffix() {
+        let inbound_signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap();
+        let outbound_signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(2)).unwrap();
+        let (_, inbound_original) = signed_transfer(&inbound_signer, 0, 1);
+        let (_, inbound_suffix) = signed_transfer(&inbound_signer, 1, 2);
+        let (_, inbound_replacement) = signed_transfer(&inbound_signer, 0, 3);
+        let (_, outbound) = signed_transfer(&outbound_signer, 0, 4);
+
+        let pool = Arc::new(HeldPool::new());
+        let inbound_port = free_port();
+        let outbound_port = free_port();
+
+        let inbound_asserter = Asserter::new();
+        let inbound_provider =
+            ProviderBuilder::default().connect_mocked_client(inbound_asserter.clone());
+        for _ in 0..3 {
+            inbound_asserter.push_success(&U256::from(1_000_000u64));
+            inbound_asserter.push_success(&0_u64);
+        }
+        let outbound_asserter = Asserter::new();
+        let outbound_provider =
+            ProviderBuilder::default().connect_mocked_client(outbound_asserter.clone());
+        outbound_asserter.push_success(&U256::from(1_000_000u64));
+        outbound_asserter.push_success(&0_u64);
+
+        let inbound_task = tokio::spawn(run_cross_chain_front(
+            inbound_port,
+            "http://127.0.0.1:1".into(),
+            Direction::Inbound,
+            Arc::clone(&pool),
+            inbound_provider,
+        ));
+        let outbound_task = tokio::spawn(run_cross_chain_front(
+            outbound_port,
+            "http://127.0.0.1:1".into(),
+            Direction::Outbound,
+            Arc::clone(&pool),
+            outbound_provider,
+        ));
+        wait_for_front(inbound_port).await;
+        wait_for_front(outbound_port).await;
+
+        let original = send_raw(inbound_port, &inbound_original, 1).await;
+        let suffix = send_raw(inbound_port, &inbound_suffix, 2).await;
+        let replacement = send_raw(inbound_port, &inbound_replacement, 3).await;
+        let outbound_response = send_raw(outbound_port, &outbound, 4).await;
+        for response in [&original, &suffix, &replacement, &outbound_response] {
+            assert!(response.get("error").is_none(), "{response}");
+            assert!(response.get("result").is_some(), "{response}");
+        }
+
+        let queued = pool.pop_all();
+        assert_eq!(queued.len(), 3);
+        assert_eq!(queued[0].hash.to_string(), replacement["result"]);
+        assert_eq!(queued[0].direction, Direction::Inbound);
+        assert_eq!(queued[0].nonce, 0);
+        assert_eq!(queued[1].hash.to_string(), suffix["result"]);
+        assert_eq!(queued[1].direction, Direction::Inbound);
+        assert_eq!(queued[1].nonce, 1);
+        assert_eq!(queued[2].hash.to_string(), outbound_response["result"]);
+        assert_eq!(queued[2].direction, Direction::Outbound);
+        assert_eq!(queued[2].nonce, 0);
+
+        inbound_task.abort();
+        outbound_task.abort();
     }
 }
