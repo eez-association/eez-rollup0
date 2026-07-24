@@ -7,18 +7,21 @@
 //!
 //! # Modes
 //!
-//! Mode is decided by env-var presence at startup:
+//! Mode is decided by env-var presence at startup. "Can attest" =
+//! `EEZ_PROVER_URL` (remote prover; composer needs only `EEZ_ATTESTER_ADDRESS`,
+//! never the key) OR `EEZ_PROOF_SIGNER_KEY` (local mock signer):
 //!
-//! | `EEZ_L1_RPC_URL` | `EEZ_PROOF_SIGNER_KEY` | Mode | Stack |
+//! | `EEZ_L1_RPC_URL` | can attest | Mode | Stack |
 //! |---|---|---|---|
 //! | unset | — | **standalone** | reth + Sequencer (interval Scheduler, Live blocks only) |
-//! | set | unset | **follower** | reth + `L1Watcher` + Deriver (no Sequencer) |
-//! | set | set | **composer** | reth + `L1Watcher` + Deriver + Sequencer (L1-anchored) + Composer umbrella |
+//! | set | no | **follower** | reth + `L1Watcher` + Deriver (no Sequencer) |
+//! | set | yes | **composer** | reth + `L1Watcher` + Deriver + Sequencer (L1-anchored) + Composer umbrella |
 
 mod bundle_rpc;
 mod follower;
 mod ingress;
 mod l1_embedded;
+mod witness_source;
 
 use std::{collections::HashMap, env, str::FromStr, sync::Arc, time::Duration};
 
@@ -83,8 +86,14 @@ enum EmbeddedL1<Dev, Chiado> {
 impl Mode {
     fn from_env() -> Self {
         let l1_enabled = env::var_os("EEZ_L1_RPC_URL").is_some();
-        let proof_signer_set = env::var_os("EEZ_PROOF_SIGNER_KEY").is_some();
-        match (l1_enabled, proof_signer_set) {
+        // A composer needs an attestation source: a remote prover
+        // (`EEZ_PROVER_URL`, which holds the key remotely — the composer only
+        // needs `EEZ_ATTESTER_ADDRESS`) or a local mock signer
+        // (`EEZ_PROOF_SIGNER_KEY`). Either presence marks composer mode; a
+        // follower has L1 but neither.
+        let can_attest = env::var_os("EEZ_PROVER_URL").is_some()
+            || env::var_os("EEZ_PROOF_SIGNER_KEY").is_some();
+        match (l1_enabled, can_attest) {
             (false, _) => Self::Standalone,
             (true, false) => Self::Follower,
             (true, true) => Self::Composer,
@@ -209,6 +218,7 @@ fn main() -> eyre::Result<()> {
                         .with_database(db)
                         .with_launch_context(build_l1_runtime()?)
                         .node(EthereumNode::default())
+                        .extend_rpc_modules(bundle_rpc::install_dev_bundle_rpc)
                         .launch_with_debug_capabilities()
                         .await?;
                     event!(
@@ -390,6 +400,28 @@ fn main() -> eyre::Result<()> {
         // standalone mode it runs the produce loop; in follower it's
         // dropped (committer stays alive via the cloned handle); in
         // composer the L1-anchored schedule arrives via spawn_l1_anchored.
+        // Remote-prover composer mode: the committer emits each committed block's
+        // hash here; a capture task re-executes it while parent state is fresh and
+        // stores the witness for the composer. `None` otherwise. Created here to
+        // thread `witness_sender` into the committer at spawn.
+        let (witness_sender, witness_rx, witness_store) =
+            if mode == Mode::Composer && env::var_os("EEZ_PROVER_URL").is_some() {
+                let (tx, rx) = mpsc::unbounded_channel::<B256>();
+                // Dedicated mdbx env (never reth's node DB); path env-configurable.
+                let witness_db_path =
+                    env::var("EEZ_WITNESS_DB_PATH").unwrap_or_else(|_| "eez-witnesses".to_owned());
+                let store = witness_source::new_store(std::path::Path::new(&witness_db_path))?;
+                event!(
+                    name: "eez.node.witness_store.opened",
+                    Level::INFO,
+                    path = %witness_db_path,
+                    "persistent witness store opened",
+                );
+                (Some(tx), Some(rx), Some(store))
+            } else {
+                (None, None, None)
+            };
+
         let mut sequencer = Sequencer::new(
             &provider,
             attributes,
@@ -397,6 +429,7 @@ fn main() -> eyre::Result<()> {
             schedule_rx,
             payload_builder_handle,
             timing,
+            witness_sender,
         )?;
         if mode != Mode::Standalone {
             let depth = env::var("EEZ_MAX_SPECULATIVE_DEPTH")
@@ -453,12 +486,29 @@ fn main() -> eyre::Result<()> {
         // would spawn a second actor with its own reconcile lock + head
         // mirror, splitting the serialization domain.
         let (sequencer, umbrella, system_tx_cfg) = if mode == Mode::Composer {
-            let proof_signer_key = env::var("EEZ_PROOF_SIGNER_KEY")
-                .map_err(|_| eyre::eyre!("EEZ_PROOF_SIGNER_KEY required in composer mode"))?;
-            let proof_signer = PrivateKeySigner::from_bytes(&B256::from_str(
-                proof_signer_key.trim_start_matches("0x"),
-            )?)?;
-            let prover = Arc::new(MockEcdsaProver::new(proof_signer));
+            // Attestation source. Remote mode (`EEZ_PROVER_URL`) holds NO signing
+            // key in the composer: it dials eez-proverd and only VERIFIES that each
+            // attestation recovers to the configured attester address (the on-chain
+            // proof-system check is authoritative; this is a fail-fast).
+            let prover: Arc<dyn eez_prover::Prover> = match env::var("EEZ_PROVER_URL") {
+                Ok(url) => {
+                    let attester = env::var("EEZ_ATTESTER_ADDRESS").map_err(|_| {
+                        eyre::eyre!("EEZ_ATTESTER_ADDRESS required in remote-prover mode")
+                    })?;
+                    let attester = Address::from_str(attester.trim())
+                        .map_err(|e| eyre::eyre!("EEZ_ATTESTER_ADDRESS: {e}"))?;
+                    Arc::new(eez_prover_client::RemoteProver::new(url, attester))
+                }
+                Err(_) => {
+                    let key = env::var("EEZ_PROOF_SIGNER_KEY").map_err(|_| {
+                        eyre::eyre!("EEZ_PROOF_SIGNER_KEY required in mock-prover mode")
+                    })?;
+                    let signer = PrivateKeySigner::from_bytes(&B256::from_str(
+                        key.trim_start_matches("0x"),
+                    )?)?;
+                    Arc::new(MockEcdsaProver::new(signer))
+                }
+            };
             let rollup_id = rollup_config.rollup_id;
             // Share the SAME HeldPool the ingress middleware pushes into
             // (the `Option<Arc<HeldPool>>` leaves room for per-rollup
@@ -719,10 +769,10 @@ fn main() -> eyre::Result<()> {
                 let l1_poster_signer = PrivateKeySigner::from_bytes(&B256::from_str(
                     l1_poster_key.trim_start_matches("0x"),
                 )?)?;
-                let mock_proof_system_address: Address = Address::from_str(
-                    &env::var("EEZ_MOCK_PROOF_SYSTEM_ADDRESS").map_err(|_| {
+                let ecdsa_proof_system_address: Address = Address::from_str(
+                    &env::var("EEZ_ECDSA_PROOF_SYSTEM_ADDRESS").map_err(|_| {
                         eyre::eyre!(
-                            "EEZ_MOCK_PROOF_SYSTEM_ADDRESS required for L1 postBatch \
+                            "EEZ_ECDSA_PROOF_SYSTEM_ADDRESS required for L1 postBatch \
                              proofSystems[0]"
                         )
                     })?,
@@ -766,7 +816,7 @@ fn main() -> eyre::Result<()> {
                     l1_poster_signer,
                     l1_chain_id,
                     l1_post_batch_priority_fee,
-                    mock_proof_system_address,
+                    ecdsa_proof_system_address,
                     l2_rollup_id: l2_rollup_id_for_ctx,
                 }))
             } else {
@@ -786,6 +836,38 @@ fn main() -> eyre::Result<()> {
                     this_rollup_id: ctx.l2_rollup_id,
                 }
             });
+            // Remote-prover mode: spawn the commit-time witness capture and back the
+            // composer's witness source with its store. Capturing at commit (parent
+            // state still fresh) is why this works on a non-archival node. Spawned
+            // before `evm_config` is moved into `Composer::new` below.
+            let witness_source = match (witness_rx, witness_store) {
+                (Some(rx), Some(store)) => {
+                    let cap_provider = provider.clone();
+                    let cap_evm = evm_config.clone();
+                    let ws_provider = provider.clone();
+                    let ws_evm = evm_config.clone();
+                    let cap_store = Arc::clone(&store);
+                    // Purge floor = L1-FINALIZED height (a reorg could un-settle a posted batch).
+                    let cap_l1_head = Arc::clone(&l1_head);
+                    task_executor.spawn_critical_task("eez-witness-capture", async move {
+                        witness_source::run_capture(
+                            rx,
+                            cap_store,
+                            cap_provider,
+                            cap_evm,
+                            move || cap_l1_head.finalized_l2(),
+                        )
+                        .await;
+                    });
+                    // Hybrid: read the store, else re-exec on demand the newest block
+                    // the async capture hasn't drained yet (state still retained; fast
+                    // for near-empty blocks).
+                    Some(Arc::new(witness_source::NodeWitnessSource::new(
+                        store, ws_provider, ws_evm,
+                    )) as Arc<dyn eez_prover::ProvingWitnessSource>)
+                }
+                _ => None,
+            };
             let composer = Composer::new(
                 rollups,
                 prover,
@@ -796,6 +878,9 @@ fn main() -> eyre::Result<()> {
                 cc_exec_ctx,
                 l2_entry_client,
             );
+            if let Some(ws) = witness_source {
+                composer.set_witness_source(ws);
+            }
             let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
 
             // Reuse the same Sequencer (and its single BlockCommitter
@@ -1139,7 +1224,7 @@ fn warn_on_deprecated_env() {
                 name: "eez.node.env.deprecated",
                 Level::WARN,
                 env = name,
-                "env var is ignored; mode is derived from EEZ_L1_RPC_URL + EEZ_PROOF_SIGNER_KEY presence (see crate docs)."
+                "env var is ignored; mode is derived from EEZ_L1_RPC_URL + (EEZ_PROVER_URL | EEZ_PROOF_SIGNER_KEY) presence (see crate docs)."
             );
         }
     }
