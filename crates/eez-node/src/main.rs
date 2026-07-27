@@ -473,7 +473,6 @@ fn main() -> eyre::Result<()> {
             type WiringParts = (
                 eez_protocol::RollupId,
                 Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
-                Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
                 std::collections::HashMap<
                     eez_protocol::RollupId,
                     (
@@ -501,7 +500,7 @@ fn main() -> eyre::Result<()> {
                     // over the chiado ChainSpec (source-sim needs only
                     // revm, not GnosisNode's AuRa paths). Both yield the
                     // same erased views, so composition is identical.
-                    let (entry_client_view, root_reader_view) = match l1_variant {
+                    let entry_client_view = match l1_variant {
                         EmbeddedL1::Dev(l1_handle) => {
                             let l1_provider = l1_handle.node.provider.clone();
                             let l1_evm_config = l1_handle.node.evm_config.clone();
@@ -518,12 +517,7 @@ fn main() -> eyre::Result<()> {
                                     + Send
                                     + Sync,
                             > = entry_client.clone();
-                            let root_view: std::sync::Arc<
-                                dyn eez_protocol::executor::ChainClient
-                                    + Send
-                                    + Sync,
-                            > = entry_client.clone();
-                            (entry_view, root_view)
+                            entry_view
                         }
                         EmbeddedL1::Chiado(chiado_handle) => {
                             // `GnosisChainSpec.inner` is the standard
@@ -551,12 +545,7 @@ fn main() -> eyre::Result<()> {
                                     + Send
                                     + Sync,
                             > = entry_client.clone();
-                            let root_view: std::sync::Arc<
-                                dyn eez_protocol::executor::ChainClient
-                                    + Send
-                                    + Sync,
-                            > = entry_client.clone();
-                            (entry_view, root_view)
+                            entry_view
                         }
                     };
 
@@ -616,12 +605,7 @@ fn main() -> eyre::Result<()> {
                     wired_rollups
                         .insert(l1_rollup_id, (Arc::clone(&entry_client_view), entry_cfg));
                     wired_rollups.insert(l2_rollup_id_typed, (l2_follower_view, l2_follower_cfg));
-                    let composed = (
-                        l1_rollup_id,
-                        entry_client_view,
-                        root_reader_view,
-                        wired_rollups,
-                    );
+                    let composed = (l1_rollup_id, entry_client_view, wired_rollups);
                     event!(
                         name: "eez.node.evm_composer.ready",
                         Level::INFO,
@@ -773,13 +757,12 @@ fn main() -> eyre::Result<()> {
             // embedded-L1 branch above, or not at all.
             let cross_chain = match (evm_composer, cc_exec_ctx, l2_entry_client) {
                 (
-                    Some((entry_rollup_id, entry_client, root_reader, wired_rollups)),
+                    Some((entry_rollup_id, entry_client, wired_rollups)),
                     Some(exec_ctx),
                     Some(l2_entry_client),
                 ) => Some(CrossChainWiring {
                     entry_rollup_id,
                     entry_client,
-                    root_reader,
                     rollups: wired_rollups,
                     exec_ctx,
                     l2_entry_client,

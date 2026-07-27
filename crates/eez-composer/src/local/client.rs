@@ -20,13 +20,13 @@
 
 use std::sync::Arc;
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::Address;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{ConfigureEvm, Evm as _};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::SignerRecoverable;
 use reth_revm::{database::StateProviderDatabase, db::State};
-use reth_storage_api::{BlockNumReader, HeaderProvider, StateProvider, StateProviderFactory};
+use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderFactory};
 
 use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
 use eez_protocol::{
@@ -217,21 +217,6 @@ impl LocalChainClient {
         }
     }
 
-    /// Internal helper — read the stored state root for
-    /// `target_rollup_id` from the entry-chain rollups contract.
-    fn read_stored_target_state_root(
-        &self,
-        state: &dyn StateProvider,
-        rollups_address: Address,
-        target_rollup_id: RollupId,
-    ) -> ExecutorResult<[u8; 32]> {
-        let root_slot = eez_protocol::action::compute_state_root_slot(target_rollup_id);
-        let value = state
-            .storage(rollups_address, root_slot)
-            .map_err(ExecutorError::provider)?
-            .unwrap_or(U256::ZERO);
-        Ok(value.to_be_bytes::<32>())
-    }
 }
 
 #[async_trait::async_trait]
@@ -464,82 +449,4 @@ impl ChainClient for LocalChainClient {
         Ok(())
     }
 
-    /// Committed-root reads — only meaningful when this client is
-    /// connected to the chain hosting the canonical committed-root storage
-    /// (L1's `EEZ.sol` in this protocol).
-    ///
-    /// Today's L1-as-entry topology has the entry client itself serve this
-    /// role; the same `Arc<LocalChainClient<...>>` is erased to BOTH
-    /// `Arc<dyn EntryChainClient>` (for `.entry(...)`) AND
-    /// `Arc<dyn CommittedRootReader>` (for `.root_reader(...)`) at the
-    /// builder seam in `main.rs`.
-    ///
-    /// L2-as-entry topology will need a follower variant: when this is a
-    /// L1 follower client, it must implement this trait honestly. That
-    /// honestly serves committed-root reads only when the client's dialect
-    /// is `EvmL1Style` — that's the only chain whose `dispatch_address`
-    /// points to a `EEZ.sol`-shaped contract whose storage layout
-    /// `compute_state_root_slot` assumes. Both entry and follower roles
-    /// can serve when L1-style: the entry case covers L1-as-entry single-binary;
-    /// the follower case covers L1-as-follower in L2-as-entry topology.
-    /// Non-L1 clients return `Unavailable` so misregistration fails loudly.
-    async fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
-        // Only L1-style clients honestly serve committed-root reads —
-        // the storage-slot math `compute_state_root_slot` assumes the
-        // L1 `EEZ.sol` layout. L2-style clients return `Unavailable`
-        // so a misregistered root_reader fails loudly at first dispatch.
-        if self.dialect != eez_protocol::ChainDialect::EvmL1Style {
-            return Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
-                "stored_target_state_root called on a non-L1 LocalChainClient \
-                 (only EvmL1Style clients hold canonical committed-root storage)"
-                    .into(),
-            )));
-        }
-        let dispatch_address = self.role.dispatch_address();
-
-        // Self-query path: the L1 client (entry or follower) asking
-        // about its OWN state. Returns the latest header root, which
-        // on the test devnet coincides with `Rollups.rollups[L1_id].stateRoot`
-        // because every postBatch atomically updates both. The
-        // cross-rollup path below is the protocol-correct read for
-        // OTHER rollups (where storage and header may diverge between
-        // batches).
-        if rollup_id == self.rollup_id {
-            let num = self
-                .provider
-                .headers
-                .best_block_number()
-                .map_err(ExecutorError::provider)?;
-            let header = self
-                .provider
-                .headers
-                .header_by_number(num)
-                .map_err(ExecutorError::provider)?
-                .ok_or_else(|| {
-                    ExecutorError::from(ExecutorErrorKind::Missing("L1 header at latest block"))
-                })?;
-            let root = header.state_root.0;
-            tracing::debug!(
-                %rollup_id,
-                root = ?B256::from(root),
-                "L1 self-query: returned latest header state_root"
-            );
-            return Ok(root);
-        }
-
-        // Cross-rollup path: read from the L1 Rollups contract's storage.
-        let state = self
-            .provider
-            .provider
-            .latest()
-            .map_err(ExecutorError::provider)?;
-        let root =
-            self.read_stored_target_state_root(state.as_ref(), dispatch_address, rollup_id)?;
-        tracing::debug!(
-            %rollup_id,
-            root = ?B256::from(root),
-            "stored target state root read"
-        );
-        Ok(root)
-    }
 }

@@ -1,9 +1,8 @@
 //! Chain-client and execution-session interfaces.
 //!
 //! The composer talks to every registered rollup through one trait,
-//! [`ChainClient`]. Role-specific operations (`simulate_source_tx` for
-//! the entry rollup, `stored_target_state_root` for the committed-root
-//! host) have default implementations that refuse with
+//! [`ChainClient`]. The role-specific `simulate_source_tx` (entry
+//! rollup only) has a default implementation that refuses with
 //! [`ExecutorErrorKind::Unavailable`], so a misregistered client fails
 //! loudly at the first role-specific call. Nested cross-chain
 //! dispatch goes through the borrowed
@@ -173,21 +172,4 @@ pub trait ChainClient: Send + Sync + 'static {
         )))
     }
 
-    /// Read what the canonical committed-root storage currently has
-    /// for `rollup_id` — `EEZ.rollups(rollup_id).stateRoot` on L1, the
-    /// upstream-invariant-6 anchor `postAndVerifyBatch` enforces
-    /// against each delta's `currentState`. Only clients connected to
-    /// the chain hosting that storage implement this; the default
-    /// refuses with [`ExecutorErrorKind::Unavailable`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ExecutorErrorKind::Provider`] if the underlying state
-    /// provider is inaccessible; [`ExecutorErrorKind::Unavailable`] if
-    /// the client does not host the committed-root storage.
-    async fn stored_target_state_root(&self, _rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
-        Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
-            "stored_target_state_root: client does not host the committed-root storage".into(),
-        )))
-    }
 }

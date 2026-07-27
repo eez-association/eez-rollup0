@@ -137,10 +137,6 @@ pub struct CrossChainWiring {
     /// Entry-chain (L1) client — runs source simulation for INBOUND
     /// (L1→L2) txs.
     pub entry_client: Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
-    /// Committed-root reader: serves every rollup's upstream-
-    /// invariant-6 anchor root (`EEZ.rollups[id].stateRoot`) —
-    /// chain headers are NOT correct for this purpose.
-    pub root_reader: Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
     /// All registered rollups (entry + followers): client + config,
     /// keyed by rollup id. The per-tx dispatch map is built from this
     /// on every composition.
