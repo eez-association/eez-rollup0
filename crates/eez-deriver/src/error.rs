@@ -138,12 +138,12 @@ impl From<eez_payload_codec::CodecError> for DeriverError {
 
 impl From<eez_driver::DriverError> for DeriverError {
     fn from(err: eez_driver::DriverError) -> Self {
-        if err.is_committer_closed() {
-            Self::committer_closed()
-        } else if err.is_invalid_forkchoice() {
-            Self::invalid_forkchoice(err.to_string())
-        } else {
-            Self::invalid_forkchoice(format!("driver: {err}"))
+        match err {
+            eez_driver::DriverError::CommitterClosed => Self::committer_closed(),
+            eez_driver::DriverError::InvalidForkchoice(_) => {
+                Self::invalid_forkchoice(err.to_string())
+            }
+            _ => Self::invalid_forkchoice(format!("driver: {err}")),
         }
     }
 }

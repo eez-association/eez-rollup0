@@ -400,7 +400,7 @@ where
             }
             match self.commit_one(SlotKind::Live, &last_header).await {
                 Ok(()) => {}
-                Err(err) if err.is_stale_parent() => {
+                Err(DriverError::StaleParent { .. }) => {
                     log_stale_parent("backfill.live");
                     break;
                 }
@@ -447,7 +447,7 @@ where
         }
         match self.commit_one(SlotKind::Live, &last_header).await {
             Ok(()) => Ok(()),
-            Err(err) if err.is_stale_parent() => {
+            Err(DriverError::StaleParent { .. }) => {
                 log_stale_parent("live_tick");
                 Ok(())
             }
@@ -508,7 +508,7 @@ where
                     let last_header = self.committer.last_header();
                     match self.commit_one(SlotKind::Live, &last_header).await {
                         Ok(()) => {}
-                        Err(err) if err.is_stale_parent() => {
+                        Err(DriverError::StaleParent { .. }) => {
                             log_stale_parent("catchup.live");
                             return Ok(());
                         }
@@ -538,7 +538,7 @@ where
                 };
                 if let Some(built) = prebuilt {
                     if let Err(err) = self.commit_one_prebuilt(SlotKind::Sync, built).await {
-                        if err.is_stale_parent() {
+                        if matches!(err, DriverError::StaleParent { .. }) {
                             log_stale_parent("catchup.sync.prebuilt");
                             return Ok(());
                         }
@@ -547,7 +547,7 @@ where
                 } else {
                     match self.commit_one(SlotKind::Sync, &last_header).await {
                         Ok(()) => {}
-                        Err(err) if err.is_stale_parent() => {
+                        Err(DriverError::StaleParent { .. }) => {
                             log_stale_parent("catchup.sync");
                             return Ok(());
                         }
@@ -563,7 +563,7 @@ where
                     }
                     match self.commit_one(SlotKind::Live, &last_header).await {
                         Ok(()) => {}
-                        Err(err) if err.is_stale_parent() => {
+                        Err(DriverError::StaleParent { .. }) => {
                             log_stale_parent("slot.live");
                             return Ok(());
                         }
@@ -577,7 +577,7 @@ where
                     }
                     match self.commit_one(SlotKind::Future, &last_header).await {
                         Ok(()) => {}
-                        Err(err) if err.is_stale_parent() => {
+                        Err(DriverError::StaleParent { .. }) => {
                             log_stale_parent("slot.future");
                             return Ok(());
                         }
@@ -642,7 +642,7 @@ where
                 if let Some(built) = prebuilt {
                     match self.commit_one_prebuilt(SlotKind::Sync, built).await {
                         Ok(()) => {}
-                        Err(err) if err.is_stale_parent() => {
+                        Err(DriverError::StaleParent { .. }) => {
                             log_stale_parent("slot.sync.prebuilt");
                         }
                         Err(err) => return Err(err),
@@ -652,7 +652,7 @@ where
 
                 match self.commit_one(SlotKind::Sync, &last_header).await {
                     Ok(()) => {}
-                    Err(err) if err.is_stale_parent() => {
+                    Err(DriverError::StaleParent { .. }) => {
                         log_stale_parent("slot.sync");
                         return Ok(());
                     }
@@ -705,7 +705,10 @@ where
         let current_head = self.committer.last_header().hash();
         let built_parent = built.header.parent_hash();
         if current_head != built_parent {
-            return Err(DriverError::stale_parent(built_parent, current_head));
+            return Err(DriverError::StaleParent {
+                expected: built_parent,
+                actual: current_head,
+            });
         }
         let block_number = built.header.number();
         let block_hash = built.header.hash();
