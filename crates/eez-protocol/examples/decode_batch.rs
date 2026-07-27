@@ -1,7 +1,7 @@
 //! Temporary decoder for the block-1251 postBatch divergence probe.
 use alloy_primitives::{B256, hex};
 use alloy_sol_types::{SolCall, SolValue};
-use eez_evm::types::{ExecutionEntrySol, postAndVerifyBatchCall};
+use eez_protocol::abi::{ExecutionEntrySol, postAndVerifyBatchCall};
 
 fn dump_entry(label: &str, e: &ExecutionEntrySol) {
     println!("== {label} ==");
@@ -148,7 +148,7 @@ fn main() {
     println!("######## DERIVER SyncPair RECONSTRUCTION (build_cross_chain_sync_pairs) ########");
     {
         use alloy_signer_local::PrivateKeySigner;
-        use eez_evm::system_tx::{
+        use eez_protocol::system_tx::{
             SystemTxContext, build_cross_chain_sync_pairs, interleave_sync_block_txs,
         };
         // Partition DA entries exactly like the deriver.

@@ -10,7 +10,7 @@
 //! redesign reshapes [`ProvingContext`] but keeps the trait surface.
 //!
 //! The EEZ `sol!` ABI binding (structs, `postAndVerifyBatch`, and the
-//! `BatchPosted` / `L2ExecutionPerformed` events) lives in `eez-evm` —
+//! `BatchPosted` / `L2ExecutionPerformed` events) lives in `eez-protocol` —
 //! the single ABI source the whole workspace shares. This crate is
 //! just the prover abstraction.
 //!
@@ -23,7 +23,7 @@ use alloy_rpc_types_debug::ExecutionWitness;
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
-use eez_evm::EvmBatch;
+use eez_protocol::EvmBatch;
 use thiserror::Error;
 
 /// Result alias.

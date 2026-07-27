@@ -34,6 +34,7 @@ sol! {
     /// `StateRootMismatch(rollupId)` (`EEZ.sol`) — the soundness
     /// backstop that makes per-rollup same-block append safe
     /// (upstream's invariant 6).
+    #[derive(Debug)]
     struct StateDeltaSol {
         uint256 rollupId;
         bytes32 currentState;
@@ -46,6 +47,7 @@ sol! {
     /// compute the 6-field `crossChainCallHash`. Field declaration
     /// order is the `abi.encode` preimage order — do not reorder
     /// without updating `EEZ.computeCrossChainCallHash`.
+    #[derive(Debug)]
     struct ActionSol {
         uint256 targetRollupId;
         address targetAddress;
@@ -61,6 +63,7 @@ sol! {
     /// `revertSpan > 0` opens an isolated revert context spanning the
     /// next `revertSpan` calls (inclusive of this one). `revertSpan = 0`
     /// is a normal call.
+    #[derive(Debug)]
     struct L2ToL1CallSol {
         address targetAddress;
         uint256 value;
@@ -75,6 +78,7 @@ sol! {
     /// Consumed sequentially from the entry's `expectedL1ToL2Calls`
     /// array. All entries here must succeed — failed reentrant calls
     /// go through [`LookupCallSol`].
+    #[derive(Debug)]
     struct ExpectedL1ToL2CallSol {
         bytes32 crossChainCallHash;
         uint256 callCount;
@@ -89,6 +93,7 @@ sol! {
     /// `(crossChainCallHash, l2ToL1CallNumber, lastL1ToL2CallConsumed,
     /// executingLookupIndex)`. Field order IS the L1 `IEEZ.ExpectedLookup`
     /// abi.encode preimage — do not reorder.
+    #[derive(Debug)]
     struct ExpectedLookupSol {
         bytes32                 crossChainCallHash;
         bytes                   returnData;
@@ -106,6 +111,7 @@ sol! {
     /// observed (upstream PR #28). Part of the lookup MATCH predicate
     /// (full-scan: a candidate matches only when every pin equals the live
     /// `EEZ.rollups(rollupId).stateRoot`). L1-only.
+    #[derive(Debug)]
     struct ExpectedStateRootPerRollupSol {
         uint256 rollupId;
         bytes32 stateRoot;
@@ -120,6 +126,7 @@ sol! {
     /// expressed via `LookupCallSol { failed: true }`. Field order IS the
     /// `IEEZ.ExecutionEntry` abi.encode preimage (origin/main 5c51e02):
     /// `expectedLookups` sits between `expectedL1ToL2Calls` and `callCount`.
+    #[derive(Debug, Default)]
     struct ExecutionEntrySol {
         StateDeltaSol[]            stateDeltas;
         bytes32                    proxyEntryHash;
@@ -138,6 +145,7 @@ sol! {
     /// `crossChainCallHash` + every `expectedStateRoots` pin live (no more
     /// cursor key). Field order IS the `IEEZ.LookupCall` abi.encode
     /// preimage; `expectedStateRoots` is LAST.
+    #[derive(Debug)]
     struct LookupCallSol {
         bytes32                          crossChainCallHash;
         uint256                          destinationRollupId;
@@ -155,6 +163,7 @@ sol! {
     /// [`ProofSystemBatchPerVerificationEntriesSol`] together with the
     /// SUBSET of the batch's global `proofSystems[]` that this rollup
     /// accepts. Indices are `uint64`, strictly increasing.
+    #[derive(Debug)]
     struct RollupIdWithProofSystemsSol {
         uint256   rollupId;
         uint64[]  proofSystemIndex;
@@ -171,6 +180,7 @@ sol! {
     /// sentinel, refused on BOTH sides) and both sides fold
     /// `(0, blockhash(N))` — see `public_inputs_hashes`. It is the LAST
     /// tuple field.
+    #[derive(Debug, Default)]
     struct ProofSystemBatchPerVerificationEntriesSol {
         ExecutionEntrySol[]              entries;
         LookupCallSol[]                  l1ToL2lookupCalls;
@@ -263,6 +273,7 @@ sol! {
 // L1 shape lacks). Field orders ARE the IEEZL2 abi.encode preimages.
 sol! {
     /// One cross-chain call inside an L2 entry's flat `incomingCalls[]`.
+    #[derive(Debug)]
     struct CrossChainCallSol {
         address targetAddress;
         uint256 value;
@@ -274,6 +285,7 @@ sol! {
 
     /// Pre-computed result for a successful reentrant OUTGOING cross-chain
     /// call fired from this L2 during execution.
+    #[derive(Debug)]
     struct ExpectedOutgoingCrossChainCallSol {
         bytes32 crossChainCallHash;
         uint256 callCount;
@@ -285,6 +297,7 @@ sol! {
     /// executingLookupIndex)`. (Note: L2 names the cursor `callNumber` /
     /// `lastOutgoingCallConsumed`, vs L1's `l2ToL1CallNumber` /
     /// `lastL1ToL2CallConsumed` — same roles, self-relative names.)
+    #[derive(Debug)]
     struct L2ExpectedLookupSol {
         bytes32                              crossChainCallHash;
         bytes                                returnData;
@@ -300,6 +313,7 @@ sol! {
 
     /// One L2 execution entry. Leaner than L1: no `stateDeltas`, no
     /// `destinationRollupId`. `proxyEntryHash` is never `bytes32(0)` on L2.
+    #[derive(Debug)]
     struct L2ExecutionEntrySol {
         bytes32                              proxyEntryHash;
         CrossChainCallSol[]                  incomingCalls;
@@ -312,6 +326,7 @@ sol! {
 
     /// L2 top-level lookup — matched by `crossChainCallHash` alone (L2 has
     /// no state roots to pin). No `destinationRollupId` / `expectedStateRoots`.
+    #[derive(Debug)]
     struct L2LookupCallSol {
         bytes32                              crossChainCallHash;
         bytes                                returnData;

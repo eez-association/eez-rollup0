@@ -19,7 +19,7 @@
 //! Tree position (caller's call index, expected-call index, parent
 //! context) is folded into the entry-level rolling hash, not encoded
 //! into the call hash itself. Reverts are tracked via `revertSpan`
-//! on the [`crate::types::L2ToL1CallSol`] slot.
+//! on the [`crate::abi::L2ToL1CallSol`] slot.
 //!
 //! On-chain mirror: `EEZ.computeCrossChainCallHash` (public pure) at
 //! `sync-rollups-protocol/src/EEZ.sol:1243`; same byte semantics in
@@ -32,11 +32,11 @@
 //! `LookupCall.crossChainCallHash` on lookup calls. Values are
 //! byte-identical; only the struct-field names diverge.
 
+use crate::RollupId;
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_sol_types::SolValue;
-use eez_protocol::RollupId;
 
-use crate::types::ActionSol;
+use crate::abi::ActionSol;
 
 /// Compute the 6-field cross-chain call hash (invariant 5).
 ///

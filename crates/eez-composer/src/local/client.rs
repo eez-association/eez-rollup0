@@ -29,10 +29,9 @@ use reth_primitives_traits::SignerRecoverable;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::{BlockNumReader, HeaderProvider, StateProvider, StateProviderFactory};
 
-use eez_evm::EvmProtocol;
 use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
 use eez_protocol::{
-    ChainClient, CommittedRootReader, Dispatcher, EntryChainClient, ExecutorError,
+    ChainClient, CommittedRootReader, CompositionBuilder, EntryChainClient, ExecutorError,
     ExecutorErrorKind, ExecutorResult, ProxyLookupConfig, RollupId, TargetBatchSimulation,
     TargetExecutionSession, TargetTransaction,
 };
@@ -45,7 +44,7 @@ use super::session::{LocalExecutionSession, simulate_local_transactions};
 /// Both variants carry `dispatch_address` — the contract holding this
 /// chain's `authorizedProxies` mapping (and, for `EvmL1Style` chains,
 /// the canonical committed-root storage). The slot is derived from the
-/// client's [`eez_evm::ChainDialect`] (stored alongside) at
+/// client's [`eez_protocol::ChainDialect`] (stored alongside) at
 /// `proxy_lookup_config` time.
 #[derive(Debug, Clone)]
 pub enum Role {
@@ -108,7 +107,7 @@ pub struct LocalChainClient<Provider, EvmConfig> {
     /// honestly: only `EvmL1Style` clients actually serve canonical
     /// committed-root reads (the L1 `EEZ.sol` storage layout
     /// `compute_state_root_slot` assumes).
-    dialect: eez_evm::ChainDialect,
+    dialect: eez_protocol::ChainDialect,
     /// Bidirectional overlay channel for shared-source-state nested
     /// dispatch. `Some(channel)` only on entry-role clients —
     /// populated by the source-sim inspector with source's in-flight
@@ -164,7 +163,7 @@ where
         rollup_id: RollupId,
         dispatch_address: Address,
         ccm_address: Address,
-        dialect: eez_evm::ChainDialect,
+        dialect: eez_protocol::ChainDialect,
     ) -> Arc<Self> {
         let cp = Self::build_chain_provider(&provider, &chain_spec);
         Arc::new(Self {
@@ -195,7 +194,7 @@ where
         rollup_id: RollupId,
         dispatch_address: Address,
         ccm_address: Address,
-        dialect: eez_evm::ChainDialect,
+        dialect: eez_protocol::ChainDialect,
     ) -> Arc<Self> {
         let cp = Self::build_chain_provider(&provider, &chain_spec);
         Arc::new(Self {
@@ -218,7 +217,7 @@ where
     /// not from role — in the L2-as-entry topology an entry uses the
     /// L2 slot. Consumed by source-sim and target-session inspectors
     /// via the shared [`SessionInspectorFactory`].
-    fn proxy_lookup_config(&self) -> ProxyLookupConfig<EvmProtocol> {
+    fn proxy_lookup_config(&self) -> ProxyLookupConfig {
         // Slot derives from dialect (per Codex's design constraint:
         // ChainDialect terminates at config accessors — `LocalChainClient`
         // reads the plain `u8` slot; the dialect itself never crosses
@@ -237,7 +236,7 @@ where
         rollups_address: Address,
         target_rollup_id: RollupId,
     ) -> ExecutorResult<[u8; 32]> {
-        let root_slot = eez_evm::action::compute_state_root_slot(target_rollup_id);
+        let root_slot = eez_protocol::action::compute_state_root_slot(target_rollup_id);
         let value = state
             .storage(rollups_address, root_slot)
             .map_err(ExecutorError::provider)?
@@ -259,11 +258,9 @@ where
         + 'static,
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives> + Clone + Send + Sync + 'static,
 {
-    type Protocol = EvmProtocol;
-
     async fn begin_execution_session(
         &self,
-    ) -> ExecutorResult<Box<dyn TargetExecutionSession<Protocol = EvmProtocol> + Send>> {
+    ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
         tracing::debug!(
             rollup_id = %self.rollup_id,
             ccm = %self.ccm_address,
@@ -340,7 +337,7 @@ where
 
     async fn simulate_transactions(
         &self,
-        txs: &[TargetTransaction<EvmProtocol>],
+        txs: &[TargetTransaction],
     ) -> ExecutorResult<TargetBatchSimulation> {
         simulate_local_transactions(&self.provider, txs)
     }
@@ -380,7 +377,7 @@ where
     async fn simulate_source_tx(
         &self,
         raw_tx: Vec<u8>,
-        dispatcher: &mut (dyn Dispatcher<Protocol = EvmProtocol> + Send),
+        dispatcher: &mut CompositionBuilder,
     ) -> ExecutorResult<()> {
         use alloy_eips::eip2718::Decodable2718;
         use std::time::Instant;
@@ -573,7 +570,7 @@ where
         // the storage-slot math `compute_state_root_slot` assumes the
         // L1 `EEZ.sol` layout. L2-style clients return `Unavailable`
         // so a misregistered root_reader fails loudly at first dispatch.
-        if self.dialect != eez_evm::ChainDialect::EvmL1Style {
+        if self.dialect != eez_protocol::ChainDialect::EvmL1Style {
             return Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
                 "stored_target_state_root called on a non-L1 LocalChainClient \
                  (only EvmL1Style clients hold canonical committed-root storage)"

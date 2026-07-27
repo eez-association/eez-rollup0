@@ -20,7 +20,7 @@ use clap::Parser;
 use eez_control_rpc::v1::{
     ProveChunk, ProveResponse, prove_chunk, prover_server::Prover, prover_server::ProverServer,
 };
-use eez_evm::EcdsaProofSigner;
+use eez_protocol::EcdsaProofSigner;
 use tonic::{Request, Response, Status, Streaming, transport::Server};
 use tracing::{Level, event};
 
@@ -144,7 +144,7 @@ impl Prover for ProveSvc {
             .map_err(|e| Status::failed_precondition(format!("publicInputsHash: {e}")))?;
 
         // 3. Settlement-chain gate (telescope + effect-prefix roots).
-        let batch = eez_evm::entries::decode_postbatch(&pb.abi_calldata)
+        let batch = eez_protocol::entries::decode_postbatch(&pb.abi_calldata)
             .map_err(|e| Status::invalid_argument(format!("decode postBatch: {e}")))?;
         // Single-call window: the batch anchor is the re-executed parent root.
         let sync_rlp = staged.last().map_or(&[][..], |b| b.rlp.as_slice());
