@@ -19,14 +19,12 @@ eez-protocol.workspace = true
 # submission. The provider stack is wallet-filled by the caller; this
 # crate only depends on the trait surface, not on a concrete transport.
 alloy-primitives.workspace = true
-alloy-sol-types.workspace = true
 
 # EVM inspector (the one genuinely EVM-coupled piece in this crate)
 revm.workspace = true
 
 # Async traits for the sync→async bridge inside Inspector::call AND
 # the Phase 09 submitter's `ProofPlanResolver` consumer.
-async-trait.workspace = true
 
 # Tokio runtime handle for the sync→async bridge inside Inspector::call
 tokio.workspace = true
