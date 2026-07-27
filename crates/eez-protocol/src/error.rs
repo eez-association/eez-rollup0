@@ -43,6 +43,15 @@
 /// about `Box<dyn Error>` — any `impl std::error::Error + Send + Sync
 /// + 'static` (or a `String`) converts in via `.into()` at the
 /// construction site.
+// TODO(post-#58): the `map_err(|e| ExecutorError::Provider(e.into()))`
+// ceremony at construction sites exists only because this enum lives in
+// the vocabulary crate, which cannot name reth's error types (orphan rule
+// blocks `From<reth ProviderError>` here, and a blanket `impl<E: Into<..>>
+// From<E>` collides with the reflexive `From<T> for T`). Once the 3-crate
+// restructure (PR #58) lands, move `ExecutorError` into eez-node next to
+// its producers and give the variants typed `#[from]` payloads
+// (`Provider(#[from] ProviderError)`, `Evm(#[from] EVMError<..>)`) so the
+// bare boxing sites collapse to `?`.
 pub(crate) type BoxedError = Box<dyn std::error::Error + Send + Sync>;
 
 // ── ProtocolError ────────────────────────────────────────────────
