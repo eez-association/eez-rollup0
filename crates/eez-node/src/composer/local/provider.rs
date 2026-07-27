@@ -5,12 +5,12 @@
 //! simulation needs:
 //!
 //! - type-erased `StateProviderFactory` (for opening a state snapshot)
-//! - type-erased [`HeaderReader`] (dyn-compatible wrapper around
-//!   `HeaderProvider`, which has generic methods that block direct
+//! - [`HeaderSource`] (concrete enum over the node's two provider
+//!   families; `HeaderProvider` has generic methods that block direct
 //!   `dyn` use)
 //! - `EthEvmConfig` (for building EVM envs from headers)
 //!
-//! Held once per rollup inside [`crate::composer::composer::local::LocalChainClient`]
+//! Held once per rollup inside [`crate::composer::local::LocalChainClient`]
 //! and cloned cheaply per execution-session open.
 
 use std::sync::Arc;
@@ -18,33 +18,59 @@ use std::sync::Arc;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderFactory};
 
-/// Dyn-compatible header reader (`HeaderProvider` has generic methods
-/// that prevent `dyn HeaderProvider`).
-pub trait HeaderReader: Send + Sync {
-    /// Look up a block header by number. Returns `Ok(None)` if the
-    /// block does not exist.
-    fn header_by_number(
-        &self,
-        num: u64,
-    ) -> Result<Option<alloy_consensus::Header>, Box<dyn std::error::Error + Send + Sync>>;
+use super::gnosis_adapter::GnosisL1Adapter;
+use crate::{ChiadoNodeProvider, EthNodeProvider};
 
-    /// Highest known block number.
-    fn best_block_number(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
+/// Concrete header source over the two provider families the node runs.
+/// (`HeaderProvider` has generic methods that prevent `dyn HeaderProvider`;
+/// this enum replaces the old dyn-compatible `HeaderReader` seam.)
+#[derive(Clone)]
+pub enum HeaderSource {
+    /// `EthereumNode`-backed provider (the L2 node and the embedded dev L1).
+    Eth(EthNodeProvider),
+    /// Chiado L1 provider behind the Gnosis header shim.
+    Chiado(GnosisL1Adapter<ChiadoNodeProvider>),
 }
 
-impl<T> HeaderReader for T
-where
-    T: HeaderProvider<Header = alloy_consensus::Header> + BlockNumReader + Send + Sync,
-{
-    fn header_by_number(
+impl HeaderSource {
+    /// Look up a block header by number. Returns `Ok(None)` if the
+    /// block does not exist.
+    pub fn header_by_number(
         &self,
         num: u64,
     ) -> Result<Option<alloy_consensus::Header>, Box<dyn std::error::Error + Send + Sync>> {
-        HeaderProvider::header_by_number(self, num).map_err(|e| Box::new(e) as _)
+        match self {
+            Self::Eth(p) => HeaderProvider::header_by_number(p, num).map_err(|e| Box::new(e) as _),
+            Self::Chiado(p) => {
+                HeaderProvider::header_by_number(p, num).map_err(|e| Box::new(e) as _)
+            }
+        }
     }
 
-    fn best_block_number(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        BlockNumReader::best_block_number(self).map_err(|e| Box::new(e) as _)
+    /// Highest known block number.
+    pub fn best_block_number(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            Self::Eth(p) => BlockNumReader::best_block_number(p).map_err(|e| Box::new(e) as _),
+            Self::Chiado(p) => BlockNumReader::best_block_number(p).map_err(|e| Box::new(e) as _),
+        }
+    }
+
+    /// Erase this source into the reth `StateProviderFactory` view —
+    /// the state half of [`ChainProvider`], sharing the same provider.
+    pub fn state_factory(&self) -> Arc<dyn StateProviderFactory> {
+        match self {
+            Self::Eth(p) => Arc::new(p.clone()),
+            Self::Chiado(p) => Arc::new(p.clone()),
+        }
+    }
+}
+
+impl std::fmt::Debug for HeaderSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Eth(_) => f.debug_tuple("Eth").field(&"..").finish(),
+            Self::Chiado(_) => f.debug_tuple("Chiado").field(&"..").finish(),
+        }
     }
 }
 
@@ -52,8 +78,8 @@ where
 pub struct ChainProvider {
     /// State provider factory — `.latest()` opens a fresh state snapshot.
     pub provider: Arc<dyn StateProviderFactory>,
-    /// Header reader — dyn-compatible wrapper around `HeaderProvider`.
-    pub headers: Arc<dyn HeaderReader>,
+    /// Header source — concrete enum over the node's provider families.
+    pub headers: HeaderSource,
     /// EVM config for building envs from headers.
     pub evm_config: EthEvmConfig,
 }
@@ -62,7 +88,7 @@ impl Clone for ChainProvider {
     fn clone(&self) -> Self {
         Self {
             provider: Arc::clone(&self.provider),
-            headers: Arc::clone(&self.headers),
+            headers: self.headers.clone(),
             evm_config: self.evm_config.clone(),
         }
     }

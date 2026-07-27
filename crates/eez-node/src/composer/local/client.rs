@@ -26,13 +26,13 @@ use reth_evm::{ConfigureEvm, Evm as _};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::SignerRecoverable;
 use reth_revm::{database::StateProviderDatabase, db::State};
-use reth_storage_api::{BlockNumReader, HeaderProvider, StateProvider, StateProviderFactory};
+use reth_storage_api::{StateProvider, StateProviderFactory};
 
 use crate::composer::{ChainClient, CompositionBuilder, ProxyLookupConfig, TargetExecutionSession};
 use crate::inspector::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
 use eez_protocol::{ExecutorError, ExecutorErrorKind, ExecutorResult, RollupId};
 
-use super::provider::{ChainProvider, HeaderReader};
+use super::provider::{ChainProvider, HeaderSource};
 use super::session::LocalExecutionSession;
 
 /// Discriminates how this client operates within the composition.
@@ -109,21 +109,11 @@ impl std::fmt::Debug for LocalChainClient {
 }
 
 impl LocalChainClient {
-    fn build_chain_provider<P>(provider: &P, evm_config: EthEvmConfig) -> ChainProvider
-    where
-        P: StateProviderFactory
-            + HeaderProvider<Header = alloy_consensus::Header>
-            + BlockNumReader
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-    {
-        let headers: Arc<dyn HeaderReader> = Arc::new(provider.clone());
-        let state_provider: Arc<dyn StateProviderFactory> = Arc::new(provider.clone());
+    fn build_chain_provider(provider: HeaderSource, evm_config: EthEvmConfig) -> ChainProvider {
+        let state_provider: Arc<dyn StateProviderFactory> = provider.state_factory();
         ChainProvider {
             provider: state_provider,
-            headers,
+            headers: provider,
             evm_config,
         }
     }
@@ -134,24 +124,15 @@ impl LocalChainClient {
     /// AND `Arc<dyn CommittedRootReader>` (for [`ComposerBuilder::root_reader`](eez_protocol::composer::ComposerBuilder::root_reader))
     /// when the entry chain is L1. The two trait views share one
     /// allocation; cheap.
-    pub fn new_entry<P>(
-        provider: P,
+    pub fn new_entry(
+        provider: HeaderSource,
         evm_config: EthEvmConfig,
         rollup_id: RollupId,
         dispatch_address: Address,
         ccm_address: Address,
         dialect: eez_protocol::ChainDialect,
-    ) -> Arc<Self>
-    where
-        P: StateProviderFactory
-            + HeaderProvider<Header = alloy_consensus::Header>
-            + BlockNumReader
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-    {
-        let cp = Self::build_chain_provider(&provider, evm_config);
+    ) -> Arc<Self> {
+        let cp = Self::build_chain_provider(provider, evm_config);
         Arc::new(Self {
             provider: cp,
             rollup_id,
@@ -170,24 +151,15 @@ impl LocalChainClient {
     /// traits unconditionally; the constructed instance only honestly
     /// answers committed-root reads when the dialect matches the
     /// underlying contract's storage layout.
-    pub fn new_follower<P>(
-        provider: P,
+    pub fn new_follower(
+        provider: HeaderSource,
         evm_config: EthEvmConfig,
         rollup_id: RollupId,
         dispatch_address: Address,
         ccm_address: Address,
         dialect: eez_protocol::ChainDialect,
-    ) -> Arc<Self>
-    where
-        P: StateProviderFactory
-            + HeaderProvider<Header = alloy_consensus::Header>
-            + BlockNumReader
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-    {
-        let cp = Self::build_chain_provider(&provider, evm_config);
+    ) -> Arc<Self> {
+        let cp = Self::build_chain_provider(provider, evm_config);
         Arc::new(Self {
             provider: cp,
             rollup_id,

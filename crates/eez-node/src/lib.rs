@@ -19,6 +19,21 @@
 //! - Node plumbing: [`bundle_rpc`], [`follower`], [`ingress`],
 //!   [`l1_embedded`], [`mock_prover`], [`payload`], [`witness_source`].
 
+/// Concrete reth provider of the eez L2 node and the embedded dev L1
+/// (both launched as `EthereumNode` over mdbx).
+pub type EthNodeProvider = reth_provider::providers::BlockchainProvider<
+    reth_node_builder::NodeTypesWithDBAdapter<
+        reth_node_ethereum::EthereumNode,
+        reth_db::DatabaseEnv,
+    >,
+>;
+
+/// Concrete reth provider of the embedded chiado L1
+/// (`reth_gnosis::GnosisNode` over mdbx).
+pub type ChiadoNodeProvider = reth_provider::providers::BlockchainProvider<
+    reth_node_builder::NodeTypesWithDBAdapter<reth_gnosis::GnosisNode, reth_db::DatabaseEnv>,
+>;
+
 pub mod bundle_rpc;
 pub mod composer;
 pub mod deriver;

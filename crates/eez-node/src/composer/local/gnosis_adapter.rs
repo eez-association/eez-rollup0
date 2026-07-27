@@ -3,7 +3,7 @@
 //!
 //! `LocalChainClient` requires
 //! `HeaderProvider<Header = alloy_consensus::Header>` (plus the usual
-//! `StateProviderFactory + BlockNumReader + HeaderReader` cluster).
+//! `StateProviderFactory + BlockNumReader + HeaderSource` cluster).
 //! The chiado L1 reth instance is launched with
 //! `reth_gnosis::GnosisNode`, whose provider exposes
 //! `HeaderProvider<Header = gnosis_primitives::header::GnosisHeader>`.
@@ -28,8 +28,6 @@ use gnosis_primitives::header::GnosisHeader;
 use reth_storage_api::{
     BlockHashReader, BlockIdReader, BlockNumReader, HeaderProvider, StateProviderFactory,
 };
-
-use super::provider::HeaderReader as LocalHeaderReader;
 
 /// Wraps a chiado L1 provider (`HeaderProvider<Header = GnosisHeader>`)
 /// and exposes `HeaderProvider<Header = alloy_consensus::Header>` —
@@ -79,7 +77,7 @@ impl<P> std::fmt::Debug for GnosisL1Adapter<P> {
 /// operator's deploy.sh guards against. Quietly dropping aura fields
 /// here would mean a malformed alloy header (its hash wouldn't match
 /// the source GnosisHeader's hash), breaking every downstream
-/// HeaderReader caller.
+/// HeaderSource caller.
 #[inline]
 fn convert_header(gnosis: GnosisHeader) -> alloy_consensus::Header {
     assert!(
@@ -305,18 +303,4 @@ where
     > {
         self.inner.maybe_pending()
     }
-}
-
-// `HeaderReader` (local trait) is auto-impl'd for any
-// `HeaderProvider<Header = alloy_consensus::Header> + Send + Sync` via
-// the blanket impl in `super::provider`. The adapter's
-// `HeaderProvider` impl above already returns
-// `alloy_consensus::Header`, so the blanket applies — no explicit impl
-// needed. The bound is re-stated here for documentation.
-#[allow(dead_code)]
-fn _assert_local_header_reader<P>()
-where
-    P: HeaderProvider<Header = GnosisHeader> + Send + Sync + 'static,
-    GnosisL1Adapter<P>: LocalHeaderReader,
-{
 }

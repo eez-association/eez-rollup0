@@ -7,7 +7,7 @@
 //!
 //! - [`LocalChainClient`] — unified chain client impl (entry or follower)
 //! - [`LocalExecutionSession`] — stateful per-source-tx target session
-//! - [`provider::ChainProvider`] / [`provider::HeaderReader`] — reth
+//! - [`provider::ChainProvider`] / [`provider::HeaderSource`] — reth
 //!   state access abstractions
 
 pub(crate) mod build;
@@ -22,6 +22,8 @@ pub use build::{BuildError, BuiltSyncBlock, build_sync_block, sync_block_pair_ro
 pub use client::LocalChainClient;
 #[doc(inline)]
 pub use gnosis_adapter::GnosisL1Adapter;
+#[doc(inline)]
+pub use provider::HeaderSource;
 // `Role` + `LocalExecutionSession` are implementation details of
 // `local.rs` and `session.rs`; not re-exported beyond the crate.
 #[allow(unused_imports, reason = "future test/public consumers")]

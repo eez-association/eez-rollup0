@@ -481,6 +481,7 @@ fn main() -> eyre::Result<()> {
             );
             let evm_composer: Option<WiringParts> =
                 if let Some(l1_variant) = embedded_l1.as_ref() {
+                    use eez_node::composer::local::HeaderSource;
                     use eez_node::composer::{GnosisL1Adapter, LocalChainClient};
                     use eez_protocol::rollup_id::RollupId;
                     use eez_node::composer::{ProxyLookupConfig, TargetConfig};
@@ -503,7 +504,7 @@ fn main() -> eyre::Result<()> {
                             let l1_provider = l1_handle.node.provider.clone();
                             let l1_evm_config = l1_handle.node.evm_config.clone();
                             let entry_client = LocalChainClient::new_entry(
-                                l1_provider,
+                                HeaderSource::Eth(l1_provider),
                                 l1_evm_config,
                                 l1_rollup_id,
                                 eez_registry,
@@ -536,7 +537,7 @@ fn main() -> eyre::Result<()> {
                             let l1_evm_config =
                                 reth_evm_ethereum::EthEvmConfig::new(Arc::clone(&l1_chain_spec));
                             let entry_client = LocalChainClient::new_entry(
-                                l1_provider,
+                                HeaderSource::Chiado(l1_provider),
                                 l1_evm_config,
                                 l1_rollup_id,
                                 eez_registry,
@@ -561,7 +562,7 @@ fn main() -> eyre::Result<()> {
                     // `ccm_address` = CCM-L2 predeploy (where
                     // authorizedProxies lives at slot 2).
                     let l2_follower = LocalChainClient::new_follower(
-                        provider.clone(),
+                        HeaderSource::Eth(provider.clone()),
                         evm_config.clone(),
                         l2_rollup_id_typed,
                         ccm_l2,
@@ -578,7 +579,7 @@ fn main() -> eyre::Result<()> {
                     // Role::Entry) — the follower client errors `Unavailable` for
                     // the outbound source-sim `simulate_and_resolve_recorded_for`.
                     let l2_entry = LocalChainClient::new_entry(
-                        provider.clone(),
+                        HeaderSource::Eth(provider.clone()),
                         evm_config.clone(),
                         l2_rollup_id_typed,
                         ccm_l2,
