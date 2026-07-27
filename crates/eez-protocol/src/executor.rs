@@ -52,12 +52,12 @@ use alloy_primitives::{Address, Bytes, U256};
 
 use crate::checkpoint::ExecutionCheckpoint;
 use crate::composition::CompositionBuilder;
-use crate::error::ExecutorResult;
 #[allow(
     unused_imports,
-    reason = "ExecutorError / its Kind enum used in rustdoc intra-doc links"
+    reason = "ExecutorError used in rustdoc intra-doc links"
 )]
-use crate::error::{ExecutorError, ExecutorErrorKind};
+use crate::error::ExecutorError;
+use crate::error::ExecutorResult;
 use crate::rollup_id::RollupId;
 use crate::types::ExecutionOutcome;
 
@@ -134,7 +134,7 @@ pub struct TargetBatchSimulation {
     /// Cumulative post-state root after each transaction in the batch.
     /// `per_tx_roots[i]` is the state root once `txs[0..=i]` are
     /// committed. Empty batches are rejected with
-    /// [`ExecutorErrorKind::EmptyBatch`],
+    /// [`ExecutorError::EmptyBatch`],
     /// so this vector is always non-empty when `simulate_transactions`
     /// returns `Ok`.
     pub per_tx_roots: Vec<[u8; 32]>,
@@ -182,10 +182,10 @@ pub trait TargetExecutionSession: Send {
     /// # Errors
     ///
     /// Returns any [`ExecutorError`] depending on the impl — local
-    /// impls surface [`ExecutorErrorKind::Evm`] /
-    /// [`ExecutorErrorKind::Provider`]; the gRPC impl surfaces
-    /// [`ExecutorErrorKind::Transport`] / [`ExecutorErrorKind::Serde`] /
-    /// [`ExecutorErrorKind::Missing`].
+    /// impls surface [`ExecutorError::Evm`] /
+    /// [`ExecutorError::Provider`]; the gRPC impl surfaces
+    /// [`ExecutorError::Transport`] / [`ExecutorError::Serde`] /
+    /// [`ExecutorError::Missing`].
     async fn execute(
         &mut self,
         req: ExecutionRequest,
@@ -212,8 +212,8 @@ pub trait TargetExecutionSession: Send {
     ///
     /// Implementation-dependent — `LocalChainClient` is infallible
     /// (deep-clones revm `State<DB>`'s 7 fields); the gRPC impl can
-    /// surface [`ExecutorErrorKind::Transport`] /
-    /// [`ExecutorErrorKind::Missing`].
+    /// surface [`ExecutorError::Transport`] /
+    /// [`ExecutorError::Missing`].
     async fn checkpoint(&mut self) -> ExecutorResult<SessionSnapshot>;
 
     /// Restore the session to the state captured by `snapshot`. The
@@ -222,7 +222,7 @@ pub trait TargetExecutionSession: Send {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Decode`] if the snapshot's
+    /// Returns [`ExecutorError::Decode`] if the snapshot's
     /// concrete type does not match this session's snapshot shape.
     async fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()>;
 
@@ -258,8 +258,8 @@ pub trait ChainClient: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Provider`] if the underlying state
-    /// provider is inaccessible; [`ExecutorErrorKind::Unavailable`] when
+    /// Returns [`ExecutorError::Provider`] if the underlying state
+    /// provider is inaccessible; [`ExecutorError::Unavailable`] when
     /// the implementation does not (or cannot) report its own header
     /// (e.g. a remote gRPC peer that does not expose this).
     async fn current_state_root(&self) -> ExecutorResult<[u8; 32]>;
@@ -271,9 +271,9 @@ pub trait ChainClient: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns any [`ExecutorError`] depending on impl — local surfaces
-    /// [`ExecutorErrorKind::Provider`] / [`ExecutorErrorKind::Evm`] /
-    /// [`ExecutorErrorKind::Missing`]; gRPC surfaces
-    /// [`ExecutorErrorKind::Transport`].
+    /// [`ExecutorError::Provider`] / [`ExecutorError::Evm`] /
+    /// [`ExecutorError::Missing`]; gRPC surfaces
+    /// [`ExecutorError::Transport`].
     async fn begin_execution_session(
         &self,
     ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>>;
@@ -285,10 +285,10 @@ pub trait ChainClient: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns any [`ExecutorError`] depending on impl — local surfaces
-    /// [`ExecutorErrorKind::TargetTransactionReverted`] (contract-level
-    /// revert) or [`ExecutorErrorKind::Evm`] (internal execution
-    /// failure); gRPC surfaces [`ExecutorErrorKind::Transport`] /
-    /// [`ExecutorErrorKind::Serde`].
+    /// [`ExecutorError::TargetTransactionReverted`] (contract-level
+    /// revert) or [`ExecutorError::Evm`] (internal execution
+    /// failure); gRPC surfaces [`ExecutorError::Transport`] /
+    /// [`ExecutorError::Serde`].
     async fn simulate_transactions(
         &self,
         txs: &[TargetTransaction],
@@ -317,9 +317,9 @@ pub trait EntryChainClient: ChainClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Decode`] if the raw tx cannot be
-    /// decoded. Returns [`ExecutorErrorKind::Provider`] if the source
-    /// state provider is inaccessible. Returns [`ExecutorErrorKind::Evm`]
+    /// Returns [`ExecutorError::Decode`] if the raw tx cannot be
+    /// decoded. Returns [`ExecutorError::Provider`] if the source
+    /// state provider is inaccessible. Returns [`ExecutorError::Evm`]
     /// if source EVM execution fails. Propagates any [`ExecutorError`]
     /// surfaced by `dispatcher` during proxy call dispatch.
     async fn simulate_source_tx(
@@ -363,9 +363,9 @@ pub trait CommittedRootReader: ChainClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Provider`] if the underlying state
-    /// provider is inaccessible; [`ExecutorErrorKind::Transport`] for
-    /// gRPC implementations; [`ExecutorErrorKind::Unavailable`] if the
+    /// Returns [`ExecutorError::Provider`] if the underlying state
+    /// provider is inaccessible; [`ExecutorError::Transport`] for
+    /// gRPC implementations; [`ExecutorError::Unavailable`] if the
     /// implementation cannot serve this capability (e.g. a non-L1
     /// node — though in practice such an impl would not be wrapped as
     /// `Arc<dyn CommittedRootReader>` in the first place).

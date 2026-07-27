@@ -34,7 +34,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::{
-    ExecutorError, ExecutorErrorKind, ExecutorResult, ProofPlan, RollupId, RollupProofAssignment,
+    ExecutorError, ExecutorResult, ProofPlan, RollupId, RollupProofAssignment,
     TimestampAndBlockHash,
 };
 use alloy_network::Ethereum;
@@ -154,9 +154,7 @@ impl RollupReader for AlloyRollupReader {
                 // (vs `Transport` for raw HTTP/gRPC stack
                 // failures); keep all three reads in this impl
                 // consistent.
-                ExecutorError::from(ExecutorErrorKind::Provider(
-                    format!("EEZ.rollups({}): {e}", rid.0).into(),
-                ))
+                ExecutorError::Provider(format!("EEZ.rollups({}): {e}", rid.0).into())
             })?;
         Ok(resp.rollupContract)
     }
@@ -172,9 +170,9 @@ impl RollupReader for AlloyRollupReader {
             .call()
             .await
             .map_err(|e| {
-                ExecutorError::from(ExecutorErrorKind::Provider(
+                ExecutorError::Provider(
                     format!("checkProofSystemsAndGetVkeys @ {rollup_contract}: {e}").into(),
-                ))
+                )
             })?;
         Ok(vkeys.into_iter().map(Into::into).collect())
     }
@@ -195,9 +193,9 @@ impl RollupReader for AlloyRollupReader {
             .call()
             .await
             .map_err(|e| {
-                ExecutorError::from(ExecutorErrorKind::Provider(
+                ExecutorError::Provider(
                     format!("getTimestampAndBlockHash @ {rollup_contract}: {e}").into(),
-                ))
+                )
             })?;
         Ok(TimestampAndBlockHash {
             timestamp: resp.timestamp.to_be_bytes::<32>(),
@@ -312,11 +310,11 @@ impl<R: RollupReader> ProofPlanResolver<R> {
         };
         sorted.sort_by_key(|r| r.0);
         if sorted.is_empty() {
-            return Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
+            return Err(ExecutorError::Unavailable(
                 "ProofPlanResolver::resolve: touched set is empty (postBatch \
                  requires at least one rollup per EEZ.sol)"
                     .into(),
-            )));
+            ));
         }
 
         // Per-rollup on-chain reads. One round-trip per rollup per
@@ -339,30 +337,28 @@ impl<R: RollupReader> ProofPlanResolver<R> {
         for rid in &sorted {
             let manager = self.reader.rollup_contract(*rid).await?;
             if manager == Address::ZERO {
-                return Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
-                    format!(
-                        "EEZ.rollups({}).rollupContract == 0 — rollup not registered",
-                        rid.0
-                    ),
+                return Err(ExecutorError::Unavailable(format!(
+                    "EEZ.rollups({}).rollupContract == 0 — rollup not registered",
+                    rid.0
                 )));
             }
             // checkProofSystemsAndGetVkeys reverts if any candidate
             // isn't in the rollup's allowed set OR if
             // candidates.length < threshold. Both surface as
-            // ExecutorErrorKind::Provider; the resolver doesn't
+            // ExecutorError::Provider; the resolver doesn't
             // try to distinguish here.
             let vkeys = self
                 .reader
                 .check_proof_systems_and_get_vkeys(manager, candidates)
                 .await?;
             if vkeys.len() != ps_count {
-                return Err(ExecutorError::from(ExecutorErrorKind::Decode(format!(
+                return Err(ExecutorError::Decode(format!(
                     "checkProofSystemsAndGetVkeys returned {} vkeys for {} candidates \
                      (rollup_id={})",
                     vkeys.len(),
                     ps_count,
                     rid.0,
-                ))));
+                )));
             }
             let context = self.reader.timestamp_and_block_hash(manager).await?;
 
@@ -389,9 +385,9 @@ impl<R: RollupReader> ProofPlanResolver<R> {
         // with an `eth_call` revert. Fail loud per upstream's
         // invariant 7.
         plan.check_invariants().map_err(|e| {
-            ExecutorError::from(ExecutorErrorKind::Decode(format!(
+            ExecutorError::Decode(format!(
                 "ProofPlanResolver produced an invariant-violating plan: {e}"
-            )))
+            ))
         })?;
 
         Ok(plan)
@@ -435,9 +431,9 @@ mod tests {
                 match self.vkeys.get(&(rollup_contract, *ps)) {
                     Some(Some(vk)) => out.push(*vk),
                     Some(None) | None => {
-                        return Err(ExecutorError::from(ExecutorErrorKind::Provider(
+                        return Err(ExecutorError::Provider(
                             format!("ProofSystemNotAllowed({ps})").into(),
-                        )));
+                        ));
                     }
                 }
             }
@@ -526,7 +522,7 @@ mod tests {
         let reader = fake_with_one_rollup();
         let resolver = ProofPlanResolver::new(reader, vec![PS_A]).unwrap();
         let err = resolver.resolve(&[]).await.unwrap_err();
-        assert!(matches!(err.kind(), ExecutorErrorKind::Unavailable(_)));
+        assert!(matches!(err, ExecutorError::Unavailable(_)));
     }
 
     #[tokio::test]
@@ -535,7 +531,7 @@ mod tests {
         // registry empty → rollup_contract returns ZERO
         let resolver = ProofPlanResolver::new(reader, vec![PS_A]).unwrap();
         let err = resolver.resolve(&[RollupId(42)]).await.unwrap_err();
-        assert!(matches!(err.kind(), ExecutorErrorKind::Unavailable(_)));
+        assert!(matches!(err, ExecutorError::Unavailable(_)));
     }
 
     #[tokio::test]
@@ -545,7 +541,7 @@ mod tests {
         // MGR_1 doesn't have PS_A in its vkey map → reverts
         let resolver = ProofPlanResolver::new(reader, vec![PS_A]).unwrap();
         let err = resolver.resolve(&[RollupId(1)]).await.unwrap_err();
-        assert!(matches!(err.kind(), ExecutorErrorKind::Provider(_)));
+        assert!(matches!(err, ExecutorError::Provider(_)));
     }
 
     // ── Canonical ordering ────────────────────────────────────

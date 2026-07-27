@@ -100,9 +100,8 @@ pub use composition::{CompositionBuilder, Rollup};
 pub use dialect::ChainDialect;
 #[doc(inline)]
 pub use error::{
-    ComposerError, ComposerErrorKind, ComposerResult, CompositionError, CompositionErrorKind,
-    CompositionResult, ExecutorError, ExecutorErrorKind, ExecutorResult, ProtocolError,
-    ProtocolErrorKind, ProtocolResult,
+    ComposerError, ComposerResult, CompositionError, CompositionResult, ExecutorError,
+    ExecutorResult, ProtocolError, ProtocolResult,
 };
 #[doc(inline)]
 pub use executor::{

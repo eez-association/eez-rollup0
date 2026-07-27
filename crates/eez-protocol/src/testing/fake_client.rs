@@ -25,7 +25,7 @@
 //!
 //! # Default behavior
 //!
-//! Every method returns [`ExecutorErrorKind::Unavailable`] when its
+//! Every method returns [`ExecutorError::Unavailable`] when its
 //! queue or hook is unset — loud, structured, easy to diagnose. Never
 //! `unimplemented!()`.
 
@@ -36,7 +36,7 @@ use async_trait::async_trait;
 
 use crate::checkpoint::ExecutionCheckpoint;
 use crate::composition::CompositionBuilder;
-use crate::error::{ExecutorError, ExecutorErrorKind, ExecutorResult};
+use crate::error::{ExecutorError, ExecutorResult};
 use crate::executor::{
     ChainClient, EntryChainClient, ExecutionRequest, ExecutionResponse, TargetBatchSimulation,
     TargetExecutionSession, TargetTransaction,
@@ -47,7 +47,7 @@ use crate::types::ExecutionOutcome;
 /// Role discriminator for [`FakeChainClient`].
 ///
 /// On a follower fake, `simulate_source_tx` and
-/// `stored_target_state_root` return [`ExecutorErrorKind::Unavailable`]
+/// `stored_target_state_root` return [`ExecutorError::Unavailable`]
 /// — the runtime mirror of the compile-time guarantee that only entry
 /// clients implement those methods in production.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,19 +204,17 @@ impl FakeChainClient {
     }
 
     fn unavailable(&self, what: &str) -> ExecutorError {
-        ExecutorError::from(ExecutorErrorKind::Unavailable(format!(
+        ExecutorError::Unavailable(format!(
             "FakeChainClient({:?}, rollup_id={}): {} not scripted",
             self.role, self.rollup_id, what
-        )))
+        ))
     }
 
     fn require_entry(&self, what: &str) -> ExecutorResult<()> {
         if self.role == FakeRole::Follower {
-            return Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
-                format!(
-                    "FakeChainClient(Follower, rollup_id={}): {what} called on follower",
-                    self.rollup_id,
-                ),
+            return Err(ExecutorError::Unavailable(format!(
+                "FakeChainClient(Follower, rollup_id={}): {what} called on follower",
+                self.rollup_id,
             )));
         }
         Ok(())
@@ -329,10 +327,10 @@ impl TargetExecutionSession for FakeChainSession {
         let outcome = {
             let mut q = self.outcomes.lock().expect("fake mutex poisoned");
             q.pop_front().ok_or_else(|| {
-                ExecutorError::from(ExecutorErrorKind::Unavailable(format!(
+                ExecutorError::Unavailable(format!(
                     "FakeChainSession(rollup_id={}): session outcome queue empty",
                     self.rollup_id,
-                )))
+                ))
             })?
         };
 
@@ -346,11 +344,9 @@ impl TargetExecutionSession for FakeChainSession {
             match guard.as_mut() {
                 Some(factory) => factory(),
                 None => {
-                    return Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
-                        format!(
-                            "FakeChainSession(rollup_id={}): checkpoint_factory not installed",
-                            self.rollup_id,
-                        ),
+                    return Err(ExecutorError::Unavailable(format!(
+                        "FakeChainSession(rollup_id={}): checkpoint_factory not installed",
+                        self.rollup_id,
                     )));
                 }
             }
@@ -534,6 +530,6 @@ mod tests {
         let err = CommittedRootReader::stored_target_state_root(&follower, RollupId(0))
             .await
             .expect_err("follower must reject entry-only methods");
-        assert!(matches!(err.kind(), ExecutorErrorKind::Unavailable(s) if s.contains("follower")));
+        assert!(matches!(err, ExecutorError::Unavailable(s) if s.contains("follower")));
     }
 }

@@ -38,7 +38,7 @@ use alloy_primitives::Address;
 
 use crate::composition::{CompositionBuilder, Rollup};
 use crate::dialect::ChainDialect;
-use crate::error::{ComposerError, ComposerErrorKind, ComposerResult};
+use crate::error::{ComposerError, ComposerResult};
 use crate::executor::{
     ChainClient, CommittedRootReader, EntryChainClient, TargetVerificationContext,
 };
@@ -309,21 +309,15 @@ impl ComposerBuilder {
             return self;
         }
         if rollup_id == self.entry_rollup_id {
-            self.deferred_error = Some(
-                ComposerErrorKind::Misconfigured {
-                    reason: "rollup() called with entry rollup id; use entry() instead",
-                }
-                .into(),
-            );
+            self.deferred_error = Some(ComposerError::Misconfigured {
+                reason: "rollup() called with entry rollup id; use entry() instead",
+            });
             return self;
         }
         if self.rollups.contains_key(&rollup_id) {
-            self.deferred_error = Some(
-                ComposerErrorKind::AlreadyRegistered {
-                    what: "rollup client",
-                }
-                .into(),
-            );
+            self.deferred_error = Some(ComposerError::AlreadyRegistered {
+                what: "rollup client",
+            });
             return self;
         }
         self.rollups
@@ -335,7 +329,7 @@ impl ComposerBuilder {
     ///
     /// # Errors
     ///
-    /// - [`ComposerErrorKind::Misconfigured`] if [`entry`](Self::entry)
+    /// - [`ComposerError::Misconfigured`] if [`entry`](Self::entry)
     ///   was never called, or if a rollup id was registered as both
     ///   entry and follower (which the builder API can't catch
     ///   structurally — the entry-id slot would be overwritten by a
@@ -347,14 +341,12 @@ impl ComposerBuilder {
         if let Some(err) = self.deferred_error {
             return Err(err);
         }
-        let entry = self.entry.ok_or_else(|| {
-            ComposerError::from(ComposerErrorKind::Misconfigured {
-                reason: "entry not registered before build",
-            })
+        let entry = self.entry.ok_or_else(|| ComposerError::Misconfigured {
+            reason: "entry not registered before build",
         })?;
         let root_reader = self
             .root_reader
-            .ok_or_else(|| ComposerError::from(ComposerErrorKind::MissingRootReader))?;
+            .ok_or_else(|| ComposerError::MissingRootReader)?;
         for rollup_id in self.rollups.keys() {
             tracing::info!(
                 name: "composer.rollup_registered",
@@ -413,9 +405,9 @@ impl Composer {
     ///
     /// # Errors
     ///
-    /// Returns [`ComposerErrorKind::Executor`] if simulation or
+    /// Returns [`ComposerError::Executor`] if simulation or
     /// verification fails.
-    /// Returns [`ComposerErrorKind::Protocol`] if entry building or
+    /// Returns [`ComposerError::Protocol`] if entry building or
     /// finalization fails.
     #[tracing::instrument(skip(self, raw_tx), fields(tx_len = raw_tx.len()))]
     pub async fn simulate_and_resolve(&self, raw_tx: &[u8]) -> ComposerResult<Composition> {
@@ -626,12 +618,8 @@ mod tests {
     #[tokio::test]
     async fn build_without_entry_returns_misconfigured() {
         match builder().root_reader(root_reader_arc()).build() {
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ComposerErrorKind::Misconfigured { reason }
-                        if reason.contains("entry not registered")
-                ) => {}
+            Err(ComposerError::Misconfigured { reason })
+                if reason.contains("entry not registered") => {}
             other => panic!("expected Misconfigured (entry not registered), got {other:?}"),
         }
     }
@@ -640,7 +628,7 @@ mod tests {
     async fn build_without_root_reader_returns_missing_root_reader() {
         let res = builder().entry(entry_arc(), target_config()).build();
         match res {
-            Err(e) => assert!(matches!(e.kind(), ComposerErrorKind::MissingRootReader)),
+            Err(e) => assert!(matches!(e, ComposerError::MissingRootReader)),
             Ok(_) => panic!("expected MissingRootReader, got Ok"),
         }
     }
@@ -661,9 +649,8 @@ mod tests {
         // check.
         match res {
             Err(e) => assert!(matches!(
-                e.kind(),
-                ComposerErrorKind::Misconfigured { .. }
-                    | ComposerErrorKind::AlreadyRegistered { .. }
+                e,
+                ComposerError::Misconfigured { .. } | ComposerError::AlreadyRegistered { .. }
             )),
             Ok(_) => panic!("expected Misconfigured, got Ok"),
         }
