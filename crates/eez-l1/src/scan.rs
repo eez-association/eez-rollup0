@@ -506,7 +506,10 @@ mod tests {
         let err = fetch_log_transaction(&provider, 14, 7, tx_hash)
             .await
             .expect_err("both lookups null must not yield a tx");
-        assert!(err.is_source_incomplete(), "unexpected error: {err}");
+        assert!(
+            matches!(err, L1Error::SourceIncomplete { .. }),
+            "unexpected error: {err}"
+        );
         match err {
             L1Error::SourceIncomplete {
                 block, tx_hash: h, ..

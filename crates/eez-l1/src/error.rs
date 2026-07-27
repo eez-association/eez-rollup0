@@ -59,12 +59,3 @@ pub enum L1Error {
     )]
     ReorgTooDeep { walked: usize, max: usize },
 }
-
-impl L1Error {
-    /// Returns true when the L1 source may simply need more time to
-    /// expose already-observed canonical data.
-    #[must_use]
-    pub const fn is_source_incomplete(&self) -> bool {
-        matches!(self, Self::SourceIncomplete { .. })
-    }
-}
