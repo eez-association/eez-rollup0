@@ -1,4 +1,4 @@
-# Production-path CI
+# Kurtosis E2E CI
 
 This package is the pull-request gate for changes that affect composition,
 sequencing, proving, settlement, or cross-chain execution. It runs the candidate
@@ -23,7 +23,7 @@ and observability services. Larger topologies belong in scheduled soak tests.
 
 The workflow runs this package for relevant pull requests on a GitHub-hosted
 Ubuntu runner. It installs and starts Kurtosis, uploads
-`artifacts/production-path-ci`, and has a separate unconditional cleanup step.
+`artifacts/kurtosis-e2e`, and has a separate unconditional cleanup step.
 
 ## Run on a CI-equivalent host
 
@@ -48,5 +48,5 @@ Useful overrides:
 - `ci-args.yaml`: reduced topology and private test keys.
 - `run-ci.sh`: CI lifecycle entry point.
 - `start.sh` and `stop.sh`: local lifecycle helpers.
-- `scripts/verify-production-path.sh`: runs the wave harness in all three modes.
+- `scripts/verify-cross-chain-waves.sh`: runs the wave harness in all three modes.
 - `scripts/cross-chain-wave.sh`: inbound, outbound, and mixed cross-chain workload.

@@ -44,7 +44,7 @@ jq -n \
 
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     {
-        echo "### Production-path result"
+        echo "### Kurtosis E2E result"
         echo
         echo "- Candidate: \`${EEZ_NODE_IMAGE:-unknown}\`"
         echo "- Inbound wave: pass"

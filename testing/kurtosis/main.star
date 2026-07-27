@@ -1,4 +1,4 @@
-# Production-path CI network: canonical L1, builder stack, and eez-node.
+# Kurtosis E2E network: canonical L1, builder stack, and eez-node.
 
 ethereum_package = import_module("github.com/ethpandaops/ethereum-package/main.star")
 

@@ -426,21 +426,8 @@ fn main() -> eyre::Result<()> {
         let rollup_config = RollupConfig::from_env()?;
         let l1_watcher_config = L1WatcherConfig::from_env()?;
 
-        // Target bundles from the builder's canonical L1 view.
-        let target_l1_rpc_url = submitter_config
-            .target_rpc_url
-            .clone()
-            .unwrap_or_else(|| submitter_config.rpc_url.clone());
         let submitter = Submitter::new(submitter_config);
-        let l1_watcher = L1Watcher::spawn(l1_watcher_config.clone());
-        let target_l1_watcher = if target_l1_rpc_url == l1_watcher_config.rpc_url {
-            l1_watcher.clone()
-        } else {
-            L1Watcher::spawn(L1WatcherConfig {
-                rpc_url: target_l1_rpc_url.clone(),
-                ..l1_watcher_config
-            })
-        };
+        let l1_watcher = L1Watcher::spawn(l1_watcher_config);
 
         // Composer-only: build the umbrella, then attach it to the
         // Sequencer built above (swapping in the L1-anchored schedule via
@@ -709,9 +696,15 @@ fn main() -> eyre::Result<()> {
                         eyre::eyre!("EEZ_CCM_L2_ADDRESS required (set by deploy.sh)")
                     })?,
                 )?;
-                // Match signing and escrow reads to the canonical L1 view.
-                let l1_provider =
-                    alloy_provider::RootProvider::new_http(target_l1_rpc_url.clone());
+                // L1 RPC URL: the embedded L1's HTTP port (so the
+                // composer's L1-forwarding round-trips back into our
+                // own L1 reth). Same value as `EEZ_L1_RPC_URL` for
+                // embedded mode.
+                let l1_rpc_url: reqwest::Url = env::var("EEZ_L1_RPC_URL")
+                    .map_err(|_| eyre::eyre!("EEZ_L1_RPC_URL required for L1 forwarding"))?
+                    .parse()
+                    .map_err(|e| eyre::eyre!("EEZ_L1_RPC_URL malformed: {e}"))?;
+                let l1_provider = alloy_provider::RootProvider::new_http(l1_rpc_url);
                 let l1_poster_key = env::var("EEZ_L1_POSTER_KEY").map_err(|_| {
                     eyre::eyre!("EEZ_L1_POSTER_KEY required for L1 postBatch signing")
                 })?;
@@ -837,7 +830,7 @@ fn main() -> eyre::Result<()> {
             // schedule + composer hooks. Speculative depth already
             // applied above.
             let schedule_rx = spawn_l1_anchored(
-                L1HeadStream::from_watcher(&target_l1_watcher),
+                L1HeadStream::from_watcher(&l1_watcher),
                 timing,
                 l2_genesis_timestamp,
             );

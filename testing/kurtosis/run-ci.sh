@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Production-path pull-request lane.
+# Kurtosis end-to-end pull-request lane.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,7 +13,7 @@ export KURTOSIS_ENCLAVE="${KURTOSIS_ENCLAVE:-$default_enclave}"
 export KURTOSIS_BUILDER_SERVICE="${KURTOSIS_BUILDER_SERVICE:-el-2-reth-builder-lighthouse}"
 export KURTOSIS_PRIVILEGED=0
 
-RESULT_DIR="${EEZ_CI_RESULT_DIR:-$REPO/artifacts/production-path-ci}"
+RESULT_DIR="${EEZ_CI_RESULT_DIR:-$REPO/artifacts/kurtosis-e2e}"
 mkdir -p "$RESULT_DIR"
 export EEZ_CI_RESULT_DIR="$RESULT_DIR"
 
@@ -80,8 +80,8 @@ done
     echo "no bundle inclusion observed before the readiness timeout" >&2
     exit 1
 }
-echo "==> production path ready: bundle inclusion observed"
+echo "==> network ready: bundle inclusion observed"
 
-bash "$HERE/scripts/verify-production-path.sh"
+bash "$HERE/scripts/verify-cross-chain-waves.sh"
 
-echo "production-path CI PASS"
+echo "kurtosis e2e CI PASS"
