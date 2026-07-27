@@ -341,6 +341,128 @@ impl CompositionBuilder {
             .collect()
     }
 
+    /// Build the Phase-2 batch for one non-entry rollup and return it
+    /// with its per-tx post-state roots. `Ok(None)` means there is
+    /// nothing to build (empty settlement batch, or all calls reverted).
+    ///
+    /// Two shapes, by dialect:
+    /// - zk-poster (L1): the executing `postAndVerifyBatch` mirror. The
+    ///   L2→L1 calls are NestedSuccess here (caller != L1), so the
+    ///   regular `build_batch` would emit an empty L1-as-caller batch;
+    ///   `build_l1_postbatch` emits the immediate executing entries
+    ///   instead. No simulation — the proof is not signed until the
+    ///   prover's return path and the L1 state transition happens at
+    ///   submission. The attributed root is L1's real current root (a
+    ///   placeholder the prover later replaces).
+    /// - L2 follower: the inbound DA-sidecar delivery. `build_batch`
+    ///   keys "top-level" on a call's source, so an incoming call
+    ///   (source is another rollup) is never top-level and yields an
+    ///   empty batch — even though this L2 must deliver it. Detect that
+    ///   and build the follower-only sidecar directly; its root is the
+    ///   terminal recorded call's, already stamped by `close_call`.
+    ///
+    /// A non-empty follower batch is unreachable: `open_call`'s
+    /// same-chain guard refuses target == source for non-entry rollups,
+    /// so every call in the group is incoming. It fails loudly rather
+    /// than emit an unverified target composition.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces any [`ExecutorError`] from reading L1's current root,
+    /// [`ProtocolErrorKind::InvalidCheckpoint`] if an inbound target has
+    /// no resolved post-state root, [`ProtocolErrorKind::Unsupported`]
+    /// for the unreachable non-empty follower batch, and any error from
+    /// `build_batch`.
+    #[allow(clippy::result_large_err)]
+    async fn build_target(
+        &mut self,
+        rollup_id: RollupId,
+        group_calls: &[ExecutedAction],
+        raw_tx: &[u8],
+        initial_roots: &HashMap<RollupId, [u8; 32]>,
+        per_tx_roots_by_rollup: &HashMap<RollupId, Vec<[u8; 32]>>,
+    ) -> CompositionResult<Option<(EvmBatch, Vec<[u8; 32]>)>> {
+        let rollup = &self.rollups[&rollup_id];
+        let client = std::sync::Arc::clone(&rollup.client);
+        let dialect = rollup.config.dialect;
+        let entry = self.entry_rollup_id;
+
+        if dialect.is_zk_poster() {
+            let batch = entries::build_l1_postbatch(group_calls, entry);
+            if batch.is_empty() {
+                Ok(None)
+            } else {
+                let root = client.current_state_root().await?;
+                Ok(Some((batch, vec![root])))
+            }
+        } else {
+            let attribution = crate::composer::SourceAttribution {
+                initial_roots,
+                per_tx_roots_by_rollup,
+            };
+            let batch = entries::build_batch(group_calls, &attribution, &dialect, rollup_id, raw_tx)?;
+            if batch.is_empty() {
+                let has_incoming = group_calls.iter().any(|c| c.source_rollup_id != rollup_id);
+                if has_incoming {
+                    let inbound = entries::build_l1_inbound_sidecar(group_calls, rollup_id);
+                    if inbound.is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some((inbound, vec![self.terminal_root(rollup_id)?])))
+                    }
+                } else {
+                    Ok(None)
+                }
+            } else {
+                Err(ProtocolErrorKind::Unsupported(
+                    "non-entry target batch with top-level calls (unreachable by construction)",
+                )
+                .into())
+            }
+        }
+    }
+
+    /// Read the last recorded call's resolved post-state root for
+    /// `rollup_id`.
+    ///
+    /// # Errors
+    ///
+    /// [`ProtocolErrorKind::InvalidCheckpoint`] if no recorded call for
+    /// `rollup_id` has a resolved root (i.e. `close_call` did not run).
+    #[allow(clippy::result_large_err)]
+    fn terminal_root(&self, rollup_id: RollupId) -> CompositionResult<[u8; 32]> {
+        self.recorded
+            .iter()
+            .rev()
+            .find(|r| r.target_rollup_id == rollup_id)
+            .and_then(|r| r.outcome.post_state_root().copied())
+            .ok_or_else(|| {
+                ProtocolErrorKind::InvalidCheckpoint {
+                    reason: format!(
+                        "inbound target {rollup_id} has no resolved \
+                         post_state_root (close_call did not run?)"
+                    ),
+                }
+                .into()
+            })
+    }
+
+    /// Overwrite the last recorded call's post-state root for
+    /// `rollup_id`. No-op if that call is not `Resolved`.
+    fn patch_terminal_root(&mut self, rollup_id: RollupId, root: [u8; 32]) {
+        if let Some(last) = self
+            .recorded
+            .iter_mut()
+            .rev()
+            .find(|r| r.target_rollup_id == rollup_id)
+            && let crate::types::ExecutionOutcome::Resolved {
+                post_state_root, ..
+            } = &mut last.outcome
+        {
+            *post_state_root = root;
+        }
+    }
+
     /// Consume the builder and produce the final [`Composition`].
     ///
     /// Steps, in order:
@@ -423,15 +545,9 @@ impl CompositionBuilder {
         // L1-poster path (proofs populated, signatures attached) lives
         // in `composer-lib::post_batch_submitter` (`submit_with_proof`).
 
-        // Phase 2 — per-rollup target batches (non-entry rollups only).
-        //
-        // For each non-entry rollup with non-empty group calls, build
-        // the batch (zk-poster settlement or inbound DA-sidecar) and
-        // record the attributed root so the entry-side build_batch
+        // Phase 2 — one target batch per non-entry rollup with calls.
+        // Each rollup's post-state root is recorded so the entry batch
         // (Phase 3) can chain stateDeltas through it.
-        //
-        // Entry rollup branch: drain pre-computed roots from the
-        // overlay-session path (`extra_per_tx_roots`).
         let mut extra_per_tx_roots = std::mem::take(&mut self.extra_per_tx_roots);
         let mut target_batches: HashMap<RollupId, EvmBatch> = HashMap::new();
         for rollup_id in &plan_order {
@@ -439,136 +555,38 @@ impl CompositionBuilder {
                 if let Some(roots) = extra_per_tx_roots.remove(rollup_id) {
                     per_tx_roots_by_rollup.insert(*rollup_id, roots);
                 }
+                // Expected: the entry has no target batch; its roots (drained
+                // above) feed the entry batch in Phase 3.
                 continue;
             }
-            let Some(rollup) = self.rollups.get(rollup_id) else {
-                continue;
-            };
-
             let group_calls = self.group_calls_for(*rollup_id);
             if group_calls.is_empty() {
+                // Expected: a registered follower with no calls this tx.
                 continue;
             }
-
-            let dialect = &rollup.config.dialect;
-
-            // zk-poster (L1) dialect — build the EXECUTING L1 `postAndVerifyBatch`
-            // mirror, NOT the regular `build_batch`. The L2→L1 calls are TopLevel
-            // for the ENTRY (L2) batch (caller==entry) but NestedSuccess here
-            // (caller!=L1), so `build_batch(source=L1)` would emit an EMPTY
-            // L1-as-caller batch. Per the `counterL2` spec, each L2→L1 call is an
-            // IMMEDIATE executing entry on L1 (`proxyEntryHash`=0 + `L2ToL1Calls`).
-            //
-            // We do NOT `simulate_transactions`: `postAndVerifyBatch` carries a
-            // proof not signed until the prover's return path, so simulating it
-            // here would revert on empty `proofs[]`. The L1 state transition
-            // happens at post-batch SUBMISSION (Step 6). We attribute the L1's
-            // REAL current state root as this rollup's post-state root (a
-            // placeholder; the prover patches the real L2 `newState` later).
-            if dialect.is_zk_poster() {
-                let batch = entries::build_l1_postbatch(&group_calls, self.entry_rollup_id);
-                if batch.is_empty() {
-                    continue;
-                }
-                let root = rollup.client.current_state_root().await?;
-                if let Some(last) = self
-                    .recorded
-                    .iter_mut()
-                    .rev()
-                    .find(|r| r.target_rollup_id == *rollup_id)
-                    && let crate::types::ExecutionOutcome::Resolved {
-                        post_state_root, ..
-                    } = &mut last.outcome
-                {
-                    *post_state_root = root;
-                }
-                tracing::debug!(
-                    name: "composer.zk_poster_l1_postbatch",
-                    %rollup_id,
-                    l1_root = ?root,
-                    entries = group_calls.len(),
-                    "zk-poster target: built immediate L1 postBatch (skipping CCM-verify sim; \
-                     settlement applied at submission)",
-                );
-                per_tx_roots_by_rollup.insert(*rollup_id, vec![root]);
-                target_batches.insert(*rollup_id, batch);
+            let Some((batch, roots)) = self
+                .build_target(
+                    *rollup_id,
+                    &group_calls,
+                    raw_tx,
+                    &initial_roots,
+                    &per_tx_roots_by_rollup,
+                )
+                .await?
+            else {
+                // Expected: nothing to build — empty settlement batch or all
+                // calls reverted.
                 continue;
-            }
-
-            let attribution_so_far = crate::composer::SourceAttribution {
-                initial_roots: &initial_roots,
-                per_tx_roots_by_rollup: &per_tx_roots_by_rollup,
             };
-            let batch = entries::build_batch(
-                &group_calls,
-                &attribution_so_far,
-                dialect,
-                *rollup_id,
-                raw_tx,
-            )?;
-
-            // Terminal-revert short-circuit: an empty batch means all
-            // calls reverted and there's nothing to verify — UNLESS this
-            // target has an INCOMING cross-chain call. `build_batch(source =
-            // this rollup)` keys "top-level" on a call's SOURCE, so an incoming
-            // call (TARGET is this rollup, SOURCE another rollup) is never
-            // top-level → empty batch here, even though the L2 must DELIVER it
-            // (`executeIncomingCrossChainCall`). Detect that and build the
-            // follower-only inbound DA-sidecar entry directly — the inbound
-            // mirror of the zk-poster outbound short-circuit above (the lean
-            // on-chain entry is produced separately by the source/entry batch).
-            // Otherwise the batch is genuinely empty (all reverted) → skip.
-            if batch.is_empty() {
-                let has_incoming = group_calls.iter().any(|c| c.source_rollup_id != *rollup_id);
-                if has_incoming {
-                    let inbound_batch = entries::build_l1_inbound_sidecar(&group_calls, *rollup_id);
-                    if !inbound_batch.is_empty() {
-                        // Attribute the inbound delivery's post-state root —
-                        // already executed during dispatch (`close_call`
-                        // stamped the recorded call's outcome). Mirrors the
-                        // zk-poster per-tx-root attribution.
-                        let root = self
-                            .recorded
-                            .iter()
-                            .rev()
-                            .find(|r| r.target_rollup_id == *rollup_id)
-                            .and_then(|r| r.outcome.post_state_root().copied())
-                            .ok_or_else(|| ProtocolErrorKind::InvalidCheckpoint {
-                                reason: format!(
-                                    "inbound target {rollup_id} has no resolved \
-                                     post_state_root (close_call did not run?)"
-                                ),
-                            })?;
-                        tracing::debug!(
-                            name: "composer.inbound_sidecar",
-                            %rollup_id,
-                            delivery_root = ?root,
-                            entries = group_calls.len(),
-                            "inbound target: built follower-only DA-sidecar entry \
-                             (build_batch(source=this) cannot express an incoming call)",
-                        );
-                        per_tx_roots_by_rollup.insert(*rollup_id, vec![root]);
-                        target_batches.insert(*rollup_id, inbound_batch);
-                    }
-                }
-                continue;
+            // Mirror the terminal call's post-state root (the last of `roots`):
+            // the zk-poster branch replaces its estimate with L1's root; for the
+            // inbound branch the value is already the terminal root, so this is
+            // a no-op.
+            if let Some(root) = roots.last().copied() {
+                self.patch_terminal_root(*rollup_id, root);
             }
-
-            // A non-empty target batch would need a call classified
-            // TopLevel (sourced from this non-entry rollup) inside its
-            // own target group — impossible by construction:
-            // `open_call`'s same-chain guard refuses target == source
-            // for non-entry rollups, so every call in the group is
-            // INCOMING and `build_batch` returns the empty batch
-            // handled above. Fail loudly if that invariant ever breaks
-            // rather than silently emitting an unverified target
-            // composition. (The CCM-verify `simulate_transactions`
-            // pass that lived here was unreachable for this reason and
-            // was removed.)
-            return Err(ProtocolErrorKind::Unsupported(
-                "non-entry target batch with top-level calls (unreachable by construction)",
-            )
-            .into());
+            per_tx_roots_by_rollup.insert(*rollup_id, roots);
+            target_batches.insert(*rollup_id, batch);
         }
 
         // Phase 3 — entry-rollup batch (across full preorder slice).
@@ -596,9 +614,12 @@ impl CompositionBuilder {
         let mut target_compositions: Vec<TargetComposition> = Vec::new();
         for rollup_id in &plan_order {
             if *rollup_id == self.entry_rollup_id {
+                // Expected: the entry is the composition source, not a target.
                 continue;
             }
             let Some(batch) = target_batches.remove(rollup_id) else {
+                // Expected: Phase 2 built no batch for this rollup (no calls,
+                // or all reverted).
                 continue;
             };
             let group_calls = self.group_calls_for(*rollup_id);
