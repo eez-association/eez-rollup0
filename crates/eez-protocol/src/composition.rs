@@ -83,10 +83,22 @@ use crate::types::{
     Composition, ExecutedAction, ExecutionOutcome, SourceComposition, TargetComposition,
 };
 
-// Avoid a protocol → composer layering cycle: TargetConfig lives in
-// `composer.rs`, but this module reads `config.verification_context`
-// + `config.ccm_gas_limit` during finalize.
-use crate::composer::TargetConfig;
+use crate::authorized_proxies::ProxyLookupConfig;
+use crate::dialect::ChainDialect;
+
+/// Per-rollup static configuration.
+///
+/// Holds the proxy lookup and ABI dialect for one rollup (entry or
+/// follower). Registered with the [`CompositionBuilder`] alongside the
+/// client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetConfig {
+    /// Proxy-lookup configuration for this rollup.
+    pub proxy_lookup: ProxyLookupConfig,
+    /// ABI dialect: selects entry-encoding and batch shape (L1-style vs
+    /// L2-style). Default = `EvmL2Style`.
+    pub dialect: ChainDialect,
+}
 
 // ── Rollup ───────────────────────────────────────────────────────
 
@@ -396,7 +408,7 @@ impl CompositionBuilder {
                 Ok(Some((batch, vec![root])))
             }
         } else {
-            let attribution = crate::composer::SourceAttribution {
+            let attribution = crate::SourceAttribution {
                 initial_roots,
                 per_tx_roots_by_rollup,
             };
@@ -590,7 +602,7 @@ impl CompositionBuilder {
         }
 
         // Phase 3 — entry-rollup batch (across full preorder slice).
-        let attribution = crate::composer::SourceAttribution {
+        let attribution = crate::SourceAttribution {
             initial_roots: &initial_roots,
             per_tx_roots_by_rollup: &per_tx_roots_by_rollup,
         };
@@ -918,8 +930,6 @@ impl CompositionBuilder {
 mod tests {
     use super::*;
     use crate::action::cross_chain_call_hash;
-    use crate::composer::ProxyLookupConfig;
-    use crate::dialect::ChainDialect;
     use alloy_primitives::{Address, Bytes, U256};
 
     // ── Mock ChainClient (spawns a canned session) ──────────────────

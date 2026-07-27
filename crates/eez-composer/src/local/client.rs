@@ -132,8 +132,7 @@ impl LocalChainClient {
 
     /// Build an entry-role client. Returned as
     /// `Arc<Self>` so the call site can erase it into BOTH
-    /// `Arc<dyn EntryChainClient>` (for [`ComposerBuilder::entry`](eez_protocol::composer::ComposerBuilder::entry))
-    /// AND `Arc<dyn CommittedRootReader>` (for [`ComposerBuilder::root_reader`](eez_protocol::composer::ComposerBuilder::root_reader))
+    /// `Arc<dyn EntryChainClient>` AND `Arc<dyn CommittedRootReader>`
     /// when the entry chain is L1. The two trait views share one
     /// allocation; cheap.
     pub fn new_entry<P>(

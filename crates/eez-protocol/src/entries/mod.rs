@@ -13,6 +13,8 @@
 //! downstream (`prepare_post_batch` fills the carriers; the proof sink
 //! fills `proofs[]` with the prover's signature).
 
+use std::collections::HashMap;
+
 use crate::{ExecutedAction, ProtocolResult, RollupId, rolling_hash::EntryRollingHash};
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_sol_types::SolCall;
@@ -27,6 +29,30 @@ use crate::abi::{
 use crate::action::cross_chain_call_hash;
 use crate::batch::EvmBatch;
 use crate::dialect::ChainDialect;
+
+/// Per-rollup attribution inputs for batch construction.
+///
+/// [`build_batch`] consumes this to chain per-entry `stateDeltas`
+/// (upstream's invariant 6). Two sources of truth:
+///
+/// - `initial_roots[rollup]` — the state root each rollup started at,
+///   read from the entry chain once when the composition began.
+/// - `per_tx_roots_by_rollup[rollup]` — the post-state roots `finalize`
+///   attributed per rollup (zk-poster settlement root or inbound
+///   delivery root).
+///
+/// References (no ownership): the builder materializes each map once per
+/// composition and hands borrowed handles to the batch builder.
+#[derive(Debug)]
+pub struct SourceAttribution<'a> {
+    /// Per-rollup initial state roots, as of the entry chain's current
+    /// block when the composition began.
+    pub initial_roots: &'a HashMap<RollupId, [u8; 32]>,
+    /// Per-rollup cumulative post-state roots for each tx in that
+    /// rollup's batch. Keyed by `RollupId`; each `Vec` is ordered by
+    /// batch tx index.
+    pub per_tx_roots_by_rollup: &'a HashMap<RollupId, Vec<[u8; 32]>>,
+}
 
 /// Classification of a single [`ExecutedAction`] within an entry's
 /// flat call window. Drives [`build_batch`]'s emission decision.
@@ -1211,10 +1237,9 @@ impl EntryBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ExecutionOutcome, SourceAttribution};
+    use crate::ExecutionOutcome;
     use alloy_primitives::address;
     use alloy_sol_types::SolValue;
-    use std::collections::HashMap;
 
     /// A2.1a: the OUTBOUND L2 deferred entry's `proxyEntryHash` must byte-match
     /// the preimage `EEZL2.executeCrossChainCall` recomputes on-chain
