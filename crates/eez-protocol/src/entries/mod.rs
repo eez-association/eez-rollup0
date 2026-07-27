@@ -20,9 +20,8 @@ use alloy_sol_types::SolCall;
 use tracing::{debug, trace};
 
 use crate::abi::{
-    CrossChainCallSol, ExecutionEntrySol, ExpectedL1ToL2CallSol, ExpectedLookupSol,
-    ExpectedOutgoingCrossChainCallSol, L2ExecutionEntrySol, L2ExpectedLookupSol, L2LookupCallSol,
-    L2ToL1CallSol, LookupCallSol, StateDeltaSol, loadExecutionTableCall, postAndVerifyBatchCall,
+    CrossChainCallSol, ExecutionEntrySol, ExpectedL1ToL2CallSol, L2ExecutionEntrySol,
+    L2ToL1CallSol, LookupCallSol, StateDeltaSol, postAndVerifyBatchCall,
 };
 use crate::action::cross_chain_call_hash;
 use crate::batch::EvmBatch;
@@ -978,129 +977,6 @@ pub fn decode_postbatch(calldata: &[u8]) -> alloy_sol_types::Result<EvmBatch> {
     Ok(call.batch)
 }
 
-/// Encode the table-loading payload for the rollup whose
-/// `dialect` is supplied. Dispatches between
-/// [`encode_postbatch`] (L1-style) and
-/// [`encode_load_table`] (L2-style) so
-/// callers don't have to peek at the dialect themselves.
-#[must_use]
-pub fn encode_table_payload(batch: &EvmBatch, dialect: &ChainDialect) -> Vec<u8> {
-    if dialect.is_zk_poster() {
-        encode_postbatch(batch)
-    } else {
-        encode_load_table(batch)
-    }
-}
-
-/// Encode `batch` as `EEZL2.loadExecutionTable` calldata — LOWERING the
-/// L1-shaped batch into the lean IEEZL2 types (D2): our pipeline carries L1
-/// `ExecutionEntrySol`/`LookupCallSol` internally; only the L2 wire is lean.
-#[must_use]
-pub fn encode_load_table(batch: &EvmBatch) -> Vec<u8> {
-    loadExecutionTableCall {
-        entries: batch.entries.iter().map(lower_entry_to_l2).collect(),
-        _lookupCalls: batch
-            .l1ToL2lookupCalls
-            .iter()
-            .map(lower_lookup_to_l2)
-            .collect(),
-    }
-    .abi_encode()
-}
-
-/// Lower one L1 `ExecutionEntrySol` to the lean L2 `L2ExecutionEntrySol`
-/// (D2). Drops `stateDeltas` (asserted empty — deltas attach only on the L1
-/// settlement leg, never at the loadExecutionTable boundary) and
-/// `destinationRollupId` (L2 is single-rollup). The L1→L2 field names are
-/// renames of identical layouts; the nested `expectedLookups` lowering only
-/// ever sees the empty vec (the D3 guard refuses nested-lookup compositions).
-fn lower_entry_to_l2(e: &ExecutionEntrySol) -> L2ExecutionEntrySol {
-    debug_assert!(
-        e.stateDeltas.is_empty(),
-        "L1 entry carries stateDeltas at the L2 encode boundary — deltas must attach only \
-         on the L1 postBatch leg",
-    );
-    L2ExecutionEntrySol {
-        proxyEntryHash: e.proxyEntryHash,
-        incomingCalls: e.l2ToL1Calls.iter().map(lower_call_to_l2).collect(),
-        expectedOutgoingCalls: e
-            .expectedL1ToL2Calls
-            .iter()
-            .map(lower_outgoing_to_l2)
-            .collect(),
-        expectedLookups: e
-            .expectedLookups
-            .iter()
-            .map(lower_lookup_meta_to_l2)
-            .collect(),
-        callCount: e.callCount,
-        returnData: e.returnData.clone(),
-        rollingHash: e.rollingHash,
-    }
-}
-
-fn lower_call_to_l2(c: &L2ToL1CallSol) -> CrossChainCallSol {
-    CrossChainCallSol {
-        targetAddress: c.targetAddress,
-        value: c.value,
-        data: c.data.clone(),
-        sourceAddress: c.sourceAddress,
-        sourceRollupId: c.sourceRollupId,
-        revertSpan: c.revertSpan,
-    }
-}
-
-fn lower_outgoing_to_l2(o: &ExpectedL1ToL2CallSol) -> ExpectedOutgoingCrossChainCallSol {
-    ExpectedOutgoingCrossChainCallSol {
-        crossChainCallHash: o.crossChainCallHash,
-        callCount: o.callCount,
-        returnData: o.returnData.clone(),
-    }
-}
-
-fn lower_lookup_meta_to_l2(l: &ExpectedLookupSol) -> L2ExpectedLookupSol {
-    L2ExpectedLookupSol {
-        crossChainCallHash: l.crossChainCallHash,
-        returnData: l.returnData.clone(),
-        failed: l.failed,
-        callNumber: l.l2ToL1CallNumber,
-        lastOutgoingCallConsumed: l.lastL1ToL2CallConsumed,
-        executingLookupIndex: l.executingLookupIndex,
-        incomingCalls: l.l2ToL1Calls.iter().map(lower_call_to_l2).collect(),
-        expectedOutgoingCalls: l
-            .expectedL1ToL2Calls
-            .iter()
-            .map(lower_outgoing_to_l2)
-            .collect(),
-        callCount: l.callCount,
-        rollingHash: l.rollingHash,
-    }
-}
-
-/// Lower one L1 `LookupCallSol` to the lean L2 `L2LookupCallSol` (D2): drops
-/// `destinationRollupId` + `expectedStateRoots` (L2 matches by hash alone).
-/// Only ever sees the empty queue at the L2 boundary (the D3 guard).
-fn lower_lookup_to_l2(l: &LookupCallSol) -> L2LookupCallSol {
-    L2LookupCallSol {
-        crossChainCallHash: l.crossChainCallHash,
-        returnData: l.returnData.clone(),
-        failed: l.failed,
-        incomingCalls: l.l2ToL1Calls.iter().map(lower_call_to_l2).collect(),
-        expectedOutgoingCalls: l
-            .expectedL1ToL2Calls
-            .iter()
-            .map(lower_outgoing_to_l2)
-            .collect(),
-        expectedLookups: l
-            .expectedLookups
-            .iter()
-            .map(lower_lookup_meta_to_l2)
-            .collect(),
-        callCount: l.callCount,
-        rollingHash: l.rollingHash,
-    }
-}
-
 // ── Internal helpers ───────────────────────────────────────────
 
 struct EntryBuilder {
@@ -1199,6 +1075,7 @@ impl EntryBuilder {
 mod tests {
     use super::*;
     use crate::ExecutionOutcome;
+    use crate::abi::ExpectedLookupSol;
     use alloy_primitives::address;
     use alloy_sol_types::SolValue;
 
@@ -1857,38 +1734,5 @@ mod tests {
         let batch = EvmBatch::default();
         let data = encode_postbatch(&batch);
         assert_eq!(&data[..4], &postAndVerifyBatchCall::SELECTOR);
-    }
-
-    #[test]
-    fn encode_load_table_selector() {
-        let batch = EvmBatch::default();
-        let data = encode_load_table(&batch);
-        assert_eq!(&data[..4], &loadExecutionTableCall::SELECTOR);
-    }
-
-    #[test]
-    fn table_payload_l1_style_emits_post_verify_and_execute_or_save() {
-        let batch = EvmBatch::default();
-        let data = encode_table_payload(&batch, &ChainDialect::EvmL1Style);
-        assert_eq!(&data[..4], &postAndVerifyBatchCall::SELECTOR);
-    }
-
-    #[test]
-    #[allow(
-        non_snake_case,
-        reason = "fn name mirrors the Solidity selector for grep"
-    )]
-    fn table_payload_l2_style_emits_loadExecutionTable() {
-        let batch = EvmBatch::default();
-        let data = encode_table_payload(&batch, &ChainDialect::EvmL2Style);
-        assert_eq!(&data[..4], &loadExecutionTableCall::SELECTOR);
-    }
-
-    #[test]
-    fn table_payload_dialects_differ() {
-        let batch = EvmBatch::default();
-        let l1 = encode_table_payload(&batch, &ChainDialect::EvmL1Style);
-        let l2 = encode_table_payload(&batch, &ChainDialect::EvmL2Style);
-        assert_ne!(&l1[..4], &l2[..4]);
     }
 }
