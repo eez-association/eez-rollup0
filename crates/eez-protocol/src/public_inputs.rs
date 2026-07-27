@@ -97,9 +97,8 @@ pub fn entry_hash(entry: &ExecutionEntrySol) -> B256 {
 /// [`entry_hash`] for `LookupCall` structs. Matches `EEZ.sol`'s
 /// per-lookup hashing.
 ///
-/// Internal fold step — integrators call [`public_inputs_hashes`].
 #[must_use]
-pub fn lookup_call_hash(lookup_call: &LookupCallSol) -> B256 {
+fn lookup_call_hash(lookup_call: &LookupCallSol) -> B256 {
     keccak256(SolValue::abi_encode(lookup_call))
 }
 
@@ -192,10 +191,10 @@ fn position_of(k: u64, indices: &[u64]) -> Option<usize> {
 /// behavior: `acc` stays `bytes32(0)` if no rollup attests,
 /// and the function returns the resulting hash.
 ///
-/// Internal fold step — integrators call [`public_inputs_hashes`] (or
-/// [`all_per_ps_hashes`]), which run `ProofPlan::check_invariants` first.
-/// This function assumes a validated plan: it indexes `per_rollup_context` /
-/// `vk_matrix` directly and would panic on a length mismatch.
+/// Assumes a **validated** plan: the production caller
+/// (`all_per_ps_hashes`) runs `check_invariants` first, so the direct
+/// `vk_matrix` / `per_rollup_context` indexing is in bounds. `pub` only
+/// because the byte-vector oracle test drives it directly.
 #[must_use]
 pub fn per_ps_public_inputs_hash(shared: B256, plan: &ProofPlan, ps_index_in_global: u64) -> B256 {
     let mut acc = B256::ZERO;
