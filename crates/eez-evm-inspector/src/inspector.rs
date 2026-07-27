@@ -321,11 +321,8 @@ impl SessionInspectorFactory {
     /// the outer call by virtue of the dispatcher's `open_call`
     /// timing.
     pub fn build<'a>(&self, dispatcher: &'a mut CompositionBuilder) -> SessionInspector<'a> {
-        let mut insp = SessionInspector::new(
-            self.proxy_lookup.clone(),
-            dispatcher,
-            self.caller_rollup_id,
-        );
+        let mut insp =
+            SessionInspector::new(self.proxy_lookup.clone(), dispatcher, self.caller_rollup_id);
         insp.overlay_channel = self.overlay_channel.clone();
         insp
     }

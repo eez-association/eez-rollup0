@@ -219,9 +219,7 @@ impl LocalChainClient {
 }
 
 impl ChainClient for LocalChainClient {
-    fn begin_execution_session(
-        &self,
-    ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
+    fn begin_execution_session(&self) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
         tracing::debug!(
             rollup_id = %self.rollup_id,
             ccm = %self.ccm_address,

@@ -761,10 +761,7 @@ mod tests {
         fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
             Ok(Box::new(()) as crate::executor::SessionSnapshot)
         }
-        fn rollback(
-            &mut self,
-            _snapshot: crate::executor::SessionSnapshot,
-        ) -> ExecutorResult<()> {
+        fn rollback(&mut self, _snapshot: crate::executor::SessionSnapshot) -> ExecutorResult<()> {
             Ok(())
         }
     }
@@ -802,10 +799,7 @@ mod tests {
             Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
         }
 
-        fn rollback(
-            &mut self,
-            _snap: crate::executor::SessionSnapshot,
-        ) -> ExecutorResult<()> {
+        fn rollback(&mut self, _snap: crate::executor::SessionSnapshot) -> ExecutorResult<()> {
             Ok(())
         }
     }

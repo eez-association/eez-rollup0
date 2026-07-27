@@ -118,8 +118,7 @@ pub trait ChainClient: Send + Sync + 'static {
     ///
     /// [`ExecutorErrorKind::Provider`] / [`ExecutorErrorKind::Evm`] /
     /// [`ExecutorErrorKind::Missing`].
-    fn begin_execution_session(&self)
-    -> ExecutorResult<Box<dyn TargetExecutionSession + Send>>;
+    fn begin_execution_session(&self) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>>;
 
     /// Simulate a source-chain transaction, dispatching every detected
     /// cross-chain proxy call through `dispatcher`. Entry-role clients
