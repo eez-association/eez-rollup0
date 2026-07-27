@@ -130,12 +130,11 @@ impl LocalChainClient {
         }
     }
 
-    /// Build an entry-role client. Returned as
-    /// `Arc<Self>` so the call site can erase it into BOTH
-    /// `Arc<dyn EntryChainClient>` (for [`ComposerBuilder::entry`](eez_protocol::composer::ComposerBuilder::entry))
-    /// AND `Arc<dyn CommittedRootReader>` (for [`ComposerBuilder::root_reader`](eez_protocol::composer::ComposerBuilder::root_reader))
-    /// when the entry chain is L1. The two trait views share one
-    /// allocation; cheap.
+    /// Build an entry-role client. Returned as `Arc<Self>` so the call
+    /// site can erase it into `Arc<dyn ChainClient>` for
+    /// [`CrossChainWiring::entry_client`](crate::composer::CrossChainWiring::entry_client),
+    /// which also serves the committed-root reads when the entry chain
+    /// is L1.
     pub fn new_entry<P>(
         provider: P,
         evm_config: EthEvmConfig,
@@ -506,10 +505,9 @@ impl ChainClient for LocalChainClient {
     /// (L1's `EEZ.sol` in this protocol).
     ///
     /// Today's L1-as-entry topology has the entry client itself serve this
-    /// role; the same `Arc<LocalChainClient<...>>` is erased to BOTH
-    /// `Arc<dyn EntryChainClient>` (for `.entry(...)`) AND
-    /// `Arc<dyn CommittedRootReader>` (for `.root_reader(...)`) at the
-    /// builder seam in `main.rs`.
+    /// role: `CrossChainWiring::entry_client` is the single erased
+    /// `Arc<dyn ChainClient>` that runs source simulation AND serves the
+    /// committed-root reads.
     ///
     /// L2-as-entry topology will need a follower variant: when this is a
     /// L1 follower client, it must implement this trait honestly. That
