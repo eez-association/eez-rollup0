@@ -421,7 +421,8 @@ impl CompositionBuilder {
             .expect("entry rollup registered at builder construction")
             .config
             .dialect;
-        let entry_batch = entries::build_batch(&self.recorded, &entry_dialect, self.entry_rollup_id)?;
+        let entry_batch =
+            entries::build_batch(&self.recorded, &entry_dialect, self.entry_rollup_id)?;
 
         tracing::debug!(
             name: "composer.finalize.complete",
@@ -681,7 +682,6 @@ impl CompositionBuilder {
             "annotated revert span and queued session rollback"
         );
     }
-
 }
 
 #[cfg(test)]
@@ -938,7 +938,7 @@ mod tests {
                 }),
                 session: None,
                 config: target_config(),
-                },
+            },
         );
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
         let err = builder
@@ -949,7 +949,11 @@ mod tests {
             "got: {err}"
         );
         // The outer session was put back despite the inner error.
-        assert_eq!(take_sessions(&mut builder).len(), 1, "outer session survives");
+        assert_eq!(
+            take_sessions(&mut builder).len(),
+            1,
+            "outer session survives"
+        );
     }
 
     #[test]

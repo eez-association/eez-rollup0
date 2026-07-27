@@ -145,7 +145,6 @@ impl OverlayChannel {
     pub fn pop_post_cache(&self) -> Option<CacheState> {
         self.overlay_cache.lock().ok().and_then(|mut g| g.pop())
     }
-
 }
 
 /// Shared handle to an [`OverlayChannel`].

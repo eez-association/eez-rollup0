@@ -216,7 +216,6 @@ impl LocalChainClient {
             authorized_proxies_slot: self.dialect.proxy_lookup_slot(),
         }
     }
-
 }
 
 impl ChainClient for LocalChainClient {
@@ -446,5 +445,4 @@ impl ChainClient for LocalChainClient {
 
         Ok(())
     }
-
 }

@@ -140,5 +140,4 @@ pub trait ChainClient: Send + Sync + 'static {
             "simulate_source_tx: not an entry-role client".into(),
         )))
     }
-
 }
