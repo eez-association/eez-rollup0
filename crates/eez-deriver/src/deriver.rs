@@ -154,8 +154,8 @@ where
     ///
     /// # Errors
     ///
-    /// `l2_provider` (lookup / scan failure), `local_diverged` (replay
-    /// failure), `committer_closed`.
+    /// `L2Provider` (lookup / scan failure), `LocalDiverged` (replay
+    /// failure), `CommitterClosed`.
     ///
     /// # Panics
     ///
@@ -186,7 +186,7 @@ where
                 .submitter
                 .canonical_l1_hash(tail.l1_block)
                 .await
-                .map_err(|e| DeriverError::l2_provider(format!("L1 canonicality probe: {e}")))?;
+                .map_err(|e| DeriverError::L2Provider(format!("L1 canonicality probe: {e}")))?;
             if canonical == Some(tail.l1_block_hash) {
                 return Ok(Some(tail.l1_block));
             }
@@ -223,13 +223,13 @@ where
             .inner
             .l2_provider
             .best_block_number()
-            .map_err(DeriverError::l2_provider)?;
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?;
         let mut chunks = self
             .inner
             .submitter
             .batch_log_chunks(from_l1_block)
             .await
-            .map_err(DeriverError::l1_scan)?;
+            .map_err(DeriverError::L1Scan)?;
         let to_l1_block = chunks.to_block();
         event!(
             name: "eez.deriver.catch_up.start",
@@ -258,7 +258,7 @@ where
             .submitter
             .next_batch_log_chunk(&mut chunks)
             .await
-            .map_err(DeriverError::l1_scan)?
+            .map_err(DeriverError::L1Scan)?
         {
             total_replayed += self
                 .reconcile_scanned_batches(&scanned_batches, &mut cumulative_l2)
@@ -337,7 +337,10 @@ where
                         claimed_current = %claimed_current,
                         "batch currentState does not match local state root at the scan cursor; refusing to replay",
                     );
-                    return Err(DeriverError::local_diverged(batch_first_l2));
+                    return Err(DeriverError::LocalDiverged {
+                        l2_block: batch_first_l2,
+                        detail: None,
+                    });
                 }
             }
 
@@ -406,8 +409,8 @@ where
     ///
     /// # Errors
     ///
-    /// `l2_provider` (parent lookup / state / builder failure),
-    /// `local_diverged` (tx decode / recover / execute failure).
+    /// `L2Provider` (parent lookup / state / builder failure),
+    /// `LocalDiverged` (tx decode / recover / execute failure).
     pub fn execute_block(
         &self,
         parent_block_number: u64,
@@ -419,7 +422,7 @@ where
             .inner
             .l2_provider
             .best_block_number()
-            .map_err(DeriverError::l2_provider)?;
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?;
         event!(
             name: "eez.deriver.execute_block.start",
             Level::DEBUG,
@@ -442,7 +445,7 @@ where
                     error = %e,
                     "sealed_header() failed",
                 );
-                DeriverError::l2_provider(e)
+                DeriverError::L2Provider(e.to_string())
             })?
             .ok_or_else(|| {
                 event!(
@@ -452,7 +455,7 @@ where
                     local_best,
                     "sealed_header() returned None — parent header is not in canonical chain",
                 );
-                DeriverError::l2_provider(format!(
+                DeriverError::L2Provider(format!(
                     "local L2 header at parent block {parent_block_number} missing"
                 ))
             })?;
@@ -480,7 +483,7 @@ where
                     error = %e,
                     "state_by_block_hash() failed for a header that sealed_header() returned successfully — likely reth state retention timing under reorg churn",
                 );
-                DeriverError::l2_provider(e)
+                DeriverError::L2Provider(e.to_string())
             })?;
         let state_db = StateProviderDatabase::new(state_provider.as_ref());
         let mut db = State::builder()
@@ -510,38 +513,36 @@ where
             .inner
             .evm_config
             .builder_for_next_block(&mut db, &parent_header, attributes)
-            .map_err(|e| {
-                DeriverError::l2_provider(format!("builder_for_next_block failed: {e}"))
-            })?;
+            .map_err(|e| DeriverError::L2Provider(format!("builder_for_next_block failed: {e}")))?;
 
         builder
             .apply_pre_execution_changes()
-            .map_err(|e| DeriverError::l2_provider(format!("pre-execution changes failed: {e}")))?;
+            .map_err(|e| DeriverError::L2Provider(format!("pre-execution changes failed: {e}")))?;
 
         for (tx_idx, tx_bytes) in raw_txs.iter().enumerate() {
             let tx = TransactionSigned::decode_2718(&mut tx_bytes.as_slice()).map_err(|e| {
-                DeriverError::local_diverged_with_msg(
-                    parent_block_number + 1,
-                    &format!("decode tx #{tx_idx}: {e}"),
-                )
+                DeriverError::LocalDiverged {
+                    l2_block: parent_block_number + 1,
+                    detail: Some(format!("decode tx #{tx_idx}: {e}")),
+                }
             })?;
             let recovered = SignedTransaction::try_into_recovered(tx).map_err(|_| {
-                DeriverError::local_diverged_with_msg(
-                    parent_block_number + 1,
-                    &format!("could not recover signer for tx #{tx_idx}"),
-                )
+                DeriverError::LocalDiverged {
+                    l2_block: parent_block_number + 1,
+                    detail: Some(format!("could not recover signer for tx #{tx_idx}")),
+                }
             })?;
-            builder.execute_transaction(recovered).map_err(|e| {
-                DeriverError::local_diverged_with_msg(
-                    parent_block_number + 1,
-                    &format!("execute tx #{tx_idx}: {e}"),
-                )
-            })?;
+            builder
+                .execute_transaction(recovered)
+                .map_err(|e| DeriverError::LocalDiverged {
+                    l2_block: parent_block_number + 1,
+                    detail: Some(format!("execute tx #{tx_idx}: {e}")),
+                })?;
         }
 
         let outcome = builder
             .finish(state_provider.as_ref(), None)
-            .map_err(|e| DeriverError::l2_provider(format!("block builder finish failed: {e}")))?;
+            .map_err(|e| DeriverError::L2Provider(format!("block builder finish failed: {e}")))?;
 
         let sealed_block = outcome.block.sealed_block().clone();
         let sealed_header = sealed_block.sealed_header().clone();
@@ -554,8 +555,8 @@ where
     /// # Errors
     ///
     /// Forwards [`Self::execute_block`] errors plus
-    /// [`DeriverError::is_invalid_forkchoice`] /
-    /// [`DeriverError::is_committer_closed`] from the
+    /// [`DeriverError::InvalidForkchoice`] /
+    /// [`DeriverError::CommitterClosed`] from the
     /// committer-side submission.
     pub async fn replay_block(
         &self,
@@ -608,7 +609,7 @@ where
             match rx.recv().await {
                 Ok(event) => {
                     if let Err(err) = self.handle_event(event).await {
-                        if err.is_committer_closed() {
+                        if matches!(err, DeriverError::CommitterClosed) {
                             event!(
                                 name: "eez.deriver.committer.closed",
                                 Level::ERROR,
@@ -668,7 +669,7 @@ where
                 );
                 true
             }
-            Err(err) if err.is_committer_closed() => {
+            Err(err @ DeriverError::CommitterClosed) => {
                 event!(
                     name: "eez.deriver.committer.closed",
                     Level::ERROR,
@@ -852,7 +853,10 @@ where
                     claimed_current = %claimed_current,
                     "batch currentState does not match local state root at cursor; resync required",
                 );
-                return Err(DeriverError::local_diverged(from_block));
+                return Err(DeriverError::LocalDiverged {
+                    l2_block: from_block,
+                    detail: None,
+                });
             }
         }
 
@@ -1035,9 +1039,9 @@ where
         self.inner
             .l2_provider
             .sealed_header(l2_block)
-            .map_err(DeriverError::l2_provider)?
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?
             .ok_or_else(|| {
-                DeriverError::l2_provider(format!("local L2 header at {l2_block} missing"))
+                DeriverError::L2Provider(format!("local L2 header at {l2_block} missing"))
             })
     }
 
@@ -1119,7 +1123,7 @@ where
                     let call =
                         eez_protocol::abi::postAndVerifyBatchCall::abi_decode(&post_batch_input)
                             .map_err(|e| {
-                                DeriverError::l2_provider(format!(
+                                DeriverError::L2Provider(format!(
                                     "decode postBatch({tx_hash}): {e}"
                                 ))
                             })?;
@@ -1137,7 +1141,7 @@ where
                     for (i, raw) in decoded.l2_entries.iter().enumerate() {
                         let entry =
                             eez_protocol::abi::ExecutionEntrySol::abi_decode(raw).map_err(|e| {
-                                DeriverError::l2_provider(format!(
+                                DeriverError::L2Provider(format!(
                                     "decode l2_entries[{i}] for tx {tx_hash}: {e}"
                                 ))
                             })?;
@@ -1188,14 +1192,14 @@ where
                     .map(|t| Bytes::from(t.clone()))
                     .collect();
                 if sync_user_txs.len() < outbound.len() {
-                    return Err(DeriverError::local_diverged_with_msg(
-                        from_block,
-                        &format!(
+                    return Err(DeriverError::LocalDiverged {
+                        l2_block: from_block,
+                        detail: Some(format!(
                             "outbound entries ({}) exceed Sync-block user txs ({})",
                             outbound.len(),
                             sync_user_txs.len(),
-                        ),
-                    ));
+                        )),
+                    });
                 }
                 let outbound_paired: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)> = outbound
                     .iter()
@@ -1215,7 +1219,7 @@ where
                     starting_nonce,
                 )
                 .map_err(|e| {
-                    DeriverError::l2_provider(format!(
+                    DeriverError::L2Provider(format!(
                         "build_cross_chain_sync_pairs(tx={tx_hash}): {e}"
                     ))
                 })?;
@@ -1308,11 +1312,11 @@ where
                 &observed,
                 cfg.this_rollup_id,
             )
-            .map_err(|e| {
-                DeriverError::local_diverged_with_msg(
-                    from_block,
-                    &format!("outbound authorization gate failed (tx={tx_hash}): {e}"),
-                )
+            .map_err(|e| DeriverError::LocalDiverged {
+                l2_block: from_block,
+                detail: Some(format!(
+                    "outbound authorization gate failed (tx={tx_hash}): {e}"
+                )),
             })?;
         }
         Ok(replayed)
@@ -1322,15 +1326,15 @@ where
     /// CCM-L2 — what [`eez_protocol::outbound_gate`] matches settlement entries against.
     ///
     /// # Errors
-    /// [`DeriverError::l2_provider`] if the block's receipts are missing locally.
+    /// [`DeriverError::L2Provider`] if the block's receipts are missing locally.
     fn observed_outbound_hashes(&self, block: u64, ccm_l2: Address) -> DeriverResult<Vec<B256>> {
         let receipts = self
             .inner
             .l2_provider
             .receipts_by_block(block.into())
-            .map_err(DeriverError::l2_provider)?
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?
             .ok_or_else(|| {
-                DeriverError::l2_provider(format!("local receipts for Sync block {block} missing"))
+                DeriverError::L2Provider(format!("local receipts for Sync block {block} missing"))
             })?;
         Ok(extract_outbound_call_hashes(&receipts, ccm_l2))
     }
@@ -1347,9 +1351,9 @@ where
             .inner
             .l2_provider
             .sealed_header(parent_block_number)
-            .map_err(DeriverError::l2_provider)?
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?
             .ok_or_else(|| {
-                DeriverError::l2_provider(format!(
+                DeriverError::L2Provider(format!(
                     "local L2 header at parent {parent_block_number} missing"
                 ))
             })?;
@@ -1357,11 +1361,11 @@ where
             .inner
             .l2_provider
             .state_by_block_hash(parent_header.hash())
-            .map_err(DeriverError::l2_provider)?;
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?;
         let system_address = cfg.system_signer.address();
         Ok(state
             .account_nonce(&system_address)
-            .map_err(DeriverError::l2_provider)?
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?
             .unwrap_or(0))
     }
 
@@ -1393,9 +1397,9 @@ where
                 .inner
                 .l2_provider
                 .sealed_header(pre)
-                .map_err(DeriverError::l2_provider)?
+                .map_err(|e| DeriverError::L2Provider(e.to_string()))?
                 .ok_or_else(|| {
-                    DeriverError::l2_provider(format!("local L2 header at {pre} missing"))
+                    DeriverError::L2Provider(format!("local L2 header at {pre} missing"))
                 })?
                 .state_root();
             if local_pre != claimed_curr {
@@ -1409,7 +1413,10 @@ where
                     claimed = %claimed_curr,
                     "local L2 state root at from_block-1 differs from batch's claimed currentState",
                 );
-                return Err(DeriverError::local_diverged(pre));
+                return Err(DeriverError::LocalDiverged {
+                    l2_block: pre,
+                    detail: None,
+                });
             }
         }
         if let Some(claimed_new) = claimed_new_state {
@@ -1417,9 +1424,9 @@ where
                 .inner
                 .l2_provider
                 .sealed_header(to_block)
-                .map_err(DeriverError::l2_provider)?
+                .map_err(|e| DeriverError::L2Provider(e.to_string()))?
                 .ok_or_else(|| {
-                    DeriverError::l2_provider(format!("local L2 header at {to_block} missing"))
+                    DeriverError::L2Provider(format!("local L2 header at {to_block} missing"))
                 })?
                 .state_root();
             if local_post != claimed_new {
@@ -1433,7 +1440,10 @@ where
                     claimed = %claimed_new,
                     "local L2 state root at to_block differs from batch's claimed newState",
                 );
-                return Err(DeriverError::local_diverged(to_block));
+                return Err(DeriverError::LocalDiverged {
+                    l2_block: to_block,
+                    detail: None,
+                });
             }
         }
         Ok(())
@@ -1454,7 +1464,7 @@ where
 {
     let Some(local_block) = l2_provider
         .block_by_number(block_number)
-        .map_err(DeriverError::l2_provider)?
+        .map_err(|e| DeriverError::L2Provider(e.to_string()))?
     else {
         return Ok(false);
     };
@@ -1481,18 +1491,18 @@ where
 {
     let Some(local_block) = l2_provider
         .block_by_number(from_block)
-        .map_err(DeriverError::l2_provider)?
+        .map_err(|e| DeriverError::L2Provider(e.to_string()))?
     else {
         return Ok(false);
     };
     let parent_block = from_block.checked_sub(1).ok_or_else(|| {
-        DeriverError::l2_provider("cannot reconcile a batch starting at genesis block")
+        DeriverError::L2Provider("cannot reconcile a batch starting at genesis block".to_string())
     })?;
     let expected_parent_hash = l2_provider
         .sealed_header(parent_block)
-        .map_err(DeriverError::l2_provider)?
+        .map_err(|e| DeriverError::L2Provider(e.to_string()))?
         .ok_or_else(|| {
-            DeriverError::l2_provider(format!("local L2 header at {parent_block} missing"))
+            DeriverError::L2Provider(format!("local L2 header at {parent_block} missing"))
         })?
         .hash();
 

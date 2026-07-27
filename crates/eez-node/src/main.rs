@@ -30,13 +30,13 @@ use alloy_provider::RootProvider;
 use alloy_signer_local::PrivateKeySigner;
 use clap::Parser as _;
 use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
-use eez_deriver::Deriver;
+use eez_deriver::{Deriver, DeriverError};
 use eez_driver::{
     EthAttributesBuilder, RollupTiming, Sequencer, SlotEvent, SyncSlotComposerHandle,
     spawn_interval, spawn_l1_anchored,
 };
 use eez_l1::{
-    L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
+    L1CanonicalHead, L1Error, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
 };
 use eez_prover::MockEcdsaProver;
 use mimalloc::MiMalloc;
@@ -874,7 +874,7 @@ fn main() -> eyre::Result<()> {
         loop {
             match deriver.catch_up().await {
                 Ok(()) => break,
-                Err(err) if err.is_source_incomplete() => {
+                Err(err @ DeriverError::L1Scan(L1Error::SourceIncomplete { .. })) => {
                     catch_up_attempts += 1;
                     event!(
                         name: "eez.node.deriver.boot_catch_up.source_incomplete",

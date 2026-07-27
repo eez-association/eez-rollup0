@@ -38,8 +38,9 @@ alloy-primitives.workspace       = true
 alloy-rpc-types-engine.workspace = true
 
 # async + diagnostics
-tokio.workspace   = true
-tracing.workspace = true
+thiserror.workspace = true
+tokio.workspace     = true
+tracing.workspace   = true
 
 [lints]
 workspace = true
