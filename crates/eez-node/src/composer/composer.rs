@@ -21,14 +21,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::driver::{
-    BlockCommitterHandle, ParentContext, SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
+    BlockCommitterHandle, ParentContext, SyncSlotBlock, SyncSlotMode,
     witness::{ExecutionWitnessMode, block_witness},
 };
 use crate::l1::{BundleTarget, L1Event, L1Watcher, SendOutcome, Submitter};
 use alloy_eips::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider as _;
-use async_trait::async_trait;
 use eez_protocol::BlockWitness;
 use eez_proverd::client::RemoteProver;
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -525,7 +524,7 @@ where
     /// the Deriver via the shared `L1CanonicalHead`).
     ///
     /// Cross-chain Sync-slot composition is driven separately through
-    /// the [`SyncSlotComposer`] trait (the Sequencer calls
+    /// [`Composer::compose_sync_slot`] (the Sequencer calls
     /// `compose_sync_slot` on its schedule), so this loop takes no
     /// batch-candidate input. Exits when the L1 event stream closes —
     /// the upstream `L1Watcher` task has exited.
@@ -744,8 +743,7 @@ where
     }
 }
 
-#[async_trait]
-impl<L2> SyncSlotComposer for Composer<L2>
+impl<L2> Composer<L2>
 where
     L2: BlockReader<Header = alloy_consensus::Header>
         + StateProviderFactory
@@ -762,7 +760,7 @@ where
     /// Each drained tx runs through `simulate_and_resolve` and the rich Sync
     /// block + atomic L1 bundle dispatch via `compose_via_evm_composer`
     /// (optimistic). Held transactions are never executed directly on L2.
-    async fn compose_sync_slot(
+    pub async fn compose_sync_slot(
         &self,
         rollup_id: u64,
         parent: ParentContext,

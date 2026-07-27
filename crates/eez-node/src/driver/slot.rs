@@ -31,7 +31,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy_consensus::Header;
 use alloy_rpc_types_engine::ExecutionData;
-use async_trait::async_trait;
 use reth_primitives_traits::SealedHeader;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
@@ -146,32 +145,15 @@ pub enum SyncSlotMode {
     Catchup,
 }
 
-/// Per-Sync-slot block producer for cross-chain content.
+/// Cheap clone-able handle for the per-Sync-slot block producer.
 ///
-/// Called by the Sequencer before each Sync block. The production impl
-/// (`eez-composer::Composer`) drains its `HeldPool`, resolves each held
-/// tx into system txs, builds the Sync block in-process, and returns it.
+/// Called by the Sequencer before each Sync block. The composer drains
+/// its `HeldPool`, resolves each held tx into system txs, builds the
+/// Sync block in-process, and returns it
+/// ([`Composer::compose_sync_slot`](crate::composer::Composer::compose_sync_slot)).
 /// `None` = no content → the Sequencer does a pool-driven Sync commit.
-/// `mode` gates the drain (see [`SyncSlotMode`]). Lives here, not in
-/// `eez-composer`, to avoid a dependency cycle.
-#[async_trait]
-pub trait SyncSlotComposer: Send + Sync + 'static {
-    /// Compose a Sync slot. `target_l1_block`: `Some(n)` aims the postBatch
-    /// at exactly L1 block `n` (steady state, `l1_head + 1`); `None` aims the
-    /// next available block (catch-up). `mode` gates the drain: `Catchup`
-    /// blocks are empty (cross-chain waits for the next `Steady` slot).
-    async fn compose_sync_slot(
-        &self,
-        rollup_id: u64,
-        parent: ParentContext,
-        timestamp: u64,
-        target_l1_block: Option<u64>,
-        mode: SyncSlotMode,
-    ) -> Option<SyncSlotBlock>;
-}
-
-/// Cheap clone-able handle for a [`SyncSlotComposer`].
-pub type SyncSlotComposerHandle = Arc<dyn SyncSlotComposer>;
+/// `mode` gates the drain (see [`SyncSlotMode`]).
+pub type SyncSlotComposerHandle = Arc<crate::composer::Composer<crate::EthNodeProvider>>;
 
 /// Spawn an interval ticker that emits [`SlotEvent::Live`] every
 /// `block_time`. Returns the receiver side of the channel.

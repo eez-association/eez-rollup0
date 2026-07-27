@@ -501,10 +501,21 @@ where
                     let parent = crate::driver::slot::ParentContext {
                         header: last_header.clone(),
                     };
-                    composer
-                        // Catch-up: next-available L1 block (unpinned), empty.
-                        .compose_sync_slot(*rollup_id, parent, sync_ts, None, SyncSlotMode::Catchup)
-                        .await
+                    // Box::pin: compose_sync_slot's future is large (was
+                    // implicitly boxed when this went through the dyn
+                    // SyncSlotComposer trait) — keep it off the stack.
+                    Box::pin(
+                        composer
+                            // Catch-up: next-available L1 block (unpinned), empty.
+                            .compose_sync_slot(
+                                *rollup_id,
+                                parent,
+                                sync_ts,
+                                None,
+                                SyncSlotMode::Catchup,
+                            ),
+                    )
+                    .await
                 } else {
                     None
                 };
@@ -597,17 +608,20 @@ where
                     let parent = crate::driver::slot::ParentContext {
                         header: last_header.clone(),
                     };
-                    composer
-                        // Steady: aim the immediate next L1 block, pinned to
-                        // expected_sync_ts (re-derivable; == the L1 slot ts on-grid).
-                        .compose_sync_slot(
-                            *rollup_id,
-                            parent,
-                            expected_sync_ts,
-                            Some(l1_head + 1),
-                            SyncSlotMode::Steady,
-                        )
-                        .await
+                    // Box::pin: see the catch-up call above.
+                    Box::pin(
+                        composer
+                            // Steady: aim the immediate next L1 block, pinned to
+                            // expected_sync_ts (re-derivable; == the L1 slot ts on-grid).
+                            .compose_sync_slot(
+                                *rollup_id,
+                                parent,
+                                expected_sync_ts,
+                                Some(l1_head + 1),
+                                SyncSlotMode::Steady,
+                            ),
+                    )
+                    .await
                 } else {
                     None
                 };

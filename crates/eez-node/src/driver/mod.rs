@@ -46,8 +46,8 @@ pub use error::{DriverError, DriverResult};
 pub use sequencer::{EthAttributesBuilder, Sequencer};
 #[doc(inline)]
 pub use slot::{
-    ParentContext, SlotEvent, SlotKind, SyncSlotBlock, SyncSlotComposer, SyncSlotComposerHandle,
-    SyncSlotMode, spawn_interval, spawn_l1_anchored,
+    ParentContext, SlotEvent, SlotKind, SyncSlotBlock, SyncSlotComposerHandle, SyncSlotMode,
+    spawn_interval, spawn_l1_anchored,
 };
 #[doc(inline)]
 #[doc(inline)]
