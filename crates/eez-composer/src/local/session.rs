@@ -252,15 +252,6 @@ impl LocalExecutionSession {
     /// reth `evm_with_env_and_inspector` API wants ownership. Dispatch
     /// errors are surfaced via the inspector's `take_error` path on
     /// drop; we promote them into `Err` before returning the outcome.
-    ///
-    /// # Pitfall #3 guard
-    ///
-    /// The target-side inspector fires from inside a scoped OS thread
-    /// whose tokio entry is `Handle::block_on(...)`. This function
-    /// body MUST NOT introduce a real `.await` — doing so would try
-    /// to park back onto the outer runtime while the scoped thread
-    /// is blocking a worker, producing a starvation deadlock. See
-    /// the amendment C15 regression test.
     fn execute_internal_with_inspector(
         &mut self,
         inspector: eez_evm_inspector::SessionInspector<'_>,
@@ -315,7 +306,7 @@ impl LocalExecutionSession {
         // Overlay write-back: when this session is the entry rollup's
         // overlay session (channel handle installed at construction),
         // publish the post-execute cache for the source-sim inspector
-        // to diff-apply onto source's journal after `block_in_place`
+        // to diff-apply onto source's journal after the dispatch
         // returns. The cache here is the cumulative state after every
         // overlay call so far, since multiple overlay executes within
         // one source-sim hook reuse the same session.
@@ -327,7 +318,7 @@ impl LocalExecutionSession {
         // `build_batch` walks for the entry rollup.
         //
         // Stack-based push: the inspector at the dispatching frame
-        // pops the top after `block_in_place` returns and applies the
+        // pops the top after the dispatch returns and applies the
         // diff. Stack semantics let nested re-entries chain
         // post-caches through their respective inspector pops without
         // collision.
@@ -389,26 +380,14 @@ impl LocalExecutionSession {
     }
 }
 
-#[async_trait::async_trait]
 impl TargetExecutionSession for LocalExecutionSession {
-    async fn execute(
+    fn execute(
         &mut self,
         req: ExecutionRequest,
         dispatcher: &mut CompositionBuilder,
     ) -> ExecutorResult<ExecutionResponse> {
-        // Pitfall #3 invariant: this method runs SYNCHRONOUSLY under
-        // the caller's `Handle::block_on`. Do NOT introduce a real
-        // `.await` on I/O here or in `execute_internal*` — the target-
-        // side inspector dispatches from a scoped OS thread that holds
-        // a tokio worker, and a real await would park the outer
-        // runtime.
-        debug_assert!(
-            tokio::runtime::Handle::try_current().is_ok(),
-            "LocalExecutionSession::execute must be called from within a tokio runtime"
-        );
         let outcome = if let Some(factory) = self.inspector_factory.clone() {
-            let handle = tokio::runtime::Handle::current();
-            let inspector = factory.build(dispatcher, handle);
+            let inspector = factory.build(dispatcher);
             self.execute_internal_with_inspector(
                 inspector,
                 &req.target_address,
@@ -447,14 +426,14 @@ impl TargetExecutionSession for LocalExecutionSession {
         })
     }
 
-    async fn checkpoint(&mut self) -> ExecutorResult<eez_protocol::SessionSnapshot> {
+    fn checkpoint(&mut self) -> ExecutorResult<eez_protocol::SessionSnapshot> {
         // Opaque snapshot carrying the current root only. The full
         // revm `State<DB>` deep-clone is tracked as known debt — see
         // CLAUDE.md "Known limitations".
         Ok(Box::new(self.current_root.0) as Box<dyn std::any::Any + Send>)
     }
 
-    async fn rollback(&mut self, snapshot: eez_protocol::SessionSnapshot) -> ExecutorResult<()> {
+    fn rollback(&mut self, snapshot: eez_protocol::SessionSnapshot) -> ExecutorResult<()> {
         let root: [u8; 32] = *snapshot.downcast::<[u8; 32]>().map_err(|_e| {
             ExecutorError::from(ExecutorErrorKind::Encoding(
                 "LocalExecutionSession::rollback: snapshot type mismatch".into(),
@@ -465,7 +444,7 @@ impl TargetExecutionSession for LocalExecutionSession {
     }
 
     /// Placeholder checkpoint until overlay/witness recording is implemented.
-    async fn take_checkpoint(&mut self) -> Option<eez_protocol::ExecutionCheckpoint> {
+    fn take_checkpoint(&mut self) -> Option<eez_protocol::ExecutionCheckpoint> {
         Some(eez_protocol::ExecutionCheckpoint {
             version: 1,
             chain_id: self.chain_id,

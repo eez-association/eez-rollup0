@@ -32,8 +32,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
-
 use crate::checkpoint::ExecutionCheckpoint;
 use crate::composition::CompositionBuilder;
 use crate::error::{ExecutorError, ExecutorErrorKind, ExecutorResult};
@@ -223,11 +221,8 @@ impl FakeChainClient {
     }
 }
 
-#[async_trait]
 impl ChainClient for FakeChainClient {
-    async fn begin_execution_session(
-        &self,
-    ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
+    fn begin_execution_session(&self) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
         Ok(Box::new(FakeChainSession {
             outcomes: Arc::clone(&self.session_outcomes),
             dispatched_outcomes: Arc::clone(&self.dispatched_outcomes),
@@ -236,7 +231,7 @@ impl ChainClient for FakeChainClient {
         }))
     }
 
-    async fn simulate_transactions(
+    fn simulate_transactions(
         &self,
         txs: &[TargetTransaction],
     ) -> ExecutorResult<TargetBatchSimulation> {
@@ -251,7 +246,7 @@ impl ChainClient for FakeChainClient {
             .unwrap_or_else(|| Err(self.unavailable("simulate_transactions")))
     }
 
-    async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
+    fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
         // Self-query for tests reuses the seeded `stored_roots` map under
         // the fake's own rollup_id, falling back to all-zeros so tests
         // that don't seed a self-root don't fail surprisingly.
@@ -265,9 +260,8 @@ impl ChainClient for FakeChainClient {
     }
 }
 
-#[async_trait]
 impl EntryChainClient for FakeChainClient {
-    async fn simulate_source_tx(
+    fn simulate_source_tx(
         &self,
         raw_tx: Vec<u8>,
         dispatcher: &mut CompositionBuilder,
@@ -284,9 +278,8 @@ impl EntryChainClient for FakeChainClient {
     }
 }
 
-#[async_trait]
 impl crate::executor::CommittedRootReader for FakeChainClient {
-    async fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
+    fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
         self.require_entry("stored_target_state_root")?;
         self.stored_roots
             .lock()
@@ -319,9 +312,8 @@ impl std::fmt::Debug for FakeChainSession {
     }
 }
 
-#[async_trait]
 impl TargetExecutionSession for FakeChainSession {
-    async fn execute(
+    fn execute(
         &mut self,
         _req: ExecutionRequest,
         _dispatcher: &mut CompositionBuilder,
@@ -362,7 +354,7 @@ impl TargetExecutionSession for FakeChainSession {
         })
     }
 
-    async fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
+    fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
         // Fake snapshot — captures the current outcome-queue length so
         // a rollback could restore the queue position. Tests don't
         // exercise rollback yet; the marker box is enough to satisfy
@@ -371,15 +363,12 @@ impl TargetExecutionSession for FakeChainSession {
         Ok(Box::new(q_len) as Box<dyn std::any::Any + Send>)
     }
 
-    async fn rollback(
-        &mut self,
-        _snapshot: crate::executor::SessionSnapshot,
-    ) -> ExecutorResult<()> {
+    fn rollback(&mut self, _snapshot: crate::executor::SessionSnapshot) -> ExecutorResult<()> {
         // Fakes don't actually restore state — they're queue-driven.
         Ok(())
     }
 
-    async fn take_checkpoint(&mut self) -> Option<ExecutionCheckpoint> {
+    fn take_checkpoint(&mut self) -> Option<ExecutionCheckpoint> {
         // Return an ad-hoc checkpoint via the factory; `None` if
         // unset. Most tests don't exercise this path.
         let mut guard = self.checkpoint_factory.lock().expect("fake mutex poisoned");
@@ -464,21 +453,9 @@ mod tests {
                         source_address: Address::ZERO,
                         source_rollup_id: entry_id,
                     };
-                    // The real inspector bridges sync → async via a
-                    // scoped OS thread + `Handle::block_on`. Mirror
-                    // that here so
-                    // the hook can invoke the async dispatcher from a
-                    // sync closure without deadlocking the outer
-                    // tokio multi-thread test runtime.
-                    let handle = tokio::runtime::Handle::current();
-                    std::thread::scope(|s| {
-                        s.spawn(|| {
-                            handle.block_on(dispatcher.dispatch_call(target_id, entry_id, req))
-                        })
-                        .join()
-                        .expect("dispatcher thread panicked")
-                    })
-                    .map(|_| ())
+                    dispatcher
+                        .dispatch_call(target_id, entry_id, req)
+                        .map(|_| ())
                 }),
         );
 
@@ -507,9 +484,8 @@ mod tests {
         let mut builder = CompositionBuilder::new(entry_id, rollups);
         entry
             .simulate_source_tx(Vec::new(), &mut builder)
-            .await
             .expect("source sim");
-        let composition = builder.finalize(&[]).await.expect("finalize");
+        let composition = builder.finalize(&[]).expect("finalize");
 
         // Entry batch carries the top-level call as one deferred entry.
         assert_eq!(composition.source.batch.entries.len(), 1);
@@ -532,7 +508,6 @@ mod tests {
         use crate::executor::CommittedRootReader;
         let follower = FakeChainClient::new_follower(RollupId(1));
         let err = CommittedRootReader::stored_target_state_root(&follower, RollupId(0))
-            .await
             .expect_err("follower must reject entry-only methods");
         assert!(matches!(err.kind(), ExecutorErrorKind::Unavailable(s) if s.contains("follower")));
     }

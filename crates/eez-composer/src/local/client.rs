@@ -245,7 +245,6 @@ where
     }
 }
 
-#[async_trait::async_trait]
 impl<Provider, EvmConfig> ChainClient for LocalChainClient<Provider, EvmConfig>
 where
     Provider: StateProviderFactory
@@ -258,9 +257,7 @@ where
         + 'static,
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives> + Clone + Send + Sync + 'static,
 {
-    async fn begin_execution_session(
-        &self,
-    ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
+    fn begin_execution_session(&self) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
         tracing::debug!(
             rollup_id = %self.rollup_id,
             ccm = %self.ccm_address,
@@ -335,7 +332,7 @@ where
         Ok(Box::new(session))
     }
 
-    async fn simulate_transactions(
+    fn simulate_transactions(
         &self,
         txs: &[TargetTransaction],
     ) -> ExecutorResult<TargetBatchSimulation> {
@@ -345,7 +342,7 @@ where
     /// Read the latest block header's `stateRoot` from this chain's
     /// own provider. Orthogonal to invariant-6 anchoring; useful for
     /// diagnostics and future paths.
-    async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
+    fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
         let num = self
             .raw_provider
             .best_block_number()
@@ -361,7 +358,6 @@ where
     }
 }
 
-#[async_trait::async_trait]
 impl<Provider, EvmConfig> EntryChainClient for LocalChainClient<Provider, EvmConfig>
 where
     Provider: StateProviderFactory
@@ -374,7 +370,7 @@ where
         + 'static,
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives> + Clone + Send + Sync + 'static,
 {
-    async fn simulate_source_tx(
+    fn simulate_source_tx(
         &self,
         raw_tx: Vec<u8>,
         dispatcher: &mut CompositionBuilder,
@@ -439,8 +435,9 @@ where
         // Reth's `StateProviderBox` is not `Sync`, so a cross-thread
         // overlay design (e.g. closures over `*mut State<DB>`) is not
         // viable. The current overlay path keeps both the source-sim
-        // EVM and the entry overlay session on the same OS thread via
-        // `block_in_place`, so this constraint never bites.
+        // EVM and the entry overlay session on the same OS thread (the
+        // dispatch is a plain nested call), so this constraint never
+        // bites.
 
         // ── 3. Run source EVM with inspector ──────────────────────
         let t_env = Instant::now();
@@ -476,8 +473,7 @@ where
         if let Some(channel) = &self.overlay_channel {
             factory = factory.with_overlay_channel(Arc::clone(channel));
         }
-        let handle = tokio::runtime::Handle::current();
-        let inspector = factory.build(dispatcher, handle);
+        let inspector = factory.build(dispatcher);
         let mut evm = self
             .raw_evm_config
             .evm_with_env_and_inspector(&mut state, evm_env, inspector);
@@ -552,7 +548,6 @@ where
 /// can serve when L1-style: the entry case covers L1-as-entry single-binary;
 /// the follower case covers L1-as-follower in L2-as-entry topology.
 /// Non-L1 clients return `Unavailable` so misregistration fails loudly.
-#[async_trait::async_trait]
 impl<Provider, EvmConfig> CommittedRootReader for LocalChainClient<Provider, EvmConfig>
 where
     Provider: StateProviderFactory
@@ -565,7 +560,7 @@ where
         + 'static,
     EvmConfig: ConfigureEvm<Primitives = EthPrimitives> + Clone + Send + Sync + 'static,
 {
-    async fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
+    fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
         // Only L1-style clients honestly serve committed-root reads —
         // the storage-slot math `compute_state_root_slot` assumes the
         // L1 `EEZ.sol` layout. L2-style clients return `Unavailable`

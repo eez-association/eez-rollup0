@@ -201,10 +201,10 @@ pub struct CompositionBuilder {
     /// which is unbuilt).
     pub(crate) checked_out: std::collections::HashSet<RollupId>,
     /// Recorded-call indices whose snapshots need rollback. Drained at
-    /// the start of every async `dispatch_call` (and at finalize) so
-    /// the rollback runs at the next `.await` point — keeps
-    /// `close_call` / `annotate_revert_span` synchronous (the
-    /// inspector calls them from synchronous EVM hooks).
+    /// the start of every `dispatch_call` (and at finalize) so the
+    /// rollback runs at the next dispatch boundary — `close_call` /
+    /// `annotate_revert_span` only queue (the inspector calls them
+    /// from EVM hooks mid-frame).
     pub(crate) pending_rollbacks: Vec<usize>,
 }
 
@@ -295,7 +295,7 @@ impl CompositionBuilder {
     /// every `dispatch_call` (and from `finalize`) so a revert
     /// observed at the previous `Inspector::call_end` propagates to
     /// the affected target sessions before the next call opens.
-    async fn process_pending_rollbacks(&mut self) -> ExecutorResult<()> {
+    fn process_pending_rollbacks(&mut self) -> ExecutorResult<()> {
         if self.pending_rollbacks.is_empty() {
             return Ok(());
         }
@@ -320,7 +320,7 @@ impl CompositionBuilder {
             if let Some(rollup) = self.rollups.get_mut(&rollup_id)
                 && let Some(session) = rollup.session.as_mut()
             {
-                session.rollback(snap).await?;
+                session.rollback(snap)?;
             }
         }
         // Any other snapshots still keyed under bracketed indices are
@@ -371,8 +371,12 @@ impl CompositionBuilder {
     /// in the plan set, [`ProtocolErrorKind::InvalidCheckpoint`] if
     /// per-rollup state-delta chaining fails in `build_batch`.
     /// Surfaces any [`ExecutorError`] from CCM verification.
+    // Large Err variant is the pre-existing error shape (previously
+    // hidden behind the async fn's returned future); boxing it is out
+    // of scope here.
+    #[allow(clippy::result_large_err)]
     #[tracing::instrument(level = "debug", name = "finalize", skip_all, err)]
-    pub async fn finalize(mut self, raw_tx: &[u8]) -> CompositionResult<Composition> {
+    pub fn finalize(mut self, raw_tx: &[u8]) -> CompositionResult<Composition> {
         tracing::debug!(name: "composer.finalize.start", "composition finalize started");
 
         if self.recorded.is_empty() || self.rollups.is_empty() {
@@ -477,7 +481,7 @@ impl CompositionBuilder {
                 if batch.is_empty() {
                     continue;
                 }
-                let root = rollup.client.current_state_root().await?;
+                let root = rollup.client.current_state_root()?;
                 if let Some(last) = self
                     .recorded
                     .iter_mut()
@@ -620,7 +624,7 @@ impl CompositionBuilder {
             let tx_exec = make_ccm_tx(Bytes::from(exec_calldata), outer_root.value);
             let txs: Vec<TargetTransaction> = vec![tx_load, tx_exec];
 
-            let sim = rollup.client.simulate_transactions(&txs).await?;
+            let sim = rollup.client.simulate_transactions(&txs)?;
 
             if let Some(last) = self
                 .recorded
@@ -733,17 +737,15 @@ impl CompositionBuilder {
         fields(target = %target_rollup_id, source = %source_rollup_id),
         err,
     )]
-    pub async fn dispatch_call(
+    pub fn dispatch_call(
         &mut self,
         target_rollup_id: RollupId,
         source_rollup_id: RollupId,
         req: ExecutionRequest,
     ) -> ExecutorResult<ExecutionResponse> {
         // Drain any pending rollbacks queued by the previous frame's
-        // `annotate_revert_span` / `close_call`. This is the next
-        // async point — synchronous lifecycle methods cannot call
-        // `session.rollback().await` directly.
-        self.process_pending_rollbacks().await?;
+        // `annotate_revert_span` / `close_call`.
+        self.process_pending_rollbacks()?;
 
         // Same-chain re-entry guard. Entry-to-entry dispatch (e.g. a
         // contract on the entry chain calling another entry-chain
@@ -758,9 +760,7 @@ impl CompositionBuilder {
 
         // Phase 1 — open: lazy-open the session, snapshot it, push
         // `Pending` placeholder, capture slot index.
-        let idx = self
-            .open_call(target_rollup_id, source_rollup_id, &req)
-            .await?;
+        let idx = self.open_call(target_rollup_id, source_rollup_id, &req)?;
 
         // Phase 2 — run execute on the lazy-opened session.
         let mut session = self
@@ -771,12 +771,12 @@ impl CompositionBuilder {
             .take()
             .expect("session opened by open_call");
 
-        // `session.execute` awaits first; nested dispatches from a
+        // `session.execute` runs first; nested dispatches from a
         // target-session inspector call back into `self.dispatch_call`
         // and push their own `ExecutedAction`s at indices `idx + 1, ..`.
         // The vec is preorder by construction.
         self.checked_out.insert(target_rollup_id);
-        let response_res = session.execute(req, self).await;
+        let response_res = session.execute(req, self);
 
         // Put the session back even on error; revert handling is
         // post-close via `annotate_revert_span`.
@@ -811,7 +811,7 @@ impl CompositionBuilder {
     ///
     /// Same as [`dispatch_call`](Self::dispatch_call) — re-entry guard
     /// and rollup-id validation fire here.
-    pub async fn open_call(
+    pub fn open_call(
         &mut self,
         target_rollup_id: RollupId,
         source_rollup_id: RollupId,
@@ -849,11 +849,11 @@ impl CompositionBuilder {
                 .get_mut(&target_rollup_id)
                 .expect("rollup present (just checked)");
             if rollup.session.is_none() {
-                let new_session = rollup.client.begin_execution_session().await?;
+                let new_session = rollup.client.begin_execution_session()?;
                 rollup.session = Some(new_session);
             }
             let session = rollup.session.as_mut().expect("session opened above");
-            session.checkpoint().await?
+            session.checkpoint()?
         };
 
         let idx = self.recorded.len();
@@ -989,19 +989,18 @@ mod tests {
         session_outcome: ExecutionOutcome,
     }
 
-    #[async_trait::async_trait]
     impl ChainClient for MockClient {
-        async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
+        fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
             Ok([0u8; 32])
         }
-        async fn begin_execution_session(
+        fn begin_execution_session(
             &self,
         ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
             Ok(Box::new(MockSession {
                 outcome: self.session_outcome.clone(),
             }))
         }
-        async fn simulate_transactions(
+        fn simulate_transactions(
             &self,
             txs: &[TargetTransaction],
         ) -> ExecutorResult<TargetBatchSimulation> {
@@ -1025,30 +1024,24 @@ mod tests {
         own_rollup: RollupId,
     }
 
-    #[async_trait::async_trait]
     impl TargetExecutionSession for ReentrantSession {
-        async fn execute(
+        fn execute(
             &mut self,
             req: ExecutionRequest,
             dispatcher: &mut CompositionBuilder,
         ) -> ExecutorResult<ExecutionResponse> {
             // Nested dispatch back into the SAME rollup (caller = some
             // other id so the plain target==source guard does not fire).
-            dispatcher
-                .open_call(self.own_rollup, RollupId(7), &req)
-                .await?;
+            dispatcher.open_call(self.own_rollup, RollupId(7), &req)?;
             unreachable!("the checked-out guard must refuse the cyclic open_call");
         }
-        async fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
+        fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
             Ok(Box::new(()) as crate::executor::SessionSnapshot)
         }
-        async fn rollback(
-            &mut self,
-            _snapshot: crate::executor::SessionSnapshot,
-        ) -> ExecutorResult<()> {
+        fn rollback(&mut self, _snapshot: crate::executor::SessionSnapshot) -> ExecutorResult<()> {
             Ok(())
         }
-        async fn take_checkpoint(&mut self) -> Option<ExecutionCheckpoint> {
+        fn take_checkpoint(&mut self) -> Option<ExecutionCheckpoint> {
             None
         }
     }
@@ -1057,19 +1050,18 @@ mod tests {
         rollup: RollupId,
     }
 
-    #[async_trait::async_trait]
     impl ChainClient for ReentrantClient {
-        async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
+        fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
             Ok([0u8; 32])
         }
-        async fn begin_execution_session(
+        fn begin_execution_session(
             &self,
         ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
             Ok(Box::new(ReentrantSession {
                 own_rollup: self.rollup,
             }))
         }
-        async fn simulate_transactions(
+        fn simulate_transactions(
             &self,
             _txs: &[TargetTransaction],
         ) -> ExecutorResult<TargetBatchSimulation> {
@@ -1083,9 +1075,8 @@ mod tests {
         outcome: ExecutionOutcome,
     }
 
-    #[async_trait::async_trait]
     impl TargetExecutionSession for MockSession {
-        async fn execute(
+        fn execute(
             &mut self,
             _req: ExecutionRequest,
             _dispatcher: &mut CompositionBuilder,
@@ -1105,18 +1096,15 @@ mod tests {
             })
         }
 
-        async fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
+        fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
             Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
         }
 
-        async fn rollback(
-            &mut self,
-            _snap: crate::executor::SessionSnapshot,
-        ) -> ExecutorResult<()> {
+        fn rollback(&mut self, _snap: crate::executor::SessionSnapshot) -> ExecutorResult<()> {
             Ok(())
         }
 
-        async fn take_checkpoint(&mut self) -> Option<ExecutionCheckpoint> {
+        fn take_checkpoint(&mut self) -> Option<ExecutionCheckpoint> {
             None
         }
     }
@@ -1192,7 +1180,6 @@ mod tests {
 
         let response = builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("dispatch");
         assert_eq!(response.outcome.post_state_root(), Some(&[0x11u8; 32]));
         assert_eq!(builder.recorded.len(), 1);
@@ -1211,7 +1198,6 @@ mod tests {
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
         let _ = builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("dispatch lazy-opens rollup 1's session");
         let sessions = builder.take_sessions();
         assert_eq!(sessions.len(), 1, "exactly the lazily-opened session");
@@ -1264,7 +1250,6 @@ mod tests {
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
         let err = builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect_err("cycle must be refused");
         assert!(
             matches!(err.kind(), ExecutorErrorKind::InvalidReentry { .. }),
@@ -1283,7 +1268,6 @@ mod tests {
 
         let err = builder
             .dispatch_call(RollupId(99), RollupId(0), make_request(99))
-            .await
             .expect_err("should fail");
         assert!(matches!(err.kind(), ExecutorErrorKind::Unavailable(_)));
     }
@@ -1293,7 +1277,7 @@ mod tests {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         let builder = CompositionBuilder::new(RollupId(0), rollups);
-        let err = builder.finalize(&[]).await.expect_err("should fail");
+        let err = builder.finalize(&[]).expect_err("should fail");
         assert!(matches!(
             err.kind(),
             crate::error::CompositionErrorKind::Protocol(p)
@@ -1314,10 +1298,9 @@ mod tests {
 
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("dispatch");
 
-        let composition = builder.finalize(&[]).await.expect("finalize");
+        let composition = builder.finalize(&[]).expect("finalize");
         assert_eq!(composition.source.rollup_id, RollupId(0));
         // Entry rollup is skipped in the targets loop, so only rollup 1
         // appears in targets.
@@ -1369,7 +1352,7 @@ mod tests {
             static_meta: None,
         });
 
-        let err = builder.finalize(&[]).await.expect_err("should fail");
+        let err = builder.finalize(&[]).expect_err("should fail");
         assert!(matches!(
             err.kind(),
             crate::error::CompositionErrorKind::Protocol(p)
@@ -1392,11 +1375,10 @@ mod tests {
         for id in [3u64, 1, 2] {
             builder
                 .dispatch_call(RollupId(id), RollupId(0), make_request(id))
-                .await
                 .expect("dispatch");
         }
 
-        let composition = builder.finalize(&[]).await.expect("finalize");
+        let composition = builder.finalize(&[]).expect("finalize");
         let ids: Vec<u64> = composition.targets.iter().map(|t| t.rollup_id.0).collect();
         assert_eq!(
             ids,
@@ -1419,7 +1401,6 @@ mod tests {
         // must match source_rollup_id, not req.source_rollup.
         builder
             .dispatch_call(RollupId(1), RollupId(7), make_request(1))
-            .await
             .expect("dispatch");
         assert_eq!(builder.recorded[0].source_rollup_id, RollupId(7));
     }
@@ -1431,12 +1412,11 @@ mod tests {
     /// skipped.
     struct NoCcmClient;
 
-    #[async_trait::async_trait]
     impl ChainClient for NoCcmClient {
-        async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
+        fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
             Ok([0u8; 32])
         }
-        async fn begin_execution_session(
+        fn begin_execution_session(
             &self,
         ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
             Ok(Box::new(MockSession {
@@ -1449,7 +1429,7 @@ mod tests {
                 },
             }))
         }
-        async fn simulate_transactions(
+        fn simulate_transactions(
             &self,
             _txs: &[TargetTransaction],
         ) -> ExecutorResult<TargetBatchSimulation> {
@@ -1484,14 +1464,13 @@ mod tests {
 
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("dispatch");
         assert!(
             !builder.recorded[0].outcome.is_success(),
             "test setup: recorded call must be reverted"
         );
 
-        let composition = builder.finalize(&[]).await.expect("finalize");
+        let composition = builder.finalize(&[]).expect("finalize");
 
         // (a) handshake validated by NoCcmClient's panic-if-called
         //     impl of simulate_transactions — if we got here, CCM
@@ -1519,7 +1498,6 @@ mod tests {
 
         let err = builder
             .dispatch_call(RollupId(1), RollupId(1), make_request(1))
-            .await
             .expect_err("L2 → L2 self-dispatch must be rejected");
         assert!(
             matches!(
@@ -1552,7 +1530,6 @@ mod tests {
         let req = make_request(1);
         let idx = builder
             .open_call(RollupId(1), RollupId(0), &req)
-            .await
             .expect("open");
         assert_eq!(idx, 0);
         assert!(builder.recorded[idx].outcome.is_pending());
@@ -1566,7 +1543,6 @@ mod tests {
         // A second top-level dispatch lands at idx 1 — preorder.
         let resp = builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("dispatch");
         assert!(resp.outcome.is_success());
         assert_eq!(builder.recorded.len(), 2);
@@ -1588,7 +1564,6 @@ mod tests {
 
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("dispatch");
 
         builder.annotate_revert_span(0, 1);
@@ -1623,16 +1598,13 @@ mod tests {
         // Outer: 0 → 1
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("outer");
         // Two inner cross-rollup calls inside the outer frame.
         builder
             .dispatch_call(RollupId(2), RollupId(1), make_request(2))
-            .await
             .expect("inner-1");
         builder
             .dispatch_call(RollupId(2), RollupId(1), make_request(2))
-            .await
             .expect("inner-2");
 
         let end = builder.recorded_count();
@@ -1657,13 +1629,11 @@ mod tests {
 
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("A");
         builder.annotate_revert_span(0, 1);
 
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("B");
 
         assert_eq!(builder.recorded[0].revert_span, Some(1));
@@ -1688,11 +1658,9 @@ mod tests {
         let start = builder.recorded_count();
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("outer");
         builder
             .dispatch_call(RollupId(2), RollupId(1), make_request(2))
-            .await
             .expect("child (succeeds)");
         let span = (builder.recorded_count() - start) as u32;
         assert_eq!(span, 2);
@@ -1723,7 +1691,6 @@ mod tests {
 
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("first dispatch");
         builder.annotate_revert_span(0, 1);
         assert_eq!(builder.pending_rollbacks, vec![0]);
@@ -1732,7 +1699,6 @@ mod tests {
         // The next dispatch drains pending rollbacks at its top.
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("second dispatch");
 
         assert!(

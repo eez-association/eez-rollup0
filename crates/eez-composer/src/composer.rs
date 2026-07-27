@@ -1270,14 +1270,11 @@ where
                     push_poison_root(&mut poison, &mut poison_gaps, held);
                     continue;
                 };
-                match evm_composer
-                    .simulate_and_resolve_recorded_for(
-                        eez_protocol::RollupId(rollup_id),
-                        l2_entry,
-                        held.raw_tx.as_ref(),
-                    )
-                    .await
-                {
+                match evm_composer.simulate_and_resolve_recorded_for(
+                    eez_protocol::RollupId(rollup_id),
+                    l2_entry,
+                    held.raw_tx.as_ref(),
+                ) {
                     Ok((composition, _recorded)) => {
                         let l1_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = composition
                             .targets
@@ -1389,10 +1386,7 @@ where
 
             // ── INBOUND (L1→L2) arm. Stage the deferred target entries; the
             // delivery system txs are built post-drain (after all outbound loads).
-            match evm_composer
-                .simulate_and_resolve(held.raw_tx.as_ref())
-                .await
-            {
+            match evm_composer.simulate_and_resolve(held.raw_tx.as_ref()) {
                 Ok(composition) => {
                     let target_entries: Vec<_> = composition
                         .targets

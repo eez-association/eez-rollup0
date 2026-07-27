@@ -3192,11 +3192,9 @@ dependencies = [
  "alloy-provider",
  "alloy-rpc-types-eth",
  "alloy-sol-types",
- "async-trait",
  "eez-protocol",
  "revm",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
 ]
 

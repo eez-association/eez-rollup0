@@ -417,8 +417,12 @@ impl Composer {
     /// verification fails.
     /// Returns [`ComposerErrorKind::Protocol`] if entry building or
     /// finalization fails.
+    // Large Err variant is the pre-existing error shape (previously
+    // hidden behind the async fn's returned future); boxing it is out
+    // of scope here.
+    #[allow(clippy::result_large_err)]
     #[tracing::instrument(skip(self, raw_tx), fields(tx_len = raw_tx.len()))]
-    pub async fn simulate_and_resolve(&self, raw_tx: &[u8]) -> ComposerResult<Composition> {
+    pub fn simulate_and_resolve(&self, raw_tx: &[u8]) -> ComposerResult<Composition> {
         // Default entry selection: the pinned entry rollup + its client.
         // Per-composition entry selection (A1) goes through
         // `simulate_and_resolve_recorded_for`.
@@ -427,7 +431,6 @@ impl Composer {
             self.inner.entry.as_ref(),
             raw_tx,
         )
-        .await
         .map(|(composition, _recorded)| composition)
     }
 
@@ -448,7 +451,8 @@ impl Composer {
     /// # Errors
     ///
     /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve).
-    pub async fn simulate_and_resolve_recorded_for(
+    #[allow(clippy::result_large_err)]
+    pub fn simulate_and_resolve_recorded_for(
         &self,
         entry_id: RollupId,
         entry_client: &(dyn EntryChainClient + Send + Sync),
@@ -481,8 +485,7 @@ impl Composer {
             let initial_state_root = self
                 .inner
                 .root_reader
-                .stored_target_state_root(*rollup_id)
-                .await?;
+                .stored_target_state_root(*rollup_id)?;
             rollups.insert(
                 *rollup_id,
                 Rollup {
@@ -502,10 +505,9 @@ impl Composer {
         let mut builder = CompositionBuilder::new(entry_id, rollups);
         entry_client
             .simulate_source_tx(raw_tx.to_vec(), &mut builder)
-            .await
             .map_err(crate::error::CompositionError::from)?;
         let recorded = builder.recorded().to_vec();
-        let composition = builder.finalize(raw_tx).await?;
+        let composition = builder.finalize(raw_tx)?;
 
         tracing::info!(
             name: "composer.simulate.complete",
@@ -527,17 +529,16 @@ mod tests {
 
     struct FakeClient;
 
-    #[async_trait::async_trait]
     impl ChainClient for FakeClient {
-        async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
+        fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
             Ok([0u8; 32])
         }
-        async fn begin_execution_session(
+        fn begin_execution_session(
             &self,
         ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
             unimplemented!("composer misconfigured-state tests never open a session")
         }
-        async fn simulate_transactions(
+        fn simulate_transactions(
             &self,
             _txs: &[TargetTransaction],
         ) -> ExecutorResult<TargetBatchSimulation> {
@@ -545,9 +546,8 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
     impl EntryChainClient for FakeClient {
-        async fn simulate_source_tx(
+        fn simulate_source_tx(
             &self,
             _raw_tx: Vec<u8>,
             _dispatcher: &mut CompositionBuilder,
@@ -559,9 +559,8 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
     impl CommittedRootReader for FakeClient {
-        async fn stored_target_state_root(&self, _rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
+        fn stored_target_state_root(&self, _rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
             Ok([0u8; 32])
         }
     }
@@ -573,17 +572,16 @@ mod tests {
     // is possible).
     struct FakeFollowerClient;
 
-    #[async_trait::async_trait]
     impl ChainClient for FakeFollowerClient {
-        async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
+        fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
             Ok([0u8; 32])
         }
-        async fn begin_execution_session(
+        fn begin_execution_session(
             &self,
         ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
             unimplemented!("composer misconfigured-state tests never open a session")
         }
-        async fn simulate_transactions(
+        fn simulate_transactions(
             &self,
             _txs: &[TargetTransaction],
         ) -> ExecutorResult<TargetBatchSimulation> {
