@@ -24,9 +24,9 @@ pub use client::LocalChainClient;
 pub use gnosis_adapter::GnosisL1Adapter;
 #[doc(inline)]
 pub use provider::HeaderSource;
-// `Role` + `LocalExecutionSession` are implementation details of
-// `local.rs` and `session.rs`; not re-exported beyond the crate.
+// `Role` is an implementation detail of `client.rs`; not re-exported
+// beyond the crate.
 #[allow(unused_imports, reason = "future test/public consumers")]
 pub(crate) use client::Role;
-#[allow(unused_imports, reason = "future test/public consumers")]
-pub(crate) use session::LocalExecutionSession;
+#[doc(inline)]
+pub use session::{LocalExecutionSession, SessionSnapshot};

@@ -460,21 +460,15 @@ fn main() -> eyre::Result<()> {
             // L2 ENTRY client for OUTBOUND (L2→L1) source-sim — built inside the
             // block below alongside the L2 follower, threaded into `Composer::new`
             // via `CrossChainWiring`. `None` without an embedded L1.
-            let mut l2_entry_client: Option<
-                Arc<
-                    dyn eez_node::composer::executor::ChainClient
-                        + Send
-                        + Sync,
-                >,
-            > = None;
+            let mut l2_entry_client: Option<Arc<eez_node::composer::LocalChainClient>> = None;
             type WiringParts = (
                 eez_protocol::RollupId,
-                Arc<dyn eez_node::composer::executor::ChainClient + Send + Sync>,
-                Arc<dyn eez_node::composer::executor::ChainClient + Send + Sync>,
+                Arc<eez_node::composer::LocalChainClient>,
+                Arc<eez_node::composer::LocalChainClient>,
                 std::collections::HashMap<
                     eez_protocol::RollupId,
                     (
-                        Arc<dyn eez_node::composer::executor::ChainClient + Send + Sync>,
+                        Arc<eez_node::composer::LocalChainClient>,
                         eez_node::composer::TargetConfig,
                     ),
                 >,
@@ -498,7 +492,7 @@ fn main() -> eyre::Result<()> {
                     // `GnosisL1Adapter` and builds a fresh `EthEvmConfig`
                     // over the chiado ChainSpec (source-sim needs only
                     // revm, not GnosisNode's AuRa paths). Both yield the
-                    // same erased views, so composition is identical.
+                    // same client views, so composition is identical.
                     let (entry_client_view, root_reader_view) = match l1_variant {
                         EmbeddedL1::Dev(l1_handle) => {
                             let l1_provider = l1_handle.node.provider.clone();
@@ -511,17 +505,7 @@ fn main() -> eyre::Result<()> {
                                 eez_registry,
                                 eez_protocol::ChainDialect::EvmL1Style,
                             );
-                            let entry_view: std::sync::Arc<
-                                dyn eez_node::composer::executor::ChainClient
-                                    + Send
-                                    + Sync,
-                            > = entry_client.clone();
-                            let root_view: std::sync::Arc<
-                                dyn eez_node::composer::executor::ChainClient
-                                    + Send
-                                    + Sync,
-                            > = entry_client.clone();
-                            (entry_view, root_view)
+                            (entry_client.clone(), entry_client)
                         }
                         EmbeddedL1::Chiado(chiado_handle) => {
                             // `GnosisChainSpec.inner` is the standard
@@ -544,17 +528,7 @@ fn main() -> eyre::Result<()> {
                                 eez_registry,
                                 eez_protocol::ChainDialect::EvmL1Style,
                             );
-                            let entry_view: std::sync::Arc<
-                                dyn eez_node::composer::executor::ChainClient
-                                    + Send
-                                    + Sync,
-                            > = entry_client.clone();
-                            let root_view: std::sync::Arc<
-                                dyn eez_node::composer::executor::ChainClient
-                                    + Send
-                                    + Sync,
-                            > = entry_client.clone();
-                            (entry_view, root_view)
+                            (entry_client.clone(), entry_client)
                         }
                     };
 
@@ -569,11 +543,7 @@ fn main() -> eyre::Result<()> {
                         ccm_l2,
                         eez_protocol::ChainDialect::EvmL2Style,
                     );
-                    let l2_follower_view: std::sync::Arc<
-                        dyn eez_node::composer::executor::ChainClient
-                            + Send
-                            + Sync,
-                    > = l2_follower;
+                    let l2_follower_view = l2_follower;
 
                     // L2 ENTRY client (follower's provider/dialect, but
                     // Role::Entry) — the follower client errors `Unavailable` for
@@ -586,12 +556,7 @@ fn main() -> eyre::Result<()> {
                         ccm_l2,
                         eez_protocol::ChainDialect::EvmL2Style,
                     );
-                    let l2_entry_view: std::sync::Arc<
-                        dyn eez_node::composer::executor::ChainClient
-                            + Send
-                            + Sync,
-                    > = l2_entry;
-                    l2_entry_client = Some(l2_entry_view);
+                    l2_entry_client = Some(l2_entry);
 
                     let entry_cfg = TargetConfig {
                         proxy_lookup: ProxyLookupConfig {

@@ -19,7 +19,7 @@ use reth_trie_common::{HashedPostState, KeccakKeyHasher};
 use revm::DatabaseCommit;
 use revm::database::CacheState;
 
-use crate::composer::{CompositionBuilder, ExecutionRequest, TargetExecutionSession};
+use crate::composer::{CompositionBuilder, ExecutionRequest};
 use eez_protocol::{ExecutionOutcome, ExecutorError, ExecutorErrorKind, ExecutorResult, RollupId};
 
 use super::provider::ChainProvider;
@@ -28,10 +28,22 @@ use super::provider::ChainProvider;
 /// enough for worst-case dev-chain paths; too low → silent reverts.
 pub(super) const DIRECT_CALL_GAS_LIMIT: u64 = 30_000_000;
 
+/// Typed snapshot of a session's rollback state, captured by
+/// [`LocalExecutionSession::checkpoint`] and restored by
+/// [`LocalExecutionSession::rollback`]. Carries the current root only —
+/// the full revm `State<DB>` deep-clone is tracked as known debt (see
+/// CLAUDE.md "Known limitations").
+#[derive(Debug, Clone)]
+pub struct SessionSnapshot {
+    /// The session's `current_root` at checkpoint time.
+    current_root: B256,
+}
+
 /// Stateful target-chain execution session.
 ///
-/// Opened by `LocalChainClient::begin_execution_session` (the
-/// `ChainClient` trait method, not an inherent fn); owned by the
+/// Opened by
+/// [`LocalChainClient::begin_execution_session`](crate::composer::LocalChainClient::begin_execution_session);
+/// owned by the
 /// `CompositionBuilder` through a `Rollup.session` slot for the
 /// lifetime of one composition.
 ///
@@ -381,9 +393,22 @@ impl LocalExecutionSession {
     }
 }
 
-#[async_trait::async_trait]
-impl TargetExecutionSession for LocalExecutionSession {
-    async fn execute(
+impl LocalExecutionSession {
+    /// Execute a single call on the target chain.
+    ///
+    /// `dispatcher` is consumed by nested cross-chain dispatch: a
+    /// target-session inspector can call back into the composer through
+    /// `dispatcher` to route a nested proxy call.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces [`ExecutorErrorKind::Evm`] / [`ExecutorErrorKind::Provider`]
+    /// from the underlying execution.
+    #[allow(
+        clippy::unused_async,
+        reason = "async-ness preserved from the removed trait surface; de-async is a separate change"
+    )]
+    pub async fn execute(
         &mut self,
         req: ExecutionRequest,
         dispatcher: &mut CompositionBuilder,
@@ -423,20 +448,45 @@ impl TargetExecutionSession for LocalExecutionSession {
         Ok(outcome)
     }
 
-    async fn checkpoint(&mut self) -> ExecutorResult<crate::composer::SessionSnapshot> {
-        // Opaque snapshot carrying the current root only. The full
-        // revm `State<DB>` deep-clone is tracked as known debt — see
-        // CLAUDE.md "Known limitations".
-        Ok(Box::new(self.current_root.0) as Box<dyn std::any::Any + Send>)
+    /// Capture a snapshot of the session's current state. The returned
+    /// value is fed back to [`rollback`](Self::rollback) to restore the
+    /// session to its pre-call state. Drop the snapshot to commit
+    /// forward (no-op).
+    ///
+    /// Used by the composer's revertSpan path:
+    /// [`CompositionBuilder::open_call`] snapshots the target session
+    /// BEFORE delegating to `execute`, stashes the snapshot keyed by
+    /// call idx, and either drops it (success path) or rolls back
+    /// (revert-span path) when
+    /// [`CompositionBuilder::annotate_revert_span`] fires.
+    ///
+    /// # Errors
+    ///
+    /// Infallible today (the snapshot carries the current root only —
+    /// see [`SessionSnapshot`]); kept fallible for parity with the
+    /// paths that stash and replay it.
+    #[allow(
+        clippy::unused_async,
+        reason = "async-ness preserved from the removed trait surface; de-async is a separate change"
+    )]
+    pub async fn checkpoint(&mut self) -> ExecutorResult<SessionSnapshot> {
+        Ok(SessionSnapshot {
+            current_root: self.current_root,
+        })
     }
 
-    async fn rollback(&mut self, snapshot: crate::composer::SessionSnapshot) -> ExecutorResult<()> {
-        let root: [u8; 32] = *snapshot.downcast::<[u8; 32]>().map_err(|_e| {
-            ExecutorError::from(ExecutorErrorKind::Encoding(
-                "LocalExecutionSession::rollback: snapshot type mismatch".into(),
-            ))
-        })?;
-        self.current_root = revm::primitives::B256::from(root);
+    /// Restore the session to the state captured by `snapshot`. The
+    /// snapshot must have come from this session's `checkpoint` call.
+    ///
+    /// # Errors
+    ///
+    /// Infallible today; kept fallible for parity with `checkpoint`.
+    #[allow(
+        clippy::unused_async,
+        reason = "async-ness preserved from the removed trait surface; de-async is a separate change"
+    )]
+    pub async fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()> {
+        self.current_root = snapshot.current_root;
         Ok(())
     }
 }

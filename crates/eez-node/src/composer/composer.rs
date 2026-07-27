@@ -136,18 +136,18 @@ pub struct CrossChainWiring {
     pub entry_rollup_id: eez_protocol::RollupId,
     /// Entry-chain (L1) client — runs source simulation for INBOUND
     /// (L1→L2) txs.
-    pub entry_client: Arc<dyn crate::composer::executor::ChainClient + Send + Sync>,
+    pub entry_client: Arc<crate::composer::LocalChainClient>,
     /// Committed-root reader: serves every rollup's upstream-
     /// invariant-6 anchor root (`EEZ.rollups[id].stateRoot`) —
     /// chain headers are NOT correct for this purpose.
-    pub root_reader: Arc<dyn crate::composer::executor::ChainClient + Send + Sync>,
+    pub root_reader: Arc<crate::composer::LocalChainClient>,
     /// All registered rollups (entry + followers): client + config,
     /// keyed by rollup id. The per-tx dispatch map is built from this
     /// on every composition.
     pub rollups: HashMap<
         eez_protocol::RollupId,
         (
-            Arc<dyn crate::composer::executor::ChainClient + Send + Sync>,
+            Arc<crate::composer::LocalChainClient>,
             crate::composer::TargetConfig,
         ),
     >,
@@ -159,7 +159,7 @@ pub struct CrossChainWiring {
     /// outbound tx originates on this L2, so its `simulate_and_resolve`
     /// must run against an L2 entry (the L2 follower's `ChainClient`
     /// errors `Unavailable` for source sim).
-    pub l2_entry_client: Arc<dyn crate::composer::executor::ChainClient + Send + Sync>,
+    pub l2_entry_client: Arc<crate::composer::LocalChainClient>,
 }
 
 impl CrossChainWiring {
@@ -175,7 +175,7 @@ impl CrossChainWiring {
         &self,
         raw_tx: &[u8],
     ) -> eez_protocol::ComposerResult<eez_protocol::Composition> {
-        self.simulate_and_resolve_recorded_for(self.entry_rollup_id, &*self.entry_client, raw_tx)
+        self.simulate_and_resolve_recorded_for(self.entry_rollup_id, &self.entry_client, raw_tx)
             .await
             .map(|(composition, _recorded)| composition)
     }
@@ -195,7 +195,7 @@ impl CrossChainWiring {
     pub async fn simulate_and_resolve_recorded_for(
         &self,
         entry_id: eez_protocol::RollupId,
-        entry_client: &(dyn crate::composer::executor::ChainClient + Send + Sync),
+        entry_client: &crate::composer::LocalChainClient,
         raw_tx: &[u8],
     ) -> eez_protocol::ComposerResult<(eez_protocol::Composition, Vec<eez_protocol::ExecutedAction>)>
     {

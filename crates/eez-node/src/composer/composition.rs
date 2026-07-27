@@ -72,7 +72,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::composer::executor::{ChainClient, ExecutionRequest, TargetExecutionSession};
+use crate::composer::executor::ExecutionRequest;
+use crate::composer::local::{LocalChainClient, LocalExecutionSession, SessionSnapshot};
 use eez_protocol::batch::EvmBatch;
 use eez_protocol::entries;
 use eez_protocol::error::{
@@ -95,19 +96,19 @@ use crate::composer::config::TargetConfig;
 ///
 /// Carries:
 ///
-/// - `client: Arc<dyn ChainClient>` directly (used for
+/// - `client: Arc<LocalChainClient>` directly (used for
 ///   `current_state_root` attribution and lazy session opening).
-/// - `session: Option<Box<dyn _>>`: opened on first `dispatch_call`
+/// - `session: Option<LocalExecutionSession>`: opened on first `dispatch_call`
 ///   to this rollup. The entry rollup's session stays `None` whenever
 ///   no inspector dispatches back to the entry chain.
 /// - `config: TargetConfig` — `finalize` reads
 ///   `config.verification_context()` and `config.proxy_lookup` directly.
 pub struct Rollup {
-    /// Client for this rollup — shared long-lived trait object.
-    pub client: Arc<dyn ChainClient + Send + Sync>,
+    /// Client for this rollup — shared long-lived handle.
+    pub client: Arc<LocalChainClient>,
     /// Lazily-opened session for this rollup. `None` until the first
     /// [`CompositionBuilder::dispatch_call`] hits this rollup.
-    pub session: Option<Box<dyn TargetExecutionSession + Send>>,
+    pub session: Option<LocalExecutionSession>,
     /// Configuration for this rollup (CCM addresses, gas limit, proxy
     /// lookup).
     pub config: TargetConfig,
@@ -122,7 +123,7 @@ impl std::fmt::Debug for Rollup {
         f.debug_struct("Rollup")
             .field("initial_state_root", &self.initial_state_root)
             .field("session_open", &self.session.is_some())
-            .field("client", &"<dyn ChainClient>")
+            .field("client", &"<LocalChainClient>")
             .field("config", &self.config)
             .finish()
     }
@@ -189,7 +190,7 @@ pub struct CompositionBuilder {
     /// recursing into `session.execute`; the snapshot is dropped on
     /// the success path of `close_call` and pushed onto
     /// [`pending_rollbacks`] on the revert path.
-    pub(crate) pending_snapshots: HashMap<usize, crate::composer::executor::SessionSnapshot>,
+    pub(crate) pending_snapshots: HashMap<usize, SessionSnapshot>,
     /// Rollups whose session is currently CHECKED OUT by an in-flight
     /// `dispatch_call` frame (taken at execute, put back after). A nested
     /// dispatch re-entering one of these would lazy-open a DUPLICATE
@@ -247,10 +248,7 @@ impl CompositionBuilder {
     /// pass-1 session. A session for a rollup not in this builder's map is
     /// dropped (logged): it cannot be probed, so it cannot drift.
     #[must_use]
-    pub fn with_sessions(
-        mut self,
-        sessions: HashMap<RollupId, Box<dyn TargetExecutionSession + Send>>,
-    ) -> Self {
+    pub fn with_sessions(mut self, sessions: HashMap<RollupId, LocalExecutionSession>) -> Self {
         for (id, session) in sessions {
             match self.rollups.get_mut(&id) {
                 Some(rollup) => rollup.session = Some(session),
@@ -271,7 +269,7 @@ impl CompositionBuilder {
     /// builder (composition succeeded) or rolls them back to its boundary
     /// snapshots (composition failed) — and drops them all at slot end:
     /// sessions never outlive their slot.
-    pub fn take_sessions(&mut self) -> HashMap<RollupId, Box<dyn TargetExecutionSession + Send>> {
+    pub fn take_sessions(&mut self) -> HashMap<RollupId, LocalExecutionSession> {
         self.rollups
             .iter_mut()
             .filter_map(|(id, rollup)| rollup.session.take().map(|s| (*id, s)))
@@ -786,9 +784,7 @@ impl CompositionBuilder {
         }
         // Lazy-open the target session and snapshot its current state
         // before the call executes — the snapshot is the rollback
-        // anchor if the surrounding frame later reverts. Snapshot is
-        // type-erased so this code stays chain-agnostic; the
-        // originating session's `rollback` downcasts internally.
+        // anchor if the surrounding frame later reverts.
         let snap = {
             let rollup = self
                 .rollups
@@ -868,8 +864,8 @@ impl CompositionBuilder {
     /// lazy-opens fresh from disk.
     ///
     /// Two rollback primitives coexist: explicit
-    /// [`TargetExecutionSession::checkpoint`] /
-    /// [`rollback`](TargetExecutionSession::rollback) for sessions that
+    /// [`LocalExecutionSession::checkpoint`] /
+    /// [`rollback`](LocalExecutionSession::rollback) for sessions that
     /// support it, and eviction (drop the in-memory `State`, re-read
     /// disk) for sessions that don't.
     pub fn annotate_revert_span(&mut self, idx: usize, span: u32) {
@@ -919,112 +915,108 @@ impl CompositionBuilder {
 mod tests {
     use super::*;
     use crate::composer::config::ProxyLookupConfig;
-    use alloy_primitives::{Address, Bytes, U256};
+    use crate::composer::local::HeaderSource;
+    use alloy_primitives::{Address, Bytes, U256, address, bytes};
     use eez_protocol::action::cross_chain_call_hash;
     use eez_protocol::dialect::ChainDialect;
+    use reth_evm_ethereum::EthEvmConfig;
 
-    // ── Mock ChainClient (spawns a canned session) ──────────────────
+    // ── Real reth-backed test chain ──────────────────────────────────
+    //
+    // The builder used to be exercised through Mock/Reentrant fakes of
+    // the (now removed) ChainClient / TargetExecutionSession traits.
+    // With concrete types everywhere, each test runs against a real
+    // `LocalChainClient` over an mdbx-backed dev-genesis provider: a
+    // dispatched call executes on the real EVM (a call to an empty
+    // account succeeds; a call to [`REVERT_CONTRACT`] reverts).
 
-    struct MockClient {
-        session_outcome: ExecutionOutcome,
+    /// Genesis-alloc'd contract whose code is `PUSH1 0 PUSH1 0 REVERT` —
+    /// every call to it reverts with empty return data.
+    const REVERT_CONTRACT: Address = address!("0x00000000000000000000000000000000000000ee");
+
+    struct TestChain {
+        provider: crate::EthNodeProvider,
+        evm_config: EthEvmConfig,
+        /// Keeps the mdbx datadir alive for the provider's lifetime.
+        _datadir: tempfile::TempDir,
     }
 
-    #[async_trait::async_trait]
-    impl ChainClient for MockClient {
-        async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
-            Ok([0u8; 32])
-        }
-        async fn begin_execution_session(
-            &self,
-        ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
-            Ok(Box::new(MockSession {
-                outcome: self.session_outcome.clone(),
-            }))
-        }
-    }
+    impl TestChain {
+        fn new() -> Self {
+            let datadir = tempfile::tempdir().expect("tempdir");
+            let genesis = reth_chainspec::DEV.genesis().clone().extend_accounts([(
+                REVERT_CONTRACT,
+                alloy_genesis::GenesisAccount::default().with_code(Some(bytes!("0x60006000fd"))),
+            )]);
+            // Mirror the DEV spec (all hardforks active) over the extended
+            // genesis — `ChainSpec::from(Genesis)` would derive hardforks
+            // from `genesis.config` instead and lose e.g. Cancun.
+            let hardforks = reth_chainspec::DEV.hardforks.clone();
+            let chain_spec = Arc::new(reth_chainspec::ChainSpec {
+                chain: reth_chainspec::Chain::dev(),
+                genesis_header: reth_primitives_traits::SealedHeader::seal_slow(
+                    reth_chainspec::make_genesis_header(&genesis, &hardforks),
+                ),
+                genesis,
+                paris_block_and_final_difficulty: Some((0, U256::from(0))),
+                hardforks,
+                ..Default::default()
+            });
 
-    // ── Reentrant fakes (cycle guard, review 2026-06-11) ─────────────
-
-    /// Session whose execute() immediately re-dispatches to its OWN
-    /// rollup through the builder — the entry→A→…→A cycle shape. The
-    /// checked-out guard must refuse the inner open_call (it would mint
-    /// a duplicate session whose writes the outer put-back drops).
-    struct ReentrantSession {
-        own_rollup: RollupId,
-    }
-
-    #[async_trait::async_trait]
-    impl TargetExecutionSession for ReentrantSession {
-        async fn execute(
-            &mut self,
-            req: ExecutionRequest,
-            dispatcher: &mut CompositionBuilder,
-        ) -> ExecutorResult<ExecutionOutcome> {
-            // Nested dispatch back into the SAME rollup (caller = some
-            // other id so the plain target==source guard does not fire).
-            dispatcher
-                .open_call(self.own_rollup, RollupId(7), &req)
-                .await?;
-            unreachable!("the checked-out guard must refuse the cyclic open_call");
-        }
-        async fn checkpoint(
-            &mut self,
-        ) -> ExecutorResult<crate::composer::executor::SessionSnapshot> {
-            Ok(Box::new(()) as crate::composer::executor::SessionSnapshot)
-        }
-        async fn rollback(
-            &mut self,
-            _snapshot: crate::composer::executor::SessionSnapshot,
-        ) -> ExecutorResult<()> {
-            Ok(())
-        }
-    }
-
-    struct ReentrantClient {
-        rollup: RollupId,
-    }
-
-    #[async_trait::async_trait]
-    impl ChainClient for ReentrantClient {
-        async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
-            Ok([0u8; 32])
-        }
-        async fn begin_execution_session(
-            &self,
-        ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
-            Ok(Box::new(ReentrantSession {
-                own_rollup: self.rollup,
-            }))
-        }
-    }
-
-    // ── Mock TargetExecutionSession ──────────────────────────────────
-
-    struct MockSession {
-        outcome: ExecutionOutcome,
-    }
-
-    #[async_trait::async_trait]
-    impl TargetExecutionSession for MockSession {
-        async fn execute(
-            &mut self,
-            _req: ExecutionRequest,
-            _dispatcher: &mut CompositionBuilder,
-        ) -> ExecutorResult<ExecutionOutcome> {
-            Ok(self.outcome.clone())
+            let db = reth_db::init_db(
+                datadir.path().join("db"),
+                reth_db::mdbx::DatabaseArguments::default(),
+            )
+            .expect("init_db");
+            let static_files = datadir.path().join("static_files");
+            std::fs::create_dir_all(&static_files).expect("static_files dir");
+            let runtime =
+                reth_tasks::RuntimeBuilder::new(reth_tasks::RuntimeConfig::default().with_tokio(
+                    reth_tasks::TokioConfig::existing_handle(tokio::runtime::Handle::current()),
+                ))
+                .build()
+                .expect("runtime");
+            let factory = reth_provider::providers::ProviderFactory::new(
+                db,
+                Arc::clone(&chain_spec),
+                reth_provider::providers::StaticFileProvider::read_write(static_files)
+                    .expect("static file provider"),
+                reth_provider::providers::RocksDBBuilder::new(datadir.path().join("rocksdb"))
+                    .with_default_tables()
+                    .build()
+                    .expect("rocksdb provider"),
+                runtime,
+            )
+            .expect("provider factory");
+            reth_db_common::init::init_genesis(&factory).expect("init genesis");
+            let provider = reth_provider::providers::BlockchainProvider::new(factory)
+                .expect("blockchain provider");
+            let evm_config = EthEvmConfig::new(Arc::clone(&chain_spec));
+            Self {
+                provider,
+                evm_config,
+                _datadir: datadir,
+            }
         }
 
-        async fn checkpoint(
-            &mut self,
-        ) -> ExecutorResult<crate::composer::executor::SessionSnapshot> {
-            Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+        fn client(&self, rollup_id: RollupId) -> Arc<LocalChainClient> {
+            LocalChainClient::new_follower(
+                HeaderSource::Eth(self.provider.clone()),
+                self.evm_config.clone(),
+                rollup_id,
+                Address::ZERO,
+                Address::ZERO,
+                ChainDialect::EvmL2Style,
+            )
         }
 
-        async fn rollback(
-            &mut self,
-            _snap: crate::composer::executor::SessionSnapshot,
-        ) -> ExecutorResult<()> {
-            Ok(())
+        fn rollup(&self, rollup_id: RollupId) -> Rollup {
+            Rollup {
+                client: self.client(rollup_id),
+                session: None,
+                config: target_config(),
+                initial_state_root: [0u8; 32],
+            }
         }
     }
 
@@ -1050,6 +1042,17 @@ mod tests {
         }
     }
 
+    /// A request whose target-chain call reverts (calls [`REVERT_CONTRACT`]).
+    fn make_reverting_request() -> ExecutionRequest {
+        ExecutionRequest {
+            target_address: REVERT_CONTRACT,
+            data: Bytes::from(vec![0x01, 0x02]),
+            value: U256::ZERO,
+            source_address: Address::ZERO,
+            source_rollup_id: RollupId(0),
+        }
+    }
+
     fn target_config() -> TargetConfig {
         TargetConfig {
             proxy_lookup: ProxyLookupConfig {
@@ -1060,35 +1063,25 @@ mod tests {
         }
     }
 
-    fn entry_rollup(outcome_root: [u8; 32]) -> Rollup {
-        rollup_with_session(outcome_root)
-    }
-
-    fn rollup_with_session(outcome_root: [u8; 32]) -> Rollup {
-        Rollup {
-            client: Arc::new(MockClient {
-                session_outcome: sample_outcome(outcome_root),
-            }),
-            session: None,
-            config: target_config(),
-            initial_state_root: [0u8; 32],
-        }
-    }
-
     // ── Tests ────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn dispatch_routes_to_registered_session_and_records() {
+        let chain = TestChain::new();
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
+        rollups.insert(RollupId(0), chain.rollup(RollupId(0)));
+        rollups.insert(RollupId(1), chain.rollup(RollupId(1)));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         let response = builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
             .await
             .expect("dispatch");
-        assert_eq!(response.post_state_root(), Some(&[0x11u8; 32]));
+        assert!(response.is_success(), "call to an empty account succeeds");
+        assert!(
+            response.post_state_root().is_some(),
+            "real session attributes a post-state root"
+        );
         assert_eq!(builder.recorded.len(), 1);
         assert_eq!(builder.recorded[0].target_rollup_id, RollupId(1));
         assert_eq!(builder.recorded[0].source_rollup_id, RollupId(0));
@@ -1099,9 +1092,10 @@ mod tests {
         // F1 (D-3): take_sessions extracts the lazily-opened live session;
         // with_sessions seeds it into the next builder; a session for an
         // unregistered rollup is dropped (it cannot be probed there).
+        let chain = TestChain::new();
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
+        rollups.insert(RollupId(0), chain.rollup(RollupId(0)));
+        rollups.insert(RollupId(1), chain.rollup(RollupId(1)));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
         let _ = builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
@@ -1115,8 +1109,8 @@ mod tests {
 
         // Seed into a fresh builder: the slot is occupied (no lazy re-open).
         let mut rollups2 = HashMap::new();
-        rollups2.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups2.insert(RollupId(1), rollup_with_session([0x22; 32]));
+        rollups2.insert(RollupId(0), chain.rollup(RollupId(0)));
+        rollups2.insert(RollupId(1), chain.rollup(RollupId(1)));
         let mut builder2 = CompositionBuilder::new(RollupId(0), rollups2).with_sessions(sessions);
         assert!(
             builder2
@@ -1132,7 +1126,7 @@ mod tests {
         // is dropped, never mis-routed.
         let carried = builder2.take_sessions();
         let mut rollups3 = HashMap::new();
-        rollups3.insert(RollupId(0), entry_rollup([0u8; 32]));
+        rollups3.insert(RollupId(0), chain.rollup(RollupId(0)));
         let builder3 = CompositionBuilder::new(RollupId(0), rollups3).with_sessions(carried);
         assert!(!builder3.rollups.contains_key(&RollupId(1)));
     }
@@ -1142,37 +1136,37 @@ mod tests {
         // entry→A→A-again: while A's session is checked out, a nested
         // dispatch back into A must error (InvalidReentry), not mint a
         // duplicate session (whose writes the outer put-back would drop).
+        // With concrete sessions there is no fake that re-dispatches from
+        // inside execute, so exercise the guard at its own layer: mark A
+        // checked out (what dispatch_call does around execute) and assert
+        // the nested open_call is refused.
+        let chain = TestChain::new();
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups.insert(
-            RollupId(1),
-            Rollup {
-                client: Arc::new(ReentrantClient {
-                    rollup: RollupId(1),
-                }),
-                session: None,
-                config: target_config(),
-                initial_state_root: [0u8; 32],
-            },
-        );
+        rollups.insert(RollupId(0), chain.rollup(RollupId(0)));
+        rollups.insert(RollupId(1), chain.rollup(RollupId(1)));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
+
+        builder.checked_out.insert(RollupId(1));
         let err = builder
-            .dispatch_call(RollupId(1), RollupId(0), make_request(1))
+            .open_call(RollupId(1), RollupId(7), &make_request(1))
             .await
             .expect_err("cycle must be refused");
         assert!(
             matches!(err.kind(), ExecutorErrorKind::InvalidReentry { .. }),
             "got: {err}"
         );
-        // The outer session was put back despite the inner error.
-        assert_eq!(builder.take_sessions().len(), 1, "outer session survives");
+        assert!(
+            builder.recorded.is_empty(),
+            "nothing must be recorded when the guard fires"
+        );
     }
 
     #[tokio::test]
     async fn dispatch_unknown_rollup_returns_unavailable() {
+        let chain = TestChain::new();
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
+        rollups.insert(RollupId(0), chain.rollup(RollupId(0)));
+        rollups.insert(RollupId(1), chain.rollup(RollupId(1)));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         let err = builder
@@ -1184,8 +1178,9 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_empty_errors() {
+        let chain = TestChain::new();
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
+        rollups.insert(RollupId(0), chain.rollup(RollupId(0)));
         let builder = CompositionBuilder::new(RollupId(0), rollups);
         let err = builder.finalize(&[]).await.expect_err("should fail");
         assert!(matches!(
@@ -1201,9 +1196,10 @@ mod tests {
         // `build_batch(source = 1)` yields an empty batch (no top-level
         // call sourced from 1), so finalize takes the inbound DA-sidecar
         // branch and the target composition carries the sidecar entry.
+        let chain = TestChain::new();
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups.insert(RollupId(1), rollup_with_session([0x22; 32]));
+        rollups.insert(RollupId(0), chain.rollup(RollupId(0)));
+        rollups.insert(RollupId(1), chain.rollup(RollupId(1)));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         builder
@@ -1247,9 +1243,10 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_rejects_recorded_calls_for_unregistered_rollups() {
+        let chain = TestChain::new();
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
+        rollups.insert(RollupId(0), chain.rollup(RollupId(0)));
+        rollups.insert(RollupId(1), chain.rollup(RollupId(1)));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
         builder.recorded.push(ExecutedAction {
             target_address: Address::ZERO,
@@ -1275,11 +1272,12 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_targets_come_out_sorted_by_rollup_id() {
+        let chain = TestChain::new();
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups.insert(RollupId(3), rollup_with_session([0x33; 32]));
-        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
-        rollups.insert(RollupId(2), rollup_with_session([0x22; 32]));
+        rollups.insert(RollupId(0), chain.rollup(RollupId(0)));
+        rollups.insert(RollupId(3), chain.rollup(RollupId(3)));
+        rollups.insert(RollupId(1), chain.rollup(RollupId(1)));
+        rollups.insert(RollupId(2), chain.rollup(RollupId(2)));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         for id in [3u64, 1, 2] {
@@ -1302,9 +1300,10 @@ mod tests {
     async fn source_rollup_id_is_stored_from_dispatch_arg() {
         // Regression guard: source_rollup_id must come from the
         // `source_rollup_id` arg on dispatch_call, not from req.source_rollup.
+        let chain = TestChain::new();
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
+        rollups.insert(RollupId(0), chain.rollup(RollupId(0)));
+        rollups.insert(RollupId(1), chain.rollup(RollupId(1)));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         // Pass RollupId(7) as source_rollup_id — distinct from req.source_rollup
@@ -1319,36 +1318,20 @@ mod tests {
 
     // ── Terminal-revert short-circuit ──────────────────────────────
 
-    fn rollup_with_reverted_session() -> Rollup {
-        Rollup {
-            client: Arc::new(MockClient {
-                session_outcome: ExecutionOutcome::Resolved {
-                    return_data: b"revert".to_vec(),
-                    pre_state_root: [0u8; 32],
-                    post_state_root: [0u8; 32],
-                    gas_used: 1,
-                    success: false,
-                },
-            }),
-            session: None,
-            config: target_config(),
-            initial_state_root: [0u8; 32],
-        }
-    }
-
     #[tokio::test]
     async fn empty_target_entries_omit_target_composition() {
         // Terminal revert — the emitter returns an empty target-entry
         // set (and the sidecar skips reverted incoming calls), so the
         // `TargetComposition` for the reverted rollup must be omitted
         // from the returned `Composition`.
+        let chain = TestChain::new();
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups.insert(RollupId(1), rollup_with_reverted_session());
+        rollups.insert(RollupId(0), chain.rollup(RollupId(0)));
+        rollups.insert(RollupId(1), chain.rollup(RollupId(1)));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         builder
-            .dispatch_call(RollupId(1), RollupId(0), make_request(1))
+            .dispatch_call(RollupId(1), RollupId(0), make_reverting_request())
             .await
             .expect("dispatch");
         assert!(
@@ -1373,9 +1356,10 @@ mod tests {
     /// reentry.
     #[tokio::test]
     async fn dispatch_same_chain_non_entry_returns_invalid_reentry() {
+        let chain = TestChain::new();
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
+        rollups.insert(RollupId(0), chain.rollup(RollupId(0)));
+        rollups.insert(RollupId(1), chain.rollup(RollupId(1)));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         let err = builder
@@ -1403,9 +1387,10 @@ mod tests {
     /// dispatches push at later indices regardless of nesting depth.
     #[tokio::test]
     async fn dispatch_records_preorder_at_open_call() {
+        let chain = TestChain::new();
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
+        rollups.insert(RollupId(0), chain.rollup(RollupId(0)));
+        rollups.insert(RollupId(1), chain.rollup(RollupId(1)));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         // Manually walk the lifecycle to assert the index is fixed at
@@ -1442,9 +1427,10 @@ mod tests {
     /// bracket for rollback at the next async dispatch boundary.
     #[tokio::test]
     async fn annotate_revert_span_writes_span_and_queues_rollback() {
+        let chain = TestChain::new();
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
+        rollups.insert(RollupId(0), chain.rollup(RollupId(0)));
+        rollups.insert(RollupId(1), chain.rollup(RollupId(1)));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         builder
@@ -1473,10 +1459,11 @@ mod tests {
     /// Bracketed children carry no `revert_span`.
     #[tokio::test]
     async fn revert_span_gt_one_covers_outer_plus_two_children() {
+        let chain = TestChain::new();
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
-        rollups.insert(RollupId(2), rollup_with_session([0x22; 32]));
+        rollups.insert(RollupId(0), chain.rollup(RollupId(0)));
+        rollups.insert(RollupId(1), chain.rollup(RollupId(1)));
+        rollups.insert(RollupId(2), chain.rollup(RollupId(2)));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         // Frame open: simulate inspector bracket — record start.
@@ -1511,9 +1498,10 @@ mod tests {
     /// stay monotonic; B is in slot 1, after A's slot 0.
     #[tokio::test]
     async fn sibling_after_revert_only_annotates_reverted_outer() {
+        let chain = TestChain::new();
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
+        rollups.insert(RollupId(0), chain.rollup(RollupId(0)));
+        rollups.insert(RollupId(1), chain.rollup(RollupId(1)));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         builder
@@ -1540,10 +1528,11 @@ mod tests {
     /// The child succeeded but is rolled back via the outer's bracket.
     #[tokio::test]
     async fn parent_reverts_after_successful_child() {
+        let chain = TestChain::new();
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
-        rollups.insert(RollupId(2), rollup_with_session([0x22; 32]));
+        rollups.insert(RollupId(0), chain.rollup(RollupId(0)));
+        rollups.insert(RollupId(1), chain.rollup(RollupId(1)));
+        rollups.insert(RollupId(2), chain.rollup(RollupId(2)));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         let start = builder.recorded_count();
@@ -1577,9 +1566,10 @@ mod tests {
     /// to `session.rollback()` invocations before the new call opens.
     #[tokio::test]
     async fn pending_rollbacks_drain_at_next_dispatch() {
+        let chain = TestChain::new();
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
+        rollups.insert(RollupId(0), chain.rollup(RollupId(0)));
+        rollups.insert(RollupId(1), chain.rollup(RollupId(1)));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         builder

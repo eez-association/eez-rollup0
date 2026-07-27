@@ -54,14 +54,17 @@ pub use composition::{CompositionBuilder, Rollup};
 #[doc(inline)]
 pub use config::{ProxyLookupConfig, TargetConfig};
 #[doc(inline)]
-pub use executor::{ChainClient, ExecutionRequest, SessionSnapshot, TargetExecutionSession};
+pub use executor::ExecutionRequest;
 #[doc(inline)]
 pub use held_pool::{HeldPool, HeldTx};
 #[doc(inline)]
 pub use ingress::Direction;
 
 #[doc(inline)]
-pub use local::{BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient, build_sync_block};
+pub use local::{
+    BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient, LocalExecutionSession,
+    SessionSnapshot, build_sync_block,
+};
 pub use optimistic::OptimisticallyIncluded;
 #[doc(inline)]
 pub use rollup::{RollupConfig, RollupState};

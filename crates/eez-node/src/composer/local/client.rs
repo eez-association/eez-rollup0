@@ -28,7 +28,7 @@ use reth_primitives_traits::SignerRecoverable;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::{StateProvider, StateProviderFactory};
 
-use crate::composer::{ChainClient, CompositionBuilder, ProxyLookupConfig, TargetExecutionSession};
+use crate::composer::{CompositionBuilder, ProxyLookupConfig};
 use crate::inspector::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
 use eez_protocol::{ExecutorError, ExecutorErrorKind, ExecutorResult, RollupId};
 
@@ -205,11 +205,20 @@ impl LocalChainClient {
     }
 }
 
-#[async_trait::async_trait]
-impl ChainClient for LocalChainClient {
-    async fn begin_execution_session(
-        &self,
-    ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
+impl LocalChainClient {
+    /// Create a fresh stateful execution session. The slot drain may
+    /// keep the returned session alive across consecutive source txs
+    /// in the same slot (F1); it never outlives its slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorErrorKind::Provider`] / [`ExecutorErrorKind::Evm`] /
+    /// [`ExecutorErrorKind::Missing`] from opening the latest state.
+    #[allow(
+        clippy::unused_async,
+        reason = "async-ness preserved from the removed trait surface; de-async is a separate change"
+    )]
+    pub async fn begin_execution_session(&self) -> ExecutorResult<LocalExecutionSession> {
         tracing::debug!(
             rollup_id = %self.rollup_id,
             ccm = %self.ccm_address,
@@ -281,13 +290,22 @@ impl ChainClient for LocalChainClient {
             preloaded_cache,
             self.overlay_channel.clone(),
         )?;
-        Ok(Box::new(session))
+        Ok(session)
     }
 
     /// Read the latest block header's `stateRoot` from this chain's
     /// own provider. Orthogonal to invariant-6 anchoring; useful for
     /// diagnostics and future paths.
-    async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorErrorKind::Provider`] if the underlying state
+    /// provider is inaccessible.
+    #[allow(
+        clippy::unused_async,
+        reason = "async-ness preserved from the removed trait surface; de-async is a separate change"
+    )]
+    pub async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
         let num = self
             .provider
             .headers
@@ -306,7 +324,26 @@ impl ChainClient for LocalChainClient {
         Ok(header.state_root.0)
     }
 
-    async fn simulate_source_tx(
+    /// Simulate a source-chain transaction, dispatching every detected
+    /// cross-chain proxy call through `dispatcher`. Entry-role clients
+    /// only; follower clients refuse with
+    /// [`ExecutorErrorKind::Unavailable`].
+    ///
+    /// Takes `raw_tx: Vec<u8>` (owned) so the impl can decode without
+    /// holding a borrow on the caller's buffer across async boundaries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorErrorKind::Decode`] if the raw tx cannot be
+    /// decoded. Returns [`ExecutorErrorKind::Provider`] if the source
+    /// state provider is inaccessible. Returns [`ExecutorErrorKind::Evm`]
+    /// if source EVM execution fails. Propagates any [`ExecutorError`]
+    /// surfaced by `dispatcher` during proxy call dispatch.
+    #[allow(
+        clippy::unused_async,
+        reason = "async-ness preserved from the removed trait surface; de-async is a separate change"
+    )]
+    pub async fn simulate_source_tx(
         &self,
         raw_tx: Vec<u8>,
         dispatcher: &mut CompositionBuilder,
@@ -490,7 +527,17 @@ impl ChainClient for LocalChainClient {
     /// can serve when L1-style: the entry case covers L1-as-entry single-binary;
     /// the follower case covers L1-as-follower in L2-as-entry topology.
     /// Non-L1 clients return `Unavailable` so misregistration fails loudly.
-    async fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutorErrorKind::Provider`] if the underlying state
+    /// provider is inaccessible; [`ExecutorErrorKind::Unavailable`] if
+    /// the client does not host the committed-root storage.
+    #[allow(
+        clippy::unused_async,
+        reason = "async-ness preserved from the removed trait surface; de-async is a separate change"
+    )]
+    pub async fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
         // Only L1-style clients honestly serve committed-root reads —
         // the storage-slot math `compute_state_root_slot` assumes the
         // L1 `EEZ.sol` layout. L2-style clients return `Unavailable`

@@ -79,6 +79,8 @@ reth-trie-common                = { git = "https://github.com/paradigmxyz/reth",
 # libmdbx (reth's own mdbx binding) — backs the persistent witness store in a
 # DEDICATED env (never reth's node DB). Same rev so we don't link a 2nd mdbx build.
 reth-libmdbx                    = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+# init_genesis for the composition unit tests' real mdbx-backed provider.
+reth-db-common                  = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 
 # reth_gnosis — Gnosis chain (chiado / gnosis mainnet) NodeBuilder.
 # Pinned to the rollup0-fd59fd22 branch which is the reth_gnosis
