@@ -62,7 +62,10 @@ pub async fn gate_and_hold(
     expected_source_chain_id: u64,
     validation_provider: &RootProvider,
 ) -> Admission {
-    let cost = match validate_front_envelope(envelope, direction, expected_source_chain_id) {
+    if let Err(msg) = validate_front_envelope(envelope, direction, expected_source_chain_id) {
+        return Admission::Rejected(msg);
+    }
+    let cost = match upfront_cost(envelope) {
         Ok(cost) => cost,
         Err(msg) => return Admission::Rejected(msg),
     };
@@ -119,11 +122,12 @@ pub async fn gate_and_hold(
     Admission::Held(hash)
 }
 
+/// Admission policy: reject envelopes cross-chain fronts won't hold.
 fn validate_front_envelope(
     envelope: &TxEnvelope,
     direction: Direction,
     expected_source_chain_id: u64,
-) -> Result<U256, String> {
+) -> Result<(), String> {
     if matches!(envelope, TxEnvelope::Eip4844(_)) {
         return Err(
             "EIP-4844 blob transactions are unsupported by the cross-chain front pipeline".into(),
@@ -140,6 +144,11 @@ fn validate_front_envelope(
             "wrong source-chain id {chain_id} for {direction:?} front: expected {expected_source_chain_id}"
         ));
     }
+    Ok(())
+}
+
+/// Upfront cost the sender must cover: value + gas_limit * max_fee_per_gas.
+fn upfront_cost(envelope: &TxEnvelope) -> Result<U256, String> {
     let gas_cost = U256::from(envelope.gas_limit())
         .checked_mul(U256::from(envelope.max_fee_per_gas()))
         .ok_or_else(|| "upfront cost overflow: gas_limit * max_fee_per_gas".to_string())?;
