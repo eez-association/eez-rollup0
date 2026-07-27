@@ -415,13 +415,8 @@ impl CompositionBuilder {
                 continue;
             };
 
-            // A `Some` batch means the group is non-empty, so `group_calls[0]`
-            // (the outer call driving the follower trigger) exists.
-            let dialect = self.rollups[rollup_id].config.dialect;
             target_compositions.push(TargetComposition {
                 rollup_id: *rollup_id,
-                load_table_payload: entries::encode_table_payload(&batch, &dialect),
-                execute_payload: dialect.encode_follower_trigger(&group_calls[0]),
                 batch,
             });
         }
@@ -444,7 +439,6 @@ impl CompositionBuilder {
         Ok(Composition {
             source: SourceComposition {
                 rollup_id: self.entry_rollup_id,
-                entry_payload: entries::encode_table_payload(&entry_batch, &entry_dialect),
                 batch: entry_batch,
             },
             targets: target_compositions,

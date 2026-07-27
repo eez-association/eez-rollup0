@@ -12,8 +12,6 @@
 //! `TargetConfig`; the runtime composer (Step 7) and
 //! inspectors never see `ChainDialect` directly.
 
-use crate::ExecutedAction;
-
 use crate::authorized_proxies::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
 
 /// Selects the contract ABI and entry-emission rules for one rollup.
@@ -59,28 +57,6 @@ impl ChainDialect {
     #[must_use]
     pub const fn is_zk_poster(&self) -> bool {
         matches!(self, Self::EvmL1Style)
-    }
-
-    /// Encode the follower-side trigger calldata for the
-    /// `outer_root` cross-chain call.
-    ///
-    /// In the multi-prover protocol, both L1 and L2 dispatch via
-    /// the same `executeCrossChainCall(sourceAddress, callData)`
-    /// entry point on the manager — invoked through the registered
-    /// proxy. The composer's CCM-verify simulation forges the
-    /// call from the proxy's address; this method returns the
-    /// calldata for the outer ROUTING call (the proxy's `fallback`
-    /// receives `outer_root.data` as-is and forwards to the
-    /// manager).
-    ///
-    #[must_use]
-    pub fn encode_follower_trigger(&self, call: &ExecutedAction) -> Vec<u8> {
-        // Both dialects route through the proxy's fallback, which
-        // forwards the original calldata to the manager. The
-        // simulator's TargetTransaction sets `destination` to the
-        // proxy address externally; here we just pass through the
-        // outer call's calldata bytes.
-        call.data.to_vec()
     }
 }
 

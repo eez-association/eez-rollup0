@@ -175,10 +175,6 @@ pub struct SourceComposition {
     pub rollup_id: RollupId,
     /// Table-loading batch the source rollup will consume.
     pub batch: EvmBatch,
-    /// Encoded calldata for the entry-chain tx that loads `batch`.
-    /// Dialect-dependent: L1-style emits `postAndVerifyBatch(...)`;
-    /// L2-style emits `loadExecutionTable(...)`.
-    pub entry_payload: Vec<u8>,
 }
 
 /// Per-target output inside a `Composition`.
@@ -191,10 +187,6 @@ pub struct TargetComposition {
     pub rollup_id: RollupId,
     /// Table-loading batch this target rollup will consume.
     pub batch: EvmBatch,
-    /// Encoded payload for loading the target execution table.
-    pub load_table_payload: Vec<u8>,
-    /// Encoded payload for executing the first cross-chain call.
-    pub execute_payload: Vec<u8>,
 }
 
 /// Output of [`CompositionBuilder::finalize`](crate::CompositionBuilder::finalize) —
