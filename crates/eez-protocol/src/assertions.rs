@@ -8,9 +8,9 @@
 //!
 //! The contract covered here:
 //!
-//! - [`Composer`](crate::Composer) is the top-level shared handle
-//!   and must be [`Send`] + [`Sync`] (cloned across tasks, often behind
-//!   `Arc` indirectly).
+//! - [`CompositionBuilder`](crate::CompositionBuilder) drives one
+//!   composition and must be [`Send`] (held across `.await` during
+//!   source simulation).
 //! - Per-composition data types cross `.await` boundaries inside the
 //!   composition pipeline and must be [`Send`].
 

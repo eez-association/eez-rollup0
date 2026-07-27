@@ -316,7 +316,7 @@ impl ChainClient for LocalChainClient {
     /// Read the latest block header's `stateRoot` from this chain's
     /// own provider. Orthogonal to invariant-6 anchoring; useful for
     /// diagnostics and future paths.
-    async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
+    fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
         let num = self
             .provider
             .headers

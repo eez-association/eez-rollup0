@@ -93,9 +93,6 @@ pub struct ExecutedAction {
 /// turn makes the `revertSpan = recorded_count() - frame_start`
 /// arithmetic at `Inspector::call_end` correct without tree
 /// reconstruction.
-///
-/// Does NOT carry the checkpoint (overlay + witness); that lives on
-/// [`ExecutionResponse`](crate::ExecutionResponse).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionOutcome {
     /// `open_call` placeholder. Replaced with `Resolved` by `close_call`.
