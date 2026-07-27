@@ -18,3 +18,5 @@ chiado-*/
 
 # CI diagnostics.
 artifacts/
+# Per-network env files (private keys)
+.env.*
