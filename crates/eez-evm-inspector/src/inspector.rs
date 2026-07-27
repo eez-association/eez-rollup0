@@ -219,9 +219,6 @@ pub struct SessionInspector<'a> {
     error: Option<ExecutorError>,
     call_depth: usize,
     proxy_lookups: usize,
-    /// Tokio runtime handle for bridging the sync `Inspector::call` hook
-    /// to the async `CompositionBuilder::dispatch_call`.
-    handle: tokio::runtime::Handle,
     /// Bidirectional side-channel between source-sim and the entry
     /// rollup's overlay session.
     overlay_channel: Option<OverlayChannelHandle>,
@@ -324,16 +321,11 @@ impl SessionInspectorFactory {
     /// back to the composer) are recorded as preorder children of
     /// the outer call by virtue of the dispatcher's `open_call`
     /// timing.
-    pub fn build<'a>(
-        &self,
-        dispatcher: &'a mut CompositionBuilder,
-        handle: tokio::runtime::Handle,
-    ) -> SessionInspector<'a> {
+    pub fn build<'a>(&self, dispatcher: &'a mut CompositionBuilder) -> SessionInspector<'a> {
         let mut insp = SessionInspector::new(
             self.proxy_lookup.clone(),
             dispatcher,
             self.caller_rollup_id,
-            handle,
         );
         insp.overlay_channel = self.overlay_channel.clone();
         insp
@@ -353,12 +345,10 @@ impl<'a> SessionInspector<'a> {
     /// - `dispatcher`: dispatch surface for detected calls.
     /// - `caller_rollup_id`: this chain's rollup id — becomes the
     ///   `caller_id` on each dispatched call.
-    /// - `handle`: tokio runtime handle for the sync→async bridge.
     pub fn new(
         proxy_lookup: ProxyLookupConfig,
         dispatcher: &'a mut CompositionBuilder,
         caller_rollup_id: RollupId,
-        handle: tokio::runtime::Handle,
     ) -> Self {
         Self {
             proxy_lookup,
@@ -367,7 +357,6 @@ impl<'a> SessionInspector<'a> {
             error: None,
             call_depth: 0,
             proxy_lookups: 0,
-            handle,
             overlay_channel: None,
             frame_starts: Vec::new(),
         }
@@ -451,22 +440,10 @@ where
             source_address: inputs.caller,
             source_rollup_id: self.caller_rollup_id,
         };
-        // Bridge sync Inspector::call → async CompositionBuilder::dispatch_call.
-        //
-        // Uses `tokio::task::block_in_place` to release the worker
-        // thread from tokio's runtime context for the duration of the
-        // dispatch, then `Handle::block_on` to drive the future. The
-        // dispatch runs on the SAME thread that's running source-sim's
-        // `evm.transact` — keeping cross-chain dispatch on a single
-        // thread and giving the overlay path direct access to
-        // source-sim's `&mut State<DB>` via the inspector's `&mut ctx`.
-        //
-        // Hard requirement: multi-threaded tokio runtime.
-        // `block_in_place` panics on single-threaded runtimes; the
-        // gRPC server's bidi Execute stream imposes the same
-        // constraint, so the workspace runs only on multi-threaded
-        // tokio.
-        //
+        // Cross-chain dispatch runs synchronously on the SAME thread as
+        // source-sim's `evm.transact`, giving the overlay path direct
+        // access to source-sim's `&mut State<DB>` via the inspector's
+        // `&mut ctx`.
         let caller_id = self.caller_rollup_id;
         // Overlay-path producer/consumer: source-sim's root-frame
         // inspector snapshots source's in-flight cache into the channel
@@ -552,15 +529,11 @@ where
                 channel.push_pre_snapshot(cache);
             }
         }
-        let sim = {
-            let handle = &self.handle;
-            let dispatcher = &mut *self.dispatcher;
-            tokio::task::block_in_place(|| {
-                handle.block_on(dispatcher.dispatch_call(info.original_rollup_id, caller_id, req))
-            })
-        };
-        // After block_in_place: any inner sessions on THIS rollup have
-        // pushed their post-cache to `overlay_cache` (LIFO). Pop the
+        let sim = self
+            .dispatcher
+            .dispatch_call(info.original_rollup_id, caller_id, req);
+        // After the nested dispatch: any inner sessions on THIS rollup
+        // have pushed their post-cache to `overlay_cache` (LIFO). Pop the
         // top and apply diff onto our `&mut ctx` so this frame's
         // continued execution sees the inner session's mutations.
         // Errors during apply are surfaced via `record_error` so the

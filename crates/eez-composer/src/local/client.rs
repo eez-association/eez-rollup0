@@ -219,9 +219,8 @@ impl LocalChainClient {
 
 }
 
-#[async_trait::async_trait]
 impl ChainClient for LocalChainClient {
-    async fn begin_execution_session(
+    fn begin_execution_session(
         &self,
     ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
         tracing::debug!(
@@ -298,7 +297,7 @@ impl ChainClient for LocalChainClient {
         Ok(Box::new(session))
     }
 
-    async fn simulate_source_tx(
+    fn simulate_source_tx(
         &self,
         raw_tx: Vec<u8>,
         dispatcher: &mut CompositionBuilder,
@@ -367,9 +366,9 @@ impl ChainClient for LocalChainClient {
 
         // Reth's `StateProviderBox` is not `Sync`, so a cross-thread
         // overlay design (e.g. closures over `*mut State<DB>`) is not
-        // viable. The current overlay path keeps both the source-sim
-        // EVM and the entry overlay session on the same OS thread via
-        // `block_in_place`, so this constraint never bites.
+        // viable. The overlay path keeps both the source-sim EVM and the
+        // entry overlay session on the same thread (dispatch is
+        // synchronous), so this constraint never bites.
 
         // ── 3. Run source EVM with inspector ──────────────────────
         let t_env = Instant::now();
@@ -406,8 +405,7 @@ impl ChainClient for LocalChainClient {
         if let Some(channel) = &self.overlay_channel {
             factory = factory.with_overlay_channel(Arc::clone(channel));
         }
-        let handle = tokio::runtime::Handle::current();
-        let inspector = factory.build(dispatcher, handle);
+        let inspector = factory.build(dispatcher);
         let mut evm = self
             .provider
             .evm_config

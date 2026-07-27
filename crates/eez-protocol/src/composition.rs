@@ -69,7 +69,7 @@
 //!                  Composition
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::batch::EvmBatch;
@@ -181,12 +181,13 @@ pub struct CompositionBuilder {
     pub(crate) entry_rollup_id: RollupId,
     pub(crate) rollups: HashMap<RollupId, Rollup>,
     pub(crate) recorded: Vec<ExecutedAction>,
-    /// Per-call snapshot stash, keyed by `recorded[..]` index. Each
-    /// open call grabs an opaque [`SessionSnapshot`] right before
-    /// recursing into `session.execute`; the snapshot is dropped on
-    /// the success path of `close_call` and pushed onto
-    /// [`pending_rollbacks`] on the revert path.
-    pub(crate) pending_snapshots: HashMap<usize, crate::executor::SessionSnapshot>,
+    /// Per-call snapshot stash, keyed by `recorded[..]` index. Carries
+    /// the call's rollup id alongside the opaque [`SessionSnapshot`] so
+    /// rollback needs no `recorded` lookup. Each open call stashes a
+    /// snapshot right before recursing into `session.execute`; it's
+    /// dropped on the success path of `close_call` and its index pushed
+    /// onto [`pending_rollbacks`] on the revert path.
+    pub(crate) pending_snapshots: HashMap<usize, (RollupId, crate::executor::SessionSnapshot)>,
     /// Rollups whose session is currently CHECKED OUT by an in-flight
     /// `dispatch_call` frame (taken at execute, put back after). A nested
     /// dispatch re-entering one of these would lazy-open a DUPLICATE
@@ -194,12 +195,11 @@ pub struct CompositionBuilder {
     /// loudly instead (review 2026-06-11; reachable only at depth>1,
     /// which is unbuilt).
     pub(crate) checked_out: std::collections::HashSet<RollupId>,
-    /// Recorded-call indices whose snapshots need rollback. Drained at
-    /// the start of every async `dispatch_call` (and at finalize) so
-    /// the rollback runs at the next `.await` point — keeps
-    /// `close_call` / `annotate_revert_span` synchronous (the
-    /// inspector calls them from synchronous EVM hooks).
-    pub(crate) pending_rollbacks: Vec<usize>,
+    /// Recorded-call indices whose snapshots need rollback. Queued by
+    /// `close_call` / `annotate_revert_span` and drained at the start of
+    /// the next `dispatch_call` (and at finalize), consolidated to one
+    /// rollback per affected session.
+    pub(crate) pending_rollbacks: VecDeque<usize>,
 }
 
 impl std::fmt::Debug for CompositionBuilder {
@@ -232,7 +232,7 @@ impl CompositionBuilder {
             recorded: Vec::new(),
             pending_snapshots: HashMap::new(),
             checked_out: std::collections::HashSet::new(),
-            pending_rollbacks: Vec::new(),
+            pending_rollbacks: VecDeque::new(),
         }
     }
 
@@ -246,41 +246,34 @@ impl CompositionBuilder {
         &self.recorded
     }
 
-    /// Drain queued rollbacks and apply them. Called at the top of
-    /// every `dispatch_call` (and from `finalize`) so a revert
-    /// observed at the previous `Inspector::call_end` propagates to
-    /// the affected target sessions before the next call opens.
-    async fn process_pending_rollbacks(&mut self) -> ExecutorResult<()> {
-        if self.pending_rollbacks.is_empty() {
-            return Ok(());
-        }
-        let queued: Vec<usize> = std::mem::take(&mut self.pending_rollbacks);
-        // Track distinct (rollup_id) under rollback so we only call
-        // `session.rollback` once per session per dispatch boundary —
-        // even if multiple recorded indices in the same span name the
-        // same rollup, we use the OUTER (smallest idx) snapshot
-        // (the deepest one to revert through).
+    /// Drain queued rollbacks, once per affected session. Called at the
+    /// top of every `dispatch_call` so a revert observed at the previous
+    /// `Inspector::call_end` lands before the next call opens. Any error
+    /// aborts the composition.
+    fn process_pending_rollbacks(&mut self) -> ExecutorResult<()> {
         let mut handled: std::collections::HashSet<RollupId> = std::collections::HashSet::new();
-        for idx in queued {
-            let Some(snap) = self.pending_snapshots.remove(&idx) else {
-                continue;
-            };
-            let Some(call) = self.recorded.get(idx) else {
-                continue;
-            };
-            let rollup_id = call.target_rollup_id;
+        while let Some(idx) = self.pending_rollbacks.pop_front() {
+            let (rollup_id, snap) = self.pending_snapshots.remove(&idx).ok_or_else(|| {
+                ExecutorError::from(ExecutorErrorKind::Unexpected(format!(
+                    "no stashed snapshot for queued rollback idx {idx}"
+                )))
+            })?;
+            // First index per rollup is its outermost snapshot; later
+            // ones for the same rollup drop without rolling back again.
             if !handled.insert(rollup_id) {
                 continue;
             }
-            if let Some(rollup) = self.rollups.get_mut(&rollup_id)
-                && let Some(session) = rollup.session.as_mut()
-            {
-                session.rollback(snap).await?;
-            }
+            let session = self
+                .rollups
+                .get_mut(&rollup_id)
+                .and_then(|r| r.session.as_mut())
+                .ok_or_else(|| {
+                    ExecutorError::from(ExecutorErrorKind::Unexpected(format!(
+                        "session for queued rollback of {rollup_id} is not checked in"
+                    )))
+                })?;
+            session.rollback(snap)?;
         }
-        // Any other snapshots still keyed under bracketed indices are
-        // dropped — the head idx's rollback already restores their
-        // shared session.
         Ok(())
     }
 
@@ -374,7 +367,7 @@ impl CompositionBuilder {
     /// the plan set, [`ProtocolErrorKind::Unsupported`] for an unreachable
     /// non-entry top-level batch, and any error from `build_batch`.
     #[tracing::instrument(level = "debug", name = "finalize", skip_all, err)]
-    pub async fn finalize(self) -> CompositionResult<Composition> {
+    pub fn finalize(self) -> CompositionResult<Composition> {
         tracing::debug!(name: "composer.finalize.start", "composition finalize started");
 
         if self.recorded.is_empty() || self.rollups.is_empty() {
@@ -472,17 +465,15 @@ impl CompositionBuilder {
         fields(target = %target_rollup_id, source = %source_rollup_id),
         err,
     )]
-    pub async fn dispatch_call(
+    pub fn dispatch_call(
         &mut self,
         target_rollup_id: RollupId,
         source_rollup_id: RollupId,
         req: ExecutionRequest,
     ) -> ExecutorResult<ExecutionOutcome> {
         // Drain any pending rollbacks queued by the previous frame's
-        // `annotate_revert_span` / `close_call`. This is the next
-        // async point — synchronous lifecycle methods cannot call
-        // `session.rollback().await` directly.
-        self.process_pending_rollbacks().await?;
+        // `annotate_revert_span` / `close_call`.
+        self.process_pending_rollbacks()?;
 
         // Same-chain re-entry guard. Entry-to-entry dispatch (e.g. a
         // contract on the entry chain calling another entry-chain
@@ -497,9 +488,7 @@ impl CompositionBuilder {
 
         // Phase 1 — open: lazy-open the session, snapshot it, push
         // `Pending` placeholder, capture slot index.
-        let idx = self
-            .open_call(target_rollup_id, source_rollup_id, &req)
-            .await?;
+        let idx = self.open_call(target_rollup_id, source_rollup_id, &req)?;
 
         // Phase 2 — run execute on the lazy-opened session.
         let mut session = self
@@ -510,12 +499,11 @@ impl CompositionBuilder {
             .take()
             .expect("session opened by open_call");
 
-        // `session.execute` awaits first; nested dispatches from a
-        // target-session inspector call back into `self.dispatch_call`
-        // and push their own `ExecutedAction`s at indices `idx + 1, ..`.
-        // The vec is preorder by construction.
+        // Nested dispatches from a target-session inspector call back
+        // into `self.dispatch_call` and push their own `ExecutedAction`s
+        // at indices `idx + 1, ..`. The vec is preorder by construction.
         self.checked_out.insert(target_rollup_id);
-        let response_res = session.execute(req, self).await;
+        let response_res = session.execute(req, self);
 
         // Put the session back even on error; revert handling is
         // post-close via `annotate_revert_span`.
@@ -550,7 +538,7 @@ impl CompositionBuilder {
     ///
     /// Same as [`dispatch_call`](Self::dispatch_call) — re-entry guard
     /// and rollup-id validation fire here.
-    pub async fn open_call(
+    pub fn open_call(
         &mut self,
         target_rollup_id: RollupId,
         source_rollup_id: RollupId,
@@ -588,11 +576,11 @@ impl CompositionBuilder {
                 .get_mut(&target_rollup_id)
                 .expect("rollup present (just checked)");
             if rollup.session.is_none() {
-                let new_session = rollup.client.begin_execution_session().await?;
+                let new_session = rollup.client.begin_execution_session()?;
                 rollup.session = Some(new_session);
             }
             let session = rollup.session.as_mut().expect("session opened above");
-            session.checkpoint().await?
+            session.checkpoint()?
         };
 
         let idx = self.recorded.len();
@@ -606,7 +594,15 @@ impl CompositionBuilder {
             outcome: crate::types::ExecutionOutcome::Pending,
             revert_span: None,
         });
-        self.pending_snapshots.insert(idx, snap);
+        if self
+            .pending_snapshots
+            .insert(idx, (target_rollup_id, snap))
+            .is_some()
+        {
+            return Err(ExecutorError::from(ExecutorErrorKind::Unexpected(format!(
+                "pending_snapshots[{idx}] was already occupied"
+            ))));
+        }
         Ok(idx)
     }
 
@@ -631,8 +627,9 @@ impl CompositionBuilder {
         if let Some(span) = revert_span {
             slot.revert_span = Some(span);
             // Queue this slot's snapshot for rollback at the next
-            // async dispatch boundary.
-            self.pending_rollbacks.push(idx);
+            // dispatch boundary — when its session is checked back into
+            // `rollups` (it's taken out for the duration of `execute`).
+            self.pending_rollbacks.push_back(idx);
         }
         // Note: when `revert_span` is `None` (the common case — the
         // inspector observes revert post-frame and calls
@@ -680,7 +677,7 @@ impl CompositionBuilder {
         let end = idx.saturating_add(span as usize).min(self.recorded.len());
         for i in idx..end {
             if self.pending_snapshots.contains_key(&i) {
-                self.pending_rollbacks.push(i);
+                self.pending_rollbacks.push_back(i);
             }
         }
         tracing::debug!(
@@ -736,9 +733,8 @@ mod tests {
         session_outcome: ExecutionOutcome,
     }
 
-    #[async_trait::async_trait]
     impl ChainClient for MockClient {
-        async fn begin_execution_session(
+        fn begin_execution_session(
             &self,
         ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
             Ok(Box::new(MockSession {
@@ -757,24 +753,21 @@ mod tests {
         own_rollup: RollupId,
     }
 
-    #[async_trait::async_trait]
     impl TargetExecutionSession for ReentrantSession {
-        async fn execute(
+        fn execute(
             &mut self,
             req: ExecutionRequest,
             dispatcher: &mut CompositionBuilder,
         ) -> ExecutorResult<ExecutionOutcome> {
             // Nested dispatch back into the SAME rollup (caller = some
             // other id so the plain target==source guard does not fire).
-            dispatcher
-                .open_call(self.own_rollup, RollupId(7), &req)
-                .await?;
+            dispatcher.open_call(self.own_rollup, RollupId(7), &req)?;
             unreachable!("the checked-out guard must refuse the cyclic open_call");
         }
-        async fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
+        fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
             Ok(Box::new(()) as crate::executor::SessionSnapshot)
         }
-        async fn rollback(
+        fn rollback(
             &mut self,
             _snapshot: crate::executor::SessionSnapshot,
         ) -> ExecutorResult<()> {
@@ -786,9 +779,8 @@ mod tests {
         rollup: RollupId,
     }
 
-    #[async_trait::async_trait]
     impl ChainClient for ReentrantClient {
-        async fn begin_execution_session(
+        fn begin_execution_session(
             &self,
         ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
             Ok(Box::new(ReentrantSession {
@@ -803,9 +795,8 @@ mod tests {
         outcome: ExecutionOutcome,
     }
 
-    #[async_trait::async_trait]
     impl TargetExecutionSession for MockSession {
-        async fn execute(
+        fn execute(
             &mut self,
             _req: ExecutionRequest,
             _dispatcher: &mut CompositionBuilder,
@@ -813,11 +804,11 @@ mod tests {
             Ok(self.outcome.clone())
         }
 
-        async fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
+        fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
             Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
         }
 
-        async fn rollback(
+        fn rollback(
             &mut self,
             _snap: crate::executor::SessionSnapshot,
         ) -> ExecutorResult<()> {
@@ -880,8 +871,8 @@ mod tests {
 
     // ── Tests ────────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn dispatch_routes_to_registered_session_and_records() {
+    #[test]
+    fn dispatch_routes_to_registered_session_and_records() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -889,7 +880,6 @@ mod tests {
 
         let response = builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("dispatch");
         assert_eq!(response.post_state_root(), Some(&[0x11u8; 32]));
         assert_eq!(builder.recorded.len(), 1);
@@ -897,8 +887,8 @@ mod tests {
         assert_eq!(builder.recorded[0].source_rollup_id, RollupId(0));
     }
 
-    #[tokio::test]
-    async fn sessions_seed_take_round_trip_and_drop_unregistered() {
+    #[test]
+    fn sessions_seed_take_round_trip_and_drop_unregistered() {
         // F1 (D-3): take_sessions extracts the lazily-opened live session;
         // with_sessions seeds it into the next builder; a session for an
         // unregistered rollup is dropped (it cannot be probed there).
@@ -908,7 +898,6 @@ mod tests {
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("dispatch lazy-opens rollup 1's session");
         let sessions = take_sessions(&mut builder);
         assert_eq!(sessions.len(), 1, "exactly the lazily-opened session");
@@ -940,8 +929,8 @@ mod tests {
         assert!(!builder3.rollups.contains_key(&RollupId(1)));
     }
 
-    #[tokio::test]
-    async fn cyclic_nested_dispatch_is_refused() {
+    #[test]
+    fn cyclic_nested_dispatch_is_refused() {
         // entry→A→A-again: while A's session is checked out, a nested
         // dispatch back into A must error (InvalidReentry), not mint a
         // duplicate session (whose writes the outer put-back would drop).
@@ -960,7 +949,6 @@ mod tests {
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
         let err = builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect_err("cycle must be refused");
         assert!(
             matches!(err.kind(), ExecutorErrorKind::InvalidReentry { .. }),
@@ -970,8 +958,8 @@ mod tests {
         assert_eq!(take_sessions(&mut builder).len(), 1, "outer session survives");
     }
 
-    #[tokio::test]
-    async fn dispatch_unknown_rollup_returns_unavailable() {
+    #[test]
+    fn dispatch_unknown_rollup_returns_unavailable() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -979,17 +967,16 @@ mod tests {
 
         let err = builder
             .dispatch_call(RollupId(99), RollupId(0), make_request(99))
-            .await
             .expect_err("should fail");
         assert!(matches!(err.kind(), ExecutorErrorKind::Unavailable(_)));
     }
 
-    #[tokio::test]
-    async fn finalize_empty_errors() {
+    #[test]
+    fn finalize_empty_errors() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         let builder = CompositionBuilder::new(RollupId(0), rollups);
-        let err = builder.finalize().await.expect_err("should fail");
+        let err = builder.finalize().expect_err("should fail");
         assert!(matches!(
             err.kind(),
             crate::error::CompositionErrorKind::Protocol(p)
@@ -997,8 +984,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn finalize_inbound_target_produces_sidecar_composition() {
+    #[test]
+    fn finalize_inbound_target_produces_sidecar_composition() {
         // An entry→rollup-1 call is INCOMING from rollup 1's perspective:
         // `build_batch(source = 1)` yields an empty batch (no top-level
         // call sourced from 1), so finalize takes the inbound DA-sidecar
@@ -1010,10 +997,9 @@ mod tests {
 
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("dispatch");
 
-        let composition = builder.finalize().await.expect("finalize");
+        let composition = builder.finalize().expect("finalize");
         assert_eq!(composition.source.rollup_id, RollupId(0));
         // Entry rollup is skipped in the targets loop, so only rollup 1
         // appears in targets.
@@ -1047,8 +1033,8 @@ mod tests {
         assert_eq!(composition.source.batch.entries.len(), 1);
     }
 
-    #[tokio::test]
-    async fn finalize_rejects_recorded_calls_for_unregistered_rollups() {
+    #[test]
+    fn finalize_rejects_recorded_calls_for_unregistered_rollups() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1064,7 +1050,7 @@ mod tests {
             revert_span: None,
         });
 
-        let err = builder.finalize().await.expect_err("should fail");
+        let err = builder.finalize().expect_err("should fail");
         assert!(matches!(
             err.kind(),
             crate::error::CompositionErrorKind::Protocol(p)
@@ -1075,8 +1061,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn finalize_targets_come_out_sorted_by_rollup_id() {
+    #[test]
+    fn finalize_targets_come_out_sorted_by_rollup_id() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(3), rollup_with_session([0x33; 32]));
@@ -1087,11 +1073,10 @@ mod tests {
         for id in [3u64, 1, 2] {
             builder
                 .dispatch_call(RollupId(id), RollupId(0), make_request(id))
-                .await
                 .expect("dispatch");
         }
 
-        let composition = builder.finalize().await.expect("finalize");
+        let composition = builder.finalize().expect("finalize");
         let ids: Vec<u64> = composition.targets.iter().map(|t| t.rollup_id.0).collect();
         assert_eq!(
             ids,
@@ -1100,8 +1085,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn source_rollup_id_is_stored_from_dispatch_arg() {
+    #[test]
+    fn source_rollup_id_is_stored_from_dispatch_arg() {
         // Regression guard: source_rollup_id must come from the
         // `source_rollup_id` arg on dispatch_call, not from req.source_rollup.
         let mut rollups = HashMap::new();
@@ -1114,7 +1099,6 @@ mod tests {
         // must match source_rollup_id, not req.source_rollup.
         builder
             .dispatch_call(RollupId(1), RollupId(7), make_request(1))
-            .await
             .expect("dispatch");
         assert_eq!(builder.recorded[0].source_rollup_id, RollupId(7));
     }
@@ -1151,8 +1135,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn empty_target_entries_omit_target_composition() {
+    #[test]
+    fn empty_target_entries_omit_target_composition() {
         // Terminal revert — the emitter returns an empty target-entry
         // set (and the sidecar skips reverted incoming calls), so the
         // `TargetComposition` for the reverted rollup must be omitted
@@ -1164,14 +1148,13 @@ mod tests {
 
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("dispatch");
         assert!(
             !builder.recorded[0].outcome.is_success(),
             "test setup: recorded call must be reverted"
         );
 
-        let composition = builder.finalize().await.expect("finalize");
+        let composition = builder.finalize().expect("finalize");
 
         assert!(
             composition.targets.is_empty(),
@@ -1186,8 +1169,8 @@ mod tests {
     /// rollup that issues a cross-chain call back to itself bypasses
     /// the entry-rollup CCM contract that mediates every legitimate
     /// reentry.
-    #[tokio::test]
-    async fn dispatch_same_chain_non_entry_returns_invalid_reentry() {
+    #[test]
+    fn dispatch_same_chain_non_entry_returns_invalid_reentry() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1195,7 +1178,6 @@ mod tests {
 
         let err = builder
             .dispatch_call(RollupId(1), RollupId(1), make_request(1))
-            .await
             .expect_err("L2 → L2 self-dispatch must be rejected");
         assert!(
             matches!(
@@ -1216,8 +1198,8 @@ mod tests {
     /// Preorder property: `open_call` fixes a slot index BEFORE the
     /// session executes. Closing the slot fills `Resolved`. Subsequent
     /// dispatches push at later indices regardless of nesting depth.
-    #[tokio::test]
-    async fn dispatch_records_preorder_at_open_call() {
+    #[test]
+    fn dispatch_records_preorder_at_open_call() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1228,7 +1210,6 @@ mod tests {
         let req = make_request(1);
         let idx = builder
             .open_call(RollupId(1), RollupId(0), &req)
-            .await
             .expect("open");
         assert_eq!(idx, 0);
         assert!(builder.recorded[idx].outcome.is_pending());
@@ -1242,7 +1223,6 @@ mod tests {
         // A second top-level dispatch lands at idx 1 — preorder.
         let resp = builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("dispatch");
         assert!(resp.is_success());
         assert_eq!(builder.recorded.len(), 2);
@@ -1255,8 +1235,8 @@ mod tests {
     /// `annotate_revert_span` writes `revert_span = Some(span)` on
     /// the bracketing call AND queues every snapshot inside the
     /// bracket for rollback at the next async dispatch boundary.
-    #[tokio::test]
-    async fn annotate_revert_span_writes_span_and_queues_rollback() {
+    #[test]
+    fn annotate_revert_span_writes_span_and_queues_rollback() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1264,7 +1244,6 @@ mod tests {
 
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("dispatch");
 
         builder.annotate_revert_span(0, 1);
@@ -1286,8 +1265,8 @@ mod tests {
     /// Outer call dispatches 2 inner calls and then the outer's
     /// frame reverts — span = 3 covers the outer + both children.
     /// Bracketed children carry no `revert_span`.
-    #[tokio::test]
-    async fn revert_span_gt_one_covers_outer_plus_two_children() {
+    #[test]
+    fn revert_span_gt_one_covers_outer_plus_two_children() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1299,16 +1278,13 @@ mod tests {
         // Outer: 0 → 1
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("outer");
         // Two inner cross-rollup calls inside the outer frame.
         builder
             .dispatch_call(RollupId(2), RollupId(1), make_request(2))
-            .await
             .expect("inner-1");
         builder
             .dispatch_call(RollupId(2), RollupId(1), make_request(2))
-            .await
             .expect("inner-2");
 
         let end = builder.recorded_count();
@@ -1324,8 +1300,8 @@ mod tests {
     /// Outer call A reverts, sibling outer B succeeds. A is annotated
     /// with span=1 (self-only); B is not annotated. Preorder indices
     /// stay monotonic; B is in slot 1, after A's slot 0.
-    #[tokio::test]
-    async fn sibling_after_revert_only_annotates_reverted_outer() {
+    #[test]
+    fn sibling_after_revert_only_annotates_reverted_outer() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1333,13 +1309,11 @@ mod tests {
 
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("A");
         builder.annotate_revert_span(0, 1);
 
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("B");
 
         assert_eq!(builder.recorded[0].revert_span, Some(1));
@@ -1353,8 +1327,8 @@ mod tests {
     /// Outer call dispatches 1 successful inner call, then the outer
     /// reverts — span = 2 covers the outer plus the successful child.
     /// The child succeeded but is rolled back via the outer's bracket.
-    #[tokio::test]
-    async fn parent_reverts_after_successful_child() {
+    #[test]
+    fn parent_reverts_after_successful_child() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1364,11 +1338,9 @@ mod tests {
         let start = builder.recorded_count();
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("outer");
         builder
             .dispatch_call(RollupId(2), RollupId(1), make_request(2))
-            .await
             .expect("child (succeeds)");
         let span = (builder.recorded_count() - start) as u32;
         assert_eq!(span, 2);
@@ -1390,8 +1362,8 @@ mod tests {
     /// Revert at a previous `Inspector::call_end` is applied at the
     /// top of the next `dispatch_call` — the queued rollbacks drain
     /// to `session.rollback()` invocations before the new call opens.
-    #[tokio::test]
-    async fn pending_rollbacks_drain_at_next_dispatch() {
+    #[test]
+    fn pending_rollbacks_drain_at_next_dispatch() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1399,7 +1371,6 @@ mod tests {
 
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("first dispatch");
         builder.annotate_revert_span(0, 1);
         assert_eq!(builder.pending_rollbacks, vec![0]);
@@ -1408,7 +1379,6 @@ mod tests {
         // The next dispatch drains pending rollbacks at its top.
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
-            .await
             .expect("second dispatch");
 
         assert!(

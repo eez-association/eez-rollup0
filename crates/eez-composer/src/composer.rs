@@ -227,10 +227,9 @@ impl CrossChainWiring {
         let mut builder = eez_protocol::CompositionBuilder::new(entry_id, rollups);
         entry_client
             .simulate_source_tx(raw_tx.to_vec(), &mut builder)
-            .await
             .map_err(eez_protocol::CompositionError::from)?;
         let recorded = builder.recorded().to_vec();
-        let composition = builder.finalize().await?;
+        let composition = builder.finalize()?;
 
         tracing::info!(
             name: "composer.simulate.complete",

@@ -8,11 +8,10 @@
 //! dispatch goes through the borrowed
 //! [`CompositionBuilder`].
 //!
-//! Both traits are `#[async_trait]` — one heap allocation per call
-//! in exchange for dyn-compatibility. Native `async fn in trait` is
-//! not dyn-compatible today, and the composer stores clients as trait
-//! objects so transports (local reth, gRPC peer, test fake) can swap
-//! without upstream changes.
+//! Both traits are synchronous and natively dyn-compatible — clients
+//! are stored as `Arc<dyn ChainClient>` and sessions as `Box<dyn
+//! TargetExecutionSession>`. Cross-chain execution is all in-process
+//! (local reth), so there is no I/O to await.
 
 use alloy_primitives::{Address, Bytes, U256};
 
@@ -58,60 +57,43 @@ pub struct ExecutionRequest {
 /// nested cross-chain dispatch: a target-session inspector can call
 /// back into the composer through `dispatcher` to route a nested
 /// proxy call.
-#[async_trait::async_trait]
 pub trait TargetExecutionSession: Send {
-    /// Execute a single call on the target chain.
-    ///
-    /// `dispatcher` is consumed by nested cross-chain dispatch.
-    ///
-    /// Returns the outcome for source simulation.
+    /// Execute a single call on the target chain. `dispatcher` is
+    /// consumed by nested cross-chain dispatch. Returns the outcome for
+    /// source simulation.
     ///
     /// # Errors
     ///
-    /// Returns any [`ExecutorError`] depending on the impl — local
-    /// impls surface [`ExecutorErrorKind::Evm`] /
-    /// [`ExecutorErrorKind::Provider`]; the gRPC impl surfaces
-    /// [`ExecutorErrorKind::Transport`] / [`ExecutorErrorKind::Serde`] /
-    /// [`ExecutorErrorKind::Missing`].
-    async fn execute(
+    /// Surfaces [`ExecutorErrorKind::Evm`] / [`ExecutorErrorKind::Provider`].
+    fn execute(
         &mut self,
         req: ExecutionRequest,
         dispatcher: &mut CompositionBuilder,
     ) -> ExecutorResult<ExecutionOutcome>;
 
-    /// Capture an opaque snapshot of the session's current state. The
-    /// returned box is fed back to [`rollback`](Self::rollback) to
-    /// restore the session to its pre-call state. Drop the snapshot
-    /// to commit forward (no-op).
+    /// Capture an opaque snapshot of the session's current state, fed
+    /// back to [`rollback`](Self::rollback) to restore it. Drop the
+    /// snapshot to commit forward (no-op).
     ///
-    /// Used by the composer's revertSpan path:
-    /// [`CompositionBuilder::open_call`] snapshots the target session
-    /// BEFORE delegating to `execute`, stashes the snapshot keyed by
-    /// call idx, and either drops it (success path) or rolls back
-    /// (revert-span path) when
-    /// [`CompositionBuilder::annotate_revert_span`] fires.
-    ///
-    /// The snapshot is type-erased via `Box<dyn Any + Send>` so the
-    /// composer can stash it without naming `Self::Snapshot`. Each
-    /// impl downcasts privately inside `rollback`.
+    /// Used by the revertSpan path: [`CompositionBuilder::open_call`]
+    /// snapshots before `execute`, then drops (success) or rolls back
+    /// (revert) when [`CompositionBuilder::annotate_revert_span`] fires.
+    /// Type-erased as `Box<dyn Any + Send>`; each impl downcasts inside
+    /// `rollback`.
     ///
     /// # Errors
     ///
-    /// Implementation-dependent — `LocalChainClient` is infallible
-    /// (deep-clones revm `State<DB>`'s 7 fields); the gRPC impl can
-    /// surface [`ExecutorErrorKind::Transport`] /
-    /// [`ExecutorErrorKind::Missing`].
-    async fn checkpoint(&mut self) -> ExecutorResult<SessionSnapshot>;
+    /// Implementation-dependent.
+    fn checkpoint(&mut self) -> ExecutorResult<SessionSnapshot>;
 
-    /// Restore the session to the state captured by `snapshot`. The
-    /// snapshot must have come from this session's `checkpoint` call;
-    /// passing a snapshot from a different session is an error.
+    /// Restore the session to the state captured by `snapshot` (which
+    /// must have come from this session's `checkpoint`).
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Decode`] if the snapshot's
-    /// concrete type does not match this session's snapshot shape.
-    async fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()>;
+    /// [`ExecutorErrorKind::Decode`] if the snapshot's concrete type
+    /// does not match this session's snapshot shape.
+    fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()>;
 }
 
 /// Type-erased session snapshot. Each [`TargetExecutionSession`] impl
@@ -123,46 +105,33 @@ pub type SessionSnapshot = Box<dyn std::any::Any + Send>;
 
 /// Uniform chain-client interface every registered rollup satisfies.
 ///
-/// `Composer` talks to every rollup through this trait. Role-specific
-/// methods (`simulate_source_tx`, `stored_target_state_root`) default
-/// to a loud [`ExecutorErrorKind::Unavailable`] refusal.
-///
 /// Stored as `Arc<dyn ChainClient + Send + Sync>` in the composer's
-/// rollup map.
-#[async_trait::async_trait]
+/// rollup map. `simulate_source_tx` defaults to a loud
+/// [`ExecutorErrorKind::Unavailable`] refusal; entry-role clients
+/// override it.
 pub trait ChainClient: Send + Sync + 'static {
-
     /// Create a fresh stateful execution session. The slot drain may
     /// keep the returned session alive across consecutive source txs
     /// in the same slot (F1); it never outlives its slot.
     ///
     /// # Errors
     ///
-    /// Returns any [`ExecutorError`] depending on impl — local surfaces
     /// [`ExecutorErrorKind::Provider`] / [`ExecutorErrorKind::Evm`] /
-    /// [`ExecutorErrorKind::Missing`]; gRPC surfaces
-    /// [`ExecutorErrorKind::Transport`].
-    async fn begin_execution_session(
-        &self,
-    ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>>;
+    /// [`ExecutorErrorKind::Missing`].
+    fn begin_execution_session(&self)
+    -> ExecutorResult<Box<dyn TargetExecutionSession + Send>>;
 
     /// Simulate a source-chain transaction, dispatching every detected
     /// cross-chain proxy call through `dispatcher`. Entry-role clients
-    /// only; the default refuses with
-    /// [`ExecutorErrorKind::Unavailable`] so follower registrations
-    /// fail loudly if they ever reach source simulation.
-    ///
-    /// Takes `raw_tx: Vec<u8>` (owned) so the impl can decode without
-    /// holding a borrow on the caller's buffer across async boundaries.
+    /// only; the default refuses so follower registrations fail loudly
+    /// if they ever reach source simulation.
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Decode`] if the raw tx cannot be
-    /// decoded. Returns [`ExecutorErrorKind::Provider`] if the source
-    /// state provider is inaccessible. Returns [`ExecutorErrorKind::Evm`]
-    /// if source EVM execution fails. Propagates any [`ExecutorError`]
-    /// surfaced by `dispatcher` during proxy call dispatch.
-    async fn simulate_source_tx(
+    /// [`ExecutorErrorKind::Decode`] on an undecodable tx;
+    /// [`ExecutorErrorKind::Provider`] / [`ExecutorErrorKind::Evm`] on
+    /// source execution; propagates any dispatch error.
+    fn simulate_source_tx(
         &self,
         _raw_tx: Vec<u8>,
         _dispatcher: &mut CompositionBuilder,

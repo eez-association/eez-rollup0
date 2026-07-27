@@ -262,6 +262,10 @@ pub enum ExecutorErrorKind {
         /// Requested target rollup (equal to `caller`, not the entry).
         target: crate::rollup_id::RollupId,
     },
+    /// An invariant that should be impossible by construction was
+    /// violated — a bug, not an operational failure.
+    #[error("unexpected (should never happen): {0}")]
+    Unexpected(String),
 }
 
 /// Shorthand for executor results.

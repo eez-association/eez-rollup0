@@ -3307,7 +3307,6 @@ dependencies = [
  "alloy-primitives",
  "alloy-signer-local",
  "alloy-sol-types",
- "async-trait",
  "eez-payload-codec",
  "hex",
  "k256",
