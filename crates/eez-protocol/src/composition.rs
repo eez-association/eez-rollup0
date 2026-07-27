@@ -366,6 +366,8 @@ impl CompositionBuilder {
     /// [`ProtocolErrorKind::UnknownTarget`] for a recorded rollup not in
     /// the plan set, [`ProtocolErrorKind::Unsupported`] for an unreachable
     /// non-entry top-level batch, and any error from `build_batch`.
+    // TODO(#57): plain error enums shrink CompositionError; drop this then.
+    #[allow(clippy::result_large_err)]
     #[tracing::instrument(level = "debug", name = "finalize", skip_all, err)]
     pub fn finalize(self) -> CompositionResult<Composition> {
         tracing::debug!(name: "composer.finalize.start", "composition finalize started");

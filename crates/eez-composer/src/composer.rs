@@ -163,8 +163,10 @@ impl CrossChainWiring {
     /// simulation fails.
     /// Returns [`eez_protocol::ComposerErrorKind::Protocol`] if entry
     /// building or finalization fails.
+    // TODO(#57): plain error enums shrink ComposerError; drop this then.
+    #[allow(clippy::result_large_err)]
     #[tracing::instrument(skip(self, raw_tx), fields(tx_len = raw_tx.len()))]
-    pub async fn simulate_and_resolve(
+    pub fn simulate_and_resolve(
         &self,
         raw_tx: &[u8],
     ) -> eez_protocol::ComposerResult<eez_protocol::Composition> {
@@ -172,7 +174,6 @@ impl CrossChainWiring {
         // Per-composition entry selection (A1) goes through
         // `simulate_and_resolve_recorded_for`.
         self.simulate_and_resolve_recorded_for(self.entry_rollup_id, &*self.entry_client, raw_tx)
-            .await
     }
 
     /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve) but
@@ -186,7 +187,8 @@ impl CrossChainWiring {
     /// # Errors
     ///
     /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve).
-    pub async fn simulate_and_resolve_recorded_for(
+    #[allow(clippy::result_large_err)] // TODO(#57): same as simulate_and_resolve
+    pub fn simulate_and_resolve_recorded_for(
         &self,
         entry_id: eez_protocol::RollupId,
         entry_client: &(dyn eez_protocol::executor::ChainClient + Send + Sync),
@@ -1377,14 +1379,11 @@ where
             // its user tx); the load tx is built post-drain by the canonical
             // builder. Zero entries → poison.
             if held.direction == Direction::Outbound {
-                match evm_composer
-                    .simulate_and_resolve_recorded_for(
-                        eez_protocol::RollupId(rollup_id),
-                        cc.l2_entry_client.as_ref(),
-                        held.raw_tx.as_ref(),
-                    )
-                    .await
-                {
+                match evm_composer.simulate_and_resolve_recorded_for(
+                    eez_protocol::RollupId(rollup_id),
+                    cc.l2_entry_client.as_ref(),
+                    held.raw_tx.as_ref(),
+                ) {
                     Ok(composition) => {
                         let l1_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = composition
                             .targets
@@ -1496,10 +1495,7 @@ where
 
             // ── INBOUND (L1→L2) arm. Stage the deferred target entries; the
             // delivery system txs are built post-drain (after all outbound loads).
-            match evm_composer
-                .simulate_and_resolve(held.raw_tx.as_ref())
-                .await
-            {
+            match evm_composer.simulate_and_resolve(held.raw_tx.as_ref()) {
                 Ok(composition) => {
                     let target_entries: Vec<_> = composition
                         .targets
