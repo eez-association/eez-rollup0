@@ -104,6 +104,31 @@ pub fn decode_proxy_value(value: U256) -> Option<ProxyInfo> {
     })
 }
 
+/// Combined proxy-lookup configuration for a registered rollup.
+///
+/// Bundles the storage-contract address and the storage slot index
+/// where that contract holds its `authorizedProxies` mapping.
+///
+/// Constructed at `main.rs` startup from the rollup's role:
+/// - L1-style client (entry-as-L1 or follower-as-L1):
+///   `contract_address = rollups_address`,
+///   `authorized_proxies_slot = 0` (`EEZ.authorizedProxies` —
+///   inherited from `EEZBase` at slot 0).
+/// - L2-style client:
+///   `contract_address = ccm_address`,
+///   `authorized_proxies_slot = 0`
+///   (`EEZL2.authorizedProxies` — inherited from `EEZBase`
+///   at slot 0).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxyLookupConfig {
+    /// Address of the contract holding `authorizedProxies` on this chain.
+    pub contract_address: Address,
+    /// Storage slot index where `authorizedProxies` lives on
+    /// `contract_address`. The inspector reads
+    /// `keccak256(addr ++ slot)` to find a registered proxy.
+    pub authorized_proxies_slot: u8,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

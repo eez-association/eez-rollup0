@@ -42,7 +42,6 @@ pub mod action;
 pub mod addresses;
 pub mod authorized_proxies;
 pub mod batch;
-pub mod composer;
 pub mod composition;
 pub mod dialect;
 pub mod entries;
@@ -67,15 +66,15 @@ pub use action::{compute_state_root_slot, cross_chain_call_hash};
 pub use addresses::{CCM_ADDRESS, SYSTEM_ADDRESS};
 #[doc(inline)]
 pub use authorized_proxies::{
-    CCM_AUTHORIZED_PROXIES_SLOT, ProxyInfo, ROLLUPS_AUTHORIZED_PROXIES_SLOT, decode_proxy_value,
-    proxy_mapping_key,
+    CCM_AUTHORIZED_PROXIES_SLOT, ProxyInfo, ProxyLookupConfig, ROLLUPS_AUTHORIZED_PROXIES_SLOT,
+    decode_proxy_value, proxy_mapping_key,
 };
 #[doc(inline)]
 pub use batch::EvmBatch;
 #[doc(inline)]
-pub use composer::{ProxyLookupConfig, SourceAttribution, TargetConfig};
+pub use composition::{CompositionBuilder, Rollup, TargetConfig};
 #[doc(inline)]
-pub use composition::{CompositionBuilder, Rollup};
+pub use entries::SourceAttribution;
 #[doc(inline)]
 pub use dialect::ChainDialect;
 #[doc(inline)]
