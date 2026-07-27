@@ -215,26 +215,14 @@ impl CrossChainWiring {
         // For each rollup (including the entry):
         // - client: cheap Arc clone from the registration.
         // - session: None (lazy-open on first dispatch).
-        // - initial_state_root: read via the committed-root reader. The
-        //   upstream protocol enforces `entry[i].currentState ==
-        //   rollups[id].stateRoot` for every delta in `postBatch` (see
-        //   `EEZ.sol`), so ALL rollups (including the entry's own) read
-        //   through the committed-root reader — chain headers
-        //   (self-reports) are NOT correct for upstream-invariant-6
-        //   anchoring.
         let mut rollups = HashMap::with_capacity(self.rollups.len());
         for (rollup_id, (client, config)) in &self.rollups {
-            let initial_state_root = self
-                .root_reader
-                .stored_target_state_root(*rollup_id)
-                .await?;
             rollups.insert(
                 *rollup_id,
                 Rollup {
                     client: Arc::clone(client),
                     session: None,
                     config: config.clone(),
-                    initial_state_root,
                 },
             );
         }
@@ -250,7 +238,7 @@ impl CrossChainWiring {
             .await
             .map_err(eez_protocol::CompositionError::from)?;
         let recorded = builder.recorded().to_vec();
-        let composition = builder.finalize(raw_tx).await?;
+        let composition = builder.finalize().await?;
 
         event!(
             name: "composer.simulate.complete",

@@ -132,22 +132,6 @@ pub type SessionSnapshot = Box<dyn std::any::Any + Send>;
 /// rollup map.
 #[async_trait::async_trait]
 pub trait ChainClient: Send + Sync + 'static {
-    /// Read this chain's own latest block-header `stateRoot`.
-    ///
-    /// Orthogonal to upstream-invariant-6 anchoring (which uses
-    /// [`stored_target_state_root`](Self::stored_target_state_root)
-    /// against L1's canonical storage). Used for diagnostics and
-    /// health checks.
-    ///
-    /// Synchronous: every client reads its own header from a local state
-    /// provider.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ExecutorErrorKind::Provider`] if the underlying state
-    /// provider is inaccessible; [`ExecutorErrorKind::Unavailable`] when
-    /// the implementation does not (or cannot) report its own header.
-    fn current_state_root(&self) -> ExecutorResult<[u8; 32]>;
 
     /// Create a fresh stateful execution session. The slot drain may
     /// keep the returned session alive across consecutive source txs
@@ -181,10 +165,9 @@ pub trait ChainClient: Send + Sync + 'static {
     /// surfaced by `dispatcher` during proxy call dispatch.
     async fn simulate_source_tx(
         &self,
-        raw_tx: Vec<u8>,
-        dispatcher: &mut CompositionBuilder,
+        _raw_tx: Vec<u8>,
+        _dispatcher: &mut CompositionBuilder,
     ) -> ExecutorResult<()> {
-        let _ = (raw_tx, dispatcher);
         Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
             "simulate_source_tx: not an entry-role client".into(),
         )))
@@ -202,8 +185,7 @@ pub trait ChainClient: Send + Sync + 'static {
     /// Returns [`ExecutorErrorKind::Provider`] if the underlying state
     /// provider is inaccessible; [`ExecutorErrorKind::Unavailable`] if
     /// the client does not host the committed-root storage.
-    async fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
-        let _ = rollup_id;
+    async fn stored_target_state_root(&self, _rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
         Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
             "stored_target_state_root: client does not host the committed-root storage".into(),
         )))

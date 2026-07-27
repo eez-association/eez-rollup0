@@ -313,28 +313,6 @@ impl ChainClient for LocalChainClient {
         Ok(Box::new(session))
     }
 
-    /// Read the latest block header's `stateRoot` from this chain's
-    /// own provider. Orthogonal to invariant-6 anchoring; useful for
-    /// diagnostics and future paths.
-    fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
-        let num = self
-            .provider
-            .headers
-            .best_block_number()
-            .map_err(ExecutorError::provider)?;
-        let header = self
-            .provider
-            .headers
-            .header_by_number(num)
-            .map_err(ExecutorError::provider)?
-            .ok_or_else(|| {
-                ExecutorError::from(ExecutorErrorKind::Missing(
-                    "header at latest block for current_state_root",
-                ))
-            })?;
-        Ok(header.state_root.0)
-    }
-
     async fn simulate_source_tx(
         &self,
         raw_tx: Vec<u8>,
@@ -464,20 +442,6 @@ impl ChainClient for LocalChainClient {
 
         if let Some(err) = inspector_error {
             return Err(err);
-        }
-
-        // Drain the entry overlay's per-tx roots (one per overlay
-        // execute, in chronological dispatch order) and forward to
-        // the dispatcher so `finalize` can populate
-        // `per_tx_roots_by_rollup[entry]`. Without this, nested calls
-        // attributed to the entry rollup hit `InvalidCheckpoint` in
-        // `build_batch` (the CCM-verify loop skips the entry rollup,
-        // leaving its slot in the map empty).
-        if let Some(channel) = &self.overlay_channel {
-            let roots = channel.drain_post_roots();
-            if !roots.is_empty() {
-                dispatcher.set_extra_per_tx_roots(self.rollup_id, roots);
-            }
         }
 
         tracing::info!(
