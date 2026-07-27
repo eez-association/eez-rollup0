@@ -12,7 +12,7 @@
 # ── chef base: toolchain + system deps reth/mdbx/secp256k1 need ───────
 FROM rust:1.94-bookworm AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        clang libclang-dev pkg-config cmake libssl-dev git ca-certificates \
+        clang libclang-dev pkg-config cmake libssl-dev git ca-certificates protobuf-compiler \
     && rm -rf /var/lib/apt/lists/* \
     && cargo install cargo-chef --locked
 WORKDIR /build
