@@ -917,6 +917,10 @@ pub(crate) fn verify_settlement_chain(
     Ok(())
 }
 #[cfg(test)]
+#[allow(
+    clippy::field_reassign_with_default,
+    reason = "mirror upstream shape; EvmBatch is now a plain Sol alias"
+)]
 mod tests {
     use super::*;
     use alloy_primitives::{U256, address};
@@ -932,15 +936,13 @@ mod tests {
     /// eez-protocol's `carrier_batch` test helper, with the publicInputsHash the
     /// composer would claim for the given `vkey`.
     fn carrier_post_batch(vkey: B256) -> eez_control_rpc::v1::PostBatch {
-        let batch = EvmBatch {
-            blockNumber: 0, // timeless
-            proofSystems: vec![address!("00000000000000000000000000000000000000aa")],
-            rollupIdsWithProofSystems: vec![RollupIdWithProofSystemsSol {
-                rollupId: U256::from(1),
-                proofSystemIndex: vec![0],
-            }],
-            ..Default::default()
-        };
+        let mut batch = EvmBatch::default();
+        batch.blockNumber = 0; // timeless
+        batch.proofSystems = vec![address!("00000000000000000000000000000000000000aa")];
+        batch.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
+            rollupId: U256::from(1),
+            proofSystemIndex: vec![0],
+        }];
         let claimed = public_inputs_hashes(&batch, vkey, None).unwrap()[0];
         eez_control_rpc::v1::PostBatch {
             abi_calldata: encode_postbatch(&batch),
@@ -1020,10 +1022,8 @@ mod tests {
         // entries.first() here would read the immediate entry and REJECT honest inbound.
         let immediate = || entry(B256::ZERO, Bytes::new(), delta());
         let deferred = || entry(h, ret.clone(), Vec::new());
-        let batch = EvmBatch {
-            entries: vec![immediate(), deferred()],
-            ..Default::default()
-        };
+        let mut batch = EvmBatch::default();
+        batch.entries = vec![immediate(), deferred()];
 
         // The REAL L2-sealed call: success, returns Y, keyed on (target,value,data,source).
         let d = DecodedInbound {
@@ -1125,14 +1125,12 @@ mod tests {
         let s0 = mi_sealed(1, true);
         let s1 = mi_sealed(2, true);
         let (h0, h1) = (mi_hash(&s0, 1), mi_hash(&s1, 1));
-        let batch = EvmBatch {
-            entries: vec![
-                mi_immediate_entry(1),
-                mi_deferred_entry(h0, s0.return_data.clone()),
-                mi_deferred_entry(h1, s1.return_data.clone()),
-            ],
-            ..Default::default()
-        };
+        let mut batch = EvmBatch::default();
+        batch.entries = vec![
+            mi_immediate_entry(1),
+            mi_deferred_entry(h0, s0.return_data.clone()),
+            mi_deferred_entry(h1, s1.return_data.clone()),
+        ];
         multi_inbound_outcome_gate(&batch, &[s0.clone(), s1.clone()])
             .expect("two distinct inbounds biject to two deferred entries in order");
 
@@ -1151,26 +1149,22 @@ mod tests {
         // one by hash-set membership.
         let s = mi_sealed(7, true);
         let h = mi_hash(&s, 1);
-        let batch = EvmBatch {
-            entries: vec![
-                mi_immediate_entry(1),
-                mi_deferred_entry(h, s.return_data.clone()),
-                mi_deferred_entry(h, s.return_data.clone()),
-            ],
-            ..Default::default()
-        };
+        let mut batch = EvmBatch::default();
+        batch.entries = vec![
+            mi_immediate_entry(1),
+            mi_deferred_entry(h, s.return_data.clone()),
+            mi_deferred_entry(h, s.return_data.clone()),
+        ];
         multi_inbound_outcome_gate(&batch, &[s.clone(), s.clone()])
             .expect("two identical inbounds biject to two identical-hash deferred entries");
 
         // Only ONE deferred entry for two identical sealed inbounds → cardinality
         // mismatch (an unmatched delivery) → REFUSE (no hash-set collapse).
-        let one_entry = EvmBatch {
-            entries: vec![
-                mi_immediate_entry(1),
-                mi_deferred_entry(h, s.return_data.clone()),
-            ],
-            ..Default::default()
-        };
+        let mut one_entry = EvmBatch::default();
+        one_entry.entries = vec![
+            mi_immediate_entry(1),
+            mi_deferred_entry(h, s.return_data.clone()),
+        ];
         assert!(multi_inbound_outcome_gate(&one_entry, &[s.clone(), s]).is_err());
     }
 
@@ -1180,22 +1174,18 @@ mod tests {
         // sealed inbounds). Cardinality 0 sealed != 1 deferred → REFUSE.
         let s = mi_sealed(1, true);
         let h = mi_hash(&s, 1);
-        let batch = EvmBatch {
-            entries: vec![
-                mi_immediate_entry(1),
-                mi_deferred_entry(h, s.return_data.clone()),
-            ],
-            ..Default::default()
-        };
+        let mut batch = EvmBatch::default();
+        batch.entries = vec![
+            mi_immediate_entry(1),
+            mi_deferred_entry(h, s.return_data.clone()),
+        ];
         assert!(
             multi_inbound_outcome_gate(&batch, &[]).is_err(),
             "a deferred entry with no sealed inbound is a phantom delivery"
         );
         // And a CLEAN inbound-free batch (no deferred entries, no sealed) → OK.
-        let empty = EvmBatch {
-            entries: vec![mi_immediate_entry(1)],
-            ..Default::default()
-        };
+        let mut empty = EvmBatch::default();
+        empty.entries = vec![mi_immediate_entry(1)];
         multi_inbound_outcome_gate(&empty, &[]).expect("no inbounds, no deferred entries → OK");
     }
 
@@ -1204,10 +1194,8 @@ mod tests {
         // UNMATCHED: the L2 sealed an inbound the batch does NOT settle (the batch
         // carries no deferred entry for it). 1 sealed != 0 deferred → REFUSE.
         let s = mi_sealed(1, true);
-        let batch = EvmBatch {
-            entries: vec![mi_immediate_entry(1)],
-            ..Default::default()
-        };
+        let mut batch = EvmBatch::default();
+        batch.entries = vec![mi_immediate_entry(1)];
         assert!(multi_inbound_outcome_gate(&batch, &[s]).is_err());
     }
 
@@ -1220,13 +1208,11 @@ mod tests {
         // asserted here from the double-match framing.)
         let s = mi_sealed(3, true);
         let h = mi_hash(&s, 1);
-        let batch = EvmBatch {
-            entries: vec![
-                mi_immediate_entry(1),
-                mi_deferred_entry(h, s.return_data.clone()),
-            ],
-            ..Default::default()
-        };
+        let mut batch = EvmBatch::default();
+        batch.entries = vec![
+            mi_immediate_entry(1),
+            mi_deferred_entry(h, s.return_data.clone()),
+        ];
         assert!(
             multi_inbound_outcome_gate(&batch, &[s.clone(), s]).is_err(),
             "one deferred entry cannot back two sealed inbounds (no double-match)",
@@ -1240,13 +1226,11 @@ mod tests {
         // consume on a call L2 never failed) → REFUSE.
         let s = mi_sealed(1, true);
         let h = mi_hash(&s, 1);
-        let mut batch = EvmBatch {
-            entries: vec![
-                mi_immediate_entry(1),
-                mi_deferred_entry(h, s.return_data.clone()),
-            ],
-            ..Default::default()
-        };
+        let mut batch = EvmBatch::default();
+        batch.entries = vec![
+            mi_immediate_entry(1),
+            mi_deferred_entry(h, s.return_data.clone()),
+        ];
         // A leftover failed lookup with no backing sealed failure.
         batch.l1ToL2lookupCalls = vec![eez_protocol::abi::LookupCallSol {
             crossChainCallHash: B256::repeat_byte(0xfe),
@@ -1316,10 +1300,8 @@ mod tests {
             U256::from(7u64),
             alloy_primitives::Bytes::from(vec![0x12u8, 0x34]),
         );
-        let batch = EvmBatch {
-            entries: vec![entry.clone()],
-            ..Default::default()
-        };
+        let mut batch = EvmBatch::default();
+        batch.entries = vec![entry.clone()];
 
         assert!(verify_outbound_authorized(&batch, &[observed_for(&entry)], 1).is_ok());
         assert!(verify_outbound_authorized(&batch, &[], 1).is_err());
@@ -1345,10 +1327,8 @@ mod tests {
             U256::from(222u64),
             alloy_primitives::Bytes::from(vec![0x03, 0x04]),
         );
-        let batch = EvmBatch {
-            entries: vec![entry0.clone(), entry1.clone()],
-            ..Default::default()
-        };
+        let mut batch = EvmBatch::default();
+        batch.entries = vec![entry0.clone(), entry1.clone()];
 
         let observed = vec![observed_for(&entry0), observed_for(&entry1)];
         assert!(verify_outbound_authorized(&batch, &observed, 1).is_ok());
@@ -1418,21 +1398,19 @@ mod tests {
     fn post_batch_with_chain(deltas: &[(u64, B256, B256)]) -> eez_control_rpc::v1::PostBatch {
         let template = fixture_batch().entries[0].clone();
         let template_delta = template.stateDeltas[0].clone();
-        let batch = EvmBatch {
-            entries: deltas
-                .iter()
-                .map(|&(rid, cur, new)| {
-                    let mut e = template.clone();
-                    let mut d = template_delta.clone();
-                    d.rollupId = U256::from(rid);
-                    d.currentState = cur;
-                    d.newState = new;
-                    e.stateDeltas = vec![d];
-                    e
-                })
-                .collect(),
-            ..Default::default()
-        };
+        let mut batch = EvmBatch::default();
+        batch.entries = deltas
+            .iter()
+            .map(|&(rid, cur, new)| {
+                let mut e = template.clone();
+                let mut d = template_delta.clone();
+                d.rollupId = U256::from(rid);
+                d.currentState = cur;
+                d.newState = new;
+                e.stateDeltas = vec![d];
+                e
+            })
+            .collect();
         eez_control_rpc::v1::PostBatch {
             abi_calldata: encode_postbatch(&batch),
             ..Default::default()
