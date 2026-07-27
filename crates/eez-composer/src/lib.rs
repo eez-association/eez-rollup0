@@ -14,7 +14,7 @@
 //!                ↑
 //! eez-l1        L1Watcher / L1CanonicalHead / Submitter primitives.
 //!                ↑
-//! eez-prover    Prover trait + impls.
+//! eez-prover    Shared proving types.
 //!                ↑
 //! eez-composer  THIS crate. Composer umbrella + RollupState +
 //!               L1-anchored Scheduler. Drives Sequencer per-rollup,

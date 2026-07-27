@@ -29,7 +29,8 @@ use eez_driver::{
     witness::{ExecutionWitnessMode, block_witness},
 };
 use eez_l1::{BundleTarget, L1Event, L1Watcher, SendOutcome, Submitter};
-use eez_prover::{BlockWitness, Prover};
+use eez_prover::BlockWitness;
+use eez_prover_client::RemoteProver;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
@@ -444,7 +445,7 @@ struct Inner<L2: BlockReader> {
     /// shape ready for multi-L2.
     rollups: HashMap<u64, RollupState<L2>>,
     /// Shared across rollups: one prover, one submitter, one `L1Watcher`.
-    prover: Arc<dyn Prover>,
+    prover: RemoteProver,
     submitter: Submitter,
     l1_watcher: L1Watcher,
     /// EVM config — used by [`build_sync_block`] to construct the
@@ -485,7 +486,7 @@ where
     #[must_use]
     pub fn new(
         rollups: HashMap<u64, RollupState<L2>>,
-        prover: Arc<dyn Prover>,
+        prover: RemoteProver,
         submitter: Submitter,
         l1_watcher: L1Watcher,
         evm_config: EthEvmConfig,
