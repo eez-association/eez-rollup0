@@ -553,9 +553,10 @@ mod tests {
     fn batch_with_entries(
         entries: Vec<eez_protocol::abi::ExecutionEntrySol>,
     ) -> eez_protocol::EvmBatch {
-        let mut b = eez_protocol::EvmBatch::default();
-        b.entries = entries;
-        b
+        eez_protocol::EvmBatch {
+            entries,
+            ..Default::default()
+        }
     }
 
     /// Composition whose source batch carries `source_entries` (the lean
