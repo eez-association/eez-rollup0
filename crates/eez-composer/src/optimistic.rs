@@ -87,6 +87,11 @@ struct InFlight {
     post_batch_hash: TxHash,
     parent: SealedHeader<alloy_consensus::Header>,
     resolution: Resolution,
+    /// Whether the Deriver cursor has confirmed this entry. This is
+    /// independent from `resolution`: the observer can mark an entry
+    /// Settled first, while cursor confirmation owns the held pool's
+    /// one-time in-flight cleanup.
+    cursor_confirmed: bool,
     /// Set by `mark_failed` when the drop was a skipped-slot miss.
     slot_skipped: bool,
 }
@@ -125,6 +130,7 @@ impl OptimisticallyIncluded {
                 post_batch_hash,
                 parent,
                 resolution: Resolution::Pending,
+                cursor_confirmed: false,
                 slot_skipped: false,
             },
         );
@@ -150,14 +156,21 @@ impl OptimisticallyIncluded {
     /// `check_claimed_state` accepted it, which is a stronger
     /// settlement proof than the observer's log scan. A Failed verdict
     /// is overridden here: a false-negative observation must not undo
-    /// a batch the Deriver confirmed.
-    pub fn resolve_below_cursor(&self, cursor: u64) {
+    /// a batch the Deriver confirmed. Returns the txs newly resolved so
+    /// the held pool can release their in-flight nonce reservations.
+    pub fn resolve_below_cursor(&self, cursor: u64) -> Vec<HeldTx> {
         let mut map = self.by_sync_height.lock().unwrap();
+        let mut newly_cursor_confirmed = Vec::new();
         for (_, entry) in map.range_mut(..=cursor) {
             if entry.resolution != Resolution::Settled {
                 entry.resolution = Resolution::Settled;
             }
+            if !entry.cursor_confirmed {
+                newly_cursor_confirmed.extend(entry.txs.iter().cloned());
+                entry.cursor_confirmed = true;
+            }
         }
+        newly_cursor_confirmed
     }
 
     /// Observer verdict: the bundle settled on L1. Entry is retained
@@ -219,6 +232,7 @@ impl OptimisticallyIncluded {
                 post_batch_hash: batch.post_batch_hash,
                 parent: batch.parent,
                 resolution: Resolution::Failed,
+                cursor_confirmed: false,
                 slot_skipped: batch.slot_skipped,
             },
         );
@@ -326,6 +340,26 @@ mod tests {
     }
 
     #[test]
+    fn reinserted_failure_preserves_nonce_reservations() {
+        let held_pool = crate::HeldPool::new();
+        let original = tx(1);
+        held_pool.push_contiguous(original.clone(), 1).unwrap();
+        let reserved = held_pool.pop_n(1);
+
+        let optimistic = OptimisticallyIncluded::new();
+        optimistic.begin(10, pb_hash(0xa), hdr(), reserved);
+        optimistic.mark_failed(10, false);
+        let failed = optimistic.take_failed_for_recovery(0).unwrap();
+        optimistic.reinsert_failed(failed);
+
+        let mut replacement = original;
+        replacement.hash = TxHash::repeat_byte(0xff);
+        replacement.raw_tx = alloy_primitives::Bytes::from(vec![0xff; 4]);
+        assert!(held_pool.push_contiguous(replacement, 1).is_err());
+        assert_eq!(optimistic.blocking_height(0), Some(10));
+    }
+
+    #[test]
     fn failed_recovery_propagates_slot_skipped() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
@@ -343,9 +377,21 @@ mod tests {
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
         pool.mark_failed(10, false);
         // Deriver confirmed the batch — false-negative verdict overridden.
-        pool.resolve_below_cursor(10);
+        let released = pool.resolve_below_cursor(10);
+        assert_eq!(released.len(), 1);
         assert!(pool.take_failed_for_recovery(0).is_none());
         assert_eq!(pool.blocking_height(10), None);
+    }
+
+    #[test]
+    fn cursor_resolution_releases_observer_settled_once() {
+        let pool = OptimisticallyIncluded::new();
+        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
+        pool.mark_settled(10);
+
+        let released = pool.resolve_below_cursor(10);
+        assert_eq!(released.len(), 2);
+        assert!(pool.resolve_below_cursor(10).is_empty());
     }
 
     #[test]
