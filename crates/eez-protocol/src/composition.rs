@@ -400,7 +400,8 @@ impl CompositionBuilder {
                 initial_roots,
                 per_tx_roots_by_rollup,
             };
-            let batch = entries::build_batch(group_calls, &attribution, &dialect, rollup_id, raw_tx)?;
+            let batch =
+                entries::build_batch(group_calls, &attribution, &dialect, rollup_id, raw_tx)?;
             if batch.is_empty() {
                 let has_incoming = group_calls.iter().any(|c| c.source_rollup_id != rollup_id);
                 if has_incoming {
