@@ -21,6 +21,7 @@ mod bundle_rpc;
 mod follower;
 mod ingress;
 mod l1_embedded;
+mod mock_prover;
 mod witness_source;
 
 use std::{collections::HashMap, env, str::FromStr, sync::Arc, time::Duration};
@@ -38,7 +39,6 @@ use eez_driver::{
 use eez_l1::{
     L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
 };
-use eez_prover::MockEcdsaProver;
 use mimalloc::MiMalloc;
 use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
 use reth_node_builder::components::BasicPayloadServiceBuilder;
@@ -438,15 +438,17 @@ fn main() -> eyre::Result<()> {
             // Attestation source. Remote mode (`EEZ_PROVER_URL`) holds NO signing
             // key in the composer: it dials eez-proverd and only VERIFIES that each
             // attestation recovers to the configured attester address (the on-chain
-            // proof-system check is authoritative; this is a fail-fast).
-            let prover: Arc<dyn eez_prover::Prover> = match env::var("EEZ_PROVER_URL") {
+            // proof-system check is authoritative; this is a fail-fast). Mock mode
+            // spawns an in-process `prove.v1.Prover` stub and dials that instead —
+            // the composer always talks gRPC.
+            let prover = match env::var("EEZ_PROVER_URL") {
                 Ok(url) => {
                     let attester = env::var("EEZ_ATTESTER_ADDRESS").map_err(|_| {
                         eyre::eyre!("EEZ_ATTESTER_ADDRESS required in remote-prover mode")
                     })?;
                     let attester = Address::from_str(attester.trim())
                         .map_err(|e| eyre::eyre!("EEZ_ATTESTER_ADDRESS: {e}"))?;
-                    Arc::new(eez_prover_client::RemoteProver::new(url, attester))
+                    eez_prover_client::RemoteProver::new(url, attester)
                 }
                 Err(_) => {
                     let key = env::var("EEZ_PROOF_SIGNER_KEY").map_err(|_| {
@@ -455,7 +457,9 @@ fn main() -> eyre::Result<()> {
                     let signer = PrivateKeySigner::from_bytes(&B256::from_str(
                         key.trim_start_matches("0x"),
                     )?)?;
-                    Arc::new(MockEcdsaProver::new(signer))
+                    let attester = signer.address();
+                    let url = mock_prover::spawn(signer).await?;
+                    eez_prover_client::RemoteProver::new(url, attester)
                 }
             };
             let rollup_id = rollup_config.rollup_id;

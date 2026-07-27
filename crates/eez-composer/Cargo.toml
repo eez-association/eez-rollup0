@@ -14,6 +14,7 @@ eez-l1.workspace             = true
 eez-payload-codec.workspace  = true
 eez-protocol.workspace       = true
 eez-prover.workspace         = true
+eez-prover-client.workspace  = true
 
 # gnosis — chiado L1 header type for GnosisL1Adapter
 gnosis-primitives.workspace = true

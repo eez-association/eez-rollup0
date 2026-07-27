@@ -8,6 +8,7 @@ description            = "eez Rollup-0 node — vanilla reth driven by an eez se
 
 [dependencies]
 eez-composer.workspace      = true
+eez-control-rpc.workspace   = true
 eez-deriver.workspace       = true
 eez-driver.workspace        = true
 eez-evm-inspector.workspace = true
@@ -51,6 +52,7 @@ alloy-primitives.workspace   = true
 alloy-rlp.workspace          = true
 alloy-rpc-types-debug.workspace = true
 alloy-provider.workspace     = true
+alloy-signer.workspace       = true
 alloy-signer-local.workspace = true
 reqwest.workspace            = true
 
@@ -66,6 +68,10 @@ serde.workspace      = true
 serde_json.workspace = true
 # Witness-store value codec (compact binary).
 postcard.workspace   = true
+# In-process mock prover: a `prove.v1.Prover` stub served on localhost in
+# mock mode so the composer always talks to the prover over gRPC.
+tonic.workspace        = true
+tokio-stream           = { workspace = true, features = ["net"] }
 
 # app
 clap.workspace               = true
