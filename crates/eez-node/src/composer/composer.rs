@@ -462,7 +462,7 @@ struct Inner<L2: BlockReader> {
     committer: std::sync::OnceLock<BlockCommitterHandle<EthEngineTypes>>,
     /// Per-block witnesses for [`eez_protocol::ProvingContext::blocks`]. Set only
     /// in remote-prover mode; `None` (mock) leaves `blocks` empty.
-    witness_source: std::sync::OnceLock<Arc<dyn crate::witness_source::ProvingWitnessSource>>,
+    witness_source: std::sync::OnceLock<Arc<crate::witness_source::NodeWitnessSource>>,
 }
 
 impl<L2: BlockReader> std::fmt::Debug for Composer<L2> {
@@ -506,7 +506,7 @@ where
     }
 
     /// Wire the proving-witness source (remote-prover mode only). Later calls no-op.
-    pub fn set_witness_source(&self, src: Arc<dyn crate::witness_source::ProvingWitnessSource>) {
+    pub fn set_witness_source(&self, src: Arc<crate::witness_source::NodeWitnessSource>) {
         let _ = self.inner.witness_source.set(src);
     }
 

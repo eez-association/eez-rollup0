@@ -763,7 +763,7 @@ fn main() -> eyre::Result<()> {
                     // for near-empty blocks).
                     Some(Arc::new(witness_source::NodeWitnessSource::new(
                         store, ws_provider, ws_evm,
-                    )) as Arc<dyn eez_node::witness_source::ProvingWitnessSource>)
+                    )))
                 }
                 _ => None,
             };

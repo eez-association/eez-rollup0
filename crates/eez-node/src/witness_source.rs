@@ -27,8 +27,11 @@ use alloy_rpc_types_debug::ExecutionWitness;
 use eez_protocol::BlockWitness;
 use reth_ethereum_primitives::{Block, EthPrimitives};
 use reth_evm::ConfigureEvm;
+use reth_evm_ethereum::EthEvmConfig;
 use reth_libmdbx::{DatabaseFlags, Environment, Geometry, WriteFlags};
-use reth_storage_api::{BlockReader, HeaderProvider, StateProviderFactory, TransactionVariant};
+use reth_storage_api::{
+    BlockHashReader, BlockReader, HeaderProvider, StateProviderFactory, TransactionVariant,
+};
 use tokio::sync::mpsc;
 use tracing::{Level, event};
 
@@ -37,20 +40,6 @@ const GIGABYTE: usize = 1024 * 1024 * 1024;
 /// grows the file lazily, so a generous cap just means "never `MAP_FULL`".
 const MAP_MAX_BYTES: usize = 256 * GIGABYTE;
 const GROWTH_STEP: isize = 1024 * 1024 * 1024;
-
-/// Produces the [`BlockWitness`] for a committed L2 block — the seam by which
-/// the composer fills
-/// [`ProvingContext::blocks`](eez_protocol::ProvingContext::blocks) without
-/// owning the reth provider itself. [`NodeWitnessSource`] backs this with the
-/// node's provider + [`crate::driver::witness`]; the composer only calls it.
-pub trait ProvingWitnessSource: Send + Sync + std::fmt::Debug {
-    /// Build the RLP + augmented witness for block `number`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message if the block is missing or witness generation fails.
-    fn block_witness(&self, number: u64) -> Result<BlockWitness, String>;
-}
 
 /// Persistent witness store: a dedicated mdbx env keyed by block number
 /// (big-endian, so key order == numeric order → ordered purge). Cheap `Arc`
@@ -196,19 +185,23 @@ pub fn new_store(path: &Path) -> eyre::Result<WitnessStore> {
     Ok(Arc::new(WitnessDb::open(path)?))
 }
 
-/// The composer's [`ProvingWitnessSource`]: reads a captured witness from the
+/// The composer's witness source: reads a captured witness from the
 /// persistent store, falling back to on-demand re-exec for the newest blocks the
 /// capture task hasn't drained yet (parent state still fresh).
 #[derive(Clone)]
-pub struct NodeWitnessSource<P, E> {
+pub struct NodeWitnessSource {
     store: WitnessStore,
-    provider: P,
-    evm_config: E,
+    provider: crate::EthNodeProvider,
+    evm_config: EthEvmConfig,
 }
 
-impl<P, E> NodeWitnessSource<P, E> {
+impl NodeWitnessSource {
     #[must_use]
-    pub const fn new(store: WitnessStore, provider: P, evm_config: E) -> Self {
+    pub const fn new(
+        store: WitnessStore,
+        provider: crate::EthNodeProvider,
+        evm_config: EthEvmConfig,
+    ) -> Self {
         Self {
             store,
             provider,
@@ -217,22 +210,22 @@ impl<P, E> NodeWitnessSource<P, E> {
     }
 }
 
-impl<P, E> std::fmt::Debug for NodeWitnessSource<P, E> {
+impl std::fmt::Debug for NodeWitnessSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeWitnessSource").finish_non_exhaustive()
     }
 }
 
-impl<P, E> ProvingWitnessSource for NodeWitnessSource<P, E>
-where
-    P: BlockReader<Block = Block>
-        + StateProviderFactory
-        + HeaderProvider<Header = Header>
-        + Send
-        + Sync,
-    E: ConfigureEvm<Primitives = EthPrimitives> + Send + Sync,
-{
-    fn block_witness(&self, number: u64) -> Result<BlockWitness, String> {
+impl NodeWitnessSource {
+    /// Build the RLP + augmented witness for block `number` — the seam by
+    /// which the composer fills
+    /// [`ProvingContext::blocks`](eez_protocol::ProvingContext::blocks)
+    /// without owning the reth provider itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if the block is missing or witness generation fails.
+    pub fn block_witness(&self, number: u64) -> Result<BlockWitness, String> {
         match self.store.get(number) {
             // Reorg guard: the store is keyed by block number, so a witness
             // captured before a reorg can be stale. Trust the hit only if its
