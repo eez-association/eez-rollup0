@@ -41,7 +41,6 @@ pub mod abi;
 pub mod action;
 pub mod addresses;
 pub mod authorized_proxies;
-pub mod batch;
 pub mod composition;
 pub mod dialect;
 pub mod entries;
@@ -69,7 +68,7 @@ pub use authorized_proxies::{
     decode_proxy_value, proxy_mapping_key,
 };
 #[doc(inline)]
-pub use batch::EvmBatch;
+pub use abi::EvmBatch;
 #[doc(inline)]
 pub use composition::{CompositionBuilder, Rollup, TargetConfig};
 #[doc(inline)]

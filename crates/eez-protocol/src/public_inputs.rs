@@ -75,7 +75,7 @@ use alloy_sol_types::{SolValue, sol};
 use tracing::debug;
 
 use crate::abi::{ExecutionEntrySol, LookupCallSol};
-use crate::batch::EvmBatch;
+use crate::abi::EvmBatch;
 
 // ── Per-element atomic hashes ─────────────────────────────────────
 
@@ -502,9 +502,9 @@ mod tests {
 
     /// Minimal finalized batch (carriers filled) for `public_inputs_hashes`
     /// context tests — one PS, one attesting rollup, no entries.
-    fn carrier_batch(block_number: u64) -> crate::batch::EvmBatch {
+    fn carrier_batch(block_number: u64) -> crate::abi::EvmBatch {
         use crate::abi::RollupIdWithProofSystemsSol;
-        let mut batch = crate::batch::EvmBatch {
+        let mut batch = crate::abi::EvmBatch {
             blockNumber: block_number,
             proofSystems: vec![address!("00000000000000000000000000000000000000aa")],
             ..Default::default()

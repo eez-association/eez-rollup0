@@ -205,18 +205,6 @@ sol! {
         ProofSystemBatchPerVerificationEntriesSol batch
     ) external;
 
-    /// L1 (`EEZ.executeL2TX`) — permissionless replay of the next
-    /// `proxyEntryHash == 0` entry in `verificationByRollup[rollupId]
-    /// .queue`. The rollup id is explicit per the multi-prover
-    /// refactor.
-    function executeL2TX(uint256 rollupId) external;
-
-    /// `staticCallLookup` — view on both chains. Looks up a cached
-    /// top-level lookup by `crossChainCallHash` (+ state-root pins on
-    /// L1) and either returns its `returnData` or reverts with it (when
-    /// `failed == true`).
-    function staticCallLookup(address sourceAddress, bytes callData) external view returns (bytes);
-
     /// Emitted once per `postAndVerifyBatch` (`EEZ.sol:154`); `rollupCount` is
     /// the global batch counter. eez-l1's watcher rings on this to detect new
     /// batches. (Re-added for eez0's centralized event decoding — eez-l1 imports
@@ -358,6 +346,21 @@ sol! {
         L2ExecutionEntrySol[] entries,
         L2LookupCallSol[] lookupCalls
     ) external payable returns (bytes);
+}
+
+/// The table-loading batch — the on-chain
+/// `ProofSystemBatchPerVerificationEntriesSol`, aliased for brevity.
+/// `entries::build_batch` fills `entries` + `l1ToL2lookupCalls`; the
+/// submit path fills the proof-system carriers and `proofs[]`.
+pub type EvmBatch = ProofSystemBatchPerVerificationEntriesSol;
+
+impl ProofSystemBatchPerVerificationEntriesSol {
+    /// `true` if the batch carries no entries and no lookup calls — the
+    /// composer's terminal-revert skip uses this.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.l1ToL2lookupCalls.is_empty()
+    }
 }
 
 #[cfg(test)]

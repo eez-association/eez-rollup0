@@ -72,7 +72,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use crate::batch::EvmBatch;
+use crate::abi::EvmBatch;
 use crate::entries;
 use crate::error::{
     CompositionResult, ExecutorError, ExecutorErrorKind, ExecutorResult, ProtocolErrorKind,

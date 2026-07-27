@@ -24,7 +24,7 @@ use crate::abi::{
     L2ToL1CallSol, LookupCallSol, StateDeltaSol, postAndVerifyBatchCall,
 };
 use crate::action::cross_chain_call_hash;
-use crate::batch::EvmBatch;
+use crate::abi::EvmBatch;
 use crate::dialect::ChainDialect;
 
 /// Classification of a single [`ExecutedAction`] within an entry's
