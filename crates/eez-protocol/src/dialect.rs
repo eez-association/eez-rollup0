@@ -75,7 +75,6 @@ impl ChainDialect {
     ///
     #[must_use]
     pub fn encode_follower_trigger(&self, call: &ExecutedAction) -> Vec<u8> {
-        let _ = self;
         // Both dialects route through the proxy's fallback, which
         // forwards the original calldata to the manager. The
         // simulator's TargetTransaction sets `destination` to the

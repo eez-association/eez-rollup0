@@ -13,8 +13,6 @@
 //! downstream (`prepare_post_batch` fills the carriers; the proof sink
 //! fills `proofs[]` with the prover's signature).
 
-use std::collections::HashMap;
-
 use crate::{ExecutedAction, ProtocolResult, RollupId, rolling_hash::EntryRollingHash};
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_sol_types::SolCall;
@@ -29,30 +27,6 @@ use crate::abi::{
 use crate::action::cross_chain_call_hash;
 use crate::batch::EvmBatch;
 use crate::dialect::ChainDialect;
-
-/// Per-rollup attribution inputs for batch construction.
-///
-/// [`build_batch`] consumes this to chain per-entry `stateDeltas`
-/// (upstream's invariant 6). Two sources of truth:
-///
-/// - `initial_roots[rollup]` — the state root each rollup started at,
-///   read from the entry chain once when the composition began.
-/// - `per_tx_roots_by_rollup[rollup]` — the post-state roots `finalize`
-///   attributed per rollup (zk-poster settlement root or inbound
-///   delivery root).
-///
-/// References (no ownership): the builder materializes each map once per
-/// composition and hands borrowed handles to the batch builder.
-#[derive(Debug)]
-pub struct SourceAttribution<'a> {
-    /// Per-rollup initial state roots, as of the entry chain's current
-    /// block when the composition began.
-    pub initial_roots: &'a HashMap<RollupId, [u8; 32]>,
-    /// Per-rollup cumulative post-state roots for each tx in that
-    /// rollup's batch. Keyed by `RollupId`; each `Vec` is ordered by
-    /// batch tx index.
-    pub per_tx_roots_by_rollup: &'a HashMap<RollupId, Vec<[u8; 32]>>,
-}
 
 /// Classification of a single [`ExecutedAction`] within an entry's
 /// flat call window. Drives [`build_batch`]'s emission decision.
@@ -97,10 +71,7 @@ impl CallKind {
 /// `expectedL1ToL2Calls` arrays or in the batch-level lookup queue,
 /// per their kind.
 ///
-/// `attribution` is plumbed for `StateDelta.currentState` chaining
-/// (future fixture wiring); `raw_tx` is plumbed for L1-style
-/// `executeL2TX` raw-tx routing. `source_rollup_id` is the rollup
-/// THIS batch targets.
+/// `source_rollup_id` is the rollup THIS batch targets.
 ///
 /// # Errors
 ///
@@ -110,19 +81,9 @@ impl CallKind {
 #[tracing::instrument(level = "debug", name = "build_batch", skip_all, fields(source = %source_rollup_id), err)]
 pub fn build_batch(
     recorded: &[ExecutedAction],
-    attribution: &crate::SourceAttribution<'_>,
     dialect: &ChainDialect,
     source_rollup_id: RollupId,
-    raw_tx: &[u8],
 ) -> ProtocolResult<EvmBatch> {
-    // TODO(attribution): use for `StateDelta.currentState` chaining — the
-    // upstream-invariant-6 anchor that pins each entry's pre-state to the
-    // committed root (today the driver attaches the settlement StateDelta
-    // separately in prepare_post_batch).
-    // TODO(raw_tx): use for L1-style `executeL2TX` raw-tx routing /
-    // stateless re-execution + custom-dialect entry shapes.
-    let _ = (attribution, raw_tx);
-
     let group: Vec<&ExecutedAction> = recorded
         .iter()
         .filter(|c| {
@@ -1352,16 +1313,6 @@ mod tests {
         }
     }
 
-    #[allow(
-        clippy::type_complexity,
-        reason = "test helper; the explicit tuple is local"
-    )]
-    fn empty_attribution() -> (
-        HashMap<RollupId, [u8; 32]>,
-        HashMap<RollupId, Vec<[u8; 32]>>,
-    ) {
-        (HashMap::new(), HashMap::new())
-    }
 
     /// A #28 execution entry whose `expectedLookups` (the PR#28-only field,
     /// absent from the #27 `ExecutionEntry`) is NON-empty, so a decode canary
@@ -1489,12 +1440,7 @@ mod tests {
 
     #[test]
     fn empty_recorded_yields_empty_batch() {
-        let (init, ptx) = empty_attribution();
-        let attr = SourceAttribution {
-            initial_roots: &init,
-            per_tx_roots_by_rollup: &ptx,
-        };
-        let batch = build_batch(&[], &attr, &ChainDialect::EvmL1Style, RollupId(1), &[])
+        let batch = build_batch(&[], &ChainDialect::EvmL1Style, RollupId(1))
             .expect("build_batch ok");
         assert!(batch.entries.is_empty());
         assert!(batch.l1ToL2lookupCalls.is_empty());
@@ -1510,13 +1456,8 @@ mod tests {
         // stateDelta and the return value (if any) is carried separately in
         // `returnData`. (sync-rollups-protocol@fe7bf66 — a folded outer here
         // makes `executeCrossChainCall` revert `RollingHashMismatch`.)
-        let (init, ptx) = empty_attribution();
-        let attr = SourceAttribution {
-            initial_roots: &init,
-            per_tx_roots_by_rollup: &ptx,
-        };
         let calls = vec![record(RollupId(1), RollupId(0), true)];
-        let batch = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[])
+        let batch = build_batch(&calls, &ChainDialect::EvmL1Style, RollupId(0))
             .expect("build_batch ok");
         assert_eq!(batch.entries.len(), 1);
         // The TopLevel call is described by the entry's
@@ -1828,13 +1769,8 @@ mod tests {
 
     #[test]
     fn outgoing_to_other_rollup_yields_empty_batch_for_target() {
-        let (init, ptx) = empty_attribution();
-        let attr = SourceAttribution {
-            initial_roots: &init,
-            per_tx_roots_by_rollup: &ptx,
-        };
         let calls = vec![record(RollupId(1), RollupId(0), true)];
-        let batch = build_batch(&calls, &attr, &ChainDialect::EvmL2Style, RollupId(1), &[])
+        let batch = build_batch(&calls, &ChainDialect::EvmL2Style, RollupId(1))
             .expect("build_batch ok");
         assert!(batch.entries.is_empty());
         assert!(batch.l1ToL2lookupCalls.is_empty());
@@ -1842,16 +1778,11 @@ mod tests {
 
     #[test]
     fn nested_reentrant_call_lands_in_expected_l1_to_l2_calls() {
-        let (init, ptx) = empty_attribution();
-        let attr = SourceAttribution {
-            initial_roots: &init,
-            per_tx_roots_by_rollup: &ptx,
-        };
         let calls = vec![
             record(RollupId(1), RollupId(0), true),
             record(RollupId(0), RollupId(1), true),
         ];
-        let batch = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[])
+        let batch = build_batch(&calls, &ChainDialect::EvmL1Style, RollupId(0))
             .expect("build_batch ok");
         assert_eq!(batch.entries.len(), 1);
         assert_eq!(
@@ -1868,16 +1799,11 @@ mod tests {
         // `expectedLookups` emission (unbuilt) — build_batch refuses loudly
         // instead of mis-emitting a top-level lookup the new contract
         // mis-consumes.
-        let (init, ptx) = empty_attribution();
-        let attr = SourceAttribution {
-            initial_roots: &init,
-            per_tx_roots_by_rollup: &ptx,
-        };
         let calls = vec![
             record(RollupId(1), RollupId(0), true),
             record(RollupId(0), RollupId(1), false),
         ];
-        let err = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[])
+        let err = build_batch(&calls, &ChainDialect::EvmL1Style, RollupId(0))
             .expect_err("nested-failed lookup must be refused");
         assert!(
             format!("{err}").contains("entry-scoped emission"),
@@ -1920,13 +1846,8 @@ mod tests {
 
     #[test]
     fn terminal_revert_yields_empty_batch() {
-        let (init, ptx) = empty_attribution();
-        let attr = SourceAttribution {
-            initial_roots: &init,
-            per_tx_roots_by_rollup: &ptx,
-        };
         let calls = vec![record(RollupId(1), RollupId(0), false)];
-        let batch = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[])
+        let batch = build_batch(&calls, &ChainDialect::EvmL1Style, RollupId(0))
             .expect("build_batch ok");
         assert!(batch.is_empty());
     }

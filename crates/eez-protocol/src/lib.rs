@@ -74,8 +74,6 @@ pub use batch::EvmBatch;
 #[doc(inline)]
 pub use composition::{CompositionBuilder, Rollup, TargetConfig};
 #[doc(inline)]
-pub use entries::SourceAttribution;
-#[doc(inline)]
 pub use dialect::ChainDialect;
 #[doc(inline)]
 pub use error::{

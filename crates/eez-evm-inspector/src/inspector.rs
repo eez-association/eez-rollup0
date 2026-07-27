@@ -86,14 +86,6 @@ use eez_protocol::{ProxyInfo, decode_proxy_value, proxy_mapping_key};
 /// `source_cache` outside the hook is a programming error.
 #[derive(Debug, Default)]
 pub struct OverlayChannel {
-    /// Monotonic write counter incremented by every `push_post_cache`
-    /// or `append_post_root`. Sampled into a session checkpoint so
-    /// rollback can truncate the post-cache log + post-root log back
-    /// to the snapshot point. The counter itself never decreases —
-    /// `truncate_to_epoch` cuts the underlying logs to length
-    /// `target_epoch`, leaving the counter ahead so post-rollback
-    /// writes still get strictly-greater epoch values.
-    epoch: std::sync::atomic::AtomicU64,
     /// Stack of pre-dispatch cache snapshots. See [`push_pre_snapshot`]
     /// / [`peek_pre_snapshot`] / [`pop_pre_snapshot`].
     ///
@@ -107,12 +99,6 @@ pub struct OverlayChannel {
     /// [`push_post_cache`]: OverlayChannel::push_post_cache
     /// [`pop_post_cache`]: OverlayChannel::pop_post_cache
     overlay_cache: Mutex<Vec<CacheState>>,
-    /// Append-only per-overlay-execute post-state roots. See
-    /// [`append_post_root`] / [`drain_post_roots`].
-    ///
-    /// [`append_post_root`]: OverlayChannel::append_post_root
-    /// [`drain_post_roots`]: OverlayChannel::drain_post_roots
-    per_tx_roots: Mutex<Vec<[u8; 32]>>,
 }
 
 impl OverlayChannel {
@@ -151,7 +137,6 @@ impl OverlayChannel {
     pub fn push_post_cache(&self, cache: CacheState) {
         if let Ok(mut guard) = self.overlay_cache.lock() {
             guard.push(cache);
-            self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
     }
 
@@ -161,77 +146,6 @@ impl OverlayChannel {
         self.overlay_cache.lock().ok().and_then(|mut g| g.pop())
     }
 
-    /// Append a per-overlay-execute post-state root in chronological
-    /// dispatch order. Each entry rollup overlay session execute
-    /// appends its `current_root` after `commit_and_finish`.
-    pub fn append_post_root(&self, root: [u8; 32]) {
-        if let Ok(mut guard) = self.per_tx_roots.lock() {
-            guard.push(root);
-            self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        }
-    }
-
-    /// Drain the accumulated per-tx roots. Called by source-sim at
-    /// end of `simulate_source_tx`; forwarded to
-    /// `CompositionBuilder::set_extra_per_tx_roots(entry_id, roots)` so
-    /// `finalize` can populate `per_tx_roots_by_rollup[entry]` —
-    /// otherwise nested calls attributed to the entry rollup
-    /// (`reentrantCrossChainCalls`-style deep alternation) hit
-    /// `InvalidCheckpoint: no per_tx_roots entry for attribution
-    /// rollup <entry>` in `build_batch`.
-    pub fn drain_post_roots(&self) -> Vec<[u8; 32]> {
-        self.per_tx_roots
-            .lock()
-            .ok()
-            .map(|mut g| std::mem::take(&mut *g))
-            .unwrap_or_default()
-    }
-
-    /// Snapshot the current write-epoch. Pair with
-    /// [`truncate_to_lengths`](Self::truncate_to_lengths) to roll the
-    /// channel back to its state at the snapshot point. Counter is
-    /// monotonic; truncation only shortens the underlying logs.
-    #[must_use]
-    pub fn current_epoch(&self) -> u64 {
-        self.epoch.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Truncate the post-cache log + post-root log to the lengths they
-    /// held when `target_epoch` was sampled. The atomic counter is
-    /// NOT decremented — its only consumer is to record snapshot
-    /// points, and post-rollback writes must produce strictly-greater
-    /// epoch values to keep ordering with any retained snapshots.
-    ///
-    /// Each `push_post_cache` and `append_post_root` since the
-    /// snapshot point incremented the epoch by 1, so the difference
-    /// `current - target` is exactly the number of writes to undo
-    /// across the two logs combined. Because the two logs interleave
-    /// in real-time (a single dispatch usually does both), this
-    /// primitive truncates each log to its own length-at-snapshot
-    /// rather than redistributing the delta.
-    ///
-    /// Callers stash the per-log lengths alongside the epoch in the
-    /// session's snapshot; this method clamps the logs to those
-    /// lengths.
-    pub fn truncate_to_lengths(&self, post_cache_len: usize, post_roots_len: usize) {
-        if let Ok(mut guard) = self.overlay_cache.lock() {
-            guard.truncate(post_cache_len);
-        }
-        if let Ok(mut guard) = self.per_tx_roots.lock() {
-            guard.truncate(post_roots_len);
-        }
-    }
-
-    /// Sample the current per-log lengths. Stash alongside the
-    /// session snapshot so
-    /// [`truncate_to_lengths`](Self::truncate_to_lengths) can roll
-    /// back precisely.
-    #[must_use]
-    pub fn current_log_lengths(&self) -> (usize, usize) {
-        let post_cache = self.overlay_cache.lock().map_or(0, |g| g.len());
-        let post_roots = self.per_tx_roots.lock().map_or(0, |g| g.len());
-        (post_cache, post_roots)
-    }
 }
 
 /// Shared handle to an [`OverlayChannel`].

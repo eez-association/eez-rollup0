@@ -314,12 +314,6 @@ impl LocalExecutionSession {
         // overlay call so far, since multiple overlay executes within
         // one source-sim hook reuse the same session.
         //
-        // Also append `post_root` to the channel's per-tx roots —
-        // nested entries attributed to the entry rollup pull
-        // `newState` from this list during `build_batch`. Order is
-        // chronological dispatch order, matching the cursor
-        // `build_batch` walks for the entry rollup.
-        //
         // Stack-based push: the inspector at the dispatching frame
         // pops the top after `block_in_place` returns and applies the
         // diff. Stack semantics let nested re-entries chain
@@ -327,7 +321,6 @@ impl LocalExecutionSession {
         // collision.
         if let Some(channel) = &self.overlay_channel {
             channel.push_post_cache(self.state.cache.clone());
-            channel.append_post_root(post_root.0);
         }
 
         tracing::debug!(
@@ -412,7 +405,6 @@ impl TargetExecutionSession for LocalExecutionSession {
                 req.source_rollup_id,
             )?
         } else {
-            let _ = dispatcher;
             self.execute_internal(
                 &req.target_address,
                 &req.data,
