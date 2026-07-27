@@ -48,7 +48,7 @@
 //!      │   → lazy-open rollups[target].session            │
 //!      │   → open_call → session.execute(req, &mut self)  │
 //!      │     → close_call resolves the slot's outcome     │
-//!      │   → return ExecutionResponse to inspector        │
+//!      │   → return ExecutionOutcome to inspector         │
 //!      └──────────────────────────────────────────────────┘
 //!                             │
 //!                             ▼
@@ -252,44 +252,6 @@ impl CompositionBuilder {
         }
     }
 
-    /// Seed LIVE target sessions from a previous composition in the same
-    /// slot (F1, D-3): the slot drain moves the sessions it took from the
-    /// last builder into the next one, so tx_{k+1}'s probes run on the
-    /// state tx_k's probes left — mirroring the source side's chained
-    /// pass-1 session. A session for a rollup not in this builder's map is
-    /// dropped (logged): it cannot be probed, so it cannot drift.
-    #[must_use]
-    pub fn with_sessions(
-        mut self,
-        sessions: HashMap<RollupId, Box<dyn TargetExecutionSession + Send>>,
-    ) -> Self {
-        for (id, session) in sessions {
-            match self.rollups.get_mut(&id) {
-                Some(rollup) => rollup.session = Some(session),
-                None => tracing::warn!(
-                    name: "composer.builder.session_dropped",
-                    rollup_id = %id,
-                    "seeded session for an unregistered rollup — dropped",
-                ),
-            }
-        }
-        self
-    }
-
-    /// Extract every live target session (F1, D-3). Called by the slot
-    /// drain AFTER the pump finishes and BEFORE [`Self::finalize`] consumes
-    /// the builder (`finalize` reads recorded outcomes and configs, never
-    /// the sessions). The drain either chains them into the next tx's
-    /// builder (composition succeeded) or rolls them back to its boundary
-    /// snapshots (composition failed) — and drops them all at slot end:
-    /// sessions never outlive their slot.
-    pub fn take_sessions(&mut self) -> HashMap<RollupId, Box<dyn TargetExecutionSession + Send>> {
-        self.rollups
-            .iter_mut()
-            .filter_map(|(id, rollup)| rollup.session.take().map(|s| (*id, s)))
-            .collect()
-    }
-
     /// The recorded cross-chain calls captured so far (preorder). Read
     /// AFTER `simulate_source_tx` but BEFORE `finalize` (which consumes
     /// `self`) when the caller needs a call's resolved `outcome` (e.g. the
@@ -355,7 +317,8 @@ impl CompositionBuilder {
 
     /// Build the Phase-2 batch for one non-entry rollup and return it
     /// with its per-tx post-state roots. `Ok(None)` means there is
-    /// nothing to build (empty settlement batch, or all calls reverted).
+    /// nothing to build (no calls for this rollup, an empty settlement
+    /// batch, or all calls reverted).
     ///
     /// Two shapes, by dialect:
     /// - zk-poster (L1): the executing `postAndVerifyBatch` mirror. The
@@ -386,8 +349,8 @@ impl CompositionBuilder {
     /// for the unreachable non-empty follower batch, and any error from
     /// `build_batch`.
     #[allow(clippy::result_large_err)]
-    async fn build_target(
-        &mut self,
+    fn build_target_batch(
+        &self,
         rollup_id: RollupId,
         group_calls: &[ExecutedAction],
         raw_tx: &[u8],
@@ -395,7 +358,6 @@ impl CompositionBuilder {
         per_tx_roots_by_rollup: &HashMap<RollupId, Vec<[u8; 32]>>,
     ) -> CompositionResult<Option<(EvmBatch, Vec<[u8; 32]>)>> {
         let rollup = &self.rollups[&rollup_id];
-        let client = std::sync::Arc::clone(&rollup.client);
         let dialect = rollup.config.dialect;
         let entry = self.entry_rollup_id;
 
@@ -404,7 +366,7 @@ impl CompositionBuilder {
             if batch.is_empty() {
                 Ok(None)
             } else {
-                let root = client.current_state_root().await?;
+                let root = rollup.client.current_state_root()?;
                 Ok(Some((batch, vec![root])))
             }
         } else {
@@ -412,7 +374,8 @@ impl CompositionBuilder {
                 initial_roots,
                 per_tx_roots_by_rollup,
             };
-            let batch = entries::build_batch(group_calls, &attribution, &dialect, rollup_id, raw_tx)?;
+            let batch =
+                entries::build_batch(group_calls, &attribution, &dialect, rollup_id, raw_tx)?;
             if batch.is_empty() {
                 let has_incoming = group_calls.iter().any(|c| c.source_rollup_id != rollup_id);
                 if has_incoming {
@@ -459,21 +422,6 @@ impl CompositionBuilder {
             })
     }
 
-    /// Overwrite the last recorded call's post-state root for
-    /// `rollup_id`. No-op if that call is not `Resolved`.
-    fn patch_terminal_root(&mut self, rollup_id: RollupId, root: [u8; 32]) {
-        if let Some(last) = self
-            .recorded
-            .iter_mut()
-            .rev()
-            .find(|r| r.target_rollup_id == rollup_id)
-            && let crate::types::ExecutionOutcome::Resolved {
-                post_state_root, ..
-            } = &mut last.outcome
-        {
-            *post_state_root = root;
-        }
-    }
 
     /// Consume the builder and produce the final [`Composition`].
     ///
@@ -557,51 +505,51 @@ impl CompositionBuilder {
         // L1-poster path (proofs populated, signatures attached) lives
         // in `composer-lib::post_batch_submitter` (`submit_with_proof`).
 
-        // Phase 2 — one target batch per non-entry rollup with calls.
-        // Each rollup's post-state root is recorded so the entry batch
-        // (Phase 3) can chain stateDeltas through it.
-        let mut extra_per_tx_roots = std::mem::take(&mut self.extra_per_tx_roots);
-        let mut target_batches: HashMap<RollupId, EvmBatch> = HashMap::new();
+        // The entry rollup is the source, not a target: fold in its
+        // overlay-session roots up front. Its own batch is the source,
+        // built below.
+        if let Some(roots) = self.extra_per_tx_roots.remove(&self.entry_rollup_id) {
+            per_tx_roots_by_rollup.insert(self.entry_rollup_id, roots);
+        }
+
+        // Target batches + compositions — a sequential, fallible fold over
+        // non-entry rollups. Each rollup's post-state root lands in
+        // `per_tx_roots_by_rollup`, which later rollups' batches and the
+        // source batch chain stateDeltas through. A `for` loop (not an
+        // iterator combinator) because `build_target_batch` is fallible
+        // and each step mutates the accumulator.
+        let mut target_compositions: Vec<TargetComposition> = Vec::new();
         for rollup_id in &plan_order {
             if *rollup_id == self.entry_rollup_id {
-                if let Some(roots) = extra_per_tx_roots.remove(rollup_id) {
-                    per_tx_roots_by_rollup.insert(*rollup_id, roots);
-                }
-                // Expected: the entry has no target batch; its roots (drained
-                // above) feed the entry batch in Phase 3.
                 continue;
             }
             let group_calls = self.group_calls_for(*rollup_id);
-            if group_calls.is_empty() {
-                // Expected: a registered follower with no calls this tx.
-                continue;
-            }
-            let Some((batch, roots)) = self
-                .build_target(
-                    *rollup_id,
-                    &group_calls,
-                    raw_tx,
-                    &initial_roots,
-                    &per_tx_roots_by_rollup,
-                )
-                .await?
+            let Some((batch, roots)) = self.build_target_batch(
+                *rollup_id,
+                &group_calls,
+                raw_tx,
+                &initial_roots,
+                &per_tx_roots_by_rollup,
+            )?
             else {
-                // Expected: nothing to build — empty settlement batch or all
-                // calls reverted.
+                // Nothing to build — no calls, empty settlement, or all reverted.
                 continue;
             };
-            // Mirror the terminal call's post-state root (the last of `roots`):
-            // the zk-poster branch replaces its estimate with L1's root; for the
-            // inbound branch the value is already the terminal root, so this is
-            // a no-op.
-            if let Some(root) = roots.last().copied() {
-                self.patch_terminal_root(*rollup_id, root);
-            }
             per_tx_roots_by_rollup.insert(*rollup_id, roots);
-            target_batches.insert(*rollup_id, batch);
+
+            // A `Some` batch means the group is non-empty, so `group_calls[0]`
+            // (the outer call driving the follower trigger) exists.
+            let dialect = self.rollups[rollup_id].config.dialect;
+            target_compositions.push(TargetComposition {
+                rollup_id: *rollup_id,
+                load_table_payload: entries::encode_table_payload(&batch, &dialect),
+                execute_payload: dialect.encode_follower_trigger(&group_calls[0]),
+                batch,
+            });
         }
 
-        // Phase 3 — entry-rollup batch (across full preorder slice).
+        // Source (entry-rollup) batch — built last: it chains stateDeltas
+        // through every target root accumulated above.
         let attribution = crate::SourceAttribution {
             initial_roots: &initial_roots,
             per_tx_roots_by_rollup: &per_tx_roots_by_rollup,
@@ -619,39 +567,6 @@ impl CompositionBuilder {
             self.entry_rollup_id,
             raw_tx,
         )?;
-        let entry_payload = entries::encode_table_payload(&entry_batch, &entry_dialect);
-
-        // Phase 4 — target compositions (re-encode from the batches
-        // captured in Phase 2). Skip entry rollup + empty groups.
-        let mut target_compositions: Vec<TargetComposition> = Vec::new();
-        for rollup_id in &plan_order {
-            if *rollup_id == self.entry_rollup_id {
-                // Expected: the entry is the composition source, not a target.
-                continue;
-            }
-            let Some(batch) = target_batches.remove(rollup_id) else {
-                // Expected: Phase 2 built no batch for this rollup (no calls,
-                // or all reverted).
-                continue;
-            };
-            let group_calls = self.group_calls_for(*rollup_id);
-            // group_calls[0] guaranteed non-empty because Phase 2 only
-            // populated `target_batches` for non-empty groups.
-            let outer_root = &group_calls[0];
-            let rollup = self
-                .rollups
-                .get(rollup_id)
-                .expect("plan_order from rollups map");
-            let dialect = &rollup.config.dialect;
-            let load_table_payload = entries::encode_table_payload(&batch, dialect);
-            let execute_payload = dialect.encode_follower_trigger(outer_root);
-            target_compositions.push(TargetComposition {
-                rollup_id: *rollup_id,
-                batch,
-                load_table_payload,
-                execute_payload,
-            });
-        }
 
         tracing::debug!(
             name: "composer.finalize.complete",
@@ -662,8 +577,8 @@ impl CompositionBuilder {
         Ok(Composition {
             source: SourceComposition {
                 rollup_id: self.entry_rollup_id,
+                entry_payload: entries::encode_table_payload(&entry_batch, &entry_dialect),
                 batch: entry_batch,
-                entry_payload,
             },
             targets: target_compositions,
         })
@@ -932,6 +847,37 @@ mod tests {
     use crate::action::cross_chain_call_hash;
     use alloy_primitives::{Address, Bytes, U256};
 
+    // Cross-tx session carry-over (F1, D-3). No production caller wires
+    // this up on this branch, so these live as test-only helpers rather
+    // than builder methods: seed live sessions into a builder, and drain
+    // them back out.
+    fn with_sessions(
+        mut builder: CompositionBuilder,
+        sessions: HashMap<RollupId, Box<dyn TargetExecutionSession + Send>>,
+    ) -> CompositionBuilder {
+        for (id, session) in sessions {
+            match builder.rollups.get_mut(&id) {
+                Some(rollup) => rollup.session = Some(session),
+                None => tracing::warn!(
+                    name: "composer.builder.session_dropped",
+                    rollup_id = %id,
+                    "seeded session for an unregistered rollup — dropped",
+                ),
+            }
+        }
+        builder
+    }
+
+    fn take_sessions(
+        builder: &mut CompositionBuilder,
+    ) -> HashMap<RollupId, Box<dyn TargetExecutionSession + Send>> {
+        builder
+            .rollups
+            .iter_mut()
+            .filter_map(|(id, rollup)| rollup.session.take().map(|s| (*id, s)))
+            .collect()
+    }
+
     // ── Mock ChainClient (spawns a canned session) ──────────────────
 
     struct MockClient {
@@ -940,7 +886,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ChainClient for MockClient {
-        async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
+        fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
             Ok([0u8; 32])
         }
         async fn begin_execution_session(
@@ -993,7 +939,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ChainClient for ReentrantClient {
-        async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
+        fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
             Ok([0u8; 32])
         }
         async fn begin_execution_session(
@@ -1112,17 +1058,17 @@ mod tests {
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
             .await
             .expect("dispatch lazy-opens rollup 1's session");
-        let sessions = builder.take_sessions();
+        let sessions = take_sessions(&mut builder);
         assert_eq!(sessions.len(), 1, "exactly the lazily-opened session");
         assert!(sessions.contains_key(&RollupId(1)));
         // Taking is draining: a second take finds nothing.
-        assert!(builder.take_sessions().is_empty());
+        assert!(take_sessions(&mut builder).is_empty());
 
         // Seed into a fresh builder: the slot is occupied (no lazy re-open).
         let mut rollups2 = HashMap::new();
         rollups2.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups2.insert(RollupId(1), rollup_with_session([0x22; 32]));
-        let mut builder2 = CompositionBuilder::new(RollupId(0), rollups2).with_sessions(sessions);
+        let mut builder2 = with_sessions(CompositionBuilder::new(RollupId(0), rollups2), sessions);
         assert!(
             builder2
                 .rollups
@@ -1135,10 +1081,10 @@ mod tests {
 
         // A session keyed to a rollup the next builder does NOT register
         // is dropped, never mis-routed.
-        let carried = builder2.take_sessions();
+        let carried = take_sessions(&mut builder2);
         let mut rollups3 = HashMap::new();
         rollups3.insert(RollupId(0), entry_rollup([0u8; 32]));
-        let builder3 = CompositionBuilder::new(RollupId(0), rollups3).with_sessions(carried);
+        let builder3 = with_sessions(CompositionBuilder::new(RollupId(0), rollups3), carried);
         assert!(!builder3.rollups.contains_key(&RollupId(1)));
     }
 
@@ -1170,7 +1116,7 @@ mod tests {
             "got: {err}"
         );
         // The outer session was put back despite the inner error.
-        assert_eq!(builder.take_sessions().len(), 1, "outer session survives");
+        assert_eq!(take_sessions(&mut builder).len(), 1, "outer session survives");
     }
 
     #[tokio::test]

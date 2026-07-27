@@ -17,8 +17,8 @@
 //! A per-rollup-only resolver API cannot express this ordering
 //! (the global `proofSystems[]` ordering, the local→global index
 //! mapping, the jagged-matrix shape all live at the batch level).
-//! [`ProofPlanResolver`](crate::proof_resolver::ProofPlanResolver)
-//! resolves a batch's full proof plan in one call.
+//! [`ProofPlan`] captures a batch's full proof plan, resolved in one
+//! pass.
 //!
 //! Timestamps and block
 //! hashes use the wire shape `[u8; 32]` (big-endian for

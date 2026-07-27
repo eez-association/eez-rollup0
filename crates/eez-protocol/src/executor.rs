@@ -47,11 +47,9 @@ pub struct ExecutionRequest {
 /// Stateful execution session driving target-chain calls during
 /// source simulation.
 ///
-/// One session per builder, lazily opened; the slot drain may chain a
-/// live session across consecutive source txs in the same slot (F1 —
-/// see [`CompositionBuilder::with_sessions`](crate::composition::CompositionBuilder::with_sessions));
-/// sessions never outlive their slot. Accumulates state across calls;
-/// `&mut self` on every method reflects that.
+/// One session per builder, lazily opened; sessions never outlive their
+/// slot. Accumulates state across calls; `&mut self` on every method
+/// reflects that.
 ///
 /// `Send` only (source simulation is single-threaded). No `'static`
 /// bound on the trait itself so the source simulator can borrow a
@@ -141,13 +139,15 @@ pub trait ChainClient: Send + Sync + 'static {
     /// against L1's canonical storage). Used for diagnostics and
     /// health checks.
     ///
+    /// Synchronous: every client reads its own header from a local state
+    /// provider.
+    ///
     /// # Errors
     ///
     /// Returns [`ExecutorErrorKind::Provider`] if the underlying state
     /// provider is inaccessible; [`ExecutorErrorKind::Unavailable`] when
-    /// the implementation does not (or cannot) report its own header
-    /// (e.g. a remote gRPC peer that does not expose this).
-    async fn current_state_root(&self) -> ExecutorResult<[u8; 32]>;
+    /// the implementation does not (or cannot) report its own header.
+    fn current_state_root(&self) -> ExecutorResult<[u8; 32]>;
 
     /// Create a fresh stateful execution session. The slot drain may
     /// keep the returned session alive across consecutive source txs

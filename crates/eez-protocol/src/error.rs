@@ -321,7 +321,7 @@ pub type CompositionResult<T> = Result<T, CompositionError>;
 // ── ComposerError ────────────────────────────────────────────────
 
 error_struct! {
-    /// Errors from the generic [`Composer`](crate::Composer) orchestrator.
+    /// Errors from the `Composer` orchestrator (in the `eez-composer` crate).
     ///
     /// Wraps the composition error family plus composer-specific
     /// lifecycle failures (already-registered source/target, missing
