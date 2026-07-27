@@ -131,7 +131,6 @@ pub type SessionSnapshot = Box<dyn std::any::Any + Send>;
 /// rollup map.
 #[async_trait::async_trait]
 pub trait ChainClient: Send + Sync + 'static {
-
     /// Create a fresh stateful execution session. The slot drain may
     /// keep the returned session alive across consecutive source txs
     /// in the same slot (F1); it never outlives its slot.
@@ -171,5 +170,4 @@ pub trait ChainClient: Send + Sync + 'static {
             "simulate_source_tx: not an entry-role client".into(),
         )))
     }
-
 }

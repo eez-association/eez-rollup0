@@ -1190,7 +1190,6 @@ mod tests {
         }
     }
 
-
     /// A #28 execution entry whose `expectedLookups` (the PR#28-only field,
     /// absent from the #27 `ExecutionEntry`) is NON-empty, so a decode canary
     /// built on it actually exercises the new wire field.
@@ -1317,8 +1316,8 @@ mod tests {
 
     #[test]
     fn empty_recorded_yields_empty_batch() {
-        let batch = build_batch(&[], &ChainDialect::EvmL1Style, RollupId(1))
-            .expect("build_batch ok");
+        let batch =
+            build_batch(&[], &ChainDialect::EvmL1Style, RollupId(1)).expect("build_batch ok");
         assert!(batch.entries.is_empty());
         assert!(batch.l1ToL2lookupCalls.is_empty());
         assert!(batch.is_empty());
@@ -1334,8 +1333,8 @@ mod tests {
         // `returnData`. (sync-rollups-protocol@fe7bf66 — a folded outer here
         // makes `executeCrossChainCall` revert `RollingHashMismatch`.)
         let calls = vec![record(RollupId(1), RollupId(0), true)];
-        let batch = build_batch(&calls, &ChainDialect::EvmL1Style, RollupId(0))
-            .expect("build_batch ok");
+        let batch =
+            build_batch(&calls, &ChainDialect::EvmL1Style, RollupId(0)).expect("build_batch ok");
         assert_eq!(batch.entries.len(), 1);
         // The TopLevel call is described by the entry's
         // `proxyEntryHash` + `returnData`; reentrant children land
@@ -1647,8 +1646,8 @@ mod tests {
     #[test]
     fn outgoing_to_other_rollup_yields_empty_batch_for_target() {
         let calls = vec![record(RollupId(1), RollupId(0), true)];
-        let batch = build_batch(&calls, &ChainDialect::EvmL2Style, RollupId(1))
-            .expect("build_batch ok");
+        let batch =
+            build_batch(&calls, &ChainDialect::EvmL2Style, RollupId(1)).expect("build_batch ok");
         assert!(batch.entries.is_empty());
         assert!(batch.l1ToL2lookupCalls.is_empty());
     }
@@ -1659,8 +1658,8 @@ mod tests {
             record(RollupId(1), RollupId(0), true),
             record(RollupId(0), RollupId(1), true),
         ];
-        let batch = build_batch(&calls, &ChainDialect::EvmL1Style, RollupId(0))
-            .expect("build_batch ok");
+        let batch =
+            build_batch(&calls, &ChainDialect::EvmL1Style, RollupId(0)).expect("build_batch ok");
         assert_eq!(batch.entries.len(), 1);
         assert_eq!(
             batch.entries[0].expectedL1ToL2Calls.len(),
@@ -1724,8 +1723,8 @@ mod tests {
     #[test]
     fn terminal_revert_yields_empty_batch() {
         let calls = vec![record(RollupId(1), RollupId(0), false)];
-        let batch = build_batch(&calls, &ChainDialect::EvmL1Style, RollupId(0))
-            .expect("build_batch ok");
+        let batch =
+            build_batch(&calls, &ChainDialect::EvmL1Style, RollupId(0)).expect("build_batch ok");
         assert!(batch.is_empty());
     }
 

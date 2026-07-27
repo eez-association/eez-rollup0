@@ -216,7 +216,6 @@ impl LocalChainClient {
             authorized_proxies_slot: self.dialect.proxy_lookup_slot(),
         }
     }
-
 }
 
 #[async_trait::async_trait]
@@ -448,5 +447,4 @@ impl ChainClient for LocalChainClient {
 
         Ok(())
     }
-
 }
