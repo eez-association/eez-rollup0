@@ -2018,10 +2018,17 @@ impl DevnetCfg {
                 "/tmp/unused-overridden-by-flag".to_string(),
             ),
             // INFO on our crates so bundle events are visible for assertions.
+            // Mirrors the pre-crate-fold filter (`warn,eez_node=info,eez_l1=info`):
+            // node plumbing + l1 at INFO, the folded composer/driver/deriver/
+            // inspector modules back at WARN — the log-count assertions do
+            // substring matching and depend on exactly this visible set.
             (
                 "RUST_LOG",
-                std::env::var("EEZ_TEST_LOG")
-                    .unwrap_or_else(|_| "warn,eez_node=info,eez_l1=info".to_string()),
+                std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| {
+                    "warn,eez_node=info,eez_node::composer=warn,eez_node::deriver=warn,\
+                     eez_node::driver=warn,eez_node::inspector=warn"
+                        .to_string()
+                }),
             ),
             (
                 TEST_L2_GENESIS_ENV,
