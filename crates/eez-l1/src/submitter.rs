@@ -19,7 +19,7 @@ use alloy_primitives::{TxHash, U256, hex};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::Filter;
 use alloy_sol_types::SolEvent;
-use eez_evm::types::L2ExecutionPerformed;
+use eez_protocol::abi::L2ExecutionPerformed;
 use tracing::{Level, event};
 
 use crate::config::SubmitterConfig;

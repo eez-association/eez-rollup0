@@ -1,54 +1,48 @@
-//! Core types — generic over [`ChainProtocol`].
-//!
-//! These are the values that cross trait boundaries: what a detected
-//! call looks like, what an execution returns, and the shape of a
-//! finished composition.
+//! Core types: what a detected call looks like, what an execution
+//! returns, and the shape of a finished composition.
 //!
 //! # Composition output shape
 //!
 //! ```text
-//!   Composition<P>
-//!   ├── source:  SourceComposition<P>
+//!   Composition
+//!   ├── source:  SourceComposition
 //!   │             ├── rollup_id          : RollupId
-//!   │             ├── batch              : P::Batch             chain-shaped table-loading batch
-//!   │             └── entry_payload      : Vec<u8>              encoded entry-chain calldata
-//!   │                                                           (L1-style: postAndVerifyBatch; L2-style: loadExecutionTable)
+//!   │             ├── batch              : EvmBatch              table-loading batch
+//!   │             └── entry_payload      : Vec<u8>               encoded entry-chain calldata
+//!   │                                                            (L1-style: postAndVerifyBatch; L2-style: loadExecutionTable)
 //!   │
-//!   └── targets: Vec<TargetComposition<P>>                       one per target rollup, ordered
+//!   └── targets: Vec<TargetComposition>                          one per target rollup, ordered
 //!                 ├── rollup_id            : RollupId
-//!                 ├── batch                : P::Batch            chain-shaped table-loading batch
-//!                 ├── load_table_payload   : Vec<u8>             encoded load-execution-table calldata
-//!                 └── execute_payload      : Vec<u8>             encoded execute-cross-chain-call calldata
+//!                 ├── batch                : EvmBatch             table-loading batch
+//!                 ├── load_table_payload   : Vec<u8>              encoded load-execution-table calldata
+//!                 └── execute_payload      : Vec<u8>              encoded execute-cross-chain-call calldata
 //! ```
 //!
-//! Both sides carry the chain-shaped batch AND pre-encoded calldata so
-//! callers can either re-hash / verify the batch themselves or ship the
-//! payload straight into a wallet for signing + broadcast.
+//! Both sides carry the batch AND pre-encoded calldata so callers can
+//! either re-hash / verify the batch themselves or ship the payload
+//! straight into a wallet for signing + broadcast.
 
+use alloy_primitives::{Address, Bytes, U256};
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::ChainProtocol;
+use crate::batch::EvmBatch;
 use crate::rollup_id::RollupId;
 
 /// A cross-chain call detected, dispatched, and recorded with its
 /// execution outcome.
 ///
-/// Generic over `P: ChainProtocol` — each chain uses its own address,
-/// value, and calldata types.
-///
 /// The outcome field is non-optional: `CompositionBuilder::dispatch_call`
 /// (the only constructor) runs after the target session has produced an
 /// outcome, so holding a `ExecutedAction` means the result is present.
 ///
-/// The action hash is not stored here. It is a derived value the
-/// protocol (via `ChainProtocol`) computes from these raw fields when
-/// building entries. Keeping it out of the struct makes
-/// [`crate::ChainProtocol::build_batch`] the single source of truth
-/// for hashes.
-pub struct ExecutedAction<P: ChainProtocol + ?Sized> {
+/// The action hash is not stored here. It is a derived value
+/// [`crate::entries::build_batch`] computes from these raw fields when
+/// building entries, keeping it the single source of truth for hashes.
+#[derive(Debug, Clone)]
+pub struct ExecutedAction {
     /// Address of the target contract on the target chain.
     /// Spec: `Action.targetAddress` / `L2ToL1Call.targetAddress`.
-    pub target_address: P::Address,
+    pub target_address: Address,
     /// Rollup ID of the target chain. Spec: `Action.targetRollupId`.
     pub target_rollup_id: RollupId,
     /// Rollup ID of the chain that triggered this call. Spec:
@@ -64,11 +58,11 @@ pub struct ExecutedAction<P: ChainProtocol + ?Sized> {
     pub source_rollup_id: RollupId,
     /// Address of the caller on the source chain. Spec:
     /// `Action.sourceAddress` / `L2ToL1Call.sourceAddress`.
-    pub source_address: P::Address,
+    pub source_address: Address,
     /// Calldata for the cross-chain call. Spec: `Action.data`.
-    pub data: P::Calldata,
+    pub data: Bytes,
     /// Value transferred with the call. Spec: `Action.value`.
-    pub value: P::Value,
+    pub value: U256,
     /// Execution outcome from the target-chain executor. `Pending`
     /// from `Dispatcher::open_call` until `Dispatcher::close_call`
     /// resolves it; `Resolved { .. }` thereafter.
@@ -82,7 +76,7 @@ pub struct ExecutedAction<P: ChainProtocol + ?Sized> {
     /// for top-level calls (see `IEEZ.sol`'s `L2ToL1Call` struct
     /// under the multi-prover protocol; formerly
     /// `CrossChainCall.revertSpan`). Populated post-close by
-    /// [`Dispatcher::annotate_revert_span`](crate::Dispatcher::annotate_revert_span)
+    /// [`CompositionBuilder::annotate_revert_span`](crate::CompositionBuilder::annotate_revert_span)
     /// when the inspector observes the frame returning with
     /// `InstructionResult::Revert`.
     pub revert_span: Option<u32>,
@@ -109,45 +103,9 @@ pub struct ExecutedAction<P: ChainProtocol + ?Sized> {
 #[non_exhaustive]
 pub struct StaticMeta;
 
-// Manual Clone + Debug: `#[derive]` generates overly strict bounds
-// (`P: Clone` / `P: Debug`) rather than bounds on the field types
-// (`P::Address: Clone` etc.). Hand-written impls use only the
-// associated-type bounds `ChainProtocol` already supplies.
-impl<P: ChainProtocol + ?Sized> Clone for ExecutedAction<P> {
-    fn clone(&self) -> Self {
-        Self {
-            target_address: self.target_address.clone(),
-            target_rollup_id: self.target_rollup_id,
-            source_rollup_id: self.source_rollup_id,
-            source_address: self.source_address.clone(),
-            data: self.data.clone(),
-            value: self.value.clone(),
-            outcome: self.outcome.clone(),
-            revert_span: self.revert_span,
-            static_meta: self.static_meta.clone(),
-        }
-    }
-}
-
-impl<P: ChainProtocol + ?Sized> std::fmt::Debug for ExecutedAction<P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExecutedAction")
-            .field("target_address", &self.target_address)
-            .field("target_rollup_id", &self.target_rollup_id)
-            .field("source_rollup_id", &self.source_rollup_id)
-            .field("source_address", &self.source_address)
-            .field("data", &self.data)
-            .field("value", &self.value)
-            .field("outcome", &self.outcome)
-            .field("revert_span", &self.revert_span)
-            .field("static_meta", &self.static_meta)
-            .finish()
-    }
-}
-
 /// Lifecycle outcome of a recorded call.
 ///
-/// The `Dispatcher` lifecycle is two-phase: `open_call` pushes a
+/// The dispatch lifecycle is two-phase: `open_call` pushes a
 /// `Pending` record and returns its index; `close_call` rewrites
 /// that slot with `Resolved { .. }` once the target session has
 /// produced a real result. The split exists because the index must
@@ -235,113 +193,45 @@ impl ExecutionOutcome {
 ///
 /// Mirrors [`TargetComposition`] so both sides of the composition carry
 /// raw entries AND pre-encoded calldata.
-pub struct SourceComposition<P: ChainProtocol + ?Sized> {
+#[derive(Debug, Clone)]
+pub struct SourceComposition {
     /// Rollup ID of the source chain.
     pub rollup_id: RollupId,
-    /// Chain-shaped batch the source rollup will consume — see
-    /// [`ChainProtocol::Batch`].
-    pub batch: P::Batch,
+    /// Table-loading batch the source rollup will consume.
+    pub batch: EvmBatch,
     /// Encoded calldata for the entry-chain tx that loads `batch`.
     /// Dialect-dependent: L1-style emits `postAndVerifyBatch(...)`;
     /// L2-style emits `loadExecutionTable(...)`.
     pub entry_payload: Vec<u8>,
 }
 
-// Manual Clone: `#[derive(Clone)]` generates `P: Clone` rather than
-// `P::Batch: Clone`, which narrows callers unnecessarily. Hand-written
-// impl uses only the bounds already supplied by `ChainProtocol`.
-impl<P: ChainProtocol + ?Sized> Clone for SourceComposition<P> {
-    fn clone(&self) -> Self {
-        Self {
-            rollup_id: self.rollup_id,
-            batch: self.batch.clone(),
-            entry_payload: self.entry_payload.clone(),
-        }
-    }
-}
-
-// Manual Debug: `ChainProtocol::Batch` doesn't require `Debug`, so
-// `#[derive(Debug)]` wouldn't compile. Terse output anyway —
-// `entry_payload.len()` is what's actionable for diagnostics.
-impl<P: ChainProtocol + ?Sized> std::fmt::Debug for SourceComposition<P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SourceComposition")
-            .field("rollup_id", &self.rollup_id)
-            .field("entry_payload", &self.entry_payload.len())
-            .finish()
-    }
-}
-
 /// Per-target output inside a `Composition`.
 ///
 /// Uses `Vec` (not `HashMap`) for ordering — upstream's invariant 2
 /// requires deterministic output from identical inputs.
-pub struct TargetComposition<P: ChainProtocol + ?Sized> {
+#[derive(Debug, Clone)]
+pub struct TargetComposition {
     /// Rollup ID of the target chain this entry describes.
     pub rollup_id: RollupId,
-    /// Chain-shaped batch this target rollup will consume — see
-    /// [`ChainProtocol::Batch`].
-    pub batch: P::Batch,
+    /// Table-loading batch this target rollup will consume.
+    pub batch: EvmBatch,
     /// Encoded payload for loading the target execution table.
     pub load_table_payload: Vec<u8>,
     /// Encoded payload for executing the first cross-chain call.
     pub execute_payload: Vec<u8>,
 }
 
-// Manual Clone + Debug — `derive` would infer overly strict
-// `P: Clone` / unreachable `P::Batch: Debug` bounds.
-impl<P: ChainProtocol + ?Sized> Clone for TargetComposition<P> {
-    fn clone(&self) -> Self {
-        Self {
-            rollup_id: self.rollup_id,
-            batch: self.batch.clone(),
-            load_table_payload: self.load_table_payload.clone(),
-            execute_payload: self.execute_payload.clone(),
-        }
-    }
-}
-
-impl<P: ChainProtocol + ?Sized> std::fmt::Debug for TargetComposition<P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TargetComposition")
-            .field("rollup_id", &self.rollup_id)
-            .field("load_table_payload", &self.load_table_payload.len())
-            .field("execute_payload", &self.execute_payload.len())
-            .finish()
-    }
-}
-
-/// Output of [`compose_transaction`](crate::compose_transaction) —
+/// Output of [`CompositionBuilder::finalize`](crate::CompositionBuilder::finalize) —
 /// everything needed for all chains.
 ///
 /// Symmetric: the source side and every target side both carry entries
 /// AND pre-encoded calldata. Callers wrap each payload in a tx of their
 /// choice to finalize. `targets` ordering is significant (invariant 2).
 /// N=2 means `targets` has exactly one element; the design supports any N.
-pub struct Composition<P: ChainProtocol + ?Sized> {
+#[derive(Debug, Clone)]
+pub struct Composition {
     /// Source-chain output (exactly one source per composition).
-    pub source: SourceComposition<P>,
+    pub source: SourceComposition,
     /// Per-target outputs, one per target rollup. Order is significant.
-    pub targets: Vec<TargetComposition<P>>,
-}
-
-// Manual Clone + Debug — same reason pattern as the inner halves
-// above: derive would infer overly strict `P: Clone`; Debug is
-// deliberately terse (just `targets.len()`).
-impl<P: ChainProtocol + ?Sized> Clone for Composition<P> {
-    fn clone(&self) -> Self {
-        Self {
-            source: self.source.clone(),
-            targets: self.targets.clone(),
-        }
-    }
-}
-
-impl<P: ChainProtocol + ?Sized> std::fmt::Debug for Composition<P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Composition")
-            .field("source", &self.source)
-            .field("targets", &self.targets.len())
-            .finish()
-    }
+    pub targets: Vec<TargetComposition>,
 }

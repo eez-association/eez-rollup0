@@ -51,11 +51,11 @@
 
 use std::collections::HashMap;
 
+use crate::RollupId;
 use alloy_primitives::{B256, U256};
-use eez_protocol::RollupId;
 
+use crate::abi::ExecutionEntrySol;
 use crate::action::cross_chain_call_hash;
-use crate::types::ExecutionEntrySol;
 
 /// `RollupId(0)` — MAINNET. An L2->L1 outbound's L1 target lives on mainnet, so
 /// the `targetRollupId` field of its call hash is 0 (the L2 proxy's
@@ -149,7 +149,7 @@ pub fn verify_outbound_authorized(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::L2ToL1CallSol;
+    use crate::abi::L2ToL1CallSol;
     use alloy_primitives::{Address, Bytes, address};
 
     fn entry(calls: Vec<L2ToL1CallSol>) -> ExecutionEntrySol {

@@ -480,7 +480,7 @@ fn main() -> eyre::Result<()> {
             // when reth ingests them via newPayload.
             let evm_config = reth_evm_ethereum::EthEvmConfig::new(chain_spec.clone());
 
-            // Build the cross-chain `EvmComposer` when the embedded L1 is
+            // Build the cross-chain composer when the embedded L1 is
             // up — it owns `LocalChainClient`s over L1 (entry) and L2
             // (follower). `None` without an embedded L1. Inlined because
             // the `FullNode` AddOns type resists a typed helper return.
@@ -489,26 +489,25 @@ fn main() -> eyre::Result<()> {
             // `None` without an embedded L1 (outbound txs then evict at compose).
             let mut l2_entry_client: Option<
                 Arc<
-                    dyn eez_protocol::executor::EntryChainClient<Protocol = eez_evm::EvmProtocol>
+                    dyn eez_protocol::executor::EntryChainClient
                         + Send
                         + Sync,
                 >,
             > = None;
-            let evm_composer: Option<eez_evm_inspector::EvmComposer> =
+            let evm_composer: Option<eez_protocol::Composer> =
                 if let Some(l1_variant) = embedded_l1.as_ref() {
                     use eez_composer::{GnosisL1Adapter, LocalChainClient};
-                    use eez_evm::EvmProtocol;
-                    use eez_evm_inspector::{
-                        DEFAULT_CCM_GAS_LIMIT, EvmTargetConfig, ProxyLookupConfig,
+                    use eez_protocol::{
+                        DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig, TargetConfig,
                     };
                     use eez_protocol::Composer as ProtocolComposer;
                     use eez_protocol::rollup_id::RollupId;
 
                     let eez_registry: Address = Address::from_str(&env::var("EEZ_REGISTRY_ADDRESS").map_err(
-                        |_| eyre::eyre!("EEZ_REGISTRY_ADDRESS required for EvmComposer (set by deploy.sh)"),
+                        |_| eyre::eyre!("EEZ_REGISTRY_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
                     )?)?;
                     let ccm_l2: Address = Address::from_str(&env::var("EEZ_CCM_L2_ADDRESS").map_err(
-                        |_| eyre::eyre!("EEZ_CCM_L2_ADDRESS required for EvmComposer (set by deploy.sh)"),
+                        |_| eyre::eyre!("EEZ_CCM_L2_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
                     )?)?;
                     let l2_system_address: Address = env::var("EEZ_L2_SYSTEM_ADDRESS")
                         .ok()
@@ -536,15 +535,15 @@ fn main() -> eyre::Result<()> {
                                 l1_rollup_id,
                                 eez_registry,
                                 eez_registry,
-                                eez_evm::ChainDialect::EvmL1Style,
+                                eez_protocol::ChainDialect::EvmL1Style,
                             );
                             let entry_view: std::sync::Arc<
-                                dyn eez_protocol::executor::EntryChainClient<Protocol = EvmProtocol>
+                                dyn eez_protocol::executor::EntryChainClient
                                     + Send
                                     + Sync,
                             > = entry_client.clone();
                             let root_view: std::sync::Arc<
-                                dyn eez_protocol::executor::CommittedRootReader<Protocol = EvmProtocol>
+                                dyn eez_protocol::executor::CommittedRootReader
                                     + Send
                                     + Sync,
                             > = entry_client.clone();
@@ -571,15 +570,15 @@ fn main() -> eyre::Result<()> {
                                 l1_rollup_id,
                                 eez_registry,
                                 eez_registry,
-                                eez_evm::ChainDialect::EvmL1Style,
+                                eez_protocol::ChainDialect::EvmL1Style,
                             );
                             let entry_view: std::sync::Arc<
-                                dyn eez_protocol::executor::EntryChainClient<Protocol = EvmProtocol>
+                                dyn eez_protocol::executor::EntryChainClient
                                     + Send
                                     + Sync,
                             > = entry_client.clone();
                             let root_view: std::sync::Arc<
-                                dyn eez_protocol::executor::CommittedRootReader<Protocol = EvmProtocol>
+                                dyn eez_protocol::executor::CommittedRootReader
                                     + Send
                                     + Sync,
                             > = entry_client.clone();
@@ -597,10 +596,10 @@ fn main() -> eyre::Result<()> {
                         l2_rollup_id_typed,
                         ccm_l2,
                         ccm_l2,
-                        eez_evm::ChainDialect::EvmL2Style,
+                        eez_protocol::ChainDialect::EvmL2Style,
                     );
                     let l2_follower_view: std::sync::Arc<
-                        dyn eez_protocol::executor::ChainClient<Protocol = EvmProtocol>
+                        dyn eez_protocol::executor::ChainClient
                             + Send
                             + Sync,
                     > = l2_follower;
@@ -615,49 +614,46 @@ fn main() -> eyre::Result<()> {
                         l2_rollup_id_typed,
                         ccm_l2,
                         ccm_l2,
-                        eez_evm::ChainDialect::EvmL2Style,
+                        eez_protocol::ChainDialect::EvmL2Style,
                     );
                     let l2_entry_view: std::sync::Arc<
-                        dyn eez_protocol::executor::EntryChainClient<Protocol = EvmProtocol>
+                        dyn eez_protocol::executor::EntryChainClient
                             + Send
                             + Sync,
                     > = l2_entry;
                     l2_entry_client = Some(l2_entry_view);
 
-                    let entry_cfg = EvmTargetConfig {
+                    let entry_cfg = TargetConfig {
                         ccm_address: eez_registry,
                         system_address: Address::ZERO, // entry has no system-tx CCM path
                         ccm_gas_limit: DEFAULT_CCM_GAS_LIMIT,
                         proxy_lookup: ProxyLookupConfig {
                             contract_address: eez_registry,
-                            authorized_proxies_slot: eez_evm::ChainDialect::EvmL1Style
+                            authorized_proxies_slot: eez_protocol::ChainDialect::EvmL1Style
                                 .proxy_lookup_slot(),
                         },
-                        dialect: eez_evm::ChainDialect::EvmL1Style,
+                        dialect: eez_protocol::ChainDialect::EvmL1Style,
                         settles_via_session_root: false,
                     };
-                    let l2_follower_cfg = EvmTargetConfig {
+                    let l2_follower_cfg = TargetConfig {
                         ccm_address: ccm_l2,
                         system_address: l2_system_address,
                         ccm_gas_limit: DEFAULT_CCM_GAS_LIMIT,
                         proxy_lookup: ProxyLookupConfig {
                             contract_address: ccm_l2,
-                            authorized_proxies_slot: eez_evm::ChainDialect::EvmL2Style
+                            authorized_proxies_slot: eez_protocol::ChainDialect::EvmL2Style
                                 .proxy_lookup_slot(),
                         },
-                        dialect: eez_evm::ChainDialect::EvmL2Style,
+                        dialect: eez_protocol::ChainDialect::EvmL2Style,
                         settles_via_session_root: false,
                     };
 
-                    let composed = ProtocolComposer::<EvmProtocol>::builder(
-                        EvmProtocol,
-                        l1_rollup_id,
-                    )
-                    .entry(entry_client_view, entry_cfg)
+                    let composed = ProtocolComposer::builder(l1_rollup_id)
+                        .entry(entry_client_view, entry_cfg)
                     .root_reader(root_reader_view)
                     .rollup(l2_rollup_id_typed, l2_follower_view, l2_follower_cfg)
                     .build()
-                    .map_err(|e| eyre::eyre!("EvmComposer build failed: {e}"))?;
+                    .map_err(|e| eyre::eyre!("cross-chain composer build failed: {e}"))?;
                     event!(
                         name: "eez.node.evm_composer.ready",
                         Level::INFO,
@@ -665,7 +661,7 @@ fn main() -> eyre::Result<()> {
                         l2_rollup_id = rollup_id,
                         eez_registry = %eez_registry,
                         ccm_l2 = %ccm_l2,
-                        "cross-chain EvmComposer constructed (L1 entry + L2 follower)",
+                        "cross-chain composer constructed (L1 entry + L2 follower)",
                     );
                     Some(composed)
                 } else {
@@ -686,7 +682,7 @@ fn main() -> eyre::Result<()> {
                 .is_some()
             {
                 let system_key = env::var("EEZ_L2_SYSTEM_KEY").map_err(|_| {
-                    eyre::eyre!("EEZ_L2_SYSTEM_KEY required when EvmComposer is wired")
+                    eyre::eyre!("EEZ_L2_SYSTEM_KEY required when the cross-chain composer is wired")
                 })?;
                 let system_signer = PrivateKeySigner::from_bytes(&B256::from_str(
                     system_key.trim_start_matches("0x"),
@@ -769,7 +765,7 @@ fn main() -> eyre::Result<()> {
             // this up further down to STF-reconstruct the same L2
             // system txs the composer produced.
             let deriver_system_tx_cfg = cc_exec_ctx.as_ref().map(|ctx| {
-                eez_evm::system_tx::SystemTxContext {
+                eez_protocol::system_tx::SystemTxContext {
                     system_signer: ctx.system_signer.clone(),
                     ccm_l2_address: ctx.ccm_l2_address,
                     l2_chain_id: ctx.l2_chain_id,
@@ -1023,7 +1019,7 @@ fn main() -> eyre::Result<()> {
 /// `Ok(None)`.
 fn build_follower_system_tx_cfg<ChainSpec>(
     chain_spec: &ChainSpec,
-) -> eyre::Result<Option<eez_evm::system_tx::SystemTxContext>>
+) -> eyre::Result<Option<eez_protocol::system_tx::SystemTxContext>>
 where
     ChainSpec: reth_chainspec::EthChainSpec,
 {
@@ -1046,7 +1042,7 @@ where
         .parse()
         .map_err(|e| eyre::eyre!("EEZ_ROLLUP_ID malformed: {e}"))?;
 
-    Ok(Some(eez_evm::system_tx::SystemTxContext {
+    Ok(Some(eez_protocol::system_tx::SystemTxContext {
         system_signer,
         ccm_l2_address,
         l2_chain_id: chain_spec.chain().id(),

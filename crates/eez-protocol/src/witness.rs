@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Inert placeholder realizing `ChainProtocol::Witness`. The real witness
+/// Inert placeholder for the state witness. The real witness
 /// is `alloy_rpc_types_debug::ExecutionWitness`, pulled from reth
 /// (`eez_executionWitness`) and shipped on the composer control feed — it
 /// does not flow through this type.

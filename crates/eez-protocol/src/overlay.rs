@@ -1,6 +1,6 @@
 //! EVM state overlay — accumulated state changes equivalent to reth's `BundleState`.
 //!
-//! Realizes `ChainProtocol::Overlay`. Currently carried as an empty default
+//! Currently carried as an empty default
 //! on checkpoints — gRPC Execute is a probe; the upstream
 //! overlay-continuation (server-side state reconstruction) was not
 //! vendored. Canonical ordering: accounts by address, storage by key.
