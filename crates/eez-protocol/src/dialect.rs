@@ -18,7 +18,7 @@ use crate::authorized_proxies::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_
 
 /// Selects the contract ABI and entry-emission rules for one rollup.
 ///
-/// Stored on [`crate::TargetConfig`] and read at composition
+/// Stored on `TargetConfig` and read at composition
 /// time to select the correct calldata encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]

@@ -137,19 +137,19 @@ pub struct CrossChainWiring {
     pub entry_rollup_id: eez_protocol::RollupId,
     /// Entry-chain (L1) client — runs source simulation for INBOUND
     /// (L1→L2) txs.
-    pub entry_client: Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+    pub entry_client: Arc<dyn crate::composer::executor::ChainClient + Send + Sync>,
     /// Committed-root reader: serves every rollup's upstream-
     /// invariant-6 anchor root (`EEZ.rollups[id].stateRoot`) —
     /// chain headers are NOT correct for this purpose.
-    pub root_reader: Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+    pub root_reader: Arc<dyn crate::composer::executor::ChainClient + Send + Sync>,
     /// All registered rollups (entry + followers): client + config,
     /// keyed by rollup id. The per-tx dispatch map is built from this
     /// on every composition.
     pub rollups: HashMap<
         eez_protocol::RollupId,
         (
-            Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
-            eez_protocol::TargetConfig,
+            Arc<dyn crate::composer::executor::ChainClient + Send + Sync>,
+            crate::composer::TargetConfig,
         ),
     >,
     /// Runtime context (signer + L2 chain config) for wrapping the
@@ -160,7 +160,7 @@ pub struct CrossChainWiring {
     /// outbound tx originates on this L2, so its `simulate_and_resolve`
     /// must run against an L2 entry (the L2 follower's `ChainClient`
     /// errors `Unavailable` for source sim).
-    pub l2_entry_client: Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+    pub l2_entry_client: Arc<dyn crate::composer::executor::ChainClient + Send + Sync>,
 }
 
 impl CrossChainWiring {
@@ -196,11 +196,11 @@ impl CrossChainWiring {
     pub async fn simulate_and_resolve_recorded_for(
         &self,
         entry_id: eez_protocol::RollupId,
-        entry_client: &(dyn eez_protocol::executor::ChainClient + Send + Sync),
+        entry_client: &(dyn crate::composer::executor::ChainClient + Send + Sync),
         raw_tx: &[u8],
     ) -> eez_protocol::ComposerResult<(eez_protocol::Composition, Vec<eez_protocol::ExecutedAction>)>
     {
-        use eez_protocol::composition::Rollup;
+        use crate::composer::composition::Rollup;
 
         event!(
             name: "composer.simulate.start",
@@ -245,7 +245,7 @@ impl CrossChainWiring {
         // finalize. `recorded` carries the resolved per-call outcomes
         // (return_data) the byte-locked inbound delivery needs,
         // captured BEFORE `finalize` consumes the builder.
-        let mut builder = eez_protocol::CompositionBuilder::new(entry_id, rollups);
+        let mut builder = crate::composer::CompositionBuilder::new(entry_id, rollups);
         entry_client
             .simulate_source_tx(raw_tx.to_vec(), &mut builder)
             .await

@@ -19,8 +19,8 @@
 //! without pulling in the full EVM execution stack.
 //!
 //! [`SessionInspector`]: crate::inspector::SessionInspector
-//! [`Composer`]: eez_protocol::Composer
-//! [`CompositionBuilder`]: eez_protocol::CompositionBuilder
+//! [`Composer`]: crate::composer::Composer
+//! [`CompositionBuilder`]: crate::composer::CompositionBuilder
 
 // Mirrors the old eez-evm-inspector crate layout (inspector.rs at crate root).
 #[allow(clippy::module_inception)]

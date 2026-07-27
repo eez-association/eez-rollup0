@@ -14,8 +14,8 @@
 //!   [`ExecutedAction`] (outcome non-optional — it's always present by
 //!   the time the call is recorded).
 //! - **Finalization**: [`CompositionBuilder::finalize`] consumes the
-//!   builder, builds source + target entries via the [`crate::entries`]
-//!   builders, and produces a [`crate::types::Composition`].
+//!   builder, builds source + target entries via the [`eez_protocol::entries`]
+//!   builders, and produces a [`eez_protocol::types::Composition`].
 //!
 //! # Design
 //!
@@ -72,21 +72,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::batch::EvmBatch;
-use crate::entries;
-use crate::error::{
+use crate::composer::executor::{ChainClient, ExecutionRequest, TargetExecutionSession};
+use eez_protocol::batch::EvmBatch;
+use eez_protocol::entries;
+use eez_protocol::error::{
     CompositionResult, ExecutorError, ExecutorErrorKind, ExecutorResult, ProtocolErrorKind,
 };
-use crate::executor::{ChainClient, ExecutionRequest, TargetExecutionSession};
-use crate::rollup_id::RollupId;
-use crate::types::{
+use eez_protocol::rollup_id::RollupId;
+use eez_protocol::types::{
     Composition, ExecutedAction, ExecutionOutcome, SourceComposition, TargetComposition,
 };
 
 // Avoid a protocol → composer layering cycle: TargetConfig lives in
 // `composer.rs`, but this module reads `config.verification_context`
 // + `config.ccm_gas_limit` during finalize.
-use crate::composer::TargetConfig;
+use crate::composer::config::TargetConfig;
 
 // ── Rollup ───────────────────────────────────────────────────────
 
@@ -137,7 +137,7 @@ impl std::fmt::Debug for Rollup {
 /// with the full set of [`Rollup`] plans (including the entry
 /// rollup); dispatches each proxy call via [`CompositionBuilder::dispatch_call`]
 /// during source simulation; consumed by [`CompositionBuilder::finalize`]
-/// to produce the final [`crate::types::Composition`].
+/// to produce the final [`eez_protocol::types::Composition`].
 ///
 /// # Dispatch lifecycle
 ///
@@ -189,7 +189,7 @@ pub struct CompositionBuilder {
     /// recursing into `session.execute`; the snapshot is dropped on
     /// the success path of `close_call` and pushed onto
     /// [`pending_rollbacks`] on the revert path.
-    pub(crate) pending_snapshots: HashMap<usize, crate::executor::SessionSnapshot>,
+    pub(crate) pending_snapshots: HashMap<usize, crate::composer::executor::SessionSnapshot>,
     /// Rollups whose session is currently CHECKED OUT by an in-flight
     /// `dispatch_call` frame (taken at execute, put back after). A nested
     /// dispatch re-entering one of these would lazy-open a DUPLICATE
@@ -396,7 +396,7 @@ impl CompositionBuilder {
                 Ok(Some((batch, vec![root])))
             }
         } else {
-            let attribution = crate::composer::SourceAttribution {
+            let attribution = eez_protocol::SourceAttribution {
                 initial_roots,
                 per_tx_roots_by_rollup,
             };
@@ -456,7 +456,7 @@ impl CompositionBuilder {
             .iter_mut()
             .rev()
             .find(|r| r.target_rollup_id == rollup_id)
-            && let crate::types::ExecutionOutcome::Resolved {
+            && let eez_protocol::types::ExecutionOutcome::Resolved {
                 post_state_root, ..
             } = &mut last.outcome
         {
@@ -591,7 +591,7 @@ impl CompositionBuilder {
         }
 
         // Phase 3 — entry-rollup batch (across full preorder slice).
-        let attribution = crate::composer::SourceAttribution {
+        let attribution = eez_protocol::SourceAttribution {
             initial_roots: &initial_roots,
             per_tx_roots_by_rollup: &per_tx_roots_by_rollup,
         };
@@ -810,7 +810,7 @@ impl CompositionBuilder {
             source_address: req.source_address,
             data: req.data.clone(),
             value: req.value,
-            outcome: crate::types::ExecutionOutcome::Pending,
+            outcome: eez_protocol::types::ExecutionOutcome::Pending,
             revert_span: None,
         });
         self.pending_snapshots.insert(idx, snap);
@@ -826,7 +826,7 @@ impl CompositionBuilder {
     pub fn close_call(
         &mut self,
         idx: usize,
-        outcome: crate::types::ExecutionOutcome,
+        outcome: eez_protocol::types::ExecutionOutcome,
         revert_span: Option<u32>,
     ) {
         let slot = &mut self.recorded[idx];
@@ -918,10 +918,10 @@ impl CompositionBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::action::cross_chain_call_hash;
-    use crate::composer::ProxyLookupConfig;
-    use crate::dialect::ChainDialect;
+    use crate::composer::config::ProxyLookupConfig;
     use alloy_primitives::{Address, Bytes, U256};
+    use eez_protocol::action::cross_chain_call_hash;
+    use eez_protocol::dialect::ChainDialect;
 
     // ── Mock ChainClient (spawns a canned session) ──────────────────
 
@@ -967,12 +967,14 @@ mod tests {
                 .await?;
             unreachable!("the checked-out guard must refuse the cyclic open_call");
         }
-        async fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
-            Ok(Box::new(()) as crate::executor::SessionSnapshot)
+        async fn checkpoint(
+            &mut self,
+        ) -> ExecutorResult<crate::composer::executor::SessionSnapshot> {
+            Ok(Box::new(()) as crate::composer::executor::SessionSnapshot)
         }
         async fn rollback(
             &mut self,
-            _snapshot: crate::executor::SessionSnapshot,
+            _snapshot: crate::composer::executor::SessionSnapshot,
         ) -> ExecutorResult<()> {
             Ok(())
         }
@@ -1012,13 +1014,15 @@ mod tests {
             Ok(self.outcome.clone())
         }
 
-        async fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
+        async fn checkpoint(
+            &mut self,
+        ) -> ExecutorResult<crate::composer::executor::SessionSnapshot> {
             Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
         }
 
         async fn rollback(
             &mut self,
-            _snap: crate::executor::SessionSnapshot,
+            _snap: crate::composer::executor::SessionSnapshot,
         ) -> ExecutorResult<()> {
             Ok(())
         }
@@ -1186,8 +1190,8 @@ mod tests {
         let err = builder.finalize(&[]).await.expect_err("should fail");
         assert!(matches!(
             err.kind(),
-            crate::error::CompositionErrorKind::Protocol(p)
-                if matches!(p.kind(), crate::error::ProtocolErrorKind::EmptyCalls)
+            eez_protocol::error::CompositionErrorKind::Protocol(p)
+                if matches!(p.kind(), eez_protocol::error::ProtocolErrorKind::EmptyCalls)
         ));
     }
 
@@ -1261,10 +1265,10 @@ mod tests {
         let err = builder.finalize(&[]).await.expect_err("should fail");
         assert!(matches!(
             err.kind(),
-            crate::error::CompositionErrorKind::Protocol(p)
+            eez_protocol::error::CompositionErrorKind::Protocol(p)
                 if matches!(
                     p.kind(),
-                    crate::error::ProtocolErrorKind::UnknownTarget { got: RollupId(99) }
+                    eez_protocol::error::ProtocolErrorKind::UnknownTarget { got: RollupId(99) }
                 )
         ));
     }
@@ -1427,7 +1431,7 @@ mod tests {
             .expect("dispatch");
         assert!(resp.is_success());
         assert_eq!(builder.recorded.len(), 2);
-        assert!(crate::assertions::is_preorder(
+        assert!(crate::composer::assertions::is_preorder(
             &builder.recorded,
             RollupId(0),
         ));
@@ -1525,7 +1529,7 @@ mod tests {
 
         assert_eq!(builder.recorded[0].revert_span, Some(1));
         assert_eq!(builder.recorded[1].revert_span, None);
-        assert!(crate::assertions::is_preorder(
+        assert!(crate::composer::assertions::is_preorder(
             &builder.recorded,
             RollupId(0),
         ));

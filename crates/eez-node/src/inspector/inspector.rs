@@ -24,8 +24,8 @@
 //! (multi-tx composition). Reading through revm's journal captures
 //! both; a pre-tx storage snapshot would not.
 //!
-//! [`Dispatcher`]: eez_protocol::CompositionBuilder
-//! [`Dispatcher::dispatch_call`]: eez_protocol::CompositionBuilder::dispatch_call
+//! [`Dispatcher`]: crate::composer::CompositionBuilder
+//! [`Dispatcher::dispatch_call`]: crate::composer::CompositionBuilder::dispatch_call
 
 use alloy_primitives::{Address, Bytes};
 use std::sync::{Arc, Mutex};
@@ -37,7 +37,8 @@ use revm::interpreter::{
     CallInputs, CallOutcome, CallScheme, Gas, InstructionResult, InterpreterResult,
 };
 
-use eez_protocol::{CompositionBuilder, ExecutorError, ProxyLookupConfig, RollupId};
+use crate::composer::{CompositionBuilder, ProxyLookupConfig};
+use eez_protocol::{ExecutorError, RollupId};
 use eez_protocol::{ProxyInfo, decode_proxy_value, proxy_mapping_key};
 
 /// Bidirectional side-channel between source-sim and the overlay
@@ -284,7 +285,7 @@ fn lookup_authorized_proxy_live<CTX: ContextTr + Host>(
 /// dispatcher's recorded-call count. On `call_end`, the popped value
 /// pairs with the current count to compute `(start, span)` for any
 /// reverted frame, and the bracket is forwarded to
-/// [`CompositionBuilder::annotate_revert_span`](eez_protocol::CompositionBuilder::annotate_revert_span). `recorded[..]` is preorder
+/// [`CompositionBuilder::annotate_revert_span`](crate::composer::CompositionBuilder::annotate_revert_span). `recorded[..]` is preorder
 /// by construction — every call's slot index is fixed at
 /// `CompositionBuilder::open_call` time, BEFORE the session recurses — so
 /// `span = end - start` is exactly the on-chain `revertSpan` for the
@@ -318,7 +319,7 @@ pub struct SessionInspector<'a> {
     /// inside this frame. If the frame's outcome is
     /// `InstructionResult::Revert` AND the range is non-empty, the
     /// inspector forwards `(start, span)` to
-    /// [`CompositionBuilder::annotate_revert_span`](eez_protocol::CompositionBuilder::annotate_revert_span).
+    /// [`CompositionBuilder::annotate_revert_span`](crate::composer::CompositionBuilder::annotate_revert_span).
     frame_starts: Vec<usize>,
 }
 
@@ -530,7 +531,7 @@ where
             CallScheme::StaticCall => "STATICCALL",
         };
 
-        let req = eez_protocol::ExecutionRequest {
+        let req = crate::composer::ExecutionRequest {
             target_address: info.original_address,
             data: calldata.clone(),
             value: call_value,

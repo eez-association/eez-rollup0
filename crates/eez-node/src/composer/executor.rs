@@ -17,15 +17,15 @@
 
 use alloy_primitives::{Address, Bytes, U256};
 
-use crate::composition::CompositionBuilder;
-use crate::error::ExecutorResult;
+use crate::composer::composition::CompositionBuilder;
+use eez_protocol::error::ExecutorResult;
 #[allow(
     unused_imports,
     reason = "ExecutorError / its Kind enum used in rustdoc intra-doc links"
 )]
-use crate::error::{ExecutorError, ExecutorErrorKind};
-use crate::rollup_id::RollupId;
-use crate::types::ExecutionOutcome;
+use eez_protocol::error::{ExecutorError, ExecutorErrorKind};
+use eez_protocol::rollup_id::RollupId;
+use eez_protocol::types::ExecutionOutcome;
 
 /// Request for a single cross-chain execution on the target chain.
 #[derive(Debug, Clone)]
@@ -49,7 +49,7 @@ pub struct ExecutionRequest {
 ///
 /// One session per builder, lazily opened; the slot drain may chain a
 /// live session across consecutive source txs in the same slot (F1 —
-/// see [`CompositionBuilder::with_sessions`](crate::composition::CompositionBuilder::with_sessions));
+/// see [`CompositionBuilder::with_sessions`](crate::composer::composition::CompositionBuilder::with_sessions));
 /// sessions never outlive their slot. Accumulates state across calls;
 /// `&mut self` on every method reflects that.
 ///

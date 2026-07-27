@@ -250,7 +250,7 @@ pub enum ExecutorErrorKind {
     /// Architecturally disallowed; L1→L2→L1 (re-entry through the
     /// entry rollup) IS valid and is handled inline by the EVM
     /// inspector via the overlay path. Raised by
-    /// [`Dispatcher::dispatch_call`](crate::CompositionBuilder::dispatch_call)'s
+    /// `Dispatcher::dispatch_call`'s
     /// guard.
     #[error(
         "invalid re-entry: caller rollup {caller} attempted to dispatch to same rollup {target} \
@@ -321,7 +321,7 @@ pub type CompositionResult<T> = Result<T, CompositionError>;
 // ── ComposerError ────────────────────────────────────────────────
 
 error_struct! {
-    /// Errors from the generic [`Composer`](crate::Composer) orchestrator.
+    /// Errors from the generic `Composer` orchestrator.
     ///
     /// Wraps the composition error family plus composer-specific
     /// lifecycle failures (already-registered source/target, missing

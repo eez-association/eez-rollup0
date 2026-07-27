@@ -462,20 +462,20 @@ fn main() -> eyre::Result<()> {
             // via `CrossChainWiring`. `None` without an embedded L1.
             let mut l2_entry_client: Option<
                 Arc<
-                    dyn eez_protocol::executor::ChainClient
+                    dyn eez_node::composer::executor::ChainClient
                         + Send
                         + Sync,
                 >,
             > = None;
             type WiringParts = (
                 eez_protocol::RollupId,
-                Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
-                Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+                Arc<dyn eez_node::composer::executor::ChainClient + Send + Sync>,
+                Arc<dyn eez_node::composer::executor::ChainClient + Send + Sync>,
                 std::collections::HashMap<
                     eez_protocol::RollupId,
                     (
-                        Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
-                        eez_protocol::TargetConfig,
+                        Arc<dyn eez_node::composer::executor::ChainClient + Send + Sync>,
+                        eez_node::composer::TargetConfig,
                     ),
                 >,
             );
@@ -483,7 +483,7 @@ fn main() -> eyre::Result<()> {
                 if let Some(l1_variant) = embedded_l1.as_ref() {
                     use eez_node::composer::{GnosisL1Adapter, LocalChainClient};
                     use eez_protocol::rollup_id::RollupId;
-                    use eez_protocol::{ProxyLookupConfig, TargetConfig};
+                    use eez_node::composer::{ProxyLookupConfig, TargetConfig};
 
                     let ccm_l2: Address = Address::from_str(&env::var("EEZ_CCM_L2_ADDRESS").map_err(
                         |_| eyre::eyre!("EEZ_CCM_L2_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
@@ -511,12 +511,12 @@ fn main() -> eyre::Result<()> {
                                 eez_protocol::ChainDialect::EvmL1Style,
                             );
                             let entry_view: std::sync::Arc<
-                                dyn eez_protocol::executor::ChainClient
+                                dyn eez_node::composer::executor::ChainClient
                                     + Send
                                     + Sync,
                             > = entry_client.clone();
                             let root_view: std::sync::Arc<
-                                dyn eez_protocol::executor::ChainClient
+                                dyn eez_node::composer::executor::ChainClient
                                     + Send
                                     + Sync,
                             > = entry_client.clone();
@@ -544,12 +544,12 @@ fn main() -> eyre::Result<()> {
                                 eez_protocol::ChainDialect::EvmL1Style,
                             );
                             let entry_view: std::sync::Arc<
-                                dyn eez_protocol::executor::ChainClient
+                                dyn eez_node::composer::executor::ChainClient
                                     + Send
                                     + Sync,
                             > = entry_client.clone();
                             let root_view: std::sync::Arc<
-                                dyn eez_protocol::executor::ChainClient
+                                dyn eez_node::composer::executor::ChainClient
                                     + Send
                                     + Sync,
                             > = entry_client.clone();
@@ -569,7 +569,7 @@ fn main() -> eyre::Result<()> {
                         eez_protocol::ChainDialect::EvmL2Style,
                     );
                     let l2_follower_view: std::sync::Arc<
-                        dyn eez_protocol::executor::ChainClient
+                        dyn eez_node::composer::executor::ChainClient
                             + Send
                             + Sync,
                     > = l2_follower;
@@ -586,7 +586,7 @@ fn main() -> eyre::Result<()> {
                         eez_protocol::ChainDialect::EvmL2Style,
                     );
                     let l2_entry_view: std::sync::Arc<
-                        dyn eez_protocol::executor::ChainClient
+                        dyn eez_node::composer::executor::ChainClient
                             + Send
                             + Sync,
                     > = l2_entry;

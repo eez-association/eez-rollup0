@@ -19,10 +19,8 @@ use reth_trie_common::{HashedPostState, KeccakKeyHasher};
 use revm::DatabaseCommit;
 use revm::database::CacheState;
 
-use eez_protocol::{
-    CompositionBuilder, ExecutionOutcome, ExecutionRequest, ExecutorError, ExecutorErrorKind,
-    ExecutorResult, RollupId, TargetExecutionSession,
-};
+use crate::composer::{CompositionBuilder, ExecutionRequest, TargetExecutionSession};
+use eez_protocol::{ExecutionOutcome, ExecutorError, ExecutorErrorKind, ExecutorResult, RollupId};
 
 use super::provider::ChainProvider;
 
@@ -425,14 +423,14 @@ impl TargetExecutionSession for LocalExecutionSession {
         Ok(outcome)
     }
 
-    async fn checkpoint(&mut self) -> ExecutorResult<eez_protocol::SessionSnapshot> {
+    async fn checkpoint(&mut self) -> ExecutorResult<crate::composer::SessionSnapshot> {
         // Opaque snapshot carrying the current root only. The full
         // revm `State<DB>` deep-clone is tracked as known debt — see
         // CLAUDE.md "Known limitations".
         Ok(Box::new(self.current_root.0) as Box<dyn std::any::Any + Send>)
     }
 
-    async fn rollback(&mut self, snapshot: eez_protocol::SessionSnapshot) -> ExecutorResult<()> {
+    async fn rollback(&mut self, snapshot: crate::composer::SessionSnapshot) -> ExecutorResult<()> {
         let root: [u8; 32] = *snapshot.downcast::<[u8; 32]>().map_err(|_e| {
             ExecutorError::from(ExecutorErrorKind::Encoding(
                 "LocalExecutionSession::rollback: snapshot type mismatch".into(),

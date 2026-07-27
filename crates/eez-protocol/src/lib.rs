@@ -1,6 +1,6 @@
-//! The eez cross-chain protocol: composition engine, composer,
-//! Solidity ABI types, flat action hashing, sequencing machinery, ZK
-//! substrate, checkpoint format.
+//! The eez cross-chain protocol vocabulary: Solidity ABI types, flat
+//! action hashing, entry building, publicInputsHash computation,
+//! settlement rules, the DA payload codec, and the shared proving types.
 //!
 //! # Soundness model
 //!
@@ -28,9 +28,6 @@
 //!
 //! # Where to start reading
 //!
-//! - [`CompositionBuilder`] runs one cross-chain composition
-//!   end-to-end: source simulation dispatches into it, `finalize`
-//!   emits the [`Composition`].
 //! - For the ABI boundary, [`entries::build_batch`] walks the preorder
 //!   `recorded[..]` slice and materializes an [`EvmBatch`]; the
 //!   per-dialect encoders (`encode_postbatch` / `encode_load_table`)
@@ -42,12 +39,9 @@ pub mod action;
 pub mod addresses;
 pub mod authorized_proxies;
 pub mod batch;
-pub mod composer;
-pub mod composition;
 pub mod dialect;
 pub mod entries;
 pub mod error;
-pub mod executor;
 pub mod outbound_gate;
 pub mod overlay;
 pub mod payload_codec;
@@ -61,8 +55,6 @@ pub mod signer;
 pub mod system_tx;
 pub mod types;
 
-mod assertions;
-
 #[doc(inline)]
 pub use action::{compute_state_root_slot, cross_chain_call_hash};
 #[doc(inline)]
@@ -75,19 +67,15 @@ pub use authorized_proxies::{
 #[doc(inline)]
 pub use batch::EvmBatch;
 #[doc(inline)]
-pub use composer::{ProxyLookupConfig, SourceAttribution, TargetConfig};
-#[doc(inline)]
-pub use composition::{CompositionBuilder, Rollup};
-#[doc(inline)]
 pub use dialect::ChainDialect;
+#[doc(inline)]
+pub use entries::SourceAttribution;
 #[doc(inline)]
 pub use error::{
     ComposerError, ComposerErrorKind, ComposerResult, CompositionError, CompositionErrorKind,
     CompositionResult, ExecutorError, ExecutorErrorKind, ExecutorResult, ProtocolError,
     ProtocolErrorKind, ProtocolResult,
 };
-#[doc(inline)]
-pub use executor::{ChainClient, ExecutionRequest, SessionSnapshot, TargetExecutionSession};
 #[doc(inline)]
 pub use overlay::{
     AccountInfo, AccountOverlay, AccountStatus, ContractCode, EvmOverlay, StorageOverlay,

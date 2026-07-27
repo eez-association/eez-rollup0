@@ -26,7 +26,7 @@
 //!
 //! Both constants are consumed at config build time as the
 //! `authorized_proxies_slot: u8` field on
-//! [`crate::ProxyLookupConfig`]. The inspector reads
+//! `ProxyLookupConfig`. The inspector reads
 //! [`proxy_mapping_key`] / [`decode_proxy_value`] directly via the
 //! `u8` slot.
 

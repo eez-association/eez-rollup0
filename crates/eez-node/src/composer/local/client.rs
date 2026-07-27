@@ -28,11 +28,9 @@ use reth_primitives_traits::SignerRecoverable;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::{BlockNumReader, HeaderProvider, StateProvider, StateProviderFactory};
 
+use crate::composer::{ChainClient, CompositionBuilder, ProxyLookupConfig, TargetExecutionSession};
 use crate::inspector::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
-use eez_protocol::{
-    ChainClient, CompositionBuilder, ExecutorError, ExecutorErrorKind, ExecutorResult,
-    ProxyLookupConfig, RollupId, TargetExecutionSession,
-};
+use eez_protocol::{ExecutorError, ExecutorErrorKind, ExecutorResult, RollupId};
 
 use super::provider::{ChainProvider, HeaderReader};
 use super::session::LocalExecutionSession;

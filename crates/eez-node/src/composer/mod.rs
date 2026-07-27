@@ -34,9 +34,13 @@
 //! See `docs/plans/IMPLEMENTATION.md` §5.4.8 (umbrella architecture) +
 //! §5.4.11 (work order).
 
+mod assertions;
 // Mirrors the old eez-composer crate layout (composer.rs at crate root).
 #[allow(clippy::module_inception)]
 pub mod composer;
+pub mod composition;
+pub mod config;
+pub mod executor;
 pub mod held_pool;
 pub mod ingress;
 pub mod local;
@@ -45,6 +49,12 @@ pub mod rollup;
 
 #[doc(inline)]
 pub use composer::{Composer, CrossChainExecCtx};
+#[doc(inline)]
+pub use composition::{CompositionBuilder, Rollup};
+#[doc(inline)]
+pub use config::{ProxyLookupConfig, TargetConfig};
+#[doc(inline)]
+pub use executor::{ChainClient, ExecutionRequest, SessionSnapshot, TargetExecutionSession};
 #[doc(inline)]
 pub use held_pool::{HeldPool, HeldTx};
 #[doc(inline)]

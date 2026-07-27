@@ -8,16 +8,16 @@
 //!
 //! The contract covered here:
 //!
-//! - [`Composer`](crate::Composer) is the top-level shared handle
+//! - [`Composer`](crate::composer::Composer) is the top-level shared handle
 //!   and must be [`Send`] + [`Sync`] (cloned across tasks, often behind
 //!   `Arc` indirectly).
 //! - Per-composition data types cross `.await` boundaries inside the
 //!   composition pipeline and must be [`Send`].
 
-use crate::composition::{CompositionBuilder, Rollup};
-use crate::executor::ExecutionRequest;
-use crate::rollup_id::RollupId;
-use crate::types::{Composition, ExecutedAction, SourceComposition, TargetComposition};
+use crate::composer::composition::{CompositionBuilder, Rollup};
+use crate::composer::executor::ExecutionRequest;
+use eez_protocol::rollup_id::RollupId;
+use eez_protocol::types::{Composition, ExecutedAction, SourceComposition, TargetComposition};
 
 const fn assert_send<T: Send>() {}
 
@@ -81,8 +81,8 @@ pub fn is_preorder(recorded: &[ExecutedAction], source_rollup_id: RollupId) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ExecutionOutcome;
     use alloy_primitives::{Address, Bytes, U256};
+    use eez_protocol::types::ExecutionOutcome;
 
     fn rec(target: RollupId, caller: RollupId) -> ExecutedAction {
         ExecutedAction {
