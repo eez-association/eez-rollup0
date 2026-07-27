@@ -94,7 +94,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake
+          sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake protobuf-compiler
       - name: Build contracts (artifacts read by harness)
         working-directory: contracts
         run: forge build

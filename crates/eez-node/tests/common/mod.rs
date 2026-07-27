@@ -393,7 +393,7 @@ impl Harness {
                 self.dep.deploy_block.to_string(),
             ),
             (
-                "EEZ_MOCK_PROOF_SYSTEM_ADDRESS",
+                "EEZ_ECDSA_PROOF_SYSTEM_ADDRESS",
                 format!("{:#x}", self.dep.mock_ps_address),
             ),
             (
@@ -1967,7 +1967,7 @@ impl CrossChainConfig {
             ("EEZ_REGISTRY_ADDRESS", format!("{:#x}", self.eez_address)),
             ("EEZ_REGISTRY_DEPLOY_BLOCK", "0".to_string()),
             (
-                "EEZ_MOCK_PROOF_SYSTEM_ADDRESS",
+                "EEZ_ECDSA_PROOF_SYSTEM_ADDRESS",
                 format!("{:#x}", self.mock_ps_address),
             ),
             (

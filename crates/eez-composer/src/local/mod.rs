@@ -17,7 +17,7 @@ pub(crate) mod provider;
 pub(crate) mod session;
 
 #[doc(inline)]
-pub use build::{BuildError, BuiltSyncBlock, build_sync_block};
+pub use build::{BuildError, BuiltSyncBlock, build_sync_block, sync_block_pair_roots};
 #[doc(inline)]
 pub use client::LocalChainClient;
 #[doc(inline)]

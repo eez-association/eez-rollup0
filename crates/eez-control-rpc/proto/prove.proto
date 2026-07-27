@@ -1,0 +1,64 @@
+// The composer-controlled prover wire (Model B).
+//
+// The composer is the CLIENT: it dials the prover and streams one posted
+// settlement window as `Prove(stream ProveChunk)` — a header chunk first, then
+// one `BlockWitness` per window block (RLP + augmented execution witness). The
+// prover re-executes the window, runs its settlement gates, ECDSA-signs the
+// recomputed `publicInputsHash`, and returns it as the response. One exchange:
+// no feed, no dispatch, no sink, no cursor, no backfill.
+
+syntax = "proto3";
+
+package prove.v1;
+
+service Prover {
+  // Client-stream a whole posted window, receive the settlement attestation.
+  // Header MUST be the first chunk; blocks follow in ascending block order.
+  rpc Prove(stream ProveChunk) returns (ProveResponse);
+}
+
+message ProveChunk {
+  oneof kind {
+    ProveHeader header = 1;  // exactly one, first
+    BlockWitness block  = 2;  // one per window block, in order
+  }
+}
+
+message ProveHeader {
+  uint64 rollup_id  = 1;
+  uint64 from_block = 2;  // posted + 1 (OD-5 anchor + 1)
+  uint64 to_block   = 3;  // sync_height (the settling block)
+  PostBatch post_batch = 4;
+}
+
+// The authoritative L1 settlement payload the prover re-derives against.
+message PostBatch {
+  // ABI-encoded `EEZ.postAndVerifyBatch` calldata (proof carriers filled,
+  // `proofs[]` empty). The prover decodes THIS to recompute publicInputsHash.
+  bytes abi_calldata = 1;
+  // 32B — the composer's claimed publicInputsHash; the prover cross-checks it.
+  bytes public_inputs_hash = 2;
+  // 32B `blockhash(N)` for a block-bound batch, or empty for timeless (0).
+  bytes l1_block_hash = 3;
+}
+
+message BlockWitness {
+  uint64 number      = 1;
+  bytes  hash        = 2;  // 32B — composer-sealed block hash
+  bytes  parent_hash = 3;  // 32B
+  bytes  rlp         = 4;  // consensus RLP (header + body)
+  ExecutionWitness witness = 5;
+}
+
+// Structural mirror of `alloy_rpc_types_debug::ExecutionWitness`.
+message ExecutionWitness {
+  repeated bytes state   = 1;  // trie nodes (augmented with removal-closure)
+  repeated bytes codes   = 2;  // contract bytecodes
+  repeated bytes keys    = 3;  // hashed-key preimages
+  repeated bytes headers = 4;  // ancestor headers (BLOCKHASH)
+}
+
+message ProveResponse {
+  bytes public_inputs_hash = 1;  // 32B — the hash the prover signed
+  bytes signature          = 2;  // 65B — ECDSA over public_inputs_hash
+}

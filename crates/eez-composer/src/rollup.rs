@@ -43,7 +43,7 @@ pub struct RollupConfig {
 
 impl RollupConfig {
     /// Read from `EEZ_*` env vars: `EEZ_ROLLUP_ID`,
-    /// `EEZ_MOCK_PROOF_SYSTEM_ADDRESS`, `EEZ_REGISTRY_DEPLOY_BLOCK`,
+    /// `EEZ_ECDSA_PROOF_SYSTEM_ADDRESS`, `EEZ_REGISTRY_DEPLOY_BLOCK`,
     /// `EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES` (defaults to `false`).
     ///
     /// # Errors
@@ -58,10 +58,10 @@ impl RollupConfig {
             .parse::<u64>()
             .map_err(|e| L1Error::Config(format!("EEZ_ROLLUP_ID: {e}")))?;
         let proof_system =
-            Address::from_str(&env::var("EEZ_MOCK_PROOF_SYSTEM_ADDRESS").map_err(|_| {
-                L1Error::Config("EEZ_MOCK_PROOF_SYSTEM_ADDRESS is required".into())
+            Address::from_str(&env::var("EEZ_ECDSA_PROOF_SYSTEM_ADDRESS").map_err(|_| {
+                L1Error::Config("EEZ_ECDSA_PROOF_SYSTEM_ADDRESS is required".into())
             })?)
-            .map_err(|e| L1Error::Config(format!("EEZ_MOCK_PROOF_SYSTEM_ADDRESS: {e}")))?;
+            .map_err(|e| L1Error::Config(format!("EEZ_ECDSA_PROOF_SYSTEM_ADDRESS: {e}")))?;
         let deploy_block = env::var("EEZ_REGISTRY_DEPLOY_BLOCK")
             .map_err(|_| L1Error::Config("EEZ_REGISTRY_DEPLOY_BLOCK is required".into()))?
             .parse::<u64>()
