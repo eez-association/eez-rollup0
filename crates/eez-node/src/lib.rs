@@ -1,23 +1,8 @@
 //! eez Rollup-0 node — the application library behind the `eez-node` binary.
 //!
-//! Deployment/trust boundaries are the only crate boundaries in this
-//! workspace: `eez-protocol` is the vocabulary kernel both sides agree
-//! on byte-for-byte, `eez-proverd` is the prover side, and everything
-//! the node process runs lives here as plain modules:
-//!
-//! - [`composer`] — Composer umbrella: per-rollup Sequencer/Scheduler/
-//!   HeldPool maps plus the shared Aggregator/Submitter/prover client,
-//!   and the local reth-backed chain client + execution sessions.
-//! - [`driver`] — Engine-API consumer that drives reth to produce
-//!   blocks on a fixed cadence (Sequencer, BlockCommitter, slots).
-//! - [`deriver`] — Consumes L1 events, decodes posted batches, keeps
-//!   L2 in sync with L1.
-//! - [`l1`] — L1 RPC client + Submitter that posts batches to
-//!   BatchPoster.sol.
-//! - [`inspector`] — revm Inspector for cross-chain proxy-call
-//!   detection during source simulation.
-//! - Node plumbing: [`bundle_rpc`], [`follower`], [`ingress`],
-//!   [`l1_embedded`], [`mock_prover`], [`payload`], [`witness_source`].
+//! Everything the node process runs lives here as plain modules; the only
+//! other crates are `eez-protocol` (the vocabulary both sides of the trust
+//! boundary share) and `eez-proverd` (the prover side of the wire).
 
 /// Concrete reth provider of the eez L2 node and the embedded dev L1
 /// (both launched as `EthereumNode` over mdbx).

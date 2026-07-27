@@ -1,10 +1,5 @@
-//! Shared proving types.
-//!
-//! The composer always talks to the prover over the `prove.v1` gRPC API
-//! (`eez-prover-client`'s `RemoteProver` → `eez-proverd`), which turns a
-//! [`ProvingContext`] into the `proof` bytes that the matching on-chain
-//! `IProofSystem.verify` accepts. This module carries the context types
-//! ([`ProvingContext`], [`BlockWitness`]) both sides must agree on.
+//! Proving context types ([`ProvingContext`], [`BlockWitness`]) the
+//! composer and the prover wire must agree on.
 
 use alloy_primitives::{B256, Bytes, b256};
 use alloy_rpc_types_debug::ExecutionWitness;
