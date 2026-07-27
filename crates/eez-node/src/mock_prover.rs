@@ -14,7 +14,7 @@ use eez_control_rpc::v1::{
     ProveChunk, ProveResponse,
     prover_server::{Prover as ProverService, ProverServer},
 };
-use eez_prover::MOCK_PROVER_DIGEST;
+use eez_protocol::MOCK_PROVER_DIGEST;
 use tonic::{Request, Response, Status, Streaming, transport::Server};
 use tracing::{Level, event};
 

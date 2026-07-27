@@ -4,7 +4,7 @@
 //! At commit, the committer feeds each produced block's hash to [`run_capture`],
 //! which re-executes it (parent state still fresh) and persists the augmented
 //! witness. [`NodeWitnessSource`] serves the committed window of
-//! [`eez_prover::ProvingContext::blocks`] from the store, re-execing on demand
+//! [`eez_protocol::ProvingContext::blocks`] from the store, re-execing on demand
 //! only for the newest blocks not yet drained.
 //!
 //! Persistent (mdbx), not RAM: the node is non-archival, so by settlement time an
@@ -24,7 +24,8 @@ use alloy_eips::BlockHashOrNumber;
 use alloy_primitives::{B256, Bytes};
 use alloy_rpc_types_debug::ExecutionWitness;
 use eez_driver::witness::{ExecutionWitnessMode, block_witness};
-use eez_prover::{BlockWitness, ProvingWitnessSource};
+use eez_protocol::BlockWitness;
+use eez_prover::ProvingWitnessSource;
 use reth_ethereum_primitives::{Block, EthPrimitives};
 use reth_evm::ConfigureEvm;
 use reth_libmdbx::{DatabaseFlags, Environment, Geometry, WriteFlags};
@@ -365,7 +366,7 @@ mod tests {
     use super::{StoredWitness, WitnessDb};
     use alloy_primitives::{B256, Bytes};
     use alloy_rpc_types_debug::ExecutionWitness;
-    use eez_prover::BlockWitness;
+    use eez_protocol::BlockWitness;
 
     fn sample(number: u64) -> BlockWitness {
         BlockWitness {

@@ -17,6 +17,10 @@ sha3.workspace        = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace  = true
 alloy-network.workspace = true
+# DA payload codec (payload_codec module): batch payload RLP encode/decode.
+alloy-rlp.workspace = true
+# ExecutionWitness carried per block in ProvingContext (proving module).
+alloy-rpc-types-debug.workspace = true
 # narrow ECDSA signing for the postBatch poster's proof system
 k256.workspace = true
 # signed L2 system txs (system_tx module)
@@ -31,7 +35,6 @@ reth-primitives-traits.workspace = true
 tokio        = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json.workspace = true
 hex.workspace = true
-eez-payload-codec.workspace = true
 
 [lints]
 workspace = true

@@ -3099,7 +3099,6 @@ dependencies = [
  "eez-driver",
  "eez-evm-inspector",
  "eez-l1",
- "eez-payload-codec",
  "eez-protocol",
  "eez-prover",
  "eez-prover-client",
@@ -3141,7 +3140,6 @@ dependencies = [
  "alloy-sol-types",
  "eez-driver",
  "eez-l1",
- "eez-payload-codec",
  "eez-protocol",
  "reth-chainspec 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-ethereum-engine-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
@@ -3169,7 +3167,7 @@ dependencies = [
  "alloy-rpc-types-engine",
  "async-trait",
  "eez-l1",
- "eez-prover",
+ "eez-protocol",
  "eyre",
  "reth-chainspec 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-engine-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
@@ -3294,15 +3292,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eez-payload-codec"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "alloy-rlp",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "eez-protocol"
 version = "0.1.0"
 dependencies = [
@@ -3310,10 +3299,11 @@ dependencies = [
  "alloy-eips 2.0.5",
  "alloy-network",
  "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-debug",
  "alloy-signer-local",
  "alloy-sol-types",
  "async-trait",
- "eez-payload-codec",
  "hex",
  "k256",
  "reth-ethereum-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
@@ -3330,8 +3320,6 @@ dependencies = [
 name = "eez-prover"
 version = "0.1.0"
 dependencies = [
- "alloy-primitives",
- "alloy-rpc-types-debug",
  "eez-protocol",
  "thiserror 2.0.18",
 ]

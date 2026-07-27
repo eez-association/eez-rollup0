@@ -29,7 +29,7 @@ use eez_driver::{
     witness::{ExecutionWitnessMode, block_witness},
 };
 use eez_l1::{BundleTarget, L1Event, L1Watcher, SendOutcome, Submitter};
-use eez_prover::BlockWitness;
+use eez_protocol::BlockWitness;
 use eez_prover_client::RemoteProver;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_evm_ethereum::EthEvmConfig;
@@ -461,7 +461,7 @@ struct Inner<L2: BlockReader> {
     /// uses it to reorg the L2 head when an optimistically-committed
     /// Sync block's bundle fails on L1.
     committer: std::sync::OnceLock<BlockCommitterHandle<EthEngineTypes>>,
-    /// Per-block witnesses for [`eez_prover::ProvingContext::blocks`]. Set only
+    /// Per-block witnesses for [`eez_protocol::ProvingContext::blocks`]. Set only
     /// in remote-prover mode; `None` (mock) leaves `blocks` empty.
     witness_source: std::sync::OnceLock<Arc<dyn eez_prover::ProvingWitnessSource>>,
 }
@@ -2466,8 +2466,8 @@ where
                     .map(eez_protocol::abi::ExecutionEntrySol::abi_encode),
             )
             .collect();
-        let payload = eez_payload_codec::encode(&blocks, &l2_entries_bytes)
-            .map_err(|e| format!("eez_payload_codec::encode: {e}"))?;
+        let payload = eez_protocol::payload_codec::encode(&blocks, &l2_entries_bytes)
+            .map_err(|e| format!("eez_protocol::payload_codec::encode: {e}"))?;
         batch.callData = alloy_primitives::Bytes::from(payload);
 
         // Prove the assembled window (proofs[] empty — not part of the
@@ -2522,7 +2522,7 @@ where
             // Mock mode: the mock prover ignores per-block witnesses.
             None => Vec::new(),
         };
-        let proving_ctx = eez_prover::ProvingContext {
+        let proving_ctx = eez_protocol::ProvingContext {
             rollup_id,
             from_block: from,
             to_block: sync_block_number,

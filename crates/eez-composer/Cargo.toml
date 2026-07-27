@@ -11,7 +11,6 @@ description            = "Composer umbrella — owns per-rollup Sequencer/Schedu
 eez-driver.workspace         = true
 eez-evm-inspector.workspace  = true
 eez-l1.workspace             = true
-eez-payload-codec.workspace  = true
 eez-protocol.workspace       = true
 eez-prover.workspace         = true
 eez-prover-client.workspace  = true

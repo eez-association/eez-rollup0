@@ -50,7 +50,9 @@ pub mod error;
 pub mod executor;
 pub mod outbound_gate;
 pub mod overlay;
+pub mod payload_codec;
 pub mod proof_plan;
+pub mod proving;
 pub mod public_inputs;
 pub mod rolling_hash;
 pub mod rollup_id;
@@ -94,6 +96,8 @@ pub use overlay::{
 pub use proof_plan::{
     ProofPlan, ProofPlanInvariantError, RollupProofAssignment, TimestampAndBlockHash,
 };
+#[doc(inline)]
+pub use proving::{BlockWitness, MOCK_PROVER_DIGEST, ProvingContext};
 #[doc(inline)]
 pub use public_inputs::{all_per_ps_hashes, entry_hash, public_inputs_hashes, shared_public_input};
 #[doc(inline)]

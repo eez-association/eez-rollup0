@@ -16,7 +16,8 @@ use eez_control_rpc::v1::{
     BlockWitness as WireBlockWitness, ExecutionWitness as WireWitness, PostBatch, ProveChunk,
     ProveHeader, prove_chunk, prover_client::ProverClient,
 };
-use eez_prover::{ProverError, ProverResult, ProvingContext};
+use eez_protocol::ProvingContext;
+use eez_prover::{ProverError, ProverResult};
 use tracing::{Level, event};
 
 /// Proves a window on a remote `eez-proverd` over the

@@ -294,7 +294,7 @@ where
         let mut new_batches: Vec<BatchRecord> = Vec::new();
         let mut total_replayed: u64 = 0;
         for batch in scanned_batches {
-            let decoded = eez_payload_codec::decode(batch.call_data.as_ref())?;
+            let decoded = eez_protocol::payload_codec::decode(batch.call_data.as_ref())?;
 
             // `settled_count == 0` = nothing applied on L1 (the claimed
             // roots are phantoms). Skip the whole reconcile — no
@@ -755,7 +755,7 @@ where
         claimed_current_state: Option<B256>,
         claimed_new_state: Option<B256>,
     ) -> DeriverResult<()> {
-        let decoded = eez_payload_codec::decode(call_data.as_ref())?;
+        let decoded = eez_protocol::payload_codec::decode(call_data.as_ref())?;
         let block_count = decoded.block_count() as u64;
         if block_count == 0 {
             return Ok(());
@@ -1065,7 +1065,7 @@ where
     async fn reconcile_batch_blocks(
         &self,
         from_block: u64,
-        decoded: &eez_payload_codec::DecodedBatch,
+        decoded: &eez_protocol::payload_codec::DecodedBatch,
         post_batch_input: Bytes,
         l1_block_number: u64,
         tx_hash: B256,

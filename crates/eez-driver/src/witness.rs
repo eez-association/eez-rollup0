@@ -23,7 +23,7 @@
 use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::{B256, Bytes, U256, keccak256};
 use alloy_rpc_types_debug::ExecutionWitness;
-use eez_prover::BlockWitness;
+use eez_protocol::BlockWitness;
 use reth_ethereum_primitives::{Block, EthPrimitives};
 use reth_evm::{ConfigureEvm, execute::Executor};
 use reth_primitives_traits::RecoveredBlock;

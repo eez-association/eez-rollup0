@@ -10,7 +10,6 @@ description            = "Consumes L1 events, decodes posted batches, drives the
 eez-driver.workspace        = true
 eez-protocol.workspace      = true
 eez-l1.workspace            = true
-eez-payload-codec.workspace = true
 
 # Decode postBatch calldata + reconstruct system txs (via
 # eez_protocol::system_tx) so the deriver's Sync block matches the composer's.

@@ -4,14 +4,11 @@ version.workspace      = true
 edition.workspace      = true
 license.workspace      = true
 rust-version.workspace = true
-description            = "Shared proving types: ProvingContext, BlockWitness, ProvingWitnessSource."
+description            = "Shared proving seams: ProvingWitnessSource + the prover error surface."
 
 [dependencies]
-# EvmBatch in ProvingContext (the authoritative postBatch payload).
+# BlockWitness (returned by ProvingWitnessSource) lives in eez-protocol.
 eez-protocol.workspace       = true
-alloy-primitives.workspace   = true
-# ExecutionWitness carried per block in ProvingContext.
-alloy-rpc-types-debug.workspace = true
 thiserror.workspace          = true
 
 [lints]

@@ -8,7 +8,7 @@ description            = "Engine-API consumer that drives a reth node to produce
 
 [dependencies]
 # eez — the witness module produces the prover's per-block input type.
-eez-prover.workspace = true
+eez-protocol.workspace = true
 
 eez-l1.workspace = true
 # reth

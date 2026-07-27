@@ -71,7 +71,7 @@ fn main() {
     }
 
     // ── DA payload ──
-    let d = eez_payload_codec::decode(&b.callData).unwrap();
+    let d = eez_protocol::payload_codec::decode(&b.callData).unwrap();
     println!("######## DA PAYLOAD ########");
     println!("block_count = {}", d.block_count());
     println!("transactions.len() = {}", d.transactions.len());
