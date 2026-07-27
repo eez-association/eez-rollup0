@@ -57,9 +57,12 @@ jobs:
       - name: Unit tests (lib + bins, parallel)
         run: cargo nextest run --workspace --lib --bins --no-fail-fast
       - name: Protocol integration vectors
-        run: |
-          cargo nextest run -p eez-evm --test cross_chain_call_hash_vectors --test public_inputs_hash_vectors --no-fail-fast
-          cargo nextest run -p eez-protocol --test rolling_hash_vectors --no-fail-fast
+        run: >-
+          cargo nextest run -p eez-protocol
+          --test cross_chain_call_hash_vectors
+          --test public_inputs_hash_vectors
+          --test rolling_hash_vectors
+          --no-fail-fast
 
   contract-build:
     name: Contract Build

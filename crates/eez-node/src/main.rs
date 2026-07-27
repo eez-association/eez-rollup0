@@ -700,7 +700,7 @@ fn main() -> eyre::Result<()> {
                     .map_err(|_| eyre::eyre!("EEZ_L1_RPC_URL required for L1 forwarding"))?
                     .parse()
                     .map_err(|e| eyre::eyre!("EEZ_L1_RPC_URL malformed: {e}"))?;
-                let l1_provider = alloy_provider::RootProvider::new_http(l1_rpc_url);
+                let l1_provider = alloy_provider::RootProvider::new_http(l1_rpc_url.clone());
                 let l1_poster_key = env::var("EEZ_L1_POSTER_KEY").map_err(|_| {
                     eyre::eyre!("EEZ_L1_POSTER_KEY required for L1 postBatch signing")
                 })?;
