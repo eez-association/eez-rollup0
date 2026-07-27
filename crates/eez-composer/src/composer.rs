@@ -131,9 +131,7 @@ pub struct CrossChainWiring {
     /// Rollup id of the entry chain.
     pub entry_rollup_id: eez_protocol::RollupId,
     /// Entry-chain (L1) client — runs source simulation for INBOUND
-    /// (L1→L2) txs, and serves every rollup's upstream-invariant-6
-    /// anchor root (`EEZ.rollups[id].stateRoot`) — chain headers
-    /// (self-reports) are NOT correct for that purpose.
+    /// (L1→L2) txs.
     pub entry_client: Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
     /// All registered rollups (entry + followers). The entry is also
     /// in this map — composition orchestration uses it uniformly.
