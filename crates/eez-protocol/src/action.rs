@@ -72,41 +72,6 @@ pub fn cross_chain_call_hash(
     keccak256(ActionSol::abi_encode_params(&action))
 }
 
-/// Storage slot of `mapping(uint256 => RollupConfig) public rollups`
-/// on `EEZ.sol` — slot 2, after `authorizedProxies` (0) and
-/// `rollupCounter` (1). Verify with `forge inspect EEZ storage`.
-const ROLLUPS_MAPPING_SLOT: u8 = 2;
-
-/// Compute the Solidity storage slot for `rollups[rollupId].stateRoot`
-/// on `EEZ.sol`.
-///
-/// `RollupConfig` shape under the multi-prover refactor
-/// (`EEZ.sol:24-28`):
-///
-/// ```solidity
-/// struct RollupConfig {
-///     address rollupContract;   // +0
-///     bytes32 stateRoot;        // +1
-///     uint256 etherBalance;     // +2
-/// }
-/// ```
-///
-/// The pre-refactor `Rollups.sol` shape had 4 fields with `stateRoot`
-/// at +2; the multi-prover refactor dropped `owner` + `verificationKey`
-/// from the central registry (vkeys moved onto the per-rollup
-/// `IRollupContract`), shifting `stateRoot` to +1.
-#[must_use]
-pub fn compute_state_root_slot(rollup_id: RollupId) -> B256 {
-    let mut data = [0u8; 64];
-    // Left-pad u64 to uint256 (bytes 0-23 zero, 24-31 the value)
-    data[24..32].copy_from_slice(&rollup_id.0.to_be_bytes());
-    data[63] = ROLLUPS_MAPPING_SLOT;
-    let base = keccak256(data);
-    // stateRoot is at offset +1 within RollupConfig under the
-    // multi-prover layout.
-    B256::from(U256::from_be_bytes(base.0) + U256::from(1))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,29 +155,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn state_root_slot_known_value() {
-        let slot = compute_state_root_slot(RollupId(1));
-        assert_ne!(slot, B256::ZERO);
-        assert_eq!(slot, compute_state_root_slot(RollupId(1)));
-        assert_ne!(
-            compute_state_root_slot(RollupId(1)),
-            compute_state_root_slot(RollupId(2))
-        );
-    }
-
-    #[test]
-    fn state_root_slot_known_value_for_rollup_one() {
-        // Hard-coded oracle: `keccak256(abi.encode(uint256(1),
-        // uint256(2))) + 1` — the slot of `rollups[1].stateRoot`
-        // (`rollups` mapping at slot 2, `stateRoot` at +1). Computed
-        // offline via `cast keccak` so this is an independent witness,
-        // not a re-derivation of the function's own formula; fails
-        // loudly if the mapping slot or `RollupConfig` shape moves.
-        let slot = compute_state_root_slot(RollupId(1));
-        let expected: B256 = "0xe90b7bceb6e7df5418fb78d8ee546e97c83a08bbccc01a0644d599ccd2a7c2e1"
-            .parse()
-            .expect("hex");
-        assert_eq!(slot, expected, "slot {slot} != {expected}");
-    }
 }

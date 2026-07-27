@@ -60,7 +60,7 @@ pub mod types;
 mod assertions;
 
 #[doc(inline)]
-pub use action::{compute_state_root_slot, cross_chain_call_hash};
+pub use action::cross_chain_call_hash;
 #[doc(inline)]
 pub use addresses::{CCM_ADDRESS, SYSTEM_ADDRESS};
 #[doc(inline)]

@@ -84,11 +84,7 @@ pub struct LocalChainClient {
     rollup_id: RollupId,
     role: Role,
     ccm_address: Address,
-    /// Per-chain dialect — drives proxy-lookup slot, CCM-verify shape,
-    /// and the [`eez_protocol::CommittedRootReader`] capability
-    /// honestly: only `EvmL1Style` clients actually serve canonical
-    /// committed-root reads (the L1 `EEZ.sol` storage layout
-    /// `compute_state_root_slot` assumes).
+    /// Per-chain dialect — drives the proxy-lookup slot and batch shape.
     dialect: eez_protocol::ChainDialect,
     /// Bidirectional overlay channel for shared-source-state nested
     /// dispatch. `Some(channel)` only on entry-role clients —
