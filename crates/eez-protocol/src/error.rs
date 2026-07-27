@@ -136,10 +136,6 @@ pub enum ProtocolErrorKind {
         /// The unknown rollup ID.
         got: crate::rollup_id::RollupId,
     },
-    /// Byte-level decoding of a chain-specific field (address, value,
-    /// calldata) failed.
-    #[error("invalid encoding: {0}")]
-    InvalidEncoding(String),
     /// A protocol capability was invoked that this chain family does not
     /// implement — e.g. a
     /// [`build_l1_postbatch`](crate::entries::build_l1_postbatch)
@@ -172,14 +168,6 @@ impl ExecutorError {
     pub fn evm(e: impl Into<BoxedError>) -> Self {
         ExecutorErrorKind::Evm(e.into()).into()
     }
-    /// Build a `Transport` error from any `Error + Send + Sync + 'static`.
-    pub fn transport(e: impl Into<BoxedError>) -> Self {
-        ExecutorErrorKind::Transport(e.into()).into()
-    }
-    /// Build a `Serde` error from any `Error + Send + Sync + 'static`.
-    pub fn serde(e: impl Into<BoxedError>) -> Self {
-        ExecutorErrorKind::Serde(e.into()).into()
-    }
 }
 
 /// Variants of [`ExecutorError`].
@@ -206,45 +194,19 @@ pub enum ExecutorErrorKind {
     /// `#[non_exhaustive]`).
     #[error("evm: {0}")]
     Evm(#[source] BoxedError),
-    /// Wire-level failure (gRPC status, connection error).
-    #[error("transport: {0}")]
-    Transport(#[source] BoxedError),
     /// Message crossed the wire but didn't decode (wrong byte length,
     /// malformed proto field, bad address encoding).
     #[error("encoding: {0}")]
     Encoding(String),
-    /// Serialization / deserialization failure crossing the executor
-    /// boundary — typically a checkpoint blob. The exact backend
-    /// (`serde_json` today) is an implementation detail of the
-    /// transport crate, not part of this crate's public surface.
-    #[error("serde: {0}")]
-    Serde(#[source] BoxedError),
     /// Expected data (header, outcome, etc.) was absent with no
     /// underlying error to wrap — used for synthetic "`.ok_or_else`"
     /// sites that aren't really provider failures.
     #[error("missing {0}")]
     Missing(&'static str),
-    /// A target-chain transaction in a batch simulation reverted at
-    /// the contract level (distinct from internal EVM failures).
-    #[error("target transaction {index} reverted: return_data={return_data:?}")]
-    TargetTransactionReverted {
-        /// Zero-based position of the reverting transaction within the
-        /// simulated batch.
-        index: usize,
-        /// Raw revert data returned by the contract, if any.
-        return_data: Vec<u8>,
-    },
     /// Failed to decode a higher-level structure (raw transaction,
     /// checkpoint, etc.) — distinct from byte-level `Encoding`.
     #[error("decode: {0}")]
     Decode(String),
-    /// A batch simulation was asked to run with zero transactions.
-    /// Distinct from a successful batch with zero post-state change —
-    /// this signals the caller passed an empty slice, which the
-    /// upstream protocol's "invariant 7" (no silent failures) says
-    /// must be a loud error rather than a synthesized zero root.
-    #[error("batch simulation requires at least one transaction")]
-    EmptyBatch,
     /// A nested dispatch attempted to route back to the same non-entry
     /// chain that issued it (e.g. L2 → L2 self-dispatch).
     /// Architecturally disallowed; L1→L2→L1 (re-entry through the
