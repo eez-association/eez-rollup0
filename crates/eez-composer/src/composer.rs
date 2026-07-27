@@ -175,15 +175,12 @@ impl CrossChainWiring {
     ) -> eez_protocol::ComposerResult<eez_protocol::Composition> {
         self.simulate_and_resolve_recorded_for(self.entry_rollup_id, &*self.entry_client, raw_tx)
             .await
-            .map(|(composition, _recorded)| composition)
     }
 
     /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve) but
     /// with an explicitly-chosen entry — `entry_id` + the `entry_client`
-    /// that runs source simulation — and ALSO returning the builder's
-    /// `recorded[..]` (preorder dispatched cross-chain calls with
-    /// resolved outcomes). The explicit entry lets one wiring compose
-    /// either direction — `(L1, L1 client)` for an inbound L1→L2 call,
+    /// that runs source simulation. The explicit entry lets one wiring
+    /// compose either direction — `(L1, L1 client)` for an inbound L1→L2 call,
     /// `(L2, L2 client)` for an outbound L2→L1 call — picked per tx by
     /// the drain.
     ///
@@ -195,8 +192,7 @@ impl CrossChainWiring {
         entry_id: eez_protocol::RollupId,
         entry_client: &(dyn eez_protocol::executor::ChainClient + Send + Sync),
         raw_tx: &[u8],
-    ) -> eez_protocol::ComposerResult<(eez_protocol::Composition, Vec<eez_protocol::ExecutedAction>)>
-    {
+    ) -> eez_protocol::ComposerResult<eez_protocol::Composition> {
         use eez_protocol::composition::Rollup;
 
         event!(
@@ -258,7 +254,7 @@ impl CrossChainWiring {
             "composition complete"
         );
 
-        Ok((composition, recorded))
+        Ok(composition)
     }
 }
 
@@ -1453,7 +1449,7 @@ where
                     )
                     .await
                 {
-                    Ok((composition, _recorded)) => {
+                    Ok(composition) => {
                         let l1_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = composition
                             .targets
                             .iter()
