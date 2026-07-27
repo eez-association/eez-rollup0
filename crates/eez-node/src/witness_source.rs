@@ -19,13 +19,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::driver::witness::{ExecutionWitnessMode, block_witness};
 use alloy_consensus::Header;
 use alloy_eips::BlockHashOrNumber;
 use alloy_primitives::{B256, Bytes};
 use alloy_rpc_types_debug::ExecutionWitness;
-use eez_driver::witness::{ExecutionWitnessMode, block_witness};
 use eez_protocol::BlockWitness;
-use eez_prover::ProvingWitnessSource;
 use reth_ethereum_primitives::{Block, EthPrimitives};
 use reth_evm::ConfigureEvm;
 use reth_libmdbx::{DatabaseFlags, Environment, Geometry, WriteFlags};
@@ -38,6 +37,20 @@ const GIGABYTE: usize = 1024 * 1024 * 1024;
 /// grows the file lazily, so a generous cap just means "never `MAP_FULL`".
 const MAP_MAX_BYTES: usize = 256 * GIGABYTE;
 const GROWTH_STEP: isize = 1024 * 1024 * 1024;
+
+/// Produces the [`BlockWitness`] for a committed L2 block — the seam by which
+/// the composer fills
+/// [`ProvingContext::blocks`](eez_protocol::ProvingContext::blocks) without
+/// owning the reth provider itself. [`NodeWitnessSource`] backs this with the
+/// node's provider + [`crate::driver::witness`]; the composer only calls it.
+pub trait ProvingWitnessSource: Send + Sync + std::fmt::Debug {
+    /// Build the RLP + augmented witness for block `number`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if the block is missing or witness generation fails.
+    fn block_witness(&self, number: u64) -> Result<BlockWitness, String>;
+}
 
 /// Persistent witness store: a dedicated mdbx env keyed by block number
 /// (big-endian, so key order == numeric order → ordered purge). Cheap `Arc`

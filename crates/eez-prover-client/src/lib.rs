@@ -17,8 +17,18 @@ use eez_control_rpc::v1::{
     ProveHeader, prove_chunk, prover_client::ProverClient,
 };
 use eez_protocol::ProvingContext;
-use eez_prover::{ProverError, ProverResult};
 use tracing::{Level, event};
+
+/// Result alias.
+pub type ProverResult<T> = Result<T, ProverError>;
+
+/// Error returned by [`RemoteProver::prove`].
+#[derive(Debug, thiserror::Error)]
+pub enum ProverError {
+    /// The proving backend (remote daemon, witness source, …) failed.
+    #[error("prover backend: {0}")]
+    Backend(String),
+}
 
 /// Proves a window on a remote `eez-proverd` over the
 /// `prove.v1.Prover` gRPC service. Cheap to clone (`Arc<Inner>`).

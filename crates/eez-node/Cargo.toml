@@ -7,20 +7,15 @@ rust-version.workspace = true
 description            = "eez Rollup-0 node — vanilla reth driven by an eez sequencer."
 
 [dependencies]
-eez-composer.workspace      = true
 eez-control-rpc.workspace   = true
-eez-deriver.workspace       = true
-eez-driver.workspace        = true
-eez-evm-inspector.workspace = true
-eez-l1.workspace            = true
 eez-protocol.workspace      = true
-eez-prover.workspace        = true
 eez-prover-client.workspace = true
 
 # reth
 reth-chainspec.workspace                  = true
 reth-cli.workspace                        = true
 reth-db.workspace                         = true
+reth-engine-primitives.workspace          = true
 reth-ethereum-cli.workspace               = true
 reth-ethereum-engine-primitives.workspace = true
 reth-ethereum-payload-builder.workspace   = true
@@ -32,13 +27,24 @@ reth-node-api.workspace                   = true
 reth-node-builder.workspace               = true
 reth-node-core.workspace                  = true
 reth-node-ethereum.workspace              = true
+reth-payload-builder.workspace            = true
+reth-payload-primitives.workspace         = true
 reth-primitives-traits.workspace          = true
+reth-provider.workspace                   = true
+# `witness` feature gates ExecutionWitnessRecord::into_execution_witness,
+# used by the per-block witness re-exec (driver::witness).
+reth-revm                                 = { workspace = true, features = ["witness"] }
 reth-rpc-eth-api.workspace                = true
 reth-storage-api.workspace                = true
 reth-tasks.workspace                      = true
 reth-transaction-pool.workspace           = true
+reth-trie.workspace                       = true
+reth-trie-common.workspace                = true
 # Persistent witness store: dedicated mdbx env, separate from reth's node DB.
 reth-libmdbx.workspace                    = true
+
+# revm direct (inspector + overlay-channel paths in composer::local::session)
+revm.workspace = true
 
 # Gnosis (chiado) L1 — provided when EEZ_L1_EMBEDDED=1 and the smoke
 # targets chiado; the L1 NodeBuilder uses these.
@@ -46,15 +52,20 @@ reth_gnosis.workspace                     = true
 gnosis-primitives.workspace               = true
 
 # alloy
-alloy-consensus.workspace    = true
-alloy-eips.workspace         = true
-alloy-primitives.workspace   = true
-alloy-rlp.workspace          = true
-alloy-rpc-types-debug.workspace = true
-alloy-provider.workspace     = true
-alloy-signer.workspace       = true
-alloy-signer-local.workspace = true
-reqwest.workspace            = true
+alloy-consensus.workspace        = true
+alloy-contract.workspace         = true
+alloy-eips.workspace             = true
+alloy-network.workspace          = true
+alloy-primitives.workspace       = true
+alloy-rlp.workspace              = true
+alloy-rpc-types-debug.workspace  = true
+alloy-rpc-types-engine.workspace = true
+alloy-rpc-types-eth.workspace    = true
+alloy-sol-types.workspace        = true
+alloy-provider.workspace         = true
+alloy-signer.workspace           = true
+alloy-signer-local.workspace     = true
+reqwest.workspace                = true
 
 # Cross-chain RPC fronts (transparent hyper proxy: forward every eth_* to the
 # source chain's node so cast/wallets read chainId/nonce/gas/receipt, intercept
@@ -74,9 +85,11 @@ tonic.workspace        = true
 tokio-stream           = { workspace = true, features = ["net"] }
 
 # app
+async-trait.workspace        = true
 clap.workspace               = true
 dotenvy.workspace            = true
 eyre.workspace               = true
+fail.workspace               = true
 mimalloc.workspace           = true
 thiserror.workspace          = true
 tokio.workspace              = true
@@ -85,23 +98,16 @@ tracing-subscriber.workspace = true
 url.workspace                = true
 
 [dev-dependencies]
-alloy-consensus.workspace = true
-alloy-contract.workspace = true
 alloy-genesis = { version = "2", default-features = false }
-alloy-network.workspace = true
-alloy-provider = { workspace = true, features = ["reqwest"] }
-alloy-rpc-types-eth.workspace = true
-alloy-signer-local.workspace = true
-alloy-sol-types.workspace = true
+alloy-transport = { version = "2", default-features = false }
 anyhow = "1"
-reth-chainspec.workspace = true
-serde_json = "1"
 tempfile = "3"
 
 [features]
-# TEST-ONLY passthrough to eez-composer/fault-inject (deriver-gate attack test).
-# NEVER enabled in normal/release builds. Revert: `git restore`.
-fault-inject = ["eez-composer/fault-inject"]
+# TEST-ONLY (deriver-gate attack test): inject a corrupted OUTBOUND settlement
+# entry into postBatch so a live node exercises verify_outbound_authorized's
+# reject path. NEVER enabled in normal/release builds. Revert: `git restore`.
+fault-inject = []
 
 [lints]
 workspace = true

@@ -5,7 +5,7 @@
 //! local dev L1 has no such relay, so the `Submitter` used to get a
 //! JSON-RPC `-32601` (method not found) and silently degrade to ordered
 //! `eth_sendRawTransaction` mempool submission
-//! (`eez_l1::submitter::post_bundle`). That divergence means the dev
+//! (`crate::l1::submitter::post_bundle`). That divergence means the dev
 //! harness never exercises the real bundle path chiado uses.
 //!
 //! This module closes the gap: [`install_dev_bundle_rpc`] registers an
@@ -41,7 +41,7 @@ use tracing::{Level, event};
 /// accepted and ignored — a single-node dev chain has no proposer
 /// auction or block-pinning to enforce them against.
 ///
-/// Matches the body produced by `eez_l1::submitter::post_bundle`:
+/// Matches the body produced by `crate::l1::submitter::post_bundle`:
 /// `{ "txs": ["0x…", …], "blockNumber": "0x…" }`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

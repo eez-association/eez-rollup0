@@ -1,15 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/eez-composer",
     "crates/eez-control-rpc",
-    "crates/eez-deriver",
-    "crates/eez-driver",
-    "crates/eez-evm-inspector",
-    "crates/eez-l1",
     "crates/eez-node",
     "crates/eez-protocol",
-    "crates/eez-prover",
     "crates/eez-prover-client",
     "crates/eez-proverd",
 ]
@@ -137,13 +131,7 @@ jsonrpsee              = { version = "0.26", features = ["server", "macros"] }
 tower                  = { version = "0.5", features = ["util"] }
 
 # internal crates
-eez-composer       = { path = "crates/eez-composer" }
-eez-deriver        = { path = "crates/eez-deriver" }
-eez-driver         = { path = "crates/eez-driver" }
-eez-evm-inspector  = { path = "crates/eez-evm-inspector" }
-eez-l1             = { path = "crates/eez-l1" }
 eez-protocol       = { path = "crates/eez-protocol" }
-eez-prover         = { path = "crates/eez-prover" }
 
 [profile.release]
 lto = "thin"

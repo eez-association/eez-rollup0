@@ -60,7 +60,7 @@ fn sign_mock_digest(signer: &PrivateKeySigner) -> Result<[u8; 65], alloy_signer:
 
 /// Bind an ephemeral localhost port, serve the stub on it in a spawned task,
 /// and return the `http://…` URL to hand `RemoteProver::new`.
-pub(crate) async fn spawn(signer: PrivateKeySigner) -> eyre::Result<String> {
+pub async fn spawn(signer: PrivateKeySigner) -> eyre::Result<String> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     tokio::spawn(async move {

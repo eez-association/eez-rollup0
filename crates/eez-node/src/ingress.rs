@@ -4,7 +4,7 @@
 //! need a real RPC for that chain. Each front is a transparent proxy: it
 //! forwards every `eth_*` to the source chain's node and intercepts only
 //! `eth_sendRawTransaction`, holding the tx in the per-rollup
-//! [`HeldPool`](eez_composer::HeldPool) with the front's fixed [`Direction`]
+//! [`HeldPool`](crate::composer::HeldPool) with the front's fixed [`Direction`]
 //! (L1 front → `Inbound`, L2 front → `Outbound`) and returning its hash at once.
 //! The receipt resolves when the held tx lands — an outbound in the L2 Sync
 //! block, an inbound in the L1 postBatch bundle.
@@ -18,12 +18,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::composer::{Direction, HeldPool, HeldTx};
 use alloy_consensus::transaction::SignerRecoverable as _;
 use alloy_consensus::{Transaction as _, TxEnvelope};
 use alloy_eips::eip2718::Decodable2718 as _;
 use alloy_primitives::{B256, Bytes, U256, keccak256};
 use alloy_provider::{Provider as _, RootProvider};
-use eez_composer::{Direction, HeldPool, HeldTx};
 use http_body_util::{BodyExt as _, Full};
 use hyper::body::Bytes as HyperBytes;
 use hyper::server::conn::http1;

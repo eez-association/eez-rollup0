@@ -3083,43 +3083,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eez-composer"
-version = "0.1.0"
-dependencies = [
- "alloy-consensus",
- "alloy-contract",
- "alloy-eips 2.0.5",
- "alloy-network",
- "alloy-primitives",
- "alloy-provider",
- "alloy-rpc-types-engine",
- "alloy-signer-local",
- "alloy-sol-types",
- "async-trait",
- "eez-driver",
- "eez-evm-inspector",
- "eez-l1",
- "eez-protocol",
- "eez-prover",
- "eez-prover-client",
- "gnosis-primitives",
- "reth-chainspec 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-ethereum-engine-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-ethereum-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-evm 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-evm-ethereum 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-payload-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-primitives-traits",
- "reth-revm 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-storage-api 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-trie-common 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "revm",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "eez-control-rpc"
 version = "0.1.0"
 dependencies = [
@@ -3127,97 +3090,6 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
-]
-
-[[package]]
-name = "eez-deriver"
-version = "0.1.0"
-dependencies = [
- "alloy-consensus",
- "alloy-eips 2.0.5",
- "alloy-primitives",
- "alloy-rpc-types-engine",
- "alloy-sol-types",
- "eez-driver",
- "eez-l1",
- "eez-protocol",
- "reth-chainspec 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-ethereum-engine-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-ethereum-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-evm 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-evm-ethereum 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-payload-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-primitives-traits",
- "reth-provider 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-revm 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-storage-api 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "revm",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "eez-driver"
-version = "0.1.0"
-dependencies = [
- "alloy-consensus",
- "alloy-primitives",
- "alloy-rlp",
- "alloy-rpc-types-debug",
- "alloy-rpc-types-engine",
- "async-trait",
- "eez-l1",
- "eez-protocol",
- "eyre",
- "reth-chainspec 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-engine-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-ethereum-engine-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-ethereum-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-evm 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-payload-builder 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-payload-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-primitives-traits",
- "reth-revm 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-storage-api 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-trie 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "eez-evm-inspector"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "alloy-sol-types",
- "async-trait",
- "eez-protocol",
- "revm",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "eez-l1"
-version = "0.1.0"
-dependencies = [
- "alloy-consensus",
- "alloy-eips 2.0.5",
- "alloy-primitives",
- "alloy-provider",
- "alloy-rpc-types-eth",
- "alloy-signer-local",
- "alloy-sol-types",
- "alloy-transport",
- "eez-protocol",
- "fail",
- "reqwest 0.12.28",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "url",
 ]
 
 [[package]]
@@ -3233,23 +3105,21 @@ dependencies = [
  "alloy-provider",
  "alloy-rlp",
  "alloy-rpc-types-debug",
+ "alloy-rpc-types-engine",
  "alloy-rpc-types-eth",
  "alloy-signer",
  "alloy-signer-local",
  "alloy-sol-types",
+ "alloy-transport",
  "anyhow",
+ "async-trait",
  "clap",
  "dotenvy",
- "eez-composer",
  "eez-control-rpc",
- "eez-deriver",
- "eez-driver",
- "eez-evm-inspector",
- "eez-l1",
  "eez-protocol",
- "eez-prover",
  "eez-prover-client",
  "eyre",
+ "fail",
  "gnosis-primitives",
  "http-body-util",
  "hyper",
@@ -3261,6 +3131,7 @@ dependencies = [
  "reth-chainspec 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-cli 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-db 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-engine-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-ethereum-cli 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-ethereum-engine-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-ethereum-payload-builder 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
@@ -3273,12 +3144,19 @@ dependencies = [
  "reth-node-builder 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-node-core 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-node-ethereum 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-payload-builder 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-payload-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-primitives-traits",
+ "reth-provider 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-revm 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-rpc-eth-api 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-storage-api 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-tasks 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-transaction-pool 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-trie 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-trie-common 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth_gnosis",
+ "revm",
  "serde",
  "serde_json",
  "tempfile",
@@ -3317,14 +3195,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eez-prover"
-version = "0.1.0"
-dependencies = [
- "eez-protocol",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "eez-prover-client"
 version = "0.1.0"
 dependencies = [
@@ -3334,7 +3204,7 @@ dependencies = [
  "alloy-sol-types",
  "eez-control-rpc",
  "eez-protocol",
- "eez-prover",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tonic",

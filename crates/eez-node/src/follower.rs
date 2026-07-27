@@ -14,9 +14,9 @@
 
 use std::time::Duration;
 
+use crate::driver::{BlockCommitterHandle, ForkchoiceOutcome};
 use alloy_eips::{BlockNumHash, BlockNumberOrTag};
 use alloy_provider::{Provider, RootProvider};
-use eez_driver::{BlockCommitterHandle, ForkchoiceOutcome};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_primitives_traits::SealedHeader;
 use reth_storage_api::{BlockIdReader, HeaderProvider};
@@ -60,7 +60,7 @@ enum SafeCompat {
 /// Polls the sequencer RPC for unsafe heads and routes every engine call
 /// through the shared [`BlockCommitterHandle`].
 #[derive(Debug)]
-pub(crate) struct UnsafeHeadFollower<P> {
+pub struct UnsafeHeadFollower<P> {
     committer: BlockCommitterHandle<EthEngineTypes>,
     sequencer_rpc: RootProvider,
     /// Local chain reader: resolves the current safe anchor and the
@@ -75,7 +75,7 @@ impl<P> UnsafeHeadFollower<P>
 where
     P: HeaderProvider<Header = alloy_consensus::Header> + BlockIdReader,
 {
-    pub(crate) fn new(
+    pub fn new(
         committer: BlockCommitterHandle<EthEngineTypes>,
         sequencer_rpc: RootProvider,
         local: P,
@@ -90,7 +90,7 @@ where
         }
     }
 
-    pub(crate) async fn run(mut self) {
+    pub async fn run(mut self) {
         let mut poll = tokio::time::interval(self.poll_interval);
         let mut fcu_interval = tokio::time::interval(FCU_REFRESH);
         loop {

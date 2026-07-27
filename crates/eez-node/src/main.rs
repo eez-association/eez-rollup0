@@ -17,29 +17,23 @@
 //! | set | no | **follower** | reth + `L1Watcher` + Deriver (no Sequencer) |
 //! | set | yes | **composer** | reth + `L1Watcher` + Deriver + Sequencer (L1-anchored) + Composer umbrella |
 
-mod bundle_rpc;
-mod follower;
-mod ingress;
-mod l1_embedded;
-mod mock_prover;
-mod witness_source;
-
 use std::{collections::HashMap, env, str::FromStr, sync::Arc, time::Duration};
 
 use alloy_primitives::{Address, B256};
 use alloy_provider::RootProvider;
 use alloy_signer_local::PrivateKeySigner;
 use clap::Parser as _;
-use eez_composer::composer::CrossChainWiring;
-use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
-use eez_deriver::Deriver;
-use eez_driver::{
+use eez_node::composer::composer::CrossChainWiring;
+use eez_node::composer::{Composer, HeldPool, RollupConfig, RollupState};
+use eez_node::deriver::Deriver;
+use eez_node::driver::{
     EthAttributesBuilder, RollupTiming, Sequencer, SlotEvent, SyncSlotComposerHandle,
     spawn_interval, spawn_l1_anchored,
 };
-use eez_l1::{
+use eez_node::l1::{
     L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
 };
+use eez_node::{bundle_rpc, ingress, l1_embedded, mock_prover, witness_source};
 use mimalloc::MiMalloc;
 use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
 use reth_node_builder::components::BasicPayloadServiceBuilder;
@@ -47,10 +41,9 @@ use reth_node_ethereum::EthereumNode;
 use tokio::sync::mpsc;
 use tracing::{Level, event};
 
-use follower::UnsafeHeadFollower;
+use eez_node::follower::UnsafeHeadFollower;
 
-mod payload;
-use payload::EezPayloadBuilder;
+use eez_node::payload::EezPayloadBuilder;
 
 /// Per M-MIMALLOC-APPS — meaningful win on allocation-heavy workloads.
 #[global_allocator]
@@ -73,7 +66,7 @@ pub(crate) enum Mode {
 ///
 /// Downstream matches `.as_ref()` for the chain_spec / provider /
 /// evm_config to build the cross-chain composer; the Chiado provider
-/// goes through `eez_composer::GnosisL1Adapter` to translate
+/// goes through `eez_node::composer::GnosisL1Adapter` to translate
 /// `GnosisHeader → alloy_consensus::Header` on each read.
 enum EmbeddedL1<Dev, Chiado> {
     Dev(Dev),
@@ -260,7 +253,7 @@ fn main() -> eyre::Result<()> {
                         kind = "chiado",
                         l1_chain_id = %chiado_handle.node.chain_spec().inner.chain(),
                         "embedded L1 reth (chiado) ready — cross-chain composer \
-                         wraps the provider via eez_composer::GnosisL1Adapter",
+                         wraps the provider via eez_node::composer::GnosisL1Adapter",
                     );
                     Some(EmbeddedL1::Chiado(chiado_handle))
                 }
@@ -276,7 +269,7 @@ fn main() -> eyre::Result<()> {
             .with_types::<EthereumNode>()
             .with_components(
                 EthereumNode::components()
-                    .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder)),
+                    .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder::default())),
             )
             .with_add_ons(reth_node_ethereum::node::EthereumAddOns::default())
             .launch_with_debug_capabilities()
@@ -443,7 +436,7 @@ fn main() -> eyre::Result<()> {
                 l2_provider: Arc::new(provider.clone()),
                 l1_head: Arc::clone(&l1_head),
                 held_pool: held_pool_for_rollup,
-                optimistic: Arc::new(eez_composer::OptimisticallyIncluded::new()),
+                optimistic: Arc::new(eez_node::composer::OptimisticallyIncluded::new()),
             };
             let mut rollups = HashMap::with_capacity(1);
             rollups.insert(rollup_id, rollup_state);
@@ -488,7 +481,7 @@ fn main() -> eyre::Result<()> {
             );
             let evm_composer: Option<WiringParts> =
                 if let Some(l1_variant) = embedded_l1.as_ref() {
-                    use eez_composer::{GnosisL1Adapter, LocalChainClient};
+                    use eez_node::composer::{GnosisL1Adapter, LocalChainClient};
                     use eez_protocol::rollup_id::RollupId;
                     use eez_protocol::{ProxyLookupConfig, TargetConfig};
 
@@ -650,7 +643,7 @@ fn main() -> eyre::Result<()> {
             // into signed legacy L2 system txs at Sync-slot time.
             // Constructed only when EvmComposer is constructed —
             // both are tied to embedded L1 mode.
-            let cc_exec_ctx: Option<Arc<eez_composer::CrossChainExecCtx>> = if evm_composer
+            let cc_exec_ctx: Option<Arc<eez_node::composer::CrossChainExecCtx>> = if evm_composer
                 .is_some()
             {
                 let system_key = env::var("EEZ_L2_SYSTEM_KEY").map_err(|_| {
@@ -709,7 +702,7 @@ fn main() -> eyre::Result<()> {
                 // `eth_sendBundle` on relays that support it (rbuilder),
                 // ordered mempool submission on plain execution RPCs
                 // (dev reth, anvil) detected via JSON-RPC -32601.
-                Some(Arc::new(eez_composer::CrossChainExecCtx {
+                Some(Arc::new(eez_node::composer::CrossChainExecCtx {
                     system_signer,
                     ccm_l2_address,
                     l2_chain_id: chain_spec.chain().id(),
@@ -769,7 +762,7 @@ fn main() -> eyre::Result<()> {
                     // for near-empty blocks).
                     Some(Arc::new(witness_source::NodeWitnessSource::new(
                         store, ws_provider, ws_evm,
-                    )) as Arc<dyn eez_prover::ProvingWitnessSource>)
+                    )) as Arc<dyn eez_node::witness_source::ProvingWitnessSource>)
                 }
                 _ => None,
             };
@@ -950,13 +943,13 @@ fn main() -> eyre::Result<()> {
                 (
                     "EEZ_L1_XCHAIN_PORT",
                     "EEZ_L1_RPC_URL",
-                    eez_composer::Direction::Inbound,
+                    eez_node::composer::Direction::Inbound,
                     "eez-l1-xchain-front",
                 ),
                 (
                     "EEZ_L2_XCHAIN_PORT",
                     "EEZ_L2_RPC_URL",
-                    eez_composer::Direction::Outbound,
+                    eez_node::composer::Direction::Outbound,
                     "eez-l2-xchain-front",
                 ),
             ] {

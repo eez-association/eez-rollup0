@@ -1,14 +1,14 @@
 //! [`EezPayloadBuilder`] — drop-in replacement for
 //! [`reth_node_ethereum::EthereumPayloadBuilder`] that pins the payload
 //! builder's `gas_limit` and `extra_data` to the shared
-//! [`eez_driver::BUILDER_GAS_LIMIT`] / [`eez_driver::BUILDER_EXTRA_DATA`]
+//! [`crate::driver::BUILDER_GAS_LIMIT`] / [`crate::driver::BUILDER_EXTRA_DATA`]
 //! constants instead of reading reth's `--builder.gaslimit` /
 //! `--builder.extradata` CLI flags. The Deriver's `execute_block`
 //! reads the same constants, so the two block-construction paths can't
 //! drift via operator misconfiguration.
 
+use crate::driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT};
 use alloy_primitives::Bytes;
-use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT};
 use reth_ethereum_engine_primitives::{EthBuiltPayload, EthPayloadAttributes};
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::EthPrimitives;
