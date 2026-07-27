@@ -4,11 +4,9 @@ version.workspace      = true
 edition.workspace      = true
 license.workspace      = true
 rust-version.workspace = true
-description            = "Composer-controlled prover server: one Prove RPC — stage the window, native-validate re-execution, fail-closed settlement gates, ECDSA attestation."
+description            = "Composer-controlled prover: the prove.v1 wire contract, the RemoteProver client, and the daemon — one Prove RPC: stage the window, native-validate re-execution, fail-closed settlement gates, ECDSA attestation."
 
 [dependencies]
-# Prove wire (server side).
-eez-control-rpc.workspace = true
 # Gates + publicInputsHash recompute + EcdsaProofSigner.
 # RollupId for the inbound-outcome cross-chain hash binding.
 eez-protocol.workspace    = true
@@ -16,6 +14,8 @@ eez-protocol.workspace    = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace  = true
 alloy-rlp.workspace        = true
+# Encode ProvingContext.batch → postAndVerifyBatch calldata for the wire.
+alloy-sol-types.workspace  = true
 # Decode the window blocks' RLP for the system-tx / inbound gates.
 reth-ethereum-primitives.workspace = true
 reth-primitives-traits.workspace   = true
@@ -24,10 +24,25 @@ serde_json.workspace = true
 hex.workspace        = true
 clap  = { workspace = true, features = ["env"] }
 eyre.workspace       = true
+thiserror.workspace  = true
 tokio.workspace      = true
+tokio-stream.workspace = true
 tracing.workspace    = true
 tracing-subscriber           = { workspace = true, features = ["env-filter"] }
-tonic = { workspace = true, features = ["server"] }
+# tonic 0.14 split: "server" (the daemon hosts Prove) + "channel" (RemoteProver dials).
+tonic       = { workspace = true, features = ["server", "channel"] }
+tonic-prost = { workspace = true }
+prost       = { workspace = true }
+
+[build-dependencies]
+# Compiles `proto/prove.proto`. Needs `protoc` on PATH.
+tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+# In-process stub `Prove` server (tonic) + a signing key to exercise RemoteProver.
+tokio-stream                 = { workspace = true, features = ["net"] }
+alloy-signer.workspace       = true
+alloy-signer-local.workspace = true
 
 [lints]
 workspace = true

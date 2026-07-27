@@ -6,16 +6,14 @@
 //! attestation, verifies it recovers to the registered attester, and returns
 //! the 65-byte signature. Stateless: one round-trip, no feed/cursor/sink.
 
-#![cfg_attr(not(test), warn(unused_crate_dependencies))]
-
 use std::sync::Arc;
 
-use alloy_primitives::{Address, B256, Bytes, Signature};
-use alloy_sol_types::SolCall;
-use eez_control_rpc::v1::{
+use crate::control_rpc::v1::{
     BlockWitness as WireBlockWitness, ExecutionWitness as WireWitness, PostBatch, ProveChunk,
     ProveHeader, prove_chunk, prover_client::ProverClient,
 };
+use alloy_primitives::{Address, B256, Bytes, Signature};
+use alloy_sol_types::SolCall;
 use eez_protocol::ProvingContext;
 use tracing::{Level, event};
 
@@ -128,8 +126,8 @@ impl RemoteProver {
         let mut client = ProverClient::connect(self.inner.url.clone())
             .await
             .map_err(|e| ProverError::Backend(format!("connect {}: {e}", self.inner.url)))?
-            .max_encoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES)
-            .max_decoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES);
+            .max_encoding_message_size(crate::control_rpc::MAX_MESSAGE_BYTES)
+            .max_decoding_message_size(crate::control_rpc::MAX_MESSAGE_BYTES);
         let resp = client
             .prove(tokio_stream::iter(chunks))
             .await
@@ -208,13 +206,13 @@ fn verify_attestation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::address;
-    use alloy_signer::SignerSync;
-    use alloy_signer_local::PrivateKeySigner;
-    use eez_control_rpc::v1::{
+    use crate::control_rpc::v1::{
         ProveResponse,
         prover_server::{Prover as ProverService, ProverServer},
     };
+    use alloy_primitives::address;
+    use alloy_signer::SignerSync;
+    use alloy_signer_local::PrivateKeySigner;
     use std::str::FromStr;
     use tonic::{Request, Response, Status, Streaming, transport::Server};
 

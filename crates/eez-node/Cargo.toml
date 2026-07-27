@@ -7,9 +7,10 @@ rust-version.workspace = true
 description            = "eez Rollup-0 node — vanilla reth driven by an eez sequencer."
 
 [dependencies]
-eez-control-rpc.workspace   = true
 eez-protocol.workspace      = true
-eez-prover-client.workspace = true
+# RemoteProver + the prove.v1 wire types (the in-process mock prover
+# implements the same service).
+eez-proverd.workspace       = true
 
 # reth
 reth-chainspec.workspace                  = true

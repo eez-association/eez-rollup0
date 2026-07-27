@@ -6,8 +6,8 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::control_rpc::v1::ExecutionWitness;
 use alloy_primitives::{Address, B256};
-use eez_control_rpc::v1::ExecutionWitness;
 use eez_protocol::entries::decode_postbatch;
 use eez_protocol::public_inputs::public_inputs_hashes;
 use eez_protocol::settlement::{is_system_tx, pair_end_positions};
@@ -16,14 +16,15 @@ use tracing::{info, warn};
 /// One staged window block the server hands `validate_window`: the composer's
 /// claimed block hash, the consensus RLP, and the augmented witness. (Replaces
 /// the old feed `ControlEvent` — same fields the staging path reads.)
-pub(crate) struct StagedBlock {
+#[derive(Debug)]
+pub struct StagedBlock {
     pub number: u64,
     pub hash: Vec<u8>,
     pub rlp: Vec<u8>,
     pub witness: Option<ExecutionWitness>,
 }
 
-pub(crate) fn witness_to_json(w: &ExecutionWitness) -> String {
+pub fn witness_to_json(w: &ExecutionWitness) -> String {
     let hexed = |v: &[Vec<u8>]| -> Vec<String> {
         v.iter().map(|b| format!("0x{}", hex::encode(b))).collect()
     };
@@ -36,9 +37,10 @@ pub(crate) fn witness_to_json(w: &ExecutionWitness) -> String {
     .to_string()
 }
 
-pub(crate) struct VerifiedWindow {
-    pub(crate) parent_state_root: B256,
-    pub(crate) final_state_root: B256,
+#[derive(Debug)]
+pub struct VerifiedWindow {
+    pub parent_state_root: B256,
+    pub final_state_root: B256,
     /// Every window block's PROVEN post-state root (re-executed `state_root`),
     /// in block order. Recognizes inter-block settlement boundaries the two
     /// top-level roots miss — chiefly the no-op leading-immediate entry's
@@ -46,16 +48,16 @@ pub(crate) struct VerifiedWindow {
     /// than just the Sync block. `None` if the validator omits the field (an
     /// older binary) — the interior gate then degrades to parent/final/per-tx
     /// recognition + the placeholder path (fail-closed, never falsely accepts).
-    pub(crate) per_block_roots: Option<Vec<B256>>,
+    pub per_block_roots: Option<Vec<B256>>,
     /// The Sync (last) block's per-tx re-executed roots (`pair_roots`), for the
     /// interior-boundaries gate. `None` if the validator omits them.
-    pub(crate) sync_per_tx_roots: Option<Vec<B256>>,
+    pub sync_per_tx_roots: Option<Vec<B256>>,
     /// The Sync block's per-tx re-executed receipt statuses, for the
     /// reverted-system-tx (#10) gate. `None` if the validator omits them.
-    pub(crate) sync_tx_statuses: Option<Vec<bool>>,
+    pub sync_tx_statuses: Option<Vec<bool>>,
     /// The Sync block's re-executed outbound `CrossChainCallExecuted` topic1
     /// hashes, filtered by native-validate to the EEZL2 emitter.
-    pub(crate) sync_outbound_call_hashes: Option<Vec<B256>>,
+    pub sync_outbound_call_hashes: Option<Vec<B256>>,
 }
 
 /// Wall-clock cap on the native-validate subprocess (env
@@ -72,7 +74,7 @@ fn validator_timeout() -> Duration {
 /// each verified block hash matches the composer-claimed one, and return the
 /// re-executed roots/per-tx data. Errors = the validator rejected the window
 /// (a real attester would refuse to sign).
-pub(crate) async fn validate_window(
+pub async fn validate_window(
     window: &[StagedBlock],
     validator_bin: &str,
     chain_config: &str,
@@ -276,8 +278,8 @@ pub(crate) async fn validate_window(
 /// - TIMELESS (blockNumber 0): the bound arm folds a composer-supplied L1
 ///   blockhash with NO independent L1 oracle here to check it. Refuse until
 ///   such an oracle exists.
-pub(crate) fn verify_settlement_public_inputs(
-    pb: &eez_control_rpc::v1::PostBatch,
+pub fn verify_settlement_public_inputs(
+    pb: &crate::control_rpc::v1::PostBatch,
     vkey: B256,
 ) -> eyre::Result<B256> {
     let batch = decode_postbatch(&pb.abi_calldata)
@@ -337,7 +339,7 @@ pub(crate) fn verify_settlement_public_inputs(
 /// (0xeeee..). Using 0xeeee misclassifies every system tx as a user tx, silently
 /// defeating the interior-boundary + reverted-system-tx gates that re-derive
 /// system flags from this block RLP.
-pub(crate) fn system_tx_flags_from_rlp(
+pub fn system_tx_flags_from_rlp(
     block_rlp: &[u8],
     ccm_l2_address: Address,
 ) -> eyre::Result<Vec<bool>> {
@@ -368,7 +370,7 @@ pub(crate) fn system_tx_flags_from_rlp(
 /// (the current validator always emits statuses; a missing list would otherwise
 /// silently disable a mandatory gate), and a count shorter than the tx count
 /// refuses too (drift).
-pub(crate) fn system_txs_succeeded(system_flags: &[bool], statuses: Option<&[bool]>) -> bool {
+pub fn system_txs_succeeded(system_flags: &[bool], statuses: Option<&[bool]>) -> bool {
     let Some(statuses) = statuses else {
         warn!(
             "validator emitted no per-tx statuses — REFUSING the window (mandatory gate cannot run)"
@@ -390,15 +392,13 @@ pub(crate) fn system_txs_succeeded(system_flags: &[bool], statuses: Option<&[boo
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SettlementKind {
+pub enum SettlementKind {
     Anchor,
     Outbound,
     Inbound,
 }
 
-pub(crate) fn classify_settlement_entry(
-    e: &eez_protocol::abi::ExecutionEntrySol,
-) -> SettlementKind {
+pub fn classify_settlement_entry(e: &eez_protocol::abi::ExecutionEntrySol) -> SettlementKind {
     if e.proxyEntryHash != B256::ZERO {
         SettlementKind::Inbound
     } else if !e.l2ToL1Calls.is_empty() {
@@ -408,7 +408,7 @@ pub(crate) fn classify_settlement_entry(
     }
 }
 
-pub(crate) fn settlement_effects_from_sync(
+pub fn settlement_effects_from_sync(
     system_flags: &[bool],
     per_tx_roots: &[B256],
 ) -> Option<Vec<(SettlementKind, B256)>> {
@@ -425,7 +425,7 @@ pub(crate) fn settlement_effects_from_sync(
         .collect()
 }
 
-pub(crate) fn verify_effect_prefix_roots(
+pub fn verify_effect_prefix_roots(
     entries: &[(SettlementKind, B256, B256)],
     system_flags: &[bool],
     per_tx_roots: Option<&[B256]>,
@@ -496,7 +496,7 @@ pub(crate) fn verify_effect_prefix_roots(
 /// double-match / unmatched). A `find_map` (first-only) would leave every
 /// delivery past the first completely ungated, so the gate consumes the whole
 /// vector.
-pub(crate) fn extract_inbounds(
+pub fn extract_inbounds(
     block_rlp: &[u8],
 ) -> eyre::Result<Vec<eez_protocol::entries::DecodedInbound>> {
     use alloy_consensus::Transaction as _;
@@ -571,7 +571,7 @@ pub(crate) fn extract_inbounds(
 /// L1 view (breaks the stateless-re-execution model) or carrying a runtime fact
 /// the composer can't know at compose time — so the strict M:M is the correct,
 /// sound gate here.
-pub(crate) fn multi_inbound_outcome_gate(
+pub fn multi_inbound_outcome_gate(
     batch: &eez_protocol::EvmBatch,
     sealed: &[eez_protocol::entries::DecodedInbound],
 ) -> Result<(), String> {
@@ -689,7 +689,7 @@ pub(crate) fn multi_inbound_outcome_gate(
 /// `eez_protocol::outbound_gate::verify_outbound_authorized` — the SAME check the
 /// deriver (A4) runs against its local replay receipts, so the prover and the
 /// follower cannot drift.
-pub(crate) fn verify_outbound_authorized(
+pub fn verify_outbound_authorized(
     batch: &eez_protocol::EvmBatch,
     observed_call_hashes: &[B256],
     l2_rollup_id: u64,
@@ -758,8 +758,8 @@ pub(crate) fn verify_outbound_authorized(
 /// it; for a single-chunk batch it equals `vw.parent_state_root`). The
 /// `interim_interior_root(r0, k)` placeholders fold `r0 == batch_anchor_root`,
 /// so they recompute correctly under a wide multi-chunk batch.
-pub(crate) fn verify_settlement_chain(
-    pb: &eez_control_rpc::v1::PostBatch,
+pub fn verify_settlement_chain(
+    pb: &crate::control_rpc::v1::PostBatch,
     vw: &VerifiedWindow,
     batch_anchor_root: B256,
     sync_block_rlp: &[u8],
@@ -935,7 +935,7 @@ mod tests {
     /// A minimal finalized PostBatch — one PS, one rollup, TIMELESS — mirroring
     /// eez-protocol's `carrier_batch` test helper, with the publicInputsHash the
     /// composer would claim for the given `vkey`.
-    fn carrier_post_batch(vkey: B256) -> eez_control_rpc::v1::PostBatch {
+    fn carrier_post_batch(vkey: B256) -> crate::control_rpc::v1::PostBatch {
         let mut batch = EvmBatch::default();
         batch.blockNumber = 0; // timeless
         batch.proofSystems = vec![address!("00000000000000000000000000000000000000aa")];
@@ -944,7 +944,7 @@ mod tests {
             proofSystemIndex: vec![0],
         }];
         let claimed = public_inputs_hashes(&batch, vkey, None).unwrap()[0];
-        eez_control_rpc::v1::PostBatch {
+        crate::control_rpc::v1::PostBatch {
             abi_calldata: encode_postbatch(&batch),
             public_inputs_hash: claimed.to_vec(),
             l1_block_hash: Vec::new(),
@@ -1351,7 +1351,7 @@ mod tests {
         let raw = std::fs::read_to_string(path).expect("embedded fixture postbatch-13.json");
         let j: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let dec = |k: &str| hex::decode(j[k].as_str().unwrap().trim_start_matches("0x")).unwrap();
-        let pb = eez_control_rpc::v1::PostBatch {
+        let pb = crate::control_rpc::v1::PostBatch {
             abi_calldata: dec("abi_calldata"),
             public_inputs_hash: dec("public_inputs_hash"),
             l1_block_hash: dec("l1_block_hash"), // 0x → empty → timeless
@@ -1368,7 +1368,7 @@ mod tests {
     #[test]
     fn malformed_calldata_fails_closed() {
         // Garbage abi_calldata can't decode → refused, not panicked.
-        let pb = eez_control_rpc::v1::PostBatch {
+        let pb = crate::control_rpc::v1::PostBatch {
             abi_calldata: vec![0xde, 0xad, 0xbe, 0xef],
             public_inputs_hash: B256::ZERO.to_vec(),
             ..Default::default()
@@ -1395,7 +1395,7 @@ mod tests {
     /// A PostBatch whose decoded batch carries `deltas` as the Position-B chain
     /// (one delta per entry). Clones the fixture entry/delta (ExecutionEntrySol
     /// has no Default) and overrides only the rollupId + the two roots.
-    fn post_batch_with_chain(deltas: &[(u64, B256, B256)]) -> eez_control_rpc::v1::PostBatch {
+    fn post_batch_with_chain(deltas: &[(u64, B256, B256)]) -> crate::control_rpc::v1::PostBatch {
         let template = fixture_batch().entries[0].clone();
         let template_delta = template.stateDeltas[0].clone();
         let mut batch = EvmBatch::default();
@@ -1411,7 +1411,7 @@ mod tests {
                 e
             })
             .collect();
-        eez_control_rpc::v1::PostBatch {
+        crate::control_rpc::v1::PostBatch {
             abi_calldata: encode_postbatch(&batch),
             ..Default::default()
         }
@@ -1678,7 +1678,7 @@ mod tests {
             std::fs::read_to_string(format!("{dir}/postbatch-13.json")).expect("fixture json");
         let j: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let dec = |k: &str| hex::decode(j[k].as_str().unwrap().trim_start_matches("0x")).unwrap();
-        let pb = eez_control_rpc::v1::PostBatch {
+        let pb = crate::control_rpc::v1::PostBatch {
             abi_calldata: dec("abi_calldata"),
             ..Default::default()
         };

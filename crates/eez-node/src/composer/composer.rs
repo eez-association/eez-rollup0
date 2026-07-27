@@ -30,7 +30,7 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider as _;
 use async_trait::async_trait;
 use eez_protocol::BlockWitness;
-use eez_prover_client::RemoteProver;
+use eez_proverd::client::RemoteProver;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};

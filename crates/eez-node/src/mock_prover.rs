@@ -10,11 +10,11 @@
 
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
-use eez_control_rpc::v1::{
+use eez_protocol::MOCK_PROVER_DIGEST;
+use eez_proverd::control_rpc::v1::{
     ProveChunk, ProveResponse,
     prover_server::{Prover as ProverService, ProverServer},
 };
-use eez_protocol::MOCK_PROVER_DIGEST;
 use tonic::{Request, Response, Status, Streaming, transport::Server};
 use tracing::{Level, event};
 
@@ -67,8 +67,8 @@ pub async fn spawn(signer: PrivateKeySigner) -> eyre::Result<String> {
         if let Err(e) = Server::builder()
             .add_service(
                 ProverServer::new(MockProverService { signer })
-                    .max_decoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES)
-                    .max_encoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES),
+                    .max_decoding_message_size(eez_proverd::control_rpc::MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(eez_proverd::control_rpc::MAX_MESSAGE_BYTES),
             )
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await

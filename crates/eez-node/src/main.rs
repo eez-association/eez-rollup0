@@ -412,7 +412,7 @@ fn main() -> eyre::Result<()> {
                     })?;
                     let attester = Address::from_str(attester.trim())
                         .map_err(|e| eyre::eyre!("EEZ_ATTESTER_ADDRESS: {e}"))?;
-                    eez_prover_client::RemoteProver::new(url, attester)
+                    eez_proverd::client::RemoteProver::new(url, attester)
                 }
                 Err(_) => {
                     let key = env::var("EEZ_PROOF_SIGNER_KEY").map_err(|_| {
@@ -423,7 +423,7 @@ fn main() -> eyre::Result<()> {
                     )?)?;
                     let attester = signer.address();
                     let url = mock_prover::spawn(signer).await?;
-                    eez_prover_client::RemoteProver::new(url, attester)
+                    eez_proverd::client::RemoteProver::new(url, attester)
                 }
             };
             let rollup_id = rollup_config.rollup_id;

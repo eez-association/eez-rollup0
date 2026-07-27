@@ -10,17 +10,17 @@
 //! never signs state it did not re-execute (an un-validated signer would attest
 //! composer-supplied roots).
 
-mod gates;
+use eez_proverd::gates;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
 use clap::Parser;
-use eez_control_rpc::v1::{
+use eez_protocol::EcdsaProofSigner;
+use eez_proverd::control_rpc::v1::{
     ProveChunk, ProveResponse, prove_chunk, prover_server::Prover, prover_server::ProverServer,
 };
-use eez_protocol::EcdsaProofSigner;
 use tonic::{Request, Response, Status, Streaming, transport::Server};
 use tracing::{Level, event};
 
@@ -242,8 +242,8 @@ async fn main() -> eyre::Result<()> {
             // Match the client's raised caps: a busy block's witness can exceed
             // tonic's 4 MiB default → `ResourceExhausted`.
             ProverServer::new(svc)
-                .max_decoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES)
-                .max_encoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES),
+                .max_decoding_message_size(eez_proverd::control_rpc::MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(eez_proverd::control_rpc::MAX_MESSAGE_BYTES),
         )
         .serve(args.listen_addr)
         .await?;

@@ -3083,16 +3083,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eez-control-rpc"
-version = "0.1.0"
-dependencies = [
- "prost",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
-]
-
-[[package]]
 name = "eez-node"
 version = "0.1.0"
 dependencies = [
@@ -3115,9 +3105,8 @@ dependencies = [
  "async-trait",
  "clap",
  "dotenvy",
- "eez-control-rpc",
  "eez-protocol",
- "eez-prover-client",
+ "eez-proverd",
  "eyre",
  "fail",
  "gnosis-primitives",
@@ -3195,39 +3184,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "eez-prover-client"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "alloy-signer",
- "alloy-signer-local",
- "alloy-sol-types",
- "eez-control-rpc",
- "eez-protocol",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
-]
-
-[[package]]
 name = "eez-proverd"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
  "alloy-rlp",
+ "alloy-signer",
+ "alloy-signer-local",
+ "alloy-sol-types",
  "clap",
- "eez-control-rpc",
  "eez-protocol",
  "eyre",
  "hex",
+ "prost",
  "reth-ethereum-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-primitives-traits",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
  "tracing",
  "tracing-subscriber 0.3.23",
 ]
