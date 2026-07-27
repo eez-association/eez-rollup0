@@ -38,6 +38,11 @@ There's no separate L1 node to run. Cross-chain batches are submitted to
 Chiado's block builder; the L1 block to aim them at is read from the embedded
 L1 once it has caught up to the chain tip.
 
+> **One command** (after the one-time setup): `bash scripts/chiado-up.sh`
+> deploys the protocol, verifies the contracts on Blockscout, prepares the
+> datadirs, starts the stack, waits until it's healthy, and prints the RPC
+> URLs. The numbered steps below are that same flow done by hand.
+
 ### One-time setup
 
 ```bash
@@ -102,16 +107,50 @@ cast block-number --rpc-url http://localhost:18645   # embedded chiado L1 climbi
 cast block-number --rpc-url http://localhost:18688   # L2 producing
 ```
 
+### Endpoints & cross-chain fronts
+
+| Endpoint | URL | Use |
+|---|---|---|
+| L2 RPC | `http://localhost:18688` | L2 `eth_*` |
+| Embedded chiado L1 RPC | `http://localhost:18645` | L1 `eth_*` (the composer's L1 view) |
+| **L1→L2 front** (Inbound) | `http://localhost:18999` | send L1-origin cross-chain txs here |
+| **L2→L1 front** (Outbound) | `http://localhost:18998` | send L2-origin cross-chain txs here |
+
+The two **cross-chain ingress fronts** are transparent proxies:
+`eth_sendRawTransaction` sent to a front is held and composed into the next Sync
+block; every other `eth_*` is forwarded to that front's source-chain RPC. They
+are enabled by the compose env `EEZ_L1_XCHAIN_PORT` / `EEZ_L2_XCHAIN_PORT`
+(**unset ⇒ that front is disabled** — there is no default port). Upstreams are
+`EEZ_L1_RPC_URL` / `EEZ_L2_RPC_URL` respectively.
+
+`EEZ_MAX_USER_TXS_PER_BUNDLE` (compose, default `3`) caps how many user
+cross-chain txs ride in one `postBatch` bundle. Raise it only against a builder
+proven to include larger bundles atomically — rbuilder-chiado silently drops the
+excess beyond ~3, which is lost tx inclusion, so measure before bumping.
+
 ### Exercise it
 
-Deploys a `Value` test contract and its cross-chain proxies, fires several
-rounds of cross-chain setter/deposit calls at the running node, then checks
-that L1 and L2 agree on the state root and that the calls actually took
-effect:
+`scripts/xchain-test.sh` is the cross-chain test driver (new-format successor to
+`devnet-test.sh`). It deploys fresh targets/proxies/wrappers, drives the ingress
+fronts through **both directions × all op types** (`setValue` / `setValueNoRet` /
+`deposit` / `withdraw`) × **direct + wrapper**, then checks L1↔L2 reconciliation +
+semantic effects and reports pipeline metrics (N+1 next-slot hit-rate,
+consecutive-L1-slot landing, bundle drops/evictions, divergence). Every run mints
+recipients + senders fresh, so re-runs never collide with stale state.
 
 ```bash
-EEZ_WAVE_COUNT=5 bash scripts/devnet-test.sh
+# MATRIX (default): waves of the full cross-chain matrix + pure-L2 + poison
+EEZ_WAVE_COUNT=5 bash scripts/xchain-test.sh
+
+# LOAD: high volume from distinct fresh senders, optionally paced + node restart
+EEZ_MODE=load EEZ_IN_N=100 EEZ_OUT_N=100 bash scripts/xchain-test.sh            # burst
+EEZ_MODE=load EEZ_IN_N=100 EEZ_OUT_N=100 EEZ_PACE_N=10 EEZ_PACE_INTERVAL=10 \
+  bash scripts/xchain-test.sh                                                  # ~1 tx/s
+EEZ_RESTART=1 EEZ_MODE=load ... bash scripts/xchain-test.sh                    # restart mid-run
 ```
+
+(`scripts/devnet-test.sh` is the earlier, simpler driver — setter+deposit only,
+raw-RPC — kept for reference.)
 
 ## Build, test, teardown
 

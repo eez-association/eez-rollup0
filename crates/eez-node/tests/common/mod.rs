@@ -14,7 +14,7 @@ use std::{
 
 use alloy_primitives::{Address, B256, U256, address, hex};
 use alloy_provider::{Provider, ProviderBuilder};
-use alloy_rpc_types_eth::TransactionRequest;
+use alloy_rpc_types_eth::{BlockNumHash, BlockNumberOrTag, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent, SolValue, sol};
 use anyhow::{Context, Result, anyhow, bail};
@@ -49,6 +49,8 @@ pub const COMPOSER_INTERVAL_SINGLE: Duration = Duration::from_secs(1);
 /// Composer tick cadence for multi-composer contention — gives the
 /// deriver time to re-sync between ticks (1-tick-per-2-blocks ratio).
 pub const COMPOSER_INTERVAL_MULTI: Duration = Duration::from_secs(2);
+
+static LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -391,7 +393,7 @@ impl Harness {
                 self.dep.deploy_block.to_string(),
             ),
             (
-                "EEZ_MOCK_PROOF_SYSTEM_ADDRESS",
+                "EEZ_ECDSA_PROOF_SYSTEM_ADDRESS",
                 format!("{:#x}", self.dep.mock_ps_address),
             ),
             (
@@ -531,10 +533,6 @@ pub async fn send_l2_value_transfer(
     to: Address,
     value: U256,
 ) -> Result<alloy_primitives::TxHash> {
-    use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
-    use alloy_network::TxSignerSync;
-    use alloy_network::eip2718::Encodable2718;
-
     let signer: PrivateKeySigner = signing_key
         .strip_prefix("0x")
         .unwrap_or(signing_key)
@@ -570,6 +568,30 @@ pub async fn send_l2_value_transfer(
     Ok(hash)
 }
 
+/// Send one L2 value transfer and wait for its receipt. Use this when a test
+/// needs to prove a later L1 attestation includes a fresh L2 state transition.
+pub async fn send_l2_value_transfer_confirmed(
+    rpc_url: &str,
+    signing_key: &str,
+    to: Address,
+    value: U256,
+    timeout: Duration,
+) -> Result<alloy_primitives::TxHash> {
+    let hash = send_l2_value_transfer(rpc_url, signing_key, to, value).await?;
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    wait_for(timeout, || async {
+        let Some(receipt) = provider.get_transaction_receipt(hash).await? else {
+            return Ok(None);
+        };
+        if !receipt.status() {
+            bail!("L2 value transfer reverted: {hash}");
+        }
+        Ok(Some(()))
+    })
+    .await?;
+    Ok(hash)
+}
+
 /// Wait until `eth_blockNumber` responds at `rpc_url`. Used to confirm a
 /// just-spawned eez-node's L2 RPC is up before we send txs at it.
 pub async fn wait_for_l2_rpc(rpc_url: &str, timeout: Duration) -> Result<()> {
@@ -585,10 +607,22 @@ pub async fn wait_for_l2_rpc(rpc_url: &str, timeout: Duration) -> Result<()> {
 /// (genesis L1 derivation pending). Used by the multi-composer reorg
 /// test to verify both composers settle on the same canonical L2 head.
 pub async fn safe_block_state_root(rpc_url: &str) -> Result<Option<B256>> {
-    use alloy_rpc_types_eth::BlockNumberOrTag;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let block = provider.get_block_by_number(BlockNumberOrTag::Safe).await?;
+    let block = provider
+        .get_block_by_number(alloy_rpc_types_eth::BlockNumberOrTag::Safe)
+        .await?;
     Ok(block.map(|b| b.header.state_root))
+}
+
+/// Block number and hash at a named tag (`latest`, `safe`, `finalized`, …).
+/// `None` when no block exists at that tag yet.
+pub async fn block_number_and_hash_at(
+    rpc_url: &str,
+    tag: alloy_rpc_types_eth::BlockNumberOrTag,
+) -> Result<Option<(u64, B256)>> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let block = provider.get_block_by_number(tag).await?;
+    Ok(block.map(|b| (b.header.number, b.header.hash)))
 }
 
 /// Deploy `EEZ` + `MockECDSAProofSystem` + `Rollup`, then register the rollup.
@@ -749,8 +783,6 @@ pub struct NodeHandle {
     pub http_port: u16,
 }
 
-static LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
 #[derive(Default)]
 pub struct NodeConfig<'a> {
     /// Path to a custom genesis JSON. `None` uses `--chain dev`.
@@ -858,7 +890,9 @@ impl NodeHandle {
         cmd.env("EEZ_L1_HTTP_PORT", l1_http_port.to_string())
             .env("EEZ_L1_AUTH_PORT", l1_auth_port.to_string())
             .env("EEZ_L1_P2P_PORT", l1_p2p_port.to_string())
-            .env("EEZ_L1_DATADIR", &l1_datadir);
+            .env("EEZ_L1_DATADIR", &l1_datadir)
+            // May be overridden below when a test uses another L2 upstream.
+            .env("EEZ_L2_RPC_URL", format!("http://127.0.0.1:{http_port}"));
         for (k, v) in env {
             if *k == TEST_L2_GENESIS_ENV {
                 continue; // test-only marker (consumed as --chain above)
@@ -886,9 +920,19 @@ impl NodeHandle {
         env: &[(&'static str, String)],
     ) -> Result<Self> {
         let datadir = tempfile::tempdir().context("datadir tempdir")?;
-        let mut handle = Self::spawn_with(name, datadir.path(), cfg, env)?;
+        let mut handle = Self::start_with_datadir(name, datadir.path(), cfg, env).await?;
         handle.keep_alive.push(datadir);
-        wait_for_l2_rpc(&handle.l2_rpc_url(), Duration::from_secs(90)).await?;
+        Ok(handle)
+    }
+
+    pub async fn start_with_datadir(
+        name: &str,
+        datadir: &std::path::Path,
+        cfg: &NodeConfig<'_>,
+        env: &[(&'static str, String)],
+    ) -> Result<Self> {
+        let handle = Self::spawn_with(name, datadir, cfg, env)?;
+        wait_for_l2_rpc(&handle.l2_rpc_url(), Duration::from_secs(180)).await?;
         Ok(handle)
     }
 
@@ -944,6 +988,23 @@ impl NodeHandle {
         );
     }
 
+    pub fn assert_no_divergence_failure_logs(&self) {
+        let patterns = [
+            "Fatal",
+            "UnexpectedStaticFile",
+            "eez.deriver.state.diverged",
+            "local L2 state root differs",
+            "engine rejected safe/finalized FCU",
+            "payload builder returned no payload",
+        ];
+        assert_eq!(
+            self.log_count_matching(&patterns).unwrap(),
+            0,
+            "{} logged a divergence/fatal-class failure",
+            self.name,
+        );
+    }
+
     /// Count lines in `log_path` matching ANY of `patterns` (substring
     /// match). Used by the multi-composer reorg test to assert
     /// reorg handling on both composers AND zero `Fatal` /
@@ -963,6 +1024,84 @@ impl Drop for NodeHandle {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+pub async fn l2_block_by_tag(rpc_url: &str, tag: BlockNumberOrTag) -> Result<Option<BlockNumHash>> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let block = provider.get_block_by_number(tag).await?;
+    Ok(block.map(|b| BlockNumHash::new(b.header.number, b.header.hash)))
+}
+
+pub async fn l2_block_by_number(rpc_url: &str, number: u64) -> Result<Option<BlockNumHash>> {
+    l2_block_by_tag(rpc_url, BlockNumberOrTag::Number(number)).await
+}
+
+pub async fn latest_block_snapshot(node: &NodeHandle) -> Result<Option<BlockNumHash>> {
+    l2_block_by_tag(&node.l2_rpc_url(), BlockNumberOrTag::Latest).await
+}
+
+pub async fn wait_for_latest_height(
+    node: &NodeHandle,
+    min_height: u64,
+    timeout: Duration,
+) -> Result<BlockNumHash> {
+    wait_for(timeout, || async {
+        let latest = latest_block_snapshot(node).await?;
+        Ok(latest.filter(|b| b.number >= min_height))
+    })
+    .await
+}
+
+/// Wait until all nodes' safe tags have reached at least `min_height` and the
+/// nodes agree on the block hash at the common safe prefix height.
+///
+/// `min_height` is part of the test's contract: callers must choose a height
+/// above the stale/setup baseline for the scenario under test. Otherwise this
+/// helper could pass because every node still agrees on genesis or another old
+/// safe block, without proving the scenario actually advanced.
+pub async fn wait_for_safe_prefix_convergence(
+    nodes: &[&NodeHandle],
+    min_height: u64,
+    timeout: Duration,
+) -> Result<BlockNumHash> {
+    wait_for_tag_prefix_convergence(nodes, BlockNumberOrTag::Safe, min_height, timeout).await
+}
+
+async fn wait_for_tag_prefix_convergence(
+    nodes: &[&NodeHandle],
+    tag: BlockNumberOrTag,
+    min_height: u64,
+    timeout: Duration,
+) -> Result<BlockNumHash> {
+    wait_for(timeout, || async {
+        let mut tag_blocks = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let Some(block) = l2_block_by_tag(&node.l2_rpc_url(), tag).await? else {
+                return Ok(None);
+            };
+            tag_blocks.push(block);
+        }
+
+        let target = tag_blocks
+            .iter()
+            .map(|b| b.number)
+            .min()
+            .unwrap_or_default();
+        if target < min_height {
+            return Ok(None);
+        }
+
+        let mut blocks = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let Some(block) = l2_block_by_number(&node.l2_rpc_url(), target).await? else {
+                return Ok(None);
+            };
+            blocks.push(block);
+        }
+        let first = blocks[0];
+        Ok(blocks.iter().all(|b| b.hash == first.hash).then_some(first))
+    })
+    .await
 }
 
 pub async fn wait_for<F, Fut, T>(timeout: Duration, mut f: F) -> Result<T>
@@ -1126,6 +1265,11 @@ pub async fn count_events(
     Ok(logs.len())
 }
 
+/// Count `BatchPosted` events on the EEZ contract since `from_block`.
+pub async fn batches_posted(l1_rpc: &str, eez: Address, from_block: u64) -> Result<usize> {
+    count_events(l1_rpc, eez, IEEZ::BatchPosted::SIGNATURE_HASH, from_block).await
+}
+
 /// Return the `newState` of the latest `L2ExecutionPerformed` event
 /// emitted by `contract` for `rollup_id`, or `None` if none exist.
 /// Cross-checks the on-chain `stateRoot` against the per-batch event.
@@ -1200,6 +1344,105 @@ pub async fn wait_for_node_caught_up(
     .await
 }
 
+/// Wait until the node's safe `stateRoot` appears in the contract's
+/// `L2ExecutionPerformed` history for this `Chain` and differs from
+/// `genesis_root`. The attestation set grows monotonically, so this doesn't
+/// race the contract's advancing head: any past attestation matching the
+/// node's current safe head proves the node imported a block the contract
+/// has, at some point, declared canonical. Excluding `genesis_root` stops a
+/// node stuck at genesis from trivially passing by matching an empty-block
+/// attestation whose `newState` equals the registered initial state.
+pub async fn wait_for_safe_state(
+    node: &NodeHandle,
+    chain: &Chain<'_>,
+    genesis_root: B256,
+    timeout: Duration,
+) -> Result<()> {
+    wait_for(timeout, || async {
+        let node_root = async {
+            let provider = ProviderBuilder::new().connect_http(node.l2_rpc_url().parse()?);
+            let block = provider
+                .get_block_by_number(alloy_rpc_types_eth::BlockNumberOrTag::Safe)
+                .await?;
+            Ok::<Option<B256>, anyhow::Error>(block.map(|b| b.header.state_root))
+        }
+        .await
+        .ok()
+        .flatten();
+        let attested = chain.executed_states().await.unwrap_or_default();
+        Ok(match node_root {
+            Some(n) if n != B256::ZERO && n != genesis_root && attested.contains(&n) => Some(()),
+            _ => None,
+        })
+    })
+    .await
+}
+
+/// Wait until `node`'s safe block carries a state root that was not attested
+/// before the scenario and is now present in the contract's execution history.
+/// Returns that safe block's `(number, hash)` so peers can be checked against
+/// the exact block, not just a repeated state root.
+pub async fn wait_for_new_attested_safe_block(
+    node: &NodeHandle,
+    chain: &Chain<'_>,
+    previous_states: &[B256],
+    timeout: Duration,
+) -> Result<(u64, B256)> {
+    wait_for(timeout, || {
+        let rpc = node.l2_rpc_url();
+        async move {
+            let provider = ProviderBuilder::new().connect_http(rpc.parse()?);
+            let Some(block) = provider
+                .get_block_by_number(alloy_rpc_types_eth::BlockNumberOrTag::Safe)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let number = block.header.number;
+            let hash = block.header.hash;
+            let root = block.header.state_root;
+            if number == 0 || root == B256::ZERO || previous_states.contains(&root) {
+                return Ok(None);
+            }
+            let attested = chain.executed_states().await?;
+            Ok(attested.contains(&root).then_some((number, hash)))
+        }
+    })
+    .await
+}
+
+/// Wait until `node`'s safe chain includes `hash` at `number`.
+pub async fn wait_for_safe_chain_contains(
+    node: &NodeHandle,
+    number: u64,
+    hash: B256,
+    timeout: Duration,
+) -> Result<()> {
+    wait_for(timeout, || {
+        let rpc = node.l2_rpc_url();
+        async move {
+            let Some((safe_number, _)) =
+                block_number_and_hash_at(&rpc, alloy_rpc_types_eth::BlockNumberOrTag::Safe).await?
+            else {
+                return Ok(None);
+            };
+            if safe_number < number {
+                return Ok(None);
+            }
+            let Some((_, actual_hash)) = block_number_and_hash_at(
+                &rpc,
+                alloy_rpc_types_eth::BlockNumberOrTag::Number(number),
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+            Ok((actual_hash == hash).then_some(()))
+        }
+    })
+    .await
+}
+
 /// Return `env` with `key`'s value replaced by `value`. No-op if `key`
 /// isn't present.
 pub fn override_env(
@@ -1213,4 +1456,579 @@ pub fn override_env(
         }
     }
     env
+}
+
+// ─── Cross-chain devnet harness (embedded dev L1 as anchor) ───
+
+use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+use alloy_network::TxSignerSync;
+use alloy_network::eip2718::Encodable2718;
+
+/// Chain ID used by the embedded dev L1.
+pub const DEV_CHAIN_ID: u64 = 1337;
+
+pub const FIRST_ROLLUP_ID: u64 = 1;
+
+/// CCM-L2 predeploy address in the L2 fixture genesis.
+pub const CCM_L2_ADDRESS: Address = address!("0x4200000000000000000000000000000000000007");
+
+sol! {
+    #[sol(rpc)]
+    interface IEEZProxy {
+        event CrossChainProxyCreated(address indexed proxy, address indexed originalAddress, uint256 indexed originalRollupId);
+        function createCrossChainProxy(address originalAddress, uint256 originalRollupId) external returns (address proxy);
+    }
+    #[sol(rpc)]
+    interface ICCML2Proxy {
+        function createCrossChainProxy(address originalAddress, uint256 originalRollupId) external returns (address proxy);
+        function computeCrossChainProxyAddress(address originalAddress, uint256 originalRollupId) external view returns (address proxy);
+    }
+    #[sol(rpc)]
+    interface IValue {
+        function value() external view returns (uint256);
+        function setValue(uint256 v) external returns (bool changed, uint256 newValue);
+    }
+    #[sol(rpc)]
+    interface IValueNoRet {
+        function value() external view returns (uint256);
+        function setValue(uint256 v) external;
+    }
+    interface ISetterWrapper {
+        function setViaProxy(uint256 v) external;
+    }
+}
+
+/// L2 fixture genesis re-stamped to `ts` so the sequencer doesn't read a stale
+/// genesis as late. Timestamp is a header field, so `initialState` is unchanged.
+fn write_l2_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
+    write_fixture_genesis(ts, None, "l2-genesis.json")
+}
+
+/// L1 genesis for the embedded dev L1: the fixture genesis (all forks at 0,
+/// prefunded hardhat accounts) with the chain id overridden to [`DEV_CHAIN_ID`].
+/// reth's built-in dev.json carries no `config`, so serializing it would yield
+/// a forkless chain that can't mine EIP-1559 deploy txs — the fixture avoids that.
+fn write_l1_dev_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
+    write_fixture_genesis(ts, Some(DEV_CHAIN_ID), "l1-genesis.json")
+}
+
+/// Read the fixture genesis, re-stamp `ts`, optionally override the chain id,
+/// and write it to a fresh tempdir.
+fn write_fixture_genesis(
+    ts: u64,
+    chain_id: Option<u64>,
+    filename: &str,
+) -> Result<(PathBuf, tempfile::TempDir)> {
+    let raw = std::fs::read_to_string(reorg_genesis_path()).context("read fixture genesis")?;
+    let mut genesis: alloy_genesis::Genesis =
+        serde_json::from_str(&raw).context("parse fixture genesis")?;
+    genesis.timestamp = ts;
+    if let Some(id) = chain_id {
+        genesis.config.chain_id = id;
+    }
+    let dir = tempfile::tempdir().context("genesis tempdir")?;
+    let path = dir.path().join(filename);
+    std::fs::write(&path, serde_json::to_vec(&genesis)?).context("write genesis")?;
+    Ok((path, dir))
+}
+
+fn signer_of(key: &str) -> Result<PrivateKeySigner> {
+    key.strip_prefix("0x")
+        .unwrap_or(key)
+        .parse()
+        .context("parse signer key")
+}
+
+pub fn signer_address(key: &str) -> Result<Address> {
+    Ok(signer_of(key)?.address())
+}
+
+/// Sign and submit an EIP-1559 transaction. `to == None` is a CREATE.
+#[allow(clippy::too_many_arguments)]
+pub async fn sign_and_send(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    nonce: u64,
+    to: Option<Address>,
+    value: U256,
+    input: Vec<u8>,
+    gas_limit: u64,
+) -> Result<alloy_primitives::TxHash> {
+    let signer = signer_of(key)?;
+    let mut tx = TxEip1559 {
+        chain_id,
+        nonce,
+        gas_limit,
+        // Generous fee cap so txs stay includable as the composer's batches push
+        // base fee up; the 1 gwei priority stays below the composer's postBatch
+        // tip, so postBatch still orders ahead of user txs within an L1 block.
+        max_fee_per_gas: 100_000_000_000,
+        max_priority_fee_per_gas: 1_000_000_000,
+        to: to.map_or(
+            alloy_primitives::TxKind::Create,
+            alloy_primitives::TxKind::Call,
+        ),
+        value,
+        access_list: alloy_rpc_types_eth::AccessList::default(),
+        input: input.into(),
+    };
+    let sig = signer.sign_transaction_sync(&mut tx)?;
+    let env = TxEnvelope::from(tx.into_signed(sig));
+    let hash = *env.tx_hash();
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let _ = provider.send_raw_transaction(&env.encoded_2718()).await?;
+    Ok(hash)
+}
+
+pub async fn pending_nonce(rpc_url: &str, key: &str) -> Result<u64> {
+    let addr = signer_of(key)?.address();
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(provider.get_transaction_count(addr).await?)
+}
+
+async fn deploy_raw(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    artifact_path: &std::path::Path,
+    constructor_args: Vec<u8>,
+) -> Result<Address> {
+    let artifact: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(artifact_path)
+            .with_context(|| format!("read {}", artifact_path.display()))?,
+    )?;
+    let bytecode_hex = artifact["bytecode"]["object"]
+        .as_str()
+        .ok_or_else(|| anyhow!("bytecode.object missing in {}", artifact_path.display()))?
+        .strip_prefix("0x")
+        .unwrap_or_default();
+    let mut data = hex::decode(bytecode_hex).context("decode bytecode")?;
+    data.extend_from_slice(&constructor_args);
+
+    let nonce = pending_nonce(rpc_url, key).await?;
+    let hash = sign_and_send(
+        rpc_url,
+        key,
+        chain_id,
+        nonce,
+        None,
+        U256::ZERO,
+        data,
+        6_000_000,
+    )
+    .await?;
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let receipt = wait_for(Duration::from_secs(60), || {
+        let provider = provider.clone();
+        async move { Ok(provider.get_transaction_receipt(hash).await?) }
+    })
+    .await?;
+    if !receipt.status() {
+        bail!("deploy of {} reverted", artifact_path.display());
+    }
+    receipt
+        .contract_address
+        .ok_or_else(|| anyhow!("no contract_address for {}", artifact_path.display()))
+}
+
+/// Deploy EEZ + MockECDSAProofSystem + Rollup on the embedded dev L1 and
+/// register the rollup. Addresses are deterministic (`CREATE(deployer, 0/1/2)`).
+pub async fn deploy_protocol_dev(
+    l1_rpc: &str,
+    key: &str,
+    initial_state: B256,
+) -> Result<Deployment> {
+    let signer = signer_of(key)?;
+    let signer_addr = signer.address();
+    let out = repo_root().join("contracts/out");
+
+    let eez_address = deploy_raw(
+        l1_rpc,
+        key,
+        DEV_CHAIN_ID,
+        &out.join("EEZ.sol/EEZ.json"),
+        Vec::new(),
+    )
+    .await?;
+    let provider = ProviderBuilder::new().connect_http(l1_rpc.parse()?);
+    let deploy_block = provider.get_block_number().await?;
+
+    let mock_ps_address = deploy_raw(
+        l1_rpc,
+        key,
+        DEV_CHAIN_ID,
+        &out.join("MockECDSAProofSystem.sol/MockECDSAProofSystem.json"),
+        signer_addr.abi_encode(),
+    )
+    .await?;
+
+    let vkeys: Vec<B256> = vec![B256::from_slice(&{
+        let mut padded = [0u8; 32];
+        padded[12..].copy_from_slice(signer_addr.as_slice());
+        padded
+    })];
+    let rollup_manager_address = deploy_raw(
+        l1_rpc,
+        key,
+        DEV_CHAIN_ID,
+        &out.join("Rollup.sol/Rollup.json"),
+        (
+            eez_address,
+            signer_addr,
+            U256::from(1u64),
+            vec![mock_ps_address],
+            vkeys,
+        )
+            .abi_encode_params(),
+    )
+    .await?;
+
+    // registerRollup — a CALL, locally signed.
+    let calldata = IEEZ::registerRollupCall {
+        rollupContract: rollup_manager_address,
+        initialState: initial_state,
+    }
+    .abi_encode();
+    let nonce = pending_nonce(l1_rpc, key).await?;
+    let hash = sign_and_send(
+        l1_rpc,
+        key,
+        DEV_CHAIN_ID,
+        nonce,
+        Some(eez_address),
+        U256::ZERO,
+        calldata,
+        1_000_000,
+    )
+    .await?;
+    let receipt = wait_for(Duration::from_secs(60), || {
+        let provider = provider.clone();
+        async move { Ok(provider.get_transaction_receipt(hash).await?) }
+    })
+    .await?;
+    if !receipt.status() {
+        bail!("registerRollup reverted");
+    }
+    let registry = IEEZ::new(eez_address, &provider);
+    let rollup_id: u64 = registry.rollupCounter().call().await?.try_into()?;
+
+    Ok(Deployment {
+        eez_address,
+        deploy_block,
+        mock_ps_address,
+        rollup_manager_address,
+        rollup_id,
+    })
+}
+
+/// Deploy `Value(initial)` on L2.
+pub async fn deploy_value_l2(l2_rpc: &str, key: &str, initial: U256) -> Result<Address> {
+    let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
+    let l2_chain_id = provider.get_chain_id().await?;
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        l2_rpc,
+        key,
+        l2_chain_id,
+        &out.join("Value.sol/Value.json"),
+        initial.abi_encode(),
+    )
+    .await
+}
+
+/// Deploy `Value(initial)` on the embedded dev L1.
+pub async fn deploy_value_l1(l1_rpc: &str, key: &str, initial: U256) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        l1_rpc,
+        key,
+        DEV_CHAIN_ID,
+        &out.join("Value.sol/Value.json"),
+        initial.abi_encode(),
+    )
+    .await
+}
+
+pub async fn deploy_value_no_ret(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    initial: U256,
+) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("ValueNoRet.sol/ValueNoRet.json"),
+        initial.abi_encode(),
+    )
+    .await
+}
+
+pub async fn deploy_setter_wrapper(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    proxy: Address,
+) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("SetterWrapper.sol/SetterWrapper.json"),
+        proxy.abi_encode(),
+    )
+    .await
+}
+
+pub async fn value_no_ret(rpc_url: &str, value_addr: Address) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(IValueNoRet::new(value_addr, &provider)
+        .value()
+        .call()
+        .await?)
+}
+
+/// Create an outbound proxy through the CCM-L2 predeploy.
+pub async fn create_l2_cross_chain_proxy(
+    l2_rpc: &str,
+    key: &str,
+    target: Address,
+    original_rollup_id: u64,
+) -> Result<Address> {
+    let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
+    let ccm = ICCML2Proxy::new(CCM_L2_ADDRESS, &provider);
+    let proxy = ccm
+        .computeCrossChainProxyAddress(target, U256::from(original_rollup_id))
+        .call()
+        .await?;
+    let chain_id = provider.get_chain_id().await?;
+    let nonce = pending_nonce(l2_rpc, key).await?;
+    let hash = sign_and_send(
+        l2_rpc,
+        key,
+        chain_id,
+        nonce,
+        Some(CCM_L2_ADDRESS),
+        U256::ZERO,
+        ICCML2Proxy::createCrossChainProxyCall {
+            originalAddress: target,
+            originalRollupId: U256::from(original_rollup_id),
+        }
+        .abi_encode(),
+        1_500_000,
+    )
+    .await?;
+    let receipt = wait_for(Duration::from_secs(60), || {
+        let provider = provider.clone();
+        async move { Ok(provider.get_transaction_receipt(hash).await?) }
+    })
+    .await?;
+    if !receipt.status() {
+        bail!("create L2 cross-chain proxy reverted");
+    }
+    Ok(proxy)
+}
+
+/// Call `EEZ.createCrossChainProxy` on the L1 and return the deployed proxy
+/// address read from the `CrossChainProxyCreated` event. (We read it rather
+/// than predict it: the CREATE2 init code uses `type(CrossChainProxy).creationCode`
+/// embedded in EEZ, whose trailing solc metadata differs from the standalone
+/// artifact — so an off-chain prediction from the artifact wouldn't match.)
+pub async fn create_cross_chain_proxy(
+    l1_rpc: &str,
+    key: &str,
+    eez: Address,
+    target: Address,
+    rollup_id: u64,
+) -> Result<Address> {
+    let calldata = IEEZProxy::createCrossChainProxyCall {
+        originalAddress: target,
+        originalRollupId: U256::from(rollup_id),
+    }
+    .abi_encode();
+    let nonce = pending_nonce(l1_rpc, key).await?;
+    let hash = sign_and_send(
+        l1_rpc,
+        key,
+        DEV_CHAIN_ID,
+        nonce,
+        Some(eez),
+        U256::ZERO,
+        calldata,
+        2_000_000,
+    )
+    .await?;
+    let provider = ProviderBuilder::new().connect_http(l1_rpc.parse()?);
+    let receipt = wait_for(Duration::from_secs(60), || {
+        let provider = provider.clone();
+        async move { Ok(provider.get_transaction_receipt(hash).await?) }
+    })
+    .await?;
+    if !receipt.status() {
+        bail!("createCrossChainProxy reverted");
+    }
+    receipt
+        .inner
+        .logs()
+        .iter()
+        .find_map(|log| {
+            IEEZProxy::CrossChainProxyCreated::decode_log(&log.inner)
+                .ok()
+                .map(|e| e.proxy)
+        })
+        .ok_or_else(|| anyhow!("CrossChainProxyCreated event not found in receipt"))
+}
+
+pub async fn l2_value(l2_rpc: &str, value_addr: Address) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
+    Ok(IValue::new(value_addr, &provider).value().call().await?)
+}
+
+pub async fn l2_balance(l2_rpc: &str, addr: Address) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
+    Ok(provider.get_balance(addr).await?)
+}
+
+pub async fn receipt_ok(rpc_url: &str, hash: alloy_primitives::TxHash) -> Result<Option<bool>> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(provider
+        .get_transaction_receipt(hash)
+        .await?
+        .map(|r| r.status()))
+}
+
+/// Precomputed config for the embedded-dev-L1 devnet.
+pub struct DevnetCfg {
+    pub l1_http_port: u16,
+    pub l1_auth_port: u16,
+    pub l1_p2p_port: u16,
+    pub l1_xchain_port: u16,
+    pub l2_xchain_port: u16,
+    pub eez_address: Address,
+    pub mock_ps_address: Address,
+    pub rollup_manager_address: Address,
+    pub rollup_id: u64,
+    pub initial_state: B256,
+    /// Deploys contracts and signs proofs. Must differ from `poster_key` so
+    /// composer batch txs never bump the deployer nonce (which would break
+    /// deterministic `CREATE(deployer, 0/1/2)` address prediction).
+    pub deployer_key: &'static str,
+    pub poster_key: &'static str,
+    pub l1_genesis: (PathBuf, tempfile::TempDir),
+    pub l2_genesis: (PathBuf, tempfile::TempDir),
+}
+
+impl DevnetCfg {
+    pub fn new() -> Result<Self> {
+        let deployer_key = ANVIL_KEY_1;
+        let poster_key = ANVIL_KEY;
+        let deployer = signer_of(deployer_key)?.address();
+        // Deploy order: EEZ(0), MockPS(1), Rollup(2).
+        let eez_address = deployer.create(0);
+        let mock_ps_address = deployer.create(1);
+        let rollup_manager_address = deployer.create(2);
+        let initial_state = reorg_genesis_state_root()?;
+        let ts = now_unix_secs();
+        // Avoid http and ws (= http + 1) ports.
+        let l1_http_port = free_port();
+        let mut l1_auth_port = free_port();
+        while l1_auth_port == l1_http_port || l1_auth_port == l1_http_port.saturating_add(1) {
+            l1_auth_port = free_port();
+        }
+        Ok(Self {
+            l1_http_port,
+            l1_auth_port,
+            l1_p2p_port: free_port(),
+            l1_xchain_port: free_port(),
+            l2_xchain_port: free_port(),
+            eez_address,
+            mock_ps_address,
+            rollup_manager_address,
+            rollup_id: FIRST_ROLLUP_ID,
+            initial_state,
+            deployer_key,
+            poster_key,
+            l1_genesis: write_l1_dev_genesis_at(ts)?,
+            l2_genesis: write_l2_genesis_at(ts)?,
+        })
+    }
+
+    pub fn l1_rpc_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.l1_http_port)
+    }
+
+    /// L1 cross-chain front: a transparent proxy in front of the embedded L1
+    /// RPC that intercepts `eth_sendRawTransaction` and holds the tx for the
+    /// next Sync slot instead of forwarding it to the L1 mempool. Inbound
+    /// (L1→L2) cross-chain ops must be submitted here, not to `l1_rpc_url()`.
+    pub fn l1_xchain_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.l1_xchain_port)
+    }
+
+    /// L2 cross-chain front for outbound L2→L1 transactions.
+    pub fn l2_xchain_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.l2_xchain_port)
+    }
+
+    /// Environment for the embedded-L1 composer test node.
+    pub fn env(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("EEZ_L1_EMBEDDED", "1".to_string()),
+            ("EEZ_L1_CHAIN", "testing".to_string()),
+            ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
+            ("EEZ_L1_RPC_URL", self.l1_rpc_url()),
+            ("EEZ_L1_BUILDER_RPC_URL", self.l1_rpc_url()),
+            ("EEZ_L1_XCHAIN_PORT", self.l1_xchain_port.to_string()),
+            ("EEZ_L2_XCHAIN_PORT", self.l2_xchain_port.to_string()),
+            ("EEZ_L1_HTTP_PORT", self.l1_http_port.to_string()),
+            ("EEZ_L1_AUTH_PORT", self.l1_auth_port.to_string()),
+            ("EEZ_L1_P2P_PORT", self.l1_p2p_port.to_string()),
+            (
+                "EEZ_L1_CHAIN_PATH",
+                self.l1_genesis.0.to_string_lossy().into_owned(),
+            ),
+            ("EEZ_L1_POSTER_KEY", self.poster_key.to_string()),
+            // MockECDSA is constructed with the deployer address as the authorized signer.
+            ("EEZ_PROOF_SIGNER_KEY", self.deployer_key.to_string()),
+            ("EEZ_L2_SYSTEM_ADDRESS", format!("{ANVIL_ADDR:#x}")),
+            ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
+            ("EEZ_CCM_L2_ADDRESS", format!("{CCM_L2_ADDRESS:#x}")),
+            // K = 5: L1 5s, L2 1s.
+            ("EEZ_L1_BLOCK_TIME_MS", "5000".to_string()),
+            ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
+            ("EEZ_PROOF_TIME_MS", "1000".to_string()),
+            ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
+            ("EEZ_REGISTRY_ADDRESS", format!("{:#x}", self.eez_address)),
+            ("EEZ_REGISTRY_DEPLOY_BLOCK", "0".to_string()),
+            (
+                "EEZ_ECDSA_PROOF_SYSTEM_ADDRESS",
+                format!("{:#x}", self.mock_ps_address),
+            ),
+            (
+                "EEZ_ROLLUP_MANAGER_ADDRESS",
+                format!("{:#x}", self.rollup_manager_address),
+            ),
+            ("EEZ_ROLLUP_ID", self.rollup_id.to_string()),
+            ("EEZ_COMPOSER_INTERVAL_SECS", "1".to_string()),
+            ("EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES", "false".to_string()),
+            (
+                "EEZ_L2_DATADIR",
+                "/tmp/unused-overridden-by-flag".to_string(),
+            ),
+            // INFO on our crates so bundle events are visible for assertions.
+            (
+                "RUST_LOG",
+                std::env::var("EEZ_TEST_LOG")
+                    .unwrap_or_else(|_| "warn,eez_node=info,eez_l1=info".to_string()),
+            ),
+            (
+                TEST_L2_GENESIS_ENV,
+                self.l2_genesis.0.to_string_lossy().into_owned(),
+            ),
+        ]
+    }
 }

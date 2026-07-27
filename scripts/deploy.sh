@@ -107,15 +107,15 @@ echo "      deployBlock= $EEZ_REGISTRY_DEPLOY_BLOCK"
 echo "[2/4] DeployMockECDSAProofSystem(authorizedSigner=$AUTHORIZED_SIGNER)"
 run_forge "DeployMockECDSAProofSystem" forge script script/DeployMockECDSAProofSystem.s.sol:DeployMockECDSAProofSystem \
     --sig "run(address)" "$AUTHORIZED_SIGNER" $RPC $KEY --broadcast
-EEZ_MOCK_PROOF_SYSTEM_ADDRESS="$(extract MOCK_PS "$OUT")"
-[[ -n "$EEZ_MOCK_PROOF_SYSTEM_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture MOCK_PS address" >&2; exit 1; }
-echo "      MOCK_PS    = $EEZ_MOCK_PROOF_SYSTEM_ADDRESS"
+EEZ_ECDSA_PROOF_SYSTEM_ADDRESS="$(extract MOCK_PS "$OUT")"
+[[ -n "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture MOCK_PS address" >&2; exit 1; }
+echo "      MOCK_PS    = $EEZ_ECDSA_PROOF_SYSTEM_ADDRESS"
 
 # ── 3/4 DeployRollup ────────────────────────────────────────────────
 echo "[3/4] DeployRollup"
 run_forge "DeployRollup" forge script script/DeployRollup.s.sol:DeployRollup \
     --sig "run(address,address,address,address)" \
-    "$EEZ_REGISTRY_ADDRESS" "$EEZ_MOCK_PROOF_SYSTEM_ADDRESS" "$AUTHORIZED_SIGNER" "$OWNER" \
+    "$EEZ_REGISTRY_ADDRESS" "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS" "$AUTHORIZED_SIGNER" "$OWNER" \
     $RPC $KEY --broadcast
 EEZ_ROLLUP_MANAGER_ADDRESS="$(extract ROLLUP_CONTRACT "$OUT")"
 [[ -n "$EEZ_ROLLUP_MANAGER_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture ROLLUP_CONTRACT address" >&2; exit 1; }
@@ -193,7 +193,7 @@ cat > "$OUT_FILE" <<EOF
 
 EEZ_REGISTRY_ADDRESS=$EEZ_REGISTRY_ADDRESS
 EEZ_REGISTRY_DEPLOY_BLOCK=$EEZ_REGISTRY_DEPLOY_BLOCK
-EEZ_MOCK_PROOF_SYSTEM_ADDRESS=$EEZ_MOCK_PROOF_SYSTEM_ADDRESS
+EEZ_ECDSA_PROOF_SYSTEM_ADDRESS=$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS
 EEZ_ROLLUP_MANAGER_ADDRESS=$EEZ_ROLLUP_MANAGER_ADDRESS
 EEZ_ROLLUP_ID=$EEZ_ROLLUP_ID
 EEZ_INITIAL_STATE_ROOT=$EEZ_INITIAL_STATE_ROOT
@@ -217,71 +217,14 @@ echo
 echo "deploy: wrote $OUT_FILE"
 
 # ── Optional: Blockscout verification ────────────────────────────────
-# Best-effort: walk forge's broadcast/ for fresh CREATE entries and
-# submit each to Blockscout via `forge verify-contract`. Failures are
-# logged but never fail the deploy — Blockscout is an inspector tool,
-# not part of the protocol surface. Skipped silently if
-# `EEZ_BLOCKSCOUT_URL` isn't set or `jq` isn't installed. Dedup is
-# delegated to Blockscout (re-submitting an already-verified address
-# is a fast no-op for forge).
-verify_on_blockscout() {
-    [[ -n "${EEZ_BLOCKSCOUT_URL:-}" ]] || return 0
-    if ! command -v jq >/dev/null 2>&1; then
-        echo "blockscout: jq not found; skipping verification"
-        return 0
-    fi
-
-    local broadcast="$CONTRACTS/broadcast"
-    [[ -d "$broadcast" ]] || return 0
-
-    local chain
-    chain="$(cast chain-id --rpc-url "$EEZ_L1_RPC_URL" 2>/dev/null)" || return 0
-
-    echo
-    echo "blockscout: verifying via $EEZ_BLOCKSCOUT_URL (chain $chain)"
-
-    local count=0 fail=0 addr name
-    while IFS=$'\t' read -r addr name; do
-        [[ -z "$addr" || -z "$name" ]] && continue
-        count=$((count + 1))
-        if ( cd "$CONTRACTS" && forge verify-contract \
-                --watch --guess-constructor-args \
-                --rpc-url "$EEZ_L1_RPC_URL" \
-                --verifier blockscout \
-                --verifier-url "$EEZ_BLOCKSCOUT_URL/api/" \
-                "$addr" "$name" ) >/dev/null 2>&1
-        then
-            echo "  verified $name @ $addr"
-        else
-            fail=$((fail + 1))
-            echo "  failed   $name @ $addr"
-        fi
-    done < <(
-        # Filter to broadcasts under <script>/<chain_id>/run-latest.json
-        # that were rewritten by this deploy run (newer than START_MARKER)
-        # and whose <chain_id> matches the current L1 RPC. The chain-id
-        # filter handles people redeploying against a different L1; the
-        # -newer filter handles re-runs against the same chain (so we
-        # don't re-verify stale CREATE entries from prior deploys).
-        find "$broadcast" -name run-latest.json -newer "$START_MARKER" -print0 2>/dev/null \
-        | while IFS= read -r -d '' f; do
-            ch="$(basename "$(dirname "$f")")"
-            [[ "$ch" == "$chain" ]] || continue
-            jq -r '.transactions[]
-                   | select(.transactionType=="CREATE" or .transactionType=="CREATE2")
-                   | "\(.contractAddress)\t\(.contractName)"' "$f" 2>/dev/null
-        done
-    )
-
-    if (( count == 0 )); then
-        echo "  no fresh CREATE entries found"
-    elif (( fail == 0 )); then
-        echo "blockscout: $count/$count verified"
-    else
-        echo "blockscout: $((count - fail))/$count verified ($fail failed)"
-    fi
-}
-verify_on_blockscout || true
+# Delegated to scripts/verify-blockscout.sh (best-effort; no-op unless
+# EEZ_BLOCKSCOUT_URL is set). START_MARKER (created at script start)
+# scopes it to THIS run's fresh CREATE entries so a re-run doesn't
+# re-submit stale addresses. Never fails the deploy.
+echo
+EEZ_BLOCKSCOUT_URL="${EEZ_BLOCKSCOUT_URL:-}" EEZ_CONTRACTS_DIR="$CONTRACTS" \
+EEZ_L1_RPC_URL="$EEZ_L1_RPC_URL" \
+    "$REPO/scripts/verify-blockscout.sh" "$START_MARKER" || true
 
 echo
 echo "deploy: ready. \`make run-node\` will pick these up automatically."
