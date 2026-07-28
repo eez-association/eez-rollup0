@@ -114,14 +114,6 @@ impl Submitter {
         self.inner.config.poster.address()
     }
 
-    /// Configured L1 RPC URL. Exposed so callers (e.g. the deriver) can
-    /// build their own provider against the same node to fetch a tx by
-    /// hash and re-decode it under a different `sol!` view.
-    #[must_use]
-    pub fn rpc_url(&self) -> reqwest::Url {
-        self.inner.config.rpc_url.clone()
-    }
-
     /// Atomically bundle already-signed, 2718-encoded `raw_txs`
     /// (`[postBatch, user_tx_1, …]`, signed upstream) into one
     /// `eth_sendBundle` POST. Flashbots ordering: the bundle lands in
@@ -519,7 +511,7 @@ impl Inner {
 /// - [`L1Error::Provider`] on transport (DNS, TCP, JSON decode) failure.
 /// - [`L1Error::Submission`] when the relay HTTP status is non-2xx OR
 ///   the JSON body carries an `error` field.
-pub async fn post_bundle(
+async fn post_bundle(
     http: &reqwest::Client,
     builder_rpc_url: &str,
     raw_tx_hexes: &[&str],

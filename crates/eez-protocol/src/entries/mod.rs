@@ -45,18 +45,12 @@ pub enum CallKind {
     /// Reentrant cross-chain call which reverted (caught by try/catch
     /// in the caller) — routes to `lookupCalls[]` with `failed = true`.
     NestedFailed,
-    /// Cross-chain call observed inside a `STATICCALL` frame
-    /// (read-only) — routes to `lookupCalls[]` with `failed = false`.
-    Static,
 }
 
 impl CallKind {
     /// Classify a recorded call relative to `source_id` (the rollup
     /// whose batch is being built).
     fn classify(call: &ExecutedAction, source_id: RollupId) -> Self {
-        if call.static_meta.is_some() {
-            return Self::Static;
-        }
         if call.source_rollup_id == source_id {
             return Self::TopLevel;
         }
@@ -174,12 +168,6 @@ pub fn build_batch(
             CallKind::NestedFailed => {
                 return Err(crate::ProtocolErrorKind::Unsupported(
                     "nested failed cross-chain lookup: entry-scoped emission (5c51e02) not built",
-                )
-                .into());
-            }
-            CallKind::Static => {
-                return Err(crate::ProtocolErrorKind::Unsupported(
-                    "static cross-chain lookup: entry-scoped emission (5c51e02) not built",
                 )
                 .into());
             }
@@ -1336,7 +1324,6 @@ mod tests {
                 success,
             },
             revert_span: None,
-            static_meta: None,
         }
     }
 

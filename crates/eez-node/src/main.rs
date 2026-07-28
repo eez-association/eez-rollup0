@@ -29,6 +29,7 @@ use alloy_primitives::{Address, B256};
 use alloy_provider::RootProvider;
 use alloy_signer_local::PrivateKeySigner;
 use clap::Parser as _;
+use eez_composer::composer::CrossChainWiring;
 use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
 use eez_deriver::Deriver;
 use eez_driver::{
@@ -402,7 +403,7 @@ fn main() -> eyre::Result<()> {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(64);
             if depth != 0 {
-                sequencer = sequencer.with_speculative_limit(depth, Arc::clone(&l1_head) as _);
+                sequencer = sequencer.with_speculative_limit(depth, Arc::clone(&l1_head));
             }
         }
 
@@ -466,7 +467,6 @@ fn main() -> eyre::Result<()> {
             let held_pool_for_rollup = Some(Arc::clone(&held_pool));
             let rollup_state = RollupState {
                 config: rollup_config.clone(),
-                timing,
                 l2_provider: Arc::new(provider.clone()),
                 l1_head: Arc::clone(&l1_head),
                 held_pool: held_pool_for_rollup,
@@ -484,35 +484,19 @@ fn main() -> eyre::Result<()> {
             // up — it owns `LocalChainClient`s over L1 (entry) and L2
             // (follower). `None` without an embedded L1. Inlined because
             // the `FullNode` AddOns type resists a typed helper return.
-            // L2 ENTRY client for OUTBOUND (L2→L1) source-sim — built inside the
-            // block below alongside the L2 follower, threaded into `Composer::new`.
-            // `None` without an embedded L1 (outbound txs then evict at compose).
-            let mut l2_entry_client: Option<
-                Arc<
-                    dyn eez_protocol::executor::EntryChainClient
-                        + Send
-                        + Sync,
-                >,
-            > = None;
-            let evm_composer: Option<eez_protocol::Composer> =
+            let cross_chain: Option<CrossChainWiring> =
                 if let Some(l1_variant) = embedded_l1.as_ref() {
                     use eez_composer::{GnosisL1Adapter, LocalChainClient};
-                    use eez_protocol::{
-                        DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig, TargetConfig,
-                    };
-                    use eez_protocol::Composer as ProtocolComposer;
+                    use eez_protocol::{ProxyLookupConfig, TargetConfig};
                     use eez_protocol::rollup_id::RollupId;
 
                     let eez_registry: Address = Address::from_str(&env::var("EEZ_REGISTRY_ADDRESS").map_err(
                         |_| eyre::eyre!("EEZ_REGISTRY_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
                     )?)?;
+
                     let ccm_l2: Address = Address::from_str(&env::var("EEZ_CCM_L2_ADDRESS").map_err(
                         |_| eyre::eyre!("EEZ_CCM_L2_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
                     )?)?;
-                    let l2_system_address: Address = env::var("EEZ_L2_SYSTEM_ADDRESS")
-                        .ok()
-                        .and_then(|s| Address::from_str(&s).ok())
-                        .unwrap_or(Address::ZERO);
                     let l1_rollup_id_u64 = read_l1_rollup_id();
                     let l1_rollup_id = RollupId(l1_rollup_id_u64);
                     let l2_rollup_id_typed = RollupId(rollup_id);
@@ -523,37 +507,29 @@ fn main() -> eyre::Result<()> {
                     // over the chiado ChainSpec (source-sim needs only
                     // revm, not GnosisNode's AuRa paths). Both yield the
                     // same erased views, so composition is identical.
-                    let (entry_client_view, root_reader_view) = match l1_variant {
+                    let entry_client_view = match l1_variant {
                         EmbeddedL1::Ethereum(l1_handle) => {
-                            let l1_chain_spec = l1_handle.node.chain_spec();
                             let l1_provider = l1_handle.node.provider.clone();
                             let l1_evm_config = l1_handle.node.evm_config.clone();
                             let entry_client = LocalChainClient::new_entry(
                                 l1_provider,
                                 l1_evm_config,
-                                l1_chain_spec,
                                 l1_rollup_id,
                                 eez_registry,
                                 eez_registry,
                                 eez_protocol::ChainDialect::EvmL1Style,
                             );
                             let entry_view: std::sync::Arc<
-                                dyn eez_protocol::executor::EntryChainClient
+                                dyn eez_protocol::executor::ChainClient
                                     + Send
                                     + Sync,
                             > = entry_client.clone();
-                            let root_view: std::sync::Arc<
-                                dyn eez_protocol::executor::CommittedRootReader
-                                    + Send
-                                    + Sync,
-                            > = entry_client.clone();
-                            (entry_view, root_view)
+                            entry_view
                         }
                         EmbeddedL1::Chiado(chiado_handle) => {
                             // `GnosisChainSpec.inner` is the standard
                             // reth `ChainSpec` (via `#[deref]`); wrap it
-                            // fresh as `Arc<ChainSpec>` for both the
-                            // LocalChainClient chain_spec slot and the
+                            // fresh as `Arc<ChainSpec>` for the
                             // standard `EthEvmConfig` simulation envs.
                             let gnosis_chain_spec = chiado_handle.node.chain_spec();
                             let l1_chain_spec: Arc<reth_chainspec::ChainSpec> =
@@ -566,23 +542,17 @@ fn main() -> eyre::Result<()> {
                             let entry_client = LocalChainClient::new_entry(
                                 l1_provider,
                                 l1_evm_config,
-                                l1_chain_spec,
                                 l1_rollup_id,
                                 eez_registry,
                                 eez_registry,
                                 eez_protocol::ChainDialect::EvmL1Style,
                             );
                             let entry_view: std::sync::Arc<
-                                dyn eez_protocol::executor::EntryChainClient
+                                dyn eez_protocol::executor::ChainClient
                                     + Send
                                     + Sync,
                             > = entry_client.clone();
-                            let root_view: std::sync::Arc<
-                                dyn eez_protocol::executor::CommittedRootReader
-                                    + Send
-                                    + Sync,
-                            > = entry_client.clone();
-                            (entry_view, root_view)
+                            entry_view
                         }
                     };
 
@@ -592,7 +562,6 @@ fn main() -> eyre::Result<()> {
                     let l2_follower = LocalChainClient::new_follower(
                         provider.clone(),
                         evm_config.clone(),
-                        chain_spec.clone(),
                         l2_rollup_id_typed,
                         ccm_l2,
                         ccm_l2,
@@ -610,77 +579,43 @@ fn main() -> eyre::Result<()> {
                     let l2_entry = LocalChainClient::new_entry(
                         provider.clone(),
                         evm_config.clone(),
-                        chain_spec.clone(),
                         l2_rollup_id_typed,
                         ccm_l2,
                         ccm_l2,
                         eez_protocol::ChainDialect::EvmL2Style,
                     );
                     let l2_entry_view: std::sync::Arc<
-                        dyn eez_protocol::executor::EntryChainClient
+                        dyn eez_protocol::executor::ChainClient
                             + Send
                             + Sync,
                     > = l2_entry;
-                    l2_entry_client = Some(l2_entry_view);
 
                     let entry_cfg = TargetConfig {
-                        ccm_address: eez_registry,
-                        system_address: Address::ZERO, // entry has no system-tx CCM path
-                        ccm_gas_limit: DEFAULT_CCM_GAS_LIMIT,
                         proxy_lookup: ProxyLookupConfig {
                             contract_address: eez_registry,
                             authorized_proxies_slot: eez_protocol::ChainDialect::EvmL1Style
                                 .proxy_lookup_slot(),
                         },
                         dialect: eez_protocol::ChainDialect::EvmL1Style,
-                        settles_via_session_root: false,
                     };
                     let l2_follower_cfg = TargetConfig {
-                        ccm_address: ccm_l2,
-                        system_address: l2_system_address,
-                        ccm_gas_limit: DEFAULT_CCM_GAS_LIMIT,
                         proxy_lookup: ProxyLookupConfig {
                             contract_address: ccm_l2,
                             authorized_proxies_slot: eez_protocol::ChainDialect::EvmL2Style
                                 .proxy_lookup_slot(),
                         },
                         dialect: eez_protocol::ChainDialect::EvmL2Style,
-                        settles_via_session_root: false,
                     };
 
-                    let composed = ProtocolComposer::builder(l1_rollup_id)
-                        .entry(entry_client_view, entry_cfg)
-                    .root_reader(root_reader_view)
-                    .rollup(l2_rollup_id_typed, l2_follower_view, l2_follower_cfg)
-                    .build()
-                    .map_err(|e| eyre::eyre!("cross-chain composer build failed: {e}"))?;
-                    event!(
-                        name: "eez.node.evm_composer.ready",
-                        Level::INFO,
-                        l1_rollup_id = l1_rollup_id_u64,
-                        l2_rollup_id = rollup_id,
-                        eez_registry = %eez_registry,
-                        ccm_l2 = %ccm_l2,
-                        "cross-chain composer constructed (L1 entry + L2 follower)",
-                    );
-                    Some(composed)
-                } else {
-                    event!(
-                        name: "eez.node.evm_composer.skipped",
-                        Level::WARN,
-                        "embedded L1 not active; cross-chain EvmComposer disabled",
-                    );
-                    None
-                };
-
+                    let mut wired_rollups = std::collections::HashMap::new();
+                    wired_rollups
+                        .insert(l1_rollup_id, (Arc::clone(&entry_client_view), entry_cfg));
+                    wired_rollups.insert(l2_rollup_id_typed, (l2_follower_view, l2_follower_cfg));
             // CrossChainExecCtx: signer + L2 addresses needed to wrap
             // EvmComposer's `(load_table, execute)` calldata pairs
             // into signed legacy L2 system txs at Sync-slot time.
             // Constructed only when EvmComposer is constructed —
             // both are tied to embedded L1 mode.
-            let cc_exec_ctx: Option<Arc<eez_composer::CrossChainExecCtx>> = if evm_composer
-                .is_some()
-            {
                 let system_key = env::var("EEZ_L2_SYSTEM_KEY").map_err(|_| {
                     eyre::eyre!("EEZ_L2_SYSTEM_KEY required when the cross-chain composer is wired")
                 })?;
@@ -715,12 +650,6 @@ fn main() -> eyre::Result<()> {
                         )
                     })?,
                 )?;
-                let l2_rollup_id_for_ctx: u64 = env::var("EEZ_ROLLUP_ID")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| {
-                        eyre::eyre!("EEZ_ROLLUP_ID required for L1 postBatch rollupIdsWithProofSystems[]")
-                    })?;
                 // L1 chainId queried from the provider would be more
                 // robust, but pulling it out of env keeps the ctx
                 // construction sync. Embedded reth `--chain dev` is
@@ -729,6 +658,12 @@ fn main() -> eyre::Result<()> {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(1337);
+                let l2_rollup_id_for_ctx: u64 = env::var("EEZ_ROLLUP_ID")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| {
+                        eyre::eyre!("EEZ_ROLLUP_ID required for L1 postBatch rollupIdsWithProofSystems[]")
+                    })?;
                 // 10 gwei comfortably exceeds the smoke user_tx's
                 // 2-gwei priority fee, so dev-reth's payload builder
                 // orders postBatch ahead of the user_tx within the
@@ -743,7 +678,7 @@ fn main() -> eyre::Result<()> {
                 // `eth_sendBundle` on relays that support it (rbuilder),
                 // ordered mempool submission on plain execution RPCs
                 // (dev reth, anvil) detected via JSON-RPC -32601.
-                Some(Arc::new(eez_composer::CrossChainExecCtx {
+                let exec_ctx = Arc::new(eez_composer::CrossChainExecCtx {
                     system_signer,
                     ccm_l2_address,
                     l2_chain_id: chain_spec.chain().id(),
@@ -756,15 +691,38 @@ fn main() -> eyre::Result<()> {
                     l1_post_batch_priority_fee,
                     ecdsa_proof_system_address,
                     l2_rollup_id: l2_rollup_id_for_ctx,
-                }))
-            } else {
-                None
-            };
+                });
+                    event!(
+                        name: "eez.node.evm_composer.ready",
+                        Level::INFO,
+                        l1_rollup_id = l1_rollup_id_u64,
+                        l2_rollup_id = rollup_id,
+                        eez_registry = %eez_registry,
+                        ccm_l2 = %ccm_l2,
+                        "cross-chain composer constructed (L1 entry + L2 follower)",
+                    );
+                    Some(CrossChainWiring {
+                        entry_rollup_id: l1_rollup_id,
+                        entry_client: entry_client_view,
+                        rollups: wired_rollups,
+                        exec_ctx,
+                        l2_entry_client: l2_entry_view,
+                    })
+                } else {
+                    event!(
+                        name: "eez.node.evm_composer.skipped",
+                        Level::WARN,
+                        "embedded L1 not active; cross-chain EvmComposer disabled",
+                    );
+                    None
+                };
+
             // Project the Arc<CrossChainExecCtx> into a SystemTxContext
             // BEFORE moving it into the Composer. The Deriver picks
             // this up further down to STF-reconstruct the same L2
             // system txs the composer produced.
-            let deriver_system_tx_cfg = cc_exec_ctx.as_ref().map(|ctx| {
+            let deriver_system_tx_cfg = cross_chain.as_ref().map(|cc| {
+                let ctx = &cc.exec_ctx;
                 eez_protocol::system_tx::SystemTxContext {
                     system_signer: ctx.system_signer.clone(),
                     ccm_l2_address: ctx.ccm_l2_address,
@@ -812,9 +770,7 @@ fn main() -> eyre::Result<()> {
                 submitter.clone(),
                 l1_watcher.clone(),
                 evm_config,
-                evm_composer,
-                cc_exec_ctx,
-                l2_entry_client,
+                cross_chain,
             );
             if let Some(ws) = witness_source {
                 composer.set_witness_source(ws);
