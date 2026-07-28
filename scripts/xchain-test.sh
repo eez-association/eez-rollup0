@@ -251,8 +251,18 @@ pbb=$(grep -oE 'l1_block: [0-9]+' <<<"$clean"|grep -oE '[0-9]+$'|sort -n|uniq); 
 for b in $pbb; do [[ -n "$prev" ]] && { [[ $((b-prev)) -eq 1 ]] && consec=$((consec+1)) || gap=$((gap+1)); }; prev=$b; done
 drops=$(grep -c 'target block passed without inclusion' <<<"$clean"); evict=$(grep -c 'evicted after MAX_BUNDLE_ATTEMPTS' <<<"$clean")
 div=$(grep -cE 'diverged from L1-confirmed|local L2 state root differs' <<<"$clean")
-l1r=$(cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint256)(address,bytes32,uint256)' "$EEZ_ROLLUP_ID" --rpc-url "$L1" 2>/dev/null|sed -n '2p'|tr -d '[:space:]')
-l2r=$(cast block safe --rpc-url "$L2" --json 2>/dev/null|jq -r '.stateRoot//empty'); recon=$([[ -n "$l1r" && "${l1r,,}" == "${l2r,,}" ]] && echo PASS || echo FAIL)
+# Reconcile L1's settled root against L2's L1-derived safe head. Both advance
+# continuously (empty Sync blocks keep settling), so a single snapshot can catch
+# them transiently offset by the in-flight delta. Poll until they align: a REAL
+# divergence never aligns (L1 settles a root not on L2's canonical chain), so this
+# still fails correctly; `div` is the independent per-block soundness guard.
+recon=FAIL
+for _ in $(seq 1 45); do
+  l1r=$(cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint256)(address,bytes32,uint256)' "$EEZ_ROLLUP_ID" --rpc-url "$L1" 2>/dev/null|sed -n '2p'|tr -d '[:space:]')
+  l2r=$(cast block safe --rpc-url "$L2" --json 2>/dev/null|jq -r '.stateRoot//empty')
+  [[ -n "$l1r" && "${l1r,,}" == "${l2r,,}" ]] && { recon=PASS; break; }
+  sleep 2
+done
 
 echo; echo "════════════════════ RESULTS ($MODE) ════════════════════"
 if [[ "$MODE" == load ]]; then
