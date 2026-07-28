@@ -1,0 +1,80 @@
+# Real-prover overlay — layered ON TOP of docker-compose.chiado-node.yml.
+#
+# Flips eez-node from the in-process mock prover to the out-of-process
+# eez-proverd (composer-controlled `Prove` RPC). The composer holds NO
+# signing key: it client-streams each settling window (postBatch + per-block
+# witnesses) to eez-proverd, which stateless-re-executes it via
+# `native-validate`, runs the settlement gates, and — only if every gate
+# passes — ECDSA-signs the recomputed publicInputsHash. The composer verifies
+# the attestation recovers to EEZ_ATTESTER_ADDRESS, then posts to L1.
+#
+# PREREQUISITE — deploy with the REAL proof system:
+#     EEZ_PROOF_SYSTEM=real make deploy-protocol
+# ECDSAProofSystem.verify recovers over the ACTUAL publicInputsHash, so it
+# accepts the prover's re-execution attestation. The dev MockECDSAProofSystem
+# recovers over a FIXED digest and would reject it — the mock is only for the
+# in-process MockEcdsaProver.
+#
+# EEZ_ATTESTER_ADDRESS (.env.chiado) MUST equal the proof system's
+# authorizedSigner == address(EEZ_PROOF_SIGNER_KEY). The proverd signs with
+# EEZ_PROOF_SIGNER_KEY; the composer only verifies against the address.
+#
+# Build the prover image once (eez-proverd + native-validate, both from source):
+#   docker compose --env-file .env.chiado \
+#     -f docker-compose.chiado-node.yml \
+#     -f docker-compose.driven.override.yml build eez-proverd
+#
+# Run:
+#   docker compose --env-file .env.chiado \
+#     -f docker-compose.chiado-node.yml \
+#     -f docker-compose.driven.override.yml up -d
+
+services:
+  eez-node:
+    environment:
+      # Remote-prover mode: dial eez-proverd instead of signing in-process.
+      # Its presence (over EEZ_PROOF_SIGNER_KEY) selects RemoteProver.
+      EEZ_PROVER_URL: "http://127.0.0.1:50061"
+      # The proof system's registered attester — the composer verifies each
+      # attestation recovers to this (fail-closed) before posting.
+      EEZ_ATTESTER_ADDRESS: "${EEZ_ATTESTER_ADDRESS:?set EEZ_ATTESTER_ADDRESS in .env.chiado (= address of EEZ_PROOF_SIGNER_KEY)}"
+
+  eez-proverd:
+    build:
+      context: .
+      dockerfile: Dockerfile.proverd
+    # Default `eez-proverd:local` = build locally. For a CI-published image set
+    # EEZ_PROVERD_IMAGE=ghcr.io/eez-association/eez-proverd:<tag> +
+    # EEZ_PULL_POLICY=always.
+    image: ${EEZ_PROVERD_IMAGE:-eez-proverd:local}
+    pull_policy: ${EEZ_PULL_POLICY:-missing}
+    container_name: eez-proverd
+    # Host networking so the composer reaches the Prove RPC at 127.0.0.1:50061
+    # exactly like the node it attaches to.
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      - eez-node
+    # EEZ_PROOF_SIGNER_KEY (== the proof system's authorizedSigner == the
+    # composer's attester). eez-proverd reads it from the env (clap `env=`).
+    env_file:
+      - ./.env.chiado
+    environment:
+      RUST_LOG: "info,eez_proverd=info"
+      # Must equal the node's EEZ_CCM_L2_ADDRESS — threaded into the settlement
+      # gate's system-tx classification.
+      EEZ_CCM_L2_ADDRESS: "0x4200000000000000000000000000000000000007"
+    # Override the image's `--help` default CMD with the real run. signer-key +
+    # ccm-l2-address come from the env above; these pin the bind address and the
+    # baked-in validator + chain-config. (`command: []` does NOT clear the CMD
+    # in compose — it's silently ignored — so pass it explicitly.)
+    command:
+      - "--listen-addr"
+      - "0.0.0.0:50061"
+      - "--validator-bin"
+      - "/usr/local/bin/native-validate"
+      - "--chain-config"
+      - "/app/l2-chainconfig.json"
+    logging:
+      driver: "local"
