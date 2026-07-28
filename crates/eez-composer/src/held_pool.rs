@@ -284,6 +284,46 @@ impl HeldPool {
         drained
     }
 
+    /// Peek the front `max` queued txs WITHOUT removing them or reserving their
+    /// nonces. The composer builds a block from these; only on success does it
+    /// [`commit_included`](Self::commit_included) the survivors. A failed build
+    /// leaves the pool untouched — nothing to re-queue, nothing to orphan.
+    #[must_use]
+    pub fn peek_n(&self, max: usize) -> Vec<HeldTx> {
+        let state = self.state.lock().expect("held_pool mutex poisoned");
+        state.txs.iter().take(max).cloned().collect()
+    }
+
+    /// Commit peeked txs that landed in an optimistically-committed block:
+    /// remove each from the queue and reserve its nonce in-flight until the
+    /// bundle settles (or a reorg re-queues it via [`Self::push_front_batch`]).
+    /// Txs already gone (e.g. evicted mid-compose) are skipped, so passing the
+    /// full survivor set is safe.
+    pub fn commit_included(&self, txs: &[HeldTx]) {
+        let mut state = self.state.lock().expect("held_pool mutex poisoned");
+        for tx in txs {
+            if let Some(pos) = state.txs.iter().position(|q| q.hash == tx.hash) {
+                state.txs.remove(pos);
+            }
+            state.by_hash.remove(&tx.hash);
+            state.mark_in_flight(tx);
+        }
+    }
+
+    /// Evict specific txs from the queue by hash, WITHOUT reserving them — for
+    /// stale (below-canonical-nonce) txs that can never land. No cascade: pass
+    /// exactly the txs to drop.
+    pub fn evict_batch(&self, txs: &[HeldTx]) {
+        let mut state = self.state.lock().expect("held_pool mutex poisoned");
+        for tx in txs {
+            if let Some(pos) = state.txs.iter().position(|q| q.hash == tx.hash) {
+                state.txs.remove(pos);
+            }
+            state.by_hash.remove(&tx.hash);
+            state.in_flight.remove(&tx.hash);
+        }
+    }
+
     /// Number of currently-held txs.
     pub fn len(&self) -> usize {
         self.state
