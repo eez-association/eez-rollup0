@@ -4,9 +4,8 @@
 //! the uniform [`ChainClient`] (all rollups) and the entry-only
 //! [`EntryChainClient`] (extends `ChainClient`; only the rollup
 //! designated as composition entry implements it). Nested cross-chain
-//! dispatch goes through the separate [`Dispatcher`] trait in
-//! [`crate::composition`], decoupling "who runs the session" from "who
-//! routes proxy-call dispatches."
+//! dispatch goes through the borrowed
+//! [`CompositionBuilder`](crate::composition::CompositionBuilder).
 //!
 //! All three traits are `#[async_trait]` — one heap allocation per call
 //! in exchange for dyn-compatibility. Native `async fn in trait` is
@@ -29,7 +28,7 @@
 //!       │
 //!       └─ simulate_source_tx       runs source simulation, dispatching
 //!                                   every detected proxy call through
-//!                                   a borrowed Dispatcher
+//!                                   a borrowed CompositionBuilder
 //!
 //!   CommittedRootReader : ChainClient   committed-root host (L1) only
 //!       │
@@ -48,39 +47,32 @@
 //! `ChainClient` only. Attempting to register a non-entry client via
 //! [`ComposerBuilder::entry`](crate::composer::ComposerBuilder::entry)
 //! fails to compile because the bound requires `EntryChainClient`.
-//!
-//! Trait-object safety requires constraining the associated `Protocol`
-//! type at the use site:
-//!
-//! ```ignore
-//! let entry: Arc<dyn EntryChainClient<Protocol = EvmProtocol>>   = /* ... */;
-//! let peer:  Arc<dyn ChainClient<Protocol = EvmProtocol>>        = /* ... */;
-//! ```
+
+use alloy_primitives::{Address, Bytes, U256};
 
 use crate::checkpoint::ExecutionCheckpoint;
-use crate::composition::Dispatcher;
+use crate::composition::CompositionBuilder;
 use crate::error::ExecutorResult;
 #[allow(
     unused_imports,
     reason = "ExecutorError / its Kind enum used in rustdoc intra-doc links"
 )]
 use crate::error::{ExecutorError, ExecutorErrorKind};
-use crate::protocol::ChainProtocol;
 use crate::rollup_id::RollupId;
 use crate::types::ExecutionOutcome;
 
 /// Request for a single cross-chain execution on the target chain.
 #[derive(Debug, Clone)]
-pub struct ExecutionRequest<P: ChainProtocol + ?Sized> {
+pub struct ExecutionRequest {
     /// Contract the target-chain call lands on. Spec: `Action.targetAddress`.
-    pub target_address: P::Address,
+    pub target_address: Address,
     /// Encoded calldata for the target-chain call. Spec: `Action.data`.
-    pub data: P::Calldata,
+    pub data: Bytes,
     /// Native value sent with the call. Spec: `Action.value`.
-    pub value: P::Value,
+    pub value: U256,
     /// Original caller on the source chain — becomes `msg.sender` in the
     /// target invocation. Spec: `Action.sourceAddress`.
-    pub source_address: P::Address,
+    pub source_address: Address,
     /// Rollup ID of the source chain; used for routing and action-hash
     /// derivation. Spec: `Action.sourceRollupId`.
     pub source_rollup_id: RollupId,
@@ -88,20 +80,19 @@ pub struct ExecutionRequest<P: ChainProtocol + ?Sized> {
 
 /// Full executor response: lean outcome + checkpoint for continuation/proving.
 #[derive(Clone)]
-pub struct ExecutionResponse<P: ChainProtocol + ?Sized> {
+pub struct ExecutionResponse {
     /// Lean result used to synthesize the source-side call's return
     /// value for the source transaction that triggered it.
     pub outcome: ExecutionOutcome,
     /// Accumulated state (overlay + optional witness) for continuation
     /// across calls and for proof-system handoff.
-    pub checkpoint: ProtocolCheckpoint<P>,
+    pub checkpoint: ExecutionCheckpoint,
 }
 
-// Manual Debug: `ChainProtocol::Overlay` / `Witness` do not require
-// `Debug`, so derive can't generate an impl. Also intentional: print
-// a placeholder for `checkpoint` — real checkpoints are large
-// (overlay + witness state) and would flood logs.
-impl<P: ChainProtocol + ?Sized> std::fmt::Debug for ExecutionResponse<P> {
+// Manual Debug — intentional: print a placeholder for `checkpoint` —
+// real checkpoints are large (overlay + witness state) and would
+// flood logs.
+impl std::fmt::Debug for ExecutionResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecutionResponse")
             .field("outcome", &self.outcome)
@@ -110,54 +101,22 @@ impl<P: ChainProtocol + ?Sized> std::fmt::Debug for ExecutionResponse<P> {
     }
 }
 
-/// Checkpoint type for a concrete chain protocol.
-pub type ProtocolCheckpoint<P> =
-    ExecutionCheckpoint<<P as ChainProtocol>::Overlay, <P as ChainProtocol>::Witness>;
-
 /// One target-chain transaction for batch simulation.
 ///
 /// This is owned rather than borrowed so it maps cleanly to future transport
 /// implementations. Local reth-backed clients can still execute it in-process.
-pub struct TargetTransaction<P: ChainProtocol + ?Sized> {
+#[derive(Debug, Clone)]
+pub struct TargetTransaction {
     /// Address to set as `msg.sender` in the simulation.
-    pub caller: P::Address,
+    pub caller: Address,
     /// Contract the call lands on.
-    pub destination: P::Address,
+    pub destination: Address,
     /// Encoded calldata.
-    pub calldata: P::Calldata,
+    pub calldata: Bytes,
     /// Native value attached to the call.
-    pub value: P::Value,
+    pub value: U256,
     /// Maximum gas this transaction may consume.
     pub gas_limit: u64,
-}
-
-// Manual Clone / Debug: `#[derive]` generates `P: Clone` / `P: Debug`
-// bounds (since `P` appears in the struct), which narrows callers
-// whose `P` isn't `Clone` — even though the FIELD types
-// (`P::Address`, `P::Calldata`, `P::Value`) all are. Hand-written
-// impls use only the bounds `ChainProtocol` already supplies.
-impl<P: ChainProtocol + ?Sized> Clone for TargetTransaction<P> {
-    fn clone(&self) -> Self {
-        Self {
-            caller: self.caller.clone(),
-            destination: self.destination.clone(),
-            calldata: self.calldata.clone(),
-            value: self.value.clone(),
-            gas_limit: self.gas_limit,
-        }
-    }
-}
-
-impl<P: ChainProtocol + ?Sized> std::fmt::Debug for TargetTransaction<P> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TargetTransaction")
-            .field("caller", &self.caller)
-            .field("destination", &self.destination)
-            .field("calldata", &self.calldata)
-            .field("value", &self.value)
-            .field("gas_limit", &self.gas_limit)
-            .finish()
-    }
 }
 
 /// Result of simulating an ordered target-chain transaction batch.
@@ -186,11 +145,11 @@ pub struct TargetBatchSimulation {
 /// [`CompositionBuilder::finalize`](crate::composition::CompositionBuilder::finalize)
 /// runs when a target plan opts in.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TargetVerificationContext<P: ChainProtocol + ?Sized> {
+pub struct TargetVerificationContext {
     /// Caller for the two system txs (target chain's configured system address).
-    pub system_address: P::Address,
+    pub system_address: Address,
     /// Destination for the two system txs (target chain's CCM entrypoint).
-    pub entrypoint_address: P::Address,
+    pub entrypoint_address: Address,
     /// Gas limit for each system tx.
     pub gas_limit: u64,
 }
@@ -206,7 +165,7 @@ pub struct TargetVerificationContext<P: ChainProtocol + ?Sized> {
 ///
 /// `Send` only (source simulation is single-threaded). No `'static`
 /// bound on the trait itself so the source simulator can borrow a
-/// session as `&'a mut dyn TargetExecutionSession<Protocol = P> + 'a`.
+/// session as `&'a mut (dyn TargetExecutionSession + 'a)`.
 ///
 /// The `dispatcher` argument on [`execute`](Self::execute) supports
 /// nested cross-chain dispatch: a target-session inspector can call
@@ -214,10 +173,6 @@ pub struct TargetVerificationContext<P: ChainProtocol + ?Sized> {
 /// proxy call.
 #[async_trait::async_trait]
 pub trait TargetExecutionSession: Send {
-    /// Chain protocol this trait operates on. Constrain at the use
-    /// site to construct a trait object: `dyn Trait<Protocol = EvmProtocol>`.
-    type Protocol: ChainProtocol + 'static;
-
     /// Execute a single call on the target chain.
     ///
     /// `dispatcher` is consumed by nested cross-chain dispatch.
@@ -233,20 +188,21 @@ pub trait TargetExecutionSession: Send {
     /// [`ExecutorErrorKind::Missing`].
     async fn execute(
         &mut self,
-        req: ExecutionRequest<Self::Protocol>,
-        dispatcher: &mut (dyn Dispatcher<Protocol = Self::Protocol> + Send),
-    ) -> ExecutorResult<ExecutionResponse<Self::Protocol>>;
+        req: ExecutionRequest,
+        dispatcher: &mut CompositionBuilder,
+    ) -> ExecutorResult<ExecutionResponse>;
 
     /// Capture an opaque snapshot of the session's current state. The
     /// returned box is fed back to [`rollback`](Self::rollback) to
     /// restore the session to its pre-call state. Drop the snapshot
     /// to commit forward (no-op).
     ///
-    /// Used by the composer's revertSpan path: `Dispatcher::open_call`
-    /// snapshots the target session BEFORE delegating to `execute`,
-    /// stashes the snapshot keyed by call idx, and either drops it
-    /// (success path) or rolls back (revert-span path) when
-    /// `Dispatcher::annotate_revert_span` fires.
+    /// Used by the composer's revertSpan path:
+    /// [`CompositionBuilder::open_call`] snapshots the target session
+    /// BEFORE delegating to `execute`, stashes the snapshot keyed by
+    /// call idx, and either drops it (success path) or rolls back
+    /// (revert-span path) when
+    /// [`CompositionBuilder::annotate_revert_span`] fires.
     ///
     /// The snapshot is type-erased via `Box<dyn Any + Send>` so the
     /// composer can stash it without naming `Self::Snapshot`. Each
@@ -273,7 +229,7 @@ pub trait TargetExecutionSession: Send {
     /// Retrieve the accumulated witness/overlay checkpoint after all
     /// calls — the prover-facing handoff distinct from the rollback
     /// snapshot above. Returns `None` if no calls have been executed.
-    async fn take_checkpoint(&mut self) -> Option<ProtocolCheckpoint<Self::Protocol>>;
+    async fn take_checkpoint(&mut self) -> Option<ExecutionCheckpoint>;
 }
 
 /// Type-erased session snapshot. Each [`TargetExecutionSession`] impl
@@ -290,14 +246,10 @@ pub type SessionSnapshot = Box<dyn std::any::Any + Send>;
 /// the chain hosting the canonical committed-root storage (L1 in this
 /// protocol) additionally implements [`CommittedRootReader`].
 ///
-/// Stored as `Arc<dyn ChainClient<Protocol = P> + Send + Sync>` in the
-/// composer's rollup map.
+/// Stored as `Arc<dyn ChainClient + Send + Sync>` in the composer's
+/// rollup map.
 #[async_trait::async_trait]
 pub trait ChainClient: Send + Sync + 'static {
-    /// Chain protocol this trait operates on. Constrain at the use
-    /// site to construct a trait object: `dyn Trait<Protocol = EvmProtocol>`.
-    type Protocol: ChainProtocol + 'static;
-
     /// Read this chain's own latest block-header `stateRoot`.
     ///
     /// Orthogonal to upstream-invariant-6 anchoring (which uses
@@ -324,7 +276,7 @@ pub trait ChainClient: Send + Sync + 'static {
     /// [`ExecutorErrorKind::Transport`].
     async fn begin_execution_session(
         &self,
-    ) -> ExecutorResult<Box<dyn TargetExecutionSession<Protocol = Self::Protocol> + Send>>;
+    ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>>;
 
     /// Simulate an ordered batch of target-chain transactions on a fresh
     /// target state. Implementations must commit each successful transaction
@@ -339,7 +291,7 @@ pub trait ChainClient: Send + Sync + 'static {
     /// [`ExecutorErrorKind::Serde`].
     async fn simulate_transactions(
         &self,
-        txs: &[TargetTransaction<Self::Protocol>],
+        txs: &[TargetTransaction],
     ) -> ExecutorResult<TargetBatchSimulation>;
 }
 
@@ -352,8 +304,8 @@ pub trait ChainClient: Send + Sync + 'static {
 /// in-process against live EVM state), so the split mirrors the wire
 /// reality.
 ///
-/// Stored as `Arc<dyn EntryChainClient<Protocol = P> + Send + Sync>`
-/// in the composer's `entry` slot. Trait upcasting (Rust 1.86+)
+/// Stored as `Arc<dyn EntryChainClient + Send + Sync>` in the
+/// composer's `entry` slot. Trait upcasting (Rust 1.86+)
 /// re-registers it as `Arc<dyn ChainClient>` in the rollup map.
 #[async_trait::async_trait]
 pub trait EntryChainClient: ChainClient {
@@ -373,7 +325,7 @@ pub trait EntryChainClient: ChainClient {
     async fn simulate_source_tx(
         &self,
         raw_tx: Vec<u8>,
-        dispatcher: &mut (dyn Dispatcher<Protocol = Self::Protocol> + Send),
+        dispatcher: &mut CompositionBuilder,
     ) -> ExecutorResult<()>;
 }
 

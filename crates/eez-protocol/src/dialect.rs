@@ -1,8 +1,6 @@
 //! Per-chain dialect for entry encoding and CCM-verify batch construction.
 //!
-//! [`ChainDialect`] is the
-//! [`ChainProtocol::Dialect`](eez_protocol::ChainProtocol::Dialect)
-//! implementation for EVM chains. Two variants distinguish the two
+//! Two [`ChainDialect`] variants distinguish the two
 //! contract surfaces the protocol exposes:
 //!
 //! - [`EvmL2Style`](ChainDialect::EvmL2Style) — `EEZL2`,
@@ -11,18 +9,16 @@
 //!   permissionless `executeCrossChainCall` / `executeL2TX`.
 //!
 //! Slot, ABI selection, and emission rules flow through
-//! `TargetConfig<EvmProtocol>`; the runtime composer (Step 7) and
+//! `TargetConfig`; the runtime composer (Step 7) and
 //! inspectors never see `ChainDialect` directly.
 
-use eez_protocol::{ExecutedAction, RollupId};
+use crate::{ExecutedAction, RollupId};
 
-use crate::EvmProtocol;
 use crate::authorized_proxies::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
 
 /// Selects the contract ABI and entry-emission rules for one rollup.
 ///
-/// Stored on [`eez_protocol::TargetConfig`] (via
-/// `ChainProtocol::Dialect = ChainDialect`) and read at composition
+/// Stored on [`crate::TargetConfig`] and read at composition
 /// time to select the correct calldata encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -55,6 +51,16 @@ impl ChainDialect {
         matches!(self, Self::EvmL2Style)
     }
 
+    /// Whether this dialect routes its table-loading payload through
+    /// the canonical proof-bundle poster (L1-style →
+    /// `EEZ.postAndVerifyBatch`). Drives
+    /// [`encode_table_payload`](crate::entries::encode_table_payload)'s
+    /// dispatch.
+    #[must_use]
+    pub const fn is_zk_poster(&self) -> bool {
+        matches!(self, Self::EvmL1Style)
+    }
+
     /// Encode the follower-side trigger calldata for the
     /// `outer_root` cross-chain call.
     ///
@@ -67,13 +73,12 @@ impl ChainDialect {
     /// receives `outer_root.data` as-is and forwards to the
     /// manager).
     ///
-    /// `raw_tx` and `source_rollup_id` are accepted for trait
-    /// compatibility but unused — the proxy fallback only needs
-    /// the original calldata.
+    /// `raw_tx` and `source_rollup_id` are accepted but unused —
+    /// the proxy fallback only needs the original calldata.
     #[must_use]
     pub fn encode_follower_trigger(
         &self,
-        call: &ExecutedAction<EvmProtocol>,
+        call: &ExecutedAction,
         _source_rollup_id: RollupId,
         _raw_tx: &[u8],
     ) -> Vec<u8> {

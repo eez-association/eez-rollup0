@@ -1,12 +1,11 @@
-//! EVM-side concrete impl of
-//! [`eez_protocol::ProofPlanResolver`].
+//! Batch proof-plan resolver.
 //!
 //! Reads `EEZ.rollups(rid).rollupContract`,
 //! `Rollup.checkProofSystemsAndGetVkeys(candidates)`, and
 //! `IRollupContract.getTimestampAndBlockHash()` over an alloy
 //! provider; assembles the result into a
-//! `ProofPlan<EvmProtocol>` validated against
-//! [`eez_protocol::ProofPlan::check_invariants`] before
+//! `ProofPlan` validated against
+//! [`crate::ProofPlan::check_invariants`] before
 //! return.
 //!
 //! # Reader abstraction
@@ -19,7 +18,7 @@
 //! - unit tests use a small in-memory fake without needing alloy
 //!   mock-provider machinery.
 //!
-//! Either way, the [`EvmProofPlanResolver`] surface stays
+//! Either way, the [`ProofPlanResolver`] surface stays
 //! identical.
 //!
 //! # Spec anchors
@@ -34,17 +33,15 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::{
+    ExecutorError, ExecutorErrorKind, ExecutorResult, ProofPlan, RollupId, RollupProofAssignment,
+    TimestampAndBlockHash,
+};
 use alloy_network::Ethereum;
 use alloy_primitives::{Address, U256};
 use alloy_provider::DynProvider;
 use alloy_sol_types::sol;
 use async_trait::async_trait;
-use eez_protocol::{
-    ExecutorError, ExecutorErrorKind, ExecutorResult, ProofPlan, ProofPlanResolver, RollupId,
-    RollupProofAssignment, TimestampAndBlockHash,
-};
-
-use crate::EvmProtocol;
 
 // ── Solidity bindings ─────────────────────────────────────────────
 
@@ -82,7 +79,7 @@ sol! {
 
 // ── Reader abstraction ────────────────────────────────────────────
 
-/// The three on-chain reads [`EvmProofPlanResolver`] performs to
+/// The three on-chain reads [`ProofPlanResolver`] performs to
 /// build a [`ProofPlan`]. Abstracted so tests can substitute an
 /// in-memory fake without alloy mock-provider machinery.
 #[async_trait]
@@ -211,8 +208,7 @@ impl RollupReader for AlloyRollupReader {
 
 // ── Resolver ──────────────────────────────────────────────────────
 
-/// EVM-side concrete impl of
-/// [`eez_protocol::ProofPlanResolver`].
+/// Resolve a batch's complete proof plan in one call.
 ///
 /// Holds the batch-wide candidate PS set (sorted ascending by
 /// address; validated at construction) and a [`RollupReader`] for
@@ -223,7 +219,7 @@ impl RollupReader for AlloyRollupReader {
 /// a future multi-PS quorum mode passes a larger sorted candidate
 /// set.
 #[derive(Debug, Clone)]
-pub struct EvmProofPlanResolver<R: RollupReader> {
+pub struct ProofPlanResolver<R: RollupReader> {
     reader: R,
     candidate_proof_systems: Vec<Address>,
 }
@@ -252,7 +248,7 @@ pub enum ResolverConfigError {
     },
 }
 
-impl<R: RollupReader> EvmProofPlanResolver<R> {
+impl<R: RollupReader> ProofPlanResolver<R> {
     /// Build a resolver. `candidate_proof_systems` MUST be strictly
     /// increasing by address (matching the on-chain `proofSystems`
     /// ordering invariant) and free of `address(0)`. Returns
@@ -289,9 +285,20 @@ impl<R: RollupReader> EvmProofPlanResolver<R> {
     }
 }
 
-#[async_trait]
-impl<R: RollupReader> ProofPlanResolver<EvmProtocol> for EvmProofPlanResolver<R> {
-    async fn resolve(&self, touched: &[RollupId]) -> ExecutorResult<ProofPlan<EvmProtocol>> {
+impl<R: RollupReader> ProofPlanResolver<R> {
+    /// Resolve the plan for the given touched rollup set. The
+    /// returned plan's `rollup_assignments` MUST be sorted by
+    /// `rollup_id` ascending (canonical batch order) regardless
+    /// of input order.
+    ///
+    /// # Errors
+    ///
+    /// Typical failure modes:
+    /// - candidate PS not allowed for a touched rollup (manager's
+    ///   `checkProofSystemsAndGetVkeys` reverts);
+    /// - touched rollup not registered on the central registry;
+    /// - on-chain provider transport failure.
+    pub async fn resolve(&self, touched: &[RollupId]) -> ExecutorResult<ProofPlan> {
         // Sort + dedup the touched set into canonical batch order.
         // Duplicates are silently collapsed (the on-chain
         // `_validateStructure` would reject duplicate rollupIds
@@ -367,7 +374,7 @@ impl<R: RollupReader> ProofPlanResolver<EvmProtocol> for EvmProofPlanResolver<R>
             vk_matrix.push(vkeys);
         }
 
-        let plan = ProofPlan::<EvmProtocol> {
+        let plan = ProofPlan {
             proof_systems: candidates.clone(),
             rollup_assignments,
             per_rollup_context,
@@ -383,7 +390,7 @@ impl<R: RollupReader> ProofPlanResolver<EvmProtocol> for EvmProofPlanResolver<R>
         // invariant 7.
         plan.check_invariants().map_err(|e| {
             ExecutorError::from(ExecutorErrorKind::Decode(format!(
-                "EvmProofPlanResolver produced an invariant-violating plan: {e}"
+                "ProofPlanResolver produced an invariant-violating plan: {e}"
             )))
         })?;
 
@@ -398,7 +405,6 @@ mod tests {
     use super::*;
     use alloy_primitives::address;
     use std::collections::HashMap;
-    use std::sync::Mutex;
 
     /// In-memory fake `RollupReader` for tests. Holds:
     /// - registry: rollup_id → manager address (Address::ZERO ⇒
@@ -411,24 +417,11 @@ mod tests {
         registry: HashMap<u64, Address>,
         vkeys: HashMap<(Address, Address), Option<[u8; 32]>>,
         context: HashMap<Address, TimestampAndBlockHash>,
-        // Pull a record of how many times each method was called
-        // so tests can assert the resolver doesn't issue redundant
-        // reads.
-        calls: Mutex<CallCounts>,
-    }
-
-    #[derive(Debug, Default)]
-    #[allow(dead_code, reason = "reserved for future call-count assertions")]
-    struct CallCounts {
-        rollup_contract: usize,
-        check_proof_systems: usize,
-        timestamp_and_block_hash: usize,
     }
 
     #[async_trait]
     impl RollupReader for FakeReader {
         async fn rollup_contract(&self, rid: RollupId) -> ExecutorResult<Address> {
-            self.calls.lock().unwrap().rollup_contract += 1;
             Ok(self.registry.get(&rid.0).copied().unwrap_or(Address::ZERO))
         }
 
@@ -437,7 +430,6 @@ mod tests {
             rollup_contract: Address,
             candidates: &[Address],
         ) -> ExecutorResult<Vec<[u8; 32]>> {
-            self.calls.lock().unwrap().check_proof_systems += 1;
             let mut out = Vec::with_capacity(candidates.len());
             for ps in candidates {
                 match self.vkeys.get(&(rollup_contract, *ps)) {
@@ -456,7 +448,6 @@ mod tests {
             &self,
             rollup_contract: Address,
         ) -> ExecutorResult<TimestampAndBlockHash> {
-            self.calls.lock().unwrap().timestamp_and_block_hash += 1;
             Ok(self
                 .context
                 .get(&rollup_contract)
@@ -482,28 +473,28 @@ mod tests {
     #[test]
     fn new_rejects_empty_candidates() {
         let r = FakeReader::default();
-        let err = EvmProofPlanResolver::new(r, vec![]).unwrap_err();
+        let err = ProofPlanResolver::new(r, vec![]).unwrap_err();
         assert_eq!(err, ResolverConfigError::EmptyCandidates);
     }
 
     #[test]
     fn new_rejects_zero_address_candidate() {
         let r = FakeReader::default();
-        let err = EvmProofPlanResolver::new(r, vec![Address::ZERO]).unwrap_err();
+        let err = ProofPlanResolver::new(r, vec![Address::ZERO]).unwrap_err();
         assert_eq!(err, ResolverConfigError::ZeroAddressCandidate);
     }
 
     #[test]
     fn new_rejects_unsorted_candidates() {
         let r = FakeReader::default();
-        let err = EvmProofPlanResolver::new(r, vec![PS_B, PS_A]).unwrap_err();
+        let err = ProofPlanResolver::new(r, vec![PS_B, PS_A]).unwrap_err();
         assert!(matches!(err, ResolverConfigError::NotSorted { index: 1 }));
     }
 
     #[test]
     fn new_accepts_singleton() {
         let r = FakeReader::default();
-        let resolver = EvmProofPlanResolver::new(r, vec![PS_A]).unwrap();
+        let resolver = ProofPlanResolver::new(r, vec![PS_A]).unwrap();
         assert_eq!(resolver.candidate_proof_systems(), &[PS_A]);
     }
 
@@ -512,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn single_rollup_single_ps_happy_path() {
         let reader = fake_with_one_rollup();
-        let resolver = EvmProofPlanResolver::new(reader, vec![PS_A]).unwrap();
+        let resolver = ProofPlanResolver::new(reader, vec![PS_A]).unwrap();
         let plan = resolver.resolve(&[RollupId(1)]).await.unwrap();
 
         assert_eq!(plan.proof_systems, vec![PS_A]);
@@ -533,7 +524,7 @@ mod tests {
     #[tokio::test]
     async fn empty_touched_set_fails() {
         let reader = fake_with_one_rollup();
-        let resolver = EvmProofPlanResolver::new(reader, vec![PS_A]).unwrap();
+        let resolver = ProofPlanResolver::new(reader, vec![PS_A]).unwrap();
         let err = resolver.resolve(&[]).await.unwrap_err();
         assert!(matches!(err.kind(), ExecutorErrorKind::Unavailable(_)));
     }
@@ -542,7 +533,7 @@ mod tests {
     async fn unregistered_rollup_fails_loud() {
         let reader = FakeReader::default();
         // registry empty → rollup_contract returns ZERO
-        let resolver = EvmProofPlanResolver::new(reader, vec![PS_A]).unwrap();
+        let resolver = ProofPlanResolver::new(reader, vec![PS_A]).unwrap();
         let err = resolver.resolve(&[RollupId(42)]).await.unwrap_err();
         assert!(matches!(err.kind(), ExecutorErrorKind::Unavailable(_)));
     }
@@ -552,7 +543,7 @@ mod tests {
         let mut reader = FakeReader::default();
         reader.registry.insert(1, MGR_1);
         // MGR_1 doesn't have PS_A in its vkey map → reverts
-        let resolver = EvmProofPlanResolver::new(reader, vec![PS_A]).unwrap();
+        let resolver = ProofPlanResolver::new(reader, vec![PS_A]).unwrap();
         let err = resolver.resolve(&[RollupId(1)]).await.unwrap_err();
         assert!(matches!(err.kind(), ExecutorErrorKind::Provider(_)));
     }
@@ -567,7 +558,7 @@ mod tests {
         reader.vkeys.insert((MGR_1, PS_A), Some([0x42; 32]));
         reader.vkeys.insert((MGR_2, PS_A), Some([0x52; 32]));
 
-        let resolver = EvmProofPlanResolver::new(reader, vec![PS_A]).unwrap();
+        let resolver = ProofPlanResolver::new(reader, vec![PS_A]).unwrap();
         // Input deliberately unsorted: [2, 1]; output must be [1, 2].
         let plan = resolver.resolve(&[RollupId(2), RollupId(1)]).await.unwrap();
 
@@ -585,7 +576,7 @@ mod tests {
         reader.registry.insert(1, MGR_1);
         reader.vkeys.insert((MGR_1, PS_A), Some([0x42; 32]));
 
-        let resolver = EvmProofPlanResolver::new(reader, vec![PS_A]).unwrap();
+        let resolver = ProofPlanResolver::new(reader, vec![PS_A]).unwrap();
         let plan = resolver
             .resolve(&[RollupId(1), RollupId(1), RollupId(1)])
             .await
@@ -615,7 +606,7 @@ mod tests {
             },
         );
 
-        let resolver = EvmProofPlanResolver::new(reader, vec![PS_A]).unwrap();
+        let resolver = ProofPlanResolver::new(reader, vec![PS_A]).unwrap();
         let plan = resolver.resolve(&[RollupId(1)]).await.unwrap();
 
         assert_eq!(plan.per_rollup_context[0].timestamp, ts_bytes);
@@ -637,7 +628,7 @@ mod tests {
         reader.vkeys.insert((MGR_1, PS_A), Some([0x42; 32]));
         reader.vkeys.insert((MGR_1, PS_B), Some([0x43; 32]));
 
-        let resolver = EvmProofPlanResolver::new(reader, vec![PS_A, PS_B]).unwrap();
+        let resolver = ProofPlanResolver::new(reader, vec![PS_A, PS_B]).unwrap();
         let plan = resolver.resolve(&[RollupId(1)]).await.unwrap();
 
         assert_eq!(plan.proof_systems, vec![PS_A, PS_B]);

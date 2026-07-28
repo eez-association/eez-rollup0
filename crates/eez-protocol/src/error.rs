@@ -146,7 +146,7 @@ pub enum ProtocolErrorKind {
     InvalidEncoding(String),
     /// A protocol capability was invoked that this chain family does not
     /// implement — e.g. a
-    /// [`SettlesOutbound::build_settlement_batch`](crate::capabilities::SettlesOutbound::build_settlement_batch)
+    /// [`build_l1_postbatch`](crate::entries::build_l1_postbatch)
     /// impl that cannot actually settle outbound. Today only the
     /// in-tree test fakes construct this variant.
     #[error("unsupported protocol operation: {0}")]
@@ -254,7 +254,7 @@ pub enum ExecutorErrorKind {
     /// Architecturally disallowed; L1→L2→L1 (re-entry through the
     /// entry rollup) IS valid and is handled inline by the EVM
     /// inspector via the overlay path. Raised by
-    /// [`Dispatcher::dispatch_call`](crate::Dispatcher::dispatch_call)'s
+    /// [`Dispatcher::dispatch_call`](crate::CompositionBuilder::dispatch_call)'s
     /// guard.
     #[error(
         "invalid re-entry: caller rollup {caller} attempted to dispatch to same rollup {target} \

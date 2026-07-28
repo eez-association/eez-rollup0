@@ -13,7 +13,6 @@
 
 use alloy_primitives::{Address, B256, Bytes, U256};
 
-use eez_evm::EvmProtocol;
 use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory};
 use reth_evm::{ConfigureEvm, Evm as _};
 use reth_evm_ethereum::EthEvmConfig;
@@ -24,7 +23,7 @@ use revm::DatabaseCommit;
 use revm::database::CacheState;
 
 use eez_protocol::{
-    Dispatcher, ExecutionRequest, ExecutionResponse, ExecutorError, ExecutorErrorKind,
+    CompositionBuilder, ExecutionRequest, ExecutionResponse, ExecutorError, ExecutorErrorKind,
     ExecutorResult, RollupId, TargetBatchSimulation, TargetExecutionSession, TargetTransaction,
 };
 
@@ -38,7 +37,7 @@ pub(super) const DIRECT_CALL_GAS_LIMIT: u64 = 30_000_000;
 ///
 /// Opened by `LocalChainClient::begin_execution_session` (the
 /// `ChainClient` trait method, not an inherent fn); owned by the
-/// `CompositionBuilder` through a `Rollup<P>.session` slot for the
+/// `CompositionBuilder` through a `Rollup.session` slot for the
 /// lifetime of one composition.
 ///
 /// ## Limitation: direct call, not full CCM path
@@ -392,13 +391,11 @@ impl LocalExecutionSession {
 
 #[async_trait::async_trait]
 impl TargetExecutionSession for LocalExecutionSession {
-    type Protocol = EvmProtocol;
-
     async fn execute(
         &mut self,
-        req: ExecutionRequest<Self::Protocol>,
-        dispatcher: &mut (dyn Dispatcher<Protocol = Self::Protocol> + Send),
-    ) -> ExecutorResult<ExecutionResponse<Self::Protocol>> {
+        req: ExecutionRequest,
+        dispatcher: &mut CompositionBuilder,
+    ) -> ExecutorResult<ExecutionResponse> {
         // Pitfall #3 invariant: this method runs SYNCHRONOUSLY under
         // the caller's `Handle::block_on`. Do NOT introduce a real
         // `.await` on I/O here or in `execute_internal*` — the target-
@@ -440,7 +437,7 @@ impl TargetExecutionSession for LocalExecutionSession {
             base_block_hash: [0u8; 32],
             base_state_root: pre,
             current_root: post,
-            overlay: eez_evm::EvmOverlay::default(),
+            overlay: eez_protocol::EvmOverlay::default(),
             witness: None,
         };
 
@@ -468,9 +465,7 @@ impl TargetExecutionSession for LocalExecutionSession {
     }
 
     /// Placeholder checkpoint until overlay/witness recording is implemented.
-    async fn take_checkpoint(
-        &mut self,
-    ) -> Option<eez_protocol::ProtocolCheckpoint<Self::Protocol>> {
+    async fn take_checkpoint(&mut self) -> Option<eez_protocol::ExecutionCheckpoint> {
         Some(eez_protocol::ExecutionCheckpoint {
             version: 1,
             chain_id: self.chain_id,
@@ -478,7 +473,7 @@ impl TargetExecutionSession for LocalExecutionSession {
             base_block_hash: [0u8; 32],
             base_state_root: [0u8; 32],
             current_root: self.current_root.0,
-            overlay: eez_evm::EvmOverlay::default(),
+            overlay: eez_protocol::EvmOverlay::default(),
             witness: None,
         })
     }
@@ -488,7 +483,7 @@ impl TargetExecutionSession for LocalExecutionSession {
 /// `executeIncomingCrossChainCall`) on a fresh target state.
 pub(super) fn simulate_local_transactions(
     target: &ChainProvider,
-    txs: &[TargetTransaction<EvmProtocol>],
+    txs: &[TargetTransaction],
 ) -> ExecutorResult<TargetBatchSimulation> {
     tracing::debug!(batch_size = txs.len(), "simulating target tx batch");
     if txs.is_empty() {

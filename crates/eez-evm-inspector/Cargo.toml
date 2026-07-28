@@ -13,7 +13,6 @@ workspace = true
 [dependencies]
 # Protocol + EVM
 eez-protocol.workspace = true
-eez-evm.workspace = true
 
 # Alloy types (Bytes, Address) for inspector calldata/addr handling +
 # RPC types / sol! / provider stack for Phase 09 §E1 post-batch
