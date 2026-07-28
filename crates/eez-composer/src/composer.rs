@@ -111,10 +111,6 @@ pub struct CrossChainExecCtx {
     /// `batch.rollupIdsWithProofSystems[0].rollupId` so the L1
     /// registry routes the per-rollup state delta correctly.
     pub l2_rollup_id: u64,
-    /// Deployed `EEZ` (rollups registry) address on L1 — the
-    /// `postBatch` target and the escrow-precheck read target.
-    /// Parsed once at startup from `EEZ_REGISTRY_ADDRESS`.
-    pub eez_registry: Address,
 }
 
 impl std::fmt::Debug for CrossChainExecCtx {
@@ -132,16 +128,15 @@ impl std::fmt::Debug for CrossChainExecCtx {
 /// The cross-chain compose dependencies, wired together (all-or-
 /// nothing) by `eez-node` startup when the embedded L1 is up.
 pub struct CrossChainWiring {
-    /// Rollup id of the pinned (L1) entry chain.
+    /// Rollup id of the entry chain.
     pub entry_rollup_id: eez_protocol::RollupId,
     /// Entry-chain (L1) client — runs source simulation for INBOUND
     /// (L1→L2) txs, and serves every rollup's upstream-invariant-6
     /// anchor root (`EEZ.rollups[id].stateRoot`) — chain headers
     /// (self-reports) are NOT correct for that purpose.
     pub entry_client: Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
-    /// All registered rollups (entry + followers): client + config,
-    /// keyed by rollup id. The per-tx dispatch map is built from this
-    /// on every composition.
+    /// All registered rollups (entry + followers). The entry is also
+    /// in this map — composition orchestration uses it uniformly.
     pub rollups: HashMap<
         eez_protocol::RollupId,
         (
@@ -161,28 +156,34 @@ pub struct CrossChainWiring {
 }
 
 impl CrossChainWiring {
-    /// Detect cross-chain proxy calls for one source tx against the
-    /// pinned (L1) entry and return the final
+    /// Detect cross-chain proxy calls and return the final
     /// [`eez_protocol::Composition`].
     ///
     /// # Errors
     ///
-    /// Surfaces simulation, dispatch, and finalization failures as
-    /// [`eez_protocol::ComposerError`].
+    /// Returns [`eez_protocol::ComposerErrorKind::Executor`] if
+    /// simulation fails.
+    /// Returns [`eez_protocol::ComposerErrorKind::Protocol`] if entry
+    /// building or finalization fails.
+    #[tracing::instrument(skip(self, raw_tx), fields(tx_len = raw_tx.len()))]
     pub async fn simulate_and_resolve(
         &self,
         raw_tx: &[u8],
     ) -> eez_protocol::ComposerResult<eez_protocol::Composition> {
+        // Default entry selection: the pinned entry rollup + its client.
+        // Per-composition entry selection (A1) goes through
+        // `simulate_and_resolve_recorded_for`.
         self.simulate_and_resolve_recorded_for(self.entry_rollup_id, &*self.entry_client, raw_tx)
             .await
     }
 
     /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve) but
     /// with an explicitly-chosen entry — `entry_id` + the `entry_client`
-    /// that runs source simulation. The explicit entry lets one wiring
+    /// that runs source simulation. The explicit entry lets ONE wiring
     /// compose either direction — `(L1, L1 client)` for an inbound L1→L2 call,
     /// `(L2, L2 client)` for an outbound L2→L1 call — picked per tx by
-    /// the drain.
+    /// the drain. The dispatch rollup map (Phase 1) is the wiring's full
+    /// registration set, unchanged.
     ///
     /// # Errors
     ///
@@ -195,10 +196,9 @@ impl CrossChainWiring {
     ) -> eez_protocol::ComposerResult<eez_protocol::Composition> {
         use eez_protocol::composition::Rollup;
 
-        event!(
+        tracing::info!(
             name: "composer.simulate.start",
-            Level::INFO,
-            entry_id = entry_id.0,
+            %entry_id,
             tx_len = raw_tx.len(),
             rollup_count = self.rollups.len(),
             "simulate_and_resolve: starting composition pipeline"
@@ -214,9 +214,10 @@ impl CrossChainWiring {
         //   rollups[id].stateRoot` for every delta in `postBatch` (see
         //   `EEZ.sol`), so ALL rollups (including the entry's own) read
         //   through the committed-root reader — chain headers
-        //   (self-reports) are NOT correct for upstream-invariant-6
-        //   anchoring.
-        let mut rollups = HashMap::with_capacity(self.rollups.len());
+        //   (self-reports via [`ChainClient::current_state_root`]) are
+        //   NOT correct for upstream-invariant-6 anchoring.
+        let mut rollups: HashMap<eez_protocol::RollupId, Rollup> =
+            HashMap::with_capacity(self.rollups.len());
         for (rollup_id, (client, config)) in &self.rollups {
             let initial_state_root = self
                 .entry_client
@@ -246,9 +247,8 @@ impl CrossChainWiring {
         let recorded = builder.recorded().to_vec();
         let composition = builder.finalize(raw_tx).await?;
 
-        event!(
+        tracing::info!(
             name: "composer.simulate.complete",
-            Level::INFO,
             target_count = composition.targets.len(),
             recorded = recorded.len(),
             "composition complete"
@@ -261,8 +261,9 @@ impl CrossChainWiring {
 impl std::fmt::Debug for CrossChainWiring {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CrossChainWiring")
-            .field("exec_ctx", &self.exec_ctx)
-            .finish_non_exhaustive()
+            .field("entry_rollup_id", &self.entry_rollup_id)
+            .field("rollups", &self.rollups.len())
+            .finish()
     }
 }
 
@@ -322,11 +323,11 @@ alloy_sol_types::sol! {
 
 /// L1-confirmed escrow (`rollups(rid).etherBalance`) an outbound withdrawal draws
 /// down. `None` on any read failure, so the caller fails open (skips the precheck).
-async fn read_rollup_escrow(
-    provider: &alloy_provider::RootProvider,
-    eez: Address,
-    rid: u64,
-) -> Option<U256> {
+async fn read_rollup_escrow(provider: &alloy_provider::RootProvider, rid: u64) -> Option<U256> {
+    let eez = std::env::var("EEZ_REGISTRY_ADDRESS")
+        .ok()?
+        .parse::<Address>()
+        .ok()?;
     IEEZReader::new(eez, provider)
         .rollups(U256::from(rid))
         .call()
@@ -955,7 +956,6 @@ where
             .compose_via_evm_composer(
                 cc,
                 rollup_id,
-                rollup,
                 drained.clone(),
                 &parent_header,
                 timestamp,
@@ -1252,7 +1252,6 @@ where
         &self,
         cc: &CrossChainWiring,
         rollup_id: u64,
-        rollup: &RollupState<L2>,
         drained: Vec<HeldTx>,
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         timestamp: u64,
@@ -1267,6 +1266,10 @@ where
         // local `nonce` counter advances per-signed-tx within this
         // function.
         let parent_hash = parent_header.hash();
+        let rollup =
+            self.inner.rollups.get(&rollup_id).ok_or_else(|| {
+                format!("unknown rollup_id {rollup_id} in compose_via_evm_composer")
+            })?;
         let state = rollup
             .l2_provider
             .state_by_block_hash(parent_hash)
@@ -1452,12 +1455,8 @@ where
                         };
                         if need > U256::ZERO {
                             if escrow_remaining.is_none() {
-                                escrow_remaining = read_rollup_escrow(
-                                    &ctx.l1_provider,
-                                    ctx.eez_registry,
-                                    rollup_id,
-                                )
-                                .await;
+                                escrow_remaining =
+                                    read_rollup_escrow(&ctx.l1_provider, rollup_id).await;
                             }
                             if let Some(avail) = escrow_remaining {
                                 if need > avail {
@@ -1641,11 +1640,10 @@ where
                 "all held txs were stale or failed simulation deterministically; emitting minimal postBatch",
             );
             return self
-                .degrade_to_minimal(
+                .dispatch_minimal_postbatch(
                     ctx,
                     rollup_id,
                     rollup,
-                    survivors,
                     parent_header,
                     timestamp,
                     suggested_fee_recipient,
@@ -1675,12 +1673,14 @@ where
                     error = %e,
                     "build_cross_chain_sync_pairs failed; re-queueing survivors, degrading to minimal postBatch",
                 );
+                if let Some(pool) = rollup.held_pool.as_ref() {
+                    pool.push_front_batch(survivors);
+                }
                 return self
-                    .degrade_to_minimal(
+                    .dispatch_minimal_postbatch(
                         ctx,
                         rollup_id,
                         rollup,
-                        survivors,
                         parent_header,
                         timestamp,
                         suggested_fee_recipient,
@@ -1711,12 +1711,14 @@ where
                     error = %e,
                     "build_sync_block failed; re-queueing survivors, degrading to minimal postBatch",
                 );
+                if let Some(pool) = rollup.held_pool.as_ref() {
+                    pool.push_front_batch(survivors);
+                }
                 return self
-                    .degrade_to_minimal(
+                    .dispatch_minimal_postbatch(
                         ctx,
                         rollup_id,
                         rollup,
-                        survivors,
                         parent_header,
                         timestamp,
                         suggested_fee_recipient,
@@ -1772,7 +1774,6 @@ where
             .prepare_post_batch_raw(
                 ctx,
                 rollup_id,
-                rollup,
                 &comp_refs,
                 parent_header,
                 built.header.state_root(),
@@ -1792,12 +1793,14 @@ where
                     error = %e,
                     "prepare_post_batch_raw failed; re-queueing survivors, degrading to minimal postBatch",
                 );
+                if let Some(pool) = rollup.held_pool.as_ref() {
+                    pool.push_front_batch(survivors);
+                }
                 return self
-                    .degrade_to_minimal(
+                    .dispatch_minimal_postbatch(
                         ctx,
                         rollup_id,
                         rollup,
-                        survivors,
                         parent_header,
                         timestamp,
                         suggested_fee_recipient,
@@ -1857,36 +1860,6 @@ where
         }))
     }
 
-    /// Shared failure tail of `compose_via_evm_composer`'s degrade
-    /// arms: re-queue the not-yet-bundled txs at the FRONT of the pool
-    /// and emit a minimal postBatch this slot. Each arm's distinct
-    /// `event!` stays at the call site (observability surface).
-    async fn degrade_to_minimal(
-        &self,
-        ctx: &CrossChainExecCtx,
-        rollup_id: u64,
-        rollup: &RollupState<L2>,
-        requeue: Vec<HeldTx>,
-        parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
-        timestamp: u64,
-        suggested_fee_recipient: Address,
-        bundle_target: BundleTarget,
-    ) -> Result<Option<SyncSlotBlock>, String> {
-        if let Some(pool) = rollup.held_pool.as_ref() {
-            pool.push_front_batch(requeue);
-        }
-        self.dispatch_minimal_postbatch(
-            ctx,
-            rollup_id,
-            rollup,
-            parent_header,
-            timestamp,
-            suggested_fee_recipient,
-            bundle_target,
-        )
-        .await
-    }
-
     /// Phase 1: build an empty Sync block, sign a leading-immediate-only
     /// postBatch covering `posted+1..=sync_height`, dispatch it to the
     /// background observer, return the block for immediate commit. The
@@ -1930,7 +1903,6 @@ where
             .prepare_post_batch_raw(
                 ctx,
                 rollup_id,
-                rollup,
                 &[], // no compositions → leading immediate only
                 parent_header,
                 empty_built.header.state_root(),
@@ -2045,7 +2017,6 @@ where
         &self,
         ctx: &CrossChainExecCtx,
         rollup_id: u64,
-        rollup: &RollupState<L2>,
         compositions: &[&eez_protocol::Composition],
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         sync_block_state_root: B256,
@@ -2090,13 +2061,25 @@ where
         // deriver's check_claimed_state agrees. `newState` = L2 at
         // sync_block-1 (`parent_header.state_root()`), lumping every
         // pre-sync block's effects into one stateDelta.
-        let posted = rollup.l1_head.cursor();
-        let pre_state_root: B256 = rollup
-            .l2_provider
-            .sealed_header(posted)
-            .map_err(|e| format!("sealed_header({posted}): {e}"))?
-            .ok_or_else(|| format!("local L2 header at {posted} missing"))?
-            .state_root();
+        let posted = self
+            .inner
+            .rollups
+            .get(&rollup_id)
+            .ok_or_else(|| format!("unknown rollup_id {rollup_id}"))?
+            .l1_head
+            .cursor();
+        let pre_state_root: B256 = {
+            let h = self
+                .inner
+                .rollups
+                .get(&rollup_id)
+                .ok_or_else(|| format!("unknown rollup_id {rollup_id}"))?
+                .l2_provider
+                .sealed_header(posted)
+                .map_err(|e| format!("sealed_header({posted}): {e}"))?
+                .ok_or_else(|| format!("local L2 header at {posted} missing"))?;
+            h.state_root()
+        };
         let pre_sync_state_root = parent_header.state_root();
         let rollup_id_u256 = U256::from(rollup_id);
         let immediate_entry = eez_protocol::abi::ExecutionEntrySol {
@@ -2276,7 +2259,10 @@ where
         // provider-index for the newest block. The Sync block (to) is
         // empty per Rollup-1 §8.3 — its system tx is reconstructed by the
         // deriver from the postBatch entries, not carried in callData.
-        //
+        let rollup =
+            self.inner.rollups.get(&rollup_id).ok_or_else(|| {
+                format!("unknown rollup_id {rollup_id} in prepare_post_batch_raw")
+            })?;
         // Reuse the SAME cursor read that anchored the leading
         // immediate's currentState above — a second read could race the
         // Deriver's cursor advance and desync the callData range from
@@ -2486,10 +2472,19 @@ where
         }
         .abi_encode();
 
+        // EEZ registry address is per-deployment; read directly from
+        // env. Loud failure on absence/garbage (invariant 7) — a
+        // postBatch signed to Address::ZERO would silently no-op on
+        // L1 with nothing but WARN-level breadcrumbs.
+        let eez_address = std::env::var("EEZ_REGISTRY_ADDRESS")
+            .ok()
+            .and_then(|s| s.parse::<Address>().ok())
+            .ok_or("EEZ_REGISTRY_ADDRESS missing or not a valid address")?;
+
         sign_post_batch_tx(
             &ctx.l1_poster_signer,
             &ctx.l1_provider,
-            ctx.eez_registry,
+            eez_address,
             calldata,
             ctx.l1_chain_id,
             ctx.l1_post_batch_priority_fee,

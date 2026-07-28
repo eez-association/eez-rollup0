@@ -42,7 +42,7 @@ pub struct ProxyLookupConfig {
 
 /// Per-rollup static configuration.
 ///
-/// Holds the proxy lookup and ABI dialect for one rollup (entry or
+/// Holds the proxy lookup for one rollup (entry or
 /// follower). Passed to
 /// [`ComposerBuilder::entry`] / [`ComposerBuilder::rollup`] alongside
 /// the client.

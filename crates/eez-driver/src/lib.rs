@@ -17,7 +17,7 @@
 //!   (production). Defines the protocol between Schedulers and
 //!   Sequencers.
 //! - [`Sequencer`] consumes [`SlotEvent`]s, builds payload attributes,
-//!   drives reth's engine and tracks head.
+//!   drives reth's engine, tracks head.
 //! - [`RollupTiming`] + [`SlotComposition`] — per-rollup wall-clock
 //!   timing config and per-trigger Live/Future/Sync split.
 //!
@@ -51,6 +51,5 @@ pub use slot::{
     ParentContext, SlotEvent, SlotKind, SyncSlotBlock, SyncSlotComposer, SyncSlotComposerHandle,
     SyncSlotMode, spawn_interval, spawn_l1_anchored,
 };
-#[doc(inline)]
 #[doc(inline)]
 pub use timing::{MAX_BLOCKS_PER_CATCHUP, RollupTiming, SlotComposition};

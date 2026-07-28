@@ -183,8 +183,6 @@ pub(crate) async fn scan_batch_logs_range(
         let input = tx.inner.input();
         let decoded = postAndVerifyBatchCall::abi_decode(input)
             .map_err(|e| L1Error::Provider(format!("decode postBatch({tx_hash}): {e}")))?;
-        // Decode kept as shape validation even though the event fields are
-        // no longer stored — a malformed BatchPosted log must still error.
         let _decoded_event = BatchPosted::decode_log(&alloy_primitives::Log {
             address: log.address(),
             data: log.data().clone(),

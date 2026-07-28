@@ -200,8 +200,9 @@ pub trait ChainClient: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns [`ExecutorErrorKind::Provider`] if the underlying state
-    /// provider is inaccessible; [`ExecutorErrorKind::Unavailable`] if
-    /// the client does not host the committed-root storage.
+    /// provider is inaccessible; [`ExecutorErrorKind::Transport`] for
+    /// gRPC implementations; [`ExecutorErrorKind::Unavailable`] if the
+    /// client does not host the committed-root storage.
     async fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
         let _ = rollup_id;
         Err(ExecutorError::from(ExecutorErrorKind::Unavailable(

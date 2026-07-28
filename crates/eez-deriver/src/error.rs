@@ -11,7 +11,6 @@ use core::fmt;
 pub type DeriverResult<T> = Result<T, DeriverError>;
 
 /// Error returned by [`Deriver`](crate::Deriver) operations.
-#[derive(Debug)]
 pub struct DeriverError {
     kind: ErrorKind,
 }
@@ -117,6 +116,14 @@ impl From<eez_driver::DriverError> for DeriverError {
         } else {
             Self::invalid_forkchoice(format!("driver: {err}"))
         }
+    }
+}
+
+impl fmt::Debug for DeriverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeriverError")
+            .field("kind", &self.kind)
+            .finish()
     }
 }
 

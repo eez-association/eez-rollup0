@@ -20,7 +20,6 @@ use crate::optimistic::OptimisticallyIncluded;
 pub struct RollupConfig {
     /// `rollupId` returned by `EEZ.registerRollup` for this L2.
     pub rollup_id: u64,
-    /// Deployed proof-system address — the `IProofSystem` instance this
     /// L1 block where `EEZ` was deployed. Lower bound for the startup
     /// `BatchPosted` log scan that seeds the L1-confirmed cursor.
     ///

@@ -26,7 +26,6 @@ pub mod scan;
 pub mod submitter;
 
 #[doc(inline)]
-#[doc(inline)]
 pub use config::SubmitterConfig;
 #[doc(inline)]
 pub use error::{L1Error, L1Result};

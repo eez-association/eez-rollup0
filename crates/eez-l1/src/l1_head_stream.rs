@@ -42,14 +42,15 @@ impl L1HeadStream {
         }
     }
 
-    /// Next canonical L1 head. Returns `None` when the source closes
-    /// (broadcast lagged past tolerance, `L1Watcher` task died, etc) —
-    /// the spawner exits cleanly so the surrounding
-    /// `spawn_critical_task` notices.
+    /// `next_head` returns `None` when the source closes (broadcast lagged
+    /// past tolerance, `L1Watcher` task died, etc) — the spawner exits
+    /// cleanly so the surrounding `spawn_critical_task` notices.
     ///
-    /// Cancel-safe: `spawn_l1_anchored` polls this inside a
-    /// `tokio::select!`; `broadcast::Receiver::recv` consumes no event
-    /// on a cancelled call.
+    /// `next_head` is cancel-safe: `spawn_l1_anchored` polls it
+    /// inside a `tokio::select!` alongside its Live ticker, so the future
+    /// is dropped and re-created whenever another branch wins. The
+    /// cancel-safety comes via `broadcast::Receiver::recv`
+    /// (no event is consumed by a cancelled call).
     pub async fn next_head(&mut self) -> Option<L1HeadInfo> {
         loop {
             match self.rx.recv().await {

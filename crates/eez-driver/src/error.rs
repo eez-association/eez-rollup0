@@ -16,7 +16,6 @@ use alloy_primitives::B256;
 pub type DriverResult<T> = Result<T, DriverError>;
 
 /// Error returned by [`Sequencer`](crate::Sequencer) operations.
-#[derive(Debug)]
 pub struct DriverError {
     kind: ErrorKind,
 }
@@ -106,6 +105,14 @@ impl DriverError {
     #[must_use]
     pub fn is_stale_parent(&self) -> bool {
         matches!(self.kind, ErrorKind::StaleParent { .. })
+    }
+}
+
+impl fmt::Debug for DriverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DriverError")
+            .field("kind", &self.kind)
+            .finish()
     }
 }
 

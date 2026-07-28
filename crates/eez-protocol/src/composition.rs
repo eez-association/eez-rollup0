@@ -389,12 +389,13 @@ impl CompositionBuilder {
         let mut plan_order: Vec<RollupId> = self.rollups.keys().copied().collect();
         plan_order.sort();
 
-        // Per-rollup attributed post-state roots. Keyed by `RollupId`;
-        // one `Vec` per rollup that contributed roots (entry rollup
-        // contributes from overlay-session executes injected via
-        // `set_extra_per_tx_roots`; non-entry rollups contribute their
-        // settlement / delivery root in the loop below). Consumed by
-        // the source-entry build step via
+        // Per-rollup cumulative post-state roots.
+        // Keyed by `RollupId`; one `Vec` per rollup that
+        // contributed roots (entry rollup contributes from
+        // overlay-session executes injected via
+        // `Dispatcher::set_extra_per_tx_roots`; non-entry rollups
+        // contribute in the loop
+        // below). Consumed by the source-entry build step via
         // `SourceAttribution::per_tx_roots_by_rollup` for
         // nested-composition upstream-invariant-6 chaining.
         let mut per_tx_roots_by_rollup: HashMap<RollupId, Vec<[u8; 32]>> = HashMap::new();
@@ -551,24 +552,7 @@ impl CompositionBuilder {
                         target_batches.insert(*rollup_id, inbound_batch);
                     }
                 }
-                continue;
             }
-
-            // A non-empty target batch would need a call classified
-            // TopLevel (sourced from this non-entry rollup) inside its
-            // own target group — impossible by construction:
-            // `open_call`'s same-chain guard refuses target == source
-            // for non-entry rollups, so every call in the group is
-            // INCOMING and `build_batch` returns the empty batch
-            // handled above. Fail loudly if that invariant ever breaks
-            // rather than silently emitting an unverified target
-            // composition. (The CCM-verify `simulate_transactions`
-            // pass that lived here was unreachable for this reason and
-            // was removed.)
-            return Err(ProtocolErrorKind::Unsupported(
-                "non-entry target batch with top-level calls (unreachable by construction)",
-            )
-            .into());
         }
 
         // Phase 3 — entry-rollup batch (across full preorder slice).
@@ -700,7 +684,7 @@ impl CompositionBuilder {
         // and push their own `ExecutedAction`s at indices `idx + 1, ..`.
         // The vec is preorder by construction.
         self.checked_out.insert(target_rollup_id);
-        let outcome_res = session.execute(req, self).await;
+        let response_res = session.execute(req, self).await;
 
         // Put the session back even on error; revert handling is
         // post-close via `annotate_revert_span`.
@@ -710,21 +694,21 @@ impl CompositionBuilder {
             .expect("rollup not removable")
             .session = Some(session);
 
-        let outcome = outcome_res?;
+        let response = response_res?;
 
         // Phase 3 — close: resolve the slot with the real outcome.
-        self.close_call(idx, outcome.clone(), None);
+        self.close_call(idx, response.clone(), None);
 
         tracing::debug!(
             name: "composer.dispatch_call",
             %target_rollup_id,
             %source_rollup_id,
-            success = outcome.is_success(),
-            gas = outcome.gas_used().unwrap_or(0),
+            success = response.is_success(),
+            gas = response.gas_used().unwrap_or(0),
             "dispatched cross-chain call"
         );
 
-        Ok(outcome)
+        Ok(response)
     }
 
     /// Push a `Pending` placeholder for a new call and return its
@@ -1035,7 +1019,14 @@ mod tests {
     }
 
     fn entry_rollup(outcome_root: [u8; 32]) -> Rollup {
-        rollup_with_session(outcome_root)
+        Rollup {
+            client: Arc::new(MockClient {
+                session_outcome: sample_outcome(outcome_root),
+            }),
+            session: None,
+            config: target_config(),
+            initial_state_root: [0u8; 32],
+        }
     }
 
     fn rollup_with_session(outcome_root: [u8; 32]) -> Rollup {
@@ -1293,17 +1284,31 @@ mod tests {
 
     // ── Terminal-revert short-circuit ──────────────────────────────
 
-    fn rollup_with_reverted_session() -> Rollup {
-        Rollup {
-            client: Arc::new(MockClient {
-                session_outcome: ExecutionOutcome::Resolved {
+    struct NoCcmClient;
+
+    #[async_trait::async_trait]
+    impl ChainClient for NoCcmClient {
+        async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
+            Ok([0u8; 32])
+        }
+        async fn begin_execution_session(
+            &self,
+        ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
+            Ok(Box::new(MockSession {
+                outcome: ExecutionOutcome::Resolved {
                     return_data: b"revert".to_vec(),
                     pre_state_root: [0u8; 32],
                     post_state_root: [0u8; 32],
                     gas_used: 1,
                     success: false,
                 },
-            }),
+            }))
+        }
+    }
+
+    fn rollup_with_reverted_session() -> Rollup {
+        Rollup {
+            client: Arc::new(NoCcmClient),
             session: None,
             config: target_config(),
             initial_state_root: [0u8; 32],

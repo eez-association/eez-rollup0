@@ -74,7 +74,6 @@ fn log_stale_parent(phase: &str) {
 
 struct SpeculativeLimit {
     max_depth: u64,
-    /// L1-confirmed L2 head cursor bounding speculative depth.
     source: Arc<eez_l1::L1CanonicalHead>,
 }
 

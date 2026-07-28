@@ -349,6 +349,10 @@ fn main() -> eyre::Result<()> {
                 rx
             }
             Mode::Composer => {
+                let submitter_config = SubmitterConfig::from_env()?;
+                let _ = submitter_config; // validated by Composer block below
+                let l1_watcher_config_preview = L1WatcherConfig::from_env()?;
+                let _ = l1_watcher_config_preview; // validated below
                 // Placeholder for schedule_rx; replaced inside the composer
                 // arm with the real L1-anchored schedule (spawn_l1_anchored).
                 let (_drop_tx, drop_rx) = mpsc::channel::<SlotEvent>(1);
@@ -476,13 +480,6 @@ fn main() -> eyre::Result<()> {
             // when reth ingests them via newPayload.
             let evm_config = reth_evm_ethereum::EthEvmConfig::new(chain_spec.clone());
 
-            // EEZ registry address — shared by the cross-chain composer
-            // wiring below and the `CrossChainExecCtx` (postBatch target
-            // + escrow precheck).
-            let eez_registry: Address = Address::from_str(&env::var("EEZ_REGISTRY_ADDRESS").map_err(
-                |_| eyre::eyre!("EEZ_REGISTRY_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
-            )?)?;
-
             // Build the cross-chain composer when the embedded L1 is
             // up — it owns `LocalChainClient`s over L1 (entry) and L2
             // (follower). `None` without an embedded L1. Inlined because
@@ -490,8 +487,12 @@ fn main() -> eyre::Result<()> {
             let cross_chain: Option<CrossChainWiring> =
                 if let Some(l1_variant) = embedded_l1.as_ref() {
                     use eez_composer::{GnosisL1Adapter, LocalChainClient};
-                    use eez_protocol::rollup_id::RollupId;
                     use eez_protocol::{ProxyLookupConfig, TargetConfig};
+                    use eez_protocol::rollup_id::RollupId;
+
+                    let eez_registry: Address = Address::from_str(&env::var("EEZ_REGISTRY_ADDRESS").map_err(
+                        |_| eyre::eyre!("EEZ_REGISTRY_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
+                    )?)?;
 
                     let ccm_l2: Address = Address::from_str(&env::var("EEZ_CCM_L2_ADDRESS").map_err(
                         |_| eyre::eyre!("EEZ_CCM_L2_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
@@ -657,6 +658,12 @@ fn main() -> eyre::Result<()> {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(1337);
+                let l2_rollup_id_for_ctx: u64 = env::var("EEZ_ROLLUP_ID")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| {
+                        eyre::eyre!("EEZ_ROLLUP_ID required for L1 postBatch rollupIdsWithProofSystems[]")
+                    })?;
                 // 10 gwei comfortably exceeds the smoke user_tx's
                 // 2-gwei priority fee, so dev-reth's payload builder
                 // orders postBatch ahead of the user_tx within the
@@ -683,8 +690,7 @@ fn main() -> eyre::Result<()> {
                     l1_chain_id,
                     l1_post_batch_priority_fee,
                     ecdsa_proof_system_address,
-                    l2_rollup_id: rollup_id,
-                    eez_registry,
+                    l2_rollup_id: l2_rollup_id_for_ctx,
                 });
                     event!(
                         name: "eez.node.evm_composer.ready",
