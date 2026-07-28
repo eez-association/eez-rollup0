@@ -361,6 +361,32 @@ impl ProofSystemBatchPerVerificationEntriesSol {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty() && self.l1ToL2lookupCalls.is_empty()
     }
+
+    /// A calldata-only batch — every `entries::build_*` builder produces one.
+    /// The proof-system carriers (`proofSystems`/`proofs`/`blobIndices`/…) are
+    /// filled downstream at submit time by `prepare_post_batch` + the proof
+    /// sink; the on-chain `_verifyProofSystemBatch` reverts if left unpopulated,
+    /// so a missed fill fails loudly.
+    #[must_use]
+    pub(crate) fn calldata_only(
+        entries: Vec<ExecutionEntrySol>,
+        transient_entries: alloy_primitives::U256,
+        lookups: Vec<LookupCallSol>,
+    ) -> Self {
+        Self {
+            entries,
+            l1ToL2lookupCalls: lookups,
+            transientExecutionEntryCount: transient_entries,
+            transientLookupCallCount: alloy_primitives::U256::ZERO,
+            proofSystems: vec![],
+            rollupIdsWithProofSystems: vec![],
+            crossProofSystemInteractions: alloy_primitives::B256::ZERO,
+            blobIndices: vec![],
+            callData: alloy_primitives::Bytes::new(),
+            proofs: vec![],
+            blockNumber: 0,
+        }
+    }
 }
 
 #[cfg(test)]

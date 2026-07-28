@@ -328,7 +328,7 @@ impl CompositionBuilder {
             let batch = entries::build_l1_postbatch(group_calls, self.entry_rollup_id);
             Ok((!batch.is_empty()).then_some(batch))
         } else {
-            let batch = entries::build_batch(group_calls, &dialect, rollup_id)?;
+            let batch = entries::build_batch(group_calls, rollup_id)?;
             if batch.is_empty() {
                 let has_incoming = group_calls.iter().any(|c| c.source_rollup_id != rollup_id);
                 if has_incoming {
@@ -417,14 +417,7 @@ impl CompositionBuilder {
         }
 
         // Source (entry-rollup) batch.
-        let entry_dialect = self
-            .rollups
-            .get(&self.entry_rollup_id)
-            .expect("entry rollup registered at builder construction")
-            .config
-            .dialect;
-        let entry_batch =
-            entries::build_batch(&self.recorded, &entry_dialect, self.entry_rollup_id)?;
+        let entry_batch = entries::build_batch(&self.recorded, self.entry_rollup_id)?;
 
         tracing::debug!(
             name: "composer.finalize.complete",

@@ -25,7 +25,6 @@ use crate::abi::{
 };
 use crate::action::cross_chain_call_hash;
 use crate::abi::EvmBatch;
-use crate::dialect::ChainDialect;
 
 /// Classification of a single [`ExecutedAction`] within an entry's
 /// flat call window. Drives [`build_batch`]'s emission decision.
@@ -61,8 +60,7 @@ impl CallKind {
     }
 }
 
-/// Build the chain-shaped [`EvmBatch`] for the rollup whose dialect
-/// is supplied.
+/// Build the chain-shaped [`EvmBatch`] for `source_rollup_id`.
 ///
 /// Walks `recorded` in preorder. Each [`CallKind::TopLevel`] call
 /// opens a new [`ExecutionEntrySol`] with that call as the outer.
@@ -80,7 +78,6 @@ impl CallKind {
 #[tracing::instrument(level = "debug", name = "build_batch", skip_all, fields(source = %source_rollup_id), err)]
 pub fn build_batch(
     recorded: &[ExecutedAction],
-    dialect: &ChainDialect,
     source_rollup_id: RollupId,
 ) -> ProtocolResult<EvmBatch> {
     let group: Vec<&ExecutedAction> = recorded
@@ -131,7 +128,7 @@ pub fn build_batch(
                 // forwards on arrival" case is handled separately by
                 // `build_l1_inbound_sidecar` (see `composition.rs` has_incoming
                 // short-circuit) — an incoming call is never top-level here.
-                let builder = EntryBuilder::new(call, *dialect);
+                let builder = EntryBuilder::new(call);
                 entry_nested_number = 0;
                 current_entry = Some(builder);
             }
@@ -182,29 +179,9 @@ pub fn build_batch(
         );
     }
 
-    Ok(EvmBatch {
-        entries,
-        // Empty by construction: NestedFailed/Static (the only top-level
-        // lookup producers) are refused above (D3); the entry batch carries
-        // no lookups.
-        l1ToL2lookupCalls: Vec::new(),
-        transientExecutionEntryCount: U256::ZERO,
-        transientLookupCallCount: U256::ZERO,
-        // Filled downstream at submit time: `prepare_post_batch`
-        // wires the carriers; the proof sink fills `proofs[]` with
-        // the prover's signature. Empty at build time.
-        proofSystems: Vec::new(),
-        rollupIdsWithProofSystems: Vec::new(),
-        crossProofSystemInteractions: B256::ZERO,
-        // Future blob-carrier wiring. Today ships calldata-only +
-        // empty proofs[]. The on-chain `_verifyProofSystemBatch`
-        // reverts if a caller forgets to populate these before
-        // submission, so missed wiring surfaces loudly.
-        blobIndices: Vec::new(),
-        callData: Bytes::new(),
-        proofs: Vec::new(),
-        blockNumber: 0,
-    })
+    // Deferred entry table, no lookups: NestedFailed/Static (the only top-level
+    // lookup producers) are refused above (D3).
+    Ok(EvmBatch::calldata_only(entries, U256::ZERO, Vec::new()))
 }
 
 /// Build the L1 `postAndVerifyBatch` batch for L2→L1 cross-chain calls.
@@ -305,20 +282,8 @@ pub fn build_l1_postbatch(calls: &[ExecutedAction], destination_rollup_id: Rollu
         immediate_count,
         "build_l1_postbatch: executing L1 batch built",
     );
-    EvmBatch {
-        entries,
-        l1ToL2lookupCalls: Vec::new(),
-        // All entries are immediate (executed inline in postAndVerifyBatch).
-        transientExecutionEntryCount: U256::from(immediate_count),
-        transientLookupCallCount: U256::ZERO,
-        proofSystems: Vec::new(),
-        rollupIdsWithProofSystems: Vec::new(),
-        crossProofSystemInteractions: B256::ZERO,
-        blobIndices: Vec::new(),
-        callData: Bytes::new(),
-        proofs: Vec::new(),
-        blockNumber: 0,
-    }
+    // All entries are immediate (executed inline in postAndVerifyBatch).
+    EvmBatch::calldata_only(entries, U256::from(immediate_count), Vec::new())
 }
 
 /// The ETH value an entry's successful `L2ToL1Calls` RELEASE on L1 — the
@@ -579,20 +544,8 @@ pub fn build_l1_inbound_entry(
         rollingHash: B256::ZERO,
     };
 
-    EvmBatch {
-        entries: vec![entry],
-        l1ToL2lookupCalls: Vec::new(),
-        // Deferred (queued, NOT immediate) → no transient prefix.
-        transientExecutionEntryCount: U256::ZERO,
-        transientLookupCallCount: U256::ZERO,
-        proofSystems: Vec::new(),
-        rollupIdsWithProofSystems: Vec::new(),
-        crossProofSystemInteractions: B256::ZERO,
-        blobIndices: Vec::new(),
-        callData: Bytes::new(),
-        proofs: Vec::new(),
-        blockNumber: 0,
-    }
+    // Deferred (queued, NOT immediate) → no transient prefix.
+    EvmBatch::calldata_only(vec![entry], U256::ZERO, Vec::new())
 }
 
 /// Build the follower-only INBOUND (L1→L2) DA-sidecar batch — the entry that
@@ -690,21 +643,9 @@ pub fn build_l1_inbound_sidecar(calls: &[ExecutedAction], target_rollup_id: Roll
         inbound_count,
         "build_l1_inbound_sidecar: follower-only inbound DA-sidecar batch built",
     );
-    EvmBatch {
-        entries,
-        l1ToL2lookupCalls: Vec::new(),
-        // Off-chain DA sidecar entries — never executed on-chain, so no
-        // transient (immediate) prefix (mirrors the deferred lean entry).
-        transientExecutionEntryCount: U256::ZERO,
-        transientLookupCallCount: U256::ZERO,
-        proofSystems: Vec::new(),
-        rollupIdsWithProofSystems: Vec::new(),
-        crossProofSystemInteractions: B256::ZERO,
-        blobIndices: Vec::new(),
-        callData: Bytes::new(),
-        proofs: Vec::new(),
-        blockNumber: 0,
-    }
+    // Off-chain DA sidecar entries — never executed on-chain, so no transient
+    // (immediate) prefix (mirrors the deferred lean entry).
+    EvmBatch::calldata_only(entries, U256::ZERO, Vec::new())
 }
 
 /// Build an L1 `postAndVerifyBatch` batch carrying a single SETTLEMENT-ONLY
@@ -735,20 +676,8 @@ pub fn build_l1_settlement_only(rollup_id: RollupId) -> EvmBatch {
         returnData: Bytes::new(),
         rollingHash: B256::ZERO,
     };
-    EvmBatch {
-        entries: vec![entry],
-        l1ToL2lookupCalls: Vec::new(),
-        // Immediate (applied inline by postAndVerifyBatch).
-        transientExecutionEntryCount: U256::from(1u8),
-        transientLookupCallCount: U256::ZERO,
-        proofSystems: Vec::new(),
-        rollupIdsWithProofSystems: Vec::new(),
-        crossProofSystemInteractions: B256::ZERO,
-        blobIndices: Vec::new(),
-        callData: Bytes::new(),
-        proofs: Vec::new(),
-        blockNumber: 0,
-    }
+    // Immediate (applied inline by postAndVerifyBatch).
+    EvmBatch::calldata_only(vec![entry], U256::from(1u8), Vec::new())
 }
 
 /// Build an L1 `postAndVerifyBatch` batch for a FAILED inbound L1→L2 call.
@@ -824,20 +753,8 @@ pub fn build_l1_inbound_failed(
         expectedStateRoots: Vec::new(),
     };
 
-    EvmBatch {
-        entries: vec![settlement],
-        l1ToL2lookupCalls: vec![failed],
-        // Settlement drained inline; the failed lookup PUBLISHED to lookupQueue.
-        transientExecutionEntryCount: U256::from(1u8),
-        transientLookupCallCount: U256::ZERO,
-        proofSystems: Vec::new(),
-        rollupIdsWithProofSystems: Vec::new(),
-        crossProofSystemInteractions: B256::ZERO,
-        blobIndices: Vec::new(),
-        callData: Bytes::new(),
-        proofs: Vec::new(),
-        blockNumber: 0,
-    }
+    // Settlement drained inline; the failed lookup PUBLISHED to lookupQueue.
+    EvmBatch::calldata_only(vec![settlement], U256::from(1u8), vec![failed])
 }
 
 /// Encode `EEZL2.executeIncomingCrossChainCall` calldata for the inbound L1→L2
@@ -1006,7 +923,7 @@ struct EntryBuilder {
 }
 
 impl EntryBuilder {
-    fn new(outer: &ExecutedAction, _dialect: ChainDialect) -> Self {
+    fn new(outer: &ExecutedAction) -> Self {
         let proxy_entry_hash = cross_chain_call_hash(
             outer.target_rollup_id,
             outer.target_address,
@@ -1317,7 +1234,7 @@ mod tests {
     #[test]
     fn empty_recorded_yields_empty_batch() {
         let batch =
-            build_batch(&[], &ChainDialect::EvmL1Style, RollupId(1)).expect("build_batch ok");
+            build_batch(&[], RollupId(1)).expect("build_batch ok");
         assert!(batch.entries.is_empty());
         assert!(batch.l1ToL2lookupCalls.is_empty());
         assert!(batch.is_empty());
@@ -1334,7 +1251,7 @@ mod tests {
         // makes `executeCrossChainCall` revert `RollingHashMismatch`.)
         let calls = vec![record(RollupId(1), RollupId(0), true)];
         let batch =
-            build_batch(&calls, &ChainDialect::EvmL1Style, RollupId(0)).expect("build_batch ok");
+            build_batch(&calls, RollupId(0)).expect("build_batch ok");
         assert_eq!(batch.entries.len(), 1);
         // The TopLevel call is described by the entry's
         // `proxyEntryHash` + `returnData`; reentrant children land
@@ -1647,7 +1564,7 @@ mod tests {
     fn outgoing_to_other_rollup_yields_empty_batch_for_target() {
         let calls = vec![record(RollupId(1), RollupId(0), true)];
         let batch =
-            build_batch(&calls, &ChainDialect::EvmL2Style, RollupId(1)).expect("build_batch ok");
+            build_batch(&calls, RollupId(1)).expect("build_batch ok");
         assert!(batch.entries.is_empty());
         assert!(batch.l1ToL2lookupCalls.is_empty());
     }
@@ -1659,7 +1576,7 @@ mod tests {
             record(RollupId(0), RollupId(1), true),
         ];
         let batch =
-            build_batch(&calls, &ChainDialect::EvmL1Style, RollupId(0)).expect("build_batch ok");
+            build_batch(&calls, RollupId(0)).expect("build_batch ok");
         assert_eq!(batch.entries.len(), 1);
         assert_eq!(
             batch.entries[0].expectedL1ToL2Calls.len(),
@@ -1679,7 +1596,7 @@ mod tests {
             record(RollupId(1), RollupId(0), true),
             record(RollupId(0), RollupId(1), false),
         ];
-        let err = build_batch(&calls, &ChainDialect::EvmL1Style, RollupId(0))
+        let err = build_batch(&calls, RollupId(0))
             .expect_err("nested-failed lookup must be refused");
         assert!(
             format!("{err}").contains("entry-scoped emission"),
@@ -1724,7 +1641,7 @@ mod tests {
     fn terminal_revert_yields_empty_batch() {
         let calls = vec![record(RollupId(1), RollupId(0), false)];
         let batch =
-            build_batch(&calls, &ChainDialect::EvmL1Style, RollupId(0)).expect("build_batch ok");
+            build_batch(&calls, RollupId(0)).expect("build_batch ok");
         assert!(batch.is_empty());
     }
 
