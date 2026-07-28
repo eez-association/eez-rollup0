@@ -709,7 +709,15 @@ where
         // `recovered_block(hash)` resolves on the first try.
         if feed_witness {
             if let Some(sender) = &self.witness_sender {
-                let _ = sender.send(block_hash);
+                if let Err(err) = sender.send(block_hash) {
+                    event!(
+                        name: "eez.committer.witness_feed.send_failed",
+                        Level::ERROR,
+                        block.hash = %block_hash,
+                        error = %err,
+                        "witness-feed channel closed; prover-capture task is gone — blocks will stop being proven and settlement will stall",
+                    );
+                }
             }
         }
 
@@ -778,9 +786,16 @@ where
         *self.last_header.write().unwrap() = header.clone();
         // Prover-feed trigger (prover-chain P1): the block is now canonical, so
         // the witness task's `recovered_block(hash)` resolves on the first try.
-        // Best-effort — a closed/lagging channel just drops it.
         if let Some(sender) = &self.witness_sender {
-            let _ = sender.send(header.hash());
+            if let Err(err) = sender.send(header.hash()) {
+                event!(
+                    name: "eez.committer.witness_feed.send_failed",
+                    Level::ERROR,
+                    block.hash = %header.hash(),
+                    error = %err,
+                    "witness-feed channel closed; prover-capture task is gone — blocks will stop being proven and settlement will stall",
+                );
+            }
         }
         Ok(CommitOutcome { header })
     }
