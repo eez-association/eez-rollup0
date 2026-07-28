@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+# Deploy contracts and generate the L2 genesis inside the CI enclave.
+
+FROM debian:bookworm-slim
+
+ARG FOUNDRY_VERSION=stable
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash git jq python3 curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/root/.foundry/bin:${PATH}"
+RUN curl -L https://foundry.paradigm.xyz | bash \
+    && foundryup -i "${FOUNDRY_VERSION}"
+
+WORKDIR /repo
+COPY scripts ./scripts
+COPY contracts ./contracts
+COPY sync-rollups-protocol ./sync-rollups-protocol
+COPY genesis.json ./genesis.json
+# Deployment values are injected by the Kurtosis task.
+RUN touch /repo/.env
+
+ENTRYPOINT ["/bin/bash", "-c"]
+CMD ["bash /repo/scripts/deploy.sh"]

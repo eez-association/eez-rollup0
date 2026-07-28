@@ -19,9 +19,6 @@ eez-protocol.workspace = true
 # submission. The provider stack is wallet-filled by the caller; this
 # crate only depends on the trait surface, not on a concrete transport.
 alloy-primitives.workspace = true
-alloy-network.workspace = true
-alloy-provider.workspace = true
-alloy-rpc-types-eth.workspace = true
 alloy-sol-types.workspace = true
 
 # EVM inspector (the one genuinely EVM-coupled piece in this crate)

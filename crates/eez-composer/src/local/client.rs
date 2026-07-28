@@ -21,8 +21,7 @@
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256, U256};
-use reth_chainspec::ChainSpec;
-use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
+use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{ConfigureEvm, Evm as _};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::SignerRecoverable;
@@ -31,13 +30,12 @@ use reth_storage_api::{BlockNumReader, HeaderProvider, StateProvider, StateProvi
 
 use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
 use eez_protocol::{
-    ChainClient, CommittedRootReader, CompositionBuilder, EntryChainClient, ExecutorError,
-    ExecutorErrorKind, ExecutorResult, ProxyLookupConfig, RollupId, TargetBatchSimulation,
-    TargetExecutionSession, TargetTransaction,
+    ChainClient, CompositionBuilder, ExecutorError, ExecutorErrorKind, ExecutorResult,
+    ProxyLookupConfig, RollupId, TargetExecutionSession,
 };
 
 use super::provider::{ChainProvider, HeaderReader};
-use super::session::{LocalExecutionSession, simulate_local_transactions};
+use super::session::LocalExecutionSession;
 
 /// Discriminates how this client operates within the composition.
 ///
@@ -78,27 +76,11 @@ impl Role {
 /// Unified local chain client.
 ///
 /// Implements [`ChainClient`] for every role and [`EntryChainClient`]
-/// additionally for the entry role — but the `EntryChainClient` methods
-/// assert `Role::Entry` via `Unavailable`, not panic. A `Follower`
-/// instance cannot reach those methods through public API anyway: the
-/// [`new_follower`](Self::new_follower) return type is
-/// `Arc<dyn ChainClient>`, which Rust cannot upcast to
-/// `Arc<dyn EntryChainClient>`.
-pub struct LocalChainClient<Provider, EvmConfig> {
-    /// Type-erased chain provider used by target-session + batch-sim paths.
+/// additionally for the entry role — the entry-only methods
+/// assert `Role::Entry` via `Unavailable`, not panic.
+pub struct LocalChainClient {
+    /// Type-erased chain provider used by every execution path.
     provider: ChainProvider,
-    /// Concrete provider retained for entry-only paths
-    /// (`simulate_source_tx` needs `HeaderProvider` + `BlockNumReader`
-    /// concrete methods; the dyn-erased `ChainProvider` hides them).
-    raw_provider: Provider,
-    /// Concrete `evm_config` retained for entry-only paths
-    /// (`simulate_source_tx` constructs an EVM with the inspector).
-    raw_evm_config: EvmConfig,
-    #[allow(
-        dead_code,
-        reason = "retained for future state-root / chain-spec diagnostics"
-    )]
-    chain_spec: Arc<ChainSpec>,
     rollup_id: RollupId,
     role: Role,
     ccm_address: Address,
@@ -118,7 +100,7 @@ pub struct LocalChainClient<Provider, EvmConfig> {
     overlay_channel: Option<OverlayChannelHandle>,
 }
 
-impl<Provider, EvmConfig> std::fmt::Debug for LocalChainClient<Provider, EvmConfig> {
+impl std::fmt::Debug for LocalChainClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocalChainClient")
             .field("rollup_id", &self.rollup_id)
@@ -128,49 +110,51 @@ impl<Provider, EvmConfig> std::fmt::Debug for LocalChainClient<Provider, EvmConf
     }
 }
 
-impl<Provider, EvmConfig> LocalChainClient<Provider, EvmConfig>
-where
-    Provider: StateProviderFactory
-        + HeaderProvider<Header = alloy_consensus::Header>
-        + BlockNumReader
-        + HeaderReader
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    EvmConfig: ConfigureEvm<Primitives = EthPrimitives> + Clone + Send + Sync + 'static,
-{
-    fn build_chain_provider(provider: &Provider, chain_spec: &Arc<ChainSpec>) -> ChainProvider {
+impl LocalChainClient {
+    fn build_chain_provider<P>(provider: &P, evm_config: EthEvmConfig) -> ChainProvider
+    where
+        P: StateProviderFactory
+            + HeaderProvider<Header = alloy_consensus::Header>
+            + BlockNumReader
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
         let headers: Arc<dyn HeaderReader> = Arc::new(provider.clone());
         let state_provider: Arc<dyn StateProviderFactory> = Arc::new(provider.clone());
         ChainProvider {
             provider: state_provider,
             headers,
-            evm_config: EthEvmConfig::new(Arc::clone(chain_spec)),
+            evm_config,
         }
     }
 
-    /// Build an entry-role client. Returned as
-    /// `Arc<Self>` so the call site can erase it into BOTH
-    /// `Arc<dyn EntryChainClient>` (for [`ComposerBuilder::entry`](eez_protocol::composer::ComposerBuilder::entry))
-    /// AND `Arc<dyn CommittedRootReader>` (for [`ComposerBuilder::root_reader`](eez_protocol::composer::ComposerBuilder::root_reader))
-    /// when the entry chain is L1. The two trait views share one
-    /// allocation; cheap.
-    pub fn new_entry(
-        provider: Provider,
-        evm_config: EvmConfig,
-        chain_spec: Arc<ChainSpec>,
+    /// Build an entry-role client. Returned as `Arc<Self>` so the call
+    /// site can erase it into `Arc<dyn ChainClient>` for
+    /// [`CrossChainWiring::entry_client`](crate::composer::CrossChainWiring::entry_client),
+    /// which also serves the committed-root reads when the entry chain
+    /// is L1.
+    pub fn new_entry<P>(
+        provider: P,
+        evm_config: EthEvmConfig,
         rollup_id: RollupId,
         dispatch_address: Address,
         ccm_address: Address,
         dialect: eez_protocol::ChainDialect,
-    ) -> Arc<Self> {
-        let cp = Self::build_chain_provider(&provider, &chain_spec);
+    ) -> Arc<Self>
+    where
+        P: StateProviderFactory
+            + HeaderProvider<Header = alloy_consensus::Header>
+            + BlockNumReader
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        let cp = Self::build_chain_provider(&provider, evm_config);
         Arc::new(Self {
             provider: cp,
-            raw_provider: provider,
-            raw_evm_config: evm_config,
-            chain_spec,
             rollup_id,
             role: Role::Entry { dispatch_address },
             ccm_address,
@@ -187,21 +171,26 @@ where
     /// traits unconditionally; the constructed instance only honestly
     /// answers committed-root reads when the dialect matches the
     /// underlying contract's storage layout.
-    pub fn new_follower(
-        provider: Provider,
-        evm_config: EvmConfig,
-        chain_spec: Arc<ChainSpec>,
+    pub fn new_follower<P>(
+        provider: P,
+        evm_config: EthEvmConfig,
         rollup_id: RollupId,
         dispatch_address: Address,
         ccm_address: Address,
         dialect: eez_protocol::ChainDialect,
-    ) -> Arc<Self> {
-        let cp = Self::build_chain_provider(&provider, &chain_spec);
+    ) -> Arc<Self>
+    where
+        P: StateProviderFactory
+            + HeaderProvider<Header = alloy_consensus::Header>
+            + BlockNumReader
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        let cp = Self::build_chain_provider(&provider, evm_config);
         Arc::new(Self {
             provider: cp,
-            raw_provider: provider,
-            raw_evm_config: evm_config,
-            chain_spec,
             rollup_id,
             role: Role::Follower { dispatch_address },
             ccm_address,
@@ -245,18 +234,7 @@ where
     }
 }
 
-impl<Provider, EvmConfig> ChainClient for LocalChainClient<Provider, EvmConfig>
-where
-    Provider: StateProviderFactory
-        + HeaderProvider<Header = alloy_consensus::Header>
-        + BlockNumReader
-        + HeaderReader
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    EvmConfig: ConfigureEvm<Primitives = EthPrimitives> + Clone + Send + Sync + 'static,
-{
+impl ChainClient for LocalChainClient {
     fn begin_execution_session(&self) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
         tracing::debug!(
             rollup_id = %self.rollup_id,
@@ -332,22 +310,19 @@ where
         Ok(Box::new(session))
     }
 
-    fn simulate_transactions(
-        &self,
-        txs: &[TargetTransaction],
-    ) -> ExecutorResult<TargetBatchSimulation> {
-        simulate_local_transactions(&self.provider, txs)
-    }
-
     /// Read the latest block header's `stateRoot` from this chain's
     /// own provider. Orthogonal to invariant-6 anchoring; useful for
     /// diagnostics and future paths.
     fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
         let num = self
-            .raw_provider
+            .provider
+            .headers
             .best_block_number()
             .map_err(ExecutorError::provider)?;
-        let header = <Provider as HeaderProvider>::header_by_number(&self.raw_provider, num)
+        let header = self
+            .provider
+            .headers
+            .header_by_number(num)
             .map_err(ExecutorError::provider)?
             .ok_or_else(|| {
                 ExecutorError::from(ExecutorErrorKind::Missing(
@@ -356,20 +331,7 @@ where
             })?;
         Ok(header.state_root.0)
     }
-}
 
-impl<Provider, EvmConfig> EntryChainClient for LocalChainClient<Provider, EvmConfig>
-where
-    Provider: StateProviderFactory
-        + HeaderProvider<Header = alloy_consensus::Header>
-        + BlockNumReader
-        + HeaderReader
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    EvmConfig: ConfigureEvm<Primitives = EthPrimitives> + Clone + Send + Sync + 'static,
-{
     fn simulate_source_tx(
         &self,
         raw_tx: Vec<u8>,
@@ -411,10 +373,14 @@ where
         // ── 2. Open source state ──────────────────────────────────
         let t_state = Instant::now();
         let latest_num = self
-            .raw_provider
+            .provider
+            .headers
             .best_block_number()
             .map_err(ExecutorError::provider)?;
-        let header = <Provider as HeaderProvider>::header_by_number(&self.raw_provider, latest_num)
+        let header = self
+            .provider
+            .headers
+            .header_by_number(latest_num)
             .map_err(ExecutorError::provider)?
             .ok_or_else(|| {
                 ExecutorError::from(ExecutorErrorKind::Missing("source header at latest block"))
@@ -425,7 +391,8 @@ where
         // `State<DB>` `'static` and unblocks any `Box<dyn Any>`-erased
         // clone path.
         let evm_state = self
-            .raw_provider
+            .provider
+            .provider
             .latest()
             .map_err(ExecutorError::provider)?;
         let db = StateProviderDatabase::new(evm_state);
@@ -435,14 +402,14 @@ where
         // Reth's `StateProviderBox` is not `Sync`, so a cross-thread
         // overlay design (e.g. closures over `*mut State<DB>`) is not
         // viable. The current overlay path keeps both the source-sim
-        // EVM and the entry overlay session on the same OS thread (the
-        // dispatch is a plain nested call), so this constraint never
-        // bites.
+        // EVM and the entry overlay session on the same OS thread via
+        // `block_in_place`, so this constraint never bites.
 
         // ── 3. Run source EVM with inspector ──────────────────────
         let t_env = Instant::now();
         let mut evm_env = self
-            .raw_evm_config
+            .provider
+            .evm_config
             .evm_env(&header)
             .map_err(ExecutorError::evm)?;
         // Relax nonce check in source-sim. For L2-as-entry topologies
@@ -457,7 +424,7 @@ where
         // mismatch is whitelisted.
         evm_env.cfg_env.disable_nonce_check = true;
         let recovered = reth_primitives_traits::Recovered::new_unchecked(tx, signer);
-        let tx_env = self.raw_evm_config.tx_env(&recovered);
+        let tx_env = self.provider.evm_config.tx_env(&recovered);
         let env_us = t_env.elapsed().as_micros();
 
         let t_sim = Instant::now();
@@ -475,7 +442,8 @@ where
         }
         let inspector = factory.build(dispatcher);
         let mut evm = self
-            .raw_evm_config
+            .provider
+            .evm_config
             .evm_with_env_and_inspector(&mut state, evm_env, inspector);
         let (gas_used, success) = match evm.transact(tx_env) {
             Ok(r) => (r.result.tx_gas_used(), r.result.is_success()),
@@ -527,39 +495,25 @@ where
 
         Ok(())
     }
-}
 
-/// `CommittedRootReader` impl — only meaningful when this client is
-/// connected to the chain hosting the canonical committed-root storage
-/// (L1's `EEZ.sol` in this protocol).
-///
-/// Today's L1-as-entry topology has the entry client itself serve this
-/// role; the same `Arc<LocalChainClient<...>>` is erased to BOTH
-/// `Arc<dyn EntryChainClient>` (for `.entry(...)`) AND
-/// `Arc<dyn CommittedRootReader>` (for `.root_reader(...)`) at the
-/// builder seam in `main.rs`.
-///
-/// L2-as-entry topology will need a follower variant: when this is a
-/// L1 follower client, it must implement this trait honestly. That
-/// honestly serves committed-root reads only when the client's dialect
-/// is `EvmL1Style` — that's the only chain whose `dispatch_address`
-/// points to a `EEZ.sol`-shaped contract whose storage layout
-/// `compute_state_root_slot` assumes. Both entry and follower roles
-/// can serve when L1-style: the entry case covers L1-as-entry single-binary;
-/// the follower case covers L1-as-follower in L2-as-entry topology.
-/// Non-L1 clients return `Unavailable` so misregistration fails loudly.
-impl<Provider, EvmConfig> CommittedRootReader for LocalChainClient<Provider, EvmConfig>
-where
-    Provider: StateProviderFactory
-        + HeaderProvider<Header = alloy_consensus::Header>
-        + BlockNumReader
-        + HeaderReader
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-    EvmConfig: ConfigureEvm<Primitives = EthPrimitives> + Clone + Send + Sync + 'static,
-{
+    /// Committed-root reads — only meaningful when this client is
+    /// connected to the chain hosting the canonical committed-root storage
+    /// (L1's `EEZ.sol` in this protocol).
+    ///
+    /// Today's L1-as-entry topology has the entry client itself serve this
+    /// role: `CrossChainWiring::entry_client` is the single erased
+    /// `Arc<dyn ChainClient>` that runs source simulation AND serves the
+    /// committed-root reads.
+    ///
+    /// L2-as-entry topology will need a follower variant: when this is a
+    /// L1 follower client, it must implement this trait honestly. That
+    /// honestly serves committed-root reads only when the client's dialect
+    /// is `EvmL1Style` — that's the only chain whose `dispatch_address`
+    /// points to a `EEZ.sol`-shaped contract whose storage layout
+    /// `compute_state_root_slot` assumes. Both entry and follower roles
+    /// can serve when L1-style: the entry case covers L1-as-entry single-binary;
+    /// the follower case covers L1-as-follower in L2-as-entry topology.
+    /// Non-L1 clients return `Unavailable` so misregistration fails loudly.
     fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
         // Only L1-style clients honestly serve committed-root reads —
         // the storage-slot math `compute_state_root_slot` assumes the
@@ -583,10 +537,14 @@ where
         // batches).
         if rollup_id == self.rollup_id {
             let num = self
-                .raw_provider
+                .provider
+                .headers
                 .best_block_number()
                 .map_err(ExecutorError::provider)?;
-            let header = <Provider as HeaderProvider>::header_by_number(&self.raw_provider, num)
+            let header = self
+                .provider
+                .headers
+                .header_by_number(num)
                 .map_err(ExecutorError::provider)?
                 .ok_or_else(|| {
                     ExecutorError::from(ExecutorErrorKind::Missing("L1 header at latest block"))
@@ -602,7 +560,8 @@ where
 
         // Cross-rollup path: read from the L1 Rollups contract's storage.
         let state = self
-            .raw_provider
+            .provider
+            .provider
             .latest()
             .map_err(ExecutorError::provider)?;
         let root =

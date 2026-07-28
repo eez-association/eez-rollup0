@@ -35,22 +35,6 @@ pub enum L1Error {
     /// [`Submitter::send_bundle`]: crate::Submitter::send_bundle
     #[error("builder relay does not support eth_sendBundle")]
     BundleRpcUnsupported,
-    /// Could not read a block from the L2 reth provider.
-    #[error("L2 source error: {0}")]
-    L2Source(String),
-    /// Payload codec rejected the input.
-    #[error("payload codec error: {0}")]
-    Codec(#[from] eez_payload_codec::CodecError),
-    /// Prover failed to produce a proof for the public inputs hash.
-    #[error("prover error: {0}")]
-    Prover(String),
-    /// Local L2 head is behind what the contract has already accepted —
-    /// likely a wiped datadir or a fresh node against a running contract.
-    /// Refusing to start; operator must reconcile (restore datadir or
-    /// redeploy a fresh contract). Stage-3 Deriver will catch this up
-    /// automatically once it lands.
-    #[error("local L2 head ({local}) is behind on-chain posted head ({on_chain})")]
-    L2Behind { local: u64, on_chain: u64 },
     /// L1 reorg deeper than the configured tolerance — beyond Ethereum
     /// finality. Operator must intervene (most likely a transient L1
     /// node anomaly; check L1 health and restart).

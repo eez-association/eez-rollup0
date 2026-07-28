@@ -26,16 +26,11 @@
 //! - **Settlement root.** Before signing, the prover checks the settlement
 //!   `StateDelta.newState` against the root reth actually produced for the block.
 //!
-//! The submit pipeline an integrator wires: resolve a `ProofPlan`
-//! ([`proof_resolver::ProofPlanResolver`]) → [`entries::build_batch`] →
-//! [`public_inputs::public_inputs_hashes`] → sign each digest with
-//! [`EcdsaProofSigner`] → fill `batch.proofs[]` → [`entries::encode_postbatch`].
-//!
 //! # Where to start reading
 //!
-//! - [`Composer::simulate_and_resolve`] runs one cross-chain
-//!   composition end-to-end over the long-lived, client-caching
-//!   [`Composer`].
+//! - [`CompositionBuilder`] runs one cross-chain composition
+//!   end-to-end: source simulation dispatches into it, `finalize`
+//!   emits the [`Composition`].
 //! - For the ABI boundary, [`entries::build_batch`] walks the preorder
 //!   `recorded[..]` slice and materializes an [`EvmBatch`]; the
 //!   per-dialect encoders (`encode_postbatch` / `encode_load_table`)
@@ -47,7 +42,6 @@ pub mod action;
 pub mod addresses;
 pub mod authorized_proxies;
 pub mod batch;
-pub mod checkpoint;
 pub mod composer;
 pub mod composition;
 pub mod dialect;
@@ -57,7 +51,6 @@ pub mod executor;
 pub mod outbound_gate;
 pub mod overlay;
 pub mod proof_plan;
-pub mod proof_resolver;
 pub mod public_inputs;
 pub mod rolling_hash;
 pub mod rollup_id;
@@ -65,14 +58,6 @@ pub mod settlement;
 pub mod signer;
 pub mod system_tx;
 pub mod types;
-pub mod witness;
-
-/// Test doubles (`FakeChainClient` / `FakeChainSession`) for unit-testing
-/// against the `ChainClient` traits. Gated by the `testing` feature so
-/// consumers opt in via `features = ["testing"]`; visible to this crate's own
-/// tests without the flag.
-#[cfg(any(test, feature = "testing"))]
-pub mod testing;
 
 mod assertions;
 
@@ -88,12 +73,7 @@ pub use authorized_proxies::{
 #[doc(inline)]
 pub use batch::EvmBatch;
 #[doc(inline)]
-pub use checkpoint::ExecutionCheckpoint;
-#[doc(inline)]
-pub use composer::{
-    Composer, ComposerBuilder, DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig, SourceAttribution,
-    TargetConfig,
-};
+pub use composer::{ProxyLookupConfig, SourceAttribution, TargetConfig};
 #[doc(inline)]
 pub use composition::{CompositionBuilder, Rollup};
 #[doc(inline)]
@@ -105,11 +85,7 @@ pub use error::{
     ProtocolErrorKind, ProtocolResult,
 };
 #[doc(inline)]
-pub use executor::{
-    ChainClient, CommittedRootReader, EntryChainClient, ExecutionRequest, ExecutionResponse,
-    SessionSnapshot, TargetBatchSimulation, TargetExecutionSession, TargetTransaction,
-    TargetVerificationContext,
-};
+pub use executor::{ChainClient, ExecutionRequest, SessionSnapshot, TargetExecutionSession};
 #[doc(inline)]
 pub use overlay::{
     AccountInfo, AccountOverlay, AccountStatus, ContractCode, EvmOverlay, StorageOverlay,
@@ -118,31 +94,15 @@ pub use overlay::{
 pub use proof_plan::{
     ProofPlan, ProofPlanInvariantError, RollupProofAssignment, TimestampAndBlockHash,
 };
-// The submit/prover surface (see the crate-level "Soundness model"): the hash
-// helpers + the proof-plan resolver, re-exported so they're discoverable at the
-// root rather than only by module path.
-#[doc(inline)]
-pub use abi::{
-    ActionSol, ExecutionEntrySol, ExpectedL1ToL2CallSol, L2ToL1CallSol, LookupCallSol,
-    ProofSystemBatchPerVerificationEntriesSol, RollupIdWithProofSystemsSol, StateDeltaSol,
-};
-#[doc(inline)]
-pub use proof_resolver::{
-    AlloyRollupReader, IEEZReader, ProofPlanResolver, ResolverConfigError, RollupReader,
-};
 #[doc(inline)]
 pub use public_inputs::{all_per_ps_hashes, entry_hash, public_inputs_hashes, shared_public_input};
 #[doc(inline)]
-pub use rolling_hash::{
-    CALL_BEGIN, CALL_END, EntryRollingHash, NESTED_BEGIN, NESTED_END, StaticCallRollingHash,
-};
+pub use rolling_hash::{EntryRollingHash, StaticCallRollingHash};
 #[doc(inline)]
-pub use rollup_id::{ChainIdentity, RollupId};
+pub use rollup_id::RollupId;
 #[doc(inline)]
 pub use signer::{EcdsaProofSigner, SignerError};
 #[doc(inline)]
 pub use types::{
-    Composition, ExecutedAction, ExecutionOutcome, SourceComposition, StaticMeta, TargetComposition,
+    Composition, ExecutedAction, ExecutionOutcome, SourceComposition, TargetComposition,
 };
-#[doc(inline)]
-pub use witness::EvmWitness;
