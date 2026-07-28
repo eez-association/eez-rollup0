@@ -7,15 +7,6 @@
 //! [`eez_protocol::Composer`] for `simulate_and_resolve`, and the
 //! resulting `system_txs` get bundled into the Sync block.
 //!
-//! Held-pool drain semantics:
-//!
-//! - [`HeldPool::pop_n`] / [`HeldPool::pop_all`] — drain queued transactions
-//!   and reserve their nonces as in-flight. Called by the umbrella on Sync-slot
-//!   trigger after the composer's batch is built and the bundle is
-//!   queued for submission. Cross-chain reorg recovery (re-injecting
-//!   pre-composed txs after L1 reorg or bundle drop) replays into the
-//!   pool via [`HeldPool::push_front_batch`].
-//!
 //! Concurrency: one `Mutex<PoolState>` keeps queue membership, hash
 //! dedupe, and in-flight nonce reservations atomic. Held-pool operations
 //! are infrequent (per sync slot, per L1 event) and never hot-path.
@@ -75,12 +66,7 @@ struct PoolState {
 }
 
 impl PoolState {
-    fn next_expected_nonce(
-        &self,
-        sender: Address,
-        direction: Direction,
-        on_chain: u64,
-    ) -> Option<u64> {
+    fn next_expected_nonce(&self, sender: Address, direction: Direction, on_chain: u64) -> u64 {
         let highest_reserved = self
             .txs
             .iter()
@@ -95,8 +81,10 @@ impl PoolState {
             .filter(|nonce| *nonce >= on_chain)
             .max();
         match highest_reserved {
-            Some(nonce) => nonce.checked_add(1),
-            None => Some(on_chain),
+            // A u64::MAX nonce is unreachable (no account sends 2^64 txs);
+            // saturate rather than overflow-panic on the impossible input.
+            Some(nonce) => nonce.saturating_add(1),
+            None => on_chain,
         }
     }
 
@@ -159,9 +147,7 @@ impl HeldPool {
         });
 
         if target_nonce < on_chain {
-            let expected = state
-                .next_expected_nonce(target_sender, target_direction, on_chain)
-                .unwrap_or(u64::MAX);
+            let expected = state.next_expected_nonce(target_sender, target_direction, on_chain);
             return Err(NonceAdmissionError { expected, on_chain });
         }
 
@@ -178,20 +164,12 @@ impl HeldPool {
             same_chain(*sender, *direction) && *nonce == target_nonce
         }) {
             return Err(NonceAdmissionError {
-                expected: state
-                    .next_expected_nonce(target_sender, target_direction, on_chain)
-                    .unwrap_or(u64::MAX),
+                expected: state.next_expected_nonce(target_sender, target_direction, on_chain),
                 on_chain,
             });
         }
 
-        let Some(expected) = state.next_expected_nonce(target_sender, target_direction, on_chain)
-        else {
-            return Err(NonceAdmissionError {
-                expected: u64::MAX,
-                on_chain,
-            });
-        };
+        let expected = state.next_expected_nonce(target_sender, target_direction, on_chain);
         if target_nonce != expected {
             return Err(NonceAdmissionError { expected, on_chain });
         }
