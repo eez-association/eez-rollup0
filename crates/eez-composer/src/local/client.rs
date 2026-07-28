@@ -484,7 +484,12 @@ where
         let (gas_used, success) = match evm.transact(tx_env) {
             Ok(r) => (r.result.tx_gas_used(), r.result.is_success()),
             Err(e) => {
-                tracing::warn!(%e, "source sim reverted");
+                // A `transact` Err is a PRE-EXECUTION failure (insufficient
+                // funds, max-fee < base-fee, ...), NOT an on-chain revert —
+                // that is the `Ok(r)` with `!is_success()` arm. Log it loudly
+                // and accurately; the empty-entries poison-eviction downstream
+                // (composer.rs) drops the tx.
+                tracing::warn!(%e, "source sim could not execute (pre-execution validation failure, not a revert); tx will be evicted downstream");
                 (0, false)
             }
         };

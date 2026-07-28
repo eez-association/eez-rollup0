@@ -324,11 +324,20 @@ pub fn public_inputs_hashes(
     let rollup_assignments: Vec<RollupProofAssignment> = batch
         .rollupIdsWithProofSystems
         .iter()
-        .map(|r| RollupProofAssignment {
-            rollup_id: RollupId(r.rollupId.to::<u64>()),
-            proof_system_index: r.proofSystemIndex.clone(),
+        .map(|r| {
+            // Fail closed on an adversarial rollupId >= 2^64 rather than
+            // panic the `u64` converter (`to::<u64>()` is `uint_try_to().expect`).
+            let rollup_id = u64::try_from(r.rollupId).map_err(|_| {
+                ProofPlanInvariantError::RollupIdOutOfRange {
+                    rollup_id: r.rollupId,
+                }
+            })?;
+            Ok(RollupProofAssignment {
+                rollup_id: RollupId(rollup_id),
+                proof_system_index: r.proofSystemIndex.clone(),
+            })
         })
-        .collect();
+        .collect::<Result<_, ProofPlanInvariantError>>()?;
     let per_rollup_context = vec![context; rollup_assignments.len()];
     let vk_matrix: Vec<Vec<[u8; 32]>> = rollup_assignments
         .iter()
@@ -567,6 +576,23 @@ mod tests {
             bound, bound_other,
             "the hash must bind the BLOCK HASH value"
         );
+    }
+
+    #[test]
+    fn rollup_id_exceeding_u64_is_refused_not_panic() {
+        use crate::abi::RollupIdWithProofSystemsSol;
+        // An adversarial PostBatch can ABI-decode a rollupId >= 2^64.
+        // The `u64` conversion must fail closed, never panic the prover.
+        let mut batch = carrier_batch(0);
+        batch.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
+            rollupId: U256::from(1u8) << 64, // 2^64, one past u64::MAX
+            proofSystemIndex: vec![0],
+        }];
+        let err = public_inputs_hashes(&batch, B256::repeat_byte(0x42), None).unwrap_err();
+        assert!(matches!(
+            err,
+            ProofPlanInvariantError::RollupIdOutOfRange { .. }
+        ));
     }
 
     #[test]
