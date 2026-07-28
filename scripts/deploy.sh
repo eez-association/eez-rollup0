@@ -103,13 +103,29 @@ EEZ_REGISTRY_DEPLOY_BLOCK="$(cast block-number --rpc-url "$EEZ_L1_RPC_URL")"
 echo "      EEZ        = $EEZ_REGISTRY_ADDRESS"
 echo "      deployBlock= $EEZ_REGISTRY_DEPLOY_BLOCK"
 
-# ── 2/4 DeployMockECDSAProofSystem ──────────────────────────────────
-echo "[2/4] DeployMockECDSAProofSystem(authorizedSigner=$AUTHORIZED_SIGNER)"
-run_forge "DeployMockECDSAProofSystem" forge script script/DeployMockECDSAProofSystem.s.sol:DeployMockECDSAProofSystem \
-    --sig "run(address)" "$AUTHORIZED_SIGNER" $RPC $KEY --broadcast
-EEZ_ECDSA_PROOF_SYSTEM_ADDRESS="$(extract MOCK_PS "$OUT")"
-[[ -n "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture MOCK_PS address" >&2; exit 1; }
-echo "      MOCK_PS    = $EEZ_ECDSA_PROOF_SYSTEM_ADDRESS"
+# ── 2/4 Proof system: EEZ_PROOF_SYSTEM=mock (default) | real ─────────
+# real  → ECDSAProofSystem: recovers over the ACTUAL publicInputsHash, so it
+#         accepts eez-proverd's stateless-re-execution attestation (the real
+#         prover path — pair with EEZ_PROVER_URL + EEZ_ATTESTER_ADDRESS).
+# mock  → MockECDSAProofSystem: recovers over a FIXED digest; matches only the
+#         in-process MockEcdsaProver (EEZ_PROOF_SIGNER_KEY), NOT eez-proverd.
+# Either way the attester/authorizedSigner is address(EEZ_PROOF_SIGNER_KEY).
+EEZ_PROOF_SYSTEM="${EEZ_PROOF_SYSTEM:-mock}"
+if [[ "$EEZ_PROOF_SYSTEM" == "real" ]]; then
+    echo "[2/4] DeployECDSAProofSystem (REAL — attester=$AUTHORIZED_SIGNER)"
+    run_forge "DeployECDSAProofSystem" forge script script/DeployECDSAProofSystem.s.sol:DeployECDSAProofSystem \
+        --sig "run(address)" "$AUTHORIZED_SIGNER" $RPC $KEY --broadcast
+    EEZ_ECDSA_PROOF_SYSTEM_ADDRESS="$(extract ECDSA_PS "$OUT")"
+elif [[ "$EEZ_PROOF_SYSTEM" == "mock" ]]; then
+    echo "[2/4] DeployMockECDSAProofSystem(authorizedSigner=$AUTHORIZED_SIGNER)"
+    run_forge "DeployMockECDSAProofSystem" forge script script/DeployMockECDSAProofSystem.s.sol:DeployMockECDSAProofSystem \
+        --sig "run(address)" "$AUTHORIZED_SIGNER" $RPC $KEY --broadcast
+    EEZ_ECDSA_PROOF_SYSTEM_ADDRESS="$(extract MOCK_PS "$OUT")"
+else
+    echo "deploy: EEZ_PROOF_SYSTEM must be 'mock' or 'real', got '$EEZ_PROOF_SYSTEM'" >&2; exit 1
+fi
+[[ -n "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture proof-system address ($EEZ_PROOF_SYSTEM)" >&2; exit 1; }
+echo "      proofSystem= $EEZ_ECDSA_PROOF_SYSTEM_ADDRESS ($EEZ_PROOF_SYSTEM)"
 
 # ── 3/4 DeployRollup ────────────────────────────────────────────────
 echo "[3/4] DeployRollup"
@@ -193,6 +209,8 @@ cat > "$OUT_FILE" <<EOF
 
 EEZ_REGISTRY_ADDRESS=$EEZ_REGISTRY_ADDRESS
 EEZ_REGISTRY_DEPLOY_BLOCK=$EEZ_REGISTRY_DEPLOY_BLOCK
+# Proof system kind: $EEZ_PROOF_SYSTEM (real = ECDSAProofSystem, binds
+# publicInputsHash → pair with eez-proverd; mock = fixed-digest dev PS).
 EEZ_ECDSA_PROOF_SYSTEM_ADDRESS=$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS
 EEZ_ROLLUP_MANAGER_ADDRESS=$EEZ_ROLLUP_MANAGER_ADDRESS
 EEZ_ROLLUP_ID=$EEZ_ROLLUP_ID
