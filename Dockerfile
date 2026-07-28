@@ -12,7 +12,7 @@
 # ── chef base: toolchain + system deps reth/mdbx/secp256k1 need ───────
 FROM rust:1.94-bookworm AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        clang libclang-dev pkg-config cmake libssl-dev git ca-certificates \
+        clang libclang-dev pkg-config cmake libssl-dev git ca-certificates protobuf-compiler \
     && rm -rf /var/lib/apt/lists/* \
     && cargo install cargo-chef --locked
 WORKDIR /build
@@ -25,6 +25,13 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # ── builder: cook deps (cached), then build eez-node ─────────────────
 FROM chef AS builder
+# CI can override release optimization for faster candidate builds.
+ARG CARGO_PROFILE_RELEASE_LTO=thin
+ARG CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+ARG CARGO_PROFILE_RELEASE_DEBUG=1
+ENV CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO} \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_PROFILE_RELEASE_CODEGEN_UNITS} \
+    CARGO_PROFILE_RELEASE_DEBUG=${CARGO_PROFILE_RELEASE_DEBUG}
 COPY --from=planner /build/recipe.json recipe.json
 # Slow, cache-friendly layer: only re-runs when the dep graph changes.
 RUN cargo chef cook --release --recipe-path recipe.json
