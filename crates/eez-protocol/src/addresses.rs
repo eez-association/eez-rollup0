@@ -1,11 +1,4 @@
 //! Well-known addresses shared across the eez stack.
-//!
-//! These two addresses jointly define what a *system transaction* is: a
-//! call from [`SYSTEM_ADDRESS`] to [`CCM_ADDRESS`] (the
-//! `loadExecutionTable` that opens a Sync block). Both the L2 payload
-//! builder (which signs the system tx) and the embedded driver (which
-//! tells user txs from system txs in a sealed block) need them, so they
-//! live here — one definition, no "keep these in sync" comments.
 
 use alloy_primitives::{Address, address};
 

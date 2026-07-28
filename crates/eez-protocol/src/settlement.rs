@@ -1,13 +1,5 @@
-//! Settlement-chain helpers shared by the composer (which BUILDS the chained
-//! per-entry `StateDelta`s) and the prover (which GATES them).
-//!
-//! Position B settles a slot as a CHAIN of one delta per entry,
-//! `R0 → P_1 → … → P_{N-1} → R_N`. Interior boundaries `P_k` are either the
-//! builder's PROVEN per-pair candidate roots (P1 transport) or, fail-open,
-//! the domain-separated placeholder below. Both sides must compute the
-//! placeholder identically — the composer to fill it, the prover to
-//! RECOGNIZE it (an interior that is neither a placeholder nor a proven
-//! pair-end root is refused) — so it lives here, in the crate both depend on.
+//! Settlement-chain helpers shared by the composer (builds the chained per-entry
+//! `StateDelta`s `R0 → P_1 → … → R_N`) and the prover (gates them).
 
 use alloy_primitives::{Address, B256, keccak256};
 

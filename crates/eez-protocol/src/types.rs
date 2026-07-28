@@ -1,26 +1,4 @@
-//! Core types: what a detected call looks like, what an execution
-//! returns, and the shape of a finished composition.
-//!
-//! # Composition output shape
-//!
-//! ```text
-//!   Composition
-//!   ├── source:  SourceComposition
-//!   │             ├── rollup_id          : RollupId
-//!   │             ├── batch              : EvmBatch              table-loading batch
-//!   │             └── entry_payload      : Vec<u8>               encoded entry-chain calldata
-//!   │                                                            (L1-style: postAndVerifyBatch; L2-style: loadExecutionTable)
-//!   │
-//!   └── targets: Vec<TargetComposition>                          one per target rollup, ordered
-//!                 ├── rollup_id            : RollupId
-//!                 ├── batch                : EvmBatch             table-loading batch
-//!                 ├── load_table_payload   : Vec<u8>              encoded load-execution-table calldata
-//!                 └── execute_payload      : Vec<u8>              encoded execute-cross-chain-call calldata
-//! ```
-//!
-//! Both sides carry the batch AND pre-encoded calldata so callers can
-//! either re-hash / verify the batch themselves or ship the payload
-//! straight into a wallet for signing + broadcast.
+//! Core types
 
 use alloy_primitives::{Address, Bytes, U256};
 use serde::{Deserialize, Serialize};
@@ -67,18 +45,9 @@ pub struct ExecutedAction {
     /// from `Dispatcher::open_call` until `Dispatcher::close_call`
     /// resolves it; `Resolved { .. }` thereafter.
     pub outcome: ExecutionOutcome,
-    /// Length of the revert span (in `recorded[..]` indices,
-    /// inclusive of this call) when this call's outer EVM frame
-    /// reverted. `None` for calls whose frames returned successfully
-    /// or whose revert was not observed.
-    ///
-    /// Maps directly to the on-chain `L2ToL1Call.revertSpan` field
-    /// for top-level calls (see `IEEZ.sol`'s `L2ToL1Call` struct
-    /// under the multi-prover protocol; formerly
-    /// `CrossChainCall.revertSpan`). Populated post-close by
-    /// [`CompositionBuilder::annotate_revert_span`](crate::CompositionBuilder::annotate_revert_span)
-    /// when the inspector observes the frame returning with
-    /// `InstructionResult::Revert`.
+    /// Length of the revert span (`recorded[..]` indices, inclusive of this
+    /// call) when this call's outer EVM frame reverted; `None` otherwise. Maps
+    /// to on-chain `L2ToL1Call.revertSpan`;
     pub revert_span: Option<u32>,
 }
 
@@ -166,9 +135,6 @@ impl ExecutionOutcome {
 }
 
 /// Source-chain output inside a `Composition`.
-///
-/// Mirrors [`TargetComposition`] so both sides of the composition carry
-/// raw entries AND pre-encoded calldata.
 #[derive(Debug, Clone)]
 pub struct SourceComposition {
     /// Rollup ID of the source chain.
@@ -190,12 +156,7 @@ pub struct TargetComposition {
 }
 
 /// Output of [`CompositionBuilder::finalize`](crate::CompositionBuilder::finalize) —
-/// everything needed for all chains.
-///
-/// Symmetric: the source side and every target side both carry entries
-/// AND pre-encoded calldata. Callers wrap each payload in a tx of their
-/// choice to finalize. `targets` ordering is significant (invariant 2).
-/// N=2 means `targets` has exactly one element; the design supports any N.
+/// one `batch` per chain. `targets` ordering is significant (invariant 2).
 #[derive(Debug, Clone)]
 pub struct Composition {
     /// Source-chain output (exactly one source per composition).

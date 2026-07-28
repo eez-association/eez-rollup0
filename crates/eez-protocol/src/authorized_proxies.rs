@@ -1,34 +1,4 @@
 //! Storage layout for the `authorizedProxies` mapping.
-//!
-//! Two EVM contracts hold this mapping. Both inherit `authorizedProxies`
-//! from the shared abstract parent `EEZBase`, which declares it as its
-//! first (and only) non-transient storage slot — so the slot number is
-//! **0** on both children:
-//!
-//! - **L1 `EEZ.sol`** — slot [`ROLLUPS_AUTHORIZED_PROXIES_SLOT`] (0).
-//!   Source side for L1→L2 composition. Full L1 layout:
-//!   `authorizedProxies` (0, from `EEZBase`), `rollups` (1),
-//!   `verificationByRollup` (2), `_transientExecutions` (3),
-//!   `_transientLookupCalls` (4).
-//! - **L2 `EEZL2.sol`** — slot [`CCM_AUTHORIZED_PROXIES_SLOT`] (0).
-//!   Source side for L2→L1 composition. Full L2 layout:
-//!   `authorizedProxies` (0, from `EEZBase`), `executions` (1),
-//!   `lookupCalls` (2), `lastLoadBlock` (3), `executionIndex` (4).
-//!   `ROLLUP_ID` and `SYSTEM_ADDRESS` are immutables (no storage slot).
-//!
-//! The two constants are equal (both 0) but kept distinct to document
-//! intent at call sites and to leave room for re-divergence if upstream
-//! ever moves either mapping off `EEZBase`.
-//!
-//! The slot is a compile-time property of the contract's storage
-//! layout. If the upstream Solidity declaration order changes, update
-//! the constant.
-//!
-//! Both constants are consumed at config build time as the
-//! `authorized_proxies_slot: u8` field on
-//! [`crate::ProxyLookupConfig`]. The inspector reads
-//! [`proxy_mapping_key`] / [`decode_proxy_value`] directly via the
-//! `u8` slot.
 
 use crate::RollupId;
 use alloy_primitives::{Address, B256, U256, keccak256};
