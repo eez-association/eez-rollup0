@@ -26,7 +26,7 @@ mod witness_source;
 use std::{collections::HashMap, env, str::FromStr, sync::Arc, time::Duration};
 
 use alloy_primitives::{Address, B256};
-use alloy_provider::RootProvider;
+use alloy_provider::{Provider as _, RootProvider};
 use alloy_signer_local::PrivateKeySigner;
 use clap::Parser as _;
 use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
@@ -702,15 +702,20 @@ fn main() -> eyre::Result<()> {
                         eyre::eyre!("EEZ_CCM_L2_ADDRESS required (set by deploy.sh)")
                     })?,
                 )?;
-                // L1 RPC URL: the embedded L1's HTTP port (so the
-                // composer's L1-forwarding round-trips back into our
-                // own L1 reth). Same value as `EEZ_L1_RPC_URL` for
-                // embedded mode.
+                // Submission RPC for postBatch and inbound source-chain reads.
+                // This can differ from the embedded L1 used for local source
+                // simulation (the E2E harness deliberately uses Anvil here), so
+                // derive the signing chain ID from this provider rather than the
+                // embedded chain spec.
                 let l1_rpc_url: reqwest::Url = env::var("EEZ_L1_RPC_URL")
                     .map_err(|_| eyre::eyre!("EEZ_L1_RPC_URL required for L1 forwarding"))?
                     .parse()
                     .map_err(|e| eyre::eyre!("EEZ_L1_RPC_URL malformed: {e}"))?;
                 let l1_provider = alloy_provider::RootProvider::new_http(l1_rpc_url.clone());
+                let l1_submission_chain_id = l1_provider
+                    .get_chain_id()
+                    .await
+                    .map_err(|e| eyre::eyre!("read chain id from EEZ_L1_RPC_URL: {e}"))?;
                 let l1_poster_key = env::var("EEZ_L1_POSTER_KEY").map_err(|_| {
                     eyre::eyre!("EEZ_L1_POSTER_KEY required for L1 postBatch signing")
                 })?;
@@ -754,7 +759,7 @@ fn main() -> eyre::Result<()> {
                     l1_provider,
                     submitter: submitter.clone(),
                     l1_poster_signer,
-                    l1_chain_id: l1_source_chain_id,
+                    l1_chain_id: l1_submission_chain_id,
                     l1_post_batch_priority_fee,
                     ecdsa_proof_system_address,
                     l2_rollup_id: l2_rollup_id_for_ctx,
