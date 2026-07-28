@@ -1,7 +1,5 @@
 //! Composer umbrella. Owns the per-rollup block-production + batch-
-//! submission stack: `HashMap<RollupId, RollupState>` (timing,
-//! L2 provider, L1-confirmed cursor per rollup) plus the shared
-//! Aggregator + Submitter + Prover + `L1Watcher`.
+//! submission stack.
 //!
 //! The composer is the "produce + post" half of an eez node. The
 //! "follow" half — reth + Deriver — lives outside the umbrella and
@@ -23,16 +21,6 @@
 //!                ↑
 //! eez-node      Binary. Decides follower vs composer mode at startup.
 //! ```
-//!
-//! # Stage 4 status
-//!
-//! - S4.2 (this commit): umbrella + L1-anchored Scheduler in place;
-//!   `eez-l1::Composer` retires; logic moves here.
-//! - S4.7: per-rollup `HeldPool`; cross-chain handlers; `eez-protocol`
-//!   inspector integration.
-//!
-//! See `docs/plans/IMPLEMENTATION.md` §5.4.8 (umbrella architecture) +
-//! §5.4.11 (work order).
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
@@ -51,7 +39,7 @@ pub use held_pool::{HeldPool, HeldTx};
 pub use ingress::Direction;
 
 #[doc(inline)]
-pub use local::{BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient, build_sync_block};
+pub use local::{build_sync_block, BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient};
 pub use optimistic::OptimisticallyIncluded;
 #[doc(inline)]
 pub use rollup::{RollupConfig, RollupState};
