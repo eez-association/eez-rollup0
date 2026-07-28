@@ -74,8 +74,8 @@ use alloy_sol_types::{SolValue, sol};
 
 use tracing::debug;
 
-use crate::abi::{ExecutionEntrySol, LookupCallSol};
 use crate::abi::EvmBatch;
+use crate::abi::{ExecutionEntrySol, LookupCallSol};
 
 // ── Per-element atomic hashes ─────────────────────────────────────
 

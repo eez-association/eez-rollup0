@@ -19,12 +19,12 @@ use alloy_sol_types::SolCall;
 
 use tracing::{debug, trace};
 
+use crate::abi::EvmBatch;
 use crate::abi::{
     CrossChainCallSol, ExecutionEntrySol, ExpectedL1ToL2CallSol, L2ExecutionEntrySol,
     L2ToL1CallSol, LookupCallSol, StateDeltaSol, postAndVerifyBatchCall,
 };
 use crate::action::cross_chain_call_hash;
-use crate::abi::EvmBatch;
 
 /// Classification of a single [`ExecutedAction`] within an entry's
 /// flat call window. Drives [`build_batch`]'s emission decision.
@@ -1233,8 +1233,7 @@ mod tests {
 
     #[test]
     fn empty_recorded_yields_empty_batch() {
-        let batch =
-            build_batch(&[], RollupId(1)).expect("build_batch ok");
+        let batch = build_batch(&[], RollupId(1)).expect("build_batch ok");
         assert!(batch.entries.is_empty());
         assert!(batch.l1ToL2lookupCalls.is_empty());
         assert!(batch.is_empty());
@@ -1250,8 +1249,7 @@ mod tests {
         // `returnData`. (sync-rollups-protocol@fe7bf66 — a folded outer here
         // makes `executeCrossChainCall` revert `RollingHashMismatch`.)
         let calls = vec![record(RollupId(1), RollupId(0), true)];
-        let batch =
-            build_batch(&calls, RollupId(0)).expect("build_batch ok");
+        let batch = build_batch(&calls, RollupId(0)).expect("build_batch ok");
         assert_eq!(batch.entries.len(), 1);
         // The TopLevel call is described by the entry's
         // `proxyEntryHash` + `returnData`; reentrant children land
@@ -1563,8 +1561,7 @@ mod tests {
     #[test]
     fn outgoing_to_other_rollup_yields_empty_batch_for_target() {
         let calls = vec![record(RollupId(1), RollupId(0), true)];
-        let batch =
-            build_batch(&calls, RollupId(1)).expect("build_batch ok");
+        let batch = build_batch(&calls, RollupId(1)).expect("build_batch ok");
         assert!(batch.entries.is_empty());
         assert!(batch.l1ToL2lookupCalls.is_empty());
     }
@@ -1575,8 +1572,7 @@ mod tests {
             record(RollupId(1), RollupId(0), true),
             record(RollupId(0), RollupId(1), true),
         ];
-        let batch =
-            build_batch(&calls, RollupId(0)).expect("build_batch ok");
+        let batch = build_batch(&calls, RollupId(0)).expect("build_batch ok");
         assert_eq!(batch.entries.len(), 1);
         assert_eq!(
             batch.entries[0].expectedL1ToL2Calls.len(),
@@ -1596,8 +1592,8 @@ mod tests {
             record(RollupId(1), RollupId(0), true),
             record(RollupId(0), RollupId(1), false),
         ];
-        let err = build_batch(&calls, RollupId(0))
-            .expect_err("nested-failed lookup must be refused");
+        let err =
+            build_batch(&calls, RollupId(0)).expect_err("nested-failed lookup must be refused");
         assert!(
             format!("{err}").contains("entry-scoped emission"),
             "got: {err}"
@@ -1640,8 +1636,7 @@ mod tests {
     #[test]
     fn terminal_revert_yields_empty_batch() {
         let calls = vec![record(RollupId(1), RollupId(0), false)];
-        let batch =
-            build_batch(&calls, RollupId(0)).expect("build_batch ok");
+        let batch = build_batch(&calls, RollupId(0)).expect("build_batch ok");
         assert!(batch.is_empty());
     }
 

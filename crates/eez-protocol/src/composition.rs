@@ -832,14 +832,7 @@ mod tests {
     }
 
     fn entry_rollup(outcome_root: [u8; 32]) -> Rollup {
-        Rollup {
-            client: Arc::new(MockClient {
-                session_outcome: sample_outcome(outcome_root),
-            }),
-            session: None,
-            config: target_config(),
-            initial_state_root: [0u8; 32],
-        }
+        rollup_with_session(outcome_root)
     }
 
     fn rollup_with_session(outcome_root: [u8; 32]) -> Rollup {
@@ -1092,31 +1085,17 @@ mod tests {
 
     // ── Terminal-revert short-circuit ──────────────────────────────
 
-    struct NoCcmClient;
-
-    #[async_trait::async_trait]
-    impl ChainClient for NoCcmClient {
-        async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
-            Ok([0u8; 32])
-        }
-        async fn begin_execution_session(
-            &self,
-        ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
-            Ok(Box::new(MockSession {
-                outcome: ExecutionOutcome::Resolved {
+    fn rollup_with_reverted_session() -> Rollup {
+        Rollup {
+            client: Arc::new(MockClient {
+                session_outcome: ExecutionOutcome::Resolved {
                     return_data: b"revert".to_vec(),
                     pre_state_root: [0u8; 32],
                     post_state_root: [0u8; 32],
                     gas_used: 1,
                     success: false,
                 },
-            }))
-        }
-    }
-
-    fn rollup_with_reverted_session() -> Rollup {
-        Rollup {
-            client: Arc::new(NoCcmClient),
+            }),
             session: None,
             config: target_config(),
         }

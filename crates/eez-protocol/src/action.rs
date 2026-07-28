@@ -154,5 +154,4 @@ mod tests {
             cross_chain_call_hash(a, b, c, d, e, RollupId(7))
         );
     }
-
 }

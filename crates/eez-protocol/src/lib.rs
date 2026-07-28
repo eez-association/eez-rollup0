@@ -59,6 +59,8 @@ pub mod types;
 mod assertions;
 
 #[doc(inline)]
+pub use abi::EvmBatch;
+#[doc(inline)]
 pub use action::cross_chain_call_hash;
 #[doc(inline)]
 pub use addresses::{CCM_ADDRESS, SYSTEM_ADDRESS};
@@ -67,8 +69,6 @@ pub use authorized_proxies::{
     CCM_AUTHORIZED_PROXIES_SLOT, ProxyInfo, ProxyLookupConfig, ROLLUPS_AUTHORIZED_PROXIES_SLOT,
     decode_proxy_value, proxy_mapping_key,
 };
-#[doc(inline)]
-pub use abi::EvmBatch;
 #[doc(inline)]
 pub use composition::{CompositionBuilder, Rollup, TargetConfig};
 #[doc(inline)]
