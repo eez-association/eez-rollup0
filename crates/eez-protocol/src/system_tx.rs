@@ -304,8 +304,11 @@ pub fn build_cross_chain_sync_pairs(
     // ── PHASE 1 — outbound: each loadExecutionTable immediately paired with
     // its consuming user tx (the self-clean requires consume-before-next-load).
     for (entry, user_tx) in outbound {
+        // Fail LOUD on a malformed outbound entry rather than silently
+        // dropping it from the Sync block (which would diverge the Sync-block
+        // root vs the batch with no error), mirroring `reject_multicall` above.
         let Some(call) = entry.l2ToL1Calls.first() else {
-            continue;
+            return Err("outbound entry has empty l2ToL1Calls — malformed".to_string());
         };
         let l2_entry = build_l2_outbound_entry(OutboundEntry {
             target: call.targetAddress,

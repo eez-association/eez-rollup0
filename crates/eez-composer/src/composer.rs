@@ -1350,6 +1350,22 @@ where
                                     continue;
                                 }
                                 escrow_remaining = Some(avail - need);
+                            } else {
+                                // Escrow read failed (transient L1 RPC): the
+                                // over-escrow check is skipped and the withdrawal
+                                // admitted. The on-chain balance check remains the
+                                // value backstop, but if it over-escrows the whole
+                                // all-or-nothing bundle reverts on L1 — surface the
+                                // liveness hit instead of silently gambling.
+                                event!(
+                                    name: "eez.composer.cc_compose.escrow_read_failed",
+                                    Level::WARN,
+                                    rollup_id,
+                                    tx_idx = idx,
+                                    tx_hash = %held.hash,
+                                    need = %need,
+                                    "escrow read returned None; over-escrow check skipped and withdrawal admitted (would drop the bundle if it reverts InsufficientRollupBalance on L1)",
+                                );
                             }
                         }
                         for oe in &l1_entries {

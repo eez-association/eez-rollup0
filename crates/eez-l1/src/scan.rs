@@ -152,15 +152,24 @@ pub(crate) async fn scan_batch_logs_range(
     // credited only its own subset later — see [`attribute_settlement`].
     let mut settled_by_block: HashMap<u64, HashSet<B256>> = HashMap::new();
     for l in &winner_logs {
-        if let Some(bn) = l.block_number {
-            let data = l.data().data.as_ref();
-            if data.len() == 32 {
-                settled_by_block
-                    .entry(bn)
-                    .or_default()
-                    .insert(B256::from_slice(data));
-            }
+        // Fail closed on a malformed winner log, symmetric with the
+        // BatchPosted path below: a missing block_number or a newState
+        // that is not a bytes32 means the L1 data source is corrupt/pruning
+        // — surface it rather than silently under-counting settlements.
+        let bn = l.block_number.ok_or_else(|| {
+            L1Error::Provider("L2ExecutionPerformed log missing block_number".into())
+        })?;
+        let data = l.data().data.as_ref();
+        if data.len() != 32 {
+            return Err(L1Error::Provider(format!(
+                "L2ExecutionPerformed log malformed: newState is {} bytes, expected 32",
+                data.len()
+            )));
         }
+        settled_by_block
+            .entry(bn)
+            .or_default()
+            .insert(B256::from_slice(data));
     }
 
     let mut out: Vec<ScannedBatch> = Vec::with_capacity(logs.len());

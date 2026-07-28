@@ -266,9 +266,18 @@ fn lookup_authorized_proxy_live<CTX: ContextTr + Host>(
     addr: Address,
 ) -> Option<ProxyInfo> {
     // Warm the rollups account before the SLOAD (see fn-level doc).
-    ctx.journal_mut().load_account(rollups_addr).ok()?;
+    // A genuine not-a-proxy is `decode_proxy_value` returning None (slot is
+    // zero); a DB error here is distinct — still treated as not-a-proxy (a
+    // real fault resurfaces on the next real SLOAD), but surfaced loudly.
+    if let Err(e) = ctx.journal_mut().load_account(rollups_addr) {
+        tracing::warn!(rollups = %rollups_addr, error = ?e, "proxy lookup: DB error loading rollups account; treating as not-a-proxy");
+        return None;
+    }
     let key = proxy_mapping_key(addr, proxy_slot);
-    let load = ctx.sload(rollups_addr, key.into())?;
+    let Some(load) = ctx.sload(rollups_addr, key.into()) else {
+        tracing::warn!(rollups = %rollups_addr, "proxy lookup: DB error reading authorizedProxies slot; treating as not-a-proxy");
+        return None;
+    };
     decode_proxy_value(load.data)
 }
 
