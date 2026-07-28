@@ -487,28 +487,7 @@ fn main() -> eyre::Result<()> {
             // up — it owns `LocalChainClient`s over L1 (entry) and L2
             // (follower). `None` without an embedded L1. Inlined because
             // the `FullNode` AddOns type resists a typed helper return.
-            // L2 ENTRY client for OUTBOUND (L2→L1) source-sim — built inside the
-            // block below alongside the L2 follower, threaded into `Composer::new`
-            // via `CrossChainWiring`. `None` without an embedded L1.
-            let mut l2_entry_client: Option<
-                Arc<
-                    dyn eez_protocol::executor::ChainClient
-                        + Send
-                        + Sync,
-                >,
-            > = None;
-            type WiringParts = (
-                eez_protocol::RollupId,
-                Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
-                std::collections::HashMap<
-                    eez_protocol::RollupId,
-                    (
-                        Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
-                        eez_protocol::TargetConfig,
-                    ),
-                >,
-            );
-            let evm_composer: Option<WiringParts> =
+            let cross_chain: Option<CrossChainWiring> =
                 if let Some(l1_variant) = embedded_l1.as_ref() {
                     use eez_composer::{GnosisL1Adapter, LocalChainClient};
                     use eez_protocol::rollup_id::RollupId;
@@ -609,7 +588,6 @@ fn main() -> eyre::Result<()> {
                             + Send
                             + Sync,
                     > = l2_entry;
-                    l2_entry_client = Some(l2_entry_view);
 
                     let entry_cfg = TargetConfig {
                         proxy_lookup: ProxyLookupConfig {
@@ -632,38 +610,11 @@ fn main() -> eyre::Result<()> {
                     wired_rollups
                         .insert(l1_rollup_id, (Arc::clone(&entry_client_view), entry_cfg));
                     wired_rollups.insert(l2_rollup_id_typed, (l2_follower_view, l2_follower_cfg));
-                    let composed = (
-                        l1_rollup_id,
-                        entry_client_view,
-                        wired_rollups,
-                    );
-                    event!(
-                        name: "eez.node.evm_composer.ready",
-                        Level::INFO,
-                        l1_rollup_id = l1_rollup_id_u64,
-                        l2_rollup_id = rollup_id,
-                        eez_registry = %eez_registry,
-                        ccm_l2 = %ccm_l2,
-                        "cross-chain composer constructed (L1 entry + L2 follower)",
-                    );
-                    Some(composed)
-                } else {
-                    event!(
-                        name: "eez.node.evm_composer.skipped",
-                        Level::WARN,
-                        "embedded L1 not active; cross-chain EvmComposer disabled",
-                    );
-                    None
-                };
-
             // CrossChainExecCtx: signer + L2 addresses needed to wrap
             // EvmComposer's `(load_table, execute)` calldata pairs
             // into signed legacy L2 system txs at Sync-slot time.
             // Constructed only when EvmComposer is constructed —
             // both are tied to embedded L1 mode.
-            let cc_exec_ctx: Option<Arc<eez_composer::CrossChainExecCtx>> = if evm_composer
-                .is_some()
-            {
                 let system_key = env::var("EEZ_L2_SYSTEM_KEY").map_err(|_| {
                     eyre::eyre!("EEZ_L2_SYSTEM_KEY required when the cross-chain composer is wired")
                 })?;
@@ -720,7 +671,7 @@ fn main() -> eyre::Result<()> {
                 // `eth_sendBundle` on relays that support it (rbuilder),
                 // ordered mempool submission on plain execution RPCs
                 // (dev reth, anvil) detected via JSON-RPC -32601.
-                Some(Arc::new(eez_composer::CrossChainExecCtx {
+                let exec_ctx = Arc::new(eez_composer::CrossChainExecCtx {
                     system_signer,
                     ccm_l2_address,
                     l2_chain_id: chain_spec.chain().id(),
@@ -734,15 +685,38 @@ fn main() -> eyre::Result<()> {
                     ecdsa_proof_system_address,
                     l2_rollup_id: rollup_id,
                     eez_registry,
-                }))
-            } else {
-                None
-            };
+                });
+                    event!(
+                        name: "eez.node.evm_composer.ready",
+                        Level::INFO,
+                        l1_rollup_id = l1_rollup_id_u64,
+                        l2_rollup_id = rollup_id,
+                        eez_registry = %eez_registry,
+                        ccm_l2 = %ccm_l2,
+                        "cross-chain composer constructed (L1 entry + L2 follower)",
+                    );
+                    Some(CrossChainWiring {
+                        entry_rollup_id: l1_rollup_id,
+                        entry_client: entry_client_view,
+                        rollups: wired_rollups,
+                        exec_ctx,
+                        l2_entry_client: l2_entry_view,
+                    })
+                } else {
+                    event!(
+                        name: "eez.node.evm_composer.skipped",
+                        Level::WARN,
+                        "embedded L1 not active; cross-chain EvmComposer disabled",
+                    );
+                    None
+                };
+
             // Project the Arc<CrossChainExecCtx> into a SystemTxContext
             // BEFORE moving it into the Composer. The Deriver picks
             // this up further down to STF-reconstruct the same L2
             // system txs the composer produced.
-            let deriver_system_tx_cfg = cc_exec_ctx.as_ref().map(|ctx| {
+            let deriver_system_tx_cfg = cross_chain.as_ref().map(|cc| {
+                let ctx = &cc.exec_ctx;
                 eez_protocol::system_tx::SystemTxContext {
                     system_signer: ctx.system_signer.clone(),
                     ccm_l2_address: ctx.ccm_l2_address,
@@ -782,22 +756,6 @@ fn main() -> eyre::Result<()> {
                         store, ws_provider, ws_evm,
                     )) as Arc<dyn eez_prover::ProvingWitnessSource>)
                 }
-                _ => None,
-            };
-            // All three cross-chain pieces are wired together by the
-            // embedded-L1 branch above, or not at all.
-            let cross_chain = match (evm_composer, cc_exec_ctx, l2_entry_client) {
-                (
-                    Some((entry_rollup_id, entry_client, wired_rollups)),
-                    Some(exec_ctx),
-                    Some(l2_entry_client),
-                ) => Some(CrossChainWiring {
-                    entry_rollup_id,
-                    entry_client,
-                    rollups: wired_rollups,
-                    exec_ctx,
-                    l2_entry_client,
-                }),
                 _ => None,
             };
             let composer = Composer::new(
