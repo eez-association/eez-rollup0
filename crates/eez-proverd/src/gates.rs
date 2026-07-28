@@ -582,14 +582,21 @@ pub(crate) fn multi_inbound_outcome_gate(
     // The settled rollup anchors every H. entries[0] is the leading-immediate
     // entry carrying the settlement StateDelta (rollupId == our L2). Without it
     // we can't bind any H → refuse.
-    let settled_rollup = entries
+    let settled_delta = entries
         .first()
         .and_then(|e| e.stateDeltas.first())
-        .map(|delta| RollupId(delta.rollupId.to::<u64>()))
         .ok_or_else(|| {
             "multi-inbound gate REFUSE: entry[0] carries no settlement StateDelta — cannot bind H"
                 .to_string()
         })?;
+    // Fail closed on an adversarial rollupId >= 2^64 rather than panic the
+    // `u64` converter (`to::<u64>()` is `uint_try_to().expect`).
+    let settled_rollup = RollupId(u64::try_from(settled_delta.rollupId).map_err(|_| {
+        format!(
+            "multi-inbound gate REFUSE: settlement rollupId {} exceeds u64::MAX",
+            settled_delta.rollupId
+        )
+    })?);
 
     let hash_of = |d: &eez_protocol::entries::DecodedInbound| -> B256 {
         eez_protocol::cross_chain_call_hash(

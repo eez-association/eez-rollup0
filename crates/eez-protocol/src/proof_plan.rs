@@ -33,7 +33,7 @@
 //! `publicInputsHash` fold and on-chain `_validateStructure` are
 //! the construction this plan is shaped to feed.
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 
 use crate::rollup_id::RollupId;
 
@@ -254,6 +254,15 @@ pub enum ProofPlanInvariantError {
         block_number: u64,
         /// Whether an L1 block hash was supplied alongside it.
         hash_supplied: bool,
+    },
+    /// A decoded `rollupId` (Solidity `uint256`) exceeded `u64::MAX`
+    /// and cannot be represented as a [`RollupId`]. A well-formed batch
+    /// never carries one; a malformed/adversarial `PostBatch` can, and
+    /// must fail closed rather than panic the `u64` converter.
+    #[error("rollupId {rollup_id} exceeds u64::MAX")]
+    RollupIdOutOfRange {
+        /// The out-of-range `rollupId`, as decoded from ABI.
+        rollup_id: U256,
     },
 }
 
