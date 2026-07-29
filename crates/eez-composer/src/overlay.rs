@@ -29,13 +29,9 @@
 //! writes mutations to its own cache + journal. On commit, diff the
 //! caches and apply.
 //!
-//! # Crate-layering invariants
-//!
-//! This module lives in `eez-evm-inspector` because that crate
-//! already depends on `revm`. It must not depend on `reth_*` or
-//! `eez-composer`. The actual nested-call execution + diff-apply path
-//! lives in this crate's `inspector.rs` (which has the necessary
-//! `&mut Context` access during the `Inspector::call` hook).
+//! The nested-call execution + diff-apply path lives in
+//! [`inspector`](crate::inspector), which has the `&mut Context` access
+//! during the `Inspector::call` hook.
 
 use revm::context_interface::journaled_state::account::JournaledAccountTr;
 use revm::context_interface::{ContextTr, Host, JournalTr};

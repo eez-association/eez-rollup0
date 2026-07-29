@@ -39,8 +39,10 @@
 pub mod composer;
 pub mod held_pool;
 pub mod ingress;
+pub mod inspector;
 pub mod local;
 pub mod optimistic;
+pub mod overlay;
 pub mod rollup;
 
 #[doc(inline)]
@@ -55,3 +57,11 @@ pub use local::{BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient, b
 pub use optimistic::OptimisticallyIncluded;
 #[doc(inline)]
 pub use rollup::{RollupConfig, RollupState};
+
+#[doc(inline)]
+pub use inspector::{
+    OverlayChannel, OverlayChannelHandle, SessionInspector, SessionInspectorFactory,
+    new_overlay_channel,
+};
+#[doc(inline)]
+pub use overlay::{OverlayError, apply_overlay_diff, clone_state};
