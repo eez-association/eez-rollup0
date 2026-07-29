@@ -26,16 +26,13 @@ use alloy_provider::Provider as _;
 use async_trait::async_trait;
 use eez_driver::{
     BlockCommitterHandle, ParentContext, SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
-    witness::{ExecutionWitnessMode, block_witness},
 };
 use eez_l1::{BundleTarget, L1Event, L1Watcher, SendOutcome, Submitter};
-use eez_prover::{BlockWitness, Prover};
+use eez_prover::Prover;
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_evm_ethereum::EthEvmConfig;
-use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
-use reth_storage_api::{
-    BlockReader, BlockSource, StateProvider, StateProviderFactory, TransactionsProvider,
-};
+use reth_primitives_traits::AlloyBlockHeader;
+use reth_storage_api::{BlockReader, StateProvider, StateProviderFactory, TransactionsProvider};
 use tokio::sync::broadcast;
 use tracing::{Level, event};
 
@@ -43,6 +40,10 @@ use crate::held_pool::HeldTx;
 use crate::ingress::Direction;
 use crate::local::{build_sync_block, sync_block_pair_roots};
 use crate::optimistic::OptimisticallyIncluded;
+use crate::postbatch::{
+    assemble_batch, attach_proof_carriers, build_da_payload, collect_window_witnesses,
+    inbound_ether_map, stitch_settlement,
+};
 use crate::rollup::RollupState;
 
 /// Runtime config for the cross-chain execution path on Sync slots.
@@ -2026,41 +2027,8 @@ where
         outbound_user_txs: &[Bytes],
     ) -> Result<Bytes, String> {
         use alloy_sol_types::SolCall;
-        use eez_protocol::abi::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
+        use eez_protocol::abi::postAndVerifyBatchCall;
 
-        // Empty compositions is a VALID case: an empty HeldPool Sync
-        // slot still emits a postBatch carrying just the leading
-        // immediate entry so L1's stored stateRoot tracks the L2
-        // progression. We build the batch from scratch (no per-tx
-        // batch to merge from); only the leading immediate entry +
-        // proof-system metadata go in.
-
-        // Take the first composition's batch as the template, then
-        // merge every later composition's entries + lookupCalls into
-        // it. Empty compositions → build a fresh empty batch shell;
-        // the leading immediate entry below is the entire payload.
-        let mut batch = if compositions.is_empty() {
-            eez_protocol::EvmBatch::default()
-        } else {
-            let mut b = compositions[0].source.batch.clone();
-            for c in &compositions[1..] {
-                b.entries.extend(c.source.batch.entries.iter().cloned());
-                b.l1ToL2lookupCalls
-                    .extend(c.source.batch.l1ToL2lookupCalls.iter().cloned());
-            }
-            b
-        };
-
-        // Prepend ONE leading immediate entry (`proxyEntryHash == 0`)
-        // covering all L2 effects before the sync block — EEZ.sol drains
-        // it inline during postAndVerifyBatch, applying its stateDelta
-        // against L1's recorded root.
-        //
-        // `currentState` = L2.stateRoot(posted) (the L1-confirmed cursor)
-        // — must equal L1.config.stateRoot at postBatch time so the
-        // deriver's check_claimed_state agrees. `newState` = L2 at
-        // sync_block-1 (`parent_header.state_root()`), lumping every
-        // pre-sync block's effects into one stateDelta.
         let posted = self
             .inner
             .rollups
@@ -2082,171 +2050,31 @@ where
         };
         let pre_sync_state_root = parent_header.state_root();
         let rollup_id_u256 = U256::from(rollup_id);
-        let immediate_entry = eez_protocol::abi::ExecutionEntrySol {
-            stateDeltas: vec![eez_protocol::abi::StateDeltaSol {
-                rollupId: rollup_id_u256,
-                currentState: pre_state_root,
-                newState: pre_sync_state_root,
-                etherDelta: alloy_primitives::I256::ZERO,
-            }],
-            proxyEntryHash: B256::ZERO,
-            destinationRollupId: rollup_id_u256,
-            l2ToL1Calls: Vec::new(),
-            expectedL1ToL2Calls: Vec::new(),
-            expectedLookups: Vec::new(),
-            callCount: U256::ZERO,
-            returnData: Bytes::new(),
-            rollingHash: B256::ZERO,
-        };
-        batch.entries.insert(0, immediate_entry);
-
-        // Splice OUTBOUND settlement entries after the leading anchor (delta
-        // attached below). The contract drains the contiguous `proxyEntryHash==0`
-        // run inline, so order must be `[anchor | outbound | inbound]`. `dest=rid`
-        // is the settlement's source rollup (not the call's MAINNET target);
-        // `_validateStructure` membership-checks it.
-        for (k, oe) in outbound_entries.iter().enumerate() {
-            let mut entry = oe.clone();
-            entry.destinationRollupId = rollup_id_u256;
-            batch.entries.insert(1 + k, entry);
-        }
-
-        // Deposit value for inbound deferred entries: the lean on-chain entry binds
-        // V only in its `proxyEntryHash` preimage, so read V from the DA sidecar
-        // (`targets[].batch`, same `proxyEntryHash`). Value-free → absent → 0.
-        let inbound_ether: HashMap<B256, alloy_primitives::I256> = compositions
-            .iter()
-            .flat_map(|c| c.targets.iter())
-            .flat_map(|t| t.batch.entries.iter())
-            .filter_map(|e| {
-                let v = e.l2ToL1Calls.first()?.value;
-                if v.is_zero() {
-                    return None;
-                }
-                alloy_primitives::I256::try_from(v)
-                    .ok()
-                    .map(|d| (e.proxyEntryHash, d))
-            })
-            .collect();
-
-        // Cross-chain entries arrive with EMPTY `stateDeltas`; attach one chained
-        // settlement delta to each (the anchor already has its own) — else
-        // `_applyStateDeltas` no-ops and the L2 root never settles. Direction by
-        // `proxyEntryHash`: outbound (== 0) → `-V` (via `outbound_ether_out`; None =
-        // multi-call-with-value, unsupported → reject); inbound (!= 0) → `+V` deposit.
-        // Value-free → 0.
-        // `newState` = effect `k`'s per-effect root `pair_roots[k]`; entries are
-        // ordered `[outbound… | inbound…]`, matching the Sync block's pair-ends.
-        // The prover requires this exact per-entry value. `currentState` is fixed
-        // by the stitch below.
-        let mut effect_k = 0usize;
-        for entry in &mut batch.entries {
-            // Skip entries that already carry a delta (the anchor); fill only the
-            // cross-chain effect entries, which arrive empty.
-            if !entry.stateDeltas.is_empty() {
-                continue;
-            }
-            let ether_delta = if entry.proxyEntryHash == B256::ZERO {
-                let v = eez_protocol::entries::outbound_ether_out(entry).ok_or_else(|| {
-                    format!(
-                        "outbound entry: multi-call value not supported \
-                         (callCount={}, l2ToL1Calls={})",
-                        entry.callCount,
-                        entry.l2ToL1Calls.len(),
-                    )
-                })?;
-                if v.is_zero() {
-                    alloy_primitives::I256::ZERO
-                } else {
-                    -alloy_primitives::I256::try_from(v)
-                        .map_err(|e| format!("outbound etherOut {v} overflows I256: {e}"))?
-                }
-            } else {
-                inbound_ether
-                    .get(&entry.proxyEntryHash)
-                    .copied()
-                    .unwrap_or(alloy_primitives::I256::ZERO)
-            };
-            let new_state = *pair_roots.get(effect_k).ok_or_else(|| {
-                format!(
-                    "settlement stitch: effect entry {effect_k} has no per-effect root \
-                     (only {} pair-end roots — pair-end/entry misalignment)",
-                    pair_roots.len(),
-                )
-            })?;
-            entry.stateDeltas = vec![eez_protocol::abi::StateDeltaSol {
-                rollupId: rollup_id_u256,
-                currentState: B256::ZERO,
-                newState: new_state,
-                etherDelta: ether_delta,
-            }];
-            effect_k += 1;
-        }
-        if effect_k != pair_roots.len() {
-            return Err(format!(
-                "settlement stitch: {effect_k} effect entries but {} per-effect roots \
-                 (pair-end/entry misalignment)",
-                pair_roots.len(),
-            ));
-        }
-
-        // Stitch the per-rollup stateDelta chain: EEZ.sol `_applyStateDeltas`
-        // enforces `config.stateRoot == delta.currentState` then sets it to
-        // `newState`, so each entry's `currentState` must chain to the prior
-        // entry's `newState`. This chains `pre_sync → R_0 → … → R_last (final
-        // root)`, satisfying both EEZ.sol and the prover's effect-prefix gate.
-        let mut running_roots: HashMap<U256, B256> = HashMap::new();
-        for entry in &mut batch.entries {
-            for delta in &mut entry.stateDeltas {
-                if let Some(prev_new) = running_roots.get(&delta.rollupId).copied() {
-                    delta.currentState = prev_new;
-                }
-                running_roots.insert(delta.rollupId, delta.newState);
-            }
-        }
-
-        // Anchor-only batch (no effects): the immediate is the last entry, so it
-        // must carry the final root. An empty Sync block still mutates state
-        // (EIP-2935 / EIP-4788 system writes), so `parent.stateRoot` differs from
-        // the re-executed final root and the endpoint gate would fail. With
-        // effects, the last effect's root already is the final root.
-        if pair_roots.is_empty() {
-            if let Some(last) = batch.entries.last_mut() {
-                for delta in last.stateDeltas.iter_mut().rev() {
-                    if delta.rollupId == rollup_id_u256 {
-                        delta.newState = sync_block_state_root;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // The chain must end at the Sync block's final root. The prover enforces
-        // this (gates.rs); assert locally so a stitch bug fails fast here.
-        debug_assert_eq!(
-            batch
-                .entries
-                .last()
-                .and_then(|e| e.stateDeltas.last())
-                .map(|d| d.newState),
-            Some(sync_block_state_root),
-            "settlement chain must end at the Sync-block state root",
+        let mut batch = assemble_batch(
+            compositions,
+            rollup_id_u256,
+            pre_state_root,
+            pre_sync_state_root,
+            outbound_entries,
         );
 
-        // The contract drains the leading contiguous `proxyEntryHash==0` run
-        // inline (`EEZ.sol:387`): 1 anchor immediate + N outbound immediates.
-        // Inbound deferred entries (proxyEntryHash != 0) queue for
-        // `executeCrossChainCall` consumption. N=0 for inbound-only → 1.
-        batch.transientExecutionEntryCount = U256::from(1 + outbound_entries.len() as u64);
+        let inbound_ether = inbound_ether_map(compositions);
 
-        // Registry-id settlement gate: refuse a batch carrying any non-registry
-        // destinationRollupId (e.g. an un-rewritten MAINNET(0) outbound entry).
-        assert_batch_registry_native(&batch, rollup_id_u256)?;
-        batch.proofSystems = vec![ctx.ecdsa_proof_system_address];
-        batch.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
-            rollupId: U256::from(ctx.l2_rollup_id),
-            proofSystemIndex: vec![0u64],
-        }];
+        stitch_settlement(
+            &mut batch,
+            rollup_id_u256,
+            pair_roots,
+            &inbound_ether,
+            sync_block_state_root,
+        )?;
+
+        attach_proof_carriers(
+            &mut batch,
+            rollup_id_u256,
+            outbound_entries.len(),
+            ctx.ecdsa_proof_system_address,
+            ctx.l2_rollup_id,
+        )?;
         // Encode the full L2 block range this batch covers, not just the
         // Sync block: the composer accumulates K-1 intermediate Live
         // blocks between Sync slots (Rollup-1 §1.3) and the deriver must
@@ -2290,167 +2118,30 @@ where
             claimed_final = %sync_block_state_root,
             "postBatch anchors: currentState at cursor, claimed final at Sync block",
         );
-        let span_len = usize::try_from(sync_block_number - from + 1)
-            .map_err(|e| format!("batch span overflow: {e}"))?;
-        let mut blocks_rev: Vec<Vec<Vec<u8>>> = Vec::with_capacity(span_len.saturating_sub(1));
-        let mut cursor_hash = parent_header.hash();
-        let mut cursor_number = parent_header.number();
-        while cursor_number >= from {
-            // `BlockSource::Any` so the lookup finds the parent even
-            // while it's still "pending" in reth: at compose_sync_slot
-            // time the Sequencer has done `newPayload(parent)` but the
-            // promoting FCU fires on the next commit, so the parent is in
-            // reth's tree but not yet canonical-head. Deeper ancestors
-            // are already canonical, so `Any` finds them too.
-            let block = rollup
-                .l2_provider
-                .find_block_by_hash(cursor_hash, BlockSource::Any)
-                .map_err(|e| {
-                    format!("l2_provider.find_block_by_hash({cursor_hash}, n={cursor_number}): {e}")
-                })?
-                .ok_or_else(|| {
-                    format!("local L2 block hash {cursor_hash} (n={cursor_number}) missing")
-                })?;
-            let tx_bytes: Vec<Vec<u8>> = block
-                .body()
-                .transactions()
-                .iter()
-                .map(Encodable2718::encoded_2718)
-                .collect();
-            // Refuse-to-emit guard (invariant 7): intermediates carry
-            // ONLY user txs (system txs live exclusively in the Sync
-            // block, reconstructed deriver-side — Rollup-1 §8). A
-            // failed-but-not-yet-recovered optimistic Sync block in this
-            // range still holds its system txs; serializing it here would
-            // launder phantom cross-chain effects into L1-accepted
-            // history. Detect both framings (type-0x7E per Rollup-1 §5.3,
-            // and the SYSTEM_ADDRESS legacy framing) and degrade — the
-            // slot commits without emission.
-            for enc in &tx_bytes {
-                let is_system = if enc.first() == Some(&0x7E) {
-                    true
-                } else {
-                    use alloy_eips::eip2718::Decodable2718 as _;
-                    use reth_primitives_traits::SignerRecoverable as _;
-                    let mut raw: &[u8] = enc.as_slice();
-                    let tx = reth_ethereum_primitives::TransactionSigned::decode_2718(&mut raw)
-                        .map_err(|e| {
-                            format!(
-                                "system-tx guard: decode_2718 failed for a tx in \
-                                 intermediate block {cursor_number}: {e}"
-                            )
-                        })?;
-                    let signer = tx.recover_signer().map_err(|e| {
-                        format!(
-                            "system-tx guard: recover_signer failed for a tx in \
-                             intermediate block {cursor_number}: {e}"
-                        )
-                    })?;
-                    signer == ctx.system_signer.address()
-                };
-                if is_system {
-                    return Err(format!(
-                        "intermediate block {cursor_number} carries type-0x7E system txs — \
-                         un-recovered failed Sync block in range; emission blocked until \
-                         recovery (invariant 7)"
-                    ));
-                }
-            }
-            blocks_rev.push(tx_bytes);
-            if cursor_number == 0 {
-                break;
-            }
-            cursor_hash = block.header().parent_hash();
-            cursor_number -= 1;
-        }
-        blocks_rev.reverse();
-        let mut blocks = blocks_rev;
-        // Outbound user txs aren't reconstructible from the entries (only the load
-        // is), so they travel in the Sync-block DA here; the deriver interleaves
-        // them with the rebuilt loads. Inbound-only → empty.
-        blocks.push(outbound_user_txs.iter().map(|b| b.to_vec()).collect());
-        // L2-shape entries for system-tx reconstruction by external
-        // followers. The L1 batch's `entries[]` carries the DEPOSIT-
-        // shape entries (callCount=0, no L2ToL1Calls) for value-bearing
-        // calls; those don't carry the inbound call params the L2
-        // system tx needs. The L2-shape entries live in
-        // `composition.targets[].batch` (built by
-        // `protocol.build_batch(source=L2)`). We serialize each via
-        // `SolValue::abi_encode` and ship them through codec v2 in
-        // `batch.callData` — the contract treats callData as opaque
-        // (only hashes it for proof binding, `EEZ.sol:596`), so this
-        // is a follower-only DA channel.
-        use alloy_sol_types::SolValue as _;
-        // DA sidecar = the full derivation entry set in canonical order: OUTBOUND
-        // settlement entries (proxyEntryHash==0, populated l2ToL1Calls) FIRST, then
-        // inbound deferred entries — outbound-first matches the deriver's prefix split.
-        let l2_entries_bytes: Vec<Vec<u8>> = outbound_entries
-            .iter()
-            .map(eez_protocol::abi::ExecutionEntrySol::abi_encode)
-            .chain(
-                compositions
-                    .iter()
-                    .flat_map(|c| c.targets.iter())
-                    .flat_map(|t| t.batch.entries.iter())
-                    .map(eez_protocol::abi::ExecutionEntrySol::abi_encode),
-            )
-            .collect();
-        let payload = eez_payload_codec::encode(&blocks, &l2_entries_bytes)
-            .map_err(|e| format!("eez_payload_codec::encode: {e}"))?;
+        let payload = build_da_payload(
+            rollup.l2_provider.as_ref(),
+            parent_header,
+            from,
+            sync_block_number,
+            ctx.system_signer.address(),
+            compositions,
+            outbound_entries,
+            outbound_user_txs,
+        )?;
         batch.callData = alloy_primitives::Bytes::from(payload);
 
         // Prove the assembled window (proofs[] empty — not part of the
         // publicInputsHash). Mock ignores the context; a remote prover re-executes
         // `blocks`. Settlement path, off block production.
-        let block_witnesses = match self.inner.witness_source.get() {
-            // Remote-prover mode. Intermediate blocks `[from..sync)` are committed
-            // (served by the witness store); the just-built endpoint isn't, so
-            // capture it here from the in-memory block.
-            Some(src) => {
-                // Witness generation is a CPU-heavy trie walk / re-exec. Run it on
-                // the blocking pool so it can't stall async worker threads on the
-                // settlement path. (Store hits are cheap; the rare store miss and
-                // the endpoint capture are the heavy parts.)
-                let src = Arc::clone(src);
-                let l2_provider = Arc::clone(
-                    &self
-                        .inner
-                        .rollups
-                        .get(&rollup_id)
-                        .ok_or_else(|| format!("unknown rollup_id {rollup_id}"))?
-                        .l2_provider,
-                );
-                let evm_config = self.inner.evm_config.clone();
-                let terminal_block = sync_block.clone();
-                tokio::task::spawn_blocking(move || -> Result<Vec<BlockWitness>, String> {
-                    let mut ws = (from..sync_block_number)
-                        .map(|n| src.block_witness(n))
-                        .collect::<Result<Vec<_>, String>>()
-                        .map_err(|e| format!("witness_source: {e}"))?;
-                    // Endpoint (the just-built, uncommitted Sync block) is captured
-                    // in-memory — no store or provider can serve an uncommitted block.
-                    ws.push(
-                        block_witness(
-                            l2_provider.as_ref(),
-                            &evm_config,
-                            &terminal_block,
-                            ExecutionWitnessMode::Legacy,
-                        )
-                        .map_err(|e| {
-                            format!(
-                                "terminal-block witness (block {}): {e}",
-                                terminal_block.header().number()
-                            )
-                        })?,
-                    );
-                    Ok(ws)
-                })
-                .await
-                .map_err(|e| format!("witness spawn_blocking join: {e}"))??
-            }
-            // Mock mode: the mock prover ignores per-block witnesses.
-            None => Vec::new(),
-        };
+        let block_witnesses = collect_window_witnesses(
+            self.inner.witness_source.get(),
+            &rollup.l2_provider,
+            &self.inner.evm_config,
+            from,
+            sync_block_number,
+            sync_block,
+        )
+        .await?;
         let proving_ctx = eez_prover::ProvingContext {
             rollup_id,
             from_block: from,
@@ -2491,39 +2182,6 @@ where
         )
         .await
     }
-}
-
-/// Refuse to settle a batch carrying any `destinationRollupId` / `sourceRollupId`
-/// that isn't this rollup's registry id — a wiring bug (e.g. an outbound entry
-/// whose `dest` stayed at the call's MAINNET(0) target) that L1 would misattribute
-/// and that folds into the `publicInputsHash`. Guards the outbound `dest=rid` rewrite.
-fn assert_batch_registry_native(batch: &eez_protocol::EvmBatch, rid: U256) -> Result<(), String> {
-    for (i, entry) in batch.entries.iter().enumerate() {
-        if entry.destinationRollupId != rid {
-            return Err(format!(
-                "entry[{i}].destinationRollupId = {} is not the configured registry id {rid} — \
-                 a non-registry id reached the settlement batch (composition must be registry-native)",
-                entry.destinationRollupId,
-            ));
-        }
-        for (j, call) in entry.l2ToL1Calls.iter().enumerate() {
-            if call.sourceRollupId != rid {
-                return Err(format!(
-                    "entry[{i}].l2ToL1Calls[{j}].sourceRollupId = {} is not the configured registry id {rid}",
-                    call.sourceRollupId,
-                ));
-            }
-        }
-    }
-    for (i, lookup) in batch.l1ToL2lookupCalls.iter().enumerate() {
-        if lookup.destinationRollupId != rid {
-            return Err(format!(
-                "l1ToL2lookupCalls[{i}].destinationRollupId = {} is not the configured registry id {rid}",
-                lookup.destinationRollupId,
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Background bundle observer — verdict recording ONLY. Marks the ledger

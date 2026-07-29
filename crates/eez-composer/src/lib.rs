@@ -41,6 +41,7 @@ pub mod held_pool;
 pub mod ingress;
 pub mod local;
 pub mod optimistic;
+mod postbatch;
 pub mod rollup;
 
 #[doc(inline)]
