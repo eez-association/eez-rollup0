@@ -423,7 +423,6 @@ struct DrainClassification {
     pending_in: Vec<eez_protocol::abi::ExecutionEntrySol>,
     outbound_entries: Vec<eez_protocol::abi::ExecutionEntrySol>,
     unincludable: Vec<HeldTx>,
-    unincludable_gaps: Vec<(Address, Direction, u64)>,
     transient: Option<(String, Vec<HeldTx>)>,
 }
 
@@ -663,7 +662,6 @@ async fn classify_drain(
         pending_in,
         outbound_entries,
         unincludable,
-        unincludable_gaps,
         transient,
     }
 }
@@ -1158,7 +1156,10 @@ where
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n >= 1)
             .unwrap_or(3);
-        let drained = pool.pop_n(max_user_txs);
+        // Peek, don't drain: the batch stays in the pool until the block is
+        // built + committed (commit_included on success). A failed build leaves
+        // the pool untouched — nothing to re-queue, nothing to orphan.
+        let drained = pool.peek_n(max_user_txs);
         // NOTE: do NOT early-exit on empty pool. Every unblocked Sync
         // slot still emits a postBatch carrying the leading immediate
         // entry (which advances L1's stored stateRoot to the L2
@@ -1587,7 +1588,7 @@ where
             );
         }
         if let Some(pool) = rollup.held_pool.as_ref() {
-            pool.release_in_flight_batch(&stale);
+            pool.evict_batch(&stale);
         }
 
         let DrainClassification {
@@ -1597,7 +1598,6 @@ where
             pending_in,
             outbound_entries,
             unincludable,
-            unincludable_gaps,
             transient,
         } = classify_drain(cc, ctx, rollup_id, drained).await;
 
@@ -1621,40 +1621,18 @@ where
             }
         }
 
-        // ── Transient abort: re-queue survivors + remainder, minimal. ──
-        if let Some((err, rest)) = transient {
+        // ── Transient abort: survivors + remainder stay queued (peeked, never
+        // removed); the unincludable cascade above already evicted any gapped
+        // ones. Emit a minimal postBatch and retry next slot.
+        if let Some((err, _rest)) = transient {
             event!(
                 name: "eez.composer.phase2.transient",
                 Level::WARN,
                 rollup_id,
                 error = %err,
                 survivors = survivors.len(),
-                "transient compose failure; re-queueing and degrading to minimal postBatch this slot",
+                "transient compose failure; degrading to minimal postBatch (held txs stay queued)",
             );
-            if let Some(pool) = rollup.held_pool.as_ref() {
-                let mut requeue = survivors;
-                requeue.extend(rest);
-                let mut cascade_evicted = Vec::new();
-                requeue.retain(|tx| {
-                    let Some(gap_at) = unincludable_gap_for(&unincludable_gaps, tx) else {
-                        return true;
-                    };
-                    event!(
-                        name: "eez.composer.cc_compose.unincludable_chain_evicted",
-                        Level::WARN,
-                        rollup_id,
-                        tx_hash = %tx.hash,
-                        sender = %tx.sender,
-                        nonce = tx.nonce,
-                        gap_at,
-                        "same-sender unprocessed tx above an evicted unincludable nonce; evicted instead of re-queued (resubmit in order)",
-                    );
-                    cascade_evicted.push(tx.clone());
-                    false
-                });
-                pool.release_in_flight_batch(&cascade_evicted);
-                pool.push_front_batch(requeue);
-            }
             return self
                 .dispatch_minimal_postbatch(
                     ctx,
@@ -1722,11 +1700,8 @@ where
                     Level::WARN,
                     rollup_id,
                     reason = %reason,
-                    "rich compose failed; re-queueing survivors, degrading to minimal postBatch",
+                    "rich compose failed; degrading to minimal postBatch (held txs stay queued)",
                 );
-                if let Some(pool) = rollup.held_pool.as_ref() {
-                    pool.push_front_batch(survivors);
-                }
                 return self
                     .dispatch_minimal_postbatch(
                         ctx,
@@ -1768,6 +1743,12 @@ where
             evicted_stale = stale.len(),
             "rich bundle dispatched to background observer; committing Sync block optimistically",
         );
+        // Success: these survivors are now in the optimistically-committed block
+        // — remove them from the queue and reserve their nonces in-flight until
+        // the bundle settles (or a reorg re-queues them via push_front_batch).
+        if let Some(pool) = rollup.held_pool.as_ref() {
+            pool.commit_included(&survivors);
+        }
         rollup.optimistic.begin(
             sync_height,
             post_batch_hash,
