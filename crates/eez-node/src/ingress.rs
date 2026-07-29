@@ -26,6 +26,7 @@ use alloy_provider::{Provider as _, RootProvider};
 use eez_composer::{Direction, HeldPool, HeldTx};
 use http_body_util::{BodyExt as _, Full};
 use hyper::body::Bytes as HyperBytes;
+use hyper::header::CONTENT_LENGTH;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -33,6 +34,8 @@ use hyper_util::rt::TokioIo;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tracing::{Level, event};
+
+const MAX_BODY: usize = 10 * 1024 * 1024;
 
 /// Outcome of the admission gate.
 #[derive(Debug)]
@@ -56,8 +59,16 @@ pub async fn gate_and_hold(
     raw_tx: &Bytes,
     direction: Direction,
     held_pool: &HeldPool,
+    expected_source_chain_id: u64,
     validation_provider: &RootProvider,
 ) -> Admission {
+    if let Err(msg) = validate_front_envelope(envelope, direction, expected_source_chain_id) {
+        return Admission::Rejected(msg);
+    }
+    let cost = match upfront_cost(envelope) {
+        Ok(cost) => cost,
+        Err(msg) => return Admission::Rejected(msg),
+    };
     let Ok(sender) = envelope.recover_signer() else {
         return Admission::Rejected("signature recovery failed".into());
     };
@@ -69,8 +80,6 @@ pub async fn gate_and_hold(
             return Admission::Rejected(format!("source-chain balance lookup failed: {e}"));
         }
     };
-    let cost = U256::from(envelope.value())
-        + U256::from(envelope.gas_limit()) * U256::from(envelope.max_fee_per_gas());
     if balance < cost {
         return Admission::Rejected(format!(
             "insufficient balance for {sender}: have {balance}, need {cost} (value + gas_limit * max_fee)"
@@ -113,6 +122,42 @@ pub async fn gate_and_hold(
     Admission::Held(hash)
 }
 
+/// Admission policy: reject envelopes cross-chain fronts won't hold.
+fn validate_front_envelope(
+    envelope: &TxEnvelope,
+    direction: Direction,
+    expected_source_chain_id: u64,
+) -> Result<(), String> {
+    if matches!(envelope, TxEnvelope::Eip4844(_)) {
+        return Err(
+            "EIP-4844 blob transactions are unsupported by the cross-chain front pipeline".into(),
+        );
+    }
+    let Some(chain_id) = envelope.chain_id() else {
+        return Err(
+            "missing source-chain id; replay-unprotected legacy transactions are not accepted by cross-chain fronts"
+                .into(),
+        );
+    };
+    if chain_id != expected_source_chain_id {
+        return Err(format!(
+            "wrong source-chain id {chain_id} for {direction:?} front: expected {expected_source_chain_id}"
+        ));
+    }
+    Ok(())
+}
+
+/// Upfront cost the sender must cover: value + gas_limit * max_fee_per_gas.
+fn upfront_cost(envelope: &TxEnvelope) -> Result<U256, String> {
+    let gas_cost = U256::from(envelope.gas_limit())
+        .checked_mul(U256::from(envelope.max_fee_per_gas()))
+        .ok_or_else(|| "upfront cost overflow: gas_limit * max_fee_per_gas".to_string())?;
+    envelope
+        .value()
+        .checked_add(gas_cost)
+        .ok_or_else(|| "upfront cost overflow: value + gas_limit * max_fee_per_gas".to_string())
+}
+
 /// Shared, cheaply-clonable per-connection context.
 #[derive(Clone)]
 struct Ctx {
@@ -121,6 +166,7 @@ struct Ctx {
     direction: Direction,
     held_pool: Arc<HeldPool>,
     validation_provider: RootProvider,
+    expected_source_chain_id: u64,
 }
 
 /// Run a transparent cross-chain front on `port`, forwarding every `eth_*` to
@@ -135,6 +181,7 @@ pub async fn run_cross_chain_front(
     direction: Direction,
     held_pool: Arc<HeldPool>,
     validation_provider: RootProvider,
+    expected_source_chain_id: u64,
 ) -> eyre::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
@@ -147,6 +194,7 @@ pub async fn run_cross_chain_front(
         %port,
         %upstream_rpc_url,
         direction = ?direction,
+        expected_source_chain_id,
         "cross-chain front listening (forward eth_* to source chain; intercept sendRawTransaction)",
     );
     let ctx = Ctx {
@@ -155,6 +203,7 @@ pub async fn run_cross_chain_front(
         direction,
         held_pool,
         validation_provider,
+        expected_source_chain_id,
     };
     loop {
         let (stream, _peer) = match listener.accept().await {
@@ -190,6 +239,73 @@ fn json_response(body: String) -> Response<Full<HyperBytes>> {
         .expect("valid response")
 }
 
+fn rpc_error(id: Value, code: i64, message: &str) -> Response<Full<HyperBytes>> {
+    json_response(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "error": { "code": code, "message": message },
+            "id": id,
+        })
+        .to_string(),
+    )
+}
+
+fn body_too_large() -> Response<Full<HyperBytes>> {
+    Response::builder()
+        .status(StatusCode::PAYLOAD_TOO_LARGE)
+        .body(Full::new(HyperBytes::from("request body too large")))
+        .expect("valid response")
+}
+
+async fn collect_body_limited(
+    mut body: hyper::body::Incoming,
+    max: usize,
+) -> Result<Result<HyperBytes, ()>, hyper::Error> {
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if data.len() > max.saturating_sub(out.len()) {
+            return Ok(Err(()));
+        }
+        out.extend_from_slice(&data);
+    }
+    Ok(Ok(HyperBytes::from(out)))
+}
+
+fn content_length_exceeds(req: &Request<hyper::body::Incoming>, max: usize) -> bool {
+    req.headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|len| len > max)
+}
+
+fn batch_has_send_raw(json: &Value) -> bool {
+    matches!(json, Value::Array(items) if items.iter().any(|it| {
+        it.get("method").and_then(Value::as_str) == Some("eth_sendRawTransaction")
+    }))
+}
+
+fn all_forwarded_methods_are_eth(json: &Value) -> bool {
+    let method_allowed = |value: &Value| {
+        value
+            .get("method")
+            .and_then(Value::as_str)
+            .is_some_and(|method| method.starts_with("eth_"))
+    };
+    match json {
+        Value::Object(_) => method_allowed(json),
+        Value::Array(items) if !items.is_empty() => items.iter().all(|item| {
+            method_allowed(item)
+                && item.get("method").and_then(Value::as_str) != Some("eth_sendRawTransaction")
+        }),
+        _ => false,
+    }
+}
+
 async fn handle(
     req: Request<hyper::body::Incoming>,
     ctx: Ctx,
@@ -210,25 +326,40 @@ async fn handle(
             .expect("valid response"));
     }
 
-    const MAX_BODY: usize = 10 * 1024 * 1024;
-    let body_bytes = match req.collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(e) => {
-            event!(name: "eez.xchain_front.body_read_failed", Level::DEBUG, error = %e, "read body failed");
-            return Ok(forward(&ctx, Vec::new()).await);
-        }
-    };
-    if body_bytes.len() > MAX_BODY {
-        return Ok(Response::builder()
-            .status(StatusCode::PAYLOAD_TOO_LARGE)
-            .body(Full::new(HyperBytes::from("request body too large")))
-            .expect("valid response"));
+    if content_length_exceeds(&req, MAX_BODY) {
+        return Ok(body_too_large());
     }
 
-    // Intercept a single `eth_sendRawTransaction`; batches and every other
-    // method fall through to the transparent forward.
-    if let Ok(json) = serde_json::from_slice::<Value>(&body_bytes)
-        && json.get("method").and_then(Value::as_str) == Some("eth_sendRawTransaction")
+    let body_bytes = match collect_body_limited(req.into_body(), MAX_BODY).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(())) => return Ok(body_too_large()),
+        Err(e) => {
+            event!(name: "eez.xchain_front.body_read_failed", Level::DEBUG, error = %e, "read body failed");
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(HyperBytes::from("read body failed")))
+                .expect("valid response"));
+        }
+    };
+
+    let Ok(json) = serde_json::from_slice::<Value>(&body_bytes) else {
+        return Ok(rpc_error(Value::Null, -32700, "parse error"));
+    };
+
+    // A JSON-RPC batch array would bypass the single-tx intercept and forward a
+    // bundled cross-chain tx straight to the mempool; reject any batch carrying
+    // `eth_sendRawTransaction`.
+    if batch_has_send_raw(&json) {
+        return Ok(rpc_error(
+            Value::Null,
+            -32600,
+            "send cross-chain eth_sendRawTransaction singly, not in a JSON-RPC batch",
+        ));
+    }
+
+    // Intercept a single `eth_sendRawTransaction`. Undecodable tx bytes fall
+    // through so the upstream RPC produces the standard JSON-RPC error.
+    if json.get("method").and_then(Value::as_str) == Some("eth_sendRawTransaction")
         && let Some(raw_hex) = json
             .get("params")
             .and_then(|p| p.get(0))
@@ -237,20 +368,14 @@ async fn handle(
     {
         return Ok(resp);
     }
-    // A JSON-RPC batch array would bypass the single-tx intercept and forward a
-    // bundled cross-chain tx straight to the mempool; reject any batch carrying
-    // `eth_sendRawTransaction` (read-only batches still forward transparently).
-    if let Ok(Value::Array(items)) = serde_json::from_slice::<Value>(&body_bytes)
-        && items
-            .iter()
-            .any(|it| it.get("method").and_then(Value::as_str) == Some("eth_sendRawTransaction"))
-    {
-        let resp = serde_json::json!({
-            "jsonrpc": "2.0",
-            "error": { "code": -32600, "message": "send cross-chain eth_sendRawTransaction singly, not in a JSON-RPC batch" },
-            "id": Value::Null,
-        });
-        return Ok(json_response(resp.to_string()));
+
+    if !all_forwarded_methods_are_eth(&json) {
+        let id = json.get("id").cloned().unwrap_or(Value::Null);
+        return Ok(rpc_error(
+            id,
+            -32601,
+            "cross-chain front forwards only eth_* JSON-RPC methods",
+        ));
     }
     Ok(forward(&ctx, body_bytes.to_vec()).await)
 }
@@ -270,6 +395,7 @@ async fn intercept_send_raw(
         &raw,
         ctx.direction,
         &ctx.held_pool,
+        ctx.expected_source_chain_id,
         &ctx.validation_provider,
     )
     .await
@@ -321,15 +447,198 @@ async fn forward(ctx: &Ctx, body: Vec<u8>) -> Response<Full<HyperBytes>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use alloy_consensus::{SignableTransaction, TxEip1559};
-    use alloy_network::TxSignerSync;
-    use alloy_network::eip2718::Encodable2718;
+    use alloy_consensus::{SignableTransaction, TxEip1559, TxEip4844, TxLegacy};
+    use alloy_network::{TxSignerSync, eip2718::Encodable2718};
     use alloy_primitives::{Address, TxKind};
     use alloy_provider::ProviderBuilder;
     use alloy_provider::mock::Asserter;
     use alloy_rpc_types_eth::AccessList;
     use alloy_signer_local::PrivateKeySigner;
+    use serde_json::json;
+
+    use super::*;
+
+    fn test_signer() -> PrivateKeySigner {
+        PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).expect("valid signer")
+    }
+
+    fn signed_eip1559(
+        chain_id: u64,
+        value: U256,
+        gas_limit: u64,
+        max_fee_per_gas: u128,
+    ) -> (PrivateKeySigner, TxEnvelope, Bytes) {
+        let signer = test_signer();
+        let mut tx = TxEip1559 {
+            chain_id,
+            nonce: 0,
+            gas_limit,
+            max_fee_per_gas,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(Address::ZERO),
+            value,
+            access_list: alloy_eips::eip2930::AccessList::default(),
+            input: Bytes::default(),
+        };
+        let sig = signer.sign_transaction_sync(&mut tx).expect("tx signs");
+        let envelope = TxEnvelope::from(tx.into_signed(sig));
+        let raw = Bytes::from(envelope.encoded_2718());
+        (signer, envelope, raw)
+    }
+
+    fn signed_legacy(chain_id: Option<u64>) -> (PrivateKeySigner, TxEnvelope, Bytes) {
+        let signer = test_signer();
+        let mut tx = TxLegacy {
+            chain_id,
+            nonce: 0,
+            gas_price: 1,
+            gas_limit: 21_000,
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            input: Bytes::default(),
+        };
+        let sig = signer.sign_transaction_sync(&mut tx).expect("tx signs");
+        let envelope = TxEnvelope::from(tx.into_signed(sig));
+        let raw = Bytes::from(envelope.encoded_2718());
+        (signer, envelope, raw)
+    }
+
+    fn signed_blob(chain_id: u64) -> (PrivateKeySigner, TxEnvelope, Bytes) {
+        let signer = test_signer();
+        let mut tx = TxEip4844 {
+            chain_id,
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: Address::ZERO,
+            value: U256::ZERO,
+            access_list: alloy_eips::eip2930::AccessList::default(),
+            blob_versioned_hashes: vec![B256::with_last_byte(2)],
+            max_fee_per_blob_gas: 1,
+            input: Bytes::default(),
+        };
+        let sig = signer.sign_transaction_sync(&mut tx).expect("tx signs");
+        let envelope = TxEnvelope::from(tx.into_signed(sig));
+        let raw = Bytes::from(envelope.encoded_2718());
+        (signer, envelope, raw)
+    }
+
+    fn rejection(admission: Admission) -> String {
+        match admission {
+            Admission::Rejected(msg) => msg,
+            Admission::Held(hash) => panic!("expected rejection, got held tx {hash}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn matching_source_chain_id_is_accepted() {
+        let (_, envelope, raw) = signed_eip1559(31337, U256::ZERO, 21_000, 1);
+        let pool = HeldPool::new();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
+        asserter.push_success(&U256::from(1_000_000u64));
+        asserter.push_success(&0_u64);
+
+        let admission =
+            gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await;
+
+        assert!(matches!(admission, Admission::Held(_)));
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wrong_source_chain_id_is_rejected_without_pool_mutation() {
+        let (signer, envelope, raw) = signed_eip1559(1, U256::ZERO, 21_000, 1);
+        let pool = HeldPool::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
+
+        let msg = rejection(
+            gate_and_hold(&envelope, &raw, Direction::Outbound, &pool, 2, &provider).await,
+        );
+
+        assert!(msg.contains("wrong source-chain id 1"));
+        assert_eq!(pool.len(), 0, "rejected tx from {signer:?} mutated pool");
+    }
+
+    #[tokio::test]
+    async fn missing_source_chain_id_is_rejected() {
+        let (signer, envelope, raw) = signed_legacy(None);
+        let pool = HeldPool::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
+
+        let msg = rejection(
+            gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await,
+        );
+
+        assert!(msg.contains("missing source-chain id"));
+        assert_eq!(pool.len(), 0, "rejected tx from {signer:?} mutated pool");
+    }
+
+    #[tokio::test]
+    async fn blob_envelope_is_rejected() {
+        let (signer, envelope, raw) = signed_blob(31337);
+        let pool = HeldPool::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
+
+        let msg = rejection(
+            gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await,
+        );
+
+        assert!(msg.contains("EIP-4844 blob transactions are unsupported"));
+        assert_eq!(pool.len(), 0, "rejected tx from {signer:?} mutated pool");
+    }
+
+    #[tokio::test]
+    async fn upfront_cost_overflow_is_rejected() {
+        let (signer, envelope, raw) = signed_eip1559(31337, U256::MAX, 1, 1);
+        let pool = HeldPool::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
+
+        let msg = rejection(
+            gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await,
+        );
+
+        assert!(msg.contains("upfront cost overflow"));
+        assert_eq!(pool.len(), 0, "rejected tx from {signer:?} mutated pool");
+    }
+
+    #[test]
+    fn batch_send_raw_is_not_forwardable() {
+        let body = json!([
+            {"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1},
+            {"jsonrpc": "2.0", "method": "eth_sendRawTransaction", "params": ["0xdead"], "id": 2}
+        ]);
+        assert!(batch_has_send_raw(&body));
+        assert!(
+            !all_forwarded_methods_are_eth(&body),
+            "sendRaw batches must be rejected before forwarding"
+        );
+    }
+
+    #[test]
+    fn only_eth_methods_are_forwardable() {
+        assert!(all_forwarded_methods_are_eth(&json!({
+            "jsonrpc": "2.0",
+            "method": "eth_chainId",
+            "params": [],
+            "id": 1
+        })));
+        assert!(all_forwarded_methods_are_eth(&json!([
+            {"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1},
+            {"jsonrpc": "2.0", "method": "eth_getBalance", "params": ["0x0000000000000000000000000000000000000000", "latest"], "id": 2}
+        ])));
+        assert!(!all_forwarded_methods_are_eth(&json!({
+            "jsonrpc": "2.0",
+            "method": "web3_clientVersion",
+            "params": [],
+            "id": 1
+        })));
+        assert!(!all_forwarded_methods_are_eth(&json!([
+            {"jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1},
+            {"jsonrpc": "2.0", "method": "admin_peers", "params": [], "id": 2}
+        ])));
+    }
 
     fn free_port() -> u16 {
         std::net::TcpListener::bind(("127.0.0.1", 0))
@@ -408,7 +717,7 @@ mod tests {
         asserter.push_success(&1_u64);
 
         assert!(matches!(
-            gate_and_hold(&first, &first_raw, Direction::Inbound, &pool, &provider,).await,
+            gate_and_hold(&first, &first_raw, Direction::Inbound, &pool, 1, &provider,).await,
             Admission::Held(_)
         ));
 
@@ -421,6 +730,7 @@ mod tests {
             &same_nonce_raw,
             Direction::Inbound,
             &pool,
+            1,
             &provider,
         )
         .await;
@@ -430,15 +740,22 @@ mod tests {
         assert!(message.contains("invalid nonce 0"), "{message}");
         assert!(message.contains("next unreserved nonce 1"), "{message}");
 
-        let rejected =
-            gate_and_hold(&gapped, &gapped_raw, Direction::Inbound, &pool, &provider).await;
+        let rejected = gate_and_hold(
+            &gapped,
+            &gapped_raw,
+            Direction::Inbound,
+            &pool,
+            1,
+            &provider,
+        )
+        .await;
         let Admission::Rejected(message) = rejected else {
             panic!("nonce 2 must not be admitted while nonce 1 is unreserved");
         };
         assert!(message.contains("nonce 1"), "{message}");
 
         assert!(matches!(
-            gate_and_hold(&next, &next_raw, Direction::Inbound, &pool, &provider).await,
+            gate_and_hold(&next, &next_raw, Direction::Inbound, &pool, 1, &provider,).await,
             Admission::Held(_)
         ));
     }
@@ -463,14 +780,22 @@ mod tests {
             &original_raw,
             Direction::Inbound,
             &pool,
+            1,
             &provider,
         )
         .await
         else {
             panic!("original transaction should be held");
         };
-        let Admission::Held(suffix_hash) =
-            gate_and_hold(&suffix, &suffix_raw, Direction::Inbound, &pool, &provider).await
+        let Admission::Held(suffix_hash) = gate_and_hold(
+            &suffix,
+            &suffix_raw,
+            Direction::Inbound,
+            &pool,
+            1,
+            &provider,
+        )
+        .await
         else {
             panic!("suffix transaction should be held");
         };
@@ -479,6 +804,7 @@ mod tests {
             &replacement_raw,
             Direction::Inbound,
             &pool,
+            1,
             &provider,
         )
         .await
@@ -527,6 +853,7 @@ mod tests {
             Direction::Inbound,
             Arc::clone(&pool),
             inbound_provider,
+            1,
         ));
         let outbound_task = tokio::spawn(run_cross_chain_front(
             outbound_port,
@@ -534,6 +861,7 @@ mod tests {
             Direction::Outbound,
             Arc::clone(&pool),
             outbound_provider,
+            1,
         ));
         wait_for_front(inbound_port).await;
         wait_for_front(outbound_port).await;
