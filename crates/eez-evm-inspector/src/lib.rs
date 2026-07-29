@@ -24,7 +24,6 @@
 
 pub mod inspector;
 pub mod overlay;
-pub mod post_batch_submitter;
 
 pub use inspector::{
     OverlayChannel, OverlayChannelHandle, SessionInspector, SessionInspectorFactory,

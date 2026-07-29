@@ -371,7 +371,6 @@ impl Harness {
             ("EEZ_L1_POSTER_KEY", opts.poster_key.to_string()),
             ("EEZ_L1_CHAIN_ID", "31337".to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
-            ("EEZ_L2_SYSTEM_ADDRESS", format!("{ANVIL_ADDR:#x}")),
             ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
             (
                 "EEZ_CCM_L2_ADDRESS",
@@ -1957,7 +1956,6 @@ impl CrossChainConfig {
             ("EEZ_L1_POSTER_KEY", self.poster_key.to_string()),
             // MockECDSA authorizes the deployer.
             ("EEZ_PROOF_SIGNER_KEY", self.deployer_key.to_string()),
-            ("EEZ_L2_SYSTEM_ADDRESS", format!("{ANVIL_ADDR:#x}")),
             ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
             ("EEZ_CCM_L2_ADDRESS", format!("{CCM_L2_ADDRESS:#x}")),
             ("EEZ_L1_BLOCK_TIME_MS", "5000".to_string()),

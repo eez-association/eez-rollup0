@@ -46,8 +46,8 @@ use crate::optimistic::OptimisticallyIncluded;
 use crate::rollup::RollupState;
 
 /// Runtime config for the cross-chain execution path on Sync slots.
-/// `Composer::new` accepts `Option<Arc<CrossChainExecCtx>>`; `Some`
-/// means a wired `EvmComposer` and the keys/addresses needed to sign
+/// Carried inside [`CrossChainWiring`] next to the wired
+/// `EvmComposer`: the keys/addresses needed to sign
 /// the L2 system txs that the composer's
 /// `simulate_and_resolve` returns as raw `(load_table_payload,
 /// execute_payload)` bytes.
@@ -125,6 +125,148 @@ impl std::fmt::Debug for CrossChainExecCtx {
     }
 }
 
+/// The cross-chain compose dependencies, wired together (all-or-
+/// nothing) by `eez-node` startup when the embedded L1 is up.
+pub struct CrossChainWiring {
+    /// Rollup id of the entry chain.
+    pub entry_rollup_id: eez_protocol::RollupId,
+    /// Entry-chain (L1) client — runs source simulation for INBOUND
+    /// (L1→L2) txs, and serves every rollup's upstream-invariant-6
+    /// anchor root (`EEZ.rollups[id].stateRoot`) — chain headers
+    /// (self-reports) are NOT correct for that purpose.
+    pub entry_client: Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+    /// All registered rollups (entry + followers). The entry is also
+    /// in this map — composition orchestration uses it uniformly.
+    pub rollups: HashMap<
+        eez_protocol::RollupId,
+        (
+            Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+            eez_protocol::TargetConfig,
+        ),
+    >,
+    /// Runtime context (signer + L2 chain config) for wrapping the
+    /// composer's `(load_table_payload, execute_payload)` byte
+    /// outputs into signed L2 system txs.
+    pub exec_ctx: Arc<CrossChainExecCtx>,
+    /// L2 ENTRY client for OUTBOUND (L2→L1) source simulation. An
+    /// outbound tx originates on this L2, so its `simulate_and_resolve`
+    /// must run against an L2 entry (the L2 follower's `ChainClient`
+    /// errors `Unavailable` for source sim).
+    pub l2_entry_client: Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+}
+
+impl CrossChainWiring {
+    /// Detect cross-chain proxy calls and return the final
+    /// [`eez_protocol::Composition`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`eez_protocol::ComposerErrorKind::Executor`] if
+    /// simulation fails.
+    /// Returns [`eez_protocol::ComposerErrorKind::Protocol`] if entry
+    /// building or finalization fails.
+    #[tracing::instrument(skip(self, raw_tx), fields(tx_len = raw_tx.len()))]
+    pub async fn simulate_and_resolve(
+        &self,
+        raw_tx: &[u8],
+    ) -> eez_protocol::ComposerResult<eez_protocol::Composition> {
+        // Default entry selection: the pinned entry rollup + its client.
+        // Per-composition entry selection (A1) goes through
+        // `simulate_and_resolve_recorded_for`.
+        self.simulate_and_resolve_recorded_for(self.entry_rollup_id, &*self.entry_client, raw_tx)
+            .await
+    }
+
+    /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve) but
+    /// with an explicitly-chosen entry — `entry_id` + the `entry_client`
+    /// that runs source simulation. The explicit entry lets ONE wiring
+    /// compose either direction — `(L1, L1 client)` for an inbound L1→L2 call,
+    /// `(L2, L2 client)` for an outbound L2→L1 call — picked per tx by
+    /// the drain. The dispatch rollup map (Phase 1) is the wiring's full
+    /// registration set, unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve).
+    pub async fn simulate_and_resolve_recorded_for(
+        &self,
+        entry_id: eez_protocol::RollupId,
+        entry_client: &(dyn eez_protocol::executor::ChainClient + Send + Sync),
+        raw_tx: &[u8],
+    ) -> eez_protocol::ComposerResult<eez_protocol::Composition> {
+        use eez_protocol::composition::Rollup;
+
+        tracing::info!(
+            name: "composer.simulate.start",
+            %entry_id,
+            tx_len = raw_tx.len(),
+            rollup_count = self.rollups.len(),
+            "simulate_and_resolve: starting composition pipeline"
+        );
+
+        // Phase 1 — assemble per-rollup state for the builder.
+        //
+        // For each rollup (including the entry):
+        // - client: cheap Arc clone from the registration.
+        // - session: None (lazy-open on first dispatch).
+        // - initial_state_root: read via the committed-root reader. The
+        //   upstream protocol enforces `entry[i].currentState ==
+        //   rollups[id].stateRoot` for every delta in `postBatch` (see
+        //   `EEZ.sol`), so ALL rollups (including the entry's own) read
+        //   through the committed-root reader — chain headers
+        //   (self-reports via [`ChainClient::current_state_root`]) are
+        //   NOT correct for upstream-invariant-6 anchoring.
+        let mut rollups: HashMap<eez_protocol::RollupId, Rollup> =
+            HashMap::with_capacity(self.rollups.len());
+        for (rollup_id, (client, config)) in &self.rollups {
+            let initial_state_root = self
+                .entry_client
+                .stored_target_state_root(*rollup_id)
+                .await?;
+            rollups.insert(
+                *rollup_id,
+                Rollup {
+                    client: Arc::clone(client),
+                    session: None,
+                    config: config.clone(),
+                    initial_state_root,
+                },
+            );
+        }
+
+        // Phase 2 — compose: drive source simulation (which dispatches
+        // every detected proxy call back into the builder), then
+        // finalize. `recorded` carries the resolved per-call outcomes
+        // (return_data) the byte-locked inbound delivery needs,
+        // captured BEFORE `finalize` consumes the builder.
+        let mut builder = eez_protocol::CompositionBuilder::new(entry_id, rollups);
+        entry_client
+            .simulate_source_tx(raw_tx.to_vec(), &mut builder)
+            .await
+            .map_err(eez_protocol::CompositionError::from)?;
+        let recorded = builder.recorded().to_vec();
+        let composition = builder.finalize(raw_tx).await?;
+
+        tracing::info!(
+            name: "composer.simulate.complete",
+            target_count = composition.targets.len(),
+            recorded = recorded.len(),
+            "composition complete"
+        );
+
+        Ok(composition)
+    }
+}
+
+impl std::fmt::Debug for CrossChainWiring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CrossChainWiring")
+            .field("entry_rollup_id", &self.entry_rollup_id)
+            .field("rollups", &self.rollups.len())
+            .finish()
+    }
+}
+
 /// Relay-drop retries before a held user_tx is evicted as probable
 /// poison. Poison is normally caught at COMPOSE time (a tx whose
 /// `simulate_and_resolve` deterministically fails — e.g. a wrong-proxy
@@ -164,6 +306,21 @@ fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
     }
 }
 
+alloy_sol_types::sol! {
+    /// Storage getter for `EEZ.rollups[rollupId]` (auto-generated
+    /// from `mapping(uint256 => RollupConfig) public rollups`).
+    /// Returns three fields in declaration order: `rollupContract`,
+    /// `stateRoot`, `etherBalance` — only `rollupContract` is
+    /// consumed here.
+    #[sol(rpc)]
+    interface IEEZReader {
+        function rollups(uint256 rollupId)
+            external
+            view
+            returns (address rollupContract, bytes32 stateRoot, uint256 etherBalance);
+    }
+}
+
 /// L1-confirmed escrow (`rollups(rid).etherBalance`) an outbound withdrawal draws
 /// down. `None` on any read failure, so the caller fails open (skips the precheck).
 async fn read_rollup_escrow(provider: &alloy_provider::RootProvider, rid: u64) -> Option<U256> {
@@ -171,7 +328,7 @@ async fn read_rollup_escrow(provider: &alloy_provider::RootProvider, rid: u64) -
         .ok()?
         .parse::<Address>()
         .ok()?;
-    eez_protocol::IEEZReader::new(eez, provider)
+    IEEZReader::new(eez, provider)
         .rollups(U256::from(rid))
         .call()
         .await
@@ -288,25 +445,10 @@ struct Inner<L2: BlockReader> {
     /// EVM config — used by [`build_sync_block`] to construct the
     /// per-Sync-slot block via reth-evm `BlockBuilder`.
     evm_config: EthEvmConfig,
-    /// Cross-chain composer: per-tx `simulate_and_resolve` orchestrator
-    /// `None` when L1 isn't wired (e.g.
-    /// standalone / follower modes). When `Some`, `compose_sync_slot`
-    /// dispatches each held tx through it to get the
-    /// `Composition` (L2 destination effects + L1
-    /// `ExecutionEntry`s).
-    evm_composer: Option<eez_protocol::Composer>,
-    /// Runtime context (signer + L2 chain config) for wrapping the
-    /// composer's `(load_table_payload, execute_payload)` byte
-    /// outputs into signed L2 system txs. Must be `Some` whenever
-    /// `evm_composer` is `Some`; both come from the same `eez-node`
-    /// startup wiring step.
-    cc_exec_ctx: Option<Arc<CrossChainExecCtx>>,
-    /// L2 ENTRY client for OUTBOUND (L2→L1) source simulation. An
-    /// outbound tx originates on this L2, so its `simulate_and_resolve`
-    /// must run against an L2 entry (the L2 follower's `ChainClient`
-    /// errors `Unavailable` for source sim). `None` when no embedded L1
-    /// is wired (inbound-only / standalone) — outbound txs then evict.
-    l2_entry_client: Option<Arc<dyn eez_protocol::executor::EntryChainClient + Send + Sync>>,
+    /// Cross-chain wiring ([`CrossChainWiring`]: `EvmComposer` +
+    /// exec ctx + L2 entry client). `None` when L1 isn't wired (e.g.
+    /// standalone / follower modes).
+    cross_chain: Option<CrossChainWiring>,
     /// Handle to the `BlockCommitter` actor (the sole engine-API
     /// owner). Set once at startup via [`Composer::set_committer`]
     /// after the Sequencer spawns the actor. The bundle-observer task
@@ -342,9 +484,7 @@ where
         submitter: Submitter,
         l1_watcher: L1Watcher,
         evm_config: EthEvmConfig,
-        evm_composer: Option<eez_protocol::Composer>,
-        cc_exec_ctx: Option<Arc<CrossChainExecCtx>>,
-        l2_entry_client: Option<Arc<dyn eez_protocol::executor::EntryChainClient + Send + Sync>>,
+        cross_chain: Option<CrossChainWiring>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -353,9 +493,7 @@ where
                 submitter,
                 l1_watcher,
                 evm_config,
-                evm_composer,
-                cc_exec_ctx,
-                l2_entry_client,
+                cross_chain,
                 committer: std::sync::OnceLock::new(),
                 witness_source: std::sync::OnceLock::new(),
             }),
@@ -660,10 +798,7 @@ where
             );
             return None;
         };
-        let (Some(evm_composer), Some(ctx)) = (
-            self.inner.evm_composer.as_ref(),
-            self.inner.cc_exec_ctx.as_ref(),
-        ) else {
+        let Some(cc) = self.inner.cross_chain.as_ref() else {
             if !pool.is_empty() {
                 event!(
                     name: "eez.composer.sync_slot.cross_chain_unavailable",
@@ -752,7 +887,7 @@ where
         if matches!(mode, SyncSlotMode::Catchup) {
             return self
                 .dispatch_minimal_postbatch(
-                    ctx,
+                    &cc.exec_ctx,
                     rollup_id,
                     rollup,
                     &parent_header,
@@ -819,8 +954,7 @@ where
         // L2 block inputs.
         match self
             .compose_via_evm_composer(
-                evm_composer,
-                ctx,
+                cc,
                 rollup_id,
                 drained.clone(),
                 &parent_header,
@@ -1116,8 +1250,7 @@ where
     /// Returns errors only before drain classification begins.
     async fn compose_via_evm_composer(
         &self,
-        evm_composer: &eez_protocol::Composer,
-        ctx: &CrossChainExecCtx,
+        cc: &CrossChainWiring,
         rollup_id: u64,
         drained: Vec<HeldTx>,
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
@@ -1125,6 +1258,8 @@ where
         suggested_fee_recipient: Address,
         bundle_target: BundleTarget,
     ) -> Result<Option<SyncSlotBlock>, String> {
+        let evm_composer = cc;
+        let ctx = cc.exec_ctx.as_ref();
         // Read SYSTEM_ADDRESS nonce at the parent state — the next
         // signed system tx must use this. We sign multiple txs per
         // composition (load_table + execute per target), so the
@@ -1259,26 +1394,15 @@ where
             // its user tx); the load tx is built post-drain by the canonical
             // builder. Zero entries → poison.
             if held.direction == Direction::Outbound {
-                let Some(l2_entry) = self.inner.l2_entry_client.as_deref() else {
-                    event!(
-                        name: "eez.composer.cc_compose.outbound_no_l2_entry",
-                        Level::WARN,
-                        rollup_id,
-                        tx_hash = %held.hash,
-                        "outbound tx but no L2 entry client wired (no embedded L1); evicting",
-                    );
-                    push_poison_root(&mut poison, &mut poison_gaps, held);
-                    continue;
-                };
                 match evm_composer
                     .simulate_and_resolve_recorded_for(
                         eez_protocol::RollupId(rollup_id),
-                        l2_entry,
+                        cc.l2_entry_client.as_ref(),
                         held.raw_tx.as_ref(),
                     )
                     .await
                 {
-                    Ok((composition, _recorded)) => {
+                    Ok(composition) => {
                         let l1_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = composition
                             .targets
                             .iter()
