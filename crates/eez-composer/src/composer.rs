@@ -41,7 +41,7 @@ use tracing::{Level, event};
 
 use crate::held_pool::HeldTx;
 use crate::ingress::Direction;
-use crate::local::{build_sync_block, sync_block_pair_roots};
+use crate::local::{BuiltSyncBlock, build_sync_block, sync_block_pair_roots};
 use crate::optimistic::OptimisticallyIncluded;
 use crate::rollup::RollupState;
 
@@ -254,12 +254,12 @@ impl std::fmt::Debug for CrossChainWiring {
 }
 
 /// Relay-drop retries before a held user_tx is evicted as probable
-/// poison. Poison is normally caught at COMPOSE time (a tx whose
+/// unincludable. Unincludable txs are normally caught at COMPOSE time (a tx whose
 /// `simulate_and_resolve` deterministically fails — e.g. a wrong-proxy
 /// tx → `EmptyCalls`, or a revert — is evicted before it can enter a
 /// bundle). Under strict all-or-nothing bundles a bundle that still
 /// DROPS is relay bad luck, so its txs are re-queued; this bound only
-/// backstops poison the compose-time sim view missed (rbuilder sims
+/// backstops unincludable txs the compose-time sim view missed (rbuilder sims
 /// against a slightly different post-postBatch state). After this many
 /// consecutive drops the tx is evicted loudly (with the nonce-cascade)
 /// so it can't block the FIFO queue forever.
@@ -267,25 +267,25 @@ pub const MAX_BUNDLE_ATTEMPTS: u32 = 3;
 
 /// Classify a `simulate_and_resolve` failure. `true` = DETERMINISTIC:
 /// the composition is structurally invalid for this tx (no cross-chain
-/// call / revert / bad encoding), so the tx is poison and must be
+/// call / revert / bad encoding), so the tx is unincludable and must be
 /// evicted before it can enter — and perpetually drop — a bundle.
 /// `false` = TRANSIENT (chain unreachable / provider / transport /
 /// missing data), which a retry may clear → re-queue, don't evict.
-fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
+fn sim_error_is_unincludable(err: &eez_protocol::ComposerError) -> bool {
     use eez_protocol::{ComposerErrorKind, ExecutorErrorKind};
     match err.kind() {
         // Protocol failures = the composition itself is invalid
         // (EmptyCalls, broken chaining, unknown target, bad encoding) —
         // deterministic for this tx.
         ComposerErrorKind::Protocol(_) => true,
-        // Executor failures: poison EXCEPT the clearly-transient ones.
+        // Executor failures: unincludable EXCEPT the clearly-transient ones.
         ComposerErrorKind::Executor(ee) => !matches!(
             ee.kind(),
             ExecutorErrorKind::Unavailable(_)
                 | ExecutorErrorKind::Provider(_)
                 | ExecutorErrorKind::Missing(_)
         ),
-        // Lifecycle / internal (misconfigured, lock poisoned, double
+        // Lifecycle / internal (misconfigured, lock unincludableed, double
         // register) — not the tx's fault → retry, don't evict.
         _ => false,
     }
@@ -392,7 +392,7 @@ fn partition_stale(
     })
 }
 
-fn poison_gap_for(gaps: &[(Address, Direction, u64)], tx: &HeldTx) -> Option<u64> {
+fn unincludable_gap_for(gaps: &[(Address, Direction, u64)], tx: &HeldTx) -> Option<u64> {
     gaps.iter()
         .filter(|(sender, direction, nonce)| {
             tx.sender == *sender && tx.direction == *direction && tx.nonce > *nonce
@@ -401,16 +401,271 @@ fn poison_gap_for(gaps: &[(Address, Direction, u64)], tx: &HeldTx) -> Option<u64
         .min()
 }
 
-fn push_poison_root(
-    poison: &mut Vec<HeldTx>,
-    poison_gaps: &mut Vec<(Address, Direction, u64)>,
+fn push_unincludable_root(
+    unincludable: &mut Vec<HeldTx>,
+    unincludable_gaps: &mut Vec<(Address, Direction, u64)>,
     tx: HeldTx,
 ) {
     let gap = (tx.sender, tx.direction, tx.nonce);
-    if !poison_gaps.contains(&gap) {
-        poison_gaps.push(gap);
+    if !unincludable_gaps.contains(&gap) {
+        unincludable_gaps.push(gap);
     }
-    poison.push(tx);
+    unincludable.push(tx);
+}
+
+/// Result of classifying a drained batch tx-by-tx (the output of
+/// [`classify_drain`]): survivors staged for building, unincludable txs to
+/// evict, and an optional transient-abort signal.
+struct DrainClassification {
+    survivors: Vec<HeldTx>,
+    survivor_comps: Vec<eez_protocol::Composition>,
+    pending_out: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)>,
+    pending_in: Vec<eez_protocol::abi::ExecutionEntrySol>,
+    outbound_entries: Vec<eez_protocol::abi::ExecutionEntrySol>,
+    unincludable: Vec<HeldTx>,
+    unincludable_gaps: Vec<(Address, Direction, u64)>,
+    transient: Option<(String, Vec<HeldTx>)>,
+}
+
+/// The rich-path build products consumed by `compose_via_evm_composer`'s
+/// dispatch phase — the output of `Composer::build_rich_artifacts`.
+struct RichArtifacts {
+    built: BuiltSyncBlock,
+    postbatch_raw: Bytes,
+    total_entries: usize,
+}
+
+/// Classify a drained batch tx-by-tx with unincludable-isolation. Each held tx
+/// is staged as a survivor (inbound → `pending_in` + `survivor_comps`; outbound
+/// → `pending_out` + `outbound_entries`), evicted as `unincludable` (a
+/// deterministic sim failure, a malformed/multicall/over-escrow outbound, or a
+/// same-chain nonce above an evicted unincludable root), or aborts the drain on
+/// the first `transient` failure (carrying the failing tx + the unprocessed
+/// remainder to re-queue).
+async fn classify_drain(
+    cc: &CrossChainWiring,
+    ctx: &CrossChainExecCtx,
+    rollup_id: u64,
+    drained: Vec<HeldTx>,
+) -> DrainClassification {
+    let mut survivors: Vec<HeldTx> = Vec::with_capacity(drained.len());
+    // Inbound survivors' compositions (their `source.batch` = the L1
+    // deferred entries) feed `prepare_post_batch_raw`'s merge.
+    let mut survivor_comps: Vec<eez_protocol::Composition> = Vec::with_capacity(drained.len());
+    // Staged, not built inline: system txs are built ONCE post-drain via the
+    // canonical `build_cross_chain_sync_pairs` (matches the deriver). pending_out
+    // = (outbound settlement entry, its user tx); pending_in = inbound targets;
+    // outbound_entries = the settlement entries spliced into the postBatch.
+    let mut pending_out: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)> = Vec::new();
+    let mut pending_in: Vec<eez_protocol::abi::ExecutionEntrySol> = Vec::new();
+    let mut outbound_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = Vec::new();
+    // Escrow drawn down per outbound withdrawal (read once, lazily) so several
+    // in one slot can't collectively over-drain. `None` = not yet read.
+    let mut escrow_remaining: Option<U256> = None;
+    let mut unincludable: Vec<HeldTx> = Vec::new();
+    let mut unincludable_gaps: Vec<(Address, Direction, u64)> = Vec::new();
+    // On a transient failure we abort the slot; this holds the error
+    // string + the txs still needing re-queue (the failing tx + the
+    // unprocessed remainder; survivors are added below).
+    let mut transient: Option<(String, Vec<HeldTx>)> = None;
+
+    let mut iter = drained.into_iter().enumerate();
+    while let Some((idx, held)) = iter.next() {
+        if let Some(gap_at) = unincludable_gap_for(&unincludable_gaps, &held) {
+            event!(
+                name: "eez.composer.cc_compose.unincludable_chain_evicted",
+                Level::WARN,
+                rollup_id,
+                tx_idx = idx,
+                tx_hash = %held.hash,
+                sender = %held.sender,
+                nonce = held.nonce,
+                gap_at,
+                "same-sender tx above an evicted unincludable nonce in the same drain; evicted (resubmit in order)",
+            );
+            unincludable.push(held);
+            continue;
+        }
+        // ── OUTBOUND (L2→L1) arm. Source-sim runs against the L2 ENTRY client
+        // (the L2 follower errors `Unavailable`). Stage each (settlement entry,
+        // its user tx); the load tx is built post-drain by the canonical
+        // builder. Zero entries → unincludable.
+        if held.direction == Direction::Outbound {
+            match cc.simulate_and_resolve_recorded_for(
+                eez_protocol::RollupId(rollup_id),
+                cc.l2_entry_client.as_ref(),
+                held.raw_tx.as_ref(),
+            ) {
+                Ok(composition) => {
+                    let l1_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = composition
+                        .targets
+                        .iter()
+                        .flat_map(|t| t.batch.entries.iter().cloned())
+                        .collect();
+                    if l1_entries.is_empty() {
+                        event!(
+                            name: "eez.composer.cc_compose.outbound_no_entries",
+                            Level::WARN,
+                            rollup_id,
+                            tx_idx = idx,
+                            tx_hash = %held.hash,
+                            "outbound tx produced no L1 settlement entry; evicting (resubmit required)",
+                        );
+                        push_unincludable_root(&mut unincludable, &mut unincludable_gaps, held);
+                        continue;
+                    }
+                    // Block multicall outbound (not supported yet) on the axis
+                    // `reject_multicall` does NOT cover: ONE tx producing MULTIPLE
+                    // settlement entries (a contract making >1 cross-chain call).
+                    // reject_multicall guards >1 call WITHIN one entry
+                    // (`l2ToL1Calls.len() > 1`); this guards >1 entry from one tx.
+                    // The pairing below gives every entry the SAME signed
+                    // `held.raw_tx`, so >1 entry would put that nonce-bearing tx in
+                    // the Sync block more than once (`interleave_sync_block_txs`) →
+                    // build/replay failure. Evict loudly until grouped multicall
+                    // lands (docs/multicall-design.md).
+                    if l1_entries.len() > 1 {
+                        event!(
+                            name: "eez.composer.cc_compose.outbound_multicall_unsupported",
+                            Level::WARN,
+                            rollup_id,
+                            tx_idx = idx,
+                            tx_hash = %held.hash,
+                            entries = l1_entries.len(),
+                            "outbound tx made multiple cross-chain calls (multicall); not supported yet — evicting (resubmit required)",
+                        );
+                        push_unincludable_root(&mut unincludable, &mut unincludable_gaps, held);
+                        continue;
+                    }
+                    // Evict a withdrawal that would exceed the rollup's L1 escrow —
+                    // it would revert on-chain and drop the whole bundle.
+                    // "ether out" is the amount of Ether being withdrawn in this outbound settlement entry.
+                    // If missing, the entry is malformed and must be evicted.
+                    let Some(need) = eez_protocol::entries::outbound_ether_out(&l1_entries[0])
+                    else {
+                        event!(name: "eez.composer.cc_compose.outbound_ether_out_missing", Level::WARN, rollup_id, tx_idx = idx, tx_hash = %held.hash, "outbound tx is missing ether out entry, likely malformed; evicting");
+                        push_unincludable_root(&mut unincludable, &mut unincludable_gaps, held);
+                        continue;
+                    };
+                    if need > U256::ZERO {
+                        if escrow_remaining.is_none() {
+                            escrow_remaining =
+                                read_rollup_escrow(&ctx.l1_provider, rollup_id).await;
+                        }
+                        if let Some(avail) = escrow_remaining {
+                            if need > avail {
+                                event!(
+                                    name: "eez.composer.cc_compose.outbound_over_escrow",
+                                    Level::WARN,
+                                    rollup_id,
+                                    tx_idx = idx,
+                                    tx_hash = %held.hash,
+                                    need = %need,
+                                    escrow = %avail,
+                                    "outbound withdrawal exceeds L1 rollup escrow; evicting at compose time (would revert InsufficientRollupBalance on L1 — resubmit required)",
+                                );
+                                push_unincludable_root(
+                                    &mut unincludable,
+                                    &mut unincludable_gaps,
+                                    held,
+                                );
+                                continue;
+                            }
+                            escrow_remaining = Some(avail - need);
+                        }
+                    }
+                    for oe in &l1_entries {
+                        pending_out.push((oe.clone(), held.raw_tx.clone()));
+                    }
+                    outbound_entries.extend(l1_entries);
+                    // NOT pushed to `survivor_comps`: its `source.batch` is OUR
+                    // L2's entries (a dest=MAINNET call that must not settle on
+                    // L1). The L1 settlement is `outbound_entries`, spliced
+                    // separately with dest=rid.
+                    survivors.push(held);
+                }
+                Err(e) if sim_error_is_unincludable(&e) => {
+                    event!(
+                        name: "eez.composer.cc_compose.outbound_unincludable",
+                        Level::WARN,
+                        rollup_id,
+                        tx_idx = idx,
+                        tx_hash = %held.hash,
+                        error = %e,
+                        "outbound tx fails simulation deterministically; evicting",
+                    );
+                    push_unincludable_root(&mut unincludable, &mut unincludable_gaps, held);
+                }
+                Err(e) => {
+                    let mut rest = vec![held];
+                    rest.extend(iter.by_ref().map(|(_, h)| h));
+                    transient = Some((
+                        format!("simulate_and_resolve_recorded_for tx#{idx}: {e}"),
+                        rest,
+                    ));
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // ── INBOUND (L1→L2) arm. Stage the deferred target entries; the
+        // delivery system txs are built post-drain (after all outbound loads).
+        match cc.simulate_and_resolve(held.raw_tx.as_ref()) {
+            Ok(composition) => {
+                let target_entries: Vec<_> = composition
+                    .targets
+                    .iter()
+                    .flat_map(|t| t.batch.entries.iter().cloned())
+                    .collect();
+                let target_count = target_entries.len();
+                pending_in.extend(target_entries);
+                event!(
+                    name: "eez.composer.cc_compose.tx",
+                    Level::INFO,
+                    rollup_id,
+                    tx_idx = idx,
+                    target_count,
+                    "simulate_and_resolve produced {{target_count}} target(s) for held tx #{{tx_idx}}",
+                );
+                survivor_comps.push(composition);
+                survivors.push(held);
+            }
+            Err(e) if sim_error_is_unincludable(&e) => {
+                event!(
+                    name: "eez.composer.cc_compose.unincludable_evicted",
+                    Level::WARN,
+                    rollup_id,
+                    tx_idx = idx,
+                    tx_hash = %held.hash,
+                    sender = %held.sender,
+                    nonce = held.nonce,
+                    error = %e,
+                    "held tx fails simulation deterministically (e.g. wrong proxy → EmptyCalls, or revert); evicting — it can never compose, resubmit required",
+                );
+                push_unincludable_root(&mut unincludable, &mut unincludable_gaps, held);
+            }
+            Err(e) => {
+                // Transient (provider / transport / unavailable) —
+                // abort the slot, re-queue this tx + the remainder.
+                let mut rest = vec![held];
+                rest.extend(iter.by_ref().map(|(_, h)| h));
+                transient = Some((format!("simulate_and_resolve tx#{idx}: {e}"), rest));
+                break;
+            }
+        }
+    }
+
+    DrainClassification {
+        survivors,
+        survivor_comps,
+        pending_out,
+        pending_in,
+        outbound_entries,
+        unincludable,
+        unincludable_gaps,
+        transient,
+    }
 }
 
 /// Composer umbrella. Cheaply [`Clone`]able (`Arc<Inner>`).
@@ -682,7 +937,7 @@ where
                                 Err(err) => {
                                     // Inconclusive: re-queueing txs that
                                     // actually landed would burn nonces
-                                    // and poison the next bundle's
+                                    // and fail the next bundle's
                                     // simulation — scream instead of
                                     // guessing (invariant 7).
                                     event!(
@@ -1104,14 +1359,14 @@ where
         // Re-push user_txs whose nonce survived — to the FRONT of the
         // pool, ahead of anything submitted since, so user ordering is
         // preserved across retries. An included-but-reverted tx has a
-        // burned nonce — re-bundling it would poison the next bundle's
+        // burned nonce — re-bundling it would fail the next bundle's
         // simulation.
         if let Some(pool) = rollup.held_pool.as_ref() {
             let mut keep: Vec<crate::HeldTx> = Vec::with_capacity(failed.txs.len());
             let mut release: Vec<crate::HeldTx> = Vec::new();
             let mut dropped = 0usize;
             let mut evicted_chains: Vec<(alloy_primitives::Address, Direction, u64)> = Vec::new();
-            // slot_skipped: re-queue without counting toward poison-eviction
+            // slot_skipped: re-queue without counting toward unincludable-eviction
             // (a skipped slot heals via a fresh pin next tick).
             let slot_skipped = failed.slot_skipped;
             for mut tx in failed.txs {
@@ -1130,13 +1385,13 @@ where
                 } else {
                     // A relay drop on a BUILT slot did NOT burn the nonce
                     // (the tx never executed), so re-queue for a fresh
-                    // attempt. Poison is normally caught at compose
-                    // time; this bounded retry only backstops poison
+                    // attempt. Unincludable txs are normally caught at compose
+                    // time; this bounded retry only backstops unincludable txs
                     // the compose-time sim missed (rbuilder sims
                     // against a slightly different post-postBatch
                     // state). After MAX_BUNDLE_ATTEMPTS such drops,
                     // evict loudly (with the nonce-cascade) so a
-                    // residual poison tx can't block the FIFO queue
+                    // residual unincludable tx can't block the FIFO queue
                     // forever. User resubmits.
                     tx.attempts += 1;
                     if tx.attempts >= MAX_BUNDLE_ATTEMPTS {
@@ -1144,14 +1399,14 @@ where
                         release.push(tx.clone());
                         evicted_chains.push((tx.sender, tx.direction, tx.nonce));
                         event!(
-                            name: "eez.composer.recovery.poison_evicted",
+                            name: "eez.composer.recovery.unincludable_evicted",
                             Level::WARN,
                             rollup_id,
                             tx_hash = %tx.hash,
                             sender = %tx.sender,
                             nonce = tx.nonce,
                             attempts = tx.attempts,
-                            "user_tx evicted after MAX_BUNDLE_ATTEMPTS relay drops (likely poison the compose-time sim missed); resubmit required",
+                            "user_tx evicted after MAX_BUNDLE_ATTEMPTS relay drops (likely an unincludable tx the compose-time sim missed); resubmit required",
                         );
                     } else {
                         keep.push(tx);
@@ -1162,7 +1417,7 @@ where
             // same-sender tx with nonce > N permanently invalid (the
             // gap never fills — the evicted nonce only lands if the
             // user resubmits, which produces a NEW tx). Leaving them
-            // queued poisons every future bundle they ride and breaks
+            // queued unincludables every future bundle they ride and breaks
             // OTHER senders' chains as collateral — the exact cascade
             // that bricked a run's user EOA. Drop them from both the
             // keep list and the pool, loudly.
@@ -1243,7 +1498,6 @@ where
         suggested_fee_recipient: Address,
         bundle_target: BundleTarget,
     ) -> Result<Option<SyncSlotBlock>, String> {
-        let evm_composer = cc;
         let ctx = cc.exec_ctx.as_ref();
         // Read SYSTEM_ADDRESS nonce at the parent state — the next
         // signed system tx must use this. We sign multiple txs per
@@ -1289,17 +1543,17 @@ where
         //   leading immediate only, empty Sync block — keeps L1's
         //   recorded stateRoot tracking L2.
 
-        // ── Per-tx compose with poison isolation ─────────────────────
+        // ── Per-tx compose with unincludable isolation ─────────────────────
         // Simulate each held tx independently:
         //   - Ok                        → survivor (gets bundled).
-        //   - deterministic sim failure → POISON (e.g. a wrong-proxy tx
+        //   - deterministic sim failure → UNINCLUDABLE (e.g. a wrong-proxy tx
         //     → EmptyCalls, or a revert): evict it here (+ nonce-cascade)
         //     so it can never freeze the pool, and keep composing the
         //     survivors.
         //   - transient sim failure     → abort the slot: re-queue
         //     everything, degrade to a minimal postBatch, retry next.
         // Only sim-clean survivors are bundled, so any later bundle DROP
-        // is relay bad luck rather than poison.
+        // is relay bad luck rather than unincludable.
         if drained.is_empty() {
             return self
                 .dispatch_minimal_postbatch(
@@ -1336,225 +1590,32 @@ where
             pool.release_in_flight_batch(&stale);
         }
 
-        let mut survivors: Vec<HeldTx> = Vec::with_capacity(drained.len());
-        // Inbound survivors' compositions (their `source.batch` = the L1
-        // deferred entries) feed `prepare_post_batch_raw`'s merge.
-        let mut survivor_comps: Vec<eez_protocol::Composition> = Vec::with_capacity(drained.len());
-        // Staged, not built inline: system txs are built ONCE post-drain via the
-        // canonical `build_cross_chain_sync_pairs` (matches the deriver). pending_out
-        // = (outbound settlement entry, its user tx); pending_in = inbound targets;
-        // outbound_entries = the settlement entries spliced into the postBatch.
-        let mut pending_out: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)> = Vec::new();
-        let mut pending_in: Vec<eez_protocol::abi::ExecutionEntrySol> = Vec::new();
-        let mut outbound_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = Vec::new();
-        // Escrow drawn down per outbound withdrawal (read once, lazily) so several
-        // in one slot can't collectively over-drain. `None` = not yet read.
-        let mut escrow_remaining: Option<U256> = None;
-        let mut poison: Vec<HeldTx> = Vec::new();
-        let mut poison_gaps: Vec<(Address, Direction, u64)> = Vec::new();
-        // On a transient failure we abort the slot; this holds the error
-        // string + the txs still needing re-queue (the failing tx + the
-        // unprocessed remainder; survivors are added below).
-        let mut transient: Option<(String, Vec<HeldTx>)> = None;
+        let DrainClassification {
+            survivors,
+            survivor_comps,
+            pending_out,
+            pending_in,
+            outbound_entries,
+            unincludable,
+            unincludable_gaps,
+            transient,
+        } = classify_drain(cc, ctx, rollup_id, drained).await;
 
-        let mut iter = drained.into_iter().enumerate();
-        while let Some((idx, held)) = iter.next() {
-            if let Some(gap_at) = poison_gap_for(&poison_gaps, &held) {
-                event!(
-                    name: "eez.composer.cc_compose.poison_chain_evicted",
-                    Level::WARN,
-                    rollup_id,
-                    tx_idx = idx,
-                    tx_hash = %held.hash,
-                    sender = %held.sender,
-                    nonce = held.nonce,
-                    gap_at,
-                    "same-sender tx above an evicted poison nonce in the same drain; evicted (resubmit in order)",
-                );
-                poison.push(held);
-                continue;
-            }
-            // ── OUTBOUND (L2→L1) arm. Source-sim runs against the L2 ENTRY client
-            // (the L2 follower errors `Unavailable`). Stage each (settlement entry,
-            // its user tx); the load tx is built post-drain by the canonical
-            // builder. Zero entries → poison.
-            if held.direction == Direction::Outbound {
-                match evm_composer.simulate_and_resolve_recorded_for(
-                    eez_protocol::RollupId(rollup_id),
-                    cc.l2_entry_client.as_ref(),
-                    held.raw_tx.as_ref(),
-                ) {
-                    Ok(composition) => {
-                        let l1_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = composition
-                            .targets
-                            .iter()
-                            .flat_map(|t| t.batch.entries.iter().cloned())
-                            .collect();
-                        if l1_entries.is_empty() {
-                            event!(
-                                name: "eez.composer.cc_compose.outbound_no_entries",
-                                Level::WARN,
-                                rollup_id,
-                                tx_idx = idx,
-                                tx_hash = %held.hash,
-                                "outbound tx produced no L1 settlement entry; evicting (resubmit required)",
-                            );
-                            push_poison_root(&mut poison, &mut poison_gaps, held);
-                            continue;
-                        }
-                        // Block multicall outbound (not supported yet) on the axis
-                        // `reject_multicall` does NOT cover: ONE tx producing MULTIPLE
-                        // settlement entries (a contract making >1 cross-chain call).
-                        // reject_multicall guards >1 call WITHIN one entry
-                        // (`l2ToL1Calls.len() > 1`); this guards >1 entry from one tx.
-                        // The pairing below gives every entry the SAME signed
-                        // `held.raw_tx`, so >1 entry would put that nonce-bearing tx in
-                        // the Sync block more than once (`interleave_sync_block_txs`) →
-                        // build/replay failure. Evict loudly until grouped multicall
-                        // lands (docs/multicall-design.md).
-                        if l1_entries.len() > 1 {
-                            event!(
-                                name: "eez.composer.cc_compose.outbound_multicall_unsupported",
-                                Level::WARN,
-                                rollup_id,
-                                tx_idx = idx,
-                                tx_hash = %held.hash,
-                                entries = l1_entries.len(),
-                                "outbound tx made multiple cross-chain calls (multicall); not supported yet — evicting (resubmit required)",
-                            );
-                            push_poison_root(&mut poison, &mut poison_gaps, held);
-                            continue;
-                        }
-                        // Evict a withdrawal that would exceed the rollup's L1 escrow —
-                        // it would revert on-chain and drop the whole bundle.
-                        // "ether out" is the amount of Ether being withdrawn in this outbound settlement entry.
-                        // If missing, the entry is malformed and must be evicted.
-                        let Some(need) = eez_protocol::entries::outbound_ether_out(&l1_entries[0])
-                        else {
-                            event!(name: "eez.composer.cc_compose.outbound_ether_out_missing", Level::WARN, rollup_id, tx_idx = idx, tx_hash = %held.hash, "outbound tx is missing ether out entry, likely malformed; evicting");
-                            push_poison_root(&mut poison, &mut poison_gaps, held);
-                            continue;
-                        };
-                        if need > U256::ZERO {
-                            if escrow_remaining.is_none() {
-                                escrow_remaining =
-                                    read_rollup_escrow(&ctx.l1_provider, rollup_id).await;
-                            }
-                            if let Some(avail) = escrow_remaining {
-                                if need > avail {
-                                    event!(
-                                        name: "eez.composer.cc_compose.outbound_over_escrow",
-                                        Level::WARN,
-                                        rollup_id,
-                                        tx_idx = idx,
-                                        tx_hash = %held.hash,
-                                        need = %need,
-                                        escrow = %avail,
-                                        "outbound withdrawal exceeds L1 rollup escrow; evicting at compose time (would revert InsufficientRollupBalance on L1 — resubmit required)",
-                                    );
-                                    push_poison_root(&mut poison, &mut poison_gaps, held);
-                                    continue;
-                                }
-                                escrow_remaining = Some(avail - need);
-                            }
-                        }
-                        for oe in &l1_entries {
-                            pending_out.push((oe.clone(), held.raw_tx.clone()));
-                        }
-                        outbound_entries.extend(l1_entries);
-                        // NOT pushed to `survivor_comps`: its `source.batch` is OUR
-                        // L2's entries (a dest=MAINNET call that must not settle on
-                        // L1). The L1 settlement is `outbound_entries`, spliced
-                        // separately with dest=rid.
-                        survivors.push(held);
-                    }
-                    Err(e) if sim_error_is_poison(&e) => {
-                        event!(
-                            name: "eez.composer.cc_compose.outbound_poison",
-                            Level::WARN,
-                            rollup_id,
-                            tx_idx = idx,
-                            tx_hash = %held.hash,
-                            error = %e,
-                            "outbound tx fails simulation deterministically; evicting",
-                        );
-                        push_poison_root(&mut poison, &mut poison_gaps, held);
-                    }
-                    Err(e) => {
-                        let mut rest = vec![held];
-                        rest.extend(iter.by_ref().map(|(_, h)| h));
-                        transient = Some((
-                            format!("simulate_and_resolve_recorded_for tx#{idx}: {e}"),
-                            rest,
-                        ));
-                        break;
-                    }
-                }
-                continue;
-            }
-
-            // ── INBOUND (L1→L2) arm. Stage the deferred target entries; the
-            // delivery system txs are built post-drain (after all outbound loads).
-            match evm_composer.simulate_and_resolve(held.raw_tx.as_ref()) {
-                Ok(composition) => {
-                    let target_entries: Vec<_> = composition
-                        .targets
-                        .iter()
-                        .flat_map(|t| t.batch.entries.iter().cloned())
-                        .collect();
-                    let target_count = target_entries.len();
-                    pending_in.extend(target_entries);
-                    event!(
-                        name: "eez.composer.cc_compose.tx",
-                        Level::INFO,
-                        rollup_id,
-                        tx_idx = idx,
-                        target_count,
-                        "simulate_and_resolve produced {{target_count}} target(s) for held tx #{{tx_idx}}",
-                    );
-                    survivor_comps.push(composition);
-                    survivors.push(held);
-                }
-                Err(e) if sim_error_is_poison(&e) => {
-                    event!(
-                        name: "eez.composer.cc_compose.poison_evicted",
-                        Level::WARN,
-                        rollup_id,
-                        tx_idx = idx,
-                        tx_hash = %held.hash,
-                        sender = %held.sender,
-                        nonce = held.nonce,
-                        error = %e,
-                        "held tx fails simulation deterministically (e.g. wrong proxy → EmptyCalls, or revert); evicting — it can never compose, resubmit required",
-                    );
-                    push_poison_root(&mut poison, &mut poison_gaps, held);
-                }
-                Err(e) => {
-                    // Transient (provider / transport / unavailable) —
-                    // abort the slot, re-queue this tx + the remainder.
-                    let mut rest = vec![held];
-                    rest.extend(iter.by_ref().map(|(_, h)| h));
-                    transient = Some((format!("simulate_and_resolve tx#{idx}: {e}"), rest));
-                    break;
-                }
-            }
-        }
-
-        // Evict the poison txs' gapped higher nonces from the pool — once
+        // Evict the unincludable txs' gapped higher nonces from the pool — once
         // a sender's nonce N is evicted, N+1.. can never land.
         if let Some(pool) = rollup.held_pool.as_ref() {
-            for tx in &poison {
-                // Inclusive eviction releases the poison root's reservation too.
+            for tx in &unincludable {
+                // Inclusive eviction releases the unincludable root's reservation too.
                 for t in pool.evict_chain_at_or_above(tx.sender, tx.direction, tx.nonce) {
                     event!(
-                        name: "eez.composer.cc_compose.poison_chain_evicted",
+                        name: "eez.composer.cc_compose.unincludable_chain_evicted",
                         Level::WARN,
                         rollup_id,
                         tx_hash = %t.hash,
                         sender = %t.sender,
                         nonce = t.nonce,
                         gap_at = tx.nonce,
-                        "same-sender tx above an evicted poison nonce; gapped chain can't land — evicted (resubmit in order)",
+                        "same-sender tx above an evicted unincludable nonce; gapped chain can't land — evicted (resubmit in order)",
                     );
                 }
             }
@@ -1575,18 +1636,18 @@ where
                 requeue.extend(rest);
                 let mut cascade_evicted = Vec::new();
                 requeue.retain(|tx| {
-                    let Some(gap_at) = poison_gap_for(&poison_gaps, tx) else {
+                    let Some(gap_at) = unincludable_gap_for(&unincludable_gaps, tx) else {
                         return true;
                     };
                     event!(
-                        name: "eez.composer.cc_compose.poison_chain_evicted",
+                        name: "eez.composer.cc_compose.unincludable_chain_evicted",
                         Level::WARN,
                         rollup_id,
                         tx_hash = %tx.hash,
                         sender = %tx.sender,
                         nonce = tx.nonce,
                         gap_at,
-                        "same-sender unprocessed tx above an evicted poison nonce; evicted instead of re-queued (resubmit in order)",
+                        "same-sender unprocessed tx above an evicted unincludable nonce; evicted instead of re-queued (resubmit in order)",
                     );
                     cascade_evicted.push(tx.clone());
                     false
@@ -1607,12 +1668,12 @@ where
                 .await;
         }
 
-        // Every held tx was poison (evicted) → nothing to compose. Still
+        // Every held tx was unincludable (evicted) → nothing to compose. Still
         // emit a minimal postBatch so L1 keeps tracking L2's progression.
         if survivors.is_empty() {
-            let evicted = poison.len() + stale.len();
+            let evicted = unincludable.len() + stale.len();
             event!(
-                name: "eez.composer.phase2.all_poison",
+                name: "eez.composer.phase2.all_unincludable",
                 Level::WARN,
                 rollup_id,
                 evicted,
@@ -1637,140 +1698,31 @@ where
         // [load,user,…,deliveries]. Handles inbound / outbound / mixed
         // uniformly. A failure is systemic (signing / nonce overflow) →
         // re-queue survivors, degrade to minimal.
-        let pairs = match eez_protocol::system_tx::build_cross_chain_sync_pairs(
-            &pending_out,
-            &pending_in,
-            &stf_cfg,
-            nonce,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                event!(
-                    name: "eez.composer.phase2.sync_pairs_failed",
-                    Level::WARN,
-                    rollup_id,
-                    error = %e,
-                    "build_cross_chain_sync_pairs failed; re-queueing survivors, degrading to minimal postBatch",
-                );
-                if let Some(pool) = rollup.held_pool.as_ref() {
-                    pool.push_front_batch(survivors);
-                }
-                return self
-                    .dispatch_minimal_postbatch(
-                        ctx,
-                        rollup_id,
-                        rollup,
-                        parent_header,
-                        timestamp,
-                        suggested_fee_recipient,
-                        bundle_target,
-                    )
-                    .await;
-            }
-        };
-
-        // ── Build the rich Sync block + postBatch from survivors. A ──
-        // ── build / prepare failure here is systemic (not one tx) →  ──
-        // ── re-queue survivors and degrade to minimal.               ──
-        let sync_txs = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
-        let built = match build_sync_block(
-            rollup.l2_provider.as_ref(),
-            &self.inner.evm_config,
-            parent_header,
-            timestamp,
-            suggested_fee_recipient,
-            &sync_txs,
-        ) {
-            Ok(b) => b,
-            Err(e) => {
-                event!(
-                    name: "eez.composer.phase2.build_failed",
-                    Level::WARN,
-                    rollup_id,
-                    error = %e,
-                    "build_sync_block failed; re-queueing survivors, degrading to minimal postBatch",
-                );
-                if let Some(pool) = rollup.held_pool.as_ref() {
-                    pool.push_front_batch(survivors);
-                }
-                return self
-                    .dispatch_minimal_postbatch(
-                        ctx,
-                        rollup_id,
-                        rollup,
-                        parent_header,
-                        timestamp,
-                        suggested_fee_recipient,
-                        bundle_target,
-                    )
-                    .await;
-            }
-        };
-        // Per-effect intermediate L2 roots: the prover requires each entry's
-        // `newState` to be its own effect's root, not the final Sync-block root.
-        // Failure here is systemic (like build/prepare) → degrade.
-        let pair_roots = match sync_block_pair_roots(
-            rollup.l2_provider.as_ref(),
-            &self.inner.evm_config,
-            parent_header,
-            timestamp,
-            suggested_fee_recipient,
-            &sync_txs,
-            ctx.ccm_l2_address,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                event!(
-                    name: "eez.composer.phase2.pair_roots_failed",
-                    Level::WARN,
-                    rollup_id,
-                    error = %e,
-                    "sync_block_pair_roots failed; re-queueing survivors, degrading to minimal postBatch",
-                );
-                if let Some(pool) = rollup.held_pool.as_ref() {
-                    pool.push_front_batch(survivors);
-                }
-                return self
-                    .dispatch_minimal_postbatch(
-                        ctx,
-                        rollup_id,
-                        rollup,
-                        parent_header,
-                        timestamp,
-                        suggested_fee_recipient,
-                        bundle_target,
-                    )
-                    .await;
-            }
-        };
-        let comp_refs: Vec<&eez_protocol::Composition> = survivor_comps.iter().collect();
-        // Outbound user txs (the SyncPair user halves) travel in the sync-block
-        // DA slot — the deriver can't reconstruct them from the postBatch entries
-        // (only the system/load txs are). Empty for inbound-only.
-        let outbound_user_txs: Vec<Bytes> =
-            pairs.iter().filter_map(|p| p.user_tx.clone()).collect();
-        let postbatch_raw = match self
-            .prepare_post_batch_raw(
+        let artifacts = match self
+            .build_rich_artifacts(
                 ctx,
                 rollup_id,
-                &comp_refs,
-                parent_header,
-                built.header.state_root(),
-                &built.block,
-                &pair_roots,
+                rollup,
+                &pending_out,
+                &pending_in,
                 &outbound_entries,
-                &outbound_user_txs,
+                &survivor_comps,
+                &stf_cfg,
+                nonce,
+                parent_header,
+                timestamp,
+                suggested_fee_recipient,
             )
             .await
         {
-            Ok(r) => r,
-            Err(e) => {
+            Ok(artifacts) => artifacts,
+            Err(reason) => {
                 event!(
-                    name: "eez.composer.phase2.prepare_failed",
+                    name: "eez.composer.phase2.degraded",
                     Level::WARN,
                     rollup_id,
-                    error = %e,
-                    "prepare_post_batch_raw failed; re-queueing survivors, degrading to minimal postBatch",
+                    reason = %reason,
+                    "rich compose failed; re-queueing survivors, degrading to minimal postBatch",
                 );
                 if let Some(pool) = rollup.held_pool.as_ref() {
                     pool.push_front_batch(survivors);
@@ -1788,16 +1740,14 @@ where
                     .await;
             }
         };
-        let total_entries: usize = comp_refs.iter().map(|c| c.source.batch.entries.len()).sum();
 
-        // ── Dispatch: rich bundle [postBatch, ...survivors], commit. ──
-        let sync_height = built.header.number();
-        // keccak of the raw EIP-2718 envelope IS the typed tx's hash —
-        // recorded in the ledger so the finality audit can look up the
-        // postBatch receipt.
-        let post_batch_hash = alloy_primitives::keccak256(&postbatch_raw);
+        // ── Dispatch: rich bundle [postBatch, ...inbound survivors], commit. ──
+        let sync_height = artifacts.built.header.number();
+        // keccak of the raw EIP-2718 envelope IS the typed tx's hash — recorded
+        // in the ledger so the finality audit can look up the postBatch receipt.
+        let post_batch_hash = alloy_primitives::keccak256(&artifacts.postbatch_raw);
         let mut bundle: Vec<Bytes> = Vec::with_capacity(1 + survivors.len());
-        bundle.push(postbatch_raw);
+        bundle.push(artifacts.postbatch_raw);
         // Only INBOUND survivors ride the L1 bundle (L1-signed, execute on L1).
         // Outbound survivors are L2-signed — they run in the L2 Sync block + DA,
         // never the L1 bundle (an L2 tx is invalid on L1).
@@ -1813,8 +1763,8 @@ where
             rollup_id,
             sync_height,
             tx_count = bundle.len(),
-            entry_count = total_entries,
-            evicted_poison = poison.len(),
+            entry_count = artifacts.total_entries,
+            evicted_unincludable = unincludable.len(),
             evicted_stale = stale.len(),
             "rich bundle dispatched to background observer; committing Sync block optimistically",
         );
@@ -1829,14 +1779,91 @@ where
             rollup_id,
             sync_height,
             bundle,
-            built.header.state_root(),
+            artifacts.built.header.state_root(),
             Arc::clone(&rollup.optimistic),
             bundle_target,
         );
         Ok(Some(SyncSlotBlock {
-            payload: built.payload,
-            header: built.header,
+            payload: artifacts.built.payload,
+            header: artifacts.built.header,
         }))
+    }
+
+    /// Build the rich Sync block + signed postBatch from the classified drain:
+    /// sync pairs → block → per-effect pair roots → postBatch. Every step is a
+    /// SYSTEMIC failure (signing / build / prove-prep — not one tx), so the
+    /// caller collapses any `Err(reason)` into a single degrade-to-minimal.
+    async fn build_rich_artifacts(
+        &self,
+        ctx: &CrossChainExecCtx,
+        rollup_id: u64,
+        rollup: &RollupState<L2>,
+        pending_out: &[(eez_protocol::abi::ExecutionEntrySol, Bytes)],
+        pending_in: &[eez_protocol::abi::ExecutionEntrySol],
+        outbound_entries: &[eez_protocol::abi::ExecutionEntrySol],
+        survivor_comps: &[eez_protocol::Composition],
+        stf_cfg: &eez_protocol::system_tx::SystemTxContext,
+        nonce: u64,
+        parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
+        timestamp: u64,
+        suggested_fee_recipient: Address,
+    ) -> Result<RichArtifacts, String> {
+        // Deriver-byte-identical two-phase SYSTEM_ADDRESS nonces (outbound loads
+        // N.., then inbound deliveries N+K..) + interleaved [load,user,…] order.
+        let pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
+            pending_out,
+            pending_in,
+            stf_cfg,
+            nonce,
+        )
+        .map_err(|e| format!("build_cross_chain_sync_pairs: {e}"))?;
+        let sync_txs = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
+        let built = build_sync_block(
+            rollup.l2_provider.as_ref(),
+            &self.inner.evm_config,
+            parent_header,
+            timestamp,
+            suggested_fee_recipient,
+            &sync_txs,
+        )
+        .map_err(|e| format!("build_sync_block: {e}"))?;
+        // Per-effect intermediate L2 roots: the prover requires each entry's
+        // `newState` to be its own effect's root, not the final Sync-block root.
+        let pair_roots = sync_block_pair_roots(
+            rollup.l2_provider.as_ref(),
+            &self.inner.evm_config,
+            parent_header,
+            timestamp,
+            suggested_fee_recipient,
+            &sync_txs,
+            ctx.ccm_l2_address,
+        )
+        .map_err(|e| format!("sync_block_pair_roots: {e}"))?;
+        let comp_refs: Vec<&eez_protocol::Composition> = survivor_comps.iter().collect();
+        // Outbound user txs (the SyncPair user halves) travel in the sync-block
+        // DA slot — the deriver can't reconstruct them from the postBatch entries.
+        let outbound_user_txs: Vec<Bytes> =
+            pairs.iter().filter_map(|p| p.user_tx.clone()).collect();
+        let postbatch_raw = self
+            .prepare_post_batch_raw(
+                ctx,
+                rollup_id,
+                &comp_refs,
+                parent_header,
+                built.header.state_root(),
+                &built.block,
+                &pair_roots,
+                outbound_entries,
+                &outbound_user_txs,
+            )
+            .await
+            .map_err(|e| format!("prepare_post_batch_raw: {e}"))?;
+        let total_entries: usize = comp_refs.iter().map(|c| c.source.batch.entries.len()).sum();
+        Ok(RichArtifacts {
+            built,
+            postbatch_raw,
+            total_entries,
+        })
     }
 
     /// Phase 1: build an empty Sync block, sign a leading-immediate-only
@@ -2528,7 +2555,7 @@ async fn observe_bundle_outcome(
         .send_bundle(&bundle, target, Some(expected_final_state))
         .await;
     // Strict all-or-nothing: Included ⟹ settled; the only failure is a drop.
-    // Poison is caught at compose time, so a drop here is bad luck — recovery
+    // Unincludable txs are caught at compose time, so a drop here is bad luck — recovery
     // recomposes a FRESH tx next trigger (the builder ignores re-sends).
     let settled = matches!(
         outcome,
@@ -2560,7 +2587,7 @@ async fn observe_bundle_outcome(
         optimistic.mark_settled(sync_height);
     } else {
         // slot_skipped = pinned slot didn't land as pinned (block ts != pin, or
-        // unreadable) → not the tx's fault; requeue without poison-eviction.
+        // unreadable) → not the tx's fault; requeue without unincludable-eviction.
         let slot_skipped = match target {
             BundleTarget::Exact { block, timestamp } => {
                 submitter.block_timestamp(block).await.ok().flatten() != Some(timestamp)
@@ -2665,40 +2692,40 @@ mod tests {
     }
 
     #[test]
-    fn poison_gap_matches_only_same_chain_higher_nonce() {
+    fn unincludable_gap_matches_only_same_chain_higher_nonce() {
         let sender = Address::repeat_byte(0xa);
         let other = Address::repeat_byte(0xb);
         let gaps = vec![(sender, Direction::Inbound, 3)];
 
         assert_eq!(
-            poison_gap_for(&gaps, &held(sender, Direction::Inbound, 4, 1)),
+            unincludable_gap_for(&gaps, &held(sender, Direction::Inbound, 4, 1)),
             Some(3)
         );
         assert_eq!(
-            poison_gap_for(&gaps, &held(sender, Direction::Inbound, 3, 2)),
+            unincludable_gap_for(&gaps, &held(sender, Direction::Inbound, 3, 2)),
             None
         );
         assert_eq!(
-            poison_gap_for(&gaps, &held(sender, Direction::Outbound, 4, 3)),
+            unincludable_gap_for(&gaps, &held(sender, Direction::Outbound, 4, 3)),
             None
         );
         assert_eq!(
-            poison_gap_for(&gaps, &held(other, Direction::Inbound, 4, 4)),
+            unincludable_gap_for(&gaps, &held(other, Direction::Inbound, 4, 4)),
             None
         );
     }
 
     #[test]
-    fn push_poison_root_records_gap_once() {
+    fn push_unincludable_root_records_gap_once() {
         let sender = Address::repeat_byte(0xc);
         let tx = held(sender, Direction::Inbound, 7, 1);
-        let mut poison = Vec::new();
+        let mut unincludable = Vec::new();
         let mut gaps = Vec::new();
 
-        push_poison_root(&mut poison, &mut gaps, tx.clone());
-        push_poison_root(&mut poison, &mut gaps, tx);
+        push_unincludable_root(&mut unincludable, &mut gaps, tx.clone());
+        push_unincludable_root(&mut unincludable, &mut gaps, tx);
 
-        assert_eq!(poison.len(), 2);
+        assert_eq!(unincludable.len(), 2);
         assert_eq!(gaps, vec![(sender, Direction::Inbound, 7)]);
     }
 

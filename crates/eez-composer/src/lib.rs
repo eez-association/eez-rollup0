@@ -39,7 +39,7 @@ pub use held_pool::{HeldPool, HeldTx};
 pub use ingress::Direction;
 
 #[doc(inline)]
-pub use local::{build_sync_block, BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient};
+pub use local::{BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient, build_sync_block};
 pub use optimistic::OptimisticallyIncluded;
 #[doc(inline)]
 pub use rollup::{RollupConfig, RollupState};
