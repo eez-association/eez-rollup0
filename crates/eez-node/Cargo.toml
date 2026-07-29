@@ -10,7 +10,6 @@ description            = "eez Rollup-0 node — vanilla reth driven by an eez se
 eez-composer.workspace      = true
 eez-deriver.workspace       = true
 eez-driver.workspace        = true
-eez-evm-inspector.workspace = true
 eez-l1.workspace            = true
 eez-protocol.workspace      = true
 eez-prover.workspace        = true

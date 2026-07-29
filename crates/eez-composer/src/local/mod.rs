@@ -1,7 +1,7 @@
 //! Reth-specific infrastructure for cross-chain composition.
 //!
 //! Composition orchestration (the per-tx `eez_protocol::Composer`)
-//! lives in `eez-protocol`; the revm Inspector in `eez-evm-inspector`.
+//! lives in `eez-protocol`; the revm Inspector is [`crate::inspector`].
 //! This module provides the reth-backed implementation of the
 //! protocol traits the orchestrator drives:
 //!

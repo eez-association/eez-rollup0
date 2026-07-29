@@ -28,7 +28,7 @@ use reth_primitives_traits::SignerRecoverable;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::{BlockNumReader, HeaderProvider, StateProvider, StateProviderFactory};
 
-use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
+use crate::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
 use eez_protocol::{
     ChainClient, CompositionBuilder, ExecutorError, ExecutorErrorKind, ExecutorResult,
     ProxyLookupConfig, RollupId, TargetExecutionSession,

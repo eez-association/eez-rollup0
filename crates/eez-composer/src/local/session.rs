@@ -10,7 +10,7 @@
 
 use alloy_primitives::{Address, B256, Bytes, U256};
 
-use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory};
+use crate::{OverlayChannelHandle, SessionInspectorFactory};
 use reth_evm::{ConfigureEvm, Evm as _};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_revm::{database::StateProviderDatabase, db::State};
@@ -52,7 +52,7 @@ pub struct LocalExecutionSession {
     chain_id: u64,
     ccm_address: Address,
     /// When `Some`, `execute()` runs each target call under a
-    /// [`eez_evm_inspector::SessionInspector`] built from this factory — forwarding
+    /// [`crate::SessionInspector`] built from this factory — forwarding
     /// detected proxy CALLs to the dispatcher. `None` means a plain
     /// direct execute with no inspection layer (used for the entry
     /// role's target-session path when the topology has no nested
@@ -86,7 +86,7 @@ impl LocalExecutionSession {
     ///
     /// `inspector_factory` pins this session's target-side inspection
     /// policy. When supplied, each `execute` call runs under a
-    /// [`eez_evm_inspector::SessionInspector`] so proxy CALLs
+    /// [`crate::SessionInspector`] so proxy CALLs
     /// detected during the target-chain execution dispatch back
     /// through the supplied `dispatcher` and are recorded into the
     /// composition's preorder `recorded[..]` slice. When `None`, the
@@ -98,7 +98,7 @@ impl LocalExecutionSession {
     /// target-session frame dispatches back to the entry rollup, the
     /// entry session is lazily opened with a clone of source-sim's
     /// in-flight cache (via the
-    /// [`eez_evm_inspector::OverlayChannel`] side-channel), so
+    /// [`crate::OverlayChannel`] side-channel), so
     /// the nested L1 call observes source-sim's pending writes —
     /// load-bearing for fixtures that mutate L1 state inside a single
     /// source tx (e.g. `flash-loan`). `None` opens a fresh State.
@@ -238,7 +238,7 @@ impl LocalExecutionSession {
     }
 
     /// Inspected direct-call path. Runs the target-chain tx under the
-    /// supplied [`eez_evm_inspector::SessionInspector`] so proxy CALLs detected during
+    /// supplied [`crate::SessionInspector`] so proxy CALLs detected during
     /// execution dispatch back through the underlying `Dispatcher`.
     ///
     /// The session takes the inspector by value (non-`'static`
@@ -257,7 +257,7 @@ impl LocalExecutionSession {
     /// the amendment C15 regression test.
     fn execute_internal_with_inspector(
         &mut self,
-        inspector: eez_evm_inspector::SessionInspector<'_>,
+        inspector: crate::SessionInspector<'_>,
         destination: &Address,
         calldata: &Bytes,
         value: &U256,
