@@ -10,7 +10,7 @@ description            = "RemoteProver: the composer-side Prover impl that turns
 eez-prover.workspace      = true
 eez-control-rpc.workspace = true
 # Encode ProvingContext.batch → postAndVerifyBatch calldata for the wire.
-eez-evm.workspace         = true
+eez-protocol.workspace    = true
 
 alloy-primitives.workspace = true
 alloy-sol-types.workspace  = true

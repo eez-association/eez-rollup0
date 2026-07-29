@@ -5,7 +5,6 @@ members = [
     "crates/eez-control-rpc",
     "crates/eez-deriver",
     "crates/eez-driver",
-    "crates/eez-evm",
     "crates/eez-evm-inspector",
     "crates/eez-l1",
     "crates/eez-node",
@@ -142,7 +141,6 @@ tower                  = { version = "0.5", features = ["util"] }
 eez-composer       = { path = "crates/eez-composer" }
 eez-deriver        = { path = "crates/eez-deriver" }
 eez-driver         = { path = "crates/eez-driver" }
-eez-evm            = { path = "crates/eez-evm" }
 eez-evm-inspector  = { path = "crates/eez-evm-inspector" }
 eez-l1             = { path = "crates/eez-l1" }
 eez-payload-codec  = { path = "crates/eez-payload-codec" }

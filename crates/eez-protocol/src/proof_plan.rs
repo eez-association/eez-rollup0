@@ -17,17 +17,13 @@
 //! A per-rollup-only resolver API cannot express this ordering
 //! (the global `proofSystems[]` ordering, the local→global index
 //! mapping, the jagged-matrix shape all live at the batch level).
-//! [`ProofPlanResolver`] resolves a batch's full proof plan in
-//! one call.
+//! [`ProofPlanResolver`](crate::proof_resolver::ProofPlanResolver)
+//! resolves a batch's full proof plan in one call.
 //!
-//! # Chain-agnostic shape
-//!
-//! The trait is parameterized by [`crate::ChainProtocol`] so the
-//! `Address` type stays chain-specific. Timestamps and block
+//! Timestamps and block
 //! hashes use the wire shape `[u8; 32]` (big-endian for
 //! timestamps) — that's the natural input to the chain's
-//! `abi.encode`-equivalent fold and avoids pulling alloy into
-//! the protocol crate. EVM-side concrete impls convert to
+//! `abi.encode`-equivalent fold. The resolver converts to
 //! `alloy_primitives::U256` / `B256` at the encoder boundary.
 //!
 //! # Spec anchors
@@ -35,12 +31,10 @@
 //! The shapes here mirror the upstream `sync-rollups-protocol`
 //! Solidity contracts (not vendored in this repo); the
 //! `publicInputsHash` fold and on-chain `_validateStructure` are
-//! the construction this trait is shaped to feed.
+//! the construction this plan is shaped to feed.
 
-use async_trait::async_trait;
+use alloy_primitives::Address;
 
-use crate::error::ExecutorResult;
-use crate::protocol::ChainProtocol;
 use crate::rollup_id::RollupId;
 
 /// Per-rollup attestation entry inside a [`ProofPlan`]. Mirrors
@@ -76,7 +70,7 @@ pub struct RollupProofAssignment {
 pub struct TimestampAndBlockHash {
     /// Manager-attested timestamp at the moment of `postBatch`
     /// execution. On-chain type is `uint256`; encoded as
-    /// big-endian 32 bytes by the EVM-side `abi.encode`
+    /// big-endian 32 bytes by the `abi.encode`
     /// boundary.
     pub timestamp: [u8; 32],
     /// Manager-attested block hash.
@@ -102,19 +96,15 @@ impl Default for TimestampAndBlockHash {
 /// `publicInputsHash`-computing layer + the signer-driven
 /// proof-population layer (both upstream-specified).
 ///
-/// Generic over `P: ChainProtocol` so the address type (`P::
-/// Address`) stays chain-specific. The `vk_matrix` is jagged:
+/// The `vk_matrix` is jagged:
 /// `vk_matrix[r]` has the same length as
 /// `rollup_assignments[r].proof_system_index`.
 #[derive(Debug, Clone)]
-pub struct ProofPlan<P: ChainProtocol + ?Sized>
-where
-    P::Address: PartialEq + Eq,
-{
+pub struct ProofPlan {
     /// Batch-wide ordered PS set. Strictly increasing by
     /// address — matches `ProofSystemBatchPerVerificationEntries
     /// .proofSystems` exactly.
-    pub proof_systems: Vec<P::Address>,
+    pub proof_systems: Vec<Address>,
     /// Per-rollup assignments, sorted by `rollup_id` ascending.
     /// Length is the rollup count for this batch.
     pub rollup_assignments: Vec<RollupProofAssignment>,
@@ -134,10 +124,7 @@ where
     pub cross_proof_system_interactions: [u8; 32],
 }
 
-impl<P: ChainProtocol + ?Sized> ProofPlan<P>
-where
-    P::Address: PartialEq + Eq,
-{
+impl ProofPlan {
     /// Number of rollups this plan attests to.
     #[must_use]
     pub fn rollup_count(&self) -> usize {
@@ -151,34 +138,11 @@ where
     }
 }
 
-/// Resolve a batch's complete proof plan in one call. Stateless
-/// from the trait's perspective; impls hold the underlying
-/// candidate-PS configuration + on-chain provider.
-///
-/// # Errors
-///
-/// Impl-dependent. Typical failure modes (per-impl):
-/// - candidate PS not allowed for a touched rollup (manager's
-///   `checkProofSystemsAndGetVkeys` reverts);
-/// - touched rollup not registered on the central registry;
-/// - on-chain provider transport failure.
-#[async_trait]
-pub trait ProofPlanResolver<P: ChainProtocol + ?Sized>: Send + Sync
-where
-    P::Address: PartialEq + Eq + Send + Sync,
-{
-    /// Resolve the plan for the given touched rollup set. The
-    /// returned plan's `rollup_assignments` MUST be sorted by
-    /// `rollup_id` ascending (canonical batch order) regardless
-    /// of input order.
-    async fn resolve(&self, touched: &[RollupId]) -> ExecutorResult<ProofPlan<P>>;
-}
-
 /// Structural-validation errors a [`ProofPlan`] can fail with at
 /// shape-check time. Distinct from
 /// [`crate::error::ExecutorError`] — the resolver returns
 /// `ExecutorError` for on-chain / transport-level failures; this
-/// type covers in-memory shape invariants that an impl might
+/// type covers in-memory shape invariants that a resolver might
 /// produce a malformed plan against.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProofPlanInvariantError {
@@ -192,11 +156,7 @@ pub enum ProofPlanInvariantError {
     /// `InvalidProofSystemConfig`.
     #[error("rollup_assignments is empty")]
     EmptyRollupAssignments,
-    /// `proof_systems` was not strictly increasing. The
-    /// chain-agnostic validator can't check for the zero
-    /// "address" (the `P::Address` type's zero is
-    /// chain-specific); EVM-side impls additionally reject
-    /// `address(0)`.
+    /// `proof_systems` was not strictly increasing.
     #[error("proof_systems not strictly increasing at index {index}")]
     ProofSystemsNotSorted {
         /// Position of the first non-increasing entry.
@@ -297,18 +257,12 @@ pub enum ProofPlanInvariantError {
     },
 }
 
-impl<P: ChainProtocol + ?Sized> ProofPlan<P>
-where
-    P::Address: PartialEq + Eq + Ord,
-{
+impl ProofPlan {
     /// Walk every structural invariant a well-formed `ProofPlan`
     /// must satisfy, returning the first violation. Resolvers
     /// SHOULD call this on their output before returning;
     /// downstream consumers (the publicInputsHash compute layer)
     /// may rely on the invariants without re-checking.
-    ///
-    /// `P::Address: Ord` so we can verify strict-increasing
-    /// ordering on `proof_systems`.
     ///
     /// # Errors
     ///
@@ -409,90 +363,7 @@ where
 mod tests {
     use super::*;
 
-    /// Stand-in protocol with `u64` addresses — keeps the test
-    /// generic-machinery happy without dragging in EVM types.
-    #[derive(Debug, Clone, Copy, Default)]
-    struct Proto;
-
-    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-    struct Empty;
-
-    impl crate::capabilities::SettlesOutbound for Proto {
-        fn build_settlement_batch(
-            &self,
-            _calls: &[crate::ExecutedAction<Self>],
-            _dst: crate::RollupId,
-        ) -> crate::error::ProtocolResult<Self::Batch> {
-            Err(
-                crate::error::ProtocolErrorKind::Unsupported("test fake: no outbound settlement")
-                    .into(),
-            )
-        }
-    }
-
-    impl ChainProtocol for Proto {
-        type Address = u64;
-        type Value = u64;
-        type Calldata = Vec<u8>;
-        type Batch = ();
-        type Overlay = Empty;
-        type Witness = Empty;
-        type Dialect = ();
-
-        fn build_batch(
-            &self,
-            _recorded: &[crate::types::ExecutedAction<Self>],
-            _attribution: &crate::composer::SourceAttribution<'_>,
-            _dialect: &Self::Dialect,
-            _src: RollupId,
-            _raw: &[u8],
-        ) -> crate::error::ProtocolResult<Self::Batch> {
-            Ok(())
-        }
-        fn encode_postbatch(&self, (): &Self::Batch) -> Vec<u8> {
-            vec![]
-        }
-        fn encode_load_table(&self, (): &Self::Batch) -> Vec<u8> {
-            vec![]
-        }
-        fn encode_follower_trigger(
-            &self,
-            _: &crate::types::ExecutedAction<Self>,
-            _: RollupId,
-            _: &[u8],
-            (): &Self::Dialect,
-        ) -> Vec<u8> {
-            vec![]
-        }
-        fn encode_address(&self, a: &u64) -> Vec<u8> {
-            a.to_be_bytes().to_vec()
-        }
-        fn decode_address(&self, b: &[u8]) -> crate::error::ProtocolResult<u64> {
-            b.try_into().map(u64::from_be_bytes).map_err(|_e| {
-                crate::error::ProtocolErrorKind::InvalidEncoding("addr".into()).into()
-            })
-        }
-        fn encode_value(&self, v: &u64) -> Vec<u8> {
-            v.to_be_bytes().to_vec()
-        }
-        fn decode_value(&self, b: &[u8]) -> crate::error::ProtocolResult<u64> {
-            b.try_into().map(u64::from_be_bytes).map_err(|_e| {
-                crate::error::ProtocolErrorKind::InvalidEncoding("value".into()).into()
-            })
-        }
-        fn encode_calldata(&self, d: &Vec<u8>) -> Vec<u8> {
-            d.clone()
-        }
-        fn decode_calldata(&self, b: &[u8]) -> crate::error::ProtocolResult<Vec<u8>> {
-            Ok(b.to_vec())
-        }
-        fn message_id(&self, m: &crate::message::Message<'_, Self>) -> [u8; 32] {
-            let _ = m;
-            [0u8; 32]
-        }
-    }
-
-    fn single_ps_plan(rollup_id: RollupId, ps: u64, vkey: [u8; 32]) -> ProofPlan<Proto> {
+    fn single_ps_plan(rollup_id: RollupId, ps: Address, vkey: [u8; 32]) -> ProofPlan {
         ProofPlan {
             proof_systems: vec![ps],
             rollup_assignments: vec![RollupProofAssignment {
@@ -507,7 +378,7 @@ mod tests {
 
     #[test]
     fn empty_proof_systems_rejected() {
-        let plan: ProofPlan<Proto> = ProofPlan {
+        let plan = ProofPlan {
             proof_systems: vec![],
             rollup_assignments: vec![],
             per_rollup_context: vec![],
@@ -522,8 +393,8 @@ mod tests {
 
     #[test]
     fn empty_rollup_assignments_rejected() {
-        let plan: ProofPlan<Proto> = ProofPlan {
-            proof_systems: vec![0xaa],
+        let plan = ProofPlan {
+            proof_systems: vec![Address::repeat_byte(0xaa)],
             rollup_assignments: vec![],
             per_rollup_context: vec![],
             vk_matrix: vec![],
@@ -537,8 +408,8 @@ mod tests {
 
     #[test]
     fn rollup_id_zero_rejected_first_position() {
-        let plan: ProofPlan<Proto> = ProofPlan {
-            proof_systems: vec![0xaa],
+        let plan = ProofPlan {
+            proof_systems: vec![Address::repeat_byte(0xaa)],
             rollup_assignments: vec![RollupProofAssignment {
                 rollup_id: RollupId(0),
                 proof_system_index: vec![0],
@@ -555,8 +426,8 @@ mod tests {
 
     #[test]
     fn empty_proof_system_index_rejected() {
-        let plan: ProofPlan<Proto> = ProofPlan {
-            proof_systems: vec![0xaa],
+        let plan = ProofPlan {
+            proof_systems: vec![Address::repeat_byte(0xaa)],
             rollup_assignments: vec![RollupProofAssignment {
                 rollup_id: RollupId(1),
                 proof_system_index: vec![],
@@ -573,8 +444,8 @@ mod tests {
 
     #[test]
     fn vk_matrix_outer_length_mismatch_caught() {
-        let plan: ProofPlan<Proto> = ProofPlan {
-            proof_systems: vec![0xaa],
+        let plan = ProofPlan {
+            proof_systems: vec![Address::repeat_byte(0xaa)],
             rollup_assignments: vec![RollupProofAssignment {
                 rollup_id: RollupId(1),
                 proof_system_index: vec![0],
@@ -594,7 +465,7 @@ mod tests {
 
     #[test]
     fn single_rollup_single_ps_is_valid() {
-        let plan = single_ps_plan(RollupId(1), 0xaa, [0x42; 32]);
+        let plan = single_ps_plan(RollupId(1), Address::repeat_byte(0xaa), [0x42; 32]);
         plan.check_invariants().expect("happy path");
         assert_eq!(plan.rollup_count(), 1);
         assert_eq!(plan.proof_system_count(), 1);
@@ -602,8 +473,8 @@ mod tests {
 
     #[test]
     fn proof_systems_must_be_strictly_increasing() {
-        let mut plan = single_ps_plan(RollupId(1), 0xaa, [0x42; 32]);
-        plan.proof_systems = vec![0xaa, 0xaa];
+        let mut plan = single_ps_plan(RollupId(1), Address::repeat_byte(0xaa), [0x42; 32]);
+        plan.proof_systems = vec![Address::repeat_byte(0xaa), Address::repeat_byte(0xaa)];
         plan.vk_matrix = vec![vec![[0x42; 32]]]; // shape unchanged for the one rollup
         plan.rollup_assignments[0].proof_system_index = vec![0];
         assert!(matches!(
@@ -614,8 +485,8 @@ mod tests {
 
     #[test]
     fn rollup_assignments_must_be_sorted() {
-        let mut plan: ProofPlan<Proto> = ProofPlan {
-            proof_systems: vec![0xaa],
+        let mut plan = ProofPlan {
+            proof_systems: vec![Address::repeat_byte(0xaa)],
             rollup_assignments: vec![
                 RollupProofAssignment {
                     rollup_id: RollupId(2),
@@ -640,8 +511,8 @@ mod tests {
 
     #[test]
     fn proof_system_index_must_be_strictly_increasing() {
-        let plan: ProofPlan<Proto> = ProofPlan {
-            proof_systems: vec![0xaa, 0xbb],
+        let plan = ProofPlan {
+            proof_systems: vec![Address::repeat_byte(0xaa), Address::repeat_byte(0xbb)],
             rollup_assignments: vec![RollupProofAssignment {
                 rollup_id: RollupId(1),
                 proof_system_index: vec![1, 0],
@@ -658,8 +529,8 @@ mod tests {
 
     #[test]
     fn proof_system_index_out_of_bounds_caught() {
-        let plan: ProofPlan<Proto> = ProofPlan {
-            proof_systems: vec![0xaa],
+        let plan = ProofPlan {
+            proof_systems: vec![Address::repeat_byte(0xaa)],
             rollup_assignments: vec![RollupProofAssignment {
                 rollup_id: RollupId(1),
                 proof_system_index: vec![5],
@@ -680,8 +551,8 @@ mod tests {
 
     #[test]
     fn vk_matrix_row_width_must_match_local_index_length() {
-        let plan: ProofPlan<Proto> = ProofPlan {
-            proof_systems: vec![0xaa, 0xbb],
+        let plan = ProofPlan {
+            proof_systems: vec![Address::repeat_byte(0xaa), Address::repeat_byte(0xbb)],
             rollup_assignments: vec![RollupProofAssignment {
                 rollup_id: RollupId(1),
                 proof_system_index: vec![0, 1],
@@ -702,8 +573,8 @@ mod tests {
 
     #[test]
     fn per_rollup_context_length_must_match() {
-        let plan: ProofPlan<Proto> = ProofPlan {
-            proof_systems: vec![0xaa],
+        let plan = ProofPlan {
+            proof_systems: vec![Address::repeat_byte(0xaa)],
             rollup_assignments: vec![RollupProofAssignment {
                 rollup_id: RollupId(1),
                 proof_system_index: vec![0],

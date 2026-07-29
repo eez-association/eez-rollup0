@@ -15,8 +15,8 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  ci:
-    name: Format, Clippy, Unit & E2E
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -26,6 +26,67 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # @stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake protobuf-compiler
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # @stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Install nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2
+        with:
+          tool: nextest
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake protobuf-compiler
+      - name: Unit tests (lib + bins, parallel)
+        run: cargo nextest run --workspace --lib --bins --no-fail-fast
+      - name: Protocol integration vectors
+        run: >-
+          cargo nextest run -p eez-protocol
+          --test cross_chain_call_hash_vectors
+          --test public_inputs_hash_vectors
+          --test rolling_hash_vectors
+          --no-fail-fast
+
+  contract-build:
+    name: Contract Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
+      - name: Build contracts (artifacts read by harness)
+        working-directory: contracts
+        run: forge build
+
+  embedded-e2e:
+    name: Embedded E2E Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # @stable
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
@@ -37,22 +98,34 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake protobuf-compiler
-      - name: Format
-        run: cargo fmt --all --check
-      # Build everything (workspace lib + integration test binaries + the
-      # eez-node binary that integration tests spawn via CARGO_BIN_EXE_).
-      # Once this completes, clippy and both nextest runs read from cache.
-      - name: Build (tests + binaries)
-        run: cargo nextest run --workspace --all-targets --no-run
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Build contracts (artifacts read by harness)
         working-directory: contracts
         run: forge build
-      # Both nextest runs read from the cache populated by the build step.
-      # Lib tests parallelise across cores; integration tests serialise to
-      # one runner-wide reth+anvil set at a time (memory-bounded).
-      - name: Unit tests (lib, parallel)
-        run: cargo nextest run --workspace --lib --no-fail-fast
-      - name: Integration tests (test '*', serial)
-        run: cargo nextest run --workspace --test '*' --test-threads=1 --no-fail-fast
+      - name: Integration tests (e2e, serial)
+        run: cargo nextest run -p eez-node --test e2e --test-threads=1 --no-fail-fast
+
+  cross-chain-e2e:
+    name: Cross-Chain E2E Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # @stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
+      - name: Install nextest
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2
+        with:
+          tool: nextest
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake protobuf-compiler
+      - name: Build contracts (artifacts read by harness)
+        working-directory: contracts
+        run: forge build
+      - name: Integration tests (cross-chain, serial)
+        run: cargo nextest run -p eez-node --test cross_chain --test-threads=1 --no-fail-fast

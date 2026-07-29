@@ -12,7 +12,7 @@
 # ── chef base: toolchain + system deps reth/mdbx/secp256k1 need ───────
 FROM rust:1.94-bookworm AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        clang libclang-dev pkg-config cmake libssl-dev git ca-certificates \
+        clang libclang-dev pkg-config cmake libssl-dev git ca-certificates protobuf-compiler \
     && rm -rf /var/lib/apt/lists/* \
     && cargo install cargo-chef --locked
 WORKDIR /build
@@ -25,12 +25,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # ── builder: cook deps (cached), then build eez-node ─────────────────
 FROM chef AS builder
-# Release-profile knobs, overridable at build time. Defaults MATCH Cargo.toml's
-# [profile.release] (lto=thin / codegen-units=1 / debug=1), so a plain
-# `docker build` still produces the optimized production binary. The Kurtosis
-# devnet build (infra/kurtosis/up.sh) overrides these for a much faster compile
-# (parallel codegen, no LTO, no debug info) — fine for a test node. Applied to
-# BOTH the cook and build steps so cargo-chef's cache stays consistent.
+# CI can override release optimization for faster candidate builds.
 ARG CARGO_PROFILE_RELEASE_LTO=thin
 ARG CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 ARG CARGO_PROFILE_RELEASE_DEBUG=1

@@ -189,11 +189,11 @@ where
             };
             let to = tx.to();
             tx.recover_signer()
-                .is_ok_and(|s| eez_evm::settlement::is_system_tx(s, to, ccm_l2_address))
+                .is_ok_and(|s| eez_protocol::settlement::is_system_tx(s, to, ccm_l2_address))
         })
         .collect();
 
-    eez_evm::settlement::pair_end_positions(&flags)
+    eez_protocol::settlement::pair_end_positions(&flags)
         .into_iter()
         .map(|p| {
             build_sync_block(

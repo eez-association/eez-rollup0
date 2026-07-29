@@ -6,7 +6,7 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::Filter;
 use alloy_sol_types::{SolCall, SolEvent};
-use eez_evm::types::{
+use eez_protocol::abi::{
     BatchPosted, L2ExecutionPerformed, ProofSystemBatchPerVerificationEntriesSol,
     postAndVerifyBatchCall,
 };
@@ -60,7 +60,6 @@ pub struct ScannedBatch {
     pub l1_block_hash: B256,
     pub tx_hash: B256,
     pub submitter: Address,
-    pub rollup_count: U256,
     pub call_data: Bytes,
     /// The originating postBatch tx's full input (the `postAndVerifyBatch`
     /// calldata), captured from the tx fetched by (block, index). Carried
@@ -184,7 +183,7 @@ pub(crate) async fn scan_batch_logs_range(
         let input = tx.inner.input();
         let decoded = postAndVerifyBatchCall::abi_decode(input)
             .map_err(|e| L1Error::Provider(format!("decode postBatch({tx_hash}): {e}")))?;
-        let decoded_event = BatchPosted::decode_log(&alloy_primitives::Log {
+        let _decoded_event = BatchPosted::decode_log(&alloy_primitives::Log {
             address: log.address(),
             data: log.data().clone(),
         })
@@ -198,7 +197,6 @@ pub(crate) async fn scan_batch_logs_range(
             l1_block_hash,
             tx_hash,
             submitter,
-            rollup_count: decoded_event.rollupCount,
             call_data: decoded.batch.callData,
             post_batch_input: input.clone(),
             state_applied: winner_tx_hashes.contains(&tx_hash),

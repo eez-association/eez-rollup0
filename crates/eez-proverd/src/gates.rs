@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, B256};
 use eez_control_rpc::v1::ExecutionWitness;
-use eez_evm::entries::decode_postbatch;
-use eez_evm::public_inputs::public_inputs_hashes;
-use eez_evm::settlement::{is_system_tx, pair_end_positions};
+use eez_protocol::entries::decode_postbatch;
+use eez_protocol::public_inputs::public_inputs_hashes;
+use eez_protocol::settlement::{is_system_tx, pair_end_positions};
 use tracing::{info, warn};
 
 /// One staged window block the server hands `validate_window`: the composer's
@@ -283,14 +283,14 @@ pub(crate) fn verify_settlement_public_inputs(
     let batch = decode_postbatch(&pb.abi_calldata)
         .map_err(|e| eyre::eyre!("decode postBatch calldata: {e}"))?;
 
-    let n_ps = batch.inner.proofSystems.len();
+    let n_ps = batch.proofSystems.len();
     if n_ps != 1 {
         eyre::bail!("settlement has {n_ps} proof systems; this gate verifies a single PS only");
     }
-    if batch.inner.blockNumber != 0 {
+    if batch.blockNumber != 0 {
         eyre::bail!(
             "settlement batch blockNumber={} is BOUND; only timeless (0) is verifiable without an L1 oracle",
-            batch.inner.blockNumber
+            batch.blockNumber
         );
     }
 
@@ -333,7 +333,7 @@ pub(crate) fn verify_settlement_public_inputs(
 /// ERROR (fail-closed): an empty tx set would pass both gates vacuously.
 ///
 /// The target is `ccm_l2_address` — the deployment's on-chain EEZL2 predeploy
-/// (runtime config, `EEZ_CCM_L2_ADDRESS`), NOT the stale `eez_evm::CCM_ADDRESS`
+/// (runtime config, `EEZ_CCM_L2_ADDRESS`), NOT the stale `eez_protocol::CCM_ADDRESS`
 /// (0xeeee..). Using 0xeeee misclassifies every system tx as a user tx, silently
 /// defeating the interior-boundary + reverted-system-tx gates that re-derive
 /// system flags from this block RLP.
@@ -396,7 +396,9 @@ pub(crate) enum SettlementKind {
     Inbound,
 }
 
-pub(crate) fn classify_settlement_entry(e: &eez_evm::types::ExecutionEntrySol) -> SettlementKind {
+pub(crate) fn classify_settlement_entry(
+    e: &eez_protocol::abi::ExecutionEntrySol,
+) -> SettlementKind {
     if e.proxyEntryHash != B256::ZERO {
         SettlementKind::Inbound
     } else if !e.l2ToL1Calls.is_empty() {
@@ -496,7 +498,7 @@ pub(crate) fn verify_effect_prefix_roots(
 /// vector.
 pub(crate) fn extract_inbounds(
     block_rlp: &[u8],
-) -> eyre::Result<Vec<eez_evm::entries::DecodedInbound>> {
+) -> eyre::Result<Vec<eez_protocol::entries::DecodedInbound>> {
     use alloy_consensus::Transaction as _;
     use alloy_rlp::Decodable as _;
 
@@ -507,7 +509,7 @@ pub(crate) fn extract_inbounds(
         .body
         .transactions
         .iter()
-        .filter_map(|tx| eez_evm::entries::decode_inbound(tx.input()))
+        .filter_map(|tx| eez_protocol::entries::decode_inbound(tx.input()))
         .collect())
 }
 
@@ -534,7 +536,7 @@ pub(crate) fn extract_inbounds(
 ///
 /// CONSUMPTION ORDER. The deferred entries appear in the batch in the SAME order
 /// the composer drained the inbound user txs (`composer.rs`: `pending_in`), and
-/// `build_inbound_system_txs` (`eez-evm/system_tx.rs`) seals the
+/// `build_inbound_system_txs` (`eez-protocol/src/system_tx.rs`) seals the
 /// `executeIncomingCrossChainCall` deliveries in that SAME order into the Sync
 /// block — so the i-th sealed success inbound (window/block order) pairs
 /// POSITIONALLY with the i-th deferred entry (batch order, `proxyEntryHash != 0`).
@@ -570,12 +572,12 @@ pub(crate) fn extract_inbounds(
 /// the composer can't know at compose time — so the strict M:M is the correct,
 /// sound gate here.
 pub(crate) fn multi_inbound_outcome_gate(
-    batch: &eez_evm::EvmBatch,
-    sealed: &[eez_evm::entries::DecodedInbound],
+    batch: &eez_protocol::EvmBatch,
+    sealed: &[eez_protocol::entries::DecodedInbound],
 ) -> Result<(), String> {
     use eez_protocol::RollupId;
-    let entries = &batch.inner.entries;
-    let lookups = &batch.inner.l1ToL2lookupCalls;
+    let entries = &batch.entries;
+    let lookups = &batch.l1ToL2lookupCalls;
 
     // The settled rollup anchors every H. entries[0] is the leading-immediate
     // entry carrying the settlement StateDelta (rollupId == our L2). Without it
@@ -589,8 +591,8 @@ pub(crate) fn multi_inbound_outcome_gate(
                 .to_string()
         })?;
 
-    let hash_of = |d: &eez_evm::entries::DecodedInbound| -> B256 {
-        eez_evm::cross_chain_call_hash(
+    let hash_of = |d: &eez_protocol::entries::DecodedInbound| -> B256 {
+        eez_protocol::cross_chain_call_hash(
             settled_rollup,
             d.target,
             d.value,
@@ -606,7 +608,7 @@ pub(crate) fn multi_inbound_outcome_gate(
     // `proxyEntryHash == 0`), so a mixed inbound+outbound batch gates the inbound
     // half only. (An outbound entry has non-empty l2ToL1Calls but proxyEntryHash
     // 0; the partition mirrors the deriver's `partition(|e| proxyEntryHash == 0)`.)
-    let deferred: Vec<&eez_evm::types::ExecutionEntrySol> = entries
+    let deferred: Vec<&eez_protocol::abi::ExecutionEntrySol> = entries
         .iter()
         .filter(|e| e.proxyEntryHash != B256::ZERO)
         .collect();
@@ -684,24 +686,23 @@ pub(crate) fn multi_inbound_outcome_gate(
 /// Outbound authorization gate (A3): every outbound L2->L1 settlement entry
 /// must match a `CrossChainCallExecuted` hash observed during stateless
 /// re-execution of the Sync block. Thin wrapper over the SHARED
-/// `eez_evm::outbound_gate::verify_outbound_authorized` — the SAME check the
+/// `eez_protocol::outbound_gate::verify_outbound_authorized` — the SAME check the
 /// deriver (A4) runs against its local replay receipts, so the prover and the
 /// follower cannot drift.
 pub(crate) fn verify_outbound_authorized(
-    batch: &eez_evm::EvmBatch,
+    batch: &eez_protocol::EvmBatch,
     observed_call_hashes: &[B256],
     l2_rollup_id: u64,
 ) -> eyre::Result<()> {
     // The outbound immediates only (proxyEntryHash == 0, non-empty calls), in DA
     // order — the SAME partition the deriver pairs (deriver.rs reconcile).
-    let outbound: Vec<eez_evm::types::ExecutionEntrySol> = batch
-        .inner
+    let outbound: Vec<eez_protocol::abi::ExecutionEntrySol> = batch
         .entries
         .iter()
         .filter(|e| e.proxyEntryHash == B256::ZERO && !e.l2ToL1Calls.is_empty())
         .cloned()
         .collect();
-    eez_evm::outbound_gate::verify_outbound_authorized(
+    eez_protocol::outbound_gate::verify_outbound_authorized(
         &outbound,
         observed_call_hashes,
         l2_rollup_id,
@@ -764,11 +765,11 @@ pub(crate) fn verify_settlement_chain(
     sync_block_rlp: &[u8],
     ccm_l2_address: Address,
 ) -> eyre::Result<()> {
-    use eez_evm::settlement::interim_interior_root;
+    use eez_protocol::settlement::interim_interior_root;
 
     let batch = decode_postbatch(&pb.abi_calldata)
         .map_err(|e| eyre::eyre!("decode postBatch calldata: {e}"))?;
-    let entries = &batch.inner.entries;
+    let entries = &batch.entries;
     if entries.is_empty() {
         eyre::bail!("settlement batch has no entries");
     }
@@ -916,25 +917,29 @@ pub(crate) fn verify_settlement_chain(
     Ok(())
 }
 #[cfg(test)]
+#[allow(
+    clippy::field_reassign_with_default,
+    reason = "mirror upstream shape; EvmBatch is now a plain Sol alias"
+)]
 mod tests {
     use super::*;
     use alloy_primitives::{U256, address};
-    use eez_evm::EvmBatch;
-    use eez_evm::entries::encode_postbatch;
-    use eez_evm::types::RollupIdWithProofSystemsSol;
+    use eez_protocol::EvmBatch;
+    use eez_protocol::abi::RollupIdWithProofSystemsSol;
+    use eez_protocol::entries::encode_postbatch;
 
     /// The EEZL2 predeploy the fixture's system txs target (= the edu deployment's
     /// address). Threaded into the settlement-chain gate's system-tx classification.
     const TEST_CCM_L2: Address = address!("0x4200000000000000000000000000000000000007");
 
     /// A minimal finalized PostBatch — one PS, one rollup, TIMELESS — mirroring
-    /// eez-evm's `carrier_batch` test helper, with the publicInputsHash the
+    /// eez-protocol's `carrier_batch` test helper, with the publicInputsHash the
     /// composer would claim for the given `vkey`.
     fn carrier_post_batch(vkey: B256) -> eez_control_rpc::v1::PostBatch {
         let mut batch = EvmBatch::default();
-        batch.inner.blockNumber = 0; // timeless
-        batch.inner.proofSystems = vec![address!("00000000000000000000000000000000000000aa")];
-        batch.inner.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
+        batch.blockNumber = 0; // timeless
+        batch.proofSystems = vec![address!("00000000000000000000000000000000000000aa")];
+        batch.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
             rollupId: U256::from(1),
             proofSystemIndex: vec![0],
         }];
@@ -976,9 +981,9 @@ mod tests {
     #[test]
     fn inbound_outcome_gate_binds_shape_hash_and_bytes() {
         use alloy_primitives::{Bytes, I256};
-        use eez_evm::entries::DecodedInbound;
-        use eez_evm::types::{ExecutionEntrySol, StateDeltaSol};
         use eez_protocol::RollupId;
+        use eez_protocol::abi::{ExecutionEntrySol, StateDeltaSol};
+        use eez_protocol::entries::DecodedInbound;
 
         let target = address!("00000000000000000000000000000000000000bb");
         let source = address!("00000000000000000000000000000000000000cc");
@@ -988,7 +993,8 @@ mod tests {
         let rollup = RollupId(1);
 
         // H the user's proxy computes on-chain (settled_rollup, …, MAINNET=0).
-        let h = eez_evm::cross_chain_call_hash(rollup, target, value, &data, source, RollupId(0));
+        let h =
+            eez_protocol::cross_chain_call_hash(rollup, target, value, &data, source, RollupId(0));
 
         let entry = |proxy: B256, ret_data: Bytes, deltas: Vec<StateDeltaSol>| ExecutionEntrySol {
             stateDeltas: deltas,
@@ -1017,7 +1023,7 @@ mod tests {
         let immediate = || entry(B256::ZERO, Bytes::new(), delta());
         let deferred = || entry(h, ret.clone(), Vec::new());
         let mut batch = EvmBatch::default();
-        batch.inner.entries = vec![immediate(), deferred()];
+        batch.entries = vec![immediate(), deferred()];
 
         // The REAL L2-sealed call: success, returns Y, keyed on (target,value,data,source).
         let d = DecodedInbound {
@@ -1037,17 +1043,17 @@ mod tests {
 
         // Forged hash: composer keys the delivery on a hash the user never consumes → REFUSE.
         let mut forged = batch.clone();
-        forged.inner.entries[1].proxyEntryHash = B256::repeat_byte(0x99);
+        forged.entries[1].proxyEntryHash = B256::repeat_byte(0x99);
         assert!(multi_inbound_outcome_gate(&forged, std::slice::from_ref(&d)).is_err());
 
         // Wrong bytes: delivers X on L2 but settles a different Y' on L1 → REFUSE.
         let mut wrong_bytes = batch.clone();
-        wrong_bytes.inner.entries[1].returnData = Bytes::from(vec![0xff]);
+        wrong_bytes.entries[1].returnData = Bytes::from(vec![0xff]);
         assert!(multi_inbound_outcome_gate(&wrong_bytes, std::slice::from_ref(&d)).is_err());
 
         // No settlement StateDelta on the immediate entry → cannot bind H → REFUSE.
         let mut no_delta = batch.clone();
-        no_delta.inner.entries[0].stateDeltas = Vec::new();
+        no_delta.entries[0].stateDeltas = Vec::new();
         assert!(multi_inbound_outcome_gate(&no_delta, std::slice::from_ref(&d)).is_err());
     }
 
@@ -1058,8 +1064,8 @@ mod tests {
     fn mi_deferred_entry(
         proxy: B256,
         ret_data: alloy_primitives::Bytes,
-    ) -> eez_evm::types::ExecutionEntrySol {
-        eez_evm::types::ExecutionEntrySol {
+    ) -> eez_protocol::abi::ExecutionEntrySol {
+        eez_protocol::abi::ExecutionEntrySol {
             stateDeltas: Vec::new(),
             proxyEntryHash: proxy,
             destinationRollupId: U256::from(1),
@@ -1074,10 +1080,10 @@ mod tests {
 
     /// The leading-immediate entry carrying the settlement StateDelta (anchors H).
     #[cfg(test)]
-    fn mi_immediate_entry(rollup: u64) -> eez_evm::types::ExecutionEntrySol {
+    fn mi_immediate_entry(rollup: u64) -> eez_protocol::abi::ExecutionEntrySol {
         use alloy_primitives::I256;
         let mut e = mi_deferred_entry(B256::ZERO, alloy_primitives::Bytes::new());
-        e.stateDeltas = vec![eez_evm::types::StateDeltaSol {
+        e.stateDeltas = vec![eez_protocol::abi::StateDeltaSol {
             rollupId: U256::from(rollup),
             currentState: B256::ZERO,
             newState: B256::ZERO,
@@ -1088,8 +1094,8 @@ mod tests {
 
     /// A `DecodedInbound` with distinct bytes per `tag`, success by default.
     #[cfg(test)]
-    fn mi_sealed(tag: u8, success: bool) -> eez_evm::entries::DecodedInbound {
-        eez_evm::entries::DecodedInbound {
+    fn mi_sealed(tag: u8, success: bool) -> eez_protocol::entries::DecodedInbound {
+        eez_protocol::entries::DecodedInbound {
             target: address!("00000000000000000000000000000000000000bb"),
             value: U256::ZERO,
             data: alloy_primitives::Bytes::from(vec![tag]),
@@ -1100,8 +1106,8 @@ mod tests {
     }
 
     #[cfg(test)]
-    fn mi_hash(d: &eez_evm::entries::DecodedInbound, rollup: u64) -> B256 {
-        eez_evm::cross_chain_call_hash(
+    fn mi_hash(d: &eez_protocol::entries::DecodedInbound, rollup: u64) -> B256 {
+        eez_protocol::cross_chain_call_hash(
             eez_protocol::RollupId(rollup),
             d.target,
             d.value,
@@ -1120,7 +1126,7 @@ mod tests {
         let s1 = mi_sealed(2, true);
         let (h0, h1) = (mi_hash(&s0, 1), mi_hash(&s1, 1));
         let mut batch = EvmBatch::default();
-        batch.inner.entries = vec![
+        batch.entries = vec![
             mi_immediate_entry(1),
             mi_deferred_entry(h0, s0.return_data.clone()),
             mi_deferred_entry(h1, s1.return_data.clone()),
@@ -1131,8 +1137,8 @@ mod tests {
         // Cross-wired returnData (entry #0 carries s1's bytes) → per-pair bytes
         // mismatch → REFUSE (the X-on-L2 / Y-on-L1 equivocation, multi-call form).
         let mut swapped = batch.clone();
-        swapped.inner.entries[1].returnData = s1.return_data.clone();
-        swapped.inner.entries[2].returnData = s0.return_data.clone();
+        swapped.entries[1].returnData = s1.return_data.clone();
+        swapped.entries[2].returnData = s0.return_data.clone();
         assert!(multi_inbound_outcome_gate(&swapped, &[s0, s1]).is_err());
     }
 
@@ -1144,7 +1150,7 @@ mod tests {
         let s = mi_sealed(7, true);
         let h = mi_hash(&s, 1);
         let mut batch = EvmBatch::default();
-        batch.inner.entries = vec![
+        batch.entries = vec![
             mi_immediate_entry(1),
             mi_deferred_entry(h, s.return_data.clone()),
             mi_deferred_entry(h, s.return_data.clone()),
@@ -1155,7 +1161,7 @@ mod tests {
         // Only ONE deferred entry for two identical sealed inbounds → cardinality
         // mismatch (an unmatched delivery) → REFUSE (no hash-set collapse).
         let mut one_entry = EvmBatch::default();
-        one_entry.inner.entries = vec![
+        one_entry.entries = vec![
             mi_immediate_entry(1),
             mi_deferred_entry(h, s.return_data.clone()),
         ];
@@ -1169,7 +1175,7 @@ mod tests {
         let s = mi_sealed(1, true);
         let h = mi_hash(&s, 1);
         let mut batch = EvmBatch::default();
-        batch.inner.entries = vec![
+        batch.entries = vec![
             mi_immediate_entry(1),
             mi_deferred_entry(h, s.return_data.clone()),
         ];
@@ -1179,7 +1185,7 @@ mod tests {
         );
         // And a CLEAN inbound-free batch (no deferred entries, no sealed) → OK.
         let mut empty = EvmBatch::default();
-        empty.inner.entries = vec![mi_immediate_entry(1)];
+        empty.entries = vec![mi_immediate_entry(1)];
         multi_inbound_outcome_gate(&empty, &[]).expect("no inbounds, no deferred entries → OK");
     }
 
@@ -1189,7 +1195,7 @@ mod tests {
         // carries no deferred entry for it). 1 sealed != 0 deferred → REFUSE.
         let s = mi_sealed(1, true);
         let mut batch = EvmBatch::default();
-        batch.inner.entries = vec![mi_immediate_entry(1)];
+        batch.entries = vec![mi_immediate_entry(1)];
         assert!(multi_inbound_outcome_gate(&batch, &[s]).is_err());
     }
 
@@ -1203,7 +1209,7 @@ mod tests {
         let s = mi_sealed(3, true);
         let h = mi_hash(&s, 1);
         let mut batch = EvmBatch::default();
-        batch.inner.entries = vec![
+        batch.entries = vec![
             mi_immediate_entry(1),
             mi_deferred_entry(h, s.return_data.clone()),
         ];
@@ -1221,12 +1227,12 @@ mod tests {
         let s = mi_sealed(1, true);
         let h = mi_hash(&s, 1);
         let mut batch = EvmBatch::default();
-        batch.inner.entries = vec![
+        batch.entries = vec![
             mi_immediate_entry(1),
             mi_deferred_entry(h, s.return_data.clone()),
         ];
         // A leftover failed lookup with no backing sealed failure.
-        batch.inner.l1ToL2lookupCalls = vec![eez_evm::types::LookupCallSol {
+        batch.l1ToL2lookupCalls = vec![eez_protocol::abi::LookupCallSol {
             crossChainCallHash: B256::repeat_byte(0xfe),
             destinationRollupId: U256::from(1),
             returnData: alloy_primitives::Bytes::from(vec![0xde]),
@@ -1249,8 +1255,8 @@ mod tests {
         target: alloy_primitives::Address,
         value: U256,
         data: alloy_primitives::Bytes,
-    ) -> eez_evm::types::ExecutionEntrySol {
-        use eez_evm::types::{ExecutionEntrySol, L2ToL1CallSol};
+    ) -> eez_protocol::abi::ExecutionEntrySol {
+        use eez_protocol::abi::{ExecutionEntrySol, L2ToL1CallSol};
 
         ExecutionEntrySol {
             stateDeltas: Vec::new(),
@@ -1272,9 +1278,9 @@ mod tests {
         }
     }
 
-    fn observed_for(entry: &eez_evm::types::ExecutionEntrySol) -> B256 {
+    fn observed_for(entry: &eez_protocol::abi::ExecutionEntrySol) -> B256 {
         let call = entry.l2ToL1Calls.first().expect("outbound call");
-        eez_evm::cross_chain_call_hash(
+        eez_protocol::cross_chain_call_hash(
             eez_protocol::RollupId(0),
             call.targetAddress,
             call.value,
@@ -1295,13 +1301,13 @@ mod tests {
             alloy_primitives::Bytes::from(vec![0x12u8, 0x34]),
         );
         let mut batch = EvmBatch::default();
-        batch.inner.entries = vec![entry.clone()];
+        batch.entries = vec![entry.clone()];
 
         assert!(verify_outbound_authorized(&batch, &[observed_for(&entry)], 1).is_ok());
         assert!(verify_outbound_authorized(&batch, &[], 1).is_err());
 
         let mut tampered = batch.clone();
-        tampered.inner.entries[0].l2ToL1Calls[0].value = U256::from(999u64);
+        tampered.entries[0].l2ToL1Calls[0].value = U256::from(999u64);
         assert!(verify_outbound_authorized(&tampered, &[observed_for(&entry)], 1).is_err());
     }
 
@@ -1322,7 +1328,7 @@ mod tests {
             alloy_primitives::Bytes::from(vec![0x03, 0x04]),
         );
         let mut batch = EvmBatch::default();
-        batch.inner.entries = vec![entry0.clone(), entry1.clone()];
+        batch.entries = vec![entry0.clone(), entry1.clone()];
 
         let observed = vec![observed_for(&entry0), observed_for(&entry1)];
         assert!(verify_outbound_authorized(&batch, &observed, 1).is_ok());
@@ -1390,10 +1396,10 @@ mod tests {
     /// (one delta per entry). Clones the fixture entry/delta (ExecutionEntrySol
     /// has no Default) and overrides only the rollupId + the two roots.
     fn post_batch_with_chain(deltas: &[(u64, B256, B256)]) -> eez_control_rpc::v1::PostBatch {
-        let template = fixture_batch().inner.entries[0].clone();
+        let template = fixture_batch().entries[0].clone();
         let template_delta = template.stateDeltas[0].clone();
         let mut batch = EvmBatch::default();
-        batch.inner.entries = deltas
+        batch.entries = deltas
             .iter()
             .map(|&(rid, cur, new)| {
                 let mut e = template.clone();
@@ -1657,7 +1663,7 @@ mod tests {
         );
         // The interior boundary M telescopes to R0=A via interim_interior_root, so
         // pass it WITHOUT per-tx roots; the only difference under test is the anchor.
-        let interim = eez_evm::settlement::interim_interior_root(a, 1);
+        let interim = eez_protocol::settlement::interim_interior_root(a, 1);
         let pb2 = post_batch_with_chain(&[(1, a, interim), (1, interim, rn)]);
         // GAP-2: anchoring at the TELESCOPED batch anchor A accepts the wide batch.
         verify_settlement_chain(&pb2, &settling, a, &empty_block_rlp(), TEST_CCM_L2)

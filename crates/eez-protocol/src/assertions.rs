@@ -1,61 +1,44 @@
 //! Compile-time thread-safety assertions for types that cross `.await`
 //! boundaries or are shared across tokio tasks.
 //!
-//! Rust type-checks the body of a generic `const fn` at definition
-//! time (even without invocation): the bounds inside an inner call
-//! must be provable from the outer signature's bounds. That means
-//! `assert_send::<Foo<P>>()` here fails the build if `Foo<P>: Send`
-//! becomes unprovable from `P: ChainProtocol + …`. No runtime cost,
-//! no instantiation needed.
+//! Rust type-checks the body of a `const fn` at definition
+//! time (even without invocation). That means
+//! `assert_send::<Foo>()` here fails the build if `Foo: Send`
+//! becomes unprovable. No runtime cost, no instantiation needed.
 //!
 //! The contract covered here:
 //!
-//! - [`Composer<P>`](crate::Composer) is the top-level shared handle
+//! - [`Composer`](crate::Composer) is the top-level shared handle
 //!   and must be [`Send`] + [`Sync`] (cloned across tasks, often behind
 //!   `Arc` indirectly).
 //! - Per-composition data types cross `.await` boundaries inside the
 //!   composition pipeline and must be [`Send`].
-//!
-//! A sibling chain-family crate with a concrete `ChainProtocol` impl
-//! verifies these again at monomorphization — this file is the
-//! earliest point in the dependency graph where the regression can
-//! fire.
 
-use crate::composer::Composer;
 use crate::composition::{CompositionBuilder, Rollup};
-use crate::executor::{ExecutionRequest, ExecutionResponse};
-use crate::protocol::ChainProtocol;
+use crate::executor::ExecutionRequest;
 use crate::rollup_id::RollupId;
 use crate::types::{Composition, ExecutedAction, SourceComposition, TargetComposition};
 
 const fn assert_send<T: Send>() {}
-const fn assert_send_sync<T: Send + Sync>() {}
 
 #[allow(
     dead_code,
     reason = "compile-time static assertion — body is type-checked at definition time"
 )]
-const fn assert_thread_safety_bounds<P: ChainProtocol + Send + Sync + 'static>()
-where
-    P::Address: Clone + Send + Sync,
-{
-    // `Composer<P>` — top-level shared handle, must be Send + Sync.
-    assert_send_sync::<Composer<P>>();
-
+const fn assert_thread_safety_bounds() {
     // Per-composition owned types — cross `.await` inside the
     // composition pipeline (dispatch → session.execute → finalize →
     // simulate_transactions). Each holds `dyn _ + Send` trait objects;
     // a future refactor could silently regress Send without this guard.
-    assert_send::<CompositionBuilder<P>>();
-    assert_send::<Rollup<P>>();
+    assert_send::<CompositionBuilder>();
+    assert_send::<Rollup>();
 
     // Per-composition data types — must be Send to cross .await.
-    assert_send::<ExecutedAction<P>>();
-    assert_send::<ExecutionRequest<P>>();
-    assert_send::<ExecutionResponse<P>>();
-    assert_send::<SourceComposition<P>>();
-    assert_send::<TargetComposition<P>>();
-    assert_send::<Composition<P>>();
+    assert_send::<ExecutedAction>();
+    assert_send::<ExecutionRequest>();
+    assert_send::<SourceComposition>();
+    assert_send::<TargetComposition>();
+    assert_send::<Composition>();
 }
 
 #[allow(
@@ -65,7 +48,7 @@ where
 /// Verify that a recorded-call slice is in preorder.
 ///
 /// In the flat sequential protocol every call's index is fixed at
-/// `Dispatcher::open_call` time — BEFORE the target session executes
+/// `CompositionBuilder::open_call` time — BEFORE the target session executes
 /// — so the recorded vec is always a preorder traversal of the
 /// dispatch tree. This helper checks the structural invariant we get
 /// from that: every call whose `source_rollup_id` differs from the
@@ -80,10 +63,7 @@ where
 /// `source_rollup_id` is the entry rollup; root-level dispatches
 /// (caller == source) do not require a prior parent frame.
 #[must_use]
-pub fn is_preorder<P: ChainProtocol + ?Sized>(
-    recorded: &[ExecutedAction<P>],
-    source_rollup_id: RollupId,
-) -> bool {
+pub fn is_preorder(recorded: &[ExecutedAction], source_rollup_id: RollupId) -> bool {
     for (i, call) in recorded.iter().enumerate() {
         if call.source_rollup_id == source_rollup_id {
             continue; // root dispatch — no parent frame required
@@ -102,108 +82,25 @@ pub fn is_preorder<P: ChainProtocol + ?Sized>(
 mod tests {
     use super::*;
     use crate::types::ExecutionOutcome;
+    use alloy_primitives::{Address, Bytes, U256};
 
-    // Tiny stand-in protocol so we can build ExecutedActions without
-    // pulling in the EVM crate.
-    #[derive(Debug, Clone, Copy, Default)]
-    struct PreorderProto;
-
-    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-    struct EmptyState;
-
-    impl crate::capabilities::SettlesOutbound for PreorderProto {
-        fn build_settlement_batch(
-            &self,
-            _calls: &[crate::ExecutedAction<Self>],
-            _dst: crate::RollupId,
-        ) -> crate::error::ProtocolResult<Self::Batch> {
-            Err(
-                crate::error::ProtocolErrorKind::Unsupported("test fake: no outbound settlement")
-                    .into(),
-            )
-        }
-    }
-
-    impl ChainProtocol for PreorderProto {
-        type Address = u64;
-        type Value = u64;
-        type Calldata = Vec<u8>;
-        type Batch = ();
-        type Overlay = EmptyState;
-        type Witness = EmptyState;
-        type Dialect = ();
-
-        fn build_batch(
-            &self,
-            _recorded: &[ExecutedAction<Self>],
-            _attribution: &crate::composer::SourceAttribution<'_>,
-            _dialect: &Self::Dialect,
-            _src: RollupId,
-            _raw: &[u8],
-        ) -> crate::error::ProtocolResult<Self::Batch> {
-            Ok(())
-        }
-        fn encode_postbatch(&self, (): &Self::Batch) -> Vec<u8> {
-            vec![]
-        }
-        fn encode_load_table(&self, (): &Self::Batch) -> Vec<u8> {
-            vec![]
-        }
-        fn encode_follower_trigger(
-            &self,
-            _: &ExecutedAction<Self>,
-            _: RollupId,
-            _: &[u8],
-            (): &Self::Dialect,
-        ) -> Vec<u8> {
-            vec![]
-        }
-        fn encode_address(&self, a: &u64) -> Vec<u8> {
-            a.to_be_bytes().to_vec()
-        }
-        fn decode_address(&self, b: &[u8]) -> crate::error::ProtocolResult<u64> {
-            b.try_into().map(u64::from_be_bytes).map_err(|_e| {
-                crate::error::ProtocolErrorKind::InvalidEncoding("addr".into()).into()
-            })
-        }
-        fn encode_value(&self, v: &u64) -> Vec<u8> {
-            v.to_be_bytes().to_vec()
-        }
-        fn decode_value(&self, b: &[u8]) -> crate::error::ProtocolResult<u64> {
-            b.try_into().map(u64::from_be_bytes).map_err(|_e| {
-                crate::error::ProtocolErrorKind::InvalidEncoding("value".into()).into()
-            })
-        }
-        fn encode_calldata(&self, d: &Vec<u8>) -> Vec<u8> {
-            d.clone()
-        }
-        fn decode_calldata(&self, b: &[u8]) -> crate::error::ProtocolResult<Vec<u8>> {
-            Ok(b.to_vec())
-        }
-        fn message_id(&self, m: &crate::message::Message<'_, Self>) -> [u8; 32] {
-            let _ = m;
-            [0u8; 32]
-        }
-    }
-
-    fn rec(target: RollupId, caller: RollupId) -> ExecutedAction<PreorderProto> {
+    fn rec(target: RollupId, caller: RollupId) -> ExecutedAction {
         ExecutedAction {
-            target_address: 0,
+            target_address: Address::ZERO,
             target_rollup_id: target,
             source_rollup_id: caller,
-            source_address: 0,
-            data: Vec::new(),
-            value: 0,
+            source_address: Address::ZERO,
+            data: Bytes::new(),
+            value: U256::ZERO,
             outcome: ExecutionOutcome::Pending,
             revert_span: None,
-            static_meta: None,
         }
     }
 
     #[test]
     fn empty_slice_is_preorder() {
-        let v: Vec<ExecutedAction<PreorderProto>> = Vec::new();
-        assert!(is_preorder::<PreorderProto>(&v, RollupId(0)));
+        let v: Vec<ExecutedAction> = Vec::new();
+        assert!(is_preorder(&v, RollupId(0)));
     }
 
     #[test]
@@ -213,14 +110,14 @@ mod tests {
             rec(RollupId(2), RollupId(0)),
             rec(RollupId(1), RollupId(0)),
         ];
-        assert!(is_preorder::<PreorderProto>(&v, RollupId(0)));
+        assert!(is_preorder(&v, RollupId(0)));
     }
 
     #[test]
     fn nested_dispatch_after_parent_is_preorder() {
         // root: 0 → 1; nested: 1 → 2 (parent frame 1 already opened earlier)
         let v = vec![rec(RollupId(1), RollupId(0)), rec(RollupId(2), RollupId(1))];
-        assert!(is_preorder::<PreorderProto>(&v, RollupId(0)));
+        assert!(is_preorder(&v, RollupId(0)));
     }
 
     #[test]
@@ -232,6 +129,6 @@ mod tests {
             rec(RollupId(1), RollupId(0)),
             rec(RollupId(3), RollupId(5)),
         ];
-        assert!(!is_preorder::<PreorderProto>(&v, RollupId(0)));
+        assert!(!is_preorder(&v, RollupId(0)));
     }
 }

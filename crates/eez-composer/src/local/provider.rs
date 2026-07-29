@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use reth_evm_ethereum::EthEvmConfig;
-use reth_storage_api::{HeaderProvider, StateProviderFactory};
+use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderFactory};
 
 /// Dyn-compatible header reader (`HeaderProvider` has generic methods
 /// that prevent `dyn HeaderProvider`).
@@ -27,17 +27,24 @@ pub trait HeaderReader: Send + Sync {
         &self,
         num: u64,
     ) -> Result<Option<alloy_consensus::Header>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Highest known block number.
+    fn best_block_number(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 impl<T> HeaderReader for T
 where
-    T: HeaderProvider<Header = alloy_consensus::Header> + Send + Sync,
+    T: HeaderProvider<Header = alloy_consensus::Header> + BlockNumReader + Send + Sync,
 {
     fn header_by_number(
         &self,
         num: u64,
     ) -> Result<Option<alloy_consensus::Header>, Box<dyn std::error::Error + Send + Sync>> {
         HeaderProvider::header_by_number(self, num).map_err(|e| Box::new(e) as _)
+    }
+
+    fn best_block_number(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        BlockNumReader::best_block_number(self).map_err(|e| Box::new(e) as _)
     }
 }
 

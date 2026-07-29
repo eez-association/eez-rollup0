@@ -24,8 +24,8 @@
 //! (multi-tx composition). Reading through revm's journal captures
 //! both; a pre-tx storage snapshot would not.
 //!
-//! [`Dispatcher`]: eez_protocol::Dispatcher
-//! [`Dispatcher::dispatch_call`]: eez_protocol::Dispatcher::dispatch_call
+//! [`Dispatcher`]: eez_protocol::CompositionBuilder
+//! [`Dispatcher::dispatch_call`]: eez_protocol::CompositionBuilder::dispatch_call
 
 use alloy_primitives::{Address, Bytes};
 use std::sync::{Arc, Mutex};
@@ -37,8 +37,8 @@ use revm::interpreter::{
     CallInputs, CallOutcome, CallScheme, Gas, InstructionResult, InterpreterResult,
 };
 
-use eez_evm::{EvmProtocol, ProxyInfo, decode_proxy_value, proxy_mapping_key};
-use eez_protocol::{Dispatcher, ExecutorError, ProxyLookupConfig, RollupId};
+use eez_protocol::{CompositionBuilder, ExecutorError, ProxyLookupConfig, RollupId};
+use eez_protocol::{ProxyInfo, decode_proxy_value, proxy_mapping_key};
 
 /// Bidirectional side-channel between source-sim and the overlay
 /// session opened on the entry rollup.
@@ -173,7 +173,7 @@ impl OverlayChannel {
 
     /// Drain the accumulated per-tx roots. Called by source-sim at
     /// end of `simulate_source_tx`; forwarded to
-    /// `Dispatcher::set_extra_per_tx_roots(entry_id, roots)` so
+    /// `CompositionBuilder::set_extra_per_tx_roots(entry_id, roots)` so
     /// `finalize` can populate `per_tx_roots_by_rollup[entry]` —
     /// otherwise nested calls attributed to the entry rollup
     /// (`reentrantCrossChainCalls`-style deep alternation) hit
@@ -273,7 +273,7 @@ fn lookup_authorized_proxy_live<CTX: ContextTr + Host>(
 }
 
 /// EVM inspector that detects proxy calls and dispatches them through
-/// a borrowed [`Dispatcher`].
+/// the borrowed [`CompositionBuilder`].
 ///
 /// After the EVM pass, the caller consults `take_error()` to surface
 /// any dispatch failure; the dispatcher already holds the recorded calls.
@@ -284,21 +284,21 @@ fn lookup_authorized_proxy_live<CTX: ContextTr + Host>(
 /// dispatcher's recorded-call count. On `call_end`, the popped value
 /// pairs with the current count to compute `(start, span)` for any
 /// reverted frame, and the bracket is forwarded to
-/// [`Dispatcher::annotate_revert_span`]. `recorded[..]` is preorder
+/// [`CompositionBuilder::annotate_revert_span`](eez_protocol::CompositionBuilder::annotate_revert_span). `recorded[..]` is preorder
 /// by construction — every call's slot index is fixed at
-/// `Dispatcher::open_call` time, BEFORE the session recurses — so
+/// `CompositionBuilder::open_call` time, BEFORE the session recurses — so
 /// `span = end - start` is exactly the on-chain `revertSpan` for the
 /// bracketed top-level call.
 pub struct SessionInspector<'a> {
     /// Combined proxy-lookup configuration: the contract address to
     /// read and which slot to read from.
-    proxy_lookup: ProxyLookupConfig<EvmProtocol>,
+    proxy_lookup: ProxyLookupConfig,
     /// Dispatch surface — composer or gRPC stub — that routes detected
     /// calls to their target rollups by id.
-    dispatcher: &'a mut (dyn Dispatcher<Protocol = EvmProtocol> + Send),
+    dispatcher: &'a mut CompositionBuilder,
     /// Rollup id of the chain this inspector is running on — the
     /// `caller_id` passed to `dispatch_call` so the resulting
-    /// [`RecordedCall.caller_rollup_id`](eez_protocol::RecordedCall::caller_rollup_id)
+    /// [`RecordedCall.caller_rollup_id`](eez_protocol::ExecutedAction::caller_rollup_id)
     /// is correct for nested action-hash emission.
     caller_rollup_id: RollupId,
     /// First target execution error, if any.
@@ -306,7 +306,7 @@ pub struct SessionInspector<'a> {
     call_depth: usize,
     proxy_lookups: usize,
     /// Tokio runtime handle for bridging the sync `Inspector::call` hook
-    /// to the async `Dispatcher::dispatch_call`.
+    /// to the async `CompositionBuilder::dispatch_call`.
     handle: tokio::runtime::Handle,
     /// Bidirectional side-channel between source-sim and the entry
     /// rollup's overlay session.
@@ -314,11 +314,11 @@ pub struct SessionInspector<'a> {
     /// Per-EVM-frame snapshot of the dispatcher's recorded-call count
     /// at the entry of `Inspector::call`. On `Inspector::call_end`,
     /// the popped value pairs with the current count to bracket the
-    /// range of [`eez_protocol::RecordedCall`]s dispatched
+    /// range of [`eez_protocol::ExecutedAction`]s dispatched
     /// inside this frame. If the frame's outcome is
     /// `InstructionResult::Revert` AND the range is non-empty, the
     /// inspector forwards `(start, span)` to
-    /// [`Dispatcher::annotate_revert_span`].
+    /// [`CompositionBuilder::annotate_revert_span`](eez_protocol::CompositionBuilder::annotate_revert_span).
     frame_starts: Vec<usize>,
 }
 
@@ -347,7 +347,7 @@ impl std::fmt::Debug for SessionInspector<'_> {
 pub struct SessionInspectorFactory {
     /// `(contract_address, slot)` discriminator for this chain's
     /// `authorizedProxies`. Derived from role at client construction.
-    proxy_lookup: ProxyLookupConfig<EvmProtocol>,
+    proxy_lookup: ProxyLookupConfig,
     /// Rollup id of the chain this factory belongs to — becomes the
     /// `caller_id` on every call dispatched through inspectors it
     /// builds.
@@ -370,7 +370,7 @@ impl SessionInspectorFactory {
     /// [`with_overlay_channel`](Self::with_overlay_channel) to install
     /// one.
     #[must_use]
-    pub fn new(proxy_lookup: ProxyLookupConfig<EvmProtocol>, caller_rollup_id: RollupId) -> Self {
+    pub fn new(proxy_lookup: ProxyLookupConfig, caller_rollup_id: RollupId) -> Self {
         Self {
             proxy_lookup,
             caller_rollup_id,
@@ -393,7 +393,7 @@ impl SessionInspectorFactory {
 
     /// Configuration this factory was built with.
     #[must_use]
-    pub fn proxy_lookup(&self) -> &ProxyLookupConfig<EvmProtocol> {
+    pub fn proxy_lookup(&self) -> &ProxyLookupConfig {
         &self.proxy_lookup
     }
 
@@ -405,14 +405,14 @@ impl SessionInspectorFactory {
 
     /// Build an inspector. Used by both the source-sim path and the
     /// target-session path. The inspector observes proxy CALLs and
-    /// dispatches each through the supplied [`Dispatcher`]; nested
+    /// dispatches each through the supplied [`CompositionBuilder`]; nested
     /// dispatches (a target-session inspector handing a callback
     /// back to the composer) are recorded as preorder children of
     /// the outer call by virtue of the dispatcher's `open_call`
     /// timing.
     pub fn build<'a>(
         &self,
-        dispatcher: &'a mut (dyn Dispatcher<Protocol = EvmProtocol> + Send),
+        dispatcher: &'a mut CompositionBuilder,
         handle: tokio::runtime::Handle,
     ) -> SessionInspector<'a> {
         let mut insp = SessionInspector::new(
@@ -430,7 +430,7 @@ impl<'a> SessionInspector<'a> {
     /// Create a new inspector instance.
     ///
     /// Used by the source-simulation path where every detected proxy
-    /// call dispatches through the supplied [`Dispatcher`] and is
+    /// call dispatches through the supplied [`CompositionBuilder`] and is
     /// recorded into the composition's preorder `recorded[..]` slice.
     ///
     /// - `proxy_lookup`: the (contract, slot) pair to read
@@ -441,8 +441,8 @@ impl<'a> SessionInspector<'a> {
     ///   `caller_id` on each dispatched call.
     /// - `handle`: tokio runtime handle for the sync→async bridge.
     pub fn new(
-        proxy_lookup: ProxyLookupConfig<EvmProtocol>,
-        dispatcher: &'a mut (dyn Dispatcher<Protocol = EvmProtocol> + Send),
+        proxy_lookup: ProxyLookupConfig,
+        dispatcher: &'a mut CompositionBuilder,
         caller_rollup_id: RollupId,
         handle: tokio::runtime::Handle,
     ) -> Self {
@@ -537,7 +537,7 @@ where
             source_address: inputs.caller,
             source_rollup_id: self.caller_rollup_id,
         };
-        // Bridge sync Inspector::call → async Dispatcher::dispatch_call.
+        // Bridge sync Inspector::call → async CompositionBuilder::dispatch_call.
         //
         // Uses `tokio::task::block_in_place` to release the worker
         // thread from tokio's runtime context for the duration of the
@@ -668,7 +668,7 @@ where
             }
         }
         let sim = match sim {
-            Ok(response) => response.outcome,
+            Ok(response) => response,
             Err(e) => {
                 tracing::error!(error = %e, "target execution failed");
                 self.record_error(e);
@@ -761,7 +761,7 @@ mod tests {
 
     use super::*;
     use alloy_primitives::{U256, address};
-    use eez_evm::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
+    use eez_protocol::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
     use revm::MainContext;
     use revm::context::Context;
     use revm::database::{CacheDB, EmptyDB};
@@ -895,7 +895,7 @@ mod tests {
         // ProxyLookupConfig with source_contract=EEZ routes to slot 0
         // (authorizedProxies declared on EEZBase, first storage slot
         // of every child).
-        let config = ProxyLookupConfig::<EvmProtocol> {
+        let config = ProxyLookupConfig {
             contract_address: ROLLUPS_ADDR,
             authorized_proxies_slot: ROLLUPS_AUTHORIZED_PROXIES_SLOT,
         };
@@ -930,7 +930,7 @@ mod tests {
         // (authorizedProxies on EEZBase, first storage slot). Same
         // value as the L1 path today — kept distinct so the two
         // constants diverging later breaks loudly.
-        let config = ProxyLookupConfig::<EvmProtocol> {
+        let config = ProxyLookupConfig {
             contract_address: ROLLUPS_ADDR,
             authorized_proxies_slot: CCM_AUTHORIZED_PROXIES_SLOT,
         };
