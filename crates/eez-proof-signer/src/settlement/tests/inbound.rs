@@ -5,7 +5,7 @@ fn inbound_binding_rejects_top_level_lookup_calls() {
     let settling = settling_with_effect_candidates(Vec::new());
     let anchor_only = state_chain(&[B256::ZERO; 2]);
     let mut lookup_batch = anchor_only;
-    lookup_batch.inner.l1ToL2lookupCalls.push(lookup(1));
+    lookup_batch.l1ToL2lookupCalls.push(lookup(1));
     let lookup_plan = effect_plan(&lookup_batch, &settling);
     assert_eq!(
         verify_inbound_effect_entries(&lookup_plan).err(),
@@ -29,7 +29,7 @@ fn inbound_effect_entries_bind_observations_positionally_and_preserve_duplicates
         assert!(verify_inbound_effect_entries(&plan).is_ok());
 
         let mut reordered = batch.clone();
-        reordered.inner.entries.swap(1, 2);
+        reordered.entries.swap(1, 2);
         let reordered_plan = effect_plan(&reordered, &settling);
         assert!(matches!(
             verify_inbound_effect_entries(&reordered_plan),
@@ -46,10 +46,9 @@ fn inbound_effect_entries_bind_observations_positionally_and_preserve_duplicates
     assert!(verify_inbound_effect_entries(&duplicate_plan).is_ok());
 
     let mut swapped_return_data = duplicates.clone();
-    let first_return = swapped_return_data.inner.entries[1].returnData.clone();
-    swapped_return_data.inner.entries[1].returnData =
-        swapped_return_data.inner.entries[2].returnData.clone();
-    swapped_return_data.inner.entries[2].returnData = first_return;
+    let first_return = swapped_return_data.entries[1].returnData.clone();
+    swapped_return_data.entries[1].returnData = swapped_return_data.entries[2].returnData.clone();
+    swapped_return_data.entries[2].returnData = first_return;
     let swapped_plan = effect_plan(&swapped_return_data, &settling);
     assert_eq!(
         verify_inbound_effect_entries(&swapped_plan).err(),
@@ -72,7 +71,7 @@ fn inbound_effect_entries_handle_mixed_effect_positions_without_authorizing_outb
         .inspection
         .as_ref()
         .unwrap();
-    let inbound = &mut batch.inner.entries[2];
+    let inbound = &mut batch.entries[2];
     inbound.proxyEntryHash = observation.recomputed_call_hash;
     inbound.returnData = observation.return_data.clone();
     inbound.stateDeltas[0].etherDelta = I256::try_from(observation.value).unwrap();
@@ -182,7 +181,7 @@ fn inbound_effect_entries_require_the_canonical_deferred_shape() {
     ];
     for (mutate, field) in shape_mutations {
         let mut batch = valid.clone();
-        mutate(&mut batch.inner.entries[1]);
+        mutate(&mut batch.entries[1]);
         let plan = effect_plan(&batch, &settling);
         assert_eq!(
             verify_inbound_effect_entries(&plan).err(),
@@ -194,7 +193,7 @@ fn inbound_effect_entries_require_the_canonical_deferred_shape() {
     }
 
     let mut wrong_rollup = valid.clone();
-    wrong_rollup.inner.entries[1].destinationRollupId = U256::from(2);
+    wrong_rollup.entries[1].destinationRollupId = U256::from(2);
     let plan = effect_plan(&wrong_rollup, &settling);
     assert_eq!(
         verify_inbound_effect_entries(&plan).err(),
@@ -206,7 +205,7 @@ fn inbound_effect_entries_require_the_canonical_deferred_shape() {
     );
 
     let mut wrong_hash = valid.clone();
-    wrong_hash.inner.entries[1].proxyEntryHash = B256::repeat_byte(0xbb);
+    wrong_hash.entries[1].proxyEntryHash = B256::repeat_byte(0xbb);
     let plan = effect_plan(&wrong_hash, &settling);
     assert!(matches!(
         verify_inbound_effect_entries(&plan),
@@ -214,7 +213,7 @@ fn inbound_effect_entries_require_the_canonical_deferred_shape() {
     ));
 
     let mut wrong_return = valid.clone();
-    wrong_return.inner.entries[1].returnData = Bytes::from_static(&[0xff]);
+    wrong_return.entries[1].returnData = Bytes::from_static(&[0xff]);
     let plan = effect_plan(&wrong_return, &settling);
     assert_eq!(
         verify_inbound_effect_entries(&plan).err(),
@@ -222,7 +221,7 @@ fn inbound_effect_entries_require_the_canonical_deferred_shape() {
     );
 
     let mut wrong_delta = valid;
-    wrong_delta.inner.entries[1].stateDeltas[0].etherDelta = I256::ZERO;
+    wrong_delta.entries[1].stateDeltas[0].etherDelta = I256::ZERO;
     let plan = effect_plan(&wrong_delta, &settling);
     assert_eq!(
         verify_inbound_effect_entries(&plan).err(),
@@ -245,10 +244,7 @@ fn inbound_effect_entries_accept_the_int256_maximum_and_reject_the_next_value() 
     let max_batch = bindable_inbound_batch(&max_settling);
     let max_plan = effect_plan(&max_batch, &max_settling);
     assert!(verify_inbound_effect_entries(&max_plan).is_ok());
-    assert_eq!(
-        max_batch.inner.entries[1].stateDeltas[0].etherDelta,
-        I256::MAX
-    );
+    assert_eq!(max_batch.entries[1].stateDeltas[0].etherDelta, I256::MAX);
 
     let value = U256::from(1) << 255;
     let candidate = observed_inbound_candidate(0, value, true);
@@ -257,8 +253,8 @@ fn inbound_effect_entries_accept_the_int256_maximum_and_reject_the_next_value() 
     let return_data = observation.return_data.clone();
     let settling = SettlingBlockObservations::for_test(vec![true], vec![candidate], Vec::new());
     let mut batch = effect_batch(&[B256::ZERO; 3], &[ClaimedEntryShape::Inbound]);
-    batch.inner.entries[1].proxyEntryHash = call_hash;
-    batch.inner.entries[1].returnData = return_data;
+    batch.entries[1].proxyEntryHash = call_hash;
+    batch.entries[1].returnData = return_data;
     let plan = effect_plan(&batch, &settling);
 
     assert_eq!(

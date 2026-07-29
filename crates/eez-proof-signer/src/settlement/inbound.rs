@@ -5,9 +5,9 @@ use std::num::NonZeroU64;
 
 use alloy_primitives::{B256, Bytes, I256, U256};
 use alloy_sol_types::{SolCall as _, SolValue as _};
-use eez_evm::entries::decode_inbound;
-use eez_evm::types::{ExecutionEntrySol, L2ToL1CallSol, executeIncomingCrossChainCallCall};
-use eez_evm::{RollupId, cross_chain_call_hash};
+use eez_protocol::abi::{ExecutionEntrySol, L2ToL1CallSol, executeIncomingCrossChainCallCall};
+use eez_protocol::entries::decode_inbound;
+use eez_protocol::{RollupId, cross_chain_call_hash};
 use thiserror::Error;
 
 use super::effect_binding::{BoundEffect, BoundEffectSequence, EffectKind};

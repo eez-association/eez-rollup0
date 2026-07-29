@@ -4,8 +4,7 @@ Status: normative anchor, successful-inbound, and successful-single-call-outboun
 attestation profile, version 9.
 Supersedes the zero-value-outbound profile (version 8), the
 anchor-and-successful-inbound profile (version 7), anchor-only profile
-(version 6), validation-only profile
-(version 5), and the `eez-proverd`
+(version 6), validation-only profile (version 5), and the predecessor daemon
 specification (version 4): the
 composer-controlled `prove.v1` wire replaces the feed transport. The
 backend-output contract is designed for pluggable validation backends; the
@@ -78,15 +77,15 @@ the final signature over the independently recomputed public-input hash.
 | Contract | Canonical definition |
 | --- | --- |
 | gRPC schema | [`../eez-control-rpc/proto/prove.proto`](../eez-control-rpc/proto/prove.proto) |
-| Decode `postAndVerifyBatch` | `eez_evm::entries::decode_postbatch` — Annex A |
+| Decode `postAndVerifyBatch` | `eez_protocol::entries::decode_postbatch` — Annex A |
 | Decode the active `callData` payload | Local exact, zero-copy RLP parser — §8.8 |
-| Public-input hashes | `eez_evm::public_inputs::public_inputs_hashes` — Annex C |
-| Inbound decoding | `eez_evm::entries::decode_inbound` — Annex D |
-| Cross-chain call hash | `eez_evm::cross_chain_call_hash` — Annex B |
-| Cross-chain Sync-block reconstruction | `eez_evm::system_tx::build_cross_chain_sync_pairs` plus `eez_evm::system_tx::interleave_sync_block_txs` — §8.8 |
-| ECDSA signing | `eez_evm::signer::EcdsaProofSigner` (§9, self-contained) |
-| Effect-candidate positions | `eez_evm::settlement::pair_end_positions`; §8.2 defines system classification from fork-aware recovered-signer evidence and the pinned EEZL2 address |
-| Batch type | `eez_evm::EvmBatch` (the decoded `postAndVerifyBatch` argument, Annex A) |
+| Public-input hashes | `eez_protocol::public_inputs::public_inputs_hashes` — Annex C |
+| Inbound decoding | `eez_protocol::entries::decode_inbound` — Annex D |
+| Cross-chain call hash | `eez_protocol::cross_chain_call_hash` — Annex B |
+| Cross-chain Sync-block reconstruction | `eez_protocol::system_tx::build_cross_chain_sync_pairs` plus `eez_protocol::system_tx::interleave_sync_block_txs` — §8.8 |
+| ECDSA signing | `eez_protocol::signer::EcdsaProofSigner` (§9, self-contained) |
+| Effect-candidate positions | `eez_protocol::settlement::pair_end_positions`; §8.2 defines system classification from fork-aware recovered-signer evidence and the pinned EEZL2 address |
+| Batch type | `eez_protocol::EvmBatch` (the decoded `postAndVerifyBatch` argument, Annex A) |
 | Rollup id | `eez_protocol::RollupId` (a `u64`, widened to `uint256` in hash preimages) |
 
 A Rust implementation should reuse these definitions directly; for Rust, the
@@ -110,6 +109,7 @@ the empty string counts as set.
 | `--vkey` | `EEZ_VKEY` | unset (required) |
 | `--proof-system` | `EEZ_PROOF_SYSTEM` | unset (required) |
 | `--signer-key` | `EEZ_PROOF_SIGNER_KEY` | unset (required) |
+| `--attester-address` | `EEZ_ATTESTER_ADDRESS` | unset (required) |
 | `--l2-system-key` | `EEZ_L2_SYSTEM_KEY` | unset (required) |
 | `--max-request-blocks` | `EEZ_PROOF_SIGNER_MAX_REQUEST_BLOCKS` | `512` |
 | `--max-request-bytes` | `EEZ_PROOF_SIGNER_MAX_REQUEST_BYTES` | `536870912` |
@@ -143,7 +143,7 @@ Throughout this document, `configured_vkey` denotes this exact value.
 
 `proof-system` is the required, non-zero Ethereum address of the deployed
 `ECDSAProofSystem` that will consume the signature. It is operator
-configuration. The sole `B.inner.proofSystems` address MUST equal it exactly;
+configuration. The sole `B.proofSystems` address MUST equal it exactly;
 accepting an arbitrary non-zero composer-selected address is insufficient.
 Missing, empty, malformed, or zero input is startup-fatal.
 
@@ -154,13 +154,19 @@ its standard Ethereum address by keccak-256 hashing the 64-byte `x || y`
 uncompressed public key without its SEC1 `0x04` prefix and taking the last 20
 bytes. The private key MUST NOT be echoed by help output, argument errors,
 `Debug`, or logs; only the derived public address may be logged. Its address
-MUST differ from `eez_evm::SYSTEM_ADDRESS`; sharing the reserved L2 identity
+MUST differ from `eez_protocol::SYSTEM_ADDRESS`; sharing the reserved L2 identity
 would collapse the separate attestation and system-transaction authorities and
 is startup-fatal.
 
+`attester-address` is the required Ethereum address configured as the deployed
+proof system's authorized signer. The address derived from `signer-key` MUST
+equal it exactly; a missing, malformed, or mismatched value is startup-fatal.
+This public binding catches a deployment/runtime key mismatch before the daemon
+accepts requests without exposing the private key.
+
 `l2-system-key` is a second required 32-byte secp256k1 private scalar with the
 same encoding and redaction rules. It MUST derive exactly
-`eez_evm::SYSTEM_ADDRESS`; any other valid key is startup-fatal. It is used
+`eez_protocol::SYSTEM_ADDRESS`; any other valid key is startup-fatal. It is used
 only to reproduce the legacy signed system transactions omitted from
 `callData`. Reconstruction MUST use the EIP-155 chain id from the same
 operator-supplied `chain-config`, the pinned EEZL2 address, gas price
@@ -175,10 +181,12 @@ errors, `Debug`, or logs and SHOULD be provisioned by a secret manager. The
 composer, followers, and signer MUST use the same system key; a mismatch
 deterministically refuses raw transaction reconstruction.
 
-These are three independent deployment bindings. The operator MUST ensure
+The rollup id, proof-system address, vkey, and attester address are independent
+deployment bindings. The operator MUST ensure
 that the L1 rollup manager maps `(rollup-id, proof-system)` to the configured
 `vkey` and that the deployed `ECDSAProofSystem` at `proof-system` reports the
-derived signer address as its authorized `signer()`. This daemon has no L1
+configured `attester-address` as its authorized `signer()`. The daemon verifies
+that its signing key derives that configured address, but it has no L1
 oracle that can prove those relationships at startup. A mismatch therefore
 produces attestations that L1 will reject; it MUST NOT be hidden by deriving or
 silently replacing one configured value with another. Because §9 signs a raw
@@ -577,14 +585,14 @@ For every batch, require `PostBatch.l1_block_hash` to have length 0, then:
 1. require the pure structural rules in Annex C, including exactly one
    proof-system address, and require it to equal the configured
    `proof-system` exactly;
-2. require `B.inner.rollupIdsWithProofSystems` to contain exactly one row,
+2. require `B.rollupIdsWithProofSystems` to contain exactly one row,
    whose `rollupId` equals the configured `rollup-id` and whose
    complete `proofSystemIndex` array is exactly `[0]`, and require every entry
    and lookup rollup reference covered by Annex C to name that sole row;
-3. require `B.inner.crossProofSystemInteractions == bytes32(0)`; the active
+3. require `B.crossProofSystemInteractions == bytes32(0)`; the active
    single-proof-system profile has no cross-PS boundary to derive or verify;
-4. require `B.inner.blockNumber == 0`;
-5. require `B.inner.blobIndices` to be empty — this daemon has no independent
+4. require `B.blockNumber == 0`;
+5. require `B.blobIndices` to be empty — this daemon has no independent
    transaction-blob oracle from which to resolve `blobhash(index)`;
 6. compute `public_inputs_hashes(B, configured_vkey, absent)` exactly as
    Annex C;
@@ -678,7 +686,7 @@ a successful status for each admitted inbound transaction.
 
 ### 8.3 State-delta chain
 
-Let `entries = B.inner.entries`. Require it to be non-empty and require
+Let `entries = B.entries`. Require it to be non-empty and require
 exactly one `StateDelta D[i]` per entry. Define `settled_rollup` by a checked
 conversion of `D[0].rollupId` to `u64`; refuse if it does not fit or is zero.
 Require `settled_rollup == configured rollup-id` before using it to classify
@@ -795,7 +803,7 @@ pre-post-block checkpoint as the final root.
 
 This gate runs on **every** settling batch. Zero inbound remains valid, but
 every admitted inbound effect MUST satisfy the complete binding below and
-`B.inner.l1ToL2lookupCalls` MUST be empty. Lookup-bearing and failed inbound
+`B.l1ToL2lookupCalls` MUST be empty. Lookup-bearing and failed inbound
 effects remain unsupported and MUST reject before attestation.
 
 An *inbound candidate* is any transaction whose input begins with the Annex D
@@ -976,7 +984,7 @@ L1 target call or the L2 funding mechanism.
 
 ### 8.8 DA sidecar and system-transaction binding
 
-`B.inner.callData` is composer-controlled data used by followers to reconstruct
+`B.callData` is composer-controlled data used by followers to reconstruct
 the posted L2 block range. Including `H(callData)` in the public-input hash
 only commits the signature to those bytes; it does not prove that they encode
 the blocks re-executed by this daemon. After §§8.4–8.7 have authorized every
@@ -1129,8 +1137,8 @@ ProveResponse {
 ```
 
 A signing error refuses the RPC like any other failure. The composer installs
-the signature into the batch's `proofs` after this daemon attests; `B.inner.
-proofs` is therefore ignored on input.
+the signature into the batch's `proofs` after this daemon attests; `B.proofs`
+is therefore ignored on input.
 
 The signature is produced by the mandatory configured signer and is intended
 for the mandatory configured `proof-system`; the public-input hash uses the
@@ -1149,10 +1157,11 @@ follow directly from §7.4 and the unsigned transient counts.
 Fatal startup errors in the active profile:
 
 - invalid or missing required core or `stateless` configuration, including
-  `vkey`, `proof-system`, `signer-key`, or `l2-system-key`;
+  `vkey`, `proof-system`, `signer-key`, `attester-address`, or `l2-system-key`;
 - a zero or invalid proof-system address, or an invalid secp256k1 private
-  scalar, including an attestation key that derives `SYSTEM_ADDRESS` or an L2
-  system key that does not derive it;
+  scalar, including an attestation key that derives `SYSTEM_ADDRESS`, an
+  attestation key that does not match `attester-address`, or an L2 system key
+  that does not derive it;
 - a zero timeout or one that cannot form a monotonic-clock deadline; or
 - listener bind failure.
 
@@ -1188,8 +1197,9 @@ A conforming implementation MUST pass tests covering:
 1. operator configuration: missing, empty, malformed, out-of-range, and zero
    `rollup-id` startup failures, plus CLI-over-environment precedence; required
    non-zero `vkey`, required non-zero `proof-system`, and required valid
-   `signer-key` and `l2-system-key`, including malformed, zero, out-of-range,
-   reserved-attestation-address, and wrong-system-address private scalars;
+   `signer-key`, `attester-address`, and `l2-system-key`, including malformed,
+   zero, out-of-range, reserved-attestation-address, mismatched-attester-address,
+   and wrong-system-address private scalars;
    prove that the configured vkey remains independent from the derived
    attestation signer address and that help, errors, `Debug`, and logs never
    expose either private key; verify the
@@ -1326,9 +1336,9 @@ and reproduce
 before signing.
 
 Golden vectors: the reference repository ships
-`crates/eez-proverd/tests/fixtures/{block-13.rlp, witness-13.json,
-postbatch-13.json}` — a real captured block, its augmented witness, and its
-posted batch. For `postbatch-13.json`, the exact public-input vector is:
+`crates/eez-proof-signer/tests/fixtures/stateless-block-13/` — a real captured
+block, its augmented witness, its chain configuration, and its posted batch.
+For `postbatch-13.json`, the exact public-input vector is:
 
 ```text
 vkey = 0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266
@@ -1338,8 +1348,8 @@ publicInputsHash = 0xe5cd0221135432a8f42b61e68f71f809d7e9b973c6866da2446fca8dd13
 
 A conforming implementation MUST reproduce that hash and accept the fixture's
 settlement chain. The Foundry-generated suites
-`crates/eez-evm/tests/fixtures/public_inputs_hash_vectors.json` and
-`crates/eez-evm/tests/fixtures/cross_chain_call_hash_vectors.json` contain
+`crates/eez-protocol/tests/fixtures/public_inputs_hash_vectors.json` and
+`crates/eez-protocol/tests/fixtures/cross_chain_call_hash_vectors.json` contain
 seven vectors each. A conforming implementation MUST match every expected
 hash in both files; these cover the general Annex C fold and Annex B,
 respectively. The public-input vectors operate on precomputed entry, lookup,
@@ -1360,7 +1370,7 @@ conforming Annex D implementation MUST match all five `entry` vectors.
 `EEZ.postAndVerifyBatch` — selector `0x8b1a095a` followed by the standard ABI
 encoding of the single struct argument. Decoding MUST verify the selector,
 ABI-decode the argument, re-encode it with
-`eez_evm::entries::encode_postbatch`, and require byte-for-byte equality with
+`eez_protocol::entries::encode_postbatch`, and require byte-for-byte equality with
 the input. This exact round trip rejects trailing bytes and non-canonical ABI
 representations. The types (field order is normative — it is the ABI layout):
 
@@ -1452,7 +1462,7 @@ struct ProofSystemBatchPerVerificationEntriesSol {
 function postAndVerifyBatch(ProofSystemBatchPerVerificationEntriesSol batch) external;
 ```
 
-Spec references of the form `B.inner.X` denote field `X` of the decoded
+Spec references of the form `B.X` denote field `X` of the decoded
 struct.
 
 ## Annex B. `cross_chain_call_hash`
@@ -1503,16 +1513,16 @@ values or add them to the preimage.
 Compute:
 
 ```text
-entryHashes[i] = H(abi.encode(B.inner.entries[i]))
-lookupHashes[i] = H(abi.encode(B.inner.l1ToL2lookupCalls[i]))
+entryHashes[i] = H(abi.encode(B.entries[i]))
+lookupHashes[i] = H(abi.encode(B.l1ToL2lookupCalls[i]))
 blobHashes = []
 
 shared = H(
     abi.encode(entryHashes)
  || abi.encode(lookupHashes)
  || abi.encode(blobHashes)
- || H(B.inner.callData)
- || B.inner.crossProofSystemInteractions
+ || H(B.callData)
+ || B.crossProofSystemInteractions
 )
 ```
 

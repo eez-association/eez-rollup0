@@ -4,7 +4,7 @@ use alloy_primitives::{Address, B256, I256, Signature, U256, address, b256};
 use eez_control_rpc::v1::{
     BlockWitness, ExecutionWitness, PostBatch, ProveChunk, ProveHeader, prove_chunk,
 };
-use reth_primitives_traits_stateless::{BlockBody as _, SignerRecoverable as _};
+use reth_primitives_traits::{BlockBody as _, SignerRecoverable as _};
 
 use super::{
     SettlementInput, TestServer, assert_attestation, checkpoint, expected_rollup_id,
@@ -113,8 +113,7 @@ fn real_successful_inbound_fixture_reaches_the_expected_hash_and_signature() {
     for block in fixture_blocks {
         let number = fixture_u64(block, "number");
         let rlp = fixture_hex(fixture_str(block, "rlp"));
-        let decoded =
-            alloy_rlp::decode_exact::<reth_ethereum_primitives_stateless::Block>(&rlp).unwrap();
+        let decoded = alloy_rlp::decode_exact::<reth_ethereum_primitives::Block>(&rlp).unwrap();
         assert_eq!(decoded.header.number, number);
         if number != to_block {
             captured_intermediate_transactions += decoded.body.transactions.len();
@@ -125,8 +124,8 @@ fn real_successful_inbound_fixture_reaches_the_expected_hash_and_signature() {
         );
     }
     assert_eq!(captured_intermediate_transactions, 27);
-    let empty_body: reth_ethereum_primitives_stateless::BlockBody = Default::default();
-    let empty_block = alloy_rlp::encode(reth_ethereum_primitives_stateless::Block::new(
+    let empty_body: reth_ethereum_primitives::BlockBody = Default::default();
+    let empty_block = alloy_rlp::encode(reth_ethereum_primitives::Block::new(
         Default::default(),
         empty_body,
     ));
@@ -150,8 +149,7 @@ fn real_successful_inbound_fixture_reaches_the_expected_hash_and_signature() {
     let settling_block = blocks.pop().unwrap();
     assert_eq!(settling_block.number(), to_block);
     let decoded_settling =
-        alloy_rlp::decode_exact::<reth_ethereum_primitives_stateless::Block>(settling_block.rlp())
-            .unwrap();
+        alloy_rlp::decode_exact::<reth_ethereum_primitives::Block>(settling_block.rlp()).unwrap();
     assert_eq!(
         decoded_settling.header.hash_slow(),
         fixture_str(&oracle, "settling_block_hash")
@@ -172,7 +170,9 @@ fn real_successful_inbound_fixture_reaches_the_expected_hash_and_signature() {
             .body
             .transactions
             .iter()
-            .all(|transaction| transaction.recover_signer().unwrap() == eez_evm::SYSTEM_ADDRESS)
+            .all(
+                |transaction| transaction.recover_signer().unwrap() == eez_protocol::SYSTEM_ADDRESS
+            )
     );
     assert_eq!(
         decoded_settling
@@ -216,7 +216,7 @@ fn real_successful_inbound_fixture_reaches_the_expected_hash_and_signature() {
     let calldata = fixture_hex(fixture_str(&post_batch, "abi_calldata"));
     let batch = settlement::decode_canonical_post_batch(calldata.clone()).unwrap();
     let (block_counts, transaction_count, l2_entry_hashes) =
-        fixture_da_payload_summary(&batch.inner.callData);
+        fixture_da_payload_summary(&batch.callData);
     assert_eq!(
         block_counts.len(),
         usize::try_from(to_block - from_block + 1).unwrap()
@@ -322,13 +322,13 @@ async fn real_nonzero_outbound_fixture_reaches_the_expected_hash_and_signature()
     let calldata = fixture_hex(fixture_str(&post_batch_json, "abi_calldata"));
     let batch = settlement::decode_canonical_post_batch(calldata.clone()).unwrap();
     assert_eq!(
-        batch.inner.entries.len(),
+        batch.entries.len(),
         usize::try_from(fixture_u64(&oracle, "entry_count")).unwrap()
     );
     let proof_system = fixture_str(&oracle, "proof_system")
         .parse::<Address>()
         .unwrap();
-    assert_eq!(batch.inner.proofSystems, [proof_system]);
+    assert_eq!(batch.proofSystems, [proof_system]);
     let proof_system_vkey =
         crate::attest::NonZeroProofSystemVkey::new(fixture_str(&oracle, "vkey").parse().unwrap())
             .unwrap();
@@ -354,7 +354,6 @@ async fn real_nonzero_outbound_fixture_reaches_the_expected_hash_and_signature()
     assert_eq!(recorded_outbound.len(), 2);
     assert_eq!(
         batch
-            .inner
             .entries
             .iter()
             .flat_map(|entry| &entry.l2ToL1Calls)
@@ -364,10 +363,10 @@ async fn real_nonzero_outbound_fixture_reaches_the_expected_hash_and_signature()
     );
     for effect in recorded_outbound {
         let entry_index = usize::try_from(fixture_u64(effect, "entry_index")).unwrap();
-        let [delta] = batch.inner.entries[entry_index].stateDeltas.as_slice() else {
+        let [delta] = batch.entries[entry_index].stateDeltas.as_slice() else {
             panic!("recorded outbound entry must have one state delta");
         };
-        let [call] = batch.inner.entries[entry_index].l2ToL1Calls.as_slice() else {
+        let [call] = batch.entries[entry_index].l2ToL1Calls.as_slice() else {
             panic!("recorded outbound entry must have one call");
         };
         assert_eq!(call.value, U256::from(fixture_u64(effect, "value")));
@@ -381,20 +380,20 @@ async fn real_nonzero_outbound_fixture_reaches_the_expected_hash_and_signature()
             fixture_str(effect, "source").parse::<Address>().unwrap()
         );
         assert_eq!(
-            eez_evm::cross_chain_call_hash(
-                eez_evm::RollupId::MAINNET,
+            eez_protocol::cross_chain_call_hash(
+                eez_protocol::RollupId::MAINNET,
                 call.targetAddress,
                 call.value,
                 &call.data,
                 call.sourceAddress,
-                eez_evm::RollupId(rollup),
+                eez_protocol::RollupId(rollup),
             ),
             fixture_str(effect, "call_hash").parse::<B256>().unwrap()
         );
     }
     let inbound = &oracle["inbound_effect"];
     let inbound_entry =
-        &batch.inner.entries[usize::try_from(fixture_u64(inbound, "entry_index")).unwrap()];
+        &batch.entries[usize::try_from(fixture_u64(inbound, "entry_index")).unwrap()];
     assert_eq!(
         inbound_entry.proxyEntryHash,
         fixture_str(inbound, "call_hash").parse::<B256>().unwrap()
@@ -421,8 +420,7 @@ async fn real_nonzero_outbound_fixture_reaches_the_expected_hash_and_signature()
     }];
     for (number, encoded_rlp, encoded_witness) in &blocks {
         let rlp = fixture_hex(encoded_rlp);
-        let block =
-            alloy_rlp::decode_exact::<reth_ethereum_primitives_stateless::Block>(&rlp).unwrap();
+        let block = alloy_rlp::decode_exact::<reth_ethereum_primitives::Block>(&rlp).unwrap();
         assert_eq!(block.header.number, *number);
         chunks.push(ProveChunk {
             kind: Some(prove_chunk::Kind::Block(BlockWitness {

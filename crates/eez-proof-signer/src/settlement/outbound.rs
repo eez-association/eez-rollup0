@@ -3,8 +3,8 @@
 use std::num::NonZeroU64;
 
 use alloy_primitives::{B256, I256, U256};
-use eez_evm::types::ExecutionEntrySol;
-use eez_evm::{RollupId, SYSTEM_ADDRESS, cross_chain_call_hash};
+use eez_protocol::abi::ExecutionEntrySol;
+use eez_protocol::{RollupId, SYSTEM_ADDRESS, cross_chain_call_hash};
 use thiserror::Error;
 
 use super::effect_binding::{BoundEffect, BoundEffectSequence, EffectKind};
@@ -348,5 +348,5 @@ fn commits_to_successful_single_call(entry: &ExecutionEntrySol) -> bool {
         call.value = U256::ONE;
     }
     let probe_value = call.value;
-    eez_evm::entries::outbound_ether_out(&outcome_probe) == Some(probe_value)
+    eez_protocol::entries::outbound_ether_out(&outcome_probe) == Some(probe_value)
 }

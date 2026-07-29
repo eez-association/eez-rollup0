@@ -5,7 +5,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use alloy_primitives::{Address, B256, Bytes};
-use eez_evm::{EcdsaProofSigner, SYSTEM_ADDRESS, SignerError};
+use eez_protocol::{EcdsaProofSigner, SYSTEM_ADDRESS, SignerError};
 use thiserror::Error;
 
 use crate::service::AttestablePublicInputsHash;

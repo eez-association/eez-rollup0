@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Deploys the upstream EEZ + MockECDSAProofSystem + Rollup manager +
-# creates our rollupId — 4 steps.
+# Deploys EEZ + ECDSAProofSystem + Rollup manager, registers the rollup,
+# and deploys the L1 bridge contracts.
 #
 # Reads from .env (poster key, proof signer key, RPC url, etc.).
 # Writes deployments.env with the addresses + rollupId + deploy block.
@@ -45,6 +45,7 @@ EEZ_DEPLOY_KEY="${EEZ_DEPLOY_KEY:-$EEZ_L1_POSTER_KEY}"
 
 # Derive addresses from keys.
 AUTHORIZED_SIGNER="$(cast wallet address --private-key "$EEZ_PROOF_SIGNER_KEY")"
+PROOF_SYSTEM_VKEY="0x000000000000000000000000${AUTHORIZED_SIGNER#0x}"
 OWNER="$(cast wallet address --private-key "$EEZ_DEPLOY_KEY")"
 
 echo "deploy: RPC                  = $EEZ_L1_RPC_URL"
@@ -94,8 +95,8 @@ run_forge() {
     fi
 }
 
-# ── 1/4 DeployEEZ ────────────────────────────────────────────────────
-echo "[1/4] DeployEEZ"
+# ── 1/5 DeployEEZ ────────────────────────────────────────────────────
+echo "[1/5] DeployEEZ"
 run_forge "DeployEEZ" forge script script/DeployEEZ.s.sol:DeployEEZ $RPC $KEY --broadcast
 EEZ_REGISTRY_ADDRESS="$(extract EEZ "$OUT")"
 [[ -n "$EEZ_REGISTRY_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture EEZ address" >&2; exit 1; }
@@ -103,16 +104,16 @@ EEZ_REGISTRY_DEPLOY_BLOCK="$(cast block-number --rpc-url "$EEZ_L1_RPC_URL")"
 echo "      EEZ        = $EEZ_REGISTRY_ADDRESS"
 echo "      deployBlock= $EEZ_REGISTRY_DEPLOY_BLOCK"
 
-# ── 2/4 DeployMockECDSAProofSystem ──────────────────────────────────
-echo "[2/4] DeployMockECDSAProofSystem(authorizedSigner=$AUTHORIZED_SIGNER)"
-run_forge "DeployMockECDSAProofSystem" forge script script/DeployMockECDSAProofSystem.s.sol:DeployMockECDSAProofSystem \
+# ── 2/5 DeployECDSAProofSystem ───────────────────────────────────────
+echo "[2/5] DeployECDSAProofSystem(authorizedSigner=$AUTHORIZED_SIGNER)"
+run_forge "DeployECDSAProofSystem" forge script script/DeployECDSAProofSystem.s.sol:DeployECDSAProofSystem \
     --sig "run(address)" "$AUTHORIZED_SIGNER" $RPC $KEY --broadcast
-EEZ_ECDSA_PROOF_SYSTEM_ADDRESS="$(extract MOCK_PS "$OUT")"
-[[ -n "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture MOCK_PS address" >&2; exit 1; }
-echo "      MOCK_PS    = $EEZ_ECDSA_PROOF_SYSTEM_ADDRESS"
+EEZ_ECDSA_PROOF_SYSTEM_ADDRESS="$(extract ECDSA_PS "$OUT")"
+[[ -n "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture ECDSA_PS address" >&2; exit 1; }
+echo "      ECDSA_PS   = $EEZ_ECDSA_PROOF_SYSTEM_ADDRESS"
 
-# ── 3/4 DeployRollup ────────────────────────────────────────────────
-echo "[3/4] DeployRollup"
+# ── 3/5 DeployRollup ────────────────────────────────────────────────
+echo "[3/5] DeployRollup"
 run_forge "DeployRollup" forge script script/DeployRollup.s.sol:DeployRollup \
     --sig "run(address,address,address,address)" \
     "$EEZ_REGISTRY_ADDRESS" "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS" "$AUTHORIZED_SIGNER" "$OWNER" \
@@ -194,6 +195,10 @@ cat > "$OUT_FILE" <<EOF
 EEZ_REGISTRY_ADDRESS=$EEZ_REGISTRY_ADDRESS
 EEZ_REGISTRY_DEPLOY_BLOCK=$EEZ_REGISTRY_DEPLOY_BLOCK
 EEZ_ECDSA_PROOF_SYSTEM_ADDRESS=$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS
+EEZ_PROOF_SYSTEM_KIND=real
+EEZ_PROOF_SYSTEM=$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS
+EEZ_VKEY=$PROOF_SYSTEM_VKEY
+EEZ_ATTESTER_ADDRESS=$AUTHORIZED_SIGNER
 EEZ_ROLLUP_MANAGER_ADDRESS=$EEZ_ROLLUP_MANAGER_ADDRESS
 EEZ_ROLLUP_ID=$EEZ_ROLLUP_ID
 EEZ_INITIAL_STATE_ROOT=$EEZ_INITIAL_STATE_ROOT

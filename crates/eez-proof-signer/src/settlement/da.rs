@@ -4,7 +4,7 @@ use alloy_consensus::Transaction as _;
 use alloy_primitives::Bytes;
 use alloy_rlp::{Decodable, Header};
 use alloy_sol_types::SolValue as _;
-use reth_primitives_traits_stateless::BlockBody as _;
+use reth_primitives_traits::BlockBody as _;
 use thiserror::Error;
 
 use super::{
@@ -144,7 +144,7 @@ pub(crate) fn verify_da_payload(
 ) -> Result<(), DaPayloadError> {
     let settling = validated_window.settling_block().block();
     verify_encoded_da_payload(
-        batch.as_batch().inner.callData.as_ref(),
+        batch.as_batch().callData.as_ref(),
         validated_window
             .preceding_blocks()
             .iter()
@@ -518,7 +518,7 @@ fn verify_reconstructed_sync_block(
             starting_nonce,
         )
         .map_err(|reason| DaPayloadError::SystemTransactionReconstruction { reason })?;
-    let reconstructed = eez_evm::system_tx::interleave_sync_block_txs(&pairs);
+    let reconstructed = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
 
     // The canonical Sync layout contains exactly `2 * outbound + inbound`
     // transactions. Reject a different terminal-block length before comparing

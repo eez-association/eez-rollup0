@@ -38,23 +38,34 @@ echo "==> protocol submodule: $(git -C "$PROTOCOL_DIR" rev-parse --short HEAD)"
 yv() { grep -E "^[[:space:]]*$1:" "$ARGS_FILE" | head -1 \
         | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//'; }
 
-NODE_IMAGE="$(yv eez_node_image)";  NODE_IMAGE="${NODE_IMAGE:-eez-node:dev}"
-DEPLOY_IMAGE="$(yv deploy_image)";  DEPLOY_IMAGE="${DEPLOY_IMAGE:-eez-deploy:dev}"
+NODE_IMAGE="$(yv eez_node_image)";                NODE_IMAGE="${NODE_IMAGE:-eez-node:dev}"
+PROOF_SIGNER_IMAGE="$(yv proof_signer_image)";    PROOF_SIGNER_IMAGE="${PROOF_SIGNER_IMAGE:-eez-proof-signer:dev}"
+DEPLOY_IMAGE="$(yv deploy_image)";                DEPLOY_IMAGE="${DEPLOY_IMAGE:-eez-deploy:dev}"
 
 export DOCKER_BUILDKIT=1
 
+# Fast local build; set EEZ_OPTIMIZED_BUILD=1 for the full release profile.
+release_build_args=()
+if [[ "${EEZ_OPTIMIZED_BUILD:-0}" != "1" ]]; then
+    release_build_args=(
+        --build-arg CARGO_PROFILE_RELEASE_LTO=false
+        --build-arg CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+        --build-arg CARGO_PROFILE_RELEASE_DEBUG=0
+    )
+fi
+
 if [[ "${EEZ_SKIP_NODE_BUILD:-0}" != "1" ]]; then
     echo "==> building $NODE_IMAGE (fast CI profile)"
-    # Fast local build; set EEZ_OPTIMIZED_BUILD=1 for the full release profile.
-    node_build_args=()
-    if [[ "${EEZ_OPTIMIZED_BUILD:-0}" != "1" ]]; then
-        node_build_args=(
-            --build-arg CARGO_PROFILE_RELEASE_LTO=false
-            --build-arg CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
-            --build-arg CARGO_PROFILE_RELEASE_DEBUG=0
-        )
-    fi
-    docker build "${node_build_args[@]}" -t "$NODE_IMAGE" "$REPO"
+    docker build "${release_build_args[@]}" -t "$NODE_IMAGE" "$REPO"
+fi
+
+if [[ "${EEZ_SKIP_PROOF_SIGNER_BUILD:-0}" != "1" ]]; then
+    echo "==> building $PROOF_SIGNER_IMAGE (fast CI profile)"
+    docker build "${release_build_args[@]}" \
+        -f "$REPO/Dockerfile.signer" \
+        -t "$PROOF_SIGNER_IMAGE" "$REPO"
+else
+    echo "==> reusing $PROOF_SIGNER_IMAGE (EEZ_SKIP_PROOF_SIGNER_BUILD=1)"
 fi
 
 if [[ "${EEZ_SKIP_DEPLOY_BUILD:-0}" != "1" ]]; then
@@ -62,6 +73,11 @@ if [[ "${EEZ_SKIP_DEPLOY_BUILD:-0}" != "1" ]]; then
     docker build -f "$HERE/Dockerfile.deploy" -t "$DEPLOY_IMAGE" "$REPO"
 else
     echo "==> reusing $DEPLOY_IMAGE (EEZ_SKIP_DEPLOY_BUILD=1)"
+fi
+
+if [[ "${EEZ_PRUNE_BUILD_CACHE:-0}" == "1" ]]; then
+    echo "==> pruning Docker build cache"
+    docker builder prune --all --force
 fi
 
 echo "==> kurtosis run (enclave: $ENCLAVE)"
@@ -78,5 +94,6 @@ cat <<EOF
 ════════════════════════════════════════
 Inspect  : kurtosis enclave inspect $ENCLAVE
 Node log : kurtosis service logs -f $ENCLAVE eez-node
+Signer log: kurtosis service logs -f $ENCLAVE eez-proof-signer
 Tear down: bash testing/kurtosis/stop.sh
 EOF

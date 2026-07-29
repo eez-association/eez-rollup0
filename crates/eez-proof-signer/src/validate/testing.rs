@@ -3,8 +3,8 @@
 use std::collections::VecDeque;
 use std::sync::{Mutex, mpsc};
 
-use eez_evm::SYSTEM_ADDRESS;
-use reth_primitives_traits_stateless::SignerRecoverable as _;
+use eez_protocol::SYSTEM_ADDRESS;
+use reth_primitives_traits::SignerRecoverable as _;
 use tokio::sync::oneshot;
 
 use super::*;

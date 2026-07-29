@@ -1,11 +1,12 @@
 # eez-rollup0
 
 An L2 rollup where L1 and L2 can call into each other as part of the same
-flow. Three components do the work: a **sequencer** produces L2 blocks (it
+flow. Four components do the work: a **sequencer** produces L2 blocks (it
 drives a stock [reth](https://github.com/paradigmxyz/reth) node), a
 **composer** posts those blocks to the `EEZ` contract on L1, and a
-**deriver** can rebuild the whole L2 chain from L1 alone. The supported L1 is
-Gnosis **Chiado** (a testnet).
+**proof signer** independently re-executes and attests them. A **deriver** can
+rebuild the whole L2 chain from L1 alone. The supported L1 is Gnosis **Chiado**
+(a testnet).
 
 ## What it does
 
@@ -25,15 +26,16 @@ Gnosis **Chiado** (a testnet).
   chain just by reading L1 (the `BatchPosted` events) and re-running the same
   transactions — no need to trust the sequencer.
 
-Proofs are a mock for now (`MockECDSAProofSystem`, an ECDSA-signature
-stand-in). The `EEZ` contract enforces the chain of state roots itself, so
-the mock is enough to test liveness and consistency — real validity proofs
-come later.
+`eez-proof-signer` statelessly re-executes each proposed batch and validates
+its settlement effects before signing the recomputed public-input hash.
+`ECDSAProofSystem` verifies that hash-bound attestation on L1. This is not yet
+a succinct validity proof, but the deployed verifier no longer accepts an
+unbound mock signature.
 
 ## Run a chiado L2 (Docker)
 
-Runs two containers: `eez-node` (which embeds a Chiado L1 node alongside the
-L2 + composer) and a **lighthouse** consensus client that drives the L1.
+Runs three containers: `eez-node` (which embeds a Chiado L1 node alongside the
+L2 + composer), `eez-proof-signer`, and a **lighthouse** consensus client that drives the L1.
 There's no separate L1 node to run. Cross-chain batches are submitted to
 Chiado's block builder; the L1 block to aim them at is read from the embedded
 L1 once it has caught up to the chain tip.
@@ -48,8 +50,9 @@ L1 once it has caught up to the chain tip.
 ```bash
 git submodule update --init --recursive
 
-# 1. Build the node image (~30 min cold; cargo-chef caches the reth deps).
+# 1. Build the node and proof-signer images.
 docker build -t eez-node:local .
+docker build -f Dockerfile.signer -t eez-proof-signer:local .
 
 # 2. Download a minimal chiado L1 snapshot (skips syncing from genesis).
 mkdir -p data
@@ -82,7 +85,7 @@ EEZ_DEPLOY_SKIP_SIMULATION=1 make deploy-protocol
 cp datadir/genesis.json ./data/genesis-fresh.json
 ```
 
-This deploys EEZ + MockECDSAProofSystem + the rollup manager, registers the
+This deploys EEZ + ECDSAProofSystem + the rollup manager, registers the
 rollup, deploys the L1 bridge contracts, and writes **`deployments.env`**
 (registry, proof system, rollup id, deploy block, bridge + CCM-L2 addresses)
 plus the L2 **`datadir/genesis.json`** whose timestamp is pinned to the deploy

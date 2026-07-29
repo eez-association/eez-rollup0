@@ -438,7 +438,7 @@ fn main() -> eyre::Result<()> {
         // mirror, splitting the serialization domain.
         let (sequencer, umbrella, system_tx_cfg) = if mode == Mode::Composer {
             // Attestation source. Remote mode (`EEZ_PROVER_URL`) holds NO signing
-            // key in the composer: it dials eez-proverd and only VERIFIES that each
+            // key in the composer: it dials eez-proof-signer and only verifies that each
             // attestation recovers to the configured attester address (the on-chain
             // proof-system check is authoritative; this is a fail-fast).
             let prover: Arc<dyn eez_prover::Prover> = match env::var("EEZ_PROVER_URL") {

@@ -5,20 +5,20 @@ use std::num::NonZeroU64;
 use alloy_consensus::{SignableTransaction as _, Transaction as _};
 use alloy_primitives::{Address, B256, Bytes, I256, Signature, U256, address, b256};
 use alloy_sol_types::{SolCall as _, SolValue as _};
-use eez_evm::EvmBatch;
-use eez_evm::entries::{
-    EXECUTE_INCOMING_SELECTOR, IncomingEntry, build_l2_incoming_entry, encode_execute_incoming,
-    encode_postbatch,
-};
-use eez_evm::public_inputs::public_inputs_hashes;
-use eez_evm::types::{
+use eez_protocol::EvmBatch;
+use eez_protocol::abi::{
     ExecutionEntrySol, ExpectedL1ToL2CallSol, ExpectedLookupSol, ExpectedOutgoingCrossChainCallSol,
     L2ExpectedLookupSol, L2LookupCallSol, L2ToL1CallSol, LookupCallSol,
     RollupIdWithProofSystemsSol, StateDeltaSol,
 };
-use eez_evm::{RollupId, SYSTEM_ADDRESS, cross_chain_call_hash};
-use reth_ethereum_primitives_stateless::{BlockBody, TransactionSigned};
-use reth_primitives_traits_stateless::{BlockBody as _, SignerRecoverable as _};
+use eez_protocol::entries::{
+    EXECUTE_INCOMING_SELECTOR, IncomingEntry, build_l2_incoming_entry, encode_execute_incoming,
+    encode_postbatch,
+};
+use eez_protocol::public_inputs::public_inputs_hashes;
+use eez_protocol::{RollupId, SYSTEM_ADDRESS, cross_chain_call_hash};
+use reth_ethereum_primitives::{BlockBody, TransactionSigned};
+use reth_primitives_traits::{BlockBody as _, SignerRecoverable as _};
 
 use crate::attest::NonZeroProofSystemVkey;
 use crate::testkit::{
@@ -51,10 +51,10 @@ fn system_transactions() -> super::SystemTransactionReconstructor {
 
 fn build_inbound_transactions(
     entries: &[ExecutionEntrySol],
-    context: &eez_evm::system_tx::SystemTxContext,
+    context: &eez_protocol::system_tx::SystemTxContext,
     starting_nonce: u64,
 ) -> Vec<TransactionSigned> {
-    eez_evm::system_tx::build_inbound_system_txs(entries, context, starting_nonce)
+    eez_protocol::system_tx::build_inbound_system_txs(entries, context, starting_nonce)
         .unwrap()
         .into_iter()
         .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
@@ -78,7 +78,7 @@ fn verify_anchor_only_da_payload<'a>(
 }
 
 // Fixed signed transaction fixtures. All except `USER_INBOUND_SELECTOR_TX`
-// use the well-known Anvil key whose address is `eez_evm::SYSTEM_ADDRESS`.
+// use the well-known Anvil key whose address is `eez_protocol::SYSTEM_ADDRESS`.
 // Transaction classification is derived from these bytes; no signer is
 // injected.
 const EIP1559_SYSTEM_TX: &str = "02f862018001018252089442000000000000000000000000000000000000078080c080a01a1ff6a847a249f83cde3536899f858e52db7ab221c7d452d1164a484859f3f3a02c507280e556114e9c646082a07a51c58d23338ff511d18c5805d90ddba8d196";
@@ -91,9 +91,11 @@ fn expected_rollup_id() -> NonZeroU64 {
 }
 
 fn carrier_batch() -> CanonicalPostBatch {
-    let mut batch = EvmBatch::empty();
-    batch.inner.proofSystems = vec![EXPECTED_PROOF_SYSTEM];
-    batch.inner.rollupIdsWithProofSystems = vec![rollup_row(1)];
+    let batch = EvmBatch {
+        proofSystems: vec![EXPECTED_PROOF_SYSTEM],
+        rollupIdsWithProofSystems: vec![rollup_row(1)],
+        ..Default::default()
+    };
     CanonicalPostBatch::from_decoded_for_test(batch)
 }
 
@@ -139,18 +141,20 @@ fn state_entry(rollup_id: U256, current: B256, new: B256) -> ExecutionEntrySol {
 }
 
 fn state_chain(roots: &[B256]) -> CanonicalPostBatch {
-    let mut batch = EvmBatch::empty();
-    batch.inner.entries = roots
-        .windows(2)
-        .map(|pair| state_entry(U256::from(1), pair[0], pair[1]))
-        .collect();
+    let batch = EvmBatch {
+        entries: roots
+            .windows(2)
+            .map(|pair| state_entry(U256::from(1), pair[0], pair[1]))
+            .collect(),
+        ..Default::default()
+    };
     CanonicalPostBatch::from_decoded_for_test(batch)
 }
 
 fn effect_batch(roots: &[B256], kinds: &[ClaimedEntryShape]) -> CanonicalPostBatch {
     assert_eq!(roots.len(), kinds.len() + 2);
     let mut batch = state_chain(roots);
-    for (entry, kind) in batch.inner.entries.iter_mut().skip(1).zip(kinds) {
+    for (entry, kind) in batch.entries.iter_mut().skip(1).zip(kinds) {
         match kind {
             ClaimedEntryShape::Outbound => {
                 let call = l2_to_l1_call();
@@ -244,7 +248,7 @@ fn bindable_inbound_batch(settling: &SettlingBlockObservations) -> CanonicalPost
     let roots = vec![B256::ZERO; observations.len() + 2];
     let kinds = vec![ClaimedEntryShape::Inbound; observations.len()];
     let mut batch = effect_batch(&roots, &kinds);
-    for (entry, observation) in batch.inner.entries.iter_mut().skip(1).zip(observations) {
+    for (entry, observation) in batch.entries.iter_mut().skip(1).zip(observations) {
         entry.proxyEntryHash = observation.recomputed_call_hash;
         entry.returnData = observation.return_data.clone();
         entry.stateDeltas[0].etherDelta = I256::try_from(observation.value).unwrap();
@@ -288,7 +292,7 @@ fn verify_effect_prefix<'batch, 'settling>(
 fn verified_state_chain_for_test(
     batch: &CanonicalPostBatch,
 ) -> super::state_chain::VerifiedStateDeltaChain<'_> {
-    let entries = &batch.inner.entries;
+    let entries = &batch.entries;
     let window_pre_state_root = entries[0].stateDeltas[0].currentState;
     let window_post_state_root = entries[entries.len() - 1].stateDeltas[0].newState;
     verify_state_delta_chain(

@@ -245,8 +245,8 @@ fn cancelled_settlement_stops_before_decoding_untrusted_input() {
 #[test]
 fn an_elapsed_deadline_stops_the_pipeline_between_validation_and_settlement() {
     let mut input = AdmittedBlock::test(5, 0x04, 0x05);
-    let empty_body: reth_ethereum_primitives_stateless::BlockBody = Default::default();
-    input.rlp = alloy_rlp::encode(reth_ethereum_primitives_stateless::Block::new(
+    let empty_body: reth_ethereum_primitives::BlockBody = Default::default();
+    input.rlp = alloy_rlp::encode(reth_ethereum_primitives::Block::new(
         Default::default(),
         empty_body,
     ));
@@ -282,11 +282,11 @@ fn an_elapsed_deadline_stops_the_pipeline_between_validation_and_settlement() {
 fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
     let value = U256::from(7);
     let (transaction, call_hash, return_data, sidecar) = strict_inbound_transaction(value);
-    let body: reth_ethereum_primitives_stateless::BlockBody = alloy_consensus::BlockBody {
+    let body: reth_ethereum_primitives::BlockBody = alloy_consensus::BlockBody {
         transactions: vec![transaction],
         ..Default::default()
     };
-    let block = reth_ethereum_primitives_stateless::Block::new(Default::default(), body);
+    let block = reth_ethereum_primitives::Block::new(Default::default(), body);
     let settling_block = validate::ValidatedBlock::for_test(
         5,
         alloy_rlp::encode(block),
@@ -294,7 +294,7 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
     );
 
     let mut batch = anchor_batch();
-    batch.inner.entries.push(ExecutionEntrySol {
+    batch.entries.push(ExecutionEntrySol {
         stateDeltas: vec![StateDeltaSol {
             rollupId: U256::from(1),
             currentState: B256::ZERO,
@@ -310,10 +310,9 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
         returnData: return_data,
         rollingHash: B256::ZERO,
     });
-    batch.inner.callData =
-        settlement::encode_da_payload(&[Vec::new()], &[sidecar.abi_encode()]).into();
+    batch.callData = settlement::encode_da_payload(&[Vec::new()], &[sidecar.abi_encode()]).into();
     let expected_hash = recompute_test_public_inputs_hash(&batch);
-    let calldata = eez_evm::entries::encode_postbatch(&batch);
+    let calldata = eez_protocol::entries::encode_postbatch(&batch);
     let statuses = [true];
     let checkpoints = [checkpoint(0, B256::ZERO)];
     let validated = validated_single_block(settling_block, statuses.to_vec(), checkpoints.to_vec());
@@ -350,7 +349,7 @@ fn a_fully_bound_outbound_effect_is_authorized() {
         ),
     );
     let expected_hash = recompute_test_public_inputs_hash(&batch);
-    let calldata = eez_evm::entries::encode_postbatch(&batch);
+    let calldata = eez_protocol::entries::encode_postbatch(&batch);
     let statuses = [true, true];
     let checkpoints = [checkpoint(1, B256::ZERO)];
     let validated = validated_single_block(settling_block, statuses.to_vec(), checkpoints.to_vec());
@@ -371,12 +370,10 @@ fn a_fully_bound_outbound_effect_is_authorized() {
     assert_eq!(run.unwrap().into_inner(), expected_hash);
 
     let mut mismatched_da = batch;
-    mismatched_da.inner.callData = settlement::encode_da_payload(
-        &[vec![user]],
-        &[mismatched_da.inner.entries[1].abi_encode()],
-    )
-    .into();
-    let mismatched_calldata = eez_evm::entries::encode_postbatch(&mismatched_da);
+    mismatched_da.callData =
+        settlement::encode_da_payload(&[vec![user]], &[mismatched_da.entries[1].abi_encode()])
+            .into();
+    let mismatched_calldata = eez_protocol::entries::encode_postbatch(&mismatched_da);
     let run = run_settlement(SettlementInput {
         submitted_post_batch_calldata: mismatched_calldata,
         validated_window: &validated,

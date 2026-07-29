@@ -707,10 +707,8 @@ where
         // `feed_witness=false` so the prover isn't double-fed the same block.
         // The block is already canonical (the FCU above), so the witness task's
         // `recovered_block(hash)` resolves on the first try.
-        if feed_witness {
-            if let Some(sender) = &self.witness_sender {
-                let _ = sender.send(block_hash);
-            }
+        if feed_witness && let Some(sender) = &self.witness_sender {
+            let _ = sender.send(block_hash);
         }
 
         Ok(DeriveOutcome {

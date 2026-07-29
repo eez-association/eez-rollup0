@@ -3,7 +3,7 @@
 use std::num::NonZeroU64;
 
 use alloy_primitives::{B256, U256};
-use eez_evm::types::{ExecutionEntrySol, LookupCallSol, StateDeltaSol};
+use eez_protocol::abi::{ExecutionEntrySol, LookupCallSol, StateDeltaSol};
 use thiserror::Error;
 
 use super::post_batch::CanonicalPostBatch;
@@ -98,11 +98,12 @@ pub(crate) fn verify_state_delta_chain(
     validated_window_pre_state_root: B256,
     validated_window_post_state_root: B256,
 ) -> Result<VerifiedStateDeltaChain<'_>, StateDeltaChainError> {
-    let inner = &batch.as_batch().inner;
-    let (leading_claimed_entry, trailing_claimed_entries) = inner
-        .entries
-        .split_first()
-        .ok_or(StateDeltaChainError::NoEntries)?;
+    let submitted_batch = batch.as_batch();
+    let (leading_claimed_entry, trailing_claimed_entries) =
+        submitted_batch
+            .entries
+            .split_first()
+            .ok_or(StateDeltaChainError::NoEntries)?;
     let leading_claimed_delta = sole_delta(leading_claimed_entry.stateDeltas.as_slice(), 0)?;
     let expected_rollup = expected_rollup_id.get();
     if leading_claimed_delta.rollupId != U256::from(expected_rollup) {
@@ -158,7 +159,7 @@ pub(crate) fn verify_state_delta_chain(
             claimed_delta: leading_claimed_delta,
         },
         trailing: verified_trailing,
-        submitted_lookup_calls: &inner.l1ToL2lookupCalls,
+        submitted_lookup_calls: &submitted_batch.l1ToL2lookupCalls,
     })
 }
 

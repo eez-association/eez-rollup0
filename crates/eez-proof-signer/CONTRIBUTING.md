@@ -63,8 +63,9 @@ See [architecture](docs/architecture.md),
 - Use fork-aware sender facts retained by Stateless. Settlement must not
   independently recover the same signatures under potentially different fork
   rules.
-- Keep the attestation key, the L2 system-transaction key, the proof-system
-  vkey, and the proof-system address as independent operator-configured bindings.
+- Keep the attestation key, expected attester address, L2 system-transaction
+  key, proof-system vkey, and proof-system address as explicit
+  operator-configured bindings.
   Never log or preserve private-key input in diagnostics.
 - An attestation does not claim canonical ancestry, sequencer authority, live
   L1 applicability, successful future L1 execution, dispatch mode, or the code
@@ -75,12 +76,12 @@ See [architecture](docs/architecture.md),
 Use the shared workspace definitions instead of locally reproducing protocol
 algorithms, including:
 
-- `eez_evm::entries::{decode_postbatch, encode_postbatch, decode_inbound,
+- `eez_protocol::entries::{decode_postbatch, encode_postbatch, decode_inbound,
   outbound_ether_out}`;
-- `eez_evm::public_inputs::public_inputs_hashes`;
-- `eez_evm::{cross_chain_call_hash, EcdsaProofSigner, SYSTEM_ADDRESS}`;
-- `eez_evm::settlement::pair_end_positions`;
-- `eez_evm::system_tx::{build_cross_chain_sync_pairs,
+- `eez_protocol::public_inputs::public_inputs_hashes`;
+- `eez_protocol::{cross_chain_call_hash, EcdsaProofSigner, SYSTEM_ADDRESS}`;
+- `eez_protocol::settlement::pair_end_positions`;
+- `eez_protocol::system_tx::{build_cross_chain_sync_pairs,
   interleave_sync_block_txs}`; and
 - the `prove.v1` schema in `crates/eez-control-rpc/proto/prove.proto`.
 
@@ -118,14 +119,14 @@ needs focused fixture coverage.
 
 ## Verify
 
-From the workspace root:
+From the repository root:
 
 ```bash
 cargo fmt --package eez-proof-signer -- --check
-cargo check --package eez-proof-signer --all-targets
-cargo clippy --package eez-proof-signer --all-targets --all-features -- -D warnings
-cargo test --package eez-proof-signer
-RUSTDOCFLAGS='-D warnings' cargo doc --package eez-proof-signer --no-deps
+cargo check --package eez-proof-signer --all-targets --locked
+cargo clippy --package eez-proof-signer --all-targets --all-features --locked -- -D warnings
+cargo test --package eez-proof-signer --locked
+RUSTDOCFLAGS='-D warnings' cargo doc --package eez-proof-signer --no-deps --locked
 ```
 
 Before updating the dependency pin, verify the fork change from a checkout of

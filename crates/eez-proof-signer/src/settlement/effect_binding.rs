@@ -1,7 +1,7 @@
 //! Binding Composer-claimed effects to locally validated execution evidence.
 
 use alloy_primitives::{B256, I256, U256};
-use eez_evm::types::{ExecutionEntrySol, LookupCallSol, StateDeltaSol};
+use eez_protocol::abi::{ExecutionEntrySol, LookupCallSol, StateDeltaSol};
 use thiserror::Error;
 
 use super::blocks::SettlingBlockObservations;

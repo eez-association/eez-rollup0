@@ -99,9 +99,9 @@ untrusted representation of the same fact.
 | Source | Treatment |
 | --- | --- |
 | Composer stream | Entirely untrusted, including hashes, RLP, witness, range, calldata, and claimed public-input hash |
-| Operator configuration | Deployment authority for the chain document, expected rollup ID, configured proof-system vkey, proof-system address, keys, and limits |
+| Operator configuration | Deployment authority for the chain document, expected rollup ID, configured proof-system vkey, proof-system and attester addresses, keys, and limits |
 | `BackendWindowOutput` | Security-critical backend result, consumed and contract-checked against the admitted input before settlement |
-| `eez_evm`, Stateless, Reth | Canonical/security-critical implementation base pinned by the workspace |
+| `eez_protocol`, Stateless, Reth | Canonical/security-critical implementation base pinned by the workspace |
 | Live L1 and L2 fork choice | Not observed by this process |
 
 The RPC transport has no peer authentication of its own. Network controls must

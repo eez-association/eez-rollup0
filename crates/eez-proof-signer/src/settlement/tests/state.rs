@@ -19,7 +19,7 @@ fn accepts_a_single_or_multi_entry_state_delta_chain() {
 #[test]
 fn rejects_missing_or_non_singular_state_deltas() {
     let root = B256::ZERO;
-    let empty = CanonicalPostBatch::from_decoded_for_test(EvmBatch::empty());
+    let empty = CanonicalPostBatch::from_decoded_for_test(EvmBatch::default());
     assert_eq!(
         verify_state_delta_chain(&empty, expected_rollup_id(), root, root).map(|_| ()),
         Err(StateDeltaChainError::NoEntries)
@@ -28,8 +28,8 @@ fn rejects_missing_or_non_singular_state_deltas() {
     for entry_index in [0, 1] {
         for actual in [0, 2] {
             let mut batch = state_chain(&[root, root, root]);
-            let delta = batch.inner.entries[entry_index].stateDeltas[0].clone();
-            batch.inner.entries[entry_index].stateDeltas = vec![delta; actual];
+            let delta = batch.entries[entry_index].stateDeltas[0].clone();
+            batch.entries[entry_index].stateDeltas = vec![delta; actual];
             assert_eq!(
                 verify_state_delta_chain(&batch, expected_rollup_id(), root, root).map(|_| ()),
                 Err(StateDeltaChainError::DeltaCount {
@@ -46,7 +46,7 @@ fn rejects_invalid_or_inconsistent_state_delta_rollup_ids() {
     let root = B256::ZERO;
 
     let mut zero = state_chain(&[root, root]);
-    zero.inner.entries[0].stateDeltas[0].rollupId = U256::ZERO;
+    zero.entries[0].stateDeltas[0].rollupId = U256::ZERO;
     assert_eq!(
         verify_state_delta_chain(&zero, expected_rollup_id(), root, root).map(|_| ()),
         Err(StateDeltaChainError::ExpectedRollupMismatch {
@@ -57,7 +57,7 @@ fn rejects_invalid_or_inconsistent_state_delta_rollup_ids() {
 
     let too_large = U256::from(u64::MAX) + U256::from(1);
     let mut out_of_range = state_chain(&[root, root]);
-    out_of_range.inner.entries[0].stateDeltas[0].rollupId = too_large;
+    out_of_range.entries[0].stateDeltas[0].rollupId = too_large;
     assert_eq!(
         verify_state_delta_chain(&out_of_range, expected_rollup_id(), root, root).map(|_| ()),
         Err(StateDeltaChainError::ExpectedRollupMismatch {
@@ -67,7 +67,7 @@ fn rejects_invalid_or_inconsistent_state_delta_rollup_ids() {
     );
 
     let mut wrong_expected_rollup = state_chain(&[root, root]);
-    wrong_expected_rollup.inner.entries[0].stateDeltas[0].rollupId = U256::from(2);
+    wrong_expected_rollup.entries[0].stateDeltas[0].rollupId = U256::from(2);
     assert_eq!(
         verify_state_delta_chain(&wrong_expected_rollup, expected_rollup_id(), root, root)
             .map(|_| ()),
@@ -78,7 +78,7 @@ fn rejects_invalid_or_inconsistent_state_delta_rollup_ids() {
     );
 
     let mut mixed = state_chain(&[root, root, root]);
-    mixed.inner.entries[1].stateDeltas[0].rollupId = U256::from(2);
+    mixed.entries[1].stateDeltas[0].rollupId = U256::from(2);
     assert_eq!(
         verify_state_delta_chain(&mixed, expected_rollup_id(), root, root).map(|_| ()),
         Err(StateDeltaChainError::RollupMismatch {
@@ -113,7 +113,7 @@ fn rejects_wrong_state_delta_endpoints_or_a_chain_break() {
     );
 
     let mut broken = batch;
-    broken.inner.entries[1].stateDeltas[0].currentState = wrong;
+    broken.entries[1].stateDeltas[0].currentState = wrong;
     assert_eq!(
         verify_state_delta_chain(&broken, expected_rollup_id(), a, c).map(|_| ()),
         Err(StateDeltaChainError::ChainBreak {
@@ -147,7 +147,7 @@ fn canonical_anchor_requires_a_zero_ether_delta() {
     let settling = settling_with_effect_candidates(Vec::new());
     for claimed in [I256::ONE, -I256::ONE] {
         let mut batch = state_chain(&[root, root]);
-        batch.inner.entries[0].stateDeltas[0].etherDelta = claimed;
+        batch.entries[0].stateDeltas[0].etherDelta = claimed;
         assert_eq!(
             verify_effect_prefix(&batch, root, &[], &settling).err(),
             Some(EffectPrefixError::NonZeroAnchorEtherDelta { claimed })
@@ -162,31 +162,27 @@ fn rejects_every_noncanonical_anchor_field() {
     let mut cases = Vec::new();
 
     let mut batch = valid.clone();
-    batch.inner.entries[0].destinationRollupId = U256::from(2);
+    batch.entries[0].destinationRollupId = U256::from(2);
     cases.push(batch);
 
     let mut batch = valid.clone();
-    batch.inner.entries[0]
-        .expectedL1ToL2Calls
-        .push(expected_call());
+    batch.entries[0].expectedL1ToL2Calls.push(expected_call());
     cases.push(batch);
 
     let mut batch = valid.clone();
-    batch.inner.entries[0]
-        .expectedLookups
-        .push(expected_lookup());
+    batch.entries[0].expectedLookups.push(expected_lookup());
     cases.push(batch);
 
     let mut batch = valid.clone();
-    batch.inner.entries[0].callCount = U256::from(1);
+    batch.entries[0].callCount = U256::from(1);
     cases.push(batch);
 
     let mut batch = valid.clone();
-    batch.inner.entries[0].returnData = Bytes::from_static(b"not inert");
+    batch.entries[0].returnData = Bytes::from_static(b"not inert");
     cases.push(batch);
 
     let mut batch = valid;
-    batch.inner.entries[0].rollingHash = B256::repeat_byte(0xee);
+    batch.entries[0].rollingHash = B256::repeat_byte(0xee);
     cases.push(batch);
 
     let settling = settling_with_effect_candidates(Vec::new());
@@ -206,7 +202,7 @@ fn rejects_an_effect_in_the_leading_anchor_position() {
     let settling = settling_with_effect_candidates(Vec::new());
 
     let mut inbound = state_chain(&[root, root]);
-    inbound.inner.entries[0].proxyEntryHash = B256::repeat_byte(0x11);
+    inbound.entries[0].proxyEntryHash = B256::repeat_byte(0x11);
     assert_eq!(
         verify_effect_prefix(&inbound, root, &[], &settling).err(),
         Some(EffectPrefixError::LeadingEntryNotAnchor {
@@ -215,7 +211,7 @@ fn rejects_an_effect_in_the_leading_anchor_position() {
     );
 
     let mut outbound = state_chain(&[root, root]);
-    outbound.inner.entries[0].l2ToL1Calls.push(l2_to_l1_call());
+    outbound.entries[0].l2ToL1Calls.push(l2_to_l1_call());
     assert_eq!(
         verify_effect_prefix(&outbound, root, &[], &settling).err(),
         Some(EffectPrefixError::LeadingEntryNotAnchor {
@@ -236,7 +232,7 @@ fn rejects_later_anchors_and_invalid_entries() {
     );
 
     let mut invalid = anchors;
-    invalid.inner.entries[1].callCount = U256::from(1);
+    invalid.entries[1].callCount = U256::from(1);
     assert_eq!(
         verify_effect_prefix(&invalid, root, &[], &settling).err(),
         Some(EffectPrefixError::InvalidEntry { entry_index: 1 })

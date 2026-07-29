@@ -14,13 +14,13 @@ use alloy_consensus::{EthereumReceipt, Transaction as _};
 use alloy_genesis::ChainConfig;
 use alloy_genesis::Genesis;
 use alloy_sol_types::SolEvent as _;
-use eez_evm::SYSTEM_ADDRESS;
-use eez_evm::settlement::{is_system_tx, pair_end_positions};
-use eez_evm::types::CrossChainCallExecuted;
-use reth_chainspec_stateless::{ChainSpec, EthereumHardforks as _};
-use reth_ethereum_primitives_stateless::Block;
-use reth_evm_ethereum_stateless::EthEvmConfig;
-use reth_primitives_traits_stateless::RecoveredBlock;
+use eez_protocol::SYSTEM_ADDRESS;
+use eez_protocol::abi::CrossChainCallExecuted;
+use eez_protocol::settlement::{is_system_tx, pair_end_positions};
+use reth_chainspec::{ChainSpec, EthereumHardforks as _};
+use reth_ethereum_primitives::Block;
+use reth_evm_ethereum::EthEvmConfig;
+use reth_primitives_traits::RecoveredBlock;
 use stateless_reth::validation::StatelessValidationError;
 use stateless_reth::{
     StatelessValidationOutput, stateless_validation_recovered,
@@ -481,10 +481,7 @@ fn decode_match_and_recover_signers(
 fn recover_block(
     block: Block,
     chain_spec: &ChainSpec,
-) -> Result<
-    RecoveredBlock<Block>,
-    reth_primitives_traits_stateless::transaction::signed::RecoveryError,
-> {
+) -> Result<RecoveredBlock<Block>, reth_primitives_traits::transaction::signed::RecoveryError> {
     if chain_spec.is_homestead_active_at_block(block.header.number) {
         RecoveredBlock::try_recover(block)
     } else {

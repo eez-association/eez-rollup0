@@ -16,18 +16,24 @@ jobs:
   kurtosis-e2e:
     name: Kurtosis E2E
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     env:
       KURTOSIS_ENCLAVE: eez-pr-${{ github.run_id }}-${{ github.run_attempt }}
       EEZ_NODE_IMAGE: eez-node:ci-${{ github.sha }}
+      EEZ_PROOF_SIGNER_IMAGE: eez-proof-signer:ci-${{ github.sha }}
       EEZ_DEPLOY_IMAGE: eez-deploy:ci-${{ github.sha }}
       EEZ_CI_RESULT_DIR: ${{ github.workspace }}/artifacts/kurtosis-e2e
+      EEZ_PRUNE_BUILD_CACHE: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
       - name: Initialize submodules
         run: git submodule update --init --recursive
+      - name: Reclaim runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          docker system prune --all --force
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
       - name: Install Kurtosis
@@ -51,4 +57,4 @@ jobs:
           retention-days: 7
       - name: Remove candidate images
         if: always()
-        run: docker image rm "$EEZ_NODE_IMAGE" "$EEZ_DEPLOY_IMAGE" || true
+        run: docker image rm "$EEZ_NODE_IMAGE" "$EEZ_PROOF_SIGNER_IMAGE" "$EEZ_DEPLOY_IMAGE" || true

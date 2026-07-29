@@ -427,8 +427,7 @@ impl TargetExecutionSession for LocalExecutionSession {
 
     async fn checkpoint(&mut self) -> ExecutorResult<eez_protocol::SessionSnapshot> {
         // Opaque snapshot carrying the current root only. The full
-        // revm `State<DB>` deep-clone is tracked as known debt — see
-        // CLAUDE.md "Known limitations".
+        // revm `State<DB>` deep-clone remains known implementation debt.
         Ok(Box::new(self.current_root.0) as Box<dyn std::any::Any + Send>)
     }
 

@@ -214,7 +214,7 @@ fn strict_inbound_observation_rejects_unbound_envelope_fields() {
 
 #[test]
 fn strict_inbound_observation_rejects_composer_controlled_shape_changes() {
-    use eez_evm::types::executeIncomingCrossChainCallCall;
+    use eez_protocol::abi::executeIncomingCrossChainCallCall;
 
     let value = U256::from(7);
     let calldata = strict_inbound_calldata(value, true);
@@ -492,7 +492,7 @@ fn exact_intermediate_inbound_candidate_is_rejected() {
     );
     assert_eq!(
         transaction.recover_signer().unwrap(),
-        eez_evm::SYSTEM_ADDRESS
+        eez_protocol::SYSTEM_ADDRESS
     );
     assert_eq!(transaction.to(), Some(crate::EEZL2_ADDRESS));
     let rlp = block_rlp(vec![transaction]);
@@ -516,7 +516,7 @@ fn selector_spoof_from_a_user_remains_an_ordinary_intermediate_transaction() {
     );
     assert_ne!(
         transaction.recover_signer().unwrap(),
-        eez_evm::SYSTEM_ADDRESS
+        eez_protocol::SYSTEM_ADDRESS
     );
     assert_eq!(transaction.to(), Some(crate::EEZL2_ADDRESS));
     let rlp = block_rlp(vec![transaction]);

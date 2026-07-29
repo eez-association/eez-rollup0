@@ -191,11 +191,11 @@ impl OptimisticallyIncluded {
     /// skipped-slot drop so recovery won't count it toward eviction.
     pub fn mark_failed(&self, sync_height: u64, slot_skipped: bool) {
         let mut map = self.by_sync_height.lock().unwrap();
-        if let Some(entry) = map.get_mut(&sync_height) {
-            if entry.resolution == Resolution::Pending {
-                entry.resolution = Resolution::Failed;
-                entry.slot_skipped = slot_skipped;
-            }
+        if let Some(entry) = map.get_mut(&sync_height)
+            && entry.resolution == Resolution::Pending
+        {
+            entry.resolution = Resolution::Failed;
+            entry.slot_skipped = slot_skipped;
         }
     }
 

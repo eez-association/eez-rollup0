@@ -3,15 +3,15 @@
 use std::num::NonZeroU64;
 
 use alloy_consensus::{Transaction as _, Typed2718 as _};
-use eez_evm::entries::EXECUTE_INCOMING_SELECTOR;
-use eez_evm::settlement::pair_end_positions as framed_effect_candidate_positions;
+use eez_protocol::entries::EXECUTE_INCOMING_SELECTOR;
+use eez_protocol::settlement::pair_end_positions as framed_effect_candidate_positions;
 use thiserror::Error;
 
 use super::inbound::{InboundCandidate, inspect_inbound_candidate};
 use crate::EEZL2_ADDRESS;
 use crate::validate::{OutboundEventObservation, SettlementBlockEvidence, ValidatedBlock};
 
-pub(super) type EthereumBlock = reth_ethereum_primitives_stateless::Block;
+pub(super) type EthereumBlock = reth_ethereum_primitives::Block;
 pub(super) const RESERVED_SYSTEM_TRANSACTION_TYPE: u8 = 0x7e;
 
 /// Settlement observations derived by combining backend-recovered evidence
@@ -242,7 +242,7 @@ pub(crate) fn inspect_settling_block(
 ///
 /// Each block is consensus-RLP decoded exactly, and recovered signer flags
 /// must cover every transaction. A transaction is privileged if it uses the
-/// reserved system type or is signed by [`eez_evm::SYSTEM_ADDRESS`], regardless of its
+/// reserved system type or is signed by [`eez_protocol::SYSTEM_ADDRESS`], regardless of its
 /// recipient. Outbound observations are rejected because effects are bound
 /// only in the settling block.
 pub(crate) fn verify_validated_intermediate_blocks(

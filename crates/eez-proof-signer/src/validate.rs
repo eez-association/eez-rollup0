@@ -15,7 +15,7 @@ use crate::window::{AdmittedBlock, AdmittedBlocks};
 
 mod stateless;
 
-type EthereumBlock = reth_ethereum_primitives_stateless::Block;
+type EthereumBlock = reth_ethereum_primitives::Block;
 
 /// A cumulative state root locally recomputed during successful block replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

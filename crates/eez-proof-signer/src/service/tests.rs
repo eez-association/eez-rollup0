@@ -13,8 +13,8 @@ use eez_control_rpc::v1::prover_client::ProverClient;
 use eez_control_rpc::v1::{
     BlockWitness, ExecutionWitness, PostBatch, ProveChunk, ProveHeader, ProveResponse, prove_chunk,
 };
-use eez_evm::types::{ExecutionEntrySol, L2ToL1CallSol, LookupCallSol, StateDeltaSol};
-use reth_primitives_traits_stateless::BlockBody as _;
+use eez_protocol::abi::{ExecutionEntrySol, L2ToL1CallSol, LookupCallSol, StateDeltaSol};
+use reth_primitives_traits::BlockBody as _;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Status};
@@ -62,13 +62,13 @@ fn test_system_transaction_key() -> settlement::SystemTransactionKey {
     settlement::SystemTransactionKey::new(SYSTEM_PRIVATE_KEY).unwrap()
 }
 
-fn anchor_batch() -> eez_evm::EvmBatch {
+fn anchor_batch() -> eez_protocol::EvmBatch {
     anchor_batch_for(1)
 }
 
-fn anchor_batch_for(rollup_id: u64) -> eez_evm::EvmBatch {
-    let mut batch = eez_evm::EvmBatch::empty();
-    batch.inner.entries.push(ExecutionEntrySol {
+fn anchor_batch_for(rollup_id: u64) -> eez_protocol::EvmBatch {
+    let mut batch = eez_protocol::EvmBatch::default();
+    batch.entries.push(ExecutionEntrySol {
         stateDeltas: vec![StateDeltaSol {
             rollupId: U256::from(rollup_id),
             currentState: B256::ZERO,
@@ -84,9 +84,9 @@ fn anchor_batch_for(rollup_id: u64) -> eez_evm::EvmBatch {
         returnData: Bytes::new(),
         rollingHash: B256::ZERO,
     });
-    batch.inner.transientExecutionEntryCount = U256::from(1);
-    batch.inner.proofSystems = vec![test_proof_system()];
-    batch.inner.rollupIdsWithProofSystems = vec![eez_evm::types::RollupIdWithProofSystemsSol {
+    batch.transientExecutionEntryCount = U256::from(1);
+    batch.proofSystems = vec![test_proof_system()];
+    batch.rollupIdsWithProofSystems = vec![eez_protocol::abi::RollupIdWithProofSystemsSol {
         rollupId: U256::from(rollup_id),
         proofSystemIndex: vec![0],
     }];
@@ -97,9 +97,9 @@ fn outbound_batch(
     anchor_root: B256,
     pre_settling_root: B256,
     final_root: B256,
-) -> eez_evm::EvmBatch {
+) -> eez_protocol::EvmBatch {
     let mut batch = anchor_batch();
-    let anchor = &mut batch.inner.entries[0];
+    let anchor = &mut batch.entries[0];
     anchor.stateDeltas[0].currentState = anchor_root;
     anchor.stateDeltas[0].newState = pre_settling_root;
 
@@ -110,7 +110,7 @@ fn outbound_batch(
     effect.callCount = U256::from(1);
     // Independent rolling-hash oracle for one successful call with empty return data.
     effect.rollingHash = b256!("68676dacdc339269dad7302dad8697771c8c23d92fa956992dc881fce33e0764");
-    batch.inner.entries.push(effect);
+    batch.entries.push(effect);
     batch
 }
 
@@ -126,47 +126,47 @@ fn l2_to_l1_call() -> L2ToL1CallSol {
 }
 
 /// Canonical one-pair Sync block and the batch that commits to it.
-fn canonical_outbound_case() -> (eez_evm::EvmBatch, Vec<u8>, Vec<u8>, B256) {
+fn canonical_outbound_case() -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256) {
     outbound_case(U256::ZERO)
 }
 
-fn outbound_case(value: U256) -> (eez_evm::EvmBatch, Vec<u8>, Vec<u8>, B256) {
+fn outbound_case(value: U256) -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256) {
     let mut batch = outbound_batch(B256::ZERO, B256::ZERO, B256::ZERO);
-    batch.inner.entries[1].l2ToL1Calls[0].value = value;
-    batch.inner.entries[1].stateDeltas[0].etherDelta = -I256::try_from(value).unwrap();
-    let call = &batch.inner.entries[1].l2ToL1Calls[0];
-    let call_hash = eez_evm::cross_chain_call_hash(
-        eez_evm::RollupId::MAINNET,
+    batch.entries[1].l2ToL1Calls[0].value = value;
+    batch.entries[1].stateDeltas[0].etherDelta = -I256::try_from(value).unwrap();
+    let call = &batch.entries[1].l2ToL1Calls[0];
+    let call_hash = eez_protocol::cross_chain_call_hash(
+        eez_protocol::RollupId::MAINNET,
         call.targetAddress,
         call.value,
         &call.data,
         call.sourceAddress,
-        eez_evm::RollupId(1),
+        eez_protocol::RollupId(1),
     );
-    let user_body: reth_ethereum_primitives_stateless::BlockBody = alloy_consensus::BlockBody {
+    let user_body: reth_ethereum_primitives::BlockBody = alloy_consensus::BlockBody {
         transactions: vec![non_system_transaction()],
         ..Default::default()
     };
     let user = user_body.encoded_2718_transactions_iter().next().unwrap();
-    let mut sidecar = batch.inner.entries[1].clone();
+    let mut sidecar = batch.entries[1].clone();
     sidecar.stateDeltas.clear();
-    let pairs = eez_evm::system_tx::build_cross_chain_sync_pairs(
+    let pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
         &[(sidecar.clone(), Bytes::from(user.clone()))],
         &[],
         &system_transaction_context(),
         0,
     )
     .unwrap();
-    let transactions = eez_evm::system_tx::interleave_sync_block_txs(&pairs)
+    let transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs)
         .into_iter()
         .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
         .collect();
-    let body: reth_ethereum_primitives_stateless::BlockBody = alloy_consensus::BlockBody {
+    let body: reth_ethereum_primitives::BlockBody = alloy_consensus::BlockBody {
         transactions,
         ..Default::default()
     };
-    let block = reth_ethereum_primitives_stateless::Block::new(Default::default(), body);
-    batch.inner.callData =
+    let block = reth_ethereum_primitives::Block::new(Default::default(), body);
+    batch.callData =
         settlement::encode_da_payload(&[vec![user.clone()]], &[sidecar.abi_encode()]).into();
     (batch, alloy_rlp::encode(block), user, call_hash)
 }
@@ -193,37 +193,37 @@ fn outbound_evidence(call_hash: B256) -> validate::SettlementBlockEvidence {
     )
 }
 
-fn mixed_outbound_inbound_case() -> (eez_evm::EvmBatch, Vec<u8>, B256) {
+fn mixed_outbound_inbound_case() -> (eez_protocol::EvmBatch, Vec<u8>, B256) {
     let (mut batch, _outbound_block, user, outbound_call_hash) = canonical_outbound_case();
     let value = U256::from(9);
     let (_unused_nonce_zero_tx, inbound_call_hash, return_data, inbound_sidecar) =
         strict_inbound_transaction(value);
 
-    let mut inbound_entry = batch.inner.entries[0].clone();
+    let mut inbound_entry = batch.entries[0].clone();
     inbound_entry.stateDeltas[0].etherDelta = I256::try_from(value).unwrap();
     inbound_entry.proxyEntryHash = inbound_call_hash;
     inbound_entry.returnData = return_data;
-    batch.inner.entries.push(inbound_entry);
+    batch.entries.push(inbound_entry);
 
-    let mut outbound_sidecar = batch.inner.entries[1].clone();
+    let mut outbound_sidecar = batch.entries[1].clone();
     outbound_sidecar.stateDeltas.clear();
-    let pairs = eez_evm::system_tx::build_cross_chain_sync_pairs(
+    let pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
         &[(outbound_sidecar.clone(), Bytes::from(user.clone()))],
         std::slice::from_ref(&inbound_sidecar),
         &system_transaction_context(),
         0,
     )
     .unwrap();
-    let transactions = eez_evm::system_tx::interleave_sync_block_txs(&pairs)
+    let transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs)
         .into_iter()
         .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
         .collect();
-    let body: reth_ethereum_primitives_stateless::BlockBody = alloy_consensus::BlockBody {
+    let body: reth_ethereum_primitives::BlockBody = alloy_consensus::BlockBody {
         transactions,
         ..Default::default()
     };
-    let block = reth_ethereum_primitives_stateless::Block::new(Default::default(), body);
-    batch.inner.callData = settlement::encode_da_payload(
+    let block = reth_ethereum_primitives::Block::new(Default::default(), body);
+    batch.callData = settlement::encode_da_payload(
         &[vec![user]],
         &[outbound_sidecar.abi_encode(), inbound_sidecar.abi_encode()],
     )
@@ -252,7 +252,10 @@ fn mixed_evidence(outbound_call_hash: B256) -> validate::SettlementBlockEvidence
     )
 }
 
-fn single_block_settlement_window(batch: eez_evm::EvmBatch, block_rlp: Vec<u8>) -> Vec<ProveChunk> {
+fn single_block_settlement_window(
+    batch: eez_protocol::EvmBatch,
+    block_rlp: Vec<u8>,
+) -> Vec<ProveChunk> {
     let mut block = block_chunk(5, 0x04, 0x05);
     block_mut(&mut block).rlp = block_rlp;
     let mut window = vec![header_chunk(5, 5), block];
@@ -283,23 +286,22 @@ fn public_input_post_batch() -> PostBatch {
     public_input_post_batch_for_empty_blocks(anchor_batch(), 3)
 }
 
-fn public_input_post_batch_for(batch: eez_evm::EvmBatch) -> PostBatch {
+fn public_input_post_batch_for(batch: eez_protocol::EvmBatch) -> PostBatch {
     PostBatch {
-        abi_calldata: eez_evm::entries::encode_postbatch(&batch),
+        abi_calldata: eez_protocol::entries::encode_postbatch(&batch),
         ..PostBatch::default()
     }
 }
 
 fn public_input_post_batch_for_empty_blocks(
-    mut batch: eez_evm::EvmBatch,
+    mut batch: eez_protocol::EvmBatch,
     block_count: usize,
 ) -> PostBatch {
-    batch.inner.callData =
-        settlement::encode_da_payload(&vec![Vec::new(); block_count], &[]).into();
+    batch.callData = settlement::encode_da_payload(&vec![Vec::new(); block_count], &[]).into();
     public_input_post_batch_for(batch)
 }
 
-fn recompute_test_public_inputs_hash(batch: &eez_evm::EvmBatch) -> B256 {
+fn recompute_test_public_inputs_hash(batch: &eez_protocol::EvmBatch) -> B256 {
     settlement::recompute_public_input_hash(
         batch,
         test_proof_system_vkey(),
@@ -366,23 +368,22 @@ fn da_payload_for_window(window: &[ProveChunk]) -> Vec<u8> {
                 panic!("test window contains a non-block chunk after its header");
             };
             let block =
-                alloy_rlp::decode_exact::<reth_ethereum_primitives_stateless::Block>(&block.rlp)
-                    .unwrap();
+                alloy_rlp::decode_exact::<reth_ethereum_primitives::Block>(&block.rlp).unwrap();
             block.body.encoded_2718_transactions_iter().collect()
         })
         .collect::<Vec<_>>();
     settlement::encode_da_payload(&blocks, &[])
 }
 
-fn replace_batch_bound_to_window(window: &mut [ProveChunk], mut batch: eez_evm::EvmBatch) {
-    batch.inner.callData = da_payload_for_window(window).into();
+fn replace_batch_bound_to_window(window: &mut [ProveChunk], mut batch: eez_protocol::EvmBatch) {
+    batch.callData = da_payload_for_window(window).into();
     replace_post_batch(window, public_input_post_batch_for(batch));
 }
 
 fn block_chunk(number: u64, parent: u8, hash: u8) -> ProveChunk {
-    let block = reth_ethereum_primitives_stateless::Block::new(
+    let block = reth_ethereum_primitives::Block::new(
         Default::default(),
-        reth_ethereum_primitives_stateless::BlockBody::default(),
+        reth_ethereum_primitives::BlockBody::default(),
     );
     ProveChunk {
         kind: Some(prove_chunk::Kind::Block(BlockWitness {
@@ -432,11 +433,11 @@ fn stateless_transaction_window() -> Vec<ProveChunk> {
         ..Default::default()
     };
     let hash = header.hash_slow();
-    let body: reth_ethereum_primitives_stateless::BlockBody = alloy_consensus::BlockBody {
+    let body: reth_ethereum_primitives::BlockBody = alloy_consensus::BlockBody {
         transactions: vec![non_system_transaction()],
         ..Default::default()
     };
-    let block = reth_ethereum_primitives_stateless::Block::new(header, body);
+    let block = reth_ethereum_primitives::Block::new(header, body);
     let chunk = ProveChunk {
         kind: Some(prove_chunk::Kind::Block(BlockWitness {
             number: 5,
@@ -479,16 +480,17 @@ fn strict_inbound_transaction(value: U256) -> (TestTransaction, B256, Bytes, Exe
     let source = alloy_primitives::address!("00000000000000000000000000000000000000bb");
     let data = Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]);
     let return_data = Bytes::from_static(&[0x01, 0x02]);
-    let entry = eez_evm::entries::build_l2_incoming_entry(eez_evm::entries::IncomingEntry {
-        target,
-        source,
-        value,
-        data: data.clone(),
-        source_rollup_id: eez_evm::RollupId(0),
-        l2_rollup_id: eez_evm::RollupId(1),
-        return_data: return_data.clone(),
-        success: true,
-    });
+    let entry =
+        eez_protocol::entries::build_l2_incoming_entry(eez_protocol::entries::IncomingEntry {
+            target,
+            source,
+            value,
+            data: data.clone(),
+            source_rollup_id: eez_protocol::RollupId(0),
+            l2_rollup_id: eez_protocol::RollupId(1),
+            return_data: return_data.clone(),
+            success: true,
+        });
     let call_hash = entry.proxyEntryHash;
     let sidecar = ExecutionEntrySol {
         stateDeltas: Vec::new(),
@@ -508,19 +510,22 @@ fn strict_inbound_transaction(value: U256) -> (TestTransaction, B256, Bytes, Exe
         returnData: return_data.clone(),
         rollingHash: entry.rollingHash,
     };
-    let input = eez_evm::entries::encode_execute_incoming(
+    let input = eez_protocol::entries::encode_execute_incoming(
         target,
         value,
         data,
         source,
-        eez_evm::RollupId(0),
+        eez_protocol::RollupId(0),
         entry,
     );
     let context = system_transaction_context();
-    let raw =
-        eez_evm::system_tx::build_inbound_system_txs(std::slice::from_ref(&sidecar), &context, 0)
-            .unwrap()
-            .remove(0);
+    let raw = eez_protocol::system_tx::build_inbound_system_txs(
+        std::slice::from_ref(&sidecar),
+        &context,
+        0,
+    )
+    .unwrap()
+    .remove(0);
     let transaction: TestTransaction = alloy_rlp::decode_exact(raw.as_ref()).unwrap();
     assert_eq!(transaction.input(), input.as_slice());
     (transaction, call_hash, return_data, sidecar)
@@ -559,11 +564,11 @@ fn transactions_block_chunk(
     hash: u8,
     transactions: Vec<TestTransaction>,
 ) -> ProveChunk {
-    let body: reth_ethereum_primitives_stateless::BlockBody = alloy_consensus::BlockBody {
+    let body: reth_ethereum_primitives::BlockBody = alloy_consensus::BlockBody {
         transactions,
         ..Default::default()
     };
-    let consensus_block = reth_ethereum_primitives_stateless::Block::new(Default::default(), body);
+    let consensus_block = reth_ethereum_primitives::Block::new(Default::default(), body);
     let mut chunk = block_chunk(number, parent, hash);
     block_mut(&mut chunk).rlp = alloy_rlp::encode(consensus_block);
     chunk

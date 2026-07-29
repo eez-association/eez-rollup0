@@ -9,7 +9,7 @@
 use alloy_primitives::{B256, b256};
 
 /// Well-known Anvil account #0 key whose address is
-/// `eez_evm::SYSTEM_ADDRESS`. Test-only and intentionally public.
+/// `eez_protocol::SYSTEM_ADDRESS`. Test-only and intentionally public.
 pub(crate) const SYSTEM_PRIVATE_KEY: B256 =
     b256!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
 
@@ -24,8 +24,8 @@ pub(crate) const SYSTEM_INBOUND_SELECTOR_TX: &str = "f8648001830186a094420000000
 
 /// Canonical context for reconstructing system transactions in tests; tests
 /// that need a noncanonical variant mutate one field of a fresh copy.
-pub(crate) fn system_transaction_context() -> eez_evm::system_tx::SystemTxContext {
-    eez_evm::system_tx::SystemTxContext {
+pub(crate) fn system_transaction_context() -> eez_protocol::system_tx::SystemTxContext {
+    eez_protocol::system_tx::SystemTxContext {
         system_signer: SYSTEM_PRIVATE_KEY.to_string().parse().unwrap(),
         ccm_l2_address: crate::EEZL2_ADDRESS,
         l2_chain_id: 1,

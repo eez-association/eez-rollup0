@@ -28,6 +28,7 @@ ethereum_package:
 
 eez:
   eez_node_image: eez-node:ci
+  proof_signer_image: eez-proof-signer:ci
   deploy_image: eez-deploy:ci
   follower_image: sigp/lighthouse:v8.1.2
 

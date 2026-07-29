@@ -3,10 +3,10 @@
 use std::num::NonZeroU64;
 
 use alloy_primitives::{Address, B256, U256};
-use eez_evm::EvmBatch;
-use eez_evm::entries::decode_postbatch;
-use eez_evm::public_inputs::public_inputs_hashes;
-use eez_evm::types::ProofSystemBatchPerVerificationEntriesSol;
+use eez_protocol::EvmBatch;
+use eez_protocol::abi::ProofSystemBatchPerVerificationEntriesSol;
+use eez_protocol::entries::decode_postbatch;
+use eez_protocol::public_inputs::public_inputs_hashes;
 use thiserror::Error;
 
 use crate::attest::NonZeroProofSystemVkey;
@@ -68,9 +68,7 @@ pub(crate) fn decode_canonical_post_batch(
     // adversarially large calldata. `decode_postbatch` already checked the
     // selector, so canonicality only needs an exact argument-byte comparison.
     let batch_token =
-        <ProofSystemBatchPerVerificationEntriesSol as alloy_sol_types::SolType>::tokenize(
-            &batch.inner,
-        );
+        <ProofSystemBatchPerVerificationEntriesSol as alloy_sol_types::SolType>::tokenize(&batch);
     let canonical_arguments = alloy_sol_types::abi::encode_sequence(&(batch_token,));
     if post_batch_calldata.get(4..) != Some(canonical_arguments.as_slice()) {
         return Err(PostBatchDecodeError::NonCanonical);
@@ -168,11 +166,10 @@ fn validate_public_input_structure(
     expected_rollup_id: NonZeroU64,
     expected_proof_system: Address,
 ) -> Result<(), PublicInputError> {
-    let inner = &batch.inner;
-    let [proof_system] = inner.proofSystems.as_slice() else {
+    let [proof_system] = batch.proofSystems.as_slice() else {
         return Err(invalid_structure(format!(
             "expected exactly one proof system, got {}",
-            inner.proofSystems.len()
+            batch.proofSystems.len()
         )));
     };
     if *proof_system != expected_proof_system {
@@ -180,10 +177,10 @@ fn validate_public_input_structure(
             "proof system address {proof_system} does not match expected proof system {expected_proof_system}"
         )));
     }
-    let [rollup_assignment] = inner.rollupIdsWithProofSystems.as_slice() else {
+    let [rollup_assignment] = batch.rollupIdsWithProofSystems.as_slice() else {
         return Err(invalid_structure(format!(
             "expected exactly one rollup assignment, got {}",
-            inner.rollupIdsWithProofSystems.len()
+            batch.rollupIdsWithProofSystems.len()
         )));
     };
     let expected_rollup = U256::from(expected_rollup_id.get());
@@ -198,14 +195,14 @@ fn validate_public_input_structure(
             "rollup assignment proof-system indices must be exactly [0]",
         ));
     }
-    if inner.crossProofSystemInteractions != B256::ZERO {
+    if batch.crossProofSystemInteractions != B256::ZERO {
         return Err(invalid_structure(
             "crossProofSystemInteractions must be zero in the single-proof-system profile",
         ));
     }
 
     let is_expected_rollup = |rollup_id: &U256| *rollup_id == expected_rollup;
-    for (entry_index, entry) in inner.entries.iter().enumerate() {
+    for (entry_index, entry) in batch.entries.iter().enumerate() {
         if !is_expected_rollup(&entry.destinationRollupId) {
             return Err(invalid_structure(format!(
                 "entry {entry_index} destination rollup {} does not match expected rollup id {expected_rollup_id}",
@@ -213,7 +210,7 @@ fn validate_public_input_structure(
             )));
         }
     }
-    for (lookup_index, lookup) in inner.l1ToL2lookupCalls.iter().enumerate() {
+    for (lookup_index, lookup) in batch.l1ToL2lookupCalls.iter().enumerate() {
         if !is_expected_rollup(&lookup.destinationRollupId) {
             return Err(invalid_structure(format!(
                 "lookup {lookup_index} destination rollup {} does not match expected rollup id {expected_rollup_id}",
@@ -222,16 +219,16 @@ fn validate_public_input_structure(
         }
     }
 
-    if inner.blockNumber != 0 {
+    if batch.blockNumber != 0 {
         return Err(invalid_structure(format!(
             "blockNumber must be zero, got {}",
-            inner.blockNumber
+            batch.blockNumber
         )));
     }
-    if !inner.blobIndices.is_empty() {
+    if !batch.blobIndices.is_empty() {
         return Err(invalid_structure(format!(
             "blobIndices must be empty, got {}",
-            inner.blobIndices.len()
+            batch.blobIndices.len()
         )));
     }
     // No pin for the remaining fields: transient counts (L1 scheduling

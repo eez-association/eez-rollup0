@@ -373,31 +373,31 @@ fn da_payload_binds_inbound_sidecars_and_complete_reconstructed_transactions() {
 fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     let mut batch = effect_batch(&[B256::ZERO; 3], &[ClaimedEntryShape::Outbound]);
     let value = U256::from(7);
-    batch.inner.entries[1].l2ToL1Calls[0].value = value;
-    batch.inner.entries[1].stateDeltas[0].etherDelta = -I256::try_from(value).unwrap();
+    batch.entries[1].l2ToL1Calls[0].value = value;
+    batch.entries[1].stateDeltas[0].etherDelta = -I256::try_from(value).unwrap();
     let mut settling = settling_with_outbound_pairs(1);
     settling
         .outbound_event_candidates_mut_for_test()
         .push(observed_outbound_call(
             1,
             0,
-            &batch.inner.entries[1].l2ToL1Calls[0],
+            &batch.entries[1].l2ToL1Calls[0],
         ));
     let plan = effect_plan(&batch, &settling);
     let outbound = authorize_outbound_effects(&plan).unwrap();
-    let mut sidecar = batch.inner.entries[1].clone();
+    let mut sidecar = batch.entries[1].clone();
     sidecar.stateDeltas.clear();
 
     let (_, mut user_payload) = block_and_payload_transactions(vec![user_transaction(7)]);
     let user = user_payload.pop().unwrap();
-    let pairs = eez_evm::system_tx::build_cross_chain_sync_pairs(
+    let pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
         &[(sidecar.clone(), Bytes::from(user.clone()))],
         &[],
         &system_transaction_context(),
         11,
     )
     .unwrap();
-    let raw_transactions = eez_evm::system_tx::interleave_sync_block_txs(&pairs);
+    let raw_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
     let transactions = raw_transactions
         .iter()
         .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
@@ -451,10 +451,8 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
 
     // Composer DA carries the pre-settlement projection, not the batch entry
     // after its state delta has been attached.
-    let with_state_delta = encode_da_payload(
-        &[vec![user.clone()]],
-        &[batch.inner.entries[1].abi_encode()],
-    );
+    let with_state_delta =
+        encode_da_payload(&[vec![user.clone()]], &[batch.entries[1].abi_encode()]);
     assert_eq!(
         verify(&with_state_delta, [(41, settling_rlp.as_slice())]),
         Err(DaPayloadError::L2EntryMismatch {
@@ -478,14 +476,14 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
 
     let mut noncanonical_context = system_transaction_context();
     noncanonical_context.l2_gas_limit += 1;
-    let wrong_pairs = eez_evm::system_tx::build_cross_chain_sync_pairs(
+    let wrong_pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
         &[(sidecar.clone(), Bytes::from(user))],
         &[],
         &noncanonical_context,
         11,
     )
     .unwrap();
-    let wrong_transactions = eez_evm::system_tx::interleave_sync_block_txs(&wrong_pairs)
+    let wrong_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&wrong_pairs)
         .into_iter()
         .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
         .collect::<Vec<_>>();
@@ -504,19 +502,18 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
         &[B256::ZERO; 4],
         &[ClaimedEntryShape::Outbound, ClaimedEntryShape::Outbound],
     );
-    batch.inner.entries[2].l2ToL1Calls[0].data = Bytes::from_static(&[0x02]);
-    batch.inner.entries[2].returnData = Bytes::from_static(&[0xca, 0xfe]);
-    batch.inner.entries[2].rollingHash =
+    batch.entries[2].l2ToL1Calls[0].data = Bytes::from_static(&[0x02]);
+    batch.entries[2].returnData = Bytes::from_static(&[0xca, 0xfe]);
+    batch.entries[2].rollingHash =
         b256!("db02b0059bb85889526354ec94d73be8588724a34c54f401645973b5e525fa96");
     let mut settling = settling_with_outbound_pairs(2);
     *settling.outbound_event_candidates_mut_for_test() = vec![
-        observed_outbound_call(1, 0, &batch.inner.entries[1].l2ToL1Calls[0]),
-        observed_outbound_call(3, 0, &batch.inner.entries[2].l2ToL1Calls[0]),
+        observed_outbound_call(1, 0, &batch.entries[1].l2ToL1Calls[0]),
+        observed_outbound_call(3, 0, &batch.entries[2].l2ToL1Calls[0]),
     ];
     let plan = effect_plan(&batch, &settling);
     let outbound = authorize_outbound_effects(&plan).unwrap();
     let sidecars = batch
-        .inner
         .entries
         .iter()
         .skip(1)
@@ -532,14 +529,14 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
         .cloned()
         .zip(users.iter().cloned().map(Bytes::from))
         .collect::<Vec<_>>();
-    let pairs = eez_evm::system_tx::build_cross_chain_sync_pairs(
+    let pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
         &outbound_inputs,
         &[],
         &system_transaction_context(),
         11,
     )
     .unwrap();
-    let raw_transactions = eez_evm::system_tx::interleave_sync_block_txs(&pairs);
+    let raw_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
     let first_load: TransactionSigned =
         alloy_rlp::decode_exact(raw_transactions[0].as_ref()).unwrap();
     let second_load: TransactionSigned =
@@ -585,14 +582,14 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
 
     let mut noncanonical_context = system_transaction_context();
     noncanonical_context.l2_gas_limit += 1;
-    let wrong_pairs = eez_evm::system_tx::build_cross_chain_sync_pairs(
+    let wrong_pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
         &outbound_inputs,
         &[],
         &noncanonical_context,
         11,
     )
     .unwrap();
-    let wrong_transactions = eez_evm::system_tx::interleave_sync_block_txs(&wrong_pairs);
+    let wrong_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&wrong_pairs);
     let mut mutated_second_load = raw_transactions;
     mutated_second_load[2] = wrong_transactions[2].clone();
     let wrong_block = block_rlp(
@@ -624,22 +621,21 @@ fn da_payload_binds_the_complete_mixed_sync_sequence_and_sidecar_order() {
         .inspection
         .as_ref()
         .unwrap();
-    batch.inner.entries[2].proxyEntryHash = inbound_observation.recomputed_call_hash;
-    batch.inner.entries[2].returnData = inbound_observation.return_data.clone();
-    batch.inner.entries[2].stateDeltas[0].etherDelta =
-        I256::try_from(inbound_observation.value).unwrap();
+    batch.entries[2].proxyEntryHash = inbound_observation.recomputed_call_hash;
+    batch.entries[2].returnData = inbound_observation.return_data.clone();
+    batch.entries[2].stateDeltas[0].etherDelta = I256::try_from(inbound_observation.value).unwrap();
     settling
         .outbound_event_candidates_mut_for_test()
         .push(observed_outbound_call(
             1,
             0,
-            &batch.inner.entries[1].l2ToL1Calls[0],
+            &batch.entries[1].l2ToL1Calls[0],
         ));
 
     let plan = effect_plan(&batch, &settling);
     let outbound = authorize_outbound_effects(&plan).unwrap();
     let inbound = verify_inbound_effect_entries(&plan).unwrap();
-    let mut outbound_sidecar = batch.inner.entries[1].clone();
+    let mut outbound_sidecar = batch.entries[1].clone();
     outbound_sidecar.stateDeltas.clear();
     let inbound_sidecar = settling.inbound_candidates()[0]
         .inspection
@@ -650,14 +646,14 @@ fn da_payload_binds_the_complete_mixed_sync_sequence_and_sidecar_order() {
         .clone();
     let (_, mut user_payload) = block_and_payload_transactions(vec![user_transaction(7)]);
     let user = user_payload.pop().unwrap();
-    let pairs = eez_evm::system_tx::build_cross_chain_sync_pairs(
+    let pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
         &[(outbound_sidecar.clone(), Bytes::from(user.clone()))],
         std::slice::from_ref(&inbound_sidecar),
         &system_transaction_context(),
         11,
     )
     .unwrap();
-    let raw_transactions = eez_evm::system_tx::interleave_sync_block_txs(&pairs);
+    let raw_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
     let transactions = raw_transactions
         .iter()
         .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())

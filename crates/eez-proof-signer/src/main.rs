@@ -65,7 +65,7 @@ async fn main() -> eyre::Result<()> {
         expected_proof_system = %config.attester.expected_proof_system(),
         proof_system_vkey = %config.attester.proof_system_vkey(),
         l2_chain_id = validator.chain_id(),
-        system_address = %eez_evm::SYSTEM_ADDRESS,
+        system_address = %eez_protocol::SYSTEM_ADDRESS,
         profile = "anchor_single_call_outbound_then_inbound",
         "serving Prove — waiting for composer windows",
     );

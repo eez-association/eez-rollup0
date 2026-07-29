@@ -3,10 +3,10 @@ use std::num::NonZeroU64;
 use alloy_consensus::{Header, SignableTransaction as _, TxLegacy};
 use alloy_primitives::{Address, B256, Bytes, I256, Log, Signature, TxKind, U256, b256};
 use alloy_sol_types::SolEvent as _;
-use eez_evm::EvmBatch;
-use eez_evm::types::{ExecutionEntrySol, StateDeltaSol};
-use reth_ethereum_primitives_stateless::TransactionSigned;
-use reth_primitives_traits_stateless::SignerRecoverable as _;
+use eez_protocol::EvmBatch;
+use eez_protocol::abi::{ExecutionEntrySol, StateDeltaSol};
+use reth_ethereum_primitives::TransactionSigned;
+use reth_primitives_traits::SignerRecoverable as _;
 
 use super::*;
 use crate::settlement::{
@@ -17,24 +17,23 @@ use crate::testkit::SYSTEM_TX;
 use crate::validate::ValidatedBlock;
 
 fn fixture_chain_config() -> ChainConfig {
-    let genesis: serde_json::Value = serde_json::from_str(include_str!(concat!(
+    serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../genesis.json"
+        "/tests/fixtures/stateless-block-13/chain-config.json"
     )))
-    .unwrap();
-    serde_json::from_value(genesis["config"].clone()).unwrap()
+    .unwrap()
 }
 
 fn fixture_input() -> AdmittedBlock {
     let rlp = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../eez-proverd/tests/fixtures/block-13.rlp"
+        "/tests/fixtures/stateless-block-13/block-13.rlp"
     ))
     .to_vec();
     let block = alloy_rlp::decode_exact::<Block>(&rlp).unwrap();
     let witness = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../eez-proverd/tests/fixtures/witness-13.json"
+        "/tests/fixtures/stateless-block-13/witness-13.json"
     )))
     .unwrap();
     AdmittedBlock {
@@ -324,9 +323,9 @@ fn checkpoint_plan_is_derived_from_recovered_transactions() {
     let recovered = RecoveredBlock::new_unhashed(
         block,
         vec![
-            eez_evm::SYSTEM_ADDRESS,
+            eez_protocol::SYSTEM_ADDRESS,
             Address::ZERO,
-            eez_evm::SYSTEM_ADDRESS,
+            eez_protocol::SYSTEM_ADDRESS,
         ],
     );
 
@@ -342,7 +341,7 @@ fn recovered_sender_facts_follow_the_homestead_signature_rule() {
     assert!(transaction.recover_signer().is_err());
     assert_eq!(
         transaction.recover_signer_unchecked().unwrap(),
-        eez_evm::SYSTEM_ADDRESS
+        eez_protocol::SYSTEM_ADDRESS
     );
     let header = Header {
         number: 7,
@@ -478,9 +477,9 @@ fn real_checkpoints_bind_successful_inbound_effects() {
         ]
     );
 
-    let mut batch = EvmBatch::empty();
+    let mut batch = EvmBatch::default();
     let mut previous = window_pre_state_root;
-    batch.inner.entries.push(checkpoint_entry(
+    batch.entries.push(checkpoint_entry(
         window_pre_state_root,
         previous,
         B256::ZERO,
@@ -488,7 +487,7 @@ fn real_checkpoints_bind_successful_inbound_effects() {
         I256::ZERO,
     ));
     for (checkpoint, observation) in expected_checkpoints.iter().zip(observations) {
-        batch.inner.entries.push(checkpoint_entry(
+        batch.entries.push(checkpoint_entry(
             previous,
             checkpoint.state_root,
             observation.recomputed_call_hash,

@@ -84,7 +84,11 @@ struct Args {
     )]
     attestation_key: SecretKeyArg,
 
-    /// Private secp256k1 key for `eez_evm::SYSTEM_ADDRESS`, used to reconstruct
+    /// Expected attester address configured in the deployed proof system.
+    #[arg(long = "attester-address", env = "EEZ_ATTESTER_ADDRESS")]
+    expected_attester_address: Address,
+
+    /// Private secp256k1 key for `eez_protocol::SYSTEM_ADDRESS`, used to reconstruct
     /// system transactions omitted from Sync-block DA.
     #[arg(
         long = "l2-system-key",
@@ -174,6 +178,10 @@ impl Config {
             args.expected_proof_system,
         )
         .map_err(eyre::Report::new)?;
+        eyre::ensure!(
+            attester.address() == args.expected_attester_address,
+            "attestation key does not match the expected attester address"
+        );
         let system_transaction_key =
             SystemTransactionKey::new(args.system_transaction_key.into_key("L2 system")?)
                 .map_err(eyre::Report::new)?;

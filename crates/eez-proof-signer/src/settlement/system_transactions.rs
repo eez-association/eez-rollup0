@@ -9,8 +9,8 @@ use std::num::NonZeroU64;
 
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_signer_local::PrivateKeySigner;
-use eez_evm::SYSTEM_ADDRESS;
-use eez_evm::types::ExecutionEntrySol;
+use eez_protocol::SYSTEM_ADDRESS;
+use eez_protocol::abi::ExecutionEntrySol;
 use thiserror::Error;
 
 use crate::EEZL2_ADDRESS;
@@ -69,7 +69,7 @@ impl SystemTransactionKey {
         expected_rollup_id: NonZeroU64,
     ) -> SystemTransactionReconstructor {
         SystemTransactionReconstructor {
-            context: eez_evm::system_tx::SystemTxContext {
+            context: eez_protocol::system_tx::SystemTxContext {
                 system_signer: self.0,
                 ccm_l2_address: EEZL2_ADDRESS,
                 l2_chain_id,
@@ -88,7 +88,7 @@ impl SystemTransactionKey {
 /// address is a deployment invariant and is not checked here.
 pub(crate) struct SystemTransactionReconstructor {
     /// Startup-checked operator and fixed protocol reconstruction parameters.
-    context: eez_evm::system_tx::SystemTxContext,
+    context: eez_protocol::system_tx::SystemTxContext,
 }
 
 impl SystemTransactionReconstructor {
@@ -98,8 +98,8 @@ impl SystemTransactionReconstructor {
         outbound: &[(ExecutionEntrySol, Bytes)],
         inbound: &[ExecutionEntrySol],
         starting_nonce: u64,
-    ) -> Result<Vec<eez_evm::system_tx::SyncPair>, String> {
-        eez_evm::system_tx::build_cross_chain_sync_pairs(
+    ) -> Result<Vec<eez_protocol::system_tx::SyncPair>, String> {
+        eez_protocol::system_tx::build_cross_chain_sync_pairs(
             outbound,
             inbound,
             &self.context,

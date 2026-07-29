@@ -3,48 +3,41 @@ name                   = "eez-proof-signer"
 version.workspace      = true
 edition.workspace      = true
 license.workspace      = true
-# The pinned Stateless/Reth validation graph requires Rust 1.93.
-rust-version = "1.93"
+rust-version.workspace = true
 description            = "EEZ attestation daemon: re-executes composer-streamed windows, binds supported settlement effects fail-closed, and signs the independently recomputed public-input hash."
 
 [dependencies]
 # The `prove.v1` wire this daemon serves.
 eez-control-rpc.workspace = true
 # Canonical `postAndVerifyBatch` ABI types and codec.
-eez-evm.workspace = true
+eez-protocol.workspace = true
 
-# Reth v2.3's block-access-list types require the Alloy 2.1 family. Without
-# this lower-bound correction Cargo can legally retain Alloy EIPs 2.0 and
-# produce incompatible EIP-7928 types inside upstream Stateless.
-alloy-consensus = { version = "=2.1.0", default-features = false }
-alloy-genesis = "=2.1.0"
+alloy-consensus.workspace = true
+alloy-genesis.workspace = true
 alloy-primitives = { workspace = true, features = ["k256"] }
-alloy-rlp.workspace        = true
-alloy-rpc-types-debug = { version = "=2.1.0", default-features = false }
+alloy-rlp.workspace = true
+alloy-rpc-types-debug.workspace = true
 # The canonical signer type `SystemTxContext` stores; parsing the L2 system
 # key directly into it avoids a second secret representation.
 alloy-signer-local.workspace = true
-alloy-sol-types.workspace   = true
+alloy-sol-types.workspace = true
 
-# Pin the EEZ Stateless fork to the immutable commit that exposes explicit
-# pre/post roots and sparse transaction checkpoints. Its public API exposes
-# Reth v2.3 types, so keep that graph explicitly named and contained inside
-# `validate::stateless` instead of mixing it with the workspace's node-side
-# Reth revision.
-reth-chainspec-stateless = { package = "reth-chainspec", git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
-reth-ethereum-primitives-stateless = { package = "reth-ethereum-primitives", git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
-reth-evm-ethereum-stateless = { package = "reth-evm-ethereum", git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0" }
-reth-primitives-traits-stateless = { package = "reth-primitives-traits", version = "0.4.1", default-features = false }
-stateless-reth = { package = "stateless", git = "https://github.com/eez-association/stateless", rev = "c933ad1dac5d9b55bb87e7e10454e2094bfacec1" }
+reth-chainspec.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-evm-ethereum.workspace = true
+reth-primitives-traits.workspace = true
+# The EEZ fork exposes the roots and transaction checkpoints consumed by the
+# validator while sharing the workspace's Reth revision.
+stateless-reth.workspace = true
 
-clap                         = { workspace = true, features = ["env"] }
-eyre.workspace               = true
-prost.workspace              = true
-serde_json.workspace         = true
-thiserror.workspace          = true
-tokio.workspace              = true
-tonic.workspace              = true
-tracing.workspace  = true
+clap = { workspace = true, features = ["env"] }
+eyre.workspace = true
+prost.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]

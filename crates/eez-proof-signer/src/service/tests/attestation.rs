@@ -127,7 +127,7 @@ async fn mismatched_intermediate_transaction_da_payload_is_rejected() {
         block_chunk(6, 0x05, 0x06),
     ];
     let mut batch = anchor_batch();
-    batch.inner.callData = da_payload_for_window(&payload_source).into();
+    batch.callData = da_payload_for_window(&payload_source).into();
     replace_post_batch(&mut window, public_input_post_batch_for(batch));
 
     let status = server.prove(window).await;
@@ -144,8 +144,8 @@ async fn transient_counts_do_not_affect_rpc_admission() {
     ))])))
     .await;
     let mut batch = anchor_batch();
-    batch.inner.transientExecutionEntryCount = U256::MAX;
-    batch.inner.transientLookupCallCount = U256::MAX;
+    batch.transientExecutionEntryCount = U256::MAX;
+    batch.transientLookupCallCount = U256::MAX;
     let mut window = happy_window();
     replace_post_batch(
         &mut window,
@@ -161,7 +161,7 @@ async fn an_empty_batch_is_rejected_by_the_state_delta_chain_gate() {
     let mut window = happy_window();
     replace_post_batch(
         &mut window,
-        public_input_post_batch_for(eez_evm::EvmBatch::empty()),
+        public_input_post_batch_for(eez_protocol::EvmBatch::default()),
     );
 
     let status = server.prove(window).await;
@@ -174,7 +174,7 @@ async fn an_empty_batch_is_rejected_by_the_state_delta_chain_gate() {
 async fn a_noncanonical_anchor_is_rejected_by_the_effect_prefix_gate() {
     let server = TestServer::new(one_accepting_validator()).await;
     let mut batch = anchor_batch();
-    batch.inner.entries[0].callCount = U256::from(1);
+    batch.entries[0].callCount = U256::from(1);
     let mut window = happy_window();
     replace_post_batch(&mut window, public_input_post_batch_for(batch));
 
@@ -188,7 +188,7 @@ async fn a_noncanonical_anchor_is_rejected_by_the_effect_prefix_gate() {
 async fn a_nonzero_anchor_ether_delta_is_rejected() {
     let server = TestServer::new(one_accepting_validator()).await;
     let mut batch = anchor_batch();
-    batch.inner.entries[0].stateDeltas[0].etherDelta = I256::ONE;
+    batch.entries[0].stateDeltas[0].etherDelta = I256::ONE;
     let mut window = happy_window();
     replace_post_batch(&mut window, public_input_post_batch_for(batch));
 
@@ -202,8 +202,8 @@ async fn a_nonzero_anchor_ether_delta_is_rejected() {
 async fn a_second_anchor_is_rejected_by_the_effect_prefix_gate() {
     let server = TestServer::new(one_accepting_validator()).await;
     let mut batch = anchor_batch();
-    let second_anchor = batch.inner.entries[0].clone();
-    batch.inner.entries.push(second_anchor);
+    let second_anchor = batch.entries[0].clone();
+    batch.entries.push(second_anchor);
     let mut window = happy_window();
     replace_post_batch(&mut window, public_input_post_batch_for(batch));
 
@@ -305,7 +305,7 @@ async fn a_state_delta_rollup_mismatch_is_rejected() {
     let inner = one_accepting_validator();
     let server = TestServer::new(Arc::clone(&inner)).await;
     let mut batch = anchor_batch();
-    batch.inner.entries[0].stateDeltas[0].rollupId = U256::from(2);
+    batch.entries[0].stateDeltas[0].rollupId = U256::from(2);
     let mut window = happy_window();
     replace_post_batch(&mut window, public_input_post_batch_for(batch));
 
@@ -340,8 +340,8 @@ async fn distinct_reexecuted_roots_are_attested_when_the_anchor_matches() {
     backend_output.blocks.last_mut().unwrap().post_state_root = final_root;
     let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output)]))).await;
     let mut batch = anchor_batch();
-    batch.inner.entries[0].stateDeltas[0].currentState = parent;
-    batch.inner.entries[0].stateDeltas[0].newState = final_root;
+    batch.entries[0].stateDeltas[0].currentState = parent;
+    batch.entries[0].stateDeltas[0].newState = final_root;
     let mut window = happy_window();
     replace_post_batch(
         &mut window,
@@ -501,7 +501,7 @@ async fn a_nonempty_inbound_lookup_carrier_is_rejected() {
     ))])))
     .await;
     let mut batch = anchor_batch();
-    batch.inner.l1ToL2lookupCalls.push(lookup_call());
+    batch.l1ToL2lookupCalls.push(lookup_call());
     let mut window = happy_window();
     replace_post_batch(&mut window, public_input_post_batch_for(batch));
 
@@ -518,7 +518,7 @@ async fn invalid_public_input_structure_is_failed_precondition_after_validation(
     ))]));
     let server = TestServer::new(Arc::clone(&inner)).await;
     let mut batch = anchor_batch();
-    batch.inner.proofSystems.clear();
+    batch.proofSystems.clear();
     let mut window = happy_window();
     replace_post_batch(&mut window, public_input_post_batch_for(batch));
 
@@ -534,7 +534,7 @@ async fn a_batch_for_a_different_proof_system_is_rejected() {
     let inner = one_accepting_validator();
     let server = TestServer::new(Arc::clone(&inner)).await;
     let mut batch = anchor_batch();
-    batch.inner.proofSystems[0] = address!("00000000000000000000000000000000000000bb");
+    batch.proofSystems[0] = address!("00000000000000000000000000000000000000bb");
     let mut window = happy_window();
     replace_post_batch(
         &mut window,
@@ -579,7 +579,7 @@ async fn malformed_or_trailing_da_payload_is_an_invalid_argument() {
 
     for payload in [vec![0x00], trailing] {
         let mut batch = anchor_batch();
-        batch.inner.callData = payload.into();
+        batch.callData = payload.into();
         let mut window = happy_window();
         replace_post_batch(&mut window, public_input_post_batch_for(batch));
 
