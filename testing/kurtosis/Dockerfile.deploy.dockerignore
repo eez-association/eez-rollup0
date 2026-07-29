@@ -1,0 +1,13 @@
+.git/
+target/
+chiado-db/
+data/
+datadir/
+crates/
+prompts/
+explanations/
+*.bak
+*.log
+.env
+.env.*
+contracts/broadcast/

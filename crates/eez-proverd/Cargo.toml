@@ -10,7 +10,6 @@ description            = "Composer-controlled prover server: one Prove RPC — s
 # Prove wire (server side).
 eez-control-rpc.workspace = true
 # Gates + publicInputsHash recompute + EcdsaProofSigner.
-eez-evm.workspace         = true
 # RollupId for the inbound-outcome cross-chain hash binding.
 eez-protocol.workspace    = true
 

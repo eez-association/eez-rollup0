@@ -14,7 +14,7 @@ use std::{
 
 use alloy_primitives::{Address, B256, U256, address, hex};
 use alloy_provider::{Provider, ProviderBuilder};
-use alloy_rpc_types_eth::{BlockNumHash, BlockNumberOrTag, TransactionRequest};
+use alloy_rpc_types_eth::{BlockNumHash, BlockNumberOrTag, TransactionReceipt, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent, SolValue, sol};
 use anyhow::{Context, Result, anyhow, bail};
@@ -371,7 +371,6 @@ impl Harness {
             ("EEZ_L1_POSTER_KEY", opts.poster_key.to_string()),
             ("EEZ_L1_CHAIN_ID", "31337".to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
-            ("EEZ_L2_SYSTEM_ADDRESS", format!("{ANVIL_ADDR:#x}")),
             ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
             (
                 "EEZ_CCM_L2_ADDRESS",
@@ -1017,6 +1016,16 @@ impl NodeHandle {
             .filter(|line| patterns.iter().any(|p| line.contains(p)))
             .count())
     }
+
+    /// Count log lines containing every supplied substring.
+    pub fn log_count_matching_all(&self, patterns: &[&str]) -> Result<usize> {
+        let contents = std::fs::read_to_string(&self.log_path)
+            .with_context(|| format!("read log {}", self.log_path.display()))?;
+        Ok(contents
+            .lines()
+            .filter(|line| patterns.iter().all(|p| line.contains(p)))
+            .count())
+    }
 }
 
 impl Drop for NodeHandle {
@@ -1458,7 +1467,7 @@ pub fn override_env(
     env
 }
 
-// ─── Cross-chain devnet harness (embedded dev L1 as anchor) ───
+// Cross-chain test fixture.
 
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_network::TxSignerSync;
@@ -1498,22 +1507,16 @@ sol! {
     }
 }
 
-/// L2 fixture genesis re-stamped to `ts` so the sequencer doesn't read a stale
-/// genesis as late. Timestamp is a header field, so `initialState` is unchanged.
+/// Write the L2 fixture genesis with a current timestamp.
 fn write_l2_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
     write_fixture_genesis(ts, None, "l2-genesis.json")
 }
 
-/// L1 genesis for the embedded dev L1: the fixture genesis (all forks at 0,
-/// prefunded hardhat accounts) with the chain id overridden to [`DEV_CHAIN_ID`].
-/// reth's built-in dev.json carries no `config`, so serializing it would yield
-/// a forkless chain that can't mine EIP-1559 deploy txs — the fixture avoids that.
+/// Write the L1 fixture genesis with the dev chain ID.
 fn write_l1_dev_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
     write_fixture_genesis(ts, Some(DEV_CHAIN_ID), "l1-genesis.json")
 }
 
-/// Read the fixture genesis, re-stamp `ts`, optionally override the chain id,
-/// and write it to a fresh tempdir.
 fn write_fixture_genesis(
     ts: u64,
     chain_id: Option<u64>,
@@ -1560,9 +1563,7 @@ pub async fn sign_and_send(
         chain_id,
         nonce,
         gas_limit,
-        // Generous fee cap so txs stay includable as the composer's batches push
-        // base fee up; the 1 gwei priority stays below the composer's postBatch
-        // tip, so postBatch still orders ahead of user txs within an L1 block.
+        // Keep transactions includable while postBatch retains priority.
         max_fee_per_gas: 100_000_000_000,
         max_priority_fee_per_gas: 1_000_000_000,
         to: to.map_or(
@@ -1585,6 +1586,23 @@ pub async fn pending_nonce(rpc_url: &str, key: &str) -> Result<u64> {
     let addr = signer_of(key)?.address();
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     Ok(provider.get_transaction_count(addr).await?)
+}
+
+async fn wait_for_successful_receipt(
+    rpc_url: &str,
+    hash: alloy_primitives::TxHash,
+    action: &str,
+) -> Result<TransactionReceipt> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let receipt = wait_for(Duration::from_secs(60), || {
+        let provider = provider.clone();
+        async move { Ok(provider.get_transaction_receipt(hash).await?) }
+    })
+    .await?;
+    if !receipt.status() {
+        bail!("{action} reverted");
+    }
+    Ok(receipt)
 }
 
 async fn deploy_raw(
@@ -1618,15 +1636,8 @@ async fn deploy_raw(
         6_000_000,
     )
     .await?;
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let receipt = wait_for(Duration::from_secs(60), || {
-        let provider = provider.clone();
-        async move { Ok(provider.get_transaction_receipt(hash).await?) }
-    })
-    .await?;
-    if !receipt.status() {
-        bail!("deploy of {} reverted", artifact_path.display());
-    }
+    let action = format!("deploy of {}", artifact_path.display());
+    let receipt = wait_for_successful_receipt(rpc_url, hash, &action).await?;
     receipt
         .contract_address
         .ok_or_else(|| anyhow!("no contract_address for {}", artifact_path.display()))
@@ -1684,7 +1695,6 @@ pub async fn deploy_protocol_dev(
     )
     .await?;
 
-    // registerRollup — a CALL, locally signed.
     let calldata = IEEZ::registerRollupCall {
         rollupContract: rollup_manager_address,
         initialState: initial_state,
@@ -1702,14 +1712,7 @@ pub async fn deploy_protocol_dev(
         1_000_000,
     )
     .await?;
-    let receipt = wait_for(Duration::from_secs(60), || {
-        let provider = provider.clone();
-        async move { Ok(provider.get_transaction_receipt(hash).await?) }
-    })
-    .await?;
-    if !receipt.status() {
-        bail!("registerRollup reverted");
-    }
+    wait_for_successful_receipt(l1_rpc, hash, "registerRollup").await?;
     let registry = IEEZ::new(eez_address, &provider);
     let rollup_id: u64 = registry.rollupCounter().call().await?.try_into()?;
 
@@ -1722,28 +1725,12 @@ pub async fn deploy_protocol_dev(
     })
 }
 
-/// Deploy `Value(initial)` on L2.
-pub async fn deploy_value_l2(l2_rpc: &str, key: &str, initial: U256) -> Result<Address> {
-    let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
-    let l2_chain_id = provider.get_chain_id().await?;
+async fn deploy_value(rpc_url: &str, key: &str, chain_id: u64, initial: U256) -> Result<Address> {
     let out = repo_root().join("contracts/out");
     deploy_raw(
-        l2_rpc,
+        rpc_url,
         key,
-        l2_chain_id,
-        &out.join("Value.sol/Value.json"),
-        initial.abi_encode(),
-    )
-    .await
-}
-
-/// Deploy `Value(initial)` on the embedded dev L1.
-pub async fn deploy_value_l1(l1_rpc: &str, key: &str, initial: U256) -> Result<Address> {
-    let out = repo_root().join("contracts/out");
-    deploy_raw(
-        l1_rpc,
-        key,
-        DEV_CHAIN_ID,
+        chain_id,
         &out.join("Value.sol/Value.json"),
         initial.abi_encode(),
     )
@@ -1822,22 +1809,11 @@ pub async fn create_l2_cross_chain_proxy(
         1_500_000,
     )
     .await?;
-    let receipt = wait_for(Duration::from_secs(60), || {
-        let provider = provider.clone();
-        async move { Ok(provider.get_transaction_receipt(hash).await?) }
-    })
-    .await?;
-    if !receipt.status() {
-        bail!("create L2 cross-chain proxy reverted");
-    }
+    wait_for_successful_receipt(l2_rpc, hash, "create L2 cross-chain proxy").await?;
     Ok(proxy)
 }
 
-/// Call `EEZ.createCrossChainProxy` on the L1 and return the deployed proxy
-/// address read from the `CrossChainProxyCreated` event. (We read it rather
-/// than predict it: the CREATE2 init code uses `type(CrossChainProxy).creationCode`
-/// embedded in EEZ, whose trailing solc metadata differs from the standalone
-/// artifact — so an off-chain prediction from the artifact wouldn't match.)
+/// Create an inbound proxy and read its address from the emitted event.
 pub async fn create_cross_chain_proxy(
     l1_rpc: &str,
     key: &str,
@@ -1862,15 +1838,7 @@ pub async fn create_cross_chain_proxy(
         2_000_000,
     )
     .await?;
-    let provider = ProviderBuilder::new().connect_http(l1_rpc.parse()?);
-    let receipt = wait_for(Duration::from_secs(60), || {
-        let provider = provider.clone();
-        async move { Ok(provider.get_transaction_receipt(hash).await?) }
-    })
-    .await?;
-    if !receipt.status() {
-        bail!("createCrossChainProxy reverted");
-    }
+    let receipt = wait_for_successful_receipt(l1_rpc, hash, "createCrossChainProxy").await?;
     receipt
         .inner
         .logs()
@@ -1901,8 +1869,8 @@ pub async fn receipt_ok(rpc_url: &str, hash: alloy_primitives::TxHash) -> Result
         .map(|r| r.status()))
 }
 
-/// Precomputed config for the embedded-dev-L1 devnet.
-pub struct DevnetCfg {
+/// Cross-chain test node configuration.
+pub struct CrossChainConfig {
     pub l1_http_port: u16,
     pub l1_auth_port: u16,
     pub l1_p2p_port: u16,
@@ -1913,16 +1881,14 @@ pub struct DevnetCfg {
     pub rollup_manager_address: Address,
     pub rollup_id: u64,
     pub initial_state: B256,
-    /// Deploys contracts and signs proofs. Must differ from `poster_key` so
-    /// composer batch txs never bump the deployer nonce (which would break
-    /// deterministic `CREATE(deployer, 0/1/2)` address prediction).
+    /// Kept separate from the poster key for deterministic CREATE addresses.
     pub deployer_key: &'static str,
     pub poster_key: &'static str,
     pub l1_genesis: (PathBuf, tempfile::TempDir),
     pub l2_genesis: (PathBuf, tempfile::TempDir),
 }
 
-impl DevnetCfg {
+impl CrossChainConfig {
     pub fn new() -> Result<Self> {
         let deployer_key = ANVIL_KEY_1;
         let poster_key = ANVIL_KEY;
@@ -1933,7 +1899,7 @@ impl DevnetCfg {
         let rollup_manager_address = deployer.create(2);
         let initial_state = reorg_genesis_state_root()?;
         let ts = now_unix_secs();
-        // Avoid http and ws (= http + 1) ports.
+        // Avoid the HTTP and adjacent WS ports.
         let l1_http_port = free_port();
         let mut l1_auth_port = free_port();
         while l1_auth_port == l1_http_port || l1_auth_port == l1_http_port.saturating_add(1) {
@@ -1961,20 +1927,16 @@ impl DevnetCfg {
         format!("http://127.0.0.1:{}", self.l1_http_port)
     }
 
-    /// L1 cross-chain front: a transparent proxy in front of the embedded L1
-    /// RPC that intercepts `eth_sendRawTransaction` and holds the tx for the
-    /// next Sync slot instead of forwarding it to the L1 mempool. Inbound
-    /// (L1→L2) cross-chain ops must be submitted here, not to `l1_rpc_url()`.
+    /// L1→L2 transaction ingress.
     pub fn l1_xchain_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.l1_xchain_port)
     }
 
-    /// L2 cross-chain front for outbound L2→L1 transactions.
+    /// L2→L1 transaction ingress.
     pub fn l2_xchain_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.l2_xchain_port)
     }
 
-    /// Environment for the embedded-L1 composer test node.
     pub fn env(&self) -> Vec<(&'static str, String)> {
         vec![
             ("EEZ_L1_EMBEDDED", "1".to_string()),
@@ -1992,12 +1954,10 @@ impl DevnetCfg {
                 self.l1_genesis.0.to_string_lossy().into_owned(),
             ),
             ("EEZ_L1_POSTER_KEY", self.poster_key.to_string()),
-            // MockECDSA is constructed with the deployer address as the authorized signer.
+            // MockECDSA authorizes the deployer.
             ("EEZ_PROOF_SIGNER_KEY", self.deployer_key.to_string()),
-            ("EEZ_L2_SYSTEM_ADDRESS", format!("{ANVIL_ADDR:#x}")),
             ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
             ("EEZ_CCM_L2_ADDRESS", format!("{CCM_L2_ADDRESS:#x}")),
-            // K = 5: L1 5s, L2 1s.
             ("EEZ_L1_BLOCK_TIME_MS", "5000".to_string()),
             ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
             ("EEZ_PROOF_TIME_MS", "1000".to_string()),
@@ -2019,7 +1979,6 @@ impl DevnetCfg {
                 "EEZ_L2_DATADIR",
                 "/tmp/unused-overridden-by-flag".to_string(),
             ),
-            // INFO on our crates so bundle events are visible for assertions.
             (
                 "RUST_LOG",
                 std::env::var("EEZ_TEST_LOG")
@@ -2031,4 +1990,162 @@ impl DevnetCfg {
             ),
         ]
     }
+}
+
+pub const SETUP_TIMEOUT: Duration = Duration::from_secs(90);
+pub const SETTLE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Separate deployer keeps CREATE addresses deterministic.
+pub const TARGET_DEPLOYER: &str = ANVIL_KEY_3;
+pub const INBOUND_USER: &str = ANVIL_KEY_2;
+pub const OUTBOUND_USER: &str = ANVIL_KEY_4;
+/// Valid key without genesis funding.
+pub const UNFUNDED_KEY: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+/// Shared cross-chain integration fixture.
+pub struct CrossChainWorld {
+    pub node: NodeHandle,
+    pub cfg: CrossChainConfig,
+    pub dep: Deployment,
+    pub l2_chain_id: u64,
+    pub value_l2: Address,
+    pub inbound_no_ret: Address,
+    pub outbound_value: Address,
+    pub outbound_no_ret: Address,
+    pub recipient: Address,
+    pub withdrawal_recipient: Address,
+    pub setter_proxy: Address,
+    pub deposit_proxy: Address,
+    pub inbound_no_ret_proxy: Address,
+    pub inbound_wrapper: Address,
+    pub outbound_proxy: Address,
+    pub outbound_no_ret_proxy: Address,
+    pub withdrawal_proxy: Address,
+    pub outbound_wrapper: Address,
+    _datadir: tempfile::TempDir,
+}
+
+impl CrossChainWorld {
+    pub fn l1_rpc(&self) -> String {
+        self.cfg.l1_rpc_url()
+    }
+    pub fn l1_xchain(&self) -> String {
+        self.cfg.l1_xchain_url()
+    }
+    pub fn l2_xchain(&self) -> String {
+        self.cfg.l2_xchain_url()
+    }
+    pub fn l2_rpc(&self) -> String {
+        self.node.l2_rpc_url()
+    }
+}
+
+/// Start the shared cross-chain fixture.
+pub async fn setup_cross_chain() -> Result<CrossChainWorld> {
+    setup_cross_chain_with_env(&[]).await
+}
+
+/// Start the fixture with additional node environment variables.
+pub async fn setup_cross_chain_with_env(
+    extra_env: &[(&'static str, String)],
+) -> Result<CrossChainWorld> {
+    let cfg = CrossChainConfig::new()?;
+    let datadir = tempfile::tempdir()?;
+    let mut env = cfg.env();
+    env.extend_from_slice(extra_env);
+    let node = NodeHandle::spawn(datadir.path(), &env)?;
+    let l1_rpc = cfg.l1_rpc_url();
+    let l2_rpc = node.l2_rpc_url();
+
+    let recipient: Address = address!("0x2222222222222222222222222222222222222222");
+    let withdrawal_recipient: Address = address!("0x3333333333333333333333333333333333333333");
+
+    wait_for_l2_rpc(&l1_rpc, SETUP_TIMEOUT).await?;
+    let dep = deploy_protocol_dev(&l1_rpc, cfg.deployer_key, cfg.initial_state).await?;
+    if dep.eez_address != cfg.eez_address {
+        bail!("EEZ address not deterministic");
+    }
+    if dep.rollup_id != cfg.rollup_id {
+        bail!(
+            "unexpected rollup id: deployed {}, expected {}",
+            dep.rollup_id,
+            cfg.rollup_id
+        );
+    }
+
+    wait_for_l2_rpc(&l2_rpc, SETUP_TIMEOUT).await?;
+    let l2_chain_id = ProviderBuilder::new()
+        .connect_http(l2_rpc.parse()?)
+        .get_chain_id()
+        .await?;
+
+    let value_l2 = deploy_value(&l2_rpc, TARGET_DEPLOYER, l2_chain_id, U256::from(5u64)).await?;
+    let expected_value = signer_address(TARGET_DEPLOYER)?.create(0);
+    if value_l2 != expected_value {
+        bail!("Value address not deterministic");
+    }
+    let inbound_no_ret =
+        deploy_value_no_ret(&l2_rpc, TARGET_DEPLOYER, l2_chain_id, U256::from(5u64)).await?;
+    let outbound_value =
+        deploy_value(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID, U256::from(5u64)).await?;
+    let outbound_no_ret =
+        deploy_value_no_ret(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID, U256::from(5u64)).await?;
+
+    let setter_proxy = create_cross_chain_proxy(
+        &l1_rpc,
+        cfg.deployer_key,
+        cfg.eez_address,
+        value_l2,
+        cfg.rollup_id,
+    )
+    .await?;
+    let deposit_proxy = create_cross_chain_proxy(
+        &l1_rpc,
+        cfg.deployer_key,
+        cfg.eez_address,
+        recipient,
+        cfg.rollup_id,
+    )
+    .await?;
+    let inbound_no_ret_proxy = create_cross_chain_proxy(
+        &l1_rpc,
+        cfg.deployer_key,
+        cfg.eez_address,
+        inbound_no_ret,
+        cfg.rollup_id,
+    )
+    .await?;
+    let inbound_wrapper =
+        deploy_setter_wrapper(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID, setter_proxy).await?;
+
+    let outbound_proxy =
+        create_l2_cross_chain_proxy(&l2_rpc, TARGET_DEPLOYER, outbound_value, 0).await?;
+    let outbound_no_ret_proxy =
+        create_l2_cross_chain_proxy(&l2_rpc, TARGET_DEPLOYER, outbound_no_ret, 0).await?;
+    let withdrawal_proxy =
+        create_l2_cross_chain_proxy(&l2_rpc, TARGET_DEPLOYER, withdrawal_recipient, 0).await?;
+    let outbound_wrapper =
+        deploy_setter_wrapper(&l2_rpc, TARGET_DEPLOYER, l2_chain_id, outbound_proxy).await?;
+
+    Ok(CrossChainWorld {
+        node,
+        cfg,
+        dep,
+        l2_chain_id,
+        value_l2,
+        inbound_no_ret,
+        outbound_value,
+        outbound_no_ret,
+        recipient,
+        withdrawal_recipient,
+        setter_proxy,
+        deposit_proxy,
+        inbound_no_ret_proxy,
+        inbound_wrapper,
+        outbound_proxy,
+        outbound_no_ret_proxy,
+        withdrawal_proxy,
+        outbound_wrapper,
+        _datadir: datadir,
+    })
 }

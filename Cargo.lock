@@ -3087,6 +3087,7 @@ name = "eez-composer"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-contract",
  "alloy-eips 2.0.5",
  "alloy-network",
  "alloy-primitives",
@@ -3096,7 +3097,6 @@ dependencies = [
  "alloy-sol-types",
  "async-trait",
  "eez-driver",
- "eez-evm",
  "eez-evm-inspector",
  "eez-l1",
  "eez-payload-codec",
@@ -3139,9 +3139,9 @@ dependencies = [
  "alloy-rpc-types-engine",
  "alloy-sol-types",
  "eez-driver",
- "eez-evm",
  "eez-l1",
  "eez-payload-codec",
+ "eez-protocol",
  "reth-chainspec 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-ethereum-engine-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-ethereum-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
@@ -3167,6 +3167,7 @@ dependencies = [
  "alloy-rpc-types-debug",
  "alloy-rpc-types-engine",
  "async-trait",
+ "eez-l1",
  "eez-prover",
  "eyre",
  "reth-chainspec 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
@@ -3185,43 +3186,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "eez-evm"
-version = "0.1.0"
-dependencies = [
- "alloy-consensus",
- "alloy-contract",
- "alloy-eips 2.0.5",
- "alloy-network",
- "alloy-primitives",
- "alloy-provider",
- "alloy-rpc-client",
- "alloy-signer-local",
- "alloy-sol-types",
- "alloy-transport-http",
- "async-trait",
- "eez-payload-codec",
- "eez-protocol",
- "k256",
- "reth-ethereum-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-primitives-traits",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "eez-evm-inspector"
 version = "0.1.0"
 dependencies = [
- "alloy-network",
  "alloy-primitives",
- "alloy-provider",
- "alloy-rpc-types-eth",
  "alloy-sol-types",
  "async-trait",
- "eez-evm",
  "eez-protocol",
  "revm",
  "thiserror 2.0.18",
@@ -3241,10 +3211,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "alloy-transport",
- "async-trait",
- "eez-driver",
- "eez-evm",
- "eez-payload-codec",
+ "eez-protocol",
  "fail",
  "reqwest 0.12.28",
  "serde_json",
@@ -3276,7 +3243,6 @@ dependencies = [
  "eez-composer",
  "eez-deriver",
  "eez-driver",
- "eez-evm",
  "eez-evm-inspector",
  "eez-l1",
  "eez-protocol",
@@ -3335,8 +3301,18 @@ dependencies = [
 name = "eez-protocol"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.5",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-signer-local",
+ "alloy-sol-types",
  "async-trait",
+ "eez-payload-codec",
  "hex",
+ "k256",
+ "reth-ethereum-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-primitives-traits",
  "serde",
  "serde_json",
  "sha3 0.10.9",
@@ -3354,7 +3330,7 @@ dependencies = [
  "alloy-signer",
  "alloy-signer-local",
  "async-trait",
- "eez-evm",
+ "eez-protocol",
  "futures-util",
  "thiserror 2.0.18",
  "tokio",
@@ -3370,7 +3346,7 @@ dependencies = [
  "alloy-sol-types",
  "async-trait",
  "eez-control-rpc",
- "eez-evm",
+ "eez-protocol",
  "eez-prover",
  "tokio",
  "tokio-stream",
@@ -3387,7 +3363,6 @@ dependencies = [
  "alloy-rlp",
  "clap",
  "eez-control-rpc",
- "eez-evm",
  "eez-protocol",
  "eyre",
  "hex",

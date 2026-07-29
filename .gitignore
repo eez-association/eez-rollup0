@@ -20,3 +20,6 @@ infra/kurtosis/args.yaml
 
 data/
 chiado-*/
+
+# CI diagnostics.
+artifacts/

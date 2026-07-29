@@ -1,32 +1,38 @@
 //! [`L1HeadStream`]: adapter that converts the [`L1Watcher`]'s
-//! `broadcast::Receiver<L1Event>` into an [`L1HeadSource`] for the
-//! L1-anchored scheduler in `eez-driver`.
+//! `broadcast::Receiver<L1Event>` into the head feed the
+//! L1-anchored scheduler in `eez-driver` polls.
 //!
 //! Filters [`L1Event::NewHead`] from the broadcast; other variants
 //! (`Reorg` / `BatchPosted` / `Finalized`) are consumed but ignored —
 //! the Composer / Deriver subscribe to those events through their own
 //! receivers.
 
-use async_trait::async_trait;
-use eez_driver::{L1HeadInfo, L1HeadSource};
 use tokio::sync::broadcast;
 use tracing::{Level, event};
 
 use crate::l1_watcher::{L1Event, L1Watcher};
 
+/// Minimal L1 head info the L1-anchored spawner needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct L1HeadInfo {
+    pub block_number: u64,
+    pub block_hash: [u8; 32],
+    pub timestamp: u64,
+}
+
 /// Adapter wrapping a [`broadcast::Receiver<L1Event>`] and exposing
-/// it as an [`L1HeadSource`].
+/// canonical L1 heads via [`next_head`](Self::next_head).
 ///
 /// Construct via [`Self::from_watcher`]; pass into
-/// [`eez_driver::spawn_l1_anchored`].
+/// `eez_driver::spawn_l1_anchored`.
 #[derive(Debug)]
 pub struct L1HeadStream {
     rx: broadcast::Receiver<L1Event>,
 }
 
 impl L1HeadStream {
-    /// Subscribe to the watcher's broadcast and wrap as an
-    /// `L1HeadSource`. Each `L1HeadStream` instance gets its own
+    /// Subscribe to the watcher's broadcast. Each `L1HeadStream`
+    /// instance gets its own
     /// receiver — passing the same `L1Watcher` to multiple constructors
     /// gives independent streams.
     #[must_use]
@@ -35,11 +41,17 @@ impl L1HeadStream {
             rx: watcher.subscribe(),
         }
     }
-}
 
-#[async_trait]
-impl L1HeadSource for L1HeadStream {
-    async fn next_head(&mut self) -> Option<L1HeadInfo> {
+    /// `next_head` returns `None` when the source closes (broadcast lagged
+    /// past tolerance, `L1Watcher` task died, etc) — the spawner exits
+    /// cleanly so the surrounding `spawn_critical_task` notices.
+    ///
+    /// `next_head` is cancel-safe: `spawn_l1_anchored` polls it
+    /// inside a `tokio::select!` alongside its Live ticker, so the future
+    /// is dropped and re-created whenever another branch wins. The
+    /// cancel-safety comes via `broadcast::Receiver::recv`
+    /// (no event is consumed by a cancelled call).
+    pub async fn next_head(&mut self) -> Option<L1HeadInfo> {
         loop {
             match self.rx.recv().await {
                 Ok(L1Event::NewHead {
