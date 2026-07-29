@@ -4,7 +4,7 @@
 //! [`ChainClient`]. Role-specific operations (`simulate_source_tx` for
 //! the entry rollup, `stored_target_state_root` for the committed-root
 //! host) have default implementations that refuse with
-//! [`ExecutorErrorKind::Unavailable`], so a misregistered client fails
+//! [`ExecutorError::Unavailable`], so a misregistered client fails
 //! loudly at the first role-specific call. Nested cross-chain
 //! dispatch goes through the borrowed
 //! [`CompositionBuilder`].
@@ -17,12 +17,12 @@
 use alloy_primitives::{Address, Bytes, U256};
 
 use crate::composition::CompositionBuilder;
-use crate::error::ExecutorResult;
 #[allow(
     unused_imports,
-    reason = "ExecutorError / its Kind enum used in rustdoc intra-doc links"
+    reason = "ExecutorError used in rustdoc intra-doc links"
 )]
-use crate::error::{ExecutorError, ExecutorErrorKind};
+use crate::error::ExecutorError;
+use crate::error::ExecutorResult;
 use crate::rollup_id::RollupId;
 use crate::types::ExecutionOutcome;
 
@@ -70,10 +70,10 @@ pub trait TargetExecutionSession: Send {
     /// # Errors
     ///
     /// Returns any [`ExecutorError`] depending on the impl — local
-    /// impls surface [`ExecutorErrorKind::Evm`] /
-    /// [`ExecutorErrorKind::Provider`]; the gRPC impl surfaces
-    /// [`ExecutorErrorKind::Transport`] / [`ExecutorErrorKind::Serde`] /
-    /// [`ExecutorErrorKind::Missing`].
+    /// impls surface [`ExecutorError::Evm`] /
+    /// [`ExecutorError::Provider`]; the gRPC impl surfaces
+    /// [`ExecutorError::Transport`] / [`ExecutorError::Serde`] /
+    /// [`ExecutorError::Missing`].
     fn execute(
         &mut self,
         req: ExecutionRequest,
@@ -100,8 +100,8 @@ pub trait TargetExecutionSession: Send {
     ///
     /// Implementation-dependent — `LocalChainClient` is infallible
     /// (deep-clones revm `State<DB>`'s 7 fields); the gRPC impl can
-    /// surface [`ExecutorErrorKind::Transport`] /
-    /// [`ExecutorErrorKind::Missing`].
+    /// surface [`ExecutorError::Transport`] /
+    /// [`ExecutorError::Missing`].
     fn checkpoint(&mut self) -> ExecutorResult<SessionSnapshot>;
 
     /// Restore the session to the state captured by `snapshot`. The
@@ -110,7 +110,7 @@ pub trait TargetExecutionSession: Send {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Decode`] if the snapshot's
+    /// Returns [`ExecutorError::Decode`] if the snapshot's
     /// concrete type does not match this session's snapshot shape.
     fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()>;
 }
@@ -126,7 +126,7 @@ pub type SessionSnapshot = Box<dyn std::any::Any + Send>;
 ///
 /// `Composer` talks to every rollup through this trait. Role-specific
 /// methods (`simulate_source_tx`, `stored_target_state_root`) default
-/// to a loud [`ExecutorErrorKind::Unavailable`] refusal.
+/// to a loud [`ExecutorError::Unavailable`] refusal.
 ///
 /// Stored as `Arc<dyn ChainClient + Send + Sync>` in the composer's
 /// rollup map.
@@ -140,8 +140,8 @@ pub trait ChainClient: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Provider`] if the underlying state
-    /// provider is inaccessible; [`ExecutorErrorKind::Unavailable`] when
+    /// Returns [`ExecutorError::Provider`] if the underlying state
+    /// provider is inaccessible; [`ExecutorError::Unavailable`] when
     /// the implementation does not (or cannot) report its own header
     /// (e.g. a remote gRPC peer that does not expose this).
     fn current_state_root(&self) -> ExecutorResult<[u8; 32]>;
@@ -153,15 +153,15 @@ pub trait ChainClient: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns any [`ExecutorError`] depending on impl — local surfaces
-    /// [`ExecutorErrorKind::Provider`] / [`ExecutorErrorKind::Evm`] /
-    /// [`ExecutorErrorKind::Missing`]; gRPC surfaces
-    /// [`ExecutorErrorKind::Transport`].
+    /// [`ExecutorError::Provider`] / [`ExecutorError::Evm`] /
+    /// [`ExecutorError::Missing`]; gRPC surfaces
+    /// [`ExecutorError::Transport`].
     fn begin_execution_session(&self) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>>;
 
     /// Simulate a source-chain transaction, dispatching every detected
     /// cross-chain proxy call through `dispatcher`. Entry-role clients
     /// only; the default refuses with
-    /// [`ExecutorErrorKind::Unavailable`] so follower registrations
+    /// [`ExecutorError::Unavailable`] so follower registrations
     /// fail loudly if they ever reach source simulation.
     ///
     /// Takes `raw_tx: Vec<u8>` (owned) so the impl can decode without
@@ -169,9 +169,9 @@ pub trait ChainClient: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Decode`] if the raw tx cannot be
-    /// decoded. Returns [`ExecutorErrorKind::Provider`] if the source
-    /// state provider is inaccessible. Returns [`ExecutorErrorKind::Evm`]
+    /// Returns [`ExecutorError::Decode`] if the raw tx cannot be
+    /// decoded. Returns [`ExecutorError::Provider`] if the source
+    /// state provider is inaccessible. Returns [`ExecutorError::Evm`]
     /// if source EVM execution fails. Propagates any [`ExecutorError`]
     /// surfaced by `dispatcher` during proxy call dispatch.
     fn simulate_source_tx(
@@ -180,9 +180,9 @@ pub trait ChainClient: Send + Sync + 'static {
         dispatcher: &mut CompositionBuilder,
     ) -> ExecutorResult<()> {
         let _ = (raw_tx, dispatcher);
-        Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
+        Err(ExecutorError::Unavailable(
             "simulate_source_tx: not an entry-role client".into(),
-        )))
+        ))
     }
 
     /// Read what the canonical committed-root storage currently has
@@ -190,18 +190,18 @@ pub trait ChainClient: Send + Sync + 'static {
     /// upstream-invariant-6 anchor `postAndVerifyBatch` enforces
     /// against each delta's `currentState`. Only clients connected to
     /// the chain hosting that storage implement this; the default
-    /// refuses with [`ExecutorErrorKind::Unavailable`].
+    /// refuses with [`ExecutorError::Unavailable`].
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Provider`] if the underlying state
-    /// provider is inaccessible; [`ExecutorErrorKind::Transport`] for
-    /// gRPC implementations; [`ExecutorErrorKind::Unavailable`] if the
+    /// Returns [`ExecutorError::Provider`] if the underlying state
+    /// provider is inaccessible; [`ExecutorError::Transport`] for
+    /// gRPC implementations; [`ExecutorError::Unavailable`] if the
     /// client does not host the committed-root storage.
     fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
         let _ = rollup_id;
-        Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
+        Err(ExecutorError::Unavailable(
             "stored_target_state_root: client does not host the committed-root storage".into(),
-        )))
+        ))
     }
 }

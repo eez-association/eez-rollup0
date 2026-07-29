@@ -30,8 +30,8 @@ use reth_storage_api::{BlockNumReader, HeaderProvider, StateProvider, StateProvi
 
 use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
 use eez_protocol::{
-    ChainClient, CompositionBuilder, ExecutorError, ExecutorErrorKind, ExecutorResult,
-    ProxyLookupConfig, RollupId, TargetExecutionSession,
+    ChainClient, CompositionBuilder, ExecutorError, ExecutorResult, ProxyLookupConfig, RollupId,
+    TargetExecutionSession,
 };
 
 use super::provider::{ChainProvider, HeaderReader};
@@ -228,7 +228,7 @@ impl LocalChainClient {
         let root_slot = eez_protocol::action::compute_state_root_slot(target_rollup_id);
         let value = state
             .storage(rollups_address, root_slot)
-            .map_err(ExecutorError::provider)?
+            .map_err(|e| ExecutorError::Provider(e.into()))?
             .unwrap_or(U256::ZERO);
         Ok(value.to_be_bytes::<32>())
     }
@@ -318,16 +318,14 @@ impl ChainClient for LocalChainClient {
             .provider
             .headers
             .best_block_number()
-            .map_err(ExecutorError::provider)?;
+            .map_err(ExecutorError::Provider)?;
         let header = self
             .provider
             .headers
             .header_by_number(num)
-            .map_err(ExecutorError::provider)?
+            .map_err(ExecutorError::Provider)?
             .ok_or_else(|| {
-                ExecutorError::from(ExecutorErrorKind::Missing(
-                    "header at latest block for current_state_root",
-                ))
+                ExecutorError::Missing("header at latest block for current_state_root")
             })?;
         Ok(header.state_root.0)
     }
@@ -347,9 +345,9 @@ impl ChainClient for LocalChainClient {
         // acquires a concrete `LocalChainClient` reference and calls
         // this method directly.
         let Role::Entry { .. } = &self.role else {
-            return Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
+            return Err(ExecutorError::Unavailable(
                 "simulate_source_tx called on follower LocalChainClient".into(),
-            )));
+            ));
         };
 
         let t_total = Instant::now();
@@ -358,10 +356,10 @@ impl ChainClient for LocalChainClient {
         let t_decode = Instant::now();
         let mut raw: &[u8] = &raw_tx;
         let tx = TransactionSigned::decode_2718(&mut raw)
-            .map_err(|e| ExecutorError::from(ExecutorErrorKind::Decode(e.to_string())))?;
+            .map_err(|e| ExecutorError::Decode(e.to_string()))?;
         let signer = tx
             .recover_signer()
-            .map_err(|e| ExecutorError::from(ExecutorErrorKind::Decode(e.to_string())))?;
+            .map_err(|e| ExecutorError::Decode(e.to_string()))?;
         let decode_us = t_decode.elapsed().as_micros();
 
         tracing::info!(
@@ -376,15 +374,13 @@ impl ChainClient for LocalChainClient {
             .provider
             .headers
             .best_block_number()
-            .map_err(ExecutorError::provider)?;
+            .map_err(ExecutorError::Provider)?;
         let header = self
             .provider
             .headers
             .header_by_number(latest_num)
-            .map_err(ExecutorError::provider)?
-            .ok_or_else(|| {
-                ExecutorError::from(ExecutorErrorKind::Missing("source header at latest block"))
-            })?;
+            .map_err(ExecutorError::Provider)?
+            .ok_or_else(|| ExecutorError::Missing("source header at latest block"))?;
         // Take ownership of the state provider so `State<DB>` is
         // `'static`. `StateProviderBox = Box<dyn StateProvider + Send
         // + 'static>` owns the provider, which keeps the resulting
@@ -394,7 +390,7 @@ impl ChainClient for LocalChainClient {
             .provider
             .provider
             .latest()
-            .map_err(ExecutorError::provider)?;
+            .map_err(|e| ExecutorError::Provider(e.into()))?;
         let db = StateProviderDatabase::new(evm_state);
         let mut state = State::builder().with_database(db).build();
         let state_us = t_state.elapsed().as_micros();
@@ -411,7 +407,7 @@ impl ChainClient for LocalChainClient {
             .provider
             .evm_config
             .evm_env(&header)
-            .map_err(ExecutorError::evm)?;
+            .map_err(|e| ExecutorError::Evm(e.into()))?;
         // Relax nonce check in source-sim. For L2-as-entry topologies
         // the user-tx's nonce is N+1 because `loadExecutionTable`
         // (also signed by the system address $PK on L2) lands first
@@ -520,11 +516,11 @@ impl ChainClient for LocalChainClient {
         // L1 `EEZ.sol` layout. L2-style clients return `Unavailable`
         // so a misregistered root_reader fails loudly at first dispatch.
         if self.dialect != eez_protocol::ChainDialect::EvmL1Style {
-            return Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
+            return Err(ExecutorError::Unavailable(
                 "stored_target_state_root called on a non-L1 LocalChainClient \
                  (only EvmL1Style clients hold canonical committed-root storage)"
                     .into(),
-            )));
+            ));
         }
         let dispatch_address = self.role.dispatch_address();
 
@@ -540,15 +536,13 @@ impl ChainClient for LocalChainClient {
                 .provider
                 .headers
                 .best_block_number()
-                .map_err(ExecutorError::provider)?;
+                .map_err(ExecutorError::Provider)?;
             let header = self
                 .provider
                 .headers
                 .header_by_number(num)
-                .map_err(ExecutorError::provider)?
-                .ok_or_else(|| {
-                    ExecutorError::from(ExecutorErrorKind::Missing("L1 header at latest block"))
-                })?;
+                .map_err(ExecutorError::Provider)?
+                .ok_or_else(|| ExecutorError::Missing("L1 header at latest block"))?;
             let root = header.state_root.0;
             tracing::debug!(
                 %rollup_id,
@@ -563,7 +557,7 @@ impl ChainClient for LocalChainClient {
             .provider
             .provider
             .latest()
-            .map_err(ExecutorError::provider)?;
+            .map_err(|e| ExecutorError::Provider(e.into()))?;
         let root =
             self.read_stored_target_state_root(state.as_ref(), dispatch_address, rollup_id)?;
         tracing::debug!(

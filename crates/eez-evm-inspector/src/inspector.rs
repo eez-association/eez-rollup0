@@ -629,9 +629,9 @@ where
                 .and_then(|c| c.pop_post_cache());
             if let (Some(before), Some(after)) = (before_snapshot.as_ref(), after_opt.as_ref()) {
                 if let Err(e) = crate::overlay::apply_overlay_diff(context, before, after) {
-                    self.record_error(ExecutorError::evm(format!(
-                        "overlay diff-apply failed: {e}"
-                    )));
+                    self.record_error(ExecutorError::Evm(
+                        format!("overlay diff-apply failed: {e}").into(),
+                    ));
                 }
             }
             if let Some(channel) = &self.overlay_channel {

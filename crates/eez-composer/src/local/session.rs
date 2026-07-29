@@ -20,8 +20,8 @@ use revm::DatabaseCommit;
 use revm::database::CacheState;
 
 use eez_protocol::{
-    CompositionBuilder, ExecutionOutcome, ExecutionRequest, ExecutorError, ExecutorErrorKind,
-    ExecutorResult, RollupId, TargetExecutionSession,
+    CompositionBuilder, ExecutionOutcome, ExecutionRequest, ExecutorError, ExecutorResult,
+    RollupId, TargetExecutionSession,
 };
 
 use super::provider::ChainProvider;
@@ -105,7 +105,7 @@ impl LocalExecutionSession {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Provider`] if reading the latest
+    /// Returns [`ExecutorError::Provider`] if reading the latest
     /// block number or header fails, or if opening the state provider
     /// fails.
     pub fn new(
@@ -118,14 +118,14 @@ impl LocalExecutionSession {
         let num = provider
             .provider
             .best_block_number()
-            .map_err(provider_err)?;
+            .map_err(|e| ExecutorError::Provider(e.into()))?;
         tracing::debug!(block = num, "target session: best block number");
 
         let header = provider
             .headers
             .header_by_number(num)
-            .map_err(provider_err)?
-            .ok_or_else(|| ExecutorError::from(ExecutorErrorKind::Missing("target header")))?;
+            .map_err(ExecutorError::Provider)?
+            .ok_or_else(|| ExecutorError::Missing("target header"))?;
         let current_root = header.state_root;
         tracing::debug!(
             block = num,
@@ -133,10 +133,19 @@ impl LocalExecutionSession {
             "target session: opened header"
         );
 
-        let state_prov = provider.provider.latest().map_err(provider_err)?;
-        let root_prov = provider.provider.latest().map_err(provider_err)?;
+        let state_prov = provider
+            .provider
+            .latest()
+            .map_err(|e| ExecutorError::Provider(e.into()))?;
+        let root_prov = provider
+            .provider
+            .latest()
+            .map_err(|e| ExecutorError::Provider(e.into()))?;
 
-        let mut evm_env = provider.evm_config.evm_env(&header).map_err(evm_err)?;
+        let mut evm_env = provider
+            .evm_config
+            .evm_env(&header)
+            .map_err(|e| ExecutorError::Evm(e.into()))?;
         let chain_id = evm_env.cfg_env.chain_id;
         disable_checks(&mut evm_env);
 
@@ -225,7 +234,9 @@ impl LocalExecutionSession {
             let mut evm = self
                 .evm_config
                 .evm_with_env(&mut self.state, self.evm_env.clone());
-            let result = evm.transact(tx_env).map_err(evm_err)?;
+            let result = evm
+                .transact(tx_env)
+                .map_err(|e| ExecutorError::Evm(e.into()))?;
             (
                 result.result.output().cloned().unwrap_or_default(),
                 result.result.tx_gas_used(),
@@ -273,7 +284,9 @@ impl LocalExecutionSession {
                 self.evm_env.clone(),
                 inspector,
             );
-            let result = evm.transact(tx_env).map_err(evm_err)?;
+            let result = evm
+                .transact(tx_env)
+                .map_err(|e| ExecutorError::Evm(e.into()))?;
             let inspector_error = evm.inspector_mut().take_error();
             (
                 result.result.output().cloned().unwrap_or_default(),
@@ -428,9 +441,9 @@ impl TargetExecutionSession for LocalExecutionSession {
 
     fn rollback(&mut self, snapshot: eez_protocol::SessionSnapshot) -> ExecutorResult<()> {
         let root: [u8; 32] = *snapshot.downcast::<[u8; 32]>().map_err(|_e| {
-            ExecutorError::from(ExecutorErrorKind::Encoding(
+            ExecutorError::Encoding(
                 "LocalExecutionSession::rollback: snapshot type mismatch".into(),
-            ))
+            )
         })?;
         self.current_root = revm::primitives::B256::from(root);
         Ok(())
@@ -482,15 +495,7 @@ pub(super) fn compute_state_root<DB: StateProvider>(
 ) -> ExecutorResult<B256> {
     state.merge_transitions(revm::database::states::bundle_state::BundleRetention::Reverts);
     let hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(state.bundle_state.state());
-    provider.state_root(hashed).map_err(provider_err)
-}
-
-pub(super) fn provider_err(
-    e: impl Into<Box<dyn std::error::Error + Send + Sync>>,
-) -> ExecutorError {
-    ExecutorError::provider(e)
-}
-
-pub(super) fn evm_err(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> ExecutorError {
-    ExecutorError::evm(e)
+    provider
+        .state_root(hashed)
+        .map_err(|e| ExecutorError::Provider(e.into()))
 }

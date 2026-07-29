@@ -289,19 +289,19 @@ pub const MAX_BUNDLE_ATTEMPTS: u32 = 3;
 /// `false` = TRANSIENT (chain unreachable / provider / transport /
 /// missing data), which a retry may clear → re-queue, don't evict.
 fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
-    use eez_protocol::{ComposerErrorKind, ExecutorErrorKind};
-    match err.kind() {
+    use eez_protocol::{ComposerError, ExecutorError};
+    match err {
         // Protocol failures = the composition itself is invalid
         // (EmptyCalls, broken chaining, unknown target, bad encoding) —
         // deterministic for this tx.
-        ComposerErrorKind::Protocol(_) => true,
+        ComposerError::Protocol(_) => true,
         // Executor failures: poison EXCEPT the clearly-transient ones.
-        ComposerErrorKind::Executor(ee) => !matches!(
-            ee.kind(),
-            ExecutorErrorKind::Unavailable(_)
-                | ExecutorErrorKind::Provider(_)
-                | ExecutorErrorKind::Transport(_)
-                | ExecutorErrorKind::Missing(_)
+        ComposerError::Executor(ee) => !matches!(
+            ee,
+            ExecutorError::Unavailable(_)
+                | ExecutorError::Provider(_)
+                | ExecutorError::Transport(_)
+                | ExecutorError::Missing(_)
         ),
         // Lifecycle / internal (misconfigured, lock poisoned, double
         // register) — not the tx's fault → retry, don't evict.

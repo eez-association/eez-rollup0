@@ -99,7 +99,7 @@ impl RollupTiming {
     ///
     /// # Errors
     ///
-    /// Returns [`DriverError::is_timing_config`] for any missing
+    /// Returns [`DriverError::TimingConfig`] for any missing
     /// required var, malformed value, or validation failure.
     pub fn from_env() -> DriverResult<Self> {
         let t = Self::new(
@@ -128,7 +128,7 @@ impl RollupTiming {
     ///
     /// # Errors
     ///
-    /// Returns [`DriverError::is_timing_config`] for any of:
+    /// Returns [`DriverError::TimingConfig`] for any of:
     /// - any zero field
     /// - `L2_block_time % 1000 != 0` — L2 block time must be whole
     ///   seconds. Block timestamps are unix integer-seconds and the
@@ -142,12 +142,13 @@ impl RollupTiming {
     ///   blocks before Sync)
     pub fn validate(&self) -> DriverResult<()> {
         if self.l1_block_time_ms == 0 || self.l2_block_time_ms == 0 || self.proof_time_ms == 0 {
-            return Err(DriverError::timing_config(
-                "all timing fields (l1_block_time, l2_block_time, proof_time) must be > 0",
+            return Err(DriverError::TimingConfig(
+                "all timing fields (l1_block_time, l2_block_time, proof_time) must be > 0"
+                    .to_string(),
             ));
         }
         if self.l2_block_time_ms % 1000 != 0 {
-            return Err(DriverError::timing_config(format!(
+            return Err(DriverError::TimingConfig(format!(
                 "L2 block time ({} ms) must be a whole number of seconds; \
                  unix block timestamps are integer-second and the sync-slot \
                  block-height arithmetic relies on it",
@@ -155,26 +156,26 @@ impl RollupTiming {
             )));
         }
         if self.l1_block_time_ms % self.l2_block_time_ms != 0 {
-            return Err(DriverError::timing_config(format!(
+            return Err(DriverError::TimingConfig(format!(
                 "L1 block time ({} ms) must be an integer multiple of L2 block time ({} ms); K must be integer",
                 self.l1_block_time_ms, self.l2_block_time_ms,
             )));
         }
         let k = self.k();
         if k < 2 {
-            return Err(DriverError::timing_config(format!(
+            return Err(DriverError::TimingConfig(format!(
                 "K must be >= 2 (got {k}); Sync slot must be distinct from surrounding Live blocks"
             )));
         }
         if self.proof_time_ms.saturating_add(self.submission_slack_ms) >= self.l1_block_time_ms {
-            return Err(DriverError::timing_config(format!(
+            return Err(DriverError::TimingConfig(format!(
                 "proof_time ({} ms) + submission_slack ({} ms) must be < L1 block time ({} ms)",
                 self.proof_time_ms, self.submission_slack_ms, self.l1_block_time_ms,
             )));
         }
         let max_budget = (k - 1) * self.l2_block_time_ms;
         if self.proof_time_ms.saturating_add(self.submission_slack_ms) > max_budget {
-            return Err(DriverError::timing_config(format!(
+            return Err(DriverError::TimingConfig(format!(
                 "proof_time ({} ms) + submission_slack ({} ms) must be <= (K-1) * L2 block time ({} * {} = {} ms); else there is no room for Future blocks before Sync",
                 self.proof_time_ms,
                 self.submission_slack_ms,
@@ -339,18 +340,18 @@ pub enum SlotComposition {
 
 fn parse_env(name: &str) -> DriverResult<u32> {
     let raw =
-        env::var(name).map_err(|_| DriverError::timing_config(format!("{name} is required")))?;
+        env::var(name).map_err(|_| DriverError::TimingConfig(format!("{name} is required")))?;
     raw.parse::<u32>()
-        .map_err(|e: ParseIntError| DriverError::timing_config(format!("{name}: {e}")))
+        .map_err(|e: ParseIntError| DriverError::TimingConfig(format!("{name}: {e}")))
 }
 
 fn parse_env_or(name: &str, default: u32) -> DriverResult<u32> {
     match env::var(name) {
         Ok(v) => v
             .parse::<u32>()
-            .map_err(|e: ParseIntError| DriverError::timing_config(format!("{name}: {e}"))),
+            .map_err(|e: ParseIntError| DriverError::TimingConfig(format!("{name}: {e}"))),
         Err(env::VarError::NotPresent) => Ok(default),
-        Err(env::VarError::NotUnicode(_)) => Err(DriverError::timing_config(format!(
+        Err(env::VarError::NotUnicode(_)) => Err(DriverError::TimingConfig(format!(
             "{name} contains non-UTF-8 bytes"
         ))),
     }

@@ -74,9 +74,7 @@ use std::sync::Arc;
 
 use crate::batch::EvmBatch;
 use crate::entries;
-use crate::error::{
-    CompositionResult, ExecutorError, ExecutorErrorKind, ExecutorResult, ProtocolErrorKind,
-};
+use crate::error::{CompositionResult, ExecutorError, ExecutorResult, ProtocolError};
 use crate::executor::{ChainClient, ExecutionRequest, TargetExecutionSession};
 use crate::rollup_id::RollupId;
 use crate::types::{
@@ -363,9 +361,9 @@ impl CompositionBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`ProtocolErrorKind::EmptyCalls`] on empty inputs,
-    /// [`ProtocolErrorKind::UnknownTarget`] for a recorded rollup not
-    /// in the plan set, [`ProtocolErrorKind::InvalidCheckpoint`] if
+    /// Returns [`ProtocolError::EmptyCalls`] on empty inputs,
+    /// [`ProtocolError::UnknownTarget`] for a recorded rollup not
+    /// in the plan set, [`ProtocolError::InvalidCheckpoint`] if
     /// per-rollup state-delta chaining fails in `build_batch`.
     /// Surfaces any [`ExecutorError`] from root attribution.
     // Large Err variant is the pre-existing error shape (previously
@@ -377,12 +375,12 @@ impl CompositionBuilder {
         tracing::debug!(name: "composer.finalize.start", "composition finalize started");
 
         if self.recorded.is_empty() || self.rollups.is_empty() {
-            return Err(ProtocolErrorKind::EmptyCalls.into());
+            return Err(ProtocolError::EmptyCalls.into());
         }
 
         for call in &self.recorded {
             if !self.rollups.contains_key(&call.target_rollup_id) {
-                return Err(ProtocolErrorKind::UnknownTarget {
+                return Err(ProtocolError::UnknownTarget {
                     got: call.target_rollup_id,
                 }
                 .into());
@@ -538,7 +536,7 @@ impl CompositionBuilder {
                             .rev()
                             .find(|r| r.target_rollup_id == *rollup_id)
                             .and_then(|r| r.outcome.post_state_root().copied())
-                            .ok_or_else(|| ProtocolErrorKind::InvalidCheckpoint {
+                            .ok_or_else(|| ProtocolError::InvalidCheckpoint {
                                 reason: format!(
                                     "inbound target {rollup_id} has no resolved \
                                      post_state_root (close_call did not run?)"
@@ -630,12 +628,12 @@ impl CompositionBuilder {
     ///
     /// Enforces a same-chain re-entry guard:
     /// `target_rollup_id == source_rollup_id && target_rollup_id != entry_rollup_id`
-    /// returns [`ExecutorErrorKind::InvalidReentry`].
+    /// returns [`ExecutorError::InvalidReentry`].
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::InvalidReentry`] for same-chain
-    /// non-entry self-dispatch. Returns [`ExecutorErrorKind::Unavailable`]
+    /// Returns [`ExecutorError::InvalidReentry`] for same-chain
+    /// non-entry self-dispatch. Returns [`ExecutorError::Unavailable`]
     /// if no rollup is registered under `target_rollup_id`. Propagates any
     /// executor error from the target session's `execute`.
     #[tracing::instrument(
@@ -662,10 +660,10 @@ impl CompositionBuilder {
         // contract during normal source simulation) is legitimate
         // and falls through.
         if target_rollup_id == source_rollup_id && target_rollup_id != self.entry_rollup_id {
-            return Err(ExecutorError::from(ExecutorErrorKind::InvalidReentry {
+            return Err(ExecutorError::InvalidReentry {
                 caller: source_rollup_id,
                 target: target_rollup_id,
-            }));
+            });
         }
 
         // Phase 1 — open: lazy-open the session, snapshot it, push
@@ -728,24 +726,24 @@ impl CompositionBuilder {
         req: &ExecutionRequest,
     ) -> ExecutorResult<usize> {
         if target_rollup_id == source_rollup_id && target_rollup_id != self.entry_rollup_id {
-            return Err(ExecutorError::from(ExecutorErrorKind::InvalidReentry {
+            return Err(ExecutorError::InvalidReentry {
                 caller: source_rollup_id,
                 target: target_rollup_id,
-            }));
+            });
         }
         // Cyclic nesting (entry→A→B→A): A's session is checked out by the
         // outer frame, so a lazy-open here would mint a DUPLICATE whose
         // writes the outer put-back drops. Refuse loudly (depth>1 is
         // unbuilt; this turns a silent state loss into an error).
         if self.checked_out.contains(&target_rollup_id) {
-            return Err(ExecutorError::from(ExecutorErrorKind::InvalidReentry {
+            return Err(ExecutorError::InvalidReentry {
                 caller: source_rollup_id,
                 target: target_rollup_id,
-            }));
+            });
         }
         if !self.rollups.contains_key(&target_rollup_id) {
-            return Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
-                format!("no rollup registered for {target_rollup_id}"),
+            return Err(ExecutorError::Unavailable(format!(
+                "no rollup registered for {target_rollup_id}"
             )));
         }
         // Lazy-open the target session and snapshot its current state
@@ -1113,7 +1111,7 @@ mod tests {
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
             .expect_err("cycle must be refused");
         assert!(
-            matches!(err.kind(), ExecutorErrorKind::InvalidReentry { .. }),
+            matches!(err, ExecutorError::InvalidReentry { .. }),
             "got: {err}"
         );
         // The outer session was put back despite the inner error.
@@ -1130,7 +1128,7 @@ mod tests {
         let err = builder
             .dispatch_call(RollupId(99), RollupId(0), make_request(99))
             .expect_err("should fail");
-        assert!(matches!(err.kind(), ExecutorErrorKind::Unavailable(_)));
+        assert!(matches!(err, ExecutorError::Unavailable(_)));
     }
 
     #[tokio::test]
@@ -1140,9 +1138,9 @@ mod tests {
         let builder = CompositionBuilder::new(RollupId(0), rollups);
         let err = builder.finalize(&[]).expect_err("should fail");
         assert!(matches!(
-            err.kind(),
-            crate::error::CompositionErrorKind::Protocol(p)
-                if matches!(p.kind(), crate::error::ProtocolErrorKind::EmptyCalls)
+            err,
+            crate::error::CompositionError::Protocol(p)
+                if matches!(p, crate::error::ProtocolError::EmptyCalls)
         ));
     }
 
@@ -1214,11 +1212,11 @@ mod tests {
 
         let err = builder.finalize(&[]).expect_err("should fail");
         assert!(matches!(
-            err.kind(),
-            crate::error::CompositionErrorKind::Protocol(p)
+            err,
+            crate::error::CompositionError::Protocol(p)
                 if matches!(
-                    p.kind(),
-                    crate::error::ProtocolErrorKind::UnknownTarget { got: RollupId(99) }
+                    p,
+                    crate::error::ProtocolError::UnknownTarget { got: RollupId(99) }
                 )
         ));
     }
@@ -1343,9 +1341,9 @@ mod tests {
             .expect_err("L2 → L2 self-dispatch must be rejected");
         assert!(
             matches!(
-                err.kind(),
-                ExecutorErrorKind::InvalidReentry { caller, target }
-                    if *caller == RollupId(1) && *target == RollupId(1)
+                err,
+                ExecutorError::InvalidReentry { caller, target }
+                    if caller == RollupId(1) && target == RollupId(1)
             ),
             "expected InvalidReentry {{ caller: 1, target: 1 }}, got {err:?}",
         );

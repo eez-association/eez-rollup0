@@ -78,7 +78,7 @@ impl CallKind {
 ///
 /// # Errors
 ///
-/// Returns [`crate::ProtocolErrorKind::InvalidEncoding`]
+/// Returns [`crate::ProtocolError::InvalidEncoding`]
 /// if a call's outcome is `Pending` (composition lifecycle bug — every
 /// call should be resolved before entering finalize).
 #[tracing::instrument(level = "debug", name = "build_batch", skip_all, fields(source = %source_rollup_id), err)]
@@ -166,10 +166,9 @@ pub fn build_batch(
             // needs a depth-2 outbound try/catch path no harness exercises) — but
             // gated so a future trigger errors instead of silently corrupting.
             CallKind::NestedFailed => {
-                return Err(crate::ProtocolErrorKind::Unsupported(
+                return Err(crate::ProtocolError::Unsupported(
                     "nested failed cross-chain lookup: entry-scoped emission (5c51e02) not built",
-                )
-                .into());
+                ));
             }
         }
     }

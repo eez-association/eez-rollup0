@@ -1,44 +1,44 @@
 //! Error type returned by the deriver.
-//!
-//! Follows M-ERRORS-CANONICAL-STRUCTS: a single public [`DeriverError`]
-//! struct wrapping a private [`ErrorKind`] enum, with a captured
-//! [`Backtrace`]. Callers discriminate via `is_*` helper methods so
-//! adding a variant doesn't break the public API.
-
-use core::fmt;
 
 /// Convenience [`Result`] alias used throughout the crate.
 pub type DeriverResult<T> = Result<T, DeriverError>;
 
 /// Error returned by [`Deriver`](crate::Deriver) operations.
-pub struct DeriverError {
-    kind: ErrorKind,
-}
-
-#[derive(Debug)]
-pub(crate) enum ErrorKind {
+#[derive(Debug, thiserror::Error)]
+pub enum DeriverError {
     /// L2 provider lookup failed (e.g., reading a block at a given
     /// height to compare against an L1-derived batch).
+    #[error("L2 provider error: {0}")]
     L2Provider(String),
     /// `eez-payload-codec::decode` rejected an L1-posted batch's
     /// `call_data`. Usually indicates a contract that posted a payload
     /// in a version we don't speak.
-    Codec(eez_payload_codec::CodecError),
-    /// L1 catch-up scan failed. Callers can inspect nested typed L1 errors
-    /// through helper methods without deriver re-encoding their meaning.
+    #[error("payload codec error: {0}")]
+    Codec(#[from] eez_payload_codec::CodecError),
+    /// L1 catch-up scan failed. Callers can inspect nested typed L1
+    /// errors by matching on the wrapped [`eez_l1::L1Error`].
+    #[error("L1 catch-up scan error: {0}")]
     L1Scan(eez_l1::L1Error),
     /// `BlockCommitter` actor task is gone; the deriver can't push
     /// safe-head advances any further.
+    #[error("block committer actor task has exited")]
     CommitterClosed,
     /// `engine_forkchoiceUpdated` rejected the safe/finalized cursors
     /// the deriver tried to set. Usually means the L1-derived hashes
     /// don't match reth's canonical chain — a genuine divergence.
+    #[error("engine rejected safe/finalized FCU: {0}")]
     InvalidForkchoice(String),
     /// Local L2 chain diverged from an L1-confirmed batch — our block
     /// at `l2_block` has different content than the batch says it
     /// should. Real reorg/replay is a follow-up; today this halts the
     /// deriver loudly.
+    #[error(
+        "local L2 block {l2_block} diverged from L1-confirmed batch; \
+         the on-chain claimed newState doesn't match local STF output{}",
+        detail.as_ref().map(|d| format!(" ({d})")).unwrap_or_default()
+    )]
     LocalDiverged {
+        /// L2 block height at which the divergence was detected.
         l2_block: u64,
         /// Why the divergence was raised (gate failure, prefix mismatch,
         /// replay error). Surfaced in `Display` — silent failures are bugs.
@@ -46,112 +46,14 @@ pub(crate) enum ErrorKind {
     },
 }
 
-impl DeriverError {
-    pub(crate) fn l2_provider(err: impl fmt::Display) -> Self {
-        Self::new(ErrorKind::L2Provider(err.to_string()))
-    }
-
-    pub(crate) fn l1_scan(err: eez_l1::L1Error) -> Self {
-        Self::new(ErrorKind::L1Scan(err))
-    }
-
-    pub(crate) fn committer_closed() -> Self {
-        Self::new(ErrorKind::CommitterClosed)
-    }
-
-    pub(crate) fn invalid_forkchoice(detail: impl Into<String>) -> Self {
-        Self::new(ErrorKind::InvalidForkchoice(detail.into()))
-    }
-
-    pub(crate) fn local_diverged(l2_block: u64) -> Self {
-        Self::new(ErrorKind::LocalDiverged {
-            l2_block,
-            detail: None,
-        })
-    }
-
-    pub(crate) fn local_diverged_with_msg(l2_block: u64, msg: &str) -> Self {
-        Self::new(ErrorKind::LocalDiverged {
-            l2_block,
-            detail: Some(msg.to_string()),
-        })
-    }
-
-    fn new(kind: ErrorKind) -> Self {
-        Self { kind }
-    }
-
-    /// Returns true if L1 is missing data for an otherwise-observed
-    /// canonical item and the caller may retry after the source catches up.
-    #[must_use]
-    pub fn is_source_incomplete(&self) -> bool {
-        matches!(&self.kind, ErrorKind::L1Scan(err) if err.is_source_incomplete())
-    }
-
-    /// Returns true if the `BlockCommitter` actor task has exited.
-    #[must_use]
-    pub fn is_committer_closed(&self) -> bool {
-        matches!(self.kind, ErrorKind::CommitterClosed)
-    }
-
-    /// Returns true if reth rejected a safe / finalized FCU.
-    #[must_use]
-    pub fn is_invalid_forkchoice(&self) -> bool {
-        matches!(self.kind, ErrorKind::InvalidForkchoice(_))
-    }
-}
-
-impl From<eez_payload_codec::CodecError> for DeriverError {
-    fn from(err: eez_payload_codec::CodecError) -> Self {
-        Self::new(ErrorKind::Codec(err))
-    }
-}
-
 impl From<eez_driver::DriverError> for DeriverError {
     fn from(err: eez_driver::DriverError) -> Self {
-        if err.is_committer_closed() {
-            Self::committer_closed()
-        } else if err.is_invalid_forkchoice() {
-            Self::invalid_forkchoice(err.to_string())
-        } else {
-            Self::invalid_forkchoice(format!("driver: {err}"))
+        match err {
+            eez_driver::DriverError::CommitterClosed => Self::CommitterClosed,
+            eez_driver::DriverError::InvalidForkchoice(_) => {
+                Self::InvalidForkchoice(err.to_string())
+            }
+            _ => Self::InvalidForkchoice(format!("driver: {err}")),
         }
     }
 }
-
-impl fmt::Debug for DeriverError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DeriverError")
-            .field("kind", &self.kind)
-            .finish()
-    }
-}
-
-impl fmt::Display for DeriverError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.kind {
-            ErrorKind::L2Provider(msg) => write!(f, "L2 provider error: {msg}"),
-            ErrorKind::Codec(err) => write!(f, "payload codec error: {err}"),
-            ErrorKind::L1Scan(err) => write!(f, "L1 catch-up scan error: {err}"),
-            ErrorKind::CommitterClosed => {
-                write!(f, "block committer actor task has exited")
-            }
-            ErrorKind::InvalidForkchoice(detail) => {
-                write!(f, "engine rejected safe/finalized FCU: {detail}")
-            }
-            ErrorKind::LocalDiverged { l2_block, detail } => {
-                write!(
-                    f,
-                    "local L2 block {l2_block} diverged from L1-confirmed batch; \
-                     the on-chain claimed newState doesn't match local STF output"
-                )?;
-                if let Some(detail) = detail {
-                    write!(f, " ({detail})")?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-impl std::error::Error for DeriverError {}
