@@ -234,11 +234,8 @@ impl LocalChainClient {
     }
 }
 
-#[async_trait::async_trait]
 impl ChainClient for LocalChainClient {
-    async fn begin_execution_session(
-        &self,
-    ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
+    fn begin_execution_session(&self) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
         tracing::debug!(
             rollup_id = %self.rollup_id,
             ccm = %self.ccm_address,
@@ -316,7 +313,7 @@ impl ChainClient for LocalChainClient {
     /// Read the latest block header's `stateRoot` from this chain's
     /// own provider. Orthogonal to invariant-6 anchoring; useful for
     /// diagnostics and future paths.
-    async fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
+    fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
         let num = self
             .provider
             .headers
@@ -335,7 +332,7 @@ impl ChainClient for LocalChainClient {
         Ok(header.state_root.0)
     }
 
-    async fn simulate_source_tx(
+    fn simulate_source_tx(
         &self,
         raw_tx: Vec<u8>,
         dispatcher: &mut CompositionBuilder,
@@ -443,8 +440,7 @@ impl ChainClient for LocalChainClient {
         if let Some(channel) = &self.overlay_channel {
             factory = factory.with_overlay_channel(Arc::clone(channel));
         }
-        let handle = tokio::runtime::Handle::current();
-        let inspector = factory.build(dispatcher, handle);
+        let inspector = factory.build(dispatcher);
         let mut evm = self
             .provider
             .evm_config
@@ -518,7 +514,7 @@ impl ChainClient for LocalChainClient {
     /// can serve when L1-style: the entry case covers L1-as-entry single-binary;
     /// the follower case covers L1-as-follower in L2-as-entry topology.
     /// Non-L1 clients return `Unavailable` so misregistration fails loudly.
-    async fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
+    fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
         // Only L1-style clients honestly serve committed-root reads —
         // the storage-slot math `compute_state_root_slot` assumes the
         // L1 `EEZ.sol` layout. L2-style clients return `Unavailable`
