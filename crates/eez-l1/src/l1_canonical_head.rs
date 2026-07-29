@@ -8,7 +8,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy_primitives::B256;
-use eez_driver::ConfirmedHeadSource;
 
 /// One winning `BatchPosted` event in the per-tx index. Walked by the
 /// L1-reorg and L1-finality handlers. Losers aren't recorded.
@@ -182,12 +181,6 @@ impl L1CanonicalHead {
     /// keeping it `<= cursor()`.
     pub fn set_finalized_l2(&self, l2_block: u64) {
         self.finalized_l2.store(l2_block, Ordering::Release);
-    }
-}
-
-impl ConfirmedHeadSource for L1CanonicalHead {
-    fn confirmed_head(&self) -> u64 {
-        self.cursor()
     }
 }
 

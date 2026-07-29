@@ -14,8 +14,7 @@
 //!   [`ExecutedAction`] (outcome non-optional — it's always present by
 //!   the time the call is recorded).
 //! - **Finalization**: [`CompositionBuilder::finalize`] consumes the
-//!   builder, runs per-rollup CCM verification (skipping the entry
-//!   rollup), builds source + target entries via the [`crate::entries`]
+//!   builder, builds source + target entries via the [`crate::entries`]
 //!   builders, and produces a [`crate::types::Composition`].
 //!
 //! # Design
@@ -29,7 +28,7 @@
 //!   inspector dispatches back to the entry chain), the config (for
 //!   CCM verify), and the initial state root.
 //! - **Entry-aware**. `finalize` skips the entry rollup in both the
-//!   CCM-verify loop (entry has no system-tx CCM path — L1 verifies
+//!   target-batch loop (entry has no system-tx CCM path — L1 verifies
 //!   via `EEZ.postAndVerifyBatch`'s
 //!   proof bundle) and the target-composition loop (entry rollup's
 //!   output lives in `source`, not `targets`).
@@ -56,8 +55,8 @@
 //!      ┌──────────────────────────────────────────────────┐
 //!      │ finalize(raw_tx)               (consumes self)   │
 //!      │   1. validate: recorded + rollups non-empty      │
-//!      │   2. CCM verify per non-entry rollup             │
-//!      │      → patch terminal recorded.post_state_root   │
+//!      │   2. per non-entry rollup: zk-poster settlement  │
+//!      │      or inbound sidecar batch + root attribution │
 //!      │   3. entries::build_batch(recorded, attribution, │
 //!      │      dialect, source_id, raw_tx) — once per      │
 //!      │      source + per non-entry target               │
@@ -73,16 +72,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use alloy_primitives::{Bytes, U256};
-
 use crate::batch::EvmBatch;
 use crate::entries;
 use crate::error::{CompositionResult, ExecutorError, ExecutorResult, ProtocolError};
-use crate::executor::{
-    ChainClient, ExecutionRequest, ExecutionResponse, TargetExecutionSession, TargetTransaction,
-};
+use crate::executor::{ChainClient, ExecutionRequest, TargetExecutionSession};
 use crate::rollup_id::RollupId;
-use crate::types::{Composition, ExecutedAction, SourceComposition, TargetComposition};
+use crate::types::{
+    Composition, ExecutedAction, ExecutionOutcome, SourceComposition, TargetComposition,
+};
 
 // Avoid a protocol → composer layering cycle: TargetConfig lives in
 // `composer.rs`, but this module reads `config.verification_context`
@@ -96,8 +93,8 @@ use crate::composer::TargetConfig;
 ///
 /// Carries:
 ///
-/// - `client: Arc<dyn ChainClient>` directly (used for CCM-verify
-///   `simulate_transactions` and lazy session opening).
+/// - `client: Arc<dyn ChainClient>` directly (used for
+///   `current_state_root` attribution and lazy session opening).
 /// - `session: Option<Box<dyn _>>`: opened on first `dispatch_call`
 ///   to this rollup. The entry rollup's session stays `None` whenever
 ///   no inspector dispatches back to the entry chain.
@@ -348,11 +345,11 @@ impl CompositionBuilder {
     ///
     /// 1. Validate: both `recorded` and `rollups` non-empty; every
     ///    recorded call targets a registered rollup.
-    /// 2. For each **non-entry** rollup: simulate the two CCM system
-    ///    transactions (`loadExecutionTable` +
-    ///    `executeIncomingCrossChainCall`) and patch the terminal
-    ///    recorded call's `post_state_root` with the CCM-path final
-    ///    root. Entry rollup is skipped (L1 verifies via
+    /// 2. For each **non-entry** rollup: build the zk-poster
+    ///    settlement batch or the inbound DA-sidecar batch and
+    ///    attribute its post-state root (patching the terminal
+    ///    recorded call for the zk-poster case). Entry rollup is
+    ///    skipped (L1 verifies via
     ///    `EEZ.postAndVerifyBatch`'s
     ///    proof bundle, not system txs).
     /// 3. Call `entries::build_batch` for the source rollup with per-rollup
@@ -368,7 +365,7 @@ impl CompositionBuilder {
     /// [`ProtocolError::UnknownTarget`] for a recorded rollup not
     /// in the plan set, [`ProtocolError::InvalidCheckpoint`] if
     /// per-rollup state-delta chaining fails in `build_batch`.
-    /// Surfaces any [`ExecutorError`] from CCM verification.
+    /// Surfaces any [`ExecutorError`] from root attribution.
     #[tracing::instrument(level = "debug", name = "finalize", skip_all, err)]
     pub async fn finalize(mut self, raw_tx: &[u8]) -> CompositionResult<Composition> {
         tracing::debug!(name: "composer.finalize.start", "composition finalize started");
@@ -390,21 +387,21 @@ impl CompositionBuilder {
         let mut plan_order: Vec<RollupId> = self.rollups.keys().copied().collect();
         plan_order.sort();
 
-        // Per-rollup cumulative post-state roots collected during CCM
-        // verify. Keyed by `RollupId`; one `Vec` per rollup that
+        // Per-rollup cumulative post-state roots.
+        // Keyed by `RollupId`; one `Vec` per rollup that
         // contributed roots (entry rollup contributes from
         // overlay-session executes injected via
         // `Dispatcher::set_extra_per_tx_roots`; non-entry rollups
-        // contribute from their CCM-batch simulation in the loop
+        // contribute in the loop
         // below). Consumed by the source-entry build step via
         // `SourceAttribution::per_tx_roots_by_rollup` for
         // nested-composition upstream-invariant-6 chaining.
         let mut per_tx_roots_by_rollup: HashMap<RollupId, Vec<[u8; 32]>> = HashMap::new();
 
-        // initial_roots is hoisted out of Phase 3 so the CCM-verify
+        // initial_roots is hoisted out of Phase 3 so the target
         // loop can pass an attribution to `build_batch`.
         // Per-tx roots are still empty at this point — they're
-        // populated later by the loop's `simulate_transactions` and
+        // populated later by the loop and
         // by `extra_per_tx_roots` for the entry rollup. The L1-as-
         // follower emitter uses `initial_roots[source_rollup_id]`
         // for its first stateDelta's currentState; with empty
@@ -420,23 +417,20 @@ impl CompositionBuilder {
         // Under the multi-prover ABI, `proofs[]` lives inside the
         // batch struct (`ProofSystemBatchPerVerificationEntries.proofs`).
         // The composer's `encode_table_payload` path here emits the
-        // empty-`proofs[]` batch destined for the CCM-verify simulator
-        // and follower-side `loadExecutionTable` payloads; the real
+        // empty-`proofs[]` batch destined for
+        // follower-side `loadExecutionTable` payloads; the real
         // L1-poster path (proofs populated, signatures attached) lives
         // in `composer-lib::post_batch_submitter` (`submit_with_proof`).
 
-        // Phase 2 — per-rollup CCM verify (non-entry rollups only).
+        // Phase 2 — per-rollup target batches (non-entry rollups only).
         //
-        // For each non-entry rollup with non-empty group calls,
-        // build the chain-shaped batch via `protocol.build_batch`,
-        // assemble the 2-tx CCM-verify batch (load + execute), run
-        // `simulate_transactions`, and record the per-tx roots so the
-        // entry-side build_batch (Phase 3) can chain stateDeltas
-        // through them.
+        // For each non-entry rollup with non-empty group calls, build
+        // the batch (zk-poster settlement or inbound DA-sidecar) and
+        // record the attributed root so the entry-side build_batch
+        // (Phase 3) can chain stateDeltas through it.
         //
         // Entry rollup branch: drain pre-computed roots from the
-        // overlay-session path (`extra_per_tx_roots`). No CCM-verify
-        // path exists for the entry chain.
+        // overlay-session path (`extra_per_tx_roots`).
         let mut extra_per_tx_roots = std::mem::take(&mut self.extra_per_tx_roots);
         let mut target_batches: HashMap<RollupId, EvmBatch> = HashMap::new();
         for rollup_id in &plan_order {
@@ -525,13 +519,13 @@ impl CompositionBuilder {
             // Otherwise the batch is genuinely empty (all reverted) → skip.
             if batch.is_empty() {
                 let has_incoming = group_calls.iter().any(|c| c.source_rollup_id != *rollup_id);
-                if !dialect.is_zk_poster() && has_incoming {
+                if has_incoming {
                     let inbound_batch = entries::build_l1_inbound_sidecar(&group_calls, *rollup_id);
                     if !inbound_batch.is_empty() {
                         // Attribute the inbound delivery's post-state root —
                         // already executed during dispatch (`close_call`
                         // stamped the recorded call's outcome). Mirrors the
-                        // zk-poster / CCM-verify per-tx-root attribution.
+                        // zk-poster per-tx-root attribution.
                         let root = self
                             .recorded
                             .iter()
@@ -556,92 +550,7 @@ impl CompositionBuilder {
                         target_batches.insert(*rollup_id, inbound_batch);
                     }
                 }
-                continue;
             }
-
-            // Session-root settlement short-circuit (inbound L1→L2): this
-            // target's client settles via its own `execute` — the real
-            // post-state root was already reported over the wire
-            // (`EndSimulate`) and stamped onto the recorded action by
-            // `close_call`. Its client cannot serve a local
-            // `simulate_transactions` CCM-verify (a remote bidi-stream
-            // client — none in-tree today; the flag is never set), so
-            // skip that pass and keep the recorded root, mirroring the
-            // zk-poster branch above (which skips sim and attributes
-            // `current_state_root` instead). The L2→L1 outbound path never
-            // reaches here — its L1 target is zk-poster and short-circuits
-            // earlier — so this branch is inbound-only.
-            if rollup.config.settles_via_session_root {
-                let root = self
-                    .recorded
-                    .iter()
-                    .rev()
-                    .find(|r| r.target_rollup_id == *rollup_id)
-                    .and_then(|r| r.outcome.post_state_root().copied())
-                    .ok_or_else(|| ProtocolError::InvalidCheckpoint {
-                        reason: format!(
-                            "settles_via_session_root target {rollup_id} has no resolved \
-                                 post_state_root (close_call did not run?)"
-                        ),
-                    })?;
-                tracing::debug!(
-                    name: "composer.session_root_settle",
-                    %rollup_id,
-                    session_root = ?root,
-                    entries = group_calls.len(),
-                    "session-root target: skipping CCM-verify sim; using recorded EndSimulate root",
-                );
-                per_tx_roots_by_rollup.insert(*rollup_id, vec![root]);
-                target_batches.insert(*rollup_id, batch);
-                continue;
-            }
-
-            // The "outer root" call drives the follower's first proxy
-            // invocation. In preorder the first matching call is the
-            // outer-most root by construction.
-            let outer_root = &group_calls[0];
-
-            let exec_calldata =
-                dialect.encode_follower_trigger(outer_root, self.entry_rollup_id, raw_tx);
-            let load_calldata = entries::encode_table_payload(&batch, dialect);
-
-            let verification = rollup.config.verification_context();
-            let make_ccm_tx = |calldata: Bytes, value: U256| TargetTransaction {
-                caller: verification.system_address,
-                destination: verification.entrypoint_address,
-                calldata,
-                value,
-                gas_limit: verification.gas_limit,
-            };
-
-            let tx_load = make_ccm_tx(Bytes::from(load_calldata), U256::ZERO);
-            let tx_exec = make_ccm_tx(Bytes::from(exec_calldata), outer_root.value);
-            let txs: Vec<TargetTransaction> = vec![tx_load, tx_exec];
-
-            let sim = rollup.client.simulate_transactions(&txs).await?;
-
-            if let Some(last) = self
-                .recorded
-                .iter_mut()
-                .rev()
-                .find(|r| r.target_rollup_id == *rollup_id)
-                && let crate::types::ExecutionOutcome::Resolved {
-                    post_state_root, ..
-                } = &mut last.outcome
-            {
-                *post_state_root = sim.final_state_root;
-            }
-
-            tracing::debug!(
-                name: "composer.ccm_verify",
-                %rollup_id,
-                final_root = ?sim.final_state_root,
-                per_tx = sim.per_tx_roots.len(),
-                "ccm verification complete"
-            );
-
-            per_tx_roots_by_rollup.insert(*rollup_id, sim.per_tx_roots);
-            target_batches.insert(*rollup_id, batch);
         }
 
         // Phase 3 — entry-rollup batch (across full preorder slice).
@@ -684,8 +593,7 @@ impl CompositionBuilder {
                 .expect("plan_order from rollups map");
             let dialect = &rollup.config.dialect;
             let load_table_payload = entries::encode_table_payload(&batch, dialect);
-            let execute_payload =
-                dialect.encode_follower_trigger(outer_root, self.entry_rollup_id, raw_tx);
+            let execute_payload = dialect.encode_follower_trigger(outer_root);
             target_compositions.push(TargetComposition {
                 rollup_id: *rollup_id,
                 batch,
@@ -736,7 +644,7 @@ impl CompositionBuilder {
         target_rollup_id: RollupId,
         source_rollup_id: RollupId,
         req: ExecutionRequest,
-    ) -> ExecutorResult<ExecutionResponse> {
+    ) -> ExecutorResult<ExecutionOutcome> {
         // Drain any pending rollbacks queued by the previous frame's
         // `annotate_revert_span` / `close_call`. This is the next
         // async point — synchronous lifecycle methods cannot call
@@ -787,14 +695,14 @@ impl CompositionBuilder {
         let response = response_res?;
 
         // Phase 3 — close: resolve the slot with the real outcome.
-        self.close_call(idx, response.outcome.clone(), None);
+        self.close_call(idx, response.clone(), None);
 
         tracing::debug!(
             name: "composer.dispatch_call",
             %target_rollup_id,
             %source_rollup_id,
-            success = response.outcome.is_success(),
-            gas = response.outcome.gas_used().unwrap_or(0),
+            success = response.is_success(),
+            gas = response.gas_used().unwrap_or(0),
             "dispatched cross-chain call"
         );
 
@@ -864,7 +772,6 @@ impl CompositionBuilder {
             value: req.value,
             outcome: crate::types::ExecutionOutcome::Pending,
             revert_span: None,
-            static_meta: None,
         });
         self.pending_snapshots.insert(idx, snap);
         Ok(idx)
@@ -954,8 +861,8 @@ impl CompositionBuilder {
     /// Inject pre-computed per-tx state roots for `rollup_id` into the
     /// builder's eventual `finalize` step.
     ///
-    /// Used by the entry-overlay path: the composer's CCM-verify loop
-    /// in `finalize` skips the entry rollup (no system-tx CCM contract
+    /// Used by the entry-overlay path: `finalize`'s target loop
+    /// skips the entry rollup (no system-tx CCM contract
     /// on L1), so nested calls attributed to the entry rollup have no
     /// `per_tx_roots` source. The entry overlay session captures one
     /// post-state root per overlay `execute` and, at end of
@@ -972,18 +879,13 @@ impl CompositionBuilder {
 mod tests {
     use super::*;
     use crate::action::cross_chain_call_hash;
-    use crate::checkpoint::ExecutionCheckpoint;
-    use crate::composer::{DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig};
+    use crate::composer::ProxyLookupConfig;
     use crate::dialect::ChainDialect;
-    use crate::executor::TargetBatchSimulation;
-    use crate::overlay::EvmOverlay;
-    use crate::types::ExecutionOutcome;
-    use alloy_primitives::Address;
+    use alloy_primitives::{Address, Bytes, U256};
 
-    // ── Mock ChainClient (returns a canned CCM final root + session) ─
+    // ── Mock ChainClient (spawns a canned session) ──────────────────
 
     struct MockClient {
-        final_root: [u8; 32],
         session_outcome: ExecutionOutcome,
     }
 
@@ -998,18 +900,6 @@ mod tests {
             Ok(Box::new(MockSession {
                 outcome: self.session_outcome.clone(),
             }))
-        }
-        async fn simulate_transactions(
-            &self,
-            txs: &[TargetTransaction],
-        ) -> ExecutorResult<TargetBatchSimulation> {
-            if txs.is_empty() {
-                return Err(crate::error::ExecutorError::EmptyBatch);
-            }
-            Ok(TargetBatchSimulation {
-                final_state_root: self.final_root,
-                per_tx_roots: vec![self.final_root; txs.len()],
-            })
         }
     }
 
@@ -1029,7 +919,7 @@ mod tests {
             &mut self,
             req: ExecutionRequest,
             dispatcher: &mut CompositionBuilder,
-        ) -> ExecutorResult<ExecutionResponse> {
+        ) -> ExecutorResult<ExecutionOutcome> {
             // Nested dispatch back into the SAME rollup (caller = some
             // other id so the plain target==source guard does not fire).
             dispatcher
@@ -1045,9 +935,6 @@ mod tests {
             _snapshot: crate::executor::SessionSnapshot,
         ) -> ExecutorResult<()> {
             Ok(())
-        }
-        async fn take_checkpoint(&mut self) -> Option<ExecutionCheckpoint> {
-            None
         }
     }
 
@@ -1067,12 +954,6 @@ mod tests {
                 own_rollup: self.rollup,
             }))
         }
-        async fn simulate_transactions(
-            &self,
-            _txs: &[TargetTransaction],
-        ) -> ExecutorResult<TargetBatchSimulation> {
-            unimplemented!("cycle test never simulates")
-        }
     }
 
     // ── Mock TargetExecutionSession ──────────────────────────────────
@@ -1087,20 +968,8 @@ mod tests {
             &mut self,
             _req: ExecutionRequest,
             _dispatcher: &mut CompositionBuilder,
-        ) -> ExecutorResult<ExecutionResponse> {
-            Ok(ExecutionResponse {
-                outcome: self.outcome.clone(),
-                checkpoint: ExecutionCheckpoint {
-                    version: 1,
-                    chain_id: 1,
-                    base_block_number: 0,
-                    base_block_hash: [0u8; 32],
-                    base_state_root: [0u8; 32],
-                    current_root: [0u8; 32],
-                    overlay: EvmOverlay::default(),
-                    witness: None,
-                },
-            })
+        ) -> ExecutorResult<ExecutionOutcome> {
+            Ok(self.outcome.clone())
         }
 
         async fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
@@ -1112,10 +981,6 @@ mod tests {
             _snap: crate::executor::SessionSnapshot,
         ) -> ExecutorResult<()> {
             Ok(())
-        }
-
-        async fn take_checkpoint(&mut self) -> Option<ExecutionCheckpoint> {
-            None
         }
     }
 
@@ -1143,22 +1008,17 @@ mod tests {
 
     fn target_config() -> TargetConfig {
         TargetConfig {
-            ccm_address: Address::ZERO,
-            system_address: Address::ZERO,
-            ccm_gas_limit: DEFAULT_CCM_GAS_LIMIT,
             proxy_lookup: ProxyLookupConfig {
                 contract_address: Address::ZERO,
                 authorized_proxies_slot: 0,
             },
             dialect: ChainDialect::EvmL2Style,
-            settles_via_session_root: false,
         }
     }
 
     fn entry_rollup(outcome_root: [u8; 32]) -> Rollup {
         Rollup {
             client: Arc::new(MockClient {
-                final_root: [0u8; 32],
                 session_outcome: sample_outcome(outcome_root),
             }),
             session: None,
@@ -1170,7 +1030,6 @@ mod tests {
     fn rollup_with_session(outcome_root: [u8; 32]) -> Rollup {
         Rollup {
             client: Arc::new(MockClient {
-                final_root: [0u8; 32],
                 session_outcome: sample_outcome(outcome_root),
             }),
             session: None,
@@ -1192,7 +1051,7 @@ mod tests {
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
             .await
             .expect("dispatch");
-        assert_eq!(response.outcome.post_state_root(), Some(&[0x11u8; 32]));
+        assert_eq!(response.post_state_root(), Some(&[0x11u8; 32]));
         assert_eq!(builder.recorded.len(), 1);
         assert_eq!(builder.recorded[0].target_rollup_id, RollupId(1));
         assert_eq!(builder.recorded[0].source_rollup_id, RollupId(0));
@@ -1364,7 +1223,6 @@ mod tests {
             value: U256::ZERO,
             outcome: sample_outcome([0u8; 32]),
             revert_span: None,
-            static_meta: None,
         });
 
         let err = builder.finalize(&[]).await.expect_err("should fail");
@@ -1424,9 +1282,6 @@ mod tests {
 
     // ── Terminal-revert short-circuit ──────────────────────────────
 
-    /// Pairs with a `MockClient` that panics if `simulate_transactions`
-    /// is called — lets the test assert the CCM-verify path was
-    /// skipped.
     struct NoCcmClient;
 
     #[async_trait::async_trait]
@@ -1447,15 +1302,6 @@ mod tests {
                 },
             }))
         }
-        async fn simulate_transactions(
-            &self,
-            _txs: &[TargetTransaction],
-        ) -> ExecutorResult<TargetBatchSimulation> {
-            panic!(
-                "simulate_transactions must NOT be called on terminal-revert path — \
-                 finalize's short-circuit should have skipped CCM verify"
-            );
-        }
     }
 
     fn rollup_with_reverted_session() -> Rollup {
@@ -1468,13 +1314,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_target_entries_skips_ccm_verify_and_omits_target_composition() {
+    async fn empty_target_entries_omit_target_composition() {
         // Terminal revert — the emitter returns an empty target-entry
-        // set, and finalize must honor both sides of that handshake:
-        //   (a) skip CCM verify (NoCcmClient::simulate_transactions
-        //       panics if called — regression guard);
-        //   (b) omit the `TargetComposition` for the reverted rollup
-        //       from the returned `Composition`.
+        // set (and the sidecar skips reverted incoming calls), so the
+        // `TargetComposition` for the reverted rollup must be omitted
+        // from the returned `Composition`.
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_reverted_session());
@@ -1491,10 +1335,6 @@ mod tests {
 
         let composition = builder.finalize(&[]).await.expect("finalize");
 
-        // (a) handshake validated by NoCcmClient's panic-if-called
-        //     impl of simulate_transactions — if we got here, CCM
-        //     verify did NOT run on the reverted rollup.
-        // (b) TargetComposition omitted:
         assert!(
             composition.targets.is_empty(),
             "finalize must omit TargetComposition for a rollup whose target entries are empty"
@@ -1566,7 +1406,7 @@ mod tests {
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
             .await
             .expect("dispatch");
-        assert!(resp.outcome.is_success());
+        assert!(resp.is_success());
         assert_eq!(builder.recorded.len(), 2);
         assert!(crate::assertions::is_preorder(
             &builder.recorded,

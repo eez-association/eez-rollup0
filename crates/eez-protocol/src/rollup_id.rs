@@ -12,30 +12,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The full identity of one chain in a deployment — the THREE names the
-/// same chain answers to, carried together at REGISTRATION time so every
-/// component resolves from one place (the D-3 decision in
-/// `chain-identity-unification.md`):
-///
-/// - `wire_key` — the opaque transport key (queue keys, gRPC routing,
-///   logs; e.g. `"eez-dev-33333"`). Never part of any hash.
-/// - `chain_id` — the EIP-155 chain id (signature/admission validation,
-///   the EVM env). VM identity, not protocol identity.
-/// - `registry_id` — the id the L1 `EEZ.registerRollup` assigned. THE
-///   protocol identity: the message hash `H`, settlement `StateDelta`s,
-///   proxy registrations, and (registry-native, D-1) the entire
-///   composition space — rollup maps, sessions, dispatches — key on it.
-///   Every runtime [`RollupId`] IS a registry id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChainIdentity {
-    /// Opaque transport key (see type docs).
-    pub wire_key: String,
-    /// EIP-155 chain id.
-    pub chain_id: u64,
-    /// L1-registry id — the protocol identity.
-    pub registry_id: RollupId,
-}
-
 /// Identifier of a rollup within this deployment.
 ///
 /// Wraps a `u64` to distinguish rollup identity from other numeric

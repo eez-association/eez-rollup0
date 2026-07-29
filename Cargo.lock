@@ -3087,6 +3087,7 @@ name = "eez-composer"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-contract",
  "alloy-eips 2.0.5",
  "alloy-network",
  "alloy-primitives",
@@ -3167,6 +3168,7 @@ dependencies = [
  "alloy-rpc-types-debug",
  "alloy-rpc-types-engine",
  "async-trait",
+ "eez-l1",
  "eez-prover",
  "eyre",
  "reth-chainspec 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
@@ -3189,10 +3191,7 @@ dependencies = [
 name = "eez-evm-inspector"
 version = "0.1.0"
 dependencies = [
- "alloy-network",
  "alloy-primitives",
- "alloy-provider",
- "alloy-rpc-types-eth",
  "alloy-sol-types",
  "async-trait",
  "eez-protocol",
@@ -3214,9 +3213,6 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "alloy-transport",
- "async-trait",
- "eez-driver",
- "eez-payload-codec",
  "eez-protocol",
  "fail",
  "reqwest 0.12.28",
@@ -3308,15 +3304,11 @@ name = "eez-protocol"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
- "alloy-contract",
  "alloy-eips 2.0.5",
  "alloy-network",
  "alloy-primitives",
- "alloy-provider",
- "alloy-rpc-client",
  "alloy-signer-local",
  "alloy-sol-types",
- "alloy-transport-http",
  "async-trait",
  "eez-payload-codec",
  "hex",
