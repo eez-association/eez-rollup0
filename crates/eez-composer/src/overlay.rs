@@ -6,7 +6,7 @@
 //! counterpart to how reth's revm executes nested CALL opcodes by
 //! sharing the live `State<DB>`.
 //!
-//! The inspector's `tokio::task::block_in_place` bridge keeps
+//! The inspector's synchronous dispatch keeps
 //! source-sim's `evm.transact`, target-session execution, and
 //! nested-back-to-entry dispatch all on the same OS thread — no
 //! Send/Sync requirements, no cross-thread cloning. The overlay
@@ -134,7 +134,7 @@ pub enum OverlayError {
 ///
 /// Source-sim's inspector hook fires for a cross-chain CALL,
 /// snapshots source's cache as `before`, populates the source-cache
-/// side-channel, and drives the dispatch (`block_in_place`). During
+/// side-channel, and drives the dispatch. During
 /// that dispatch, an inner target session may dispatch back to the
 /// entry rollup; the entry rollup's session opens its `State` preloaded
 /// with `before` and accumulates per-overlay-call mutations. After the

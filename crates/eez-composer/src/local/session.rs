@@ -251,7 +251,7 @@ impl LocalExecutionSession {
     ///
     /// The target-side inspector fires from inside a scoped OS thread
     /// whose tokio entry is `Handle::block_on(...)`. This function
-    /// body MUST NOT introduce a real `.await` — doing so would try
+    /// body MUST NOT introduce a real `` — doing so would try
     /// to park back onto the outer runtime while the scoped thread
     /// is blocking a worker, producing a starvation deadlock. See
     /// the amendment C15 regression test.
@@ -383,26 +383,20 @@ impl LocalExecutionSession {
     }
 }
 
-#[async_trait::async_trait]
 impl TargetExecutionSession for LocalExecutionSession {
-    async fn execute(
+    fn execute(
         &mut self,
         req: ExecutionRequest,
         dispatcher: &mut CompositionBuilder,
     ) -> ExecutorResult<ExecutionOutcome> {
         // Pitfall #3 invariant: this method runs SYNCHRONOUSLY under
         // the caller's `Handle::block_on`. Do NOT introduce a real
-        // `.await` on I/O here or in `execute_internal*` — the target-
+        // `` on I/O here or in `execute_internal*` — the target-
         // side inspector dispatches from a scoped OS thread that holds
         // a tokio worker, and a real await would park the outer
         // runtime.
-        debug_assert!(
-            tokio::runtime::Handle::try_current().is_ok(),
-            "LocalExecutionSession::execute must be called from within a tokio runtime"
-        );
         let outcome = if let Some(factory) = self.inspector_factory.clone() {
-            let handle = tokio::runtime::Handle::current();
-            let inspector = factory.build(dispatcher, handle);
+            let inspector = factory.build(dispatcher);
             self.execute_internal_with_inspector(
                 inspector,
                 &req.target_address,
@@ -425,14 +419,14 @@ impl TargetExecutionSession for LocalExecutionSession {
         Ok(outcome)
     }
 
-    async fn checkpoint(&mut self) -> ExecutorResult<eez_protocol::SessionSnapshot> {
+    fn checkpoint(&mut self) -> ExecutorResult<eez_protocol::SessionSnapshot> {
         // Opaque snapshot carrying the current root only. The full
         // revm `State<DB>` deep-clone is tracked as known debt — see
         // CLAUDE.md "Known limitations".
         Ok(Box::new(self.current_root.0) as Box<dyn std::any::Any + Send>)
     }
 
-    async fn rollback(&mut self, snapshot: eez_protocol::SessionSnapshot) -> ExecutorResult<()> {
+    fn rollback(&mut self, snapshot: eez_protocol::SessionSnapshot) -> ExecutorResult<()> {
         let root: [u8; 32] = *snapshot.downcast::<[u8; 32]>().map_err(|_e| {
             ExecutorError::from(ExecutorErrorKind::Encoding(
                 "LocalExecutionSession::rollback: snapshot type mismatch".into(),

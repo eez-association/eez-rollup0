@@ -165,8 +165,12 @@ impl CrossChainWiring {
     /// simulation fails.
     /// Returns [`eez_protocol::ComposerErrorKind::Protocol`] if entry
     /// building or finalization fails.
+    // Large Err variant is the pre-existing error shape (previously
+    // hidden behind the async fn's returned future); boxing it is out
+    // of scope here.
+    #[allow(clippy::result_large_err)]
     #[tracing::instrument(skip(self, raw_tx), fields(tx_len = raw_tx.len()))]
-    pub async fn simulate_and_resolve(
+    pub fn simulate_and_resolve(
         &self,
         raw_tx: &[u8],
     ) -> eez_protocol::ComposerResult<eez_protocol::Composition> {
@@ -174,7 +178,6 @@ impl CrossChainWiring {
         // Per-composition entry selection (A1) goes through
         // `simulate_and_resolve_recorded_for`.
         self.simulate_and_resolve_recorded_for(self.entry_rollup_id, &*self.entry_client, raw_tx)
-            .await
     }
 
     /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve) but
@@ -188,7 +191,11 @@ impl CrossChainWiring {
     /// # Errors
     ///
     /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve).
-    pub async fn simulate_and_resolve_recorded_for(
+    // Large Err variant is the pre-existing error shape (previously
+    // hidden behind the async fn's returned future); boxing it is out
+    // of scope here.
+    #[allow(clippy::result_large_err)]
+    pub fn simulate_and_resolve_recorded_for(
         &self,
         entry_id: eez_protocol::RollupId,
         entry_client: &(dyn eez_protocol::executor::ChainClient + Send + Sync),
@@ -219,10 +226,7 @@ impl CrossChainWiring {
         let mut rollups: HashMap<eez_protocol::RollupId, Rollup> =
             HashMap::with_capacity(self.rollups.len());
         for (rollup_id, (client, config)) in &self.rollups {
-            let initial_state_root = self
-                .entry_client
-                .stored_target_state_root(*rollup_id)
-                .await?;
+            let initial_state_root = self.entry_client.stored_target_state_root(*rollup_id)?;
             rollups.insert(
                 *rollup_id,
                 Rollup {
@@ -242,10 +246,9 @@ impl CrossChainWiring {
         let mut builder = eez_protocol::CompositionBuilder::new(entry_id, rollups);
         entry_client
             .simulate_source_tx(raw_tx.to_vec(), &mut builder)
-            .await
             .map_err(eez_protocol::CompositionError::from)?;
         let recorded = builder.recorded().to_vec();
-        let composition = builder.finalize(raw_tx).await?;
+        let composition = builder.finalize(raw_tx)?;
 
         tracing::info!(
             name: "composer.simulate.complete",
@@ -1394,14 +1397,11 @@ where
             // its user tx); the load tx is built post-drain by the canonical
             // builder. Zero entries → poison.
             if held.direction == Direction::Outbound {
-                match evm_composer
-                    .simulate_and_resolve_recorded_for(
-                        eez_protocol::RollupId(rollup_id),
-                        cc.l2_entry_client.as_ref(),
-                        held.raw_tx.as_ref(),
-                    )
-                    .await
-                {
+                match evm_composer.simulate_and_resolve_recorded_for(
+                    eez_protocol::RollupId(rollup_id),
+                    cc.l2_entry_client.as_ref(),
+                    held.raw_tx.as_ref(),
+                ) {
                     Ok(composition) => {
                         let l1_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = composition
                             .targets
@@ -1513,10 +1513,7 @@ where
 
             // ── INBOUND (L1→L2) arm. Stage the deferred target entries; the
             // delivery system txs are built post-drain (after all outbound loads).
-            match evm_composer
-                .simulate_and_resolve(held.raw_tx.as_ref())
-                .await
-            {
+            match evm_composer.simulate_and_resolve(held.raw_tx.as_ref()) {
                 Ok(composition) => {
                     let target_entries: Vec<_> = composition
                         .targets
