@@ -21,12 +21,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use alloy_eips::Encodable2718;
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_provider::Provider as _;
 use async_trait::async_trait;
 use eez_driver::{
+    witness::{block_witness, ExecutionWitnessMode},
     BlockCommitterHandle, ParentContext, SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
-    witness::{ExecutionWitnessMode, block_witness},
 };
 use eez_l1::{BundleTarget, L1Event, L1Watcher, SendOutcome, Submitter};
 use eez_prover::{BlockWitness, Prover};
@@ -37,13 +37,14 @@ use reth_storage_api::{
     BlockReader, BlockSource, StateProvider, StateProviderFactory, TransactionsProvider,
 };
 use tokio::sync::broadcast;
-use tracing::{Level, event};
+use tracing::{event, Level};
 
-use crate::held_pool::HeldTx;
-use crate::ingress::Direction;
+use crate::composition::Rollup;
 use crate::local::{build_sync_block, sync_block_pair_roots};
 use crate::optimistic::OptimisticallyIncluded;
 use crate::rollup::RollupState;
+use crate::{composition::CompositionBuilder, ingress::Direction};
+use crate::{held_pool::HeldTx, LocalChainClient};
 
 /// Runtime config for the cross-chain execution path on Sync slots.
 /// Carried inside [`CrossChainWiring`] next to the wired
@@ -134,16 +135,11 @@ pub struct CrossChainWiring {
     /// (L1→L2) txs, and serves every rollup's upstream-invariant-6
     /// anchor root (`EEZ.rollups[id].stateRoot`) — chain headers
     /// (self-reports) are NOT correct for that purpose.
-    pub entry_client: Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+    pub entry_client: LocalChainClient,
     /// All registered rollups (entry + followers). The entry is also
     /// in this map — composition orchestration uses it uniformly.
-    pub rollups: HashMap<
-        eez_protocol::RollupId,
-        (
-            Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
-            eez_protocol::TargetConfig,
-        ),
-    >,
+    pub rollups:
+        HashMap<eez_protocol::RollupId, (Arc<LocalChainClient>, eez_protocol::TargetConfig)>,
     /// Runtime context (signer + L2 chain config) for wrapping the
     /// composer's `(load_table_payload, execute_payload)` byte
     /// outputs into signed L2 system txs.
@@ -152,7 +148,7 @@ pub struct CrossChainWiring {
     /// outbound tx originates on this L2, so its `simulate_and_resolve`
     /// must run against an L2 entry (the L2 follower's `ChainClient`
     /// errors `Unavailable` for source sim).
-    pub l2_entry_client: Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+    pub l2_entry_client: Arc<LocalChainClient>,
 }
 
 impl CrossChainWiring {
@@ -177,7 +173,7 @@ impl CrossChainWiring {
         // Default entry selection: the pinned entry rollup + its client.
         // Per-composition entry selection (A1) goes through
         // `simulate_and_resolve_recorded_for`.
-        self.simulate_and_resolve_recorded_for(self.entry_rollup_id, &*self.entry_client, raw_tx)
+        self.simulate_and_resolve_recorded_for(self.entry_rollup_id, &self.entry_client, raw_tx)
     }
 
     /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve) but
@@ -198,11 +194,9 @@ impl CrossChainWiring {
     pub fn simulate_and_resolve_recorded_for(
         &self,
         entry_id: eez_protocol::RollupId,
-        entry_client: &(dyn eez_protocol::executor::ChainClient + Send + Sync),
+        entry_client: &LocalChainClient,
         raw_tx: &[u8],
     ) -> eez_protocol::ComposerResult<eez_protocol::Composition> {
-        use eez_protocol::composition::Rollup;
-
         tracing::info!(
             name: "composer.simulate.start",
             %entry_id,
@@ -230,7 +224,7 @@ impl CrossChainWiring {
             rollups.insert(
                 *rollup_id,
                 Rollup {
-                    client: Arc::clone(client),
+                    client: client.clone(),
                     session: None,
                     config: config.clone(),
                     initial_state_root,
@@ -243,7 +237,7 @@ impl CrossChainWiring {
         // finalize. `recorded` carries the resolved per-call outcomes
         // (return_data) the byte-locked inbound delivery needs,
         // captured BEFORE `finalize` consumes the builder.
-        let mut builder = eez_protocol::CompositionBuilder::new(entry_id, rollups);
+        let mut builder = CompositionBuilder::new(entry_id, rollups);
         entry_client
             .simulate_source_tx(raw_tx.to_vec(), &mut builder)
             .map_err(eez_protocol::CompositionError::from)?;
@@ -2023,7 +2017,7 @@ where
         outbound_user_txs: &[Bytes],
     ) -> Result<Bytes, String> {
         use alloy_sol_types::SolCall;
-        use eez_protocol::abi::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
+        use eez_protocol::abi::{postAndVerifyBatchCall, RollupIdWithProofSystemsSol};
 
         // Empty compositions is a VALID case: an empty HeldPool Sync
         // slot still emits a postBatch carrying just the leading

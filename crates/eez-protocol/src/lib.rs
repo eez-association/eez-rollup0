@@ -43,7 +43,6 @@ pub mod addresses;
 pub mod authorized_proxies;
 pub mod batch;
 pub mod composer;
-pub mod composition;
 pub mod dialect;
 pub mod entries;
 pub mod error;
@@ -75,8 +74,6 @@ pub use batch::EvmBatch;
 #[doc(inline)]
 pub use composer::{ProxyLookupConfig, SourceAttribution, TargetConfig};
 #[doc(inline)]
-pub use composition::{CompositionBuilder, Rollup};
-#[doc(inline)]
 pub use dialect::ChainDialect;
 #[doc(inline)]
 pub use error::{
@@ -84,8 +81,6 @@ pub use error::{
     CompositionResult, ExecutorError, ExecutorErrorKind, ExecutorResult, ProtocolError,
     ProtocolErrorKind, ProtocolResult,
 };
-#[doc(inline)]
-pub use executor::{ChainClient, ExecutionRequest, SessionSnapshot, TargetExecutionSession};
 #[doc(inline)]
 pub use overlay::{
     AccountInfo, AccountOverlay, AccountStatus, ContractCode, EvmOverlay, StorageOverlay,

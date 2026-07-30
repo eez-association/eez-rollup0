@@ -28,6 +28,7 @@
 //! [`Dispatcher::dispatch_call`]: eez_protocol::CompositionBuilder::dispatch_call
 
 use alloy_primitives::{Address, Bytes};
+use eez_protocol::executor::ExecutionRequest;
 use std::sync::{Arc, Mutex};
 
 use revm::context_interface::{ContextTr, Host, JournalTr};
@@ -37,8 +38,9 @@ use revm::interpreter::{
 };
 use revm::Inspector;
 
+use crate::composition::CompositionBuilder;
 use eez_protocol::{decode_proxy_value, proxy_mapping_key, ProxyInfo};
-use eez_protocol::{CompositionBuilder, ExecutorError, ProxyLookupConfig, RollupId};
+use eez_protocol::{ExecutorError, ProxyLookupConfig, RollupId};
 
 /// Bidirectional side-channel between source-sim and the overlay
 /// session opened on the entry rollup.
@@ -399,7 +401,6 @@ impl std::fmt::Debug for SessionInspector<'_> {
             .field("call_depth", &self.call_depth)
             .field("proxy_lookups", &self.proxy_lookups)
             .field("has_error", &self.error.is_some())
-            .field("has_overlay_channel", &self.overlay_channel.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -509,7 +510,7 @@ where
             CallScheme::StaticCall => "STATICCALL",
         };
 
-        let req = eez_protocol::ExecutionRequest {
+        let req = ExecutionRequest {
             target_address: info.original_address,
             data: calldata.clone(),
             value: call_value,

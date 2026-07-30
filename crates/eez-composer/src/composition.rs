@@ -72,21 +72,26 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::batch::EvmBatch;
-use crate::entries;
-use crate::error::{
-    CompositionResult, ExecutorError, ExecutorErrorKind, ExecutorResult, ProtocolErrorKind,
-};
-use crate::executor::{ChainClient, ExecutionRequest, TargetExecutionSession};
-use crate::rollup_id::RollupId;
-use crate::types::{
-    Composition, ExecutedAction, ExecutionOutcome, SourceComposition, TargetComposition,
-};
+use eez_protocol::{ExecutorErrorKind,
+ExecutorError,
+ExecutionOutcome,
+ExecutedAction,
+    SourceComposition,
+    Composition,
+    TargetComposition,
+    entries,
+ExecutorResult,
+    ProtocolErrorKind,
+    EvmBatch,
+    CompositionResult,
+    TargetConfig,
+executor::ExecutionRequest,RollupId};
+
+use crate::{LocalChainClient, local::session::SessionSnapshot};
 
 // Avoid a protocol → composer layering cycle: TargetConfig lives in
 // `composer.rs`, but this module reads `config.verification_context`
 // + `config.ccm_gas_limit` during finalize.
-use crate::composer::TargetConfig;
 
 // ── Rollup ───────────────────────────────────────────────────────
 
@@ -104,10 +109,10 @@ use crate::composer::TargetConfig;
 ///   `config.verification_context()` and `config.proxy_lookup` directly.
 pub struct Rollup {
     /// Client for this rollup — shared long-lived trait object.
-    pub client: Arc<dyn ChainClient + Send + Sync>,
+    pub client: Arc<LocalChainClient>,
     /// Lazily-opened session for this rollup. `None` until the first
     /// [`CompositionBuilder::dispatch_call`] hits this rollup.
-    pub session: Option<Box<dyn TargetExecutionSession + Send>>,
+    pub session: Option<Box<LocalChainClient>>,
     /// Configuration for this rollup (CCM addresses, gas limit, proxy
     /// lookup).
     pub config: TargetConfig,
@@ -189,7 +194,7 @@ pub struct CompositionBuilder {
     /// recursing into `session.execute`; the snapshot is dropped on
     /// the success path of `close_call` and pushed onto
     /// [`pending_rollbacks`] on the revert path.
-    pub(crate) pending_snapshots: HashMap<usize, crate::executor::SessionSnapshot>,
+    pub(crate) pending_snapshots: HashMap<usize, SessionSnapshot>,
     /// Rollups whose session is currently CHECKED OUT by an in-flight
     /// `dispatch_call` frame (taken at execute, put back after). A nested
     /// dispatch re-entering one of these would lazy-open a DUPLICATE
@@ -249,7 +254,7 @@ impl CompositionBuilder {
     #[must_use]
     pub fn with_sessions(
         mut self,
-        sessions: HashMap<RollupId, Box<dyn TargetExecutionSession + Send>>,
+        sessions: HashMap<RollupId, Box<LocalChainClient>>,
     ) -> Self {
         for (id, session) in sessions {
             match self.rollups.get_mut(&id) {
@@ -271,7 +276,7 @@ impl CompositionBuilder {
     /// builder (composition succeeded) or rolls them back to its boundary
     /// snapshots (composition failed) — and drops them all at slot end:
     /// sessions never outlive their slot.
-    pub fn take_sessions(&mut self) -> HashMap<RollupId, Box<dyn TargetExecutionSession + Send>> {
+    pub fn take_sessions(&mut self) -> HashMap<RollupId, Box<LocalChainClient>> {
         self.rollups
             .iter_mut()
             .filter_map(|(id, rollup)| rollup.session.take().map(|s| (*id, s)))
@@ -476,17 +481,6 @@ impl CompositionBuilder {
                     continue;
                 }
                 let root = rollup.client.current_state_root()?;
-                if let Some(last) = self
-                    .recorded
-                    .iter_mut()
-                    .rev()
-                    .find(|r| r.target_rollup_id == *rollup_id)
-                    && let crate::types::ExecutionOutcome::Resolved {
-                        post_state_root, ..
-                    } = &mut last.outcome
-                {
-                    *post_state_root = root;
-                }
                 tracing::debug!(
                     name: "composer.zk_poster_l1_postbatch",
                     %rollup_id,
@@ -500,17 +494,7 @@ impl CompositionBuilder {
                 continue;
             }
 
-            let attribution_so_far = crate::composer::SourceAttribution {
-                initial_roots: &initial_roots,
-                per_tx_roots_by_rollup: &per_tx_roots_by_rollup,
-            };
-            let batch = entries::build_batch(
-                &group_calls,
-                &attribution_so_far,
-                dialect,
-                *rollup_id,
-                raw_tx,
-            )?;
+            let batch = entries::build_batch(&group_calls, dialect, *rollup_id, raw_tx)?;
 
             // Terminal-revert short-circuit: an empty batch means all
             // calls reverted and there's nothing to verify — UNLESS this
@@ -559,24 +543,14 @@ impl CompositionBuilder {
             }
         }
 
-        // Phase 3 — entry-rollup batch (across full preorder slice).
-        let attribution = crate::composer::SourceAttribution {
-            initial_roots: &initial_roots,
-            per_tx_roots_by_rollup: &per_tx_roots_by_rollup,
-        };
         let entry_dialect = self
             .rollups
             .get(&self.entry_rollup_id)
             .expect("entry rollup registered at builder construction")
             .config
             .dialect;
-        let entry_batch = entries::build_batch(
-            &self.recorded,
-            &attribution,
-            &entry_dialect,
-            self.entry_rollup_id,
-            raw_tx,
-        )?;
+        let entry_batch =
+            entries::build_batch(&self.recorded, &entry_dialect, self.entry_rollup_id, raw_tx)?;
         let entry_payload = entries::encode_table_payload(&entry_batch, &entry_dialect);
 
         // Phase 4 — target compositions (re-encode from the batches
@@ -774,7 +748,7 @@ impl CompositionBuilder {
             source_address: req.source_address,
             data: req.data.clone(),
             value: req.value,
-            outcome: crate::types::ExecutionOutcome::Pending,
+            outcome: ExecutionOutcome::Pending,
             revert_span: None,
         });
         self.pending_snapshots.insert(idx, snap);
@@ -787,12 +761,7 @@ impl CompositionBuilder {
     /// pass `None` and let
     /// [`annotate_revert_span`](Self::annotate_revert_span) fill it
     /// in post-frame.
-    pub fn close_call(
-        &mut self,
-        idx: usize,
-        outcome: crate::types::ExecutionOutcome,
-        revert_span: Option<u32>,
-    ) {
+    pub fn close_call(&mut self, idx: usize, outcome: ExecutionOutcome, revert_span: Option<u32>) {
         let slot = &mut self.recorded[idx];
         debug_assert!(
             slot.outcome.is_pending(),
@@ -908,74 +877,11 @@ mod tests {
 
     // ── Reentrant fakes (cycle guard, review 2026-06-11) ─────────────
 
-    /// Session whose execute() immediately re-dispatches to its OWN
-    /// rollup through the builder — the entry→A→…→A cycle shape. The
-    /// checked-out guard must refuse the inner open_call (it would mint
-    /// a duplicate session whose writes the outer put-back drops).
-    struct ReentrantSession {
-        own_rollup: RollupId,
-    }
-
-    impl TargetExecutionSession for ReentrantSession {
-        fn execute(
-            &mut self,
-            req: ExecutionRequest,
-            dispatcher: &mut CompositionBuilder,
-        ) -> ExecutorResult<ExecutionOutcome> {
-            // Nested dispatch back into the SAME rollup (caller = some
-            // other id so the plain target==source guard does not fire).
-            dispatcher.open_call(self.own_rollup, RollupId(7), &req)?;
-            unreachable!("the checked-out guard must refuse the cyclic open_call");
-        }
-        fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
-            Ok(Box::new(()) as crate::executor::SessionSnapshot)
-        }
-        fn rollback(&mut self, _snapshot: crate::executor::SessionSnapshot) -> ExecutorResult<()> {
-            Ok(())
-        }
-    }
-
-    struct ReentrantClient {
-        rollup: RollupId,
-    }
-
-    impl ChainClient for ReentrantClient {
-        fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
-            Ok([0u8; 32])
-        }
-        fn begin_execution_session(
-            &self,
-        ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
-            Ok(Box::new(ReentrantSession {
-                own_rollup: self.rollup,
-            }))
-        }
-    }
-
+   
+  
     // ── Mock TargetExecutionSession ──────────────────────────────────
 
-    struct MockSession {
-        outcome: ExecutionOutcome,
-    }
-
-    impl TargetExecutionSession for MockSession {
-        fn execute(
-            &mut self,
-            _req: ExecutionRequest,
-            _dispatcher: &mut CompositionBuilder,
-        ) -> ExecutorResult<ExecutionOutcome> {
-            Ok(self.outcome.clone())
-        }
-
-        fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
-            Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
-        }
-
-        fn rollback(&mut self, _snap: crate::executor::SessionSnapshot) -> ExecutorResult<()> {
-            Ok(())
-        }
-    }
-
+  
     // ── Helpers ──────────────────────────────────────────────────────
 
     fn sample_outcome(post_root: [u8; 32]) -> ExecutionOutcome {

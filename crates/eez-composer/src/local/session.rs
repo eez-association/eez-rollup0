@@ -10,7 +10,7 @@
 
 use alloy_primitives::{Address, Bytes, B256, U256};
 
-use eez_evm_inspector::{OverlayChannelHandle, SessionInspector};
+use crate::inspector::{OverlayChannelHandle, SessionInspector};
 use reth_evm::{ConfigureEvm, Evm as _};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_revm::{database::StateProviderDatabase, db::State};
@@ -19,9 +19,10 @@ use reth_trie_common::{HashedPostState, KeccakKeyHasher};
 use revm::database::CacheState;
 use revm::DatabaseCommit;
 
+use crate::composition::CompositionBuilder;
 use eez_protocol::{
-    CompositionBuilder, ExecutionOutcome, ExecutionRequest, ExecutorError, ExecutorErrorKind,
-    ExecutorResult, ProxyLookupConfig, RollupId, TargetExecutionSession,
+    executor::ExecutionRequest, ExecutionOutcome, ExecutorError, ExecutorErrorKind, ExecutorResult,
+    ProxyLookupConfig, RollupId,
 };
 
 use super::provider::ChainProvider;
@@ -29,6 +30,8 @@ use super::provider::ChainProvider;
 /// Gas limit for direct target-chain calls during inspection. Generous
 /// enough for worst-case dev-chain paths; too low → silent reverts.
 pub(super) const DIRECT_CALL_GAS_LIMIT: u64 = 30_000_000;
+
+pub type SessionSnapshot = u64;
 
 /// Stateful target-chain execution session.
 ///
@@ -218,13 +221,13 @@ impl LocalExecutionSession {
     /// the amendment C15 regression test.
     fn execute_internal_with_inspector(
         &mut self,
-        inspector: eez_evm_inspector::SessionInspector<'_>,
+        inspector: SessionInspector<'_>,
         destination: &Address,
         calldata: &Bytes,
         value: &U256,
         source_address: &Address,
         source_rollup: RollupId,
-    ) -> ExecutorResult<eez_protocol::ExecutionOutcome> {
+    ) -> ExecutorResult<ExecutionOutcome> {
         let tx_env = self.build_tx_env(destination, calldata, value, source_address, source_rollup);
         let caller = tx_env.caller;
         let pre_root = self.current_root;
@@ -341,9 +344,7 @@ impl LocalExecutionSession {
             ..Default::default()
         }
     }
-}
 
-impl TargetExecutionSession for LocalExecutionSession {
     fn execute(
         &mut self,
         req: ExecutionRequest,
@@ -371,14 +372,7 @@ impl TargetExecutionSession for LocalExecutionSession {
         )
     }
 
-    fn checkpoint(&mut self) -> ExecutorResult<eez_protocol::SessionSnapshot> {
-        // Opaque snapshot carrying the current root only. The full
-        // revm `State<DB>` deep-clone is tracked as known debt — see
-        // CLAUDE.md "Known limitations".
-        Ok(Box::new(self.current_root.0) as Box<dyn std::any::Any + Send>)
-    }
-
-    fn rollback(&mut self, snapshot: eez_protocol::SessionSnapshot) -> ExecutorResult<()> {
+    fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()> {
         let root: [u8; 32] = *snapshot.downcast::<[u8; 32]>().map_err(|_e| {
             ExecutorError::from(ExecutorErrorKind::Encoding(
                 "LocalExecutionSession::rollback: snapshot type mismatch".into(),

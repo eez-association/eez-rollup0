@@ -13,16 +13,17 @@
 //! downstream (`prepare_post_batch` fills the carriers; the proof sink
 //! fills `proofs[]` with the prover's signature).
 
-use crate::{ExecutedAction, ProtocolResult, RollupId, rolling_hash::EntryRollingHash};
-use alloy_primitives::{Address, B256, Bytes, U256};
+use crate::{rolling_hash::EntryRollingHash, ExecutedAction, ProtocolResult, RollupId};
+use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_sol_types::SolCall;
 
 use tracing::{debug, trace};
 
 use crate::abi::{
-    CrossChainCallSol, ExecutionEntrySol, ExpectedL1ToL2CallSol, ExpectedLookupSol,
-    ExpectedOutgoingCrossChainCallSol, L2ExecutionEntrySol, L2ExpectedLookupSol, L2LookupCallSol,
-    L2ToL1CallSol, LookupCallSol, StateDeltaSol, loadExecutionTableCall, postAndVerifyBatchCall,
+    loadExecutionTableCall, postAndVerifyBatchCall, CrossChainCallSol, ExecutionEntrySol,
+    ExpectedL1ToL2CallSol, ExpectedLookupSol, ExpectedOutgoingCrossChainCallSol,
+    L2ExecutionEntrySol, L2ExpectedLookupSol, L2LookupCallSol, L2ToL1CallSol, LookupCallSol,
+    StateDeltaSol,
 };
 use crate::action::cross_chain_call_hash;
 use crate::batch::EvmBatch;
@@ -84,19 +85,9 @@ impl CallKind {
 #[tracing::instrument(level = "debug", name = "build_batch", skip_all, fields(source = %source_rollup_id), err)]
 pub fn build_batch(
     recorded: &[ExecutedAction],
-    attribution: &crate::SourceAttribution<'_>,
     dialect: &ChainDialect,
     source_rollup_id: RollupId,
-    raw_tx: &[u8],
 ) -> ProtocolResult<EvmBatch> {
-    // TODO(attribution): use for `StateDelta.currentState` chaining — the
-    // upstream-invariant-6 anchor that pins each entry's pre-state to the
-    // committed root (today the driver attaches the settlement StateDelta
-    // separately in prepare_post_batch).
-    // TODO(raw_tx): use for L1-style `executeL2TX` raw-tx routing /
-    // stateless re-execution + custom-dialect entry shapes.
-    let _ = (attribution, raw_tx);
-
     let group: Vec<&ExecutedAction> = recorded
         .iter()
         .filter(|c| {

@@ -21,9 +21,3 @@
 //! [`SessionInspector`]: crate::SessionInspector
 //! [`Composer`]: eez_protocol::Composer
 //! [`CompositionBuilder`]: eez_protocol::CompositionBuilder
-
-pub mod inspector;
-pub mod overlay;
-
-pub use inspector::{OverlayChannel, OverlayChannelHandle, SessionInspector};
-pub use overlay::{apply_overlay_diff, clone_state, OverlayError};

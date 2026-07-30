@@ -14,7 +14,6 @@
 //! - Per-composition data types cross `.await` boundaries inside the
 //!   composition pipeline and must be [`Send`].
 
-use crate::composition::{CompositionBuilder, Rollup};
 use crate::executor::ExecutionRequest;
 use crate::rollup_id::RollupId;
 use crate::types::{Composition, ExecutedAction, SourceComposition, TargetComposition};
@@ -30,8 +29,6 @@ const fn assert_thread_safety_bounds() {
     // composition pipeline (dispatch → session.execute → finalize →
     // simulate_transactions). Each holds `dyn _ + Send` trait objects;
     // a future refactor could silently regress Send without this guard.
-    assert_send::<CompositionBuilder>();
-    assert_send::<Rollup>();
 
     // Per-composition data types — must be Send to cross .await.
     assert_send::<ExecutedAction>();

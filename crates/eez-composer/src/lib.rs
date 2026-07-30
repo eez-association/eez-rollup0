@@ -37,10 +37,13 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 pub mod composer;
+pub mod composition;
 pub mod held_pool;
 pub mod ingress;
+pub mod inspector;
 pub mod local;
 pub mod optimistic;
+pub mod overlay;
 pub mod rollup;
 
 #[doc(inline)]
@@ -51,7 +54,7 @@ pub use held_pool::{HeldPool, HeldTx};
 pub use ingress::Direction;
 
 #[doc(inline)]
-pub use local::{BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient, build_sync_block};
+pub use local::{build_sync_block, BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient};
 pub use optimistic::OptimisticallyIncluded;
 #[doc(inline)]
 pub use rollup::{RollupConfig, RollupState};
