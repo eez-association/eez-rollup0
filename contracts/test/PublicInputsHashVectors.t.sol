@@ -129,6 +129,57 @@ contract PublicInputsHashVectorsTest is Test {
         eez.postAndVerifyBatch(batch);
     }
 
+    /// `immediateEntryCount` changes dispatch but is absent from the proof
+    /// preimage. This locks the current contract behavior so the protocol can
+    /// decide whether to bind the field or make derivation tolerate it.
+    function testImmediateEntryCountCanDropADeferredEntryWithoutChangingPublicInput() external {
+        MockProofSystem proofSystem = new MockProofSystem();
+        bytes32 vkey = bytes32(uint256(0x42));
+        bytes32 initialState = bytes32(uint256(0x1111));
+        bytes32 anchorState = bytes32(uint256(0x2222));
+
+        EEZ canonicalEez = new EEZ(address(0xDEAD));
+        uint64 canonicalRollup =
+            _registerRollup(canonicalEez, _singleton(proofSystem), _singleton(vkey), initialState);
+        ProofSystemBatchPerVerificationEntries memory canonical =
+            _schedulerBatch(proofSystem, canonicalRollup, initialState, anchorState, 1);
+
+        EEZ mutatedEez = new EEZ(address(0xDEAD));
+        uint64 mutatedRollup =
+            _registerRollup(mutatedEez, _singleton(proofSystem), _singleton(vkey), initialState);
+        ProofSystemBatchPerVerificationEntries memory mutated =
+            _schedulerBatch(proofSystem, mutatedRollup, initialState, anchorState, 2);
+
+        assertEq(canonicalRollup, mutatedRollup);
+        assertNotEq(keccak256(abi.encode(canonical)), keccak256(abi.encode(mutated)));
+
+        bytes32 canonicalShared = _shared(canonical, _emptyCustomData(1), address(0));
+        bytes32 mutatedShared = _shared(mutated, _emptyCustomData(1), address(0));
+        bytes32 canonicalPublicInput = _publicInput(
+            canonicalShared, _singleton(canonicalRollup), _singleton(vkey)
+        );
+        bytes32 mutatedPublicInput =
+            _publicInput(mutatedShared, _singleton(mutatedRollup), _singleton(vkey));
+        assertEq(canonicalShared, mutatedShared);
+        assertEq(canonicalPublicInput, mutatedPublicInput);
+
+        proofSystem.setExpectedPublicInputsHash(canonicalPublicInput);
+
+        address poster = address(0xBEEF);
+        vm.prank(poster);
+        canonicalEez.postAndVerifyBatch(canonical);
+        assertEq(canonicalEez.queueLength(canonicalRollup), 1);
+
+        vm.prank(poster);
+        mutatedEez.postAndVerifyBatch(mutated);
+        assertEq(mutatedEez.queueLength(mutatedRollup), 0);
+
+        (, bytes32 canonicalState,) = canonicalEez.rollups(canonicalRollup);
+        (, bytes32 mutatedState,) = mutatedEez.rollups(mutatedRollup);
+        assertEq(canonicalState, anchorState);
+        assertEq(mutatedState, anchorState);
+    }
+
     function _shared(
         ProofSystemBatchPerVerificationEntries memory batch,
         bytes[] memory customData,
@@ -200,6 +251,56 @@ contract PublicInputsHashVectorsTest is Test {
         entry.destinationRollupId = rollupId;
         entry.success = true;
         entry.returnData = hex"deadbeef";
+    }
+
+    function _schedulerBatch(
+        MockProofSystem proofSystem,
+        uint64 rollupId,
+        bytes32 initialState,
+        bytes32 anchorState,
+        uint256 immediateEntryCount
+    )
+        private
+        pure
+        returns (ProofSystemBatchPerVerificationEntries memory batch)
+    {
+        batch = _emptyBatch();
+        batch.entries = new ExecutionEntry[](2);
+        batch.entries[0] = _schedulerEntry(rollupId, initialState, anchorState, bytes32(0));
+        batch.entries[1] = _schedulerEntry(
+            rollupId, anchorState, bytes32(uint256(0x3333)), bytes32(uint256(0x4444))
+        );
+        batch.immediateEntryCount = immediateEntryCount;
+        batch.proofSystems = _addresses(_singleton(proofSystem));
+        batch.proofs = _proofs(1);
+        batch.rollupIdsWithProofSystems = _assignments1(rollupId, 0);
+    }
+
+    function _schedulerEntry(
+        uint64 rollupId,
+        bytes32 currentState,
+        bytes32 newState,
+        bytes32 proxyEntryHash
+    )
+        private
+        pure
+        returns (ExecutionEntry memory entry)
+    {
+        entry.stateUpdates = new StateUpdate[](1);
+        entry.stateUpdates[0] = StateUpdate({
+            rollupId: rollupId,
+            currentState: currentState,
+            newState: newState,
+            etherDelta: 0
+        });
+        entry.proxyEntryHash = proxyEntryHash;
+        entry.l2ToL1Calls = new L2ToL1Call[](0);
+        entry.expectedL1ToL2Calls = new ExpectedL1ToL2Call[](0);
+        bytes32 statesHash = keccak256(abi.encodePacked(bytes32(0), rollupId, currentState));
+        entry.rollingHash = keccak256(abi.encodePacked(statesHash, proxyEntryHash));
+        entry.destinationRollupId = rollupId;
+        entry.success = true;
+        entry.returnData = "";
     }
 
     function _registerRollup(
