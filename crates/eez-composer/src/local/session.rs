@@ -10,7 +10,7 @@
 
 use alloy_primitives::{Address, Bytes, B256, U256};
 
-use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory};
+use eez_evm_inspector::{OverlayChannelHandle, SessionInspector};
 use reth_evm::{ConfigureEvm, Evm as _};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_revm::{database::StateProviderDatabase, db::State};
@@ -21,7 +21,7 @@ use revm::DatabaseCommit;
 
 use eez_protocol::{
     CompositionBuilder, ExecutionOutcome, ExecutionRequest, ExecutorError, ExecutorErrorKind,
-    ExecutorResult, RollupId, TargetExecutionSession,
+    ExecutorResult, ProxyLookupConfig, RollupId, TargetExecutionSession,
 };
 
 use super::provider::ChainProvider;
@@ -51,15 +51,6 @@ pub struct LocalExecutionSession {
     current_root: B256,
     chain_id: u64,
     ccm_address: Address,
-    /// When `Some`, `execute()` runs each target call under a
-    /// [`eez_evm_inspector::SessionInspector`] built from this factory — forwarding
-    /// detected proxy CALLs to the dispatcher. `None` means a plain
-    /// direct execute with no inspection layer (used for the entry
-    /// role's target-session path when the topology has no nested
-    /// reentry into the entry chain). The factory holds this chain's
-    /// `proxy_lookup` + `rollup_id`, so the inspector's `caller_id`
-    /// matches the chain it runs on.
-    inspector_factory: Option<SessionInspectorFactory>,
     /// Overlay channel write-back handle.
     /// `Some(channel)` when the entry rollup's session is opened on
     /// behalf of a nested-back-to-entry dispatch — this session writes
@@ -68,6 +59,7 @@ pub struct LocalExecutionSession {
     /// journal. `None` for follower sessions and for entry sessions
     /// opened outside the overlay context.
     overlay_channel: OverlayChannelHandle,
+    proxy_lookup_config: ProxyLookupConfig,
 }
 
 impl std::fmt::Debug for LocalExecutionSession {
@@ -76,7 +68,6 @@ impl std::fmt::Debug for LocalExecutionSession {
             .field("current_root", &self.current_root)
             .field("chain_id", &self.chain_id)
             .field("ccm_address", &self.ccm_address)
-            .field("has_inspector_factory", &self.inspector_factory.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -111,9 +102,9 @@ impl LocalExecutionSession {
     pub fn new(
         provider: &ChainProvider,
         ccm_address: Address,
-        inspector_factory: Option<SessionInspectorFactory>,
         cache: Option<CacheState>,
         overlay_channel: OverlayChannelHandle,
+        proxy_lookup_config: ProxyLookupConfig,
     ) -> ExecutorResult<Self> {
         let num = provider
             .provider
@@ -163,8 +154,8 @@ impl LocalExecutionSession {
             current_root,
             chain_id,
             ccm_address,
-            inspector_factory,
             overlay_channel,
+            proxy_lookup_config,
         })
     }
 
@@ -205,36 +196,6 @@ impl LocalExecutionSession {
 
         let output = result.result.output()?;
         (output.len() >= 32).then(|| Address::from_slice(&output[12..32]))
-    }
-
-    /// Uninspected direct-call path: a plain `evm.transact` plus
-    /// invariant-7 bookkeeping. Used when this session was opened with
-    /// `inspector_factory = None` (entry rollup).
-    fn execute_internal(
-        &mut self,
-        destination: &Address,
-        calldata: &Bytes,
-        value: &U256,
-        source_address: &Address,
-        source_rollup: RollupId,
-    ) -> ExecutorResult<eez_protocol::ExecutionOutcome> {
-        let tx_env = self.build_tx_env(destination, calldata, value, source_address, source_rollup);
-        let caller = tx_env.caller;
-        let pre_root = self.current_root;
-        let (return_data, gas_used, success, mut changes) = {
-            let mut evm = self
-                .evm_config
-                .evm_with_env(&mut self.state, self.evm_env.clone());
-            let result = evm.transact(tx_env).map_err(evm_err)?;
-            (
-                result.result.output().cloned().unwrap_or_default(),
-                result.result.tx_gas_used(),
-                result.result.is_success(),
-                result.state,
-            )
-        };
-        restore_caller_nonce(&mut changes, caller);
-        self.commit_and_finish(pre_root, return_data, gas_used, success, changes)
     }
 
     /// Inspected direct-call path. Runs the target-chain tx under the
@@ -394,28 +355,20 @@ impl TargetExecutionSession for LocalExecutionSession {
         // side inspector dispatches from a scoped OS thread that holds
         // a tokio worker, and a real await would park the outer
         // runtime.
-        let outcome = if let Some(factory) = self.inspector_factory.clone() {
-            let inspector = factory.build(dispatcher);
-            self.execute_internal_with_inspector(
-                inspector,
-                &req.target_address,
-                &req.data,
-                &req.value,
-                &req.source_address,
-                req.source_rollup_id,
-            )?
-        } else {
-            let _ = dispatcher;
-            self.execute_internal(
-                &req.target_address,
-                &req.data,
-                &req.value,
-                &req.source_address,
-                req.source_rollup_id,
-            )?
-        };
-
-        Ok(outcome)
+        let inspector = SessionInspector::new(
+            self.proxy_lookup_config.clone(),
+            dispatcher,
+            // TODO: is this the correct ID?
+            req.source_rollup_id,
+        );
+        self.execute_internal_with_inspector(
+            inspector,
+            &req.target_address,
+            &req.data,
+            &req.value,
+            &req.source_address,
+            req.source_rollup_id,
+        )
     }
 
     fn checkpoint(&mut self) -> ExecutorResult<eez_protocol::SessionSnapshot> {

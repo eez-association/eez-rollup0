@@ -404,89 +404,6 @@ impl std::fmt::Debug for SessionInspector<'_> {
     }
 }
 
-/// Shared construction surface for [`SessionInspector`] instances.
-///
-/// Collapses the per-chain configuration (proxy lookup + caller rollup
-/// id) that both the source-sim path and the target-session path need,
-/// so each call site produces inspectors the same way and any future
-/// field added to `SessionInspector` flows through one site.
-///
-/// Each call site produces an inspector via [`build`](Self::build).
-#[derive(Debug, Clone)]
-pub struct SessionInspectorFactory {
-    /// `(contract_address, slot)` discriminator for this chain's
-    /// `authorizedProxies`. Derived from role at client construction.
-    proxy_lookup: ProxyLookupConfig,
-    /// Rollup id of the chain this factory belongs to — becomes the
-    /// `caller_id` on every call dispatched through inspectors it
-    /// builds.
-    caller_rollup_id: RollupId,
-    /// Overlay channel handle for the shared-source-state overlay
-    /// path. `Some(channel)` only on the entry-role factory used at
-    /// the source-sim site; follower-role factories used at
-    /// target-session sites leave this `None`. Forwarded to the
-    /// inspector via [`SessionInspectorFactory::build`] so root-frame
-    /// inspectors snapshot source's cache before each downstream
-    /// dispatch and apply overlay diffs after.
-    overlay_channel: Option<OverlayChannelHandle>,
-}
-
-impl SessionInspectorFactory {
-    /// Create a factory pinned to one chain's configuration.
-    ///
-    /// Defaults to no overlay channel — the entry-role factory used
-    /// for source-sim should call
-    /// [`with_overlay_channel`](Self::with_overlay_channel) to install
-    /// one.
-    #[must_use]
-    pub fn new(proxy_lookup: ProxyLookupConfig, caller_rollup_id: RollupId) -> Self {
-        Self {
-            proxy_lookup,
-            caller_rollup_id,
-            overlay_channel: None,
-        }
-    }
-
-    /// Install the overlay channel used by the shared-source-state
-    /// overlay path.
-    ///
-    /// Caller responsibility: only attach this to the factory the
-    /// source-sim inspector is built from. Inspectors built from
-    /// factories without a channel do not snapshot or apply diffs,
-    /// which is the correct default for target-session frames.
-    #[must_use]
-    pub fn with_overlay_channel(mut self, channel: OverlayChannelHandle) -> Self {
-        self.overlay_channel = Some(channel);
-        self
-    }
-
-    /// Configuration this factory was built with.
-    #[must_use]
-    pub fn proxy_lookup(&self) -> &ProxyLookupConfig {
-        &self.proxy_lookup
-    }
-
-    /// Caller rollup id this factory passes to every built inspector.
-    #[must_use]
-    pub fn caller_rollup_id(&self) -> RollupId {
-        self.caller_rollup_id
-    }
-
-    /// Build an inspector. Used by both the source-sim path and the
-    /// target-session path. The inspector observes proxy CALLs and
-    /// dispatches each through the supplied [`CompositionBuilder`]; nested
-    /// dispatches (a target-session inspector handing a callback
-    /// back to the composer) are recorded as preorder children of
-    /// the outer call by virtue of the dispatcher's `open_call`
-    /// timing.
-    pub fn build<'a>(&self, dispatcher: &'a mut CompositionBuilder) -> SessionInspector<'a> {
-        let mut insp =
-            SessionInspector::new(self.proxy_lookup.clone(), dispatcher, self.caller_rollup_id);
-        insp.overlay_channel = self.overlay_channel.clone();
-        insp
-    }
-}
-
 impl<'a> SessionInspector<'a> {
     /// Create a new inspector instance.
     ///
@@ -515,6 +432,10 @@ impl<'a> SessionInspector<'a> {
             overlay_channel: None,
             frame_starts: Vec::new(),
         }
+    }
+
+    pub fn proxy_lookup(&self) -> &ProxyLookupConfig {
+        &self.proxy_lookup
     }
 
     /// Number of proxy lookups performed during this EVM pass.

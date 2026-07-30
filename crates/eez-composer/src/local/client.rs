@@ -28,7 +28,7 @@ use reth_primitives_traits::SignerRecoverable;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::{BlockNumReader, HeaderProvider, StateProvider, StateProviderFactory};
 
-use eez_evm_inspector::{OverlayChannel, OverlayChannelHandle, SessionInspectorFactory};
+use eez_evm_inspector::{OverlayChannel, OverlayChannelHandle, SessionInspector};
 use eez_protocol::{
     ChainClient, CompositionBuilder, ExecutorError, ExecutorErrorKind, ExecutorResult,
     ProxyLookupConfig, RollupId, TargetExecutionSession,
@@ -242,16 +242,6 @@ impl ChainClient for LocalChainClient {
             role = ?self.role,
             "opening execution session"
         );
-        // Both roles install a target-side inspector. Entry overlay
-        // sessions can themselves dispatch outgoing proxy calls (e.g.
-        // `reentrantCrossChainCalls`'s deeper alternation), and the
-        // rollup's `overlay_channel` is attached to the inspector
-        // factory unconditionally so every session participates in
-        // the pre/post stack mechanism for state propagation across
-        // re-entered sessions of THIS rollup.
-        let mut factory = SessionInspectorFactory::new(self.proxy_lookup_config(), self.rollup_id);
-        factory = factory.with_overlay_channel(Arc::clone(&self.overlay_channel));
-        let inspector_factory = Some(factory);
         // Overlay path. When the entry
         // rollup's session is lazily opened by the `CompositionBuilder`
         // because an inner target-session frame is dispatching back to
@@ -298,9 +288,9 @@ impl ChainClient for LocalChainClient {
         let session = LocalExecutionSession::new(
             &self.provider,
             proxy_lookup_addr,
-            inspector_factory,
             preloaded_cache,
             self.overlay_channel.clone(),
+            self.proxy_lookup_config(),
         )?;
         Ok(Box::new(session))
     }
@@ -431,9 +421,8 @@ impl ChainClient for LocalChainClient {
         // source's cache before each downstream dispatch (preload
         // for the entry overlay session) and applies the post-execute
         // diff onto source's journal after dispatch returns.
-        let mut factory = SessionInspectorFactory::new(self.proxy_lookup_config(), self.rollup_id);
-        factory = factory.with_overlay_channel(Arc::clone(&self.overlay_channel));
-        let inspector = factory.build(dispatcher);
+        let inspector =
+            SessionInspector::new(self.proxy_lookup_config(), dispatcher, self.rollup_id);
         let mut evm = self
             .provider
             .evm_config
