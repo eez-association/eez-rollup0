@@ -744,8 +744,9 @@ mod tests {
 
     fn packed_proxy_value(destination: Address, rollup_id: u64) -> U256 {
         let mut word = [0u8; 32];
-        word[4..12].copy_from_slice(&rollup_id.to_be_bytes());
-        word[12..32].copy_from_slice(destination.as_ref());
+        word[3..11].copy_from_slice(&rollup_id.to_be_bytes());
+        word[11..31].copy_from_slice(destination.as_ref());
+        word[31] = 1;
         U256::from_be_bytes(word)
     }
 

@@ -6,14 +6,13 @@
 //! **0** on both children:
 //!
 //! - **L1 `EEZ.sol`** — slot [`ROLLUPS_AUTHORIZED_PROXIES_SLOT`] (0).
-//!   Source side for L1→L2 composition. Full L1 layout:
-//!   `authorizedProxies` (0, from `EEZBase`), `rollups` (1),
-//!   `verificationByRollup` (2), `_transientExecutions` (3),
-//!   `_transientLookupCalls` (4).
+//!   Source side for L1→L2 composition. The persistent L1 layout begins:
+//!   `authorizedProxies` (0, from `EEZBase`), `rollupCounter` (1),
+//!   `rollups` (2), and `verificationByRollup` (3).
 //! - **L2 `EEZL2.sol`** — slot [`CCM_AUTHORIZED_PROXIES_SLOT`] (0).
-//!   Source side for L2→L1 composition. Full L2 layout:
-//!   `authorizedProxies` (0, from `EEZBase`), `executions` (1),
-//!   `lookupCalls` (2), `lastLoadBlock` (3), `executionIndex` (4).
+//!   Source side for L2→L1 composition. The persistent L2 layout is:
+//!   `authorizedProxies` (0, from `EEZBase`), `entries` (1),
+//!   `staticEntries` (2), `lastLoadBlock` (3), `entryIndex` (4).
 //!   `ROLLUP_ID` and `SYSTEM_ADDRESS` are immutables (no storage slot).
 //!
 //! The two constants are equal (both 0) but kept distinct to document
@@ -79,24 +78,25 @@ pub fn proxy_mapping_key(addr: Address, slot: u8) -> B256 {
 
 /// Decode a packed `uint256` storage word into [`ProxyInfo`].
 ///
-/// Returns `None` if `value` is zero — Solidity's default for an
-/// unset mapping entry, i.e. "this address is not a registered proxy".
+/// Returns `None` unless the packed `isProxy` flag is the canonical
+/// Solidity `true` value. The other fields are not evidence of registration.
 ///
 /// The Solidity contract packs proxy info as:
 /// ```text
-/// bytes [0..4]   — unused (padding)
-/// bytes [4..12]  — original_rollup_id (u64, big-endian)
-/// bytes [12..32] — original_address   (20 bytes)
+/// bytes [0..3]   — unused (padding)
+/// bytes [3..11]  — original_rollup_id (u64, big-endian)
+/// bytes [11..31] — original_address   (20 bytes)
+/// byte  [31]     — is_proxy           (`1` when registered)
 /// ```
 #[must_use]
 pub fn decode_proxy_value(value: U256) -> Option<ProxyInfo> {
-    if value == U256::ZERO {
+    let bytes = value.to_be_bytes::<32>();
+    if bytes[31] != 1 {
         return None;
     }
-    let bytes = value.to_be_bytes::<32>();
-    let original_address = Address::from_slice(&bytes[12..32]);
+    let original_address = Address::from_slice(&bytes[11..31]);
     let mut rollup_bytes = [0u8; 8];
-    rollup_bytes.copy_from_slice(&bytes[4..12]);
+    rollup_bytes.copy_from_slice(&bytes[3..11]);
     let original_rollup_id = RollupId(u64::from_be_bytes(rollup_bytes));
     Some(ProxyInfo {
         original_address,
@@ -119,25 +119,34 @@ mod tests {
 
     #[test]
     fn decode_zero_returns_none() {
-        // Solidity's default for an unread mapping entry is zero.
-        // `None` = "not a registered proxy" vs an address literally at 0x0.
         assert!(decode_proxy_value(U256::ZERO).is_none());
     }
 
     #[test]
-    fn decode_non_zero_round_trip() {
-        let addr = Address::from([0xAB; 20]);
-        let rollup_id: u64 = 42;
-
-        // Pack: bytes[4..12] = rollup_id, bytes[12..32] = address
+    fn decode_rejects_fields_without_registration_flag() {
         let mut packed = [0u8; 32];
-        packed[4..12].copy_from_slice(&rollup_id.to_be_bytes());
-        packed[12..32].copy_from_slice(addr.as_ref());
+        packed[3..11].copy_from_slice(&42u64.to_be_bytes());
+        packed[11..31].fill(0xab);
 
-        let info = decode_proxy_value(U256::from_be_bytes(packed))
-            .expect("non-zero packed value decodes to Some");
-        assert_eq!(info.original_address, addr);
-        assert_eq!(info.original_rollup_id, RollupId(rollup_id));
+        assert!(decode_proxy_value(U256::from_be_bytes(packed)).is_none());
+    }
+
+    #[test]
+    fn decode_matches_solidity_storage_layout_vector() {
+        // `forge inspect EEZ storage-layout`: `isProxy` offset 0,
+        // `originalAddress` offset 1, `originalRollupId` offset 21.
+        let packed = "0x000000010203040506070811223344556677889900aabbccddeeff0011223301"
+            .parse::<U256>()
+            .expect("valid storage word");
+
+        let info = decode_proxy_value(packed).expect("registered proxy");
+        assert_eq!(
+            info.original_address,
+            "0x11223344556677889900aabbccddeeff00112233"
+                .parse::<Address>()
+                .expect("valid address")
+        );
+        assert_eq!(info.original_rollup_id, RollupId(0x0102_0304_0506_0708));
     }
 
     #[test]
