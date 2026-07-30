@@ -28,7 +28,7 @@ use reth_primitives_traits::SignerRecoverable;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::{BlockNumReader, HeaderProvider, StateProvider, StateProviderFactory};
 
-use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
+use eez_evm_inspector::{OverlayChannel, OverlayChannelHandle, SessionInspectorFactory};
 use eez_protocol::{
     ChainClient, CompositionBuilder, ExecutorError, ExecutorErrorKind, ExecutorResult,
     ProxyLookupConfig, RollupId, TargetExecutionSession,
@@ -97,7 +97,7 @@ pub struct LocalChainClient {
     /// it; the entry session then writes its post-execute cache back,
     /// and the source-sim inspector applies the diff onto source's
     /// journal. Follower clients leave this `None`.
-    overlay_channel: Option<OverlayChannelHandle>,
+    overlay_channel: OverlayChannelHandle,
 }
 
 impl std::fmt::Debug for LocalChainClient {
@@ -159,7 +159,7 @@ impl LocalChainClient {
             role: Role::Entry { dispatch_address },
             ccm_address,
             dialect,
-            overlay_channel: Some(new_overlay_channel()),
+            overlay_channel: Arc::new(OverlayChannel::default()),
         })
     }
 
@@ -195,7 +195,7 @@ impl LocalChainClient {
             role: Role::Follower { dispatch_address },
             ccm_address,
             dialect,
-            overlay_channel: Some(new_overlay_channel()),
+            overlay_channel: Arc::new(OverlayChannel::default()),
         })
     }
 
@@ -250,9 +250,7 @@ impl ChainClient for LocalChainClient {
         // the pre/post stack mechanism for state propagation across
         // re-entered sessions of THIS rollup.
         let mut factory = SessionInspectorFactory::new(self.proxy_lookup_config(), self.rollup_id);
-        if let Some(channel) = &self.overlay_channel {
-            factory = factory.with_overlay_channel(Arc::clone(channel));
-        }
+        factory = factory.with_overlay_channel(Arc::clone(&self.overlay_channel));
         let inspector_factory = Some(factory);
         // Overlay path. When the entry
         // rollup's session is lazily opened by the `CompositionBuilder`
@@ -275,10 +273,7 @@ impl ChainClient for LocalChainClient {
         // session whose outer instance is `take()`-en mid-execute,
         // this gives the new session continuation from outer's state
         // instead of fresh from disk.
-        let preloaded_cache = self
-            .overlay_channel
-            .as_ref()
-            .and_then(|c| c.peek_pre_snapshot());
+        let preloaded_cache = self.overlay_channel.peek_pre_snapshot();
         // `compute_proxy_address` (called from `build_tx_env` for every
         // session execute) calls `computeCrossChainProxyAddress` on a
         // chain-local contract. Both Rollups (L1) and CrossChainManager
@@ -437,9 +432,7 @@ impl ChainClient for LocalChainClient {
         // for the entry overlay session) and applies the post-execute
         // diff onto source's journal after dispatch returns.
         let mut factory = SessionInspectorFactory::new(self.proxy_lookup_config(), self.rollup_id);
-        if let Some(channel) = &self.overlay_channel {
-            factory = factory.with_overlay_channel(Arc::clone(channel));
-        }
+        factory = factory.with_overlay_channel(Arc::clone(&self.overlay_channel));
         let inspector = factory.build(dispatcher);
         let mut evm = self
             .provider
@@ -469,11 +462,9 @@ impl ChainClient for LocalChainClient {
         // attributed to the entry rollup hit `InvalidCheckpoint` in
         // `build_batch` (the CCM-verify loop skips the entry rollup,
         // leaving its slot in the map empty).
-        if let Some(channel) = &self.overlay_channel {
-            let roots = channel.drain_post_roots();
-            if !roots.is_empty() {
-                dispatcher.set_extra_per_tx_roots(self.rollup_id, roots);
-            }
+        let roots = self.overlay_channel.drain_post_roots();
+        if !roots.is_empty() {
+            dispatcher.set_extra_per_tx_roots(self.rollup_id, roots);
         }
 
         tracing::info!(

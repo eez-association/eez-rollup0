@@ -8,7 +8,7 @@
 //! Also hosts the reth helpers
 //! ([`disable_checks`], [`compute_state_root`]).
 
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, Bytes, B256, U256};
 
 use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory};
 use reth_evm::{ConfigureEvm, Evm as _};
@@ -16,8 +16,8 @@ use reth_evm_ethereum::EthEvmConfig;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::{BlockNumReader, StateProvider, StateProviderFactory};
 use reth_trie_common::{HashedPostState, KeccakKeyHasher};
-use revm::DatabaseCommit;
 use revm::database::CacheState;
+use revm::DatabaseCommit;
 
 use eez_protocol::{
     CompositionBuilder, ExecutionOutcome, ExecutionRequest, ExecutorError, ExecutorErrorKind,
@@ -67,7 +67,7 @@ pub struct LocalExecutionSession {
     /// so source-sim's inspector can apply the diff onto source's
     /// journal. `None` for follower sessions and for entry sessions
     /// opened outside the overlay context.
-    overlay_channel: Option<OverlayChannelHandle>,
+    overlay_channel: OverlayChannelHandle,
 }
 
 impl std::fmt::Debug for LocalExecutionSession {
@@ -113,7 +113,7 @@ impl LocalExecutionSession {
         ccm_address: Address,
         inspector_factory: Option<SessionInspectorFactory>,
         cache: Option<CacheState>,
-        overlay_channel: Option<OverlayChannelHandle>,
+        overlay_channel: OverlayChannelHandle,
     ) -> ExecutorResult<Self> {
         let num = provider
             .provider
@@ -325,10 +325,9 @@ impl LocalExecutionSession {
         // diff. Stack semantics let nested re-entries chain
         // post-caches through their respective inspector pops without
         // collision.
-        if let Some(channel) = &self.overlay_channel {
-            channel.push_post_cache(self.state.cache.clone());
-            channel.append_post_root(post_root.0);
-        }
+        self.overlay_channel
+            .push_post_cache(self.state.cache.clone());
+        self.overlay_channel.append_post_root(post_root.0);
 
         tracing::debug!(
             success = success,

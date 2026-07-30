@@ -25,7 +25,7 @@
 //!       └─ ExecutorErrorKind     Unavailable | Provider | Evm | Transport
 //!                                | Encoding | Serde | Missing
 //!                                | TargetTransactionReverted | Decode
-//!                                | EmptyBatch | InvalidReentry
+//!                                | EmptyBatch | InvalidReentry | Unexpected
 //! ```
 //!
 //! [`ComposerError`] flattens across the composition layer: the
@@ -180,6 +180,11 @@ impl ExecutorError {
     pub fn serde(e: impl Into<BoxedError>) -> Self {
         ExecutorErrorKind::Serde(e.into()).into()
     }
+    /// Build an `Unexpected` error — a violated "can't happen" invariant (a
+    /// bug), surfaced instead of panicking.
+    pub fn unexpected(msg: impl Into<String>) -> Self {
+        ExecutorErrorKind::Unexpected(msg.into()).into()
+    }
 }
 
 /// Variants of [`ExecutorError`].
@@ -262,6 +267,10 @@ pub enum ExecutorErrorKind {
         /// Requested target rollup (equal to `caller`, not the entry).
         target: crate::rollup_id::RollupId,
     },
+    /// A "can't happen" invariant was violated — a bug, not an input or I/O
+    /// failure. Surfaced as a returned error rather than a panic.
+    #[error("unexpected (should never happen): {0}")]
+    Unexpected(String),
 }
 
 /// Shorthand for executor results.

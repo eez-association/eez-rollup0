@@ -30,15 +30,15 @@
 use alloy_primitives::{Address, Bytes};
 use std::sync::{Arc, Mutex};
 
-use revm::Inspector;
 use revm::context_interface::{ContextTr, Host, JournalTr};
 use revm::database::{CacheState, State};
 use revm::interpreter::{
     CallInputs, CallOutcome, CallScheme, Gas, InstructionResult, InterpreterResult,
 };
+use revm::Inspector;
 
+use eez_protocol::{decode_proxy_value, proxy_mapping_key, ProxyInfo};
 use eez_protocol::{CompositionBuilder, ExecutorError, ProxyLookupConfig, RollupId};
-use eez_protocol::{ProxyInfo, decode_proxy_value, proxy_mapping_key};
 
 /// Bidirectional side-channel between source-sim and the overlay
 /// session opened on the entry rollup.
@@ -237,12 +237,6 @@ impl OverlayChannel {
 /// Shared handle to an [`OverlayChannel`].
 pub type OverlayChannelHandle = Arc<OverlayChannel>;
 
-/// Build a fresh, empty [`OverlayChannelHandle`].
-#[must_use]
-pub fn new_overlay_channel() -> OverlayChannelHandle {
-    Arc::new(OverlayChannel::default())
-}
-
 /// Look up `authorizedProxies[addr]` from the live EVM state at the
 /// hook site.
 ///
@@ -270,6 +264,84 @@ fn lookup_authorized_proxy_live<CTX: ContextTr + Host>(
     let key = proxy_mapping_key(addr, proxy_slot);
     let load = ctx.sload(rollups_addr, key.into())?;
     decode_proxy_value(load.data)
+}
+
+/// Clone the current source-sim cache and refresh it to LIVE (journal-aware)
+/// values, so the entry-rollup overlay session preloads post-write state.
+///
+/// `state.cache.clone()` holds values revm LOADED from disk during the tx, but
+/// mid-tx `SSTORE` / balance changes live in the journal until commit — the
+/// cached values stay at their pre-write snapshots. Flash-loan exposed this:
+/// source-sim's `bridge.bridgeTokens` does `safeTransferFrom(executor, BridgeL1,
+/// 10000e18)` BEFORE its proxy.call dispatches CC1, then CC2-nested needs the L1
+/// entry overlay to read the locked balance — the cache alone returns 0.
+///
+/// We re-read every already-loaded slot/account through `Host::sload` /
+/// `Host::load_account_info_skip_cold_load` (journal-aware, LIVE post-write). No
+/// need to discover NEW slots: any `SSTORE` is preceded by an `SLOAD` that added
+/// the slot to the cache, so iterating cache slots is sufficient.
+fn snapshot_live_cache<'db, DB, CTX>(context: &mut CTX) -> Result<CacheState, ExecutorError>
+where
+    CTX: ContextTr<Db = &'db mut State<DB>> + Host,
+    DB: 'db,
+{
+    let mut cache = context.db_mut().cache.clone();
+    // Collect (addr, slot) pairs to refresh — release the cache borrow before
+    // calling Host::sload.
+    let mut slots_to_refresh: Vec<(Address, alloy_primitives::U256)> = Vec::new();
+    let mut addrs_to_refresh: Vec<Address> = Vec::new();
+    for (addr, acc) in &cache.accounts {
+        addrs_to_refresh.push(*addr);
+        if let Some(plain) = acc.account.as_ref() {
+            for slot in plain.storage.keys() {
+                slots_to_refresh.push((*addr, *slot));
+            }
+        }
+    }
+    let mut live_storage: Vec<(Address, alloy_primitives::U256, alloy_primitives::U256)> =
+        Vec::with_capacity(slots_to_refresh.len());
+    for (addr, slot) in slots_to_refresh {
+        if let Some(load) = context.sload(addr, slot) {
+            live_storage.push((addr, slot, load.data));
+        }
+    }
+    let mut live_account_info: Vec<(Address, alloy_primitives::U256, u64)> =
+        Vec::with_capacity(addrs_to_refresh.len());
+    for addr in addrs_to_refresh {
+        if let Ok(info) = context.load_account_info_skip_cold_load(addr, false, true) {
+            live_account_info.push((addr, info.balance, info.nonce));
+        }
+    }
+    for (addr, slot, value) in live_storage {
+        // Both invariant: (addr, slot) was collected from a cache account that
+        // had plain storage, and `cache` isn't mutated between collect + apply.
+        let acc = cache.accounts.get_mut(&addr).ok_or_else(|| {
+            ExecutorError::unexpected(format!(
+                "snapshot_live_cache: account {addr} vanished from cache"
+            ))
+        })?;
+        let plain = acc.account.as_mut().ok_or_else(|| {
+            ExecutorError::unexpected(format!(
+                "snapshot_live_cache: account {addr} lost plain data"
+            ))
+        })?;
+        plain.storage.insert(slot, value);
+    }
+    for (addr, balance, nonce) in live_account_info {
+        // `addr` was collected from `cache.accounts` → get_mut is invariant.
+        let acc = cache.accounts.get_mut(&addr).ok_or_else(|| {
+            ExecutorError::unexpected(format!(
+                "snapshot_live_cache: account {addr} vanished from cache"
+            ))
+        })?;
+        // Accounts without plain data (not materialized) legitimately have
+        // nothing to update.
+        if let Some(plain) = acc.account.as_mut() {
+            plain.info.balance = balance;
+            plain.info.nonce = nonce;
+        }
+    }
+    Ok(cache)
 }
 
 /// EVM inspector that detects proxy calls and dispatches them through
@@ -529,114 +601,41 @@ where
         // overlay path direct access to source-sim's `&mut State<DB>`
         // via the inspector's `&mut ctx`.
         let caller_id = self.caller_rollup_id;
-        // Overlay-path producer/consumer: source-sim's root-frame
-        // inspector snapshots source's in-flight cache into the channel
-        // before dispatching downstream (preload for the entry-rollup
-        // overlay session) and applies the channel's overlay-after diff
-        // back onto source's journal after dispatch returns. Both halves
-        // are skipped on target-session inspectors (whose factory is
-        // built without an overlay channel); the runtime check on
-        // `is_nested_frame` keeps the invariant local to this file.
-        // Stack-based overlay channel for recursive re-entry. When the
-        // channel is installed every inspector frame participates in
-        // push/pop on its rollup's channel — re-entered sessions
-        // inherit their own rollup's mid-execute state and write
-        // back accumulated mutations.
-        let overlay_active = self.overlay_channel.is_some();
-        let mut before_snapshot: Option<CacheState> = None;
-        if overlay_active {
-            // `state.cache.clone()` holds the values revm LOADED from
-            // disk during the source-sim tx, but mid-tx `SSTORE` /
-            // balance changes live in the journal until commit; the
-            // cached values stay at their pre-write snapshots. flash-
-            // loan exposed this: source-sim's `bridge.bridgeTokens`
-            // does `safeTransferFrom(executor, BridgeL1, 10000e18)`
-            // BEFORE its proxy.call dispatches CC1, then later CC2-
-            // nested needs the L1 entry overlay to read the locked
-            // balance — the cache alone returns 0.
-            //
-            // Refresh the cloned cache by re-reading every loaded slot
-            // and account through `Host::sload` / `Host::balance` /
-            // `Host::load_account_info_skip_cold_load`, which go
-            // through the journal and return the LIVE post-write
-            // values. We don't need to discover NEW slots — the journal
-            // and cache touch the same addresses (any SSTORE is
-            // preceded by an SLOAD which adds the slot to the cache),
-            // so iterating cache slots is sufficient.
-            let mut cache = context.db_mut().cache.clone();
-            // Collect (addr, slot) pairs to refresh — must release the
-            // `&mut updated` borrow before calling Host::sload.
-            let mut slots_to_refresh: Vec<(Address, alloy_primitives::U256)> = Vec::new();
-            let mut addrs_to_refresh: Vec<Address> = Vec::new();
-            for (addr, acc) in &cache.accounts {
-                addrs_to_refresh.push(*addr);
-                if let Some(plain) = acc.account.as_ref() {
-                    for slot in plain.storage.keys() {
-                        slots_to_refresh.push((*addr, *slot));
+        // Overlay side-channel (nested entry-rollup re-entry): snapshot source's
+        // live cache into the channel before dispatching (preload for the entry
+        // overlay session), then apply the session's post-cache diff back after.
+        // Target-session inspectors have no channel, so both halves no-op. Bind
+        // the handle once (an Arc clone → no `self` borrow held across dispatch /
+        // record_error); `before` is Some exactly when `overlay` is.
+        let overlay = match self.overlay_channel.clone() {
+            Some(channel) => {
+                let cache = match snapshot_live_cache(context) {
+                    Ok(cache) => cache,
+                    Err(e) => {
+                        self.record_error(e);
+                        return None;
                     }
-                }
+                };
+                channel.push_pre_snapshot(cache.clone());
+                Some((channel, cache))
             }
-            // Snapshot live storage values via Host::sload (journal-aware).
-            let mut live_storage: Vec<(Address, alloy_primitives::U256, alloy_primitives::U256)> =
-                Vec::with_capacity(slots_to_refresh.len());
-            for (addr, slot) in slots_to_refresh {
-                if let Some(load) = context.sload(addr, slot) {
-                    live_storage.push((addr, slot, load.data));
-                }
-            }
-            // Snapshot live balance/nonce via Host::load_account_info_skip_cold_load.
-            let mut live_account_info: Vec<(Address, alloy_primitives::U256, u64)> =
-                Vec::with_capacity(addrs_to_refresh.len());
-            for addr in addrs_to_refresh {
-                if let Ok(info) = context.load_account_info_skip_cold_load(addr, false, true) {
-                    live_account_info.push((addr, info.balance, info.nonce));
-                }
-            }
-            // Apply live values to the cloned cache.
-            for (addr, slot, value) in live_storage {
-                if let Some(acc) = cache.accounts.get_mut(&addr) {
-                    if let Some(plain) = acc.account.as_mut() {
-                        plain.storage.insert(slot, value);
-                    }
-                }
-            }
-            for (addr, balance, nonce) in live_account_info {
-                if let Some(acc) = cache.accounts.get_mut(&addr) {
-                    if let Some(plain) = acc.account.as_mut() {
-                        plain.info.balance = balance;
-                        plain.info.nonce = nonce;
-                    }
-                }
-            }
-            before_snapshot = Some(cache.clone());
-            if let Some(channel) = &self.overlay_channel {
-                channel.push_pre_snapshot(cache);
-            }
-        }
+            None => None,
+        };
         let sim = self
             .dispatcher
             .dispatch_call(info.original_rollup_id, caller_id, req);
-        // After the dispatch: any inner sessions on THIS rollup have
-        // pushed their post-cache to `overlay_cache` (LIFO). Pop the
-        // top and apply diff onto our `&mut ctx` so this frame's
-        // continued execution sees the inner session's mutations.
-        // Errors during apply are surfaced via `record_error` so the
-        // caller's `take_error()` consumer sees them (invariant 7).
-        if overlay_active {
-            let after_opt = self
-                .overlay_channel
-                .as_ref()
-                .and_then(|c| c.pop_post_cache());
-            if let (Some(before), Some(after)) = (before_snapshot.as_ref(), after_opt.as_ref()) {
-                if let Err(e) = crate::overlay::apply_overlay_diff(context, before, after) {
+        // After dispatch: apply the inner session's post-cache diff (LIFO pop)
+        // onto this frame's `&mut ctx`, then release the pre-snapshot. Apply
+        // errors surface via record_error (invariant 7).
+        if let Some((channel, before)) = &overlay {
+            if let Some(after) = channel.pop_post_cache() {
+                if let Err(e) = crate::overlay::apply_overlay_diff(context, before, &after) {
                     self.record_error(ExecutorError::evm(format!(
                         "overlay diff-apply failed: {e}"
                     )));
                 }
             }
-            if let Some(channel) = &self.overlay_channel {
-                channel.pop_pre_snapshot();
-            }
+            channel.pop_pre_snapshot();
         }
         let sim = match sim {
             Ok(response) => response,
@@ -731,11 +730,11 @@ mod tests {
     //! snapshot.
 
     use super::*;
-    use alloy_primitives::{U256, address};
+    use alloy_primitives::{address, U256};
     use eez_protocol::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
-    use revm::MainContext;
     use revm::context::Context;
     use revm::database::{CacheDB, EmptyDB};
+    use revm::MainContext;
 
     const ROLLUPS_ADDR: Address = address!("0x1111111111111111111111111111111111111111");
     const PROXY_ADDR: Address = address!("0x2222222222222222222222222222222222222222");
