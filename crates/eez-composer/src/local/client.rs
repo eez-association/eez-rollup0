@@ -260,9 +260,9 @@ impl ChainClient for LocalChainClient {
         // entry, the source-sim inspector has already snapshotted
         // source's in-flight cache into the channel's `source_cache`
         // slot. We preload the new session's `State` with that
-        // snapshot, and forward the channel handle so the session
-        // writes its post-execute cache back to `overlay_cache` for
-        // the inspector to diff-apply onto source.
+        // snapshot. Only a session that consumed such a snapshot may
+        // write its post-execute cache back; otherwise an ordinary
+        // target session would leave stale state for a later call.
         //
         // `None` channel or `None` snapshot opens a fresh `State`,
         // which is byte-identical for fixtures whose source tx makes
@@ -279,6 +279,10 @@ impl ChainClient for LocalChainClient {
             .overlay_channel
             .as_ref()
             .and_then(|c| c.peek_pre_snapshot());
+        let overlay_write_back = preloaded_cache
+            .as_ref()
+            .zip(self.overlay_channel.as_ref())
+            .map(|(_, channel)| Arc::clone(channel));
         // `compute_proxy_address` (called from `build_tx_env` for every
         // session execute) calls `computeCrossChainProxyAddress` on a
         // chain-local contract. Both Rollups (L1) and CrossChainManager
@@ -305,7 +309,7 @@ impl ChainClient for LocalChainClient {
             proxy_lookup_addr,
             inspector_factory,
             preloaded_cache,
-            self.overlay_channel.clone(),
+            overlay_write_back,
         )?;
         Ok(Box::new(session))
     }
