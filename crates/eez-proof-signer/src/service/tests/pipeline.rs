@@ -59,10 +59,10 @@ fn settlement_pipeline_errors_have_stable_rpc_mappings() {
             "block_inspection",
         ),
         (
-            SettlementPipelineError::StateDeltaChain(
-                crate::settlement::StateDeltaChainError::NoEntries,
+            SettlementPipelineError::StateUpdateChain(
+                crate::settlement::StateUpdateChainError::NoEntries,
             ),
-            "state_delta_chain",
+            "state_update_chain",
         ),
         (
             SettlementPipelineError::EffectPrefix(
@@ -295,21 +295,21 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
 
     let mut batch = anchor_batch();
     batch.entries.push(ExecutionEntrySol {
-        stateDeltas: vec![StateDeltaSol {
-            rollupId: U256::from(1),
+        stateUpdates: vec![StateUpdateSol {
+            rollupId: 1,
             currentState: B256::ZERO,
             newState: B256::ZERO,
             etherDelta: I256::try_from(value).unwrap(),
         }],
         proxyEntryHash: call_hash,
-        destinationRollupId: U256::from(1),
         l2ToL1Calls: Vec::new(),
         expectedL1ToL2Calls: Vec::new(),
-        expectedLookups: Vec::new(),
-        callCount: U256::ZERO,
-        returnData: return_data,
         rollingHash: B256::ZERO,
+        destinationRollupId: 1,
+        success: true,
+        returnData: return_data,
     });
+    eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
     batch.callData = settlement::encode_da_payload(&[Vec::new()], &[sidecar.abi_encode()]).into();
     let expected_hash = recompute_test_public_inputs_hash(&batch);
     let calldata = eez_protocol::entries::encode_postbatch(&batch);

@@ -7,22 +7,24 @@ fn dump_entry(label: &str, e: &ExecutionEntrySol) {
     println!("== {label} ==");
     println!("  proxyEntryHash = {}", e.proxyEntryHash);
     println!("  destinationRollupId = {}", e.destinationRollupId);
-    println!("  stateDeltas.len() = {}", e.stateDeltas.len());
-    for (j, d) in e.stateDeltas.iter().enumerate() {
+    println!("  stateUpdates.len() = {}", e.stateUpdates.len());
+    for (j, d) in e.stateUpdates.iter().enumerate() {
         println!(
-            "    delta[{j}] rollupId={} currentState={} newState={} etherDelta={}",
+            "    update[{j}] rollupId={} currentState={} newState={} etherDelta={}",
             d.rollupId, d.currentState, d.newState, d.etherDelta
         );
     }
     println!("  l2ToL1Calls.len() = {}", e.l2ToL1Calls.len());
     for (j, c) in e.l2ToL1Calls.iter().enumerate() {
         println!(
-            "    call[{j}] target={} value={} source={} sourceRollupId={} revertSpan={} data=0x{}",
+            "    call[{j}] target={} value={} source={} sourceRollupId={} revertNextNCalls={} isStatic={} gas={} data=0x{}",
             c.targetAddress,
             c.value,
             c.sourceAddress,
             c.sourceRollupId,
-            c.revertSpan,
+            c.revertNextNCalls,
+            c.isStatic,
+            c.gas,
             hex::encode(&c.data)
         );
     }
@@ -30,8 +32,7 @@ fn dump_entry(label: &str, e: &ExecutionEntrySol) {
         "  expectedL1ToL2Calls.len() = {}",
         e.expectedL1ToL2Calls.len()
     );
-    println!("  expectedLookups.len() = {}", e.expectedLookups.len());
-    println!("  callCount = {}", e.callCount);
+    println!("  success = {}", e.success);
     println!("  returnData = 0x{}", hex::encode(&e.returnData));
     println!("  rollingHash = {}", e.rollingHash);
     let dir = if e.proxyEntryHash == B256::ZERO && !e.l2ToL1Calls.is_empty() {
@@ -56,10 +57,12 @@ fn main() {
 
     println!("== BATCH TOP-LEVEL ==");
     println!("entries.len() = {}", b.entries.len());
+    println!("immediateEntryCount = {}", b.immediateEntryCount);
     println!(
-        "transientExecutionEntryCount = {}",
-        b.transientExecutionEntryCount
+        "immediateStaticEntryCount = {}",
+        b.immediateStaticEntryCount
     );
+    println!("staticEntries.len() = {}", b.staticEntries.len());
     println!("callData.len() = {}", b.callData.len());
     println!("proofs.len() = {}", b.proofs.len());
     println!();
@@ -132,7 +135,7 @@ fn main() {
     println!();
     println!("######## CLAIMED CHAIN (on-chain entries[] deltas, in order) ########");
     for (i, e) in b.entries.iter().enumerate() {
-        for d in &e.stateDeltas {
+        for d in &e.stateUpdates {
             println!("entry[{i}]: {} -> {}", d.currentState, d.newState);
         }
     }

@@ -86,20 +86,27 @@ pub fn build_inbound_system_txs(
     let mut nonce = starting_nonce;
     let mut out: Vec<Bytes> = Vec::new();
     for entry in entries {
-        // `destinationRollupId` is `uint256` on-chain; rollup ids fit
-        // in u64 by construction (`crate::RollupId`).
-        let dest_rollup = u64::try_from(entry.destinationRollupId).unwrap_or(u64::MAX);
-        if dest_rollup != cfg.this_rollup_id {
+        if entry.destinationRollupId != cfg.this_rollup_id {
             continue;
         }
         if entry.l2ToL1Calls.is_empty() {
             continue;
         }
+        if !entry.success
+            || entry.l2ToL1Calls.len() != 1
+            || !entry.expectedL1ToL2Calls.is_empty()
+            || entry.l2ToL1Calls[0].isStatic
+            || entry.l2ToL1Calls[0].revertNextNCalls != 0
+            || entry.l2ToL1Calls[0].gas != 0
+        {
+            return Err(
+                "inbound system transaction uses an unsupported execution shape".to_owned(),
+            );
+        }
         let outer = &entry.l2ToL1Calls[0];
-        let source_rollup = u64::try_from(outer.sourceRollupId).unwrap_or(u64::MAX);
-        // Lower the L1 deferred entry to the lean #28 L2 mirror, then encode
-        // `executeIncomingCrossChainCall(...)` (a SINGLE lean entry under #28,
-        // no separate lookup-calls arg). NOTE: inbound runtime semantics
+        let source_rollup = outer.sourceRollupId;
+        // Build the lean L2 mirror, then encode
+        // `executeIncomingCrossChainCall(...)`. NOTE: inbound runtime semantics
         // (success / return_data byte-identity vs the composer's emit) are
         // validated in the prover phase — outbound-first does not exercise
         // this delivery path at runtime.
@@ -111,8 +118,9 @@ pub fn build_inbound_system_txs(
             source_rollup_id: RollupId(source_rollup),
             l2_rollup_id: RollupId(cfg.this_rollup_id),
             return_data: entry.returnData.clone(),
-            success: true,
-        });
+            success: entry.success,
+        })
+        .map_err(|error| error.to_string())?;
         let calldata = encode_execute_incoming(
             outer.targetAddress,
             outer.value,
@@ -174,8 +182,8 @@ pub fn build_outbound_load_table_txs(
         // the lean L2 entry directly — NOT via `encode_load_table`, which
         // lowers L1-shaped entries.
         let calldata = loadExecutionTableCall {
-            entries: vec![entry.clone()],
-            _lookupCalls: Vec::new(),
+            _entries: vec![entry.clone()],
+            _staticEntries: Vec::new(),
         }
         .abi_encode();
         let raw = sign_legacy_system_tx(
@@ -277,19 +285,35 @@ pub fn build_cross_chain_sync_pairs(
     let mut pairs: Vec<SyncPair> = Vec::with_capacity(outbound.len() + inbound.len());
 
     // N>=2 multi-call is NOT yet supported. An entry with multiple l2ToL1Calls
-    // (or callCount > 1) would be SILENTLY TRUNCATED to call[0] below (the
+    // would be SILENTLY TRUNCATED to call[0] below (the
     // outbound `.first()` and build_inbound_system_txs both read only [0]),
     // diverging the Sync-block root with no error — the #1 footgun called out in
     // docs/multicall-design.md. Fail LOUD until multi-call lands. Today the
     // composer only ever produces single-call entries, so this never fires on
     // the happy path; it is the safe boundary for the parked feature.
     let reject_multicall = |entry: &ExecutionEntrySol, dir: &str| -> Result<(), String> {
-        if entry.l2ToL1Calls.len() > 1 || entry.callCount > U256::from(1u8) {
+        if entry.l2ToL1Calls.len() > 1 {
             return Err(format!(
                 "N>=2 multi-call {dir} entry not yet supported \
-                 (l2ToL1Calls={}, callCount={}); see docs/multicall-design.md",
+                 (l2ToL1Calls={}); see docs/multicall-design.md",
                 entry.l2ToL1Calls.len(),
-                entry.callCount,
+            ));
+        }
+        if !entry.expectedL1ToL2Calls.is_empty() {
+            return Err(format!(
+                "nested {dir} entry materialization is not supported"
+            ));
+        }
+        if !entry.success {
+            return Err(format!("unsuccessful {dir} entry is not supported"));
+        }
+        if entry
+            .l2ToL1Calls
+            .iter()
+            .any(|call| call.isStatic || call.revertNextNCalls != 0 || call.gas != 0)
+        {
+            return Err(format!(
+                "{dir} entry uses static, revert-span, or explicit-gas semantics that are not supported"
             ));
         }
         Ok(())
@@ -314,8 +338,9 @@ pub fn build_cross_chain_sync_pairs(
             data: call.data.clone(),
             l2_rollup_id: RollupId(cfg.this_rollup_id),
             return_data: entry.returnData.clone(),
-            success: true,
-        });
+            success: entry.success,
+        })
+        .map_err(|error| error.to_string())?;
         let loads = build_outbound_load_table_txs(std::slice::from_ref(&l2_entry), cfg, nonce)?;
         nonce = nonce
             .checked_add(loads.len() as u64)
@@ -388,7 +413,7 @@ fn sign_legacy_system_tx(
 mod tests {
     use super::*;
     use crate::EvmBatch;
-    use crate::abi::{L2ToL1CallSol, RollupIdWithProofSystemsSol, StateDeltaSol};
+    use crate::abi::{L2ToL1CallSol, RollupIdWithProofSystemsSol, StateUpdateSol};
     use crate::entries::{decode_postbatch, encode_postbatch};
     use alloy_primitives::{B256, I256, address};
 
@@ -408,27 +433,28 @@ mod tests {
     /// lowers to an `executeIncomingCrossChainCall` system tx.
     fn inbound_entry() -> ExecutionEntrySol {
         ExecutionEntrySol {
-            stateDeltas: vec![StateDeltaSol {
-                rollupId: U256::from(1),
+            stateUpdates: vec![StateUpdateSol {
+                rollupId: 1,
                 currentState: B256::ZERO,
                 newState: B256::repeat_byte(0x11),
                 etherDelta: I256::ZERO,
             }],
             proxyEntryHash: B256::repeat_byte(0xab),
-            destinationRollupId: U256::from(1),
             l2ToL1Calls: vec![L2ToL1CallSol {
+                revertNextNCalls: 0,
+                isStatic: false,
+                gas: 0,
+                sourceAddress: address!("00000000000000000000000000000000000000cc"),
+                sourceRollupId: 0, // MAINNET source for an L1→L2 inbound
                 targetAddress: address!("00000000000000000000000000000000000000bb"),
                 value: U256::ZERO,
                 data: Bytes::from(vec![0x12, 0x34]),
-                sourceAddress: address!("00000000000000000000000000000000000000cc"),
-                sourceRollupId: U256::ZERO, // MAINNET source for an L1→L2 inbound
-                revertSpan: U256::ZERO,
             }],
             expectedL1ToL2Calls: Vec::new(),
-            expectedLookups: Vec::new(),
-            callCount: U256::from(1u8),
-            returnData: Bytes::from(vec![0xab, 0xcd]),
             rollingHash: B256::ZERO,
+            destinationRollupId: 1,
+            success: true,
+            returnData: Bytes::from(vec![0xab, 0xcd]),
         }
     }
 
@@ -438,8 +464,8 @@ mod tests {
             ..Default::default()
         };
         batch.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
-            rollupId: U256::from(1),
-            proofSystemIndex: vec![0],
+            rollupId: 1,
+            proofSystemIndexes: vec![0],
         }];
         let calldata = encode_postbatch(&batch);
         decode_postbatch(&calldata)
@@ -452,22 +478,23 @@ mod tests {
     /// lowers to a `loadExecutionTable` system tx.
     fn outbound_entry() -> ExecutionEntrySol {
         ExecutionEntrySol {
-            stateDeltas: Vec::new(),
+            stateUpdates: Vec::new(),
             proxyEntryHash: B256::ZERO, // outbound immediate
-            destinationRollupId: U256::from(1),
             l2ToL1Calls: vec![L2ToL1CallSol {
+                revertNextNCalls: 0,
+                isStatic: false,
+                gas: 0,
+                sourceAddress: address!("00000000000000000000000000000000000000ee"),
+                sourceRollupId: 1, // L2 source for an L2→L1 outbound
                 targetAddress: address!("00000000000000000000000000000000000000dd"),
                 value: U256::ZERO,
                 data: Bytes::from(vec![0x55, 0x66]),
-                sourceAddress: address!("00000000000000000000000000000000000000ee"),
-                sourceRollupId: U256::from(1), // L2 source for an L2→L1 outbound
-                revertSpan: U256::ZERO,
             }],
             expectedL1ToL2Calls: Vec::new(),
-            expectedLookups: Vec::new(),
-            callCount: U256::from(1u8),
-            returnData: Bytes::from(vec![0x77]),
             rollingHash: B256::ZERO,
+            destinationRollupId: 1,
+            success: true,
+            returnData: Bytes::from(vec![0x77]),
         }
     }
 
@@ -519,7 +546,7 @@ mod tests {
     }
 
     /// N>=2 multi-call is rejected LOUD, not silently truncated. An entry with
-    /// 2 l2ToL1Calls / callCount=2 would lower to only call[0] today (the
+    /// Two `l2ToL1Calls` would lower to only call[0] today (the
     /// outbound `.first()` + build_inbound_system_txs read only [0]); the guard
     /// turns that root-diverging footgun into a clear error pointing at the
     /// parked design (docs/multicall-design.md).
@@ -528,11 +555,10 @@ mod tests {
         let cfg = ctx();
         let user = Bytes::from(vec![0x01]);
 
-        // Outbound entry with TWO l2ToL1Calls (callCount=2) → rejected.
+        // Outbound entry with two calls → rejected.
         let mut multi_out = outbound_entry();
         let extra = multi_out.l2ToL1Calls[0].clone();
         multi_out.l2ToL1Calls.push(extra);
-        multi_out.callCount = U256::from(2u8);
         let err = build_cross_chain_sync_pairs(&[(multi_out, user.clone())], &[], &cfg, 0)
             .expect_err("N>=2 outbound must be rejected, not silently truncated");
         assert!(err.contains("multi-call outbound"), "err: {err}");
@@ -541,19 +567,36 @@ mod tests {
             "error must point at the design doc: {err}",
         );
 
-        // Inbound entry with TWO l2ToL1Calls (callCount=2) → rejected.
+        // Inbound entry with two calls → rejected.
         let mut multi_in = inbound_entry();
         let extra_in = multi_in.l2ToL1Calls[0].clone();
         multi_in.l2ToL1Calls.push(extra_in);
-        multi_in.callCount = U256::from(2u8);
         let err = build_cross_chain_sync_pairs(&[], &[multi_in], &cfg, 0)
             .expect_err("N>=2 inbound must be rejected");
         assert!(err.contains("multi-call inbound"), "err: {err}");
 
-        // Single-call (callCount=1, one l2ToL1Call) still builds fine — the
+        // A single call still builds fine — the
         // guard is a no-op on the only shape the composer produces today.
         build_cross_chain_sync_pairs(&[(outbound_entry(), user)], &[inbound_entry()], &cfg, 0)
             .expect("single-call still builds through the guard");
+    }
+
+    #[test]
+    fn cross_chain_sync_pairs_rejects_unsuccessful_entries() {
+        let cfg = ctx();
+
+        let mut outbound = outbound_entry();
+        outbound.success = false;
+        let err =
+            build_cross_chain_sync_pairs(&[(outbound, Bytes::from_static(&[0x01]))], &[], &cfg, 0)
+                .expect_err("unsuccessful outbound entries are outside the supported profile");
+        assert!(err.contains("unsuccessful outbound"), "err: {err}");
+
+        let mut inbound = inbound_entry();
+        inbound.success = false;
+        let err = build_cross_chain_sync_pairs(&[], &[inbound], &cfg, 0)
+            .expect_err("unsuccessful inbound entries are outside the supported profile");
+        assert!(err.contains("unsuccessful inbound"), "err: {err}");
     }
 
     /// Single-direction degenerates EXACTLY to the per-direction builds, so
@@ -576,7 +619,8 @@ mod tests {
             l2_rollup_id: RollupId(1),
             return_data: outbound_entry().returnData.clone(),
             success: true,
-        });
+        })
+        .unwrap();
         let direct_out =
             build_outbound_load_table_txs(std::slice::from_ref(&l2e), &cfg, n).unwrap();
         assert_eq!(out_pairs.len(), 1);
@@ -686,7 +730,8 @@ mod tests {
             l2_rollup_id: RollupId(cfg.this_rollup_id),
             return_data: Bytes::new(),
             success: true,
-        });
+        })
+        .unwrap();
 
         let emitted =
             build_outbound_load_table_txs(std::slice::from_ref(&entry), &cfg, nonce).unwrap();
@@ -699,13 +744,13 @@ mod tests {
         // Deriver rebuild: decode the entry back out of the loadExecutionTable
         // calldata and re-emit — must be byte-identical.
         let calldata = loadExecutionTableCall {
-            entries: vec![entry.clone()],
-            _lookupCalls: Vec::new(),
+            _entries: vec![entry.clone()],
+            _staticEntries: Vec::new(),
         }
         .abi_encode();
         let decoded =
             loadExecutionTableCall::abi_decode(&calldata).expect("loadExecutionTable round-trips");
-        let rebuilt = build_outbound_load_table_txs(&decoded.entries, &cfg, nonce).unwrap();
+        let rebuilt = build_outbound_load_table_txs(&decoded._entries, &cfg, nonce).unwrap();
         assert_eq!(
             emitted, rebuilt,
             "composer-emit must equal deriver-rebuild byte-for-byte"

@@ -120,14 +120,14 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
 /// Builder mode, sustained operation through a restart. Asserts every
 /// observable invariant in one place:
 ///   - lockstep: `BatchPosted == L2ExecutionPerformed`, always;
-///   - zero `ImmediateEntrySkipped` (no prestate/rolling-hash misfire);
+///   - zero `L2TxSkipped` (no prestate/rolling-hash misfire);
 ///   - `latest_event.newState == rollups[rid].stateRoot` (event-state
 ///     consistency);
 ///   - state advances forward (≠ `B256::ZERO`, monotonic);
 ///   - across restart: counts keep lockstep (no replay), state keeps
 ///     advancing (`posted_through` re-seeded from on-chain logs).
 ///
-/// Would have caught `transientExecutionEntryCount = 0` (state never
+/// Would have caught `immediateEntryCount = 0` (state never
 /// advances) AND any future replay bug across the restart boundary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn happy_case_builder_sustained() {

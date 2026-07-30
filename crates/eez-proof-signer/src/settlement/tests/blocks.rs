@@ -152,8 +152,8 @@ fn reverted_system_transactions_are_rejected_but_user_reverts_are_allowed() {
 #[test]
 fn settling_inbound_candidates_are_retained_independently_of_effect_candidates() {
     let rlp = block_rlp(vec![
-        transaction(SYSTEM_INBOUND_SELECTOR_TX),
-        transaction(USER_INBOUND_SELECTOR_TX),
+        target_system_inbound_transaction(),
+        target_user_inbound_selector_transaction(),
     ]);
 
     let facts = inspect_settling_block(&rlp, &[true, true], expected_rollup_id()).unwrap();
@@ -162,7 +162,7 @@ fn settling_inbound_candidates_are_retained_independently_of_effect_candidates()
     assert_eq!(facts.effect_candidate_positions(), [1]);
     assert_eq!(facts.inbound_candidates().len(), 1);
     assert_eq!(facts.inbound_candidates()[0].transaction_index, 0);
-    assert!(facts.inbound_candidates()[0].inspection.is_err());
+    assert!(facts.inbound_candidates()[0].inspection.is_ok());
 }
 
 #[test]
@@ -175,16 +175,7 @@ fn strict_inbound_observation_binds_the_envelope_entry_and_outcome() {
 
     assert_eq!(observation.value, value);
     assert_eq!(observation.return_data, Bytes::from_static(&[0x01, 0x02]));
-    assert!(observation.rolling_hash_committed_success);
     assert_ne!(observation.recomputed_call_hash, B256::ZERO);
-
-    let failed_call = strict_inbound_calldata(value, false);
-    let failed =
-        inspect_inbound_candidate(value, &failed_call, true, expected_rollup_id()).unwrap();
-    assert!(
-        !failed.rolling_hash_committed_success,
-        "receipt success is not inner-call success"
-    );
 }
 
 #[test]
@@ -221,8 +212,8 @@ fn strict_inbound_observation_rejects_composer_controlled_shape_changes() {
     let call = executeIncomingCrossChainCallCall::abi_decode(&calldata).unwrap();
 
     let mut wrong_source_rollup = call.clone();
-    wrong_source_rollup.sourceRollup = U256::from(2);
-    wrong_source_rollup.entries[0].incomingCalls[0].sourceRollupId = U256::from(2);
+    wrong_source_rollup.sourceRollup = 2;
+    wrong_source_rollup._entries[0].incomingCalls[0].sourceRollupId = 2;
     assert_eq!(
         inspect_inbound_candidate(
             value,
@@ -230,47 +221,45 @@ fn strict_inbound_observation_rejects_composer_controlled_shape_changes() {
             true,
             expected_rollup_id(),
         ),
-        Err(InboundObservationError::SourceRollup {
-            actual: U256::from(2),
-        })
+        Err(InboundObservationError::SourceRollup { actual: 2 })
     );
 
     type Mutation = fn(&mut executeIncomingCrossChainCallCall);
-    let mutations: [(Mutation, InboundObservationError); 13] = [
+    let mutations: [(Mutation, InboundObservationError); 12] = [
         (
-            |call| call.entries.clear(),
+            |call| call._entries.clear(),
             InboundObservationError::EntryCount { actual: 0 },
         ),
         (
-            |call| call.entries.push(call.entries[0].clone()),
+            |call| call._entries.push(call._entries[0].clone()),
             InboundObservationError::EntryCount { actual: 2 },
         ),
         (
-            |call| call.lookupCalls.push(l2_lookup_call()),
-            InboundObservationError::LookupCount { actual: 1 },
+            |call| call._staticEntries.push(Default::default()),
+            InboundObservationError::StaticEntryCount { actual: 1 },
         ),
         (
-            |call| call.entries[0].incomingCalls.clear(),
+            |call| call._entries[0].incomingCalls.clear(),
             InboundObservationError::InvalidEntryShape {
                 field: "incomingCalls",
             },
         ),
         (
             |call| {
-                let duplicate = call.entries[0].incomingCalls[0].clone();
-                call.entries[0].incomingCalls.push(duplicate);
+                let duplicate = call._entries[0].incomingCalls[0].clone();
+                call._entries[0].incomingCalls.push(duplicate);
             },
             InboundObservationError::InvalidEntryShape {
                 field: "incomingCalls",
             },
         ),
         (
-            |call| call.entries[0].callCount = U256::from(2),
-            InboundObservationError::InvalidEntryShape { field: "callCount" },
+            |call| call._entries[0].success = false,
+            InboundObservationError::InvalidEntryShape { field: "success" },
         ),
         (
             |call| {
-                call.entries[0]
+                call._entries[0]
                     .expectedOutgoingCalls
                     .push(l2_expected_outgoing_call());
             },
@@ -279,35 +268,29 @@ fn strict_inbound_observation_rejects_composer_controlled_shape_changes() {
             },
         ),
         (
-            |call| call.entries[0].expectedLookups.push(l2_expected_lookup()),
-            InboundObservationError::InvalidEntryShape {
-                field: "expectedLookups",
-            },
-        ),
-        (
-            |call| call.entries[0].incomingCalls[0].targetAddress = Address::ZERO,
+            |call| call._entries[0].incomingCalls[0].targetAddress = Address::ZERO,
             InboundObservationError::OuterInnerMismatch {
                 field: "destination",
             },
         ),
         (
-            |call| call.entries[0].incomingCalls[0].value = U256::from(8),
+            |call| call._entries[0].incomingCalls[0].value = U256::from(8),
             InboundObservationError::OuterInnerMismatch { field: "value" },
         ),
         (
             |call| {
-                call.entries[0].incomingCalls[0].data = Bytes::from_static(&[0xff]);
+                call._entries[0].incomingCalls[0].data = Bytes::from_static(&[0xff]);
             },
             InboundObservationError::OuterInnerMismatch { field: "data" },
         ),
         (
-            |call| call.entries[0].incomingCalls[0].sourceAddress = Address::ZERO,
+            |call| call._entries[0].incomingCalls[0].sourceAddress = Address::ZERO,
             InboundObservationError::OuterInnerMismatch {
                 field: "sourceAddress",
             },
         ),
         (
-            |call| call.entries[0].incomingCalls[0].sourceRollupId = U256::from(1),
+            |call| call._entries[0].incomingCalls[0].sourceRollupId = 1,
             InboundObservationError::OuterInnerMismatch {
                 field: "sourceRollup",
             },
@@ -322,24 +305,43 @@ fn strict_inbound_observation_rejects_composer_controlled_shape_changes() {
         );
     }
 
-    let mut revert_span = call.clone();
-    revert_span.entries[0].incomingCalls[0].revertSpan = U256::from(1);
-    assert_eq!(
-        inspect_inbound_candidate(value, &revert_span.abi_encode(), true, expected_rollup_id(),),
-        Err(InboundObservationError::InvalidEntryShape {
-            field: "revertSpan",
-        })
-    );
+    for (mutate, field) in [
+        (
+            (|call: &mut executeIncomingCrossChainCallCall| {
+                call._entries[0].incomingCalls[0].revertNextNCalls = 1;
+            }) as Mutation,
+            "revertNextNCalls",
+        ),
+        (
+            (|call: &mut executeIncomingCrossChainCallCall| {
+                call._entries[0].incomingCalls[0].isStatic = true;
+            }) as Mutation,
+            "isStatic",
+        ),
+        (
+            (|call: &mut executeIncomingCrossChainCallCall| {
+                call._entries[0].incomingCalls[0].gas = 1;
+            }) as Mutation,
+            "gas",
+        ),
+    ] {
+        let mut malformed = call.clone();
+        mutate(&mut malformed);
+        assert_eq!(
+            inspect_inbound_candidate(value, &malformed.abi_encode(), true, expected_rollup_id()),
+            Err(InboundObservationError::InvalidEntryShape { field })
+        );
+    }
 
     let mut forged_hash = call.clone();
-    forged_hash.entries[0].proxyEntryHash = B256::repeat_byte(0xee);
+    forged_hash._entries[0].proxyEntryHash = B256::repeat_byte(0xee);
     assert!(matches!(
         inspect_inbound_candidate(value, &forged_hash.abi_encode(), true, expected_rollup_id(),),
         Err(InboundObservationError::CallHashMismatch { .. })
     ));
 
     let mut forged_outcome = call;
-    forged_outcome.entries[0].rollingHash = B256::repeat_byte(0xdd);
+    forged_outcome._entries[0].rollingHash = B256::repeat_byte(0xdd);
     assert_eq!(
         inspect_inbound_candidate(
             value,
@@ -347,15 +349,17 @@ fn strict_inbound_observation_rejects_composer_controlled_shape_changes() {
             true,
             expected_rollup_id(),
         ),
-        Err(InboundObservationError::InvalidOutcome)
+        Err(InboundObservationError::InvalidEntryShape {
+            field: "rollingHash",
+        })
     );
 }
 
 #[test]
 fn inbound_binding_rejects_a_candidate_hidden_inside_an_outbound_pair() {
     let rlp = block_rlp(vec![
-        transaction(SYSTEM_INBOUND_SELECTOR_TX),
-        transaction(USER_INBOUND_SELECTOR_TX),
+        target_system_inbound_transaction(),
+        target_user_inbound_selector_transaction(),
     ]);
     let settling = inspect_settling_block(&rlp, &[true, true], expected_rollup_id()).unwrap();
     let pre_settling = B256::repeat_byte(0x0a);
@@ -485,7 +489,7 @@ fn validated_intermediate_blocks_reject_outbound_events() {
 
 #[test]
 fn exact_intermediate_inbound_candidate_is_rejected() {
-    let transaction = transaction(SYSTEM_INBOUND_SELECTOR_TX);
+    let transaction = target_system_inbound_transaction();
     assert!(
         transaction
             .input()
@@ -509,7 +513,7 @@ fn exact_intermediate_inbound_candidate_is_rejected() {
 
 #[test]
 fn selector_spoof_from_a_user_remains_an_ordinary_intermediate_transaction() {
-    let transaction = transaction(USER_INBOUND_SELECTOR_TX);
+    let transaction = target_user_inbound_selector_transaction();
     assert!(
         transaction
             .input()

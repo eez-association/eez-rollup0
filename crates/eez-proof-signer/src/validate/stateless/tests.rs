@@ -396,7 +396,7 @@ fn selected_checkpoints_flow_through_the_stateless_adapter() {
 }
 
 #[test]
-fn real_checkpoints_reject_legacy_inbound_call_hashes() {
+fn real_checkpoints_do_not_classify_the_legacy_inbound_selector() {
     let (mut input, chain_config, expected_checkpoints) = checkpoint_fixture();
     let block_number = input.declared_number;
     let block_rlp = input.rlp.clone();
@@ -418,37 +418,10 @@ fn real_checkpoints_reject_legacy_inbound_call_hashes() {
         NonZeroU64::new(1).unwrap(),
     )
     .unwrap();
-    assert_eq!(
-        settling.inbound_candidates().len(),
-        expected_checkpoints.len()
-    );
-    let mismatches = settling
-        .inbound_candidates()
-        .iter()
-        .map(|candidate| match &candidate.inspection {
-            Err(crate::settlement::InboundObservationError::CallHashMismatch {
-                recomputed,
-                claimed,
-            }) => (*recomputed, *claimed),
-            other => panic!("expected legacy call-hash rejection, got {other:?}"),
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        mismatches
-            .iter()
-            .map(|(_, claimed)| *claimed)
-            .collect::<Vec<_>>(),
-        [
-            b256!("44115129ec15ba85f4a5c80bcff7ab321119bb67f985c04be1350ff737958d5d"),
-            b256!("bcfcf3ae808362dc3346d66d87cb1d1aabbb114e5b9e13fa5eeb328e5b0eba21"),
-            b256!("f80b4d00f410d3ac7c369caceb0e426ea40e409b924a55ade552ad15d50f3e66"),
-        ]
-    );
-    assert!(
-        mismatches
-            .iter()
-            .all(|(recomputed, claimed)| recomputed != claimed)
-    );
+    // The transactions are still genuine system calls and checkpoint inputs,
+    // but their obsolete selector cannot enter the target inbound decoder.
+    assert_eq!(settling.system_sender_flags(), [true, true, true]);
+    assert!(settling.inbound_candidates().is_empty());
 }
 
 #[test]

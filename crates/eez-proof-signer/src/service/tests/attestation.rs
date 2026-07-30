@@ -138,25 +138,27 @@ async fn mismatched_intermediate_transaction_da_payload_is_rejected() {
 }
 
 #[tokio::test]
-async fn transient_counts_do_not_affect_rpc_admission() {
+async fn mismatched_immediate_entry_count_is_rejected() {
     let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output_for(
         &happy_block_inputs(),
     ))])))
     .await;
     let mut batch = anchor_batch();
-    batch.transientExecutionEntryCount = U256::MAX;
-    batch.transientLookupCallCount = U256::MAX;
+    batch.immediateEntryCount = U256::ZERO;
     let mut window = happy_window();
     replace_post_batch(
         &mut window,
         public_input_post_batch_for_empty_blocks(batch, 3),
     );
 
-    let _response = server.attest(window).await;
+    let status = server.prove(window).await;
+
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+    assert_eq!(status.message(), "settlement validation rejected");
 }
 
 #[tokio::test]
-async fn an_empty_batch_is_rejected_by_the_state_delta_chain_gate() {
+async fn an_empty_batch_is_rejected_by_the_state_update_chain_gate() {
     let server = TestServer::new(one_accepting_validator()).await;
     let mut window = happy_window();
     replace_post_batch(
@@ -174,7 +176,7 @@ async fn an_empty_batch_is_rejected_by_the_state_delta_chain_gate() {
 async fn a_noncanonical_anchor_is_rejected_by_the_effect_prefix_gate() {
     let server = TestServer::new(one_accepting_validator()).await;
     let mut batch = anchor_batch();
-    batch.entries[0].callCount = U256::from(1);
+    batch.entries[0].rollingHash = B256::repeat_byte(0xee);
     let mut window = happy_window();
     replace_post_batch(&mut window, public_input_post_batch_for(batch));
 
@@ -188,7 +190,7 @@ async fn a_noncanonical_anchor_is_rejected_by_the_effect_prefix_gate() {
 async fn a_nonzero_anchor_ether_delta_is_rejected() {
     let server = TestServer::new(one_accepting_validator()).await;
     let mut batch = anchor_batch();
-    batch.entries[0].stateDeltas[0].etherDelta = I256::ONE;
+    batch.entries[0].stateUpdates[0].etherDelta = I256::ONE;
     let mut window = happy_window();
     replace_post_batch(&mut window, public_input_post_batch_for(batch));
 
@@ -204,6 +206,7 @@ async fn a_second_anchor_is_rejected_by_the_effect_prefix_gate() {
     let mut batch = anchor_batch();
     let second_anchor = batch.entries[0].clone();
     batch.entries.push(second_anchor);
+    batch.immediateEntryCount = U256::from(2);
     let mut window = happy_window();
     replace_post_batch(&mut window, public_input_post_batch_for(batch));
 
@@ -288,7 +291,7 @@ async fn a_multi_block_effect_uses_the_penultimate_block_root() {
 }
 
 #[tokio::test]
-async fn a_state_delta_final_root_mismatch_is_rejected() {
+async fn a_state_update_final_root_mismatch_is_rejected() {
     let window = happy_block_inputs();
     let mut backend_output = backend_output_for(&window);
     backend_output.blocks.last_mut().unwrap().post_state_root = B256::repeat_byte(0xee);
@@ -301,11 +304,11 @@ async fn a_state_delta_final_root_mismatch_is_rejected() {
 }
 
 #[tokio::test]
-async fn a_state_delta_rollup_mismatch_is_rejected() {
+async fn a_state_update_rollup_mismatch_is_rejected() {
     let inner = one_accepting_validator();
     let server = TestServer::new(Arc::clone(&inner)).await;
     let mut batch = anchor_batch();
-    batch.entries[0].stateDeltas[0].rollupId = U256::from(2);
+    batch.entries[0].stateUpdates[0].rollupId = 2;
     let mut window = happy_window();
     replace_post_batch(&mut window, public_input_post_batch_for(batch));
 
@@ -340,8 +343,9 @@ async fn distinct_reexecuted_roots_are_attested_when_the_anchor_matches() {
     backend_output.blocks.last_mut().unwrap().post_state_root = final_root;
     let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output)]))).await;
     let mut batch = anchor_batch();
-    batch.entries[0].stateDeltas[0].currentState = parent;
-    batch.entries[0].stateDeltas[0].newState = final_root;
+    batch.entries[0].stateUpdates[0].currentState = parent;
+    batch.entries[0].stateUpdates[0].newState = final_root;
+    eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
     let mut window = happy_window();
     replace_post_batch(
         &mut window,
@@ -495,13 +499,13 @@ async fn an_inbound_candidate_hidden_in_an_outbound_pair_is_rejected() {
 }
 
 #[tokio::test]
-async fn a_nonempty_inbound_lookup_carrier_is_rejected() {
+async fn a_static_entry_carrier_is_rejected() {
     let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output_for(
         &happy_block_inputs(),
     ))])))
     .await;
     let mut batch = anchor_batch();
-    batch.l1ToL2lookupCalls.push(lookup_call());
+    batch.staticEntries.push(Default::default());
     let mut window = happy_window();
     replace_post_batch(&mut window, public_input_post_batch_for(batch));
 

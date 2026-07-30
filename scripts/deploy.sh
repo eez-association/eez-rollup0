@@ -97,7 +97,8 @@ run_forge() {
 
 # ── 1/5 DeployEEZ ────────────────────────────────────────────────────
 echo "[1/5] DeployEEZ"
-run_forge "DeployEEZ" forge script script/DeployEEZ.s.sol:DeployEEZ $RPC $KEY --broadcast
+run_forge "DeployEEZ" forge script script/DeployEEZ.s.sol:DeployEEZ \
+    --sig "run(address)" "$OWNER" $RPC $KEY --broadcast
 EEZ_REGISTRY_ADDRESS="$(extract EEZ "$OUT")"
 [[ -n "$EEZ_REGISTRY_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture EEZ address" >&2; exit 1; }
 EEZ_REGISTRY_DEPLOY_BLOCK="$(cast block-number --rpc-url "$EEZ_L1_RPC_URL")"
@@ -156,8 +157,8 @@ echo "      L1 bridge  = $EEZ_L1_BRIDGE_SENDER"
 # `parent.timestamp + 2s` until wall-clock — from a 2023 genesis
 # that's ~47M blocks of pure timestamp catch-up to reach 2026.
 # Useless work. We write a per-deploy genesis with timestamp set to
-# the L1 block that confirmed RegisterRollup, so catch-up only
-# bridges deploy-time to now.
+# the L1 block observed after deploying the EEZ registry, so catch-up
+# only bridges deployment time to now.
 GENESIS_OUT="${EEZ_GENESIS_OUT:-$REPO/datadir/genesis.json}"
 mkdir -p "$REPO/datadir"
 DEPLOY_BLOCK_TS_HEX="$(cast block "$EEZ_REGISTRY_DEPLOY_BLOCK" --rpc-url "$EEZ_L1_RPC_URL" --json | jq -r '.timestamp')"

@@ -59,8 +59,9 @@ pub struct TargetConfig {
 
 /// Per-rollup attribution inputs for batch construction.
 ///
-/// [`crate::entries::build_batch`]
-/// consumes this to chain per-entry `stateDeltas` (upstream's invariant 6).
+/// This remains the carrier for roots collected by composition sessions. The
+/// initial simplify profile attaches settlement `StateUpdate`s downstream, so
+/// its entry materializer does not consume these roots yet.
 /// Two sources of truth:
 ///
 /// - `initial_roots[rollup]` — the state root each rollup started at,

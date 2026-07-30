@@ -104,10 +104,6 @@ pub struct CrossChainExecCtx {
     /// `ECDSA.recover(publicInputsHash, proof) == signer`; the remote proof
     /// signer signs that exact hash after validating the batch.
     pub ecdsa_proof_system_address: Address,
-    /// L2 rollup id, embedded in
-    /// `batch.rollupIdsWithProofSystems[0].rollupId` so the L1
-    /// registry routes the per-rollup state delta correctly.
-    pub l2_rollup_id: u64,
 }
 
 impl std::fmt::Debug for CrossChainExecCtx {
@@ -1990,18 +1986,18 @@ where
     ///
     /// EEZ.sol's `lastVerifiedBlock` guard (lines 65-70) allows at most
     /// one `postAndVerifyBatch` per rollupId per L1 block, so every entry
-    /// drained in one Sync slot merges into ONE batch: `entries[]` and
-    /// `l1ToL2lookupCalls[]` concatenated in submission order (FIFO-
-    /// matching the deferred-consumption queue), `transientExecutionEntryCount`
-    /// summed. A single `self.inner.prover` proof covers the merged batch.
+    /// drained in one Sync slot merges into ONE batch: `entries[]` are
+    /// concatenated in submission order (FIFO-matching the deferred-consumption
+    /// queue). A single `self.inner.prover` proof covers the merged batch.
     ///
-    /// **Chained stateDeltas** (Rollup-1 §1 invariant 6): this function
+    /// **Chained state updates**: this function
     /// stitches the merged entries so `entries[k].currentState ==
-    /// entries[k-1].newState` per rollup; EEZ.sol's `_applyStateDeltas`
+    /// entries[k-1].newState` per rollup; EEZ.sol's `_applyStateUpdates`
     /// enforces the chain on L1 (`StateRootMismatch` revert) regardless of
     /// proof system. Each effect entry's `newState` is its per-effect root from
     /// `pair_roots` (required by the prover's `verify_effect_prefix_roots`); the
-    /// last is the final Sync-block root. `sync_block_state_root` is telemetry only.
+    /// last is the final Sync-block root. `sync_block_state_root` is the required
+    /// settlement-chain endpoint.
     ///
     /// # Errors
     ///
@@ -2030,7 +2026,7 @@ where
         // proof-system metadata go in.
 
         // Take the first composition's batch as the template, then
-        // merge every later composition's entries + lookupCalls into
+        // merge every later composition's entries into
         // it. Empty compositions → build a fresh empty batch shell;
         // the leading immediate entry below is the entire payload.
         let mut batch = if compositions.is_empty() {
@@ -2039,22 +2035,29 @@ where
             let mut b = compositions[0].source.batch.clone();
             for c in &compositions[1..] {
                 b.entries.extend(c.source.batch.entries.iter().cloned());
-                b.l1ToL2lookupCalls
-                    .extend(c.source.batch.l1ToL2lookupCalls.iter().cloned());
+                b.staticEntries
+                    .extend(c.source.batch.staticEntries.iter().cloned());
             }
             b
         };
 
+        if !batch.staticEntries.is_empty() {
+            return Err(
+                "static execution entries are not supported by the initial simplify profile"
+                    .to_owned(),
+            );
+        }
+
         // Prepend ONE leading immediate entry (`proxyEntryHash == 0`)
         // covering all L2 effects before the sync block — EEZ.sol drains
-        // it inline during postAndVerifyBatch, applying its stateDelta
+        // it inline during postAndVerifyBatch, applying its state update
         // against L1's recorded root.
         //
         // `currentState` = L2.stateRoot(posted) (the L1-confirmed cursor)
         // — must equal L1.config.stateRoot at postBatch time so the
         // deriver's check_claimed_state agrees. `newState` = L2 at
         // sync_block-1 (`parent_header.state_root()`), lumping every
-        // pre-sync block's effects into one stateDelta.
+        // pre-sync block's effects into one state update.
         let posted = self
             .inner
             .rollups
@@ -2075,22 +2078,20 @@ where
             h.state_root()
         };
         let pre_sync_state_root = parent_header.state_root();
-        let rollup_id_u256 = U256::from(rollup_id);
         let immediate_entry = eez_protocol::abi::ExecutionEntrySol {
-            stateDeltas: vec![eez_protocol::abi::StateDeltaSol {
-                rollupId: rollup_id_u256,
+            stateUpdates: vec![eez_protocol::abi::StateUpdateSol {
+                rollupId: rollup_id,
                 currentState: pre_state_root,
                 newState: pre_sync_state_root,
                 etherDelta: alloy_primitives::I256::ZERO,
             }],
             proxyEntryHash: B256::ZERO,
-            destinationRollupId: rollup_id_u256,
             l2ToL1Calls: Vec::new(),
             expectedL1ToL2Calls: Vec::new(),
-            expectedLookups: Vec::new(),
-            callCount: U256::ZERO,
-            returnData: Bytes::new(),
             rollingHash: B256::ZERO,
+            destinationRollupId: rollup_id,
+            success: true,
+            returnData: Bytes::new(),
         };
         batch.entries.insert(0, immediate_entry);
 
@@ -2101,7 +2102,7 @@ where
         // `_validateStructure` membership-checks it.
         for (k, oe) in outbound_entries.iter().enumerate() {
             let mut entry = oe.clone();
-            entry.destinationRollupId = rollup_id_u256;
+            entry.destinationRollupId = rollup_id;
             batch.entries.insert(1 + k, entry);
         }
 
@@ -2123,9 +2124,9 @@ where
             })
             .collect();
 
-        // Cross-chain entries arrive with EMPTY `stateDeltas`; attach one chained
+        // Cross-chain entries arrive with EMPTY `stateUpdates`; attach one chained
         // settlement delta to each (the anchor already has its own) — else
-        // `_applyStateDeltas` no-ops and the L2 root never settles. Direction by
+        // `_applyStateUpdates` no-ops and the L2 root never settles. Direction by
         // `proxyEntryHash`: outbound (== 0) → `-V` (via `outbound_ether_out`; None =
         // multi-call-with-value, unsupported → reject); inbound (!= 0) → `+V` deposit.
         // Value-free → 0.
@@ -2137,15 +2138,14 @@ where
         for entry in &mut batch.entries {
             // Skip entries that already carry a delta (the anchor); fill only the
             // cross-chain effect entries, which arrive empty.
-            if !entry.stateDeltas.is_empty() {
+            if !entry.stateUpdates.is_empty() {
                 continue;
             }
             let ether_delta = if entry.proxyEntryHash == B256::ZERO {
                 let v = eez_protocol::entries::outbound_ether_out(entry).ok_or_else(|| {
                     format!(
                         "outbound entry: multi-call value not supported \
-                         (callCount={}, l2ToL1Calls={})",
-                        entry.callCount,
+                         (l2ToL1Calls={})",
                         entry.l2ToL1Calls.len(),
                     )
                 })?;
@@ -2168,8 +2168,8 @@ where
                     pair_roots.len(),
                 )
             })?;
-            entry.stateDeltas = vec![eez_protocol::abi::StateDeltaSol {
-                rollupId: rollup_id_u256,
+            entry.stateUpdates = vec![eez_protocol::abi::StateUpdateSol {
+                rollupId: rollup_id,
                 currentState: B256::ZERO,
                 newState: new_state,
                 etherDelta: ether_delta,
@@ -2184,14 +2184,14 @@ where
             ));
         }
 
-        // Stitch the per-rollup stateDelta chain: EEZ.sol `_applyStateDeltas`
+        // Stitch the per-rollup state-update chain: EEZ.sol `_applyStateUpdates`
         // enforces `config.stateRoot == delta.currentState` then sets it to
         // `newState`, so each entry's `currentState` must chain to the prior
         // entry's `newState`. This chains `pre_sync → R_0 → … → R_last (final
         // root)`, satisfying both EEZ.sol and the prover's effect-prefix gate.
-        let mut running_roots: HashMap<U256, B256> = HashMap::new();
+        let mut running_roots: HashMap<u64, B256> = HashMap::new();
         for entry in &mut batch.entries {
-            for delta in &mut entry.stateDeltas {
+            for delta in &mut entry.stateUpdates {
                 if let Some(prev_new) = running_roots.get(&delta.rollupId).copied() {
                     delta.currentState = prev_new;
                 }
@@ -2207,39 +2207,40 @@ where
         if pair_roots.is_empty()
             && let Some(last) = batch.entries.last_mut()
         {
-            for delta in last.stateDeltas.iter_mut().rev() {
-                if delta.rollupId == rollup_id_u256 {
+            for delta in last.stateUpdates.iter_mut().rev() {
+                if delta.rollupId == rollup_id {
                     delta.newState = sync_block_state_root;
                     break;
                 }
             }
         }
 
-        // The chain must end at the Sync block's final root. The prover enforces
-        // this (gates.rs); assert locally so a stitch bug fails fast here.
-        debug_assert_eq!(
-            batch
-                .entries
-                .last()
-                .and_then(|e| e.stateDeltas.last())
-                .map(|d| d.newState),
-            Some(sync_block_state_root),
-            "settlement chain must end at the Sync-block state root",
-        );
+        // Reject a stitch bug in release builds before signing or submitting a
+        // batch whose settlement chain does not reach the Sync block root.
+        ensure_settlement_endpoint(&batch, rollup_id, sync_block_state_root)?;
+
+        // The L1 rolling seed commits the finalized ordered state updates, so
+        // it can only be computed after the stitch above has set every
+        // `currentState` and the anchor-only path has set its final root.
+        eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch)
+            .map_err(|error| format!("finalize L1 rolling hashes: {error}"))?;
 
         // The contract drains the leading contiguous `proxyEntryHash==0` run
         // inline (`EEZ.sol:387`): 1 anchor immediate + N outbound immediates.
         // Inbound deferred entries (proxyEntryHash != 0) queue for
         // `executeCrossChainCall` consumption. N=0 for inbound-only → 1.
-        batch.transientExecutionEntryCount = U256::from(1 + outbound_entries.len() as u64);
+        batch.immediateEntryCount = U256::from(1 + outbound_entries.len() as u64);
+        batch.immediateStaticEntryCount = U256::ZERO;
+        batch.blockNumber = 0;
+        batch.bindMsgSenderInPublicInput = false;
 
         // Registry-id settlement gate: refuse a batch carrying any non-registry
         // destinationRollupId (e.g. an un-rewritten MAINNET(0) outbound entry).
-        assert_batch_registry_native(&batch, rollup_id_u256)?;
+        assert_batch_registry_native(&batch, rollup_id)?;
         batch.proofSystems = vec![ctx.ecdsa_proof_system_address];
         batch.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
-            rollupId: U256::from(ctx.l2_rollup_id),
-            proofSystemIndex: vec![0u64],
+            rollupId: rollup_id,
+            proofSystemIndexes: vec![0u64],
         }];
         // Encode the full L2 block range this batch covers, not just the
         // Sync block: the composer accumulates K-1 intermediate Live
@@ -2260,7 +2261,7 @@ where
         // Reuse the SAME cursor read that anchored the leading
         // immediate's currentState above — a second read could race the
         // Deriver's cursor advance and desync the callData range from
-        // the stateDelta anchor (TOCTOU).
+        // the state-update anchor (TOCTOU).
         let from = posted + 1;
         let sync_block_number = parent_header.number() + 1;
         if sync_block_number < from {
@@ -2365,7 +2366,7 @@ where
         blocks.push(outbound_user_txs.iter().map(|b| b.to_vec()).collect());
         // L2-shape entries for system-tx reconstruction by external
         // followers. The L1 batch's `entries[]` carries the DEPOSIT-
-        // shape entries (callCount=0, no L2ToL1Calls) for value-bearing
+        // shape entries (no L2ToL1Calls) for value-bearing
         // calls; those don't carry the inbound call params the L2
         // system tx needs. The L2-shape entries live in
         // `composition.targets[].batch` (built by
@@ -2491,7 +2492,7 @@ where
 /// that isn't this rollup's registry id — a wiring bug (e.g. an outbound entry
 /// whose `dest` stayed at the call's MAINNET(0) target) that L1 would misattribute
 /// and that folds into the `publicInputsHash`. Guards the outbound `dest=rid` rewrite.
-fn assert_batch_registry_native(batch: &eez_protocol::EvmBatch, rid: U256) -> Result<(), String> {
+fn assert_batch_registry_native(batch: &eez_protocol::EvmBatch, rid: u64) -> Result<(), String> {
     for (i, entry) in batch.entries.iter().enumerate() {
         if entry.destinationRollupId != rid {
             return Err(format!(
@@ -2509,15 +2510,29 @@ fn assert_batch_registry_native(batch: &eez_protocol::EvmBatch, rid: U256) -> Re
             }
         }
     }
-    for (i, lookup) in batch.l1ToL2lookupCalls.iter().enumerate() {
-        if lookup.destinationRollupId != rid {
-            return Err(format!(
-                "l1ToL2lookupCalls[{i}].destinationRollupId = {} is not the configured registry id {rid}",
-                lookup.destinationRollupId,
-            ));
-        }
-    }
     Ok(())
+}
+
+fn ensure_settlement_endpoint(
+    batch: &eez_protocol::EvmBatch,
+    rollup_id: u64,
+    expected: B256,
+) -> Result<(), String> {
+    let actual = batch.entries.last().and_then(|entry| {
+        entry
+            .stateUpdates
+            .iter()
+            .rev()
+            .find(|update| update.rollupId == rollup_id)
+            .map(|update| update.newState)
+    });
+    if actual == Some(expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "settlement chain ends at {actual:?}, expected Sync-block root {expected}",
+        ))
+    }
 }
 
 /// Background bundle observer — verdict recording ONLY. Marks the ledger
@@ -2666,7 +2681,8 @@ async fn sign_post_batch_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::TxHash;
+    use alloy_primitives::{I256, TxHash};
+    use eez_protocol::abi::{ExecutionEntrySol, StateUpdateSol};
 
     fn held(sender: Address, direction: Direction, nonce: u64, hash_byte: u8) -> HeldTx {
         HeldTx {
@@ -2677,6 +2693,30 @@ mod tests {
             nonce,
             direction,
         }
+    }
+
+    fn batch_ending_at(rollup_id: u64, root: B256) -> eez_protocol::EvmBatch {
+        let mut batch = eez_protocol::EvmBatch::default();
+        batch.entries.push(ExecutionEntrySol {
+            stateUpdates: vec![StateUpdateSol {
+                rollupId: rollup_id,
+                currentState: B256::ZERO,
+                newState: root,
+                etherDelta: I256::ZERO,
+            }],
+            ..Default::default()
+        });
+        batch
+    }
+
+    #[test]
+    fn settlement_endpoint_must_be_present_and_match() {
+        let expected = B256::repeat_byte(0x42);
+        assert!(
+            ensure_settlement_endpoint(&eez_protocol::EvmBatch::default(), 1, expected).is_err()
+        );
+        assert!(ensure_settlement_endpoint(&batch_ending_at(1, B256::ZERO), 1, expected).is_err());
+        ensure_settlement_endpoint(&batch_ending_at(1, expected), 1, expected).unwrap();
     }
 
     #[test]

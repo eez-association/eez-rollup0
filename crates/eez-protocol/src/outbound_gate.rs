@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use crate::RollupId;
-use alloy_primitives::{B256, U256};
+use alloy_primitives::B256;
 
 use crate::abi::ExecutionEntrySol;
 use crate::action::{CallHashInput, l2_mutable_outbound_call_hash};
@@ -96,18 +96,26 @@ pub fn verify_outbound_authorized(
                 "outbound gate misused: entry {i} has non-zero proxyEntryHash (not an outbound immediate)"
             ));
         }
-        let Some(call) = entry.l2ToL1Calls.first() else {
+        let [call] = entry.l2ToL1Calls.as_slice() else {
             return Err(format!(
-                "outbound gate misused: entry {i} has empty l2ToL1Calls (not an outbound immediate)"
+                "outbound entry {i} must contain exactly one L2-to-L1 call"
             ));
         };
-        // N>=2 multi-call outbound is parked + rejected upstream
-        // (system_tx::reject_multicall); one call per immediate here.
+        if !entry.success || !entry.expectedL1ToL2Calls.is_empty() {
+            return Err(format!(
+                "outbound entry {i} uses an unsuccessful or nested execution shape"
+            ));
+        }
+        if call.isStatic || call.revertNextNCalls != 0 || call.gas != 0 {
+            return Err(format!(
+                "outbound entry {i} uses unsupported static, revert-span, or explicit-gas semantics"
+            ));
+        }
 
         // source rollup id == this L2 — the L1 delivery builds the source proxy
         // from (sourceAddress, sourceRollupId) (EEZ.sol:958), so a wrong id
         // would settle against a different source identity.
-        if call.sourceRollupId != U256::from(l2_rollup_id) {
+        if call.sourceRollupId != l2_rollup_id {
             return Err(format!(
                 "outbound entry {i}: sourceRollupId {} != this L2 {l2_rollup_id}",
                 call.sourceRollupId,
@@ -146,19 +154,18 @@ pub fn verify_outbound_authorized(
 mod tests {
     use super::*;
     use crate::abi::L2ToL1CallSol;
-    use alloy_primitives::{Address, Bytes, address};
+    use alloy_primitives::{Address, Bytes, U256, address};
 
     fn entry(calls: Vec<L2ToL1CallSol>) -> ExecutionEntrySol {
         ExecutionEntrySol {
-            stateDeltas: Vec::new(),
+            stateUpdates: Vec::new(),
             proxyEntryHash: B256::ZERO, // outbound immediate
-            destinationRollupId: U256::from(1),
-            callCount: U256::from(calls.len() as u64),
             l2ToL1Calls: calls,
             expectedL1ToL2Calls: Vec::new(),
-            expectedLookups: Vec::new(),
-            returnData: Bytes::new(),
             rollingHash: B256::ZERO,
+            destinationRollupId: 1,
+            success: true,
+            returnData: Bytes::new(),
         }
     }
 
@@ -184,12 +191,14 @@ mod tests {
 
     fn call(source: Address, target: Address, value: u64, data: &[u8]) -> L2ToL1CallSol {
         L2ToL1CallSol {
+            revertNextNCalls: 0,
+            isStatic: false,
+            gas: 0,
+            sourceAddress: source,
+            sourceRollupId: 1,
             targetAddress: target,
             value: U256::from(value),
             data: Bytes::from(data.to_vec()),
-            sourceAddress: source,
-            sourceRollupId: U256::from(1u64),
-            revertSpan: U256::ZERO,
         }
     }
 
@@ -343,5 +352,23 @@ mod tests {
 
         // Empty l2ToL1Calls = not an outbound immediate.
         assert!(verify_outbound_authorized(&[entry(vec![])], &[], 1).is_err());
+
+        let mut failed = entry(vec![c.clone()]);
+        failed.success = false;
+        assert!(verify_outbound_authorized(&[failed], &[observed(&c, 1)], 1).is_err());
+
+        for unsupported in [
+            L2ToL1CallSol {
+                isStatic: true,
+                ..c.clone()
+            },
+            L2ToL1CallSol {
+                revertNextNCalls: 1,
+                ..c.clone()
+            },
+            L2ToL1CallSol { gas: 1, ..c },
+        ] {
+            assert!(verify_outbound_authorized(&[entry(vec![unsupported])], &[], 1).is_err());
+        }
     }
 }

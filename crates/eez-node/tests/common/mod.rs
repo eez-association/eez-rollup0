@@ -461,20 +461,20 @@ sol! {
     #[sol(rpc)]
     interface IEEZ {
         event BatchPosted(uint256 rollupCount);
-        event L2ExecutionPerformed(uint256 indexed rollupId, bytes32 newState);
-        event ImmediateEntrySkipped(uint256 indexed transientIdx, bytes revertData);
-        function rollups(uint256 rollupId) external view returns (address rollupContract, bytes32 stateRoot, uint256 etherBalance);
+        event L2ExecutionPerformed(uint64 indexed rollupId, bytes32 newState);
+        event L2TxSkipped(uint256 indexed transientIdx, bytes revertData);
+        function rollups(uint64 rollupId) external view returns (address rollupContract, bytes32 stateRoot, uint256 etherBalance);
         function rollupCounter() external view returns (uint256);
-        function registerRollup(address rollupContract, bytes32 initialState) external returns (uint256 rollupId);
+        function registerRollup(address rollupContract, bytes32 initialState) external returns (uint64 rollupId);
     }
 }
 
 /// Reth's `--chain dev` genesis state root. Used as the `initialState`
 /// when registering the rollup so the very first batch's prestate
 /// (`l2_state_root(0)`) matches the on-chain `rollups[rid].stateRoot`.
-/// With the default `B256::ZERO`, every batch's `_applyStateDeltas`
+/// With the default `B256::ZERO`, every batch's `_applyStateUpdates`
 /// reverts with `StateRootMismatch`, caught by the try/catch,
-/// emitting `ImmediateEntrySkipped` instead of `L2ExecutionPerformed`.
+/// emitting `L2TxSkipped` instead of `L2ExecutionPerformed`.
 pub fn dev_genesis_state_root() -> B256 {
     reth_chainspec::DEV.genesis_header().state_root
 }
@@ -658,7 +658,7 @@ pub async fn deploy_contracts_with_initial(
         &provider,
         signer_addr,
         &out.join("EEZ.sol/EEZ.json"),
-        Vec::new(),
+        signer_addr.abi_encode(),
     )
     .await?;
     let deploy_block = provider.get_block_number().await?;
@@ -1172,7 +1172,7 @@ impl<'a> Chain<'a> {
         count_events(
             self.rpc_url,
             self.eez_address,
-            IEEZ::ImmediateEntrySkipped::SIGNATURE_HASH,
+            IEEZ::L2TxSkipped::SIGNATURE_HASH,
             self.deploy_block,
         )
         .await
@@ -1252,7 +1252,7 @@ pub async fn wait_for_l1_blocks(rpc_url: &str, target: u64, timeout: Duration) -
 pub async fn state_root(rpc_url: &str, eez: Address, rollup_id: u64) -> Result<B256> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let registry = IEEZ::new(eez, &provider);
-    let r = registry.rollups(U256::from(rollup_id)).call().await?;
+    let r = registry.rollups(rollup_id).call().await?;
     Ok(r.stateRoot)
 }
 
@@ -1484,13 +1484,13 @@ pub const CCM_L2_ADDRESS: Address = address!("0x42000000000000000000000000000000
 sol! {
     #[sol(rpc)]
     interface IEEZProxy {
-        event CrossChainProxyCreated(address indexed proxy, address indexed originalAddress, uint256 indexed originalRollupId);
-        function createCrossChainProxy(address originalAddress, uint256 originalRollupId) external returns (address proxy);
+        event CrossChainProxyCreated(address indexed proxy, address indexed originalAddress, uint64 indexed originalRollupId);
+        function createCrossChainProxy(address originalAddress, uint64 originalRollupId) external returns (address proxy);
     }
     #[sol(rpc)]
     interface ICCML2Proxy {
-        function createCrossChainProxy(address originalAddress, uint256 originalRollupId) external returns (address proxy);
-        function computeCrossChainProxyAddress(address originalAddress, uint256 originalRollupId) external view returns (address proxy);
+        function createCrossChainProxy(address originalAddress, uint64 originalRollupId) external returns (address proxy);
+        function computeCrossChainProxyAddress(address originalAddress, uint64 originalRollupId) external view returns (address proxy);
     }
     #[sol(rpc)]
     interface IValue {
@@ -1659,7 +1659,7 @@ pub async fn deploy_protocol_dev(
         key,
         DEV_CHAIN_ID,
         &out.join("EEZ.sol/EEZ.json"),
-        Vec::new(),
+        signer_addr.abi_encode(),
     )
     .await?;
     let provider = ProviderBuilder::new().connect_http(l1_rpc.parse()?);
@@ -1789,7 +1789,7 @@ pub async fn create_l2_cross_chain_proxy(
     let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
     let ccm = ICCML2Proxy::new(CCM_L2_ADDRESS, &provider);
     let proxy = ccm
-        .computeCrossChainProxyAddress(target, U256::from(original_rollup_id))
+        .computeCrossChainProxyAddress(target, original_rollup_id)
         .call()
         .await?;
     let chain_id = provider.get_chain_id().await?;
@@ -1803,7 +1803,7 @@ pub async fn create_l2_cross_chain_proxy(
         U256::ZERO,
         ICCML2Proxy::createCrossChainProxyCall {
             originalAddress: target,
-            originalRollupId: U256::from(original_rollup_id),
+            originalRollupId: original_rollup_id,
         }
         .abi_encode(),
         1_500_000,
@@ -1823,7 +1823,7 @@ pub async fn create_cross_chain_proxy(
 ) -> Result<Address> {
     let calldata = IEEZProxy::createCrossChainProxyCall {
         originalAddress: target,
-        originalRollupId: U256::from(rollup_id),
+        originalRollupId: rollup_id,
     }
     .abi_encode();
     let nonce = pending_nonce(l1_rpc, key).await?;

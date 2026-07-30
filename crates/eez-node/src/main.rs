@@ -664,12 +664,6 @@ fn main() -> eyre::Result<()> {
                         )
                     })?,
                 )?;
-                let l2_rollup_id_for_ctx: u64 = env::var("EEZ_ROLLUP_ID")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| {
-                        eyre::eyre!("EEZ_ROLLUP_ID required for L1 postBatch rollupIdsWithProofSystems[]")
-                    })?;
                 // 10 gwei comfortably exceeds the smoke user_tx's
                 // 2-gwei priority fee, so dev-reth's payload builder
                 // orders postBatch ahead of the user_tx within the
@@ -696,7 +690,6 @@ fn main() -> eyre::Result<()> {
                     l1_chain_id: l1_submission_chain_id,
                     l1_post_batch_priority_fee,
                     ecdsa_proof_system_address,
-                    l2_rollup_id: l2_rollup_id_for_ctx,
                 });
                     event!(
                         name: "eez.node.evm_composer.ready",
@@ -735,7 +728,7 @@ fn main() -> eyre::Result<()> {
                     l2_chain_id: ctx.l2_chain_id,
                     l2_gas_price: ctx.l2_gas_price,
                     l2_gas_limit: ctx.l2_gas_limit,
-                    this_rollup_id: ctx.l2_rollup_id,
+                    this_rollup_id: rollup_id,
                 }
             });
             let cross_chain_composer_wired = cross_chain.is_some();

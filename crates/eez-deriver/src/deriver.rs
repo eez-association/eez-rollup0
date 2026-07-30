@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy_eips::{Decodable2718, Encodable2718};
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT, BlockCommitterHandle, DeriveOutcome};
 use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Watcher, ScannedBatch, Submitter};
@@ -813,7 +813,7 @@ where
         );
 
         // `state_applied` only catches the IMMEDIATE-entry path, where
-        // `_applyStateDeltas` fires in the postBatch tx itself. In the
+        // `_applyStateUpdates` fires in the postBatch tx itself. In the
         // DEFERRED-entry path (our setter / deposit flow) it fires later
         // inside the user_tx calling `executeCrossChainCall` — a
         // different tx hash in the same L1 block — so the batch-log scanner
@@ -1073,13 +1073,9 @@ where
         settled_count: usize,
     ) -> DeriverResult<u64> {
         // Cross-chain path (skipped when `system_tx_cfg` is `None`):
-        // reconstruct the system txs the composer produced, from either
-        // codec branch:
-        //
-        // - `decoded.l2_entries` non-empty: the L2-shape entries travel
-        //   in the payload directly (value-bearing batches).
-        // - empty: fall back to the on-chain `batch.entries[]` (L1
-        //   entries) — for value-free calls L1 and L2 shapes coincide.
+        // reconstruct the system txs from the L2-shaped entries carried in
+        // the payload. The on-chain batch is decoded separately to validate
+        // the supported profile and obtain its explicit immediate boundary.
         event!(
             name: "eez.deriver.reconcile.start",
             Level::INFO,
@@ -1096,64 +1092,181 @@ where
         // by construction. `None` when no cross-chain cfg (loop uses user txs
         // verbatim).
         //
-        // Producing entries are ordered `[anchor, outbound…, inbound…]`:
-        // `postAndVerifyBatch` drains the leading `proxyEntryHash==0` run (anchor +
-        // outbound) inline, then consumes the deferred inbound ones (`EEZ.sol:387`).
-        // Applied entries are always a PREFIX (a skipped immediate cascades via
-        // `StateDelta` currentState mismatch, `EEZ.sol:384`), so `settled_count - 1`
-        // splits outbound-first, then inbound. One path: inbound-only / outbound-only
-        // / mixed.
+        // Producing entries are ordered `[anchor, outbound…, inbound…]`.
+        // `immediateEntryCount` includes the anchor and outbound prefix; the
+        // remaining entries are deferred inbound deliveries. Applied entries
+        // are a prefix because every entry's `StateUpdate.currentState` chains
+        // from the preceding entry, so `settled_count - 1` removes the anchor.
         //
         // `gate_outbound`: outbound entries L1 paid, stashed for the post-replay
         // gate (empty in the pure-user-tx path → no-op).
         let mut gate_outbound: Vec<eez_protocol::abi::ExecutionEntrySol> = Vec::new();
         let sync_block_txs: Option<Vec<Vec<u8>>> = match self.inner.system_tx_cfg.as_ref() {
             Some(cfg) => {
-                let mut entries = if decoded.l2_entries.is_empty() {
-                    // decode the on-chain `batch.entries[]`
-                    // from the postBatch tx input captured during the scan
-                    // (tx fetched by (block, index), pruning-robust). No
-                    // re-fetch by tx hash here — that lookup fails on a pruned
-                    // or still-resyncing embedded L1 and crashed boot catch_up
-                    // on restart-after-post.
-                    use alloy_sol_types::SolCall as _;
-                    let call =
-                        eez_protocol::abi::postAndVerifyBatchCall::abi_decode(&post_batch_input)
-                            .map_err(|e| {
-                                DeriverError::l2_provider(format!(
-                                    "decode postBatch({tx_hash}): {e}"
-                                ))
-                            })?;
-                    event!(
-                        name: "eez.deriver.reconcile.fallback_entries",
-                        Level::INFO,
-                        tx_hash = %tx_hash,
-                        entries = call.batch.entries.len(),
-                        "decoding scanned on-chain postBatch entries (codec v1 fallback)",
-                    );
-                    call.batch.entries
-                } else {
-                    use alloy_sol_types::SolValue as _;
-                    let mut out = Vec::with_capacity(decoded.l2_entries.len());
-                    for (i, raw) in decoded.l2_entries.iter().enumerate() {
-                        let entry =
-                            eez_protocol::abi::ExecutionEntrySol::abi_decode(raw).map_err(|e| {
-                                DeriverError::l2_provider(format!(
-                                    "decode l2_entries[{i}] for tx {tx_hash}: {e}"
-                                ))
-                            })?;
-                        out.push(entry);
+                // Decode from the input captured by the L1 scan. Re-fetching by
+                // transaction hash is not safe against pruned or resyncing L1
+                // providers.
+                use alloy_sol_types::{SolCall as _, SolValue as _};
+                let posted =
+                    eez_protocol::abi::postAndVerifyBatchCall::abi_decode(&post_batch_input)
+                        .map_err(|error| {
+                            DeriverError::l2_provider(format!(
+                                "decode postBatch({tx_hash}): {error}"
+                            ))
+                        })?;
+                let batch = posted.batch;
+
+                if !batch.expectedStateRootPerRollup.is_empty()
+                    || !batch.staticEntries.is_empty()
+                    || batch.immediateStaticEntryCount != U256::ZERO
+                    || !batch.blobIndices.is_empty()
+                    || batch.blockNumber != 0
+                    || batch.bindMsgSenderInPublicInput
+                {
+                    return Err(DeriverError::local_diverged_with_msg(
+                        from_block,
+                        &format!(
+                            "postBatch {tx_hash} uses features outside the supported derivation profile"
+                        ),
+                    ));
+                }
+
+                let immediate_count = usize::try_from(batch.immediateEntryCount).map_err(|_| {
+                    DeriverError::local_diverged_with_msg(
+                        from_block,
+                        &format!(
+                            "postBatch {tx_hash} immediateEntryCount {} does not fit usize",
+                            batch.immediateEntryCount
+                        ),
+                    )
+                })?;
+                if immediate_count == 0 || immediate_count > batch.entries.len() {
+                    return Err(DeriverError::local_diverged_with_msg(
+                        from_block,
+                        &format!(
+                            "postBatch {tx_hash} has invalid local-profile immediate boundary {immediate_count}/{}",
+                            batch.entries.len()
+                        ),
+                    ));
+                }
+                if settled_count > batch.entries.len() {
+                    return Err(DeriverError::local_diverged_with_msg(
+                        from_block,
+                        &format!(
+                            "postBatch {tx_hash} settled {settled_count} entries but declares only {}",
+                            batch.entries.len()
+                        ),
+                    ));
+                }
+
+                for (index, entry) in batch.entries.iter().enumerate() {
+                    let [update] = entry.stateUpdates.as_slice() else {
+                        return Err(DeriverError::local_diverged_with_msg(
+                            from_block,
+                            &format!(
+                                "postBatch {tx_hash} entry {index} must contain exactly one StateUpdate"
+                            ),
+                        ));
+                    };
+                    if update.rollupId != cfg.this_rollup_id
+                        || entry.destinationRollupId != cfg.this_rollup_id
+                    {
+                        return Err(DeriverError::local_diverged_with_msg(
+                            from_block,
+                            &format!(
+                                "postBatch {tx_hash} entry {index} is outside rollup {}",
+                                cfg.this_rollup_id
+                            ),
+                        ));
                     }
-                    out
-                };
-                // Drop non-producing entries (the anchor immediate signs no system
-                // tx), then split by direction: `proxyEntryHash == 0` = outbound
-                // settlement, `!= 0` = inbound delivery. `partition` keeps each
-                // side's order, preserving `[outbound…, inbound…]`.
-                entries.retain(|e| !e.l2ToL1Calls.is_empty());
-                let (mut outbound, mut inbound): (Vec<_>, Vec<_>) = entries
-                    .into_iter()
-                    .partition(|e| e.proxyEntryHash == alloy_primitives::B256::ZERO);
+                    if !entry.success
+                        || !entry.expectedL1ToL2Calls.is_empty()
+                        || entry.l2ToL1Calls.len() > 1
+                        || entry.l2ToL1Calls.iter().any(|call| {
+                            call.isStatic || call.revertNextNCalls != 0 || call.gas != 0
+                        })
+                    {
+                        return Err(DeriverError::local_diverged_with_msg(
+                            from_block,
+                            &format!(
+                                "postBatch {tx_hash} entry {index} uses an unsupported execution shape"
+                            ),
+                        ));
+                    }
+                }
+
+                let anchor = &batch.entries[0];
+                if anchor.proxyEntryHash != B256::ZERO || !anchor.l2ToL1Calls.is_empty() {
+                    return Err(DeriverError::local_diverged_with_msg(
+                        from_block,
+                        &format!(
+                            "postBatch {tx_hash} does not start with the required anchor entry"
+                        ),
+                    ));
+                }
+                if batch.entries[..immediate_count]
+                    .iter()
+                    .any(|entry| entry.proxyEntryHash != B256::ZERO)
+                    || batch.entries[immediate_count..]
+                        .iter()
+                        .any(|entry| entry.proxyEntryHash == B256::ZERO)
+                {
+                    return Err(DeriverError::local_diverged_with_msg(
+                        from_block,
+                        &format!(
+                            "postBatch {tx_hash} entry order disagrees with immediateEntryCount"
+                        ),
+                    ));
+                }
+
+                let cross_chain_count = batch.entries.len() - 1;
+                if decoded.l2_entries.len() != cross_chain_count {
+                    return Err(DeriverError::local_diverged_with_msg(
+                        from_block,
+                        &format!(
+                            "postBatch {tx_hash} has {cross_chain_count} cross-chain entries but {} derivation sidecars",
+                            decoded.l2_entries.len()
+                        ),
+                    ));
+                }
+
+                let mut entries = Vec::with_capacity(decoded.l2_entries.len());
+                for (index, raw) in decoded.l2_entries.iter().enumerate() {
+                    let entry =
+                        eez_protocol::abi::ExecutionEntrySol::abi_decode(raw).map_err(|error| {
+                            DeriverError::l2_provider(format!(
+                                "decode l2_entries[{index}] for tx {tx_hash}: {error}"
+                            ))
+                        })?;
+                    if entry.proxyEntryHash != batch.entries[index + 1].proxyEntryHash {
+                        return Err(DeriverError::local_diverged_with_msg(
+                            from_block,
+                            &format!(
+                                "postBatch {tx_hash} derivation sidecar {index} does not match its on-chain entry"
+                            ),
+                        ));
+                    }
+                    entries.push(entry);
+                }
+
+                let outbound_count = immediate_count - 1;
+                if entries[..outbound_count]
+                    .iter()
+                    .any(|entry| entry.proxyEntryHash != B256::ZERO)
+                    || entries[outbound_count..]
+                        .iter()
+                        .any(|entry| entry.proxyEntryHash == B256::ZERO)
+                {
+                    return Err(DeriverError::local_diverged_with_msg(
+                        from_block,
+                        &format!(
+                            "postBatch {tx_hash} derivation sidecars disagree with immediateEntryCount"
+                        ),
+                    ));
+                }
+                let (outbound, inbound) = entries.split_at(outbound_count);
+                let mut outbound = outbound.to_vec();
+                let mut inbound = inbound.to_vec();
 
                 // Prefix split: applied non-anchor entries consume outbound first.
                 let applied = settled_count.saturating_sub(1);
@@ -1372,9 +1485,9 @@ where
     /// Loud-fail if the batch's claimed state-root chain disagrees with
     /// our STF's actual L2 roots at the batch boundaries:
     ///
-    /// - `claimed_current_state` (first stateDelta.currentState) vs the
+    /// - `claimed_current_state` (first state update's `currentState`) vs the
     ///   local root at `from_block - 1`.
-    /// - `claimed_new_state` (last stateDelta.newState) vs the local
+    /// - `claimed_new_state` (last state update's `newState`) vs the local
     ///   root at `to_block`.
     ///
     /// Both ends are checked — the composer chains deltas across
@@ -1600,26 +1713,27 @@ mod outbound_wiring_tests {
 
     fn outbound_call(source: Address, target: Address, value: u64, data: &[u8]) -> L2ToL1CallSol {
         L2ToL1CallSol {
+            revertNextNCalls: 0,
+            isStatic: false,
+            gas: 0,
+            sourceAddress: source,
+            sourceRollupId: L2_RID,
             targetAddress: target,
             value: U256::from(value),
             data: Bytes::from(data.to_vec()),
-            sourceAddress: source,
-            sourceRollupId: U256::from(L2_RID),
-            revertSpan: U256::ZERO,
         }
     }
 
     fn outbound_entry(call: L2ToL1CallSol) -> ExecutionEntrySol {
         ExecutionEntrySol {
-            stateDeltas: Vec::new(),
+            stateUpdates: Vec::new(),
             proxyEntryHash: B256::ZERO, // outbound immediate
-            destinationRollupId: U256::from(L2_RID),
-            callCount: U256::from(1u64),
             l2ToL1Calls: vec![call],
             expectedL1ToL2Calls: Vec::new(),
-            expectedLookups: Vec::new(),
-            returnData: Bytes::new(),
             rollingHash: B256::ZERO,
+            destinationRollupId: L2_RID,
+            success: true,
+            returnData: Bytes::new(),
         }
     }
 

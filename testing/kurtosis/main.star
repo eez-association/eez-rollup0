@@ -14,7 +14,7 @@ BUILDER_FLASHBOTS_RPC_PORT = 8645
 PROOF_SIGNER_GRPC_PORT = 50061
 
 # L2 genesis state root for genesis.json. Recompute if genesis alloc changes.
-L2_GENESIS_STATE_ROOT = "0xd381d828f650845aa890778c74ad2de245f5b3f2a24763f243e19a6bafb4fec5"
+L2_GENESIS_STATE_ROOT = "0x2ed06189f906981844a89fe235a57db5293c1f3d101a285c292cf453435f5ee9"
 
 
 def run(plan, args):
@@ -142,8 +142,7 @@ def run(plan, args):
         "EEZ_L2_AUTH_PORT": str(L2_ENGINE_PORT),
         "EEZ_L2_P2P_PORT": str(L2_P2P_PORT),
         "EEZ_L2_SYSTEM_KEY": l2_system_key,
-        "EEZ_L2_SYSTEM_ADDRESS": eez.get("l2_system_address", "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
-        "EEZ_CCM_L2_ADDRESS": eez.get("ccm_l2_address", "0x4200000000000000000000000000000000000007"),
+        "EEZ_CCM_L2_ADDRESS": "0x4200000000000000000000000000000000000007",
     }
 
     node_cmd = " ".join([

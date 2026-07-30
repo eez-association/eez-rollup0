@@ -79,9 +79,8 @@ pub struct DecodedBatch {
     pub transactions: Vec<RawTx>,
     /// L2-shape `ExecutionEntry` bytes (ABI-encoded). Empty for
     /// arbitrary-call batches; populated for value-bearing ones
-    /// (deposits/withdrawals), where the L1 `entries[]` is the
-    /// deposit-shape (callCount=0, no L2ToL1Calls) so the L2-shape must
-    /// travel separately for followers to rebuild the L2 system tx.
+    /// (deposits/withdrawals), where the L1 settlement entry does not
+    /// contain the exact L2 execution-table shape followers must rebuild.
     pub l2_entries: Vec<Vec<u8>>,
 }
 

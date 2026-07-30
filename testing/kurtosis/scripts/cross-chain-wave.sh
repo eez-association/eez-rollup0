@@ -187,19 +187,19 @@ L2_CHAIN_ID=$(cast chain-id --rpc-url "$L2")
 # L1 proxy = createCrossChainProxy(target_on_L2, rid=EEZ_ROLLUP_ID) on the L1 EEZ.
 create_l1_proxy() { # <target_on_L2> → proxy addr
     forge_deploy "$L1" "$L1_SETUP_KEY" CreateValueProxy.s.sol:CreateValueProxy \
-        'run(address,address,uint256)' "$EEZ_REGISTRY_ADDRESS" "$1" "$EEZ_ROLLUP_ID" | grab EEZ_VALUE_PROXY
+        'run(address,address,uint64)' "$EEZ_REGISTRY_ADDRESS" "$1" "$EEZ_ROLLUP_ID" | grab EEZ_VALUE_PROXY
 }
 # L2 proxy = computeCrossChainProxyAddress(target_on_L1, MAINNET) then
 # createCrossChainProxy on the L2 CCM (a PURE L2 tx → normal L2 RPC).
 create_l2_proxy() { # <target_on_L1> → proxy addr
     local tgt="$1" p code nonce raw
-    p=$(cast call "$EEZ_CCM_L2_PREDEPLOY" 'computeCrossChainProxyAddress(address,uint256)(address)' "$tgt" "$MAINNET_RID" --rpc-url "$L2" | tr -d '[:space:]')
+    p=$(cast call "$EEZ_CCM_L2_PREDEPLOY" 'computeCrossChainProxyAddress(address,uint64)(address)' "$tgt" "$MAINNET_RID" --rpc-url "$L2" | tr -d '[:space:]')
     code=$(cast code "$p" --rpc-url "$L2" 2>/dev/null || echo 0x)
     if [[ "$code" == "0x" || -z "$code" ]]; then
         nonce=$(cast nonce "$HH_KEY_2_ADDR" --rpc-url "$L2")
         raw=$(cast mktx --rpc-url "$L2" --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_2" --nonce "$nonce" \
             --gas-limit 1500000 --gas-price "$(gas_price_for "$L2")" \
-            "$EEZ_CCM_L2_PREDEPLOY" 'createCrossChainProxy(address,uint256)' "$tgt" "$MAINNET_RID")
+            "$EEZ_CCM_L2_PREDEPLOY" 'createCrossChainProxy(address,uint64)' "$tgt" "$MAINNET_RID")
         curl -s -X POST "$L2" -H 'Content-Type: application/json' \
             -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"],\"id\":1}" >/dev/null
         for _ in $(seq 1 30); do
@@ -503,7 +503,7 @@ run_waves() {
     local EXECUTION_COUNT
     EXECUTION_COUNT=$(cast logs --address "$EEZ_REGISTRY_ADDRESS" \
         --from-block "${EEZ_REGISTRY_DEPLOY_BLOCK:-0}" --to-block latest \
-        "L2ExecutionPerformed(uint256,bytes32)" --rpc-url "$L1" --json 2>/dev/null \
+        "L2ExecutionPerformed(uint64,bytes32)" --rpc-url "$L1" --json 2>/dev/null \
         | jq 'length' 2>/dev/null || echo 0)
     if (( EXECUTION_COUNT > 0 )); then
         echo "    ✓ L2 execution events on L1: $EXECUTION_COUNT"
@@ -518,12 +518,12 @@ run_waves() {
         | grep -oE "sync_height=[0-9]+" | grep -oE "[0-9]+" | sort -n | tail -1 || true)
     if [[ -n "$LAST_SETTLED" ]]; then
         while (( SECONDS < root_deadline )); do
-            L1_TRACKED=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint256)(address,bytes32,uint256)' \
+            L1_TRACKED=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' \
                 "$EEZ_ROLLUP_ID" --rpc-url "$L1" | sed -n '2p' | tr -d '[:space:]')
             SAFE_BLOCK=$(retry cast block safe --rpc-url "$L2" --json)
             L2_SAFE=$(jq -r '.number' <<<"$SAFE_BLOCK" | xargs cast to-dec)
             L2_ROOT=$(jq -r '.stateRoot' <<<"$SAFE_BLOCK")
-            L1_RECHECK=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint256)(address,bytes32,uint256)' \
+            L1_RECHECK=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' \
                 "$EEZ_ROLLUP_ID" --rpc-url "$L1" | sed -n '2p' | tr -d '[:space:]')
             if [[ "${L1_TRACKED,,}" == "${L1_RECHECK,,}" \
                 && "${L1_RECHECK,,}" == "${L2_ROOT,,}" ]]; then

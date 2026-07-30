@@ -121,18 +121,18 @@ deploy_l2(){ local full="$1${2#0x}" nonce raw txh ca; nonce=$(cast nonce "$HH_AD
   txh=$(curl -s -X POST "$L2" -H 'Content-Type: application/json' -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"],\"id\":1}"|jq -r '.result//empty')
   for _ in $(seq 1 30); do ca=$(cast receipt "$txh" --rpc-url "$L2" --async --json 2>/dev/null|jq -r '.contractAddress//empty'); [[ -n "$ca" && "$ca" != null ]] && break; sleep 2; done; echo "$ca"; }
 l2_proxy(){ local tgt="$1" p code nonce raw
-  p=$(cast call "$CCM" 'computeCrossChainProxyAddress(address,uint256)(address)' "$tgt" "$MAINNET_RID" --rpc-url "$L2"|tr -d '[:space:]'); code=$(cast code "$p" --rpc-url "$L2" 2>/dev/null||echo 0x)
+  p=$(cast call "$CCM" 'computeCrossChainProxyAddress(address,uint64)(address)' "$tgt" "$MAINNET_RID" --rpc-url "$L2"|tr -d '[:space:]'); code=$(cast code "$p" --rpc-url "$L2" 2>/dev/null||echo 0x)
   if [[ "$code" == "0x" || -z "$code" ]]; then nonce=$(cast nonce "$HH_ADDR_2" --rpc-url "$L2")
-    raw=$(cast mktx --rpc-url "$L2" --chain-id "$L2_CID" --private-key "$HH_KEY_2" --nonce "$nonce" --gas-limit 1500000 --gas-price 1000000000 "$CCM" 'createCrossChainProxy(address,uint256)' "$tgt" "$MAINNET_RID")
+    raw=$(cast mktx --rpc-url "$L2" --chain-id "$L2_CID" --private-key "$HH_KEY_2" --nonce "$nonce" --gas-limit 1500000 --gas-price 1000000000 "$CCM" 'createCrossChainProxy(address,uint64)' "$tgt" "$MAINNET_RID")
     curl -s -X POST "$L2" -H 'Content-Type: application/json' -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"],\"id\":1}">/dev/null
     for _ in $(seq 1 30); do code=$(cast code "$p" --rpc-url "$L2" 2>/dev/null||echo 0x); [[ "$code" != "0x" && -n "$code" ]] && break; sleep 1; done; fi; echo "$p"; }
 # Idempotent L1 proxy: reuse the deterministic address if it already has code
 # (a fixed recipient's proxy persists across runs), else create it.
 l1_proxy(){ local tgt="$1" p code
-  p=$(cast call "$EEZ_REGISTRY_ADDRESS" 'computeCrossChainProxyAddress(address,uint256)(address)' "$tgt" "$EEZ_ROLLUP_ID" --rpc-url "$L1" 2>/dev/null|tr -d '[:space:]')
+  p=$(cast call "$EEZ_REGISTRY_ADDRESS" 'computeCrossChainProxyAddress(address,uint64)(address)' "$tgt" "$EEZ_ROLLUP_ID" --rpc-url "$L1" 2>/dev/null|tr -d '[:space:]')
   code=$(cast code "$p" --rpc-url "$L1" 2>/dev/null||echo 0x)
   if [[ "$code" == "0x" || -z "$code" ]]; then
-    fdep "$L1" "$OP" CreateValueProxy.s.sol:CreateValueProxy 'run(address,address,uint256)' "$EEZ_REGISTRY_ADDRESS" "$tgt" "$EEZ_ROLLUP_ID" >/dev/null
+    fdep "$L1" "$OP" CreateValueProxy.s.sol:CreateValueProxy 'run(address,address,uint64)' "$EEZ_REGISTRY_ADDRESS" "$tgt" "$EEZ_ROLLUP_ID" >/dev/null
     for _ in $(seq 1 30); do code=$(cast code "$p" --rpc-url "$L1" 2>/dev/null||echo 0x); [[ "$code" != "0x" && -n "$code" ]] && break; sleep 1; done; fi
   echo "$p"; }
 
@@ -145,9 +145,9 @@ L2_VALUE=$(deploy_l2 "$VALUE_BC" "$(cast abi-encode 'c(uint256)' 0)")
 L2_NORET=$(deploy_l2 "$NORET_BC" "$(cast abi-encode 'c(uint256)' 0)")
 L1_VALUE=$(dep_l1 DeployValueL2.s.sol:DeployValueL2 'run(uint256)' 0 EEZ_VALUE_ADDRESS)
 L1_NORET=$(dep_l1 DeployValueNoRetL2.s.sol:DeployValueNoRetL2 'run(uint256)' 0 EEZ_VALUE_NORET_ADDRESS)
-IN_VALUE_PROXY=$(fdep "$L1" "$OP" CreateValueProxy.s.sol:CreateValueProxy 'run(address,address,uint256)' "$EEZ_REGISTRY_ADDRESS" "$L2_VALUE" "$EEZ_ROLLUP_ID"|grab EEZ_VALUE_PROXY)
-IN_NORET_PROXY=$(fdep "$L1" "$OP" CreateValueProxy.s.sol:CreateValueProxy 'run(address,address,uint256)' "$EEZ_REGISTRY_ADDRESS" "$L2_NORET" "$EEZ_ROLLUP_ID"|grab EEZ_VALUE_PROXY)
-IN_DEP_PROXY=$(fdep "$L1" "$OP" CreateValueProxy.s.sol:CreateValueProxy 'run(address,address,uint256)' "$EEZ_REGISTRY_ADDRESS" "$L2_DEP_RECIPIENT" "$EEZ_ROLLUP_ID"|grab EEZ_VALUE_PROXY)
+IN_VALUE_PROXY=$(fdep "$L1" "$OP" CreateValueProxy.s.sol:CreateValueProxy 'run(address,address,uint64)' "$EEZ_REGISTRY_ADDRESS" "$L2_VALUE" "$EEZ_ROLLUP_ID"|grab EEZ_VALUE_PROXY)
+IN_NORET_PROXY=$(fdep "$L1" "$OP" CreateValueProxy.s.sol:CreateValueProxy 'run(address,address,uint64)' "$EEZ_REGISTRY_ADDRESS" "$L2_NORET" "$EEZ_ROLLUP_ID"|grab EEZ_VALUE_PROXY)
+IN_DEP_PROXY=$(fdep "$L1" "$OP" CreateValueProxy.s.sol:CreateValueProxy 'run(address,address,uint64)' "$EEZ_REGISTRY_ADDRESS" "$L2_DEP_RECIPIENT" "$EEZ_ROLLUP_ID"|grab EEZ_VALUE_PROXY)
 IN_WRAPPER=$(fdep "$L1" "$OP" DeploySetterWrapperL1.s.sol:DeploySetterWrapperL1 'run(address)' "$IN_VALUE_PROXY"|grab EEZ_SETTER_WRAPPER)
 OUT_VALUE_PROXY=$(l2_proxy "$L1_VALUE"); OUT_NORET_PROXY=$(l2_proxy "$L1_NORET"); OUT_WD_PROXY=$(l2_proxy "$L1_WD_RECIPIENT")
 OUT_WRAPPER=$(deploy_l2 "$WRAP_BC" "$(cast abi-encode 'c(address)' "$OUT_VALUE_PROXY")")
@@ -251,7 +251,7 @@ pbb=$(grep -oE 'l1_block: [0-9]+' <<<"$clean"|grep -oE '[0-9]+$'|sort -n|uniq); 
 for b in $pbb; do [[ -n "$prev" ]] && { [[ $((b-prev)) -eq 1 ]] && consec=$((consec+1)) || gap=$((gap+1)); }; prev=$b; done
 drops=$(grep -c 'target block passed without inclusion' <<<"$clean"); evict=$(grep -c 'evicted after MAX_BUNDLE_ATTEMPTS' <<<"$clean")
 div=$(grep -cE 'diverged from L1-confirmed|local L2 state root differs' <<<"$clean")
-l1r=$(cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint256)(address,bytes32,uint256)' "$EEZ_ROLLUP_ID" --rpc-url "$L1" 2>/dev/null|sed -n '2p'|tr -d '[:space:]')
+l1r=$(cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' "$EEZ_ROLLUP_ID" --rpc-url "$L1" 2>/dev/null|sed -n '2p'|tr -d '[:space:]')
 l2r=$(cast block safe --rpc-url "$L2" --json 2>/dev/null|jq -r '.stateRoot//empty'); recon=$([[ -n "$l1r" && "${l1r,,}" == "${l2r,,}" ]] && echo PASS || echo FAIL)
 
 echo; echo "════════════════════ RESULTS ($MODE) ════════════════════"

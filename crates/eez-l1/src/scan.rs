@@ -50,7 +50,7 @@ impl BatchLogChunks {
 }
 
 /// One decoded `BatchPosted` log: winner flag plus the claimed state
-/// roots from our rollup's `StateDelta`. The Deriver's catch-up scan and
+/// roots from our rollup's `StateUpdate`. The Deriver's catch-up scan and
 /// the live [`L1Watcher`](crate::L1Watcher) poll consume the same shape.
 #[derive(Debug, Clone)]
 pub struct ScannedBatch {
@@ -76,6 +76,37 @@ pub struct ScannedBatch {
     pub settled_final_state: Option<B256>,
     pub claimed_current_state: Option<B256>,
     pub claimed_new_state: Option<B256>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OrderedSettlement {
+    transaction_index: u64,
+    log_index: u64,
+    new_state: B256,
+}
+
+#[derive(Debug)]
+struct PendingBatch {
+    scanned: ScannedBatch,
+    transaction_index: u64,
+    log_index: u64,
+    touches_rollup: bool,
+    claimed_chain: Vec<B256>,
+}
+
+/// Finds transactions containing multiple batches for the observed rollup.
+/// Their event streams cannot be separated by transaction index alone.
+fn ambiguous_batch_transactions(
+    batches: impl IntoIterator<Item = (u64, u64, bool)>,
+) -> HashSet<(u64, u64)> {
+    let mut seen = HashSet::new();
+    let mut ambiguous = HashSet::new();
+    for (block_number, transaction_index, touches_rollup) in batches {
+        if touches_rollup && !seen.insert((block_number, transaction_index)) {
+            ambiguous.insert((block_number, transaction_index));
+        }
+    }
+    ambiguous
 }
 
 fn initial_log_scan_ranges(from_block: u64, to_block: u64) -> Vec<(u64, u64)> {
@@ -144,25 +175,41 @@ pub(crate) async fn scan_batch_logs_range(
         .map_err(|e| L1Error::Provider(format!("get_logs(L2ExecutionPerformed): {e}")))?;
     let winner_tx_hashes: HashSet<B256> = winner_logs
         .iter()
-        .filter_map(|l| l.transaction_hash)
+        .filter_map(|log| log.transaction_hash)
         .collect();
-    // `L2ExecutionPerformed.newState` roots L1 settled, per L1 block (per-block
-    // not per-tx: deferred entries emit from the bundled user_tx). Each batch is
-    // credited only its own subset later — see [`attribute_settlement`].
-    let mut settled_by_block: HashMap<u64, HashSet<B256>> = HashMap::new();
-    for l in &winner_logs {
-        if let Some(bn) = l.block_number {
-            let data = l.data().data.as_ref();
-            if data.len() == 32 {
-                settled_by_block
-                    .entry(bn)
-                    .or_default()
-                    .insert(B256::from_slice(data));
-            }
-        }
+    // The contract emits one event per applied StateUpdate, in update order.
+    // Keep both that order and duplicate roots: the deriver consumes an applied
+    // count as a prefix of the batch's claimed chain.
+    let mut settled_by_block: HashMap<u64, Vec<OrderedSettlement>> = HashMap::new();
+    for log in &winner_logs {
+        let block_number = log.block_number.ok_or_else(|| {
+            L1Error::Provider("L2ExecutionPerformed log missing block_number".into())
+        })?;
+        let transaction_index = log.transaction_index.ok_or_else(|| {
+            L1Error::Provider("L2ExecutionPerformed log missing transaction_index".into())
+        })?;
+        let log_index = log.log_index.ok_or_else(|| {
+            L1Error::Provider("L2ExecutionPerformed log missing log_index".into())
+        })?;
+        let decoded = L2ExecutionPerformed::decode_log(&log.inner).map_err(|error| {
+            L1Error::Provider(format!("decode L2ExecutionPerformed log: {error}"))
+        })?;
+        settled_by_block
+            .entry(block_number)
+            .or_default()
+            .push(OrderedSettlement {
+                transaction_index,
+                log_index,
+                new_state: decoded.newState,
+            });
+    }
+    for settlements in settled_by_block.values_mut() {
+        settlements.sort_unstable_by_key(|settlement| {
+            (settlement.transaction_index, settlement.log_index)
+        });
     }
 
-    let mut out: Vec<ScannedBatch> = Vec::with_capacity(logs.len());
+    let mut pending: Vec<PendingBatch> = Vec::with_capacity(logs.len());
     for log in &logs {
         let l1_block_number = log
             .block_number
@@ -178,6 +225,9 @@ pub(crate) async fn scan_batch_logs_range(
         let tx_index = log
             .transaction_index
             .ok_or_else(|| L1Error::Provider("BatchPosted log missing transaction_index".into()))?;
+        let log_index = log
+            .log_index
+            .ok_or_else(|| L1Error::Provider("BatchPosted log missing log_index".into()))?;
         let tx = fetch_log_transaction(provider, l1_block_number, tx_index, tx_hash).await?;
         let submitter = tx.inner.signer();
         let input = tx.inner.input();
@@ -190,71 +240,135 @@ pub(crate) async fn scan_batch_logs_range(
         .map_err(|e| L1Error::Provider(format!("decode BatchPosted({tx_hash}): {e}")))?;
         let (claimed_current_state, claimed_chain) = our_state_chain(&decoded.batch, rollup_id);
         let claimed_new_state = claimed_chain.last().copied();
-        let (settled_count, settled_final_state) =
-            attribute_settlement(&claimed_chain, settled_by_block.get(&l1_block_number));
-        out.push(ScannedBatch {
-            l1_block_number,
-            l1_block_hash,
-            tx_hash,
-            submitter,
-            call_data: decoded.batch.callData,
-            post_batch_input: input.clone(),
-            state_applied: winner_tx_hashes.contains(&tx_hash),
-            settled_count,
-            settled_final_state,
-            claimed_current_state,
-            claimed_new_state,
+        let touches_rollup = decoded
+            .batch
+            .rollupIdsWithProofSystems
+            .iter()
+            .any(|rollup| rollup.rollupId == rollup_id);
+        pending.push(PendingBatch {
+            scanned: ScannedBatch {
+                l1_block_number,
+                l1_block_hash,
+                tx_hash,
+                submitter,
+                call_data: decoded.batch.callData,
+                post_batch_input: input.clone(),
+                state_applied: winner_tx_hashes.contains(&tx_hash),
+                settled_count: 0,
+                settled_final_state: None,
+                claimed_current_state,
+                claimed_new_state,
+            },
+            transaction_index: tx_index,
+            log_index,
+            touches_rollup,
+            claimed_chain,
         });
     }
-    Ok(out)
+
+    pending.sort_by_key(|batch| {
+        (
+            batch.scanned.l1_block_number,
+            batch.transaction_index,
+            batch.log_index,
+        )
+    });
+    let ambiguous_transactions = ambiguous_batch_transactions(pending.iter().map(|batch| {
+        (
+            batch.scanned.l1_block_number,
+            batch.transaction_index,
+            batch.touches_rollup,
+        )
+    }));
+    for index in 0..pending.len() {
+        let (current_and_previous, following) = pending.split_at_mut(index + 1);
+        let current = &mut current_and_previous[index];
+        // Sequential post calls can interleave each call's immediate events
+        // before its BatchPosted marker. Without a call-start boundary, leave
+        // every same-transaction batch unattributed rather than guess.
+        if !current.touches_rollup
+            || ambiguous_transactions
+                .contains(&(current.scanned.l1_block_number, current.transaction_index))
+        {
+            continue;
+        }
+
+        let block_number = current.scanned.l1_block_number;
+        // A later batch touching this rollup replaces its queues. Events in
+        // that later post transaction (including its immediate updates) belong
+        // to the later batch, so its transaction index is the exclusive bound.
+        let next_batch_tx = following
+            .iter()
+            .find(|batch| batch.scanned.l1_block_number == block_number && batch.touches_rollup)
+            .map(|batch| batch.transaction_index);
+        let settlements = settled_by_block
+            .get(&block_number)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let settlements = settlement_window(settlements, current.transaction_index, next_batch_tx);
+        (
+            current.scanned.settled_count,
+            current.scanned.settled_final_state,
+        ) = attribute_settlement(
+            &current.claimed_chain,
+            settlements.iter().map(|settlement| &settlement.new_state),
+        );
+    }
+
+    Ok(pending.into_iter().map(|batch| batch.scanned).collect())
 }
 
-/// Our rollup's stateDelta chain in a batch: the first delta's `currentState`
-/// (pre-batch root) and the ordered per-delta `newState` roots.
+/// Our rollup's state-update chain in a batch: the first update's
+/// `currentState` (pre-batch root) and the ordered per-update `newState` roots.
 fn our_state_chain(
     batch: &ProofSystemBatchPerVerificationEntriesSol,
     rollup_id: u64,
 ) -> (Option<B256>, Vec<B256>) {
-    let rid = U256::from(rollup_id);
     let mut first_curr: Option<B256> = None;
     let mut new_states: Vec<B256> = Vec::new();
     for entry in &batch.entries {
-        for delta in &entry.stateDeltas {
-            if delta.rollupId == rid {
+        for update in &entry.stateUpdates {
+            if update.rollupId == rollup_id {
                 if first_curr.is_none() {
-                    first_curr = Some(delta.currentState);
+                    first_curr = Some(update.currentState);
                 }
-                new_states.push(delta.newState);
+                new_states.push(update.newState);
             }
         }
     }
     (first_curr, new_states)
 }
 
-/// How much of this batch L1 actually settled: matches the batch's claimed
-/// `newState` roots against the roots settled in its L1 block, returning the
-/// match count and the deepest match (the batch's true post-batch root), or
-/// `(0, None)` if none match — in which case the deriver skips the batch.
-///
-/// Matched per batch, not by taking the block's last settled root, because two
-/// postBatches for the same rollup can land in one L1 block: an empty `A→A`
-/// batch must not be judged against a rich `A→B` batch's `B` in that block.
-fn attribute_settlement(
+/// Returns the ordered settlement events belonging to one batch. A subsequent
+/// batch for the same rollup supersedes its queues at the start of its post
+/// transaction, making that transaction the exclusive upper bound.
+fn settlement_window(
+    block_settlements: &[OrderedSettlement],
+    batch_transaction_index: u64,
+    next_batch_transaction_index: Option<u64>,
+) -> &[OrderedSettlement] {
+    let start = block_settlements
+        .partition_point(|settlement| settlement.transaction_index < batch_transaction_index);
+    let end = next_batch_transaction_index.map_or(block_settlements.len(), |transaction_index| {
+        block_settlements
+            .partition_point(|settlement| settlement.transaction_index < transaction_index)
+    });
+    &block_settlements[start..end]
+}
+
+/// How much of this batch L1 actually settled. Only an exact leading prefix of
+/// the claimed `newState` chain is safe for the deriver to replay: every event
+/// in the batch's window must match, with no surplus observations. Comparing
+/// the ordered streams also preserves repeated roots as distinct state updates.
+fn attribute_settlement<'a>(
     claimed_chain: &[B256],
-    block_settled: Option<&HashSet<B256>>,
+    settled_roots: impl ExactSizeIterator<Item = &'a B256>,
 ) -> (usize, Option<B256>) {
-    let Some(settled) = block_settled else {
+    let count = settled_roots.len();
+    if count > claimed_chain.len() || !claimed_chain[..count].iter().eq(settled_roots) {
         return (0, None);
-    };
-    let count = claimed_chain
-        .iter()
-        .filter(|&&root| settled.contains(&root))
-        .count();
-    let final_state = claimed_chain
-        .iter()
-        .rev()
-        .find(|&&root| settled.contains(&root))
-        .copied();
+    }
+    let final_state = count.checked_sub(1).map(|index| claimed_chain[index]);
     (count, final_state)
 }
 
@@ -304,17 +418,21 @@ async fn fetch_log_transaction(
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchLogChunks, LOG_SCAN_CHUNK_BLOCKS, attribute_settlement, fetch_log_transaction,
-        initial_log_scan_ranges, scan_next_batch_log_chunk,
+        BatchLogChunks, LOG_SCAN_CHUNK_BLOCKS, OrderedSettlement, ambiguous_batch_transactions,
+        attribute_settlement, fetch_log_transaction, initial_log_scan_ranges,
+        scan_next_batch_log_chunk, settlement_window,
     };
     use crate::error::L1Error;
     use alloy_primitives::{Address, B256, Bytes, U256};
     use alloy_provider::ProviderBuilder;
     use alloy_transport::mock::Asserter;
-    use std::collections::HashSet;
 
-    fn settled(roots: &[B256]) -> HashSet<B256> {
-        roots.iter().copied().collect()
+    fn settlement(transaction_index: u64, log_index: u64, new_state: B256) -> OrderedSettlement {
+        OrderedSettlement {
+            transaction_index,
+            log_index,
+            new_state,
+        }
     }
 
     #[test]
@@ -399,17 +517,53 @@ mod tests {
     fn same_block_batches_attributed_per_chain_not_block_last() {
         let a = B256::repeat_byte(0xAA);
         let b = B256::repeat_byte(0xBB);
-        let block = settled(&[a, b]);
-        assert_eq!(attribute_settlement(&[a], Some(&block)), (1, Some(a)));
-        assert_eq!(attribute_settlement(&[b], Some(&block)), (1, Some(b)));
+        let block = [settlement(3, 1, a), settlement(7, 2, b)];
+        let first = settlement_window(&block, 3, Some(7));
+        let second = settlement_window(&block, 7, None);
+
+        assert_eq!(
+            attribute_settlement(&[a], first.iter().map(|event| &event.new_state)),
+            (1, Some(a))
+        );
+        assert_eq!(
+            attribute_settlement(&[b], second.iter().map(|event| &event.new_state)),
+            (1, Some(b))
+        );
     }
 
-    /// A loser whose claimed root never settled → `(0, None)` ⇒ deriver skips it.
     #[test]
-    fn unsettled_loser_is_skipped() {
+    fn same_transaction_rollup_batches_are_ambiguous() {
+        let ambiguous = ambiguous_batch_transactions([
+            (10, 3, true),
+            (10, 3, true),
+            (10, 7, true),
+            (11, 3, true),
+            // An unrelated batch in the same transaction is not a second
+            // attribution candidate for this rollup.
+            (12, 4, false),
+            (12, 4, true),
+        ]);
+
+        assert_eq!(ambiguous.len(), 1);
+        assert!(ambiguous.contains(&(10, 3)));
+    }
+
+    /// A loser is not credited with an equal root emitted by the next batch.
+    #[test]
+    fn later_batch_settlement_does_not_credit_loser() {
         let b = B256::repeat_byte(0xBB);
-        let y = B256::repeat_byte(0xCC);
-        assert_eq!(attribute_settlement(&[y], Some(&settled(&[b]))), (0, None));
+        let block = [settlement(7, 2, b)];
+        let loser = settlement_window(&block, 3, Some(7));
+        let winner = settlement_window(&block, 7, None);
+
+        assert_eq!(
+            attribute_settlement(&[b], loser.iter().map(|event| &event.new_state)),
+            (0, None)
+        );
+        assert_eq!(
+            attribute_settlement(&[b], winner.iter().map(|event| &event.new_state)),
+            (1, Some(b))
+        );
     }
 
     /// Partial consumption: only a prefix settled → endpoint is the deepest
@@ -419,8 +573,9 @@ mod tests {
         let b = B256::repeat_byte(0x0B);
         let c = B256::repeat_byte(0x0C);
         let d = B256::repeat_byte(0x0D);
+        let settled = [b, c];
         assert_eq!(
-            attribute_settlement(&[b, c, d], Some(&settled(&[b, c]))),
+            attribute_settlement(&[b, c, d], settled.iter()),
             (2, Some(c)),
         );
     }
@@ -430,9 +585,59 @@ mod tests {
     fn full_consumption_uses_claimed_end() {
         let b = B256::repeat_byte(0x0B);
         let c = B256::repeat_byte(0x0C);
+        let settled = [b, c];
+        assert_eq!(attribute_settlement(&[b, c], settled.iter()), (2, Some(c)),);
+    }
+
+    /// Event order is consensus order; membership alone must not turn a
+    /// reordered chain into a settled prefix.
+    #[test]
+    fn out_of_order_roots_do_not_form_a_prefix() {
+        let b = B256::repeat_byte(0x0B);
+        let c = B256::repeat_byte(0x0C);
+        let settled = [c, b];
+
+        assert_eq!(attribute_settlement(&[b, c], settled.iter()), (0, None));
+    }
+
+    /// A later mismatch invalidates the complete observation; reporting the
+    /// matching portion would make the deriver replay a prefix L1 did not emit.
+    #[test]
+    fn later_mismatch_rejects_the_observed_slice() {
+        let b = B256::repeat_byte(0x0B);
+        let c = B256::repeat_byte(0x0C);
+        let unexpected = B256::repeat_byte(0xEE);
+        let settled = [b, unexpected];
+
+        assert_eq!(attribute_settlement(&[b, c], settled.iter()), (0, None));
+    }
+
+    /// Every event in the batch's settlement window must be explained by its
+    /// claimed chain; zip truncation must not hide surplus observations.
+    #[test]
+    fn surplus_settlement_event_rejects_the_observed_slice() {
+        let b = B256::repeat_byte(0x0B);
+        let unexpected = B256::repeat_byte(0xEE);
+        let settled = [b, unexpected];
+
+        assert_eq!(attribute_settlement(&[b], settled.iter()), (0, None));
+    }
+
+    /// Repeated roots represent repeated updates and therefore require one
+    /// event each; a set would incorrectly credit both from a single event.
+    #[test]
+    fn repeated_root_requires_repeated_settlement_event() {
+        let b = B256::repeat_byte(0x0B);
+        let one_event = [b];
+        let two_events = [b, b];
+
         assert_eq!(
-            attribute_settlement(&[b, c], Some(&settled(&[b, c]))),
-            (2, Some(c)),
+            attribute_settlement(&[b, b], one_event.iter()),
+            (1, Some(b))
+        );
+        assert_eq!(
+            attribute_settlement(&[b, b], two_events.iter()),
+            (2, Some(b))
         );
     }
 
@@ -440,7 +645,7 @@ mod tests {
     #[test]
     fn no_block_settlements_is_unsettled() {
         assert_eq!(
-            attribute_settlement(&[B256::repeat_byte(1)], None),
+            attribute_settlement(&[B256::repeat_byte(1)], std::iter::empty::<&B256>()),
             (0, None)
         );
     }

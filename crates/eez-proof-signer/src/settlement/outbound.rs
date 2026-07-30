@@ -4,7 +4,11 @@ use std::num::NonZeroU64;
 
 use alloy_primitives::{B256, I256, U256};
 use eez_protocol::abi::ExecutionEntrySol;
-use eez_protocol::{CallHashInput, RollupId, SYSTEM_ADDRESS, l2_mutable_outbound_call_hash};
+use eez_protocol::rolling_hash::EntryRollingHash;
+use eez_protocol::{
+    CallHashInput, CallMode, RollupId, SYSTEM_ADDRESS, common_cross_chain_call_hash,
+    l2_mutable_outbound_call_hash,
+};
 use thiserror::Error;
 
 use super::effect_binding::{BoundEffect, BoundEffectSequence, EffectKind};
@@ -61,7 +65,7 @@ pub(crate) enum OutboundEffectError {
     DestinationRollupMismatch {
         entry_index: usize,
         expected: u64,
-        actual: U256,
+        actual: u64,
     },
     #[error(
         "outbound entry {entry_index} call has source rollup {actual}; expected rollup {expected}"
@@ -69,7 +73,7 @@ pub(crate) enum OutboundEffectError {
     SourceRollupMismatch {
         entry_index: usize,
         expected: u64,
-        actual: U256,
+        actual: u64,
     },
     #[error(
         "outbound entry {entry_index} recomputes call hash {recomputed}; transaction {transaction_index} emitted {observed}"
@@ -85,8 +89,12 @@ pub(crate) enum OutboundEffectError {
         entry_index: usize,
         field: &'static str,
     },
-    #[error("outbound entry {entry_index} does not commit to a successful single-call outcome")]
-    UnsupportedOutcome { entry_index: usize },
+    #[error("outbound entry {entry_index} claims rolling hash {claimed}; recomputed {recomputed}")]
+    RollingHashMismatch {
+        entry_index: usize,
+        recomputed: B256,
+        claimed: B256,
+    },
     #[error("outbound entry {entry_index} uses the reserved system account as its source")]
     ReservedSourceAddress { entry_index: usize },
     #[error("outbound entry {entry_index} value {value} exceeds the non-negative int256 range")]
@@ -101,7 +109,7 @@ pub(crate) enum OutboundEffectError {
     },
 }
 
-/// Outbound effects bound to positioned EEZL2 events and state-delta-free
+/// Outbound effects bound to positioned EEZL2 events and state-update-free
 /// sidecar projections.
 ///
 /// `verify_da_payload` binds each projection to its canonical `[load, user]`
@@ -113,7 +121,7 @@ pub(crate) struct AuthorizedOutboundEffects {
 }
 
 /// One authorized effect: the preceding system-load position, the user
-/// transaction position, and the entry with state deltas cleared.
+/// transaction position, and the unfinished source entry carried in DA.
 pub(super) struct AuthorizedOutboundEffect {
     load_transaction_index: usize,
     transaction_index: usize,
@@ -151,7 +159,8 @@ impl AuthorizedOutboundEffect {
 /// system load. The function enforces outbound-before-inbound ordering, one
 /// matching event and call, matching rollup IDs and call hash, a successful
 /// single-call rolling hash, a non-system source, and an ether delta of
-/// `-value`. Stored entries omit state deltas for DA reconstruction.
+/// `-value`. Stored entries omit state updates and their unfinished L1 rolling
+/// hash for DA reconstruction.
 pub(crate) fn authorize_outbound_effects(
     bound_effects: &BoundEffectSequence<'_, '_>,
     expected_rollup_id: NonZeroU64,
@@ -222,7 +231,8 @@ pub(crate) fn authorize_outbound_effects(
                 }
                 authorize_outbound_effect(effect, observation, expected_rollup_id)?;
                 let mut derived_da_entry = effect.claimed_entry().clone();
-                derived_da_entry.stateDeltas.clear();
+                derived_da_entry.stateUpdates.clear();
+                derived_da_entry.rollingHash = B256::ZERO;
                 authorized_bindings.push(AuthorizedOutboundEffect {
                     load_transaction_index,
                     transaction_index: effect.transaction_index(),
@@ -253,26 +263,40 @@ fn authorize_outbound_effect(
     expected_rollup_id: NonZeroU64,
 ) -> Result<(), OutboundEffectError> {
     let entry_index = effect.entry_index();
-    let [call] = effect.claimed_entry().l2ToL1Calls.as_slice() else {
+    let entry = effect.claimed_entry();
+    let [call] = entry.l2ToL1Calls.as_slice() else {
         return Err(OutboundEffectError::L2ToL1CallCount {
             entry_index,
-            actual: effect.claimed_entry().l2ToL1Calls.len(),
+            actual: entry.l2ToL1Calls.len(),
         });
     };
-    if effect.claimed_entry().destinationRollupId != U256::from(expected_rollup_id.get()) {
+    if entry.destinationRollupId != expected_rollup_id.get() {
         return Err(OutboundEffectError::DestinationRollupMismatch {
             entry_index,
             expected: expected_rollup_id.get(),
-            actual: effect.claimed_entry().destinationRollupId,
+            actual: entry.destinationRollupId,
         });
     }
-    if call.sourceRollupId != U256::from(expected_rollup_id.get()) {
+    if call.sourceRollupId != expected_rollup_id.get() {
         return Err(OutboundEffectError::SourceRollupMismatch {
             entry_index,
             expected: expected_rollup_id.get(),
             actual: call.sourceRollupId,
         });
     }
+    for (valid, field) in [
+        (entry.proxyEntryHash == B256::ZERO, "proxyEntryHash"),
+        (entry.expectedL1ToL2Calls.is_empty(), "expectedL1ToL2Calls"),
+        (entry.success, "success"),
+        (call.revertNextNCalls == 0, "revertNextNCalls"),
+        (!call.isStatic, "isStatic"),
+        (call.gas == 0, "gas"),
+    ] {
+        if !valid {
+            return Err(OutboundEffectError::InvalidEntryShape { entry_index, field });
+        }
+    }
+
     let decoded_event =
         observation
             .decoded_event()
@@ -308,30 +332,33 @@ fn authorize_outbound_effect(
         });
     }
 
-    for (valid, field) in [
-        (
-            effect.claimed_entry().expectedL1ToL2Calls.is_empty(),
-            "expectedL1ToL2Calls",
-        ),
-        (
-            effect.claimed_entry().expectedLookups.is_empty(),
-            "expectedLookups",
-        ),
-        (
-            effect.claimed_entry().callCount == U256::from(1),
-            "callCount",
-        ),
-        (call.revertSpan.is_zero(), "revertSpan"),
-    ] {
-        if !valid {
-            return Err(OutboundEffectError::InvalidEntryShape { entry_index, field });
-        }
-    }
-    // Outcome recovery normally short-circuits zero-value calls. The helper
-    // below deliberately probes with a nonzero value so the rolling-hash
-    // commitment is checked for every authorized outbound effect.
-    if !commits_to_successful_single_call(effect.claimed_entry()) {
-        return Err(OutboundEffectError::UnsupportedOutcome { entry_index });
+    // L1 uses the common gas-free call identity in the rolling hash. This is
+    // deliberately distinct from the gas-aware L2 event hash checked above.
+    let l1_call_hash = common_cross_chain_call_hash(
+        CallMode::Mutable,
+        CallHashInput {
+            source_address: call.sourceAddress,
+            source_rollup_id: RollupId(call.sourceRollupId),
+            target_address: call.targetAddress,
+            target_rollup_id: RollupId::MAINNET,
+            value: call.value,
+            data: &call.data,
+        },
+    );
+    let update = effect.claimed_state_update();
+    let mut rolling_hash = EntryRollingHash::for_l1(
+        [(update.rollupId, update.currentState)],
+        entry.proxyEntryHash,
+    );
+    rolling_hash.call_begin(l1_call_hash);
+    rolling_hash.call_end(entry.success, &entry.returnData);
+    let recomputed_rolling_hash = rolling_hash.current();
+    if entry.rollingHash != recomputed_rolling_hash {
+        return Err(OutboundEffectError::RollingHashMismatch {
+            entry_index,
+            recomputed: recomputed_rolling_hash,
+            claimed: entry.rollingHash,
+        });
     }
 
     if call.sourceAddress == SYSTEM_ADDRESS {
@@ -344,28 +371,12 @@ fn authorize_outbound_effect(
             entry_index,
             value: call.value,
         })?;
-    if effect.claimed_state_delta().etherDelta != expected_delta {
+    if update.etherDelta != expected_delta {
         return Err(OutboundEffectError::EtherDeltaMismatch {
             entry_index,
             expected: expected_delta,
-            actual: effect.claimed_state_delta().etherDelta,
+            actual: update.etherDelta,
         });
     }
     Ok(())
-}
-
-/// Return whether the rolling hash commits to one successful call.
-fn commits_to_successful_single_call(entry: &ExecutionEntrySol) -> bool {
-    let mut outcome_probe = entry.clone();
-    let [call] = outcome_probe.l2ToL1Calls.as_mut_slice() else {
-        return false;
-    };
-    // `outbound_ether_out` returns `Some(0)` for a zero-value entry without
-    // checking its rolling hash. Temporarily setting value to one forces outcome
-    // recovery; value is absent from the preimage, and accounting checks it.
-    if call.value.is_zero() {
-        call.value = U256::ONE;
-    }
-    let probe_value = call.value;
-    eez_protocol::entries::outbound_ether_out(&outcome_probe) == Some(probe_value)
 }

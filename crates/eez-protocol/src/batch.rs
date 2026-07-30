@@ -1,4 +1,4 @@
-//! `EvmBatch` — the table-loading batch.
+//! `EvmBatch` — the L1 protocol batch.
 //!
 //! Thin wrapper over the on-chain
 //! [`ProofSystemBatchPerVerificationEntriesSol`] struct so the
@@ -7,14 +7,8 @@
 //! and is populated by the entry builder and, at submit
 //! time, by the proof-system carrier population layer.
 //!
-//! Out of `build_batch` the proof-system fields are empty:
-//! `proofSystems = []`, `rollupIdsWithProofSystems = []`,
-//! `crossProofSystemInteractions = 0`, `blobIndices = []`,
-//! `callData = b""`, `proofs = []`. The submit path populates them
-//! (`prepare_post_batch` fills the carriers, the proof sink fills
-//! `proofs[]` with the prover's signature). The deferred-execution
-//! table (`entries`) and lookup queue (`l1ToL2lookupCalls`) are
-//! populated by [`crate::entries::build_batch`].
+//! Entry construction populates the mutable and static execution tables;
+//! submission fills the proof-system carriers and proofs.
 
 use crate::abi::ProofSystemBatchPerVerificationEntriesSol;
 
@@ -25,30 +19,27 @@ use crate::abi::ProofSystemBatchPerVerificationEntriesSol;
 pub type EvmBatch = ProofSystemBatchPerVerificationEntriesSol;
 
 impl ProofSystemBatchPerVerificationEntriesSol {
-    /// `true` if the batch carries no entries and no lookup calls.
+    /// `true` if the batch carries no mutable or static entries.
     /// Used by the composer's terminal-revert short-circuit to skip
     /// target-composition emission for a batch that was fully
     /// reverted.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.l1ToL2lookupCalls.is_empty()
+        self.entries.is_empty() && self.staticEntries.is_empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::ExecutionEntrySol;
-    use alloy_primitives::U256;
+    use crate::abi::{ExecutionEntrySol, StaticExecutionEntrySol};
 
     fn one_entry_batch(rid: u64) -> EvmBatch {
         let mut b = EvmBatch::default();
         b.entries.push(ExecutionEntrySol {
-            destinationRollupId: U256::from(rid),
-            callCount: U256::from(1u8),
+            destinationRollupId: rid,
             ..Default::default()
         });
-        b.transientExecutionEntryCount = U256::from(1u8);
         b
     }
 
@@ -56,5 +47,11 @@ mod tests {
     fn empty_batch_is_empty() {
         assert!(EvmBatch::default().is_empty());
         assert!(!one_entry_batch(7).is_empty());
+
+        let batch = EvmBatch {
+            staticEntries: vec![StaticExecutionEntrySol::default()],
+            ..Default::default()
+        };
+        assert!(!batch.is_empty());
     }
 }
