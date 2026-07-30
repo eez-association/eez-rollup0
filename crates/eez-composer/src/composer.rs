@@ -304,13 +304,12 @@ fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
 
 alloy_sol_types::sol! {
     /// Storage getter for `EEZ.rollups[rollupId]` (auto-generated
-    /// from `mapping(uint256 => RollupConfig) public rollups`).
-    /// Returns three fields in declaration order: `rollupContract`,
-    /// `stateRoot`, `etherBalance` — only `rollupContract` is
-    /// consumed here.
+    /// from `mapping(uint64 => RollupConfig) public rollups`).
+    /// Returns the three public-getter fields in declaration order;
+    /// this reader consumes `etherBalance`.
     #[sol(rpc)]
     interface IEEZReader {
-        function rollups(uint256 rollupId)
+        function rollups(uint64 rollupId)
             external
             view
             returns (address rollupContract, bytes32 stateRoot, uint256 etherBalance);
@@ -325,7 +324,7 @@ async fn read_rollup_escrow(provider: &alloy_provider::RootProvider, rid: u64) -
         .parse::<Address>()
         .ok()?;
     IEEZReader::new(eez, provider)
-        .rollups(U256::from(rid))
+        .rollups(rid)
         .call()
         .await
         .ok()
@@ -2682,7 +2681,13 @@ async fn sign_post_batch_tx(
 mod tests {
     use super::*;
     use alloy_primitives::{I256, TxHash};
+    use alloy_sol_types::SolCall;
     use eez_protocol::abi::{ExecutionEntrySol, StateUpdateSol};
+
+    #[test]
+    fn rollups_selector_matches_simplify_abi() {
+        assert_eq!(IEEZReader::rollupsCall::SELECTOR, [0xef, 0x67, 0x8d, 0x27]);
+    }
 
     fn held(sender: Address, direction: Direction, nonce: u64, hash_byte: u8) -> HeldTx {
         HeldTx {

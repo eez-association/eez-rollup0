@@ -26,6 +26,13 @@ use eez_protocol::{
 
 use super::provider::ChainProvider;
 
+alloy_sol_types::sol! {
+    function computeCrossChainProxyAddress(address originalAddress, uint64 originalRollupId)
+        external
+        view
+        returns (address proxy);
+}
+
 /// Gas limit for direct target-chain calls during inspection. Generous
 /// enough for worst-case dev-chain paths; too low → silent reverts.
 pub(super) const DIRECT_CALL_GAS_LIMIT: u64 = 30_000_000;
@@ -175,15 +182,12 @@ impl LocalExecutionSession {
         &mut self,
         source_address: Address,
         source_rollup: RollupId,
-    ) -> Option<Address> {
-        alloy_sol_types::sol! {
-            function computeCrossChainProxyAddress(address originalAddress, uint256 originalRollupId) external view returns (address);
-        }
+    ) -> ExecutorResult<Address> {
         use alloy_sol_types::SolCall;
 
         let calldata = computeCrossChainProxyAddressCall {
             originalAddress: source_address,
-            originalRollupId: U256::from(source_rollup.0),
+            originalRollupId: source_rollup.0,
         }
         .abi_encode();
 
@@ -200,11 +204,24 @@ impl LocalExecutionSession {
             let mut evm = self
                 .evm_config
                 .evm_with_env(&mut self.state, self.evm_env.clone());
-            evm.transact(tx_env).ok()?
+            evm.transact(tx_env).map_err(evm_err)?
         };
 
-        let output = result.result.output()?;
-        (output.len() >= 32).then(|| Address::from_slice(&output[12..32]))
+        if !result.result.is_success() {
+            return Err(ExecutorErrorKind::TargetTransactionReverted {
+                index: 0,
+                return_data: result.result.output().cloned().unwrap_or_default().to_vec(),
+            }
+            .into());
+        }
+
+        let output = result
+            .result
+            .output()
+            .ok_or(ExecutorErrorKind::Missing("proxy-address call output"))?;
+        computeCrossChainProxyAddressCall::abi_decode_returns_validate(output).map_err(|err| {
+            ExecutorErrorKind::Decode(format!("invalid proxy-address return data: {err}")).into()
+        })
     }
 
     /// Uninspected direct-call path: a plain `evm.transact` plus
@@ -218,7 +235,8 @@ impl LocalExecutionSession {
         source_address: &Address,
         source_rollup: RollupId,
     ) -> ExecutorResult<eez_protocol::ExecutionOutcome> {
-        let tx_env = self.build_tx_env(destination, calldata, value, source_address, source_rollup);
+        let tx_env =
+            self.build_tx_env(destination, calldata, value, source_address, source_rollup)?;
         let caller = tx_env.caller;
         let pre_root = self.current_root;
         let (return_data, gas_used, success, mut changes) = {
@@ -251,7 +269,7 @@ impl LocalExecutionSession {
     ///
     /// The target-side inspector fires from inside a scoped OS thread
     /// whose tokio entry is `Handle::block_on(...)`. This function
-    /// body MUST NOT introduce a real `` — doing so would try
+    /// body MUST NOT introduce a real `.await` — doing so would try
     /// to park back onto the outer runtime while the scoped thread
     /// is blocking a worker, producing a starvation deadlock. See
     /// the amendment C15 regression test.
@@ -264,7 +282,8 @@ impl LocalExecutionSession {
         source_address: &Address,
         source_rollup: RollupId,
     ) -> ExecutorResult<eez_protocol::ExecutionOutcome> {
-        let tx_env = self.build_tx_env(destination, calldata, value, source_address, source_rollup);
+        let tx_env =
+            self.build_tx_env(destination, calldata, value, source_address, source_rollup)?;
         let caller = tx_env.caller;
         let pre_root = self.current_root;
         let (return_data, gas_used, success, mut changes, inspector_error) = {
@@ -357,10 +376,8 @@ impl LocalExecutionSession {
         value: &U256,
         source_address: &Address,
         source_rollup: RollupId,
-    ) -> revm::context::TxEnv {
-        let caller = self
-            .compute_proxy_address(*source_address, source_rollup)
-            .unwrap_or(Address::ZERO);
+    ) -> ExecutorResult<revm::context::TxEnv> {
+        let caller = self.compute_proxy_address(*source_address, source_rollup)?;
 
         tracing::trace!(
             dest = %destination,
@@ -371,7 +388,7 @@ impl LocalExecutionSession {
             calldata_len = calldata.len(),
             "executing direct call on target chain");
 
-        revm::context::TxEnv {
+        Ok(revm::context::TxEnv {
             caller,
             gas_limit: DIRECT_CALL_GAS_LIMIT,
             kind: alloy_primitives::TxKind::Call(*destination),
@@ -379,7 +396,7 @@ impl LocalExecutionSession {
             value: *value,
             chain_id: Some(self.chain_id),
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -498,4 +515,18 @@ pub(super) fn provider_err(
 
 pub(super) fn evm_err(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> ExecutorError {
     ExecutorError::evm(e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_sol_types::SolCall;
+
+    #[test]
+    fn proxy_address_selector_matches_simplify_abi() {
+        assert_eq!(
+            computeCrossChainProxyAddressCall::SELECTOR,
+            [0xeb, 0x20, 0xc0, 0xaa]
+        );
+    }
 }

@@ -274,7 +274,8 @@ pub fn interleave_sync_block_txs(pairs: &[SyncPair]) -> Vec<Bytes> {
 /// the pre-refactor per-direction builds.
 ///
 /// # Errors
-/// Signing failure or SYSTEM_ADDRESS nonce overflow.
+/// Rejects unsupported entry shapes, signing failures, and SYSTEM_ADDRESS
+/// nonce overflow.
 pub fn build_cross_chain_sync_pairs(
     outbound: &[(ExecutionEntrySol, Bytes)],
     inbound: &[ExecutionEntrySol],
@@ -328,9 +329,9 @@ pub fn build_cross_chain_sync_pairs(
     // ── PHASE 1 — outbound: each loadExecutionTable immediately paired with
     // its consuming user tx (the self-clean requires consume-before-next-load).
     for (entry, user_tx) in outbound {
-        let Some(call) = entry.l2ToL1Calls.first() else {
-            continue;
-        };
+        let call = entry.l2ToL1Calls.first().ok_or_else(|| {
+            "outbound entry must contain exactly one l2ToL1Call; found 0".to_string()
+        })?;
         let l2_entry = build_l2_outbound_entry(OutboundEntry {
             target: call.targetAddress,
             source: call.sourceAddress,
@@ -579,6 +580,22 @@ mod tests {
         // guard is a no-op on the only shape the composer produces today.
         build_cross_chain_sync_pairs(&[(outbound_entry(), user)], &[inbound_entry()], &cfg, 0)
             .expect("single-call still builds through the guard");
+    }
+
+    #[test]
+    fn cross_chain_sync_pairs_rejects_empty_outbound_entry() {
+        let cfg = ctx();
+        let mut outbound = outbound_entry();
+        outbound.l2ToL1Calls.clear();
+
+        let err =
+            build_cross_chain_sync_pairs(&[(outbound, Bytes::from_static(&[0x01]))], &[], &cfg, 0)
+                .expect_err("an outbound entry without a call must not drop its user transaction");
+
+        assert!(
+            err.contains("exactly one l2ToL1Call"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
