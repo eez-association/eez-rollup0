@@ -16,6 +16,7 @@
 
 use alloy_primitives::{Address, Bytes, U256};
 
+use crate::action::CallMode;
 use crate::composition::CompositionBuilder;
 use crate::error::ExecutorResult;
 #[allow(
@@ -29,17 +30,17 @@ use crate::types::ExecutionOutcome;
 /// Request for a single cross-chain execution on the target chain.
 #[derive(Debug, Clone)]
 pub struct ExecutionRequest {
-    /// Contract the target-chain call lands on. Spec: `Action.targetAddress`.
+    /// Effective EVM mode, including static context inherited from a parent call.
+    pub call_mode: CallMode,
+    /// Contract invoked on the destination chain.
     pub target_address: Address,
-    /// Encoded calldata for the target-chain call. Spec: `Action.data`.
+    /// Calldata sent to the destination contract.
     pub data: Bytes,
-    /// Native value sent with the call. Spec: `Action.value`.
+    /// Native value sent with the call.
     pub value: U256,
-    /// Original caller on the source chain — becomes `msg.sender` in the
-    /// target invocation. Spec: `Action.sourceAddress`.
+    /// Original caller on the source chain; becomes `msg.sender` at the destination.
     pub source_address: Address,
-    /// Rollup ID of the source chain; used for routing and action-hash
-    /// derivation. Spec: `Action.sourceRollupId`.
+    /// Rollup ID of the source chain, used for routing and call-hash derivation.
     pub source_rollup_id: RollupId,
 }
 

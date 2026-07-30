@@ -6,10 +6,24 @@
 //! [`l2_mutable_outbound_call_hash`].
 
 use crate::RollupId;
-use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
+use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_sol_types::SolValue;
 
-use crate::abi::ActionSol;
+/// Execution mode committed by the common cross-chain call hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallMode {
+    /// Normal call, where state changes are permitted.
+    Mutable,
+    /// Static context, where the EVM enforces read-only execution.
+    Static,
+}
+
+impl CallMode {
+    /// Value encoded as the Solidity `isStatic` field.
+    const fn is_static(self) -> bool {
+        matches!(self, Self::Static)
+    }
+}
 
 /// Fields shared by the protocol's cross-chain call-hash formulas.
 ///
@@ -28,7 +42,7 @@ pub struct CallHashInput<'a> {
     /// Ether transferred by the cross-chain call.
     pub value: U256,
     /// Calldata sent to `target_address`.
-    pub data: &'a Bytes,
+    pub data: &'a [u8],
 }
 
 /// Compute the hash for a mutable call leaving an L2.
@@ -53,36 +67,26 @@ pub fn l2_mutable_outbound_call_hash(input: CallHashInput<'_>, call_gas: u64) ->
     )
 }
 
-/// Compute the target-first six-field call hash.
+/// Compute the protocol's gas-free cross-chain call hash.
 ///
-/// `keccak256(abi.encode(targetRollupId, targetAddress, value, data,
-/// sourceAddress, sourceRollupId))`.
-///
-/// This encoding has neither the call-kind discriminator used by the common
-/// contract formula nor the `callGas` field used by mutable L2 outbound calls.
-pub fn cross_chain_call_hash(
-    target_rollup_id: RollupId,
-    target_address: Address,
-    value: U256,
-    data: &Bytes,
-    source_address: Address,
-    source_rollup_id: RollupId,
-) -> B256 {
-    let action = ActionSol {
-        targetRollupId: U256::from(target_rollup_id.0),
-        targetAddress: target_address,
-        value,
-        data: data.to_vec().into(),
-        sourceAddress: source_address,
-        sourceRollupId: U256::from(source_rollup_id.0),
-    };
-    // `abi.encode(field1, field2, ...)` in Solidity uses the *params*
-    // encoding (no wrapper-tuple offset). `SolValue::abi_encode` on a
-    // sol!-generated struct emits the *standalone* encoding (32-byte
-    // tuple offset prepended when the struct contains dynamic
-    // members). Use `abi_encode_params` to match the on-chain
-    // `abi.encode(...)` call byte-for-byte.
-    keccak256(ActionSol::abi_encode_params(&action))
+/// Mirrors `EEZBase.computeCrossChainCallHash`:
+/// `keccak256(abi.encode(isStatic, sourceAddress, uint64(sourceRollupId),
+/// targetAddress, uint64(targetRollupId), value, data))`.
+/// Mutable calls leaving an L2 use [`l2_mutable_outbound_call_hash`] instead.
+#[must_use]
+pub fn common_cross_chain_call_hash(mode: CallMode, input: CallHashInput<'_>) -> B256 {
+    keccak256(
+        (
+            mode.is_static(),
+            input.source_address,
+            input.source_rollup_id.0,
+            input.target_address,
+            input.target_rollup_id.0,
+            input.value,
+            input.data,
+        )
+            .abi_encode_params(),
+    )
 }
 
 /// Storage slot of `mapping(uint256 => RollupConfig) public rollups`
@@ -123,83 +127,45 @@ pub fn compute_state_root_slot(rollup_id: RollupId) -> B256 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{address, b256};
-
-    fn sample_args() -> (RollupId, Address, U256, Bytes, Address, RollupId) {
-        (
-            RollupId(1),
-            address!("00000000000000000000000000000000000000aa"),
-            U256::from(0),
-            Bytes::from(vec![1u8, 2, 3]),
-            address!("00000000000000000000000000000000000000bb"),
-            RollupId(0),
-        )
-    }
+    use alloy_primitives::{Bytes, address, b256};
 
     #[test]
-    fn cross_chain_call_hash_deterministic() {
-        let (a, b, c, ref d, e, f) = sample_args();
-        let h1 = cross_chain_call_hash(a, b, c, d, e, f);
-        let h2 = cross_chain_call_hash(a, b, c, d, e, f);
-        assert_eq!(h1, h2);
-    }
+    fn common_call_hash_matches_solidity_vectors() {
+        let data = Bytes::from_static(&[1, 2, 3]);
+        let input = CallHashInput {
+            source_address: address!("00000000000000000000000000000000000000bb"),
+            source_rollup_id: RollupId(7),
+            target_address: address!("00000000000000000000000000000000000000aa"),
+            target_rollup_id: RollupId(1),
+            value: U256::ZERO,
+            data: &data,
+        };
 
-    #[test]
-    fn cross_chain_call_hash_changes_with_target_rollup_id() {
-        let (a, b, c, ref d, e, f) = sample_args();
-        let h1 = cross_chain_call_hash(a, b, c, d, e, f);
-        let h2 = cross_chain_call_hash(RollupId(2), b, c, d, e, f);
-        assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn cross_chain_call_hash_changes_with_target_address() {
-        let (a, _, c, ref d, e, f) = sample_args();
-        let b1 = address!("00000000000000000000000000000000000000aa");
-        let b2 = address!("00000000000000000000000000000000000000ac");
-        assert_ne!(
-            cross_chain_call_hash(a, b1, c, d, e, f),
-            cross_chain_call_hash(a, b2, c, d, e, f)
+        assert_eq!(
+            common_cross_chain_call_hash(CallMode::Mutable, input),
+            b256!("0aea0f2282e747ca563ff59f9dbd36570e9973cfc007abfa51893d3fb9aaefdf")
+        );
+        assert_eq!(
+            common_cross_chain_call_hash(CallMode::Static, input),
+            b256!("a03958bfe3866dabc6d8e5466965bdfe5f0368308af0d2069801e1562bcd35d0")
         );
     }
 
     #[test]
-    fn cross_chain_call_hash_changes_with_value() {
-        let (a, b, _, ref d, e, f) = sample_args();
-        assert_ne!(
-            cross_chain_call_hash(a, b, U256::ZERO, d, e, f),
-            cross_chain_call_hash(a, b, U256::from(1u8), d, e, f)
-        );
-    }
+    fn common_call_hash_matches_boundary_solidity_vector() {
+        let data = Bytes::new();
+        let input = CallHashInput {
+            source_address: address!("00000000000000000000000000000000000000bb"),
+            source_rollup_id: RollupId(u64::MAX),
+            target_address: address!("00000000000000000000000000000000000000aa"),
+            target_rollup_id: RollupId(u64::MAX - 1),
+            value: U256::MAX,
+            data: &data,
+        };
 
-    #[test]
-    fn cross_chain_call_hash_changes_with_data() {
-        let (a, b, c, _, e, f) = sample_args();
-        let d1 = Bytes::from(vec![1u8, 2, 3]);
-        let d2 = Bytes::from(vec![1u8, 2, 4]);
-        assert_ne!(
-            cross_chain_call_hash(a, b, c, &d1, e, f),
-            cross_chain_call_hash(a, b, c, &d2, e, f)
-        );
-    }
-
-    #[test]
-    fn cross_chain_call_hash_changes_with_source_address() {
-        let (a, b, c, ref d, _, f) = sample_args();
-        let e1 = address!("00000000000000000000000000000000000000bb");
-        let e2 = address!("00000000000000000000000000000000000000bc");
-        assert_ne!(
-            cross_chain_call_hash(a, b, c, d, e1, f),
-            cross_chain_call_hash(a, b, c, d, e2, f)
-        );
-    }
-
-    #[test]
-    fn cross_chain_call_hash_changes_with_source_rollup_id() {
-        let (a, b, c, ref d, e, _) = sample_args();
-        assert_ne!(
-            cross_chain_call_hash(a, b, c, d, e, RollupId(0)),
-            cross_chain_call_hash(a, b, c, d, e, RollupId(7))
+        assert_eq!(
+            common_cross_chain_call_hash(CallMode::Mutable, input),
+            b256!("f149543f591e628d8247387fdf6780d6aee8c119258a34b348509695c202a1a1")
         );
     }
 

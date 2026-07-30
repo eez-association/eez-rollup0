@@ -24,7 +24,9 @@ use crate::abi::{
     ExpectedOutgoingCrossChainCallSol, L2ExecutionEntrySol, L2ExpectedLookupSol, L2LookupCallSol,
     L2ToL1CallSol, LookupCallSol, StateDeltaSol, loadExecutionTableCall, postAndVerifyBatchCall,
 };
-use crate::action::{CallHashInput, cross_chain_call_hash, l2_mutable_outbound_call_hash};
+use crate::action::{
+    CallHashInput, CallMode, common_cross_chain_call_hash, l2_mutable_outbound_call_hash,
+};
 use crate::batch::EvmBatch;
 use crate::dialect::ChainDialect;
 
@@ -62,8 +64,24 @@ impl CallKind {
     }
 }
 
-/// Build the chain-shaped [`EvmBatch`] for the rollup whose dialect
-/// is supplied.
+/// Reject recorded calls that the current entry formats cannot materialize.
+pub(crate) fn ensure_materializable_calls(calls: &[ExecutedAction]) -> ProtocolResult<()> {
+    if calls.iter().any(|call| call.outcome.is_pending()) {
+        return Err(crate::ProtocolErrorKind::InvalidEncoding(
+            "recorded cross-chain call still has a pending outcome".to_owned(),
+        )
+        .into());
+    }
+    if calls.iter().any(|call| call.call_mode == CallMode::Static) {
+        return Err(crate::ProtocolErrorKind::Unsupported(
+            "static cross-chain call materialization is not implemented",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Build the chain-shaped [`EvmBatch`] for `source_rollup_id`.
 ///
 /// Walks `recorded` in preorder. Each [`CallKind::TopLevel`] call
 /// opens a new [`ExecutionEntrySol`] with that call as the outer.
@@ -81,11 +99,12 @@ impl CallKind {
 /// Returns [`crate::ProtocolErrorKind::InvalidEncoding`]
 /// if a call's outcome is `Pending` (composition lifecycle bug — every
 /// call should be resolved before entering finalize).
+/// Returns [`crate::ProtocolErrorKind::Unsupported`] when the selected calls
+/// require static-entry materialization, which is not implemented yet.
 #[tracing::instrument(level = "debug", name = "build_batch", skip_all, fields(source = %source_rollup_id), err)]
 pub fn build_batch(
     recorded: &[ExecutedAction],
     attribution: &crate::SourceAttribution<'_>,
-    dialect: &ChainDialect,
     source_rollup_id: RollupId,
     raw_tx: &[u8],
 ) -> ProtocolResult<EvmBatch> {
@@ -96,6 +115,8 @@ pub fn build_batch(
     // TODO(raw_tx): use for L1-style `executeL2TX` raw-tx routing /
     // stateless re-execution + custom-dialect entry shapes.
     let _ = (attribution, raw_tx);
+
+    ensure_materializable_calls(recorded)?;
 
     let group: Vec<&ExecutedAction> = recorded
         .iter()
@@ -112,7 +133,7 @@ pub fn build_batch(
             target: "eez::entries",
             %source_rollup_id,
             group = group.len(),
-            "build_batch: no top-level success in group → empty batch (nested/static only)",
+            "build_batch: no successful top-level call in group → empty batch",
         );
         return Ok(EvmBatch::default());
     }
@@ -145,7 +166,7 @@ pub fn build_batch(
                 // forwards on arrival" case is handled separately by
                 // `build_l1_inbound_sidecar` (see `composition.rs` has_incoming
                 // short-circuit) — an incoming call is never top-level here.
-                let builder = EntryBuilder::new(call, *dialect);
+                let builder = EntryBuilder::new(call);
                 entry_nested_number = 0;
                 current_entry = Some(builder);
             }
@@ -156,15 +177,10 @@ pub fn build_batch(
                 entry_nested_number += 1;
                 builder.append_nested(call, entry_nested_number);
             }
-            // D3 (5c51e02): nested failed / static lookups now live ENTRY-SCOPED
-            // in `expectedLookups`, keyed by execution-context cursors — a
-            // top-level `l1ToL2lookupCalls` entry would mis-consume on the new
-            // contract. The entry-scoped emission is the deferred feature; until
-            // it exists, REFUSE such a composition loudly (fail-closed) rather
-            // than emit a batch the new semantics handle wrong. Unreachable in
-            // production today (Static needs `static_meta`, never set; NestedFailed
-            // needs a depth-2 outbound try/catch path no harness exercises) — but
-            // gated so a future trigger errors instead of silently corrupting.
+            // Nested failed lookups require entry-scoped `expectedLookups` keyed
+            // by execution-context cursors. Refuse them until that representation
+            // is implemented instead of emitting a top-level lookup with different
+            // consumption semantics.
             CallKind::NestedFailed => {
                 return Err(crate::ProtocolErrorKind::Unsupported(
                     "nested failed cross-chain lookup: entry-scoped emission (5c51e02) not built",
@@ -245,7 +261,10 @@ pub fn build_batch(
 /// builder emits them empty.
 #[must_use]
 #[tracing::instrument(level = "debug", name = "build_l1_postbatch", skip_all, fields(dest = %destination_rollup_id, calls = calls.len()))]
-pub fn build_l1_postbatch(calls: &[ExecutedAction], destination_rollup_id: RollupId) -> EvmBatch {
+pub(crate) fn build_l1_postbatch(
+    calls: &[ExecutedAction],
+    destination_rollup_id: RollupId,
+) -> EvmBatch {
     let mut entries: Vec<ExecutionEntrySol> = Vec::with_capacity(calls.len());
 
     for call in calls {
@@ -405,16 +424,17 @@ pub struct IncomingEntry {
 /// Build the single L2 mirror entry for an inbound L1→L2 cross-chain call
 /// (counterL1), executed on the L2 via `EEZL2.executeIncomingCrossChainCall`.
 ///
-/// This is the inverse of [`build_l1_postbatch`]: there the L1 *executes* an
-/// L2→L1 call; here the L2 executes an L1→L2 call. Per the spec
+/// This is the inverse of L1 post-batch materialization: there the L1 *executes*
+/// an L2→L1 call; here the L2 executes an L1→L2 call. Per the spec
 /// (`script/e2e/counter/E2E.s.sol::_l2Entries`) the L2 mirror entry carries the
 /// inbound call in `L2ToL1Calls[0]` (`callCount = 1`), runs it through
 /// `_processNCalls` (delivered via the lazily-created source proxy for
 /// `(source, source_rollup_id)`), and its `proxyEntryHash` binds the call —
-/// `crossChainCallHash(l2_rollup_id, target, value, data, source, source_rollup_id)`
-/// — to the entry, the SAME preimage `executeIncomingCrossChainCall` recomputes
-/// on-chain (it hashes with the L2's own `ROLLUP_ID` as the target rollup, so
-/// `l2_rollup_id` MUST equal the deployed `EEZL2.ROLLUP_ID`).
+/// common mutable hash over source `(source, source_rollup_id)` and target
+/// `(target, l2_rollup_id)` — the same preimage
+/// `executeIncomingCrossChainCall` recomputes on-chain (it hashes with the L2's
+/// own `ROLLUP_ID` as the target rollup, so `l2_rollup_id` MUST equal the
+/// deployed `EEZL2.ROLLUP_ID`).
 ///
 /// `return_data` is the inbound call's result (e.g. `abi.encode(1)` for
 /// `Counter.increment()`), folded into the rolling hash and returned by the
@@ -431,8 +451,17 @@ pub fn build_l2_incoming_entry(entry: IncomingEntry) -> L2ExecutionEntrySol {
         return_data,
         success,
     } = entry;
-    let proxy_entry_hash =
-        cross_chain_call_hash(l2_rollup_id, target, value, &data, source, source_rollup_id);
+    let proxy_entry_hash = common_cross_chain_call_hash(
+        CallMode::Mutable,
+        CallHashInput {
+            source_address: source,
+            source_rollup_id,
+            target_address: target,
+            target_rollup_id: l2_rollup_id,
+            value,
+            data: &data,
+        },
+    );
 
     // One inbound top-level call → callCount = 1; rolling hash folds
     // CALL_BEGIN(1) ++ CALL_END(1, success, returnData), exactly as
@@ -561,8 +590,8 @@ pub fn build_l2_outbound_entry(entry: OutboundEntry) -> L2ExecutionEntrySol {
 /// precomputed `return_data` to the caller (CAP@L1) and applies the settlement
 /// `StateDelta` (added later by `prepare_post_batch`). So: `callCount = 0`, no
 /// `L2ToL1Calls`, `rollingHash = 0`, and a NON-zero `proxyEntryHash` =
-/// `crossChainCallHash(dest_rollup_id, target, value, data, source, MAINNET=0)`
-/// — the preimage `executeCrossChainCall` recomputes on-chain (it uses the L1
+/// the common mutable hash over source `(source, MAINNET)` and target
+/// `(target, dest_rollup_id)` — the preimage `executeCrossChainCall` recomputes on-chain (it uses the L1
 /// proxy's `originalRollupId` = `dest_rollup_id` as the target rollup, and
 /// `MAINNET_ROLLUP_ID` as the source). The entry is DEFERRED (queued), so
 /// `transientExecutionEntryCount = 0`.
@@ -575,8 +604,17 @@ pub fn build_l1_inbound_entry(
     dest_rollup_id: RollupId,
     return_data: Bytes,
 ) -> EvmBatch {
-    let proxy_entry_hash =
-        cross_chain_call_hash(dest_rollup_id, target, value, &data, source, RollupId(0));
+    let proxy_entry_hash = common_cross_chain_call_hash(
+        CallMode::Mutable,
+        CallHashInput {
+            source_address: source,
+            source_rollup_id: RollupId::MAINNET,
+            target_address: target,
+            target_rollup_id: dest_rollup_id,
+            value,
+            data: &data,
+        },
+    );
 
     let entry = ExecutionEntrySol {
         stateDeltas: Vec::new(), // the settlement delta is attached downstream
@@ -623,16 +661,18 @@ pub fn build_l1_inbound_entry(
 /// bundled L1 user tx.
 ///
 /// One entry per INCOMING call in `calls` (`target_rollup_id == this`, source on
-/// another rollup). Every per-entry field is taken from the SAME recorded call
-/// the on-chain `EntryBuilder` uses (`target_rollup_id`, `source_rollup_id`,
-/// addresses, value, data, return data) so the sidecar's `proxyEntryHash` binds
-/// the SAME cross-chain call as the on-chain entry; only `l2ToL1Calls` /
-/// `callCount` differ. The `build_inbound_system_txs` consumer reuses
+/// another rollup). Every per-entry field is taken from the same recorded call
+/// used by the source entry. The sidecar binds the destination-side common hash;
+/// an L2 source entry may instead use its gas-aware mutable hash. The
+/// `build_inbound_system_txs` consumer reuses
 /// `l2ToL1Calls[0].sourceRollupId` for BOTH the L2 hash recompute and the
 /// `executeIncomingCrossChainCall` `sourceRollup` arg, so the value is
 /// self-consistent on delivery.
 #[must_use]
-pub fn build_l1_inbound_sidecar(calls: &[ExecutedAction], target_rollup_id: RollupId) -> EvmBatch {
+pub(crate) fn build_l1_inbound_sidecar(
+    calls: &[ExecutedAction],
+    target_rollup_id: RollupId,
+) -> EvmBatch {
     let mut entries: Vec<ExecutionEntrySol> = Vec::new();
 
     for call in calls {
@@ -655,16 +695,18 @@ pub fn build_l1_inbound_sidecar(calls: &[ExecutedAction], target_rollup_id: Roll
             .map(<[u8]>::to_vec)
             .unwrap_or_default();
 
-        // SAME preimage as the on-chain `EntryBuilder::new` (6 fields, same
-        // order) so the sidecar and the lean on-chain entry bind the identical
-        // cross-chain call.
-        let proxy_entry_hash = cross_chain_call_hash(
-            call.target_rollup_id,
-            call.target_address,
-            call.value,
-            &call.data,
-            call.source_address,
-            call.source_rollup_id,
+        // The destination-side identity uses the common formula; L2's
+        // source-side gas-aware key is deliberately a different hash.
+        let proxy_entry_hash = common_cross_chain_call_hash(
+            call.call_mode,
+            CallHashInput {
+                source_address: call.source_address,
+                source_rollup_id: call.source_rollup_id,
+                target_address: call.target_address,
+                target_rollup_id: call.target_rollup_id,
+                value: call.value,
+                data: &call.data,
+            },
         );
 
         // One incoming top-level call → callCount = 1; rolling hash folds
@@ -782,8 +824,8 @@ pub fn build_l1_settlement_only(rollup_id: RollupId) -> EvmBatch {
 ///   user's proxy call (same block) misses the empty entry queue and falls into
 ///   `_tryRevertedTopLevelLookup`, reverting with `revert_data`.
 ///
-/// `H = cross_chain_call_hash(dest_rollup_id, target, value, data, source, MAINNET=0)` — the
-/// exact hash `executeCrossChainCall` recomputes (target rollup = dest, source = MAINNET).
+/// `H` is the common mutable hash over source `(source, MAINNET)` and target
+/// `(target, dest_rollup_id)` — the exact hash `executeCrossChainCall` recomputes.
 /// At pin 5c51e02 the failed lookup runs as a degenerate reverted-lookup mini-entry
 /// (`callCount = 0`, empty tables, empty `expectedStateRoots` → vacuous pin match), which
 /// `_executeRevertedLookup` reverts with `returnData` — observably identical to the prior
@@ -798,7 +840,17 @@ pub fn build_l1_inbound_failed(
     dest_rollup_id: RollupId,
     revert_data: Bytes,
 ) -> EvmBatch {
-    let h = cross_chain_call_hash(dest_rollup_id, target, value, &data, source, RollupId(0));
+    let h = common_cross_chain_call_hash(
+        CallMode::Mutable,
+        CallHashInput {
+            source_address: source,
+            source_rollup_id: RollupId::MAINNET,
+            target_address: target,
+            target_rollup_id: dest_rollup_id,
+            value,
+            data: &data,
+        },
+    );
 
     // entries[0]: the immediate settlement-only entry (the R delta is attached by
     // `prepare_post_batch` via `chain_settlement_deltas` — single entry, one
@@ -929,7 +981,7 @@ pub struct DecodedInbound {
 /// The prover uses ALL fields to gate the L1 batch against the real outcome: the SHAPE
 /// (success ⇒ returning deferred entry; failure ⇒ failed `LookupCall`) AND the call HASH
 /// (the entry's `proxyEntryHash` / the lookup's `crossChainCallHash` must equal
-/// `cross_chain_call_hash(settled_rollup, target, value, data, source, MAINNET=0)` — the H
+/// the common mutable hash over the observed source and target fields — the key
 /// the user computes on-chain — so the composer can't ship a delivery keyed on a hash the
 /// user will never consume, which would grief them into `ExecutionNotFound`).
 #[must_use]
@@ -1140,15 +1192,8 @@ struct EntryBuilder {
 }
 
 impl EntryBuilder {
-    fn new(outer: &ExecutedAction, _dialect: ChainDialect) -> Self {
-        let proxy_entry_hash = cross_chain_call_hash(
-            outer.target_rollup_id,
-            outer.target_address,
-            outer.value,
-            &outer.data,
-            outer.source_address,
-            outer.source_rollup_id,
-        );
+    fn new(outer: &ExecutedAction) -> Self {
+        let proxy_entry_hash = source_side_call_hash(outer);
         let return_data: Bytes = match &outer.outcome {
             crate::ExecutionOutcome::Resolved { return_data, .. } => {
                 Bytes::from(return_data.clone())
@@ -1167,14 +1212,7 @@ impl EntryBuilder {
     }
 
     fn append_nested(&mut self, call: &ExecutedAction, nested_number: u64) {
-        let hash = cross_chain_call_hash(
-            call.target_rollup_id,
-            call.target_address,
-            call.value,
-            &call.data,
-            call.source_address,
-            call.source_rollup_id,
-        );
+        let hash = source_side_call_hash(call);
         let return_data: Bytes = call
             .outcome
             .return_data()
@@ -1201,6 +1239,31 @@ impl EntryBuilder {
             callCount: U256::ZERO,
             returnData: self.return_data,
             rollingHash: B256::from(self.rolling.current()),
+        }
+    }
+}
+
+/// Derive the key used on the chain where a call originates.
+fn source_side_call_hash(call: &ExecutedAction) -> B256 {
+    let input = CallHashInput {
+        source_address: call.source_address,
+        source_rollup_id: call.source_rollup_id,
+        target_address: call.target_address,
+        target_rollup_id: call.target_rollup_id,
+        value: call.value,
+        data: &call.data,
+    };
+
+    match call.call_mode {
+        // `EEZL2.staticCrossChainCall` deliberately uses the common,
+        // gas-free formula even when the source is an L2.
+        CallMode::Static => common_cross_chain_call_hash(CallMode::Static, input),
+        CallMode::Mutable if call.source_rollup_id.is_mainnet() => {
+            common_cross_chain_call_hash(CallMode::Mutable, input)
+        }
+        CallMode::Mutable => {
+            // The supported EEZL2 deployment does not fold `gasleft()`.
+            l2_mutable_outbound_call_hash(input, 0)
         }
     }
 }
@@ -1326,6 +1389,7 @@ mod tests {
 
     fn record(target: RollupId, caller_rollup: RollupId, success: bool) -> ExecutedAction {
         ExecutedAction {
+            call_mode: CallMode::Mutable,
             target_address: address!("00000000000000000000000000000000000000aa"),
             target_rollup_id: target,
             source_rollup_id: caller_rollup,
@@ -1341,6 +1405,52 @@ mod tests {
             },
             revert_span: None,
         }
+    }
+
+    #[test]
+    fn source_side_hash_selects_the_source_chain_formula() {
+        let l1_call = record(RollupId(1), RollupId::MAINNET, true);
+        let l1_input = CallHashInput {
+            source_address: l1_call.source_address,
+            source_rollup_id: l1_call.source_rollup_id,
+            target_address: l1_call.target_address,
+            target_rollup_id: l1_call.target_rollup_id,
+            value: l1_call.value,
+            data: &l1_call.data,
+        };
+        assert_eq!(
+            source_side_call_hash(&l1_call),
+            common_cross_chain_call_hash(CallMode::Mutable, l1_input),
+        );
+
+        let l2_call = record(RollupId::MAINNET, RollupId(1), true);
+        let l2_input = CallHashInput {
+            source_address: l2_call.source_address,
+            source_rollup_id: l2_call.source_rollup_id,
+            target_address: l2_call.target_address,
+            target_rollup_id: l2_call.target_rollup_id,
+            value: l2_call.value,
+            data: &l2_call.data,
+        };
+        assert_eq!(
+            source_side_call_hash(&l2_call),
+            l2_mutable_outbound_call_hash(l2_input, 0),
+        );
+
+        let mut static_l2_call = l2_call.clone();
+        static_l2_call.call_mode = CallMode::Static;
+        let static_l2_input = CallHashInput {
+            source_address: static_l2_call.source_address,
+            source_rollup_id: static_l2_call.source_rollup_id,
+            target_address: static_l2_call.target_address,
+            target_rollup_id: static_l2_call.target_rollup_id,
+            value: static_l2_call.value,
+            data: &static_l2_call.data,
+        };
+        assert_eq!(
+            source_side_call_hash(&static_l2_call),
+            common_cross_chain_call_hash(CallMode::Static, static_l2_input),
+        );
     }
 
     #[allow(
@@ -1485,8 +1595,7 @@ mod tests {
             initial_roots: &init,
             per_tx_roots_by_rollup: &ptx,
         };
-        let batch = build_batch(&[], &attr, &ChainDialect::EvmL1Style, RollupId(1), &[])
-            .expect("build_batch ok");
+        let batch = build_batch(&[], &attr, RollupId(1), &[]).expect("build_batch ok");
         assert!(batch.entries.is_empty());
         assert!(batch.l1ToL2lookupCalls.is_empty());
         assert!(batch.is_empty());
@@ -1507,8 +1616,7 @@ mod tests {
             per_tx_roots_by_rollup: &ptx,
         };
         let calls = vec![record(RollupId(1), RollupId(0), true)];
-        let batch = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[])
-            .expect("build_batch ok");
+        let batch = build_batch(&calls, &attr, RollupId(0), &[]).expect("build_batch ok");
         assert_eq!(batch.entries.len(), 1);
         // The TopLevel call is described by the entry's
         // `proxyEntryHash` + `returnData`; reentrant children land
@@ -1661,7 +1769,17 @@ mod tests {
         // preimage `executeIncomingCrossChainCall` recomputes with ROLLUP_ID.
         assert_eq!(
             entry.proxyEntryHash,
-            cross_chain_call_hash(l2_id, counter, U256::ZERO, &data, cap, src_id),
+            common_cross_chain_call_hash(
+                CallMode::Mutable,
+                CallHashInput {
+                    source_address: cap,
+                    source_rollup_id: src_id,
+                    target_address: counter,
+                    target_rollup_id: l2_id,
+                    value: U256::ZERO,
+                    data: &data,
+                },
+            ),
         );
         assert_eq!(entry.callCount, U256::from(1));
         assert_eq!(entry.incomingCalls.len(), 1);
@@ -1811,7 +1929,17 @@ mod tests {
         assert!(l.expectedLookups.is_empty());
         assert_eq!(
             l.crossChainCallHash,
-            cross_chain_call_hash(dest, target, U256::ZERO, &data, source, RollupId(0)),
+            common_cross_chain_call_hash(
+                CallMode::Mutable,
+                CallHashInput {
+                    source_address: source,
+                    source_rollup_id: RollupId::MAINNET,
+                    target_address: target,
+                    target_rollup_id: dest,
+                    value: U256::ZERO,
+                    data: &data,
+                },
+            ),
             "H must match what executeCrossChainCall recomputes (target=dest, source=MAINNET)",
         );
         assert_eq!(batch.transientLookupCallCount, U256::ZERO);
@@ -1825,10 +1953,50 @@ mod tests {
             per_tx_roots_by_rollup: &ptx,
         };
         let calls = vec![record(RollupId(1), RollupId(0), true)];
-        let batch = build_batch(&calls, &attr, &ChainDialect::EvmL2Style, RollupId(1), &[])
-            .expect("build_batch ok");
+        let batch = build_batch(&calls, &attr, RollupId(1), &[]).expect("build_batch ok");
         assert!(batch.entries.is_empty());
         assert!(batch.l1ToL2lookupCalls.is_empty());
+    }
+
+    #[test]
+    fn static_call_is_rejected_before_materialization() {
+        let (init, ptx) = empty_attribution();
+        let attr = SourceAttribution {
+            initial_roots: &init,
+            per_tx_roots_by_rollup: &ptx,
+        };
+        let mut call = record(RollupId(1), RollupId::MAINNET, true);
+        call.call_mode = CallMode::Static;
+
+        let error = build_batch(&[call], &attr, RollupId::MAINNET, &[])
+            .expect_err("static entries are not implemented");
+
+        assert!(matches!(
+            error.kind(),
+            crate::ProtocolErrorKind::Unsupported(
+                "static cross-chain call materialization is not implemented"
+            )
+        ));
+    }
+
+    #[test]
+    fn pending_call_is_rejected_before_materialization() {
+        let (init, ptx) = empty_attribution();
+        let attr = SourceAttribution {
+            initial_roots: &init,
+            per_tx_roots_by_rollup: &ptx,
+        };
+        let mut call = record(RollupId(1), RollupId::MAINNET, true);
+        call.outcome = ExecutionOutcome::Pending;
+
+        let error = build_batch(&[call], &attr, RollupId::MAINNET, &[])
+            .expect_err("pending calls cannot be materialized");
+
+        assert!(matches!(
+            error.kind(),
+            crate::ProtocolErrorKind::InvalidEncoding(reason)
+                if reason == "recorded cross-chain call still has a pending outcome"
+        ));
     }
 
     #[test]
@@ -1842,8 +2010,7 @@ mod tests {
             record(RollupId(1), RollupId(0), true),
             record(RollupId(0), RollupId(1), true),
         ];
-        let batch = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[])
-            .expect("build_batch ok");
+        let batch = build_batch(&calls, &attr, RollupId(0), &[]).expect("build_batch ok");
         assert_eq!(batch.entries.len(), 1);
         assert_eq!(
             batch.entries[0].expectedL1ToL2Calls.len(),
@@ -1868,7 +2035,7 @@ mod tests {
             record(RollupId(1), RollupId(0), true),
             record(RollupId(0), RollupId(1), false),
         ];
-        let err = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[])
+        let err = build_batch(&calls, &attr, RollupId(0), &[])
             .expect_err("nested-failed lookup must be refused");
         assert!(
             format!("{err}").contains("entry-scoped emission"),
@@ -1917,8 +2084,7 @@ mod tests {
             per_tx_roots_by_rollup: &ptx,
         };
         let calls = vec![record(RollupId(1), RollupId(0), false)];
-        let batch = build_batch(&calls, &attr, &ChainDialect::EvmL1Style, RollupId(0), &[])
-            .expect("build_batch ok");
+        let batch = build_batch(&calls, &attr, RollupId(0), &[]).expect("build_batch ok");
         assert!(batch.is_empty());
     }
 

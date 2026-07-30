@@ -7,7 +7,7 @@ use alloy_primitives::{B256, Bytes, I256, U256};
 use alloy_sol_types::{SolCall as _, SolValue as _};
 use eez_protocol::abi::{ExecutionEntrySol, L2ToL1CallSol, executeIncomingCrossChainCallCall};
 use eez_protocol::entries::decode_inbound;
-use eez_protocol::{RollupId, cross_chain_call_hash};
+use eez_protocol::{CallHashInput, CallMode, RollupId, common_cross_chain_call_hash};
 use thiserror::Error;
 
 use super::effect_binding::{BoundEffect, BoundEffectSequence, EffectKind};
@@ -175,13 +175,16 @@ pub(super) fn inspect_inbound_candidate(
         });
     }
 
-    let recomputed_call_hash = cross_chain_call_hash(
-        RollupId(expected_rollup_id.get()),
-        call.destination,
-        call.value,
-        &call.data,
-        call.sourceAddress,
-        RollupId(0),
+    let recomputed_call_hash = common_cross_chain_call_hash(
+        CallMode::Mutable,
+        CallHashInput {
+            source_address: call.sourceAddress,
+            source_rollup_id: RollupId::MAINNET,
+            target_address: call.destination,
+            target_rollup_id: RollupId(expected_rollup_id.get()),
+            value: call.value,
+            data: &call.data,
+        },
     );
     if recomputed_call_hash == B256::ZERO {
         return Err(InboundObservationError::ZeroCallHash);

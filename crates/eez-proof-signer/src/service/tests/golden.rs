@@ -1,14 +1,14 @@
 //! Captured settlement and attestation regressions.
 
-use alloy_primitives::{Address, B256, I256, Signature, U256, address, b256};
+use alloy_primitives::{Address, B256, I256, U256, b256};
 use eez_control_rpc::v1::{
     BlockWitness, ExecutionWitness, PostBatch, ProveChunk, ProveHeader, prove_chunk,
 };
 use reth_primitives_traits::{BlockBody as _, SignerRecoverable as _};
 
 use super::{
-    SettlementInput, TestServer, checkpoint, expected_rollup_id, run_settlement,
-    test_system_transaction_key, test_system_transaction_reconstructor,
+    SettlementInput, SettlementPipelineError, TestServer, checkpoint, expected_rollup_id,
+    run_settlement, test_system_transaction_key, test_system_transaction_reconstructor,
 };
 use crate::cancel::CancellationToken;
 use crate::{settlement, validate};
@@ -90,7 +90,7 @@ fn fixture_da_payload_summary(da_payload: &[u8]) -> (Vec<usize>, usize, Vec<B256
 }
 
 #[test]
-fn real_successful_inbound_fixture_reaches_the_expected_hash_and_signature() {
+fn captured_legacy_inbound_fixture_is_rejected_by_target_call_hash() {
     let post_batch = fixture_json("fresh-chain-inbound-2175", "postbatch.json");
     let oracle = fixture_json("fresh-chain-inbound-2175", "oracle.json");
     let fixture_blocks = fixture_json("fresh-chain-inbound-2175", "transaction-blocks.json");
@@ -239,7 +239,7 @@ fn real_successful_inbound_fixture_reaches_the_expected_hash_and_signature() {
         blocks,
         validate::ValidatedSettlingBlock::for_test(settling_block, receipt_successes, checkpoints),
     );
-    let recomputed_public_inputs_hash = run_settlement(SettlementInput {
+    let error = run_settlement(SettlementInput {
         submitted_post_batch_calldata: calldata,
         validated_window: &validated,
         expected_rollup_id,
@@ -248,28 +248,24 @@ fn real_successful_inbound_fixture_reaches_the_expected_hash_and_signature() {
         system_transaction_reconstructor: &system_transaction_reconstructor,
         cancellation: &cancellation,
     })
-    .unwrap();
-    let recomputed_hash = recomputed_public_inputs_hash.into_inner();
-    assert_eq!(recomputed_hash, expected_hash.parse::<B256>().unwrap());
+    .expect_err("the captured fixture uses the pre-simplify call hash");
 
-    // Sign only after the captured settlement vector has passed every gate.
-    // The intentionally public test key is not part of the recording.
-    let attester = crate::attest::Attester::new(
-        b256!("59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"),
-        proof_system_vkey,
-        proof_system,
-    )
-    .unwrap();
-    let signature_bytes = attester.sign(recomputed_public_inputs_hash).unwrap();
-    let signature = Signature::try_from(signature_bytes.as_ref()).unwrap();
-    let expected_attester = address!("70997970c51812dc3a010c7d01b50e0d17dc79c8");
-    assert_eq!(attester.address(), expected_attester);
-    assert_eq!(
-        signature
-            .recover_address_from_prehash(&recomputed_hash)
-            .unwrap(),
-        expected_attester
-    );
+    assert!(matches!(
+        error,
+        SettlementPipelineError::InboundEffects(
+            settlement::InboundEffectError::InvalidObservation {
+                entry_index: 1,
+                transaction_index: 0,
+                source: settlement::InboundObservationError::CallHashMismatch {
+                    recomputed,
+                    claimed,
+                },
+            }
+        ) if recomputed
+            == b256!("77e9bbae9307300c2c0dd178dde3de8f318b58fd740e4714e842bfed2c603fab")
+            && claimed
+                == b256!("44115129ec15ba85f4a5c80bcff7ab321119bb67f985c04be1350ff737958d5d")
+    ));
 }
 
 fn recorded_wire_witness(encoded: &str) -> ExecutionWitness {
@@ -378,17 +374,6 @@ async fn captured_five_field_outbound_events_are_rejected() {
         assert_eq!(
             call.sourceAddress,
             fixture_str(effect, "source").parse::<Address>().unwrap()
-        );
-        assert_eq!(
-            eez_protocol::cross_chain_call_hash(
-                eez_protocol::RollupId::MAINNET,
-                call.targetAddress,
-                call.value,
-                &call.data,
-                call.sourceAddress,
-                eez_protocol::RollupId(rollup),
-            ),
-            fixture_str(effect, "call_hash").parse::<B256>().unwrap()
         );
     }
     let inbound = &oracle["inbound_effect"];

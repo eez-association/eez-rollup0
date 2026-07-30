@@ -20,8 +20,7 @@
 //!
 //! The per-element `keccak256(abi.encode(entry))` byte-equality
 //! against alloy's `SolValue::abi_encode` is a separate concern,
-//! covered by the `cross_chain_call_hash_vectors.rs` byte-equality
-//! lock for the analogous 6-field action-hash struct.
+//! covered by the Solidity-backed call-hash tests in `action.rs`.
 
 use std::fs;
 use std::path::PathBuf;

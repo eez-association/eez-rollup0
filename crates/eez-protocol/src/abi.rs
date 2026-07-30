@@ -42,21 +42,6 @@ sol! {
         int256  etherDelta;
     }
 
-    /// Off-chain-only action representation. Mirrors the upstream
-    /// `Action` struct (`E2EHelpers.sol`); used by Rust tooling to
-    /// compute the 6-field `crossChainCallHash`. Field declaration
-    /// order is the `abi.encode` preimage order — do not reorder
-    /// without updating `EEZ.computeCrossChainCallHash`.
-    #[derive(Debug)]
-    struct ActionSol {
-        uint256 targetRollupId;
-        address targetAddress;
-        uint256 value;
-        bytes   data;
-        address sourceAddress;
-        uint256 sourceRollupId;
-    }
-
     /// One cross-chain call inside an entry's flat `L2ToL1Calls[]`
     /// list (formerly `CrossChainCall`).
     ///

@@ -1,18 +1,13 @@
 use std::num::NonZeroU64;
 
 use alloy_consensus::{Header, SignableTransaction as _, TxLegacy};
-use alloy_primitives::{Address, B256, Bytes, I256, Log, Signature, TxKind, U256, b256};
+use alloy_primitives::{Address, B256, Bytes, Log, Signature, TxKind, U256, b256};
 use alloy_sol_types::SolEvent as _;
-use eez_protocol::EvmBatch;
-use eez_protocol::abi::{ExecutionEntrySol, StateDeltaSol};
 use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable as _;
 
 use super::*;
-use crate::settlement::{
-    CanonicalPostBatch, authorize_inbound_effects, bind_effects_to_execution,
-    inspect_validated_settling_block, verify_state_delta_chain,
-};
+use crate::settlement::inspect_validated_settling_block;
 use crate::testkit::SYSTEM_TX;
 use crate::validate::ValidatedBlock;
 
@@ -401,7 +396,7 @@ fn selected_checkpoints_flow_through_the_stateless_adapter() {
 }
 
 #[test]
-fn real_checkpoints_bind_successful_inbound_effects() {
+fn real_checkpoints_reject_legacy_inbound_call_hashes() {
     let (mut input, chain_config, expected_checkpoints) = checkpoint_fixture();
     let block_number = input.declared_number;
     let block_rlp = input.rlp.clone();
@@ -412,7 +407,6 @@ fn real_checkpoints_bind_successful_inbound_effects() {
             expected_checkpoints.len(),
         )
         .unwrap();
-    let window_pre_state_root = output.pre_state_root;
     let block_output = output.blocks.remove(0);
     assert_eq!(block_output.receipt_successes, [true, true, true]);
 
@@ -428,18 +422,21 @@ fn real_checkpoints_bind_successful_inbound_effects() {
         settling.inbound_candidates().len(),
         expected_checkpoints.len()
     );
-    let observations = settling
+    let mismatches = settling
         .inbound_candidates()
         .iter()
-        .map(|candidate| candidate.inspection.as_ref().unwrap())
+        .map(|candidate| match &candidate.inspection {
+            Err(crate::settlement::InboundObservationError::CallHashMismatch {
+                recomputed,
+                claimed,
+            }) => (*recomputed, *claimed),
+            other => panic!("expected legacy call-hash rejection, got {other:?}"),
+        })
         .collect::<Vec<_>>();
-    assert!(observations.iter().all(|observation| {
-        observation.value.is_zero() && observation.rolling_hash_committed_success
-    }));
     assert_eq!(
-        observations
+        mismatches
             .iter()
-            .map(|observation| observation.recomputed_call_hash)
+            .map(|(_, claimed)| *claimed)
             .collect::<Vec<_>>(),
         [
             b256!("44115129ec15ba85f4a5c80bcff7ab321119bb67f985c04be1350ff737958d5d"),
@@ -447,71 +444,11 @@ fn real_checkpoints_bind_successful_inbound_effects() {
             b256!("f80b4d00f410d3ac7c369caceb0e426ea40e409b924a55ade552ad15d50f3e66"),
         ]
     );
-
-    let mut batch = EvmBatch::default();
-    let mut previous = window_pre_state_root;
-    batch.entries.push(checkpoint_entry(
-        window_pre_state_root,
-        previous,
-        B256::ZERO,
-        Bytes::new(),
-        I256::ZERO,
-    ));
-    for (checkpoint, observation) in expected_checkpoints.iter().zip(observations) {
-        batch.entries.push(checkpoint_entry(
-            previous,
-            checkpoint.state_root,
-            observation.recomputed_call_hash,
-            observation.return_data.clone(),
-            I256::try_from(observation.value).unwrap(),
-        ));
-        previous = checkpoint.state_root;
-    }
-    assert_eq!(previous, block_output.post_state_root);
-
-    let batch = CanonicalPostBatch::from_decoded_for_test(batch);
-    let verified_state_chain = verify_state_delta_chain(
-        &batch,
-        NonZeroU64::new(1).unwrap(),
-        window_pre_state_root,
-        block_output.post_state_root,
-    )
-    .unwrap();
-    let effects = bind_effects_to_execution(
-        &verified_state_chain,
-        window_pre_state_root,
-        block_output.transaction_state_checkpoints.as_slice(),
-        &settling,
-    )
-    .unwrap();
-    assert_eq!(effects.inbound_count(), expected_checkpoints.len());
-    assert_eq!(effects.outbound_count(), 0);
-    assert!(authorize_inbound_effects(&effects, NonZeroU64::new(1).unwrap()).is_ok());
-}
-
-fn checkpoint_entry(
-    current: B256,
-    new: B256,
-    proxy_entry_hash: B256,
-    return_data: Bytes,
-    ether_delta: I256,
-) -> ExecutionEntrySol {
-    ExecutionEntrySol {
-        stateDeltas: vec![StateDeltaSol {
-            rollupId: U256::from(1),
-            currentState: current,
-            newState: new,
-            etherDelta: ether_delta,
-        }],
-        proxyEntryHash: proxy_entry_hash,
-        destinationRollupId: U256::from(1),
-        l2ToL1Calls: Vec::new(),
-        expectedL1ToL2Calls: Vec::new(),
-        expectedLookups: Vec::new(),
-        callCount: U256::ZERO,
-        returnData: return_data,
-        rollingHash: B256::ZERO,
-    }
+    assert!(
+        mismatches
+            .iter()
+            .all(|(recomputed, claimed)| recomputed != claimed)
+    );
 }
 
 #[test]

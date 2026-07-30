@@ -1,9 +1,7 @@
 //! Foundry-grounded byte-equality tests for the two rolling-hash
 //! accumulators (`EntryRollingHash`, `StaticCallRollingHash`).
 //!
-//! Mirror of
-//! `crates/eez-protocol/tests/cross_chain_call_hash_vectors.rs` —
-//! reads the JSON fixture at
+//! Reads the JSON fixture at
 //! `tests/fixtures/rolling_hash_vectors.json` (regenerated via
 //! `scripts/regen-rolling-hash-vectors.sh`, which runs the Foundry
 //! script `contracts/script/GenRollingHashVectors.s.sol`) and asserts

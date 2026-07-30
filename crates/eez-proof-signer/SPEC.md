@@ -81,19 +81,22 @@ the final signature over the independently recomputed public-input hash.
 | Decode the active `callData` payload | Local exact, zero-copy RLP parser — §8.8 |
 | Public-input hashes | `eez_protocol::public_inputs::public_inputs_hashes` — Annex C |
 | Inbound decoding | `eez_protocol::entries::decode_inbound` — Annex D |
-| Cross-chain call hash | `eez_protocol::cross_chain_call_hash` — Annex B |
+| Common cross-chain call hash | `eez_protocol::common_cross_chain_call_hash` — Annex B |
 | Cross-chain Sync-block reconstruction | `eez_protocol::system_tx::build_cross_chain_sync_pairs` plus `eez_protocol::system_tx::interleave_sync_block_txs` — §8.8 |
 | ECDSA signing | `eez_protocol::signer::EcdsaProofSigner` (§9, self-contained) |
 | Effect-candidate positions | `eez_protocol::settlement::pair_end_positions`; §8.2 defines system classification from fork-aware recovered-signer evidence and the pinned EEZL2 address |
 | Batch type | `eez_protocol::EvmBatch` (the decoded `postAndVerifyBatch` argument, Annex A) |
-| Rollup id | `eez_protocol::RollupId` (a `u64`, widened to `uint256` in hash preimages) |
+| Rollup id | `eez_protocol::RollupId` (encoded as Solidity `uint64` in call-hash preimages) |
 
 A Rust implementation should reuse these definitions directly; for Rust, the
 paths above are normative. For any other language, Annexes A–D are the
 byte-level contract. The deployed `EEZ._verifyProofSystemBatch` computation is
 the final oracle for Annex C, and section 11 supplies its concrete fixture
-vector. The ABI and oracle are pinned by the `sync-rollups-protocol` submodule
-at commit `5c51e02b0f965ee8c94e9ed2c7e0e9f924d41fba`.
+vector. The target protocol source is pinned by the `sync-rollups-protocol`
+submodule at commit `f6226f569e9b4534d42eecf5d2e3dd6c649bc6aa`. Annex B
+is aligned with that revision. Until the atomic ABI cutover is complete,
+Annexes A, C, and D describe the currently implemented Rust wire profile; the
+Rust paths in the table above remain normative for that profile.
 
 ## 3. Configuration
 
@@ -824,9 +827,9 @@ derive a strict observation only after all of these checks succeed:
 - equality of every outer and inner call field (`destination` /
   `targetAddress`, `value`, `data`, `sourceAddress`, and `sourceRollup` /
   `sourceRollupId`) and `revertSpan == 0`; and
-- a non-zero recomputation of
-  `cross_chain_call_hash(settled_rollup, destination, value, data,
-  sourceAddress, RollupId(0))` equal to the inner `proxyEntryHash`.
+- a non-zero recomputation of the common mutable hash over source
+  `(sourceAddress, RollupId(0))` and target `(destination, settled_rollup)`,
+  with `value` and `data`, equal to the inner `proxyEntryHash`.
 
 Only after these checks may the shared decoder recover the claimed success
 flag and return bytes from the rolling hash. The recovered outcome MUST be
@@ -1301,9 +1304,9 @@ A conforming implementation MUST pass tests covering:
    failure with no response, and no signature for every rejection path; include
    an L1 integration fixture in which the configured proof system, independent
    vkey, and authorized signer agree and only the first applicable of two valid
-   sibling transitions mutates state. Include the real successful-inbound
-   conformance fixture and require its expected public-input hash and valid
-   recovered signature. The active profile MUST cover an admitted canonical
+   sibling transitions mutates state. Include a successful-inbound conformance
+   fixture captured from the current protocol and require its expected
+   public-input hash and valid recovered signature. The active profile MUST cover an admitted canonical
    outbound and mixed outbound-then-inbound sequence while proving that every
    malformed origin, shape, accounting, sidecar, transaction, nonce, or order
    is rejected before signing (sections 7.4 and 8.6–9). The active test profile
@@ -1311,17 +1314,16 @@ A conforming implementation MUST pass tests covering:
    through Stateless receipt extraction, settlement, and signature recovery.
 
 The crate-local fixture
-`tests/fixtures/fresh-chain-inbound-2175/` is the required successful-inbound
-golden for the validation-and-settlement pipeline. It preserves every
+`tests/fixtures/fresh-chain-inbound-2175/` uses the superseded call-hash
+preimage and is retained as a fail-closed regression. It preserves every
 transaction-bearing block body from the recorded `[1561..2175]` window, the
 exact `PostBatch`, independently recorded checkpoints and artifact hashes, and
 the expected public-input hash. Empty-body positions are represented by an
 equivalent empty block body because consensus validation is outside this
 projection. The dedicated Stateless adapter fixture covers consensus validation
-separately. A conforming implementation MUST bind all 27 DA transactions, all
-three inbound sidecars, and all three complete system transactions and reproduce
-`0x1b30affed04853df5991b6388c8d5884f13a8c54cc2af42ca005bb05383ce11d`
-before signing.
+separately. A conforming implementation MUST reject the fixture when its
+claimed inbound hash is compared with the Annex B recomputation and MUST NOT
+sign it.
 
 This fixture spans 615 blocks, while the reference service default is 512. A
 conformance test that sends it through the full RPC and expects success MUST
@@ -1347,12 +1349,13 @@ publicInputsHash = 0xe5cd0221135432a8f42b61e68f71f809d7e9b973c6866da2446fca8dd13
 ```
 
 A conforming implementation MUST reproduce that hash and accept the fixture's
-settlement chain. The Foundry-generated suites
-`crates/eez-protocol/tests/fixtures/public_inputs_hash_vectors.json` and
-`crates/eez-protocol/tests/fixtures/cross_chain_call_hash_vectors.json` contain
-seven vectors each. A conforming implementation MUST match every expected
-hash in both files; these cover the general Annex C fold and Annex B,
-respectively. The public-input vectors operate on precomputed entry, lookup,
+settlement chain. The Foundry-generated public-input suite
+`crates/eez-protocol/tests/fixtures/public_inputs_hash_vectors.json` contains
+seven vectors. A conforming implementation MUST match every expected hash;
+these cover the general Annex C fold. Annex B is locked against
+`contracts/test/CallHashVectors.t.sol` by the unit tests in
+`eez_protocol::action`, including mutable, static, and `uint64` boundary
+vectors. The public-input vectors operate on precomputed entry, lookup,
 and blob hashes and deliberately include generic multi-PS and non-empty-blob
 cases. Test that low-level fold against all seven vectors; the daemon-level
 admission rules in §8.1 still reject unsupported batch shapes.
@@ -1465,22 +1468,22 @@ function postAndVerifyBatch(ProofSystemBatchPerVerificationEntriesSol batch) ext
 Spec references of the form `B.X` denote field `X` of the decoded
 struct.
 
-## Annex B. `cross_chain_call_hash`
+## Annex B. `common_cross_chain_call_hash`
 
 ```text
-cross_chain_call_hash(targetRollupId, targetAddress, value, data,
-                      sourceAddress, sourceRollupId)
-  = keccak256(abi.encode(uint256(targetRollupId), targetAddress, value,
-                         data, sourceAddress, uint256(sourceRollupId)))
+common_cross_chain_call_hash(mode, sourceAddress, sourceRollupId,
+                             targetAddress, targetRollupId, value, data)
+  = keccak256(abi.encode(mode == Static, sourceAddress,
+                         uint64(sourceRollupId), targetAddress,
+                         uint64(targetRollupId), value, data))
 ```
 
 where `abi.encode(a, b, ...)` is Solidity's **parameter-list encoding** — the
-head/tail encoding of the six values as a parameter list, with **no** leading
-32-byte tuple-offset word. (Encoding the equivalent struct "standalone"
-prepends such an offset because `data` is dynamic; that is the classic byte
-mismatch to avoid.) Rollup ids are `u64` values widened to `uint256`. This is
-byte-identical to `EEZBase.computeCrossChainCallHash`, inherited by both
-`EEZ` and `EEZL2`.
+head/tail encoding of the seven values as a parameter list, with **no** leading
+32-byte tuple-offset word. Rollup ids are Solidity `uint64` values. This is
+byte-identical to `EEZBase.computeCrossChainCallHash`. Mutable calls leaving an
+L2 use the distinct gas-aware `EEZL2.computeCrossChainCallHash` overload; L2
+static calls use this common gas-free formula.
 
 ## Annex C. Public-input hashes
 

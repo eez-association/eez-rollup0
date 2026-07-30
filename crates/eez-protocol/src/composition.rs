@@ -10,9 +10,8 @@
 //!   registered rollup session by
 //!   `rollup_id` and forwards the call — returning the outcome to the
 //!   source inspector so execution can continue.
-//! - **Recording**: each dispatched call is stored internally as a
-//!   [`ExecutedAction`] (outcome non-optional — it's always present by
-//!   the time the call is recorded).
+//! - **Recording**: each dispatched call opens a pending [`ExecutedAction`]
+//!   before target execution and resolves that same slot afterward.
 //! - **Finalization**: [`CompositionBuilder::finalize`] consumes the
 //!   builder, builds source + target entries via the [`crate::entries`]
 //!   builders, and produces a [`crate::types::Composition`].
@@ -48,7 +47,7 @@
 //!      │   → lazy-open rollups[target].session            │
 //!      │   → open_call → session.execute(req, &mut self)  │
 //!      │     → close_call resolves the slot's outcome     │
-//!      │   → return ExecutionResponse to inspector        │
+//!      │   → return ExecutionOutcome to inspector         │
 //!      └──────────────────────────────────────────────────┘
 //!                             │
 //!                             ▼
@@ -58,7 +57,7 @@
 //!      │   2. per non-entry rollup: zk-poster settlement  │
 //!      │      or inbound sidecar batch + root attribution │
 //!      │   3. entries::build_batch(recorded, attribution, │
-//!      │      dialect, source_id, raw_tx) — once per      │
+//!      │      source_id, raw_tx) — once per               │
 //!      │      source + per non-entry target               │
 //!      │   4. encode_table_payload + encode_follower_     │
 //!      │      trigger per target                          │
@@ -364,8 +363,10 @@ impl CompositionBuilder {
     /// # Errors
     ///
     /// Returns [`ProtocolErrorKind::EmptyCalls`] on empty inputs,
-    /// [`ProtocolErrorKind::UnknownTarget`] for a recorded rollup not
-    /// in the plan set, [`ProtocolErrorKind::InvalidCheckpoint`] if
+    /// [`ProtocolErrorKind::UnknownTarget`] for a recorded rollup not in the
+    /// plan set, [`ProtocolErrorKind::InvalidEncoding`] for a pending call,
+    /// [`ProtocolErrorKind::Unsupported`] when static-entry materialization
+    /// would be required, and [`ProtocolErrorKind::InvalidCheckpoint`] if
     /// per-rollup state-delta chaining fails in `build_batch`.
     /// Surfaces any [`ExecutorError`] from root attribution.
     // Large Err variant is the pre-existing error shape (previously
@@ -388,6 +389,7 @@ impl CompositionBuilder {
                 .into());
             }
         }
+        entries::ensure_materializable_calls(&self.recorded)?;
 
         // Sorted plan order for deterministic output (upstream's invariant 2).
         let mut plan_order: Vec<RollupId> = self.rollups.keys().copied().collect();
@@ -504,13 +506,8 @@ impl CompositionBuilder {
                 initial_roots: &initial_roots,
                 per_tx_roots_by_rollup: &per_tx_roots_by_rollup,
             };
-            let batch = entries::build_batch(
-                &group_calls,
-                &attribution_so_far,
-                dialect,
-                *rollup_id,
-                raw_tx,
-            )?;
+            let batch =
+                entries::build_batch(&group_calls, &attribution_so_far, *rollup_id, raw_tx)?;
 
             // Terminal-revert short-circuit: an empty batch means all
             // calls reverted and there's nothing to verify — UNLESS this
@@ -570,13 +567,8 @@ impl CompositionBuilder {
             .expect("entry rollup registered at builder construction")
             .config
             .dialect;
-        let entry_batch = entries::build_batch(
-            &self.recorded,
-            &attribution,
-            &entry_dialect,
-            self.entry_rollup_id,
-            raw_tx,
-        )?;
+        let entry_batch =
+            entries::build_batch(&self.recorded, &attribution, self.entry_rollup_id, raw_tx)?;
         let entry_payload = entries::encode_table_payload(&entry_batch, &entry_dialect);
 
         // Phase 4 — target compositions (re-encode from the batches
@@ -768,6 +760,7 @@ impl CompositionBuilder {
 
         let idx = self.recorded.len();
         self.recorded.push(ExecutedAction {
+            call_mode: req.call_mode,
             target_address: req.target_address,
             target_rollup_id,
             source_rollup_id,
@@ -882,7 +875,7 @@ impl CompositionBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::action::cross_chain_call_hash;
+    use crate::action::{CallHashInput, CallMode, common_cross_chain_call_hash};
     use crate::composer::ProxyLookupConfig;
     use crate::dialect::ChainDialect;
     use alloy_primitives::{Address, Bytes, U256};
@@ -990,6 +983,7 @@ mod tests {
 
     fn make_request(rollup: u64) -> ExecutionRequest {
         ExecutionRequest {
+            call_mode: crate::CallMode::Mutable,
             target_address: Address::repeat_byte(rollup as u8),
             data: Bytes::from(vec![0x01, 0x02]),
             value: U256::ZERO,
@@ -1046,6 +1040,23 @@ mod tests {
         assert_eq!(builder.recorded.len(), 1);
         assert_eq!(builder.recorded[0].target_rollup_id, RollupId(1));
         assert_eq!(builder.recorded[0].source_rollup_id, RollupId(0));
+        assert_eq!(builder.recorded[0].call_mode, crate::CallMode::Mutable);
+    }
+
+    #[tokio::test]
+    async fn dispatch_preserves_call_mode() {
+        let mut rollups = HashMap::new();
+        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
+        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
+        let mut builder = CompositionBuilder::new(RollupId(0), rollups);
+        let mut request = make_request(1);
+        request.call_mode = crate::CallMode::Static;
+
+        builder
+            .dispatch_call(RollupId(1), RollupId(0), request)
+            .expect("dispatch");
+
+        assert_eq!(builder.recorded[0].call_mode, crate::CallMode::Static);
     }
 
     #[tokio::test]
@@ -1168,9 +1179,8 @@ mod tests {
         assert_eq!(composition.targets.len(), 1);
         assert_eq!(composition.targets[0].rollup_id, RollupId(1));
 
-        // The sidecar entry mirrors the recorded call: callCount 1, the
-        // call in l2ToL1Calls[0], proxyEntryHash bound to the same
-        // 6-field preimage the on-chain entry uses.
+        // The sidecar entry mirrors the recorded call and binds its
+        // destination-side identity in `proxyEntryHash`.
         let entries = &composition.targets[0].batch.entries;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].callCount, U256::from(1u8));
@@ -1181,13 +1191,16 @@ mod tests {
         );
         assert_eq!(
             entries[0].proxyEntryHash,
-            cross_chain_call_hash(
-                RollupId(1),
-                Address::repeat_byte(1),
-                U256::ZERO,
-                &Bytes::from(vec![0x01, 0x02]),
-                Address::ZERO,
-                RollupId(0),
+            common_cross_chain_call_hash(
+                CallMode::Mutable,
+                CallHashInput {
+                    source_address: Address::ZERO,
+                    source_rollup_id: RollupId::MAINNET,
+                    target_address: Address::repeat_byte(1),
+                    target_rollup_id: RollupId(1),
+                    value: U256::ZERO,
+                    data: &Bytes::from(vec![0x01, 0x02]),
+                },
             ),
         );
 
@@ -1202,6 +1215,7 @@ mod tests {
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
         builder.recorded.push(ExecutedAction {
+            call_mode: crate::CallMode::Mutable,
             target_address: Address::ZERO,
             target_rollup_id: RollupId(99),
             source_rollup_id: RollupId(0),
@@ -1219,6 +1233,62 @@ mod tests {
                 if matches!(
                     p.kind(),
                     crate::error::ProtocolErrorKind::UnknownTarget { got: RollupId(99) }
+                )
+        ));
+    }
+
+    #[tokio::test]
+    async fn finalize_rejects_static_calls_before_building_any_dialect() {
+        let mut rollups = HashMap::new();
+        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
+        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
+        let mut builder = CompositionBuilder::new(RollupId(0), rollups);
+        let mut request = make_request(1);
+        request.call_mode = crate::CallMode::Static;
+        builder
+            .dispatch_call(RollupId(1), RollupId(0), request)
+            .expect("dispatch");
+
+        let error = builder
+            .finalize(&[])
+            .expect_err("static entry materialization is not implemented");
+
+        assert!(matches!(
+            error.kind(),
+            crate::error::CompositionErrorKind::Protocol(protocol)
+                if matches!(
+                    protocol.kind(),
+                    crate::ProtocolErrorKind::Unsupported(
+                        "static cross-chain call materialization is not implemented"
+                    )
+                )
+        ));
+    }
+
+    #[tokio::test]
+    async fn finalize_rejects_pending_call_before_zk_poster_can_drop_it() {
+        let mut l1_rollup = rollup_with_session([0u8; 32]);
+        l1_rollup.config.dialect = ChainDialect::EvmL1Style;
+
+        let mut rollups = HashMap::new();
+        rollups.insert(RollupId(1), entry_rollup([0u8; 32]));
+        rollups.insert(RollupId::MAINNET, l1_rollup);
+        let mut builder = CompositionBuilder::new(RollupId(1), rollups);
+        builder
+            .open_call(RollupId::MAINNET, RollupId(2), &make_request(0))
+            .expect("open pending call");
+
+        let error = builder
+            .finalize(&[])
+            .expect_err("finalize must reject every unresolved call");
+
+        assert!(matches!(
+            error.kind(),
+            crate::error::CompositionErrorKind::Protocol(protocol)
+                if matches!(
+                    protocol.kind(),
+                    crate::ProtocolErrorKind::InvalidEncoding(reason)
+                        if reason == "recorded cross-chain call still has a pending outcome"
                 )
         ));
     }

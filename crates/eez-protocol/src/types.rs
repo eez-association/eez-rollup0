@@ -25,43 +25,41 @@
 use alloy_primitives::{Address, Bytes, U256};
 use serde::{Deserialize, Serialize};
 
+use crate::action::CallMode;
 use crate::batch::EvmBatch;
 use crate::rollup_id::RollupId;
 
 /// A cross-chain call detected, dispatched, and recorded with its
 /// execution outcome.
 ///
-/// The outcome field is non-optional: `CompositionBuilder::dispatch_call`
-/// (the only constructor) runs after the target session has produced an
-/// outcome, so holding a `ExecutedAction` means the result is present.
+/// `CompositionBuilder::open_call` records a pending item before recursive
+/// dispatch, and `CompositionBuilder::close_call` replaces it with the target
+/// execution result.
 ///
-/// The action hash is not stored here. It is a derived value
-/// [`crate::entries::build_batch`] computes from these raw fields when
-/// building entries, keeping it the single source of truth for hashes.
+/// The cross-chain call hash is not stored here. Entry materializers derive the
+/// appropriate source- or destination-side hash from these raw fields.
 #[derive(Debug, Clone)]
 pub struct ExecutedAction {
-    /// Address of the target contract on the target chain.
-    /// Spec: `Action.targetAddress` / `L2ToL1Call.targetAddress`.
+    /// Effective EVM mode observed when the source call was intercepted.
+    pub call_mode: CallMode,
+    /// Contract invoked on the destination chain.
     pub target_address: Address,
-    /// Rollup ID of the target chain. Spec: `Action.targetRollupId`.
+    /// Rollup ID of the destination chain.
     pub target_rollup_id: RollupId,
-    /// Rollup ID of the chain that triggered this call. Spec:
-    /// `Action.sourceRollupId` / `L2ToL1Call.sourceRollupId`.
+    /// Rollup ID of the chain that triggered this call.
     ///
     /// For top-level calls detected during source simulation: equal to
     /// the entry rollup id. For nested calls dispatched by target-session
     /// inspectors: the rollup id of the session that dispatched.
     ///
-    /// Load-bearing for nested action-hash correctness: the upstream
-    /// CCM contracts emit `sourceRollupId = ROLLUP_ID` (their own id)
-    /// on nested cross-chain calls.
+    /// The source manager uses its own rollup id for nested calls, so this
+    /// field is part of the nested cross-chain call hash.
     pub source_rollup_id: RollupId,
-    /// Address of the caller on the source chain. Spec:
-    /// `Action.sourceAddress` / `L2ToL1Call.sourceAddress`.
+    /// Address of the caller on the source chain.
     pub source_address: Address,
-    /// Calldata for the cross-chain call. Spec: `Action.data`.
+    /// Calldata for the cross-chain call.
     pub data: Bytes,
-    /// Value transferred with the call. Spec: `Action.value`.
+    /// Native value transferred with the call.
     pub value: U256,
     /// Execution outcome from the target-chain executor. `Pending`
     /// from `Dispatcher::open_call` until `Dispatcher::close_call`
@@ -94,8 +92,8 @@ pub struct ExecutedAction {
 /// arithmetic at `Inspector::call_end` correct without tree
 /// reconstruction.
 ///
-/// Does NOT carry the checkpoint (overlay + witness); that lives on
-/// [`ExecutionResponse`](crate::ExecutionResponse).
+/// Session rollback checkpoints are stored separately by
+/// [`CompositionBuilder`](crate::CompositionBuilder) while a call is open.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionOutcome {
     /// `open_call` placeholder. Replaced with `Resolved` by `close_call`.

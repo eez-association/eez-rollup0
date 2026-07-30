@@ -10,7 +10,7 @@
 //! bytes — every proof verifies if and only if both sides agreed.
 //!
 //! A future byte-equality lock against a Solidity oracle (analogous to
-//! `cross_chain_call_hash_vectors.rs`) belongs at
+//! the call-hash vectors in `action.rs`) belongs at
 //! `crates/eez-protocol/tests/public_inputs_hash_vectors.rs`.
 //!
 //! # Construction
@@ -214,7 +214,7 @@ pub fn per_ps_public_inputs_hash(shared: B256, plan: &ProofPlan, ps_index_in_glo
         // Step 4: incremental keccak256(abi.encode(...)). Use
         // `abi_encode_params` to get the positional form
         // (matches Solidity's `abi.encode(field1, field2, ...)`
-        // exactly — same trick as `cross_chain_call_hash`).
+        // exactly — same trick as `common_cross_chain_call_hash`).
         acc = keccak256(PerPsFoldStep::abi_encode_params(&step));
     }
     // Step 5: abi.encodePacked of shared + acc → two raw

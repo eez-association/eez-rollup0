@@ -20,8 +20,8 @@ use revm::DatabaseCommit;
 use revm::database::CacheState;
 
 use eez_protocol::{
-    CompositionBuilder, ExecutionOutcome, ExecutionRequest, ExecutorError, ExecutorErrorKind,
-    ExecutorResult, RollupId, TargetExecutionSession,
+    CallMode, CompositionBuilder, ExecutionOutcome, ExecutionRequest, ExecutorError,
+    ExecutorErrorKind, ExecutorResult, RollupId, TargetExecutionSession,
 };
 
 use super::provider::ChainProvider;
@@ -389,6 +389,12 @@ impl TargetExecutionSession for LocalExecutionSession {
         req: ExecutionRequest,
         dispatcher: &mut CompositionBuilder,
     ) -> ExecutorResult<ExecutionOutcome> {
+        if req.call_mode == CallMode::Static {
+            return Err(ExecutorErrorKind::Unavailable(
+                "static target execution is not implemented".to_owned(),
+            )
+            .into());
+        }
         // Pitfall #3 invariant: this method runs SYNCHRONOUSLY under
         // the caller's `Handle::block_on`. Do NOT introduce a real
         // `` on I/O here or in `execute_internal*` — the target-

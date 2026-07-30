@@ -140,11 +140,8 @@ pub enum ProtocolErrorKind {
     /// calldata) failed.
     #[error("invalid encoding: {0}")]
     InvalidEncoding(String),
-    /// A protocol capability was invoked that this chain family does not
-    /// implement — e.g. a
-    /// [`build_l1_postbatch`](crate::entries::build_l1_postbatch)
-    /// impl that cannot actually settle outbound. Today only the
-    /// in-tree test fakes construct this variant.
+    /// A protocol capability was invoked before its wire representation or
+    /// execution path was implemented, such as static-entry materialization.
     #[error("unsupported protocol operation: {0}")]
     Unsupported(&'static str),
 }
