@@ -429,12 +429,11 @@ validation is an invalid backend result and maps to `internal`.
 The same execution MUST provide every outbound-event candidate from every
 block's verified receipts. A candidate is a log emitted by the pinned EEZL2
 address whose `topic0` is the ABI-derived `CrossChainCallExecuted` signature.
-Retain its zero-based transaction index, its zero-based receipt-local log
-index, and the call hash only when the complete topics and ABI body decode and
-re-encode exactly. A named but malformed candidate remains present with an
-absent call hash rather than disappearing. Preserve receipt/log order and
-duplicates. These observations are associated settlement evidence, not
-Composer input.
+Retain its zero-based transaction index and receipt-local log index. When the
+complete topics and ABI body decode and re-encode exactly, also retain the call
+hash and `uint64 callGas`; otherwise retain the named candidate without decoded
+event fields rather than dropping it. Preserve receipt/log order and duplicates.
+These observations are associated settlement evidence, not Composer input.
 
 ### 7.2 Evidence scope
 
@@ -872,12 +871,18 @@ receipt observations from §7.1. Every provisionally
 transaction index; missing, extra, multiple, malformed, reassociated, or
 inbound-position observations reject. Its batch entry MUST contain exactly one
 `l2ToL1Call`, target the configured rollup, and name that rollup as the call's
-source. Recompute the call hash with target rollup `MAINNET` and the configured L2
-source rollup, then require equality with the observed event hash. Matching is
-positional and duplicate-preserving: equal hashes at distinct effect positions
-remain distinct observations. Every intermediate-block observation rejects.
-The call's `sourceAddress` MUST NOT be `SYSTEM_ADDRESS`; that identity is
-reserved for protocol transactions rather than application-originated effects.
+source. The supported EEZL2 deployment has `USE_GAS_LEFT` disabled, so the
+observation's manager-entry `callGas` MUST be zero. Recompute the mutable L2
+outbound hash as
+`keccak256(abi.encode(false, sourceAddress, uint64(sourceRollupId),
+targetAddress, uint64(MAINNET), value, uint64(callGas), data))`, then require
+equality with the observed event hash. Matching is positional and
+duplicate-preserving: equal hashes at distinct effect positions remain distinct
+observations. Every intermediate-block observation rejects. The call's
+`sourceAddress` MUST NOT be `SYSTEM_ADDRESS`; that identity is reserved for
+protocol transactions rather than application-originated effects. The event's
+`callGas` is part of this source-side hash; it is not the destination-call gas
+limit carried by a cross-chain call record.
 
 The gate then restricts every outbound entry to the success-expected
 single-call subset supported by this profile. The entry schema and wider
@@ -913,8 +918,8 @@ proof of the deployment's funding mechanism.
 
 This correspondence proves L2 origin: the exact re-executed transaction
 produced, from the fixed EEZL2 address, a canonical event carrying the call
-hash that commits target, value, data, source, and both rollup directions. A
-flat list or multiset of hashes is insufficient because it loses the
+hash that commits target, value, data, source, both rollup directions, and
+manager-entry gas. A flat list or multiset of hashes is insufficient because it loses the
 transaction and receipt-log provenance retained here. Section 8.8 additionally
 binds the derivation sidecar and exact `[load, user]` bytes to the same
 re-executed block.
@@ -1264,7 +1269,8 @@ A conforming implementation MUST pass tests covering:
    destination, hash, return data, or ether delta, and a value outside the
    non-negative representable `int256` range; for outbound observations, cover
    emitter and signature filtering, strict event decoding, receipt-local
-   positions, preserved duplicate hashes, intermediate-block events, and
+   positions, preserved duplicate hashes, zero manager-entry gas, rejection of
+   non-zero manager-entry gas, intermediate-block events, and
    missing, extra, multiple, malformed, reassociated, wrong-rollup, or
    wrong-hash correspondence; additionally reject the reserved system source,
    an outbound value outside the non-negative `int256` range, non-unit `callCount`,
@@ -1322,18 +1328,12 @@ conformance test that sends it through the full RPC and expects success MUST
 raise `max-request-blocks` to at least 615; a direct validation-and-settlement pipeline
 test is not subject to stream-admission quotas.
 
-The crate-local fixture `tests/fixtures/nonzero-outbound-630/` satisfies the
-real-witness non-zero-value requirement. It preserves the complete captured
-`[626..630]` window, chain configuration, exact `PostBatch`, independently
-recorded roots, checkpoints, effect values, call hashes, and artifact hashes.
-The settling block contains canonical `[load, user]` pairs for two outbound
-effects followed by one inbound transaction; the first outbound carries
-`10_000_000_000_000` wei and commits to
-`etherDelta = -10_000_000_000_000`. A conforming implementation MUST derive
-the receipt observations and checkpoints from Stateless, bind the DA payload,
-and reproduce
-`0x928b141f536c03ff1ceea2b290797d11fec3b092bd91d0ad5953605f68801e14`
-before signing.
+The crate-local fixture `tests/fixtures/nonzero-outbound-630/` is an
+incompatible-event rejection vector. Its captured L2 manager emitted the
+five-field base `CrossChainCallExecuted` event, while the current `EEZL2`
+contract emits the six-field overload containing `uint64 callGas`. A conforming
+implementation MUST NOT treat those logs as current outbound evidence or
+invent a zero gas value, and therefore MUST NOT sign this captured batch.
 
 Golden vectors: the reference repository ships
 `crates/eez-proof-signer/tests/fixtures/stateless-block-13/` — a real captured

@@ -1,36 +1,9 @@
-//! Cross-chain call hash + per-rollup state-root slot derivation.
+//! Cross-chain call-hash and per-rollup state-root slot derivation.
 //!
-//! # Cross-chain call hash (invariant 5)
-//!
-//! In the multi-prover protocol, every cross-chain call is identified
-//! by a 6-field hash:
-//!
-//! ```text
-//! crossChainCallHash = keccak256(abi.encode(
-//!     targetRollupId,    // uint256
-//!     targetAddress,     // address (20 bytes)
-//!     value,             // uint256
-//!     data,              // bytes
-//!     sourceAddress,     // address
-//!     sourceRollupId,    // uint256
-//! ))
-//! ```
-//!
-//! Tree position (caller's call index, expected-call index, parent
-//! context) is folded into the entry-level rolling hash, not encoded
-//! into the call hash itself. Reverts are tracked via `revertSpan`
-//! on the [`crate::abi::L2ToL1CallSol`] slot.
-//!
-//! On-chain mirror: `EEZ.computeCrossChainCallHash` (public pure) at
-//! `sync-rollups-protocol/src/EEZ.sol:1243`; same byte semantics in
-//! `CrossChainManagerL2.computeCrossChainCallHash` at
-//! `sync-rollups-protocol/src/CrossChainManagerL2.sol:532`.
-//!
-//! **Asymmetric on-chain field naming** (upstream rename caveat —
-//! captured in invariant 5): the same 32-byte hash appears as
-//! `ExecutionEntry.proxyEntryHash` (struct field) on entries and as
-//! `LookupCall.crossChainCallHash` on lookup calls. Values are
-//! byte-identical; only the struct-field names diverge.
+//! The common contract formula hashes the call kind, source pair, target pair,
+//! value, and calldata. A mutable call leaving an L2 uses a distinct formula
+//! that also includes the manager-entry `callGas`; see
+//! [`l2_mutable_outbound_call_hash`].
 
 use crate::RollupId;
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
@@ -38,15 +11,55 @@ use alloy_sol_types::SolValue;
 
 use crate::abi::ActionSol;
 
-/// Compute the 6-field cross-chain call hash (invariant 5).
+/// Fields shared by the protocol's cross-chain call-hash formulas.
+///
+/// Keeping the source and target names at the call site avoids silently
+/// swapping the two address/rollup pairs.
+#[derive(Clone, Copy, Debug)]
+pub struct CallHashInput<'a> {
+    /// Address that originated the call on the source chain.
+    pub source_address: Address,
+    /// Rollup containing `source_address` (`0` denotes L1).
+    pub source_rollup_id: RollupId,
+    /// Address invoked on the destination chain.
+    pub target_address: Address,
+    /// Rollup containing `target_address` (`0` denotes L1).
+    pub target_rollup_id: RollupId,
+    /// Ether transferred by the cross-chain call.
+    pub value: U256,
+    /// Calldata sent to `target_address`.
+    pub data: &'a Bytes,
+}
+
+/// Compute the hash for a mutable call leaving an L2.
+///
+/// Unlike the common L1/inbound formula, `EEZL2` includes the manager-entry
+/// `call_gas` value between `value` and `data`. The supported deployment uses
+/// `USE_GAS_LEFT = false`, so production callers currently pass zero.
+#[must_use]
+pub fn l2_mutable_outbound_call_hash(input: CallHashInput<'_>, call_gas: u64) -> B256 {
+    keccak256(
+        (
+            false,
+            input.source_address,
+            input.source_rollup_id.0,
+            input.target_address,
+            input.target_rollup_id.0,
+            input.value,
+            call_gas,
+            input.data,
+        )
+            .abi_encode_params(),
+    )
+}
+
+/// Compute the target-first six-field call hash.
 ///
 /// `keccak256(abi.encode(targetRollupId, targetAddress, value, data,
-/// sourceAddress, sourceRollupId))`. Byte-for-byte identical to
-/// `EEZ.computeCrossChainCallHash` on L1 and
-/// `CrossChainManagerL2.computeCrossChainCallHash` on L2. The hash
-/// inputs are unchanged from the prior protocol; only the function
-/// name rotated. The Rust function rename here mirrors the on-chain
-/// rename.
+/// sourceAddress, sourceRollupId))`.
+///
+/// This encoding has neither the call-kind discriminator used by the common
+/// contract formula nor the `callGas` field used by mutable L2 outbound calls.
 pub fn cross_chain_call_hash(
     target_rollup_id: RollupId,
     target_address: Address,
@@ -110,7 +123,7 @@ pub fn compute_state_root_slot(rollup_id: RollupId) -> B256 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::address;
+    use alloy_primitives::{address, b256};
 
     fn sample_args() -> (RollupId, Address, U256, Bytes, Address, RollupId) {
         (
@@ -187,6 +200,46 @@ mod tests {
         assert_ne!(
             cross_chain_call_hash(a, b, c, d, e, RollupId(0)),
             cross_chain_call_hash(a, b, c, d, e, RollupId(7))
+        );
+    }
+
+    #[test]
+    fn l2_mutable_outbound_hash_matches_solidity_vectors() {
+        let data = Bytes::from_static(&[1, 2, 3]);
+        let input = CallHashInput {
+            source_address: address!("00000000000000000000000000000000000000bb"),
+            source_rollup_id: RollupId(1),
+            target_address: address!("00000000000000000000000000000000000000aa"),
+            target_rollup_id: RollupId(7),
+            value: U256::from(1_000_000_000_000_000_000u128),
+            data: &data,
+        };
+
+        assert_eq!(
+            l2_mutable_outbound_call_hash(input, 0),
+            b256!("9fd05cd7eebaf1d08b2961cb5d1237ef586cea58141270697a5509c6f3a03a37")
+        );
+        assert_eq!(
+            l2_mutable_outbound_call_hash(input, 123_456),
+            b256!("25400cdd749a1c3ac82f4e3093f0460afe21e718a545a96f9399b9ae486c99e4")
+        );
+    }
+
+    #[test]
+    fn l2_mutable_outbound_hash_matches_boundary_solidity_vector() {
+        let data = Bytes::new();
+        let input = CallHashInput {
+            source_address: address!("00000000000000000000000000000000000000bb"),
+            source_rollup_id: RollupId(u64::MAX),
+            target_address: address!("00000000000000000000000000000000000000aa"),
+            target_rollup_id: RollupId(u64::MAX - 1),
+            value: U256::MAX,
+            data: &data,
+        };
+
+        assert_eq!(
+            l2_mutable_outbound_call_hash(input, u64::MAX),
+            b256!("7f04915c437db6536fe9d746b135ed834b391532e4be8beadd898ad1f592895f")
         );
     }
 

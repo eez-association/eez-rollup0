@@ -341,10 +341,8 @@ fn a_fully_bound_outbound_effect_is_authorized() {
         block_rlp,
         validate::SettlementBlockEvidence::for_test(
             vec![true, false],
-            vec![validate::OutboundEventObservation::for_test(
-                1,
-                0,
-                Some(call_hash),
+            vec![validate::OutboundEventObservation::decoded_for_test(
+                1, 0, call_hash, 0,
             )],
         ),
     );

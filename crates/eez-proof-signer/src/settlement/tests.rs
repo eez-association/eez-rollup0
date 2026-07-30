@@ -16,7 +16,7 @@ use eez_protocol::entries::{
     encode_postbatch,
 };
 use eez_protocol::public_inputs::public_inputs_hashes;
-use eez_protocol::{RollupId, SYSTEM_ADDRESS, cross_chain_call_hash};
+use eez_protocol::{CallHashInput, RollupId, SYSTEM_ADDRESS, l2_mutable_outbound_call_hash};
 use reth_ethereum_primitives::{BlockBody, TransactionSigned};
 use reth_primitives_traits::{BlockBody as _, SignerRecoverable as _};
 
@@ -334,17 +334,30 @@ fn observed_outbound_call(
     receipt_log_index: usize,
     call: &L2ToL1CallSol,
 ) -> OutboundEventObservation {
-    OutboundEventObservation::for_test(
+    observed_outbound_call_with_gas(transaction_index, receipt_log_index, call, 0)
+}
+
+fn observed_outbound_call_with_gas(
+    transaction_index: usize,
+    receipt_log_index: usize,
+    call: &L2ToL1CallSol,
+    call_gas: u64,
+) -> OutboundEventObservation {
+    OutboundEventObservation::decoded_for_test(
         transaction_index,
         receipt_log_index,
-        Some(cross_chain_call_hash(
-            RollupId::MAINNET,
-            call.targetAddress,
-            call.value,
-            &call.data,
-            call.sourceAddress,
-            RollupId(1),
-        )),
+        l2_mutable_outbound_call_hash(
+            CallHashInput {
+                source_address: call.sourceAddress,
+                source_rollup_id: RollupId(1),
+                target_address: call.targetAddress,
+                target_rollup_id: RollupId::MAINNET,
+                value: call.value,
+                data: &call.data,
+            },
+            call_gas,
+        ),
+        call_gas,
     )
 }
 

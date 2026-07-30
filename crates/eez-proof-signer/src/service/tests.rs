@@ -135,13 +135,16 @@ fn outbound_case(value: U256) -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256
     batch.entries[1].l2ToL1Calls[0].value = value;
     batch.entries[1].stateDeltas[0].etherDelta = -I256::try_from(value).unwrap();
     let call = &batch.entries[1].l2ToL1Calls[0];
-    let call_hash = eez_protocol::cross_chain_call_hash(
-        eez_protocol::RollupId::MAINNET,
-        call.targetAddress,
-        call.value,
-        &call.data,
-        call.sourceAddress,
-        eez_protocol::RollupId(1),
+    let call_hash = eez_protocol::l2_mutable_outbound_call_hash(
+        eez_protocol::CallHashInput {
+            source_address: call.sourceAddress,
+            source_rollup_id: eez_protocol::RollupId(1),
+            target_address: call.targetAddress,
+            target_rollup_id: eez_protocol::RollupId::MAINNET,
+            value: call.value,
+            data: &call.data,
+        },
+        0,
     );
     let user_body: reth_ethereum_primitives::BlockBody = alloy_consensus::BlockBody {
         transactions: vec![non_system_transaction()],
@@ -185,10 +188,8 @@ fn outbound_backend_output() -> validate::BackendWindowOutput {
 fn outbound_evidence(call_hash: B256) -> validate::SettlementBlockEvidence {
     validate::SettlementBlockEvidence::for_test(
         vec![true, false],
-        vec![validate::OutboundEventObservation::for_test(
-            1,
-            0,
-            Some(call_hash),
+        vec![validate::OutboundEventObservation::decoded_for_test(
+            1, 0, call_hash, 0,
         )],
     )
 }
@@ -244,10 +245,11 @@ fn mixed_backend_output() -> validate::BackendWindowOutput {
 fn mixed_evidence(outbound_call_hash: B256) -> validate::SettlementBlockEvidence {
     validate::SettlementBlockEvidence::for_test(
         vec![true, false, true],
-        vec![validate::OutboundEventObservation::for_test(
+        vec![validate::OutboundEventObservation::decoded_for_test(
             1,
             0,
-            Some(outbound_call_hash),
+            outbound_call_hash,
+            0,
         )],
     )
 }

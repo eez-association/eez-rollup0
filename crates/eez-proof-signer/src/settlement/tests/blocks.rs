@@ -22,7 +22,7 @@ fn validated_settling_block_uses_backend_recovered_sender_facts() {
         transaction(USER_INBOUND_SELECTOR_TX),
         transaction(USER_INBOUND_SELECTOR_TX),
     ]);
-    let observation = OutboundEventObservation::for_test(2, 1, Some(B256::repeat_byte(0x44)));
+    let observation = OutboundEventObservation::decoded_for_test(2, 1, B256::repeat_byte(0x44), 0);
     let block = ValidatedBlock::for_test(
         42,
         rlp,
@@ -465,10 +465,11 @@ fn validated_intermediate_blocks_reject_outbound_events() {
         block_rlp(vec![transaction(USER_INBOUND_SELECTOR_TX)]),
         SettlementBlockEvidence::for_test(
             vec![false],
-            vec![OutboundEventObservation::for_test(
+            vec![OutboundEventObservation::decoded_for_test(
                 0,
                 2,
-                Some(B256::repeat_byte(0x11)),
+                B256::repeat_byte(0x11),
+                0,
             )],
         ),
     );

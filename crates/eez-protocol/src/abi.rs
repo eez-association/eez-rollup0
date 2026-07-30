@@ -243,16 +243,10 @@ sol! {
         bytes32 indexed crossChainCallHash, uint256 indexed rollupId, uint256 indexed executionQueueIndex
     );
 
-    /// Emitted by `EEZL2.executeCrossChainCall` (`EEZL2.sol:200`, decl
-    /// `EEZBase.sol:97`) each time an OUTBOUND L2→L1 call is consumed on L2 —
-    /// `crossChainCallHash` (topic1) is `computeCrossChainCallHash(targetRollupId,
-    /// target, value, data, sourceAddress, ROLLUP_ID)` over the ACTUAL call
-    /// (source = the proxy's immediate caller, at ANY depth — so a wrapper
-    /// contract is the source). The outbound authorization gate matches each
-    /// settlement entry's computed hash against these topic1 values from the
-    /// re-executed Sync block: a phantom withdrawal has no matching event. INBOUND
-    /// delivery emits `IncomingCrossChainCallExecuted` instead, so filtering on
-    /// this topic0 isolates outbound consumptions.
+    /// Emitted by `EEZ` when L1 executes a mutable call through a proxy.
+    ///
+    /// `EEZL2` overloads this event with an additional `callGas` field; use
+    /// [`eez_l2_events::CrossChainCallExecuted`] when decoding L2 receipts.
     event CrossChainCallExecuted(
         bytes32 indexed crossChainCallHash,
         address indexed proxy,
@@ -260,6 +254,26 @@ sol! {
         bytes callData,
         uint256 value
     );
+}
+
+/// Events whose ABI differs specifically on `EEZL2`.
+pub mod eez_l2_events {
+    use alloy_sol_types::sol;
+
+    sol! {
+        /// Emitted when a mutable call leaves an L2 through a proxy.
+        ///
+        /// `callGas` is the manager-entry gas value included in the call hash.
+        /// It is zero when the deployed manager has `USE_GAS_LEFT` disabled.
+        event CrossChainCallExecuted(
+            bytes32 indexed crossChainCallHash,
+            address indexed proxy,
+            address sourceAddress,
+            bytes callData,
+            uint256 value,
+            uint64 callGas
+        );
+    }
 }
 
 // L2 (`EEZL2`, IEEZL2) execution table types — a SEPARATE, leaner family

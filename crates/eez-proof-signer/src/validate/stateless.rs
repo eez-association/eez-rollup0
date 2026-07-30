@@ -15,7 +15,7 @@ use alloy_genesis::ChainConfig;
 use alloy_genesis::Genesis;
 use alloy_sol_types::SolEvent as _;
 use eez_protocol::SYSTEM_ADDRESS;
-use eez_protocol::abi::CrossChainCallExecuted;
+use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
 use eez_protocol::settlement::{is_system_tx, pair_end_positions};
 use reth_chainspec::{ChainSpec, EthereumHardforks as _};
 use reth_ethereum_primitives::Block;
@@ -29,8 +29,8 @@ use stateless_reth::{
 use tracing::{debug, info, trace};
 
 use super::{
-    BackendBlockOutput, BackendWindowOutput, OutboundEventObservation, SettlementBlockEvidence,
-    TransactionStateCheckpoint, ValidationError,
+    BackendBlockOutput, BackendWindowOutput, DecodedOutboundEvent, OutboundEventObservation,
+    SettlementBlockEvidence, TransactionStateCheckpoint, ValidationError,
 };
 use crate::EEZL2_ADDRESS;
 use crate::cancel::CancellationToken;
@@ -331,7 +331,7 @@ impl Backend {
                     .count();
                 let malformed_outbound_events = observed_outbound_events
                     .iter()
-                    .filter(|observation| observation.decoded_call_hash.is_none())
+                    .filter(|observation| observation.decoded_event.is_none())
                     .count();
                 trace!(
                     block_ordinal,
@@ -492,8 +492,8 @@ fn recover_block(
 /// Retain every EEZL2 outbound-event candidate with receipt provenance.
 ///
 /// Matching emitter/signature logs remain observations in receipt order.
-/// Canonical encodings expose `crossChainCallHash`; malformed or non-canonical
-/// encodings remain observations without a hash.
+/// Canonical encodings expose the emitted hash and manager-entry gas;
+/// malformed or non-canonical encodings remain undecoded observations.
 fn observe_outbound_events(
     validated_receipts: &[EthereumReceipt],
 ) -> Vec<OutboundEventObservation> {
@@ -505,14 +505,16 @@ fn observe_outbound_events(
             {
                 continue;
             }
-            let decoded_call_hash = CrossChainCallExecuted::decode_log_validate(log)
+            let decoded_event = CrossChainCallExecuted::decode_log_validate(log)
                 .ok()
                 .filter(|decoded| &CrossChainCallExecuted::encode_log(decoded) == log)
-                .map(|decoded| decoded.data.crossChainCallHash);
+                .map(|decoded| {
+                    DecodedOutboundEvent::new(decoded.data.crossChainCallHash, decoded.data.callGas)
+                });
             observations.push(OutboundEventObservation {
                 transaction_index,
                 receipt_log_index,
-                decoded_call_hash,
+                decoded_event,
             });
         }
     }

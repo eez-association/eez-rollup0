@@ -7,8 +7,8 @@ use eez_control_rpc::v1::{
 use reth_primitives_traits::{BlockBody as _, SignerRecoverable as _};
 
 use super::{
-    SettlementInput, TestServer, assert_attestation, checkpoint, expected_rollup_id,
-    run_settlement, test_system_transaction_key, test_system_transaction_reconstructor,
+    SettlementInput, TestServer, checkpoint, expected_rollup_id, run_settlement,
+    test_system_transaction_key, test_system_transaction_reconstructor,
 };
 use crate::cancel::CancellationToken;
 use crate::{settlement, validate};
@@ -291,7 +291,7 @@ fn recorded_wire_witness(encoded: &str) -> ExecutionWitness {
 }
 
 #[tokio::test]
-async fn real_nonzero_outbound_fixture_reaches_the_expected_hash_and_signature() {
+async fn captured_five_field_outbound_events_are_rejected() {
     let blocks: Vec<(u64, String, String)> = (626..=630)
         .map(|number| {
             (
@@ -530,22 +530,9 @@ async fn real_nonzero_outbound_fixture_reaches_the_expected_hash_and_signature()
             .map(|flag| flag.as_bool().unwrap())
             .collect::<Vec<_>>()
     );
-    assert_eq!(
-        settling_evidence
-            .observed_outbound_events()
-            .iter()
-            .map(|observation| (
-                observation.transaction_index(),
-                observation.decoded_call_hash().unwrap()
-            ))
-            .collect::<Vec<_>>(),
-        recorded_outbound
-            .iter()
-            .map(|effect| (
-                usize::try_from(fixture_u64(effect, "transaction_index")).unwrap(),
-                fixture_str(effect, "call_hash").parse::<B256>().unwrap(),
-            ))
-            .collect::<Vec<_>>()
+    assert!(
+        settling_evidence.observed_outbound_events().is_empty(),
+        "the target EEZL2 decoder must not accept the five-field event topic"
     );
 
     let attester = crate::attest::Attester::new(
@@ -566,6 +553,6 @@ async fn real_nonzero_outbound_fixture_reaches_the_expected_hash_and_signature()
     )))
     .await;
 
-    let response = server.attest(chunks).await;
-    assert_attestation(&response, expected_hash, expected_attester);
+    let status = server.prove(chunks).await;
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
 }

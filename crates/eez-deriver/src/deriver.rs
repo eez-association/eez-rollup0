@@ -14,6 +14,7 @@ use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT, BlockCommitterHandle, DeriveOutcome};
 use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Watcher, ScannedBatch, Submitter};
+use eez_protocol::outbound_gate::OutboundCallObservation;
 use reth_chainspec::{ChainSpec, EthereumHardforks};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_ethereum_primitives::TransactionSigned;
@@ -1302,7 +1303,7 @@ where
                 .as_ref()
                 .expect("gate_outbound only populated under system_tx_cfg = Some");
             let to_block = from_block + last_index as u64;
-            let observed = self.observed_outbound_hashes(to_block, cfg.ccm_l2_address)?;
+            let observed = self.observed_outbound_calls(to_block, cfg.ccm_l2_address)?;
             eez_protocol::outbound_gate::verify_outbound_authorized(
                 &gate_outbound,
                 &observed,
@@ -1318,12 +1319,15 @@ where
         Ok(replayed)
     }
 
-    /// The outbound `crossChainCallHash`es (topic1) `block` emitted from the
-    /// CCM-L2 — what [`eez_protocol::outbound_gate`] matches settlement entries against.
+    /// Canonical outbound-call events emitted by the L2 manager in `block`.
     ///
     /// # Errors
     /// [`DeriverError::l2_provider`] if the block's receipts are missing locally.
-    fn observed_outbound_hashes(&self, block: u64, ccm_l2: Address) -> DeriverResult<Vec<B256>> {
+    fn observed_outbound_calls(
+        &self,
+        block: u64,
+        eez_l2: Address,
+    ) -> DeriverResult<Vec<OutboundCallObservation>> {
         let receipts = self
             .inner
             .l2_provider
@@ -1332,7 +1336,7 @@ where
             .ok_or_else(|| {
                 DeriverError::l2_provider(format!("local receipts for Sync block {block} missing"))
             })?;
-        Ok(extract_outbound_call_hashes(&receipts, ccm_l2))
+        Ok(extract_outbound_call_observations(&receipts, eez_l2))
     }
 
     /// SYSTEM_ADDRESS account nonce at the L2 parent block. Both
@@ -1499,68 +1503,91 @@ where
     Ok(local_block.header().parent_hash == expected_parent_hash)
 }
 
-/// Outbound-call hashes the gate consumes: topic1 of each `CrossChainCallExecuted`
-/// log from `ccm_l2`, as a multiset (duplicates kept).
+/// Canonically decoded `CrossChainCallExecuted` logs from `eez_l2`.
 ///
 /// Both filters are load-bearing:
-/// - `log.address == ccm_l2` rejects a look-alike event any other contract could
+/// - `log.address == eez_l2` rejects a look-alike event any other contract could
 ///   emit with a chosen `crossChainCallHash`;
 /// - the topic0 signature excludes inbound (`IncomingCrossChainCallExecuted`) and
 ///   every other event.
 ///
-/// Reverted txs contribute no logs, so a rolled-back call can't authorize a settlement.
-fn extract_outbound_call_hashes<R>(receipts: &[R], ccm_l2: Address) -> Vec<B256>
+/// Matching logs must also have the exact canonical event encoding. Reverted
+/// transactions contribute no logs, so a rolled-back call cannot authorize a
+/// settlement.
+fn extract_outbound_call_observations<R>(
+    receipts: &[R],
+    eez_l2: Address,
+) -> Vec<OutboundCallObservation>
 where
     R: alloy_consensus::TxReceipt<Log = alloy_primitives::Log>,
 {
     use alloy_sol_types::SolEvent as _;
-    let sig = eez_protocol::abi::CrossChainCallExecuted::SIGNATURE_HASH;
-    let mut hashes = Vec::new();
+    use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
+
+    let mut observations = Vec::new();
     for receipt in receipts {
         for log in receipt.logs() {
-            if log.address == ccm_l2 {
-                let topics = log.data.topics();
-                if topics.first() == Some(&sig)
-                    && let Some(h) = topics.get(1)
-                {
-                    hashes.push(*h);
-                }
+            if log.address != eez_l2
+                || log.data.topics().first() != Some(&CrossChainCallExecuted::SIGNATURE_HASH)
+            {
+                continue;
             }
+            let Ok(decoded) = CrossChainCallExecuted::decode_log_validate(log) else {
+                continue;
+            };
+            if &CrossChainCallExecuted::encode_log(&decoded) != log {
+                continue;
+            }
+            observations.push(OutboundCallObservation::new(
+                decoded.data.crossChainCallHash,
+                decoded.data.callGas,
+            ));
         }
     }
-    hashes
+    observations
 }
 
 #[cfg(test)]
 mod outbound_wiring_tests {
     //! Wiring + attack-surface tests for the outbound authorization path: the
-    //! event extraction ([`extract_outbound_call_hashes`]) and its composition
+    //! event extraction ([`extract_outbound_call_observations`]) and its composition
     //! with [`eez_protocol::outbound_gate::verify_outbound_authorized`]. The pure gate
     //! logic is unit-tested in `eez-protocol`; here we exercise the DERIVER-side wiring
     //! — the address + event-signature filters that decide which events authorize
     //! — and the accept/reject decisions on synthetic receipts.
 
-    use super::extract_outbound_call_hashes;
+    use super::extract_outbound_call_observations;
     use alloy_consensus::Receipt;
-    use alloy_primitives::{Address, B256, Bytes, Log, U256, address};
+    use alloy_primitives::{Address, B256, Bytes, Log, U256, address, b256};
+    use alloy_sol_types::SolEvent;
     use eez_protocol::RollupId;
-    use eez_protocol::abi::{CrossChainCallExecuted, ExecutionEntrySol, L2ToL1CallSol};
-    use eez_protocol::action::cross_chain_call_hash;
-    use eez_protocol::outbound_gate::verify_outbound_authorized;
+    use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
+    use eez_protocol::abi::{ExecutionEntrySol, L2ToL1CallSol};
+    use eez_protocol::action::{CallHashInput, l2_mutable_outbound_call_hash};
+    use eez_protocol::outbound_gate::{OutboundCallObservation, verify_outbound_authorized};
 
-    const CCM: Address = address!("4200000000000000000000000000000000000007");
+    const EEZ_L2: Address = address!("4200000000000000000000000000000000000007");
     const OTHER: Address = address!("00000000000000000000000000000000deadbeef");
     const L2_RID: u64 = 1;
 
-    /// A `CrossChainCallExecuted` log from `addr` carrying `call_hash` as topic1.
-    fn cc_log(addr: Address, call_hash: B256) -> Log {
-        use alloy_sol_types::SolEvent as _;
-        let topics = vec![
-            CrossChainCallExecuted::SIGNATURE_HASH,
-            call_hash,
-            B256::ZERO,
-        ];
-        Log::new_unchecked(addr, topics, Bytes::new())
+    /// Encode a canonical event with caller-supplied fields for decoder tests.
+    fn encoded_event_log(addr: Address, call_hash: B256, call_gas: u64) -> Log {
+        Log {
+            address: addr,
+            data: CrossChainCallExecuted {
+                crossChainCallHash: call_hash,
+                proxy: Address::ZERO,
+                sourceAddress: Address::repeat_byte(0x11),
+                callData: Bytes::from_static(&[0xaa, 0xbb]),
+                value: U256::from(7),
+                callGas: call_gas,
+            }
+            .encode_log_data(),
+        }
+    }
+
+    fn observation(call_hash: B256, call_gas: u64) -> OutboundCallObservation {
+        OutboundCallObservation::new(call_hash, call_gas)
     }
 
     fn receipt(logs: Vec<Log>) -> Receipt {
@@ -1598,15 +1625,34 @@ mod outbound_wiring_tests {
 
     /// The topic1 `EEZL2` emits for `call` on this L2 (`targetRollupId` =
     /// MAINNET(0), `sourceRollupId` = `L2_RID`) — what the gate recomputes.
-    fn call_hash(call: &L2ToL1CallSol) -> B256 {
-        cross_chain_call_hash(
-            RollupId(0),
-            call.targetAddress,
-            call.value,
-            &call.data,
-            call.sourceAddress,
-            RollupId(L2_RID),
+    fn call_hash(call: &L2ToL1CallSol, call_gas: u64) -> B256 {
+        l2_mutable_outbound_call_hash(
+            CallHashInput {
+                source_address: call.sourceAddress,
+                source_rollup_id: RollupId(L2_RID),
+                target_address: call.targetAddress,
+                target_rollup_id: RollupId::MAINNET,
+                value: call.value,
+                data: &call.data,
+            },
+            call_gas,
         )
+    }
+
+    /// Encode a self-consistent event for a call-hash wiring test.
+    fn event_log_for_call(addr: Address, call: &L2ToL1CallSol, call_gas: u64) -> Log {
+        Log {
+            address: addr,
+            data: CrossChainCallExecuted {
+                crossChainCallHash: call_hash(call, call_gas),
+                proxy: Address::ZERO,
+                sourceAddress: call.sourceAddress,
+                callData: call.data.clone(),
+                value: call.value,
+                callGas: call_gas,
+            }
+            .encode_log_data(),
+        }
     }
 
     fn eoa() -> Address {
@@ -1619,20 +1665,44 @@ mod outbound_wiring_tests {
     // ── extraction filters ──────────────────────────────────────────────
 
     #[test]
-    fn extract_picks_ccm_events_and_preserves_multiset() {
+    fn outbound_event_signature_matches_the_l2_contract() {
+        assert_eq!(
+            CrossChainCallExecuted::SIGNATURE_HASH,
+            b256!("ec2129bc21aa3a28f7f705d280646ec2ebfbf1769b89938768c6bdbfb04da7c4")
+        );
+    }
+
+    #[test]
+    fn extraction_requires_canonical_manager_events_and_preserves_fields() {
         let h1 = B256::repeat_byte(0x11);
         let h2 = B256::repeat_byte(0x22);
-        // Empty receipts (reverted txs) and topicless logs carry no hash — ignored.
-        let bare = Log::new_unchecked(CCM, Vec::new(), Bytes::new());
+        // Topicless and body-less look-alikes are not canonical observations.
+        let bare = Log::new_unchecked(EEZ_L2, Vec::new(), Bytes::new());
+        let malformed = Log::new_unchecked(
+            EEZ_L2,
+            vec![CrossChainCallExecuted::SIGNATURE_HASH, h1, B256::ZERO],
+            Bytes::new(),
+        );
+        let mut trailing = encoded_event_log(EEZ_L2, h1, 0);
+        let mut body = trailing.data.data.to_vec();
+        body.push(0);
+        trailing.data.data = Bytes::from(body);
         let receipts = vec![
-            receipt(vec![cc_log(CCM, h1), cc_log(CCM, h2)]),
-            receipt(vec![cc_log(CCM, h1)]), // duplicate h1 → multiset keeps both
-            receipt(vec![]),                // reverted tx → no logs
-            receipt(vec![bare]),            // topicless log → no hash
+            receipt(vec![
+                encoded_event_log(EEZ_L2, h1, 0),
+                encoded_event_log(EEZ_L2, h2, u64::MAX),
+            ]),
+            receipt(vec![encoded_event_log(EEZ_L2, h1, 0)]),
+            receipt(vec![]),
+            receipt(vec![bare, malformed, trailing]),
         ];
         assert_eq!(
-            extract_outbound_call_hashes(&receipts, CCM),
-            vec![h1, h2, h1]
+            extract_outbound_call_observations(&receipts, EEZ_L2),
+            vec![
+                observation(h1, 0),
+                observation(h2, u64::MAX),
+                observation(h1, 0),
+            ]
         );
     }
 
@@ -1643,8 +1713,8 @@ mod outbound_wiring_tests {
         // Outbound-via-wrapper end to end through extraction: source is a CONTRACT.
         let wrapper = address!("cccccccccccccccccccccccccccccccccccccccc");
         let call = outbound_call(wrapper, l1_target(), 42, &[0xab]);
-        let receipts = vec![receipt(vec![cc_log(CCM, call_hash(&call))])];
-        let observed = extract_outbound_call_hashes(&receipts, CCM);
+        let receipts = vec![receipt(vec![event_log_for_call(EEZ_L2, &call, 0)])];
+        let observed = extract_outbound_call_observations(&receipts, EEZ_L2);
         assert!(
             verify_outbound_authorized(&[outbound_entry(call)], &observed, L2_RID).is_ok(),
             "a contract-initiated (wrapper) outbound must be accepted"
@@ -1656,30 +1726,47 @@ mod outbound_wiring_tests {
         // ATTACK: the only event with the matching hash is emitted by a foreign
         // address; extraction drops it, so the gate sees a phantom.
         let call = outbound_call(eoa(), l1_target(), 7, &[0x12]);
-        let receipts = vec![receipt(vec![cc_log(OTHER, call_hash(&call))])];
-        let observed = extract_outbound_call_hashes(&receipts, CCM);
+        let receipts = vec![receipt(vec![event_log_for_call(OTHER, &call, 0)])];
+        let observed = extract_outbound_call_observations(&receipts, EEZ_L2);
+        assert!(verify_outbound_authorized(&[outbound_entry(call)], &observed, L2_RID).is_err());
+    }
+
+    #[test]
+    fn wiring_rejects_nonzero_manager_entry_gas() {
+        let call = outbound_call(eoa(), l1_target(), 7, &[0x12]);
+        let receipts = vec![receipt(vec![event_log_for_call(EEZ_L2, &call, 1)])];
+        let observed = extract_outbound_call_observations(&receipts, EEZ_L2);
+
         assert!(verify_outbound_authorized(&[outbound_entry(call)], &observed, L2_RID).is_err());
     }
 
     #[test]
     fn wiring_rejects_double_count() {
-        // ATTACK: two identical settlement entries, one real event → the second is
+        // ATTACK: two identical settlement entries, one matching event → the second is
         // unmatched (multiset consumption).
         let call = outbound_call(eoa(), l1_target(), 7, &[0x12]);
         let entries = vec![outbound_entry(call.clone()), outbound_entry(call.clone())];
-        let one = vec![receipt(vec![cc_log(CCM, call_hash(&call))])];
+        let one = vec![receipt(vec![event_log_for_call(EEZ_L2, &call, 0)])];
         assert!(
-            verify_outbound_authorized(&entries, &extract_outbound_call_hashes(&one, CCM), L2_RID)
-                .is_err()
+            verify_outbound_authorized(
+                &entries,
+                &extract_outbound_call_observations(&one, EEZ_L2),
+                L2_RID,
+            )
+            .is_err()
         );
         // …but two events authorize both.
         let two = vec![receipt(vec![
-            cc_log(CCM, call_hash(&call)),
-            cc_log(CCM, call_hash(&call)),
+            event_log_for_call(EEZ_L2, &call, 0),
+            event_log_for_call(EEZ_L2, &call, 0),
         ])];
         assert!(
-            verify_outbound_authorized(&entries, &extract_outbound_call_hashes(&two, CCM), L2_RID)
-                .is_ok()
+            verify_outbound_authorized(
+                &entries,
+                &extract_outbound_call_observations(&two, EEZ_L2),
+                L2_RID,
+            )
+            .is_ok()
         );
     }
 }

@@ -4,7 +4,7 @@ use std::num::NonZeroU64;
 
 use alloy_primitives::{B256, I256, U256};
 use eez_protocol::abi::ExecutionEntrySol;
-use eez_protocol::{RollupId, SYSTEM_ADDRESS, cross_chain_call_hash};
+use eez_protocol::{CallHashInput, RollupId, SYSTEM_ADDRESS, l2_mutable_outbound_call_hash};
 use thiserror::Error;
 
 use super::effect_binding::{BoundEffect, BoundEffectSequence, EffectKind};
@@ -46,6 +46,14 @@ pub(crate) enum OutboundEffectError {
     MalformedObservation {
         transaction_index: usize,
         receipt_log_index: usize,
+    },
+    #[error(
+        "outbound event at transaction {transaction_index}, receipt log {receipt_log_index}, uses callGas {actual}; expected 0"
+    )]
+    UnsupportedCallGas {
+        transaction_index: usize,
+        receipt_log_index: usize,
+        actual: u64,
     },
     #[error("outbound entry {entry_index} has {actual} L2-to-L1 calls; expected exactly one")]
     L2ToL1CallCount { entry_index: usize, actual: usize },
@@ -265,20 +273,31 @@ fn authorize_outbound_effect(
             actual: call.sourceRollupId,
         });
     }
-    let observed_call_hash =
+    let decoded_event =
         observation
-            .decoded_call_hash()
+            .decoded_event()
             .ok_or(OutboundEffectError::MalformedObservation {
                 transaction_index: observation.transaction_index(),
                 receipt_log_index: observation.receipt_log_index(),
             })?;
-    let recomputed_call_hash = cross_chain_call_hash(
-        RollupId::MAINNET,
-        call.targetAddress,
-        call.value,
-        &call.data,
-        call.sourceAddress,
-        RollupId(expected_rollup_id.get()),
+    if decoded_event.call_gas() != 0 {
+        return Err(OutboundEffectError::UnsupportedCallGas {
+            transaction_index: observation.transaction_index(),
+            receipt_log_index: observation.receipt_log_index(),
+            actual: decoded_event.call_gas(),
+        });
+    }
+    let observed_call_hash = decoded_event.call_hash();
+    let recomputed_call_hash = l2_mutable_outbound_call_hash(
+        CallHashInput {
+            source_address: call.sourceAddress,
+            source_rollup_id: RollupId(expected_rollup_id.get()),
+            target_address: call.targetAddress,
+            target_rollup_id: RollupId::MAINNET,
+            value: call.value,
+            data: &call.data,
+        },
+        decoded_event.call_gas(),
     );
     if observed_call_hash != recomputed_call_hash {
         return Err(OutboundEffectError::CallHashMismatch {

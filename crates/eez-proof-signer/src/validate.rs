@@ -60,9 +60,38 @@ pub(crate) struct BackendWindowOutput {
     pub(crate) blocks: Vec<BackendBlockOutput>,
 }
 
+/// Canonically decoded fields used to bind an outbound effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecodedOutboundEvent {
+    call_hash: B256,
+    call_gas: u64,
+}
+
+impl DecodedOutboundEvent {
+    /// Construct fields recovered from one canonical `EEZL2` event.
+    pub(in crate::validate) const fn new(call_hash: B256, call_gas: u64) -> Self {
+        Self {
+            call_hash,
+            call_gas,
+        }
+    }
+
+    /// Hash emitted for the executed call.
+    pub(crate) const fn call_hash(&self) -> B256 {
+        self.call_hash
+    }
+
+    /// Manager-entry gas value included in the emitted hash.
+    ///
+    /// This is distinct from any gas limit forwarded to the destination.
+    pub(crate) const fn call_gas(&self) -> u64 {
+        self.call_gas
+    }
+}
+
 /// One outbound-event candidate observed in the validated execution output.
 ///
-/// `decoded_call_hash` is absent when a log from EEZL2 has the outbound event
+/// `decoded_event` is absent when a log from EEZL2 has the outbound event
 /// signature but its complete event encoding is malformed. Retaining that
 /// candidate lets settlement fail closed instead of silently ignoring it.
 /// Production construction is restricted to validation backends.
@@ -72,8 +101,8 @@ pub(crate) struct OutboundEventObservation {
     pub(in crate::validate) transaction_index: usize,
     /// Zero-based log position within that transaction's receipt.
     pub(in crate::validate) receipt_log_index: usize,
-    /// Decoded `crossChainCallHash`, when the complete event is canonical.
-    pub(in crate::validate) decoded_call_hash: Option<B256>,
+    /// Decoded fields, when the complete event is canonical.
+    pub(in crate::validate) decoded_event: Option<DecodedOutboundEvent>,
 }
 
 impl OutboundEventObservation {
@@ -87,22 +116,36 @@ impl OutboundEventObservation {
         self.receipt_log_index
     }
 
-    /// Canonically decoded call hash, or `None` for a malformed candidate.
-    pub(crate) const fn decoded_call_hash(&self) -> Option<B256> {
-        self.decoded_call_hash
+    /// Canonically decoded event, or `None` for a malformed candidate.
+    pub(crate) const fn decoded_event(&self) -> Option<DecodedOutboundEvent> {
+        self.decoded_event
     }
 
-    /// Construct synthetic backend evidence for tests outside `validate`.
+    /// Construct synthetic backend evidence with decoded event fields.
     #[cfg(test)]
-    pub(crate) const fn for_test(
+    pub(crate) const fn decoded_for_test(
         transaction_index: usize,
         receipt_log_index: usize,
-        decoded_call_hash: Option<B256>,
+        call_hash: B256,
+        call_gas: u64,
     ) -> Self {
         Self {
             transaction_index,
             receipt_log_index,
-            decoded_call_hash,
+            decoded_event: Some(DecodedOutboundEvent::new(call_hash, call_gas)),
+        }
+    }
+
+    /// Construct a malformed synthetic event candidate for rejection tests.
+    #[cfg(test)]
+    pub(crate) const fn malformed_for_test(
+        transaction_index: usize,
+        receipt_log_index: usize,
+    ) -> Self {
+        Self {
+            transaction_index,
+            receipt_log_index,
+            decoded_event: None,
         }
     }
 }

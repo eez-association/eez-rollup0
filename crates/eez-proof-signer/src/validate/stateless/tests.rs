@@ -119,6 +119,10 @@ fn checkpoint(transaction_index: usize) -> TransactionStateCheckpoint {
 }
 
 fn outbound_log(address: Address, call_hash: B256) -> Log {
+    outbound_log_with_gas(address, call_hash, 0)
+}
+
+fn outbound_log_with_gas(address: Address, call_hash: B256, call_gas: u64) -> Log {
     Log {
         address,
         data: CrossChainCallExecuted {
@@ -127,6 +131,7 @@ fn outbound_log(address: Address, call_hash: B256) -> Log {
             sourceAddress: Address::repeat_byte(0x11),
             callData: Bytes::from_static(&[0xaa, 0xbb]),
             value: U256::from(7),
+            callGas: call_gas,
         }
         .encode_log_data(),
     }
@@ -156,16 +161,14 @@ fn outbound_observations_require_the_eezl2_emitter_and_event_signature() {
 
     assert_eq!(
         observe_outbound_events(&[receipt_with_logs(logs)]),
-        [OutboundEventObservation {
-            transaction_index: 0,
-            receipt_log_index: 2,
-            decoded_call_hash: Some(call_hash),
-        }]
+        [OutboundEventObservation::decoded_for_test(
+            0, 2, call_hash, 0,
+        )]
     );
 }
 
 #[test]
-fn malformed_named_outbound_events_are_retained_without_a_hash() {
+fn malformed_named_outbound_events_are_retained_without_decoded_fields() {
     let call_hash = B256::repeat_byte(0x33);
     let mut topic0_only = outbound_log(EEZL2_ADDRESS, call_hash);
     topic0_only.data.topics_mut_unchecked().truncate(1);
@@ -189,26 +192,10 @@ fn malformed_named_outbound_events_are_retained_without_a_hash() {
             trailing_body,
         ])]),
         [
-            OutboundEventObservation {
-                transaction_index: 0,
-                receipt_log_index: 0,
-                decoded_call_hash: None,
-            },
-            OutboundEventObservation {
-                transaction_index: 0,
-                receipt_log_index: 1,
-                decoded_call_hash: None,
-            },
-            OutboundEventObservation {
-                transaction_index: 0,
-                receipt_log_index: 2,
-                decoded_call_hash: None,
-            },
-            OutboundEventObservation {
-                transaction_index: 0,
-                receipt_log_index: 3,
-                decoded_call_hash: None,
-            },
+            OutboundEventObservation::malformed_for_test(0, 0),
+            OutboundEventObservation::malformed_for_test(0, 1),
+            OutboundEventObservation::malformed_for_test(0, 2),
+            OutboundEventObservation::malformed_for_test(0, 3),
         ]
     );
 }
@@ -225,7 +212,7 @@ fn outbound_observations_preserve_receipt_log_order_and_duplicates() {
         ]),
         receipt_with_logs(vec![
             noise,
-            outbound_log(EEZL2_ADDRESS, b),
+            outbound_log_with_gas(EEZL2_ADDRESS, b, u64::MAX),
             outbound_log(EEZL2_ADDRESS, a),
         ]),
     ]);
@@ -233,26 +220,10 @@ fn outbound_observations_preserve_receipt_log_order_and_duplicates() {
     assert_eq!(
         observations,
         [
-            OutboundEventObservation {
-                transaction_index: 0,
-                receipt_log_index: 0,
-                decoded_call_hash: Some(a),
-            },
-            OutboundEventObservation {
-                transaction_index: 0,
-                receipt_log_index: 1,
-                decoded_call_hash: Some(a),
-            },
-            OutboundEventObservation {
-                transaction_index: 1,
-                receipt_log_index: 1,
-                decoded_call_hash: Some(b),
-            },
-            OutboundEventObservation {
-                transaction_index: 1,
-                receipt_log_index: 2,
-                decoded_call_hash: Some(a),
-            },
+            OutboundEventObservation::decoded_for_test(0, 0, a, 0),
+            OutboundEventObservation::decoded_for_test(0, 1, a, 0),
+            OutboundEventObservation::decoded_for_test(1, 1, b, u64::MAX),
+            OutboundEventObservation::decoded_for_test(1, 2, a, 0),
         ]
     );
 }

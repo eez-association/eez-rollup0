@@ -1,53 +1,11 @@
-//! Outbound L2->L1 authorization gate — the soundness check the DERIVER runs
-//! (over the reconciled batch + the Sync block it re-executed) when re-deriving
-//! the L2 chain from L1. Designed to be the SHARED check a future out-of-process
-//! prover would also run (so the two can never drift), but in THIS repo only the
-//! deriver calls it — the composer builds these entries from its own drained,
-//! signed mempool txs, and the mock prover runs no gate. The deriver is the
-//! canonical-chain authority, so this is the enforcement point today.
+//! Authorization for mutable L2 calls represented by outbound settlement entries.
 //!
-//! An outbound settlement entry (an immediate — `proxyEntryHash == 0` — carrying
-//! a non-empty `l2ToL1Calls`) claims an L2->L1 call L1 will EXECUTE, paying the
-//! rollup's escrowed ether. The gate proves the L2 ACTUALLY originated it by
-//! recomputing the entry's cross-chain call hash and matching it against the
-//! `CrossChainCallExecuted` events the Sync block emitted when the deriver
-//! re-executed it (`EEZL2.executeCrossChainCall`, `EEZL2.sol:200`).
-//!
-//! `EEZL2` computes that hash from the ACTUAL call: `sourceAddress` is the
-//! proxy's IMMEDIATE caller at ANY depth — so a WRAPPER contract that internally
-//! calls the proxy is a first-class source (an L2 DeFi contract swapping on an L1
-//! pool) — `targetRollupId` is the proxy's `originalRollupId` (MAINNET=0 for an
-//! L1 target), and `sourceRollupId` is forced to this L2's `ROLLUP_ID`. Matching
-//! that single hash therefore binds ALL of: source (incl. a wrapper), target,
-//! value, data, and target-rollup==MAINNET, in one comparison. It is exactly
-//! what the outbound consume path enforces on re-execution: `_consumeAndExecute`
-//! reverts `ExecutionNotFound` unless a loaded entry's `proxyEntryHash` equals
-//! this hash (`EEZL2.sol:405`,`:408`; the inbound analog is `EntryHashMismatch`
-//! at `:265`) — and what a real zk-prover of the L2 STF proves — so the bind
-//! is UNFORGEABLE: a composer cannot make a phantom settlement entry match an
-//! event, because emitting that event requires a real signed DA tx that, when
-//! deterministically replayed, actually makes that exact call. Anti-phantom
-//! safety thus rests on "a composer can't forge what deterministic execution of
-//! the signed DA produces" — a superset of the prior gate's "can't forge a
-//! signature", and one that (unlike the prior gate) covers contract-initiated
-//! withdrawals. See `docs/OUTBOUND-VIA-WRAPPER-GATE.md`.
-//!
-//! (The prior gate bound each entry positionally to the top-level signed
-//! Sync-block user tx's `to`/`signer`/`value`/`data`. Those binds only hold for
-//! a DIRECT EOA->proxy call: a wrapper makes `sourceAddress` the wrapper and
-//! `tx.to` the wrapper, so every bind misfired and the deriver rejected the
-//! withdrawal by design. The trace binding here is depth-agnostic.)
-//!
-//! NOTE on the L2 execution + ether model (verified against EEZL2.sol @5c51e02):
-//! the outbound user tx SUCCEEDS in plain re-execution. `executeCrossChainCall`
-//! burns `msg.value` to `SYSTEM_ADDRESS` (`EEZL2.sol:192-194`) and then consumes
-//! the loaded LEAN settlement entry (`callCount == 0`, empty `incomingCalls` →
-//! `_processNCalls(0)` is a no-op, so `_rollingHash` stays 0 and matches
-//! `entry.rollingHash`). There is NO L1 delivery on L2 — the L2 leg is the burn
-//! + a no-op settlement record; the real delivery is the L1 immediate entry. So
-//! the L2 ether debit IS the `SYSTEM_ADDRESS` burn (NOT a `StateDelta` — EEZL2
-//! has no state deltas / ether accounting); the L1 debit is the settlement
-//! entry's `etherDelta` (`-value`); conservation is cross-chain.
+//! For each claimed call, the gate recomputes the gas-aware key used by
+//! `EEZL2.executeCrossChainCall` and consumes one matching event observation
+//! from the re-executed Sync block. The hash binds the immediate L2 caller,
+//! source and target rollups, target, value, calldata, and manager-entry gas.
+//! Treating observations as a multiset preserves duplicate calls while
+//! preventing one event from authorizing more than one entry.
 
 use std::collections::HashMap;
 
@@ -55,12 +13,47 @@ use crate::RollupId;
 use alloy_primitives::{B256, U256};
 
 use crate::abi::ExecutionEntrySol;
-use crate::action::cross_chain_call_hash;
+use crate::action::{CallHashInput, l2_mutable_outbound_call_hash};
 
 /// `RollupId(0)` — MAINNET. An L2->L1 outbound's L1 target lives on mainnet, so
 /// the `targetRollupId` field of its call hash is 0 (the L2 proxy's
 /// `originalRollupId`) — the value `EEZL2.executeCrossChainCall` recomputes.
 const MAINNET_ROLLUP_ID: RollupId = RollupId(0);
+
+/// The supported EEZL2 deployment disables `USE_GAS_LEFT`.
+const SUPPORTED_CALL_GAS: u64 = 0;
+
+/// Canonically decoded evidence from an `EEZL2.CrossChainCallExecuted` log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutboundCallObservation {
+    call_hash: B256,
+    call_gas: u64,
+}
+
+impl OutboundCallObservation {
+    /// Construct an observation from a canonically decoded `EEZL2` event.
+    #[must_use]
+    pub const fn new(call_hash: B256, call_gas: u64) -> Self {
+        Self {
+            call_hash,
+            call_gas,
+        }
+    }
+
+    /// Hash emitted by `EEZL2` for the executed call.
+    #[must_use]
+    pub const fn call_hash(&self) -> B256 {
+        self.call_hash
+    }
+
+    /// Manager-entry gas value folded into the emitted hash.
+    ///
+    /// This is not the destination-call forwarding gas limit.
+    #[must_use]
+    pub const fn call_gas(&self) -> u64 {
+        self.call_gas
+    }
+}
 
 /// Verify every OUTBOUND settlement entry was actually originated on L2, by
 /// matching its recomputed cross-chain call hash against the
@@ -68,11 +61,9 @@ const MAINNET_ROLLUP_ID: RollupId = RollupId(0);
 ///
 /// `outbound_entries` MUST be the outbound immediates only (`proxyEntryHash ==
 /// 0`, non-empty `l2ToL1Calls`) that L1 settled, in DA order.
-/// `observed_call_hashes` is the multiset of `crossChainCallHash` (topic1) from
-/// every `CrossChainCallExecuted` log the Sync block emitted (outbound
-/// consumptions; inbound delivery emits a different event, so it is naturally
-/// excluded). `l2_rollup_id` is this L2's own id, which each entry's
-/// `sourceRollupId` must equal.
+/// `observed_calls` contains the canonically decoded
+/// `CrossChainCallExecuted` logs from the Sync block. `l2_rollup_id` is this
+/// L2's own id, which each entry's `sourceRollupId` must equal.
 ///
 /// # Errors
 /// The first outbound entry that is malformed (non-zero `proxyEntryHash`, empty
@@ -81,14 +72,20 @@ const MAINNET_ROLLUP_ID: RollupId = RollupId(0);
 /// non-mainnet-target withdrawal.
 pub fn verify_outbound_authorized(
     outbound_entries: &[ExecutionEntrySol],
-    observed_call_hashes: &[B256],
+    observed_calls: &[OutboundCallObservation],
     l2_rollup_id: u64,
 ) -> Result<(), String> {
     // Multiset of hashes actually consumed on L2 this Sync block. Each entry
     // claims one — two identical calls need two events.
     let mut available: HashMap<B256, usize> = HashMap::new();
-    for h in observed_call_hashes {
-        *available.entry(*h).or_insert(0) += 1;
+    for observation in observed_calls {
+        if observation.call_gas() != SUPPORTED_CALL_GAS {
+            return Err(format!(
+                "outbound event uses callGas {}; this deployment requires callGas 0",
+                observation.call_gas(),
+            ));
+        }
+        *available.entry(observation.call_hash()).or_insert(0) += 1;
     }
 
     for (i, entry) in outbound_entries.iter().enumerate() {
@@ -117,19 +114,18 @@ pub fn verify_outbound_authorized(
             ));
         }
 
-        // Recompute the hash EEZL2 computes for this call and require a matching
-        // emitted event. `targetRollupId = MAINNET(0)` binds the target to L1;
-        // `sourceRollupId = this L2` is what EEZL2 forces into the hash. A match
-        // binds source (the immediate caller, so wrapper-friendly) / target /
-        // value / data / mainnet-target all at once, at any call depth — the
-        // same hash `EntryHashMismatch` enforces during replay.
-        let expected = cross_chain_call_hash(
-            MAINNET_ROLLUP_ID,
-            call.targetAddress,
-            call.value,
-            &call.data,
-            call.sourceAddress,
-            RollupId(l2_rollup_id),
+        // Recompute the key EEZL2 uses to find the loaded entry. MAINNET binds
+        // the destination to L1; the configured rollup binds the L2 source.
+        let expected = l2_mutable_outbound_call_hash(
+            CallHashInput {
+                source_address: call.sourceAddress,
+                source_rollup_id: RollupId(l2_rollup_id),
+                target_address: call.targetAddress,
+                target_rollup_id: MAINNET_ROLLUP_ID,
+                value: call.value,
+                data: &call.data,
+            },
+            SUPPORTED_CALL_GAS,
         );
         match available.get_mut(&expected) {
             Some(n) if *n > 0 => *n -= 1,
@@ -169,14 +165,20 @@ mod tests {
     /// The observed `CrossChainCallExecuted` topic1 EEZL2 would emit for `call`
     /// on this L2 — `sourceRollupId` forced to `l2_rollup_id`, `targetRollupId`
     /// = MAINNET(0). The gate recomputes the identical hash.
-    fn observed(call: &L2ToL1CallSol, l2_rollup_id: u64) -> B256 {
-        cross_chain_call_hash(
-            RollupId(0),
-            call.targetAddress,
-            call.value,
-            &call.data,
-            call.sourceAddress,
-            RollupId(l2_rollup_id),
+    fn observed(call: &L2ToL1CallSol, l2_rollup_id: u64) -> OutboundCallObservation {
+        OutboundCallObservation::new(
+            l2_mutable_outbound_call_hash(
+                CallHashInput {
+                    source_address: call.sourceAddress,
+                    source_rollup_id: RollupId(l2_rollup_id),
+                    target_address: call.targetAddress,
+                    target_rollup_id: RollupId::MAINNET,
+                    value: call.value,
+                    data: &call.data,
+                },
+                SUPPORTED_CALL_GAS,
+            ),
+            SUPPORTED_CALL_GAS,
         )
     }
 
@@ -256,13 +258,19 @@ mod tests {
         let c = call(source, target, 7, &[0x12, 0x34]);
 
         // An event whose hash used targetRollupId = 5 (a non-mainnet target).
-        let non_mainnet_event = cross_chain_call_hash(
-            RollupId(5),
-            c.targetAddress,
-            c.value,
-            &c.data,
-            c.sourceAddress,
-            RollupId(1),
+        let non_mainnet_event = OutboundCallObservation::new(
+            l2_mutable_outbound_call_hash(
+                CallHashInput {
+                    source_address: c.sourceAddress,
+                    source_rollup_id: RollupId(1),
+                    target_address: c.targetAddress,
+                    target_rollup_id: RollupId(5),
+                    value: c.value,
+                    data: &c.data,
+                },
+                SUPPORTED_CALL_GAS,
+            ),
+            SUPPORTED_CALL_GAS,
         );
         assert_ne!(non_mainnet_event, observed(&c, 1));
         assert!(
@@ -280,6 +288,31 @@ mod tests {
         assert!(
             verify_outbound_authorized(&[entry(vec![c.clone()])], &[observed(&c, 2)], 2).is_err()
         );
+    }
+
+    #[test]
+    fn gate_rejects_nonzero_call_gas() {
+        let c = call(
+            address!("00000000000000000000000000000000000000aa"),
+            address!("dc64a140aa3e981100a9beca4e685f962f0cf6c9"),
+            7,
+            &[0x12, 0x34],
+        );
+        let call_gas = 1;
+        let call_hash = l2_mutable_outbound_call_hash(
+            CallHashInput {
+                source_address: c.sourceAddress,
+                source_rollup_id: RollupId(1),
+                target_address: c.targetAddress,
+                target_rollup_id: RollupId::MAINNET,
+                value: c.value,
+                data: &c.data,
+            },
+            call_gas,
+        );
+        let observation = OutboundCallObservation::new(call_hash, call_gas);
+
+        assert!(verify_outbound_authorized(&[entry(vec![c])], &[observation], 1).is_err());
     }
 
     /// Multiset semantics: two IDENTICAL outbound entries need two matching

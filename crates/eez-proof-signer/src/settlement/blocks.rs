@@ -30,7 +30,7 @@ pub(crate) struct SettlingBlockObservations {
     inbound_candidates: Vec<InboundCandidate>,
     /// EEZL2-emitter/signature-matched outbound-event candidates from validated
     /// receipts, in transaction and receipt-log order. Malformed candidates
-    /// retain their position with an absent hash.
+    /// retain their position without decoded event fields.
     outbound_event_candidates: Vec<OutboundEventObservation>,
 }
 

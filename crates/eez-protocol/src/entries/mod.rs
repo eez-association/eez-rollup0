@@ -24,7 +24,7 @@ use crate::abi::{
     ExpectedOutgoingCrossChainCallSol, L2ExecutionEntrySol, L2ExpectedLookupSol, L2LookupCallSol,
     L2ToL1CallSol, LookupCallSol, StateDeltaSol, loadExecutionTableCall, postAndVerifyBatchCall,
 };
-use crate::action::cross_chain_call_hash;
+use crate::action::{CallHashInput, cross_chain_call_hash, l2_mutable_outbound_call_hash};
 use crate::batch::EvmBatch;
 use crate::dialect::ChainDialect;
 
@@ -461,24 +461,21 @@ pub fn build_l2_incoming_entry(entry: IncomingEntry) -> L2ExecutionEntrySol {
     }
 }
 
-/// Fields for an OUTBOUND L2→L1 deferred entry (A2.1) — the mirror of
-/// [`IncomingEntry`] with the cross-chain hash direction INVERTED.
+/// Fields for a deferred L2→L1 outbound entry.
 ///
 /// There is deliberately NO `target_rollup_id` field: an L2→L1 call
 /// targets L1 (`RollupId::MAINNET`) by definition, hardcoded inside
 /// [`build_l2_outbound_entry`], so the two silently-swappable `RollupId`
-/// args of [`cross_chain_call_hash`] cannot be mis-ordered by a caller
-/// (a swap yields a different `proxyEntryHash` → `ExecutionNotFound` on
-/// L2). The deployed L2 source proxy MUST be created with
-/// `originalRollupId == 0` for the on-chain recompute
-/// (`EEZL2.executeCrossChainCall`, `EEZL2.sol:197-199`) to match.
+/// fields of [`CallHashInput`] cannot be mis-ordered by a caller. The deployed
+/// L2 source proxy MUST have `originalRollupId == 0` for the on-chain
+/// `EEZL2.executeCrossChainCall` recomputation to match.
 #[derive(Clone, Debug)]
 pub struct OutboundEntry {
     /// The L1 target contract the L2→L1 call invokes.
     pub target: Address,
-    /// The L2 caller the proxy passes as `sourceAddress` (the user EOA).
+    /// The L2 account or contract passed as `sourceAddress`.
     pub source: Address,
-    /// `msg.value` of the L2→L1 call (0 for the value-free first cut).
+    /// `msg.value` of the L2→L1 call.
     pub value: U256,
     /// The L2→L1 call's calldata.
     pub data: Bytes,
@@ -495,12 +492,9 @@ pub struct OutboundEntry {
 /// loaded via `EEZL2.loadExecutionTable` and consumed by the user tx's
 /// `EEZL2.executeCrossChainCall`.
 ///
-/// `proxyEntryHash` uses `targetRollupId = MAINNET(0)` (the L1 target's
-/// home rollup = the L2 proxy's `originalRollupId`) and `sourceRollupId =
-/// l2_rollup_id` (the L2's own id = `ROLLUP_ID` on-chain) — the exact
-/// preimage `EEZL2.executeCrossChainCall` recomputes (`EEZL2.sol:197-199`)
-/// and the ONLY field the on-chain consume compares to select the entry
-/// (`_consumeAndExecute`, `EEZL2.sol:405`).
+/// `proxyEntryHash` uses the mutable L2 formula with the configured source
+/// rollup, `targetRollupId = MAINNET`, and `callGas = 0`. This matches an
+/// `EEZL2` deployment with `USE_GAS_LEFT` disabled.
 ///
 /// LEAN settlement-record shape: `callCount = 0`, empty `incomingCalls`,
 /// `rollingHash = 0` — the mirror of [`build_l1_inbound_entry`] (the L1
@@ -533,13 +527,16 @@ pub fn build_l2_outbound_entry(entry: OutboundEntry) -> L2ExecutionEntrySol {
         // immediate entry's rolling hash (`outbound_ether_out`), not here.
         success: _,
     } = entry;
-    let proxy_entry_hash = cross_chain_call_hash(
-        RollupId::MAINNET, // targetRollupId — L1 target's home rollup (proxy.originalRollupId)
-        target,
-        value,
-        &data,
-        source,
-        l2_rollup_id, // sourceRollupId — the L2's own id (ROLLUP_ID on-chain)
+    let proxy_entry_hash = l2_mutable_outbound_call_hash(
+        CallHashInput {
+            source_address: source,
+            source_rollup_id: l2_rollup_id,
+            target_address: target,
+            target_rollup_id: RollupId::MAINNET,
+            value,
+            data: &data,
+        },
+        0, // The supported EEZL2 deployment has USE_GAS_LEFT disabled.
     );
 
     L2ExecutionEntrySol {
@@ -1223,7 +1220,7 @@ mod tests {
     /// the direction, the shape gates, and the rolling-hash fold (success +
     /// returnData).
     #[test]
-    fn outbound_l2_entry_hash_direction_and_lean_shape() {
+    fn outbound_l2_entry_uses_gas_aware_hash_and_lean_shape() {
         let c = address!("00000000000000000000000000000000000000cc"); // L1 target
         let d = address!("00000000000000000000000000000000000000dd"); // L2 user EOA
         let l2 = RollupId(42069);
@@ -1245,12 +1242,20 @@ mod tests {
             success: true,
         });
 
-        // proxyEntryHash == cross_chain_call_hash(MAINNET(0), C, 0, data, D, L2)
-        // — the ONLY field the on-chain consume compares to select the entry
-        // (`_consumeAndExecute`, EEZL2.sol:405).
+        // proxyEntryHash uses the gas-aware mutable L2 formula with callGas=0.
         assert_eq!(
             entry.proxyEntryHash,
-            cross_chain_call_hash(RollupId::MAINNET, c, value, &data, d, l2),
+            l2_mutable_outbound_call_hash(
+                CallHashInput {
+                    source_address: d,
+                    source_rollup_id: l2,
+                    target_address: c,
+                    target_rollup_id: RollupId::MAINNET,
+                    value,
+                    data: &data,
+                },
+                0,
+            ),
             "outbound proxyEntryHash must match the (MAINNET, …, L2) preimage",
         );
         assert_ne!(
@@ -1259,11 +1264,22 @@ mod tests {
             "deferred entry → non-zero proxyEntryHash"
         );
 
-        // Direction is load-bearing: the INBOUND hash (rollup args swapped) MUST differ.
+        // The destination rollup is part of the gas-aware key: the same call
+        // aimed at another L2 must not match this L1-bound entry.
         assert_ne!(
             entry.proxyEntryHash,
-            cross_chain_call_hash(l2, c, value, &data, d, RollupId::MAINNET),
-            "outbound (MAINNET,…,L2) must differ from inbound (L2,…,MAINNET) — the swap is the #1 risk",
+            l2_mutable_outbound_call_hash(
+                CallHashInput {
+                    source_address: d,
+                    source_rollup_id: l2,
+                    target_address: c,
+                    target_rollup_id: l2,
+                    value,
+                    data: &data,
+                },
+                0,
+            ),
+            "an L1-bound call must differ from an otherwise identical L2-bound call",
         );
 
         // LEAN settlement-record shape (mirrors build_l1_inbound_entry): callCount=0

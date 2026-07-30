@@ -105,7 +105,7 @@ fn outbound_events_reject_missing_extra_multiple_and_malformed_observations() {
     let mut malformed = settling_with_outbound_pairs(1);
     malformed
         .outbound_event_candidates_mut_for_test()
-        .push(OutboundEventObservation::for_test(1, 3, None));
+        .push(OutboundEventObservation::malformed_for_test(1, 3));
     let malformed_plan = effect_plan(&outbound_batch, &malformed);
     assert_eq!(
         authorize_outbound_effects(&malformed_plan).err(),
@@ -116,13 +116,15 @@ fn outbound_events_reject_missing_extra_multiple_and_malformed_observations() {
     );
 
     let observation = observed_outbound_call(1, 0, call);
+    let decoded_event = observation.decoded_event().unwrap();
     let mut multiple = settling_with_outbound_pairs(1);
     *multiple.outbound_event_candidates_mut_for_test() = vec![
         observation,
-        OutboundEventObservation::for_test(
+        OutboundEventObservation::decoded_for_test(
             observation.transaction_index(),
             1,
-            observation.decoded_call_hash(),
+            decoded_event.call_hash(),
+            decoded_event.call_gas(),
         ),
     ];
     let multiple_plan = effect_plan(&outbound_batch, &multiple);
@@ -137,7 +139,12 @@ fn outbound_events_reject_missing_extra_multiple_and_malformed_observations() {
     let mut extra = settling_with_outbound_pairs(1);
     *extra.outbound_event_candidates_mut_for_test() = vec![
         observation,
-        OutboundEventObservation::for_test(2, 0, observation.decoded_call_hash()),
+        OutboundEventObservation::decoded_for_test(
+            2,
+            0,
+            decoded_event.call_hash(),
+            decoded_event.call_gas(),
+        ),
     ];
     let extra_plan = effect_plan(&outbound_batch, &extra);
     assert_eq!(
@@ -175,6 +182,26 @@ fn outbound_events_reject_missing_extra_multiple_and_malformed_observations() {
         Some(OutboundEffectError::UnexpectedObservation {
             transaction_index: 1,
             receipt_log_index: 0,
+        })
+    );
+}
+
+#[test]
+fn outbound_events_reject_nonzero_manager_entry_gas() {
+    let batch = effect_batch(&[B256::ZERO; 3], &[ClaimedEntryShape::Outbound]);
+    let call = &batch.entries[1].l2ToL1Calls[0];
+    let call_gas = 1;
+    let mut settling = settling_with_outbound_pairs(1);
+    settling
+        .outbound_event_candidates_mut_for_test()
+        .push(observed_outbound_call_with_gas(1, 2, call, call_gas));
+
+    assert_eq!(
+        authorize_outbound_effects(&effect_plan(&batch, &settling)).err(),
+        Some(OutboundEffectError::UnsupportedCallGas {
+            transaction_index: 1,
+            receipt_log_index: 2,
+            actual: call_gas,
         })
     );
 }
