@@ -87,7 +87,7 @@ ExecutorResult,
     TargetConfig,
 executor::ExecutionRequest,RollupId};
 
-use crate::{LocalChainClient, local::session::SessionSnapshot};
+use crate::{LocalChainClient, local::{LocalExecutionSession, session::SessionSnapshot}};
 
 // Avoid a protocol → composer layering cycle: TargetConfig lives in
 // `composer.rs`, but this module reads `config.verification_context`
@@ -112,7 +112,7 @@ pub struct Rollup {
     pub client: Arc<LocalChainClient>,
     /// Lazily-opened session for this rollup. `None` until the first
     /// [`CompositionBuilder::dispatch_call`] hits this rollup.
-    pub session: Option<Box<LocalChainClient>>,
+    pub session: Option<Box<LocalExecutionSession>>,
     /// Configuration for this rollup (CCM addresses, gas limit, proxy
     /// lookup).
     pub config: TargetConfig,
@@ -254,7 +254,7 @@ impl CompositionBuilder {
     #[must_use]
     pub fn with_sessions(
         mut self,
-        sessions: HashMap<RollupId, Box<LocalChainClient>>,
+        sessions: HashMap<RollupId, Box<LocalExecutionSession>>,
     ) -> Self {
         for (id, session) in sessions {
             match self.rollups.get_mut(&id) {
@@ -276,7 +276,7 @@ impl CompositionBuilder {
     /// builder (composition succeeded) or rolls them back to its boundary
     /// snapshots (composition failed) — and drops them all at slot end:
     /// sessions never outlive their slot.
-    pub fn take_sessions(&mut self) -> HashMap<RollupId, Box<LocalChainClient>> {
+    pub fn take_sessions(&mut self) -> HashMap<RollupId, Box<LocalExecutionSession>> {
         self.rollups
             .iter_mut()
             .filter_map(|(id, rollup)| rollup.session.take().map(|s| (*id, s)))
@@ -378,7 +378,7 @@ impl CompositionBuilder {
     // of scope here.
     #[allow(clippy::result_large_err)]
     #[tracing::instrument(level = "debug", name = "finalize", skip_all, err)]
-    pub fn finalize(mut self, raw_tx: &[u8]) -> CompositionResult<Composition> {
+    pub fn finalize(mut self, _raw_tx: &[u8]) -> CompositionResult<Composition> {
         tracing::debug!(name: "composer.finalize.start", "composition finalize started");
 
         if self.recorded.is_empty() || self.rollups.is_empty() {
@@ -409,21 +409,6 @@ impl CompositionBuilder {
         // nested-composition upstream-invariant-6 chaining.
         let mut per_tx_roots_by_rollup: HashMap<RollupId, Vec<[u8; 32]>> = HashMap::new();
 
-        // initial_roots is hoisted out of Phase 3 so the target
-        // loop can pass an attribution to `build_batch`.
-        // Per-tx roots are still empty at this point — they're
-        // populated later by the loop and
-        // by `extra_per_tx_roots` for the entry rollup. The L1-as-
-        // follower emitter uses `initial_roots[source_rollup_id]`
-        // for its first stateDelta's currentState; with empty
-        // per_tx_roots it emits a degenerate-tail chain (newState ==
-        // currentState), which `EEZ.executeL2TX`'s simulation
-        // accepts (each delta matches the rollup's stored root).
-        let initial_roots: HashMap<RollupId, [u8; 32]> = self
-            .rollups
-            .iter()
-            .map(|(id, r)| (*id, r.initial_state_root))
-            .collect();
 
         // Under the multi-prover ABI, `proofs[]` lives inside the
         // batch struct (`ProofSystemBatchPerVerificationEntries.proofs`).
@@ -494,7 +479,7 @@ impl CompositionBuilder {
                 continue;
             }
 
-            let batch = entries::build_batch(&group_calls, dialect, *rollup_id, raw_tx)?;
+            let batch = entries::build_batch(&group_calls, dialect, *rollup_id)?;
 
             // Terminal-revert short-circuit: an empty batch means all
             // calls reverted and there's nothing to verify — UNLESS this
@@ -550,7 +535,7 @@ impl CompositionBuilder {
             .config
             .dialect;
         let entry_batch =
-            entries::build_batch(&self.recorded, &entry_dialect, self.entry_rollup_id, raw_tx)?;
+            entries::build_batch(&self.recorded, &entry_dialect, self.entry_rollup_id)?;
         let entry_payload = entries::encode_table_payload(&entry_batch, &entry_dialect);
 
         // Phase 4 — target compositions (re-encode from the batches

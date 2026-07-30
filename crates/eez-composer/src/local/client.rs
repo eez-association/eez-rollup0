@@ -231,7 +231,7 @@ impl LocalChainClient {
         Ok(value.to_be_bytes::<32>())
     }
 
-    fn begin_execution_session(&self) -> ExecutorResult<Box<LocalChainClient>> {
+    pub fn begin_execution_session(&self) -> ExecutorResult<Box<LocalExecutionSession>> {
         tracing::debug!(
             rollup_id = %self.rollup_id,
             ccm = %self.ccm_address,
@@ -294,7 +294,7 @@ impl LocalChainClient {
     /// Read the latest block header's `stateRoot` from this chain's
     /// own provider. Orthogonal to invariant-6 anchoring; useful for
     /// diagnostics and future paths.
-    fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
+    pub fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
         let num = self
             .provider
             .headers

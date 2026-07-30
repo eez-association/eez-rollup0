@@ -31,7 +31,7 @@ use super::provider::ChainProvider;
 /// enough for worst-case dev-chain paths; too low → silent reverts.
 pub(super) const DIRECT_CALL_GAS_LIMIT: u64 = 30_000_000;
 
-pub type SessionSnapshot = u64;
+pub type SessionSnapshot = B256;
 
 /// Stateful target-chain execution session.
 ///
@@ -345,7 +345,7 @@ impl LocalExecutionSession {
         }
     }
 
-    fn execute(
+    pub fn execute(
         &mut self,
         req: ExecutionRequest,
         dispatcher: &mut CompositionBuilder,
@@ -372,13 +372,15 @@ impl LocalExecutionSession {
         )
     }
 
-    fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()> {
-        let root: [u8; 32] = *snapshot.downcast::<[u8; 32]>().map_err(|_e| {
-            ExecutorError::from(ExecutorErrorKind::Encoding(
-                "LocalExecutionSession::rollback: snapshot type mismatch".into(),
-            ))
-        })?;
-        self.current_root = revm::primitives::B256::from(root);
+    pub fn checkpoint(&mut self) -> ExecutorResult<SessionSnapshot> {
+        // Opaque snapshot carrying the current root only. The full
+        // revm `State<DB>` deep-clone is tracked as known debt — see
+        // CLAUDE.md "Known limitations".
+        Ok(self.current_root)
+    }
+
+    pub fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()> {
+        self.current_root = snapshot;
         Ok(())
     }
 }
