@@ -2206,13 +2206,12 @@ where
         // effects, the last effect's root already is the final root.
         if pair_roots.is_empty()
             && let Some(last) = batch.entries.last_mut()
+            && let Some(delta) = last
+                .stateUpdates
+                .iter_mut()
+                .find(|delta| delta.rollupId == rollup_id)
         {
-            for delta in last.stateUpdates.iter_mut().rev() {
-                if delta.rollupId == rollup_id {
-                    delta.newState = sync_block_state_root;
-                    break;
-                }
-            }
+            delta.newState = sync_block_state_root;
         }
 
         // Reject a stitch bug in release builds before signing or submitting a
@@ -2522,7 +2521,6 @@ fn ensure_settlement_endpoint(
         entry
             .stateUpdates
             .iter()
-            .rev()
             .find(|update| update.rollupId == rollup_id)
             .map(|update| update.newState)
     });
