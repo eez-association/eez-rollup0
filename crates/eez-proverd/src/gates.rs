@@ -1356,7 +1356,7 @@ mod tests {
             public_inputs_hash: dec("public_inputs_hash"),
             l1_block_hash: dec("l1_block_hash"), // 0x → empty → timeless
         };
-        // MockEcdsaProver vkey = bytes32(uint160(authorizedSigner = hardhat #0)).
+        // Mock prover vkey = bytes32(uint160(authorizedSigner = hardhat #0)).
         let vkey: B256 = "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
             .parse()
             .unwrap();

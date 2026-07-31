@@ -1,11 +1,10 @@
-//! `RemoteProver` — the composer-side [`Prover`] backed by one `Prove` RPC.
+//! `RemoteProver` — the composer-side prover client backed by one `Prove` RPC.
 //!
-//! The composer holds `Arc<dyn Prover>` and calls `prove(ctx)`; when that
-//! `Arc` is a [`RemoteProver`], the call maps [`ProvingContext`] to a
-//! `prove.v1` client-stream (a header then one chunk per window block), dials
-//! the configured `eez-proverd`, awaits the attestation, verifies it recovers
-//! to the registered attester, and returns the 65-byte signature. Stateless:
-//! one round-trip, no feed/cursor/sink.
+//! The composer holds a [`RemoteProver`] and calls `prove(ctx)`; the call maps
+//! [`ProvingContext`] to a `prove.v1` client-stream (a header then one chunk
+//! per window block), dials the configured `eez-proverd`, awaits the
+//! attestation, verifies it recovers to the registered attester, and returns
+//! the 65-byte signature. Stateless: one round-trip, no feed/cursor/sink.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
@@ -13,15 +12,14 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, B256, Bytes, Signature};
 use alloy_sol_types::SolCall;
-use async_trait::async_trait;
 use eez_control_rpc::v1::{
     BlockWitness as WireBlockWitness, ExecutionWitness as WireWitness, PostBatch, ProveChunk,
     ProveHeader, prove_chunk, prover_client::ProverClient,
 };
-use eez_prover::{Prover, ProverError, ProverResult, ProvingContext};
+use eez_prover::{ProverError, ProverResult, ProvingContext};
 use tracing::{Level, event};
 
-/// A [`Prover`] that proves a window on a remote `eez-proverd` over the
+/// Proves a window on a remote `eez-proverd` over the
 /// `prove.v1.Prover` gRPC service. Cheap to clone (`Arc<Inner>`).
 #[derive(Debug, Clone)]
 pub struct RemoteProver {
@@ -102,9 +100,15 @@ fn chunks_for(ctx: &ProvingContext) -> Vec<ProveChunk> {
     chunks
 }
 
-#[async_trait]
-impl Prover for RemoteProver {
-    async fn prove(&self, ctx: ProvingContext) -> ProverResult<Bytes> {
+impl RemoteProver {
+    /// Produce a proof: one `Prove` RPC round-trip to the configured
+    /// `eez-proverd`.
+    ///
+    /// # Errors
+    ///
+    /// [`ProverError::Backend`] if the dial, the RPC, or the attestation
+    /// verification (recover to the registered attester) fails.
+    pub async fn prove(&self, ctx: ProvingContext) -> ProverResult<Bytes> {
         let chunks = chunks_for(&ctx);
         let n_blocks = chunks.len().saturating_sub(1);
 
@@ -142,7 +146,11 @@ impl Prover for RemoteProver {
         Ok(Bytes::copy_from_slice(&resp.signature))
     }
 
-    fn vkey(&self) -> B256 {
+    /// Registry-membership key for this prover. The per-rollup
+    /// `IRollupContract` records this in its vkey map; EEZ reads it
+    /// when checking proof-system membership.
+    #[must_use]
+    pub fn vkey(&self) -> B256 {
         // Left-zero-pad the 20-byte attester into a B256 (the registry vkey).
         self.inner.attester.into_word()
     }
