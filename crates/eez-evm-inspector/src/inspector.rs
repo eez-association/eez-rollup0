@@ -484,9 +484,9 @@ where
             return None;
         }
 
-        // Only ordinary CALLs can represent cross-chain proxy calls.
-        // Leave CALLCODE, DELEGATECALL, and STATICCALL to the EVM.
-        if !matches!(inputs.scheme, CallScheme::Call) {
+        // Only mutable CALLs can represent cross-chain proxy calls.
+        // Leave all other call shapes to the EVM.
+        if inputs.is_static || !matches!(inputs.scheme, CallScheme::Call) {
             return None;
         }
 
@@ -514,20 +514,6 @@ where
         };
 
         let call_value = inputs.value.get();
-
-        if inputs.is_static {
-            self.record_error(ExecutorError::evm(
-                "static cross-chain calls are not implemented",
-            ));
-            return Some(CallOutcome::new(
-                InterpreterResult::new(
-                    InstructionResult::Revert,
-                    Bytes::new(),
-                    Gas::new(inputs.gas_limit),
-                ),
-                inputs.return_memory_offset.clone(),
-            ));
-        }
 
         let req = eez_protocol::ExecutionRequest {
             call_mode: CallMode::Mutable,
@@ -675,7 +661,6 @@ where
             caller = %inputs.caller,
             proxy = %inputs.target_address,
             depth = self.call_depth,
-            scheme = "CALL",
             calldata_len = calldata.len(),
             value = %call_value,
             target_result = if success { "ok" } else { "REVERT" },
