@@ -83,11 +83,6 @@ pub(crate) enum OutboundEffectError {
         recomputed: B256,
         observed: B256,
     },
-    #[error("outbound entry {entry_index} has a non-canonical {field}")]
-    InvalidEntryShape {
-        entry_index: usize,
-        field: &'static str,
-    },
     #[error("outbound entry {entry_index} claims rolling hash {claimed}; recomputed {recomputed}")]
     RollingHashMismatch {
         entry_index: usize,
@@ -290,19 +285,6 @@ fn authorize_outbound_effect(
             actual: call.sourceRollupId,
         });
     }
-    for (valid, field) in [
-        (entry.proxyEntryHash == B256::ZERO, "proxyEntryHash"),
-        (entry.expectedL1ToL2Calls.is_empty(), "expectedL1ToL2Calls"),
-        (entry.success, "success"),
-        (call.revertNextNCalls == 0, "revertNextNCalls"),
-        (!call.isStatic, "isStatic"),
-        (call.gas == 0, "gas"),
-    ] {
-        if !valid {
-            return Err(OutboundEffectError::InvalidEntryShape { entry_index, field });
-        }
-    }
-
     let decoded_event =
         observation
             .decoded_event()

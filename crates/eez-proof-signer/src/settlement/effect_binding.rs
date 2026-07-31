@@ -302,8 +302,8 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
     })
 }
 
-/// Classification reads only the discriminating fields; the per-kind effect
-/// gates validate the entries in depth.
+/// Classification establishes the complete supported shape for each effect
+/// kind; the per-kind gates bind that shape to locally recovered evidence.
 fn classify_claimed_entry(
     entry: &ExecutionEntrySol,
     update: &StateUpdateSol,

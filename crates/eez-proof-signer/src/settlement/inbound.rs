@@ -400,15 +400,6 @@ fn authorize_inbound_effect(
             actual: entry.destinationRollupId,
         });
     }
-    for (valid, field) in [
-        (entry.l2ToL1Calls.is_empty(), "l2ToL1Calls"),
-        (entry.expectedL1ToL2Calls.is_empty(), "expectedL1ToL2Calls"),
-        (entry.success, "success"),
-    ] {
-        if !valid {
-            return Err(InboundEffectError::InvalidEntryShape { entry_index, field });
-        }
-    }
     if entry.proxyEntryHash != observation.recomputed_call_hash {
         return Err(InboundEffectError::CallHashMismatch {
             entry_index,
