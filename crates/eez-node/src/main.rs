@@ -25,7 +25,7 @@ mod witness_source;
 
 use std::{collections::HashMap, env, str::FromStr, sync::Arc, time::Duration};
 
-use alloy_primitives::{Address, B256, keccak256};
+use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider as _, RootProvider};
 use alloy_signer_local::PrivateKeySigner;
 use clap::Parser as _;
@@ -121,10 +121,8 @@ struct NodeExt {
 // catches genuinely sprawling logic — main() is the exception.
 #[allow(clippy::too_many_lines)]
 fn main() -> eyre::Result<()> {
-    // Deployment-generated public bindings take precedence over local defaults.
-    // Explicit process environment variables still override both files.
-    let _ = dotenvy::from_filename("deployments.env");
     let _ = dotenvy::dotenv();
+    let _ = dotenvy::from_filename("deployments.env");
 
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         // SAFETY: set during single-threaded startup before any other thread is spawned.
@@ -158,7 +156,6 @@ fn main() -> eyre::Result<()> {
         );
 
         warn_on_deprecated_env();
-        verify_deployment_genesis(builder.config().chain.as_ref())?;
         if mode != Mode::Follower && ext.sequencer_rpc.is_some() {
             return Err(eyre::eyre!(
                 "follower sequencer RPC can only be set in follower mode",
@@ -628,9 +625,12 @@ fn main() -> eyre::Result<()> {
             // into signed legacy L2 system txs at Sync-slot time.
             // Constructed only when EvmComposer is constructed —
             // both are tied to embedded L1 mode.
-                let system_signer = read_l2_system_signer()?.ok_or_else(|| {
+                let system_key = env::var("EEZ_L2_SYSTEM_KEY").map_err(|_| {
                     eyre::eyre!("EEZ_L2_SYSTEM_KEY required when the cross-chain composer is wired")
                 })?;
+                let system_signer = PrivateKeySigner::from_bytes(&B256::from_str(
+                    system_key.trim_start_matches("0x"),
+                )?)?;
                 let ccm_l2_address: Address = Address::from_str(
                     &env::var("EEZ_CCM_L2_ADDRESS").map_err(|_| {
                         eyre::eyre!("EEZ_CCM_L2_ADDRESS required (set by deploy.sh)")
@@ -698,7 +698,6 @@ fn main() -> eyre::Result<()> {
                         l2_rollup_id = rollup_id,
                         eez_registry = %eez_registry,
                         ccm_l2 = %ccm_l2,
-                        system_address = %exec_ctx.system_signer.address(),
                         "cross-chain composer constructed (L1 entry + L2 follower)",
                     );
                     Some(CrossChainWiring {
@@ -971,97 +970,13 @@ fn main() -> eyre::Result<()> {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DeploymentGenesisBinding {
-    state_root: B256,
-    eezl2_code_hash: B256,
-}
-
-/// Read the hashes emitted alongside the deployment-generated genesis.
-fn read_deployment_genesis_binding() -> eyre::Result<Option<DeploymentGenesisBinding>> {
-    fn optional_env(name: &str) -> eyre::Result<Option<String>> {
-        match env::var(name) {
-            Ok(value) => Ok(Some(value)),
-            Err(env::VarError::NotPresent) => Ok(None),
-            Err(env::VarError::NotUnicode(_)) => {
-                Err(eyre::eyre!("{name} contains non-UTF-8 bytes"))
-            }
-        }
-    }
-
-    let state_root = optional_env("EEZ_INITIAL_STATE_ROOT")?;
-    let code_hash = optional_env("EEZ_L2_EEZL2_CODE_HASH")?;
-    parse_deployment_genesis_binding(state_root.as_deref(), code_hash.as_deref())
-}
-
-fn parse_deployment_genesis_binding(
-    state_root: Option<&str>,
-    code_hash: Option<&str>,
-) -> eyre::Result<Option<DeploymentGenesisBinding>> {
-    let (Some(state_root), Some(code_hash)) = (state_root, code_hash) else {
-        eyre::ensure!(
-            state_root.is_none() && code_hash.is_none(),
-            "EEZ_INITIAL_STATE_ROOT and EEZ_L2_EEZL2_CODE_HASH must be configured together"
-        );
-        return Ok(None);
-    };
-
-    let state_root = B256::from_str(state_root)
-        .map_err(|error| eyre::eyre!("EEZ_INITIAL_STATE_ROOT is malformed: {error}"))?;
-    let eezl2_code_hash = B256::from_str(code_hash)
-        .map_err(|error| eyre::eyre!("EEZ_L2_EEZL2_CODE_HASH is malformed: {error}"))?;
-    Ok(Some(DeploymentGenesisBinding {
-        state_root,
-        eezl2_code_hash,
-    }))
-}
-
-/// Fail before launch when the selected chain differs from the deployment.
-fn verify_deployment_genesis(chain_spec: &reth_chainspec::ChainSpec) -> eyre::Result<()> {
-    let Some(expected) = read_deployment_genesis_binding()? else {
-        return Ok(());
-    };
-    verify_deployment_genesis_binding(chain_spec, expected)
-}
-
-fn verify_deployment_genesis_binding(
-    chain_spec: &reth_chainspec::ChainSpec,
-    expected: DeploymentGenesisBinding,
-) -> eyre::Result<()> {
-    let actual_state_root = chain_spec.genesis_header().state_root;
-    eyre::ensure!(
-        actual_state_root == expected.state_root,
-        "L2 genesis state root {actual_state_root} does not match deployment {}",
-        expected.state_root
-    );
-
-    let runtime = chain_spec
-        .genesis()
-        .alloc
-        .get(&eez_protocol::CCM_ADDRESS)
-        .and_then(|account| account.code.as_ref())
-        .ok_or_else(|| {
-            eyre::eyre!(
-                "L2 genesis has no EEZL2 runtime at {}",
-                eez_protocol::CCM_ADDRESS
-            )
-        })?;
-    let actual_code_hash = keccak256(runtime);
-    eyre::ensure!(
-        actual_code_hash == expected.eezl2_code_hash,
-        "EEZL2 runtime hash {actual_code_hash} does not match deployment {}",
-        expected.eezl2_code_hash
-    );
-    Ok(())
-}
-
 /// Build a `SystemTxContext` for follower mode from env (the follower
 /// has no Composer to feed the composer-mode projection). Returns
 /// `Ok(None)` when cross-chain env isn't present → pure-user-tx follower
-/// mode. Reads `EEZ_L2_SYSTEM_KEY` / `EEZ_L2_SYSTEM_ADDRESS` /
-/// `EEZ_CCM_L2_ADDRESS` / `EEZ_ROLLUP_ID`; the `l2_gas_price` (1 gwei) and
-/// `l2_gas_limit` (2M) defaults mirror composer-mode so reconstructed system
-/// txs are byte-identical.
+/// mode. Reads `EEZ_L2_SYSTEM_KEY` / `EEZ_CCM_L2_ADDRESS` /
+/// `EEZ_ROLLUP_ID`; the `l2_gas_price` (1 gwei) and `l2_gas_limit` (2M)
+/// defaults mirror composer-mode so reconstructed system txs are
+/// byte-identical.
 ///
 /// # Errors
 ///
@@ -1073,14 +988,20 @@ fn build_follower_system_tx_cfg<ChainSpec>(
 where
     ChainSpec: reth_chainspec::EthChainSpec,
 {
-    let Some(system_signer) = read_l2_system_signer()? else {
-        return Ok(None);
+    let system_key = match env::var("EEZ_L2_SYSTEM_KEY") {
+        Ok(system_key) => system_key,
+        Err(env::VarError::NotPresent) => return Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(eyre::eyre!("EEZ_L2_SYSTEM_KEY contains non-UTF-8 bytes"));
+        }
     };
     let ccm_l2_str = env::var("EEZ_CCM_L2_ADDRESS")
         .map_err(|_| eyre::eyre!("EEZ_CCM_L2_ADDRESS required when EEZ_L2_SYSTEM_KEY is set"))?;
     let rollup_id_str = env::var("EEZ_ROLLUP_ID")
         .map_err(|_| eyre::eyre!("EEZ_ROLLUP_ID required when EEZ_L2_SYSTEM_KEY is set"))?;
 
+    let system_signer =
+        PrivateKeySigner::from_bytes(&B256::from_str(system_key.trim_start_matches("0x"))?)?;
     let ccm_l2_address: Address = Address::from_str(&ccm_l2_str)?;
     let this_rollup_id: u64 = rollup_id_str
         .parse()
@@ -1094,48 +1015,6 @@ where
         l2_gas_limit: 2_000_000,
         this_rollup_id,
     }))
-}
-
-/// Read the optional system-transaction identity and bind its private key to
-/// the public address emitted by the deployment.
-fn read_l2_system_signer() -> eyre::Result<Option<PrivateKeySigner>> {
-    let system_key = match env::var("EEZ_L2_SYSTEM_KEY") {
-        Ok(system_key) => system_key,
-        Err(env::VarError::NotPresent) => return Ok(None),
-        Err(env::VarError::NotUnicode(_)) => {
-            return Err(eyre::eyre!("EEZ_L2_SYSTEM_KEY contains non-UTF-8 bytes"));
-        }
-    };
-    let expected_system_address =
-        env::var("EEZ_L2_SYSTEM_ADDRESS").map_err(|error| match error {
-            env::VarError::NotPresent => {
-                eyre::eyre!("EEZ_L2_SYSTEM_ADDRESS required when EEZ_L2_SYSTEM_KEY is set")
-            }
-            env::VarError::NotUnicode(_) => {
-                eyre::eyre!("EEZ_L2_SYSTEM_ADDRESS contains non-UTF-8 bytes")
-            }
-        })?;
-
-    parse_l2_system_signer(&system_key, &expected_system_address).map(Some)
-}
-
-/// Parse a system key/address pair without retaining or reporting key text.
-fn parse_l2_system_signer(
-    system_key: &str,
-    expected_system_address: &str,
-) -> eyre::Result<PrivateKeySigner> {
-    let expected_system_address = Address::from_str(expected_system_address)
-        .map_err(|error| eyre::eyre!("EEZ_L2_SYSTEM_ADDRESS is malformed: {error}"))?;
-    let private_key = B256::from_str(system_key.strip_prefix("0x").unwrap_or(system_key))
-        .map_err(|_| eyre::eyre!("EEZ_L2_SYSTEM_KEY must be a 32-byte hexadecimal private key"))?;
-    let signer = PrivateKeySigner::from_bytes(&private_key)
-        .map_err(|_| eyre::eyre!("EEZ_L2_SYSTEM_KEY is not a valid secp256k1 private key"))?;
-    let actual_system_address = signer.address();
-    eyre::ensure!(
-        actual_system_address == expected_system_address,
-        "EEZ_L2_SYSTEM_KEY derives {actual_system_address}; deployment expects {expected_system_address}"
-    );
-    Ok(signer)
 }
 
 /// Read the L1 rollup id from env. Defaults to `0` to match the bridge
@@ -1343,121 +1222,6 @@ fn warn_on_deprecated_env() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_genesis::{Genesis, GenesisAccount};
-    use alloy_primitives::Bytes;
-
-    const TEST_SYSTEM_KEY: &str =
-        "0000000000000000000000000000000000000000000000000000000000000001";
-    const TEST_SYSTEM_ADDRESS: &str = "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf";
-
-    fn deployment_chain_spec() -> reth_chainspec::ChainSpec {
-        Genesis {
-            alloc: [(
-                eez_protocol::CCM_ADDRESS,
-                GenesisAccount {
-                    code: Some(Bytes::from_static(b"eezl2-runtime")),
-                    ..Default::default()
-                },
-            )]
-            .into(),
-            ..Default::default()
-        }
-        .into()
-    }
-
-    fn deployment_binding(chain_spec: &reth_chainspec::ChainSpec) -> DeploymentGenesisBinding {
-        let runtime = chain_spec.genesis().alloc[&eez_protocol::CCM_ADDRESS]
-            .code
-            .as_ref()
-            .unwrap();
-        DeploymentGenesisBinding {
-            state_root: chain_spec.genesis_header().state_root,
-            eezl2_code_hash: keccak256(runtime),
-        }
-    }
-
-    #[test]
-    fn deployment_genesis_binding_matches_chain_spec() {
-        let chain_spec = deployment_chain_spec();
-
-        verify_deployment_genesis_binding(&chain_spec, deployment_binding(&chain_spec)).unwrap();
-    }
-
-    #[test]
-    fn deployment_genesis_binding_rejects_wrong_root_or_runtime() {
-        let chain_spec = deployment_chain_spec();
-        let expected = deployment_binding(&chain_spec);
-
-        let root_error = verify_deployment_genesis_binding(
-            &chain_spec,
-            DeploymentGenesisBinding {
-                state_root: B256::ZERO,
-                ..expected
-            },
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(root_error.contains("genesis state root"));
-
-        let code_error = verify_deployment_genesis_binding(
-            &chain_spec,
-            DeploymentGenesisBinding {
-                eezl2_code_hash: B256::ZERO,
-                ..expected
-            },
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(code_error.contains("runtime hash"));
-    }
-
-    #[test]
-    fn deployment_genesis_hashes_must_be_configured_together() {
-        let error = parse_deployment_genesis_binding(Some(&B256::ZERO.to_string()), None)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("must be configured together"));
-    }
-
-    #[test]
-    fn system_signer_matches_deployment_address() {
-        let signer = parse_l2_system_signer(TEST_SYSTEM_KEY, TEST_SYSTEM_ADDRESS).unwrap();
-
-        assert_eq!(
-            signer.address(),
-            TEST_SYSTEM_ADDRESS.parse::<Address>().unwrap()
-        );
-    }
-
-    #[test]
-    fn system_signer_rejects_deployment_address_mismatch() {
-        let error = parse_l2_system_signer(
-            TEST_SYSTEM_KEY,
-            "0x1111111111111111111111111111111111111111",
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("deployment expects"));
-        assert!(!error.contains(TEST_SYSTEM_KEY));
-    }
-
-    #[test]
-    fn system_signer_rejects_malformed_values_without_echoing_the_key() {
-        let malformed_key = "private-key-material";
-        let key_error = parse_l2_system_signer(malformed_key, TEST_SYSTEM_ADDRESS)
-            .unwrap_err()
-            .to_string();
-        assert!(key_error.contains("32-byte hexadecimal private key"));
-        assert!(!key_error.contains(malformed_key));
-
-        let address_error = parse_l2_system_signer(TEST_SYSTEM_KEY, "not-an-address")
-            .unwrap_err()
-            .to_string();
-        assert!(address_error.contains("EEZ_L2_SYSTEM_ADDRESS is malformed"));
-        assert!(!address_error.contains(TEST_SYSTEM_KEY));
-    }
 
     #[test]
     fn xchain_front_absent_port_disables_front() {

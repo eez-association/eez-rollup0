@@ -32,7 +32,6 @@ pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E
 /// Dedicated deterministic L2 system identity; deliberately not an Anvil account.
 pub const L2_SYSTEM_KEY: &str =
     "0x6f7d72ecb79c8bf1bd8e7c49a1c4a22741ab708f06bb19e5b5d44a6f0934a7c1";
-pub const L2_SYSTEM_ADDRESS: Address = address!("0xE3601fD07288f142938bBDeFf14e6474Ea256477");
 
 /// External anvil cadence for composer-mode e2e tests. K = L1/L2 = 3 (not 2):
 /// `RollupTiming::validate` needs proof+slack (1100ms) ≤ (K−1)·L2 = 2000ms.
@@ -376,7 +375,6 @@ impl Harness {
             ("EEZ_L1_CHAIN_ID", "31337".to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
             ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
-            ("EEZ_L2_SYSTEM_ADDRESS", format!("{L2_SYSTEM_ADDRESS:#x}")),
             (
                 "EEZ_CCM_L2_ADDRESS",
                 "0x4200000000000000000000000000000000000007".to_string(),
@@ -1962,7 +1960,6 @@ impl CrossChainConfig {
             // MockECDSA authorizes the deployer.
             ("EEZ_PROOF_SIGNER_KEY", self.deployer_key.to_string()),
             ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
-            ("EEZ_L2_SYSTEM_ADDRESS", format!("{L2_SYSTEM_ADDRESS:#x}")),
             ("EEZ_CCM_L2_ADDRESS", format!("{CCM_L2_ADDRESS:#x}")),
             ("EEZ_L1_BLOCK_TIME_MS", "5000".to_string()),
             ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
