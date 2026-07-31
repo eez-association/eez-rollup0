@@ -34,7 +34,7 @@ export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
 
 # ── Endpoints (the running node) ─────────────────────────────────────
-L1=http://localhost:18645          # embedded chiado L1 (composer watches + posts)
+L1="${EEZ_XT_L1_RPC:-http://localhost:18645}"   # L1 RPC (chiado embedded default; Kurtosis: http://<M1>:8545)
 L2=http://localhost:18688          # L2 RPC
 L1F=http://localhost:18999         # L1 front (Inbound)
 L2F=http://localhost:18998         # L2 front (Outbound)
@@ -49,7 +49,7 @@ PACE_N="${EEZ_PACE_N:-0}"; PACE_INT="${EEZ_PACE_INTERVAL:-10}"
 DO_RESTART="${EEZ_RESTART:-0}"
 
 # ── Keys (testnet only) ──────────────────────────────────────────────
-OP=0x2248a31395af28e24349c8e566c19475a79cb610389204ab26bc585493e5cf27       # funded operator (L1 deploys + funding)
+OP="${EEZ_XT_OP:-0x2248a31395af28e24349c8e566c19475a79cb610389204ab26bc585493e5cf27}"   # L1 operator (deploys+funding); must be funded on L1 and NOT the composer's poster
 HH_KEY_2=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a  # L2 deployer / pure sender (genesis alloc)
 HH_ADDR_2=0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC
 # Fresh random recipients per run — a FIXED recipient's cross-chain proxy would
@@ -60,7 +60,7 @@ L2_DEP_RECIPIENT=$(rand_addr); L1_WD_RECIPIENT=$(rand_addr)
 
 for t in cast forge jq curl docker python3; do command -v "$t" >/dev/null || { echo "✗ $t not in PATH"; exit 1; }; done
 docker inspect "$NODE_CONTAINER" >/dev/null 2>&1 || { echo "✗ container '$NODE_CONTAINER' not up — run scripts/chiado-up.sh"; exit 1; }
-[[ "$(cast chain-id --rpc-url "$L1" 2>/dev/null)" == "10200" ]] || { echo "✗ embedded L1 not on :18645"; exit 1; }
+EXP_L1_CID="${EEZ_XT_L1_CID:-10200}"; [[ "$(cast chain-id --rpc-url "$L1" 2>/dev/null)" == "$EXP_L1_CID" ]] || { echo "✗ L1 at $L1 chainId != $EXP_L1_CID"; exit 1; }
 [[ -f "$REPO/deployments.env" ]] || { echo "✗ deployments.env missing — deploy first"; exit 1; }
 set -a; source "$REPO/deployments.env"; set +a
 L1_CID=$(cast chain-id --rpc-url "$L1"); L2_CID=$(cast chain-id --rpc-url "$L2")
