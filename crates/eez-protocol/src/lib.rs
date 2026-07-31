@@ -63,7 +63,7 @@ mod assertions;
 #[doc(inline)]
 pub use action::{
     CallHashInput, CallMode, common_cross_chain_call_hash, compute_state_root_slot,
-    l2_mutable_outbound_call_hash,
+    l2_outbound_call_hash,
 };
 #[doc(inline)]
 pub use addresses::CCM_ADDRESS;

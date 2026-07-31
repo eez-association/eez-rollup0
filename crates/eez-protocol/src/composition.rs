@@ -1186,17 +1186,15 @@ mod tests {
         );
         assert_eq!(
             entries[0].proxyEntryHash,
-            common_cross_chain_call_hash(
-                CallMode::Mutable,
-                CallHashInput {
-                    source_address: Address::ZERO,
-                    source_rollup_id: RollupId::MAINNET,
-                    target_address: Address::repeat_byte(1),
-                    target_rollup_id: RollupId(1),
-                    value: U256::ZERO,
-                    data: &Bytes::from(vec![0x01, 0x02]),
-                },
-            ),
+            common_cross_chain_call_hash(CallHashInput {
+                call_mode: CallMode::Mutable,
+                source_address: Address::ZERO,
+                source_rollup_id: RollupId::MAINNET,
+                target_address: Address::repeat_byte(1),
+                target_rollup_id: RollupId(1),
+                value: U256::ZERO,
+                data: &Bytes::from(vec![0x01, 0x02]),
+            },),
         );
 
         // The entry batch carries the top-level call as one deferred entry.

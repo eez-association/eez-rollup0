@@ -13,7 +13,7 @@ use crate::RollupId;
 use alloy_primitives::B256;
 
 use crate::abi::ExecutionEntrySol;
-use crate::action::{CallHashInput, l2_mutable_outbound_call_hash};
+use crate::action::{CallHashInput, CallMode, l2_outbound_call_hash};
 
 /// `RollupId(0)` — MAINNET. An L2->L1 outbound's L1 target lives on mainnet, so
 /// the `targetRollupId` field of its call hash is 0 (the L2 proxy's
@@ -124,8 +124,9 @@ pub fn verify_outbound_authorized(
 
         // Recompute the key EEZL2 uses to find the loaded entry. MAINNET binds
         // the destination to L1; the configured rollup binds the L2 source.
-        let expected = l2_mutable_outbound_call_hash(
+        let expected = l2_outbound_call_hash(
             CallHashInput {
+                call_mode: CallMode::from_is_static(call.isStatic),
                 source_address: call.sourceAddress,
                 source_rollup_id: RollupId(l2_rollup_id),
                 target_address: call.targetAddress,
@@ -174,8 +175,9 @@ mod tests {
     /// = MAINNET(0). The gate recomputes the identical hash.
     fn observed(call: &L2ToL1CallSol, l2_rollup_id: u64) -> OutboundCallObservation {
         OutboundCallObservation::new(
-            l2_mutable_outbound_call_hash(
+            l2_outbound_call_hash(
                 CallHashInput {
+                    call_mode: CallMode::Mutable,
                     source_address: call.sourceAddress,
                     source_rollup_id: RollupId(l2_rollup_id),
                     target_address: call.targetAddress,
@@ -268,8 +270,9 @@ mod tests {
 
         // An event whose hash used targetRollupId = 5 (a non-mainnet target).
         let non_mainnet_event = OutboundCallObservation::new(
-            l2_mutable_outbound_call_hash(
+            l2_outbound_call_hash(
                 CallHashInput {
+                    call_mode: CallMode::Mutable,
                     source_address: c.sourceAddress,
                     source_rollup_id: RollupId(1),
                     target_address: c.targetAddress,
@@ -308,8 +311,9 @@ mod tests {
             &[0x12, 0x34],
         );
         let call_gas = 1;
-        let call_hash = l2_mutable_outbound_call_hash(
+        let call_hash = l2_outbound_call_hash(
             CallHashInput {
+                call_mode: CallMode::Mutable,
                 source_address: c.sourceAddress,
                 source_rollup_id: RollupId(1),
                 target_address: c.targetAddress,

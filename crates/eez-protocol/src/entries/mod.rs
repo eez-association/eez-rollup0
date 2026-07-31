@@ -13,9 +13,7 @@ use crate::abi::{
     L2ExecutionEntrySol, L2StaticExecutionEntrySol, L2ToL1CallSol, StaticExecutionEntrySol,
     loadExecutionTableCall, postAndVerifyBatchCall,
 };
-use crate::action::{
-    CallHashInput, CallMode, common_cross_chain_call_hash, l2_mutable_outbound_call_hash,
-};
+use crate::action::{CallHashInput, CallMode, common_cross_chain_call_hash, l2_outbound_call_hash};
 use crate::batch::EvmBatch;
 use crate::dialect::ChainDialect;
 use crate::{ExecutedAction, ProtocolResult, RollupId, rolling_hash::EntryRollingHash};
@@ -195,17 +193,15 @@ pub fn finalize_l1_rolling_hashes(batch: &mut EvmBatch) -> ProtocolResult<()> {
 
         if let Some(call) = entry.l2ToL1Calls.first() {
             ensure_supported_flat_call(call)?;
-            let call_hash = common_cross_chain_call_hash(
-                CallMode::Mutable,
-                CallHashInput {
-                    source_address: call.sourceAddress,
-                    source_rollup_id: RollupId(call.sourceRollupId),
-                    target_address: call.targetAddress,
-                    target_rollup_id: RollupId::MAINNET,
-                    value: call.value,
-                    data: &call.data,
-                },
-            );
+            let call_hash = common_cross_chain_call_hash(CallHashInput {
+                call_mode: CallMode::Mutable,
+                source_address: call.sourceAddress,
+                source_rollup_id: RollupId(call.sourceRollupId),
+                target_address: call.targetAddress,
+                target_rollup_id: RollupId::MAINNET,
+                value: call.value,
+                data: &call.data,
+            });
             rolling_hash.call_begin(call_hash);
             rolling_hash.call_end(entry.success, &entry.returnData);
         }
@@ -278,17 +274,15 @@ pub fn build_l2_incoming_entry(entry: IncomingEntry) -> ProtocolResult<L2Executi
         return Err(crate::ProtocolErrorKind::Unsupported(UNSUCCESSFUL_CALL).into());
     }
 
-    let call_hash = common_cross_chain_call_hash(
-        CallMode::Mutable,
-        CallHashInput {
-            source_address: source,
-            source_rollup_id,
-            target_address: target,
-            target_rollup_id: l2_rollup_id,
-            value,
-            data: &data,
-        },
-    );
+    let call_hash = common_cross_chain_call_hash(CallHashInput {
+        call_mode: CallMode::Mutable,
+        source_address: source,
+        source_rollup_id,
+        target_address: target,
+        target_rollup_id: l2_rollup_id,
+        value,
+        data: &data,
+    });
     let mut rolling_hash = EntryRollingHash::for_l2(call_hash);
     rolling_hash.call_begin(call_hash);
     rolling_hash.call_end(true, &return_data);
@@ -353,8 +347,9 @@ pub fn build_l2_outbound_entry(entry: OutboundEntry) -> ProtocolResult<L2Executi
         return Err(crate::ProtocolErrorKind::Unsupported(UNSUCCESSFUL_CALL).into());
     }
 
-    let proxy_entry_hash = l2_mutable_outbound_call_hash(
+    let proxy_entry_hash = l2_outbound_call_hash(
         CallHashInput {
+            call_mode: CallMode::Mutable,
             source_address: source,
             source_rollup_id: l2_rollup_id,
             target_address: target,
@@ -388,17 +383,15 @@ pub fn build_l1_inbound_entry(
     destination_rollup_id: RollupId,
     return_data: Bytes,
 ) -> EvmBatch {
-    let proxy_entry_hash = common_cross_chain_call_hash(
-        CallMode::Mutable,
-        CallHashInput {
-            source_address: source,
-            source_rollup_id: RollupId::MAINNET,
-            target_address: target,
-            target_rollup_id: destination_rollup_id,
-            value,
-            data: &data,
-        },
-    );
+    let proxy_entry_hash = common_cross_chain_call_hash(CallHashInput {
+        call_mode: CallMode::Mutable,
+        source_address: source,
+        source_rollup_id: RollupId::MAINNET,
+        target_address: target,
+        target_rollup_id: destination_rollup_id,
+        value,
+        data: &data,
+    });
 
     batch_with_entries(
         vec![ExecutionEntrySol {
@@ -433,17 +426,15 @@ pub(crate) fn build_l1_inbound_sidecar(
             .into());
         }
 
-        let call_hash = common_cross_chain_call_hash(
-            CallMode::Mutable,
-            CallHashInput {
-                source_address: call.source_address,
-                source_rollup_id: call.source_rollup_id,
-                target_address: call.target_address,
-                target_rollup_id,
-                value: call.value,
-                data: &call.data,
-            },
-        );
+        let call_hash = common_cross_chain_call_hash(CallHashInput {
+            call_mode: CallMode::Mutable,
+            source_address: call.source_address,
+            source_rollup_id: call.source_rollup_id,
+            target_address: call.target_address,
+            target_rollup_id,
+            value: call.value,
+            data: &call.data,
+        });
         let mut rolling_hash = EntryRollingHash::for_l2(call_hash);
         rolling_hash.call_begin(call_hash);
         rolling_hash.call_end(true, return_data);
@@ -736,6 +727,7 @@ fn l1_call_from_action(call: &ExecutedAction) -> L2ToL1CallSol {
 
 fn source_side_call_hash(call: &ExecutedAction) -> B256 {
     let input = CallHashInput {
+        call_mode: call.call_mode,
         source_address: call.source_address,
         source_rollup_id: call.source_rollup_id,
         target_address: call.target_address,
@@ -744,9 +736,9 @@ fn source_side_call_hash(call: &ExecutedAction) -> B256 {
         data: &call.data,
     };
     if call.source_rollup_id.is_mainnet() {
-        common_cross_chain_call_hash(CallMode::Mutable, input)
+        common_cross_chain_call_hash(input)
     } else {
-        l2_mutable_outbound_call_hash(input, 0)
+        l2_outbound_call_hash(input, 0)
     }
 }
 
@@ -857,8 +849,9 @@ mod tests {
         )
         .unwrap();
         let entry = &batch.entries[0];
-        let expected_key = l2_mutable_outbound_call_hash(
+        let expected_key = l2_outbound_call_hash(
             CallHashInput {
+                call_mode: CallMode::Mutable,
                 source_address: action.source_address,
                 source_rollup_id: action.source_rollup_id,
                 target_address: action.target_address,
@@ -908,17 +901,15 @@ mod tests {
 
         let entry = &batch.entries[0];
         let call = &entry.l2ToL1Calls[0];
-        let call_hash = common_cross_chain_call_hash(
-            CallMode::Mutable,
-            CallHashInput {
-                source_address: call.sourceAddress,
-                source_rollup_id: RollupId(call.sourceRollupId),
-                target_address: call.targetAddress,
-                target_rollup_id: RollupId::MAINNET,
-                value: call.value,
-                data: &call.data,
-            },
-        );
+        let call_hash = common_cross_chain_call_hash(CallHashInput {
+            call_mode: CallMode::Mutable,
+            source_address: call.sourceAddress,
+            source_rollup_id: RollupId(call.sourceRollupId),
+            target_address: call.targetAddress,
+            target_rollup_id: RollupId::MAINNET,
+            value: call.value,
+            data: &call.data,
+        });
         let mut expected = EntryRollingHash::for_l1([(7, B256::with_last_byte(0x11))], B256::ZERO);
         expected.call_begin(call_hash);
         expected.call_end(true, &entry.returnData);

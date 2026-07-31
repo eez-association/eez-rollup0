@@ -1676,7 +1676,7 @@ mod outbound_wiring_tests {
     use eez_protocol::RollupId;
     use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
     use eez_protocol::abi::{ExecutionEntrySol, L2ToL1CallSol};
-    use eez_protocol::action::{CallHashInput, l2_mutable_outbound_call_hash};
+    use eez_protocol::action::{CallHashInput, l2_outbound_call_hash};
     use eez_protocol::outbound_gate::{OutboundCallObservation, verify_outbound_authorized};
 
     const EEZ_L2: Address = address!("4200000000000000000000000000000000000007");
@@ -1740,8 +1740,9 @@ mod outbound_wiring_tests {
     /// The topic1 `EEZL2` emits for `call` on this L2 (`targetRollupId` =
     /// MAINNET(0), `sourceRollupId` = `L2_RID`) — what the gate recomputes.
     fn call_hash(call: &L2ToL1CallSol, call_gas: u64) -> B256 {
-        l2_mutable_outbound_call_hash(
+        l2_outbound_call_hash(
             CallHashInput {
+                call_mode: eez_protocol::CallMode::Mutable,
                 source_address: call.sourceAddress,
                 source_rollup_id: RollupId(L2_RID),
                 target_address: call.targetAddress,

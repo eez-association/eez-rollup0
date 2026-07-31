@@ -6,7 +6,7 @@ use alloy_primitives::{Address, B256, I256, U256};
 use eez_protocol::abi::ExecutionEntrySol;
 use eez_protocol::rolling_hash::EntryRollingHash;
 use eez_protocol::{
-    CallHashInput, CallMode, RollupId, common_cross_chain_call_hash, l2_mutable_outbound_call_hash,
+    CallHashInput, CallMode, RollupId, common_cross_chain_call_hash, l2_outbound_call_hash,
 };
 use thiserror::Error;
 
@@ -318,8 +318,9 @@ fn authorize_outbound_effect(
         });
     }
     let observed_call_hash = decoded_event.call_hash();
-    let recomputed_call_hash = l2_mutable_outbound_call_hash(
+    let recomputed_call_hash = l2_outbound_call_hash(
         CallHashInput {
+            call_mode: CallMode::Mutable,
             source_address: call.sourceAddress,
             source_rollup_id: RollupId(expected_rollup_id.get()),
             target_address: call.targetAddress,
@@ -340,17 +341,15 @@ fn authorize_outbound_effect(
 
     // L1 uses the common gas-free call identity in the rolling hash. This is
     // deliberately distinct from the gas-aware L2 event hash checked above.
-    let l1_call_hash = common_cross_chain_call_hash(
-        CallMode::Mutable,
-        CallHashInput {
-            source_address: call.sourceAddress,
-            source_rollup_id: RollupId(call.sourceRollupId),
-            target_address: call.targetAddress,
-            target_rollup_id: RollupId::MAINNET,
-            value: call.value,
-            data: &call.data,
-        },
-    );
+    let l1_call_hash = common_cross_chain_call_hash(CallHashInput {
+        call_mode: CallMode::Mutable,
+        source_address: call.sourceAddress,
+        source_rollup_id: RollupId(call.sourceRollupId),
+        target_address: call.targetAddress,
+        target_rollup_id: RollupId::MAINNET,
+        value: call.value,
+        data: &call.data,
+    });
     let update = effect.claimed_state_update();
     let mut rolling_hash = EntryRollingHash::for_l1(
         [(update.rollupId, update.currentState)],

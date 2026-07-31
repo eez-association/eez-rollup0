@@ -7,17 +7,15 @@ fn refresh_outbound_rolling_hash(entry: &mut ExecutionEntrySol) {
     let [call] = entry.l2ToL1Calls.as_slice() else {
         panic!("outbound fixture must contain one call");
     };
-    let call_hash = eez_protocol::common_cross_chain_call_hash(
-        eez_protocol::CallMode::Mutable,
-        CallHashInput {
-            source_address: call.sourceAddress,
-            source_rollup_id: RollupId(call.sourceRollupId),
-            target_address: call.targetAddress,
-            target_rollup_id: RollupId::MAINNET,
-            value: call.value,
-            data: &call.data,
-        },
-    );
+    let call_hash = eez_protocol::common_cross_chain_call_hash(CallHashInput {
+        call_mode: eez_protocol::CallMode::Mutable,
+        source_address: call.sourceAddress,
+        source_rollup_id: RollupId(call.sourceRollupId),
+        target_address: call.targetAddress,
+        target_rollup_id: RollupId::MAINNET,
+        value: call.value,
+        data: &call.data,
+    });
     let mut rolling_hash = eez_protocol::rolling_hash::EntryRollingHash::for_l1(
         [(update.rollupId, update.currentState)],
         entry.proxyEntryHash,
@@ -33,6 +31,7 @@ fn outbound_event_and_l1_rolling_hash_use_distinct_call_identities() {
     let entry = &batch.entries[1];
     let call = &entry.l2ToL1Calls[0];
     let input = CallHashInput {
+        call_mode: CallMode::Mutable,
         source_address: call.sourceAddress,
         source_rollup_id: RollupId(call.sourceRollupId),
         target_address: call.targetAddress,
@@ -40,9 +39,8 @@ fn outbound_event_and_l1_rolling_hash_use_distinct_call_identities() {
         value: call.value,
         data: &call.data,
     };
-    let event_hash = eez_protocol::l2_mutable_outbound_call_hash(input, 0);
-    let l1_call_hash =
-        eez_protocol::common_cross_chain_call_hash(eez_protocol::CallMode::Mutable, input);
+    let event_hash = eez_protocol::l2_outbound_call_hash(input, 0);
+    let l1_call_hash = eez_protocol::common_cross_chain_call_hash(input);
 
     assert_ne!(event_hash, l1_call_hash);
     let mut expected_rolling = eez_protocol::rolling_hash::EntryRollingHash::for_l1(

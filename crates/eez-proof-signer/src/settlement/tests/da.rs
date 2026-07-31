@@ -17,17 +17,15 @@ fn refresh_l1_rolling_hash(entry: &mut ExecutionEntrySol) {
             } else {
                 CallMode::Mutable
             };
-            let call_hash = common_cross_chain_call_hash(
-                mode,
-                CallHashInput {
-                    source_address: call.sourceAddress,
-                    source_rollup_id: RollupId(call.sourceRollupId),
-                    target_address: call.targetAddress,
-                    target_rollup_id: RollupId::MAINNET,
-                    value: call.value,
-                    data: &call.data,
-                },
-            );
+            let call_hash = common_cross_chain_call_hash(CallHashInput {
+                call_mode: mode,
+                source_address: call.sourceAddress,
+                source_rollup_id: RollupId(call.sourceRollupId),
+                target_address: call.targetAddress,
+                target_rollup_id: RollupId::MAINNET,
+                value: call.value,
+                data: &call.data,
+            });
             rolling_hash.call_begin(call_hash);
             rolling_hash.call_end(entry.success, &entry.returnData);
         }

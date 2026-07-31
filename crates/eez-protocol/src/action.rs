@@ -1,9 +1,9 @@
 //! Cross-chain call-hash and per-rollup state-root slot derivation.
 //!
 //! The common contract formula hashes the call kind, source pair, target pair,
-//! value, and calldata. A mutable call leaving an L2 uses a distinct formula
+//! value, and calldata. A call leaving an L2 uses a distinct formula
 //! that also includes the manager-entry `callGas`; see
-//! [`l2_mutable_outbound_call_hash`].
+//! [`l2_outbound_call_hash`].
 
 use crate::RollupId;
 use alloy_primitives::{Address, B256, U256, keccak256};
@@ -19,6 +19,15 @@ pub enum CallMode {
 }
 
 impl CallMode {
+    /// Convert the Solidity `isStatic` field into the typed execution mode.
+    pub const fn from_is_static(is_static: bool) -> Self {
+        if is_static {
+            Self::Static
+        } else {
+            Self::Mutable
+        }
+    }
+
     /// Value encoded as the Solidity `isStatic` field.
     const fn is_static(self) -> bool {
         matches!(self, Self::Static)
@@ -31,6 +40,8 @@ impl CallMode {
 /// swapping the two address/rollup pairs.
 #[derive(Clone, Copy, Debug)]
 pub struct CallHashInput<'a> {
+    /// Whether execution may modify destination-chain state.
+    pub call_mode: CallMode,
     /// Address that originated the call on the source chain.
     pub source_address: Address,
     /// Rollup containing `source_address` (`0` denotes L1).
@@ -45,16 +56,16 @@ pub struct CallHashInput<'a> {
     pub data: &'a [u8],
 }
 
-/// Compute the hash for a mutable call leaving an L2.
+/// Compute the hash for a call leaving an L2.
 ///
 /// Unlike the common L1/inbound formula, `EEZL2` includes the manager-entry
 /// `call_gas` value between `value` and `data`. The supported deployment uses
 /// `USE_GAS_LEFT = false`, so production callers currently pass zero.
 #[must_use]
-pub fn l2_mutable_outbound_call_hash(input: CallHashInput<'_>, call_gas: u64) -> B256 {
+pub fn l2_outbound_call_hash(input: CallHashInput<'_>, call_gas: u64) -> B256 {
     keccak256(
         (
-            false,
+            input.call_mode.is_static(),
             input.source_address,
             input.source_rollup_id.0,
             input.target_address,
@@ -72,12 +83,12 @@ pub fn l2_mutable_outbound_call_hash(input: CallHashInput<'_>, call_gas: u64) ->
 /// Mirrors `EEZBase.computeCrossChainCallHash`:
 /// `keccak256(abi.encode(isStatic, sourceAddress, uint64(sourceRollupId),
 /// targetAddress, uint64(targetRollupId), value, data))`.
-/// Mutable calls leaving an L2 use [`l2_mutable_outbound_call_hash`] instead.
+/// Calls leaving an L2 use [`l2_outbound_call_hash`] instead.
 #[must_use]
-pub fn common_cross_chain_call_hash(mode: CallMode, input: CallHashInput<'_>) -> B256 {
+pub fn common_cross_chain_call_hash(input: CallHashInput<'_>) -> B256 {
     keccak256(
         (
-            mode.is_static(),
+            input.call_mode.is_static(),
             input.source_address,
             input.source_rollup_id.0,
             input.target_address,
@@ -133,6 +144,7 @@ mod tests {
     fn common_call_hash_matches_solidity_vectors() {
         let data = Bytes::from_static(&[1, 2, 3]);
         let input = CallHashInput {
+            call_mode: CallMode::Mutable,
             source_address: address!("00000000000000000000000000000000000000bb"),
             source_rollup_id: RollupId(7),
             target_address: address!("00000000000000000000000000000000000000aa"),
@@ -142,11 +154,14 @@ mod tests {
         };
 
         assert_eq!(
-            common_cross_chain_call_hash(CallMode::Mutable, input),
+            common_cross_chain_call_hash(input),
             b256!("0aea0f2282e747ca563ff59f9dbd36570e9973cfc007abfa51893d3fb9aaefdf")
         );
         assert_eq!(
-            common_cross_chain_call_hash(CallMode::Static, input),
+            common_cross_chain_call_hash(CallHashInput {
+                call_mode: CallMode::Static,
+                ..input
+            }),
             b256!("a03958bfe3866dabc6d8e5466965bdfe5f0368308af0d2069801e1562bcd35d0")
         );
     }
@@ -155,6 +170,7 @@ mod tests {
     fn common_call_hash_matches_boundary_solidity_vector() {
         let data = Bytes::new();
         let input = CallHashInput {
+            call_mode: CallMode::Mutable,
             source_address: address!("00000000000000000000000000000000000000bb"),
             source_rollup_id: RollupId(u64::MAX),
             target_address: address!("00000000000000000000000000000000000000aa"),
@@ -164,15 +180,16 @@ mod tests {
         };
 
         assert_eq!(
-            common_cross_chain_call_hash(CallMode::Mutable, input),
+            common_cross_chain_call_hash(input),
             b256!("f149543f591e628d8247387fdf6780d6aee8c119258a34b348509695c202a1a1")
         );
     }
 
     #[test]
-    fn l2_mutable_outbound_hash_matches_solidity_vectors() {
+    fn l2_outbound_hash_matches_solidity_vectors() {
         let data = Bytes::from_static(&[1, 2, 3]);
         let input = CallHashInput {
+            call_mode: CallMode::Mutable,
             source_address: address!("00000000000000000000000000000000000000bb"),
             source_rollup_id: RollupId(1),
             target_address: address!("00000000000000000000000000000000000000aa"),
@@ -182,19 +199,30 @@ mod tests {
         };
 
         assert_eq!(
-            l2_mutable_outbound_call_hash(input, 0),
+            l2_outbound_call_hash(input, 0),
             b256!("9fd05cd7eebaf1d08b2961cb5d1237ef586cea58141270697a5509c6f3a03a37")
         );
         assert_eq!(
-            l2_mutable_outbound_call_hash(input, 123_456),
+            l2_outbound_call_hash(input, 123_456),
             b256!("25400cdd749a1c3ac82f4e3093f0460afe21e718a545a96f9399b9ae486c99e4")
+        );
+        assert_eq!(
+            l2_outbound_call_hash(
+                CallHashInput {
+                    call_mode: CallMode::Static,
+                    ..input
+                },
+                0,
+            ),
+            b256!("a5aeac7d89f6ef62251b7ab3a1645a75f30a11d9f15627ea3885ae49dd0940d3")
         );
     }
 
     #[test]
-    fn l2_mutable_outbound_hash_matches_boundary_solidity_vector() {
+    fn l2_outbound_hash_matches_boundary_solidity_vector() {
         let data = Bytes::new();
         let input = CallHashInput {
+            call_mode: CallMode::Mutable,
             source_address: address!("00000000000000000000000000000000000000bb"),
             source_rollup_id: RollupId(u64::MAX),
             target_address: address!("00000000000000000000000000000000000000aa"),
@@ -204,7 +232,7 @@ mod tests {
         };
 
         assert_eq!(
-            l2_mutable_outbound_call_hash(input, u64::MAX),
+            l2_outbound_call_hash(input, u64::MAX),
             b256!("7f04915c437db6536fe9d746b135ed834b391532e4be8beadd898ad1f592895f")
         );
     }

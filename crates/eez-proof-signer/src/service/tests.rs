@@ -189,8 +189,9 @@ fn outbound_case(value: U256) -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256
     batch.entries[1].stateUpdates[0].etherDelta = -I256::try_from(value).unwrap();
     eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
     let call = &batch.entries[1].l2ToL1Calls[0];
-    let call_hash = eez_protocol::l2_mutable_outbound_call_hash(
+    let call_hash = eez_protocol::l2_outbound_call_hash(
         eez_protocol::CallHashInput {
+            call_mode: eez_protocol::CallMode::Mutable,
             source_address: call.sourceAddress,
             source_rollup_id: eez_protocol::RollupId(1),
             target_address: call.targetAddress,

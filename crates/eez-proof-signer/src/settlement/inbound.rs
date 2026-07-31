@@ -169,17 +169,15 @@ pub(super) fn inspect_inbound_candidate(
         }
     }
 
-    let recomputed_call_hash = common_cross_chain_call_hash(
-        CallMode::Mutable,
-        CallHashInput {
-            source_address: call.sourceAddress,
-            source_rollup_id: RollupId::MAINNET,
-            target_address: call.destination,
-            target_rollup_id: RollupId(expected_rollup_id.get()),
-            value: call.value,
-            data: &call.data,
-        },
-    );
+    let recomputed_call_hash = common_cross_chain_call_hash(CallHashInput {
+        call_mode: CallMode::Mutable,
+        source_address: call.sourceAddress,
+        source_rollup_id: RollupId::MAINNET,
+        target_address: call.destination,
+        target_rollup_id: RollupId(expected_rollup_id.get()),
+        value: call.value,
+        data: &call.data,
+    });
     if recomputed_call_hash == B256::ZERO {
         return Err(InboundObservationError::ZeroCallHash);
     }

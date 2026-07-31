@@ -18,7 +18,7 @@ use eez_protocol::entries::{
 use eez_protocol::public_inputs::public_inputs_hashes;
 use eez_protocol::{
     CallHashInput, CallMode, EntryRollingHash, RollupId, common_cross_chain_call_hash,
-    l2_mutable_outbound_call_hash,
+    l2_outbound_call_hash,
 };
 use reth_ethereum_primitives::{BlockBody, TransactionSigned};
 use reth_primitives_traits::{BlockBody as _, SignerRecoverable as _};
@@ -145,17 +145,15 @@ fn effect_batch(roots: &[B256], kinds: &[ClaimedEntryShape]) -> CanonicalPostBat
             ClaimedEntryShape::Outbound => {
                 let call = l2_to_l1_call();
                 entry.stateUpdates[0].etherDelta = -I256::try_from(call.value).unwrap();
-                let call_hash = common_cross_chain_call_hash(
-                    CallMode::Mutable,
-                    CallHashInput {
-                        source_address: call.sourceAddress,
-                        source_rollup_id: RollupId(call.sourceRollupId),
-                        target_address: call.targetAddress,
-                        target_rollup_id: RollupId::MAINNET,
-                        value: call.value,
-                        data: &call.data,
-                    },
-                );
+                let call_hash = common_cross_chain_call_hash(CallHashInput {
+                    call_mode: CallMode::Mutable,
+                    source_address: call.sourceAddress,
+                    source_rollup_id: RollupId(call.sourceRollupId),
+                    target_address: call.targetAddress,
+                    target_rollup_id: RollupId::MAINNET,
+                    value: call.value,
+                    data: &call.data,
+                });
                 let update = &entry.stateUpdates[0];
                 let mut rolling_hash = EntryRollingHash::for_l1(
                     [(update.rollupId, update.currentState)],
@@ -364,8 +362,9 @@ fn observed_outbound_call_with_gas(
     OutboundEventObservation::decoded_for_test(
         transaction_index,
         receipt_log_index,
-        l2_mutable_outbound_call_hash(
+        l2_outbound_call_hash(
             CallHashInput {
+                call_mode: CallMode::Mutable,
                 source_address: call.sourceAddress,
                 source_rollup_id: RollupId(1),
                 target_address: call.targetAddress,
