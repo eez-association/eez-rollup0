@@ -467,20 +467,6 @@ impl<'a> SessionInspector<'a> {
     }
 }
 
-/// Classify the EVM call shape that can be represented by the current executor.
-fn supported_call_mode(is_static: bool, scheme: CallScheme) -> Result<CallMode, &'static str> {
-    if is_static || matches!(scheme, CallScheme::StaticCall) {
-        return Err("static cross-chain calls are not implemented");
-    }
-    match scheme {
-        CallScheme::Call => Ok(CallMode::Mutable),
-        CallScheme::CallCode | CallScheme::DelegateCall => {
-            Err("CALLCODE and DELEGATECALL cannot represent a cross-chain proxy call")
-        }
-        CallScheme::StaticCall => unreachable!("handled above"),
-    }
-}
-
 impl<'db, DB, CTX> Inspector<CTX> for SessionInspector<'_>
 where
     CTX: ContextTr<Db = &'db mut State<DB>> + Host,
@@ -498,56 +484,53 @@ where
             return None;
         }
 
+        // Only ordinary CALLs can represent cross-chain proxy calls.
+        // Leave CALLCODE, DELEGATECALL, and STATICCALL to the EVM.
+        if !matches!(inputs.scheme, CallScheme::Call) {
+            return None;
+        }
+
         let calldata = inputs.input.bytes(context);
 
         tracing::trace!(
             depth = self.call_depth,
-            code_addr = %inputs.bytecode_address,
+            target_addr = %inputs.target_address,
             caller = %inputs.caller,
             calldata_len = calldata.len(),
             "inspector: CALL"
         );
 
-        // Authorization follows the account whose code the opcode executes.
-        // `target_address` differs for CALLCODE/DELEGATECALL, so using it here
-        // would let those unsupported schemes bypass the proxy guard.
+        // Look up `authorizedProxies[target_address]` on the configured
+        // contract via the live EVM state. Sees in-tx / in-block writes.
         self.proxy_lookups += 1;
         let Some(info) = lookup_authorized_proxy_live(
             context,
             self.proxy_lookup.contract_address,
             self.proxy_lookup.authorized_proxies_slot,
-            inputs.bytecode_address,
+            inputs.target_address,
         ) else {
-            tracing::trace!(addr = %inputs.bytecode_address, "inspector: not a proxy");
+            tracing::trace!(addr = %inputs.target_address, "inspector: not a proxy");
             return None;
         };
 
         let call_value = inputs.value.get();
 
-        let scheme = match inputs.scheme {
-            CallScheme::Call => "CALL",
-            CallScheme::CallCode => "CALLCODE",
-            CallScheme::DelegateCall => "DELEGATECALL",
-            CallScheme::StaticCall => "STATICCALL",
-        };
-
-        let call_mode = match supported_call_mode(inputs.is_static, inputs.scheme) {
-            Ok(mode) => mode,
-            Err(reason) => {
-                self.record_error(ExecutorError::evm(reason));
-                return Some(CallOutcome::new(
-                    InterpreterResult::new(
-                        InstructionResult::Revert,
-                        Bytes::new(),
-                        Gas::new(inputs.gas_limit),
-                    ),
-                    inputs.return_memory_offset.clone(),
-                ));
-            }
-        };
+        if inputs.is_static {
+            self.record_error(ExecutorError::evm(
+                "static cross-chain calls are not implemented",
+            ));
+            return Some(CallOutcome::new(
+                InterpreterResult::new(
+                    InstructionResult::Revert,
+                    Bytes::new(),
+                    Gas::new(inputs.gas_limit),
+                ),
+                inputs.return_memory_offset.clone(),
+            ));
+        }
 
         let req = eez_protocol::ExecutionRequest {
-            call_mode,
+            call_mode: CallMode::Mutable,
             target_address: info.original_address,
             data: calldata.clone(),
             value: call_value,
@@ -690,9 +673,9 @@ where
             dest = %info.original_address,
             rollup_id = %info.original_rollup_id,
             caller = %inputs.caller,
-            proxy = %inputs.bytecode_address,
+            proxy = %inputs.target_address,
             depth = self.call_depth,
-            scheme,
+            scheme = "CALL",
             calldata_len = calldata.len(),
             value = %call_value,
             target_result = if success { "ok" } else { "REVERT" },
@@ -762,12 +745,11 @@ mod tests {
     //! snapshot.
 
     use super::*;
-    use alloy_primitives::{B256, U256, address};
+    use alloy_primitives::{U256, address};
     use eez_protocol::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
     use revm::MainContext;
     use revm::context::Context;
     use revm::database::{CacheDB, EmptyDB};
-    use revm::interpreter::{CallInput, CallValue};
 
     const ROLLUPS_ADDR: Address = address!("0x1111111111111111111111111111111111111111");
     const PROXY_ADDR: Address = address!("0x2222222222222222222222222222222222222222");
@@ -807,67 +789,6 @@ mod tests {
             PROXY_ADDR,
         );
         assert!(info.is_none());
-    }
-
-    #[test]
-    fn only_non_static_call_is_supported_for_cross_chain_dispatch() {
-        assert_eq!(
-            supported_call_mode(false, CallScheme::Call),
-            Ok(CallMode::Mutable)
-        );
-        assert!(supported_call_mode(true, CallScheme::Call).is_err());
-        assert!(supported_call_mode(true, CallScheme::StaticCall).is_err());
-        assert!(supported_call_mode(false, CallScheme::CallCode).is_err());
-        assert!(supported_call_mode(false, CallScheme::DelegateCall).is_err());
-    }
-
-    #[test]
-    fn delegatecall_to_an_authorized_proxy_cannot_bypass_scheme_validation() {
-        let key = proxy_mapping_key(PROXY_ADDR, ROLLUPS_AUTHORIZED_PROXIES_SLOT);
-        let value = packed_proxy_value(DESTINATION_ADDR, TARGET_ROLLUP);
-        let mut cache_db = CacheDB::<EmptyDB>::default();
-        cache_db.insert_account_info(ROLLUPS_ADDR, Default::default());
-        cache_db
-            .insert_account_storage(ROLLUPS_ADDR, key.into(), value)
-            .expect("populate storage");
-        let mut state = State::builder().with_database(cache_db).build();
-        let mut context = Context::mainnet().with_db(&mut state);
-
-        let mut dispatcher = CompositionBuilder::new(RollupId::MAINNET, Default::default());
-        let mut inspector = SessionInspector::new(
-            ProxyLookupConfig {
-                contract_address: ROLLUPS_ADDR,
-                authorized_proxies_slot: ROLLUPS_AUTHORIZED_PROXIES_SLOT,
-            },
-            &mut dispatcher,
-            RollupId::MAINNET,
-        );
-        let mut inputs = CallInputs {
-            input: CallInput::default(),
-            return_memory_offset: 0..0,
-            gas_limit: 100_000,
-            reservoir: 0,
-            bytecode_address: PROXY_ADDR,
-            known_bytecode: (B256::ZERO, Default::default()),
-            target_address: Address::repeat_byte(0x44),
-            caller: Address::repeat_byte(0x55),
-            value: CallValue::Apparent(U256::ZERO),
-            scheme: CallScheme::DelegateCall,
-            is_static: false,
-        };
-
-        let outcome = inspector
-            .call(&mut context, &mut inputs)
-            .expect("authorized proxy call must be intercepted");
-
-        assert_eq!(outcome.result.result, InstructionResult::Revert);
-        assert!(
-            inspector
-                .take_error()
-                .expect("unsupported scheme must be surfaced")
-                .to_string()
-                .contains("DELEGATECALL")
-        );
     }
 
     #[test]
