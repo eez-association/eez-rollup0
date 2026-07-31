@@ -7,7 +7,7 @@ mod pipeline;
 mod runtime;
 
 use alloy_consensus::{SignableTransaction as _, Transaction as _};
-use alloy_primitives::{Address, B256, Bytes, I256, Signature, U256, address, b256};
+use alloy_primitives::{B256, Bytes, I256, Signature, U256, address, b256};
 use alloy_sol_types::SolValue as _;
 use eez_control_rpc::v1::prover_client::ProverClient;
 use eez_control_rpc::v1::{
@@ -26,7 +26,8 @@ use super::settlement_job::{
 use super::*;
 use crate::cancel::CancellationToken;
 use crate::testkit::{
-    SYSTEM_PRIVATE_KEY, checkpoint, system_transaction_context, test_proof_system_vkey,
+    SYSTEM_PRIVATE_KEY, TEST_SYSTEM_ADDRESS, checkpoint, system_transaction_context,
+    test_proof_system_vkey,
 };
 use crate::validate::Validator;
 use crate::validate::testing::backend_output_for;
@@ -47,19 +48,70 @@ fn test_proof_system() -> Address {
 fn test_attester() -> crate::attest::Attester {
     // Anvil account #1. Test-only and intentionally public.
     let private_key = b256!("59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
-    crate::attest::Attester::new(private_key, test_proof_system_vkey(), test_proof_system())
-        .unwrap()
+    crate::attest::Attester::new(
+        private_key,
+        test_proof_system_vkey(),
+        test_proof_system(),
+        TEST_SYSTEM_ADDRESS,
+    )
+    .unwrap()
 }
 
 fn test_system_transaction_reconstructor(
     rollup_id: NonZeroU64,
 ) -> settlement::SystemTransactionReconstructor {
-    // Anvil account #0: the protocol's reserved SYSTEM_ADDRESS.
     test_system_transaction_key().into_reconstructor(1, rollup_id)
 }
 
 fn test_system_transaction_key() -> settlement::SystemTransactionKey {
-    settlement::SystemTransactionKey::new(SYSTEM_PRIVATE_KEY).unwrap()
+    settlement::SystemTransactionKey::new(SYSTEM_PRIVATE_KEY, TEST_SYSTEM_ADDRESS).unwrap()
+}
+
+#[test]
+fn service_state_rejects_a_validator_for_another_system_identity() {
+    let other_address = address!("6f4c950442e1Af093BcfF730381E63Ae9171b87a");
+    let other_key = settlement::SystemTransactionKey::new(
+        b256!("0000000000000000000000000000000000000000000000000000000000000042"),
+        other_address,
+    )
+    .unwrap();
+
+    let error = ServiceState::new(
+        Validator::stub(Vec::new()),
+        expected_rollup_id(1),
+        test_attester(),
+        other_key,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "validator and system-transaction key use different L2 system addresses"
+    );
+}
+
+#[test]
+fn service_state_rejects_an_attester_bound_to_another_system_identity() {
+    let attester = crate::attest::Attester::new(
+        b256!("59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"),
+        test_proof_system_vkey(),
+        test_proof_system(),
+        Address::repeat_byte(0xbb),
+    )
+    .unwrap();
+
+    let error = ServiceState::new(
+        Validator::stub(Vec::new()),
+        expected_rollup_id(1),
+        attester,
+        test_system_transaction_key(),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "attester and system-transaction key use different L2 system addresses"
+    );
 }
 
 fn anchor_batch() -> eez_protocol::EvmBatch {
@@ -722,10 +774,13 @@ fn inner(validator: Validator) -> Arc<ServiceState> {
 }
 
 fn inner_with_rollup(validator: Validator, expected_rollup_id: NonZeroU64) -> Arc<ServiceState> {
-    Arc::new(ServiceState::new(
-        validator,
-        expected_rollup_id,
-        test_attester(),
-        test_system_transaction_key(),
-    ))
+    Arc::new(
+        ServiceState::new(
+            validator,
+            expected_rollup_id,
+            test_attester(),
+            test_system_transaction_key(),
+        )
+        .unwrap(),
+    )
 }

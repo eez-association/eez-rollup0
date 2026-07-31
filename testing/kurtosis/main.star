@@ -13,9 +13,6 @@ L2_XCHAIN_PORT = 18998
 BUILDER_FLASHBOTS_RPC_PORT = 8645
 PROOF_SIGNER_GRPC_PORT = 50061
 
-# L2 genesis state root for genesis.json. Recompute if genesis alloc changes.
-L2_GENESIS_STATE_ROOT = "0x2ed06189f906981844a89fe235a57db5293c1f3d101a285c292cf453435f5ee9"
-
 
 def run(plan, args):
     eth_args = args["ethereum_package"]
@@ -23,9 +20,9 @@ def run(plan, args):
 
     poster_key = eez.get("poster_key", "")
     proof_signer_key = eez.get("proof_signer_key", "")
-    l2_system_key = eez.get("l2_system_key", "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
-    if poster_key in ["", "0xCHANGE_ME"] or proof_signer_key in ["", "0xCHANGE_ME"]:
-        fail("set eez.poster_key and eez.proof_signer_key in the args file " +
+    l2_system_key = eez.get("l2_system_key", "")
+    if poster_key in ["", "0xCHANGE_ME"] or proof_signer_key in ["", "0xCHANGE_ME"] or l2_system_key in ["", "0xCHANGE_ME"]:
+        fail("set eez.poster_key, eez.proof_signer_key, and eez.l2_system_key in the args file " +
              "(set deterministic test keys in the CI args file)")
 
     # Pair B: canonical L1, validators, and MEV stack.
@@ -71,9 +68,9 @@ def run(plan, args):
             "EEZ_L1_RPC_URL": l1_el.rpc_http_url,
             "EEZ_L1_POSTER_KEY": poster_key,
             "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
+            "EEZ_L2_SYSTEM_KEY": l2_system_key,
             "EEZ_DEPLOYMENTS_FILE": "/out/deployments.env",
             "EEZ_GENESIS_OUT": "/out/l2-genesis.json",
-            "EEZ_INITIAL_STATE_ROOT": L2_GENESIS_STATE_ROOT,
         },
         run = "mkdir -p /out && bash /repo/scripts/deploy.sh",
         store = [StoreSpec(src = "/out", name = "eez-deployments")],

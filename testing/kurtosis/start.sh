@@ -69,7 +69,11 @@ fi
 
 if [[ "${EEZ_SKIP_DEPLOY_BUILD:-0}" != "1" ]]; then
     echo "==> building $DEPLOY_IMAGE (foundry + contracts)"
-    docker build -f "$HERE/Dockerfile.deploy" -t "$DEPLOY_IMAGE" "$REPO"
+    docker build \
+        --build-arg "EEZ_NODE_IMAGE=$NODE_IMAGE" \
+        -f "$HERE/Dockerfile.deploy" \
+        -t "$DEPLOY_IMAGE" \
+        "$REPO"
 else
     echo "==> reusing $DEPLOY_IMAGE (EEZ_SKIP_DEPLOY_BUILD=1)"
 fi

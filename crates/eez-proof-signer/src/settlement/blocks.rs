@@ -242,9 +242,10 @@ pub(crate) fn inspect_settling_block(
 ///
 /// Each block is consensus-RLP decoded exactly, and recovered signer flags
 /// must cover every transaction. A transaction is privileged if it uses the
-/// reserved system type or is signed by [`eez_protocol::SYSTEM_ADDRESS`], regardless of its
-/// recipient. Outbound observations are rejected because effects are bound
-/// only in the settling block.
+/// reserved system type or was classified by validation as coming from the
+/// deployment-configured system address, regardless of its recipient.
+/// Outbound observations are rejected because effects are bound only in the
+/// settling block.
 pub(crate) fn verify_validated_intermediate_blocks(
     blocks: &[ValidatedBlock],
 ) -> Result<(), BlockInspectionError> {

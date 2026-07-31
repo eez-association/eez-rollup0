@@ -40,7 +40,9 @@ async fn main() -> eyre::Result<()> {
 
     let listen_addr = config.listen_addr;
     let limits = config.limits;
-    let validator = validate::Validator::stateless(&config.chain_document_path)?;
+    let expected_l2_system_address = config.expected_l2_system_address;
+    let validator =
+        validate::Validator::stateless(&config.chain_document_path, expected_l2_system_address)?;
     if !listen_addr.ip().is_loopback() {
         warn!(
             listen = %listen_addr,
@@ -64,7 +66,7 @@ async fn main() -> eyre::Result<()> {
         expected_proof_system = %config.attester.expected_proof_system(),
         proof_system_vkey = %config.attester.proof_system_vkey(),
         l2_chain_id = validator.chain_id(),
-        system_address = %eez_protocol::SYSTEM_ADDRESS,
+        expected_l2_system_address = %expected_l2_system_address,
         profile = "anchor_single_call_outbound_then_inbound",
         "serving Prove — waiting for composer windows",
     );
@@ -74,7 +76,7 @@ async fn main() -> eyre::Result<()> {
             config.expected_rollup_id,
             config.attester,
             config.system_transaction_key,
-        )),
+        )?),
         limits,
     );
     let shutdown_service = svc.clone();

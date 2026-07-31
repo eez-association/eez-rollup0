@@ -445,10 +445,28 @@ fn outbound_effects_require_a_successful_outcome_and_exact_value_accounting() {
     }
 
     let mut reserved_source = valid;
-    reserved_source.entries[1].l2ToL1Calls[0].sourceAddress = SYSTEM_ADDRESS;
+    reserved_source.entries[1].l2ToL1Calls[0].sourceAddress = TEST_SYSTEM_ADDRESS;
     refresh_outbound_rolling_hash(&mut reserved_source.entries[1]);
     assert_eq!(
         verify(&reserved_source),
         Some(OutboundEffectError::ReservedSourceAddress { entry_index: 1 })
+    );
+
+    let mut settling = settling_with_outbound_pairs(1);
+    settling
+        .outbound_event_candidates_mut_for_test()
+        .push(observed_outbound_call(
+            1,
+            0,
+            &reserved_source.entries[1].l2ToL1Calls[0],
+        ));
+    let plan = effect_plan(&reserved_source, &settling);
+    assert!(
+        authorize_outbound_effects_for_rollup(
+            &plan,
+            expected_rollup_id(),
+            Address::repeat_byte(0xbb),
+        )
+        .is_ok()
     );
 }

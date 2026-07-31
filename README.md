@@ -80,6 +80,7 @@ standalone chiado-reth.
 cp .env.example .env
 #   EEZ_L1_RPC_URL=<tip chiado RPC>   EEZ_L1_POSTER_KEY=<operator key>
 #   EEZ_PROOF_SIGNER_KEY=<operator key>   (its address becomes the proof system's authorizedSigner)
+#   EEZ_L2_SYSTEM_KEY=<separate L2 system-transaction key>
 EEZ_DEPLOY_SKIP_SIMULATION=1 make deploy-protocol
 
 cp datadir/genesis.json ./data/genesis-fresh.json
@@ -87,9 +88,12 @@ cp datadir/genesis.json ./data/genesis-fresh.json
 
 This deploys EEZ + ECDSAProofSystem + the rollup manager, registers the
 rollup, deploys the L1 bridge contracts, and writes **`deployments.env`**
-(registry, proof system, rollup id, deploy block, bridge + CCM-L2 addresses)
-plus the L2 **`datadir/genesis.json`** whose timestamp is pinned to the deploy
-block. The container loads `deployments.env` automatically; `.env.chiado`'s
+(registry, proof system, rollup id, deploy block, bridge + CCM-L2 addresses).
+The deploy derives the public L2 system address from `EEZ_L2_SYSTEM_KEY`,
+generates and funds its canonical EEZL2 genesis, and registers that exact state
+root; the private key is never written to `deployments.env`. It also writes the
+L2 **`datadir/genesis.json`** whose timestamp is pinned to the deploy block. The
+container loads `deployments.env` automatically; `.env.chiado`'s
 `FRESH_GENESIS` points at that genesis (default `./datadir/genesis.json`), so
 **deploy must run before `up`** — there is no separate genesis-creation step.
 (Set `EEZ_BLOCKSCOUT_URL` first to also verify the contracts on Blockscout —

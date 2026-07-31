@@ -2,12 +2,11 @@
 
 use std::num::NonZeroU64;
 
-use alloy_primitives::{B256, I256, U256};
+use alloy_primitives::{Address, B256, I256, U256};
 use eez_protocol::abi::ExecutionEntrySol;
 use eez_protocol::rolling_hash::EntryRollingHash;
 use eez_protocol::{
-    CallHashInput, CallMode, RollupId, SYSTEM_ADDRESS, common_cross_chain_call_hash,
-    l2_mutable_outbound_call_hash,
+    CallHashInput, CallMode, RollupId, common_cross_chain_call_hash, l2_mutable_outbound_call_hash,
 };
 use thiserror::Error;
 
@@ -164,6 +163,7 @@ impl AuthorizedOutboundEffect {
 pub(crate) fn authorize_outbound_effects(
     bound_effects: &BoundEffectSequence<'_, '_>,
     expected_rollup_id: NonZeroU64,
+    expected_l2_system_address: Address,
 ) -> Result<AuthorizedOutboundEffects, OutboundEffectError> {
     let mut observations = bound_effects
         .settling_observations()
@@ -229,7 +229,12 @@ pub(crate) fn authorize_outbound_effects(
                 {
                     return Err(unexpected_outbound_observation(next));
                 }
-                authorize_outbound_effect(effect, observation, expected_rollup_id)?;
+                authorize_outbound_effect(
+                    effect,
+                    observation,
+                    expected_rollup_id,
+                    expected_l2_system_address,
+                )?;
                 let mut derived_da_entry = effect.claimed_entry().clone();
                 derived_da_entry.stateUpdates.clear();
                 derived_da_entry.rollingHash = B256::ZERO;
@@ -261,6 +266,7 @@ fn authorize_outbound_effect(
     effect: &BoundEffect<'_>,
     observation: &OutboundEventObservation,
     expected_rollup_id: NonZeroU64,
+    expected_l2_system_address: Address,
 ) -> Result<(), OutboundEffectError> {
     let entry_index = effect.entry_index();
     let entry = effect.claimed_entry();
@@ -361,7 +367,7 @@ fn authorize_outbound_effect(
         });
     }
 
-    if call.sourceAddress == SYSTEM_ADDRESS {
+    if call.sourceAddress == expected_l2_system_address {
         return Err(OutboundEffectError::ReservedSourceAddress { entry_index });
     }
     // Available L1 funding is outside this claim; bind the ledger delta to

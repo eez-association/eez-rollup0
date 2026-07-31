@@ -59,8 +59,8 @@ pub struct ProxyInfo {
 /// Compute the Solidity storage key for `authorizedProxies[addr]`.
 ///
 /// Layout: `mapping(address => packed ProxyInfo)` at storage `slot`.
-/// Key = `keccak256(abi.encodePacked(address, slot))` where both are
-/// left-padded to 32 bytes.
+/// Key = `keccak256(abi.encode(address, uint256(slot)))`, where both values
+/// occupy one left-padded 32-byte ABI word.
 ///
 /// ```text
 /// [0..12]  = zero padding (address is 20 bytes)

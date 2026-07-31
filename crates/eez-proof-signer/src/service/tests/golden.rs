@@ -7,6 +7,7 @@ use eez_control_rpc::v1::{
 
 use super::expected_rollup_id;
 use crate::cancel::CancellationToken;
+use crate::testkit::TEST_SYSTEM_ADDRESS;
 use crate::{settlement, validate};
 
 fn fixture_hex(value: &str) -> Vec<u8> {
@@ -133,7 +134,7 @@ fn captured_five_field_outbound_events_are_not_decoded_as_target_events() {
 
     let chain_config =
         serde_json::from_str(&fixture("nonzero-outbound-630", "chain-config.json")).unwrap();
-    let validator = validate::Validator::stateless_for_test(chain_config);
+    let validator = validate::Validator::stateless_for_test(chain_config, TEST_SYSTEM_ADDRESS);
     assert_eq!(validator.chain_id(), fixture_u64(&oracle, "l2_chain_id"));
 
     let mut assembler = crate::window::WindowAssembler::start(

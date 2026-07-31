@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "rollupId": 1,
+  "systemAddress": "0xE3601fD07288f142938bBDeFf14e6474Ea256477",
+  "systemBalance": "0xd3c21bcecceda1000000",
+  "useGasLeft": false,
+  "eezL2Address": "0x4200000000000000000000000000000000000007",
+  "runtimeCodeHash": "0x97eec3356de07514c36f7e5e769f947bffbf0a5dd40184fd244e6650d3f5c585",
+  "genesisStateRoot": "0xba1e16c9c8c1a00b7ca1b237298af6052245843e7cfe4f1dd84aed19e3dcb115",
+  "foundryVersion": "1.7.1"
+}

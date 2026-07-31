@@ -38,17 +38,17 @@ RUN cargo chef cook --release --recipe-path recipe.json --package eez-node
 # Workspace sources; only this layer rebuilds on first-party code changes.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release -p eez-node \
-    && strip target/release/eez-node
+RUN cargo build --release -p eez-node --bin eez-node --example genesis_state_root \
+    && strip target/release/eez-node target/release/examples/genesis_state_root
 
-# ── runtime: slim image with just the binary + L2 genesis ────────────
+# ── runtime: slim image with just the binaries ──────────────────
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/eez-node /usr/local/bin/eez-node
-# L2 genesis the node boots from. Fixed (deterministic) — every operator's
-# L2 chain shares this genesis; each gets its own EEZ rollup on chiado.
-COPY genesis.json /app/genesis.json
+COPY --from=builder /build/target/release/examples/genesis_state_root /usr/local/bin/eez-genesis-state-root
+# Deployment generates the L2 genesis with its own system address. It must be
+# mounted explicitly; the image must never ship a privileged test identity.
 ENTRYPOINT ["eez-node"]
 CMD ["--help"]

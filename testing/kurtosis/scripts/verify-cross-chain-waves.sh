@@ -16,3 +16,8 @@ for mode in inbound outbound mixed; do
         env EEZ_WAVE_MODE="$mode" EEZ_WAVE_COUNT=1 \
         bash "$HERE/cross-chain-wave.sh"
 done
+
+run_check "cross-chain-wave-mixed-pure" \
+    env EEZ_WAVE_MODE=mixed-pure \
+        EEZ_WAVE_COUNT="${EEZ_MIXED_PURE_WAVE_COUNT:-3}" \
+    bash "$HERE/cross-chain-wave.sh"

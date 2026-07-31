@@ -9,6 +9,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alloy_primitives::Address;
 use eez_control_rpc::v1::prover_server::ProverServer;
 use tokio::sync::Semaphore;
 
@@ -111,6 +112,7 @@ impl ServiceLimits {
 pub(crate) struct ServiceState {
     validator: validate::Validator,
     expected_rollup_id: NonZeroU64,
+    expected_l2_system_address: Address,
     attester: Attester,
     system_transaction_reconstructor: settlement::SystemTransactionReconstructor,
 }
@@ -123,15 +125,25 @@ impl ServiceState {
         expected_rollup_id: NonZeroU64,
         attester: Attester,
         system_transaction_key: settlement::SystemTransactionKey,
-    ) -> Self {
+    ) -> eyre::Result<Self> {
+        let expected_l2_system_address = system_transaction_key.address();
+        eyre::ensure!(
+            validator.expected_l2_system_address() == expected_l2_system_address,
+            "validator and system-transaction key use different L2 system addresses"
+        );
+        eyre::ensure!(
+            attester.expected_l2_system_address() == expected_l2_system_address,
+            "attester and system-transaction key use different L2 system addresses"
+        );
         let system_transaction_reconstructor =
             system_transaction_key.into_reconstructor(validator.chain_id(), expected_rollup_id);
-        Self {
+        Ok(Self {
             validator,
             expected_rollup_id,
+            expected_l2_system_address,
             attester,
             system_transaction_reconstructor,
-        }
+        })
     }
 }
 

@@ -66,7 +66,7 @@ pub use action::{
     l2_mutable_outbound_call_hash,
 };
 #[doc(inline)]
-pub use addresses::{CCM_ADDRESS, SYSTEM_ADDRESS};
+pub use addresses::CCM_ADDRESS;
 #[doc(inline)]
 pub use authorized_proxies::{
     CCM_AUTHORIZED_PROXIES_SLOT, ProxyInfo, ROLLUPS_AUTHORIZED_PROXIES_SLOT, decode_proxy_value,

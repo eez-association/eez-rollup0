@@ -495,10 +495,7 @@ fn exact_intermediate_inbound_candidate_is_rejected() {
             .input()
             .starts_with(EXECUTE_INCOMING_SELECTOR.as_slice())
     );
-    assert_eq!(
-        transaction.recover_signer().unwrap(),
-        eez_protocol::SYSTEM_ADDRESS
-    );
+    assert_eq!(transaction.recover_signer().unwrap(), TEST_SYSTEM_ADDRESS);
     assert_eq!(transaction.to(), Some(crate::EEZL2_ADDRESS));
     let rlp = block_rlp(vec![transaction]);
 
@@ -519,10 +516,7 @@ fn selector_spoof_from_a_user_remains_an_ordinary_intermediate_transaction() {
             .input()
             .starts_with(EXECUTE_INCOMING_SELECTOR.as_slice())
     );
-    assert_ne!(
-        transaction.recover_signer().unwrap(),
-        eez_protocol::SYSTEM_ADDRESS
-    );
+    assert_ne!(transaction.recover_signer().unwrap(), TEST_SYSTEM_ADDRESS);
     assert_eq!(transaction.to(), Some(crate::EEZL2_ADDRESS));
     let rlp = block_rlp(vec![transaction]);
 

@@ -13,8 +13,8 @@ use alloy_consensus::{EthereumReceipt, Transaction as _};
 #[cfg(test)]
 use alloy_genesis::ChainConfig;
 use alloy_genesis::Genesis;
+use alloy_primitives::Address;
 use alloy_sol_types::SolEvent as _;
-use eez_protocol::SYSTEM_ADDRESS;
 use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
 use eez_protocol::settlement::{is_system_tx, pair_end_positions};
 use reth_chainspec::{ChainSpec, EthereumHardforks as _};
@@ -73,16 +73,18 @@ impl CheckpointPlan {
     fn from_recovered_block(
         block: &RecoveredBlock<Block>,
         max_checkpoints: usize,
+        expected_l2_system_address: Address,
     ) -> Result<(Self, Vec<bool>), ValidationError> {
         let transaction_count = block.body().transactions.len();
         let mut system_sender_flags = Vec::with_capacity(transaction_count);
         let mut sync_system_transaction_flags = Vec::with_capacity(transaction_count);
         for transaction in block.transactions_recovered() {
-            let is_system_sender = transaction.signer() == SYSTEM_ADDRESS;
+            let is_system_sender = transaction.signer() == expected_l2_system_address;
             system_sender_flags.push(is_system_sender);
             sync_system_transaction_flags.push(is_system_tx(
                 transaction.signer(),
                 transaction.to(),
+                expected_l2_system_address,
                 EEZL2_ADDRESS,
             ));
         }
@@ -134,6 +136,7 @@ struct PreparedSettlingBlock {
 pub(crate) struct Backend {
     chain_spec: Arc<ChainSpec>,
     evm_config: EthEvmConfig,
+    expected_l2_system_address: Address,
 }
 
 impl Backend {
@@ -142,7 +145,15 @@ impl Backend {
         self.chain_spec.chain().id()
     }
 
-    pub(super) fn from_chain_document_file(path: &Path) -> eyre::Result<Self> {
+    /// Deployment address used to classify privileged L2 transactions.
+    pub(super) const fn expected_l2_system_address(&self) -> Address {
+        self.expected_l2_system_address
+    }
+
+    pub(super) fn from_chain_document_file(
+        path: &Path,
+        expected_l2_system_address: Address,
+    ) -> eyre::Result<Self> {
         let (genesis, document_kind) = load_chain_document(path)?;
         let chain_config = &genesis.config;
         let genesis_timestamp =
@@ -158,23 +169,27 @@ impl Backend {
             ?genesis_timestamp,
             "stateless chain configuration details",
         );
-        Ok(Self::from_genesis(genesis))
+        Ok(Self::from_genesis(genesis, expected_l2_system_address))
     }
 
     #[cfg(test)]
-    pub(super) fn new(chain_config: ChainConfig) -> Self {
-        Self::from_genesis(Genesis {
-            config: chain_config,
-            ..Default::default()
-        })
+    pub(super) fn new(chain_config: ChainConfig, expected_l2_system_address: Address) -> Self {
+        Self::from_genesis(
+            Genesis {
+                config: chain_config,
+                ..Default::default()
+            },
+            expected_l2_system_address,
+        )
     }
 
-    fn from_genesis(genesis: Genesis) -> Self {
+    fn from_genesis(genesis: Genesis, expected_l2_system_address: Address) -> Self {
         let chain_spec = Arc::new(ChainSpec::from_genesis(genesis));
         let evm_config = EthEvmConfig::new(Arc::clone(&chain_spec));
         Self {
             chain_spec,
             evm_config,
+            expected_l2_system_address,
         }
     }
 
@@ -213,6 +228,7 @@ impl Backend {
                 let (checkpoint_plan, system_sender_flags) = CheckpointPlan::from_recovered_block(
                     &recovered_block,
                     max_transaction_state_checkpoints,
+                    self.expected_l2_system_address,
                 )?;
                 Ok(PreparedSettlingBlock {
                     block: recovered_block,
@@ -241,7 +257,8 @@ impl Backend {
                 )
             } else {
                 let recovered_block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
-                let system_sender_flags = system_sender_flags(&recovered_block);
+                let system_sender_flags =
+                    system_sender_flags(&recovered_block, self.expected_l2_system_address);
                 (recovered_block, None, system_sender_flags)
             };
             let block_number = recovered_block.header().number;
@@ -402,10 +419,13 @@ fn map_stateless_error(block_number: u64, error: StatelessValidationError) -> Va
 }
 
 /// Classify each locally recovered signer for later settlement policy.
-fn system_sender_flags(block: &RecoveredBlock<Block>) -> Vec<bool> {
+fn system_sender_flags(
+    block: &RecoveredBlock<Block>,
+    expected_l2_system_address: Address,
+) -> Vec<bool> {
     block
         .transactions_recovered()
-        .map(|transaction| transaction.signer() == SYSTEM_ADDRESS)
+        .map(|transaction| transaction.signer() == expected_l2_system_address)
         .collect()
 }
 

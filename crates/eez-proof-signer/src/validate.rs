@@ -392,13 +392,26 @@ pub(crate) enum Validator {
 impl Validator {
     /// Construct the production backend from the operator-configured execution
     /// rules. Composer never supplies this trust input.
-    pub(crate) fn stateless(chain_document_path: &Path) -> eyre::Result<Self> {
-        stateless::Backend::from_chain_document_file(chain_document_path).map(Self::Stateless)
+    pub(crate) fn stateless(
+        chain_document_path: &Path,
+        expected_l2_system_address: alloy_primitives::Address,
+    ) -> eyre::Result<Self> {
+        stateless::Backend::from_chain_document_file(
+            chain_document_path,
+            expected_l2_system_address,
+        )
+        .map(Self::Stateless)
     }
 
     #[cfg(test)]
-    pub(crate) fn stateless_for_test(chain_config: alloy_genesis::ChainConfig) -> Self {
-        Self::Stateless(stateless::Backend::new(chain_config))
+    pub(crate) fn stateless_for_test(
+        chain_config: alloy_genesis::ChainConfig,
+        expected_l2_system_address: alloy_primitives::Address,
+    ) -> Self {
+        Self::Stateless(stateless::Backend::new(
+            chain_config,
+            expected_l2_system_address,
+        ))
     }
 
     /// Static, non-sensitive identifier for startup logs.
@@ -416,6 +429,15 @@ impl Validator {
             Self::Stateless(backend) => backend.chain_id(),
             #[cfg(test)]
             Self::Stub(_) => 1,
+        }
+    }
+
+    /// Deployment address used by this backend to classify system transactions.
+    pub(crate) fn expected_l2_system_address(&self) -> alloy_primitives::Address {
+        match self {
+            Self::Stateless(backend) => backend.expected_l2_system_address(),
+            #[cfg(test)]
+            Self::Stub(backend) => backend.expected_l2_system_address,
         }
     }
 

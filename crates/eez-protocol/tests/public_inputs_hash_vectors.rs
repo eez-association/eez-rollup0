@@ -14,11 +14,23 @@ use eez_protocol::public_inputs::{all_per_ps_hashes, entry_hash, shared_public_i
 use eez_protocol::{ProofPlan, RollupId, RollupProofAssignment};
 use serde::Deserialize;
 
+const EXPECTED_PROTOCOL_COMMIT: &str = "f6226f569e9b4534d42eecf5d2e3dd6c649bc6aa";
+const EXPECTED_SOLIDITY_ORACLE: &str = "contracts/test/PublicInputsHashVectors.t.sol";
+
 sol! {
     struct CustomDataHashInput {
         uint64 rollupId;
         bytes customData;
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Fixture {
+    schema_version: u64,
+    protocol_commit: String,
+    solidity_oracle: String,
+    vectors: Vec<Vector>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,7 +83,17 @@ fn load_vectors() -> Vec<Vector> {
         .join("tests/fixtures/public_inputs_hash_vectors.json");
     let raw = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-    serde_json::from_str(&raw).expect("valid public-input vector fixture")
+    let fixture: Fixture = serde_json::from_str(&raw).expect("valid public-input vector fixture");
+    assert_eq!(fixture.schema_version, 1, "fixture schema version");
+    assert_eq!(
+        fixture.protocol_commit, EXPECTED_PROTOCOL_COMMIT,
+        "fixture protocol commit"
+    );
+    assert_eq!(
+        fixture.solidity_oracle, EXPECTED_SOLIDITY_ORACLE,
+        "fixture Solidity oracle"
+    );
+    fixture.vectors
 }
 
 fn proof_system_address(index: usize) -> Address {

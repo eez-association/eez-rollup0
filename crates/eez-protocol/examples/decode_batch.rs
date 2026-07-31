@@ -177,10 +177,9 @@ fn main() {
                     .map(|t| alloy_primitives::Bytes::from(t.clone())),
             )
             .collect();
-        // The dev SYSTEM_ADDRESS key used on this devnet is the anvil index-0 key
-        // unless overridden; we only need the SHAPE + nonce, so any key gives the
-        // structure. Print BOTH the nonce assignment and the load-tx calldata
-        // (which is key-INDEPENDENT).
+        // This diagnostic only needs the transaction shape and nonce assignment,
+        // so an arbitrary example key is sufficient. The printed load calldata is
+        // independent of that key.
         let cfg = SystemTxContext {
             system_signer: PrivateKeySigner::from_bytes(&alloy_primitives::B256::with_last_byte(1))
                 .unwrap(),

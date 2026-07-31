@@ -17,14 +17,15 @@ use eez_protocol::entries::{
 };
 use eez_protocol::public_inputs::public_inputs_hashes;
 use eez_protocol::{
-    CallHashInput, CallMode, EntryRollingHash, RollupId, SYSTEM_ADDRESS,
-    common_cross_chain_call_hash, l2_mutable_outbound_call_hash,
+    CallHashInput, CallMode, EntryRollingHash, RollupId, common_cross_chain_call_hash,
+    l2_mutable_outbound_call_hash,
 };
 use reth_ethereum_primitives::{BlockBody, TransactionSigned};
 use reth_primitives_traits::{BlockBody as _, SignerRecoverable as _};
 
 use crate::testkit::{
-    SYSTEM_PRIVATE_KEY, SYSTEM_TX, checkpoint, system_transaction_context, test_proof_system_vkey,
+    SYSTEM_PRIVATE_KEY, SYSTEM_TX, TEST_SYSTEM_ADDRESS, checkpoint, system_transaction_context,
+    test_proof_system_vkey,
 };
 use crate::validate::{OutboundEventObservation, SettlementBlockEvidence, ValidatedBlock};
 
@@ -45,7 +46,7 @@ use super::{
 const EXPECTED_PROOF_SYSTEM: Address = address!("00000000000000000000000000000000000000aa");
 
 fn system_transactions() -> super::SystemTransactionReconstructor {
-    SystemTransactionKey::new(SYSTEM_PRIVATE_KEY)
+    SystemTransactionKey::new(SYSTEM_PRIVATE_KEY, TEST_SYSTEM_ADDRESS)
         .unwrap()
         .into_reconstructor(1, NonZeroU64::new(1).unwrap())
 }
@@ -79,7 +80,7 @@ fn verify_anchor_only_da_payload<'a>(
 }
 
 // Fixed signed transaction fixtures. All except `USER_INBOUND_SELECTOR_TX`
-// use the well-known Anvil key whose address is `eez_protocol::SYSTEM_ADDRESS`.
+// use the deterministic system identity in `testkit`.
 // Transaction classification is derived from these bytes; no signer is
 // injected.
 const EIP1559_SYSTEM_TX: &str = "02f862018001018252089442000000000000000000000000000000000000078080c080a01a1ff6a847a249f83cde3536899f858e52db7ab221c7d452d1164a484859f3f3a02c507280e556114e9c646082a07a51c58d23338ff511d18c5805d90ddba8d196";
@@ -330,7 +331,7 @@ fn verify_inbound_effect_entries<'settling>(
 fn authorize_outbound_effects(
     bound_effects: &BoundEffectSequence<'_, '_>,
 ) -> Result<AuthorizedOutboundEffects, OutboundEffectError> {
-    authorize_outbound_effects_for_rollup(bound_effects, expected_rollup_id())
+    authorize_outbound_effects_for_rollup(bound_effects, expected_rollup_id(), TEST_SYSTEM_ADDRESS)
 }
 
 fn l2_to_l1_call() -> L2ToL1CallSol {

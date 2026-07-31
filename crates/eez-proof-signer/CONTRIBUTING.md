@@ -77,7 +77,7 @@ algorithms, including:
 
 - `eez_protocol::entries::{decode_postbatch, encode_postbatch}`;
 - `eez_protocol::public_inputs::public_inputs_hashes`;
-- `eez_protocol::{common_cross_chain_call_hash, EcdsaProofSigner, SYSTEM_ADDRESS}`;
+- `eez_protocol::{common_cross_chain_call_hash, EcdsaProofSigner}`;
 - `eez_protocol::settlement::pair_end_positions`;
 - `eez_protocol::system_tx::{build_cross_chain_sync_pairs,
   interleave_sync_block_txs}`; and

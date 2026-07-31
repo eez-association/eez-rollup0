@@ -174,13 +174,14 @@ pub fn sync_block_pair_roots<P>(
     timestamp: u64,
     suggested_fee_recipient: Address,
     sync_txs: &[Bytes],
+    system_address: Address,
     ccm_l2_address: Address,
 ) -> Result<Vec<B256>, BuildError>
 where
     P: StateProviderFactory,
 {
-    // Per-tx SYSTEM flags — must match the prover's `system_tx_flags_from_rlp`
-    // (signer == SYSTEM_ADDRESS && to == CCM-L2) so pair-ends agree on both sides.
+    // Per-tx system flags must match the proof signer's classification so
+    // pair-end positions agree on both sides.
     let flags: Vec<bool> = sync_txs
         .iter()
         .map(|raw| {
@@ -188,8 +189,9 @@ where
                 return false;
             };
             let to = tx.to();
-            tx.recover_signer()
-                .is_ok_and(|s| eez_protocol::settlement::is_system_tx(s, to, ccm_l2_address))
+            tx.recover_signer().is_ok_and(|signer| {
+                eez_protocol::settlement::is_system_tx(signer, to, system_address, ccm_l2_address)
+            })
         })
         .collect();
 

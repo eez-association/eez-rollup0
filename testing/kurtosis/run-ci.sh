@@ -74,7 +74,7 @@ write_result() {
                 remote_attestations: $remote_attestations
             }
         } + if $result == "pass" then {
-            modes: ["inbound", "outbound", "mixed"],
+            modes: ["inbound", "outbound", "mixed", "mixed-pure"],
             cross_chain_convergence: "pass",
             l1_l2_root_divergence: 0,
             safe_head_convergence: "pass"
@@ -168,6 +168,8 @@ done
     exit 1
 }
 
+L2="$l2" bash "$HERE/scripts/verify-eezl2-deployment.sh"
+
 while (( SECONDS < deadline )); do
     node_logs="$(timeout 10s kurtosis service logs "$KURTOSIS_ENCLAVE" eez-node 2>/dev/null || true)"
     if grep -qE 'bundle outcome observed.*Included' <<<"$node_logs"; then
@@ -197,7 +199,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         echo "- Node image: \`$EEZ_NODE_IMAGE\`"
         echo "- Proof-signer image: \`$EEZ_PROOF_SIGNER_IMAGE\`"
         echo "- Deploy image: \`$EEZ_DEPLOY_IMAGE\`"
-        echo "- Inbound, outbound, and mixed waves: pass"
+        echo "- Inbound, outbound, mixed, and mixed-pure waves: pass"
         echo "- Signed windows observed: $signed_window_count"
         echo "- Remote attestations observed: $remote_attestation_count"
         echo "- L1/L2 root divergence: 0"

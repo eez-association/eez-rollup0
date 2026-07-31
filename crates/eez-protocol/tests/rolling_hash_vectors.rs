@@ -10,9 +10,15 @@ use alloy_primitives::{B256, b256};
 use eez_protocol::rolling_hash::{EntryRollingHash, StaticCallRollingHash};
 use serde::Deserialize;
 
+const EXPECTED_PROTOCOL_COMMIT: &str = "f6226f569e9b4534d42eecf5d2e3dd6c649bc6aa";
+const EXPECTED_SOLIDITY_ORACLE: &str = "contracts/test/RollingHashVectors.t.sol";
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Vectors {
+    schema_version: u64,
+    protocol_commit: String,
+    solidity_oracle: String,
     l1_seed: String,
     l2_seed: String,
     after_call_begin: String,
@@ -29,7 +35,17 @@ fn load_vectors() -> Vectors {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rolling_hash_vectors.json");
     let raw = fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-    serde_json::from_str(&raw).expect("valid rolling-hash vector fixture")
+    let vectors: Vectors = serde_json::from_str(&raw).expect("valid rolling-hash vector fixture");
+    assert_eq!(vectors.schema_version, 1, "fixture schema version");
+    assert_eq!(
+        vectors.protocol_commit, EXPECTED_PROTOCOL_COMMIT,
+        "fixture protocol commit"
+    );
+    assert_eq!(
+        vectors.solidity_oracle, EXPECTED_SOLIDITY_ORACLE,
+        "fixture Solidity oracle"
+    );
+    vectors
 }
 
 fn parse_hash(value: &str) -> B256 {

@@ -1726,6 +1726,7 @@ where
             timestamp,
             suggested_fee_recipient,
             &sync_txs,
+            ctx.system_signer.address(),
             ctx.ccm_l2_address,
         ) {
             Ok(r) => r,

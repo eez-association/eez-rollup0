@@ -3,15 +3,18 @@
 
 use alloy_primitives::Address;
 
-use crate::SYSTEM_ADDRESS;
-
-/// A sync-block tx is a SYSTEM tx iff signed by [`SYSTEM_ADDRESS`] and targeting
-/// the CCM-L2 predeploy. The proof signer derives per-tx flags this way (from the
-/// block RLP); the composer must match it EXACTLY so pair-end positions — and
-/// thus the per-effect settlement roots — agree on both sides.
+/// A sync-block transaction is a system transaction iff its recovered signer
+/// matches the deployment's system address and it targets the CCM-L2 predeploy.
+/// The proof signer and composer must use the same deployment values so their
+/// pair-end positions, and therefore per-effect settlement roots, agree.
 #[must_use]
-pub fn is_system_tx(signer: Address, to: Option<Address>, ccm_l2_address: Address) -> bool {
-    signer == SYSTEM_ADDRESS && to == Some(ccm_l2_address)
+pub fn is_system_tx(
+    signer: Address,
+    to: Option<Address>,
+    expected_system_address: Address,
+    ccm_l2_address: Address,
+) -> bool {
+    signer == expected_system_address && to == Some(ccm_l2_address)
 }
 
 /// Pair-end tx positions in a sync block — one per settled cross-chain effect,
@@ -29,7 +32,34 @@ pub fn pair_end_positions(is_system: &[bool]) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::pair_end_positions;
+    use alloy_primitives::address;
+
+    use super::{is_system_tx, pair_end_positions};
+
+    #[test]
+    fn system_transaction_identity_uses_deployment_addresses() {
+        let system_address = address!("1111111111111111111111111111111111111111");
+        let ccm_l2_address = address!("2222222222222222222222222222222222222222");
+
+        assert!(is_system_tx(
+            system_address,
+            Some(ccm_l2_address),
+            system_address,
+            ccm_l2_address,
+        ));
+        assert!(!is_system_tx(
+            address!("3333333333333333333333333333333333333333"),
+            Some(ccm_l2_address),
+            system_address,
+            ccm_l2_address,
+        ));
+        assert!(!is_system_tx(
+            system_address,
+            Some(address!("4444444444444444444444444444444444444444")),
+            system_address,
+            ccm_l2_address,
+        ));
+    }
 
     /// A pair ends at every user (non-system) tx, at a system tx followed by a
     /// system tx, and at the last tx regardless. A system tx followed by a user

@@ -73,9 +73,16 @@ jobs:
           submodules: recursive
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
+        with:
+          version: v1.7.1
       - name: Build and test contracts
         working-directory: contracts
         run: forge test
+      - name: Test canonical CREATE2 proxy derivation
+        working-directory: sync-rollups-protocol
+        run: |
+          forge test --match-path test/EEZ.t.sol --match-test test_ComputeCrossChainProxyAddress
+          forge test --match-path test/EEZL2.t.sol --match-test test_ComputeCrossChainProxyAddress_MatchesActual
 
   embedded-e2e:
     name: Embedded E2E Tests
@@ -89,6 +96,8 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
+        with:
+          version: v1.7.1
       - name: Install nextest
         uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2
         with:
@@ -117,6 +126,8 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
+        with:
+          version: v1.7.1
       - name: Install nextest
         uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2
         with:
