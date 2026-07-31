@@ -4,12 +4,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
-    default_enclave="eez-pr-$GITHUB_RUN_ID-${GITHUB_RUN_ATTEMPT:-1}"
-else
-    default_enclave="eez-local-$(date +%s)-$$"
-fi
-export KURTOSIS_ENCLAVE="${KURTOSIS_ENCLAVE:-$default_enclave}"
+export KURTOSIS_ENCLAVE="${KURTOSIS_ENCLAVE:-eez-ci}"
 export KURTOSIS_BUILDER_SERVICE="${KURTOSIS_BUILDER_SERVICE:-el-2-reth-builder-lighthouse}"
 export KURTOSIS_PRIVILEGED=0
 
@@ -19,23 +14,29 @@ export EEZ_CI_RESULT_DIR="$RESULT_DIR"
 
 ARGS_TEMPLATE="${KURTOSIS_ARGS_FILE:-$HERE/ci-args.yaml}"
 export EEZ_NODE_IMAGE="${EEZ_NODE_IMAGE:-eez-node:ci-${GITHUB_SHA:-local}}"
+export EEZ_PROVER_IMAGE="${EEZ_PROVER_IMAGE:-eez-proverd:ci-${GITHUB_SHA:-local}}"
 export EEZ_DEPLOY_IMAGE="${EEZ_DEPLOY_IMAGE:-eez-deploy:ci-${GITHUB_SHA:-local}}"
 export KURTOSIS_ARGS_FILE="$RESULT_DIR/ci-args.yaml"
 sed \
     -e "s|^[[:space:]]*eez_node_image:.*|  eez_node_image: $EEZ_NODE_IMAGE|" \
+    -e "s|^[[:space:]]*prover_image:.*|  prover_image: $EEZ_PROVER_IMAGE|" \
     -e "s|^[[:space:]]*deploy_image:.*|  deploy_image: $EEZ_DEPLOY_IMAGE|" \
     "$ARGS_TEMPLATE" >"$KURTOSIS_ARGS_FILE"
 
 cleanup() {
     status=$?
     kurtosis enclave inspect "$KURTOSIS_ENCLAVE" >"$RESULT_DIR/enclave.txt" 2>&1 || true
-    for service in eez-node "$KURTOSIS_BUILDER_SERVICE" mev-relay-api; do
+    for service in eez-node eez-prover "$KURTOSIS_BUILDER_SERVICE" mev-relay-api; do
         kurtosis service logs "$KURTOSIS_ENCLAVE" "$service" \
             >"$RESULT_DIR/$service.log" 2>&1 || true
     done
     if (( status != 0 )); then
         echo "==> candidate node log tail (failure diagnostics)" >&2
         tail -n 200 "$RESULT_DIR/eez-node.log" >&2 || true
+        # A rejected window or a dead validator only shows up here; without it
+        # a proving failure reads as an unexplained bundle-inclusion timeout.
+        echo "==> prover log tail (failure diagnostics)" >&2
+        tail -n 100 "$RESULT_DIR/eez-prover.log" >&2 || true
     fi
     bash "$HERE/stop.sh" || true
     exit "$status"

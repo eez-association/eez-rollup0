@@ -2,8 +2,10 @@
 
 This package is the pull-request gate for changes that affect composition,
 sequencing, proving, settlement, or cross-chain execution. It runs the candidate
-`eez-node` image against a private PoS L1, rbuilder, relay, proposer, and
-embedded-L1 follower.
+`eez-node` image against a private PoS L1, rbuilder, relay, proposer,
+embedded-L1 follower, and a separate `eez-proverd` with native validation.
+The package explicitly deploys `EEZ_PROOF_SYSTEM=real`; the shared deployment
+script continues to default to the in-process mock proof system elsewhere.
 
 The PR topology has one validator pair and omits load generation, reorg tooling,
 and observability services. Larger topologies belong in scheduled soak tests.
@@ -13,12 +15,12 @@ and observability services. Larger topologies belong in scheduled soak tests.
 `run-ci.sh` owns the lifecycle:
 
 1. Render `ci-args.yaml` with commit-specific candidate image tags.
-2. Build the node and deployment images.
-3. Start the reduced network and wait for a settled bundle inclusion.
+2. Build the node, prover, and deployment images.
+3. Start the reduced network and wait for a bundle inclusion.
 4. Run the single cross-chain wave harness in `inbound`, `outbound`, and
    `mixed` modes.
-5. Check convergence, settlement, L1/L2 state roots, and the L2 safe head in
-   each mode.
+5. In each mode, check prover re-execution and composer acceptance, convergence,
+   settlement, L1/L2 state roots, and the L2 safe head.
 6. Save a JSON result and service logs, then remove the enclave.
 
 The workflow runs this package for relevant pull requests on a GitHub-hosted
@@ -36,9 +38,10 @@ bash testing/kurtosis/run-ci.sh
 
 Useful overrides:
 
-- `KURTOSIS_ENCLAVE`: enclave name.
-- `EEZ_NODE_IMAGE`, `EEZ_DEPLOY_IMAGE`: candidate image tags.
-- `EEZ_SKIP_NODE_BUILD=1`, `EEZ_SKIP_DEPLOY_BUILD=1`: reuse images.
+- `KURTOSIS_ENCLAVE`: enclave name (default `eez-ci`).
+- `EEZ_NODE_IMAGE`, `EEZ_PROVER_IMAGE`, `EEZ_DEPLOY_IMAGE`: candidate image tags.
+- `EEZ_SKIP_NODE_BUILD=1`, `EEZ_SKIP_PROVER_BUILD=1`,
+  `EEZ_SKIP_DEPLOY_BUILD=1`: reuse images.
 - `EEZ_CI_RESULT_DIR`: result and diagnostic directory.
 - `EEZ_CI_READY_TIMEOUT_SECS`: RPC readiness timeout.
 

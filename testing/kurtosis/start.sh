@@ -39,9 +39,17 @@ yv() { grep -E "^[[:space:]]*$1:" "$ARGS_FILE" | head -1 \
         | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//'; }
 
 NODE_IMAGE="$(yv eez_node_image)";  NODE_IMAGE="${NODE_IMAGE:-eez-node:dev}"
+PROVER_IMAGE="$(yv prover_image)";  PROVER_IMAGE="${PROVER_IMAGE:-eez-proverd:dev}"
 DEPLOY_IMAGE="$(yv deploy_image)";  DEPLOY_IMAGE="${DEPLOY_IMAGE:-eez-deploy:dev}"
 
 export DOCKER_BUILDKIT=1
+
+reclaim_ci_builder_cache() {
+    if [[ "${GITHUB_ACTIONS:-false}" == "true" ]]; then
+        echo "==> reclaiming unused BuildKit cache on the ephemeral CI runner"
+        docker builder prune --force
+    fi
+}
 
 if [[ "${EEZ_SKIP_NODE_BUILD:-0}" != "1" ]]; then
     echo "==> building $NODE_IMAGE (fast CI profile)"
@@ -55,6 +63,15 @@ if [[ "${EEZ_SKIP_NODE_BUILD:-0}" != "1" ]]; then
         )
     fi
     docker build "${node_build_args[@]}" -t "$NODE_IMAGE" "$REPO"
+    reclaim_ci_builder_cache
+fi
+
+if [[ "${EEZ_SKIP_PROVER_BUILD:-0}" != "1" ]]; then
+    echo "==> building $PROVER_IMAGE (prover + native validator)"
+    docker build -f "$REPO/Dockerfile.proverd" -t "$PROVER_IMAGE" "$REPO"
+    reclaim_ci_builder_cache
+else
+    echo "==> reusing $PROVER_IMAGE (EEZ_SKIP_PROVER_BUILD=1)"
 fi
 
 if [[ "${EEZ_SKIP_DEPLOY_BUILD:-0}" != "1" ]]; then
@@ -63,6 +80,11 @@ if [[ "${EEZ_SKIP_DEPLOY_BUILD:-0}" != "1" ]]; then
 else
     echo "==> reusing $DEPLOY_IMAGE (EEZ_SKIP_DEPLOY_BUILD=1)"
 fi
+
+# The CI enclave name is stable. Remove a stale copy left by an interrupted
+# previous run before creating the replacement.
+echo "==> removing any stale enclave named '$ENCLAVE'"
+kurtosis enclave rm -f "$ENCLAVE" >/dev/null 2>&1 || true
 
 echo "==> kurtosis run (enclave: $ENCLAVE)"
 kurtosis_flags=()
@@ -76,7 +98,8 @@ cat <<EOF
 ════════════════════════════════════════
   EEZ CI test network is up.
 ════════════════════════════════════════
-Inspect  : kurtosis enclave inspect $ENCLAVE
-Node log : kurtosis service logs -f $ENCLAVE eez-node
-Tear down: bash testing/kurtosis/stop.sh
+Inspect   : kurtosis enclave inspect $ENCLAVE
+Node log  : kurtosis service logs -f $ENCLAVE eez-node
+Prover log: kurtosis service logs -f $ENCLAVE eez-prover
+Tear down : bash testing/kurtosis/stop.sh
 EOF

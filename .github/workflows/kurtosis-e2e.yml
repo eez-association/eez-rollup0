@@ -16,10 +16,11 @@ jobs:
   kurtosis-e2e:
     name: Kurtosis E2E
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
     env:
-      KURTOSIS_ENCLAVE: eez-pr-${{ github.run_id }}-${{ github.run_attempt }}
+      KURTOSIS_ENCLAVE: eez-ci
       EEZ_NODE_IMAGE: eez-node:ci-${{ github.sha }}
+      EEZ_PROVER_IMAGE: eez-proverd:ci-${{ github.sha }}
       EEZ_DEPLOY_IMAGE: eez-deploy:ci-${{ github.sha }}
       EEZ_CI_RESULT_DIR: ${{ github.workspace }}/artifacts/kurtosis-e2e
     steps:
@@ -51,4 +52,4 @@ jobs:
           retention-days: 7
       - name: Remove candidate images
         if: always()
-        run: docker image rm "$EEZ_NODE_IMAGE" "$EEZ_DEPLOY_IMAGE" || true
+        run: docker image rm "$EEZ_NODE_IMAGE" "$EEZ_PROVER_IMAGE" "$EEZ_DEPLOY_IMAGE" || true

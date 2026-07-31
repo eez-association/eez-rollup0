@@ -39,6 +39,7 @@ _http() { case "$1" in http*) echo "$1";; "") echo "";; *) echo "http://$1";; es
     || { echo "could not resolve enclave ports — is '$ENCLAVE' up? (kurtosis enclave inspect $ENCLAVE)"; exit 1; }
 
 NODE_LOG="${EEZ_NODE_LOG:-$LOG_DIR/wave-$MODE-node.log}"
+PROVER_LOG="${EEZ_PROVER_LOG:-$LOG_DIR/wave-$MODE-prover.log}"
 DEPLOY_DIR="$(mktemp -d /tmp/eez-deployments.XXXXXX)"
 trap 'rm -rf "$DEPLOY_DIR"' EXIT
 
@@ -243,6 +244,7 @@ FILLER_PER_GAP="${EEZ_FILLER_PER_GAP:-2}"
 PURE_RECIPIENT=0x2222222222222222222222222222222222222222
 
 refresh_node_log() { kurtosis service logs "$ENCLAVE" eez-node >"$NODE_LOG" 2>&1 || true; }
+refresh_prover_log() { kurtosis service logs "$ENCLAVE" eez-prover >"$PROVER_LOG" 2>&1 || true; }
 strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
 
 # receipt_status <hash> <rpc> → "1" mined-ok, "0x0" reverted, "missing"
@@ -458,7 +460,7 @@ run_waves() {
     # ── Assertions ──────────────────────────────────────────────────────
     echo
     echo "==> assertions"
-    local ok_all=1
+    local ok_all=1 prover_ok=0 prover_hash=""
 
     check_eq() { # <label> <actual> <expected>
         if [[ "$2" == "$3" && -n "$3" ]]; then
@@ -558,13 +560,32 @@ run_waves() {
     DROPS=$(grep -c "bundle dropped" "$NODE_LOG" 2>/dev/null || true); DROPS=${DROPS:-0}
     echo "    ℹ dropped-bundle log lines: $DROPS"
 
+    # ── Prover verification ─────────────────────────────────────────────
+    local prover_line=""
+    # Both logs carry tracing ANSI codes around fields, so strip them first.
+    refresh_node_log
+    refresh_prover_log
+    prover_hash=$(strip_ansi <"$NODE_LOG" | grep 'remote prover attested the window' \
+        | grep -oE 'hash=0x[0-9a-fA-F]{64}' | tail -1 | cut -d= -f2 || true)
+    if [[ -n "$prover_hash" ]]; then
+        prover_line=$(strip_ansi <"$PROVER_LOG" \
+            | grep -F "public_inputs_hash=$prover_hash" | tail -1 || true)
+    fi
+    if [[ "$prover_line" == *"window re-executed + gated + signed"* ]]; then
+        prover_ok=1
+    fi
+
     echo
     if (( ok_all )); then
         echo "==> WAVE TEST PASSED (mode=$MODE waves=$WAVES, $total cross-chain ops, $PB_COUNT PBs)"
-        exit 0
     else
         echo "==> WAVE TEST FAILED (mode=$MODE)"
-        exit 1
     fi
+    if (( prover_ok )); then
+        echo "==> PROVER TEST PASSED (publicInputsHash=$prover_hash)"
+    else
+        echo "==> PROVER TEST FAILED (no matching prover and composer attestation)"
+    fi
+    (( ok_all && prover_ok ))
 }
 run_waves

@@ -28,15 +28,17 @@ ethereum_package:
 
 eez:
   eez_node_image: eez-node:ci
+  prover_image: eez-proverd:ci
   deploy_image: eez-deploy:ci
   follower_image: sigp/lighthouse:v8.1.2
 
   # Deterministic private-network keys only; never use these on a public chain.
   poster_key: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
   proof_signer_key: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+  attester_address: "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
   l1_block_time_ms: 12000
   l2_block_time_ms: 2000
-  proof_time_ms: 1000
+  proof_time_ms: 5000
   submission_slack_ms: 500
   max_speculative_depth: 0
 

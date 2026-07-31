@@ -10,6 +10,7 @@ L2_ENGINE_PORT = 18684
 L2_P2P_PORT = 30640
 L1_XCHAIN_PORT = 18999
 L2_XCHAIN_PORT = 18998
+PROVER_GRPC_PORT = 50061
 BUILDER_FLASHBOTS_RPC_PORT = 8645
 
 # L2 genesis state root for genesis.json. Recompute if genesis alloc changes.
@@ -22,8 +23,12 @@ def run(plan, args):
 
     poster_key = eez.get("poster_key", "")
     proof_signer_key = eez.get("proof_signer_key", "")
-    if poster_key in ["", "0xCHANGE_ME"] or proof_signer_key in ["", "0xCHANGE_ME"]:
-        fail("set eez.poster_key and eez.proof_signer_key in the args file " +
+    attester_address = eez.get("attester_address", "")
+    ccm_l2_address = eez.get("ccm_l2_address", "0x4200000000000000000000000000000000000007")
+    if (poster_key in ["", "0xCHANGE_ME"] or
+        proof_signer_key in ["", "0xCHANGE_ME"] or
+        attester_address in ["", "0xCHANGE_ME"]):
+        fail("set eez.poster_key, eez.proof_signer_key, and eez.attester_address in the args file " +
              "(set deterministic test keys in the CI args file)")
 
     # Pair B: canonical L1, validators, and MEV stack.
@@ -68,12 +73,17 @@ def run(plan, args):
         env_vars = {
             "EEZ_L1_RPC_URL": l1_el.rpc_http_url,
             "EEZ_L1_POSTER_KEY": poster_key,
+            # deploy.sh derives the ECDSAProofSystem attester from this key;
+            # it must be the key eez-prover signs with (== attester_address).
             "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
+            # deploy.sh defaults to the in-process mock proof system. This
+            # topology runs eez-proverd, so deploy the public-input-bound PS.
+            "EEZ_PROOF_SYSTEM": "real",
             "EEZ_DEPLOYMENTS_FILE": "/out/deployments.env",
             "EEZ_GENESIS_OUT": "/out/l2-genesis.json",
             "EEZ_INITIAL_STATE_ROOT": L2_GENESIS_STATE_ROOT,
         },
-        run = "mkdir -p /out && bash /repo/scripts/deploy.sh",
+        run = "mkdir -p /out && bash /repo/scripts/deploy.sh && jq -e .config /out/l2-genesis.json > /out/l2-chainconfig.json",
         store = [StoreSpec(src = "/out", name = "eez-deployments")],
         wait = "900s",
     )
@@ -97,7 +107,11 @@ def run(plan, args):
         "EEZ_SUBMISSION_SLACK_MS": str(eez.get("submission_slack_ms", 2500)),
         "EEZ_MAX_SPECULATIVE_DEPTH": str(eez.get("max_speculative_depth", 0)),
         "EEZ_L1_POSTER_KEY": poster_key,
-        "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
+        "EEZ_PROVER_URL": "http://eez-prover:{}".format(PROVER_GRPC_PORT),
+        "EEZ_ATTESTER_ADDRESS": attester_address,
+        # Remote-prover mode captures a witness per committed block. Pin the
+        # store next to the L2 datadir; the default is relative to cwd (/).
+        "EEZ_WITNESS_DB_PATH": "/data/witnesses",
         "EEZ_L2_DATADIR": "/data/l2",
         "EEZ_L2_HTTP_PORT": str(L2_RPC_PORT),
         "EEZ_L2_RPC_URL": "http://127.0.0.1:{}".format(L2_RPC_PORT),
@@ -107,7 +121,7 @@ def run(plan, args):
         "EEZ_L2_P2P_PORT": str(L2_P2P_PORT),
         "EEZ_L2_SYSTEM_KEY": eez.get("l2_system_key", "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"),
         "EEZ_L2_SYSTEM_ADDRESS": eez.get("l2_system_address", "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
-        "EEZ_CCM_L2_ADDRESS": eez.get("ccm_l2_address", "0x4200000000000000000000000000000000000007"),
+        "EEZ_CCM_L2_ADDRESS": ccm_l2_address,
     }
 
     node_cmd = " ".join([
@@ -126,6 +140,36 @@ def run(plan, args):
         "--discovery.v5.port=$((EEZ_L2_P2P_PORT+1))",
         "--ipcdisable --disable-discovery",
     ])
+
+    # Keep the attestation key in the prover. The composer sends each settlement
+    # window over gRPC and only accepts signatures from attester_address.
+    plan.add_service(
+        name = "eez-prover",
+        config = ServiceConfig(
+            image = eez.get("prover_image", "eez-proverd:dev"),
+            ports = {
+                "grpc": PortSpec(number = PROVER_GRPC_PORT, transport_protocol = "TCP"),
+            },
+            files = {
+                "/out": deploy.files_artifacts[0],
+            },
+            env_vars = {
+                "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
+                # Must equal the node's — it feeds the settlement gate's
+                # system-tx classification.
+                "EEZ_CCM_L2_ADDRESS": ccm_l2_address,
+                # Match the composer's configured prover wall-clock budget.
+                "EEZ_VALIDATOR_TIMEOUT_SECS": "5",
+                "RUST_LOG": "info,eez_proverd=info",
+            },
+            entrypoint = ["eez-proverd"],
+            cmd = [
+                "--listen-addr=0.0.0.0:{}".format(PROVER_GRPC_PORT),
+                "--validator-bin=/usr/local/bin/native-validate",
+                "--chain-config=/out/l2-chainconfig.json",
+            ],
+        ),
+    )
 
     # Follower beacon drives eez-node's embedded reth over the engine API.
     plan.add_service(
