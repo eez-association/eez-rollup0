@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "protocolCommit": "f6226f569e9b4534d42eecf5d2e3dd6c649bc6aa",
+  "protocolCommit": "6fcc90b65063831cb7797e9fa361004064d28f9f",
   "solidityOracle": "contracts/test/PublicInputsHashVectors.t.sol",
   "vectors": [
     {

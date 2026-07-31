@@ -204,7 +204,7 @@ sol! {
 
 #[cfg(test)]
 mod selector_locks {
-    //! ABI pins from `sync-rollups-protocol` commit f6226f5.
+    //! ABI pins from `sync-rollups-protocol` commit 6fcc90b.
     use super::*;
     use alloy_sol_types::SolCall;
 

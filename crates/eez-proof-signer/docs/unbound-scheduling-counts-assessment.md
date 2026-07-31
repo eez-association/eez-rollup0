@@ -4,7 +4,7 @@ Status: reviewed with the protocol owners; intentional dispatch policy
 
 ## Executive conclusion
 
-At protocol revision `f6226f569e9b4534d42eecf5d2e3dd6c649bc6aa`,
+At protocol revision `6fcc90b65063831cb7797e9fa361004064d28f9f`,
 `immediateEntryCount` and `immediateStaticEntryCount` are not included in the
 public-input hash. They can therefore be changed after a proof or ECDSA
 attestation has been created without invalidating that proof or signature.
@@ -190,7 +190,7 @@ of intended cross-entry atomicity.
 
 `postAndVerifyBatch` is permissionless; proofs provide authorization, and
 sender binding is optional
-([`CORE_PROTOCOL_SPEC.md:1403-1410`](../../../sync-rollups-protocol/docs/CORE_PROTOCOL_SPEC.md#L1403)).
+([`CORE_PROTOCOL_SPEC.md:1374-1384`](../../../sync-rollups-protocol/docs/CORE_PROTOCOL_SPEC.md#L1374)).
 
 The current Composer sets `bindMsgSenderInPublicInput = false`
 ([`composer.rs:2227-2234`](../../eez-composer/src/composer.rs#L2227)), and the
@@ -238,14 +238,14 @@ The omission is consistent across normative and explanatory sources:
   ([`MULTI_PROVER_SPEC.md:122-159`](../../../sync-rollups-protocol/docs/MULTI_PROVER_SPEC.md#L122)).
 - The execution-entry and lookup specifications describe the same unproven
   split
-  ([`EXECUTION_ENTRY_SPEC.md:335-349`](../../../sync-rollups-protocol/docs/EXECUTION_ENTRY_SPEC.md#L335),
-  [`LOOKUP_SPEC.md:268-273`](../../../sync-rollups-protocol/docs/LOOKUP_SPEC.md#L268)).
+  ([`EXECUTION_ENTRY_SPEC.md:273-289`](../../../sync-rollups-protocol/docs/EXECUTION_ENTRY_SPEC.md#L273),
+  [`STATIC_ENTRY.md:264-269`](../../../sync-rollups-protocol/docs/STATIC_ENTRY.md#L264)).
 - The security section calls the meta hook untrusted and allows it to consume
   partially or ignore the call
-  ([`CORE_PROTOCOL_SPEC.md:1395-1401`](../../../sync-rollups-protocol/docs/CORE_PROTOCOL_SPEC.md#L1395)).
+  ([`CORE_PROTOCOL_SPEC.md:1366-1372`](../../../sync-rollups-protocol/docs/CORE_PROTOCOL_SPEC.md#L1366)).
 - The same document classifies discarding unconsumed-but-proved entries as a
   liveness choice, not a safety violation
-  ([`CORE_PROTOCOL_SPEC.md:1359-1367`](../../../sync-rollups-protocol/docs/CORE_PROTOCOL_SPEC.md#L1359)).
+  ([`CORE_PROTOCOL_SPEC.md:1334-1338`](../../../sync-rollups-protocol/docs/CORE_PROTOCOL_SPEC.md#L1334)).
 
 Repository history reinforces that this was considered rather than merely
 overlooked. Commit `7c5db1b5` removed a comment that explicitly described an

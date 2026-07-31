@@ -5,9 +5,7 @@ use std::num::NonZeroU64;
 use alloy_primitives::{Address, B256, I256, U256};
 use eez_protocol::abi::ExecutionEntrySol;
 use eez_protocol::rolling_hash::EntryRollingHash;
-use eez_protocol::{
-    CallHashInput, CallMode, RollupId, common_cross_chain_call_hash, l2_outbound_call_hash,
-};
+use eez_protocol::{CallHashInput, CallMode, RollupId, l2_outbound_call_hash};
 use thiserror::Error;
 
 use super::effect_binding::{BoundEffect, BoundEffectSequence, EffectKind};
@@ -321,23 +319,14 @@ fn authorize_outbound_effect(
         });
     }
 
-    // L1 uses the common gas-free call identity in the rolling hash. This is
-    // deliberately distinct from the gas-aware L2 event hash checked above.
-    let l1_call_hash = common_cross_chain_call_hash(CallHashInput {
-        call_mode: CallMode::Mutable,
-        source_address: call.sourceAddress,
-        source_rollup_id: RollupId(call.sourceRollupId),
-        target_address: call.targetAddress,
-        target_rollup_id: RollupId::MAINNET,
-        value: call.value,
-        data: &call.data,
-    });
+    // With the supported zero-callGas profile, the event hash is also the
+    // call identity committed by the L1 entry rolling hash.
     let update = effect.claimed_state_update();
     let mut rolling_hash = EntryRollingHash::seed_for_l1(
         [(update.rollupId, update.currentState)],
         entry.proxyEntryHash,
     );
-    rolling_hash.call_begin(l1_call_hash);
+    rolling_hash.call_begin(recomputed_call_hash);
     rolling_hash.call_end(entry.success, &entry.returnData);
     let recomputed_rolling_hash = rolling_hash.current();
     if entry.rollingHash != recomputed_rolling_hash {

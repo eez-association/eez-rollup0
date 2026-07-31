@@ -21,12 +21,12 @@ contract CallHashVectorsTest is Test {
         bytes memory data = hex"010203";
 
         assertEq(
-            eez.computeCrossChainCallHash(false, source, 7, target, 1, 0, data),
-            0x0aea0f2282e747ca563ff59f9dbd36570e9973cfc007abfa51893d3fb9aaefdf
+            eez.computeCrossChainCallHash(false, source, 7, target, 1, 0, 0, data),
+            0x16b1575ff5a4ec44167aebf047dd46f77db3766f7481445ad09c8136bff735a8
         );
         assertEq(
-            eez.computeCrossChainCallHash(true, source, 7, target, 1, 0, data),
-            0xa03958bfe3866dabc6d8e5466965bdfe5f0368308af0d2069801e1562bcd35d0
+            eez.computeCrossChainCallHash(true, source, 7, target, 1, 0, 0, data),
+            0x4cf0f2738ced4dcd497cf8a081030f41c5dc588fbdcac75f3a217e979d19abe7
         );
         assertEq(
             eezL2.computeCrossChainCallHash(false, source, 1, target, 7, 1 ether, 0, data),
@@ -39,9 +39,9 @@ contract CallHashVectorsTest is Test {
 
         assertEq(
             eez.computeCrossChainCallHash(
-                false, source, type(uint64).max, target, type(uint64).max - 1, type(uint256).max, hex""
+                false, source, type(uint64).max, target, type(uint64).max - 1, type(uint256).max, 0, hex""
             ),
-            0xf149543f591e628d8247387fdf6780d6aee8c119258a34b348509695c202a1a1
+            0x414b9d6bf91a3e266bcd34ddd870a53332107a606b6eda618455f9f940291e2b
         );
         assertEq(
             eezL2.computeCrossChainCallHash(

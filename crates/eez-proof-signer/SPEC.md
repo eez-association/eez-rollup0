@@ -8,7 +8,7 @@ EEZ protocol.
 
 The protocol source used by this profile is the `sync-rollups-protocol`
 submodule at commit
-`f6226f569e9b4534d42eecf5d2e3dd6c649bc6aa`. Stateless execution uses
+`6fcc90b65063831cb7797e9fa361004064d28f9f`. Stateless execution uses
 `eez-association/stateless` at commit
 `4fc3806bdd0e6b296c761ef4d4b260938365cf45`.
 
@@ -536,14 +536,13 @@ The event's `callGas` MUST be zero. The batch entry MUST:
 
 The call source address MUST NOT be `SYSTEM_ADDRESS`.
 
-The signer MUST recompute the gas-aware mutable L2 outbound call hash with
-target rollup `0` and the event's zero `callGas`; it MUST equal the event hash.
-
-The entry's L1 rolling hash uses the distinct gas-free common call hash:
+The signer MUST recompute the mutable cross-chain call hash with target rollup
+`0` and the event's zero `callGas`; it MUST equal the event hash. The same
+zero-`callGas` identity is committed by the entry's L1 rolling hash:
 
 ```text
 L1 seed(sole update, proxyEntryHash = 0)
-  -> CALL_BEGIN(common gas-free call hash)
+  -> CALL_BEGIN(common zero-callGas call hash)
   -> CALL_END(true, entry.returnData)
 ```
 
@@ -748,7 +747,7 @@ A compatible implementation MUST test at least:
 - state-chain endpoints, continuity, effect count/order/kind, and checkpoints;
 - inbound outer/inner equality, call hash, rolling hash, value, and canonical
   calldata;
-- outbound event provenance, canonical encoding, gas-aware hash, gas-free L1
+- outbound event provenance, canonical encoding, zero-`callGas` hash, L1
   rolling hash, ordering, source, and value;
 - exact DA projection, sidecars, and mixed Sync-block reconstruction;
 - public-input vectors against the pinned Solidity formula; and
@@ -932,7 +931,7 @@ Current selector locks are:
 Let `H = keccak256`. `abi.encode` below is standard Solidity ABI encoding;
 `packed` means the exact byte concatenation shown.
 
-### B.1 Common cross-chain call hash
+### B.1 Cross-chain call hash
 
 ```text
 H(abi.encode(
@@ -942,9 +941,12 @@ H(abi.encode(
     address targetAddress,
     uint64 targetRollupId,
     uint256 value,
+    uint64 callGas,
     bytes data
 ))
 ```
+
+All supported L1, inbound, and static paths use `callGas == 0`.
 
 ### B.2 Mutable L2 outbound event hash
 
@@ -961,8 +963,9 @@ H(abi.encode(
 ))
 ```
 
-The supported deployment requires `callGas == 0`. This gas-aware hash is used
-for the L2 event only. The L1 entry rolling hash uses B.1.
+This is B.1 with `isStatic == false` and the `callGas` observed in the event.
+The supported deployment requires `callGas == 0`, so the event hash is also
+the identity folded into the corresponding L1 entry rolling hash.
 
 ### B.3 Entry rolling hashes
 

@@ -725,8 +725,9 @@ fn l1_call_from_action(call: &ExecutedAction) -> L2ToL1CallSol {
     }
 }
 
+/// Hash a source-side action using the supported zero-`callGas` profile.
 fn source_side_call_hash(call: &ExecutedAction) -> B256 {
-    let input = CallHashInput {
+    common_cross_chain_call_hash(CallHashInput {
         call_mode: call.call_mode,
         source_address: call.source_address,
         source_rollup_id: call.source_rollup_id,
@@ -734,12 +735,7 @@ fn source_side_call_hash(call: &ExecutedAction) -> B256 {
         target_rollup_id: call.target_rollup_id,
         value: call.value,
         data: &call.data,
-    };
-    if call.source_rollup_id.is_mainnet() {
-        common_cross_chain_call_hash(input)
-    } else {
-        l2_outbound_call_hash(input, 0)
-    }
+    })
 }
 
 fn batch_with_entries(entries: Vec<ExecutionEntrySol>, immediate_count: usize) -> EvmBatch {

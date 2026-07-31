@@ -10,7 +10,7 @@ use alloy_primitives::{B256, b256};
 use eez_protocol::rolling_hash::{EntryRollingHash, StaticCallRollingHash};
 use serde::Deserialize;
 
-const EXPECTED_PROTOCOL_COMMIT: &str = "f6226f569e9b4534d42eecf5d2e3dd6c649bc6aa";
+const EXPECTED_PROTOCOL_COMMIT: &str = "6fcc90b65063831cb7797e9fa361004064d28f9f";
 const EXPECTED_SOLIDITY_ORACLE: &str = "contracts/test/RollingHashVectors.t.sol";
 
 #[derive(Debug, Deserialize)]

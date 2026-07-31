@@ -1,9 +1,8 @@
 //! Cross-chain call-hash and per-rollup state-root slot derivation.
 //!
-//! The common contract formula hashes the call kind, source pair, target pair,
-//! value, and calldata. A call leaving an L2 uses a distinct formula
-//! that also includes the manager-entry `callGas`; see
-//! [`l2_outbound_call_hash`].
+//! The protocol formula hashes the call kind, source pair, target pair, value,
+//! call gas, and calldata. Most paths commit zero call gas; calls leaving an
+//! L2 may instead commit the manager-entry `callGas`.
 
 use crate::RollupId;
 use alloy_primitives::{Address, B256, U256, keccak256};
@@ -34,7 +33,7 @@ impl CallMode {
     }
 }
 
-/// Fields shared by the protocol's cross-chain call-hash formulas.
+/// Fields encoded by the protocol's cross-chain call-hash formula.
 ///
 /// Keeping the source and target names at the call site avoids silently
 /// swapping the two address/rollup pairs.
@@ -58,11 +57,27 @@ pub struct CallHashInput<'a> {
 
 /// Compute the hash for a call leaving an L2.
 ///
-/// Unlike the common L1/inbound formula, `EEZL2` includes the manager-entry
-/// `call_gas` value between `value` and `data`. The supported deployment uses
-/// `USE_GAS_LEFT = false`, so production callers currently pass zero.
+/// `EEZL2` supplies the manager-entry `call_gas` value to the shared protocol
+/// formula. The supported deployment uses `USE_GAS_LEFT = false`, so
+/// production callers currently pass zero.
 #[must_use]
 pub fn l2_outbound_call_hash(input: CallHashInput<'_>, call_gas: u64) -> B256 {
+    cross_chain_call_hash(input, call_gas)
+}
+
+/// Compute the protocol's cross-chain call hash with zero call gas.
+///
+/// Mirrors `EEZBase.computeCrossChainCallHash` with `callGas == 0`:
+/// `keccak256(abi.encode(isStatic, sourceAddress, uint64(sourceRollupId),
+/// targetAddress, uint64(targetRollupId), value, uint64(0), data))`.
+/// Calls leaving an L2 use [`l2_outbound_call_hash`] to supply the observed
+/// manager-entry gas when required.
+#[must_use]
+pub fn common_cross_chain_call_hash(input: CallHashInput<'_>) -> B256 {
+    cross_chain_call_hash(input, 0)
+}
+
+fn cross_chain_call_hash(input: CallHashInput<'_>, call_gas: u64) -> B256 {
     keccak256(
         (
             input.call_mode.is_static(),
@@ -78,28 +93,6 @@ pub fn l2_outbound_call_hash(input: CallHashInput<'_>, call_gas: u64) -> B256 {
     )
 }
 
-/// Compute the protocol's gas-free cross-chain call hash.
-///
-/// Mirrors `EEZBase.computeCrossChainCallHash`:
-/// `keccak256(abi.encode(isStatic, sourceAddress, uint64(sourceRollupId),
-/// targetAddress, uint64(targetRollupId), value, data))`.
-/// Calls leaving an L2 use [`l2_outbound_call_hash`] instead.
-#[must_use]
-pub fn common_cross_chain_call_hash(input: CallHashInput<'_>) -> B256 {
-    keccak256(
-        (
-            input.call_mode.is_static(),
-            input.source_address,
-            input.source_rollup_id.0,
-            input.target_address,
-            input.target_rollup_id.0,
-            input.value,
-            input.data,
-        )
-            .abi_encode_params(),
-    )
-}
-
 /// Storage slot of `mapping(uint256 => RollupConfig) public rollups`
 /// on `EEZ.sol` — slot 2, after `authorizedProxies` (0) and
 /// `rollupCounter` (1). Verify with `forge inspect EEZ storage`.
@@ -109,7 +102,7 @@ const ROLLUPS_MAPPING_SLOT: u8 = 2;
 /// on `EEZ.sol`.
 ///
 /// `RollupConfig` shape under the multi-prover refactor
-/// (`EEZ.sol:24-28`):
+/// (`interfaces/IEEZ.sol:49-53`):
 ///
 /// ```solidity
 /// struct RollupConfig {
@@ -155,14 +148,14 @@ mod tests {
 
         assert_eq!(
             common_cross_chain_call_hash(input),
-            b256!("0aea0f2282e747ca563ff59f9dbd36570e9973cfc007abfa51893d3fb9aaefdf")
+            b256!("16b1575ff5a4ec44167aebf047dd46f77db3766f7481445ad09c8136bff735a8")
         );
         assert_eq!(
             common_cross_chain_call_hash(CallHashInput {
                 call_mode: CallMode::Static,
                 ..input
             }),
-            b256!("a03958bfe3866dabc6d8e5466965bdfe5f0368308af0d2069801e1562bcd35d0")
+            b256!("4cf0f2738ced4dcd497cf8a081030f41c5dc588fbdcac75f3a217e979d19abe7")
         );
     }
 
@@ -181,7 +174,7 @@ mod tests {
 
         assert_eq!(
             common_cross_chain_call_hash(input),
-            b256!("f149543f591e628d8247387fdf6780d6aee8c119258a34b348509695c202a1a1")
+            b256!("414b9d6bf91a3e266bcd34ddd870a53332107a606b6eda618455f9f940291e2b")
         );
     }
 

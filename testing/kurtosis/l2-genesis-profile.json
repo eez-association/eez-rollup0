@@ -5,7 +5,7 @@
   "systemBalance": "0xd3c21bcecceda1000000",
   "useGasLeft": false,
   "eezL2Address": "0x4200000000000000000000000000000000000007",
-  "runtimeCodeHash": "0x97eec3356de07514c36f7e5e769f947bffbf0a5dd40184fd244e6650d3f5c585",
-  "genesisStateRoot": "0xba1e16c9c8c1a00b7ca1b237298af6052245843e7cfe4f1dd84aed19e3dcb115",
+  "runtimeCodeHash": "0x165c4a2d27ad14d1fecd80a97a7a3de5586d8c37a553f3a80cf846fddd10ccf7",
+  "genesisStateRoot": "0x4616cf02be1518ec64664084a6cfb103c12150f1a8831b79cbd64c870ad8c183",
   "foundryVersion": "1.7.1"
 }

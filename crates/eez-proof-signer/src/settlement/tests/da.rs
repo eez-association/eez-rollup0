@@ -546,7 +546,7 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
     refresh_l1_rolling_hash(&mut batch.entries[2]);
     assert_eq!(
         batch.entries[2].rollingHash,
-        b256!("f3e1e42a3edb716155d9e5fee16a8cab4324b20ce27abaa729df594dca70b98d")
+        b256!("78f69e61b6a717b35a9ded7bd8eb7b8782e70680d1335623833272cfa66f5921")
     );
     let mut settling = settling_with_outbound_pairs(2);
     *settling.outbound_event_candidates_mut_for_test() = vec![

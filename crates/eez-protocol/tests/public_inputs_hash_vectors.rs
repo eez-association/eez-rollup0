@@ -14,7 +14,7 @@ use eez_protocol::public_inputs::{all_per_ps_hashes, entry_hash, shared_public_i
 use eez_protocol::{ProofPlan, RollupId, RollupProofAssignment};
 use serde::Deserialize;
 
-const EXPECTED_PROTOCOL_COMMIT: &str = "f6226f569e9b4534d42eecf5d2e3dd6c649bc6aa";
+const EXPECTED_PROTOCOL_COMMIT: &str = "6fcc90b65063831cb7797e9fa361004064d28f9f";
 const EXPECTED_SOLIDITY_ORACLE: &str = "contracts/test/PublicInputsHashVectors.t.sol";
 
 sol! {

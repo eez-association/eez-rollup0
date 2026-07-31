@@ -26,7 +26,7 @@ fn refresh_outbound_rolling_hash(entry: &mut ExecutionEntrySol) {
 }
 
 #[test]
-fn outbound_event_and_l1_rolling_hash_use_distinct_call_identities() {
+fn outbound_event_and_l1_rolling_hash_share_the_zero_gas_identity() {
     let batch = effect_batch(&[B256::ZERO; 3], &[ClaimedEntryShape::Outbound]);
     let entry = &batch.entries[1];
     let call = &entry.l2ToL1Calls[0];
@@ -42,7 +42,7 @@ fn outbound_event_and_l1_rolling_hash_use_distinct_call_identities() {
     let event_hash = eez_protocol::l2_outbound_call_hash(input, 0);
     let l1_call_hash = eez_protocol::common_cross_chain_call_hash(input);
 
-    assert_ne!(event_hash, l1_call_hash);
+    assert_eq!(event_hash, l1_call_hash);
     let mut expected_rolling = eez_protocol::rolling_hash::EntryRollingHash::seed_for_l1(
         [(
             entry.stateUpdates[0].rollupId,
@@ -50,7 +50,7 @@ fn outbound_event_and_l1_rolling_hash_use_distinct_call_identities() {
         )],
         entry.proxyEntryHash,
     );
-    expected_rolling.call_begin(l1_call_hash);
+    expected_rolling.call_begin(event_hash);
     expected_rolling.call_end(entry.success, &entry.returnData);
     assert_eq!(entry.rollingHash, expected_rolling.current());
 }
