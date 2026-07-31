@@ -69,10 +69,10 @@ fn entry_vectors_match_solidity() {
         ),
     ];
 
-    let mut l1 = EntryRollingHash::for_l1(updates, proxy_entry_hash);
+    let mut l1 = EntryRollingHash::seed_for_l1(updates, proxy_entry_hash);
     assert_eq!(l1.current(), parse_hash(&expected.l1_seed), "L1 seed");
 
-    let l2 = EntryRollingHash::for_l2(proxy_entry_hash);
+    let l2 = EntryRollingHash::seed_for_l2(proxy_entry_hash);
     assert_eq!(l2.current(), parse_hash(&expected.l2_seed), "L2 seed");
 
     l1.call_begin(call_hash);

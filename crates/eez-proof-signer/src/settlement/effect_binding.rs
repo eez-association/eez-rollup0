@@ -333,7 +333,8 @@ fn classify_claimed_entry(
     }
 
     let expected_anchor_hash =
-        EntryRollingHash::for_l1([(update.rollupId, update.currentState)], B256::ZERO).current();
+        EntryRollingHash::seed_for_l1([(update.rollupId, update.currentState)], B256::ZERO)
+            .current();
     if entry.destinationRollupId == settled_rollup
         && entry.returnData.is_empty()
         && entry.rollingHash == expected_anchor_hash

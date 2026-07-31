@@ -16,7 +16,7 @@ fn refresh_outbound_rolling_hash(entry: &mut ExecutionEntrySol) {
         value: call.value,
         data: &call.data,
     });
-    let mut rolling_hash = eez_protocol::rolling_hash::EntryRollingHash::for_l1(
+    let mut rolling_hash = eez_protocol::rolling_hash::EntryRollingHash::seed_for_l1(
         [(update.rollupId, update.currentState)],
         entry.proxyEntryHash,
     );
@@ -43,7 +43,7 @@ fn outbound_event_and_l1_rolling_hash_use_distinct_call_identities() {
     let l1_call_hash = eez_protocol::common_cross_chain_call_hash(input);
 
     assert_ne!(event_hash, l1_call_hash);
-    let mut expected_rolling = eez_protocol::rolling_hash::EntryRollingHash::for_l1(
+    let mut expected_rolling = eez_protocol::rolling_hash::EntryRollingHash::seed_for_l1(
         [(
             entry.stateUpdates[0].rollupId,
             entry.stateUpdates[0].currentState,

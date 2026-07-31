@@ -78,7 +78,7 @@ pub fn build_batch(
                 // The L1 seed depends on StateUpdates that are attached later.
                 B256::ZERO
             } else {
-                EntryRollingHash::for_l2(proxy_entry_hash).current()
+                EntryRollingHash::seed_for_l2(proxy_entry_hash).current()
             };
 
             Ok(ExecutionEntrySol {
@@ -183,7 +183,7 @@ pub fn finalize_l1_rolling_hashes(batch: &mut EvmBatch) -> ProtocolResult<()> {
             .into());
         }
 
-        let mut rolling_hash = EntryRollingHash::for_l1(
+        let mut rolling_hash = EntryRollingHash::seed_for_l1(
             entry
                 .stateUpdates
                 .iter()
@@ -283,7 +283,7 @@ pub fn build_l2_incoming_entry(entry: IncomingEntry) -> ProtocolResult<L2Executi
         value,
         data: &data,
     });
-    let mut rolling_hash = EntryRollingHash::for_l2(call_hash);
+    let mut rolling_hash = EntryRollingHash::seed_for_l2(call_hash);
     rolling_hash.call_begin(call_hash);
     rolling_hash.call_end(true, &return_data);
 
@@ -364,7 +364,7 @@ pub fn build_l2_outbound_entry(entry: OutboundEntry) -> ProtocolResult<L2Executi
         proxyEntryHash: proxy_entry_hash,
         incomingCalls: Vec::new(),
         expectedOutgoingCalls: Vec::new(),
-        rollingHash: EntryRollingHash::for_l2(proxy_entry_hash).current(),
+        rollingHash: EntryRollingHash::seed_for_l2(proxy_entry_hash).current(),
         success: true,
         returnData: return_data,
     })
@@ -435,7 +435,7 @@ pub(crate) fn build_l1_inbound_sidecar(
             value: call.value,
             data: &call.data,
         });
-        let mut rolling_hash = EntryRollingHash::for_l2(call_hash);
+        let mut rolling_hash = EntryRollingHash::seed_for_l2(call_hash);
         rolling_hash.call_begin(call_hash);
         rolling_hash.call_end(true, return_data);
 
@@ -556,7 +556,7 @@ pub fn decode_inbound(calldata: &[u8]) -> Option<DecodedInbound> {
         return None;
     }
 
-    let mut rolling_hash = EntryRollingHash::for_l2(entry.proxyEntryHash);
+    let mut rolling_hash = EntryRollingHash::seed_for_l2(entry.proxyEntryHash);
     rolling_hash.call_begin(entry.proxyEntryHash);
     rolling_hash.call_end(entry.success, &entry.returnData);
     if rolling_hash.current() != entry.rollingHash {
@@ -866,7 +866,7 @@ mod tests {
         assert!(entry.l2ToL1Calls.is_empty());
         assert_eq!(
             entry.rollingHash,
-            EntryRollingHash::for_l2(expected_key).current()
+            EntryRollingHash::seed_for_l2(expected_key).current()
         );
         assert!(entry.success);
     }
@@ -910,7 +910,8 @@ mod tests {
             value: call.value,
             data: &call.data,
         });
-        let mut expected = EntryRollingHash::for_l1([(7, B256::with_last_byte(0x11))], B256::ZERO);
+        let mut expected =
+            EntryRollingHash::seed_for_l1([(7, B256::with_last_byte(0x11))], B256::ZERO);
         expected.call_begin(call_hash);
         expected.call_end(true, &entry.returnData);
         assert_eq!(entry.rollingHash, expected.current());
@@ -976,7 +977,7 @@ mod tests {
         })
         .unwrap();
 
-        let mut expected = EntryRollingHash::for_l2(entry.proxyEntryHash);
+        let mut expected = EntryRollingHash::seed_for_l2(entry.proxyEntryHash);
         expected.call_begin(entry.proxyEntryHash);
         expected.call_end(true, &return_data);
         assert_eq!(entry.rollingHash, expected.current());
@@ -1031,7 +1032,7 @@ mod tests {
         assert!(entry.incomingCalls.is_empty());
         assert_eq!(
             entry.rollingHash,
-            EntryRollingHash::for_l2(entry.proxyEntryHash).current()
+            EntryRollingHash::seed_for_l2(entry.proxyEntryHash).current()
         );
         assert!(entry.success);
     }

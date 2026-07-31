@@ -122,7 +122,7 @@ fn state_entry(rollup_id: u64, current: B256, new: B256) -> ExecutionEntrySol {
         expectedL1ToL2Calls: Vec::new(),
         success: true,
         returnData: Bytes::new(),
-        rollingHash: EntryRollingHash::for_l1([(rollup_id, current)], B256::ZERO).current(),
+        rollingHash: EntryRollingHash::seed_for_l1([(rollup_id, current)], B256::ZERO).current(),
     }
 }
 
@@ -155,7 +155,7 @@ fn effect_batch(roots: &[B256], kinds: &[ClaimedEntryShape]) -> CanonicalPostBat
                     data: &call.data,
                 });
                 let update = &entry.stateUpdates[0];
-                let mut rolling_hash = EntryRollingHash::for_l1(
+                let mut rolling_hash = EntryRollingHash::seed_for_l1(
                     [(update.rollupId, update.currentState)],
                     entry.proxyEntryHash,
                 );
@@ -167,7 +167,7 @@ fn effect_batch(roots: &[B256], kinds: &[ClaimedEntryShape]) -> CanonicalPostBat
             ClaimedEntryShape::Inbound => {
                 entry.proxyEntryHash = B256::repeat_byte(0x11);
                 let update = &entry.stateUpdates[0];
-                entry.rollingHash = EntryRollingHash::for_l1(
+                entry.rollingHash = EntryRollingHash::seed_for_l1(
                     [(update.rollupId, update.currentState)],
                     entry.proxyEntryHash,
                 )
@@ -261,7 +261,7 @@ fn bindable_inbound_batch(settling: &SettlingBlockObservations) -> CanonicalPost
         entry.returnData = observation.return_data.clone();
         entry.stateUpdates[0].etherDelta = I256::try_from(observation.value).unwrap();
         let update = &entry.stateUpdates[0];
-        entry.rollingHash = EntryRollingHash::for_l1(
+        entry.rollingHash = EntryRollingHash::seed_for_l1(
             [(update.rollupId, update.currentState)],
             entry.proxyEntryHash,
         )

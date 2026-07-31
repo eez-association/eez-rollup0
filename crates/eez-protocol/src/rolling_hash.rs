@@ -41,7 +41,7 @@ pub const CALL_NOT_FOUND: u8 = 5;
 /// folded.
 #[derive(Debug, Clone)]
 pub struct EntryRollingHash {
-    state: B256,
+    rolling_hash: B256,
 }
 
 impl EntryRollingHash {
@@ -51,7 +51,7 @@ impl EntryRollingHash {
     /// `rollup_id` is encoded as an 8-byte big-endian `uint64`, matching
     /// Solidity's packed encoding. Update order is commitment-significant.
     #[must_use]
-    pub fn for_l1(
+    pub fn seed_for_l1(
         state_updates: impl IntoIterator<Item = (u64, B256)>,
         proxy_entry_hash: B256,
     ) -> Self {
@@ -67,33 +67,37 @@ impl EntryRollingHash {
                 });
 
         Self {
-            state: hash_parts(&[states_hash.as_slice(), proxy_entry_hash.as_slice()]),
+            rolling_hash: hash_parts(&[states_hash.as_slice(), proxy_entry_hash.as_slice()]),
         }
     }
 
     /// Seed an L2 entry from the proxy entry hash.
     #[must_use]
-    pub fn for_l2(proxy_entry_hash: B256) -> Self {
+    pub fn seed_for_l2(proxy_entry_hash: B256) -> Self {
         Self {
-            state: hash_parts(&[B256::ZERO.as_slice(), proxy_entry_hash.as_slice()]),
+            rolling_hash: hash_parts(&[B256::ZERO.as_slice(), proxy_entry_hash.as_slice()]),
         }
     }
 
     /// Return the current rolling hash.
     #[must_use]
     pub const fn current(&self) -> B256 {
-        self.state
+        self.rolling_hash
     }
 
     /// Fold the beginning of a call identified by its cross-chain call hash.
     pub fn call_begin(&mut self, call_hash: B256) {
-        self.state = hash_parts(&[self.state.as_slice(), &[CALL_BEGIN], call_hash.as_slice()]);
+        self.rolling_hash = hash_parts(&[
+            self.rolling_hash.as_slice(),
+            &[CALL_BEGIN],
+            call_hash.as_slice(),
+        ]);
     }
 
     /// Fold a call's final success flag and raw return data.
     pub fn call_end(&mut self, success: bool, return_data: &[u8]) {
-        self.state = hash_parts(&[
-            self.state.as_slice(),
+        self.rolling_hash = hash_parts(&[
+            self.rolling_hash.as_slice(),
             &[CALL_END],
             &[u8::from(success)],
             return_data,
@@ -102,18 +106,22 @@ impl EntryRollingHash {
 
     /// Fold the beginning of a nested call identified by its call hash.
     pub fn nested_begin(&mut self, call_hash: B256) {
-        self.state = hash_parts(&[self.state.as_slice(), &[NESTED_BEGIN], call_hash.as_slice()]);
+        self.rolling_hash = hash_parts(&[
+            self.rolling_hash.as_slice(),
+            &[NESTED_BEGIN],
+            call_hash.as_slice(),
+        ]);
     }
 
     /// Fold the end of the current nested call.
     pub fn nested_end(&mut self) {
-        self.state = hash_parts(&[self.state.as_slice(), &[NESTED_END]]);
+        self.rolling_hash = hash_parts(&[self.rolling_hash.as_slice(), &[NESTED_END]]);
     }
 
     /// Fold an expected call that was not made.
     pub fn call_not_found(&mut self, call_hash: B256) {
-        self.state = hash_parts(&[
-            self.state.as_slice(),
+        self.rolling_hash = hash_parts(&[
+            self.rolling_hash.as_slice(),
             &[CALL_NOT_FOUND],
             call_hash.as_slice(),
         ]);
@@ -126,7 +134,7 @@ impl EntryRollingHash {
 /// nor call identities.
 #[derive(Debug, Clone)]
 pub struct StaticCallRollingHash {
-    state: B256,
+    rolling_hash: B256,
 }
 
 impl Default for StaticCallRollingHash {
@@ -139,18 +147,24 @@ impl StaticCallRollingHash {
     /// Construct a zero-seeded static-result accumulator.
     #[must_use]
     pub const fn new() -> Self {
-        Self { state: B256::ZERO }
+        Self {
+            rolling_hash: B256::ZERO,
+        }
     }
 
     /// Return the current rolling hash.
     #[must_use]
     pub const fn current(&self) -> B256 {
-        self.state
+        self.rolling_hash
     }
 
     /// Fold a static call's success flag and raw return data.
     pub fn append(&mut self, success: bool, return_data: &[u8]) {
-        self.state = hash_parts(&[self.state.as_slice(), &[u8::from(success)], return_data]);
+        self.rolling_hash = hash_parts(&[
+            self.rolling_hash.as_slice(),
+            &[u8::from(success)],
+            return_data,
+        ]);
     }
 }
 
@@ -172,8 +186,8 @@ mod tests {
         let first = (1, B256::with_last_byte(2));
         let second = (2, B256::with_last_byte(3));
 
-        let forward = EntryRollingHash::for_l1([first, second], proxy_hash);
-        let reversed = EntryRollingHash::for_l1([second, first], proxy_hash);
+        let forward = EntryRollingHash::seed_for_l1([first, second], proxy_hash);
+        let reversed = EntryRollingHash::seed_for_l1([second, first], proxy_hash);
 
         assert_ne!(forward.current(), reversed.current());
     }
@@ -181,8 +195,8 @@ mod tests {
     #[test]
     fn l1_and_l2_seeds_are_distinct() {
         let proxy_hash = B256::with_last_byte(1);
-        let l1 = EntryRollingHash::for_l1([(1, B256::with_last_byte(2))], proxy_hash);
-        let l2 = EntryRollingHash::for_l2(proxy_hash);
+        let l1 = EntryRollingHash::seed_for_l1([(1, B256::with_last_byte(2))], proxy_hash);
+        let l2 = EntryRollingHash::seed_for_l2(proxy_hash);
 
         assert_ne!(l1.current(), l2.current());
     }

@@ -28,7 +28,7 @@ fn inbound_candidate_requires_the_exact_l2_shape_and_rolling_hash() {
     assert!(entry.expectedOutgoingCalls.is_empty());
     assert!(sidecar.expectedL1ToL2Calls.is_empty());
     let mut expected_rolling =
-        eez_protocol::rolling_hash::EntryRollingHash::for_l2(entry.proxyEntryHash);
+        eez_protocol::rolling_hash::EntryRollingHash::seed_for_l2(entry.proxyEntryHash);
     expected_rolling.call_begin(entry.proxyEntryHash);
     expected_rolling.call_end(true, &entry.returnData);
     assert_eq!(entry.rollingHash, expected_rolling.current());
@@ -180,7 +180,7 @@ fn inbound_effect_entries_handle_mixed_effect_positions_without_authorizing_outb
     inbound.proxyEntryHash = observation.recomputed_call_hash;
     inbound.returnData = observation.return_data.clone();
     inbound.stateUpdates[0].etherDelta = I256::try_from(observation.value).unwrap();
-    inbound.rollingHash = eez_protocol::rolling_hash::EntryRollingHash::for_l1(
+    inbound.rollingHash = eez_protocol::rolling_hash::EntryRollingHash::seed_for_l1(
         [(
             inbound.stateUpdates[0].rollupId,
             inbound.stateUpdates[0].currentState,
@@ -288,7 +288,7 @@ fn inbound_effect_entries_require_the_canonical_deferred_shape() {
     let update = &entry.stateUpdates[0];
     assert_eq!(
         entry.rollingHash,
-        eez_protocol::rolling_hash::EntryRollingHash::for_l1(
+        eez_protocol::rolling_hash::EntryRollingHash::seed_for_l1(
             [(update.rollupId, update.currentState)],
             entry.proxyEntryHash,
         )
@@ -363,7 +363,7 @@ fn inbound_effect_entries_accept_the_int256_maximum_and_reject_the_next_value() 
     let rolling_seed = (update.rollupId, update.currentState);
     let proxy_entry_hash = batch.entries[1].proxyEntryHash;
     batch.entries[1].rollingHash =
-        eez_protocol::rolling_hash::EntryRollingHash::for_l1([rolling_seed], proxy_entry_hash)
+        eez_protocol::rolling_hash::EntryRollingHash::seed_for_l1([rolling_seed], proxy_entry_hash)
             .current();
     let plan = effect_plan(&batch, &settling);
 

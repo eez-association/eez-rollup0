@@ -351,7 +351,7 @@ fn authorize_outbound_effect(
         data: &call.data,
     });
     let update = effect.claimed_state_update();
-    let mut rolling_hash = EntryRollingHash::for_l1(
+    let mut rolling_hash = EntryRollingHash::seed_for_l1(
         [(update.rollupId, update.currentState)],
         entry.proxyEntryHash,
     );

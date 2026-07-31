@@ -2,7 +2,7 @@ use super::*;
 
 /// Refresh the exact L1 commitment after a test mutates a claimed entry.
 fn refresh_l1_rolling_hash(entry: &mut ExecutionEntrySol) {
-    let mut rolling_hash = EntryRollingHash::for_l1(
+    let mut rolling_hash = EntryRollingHash::seed_for_l1(
         entry
             .stateUpdates
             .iter()

@@ -188,7 +188,7 @@ pub(super) fn inspect_inbound_candidate(
         });
     }
 
-    let mut l2_rolling_hash = EntryRollingHash::for_l2(entry.proxyEntryHash);
+    let mut l2_rolling_hash = EntryRollingHash::seed_for_l2(entry.proxyEntryHash);
     l2_rolling_hash.call_begin(entry.proxyEntryHash);
     l2_rolling_hash.call_end(entry.success, &entry.returnData);
     if entry.rollingHash != l2_rolling_hash.current() {
@@ -420,7 +420,7 @@ fn authorize_inbound_effect(
         return Err(InboundEffectError::ReturnDataMismatch { entry_index });
     }
     let update = effect.claimed_state_update();
-    let expected_rolling_hash = EntryRollingHash::for_l1(
+    let expected_rolling_hash = EntryRollingHash::seed_for_l1(
         [(update.rollupId, update.currentState)],
         entry.proxyEntryHash,
     )

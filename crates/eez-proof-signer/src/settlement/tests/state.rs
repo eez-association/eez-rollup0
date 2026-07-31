@@ -148,7 +148,7 @@ fn canonical_anchor_requires_a_zero_ether_delta() {
 fn canonical_anchor_uses_the_exact_l1_rolling_seed() {
     let current = B256::repeat_byte(0x11);
     let batch = state_chain(&[current, current]);
-    let expected = EntryRollingHash::for_l1([(1, current)], B256::ZERO).current();
+    let expected = EntryRollingHash::seed_for_l1([(1, current)], B256::ZERO).current();
 
     assert_eq!(batch.entries[0].rollingHash, expected);
     assert!(
