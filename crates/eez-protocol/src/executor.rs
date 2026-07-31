@@ -86,11 +86,11 @@ pub trait TargetExecutionSession: Send {
     /// restore the session to its pre-call state. Drop the snapshot
     /// to commit forward (no-op).
     ///
-    /// Used by the composer's revertSpan path:
+    /// Used to restore nested execution after a reverted frame:
     /// [`CompositionBuilder::open_call`] snapshots the target session
     /// BEFORE delegating to `execute`, stashes the snapshot keyed by
     /// call idx, and either drops it (success path) or rolls back
-    /// (revert-span path) when
+    /// (reverted-frame path) when
     /// [`CompositionBuilder::annotate_revert_span`] fires.
     ///
     /// The snapshot is type-erased via `Box<dyn Any + Send>` so the

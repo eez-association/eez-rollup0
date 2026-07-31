@@ -2,12 +2,12 @@
 //!
 //! ```text
 //!   payload := tagByte ‖ rlp([
-//!     blockTxCounts,    # list of uint16, length == toBlock - fromBlock
-//!                       # entry i = number of user txs in block (fromBlock + 1 + i)
+//!     blockTxCounts,    # list of uint16, length == toBlock - fromBlock + 1
+//!                       # entry i = number of user txs in block (fromBlock + i)
 //!                       # 0 means empty block
 //!     transactions,     # list of bytes, block-major order
-//!                       # the first blockTxCounts[0] entries belong to block fromBlock+1,
-//!                       # the next blockTxCounts[1] entries to block fromBlock+2, etc.
+//!                       # the first blockTxCounts[0] entries belong to block fromBlock,
+//!                       # the next blockTxCounts[1] entries to block fromBlock+1, etc.
 //!                       # each entry is a standard RLP-encoded EVM tx
 //!     l2_entries,       # list of bytes — ABI-encoded L2-shape
 //!                       # ExecutionEntry the L2 system tx
@@ -23,11 +23,10 @@
 //! Single format on the wire today; the one-byte tag prefix leaves
 //! room to add another later without breaking the decoder.
 //!
-//! `fromBlock` and `toBlock` are **not** in the payload — per spec §12 they
-//! are public inputs bound by the proof, derived from on-chain state at
-//! consume time. The Submitter knows `fromBlock` from its own state-walk
-//! over past `BatchPosted` events; the Deriver gets them from the same
-//! walk + proof binding.
+//! `fromBlock` and `toBlock` are **not** in this encoding. Callers supply the
+//! absolute block range from their surrounding protocol context; this codec
+//! only preserves the number of covered blocks and each block's transaction
+//! count.
 //!
 //! Decode invariants enforced (§8.3):
 //!  - `sum(blockTxCounts) == len(transactions)`

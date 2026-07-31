@@ -14,6 +14,7 @@ import {
     StaticExecutionEntry
 } from "sync-rollups-protocol/src/interfaces/IEEZ.sol";
 import {MockProofSystem} from "sync-rollups-protocol/test/mocks/MockProofSystem.sol";
+import {ECDSAProofSystem} from "../src/ECDSAProofSystem.sol";
 
 /// Solidity oracle for the two-stage public-input construction at the pinned
 /// protocol revision. Each vector is also submitted to the real EEZ contract,
@@ -129,9 +130,39 @@ contract PublicInputsHashVectorsTest is Test {
         eez.postAndVerifyBatch(batch);
     }
 
-    /// `immediateEntryCount` changes dispatch but is absent from the proof
-    /// preimage. This locks the current contract behavior so the protocol can
-    /// decide whether to bind the field or make derivation tolerate it.
+    function testECDSAProofCannotBeReusedForDifferentCallData() external {
+        uint256 signerKey = 0xA11CE;
+        address signer = vm.addr(signerKey);
+        bytes32 vkey = bytes32(uint256(uint160(signer)));
+
+        EEZ eez = new EEZ(address(0xDEAD));
+        ECDSAProofSystem proofSystem = new ECDSAProofSystem(signer);
+        address[] memory proofSystems = new address[](1);
+        proofSystems[0] = address(proofSystem);
+        bytes32[] memory vkeys = _singleton(vkey);
+        Rollup rollup = new Rollup(address(eez), address(this), 1, proofSystems, vkeys);
+        uint64 rollupId = eez.registerRollup(address(rollup), bytes32(uint256(0x1111)));
+
+        ProofSystemBatchPerVerificationEntries memory batch = _emptyBatch();
+        batch.proofSystems = proofSystems;
+        batch.proofs = new bytes[](1);
+        batch.rollupIdsWithProofSystems = _assignments1(rollupId, 0);
+
+        bytes32 shared = _shared(batch, _emptyCustomData(1), address(0));
+        bytes32 signedHash = _publicInput(shared, _singleton(rollupId), vkeys);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, signedHash);
+        bytes memory signature = abi.encodePacked(r, s, v);
+
+        batch.proofs[0] = signature;
+        eez.postAndVerifyBatch(batch);
+
+        batch.callData = hex"01";
+        vm.expectRevert(EEZ.InvalidProof.selector);
+        eez.postAndVerifyBatch(batch);
+    }
+
+    /// `immediateEntryCount` is an intentional poster-controlled scheduling
+    /// parameter: it changes dispatch while remaining outside the proof preimage.
     function testImmediateEntryCountCanDropADeferredEntryWithoutChangingPublicInput() external {
         MockProofSystem proofSystem = new MockProofSystem();
         bytes32 vkey = bytes32(uint256(0x42));

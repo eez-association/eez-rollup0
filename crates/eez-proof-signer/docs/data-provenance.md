@@ -74,17 +74,18 @@ contract check succeeds.
 ### `ValidatedWindow`
 
 This is the settlement-facing output of execution validation. It contains exact
-admitted block bytes, locally validated endpoint roots, transaction outcomes,
-system-sender flags, and outbound receipt observations. It contains no
-execution witnesses; validation consumed them.
+admitted block bytes, locally validated endpoint roots, system-sender flags,
+and outbound receipt observations. The terminal block additionally retains
+receipt outcomes and selected transaction checkpoints. It contains no execution
+witnesses; validation consumed them.
 
 Its `window_pre_state_root` is not yet a batch anchor. It becomes an anchor only
-when settlement matches the leading submitted state delta against it.
+when settlement matches the leading submitted state update against it.
 
 ### `CanonicalPostBatch`
 
 Canonical decoding proves only that the submitted calldata is a complete,
-round-trippable ABI representation. The decoded state deltas, effects, DA,
+round-trippable ABI representation. The decoded state updates, effects, DA,
 rollup assignments, and public-input fields remain untrusted claims.
 
 ### Bound and authorized settlement data

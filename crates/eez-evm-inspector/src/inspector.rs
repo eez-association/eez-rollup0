@@ -287,8 +287,8 @@ fn lookup_authorized_proxy_live<CTX: ContextTr + Host>(
 /// [`CompositionBuilder::annotate_revert_span`](eez_protocol::CompositionBuilder::annotate_revert_span). `recorded[..]` is preorder
 /// by construction — every call's slot index is fixed at
 /// `CompositionBuilder::open_call` time, BEFORE the session recurses — so
-/// `span = end - start` is exactly the on-chain `revertSpan` for the
-/// bracketed top-level call.
+/// `span = end - start` is the recorded-call scope of the reverted frame.
+/// The current entry profile rejects calls carrying such a scope.
 pub struct SessionInspector<'a> {
     /// Combined proxy-lookup configuration: the contract address to
     /// read and which slot to read from.
@@ -708,7 +708,7 @@ where
 
         // Surface a failed cross-chain sim as `Revert` to the surrounding
         // EVM — the outer Solidity frame should see the call as reverted
-        // so try/catch + revertSpan accounting bracket the right range.
+        // so try/catch + reverted-frame accounting bracket the right range.
         let result = if success {
             InstructionResult::Return
         } else {
@@ -725,7 +725,7 @@ where
         // Pair with the snapshot pushed in `call`. If the frame ended
         // with `Revert` AND one or more dispatches happened inside it
         // (range non-empty), notify the dispatcher: those recorded
-        // calls' effects on the source state-delta chain are rolled
+        // calls' effects on the source state-update chain are rolled
         // back, and any in-memory target session that captured those
         // writes is evicted so the next dispatch reads pre-revert
         // disk state.

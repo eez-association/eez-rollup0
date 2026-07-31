@@ -19,7 +19,11 @@ and observability services. Larger topologies belong in scheduled soak tests.
    `mixed` modes.
 5. Check convergence, settlement, L1/L2 state roots, and the L2 safe head in
    each mode.
-6. Save a JSON result and service logs, then remove the enclave.
+6. Require evidence that the proof signer signed at least one window and the
+   node accepted at least one remote attestation, while rejecting signer
+   validation, invariant, or signing failures.
+7. Save a JSON result with source commits, candidate images, proof-flow counts,
+   and service logs, then remove the enclave.
 
 The workflow runs this package for relevant pull requests on a GitHub-hosted
 Ubuntu runner. It installs and starts Kurtosis, uploads
@@ -48,7 +52,8 @@ Useful overrides:
 
 - `main.star` and `kurtosis.yml`: network definition.
 - `ci-args.yaml`: reduced topology and private test keys.
-- `run-ci.sh`: CI lifecycle entry point.
+- `run-ci.sh`: CI lifecycle, proof-flow gate, and result owner.
 - `start.sh` and `stop.sh`: local lifecycle helpers.
-- `scripts/verify-cross-chain-waves.sh`: runs the wave harness in all three modes.
+- `scripts/verify-cross-chain-waves.sh`: runs the wave harness in all three modes;
+  it does not decide or write the final CI result.
 - `scripts/cross-chain-wave.sh`: inbound, outbound, and mixed cross-chain workload.

@@ -101,7 +101,7 @@ and `ValidatedWindow` is the only production handoff after shared checks. It:
 - drops witnesses that execution has already consumed.
 
 The window pre-state root is not automatically a batch anchor. Settlement must
-still bind the leading submitted state delta to it. `ValidatedWindow` is an
+still bind the leading submitted state update to it. `ValidatedWindow` is an
 architectural boundary, not another proof: construction is safe because the
 backend-output contract and admitted input were consumed and checked
 immediately beforehand.
@@ -117,9 +117,8 @@ Stateless/Reth responsibilities.
 
 A fork change must keep the extension narrow and pass that repository's tests
 before this crate updates its pin. The pin update must also pass this crate's
-adapter and fixture tests. The draft ZisK backend is not selectable: its
-current summary shape does not transport the system-sender and receipt evidence
-required by the active settlement profile.
+adapter and fixture tests. No alternative validation backend is selectable in
+the current binary.
 
 Next, see how these facts are joined in the
 [Settlement pipeline](settlement-pipeline.md).

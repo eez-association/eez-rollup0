@@ -492,10 +492,10 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
 
     // Composer DA carries the pre-settlement projection, not the batch entry
     // after its state update has been attached.
-    let with_state_delta =
+    let with_state_update =
         encode_da_payload(&[vec![user.clone()]], &[batch.entries[1].abi_encode()]);
     assert_eq!(
-        verify(&with_state_delta, [(41, settling_rlp.as_slice())]),
+        verify(&with_state_update, [(41, settling_rlp.as_slice())]),
         Err(DaPayloadError::L2EntryMismatch {
             entry_index: 0,
             transaction_index: 1,

@@ -65,15 +65,12 @@ pub struct ExecutedAction {
     /// from `Dispatcher::open_call` until `Dispatcher::close_call`
     /// resolves it; `Resolved { .. }` thereafter.
     pub outcome: ExecutionOutcome,
-    /// Length of the revert span (in `recorded[..]` indices,
-    /// inclusive of this call) when this call's outer EVM frame
-    /// reverted. `None` for calls whose frames returned successfully
-    /// or whose revert was not observed.
+    /// Number of recorded calls covered by a reverted outer EVM frame,
+    /// inclusive of this call. `None` when no enclosing revert was observed.
     ///
-    /// Maps directly to the on-chain `L2ToL1Call.revertSpan` field
-    /// for top-level calls (see `IEEZ.sol`'s `L2ToL1Call` struct
-    /// under the multi-prover protocol; formerly
-    /// `CrossChainCall.revertSpan`). Populated post-close by
+    /// The current entry profile rejects actions with a recorded revert scope;
+    /// retaining it here prevents reverted calls from being materialized as
+    /// successful entries. Populated post-close by
     /// [`CompositionBuilder::annotate_revert_span`](crate::CompositionBuilder::annotate_revert_span)
     /// when the inspector observes the frame returning with
     /// `InstructionResult::Revert`.
@@ -88,8 +85,8 @@ pub struct ExecutedAction {
 /// produced a real result. The split exists because the index must
 /// be fixed BEFORE recursing into `session.execute` — that's what
 /// makes `recorded[..]` preorder rather than post-order, which in
-/// turn makes the `revertSpan = recorded_count() - frame_start`
-/// arithmetic at `Inspector::call_end` correct without tree
+/// turn makes the `span = recorded_count() - frame_start` arithmetic at
+/// `Inspector::call_end` correct without tree
 /// reconstruction.
 ///
 /// Session rollback checkpoints are stored separately by

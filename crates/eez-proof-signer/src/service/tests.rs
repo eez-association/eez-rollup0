@@ -462,11 +462,6 @@ fn system_transaction() -> TestTransaction {
     alloy_rlp::decode_exact(hex::decode(crate::testkit::SYSTEM_TX).unwrap()).unwrap()
 }
 
-fn inbound_system_transaction() -> TestTransaction {
-    alloy_rlp::decode_exact(hex::decode(crate::testkit::SYSTEM_INBOUND_SELECTOR_TX).unwrap())
-        .unwrap()
-}
-
 fn strict_inbound_transaction(value: U256) -> (TestTransaction, B256, Bytes, ExecutionEntrySol) {
     let target = alloy_primitives::address!("00000000000000000000000000000000000000aa");
     let source = alloy_primitives::address!("00000000000000000000000000000000000000bb");

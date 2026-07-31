@@ -484,7 +484,10 @@ async fn an_inbound_candidate_hidden_in_an_outbound_pair_is_rejected() {
             5,
             0x04,
             0x05,
-            vec![inbound_system_transaction(), non_system_transaction()],
+            vec![
+                strict_inbound_transaction(U256::ZERO).0,
+                non_system_transaction(),
+            ],
         ),
     ];
     replace_post_batch(

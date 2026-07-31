@@ -30,9 +30,8 @@ mod testkit;
 mod validate;
 mod window;
 
-/// Fixed L2 address used for cross-chain transaction and event checks.
-pub(crate) const EEZL2_ADDRESS: alloy_primitives::Address =
-    alloy_primitives::address!("4200000000000000000000000000000000000007");
+/// Fixed L2 predeploy used for cross-chain transaction and event checks.
+pub(crate) use eez_protocol::CCM_ADDRESS as EEZL2_ADDRESS;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
