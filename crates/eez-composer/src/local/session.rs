@@ -8,7 +8,7 @@
 //! Also hosts the reth helpers
 //! ([`disable_checks`], [`compute_state_root`]).
 
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 
 use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory};
 use reth_evm::{ConfigureEvm, Evm as _};
@@ -26,11 +26,35 @@ use eez_protocol::{
 
 use super::provider::ChainProvider;
 
-alloy_sol_types::sol! {
-    function computeCrossChainProxyAddress(address originalAddress, uint64 originalRollupId)
-        external
-        view
-        returns (address proxy);
+/// Canonical `CrossChainProxy` creation code, compiled from
+/// `sync-rollups-protocol/src/base/CrossChainProxy.sol` with the settings in
+/// `sync-rollups-protocol/foundry.toml` (solc 0.8.34, optimizer 200, via IR).
+///
+/// The constructor's ABI-encoded manager address is appended at runtime. The
+/// fixed-vector checks in this module and `scripts/update-eezl2-genesis.sh`
+/// deliberately fail if this bytecode drifts from the protocol contract.
+const CROSS_CHAIN_PROXY_CREATION_CODE: &[u8] = &alloy_primitives::hex!(
+    "60a080604052346101285761002a9061055a8038038091610020828561012c565b833981019061014f565b80608052478061005b575b6040516103eb908161016f82396080518181816101670152818161030901526103850152f35b6040516316ae1c2d60e21b815291602090839060049082906001600160a01b03165afa801561011d575f9283928392839283916100ee575b505af1503d156100e9573d6001600160401b0381116100d557604051906100c4601f8201601f19166020018361012c565b81525f60203d92013e5b5f80610035565b634e487b7160e01b5f52604160045260245ffd5b6100ce565b610110915060203d602011610116575b610108818361012c565b81019061014f565b5f610093565b503d6100fe565b6040513d5f823e3d90fd5b5f80fd5b601f909101601f19168101906001600160401b038211908210176100d557604052565b9081602091031261012857516001600160a01b0381168103610128579056fe608060405260043610610299575f3560e01c80638205f3e11461002b57639f149e1b03610299576100ab565b60603660031901126100a7576004356001600160a01b03811681036100a7576024359067ffffffffffffffff821682036100a7576044359167ffffffffffffffff83116100a757366023840112156100a75782600401359267ffffffffffffffff84116100a75736602485830101116100a7576024019161015f565b5f80fd5b346100a7575f3660031901126100a7573330036100c7575f805d005b610299565b908092918237015f815290565b634e487b7160e01b5f52604160045260245ffd5b90601f8019910116810190811067ffffffffffffffff82111761010f57604052565b6100d9565b67ffffffffffffffff811161010f57601f01601f191660200190565b3d1561015a573d9061014182610114565b9161014f60405193846100ed565b82523d5f602084013e565b606090565b9192909190337f00000000000000000000000000000000000000000000000000000000000000006001600160a01b0316036100c7575f93849367ffffffffffffffff16806101dc57506101b7604051809381936100cc565b039134905af16101c5610130565b905b156101d457602081519101f35b602081519101fd5b906101ec604051809481936100cc565b03923491f16101f9610130565b906101c7565b6001600160a01b0390911681526040602082018190528101829052606091805f848401375f828201840152601f01601f1916010190565b6020818303126100a75780519067ffffffffffffffff82116100a7570181601f820112156100a75780519061026a82610114565b9261027860405194856100ed565b828452602083830101116100a757815f9260208093018386015e8301015290565b5f806040516020810190639f149e1b60e01b8252600481526102bc6024826100ed565b519082306103e8f16102cc610130565b5061035a575f80604051602081019063189a256f60e11b8252610305816102f73633602484016101ff565b03601f1981018352826100ed565b51907f00000000000000000000000000000000000000000000000000000000000000005afa610332610130565b90805b61034657156101d457602081519101f35b90806020806101f993518301019101610236565b5f806040516020810190639af5325960e01b8252610380816102f73633602484016101ff565b5190347f00000000000000000000000000000000000000000000000000000000000000005af16103ae610130565b908061033556fea2646970667358221220902b4168f100d5946f93f0c89bec6fccc1768036fe918e981cd09f859fd2316964736f6c63430008220033"
+);
+
+fn proxy_init_code_hash(manager: Address) -> B256 {
+    let mut init_code = Vec::with_capacity(CROSS_CHAIN_PROXY_CREATION_CODE.len() + 32);
+    init_code.extend_from_slice(CROSS_CHAIN_PROXY_CREATION_CODE);
+    init_code.extend_from_slice(&[0; 12]);
+    init_code.extend_from_slice(manager.as_slice());
+    keccak256(init_code)
+}
+
+fn compute_proxy_address(
+    manager: Address,
+    init_code_hash: B256,
+    source_address: Address,
+    source_rollup: RollupId,
+) -> Address {
+    let mut salt_preimage = [0; 28];
+    salt_preimage[..8].copy_from_slice(&source_rollup.0.to_be_bytes());
+    salt_preimage[8..].copy_from_slice(source_address.as_slice());
+    manager.create2(keccak256(salt_preimage), init_code_hash)
 }
 
 /// Gas limit for direct target-chain calls during inspection. Generous
@@ -58,6 +82,7 @@ pub struct LocalExecutionSession {
     current_root: B256,
     chain_id: u64,
     ccm_address: Address,
+    proxy_init_code_hash: B256,
     /// When `Some`, `execute()` runs each target call under a
     /// [`eez_evm_inspector::SessionInspector`] built from this factory — forwarding
     /// detected proxy CALLs to the dispatcher. `None` means a plain
@@ -170,57 +195,9 @@ impl LocalExecutionSession {
             current_root,
             chain_id,
             ccm_address,
+            proxy_init_code_hash: proxy_init_code_hash(ccm_address),
             inspector_factory,
             overlay_channel,
-        })
-    }
-
-    /// Compute the target-chain proxy address for a given
-    /// `(sourceAddress, sourceRollup)` via a static call to
-    /// `CCM.computeCrossChainProxyAddress()`.
-    fn compute_proxy_address(
-        &mut self,
-        source_address: Address,
-        source_rollup: RollupId,
-    ) -> ExecutorResult<Address> {
-        use alloy_sol_types::SolCall;
-
-        let calldata = computeCrossChainProxyAddressCall {
-            originalAddress: source_address,
-            originalRollupId: source_rollup.0,
-        }
-        .abi_encode();
-
-        let tx_env = revm::context::TxEnv {
-            caller: Address::ZERO,
-            gas_limit: 1_000_000,
-            kind: alloy_primitives::TxKind::Call(self.ccm_address),
-            data: calldata.into(),
-            chain_id: Some(self.chain_id),
-            ..Default::default()
-        };
-
-        let result = {
-            let mut evm = self
-                .evm_config
-                .evm_with_env(&mut self.state, self.evm_env.clone());
-            evm.transact(tx_env).map_err(evm_err)?
-        };
-
-        if !result.result.is_success() {
-            return Err(ExecutorErrorKind::TargetTransactionReverted {
-                index: 0,
-                return_data: result.result.output().cloned().unwrap_or_default().to_vec(),
-            }
-            .into());
-        }
-
-        let output = result
-            .result
-            .output()
-            .ok_or(ExecutorErrorKind::Missing("proxy-address call output"))?;
-        computeCrossChainProxyAddressCall::abi_decode_returns_validate(output).map_err(|err| {
-            ExecutorErrorKind::Decode(format!("invalid proxy-address return data: {err}")).into()
         })
     }
 
@@ -377,7 +354,12 @@ impl LocalExecutionSession {
         source_address: &Address,
         source_rollup: RollupId,
     ) -> ExecutorResult<revm::context::TxEnv> {
-        let caller = self.compute_proxy_address(*source_address, source_rollup)?;
+        let caller = compute_proxy_address(
+            self.ccm_address,
+            self.proxy_init_code_hash,
+            *source_address,
+            source_rollup,
+        );
 
         tracing::trace!(
             dest = %destination,
@@ -520,13 +502,29 @@ pub(super) fn evm_err(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_sol_types::SolCall;
 
     #[test]
-    fn proxy_address_selector_matches_simplify_abi() {
+    fn proxy_create2_formula_matches_canonical_fixed_vector() {
+        let manager = alloy_primitives::address!("4200000000000000000000000000000000000007");
+        let original = alloy_primitives::address!("11223344556677889900aabbccddeeff00112233");
+        let init_code_hash = proxy_init_code_hash(manager);
+
+        assert_eq!(CROSS_CHAIN_PROXY_CREATION_CODE.len(), 1_370);
         assert_eq!(
-            computeCrossChainProxyAddressCall::SELECTOR,
-            [0xeb, 0x20, 0xc0, 0xaa]
+            keccak256(CROSS_CHAIN_PROXY_CREATION_CODE),
+            alloy_primitives::b256!(
+                "f4bc7a948c6ada02e821e1800f18aa19c418a22155897ec758332847505618c6"
+            )
+        );
+        assert_eq!(
+            init_code_hash,
+            alloy_primitives::b256!(
+                "7c63e527554027dc06e5f9aebc6a153ec5e54dbf588ac2238a2776bf3c9fdc31"
+            )
+        );
+        assert_eq!(
+            compute_proxy_address(manager, init_code_hash, original, RollupId(0)),
+            alloy_primitives::address!("0093d413a54e6e751f882d69785d90fb5d0646a4")
         );
     }
 }
