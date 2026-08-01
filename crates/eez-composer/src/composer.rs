@@ -2665,6 +2665,8 @@ mod tests {
             raw_tx: Bytes::from(vec![hash_byte; 4]),
             hash: TxHash::repeat_byte(hash_byte),
             attempts: 0,
+            max_fee_per_gas: u128::from(hash_byte),
+            priority_fee_per_gas: u128::from(hash_byte),
             sender,
             nonce,
             direction,

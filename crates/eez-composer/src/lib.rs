@@ -46,7 +46,7 @@ pub mod rollup;
 #[doc(inline)]
 pub use composer::{Composer, CrossChainExecCtx};
 #[doc(inline)]
-pub use held_pool::{HeldPool, HeldTx};
+pub use held_pool::{AdmissionError, HeldPool, HeldTx, NonceAdmissionError};
 #[doc(inline)]
 pub use ingress::Direction;
 

@@ -23,7 +23,7 @@ use alloy_consensus::{Transaction as _, TxEnvelope};
 use alloy_eips::eip2718::Decodable2718 as _;
 use alloy_primitives::{B256, Bytes, U256, keccak256};
 use alloy_provider::{Provider as _, RootProvider};
-use eez_composer::{Direction, HeldPool, HeldTx};
+use eez_composer::{AdmissionError, Direction, HeldPool, HeldTx};
 use http_body_util::{BodyExt as _, Full};
 use hyper::body::Bytes as HyperBytes;
 use hyper::header::CONTENT_LENGTH;
@@ -91,6 +91,11 @@ pub async fn gate_and_hold(
         raw_tx: raw_tx.clone(),
         hash,
         attempts: 0,
+        max_fee_per_gas: envelope.max_fee_per_gas(),
+        // Legacy/2930 have no tip field; gas_price is both cap and tip.
+        priority_fee_per_gas: envelope
+            .max_priority_fee_per_gas()
+            .unwrap_or_else(|| envelope.max_fee_per_gas()),
         sender,
         nonce,
         direction,
@@ -105,10 +110,20 @@ pub async fn gate_and_hold(
         Err(e) => return Admission::Rejected(format!("source-chain nonce lookup failed: {e}")),
     };
     if let Err(err) = held_pool.push_contiguous(tx, on_chain) {
-        return Admission::Rejected(format!(
-            "invalid nonce {nonce} for {sender}: expected next unreserved nonce {} (source-chain nonce {})",
-            err.expected, err.on_chain
-        ));
+        return Admission::Rejected(match err {
+            AdmissionError::Nonce(err) => format!(
+                "invalid nonce {nonce} for {sender}: expected next unreserved nonce {} (source-chain nonce {})",
+                err.expected, err.on_chain
+            ),
+            AdmissionError::UnderpricedReplacement {
+                offered_max_fee,
+                min_max_fee,
+                offered_priority_fee,
+                min_priority_fee,
+            } => format!(
+                "replacement underpriced for {sender} nonce {nonce}: max_fee_per_gas {offered_max_fee} (need {min_max_fee}), priority fee {offered_priority_fee} (need {min_priority_fee})"
+            ),
+        });
     }
     event!(
         name: "eez.ingress.cross_chain.push",
@@ -128,10 +143,17 @@ fn validate_front_envelope(
     direction: Direction,
     expected_source_chain_id: u64,
 ) -> Result<(), String> {
-    if matches!(envelope, TxEnvelope::Eip4844(_)) {
-        return Err(
-            "EIP-4844 blob transactions are unsupported by the cross-chain front pipeline".into(),
-        );
+    // Allowlist: only types the pipeline is known to handle. Notably out:
+    // EIP-4844 (blobs) and EIP-7702 (authorizations bump OTHER accounts'
+    // nonces, breaking the pool's contiguity model).
+    match envelope {
+        TxEnvelope::Legacy(_) | TxEnvelope::Eip2930(_) | TxEnvelope::Eip1559(_) => {}
+        other => {
+            return Err(format!(
+                "unsupported transaction type {:?}: cross-chain fronts accept legacy (EIP-155), EIP-2930, and EIP-1559 only",
+                other.tx_type()
+            ));
+        }
     }
     let Some(chain_id) = envelope.chain_id() else {
         return Err(
@@ -183,6 +205,17 @@ pub async fn run_cross_chain_front(
     validation_provider: RootProvider,
     expected_source_chain_id: u64,
 ) -> eyre::Result<()> {
+    // The configured chain id and the upstream URL are independent config;
+    // a mismatch would reject every valid tx at the door. Verify at boot
+    // and refuse to start on lookup failure or mismatch.
+    let upstream = validation_provider.get_chain_id().await.map_err(|e| {
+        eyre::eyre!("cross-chain front: upstream chain id lookup failed at startup: {e}")
+    })?;
+    if upstream != expected_source_chain_id {
+        return Err(eyre::eyre!(
+            "cross-chain front misconfigured: upstream RPC reports chain id {upstream}, expected {expected_source_chain_id}"
+        ));
+    }
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
     let client = reqwest::Client::builder()
@@ -486,12 +519,12 @@ mod tests {
         (signer, envelope, raw)
     }
 
-    fn signed_legacy(chain_id: Option<u64>) -> (PrivateKeySigner, TxEnvelope, Bytes) {
+    fn signed_legacy(chain_id: Option<u64>, gas_price: u128) -> (PrivateKeySigner, TxEnvelope, Bytes) {
         let signer = test_signer();
         let mut tx = TxLegacy {
             chain_id,
             nonce: 0,
-            gas_price: 1,
+            gas_price,
             gas_limit: 21_000,
             to: TxKind::Call(Address::ZERO),
             value: U256::ZERO,
@@ -563,7 +596,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_source_chain_id_is_rejected() {
-        let (signer, envelope, raw) = signed_legacy(None);
+        let (signer, envelope, raw) = signed_legacy(None, 1);
         let pool = HeldPool::new();
         let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
 
@@ -585,8 +618,84 @@ mod tests {
             gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await,
         );
 
-        assert!(msg.contains("EIP-4844 blob transactions are unsupported"));
+        assert!(msg.contains("unsupported transaction type"));
         assert_eq!(pool.len(), 0, "rejected tx from {signer:?} mutated pool");
+    }
+
+    #[tokio::test]
+    async fn legacy_gas_price_is_both_cap_and_tip_for_replacement() {
+        let (_, original, original_raw) = signed_legacy(Some(31337), 100);
+        let (_, underpriced, underpriced_raw) = signed_legacy(Some(31337), 105);
+        let (_, replacement, replacement_raw) = signed_legacy(Some(31337), 110);
+        let pool = HeldPool::new();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
+        for _ in 0..3 {
+            asserter.push_success(&U256::from(10_000_000u64));
+            asserter.push_success(&0_u64);
+        }
+
+        assert!(matches!(
+            gate_and_hold(&original, &original_raw, Direction::Inbound, &pool, 31337, &provider)
+                .await,
+            Admission::Held(_)
+        ));
+        // 5% gas_price bump < 10% → rejected on both fee dimensions.
+        let msg = rejection(
+            gate_and_hold(
+                &underpriced,
+                &underpriced_raw,
+                Direction::Inbound,
+                &pool,
+                31337,
+                &provider,
+            )
+            .await,
+        );
+        assert!(msg.contains("replacement underpriced"), "{msg}");
+        // 10% bump → replaces.
+        assert!(matches!(
+            gate_and_hold(
+                &replacement,
+                &replacement_raw,
+                Direction::Inbound,
+                &pool,
+                31337,
+                &provider,
+            )
+            .await,
+            Admission::Held(_)
+        ));
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn eip7702_envelope_is_rejected() {
+        let signer = test_signer();
+        let mut tx = alloy_consensus::TxEip7702 {
+            chain_id: 31337,
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: Address::ZERO,
+            value: U256::ZERO,
+            access_list: alloy_eips::eip2930::AccessList::default(),
+            authorization_list: vec![],
+            input: Bytes::default(),
+        };
+        let sig = signer.sign_transaction_sync(&mut tx).expect("tx signs");
+        let envelope = TxEnvelope::from(tx.into_signed(sig));
+        let raw = Bytes::from(envelope.encoded_2718());
+        let pool = HeldPool::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
+
+        let msg = rejection(
+            gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await,
+        );
+
+        assert!(msg.contains("unsupported transaction type"), "{msg}");
+        assert_eq!(pool.len(), 0);
     }
 
     #[tokio::test]
@@ -678,13 +787,18 @@ mod tests {
             .unwrap()
     }
 
-    fn signed_transfer(signer: &PrivateKeySigner, nonce: u64, value: u64) -> (TxEnvelope, Bytes) {
+    fn signed_transfer(
+        signer: &PrivateKeySigner,
+        nonce: u64,
+        value: u64,
+        max_fee_per_gas: u128,
+    ) -> (TxEnvelope, Bytes) {
         let mut tx = TxEip1559 {
             chain_id: 1,
             nonce,
             gas_limit: 21_000,
-            max_fee_per_gas: 1,
-            max_priority_fee_per_gas: 1,
+            max_fee_per_gas,
+            max_priority_fee_per_gas: max_fee_per_gas,
             to: TxKind::Call(Address::repeat_byte(0x42)),
             value: U256::from(value),
             access_list: AccessList::default(),
@@ -699,10 +813,10 @@ mod tests {
     #[tokio::test]
     async fn gate_handles_landed_but_not_derived_reservation() {
         let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap();
-        let (first, first_raw) = signed_transfer(&signer, 0, 1);
-        let (same_nonce, same_nonce_raw) = signed_transfer(&signer, 0, 2);
-        let (next, next_raw) = signed_transfer(&signer, 1, 3);
-        let (gapped, gapped_raw) = signed_transfer(&signer, 2, 4);
+        let (first, first_raw) = signed_transfer(&signer, 0, 1, 1);
+        let (same_nonce, same_nonce_raw) = signed_transfer(&signer, 0, 2, 2);
+        let (next, next_raw) = signed_transfer(&signer, 1, 3, 1);
+        let (gapped, gapped_raw) = signed_transfer(&signer, 2, 4, 1);
         let pool = HeldPool::new();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
@@ -763,14 +877,15 @@ mod tests {
     #[tokio::test]
     async fn gate_replaces_queued_nonce_and_preserves_higher_suffix() {
         let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap();
-        let (original, original_raw) = signed_transfer(&signer, 0, 1);
-        let (suffix, suffix_raw) = signed_transfer(&signer, 1, 2);
-        let (replacement, replacement_raw) = signed_transfer(&signer, 0, 3);
+        let (original, original_raw) = signed_transfer(&signer, 0, 1, 1);
+        let (suffix, suffix_raw) = signed_transfer(&signer, 1, 2, 1);
+        let (replacement, replacement_raw) = signed_transfer(&signer, 0, 3, 2);
+        let (underpriced, underpriced_raw) = signed_transfer(&signer, 0, 4, 1);
         let pool = HeldPool::new();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
 
-        for _ in 0..3 {
+        for _ in 0..4 {
             asserter.push_success(&U256::from(1_000_000u64));
             asserter.push_success(&0_u64);
         }
@@ -787,6 +902,20 @@ mod tests {
         else {
             panic!("original transaction should be held");
         };
+        // Equal fee (no bump) → replacement of the queued original rejected.
+        let Admission::Rejected(msg) = gate_and_hold(
+            &underpriced,
+            &underpriced_raw,
+            Direction::Inbound,
+            &pool,
+            1,
+            &provider,
+        )
+        .await
+        else {
+            panic!("equal-fee replacement must be rejected");
+        };
+        assert!(msg.contains("replacement underpriced"), "{msg}");
         let Admission::Held(suffix_hash) = gate_and_hold(
             &suffix,
             &suffix_raw,
@@ -822,13 +951,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mismatched_upstream_chain_id_aborts_front_startup() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
+        asserter.push_success(&2_u64);
+
+        let err = run_cross_chain_front(
+            free_port(),
+            "http://127.0.0.1:1".into(),
+            Direction::Inbound,
+            Arc::new(HeldPool::new()),
+            provider,
+            1,
+        )
+        .await
+        .expect_err("front must refuse to start on a chain-id mismatch");
+
+        let msg = err.to_string();
+        assert!(msg.contains("chain id 2"), "{msg}");
+        assert!(msg.contains("expected 1"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn failed_upstream_chain_id_lookup_aborts_front_startup() {
+        // Empty asserter queue → the startup lookup errors.
+        let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
+
+        let err = run_cross_chain_front(
+            free_port(),
+            "http://127.0.0.1:1".into(),
+            Direction::Inbound,
+            Arc::new(HeldPool::new()),
+            provider,
+            1,
+        )
+        .await
+        .expect_err("front must refuse to start when the chain id lookup fails");
+
+        assert!(err.to_string().contains("chain id lookup failed"), "{err}");
+    }
+
+    #[tokio::test]
     async fn real_http_fronts_route_directions_and_preserve_replacement_suffix() {
         let inbound_signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap();
         let outbound_signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(2)).unwrap();
-        let (_, inbound_original) = signed_transfer(&inbound_signer, 0, 1);
-        let (_, inbound_suffix) = signed_transfer(&inbound_signer, 1, 2);
-        let (_, inbound_replacement) = signed_transfer(&inbound_signer, 0, 3);
-        let (_, outbound) = signed_transfer(&outbound_signer, 0, 4);
+        let (_, inbound_original) = signed_transfer(&inbound_signer, 0, 1, 1);
+        let (_, inbound_suffix) = signed_transfer(&inbound_signer, 1, 2, 1);
+        let (_, inbound_replacement) = signed_transfer(&inbound_signer, 0, 3, 2);
+        let (_, outbound) = signed_transfer(&outbound_signer, 0, 4, 1);
 
         let pool = Arc::new(HeldPool::new());
         let inbound_port = free_port();
@@ -837,6 +1007,8 @@ mod tests {
         let inbound_asserter = Asserter::new();
         let inbound_provider =
             ProviderBuilder::default().connect_mocked_client(inbound_asserter.clone());
+        // First response feeds the front's startup chain-id sanity check.
+        inbound_asserter.push_success(&1_u64);
         for _ in 0..3 {
             inbound_asserter.push_success(&U256::from(1_000_000u64));
             inbound_asserter.push_success(&0_u64);
@@ -844,6 +1016,7 @@ mod tests {
         let outbound_asserter = Asserter::new();
         let outbound_provider =
             ProviderBuilder::default().connect_mocked_client(outbound_asserter.clone());
+        outbound_asserter.push_success(&1_u64);
         outbound_asserter.push_success(&U256::from(1_000_000u64));
         outbound_asserter.push_success(&0_u64);
 

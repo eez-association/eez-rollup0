@@ -294,6 +294,8 @@ mod tests {
             raw_tx: raw,
             hash,
             attempts: 0,
+            max_fee_per_gas: u128::from(tag),
+            priority_fee_per_gas: u128::from(tag),
             sender: alloy_primitives::Address::repeat_byte(tag),
             nonce: u64::from(tag),
             direction: crate::ingress::Direction::Inbound,
