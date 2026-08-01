@@ -96,8 +96,9 @@ pub enum AdmissionError {
 /// Smallest fee a replacement must offer over `replaced`: ≥10% more,
 /// always at least +1 (bars equal-fee churn).
 fn min_replacement_fee(replaced: u128) -> u128 {
-    let required_increase = (replaced / 100)
+    let required_increase = (replaced
         .saturating_mul(REPLACEMENT_TX_COST_PERCENT)
+        / 100)
         .max(1);
     replaced.saturating_add(required_increase)
 }
