@@ -10,10 +10,10 @@ import {IProofSystem} from "sync-rollups-protocol/src/interfaces/IProofSystem.so
 ///
 /// @dev    This is the real counterpart of `MockECDSAProofSystem` (which ignores
 ///         the hash and recovers a fixed digest). Here the off-chain attester —
-///         `eez-proverd`, after stateless re-execution + the settlement gates —
+///         `eez-proof-signer`, after stateless re-execution and settlement gates —
 ///         signs the recomputed `publicInputsHash`; `verify` recovers against
 ///         that same hash, so the proof is BOUND to the batch. Sound only when
-///         the attester signs a hash it actually re-executed (proverd enforces
+///         the attester signs a hash it actually re-executed (the signer enforces
 ///         this: validator mandatory, sign only if every gate passes).
 ///
 ///         Proof shape: `abi.encodePacked(r, s, v)` — 32 + 32 + 1 = 65 bytes.
@@ -65,7 +65,8 @@ contract ECDSAProofSystem is IProofSystem {
 
         // Reject high-`s` (malleable) signatures: EIP-2 canonical form requires
         // `s <= secp256k1_n/2`. The off-chain signer already emits low-`s` (see
-        // eez-evm/src/signer.rs, which documents this verifier enforcing it), so
+        // crates/eez-protocol/src/signer.rs, which documents the low-`s`
+        // guarantee), so
         // a malleated twin of a valid attestation must not also verify. Constant
         // is secp256k1_n/2 (OpenZeppelin ECDSA `_HALF_N`).
         if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {

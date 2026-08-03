@@ -25,7 +25,7 @@ help:
 	@echo "  make check            - cargo fmt --check + clippy + check (workspace)"
 	@echo "  make test             - cargo test + forge test"
 	@echo "  make fmt              - cargo fmt + forge fmt"
-	@echo "  make deploy-protocol  - deploy EEZ + Mock PS + Rollup manager + register; writes deployments.env"
+	@echo "  make deploy-protocol  - deploy EEZ + ECDSA PS + Rollup manager + register; writes deployments.env"
 	@echo "  make run-node         - run eez-node against the configured L2 datadir"
 	@echo "  make clean-l2         - rm EEZ_L2_DATADIR (fresh L2 chain)"
 	@echo "  make clean-deploy     - rm deployments.env (fresh contract addresses on next deploy)"
@@ -49,13 +49,14 @@ fmt:
 
 # ─── Contracts ────────────────────────────────────────────────────────────
 #
-# Runs the 4-step deploy sequence:
+# Runs the 5-step deploy sequence:
 #
 #   1. DeployEEZ                 → EEZ_REGISTRY_ADDRESS + deploy block
-#   2. DeployMockECDSAProofSystem → EEZ_ECDSA_PROOF_SYSTEM_ADDRESS
-#                                    (authorizedSigner derived from EEZ_PROOF_SIGNER_KEY)
+#   2. DeployECDSAProofSystem     → EEZ_ECDSA_PROOF_SYSTEM_ADDRESS
+#                                   (authorizedSigner derived from EEZ_PROOF_SIGNER_KEY)
 #   3. DeployRollup              → Rollup manager contract
 #   4. RegisterRollup            → EEZ_ROLLUP_ID = 1
+#   5. DeployBridgeL1            → L1 cross-chain bridge contracts
 #
 # Outputs land in deployments.env (gitignored). eez-node loads it
 # alongside .env at startup, so a successful deploy means `make run-node`

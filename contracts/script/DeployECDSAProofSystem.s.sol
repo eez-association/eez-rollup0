@@ -16,7 +16,7 @@ import {ECDSAProofSystem} from "../src/ECDSAProofSystem.sol";
 ///             --sig "run(address)" $ATTESTER
 ///             --rpc-url $L1_RPC --broadcast --private-key $PK
 ///
-///         `$ATTESTER` is the address whose key (on `eez-proverd`) signs the
+///         `$ATTESTER` is the address whose key `eez-proof-signer` uses to sign the
 ///         recomputed `publicInputsHash`.
 contract DeployECDSAProofSystem is Script {
     function run(address attester) external {

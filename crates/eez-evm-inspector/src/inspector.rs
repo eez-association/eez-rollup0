@@ -594,18 +594,18 @@ where
             }
             // Apply live values to the cloned cache.
             for (addr, slot, value) in live_storage {
-                if let Some(acc) = cache.accounts.get_mut(&addr) {
-                    if let Some(plain) = acc.account.as_mut() {
-                        plain.storage.insert(slot, value);
-                    }
+                if let Some(acc) = cache.accounts.get_mut(&addr)
+                    && let Some(plain) = acc.account.as_mut()
+                {
+                    plain.storage.insert(slot, value);
                 }
             }
             for (addr, balance, nonce) in live_account_info {
-                if let Some(acc) = cache.accounts.get_mut(&addr) {
-                    if let Some(plain) = acc.account.as_mut() {
-                        plain.info.balance = balance;
-                        plain.info.nonce = nonce;
-                    }
+                if let Some(acc) = cache.accounts.get_mut(&addr)
+                    && let Some(plain) = acc.account.as_mut()
+                {
+                    plain.info.balance = balance;
+                    plain.info.nonce = nonce;
                 }
             }
             before_snapshot = Some(cache.clone());
@@ -627,12 +627,12 @@ where
                 .overlay_channel
                 .as_ref()
                 .and_then(|c| c.pop_post_cache());
-            if let (Some(before), Some(after)) = (before_snapshot.as_ref(), after_opt.as_ref()) {
-                if let Err(e) = crate::overlay::apply_overlay_diff(context, before, after) {
-                    self.record_error(ExecutorError::evm(format!(
-                        "overlay diff-apply failed: {e}"
-                    )));
-                }
+            if let (Some(before), Some(after)) = (before_snapshot.as_ref(), after_opt.as_ref())
+                && let Err(e) = crate::overlay::apply_overlay_diff(context, before, after)
+            {
+                self.record_error(ExecutorError::evm(format!(
+                    "overlay diff-apply failed: {e}"
+                )));
             }
             if let Some(channel) = &self.overlay_channel {
                 channel.pop_pre_snapshot();

@@ -1520,10 +1520,10 @@ where
         for log in receipt.logs() {
             if log.address == ccm_l2 {
                 let topics = log.data.topics();
-                if topics.first() == Some(&sig) {
-                    if let Some(h) = topics.get(1) {
-                        hashes.push(*h);
-                    }
+                if topics.first() == Some(&sig)
+                    && let Some(h) = topics.get(1)
+                {
+                    hashes.push(*h);
                 }
             }
         }

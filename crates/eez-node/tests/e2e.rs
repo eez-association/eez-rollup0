@@ -21,7 +21,7 @@ use common::{
     wait_for_safe_prefix_convergence, wait_for_safe_state,
 };
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
+const DEFAULT_TIMEOUT: Duration = Duration::from_mins(3);
 
 fn with_composer_disabled(mut env: Vec<(&'static str, String)>) -> Vec<(&'static str, String)> {
     env.push(("EEZ_COMPOSER_DISABLED", "1".to_string()));
@@ -262,7 +262,7 @@ async fn failure_l1_outage_recovery() {
     let _node = NodeHandle::spawn(datadir.path(), &harness.env()).unwrap();
 
     let n_before = chain
-        .wait_for_batches(2, Duration::from_secs(60))
+        .wait_for_batches(2, Duration::from_mins(1))
         .await
         .unwrap();
 
@@ -288,7 +288,7 @@ async fn failure_l1_outage_recovery() {
         .await
         .unwrap();
     chain
-        .wait_for_batches(n_before + 1, Duration::from_secs(60))
+        .wait_for_batches(n_before + 1, Duration::from_mins(1))
         .await
         .expect("composer did not recover after balance restored");
 }

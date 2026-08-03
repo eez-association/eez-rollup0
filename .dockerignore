@@ -2,7 +2,7 @@
 # Everything else (esp. the 20 GB chiado snapshot + target/) must stay out
 # of the build context or `docker build` ships it to the daemon.
 .git/
-target/
+**/target/
 chiado-db/
 data/
 datadir/

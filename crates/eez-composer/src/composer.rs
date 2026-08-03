@@ -99,13 +99,10 @@ pub struct CrossChainExecCtx {
     pub l1_post_batch_priority_fee: u128,
     /// Address of the rollup's on-chain proof-system contract, embedded
     /// in `batch.proofSystems[0]`; `EEZ.postAndVerifyBatch` iterates
-    /// `proofSystems[]` and calls `verify` on each. The composer-
-    /// controlled-prover deploy (`deploy-real.sh`) registers the real
-    /// `ECDSAProofSystem`: `ECDSA.recover(publicInputsHash, proof) ==
-    /// signer`, binding the attestation to the batch's real
-    /// `publicInputsHash` (proverd signs that exact hash). The mock
-    /// deploy (`deploy.sh`) instead registers `MockECDSAProofSystem`,
-    /// which ignores `publicInputsHash` and checks a fixed digest.
+    /// `proofSystems[]` and calls `verify` on each. Deployment registers
+    /// `ECDSAProofSystem`, which requires
+    /// `ECDSA.recover(publicInputsHash, proof) == signer`; the remote proof
+    /// signer signs that exact hash after validating the batch.
     pub ecdsa_proof_system_address: Address,
     /// L2 rollup id, embedded in
     /// `batch.rollupIdsWithProofSystems[0].rollupId` so the L1
@@ -2207,13 +2204,13 @@ where
         // (EIP-2935 / EIP-4788 system writes), so `parent.stateRoot` differs from
         // the re-executed final root and the endpoint gate would fail. With
         // effects, the last effect's root already is the final root.
-        if pair_roots.is_empty() {
-            if let Some(last) = batch.entries.last_mut() {
-                for delta in last.stateDeltas.iter_mut().rev() {
-                    if delta.rollupId == rollup_id_u256 {
-                        delta.newState = sync_block_state_root;
-                        break;
-                    }
+        if pair_roots.is_empty()
+            && let Some(last) = batch.entries.last_mut()
+        {
+            for delta in last.stateDeltas.iter_mut().rev() {
+                if delta.rollupId == rollup_id_u256 {
+                    delta.newState = sync_block_state_root;
+                    break;
                 }
             }
         }

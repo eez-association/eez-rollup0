@@ -39,6 +39,7 @@ _http() { case "$1" in http*) echo "$1";; "") echo "";; *) echo "http://$1";; es
     || { echo "could not resolve enclave ports — is '$ENCLAVE' up? (kurtosis enclave inspect $ENCLAVE)"; exit 1; }
 
 NODE_LOG="${EEZ_NODE_LOG:-$LOG_DIR/wave-$MODE-node.log}"
+SIGNER_LOG="${EEZ_PROOF_SIGNER_LOG:-$LOG_DIR/wave-$MODE-proof-signer.log}"
 DEPLOY_DIR="$(mktemp -d /tmp/eez-deployments.XXXXXX)"
 trap 'rm -rf "$DEPLOY_DIR"' EXIT
 
@@ -243,6 +244,7 @@ FILLER_PER_GAP="${EEZ_FILLER_PER_GAP:-2}"
 PURE_RECIPIENT=0x2222222222222222222222222222222222222222
 
 refresh_node_log() { kurtosis service logs "$ENCLAVE" eez-node >"$NODE_LOG" 2>&1 || true; }
+refresh_signer_log() { kurtosis service logs "$ENCLAVE" eez-proof-signer >"$SIGNER_LOG" 2>&1 || true; }
 strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
 
 # receipt_status <hash> <rpc> → "1" mined-ok, "0x0" reverted, "missing"
@@ -458,7 +460,7 @@ run_waves() {
     # ── Assertions ──────────────────────────────────────────────────────
     echo
     echo "==> assertions"
-    local ok_all=1
+    local ok_all=1 signer_ok=0 attested_hash=""
 
     check_eq() { # <label> <actual> <expected>
         if [[ "$2" == "$3" && -n "$3" ]]; then
@@ -558,12 +560,35 @@ run_waves() {
     DROPS=$(grep -c "bundle dropped" "$NODE_LOG" 2>/dev/null || true); DROPS=${DROPS:-0}
     echo "    ℹ dropped-bundle log lines: $DROPS"
 
+    # Correlate the composer's accepted attestation with the signer's completed
+    # validation pipeline.
+    local signer_line=""
+    refresh_node_log
+    refresh_signer_log
+    attested_hash=$(strip_ansi <"$NODE_LOG" | grep 'remote prover attested the window' \
+        | grep -oE 'hash=0x[0-9a-fA-F]{64}' | tail -1 | cut -d= -f2 || true)
+    if [[ -n "$attested_hash" ]]; then
+        signer_line=$(strip_ansi <"$SIGNER_LOG" \
+            | grep -F "recomputed_public_inputs_hash=$attested_hash" | tail -1 || true)
+    fi
+    if [[ "$signer_line" == *"window validated and signed"* ]]; then
+        signer_ok=1
+    fi
+
     echo
     if (( ok_all )); then
         echo "==> WAVE TEST PASSED (mode=$MODE waves=$WAVES, $total cross-chain ops, $PB_COUNT PBs)"
-        exit 0
     else
         echo "==> WAVE TEST FAILED (mode=$MODE)"
+    fi
+    if (( signer_ok )); then
+        echo "==> PROOF SIGNER TEST PASSED (publicInputsHash=$attested_hash)"
+    else
+        echo "==> PROOF SIGNER TEST FAILED (no matching validated signer attestation)"
+    fi
+    if (( ok_all && signer_ok )); then
+        exit 0
+    else
         exit 1
     fi
 }

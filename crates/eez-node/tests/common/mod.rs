@@ -931,7 +931,7 @@ impl NodeHandle {
         env: &[(&'static str, String)],
     ) -> Result<Self> {
         let handle = Self::spawn_with(name, datadir, cfg, env)?;
-        wait_for_l2_rpc(&handle.l2_rpc_url(), Duration::from_secs(180)).await?;
+        wait_for_l2_rpc(&handle.l2_rpc_url(), Duration::from_mins(3)).await?;
         Ok(handle)
     }
 
@@ -1594,7 +1594,7 @@ async fn wait_for_successful_receipt(
     action: &str,
 ) -> Result<TransactionReceipt> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let receipt = wait_for(Duration::from_secs(60), || {
+    let receipt = wait_for(Duration::from_mins(1), || {
         let provider = provider.clone();
         async move { Ok(provider.get_transaction_receipt(hash).await?) }
     })
@@ -1993,7 +1993,7 @@ impl CrossChainConfig {
 }
 
 pub const SETUP_TIMEOUT: Duration = Duration::from_secs(90);
-pub const SETTLE_TIMEOUT: Duration = Duration::from_secs(180);
+pub const SETTLE_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// Separate deployer keeps CREATE addresses deterministic.
 pub const TARGET_DEPLOYER: &str = ANVIL_KEY_3;

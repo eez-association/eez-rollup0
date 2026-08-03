@@ -146,7 +146,7 @@ impl RollupTiming {
                 "all timing fields (l1_block_time, l2_block_time, proof_time) must be > 0",
             ));
         }
-        if self.l2_block_time_ms % 1000 != 0 {
+        if !self.l2_block_time_ms.is_multiple_of(1000) {
             return Err(DriverError::timing_config(format!(
                 "L2 block time ({} ms) must be a whole number of seconds; \
                  unix block timestamps are integer-second and the sync-slot \
@@ -154,7 +154,7 @@ impl RollupTiming {
                 self.l2_block_time_ms,
             )));
         }
-        if self.l1_block_time_ms % self.l2_block_time_ms != 0 {
+        if !self.l1_block_time_ms.is_multiple_of(self.l2_block_time_ms) {
             return Err(DriverError::timing_config(format!(
                 "L1 block time ({} ms) must be an integer multiple of L2 block time ({} ms); K must be integer",
                 self.l1_block_time_ms, self.l2_block_time_ms,

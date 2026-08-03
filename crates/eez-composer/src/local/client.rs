@@ -207,8 +207,8 @@ impl LocalChainClient {
     /// L2 slot. Consumed by source-sim and target-session inspectors
     /// via the shared [`SessionInspectorFactory`].
     fn proxy_lookup_config(&self) -> ProxyLookupConfig {
-        // Slot derives from dialect (per Codex's design constraint:
-        // ChainDialect terminates at config accessors — `LocalChainClient`
+        // Slot derives from the selected protocol dialect. `ChainDialect`
+        // terminates at config accessors: `LocalChainClient`
         // reads the plain `u8` slot; the dialect itself never crosses
         // into inspector code).
         ProxyLookupConfig {
