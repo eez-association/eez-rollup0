@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 150
     env:
-      KURTOSIS_ENCLAVE: eez-pr-${{ github.run_id }}-${{ github.run_attempt }}
+      KURTOSIS_ENCLAVE: eez-ci
       EEZ_NODE_IMAGE: eez-node:ci-${{ github.sha }}
       EEZ_PROOF_SIGNER_IMAGE: eez-proof-signer:ci-${{ github.sha }}
       EEZ_DEPLOY_IMAGE: eez-deploy:ci-${{ github.sha }}

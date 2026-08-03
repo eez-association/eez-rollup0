@@ -37,7 +37,7 @@ eez:
   proof_signer_key: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
   l1_block_time_ms: 12000
   l2_block_time_ms: 2000
-  proof_time_ms: 1000
+  proof_time_ms: 5000
   submission_slack_ms: 500
   max_speculative_depth: 0
 
