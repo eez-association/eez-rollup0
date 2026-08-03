@@ -111,17 +111,16 @@ pub async fn gate_and_hold(
     };
     if let Err(err) = held_pool.push_contiguous(tx, on_chain) {
         return Admission::Rejected(match err {
-            AdmissionError::Nonce(err) => format!(
-                "invalid nonce {nonce} for {sender}: expected next unreserved nonce {} (source-chain nonce {})",
-                err.expected, err.on_chain
+            AdmissionError::Nonce { expected, on_chain } => format!(
+                "invalid nonce {nonce} for {sender}: expected next unreserved nonce {expected} (source-chain nonce {on_chain})"
             ),
             AdmissionError::UnderpricedReplacement {
                 offered_max_fee,
-                min_max_fee,
+                required_max_fee,
                 offered_priority_fee,
-                min_priority_fee,
+                required_priority_fee,
             } => format!(
-                "replacement underpriced for {sender} nonce {nonce}: max_fee_per_gas {offered_max_fee} (need {min_max_fee}), priority fee {offered_priority_fee} (need {min_priority_fee})"
+                "replacement underpriced for {sender} nonce {nonce}: max_fee_per_gas {offered_max_fee} (need {required_max_fee}), priority fee {offered_priority_fee} (need {required_priority_fee})"
             ),
         });
     }
@@ -191,6 +190,26 @@ struct Ctx {
     expected_source_chain_id: u64,
 }
 
+/// Verify that a configured cross-chain front points at its expected source chain.
+///
+/// # Errors
+///
+/// Returns an error when the upstream chain ID cannot be read or does not match.
+pub async fn validate_cross_chain_front(
+    validation_provider: &RootProvider,
+    expected_source_chain_id: u64,
+) -> eyre::Result<()> {
+    let upstream = validation_provider.get_chain_id().await.map_err(|e| {
+        eyre::eyre!("cross-chain front: upstream chain id lookup failed at startup: {e}")
+    })?;
+    if upstream != expected_source_chain_id {
+        return Err(eyre::eyre!(
+            "cross-chain front misconfigured: upstream RPC reports chain id {upstream}, expected {expected_source_chain_id}"
+        ));
+    }
+    Ok(())
+}
+
 /// Run a transparent cross-chain front on `port`, forwarding every `eth_*` to
 /// `upstream_rpc_url` (the source chain's node) and holding intercepted
 /// `eth_sendRawTransaction`s with `direction`. Never returns under normal op.
@@ -205,17 +224,6 @@ pub async fn run_cross_chain_front(
     validation_provider: RootProvider,
     expected_source_chain_id: u64,
 ) -> eyre::Result<()> {
-    // The configured chain id and the upstream URL are independent config;
-    // a mismatch would reject every valid tx at the door. Verify at boot
-    // and refuse to start on lookup failure or mismatch.
-    let upstream = validation_provider.get_chain_id().await.map_err(|e| {
-        eyre::eyre!("cross-chain front: upstream chain id lookup failed at startup: {e}")
-    })?;
-    if upstream != expected_source_chain_id {
-        return Err(eyre::eyre!(
-            "cross-chain front misconfigured: upstream RPC reports chain id {upstream}, expected {expected_source_chain_id}"
-        ));
-    }
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
     let client = reqwest::Client::builder()
@@ -519,7 +527,10 @@ mod tests {
         (signer, envelope, raw)
     }
 
-    fn signed_legacy(chain_id: Option<u64>, gas_price: u128) -> (PrivateKeySigner, TxEnvelope, Bytes) {
+    fn signed_legacy(
+        chain_id: Option<u64>,
+        gas_price: u128,
+    ) -> (PrivateKeySigner, TxEnvelope, Bytes) {
         let signer = test_signer();
         let mut tx = TxLegacy {
             chain_id,
@@ -636,8 +647,15 @@ mod tests {
         }
 
         assert!(matches!(
-            gate_and_hold(&original, &original_raw, Direction::Inbound, &pool, 31337, &provider)
-                .await,
+            gate_and_hold(
+                &original,
+                &original_raw,
+                Direction::Inbound,
+                &pool,
+                31337,
+                &provider
+            )
+            .await,
             Admission::Held(_)
         ));
         // 5% gas_price bump < 10% → rejected on both fee dimensions.
@@ -877,16 +895,16 @@ mod tests {
     #[tokio::test]
     async fn gate_replaces_queued_nonce_and_preserves_higher_suffix() {
         let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap();
-        let (original, original_raw) = signed_transfer(&signer, 0, 1, 1);
-        let (suffix, suffix_raw) = signed_transfer(&signer, 1, 2, 1);
-        let (replacement, replacement_raw) = signed_transfer(&signer, 0, 3, 2);
-        let (underpriced, underpriced_raw) = signed_transfer(&signer, 0, 4, 1);
+        let (original, original_raw) = signed_transfer(&signer, 0, 1, 100);
+        let (suffix, suffix_raw) = signed_transfer(&signer, 1, 2, 100);
+        let (replacement, replacement_raw) = signed_transfer(&signer, 0, 3, 110);
+        let (underpriced, underpriced_raw) = signed_transfer(&signer, 0, 4, 109);
         let pool = HeldPool::new();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
 
         for _ in 0..4 {
-            asserter.push_success(&U256::from(1_000_000u64));
+            asserter.push_success(&U256::from(10_000_000u64));
             asserter.push_success(&0_u64);
         }
 
@@ -902,7 +920,7 @@ mod tests {
         else {
             panic!("original transaction should be held");
         };
-        // Equal fee (no bump) → replacement of the queued original rejected.
+        // A 9% bump is below the required 10% replacement threshold.
         let Admission::Rejected(msg) = gate_and_hold(
             &underpriced,
             &underpriced_raw,
@@ -913,7 +931,7 @@ mod tests {
         )
         .await
         else {
-            panic!("equal-fee replacement must be rejected");
+            panic!("underpriced replacement must be rejected");
         };
         assert!(msg.contains("replacement underpriced"), "{msg}");
         let Admission::Held(suffix_hash) = gate_and_hold(
@@ -956,16 +974,9 @@ mod tests {
         let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
         asserter.push_success(&2_u64);
 
-        let err = run_cross_chain_front(
-            free_port(),
-            "http://127.0.0.1:1".into(),
-            Direction::Inbound,
-            Arc::new(HeldPool::new()),
-            provider,
-            1,
-        )
-        .await
-        .expect_err("front must refuse to start on a chain-id mismatch");
+        let err = validate_cross_chain_front(&provider, 1)
+            .await
+            .expect_err("front must refuse to start on a chain-id mismatch");
 
         let msg = err.to_string();
         assert!(msg.contains("chain id 2"), "{msg}");
@@ -977,16 +988,9 @@ mod tests {
         // Empty asserter queue → the startup lookup errors.
         let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
 
-        let err = run_cross_chain_front(
-            free_port(),
-            "http://127.0.0.1:1".into(),
-            Direction::Inbound,
-            Arc::new(HeldPool::new()),
-            provider,
-            1,
-        )
-        .await
-        .expect_err("front must refuse to start when the chain id lookup fails");
+        let err = validate_cross_chain_front(&provider, 1)
+            .await
+            .expect_err("front must refuse to start when the chain id lookup fails");
 
         assert!(err.to_string().contains("chain id lookup failed"), "{err}");
     }
@@ -1007,8 +1011,6 @@ mod tests {
         let inbound_asserter = Asserter::new();
         let inbound_provider =
             ProviderBuilder::default().connect_mocked_client(inbound_asserter.clone());
-        // First response feeds the front's startup chain-id sanity check.
-        inbound_asserter.push_success(&1_u64);
         for _ in 0..3 {
             inbound_asserter.push_success(&U256::from(1_000_000u64));
             inbound_asserter.push_success(&0_u64);
@@ -1016,7 +1018,6 @@ mod tests {
         let outbound_asserter = Asserter::new();
         let outbound_provider =
             ProviderBuilder::default().connect_mocked_client(outbound_asserter.clone());
-        outbound_asserter.push_success(&1_u64);
         outbound_asserter.push_success(&U256::from(1_000_000u64));
         outbound_asserter.push_success(&0_u64);
 

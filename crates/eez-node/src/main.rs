@@ -819,11 +819,35 @@ fn main() -> eyre::Result<()> {
             }
         }
 
+        let l2_source_chain_id = chain_spec.chain().id();
+        // Resolve and validate enabled fronts before spawning the deriver,
+        // sequencer, or composer. A configured front is required infrastructure,
+        // so a bad or unavailable upstream must fail node launch rather than
+        // leave a healthy-looking node running without cross-chain ingress.
+        let mut xchain_fronts = Vec::new();
+        if mode == Mode::Composer {
+            let l1_source_chain_id =
+                l1_source_chain_id.expect("composer mode sets L1 source chain id");
+            for spec in xchain_front_specs(l1_source_chain_id, l2_source_chain_id) {
+                let Some((port, url, parsed)) =
+                    read_xchain_front_config(spec.port_env, spec.url_env)?
+                else {
+                    continue;
+                };
+                let validation_provider = alloy_provider::RootProvider::new_http(parsed);
+                ingress::validate_cross_chain_front(
+                    &validation_provider,
+                    spec.expected_source_chain_id,
+                )
+                .await?;
+                xchain_fronts.push((spec, port, url, validation_provider));
+            }
+        }
+
         // Deriver: drives BlockCommitter from L1Events (follower +
         // composer). A wired `SystemTxContext` makes it reconstruct the
         // same L2 system txs the composer produced (single-source STF).
         let l2_block_time_secs = timing.l2_block_time().as_secs();
-        let l2_source_chain_id = chain_spec.chain().id();
         let deriver = Deriver::new(
             l1_watcher.clone(),
             block_committer.clone(),
@@ -930,29 +954,19 @@ fn main() -> eyre::Result<()> {
             // no front for that chain):
             //   L1 front (EEZ_L1_XCHAIN_PORT → EEZ_L1_RPC_URL): L1→L2 Inbound.
             //   L2 front (EEZ_L2_XCHAIN_PORT → EEZ_L2_RPC_URL): L2→L1 Outbound.
-            let l1_source_chain_id =
-                l1_source_chain_id.expect("composer mode sets L1 source chain id");
-            for spec in xchain_front_specs(l1_source_chain_id, l2_source_chain_id) {
-                let Some((port, url, parsed)) =
-                    read_xchain_front_config(spec.port_env, spec.url_env)?
-                else {
-                    continue;
-                };
+            for (spec, port, url, validation_provider) in xchain_fronts {
                 let pool = Arc::clone(&held_pool);
-                let provider = alloy_provider::RootProvider::new_http(parsed);
                 task_executor.spawn_critical_task(spec.task, async move {
-                    if let Err(e) = ingress::run_cross_chain_front(
+                    ingress::run_cross_chain_front(
                         port,
                         url,
                         spec.direction,
                         pool,
-                        provider,
+                        validation_provider,
                         spec.expected_source_chain_id,
                     )
                     .await
-                    {
-                        event!(name: "eez.xchain_front.exited", Level::ERROR, error = %e, "cross-chain front exited");
-                    }
+                    .unwrap_or_else(|e| panic!("configured cross-chain front exited: {e:#}"));
                 });
             }
         }

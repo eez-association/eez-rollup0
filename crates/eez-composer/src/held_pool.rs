@@ -71,35 +71,25 @@ pub struct HeldTx {
 /// balance check; the tip bump keeps a replacement a real better offer.
 pub const REPLACEMENT_TX_COST_PERCENT: u128 = 10;
 
-/// A nonce-contiguity admission failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NonceAdmissionError {
-    pub expected: u64,
-    pub on_chain: u64,
-}
-
 /// A pool admission failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionError {
     /// Nonce is burned, reserved in-flight, or not the next unreserved slot.
-    Nonce(NonceAdmissionError),
+    Nonce { expected: u64, on_chain: u64 },
     /// Queued-nonce replacement did not bump both fees by the required
-    /// percent. `minimum`s are what the replacement had to offer.
+    /// percent. `required_*` values are what the replacement had to offer.
     UnderpricedReplacement {
         offered_max_fee: u128,
-        min_max_fee: u128,
+        required_max_fee: u128,
         offered_priority_fee: u128,
-        min_priority_fee: u128,
+        required_priority_fee: u128,
     },
 }
 
 /// Smallest fee a replacement must offer over `replaced`: ≥10% more,
 /// always at least +1 (bars equal-fee churn).
 fn min_replacement_fee(replaced: u128) -> u128 {
-    let required_increase = (replaced
-        .saturating_mul(REPLACEMENT_TX_COST_PERCENT)
-        / 100)
-        .max(1);
+    let required_increase = (replaced.saturating_mul(REPLACEMENT_TX_COST_PERCENT) / 100).max(1);
     replaced.saturating_add(required_increase)
 }
 
@@ -219,22 +209,22 @@ impl HeldPool {
             let expected = state
                 .next_expected_nonce(target_sender, target_direction, on_chain)
                 .unwrap_or(u64::MAX);
-            return Err(AdmissionError::Nonce(NonceAdmissionError {
-                expected,
-                on_chain,
-            }));
+            return Err(AdmissionError::Nonce { expected, on_chain });
         }
 
         if let Some(queued_idx) = queued_match {
             // Geth price-bump rule: BOTH fees must bump over the replaced tx.
-            let min_max_fee = min_replacement_fee(state.txs[queued_idx].max_fee_per_gas);
-            let min_priority_fee = min_replacement_fee(state.txs[queued_idx].priority_fee_per_gas);
-            if tx.max_fee_per_gas < min_max_fee || tx.priority_fee_per_gas < min_priority_fee {
+            let required_max_fee = min_replacement_fee(state.txs[queued_idx].max_fee_per_gas);
+            let required_priority_fee =
+                min_replacement_fee(state.txs[queued_idx].priority_fee_per_gas);
+            if tx.max_fee_per_gas < required_max_fee
+                || tx.priority_fee_per_gas < required_priority_fee
+            {
                 return Err(AdmissionError::UnderpricedReplacement {
                     offered_max_fee: tx.max_fee_per_gas,
-                    min_max_fee,
+                    required_max_fee,
                     offered_priority_fee: tx.priority_fee_per_gas,
-                    min_priority_fee,
+                    required_priority_fee,
                 });
             }
             let replacement_hash = tx.hash;
@@ -248,26 +238,23 @@ impl HeldPool {
         if state.in_flight.values().any(|(sender, direction, nonce)| {
             same_chain(*sender, *direction) && *nonce == target_nonce
         }) {
-            return Err(AdmissionError::Nonce(NonceAdmissionError {
+            return Err(AdmissionError::Nonce {
                 expected: state
                     .next_expected_nonce(target_sender, target_direction, on_chain)
                     .unwrap_or(u64::MAX),
                 on_chain,
-            }));
+            });
         }
 
         let Some(expected) = state.next_expected_nonce(target_sender, target_direction, on_chain)
         else {
-            return Err(AdmissionError::Nonce(NonceAdmissionError {
+            return Err(AdmissionError::Nonce {
                 expected: u64::MAX,
                 on_chain,
-            }));
+            });
         };
         if target_nonce != expected {
-            return Err(AdmissionError::Nonce(NonceAdmissionError {
-                expected,
-                on_chain,
-            }));
+            return Err(AdmissionError::Nonce { expected, on_chain });
         }
         state.by_hash.insert(tx.hash);
         state.txs.push_back(tx);
@@ -448,10 +435,10 @@ mod tests {
         replacement.hash = TxHash::from(B256::repeat_byte(9));
         assert_eq!(
             pool.push_contiguous(replacement, 1).unwrap_err(),
-            AdmissionError::Nonce(NonceAdmissionError {
+            AdmissionError::Nonce {
                 expected: 2,
                 on_chain: 1
-            })
+            }
         );
         pool.release_in_flight_batch(&drained);
     }
@@ -473,9 +460,9 @@ mod tests {
             pool.push_contiguous(replacement.clone(), 1).unwrap_err(),
             AdmissionError::UnderpricedReplacement {
                 offered_max_fee: 110,
-                min_max_fee: 110,
+                required_max_fee: 110,
                 offered_priority_fee: 10,
-                min_priority_fee: 11
+                required_priority_fee: 11
             }
         );
 
@@ -604,10 +591,10 @@ mod tests {
         pool.push_contiguous(mk(1, 9), 0).unwrap();
         assert_eq!(
             pool.push_contiguous(mk(0, 8), 0).unwrap_err(),
-            AdmissionError::Nonce(NonceAdmissionError {
+            AdmissionError::Nonce {
                 expected: 3,
                 on_chain: 0
-            })
+            }
         );
         pool.push_contiguous(mk(2, 7), 0).unwrap();
 
@@ -647,10 +634,10 @@ mod tests {
         let err = pool.push_contiguous(mk(4, 4), 1).unwrap_err();
         assert_eq!(
             err,
-            AdmissionError::Nonce(NonceAdmissionError {
+            AdmissionError::Nonce {
                 expected: 3,
                 on_chain: 1
-            })
+            }
         );
 
         pool.release_in_flight_batch(&drained);
@@ -677,10 +664,10 @@ mod tests {
         assert_eq!(drained[0].hash, TxHash::from(B256::repeat_byte(2)));
         assert_eq!(
             pool.push_contiguous(mk(3), u64::MAX).unwrap_err(),
-            AdmissionError::Nonce(NonceAdmissionError {
+            AdmissionError::Nonce {
                 expected: u64::MAX,
                 on_chain: u64::MAX
-            })
+            }
         );
     }
 
