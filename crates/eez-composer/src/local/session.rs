@@ -212,8 +212,7 @@ impl LocalExecutionSession {
         source_address: &Address,
         source_rollup: RollupId,
     ) -> ExecutorResult<eez_protocol::ExecutionOutcome> {
-        let tx_env =
-            self.build_tx_env(destination, calldata, value, source_address, source_rollup)?;
+        let tx_env = self.build_tx_env(destination, calldata, value, source_address, source_rollup);
         let caller = tx_env.caller;
         let pre_root = self.current_root;
         let (return_data, gas_used, success, mut changes) = {
@@ -259,8 +258,7 @@ impl LocalExecutionSession {
         source_address: &Address,
         source_rollup: RollupId,
     ) -> ExecutorResult<eez_protocol::ExecutionOutcome> {
-        let tx_env =
-            self.build_tx_env(destination, calldata, value, source_address, source_rollup)?;
+        let tx_env = self.build_tx_env(destination, calldata, value, source_address, source_rollup);
         let caller = tx_env.caller;
         let pre_root = self.current_root;
         let (return_data, gas_used, success, mut changes, inspector_error) = {
@@ -347,13 +345,13 @@ impl LocalExecutionSession {
     /// between inspected and uninspected paths so the revm input shape
     /// is identical regardless of inspection policy.
     fn build_tx_env(
-        &mut self,
+        &self,
         destination: &Address,
         calldata: &Bytes,
         value: &U256,
         source_address: &Address,
         source_rollup: RollupId,
-    ) -> ExecutorResult<revm::context::TxEnv> {
+    ) -> revm::context::TxEnv {
         let caller = compute_proxy_address(
             self.ccm_address,
             self.proxy_init_code_hash,
@@ -370,7 +368,7 @@ impl LocalExecutionSession {
             calldata_len = calldata.len(),
             "executing direct call on target chain");
 
-        Ok(revm::context::TxEnv {
+        revm::context::TxEnv {
             caller,
             gas_limit: DIRECT_CALL_GAS_LIMIT,
             kind: alloy_primitives::TxKind::Call(*destination),
@@ -378,7 +376,7 @@ impl LocalExecutionSession {
             value: *value,
             chain_id: Some(self.chain_id),
             ..Default::default()
-        })
+        }
     }
 }
 
