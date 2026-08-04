@@ -249,15 +249,6 @@ impl CompositionBuilder {
             .collect()
     }
 
-    /// The recorded cross-chain calls captured so far (preorder). Read
-    /// after `simulate_source_tx` but before `finalize` (which consumes
-    /// `self`) when the caller needs a call's resolved `outcome` (e.g. the
-    /// inbound delivery's `return_data`) to build a downstream transaction.
-    #[must_use]
-    pub fn recorded(&self) -> &[ExecutedAction] {
-        &self.recorded
-    }
-
     /// Apply queued rollbacks before the next target call opens.
     fn process_pending_rollbacks(&mut self) -> ExecutorResult<()> {
         if self.pending_rollbacks.is_empty() {

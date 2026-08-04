@@ -225,21 +225,19 @@ impl CrossChainWiring {
         }
 
         // Phase 2 — compose: drive source simulation (which dispatches
-        // every detected proxy call back into the builder), then
-        // finalize. `recorded` carries the resolved per-call outcomes
-        // (return_data) the byte-locked inbound delivery needs,
-        // captured BEFORE `finalize` consumes the builder.
+        // every detected proxy call back into the builder), then finalize.
+        // Capture the count first because `finalize` consumes the builder.
         let mut builder = eez_protocol::CompositionBuilder::new(entry_id, rollups);
         entry_client
             .simulate_source_tx(raw_tx.to_vec(), &mut builder)
             .map_err(eez_protocol::CompositionError::from)?;
-        let recorded = builder.recorded().to_vec();
+        let recorded_count = builder.recorded_count();
         let composition = builder.finalize()?;
 
         tracing::info!(
             name: "composer.simulate.complete",
             target_count = composition.targets.len(),
-            recorded = recorded.len(),
+            recorded = recorded_count,
             "composition complete"
         );
 
