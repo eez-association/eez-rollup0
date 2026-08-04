@@ -345,10 +345,8 @@ impl CompositionBuilder {
     ///    `EEZ.postAndVerifyBatch`'s
     ///    proof bundle, not system txs).
     /// 3. Call `entries::build_batch` for the source rollup with per-rollup
-    ///    initial state roots; encode via `entries::encode_table_payload`.
-    /// 4. Per **non-entry** rollup: `build_batch` + `encode_table_payload`
-    ///    + `encode_follower_trigger`. One [`TargetComposition`] per
-    ///    rollup.
+    ///    initial state roots.
+    /// 4. Wrap every non-empty target batch in one [`TargetComposition`].
     /// 5. Package as [`Composition`].
     ///
     /// # Errors
@@ -547,18 +545,11 @@ impl CompositionBuilder {
             initial_roots: &initial_roots,
             per_tx_roots_by_rollup: &per_tx_roots_by_rollup,
         };
-        let entry_dialect = self
-            .rollups
-            .get(&self.entry_rollup_id)
-            .expect("entry rollup registered at builder construction")
-            .config
-            .dialect;
         let entry_batch =
             entries::build_batch(&self.recorded, &attribution, self.entry_rollup_id, raw_tx)?;
-        let entry_payload = entries::encode_table_payload(&entry_batch, &entry_dialect);
 
-        // Phase 4 — target compositions (re-encode from the batches
-        // captured in Phase 2). Skip entry rollup + empty groups.
+        // Phase 4 — target compositions from the batches captured in Phase 2.
+        // Skip the entry rollup and empty groups.
         let mut target_compositions: Vec<TargetComposition> = Vec::new();
         for rollup_id in &plan_order {
             if *rollup_id == self.entry_rollup_id {
@@ -567,22 +558,9 @@ impl CompositionBuilder {
             let Some(batch) = target_batches.remove(rollup_id) else {
                 continue;
             };
-            let group_calls = self.group_calls_for(*rollup_id);
-            // group_calls[0] guaranteed non-empty because Phase 2 only
-            // populated `target_batches` for non-empty groups.
-            let outer_root = &group_calls[0];
-            let rollup = self
-                .rollups
-                .get(rollup_id)
-                .expect("plan_order from rollups map");
-            let dialect = &rollup.config.dialect;
-            let load_table_payload = entries::encode_table_payload(&batch, dialect);
-            let execute_payload = dialect.encode_follower_trigger(outer_root);
             target_compositions.push(TargetComposition {
                 rollup_id: *rollup_id,
                 batch,
-                load_table_payload,
-                execute_payload,
             });
         }
 
@@ -596,7 +574,6 @@ impl CompositionBuilder {
             source: SourceComposition {
                 rollup_id: self.entry_rollup_id,
                 batch: entry_batch,
-                entry_payload,
             },
             targets: target_compositions,
         })

@@ -7,20 +7,15 @@
 //!   Composition
 //!   ├── source:  SourceComposition
 //!   │             ├── rollup_id          : RollupId
-//!   │             ├── batch              : EvmBatch              table-loading batch
-//!   │             └── entry_payload      : Vec<u8>               encoded entry-chain calldata
-//!   │                                                            (L1-style: postAndVerifyBatch; L2-style: loadExecutionTable)
+//!   │             └── batch              : EvmBatch              table-loading batch
 //!   │
 //!   └── targets: Vec<TargetComposition>                          one per target rollup, ordered
 //!                 ├── rollup_id            : RollupId
-//!                 ├── batch                : EvmBatch             table-loading batch
-//!                 ├── load_table_payload   : Vec<u8>              encoded load-execution-table calldata
-//!                 └── execute_payload      : Vec<u8>              encoded execute-cross-chain-call calldata
+//!                 └── batch                : EvmBatch             table-loading batch
 //! ```
 //!
-//! Both sides carry the batch AND pre-encoded calldata so callers can
-//! either re-hash / verify the batch themselves or ship the payload
-//! straight into a wallet for signing + broadcast.
+//! Composition produces semantic batches. Transaction construction and
+//! encoding happen later, once settlement state and proofs are available.
 
 use alloy_primitives::{Address, Bytes, U256};
 use serde::{Deserialize, Serialize};
@@ -165,18 +160,13 @@ impl ExecutionOutcome {
 
 /// Source-chain output inside a `Composition`.
 ///
-/// Mirrors [`TargetComposition`] so both sides of the composition carry
-/// raw entries AND pre-encoded calldata.
+/// Mirrors [`TargetComposition`] so both sides carry their semantic batch.
 #[derive(Debug, Clone)]
 pub struct SourceComposition {
     /// Rollup ID of the source chain.
     pub rollup_id: RollupId,
     /// Table-loading batch the source rollup will consume.
     pub batch: EvmBatch,
-    /// Encoded calldata for the entry-chain tx that loads `batch`.
-    /// Dialect-dependent: L1-style emits `postAndVerifyBatch(...)`;
-    /// L2-style emits `loadExecutionTable(...)`.
-    pub entry_payload: Vec<u8>,
 }
 
 /// Per-target output inside a `Composition`.
@@ -189,19 +179,15 @@ pub struct TargetComposition {
     pub rollup_id: RollupId,
     /// Table-loading batch this target rollup will consume.
     pub batch: EvmBatch,
-    /// Encoded payload for loading the target execution table.
-    pub load_table_payload: Vec<u8>,
-    /// Encoded payload for executing the first cross-chain call.
-    pub execute_payload: Vec<u8>,
 }
 
 /// Output of [`CompositionBuilder::finalize`](crate::CompositionBuilder::finalize) —
 /// everything needed for all chains.
 ///
-/// Symmetric: the source side and every target side both carry entries
-/// AND pre-encoded calldata. Callers wrap each payload in a tx of their
-/// choice to finalize. `targets` ordering is significant (invariant 2).
-/// N=2 means `targets` has exactly one element; the design supports any N.
+/// The source side and every target side carry semantic batch entries;
+/// transaction encoding happens downstream. `targets` ordering is significant
+/// (invariant 2). N=2 means `targets` has exactly one element; the design
+/// supports any N.
 #[derive(Debug, Clone)]
 pub struct Composition {
     /// Source-chain output (exactly one source per composition).
