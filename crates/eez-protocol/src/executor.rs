@@ -32,7 +32,10 @@ pub struct ExecutionRequest {
     /// Original source-chain caller, used to derive the destination-side proxy
     /// address that executes as `msg.sender`.
     pub source_address: Address,
-    /// Rollup ID of the source chain, used for routing and call-hash derivation.
+    /// Authoritative ID of the chain on which `source_address` made the
+    /// intercepted call. Used for re-entry checks and recording,
+    /// destination-proxy derivation during execution, and call-hash
+    /// materialization.
     pub source_rollup_id: RollupId,
 }
 

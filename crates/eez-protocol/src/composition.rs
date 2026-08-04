@@ -410,9 +410,10 @@ impl CompositionBuilder {
     /// → close. Inspectors call this from their EVM-frame `call`
     /// handler.
     ///
-    /// Enforces a same-chain re-entry guard:
-    /// `target_rollup_id == source_rollup_id && target_rollup_id != entry_rollup_id`
-    /// returns [`ExecutorErrorKind::InvalidReentry`].
+    /// Enforces a same-chain re-entry guard when `target_rollup_id` matches
+    /// `req.source_rollup_id` outside the entry rollup.
+    /// `req.source_rollup_id` is forwarded unchanged to target execution and
+    /// becomes the recorded call's source identity for batch materialization.
     ///
     /// # Errors
     ///
@@ -424,33 +425,22 @@ impl CompositionBuilder {
         level = "debug",
         name = "dispatch_call",
         skip_all,
-        fields(target = %target_rollup_id, source = %source_rollup_id),
+        fields(target = %target_rollup_id, source = %req.source_rollup_id),
         err,
     )]
     pub fn dispatch_call(
         &mut self,
         target_rollup_id: RollupId,
-        source_rollup_id: RollupId,
         req: ExecutionRequest,
     ) -> ExecutorResult<ExecutionOutcome> {
+        let source_rollup_id = req.source_rollup_id;
         // Drain rollbacks queued by a previous frame before opening another
         // target call.
         self.process_pending_rollbacks()?;
 
-        // Same-chain re-entry guard. Entry-to-entry dispatch (e.g. a
-        // contract on the entry chain calling another entry-chain
-        // contract during normal source simulation) is legitimate
-        // and falls through.
-        if target_rollup_id == source_rollup_id && target_rollup_id != self.entry_rollup_id {
-            return Err(ExecutorError::from(ExecutorErrorKind::InvalidReentry {
-                caller: source_rollup_id,
-                target: target_rollup_id,
-            }));
-        }
-
         // Phase 1 — open: lazy-open the session, snapshot it, push
         // `Pending` placeholder, capture slot index.
-        let idx = self.open_call(target_rollup_id, source_rollup_id, &req)?;
+        let idx = self.open_call(target_rollup_id, &req)?;
 
         // Phase 2 — run execute on the lazy-opened session.
         let mut session = self
@@ -504,9 +494,9 @@ impl CompositionBuilder {
     pub fn open_call(
         &mut self,
         target_rollup_id: RollupId,
-        source_rollup_id: RollupId,
         req: &ExecutionRequest,
     ) -> ExecutorResult<usize> {
+        let source_rollup_id = req.source_rollup_id;
         if target_rollup_id == source_rollup_id && target_rollup_id != self.entry_rollup_id {
             return Err(ExecutorError::from(ExecutorErrorKind::InvalidReentry {
                 caller: source_rollup_id,
@@ -670,9 +660,9 @@ mod tests {
             req: ExecutionRequest,
             dispatcher: &mut CompositionBuilder,
         ) -> ExecutorResult<ExecutionOutcome> {
-            // Nested dispatch back into the SAME rollup (caller = some
-            // other id so the plain target==source guard does not fire).
-            dispatcher.open_call(self.own_rollup, RollupId(7), &req)?;
+            // The target session is already checked out, so reopening its
+            // rollup must fail before a duplicate session is created.
+            dispatcher.open_call(self.own_rollup, &req)?;
             unreachable!("the checked-out guard must refuse the cyclic open_call");
         }
         fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
@@ -721,6 +711,40 @@ mod tests {
         }
     }
 
+    struct SourceEchoClient;
+
+    impl ChainClient for SourceEchoClient {
+        fn begin_execution_session(
+            &self,
+        ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
+            Ok(Box::new(SourceEchoSession))
+        }
+    }
+
+    struct SourceEchoSession;
+
+    impl TargetExecutionSession for SourceEchoSession {
+        fn execute(
+            &mut self,
+            req: ExecutionRequest,
+            _dispatcher: &mut CompositionBuilder,
+        ) -> ExecutorResult<ExecutionOutcome> {
+            Ok(ExecutionOutcome::Resolved {
+                return_data: req.source_rollup_id.0.to_be_bytes().to_vec(),
+                gas_used: 21_000,
+                success: true,
+            })
+        }
+
+        fn checkpoint(&mut self) -> ExecutorResult<crate::executor::SessionSnapshot> {
+            Ok(Box::new(()) as crate::executor::SessionSnapshot)
+        }
+
+        fn rollback(&mut self, _snapshot: crate::executor::SessionSnapshot) -> ExecutorResult<()> {
+            Ok(())
+        }
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────
 
     fn sample_outcome(return_data: [u8; 32]) -> ExecutionOutcome {
@@ -732,13 +756,17 @@ mod tests {
     }
 
     fn make_request(rollup: u64) -> ExecutionRequest {
+        make_request_from(rollup, RollupId::MAINNET)
+    }
+
+    fn make_request_from(rollup: u64, source_rollup_id: RollupId) -> ExecutionRequest {
         ExecutionRequest {
             call_mode: crate::CallMode::Mutable,
             target_address: Address::repeat_byte(rollup as u8),
             data: Bytes::from(vec![0x01, 0x02]),
             value: U256::ZERO,
             source_address: Address::ZERO,
-            source_rollup_id: RollupId(0),
+            source_rollup_id,
         }
     }
 
@@ -772,6 +800,14 @@ mod tests {
         }
     }
 
+    fn source_echo_rollup() -> Rollup {
+        Rollup {
+            client: Arc::new(SourceEchoClient),
+            session: None,
+            config: target_config(),
+        }
+    }
+
     // ── Tests ────────────────────────────────────────────────────────
 
     #[test]
@@ -782,7 +818,7 @@ mod tests {
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         let response = builder
-            .dispatch_call(RollupId(1), RollupId(0), make_request(1))
+            .dispatch_call(RollupId(1), make_request(1))
             .expect("dispatch");
         assert_eq!(response.return_data(), Some(&[0x11; 32][..]));
         assert_eq!(builder.recorded.len(), 1);
@@ -801,7 +837,7 @@ mod tests {
         request.call_mode = crate::CallMode::Static;
 
         builder
-            .dispatch_call(RollupId(1), RollupId(0), request)
+            .dispatch_call(RollupId(1), request)
             .expect("dispatch");
 
         assert_eq!(builder.recorded[0].call_mode, crate::CallMode::Static);
@@ -817,7 +853,7 @@ mod tests {
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
         let _ = builder
-            .dispatch_call(RollupId(1), RollupId(0), make_request(1))
+            .dispatch_call(RollupId(1), make_request(1))
             .expect("dispatch lazy-opens rollup 1's session");
         let sessions = builder.take_sessions();
         assert_eq!(sessions.len(), 1, "exactly the lazily-opened session");
@@ -866,7 +902,7 @@ mod tests {
         );
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
         let err = builder
-            .dispatch_call(RollupId(1), RollupId(0), make_request(1))
+            .dispatch_call(RollupId(1), make_request(1))
             .expect_err("cycle must be refused");
         assert!(
             matches!(err.kind(), ExecutorErrorKind::InvalidReentry { .. }),
@@ -884,7 +920,7 @@ mod tests {
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         let err = builder
-            .dispatch_call(RollupId(99), RollupId(0), make_request(99))
+            .dispatch_call(RollupId(99), make_request(99))
             .expect_err("should fail");
         assert!(matches!(err.kind(), ExecutorErrorKind::Unavailable(_)));
     }
@@ -913,7 +949,7 @@ mod tests {
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         builder
-            .dispatch_call(RollupId(1), RollupId(0), make_request(1))
+            .dispatch_call(RollupId(1), make_request(1))
             .expect("dispatch");
 
         let composition = builder.finalize().expect("finalize");
@@ -985,7 +1021,7 @@ mod tests {
         let mut request = make_request(1);
         request.call_mode = crate::CallMode::Static;
         builder
-            .dispatch_call(RollupId(1), RollupId(0), request)
+            .dispatch_call(RollupId(1), request)
             .expect("dispatch");
 
         let error = builder
@@ -1014,7 +1050,7 @@ mod tests {
         rollups.insert(RollupId::MAINNET, l1_rollup);
         let mut builder = CompositionBuilder::new(RollupId(1), rollups);
         builder
-            .open_call(RollupId::MAINNET, RollupId(2), &make_request(0))
+            .open_call(RollupId::MAINNET, &make_request_from(0, RollupId(1)))
             .expect("open pending call");
 
         let error = builder
@@ -1043,7 +1079,7 @@ mod tests {
 
         for id in [3u64, 1, 2] {
             builder
-                .dispatch_call(RollupId(id), RollupId(0), make_request(id))
+                .dispatch_call(RollupId(id), make_request(id))
                 .expect("dispatch");
         }
 
@@ -1128,18 +1164,41 @@ mod tests {
     }
 
     #[test]
-    fn source_rollup_id_is_stored_from_dispatch_arg() {
-        // The explicit dispatch source is authoritative when it differs from
-        // request metadata.
+    fn dispatch_uses_request_source_identity_end_to_end() {
         let mut rollups = HashMap::new();
-        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
-        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
-        let mut builder = CompositionBuilder::new(RollupId(0), rollups);
+        rollups.insert(RollupId(7), entry_rollup([0u8; 32]));
+        rollups.insert(RollupId(1), source_echo_rollup());
+        let mut builder = CompositionBuilder::new(RollupId(7), rollups);
+        let request = make_request_from(1, RollupId(7));
+        let hash_input = CallHashInput {
+            call_mode: request.call_mode,
+            source_address: request.source_address,
+            source_rollup_id: RollupId(7),
+            target_address: request.target_address,
+            target_rollup_id: RollupId(1),
+            value: request.value,
+            data: &request.data,
+        };
+        let expected_hash = common_cross_chain_call_hash(hash_input);
+        let mainnet_hash = common_cross_chain_call_hash(CallHashInput {
+            source_rollup_id: RollupId::MAINNET,
+            ..hash_input
+        });
 
-        builder
-            .dispatch_call(RollupId(1), RollupId(7), make_request(1))
+        let response = builder
+            .dispatch_call(RollupId(1), request)
             .expect("dispatch");
+        let expected_return_data = RollupId(7).0.to_be_bytes();
+        assert_eq!(response.return_data(), Some(&expected_return_data[..]));
         assert_eq!(builder.recorded[0].source_rollup_id, RollupId(7));
+
+        let composition = builder.finalize().expect("finalize");
+        assert_eq!(composition.targets.len(), 1);
+        assert_eq!(composition.targets[0].rollup_id, RollupId(1));
+        let target_entry = &composition.targets[0].batch.entries[0];
+        assert_eq!(target_entry.l2ToL1Calls[0].sourceRollupId, 7);
+        assert_eq!(target_entry.proxyEntryHash, expected_hash);
+        assert_ne!(target_entry.proxyEntryHash, mainnet_hash);
     }
 
     // ── Unsuccessful-call rejection ──────────────────────────────
@@ -1176,7 +1235,7 @@ mod tests {
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         builder
-            .dispatch_call(RollupId(1), RollupId(0), make_request(1))
+            .dispatch_call(RollupId(1), make_request(1))
             .expect("dispatch");
         assert!(
             !builder.recorded[0].outcome.is_success(),
@@ -1207,12 +1266,10 @@ mod tests {
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         builder
-            .dispatch_call(RollupId(1), RollupId(0), make_request(1))
+            .dispatch_call(RollupId(1), make_request(1))
             .expect("top-level dispatch");
-        let mut nested_request = make_request(2);
-        nested_request.source_rollup_id = RollupId(1);
         builder
-            .dispatch_call(RollupId(2), RollupId(1), nested_request)
+            .dispatch_call(RollupId(2), make_request_from(2, RollupId(1)))
             .expect("nested dispatch records before materialization");
 
         let error = builder
@@ -1242,7 +1299,7 @@ mod tests {
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         let err = builder
-            .dispatch_call(RollupId(1), RollupId(1), make_request(1))
+            .dispatch_call(RollupId(1), make_request_from(1, RollupId(1)))
             .expect_err("L2 → L2 self-dispatch must be rejected");
         assert!(
             matches!(
@@ -1255,6 +1312,13 @@ mod tests {
         assert!(
             builder.recorded.is_empty(),
             "nothing must be recorded when the guard fires"
+        );
+        assert!(
+            builder
+                .rollups
+                .get(&RollupId(1))
+                .is_some_and(|rollup| rollup.session.is_none()),
+            "the guard must fire before opening a session",
         );
     }
 
@@ -1272,9 +1336,7 @@ mod tests {
         // Walk the lifecycle directly to verify that `open_call` fixes the
         // index before `close_call` resolves it.
         let req = make_request(1);
-        let idx = builder
-            .open_call(RollupId(1), RollupId(0), &req)
-            .expect("open");
+        let idx = builder.open_call(RollupId(1), &req).expect("open");
         assert_eq!(idx, 0);
         assert!(builder.recorded[idx].outcome.is_pending());
         builder.close_call(idx, sample_outcome([0xCC; 32]), None);
@@ -1285,7 +1347,7 @@ mod tests {
         );
 
         let resp = builder
-            .dispatch_call(RollupId(1), RollupId(0), make_request(1))
+            .dispatch_call(RollupId(1), make_request(1))
             .expect("dispatch");
         assert!(resp.is_success());
         assert_eq!(builder.recorded.len(), 2);
@@ -1306,7 +1368,7 @@ mod tests {
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         builder
-            .dispatch_call(RollupId(1), RollupId(0), make_request(1))
+            .dispatch_call(RollupId(1), make_request(1))
             .expect("dispatch");
 
         builder.annotate_revert_span(0, 1);
@@ -1340,14 +1402,14 @@ mod tests {
         let start = builder.recorded_count();
         // Outer: 0 → 1
         builder
-            .dispatch_call(RollupId(1), RollupId(0), make_request(1))
+            .dispatch_call(RollupId(1), make_request(1))
             .expect("outer");
         // Two inner cross-rollup calls inside the outer frame.
         builder
-            .dispatch_call(RollupId(2), RollupId(1), make_request(2))
+            .dispatch_call(RollupId(2), make_request_from(2, RollupId(1)))
             .expect("inner-1");
         builder
-            .dispatch_call(RollupId(2), RollupId(1), make_request(2))
+            .dispatch_call(RollupId(2), make_request_from(2, RollupId(1)))
             .expect("inner-2");
 
         let end = builder.recorded_count();
@@ -1371,12 +1433,12 @@ mod tests {
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         builder
-            .dispatch_call(RollupId(1), RollupId(0), make_request(1))
+            .dispatch_call(RollupId(1), make_request(1))
             .expect("A");
         builder.annotate_revert_span(0, 1);
 
         builder
-            .dispatch_call(RollupId(1), RollupId(0), make_request(1))
+            .dispatch_call(RollupId(1), make_request(1))
             .expect("B");
 
         assert_eq!(builder.recorded[0].revert_span, Some(1));
@@ -1400,10 +1462,10 @@ mod tests {
 
         let start = builder.recorded_count();
         builder
-            .dispatch_call(RollupId(1), RollupId(0), make_request(1))
+            .dispatch_call(RollupId(1), make_request(1))
             .expect("outer");
         builder
-            .dispatch_call(RollupId(2), RollupId(1), make_request(2))
+            .dispatch_call(RollupId(2), make_request_from(2, RollupId(1)))
             .expect("child (succeeds)");
         let span = (builder.recorded_count() - start) as u32;
         assert_eq!(span, 2);
@@ -1431,14 +1493,14 @@ mod tests {
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
         builder
-            .dispatch_call(RollupId(1), RollupId(0), make_request(1))
+            .dispatch_call(RollupId(1), make_request(1))
             .expect("first dispatch");
         builder.annotate_revert_span(0, 1);
         assert_eq!(builder.pending_rollbacks, vec![0]);
         assert!(builder.pending_snapshots.contains_key(&0));
 
         builder
-            .dispatch_call(RollupId(1), RollupId(0), make_request(1))
+            .dispatch_call(RollupId(1), make_request(1))
             .expect("second dispatch");
 
         assert!(

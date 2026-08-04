@@ -165,10 +165,9 @@ pub struct SessionInspector<'a> {
     proxy_lookup: ProxyLookupConfig,
     /// Composition builder that routes and records detected calls.
     dispatcher: &'a mut CompositionBuilder,
-    /// Rollup id of the chain this inspector is running on — the
-    /// `caller_id` passed to `dispatch_call` so the resulting
-    /// [`ExecutedAction::source_rollup_id`](eez_protocol::ExecutedAction::source_rollup_id)
-    /// is correct for nested cross-chain call hashing.
+    /// Rollup ID of the chain this inspector is running on. Written to each
+    /// [`eez_protocol::ExecutionRequest`] as the source identity used for
+    /// target execution, recording, and call hashing.
     caller_rollup_id: RollupId,
     /// First target execution error, if any.
     error: Option<ExecutorError>,
@@ -210,9 +209,8 @@ impl std::fmt::Debug for SessionInspector<'_> {
 pub struct SessionInspectorFactory {
     /// Contract and storage slot for this chain's `authorizedProxies` map.
     proxy_lookup: ProxyLookupConfig,
-    /// Rollup id of the chain this factory belongs to — becomes the
-    /// `caller_id` on every call dispatched through inspectors it
-    /// builds.
+    /// Source rollup ID written to every request dispatched by inspectors
+    /// built from this factory.
     caller_rollup_id: RollupId,
     /// Per-rollup channel for propagating state through recursive re-entry.
     overlay_channel: Option<OverlayChannelHandle>,
@@ -249,7 +247,7 @@ impl SessionInspectorFactory {
         &self.proxy_lookup
     }
 
-    /// Caller rollup id this factory passes to every built inspector.
+    /// Source rollup ID written into requests by every built inspector.
     #[must_use]
     pub fn caller_rollup_id(&self) -> RollupId {
         self.caller_rollup_id
@@ -273,8 +271,7 @@ impl<'a> SessionInspector<'a> {
     /// - `proxy_lookup`: the (contract, slot) pair used to read
     ///   `authorizedProxies` from the chain-local manager.
     /// - `dispatcher`: dispatch surface for detected calls.
-    /// - `caller_rollup_id`: this chain's rollup id — becomes the
-    ///   `caller_id` on each dispatched call.
+    /// - `caller_rollup_id`: source rollup ID stored in each dispatched request.
     pub fn new(
         proxy_lookup: ProxyLookupConfig,
         dispatcher: &'a mut CompositionBuilder,
@@ -372,7 +369,6 @@ where
         };
         // Dispatch is synchronous, so this inspector can exchange cache
         // snapshots around the nested execution.
-        let caller_id = self.caller_rollup_id;
         // Snapshot this rollup's in-flight cache before dispatch. If the
         // downstream call re-enters this rollup, the new session preloads the
         // snapshot and publishes its updated cache for this frame to apply.
@@ -433,9 +429,7 @@ where
                 channel.push_pre_snapshot(cache);
             }
         }
-        let sim = self
-            .dispatcher
-            .dispatch_call(info.original_rollup_id, caller_id, req);
+        let sim = self.dispatcher.dispatch_call(info.original_rollup_id, req);
         // A downstream session that re-entered this rollup publishes its
         // post-execution cache on the same channel. Apply that diff before
         // this EVM frame continues.
