@@ -42,7 +42,9 @@ NODE_LOG="${EEZ_NODE_LOG:-$LOG_DIR/wave-$MODE-node.log}"
 SIGNER_LOG="${EEZ_PROOF_SIGNER_LOG:-$LOG_DIR/wave-$MODE-proof-signer.log}"
 MODE_NODE_LOG="${NODE_LOG%.log}-evidence.log"
 MODE_SIGNER_LOG="${SIGNER_LOG%.log}-evidence.log"
-DEPLOY_DIR="$(mktemp -d /tmp/eez-deployments.XXXXXX)"
+DEPLOY_DIR="${TMPDIR:-/tmp}/eez-deployments-$ENCLAVE-$MODE"
+rm -rf "$DEPLOY_DIR"
+mkdir -p "$DEPLOY_DIR"
 trap 'rm -rf "$DEPLOY_DIR"' EXIT
 
 # Pull the deployment artifact from the enclave by default.
@@ -244,8 +246,8 @@ WAVE_GAP_SECS="${EEZ_WAVE_GAP_SECS:-20}"
 FILLER_PER_GAP="${EEZ_FILLER_PER_GAP:-2}"
 PURE_RECIPIENT=0x2222222222222222222222222222222222222222
 
-refresh_node_log() { kurtosis service logs "$ENCLAVE" eez-node >"$NODE_LOG" 2>&1 || true; }
-refresh_signer_log() { kurtosis service logs "$ENCLAVE" eez-proof-signer >"$SIGNER_LOG" 2>&1 || true; }
+refresh_node_log() { kurtosis service logs -a "$ENCLAVE" eez-node >"$NODE_LOG" 2>&1 || true; }
+refresh_signer_log() { kurtosis service logs -a "$ENCLAVE" eez-proof-signer >"$SIGNER_LOG" 2>&1 || true; }
 strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
 
 SIGNED_WINDOW_EVENT='event_name="eez.proof_signer.window_signed"'
