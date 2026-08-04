@@ -26,8 +26,8 @@ use eez_protocol::{
 
 use super::provider::ChainProvider;
 
-/// Gas limit for direct target-chain calls during inspection. Generous
-/// enough for worst-case dev-chain paths; too low → silent reverts.
+/// Gas cap for simulated direct target calls; exhaustion is returned as an
+/// unsuccessful execution outcome.
 pub(super) const DIRECT_CALL_GAS_LIMIT: u64 = 30_000_000;
 
 /// Stateful target-chain execution session.
@@ -51,22 +51,11 @@ pub struct LocalExecutionSession {
     current_root: B256,
     chain_id: u64,
     manager_address: Address,
-    /// When `Some`, `execute()` runs each target call under a
-    /// [`eez_evm_inspector::SessionInspector`] built from this factory — forwarding
-    /// detected proxy CALLs to the dispatcher. `None` means a plain
-    /// direct execute with no inspection layer (used for the entry
-    /// role's target-session path when the topology has no nested
-    /// reentry into the entry chain). The factory holds this chain's
-    /// `proxy_lookup` + `rollup_id`, so the inspector's `caller_id`
-    /// matches the chain it runs on.
+    /// Optional factory for inspecting nested proxy calls. `None` disables
+    /// nested-call detection for this session.
     inspector_factory: Option<SessionInspectorFactory>,
-    /// Overlay channel write-back handle.
-    /// `Some(channel)` when the entry rollup's session is opened on
-    /// behalf of a nested-back-to-entry dispatch — this session writes
-    /// its post-execute `state.cache.clone()` into `channel.overlay_cache`
-    /// so source-sim's inspector can apply the diff onto source's
-    /// journal. `None` for follower sessions and for entry sessions
-    /// opened outside the overlay context.
+    /// Optional cache channel for propagating state through re-entry. `None`
+    /// disables cache propagation for this session.
     overlay_channel: Option<OverlayChannelHandle>,
 }
 
@@ -84,24 +73,13 @@ impl std::fmt::Debug for LocalExecutionSession {
 impl LocalExecutionSession {
     /// Create from a `ChainProvider`. Opens latest state.
     ///
-    /// `inspector_factory` pins this session's target-side inspection
-    /// policy. When supplied, each `execute` call runs under a
-    /// [`eez_evm_inspector::SessionInspector`] so proxy CALLs
-    /// detected during the target-chain execution dispatch back
-    /// through the supplied `dispatcher` and are recorded into the
-    /// composition's preorder `recorded[..]` slice. When `None`, the
-    /// session executes without an inspector — used for the entry
-    /// rollup's session in topologies where no inspector dispatches
-    /// back to the entry chain.
+    /// When supplied, `inspector_factory` detects nested proxy calls and routes
+    /// them through the composition builder. `None` executes without nested
+    /// call inspection.
     ///
-    /// `cache` is the overlay-path preload: when an inner
-    /// target-session frame dispatches back to the entry rollup, the
-    /// entry session is lazily opened with a clone of source-sim's
-    /// in-flight cache (via the
-    /// [`eez_evm_inspector::OverlayChannel`] side-channel), so
-    /// the nested L1 call observes source-sim's pending writes —
-    /// load-bearing for fixtures that mutate L1 state inside a single
-    /// source tx (e.g. `flash-loan`). `None` opens a fresh State.
+    /// `cache` preloads in-flight state captured before a nested dispatch;
+    /// `None` opens a fresh revm state. `overlay_channel` publishes cumulative
+    /// state after execution so a suspended inspector can apply the diff.
     ///
     /// # Errors
     ///
@@ -207,9 +185,8 @@ impl LocalExecutionSession {
         (output.len() >= 32).then(|| Address::from_slice(&output[12..32]))
     }
 
-    /// Uninspected direct-call path: a plain `evm.transact` plus
-    /// invariant-7 bookkeeping. Used when this session was opened with
-    /// `inspector_factory = None` (entry rollup).
+    /// Uninspected direct-call path. Executes the call and restores the
+    /// simulated proxy caller's nonce before committing the result.
     fn execute_internal(
         &mut self,
         destination: &Address,
@@ -238,23 +215,11 @@ impl LocalExecutionSession {
     }
 
     /// Inspected direct-call path. Runs the target-chain tx under the
-    /// supplied [`eez_evm_inspector::SessionInspector`] so proxy CALLs detected during
-    /// execution dispatch back through the underlying `Dispatcher`.
+    /// supplied [`eez_evm_inspector::SessionInspector`] so proxy CALLs detected
+    /// during execution dispatch through the composition builder.
     ///
-    /// The session takes the inspector by value (non-`'static`
-    /// borrow) — it can't outlive this function call anyway, and the
-    /// reth `evm_with_env_and_inspector` API wants ownership. Dispatch
-    /// errors are surfaced via the inspector's `take_error` path on
-    /// drop; we promote them into `Err` before returning the outcome.
-    ///
-    /// # Pitfall #3 guard
-    ///
-    /// The target-side inspector fires from inside a scoped OS thread
-    /// whose tokio entry is `Handle::block_on(...)`. This function
-    /// body MUST NOT introduce a real `` — doing so would try
-    /// to park back onto the outer runtime while the scoped thread
-    /// is blocking a worker, producing a starvation deadlock. See
-    /// the amendment C15 regression test.
+    /// The session takes the inspector by value because reth owns it for the
+    /// EVM pass. The caller reads `take_error` before returning the outcome.
     fn execute_internal_with_inspector(
         &mut self,
         inspector: eez_evm_inspector::SessionInspector<'_>,
@@ -290,9 +255,8 @@ impl LocalExecutionSession {
         self.commit_and_finish(pre_root, return_data, gas_used, success, changes)
     }
 
-    /// Shared post-commit bookkeeping: commit the revm bundle, compute
-    /// the post-state root, advance `current_root`, log, and emit an
-    /// [`ExecutionOutcome`](eez_protocol::ExecutionOutcome).
+    /// Commit the revm bundle, advance the session root, publish the overlay
+    /// cache, and return the execution outcome.
     fn commit_and_finish(
         &mut self,
         pre_root: B256,
@@ -306,28 +270,11 @@ impl LocalExecutionSession {
         let post_root = compute_state_root(&mut self.state, self.state_provider.as_ref())?;
         self.current_root = post_root;
 
-        // Overlay write-back: when this session is the entry rollup's
-        // overlay session (channel handle installed at construction),
-        // publish the post-execute cache for the source-sim inspector
-        // to diff-apply onto source's journal after `block_in_place`
-        // returns. The cache here is the cumulative state after every
-        // overlay call so far, since multiple overlay executes within
-        // one source-sim hook reuse the same session.
-        //
-        // Also append `post_root` to the channel's per-tx roots —
-        // nested entries attributed to the entry rollup pull
-        // `newState` from this list during `build_batch`. Order is
-        // chronological dispatch order, matching the cursor
-        // `build_batch` walks for the entry rollup.
-        //
-        // Stack-based push: the inspector at the dispatching frame
-        // pops the top after `block_in_place` returns and applies the
-        // diff. Stack semantics let nested re-entries chain
-        // post-caches through their respective inspector pops without
-        // collision.
+        // Publish the cumulative post-execute cache. An inspector waiting on
+        // the same channel can pop and apply it after nested dispatch; the
+        // stack preserves LIFO order for recursive re-entry.
         if let Some(channel) = &self.overlay_channel {
             channel.push_post_cache(self.state.cache.clone());
-            channel.append_post_root(post_root.0);
         }
 
         tracing::debug!(
@@ -340,8 +287,6 @@ impl LocalExecutionSession {
 
         Ok(eez_protocol::ExecutionOutcome::Resolved {
             return_data: return_data.to_vec(),
-            pre_state_root: pre_root.0,
-            post_state_root: post_root.0,
             gas_used,
             success,
         })
@@ -395,12 +340,6 @@ impl TargetExecutionSession for LocalExecutionSession {
             )
             .into());
         }
-        // Pitfall #3 invariant: this method runs SYNCHRONOUSLY under
-        // the caller's `Handle::block_on`. Do NOT introduce a real
-        // `` on I/O here or in `execute_internal*` — the target-
-        // side inspector dispatches from a scoped OS thread that holds
-        // a tokio worker, and a real await would park the outer
-        // runtime.
         let outcome = if let Some(factory) = self.inspector_factory.clone() {
             let inspector = factory.build(dispatcher);
             self.execute_internal_with_inspector(
@@ -426,8 +365,8 @@ impl TargetExecutionSession for LocalExecutionSession {
     }
 
     fn checkpoint(&mut self) -> ExecutorResult<eez_protocol::SessionSnapshot> {
-        // Opaque snapshot carrying the current root only. The full
-        // revm `State<DB>` deep-clone remains known implementation debt.
+        // This snapshot restores only root bookkeeping; it does not restore the
+        // revm state cache or bundle.
         Ok(Box::new(self.current_root.0) as Box<dyn std::any::Any + Send>)
     }
 

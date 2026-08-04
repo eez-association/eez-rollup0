@@ -30,7 +30,8 @@ use crate::rollup_id::RollupId;
 ///
 /// [`CompositionBuilder::open_call`](crate::CompositionBuilder::open_call)
 /// inserts the action with [`ExecutionOutcome::Pending`] before dispatching
-/// target execution. `close_call` replaces it with the resolved result.
+/// target execution. [`CompositionBuilder::close_call`](crate::CompositionBuilder::close_call)
+/// replaces it with the resolved result.
 /// Recording before dispatch preserves preorder when nested calls occur.
 ///
 /// Protocol call hashes are derived from these fields during entry
@@ -39,7 +40,7 @@ use crate::rollup_id::RollupId;
 pub struct ExecutedAction {
     /// Effective EVM mode observed when the source call was intercepted.
     pub call_mode: CallMode,
-    /// Contract invoked on the destination chain.
+    /// Address invoked on the destination chain.
     pub target_address: Address,
     /// Rollup ID of the destination chain.
     pub target_rollup_id: RollupId,
@@ -55,14 +56,13 @@ pub struct ExecutedAction {
     pub data: Bytes,
     /// Native value transferred with the call.
     pub value: U256,
-    /// Target execution status. `open_call` initializes it as `Pending`;
-    /// `close_call` replaces it with the target session's result.
+    /// Execution status for this call.
     pub outcome: ExecutionOutcome,
     /// Number of consecutive recorded actions covered by a reverted EVM frame,
     /// starting with this action. Only the first action in a span carries this
     /// value; `None` means no enclosing revert was observed.
     ///
-    /// The current materializer rejects actions with a revert span, preventing
+    /// The materializer rejects actions with a revert span, preventing
     /// reverted calls from being emitted as successful entries. The inspector
     /// normally populates it after execution through
     /// [`CompositionBuilder::annotate_revert_span`](crate::CompositionBuilder::annotate_revert_span)
@@ -84,10 +84,6 @@ pub enum ExecutionOutcome {
     Resolved {
         /// Raw target-EVM output, including revert data for an unsuccessful call.
         return_data: Vec<u8>,
-        /// State root before this call was executed.
-        pre_state_root: [u8; 32],
-        /// State root after this call completed.
-        post_state_root: [u8; 32],
         /// Gas consumed by this call.
         gas_used: u64,
         /// Whether target EVM execution completed successfully.
@@ -107,26 +103,6 @@ impl ExecutionOutcome {
     #[must_use]
     pub fn is_pending(&self) -> bool {
         matches!(self, Self::Pending)
-    }
-
-    /// Borrow the post-state-root if resolved.
-    #[must_use]
-    pub fn post_state_root(&self) -> Option<&[u8; 32]> {
-        match self {
-            Self::Pending => None,
-            Self::Resolved {
-                post_state_root, ..
-            } => Some(post_state_root),
-        }
-    }
-
-    /// Borrow the pre-state-root if resolved.
-    #[must_use]
-    pub fn pre_state_root(&self) -> Option<&[u8; 32]> {
-        match self {
-            Self::Pending => None,
-            Self::Resolved { pre_state_root, .. } => Some(pre_state_root),
-        }
     }
 
     /// Borrow the return-data if resolved.
@@ -153,9 +129,7 @@ impl ExecutionOutcome {
 pub struct SourceComposition {
     /// Rollup ID of the source chain.
     pub rollup_id: RollupId,
-    /// Batch entries produced for the source side.
-    ///
-    /// Downstream settlement may merge and finalize this batch before submission.
+    /// Semantic batch produced for source-side processing.
     pub batch: EvmBatch,
 }
 
@@ -164,18 +138,15 @@ pub struct SourceComposition {
 pub struct TargetComposition {
     /// Rollup associated with this target batch.
     pub rollup_id: RollupId,
-    /// Batch entries produced for this target side.
-    ///
-    /// Downstream code uses these entries to construct target system transactions.
+    /// Semantic batch produced for target-side processing.
     pub batch: EvmBatch,
 }
 
-/// Structured batch output of
+/// Semantic source and target batches produced by
 /// [`CompositionBuilder::finalize`](crate::CompositionBuilder::finalize).
 ///
-/// This value does not contain transaction calldata, settlement state updates,
-/// or proof data; downstream code constructs those artifacts. `targets`
-/// contains only non-empty target batches and is sorted by rollup ID.
+/// Target outputs are non-empty and sorted by rollup ID. Transaction
+/// construction and settlement occur downstream.
 #[derive(Debug, Clone)]
 pub struct Composition {
     /// Batch output for the entry/source rollup.

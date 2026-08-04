@@ -1,28 +1,19 @@
-//! Chain-client and execution-session interfaces.
+//! Synchronous chain-client and execution-session interfaces used by
+//! composition.
 //!
-//! The composer talks to every registered rollup through one trait,
-//! [`ChainClient`]. Role-specific operations (`simulate_source_tx` for
-//! the entry rollup, `stored_target_state_root` for the committed-root
-//! host) have default implementations that refuse with
-//! [`ExecutorErrorKind::Unavailable`], so a misregistered client fails
-//! loudly at the first role-specific call. Nested cross-chain
-//! dispatch goes through the borrowed
-//! [`CompositionBuilder`].
+//! [`ChainClient`] opens stateful target sessions for registered rollups.
+//! Entry-role implementations also override `simulate_source_tx`; its default
+//! returns [`ExecutorErrorKind::Unavailable`]. Nested cross-chain dispatch
+//! goes through the borrowed [`CompositionBuilder`].
 //!
-//! Both traits are synchronous — every in-tree impl does in-process
-//! reth/EVM work with no I/O to await. The composer stores clients as
-//! trait objects so transports (local reth, test fake) can swap
-//! without upstream changes.
+//! Both traits are synchronous because execution is in-process. Trait objects
+//! let local implementations and test fakes share the same orchestration.
 
 use alloy_primitives::{Address, Bytes, U256};
 
 use crate::action::CallMode;
 use crate::composition::CompositionBuilder;
 use crate::error::ExecutorResult;
-#[allow(
-    unused_imports,
-    reason = "ExecutorError / its Kind enum used in rustdoc intra-doc links"
-)]
 use crate::error::{ExecutorError, ExecutorErrorKind};
 use crate::rollup_id::RollupId;
 use crate::types::ExecutionOutcome;
@@ -32,13 +23,14 @@ use crate::types::ExecutionOutcome;
 pub struct ExecutionRequest {
     /// Effective EVM mode, including static context inherited from a parent call.
     pub call_mode: CallMode,
-    /// Contract invoked on the destination chain.
+    /// Address invoked on the destination chain.
     pub target_address: Address,
     /// Calldata sent to the destination contract.
     pub data: Bytes,
     /// Native value sent with the call.
     pub value: U256,
-    /// Original caller on the source chain; becomes `msg.sender` at the destination.
+    /// Original source-chain caller, used to derive the destination-side proxy
+    /// address that executes as `msg.sender`.
     pub source_address: Address,
     /// Rollup ID of the source chain, used for routing and call-hash derivation.
     pub source_rollup_id: RollupId,
@@ -47,15 +39,10 @@ pub struct ExecutionRequest {
 /// Stateful execution session driving target-chain calls during
 /// source simulation.
 ///
-/// One session per builder, lazily opened; the slot drain may chain a
-/// live session across consecutive source txs in the same slot (F1 —
-/// see [`CompositionBuilder::with_sessions`](crate::composition::CompositionBuilder::with_sessions));
-/// sessions never outlive their slot. Accumulates state across calls;
-/// `&mut self` on every method reflects that.
-///
-/// `Send` only (source simulation is single-threaded). No `'static`
-/// bound on the trait itself so the source simulator can borrow a
-/// session as `&'a mut (dyn TargetExecutionSession + 'a)`.
+/// A builder lazily opens at most one session per rollup. Sessions accumulate
+/// state across calls and can be transferred explicitly through
+/// [`CompositionBuilder::with_sessions`]. `&mut self` on every method reflects
+/// that stateful lifecycle.
 ///
 /// The `dispatcher` argument on [`execute`](Self::execute) supports
 /// nested cross-chain dispatch: a target-session inspector can call
@@ -64,99 +51,58 @@ pub struct ExecutionRequest {
 pub trait TargetExecutionSession: Send {
     /// Execute a single call on the target chain.
     ///
-    /// `dispatcher` is consumed by nested cross-chain dispatch.
+    /// `dispatcher` routes nested cross-chain calls observed during execution.
     ///
     /// Returns the outcome for source simulation.
     ///
     /// # Errors
     ///
-    /// Returns any [`ExecutorError`] depending on the impl — local
-    /// impls surface [`ExecutorErrorKind::Evm`] /
-    /// [`ExecutorErrorKind::Provider`]; the gRPC impl surfaces
-    /// [`ExecutorErrorKind::Transport`] / [`ExecutorErrorKind::Serde`] /
-    /// [`ExecutorErrorKind::Missing`].
+    /// Returns implementation-specific target execution errors and propagates
+    /// errors from nested dispatch.
     fn execute(
         &mut self,
         req: ExecutionRequest,
         dispatcher: &mut CompositionBuilder,
     ) -> ExecutorResult<ExecutionOutcome>;
 
-    /// Capture an opaque snapshot of the session's current state. The
-    /// returned box is fed back to [`rollback`](Self::rollback) to
-    /// restore the session to its pre-call state. Drop the snapshot
-    /// to commit forward (no-op).
+    /// Capture an opaque checkpoint accepted by [`rollback`](Self::rollback).
     ///
     /// Used to restore nested execution after a reverted frame:
     /// [`CompositionBuilder::open_call`] snapshots the target session
-    /// BEFORE delegating to `execute`, stashes the snapshot keyed by
-    /// call idx, and either drops it (success path) or rolls back
-    /// (reverted-frame path) when
-    /// [`CompositionBuilder::annotate_revert_span`] fires.
-    ///
-    /// The snapshot is type-erased via `Box<dyn Any + Send>` so the
-    /// composer can stash it without naming `Self::Snapshot`. Each
-    /// impl downcasts privately inside `rollback`.
+    /// before delegating to `execute` and stashes it by call index.
+    /// Reverted spans queue the matching snapshots for rollback before a later
+    /// dispatch; unused snapshots are dropped with the builder.
     ///
     /// # Errors
     ///
-    /// Implementation-dependent — `LocalChainClient` is infallible
-    /// (deep-clones revm `State<DB>`'s 7 fields); the gRPC impl can
-    /// surface [`ExecutorErrorKind::Transport`] /
-    /// [`ExecutorErrorKind::Missing`].
+    /// Implementations may fail while capturing their checkpoint state.
     fn checkpoint(&mut self) -> ExecutorResult<SessionSnapshot>;
 
-    /// Restore the session to the state captured by `snapshot`. The
-    /// snapshot must have come from this session's `checkpoint` call;
-    /// passing a snapshot from a different session is an error.
+    /// Apply a checkpoint produced by this session.
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Decode`] if the snapshot's
-    /// concrete type does not match this session's snapshot shape.
+    /// Returns [`ExecutorErrorKind::Encoding`] when the snapshot has the wrong
+    /// concrete type for this session.
     fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()>;
 }
 
-/// Type-erased session snapshot. Each [`TargetExecutionSession`] impl
-/// chooses its own concrete `Box<dyn Any + Send>`-wrapped state.
-/// Holding this type alone is enough for composition.rs to stash and
-/// hand snapshots back to the originating session without naming the
-/// concrete type.
+/// Opaque checkpoint returned by [`TargetExecutionSession::checkpoint`] and
+/// consumed by [`TargetExecutionSession::rollback`].
 pub type SessionSnapshot = Box<dyn std::any::Any + Send>;
 
 /// Uniform chain-client interface every registered rollup satisfies.
 ///
-/// `Composer` talks to every rollup through this trait. Role-specific
-/// methods (`simulate_source_tx`, `stored_target_state_root`) default
-/// to a loud [`ExecutorErrorKind::Unavailable`] refusal.
+/// The runtime composer talks to every rollup through this trait.
+/// `simulate_source_tx` is role-specific and defaults to an
+/// [`ExecutorErrorKind::Unavailable`] refusal.
 ///
-/// Stored as `Arc<dyn ChainClient + Send + Sync>` in the composer's
-/// rollup map.
 pub trait ChainClient: Send + Sync + 'static {
-    /// Read this chain's own latest block-header `stateRoot`.
-    ///
-    /// Orthogonal to upstream-invariant-6 anchoring (which uses
-    /// [`stored_target_state_root`](Self::stored_target_state_root)
-    /// against L1's canonical storage). Used for diagnostics and
-    /// health checks.
+    /// Create a fresh stateful execution session.
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Provider`] if the underlying state
-    /// provider is inaccessible; [`ExecutorErrorKind::Unavailable`] when
-    /// the implementation does not (or cannot) report its own header
-    /// (e.g. a remote gRPC peer that does not expose this).
-    fn current_state_root(&self) -> ExecutorResult<[u8; 32]>;
-
-    /// Create a fresh stateful execution session. The slot drain may
-    /// keep the returned session alive across consecutive source txs
-    /// in the same slot (F1); it never outlives its slot.
-    ///
-    /// # Errors
-    ///
-    /// Returns any [`ExecutorError`] depending on impl — local surfaces
-    /// [`ExecutorErrorKind::Provider`] / [`ExecutorErrorKind::Evm`] /
-    /// [`ExecutorErrorKind::Missing`]; gRPC surfaces
-    /// [`ExecutorErrorKind::Transport`].
+    /// Returns an executor error when the session cannot be initialized.
     fn begin_execution_session(&self) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>>;
 
     /// Simulate a source-chain transaction, dispatching every detected
@@ -165,16 +111,12 @@ pub trait ChainClient: Send + Sync + 'static {
     /// [`ExecutorErrorKind::Unavailable`] so follower registrations
     /// fail loudly if they ever reach source simulation.
     ///
-    /// Takes `raw_tx: Vec<u8>` (owned) so the impl can decode without
-    /// holding a borrow on the caller's buffer across async boundaries.
-    ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Decode`] if the raw tx cannot be
-    /// decoded. Returns [`ExecutorErrorKind::Provider`] if the source
-    /// state provider is inaccessible. Returns [`ExecutorErrorKind::Evm`]
-    /// if source EVM execution fails. Propagates any [`ExecutorError`]
-    /// surfaced by `dispatcher` during proxy call dispatch.
+    /// Returns [`ExecutorErrorKind::Decode`] if the raw transaction cannot be
+    /// decoded, [`ExecutorErrorKind::Provider`] if source state is inaccessible,
+    /// or [`ExecutorErrorKind::Evm`] if EVM setup fails. Propagates errors from
+    /// nested dispatch.
     fn simulate_source_tx(
         &self,
         raw_tx: Vec<u8>,
@@ -183,26 +125,6 @@ pub trait ChainClient: Send + Sync + 'static {
         let _ = (raw_tx, dispatcher);
         Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
             "simulate_source_tx: not an entry-role client".into(),
-        )))
-    }
-
-    /// Read what the canonical committed-root storage currently has
-    /// for `rollup_id` — `EEZ.rollups(rollup_id).stateRoot` on L1, the
-    /// upstream-invariant-6 anchor `postAndVerifyBatch` enforces
-    /// against each delta's `currentState`. Only clients connected to
-    /// the chain hosting that storage implement this; the default
-    /// refuses with [`ExecutorErrorKind::Unavailable`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ExecutorErrorKind::Provider`] if the underlying state
-    /// provider is inaccessible; [`ExecutorErrorKind::Transport`] for
-    /// gRPC implementations; [`ExecutorErrorKind::Unavailable`] if the
-    /// client does not host the committed-root storage.
-    fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
-        let _ = rollup_id;
-        Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
-            "stored_target_state_root: client does not host the committed-root storage".into(),
         )))
     }
 }

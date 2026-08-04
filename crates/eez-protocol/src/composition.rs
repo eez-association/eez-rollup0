@@ -25,7 +25,7 @@
 //!   client, an optional session (`None` until the first dispatch
 //!   opens it — the entry rollup's session stays `None` whenever no
 //!   inspector dispatches back to the entry chain), the target
-//!   configuration, and legacy composition-time root attribution.
+//!   configuration.
 //! - **Entry-aware**. `finalize` omits the entry rollup from `targets`
 //!   because its output lives in `source`.
 //!
@@ -82,15 +82,8 @@ use crate::composer::TargetConfig;
 /// Per-rollup state held inside a [`CompositionBuilder`] during one
 /// composition.
 ///
-/// Carries:
-///
-/// - `client: Arc<dyn ChainClient>` directly (used for legacy
-///   `current_state_root` attribution and lazy session opening).
-/// - `session: Option<Box<dyn _>>`: opened on first `dispatch_call`
-///   to this rollup. The entry rollup's session stays `None` whenever
-///   no inspector dispatches back to the entry chain.
-/// - `config: TargetConfig` — selects the target contract dialect and proxy
-///   lookup configuration.
+/// The client lazily opens the session on first dispatch. The configuration
+/// selects the target contract dialect and proxy lookup layout.
 pub struct Rollup {
     /// Client for this rollup — shared long-lived trait object.
     pub client: Arc<dyn ChainClient + Send + Sync>,
@@ -99,16 +92,11 @@ pub struct Rollup {
     pub session: Option<Box<dyn TargetExecutionSession + Send>>,
     /// Target contract dialect and proxy lookup configuration for this rollup.
     pub config: TargetConfig,
-    /// Legacy committed root forwarded through `SourceAttribution`.
-    /// The current materializer does not consume composition-time roots;
-    /// downstream settlement attaches authoritative state updates.
-    pub initial_state_root: [u8; 32],
 }
 
 impl std::fmt::Debug for Rollup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Rollup")
-            .field("initial_state_root", &self.initial_state_root)
             .field("session_open", &self.session.is_some())
             .field("client", &"<dyn ChainClient>")
             .field("config", &self.config)
@@ -139,12 +127,8 @@ impl std::fmt::Debug for Rollup {
 /// 2. [`close_call`](Self::close_call) — overwrite the slot's outcome
 ///    with the resolved result.
 ///
-/// [`dispatch_call`](Self::dispatch_call) is the convenience entry
-/// point — it wraps the lifecycle (`open` → `session.execute` →
-/// `close`) and is what inspectors call. The split is exposed for
-/// callers that need to interleave their own logic between open and
-/// session.execute (none in-tree yet; the lifecycle methods are
-/// mostly internal-stable for now).
+/// [`dispatch_call`](Self::dispatch_call) wraps the open → execute → close
+/// lifecycle and is the inspector entry point.
 ///
 /// [`recorded_count`](Self::recorded_count) snapshots the current
 /// length so the inspector can bracket a CALL frame:
@@ -152,8 +136,8 @@ impl std::fmt::Debug for Rollup {
 /// at frame end, and on revert the inspector calls
 /// [`annotate_revert_span`](Self::annotate_revert_span) with the
 /// resulting `(start, end - start)` so the bracketed calls' revert scope is
-/// retained. The initial simplify profile rejects nonzero scopes rather than
-/// lowering them to `revertNextNCalls`.
+/// retained. The materializer rejects nonzero scopes rather than lowering
+/// them to `revertNextNCalls`.
 ///
 /// `annotate_revert_span` is separate from `close_call` because
 /// `Inspector::call_end` fires after the inspector's own dispatch
@@ -164,9 +148,6 @@ pub struct CompositionBuilder {
     pub(crate) entry_rollup_id: RollupId,
     pub(crate) rollups: HashMap<RollupId, Rollup>,
     pub(crate) recorded: Vec<ExecutedAction>,
-    /// Legacy composition-time roots keyed by rollup ID. The current
-    /// materializer ignores them; settlement attaches state updates later.
-    pub(crate) extra_per_tx_roots: HashMap<RollupId, Vec<[u8; 32]>>,
     /// Per-call checkpoint keyed by `recorded[..]` index. Checkpoints remain
     /// available while enclosing EVM frames may still revert; reverted spans
     /// queue their indices for rollback. Unused checkpoints are dropped with
@@ -209,7 +190,6 @@ impl CompositionBuilder {
             entry_rollup_id,
             rollups,
             recorded: Vec::new(),
-            extra_per_tx_roots: HashMap::new(),
             pending_snapshots: HashMap::new(),
             checked_out: std::collections::HashSet::new(),
             pending_rollbacks: Vec::new(),
@@ -280,10 +260,8 @@ impl CompositionBuilder {
         Ok(())
     }
 
-    /// Clone calls targeting `rollup_id`.
-    ///
-    /// `recorded` is preorder because `open_call` fixes each index before
-    /// target execution, so filtering preserves dispatch order.
+    /// Filtering the preorder action log preserves dispatch order for each
+    /// target.
     fn group_calls_for(&self, rollup_id: RollupId) -> Vec<ExecutedAction> {
         self.recorded
             .iter()
@@ -306,16 +284,13 @@ impl CompositionBuilder {
     ///
     /// Returns [`ProtocolErrorKind::EmptyCalls`] for an empty composition,
     /// [`ProtocolErrorKind::UnknownTarget`] for an unregistered target, and
-    /// [`ProtocolErrorKind::InvalidEncoding`] for an unresolved call. Returns
+    /// [`ProtocolErrorKind::InvalidEncoding`] for an unresolved call, and
     /// [`ProtocolErrorKind::Unsupported`] for execution shapes outside the
-    /// supported materialization profile, and
-    /// [`ProtocolErrorKind::InvalidCheckpoint`] when an inbound target has no
-    /// resolved post-state root. Propagates executor failures while reading the
-    /// current L1 root.
+    /// supported materialization profile.
     // Keep the structured public error type rather than boxing it.
     #[allow(clippy::result_large_err)]
     #[tracing::instrument(level = "debug", name = "finalize", skip_all, err)]
-    pub fn finalize(mut self) -> CompositionResult<Composition> {
+    pub fn finalize(self) -> CompositionResult<Composition> {
         tracing::debug!(name: "composer.finalize.start", "composition finalize started");
 
         if self.recorded.is_empty() || self.rollups.is_empty() {
@@ -331,34 +306,16 @@ impl CompositionBuilder {
             }
         }
         entries::ensure_materializable_calls(&self.recorded)?;
+        entries::ensure_source_side_calls(self.recorded.iter(), self.entry_rollup_id)?;
 
         // Sort by rollup ID so identical inputs produce identical target order.
         let mut plan_order: Vec<RollupId> = self.rollups.keys().copied().collect();
         plan_order.sort();
 
-        // Legacy composition-time attribution. The current entry materializer
-        // ignores these maps because settlement attaches state updates later.
-        let mut per_tx_roots_by_rollup: HashMap<RollupId, Vec<[u8; 32]>> = HashMap::new();
-
-        // Preserve the legacy attribution carrier until the root plumbing is
-        // removed in a dedicated change.
-        let initial_roots: HashMap<RollupId, [u8; 32]> = self
-            .rollups
-            .iter()
-            .map(|(id, r)| (*id, r.initial_state_root))
-            .collect();
-
         // Build per-rollup target batches (non-entry rollups only).
-        //
-        // The root maps below are legacy attribution inputs; returned batches
-        // do not contain state updates until downstream settlement attaches them.
-        let mut extra_per_tx_roots = std::mem::take(&mut self.extra_per_tx_roots);
         let mut target_compositions = Vec::new();
         for rollup_id in &plan_order {
             if *rollup_id == self.entry_rollup_id {
-                if let Some(roots) = extra_per_tx_roots.remove(rollup_id) {
-                    per_tx_roots_by_rollup.insert(*rollup_id, roots);
-                }
                 continue;
             }
             let Some(rollup) = self.rollups.get(rollup_id) else {
@@ -374,45 +331,25 @@ impl CompositionBuilder {
 
             // L1 targets need immediate L2-to-L1 post-batch entries. Generic
             // `build_batch` materializes source-side calls and cannot represent
-            // this target-side form. Proofs and state updates are attached
-            // downstream. The current-root patch is legacy attribution and does
-            // not affect the returned batch.
+            // this target-side form. State updates and proofs are attached
+            // downstream.
             if dialect.is_zk_poster() {
                 let batch = entries::build_l1_postbatch(&group_calls, self.entry_rollup_id)?;
                 if batch.is_empty() {
                     continue;
                 }
-                let root = rollup.client.current_state_root()?;
-                if let Some(last) = self
-                    .recorded
-                    .iter_mut()
-                    .rev()
-                    .find(|r| r.target_rollup_id == *rollup_id)
-                    && let crate::types::ExecutionOutcome::Resolved {
-                        post_state_root, ..
-                    } = &mut last.outcome
-                {
-                    *post_state_root = root;
-                }
                 tracing::debug!(
                     name: "composer.zk_poster_l1_postbatch",
                     %rollup_id,
-                    l1_root = ?root,
                     entries = group_calls.len(),
                     "zk-poster target: built immediate L1 postBatch; settlement applied at submission",
                 );
-                per_tx_roots_by_rollup.insert(*rollup_id, vec![root]);
                 target_compositions.push(TargetComposition {
                     rollup_id: *rollup_id,
                     batch,
                 });
                 continue;
             }
-
-            let attribution_so_far = crate::composer::SourceAttribution {
-                initial_roots: &initial_roots,
-                per_tx_roots_by_rollup: &per_tx_roots_by_rollup,
-            };
 
             let has_incoming = group_calls
                 .iter()
@@ -429,25 +366,12 @@ impl CompositionBuilder {
                 }
 
                 let inbound_batch = entries::build_l1_inbound_sidecar(&group_calls, *rollup_id)?;
-                let root = self
-                    .recorded
-                    .iter()
-                    .rev()
-                    .find(|recorded| recorded.target_rollup_id == *rollup_id)
-                    .and_then(|recorded| recorded.outcome.post_state_root().copied())
-                    .ok_or_else(|| ProtocolErrorKind::InvalidCheckpoint {
-                        reason: format!(
-                            "inbound target {rollup_id} has no resolved post_state_root"
-                        ),
-                    })?;
                 tracing::debug!(
                     name: "composer.inbound_sidecar",
                     %rollup_id,
-                    delivery_root = ?root,
                     entries = group_calls.len(),
                     "inbound target sidecar built",
                 );
-                per_tx_roots_by_rollup.insert(*rollup_id, vec![root]);
                 target_compositions.push(TargetComposition {
                     rollup_id: *rollup_id,
                     batch: inbound_batch,
@@ -455,7 +379,7 @@ impl CompositionBuilder {
                 continue;
             }
 
-            let batch = entries::build_batch(&group_calls, &attribution_so_far, *rollup_id)?;
+            let batch = entries::build_batch(&group_calls, *rollup_id)?;
             if !batch.is_empty() {
                 target_compositions.push(TargetComposition {
                     rollup_id: *rollup_id,
@@ -465,11 +389,7 @@ impl CompositionBuilder {
         }
 
         // Build the entry-rollup batch across the full preorder slice.
-        let attribution = crate::composer::SourceAttribution {
-            initial_roots: &initial_roots,
-            per_tx_roots_by_rollup: &per_tx_roots_by_rollup,
-        };
-        let entry_batch = entries::build_batch(&self.recorded, &attribution, self.entry_rollup_id)?;
+        let entry_batch = entries::build_batch(&self.recorded, self.entry_rollup_id)?;
 
         tracing::debug!(
             name: "composer.finalize.complete",
@@ -496,10 +416,10 @@ impl CompositionBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::InvalidReentry`] for same-chain
-    /// non-entry self-dispatch. Returns [`ExecutorErrorKind::Unavailable`]
-    /// if no rollup is registered under `target_rollup_id`. Propagates any
-    /// executor error from the target session's `execute`.
+    /// Returns [`ExecutorErrorKind::InvalidReentry`] for prohibited re-entry
+    /// and [`ExecutorErrorKind::Unavailable`] for an unregistered target.
+    /// Propagates rollback, session creation, checkpoint, and target-execution
+    /// errors.
     #[tracing::instrument(
         level = "debug",
         name = "dispatch_call",
@@ -641,12 +561,11 @@ impl CompositionBuilder {
         Ok(idx)
     }
 
-    /// Resolve the call opened by [`open_call`](Self::open_call) at `idx` with its outcome.
-    /// `revert_span` retains a bracketing call's reverted scope when known at
-    /// close time. The current simplify materializers reject it; most callers
-    /// pass `None` and let
-    /// [`annotate_revert_span`](Self::annotate_revert_span) fill it
-    /// in post-frame.
+    /// Resolve the call opened by [`open_call`](Self::open_call) at `idx`.
+    ///
+    /// The materializer rejects a non-`None` `revert_span`. Callers normally
+    /// pass `None`; [`annotate_revert_span`](Self::annotate_revert_span)
+    /// records a reverted enclosing frame after execution.
     pub fn close_call(
         &mut self,
         idx: usize,
@@ -708,16 +627,6 @@ impl CompositionBuilder {
             "annotated revert span and queued session rollback"
         );
     }
-
-    /// Store legacy composition-time roots for `rollup_id`.
-    ///
-    /// The current materializer ignores these roots; downstream settlement
-    /// attaches authoritative state updates.
-    pub fn set_extra_per_tx_roots(&mut self, rollup_id: RollupId, roots: Vec<[u8; 32]>) {
-        if !roots.is_empty() {
-            self.extra_per_tx_roots.insert(rollup_id, roots);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -736,9 +645,6 @@ mod tests {
     }
 
     impl ChainClient for MockClient {
-        fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
-            Ok([0u8; 32])
-        }
         fn begin_execution_session(
             &self,
         ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
@@ -748,7 +654,7 @@ mod tests {
         }
     }
 
-    // ── Reentrant fakes (cycle guard, review 2026-06-11) ─────────────
+    // ── Reentrant fakes ──────────────────────────────────────────
 
     /// Session whose execute() immediately re-dispatches to its OWN
     /// rollup through the builder — the entry→A→…→A cycle shape. The
@@ -782,9 +688,6 @@ mod tests {
     }
 
     impl ChainClient for ReentrantClient {
-        fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
-            Ok([0u8; 32])
-        }
         fn begin_execution_session(
             &self,
         ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
@@ -820,11 +723,9 @@ mod tests {
 
     // ── Helpers ──────────────────────────────────────────────────────
 
-    fn sample_outcome(post_root: [u8; 32]) -> ExecutionOutcome {
+    fn sample_outcome(return_data: [u8; 32]) -> ExecutionOutcome {
         ExecutionOutcome::Resolved {
-            return_data: vec![0xAB],
-            pre_state_root: [0u8; 32],
-            post_state_root: post_root,
+            return_data: return_data.to_vec(),
             gas_used: 21_000,
             success: true,
         }
@@ -851,25 +752,23 @@ mod tests {
         }
     }
 
-    fn entry_rollup(outcome_root: [u8; 32]) -> Rollup {
+    fn entry_rollup(return_data: [u8; 32]) -> Rollup {
         Rollup {
             client: Arc::new(MockClient {
-                session_outcome: sample_outcome(outcome_root),
+                session_outcome: sample_outcome(return_data),
             }),
             session: None,
             config: target_config(),
-            initial_state_root: [0u8; 32],
         }
     }
 
-    fn rollup_with_session(outcome_root: [u8; 32]) -> Rollup {
+    fn rollup_with_session(return_data: [u8; 32]) -> Rollup {
         Rollup {
             client: Arc::new(MockClient {
-                session_outcome: sample_outcome(outcome_root),
+                session_outcome: sample_outcome(return_data),
             }),
             session: None,
             config: target_config(),
-            initial_state_root: [0u8; 32],
         }
     }
 
@@ -885,7 +784,7 @@ mod tests {
         let response = builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
             .expect("dispatch");
-        assert_eq!(response.post_state_root(), Some(&[0x11u8; 32]));
+        assert_eq!(response.return_data(), Some(&[0x11; 32][..]));
         assert_eq!(builder.recorded.len(), 1);
         assert_eq!(builder.recorded[0].target_rollup_id, RollupId(1));
         assert_eq!(builder.recorded[0].source_rollup_id, RollupId(0));
@@ -923,10 +822,8 @@ mod tests {
         let sessions = builder.take_sessions();
         assert_eq!(sessions.len(), 1, "exactly the lazily-opened session");
         assert!(sessions.contains_key(&RollupId(1)));
-        // Taking is draining: a second take finds nothing.
         assert!(builder.take_sessions().is_empty());
 
-        // Seed into a fresh builder: the slot is occupied (no lazy re-open).
         let mut rollups2 = HashMap::new();
         rollups2.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups2.insert(RollupId(1), rollup_with_session([0x22; 32]));
@@ -965,7 +862,6 @@ mod tests {
                 }),
                 session: None,
                 config: target_config(),
-                initial_state_root: [0u8; 32],
             },
         );
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
@@ -1022,8 +918,6 @@ mod tests {
 
         let composition = builder.finalize().expect("finalize");
         assert_eq!(composition.source.rollup_id, RollupId(0));
-        // Entry rollup is skipped in the targets loop, so only rollup 1
-        // appears in targets.
         assert_eq!(composition.targets.len(), 1);
         assert_eq!(composition.targets[0].rollup_id, RollupId(1));
 
@@ -1185,8 +1079,6 @@ mod tests {
                 value: U256::from(5),
                 outcome: ExecutionOutcome::Resolved {
                     return_data: vec![0x04, 0x05],
-                    pre_state_root: [0x11; 32],
-                    post_state_root: [0x12; 32],
                     gas_used: 123,
                     success: true,
                 },
@@ -1202,16 +1094,12 @@ mod tests {
                 value: U256::from(8),
                 outcome: ExecutionOutcome::Resolved {
                     return_data: vec![0x09, 0x0a],
-                    pre_state_root: [0x21; 32],
-                    post_state_root: [0x22; 32],
                     gas_used: 456,
                     success: true,
                 },
                 revert_span: None,
             },
         ];
-        builder.set_extra_per_tx_roots(entry_rollup_id, vec![[0x40; 32]]);
-
         let composition = builder.finalize().expect("finalize composition");
         let source_hash = keccak256(composition.source.batch.abi_encode());
         let target_hashes = composition
@@ -1241,15 +1129,13 @@ mod tests {
 
     #[test]
     fn source_rollup_id_is_stored_from_dispatch_arg() {
-        // Regression guard: the recorded source rollup must come from the
-        // explicit `dispatch_call` argument, not from `req.source_rollup_id`.
+        // The explicit dispatch source is authoritative when it differs from
+        // request metadata.
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
-        // Pass RollupId(7) explicitly, distinct from the request's RollupId(0).
-        // The recorded value must match the dispatch argument.
         builder
             .dispatch_call(RollupId(1), RollupId(7), make_request(1))
             .expect("dispatch");
@@ -1261,17 +1147,12 @@ mod tests {
     struct NoCcmClient;
 
     impl ChainClient for NoCcmClient {
-        fn current_state_root(&self) -> ExecutorResult<[u8; 32]> {
-            Ok([0u8; 32])
-        }
         fn begin_execution_session(
             &self,
         ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
             Ok(Box::new(MockSession {
                 outcome: ExecutionOutcome::Resolved {
                     return_data: b"revert".to_vec(),
-                    pre_state_root: [0u8; 32],
-                    post_state_root: [0u8; 32],
                     gas_used: 1,
                     success: false,
                 },
@@ -1284,7 +1165,6 @@ mod tests {
             client: Arc::new(NoCcmClient),
             session: None,
             config: target_config(),
-            initial_state_root: [0u8; 32],
         }
     }
 
@@ -1318,7 +1198,39 @@ mod tests {
         ));
     }
 
-    // ── Router regression tests ──────────────────────────────────
+    #[test]
+    fn finalize_rejects_nested_calls_across_distinct_targets() {
+        let mut rollups = HashMap::new();
+        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
+        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
+        rollups.insert(RollupId(2), rollup_with_session([0x22; 32]));
+        let mut builder = CompositionBuilder::new(RollupId(0), rollups);
+
+        builder
+            .dispatch_call(RollupId(1), RollupId(0), make_request(1))
+            .expect("top-level dispatch");
+        let mut nested_request = make_request(2);
+        nested_request.source_rollup_id = RollupId(1);
+        builder
+            .dispatch_call(RollupId(2), RollupId(1), nested_request)
+            .expect("nested dispatch records before materialization");
+
+        let error = builder
+            .finalize()
+            .expect_err("nested calls are outside the supported profile");
+        assert!(matches!(
+            error.kind(),
+            crate::error::CompositionErrorKind::Protocol(protocol)
+                if matches!(
+                    protocol.kind(),
+                    crate::ProtocolErrorKind::Unsupported(
+                        "nested cross-chain calls are not supported"
+                    )
+                )
+        ));
+    }
+
+    // ── Re-entry guard tests ──────────────────────────────────────
 
     /// A non-entry rollup dispatching back to itself must surface
     /// `InvalidReentry` before recording or opening another session.
@@ -1368,11 +1280,10 @@ mod tests {
         builder.close_call(idx, sample_outcome([0xCC; 32]), None);
         assert!(builder.recorded[idx].outcome.is_success());
         assert_eq!(
-            builder.recorded[idx].outcome.post_state_root(),
-            Some(&[0xCCu8; 32])
+            builder.recorded[idx].outcome.return_data(),
+            Some(&[0xCC; 32][..])
         );
 
-        // A second top-level dispatch lands at idx 1 — preorder.
         let resp = builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
             .expect("dispatch");
@@ -1526,7 +1437,6 @@ mod tests {
         assert_eq!(builder.pending_rollbacks, vec![0]);
         assert!(builder.pending_snapshots.contains_key(&0));
 
-        // The next dispatch drains pending rollbacks at its top.
         builder
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
             .expect("second dispatch");

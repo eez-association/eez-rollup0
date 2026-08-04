@@ -6,30 +6,17 @@
 //! (`eez-composer`'s `CrossChainWiring`); this module carries the
 //! static per-rollup configuration it registers.
 
-use std::collections::HashMap;
-
 use alloy_primitives::Address;
 
 use crate::dialect::ChainDialect;
-use crate::rollup_id::RollupId;
 
 // ── Config ───────────────────────────────────────────────────────
 
 /// Combined proxy-lookup configuration for a registered rollup.
 ///
-/// Bundles the storage-contract address and the storage slot index
-/// where that contract holds its `authorizedProxies` mapping.
-///
-/// Constructed at `main.rs` startup from the rollup's role:
-/// - L1-style client (entry-as-L1 or follower-as-L1):
-///   `contract_address = eez_address`,
-///   `authorized_proxies_slot = 0` (`EEZ.authorizedProxies` —
-///   inherited from `EEZBase` at slot 0).
-/// - L2-style client:
-///   `contract_address = eezl2_address`,
-///   `authorized_proxies_slot = 0`
-///   (`EEZL2.authorizedProxies` — inherited from `EEZBase`
-///   at slot 0).
+/// `contract_address` identifies the chain-local manager and
+/// `authorized_proxies_slot` identifies its mapping slot. Both supported
+/// manager contracts inherit `authorizedProxies` at slot zero from `EEZBase`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProxyLookupConfig {
     /// Address of the contract holding `authorizedProxies` on this chain.
@@ -48,40 +35,6 @@ pub struct ProxyLookupConfig {
 pub struct TargetConfig {
     /// Proxy-lookup configuration for this rollup.
     pub proxy_lookup: ProxyLookupConfig,
-    /// ABI dialect: selects entry-encoding and
-    /// batch shape (L1-style vs L2-style).
-    /// Default = `EvmL2Style`
-    /// (preserves byte-identity for the existing 12 L1→L2 fixtures).
+    /// Contract dialect used for proxy lookup and target-batch construction.
     pub dialect: ChainDialect,
-}
-
-/// Per-rollup attribution inputs for batch construction.
-///
-/// This remains the carrier for roots collected by composition sessions. The
-/// initial simplify profile attaches settlement `StateUpdate`s downstream, so
-/// its entry materializer does not consume these roots yet.
-/// Two sources of truth:
-///
-/// - `initial_roots[rollup]` — the state root each rollup started at,
-///   read from the entry chain once per source-transaction simulation.
-/// - `per_tx_roots_by_rollup[rollup]` — the post-state roots
-///   `finalize` attributed per rollup (zk-poster settlement root or
-///   inbound delivery root).
-///
-/// References (no ownership) so the builder materializes each map once
-/// per composition and hands borrowed handles to the batch builder.
-///
-/// This struct is protocol-agnostic by construction: no EVM types named.
-/// Builders that need chain-specific bookkeeping (counter folds,
-/// classifier passes) walk the preorder `recorded[..]` slice directly —
-/// the attribution here is purely about numeric state roots.
-#[derive(Debug)]
-pub struct SourceAttribution<'a> {
-    /// Per-rollup initial state roots, as of the entry chain's current
-    /// block when the composition began.
-    pub initial_roots: &'a HashMap<RollupId, [u8; 32]>,
-    /// Per-rollup cumulative post-state roots produced by target-chain
-    /// execution. Keyed by `RollupId`; each `Vec` is
-    /// ordered by batch tx index.
-    pub per_tx_roots_by_rollup: &'a HashMap<RollupId, Vec<[u8; 32]>>,
 }
