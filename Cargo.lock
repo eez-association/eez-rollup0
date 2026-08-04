@@ -3336,7 +3336,6 @@ dependencies = [
  "alloy-primitives",
  "alloy-signer-local",
  "alloy-sol-types",
- "async-trait",
  "eez-payload-codec",
  "hex",
  "k256",
@@ -3346,7 +3345,6 @@ dependencies = [
  "serde_json",
  "sha3 0.10.9",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
 ]
 

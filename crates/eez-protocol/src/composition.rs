@@ -874,8 +874,8 @@ mod tests {
 
     // ── Tests ────────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn dispatch_routes_to_registered_session_and_records() {
+    #[test]
+    fn dispatch_routes_to_registered_session_and_records() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -891,8 +891,8 @@ mod tests {
         assert_eq!(builder.recorded[0].call_mode, crate::CallMode::Mutable);
     }
 
-    #[tokio::test]
-    async fn dispatch_preserves_call_mode() {
+    #[test]
+    fn dispatch_preserves_call_mode() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -907,8 +907,8 @@ mod tests {
         assert_eq!(builder.recorded[0].call_mode, crate::CallMode::Static);
     }
 
-    #[tokio::test]
-    async fn sessions_seed_take_round_trip_and_drop_unregistered() {
+    #[test]
+    fn sessions_seed_take_round_trip_and_drop_unregistered() {
         // `take_sessions` extracts the lazily opened session and
         // `with_sessions` can seed it into another compatible builder. A
         // session for an unregistered rollup is dropped.
@@ -949,8 +949,8 @@ mod tests {
         assert!(!builder3.rollups.contains_key(&RollupId(1)));
     }
 
-    #[tokio::test]
-    async fn cyclic_nested_dispatch_is_refused() {
+    #[test]
+    fn cyclic_nested_dispatch_is_refused() {
         // entry→A→A-again: while A's session is checked out, a nested
         // dispatch back into A must error (InvalidReentry), not mint a
         // duplicate session (whose writes the outer put-back would drop).
@@ -979,8 +979,8 @@ mod tests {
         assert_eq!(builder.take_sessions().len(), 1, "outer session survives");
     }
 
-    #[tokio::test]
-    async fn dispatch_unknown_rollup_returns_unavailable() {
+    #[test]
+    fn dispatch_unknown_rollup_returns_unavailable() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -992,8 +992,8 @@ mod tests {
         assert!(matches!(err.kind(), ExecutorErrorKind::Unavailable(_)));
     }
 
-    #[tokio::test]
-    async fn finalize_empty_errors() {
+    #[test]
+    fn finalize_empty_errors() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         let builder = CompositionBuilder::new(RollupId(0), rollups);
@@ -1005,8 +1005,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn finalize_inbound_target_produces_sidecar_composition() {
+    #[test]
+    fn finalize_inbound_target_produces_sidecar_composition() {
         // An entry→rollup-1 call is incoming from rollup 1's perspective, so
         // finalize uses the inbound sidecar builder rather than source-side
         // `build_batch`.
@@ -1052,8 +1052,8 @@ mod tests {
         assert_eq!(composition.source.batch.entries.len(), 1);
     }
 
-    #[tokio::test]
-    async fn finalize_rejects_recorded_calls_for_unregistered_rollups() {
+    #[test]
+    fn finalize_rejects_recorded_calls_for_unregistered_rollups() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1081,8 +1081,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn finalize_rejects_static_calls_before_building_any_dialect() {
+    #[test]
+    fn finalize_rejects_static_calls_before_building_any_dialect() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1109,8 +1109,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn finalize_rejects_pending_call_before_zk_poster_can_drop_it() {
+    #[test]
+    fn finalize_rejects_pending_call_before_zk_poster_can_drop_it() {
         let mut l1_rollup = rollup_with_session([0u8; 32]);
         l1_rollup.config.dialect = ChainDialect::EvmL1Style;
 
@@ -1137,8 +1137,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn finalize_targets_come_out_sorted_by_rollup_id() {
+    #[test]
+    fn finalize_targets_come_out_sorted_by_rollup_id() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(3), rollup_with_session([0x33; 32]));
@@ -1161,8 +1161,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn source_rollup_id_is_stored_from_dispatch_arg() {
+    #[test]
+    fn source_rollup_id_is_stored_from_dispatch_arg() {
         // Regression guard: the recorded source rollup must come from the
         // explicit `dispatch_call` argument, not from `req.source_rollup_id`.
         let mut rollups = HashMap::new();
@@ -1210,8 +1210,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn finalize_rejects_unsuccessful_calls() {
+    #[test]
+    fn finalize_rejects_unsuccessful_calls() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_reverted_session());
@@ -1244,8 +1244,8 @@ mod tests {
 
     /// A non-entry rollup dispatching back to itself must surface
     /// `InvalidReentry` before recording or opening another session.
-    #[tokio::test]
-    async fn dispatch_same_chain_non_entry_returns_invalid_reentry() {
+    #[test]
+    fn dispatch_same_chain_non_entry_returns_invalid_reentry() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1272,8 +1272,8 @@ mod tests {
 
     /// `open_call` fixes a slot before execution and `close_call` resolves it.
     /// A subsequent dispatch appends a later slot.
-    #[tokio::test]
-    async fn dispatch_records_preorder_at_open_call() {
+    #[test]
+    fn dispatch_records_preorder_at_open_call() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1309,8 +1309,8 @@ mod tests {
     /// `annotate_revert_span` writes `revert_span = Some(span)` on
     /// the bracketing call AND queues every snapshot inside the
     /// bracket for rollback at the next dispatch boundary.
-    #[tokio::test]
-    async fn annotate_revert_span_writes_span_and_queues_rollback() {
+    #[test]
+    fn annotate_revert_span_writes_span_and_queues_rollback() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1339,8 +1339,8 @@ mod tests {
     /// Outer call dispatches 2 inner calls and then the outer's
     /// frame reverts — span = 3 covers the outer + both children.
     /// Bracketed children carry no `revert_span`.
-    #[tokio::test]
-    async fn revert_span_gt_one_covers_outer_plus_two_children() {
+    #[test]
+    fn revert_span_gt_one_covers_outer_plus_two_children() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1374,8 +1374,8 @@ mod tests {
     /// Outer call A reverts, sibling outer B succeeds. A is annotated
     /// with span=1 (self-only); B is not annotated. Preorder indices
     /// stay monotonic; B is in slot 1, after A's slot 0.
-    #[tokio::test]
-    async fn sibling_after_revert_only_annotates_reverted_outer() {
+    #[test]
+    fn sibling_after_revert_only_annotates_reverted_outer() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1401,8 +1401,8 @@ mod tests {
     /// Outer call dispatches 1 successful inner call, then the outer
     /// reverts — span = 2 covers the outer plus the successful child.
     /// The child succeeded but is queued for rollback with the outer bracket.
-    #[tokio::test]
-    async fn parent_reverts_after_successful_child() {
+    #[test]
+    fn parent_reverts_after_successful_child() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1434,8 +1434,8 @@ mod tests {
     /// Revert at a previous `Inspector::call_end` is applied at the
     /// top of the next `dispatch_call` — the queued rollbacks drain
     /// to `session.rollback()` invocations before the new call opens.
-    #[tokio::test]
-    async fn pending_rollbacks_drain_at_next_dispatch() {
+    #[test]
+    fn pending_rollbacks_drain_at_next_dispatch() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
