@@ -48,7 +48,7 @@ use crate::rollup::RollupState;
 /// Runtime config for the cross-chain execution path on Sync slots.
 /// Carried inside [`CrossChainWiring`] next to the wired
 /// `EvmComposer`: the keys and addresses needed to construct and sign
-/// canonical L2 system transactions from semantic composition batches.
+/// canonical L2 system transactions from composition batch entries.
 ///
 /// Owned by `eez-node` at startup and shared via `Arc` because the
 /// `PrivateKeySigner` is bigger than two-line clone-cheap.

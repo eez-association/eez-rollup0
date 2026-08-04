@@ -7,17 +7,17 @@
 //!   Composition
 //!   ├── source:  SourceComposition
 //!   │             ├── rollup_id          : RollupId
-//!   │             └── batch              : EvmBatch              semantic batch
+//!   │             └── batch              : EvmBatch
 //!   │
-//!   └── targets: Vec<TargetComposition>                          non-empty targets, sorted by rollup ID
+//!   └── targets: Vec<TargetComposition>              non-empty targets, sorted by rollup ID
 //!                 ├── rollup_id            : RollupId
-//!                 └── batch                : EvmBatch             semantic batch
+//!                 └── batch                : EvmBatch
 //! ```
 //!
-//! Composition contains semantic batches, not transaction calldata.
-//! Downstream code derives system transactions from those batches and later
-//! attaches settlement state updates and proof data before encoding submission
-//! calldata.
+//! `Composition` contains structured `EvmBatch` values, not encoded transaction
+//! calldata. Downstream code consumes their entries to build system transactions
+//! and, for settlement, may merge batches and attach state updates and proof data
+//! before encoding submission calldata.
 
 use alloy_primitives::{Address, Bytes, U256};
 use serde::{Deserialize, Serialize};
@@ -148,12 +148,14 @@ impl ExecutionOutcome {
     }
 }
 
-/// Semantic batch output associated with the entry/source rollup.
+/// Structured batch output associated with the entry/source rollup.
 #[derive(Debug, Clone)]
 pub struct SourceComposition {
     /// Rollup ID of the source chain.
     pub rollup_id: RollupId,
-    /// Semantic batch materialized for the source side.
+    /// Batch entries produced for the source side.
+    ///
+    /// Downstream settlement may merge and finalize this batch before submission.
     pub batch: EvmBatch,
 }
 
@@ -162,11 +164,13 @@ pub struct SourceComposition {
 pub struct TargetComposition {
     /// Rollup associated with this target batch.
     pub rollup_id: RollupId,
-    /// Semantic batch materialized for this target side.
+    /// Batch entries produced for this target side.
+    ///
+    /// Downstream code uses these entries to construct target system transactions.
     pub batch: EvmBatch,
 }
 
-/// Semantic batch output of
+/// Structured batch output of
 /// [`CompositionBuilder::finalize`](crate::CompositionBuilder::finalize).
 ///
 /// This value does not contain transaction calldata, settlement state updates,

@@ -55,7 +55,7 @@
 //!      │      L1 post-batch, inbound sidecar, or          │
 //!      │      source-side execution table                 │
 //!      │   3. build the entry-rollup batch                │
-//!      │   4. package semantic batches into Composition   │
+//!      │   4. package the batches into Composition        │
 //!      └──────────────────────────────────────────────────┘
 //!                             │
 //!                             ▼
@@ -307,7 +307,7 @@ impl CompositionBuilder {
     ///
     /// 1. Validate: both `recorded` and `rollups` non-empty; every
     ///    recorded call targets a registered rollup.
-    /// 2. Build one semantic batch for each non-empty, non-entry target.
+    /// 2. Build one `EvmBatch` for each non-empty, non-entry target.
     /// 3. Build the entry-rollup batch.
     /// 4. Package the source and sorted target batches as [`Composition`].
     ///
