@@ -14,8 +14,8 @@
 //! A per-rollup-only resolver API cannot express this ordering
 //! (the global `proofSystems[]` ordering, the local→global index
 //! mapping, the jagged-matrix shape all live at the batch level).
-//! [`ProofPlanResolver`](crate::proof_resolver::ProofPlanResolver)
-//! resolves a batch's full proof plan in one call.
+//! The runtime proof-plan resolver resolves a batch's full proof plan in one
+//! call.
 //!
 //! # Spec anchors
 //!
@@ -48,7 +48,7 @@ pub struct RollupProofAssignment {
     pub proof_system_indexes: Vec<u64>,
 }
 
-/// Complete proof-system plan for one L1 `postBatch` call.
+/// Complete proof-system plan for one L1 `postAndVerifyBatch` call.
 ///
 /// Maps directly to the on-chain
 /// `ProofSystemBatchPerVerificationEntries` struct's

@@ -22,11 +22,11 @@ use crate::rollup_id::RollupId;
 ///
 /// Constructed at `main.rs` startup from the rollup's role:
 /// - L1-style client (entry-as-L1 or follower-as-L1):
-///   `contract_address = rollups_address`,
+///   `contract_address = eez_address`,
 ///   `authorized_proxies_slot = 0` (`EEZ.authorizedProxies` —
 ///   inherited from `EEZBase` at slot 0).
 /// - L2-style client:
-///   `contract_address = ccm_address`,
+///   `contract_address = eezl2_address`,
 ///   `authorized_proxies_slot = 0`
 ///   (`EEZL2.authorizedProxies` — inherited from `EEZBase`
 ///   at slot 0).
@@ -42,10 +42,8 @@ pub struct ProxyLookupConfig {
 
 /// Per-rollup static configuration.
 ///
-/// Holds the proxy lookup for one rollup (entry or
-/// follower). Passed to
-/// [`ComposerBuilder::entry`] / [`ComposerBuilder::rollup`] alongside
-/// the client.
+/// Holds the proxy lookup for one rollup (entry or follower). Passed to the
+/// runtime composer's rollup-registration paths alongside the client.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetConfig {
     /// Proxy-lookup configuration for this rollup.
@@ -65,8 +63,7 @@ pub struct TargetConfig {
 /// Two sources of truth:
 ///
 /// - `initial_roots[rollup]` — the state root each rollup started at,
-///   read from the entry chain once per
-///   [`Composer::simulate_and_resolve`](Composer::simulate_and_resolve).
+///   read from the entry chain once per source-transaction simulation.
 /// - `per_tx_roots_by_rollup[rollup]` — the post-state roots
 ///   `finalize` attributed per rollup (zk-poster settlement root or
 ///   inbound delivery root).
@@ -83,8 +80,8 @@ pub struct SourceAttribution<'a> {
     /// Per-rollup initial state roots, as of the entry chain's current
     /// block when the composition began.
     pub initial_roots: &'a HashMap<RollupId, [u8; 32]>,
-    /// Per-rollup cumulative post-state roots for each tx in that
-    /// rollup's CCM-verify batch. Keyed by `RollupId`; each `Vec` is
+    /// Per-rollup cumulative post-state roots produced by target-chain
+    /// execution. Keyed by `RollupId`; each `Vec` is
     /// ordered by batch tx index.
     pub per_tx_roots_by_rollup: &'a HashMap<RollupId, Vec<[u8; 32]>>,
 }

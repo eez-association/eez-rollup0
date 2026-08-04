@@ -34,6 +34,13 @@ contract PublicInputsHashVectorsTest is Test {
         0x3c9874af807b93a58190c46b40539cee1e70563191f9d809ed0220c03ace0c24;
     bytes32 private constant MULTI_PS_PUBLIC_INPUT_2 =
         0x70f74b384fe5841518e09eadcd178c46e6a7f62f9ca651e30c600ee23bb41a42;
+    bytes32 private constant ALL_DIMENSIONS_STATIC_ENTRY_HASH =
+        0x1a63bcaad1cc1d18331cee8e48f0074de3a9f1f887255d3dfdf44f62a08036c3;
+    bytes32 private constant ALL_DIMENSIONS_BLOB_HASH = bytes32(uint256(0xB10B));
+    bytes32 private constant ALL_DIMENSIONS_CUSTOM_BLOCK_HASH = bytes32(uint256(0xC0570D));
+    bytes32 private constant ALL_DIMENSIONS_SHARED = 0x63337a6c8300ec03d53497260962ca38155db08c6b233088078cb26caf172845;
+    bytes32 private constant ALL_DIMENSIONS_PUBLIC_INPUT =
+        0x18742f97fac6fcd3ca33e57739399b92eb55a4cf3465327a9dd274199ef677ef;
 
     function testEmptyEntryVector() external {
         EEZ eez = new EEZ(address(0xDEAD));
@@ -130,6 +137,56 @@ contract PublicInputsHashVectorsTest is Test {
         eez.postAndVerifyBatch(batch);
     }
 
+    function testAllSharedInputDimensionsVector() external {
+        EEZ eez = new EEZ(address(0xDEAD));
+        MockProofSystem proofSystem = new MockProofSystem();
+        bytes32 initialState = bytes32(uint256(0x1111));
+        uint64 rollupId =
+            _registerRollup(eez, _singleton(proofSystem), _singleton(bytes32(uint256(0x42))), initialState);
+
+        StaticExecutionEntry memory staticEntry;
+        staticEntry.expectedStateRoots = new ExpectedStateRootPerRollup[](1);
+        staticEntry.expectedStateRoots[0] = ExpectedStateRootPerRollup({rollupId: rollupId, stateRoot: initialState});
+        staticEntry.proxyEntryHash = bytes32(uint256(0x5555));
+        staticEntry.l2ToL1Calls = new L2ToL1Call[](0);
+        staticEntry.rollingHash = bytes32(uint256(0x6666));
+        staticEntry.destinationRollupId = rollupId;
+        staticEntry.success = true;
+        staticEntry.returnData = hex"cafe";
+
+        ProofSystemBatchPerVerificationEntries memory batch = _emptyBatch();
+        batch.staticEntries = new StaticExecutionEntry[](1);
+        batch.staticEntries[0] = staticEntry;
+        batch.blobIndices = new uint256[](1);
+        batch.blobIndices[0] = 0;
+        batch.callData = hex"a1b2c3";
+        batch.proofSystems = _addresses(_singleton(proofSystem));
+        batch.proofs = _proofs(1);
+        batch.rollupIdsWithProofSystems = _assignments1(rollupId, 0);
+        batch.blockNumber = 50;
+        batch.bindMsgSenderInPublicInput = true;
+
+        bytes32[] memory blobHashes = _singleton(ALL_DIMENSIONS_BLOB_HASH);
+        bytes[] memory customData = new bytes[](1);
+        customData[0] = abi.encode(uint256(0), ALL_DIMENSIONS_CUSTOM_BLOCK_HASH);
+        address boundSender = address(0xBEEF);
+
+        bytes32 staticEntryHash = keccak256(abi.encode(staticEntry));
+        bytes32 shared = _shared(batch, blobHashes, customData, boundSender);
+        bytes32 publicInput = _publicInput(shared, _singleton(rollupId), _singleton(bytes32(uint256(0x42))));
+
+        assertEq(staticEntryHash, ALL_DIMENSIONS_STATIC_ENTRY_HASH);
+        assertEq(shared, ALL_DIMENSIONS_SHARED);
+        assertEq(publicInput, ALL_DIMENSIONS_PUBLIC_INPUT);
+
+        vm.roll(100);
+        vm.setBlockhash(50, ALL_DIMENSIONS_CUSTOM_BLOCK_HASH);
+        vm.blobhashes(blobHashes);
+        proofSystem.setExpectedPublicInputsHash(publicInput);
+        vm.prank(boundSender);
+        eez.postAndVerifyBatch(batch);
+    }
+
     function testECDSAProofCannotBeReusedForDifferentCallData() external {
         uint256 signerKey = 0xA11CE;
         address signer = vm.addr(signerKey);
@@ -220,6 +277,19 @@ contract PublicInputsHashVectorsTest is Test {
         pure
         returns (bytes32)
     {
+        return _shared(batch, new bytes32[](0), customData, boundSender);
+    }
+
+    function _shared(
+        ProofSystemBatchPerVerificationEntries memory batch,
+        bytes32[] memory blobHashes,
+        bytes[] memory customData,
+        address boundSender
+    )
+        private
+        pure
+        returns (bytes32)
+    {
         bytes32[] memory entryHashes = new bytes32[](batch.entries.length);
         for (uint256 i = 0; i < batch.entries.length; i++) {
             entryHashes[i] = keccak256(abi.encode(batch.entries[i]));
@@ -228,7 +298,6 @@ contract PublicInputsHashVectorsTest is Test {
         for (uint256 i = 0; i < batch.staticEntries.length; i++) {
             staticEntryHashes[i] = keccak256(abi.encode(batch.staticEntries[i]));
         }
-        bytes32[] memory blobHashes = new bytes32[](0);
         bytes32[] memory customDataHashes = new bytes32[](batch.rollupIdsWithProofSystems.length);
         for (uint256 i = 0; i < customData.length; i++) {
             customDataHashes[i] = keccak256(abi.encode(batch.rollupIdsWithProofSystems[i].rollupId, customData[i]));

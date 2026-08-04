@@ -9,8 +9,12 @@ use std::{fs, path::PathBuf};
 
 use alloy_primitives::{Address, B256, Bytes, I256, U256, hex, keccak256};
 use alloy_sol_types::{SolValue, sol};
-use eez_protocol::abi::{ExecutionEntrySol, StateUpdateSol};
-use eez_protocol::public_inputs::{all_per_ps_hashes, entry_hash, shared_public_input};
+use eez_protocol::abi::{
+    ExecutionEntrySol, ExpectedStateRootPerRollupSol, StateUpdateSol, StaticExecutionEntrySol,
+};
+use eez_protocol::public_inputs::{
+    all_per_ps_hashes, entry_hash, shared_public_input, static_entry_hash,
+};
 use eez_protocol::{ProofPlan, RollupId, RollupProofAssignment};
 use serde::Deserialize;
 
@@ -156,6 +160,27 @@ fn execution_entry_encoding_matches_pinned_solidity() {
     assert_eq!(
         entry_hash(&entry),
         parse_b256("0x2c4c8cbc9b39743790f04a13406c6c0e3ab6ca0bf5acb3b923f5549d3aabb759")
+    );
+}
+
+#[test]
+fn static_execution_entry_encoding_matches_pinned_solidity() {
+    let entry = StaticExecutionEntrySol {
+        expectedStateRoots: vec![ExpectedStateRootPerRollupSol {
+            rollupId: 1,
+            stateRoot: B256::from(U256::from(0x1111)),
+        }],
+        proxyEntryHash: B256::from(U256::from(0x5555)),
+        l2ToL1Calls: Vec::new(),
+        rollingHash: B256::from(U256::from(0x6666)),
+        destinationRollupId: 1,
+        success: true,
+        returnData: Bytes::from_static(&[0xca, 0xfe]),
+    };
+
+    assert_eq!(
+        static_entry_hash(&entry),
+        parse_b256("0x1a63bcaad1cc1d18331cee8e48f0074de3a9f1f887255d3dfdf44f62a08036c3")
     );
 }
 

@@ -90,7 +90,7 @@ services:
       # oracle falls back to the embedded L1 (config.rs build_target_provider).
       EEZ_L1_ROLLUP_ID: "0"
       # Cross-chain wiring.
-      EEZ_CCM_L2_ADDRESS: "0x4200000000000000000000000000000000000007"
+      EEZL2_ADDRESS: "0x4200000000000000000000000000000000000007"
       EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS: "10200"
       # L2 RPC — outbound front upstream + composer L2 reads.
       EEZ_L2_RPC_URL: http://127.0.0.1:18688

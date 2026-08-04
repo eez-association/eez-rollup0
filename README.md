@@ -15,7 +15,7 @@ rebuild the whole L2 chain from L1 alone. The supported L1 is Gnosis **Chiado**
   cross-chain work.
 - **Routes cross-chain calls.** A transaction aimed at a cross-chain proxy
   (or sent from L1) is held aside, simulated, and packed into the next Sync
-  block. The matching L1 call (`postBatch`) and the user's L1 transactions
+  block. The matching L1 `postAndVerifyBatch` call and the user's L1 transactions
   are submitted together so they all land in the *same* L1 block — all or
   nothing.
 - **Commits first, repairs if needed.** The Sync block is added to L2 right
@@ -88,7 +88,7 @@ cp datadir/genesis.json ./data/genesis-fresh.json
 
 This deploys EEZ + ECDSAProofSystem + the rollup manager, registers the
 rollup, deploys the L1 bridge contracts, and writes **`deployments.env`**
-(registry, proof system, rollup id, deploy block, bridge + CCM-L2 addresses).
+(registry, proof system, rollup id, deploy block, bridge, and EEZL2 addresses).
 The deploy derives the public L2 system address from `EEZ_L2_SYSTEM_KEY`,
 generates and funds its canonical EEZL2 genesis, and registers that exact state
 root; the private key is never written to `deployments.env`. It also writes the

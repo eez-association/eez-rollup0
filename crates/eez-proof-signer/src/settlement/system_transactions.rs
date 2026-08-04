@@ -78,7 +78,7 @@ impl SystemTransactionKey {
         SystemTransactionReconstructor {
             context: eez_protocol::system_tx::SystemTxContext {
                 system_signer: self.0,
-                ccm_l2_address: EEZL2_ADDRESS,
+                eezl2_address: EEZL2_ADDRESS,
                 l2_chain_id,
                 l2_gas_price: SYSTEM_TRANSACTION_GAS_PRICE,
                 l2_gas_limit: SYSTEM_TRANSACTION_GAS_LIMIT,
@@ -120,7 +120,7 @@ impl fmt::Debug for SystemTransactionReconstructor {
         formatter
             .debug_struct("SystemTransactionReconstructor")
             .field("system_address", &self.context.system_signer.address())
-            .field("ccm_l2_address", &self.context.ccm_l2_address)
+            .field("eezl2_address", &self.context.eezl2_address)
             .field("l2_chain_id", &self.context.l2_chain_id)
             .field("l2_gas_price", &self.context.l2_gas_price)
             .field("l2_gas_limit", &self.context.l2_gas_limit)

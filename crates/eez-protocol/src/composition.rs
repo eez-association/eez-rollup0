@@ -24,13 +24,11 @@
 //! - **Owned [`Rollup`] per rollup**. Each rollup bundles the
 //!   client, an optional session (`None` until the first dispatch
 //!   opens it — the entry rollup's session stays `None` whenever no
-//!   inspector dispatches back to the entry chain), the config (for
-//!   CCM verify), and the initial state root.
+//!   inspector dispatches back to the entry chain), the target
+//!   configuration, and the initial state root.
 //! - **Entry-aware**. `finalize` skips the entry rollup in both the
-//!   target-batch loop (entry has no system-tx CCM path — L1 verifies
-//!   via `EEZ.postAndVerifyBatch`'s
-//!   proof bundle) and the target-composition loop (entry rollup's
-//!   output lives in `source`, not `targets`).
+//!   target-batch loop and the target-composition loop because the entry
+//!   rollup's output lives in `source`, not `targets`.
 //!
 //! # Lifecycle
 //!
@@ -82,9 +80,6 @@ use crate::types::{
     Composition, ExecutedAction, ExecutionOutcome, SourceComposition, TargetComposition,
 };
 
-// Avoid a protocol → composer layering cycle: TargetConfig lives in
-// `composer.rs`, but this module reads `config.verification_context`
-// + `config.ccm_gas_limit` during finalize.
 use crate::composer::TargetConfig;
 
 // ── Rollup ───────────────────────────────────────────────────────
@@ -99,16 +94,15 @@ use crate::composer::TargetConfig;
 /// - `session: Option<Box<dyn _>>`: opened on first `dispatch_call`
 ///   to this rollup. The entry rollup's session stays `None` whenever
 ///   no inspector dispatches back to the entry chain.
-/// - `config: TargetConfig` — `finalize` reads
-///   `config.verification_context()` and `config.proxy_lookup` directly.
+/// - `config: TargetConfig` — selects the target contract dialect and proxy
+///   lookup configuration.
 pub struct Rollup {
     /// Client for this rollup — shared long-lived trait object.
     pub client: Arc<dyn ChainClient + Send + Sync>,
     /// Lazily-opened session for this rollup. `None` until the first
     /// [`CompositionBuilder::dispatch_call`] hits this rollup.
     pub session: Option<Box<dyn TargetExecutionSession + Send>>,
-    /// Configuration for this rollup (CCM addresses, gas limit, proxy
-    /// lookup).
+    /// Target contract dialect and proxy lookup configuration for this rollup.
     pub config: TargetConfig,
     /// Root the entry chain currently holds for this rollup. Used as
     /// the `currentState` of the first source entry that touches this
@@ -176,13 +170,9 @@ pub struct CompositionBuilder {
     pub(crate) rollups: HashMap<RollupId, Rollup>,
     pub(crate) recorded: Vec<ExecutedAction>,
     /// Pre-computed per-tx state roots, keyed by rollup id, injected
-    /// via [`Self::set_extra_per_tx_roots`]. Merged into
-    /// `per_tx_roots_by_rollup` at the start of `finalize`'s CCM-verify
-    /// loop — values do not get overwritten by CCM-verify when the
-    /// rollup is skipped (e.g. the entry rollup), but a follower
-    /// rollup that ALSO had pre-computed roots injected would have
-    /// them clobbered by the CCM-verify result. In practice only the
-    /// entry rollup uses this path (overlay session post-execute roots).
+    /// via [`Self::set_extra_per_tx_roots`]. The entry rollup consumes these
+    /// roots during `finalize`; non-entry rollups derive their attribution
+    /// while their target batches are built.
     pub(crate) extra_per_tx_roots: HashMap<RollupId, Vec<[u8; 32]>>,
     /// Per-call snapshot stash, keyed by `recorded[..]` index. Each
     /// open call grabs an opaque [`SessionSnapshot`] right before
@@ -495,8 +485,7 @@ impl CompositionBuilder {
                     %rollup_id,
                     l1_root = ?root,
                     entries = group_calls.len(),
-                    "zk-poster target: built immediate L1 postBatch (skipping CCM-verify sim; \
-                     settlement applied at submission)",
+                    "zk-poster target: built immediate L1 postBatch; settlement applied at submission",
                 );
                 per_tx_roots_by_rollup.insert(*rollup_id, vec![root]);
                 target_batches.insert(*rollup_id, batch);
@@ -855,8 +844,8 @@ impl CompositionBuilder {
     /// builder's eventual `finalize` step.
     ///
     /// Used by the entry-overlay path: `finalize`'s target loop
-    /// skips the entry rollup (no system-tx CCM contract
-    /// on L1), so nested calls attributed to the entry rollup have no
+    /// skips the entry rollup because its output is built separately as the
+    /// source composition, so nested calls attributed to it have no
     /// `per_tx_roots` source. The entry overlay session captures one
     /// post-state root per overlay `execute` and, at end of
     /// `simulate_source_tx`, the source-sim path drains that buffer
@@ -1395,7 +1384,7 @@ mod tests {
     /// Same-chain non-entry self-dispatch must surface `InvalidReentry`
     /// loudly. L2 → L2 is architecturally disallowed: a non-entry
     /// rollup that issues a cross-chain call back to itself bypasses
-    /// the entry-rollup CCM contract that mediates every legitimate
+    /// the entry rollup's dispatch contract that mediates every legitimate
     /// reentry.
     #[tokio::test]
     async fn dispatch_same_chain_non_entry_returns_invalid_reentry() {

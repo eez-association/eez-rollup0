@@ -503,8 +503,8 @@ fn main() -> eyre::Result<()> {
                         |_| eyre::eyre!("EEZ_REGISTRY_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
                     )?)?;
 
-                    let ccm_l2: Address = Address::from_str(&env::var("EEZ_CCM_L2_ADDRESS").map_err(
-                        |_| eyre::eyre!("EEZ_CCM_L2_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
+                    let eezl2_address: Address = Address::from_str(&env::var("EEZL2_ADDRESS").map_err(
+                        |_| eyre::eyre!("EEZL2_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
                     )?)?;
                     let l1_rollup_id_u64 = read_l1_rollup_id();
                     let l1_rollup_id = RollupId(l1_rollup_id_u64);
@@ -524,7 +524,6 @@ fn main() -> eyre::Result<()> {
                                 l1_provider,
                                 l1_evm_config,
                                 l1_rollup_id,
-                                eez_registry,
                                 eez_registry,
                                 eez_protocol::ChainDialect::EvmL1Style,
                             );
@@ -553,7 +552,6 @@ fn main() -> eyre::Result<()> {
                                 l1_evm_config,
                                 l1_rollup_id,
                                 eez_registry,
-                                eez_registry,
                                 eez_protocol::ChainDialect::EvmL1Style,
                             );
                             let entry_view: std::sync::Arc<
@@ -565,15 +563,14 @@ fn main() -> eyre::Result<()> {
                         }
                     };
 
-                    // L2 follower — EvmL2Style. `dispatch_address` =
-                    // `ccm_address` = CCM-L2 predeploy (where
-                    // authorizedProxies lives at slot 2).
+                    // L2 follower — EvmL2Style. Its dispatch contract is the
+                    // `EEZL2` predeploy, whose inherited `authorizedProxies`
+                    // mapping occupies slot 0.
                     let l2_follower = LocalChainClient::new_follower(
                         provider.clone(),
                         evm_config.clone(),
                         l2_rollup_id_typed,
-                        ccm_l2,
-                        ccm_l2,
+                        eezl2_address,
                         eez_protocol::ChainDialect::EvmL2Style,
                     );
                     let l2_follower_view: std::sync::Arc<
@@ -589,8 +586,7 @@ fn main() -> eyre::Result<()> {
                         provider.clone(),
                         evm_config.clone(),
                         l2_rollup_id_typed,
-                        ccm_l2,
-                        ccm_l2,
+                        eezl2_address,
                         eez_protocol::ChainDialect::EvmL2Style,
                     );
                     let l2_entry_view: std::sync::Arc<
@@ -609,7 +605,7 @@ fn main() -> eyre::Result<()> {
                     };
                     let l2_follower_cfg = TargetConfig {
                         proxy_lookup: ProxyLookupConfig {
-                            contract_address: ccm_l2,
+                            contract_address: eezl2_address,
                             authorized_proxies_slot: eez_protocol::ChainDialect::EvmL2Style
                                 .proxy_lookup_slot(),
                         },
@@ -631,11 +627,6 @@ fn main() -> eyre::Result<()> {
                 let system_signer = PrivateKeySigner::from_bytes(&B256::from_str(
                     system_key.trim_start_matches("0x"),
                 )?)?;
-                let ccm_l2_address: Address = Address::from_str(
-                    &env::var("EEZ_CCM_L2_ADDRESS").map_err(|_| {
-                        eyre::eyre!("EEZ_CCM_L2_ADDRESS required (set by deploy.sh)")
-                    })?,
-                )?;
                 // Submission RPC for postBatch and inbound source-chain reads.
                 // This can differ from the embedded L1 used for local source
                 // simulation (the E2E harness deliberately uses Anvil here), so
@@ -680,7 +671,7 @@ fn main() -> eyre::Result<()> {
                 // (dev reth, anvil) detected via JSON-RPC -32601.
                 let exec_ctx = Arc::new(eez_composer::CrossChainExecCtx {
                     system_signer,
-                    ccm_l2_address,
+                    eezl2_address,
                     l2_chain_id: chain_spec.chain().id(),
                     l2_gas_price: 1_000_000_000,
                     l2_gas_limit: 2_000_000,
@@ -697,7 +688,7 @@ fn main() -> eyre::Result<()> {
                         l1_rollup_id = l1_rollup_id_u64,
                         l2_rollup_id = rollup_id,
                         eez_registry = %eez_registry,
-                        ccm_l2 = %ccm_l2,
+                        %eezl2_address,
                         "cross-chain composer constructed (L1 entry + L2 follower)",
                     );
                     Some(CrossChainWiring {
@@ -724,7 +715,7 @@ fn main() -> eyre::Result<()> {
                 let ctx = &cc.exec_ctx;
                 eez_protocol::system_tx::SystemTxContext {
                     system_signer: ctx.system_signer.clone(),
-                    ccm_l2_address: ctx.ccm_l2_address,
+                    eezl2_address: ctx.eezl2_address,
                     l2_chain_id: ctx.l2_chain_id,
                     l2_gas_price: ctx.l2_gas_price,
                     l2_gas_limit: ctx.l2_gas_limit,
@@ -973,7 +964,7 @@ fn main() -> eyre::Result<()> {
 /// Build a `SystemTxContext` for follower mode from env (the follower
 /// has no Composer to feed the composer-mode projection). Returns
 /// `Ok(None)` when cross-chain env isn't present → pure-user-tx follower
-/// mode. Reads `EEZ_L2_SYSTEM_KEY` / `EEZ_CCM_L2_ADDRESS` /
+/// mode. Reads `EEZ_L2_SYSTEM_KEY` / `EEZL2_ADDRESS` /
 /// `EEZ_ROLLUP_ID`; the `l2_gas_price` (1 gwei) and `l2_gas_limit` (2M)
 /// defaults mirror composer-mode so reconstructed system txs are
 /// byte-identical.
@@ -995,21 +986,21 @@ where
             return Err(eyre::eyre!("EEZ_L2_SYSTEM_KEY contains non-UTF-8 bytes"));
         }
     };
-    let ccm_l2_str = env::var("EEZ_CCM_L2_ADDRESS")
-        .map_err(|_| eyre::eyre!("EEZ_CCM_L2_ADDRESS required when EEZ_L2_SYSTEM_KEY is set"))?;
+    let eezl2_address_str = env::var("EEZL2_ADDRESS")
+        .map_err(|_| eyre::eyre!("EEZL2_ADDRESS required when EEZ_L2_SYSTEM_KEY is set"))?;
     let rollup_id_str = env::var("EEZ_ROLLUP_ID")
         .map_err(|_| eyre::eyre!("EEZ_ROLLUP_ID required when EEZ_L2_SYSTEM_KEY is set"))?;
 
     let system_signer =
         PrivateKeySigner::from_bytes(&B256::from_str(system_key.trim_start_matches("0x"))?)?;
-    let ccm_l2_address: Address = Address::from_str(&ccm_l2_str)?;
+    let eezl2_address: Address = Address::from_str(&eezl2_address_str)?;
     let this_rollup_id: u64 = rollup_id_str
         .parse()
         .map_err(|e| eyre::eyre!("EEZ_ROLLUP_ID malformed: {e}"))?;
 
     Ok(Some(eez_protocol::system_tx::SystemTxContext {
         system_signer,
-        ccm_l2_address,
+        eezl2_address,
         l2_chain_id: chain_spec.chain().id(),
         l2_gas_price: 1_000_000_000,
         l2_gas_limit: 2_000_000,
@@ -1115,7 +1106,7 @@ fn require_xchain_composer_wiring(
     Ok(())
 }
 
-/// Build the [`EmbeddedL1Config`] from env; all vars optional, with testing
+/// Build the `EmbeddedL1Config` from env; all vars optional, with testing
 /// defaults so the smoke harness only overrides what it needs.
 ///
 ///   - `EEZ_L1_HTTP_PORT` — default `18545` (WS = http_port + 1)

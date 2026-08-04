@@ -1303,7 +1303,7 @@ where
                 .as_ref()
                 .expect("gate_outbound only populated under system_tx_cfg = Some");
             let to_block = from_block + last_index as u64;
-            let observed = self.observed_outbound_calls(to_block, cfg.ccm_l2_address)?;
+            let observed = self.observed_outbound_calls(to_block, cfg.eezl2_address)?;
             eez_protocol::outbound_gate::verify_outbound_authorized(
                 &gate_outbound,
                 &observed,
@@ -1544,7 +1544,7 @@ mod outbound_wiring_tests {
     use eez_protocol::action::{CallHashInput, l2_outbound_call_hash};
     use eez_protocol::outbound_gate::{OutboundCallObservation, verify_outbound_authorized};
 
-    const CCM: Address = address!("4200000000000000000000000000000000000007");
+    const EEZL2: Address = address!("4200000000000000000000000000000000000007");
     const OTHER: Address = address!("00000000000000000000000000000000deadbeef");
     const L2_RID: u64 = 1;
 
@@ -1625,19 +1625,19 @@ mod outbound_wiring_tests {
     // ── extraction filters ──────────────────────────────────────────────
 
     #[test]
-    fn extract_picks_ccm_events_and_preserves_multiset() {
+    fn extract_picks_eezl2_events_and_preserves_multiset() {
         let h1 = B256::repeat_byte(0x11);
         let h2 = B256::repeat_byte(0x22);
         // Empty receipts (reverted txs) and topicless logs carry no hash — ignored.
-        let bare = Log::new_unchecked(CCM, Vec::new(), Bytes::new());
+        let bare = Log::new_unchecked(EEZL2, Vec::new(), Bytes::new());
         let receipts = vec![
-            receipt(vec![cc_log(CCM, h1), cc_log(CCM, h2)]),
-            receipt(vec![cc_log(CCM, h1)]), // duplicate h1 → multiset keeps both
-            receipt(vec![]),                // reverted tx → no logs
-            receipt(vec![bare]),            // topicless log → no hash
+            receipt(vec![cc_log(EEZL2, h1), cc_log(EEZL2, h2)]),
+            receipt(vec![cc_log(EEZL2, h1)]), // duplicate h1 → multiset keeps both
+            receipt(vec![]),                  // reverted tx → no logs
+            receipt(vec![bare]),              // topicless log → no hash
         ];
         assert_eq!(
-            extract_outbound_call_observations(&receipts, CCM),
+            extract_outbound_call_observations(&receipts, EEZL2),
             vec![
                 OutboundCallObservation::new(h1, 0),
                 OutboundCallObservation::new(h2, 0),
@@ -1653,8 +1653,8 @@ mod outbound_wiring_tests {
         // Outbound-via-wrapper end to end through extraction: source is a CONTRACT.
         let wrapper = address!("cccccccccccccccccccccccccccccccccccccccc");
         let call = outbound_call(wrapper, l1_target(), 42, &[0xab]);
-        let receipts = vec![receipt(vec![cc_log(CCM, call_hash(&call))])];
-        let observed = extract_outbound_call_observations(&receipts, CCM);
+        let receipts = vec![receipt(vec![cc_log(EEZL2, call_hash(&call))])];
+        let observed = extract_outbound_call_observations(&receipts, EEZL2);
         assert!(
             verify_outbound_authorized(&[outbound_entry(call)], &observed, L2_RID).is_ok(),
             "a contract-initiated (wrapper) outbound must be accepted"
@@ -1667,7 +1667,7 @@ mod outbound_wiring_tests {
         // address; extraction drops it, so the gate sees a phantom.
         let call = outbound_call(eoa(), l1_target(), 7, &[0x12]);
         let receipts = vec![receipt(vec![cc_log(OTHER, call_hash(&call))])];
-        let observed = extract_outbound_call_observations(&receipts, CCM);
+        let observed = extract_outbound_call_observations(&receipts, EEZL2);
         assert!(verify_outbound_authorized(&[outbound_entry(call)], &observed, L2_RID).is_err());
     }
 
@@ -1677,24 +1677,24 @@ mod outbound_wiring_tests {
         // unmatched (multiset consumption).
         let call = outbound_call(eoa(), l1_target(), 7, &[0x12]);
         let entries = vec![outbound_entry(call.clone()), outbound_entry(call.clone())];
-        let one = vec![receipt(vec![cc_log(CCM, call_hash(&call))])];
+        let one = vec![receipt(vec![cc_log(EEZL2, call_hash(&call))])];
         assert!(
             verify_outbound_authorized(
                 &entries,
-                &extract_outbound_call_observations(&one, CCM),
+                &extract_outbound_call_observations(&one, EEZL2),
                 L2_RID,
             )
             .is_err()
         );
         // …but two events authorize both.
         let two = vec![receipt(vec![
-            cc_log(CCM, call_hash(&call)),
-            cc_log(CCM, call_hash(&call)),
+            cc_log(EEZL2, call_hash(&call)),
+            cc_log(EEZL2, call_hash(&call)),
         ])];
         assert!(
             verify_outbound_authorized(
                 &entries,
-                &extract_outbound_call_observations(&two, CCM),
+                &extract_outbound_call_observations(&two, EEZL2),
                 L2_RID,
             )
             .is_ok()

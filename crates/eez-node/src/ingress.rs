@@ -4,7 +4,7 @@
 //! need a real RPC for that chain. Each front is a transparent proxy: it
 //! forwards every `eth_*` to the source chain's node and intercepts only
 //! `eth_sendRawTransaction`, holding the tx in the per-rollup
-//! [`HeldPool`](eez_composer::HeldPool) with the front's fixed [`Direction`]
+//! [`HeldPool`] with the front's fixed [`Direction`]
 //! (L1 front → `Inbound`, L2 front → `Outbound`) and returning its hash at once.
 //! The receipt resolves when the held tx lands — an outbound in the L2 Sync
 //! block, an inbound in the L1 postBatch bundle.

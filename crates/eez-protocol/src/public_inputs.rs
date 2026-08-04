@@ -188,7 +188,7 @@ pub enum PublicInputsError {
 /// profile: block number zero, no sender binding, and no blobs.
 ///
 /// The reference manager returns empty `customData` for block zero, so this
-/// helper supplies one empty blob per rollup and binds `address(0)`.
+/// helper supplies one empty custom-data value per rollup and binds `address(0)`.
 ///
 /// # Errors
 ///

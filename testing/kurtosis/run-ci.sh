@@ -23,6 +23,9 @@ signed_window_count=0
 remote_attestation_count=0
 export KURTOSIS_ARGS_FILE="$RESULT_DIR/ci-args.yaml"
 
+SIGNED_WINDOW_EVENT='event_name="eez.proof_signer.window_signed"'
+REMOTE_ATTESTATION_EVENT='event_name="eez.prover_client.attested"'
+
 capture_service_log() {
     local service="$1"
     timeout 30s kurtosis service logs "$KURTOSIS_ENCLAVE" "$service" \
@@ -31,15 +34,16 @@ capture_service_log() {
 
 count_literal() {
     local needle="$1" file="$2"
-    awk -v needle="$needle" 'index($0, needle) { count++ } END { print count + 0 }' "$file"
+    sed 's/\x1b\[[0-9;]*m//g' "$file" \
+        | awk -v needle="$needle" 'index($0, needle) { count++ } END { print count + 0 }'
 }
 
 refresh_proof_counts() {
     if [[ -f "$RESULT_DIR/eez-proof-signer.log" ]]; then
-        signed_window_count="$(count_literal 'window validated and signed' "$RESULT_DIR/eez-proof-signer.log")"
+        signed_window_count="$(count_literal "$SIGNED_WINDOW_EVENT" "$RESULT_DIR/eez-proof-signer.log")"
     fi
     if [[ -f "$RESULT_DIR/eez-node.log" ]]; then
-        remote_attestation_count="$(count_literal 'remote prover attested the window' "$RESULT_DIR/eez-node.log")"
+        remote_attestation_count="$(count_literal "$REMOTE_ATTESTATION_EVENT" "$RESULT_DIR/eez-node.log")"
     fi
 }
 

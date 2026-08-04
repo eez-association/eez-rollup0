@@ -46,8 +46,8 @@ pub struct SystemTxContext {
     /// `executeIncomingCrossChainCall`'s `onlySystemAddress` modifier
     /// reverts.
     pub system_signer: PrivateKeySigner,
-    /// On-L2 address of the `EEZL2` contract (CCM-L2 predeploy).
-    pub ccm_l2_address: Address,
+    /// Address of the `EEZL2` contract on this L2.
+    pub eezl2_address: Address,
     /// EIP-155 chain id of this L2.
     pub l2_chain_id: u64,
     /// Legacy `gasPrice` for the signed system tx. Dev/devnet uses
@@ -132,7 +132,7 @@ pub fn build_inbound_system_txs(
         let raw = sign_legacy_system_tx(
             &cfg.system_signer,
             nonce,
-            cfg.ccm_l2_address,
+            cfg.eezl2_address,
             calldata,
             outer.value,
             cfg.l2_chain_id,
@@ -154,9 +154,8 @@ pub fn build_inbound_system_txs(
 /// so the SyncPair block layout is `[load_1 | user_1 | load_2 | user_2 | …]`.
 /// Per-outbound-load is a deliberate FAILURE-ISOLATION choice, NOT forced: a
 /// single `loadExecutionTable([all entries])` followed by N user txs also works
-/// (`executionIndex` is persistent storage walked across txs by each
-/// `_consumeAndExecute`, `EEZL2.sol:404-410`). But each `loadExecutionTable`
-/// wipes the table AND resets `executionIndex = 0` (`EEZL2.sol:148-161`), so
+/// (`entryIndex` is persistent storage advanced by `_consumeAndExecute`). But
+/// `_loadExecutionTable` replaces the table and resets `entryIndex` to zero, so
 /// one load per entry isolates a reverting/desync'd withdrawal — it can't
 /// cascade-desync the cursor for the rest. Given that choice, each load's user
 /// tx must run before the next load wipes the table → the interleaved order.
@@ -189,7 +188,7 @@ pub fn build_outbound_load_table_txs(
         let raw = sign_legacy_system_tx(
             &cfg.system_signer,
             nonce,
-            cfg.ccm_l2_address,
+            cfg.eezl2_address,
             calldata,
             U256::ZERO, // loadExecutionTable carries no value
             cfg.l2_chain_id,
@@ -226,7 +225,7 @@ pub struct SyncPair {
 ///
 /// INTERLEAVED, not system-first: GIVEN the per-outbound-load failure-isolation
 /// choice (see `build_outbound_load_table_txs`), each `loadExecutionTable` wipes
-/// + resets the cursor (`EEZL2.sol:148-161`), so each load's user tx must run
+/// + resets the cursor in `_loadExecutionTable`, so each load's user tx must run
 /// before the next load. Both `build_sync_block` (the composer) and the
 /// deriver's reconstruction build their tx list through THIS fn, so the order
 /// is identical by construction (no system-first vs interleaved drift → no
@@ -254,7 +253,7 @@ pub fn interleave_sync_block_txs(pairs: &[SyncPair]) -> Vec<Bytes> {
 /// fork.)
 ///
 /// Canonical order (given the per-outbound-load failure-isolation choice +
-/// `loadExecutionTable`'s table wipe + cursor reset, `EEZL2.sol:148-161`, which
+/// `_loadExecutionTable`'s table replacement + cursor reset, which
 /// `executeIncomingCrossChainCall` also triggers):
 /// ALL outbound load+user pairs FIRST, THEN all inbound deliveries —
 /// `[load_0,user_0, …, load_{K-1},user_{K-1}, deliver_0, …, deliver_{M-1}]`.
@@ -371,7 +370,7 @@ pub fn build_cross_chain_sync_pairs(
 /// `value`.
 ///
 /// `EEZL2.executeIncomingCrossChainCall` enforces strict
-/// `msg.value == value` equality (`EEZL2.sol:194`) — pass the same
+/// `msg.value == value` equality in `executeIncomingCrossChainCall` — pass the same
 /// value here as is embedded in the calldata.
 ///
 /// # Errors
@@ -421,7 +420,7 @@ mod tests {
     fn ctx() -> SystemTxContext {
         SystemTxContext {
             system_signer: PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap(),
-            ccm_l2_address: address!("4200000000000000000000000000000000000007"),
+            eezl2_address: address!("4200000000000000000000000000000000000007"),
             l2_chain_id: 1,
             l2_gas_price: 1_000_000_000,
             l2_gas_limit: 2_000_000,

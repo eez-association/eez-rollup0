@@ -268,8 +268,8 @@ pub type ExecutorResult<T> = Result<T, ExecutorError>;
 
 error_struct! {
     /// Composition-pipeline error. `finalize` crosses the protocol /
-    /// executor boundary (CCM verification runs target-chain
-    /// simulation), so this type preserves both layers losslessly via
+    /// executor boundary (composition runs target-chain simulation), so this
+    /// type preserves both layers losslessly via
     /// [`CompositionErrorKind`].
     #[derive(Debug)]
     pub struct CompositionError wraps CompositionErrorKind;
@@ -307,7 +307,7 @@ pub enum CompositionErrorKind {
     /// checkpoint validation, etc.).
     #[error("protocol: {0}")]
     Protocol(#[source] ProtocolError),
-    /// Target-chain execution failure raised during CCM verification.
+    /// Target-chain execution failure raised during composition.
     #[error("executor: {0}")]
     Executor(#[source] ExecutorError),
 }
@@ -318,7 +318,7 @@ pub type CompositionResult<T> = Result<T, CompositionError>;
 // ── ComposerError ────────────────────────────────────────────────
 
 error_struct! {
-    /// Errors from the generic [`Composer`](crate::Composer) orchestrator.
+    /// Errors from the generic runtime composer orchestrator.
     ///
     /// Wraps the composition error family plus composer-specific
     /// lifecycle failures (already-registered source/target, missing

@@ -95,6 +95,35 @@
         "0x3c9874af807b93a58190c46b40539cee1e70563191f9d809ed0220c03ace0c24",
         "0x70f74b384fe5841518e09eadcd178c46e6a7f62f9ca651e30c600ee23bb41a42"
       ]
+    },
+    {
+      "name": "all_shared_input_dimensions",
+      "entryHashes": [],
+      "staticEntryHashes": [
+        "0x1a63bcaad1cc1d18331cee8e48f0074de3a9f1f887255d3dfdf44f62a08036c3"
+      ],
+      "blobHashes": [
+        "0x000000000000000000000000000000000000000000000000000000000000b10b"
+      ],
+      "callData": "0xa1b2c3",
+      "rollupAssignments": [
+        {
+          "rollupId": 1,
+          "proofSystemIndexes": [
+            0
+          ],
+          "vkeys": [
+            "0x0000000000000000000000000000000000000000000000000000000000000042"
+          ],
+          "customData": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c0570d"
+        }
+      ],
+      "proofSystemCount": 1,
+      "boundSender": "0x000000000000000000000000000000000000beef",
+      "expectedSharedPublicInput": "0x63337a6c8300ec03d53497260962ca38155db08c6b233088078cb26caf172845",
+      "expectedPublicInputsHashes": [
+        "0x18742f97fac6fcd3ca33e57739399b92eb55a4cf3465327a9dd274199ef677ef"
+      ]
     }
   ]
 }

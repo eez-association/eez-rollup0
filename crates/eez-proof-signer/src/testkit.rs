@@ -30,7 +30,7 @@ pub(crate) const SYSTEM_TX: &str = "f85f8001825208944200000000000000000000000000
 pub(crate) fn system_transaction_context() -> eez_protocol::system_tx::SystemTxContext {
     eez_protocol::system_tx::SystemTxContext {
         system_signer: SYSTEM_PRIVATE_KEY.to_string().parse().unwrap(),
-        ccm_l2_address: crate::EEZL2_ADDRESS,
+        eezl2_address: crate::EEZL2_ADDRESS,
         l2_chain_id: 1,
         l2_gas_price: 1_000_000_000,
         l2_gas_limit: 2_000_000,

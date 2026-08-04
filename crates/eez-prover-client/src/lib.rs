@@ -133,6 +133,7 @@ impl Prover for RemoteProver {
         event!(
             name: "eez.prover_client.attested",
             Level::INFO,
+            event_name = "eez.prover_client.attested",
             from = ctx.from_block,
             to = ctx.to_block,
             blocks = n_blocks,

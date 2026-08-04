@@ -18,6 +18,7 @@ use alloy_rpc_types_eth::{BlockNumHash, BlockNumberOrTag, TransactionReceipt, Tr
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent, SolValue, sol};
 use anyhow::{Context, Result, anyhow, bail};
+use eez_protocol::EEZL2_ADDRESS;
 
 /// Anvil's first default account (mnemonic `test test test test test test test test test test test junk`).
 pub const ANVIL_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -375,10 +376,7 @@ impl Harness {
             ("EEZ_L1_CHAIN_ID", "31337".to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
             ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
-            (
-                "EEZ_CCM_L2_ADDRESS",
-                "0x4200000000000000000000000000000000000007".to_string(),
-            ),
+            ("EEZL2_ADDRESS", format!("{EEZL2_ADDRESS:#x}")),
             (
                 "EEZ_L1_BLOCK_TIME_MS",
                 (L1_BLOCK_TIME_SECS * 1000).to_string(),
@@ -1481,9 +1479,6 @@ pub const DEV_CHAIN_ID: u64 = 1337;
 
 pub const FIRST_ROLLUP_ID: u64 = 1;
 
-/// CCM-L2 predeploy address in the L2 fixture genesis.
-pub const CCM_L2_ADDRESS: Address = address!("0x4200000000000000000000000000000000000007");
-
 sol! {
     #[sol(rpc)]
     interface IEEZProxy {
@@ -1491,7 +1486,7 @@ sol! {
         function createCrossChainProxy(address originalAddress, uint64 originalRollupId) external returns (address proxy);
     }
     #[sol(rpc)]
-    interface ICCML2Proxy {
+    interface IEEZL2Proxy {
         function createCrossChainProxy(address originalAddress, uint64 originalRollupId) external returns (address proxy);
         function computeCrossChainProxyAddress(address originalAddress, uint64 originalRollupId) external view returns (address proxy);
     }
@@ -1782,7 +1777,7 @@ pub async fn value_no_ret(rpc_url: &str, value_addr: Address) -> Result<U256> {
         .await?)
 }
 
-/// Create an outbound proxy through the CCM-L2 predeploy.
+/// Create an outbound proxy through the `EEZL2` predeploy.
 pub async fn create_l2_cross_chain_proxy(
     l2_rpc: &str,
     key: &str,
@@ -1790,8 +1785,8 @@ pub async fn create_l2_cross_chain_proxy(
     original_rollup_id: u64,
 ) -> Result<Address> {
     let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
-    let ccm = ICCML2Proxy::new(CCM_L2_ADDRESS, &provider);
-    let proxy = ccm
+    let eezl2 = IEEZL2Proxy::new(EEZL2_ADDRESS, &provider);
+    let proxy = eezl2
         .computeCrossChainProxyAddress(target, original_rollup_id)
         .call()
         .await?;
@@ -1802,9 +1797,9 @@ pub async fn create_l2_cross_chain_proxy(
         key,
         chain_id,
         nonce,
-        Some(CCM_L2_ADDRESS),
+        Some(EEZL2_ADDRESS),
         U256::ZERO,
-        ICCML2Proxy::createCrossChainProxyCall {
+        IEEZL2Proxy::createCrossChainProxyCall {
             originalAddress: target,
             originalRollupId: original_rollup_id,
         }
@@ -1960,7 +1955,7 @@ impl CrossChainConfig {
             // MockECDSA authorizes the deployer.
             ("EEZ_PROOF_SIGNER_KEY", self.deployer_key.to_string()),
             ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
-            ("EEZ_CCM_L2_ADDRESS", format!("{CCM_L2_ADDRESS:#x}")),
+            ("EEZL2_ADDRESS", format!("{EEZL2_ADDRESS:#x}")),
             ("EEZ_L1_BLOCK_TIME_MS", "5000".to_string()),
             ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
             ("EEZ_PROOF_TIME_MS", "1000".to_string()),

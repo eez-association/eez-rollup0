@@ -139,7 +139,7 @@ def run(plan, args):
         "EEZ_L2_AUTH_PORT": str(L2_ENGINE_PORT),
         "EEZ_L2_P2P_PORT": str(L2_P2P_PORT),
         "EEZ_L2_SYSTEM_KEY": l2_system_key,
-        "EEZ_CCM_L2_ADDRESS": "0x4200000000000000000000000000000000000007",
+        "EEZL2_ADDRESS": "0x4200000000000000000000000000000000000007",
     }
 
     node_cmd = " ".join([

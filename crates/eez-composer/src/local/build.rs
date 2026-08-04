@@ -175,7 +175,7 @@ pub fn sync_block_pair_roots<P>(
     suggested_fee_recipient: Address,
     sync_txs: &[Bytes],
     system_address: Address,
-    ccm_l2_address: Address,
+    eezl2_address: Address,
 ) -> Result<Vec<B256>, BuildError>
 where
     P: StateProviderFactory,
@@ -190,7 +190,7 @@ where
             };
             let to = tx.to();
             tx.recover_signer().is_ok_and(|signer| {
-                eez_protocol::settlement::is_system_tx(signer, to, system_address, ccm_l2_address)
+                eez_protocol::settlement::is_system_tx(signer, to, system_address, eezl2_address)
             })
         })
         .collect();

@@ -46,12 +46,19 @@ fn test_proof_system() -> Address {
 }
 
 fn test_attester() -> crate::attest::Attester {
+    test_attester_for(test_proof_system_vkey(), test_proof_system())
+}
+
+fn test_attester_for(
+    proof_system_vkey: crate::attest::NonZeroProofSystemVkey,
+    proof_system: Address,
+) -> crate::attest::Attester {
     // Anvil account #1. Test-only and intentionally public.
     let private_key = b256!("59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
     crate::attest::Attester::new(
         private_key,
-        test_proof_system_vkey(),
-        test_proof_system(),
+        proof_system_vkey,
+        proof_system,
         TEST_SYSTEM_ADDRESS,
     )
     .unwrap()

@@ -93,7 +93,7 @@ fn cross_chain_call_hash(input: CallHashInput<'_>, call_gas: u64) -> B256 {
     )
 }
 
-/// Storage slot of `mapping(uint256 => RollupConfig) public rollups`
+/// Storage slot of `mapping(uint64 => RollupConfig) public rollups`
 /// on `EEZ.sol` — slot 2, after `authorizedProxies` (0) and
 /// `rollupCounter` (1). Verify with `forge inspect EEZ storage`.
 const ROLLUPS_MAPPING_SLOT: u8 = 2;
@@ -101,8 +101,7 @@ const ROLLUPS_MAPPING_SLOT: u8 = 2;
 /// Compute the Solidity storage slot for `rollups[rollupId].stateRoot`
 /// on `EEZ.sol`.
 ///
-/// `RollupConfig` shape under the multi-prover refactor
-/// (`interfaces/IEEZ.sol:49-53`):
+/// The current `RollupConfig` layout is:
 ///
 /// ```solidity
 /// struct RollupConfig {
@@ -111,20 +110,14 @@ const ROLLUPS_MAPPING_SLOT: u8 = 2;
 ///     uint256 etherBalance;     // +2
 /// }
 /// ```
-///
-/// The pre-refactor `Rollups.sol` shape had 4 fields with `stateRoot`
-/// at +2; the multi-prover refactor dropped `owner` + `verificationKey`
-/// from the central registry (vkeys moved onto the per-rollup
-/// `IRollupContract`), shifting `stateRoot` to +1.
 #[must_use]
 pub fn compute_state_root_slot(rollup_id: RollupId) -> B256 {
     let mut data = [0u8; 64];
-    // Left-pad u64 to uint256 (bytes 0-23 zero, 24-31 the value)
+    // Solidity mapping keys occupy one 32-byte word.
     data[24..32].copy_from_slice(&rollup_id.0.to_be_bytes());
     data[63] = ROLLUPS_MAPPING_SLOT;
     let base = keccak256(data);
-    // stateRoot is at offset +1 within RollupConfig under the
-    // multi-prover layout.
+    // `stateRoot` is the second word in `RollupConfig`.
     B256::from(U256::from_be_bytes(base.0) + U256::from(1))
 }
 

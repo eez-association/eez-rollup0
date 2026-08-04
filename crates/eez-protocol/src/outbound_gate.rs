@@ -113,7 +113,7 @@ pub fn verify_outbound_authorized(
         }
 
         // source rollup id == this L2 — the L1 delivery builds the source proxy
-        // from (sourceAddress, sourceRollupId) (EEZ.sol:958), so a wrong id
+        // from (sourceAddress, sourceRollupId), so a wrong id
         // would settle against a different source identity.
         if call.sourceRollupId != l2_rollup_id {
             return Err(format!(

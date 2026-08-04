@@ -183,7 +183,7 @@ fn main() {
         let cfg = SystemTxContext {
             system_signer: PrivateKeySigner::from_bytes(&alloy_primitives::B256::with_last_byte(1))
                 .unwrap(),
-            ccm_l2_address: alloy_primitives::address!("4200000000000000000000000000000000000007"),
+            eezl2_address: alloy_primitives::address!("4200000000000000000000000000000000000007"),
             l2_chain_id: 1,
             l2_gas_price: 1_000_000_000,
             l2_gas_limit: 1_500_000,

@@ -422,9 +422,9 @@ impl<'a> SessionInspector<'a> {
     /// call dispatches through the supplied [`CompositionBuilder`] and is
     /// recorded into the composition's preorder `recorded[..]` slice.
     ///
-    /// - `proxy_lookup`: the (contract, slot) pair to read
-    ///   `authorizedProxies` from on this chain. Derived from role at
-    ///   `main.rs` startup (entry → Rollups slot 3; follower → CCM slot 1).
+    /// - `proxy_lookup`: the (contract, slot) pair used to read
+    ///   `authorizedProxies` from the chain's `EEZ` or `EEZL2` manager.
+    ///   Both mappings currently occupy slot 0 through `EEZBase`.
     /// - `dispatcher`: dispatch surface for detected calls.
     /// - `caller_rollup_id`: this chain's rollup id — becomes the
     ///   `caller_id` on each dispatched call.
@@ -731,12 +731,13 @@ mod tests {
 
     use super::*;
     use alloy_primitives::{U256, address};
-    use eez_protocol::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
+    use eez_protocol::{EEZ_AUTHORIZED_PROXIES_SLOT, EEZL2_AUTHORIZED_PROXIES_SLOT};
     use revm::MainContext;
     use revm::context::Context;
     use revm::database::{CacheDB, EmptyDB};
 
-    const ROLLUPS_ADDR: Address = address!("0x1111111111111111111111111111111111111111");
+    const EEZ_ADDRESS: Address = address!("0x1111111111111111111111111111111111111111");
+    const EEZL2_ADDRESS: Address = address!("0x4444444444444444444444444444444444444444");
     const PROXY_ADDR: Address = address!("0x2222222222222222222222222222222222222222");
     const DESTINATION_ADDR: Address = address!("0x3333333333333333333333333333333333333333");
     const TARGET_ROLLUP: u64 = 42;
@@ -764,13 +765,13 @@ mod tests {
     fn unregistered_address_returns_none() {
         let mut ctx = fresh_context();
         ctx.journal_mut()
-            .load_account(ROLLUPS_ADDR)
-            .expect("load rollups account");
+            .load_account(EEZ_ADDRESS)
+            .expect("load EEZ account");
 
         let info = lookup_authorized_proxy_live(
             &mut ctx,
-            ROLLUPS_ADDR,
-            ROLLUPS_AUTHORIZED_PROXIES_SLOT,
+            EEZ_ADDRESS,
+            EEZ_AUTHORIZED_PROXIES_SLOT,
             PROXY_ADDR,
         );
         assert!(info.is_none());
@@ -778,23 +779,23 @@ mod tests {
 
     #[test]
     fn registered_in_db_returns_some_cold_read() {
-        let key = proxy_mapping_key(PROXY_ADDR, ROLLUPS_AUTHORIZED_PROXIES_SLOT);
+        let key = proxy_mapping_key(PROXY_ADDR, EEZ_AUTHORIZED_PROXIES_SLOT);
         let value = packed_proxy_value(DESTINATION_ADDR, TARGET_ROLLUP);
 
         let mut cache_db = CacheDB::<EmptyDB>::default();
         cache_db
-            .insert_account_storage(ROLLUPS_ADDR, key.into(), value)
+            .insert_account_storage(EEZ_ADDRESS, key.into(), value)
             .expect("populate storage");
 
         let mut ctx = Context::mainnet().with_db(cache_db);
         ctx.journal_mut()
-            .load_account(ROLLUPS_ADDR)
-            .expect("load rollups account");
+            .load_account(EEZ_ADDRESS)
+            .expect("load EEZ account");
 
         let info = lookup_authorized_proxy_live(
             &mut ctx,
-            ROLLUPS_ADDR,
-            ROLLUPS_AUTHORIZED_PROXIES_SLOT,
+            EEZ_ADDRESS,
+            EEZ_AUTHORIZED_PROXIES_SLOT,
             PROXY_ADDR,
         )
         .expect("proxy present in DB");
@@ -806,20 +807,20 @@ mod tests {
     #[test]
     fn registered_in_journal_returns_some_hot_read() {
         let mut ctx = fresh_context();
-        let key = proxy_mapping_key(PROXY_ADDR, ROLLUPS_AUTHORIZED_PROXIES_SLOT);
+        let key = proxy_mapping_key(PROXY_ADDR, EEZ_AUTHORIZED_PROXIES_SLOT);
         let value = packed_proxy_value(DESTINATION_ADDR, TARGET_ROLLUP);
 
         ctx.journal_mut()
-            .load_account(ROLLUPS_ADDR)
-            .expect("load rollups account");
+            .load_account(EEZ_ADDRESS)
+            .expect("load EEZ account");
         ctx.journal_mut()
-            .sstore(ROLLUPS_ADDR, key.into(), value)
+            .sstore(EEZ_ADDRESS, key.into(), value)
             .expect("journal sstore");
 
         let info = lookup_authorized_proxy_live(
             &mut ctx,
-            ROLLUPS_ADDR,
-            ROLLUPS_AUTHORIZED_PROXIES_SLOT,
+            EEZ_ADDRESS,
+            EEZ_AUTHORIZED_PROXIES_SLOT,
             PROXY_ADDR,
         )
         .expect("journal must expose in-tx writes to the inspector");
@@ -832,7 +833,7 @@ mod tests {
     fn wrong_source_contract_slot_returns_none() {
         // Populate the correct slot; reading an arbitrary other slot
         // must miss, not silently decode garbage.
-        let correct_slot = ROLLUPS_AUTHORIZED_PROXIES_SLOT;
+        let correct_slot = EEZ_AUTHORIZED_PROXIES_SLOT;
         let wrong_slot: u8 = 7;
         assert_ne!(
             correct_slot, wrong_slot,
@@ -844,15 +845,15 @@ mod tests {
 
         let mut cache_db = CacheDB::<EmptyDB>::default();
         cache_db
-            .insert_account_storage(ROLLUPS_ADDR, key.into(), value)
+            .insert_account_storage(EEZ_ADDRESS, key.into(), value)
             .expect("populate storage");
 
         let mut ctx = Context::mainnet().with_db(cache_db);
         ctx.journal_mut()
-            .load_account(ROLLUPS_ADDR)
-            .expect("load rollups account");
+            .load_account(EEZ_ADDRESS)
+            .expect("load EEZ account");
 
-        let info = lookup_authorized_proxy_live(&mut ctx, ROLLUPS_ADDR, wrong_slot, PROXY_ADDR);
+        let info = lookup_authorized_proxy_live(&mut ctx, EEZ_ADDRESS, wrong_slot, PROXY_ADDR);
         assert!(
             info.is_none(),
             "reading with the wrong slot must miss, not silently decode garbage"
@@ -862,13 +863,13 @@ mod tests {
     // ── New tests for ProxyLookupConfig variants ────────────────────
 
     #[test]
-    fn rollups_slot_path_reads_slot_0() {
+    fn eez_slot_path_reads_slot_0() {
         // ProxyLookupConfig with source_contract=EEZ routes to slot 0
         // (authorizedProxies declared on EEZBase, first storage slot
         // of every child).
         let config = ProxyLookupConfig {
-            contract_address: ROLLUPS_ADDR,
-            authorized_proxies_slot: ROLLUPS_AUTHORIZED_PROXIES_SLOT,
+            contract_address: EEZ_ADDRESS,
+            authorized_proxies_slot: EEZ_AUTHORIZED_PROXIES_SLOT,
         };
         assert_eq!(config.authorized_proxies_slot, 0u8);
 
@@ -890,20 +891,20 @@ mod tests {
             config.authorized_proxies_slot,
             PROXY_ADDR,
         )
-        .expect("Rollups-config path must find proxy");
+        .expect("EEZ config path must find proxy");
         assert_eq!(info.original_rollup_id, RollupId(TARGET_ROLLUP));
         assert_eq!(info.original_address, DESTINATION_ADDR);
     }
 
     #[test]
-    fn ccm_slot_path_reads_slot_0() {
+    fn eezl2_slot_path_reads_slot_0() {
         // ProxyLookupConfig with source_contract=EEZL2 routes to slot 0
         // (authorizedProxies on EEZBase, first storage slot). Same
         // value as the L1 path today — kept distinct so the two
         // constants diverging later breaks loudly.
         let config = ProxyLookupConfig {
-            contract_address: ROLLUPS_ADDR,
-            authorized_proxies_slot: CCM_AUTHORIZED_PROXIES_SLOT,
+            contract_address: EEZL2_ADDRESS,
+            authorized_proxies_slot: EEZL2_AUTHORIZED_PROXIES_SLOT,
         };
         assert_eq!(config.authorized_proxies_slot, 0u8);
 
@@ -925,7 +926,7 @@ mod tests {
             config.authorized_proxies_slot,
             PROXY_ADDR,
         )
-        .expect("CCM-config path must find proxy");
+        .expect("EEZL2 config path must find proxy");
         assert_eq!(info.original_rollup_id, RollupId(TARGET_ROLLUP));
         assert_eq!(info.original_address, DESTINATION_ADDR);
     }

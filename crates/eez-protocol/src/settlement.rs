@@ -4,7 +4,7 @@
 use alloy_primitives::Address;
 
 /// A sync-block transaction is a system transaction iff its recovered signer
-/// matches the deployment's system address and it targets the CCM-L2 predeploy.
+/// matches the deployment's system address and it targets `EEZL2`.
 /// The proof signer and composer must use the same deployment values so their
 /// pair-end positions, and therefore per-effect settlement roots, agree.
 #[must_use]
@@ -12,9 +12,9 @@ pub fn is_system_tx(
     signer: Address,
     to: Option<Address>,
     expected_system_address: Address,
-    ccm_l2_address: Address,
+    eezl2_address: Address,
 ) -> bool {
-    signer == expected_system_address && to == Some(ccm_l2_address)
+    signer == expected_system_address && to == Some(eezl2_address)
 }
 
 /// Pair-end tx positions in a sync block — one per settled cross-chain effect,
@@ -39,25 +39,25 @@ mod tests {
     #[test]
     fn system_transaction_identity_uses_deployment_addresses() {
         let system_address = address!("1111111111111111111111111111111111111111");
-        let ccm_l2_address = address!("2222222222222222222222222222222222222222");
+        let eezl2_address = address!("2222222222222222222222222222222222222222");
 
         assert!(is_system_tx(
             system_address,
-            Some(ccm_l2_address),
+            Some(eezl2_address),
             system_address,
-            ccm_l2_address,
+            eezl2_address,
         ));
         assert!(!is_system_tx(
             address!("3333333333333333333333333333333333333333"),
-            Some(ccm_l2_address),
+            Some(eezl2_address),
             system_address,
-            ccm_l2_address,
+            eezl2_address,
         ));
         assert!(!is_system_tx(
             system_address,
             Some(address!("4444444444444444444444444444444444444444")),
             system_address,
-            ccm_l2_address,
+            eezl2_address,
         ));
     }
 

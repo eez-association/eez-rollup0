@@ -31,7 +31,7 @@ source "$deploy_dir/deployments.env"
 set +a
 
 for name in \
-    EEZ_CCM_L2_ADDRESS \
+    EEZL2_ADDRESS \
     EEZ_L2_SYSTEM_ADDRESS \
     EEZ_L2_EEZL2_CODE_HASH \
     EEZ_ROLLUP_ID \
@@ -40,10 +40,10 @@ do
     [[ -n "${!name:-}" ]] || { echo "$name missing from deployments.env" >&2; exit 1; }
 done
 
-actual_system="$(cast call "$EEZ_CCM_L2_ADDRESS" 'SYSTEM_ADDRESS()(address)' --rpc-url "$L2")"
-actual_rollup_id="$(cast call "$EEZ_CCM_L2_ADDRESS" 'ROLLUP_ID()(uint64)' --rpc-url "$L2" | awk '{print $1}')"
-actual_use_gas_left="$(cast call "$EEZ_CCM_L2_ADDRESS" 'USE_GAS_LEFT()(bool)' --rpc-url "$L2")"
-runtime="$(cast code "$EEZ_CCM_L2_ADDRESS" --rpc-url "$L2")"
+actual_system="$(cast call "$EEZL2_ADDRESS" 'SYSTEM_ADDRESS()(address)' --rpc-url "$L2")"
+actual_rollup_id="$(cast call "$EEZL2_ADDRESS" 'ROLLUP_ID()(uint64)' --rpc-url "$L2" | awk '{print $1}')"
+actual_use_gas_left="$(cast call "$EEZL2_ADDRESS" 'USE_GAS_LEFT()(bool)' --rpc-url "$L2")"
+runtime="$(cast code "$EEZL2_ADDRESS" --rpc-url "$L2")"
 actual_runtime_hash="$(cast keccak "$runtime")"
 actual_state_root="$(cast block 0 --rpc-url "$L2" --json | jq -er '.stateRoot')"
 

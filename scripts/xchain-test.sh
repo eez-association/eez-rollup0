@@ -38,7 +38,7 @@ L1=http://localhost:18645          # embedded chiado L1 (composer watches + post
 L2=http://localhost:18688          # L2 RPC
 L1F=http://localhost:18999         # L1 front (Inbound)
 L2F=http://localhost:18998         # L2 front (Outbound)
-CCM=0x4200000000000000000000000000000000000007; MAINNET_RID=0
+EEZL2_ADDRESS=0x4200000000000000000000000000000000000007; MAINNET_RID=0
 NODE_CONTAINER="${NODE_CONTAINER:-eez-node-chiado}"
 
 # ── Knobs ────────────────────────────────────────────────────────────
@@ -121,9 +121,9 @@ deploy_l2(){ local full="$1${2#0x}" nonce raw txh ca; nonce=$(cast nonce "$HH_AD
   txh=$(curl -s -X POST "$L2" -H 'Content-Type: application/json' -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"],\"id\":1}"|jq -r '.result//empty')
   for _ in $(seq 1 30); do ca=$(cast receipt "$txh" --rpc-url "$L2" --async --json 2>/dev/null|jq -r '.contractAddress//empty'); [[ -n "$ca" && "$ca" != null ]] && break; sleep 2; done; echo "$ca"; }
 l2_proxy(){ local tgt="$1" p code nonce raw
-  p=$(cast call "$CCM" 'computeCrossChainProxyAddress(address,uint64)(address)' "$tgt" "$MAINNET_RID" --rpc-url "$L2"|tr -d '[:space:]'); code=$(cast code "$p" --rpc-url "$L2" 2>/dev/null||echo 0x)
+  p=$(cast call "$EEZL2_ADDRESS" 'computeCrossChainProxyAddress(address,uint64)(address)' "$tgt" "$MAINNET_RID" --rpc-url "$L2"|tr -d '[:space:]'); code=$(cast code "$p" --rpc-url "$L2" 2>/dev/null||echo 0x)
   if [[ "$code" == "0x" || -z "$code" ]]; then nonce=$(cast nonce "$HH_ADDR_2" --rpc-url "$L2")
-    raw=$(cast mktx --rpc-url "$L2" --chain-id "$L2_CID" --private-key "$HH_KEY_2" --nonce "$nonce" --gas-limit 1500000 --gas-price 1000000000 "$CCM" 'createCrossChainProxy(address,uint64)' "$tgt" "$MAINNET_RID")
+    raw=$(cast mktx --rpc-url "$L2" --chain-id "$L2_CID" --private-key "$HH_KEY_2" --nonce "$nonce" --gas-limit 1500000 --gas-price 1000000000 "$EEZL2_ADDRESS" 'createCrossChainProxy(address,uint64)' "$tgt" "$MAINNET_RID")
     curl -s -X POST "$L2" -H 'Content-Type: application/json' -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"],\"id\":1}">/dev/null
     for _ in $(seq 1 30); do code=$(cast code "$p" --rpc-url "$L2" 2>/dev/null||echo 0x); [[ "$code" != "0x" && -n "$code" ]] && break; sleep 1; done; fi; echo "$p"; }
 # Idempotent L1 proxy: reuse the deterministic address if it already has code

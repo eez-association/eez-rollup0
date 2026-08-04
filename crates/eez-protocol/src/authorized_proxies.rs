@@ -5,11 +5,11 @@
 //! first (and only) non-transient storage slot — so the slot number is
 //! **0** on both children:
 //!
-//! - **L1 `EEZ.sol`** — slot [`ROLLUPS_AUTHORIZED_PROXIES_SLOT`] (0).
+//! - **L1 `EEZ.sol`** — slot [`EEZ_AUTHORIZED_PROXIES_SLOT`] (0).
 //!   Source side for L1→L2 composition. The persistent L1 layout begins:
 //!   `authorizedProxies` (0, from `EEZBase`), `rollupCounter` (1),
 //!   `rollups` (2), and `verificationByRollup` (3).
-//! - **L2 `EEZL2.sol`** — slot [`CCM_AUTHORIZED_PROXIES_SLOT`] (0).
+//! - **L2 `EEZL2.sol`** — slot [`EEZL2_AUTHORIZED_PROXIES_SLOT`] (0).
 //!   Source side for L2→L1 composition. The persistent L2 layout is:
 //!   `authorizedProxies` (0, from `EEZBase`), `entries` (1),
 //!   `staticEntries` (2), `lastLoadBlock` (3), `entryIndex` (4).
@@ -38,14 +38,14 @@ use alloy_primitives::{Address, B256, U256, keccak256};
 /// is declared on the abstract parent `EEZBase` as its first
 /// non-transient storage variable, so the slot is 0 on every
 /// `EEZBase` subclass — including `EEZ` (L1).
-pub const ROLLUPS_AUTHORIZED_PROXIES_SLOT: u8 = 0;
+pub const EEZ_AUTHORIZED_PROXIES_SLOT: u8 = 0;
 
 /// Storage slot of `authorizedProxies` on `EEZL2.sol` (L2).
 ///
 /// Used by the follower-rollup proxy-lookup configuration. Same
-/// reasoning as [`ROLLUPS_AUTHORIZED_PROXIES_SLOT`] — inherited from
+/// reasoning as [`EEZ_AUTHORIZED_PROXIES_SLOT`] — inherited from
 /// `EEZBase` at slot 0.
-pub const CCM_AUTHORIZED_PROXIES_SLOT: u8 = 0;
+pub const EEZL2_AUTHORIZED_PROXIES_SLOT: u8 = 0;
 
 /// Information about a registered cross-chain proxy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,8 +113,8 @@ mod tests {
         // Compile-time constants from the contracts' storage layout.
         // Any change here must be paired with a matching change in the
         // upstream Solidity declaration order.
-        assert_eq!(ROLLUPS_AUTHORIZED_PROXIES_SLOT, 0);
-        assert_eq!(CCM_AUTHORIZED_PROXIES_SLOT, 0);
+        assert_eq!(EEZ_AUTHORIZED_PROXIES_SLOT, 0);
+        assert_eq!(EEZL2_AUTHORIZED_PROXIES_SLOT, 0);
     }
 
     #[test]
@@ -169,11 +169,11 @@ mod tests {
         let addr = Address::from([0xCD; 20]);
 
         assert_eq!(
-            proxy_mapping_key(addr, ROLLUPS_AUTHORIZED_PROXIES_SLOT),
+            proxy_mapping_key(addr, EEZ_AUTHORIZED_PROXIES_SLOT),
             proxy_mapping_key(addr, 0),
         );
         assert_eq!(
-            proxy_mapping_key(addr, CCM_AUTHORIZED_PROXIES_SLOT),
+            proxy_mapping_key(addr, EEZL2_AUTHORIZED_PROXIES_SLOT),
             proxy_mapping_key(addr, 0),
         );
     }

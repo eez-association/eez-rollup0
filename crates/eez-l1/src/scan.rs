@@ -69,8 +69,8 @@ pub struct ScannedBatch {
     /// catch_up on restart-after-post.
     pub post_batch_input: Bytes,
     pub state_applied: bool,
-    /// How many of this batch's claimed roots L1 settled (0 = skip). See
-    /// [`attribute_settlement`].
+    /// How many of this batch's claimed roots L1 settled (0 = skip). Computed
+    /// by the scanner's settlement-attribution pass.
     pub settled_count: usize,
     /// Deepest claimed root L1 settled — this batch's actual post-batch endpoint.
     pub settled_final_state: Option<B256>,

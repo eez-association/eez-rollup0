@@ -104,7 +104,7 @@ Values are classified as follows:
 
 | Source | Authority and required treatment |
 | --- | --- |
-| Operator configuration | Authoritative for execution-chain rules, expected rollup ID, proof-system address and vkey, attester identity, system-transaction key, and resource limits. The deployment MUST match the binary's fixed EEZL2 and system-address constants. |
+| Operator configuration | Authoritative for execution-chain rules, expected rollup ID, proof-system address and vkey, attester identity, system-transaction key, and resource limits. The deployment MUST use the fixed EEZL2 address and MUST bind its configured system address to the configured system-transaction key. |
 | Composer stream | Untrusted, including range, hashes, RLP, witness, settlement calldata, and claimed public-input hash. |
 | Stateless/Reth output | Security-critical derived evidence. It MUST be consumed and checked against the corresponding admitted blocks before settlement uses it. |
 | Pinned EEZ contracts | Authoritative for on-chain ABI layouts, selectors, hashes, and execution behavior. |

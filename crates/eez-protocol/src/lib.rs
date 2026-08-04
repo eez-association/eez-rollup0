@@ -66,10 +66,10 @@ pub use action::{
     l2_outbound_call_hash,
 };
 #[doc(inline)]
-pub use addresses::CCM_ADDRESS;
+pub use addresses::EEZL2_ADDRESS;
 #[doc(inline)]
 pub use authorized_proxies::{
-    CCM_AUTHORIZED_PROXIES_SLOT, ProxyInfo, ROLLUPS_AUTHORIZED_PROXIES_SLOT, decode_proxy_value,
+    EEZ_AUTHORIZED_PROXIES_SLOT, EEZL2_AUTHORIZED_PROXIES_SLOT, ProxyInfo, decode_proxy_value,
     proxy_mapping_key,
 };
 #[doc(inline)]

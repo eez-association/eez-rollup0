@@ -31,7 +31,7 @@ mod validate;
 mod window;
 
 /// Fixed L2 predeploy used for cross-chain transaction and event checks.
-pub(crate) use eez_protocol::CCM_ADDRESS as EEZL2_ADDRESS;
+pub(crate) use eez_protocol::EEZL2_ADDRESS;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {

@@ -40,6 +40,8 @@ _http() { case "$1" in http*) echo "$1";; "") echo "";; *) echo "http://$1";; es
 
 NODE_LOG="${EEZ_NODE_LOG:-$LOG_DIR/wave-$MODE-node.log}"
 SIGNER_LOG="${EEZ_PROOF_SIGNER_LOG:-$LOG_DIR/wave-$MODE-proof-signer.log}"
+MODE_NODE_LOG="${NODE_LOG%.log}-evidence.log"
+MODE_SIGNER_LOG="${SIGNER_LOG%.log}-evidence.log"
 DEPLOY_DIR="$(mktemp -d /tmp/eez-deployments.XXXXXX)"
 trap 'rm -rf "$DEPLOY_DIR"' EXIT
 
@@ -72,7 +74,7 @@ FUND_FROM_KEY="${EEZ_FUND_FROM_KEY:-${EEZ_PROOF_SIGNER_KEY:-$(_yaml proof_signer
 [[ -n "$FUND_FROM_KEY" ]] || { echo "could not resolve a funding key — set EEZ_FUND_FROM_KEY or check $K/args.yaml"; exit 1; }
 L1_SETUP_KEY="${EEZ_L1_SETUP_KEY:-$FUND_FROM_KEY}"
 
-EEZ_CCM_L2_PREDEPLOY="${EEZ_CCM_L2_ADDRESS:-0x4200000000000000000000000000000000000007}"
+EEZL2_ADDRESS="${EEZL2_ADDRESS:-0x4200000000000000000000000000000000000007}"
 MAINNET_RID="${EEZ_L1_ROLLUP_ID:-0}"   # L1's rollup id (outbound proxy target)
 
 # Deposit/withdraw recipient EOAs. Random by default to avoid deterministic
@@ -189,16 +191,16 @@ create_l1_proxy() { # <target_on_L2> → proxy addr
         'run(address,address,uint64)' "$EEZ_REGISTRY_ADDRESS" "$1" "$EEZ_ROLLUP_ID" | grab EEZ_VALUE_PROXY
 }
 # L2 proxy = computeCrossChainProxyAddress(target_on_L1, MAINNET) then
-# createCrossChainProxy on the L2 CCM (a PURE L2 tx → normal L2 RPC).
+# createCrossChainProxy on EEZL2 (a pure L2 tx → normal L2 RPC).
 create_l2_proxy() { # <target_on_L1> → proxy addr
     local tgt="$1" p code nonce raw
-    p=$(cast call "$EEZ_CCM_L2_PREDEPLOY" 'computeCrossChainProxyAddress(address,uint64)(address)' "$tgt" "$MAINNET_RID" --rpc-url "$L2" | tr -d '[:space:]')
+    p=$(cast call "$EEZL2_ADDRESS" 'computeCrossChainProxyAddress(address,uint64)(address)' "$tgt" "$MAINNET_RID" --rpc-url "$L2" | tr -d '[:space:]')
     code=$(cast code "$p" --rpc-url "$L2" 2>/dev/null || echo 0x)
     if [[ "$code" == "0x" || -z "$code" ]]; then
         nonce=$(cast nonce "$HH_KEY_2_ADDR" --rpc-url "$L2")
         raw=$(cast mktx --rpc-url "$L2" --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_2" --nonce "$nonce" \
             --gas-limit 1500000 --gas-price "$(gas_price_for "$L2")" \
-            "$EEZ_CCM_L2_PREDEPLOY" 'createCrossChainProxy(address,uint64)' "$tgt" "$MAINNET_RID")
+            "$EEZL2_ADDRESS" 'createCrossChainProxy(address,uint64)' "$tgt" "$MAINNET_RID")
         curl -s -X POST "$L2" -H 'Content-Type: application/json' \
             -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"],\"id\":1}" >/dev/null
         for _ in $(seq 1 30); do
@@ -246,6 +248,18 @@ refresh_node_log() { kurtosis service logs "$ENCLAVE" eez-node >"$NODE_LOG" 2>&1
 refresh_signer_log() { kurtosis service logs "$ENCLAVE" eez-proof-signer >"$SIGNER_LOG" 2>&1 || true; }
 strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
 
+SIGNED_WINDOW_EVENT='event_name="eez.proof_signer.window_signed"'
+REMOTE_ATTESTATION_EVENT='event_name="eez.prover_client.attested"'
+BUNDLE_OBSERVED_EVENT='event_name="eez.composer.bundle.observed"'
+
+registry_event_count() {
+    local event_signature="$1" logs
+    logs=$(retry cast logs --address "$EEZ_REGISTRY_ADDRESS" \
+        --from-block "${EEZ_REGISTRY_DEPLOY_BLOCK:-0}" --to-block latest \
+        "$event_signature" --rpc-url "$L1" --json)
+    jq -er 'if type == "array" then length else error("expected a JSON log array") end' <<<"$logs"
+}
+
 # receipt_status <hash> <rpc> → "1" mined-ok, "0x0" reverted, "missing"
 receipt_status() {
     local r st
@@ -289,6 +303,17 @@ run_waves() {
         mixed-pure) do_in=1; do_out=1; do_pure=1 ;;
         *) echo "cross-chain wave: unknown mode '$MODE'"; exit 1 ;;
     esac
+
+    # Capture per-mode baselines immediately before submitting the wave. Every
+    # assertion below must therefore be backed by evidence created by this run,
+    # not by an earlier mode in the same enclave.
+    refresh_node_log
+    refresh_signer_log
+    local node_log_baseline signer_log_baseline batch_posted_before executions_before
+    node_log_baseline=$(wc -l <"$NODE_LOG")
+    signer_log_baseline=$(wc -l <"$SIGNER_LOG")
+    batch_posted_before=$(registry_event_count "BatchPosted(uint256)")
+    executions_before=$(registry_event_count "L2ExecutionPerformed(uint64,bytes32)")
 
     # ── Baselines (deltas asserted at the end) ───────────────────────
     local DEP_BEFORE=0 WD_BEFORE=0
@@ -489,33 +514,38 @@ run_waves() {
     fi
 
     # postBatches actually landed on L1 (the original bundle-drop symptom).
-    local PB_COUNT
-    PB_COUNT=$(cast logs --address "$EEZ_REGISTRY_ADDRESS" \
-        --from-block "${EEZ_REGISTRY_DEPLOY_BLOCK:-0}" --to-block latest \
-        "BatchPosted(uint256)" --rpc-url "$L1" --json 2>/dev/null | jq 'length' 2>/dev/null || echo 0)
+    local PB_COUNT PB_TOTAL
+    PB_TOTAL=$(registry_event_count "BatchPosted(uint256)")
+    PB_COUNT=$((PB_TOTAL - batch_posted_before))
     if (( PB_COUNT >= WAVES )); then
-        echo "    ✓ postBatches on L1: $PB_COUNT (≥ $WAVES waves)"
+        echo "    ✓ new postBatches on L1: $PB_COUNT (≥ $WAVES waves)"
     else
-        echo "    ✗ postBatches on L1: $PB_COUNT (expected ≥ $WAVES)"; ok_all=0
+        echo "    ✗ new postBatches on L1: $PB_COUNT (expected ≥ $WAVES)"; ok_all=0
     fi
 
-    local EXECUTION_COUNT
-    EXECUTION_COUNT=$(cast logs --address "$EEZ_REGISTRY_ADDRESS" \
-        --from-block "${EEZ_REGISTRY_DEPLOY_BLOCK:-0}" --to-block latest \
-        "L2ExecutionPerformed(uint64,bytes32)" --rpc-url "$L1" --json 2>/dev/null \
-        | jq 'length' 2>/dev/null || echo 0)
+    local EXECUTION_COUNT EXECUTION_TOTAL
+    EXECUTION_TOTAL=$(registry_event_count "L2ExecutionPerformed(uint64,bytes32)")
+    EXECUTION_COUNT=$((EXECUTION_TOTAL - executions_before))
     if (( EXECUTION_COUNT > 0 )); then
-        echo "    ✓ L2 execution events on L1: $EXECUTION_COUNT"
+        echo "    ✓ new L2 execution events on L1: $EXECUTION_COUNT"
     else
-        echo "    ✗ no L2ExecutionPerformed event found"; ok_all=0
+        echo "    ✗ no new L2ExecutionPerformed event found"; ok_all=0
     fi
 
     # L1's stored state root must converge with the current L2 safe block.
     local LAST_SETTLED="" L1_TRACKED="" L1_RECHECK="" L2_ROOT="" L2_SAFE=0 SAFE_BLOCK=""
-    local root_deadline=$((SECONDS + ${EEZ_STATE_ROOT_WAIT_SECS:-30})) root_matched=0
-    LAST_SETTLED=$(strip_ansi <"$NODE_LOG" | grep "bundle outcome observed" | grep "settled=true" \
-        | grep -oE "sync_height=[0-9]+" | grep -oE "[0-9]+" | sort -n | tail -1 || true)
+    local state_root_wait_secs=${EEZ_STATE_ROOT_WAIT_SECS:-30} root_matched=0
+    local settlement_deadline=$((SECONDS + state_root_wait_secs))
+    while (( SECONDS < settlement_deadline )); do
+        refresh_node_log
+        sed -n "$((node_log_baseline + 1)),\$p" "$NODE_LOG" >"$MODE_NODE_LOG"
+        LAST_SETTLED=$(strip_ansi <"$MODE_NODE_LOG" | grep -F "$BUNDLE_OBSERVED_EVENT" | grep "settled=true" \
+            | grep -oE "sync_height=[0-9]+" | grep -oE "[0-9]+" | sort -n | tail -1 || true)
+        [[ -n "$LAST_SETTLED" ]] && break
+        sleep 1
+    done
     if [[ -n "$LAST_SETTLED" ]]; then
+        local root_deadline=$((SECONDS + state_root_wait_secs))
         while (( SECONDS < root_deadline )); do
             L1_TRACKED=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' \
                 "$EEZ_ROLLUP_ID" --rpc-url "$L1" | sed -n '2p' | tr -d '[:space:]')
@@ -542,12 +572,12 @@ run_waves() {
             echo "    ✗ L2 safe head $L2_SAFE is below settled height $LAST_SETTLED"; ok_all=0
         fi
     else
-        echo "    ✗ no settled bundle found in the node log (grep 'settled=true')"; ok_all=0
+        echo "    ✗ no new settled bundle observed for this mode"; ok_all=0
     fi
 
     # Zero divergence (legacy check is hard; deriver-side WARNs are residual).
     local DIVERGED
-    DIVERGED=$(grep -c "local L2 state root differs" "$NODE_LOG" 2>/dev/null || true); DIVERGED=${DIVERGED:-0}
+    DIVERGED=$(grep -c "local L2 state root differs" "$MODE_NODE_LOG" 2>/dev/null || true); DIVERGED=${DIVERGED:-0}
     if (( DIVERGED == 0 )); then
         echo "    ✓ zero state-root divergence events"
     else
@@ -556,7 +586,7 @@ run_waves() {
 
     # Dropped-bundle telemetry.
     local DROPS
-    DROPS=$(grep -c "bundle dropped" "$NODE_LOG" 2>/dev/null || true); DROPS=${DROPS:-0}
+    DROPS=$(grep -c "bundle dropped" "$MODE_NODE_LOG" 2>/dev/null || true); DROPS=${DROPS:-0}
     echo "    ℹ dropped-bundle log lines: $DROPS"
 
     # Correlate the composer's accepted attestation with the signer's completed
@@ -564,13 +594,15 @@ run_waves() {
     local signer_line=""
     refresh_node_log
     refresh_signer_log
-    attested_hash=$(strip_ansi <"$NODE_LOG" | grep 'remote prover attested the window' \
+    sed -n "$((node_log_baseline + 1)),\$p" "$NODE_LOG" >"$MODE_NODE_LOG"
+    sed -n "$((signer_log_baseline + 1)),\$p" "$SIGNER_LOG" >"$MODE_SIGNER_LOG"
+    attested_hash=$(strip_ansi <"$MODE_NODE_LOG" | grep -F "$REMOTE_ATTESTATION_EVENT" \
         | grep -oE 'hash=0x[0-9a-fA-F]{64}' | tail -1 | cut -d= -f2 || true)
     if [[ -n "$attested_hash" ]]; then
-        signer_line=$(strip_ansi <"$SIGNER_LOG" \
+        signer_line=$(strip_ansi <"$MODE_SIGNER_LOG" | grep -F "$SIGNED_WINDOW_EVENT" \
             | grep -F "recomputed_public_inputs_hash=$attested_hash" | tail -1 || true)
     fi
-    if [[ "$signer_line" == *"window validated and signed"* ]]; then
+    if [[ -n "$signer_line" ]]; then
         signer_ok=1
     fi
 
