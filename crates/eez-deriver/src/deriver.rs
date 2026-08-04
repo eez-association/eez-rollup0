@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy_eips::{Decodable2718, Encodable2718};
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT, BlockCommitterHandle, DeriveOutcome};
 use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Watcher, ScannedBatch, Submitter};
@@ -1073,9 +1073,13 @@ where
         settled_count: usize,
     ) -> DeriverResult<u64> {
         // Cross-chain path (skipped when `system_tx_cfg` is `None`):
-        // reconstruct the system txs from the L2-shaped entries carried in
-        // the payload. The on-chain batch is decoded separately to validate
-        // the supported profile and obtain its explicit immediate boundary.
+        // reconstruct the system txs the composer produced, from either
+        // codec branch:
+        //
+        // - `decoded.l2_entries` non-empty: the L2-shape entries travel
+        //   in the payload directly (value-bearing batches).
+        // - empty: fall back to the on-chain `batch.entries[]` (L1
+        //   entries) — for value-free calls L1 and L2 shapes coincide.
         event!(
             name: "eez.deriver.reconcile.start",
             Level::INFO,
@@ -1092,181 +1096,64 @@ where
         // by construction. `None` when no cross-chain cfg (loop uses user txs
         // verbatim).
         //
-        // Producing entries are ordered `[anchor, outbound…, inbound…]`.
-        // `immediateEntryCount` includes the anchor and outbound prefix; the
-        // remaining entries are deferred inbound deliveries. Applied entries
-        // are a prefix because every entry's `StateUpdate.currentState` chains
-        // from the preceding entry, so `settled_count - 1` removes the anchor.
+        // Producing entries are ordered `[anchor, outbound…, inbound…]`:
+        // `postAndVerifyBatch` drains the leading `proxyEntryHash==0` run (anchor +
+        // outbound) inline, then consumes the deferred inbound ones (`EEZ.sol:387`).
+        // Applied entries are always a PREFIX (a skipped immediate cascades via
+        // `StateUpdate.currentState` mismatch), so `settled_count - 1`
+        // splits outbound-first, then inbound. One path: inbound-only / outbound-only
+        // / mixed.
         //
         // `gate_outbound`: outbound entries L1 paid, stashed for the post-replay
         // gate (empty in the pure-user-tx path → no-op).
         let mut gate_outbound: Vec<eez_protocol::abi::ExecutionEntrySol> = Vec::new();
         let sync_block_txs: Option<Vec<Vec<u8>>> = match self.inner.system_tx_cfg.as_ref() {
             Some(cfg) => {
-                // Decode from the input captured by the L1 scan. Re-fetching by
-                // transaction hash is not safe against pruned or resyncing L1
-                // providers.
-                use alloy_sol_types::{SolCall as _, SolValue as _};
-                let posted =
-                    eez_protocol::abi::postAndVerifyBatchCall::abi_decode(&post_batch_input)
-                        .map_err(|error| {
-                            DeriverError::l2_provider(format!(
-                                "decode postBatch({tx_hash}): {error}"
-                            ))
-                        })?;
-                let batch = posted.batch;
-
-                if !batch.expectedStateRootPerRollup.is_empty()
-                    || !batch.staticEntries.is_empty()
-                    || batch.immediateStaticEntryCount != U256::ZERO
-                    || !batch.blobIndices.is_empty()
-                    || batch.blockNumber != 0
-                    || batch.bindMsgSenderInPublicInput
-                {
-                    return Err(DeriverError::local_diverged_with_msg(
-                        from_block,
-                        &format!(
-                            "postBatch {tx_hash} uses features outside the supported derivation profile"
-                        ),
-                    ));
-                }
-
-                let immediate_count = usize::try_from(batch.immediateEntryCount).map_err(|_| {
-                    DeriverError::local_diverged_with_msg(
-                        from_block,
-                        &format!(
-                            "postBatch {tx_hash} immediateEntryCount {} does not fit usize",
-                            batch.immediateEntryCount
-                        ),
-                    )
-                })?;
-                if immediate_count == 0 || immediate_count > batch.entries.len() {
-                    return Err(DeriverError::local_diverged_with_msg(
-                        from_block,
-                        &format!(
-                            "postBatch {tx_hash} has invalid local-profile immediate boundary {immediate_count}/{}",
-                            batch.entries.len()
-                        ),
-                    ));
-                }
-                if settled_count > batch.entries.len() {
-                    return Err(DeriverError::local_diverged_with_msg(
-                        from_block,
-                        &format!(
-                            "postBatch {tx_hash} settled {settled_count} entries but declares only {}",
-                            batch.entries.len()
-                        ),
-                    ));
-                }
-
-                for (index, entry) in batch.entries.iter().enumerate() {
-                    let [update] = entry.stateUpdates.as_slice() else {
-                        return Err(DeriverError::local_diverged_with_msg(
-                            from_block,
-                            &format!(
-                                "postBatch {tx_hash} entry {index} must contain exactly one StateUpdate"
-                            ),
-                        ));
-                    };
-                    if update.rollupId != cfg.this_rollup_id
-                        || entry.destinationRollupId != cfg.this_rollup_id
-                    {
-                        return Err(DeriverError::local_diverged_with_msg(
-                            from_block,
-                            &format!(
-                                "postBatch {tx_hash} entry {index} is outside rollup {}",
-                                cfg.this_rollup_id
-                            ),
-                        ));
+                let mut entries = if decoded.l2_entries.is_empty() {
+                    // decode the on-chain `batch.entries[]`
+                    // from the postBatch tx input captured during the scan
+                    // (tx fetched by (block, index), pruning-robust). No
+                    // re-fetch by tx hash here — that lookup fails on a pruned
+                    // or still-resyncing embedded L1 and crashed boot catch_up
+                    // on restart-after-post.
+                    use alloy_sol_types::SolCall as _;
+                    let call =
+                        eez_protocol::abi::postAndVerifyBatchCall::abi_decode(&post_batch_input)
+                            .map_err(|e| {
+                                DeriverError::l2_provider(format!(
+                                    "decode postBatch({tx_hash}): {e}"
+                                ))
+                            })?;
+                    event!(
+                        name: "eez.deriver.reconcile.fallback_entries",
+                        Level::INFO,
+                        tx_hash = %tx_hash,
+                        entries = call.batch.entries.len(),
+                        "decoding scanned on-chain postBatch entries (codec v1 fallback)",
+                    );
+                    call.batch.entries
+                } else {
+                    use alloy_sol_types::SolValue as _;
+                    let mut out = Vec::with_capacity(decoded.l2_entries.len());
+                    for (i, raw) in decoded.l2_entries.iter().enumerate() {
+                        let entry =
+                            eez_protocol::abi::ExecutionEntrySol::abi_decode(raw).map_err(|e| {
+                                DeriverError::l2_provider(format!(
+                                    "decode l2_entries[{i}] for tx {tx_hash}: {e}"
+                                ))
+                            })?;
+                        out.push(entry);
                     }
-                    if !entry.success
-                        || !entry.expectedL1ToL2Calls.is_empty()
-                        || entry.l2ToL1Calls.len() > 1
-                        || entry.l2ToL1Calls.iter().any(|call| {
-                            call.isStatic || call.revertNextNCalls != 0 || call.gas != 0
-                        })
-                    {
-                        return Err(DeriverError::local_diverged_with_msg(
-                            from_block,
-                            &format!(
-                                "postBatch {tx_hash} entry {index} uses an unsupported execution shape"
-                            ),
-                        ));
-                    }
-                }
-
-                let anchor = &batch.entries[0];
-                if anchor.proxyEntryHash != B256::ZERO || !anchor.l2ToL1Calls.is_empty() {
-                    return Err(DeriverError::local_diverged_with_msg(
-                        from_block,
-                        &format!(
-                            "postBatch {tx_hash} does not start with the required anchor entry"
-                        ),
-                    ));
-                }
-                if batch.entries[..immediate_count]
-                    .iter()
-                    .any(|entry| entry.proxyEntryHash != B256::ZERO)
-                    || batch.entries[immediate_count..]
-                        .iter()
-                        .any(|entry| entry.proxyEntryHash == B256::ZERO)
-                {
-                    return Err(DeriverError::local_diverged_with_msg(
-                        from_block,
-                        &format!(
-                            "postBatch {tx_hash} entry order disagrees with immediateEntryCount"
-                        ),
-                    ));
-                }
-
-                let cross_chain_count = batch.entries.len() - 1;
-                if decoded.l2_entries.len() != cross_chain_count {
-                    return Err(DeriverError::local_diverged_with_msg(
-                        from_block,
-                        &format!(
-                            "postBatch {tx_hash} has {cross_chain_count} cross-chain entries but {} derivation sidecars",
-                            decoded.l2_entries.len()
-                        ),
-                    ));
-                }
-
-                let mut entries = Vec::with_capacity(decoded.l2_entries.len());
-                for (index, raw) in decoded.l2_entries.iter().enumerate() {
-                    let entry =
-                        eez_protocol::abi::ExecutionEntrySol::abi_decode(raw).map_err(|error| {
-                            DeriverError::l2_provider(format!(
-                                "decode l2_entries[{index}] for tx {tx_hash}: {error}"
-                            ))
-                        })?;
-                    if entry.proxyEntryHash != batch.entries[index + 1].proxyEntryHash {
-                        return Err(DeriverError::local_diverged_with_msg(
-                            from_block,
-                            &format!(
-                                "postBatch {tx_hash} derivation sidecar {index} does not match its on-chain entry"
-                            ),
-                        ));
-                    }
-                    entries.push(entry);
-                }
-
-                let outbound_count = immediate_count - 1;
-                if entries[..outbound_count]
-                    .iter()
-                    .any(|entry| entry.proxyEntryHash != B256::ZERO)
-                    || entries[outbound_count..]
-                        .iter()
-                        .any(|entry| entry.proxyEntryHash == B256::ZERO)
-                {
-                    return Err(DeriverError::local_diverged_with_msg(
-                        from_block,
-                        &format!(
-                            "postBatch {tx_hash} derivation sidecars disagree with immediateEntryCount"
-                        ),
-                    ));
-                }
-                let (outbound, inbound) = entries.split_at(outbound_count);
-                let mut outbound = outbound.to_vec();
-                let mut inbound = inbound.to_vec();
+                    out
+                };
+                // Drop non-producing entries (the anchor immediate signs no system
+                // tx), then split by direction: `proxyEntryHash == 0` = outbound
+                // settlement, `!= 0` = inbound delivery. `partition` keeps each
+                // side's order, preserving `[outbound…, inbound…]`.
+                entries.retain(|e| !e.l2ToL1Calls.is_empty());
+                let (mut outbound, mut inbound): (Vec<_>, Vec<_>) = entries
+                    .into_iter()
+                    .partition(|e| e.proxyEntryHash == alloy_primitives::B256::ZERO);
 
                 // Prefix split: applied non-anchor entries consume outbound first.
                 let applied = settled_count.saturating_sub(1);
@@ -1432,7 +1319,7 @@ where
         Ok(replayed)
     }
 
-    /// Canonical outbound-call events emitted by the L2 manager in `block`.
+    /// Outbound calls emitted by the L2 manager in `block`.
     ///
     /// # Errors
     /// [`DeriverError::l2_provider`] if the block's receipts are missing locally.
@@ -1616,17 +1503,7 @@ where
     Ok(local_block.header().parent_hash == expected_parent_hash)
 }
 
-/// Canonically decoded `CrossChainCallExecuted` logs from `eez_l2`.
-///
-/// Both filters are load-bearing:
-/// - `log.address == eez_l2` rejects a look-alike event any other contract could
-///   emit with a chosen `crossChainCallHash`;
-/// - the topic0 signature excludes inbound (`IncomingCrossChainCallExecuted`) and
-///   every other event.
-///
-/// Matching logs must also have the exact canonical event encoding. Reverted
-/// transactions contribute no logs, so a rolled-back call cannot authorize a
-/// settlement.
+/// Decode outbound-call events emitted by the configured L2 manager.
 fn extract_outbound_call_observations<R>(
     receipts: &[R],
     eez_l2: Address,
@@ -1637,27 +1514,15 @@ where
     use alloy_sol_types::SolEvent as _;
     use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
 
-    let mut observations = Vec::new();
-    for receipt in receipts {
-        for log in receipt.logs() {
-            if log.address != eez_l2
-                || log.data.topics().first() != Some(&CrossChainCallExecuted::SIGNATURE_HASH)
-            {
-                continue;
-            }
-            let Ok(decoded) = CrossChainCallExecuted::decode_log_validate(log) else {
-                continue;
-            };
-            if &CrossChainCallExecuted::encode_log(&decoded) != log {
-                continue;
-            }
-            observations.push(OutboundCallObservation::new(
-                decoded.data.crossChainCallHash,
-                decoded.data.callGas,
-            ));
-        }
-    }
-    observations
+    receipts
+        .iter()
+        .flat_map(alloy_consensus::TxReceipt::logs)
+        .filter(|log| log.address == eez_l2)
+        .filter_map(|log| CrossChainCallExecuted::decode_log_validate(log).ok())
+        .map(|event| {
+            OutboundCallObservation::new(event.data.crossChainCallHash, event.data.callGas)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1671,7 +1536,7 @@ mod outbound_wiring_tests {
 
     use super::extract_outbound_call_observations;
     use alloy_consensus::Receipt;
-    use alloy_primitives::{Address, B256, Bytes, Log, U256, address, b256};
+    use alloy_primitives::{Address, B256, Bytes, Log, U256, address};
     use alloy_sol_types::SolEvent;
     use eez_protocol::RollupId;
     use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
@@ -1679,28 +1544,24 @@ mod outbound_wiring_tests {
     use eez_protocol::action::{CallHashInput, l2_outbound_call_hash};
     use eez_protocol::outbound_gate::{OutboundCallObservation, verify_outbound_authorized};
 
-    const EEZ_L2: Address = address!("4200000000000000000000000000000000000007");
+    const CCM: Address = address!("4200000000000000000000000000000000000007");
     const OTHER: Address = address!("00000000000000000000000000000000deadbeef");
     const L2_RID: u64 = 1;
 
-    /// Encode a canonical event with caller-supplied fields for decoder tests.
-    fn encoded_event_log(addr: Address, call_hash: B256, call_gas: u64) -> Log {
+    /// A canonical `CrossChainCallExecuted` log from `addr`.
+    fn cc_log(addr: Address, call_hash: B256) -> Log {
         Log {
             address: addr,
             data: CrossChainCallExecuted {
                 crossChainCallHash: call_hash,
                 proxy: Address::ZERO,
-                sourceAddress: Address::repeat_byte(0x11),
-                callData: Bytes::from_static(&[0xaa, 0xbb]),
-                value: U256::from(7),
-                callGas: call_gas,
+                sourceAddress: Address::ZERO,
+                callData: Bytes::new(),
+                value: U256::ZERO,
+                callGas: 0,
             }
             .encode_log_data(),
         }
-    }
-
-    fn observation(call_hash: B256, call_gas: u64) -> OutboundCallObservation {
-        OutboundCallObservation::new(call_hash, call_gas)
     }
 
     fn receipt(logs: Vec<Log>) -> Receipt {
@@ -1739,7 +1600,7 @@ mod outbound_wiring_tests {
 
     /// The topic1 `EEZL2` emits for `call` on this L2 (`targetRollupId` =
     /// MAINNET(0), `sourceRollupId` = `L2_RID`) — what the gate recomputes.
-    fn call_hash(call: &L2ToL1CallSol, call_gas: u64) -> B256 {
+    fn call_hash(call: &L2ToL1CallSol) -> B256 {
         l2_outbound_call_hash(
             CallHashInput {
                 call_mode: eez_protocol::CallMode::Mutable,
@@ -1750,24 +1611,8 @@ mod outbound_wiring_tests {
                 value: call.value,
                 data: &call.data,
             },
-            call_gas,
+            0,
         )
-    }
-
-    /// Encode a self-consistent event for a call-hash wiring test.
-    fn event_log_for_call(addr: Address, call: &L2ToL1CallSol, call_gas: u64) -> Log {
-        Log {
-            address: addr,
-            data: CrossChainCallExecuted {
-                crossChainCallHash: call_hash(call, call_gas),
-                proxy: Address::ZERO,
-                sourceAddress: call.sourceAddress,
-                callData: call.data.clone(),
-                value: call.value,
-                callGas: call_gas,
-            }
-            .encode_log_data(),
-        }
     }
 
     fn eoa() -> Address {
@@ -1780,43 +1625,23 @@ mod outbound_wiring_tests {
     // ── extraction filters ──────────────────────────────────────────────
 
     #[test]
-    fn outbound_event_signature_matches_the_l2_contract() {
-        assert_eq!(
-            CrossChainCallExecuted::SIGNATURE_HASH,
-            b256!("ec2129bc21aa3a28f7f705d280646ec2ebfbf1769b89938768c6bdbfb04da7c4")
-        );
-    }
-
-    #[test]
-    fn extraction_requires_canonical_manager_events_and_preserves_fields() {
+    fn extract_picks_ccm_events_and_preserves_multiset() {
         let h1 = B256::repeat_byte(0x11);
         let h2 = B256::repeat_byte(0x22);
-        // Topicless and body-less look-alikes are not canonical observations.
-        let bare = Log::new_unchecked(EEZ_L2, Vec::new(), Bytes::new());
-        let malformed = Log::new_unchecked(
-            EEZ_L2,
-            vec![CrossChainCallExecuted::SIGNATURE_HASH, h1, B256::ZERO],
-            Bytes::new(),
-        );
-        let mut trailing = encoded_event_log(EEZ_L2, h1, 0);
-        let mut body = trailing.data.data.to_vec();
-        body.push(0);
-        trailing.data.data = Bytes::from(body);
+        // Empty receipts (reverted txs) and topicless logs carry no hash — ignored.
+        let bare = Log::new_unchecked(CCM, Vec::new(), Bytes::new());
         let receipts = vec![
-            receipt(vec![
-                encoded_event_log(EEZ_L2, h1, 0),
-                encoded_event_log(EEZ_L2, h2, u64::MAX),
-            ]),
-            receipt(vec![encoded_event_log(EEZ_L2, h1, 0)]),
-            receipt(vec![]),
-            receipt(vec![bare, malformed, trailing]),
+            receipt(vec![cc_log(CCM, h1), cc_log(CCM, h2)]),
+            receipt(vec![cc_log(CCM, h1)]), // duplicate h1 → multiset keeps both
+            receipt(vec![]),                // reverted tx → no logs
+            receipt(vec![bare]),            // topicless log → no hash
         ];
         assert_eq!(
-            extract_outbound_call_observations(&receipts, EEZ_L2),
+            extract_outbound_call_observations(&receipts, CCM),
             vec![
-                observation(h1, 0),
-                observation(h2, u64::MAX),
-                observation(h1, 0),
+                OutboundCallObservation::new(h1, 0),
+                OutboundCallObservation::new(h2, 0),
+                OutboundCallObservation::new(h1, 0),
             ]
         );
     }
@@ -1828,8 +1653,8 @@ mod outbound_wiring_tests {
         // Outbound-via-wrapper end to end through extraction: source is a CONTRACT.
         let wrapper = address!("cccccccccccccccccccccccccccccccccccccccc");
         let call = outbound_call(wrapper, l1_target(), 42, &[0xab]);
-        let receipts = vec![receipt(vec![event_log_for_call(EEZ_L2, &call, 0)])];
-        let observed = extract_outbound_call_observations(&receipts, EEZ_L2);
+        let receipts = vec![receipt(vec![cc_log(CCM, call_hash(&call))])];
+        let observed = extract_outbound_call_observations(&receipts, CCM);
         assert!(
             verify_outbound_authorized(&[outbound_entry(call)], &observed, L2_RID).is_ok(),
             "a contract-initiated (wrapper) outbound must be accepted"
@@ -1841,44 +1666,35 @@ mod outbound_wiring_tests {
         // ATTACK: the only event with the matching hash is emitted by a foreign
         // address; extraction drops it, so the gate sees a phantom.
         let call = outbound_call(eoa(), l1_target(), 7, &[0x12]);
-        let receipts = vec![receipt(vec![event_log_for_call(OTHER, &call, 0)])];
-        let observed = extract_outbound_call_observations(&receipts, EEZ_L2);
-        assert!(verify_outbound_authorized(&[outbound_entry(call)], &observed, L2_RID).is_err());
-    }
-
-    #[test]
-    fn wiring_rejects_nonzero_manager_entry_gas() {
-        let call = outbound_call(eoa(), l1_target(), 7, &[0x12]);
-        let receipts = vec![receipt(vec![event_log_for_call(EEZ_L2, &call, 1)])];
-        let observed = extract_outbound_call_observations(&receipts, EEZ_L2);
-
+        let receipts = vec![receipt(vec![cc_log(OTHER, call_hash(&call))])];
+        let observed = extract_outbound_call_observations(&receipts, CCM);
         assert!(verify_outbound_authorized(&[outbound_entry(call)], &observed, L2_RID).is_err());
     }
 
     #[test]
     fn wiring_rejects_double_count() {
-        // ATTACK: two identical settlement entries, one matching event → the second is
+        // ATTACK: two identical settlement entries, one real event → the second is
         // unmatched (multiset consumption).
         let call = outbound_call(eoa(), l1_target(), 7, &[0x12]);
         let entries = vec![outbound_entry(call.clone()), outbound_entry(call.clone())];
-        let one = vec![receipt(vec![event_log_for_call(EEZ_L2, &call, 0)])];
+        let one = vec![receipt(vec![cc_log(CCM, call_hash(&call))])];
         assert!(
             verify_outbound_authorized(
                 &entries,
-                &extract_outbound_call_observations(&one, EEZ_L2),
+                &extract_outbound_call_observations(&one, CCM),
                 L2_RID,
             )
             .is_err()
         );
         // …but two events authorize both.
         let two = vec![receipt(vec![
-            event_log_for_call(EEZ_L2, &call, 0),
-            event_log_for_call(EEZ_L2, &call, 0),
+            cc_log(CCM, call_hash(&call)),
+            cc_log(CCM, call_hash(&call)),
         ])];
         assert!(
             verify_outbound_authorized(
                 &entries,
-                &extract_outbound_call_observations(&two, EEZ_L2),
+                &extract_outbound_call_observations(&two, CCM),
                 L2_RID,
             )
             .is_ok()

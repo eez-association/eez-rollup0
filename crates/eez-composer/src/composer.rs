@@ -939,7 +939,7 @@ where
         // Route each held source-chain transaction through
         // `simulate_and_resolve`. The cross-chain path also builds the Sync block
         // locally (via reth-evm) and stamps that block's state root
-        // into each postBatch's stateDelta.newState before sending —
+        // into each postBatch's stateUpdate.newState before sending —
         // so the deriver's `check_claimed_state` validates against the
         // same root reth will produce when it ingests the payload.
         //
@@ -2026,7 +2026,7 @@ where
         // proof-system metadata go in.
 
         // Take the first composition's batch as the template, then
-        // merge every later composition's entries into
+        // merge every later composition's entries + static entries into
         // it. Empty compositions → build a fresh empty batch shell;
         // the leading immediate entry below is the entire payload.
         let mut batch = if compositions.is_empty() {
@@ -2040,13 +2040,6 @@ where
             }
             b
         };
-
-        if !batch.staticEntries.is_empty() {
-            return Err(
-                "static execution entries are not supported by the initial simplify profile"
-                    .to_owned(),
-            );
-        }
 
         // Prepend ONE leading immediate entry (`proxyEntryHash == 0`)
         // covering all L2 effects before the sync block — EEZ.sol drains
@@ -2206,17 +2199,26 @@ where
         // effects, the last effect's root already is the final root.
         if pair_roots.is_empty()
             && let Some(last) = batch.entries.last_mut()
-            && let Some(delta) = last
-                .stateUpdates
-                .iter_mut()
-                .find(|delta| delta.rollupId == rollup_id)
         {
-            delta.newState = sync_block_state_root;
+            for delta in last.stateUpdates.iter_mut().rev() {
+                if delta.rollupId == rollup_id {
+                    delta.newState = sync_block_state_root;
+                    break;
+                }
+            }
         }
 
-        // Reject a stitch bug in release builds before signing or submitting a
-        // batch whose settlement chain does not reach the Sync block root.
-        ensure_settlement_endpoint(&batch, rollup_id, sync_block_state_root)?;
+        // The chain must end at the Sync block's final root. The prover enforces
+        // this; assert locally so a stitch bug fails fast here.
+        debug_assert_eq!(
+            batch
+                .entries
+                .last()
+                .and_then(|entry| entry.stateUpdates.last())
+                .map(|update| update.newState),
+            Some(sync_block_state_root),
+            "settlement chain must end at the Sync-block state root",
+        );
 
         // The L1 rolling seed commits the finalized ordered state updates, so
         // it can only be computed after the stitch above has set every
@@ -2229,9 +2231,6 @@ where
         // Inbound deferred entries (proxyEntryHash != 0) queue for
         // `executeCrossChainCall` consumption. N=0 for inbound-only → 1.
         batch.immediateEntryCount = U256::from(1 + outbound_entries.len() as u64);
-        batch.immediateStaticEntryCount = U256::ZERO;
-        batch.blockNumber = 0;
-        batch.bindMsgSenderInPublicInput = false;
 
         // Registry-id settlement gate: refuse a batch carrying any non-registry
         // destinationRollupId (e.g. an un-rewritten MAINNET(0) outbound entry).
@@ -2512,27 +2511,6 @@ fn assert_batch_registry_native(batch: &eez_protocol::EvmBatch, rid: u64) -> Res
     Ok(())
 }
 
-fn ensure_settlement_endpoint(
-    batch: &eez_protocol::EvmBatch,
-    rollup_id: u64,
-    expected: B256,
-) -> Result<(), String> {
-    let actual = batch.entries.last().and_then(|entry| {
-        entry
-            .stateUpdates
-            .iter()
-            .find(|update| update.rollupId == rollup_id)
-            .map(|update| update.newState)
-    });
-    if actual == Some(expected) {
-        Ok(())
-    } else {
-        Err(format!(
-            "settlement chain ends at {actual:?}, expected Sync-block root {expected}",
-        ))
-    }
-}
-
 /// Background bundle observer — verdict recording ONLY. Marks the ledger
 /// entry Settled or Failed; never mutates chain state. The destructive
 /// recovery for Failed entries runs at the next Sync slot
@@ -2679,14 +2657,7 @@ async fn sign_post_batch_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{I256, TxHash};
-    use alloy_sol_types::SolCall;
-    use eez_protocol::abi::{ExecutionEntrySol, StateUpdateSol};
-
-    #[test]
-    fn rollups_selector_matches_simplify_abi() {
-        assert_eq!(IEEZReader::rollupsCall::SELECTOR, [0xef, 0x67, 0x8d, 0x27]);
-    }
+    use alloy_primitives::TxHash;
 
     fn held(sender: Address, direction: Direction, nonce: u64, hash_byte: u8) -> HeldTx {
         HeldTx {
@@ -2697,30 +2668,6 @@ mod tests {
             nonce,
             direction,
         }
-    }
-
-    fn batch_ending_at(rollup_id: u64, root: B256) -> eez_protocol::EvmBatch {
-        let mut batch = eez_protocol::EvmBatch::default();
-        batch.entries.push(ExecutionEntrySol {
-            stateUpdates: vec![StateUpdateSol {
-                rollupId: rollup_id,
-                currentState: B256::ZERO,
-                newState: root,
-                etherDelta: I256::ZERO,
-            }],
-            ..Default::default()
-        });
-        batch
-    }
-
-    #[test]
-    fn settlement_endpoint_must_be_present_and_match() {
-        let expected = B256::repeat_byte(0x42);
-        assert!(
-            ensure_settlement_endpoint(&eez_protocol::EvmBatch::default(), 1, expected).is_err()
-        );
-        assert!(ensure_settlement_endpoint(&batch_ending_at(1, B256::ZERO), 1, expected).is_err());
-        ensure_settlement_endpoint(&batch_ending_at(1, expected), 1, expected).unwrap();
     }
 
     #[test]

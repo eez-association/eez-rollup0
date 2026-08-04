@@ -260,9 +260,9 @@ impl ChainClient for LocalChainClient {
         // entry, the source-sim inspector has already snapshotted
         // source's in-flight cache into the channel's `source_cache`
         // slot. We preload the new session's `State` with that
-        // snapshot. Only a session that consumed such a snapshot may
-        // write its post-execute cache back; otherwise an ordinary
-        // target session would leave stale state for a later call.
+        // snapshot, and forward the channel handle so the session
+        // writes its post-execute cache back to `overlay_cache` for
+        // the inspector to diff-apply onto source.
         //
         // `None` channel or `None` snapshot opens a fresh `State`,
         // which is byte-identical for fixtures whose source tx makes
@@ -279,18 +279,19 @@ impl ChainClient for LocalChainClient {
             .overlay_channel
             .as_ref()
             .and_then(|c| c.peek_pre_snapshot());
-        let overlay_write_back = preloaded_cache
-            .as_ref()
-            .zip(self.overlay_channel.as_ref())
-            .map(|(_, channel)| Arc::clone(channel));
-        // `compute_proxy_address` uses this chain-local manager as the CREATE2
-        // deployer and as the CrossChainProxy constructor argument. Rollups
-        // (L1) and CrossChainManager (L2) implement the same proxy factory but
-        // live at different addresses. For the entry rollup we need Rollups
-        // (L1's `rollups_address`); for followers we need their CCM
-        // (`ccm_address`). Using L2's CCM address on L1 derives a different,
-        // invalid proxy caller and makes the overlay call revert.
-        // Entry session: use the dispatch contract for proxy derivation.
+        // `compute_proxy_address` (called from `build_tx_env` for every
+        // session execute) calls `computeCrossChainProxyAddress` on a
+        // chain-local contract. Both Rollups (L1) and CrossChainManager
+        // (L2) implement that function with the same signature, but
+        // they live at different addresses. For the entry rollup we
+        // want Rollups (L1's `rollups_address`); for followers we want
+        // their CCM (`ccm_address`). Without this split, an entry
+        // overlay session targets `source_block.ccm_address` (L2's
+        // CCM address) on L1 — a non-contract address — and silently
+        // returns `Address::ZERO` as the proxy caller, causing the
+        // overlay's CALL to revert at the proxy's
+        // `executeCrossChainCall` site.
+        // Entry session: target the dispatch contract for `compute_proxy_address`.
         // Follower session: target the CCM contract (the actual cross-chain
         // dispatch endpoint). For EVM these may coincide on a chain whose
         // dispatch contract is the CCM (L2 CrossChainManagerL2); they
@@ -304,7 +305,7 @@ impl ChainClient for LocalChainClient {
             proxy_lookup_addr,
             inspector_factory,
             preloaded_cache,
-            overlay_write_back,
+            self.overlay_channel.clone(),
         )?;
         Ok(Box::new(session))
     }
