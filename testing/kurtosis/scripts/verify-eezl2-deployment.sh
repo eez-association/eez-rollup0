@@ -21,7 +21,9 @@ http_url() {
 L2="${L2:-$(http_url "$(kurtosis port print "$ENCLAVE" eez-node l2-rpc 2>/dev/null || true)")}"
 [[ -n "$L2" ]] || { echo "could not resolve the enclave L2 RPC" >&2; exit 1; }
 
-deploy_dir="$(mktemp -d /tmp/eez-deployment-check.XXXXXX)"
+deploy_dir="${TMPDIR:-/tmp}/eez-deployment-check-$ENCLAVE"
+rm -rf "$deploy_dir"
+mkdir -p "$deploy_dir"
 trap 'rm -rf "$deploy_dir"' EXIT
 kurtosis files download "$ENCLAVE" eez-deployments "$deploy_dir" >/dev/null
 
