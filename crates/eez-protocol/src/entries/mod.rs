@@ -48,11 +48,10 @@ pub fn build_batch(
     recorded: &[ExecutedAction],
     attribution: &crate::SourceAttribution<'_>,
     source_rollup_id: RollupId,
-    raw_tx: &[u8],
 ) -> ProtocolResult<EvmBatch> {
-    // State updates and raw L1 transaction routing are attached by the
-    // settlement path, after this source-side table is built.
-    let _ = (attribution, raw_tx);
+    // State updates are attached by the settlement path after this
+    // source-side table is built.
+    let _ = attribution;
 
     ensure_materializable_calls(recorded)?;
     let group = recorded
@@ -826,7 +825,7 @@ mod tests {
             record(RollupId::MAINNET, RollupId(1)),
         ];
 
-        assert!(build_batch(&calls, &attribution, RollupId::MAINNET, &[]).is_err());
+        assert!(build_batch(&calls, &attribution, RollupId::MAINNET).is_err());
     }
 
     #[test]
@@ -837,13 +836,7 @@ mod tests {
             per_tx_roots_by_rollup: &per_tx,
         };
         let action = record(RollupId::MAINNET, RollupId(7));
-        let batch = build_batch(
-            std::slice::from_ref(&action),
-            &attribution,
-            RollupId(7),
-            &[],
-        )
-        .unwrap();
+        let batch = build_batch(std::slice::from_ref(&action), &attribution, RollupId(7)).unwrap();
         let entry = &batch.entries[0];
         let expected_key = l2_outbound_call_hash(
             CallHashInput {
