@@ -31,9 +31,10 @@
 //!   end-to-end: source simulation dispatches into it, `finalize`
 //!   emits the [`Composition`].
 //! - For the ABI boundary, [`entries::build_batch`] walks the preorder
-//!   `recorded[..]` slice and materializes an [`EvmBatch`]; the
-//!   per-dialect encoders (`encode_postbatch` / `encode_load_table`)
-//!   produce the calldata wrappers.
+//!   `recorded[..]` slice and materializes an [`EvmBatch`].
+//!   [`entries::encode_postbatch`] wraps an L1 batch for submission, while
+//!   [`system_tx`] constructs canonical L2 system transactions from lean L2
+//!   entries.
 #![deny(missing_docs)]
 
 pub mod abi;
