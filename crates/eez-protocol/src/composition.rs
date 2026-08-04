@@ -726,7 +726,8 @@ mod tests {
     use crate::action::{CallHashInput, CallMode, common_cross_chain_call_hash};
     use crate::composer::ProxyLookupConfig;
     use crate::dialect::ChainDialect;
-    use alloy_primitives::{Address, Bytes, U256};
+    use alloy_primitives::{Address, Bytes, U256, b256, keccak256};
+    use alloy_sol_types::SolValue as _;
 
     // ── Mock ChainClient (spawns a canned session) ──────────────────
 
@@ -1158,6 +1159,83 @@ mod tests {
             ids,
             vec![1, 2, 3],
             "targets must be sorted by rollup_id, not insertion order"
+        );
+    }
+
+    #[test]
+    fn composition_batch_encodings_are_stable() {
+        let entry_rollup_id = RollupId(1);
+        let mut l1_target = rollup_with_session([0x20; 32]);
+        l1_target.config.dialect = ChainDialect::EvmL1Style;
+
+        let mut rollups = HashMap::new();
+        rollups.insert(entry_rollup_id, entry_rollup([0x10; 32]));
+        rollups.insert(RollupId::MAINNET, l1_target);
+        rollups.insert(RollupId(2), rollup_with_session([0x30; 32]));
+
+        let mut builder = CompositionBuilder::new(entry_rollup_id, rollups);
+        builder.recorded = vec![
+            ExecutedAction {
+                call_mode: CallMode::Mutable,
+                target_address: Address::repeat_byte(0xa1),
+                target_rollup_id: RollupId::MAINNET,
+                source_rollup_id: entry_rollup_id,
+                source_address: Address::repeat_byte(0xb1),
+                data: Bytes::from_static(&[0x01, 0x02, 0x03]),
+                value: U256::from(5),
+                outcome: ExecutionOutcome::Resolved {
+                    return_data: vec![0x04, 0x05],
+                    pre_state_root: [0x11; 32],
+                    post_state_root: [0x12; 32],
+                    gas_used: 123,
+                    success: true,
+                },
+                revert_span: None,
+            },
+            ExecutedAction {
+                call_mode: CallMode::Mutable,
+                target_address: Address::repeat_byte(0xa2),
+                target_rollup_id: RollupId(2),
+                source_rollup_id: entry_rollup_id,
+                source_address: Address::repeat_byte(0xb2),
+                data: Bytes::from_static(&[0x06, 0x07]),
+                value: U256::from(8),
+                outcome: ExecutionOutcome::Resolved {
+                    return_data: vec![0x09, 0x0a],
+                    pre_state_root: [0x21; 32],
+                    post_state_root: [0x22; 32],
+                    gas_used: 456,
+                    success: true,
+                },
+                revert_span: None,
+            },
+        ];
+        builder.set_extra_per_tx_roots(entry_rollup_id, vec![[0x40; 32]]);
+
+        let composition = builder.finalize().expect("finalize composition");
+        let source_hash = keccak256(composition.source.batch.abi_encode());
+        let target_hashes = composition
+            .targets
+            .iter()
+            .map(|target| (target.rollup_id, keccak256(target.batch.abi_encode())))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            source_hash,
+            b256!("280a4e30c195b4f4f21c66889b1a6acb0c0b30f18b5efd435348b39fc986d56b")
+        );
+        assert_eq!(
+            target_hashes,
+            vec![
+                (
+                    RollupId::MAINNET,
+                    b256!("f7e0edc00ed7cb620f1251581e6251ec9c459497b151bc80fe3bf6d99103bd71"),
+                ),
+                (
+                    RollupId(2),
+                    b256!("486f05e9bf5d8294de7a7f2295e0a0d630b3bef4abea866ced107f0faba42dae"),
+                ),
+            ]
         );
     }
 
