@@ -30,10 +30,80 @@
 //! lives in this crate's `inspector.rs` (which has the necessary
 //! `&mut Context` access during the `Inspector::call` hook).
 
+use std::sync::{Arc, Mutex};
+
 use revm::context_interface::journaled_state::account::JournaledAccountTr;
 use revm::context_interface::{ContextTr, Host, JournalTr};
 use revm::database::{AccountStatus, CacheState, states::CacheAccount};
 use revm::primitives::Address;
+
+/// Cache exchange for nested dispatches that re-enter a suspended rollup.
+///
+/// # Why it exists
+///
+/// During nested dispatch, the caller's revm state remains mutably borrowed.
+/// A re-entered session therefore cannot borrow that state directly. This
+/// channel transfers cache snapshots across the dispatch boundary using two
+/// LIFO stacks:
+///
+/// - `source_cache` stores this rollup's live cache before dispatch. A session
+///   that re-enters the rollup peeks at the latest snapshot when it opens.
+///
+/// - `overlay_cache` stores the cache produced by a re-entered session. The
+///   suspended inspector pops it after dispatch and applies the diff through
+///   [`apply_overlay_diff`].
+///
+/// Stacks keep recursive re-entry snapshots paired with their call frames.
+/// All access is same-thread; a poisoned lock means a dispatch panicked
+/// mid-exchange, so methods panic rather than silently dropping state.
+#[derive(Debug, Default)]
+pub struct OverlayChannel {
+    /// Stack of pre-dispatch cache snapshots.
+    source_cache: Mutex<Vec<CacheState>>,
+    /// Stack of post-execute cache snapshots.
+    overlay_cache: Mutex<Vec<CacheState>>,
+}
+
+/// A poisoned lock means a panic escaped mid-exchange; continuing would
+/// silently drop state propagation.
+const POISONED: &str = "overlay channel mutex poisoned by a panicked dispatch";
+
+impl OverlayChannel {
+    /// Push a pre-dispatch cache snapshot for this rollup.
+    pub fn push_pre_snapshot(&self, cache: CacheState) {
+        self.source_cache.lock().expect(POISONED).push(cache);
+    }
+
+    /// Pop the matching pre-dispatch snapshot at the end of the
+    /// inspector frame.
+    pub fn pop_pre_snapshot(&self) -> Option<CacheState> {
+        self.source_cache.lock().expect(POISONED).pop()
+    }
+
+    /// Clone the latest pre-dispatch snapshot for a re-entered session.
+    pub fn peek_pre_snapshot(&self) -> Option<CacheState> {
+        self.source_cache.lock().expect(POISONED).last().cloned()
+    }
+
+    /// Push the cache produced by a re-entered session.
+    pub fn push_post_cache(&self, cache: CacheState) {
+        self.overlay_cache.lock().expect(POISONED).push(cache);
+    }
+
+    /// Pop the cache produced by the latest re-entered session.
+    pub fn pop_post_cache(&self) -> Option<CacheState> {
+        self.overlay_cache.lock().expect(POISONED).pop()
+    }
+}
+
+/// Shared handle to an [`OverlayChannel`].
+pub type OverlayChannelHandle = Arc<OverlayChannel>;
+
+/// Build a fresh, empty [`OverlayChannelHandle`].
+#[must_use]
+pub fn new_overlay_channel() -> OverlayChannelHandle {
+    Arc::new(OverlayChannel::default())
+}
 
 // Note on trait choice:
 //
@@ -257,6 +327,28 @@ where
 mod tests {
     use super::*;
     use revm::database::{EmptyDB, State};
+
+    #[test]
+    fn overlay_cache_snapshots_are_lifo() {
+        let marker = Address::with_last_byte(0x22);
+        let channel = OverlayChannel::default();
+        let first = CacheState::default();
+        let mut second = CacheState::default();
+        second.insert_not_existing(marker);
+
+        channel.push_pre_snapshot(first.clone());
+        channel.push_pre_snapshot(second.clone());
+        assert_eq!(channel.peek_pre_snapshot(), Some(second.clone()));
+        assert_eq!(channel.pop_pre_snapshot(), Some(second.clone()));
+        assert_eq!(channel.pop_pre_snapshot(), Some(first.clone()));
+        assert_eq!(channel.pop_pre_snapshot(), None);
+
+        channel.push_post_cache(first.clone());
+        channel.push_post_cache(second.clone());
+        assert_eq!(channel.pop_post_cache(), Some(second));
+        assert_eq!(channel.pop_post_cache(), Some(first));
+        assert_eq!(channel.pop_post_cache(), None);
+    }
 
     /// Field-by-field clone of revm [`State<DB>`], constructed literally so a
     /// field addition in a future revm version breaks this test's compile —
