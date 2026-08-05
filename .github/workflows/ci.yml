@@ -101,6 +101,8 @@ jobs:
       - name: Build contracts (artifacts read by harness)
         working-directory: contracts
         run: forge build
+      - name: Build proof signer (launched by harness)
+        run: cargo build -p eez-proof-signer --locked
       - name: Integration tests (e2e, serial)
         run: cargo nextest run -p eez-node --test e2e --test-threads=1 --no-fail-fast
 
@@ -127,5 +129,7 @@ jobs:
       - name: Build contracts (artifacts read by harness)
         working-directory: contracts
         run: forge build
+      - name: Build proof signer (launched by harness)
+        run: cargo build -p eez-proof-signer --locked
       - name: Integration tests (cross-chain, serial)
         run: cargo nextest run -p eez-node --test cross_chain --test-threads=1 --no-fail-fast
