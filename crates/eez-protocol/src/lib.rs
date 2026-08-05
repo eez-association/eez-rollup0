@@ -46,7 +46,6 @@ pub mod entries;
 pub mod error;
 pub mod executor;
 pub mod outbound_gate;
-pub mod overlay;
 pub mod proof_plan;
 pub mod public_inputs;
 pub mod rolling_hash;
@@ -83,10 +82,6 @@ pub use error::{
 };
 #[doc(inline)]
 pub use executor::{ChainClient, ExecutionRequest, SessionSnapshot, TargetExecutionSession};
-#[doc(inline)]
-pub use overlay::{
-    AccountInfo, AccountOverlay, AccountStatus, ContractCode, EvmOverlay, StorageOverlay,
-};
 #[doc(inline)]
 pub use proof_plan::{ProofPlan, ProofPlanInvariantError, RollupProofAssignment};
 #[doc(inline)]
