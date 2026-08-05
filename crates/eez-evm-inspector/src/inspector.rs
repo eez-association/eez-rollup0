@@ -171,7 +171,6 @@ pub struct SessionInspector<'a> {
     caller_rollup_id: RollupId,
     /// First target execution error, if any.
     error: Option<ExecutorError>,
-    call_depth: usize,
     /// Per-rollup cache channel for nested re-entry.
     overlay_channel: Option<OverlayChannelHandle>,
     /// Per-EVM-frame snapshot of the dispatcher's recorded-call count
@@ -190,7 +189,6 @@ impl std::fmt::Debug for SessionInspector<'_> {
         f.debug_struct("SessionInspector")
             .field("proxy_lookup", &self.proxy_lookup)
             .field("caller_rollup_id", &self.caller_rollup_id)
-            .field("call_depth", &self.call_depth)
             .field("has_error", &self.error.is_some())
             .field("has_overlay_channel", &self.overlay_channel.is_some())
             .finish_non_exhaustive()
@@ -280,7 +278,6 @@ impl<'a> SessionInspector<'a> {
             dispatcher,
             caller_rollup_id,
             error: None,
-            call_depth: 0,
             overlay_channel: None,
             frame_starts: Vec::new(),
         }
@@ -308,7 +305,6 @@ where
     DB: 'db,
 {
     fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
-        self.call_depth += 1;
         // Bracket every CALL frame with a recorded-count snapshot so
         // `call_end` can detect "frame reverted AFTER dispatching one
         // or more cross-chain calls" (revert-continue patterns —
@@ -328,7 +324,7 @@ where
         let calldata = inputs.input.bytes(context);
 
         tracing::trace!(
-            depth = self.call_depth,
+            depth = context.journal_ref().depth(),
             target_addr = %inputs.target_address,
             caller = %inputs.caller,
             calldata_len = calldata.len(),
@@ -461,7 +457,7 @@ where
             rollup_id = %info.original_rollup_id,
             caller = %inputs.caller,
             proxy = %inputs.target_address,
-            depth = self.call_depth,
+            depth = context.journal_ref().depth(),
             calldata_len = calldata.len(),
             value = %call_value,
             target_result = if success { "ok" } else { "REVERT" },
@@ -504,7 +500,6 @@ where
             let span = u32::try_from(end - start).unwrap_or(u32::MAX);
             self.dispatcher.annotate_revert_span(start, span);
         }
-        self.call_depth = self.call_depth.saturating_sub(1);
     }
 }
 
