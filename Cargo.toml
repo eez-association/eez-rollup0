@@ -58,10 +58,8 @@ mimalloc           = "0.1"
 clap               = { version = "4", features = ["derive"] }
 
 # reth — pinned to mediocregopher/partial-persistence-clean tip (contains the receipts-reorg truncation fix).
-reth-chain-state                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-chainspec                  = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-cli                        = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-cli-runner                 = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-db                         = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-engine-primitives          = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-ethereum-cli               = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
@@ -120,13 +118,11 @@ alloy-network          = { version = "2", default-features = false }
 alloy-primitives       = { version = "1", default-features = false }
 alloy-provider         = { version = "2", default-features = false, features = ["reqwest"] }
 alloy-rlp              = { version = "0.3", features = ["derive"] }
-alloy-rpc-client       = { version = "2", default-features = false }
 alloy-rpc-types-engine = { version = "2", default-features = false }
 alloy-rpc-types-eth    = { version = "2", default-features = false }
 alloy-signer           = { version = "2", default-features = false }
 alloy-signer-local     = { version = "2", default-features = false }
 alloy-sol-types        = { version = "1", default-features = false }
-alloy-transport-http   = { version = "2", default-features = false }
 fail                   = "0.5"
 k256                   = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 url                    = "2"
@@ -138,7 +134,6 @@ serde_json             = "1"
 # jsonrpsee — used by eez-node's TxIngress middleware (eth_sendRawTransaction override).
 # Pinned to whatever reth's pinned rev uses; cargo resolves the right minor.
 jsonrpsee              = { version = "0.26", features = ["server", "macros"] }
-tower                  = { version = "0.5", features = ["util"] }
 
 # internal crates
 eez-composer       = { path = "crates/eez-composer" }
