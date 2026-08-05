@@ -119,6 +119,13 @@ sol! {
     );
 }
 
+/// Alias for the batch accepted by the protocol's `postAndVerifyBatch` ABI.
+///
+/// Composition builds partial batches containing source-side or target-side
+/// entries. Downstream settlement may merge them and attach state updates,
+/// proof-system metadata, and proofs.
+pub type EvmBatch = ProofSystemBatchPerVerificationEntriesSol;
+
 /// Events whose ABI differs specifically on `EEZL2`.
 pub mod eez_l2_events {
     use alloy_sol_types::sol;

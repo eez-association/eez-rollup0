@@ -23,8 +23,8 @@
 use alloy_primitives::{Address, Bytes, U256};
 use serde::{Deserialize, Serialize};
 
+use crate::abi::EvmBatch;
 use crate::action::CallMode;
-use crate::batch::EvmBatch;
 use crate::rollup_id::RollupId;
 
 /// A recorded cross-chain call and its target execution status.

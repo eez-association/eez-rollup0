@@ -38,7 +38,6 @@ pub mod abi;
 pub mod action;
 pub mod addresses;
 pub mod authorized_proxies;
-pub mod batch;
 pub mod composition;
 pub mod dialect;
 pub mod entries;
@@ -57,6 +56,8 @@ pub mod types;
 mod assertions;
 
 #[doc(inline)]
+pub use abi::EvmBatch;
+#[doc(inline)]
 pub use action::{CallHashInput, CallMode, common_cross_chain_call_hash, l2_outbound_call_hash};
 #[doc(inline)]
 pub use addresses::EEZL2_ADDRESS;
@@ -65,8 +66,6 @@ pub use authorized_proxies::{
     EEZ_AUTHORIZED_PROXIES_SLOT, EEZL2_AUTHORIZED_PROXIES_SLOT, ProxyInfo, ProxyLookupConfig,
     decode_proxy_value, proxy_mapping_key,
 };
-#[doc(inline)]
-pub use batch::EvmBatch;
 #[doc(inline)]
 pub use composition::{CompositionBuilder, Rollup, TargetConfig};
 #[doc(inline)]

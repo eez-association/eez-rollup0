@@ -8,11 +8,10 @@ use alloy_sol_types::SolCall;
 use tracing::{debug, trace};
 
 use crate::abi::{
-    CrossChainCallSol, ExecutionEntrySol, L2ExecutionEntrySol, L2ToL1CallSol,
+    CrossChainCallSol, EvmBatch, ExecutionEntrySol, L2ExecutionEntrySol, L2ToL1CallSol,
     postAndVerifyBatchCall,
 };
 use crate::action::{CallHashInput, CallMode, common_cross_chain_call_hash, l2_outbound_call_hash};
-use crate::batch::EvmBatch;
 use crate::{ExecutedAction, ProtocolResult, RollupId, rolling_hash::EntryRollingHash};
 
 const UNSUCCESSFUL_CALL: &str = "unsuccessful cross-chain calls are not supported";
