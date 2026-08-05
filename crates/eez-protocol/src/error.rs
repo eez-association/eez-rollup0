@@ -13,10 +13,9 @@ use std::backtrace::Backtrace;
 ///
 /// Crate-private on purpose: downstream code shouldn't need to think
 /// about `Box<dyn Error>`. Use the public constructors
-/// ([`ExecutorError::provider`], [`ExecutorError::evm`],
-/// [`ExecutorError::transport`], [`ExecutorError::serde`]) — they
-/// accept any `impl std::error::Error + Send + Sync + 'static` and box
-/// it internally.
+/// ([`ExecutorError::provider`], [`ExecutorError::evm`]) — they accept
+/// any `impl std::error::Error + Send + Sync + 'static` and box it
+/// internally.
 pub(crate) type BoxedError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Generate the struct-layer boilerplate for an error type that wraps
@@ -123,14 +122,6 @@ impl ExecutorError {
     pub fn evm(e: impl Into<BoxedError>) -> Self {
         ExecutorErrorKind::Evm(e.into()).into()
     }
-    /// Build a `Transport` error from any `Error + Send + Sync + 'static`.
-    pub fn transport(e: impl Into<BoxedError>) -> Self {
-        ExecutorErrorKind::Transport(e.into()).into()
-    }
-    /// Build a `Serde` error from any `Error + Send + Sync + 'static`.
-    pub fn serde(e: impl Into<BoxedError>) -> Self {
-        ExecutorErrorKind::Serde(e.into()).into()
-    }
 }
 
 /// Variants of [`ExecutorError`].
@@ -148,34 +139,15 @@ pub enum ExecutorErrorKind {
     /// returned.
     #[error("evm: {0}")]
     Evm(#[source] BoxedError),
-    /// Communication with an external executor failed.
-    #[error("transport: {0}")]
-    Transport(#[source] BoxedError),
     /// Executor data has an invalid representation or concrete type.
     #[error("encoding: {0}")]
     Encoding(String),
-    /// Serialization or deserialization failed.
-    #[error("serde: {0}")]
-    Serde(#[source] BoxedError),
     /// Required provider or execution data was absent.
     #[error("missing {0}")]
     Missing(&'static str),
-    /// A target-chain transaction in a batch simulation reverted at
-    /// the contract level (distinct from internal EVM failures).
-    #[error("target transaction {index} reverted: return_data={return_data:?}")]
-    TargetTransactionReverted {
-        /// Zero-based position of the reverting transaction within the
-        /// simulated batch.
-        index: usize,
-        /// Raw revert data returned by the contract, if any.
-        return_data: Vec<u8>,
-    },
     /// Failed to decode a higher-level input such as a raw transaction.
     #[error("decode: {0}")]
     Decode(String),
-    /// Batch execution was requested without transactions.
-    #[error("batch simulation requires at least one transaction")]
-    EmptyBatch,
     /// A dispatch targeted a non-entry rollup that cannot safely accept
     /// re-entry: either the caller targets itself or the target session is
     /// already executing an outer call.

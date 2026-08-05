@@ -265,7 +265,6 @@ fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
             ee.kind(),
             ExecutorErrorKind::Unavailable(_)
                 | ExecutorErrorKind::Provider(_)
-                | ExecutorErrorKind::Transport(_)
                 | ExecutorErrorKind::Missing(_)
         ),
         // Lifecycle / internal (misconfigured, lock poisoned, double
