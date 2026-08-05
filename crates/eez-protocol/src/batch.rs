@@ -1,28 +1,18 @@
-//! `EvmBatch` — the L1 protocol batch.
+//! Shared EVM batch representation.
 //!
-//! Thin wrapper over the on-chain
-//! [`ProofSystemBatchPerVerificationEntriesSol`] struct so the
-//! batch surface mirrors the actual L1 ABI. The
-//! wrapper carries no duplicated state
-//! and is populated by the entry builder and, at submit
-//! time, by the proof-system carrier population layer.
-//!
-//! Entry construction populates the mutable and static execution tables;
-//! submission fills the proof-system carriers and proofs.
+//! [`EvmBatch`] aliases the pinned
+//! [`ProofSystemBatchPerVerificationEntriesSol`] ABI type. Composition builds
+//! partial batches containing source-side or target-side entries. Downstream
+//! settlement may merge them and attach state updates, proof-system metadata,
+//! and proofs.
 
 use crate::abi::ProofSystemBatchPerVerificationEntriesSol;
 
-/// The table-loading batch — the on-chain
-/// `ProofSystemBatchPerVerificationEntriesSol`, aliased for brevity.
-/// Populated field-by-field by the entry builder and, at submit time,
-/// by `prepare_post_batch` (carriers) + the proof sink (`proofs[]`).
+/// Alias for the batch accepted by the protocol's `postAndVerifyBatch` ABI.
 pub type EvmBatch = ProofSystemBatchPerVerificationEntriesSol;
 
 impl ProofSystemBatchPerVerificationEntriesSol {
     /// `true` if the batch carries no mutable or static entries.
-    /// Used by the composer's terminal-revert short-circuit to skip
-    /// target-composition emission for a batch that was fully
-    /// reverted.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty() && self.staticEntries.is_empty()

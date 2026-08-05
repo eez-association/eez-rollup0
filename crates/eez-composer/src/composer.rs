@@ -4,11 +4,12 @@
 //! Two entry points:
 //!
 //! - `compose_sync_slot` — called by the Sequencer on each Sync slot.
-//!   Drains the rollup's [`HeldPool`](crate::HeldPool), runs every held
-//!   tx through cross-chain simulation, builds the rich Sync block, and submits
-//!   `[postBatch, user_tx…]` through the configured bundle transport:
-//!   committed to L2 optimistically, observed in the background, reorged
-//!   on failure (see [`crate::optimistic`]).
+//!   Processes a bounded batch from the rollup's [`HeldPool`](crate::HeldPool),
+//!   simulates eligible transactions, and returns a Sync block for optimistic
+//!   L2 commit. Inbound survivors accompany `postBatch` in the L1 bundle;
+//!   outbound survivors execute in the L2 Sync block and are carried in DA. A
+//!   background observer records the settlement verdict for later slot-context
+//!   recovery (see [`crate::optimistic`]).
 //! - [`Composer::run`] — follows the shared `L1Watcher` event stream,
 //!   logging confirmed vs external `BatchPosted` for this rollup. The
 //!   L1-confirmed cursor + batch index are advanced by the Deriver (sole
@@ -75,11 +76,11 @@ pub struct CrossChainExecCtx {
     pub l1_provider: alloy_provider::RootProvider,
     /// Shared `Submitter` handle — the single L1 submission path.
     /// `Submitter` is internally `Arc<Inner>`, so `Clone` is cheap.
-    /// `compose_sync_slot` hands it `[postBatch, user_tx_1, …]` via
-    /// `Submitter::send_bundle`; the Submitter owns the transport
-    /// decision (atomic `eth_sendBundle` on relays that support it,
-    /// ordered mempool submission on plain execution RPCs like dev
-    /// reth / anvil).
+    /// `compose_sync_slot` hands it `[postBatch, inbound_user_tx_1, …]` via
+    /// `Submitter::send_bundle`; outbound user transactions execute in the L2
+    /// Sync block instead. The Submitter owns the transport decision (atomic
+    /// `eth_sendBundle` on supporting relays, ordered mempool submission on
+    /// plain execution RPCs).
     pub submitter: eez_l1::Submitter,
     /// L1 EOA whose key signs the `postAndVerifyBatch` transaction. Different from
     /// `system_signer` (which is the L2 SYSTEM_ADDRESS). For dev
@@ -207,7 +208,7 @@ impl CrossChainWiring {
         }
 
         // Drive source simulation, including proxy dispatch through the
-        // builder, then finalize the semantic batches.
+        // builder, then materialize the composition's source and target batches.
         // Capture the count first because `finalize` consumes the builder.
         let mut builder = eez_protocol::CompositionBuilder::new(entry_id, rollups);
         entry_client
@@ -288,7 +289,8 @@ alloy_sol_types::sol! {
 }
 
 /// L1-confirmed escrow (`rollups(rid).etherBalance`) an outbound withdrawal draws
-/// down. `None` on any read failure, so the caller fails open (skips the precheck).
+/// down. `None` on any read failure, so the caller skips this early rejection;
+/// the on-chain escrow check remains authoritative.
 async fn read_rollup_escrow(provider: &alloy_provider::RootProvider, rid: u64) -> Option<U256> {
     let eez = std::env::var("EEZ_REGISTRY_ADDRESS")
         .ok()?
@@ -715,9 +717,9 @@ where
     /// Returns `None` (→ vanilla pool-driven Sync commit) when cross-chain
     /// composition is unavailable or cannot produce a block this slot.
     ///
-    /// Each drained transaction runs through `simulate_and_resolve` and
-    /// `compose_cross_chain_batch`. Held transactions are never executed
-    /// directly on L2.
+    /// Each eligible transaction runs through cross-chain simulation. Inbound
+    /// survivors execute through the L1 bundle; outbound survivors execute in
+    /// the constructed L2 Sync block and are carried in DA.
     async fn compose_sync_slot(
         &self,
         rollup_id: u64,
@@ -880,14 +882,11 @@ where
             .filter(|&n| n >= 1)
             .unwrap_or(3);
         let drained = pool.pop_n(max_user_txs);
-        // NOTE: do NOT early-exit on empty pool. Every unblocked Sync
-        // slot still emits a postBatch carrying the leading immediate
-        // entry (which advances L1's stored stateRoot to the L2
-        // stateRoot at sync_block - 1). Without this, L1's view of the
-        // rollup state stops advancing while the composer keeps
-        // producing L2 blocks — the chains diverge in time. An
-        // "empty-pool" postBatch has ZERO deferred entries and no
-        // user_txs bundled with it; the bundle is just `[postBatch]`.
+        // When the pool is empty, do not return early. This slot attempts a
+        // minimal postBatch whose leading immediate entry advances L1's stored
+        // root to the empty Sync block's final state root. Without it, L1's view
+        // would stop advancing while L2 continues producing blocks. The L1
+        // bundle contains only `postBatch` in this path.
         let drained_count = drained.len();
         // Per-slot drain visibility (pool depth vs how many txs this bundle
         // took) — DEBUG so it doesn't spam the steady-state INFO stream.
@@ -902,15 +901,15 @@ where
             "drained held pool at Sync slot",
         );
 
-        // Route each held source-chain transaction through
-        // `simulate_and_resolve`. The cross-chain path computes per-effect roots
-        // and stitches state updates so their final endpoint equals the locally
+        // Process held transactions through direction-specific nonce preflight
+        // and simulation. The cross-chain path computes per-effect roots and
+        // stitches state updates so their final endpoint equals the locally
         // built Sync-block root.
         //
-        // This path is authoritative: it builds the Sync block, registers the
-        // drained txs in the optimistic ledger, and observes L1 settlement in
-        // the background. The source transactions themselves are not generic
-        // L2 block inputs.
+        // This path owns the composed Sync block, registers its survivors in
+        // the optimistic ledger, and observes L1 settlement in the background.
+        // Inbound source transactions execute through the L1 bundle; outbound
+        // source transactions execute as user halves of L2 Sync pairs.
         match self
             .compose_cross_chain_batch(
                 cc,
@@ -1189,8 +1188,8 @@ where
     }
 
     /// Simulate each drained transaction, construct canonical L2 system
-    /// transactions, build the Sync block, register optimistic state, submit
-    /// the L1 payload, and return the block for immediate L2 commit.
+    /// transactions, build the Sync block, register optimistic state, spawn L1
+    /// submission observation, and return the block for immediate L2 commit.
     ///
     /// # Errors
     /// Returns errors only before drain classification begins.
@@ -1238,25 +1237,24 @@ where
         // observed by a background task (see [`crate::optimistic`]).
         // Two paths keep the Sync block as the range's last
         // block:
-        // - **Rich:** non-empty drain + every build step
-        //   succeeds → bundle `[postBatch_with_entries, user_tx_1, …]`,
-        //   rich Sync block carrying the cross-chain system txs.
-        // - **Minimal:** empty drain, or a rich-path build
-        //   failure (user_txs re-queued) → bundle `[postBatch]` with the
-        //   leading immediate only, empty Sync block — keeps L1's
-        //   recorded stateRoot tracking L2.
+        // - **Rich:** at least one transaction survives and every build step
+        //   succeeds. The L1 bundle contains `postBatch` plus inbound survivors;
+        //   the Sync block contains system transactions and outbound user halves.
+        // - **Minimal:** the drain is empty, no transaction survives, or a rich
+        //   build step fails. The L1 bundle contains only `postBatch` with the
+        //   leading immediate entry, and the Sync block is empty.
 
         // ── Per-tx compose with poison isolation ─────────────────────
         // Simulate each held tx independently:
-        //   - Ok                        → survivor (gets bundled).
+        //   - Ok                        → survivor, routed by direction.
         //   - deterministic sim failure → POISON (e.g. a wrong-proxy tx
         //     → EmptyCalls, or a revert): evict it here (+ nonce-cascade)
         //     so it can never freeze the pool, and keep composing the
         //     survivors.
         //   - transient sim failure     → abort the slot: re-queue
         //     everything, degrade to a minimal postBatch, retry next.
-        // Only sim-clean survivors are bundled, so any later bundle DROP
-        // is relay bad luck rather than poison.
+        // Only simulation-clean survivors reach the rich path. Recovery still
+        // caps retries because relay-side simulation may observe different state.
         if drained.is_empty() {
             return self
                 .dispatch_minimal_postbatch(
@@ -1298,9 +1296,10 @@ where
         // deferred entries) feed `prepare_post_batch_raw`'s merge.
         let mut survivor_comps: Vec<eez_protocol::Composition> = Vec::with_capacity(drained.len());
         // Staged, not built inline: system txs are built ONCE post-drain via the
-        // canonical `build_cross_chain_sync_pairs` (matches the deriver). pending_out
-        // = (outbound settlement entry, its user tx); pending_in = inbound targets;
-        // outbound_entries = the settlement entries spliced into the postBatch.
+        // canonical `build_cross_chain_sync_pairs` (matches the deriver).
+        // `pending_out` pairs an outbound settlement entry with its user tx;
+        // `pending_in` holds inbound target-side derivation entries; and
+        // `outbound_entries` holds settlement entries spliced into `postBatch`.
         let mut pending_out: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)> = Vec::new();
         let mut pending_in: Vec<eez_protocol::abi::ExecutionEntrySol> = Vec::new();
         let mut outbound_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = Vec::new();
@@ -1445,8 +1444,8 @@ where
                 continue;
             }
 
-            // ── INBOUND (L1→L2) arm. Stage the deferred target entries; the
-            // delivery system txs are built post-drain (after all outbound loads).
+            // ── INBOUND (L1→L2) arm. Stage target-side derivation entries
+            // for L2 delivery; system transactions follow all outbound loads.
             match cc.simulate_and_resolve(held.raw_tx.as_ref()) {
                 Ok(composition) => {
                     let target_entries: Vec<_> = composition
@@ -1743,7 +1742,7 @@ where
         };
         let total_entries: usize = comp_refs.iter().map(|c| c.source.batch.entries.len()).sum();
 
-        // ── Dispatch: rich bundle [postBatch, ...survivors], commit. ──
+        // ── Dispatch the rich L1 bundle and register the optimistic block. ──
         let sync_height = built.header.number();
         // keccak of the raw EIP-2718 envelope IS the typed tx's hash —
         // recorded in the ledger so the finality audit can look up the
@@ -1893,11 +1892,10 @@ where
         }))
     }
 
-    /// Spawn the background bundle-observer task. The observer only
-    /// records the verdict in the ledger — all chain mutations happen
-    /// in slot context (`recover_failed_batch`), so the task captures
-    /// nothing but the submitter, the ledger, and the expected final
-    /// state root.
+    /// Spawn the background bundle-observer task. It owns the submission inputs
+    /// and records only the verdict in the optimistic ledger; it holds neither
+    /// the Composer nor the block committer, so chain recovery stays in slot
+    /// context through `recover_failed_batch`.
     fn spawn_bundle_observer(
         &self,
         ctx: &CrossChainExecCtx,
@@ -1923,14 +1921,14 @@ where
     /// Build + sign the L1 `postBatch` raw tx for a Sync slot's
     /// compositions, covering blocks `posted+1..=parent+1` (intermediate
     /// blocks + the new Sync block at `parent+1`, always the range's last
-    /// block). Returns EIP-2718 bytes so the caller can bundle the tx
-    /// with the N user_tx forwards.
+    /// block). Returns only the signed EIP-2718 `postBatch` bytes; the caller
+    /// appends surviving inbound user transactions to the L1 bundle.
     ///
-    /// EEZ.sol's `lastVerifiedBlock` guard allows at most one
-    /// `postAndVerifyBatch` per rollup ID per L1 block, so every entry
-    /// drained in one Sync slot merges into one batch: `entries[]` are
-    /// concatenated in submission order (FIFO-matching the deferred-consumption
-    /// queue). A single `self.inner.prover` proof covers the merged batch.
+    /// A later `postAndVerifyBatch` for the same rollup and L1 block replaces the
+    /// earlier deferred queue. The composer therefore merges one Sync slot into
+    /// one batch so no earlier entries are lost. Entries are ordered as the
+    /// leading anchor, outbound immediate entries in drain order, then inbound
+    /// deferred entries in drain order. One proof covers the merged batch.
     ///
     /// **Chained state updates**: this function
     /// stitches the merged entries so `entries[k].currentState ==
@@ -1961,8 +1959,9 @@ where
         use alloy_sol_types::SolCall;
         use eez_protocol::abi::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
 
-        // Merge source batches, or start empty so an idle Sync slot can carry
-        // only the leading immediate entry that advances L1's stored root.
+        // Merge inbound compositions' L1 source batches, or start empty so an
+        // idle Sync slot can carry only the leading immediate entry that
+        // advances L1's stored root.
         let mut batch = if compositions.is_empty() {
             eez_protocol::EvmBatch::default()
         } else {
@@ -1982,9 +1981,9 @@ where
         //
         // `currentState` = L2.stateRoot(posted) (the L1-confirmed cursor)
         // — must equal L1.config.stateRoot at postBatch time so the
-        // deriver's check_claimed_state agrees. `newState` = L2 at
-        // sync_block-1 (`parent_header.state_root()`), lumping every
-        // pre-sync block's effects into one state update.
+        // deriver's check_claimed_state agrees. `newState` initially equals the
+        // pre-Sync root so later effect entries chain from it; an anchor-only
+        // batch replaces it below with the empty Sync block's final root.
         let posted = self
             .inner
             .rollups
@@ -2142,8 +2141,9 @@ where
             }
         }
 
-        // The chain must end at the Sync block's final root. The prover enforces
-        // this; assert locally so a stitch bug fails fast here.
+        // The validating proof path enforces that the chain ends at the Sync
+        // block's final root. Debug builds also check the local stitching
+        // invariant here, including when a mock prover is configured.
         debug_assert_eq!(
             batch
                 .entries
@@ -2288,11 +2288,10 @@ where
         // is), so they travel in the Sync-block DA here; the deriver interleaves
         // them with the rebuilt loads. Inbound-only → empty.
         blocks.push(outbound_user_txs.iter().map(|b| b.to_vec()).collect());
-        // L2-shaped entries let followers reconstruct system transactions. L1
-        // settlement entries for value-bearing calls omit the inbound call
-        // parameters needed on L2, so target-side batches carry a separate
-        // derivation shape. Encode those entries into `batch.callData`, which
-        // the contract treats as proof-bound opaque data.
+        // Encoded `ExecutionEntrySol` values let followers reconstruct system
+        // transactions. Outbound entries describe L1 settlement and L2 loads;
+        // inbound target batches carry the L2 delivery inputs. Encode both into
+        // `batch.callData`, which enters the public-input preimage as opaque data.
         use alloy_sol_types::SolValue as _;
         // The DA sidecar stores the full derivation entry set in canonical
         // order: outbound settlement entries first, then inbound deferred
@@ -2504,8 +2503,8 @@ async fn observe_bundle_outcome(
 ///
 /// # Errors
 ///
-/// Returns a `String` error if RPC calls fail (chain id, nonce, base
-/// fee, EIP-1559 fee estimation) or if signing fails.
+/// Returns a `String` error if the pending-nonce or latest-block RPC fails, or
+/// if transaction signing fails.
 async fn sign_post_batch_tx(
     signer: &alloy_signer_local::PrivateKeySigner,
     provider: &alloy_provider::RootProvider,
@@ -2538,14 +2537,9 @@ async fn sign_post_batch_tx(
     let base_fee = u128::from(latest.header.base_fee_per_gas.unwrap_or(0));
     let max_fee_per_gas = base_fee.saturating_mul(2).saturating_add(priority_fee);
 
-    // Gas budget for postAndVerifyBatch: per-rollup verification +
-    // entry apply. 10M is plenty for a single-PS single-entry batch
-    // on the smoke; the dev chain's block gas limit is 30M.
-    // 4M leaves enough headroom under chiado's 17M block gas limit for
-    // the bundled user_txs to fit in the same block. Actual postBatch
-    // gas usage is ~500K for our smoke's entry counts; 4M is ~8x
-    // safety. Original 10M caused bundles to fail rbuilder's
-    // "bundle fits in block" check.
+    // The fixed four-million-gas budget targets the current bounded,
+    // single-proof-system profile and leaves headroom under Chiado's 17M limit
+    // for bundled inbound transactions; no dynamic estimate is performed.
     const POST_BATCH_GAS_LIMIT: u64 = 4_000_000;
 
     let mut tx = TxEip1559 {
