@@ -44,8 +44,8 @@ pub const ANVIL_ATTESTER_KEY: &str =
     "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906");
 
-// K = L1/L2 must be at least 3: proof + submission slack needs two L2 slots.
-const L1_BLOCK_TIME_SECS: u64 = 3;
+// K = L1/L2 = 2 matches standalone's 2s cadence and leaves one L2 slot for proving.
+const L1_BLOCK_TIME_SECS: u64 = 4;
 
 // Consumed by the launcher as `--chain`; never forwarded to `eez-node`.
 const TEST_L2_GENESIS_ENV: &str = "EEZ_TEST_L2_GENESIS_PATH";
@@ -697,7 +697,7 @@ impl Harness {
     /// Stages a local chain that can later restart as a composer or follower.
     pub fn standalone_env(&self) -> Vec<(&'static str, String)> {
         vec![
-            ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
+            ("EEZ_L2_BLOCK_TIME_MS", "2000".to_string()),
             (
                 "RUST_LOG",
                 std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
@@ -804,7 +804,7 @@ impl Harness {
                 "EEZ_L1_BLOCK_TIME_MS",
                 (L1_BLOCK_TIME_SECS * 1000).to_string(),
             ),
-            ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
+            ("EEZ_L2_BLOCK_TIME_MS", "2000".to_string()),
             ("EEZ_PROOF_TIME_MS", "1000".to_string()),
             ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
             (
