@@ -9,25 +9,18 @@
 //! The inspector's synchronous dispatch keeps
 //! source-sim's `evm.transact`, target-session execution, and
 //! nested-back-to-entry dispatch all on the same OS thread — no
-//! Send/Sync requirements, no cross-thread cloning. The overlay
-//! handle holds a fresh `State<DB>` constructed with
-//! `StateBuilder::with_cached_prestate(source_cache.clone())`, runs
-//! the nested call against it, and on commit walks the cache delta to
-//! emit journal entries onto source-sim's live state via the
-//! inspector's `&mut ctx`.
+//! Send/Sync requirements, no cross-thread cloning. The re-entered
+//! session opens a fresh `State<DB>` preloaded with the published
+//! snapshot via `StateBuilder::with_cached_prestate`, runs the nested
+//! call against it, and publishes its post-execute cache; the
+//! suspended inspector then applies the cache delta as journal
+//! entries onto source-sim's live state.
 //!
-//! # Why a manual clone of `State<DB>` is unnecessary
-//!
-//! revm's `State<DB>` lacks `Clone`, and reth's `StateProviderBox =
-//! Box<dyn StateProvider + Send>` is neither `Clone` nor `Sync`.
-//! Cloning `State<DB>` in full is impossible without `unsafe` fiat.
-//! But we don't need to: revm's
-//! [`StateBuilder::with_cached_prestate`](revm::database::states::StateBuilder::with_cached_prestate)
-//! preloads a fresh `State` with another state's `CacheState` (which
-//! IS `Clone`). The fresh `State` reads cold data from a fresh
-//! database instance (cheap to obtain via `provider.latest()`) and
-//! writes mutations to its own cache + journal. On commit, diff the
-//! caches and apply.
+//! Sharing works through `CacheState` because revm's `State<DB>`
+//! itself lacks `Clone`: `with_cached_prestate` preloads a fresh
+//! `State` with a cloned cache, reading cold data from a fresh
+//! database instance. (`clone_state` in this module's tests guards
+//! that assumption against revm field drift.)
 //!
 //! # Crate-layering invariants
 //!
@@ -117,15 +110,12 @@ fn has_unsupported_destruction(
 ///
 /// # When this is called
 ///
-/// Source-sim's inspector hook fires for a cross-chain CALL,
-/// snapshots source's cache as `before`, populates the source-cache
-/// side-channel, and drives the dispatch. During
-/// that dispatch, an inner target session may dispatch back to the
-/// entry rollup; the entry rollup's session opens its `State` preloaded
-/// with `before` and accumulates per-overlay-call mutations. After the
-/// outer dispatch returns, the inspector reads the entry session's
-/// post-execute cache (`after`) from the second side-channel and calls
-/// this function on source-sim's `&mut ctx`.
+/// The inspector hook fires for a cross-chain CALL, snapshots the
+/// source cache as `before`, publishes it on the overlay channel, and
+/// drives the dispatch. A nested dispatch back into this rollup opens
+/// its session preloaded with `before` and publishes its post-execute
+/// cache; after the outer dispatch returns, the inspector pops that
+/// cache as `after` and calls this function on the source EVM context.
 ///
 /// # Mutation classes
 ///
@@ -161,10 +151,9 @@ fn has_unsupported_destruction(
 ///
 /// # Idempotency
 ///
-/// The inspector clears both side-channel slots after this function
-/// returns. Calling it twice on the same `(before, after)` is
-/// well-defined but emits redundant journal entries; callers should
-/// not do this.
+/// The inspector pops both channel stacks around this call. Calling it
+/// twice on the same `(before, after)` is well-defined but emits
+/// redundant journal entries; callers should not do this.
 ///
 /// # Errors
 ///

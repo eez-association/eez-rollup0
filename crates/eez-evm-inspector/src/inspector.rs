@@ -53,55 +53,45 @@ use eez_protocol::{ProxyInfo, decode_proxy_value, proxy_mapping_key};
 ///   [`apply_overlay_diff`](crate::overlay::apply_overlay_diff).
 ///
 /// Stacks keep recursive re-entry snapshots paired with their call frames.
+/// All access is same-thread; a poisoned lock means a dispatch panicked
+/// mid-exchange, so methods panic rather than silently dropping state.
 #[derive(Debug, Default)]
 pub struct OverlayChannel {
-    /// Stack of pre-dispatch cache snapshots. See [`push_pre_snapshot`]
-    /// / [`peek_pre_snapshot`] / [`pop_pre_snapshot`].
-    ///
-    /// [`push_pre_snapshot`]: OverlayChannel::push_pre_snapshot
-    /// [`peek_pre_snapshot`]: OverlayChannel::peek_pre_snapshot
-    /// [`pop_pre_snapshot`]: OverlayChannel::pop_pre_snapshot
+    /// Stack of pre-dispatch cache snapshots.
     source_cache: Mutex<Vec<CacheState>>,
-    /// Stack of post-execute cache snapshots. See [`push_post_cache`]
-    /// / [`pop_post_cache`].
-    ///
-    /// [`push_post_cache`]: OverlayChannel::push_post_cache
-    /// [`pop_post_cache`]: OverlayChannel::pop_post_cache
+    /// Stack of post-execute cache snapshots.
     overlay_cache: Mutex<Vec<CacheState>>,
 }
+
+/// A poisoned lock means a panic escaped mid-exchange; continuing would
+/// silently drop state propagation.
+const POISONED: &str = "overlay channel mutex poisoned by a panicked dispatch";
 
 impl OverlayChannel {
     /// Push a pre-dispatch cache snapshot for this rollup.
     pub fn push_pre_snapshot(&self, cache: CacheState) {
-        if let Ok(mut guard) = self.source_cache.lock() {
-            guard.push(cache);
-        }
+        self.source_cache.lock().expect(POISONED).push(cache);
     }
 
     /// Pop the matching pre-dispatch snapshot at the end of the
     /// inspector frame.
     pub fn pop_pre_snapshot(&self) -> Option<CacheState> {
-        self.source_cache.lock().ok().and_then(|mut g| g.pop())
+        self.source_cache.lock().expect(POISONED).pop()
     }
 
     /// Clone the latest pre-dispatch snapshot for a re-entered session.
     pub fn peek_pre_snapshot(&self) -> Option<CacheState> {
-        self.source_cache
-            .lock()
-            .ok()
-            .and_then(|g| g.last().cloned())
+        self.source_cache.lock().expect(POISONED).last().cloned()
     }
 
     /// Push the cache produced by a re-entered session.
     pub fn push_post_cache(&self, cache: CacheState) {
-        if let Ok(mut guard) = self.overlay_cache.lock() {
-            guard.push(cache);
-        }
+        self.overlay_cache.lock().expect(POISONED).push(cache);
     }
 
     /// Pop the cache produced by the latest re-entered session.
     pub fn pop_post_cache(&self) -> Option<CacheState> {
-        self.overlay_cache.lock().ok().and_then(|mut g| g.pop())
+        self.overlay_cache.lock().expect(POISONED).pop()
     }
 }
 
@@ -132,15 +122,67 @@ pub fn new_overlay_channel() -> OverlayChannelHandle {
 /// We explicitly load it; a no-op if it was already warm.
 fn lookup_authorized_proxy_live<CTX: ContextTr + Host>(
     ctx: &mut CTX,
-    rollups_addr: Address,
-    proxy_slot: u8,
+    lookup: &ProxyLookupConfig,
     addr: Address,
 ) -> Option<ProxyInfo> {
     // Warm the rollups account before the SLOAD (see fn-level doc).
-    ctx.journal_mut().load_account(rollups_addr).ok()?;
-    let key = proxy_mapping_key(addr, proxy_slot);
-    let load = ctx.sload(rollups_addr, key.into())?;
+    ctx.journal_mut()
+        .load_account(lookup.contract_address)
+        .ok()?;
+    let key = proxy_mapping_key(addr, lookup.authorized_proxies_slot);
+    let load = ctx.sload(lookup.contract_address, key.into())?;
     decode_proxy_value(load.data)
+}
+
+/// Clone this rollup's in-flight cache with journal-live values.
+///
+/// revm keeps mid-transaction writes in its journal, while loaded cache
+/// entries can still contain their pre-write values. Refresh every loaded
+/// account and slot through `Host` before sharing the cache. An `SSTORE`
+/// first loads its slot, so the cache already identifies every storage key
+/// that needs refreshing.
+fn live_cache_snapshot<'db, DB, CTX>(context: &mut CTX) -> CacheState
+where
+    CTX: ContextTr<Db = &'db mut State<DB>> + Host,
+    DB: 'db,
+{
+    let mut cache = context.db_mut().cache.clone();
+    // Collect keys first: the refresh loops below mutate `cache` while
+    // reading live values through `context`.
+    let mut addrs: Vec<Address> = Vec::new();
+    let mut slots: Vec<(Address, alloy_primitives::U256)> = Vec::new();
+    for (addr, acc) in &cache.accounts {
+        addrs.push(*addr);
+        if let Some(plain) = acc.account.as_ref() {
+            for slot in plain.storage.keys() {
+                slots.push((*addr, *slot));
+            }
+        }
+    }
+    // Read live storage values through the journal-aware host.
+    for (addr, slot) in slots {
+        if let Some(load) = context.sload(addr, slot)
+            && let Some(plain) = cache
+                .accounts
+                .get_mut(&addr)
+                .and_then(|a| a.account.as_mut())
+        {
+            plain.storage.insert(slot, load.data);
+        }
+    }
+    // Read live balances and nonces through the host.
+    for addr in addrs {
+        if let Ok(info) = context.load_account_info_skip_cold_load(addr, false, true)
+            && let Some(plain) = cache
+                .accounts
+                .get_mut(&addr)
+                .and_then(|a| a.account.as_mut())
+        {
+            plain.info.balance = info.balance;
+            plain.info.nonce = info.nonce;
+        }
+    }
+    cache
 }
 
 /// EVM inspector that detects proxy calls and dispatches them through
@@ -284,23 +326,21 @@ where
         }
 
         let calldata = inputs.input.bytes(context);
+        let calldata_len = calldata.len();
 
         tracing::trace!(
             depth = context.journal_ref().depth(),
             target_addr = %inputs.target_address,
             caller = %inputs.caller,
-            calldata_len = calldata.len(),
+            calldata_len,
             "inspector: CALL"
         );
 
         // Look up `authorizedProxies[target_address]` on the configured
         // contract via the live EVM state. Sees in-tx / in-block writes.
-        let Some(info) = lookup_authorized_proxy_live(
-            context,
-            self.proxy_lookup.contract_address,
-            self.proxy_lookup.authorized_proxies_slot,
-            inputs.target_address,
-        ) else {
+        let Some(info) =
+            lookup_authorized_proxy_live(context, &self.proxy_lookup, inputs.target_address)
+        else {
             tracing::trace!(addr = %inputs.target_address, "inspector: not a proxy");
             return None;
         };
@@ -310,7 +350,7 @@ where
         let req = eez_protocol::ExecutionRequest {
             call_mode: CallMode::Mutable,
             target_address: info.original_address,
-            data: calldata.clone(),
+            data: calldata,
             value: call_value,
             source_address: inputs.caller,
             source_rollup_id: self.caller_rollup_id,
@@ -320,60 +360,9 @@ where
         // Snapshot this rollup's in-flight cache before dispatch. If the
         // downstream call re-enters this rollup, the new session preloads the
         // snapshot and publishes its updated cache for this frame to apply.
-        let before_snapshot;
-        {
-            // revm keeps mid-transaction writes in its journal, while loaded
-            // cache entries can still contain their pre-write values. Refresh
-            // every loaded account and slot through `Host` before sharing the
-            // cache. An `SSTORE` first loads its slot, so the cache already
-            // identifies every storage key that needs refreshing.
-            let mut cache = context.db_mut().cache.clone();
-            // Collect keys before mutating the cloned cache with refreshed
-            // values.
-            let mut slots_to_refresh: Vec<(Address, alloy_primitives::U256)> = Vec::new();
-            let mut addrs_to_refresh: Vec<Address> = Vec::new();
-            for (addr, acc) in &cache.accounts {
-                addrs_to_refresh.push(*addr);
-                if let Some(plain) = acc.account.as_ref() {
-                    for slot in plain.storage.keys() {
-                        slots_to_refresh.push((*addr, *slot));
-                    }
-                }
-            }
-            // Read live storage values through the journal-aware host.
-            let mut live_storage: Vec<(Address, alloy_primitives::U256, alloy_primitives::U256)> =
-                Vec::with_capacity(slots_to_refresh.len());
-            for (addr, slot) in slots_to_refresh {
-                if let Some(load) = context.sload(addr, slot) {
-                    live_storage.push((addr, slot, load.data));
-                }
-            }
-            // Read live balances and nonces through the host.
-            let mut live_account_info: Vec<(Address, alloy_primitives::U256, u64)> =
-                Vec::with_capacity(addrs_to_refresh.len());
-            for addr in addrs_to_refresh {
-                if let Ok(info) = context.load_account_info_skip_cold_load(addr, false, true) {
-                    live_account_info.push((addr, info.balance, info.nonce));
-                }
-            }
-            for (addr, slot, value) in live_storage {
-                if let Some(acc) = cache.accounts.get_mut(&addr)
-                    && let Some(plain) = acc.account.as_mut()
-                {
-                    plain.storage.insert(slot, value);
-                }
-            }
-            for (addr, balance, nonce) in live_account_info {
-                if let Some(acc) = cache.accounts.get_mut(&addr)
-                    && let Some(plain) = acc.account.as_mut()
-                {
-                    plain.info.balance = balance;
-                    plain.info.nonce = nonce;
-                }
-            }
-            before_snapshot = cache.clone();
-            self.overlay_channel.push_pre_snapshot(cache);
-        }
+        let before_snapshot = live_cache_snapshot(context);
+        self.overlay_channel
+            .push_pre_snapshot(before_snapshot.clone());
         let sim = self.dispatcher.dispatch_call(info.original_rollup_id, req);
         // A downstream session that re-entered this rollup publishes its
         // post-execution cache on the same channel. Apply that diff before
@@ -409,7 +398,7 @@ where
             caller = %inputs.caller,
             proxy = %inputs.target_address,
             depth = context.journal_ref().depth(),
-            calldata_len = calldata.len(),
+            calldata_len,
             value = %call_value,
             target_result = if success { "ok" } else { "REVERT" },
             target_gas = sim.gas_used().unwrap_or(0),
@@ -476,6 +465,13 @@ mod tests {
     const DESTINATION_ADDR: Address = address!("0x3333333333333333333333333333333333333333");
     const TARGET_ROLLUP: u64 = 42;
 
+    fn lookup(contract_address: Address, authorized_proxies_slot: u8) -> ProxyLookupConfig {
+        ProxyLookupConfig {
+            contract_address,
+            authorized_proxies_slot,
+        }
+    }
+
     fn packed_proxy_value(destination: Address, rollup_id: u64) -> U256 {
         let mut word = [0u8; 32];
         word[3..11].copy_from_slice(&rollup_id.to_be_bytes());
@@ -504,8 +500,7 @@ mod tests {
 
         let info = lookup_authorized_proxy_live(
             &mut ctx,
-            EEZ_ADDRESS,
-            EEZ_AUTHORIZED_PROXIES_SLOT,
+            &lookup(EEZ_ADDRESS, EEZ_AUTHORIZED_PROXIES_SLOT),
             PROXY_ADDR,
         );
         assert!(info.is_none());
@@ -528,8 +523,7 @@ mod tests {
 
         let info = lookup_authorized_proxy_live(
             &mut ctx,
-            EEZ_ADDRESS,
-            EEZ_AUTHORIZED_PROXIES_SLOT,
+            &lookup(EEZ_ADDRESS, EEZ_AUTHORIZED_PROXIES_SLOT),
             PROXY_ADDR,
         )
         .expect("proxy present in DB");
@@ -553,8 +547,7 @@ mod tests {
 
         let info = lookup_authorized_proxy_live(
             &mut ctx,
-            EEZ_ADDRESS,
-            EEZ_AUTHORIZED_PROXIES_SLOT,
+            &lookup(EEZ_ADDRESS, EEZ_AUTHORIZED_PROXIES_SLOT),
             PROXY_ADDR,
         )
         .expect("journal must expose in-tx writes to the inspector");
@@ -587,7 +580,8 @@ mod tests {
             .load_account(EEZ_ADDRESS)
             .expect("load EEZ account");
 
-        let info = lookup_authorized_proxy_live(&mut ctx, EEZ_ADDRESS, wrong_slot, PROXY_ADDR);
+        let info =
+            lookup_authorized_proxy_live(&mut ctx, &lookup(EEZ_ADDRESS, wrong_slot), PROXY_ADDR);
         assert!(
             info.is_none(),
             "reading with the wrong slot must miss, not silently decode garbage"
@@ -640,13 +634,8 @@ mod tests {
             .load_account(config.contract_address)
             .expect("load");
 
-        let info = lookup_authorized_proxy_live(
-            &mut ctx,
-            config.contract_address,
-            config.authorized_proxies_slot,
-            PROXY_ADDR,
-        )
-        .expect("EEZ config path must find proxy");
+        let info = lookup_authorized_proxy_live(&mut ctx, &config, PROXY_ADDR)
+            .expect("EEZ config path must find proxy");
         assert_eq!(info.original_rollup_id, RollupId(TARGET_ROLLUP));
         assert_eq!(info.original_address, DESTINATION_ADDR);
     }
@@ -673,13 +662,8 @@ mod tests {
             .load_account(config.contract_address)
             .expect("load");
 
-        let info = lookup_authorized_proxy_live(
-            &mut ctx,
-            config.contract_address,
-            config.authorized_proxies_slot,
-            PROXY_ADDR,
-        )
-        .expect("EEZL2 config path must find proxy");
+        let info = lookup_authorized_proxy_live(&mut ctx, &config, PROXY_ADDR)
+            .expect("EEZL2 config path must find proxy");
         assert_eq!(info.original_rollup_id, RollupId(TARGET_ROLLUP));
         assert_eq!(info.original_address, DESTINATION_ADDR);
     }
