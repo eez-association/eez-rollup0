@@ -27,4 +27,4 @@ pub use inspector::{
     OverlayChannel, OverlayChannelHandle, SessionInspector, SessionInspectorFactory,
     new_overlay_channel,
 };
-pub use overlay::{OverlayError, apply_overlay_diff, clone_state};
+pub use overlay::{OverlayError, apply_overlay_diff};

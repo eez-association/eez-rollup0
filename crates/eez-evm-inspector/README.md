@@ -15,8 +15,8 @@ shared overlay channel.
   chain.
 - `OverlayChannel`, `OverlayChannelHandle`, and `new_overlay_channel` coordinate
   nested execution against the entry chain's in-progress state.
-- `apply_overlay_diff`, `clone_state`, and `OverlayError` provide the state
-  overlay primitives.
+- `apply_overlay_diff` and `OverlayError` provide the state overlay
+  primitives.
 
 Composition orchestration, protocol types, and errors remain in
 [`eez-protocol`](../eez-protocol/); this crate does not re-export them or define

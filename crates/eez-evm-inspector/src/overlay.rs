@@ -39,7 +39,7 @@
 
 use revm::context_interface::journaled_state::account::JournaledAccountTr;
 use revm::context_interface::{ContextTr, Host, JournalTr};
-use revm::database::{AccountStatus, CacheState, State, states::CacheAccount};
+use revm::database::{AccountStatus, CacheState, states::CacheAccount};
 use revm::primitives::Address;
 
 // Note on trait choice:
@@ -61,34 +61,6 @@ use revm::primitives::Address;
 //
 // Balance writes go through `JournaledAccountTr::set_balance` —
 // `Host` exposes `balance(addr)` for reads but no public setter.
-
-/// Field-by-field clone of revm [`State<DB>`].
-///
-/// Constructs the struct literally so any field addition in a future
-/// revm version causes a compile error here (and the matching
-/// `clone_state_field_parity` regression test catches drift in
-/// existing fields). All seven fields are `pub` and individually
-/// `Clone` when `DB: Clone`.
-///
-/// Retained as a primitive even though the live overlay path uses
-/// `with_cached_prestate` instead. The field-parity test is the
-/// canonical drift guard against revm version bumps.
-///
-/// # Errors
-///
-/// Infallible.
-#[must_use]
-pub fn clone_state<DB: Clone>(src: &State<DB>) -> State<DB> {
-    State {
-        cache: src.cache.clone(),
-        database: src.database.clone(),
-        transition_state: src.transition_state.clone(),
-        bundle_state: src.bundle_state.clone(),
-        use_preloaded_bundle: src.use_preloaded_bundle,
-        block_hashes: src.block_hashes.clone(),
-        bal_state: src.bal_state.clone(),
-    }
-}
 
 /// Errors surfaced by the overlay diff-apply path.
 ///
@@ -295,7 +267,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use revm::database::EmptyDB;
+    use revm::database::{EmptyDB, State};
+
+    /// Field-by-field clone of revm [`State<DB>`], constructed literally so a
+    /// field addition in a future revm version breaks this test's compile —
+    /// the drift guard for the cache-sharing assumptions in the live overlay
+    /// path (`with_cached_prestate`).
+    fn clone_state<DB: Clone>(src: &State<DB>) -> State<DB> {
+        State {
+            cache: src.cache.clone(),
+            database: src.database.clone(),
+            transition_state: src.transition_state.clone(),
+            bundle_state: src.bundle_state.clone(),
+            use_preloaded_bundle: src.use_preloaded_bundle,
+            block_hashes: src.block_hashes.clone(),
+            bal_state: src.bal_state.clone(),
+        }
+    }
 
     /// Regression: `clone_state` must produce a struct literally
     /// equivalent to the source. Any divergence (a field accidentally
