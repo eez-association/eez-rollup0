@@ -172,7 +172,7 @@ pub struct SessionInspector<'a> {
     /// First target execution error, if any.
     error: Option<ExecutorError>,
     /// Per-rollup cache channel for nested re-entry.
-    overlay_channel: Option<OverlayChannelHandle>,
+    overlay_channel: OverlayChannelHandle,
     /// Per-EVM-frame snapshot of the dispatcher's recorded-call count
     /// at the entry of `Inspector::call`. On `Inspector::call_end`,
     /// the popped value pairs with the current count to bracket the
@@ -190,15 +190,14 @@ impl std::fmt::Debug for SessionInspector<'_> {
             .field("proxy_lookup", &self.proxy_lookup)
             .field("caller_rollup_id", &self.caller_rollup_id)
             .field("has_error", &self.error.is_some())
-            .field("has_overlay_channel", &self.overlay_channel.is_some())
             .finish_non_exhaustive()
     }
 }
 
 /// Shared construction surface for [`SessionInspector`] instances.
 ///
-/// Holds the per-chain proxy lookup, caller rollup id, and optional overlay
-/// channel shared by source and target-session inspectors.
+/// Holds the per-chain proxy lookup, caller rollup id, and overlay channel
+/// shared by source and target-session inspectors.
 ///
 /// Each call site produces an inspector via [`build`](Self::build).
 #[derive(Debug, Clone)]
@@ -209,44 +208,24 @@ pub struct SessionInspectorFactory {
     /// built from this factory.
     caller_rollup_id: RollupId,
     /// Per-rollup channel for propagating state through recursive re-entry.
-    overlay_channel: Option<OverlayChannelHandle>,
+    /// Source and target-session inspectors use the channel belonging to the
+    /// rollup whose EVM state they inspect.
+    overlay_channel: OverlayChannelHandle,
 }
 
 impl SessionInspectorFactory {
     /// Create a factory pinned to one chain's configuration.
-    ///
-    /// The caller may install an overlay channel with
-    /// [`with_overlay_channel`](Self::with_overlay_channel).
     #[must_use]
-    pub fn new(proxy_lookup: ProxyLookupConfig, caller_rollup_id: RollupId) -> Self {
+    pub fn new(
+        proxy_lookup: ProxyLookupConfig,
+        caller_rollup_id: RollupId,
+        overlay_channel: OverlayChannelHandle,
+    ) -> Self {
         Self {
             proxy_lookup,
             caller_rollup_id,
-            overlay_channel: None,
+            overlay_channel,
         }
-    }
-
-    /// Install the overlay channel used by the shared-source-state
-    /// overlay path.
-    ///
-    /// Source and target-session inspectors use the channel belonging to the
-    /// rollup whose EVM state they inspect.
-    #[must_use]
-    pub fn with_overlay_channel(mut self, channel: OverlayChannelHandle) -> Self {
-        self.overlay_channel = Some(channel);
-        self
-    }
-
-    /// Configuration this factory was built with.
-    #[must_use]
-    pub fn proxy_lookup(&self) -> &ProxyLookupConfig {
-        &self.proxy_lookup
-    }
-
-    /// Source rollup ID written into requests by every built inspector.
-    #[must_use]
-    pub fn caller_rollup_id(&self) -> RollupId {
-        self.caller_rollup_id
     }
 
     /// Build an inspector for source simulation or a target session.
@@ -254,35 +233,18 @@ impl SessionInspectorFactory {
     /// Calls are opened before target execution, so nested dispatches are
     /// recorded as preorder children of their outer call.
     pub fn build<'a>(&self, dispatcher: &'a mut CompositionBuilder) -> SessionInspector<'a> {
-        let mut insp =
-            SessionInspector::new(self.proxy_lookup.clone(), dispatcher, self.caller_rollup_id);
-        insp.overlay_channel = self.overlay_channel.clone();
-        insp
-    }
-}
-
-impl<'a> SessionInspector<'a> {
-    /// Create an inspector that routes detected calls through `dispatcher`.
-    ///
-    /// - `proxy_lookup`: the (contract, slot) pair used to read
-    ///   `authorizedProxies` from the chain-local manager.
-    /// - `dispatcher`: dispatch surface for detected calls.
-    /// - `caller_rollup_id`: source rollup ID stored in each dispatched request.
-    pub fn new(
-        proxy_lookup: ProxyLookupConfig,
-        dispatcher: &'a mut CompositionBuilder,
-        caller_rollup_id: RollupId,
-    ) -> Self {
-        Self {
-            proxy_lookup,
+        SessionInspector {
+            proxy_lookup: self.proxy_lookup.clone(),
             dispatcher,
-            caller_rollup_id,
+            caller_rollup_id: self.caller_rollup_id,
             error: None,
-            overlay_channel: None,
+            overlay_channel: self.overlay_channel.clone(),
             frame_starts: Vec::new(),
         }
     }
+}
 
+impl SessionInspector<'_> {
     /// Take the recorded error, if any.
     pub fn take_error(&mut self) -> Option<ExecutorError> {
         self.error.take()
@@ -358,9 +320,8 @@ where
         // Snapshot this rollup's in-flight cache before dispatch. If the
         // downstream call re-enters this rollup, the new session preloads the
         // snapshot and publishes its updated cache for this frame to apply.
-        let overlay_active = self.overlay_channel.is_some();
-        let mut before_snapshot: Option<CacheState> = None;
-        if overlay_active {
+        let before_snapshot;
+        {
             // revm keeps mid-transaction writes in its journal, while loaded
             // cache entries can still contain their pre-write values. Refresh
             // every loaded account and slot through `Host` before sharing the
@@ -410,31 +371,21 @@ where
                     plain.info.nonce = nonce;
                 }
             }
-            before_snapshot = Some(cache.clone());
-            if let Some(channel) = &self.overlay_channel {
-                channel.push_pre_snapshot(cache);
-            }
+            before_snapshot = cache.clone();
+            self.overlay_channel.push_pre_snapshot(cache);
         }
         let sim = self.dispatcher.dispatch_call(info.original_rollup_id, req);
         // A downstream session that re-entered this rollup publishes its
         // post-execution cache on the same channel. Apply that diff before
         // this EVM frame continues.
-        if overlay_active {
-            let after_opt = self
-                .overlay_channel
-                .as_ref()
-                .and_then(|c| c.pop_post_cache());
-            if let (Some(before), Some(after)) = (before_snapshot.as_ref(), after_opt.as_ref())
-                && let Err(e) = crate::overlay::apply_overlay_diff(context, before, after)
-            {
-                self.record_error(ExecutorError::evm(format!(
-                    "overlay diff-apply failed: {e}"
-                )));
-            }
-            if let Some(channel) = &self.overlay_channel {
-                channel.pop_pre_snapshot();
-            }
+        if let Some(after) = self.overlay_channel.pop_post_cache()
+            && let Err(e) = crate::overlay::apply_overlay_diff(context, &before_snapshot, &after)
+        {
+            self.record_error(ExecutorError::evm(format!(
+                "overlay diff-apply failed: {e}"
+            )));
         }
+        self.overlay_channel.pop_pre_snapshot();
         let sim = match sim {
             Ok(response) => response,
             Err(e) => {

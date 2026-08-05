@@ -56,7 +56,7 @@ pub struct LocalExecutionSession {
     inspector_factory: Option<SessionInspectorFactory>,
     /// Optional cache channel for propagating state through re-entry. `None`
     /// disables cache propagation for this session.
-    overlay_channel: Option<OverlayChannelHandle>,
+    overlay_channel: OverlayChannelHandle,
 }
 
 impl std::fmt::Debug for LocalExecutionSession {
@@ -91,7 +91,7 @@ impl LocalExecutionSession {
         manager_address: Address,
         inspector_factory: Option<SessionInspectorFactory>,
         cache: Option<CacheState>,
-        overlay_channel: Option<OverlayChannelHandle>,
+        overlay_channel: OverlayChannelHandle,
     ) -> ExecutorResult<Self> {
         let num = provider
             .provider
@@ -273,9 +273,8 @@ impl LocalExecutionSession {
         // Publish the cumulative post-execute cache. An inspector waiting on
         // the same channel can pop and apply it after nested dispatch; the
         // stack preserves LIFO order for recursive re-entry.
-        if let Some(channel) = &self.overlay_channel {
-            channel.push_post_cache(self.state.cache.clone());
-        }
+        self.overlay_channel
+            .push_post_cache(self.state.cache.clone());
 
         tracing::debug!(
             success = success,

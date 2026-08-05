@@ -67,7 +67,7 @@ pub struct LocalChainClient {
     dialect: eez_protocol::ChainDialect,
     /// Bidirectional cache channel used to propagate in-flight state through
     /// nested dispatches that re-enter this rollup.
-    overlay_channel: Option<OverlayChannelHandle>,
+    overlay_channel: OverlayChannelHandle,
 }
 
 impl std::fmt::Debug for LocalChainClient {
@@ -122,7 +122,7 @@ impl LocalChainClient {
             rollup_id,
             role: Role::Entry { dispatch_address },
             dialect,
-            overlay_channel: Some(new_overlay_channel()),
+            overlay_channel: new_overlay_channel(),
         })
     }
 
@@ -149,7 +149,7 @@ impl LocalChainClient {
             rollup_id,
             role: Role::Follower { dispatch_address },
             dialect,
-            overlay_channel: Some(new_overlay_channel()),
+            overlay_channel: new_overlay_channel(),
         })
     }
 
@@ -175,16 +175,13 @@ impl ChainClient for LocalChainClient {
         // Inspect every target session because nested proxy calls may dispatch
         // again. The inspector exchanges cache snapshots through this client's
         // configured channel.
-        let mut factory = SessionInspectorFactory::new(self.proxy_lookup_config(), self.rollup_id);
-        if let Some(channel) = &self.overlay_channel {
-            factory = factory.with_overlay_channel(Arc::clone(channel));
-        }
-        let inspector_factory = Some(factory);
+        let inspector_factory = Some(SessionInspectorFactory::new(
+            self.proxy_lookup_config(),
+            self.rollup_id,
+            Arc::clone(&self.overlay_channel),
+        ));
         // Preload the top cache snapshot when one is available.
-        let preloaded_cache = self
-            .overlay_channel
-            .as_ref()
-            .and_then(|c| c.peek_pre_snapshot());
+        let preloaded_cache = self.overlay_channel.peek_pre_snapshot();
         let manager_address = self.role.dispatch_address();
         let session = LocalExecutionSession::new(
             &self.provider,
@@ -277,10 +274,11 @@ impl ChainClient for LocalChainClient {
         // The source-simulation inspector dispatches every detected proxy CALL
         // through the composition builder, which records calls in preorder.
         // Attach the cache channel around each downstream dispatch.
-        let mut factory = SessionInspectorFactory::new(self.proxy_lookup_config(), self.rollup_id);
-        if let Some(channel) = &self.overlay_channel {
-            factory = factory.with_overlay_channel(Arc::clone(channel));
-        }
+        let factory = SessionInspectorFactory::new(
+            self.proxy_lookup_config(),
+            self.rollup_id,
+            Arc::clone(&self.overlay_channel),
+        );
         let inspector = factory.build(dispatcher);
         let mut evm = self
             .provider
