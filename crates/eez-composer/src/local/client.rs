@@ -293,8 +293,6 @@ impl ChainClient for LocalChainClient {
                 (0, false)
             }
         };
-        let proxy_lookups = evm.inspector().proxy_lookups();
-
         let inspector_error = evm.inspector_mut().take_error();
         drop(evm);
         let sim_us = t_sim.elapsed().as_micros();
@@ -303,12 +301,7 @@ impl ChainClient for LocalChainClient {
             return Err(err);
         }
 
-        tracing::info!(
-            gas_used,
-            success,
-            proxy_lookups,
-            "source simulation complete"
-        );
+        tracing::info!(gas_used, success, "source simulation complete");
 
         let total_us = t_total.elapsed().as_micros();
         tracing::debug!(

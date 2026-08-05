@@ -172,7 +172,6 @@ pub struct SessionInspector<'a> {
     /// First target execution error, if any.
     error: Option<ExecutorError>,
     call_depth: usize,
-    proxy_lookups: usize,
     /// Per-rollup cache channel for nested re-entry.
     overlay_channel: Option<OverlayChannelHandle>,
     /// Per-EVM-frame snapshot of the dispatcher's recorded-call count
@@ -192,7 +191,6 @@ impl std::fmt::Debug for SessionInspector<'_> {
             .field("proxy_lookup", &self.proxy_lookup)
             .field("caller_rollup_id", &self.caller_rollup_id)
             .field("call_depth", &self.call_depth)
-            .field("proxy_lookups", &self.proxy_lookups)
             .field("has_error", &self.error.is_some())
             .field("has_overlay_channel", &self.overlay_channel.is_some())
             .finish_non_exhaustive()
@@ -283,16 +281,9 @@ impl<'a> SessionInspector<'a> {
             caller_rollup_id,
             error: None,
             call_depth: 0,
-            proxy_lookups: 0,
             overlay_channel: None,
             frame_starts: Vec::new(),
         }
-    }
-
-    /// Number of proxy lookups performed during this EVM pass.
-    #[must_use]
-    pub fn proxy_lookups(&self) -> usize {
-        self.proxy_lookups
     }
 
     /// Take the recorded error, if any.
@@ -346,7 +337,6 @@ where
 
         // Look up `authorizedProxies[target_address]` on the configured
         // contract via the live EVM state. Sees in-tx / in-block writes.
-        self.proxy_lookups += 1;
         let Some(info) = lookup_authorized_proxy_live(
             context,
             self.proxy_lookup.contract_address,
