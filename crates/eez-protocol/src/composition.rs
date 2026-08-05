@@ -70,9 +70,22 @@ use crate::types::{
     Composition, ExecutedAction, ExecutionOutcome, SourceComposition, TargetComposition,
 };
 
-use crate::composer::TargetConfig;
+use crate::authorized_proxies::ProxyLookupConfig;
+use crate::dialect::ChainDialect;
 
 // ── Rollup ───────────────────────────────────────────────────────
+
+/// Per-rollup static configuration.
+///
+/// Holds the proxy lookup for one rollup (entry or follower). Passed to the
+/// runtime composer's rollup-registration paths alongside the client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetConfig {
+    /// Proxy-lookup configuration for this rollup.
+    pub proxy_lookup: ProxyLookupConfig,
+    /// Contract dialect used for proxy lookup and target-batch construction.
+    pub dialect: ChainDialect,
+}
 
 /// Per-rollup state held inside a [`CompositionBuilder`] during one
 /// composition.
@@ -587,8 +600,6 @@ impl CompositionBuilder {
 mod tests {
     use super::*;
     use crate::action::{CallHashInput, CallMode, common_cross_chain_call_hash};
-    use crate::composer::ProxyLookupConfig;
-    use crate::dialect::ChainDialect;
     use alloy_primitives::{Address, Bytes, U256, b256, keccak256};
     use alloy_sol_types::SolValue as _;
 
