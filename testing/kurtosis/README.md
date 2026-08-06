@@ -35,7 +35,7 @@ Ubuntu runner. It installs and starts Kurtosis, uploads
 ## Run on a CI-equivalent host
 
 The host needs Docker, Kurtosis, Foundry, `jq`, `curl`, `openssl`, and the
-initialized `sync-rollups-protocol` submodule.
+initialized `eez-core-protocol` submodule.
 
 ```bash
 bash testing/kurtosis/run-ci.sh

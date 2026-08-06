@@ -1,4 +1,4 @@
-//! Solidity ABI types for the pinned `sync-rollups-protocol` contracts.
+//! Solidity ABI types for the pinned `eez-core-protocol` contracts.
 //!
 //! The L1 types mirror `IEEZ.sol`; the separate L2 family mirrors
 //! `IEEZL2.sol`. Field order and integer widths are part of the wire ABI.
@@ -211,7 +211,7 @@ sol! {
 
 #[cfg(test)]
 mod selector_locks {
-    //! ABI pins from `sync-rollups-protocol` commit 6fcc90b.
+    //! ABI pins from `eez-core-protocol` commit 6fcc90b.
     use super::*;
     use alloy_sol_types::SolCall;
 

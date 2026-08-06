@@ -23,7 +23,7 @@
 # Reads the composer log via `docker logs $NODE_CONTAINER` (the node runs
 # in a container now), not an on-disk file.
 #
-# Prereqs on the host: cast, forge, jq, docker; the sync-rollups-protocol
+# Prereqs on the host: cast, forge, jq, docker; the eez-core-protocol
 # submodule initialised (forge compiles contracts/ + lib).
 
 set -euo pipefail

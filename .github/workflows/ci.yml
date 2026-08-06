@@ -79,7 +79,7 @@ jobs:
         working-directory: contracts
         run: forge test
       - name: Test canonical CREATE2 proxy derivation
-        working-directory: sync-rollups-protocol
+        working-directory: eez-core-protocol
         run: |
           forge test --match-path test/EEZ.t.sol --match-test test_ComputeCrossChainProxyAddress
           forge test --match-path test/EEZL2.t.sol --match-test test_ComputeCrossChainProxyAddress_MatchesActual
