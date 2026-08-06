@@ -295,7 +295,7 @@ pub fn build_cross_chain_sync_pairs(
         if entry.l2ToL1Calls.len() > 1 {
             return Err(format!(
                 "N>=2 multi-call {dir} entry not yet supported \
-                 (l2ToL1Calls={}); see docs/multicall-design.md",
+                 (l2ToL1Calls={});",
                 entry.l2ToL1Calls.len(),
             ));
         }
