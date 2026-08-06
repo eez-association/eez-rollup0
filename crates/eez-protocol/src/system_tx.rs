@@ -295,7 +295,7 @@ pub fn build_cross_chain_sync_pairs(
         if entry.l2ToL1Calls.len() > 1 {
             return Err(format!(
                 "N>=2 multi-call {dir} entry not yet supported \
-                 (l2ToL1Calls={});",
+                 (l2ToL1Calls={})",
                 entry.l2ToL1Calls.len(),
             ));
         }
@@ -548,8 +548,8 @@ mod tests {
     /// N>=2 multi-call is rejected LOUD, not silently truncated. An entry with
     /// Two `l2ToL1Calls` would lower to only call[0] today (the
     /// outbound `.first()` + build_inbound_system_txs read only [0]); the guard
-    /// turns that root-diverging footgun into a clear error pointing at the
-    /// parked design (docs/multicall-design.md).
+    /// turns that root-diverging footgun into a clear error naming the
+    /// offending call count.
     #[test]
     fn cross_chain_sync_pairs_rejects_multicall_entries() {
         let cfg = ctx();
@@ -563,8 +563,8 @@ mod tests {
             .expect_err("N>=2 outbound must be rejected, not silently truncated");
         assert!(err.contains("multi-call outbound"), "err: {err}");
         assert!(
-            err.contains("multicall-design.md"),
-            "error must point at the design doc: {err}",
+            err.contains("l2ToL1Calls=2"),
+            "error must name the offending call count: {err}",
         );
 
         // Inbound entry with two calls → rejected.
