@@ -40,7 +40,6 @@ reth-payload-primitives.workspace         = true
 reth-primitives-traits.workspace          = true
 reth-revm.workspace                       = true
 reth-storage-api.workspace                = true
-reth-trie-common.workspace                = true
 
 # revm direct (overlay-channel paths in local/session.rs)
 revm.workspace = true

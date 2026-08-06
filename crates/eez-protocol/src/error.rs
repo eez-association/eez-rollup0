@@ -1,12 +1,10 @@
 //! Typed errors for protocol materialization, target execution, composition,
 //! and runtime composition orchestration.
 //!
-//! Public wrapper structs capture backtraces and expose non-exhaustive kind
-//! enums through `kind()`. [`ComposerError`] flattens the intermediate
+//! Public wrapper structs expose non-exhaustive kind enums through `kind()`.
+//! [`ComposerError`] flattens the intermediate
 //! [`CompositionError`] layer while preserving the originating protocol or
 //! executor error.
-
-use std::backtrace::Backtrace;
 
 /// Boxed source error used by provider-specific variants without exposing
 /// their concrete error types.
@@ -18,11 +16,10 @@ use std::backtrace::Backtrace;
 /// internally.
 pub(crate) type BoxedError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Generate the struct-layer boilerplate for an error type that wraps
-/// a `*Kind` enum plus a [`Backtrace`]. Emits the struct, its
-/// `kind()`/`backtrace()` accessors, `Display`, `Error::source`
-/// forwarding, and `From<*Kind>`. The corresponding `*Kind` enum is
-/// declared separately and carries the actual variants + thiserror.
+/// Generate the struct-layer boilerplate for an error type that wraps a
+/// `*Kind` enum. Emits the struct, its `kind()` accessor, `Display`,
+/// `Error::source` forwarding, and `From<*Kind>`. The corresponding `*Kind`
+/// enum is declared separately and carries the actual variants + thiserror.
 macro_rules! error_struct {
     (
         $(#[$meta:meta])*
@@ -31,7 +28,6 @@ macro_rules! error_struct {
         $(#[$meta])*
         $vis struct $name {
             kind: $kind,
-            bt: Backtrace,
         }
 
         impl $name {
@@ -39,10 +35,6 @@ macro_rules! error_struct {
             #[must_use]
             pub fn kind(&self) -> &$kind {
                 &self.kind
-            }
-            /// Backtrace captured at the construction site.
-            pub fn backtrace(&self) -> &Backtrace {
-                &self.bt
             }
         }
 
@@ -60,7 +52,7 @@ macro_rules! error_struct {
 
         impl From<$kind> for $name {
             fn from(kind: $kind) -> Self {
-                Self { kind, bt: Backtrace::capture() }
+                Self { kind }
             }
         }
     };
@@ -71,7 +63,7 @@ macro_rules! error_struct {
 error_struct! {
     /// Errors from pure protocol logic.
     ///
-    /// Wraps a [`ProtocolErrorKind`] plus a captured backtrace.
+    /// Wraps a [`ProtocolErrorKind`].
     #[derive(Debug)]
     pub struct ProtocolError wraps ProtocolErrorKind;
 }
@@ -107,7 +99,7 @@ pub type ProtocolResult<T> = Result<T, ProtocolError>;
 error_struct! {
     /// Errors from target-chain client/session implementations.
     ///
-    /// Wraps an [`ExecutorErrorKind`] plus a captured backtrace.
+    /// Wraps an [`ExecutorErrorKind`].
     #[derive(Debug)]
     pub struct ExecutorError wraps ExecutorErrorKind;
 }
@@ -235,7 +227,7 @@ impl From<ExecutorError> for ComposerError {
 impl From<CompositionError> for ComposerError {
     fn from(e: CompositionError) -> Self {
         // Flatten the intermediate kind while preserving the originating
-        // protocol or executor error and its backtrace.
+        // protocol or executor error.
         match e.kind {
             CompositionErrorKind::Protocol(p) => ComposerErrorKind::Protocol(p).into(),
             CompositionErrorKind::Executor(ex) => ComposerErrorKind::Executor(ex).into(),

@@ -5,17 +5,15 @@
 //! destination contract with the proxy address as `msg.sender`
 //! (CREATE2-derived).
 //!
-//! Also hosts the reth helpers
-//! ([`disable_checks`], [`compute_state_root`]).
+//! Also hosts the reth helper [`disable_checks`].
 
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, Bytes, U256};
 
 use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory};
 use reth_evm::{ConfigureEvm, Evm as _};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_revm::{database::StateProviderDatabase, db::State};
-use reth_storage_api::{BlockNumReader, StateProvider, StateProviderFactory};
-use reth_trie_common::{HashedPostState, KeccakKeyHasher};
+use reth_storage_api::{BlockNumReader, StateProviderFactory};
 use revm::DatabaseCommit;
 use revm::database::CacheState;
 
@@ -47,22 +45,18 @@ pub struct LocalExecutionSession {
     evm_config: EthEvmConfig,
     state: State<StateProviderDatabase<reth_storage_api::StateProviderBox>>,
     evm_env: reth_evm::EvmEnvFor<EthEvmConfig>,
-    state_provider: reth_storage_api::StateProviderBox,
-    current_root: B256,
     chain_id: u64,
     manager_address: Address,
     /// Optional factory for inspecting nested proxy calls. `None` disables
     /// nested-call detection for this session.
     inspector_factory: Option<SessionInspectorFactory>,
-    /// Optional cache channel for propagating state through re-entry. `None`
-    /// disables cache propagation for this session.
-    overlay_channel: Option<OverlayChannelHandle>,
+    /// This rollup's cache channel for propagating state through re-entry.
+    overlay_channel: OverlayChannelHandle,
 }
 
 impl std::fmt::Debug for LocalExecutionSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LocalExecutionSession")
-            .field("current_root", &self.current_root)
             .field("chain_id", &self.chain_id)
             .field("manager_address", &self.manager_address)
             .field("has_inspector_factory", &self.inspector_factory.is_some())
@@ -91,7 +85,7 @@ impl LocalExecutionSession {
         manager_address: Address,
         inspector_factory: Option<SessionInspectorFactory>,
         cache: Option<CacheState>,
-        overlay_channel: Option<OverlayChannelHandle>,
+        overlay_channel: OverlayChannelHandle,
     ) -> ExecutorResult<Self> {
         let num = provider
             .provider
@@ -104,15 +98,13 @@ impl LocalExecutionSession {
             .header_by_number(num)
             .map_err(provider_err)?
             .ok_or_else(|| ExecutorError::from(ExecutorErrorKind::Missing("target header")))?;
-        let current_root = header.state_root;
         tracing::debug!(
             block = num,
-            state_root = %current_root,
+            state_root = %header.state_root,
             "target session: opened header"
         );
 
         let state_prov = provider.provider.latest().map_err(provider_err)?;
-        let root_prov = provider.provider.latest().map_err(provider_err)?;
 
         let mut evm_env = provider.evm_config.evm_env(&header).map_err(evm_err)?;
         let chain_id = evm_env.cfg_env.chain_id;
@@ -129,7 +121,6 @@ impl LocalExecutionSession {
             block = num,
             chain_id,
             %manager_address,
-            %current_root,
             "target session: ready"
         );
 
@@ -137,8 +128,6 @@ impl LocalExecutionSession {
             evm_config: provider.evm_config.clone(),
             state,
             evm_env,
-            state_provider: root_prov,
-            current_root,
             chain_id,
             manager_address,
             inspector_factory,
@@ -197,7 +186,6 @@ impl LocalExecutionSession {
     ) -> ExecutorResult<eez_protocol::ExecutionOutcome> {
         let tx_env = self.build_tx_env(destination, calldata, value, source_address, source_rollup);
         let caller = tx_env.caller;
-        let pre_root = self.current_root;
         let (return_data, gas_used, success, mut changes) = {
             let mut evm = self
                 .evm_config
@@ -211,7 +199,7 @@ impl LocalExecutionSession {
             )
         };
         restore_caller_nonce(&mut changes, caller);
-        self.commit_and_finish(pre_root, return_data, gas_used, success, changes)
+        Ok(self.commit_and_finish(return_data, gas_used, success, changes))
     }
 
     /// Inspected direct-call path. Runs the target-chain tx under the
@@ -231,7 +219,6 @@ impl LocalExecutionSession {
     ) -> ExecutorResult<eez_protocol::ExecutionOutcome> {
         let tx_env = self.build_tx_env(destination, calldata, value, source_address, source_rollup);
         let caller = tx_env.caller;
-        let pre_root = self.current_root;
         let (return_data, gas_used, success, mut changes, inspector_error) = {
             let mut evm = self.evm_config.evm_with_env_and_inspector(
                 &mut self.state,
@@ -252,44 +239,38 @@ impl LocalExecutionSession {
             return Err(err);
         }
         restore_caller_nonce(&mut changes, caller);
-        self.commit_and_finish(pre_root, return_data, gas_used, success, changes)
+        Ok(self.commit_and_finish(return_data, gas_used, success, changes))
     }
 
-    /// Commit the revm bundle, advance the session root, publish the overlay
-    /// cache, and return the execution outcome.
+    /// Commit the revm bundle, publish the overlay cache, and return the
+    /// execution outcome.
     fn commit_and_finish(
         &mut self,
-        pre_root: B256,
         return_data: Bytes,
         gas_used: u64,
         success: bool,
         changes: revm::primitives::map::AddressHashMap<revm::state::Account>,
-    ) -> ExecutorResult<eez_protocol::ExecutionOutcome> {
+    ) -> eez_protocol::ExecutionOutcome {
         self.state.commit(changes);
-
-        let post_root = compute_state_root(&mut self.state, self.state_provider.as_ref())?;
-        self.current_root = post_root;
 
         // Publish the cumulative post-execute cache. An inspector waiting on
         // the same channel can pop and apply it after nested dispatch; the
         // stack preserves LIFO order for recursive re-entry.
-        if let Some(channel) = &self.overlay_channel {
-            channel.push_post_cache(self.state.cache.clone());
-        }
+        self.overlay_channel
+            .push_post_cache(self.state.cache.clone());
 
         tracing::debug!(
             success = success,
             gas = gas_used,
-            pre = %pre_root,
-            post = %post_root,
             return_len = return_data.len(),
-            "target call completed");
+            "target call completed"
+        );
 
-        Ok(eez_protocol::ExecutionOutcome::Resolved {
+        eez_protocol::ExecutionOutcome::Resolved {
             return_data: return_data.to_vec(),
             gas_used,
             success,
-        })
+        }
     }
 
     /// Build the `TxEnv` for a direct call on the target chain. Shared
@@ -365,18 +346,20 @@ impl TargetExecutionSession for LocalExecutionSession {
     }
 
     fn checkpoint(&mut self) -> ExecutorResult<eez_protocol::SessionSnapshot> {
-        // This snapshot restores only root bookkeeping; it does not restore the
-        // revm state cache or bundle.
-        Ok(Box::new(self.current_root.0) as Box<dyn std::any::Any + Send>)
+        // The snapshot restores no session state: the revm cache and bundle
+        // are not captured (full-snapshot rollback is planned separately).
+        // Annulled-call safety rests on batch materialization rejecting
+        // revert spans, so a composition with rolled-back calls never emits
+        // entries.
+        Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
     }
 
     fn rollback(&mut self, snapshot: eez_protocol::SessionSnapshot) -> ExecutorResult<()> {
-        let root: [u8; 32] = *snapshot.downcast::<[u8; 32]>().map_err(|_e| {
+        snapshot.downcast::<()>().map_err(|_e| {
             ExecutorError::from(ExecutorErrorKind::Encoding(
                 "LocalExecutionSession::rollback: snapshot type mismatch".into(),
             ))
         })?;
-        self.current_root = revm::primitives::B256::from(root);
         Ok(())
     }
 }
@@ -416,15 +399,6 @@ pub(super) fn disable_checks(env: &mut reth_evm::EvmEnvFor<EthEvmConfig>) {
     env.cfg_env.disable_eip3607 = true;
     env.cfg_env.disable_block_gas_limit = true;
     env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
-}
-
-pub(super) fn compute_state_root<DB: StateProvider>(
-    state: &mut State<StateProviderDatabase<DB>>,
-    provider: &dyn StateProvider,
-) -> ExecutorResult<B256> {
-    state.merge_transitions(revm::database::states::bundle_state::BundleRetention::Reverts);
-    let hashed = HashedPostState::from_bundle_state::<KeccakKeyHasher>(state.bundle_state.state());
-    provider.state_root(hashed).map_err(provider_err)
 }
 
 pub(super) fn provider_err(
