@@ -6,28 +6,31 @@
 //! `validate::testing`, and behavior-specific builders stay beside the test
 //! suite that owns them.
 
-use alloy_primitives::{B256, b256};
+use alloy_primitives::{Address, B256, address, b256};
 
-/// Well-known Anvil account #0 key whose address is
-/// `eez_protocol::SYSTEM_ADDRESS`. Test-only and intentionally public.
+/// Deterministic system-transaction identity used only by tests.
+pub(crate) const TEST_SYSTEM_ADDRESS_ARG: &str = "f39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+
+/// Parsed form of [`TEST_SYSTEM_ADDRESS_ARG`] for transaction and policy tests.
+pub(crate) const TEST_SYSTEM_ADDRESS: Address =
+    address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+
+/// Private key for [`TEST_SYSTEM_ADDRESS`]. Test-only and intentionally public.
 pub(crate) const SYSTEM_PRIVATE_KEY: B256 =
     b256!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
 
 /// RLP-encoded legacy transaction with empty calldata, signed with
-/// [`SYSTEM_PRIVATE_KEY`] and addressed to the pinned EEZL2 address. Tests
+/// [`SYSTEM_PRIVATE_KEY`] and addressed to the configured EEZL2 address. Tests
 /// classify it by recovering the sender from these bytes; no signer is
 /// injected.
 pub(crate) const SYSTEM_TX: &str = "f85f8001825208944200000000000000000000000000000000000007808026a0ed95c78ea14cbb6af669c61f27c5fb7fb0192101d4d706d055ab9ff9895c9f66a027c2e67303de8fa1cad36d0e59298a98df684e54295eb5f61ab99609c1738f73";
-/// Like [`SYSTEM_TX`], but its calldata is exactly the inbound
-/// `executeIncomingCrossChainCall` selector.
-pub(crate) const SYSTEM_INBOUND_SELECTOR_TX: &str = "f8648001830186a09442000000000000000000000000000000000000078084eb49424626a07c37f3a2a8fb7f53b2c4da13188c4d03b3b620216c3d25cacd4b374b85955299a016134406df3f67267dacedbfd0bc944c08f1e7d46a1a3ba7260b1cbed42dcb59";
 
 /// Canonical context for reconstructing system transactions in tests; tests
 /// that need a noncanonical variant mutate one field of a fresh copy.
 pub(crate) fn system_transaction_context() -> eez_protocol::system_tx::SystemTxContext {
     eez_protocol::system_tx::SystemTxContext {
         system_signer: SYSTEM_PRIVATE_KEY.to_string().parse().unwrap(),
-        ccm_l2_address: crate::EEZL2_ADDRESS,
+        eezl2_address: crate::EEZL2_ADDRESS,
         l2_chain_id: 1,
         l2_gas_price: 1_000_000_000,
         l2_gas_limit: 2_000_000,

@@ -5,7 +5,7 @@ edition.workspace      = true
 license.workspace      = true
 rust-version.workspace = true
 readme                 = "README.md"
-description            = "EVM composer glue: revm Inspector for proxy-call detection + EVM-bound type aliases for the chain-agnostic Composer"
+description            = "EVM composer glue: revm inspector for proxy-call detection and shared-state overlays"
 
 [lints]
 workspace = true

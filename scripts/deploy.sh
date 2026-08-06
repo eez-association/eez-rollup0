@@ -18,7 +18,12 @@ OUT_FILE="${EEZ_DEPLOYMENTS_FILE:-$REPO/deployments.env}"
 # Timestamp marker — used at the end to find broadcast/ entries produced
 # by *this* run (vs stale ones from prior chain ids or earlier deploys).
 START_MARKER="$(mktemp -t eez-deploy.XXXXXX)"
-trap 'rm -f "$START_MARKER"' EXIT
+GENESIS_TIMESTAMP_TMP=""
+cleanup() {
+    rm -f "$START_MARKER"
+    [[ -z "$GENESIS_TIMESTAMP_TMP" ]] || rm -f "$GENESIS_TIMESTAMP_TMP"
+}
+trap cleanup EXIT
 
 # ── Inputs from .env ──────────────────────────────────────────────────
 [[ -f "$ENV_FILE" ]] || { echo "deploy: $ENV_FILE not found — copy .env.example to .env first" >&2; exit 1; }
@@ -28,16 +33,9 @@ source "$ENV_FILE"
 : "${EEZ_L1_RPC_URL:?EEZ_L1_RPC_URL not set in .env}"
 : "${EEZ_L1_POSTER_KEY:?EEZ_L1_POSTER_KEY not set in .env}"
 : "${EEZ_PROOF_SIGNER_KEY:?EEZ_PROOF_SIGNER_KEY not set in .env}"
+: "${EEZ_L2_SYSTEM_KEY:?EEZ_L2_SYSTEM_KEY not set in .env}"
 
-# L2 genesis state root (must equal reth's genesis root, else the first batch
-# reverts). No default: require it from .env, or derive from EEZ_L2_RPC_URL.
-if [[ -z "${EEZ_INITIAL_STATE_ROOT:-}" && -n "${EEZ_L2_RPC_URL:-}" ]]; then
-    EEZ_INITIAL_STATE_ROOT="$(cast block 0 --rpc-url "$EEZ_L2_RPC_URL" --json 2>/dev/null \
-        | python3 -c 'import sys,json; print(json.load(sys.stdin).get("stateRoot",""))' 2>/dev/null)"
-    [[ -n "$EEZ_INITIAL_STATE_ROOT" ]] \
-        && echo "deploy: derived genesis state root from L2 node $EEZ_L2_RPC_URL"
-fi
-: "${EEZ_INITIAL_STATE_ROOT:?not set — put the L2 genesis state root in .env (cast block 0 <L2-rpc> .stateRoot) or set EEZ_L2_RPC_URL so deploy can derive it}"
+configured_initial_state_root="${EEZ_INITIAL_STATE_ROOT:-}"
 
 # Deploy/own key, decoupled from the composer's poster so posting can't advance
 # the deployer's nonce or shift the CREATE addresses. Defaults to the poster.
@@ -47,11 +45,16 @@ EEZ_DEPLOY_KEY="${EEZ_DEPLOY_KEY:-$EEZ_L1_POSTER_KEY}"
 AUTHORIZED_SIGNER="$(cast wallet address --private-key "$EEZ_PROOF_SIGNER_KEY")"
 PROOF_SYSTEM_VKEY="0x000000000000000000000000${AUTHORIZED_SIGNER#0x}"
 OWNER="$(cast wallet address --private-key "$EEZ_DEPLOY_KEY")"
+EEZ_L2_SYSTEM_ADDRESS="$(cast wallet address --private-key "$EEZ_L2_SYSTEM_KEY")"
+if [[ "${AUTHORIZED_SIGNER,,}" == "${EEZ_L2_SYSTEM_ADDRESS,,}" ]]; then
+    echo "deploy: proof attestation and L2 system keys must be different" >&2
+    exit 1
+fi
 
 echo "deploy: RPC                  = $EEZ_L1_RPC_URL"
 echo "deploy: deployer / owner     = $OWNER"
 echo "deploy: authorized signer    = $AUTHORIZED_SIGNER"
-echo "deploy: initial state root   = $EEZ_INITIAL_STATE_ROOT"
+echo "deploy: L2 system address    = $EEZ_L2_SYSTEM_ADDRESS"
 echo
 
 CONTRACTS="$REPO/contracts"
@@ -95,9 +98,22 @@ run_forge() {
     fi
 }
 
+compute_genesis_state_root() {
+    local genesis="$1"
+    if command -v eez-genesis-state-root >/dev/null 2>&1; then
+        eez-genesis-state-root "$genesis"
+    else
+        (
+            cd "$REPO"
+            cargo run --quiet --locked --package eez-node --example genesis_state_root -- "$genesis"
+        )
+    fi
+}
+
 # ── 1/5 DeployEEZ ────────────────────────────────────────────────────
 echo "[1/5] DeployEEZ"
-run_forge "DeployEEZ" forge script script/DeployEEZ.s.sol:DeployEEZ $RPC $KEY --broadcast
+run_forge "DeployEEZ" forge script script/DeployEEZ.s.sol:DeployEEZ \
+    --sig "run(address)" "$OWNER" $RPC $KEY --broadcast
 EEZ_REGISTRY_ADDRESS="$(extract EEZ "$OUT")"
 [[ -n "$EEZ_REGISTRY_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture EEZ address" >&2; exit 1; }
 EEZ_REGISTRY_DEPLOY_BLOCK="$(cast block-number --rpc-url "$EEZ_L1_RPC_URL")"
@@ -122,6 +138,42 @@ EEZ_ROLLUP_MANAGER_ADDRESS="$(extract ROLLUP_CONTRACT "$OUT")"
 [[ -n "$EEZ_ROLLUP_MANAGER_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture ROLLUP_CONTRACT address" >&2; exit 1; }
 echo "      rollupMgr  = $EEZ_ROLLUP_MANAGER_ADDRESS"
 
+# ── Generate deployment-bound L2 genesis ────────────────────────────
+# This deploy creates a fresh registry, so the first L2 rollup ID is 1.
+# Generate EEZL2 with that ID and the address derived from the secret system
+# key before registering the resulting state root on L1.
+ROLLUP_COUNTER="$(cast call "$EEZ_REGISTRY_ADDRESS" "rollupCounter()(uint256)" \
+    --rpc-url "$EEZ_L1_RPC_URL" | awk '{print $1}')"
+[[ "$ROLLUP_COUNTER" == "0" ]] || {
+    echo "deploy: fresh EEZ registry unexpectedly has rollupCounter=$ROLLUP_COUNTER" >&2
+    exit 1
+}
+EXPECTED_ROLLUP_ID=1
+GENESIS_OUT="${EEZ_GENESIS_OUT:-$REPO/datadir/genesis.json}"
+GENESIS_PROFILE_OUT="${EEZ_GENESIS_PROFILE_OUT:-${GENESIS_OUT%.json}.profile.json}"
+GENESIS_BASE="${EEZ_GENESIS_BASE:-$REPO/genesis.json}"
+
+echo "      rendering L2 genesis (rollupId=$EXPECTED_ROLLUP_ID, system=$EEZ_L2_SYSTEM_ADDRESS)"
+"$REPO/scripts/update-eezl2-genesis.sh" --render \
+    --rollup-id "$EXPECTED_ROLLUP_ID" \
+    --system-address "$EEZ_L2_SYSTEM_ADDRESS" \
+    --base "$GENESIS_BASE" \
+    --output "$GENESIS_OUT" \
+    --profile-output "$GENESIS_PROFILE_OUT"
+
+EEZ_INITIAL_STATE_ROOT="$(jq -er '.genesisStateRoot' "$GENESIS_PROFILE_OUT")"
+EEZ_L2_EEZL2_CODE_HASH="$(jq -er '.runtimeCodeHash' "$GENESIS_PROFILE_OUT")"
+if [[ -n "$configured_initial_state_root" \
+    && "${configured_initial_state_root,,}" != "${EEZ_INITIAL_STATE_ROOT,,}" ]]
+then
+    echo "deploy: configured EEZ_INITIAL_STATE_ROOT does not match the rendered L2 genesis" >&2
+    echo "configured: $configured_initial_state_root" >&2
+    echo "rendered:   $EEZ_INITIAL_STATE_ROOT" >&2
+    exit 1
+fi
+echo "      stateRoot  = $EEZ_INITIAL_STATE_ROOT"
+echo "      runtimeHash= $EEZ_L2_EEZL2_CODE_HASH"
+
 # ── 4/5 RegisterRollup ──────────────────────────────────────────────
 echo "[4/5] RegisterRollup(initialState=$EEZ_INITIAL_STATE_ROOT)"
 run_forge "RegisterRollup" forge script script/RegisterRollup.s.sol:RegisterRollup \
@@ -130,6 +182,10 @@ run_forge "RegisterRollup" forge script script/RegisterRollup.s.sol:RegisterRoll
     $RPC $KEY --broadcast
 EEZ_ROLLUP_ID="$(extract_uint L2_ROLLUP_ID "$OUT")"
 [[ -n "$EEZ_ROLLUP_ID" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture L2_ROLLUP_ID" >&2; exit 1; }
+[[ "$EEZ_ROLLUP_ID" == "$EXPECTED_ROLLUP_ID" ]] || {
+    echo "deploy: registry assigned rollupId=$EEZ_ROLLUP_ID; generated EEZL2 expects $EXPECTED_ROLLUP_ID" >&2
+    exit 1
+}
 echo "      rollupId   = $EEZ_ROLLUP_ID"
 
 # ── 5/5 DeployBridgeL1 ──────────────────────────────────────────────
@@ -156,35 +212,50 @@ echo "      L1 bridge  = $EEZ_L1_BRIDGE_SENDER"
 # `parent.timestamp + 2s` until wall-clock — from a 2023 genesis
 # that's ~47M blocks of pure timestamp catch-up to reach 2026.
 # Useless work. We write a per-deploy genesis with timestamp set to
-# the L1 block that confirmed RegisterRollup, so catch-up only
-# bridges deploy-time to now.
-GENESIS_OUT="${EEZ_GENESIS_OUT:-$REPO/datadir/genesis.json}"
-mkdir -p "$REPO/datadir"
+# the L1 block observed after deploying the EEZ registry, so catch-up
+# only bridges deployment time to now. Timestamp and fork activation do not
+# change the genesis state root, but verify that explicitly before publishing.
 DEPLOY_BLOCK_TS_HEX="$(cast block "$EEZ_REGISTRY_DEPLOY_BLOCK" --rpc-url "$EEZ_L1_RPC_URL" --json | jq -r '.timestamp')"
 [[ -n "$DEPLOY_BLOCK_TS_HEX" && "$DEPLOY_BLOCK_TS_HEX" != "null" ]] || {
     echo "deploy: failed to capture L1 block timestamp for $EEZ_REGISTRY_DEPLOY_BLOCK" >&2
     exit 1
 }
-python3 -c "
-import json, sys
-g = json.load(open('$REPO/genesis.json'))
-g['timestamp'] = '$DEPLOY_BLOCK_TS_HEX'
-# Mirror reth --chain dev's hardfork activation (all forks at genesis).
-# Without these the chain spec defaults to no-forks, the produced
-# blocks omit Cancun/Shanghai header fields, and the Deriver's STF
-# replay (which sets those fields based on its own NextBlockEnvAttributes)
-# disagrees on block-hash.
-g['config'].update({
-    'homesteadBlock': 0, 'eip150Block': 0, 'eip155Block': 0,
-    'eip158Block': 0, 'byzantiumBlock': 0, 'constantinopleBlock': 0,
-    'petersburgBlock': 0, 'istanbulBlock': 0, 'muirGlacierBlock': 0,
-    'berlinBlock': 0, 'londonBlock': 0, 'arrowGlacierBlock': 0,
-    'grayGlacierBlock': 0, 'mergeNetsplitBlock': 0,
-    'shanghaiTime': 0, 'cancunTime': 0, 'pragueTime': 0, 'osakaTime': 0,
-    'terminalTotalDifficulty': 0, 'terminalTotalDifficultyPassed': True,
-})
-json.dump(g, open('$GENESIS_OUT', 'w'), indent=2)
-" || { echo "deploy: failed to write $GENESIS_OUT" >&2; exit 1; }
+GENESIS_TIMESTAMP_TMP="$(mktemp "${GENESIS_OUT}.tmp.XXXXXX")"
+jq --arg timestamp "$DEPLOY_BLOCK_TS_HEX" '
+    .timestamp = $timestamp
+    | .config += {
+        homesteadBlock: 0,
+        eip150Block: 0,
+        eip155Block: 0,
+        eip158Block: 0,
+        byzantiumBlock: 0,
+        constantinopleBlock: 0,
+        petersburgBlock: 0,
+        istanbulBlock: 0,
+        muirGlacierBlock: 0,
+        berlinBlock: 0,
+        londonBlock: 0,
+        arrowGlacierBlock: 0,
+        grayGlacierBlock: 0,
+        mergeNetsplitBlock: 0,
+        shanghaiTime: 0,
+        cancunTime: 0,
+        pragueTime: 0,
+        osakaTime: 0,
+        terminalTotalDifficulty: 0,
+        terminalTotalDifficultyPassed: true
+    }
+' "$GENESIS_OUT" >"$GENESIS_TIMESTAMP_TMP"
+chmod --reference="$GENESIS_OUT" "$GENESIS_TIMESTAMP_TMP"
+mv "$GENESIS_TIMESTAMP_TMP" "$GENESIS_OUT"
+
+FINAL_STATE_ROOT="$(compute_genesis_state_root "$GENESIS_OUT")"
+if [[ "${FINAL_STATE_ROOT,,}" != "${EEZ_INITIAL_STATE_ROOT,,}" ]]; then
+    echo "deploy: finalized genesis state root changed after registration" >&2
+    echo "registered: $EEZ_INITIAL_STATE_ROOT" >&2
+    echo "finalized:  $FINAL_STATE_ROOT" >&2
+    exit 1
+fi
 echo "      genesis.ts = $DEPLOY_BLOCK_TS_HEX ($(printf %d $DEPLOY_BLOCK_TS_HEX))"
 
 # ── Write deployments.env ───────────────────────────────────────────
@@ -203,19 +274,19 @@ EEZ_ROLLUP_MANAGER_ADDRESS=$EEZ_ROLLUP_MANAGER_ADDRESS
 EEZ_ROLLUP_ID=$EEZ_ROLLUP_ID
 EEZ_INITIAL_STATE_ROOT=$EEZ_INITIAL_STATE_ROOT
 EEZ_L2_GENESIS_PATH=$GENESIS_OUT
+EEZ_L2_GENESIS_PROFILE_PATH=$GENESIS_PROFILE_OUT
 
 # L1 cross-chain bridge contracts (DeployBridgeL1).
 EEZ_L1_L2_PROXY=$EEZ_L1_L2_PROXY
 EEZ_L1_BRIDGE_SENDER=$EEZ_L1_BRIDGE_SENDER
 EEZ_L2_BRIDGE_RECEIVER=$EEZ_L2_BRIDGE_RECEIVER
 
-# L2 CCM-L2 (predeploy baked into genesis.json).
-EEZ_CCM_L2_ADDRESS=0x4200000000000000000000000000000000000007
-# Smoke deviation from Rollup-1.md §3: SystemAddress is a real funded
-# EOA (hardhat #0) so the L2 system tx can be signed normally — vanilla
-# reth doesn't support type-0x7E (OP-Stack deposit) txs. Replace with
-# 0xdead…dead + NodePrimitives extension when type-0x7E lands.
-EEZ_L2_SYSTEM_ADDRESS=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266
+# EEZL2 predeploy baked into genesis.json.
+EEZL2_ADDRESS=0x4200000000000000000000000000000000000007
+# Public deployment binding derived from EEZ_L2_SYSTEM_KEY. The secret key is
+# deliberately not written to this file.
+EEZ_L2_SYSTEM_ADDRESS=$EEZ_L2_SYSTEM_ADDRESS
+EEZ_L2_EEZL2_CODE_HASH=$EEZ_L2_EEZL2_CODE_HASH
 EOF
 
 echo

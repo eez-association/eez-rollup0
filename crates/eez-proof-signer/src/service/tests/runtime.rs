@@ -80,7 +80,7 @@ async fn a_mismatched_header_rollup_is_rejected_without_waiting_for_eof() {
 
 #[tokio::test]
 async fn a_checkpoint_plan_above_the_configured_limit_is_resource_exhausted() {
-    let validator = Validator::stateless_for_test(Default::default());
+    let validator = Validator::stateless_for_test(Default::default(), TEST_SYSTEM_ADDRESS);
     let server = TestServer::with_limits(inner(validator), limits_with_checkpoint_limit(0)).await;
 
     let status = server.prove(stateless_transaction_window()).await;

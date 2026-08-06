@@ -1,9 +1,8 @@
 //! Error type returned by the deriver.
 //!
-//! Follows M-ERRORS-CANONICAL-STRUCTS: a single public [`DeriverError`]
-//! struct wrapping a private [`ErrorKind`] enum, with a captured
-//! [`Backtrace`]. Callers discriminate via `is_*` helper methods so
-//! adding a variant doesn't break the public API.
+//! Exposes one public [`DeriverError`] while keeping its error categories
+//! private. Callers discriminate via `is_*` helper methods so adding a
+//! category does not break the public API.
 
 use core::fmt;
 

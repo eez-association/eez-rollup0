@@ -36,7 +36,7 @@ changing `service/`; Operations is aimed at deployment and incident diagnosis.
   correspond to an effect. It is not authorization by itself.
 - **Transaction-state checkpoint:** a state root locally recomputed immediately
   after a selected transaction and before post-block processing. Settlement
-  later binds it to a submitted state-delta claim.
+  later binds it to a submitted state-update claim.
 - **DA sidecar / Sync block:** a sidecar is the canonical derivation projection
   for one effect; the Sync block is the terminal L2 block reconstructed from
   those projections and retained user transactions.

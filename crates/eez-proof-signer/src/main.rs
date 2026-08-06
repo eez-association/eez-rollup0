@@ -30,9 +30,8 @@ mod testkit;
 mod validate;
 mod window;
 
-/// Fixed L2 address used for cross-chain transaction and event checks.
-pub(crate) const EEZL2_ADDRESS: alloy_primitives::Address =
-    alloy_primitives::address!("4200000000000000000000000000000000000007");
+/// Fixed L2 predeploy used for cross-chain transaction and event checks.
+pub(crate) use eez_protocol::EEZL2_ADDRESS;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
@@ -41,7 +40,9 @@ async fn main() -> eyre::Result<()> {
 
     let listen_addr = config.listen_addr;
     let limits = config.limits;
-    let validator = validate::Validator::stateless(&config.chain_document_path)?;
+    let expected_l2_system_address = config.expected_l2_system_address;
+    let validator =
+        validate::Validator::stateless(&config.chain_document_path, expected_l2_system_address)?;
     if !listen_addr.ip().is_loopback() {
         warn!(
             listen = %listen_addr,
@@ -65,7 +66,7 @@ async fn main() -> eyre::Result<()> {
         expected_proof_system = %config.attester.expected_proof_system(),
         proof_system_vkey = %config.attester.proof_system_vkey(),
         l2_chain_id = validator.chain_id(),
-        system_address = %eez_protocol::SYSTEM_ADDRESS,
+        expected_l2_system_address = %expected_l2_system_address,
         profile = "anchor_single_call_outbound_then_inbound",
         "serving Prove — waiting for composer windows",
     );
@@ -75,7 +76,7 @@ async fn main() -> eyre::Result<()> {
             config.expected_rollup_id,
             config.attester,
             config.system_transaction_key,
-        )),
+        )?),
         limits,
     );
     let shutdown_service = svc.clone();

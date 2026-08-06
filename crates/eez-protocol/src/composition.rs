@@ -10,9 +10,8 @@
 //!   registered rollup session by
 //!   `rollup_id` and forwards the call — returning the outcome to the
 //!   source inspector so execution can continue.
-//! - **Recording**: each dispatched call is stored internally as a
-//!   [`ExecutedAction`] (outcome non-optional — it's always present by
-//!   the time the call is recorded).
+//! - **Recording**: each dispatched call opens a pending [`ExecutedAction`]
+//!   before target execution and resolves that same slot afterward.
 //! - **Finalization**: [`CompositionBuilder::finalize`] consumes the
 //!   builder, builds source + target entries via the [`crate::entries`]
 //!   builders, and produces a [`crate::types::Composition`].
@@ -25,13 +24,11 @@
 //! - **Owned [`Rollup`] per rollup**. Each rollup bundles the
 //!   client, an optional session (`None` until the first dispatch
 //!   opens it — the entry rollup's session stays `None` whenever no
-//!   inspector dispatches back to the entry chain), the config (for
-//!   CCM verify), and the initial state root.
+//!   inspector dispatches back to the entry chain), the target
+//!   configuration, and the initial state root.
 //! - **Entry-aware**. `finalize` skips the entry rollup in both the
-//!   target-batch loop (entry has no system-tx CCM path — L1 verifies
-//!   via `EEZ.postAndVerifyBatch`'s
-//!   proof bundle) and the target-composition loop (entry rollup's
-//!   output lives in `source`, not `targets`).
+//!   target-batch loop and the target-composition loop because the entry
+//!   rollup's output lives in `source`, not `targets`.
 //!
 //! # Lifecycle
 //!
@@ -48,7 +45,7 @@
 //!      │   → lazy-open rollups[target].session            │
 //!      │   → open_call → session.execute(req, &mut self)  │
 //!      │     → close_call resolves the slot's outcome     │
-//!      │   → return ExecutionResponse to inspector        │
+//!      │   → return ExecutionOutcome to inspector         │
 //!      └──────────────────────────────────────────────────┘
 //!                             │
 //!                             ▼
@@ -58,7 +55,7 @@
 //!      │   2. per non-entry rollup: zk-poster settlement  │
 //!      │      or inbound sidecar batch + root attribution │
 //!      │   3. entries::build_batch(recorded, attribution, │
-//!      │      dialect, source_id, raw_tx) — once per      │
+//!      │      source_id, raw_tx) — once per               │
 //!      │      source + per non-entry target               │
 //!      │   4. encode_table_payload + encode_follower_     │
 //!      │      trigger per target                          │
@@ -83,9 +80,6 @@ use crate::types::{
     Composition, ExecutedAction, ExecutionOutcome, SourceComposition, TargetComposition,
 };
 
-// Avoid a protocol → composer layering cycle: TargetConfig lives in
-// `composer.rs`, but this module reads `config.verification_context`
-// + `config.ccm_gas_limit` during finalize.
 use crate::composer::TargetConfig;
 
 // ── Rollup ───────────────────────────────────────────────────────
@@ -100,16 +94,15 @@ use crate::composer::TargetConfig;
 /// - `session: Option<Box<dyn _>>`: opened on first `dispatch_call`
 ///   to this rollup. The entry rollup's session stays `None` whenever
 ///   no inspector dispatches back to the entry chain.
-/// - `config: TargetConfig` — `finalize` reads
-///   `config.verification_context()` and `config.proxy_lookup` directly.
+/// - `config: TargetConfig` — selects the target contract dialect and proxy
+///   lookup configuration.
 pub struct Rollup {
     /// Client for this rollup — shared long-lived trait object.
     pub client: Arc<dyn ChainClient + Send + Sync>,
     /// Lazily-opened session for this rollup. `None` until the first
     /// [`CompositionBuilder::dispatch_call`] hits this rollup.
     pub session: Option<Box<dyn TargetExecutionSession + Send>>,
-    /// Configuration for this rollup (CCM addresses, gas limit, proxy
-    /// lookup).
+    /// Target contract dialect and proxy lookup configuration for this rollup.
     pub config: TargetConfig,
     /// Root the entry chain currently holds for this rollup. Used as
     /// the `currentState` of the first source entry that touches this
@@ -163,8 +156,9 @@ impl std::fmt::Debug for Rollup {
 /// `start = recorded_count()` at frame open, `end = recorded_count()`
 /// at frame end, and on revert the inspector calls
 /// [`annotate_revert_span`](Self::annotate_revert_span) with the
-/// resulting `(start, end - start)` so the bracketed calls' on-chain
-/// `revertSpan` is captured.
+/// resulting `(start, end - start)` so the bracketed calls' revert scope is
+/// retained. The initial simplify profile rejects nonzero scopes rather than
+/// lowering them to `revertNextNCalls`.
 ///
 /// `annotate_revert_span` is separate from `close_call` because
 /// `Inspector::call_end` fires AFTER the inspector's own dispatch
@@ -176,13 +170,9 @@ pub struct CompositionBuilder {
     pub(crate) rollups: HashMap<RollupId, Rollup>,
     pub(crate) recorded: Vec<ExecutedAction>,
     /// Pre-computed per-tx state roots, keyed by rollup id, injected
-    /// via [`Self::set_extra_per_tx_roots`]. Merged into
-    /// `per_tx_roots_by_rollup` at the start of `finalize`'s CCM-verify
-    /// loop — values do not get overwritten by CCM-verify when the
-    /// rollup is skipped (e.g. the entry rollup), but a follower
-    /// rollup that ALSO had pre-computed roots injected would have
-    /// them clobbered by the CCM-verify result. In practice only the
-    /// entry rollup uses this path (overlay session post-execute roots).
+    /// via [`Self::set_extra_per_tx_roots`]. The entry rollup consumes these
+    /// roots during `finalize`; non-entry rollups derive their attribution
+    /// while their target batches are built.
     pub(crate) extra_per_tx_roots: HashMap<RollupId, Vec<[u8; 32]>>,
     /// Per-call snapshot stash, keyed by `recorded[..]` index. Each
     /// open call grabs an opaque [`SessionSnapshot`] right before
@@ -364,8 +354,10 @@ impl CompositionBuilder {
     /// # Errors
     ///
     /// Returns [`ProtocolErrorKind::EmptyCalls`] on empty inputs,
-    /// [`ProtocolErrorKind::UnknownTarget`] for a recorded rollup not
-    /// in the plan set, [`ProtocolErrorKind::InvalidCheckpoint`] if
+    /// [`ProtocolErrorKind::UnknownTarget`] for a recorded rollup not in the
+    /// plan set, [`ProtocolErrorKind::InvalidEncoding`] for a pending call,
+    /// [`ProtocolErrorKind::Unsupported`] when static-entry materialization
+    /// would be required, and [`ProtocolErrorKind::InvalidCheckpoint`] if
     /// per-rollup state-delta chaining fails in `build_batch`.
     /// Surfaces any [`ExecutorError`] from root attribution.
     // Large Err variant is the pre-existing error shape (previously
@@ -388,6 +380,7 @@ impl CompositionBuilder {
                 .into());
             }
         }
+        entries::ensure_materializable_calls(&self.recorded)?;
 
         // Sorted plan order for deterministic output (upstream's invariant 2).
         let mut plan_order: Vec<RollupId> = self.rollups.keys().copied().collect();
@@ -410,7 +403,7 @@ impl CompositionBuilder {
         // populated later by the loop and
         // by `extra_per_tx_roots` for the entry rollup. The L1-as-
         // follower emitter uses `initial_roots[source_rollup_id]`
-        // for its first stateDelta's currentState; with empty
+        // for its first state update's currentState; with empty
         // per_tx_roots it emits a degenerate-tail chain (newState ==
         // currentState), which `EEZ.executeL2TX`'s simulation
         // accepts (each delta matches the rollup's stored root).
@@ -433,7 +426,7 @@ impl CompositionBuilder {
         // For each non-entry rollup with non-empty group calls, build
         // the batch (zk-poster settlement or inbound DA-sidecar) and
         // record the attributed root so the entry-side build_batch
-        // (Phase 3) can chain stateDeltas through it.
+        // (Phase 3) can chain state updates through it.
         //
         // Entry rollup branch: drain pre-computed roots from the
         // overlay-session path (`extra_per_tx_roots`).
@@ -471,7 +464,7 @@ impl CompositionBuilder {
             // REAL current state root as this rollup's post-state root (a
             // placeholder; the prover patches the real L2 `newState` later).
             if dialect.is_zk_poster() {
-                let batch = entries::build_l1_postbatch(&group_calls, self.entry_rollup_id);
+                let batch = entries::build_l1_postbatch(&group_calls, self.entry_rollup_id)?;
                 if batch.is_empty() {
                     continue;
                 }
@@ -492,8 +485,7 @@ impl CompositionBuilder {
                     %rollup_id,
                     l1_root = ?root,
                     entries = group_calls.len(),
-                    "zk-poster target: built immediate L1 postBatch (skipping CCM-verify sim; \
-                     settlement applied at submission)",
+                    "zk-poster target: built immediate L1 postBatch; settlement applied at submission",
                 );
                 per_tx_roots_by_rollup.insert(*rollup_id, vec![root]);
                 target_batches.insert(*rollup_id, batch);
@@ -504,58 +496,49 @@ impl CompositionBuilder {
                 initial_roots: &initial_roots,
                 per_tx_roots_by_rollup: &per_tx_roots_by_rollup,
             };
-            let batch = entries::build_batch(
-                &group_calls,
-                &attribution_so_far,
-                dialect,
-                *rollup_id,
-                raw_tx,
-            )?;
 
-            // Terminal-revert short-circuit: an empty batch means all
-            // calls reverted and there's nothing to verify — UNLESS this
-            // target has an INCOMING cross-chain call. `build_batch(source =
-            // this rollup)` keys "top-level" on a call's SOURCE, so an incoming
-            // call (TARGET is this rollup, SOURCE another rollup) is never
-            // top-level → empty batch here, even though the L2 must DELIVER it
-            // (`executeIncomingCrossChainCall`). Detect that and build the
-            // follower-only inbound DA-sidecar entry directly — the inbound
-            // mirror of the zk-poster outbound short-circuit above (the lean
-            // on-chain entry is produced separately by the source/entry batch).
-            // Otherwise the batch is genuinely empty (all reverted) → skip.
-            if batch.is_empty() {
-                let has_incoming = group_calls.iter().any(|c| c.source_rollup_id != *rollup_id);
-                if has_incoming {
-                    let inbound_batch = entries::build_l1_inbound_sidecar(&group_calls, *rollup_id);
-                    if !inbound_batch.is_empty() {
-                        // Attribute the inbound delivery's post-state root —
-                        // already executed during dispatch (`close_call`
-                        // stamped the recorded call's outcome). Mirrors the
-                        // zk-poster per-tx-root attribution.
-                        let root = self
-                            .recorded
-                            .iter()
-                            .rev()
-                            .find(|r| r.target_rollup_id == *rollup_id)
-                            .and_then(|r| r.outcome.post_state_root().copied())
-                            .ok_or_else(|| ProtocolErrorKind::InvalidCheckpoint {
-                                reason: format!(
-                                    "inbound target {rollup_id} has no resolved \
-                                     post_state_root (close_call did not run?)"
-                                ),
-                            })?;
-                        tracing::debug!(
-                            name: "composer.inbound_sidecar",
-                            %rollup_id,
-                            delivery_root = ?root,
-                            entries = group_calls.len(),
-                            "inbound target: built follower-only DA-sidecar entry \
-                             (build_batch(source=this) cannot express an incoming call)",
-                        );
-                        per_tx_roots_by_rollup.insert(*rollup_id, vec![root]);
-                        target_batches.insert(*rollup_id, inbound_batch);
-                    }
+            let has_incoming = group_calls
+                .iter()
+                .any(|call| call.source_rollup_id != *rollup_id);
+            if has_incoming {
+                if group_calls
+                    .iter()
+                    .any(|call| call.source_rollup_id == *rollup_id)
+                {
+                    return Err(ProtocolErrorKind::Unsupported(
+                        "mixed incoming and source-side calls for one target are not supported",
+                    )
+                    .into());
                 }
+
+                let inbound_batch = entries::build_l1_inbound_sidecar(&group_calls, *rollup_id)?;
+                let root = self
+                    .recorded
+                    .iter()
+                    .rev()
+                    .find(|recorded| recorded.target_rollup_id == *rollup_id)
+                    .and_then(|recorded| recorded.outcome.post_state_root().copied())
+                    .ok_or_else(|| ProtocolErrorKind::InvalidCheckpoint {
+                        reason: format!(
+                            "inbound target {rollup_id} has no resolved post_state_root"
+                        ),
+                    })?;
+                tracing::debug!(
+                    name: "composer.inbound_sidecar",
+                    %rollup_id,
+                    delivery_root = ?root,
+                    entries = group_calls.len(),
+                    "inbound target sidecar built",
+                );
+                per_tx_roots_by_rollup.insert(*rollup_id, vec![root]);
+                target_batches.insert(*rollup_id, inbound_batch);
+                continue;
+            }
+
+            let batch =
+                entries::build_batch(&group_calls, &attribution_so_far, *rollup_id, raw_tx)?;
+            if !batch.is_empty() {
+                target_batches.insert(*rollup_id, batch);
             }
         }
 
@@ -570,13 +553,8 @@ impl CompositionBuilder {
             .expect("entry rollup registered at builder construction")
             .config
             .dialect;
-        let entry_batch = entries::build_batch(
-            &self.recorded,
-            &attribution,
-            &entry_dialect,
-            self.entry_rollup_id,
-            raw_tx,
-        )?;
+        let entry_batch =
+            entries::build_batch(&self.recorded, &attribution, self.entry_rollup_id, raw_tx)?;
         let entry_payload = entries::encode_table_payload(&entry_batch, &entry_dialect);
 
         // Phase 4 — target compositions (re-encode from the batches
@@ -768,6 +746,7 @@ impl CompositionBuilder {
 
         let idx = self.recorded.len();
         self.recorded.push(ExecutedAction {
+            call_mode: req.call_mode,
             target_address: req.target_address,
             target_rollup_id,
             source_rollup_id,
@@ -782,8 +761,8 @@ impl CompositionBuilder {
     }
 
     /// Resolve the call opened by [`open_call`](Self::open_call) at `idx` with its outcome.
-    /// `revert_span` carries the on-chain `L2ToL1CallSol::revertSpan`
-    /// for top-level calls when known at close time; most callers
+    /// `revert_span` retains a top-level call's reverted scope when known at
+    /// close time. The current simplify materializers reject it; most callers
     /// pass `None` and let
     /// [`annotate_revert_span`](Self::annotate_revert_span) fill it
     /// in post-frame.
@@ -841,8 +820,7 @@ impl CompositionBuilder {
             return;
         }
         // Annotate the bracketing top-level call. Only the call at
-        // the head of the span carries the on-chain `revertSpan`;
-        // bracketed inner calls don't.
+        // Only the head carries the scope; bracketed inner calls do not.
         self.recorded[idx].revert_span = Some(span);
         // Queue rollbacks for every recorded index in the bracket.
         // `process_pending_rollbacks` consolidates by rollup id and
@@ -866,8 +844,8 @@ impl CompositionBuilder {
     /// builder's eventual `finalize` step.
     ///
     /// Used by the entry-overlay path: `finalize`'s target loop
-    /// skips the entry rollup (no system-tx CCM contract
-    /// on L1), so nested calls attributed to the entry rollup have no
+    /// skips the entry rollup because its output is built separately as the
+    /// source composition, so nested calls attributed to it have no
     /// `per_tx_roots` source. The entry overlay session captures one
     /// post-state root per overlay `execute` and, at end of
     /// `simulate_source_tx`, the source-sim path drains that buffer
@@ -882,7 +860,7 @@ impl CompositionBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::action::cross_chain_call_hash;
+    use crate::action::{CallHashInput, CallMode, common_cross_chain_call_hash};
     use crate::composer::ProxyLookupConfig;
     use crate::dialect::ChainDialect;
     use alloy_primitives::{Address, Bytes, U256};
@@ -990,6 +968,7 @@ mod tests {
 
     fn make_request(rollup: u64) -> ExecutionRequest {
         ExecutionRequest {
+            call_mode: crate::CallMode::Mutable,
             target_address: Address::repeat_byte(rollup as u8),
             data: Bytes::from(vec![0x01, 0x02]),
             value: U256::ZERO,
@@ -1046,6 +1025,23 @@ mod tests {
         assert_eq!(builder.recorded.len(), 1);
         assert_eq!(builder.recorded[0].target_rollup_id, RollupId(1));
         assert_eq!(builder.recorded[0].source_rollup_id, RollupId(0));
+        assert_eq!(builder.recorded[0].call_mode, crate::CallMode::Mutable);
+    }
+
+    #[tokio::test]
+    async fn dispatch_preserves_call_mode() {
+        let mut rollups = HashMap::new();
+        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
+        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
+        let mut builder = CompositionBuilder::new(RollupId(0), rollups);
+        let mut request = make_request(1);
+        request.call_mode = crate::CallMode::Static;
+
+        builder
+            .dispatch_call(RollupId(1), RollupId(0), request)
+            .expect("dispatch");
+
+        assert_eq!(builder.recorded[0].call_mode, crate::CallMode::Static);
     }
 
     #[tokio::test]
@@ -1168,12 +1164,10 @@ mod tests {
         assert_eq!(composition.targets.len(), 1);
         assert_eq!(composition.targets[0].rollup_id, RollupId(1));
 
-        // The sidecar entry mirrors the recorded call: callCount 1, the
-        // call in l2ToL1Calls[0], proxyEntryHash bound to the same
-        // 6-field preimage the on-chain entry uses.
+        // The sidecar entry mirrors the recorded call and binds its
+        // destination-side identity in `proxyEntryHash`.
         let entries = &composition.targets[0].batch.entries;
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].callCount, U256::from(1u8));
         assert_eq!(entries[0].l2ToL1Calls.len(), 1);
         assert_eq!(
             entries[0].l2ToL1Calls[0].targetAddress,
@@ -1181,14 +1175,15 @@ mod tests {
         );
         assert_eq!(
             entries[0].proxyEntryHash,
-            cross_chain_call_hash(
-                RollupId(1),
-                Address::repeat_byte(1),
-                U256::ZERO,
-                &Bytes::from(vec![0x01, 0x02]),
-                Address::ZERO,
-                RollupId(0),
-            ),
+            common_cross_chain_call_hash(CallHashInput {
+                call_mode: CallMode::Mutable,
+                source_address: Address::ZERO,
+                source_rollup_id: RollupId::MAINNET,
+                target_address: Address::repeat_byte(1),
+                target_rollup_id: RollupId(1),
+                value: U256::ZERO,
+                data: &Bytes::from(vec![0x01, 0x02]),
+            },),
         );
 
         // The entry batch carries the top-level call as one deferred entry.
@@ -1202,6 +1197,7 @@ mod tests {
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
         builder.recorded.push(ExecutedAction {
+            call_mode: crate::CallMode::Mutable,
             target_address: Address::ZERO,
             target_rollup_id: RollupId(99),
             source_rollup_id: RollupId(0),
@@ -1219,6 +1215,62 @@ mod tests {
                 if matches!(
                     p.kind(),
                     crate::error::ProtocolErrorKind::UnknownTarget { got: RollupId(99) }
+                )
+        ));
+    }
+
+    #[tokio::test]
+    async fn finalize_rejects_static_calls_before_building_any_dialect() {
+        let mut rollups = HashMap::new();
+        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
+        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
+        let mut builder = CompositionBuilder::new(RollupId(0), rollups);
+        let mut request = make_request(1);
+        request.call_mode = crate::CallMode::Static;
+        builder
+            .dispatch_call(RollupId(1), RollupId(0), request)
+            .expect("dispatch");
+
+        let error = builder
+            .finalize(&[])
+            .expect_err("static entry materialization is not implemented");
+
+        assert!(matches!(
+            error.kind(),
+            crate::error::CompositionErrorKind::Protocol(protocol)
+                if matches!(
+                    protocol.kind(),
+                    crate::ProtocolErrorKind::Unsupported(
+                        "static cross-chain calls are not supported"
+                    )
+                )
+        ));
+    }
+
+    #[tokio::test]
+    async fn finalize_rejects_pending_call_before_zk_poster_can_drop_it() {
+        let mut l1_rollup = rollup_with_session([0u8; 32]);
+        l1_rollup.config.dialect = ChainDialect::EvmL1Style;
+
+        let mut rollups = HashMap::new();
+        rollups.insert(RollupId(1), entry_rollup([0u8; 32]));
+        rollups.insert(RollupId::MAINNET, l1_rollup);
+        let mut builder = CompositionBuilder::new(RollupId(1), rollups);
+        builder
+            .open_call(RollupId::MAINNET, RollupId(2), &make_request(0))
+            .expect("open pending call");
+
+        let error = builder
+            .finalize(&[])
+            .expect_err("finalize must reject every unresolved call");
+
+        assert!(matches!(
+            error.kind(),
+            crate::error::CompositionErrorKind::Protocol(protocol)
+                if matches!(
+                    protocol.kind(),
+                    crate::ProtocolErrorKind::InvalidEncoding(reason)
+                        if reason == "recorded cross-chain call still has a pending outcome"
                 )
         ));
     }
@@ -1298,11 +1350,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_target_entries_omit_target_composition() {
-        // Terminal revert — the emitter returns an empty target-entry
-        // set (and the sidecar skips reverted incoming calls), so the
-        // `TargetComposition` for the reverted rollup must be omitted
-        // from the returned `Composition`.
+    async fn finalize_rejects_unsuccessful_calls() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_reverted_session());
@@ -1316,12 +1364,19 @@ mod tests {
             "test setup: recorded call must be reverted"
         );
 
-        let composition = builder.finalize(&[]).expect("finalize");
-
-        assert!(
-            composition.targets.is_empty(),
-            "finalize must omit TargetComposition for a rollup whose target entries are empty"
-        );
+        let error = builder
+            .finalize(&[])
+            .expect_err("unsuccessful calls are outside the supported profile");
+        assert!(matches!(
+            error.kind(),
+            crate::error::CompositionErrorKind::Protocol(protocol)
+                if matches!(
+                    protocol.kind(),
+                    crate::ProtocolErrorKind::Unsupported(
+                        "unsuccessful cross-chain calls are not supported"
+                    )
+                )
+        ));
     }
 
     // ── Router regression tests ──────────────────────────────────
@@ -1329,7 +1384,7 @@ mod tests {
     /// Same-chain non-entry self-dispatch must surface `InvalidReentry`
     /// loudly. L2 → L2 is architecturally disallowed: a non-entry
     /// rollup that issues a cross-chain call back to itself bypasses
-    /// the entry-rollup CCM contract that mediates every legitimate
+    /// the entry rollup's dispatch contract that mediates every legitimate
     /// reentry.
     #[tokio::test]
     async fn dispatch_same_chain_non_entry_returns_invalid_reentry() {

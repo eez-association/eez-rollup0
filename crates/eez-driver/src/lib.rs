@@ -12,7 +12,7 @@
 //!
 //! ## Surface (Stage 4)
 //!
-//! - [`slot`] — `SlotKind`, `SlotEvent`, `L1HeadSource`, plus
+//! - [`slot`] — `SlotKind`, `SlotEvent`, plus
 //!   [`spawn_interval`] (standalone-mode) and [`spawn_l1_anchored`]
 //!   (production). Defines the protocol between Schedulers and
 //!   Sequencers.
@@ -21,9 +21,8 @@
 //! - [`RollupTiming`] + [`SlotComposition`] — per-rollup wall-clock
 //!   timing config and per-trigger Live/Future/Sync split.
 //!
-//! Composition with `eez-l1` + `eez-composer`: this crate has zero L1
-//! dependencies; L1 wiring crosses the [`L1HeadSource`] trait boundary
-//! (impl lives in `eez-l1::L1HeadStream`).
+//! L1-anchored scheduling consumes an [`eez_l1::L1HeadStream`] through
+//! [`spawn_l1_anchored`]; higher-level composition remains in `eez-composer`.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 

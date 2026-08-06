@@ -88,8 +88,8 @@ struct Args {
     #[arg(long = "attester-address", env = "EEZ_ATTESTER_ADDRESS")]
     expected_attester_address: Address,
 
-    /// Private secp256k1 key for `eez_protocol::SYSTEM_ADDRESS`, used to reconstruct
-    /// system transactions omitted from Sync-block DA.
+    /// Private secp256k1 key for the deployment-configured L2 system address,
+    /// used to reconstruct system transactions omitted from Sync-block DA.
     #[arg(
         long = "l2-system-key",
         env = "EEZ_L2_SYSTEM_KEY",
@@ -97,6 +97,10 @@ struct Args {
         hide_env_values = true
     )]
     system_transaction_key: SecretKeyArg,
+
+    /// L2 system address embedded in the deployed EEZL2 contract.
+    #[arg(long = "l2-system-address", env = "EEZ_L2_SYSTEM_ADDRESS")]
+    expected_l2_system_address: Address,
 
     /// Expected non-zero proof-system contract selected by the operator.
     #[arg(long = "proof-system", env = "EEZ_PROOF_SYSTEM")]
@@ -159,6 +163,8 @@ pub(crate) struct Config {
     pub(crate) chain_document_path: PathBuf,
     /// Expected L1 rollup-registry ID, distinct from the L2 EIP-155 chain ID.
     pub(crate) expected_rollup_id: NonZeroU64,
+    /// Deployment-configured privileged L2 transaction signer.
+    pub(crate) expected_l2_system_address: Address,
     pub(crate) attester: Attester,
     pub(crate) system_transaction_key: SystemTransactionKey,
     pub(crate) limits: ServiceLimits,
@@ -176,19 +182,23 @@ impl Config {
             attestation_private_key,
             args.proof_system_vkey,
             args.expected_proof_system,
+            args.expected_l2_system_address,
         )
         .map_err(eyre::Report::new)?;
         eyre::ensure!(
             attester.address() == args.expected_attester_address,
             "attestation key does not match the expected attester address"
         );
-        let system_transaction_key =
-            SystemTransactionKey::new(args.system_transaction_key.into_key("L2 system")?)
-                .map_err(eyre::Report::new)?;
+        let system_transaction_key = SystemTransactionKey::new(
+            args.system_transaction_key.into_key("L2 system")?,
+            args.expected_l2_system_address,
+        )
+        .map_err(eyre::Report::new)?;
         Ok(Self {
             listen_addr: args.listen_addr,
             chain_document_path: args.chain_document_path,
             expected_rollup_id: args.expected_rollup_id,
+            expected_l2_system_address: args.expected_l2_system_address,
             attester,
             system_transaction_key,
             limits: ServiceLimits::new(ServiceLimitsParams {

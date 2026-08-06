@@ -1,4 +1,4 @@
-# Real non-zero outbound fixture
+# Captured incompatible outbound fixture
 
 This fixture is the five-block settlement window `[626..630]` exported from
 `fixtures/scenarios/fresh-chain-canonical`. The source recording was captured
@@ -14,12 +14,11 @@ Block 630 contains five successful transactions in canonical Sync order:
 4. its zero-value user outbound transaction; and
 5. one inbound system transaction.
 
-Stateless re-execution derives the two outbound receipt events, the inbound
-effect, all five statuses, and transaction checkpoints `[1, 3, 4]`. Settlement
-then checks the captured four-entry effect prefix, including the exact
-`etherDelta = -10_000_000_000_000` for the value-bearing outbound, reconstructs
-the Sync transactions, checks the DA payload, recomputes the independently
-recorded public-input hash, and only then permits the test attestation.
+The recording's L2 manager emitted the five-field base
+`CrossChainCallExecuted` event. The current `EEZL2` contract emits a distinct
+six-field event containing `uint64 callGas`, with a different topic. The
+fixture is retained to verify that stateless replay does not reinterpret the
+incompatible event or permit an attestation by inventing a gas value.
 
 The block, witness, and `PostBatch` artifacts were exported from
 `fixtures/scenarios/fresh-chain-canonical`. `chain-config.json` was copied
@@ -42,12 +41,7 @@ so `fixture_file_sha256` separately covers the repository representations. The
 empty L1 block hash and on-chain batch `blockNumber == 0` are intentional
 properties of this recording's timeless profile.
 
-This regression proves the signer's execution, effect, DA, public-input, and
-attestation bindings. It does not prove the future deployment mechanism that
-will custody or fund outbound value through `EEZL2_ADDRESS`; that remains an
-explicit deployment invariant.
+This is a rejection vector, not a successful outbound conformance vector.
 
-The fixture contains no credentials. The signing key used by the regression
-test is the separate, intentionally public Anvil test key and is not part of
-the recording. These artifacts are contributed under the repository's dual
-`MIT OR Apache-2.0` license.
+The fixture contains no credentials. These artifacts are contributed under the
+repository's dual `MIT OR Apache-2.0` license.

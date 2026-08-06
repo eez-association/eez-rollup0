@@ -9,22 +9,13 @@
 //!   rollup to its subset of `proofSystems[]` (also strictly
 //!   increasing `uint64[]` indices into the global ordering),
 //! - a jagged `vkMatrix` row-per-rollup, column-per-local-PS,
-//!   where row `r`'s column `j` is the vkey rollup `r`'s manager
-//!   returned for the PS at `proofSystemIndex[r][j]`,
-//! - per-rollup `(timestamp, blockHash)` pairs read once from
-//!   each manager's `getTimestampAndBlockHash()`.
+//! - one opaque `customData` blob per rollup, returned by its manager.
 //!
 //! A per-rollup-only resolver API cannot express this ordering
 //! (the global `proofSystems[]` ordering, the local→global index
 //! mapping, the jagged-matrix shape all live at the batch level).
-//! [`ProofPlanResolver`](crate::proof_resolver::ProofPlanResolver)
-//! resolves a batch's full proof plan in one call.
-//!
-//! Timestamps and block
-//! hashes use the wire shape `[u8; 32]` (big-endian for
-//! timestamps) — that's the natural input to the chain's
-//! `abi.encode`-equivalent fold. The resolver converts to
-//! `alloy_primitives::U256` / `B256` at the encoder boundary.
+//! The runtime proof-plan resolver resolves a batch's full proof plan in one
+//! call.
 //!
 //! # Spec anchors
 //!
@@ -33,14 +24,14 @@
 //! `publicInputsHash` fold and on-chain `_validateStructure` are
 //! the construction this plan is shaped to feed.
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, Bytes};
 
 use crate::rollup_id::RollupId;
 
 /// Per-rollup attestation entry inside a [`ProofPlan`]. Mirrors
 /// the on-chain `RollupIdWithProofSystems` struct exactly.
 ///
-/// `proof_system_index` is a strictly increasing `Vec<u64>` of
+/// `proof_system_indexes` is a strictly increasing `Vec<u64>` of
 /// indices into [`ProofPlan::proof_systems`]. The strict-
 /// increasing invariant is enforced both off-chain by the
 /// resolver and on-chain by `EEZ.sol::_validateStructure`; it's
@@ -54,41 +45,10 @@ pub struct RollupProofAssignment {
     pub rollup_id: RollupId,
     /// Sorted indices into `ProofPlan::proof_systems`. Each entry
     /// must be `< proof_systems.len()`.
-    pub proof_system_index: Vec<u64>,
+    pub proof_system_indexes: Vec<u64>,
 }
 
-/// Per-rollup `(timestamp, blockHash)` pair fetched once from
-/// each manager's `getTimestampAndBlockHash()`. Folded into the
-/// per-PS `publicInputsHash` accumulator (upstream's posting
-/// algorithm).
-///
-/// Wire shape `[u8; 32]` is the natural input to a chain's
-/// `abi.encode`-equivalent fold. The reference `Rollup.sol` stub
-/// returns `(0, bytes32(0))`; real managers override with
-/// rollup-specific block info.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TimestampAndBlockHash {
-    /// Manager-attested timestamp at the moment of `postBatch`
-    /// execution. On-chain type is `uint256`; encoded as
-    /// big-endian 32 bytes by the `abi.encode`
-    /// boundary.
-    pub timestamp: [u8; 32],
-    /// Manager-attested block hash.
-    pub block_hash: [u8; 32],
-}
-
-impl Default for TimestampAndBlockHash {
-    /// Matches the reference `Rollup.sol`'s
-    /// `getTimestampAndBlockHash()` stub: `(0, bytes32(0))`.
-    fn default() -> Self {
-        Self {
-            timestamp: [0u8; 32],
-            block_hash: [0u8; 32],
-        }
-    }
-}
-
-/// Complete proof-system plan for one L1 `postBatch` call.
+/// Complete proof-system plan for one L1 `postAndVerifyBatch` call.
 ///
 /// Maps directly to the on-chain
 /// `ProofSystemBatchPerVerificationEntries` struct's
@@ -98,7 +58,7 @@ impl Default for TimestampAndBlockHash {
 ///
 /// The `vk_matrix` is jagged:
 /// `vk_matrix[r]` has the same length as
-/// `rollup_assignments[r].proof_system_index`.
+/// `rollup_assignments[r].proof_system_indexes`.
 #[derive(Debug, Clone)]
 pub struct ProofPlan {
     /// Batch-wide ordered PS set. Strictly increasing by
@@ -108,20 +68,15 @@ pub struct ProofPlan {
     /// Per-rollup assignments, sorted by `rollup_id` ascending.
     /// Length is the rollup count for this batch.
     pub rollup_assignments: Vec<RollupProofAssignment>,
-    /// Per-rollup `(timestamp, blockHash)` parallel to
-    /// `rollup_assignments`. Each entry was fetched once via the
-    /// manager's view function ahead of the per-PS loop.
-    pub per_rollup_context: Vec<TimestampAndBlockHash>,
+    /// Opaque manager data parallel to `rollup_assignments`. On-chain this is
+    /// returned by `getCustomData(batch.blockNumber)`.
+    pub custom_data: Vec<Bytes>,
     /// Jagged vkey matrix. `vk_matrix[r][j]` is the vkey rollup
     /// `r`'s manager returned for the PS at
-    /// `rollup_assignments[r].proof_system_index[j]`. Row count
+    /// `rollup_assignments[r].proof_system_indexes[j]`. Row count
     /// equals `rollup_assignments.len()`; each row's length
-    /// equals that row's `proof_system_index.len()`.
+    /// equals that row's `proof_system_indexes.len()`.
     pub vk_matrix: Vec<Vec<[u8; 32]>>,
-    /// `crossProofSystemInteractions` field on the batch. For
-    /// single-PS phases this is `[0u8; 32]`; multi-PS quorums
-    /// fold their cross-interaction commitment in here.
-    pub cross_proof_system_interactions: [u8; 32],
 }
 
 impl ProofPlan {
@@ -176,29 +131,29 @@ pub enum ProofPlanInvariantError {
         /// first entry's `rollup_id` itself was `0`.
         index: usize,
     },
-    /// A `rollup_assignments[r].proof_system_index` was empty.
+    /// A `rollup_assignments[r].proof_system_indexes` row was empty.
     /// The on-chain check rejects this with
     /// `InvalidProofSystemConfig`.
-    #[error("rollup_assignments[{rollup_idx}].proof_system_index is empty")]
+    #[error("rollup_assignments[{rollup_idx}].proof_system_indexes is empty")]
     EmptyProofSystemIndex {
         /// Index into `rollup_assignments` of the offending row.
         rollup_idx: usize,
     },
-    /// A `proof_system_index[r][j]` was not strictly increasing.
+    /// A `proof_system_indexes[r][j]` was not strictly increasing.
     #[error(
-        "rollup_assignments[{rollup_idx}].proof_system_index not strictly increasing at {index}"
+        "rollup_assignments[{rollup_idx}].proof_system_indexes not strictly increasing at {index}"
     )]
     ProofSystemIndexNotSorted {
         /// Index into `rollup_assignments` of the offending row.
         rollup_idx: usize,
-        /// Position within that row's `proof_system_index` where
+        /// Position within that row's `proof_system_indexes` where
         /// the strict-increasing invariant first broke.
         index: usize,
     },
-    /// A `proof_system_index[r][j]` was out of bounds for
+    /// A `proof_system_indexes[r][j]` was out of bounds for
     /// `proof_systems`.
     #[error(
-        "rollup_assignments[{rollup_idx}].proof_system_index[{index}]={value} >= proof_systems.len()={ps_len}"
+        "rollup_assignments[{rollup_idx}].proof_system_indexes[{index}]={value} >= proof_systems.len()={ps_len}"
     )]
     ProofSystemIndexOutOfBounds {
         /// Index into `rollup_assignments` of the offending row.
@@ -221,9 +176,9 @@ pub enum ProofPlanInvariantError {
         got: usize,
     },
     /// A `vk_matrix[r]` row's length didn't equal the
-    /// corresponding `proof_system_index[r].len()`.
+    /// corresponding `proof_system_indexes[r].len()`.
     #[error(
-        "vk_matrix[{rollup_idx}] row width mismatch: expected {expected} (proof_system_index.len()), got {got}"
+        "vk_matrix[{rollup_idx}] row width mismatch: expected {expected} (proof_system_indexes.len()), got {got}"
     )]
     VkMatrixRowLength {
         /// Index into `rollup_assignments` of the offending row.
@@ -233,27 +188,13 @@ pub enum ProofPlanInvariantError {
         /// Actual row width found.
         got: usize,
     },
-    /// `per_rollup_context.len()` didn't equal
-    /// `rollup_assignments.len()`.
-    #[error("per_rollup_context length {got} != rollup_assignments length {expected}")]
-    PerRollupContextLength {
+    /// `custom_data.len()` didn't equal `rollup_assignments.len()`.
+    #[error("custom_data length {got} != rollup_assignments length {expected}")]
+    CustomDataLength {
         /// Expected length (matches `rollup_assignments.len()`).
         expected: usize,
         /// Actual length found.
         got: usize,
-    },
-    /// The batch's `blockNumber` and the supplied L1 block hash disagree.
-    /// A bound batch (`blockNumber != 0`) needs `blockhash(N)` to reproduce
-    /// the on-chain `getTimestampAndBlockHash` fold; a timeless batch
-    /// (`blockNumber == 0`) must not carry one.
-    #[error(
-        "blockNumber/block-hash mismatch: blockNumber={block_number}, hash supplied={hash_supplied}"
-    )]
-    BlockContextMismatch {
-        /// The batch's `blockNumber` field.
-        block_number: u64,
-        /// Whether an L1 block hash was supplied alongside it.
-        hash_supplied: bool,
     },
 }
 
@@ -275,6 +216,12 @@ impl ProofPlan {
         }
         if self.rollup_assignments.is_empty() {
             return Err(ProofPlanInvariantError::EmptyRollupAssignments);
+        }
+
+        // Solidity seeds the ordering check with address(0), so the first
+        // proof system must also be non-zero.
+        if self.proof_systems[0] == Address::ZERO {
+            return Err(ProofPlanInvariantError::ProofSystemsNotSorted { index: 0 });
         }
 
         // proof_systems strictly increasing.
@@ -302,11 +249,11 @@ impl ProofPlan {
             first = false;
         }
 
-        // per_rollup_context length matches.
-        if self.per_rollup_context.len() != self.rollup_assignments.len() {
-            return Err(ProofPlanInvariantError::PerRollupContextLength {
+        // Custom-data rows stay parallel to rollup assignments.
+        if self.custom_data.len() != self.rollup_assignments.len() {
+            return Err(ProofPlanInvariantError::CustomDataLength {
                 expected: self.rollup_assignments.len(),
-                got: self.per_rollup_context.len(),
+                got: self.custom_data.len(),
             });
         }
 
@@ -323,10 +270,10 @@ impl ProofPlan {
         // vkey row width matches.
         let ps_len = self.proof_systems.len();
         for (r, assignment) in self.rollup_assignments.iter().enumerate() {
-            if assignment.proof_system_index.is_empty() {
+            if assignment.proof_system_indexes.is_empty() {
                 return Err(ProofPlanInvariantError::EmptyProofSystemIndex { rollup_idx: r });
             }
-            for (j, pair) in assignment.proof_system_index.windows(2).enumerate() {
+            for (j, pair) in assignment.proof_system_indexes.windows(2).enumerate() {
                 if pair[0] >= pair[1] {
                     return Err(ProofPlanInvariantError::ProofSystemIndexNotSorted {
                         rollup_idx: r,
@@ -334,7 +281,7 @@ impl ProofPlan {
                     });
                 }
             }
-            for (j, &idx) in assignment.proof_system_index.iter().enumerate() {
+            for (j, &idx) in assignment.proof_system_indexes.iter().enumerate() {
                 if (idx as usize) >= ps_len {
                     return Err(ProofPlanInvariantError::ProofSystemIndexOutOfBounds {
                         rollup_idx: r,
@@ -344,7 +291,7 @@ impl ProofPlan {
                     });
                 }
             }
-            let expected_row = assignment.proof_system_index.len();
+            let expected_row = assignment.proof_system_indexes.len();
             let got_row = self.vk_matrix[r].len();
             if expected_row != got_row {
                 return Err(ProofPlanInvariantError::VkMatrixRowLength {
@@ -368,11 +315,10 @@ mod tests {
             proof_systems: vec![ps],
             rollup_assignments: vec![RollupProofAssignment {
                 rollup_id,
-                proof_system_index: vec![0],
+                proof_system_indexes: vec![0],
             }],
-            per_rollup_context: vec![TimestampAndBlockHash::default()],
+            custom_data: vec![Bytes::new()],
             vk_matrix: vec![vec![vkey]],
-            cross_proof_system_interactions: [0u8; 32],
         }
     }
 
@@ -381,9 +327,8 @@ mod tests {
         let plan = ProofPlan {
             proof_systems: vec![],
             rollup_assignments: vec![],
-            per_rollup_context: vec![],
+            custom_data: vec![],
             vk_matrix: vec![],
-            cross_proof_system_interactions: [0u8; 32],
         };
         assert_eq!(
             plan.check_invariants(),
@@ -396,9 +341,8 @@ mod tests {
         let plan = ProofPlan {
             proof_systems: vec![Address::repeat_byte(0xaa)],
             rollup_assignments: vec![],
-            per_rollup_context: vec![],
+            custom_data: vec![],
             vk_matrix: vec![],
-            cross_proof_system_interactions: [0u8; 32],
         };
         assert_eq!(
             plan.check_invariants(),
@@ -412,11 +356,10 @@ mod tests {
             proof_systems: vec![Address::repeat_byte(0xaa)],
             rollup_assignments: vec![RollupProofAssignment {
                 rollup_id: RollupId(0),
-                proof_system_index: vec![0],
+                proof_system_indexes: vec![0],
             }],
-            per_rollup_context: vec![Default::default()],
+            custom_data: vec![Bytes::new()],
             vk_matrix: vec![vec![[0u8; 32]]],
-            cross_proof_system_interactions: [0u8; 32],
         };
         assert_eq!(
             plan.check_invariants(),
@@ -430,11 +373,10 @@ mod tests {
             proof_systems: vec![Address::repeat_byte(0xaa)],
             rollup_assignments: vec![RollupProofAssignment {
                 rollup_id: RollupId(1),
-                proof_system_index: vec![],
+                proof_system_indexes: vec![],
             }],
-            per_rollup_context: vec![Default::default()],
+            custom_data: vec![Bytes::new()],
             vk_matrix: vec![vec![]],
-            cross_proof_system_interactions: [0u8; 32],
         };
         assert_eq!(
             plan.check_invariants(),
@@ -448,11 +390,10 @@ mod tests {
             proof_systems: vec![Address::repeat_byte(0xaa)],
             rollup_assignments: vec![RollupProofAssignment {
                 rollup_id: RollupId(1),
-                proof_system_index: vec![0],
+                proof_system_indexes: vec![0],
             }],
-            per_rollup_context: vec![Default::default()],
+            custom_data: vec![Bytes::new()],
             vk_matrix: vec![], // empty — should have 1 row
-            cross_proof_system_interactions: [0u8; 32],
         };
         assert_eq!(
             plan.check_invariants(),
@@ -476,11 +417,20 @@ mod tests {
         let mut plan = single_ps_plan(RollupId(1), Address::repeat_byte(0xaa), [0x42; 32]);
         plan.proof_systems = vec![Address::repeat_byte(0xaa), Address::repeat_byte(0xaa)];
         plan.vk_matrix = vec![vec![[0x42; 32]]]; // shape unchanged for the one rollup
-        plan.rollup_assignments[0].proof_system_index = vec![0];
+        plan.rollup_assignments[0].proof_system_indexes = vec![0];
         assert!(matches!(
             plan.check_invariants(),
             Err(ProofPlanInvariantError::ProofSystemsNotSorted { .. })
         ));
+    }
+
+    #[test]
+    fn zero_proof_system_rejected_first_position() {
+        let plan = single_ps_plan(RollupId(1), Address::ZERO, [0x42; 32]);
+        assert_eq!(
+            plan.check_invariants(),
+            Err(ProofPlanInvariantError::ProofSystemsNotSorted { index: 0 })
+        );
     }
 
     #[test]
@@ -490,16 +440,15 @@ mod tests {
             rollup_assignments: vec![
                 RollupProofAssignment {
                     rollup_id: RollupId(2),
-                    proof_system_index: vec![0],
+                    proof_system_indexes: vec![0],
                 },
                 RollupProofAssignment {
                     rollup_id: RollupId(1),
-                    proof_system_index: vec![0],
+                    proof_system_indexes: vec![0],
                 },
             ],
-            per_rollup_context: vec![Default::default(); 2],
+            custom_data: vec![Bytes::new(); 2],
             vk_matrix: vec![vec![[0u8; 32]], vec![[0u8; 32]]],
-            cross_proof_system_interactions: [0u8; 32],
         };
         assert!(matches!(
             plan.check_invariants(),
@@ -515,11 +464,10 @@ mod tests {
             proof_systems: vec![Address::repeat_byte(0xaa), Address::repeat_byte(0xbb)],
             rollup_assignments: vec![RollupProofAssignment {
                 rollup_id: RollupId(1),
-                proof_system_index: vec![1, 0],
+                proof_system_indexes: vec![1, 0],
             }],
-            per_rollup_context: vec![Default::default()],
+            custom_data: vec![Bytes::new()],
             vk_matrix: vec![vec![[0u8; 32], [0u8; 32]]],
-            cross_proof_system_interactions: [0u8; 32],
         };
         assert!(matches!(
             plan.check_invariants(),
@@ -533,11 +481,10 @@ mod tests {
             proof_systems: vec![Address::repeat_byte(0xaa)],
             rollup_assignments: vec![RollupProofAssignment {
                 rollup_id: RollupId(1),
-                proof_system_index: vec![5],
+                proof_system_indexes: vec![5],
             }],
-            per_rollup_context: vec![Default::default()],
+            custom_data: vec![Bytes::new()],
             vk_matrix: vec![vec![[0u8; 32]]],
-            cross_proof_system_interactions: [0u8; 32],
         };
         assert!(matches!(
             plan.check_invariants(),
@@ -555,11 +502,10 @@ mod tests {
             proof_systems: vec![Address::repeat_byte(0xaa), Address::repeat_byte(0xbb)],
             rollup_assignments: vec![RollupProofAssignment {
                 rollup_id: RollupId(1),
-                proof_system_index: vec![0, 1],
+                proof_system_indexes: vec![0, 1],
             }],
-            per_rollup_context: vec![Default::default()],
+            custom_data: vec![Bytes::new()],
             vk_matrix: vec![vec![[0u8; 32]]], // only 1 col, expected 2
-            cross_proof_system_interactions: [0u8; 32],
         };
         assert!(matches!(
             plan.check_invariants(),
@@ -572,27 +518,26 @@ mod tests {
     }
 
     #[test]
-    fn per_rollup_context_length_must_match() {
+    fn custom_data_length_must_match() {
         let plan = ProofPlan {
             proof_systems: vec![Address::repeat_byte(0xaa)],
             rollup_assignments: vec![RollupProofAssignment {
                 rollup_id: RollupId(1),
-                proof_system_index: vec![0],
+                proof_system_indexes: vec![0],
             }],
-            per_rollup_context: vec![],
+            custom_data: vec![],
             vk_matrix: vec![vec![[0u8; 32]]],
-            cross_proof_system_interactions: [0u8; 32],
         };
         assert!(matches!(
             plan.check_invariants(),
-            Err(ProofPlanInvariantError::PerRollupContextLength { .. })
+            Err(ProofPlanInvariantError::CustomDataLength { .. })
         ));
     }
 
     #[test]
-    fn timestamp_and_block_hash_default_matches_solidity_stub() {
-        let ctx = TimestampAndBlockHash::default();
-        assert_eq!(ctx.timestamp, [0u8; 32]);
-        assert_eq!(ctx.block_hash, [0u8; 32]);
+    fn custom_data_is_opaque() {
+        let mut plan = single_ps_plan(RollupId(1), Address::repeat_byte(0xaa), [0x42; 32]);
+        plan.custom_data[0] = Bytes::from_static(b"manager-defined");
+        plan.check_invariants().expect("opaque bytes are accepted");
     }
 }

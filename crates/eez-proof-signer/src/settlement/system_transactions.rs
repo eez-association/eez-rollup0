@@ -9,7 +9,6 @@ use std::num::NonZeroU64;
 
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_signer_local::PrivateKeySigner;
-use eez_protocol::SYSTEM_ADDRESS;
 use eez_protocol::abi::ExecutionEntrySol;
 use thiserror::Error;
 
@@ -23,7 +22,7 @@ const SYSTEM_TRANSACTION_GAS_LIMIT: u64 = 2_000_000;
 /// System private key used to reconstruct signed Sync-block transactions
 /// omitted from DA.
 ///
-/// The key must be the deployment key for [`SYSTEM_ADDRESS`]. System
+/// The key must derive the deployment-configured L2 system address. System
 /// transactions present in Composer-supplied block RLP but omitted from batch
 /// DA are accepted only when they byte-match the sequence independently
 /// reconstructed with this key.
@@ -33,7 +32,7 @@ impl fmt::Debug for SystemTransactionKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SystemTransactionKey")
-            .field("address", &SYSTEM_ADDRESS)
+            .field("address", &self.0.address())
             .finish_non_exhaustive()
     }
 }
@@ -47,19 +46,27 @@ pub(crate) enum SystemTransactionConfigError {
 }
 
 impl SystemTransactionKey {
-    /// Parse once into the canonical signer and pin it to the reserved
-    /// system address; no secret representation other than the signer is kept.
-    pub(crate) fn new(private_key: B256) -> Result<Self, SystemTransactionConfigError> {
+    /// Parse once and bind the key to the address selected by deployment; no
+    /// secret representation other than the signer is kept.
+    pub(crate) fn new(
+        private_key: B256,
+        expected_address: Address,
+    ) -> Result<Self, SystemTransactionConfigError> {
         let signer = PrivateKeySigner::from_bytes(&private_key)
             .map_err(|_| SystemTransactionConfigError::InvalidPrivateKey)?;
         let actual = signer.address();
-        if actual != SYSTEM_ADDRESS {
+        if actual != expected_address {
             return Err(SystemTransactionConfigError::WrongAddress {
-                expected: SYSTEM_ADDRESS,
+                expected: expected_address,
                 actual,
             });
         }
         Ok(Self(signer))
+    }
+
+    /// Return the deployment address already verified by [`Self::new`].
+    pub(crate) fn address(&self) -> Address {
+        self.0.address()
     }
 
     /// Complete the operator-configured reconstruction context with chain identity.
@@ -71,7 +78,7 @@ impl SystemTransactionKey {
         SystemTransactionReconstructor {
             context: eez_protocol::system_tx::SystemTxContext {
                 system_signer: self.0,
-                ccm_l2_address: EEZL2_ADDRESS,
+                eezl2_address: EEZL2_ADDRESS,
                 l2_chain_id,
                 l2_gas_price: SYSTEM_TRANSACTION_GAS_PRICE,
                 l2_gas_limit: SYSTEM_TRANSACTION_GAS_LIMIT,
@@ -113,7 +120,7 @@ impl fmt::Debug for SystemTransactionReconstructor {
         formatter
             .debug_struct("SystemTransactionReconstructor")
             .field("system_address", &self.context.system_signer.address())
-            .field("ccm_l2_address", &self.context.ccm_l2_address)
+            .field("eezl2_address", &self.context.eezl2_address)
             .field("l2_chain_id", &self.context.l2_chain_id)
             .field("l2_gas_price", &self.context.l2_gas_price)
             .field("l2_gas_limit", &self.context.l2_gas_limit)

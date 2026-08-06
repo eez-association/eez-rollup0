@@ -1,9 +1,12 @@
 # syntax=docker/dockerfile:1
 # Deploy contracts and generate the L2 genesis inside the CI enclave.
 
+ARG EEZ_NODE_IMAGE=eez-node:dev
+FROM ${EEZ_NODE_IMAGE} AS node-tools
+
 FROM debian:bookworm-slim
 
-ARG FOUNDRY_VERSION=stable
+ARG FOUNDRY_VERSION=v1.7.1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash git jq python3 curl ca-certificates \
@@ -12,6 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV PATH="/root/.foundry/bin:${PATH}"
 RUN curl -L https://foundry.paradigm.xyz | bash \
     && foundryup -i "${FOUNDRY_VERSION}"
+
+COPY --from=node-tools /usr/local/bin/eez-genesis-state-root /usr/local/bin/eez-genesis-state-root
 
 WORKDIR /repo
 COPY scripts ./scripts

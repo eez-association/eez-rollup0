@@ -14,8 +14,9 @@ must verify those external relationships.
 
 The two private keys have different authority:
 
-- the attestation key signs only an `AttestablePublicInputsHash` authorized by
-  the complete pipeline, using raw/prehash ECDSA without an EIP-191 prefix; and
+- the daemon uses the attestation key only after the complete pipeline produces
+  an `AttestablePublicInputsHash`, signing it with raw/prehash ECDSA and no
+  EIP-191 prefix; and
 - the L2 system-transaction key reconstructs omitted legacy EIP-155 L2 system
   transactions and must derive the reserved system address.
 

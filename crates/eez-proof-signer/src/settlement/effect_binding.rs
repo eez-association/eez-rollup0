@@ -1,11 +1,12 @@
 //! Binding Composer-claimed effects to locally validated execution evidence.
 
-use alloy_primitives::{B256, I256, U256};
-use eez_protocol::abi::{ExecutionEntrySol, LookupCallSol, StateDeltaSol};
+use alloy_primitives::{B256, I256};
+use eez_protocol::abi::{ExecutionEntrySol, StateUpdateSol};
+use eez_protocol::rolling_hash::EntryRollingHash;
 use thiserror::Error;
 
 use super::blocks::SettlingBlockObservations;
-use super::state_chain::VerifiedStateDeltaChain;
+use super::state_chain::VerifiedStateUpdateChain;
 use crate::validate::TransactionStateCheckpoint;
 
 /// Shape classification of one claimed batch entry; every unsupported shape
@@ -50,7 +51,7 @@ pub(super) struct BoundEffect<'batch> {
     transaction_index: usize,
     kind: EffectKind,
     claimed_entry: &'batch ExecutionEntrySol,
-    claimed_state_delta: &'batch StateDeltaSol,
+    claimed_state_update: &'batch StateUpdateSol,
 }
 
 impl<'batch> BoundEffect<'batch> {
@@ -70,8 +71,8 @@ impl<'batch> BoundEffect<'batch> {
         self.claimed_entry
     }
 
-    pub(super) const fn claimed_state_delta(&self) -> &'batch StateDeltaSol {
-        self.claimed_state_delta
+    pub(super) const fn claimed_state_update(&self) -> &'batch StateUpdateSol {
+        self.claimed_state_update
     }
 }
 
@@ -80,17 +81,12 @@ impl<'batch> BoundEffect<'batch> {
 /// Construction remains local so this type can serve as validation evidence.
 pub(crate) struct BoundEffectSequence<'batch, 'settling> {
     effects: Vec<BoundEffect<'batch>>,
-    submitted_lookup_calls: &'batch [LookupCallSol],
     settling_observations: &'settling SettlingBlockObservations,
 }
 
 impl<'batch, 'settling> BoundEffectSequence<'batch, 'settling> {
     pub(super) fn effects(&self) -> &[BoundEffect<'batch>] {
         &self.effects
-    }
-
-    pub(super) const fn submitted_lookup_calls(&self) -> &'batch [LookupCallSol] {
-        self.submitted_lookup_calls
     }
 
     pub(super) const fn settling_observations(&self) -> &'settling SettlingBlockObservations {
@@ -166,22 +162,22 @@ pub(crate) enum EffectPrefixError {
     NonZeroAnchorEtherDelta { claimed: I256 },
 }
 
-/// Bind each verified state-chain entry to its settling-block candidate and
+/// Bind each verified state-update-chain entry to its settling-block candidate and
 /// transaction state checkpoint.
 ///
-/// [`VerifiedStateDeltaChain`] already guarantees a nonempty batch with exactly
-/// one continuous, expected-rollup delta per entry. This gate adds effect-shape,
+/// [`VerifiedStateUpdateChain`] already guarantees a nonempty batch with exactly
+/// one continuous, expected-rollup update per entry. This gate adds effect-shape,
 /// candidate, and checkpoint bindings. For a nonempty effect set, the anchor's
 /// `newState` must equal the validated pre-settling root.
 pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
-    verified_state_chain: &VerifiedStateDeltaChain<'batch>,
+    verified_state_chain: &VerifiedStateUpdateChain<'batch>,
     validated_settling_pre_state_root: B256,
     computed_transaction_state_checkpoints: &[TransactionStateCheckpoint],
     settling_observations: &'settling SettlingBlockObservations,
 ) -> Result<BoundEffectSequence<'batch, 'settling>, EffectPrefixError> {
-    let (leading, anchor_delta) = verified_state_chain.leading();
+    let (leading, anchor_update) = verified_state_chain.leading();
     let settled_rollup = verified_state_chain.expected_rollup();
-    let leading_kind = classify_claimed_entry(leading, settled_rollup);
+    let leading_kind = classify_claimed_entry(leading, anchor_update, settled_rollup);
     if leading_kind != ClaimedEntryShape::Anchor {
         return Err(EffectPrefixError::LeadingEntryNotAnchor {
             actual: leading_kind,
@@ -189,8 +185,8 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
     }
 
     let mut claimed_effects = Vec::with_capacity(verified_state_chain.trailing_len());
-    for (entry_index, entry, delta) in verified_state_chain.trailing() {
-        match classify_claimed_entry(entry, settled_rollup) {
+    for (entry_index, entry, update) in verified_state_chain.trailing() {
+        match classify_claimed_entry(entry, update, settled_rollup) {
             ClaimedEntryShape::Anchor => {
                 return Err(EffectPrefixError::LaterAnchor { entry_index });
             }
@@ -198,10 +194,10 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
                 return Err(EffectPrefixError::InvalidEntry { entry_index });
             }
             ClaimedEntryShape::Outbound => {
-                claimed_effects.push((entry_index, EffectKind::Outbound, entry, delta));
+                claimed_effects.push((entry_index, EffectKind::Outbound, entry, update));
             }
             ClaimedEntryShape::Inbound => {
-                claimed_effects.push((entry_index, EffectKind::Inbound, entry, delta));
+                claimed_effects.push((entry_index, EffectKind::Inbound, entry, update));
             }
         }
     }
@@ -214,13 +210,13 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
     }
     // A canonical anchor carries no cross-chain value. Check this only after
     // the leading Composer entry has actually been classified as an anchor.
-    if anchor_delta.etherDelta != I256::ZERO {
+    if anchor_update.etherDelta != I256::ZERO {
         return Err(EffectPrefixError::NonZeroAnchorEtherDelta {
-            claimed: anchor_delta.etherDelta,
+            claimed: anchor_update.etherDelta,
         });
     }
     // With no effects the batch never represents the pre-settling root; the
-    // delta-chain gate binds the anchor's `newState` to the final root instead.
+    // state-update-chain gate binds the anchor's `newState` to the final root instead.
     if claimed == 0 {
         if !computed_transaction_state_checkpoints.is_empty() {
             return Err(EffectPrefixError::TransactionStateCheckpointCountMismatch {
@@ -230,15 +226,14 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
         }
         return Ok(BoundEffectSequence {
             effects: Vec::new(),
-            submitted_lookup_calls: verified_state_chain.submitted_lookup_calls(),
             settling_observations,
         });
     }
 
-    if anchor_delta.newState != validated_settling_pre_state_root {
+    if anchor_update.newState != validated_settling_pre_state_root {
         return Err(EffectPrefixError::AnchorRootMismatch {
             validated_pre_settling_root: validated_settling_pre_state_root,
-            claimed_anchor_post_state: anchor_delta.newState,
+            claimed_anchor_post_state: anchor_update.newState,
         });
     }
     if computed_transaction_state_checkpoints.len() != observed {
@@ -251,7 +246,8 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
     let mut bound_effects = Vec::with_capacity(claimed);
     // Equal counts were established above, so one index names the claim, its
     // observed transaction boundary, and the locally recomputed checkpoint.
-    for (effect_index, (entry_index, kind, entry, delta)) in claimed_effects.into_iter().enumerate()
+    for (effect_index, (entry_index, kind, entry, update)) in
+        claimed_effects.into_iter().enumerate()
     {
         let transaction_index = effect_candidate_positions[effect_index];
         let checkpoint = &computed_transaction_state_checkpoints[effect_index];
@@ -282,7 +278,7 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
             });
         }
         let recomputed_checkpoint = checkpoint.state_root;
-        let claimed_post_state = delta.newState;
+        let claimed_post_state = update.newState;
         if claimed_post_state != recomputed_checkpoint {
             return Err(EffectPrefixError::EffectStateRootMismatch {
                 entry_index,
@@ -296,30 +292,52 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
             transaction_index,
             kind,
             claimed_entry: entry,
-            claimed_state_delta: delta,
+            claimed_state_update: update,
         });
     }
 
     Ok(BoundEffectSequence {
         effects: bound_effects,
-        submitted_lookup_calls: verified_state_chain.submitted_lookup_calls(),
         settling_observations,
     })
 }
 
-/// Classification reads only the discriminating fields; the per-kind effect
-/// gates validate the entries in depth.
-fn classify_claimed_entry(entry: &ExecutionEntrySol, settled_rollup: U256) -> ClaimedEntryShape {
+/// Classification establishes the complete supported shape for each effect
+/// kind; the per-kind gates bind that shape to locally recovered evidence.
+fn classify_claimed_entry(
+    entry: &ExecutionEntrySol,
+    update: &StateUpdateSol,
+    settled_rollup: u64,
+) -> ClaimedEntryShape {
+    if !entry.success || !entry.expectedL1ToL2Calls.is_empty() {
+        return ClaimedEntryShape::Invalid;
+    }
+
     if entry.proxyEntryHash != B256::ZERO {
-        ClaimedEntryShape::Inbound
-    } else if !entry.l2ToL1Calls.is_empty() {
-        ClaimedEntryShape::Outbound
-    } else if entry.destinationRollupId == settled_rollup
-        && entry.expectedL1ToL2Calls.is_empty()
-        && entry.expectedLookups.is_empty()
-        && entry.callCount.is_zero()
+        return if entry.l2ToL1Calls.is_empty() {
+            ClaimedEntryShape::Inbound
+        } else {
+            ClaimedEntryShape::Invalid
+        };
+    }
+    if !entry.l2ToL1Calls.is_empty() {
+        return if entry.l2ToL1Calls.len() == 1
+            && entry.l2ToL1Calls[0].revertNextNCalls == 0
+            && !entry.l2ToL1Calls[0].isStatic
+            && entry.l2ToL1Calls[0].gas == 0
+        {
+            ClaimedEntryShape::Outbound
+        } else {
+            ClaimedEntryShape::Invalid
+        };
+    }
+
+    let expected_anchor_hash =
+        EntryRollingHash::seed_for_l1([(update.rollupId, update.currentState)], B256::ZERO)
+            .current();
+    if entry.destinationRollupId == settled_rollup
         && entry.returnData.is_empty()
-        && entry.rollingHash == B256::ZERO
+        && entry.rollingHash == expected_anchor_hash
     {
         ClaimedEntryShape::Anchor
     } else {

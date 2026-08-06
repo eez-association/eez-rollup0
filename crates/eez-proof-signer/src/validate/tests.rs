@@ -129,11 +129,7 @@ fn rejects_an_outbound_observation_outside_the_block() {
     let mut output = backend_output_for(&window);
     output.blocks[0]
         .settlement_evidence
-        .observed_outbound_events = vec![OutboundEventObservation {
-        transaction_index: 2,
-        receipt_log_index: 0,
-        decoded_call_hash: None,
-    }];
+        .observed_outbound_events = vec![OutboundEventObservation::malformed_for_test(2, 0)];
     let validator = Validator::stub(vec![Ok(output)]);
     assert!(matches!(
         validator.validate(&window),
@@ -148,16 +144,8 @@ fn rejects_unordered_outbound_observations() {
     output.blocks[0]
         .settlement_evidence
         .observed_outbound_events = vec![
-        OutboundEventObservation {
-            transaction_index: 1,
-            receipt_log_index: 0,
-            decoded_call_hash: None,
-        },
-        OutboundEventObservation {
-            transaction_index: 0,
-            receipt_log_index: 0,
-            decoded_call_hash: None,
-        },
+        OutboundEventObservation::malformed_for_test(1, 0),
+        OutboundEventObservation::malformed_for_test(0, 0),
     ];
     let validator = Validator::stub(vec![Ok(output)]);
     assert!(matches!(

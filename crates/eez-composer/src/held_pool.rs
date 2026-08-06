@@ -3,8 +3,7 @@
 //!
 //! Cross-chain txs (detected at `TxIngress` time per §5.4.5) sit here
 //! between submission and the next Sync slot, where they're drained,
-//! handed to the umbrella's
-//! [`eez_protocol::Composer`] for `simulate_and_resolve`, and the
+//! handed to the umbrella's [`crate::Composer`] for simulation, and the
 //! resulting `system_txs` get bundled into the Sync block.
 //!
 //! Held-pool drain semantics:

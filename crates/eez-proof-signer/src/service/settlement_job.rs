@@ -108,6 +108,7 @@ pub(super) fn validate_and_settle(
         submitted_post_batch_calldata,
         validated_window: &validated_window,
         expected_rollup_id: state.expected_rollup_id,
+        expected_l2_system_address: state.expected_l2_system_address,
         proof_system_vkey: state.attester.proof_system_vkey(),
         expected_proof_system: state.attester.expected_proof_system(),
         system_transaction_reconstructor: &state.system_transaction_reconstructor,
@@ -129,6 +130,7 @@ pub(super) struct SettlementInput<'a> {
     pub(super) submitted_post_batch_calldata: Vec<u8>,
     pub(super) validated_window: &'a validate::ValidatedWindow,
     pub(super) expected_rollup_id: NonZeroU64,
+    pub(super) expected_l2_system_address: Address,
     pub(super) proof_system_vkey: crate::attest::NonZeroProofSystemVkey,
     pub(super) expected_proof_system: Address,
     pub(super) system_transaction_reconstructor: &'a settlement::SystemTransactionReconstructor,
@@ -144,7 +146,7 @@ pub(super) enum SettlementPipelineError {
     #[error(transparent)]
     BlockInspection(#[from] settlement::BlockInspectionError),
     #[error(transparent)]
-    StateDeltaChain(#[from] settlement::StateDeltaChainError),
+    StateUpdateChain(#[from] settlement::StateUpdateChainError),
     #[error(transparent)]
     EffectPrefix(#[from] settlement::EffectPrefixError),
     #[error(transparent)]
@@ -163,7 +165,7 @@ impl SettlementPipelineError {
             Self::PostBatchCalldata(_) => "post_batch_calldata",
             Self::PublicInputs(_) => "public_inputs",
             Self::BlockInspection(_) => "block_inspection",
-            Self::StateDeltaChain(_) => "state_delta_chain",
+            Self::StateUpdateChain(_) => "state_update_chain",
             Self::EffectPrefix(_) => "effect_prefix",
             Self::InboundEffects(_) => "inbound_effects",
             Self::OutboundEffects(_) => "outbound_effects",
@@ -223,7 +225,7 @@ impl SettlementPipelineError {
                 ),
             },
             Self::PublicInputs(settlement::PublicInputError::InvalidStructure(_))
-            | Self::StateDeltaChain(_)
+            | Self::StateUpdateChain(_)
             | Self::InboundEffects(_)
             | Self::OutboundEffects(_) => (
                 tonic::Code::FailedPrecondition,
@@ -269,6 +271,7 @@ pub(super) fn run_settlement(
         submitted_post_batch_calldata,
         validated_window,
         expected_rollup_id,
+        expected_l2_system_address,
         proof_system_vkey,
         expected_proof_system,
         system_transaction_reconstructor,
@@ -283,7 +286,7 @@ pub(super) fn run_settlement(
         expected_proof_system,
     )?;
 
-    let verified_state_chain = settlement::verify_state_delta_chain(
+    let verified_state_chain = settlement::verify_state_update_chain(
         &canonical_batch,
         expected_rollup_id,
         validated_window.window_pre_state_root(),
@@ -308,8 +311,11 @@ pub(super) fn run_settlement(
     // capabilities accepted by exact DA reconstruction.
     let authorized_inbound_effects =
         settlement::authorize_inbound_effects(&bound_effects, expected_rollup_id)?;
-    let authorized_outbound_effects =
-        settlement::authorize_outbound_effects(&bound_effects, expected_rollup_id)?;
+    let authorized_outbound_effects = settlement::authorize_outbound_effects(
+        &bound_effects,
+        expected_rollup_id,
+        expected_l2_system_address,
+    )?;
 
     ensure_settlement_active(cancellation)?;
 

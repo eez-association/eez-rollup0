@@ -5,7 +5,7 @@
 //! [`Sequencer::run`] is the long-running loop. Each iteration handles one
 //! of:
 //!
-//! 1. A scheduler tick. [`Sequencer::advance`] runs in a loop, producing
+//! 1. A scheduler tick. `Sequencer::advance` runs in a loop, producing
 //!    blocks at deterministic `parent.timestamp() + BLOCK_TIME_SECS`
 //!    slots until the chain catches up to the tick's wall-clock target.
 //!    Most ticks produce a single block (the chain is on cadence); after

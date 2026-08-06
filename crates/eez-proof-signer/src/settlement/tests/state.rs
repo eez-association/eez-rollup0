@@ -1,38 +1,38 @@
 use super::*;
 
 #[test]
-fn accepts_a_single_or_multi_entry_state_delta_chain() {
+fn accepts_a_single_or_multi_entry_state_update_chain() {
     let a = B256::repeat_byte(0x0a);
     let b = B256::repeat_byte(0x0b);
     let c = B256::repeat_byte(0x0c);
 
     assert_eq!(
-        verify_state_delta_chain(&state_chain(&[a, a]), expected_rollup_id(), a, a).map(|_| ()),
+        verify_state_update_chain(&state_chain(&[a, a]), expected_rollup_id(), a, a).map(|_| ()),
         Ok(())
     );
     assert_eq!(
-        verify_state_delta_chain(&state_chain(&[a, b, c]), expected_rollup_id(), a, c).map(|_| ()),
+        verify_state_update_chain(&state_chain(&[a, b, c]), expected_rollup_id(), a, c).map(|_| ()),
         Ok(())
     );
 }
 
 #[test]
-fn rejects_missing_or_non_singular_state_deltas() {
+fn rejects_missing_or_non_singular_state_updates() {
     let root = B256::ZERO;
     let empty = CanonicalPostBatch::from_decoded_for_test(EvmBatch::default());
     assert_eq!(
-        verify_state_delta_chain(&empty, expected_rollup_id(), root, root).map(|_| ()),
-        Err(StateDeltaChainError::NoEntries)
+        verify_state_update_chain(&empty, expected_rollup_id(), root, root).map(|_| ()),
+        Err(StateUpdateChainError::NoEntries)
     );
 
     for entry_index in [0, 1] {
         for actual in [0, 2] {
             let mut batch = state_chain(&[root, root, root]);
-            let delta = batch.entries[entry_index].stateDeltas[0].clone();
-            batch.entries[entry_index].stateDeltas = vec![delta; actual];
+            let update = batch.entries[entry_index].stateUpdates[0].clone();
+            batch.entries[entry_index].stateUpdates = vec![update; actual];
             assert_eq!(
-                verify_state_delta_chain(&batch, expected_rollup_id(), root, root).map(|_| ()),
-                Err(StateDeltaChainError::DeltaCount {
+                verify_state_update_chain(&batch, expected_rollup_id(), root, root).map(|_| ()),
+                Err(StateUpdateChainError::UpdateCount {
                     entry_index,
                     actual,
                 })
@@ -42,55 +42,44 @@ fn rejects_missing_or_non_singular_state_deltas() {
 }
 
 #[test]
-fn rejects_invalid_or_inconsistent_state_delta_rollup_ids() {
+fn rejects_invalid_or_inconsistent_state_update_rollup_ids() {
     let root = B256::ZERO;
 
     let mut zero = state_chain(&[root, root]);
-    zero.entries[0].stateDeltas[0].rollupId = U256::ZERO;
+    zero.entries[0].stateUpdates[0].rollupId = 0;
     assert_eq!(
-        verify_state_delta_chain(&zero, expected_rollup_id(), root, root).map(|_| ()),
-        Err(StateDeltaChainError::ExpectedRollupMismatch {
+        verify_state_update_chain(&zero, expected_rollup_id(), root, root).map(|_| ()),
+        Err(StateUpdateChainError::ExpectedRollupMismatch {
             expected: 1,
-            claimed: U256::ZERO,
-        })
-    );
-
-    let too_large = U256::from(u64::MAX) + U256::from(1);
-    let mut out_of_range = state_chain(&[root, root]);
-    out_of_range.entries[0].stateDeltas[0].rollupId = too_large;
-    assert_eq!(
-        verify_state_delta_chain(&out_of_range, expected_rollup_id(), root, root).map(|_| ()),
-        Err(StateDeltaChainError::ExpectedRollupMismatch {
-            expected: 1,
-            claimed: too_large,
+            claimed: 0,
         })
     );
 
     let mut wrong_expected_rollup = state_chain(&[root, root]);
-    wrong_expected_rollup.entries[0].stateDeltas[0].rollupId = U256::from(2);
+    wrong_expected_rollup.entries[0].stateUpdates[0].rollupId = 2;
     assert_eq!(
-        verify_state_delta_chain(&wrong_expected_rollup, expected_rollup_id(), root, root)
+        verify_state_update_chain(&wrong_expected_rollup, expected_rollup_id(), root, root)
             .map(|_| ()),
-        Err(StateDeltaChainError::ExpectedRollupMismatch {
+        Err(StateUpdateChainError::ExpectedRollupMismatch {
             expected: 1,
-            claimed: U256::from(2),
+            claimed: 2,
         })
     );
 
     let mut mixed = state_chain(&[root, root, root]);
-    mixed.entries[1].stateDeltas[0].rollupId = U256::from(2);
+    mixed.entries[1].stateUpdates[0].rollupId = 2;
     assert_eq!(
-        verify_state_delta_chain(&mixed, expected_rollup_id(), root, root).map(|_| ()),
-        Err(StateDeltaChainError::RollupMismatch {
+        verify_state_update_chain(&mixed, expected_rollup_id(), root, root).map(|_| ()),
+        Err(StateUpdateChainError::RollupMismatch {
             entry_index: 1,
-            expected: U256::from(1),
-            claimed: U256::from(2),
+            expected: 1,
+            claimed: 2,
         })
     );
 }
 
 #[test]
-fn rejects_wrong_state_delta_endpoints_or_a_chain_break() {
+fn rejects_wrong_state_update_endpoints_or_a_chain_break() {
     let a = B256::repeat_byte(0x0a);
     let b = B256::repeat_byte(0x0b);
     let c = B256::repeat_byte(0x0c);
@@ -98,25 +87,25 @@ fn rejects_wrong_state_delta_endpoints_or_a_chain_break() {
     let batch = state_chain(&[a, b, c]);
 
     assert_eq!(
-        verify_state_delta_chain(&batch, expected_rollup_id(), wrong, c).map(|_| ()),
-        Err(StateDeltaChainError::InitialRootMismatch {
+        verify_state_update_chain(&batch, expected_rollup_id(), wrong, c).map(|_| ()),
+        Err(StateUpdateChainError::InitialRootMismatch {
             validated: wrong,
             claimed: a,
         })
     );
     assert_eq!(
-        verify_state_delta_chain(&batch, expected_rollup_id(), a, wrong).map(|_| ()),
-        Err(StateDeltaChainError::FinalMismatch {
+        verify_state_update_chain(&batch, expected_rollup_id(), a, wrong).map(|_| ()),
+        Err(StateUpdateChainError::FinalMismatch {
             validated: wrong,
             claimed: c,
         })
     );
 
     let mut broken = batch;
-    broken.entries[1].stateDeltas[0].currentState = wrong;
+    broken.entries[1].stateUpdates[0].currentState = wrong;
     assert_eq!(
-        verify_state_delta_chain(&broken, expected_rollup_id(), a, c).map(|_| ()),
-        Err(StateDeltaChainError::ChainBreak {
+        verify_state_update_chain(&broken, expected_rollup_id(), a, c).map(|_| ()),
+        Err(StateUpdateChainError::ChainBreak {
             entry_index: 1,
             previous_claimed_post_state: b,
             next_claimed_pre_state: wrong,
@@ -133,10 +122,10 @@ fn accepts_only_a_canonical_anchor_for_an_empty_settling_block() {
     let empty = verify_effect_prefix(&batch, root, &[], &settling).unwrap();
     assert_eq!((empty.inbound_count(), empty.outbound_count()), (0, 0));
 
-    let recorded = recorded_batch();
-    let recorded = verify_effect_prefix(&recorded, root, &[], &settling).unwrap();
+    let target_batch = target_anchor_batch();
+    let target_batch = verify_effect_prefix(&target_batch, root, &[], &settling).unwrap();
     assert_eq!(
-        (recorded.inbound_count(), recorded.outbound_count()),
+        (target_batch.inbound_count(), target_batch.outbound_count()),
         (0, 0)
     );
 }
@@ -147,12 +136,30 @@ fn canonical_anchor_requires_a_zero_ether_delta() {
     let settling = settling_with_effect_candidates(Vec::new());
     for claimed in [I256::ONE, -I256::ONE] {
         let mut batch = state_chain(&[root, root]);
-        batch.entries[0].stateDeltas[0].etherDelta = claimed;
+        batch.entries[0].stateUpdates[0].etherDelta = claimed;
         assert_eq!(
             verify_effect_prefix(&batch, root, &[], &settling).err(),
             Some(EffectPrefixError::NonZeroAnchorEtherDelta { claimed })
         );
     }
+}
+
+#[test]
+fn canonical_anchor_uses_the_exact_l1_rolling_seed() {
+    let current = B256::repeat_byte(0x11);
+    let batch = state_chain(&[current, current]);
+    let expected = EntryRollingHash::seed_for_l1([(1, current)], B256::ZERO).current();
+
+    assert_eq!(batch.entries[0].rollingHash, expected);
+    assert!(
+        verify_effect_prefix(
+            &batch,
+            current,
+            &[],
+            &settling_with_effect_candidates(Vec::new())
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -162,7 +169,7 @@ fn rejects_every_noncanonical_anchor_field() {
     let mut cases = Vec::new();
 
     let mut batch = valid.clone();
-    batch.entries[0].destinationRollupId = U256::from(2);
+    batch.entries[0].destinationRollupId = 2;
     cases.push(batch);
 
     let mut batch = valid.clone();
@@ -170,11 +177,7 @@ fn rejects_every_noncanonical_anchor_field() {
     cases.push(batch);
 
     let mut batch = valid.clone();
-    batch.entries[0].expectedLookups.push(expected_lookup());
-    cases.push(batch);
-
-    let mut batch = valid.clone();
-    batch.entries[0].callCount = U256::from(1);
+    batch.entries[0].success = false;
     cases.push(batch);
 
     let mut batch = valid.clone();
@@ -232,7 +235,7 @@ fn rejects_later_anchors_and_invalid_entries() {
     );
 
     let mut invalid = anchors;
-    invalid.entries[1].callCount = U256::from(1);
+    invalid.entries[1].success = false;
     assert_eq!(
         verify_effect_prefix(&invalid, root, &[], &settling).err(),
         Some(EffectPrefixError::InvalidEntry { entry_index: 1 })
@@ -372,14 +375,14 @@ fn effect_checkpoints_cannot_hide_a_post_block_state_change() {
         &[ClaimedEntryShape::Outbound],
     );
     assert_eq!(
-        verify_state_delta_chain(
+        verify_state_update_chain(
             &transaction_endpoint,
             expected_rollup_id(),
             anchor,
             final_root,
         )
         .map(|_| ()),
-        Err(StateDeltaChainError::FinalMismatch {
+        Err(StateUpdateChainError::FinalMismatch {
             validated: final_root,
             claimed: transaction_root,
         })
@@ -390,7 +393,8 @@ fn effect_checkpoints_cannot_hide_a_post_block_state_change() {
         &[ClaimedEntryShape::Outbound],
     );
     assert!(
-        verify_state_delta_chain(&final_endpoint, expected_rollup_id(), anchor, final_root).is_ok()
+        verify_state_update_chain(&final_endpoint, expected_rollup_id(), anchor, final_root)
+            .is_ok()
     );
     assert_eq!(
         verify_effect_prefix(&final_endpoint, pre_settling, &checkpoints, &settling,).err(),

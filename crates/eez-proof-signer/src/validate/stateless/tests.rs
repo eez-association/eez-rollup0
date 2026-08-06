@@ -1,19 +1,14 @@
 use std::num::NonZeroU64;
 
 use alloy_consensus::{Header, SignableTransaction as _, TxLegacy};
-use alloy_primitives::{Address, B256, Bytes, I256, Log, Signature, TxKind, U256, b256};
+use alloy_primitives::{B256, Bytes, Log, Signature, TxKind, U256, b256};
 use alloy_sol_types::SolEvent as _;
-use eez_protocol::EvmBatch;
-use eez_protocol::abi::{ExecutionEntrySol, StateDeltaSol};
 use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable as _;
 
 use super::*;
-use crate::settlement::{
-    CanonicalPostBatch, authorize_inbound_effects, bind_effects_to_execution,
-    inspect_validated_settling_block, verify_state_delta_chain,
-};
-use crate::testkit::SYSTEM_TX;
+use crate::settlement::inspect_validated_settling_block;
+use crate::testkit::{SYSTEM_TX, TEST_SYSTEM_ADDRESS};
 use crate::validate::ValidatedBlock;
 
 fn fixture_chain_config() -> ChainConfig {
@@ -119,6 +114,10 @@ fn checkpoint(transaction_index: usize) -> TransactionStateCheckpoint {
 }
 
 fn outbound_log(address: Address, call_hash: B256) -> Log {
+    outbound_log_with_gas(address, call_hash, 0)
+}
+
+fn outbound_log_with_gas(address: Address, call_hash: B256, call_gas: u64) -> Log {
     Log {
         address,
         data: CrossChainCallExecuted {
@@ -127,6 +126,7 @@ fn outbound_log(address: Address, call_hash: B256) -> Log {
             sourceAddress: Address::repeat_byte(0x11),
             callData: Bytes::from_static(&[0xaa, 0xbb]),
             value: U256::from(7),
+            callGas: call_gas,
         }
         .encode_log_data(),
     }
@@ -156,16 +156,14 @@ fn outbound_observations_require_the_eezl2_emitter_and_event_signature() {
 
     assert_eq!(
         observe_outbound_events(&[receipt_with_logs(logs)]),
-        [OutboundEventObservation {
-            transaction_index: 0,
-            receipt_log_index: 2,
-            decoded_call_hash: Some(call_hash),
-        }]
+        [OutboundEventObservation::decoded_for_test(
+            0, 2, call_hash, 0,
+        )]
     );
 }
 
 #[test]
-fn malformed_named_outbound_events_are_retained_without_a_hash() {
+fn malformed_named_outbound_events_are_retained_without_decoded_fields() {
     let call_hash = B256::repeat_byte(0x33);
     let mut topic0_only = outbound_log(EEZL2_ADDRESS, call_hash);
     topic0_only.data.topics_mut_unchecked().truncate(1);
@@ -189,26 +187,10 @@ fn malformed_named_outbound_events_are_retained_without_a_hash() {
             trailing_body,
         ])]),
         [
-            OutboundEventObservation {
-                transaction_index: 0,
-                receipt_log_index: 0,
-                decoded_call_hash: None,
-            },
-            OutboundEventObservation {
-                transaction_index: 0,
-                receipt_log_index: 1,
-                decoded_call_hash: None,
-            },
-            OutboundEventObservation {
-                transaction_index: 0,
-                receipt_log_index: 2,
-                decoded_call_hash: None,
-            },
-            OutboundEventObservation {
-                transaction_index: 0,
-                receipt_log_index: 3,
-                decoded_call_hash: None,
-            },
+            OutboundEventObservation::malformed_for_test(0, 0),
+            OutboundEventObservation::malformed_for_test(0, 1),
+            OutboundEventObservation::malformed_for_test(0, 2),
+            OutboundEventObservation::malformed_for_test(0, 3),
         ]
     );
 }
@@ -225,7 +207,7 @@ fn outbound_observations_preserve_receipt_log_order_and_duplicates() {
         ]),
         receipt_with_logs(vec![
             noise,
-            outbound_log(EEZL2_ADDRESS, b),
+            outbound_log_with_gas(EEZL2_ADDRESS, b, u64::MAX),
             outbound_log(EEZL2_ADDRESS, a),
         ]),
     ]);
@@ -233,26 +215,10 @@ fn outbound_observations_preserve_receipt_log_order_and_duplicates() {
     assert_eq!(
         observations,
         [
-            OutboundEventObservation {
-                transaction_index: 0,
-                receipt_log_index: 0,
-                decoded_call_hash: Some(a),
-            },
-            OutboundEventObservation {
-                transaction_index: 0,
-                receipt_log_index: 1,
-                decoded_call_hash: Some(a),
-            },
-            OutboundEventObservation {
-                transaction_index: 1,
-                receipt_log_index: 1,
-                decoded_call_hash: Some(b),
-            },
-            OutboundEventObservation {
-                transaction_index: 1,
-                receipt_log_index: 2,
-                decoded_call_hash: Some(a),
-            },
+            OutboundEventObservation::decoded_for_test(0, 0, a, 0),
+            OutboundEventObservation::decoded_for_test(0, 1, a, 0),
+            OutboundEventObservation::decoded_for_test(1, 1, b, u64::MAX),
+            OutboundEventObservation::decoded_for_test(1, 2, a, 0),
         ]
     );
 }
@@ -322,17 +288,35 @@ fn checkpoint_plan_is_derived_from_recovered_transactions() {
     );
     let recovered = RecoveredBlock::new_unhashed(
         block,
-        vec![
-            eez_protocol::SYSTEM_ADDRESS,
-            Address::ZERO,
-            eez_protocol::SYSTEM_ADDRESS,
-        ],
+        vec![TEST_SYSTEM_ADDRESS, Address::ZERO, TEST_SYSTEM_ADDRESS],
     );
 
-    let (plan, system_sender_flags) = CheckpointPlan::from_recovered_block(&recovered, 2).unwrap();
+    let (plan, system_sender_flags) =
+        CheckpointPlan::from_recovered_block(&recovered, 2, TEST_SYSTEM_ADDRESS).unwrap();
 
     assert_eq!(system_sender_flags, [true, false, true]);
     assert_eq!(plan.transaction_indices, [1, 2]);
+}
+
+#[test]
+fn sender_classification_uses_the_configured_system_address() {
+    let transaction = TxLegacy::default()
+        .into_signed(alloy_primitives::Signature::test_signature())
+        .into();
+    let block = Block::new(
+        Default::default(),
+        alloy_consensus::BlockBody {
+            transactions: vec![transaction],
+            ..Default::default()
+        },
+    );
+    let recovered = RecoveredBlock::new_unhashed(block, vec![TEST_SYSTEM_ADDRESS]);
+
+    assert_eq!(system_sender_flags(&recovered, TEST_SYSTEM_ADDRESS), [true]);
+    assert_eq!(
+        system_sender_flags(&recovered, Address::repeat_byte(0xbb)),
+        [false]
+    );
 }
 
 #[test]
@@ -341,7 +325,7 @@ fn recovered_sender_facts_follow_the_homestead_signature_rule() {
     assert!(transaction.recover_signer().is_err());
     assert_eq!(
         transaction.recover_signer_unchecked().unwrap(),
-        eez_protocol::SYSTEM_ADDRESS
+        TEST_SYSTEM_ADDRESS
     );
     let header = Header {
         number: 7,
@@ -363,7 +347,7 @@ fn recovered_sender_facts_follow_the_homestead_signature_rule() {
         ..Default::default()
     });
     let recovered = recover_block(block.clone(), &pre_homestead).unwrap();
-    assert_eq!(system_sender_flags(&recovered), [true]);
+    assert_eq!(system_sender_flags(&recovered, TEST_SYSTEM_ADDRESS), [true]);
 
     let post_homestead = ChainSpec::from_genesis(Genesis {
         config: ChainConfig {
@@ -377,7 +361,7 @@ fn recovered_sender_facts_follow_the_homestead_signature_rule() {
 
 #[test]
 fn validates_the_golden_block_through_stateless() {
-    let output = Backend::new(fixture_chain_config())
+    let output = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS)
         .validate(&[fixture_input()])
         .unwrap();
     let root = b256!("f09d8f7da5bc5036f8dd9536c953e2212390a46fb3e553ece2b7d419131537b1");
@@ -406,7 +390,7 @@ fn selected_checkpoints_flow_through_the_stateless_adapter() {
     let (mut input, chain_config, expected) = checkpoint_fixture();
     let expected_hash = input.claimed_hash;
 
-    let output = Backend::new(chain_config)
+    let output = Backend::new(chain_config, TEST_SYSTEM_ADDRESS)
         .validate_blocks(
             std::slice::from_mut(&mut input),
             &CancellationToken::default(),
@@ -430,18 +414,17 @@ fn selected_checkpoints_flow_through_the_stateless_adapter() {
 }
 
 #[test]
-fn real_checkpoints_bind_successful_inbound_effects() {
+fn real_checkpoints_do_not_classify_the_legacy_inbound_selector() {
     let (mut input, chain_config, expected_checkpoints) = checkpoint_fixture();
     let block_number = input.declared_number;
     let block_rlp = input.rlp.clone();
-    let mut output = Backend::new(chain_config)
+    let mut output = Backend::new(chain_config, TEST_SYSTEM_ADDRESS)
         .validate_blocks(
             std::slice::from_mut(&mut input),
             &CancellationToken::default(),
             expected_checkpoints.len(),
         )
         .unwrap();
-    let window_pre_state_root = output.pre_state_root;
     let block_output = output.blocks.remove(0);
     assert_eq!(block_output.receipt_successes, [true, true, true]);
 
@@ -453,94 +436,10 @@ fn real_checkpoints_bind_successful_inbound_effects() {
         NonZeroU64::new(1).unwrap(),
     )
     .unwrap();
-    assert_eq!(
-        settling.inbound_candidates().len(),
-        expected_checkpoints.len()
-    );
-    let observations = settling
-        .inbound_candidates()
-        .iter()
-        .map(|candidate| candidate.inspection.as_ref().unwrap())
-        .collect::<Vec<_>>();
-    assert!(observations.iter().all(|observation| {
-        observation.value.is_zero() && observation.rolling_hash_committed_success
-    }));
-    assert_eq!(
-        observations
-            .iter()
-            .map(|observation| observation.recomputed_call_hash)
-            .collect::<Vec<_>>(),
-        [
-            b256!("44115129ec15ba85f4a5c80bcff7ab321119bb67f985c04be1350ff737958d5d"),
-            b256!("bcfcf3ae808362dc3346d66d87cb1d1aabbb114e5b9e13fa5eeb328e5b0eba21"),
-            b256!("f80b4d00f410d3ac7c369caceb0e426ea40e409b924a55ade552ad15d50f3e66"),
-        ]
-    );
-
-    let mut batch = EvmBatch::default();
-    let mut previous = window_pre_state_root;
-    batch.entries.push(checkpoint_entry(
-        window_pre_state_root,
-        previous,
-        B256::ZERO,
-        Bytes::new(),
-        I256::ZERO,
-    ));
-    for (checkpoint, observation) in expected_checkpoints.iter().zip(observations) {
-        batch.entries.push(checkpoint_entry(
-            previous,
-            checkpoint.state_root,
-            observation.recomputed_call_hash,
-            observation.return_data.clone(),
-            I256::try_from(observation.value).unwrap(),
-        ));
-        previous = checkpoint.state_root;
-    }
-    assert_eq!(previous, block_output.post_state_root);
-
-    let batch = CanonicalPostBatch::from_decoded_for_test(batch);
-    let verified_state_chain = verify_state_delta_chain(
-        &batch,
-        NonZeroU64::new(1).unwrap(),
-        window_pre_state_root,
-        block_output.post_state_root,
-    )
-    .unwrap();
-    let effects = bind_effects_to_execution(
-        &verified_state_chain,
-        window_pre_state_root,
-        block_output.transaction_state_checkpoints.as_slice(),
-        &settling,
-    )
-    .unwrap();
-    assert_eq!(effects.inbound_count(), expected_checkpoints.len());
-    assert_eq!(effects.outbound_count(), 0);
-    assert!(authorize_inbound_effects(&effects, NonZeroU64::new(1).unwrap()).is_ok());
-}
-
-fn checkpoint_entry(
-    current: B256,
-    new: B256,
-    proxy_entry_hash: B256,
-    return_data: Bytes,
-    ether_delta: I256,
-) -> ExecutionEntrySol {
-    ExecutionEntrySol {
-        stateDeltas: vec![StateDeltaSol {
-            rollupId: U256::from(1),
-            currentState: current,
-            newState: new,
-            etherDelta: ether_delta,
-        }],
-        proxyEntryHash: proxy_entry_hash,
-        destinationRollupId: U256::from(1),
-        l2ToL1Calls: Vec::new(),
-        expectedL1ToL2Calls: Vec::new(),
-        expectedLookups: Vec::new(),
-        callCount: U256::ZERO,
-        returnData: return_data,
-        rollingHash: B256::ZERO,
-    }
+    // The transactions are still genuine system calls and checkpoint inputs,
+    // but their obsolete selector cannot enter the target inbound decoder.
+    assert_eq!(settling.system_sender_flags(), [true, true, true]);
+    assert!(settling.inbound_candidates().is_empty());
 }
 
 #[test]
@@ -548,7 +447,7 @@ fn a_plan_over_quota_is_rejected_before_checkpoint_execution() {
     let (mut input, chain_config, expected) = checkpoint_fixture();
     let witness_items = input.witness.state.len();
 
-    let error = Backend::new(chain_config)
+    let error = Backend::new(chain_config, TEST_SYSTEM_ADDRESS)
         .validate_blocks(
             std::slice::from_mut(&mut input),
             &CancellationToken::default(),
@@ -573,7 +472,7 @@ fn pre_cancelled_validation_does_not_consume_the_witness() {
     let mut input = fixture_input();
     let state_items = input.witness.state.len();
 
-    let result = Backend::new(fixture_chain_config()).validate_blocks(
+    let result = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS).validate_blocks(
         std::slice::from_mut(&mut input),
         &cancellation,
         usize::MAX,
@@ -588,7 +487,7 @@ fn consensus_rlp_must_decode_exactly() {
     let mut input = fixture_input();
     input.rlp.push(0x80);
     assert!(matches!(
-        Backend::new(fixture_chain_config()).validate(&[input]),
+        Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS).validate(&[input]),
         Err(ValidationError::Rejected(_))
     ));
 }
@@ -603,7 +502,7 @@ fn decoded_header_must_match_the_streamed_number_and_parent() {
         let mut input = fixture_input();
         mutate(&mut input);
         assert!(matches!(
-            Backend::new(fixture_chain_config()).validate(&[input]),
+            Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS).validate(&[input]),
             Err(ValidationError::Rejected(_))
         ));
     }
@@ -616,7 +515,7 @@ fn decoded_header_hash_must_match_the_streamed_hash_before_reexecution() {
     let mut node = input.witness.state[0].to_vec();
     node[0] ^= 0x01;
     input.witness.state[0] = node.into();
-    let error = Backend::new(fixture_chain_config())
+    let error = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS)
         .validate(&[input])
         .unwrap_err();
     assert!(matches!(error, ValidationError::Rejected(_)));
@@ -635,7 +534,7 @@ fn execution_must_produce_the_state_root_committed_by_the_header() {
     input.claimed_hash = block.header.hash_slow();
     input.rlp = alloy_rlp::encode(block);
 
-    let error = Backend::new(fixture_chain_config())
+    let error = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS)
         .validate(&[input])
         .unwrap_err();
 
@@ -652,7 +551,7 @@ fn corrupt_witness_data_is_rejected_by_stateless() {
     node[0] ^= 0x01;
     input.witness.state[0] = node.into();
     assert!(matches!(
-        Backend::new(fixture_chain_config()).validate(&[input]),
+        Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS).validate(&[input]),
         Err(ValidationError::Rejected(_))
     ));
 }

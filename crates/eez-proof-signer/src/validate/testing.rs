@@ -3,7 +3,6 @@
 use std::collections::VecDeque;
 use std::sync::{Mutex, mpsc};
 
-use eez_protocol::SYSTEM_ADDRESS;
 use reth_primitives_traits::SignerRecoverable as _;
 use tokio::sync::oneshot;
 
@@ -25,7 +24,7 @@ impl SettlementBlockEvidence {
                     .map(|transaction| {
                         transaction
                             .recover_signer()
-                            .is_ok_and(|signer| signer == SYSTEM_ADDRESS)
+                            .is_ok_and(|signer| signer == crate::testkit::TEST_SYSTEM_ADDRESS)
                     })
                     .collect()
             })
@@ -61,6 +60,7 @@ enum StubAction {
 #[derive(Debug)]
 pub(crate) struct StubValidator {
     actions: Mutex<VecDeque<StubAction>>,
+    pub(super) expected_l2_system_address: alloy_primitives::Address,
 }
 
 impl StubValidator {
@@ -98,6 +98,7 @@ impl Validator {
     pub(crate) fn stub(responses: Vec<Result<BackendWindowOutput, String>>) -> Self {
         Self::Stub(StubValidator {
             actions: Mutex::new(responses.into_iter().map(StubAction::Respond).collect()),
+            expected_l2_system_address: crate::testkit::TEST_SYSTEM_ADDRESS,
         })
     }
 
@@ -132,6 +133,7 @@ impl Validator {
                 }]
                 .into(),
             ),
+            expected_l2_system_address: crate::testkit::TEST_SYSTEM_ADDRESS,
         });
         (validator, started_rx, release_tx)
     }
@@ -140,6 +142,7 @@ impl Validator {
     pub(crate) fn panicking_stub() -> Self {
         Self::Stub(StubValidator {
             actions: Mutex::new([StubAction::Panic].into()),
+            expected_l2_system_address: crate::testkit::TEST_SYSTEM_ADDRESS,
         })
     }
 
