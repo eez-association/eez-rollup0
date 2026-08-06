@@ -1,6 +1,5 @@
-//! [`SessionInspector`]: detects cross-chain proxy calls during source
-//! chain EVM execution and dispatches each one through a borrowed
-//! [`Dispatcher`].
+//! [`SessionInspector`] detects cross-chain proxy calls during EVM execution
+//! and dispatches each one through a borrowed [`CompositionBuilder`].
 //!
 //! When the inspector sees a CALL opcode:
 //! 1. `lookup_authorized_proxy_live` reads `authorizedProxies[addr]`
@@ -8,7 +7,7 @@
 //!    registered by earlier calls in the same transaction, or by
 //!    earlier transactions in the same in-progress block, are visible.
 //! 2. If the address is a registered proxy,
-//!    [`Dispatcher::dispatch_call`] forwards the call to the target
+//!    [`CompositionBuilder::dispatch_call`] forwards the call to the target
 //!    session and returns the execution response.
 //! 3. The inspector synthesizes the outcome back into the source EVM so
 //!    the source transaction's control flow can continue.
@@ -24,12 +23,9 @@
 //! (multi-tx composition). Reading through revm's journal captures
 //! both; a pre-tx storage snapshot would not.
 //!
-//! [`Dispatcher`]: eez_protocol::CompositionBuilder
-//! [`Dispatcher::dispatch_call`]: eez_protocol::CompositionBuilder::dispatch_call
-
-use alloy_primitives::{Address, Bytes};
 use std::sync::{Arc, Mutex};
 
+use alloy_primitives::{Address, Bytes};
 use revm::Inspector;
 use revm::context_interface::{ContextTr, Host, JournalTr};
 use revm::database::{CacheState, State};
@@ -40,60 +36,25 @@ use revm::interpreter::{
 use eez_protocol::{CallMode, CompositionBuilder, ExecutorError, ProxyLookupConfig, RollupId};
 use eez_protocol::{ProxyInfo, decode_proxy_value, proxy_mapping_key};
 
-/// Bidirectional side-channel between source-sim and the overlay
-/// session opened on the entry rollup.
+/// Cache exchange for nested dispatches that re-enter a suspended rollup.
 ///
 /// # Why it exists
 ///
-/// At the moment a target-session inspector detects a nested call
-/// targeting the entry rollup, the inspector holds `&mut target_ctx`
-/// — not `&mut source_ctx`. Source-sim's State is several stack frames
-/// up, mutably borrowed by source-sim's `evm.transact`. The overlay
-/// session opened on the entry rollup needs source-sim's *current*
-/// cache to preload a fresh `State` via
-/// `State::builder().with_cached_prestate(...)`; once it executes,
-/// source-sim's continued execution needs to observe the overlay's
-/// mutations. Rust can't hand out a second `&mut` to source state.
+/// During nested dispatch, the caller's revm state remains mutably borrowed.
+/// A re-entered session therefore cannot borrow that state directly. This
+/// channel transfers cache snapshots across the dispatch boundary using two
+/// LIFO stacks:
 ///
-/// The channel is the workaround. Two slots:
+/// - `source_cache` stores this rollup's live cache before dispatch. A session
+///   that re-enters the rollup peeks at the latest snapshot when it opens.
 ///
-/// - `source_cache` (source-sim → overlay): the source-sim inspector
-///   clones source's cache into this slot before dispatching
-///   downstream. The entry rollup's `LocalExecutionSession`, opened
-///   as the entry rollup's `TargetExecutionSession` by the
-///   `CompositionBuilder`, reads from it on construction to preload.
+/// - `overlay_cache` stores the cache produced by a re-entered session. The
+///   suspended inspector pops it after dispatch and applies the diff through
+///   [`apply_overlay_diff`](crate::overlay::apply_overlay_diff).
 ///
-/// - `overlay_cache` (overlay → source-sim): the
-///   `LocalExecutionSession` (entry rollup) writes its
-///   post-execute `state.cache.clone()` into this slot at the end of
-///   each `execute`. The source-sim inspector reads it after the
-///   downstream dispatch returns and applies the diff onto source's
-///   journal via [`apply_overlay_diff`](crate::overlay::apply_overlay_diff).
-///   Last write wins — the entry session is reused across multiple
-///   overlay executes within one source-sim hook, so the final
-///   accumulated cache is what reaches source-sim.
-///
-/// Single-threaded by design — the synchronous nested dispatch keeps
-/// source and overlay execution on the same worker. The `Mutex`es are
-/// therefore uncontended in steady state; they exist for
-/// borrow-checker satisfaction, not concurrent access.
-///
-/// # Lifecycle
-///
-/// Both slots are visible only while source-sim's `evm.transact` is
-/// inside an `Inspector::call` hook that has dispatched to a target
-/// session. Outside that window both slots are `None`. Any read of
-/// `source_cache` outside the hook is a programming error.
+/// Stacks keep recursive re-entry snapshots paired with their call frames.
 #[derive(Debug, Default)]
 pub struct OverlayChannel {
-    /// Monotonic write counter incremented by every `push_post_cache`
-    /// or `append_post_root`. Sampled into a session checkpoint so
-    /// rollback can truncate the post-cache log + post-root log back
-    /// to the snapshot point. The counter itself never decreases —
-    /// `truncate_to_epoch` cuts the underlying logs to length
-    /// `target_epoch`, leaving the counter ahead so post-rollback
-    /// writes still get strictly-greater epoch values.
-    epoch: std::sync::atomic::AtomicU64,
     /// Stack of pre-dispatch cache snapshots. See [`push_pre_snapshot`]
     /// / [`peek_pre_snapshot`] / [`pop_pre_snapshot`].
     ///
@@ -107,20 +68,10 @@ pub struct OverlayChannel {
     /// [`push_post_cache`]: OverlayChannel::push_post_cache
     /// [`pop_post_cache`]: OverlayChannel::pop_post_cache
     overlay_cache: Mutex<Vec<CacheState>>,
-    /// Append-only per-overlay-execute post-state roots. See
-    /// [`append_post_root`] / [`drain_post_roots`].
-    ///
-    /// [`append_post_root`]: OverlayChannel::append_post_root
-    /// [`drain_post_roots`]: OverlayChannel::drain_post_roots
-    per_tx_roots: Mutex<Vec<[u8; 32]>>,
 }
 
 impl OverlayChannel {
-    /// Push a pre-dispatch cache snapshot — called by every inspector
-    /// frame before dispatching. Stack-based for recursive
-    /// re-entry: `reentrantCrossChainCalls` re-enters L1's overlay
-    /// multiple times within one source-sim tx; each frame's
-    /// pre-snapshot nests cleanly via push/pop.
+    /// Push a pre-dispatch cache snapshot for this rollup.
     pub fn push_pre_snapshot(&self, cache: CacheState) {
         if let Ok(mut guard) = self.source_cache.lock() {
             guard.push(cache);
@@ -133,9 +84,7 @@ impl OverlayChannel {
         self.source_cache.lock().ok().and_then(|mut g| g.pop())
     }
 
-    /// Peek the top pre-dispatch snapshot without popping. Lazy-opened
-    /// sessions for this rollup use this to preload — "the latest live
-    /// state of this rollup" at the moment the inner dispatch fires.
+    /// Clone the latest pre-dispatch snapshot for a re-entered session.
     pub fn peek_pre_snapshot(&self) -> Option<CacheState> {
         self.source_cache
             .lock()
@@ -143,94 +92,16 @@ impl OverlayChannel {
             .and_then(|g| g.last().cloned())
     }
 
-    /// Push a post-execute cache snapshot — called by the overlay
-    /// session at `commit_and_finish`. The matching inspector pops it
-    /// after the dispatch returns and applies the diff onto its
-    /// own `&mut ctx`. Without the stack, two nested overlay executes'
-    /// post-caches would collide.
+    /// Push the cache produced by a re-entered session.
     pub fn push_post_cache(&self, cache: CacheState) {
         if let Ok(mut guard) = self.overlay_cache.lock() {
             guard.push(cache);
-            self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
     }
 
-    /// Pop the most recent post-execute cache so the inspector can
-    /// run `apply_overlay_diff` on it.
+    /// Pop the cache produced by the latest re-entered session.
     pub fn pop_post_cache(&self) -> Option<CacheState> {
         self.overlay_cache.lock().ok().and_then(|mut g| g.pop())
-    }
-
-    /// Append a per-overlay-execute post-state root in chronological
-    /// dispatch order. Each entry rollup overlay session execute
-    /// appends its `current_root` after `commit_and_finish`.
-    pub fn append_post_root(&self, root: [u8; 32]) {
-        if let Ok(mut guard) = self.per_tx_roots.lock() {
-            guard.push(root);
-            self.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        }
-    }
-
-    /// Drain the accumulated per-tx roots. Called by source-sim at
-    /// end of `simulate_source_tx`; forwarded to
-    /// `CompositionBuilder::set_extra_per_tx_roots(entry_id, roots)` so
-    /// `finalize` can populate `per_tx_roots_by_rollup[entry]` —
-    /// otherwise nested calls attributed to the entry rollup
-    /// (`reentrantCrossChainCalls`-style deep alternation) hit
-    /// `InvalidCheckpoint: no per_tx_roots entry for attribution
-    /// rollup <entry>` in `build_batch`.
-    pub fn drain_post_roots(&self) -> Vec<[u8; 32]> {
-        self.per_tx_roots
-            .lock()
-            .ok()
-            .map(|mut g| std::mem::take(&mut *g))
-            .unwrap_or_default()
-    }
-
-    /// Snapshot the current write-epoch. Pair with
-    /// [`truncate_to_lengths`](Self::truncate_to_lengths) to roll the
-    /// channel back to its state at the snapshot point. Counter is
-    /// monotonic; truncation only shortens the underlying logs.
-    #[must_use]
-    pub fn current_epoch(&self) -> u64 {
-        self.epoch.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Truncate the post-cache log + post-root log to the lengths they
-    /// held when `target_epoch` was sampled. The atomic counter is
-    /// NOT decremented — its only consumer is to record snapshot
-    /// points, and post-rollback writes must produce strictly-greater
-    /// epoch values to keep ordering with any retained snapshots.
-    ///
-    /// Each `push_post_cache` and `append_post_root` since the
-    /// snapshot point incremented the epoch by 1, so the difference
-    /// `current - target` is exactly the number of writes to undo
-    /// across the two logs combined. Because the two logs interleave
-    /// in real-time (a single dispatch usually does both), this
-    /// primitive truncates each log to its own length-at-snapshot
-    /// rather than redistributing the delta.
-    ///
-    /// Callers stash the per-log lengths alongside the epoch in the
-    /// session's snapshot; this method clamps the logs to those
-    /// lengths.
-    pub fn truncate_to_lengths(&self, post_cache_len: usize, post_roots_len: usize) {
-        if let Ok(mut guard) = self.overlay_cache.lock() {
-            guard.truncate(post_cache_len);
-        }
-        if let Ok(mut guard) = self.per_tx_roots.lock() {
-            guard.truncate(post_roots_len);
-        }
-    }
-
-    /// Sample the current per-log lengths. Stash alongside the
-    /// session snapshot so
-    /// [`truncate_to_lengths`](Self::truncate_to_lengths) can roll
-    /// back precisely.
-    #[must_use]
-    pub fn current_log_lengths(&self) -> (usize, usize) {
-        let post_cache = self.overlay_cache.lock().map_or(0, |g| g.len());
-        let post_roots = self.per_tx_roots.lock().map_or(0, |g| g.len());
-        (post_cache, post_roots)
     }
 }
 
@@ -284,29 +155,24 @@ fn lookup_authorized_proxy_live<CTX: ContextTr + Host>(
 /// dispatcher's recorded-call count. On `call_end`, the popped value
 /// pairs with the current count to compute `(start, span)` for any
 /// reverted frame, and the bracket is forwarded to
-/// [`CompositionBuilder::annotate_revert_span`](eez_protocol::CompositionBuilder::annotate_revert_span). `recorded[..]` is preorder
-/// by construction — every call's slot index is fixed at
-/// `CompositionBuilder::open_call` time, BEFORE the session recurses — so
-/// `span = end - start` is the recorded-call scope of the reverted frame.
-/// The current entry profile rejects calls carrying such a scope.
+/// [`CompositionBuilder::annotate_revert_span`](eez_protocol::CompositionBuilder::annotate_revert_span).
+/// Calls are recorded in preorder because each slot is opened before its
+/// session executes. Therefore, `span = end - start` covers the reverted
+/// frame's recorded calls. Batch materialization rejects such spans.
 pub struct SessionInspector<'a> {
     /// Combined proxy-lookup configuration: the contract address to
     /// read and which slot to read from.
     proxy_lookup: ProxyLookupConfig,
-    /// Dispatch surface — composer or gRPC stub — that routes detected
-    /// calls to their target rollups by id.
+    /// Composition builder that routes and records detected calls.
     dispatcher: &'a mut CompositionBuilder,
-    /// Rollup id of the chain this inspector is running on — the
-    /// `caller_id` passed to `dispatch_call` so the resulting
-    /// [`ExecutedAction::source_rollup_id`](eez_protocol::ExecutedAction::source_rollup_id)
-    /// is correct for nested cross-chain call hashing.
+    /// Rollup ID of the chain this inspector is running on. Written to each
+    /// [`eez_protocol::ExecutionRequest`] as the source identity used for
+    /// target execution, recording, and call hashing.
     caller_rollup_id: RollupId,
     /// First target execution error, if any.
     error: Option<ExecutorError>,
     call_depth: usize,
-    proxy_lookups: usize,
-    /// Bidirectional side-channel between source-sim and the entry
-    /// rollup's overlay session.
+    /// Per-rollup cache channel for nested re-entry.
     overlay_channel: Option<OverlayChannelHandle>,
     /// Per-EVM-frame snapshot of the dispatcher's recorded-call count
     /// at the entry of `Inspector::call`. On `Inspector::call_end`,
@@ -325,7 +191,6 @@ impl std::fmt::Debug for SessionInspector<'_> {
             .field("proxy_lookup", &self.proxy_lookup)
             .field("caller_rollup_id", &self.caller_rollup_id)
             .field("call_depth", &self.call_depth)
-            .field("proxy_lookups", &self.proxy_lookups)
             .field("has_error", &self.error.is_some())
             .field("has_overlay_channel", &self.overlay_channel.is_some())
             .finish_non_exhaustive()
@@ -334,38 +199,26 @@ impl std::fmt::Debug for SessionInspector<'_> {
 
 /// Shared construction surface for [`SessionInspector`] instances.
 ///
-/// Collapses the per-chain configuration (proxy lookup + caller rollup
-/// id) that both the source-sim path and the target-session path need,
-/// so each call site produces inspectors the same way and any future
-/// field added to `SessionInspector` flows through one site.
+/// Holds the per-chain proxy lookup, caller rollup id, and optional overlay
+/// channel shared by source and target-session inspectors.
 ///
 /// Each call site produces an inspector via [`build`](Self::build).
 #[derive(Debug, Clone)]
 pub struct SessionInspectorFactory {
-    /// `(contract_address, slot)` discriminator for this chain's
-    /// `authorizedProxies`. Derived from role at client construction.
+    /// Contract and storage slot for this chain's `authorizedProxies` map.
     proxy_lookup: ProxyLookupConfig,
-    /// Rollup id of the chain this factory belongs to — becomes the
-    /// `caller_id` on every call dispatched through inspectors it
-    /// builds.
+    /// Source rollup ID written to every request dispatched by inspectors
+    /// built from this factory.
     caller_rollup_id: RollupId,
-    /// Overlay channel handle for the shared-source-state overlay
-    /// path. `Some(channel)` only on the entry-role factory used at
-    /// the source-sim site; follower-role factories used at
-    /// target-session sites leave this `None`. Forwarded to the
-    /// inspector via [`SessionInspectorFactory::build`] so root-frame
-    /// inspectors snapshot source's cache before each downstream
-    /// dispatch and apply overlay diffs after.
+    /// Per-rollup channel for propagating state through recursive re-entry.
     overlay_channel: Option<OverlayChannelHandle>,
 }
 
 impl SessionInspectorFactory {
     /// Create a factory pinned to one chain's configuration.
     ///
-    /// Defaults to no overlay channel — the entry-role factory used
-    /// for source-sim should call
-    /// [`with_overlay_channel`](Self::with_overlay_channel) to install
-    /// one.
+    /// The caller may install an overlay channel with
+    /// [`with_overlay_channel`](Self::with_overlay_channel).
     #[must_use]
     pub fn new(proxy_lookup: ProxyLookupConfig, caller_rollup_id: RollupId) -> Self {
         Self {
@@ -378,10 +231,8 @@ impl SessionInspectorFactory {
     /// Install the overlay channel used by the shared-source-state
     /// overlay path.
     ///
-    /// Caller responsibility: only attach this to the factory the
-    /// source-sim inspector is built from. Inspectors built from
-    /// factories without a channel do not snapshot or apply diffs,
-    /// which is the correct default for target-session frames.
+    /// Source and target-session inspectors use the channel belonging to the
+    /// rollup whose EVM state they inspect.
     #[must_use]
     pub fn with_overlay_channel(mut self, channel: OverlayChannelHandle) -> Self {
         self.overlay_channel = Some(channel);
@@ -394,19 +245,16 @@ impl SessionInspectorFactory {
         &self.proxy_lookup
     }
 
-    /// Caller rollup id this factory passes to every built inspector.
+    /// Source rollup ID written into requests by every built inspector.
     #[must_use]
     pub fn caller_rollup_id(&self) -> RollupId {
         self.caller_rollup_id
     }
 
-    /// Build an inspector. Used by both the source-sim path and the
-    /// target-session path. The inspector observes proxy CALLs and
-    /// dispatches each through the supplied [`CompositionBuilder`]; nested
-    /// dispatches (a target-session inspector handing a callback
-    /// back to the composer) are recorded as preorder children of
-    /// the outer call by virtue of the dispatcher's `open_call`
-    /// timing.
+    /// Build an inspector for source simulation or a target session.
+    ///
+    /// Calls are opened before target execution, so nested dispatches are
+    /// recorded as preorder children of their outer call.
     pub fn build<'a>(&self, dispatcher: &'a mut CompositionBuilder) -> SessionInspector<'a> {
         let mut insp =
             SessionInspector::new(self.proxy_lookup.clone(), dispatcher, self.caller_rollup_id);
@@ -416,18 +264,12 @@ impl SessionInspectorFactory {
 }
 
 impl<'a> SessionInspector<'a> {
-    /// Create a new inspector instance.
-    ///
-    /// Used by the source-simulation path where every detected proxy
-    /// call dispatches through the supplied [`CompositionBuilder`] and is
-    /// recorded into the composition's preorder `recorded[..]` slice.
+    /// Create an inspector that routes detected calls through `dispatcher`.
     ///
     /// - `proxy_lookup`: the (contract, slot) pair used to read
-    ///   `authorizedProxies` from the chain's `EEZ` or `EEZL2` manager.
-    ///   Both mappings currently occupy slot 0 through `EEZBase`.
+    ///   `authorizedProxies` from the chain-local manager.
     /// - `dispatcher`: dispatch surface for detected calls.
-    /// - `caller_rollup_id`: this chain's rollup id — becomes the
-    ///   `caller_id` on each dispatched call.
+    /// - `caller_rollup_id`: source rollup ID stored in each dispatched request.
     pub fn new(
         proxy_lookup: ProxyLookupConfig,
         dispatcher: &'a mut CompositionBuilder,
@@ -439,16 +281,9 @@ impl<'a> SessionInspector<'a> {
             caller_rollup_id,
             error: None,
             call_depth: 0,
-            proxy_lookups: 0,
             overlay_channel: None,
             frame_starts: Vec::new(),
         }
-    }
-
-    /// Number of proxy lookups performed during this EVM pass.
-    #[must_use]
-    pub fn proxy_lookups(&self) -> usize {
-        self.proxy_lookups
     }
 
     /// Take the recorded error, if any.
@@ -502,7 +337,6 @@ where
 
         // Look up `authorizedProxies[target_address]` on the configured
         // contract via the live EVM state. Sees in-tx / in-block writes.
-        self.proxy_lookups += 1;
         let Some(info) = lookup_authorized_proxy_live(
             context,
             self.proxy_lookup.contract_address,
@@ -523,49 +357,22 @@ where
             source_address: inputs.caller,
             source_rollup_id: self.caller_rollup_id,
         };
-        // The dispatch is a plain nested call — it runs on the SAME
-        // thread that's running source-sim's `evm.transact`, keeping
-        // cross-chain dispatch on a single thread and giving the
-        // overlay path direct access to source-sim's `&mut State<DB>`
-        // via the inspector's `&mut ctx`.
-        let caller_id = self.caller_rollup_id;
-        // Overlay-path producer/consumer: source-sim's root-frame
-        // inspector snapshots source's in-flight cache into the channel
-        // before dispatching downstream (preload for the entry-rollup
-        // overlay session) and applies the channel's overlay-after diff
-        // back onto source's journal after dispatch returns. Both halves
-        // are skipped on target-session inspectors (whose factory is
-        // built without an overlay channel); the runtime check on
-        // `is_nested_frame` keeps the invariant local to this file.
-        // Stack-based overlay channel for recursive re-entry. When the
-        // channel is installed every inspector frame participates in
-        // push/pop on its rollup's channel — re-entered sessions
-        // inherit their own rollup's mid-execute state and write
-        // back accumulated mutations.
+        // Dispatch is synchronous, so this inspector can exchange cache
+        // snapshots around the nested execution.
+        // Snapshot this rollup's in-flight cache before dispatch. If the
+        // downstream call re-enters this rollup, the new session preloads the
+        // snapshot and publishes its updated cache for this frame to apply.
         let overlay_active = self.overlay_channel.is_some();
         let mut before_snapshot: Option<CacheState> = None;
         if overlay_active {
-            // `state.cache.clone()` holds the values revm LOADED from
-            // disk during the source-sim tx, but mid-tx `SSTORE` /
-            // balance changes live in the journal until commit; the
-            // cached values stay at their pre-write snapshots. flash-
-            // loan exposed this: source-sim's `bridge.bridgeTokens`
-            // does `safeTransferFrom(executor, BridgeL1, 10000e18)`
-            // BEFORE its proxy.call dispatches CC1, then later CC2-
-            // nested needs the L1 entry overlay to read the locked
-            // balance — the cache alone returns 0.
-            //
-            // Refresh the cloned cache by re-reading every loaded slot
-            // and account through `Host::sload` / `Host::balance` /
-            // `Host::load_account_info_skip_cold_load`, which go
-            // through the journal and return the LIVE post-write
-            // values. We don't need to discover NEW slots — the journal
-            // and cache touch the same addresses (any SSTORE is
-            // preceded by an SLOAD which adds the slot to the cache),
-            // so iterating cache slots is sufficient.
+            // revm keeps mid-transaction writes in its journal, while loaded
+            // cache entries can still contain their pre-write values. Refresh
+            // every loaded account and slot through `Host` before sharing the
+            // cache. An `SSTORE` first loads its slot, so the cache already
+            // identifies every storage key that needs refreshing.
             let mut cache = context.db_mut().cache.clone();
-            // Collect (addr, slot) pairs to refresh — must release the
-            // `&mut updated` borrow before calling Host::sload.
+            // Collect keys before mutating the cloned cache with refreshed
+            // values.
             let mut slots_to_refresh: Vec<(Address, alloy_primitives::U256)> = Vec::new();
             let mut addrs_to_refresh: Vec<Address> = Vec::new();
             for (addr, acc) in &cache.accounts {
@@ -576,7 +383,7 @@ where
                     }
                 }
             }
-            // Snapshot live storage values via Host::sload (journal-aware).
+            // Read live storage values through the journal-aware host.
             let mut live_storage: Vec<(Address, alloy_primitives::U256, alloy_primitives::U256)> =
                 Vec::with_capacity(slots_to_refresh.len());
             for (addr, slot) in slots_to_refresh {
@@ -584,7 +391,7 @@ where
                     live_storage.push((addr, slot, load.data));
                 }
             }
-            // Snapshot live balance/nonce via Host::load_account_info_skip_cold_load.
+            // Read live balances and nonces through the host.
             let mut live_account_info: Vec<(Address, alloy_primitives::U256, u64)> =
                 Vec::with_capacity(addrs_to_refresh.len());
             for addr in addrs_to_refresh {
@@ -592,7 +399,6 @@ where
                     live_account_info.push((addr, info.balance, info.nonce));
                 }
             }
-            // Apply live values to the cloned cache.
             for (addr, slot, value) in live_storage {
                 if let Some(acc) = cache.accounts.get_mut(&addr)
                     && let Some(plain) = acc.account.as_mut()
@@ -613,15 +419,10 @@ where
                 channel.push_pre_snapshot(cache);
             }
         }
-        let sim = self
-            .dispatcher
-            .dispatch_call(info.original_rollup_id, caller_id, req);
-        // After the dispatch: any inner sessions on THIS rollup have
-        // pushed their post-cache to `overlay_cache` (LIFO). Pop the
-        // top and apply diff onto our `&mut ctx` so this frame's
-        // continued execution sees the inner session's mutations.
-        // Errors during apply are surfaced via `record_error` so the
-        // caller's `take_error()` consumer sees them (invariant 7).
+        let sim = self.dispatcher.dispatch_call(info.original_rollup_id, req);
+        // A downstream session that re-entered this rollup publishes its
+        // post-execution cache on the same channel. Apply that diff before
+        // this EVM frame continues.
         if overlay_active {
             let after_opt = self
                 .overlay_channel
@@ -690,26 +491,13 @@ where
     }
 
     fn call_end(&mut self, _context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
-        // Pair with the snapshot pushed in `call`. If the frame ended
-        // with `Revert` AND one or more dispatches happened inside it
-        // (range non-empty), notify the dispatcher: those recorded
-        // calls' effects on the source state-update chain are rolled
-        // back, and any in-memory target session that captured those
-        // writes is evicted so the next dispatch reads pre-revert
-        // disk state.
+        // Pair with the count captured in `call`. A reverted frame with a
+        // non-empty dispatch range records the span and queues the affected
+        // session checkpoints for rollback before the next dispatch.
         //
-        // Skipped when:
-        // - We already recorded an executor error this pass — the
-        //   composition will fail; spurious marks would be noise.
-        // - The popped range is empty — proxy frames have count++ but
-        //   we synthesize `Return` on success; non-proxy frames with
-        //   no children leave count unchanged. Either way, nothing
-        //   to mark.
-        // - The frame's `InstructionResult` is not `Revert` — we
-        //   only act on controlled Solidity reverts (the `revert(...)`
-        //   opcode), not `OutOfGas` / `InvalidOpcode` / etc. Other
-        //   failure modes are not part of any try/catch revert-continue
-        //   pattern this protocol supports.
+        // Skip when an executor error already aborts composition, no calls
+        // were dispatched in the frame, or the outcome is not an explicit
+        // revert.
         let start = self.frame_starts.pop().unwrap_or(0);
         let end = self.dispatcher.recorded_count();
         if !self.has_error() && start < end && outcome.result.result == InstructionResult::Revert {
@@ -860,7 +648,28 @@ mod tests {
         );
     }
 
-    // ── New tests for ProxyLookupConfig variants ────────────────────
+    // ── Cache exchange and proxy lookup ───────────────────────────────
+
+    #[test]
+    fn overlay_cache_snapshots_are_lifo() {
+        let channel = OverlayChannel::default();
+        let first = CacheState::default();
+        let mut second = CacheState::default();
+        second.insert_not_existing(PROXY_ADDR);
+
+        channel.push_pre_snapshot(first.clone());
+        channel.push_pre_snapshot(second.clone());
+        assert_eq!(channel.peek_pre_snapshot(), Some(second.clone()));
+        assert_eq!(channel.pop_pre_snapshot(), Some(second.clone()));
+        assert_eq!(channel.pop_pre_snapshot(), Some(first.clone()));
+        assert_eq!(channel.pop_pre_snapshot(), None);
+
+        channel.push_post_cache(first.clone());
+        channel.push_post_cache(second.clone());
+        assert_eq!(channel.pop_post_cache(), Some(second));
+        assert_eq!(channel.pop_post_cache(), Some(first));
+        assert_eq!(channel.pop_post_cache(), None);
+    }
 
     #[test]
     fn eez_slot_path_reads_slot_0() {
@@ -898,10 +707,8 @@ mod tests {
 
     #[test]
     fn eezl2_slot_path_reads_slot_0() {
-        // ProxyLookupConfig with source_contract=EEZL2 routes to slot 0
-        // (authorizedProxies on EEZBase, first storage slot). Same
-        // value as the L1 path today — kept distinct so the two
-        // constants diverging later breaks loudly.
+        // Keep the EEZL2 constant path distinct so each dialect's configured
+        // slot is tested.
         let config = ProxyLookupConfig {
             contract_address: EEZL2_ADDRESS,
             authorized_proxies_slot: EEZL2_AUTHORIZED_PROXIES_SLOT,
