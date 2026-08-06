@@ -43,14 +43,11 @@ DEPLOY_IMAGE="$(yv deploy_image)";                DEPLOY_IMAGE="${DEPLOY_IMAGE:-
 
 export DOCKER_BUILDKIT=1
 
-# Fast local build; set EEZ_OPTIMIZED_BUILD=1 for the full release profile.
+# The default `release` profile is already the fast build; set
+# EEZ_OPTIMIZED_BUILD=1 for production (maxperf) binaries.
 release_build_args=()
-if [[ "${EEZ_OPTIMIZED_BUILD:-0}" != "1" ]]; then
-    release_build_args=(
-        --build-arg CARGO_PROFILE_RELEASE_LTO=false
-        --build-arg CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
-        --build-arg CARGO_PROFILE_RELEASE_DEBUG=0
-    )
+if [[ "${EEZ_OPTIMIZED_BUILD:-0}" == "1" ]]; then
+    release_build_args=(--build-arg BUILD_PROFILE=maxperf)
 fi
 
 if [[ "${EEZ_SKIP_NODE_BUILD:-0}" != "1" ]]; then
