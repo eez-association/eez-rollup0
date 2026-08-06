@@ -94,7 +94,7 @@ services:
       EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS: "10200"
       # L2 RPC — outbound front upstream + composer L2 reads.
       EEZ_L2_RPC_URL: http://127.0.0.1:18688
-      # Transparent cross-chain ingress fronts (unset → that front is disabled).
+      # Transparent cross-chain ingress fronts (both required in composer mode).
       # Send L1→L2 (Inbound) txs to :18999, L2→L1 (Outbound) txs to :18998; every
       # other eth_* is transparently forwarded to the matching source-chain RPC.
       EEZ_L1_XCHAIN_PORT: "18999"

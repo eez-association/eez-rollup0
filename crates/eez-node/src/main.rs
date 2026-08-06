@@ -809,31 +809,20 @@ fn main() -> eyre::Result<()> {
         let (sequencer, umbrella, system_tx_cfg, cross_chain_composer_wired, l1_source_chain_id) =
             composer_setup;
 
-        if mode == Mode::Composer {
-            for port_env in ["EEZ_L1_XCHAIN_PORT", "EEZ_L2_XCHAIN_PORT"] {
-                require_xchain_composer_wiring(
-                    port_env,
-                    env::var_os(port_env).is_some(),
-                    cross_chain_composer_wired,
-                )?;
-            }
-        }
-
         let l2_source_chain_id = chain_spec.chain().id();
-        // Resolve and validate enabled fronts before spawning the deriver,
-        // sequencer, or composer. A configured front is required infrastructure,
-        // so a bad or unavailable upstream must fail node launch rather than
-        // leave a healthy-looking node running without cross-chain ingress.
+        // Resolve and validate both required fronts before spawning the deriver,
+        // sequencer, or composer. The fronts are required infrastructure, so a
+        // missing configuration or bad/unavailable upstream must fail launch
+        // rather than leave a healthy-looking node running without cross-chain
+        // ingress.
         let mut xchain_fronts = Vec::new();
         if mode == Mode::Composer {
+            require_xchain_composer_wiring(cross_chain_composer_wired)?;
             let l1_source_chain_id =
                 l1_source_chain_id.expect("composer mode sets L1 source chain id");
             for spec in xchain_front_specs(l1_source_chain_id, l2_source_chain_id) {
-                let Some((port, url, parsed)) =
-                    read_xchain_front_config(spec.port_env, spec.url_env)?
-                else {
-                    continue;
-                };
+                let (port, url, parsed) =
+                    read_xchain_front_config(spec.port_env, spec.url_env)?;
                 let validation_provider = alloy_provider::RootProvider::new_http(parsed);
                 ingress::validate_cross_chain_front(
                     &validation_provider,
@@ -950,8 +939,7 @@ fn main() -> eyre::Result<()> {
             });
 
             // Cross-chain ingress fronts (see `run_cross_chain_front`) — one per
-            // SOURCE chain, sharing `held_pool`, gated on its port env (absent →
-            // no front for that chain):
+            // SOURCE chain, sharing `held_pool`. Both are required in composer mode:
             //   L1 front (EEZ_L1_XCHAIN_PORT → EEZ_L1_RPC_URL): L1→L2 Inbound.
             //   L2 front (EEZ_L2_XCHAIN_PORT → EEZ_L2_RPC_URL): L2→L1 Outbound.
             for (spec, port, url, validation_provider) in xchain_fronts {
@@ -1072,7 +1060,7 @@ fn xchain_front_specs(l1_chain_id: u64, l2_chain_id: u64) -> [XchainFrontSpec; 2
 fn read_xchain_front_config(
     port_env: &str,
     url_env: &str,
-) -> eyre::Result<Option<(u16, String, reqwest::Url)>> {
+) -> eyre::Result<(u16, String, reqwest::Url)> {
     let port = match env::var(port_env) {
         Ok(value) => Some(value),
         Err(env::VarError::NotPresent) => None,
@@ -1091,10 +1079,8 @@ fn parse_xchain_front_config(
     url_env: &str,
     port: Option<&str>,
     url: Option<&str>,
-) -> eyre::Result<Option<(u16, String, reqwest::Url)>> {
-    let Some(port_raw) = port else {
-        return Ok(None);
-    };
+) -> eyre::Result<(u16, String, reqwest::Url)> {
+    let port_raw = port.ok_or_else(|| eyre::eyre!("{port_env} is required in composer mode"))?;
     let port = port_raw
         .parse::<u16>()
         .map_err(|err| eyre::eyre!("{port_env}={port_raw:?} malformed: {err}"))?;
@@ -1104,17 +1090,13 @@ fn parse_xchain_front_config(
     let parsed = url_raw
         .parse::<reqwest::Url>()
         .map_err(|err| eyre::eyre!("{url_env}={url_raw:?} malformed: {err}"))?;
-    Ok(Some((port, url_raw.to_string(), parsed)))
+    Ok((port, url_raw.to_string(), parsed))
 }
 
-fn require_xchain_composer_wiring(
-    port_env: &str,
-    front_enabled: bool,
-    composer_wired: bool,
-) -> eyre::Result<()> {
-    if front_enabled && !composer_wired {
+fn require_xchain_composer_wiring(composer_wired: bool) -> eyre::Result<()> {
+    if !composer_wired {
         return Err(eyre::eyre!(
-            "{port_env} enables cross-chain ingress, but the cross-chain composer is unavailable; configure embedded L1 composition or unset {port_env}"
+            "composer mode requires cross-chain composer wiring; configure embedded L1 composition"
         ));
     }
     Ok(())
@@ -1229,10 +1211,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn xchain_front_absent_port_disables_front() {
-        let parsed = parse_xchain_front_config("PORT", "URL", None, Some("http://127.0.0.1:8545"))
-            .expect("absent port is allowed");
-        assert!(parsed.is_none());
+    fn xchain_front_missing_port_fails_fast() {
+        let err = parse_xchain_front_config("PORT", "URL", None, Some("http://127.0.0.1:8545"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("PORT is required in composer mode"));
     }
 
     #[test]
@@ -1264,8 +1247,7 @@ mod tests {
     fn xchain_front_valid_config_is_returned() {
         let (port, url, parsed) =
             parse_xchain_front_config("PORT", "URL", Some("8546"), Some("http://127.0.0.1:8545"))
-                .expect("valid config")
-                .expect("front enabled");
+                .expect("valid config");
 
         assert_eq!(port, 8546);
         assert_eq!(url, "http://127.0.0.1:8545");
@@ -1274,13 +1256,12 @@ mod tests {
 
     #[test]
     fn xchain_front_requires_composer_wiring() {
-        let err = require_xchain_composer_wiring("PORT", true, false)
+        let err = require_xchain_composer_wiring(false)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("PORT enables cross-chain ingress"));
+        assert!(err.contains("composer mode requires cross-chain composer wiring"));
 
-        require_xchain_composer_wiring("PORT", true, true).unwrap();
-        require_xchain_composer_wiring("PORT", false, false).unwrap();
+        require_xchain_composer_wiring(true).unwrap();
     }
 
     #[test]
