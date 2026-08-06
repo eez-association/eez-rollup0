@@ -269,7 +269,7 @@ impl CompositionBuilder {
 
     /// Filtering the preorder action log preserves dispatch order for each
     /// target.
-    fn group_calls_for(&self, rollup_id: RollupId) -> Vec<ExecutedAction> {
+    fn group_calls_for_target_rollup_id(&self, rollup_id: RollupId) -> Vec<ExecutedAction> {
         self.recorded
             .iter()
             .filter(|c| c.target_rollup_id == rollup_id)
@@ -318,20 +318,17 @@ impl CompositionBuilder {
         entries::ensure_source_side_calls(self.recorded.iter(), self.entry_rollup_id)?;
 
         // Sort by rollup ID so identical inputs produce identical target order.
-        let mut plan_order: Vec<RollupId> = self.rollups.keys().copied().collect();
-        plan_order.sort();
+        let mut plan: Vec<(&RollupId, &Rollup)> = self.rollups.iter().collect();
+        plan.sort_by_key(|(id, _)| **id);
 
         // Build per-rollup target batches (non-entry rollups only).
         let mut target_compositions = Vec::new();
-        for rollup_id in &plan_order {
+        for (rollup_id, rollup) in plan {
             if *rollup_id == self.entry_rollup_id {
                 continue;
             }
-            let Some(rollup) = self.rollups.get(rollup_id) else {
-                continue;
-            };
 
-            let group_calls = self.group_calls_for(*rollup_id);
+            let group_calls = self.group_calls_for_target_rollup_id(*rollup_id);
             if group_calls.is_empty() {
                 continue;
             }
@@ -340,13 +337,13 @@ impl CompositionBuilder {
             // is the entry rollup. Because this loop excludes that rollup,
             // every call in the target group is incoming; only the target
             // dialect determines its materialized form.
-            let batch = if rollup.config.dialect.is_zk_poster() {
+            let batch = if rollup.config.dialect.is_evm_l1_style() {
                 let batch = entries::build_l1_postbatch(&group_calls, self.entry_rollup_id)?;
                 tracing::debug!(
-                    name: "composer.zk_poster_l1_postbatch",
+                    name: "composer.evm_l1_postbatch",
                     %rollup_id,
                     entries = group_calls.len(),
-                    "zk-poster target: built immediate L1 postBatch; settlement applied at submission",
+                    "EVM L1-style target: built immediate L1 postBatch; settlement applied at submission",
                 );
                 batch
             } else {

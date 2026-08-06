@@ -84,7 +84,7 @@ impl RollupConfig {
 /// Runtime state for one rollup the umbrella manages.
 ///
 /// `Composer<L2>` is generic over the L2 provider type; all entries in
-/// the `HashMap<RollupId, RollupState<L2>>` share that type today
+/// the `HashMap<u64, RollupState<L2>>` share that type today
 /// (single chainspec for all rollups). Stage-N multi-L2 with
 /// heterogeneous chainspecs is a separate refactor.
 #[derive(Debug)]

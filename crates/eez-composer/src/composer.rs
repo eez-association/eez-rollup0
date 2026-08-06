@@ -1190,6 +1190,10 @@ where
     /// transactions, build the Sync block, register optimistic state, spawn L1
     /// submission observation, and return the block for immediate L2 commit.
     ///
+    /// Cadence: `CompositionBuilder::finalize` runs once per drained tx (via
+    /// the simulate arms below); [`Self::prepare_post_batch_raw`] runs once
+    /// per slot, merging every survivor's `Composition`.
+    ///
     /// # Errors
     /// Returns errors only before drain classification begins.
     async fn compose_cross_chain_batch(
@@ -1312,6 +1316,8 @@ where
         // unprocessed remainder; survivors are added below).
         let mut transient: Option<(String, Vec<HeldTx>)> = None;
 
+        // Per-tx phase: each arm below runs a fresh CompositionBuilder through
+        // finalize — one multi-target Composition per surviving tx.
         let mut iter = drained.into_iter().enumerate();
         while let Some((idx, held)) = iter.next() {
             if let Some(gap_at) = poison_gap_for(&poison_gaps, &held) {
@@ -1379,6 +1385,7 @@ where
                         // it would revert on-chain and drop the whole bundle.
                         // "ether out" is the amount of Ether being withdrawn in this outbound settlement entry.
                         // If missing, the entry is malformed and must be evicted.
+                        // Review once reentrancy is available
                         let Some(need) = eez_protocol::entries::outbound_ether_out(&l1_entries[0])
                         else {
                             event!(name: "eez.composer.cc_compose.outbound_ether_out_missing", Level::WARN, rollup_id, tx_idx = idx, tx_hash = %held.hash, "outbound tx is missing ether out entry, likely malformed; evicting");
@@ -1700,6 +1707,8 @@ where
         // (only the system/load txs are). Empty for inbound-only.
         let outbound_user_txs: Vec<Bytes> =
             pairs.iter().filter_map(|p| p.user_tx.clone()).collect();
+        // Per-slot phase: one merge over all survivor compositions, now that
+        // the built block's state root and per-effect roots exist.
         let postbatch_raw = match self
             .prepare_post_batch_raw(
                 ctx,
