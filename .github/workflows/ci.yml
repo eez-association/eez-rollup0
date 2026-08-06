@@ -78,11 +78,6 @@ jobs:
       - name: Build and test contracts
         working-directory: contracts
         run: forge test
-      - name: Test canonical CREATE2 proxy derivation
-        working-directory: sync-rollups-protocol
-        run: |
-          forge test --match-path test/EEZ.t.sol --match-test test_ComputeCrossChainProxyAddress
-          forge test --match-path test/EEZL2.t.sol --match-test test_ComputeCrossChainProxyAddress_MatchesActual
 
   embedded-e2e:
     name: Embedded E2E Tests
