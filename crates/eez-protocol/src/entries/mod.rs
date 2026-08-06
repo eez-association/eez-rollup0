@@ -9,13 +9,11 @@ use alloy_sol_types::SolCall;
 use tracing::{debug, trace};
 
 use crate::abi::{
-    CrossChainCallSol, ExecutionEntrySol, ExpectedL1ToL2CallSol, ExpectedOutgoingCrossChainCallSol,
-    L2ExecutionEntrySol, L2StaticExecutionEntrySol, L2ToL1CallSol, StaticExecutionEntrySol,
-    loadExecutionTableCall, postAndVerifyBatchCall,
+    CrossChainCallSol, ExecutionEntrySol, L2ExecutionEntrySol, L2ToL1CallSol,
+    postAndVerifyBatchCall,
 };
 use crate::action::{CallHashInput, CallMode, common_cross_chain_call_hash, l2_outbound_call_hash};
 use crate::batch::EvmBatch;
-use crate::dialect::ChainDialect;
 use crate::{ExecutedAction, ProtocolResult, RollupId, rolling_hash::EntryRollingHash};
 
 const UNSUCCESSFUL_CALL: &str = "unsuccessful cross-chain calls are not supported";
@@ -48,11 +46,10 @@ pub fn build_batch(
     recorded: &[ExecutedAction],
     attribution: &crate::SourceAttribution<'_>,
     source_rollup_id: RollupId,
-    raw_tx: &[u8],
 ) -> ProtocolResult<EvmBatch> {
-    // State updates and raw L1 transaction routing are attached by the
-    // settlement path, after this source-side table is built.
-    let _ = (attribution, raw_tx);
+    // State updates are attached by the settlement path after this
+    // source-side table is built.
+    let _ = attribution;
 
     ensure_materializable_calls(recorded)?;
     let group = recorded
@@ -587,78 +584,6 @@ pub fn decode_postbatch(calldata: &[u8]) -> alloy_sol_types::Result<EvmBatch> {
     Ok(postAndVerifyBatchCall::abi_decode(calldata)?.batch)
 }
 
-/// Encode a batch for its configured L1 or L2 table-loading dialect.
-#[must_use]
-pub fn encode_table_payload(batch: &EvmBatch, dialect: &ChainDialect) -> Vec<u8> {
-    if dialect.is_zk_poster() {
-        encode_postbatch(batch)
-    } else {
-        encode_load_table(batch)
-    }
-}
-
-/// Lower a shared batch into the exact L2 table ABI and encode it.
-#[must_use]
-pub fn encode_load_table(batch: &EvmBatch) -> Vec<u8> {
-    loadExecutionTableCall {
-        _entries: batch.entries.iter().map(lower_entry_to_l2).collect(),
-        _staticEntries: batch
-            .staticEntries
-            .iter()
-            .map(lower_static_entry_to_l2)
-            .collect(),
-    }
-    .abi_encode()
-}
-
-fn lower_entry_to_l2(entry: &ExecutionEntrySol) -> L2ExecutionEntrySol {
-    L2ExecutionEntrySol {
-        proxyEntryHash: entry.proxyEntryHash,
-        incomingCalls: entry.l2ToL1Calls.iter().map(lower_call_to_l2).collect(),
-        expectedOutgoingCalls: entry
-            .expectedL1ToL2Calls
-            .iter()
-            .map(lower_expected_call_to_l2)
-            .collect(),
-        rollingHash: entry.rollingHash,
-        success: entry.success,
-        returnData: entry.returnData.clone(),
-    }
-}
-
-fn lower_static_entry_to_l2(entry: &StaticExecutionEntrySol) -> L2StaticExecutionEntrySol {
-    L2StaticExecutionEntrySol {
-        proxyEntryHash: entry.proxyEntryHash,
-        incomingCalls: entry.l2ToL1Calls.iter().map(lower_call_to_l2).collect(),
-        rollingHash: entry.rollingHash,
-        success: entry.success,
-        returnData: entry.returnData.clone(),
-    }
-}
-
-fn lower_call_to_l2(call: &L2ToL1CallSol) -> CrossChainCallSol {
-    CrossChainCallSol {
-        revertNextNCalls: call.revertNextNCalls,
-        isStatic: call.isStatic,
-        gas: call.gas,
-        sourceAddress: call.sourceAddress,
-        sourceRollupId: call.sourceRollupId,
-        targetAddress: call.targetAddress,
-        value: call.value,
-        data: call.data.clone(),
-    }
-}
-
-fn lower_expected_call_to_l2(call: &ExpectedL1ToL2CallSol) -> ExpectedOutgoingCrossChainCallSol {
-    ExpectedOutgoingCrossChainCallSol {
-        expectedOutgoingHash: call.expectedL1toL2Hash,
-        incomingCalls: call.l2ToL1Calls.iter().map(lower_call_to_l2).collect(),
-        revertedOrStaticRollingHash: call.revertedOrStaticRollingHash,
-        success: call.success,
-        returnData: call.returnData.clone(),
-    }
-}
-
 fn supported_return_data(call: &ExecutedAction) -> ProtocolResult<&[u8]> {
     if call.outcome.is_pending() {
         return Err(crate::ProtocolErrorKind::InvalidEncoding(
@@ -753,7 +678,7 @@ mod tests {
     use alloy_primitives::{I256, address};
 
     use super::*;
-    use crate::abi::{ExpectedStateRootPerRollupSol, StateUpdateSol};
+    use crate::abi::StateUpdateSol;
     use crate::{ExecutionOutcome, SourceAttribution};
 
     fn record(target: RollupId, source: RollupId) -> ExecutedAction {
@@ -826,7 +751,7 @@ mod tests {
             record(RollupId::MAINNET, RollupId(1)),
         ];
 
-        assert!(build_batch(&calls, &attribution, RollupId::MAINNET, &[]).is_err());
+        assert!(build_batch(&calls, &attribution, RollupId::MAINNET).is_err());
     }
 
     #[test]
@@ -837,13 +762,7 @@ mod tests {
             per_tx_roots_by_rollup: &per_tx,
         };
         let action = record(RollupId::MAINNET, RollupId(7));
-        let batch = build_batch(
-            std::slice::from_ref(&action),
-            &attribution,
-            RollupId(7),
-            &[],
-        )
-        .unwrap();
+        let batch = build_batch(std::slice::from_ref(&action), &attribution, RollupId(7)).unwrap();
         let entry = &batch.entries[0];
         let expected_key = l2_outbound_call_hash(
             CallHashInput {
@@ -1084,72 +1003,10 @@ mod tests {
     }
 
     #[test]
-    fn l2_lowering_preserves_target_fields_and_static_array() {
-        let nested_call = L2ToL1CallSol {
-            revertNextNCalls: 0,
-            isStatic: false,
-            gas: 0,
-            sourceAddress: Address::ZERO,
-            sourceRollupId: 7,
-            targetAddress: address!("00000000000000000000000000000000000000aa"),
-            value: U256::ZERO,
-            data: Bytes::new(),
-        };
-        let entry = ExecutionEntrySol {
-            proxyEntryHash: B256::with_last_byte(1),
-            l2ToL1Calls: vec![nested_call.clone()],
-            expectedL1ToL2Calls: vec![ExpectedL1ToL2CallSol {
-                expectedL1toL2Hash: B256::with_last_byte(2),
-                l2ToL1Calls: vec![nested_call],
-                revertedOrStaticRollingHash: B256::with_last_byte(3),
-                success: true,
-                returnData: Bytes::from_static(&[4]),
-            }],
-            rollingHash: B256::with_last_byte(5),
-            success: true,
-            returnData: Bytes::from_static(&[6]),
-            ..Default::default()
-        };
-        let static_entry = StaticExecutionEntrySol {
-            expectedStateRoots: vec![ExpectedStateRootPerRollupSol {
-                rollupId: 7,
-                stateRoot: B256::with_last_byte(8),
-            }],
-            proxyEntryHash: B256::with_last_byte(9),
-            l2ToL1Calls: Vec::new(),
-            rollingHash: B256::with_last_byte(10),
-            destinationRollupId: 7,
-            success: true,
-            returnData: Bytes::from_static(&[11]),
-        };
-        let mut batch = EvmBatch::default();
-        batch.entries.push(entry);
-        batch.staticEntries.push(static_entry);
-
-        let calldata = encode_load_table(&batch);
-        let decoded = loadExecutionTableCall::abi_decode(&calldata).unwrap();
-        assert_eq!(decoded._entries.len(), 1);
-        assert_eq!(decoded._entries[0].incomingCalls[0].sourceRollupId, 7);
-        assert_eq!(
-            decoded._entries[0].expectedOutgoingCalls[0].expectedOutgoingHash,
-            B256::with_last_byte(2)
-        );
-        assert!(decoded._entries[0].success);
-        assert_eq!(decoded._staticEntries.len(), 1);
-        assert_eq!(
-            decoded._staticEntries[0].proxyEntryHash,
-            B256::with_last_byte(9)
-        );
-    }
-
-    #[test]
-    fn postbatch_round_trip_and_table_selectors_match() {
+    fn postbatch_round_trip_uses_pinned_selector() {
         let batch = EvmBatch::default();
         let encoded = encode_postbatch(&batch);
         assert_eq!(&encoded[..4], &postAndVerifyBatchCall::SELECTOR);
         assert_eq!(decode_postbatch(&encoded).unwrap().entries.len(), 0);
-
-        let l2 = encode_load_table(&batch);
-        assert_eq!(&l2[..4], &loadExecutionTableCall::SELECTOR);
     }
 }

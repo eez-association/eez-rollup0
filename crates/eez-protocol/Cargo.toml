@@ -7,7 +7,6 @@ rust-version.workspace = true
 description            = "The eez cross-chain protocol: Solidity ABI + entry building, composition engine, composer, checkpoint format, proof signing."
 
 [dependencies]
-async-trait.workspace = true
 thiserror.workspace   = true
 serde.workspace       = true
 tracing.workspace     = true
@@ -28,7 +27,6 @@ reth-ethereum-primitives.workspace = true
 reth-primitives-traits.workspace = true
 
 [dev-dependencies]
-tokio        = { workspace = true, features = ["macros", "rt-multi-thread"] }
 serde_json.workspace = true
 hex.workspace = true
 eez-payload-codec.workspace = true

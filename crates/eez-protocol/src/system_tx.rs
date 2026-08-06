@@ -177,9 +177,9 @@ pub fn build_outbound_load_table_txs(
     for entry in entries {
         // One entry per `loadExecutionTable`: the SyncPair pairs each load
         // with its consuming user tx, so a single-element table is correct
-        // (the self-clean only matters across pairs, not within one). Encode
-        // the lean L2 entry directly — NOT via `encode_load_table`, which
-        // lowers L1-shaped entries.
+        // (the self-clean only matters across pairs, not within one). This is
+        // the canonical encoding boundary for an already-validated lean L2
+        // entry.
         let calldata = loadExecutionTableCall {
             _entries: vec![entry.clone()],
             _staticEntries: Vec::new(),

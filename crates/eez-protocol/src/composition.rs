@@ -25,10 +25,9 @@
 //!   client, an optional session (`None` until the first dispatch
 //!   opens it — the entry rollup's session stays `None` whenever no
 //!   inspector dispatches back to the entry chain), the target
-//!   configuration, and the initial state root.
-//! - **Entry-aware**. `finalize` skips the entry rollup in both the
-//!   target-batch loop and the target-composition loop because the entry
-//!   rollup's output lives in `source`, not `targets`.
+//!   configuration, and legacy composition-time root attribution.
+//! - **Entry-aware**. `finalize` omits the entry rollup from `targets`
+//!   because its output lives in `source`.
 //!
 //! # Lifecycle
 //!
@@ -50,16 +49,13 @@
 //!                             │
 //!                             ▼
 //!      ┌──────────────────────────────────────────────────┐
-//!      │ finalize(raw_tx)               (consumes self)   │
-//!      │   1. validate: recorded + rollups non-empty      │
-//!      │   2. per non-entry rollup: zk-poster settlement  │
-//!      │      or inbound sidecar batch + root attribution │
-//!      │   3. entries::build_batch(recorded, attribution, │
-//!      │      source_id, raw_tx) — once per               │
-//!      │      source + per non-entry target               │
-//!      │   4. encode_table_payload + encode_follower_     │
-//!      │      trigger per target                          │
-//!      │   5. package into Composition                    │
+//!      │ finalize()                     (consumes self)   │
+//!      │   1. validate recorded calls and target plans    │
+//!      │   2. build each non-entry target batch:          │
+//!      │      L1 post-batch, inbound sidecar, or          │
+//!      │      source-side execution table                 │
+//!      │   3. build the entry-rollup batch                │
+//!      │   4. package the batches into Composition        │
 //!      └──────────────────────────────────────────────────┘
 //!                             │
 //!                             ▼
@@ -69,7 +65,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::batch::EvmBatch;
 use crate::entries;
 use crate::error::{
     CompositionResult, ExecutorError, ExecutorErrorKind, ExecutorResult, ProtocolErrorKind,
@@ -89,7 +84,7 @@ use crate::composer::TargetConfig;
 ///
 /// Carries:
 ///
-/// - `client: Arc<dyn ChainClient>` directly (used for
+/// - `client: Arc<dyn ChainClient>` directly (used for legacy
 ///   `current_state_root` attribution and lazy session opening).
 /// - `session: Option<Box<dyn _>>`: opened on first `dispatch_call`
 ///   to this rollup. The entry rollup's session stays `None` whenever
@@ -104,9 +99,9 @@ pub struct Rollup {
     pub session: Option<Box<dyn TargetExecutionSession + Send>>,
     /// Target contract dialect and proxy lookup configuration for this rollup.
     pub config: TargetConfig,
-    /// Root the entry chain currently holds for this rollup. Used as
-    /// the `currentState` of the first source entry that touches this
-    /// rollup.
+    /// Legacy committed root forwarded through `SourceAttribution`.
+    /// The current materializer does not consume composition-time roots;
+    /// downstream settlement attaches authoritative state updates.
     pub initial_state_root: [u8; 32],
 }
 
@@ -137,7 +132,7 @@ impl std::fmt::Debug for Rollup {
 /// Each call runs through a two-phase open/close lifecycle:
 ///
 /// 1. [`open_call`](Self::open_call) — push a `Pending` `ExecutedAction`
-///    placeholder, return its slot index. Called BEFORE recursing into
+///    placeholder, return its slot index. Called before recursing into
 ///    `session.execute`; this is what makes `recorded[..]` a preorder
 ///    traversal (parent's index is fixed before any nested dispatches
 ///    can push their own).
@@ -161,7 +156,7 @@ impl std::fmt::Debug for Rollup {
 /// lowering them to `revertNextNCalls`.
 ///
 /// `annotate_revert_span` is separate from `close_call` because
-/// `Inspector::call_end` fires AFTER the inspector's own dispatch
+/// `Inspector::call_end` fires after the inspector's own dispatch
 /// returned and `close_call` already ran — re-rewriting the outcome
 /// would trip a "slot already resolved" check. The post-close span
 /// write is its own primitive.
@@ -169,29 +164,20 @@ pub struct CompositionBuilder {
     pub(crate) entry_rollup_id: RollupId,
     pub(crate) rollups: HashMap<RollupId, Rollup>,
     pub(crate) recorded: Vec<ExecutedAction>,
-    /// Pre-computed per-tx state roots, keyed by rollup id, injected
-    /// via [`Self::set_extra_per_tx_roots`]. The entry rollup consumes these
-    /// roots during `finalize`; non-entry rollups derive their attribution
-    /// while their target batches are built.
+    /// Legacy composition-time roots keyed by rollup ID. The current
+    /// materializer ignores them; settlement attaches state updates later.
     pub(crate) extra_per_tx_roots: HashMap<RollupId, Vec<[u8; 32]>>,
-    /// Per-call snapshot stash, keyed by `recorded[..]` index. Each
-    /// open call grabs an opaque [`SessionSnapshot`] right before
-    /// recursing into `session.execute`; the snapshot is dropped on
-    /// the success path of `close_call` and pushed onto
-    /// [`pending_rollbacks`] on the revert path.
+    /// Per-call checkpoint keyed by `recorded[..]` index. Checkpoints remain
+    /// available while enclosing EVM frames may still revert; reverted spans
+    /// queue their indices for rollback. Unused checkpoints are dropped with
+    /// the builder.
     pub(crate) pending_snapshots: HashMap<usize, crate::executor::SessionSnapshot>,
-    /// Rollups whose session is currently CHECKED OUT by an in-flight
-    /// `dispatch_call` frame (taken at execute, put back after). A nested
-    /// dispatch re-entering one of these would lazy-open a DUPLICATE
-    /// session whose writes the outer put-back silently drops — refuse it
-    /// loudly instead (review 2026-06-11; reachable only at depth>1,
-    /// which is unbuilt).
+    /// Rollups whose sessions are temporarily removed while `execute` runs.
+    /// Recursive dispatch to a checked-out rollup is rejected to avoid opening
+    /// a second session whose writes would be lost when the first is restored.
     pub(crate) checked_out: std::collections::HashSet<RollupId>,
-    /// Recorded-call indices whose snapshots need rollback. Drained at
-    /// the start of every async `dispatch_call` (and at finalize) so
-    /// the rollback runs at the next `` point — keeps
-    /// `close_call` / `annotate_revert_span` synchronous (the
-    /// inspector calls them from synchronous EVM hooks).
+    /// Recorded-call indices queued by revert-span annotation. They are
+    /// consumed before a subsequent dispatch opens another target call.
     pub(crate) pending_rollbacks: Vec<usize>,
 }
 
@@ -230,12 +216,10 @@ impl CompositionBuilder {
         }
     }
 
-    /// Seed LIVE target sessions from a previous composition in the same
-    /// slot (F1, D-3): the slot drain moves the sessions it took from the
-    /// last builder into the next one, so tx_{k+1}'s probes run on the
-    /// state tx_k's probes left — mirroring the source side's chained
-    /// pass-1 session. A session for a rollup not in this builder's map is
-    /// dropped (logged): it cannot be probed, so it cannot drift.
+    /// Seed target sessions created by an earlier builder.
+    ///
+    /// A seeded session continues from its existing execution state. Sessions
+    /// for rollups absent from this builder's plan are dropped and logged.
     #[must_use]
     pub fn with_sessions(
         mut self,
@@ -254,13 +238,10 @@ impl CompositionBuilder {
         self
     }
 
-    /// Extract every live target session (F1, D-3). Called by the slot
-    /// drain AFTER the pump finishes and BEFORE [`Self::finalize`] consumes
-    /// the builder (`finalize` reads recorded outcomes and configs, never
-    /// the sessions). The drain either chains them into the next tx's
-    /// builder (composition succeeded) or rolls them back to its boundary
-    /// snapshots (composition failed) — and drops them all at slot end:
-    /// sessions never outlive their slot.
+    /// Remove and return every live target session.
+    ///
+    /// This lets an orchestrator transfer session state before [`Self::finalize`]
+    /// consumes the builder.
     pub fn take_sessions(&mut self) -> HashMap<RollupId, Box<dyn TargetExecutionSession + Send>> {
         self.rollups
             .iter_mut()
@@ -268,30 +249,14 @@ impl CompositionBuilder {
             .collect()
     }
 
-    /// The recorded cross-chain calls captured so far (preorder). Read
-    /// AFTER `simulate_source_tx` but BEFORE `finalize` (which consumes
-    /// `self`) when the caller needs a call's resolved `outcome` (e.g. the
-    /// inbound delivery's `return_data`) to build a chain-specific payload
-    /// the composition output doesn't carry verbatim.
-    #[must_use]
-    pub fn recorded(&self) -> &[ExecutedAction] {
-        &self.recorded
-    }
-
-    /// Drain queued rollbacks and apply them. Called at the top of
-    /// every `dispatch_call` (and from `finalize`) so a revert
-    /// observed at the previous `Inspector::call_end` propagates to
-    /// the affected target sessions before the next call opens.
+    /// Apply queued rollbacks before the next target call opens.
     fn process_pending_rollbacks(&mut self) -> ExecutorResult<()> {
         if self.pending_rollbacks.is_empty() {
             return Ok(());
         }
         let queued: Vec<usize> = std::mem::take(&mut self.pending_rollbacks);
-        // Track distinct (rollup_id) under rollback so we only call
-        // `session.rollback` once per session per dispatch boundary —
-        // even if multiple recorded indices in the same span name the
-        // same rollup, we use the OUTER (smallest idx) snapshot
-        // (the deepest one to revert through).
+        // Roll back each rollup once using its first queued checkpoint;
+        // discard later queued checkpoints for the same rollup.
         let mut handled: std::collections::HashSet<RollupId> = std::collections::HashSet::new();
         for idx in queued {
             let Some(snap) = self.pending_snapshots.remove(&idx) else {
@@ -310,19 +275,15 @@ impl CompositionBuilder {
                 session.rollback(snap)?;
             }
         }
-        // Any other snapshots still keyed under bracketed indices are
-        // dropped — the head idx's rollback already restores their
-        // shared session.
+        // Later queued checkpoints for a handled rollup are discarded because
+        // the first rollback already restored that shared session.
         Ok(())
     }
 
-    /// Clone all recorded calls whose `target_rollup_id` matches
-    /// `rollup_id` — the per-target group `finalize` processes.
+    /// Clone calls targeting `rollup_id`.
     ///
-    /// The recorded vec is preorder by construction (each call's index
-    /// is fixed at `Dispatcher::open_call` time), so a linear filter
-    /// preserves dispatch order without tree reconstruction. The
-    /// unified emitter walks this pre-filtered slice directly.
+    /// `recorded` is preorder because `open_call` fixes each index before
+    /// target execution, so filtering preserves dispatch order.
     fn group_calls_for(&self, rollup_id: RollupId) -> Vec<ExecutedAction> {
         self.recorded
             .iter()
@@ -337,35 +298,24 @@ impl CompositionBuilder {
     ///
     /// 1. Validate: both `recorded` and `rollups` non-empty; every
     ///    recorded call targets a registered rollup.
-    /// 2. For each **non-entry** rollup: build the zk-poster
-    ///    settlement batch or the inbound DA-sidecar batch and
-    ///    attribute its post-state root (patching the terminal
-    ///    recorded call for the zk-poster case). Entry rollup is
-    ///    skipped (L1 verifies via
-    ///    `EEZ.postAndVerifyBatch`'s
-    ///    proof bundle, not system txs).
-    /// 3. Call `entries::build_batch` for the source rollup with per-rollup
-    ///    initial state roots; encode via `entries::encode_table_payload`.
-    /// 4. Per **non-entry** rollup: `build_batch` + `encode_table_payload`
-    ///    + `encode_follower_trigger`. One [`TargetComposition`] per
-    ///    rollup.
-    /// 5. Package as [`Composition`].
+    /// 2. Build one `EvmBatch` for each non-empty, non-entry target.
+    /// 3. Build the entry-rollup batch.
+    /// 4. Package the source and sorted target batches as [`Composition`].
     ///
     /// # Errors
     ///
-    /// Returns [`ProtocolErrorKind::EmptyCalls`] on empty inputs,
-    /// [`ProtocolErrorKind::UnknownTarget`] for a recorded rollup not in the
-    /// plan set, [`ProtocolErrorKind::InvalidEncoding`] for a pending call,
-    /// [`ProtocolErrorKind::Unsupported`] when static-entry materialization
-    /// would be required, and [`ProtocolErrorKind::InvalidCheckpoint`] if
-    /// per-rollup state-delta chaining fails in `build_batch`.
-    /// Surfaces any [`ExecutorError`] from root attribution.
-    // Large Err variant is the pre-existing error shape (previously
-    // hidden behind the async fn's returned future); boxing it is out
-    // of scope here.
+    /// Returns [`ProtocolErrorKind::EmptyCalls`] for an empty composition,
+    /// [`ProtocolErrorKind::UnknownTarget`] for an unregistered target, and
+    /// [`ProtocolErrorKind::InvalidEncoding`] for an unresolved call. Returns
+    /// [`ProtocolErrorKind::Unsupported`] for execution shapes outside the
+    /// supported materialization profile, and
+    /// [`ProtocolErrorKind::InvalidCheckpoint`] when an inbound target has no
+    /// resolved post-state root. Propagates executor failures while reading the
+    /// current L1 root.
+    // Keep the structured public error type rather than boxing it.
     #[allow(clippy::result_large_err)]
     #[tracing::instrument(level = "debug", name = "finalize", skip_all, err)]
-    pub fn finalize(mut self, raw_tx: &[u8]) -> CompositionResult<Composition> {
+    pub fn finalize(mut self) -> CompositionResult<Composition> {
         tracing::debug!(name: "composer.finalize.start", "composition finalize started");
 
         if self.recorded.is_empty() || self.rollups.is_empty() {
@@ -382,56 +332,28 @@ impl CompositionBuilder {
         }
         entries::ensure_materializable_calls(&self.recorded)?;
 
-        // Sorted plan order for deterministic output (upstream's invariant 2).
+        // Sort by rollup ID so identical inputs produce identical target order.
         let mut plan_order: Vec<RollupId> = self.rollups.keys().copied().collect();
         plan_order.sort();
 
-        // Per-rollup cumulative post-state roots.
-        // Keyed by `RollupId`; one `Vec` per rollup that
-        // contributed roots (entry rollup contributes from
-        // overlay-session executes injected via
-        // `Dispatcher::set_extra_per_tx_roots`; non-entry rollups
-        // contribute in the loop
-        // below). Consumed by the source-entry build step via
-        // `SourceAttribution::per_tx_roots_by_rollup` for
-        // nested-composition upstream-invariant-6 chaining.
+        // Legacy composition-time attribution. The current entry materializer
+        // ignores these maps because settlement attaches state updates later.
         let mut per_tx_roots_by_rollup: HashMap<RollupId, Vec<[u8; 32]>> = HashMap::new();
 
-        // initial_roots is hoisted out of Phase 3 so the target
-        // loop can pass an attribution to `build_batch`.
-        // Per-tx roots are still empty at this point — they're
-        // populated later by the loop and
-        // by `extra_per_tx_roots` for the entry rollup. The L1-as-
-        // follower emitter uses `initial_roots[source_rollup_id]`
-        // for its first state update's currentState; with empty
-        // per_tx_roots it emits a degenerate-tail chain (newState ==
-        // currentState), which `EEZ.executeL2TX`'s simulation
-        // accepts (each delta matches the rollup's stored root).
+        // Preserve the legacy attribution carrier until the root plumbing is
+        // removed in a dedicated change.
         let initial_roots: HashMap<RollupId, [u8; 32]> = self
             .rollups
             .iter()
             .map(|(id, r)| (*id, r.initial_state_root))
             .collect();
 
-        // Under the multi-prover ABI, `proofs[]` lives inside the
-        // batch struct (`ProofSystemBatchPerVerificationEntries.proofs`).
-        // The composer's `encode_table_payload` path here emits the
-        // empty-`proofs[]` batch destined for
-        // follower-side `loadExecutionTable` payloads; the real
-        // L1-poster path (proofs populated, signatures attached) lives
-        // in `composer-lib::post_batch_submitter` (`submit_with_proof`).
-
-        // Phase 2 — per-rollup target batches (non-entry rollups only).
+        // Build per-rollup target batches (non-entry rollups only).
         //
-        // For each non-entry rollup with non-empty group calls, build
-        // the batch (zk-poster settlement or inbound DA-sidecar) and
-        // record the attributed root so the entry-side build_batch
-        // (Phase 3) can chain state updates through it.
-        //
-        // Entry rollup branch: drain pre-computed roots from the
-        // overlay-session path (`extra_per_tx_roots`).
+        // The root maps below are legacy attribution inputs; returned batches
+        // do not contain state updates until downstream settlement attaches them.
         let mut extra_per_tx_roots = std::mem::take(&mut self.extra_per_tx_roots);
-        let mut target_batches: HashMap<RollupId, EvmBatch> = HashMap::new();
+        let mut target_compositions = Vec::new();
         for rollup_id in &plan_order {
             if *rollup_id == self.entry_rollup_id {
                 if let Some(roots) = extra_per_tx_roots.remove(rollup_id) {
@@ -450,19 +372,11 @@ impl CompositionBuilder {
 
             let dialect = &rollup.config.dialect;
 
-            // zk-poster (L1) dialect — build the EXECUTING L1 `postAndVerifyBatch`
-            // mirror, NOT the regular `build_batch`. The L2→L1 calls are TopLevel
-            // for the ENTRY (L2) batch (caller==entry) but NestedSuccess here
-            // (caller!=L1), so `build_batch(source=L1)` would emit an EMPTY
-            // L1-as-caller batch. Per the `counterL2` spec, each L2→L1 call is an
-            // IMMEDIATE executing entry on L1 (`proxyEntryHash`=0 + `L2ToL1Calls`).
-            //
-            // We do NOT `simulate_transactions`: `postAndVerifyBatch` carries a
-            // proof not signed until the prover's return path, so simulating it
-            // here would revert on empty `proofs[]`. The L1 state transition
-            // happens at post-batch SUBMISSION (Step 6). We attribute the L1's
-            // REAL current state root as this rollup's post-state root (a
-            // placeholder; the prover patches the real L2 `newState` later).
+            // L1 targets need immediate L2-to-L1 post-batch entries. Generic
+            // `build_batch` materializes source-side calls and cannot represent
+            // this target-side form. Proofs and state updates are attached
+            // downstream. The current-root patch is legacy attribution and does
+            // not affect the returned batch.
             if dialect.is_zk_poster() {
                 let batch = entries::build_l1_postbatch(&group_calls, self.entry_rollup_id)?;
                 if batch.is_empty() {
@@ -488,7 +402,10 @@ impl CompositionBuilder {
                     "zk-poster target: built immediate L1 postBatch; settlement applied at submission",
                 );
                 per_tx_roots_by_rollup.insert(*rollup_id, vec![root]);
-                target_batches.insert(*rollup_id, batch);
+                target_compositions.push(TargetComposition {
+                    rollup_id: *rollup_id,
+                    batch,
+                });
                 continue;
             }
 
@@ -531,60 +448,28 @@ impl CompositionBuilder {
                     "inbound target sidecar built",
                 );
                 per_tx_roots_by_rollup.insert(*rollup_id, vec![root]);
-                target_batches.insert(*rollup_id, inbound_batch);
+                target_compositions.push(TargetComposition {
+                    rollup_id: *rollup_id,
+                    batch: inbound_batch,
+                });
                 continue;
             }
 
-            let batch =
-                entries::build_batch(&group_calls, &attribution_so_far, *rollup_id, raw_tx)?;
+            let batch = entries::build_batch(&group_calls, &attribution_so_far, *rollup_id)?;
             if !batch.is_empty() {
-                target_batches.insert(*rollup_id, batch);
+                target_compositions.push(TargetComposition {
+                    rollup_id: *rollup_id,
+                    batch,
+                });
             }
         }
 
-        // Phase 3 — entry-rollup batch (across full preorder slice).
+        // Build the entry-rollup batch across the full preorder slice.
         let attribution = crate::composer::SourceAttribution {
             initial_roots: &initial_roots,
             per_tx_roots_by_rollup: &per_tx_roots_by_rollup,
         };
-        let entry_dialect = self
-            .rollups
-            .get(&self.entry_rollup_id)
-            .expect("entry rollup registered at builder construction")
-            .config
-            .dialect;
-        let entry_batch =
-            entries::build_batch(&self.recorded, &attribution, self.entry_rollup_id, raw_tx)?;
-        let entry_payload = entries::encode_table_payload(&entry_batch, &entry_dialect);
-
-        // Phase 4 — target compositions (re-encode from the batches
-        // captured in Phase 2). Skip entry rollup + empty groups.
-        let mut target_compositions: Vec<TargetComposition> = Vec::new();
-        for rollup_id in &plan_order {
-            if *rollup_id == self.entry_rollup_id {
-                continue;
-            }
-            let Some(batch) = target_batches.remove(rollup_id) else {
-                continue;
-            };
-            let group_calls = self.group_calls_for(*rollup_id);
-            // group_calls[0] guaranteed non-empty because Phase 2 only
-            // populated `target_batches` for non-empty groups.
-            let outer_root = &group_calls[0];
-            let rollup = self
-                .rollups
-                .get(rollup_id)
-                .expect("plan_order from rollups map");
-            let dialect = &rollup.config.dialect;
-            let load_table_payload = entries::encode_table_payload(&batch, dialect);
-            let execute_payload = dialect.encode_follower_trigger(outer_root);
-            target_compositions.push(TargetComposition {
-                rollup_id: *rollup_id,
-                batch,
-                load_table_payload,
-                execute_payload,
-            });
-        }
+        let entry_batch = entries::build_batch(&self.recorded, &attribution, self.entry_rollup_id)?;
 
         tracing::debug!(
             name: "composer.finalize.complete",
@@ -596,7 +481,6 @@ impl CompositionBuilder {
             source: SourceComposition {
                 rollup_id: self.entry_rollup_id,
                 batch: entry_batch,
-                entry_payload,
             },
             targets: target_compositions,
         })
@@ -629,10 +513,8 @@ impl CompositionBuilder {
         source_rollup_id: RollupId,
         req: ExecutionRequest,
     ) -> ExecutorResult<ExecutionOutcome> {
-        // Drain any pending rollbacks queued by the previous frame's
-        // `annotate_revert_span` / `close_call`. This is the next
-        // async point — synchronous lifecycle methods cannot call
-        // `session.rollback()` directly.
+        // Drain rollbacks queued by a previous frame before opening another
+        // target call.
         self.process_pending_rollbacks()?;
 
         // Same-chain re-entry guard. Entry-to-entry dispatch (e.g. a
@@ -659,15 +541,15 @@ impl CompositionBuilder {
             .take()
             .expect("session opened by open_call");
 
-        // `session.execute` awaits first; nested dispatches from a
-        // target-session inspector call back into `self.dispatch_call`
-        // and push their own `ExecutedAction`s at indices `idx + 1, ..`.
-        // The vec is preorder by construction.
+        // A target-session inspector may dispatch recursively during
+        // `session.execute`, appending child actions after `idx`. Recording the
+        // parent before execution therefore preserves preorder.
         self.checked_out.insert(target_rollup_id);
         let response_res = session.execute(req, self);
 
-        // Put the session back even on error; revert handling is
-        // post-close via `annotate_revert_span`.
+        // Restore the checked-out session before propagating the execution
+        // result. Controlled EVM reverts arrive as `ExecutionOutcome`, not
+        // `Err`.
         self.checked_out.remove(&target_rollup_id);
         self.rollups
             .get_mut(&target_rollup_id)
@@ -692,13 +574,13 @@ impl CompositionBuilder {
     }
 
     /// Push a `Pending` placeholder for a new call and return its
-    /// slot index. Called BEFORE the target session's `execute` so
+    /// slot index. Called before the target session's `execute` so
     /// the index is stable across nested dispatches.
     ///
     /// # Errors
     ///
-    /// Same as [`dispatch_call`](Self::dispatch_call) — re-entry guard
-    /// and rollup-id validation fire here.
+    /// Returns an error for invalid re-entry, an unregistered target, session
+    /// creation failure, or checkpoint failure.
     pub fn open_call(
         &mut self,
         target_rollup_id: RollupId,
@@ -711,10 +593,9 @@ impl CompositionBuilder {
                 target: target_rollup_id,
             }));
         }
-        // Cyclic nesting (entry→A→B→A): A's session is checked out by the
-        // outer frame, so a lazy-open here would mint a DUPLICATE whose
-        // writes the outer put-back drops. Refuse loudly (depth>1 is
-        // unbuilt; this turns a silent state loss into an error).
+        // Nested materialization is rejected later, but simulation must still
+        // refuse cycles such as entry→A→B→A to prevent silent session-state
+        // loss while A's session is checked out.
         if self.checked_out.contains(&target_rollup_id) {
             return Err(ExecutorError::from(ExecutorErrorKind::InvalidReentry {
                 caller: source_rollup_id,
@@ -761,7 +642,7 @@ impl CompositionBuilder {
     }
 
     /// Resolve the call opened by [`open_call`](Self::open_call) at `idx` with its outcome.
-    /// `revert_span` retains a top-level call's reverted scope when known at
+    /// `revert_span` retains a bracketing call's reverted scope when known at
     /// close time. The current simplify materializers reject it; most callers
     /// pass `None` and let
     /// [`annotate_revert_span`](Self::annotate_revert_span) fill it
@@ -780,17 +661,13 @@ impl CompositionBuilder {
         slot.outcome = outcome;
         if let Some(span) = revert_span {
             slot.revert_span = Some(span);
-            // Queue this slot's snapshot for rollback at the next
-            // async dispatch boundary.
+            // Queue this slot's snapshot for rollback at the next dispatch
+            // boundary.
             self.pending_rollbacks.push(idx);
         }
-        // Note: when `revert_span` is `None` (the common case — the
-        // inspector observes revert post-frame and calls
-        // [`annotate_revert_span`] AFTER `close_call` already ran),
-        // the snapshot stays stashed in `pending_snapshots`. The
-        // bracketing inspector frame's `call_end` decides between
-        // queue-rollback (revert) and drop (commit). Any snapshot
-        // still stashed after the EVM pass is dropped at finalize.
+        // When `revert_span` is `None`, the checkpoint remains available for
+        // an enclosing frame that may still revert. Unused checkpoints are
+        // dropped with the builder.
     }
 
     /// Number of [`ExecutedAction`]s captured so far in this composition.
@@ -805,27 +682,19 @@ impl CompositionBuilder {
         self.recorded.len()
     }
 
-    /// Annotate `recorded[idx].revert_span = Some(span)` AND evict
-    /// every target session that captured writes inside the
-    /// `[idx, idx + span as usize)` window so the next dispatch
-    /// lazy-opens fresh from disk.
-    ///
-    /// Two rollback primitives coexist: explicit
-    /// [`TargetExecutionSession::checkpoint`] /
-    /// [`rollback`](TargetExecutionSession::rollback) for sessions that
-    /// support it, and eviction (drop the in-memory `State`, re-read
-    /// disk) for sessions that don't.
+    /// Mark the bracketing call with `revert_span` and queue checkpoints for
+    /// recorded calls in that range. Rollbacks are coalesced per rollup and
+    /// applied before a later dispatch.
     pub fn annotate_revert_span(&mut self, idx: usize, span: u32) {
         if idx >= self.recorded.len() || span == 0 {
             return;
         }
-        // Annotate the bracketing top-level call. Only the call at
         // Only the head carries the scope; bracketed inner calls do not.
         self.recorded[idx].revert_span = Some(span);
         // Queue rollbacks for every recorded index in the bracket.
         // `process_pending_rollbacks` consolidates by rollup id and
-        // applies one rollback per affected session at the next
-        // async dispatch boundary.
+        // applies one rollback per affected session at the next dispatch
+        // boundary.
         let end = idx.saturating_add(span as usize).min(self.recorded.len());
         for i in idx..end {
             if self.pending_snapshots.contains_key(&i) {
@@ -840,16 +709,10 @@ impl CompositionBuilder {
         );
     }
 
-    /// Inject pre-computed per-tx state roots for `rollup_id` into the
-    /// builder's eventual `finalize` step.
+    /// Store legacy composition-time roots for `rollup_id`.
     ///
-    /// Used by the entry-overlay path: `finalize`'s target loop
-    /// skips the entry rollup because its output is built separately as the
-    /// source composition, so nested calls attributed to it have no
-    /// `per_tx_roots` source. The entry overlay session captures one
-    /// post-state root per overlay `execute` and, at end of
-    /// `simulate_source_tx`, the source-sim path drains that buffer
-    /// and forwards it here.
+    /// The current materializer ignores these roots; downstream settlement
+    /// attaches authoritative state updates.
     pub fn set_extra_per_tx_roots(&mut self, rollup_id: RollupId, roots: Vec<[u8; 32]>) {
         if !roots.is_empty() {
             self.extra_per_tx_roots.insert(rollup_id, roots);
@@ -863,7 +726,8 @@ mod tests {
     use crate::action::{CallHashInput, CallMode, common_cross_chain_call_hash};
     use crate::composer::ProxyLookupConfig;
     use crate::dialect::ChainDialect;
-    use alloy_primitives::{Address, Bytes, U256};
+    use alloy_primitives::{Address, Bytes, U256, b256, keccak256};
+    use alloy_sol_types::SolValue as _;
 
     // ── Mock ChainClient (spawns a canned session) ──────────────────
 
@@ -1011,8 +875,8 @@ mod tests {
 
     // ── Tests ────────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn dispatch_routes_to_registered_session_and_records() {
+    #[test]
+    fn dispatch_routes_to_registered_session_and_records() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1028,8 +892,8 @@ mod tests {
         assert_eq!(builder.recorded[0].call_mode, crate::CallMode::Mutable);
     }
 
-    #[tokio::test]
-    async fn dispatch_preserves_call_mode() {
+    #[test]
+    fn dispatch_preserves_call_mode() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1044,11 +908,11 @@ mod tests {
         assert_eq!(builder.recorded[0].call_mode, crate::CallMode::Static);
     }
 
-    #[tokio::test]
-    async fn sessions_seed_take_round_trip_and_drop_unregistered() {
-        // F1 (D-3): take_sessions extracts the lazily-opened live session;
-        // with_sessions seeds it into the next builder; a session for an
-        // unregistered rollup is dropped (it cannot be probed there).
+    #[test]
+    fn sessions_seed_take_round_trip_and_drop_unregistered() {
+        // `take_sessions` extracts the lazily opened session and
+        // `with_sessions` can seed it into another compatible builder. A
+        // session for an unregistered rollup is dropped.
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1086,8 +950,8 @@ mod tests {
         assert!(!builder3.rollups.contains_key(&RollupId(1)));
     }
 
-    #[tokio::test]
-    async fn cyclic_nested_dispatch_is_refused() {
+    #[test]
+    fn cyclic_nested_dispatch_is_refused() {
         // entry→A→A-again: while A's session is checked out, a nested
         // dispatch back into A must error (InvalidReentry), not mint a
         // duplicate session (whose writes the outer put-back would drop).
@@ -1116,8 +980,8 @@ mod tests {
         assert_eq!(builder.take_sessions().len(), 1, "outer session survives");
     }
 
-    #[tokio::test]
-    async fn dispatch_unknown_rollup_returns_unavailable() {
+    #[test]
+    fn dispatch_unknown_rollup_returns_unavailable() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1129,12 +993,12 @@ mod tests {
         assert!(matches!(err.kind(), ExecutorErrorKind::Unavailable(_)));
     }
 
-    #[tokio::test]
-    async fn finalize_empty_errors() {
+    #[test]
+    fn finalize_empty_errors() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         let builder = CompositionBuilder::new(RollupId(0), rollups);
-        let err = builder.finalize(&[]).expect_err("should fail");
+        let err = builder.finalize().expect_err("should fail");
         assert!(matches!(
             err.kind(),
             crate::error::CompositionErrorKind::Protocol(p)
@@ -1142,12 +1006,11 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn finalize_inbound_target_produces_sidecar_composition() {
-        // An entry→rollup-1 call is INCOMING from rollup 1's perspective:
-        // `build_batch(source = 1)` yields an empty batch (no top-level
-        // call sourced from 1), so finalize takes the inbound DA-sidecar
-        // branch and the target composition carries the sidecar entry.
+    #[test]
+    fn finalize_inbound_target_produces_sidecar_composition() {
+        // An entry→rollup-1 call is incoming from rollup 1's perspective, so
+        // finalize uses the inbound sidecar builder rather than source-side
+        // `build_batch`.
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x22; 32]));
@@ -1157,7 +1020,7 @@ mod tests {
             .dispatch_call(RollupId(1), RollupId(0), make_request(1))
             .expect("dispatch");
 
-        let composition = builder.finalize(&[]).expect("finalize");
+        let composition = builder.finalize().expect("finalize");
         assert_eq!(composition.source.rollup_id, RollupId(0));
         // Entry rollup is skipped in the targets loop, so only rollup 1
         // appears in targets.
@@ -1190,8 +1053,8 @@ mod tests {
         assert_eq!(composition.source.batch.entries.len(), 1);
     }
 
-    #[tokio::test]
-    async fn finalize_rejects_recorded_calls_for_unregistered_rollups() {
+    #[test]
+    fn finalize_rejects_recorded_calls_for_unregistered_rollups() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1208,7 +1071,7 @@ mod tests {
             revert_span: None,
         });
 
-        let err = builder.finalize(&[]).expect_err("should fail");
+        let err = builder.finalize().expect_err("should fail");
         assert!(matches!(
             err.kind(),
             crate::error::CompositionErrorKind::Protocol(p)
@@ -1219,8 +1082,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn finalize_rejects_static_calls_before_building_any_dialect() {
+    #[test]
+    fn finalize_rejects_static_calls_before_building_any_dialect() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1232,7 +1095,7 @@ mod tests {
             .expect("dispatch");
 
         let error = builder
-            .finalize(&[])
+            .finalize()
             .expect_err("static entry materialization is not implemented");
 
         assert!(matches!(
@@ -1247,8 +1110,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn finalize_rejects_pending_call_before_zk_poster_can_drop_it() {
+    #[test]
+    fn finalize_rejects_pending_call_before_zk_poster_can_drop_it() {
         let mut l1_rollup = rollup_with_session([0u8; 32]);
         l1_rollup.config.dialect = ChainDialect::EvmL1Style;
 
@@ -1261,7 +1124,7 @@ mod tests {
             .expect("open pending call");
 
         let error = builder
-            .finalize(&[])
+            .finalize()
             .expect_err("finalize must reject every unresolved call");
 
         assert!(matches!(
@@ -1275,8 +1138,8 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn finalize_targets_come_out_sorted_by_rollup_id() {
+    #[test]
+    fn finalize_targets_come_out_sorted_by_rollup_id() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(3), rollup_with_session([0x33; 32]));
@@ -1290,34 +1153,110 @@ mod tests {
                 .expect("dispatch");
         }
 
-        let composition = builder.finalize(&[]).expect("finalize");
+        let composition = builder.finalize().expect("finalize");
         let ids: Vec<u64> = composition.targets.iter().map(|t| t.rollup_id.0).collect();
         assert_eq!(
             ids,
             vec![1, 2, 3],
-            "targets must be sorted by rollup_id, not insertion order (upstream's invariant 2)"
+            "targets must be sorted by rollup_id, not insertion order"
         );
     }
 
-    #[tokio::test]
-    async fn source_rollup_id_is_stored_from_dispatch_arg() {
-        // Regression guard: source_rollup_id must come from the
-        // `source_rollup_id` arg on dispatch_call, not from req.source_rollup.
+    #[test]
+    fn composition_batch_encodings_are_stable() {
+        let entry_rollup_id = RollupId(1);
+        let mut l1_target = rollup_with_session([0x20; 32]);
+        l1_target.config.dialect = ChainDialect::EvmL1Style;
+
+        let mut rollups = HashMap::new();
+        rollups.insert(entry_rollup_id, entry_rollup([0x10; 32]));
+        rollups.insert(RollupId::MAINNET, l1_target);
+        rollups.insert(RollupId(2), rollup_with_session([0x30; 32]));
+
+        let mut builder = CompositionBuilder::new(entry_rollup_id, rollups);
+        builder.recorded = vec![
+            ExecutedAction {
+                call_mode: CallMode::Mutable,
+                target_address: Address::repeat_byte(0xa1),
+                target_rollup_id: RollupId::MAINNET,
+                source_rollup_id: entry_rollup_id,
+                source_address: Address::repeat_byte(0xb1),
+                data: Bytes::from_static(&[0x01, 0x02, 0x03]),
+                value: U256::from(5),
+                outcome: ExecutionOutcome::Resolved {
+                    return_data: vec![0x04, 0x05],
+                    pre_state_root: [0x11; 32],
+                    post_state_root: [0x12; 32],
+                    gas_used: 123,
+                    success: true,
+                },
+                revert_span: None,
+            },
+            ExecutedAction {
+                call_mode: CallMode::Mutable,
+                target_address: Address::repeat_byte(0xa2),
+                target_rollup_id: RollupId(2),
+                source_rollup_id: entry_rollup_id,
+                source_address: Address::repeat_byte(0xb2),
+                data: Bytes::from_static(&[0x06, 0x07]),
+                value: U256::from(8),
+                outcome: ExecutionOutcome::Resolved {
+                    return_data: vec![0x09, 0x0a],
+                    pre_state_root: [0x21; 32],
+                    post_state_root: [0x22; 32],
+                    gas_used: 456,
+                    success: true,
+                },
+                revert_span: None,
+            },
+        ];
+        builder.set_extra_per_tx_roots(entry_rollup_id, vec![[0x40; 32]]);
+
+        let composition = builder.finalize().expect("finalize composition");
+        let source_hash = keccak256(composition.source.batch.abi_encode());
+        let target_hashes = composition
+            .targets
+            .iter()
+            .map(|target| (target.rollup_id, keccak256(target.batch.abi_encode())))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            source_hash,
+            b256!("280a4e30c195b4f4f21c66889b1a6acb0c0b30f18b5efd435348b39fc986d56b")
+        );
+        assert_eq!(
+            target_hashes,
+            vec![
+                (
+                    RollupId::MAINNET,
+                    b256!("f7e0edc00ed7cb620f1251581e6251ec9c459497b151bc80fe3bf6d99103bd71"),
+                ),
+                (
+                    RollupId(2),
+                    b256!("486f05e9bf5d8294de7a7f2295e0a0d630b3bef4abea866ced107f0faba42dae"),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn source_rollup_id_is_stored_from_dispatch_arg() {
+        // Regression guard: the recorded source rollup must come from the
+        // explicit `dispatch_call` argument, not from `req.source_rollup_id`.
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
-        // Pass RollupId(7) as source_rollup_id — distinct from req.source_rollup
-        // (which is RollupId(0) from make_request). The stored value
-        // must match source_rollup_id, not req.source_rollup.
+        // Pass RollupId(7) explicitly, distinct from the request's RollupId(0).
+        // The recorded value must match the dispatch argument.
         builder
             .dispatch_call(RollupId(1), RollupId(7), make_request(1))
             .expect("dispatch");
         assert_eq!(builder.recorded[0].source_rollup_id, RollupId(7));
     }
 
-    // ── Terminal-revert short-circuit ──────────────────────────────
+    // ── Unsuccessful-call rejection ──────────────────────────────
 
     struct NoCcmClient;
 
@@ -1349,8 +1288,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn finalize_rejects_unsuccessful_calls() {
+    #[test]
+    fn finalize_rejects_unsuccessful_calls() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_reverted_session());
@@ -1365,7 +1304,7 @@ mod tests {
         );
 
         let error = builder
-            .finalize(&[])
+            .finalize()
             .expect_err("unsuccessful calls are outside the supported profile");
         assert!(matches!(
             error.kind(),
@@ -1381,13 +1320,10 @@ mod tests {
 
     // ── Router regression tests ──────────────────────────────────
 
-    /// Same-chain non-entry self-dispatch must surface `InvalidReentry`
-    /// loudly. L2 → L2 is architecturally disallowed: a non-entry
-    /// rollup that issues a cross-chain call back to itself bypasses
-    /// the entry rollup's dispatch contract that mediates every legitimate
-    /// reentry.
-    #[tokio::test]
-    async fn dispatch_same_chain_non_entry_returns_invalid_reentry() {
+    /// A non-entry rollup dispatching back to itself must surface
+    /// `InvalidReentry` before recording or opening another session.
+    #[test]
+    fn dispatch_same_chain_non_entry_returns_invalid_reentry() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1412,18 +1348,17 @@ mod tests {
 
     // ── Preorder lifecycle + revertSpan vector tests ─────────────────
 
-    /// Preorder property: `open_call` fixes a slot index BEFORE the
-    /// session executes. Closing the slot fills `Resolved`. Subsequent
-    /// dispatches push at later indices regardless of nesting depth.
-    #[tokio::test]
-    async fn dispatch_records_preorder_at_open_call() {
+    /// `open_call` fixes a slot before execution and `close_call` resolves it.
+    /// A subsequent dispatch appends a later slot.
+    #[test]
+    fn dispatch_records_preorder_at_open_call() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
         let mut builder = CompositionBuilder::new(RollupId(0), rollups);
 
-        // Manually walk the lifecycle to assert the index is fixed at
-        // open_call BEFORE close_call resolves the slot.
+        // Walk the lifecycle directly to verify that `open_call` fixes the
+        // index before `close_call` resolves it.
         let req = make_request(1);
         let idx = builder
             .open_call(RollupId(1), RollupId(0), &req)
@@ -1451,9 +1386,9 @@ mod tests {
 
     /// `annotate_revert_span` writes `revert_span = Some(span)` on
     /// the bracketing call AND queues every snapshot inside the
-    /// bracket for rollback at the next async dispatch boundary.
-    #[tokio::test]
-    async fn annotate_revert_span_writes_span_and_queues_rollback() {
+    /// bracket for rollback at the next dispatch boundary.
+    #[test]
+    fn annotate_revert_span_writes_span_and_queues_rollback() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1482,8 +1417,8 @@ mod tests {
     /// Outer call dispatches 2 inner calls and then the outer's
     /// frame reverts — span = 3 covers the outer + both children.
     /// Bracketed children carry no `revert_span`.
-    #[tokio::test]
-    async fn revert_span_gt_one_covers_outer_plus_two_children() {
+    #[test]
+    fn revert_span_gt_one_covers_outer_plus_two_children() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1517,8 +1452,8 @@ mod tests {
     /// Outer call A reverts, sibling outer B succeeds. A is annotated
     /// with span=1 (self-only); B is not annotated. Preorder indices
     /// stay monotonic; B is in slot 1, after A's slot 0.
-    #[tokio::test]
-    async fn sibling_after_revert_only_annotates_reverted_outer() {
+    #[test]
+    fn sibling_after_revert_only_annotates_reverted_outer() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1543,9 +1478,9 @@ mod tests {
 
     /// Outer call dispatches 1 successful inner call, then the outer
     /// reverts — span = 2 covers the outer plus the successful child.
-    /// The child succeeded but is rolled back via the outer's bracket.
-    #[tokio::test]
-    async fn parent_reverts_after_successful_child() {
+    /// The child succeeded but is queued for rollback with the outer bracket.
+    #[test]
+    fn parent_reverts_after_successful_child() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1569,18 +1504,16 @@ mod tests {
         assert_eq!(builder.recorded[0].revert_span, Some(2));
         assert!(builder.recorded[1].outcome.is_success());
         assert_eq!(builder.recorded[1].revert_span, None);
-        // Both bracketed slots are queued for rollback. The drain
-        // happens at the next `dispatch_call` (covered by the E2E
-        // suite); for unit-level coverage the queue contents are the
-        // observable.
+        // Both bracketed slots are queued for rollback; this test observes the
+        // queue before the next dispatch drains it.
         assert_eq!(builder.pending_rollbacks, vec![0, 1]);
     }
 
     /// Revert at a previous `Inspector::call_end` is applied at the
     /// top of the next `dispatch_call` — the queued rollbacks drain
     /// to `session.rollback()` invocations before the new call opens.
-    #[tokio::test]
-    async fn pending_rollbacks_drain_at_next_dispatch() {
+    #[test]
+    fn pending_rollbacks_drain_at_next_dispatch() {
         let mut rollups = HashMap::new();
         rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
         rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
@@ -1600,13 +1533,14 @@ mod tests {
 
         assert!(
             builder.pending_rollbacks.is_empty(),
-            "queue must be drained at the next async dispatch boundary",
+            "queue must be drained at the next dispatch boundary",
         );
         assert!(
             !builder.pending_snapshots.contains_key(&0),
             "rolled-back snapshot must be removed from stash",
         );
-        // The new call's snapshot at idx 1 still stashed (mid-flight).
+        // The completed call's checkpoint remains available in case an
+        // enclosing frame later reverts.
         assert!(builder.pending_snapshots.contains_key(&1));
     }
 }

@@ -47,22 +47,19 @@ use crate::rollup::RollupState;
 
 /// Runtime config for the cross-chain execution path on Sync slots.
 /// Carried inside [`CrossChainWiring`] next to the wired
-/// `EvmComposer`: the keys/addresses needed to sign
-/// the L2 system txs that the composer's
-/// `simulate_and_resolve` returns as raw `(load_table_payload,
-/// execute_payload)` bytes.
+/// `EvmComposer`: the keys and addresses needed to construct and sign
+/// canonical L2 system transactions from composition batch entries.
 ///
 /// Owned by `eez-node` at startup and shared via `Arc` because the
 /// `PrivateKeySigner` is bigger than two-line clone-cheap.
 #[derive(Clone)]
 pub struct CrossChainExecCtx {
     /// Signing key for SYSTEM_ADDRESS — must match `EEZL2`'s
-    /// `SYSTEM_ADDRESS` immutable. Used to wrap each composer-
-    /// produced `(load_table_payload, execute_payload)` pair into
-    /// two signed legacy L2 txs.
+    /// `SYSTEM_ADDRESS` immutable. Used for `loadExecutionTable` and
+    /// `executeIncomingCrossChainCall` system transactions.
     pub system_signer: alloy_signer_local::PrivateKeySigner,
     /// `EEZL2` address, where SYSTEM_ADDRESS calls both
-    /// `loadExecutionTable` and `executeIncomingCrossChainCall`).
+    /// `loadExecutionTable` and `executeIncomingCrossChainCall`.
     pub eezl2_address: Address,
     /// L2 chain id for EIP-155 signing.
     pub l2_chain_id: u64,
@@ -137,9 +134,8 @@ pub struct CrossChainWiring {
             eez_protocol::TargetConfig,
         ),
     >,
-    /// Runtime context (signer + L2 chain config) for wrapping the
-    /// composer's `(load_table_payload, execute_payload)` byte
-    /// outputs into signed L2 system txs.
+    /// Runtime context for deriving and signing L2 system transactions from
+    /// composition batches.
     pub exec_ctx: Arc<CrossChainExecCtx>,
     /// L2 ENTRY client for OUTBOUND (L2→L1) source simulation. An
     /// outbound tx originates on this L2, so its `simulate_and_resolve`
@@ -229,21 +225,19 @@ impl CrossChainWiring {
         }
 
         // Phase 2 — compose: drive source simulation (which dispatches
-        // every detected proxy call back into the builder), then
-        // finalize. `recorded` carries the resolved per-call outcomes
-        // (return_data) the byte-locked inbound delivery needs,
-        // captured BEFORE `finalize` consumes the builder.
+        // every detected proxy call back into the builder), then finalize.
+        // Capture the count first because `finalize` consumes the builder.
         let mut builder = eez_protocol::CompositionBuilder::new(entry_id, rollups);
         entry_client
             .simulate_source_tx(raw_tx.to_vec(), &mut builder)
             .map_err(eez_protocol::CompositionError::from)?;
-        let recorded = builder.recorded().to_vec();
-        let composition = builder.finalize(raw_tx)?;
+        let recorded_count = builder.recorded_count();
+        let composition = builder.finalize()?;
 
         tracing::info!(
             name: "composer.simulate.complete",
             target_count = composition.targets.len(),
-            recorded = recorded.len(),
+            recorded = recorded_count,
             "composition complete"
         );
 
