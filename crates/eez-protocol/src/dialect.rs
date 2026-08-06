@@ -43,7 +43,7 @@ impl ChainDialect {
     /// Whether this is the L1 `EEZ` dialect whose batches are submitted
     /// through `postAndVerifyBatch`.
     #[must_use]
-    pub const fn is_zk_poster(&self) -> bool {
+    pub const fn is_evm_l1_style(&self) -> bool {
         matches!(self, Self::EvmL1Style)
     }
 }
