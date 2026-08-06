@@ -126,9 +126,9 @@ cast block-number --rpc-url http://localhost:18688   # L2 producing
 The two **cross-chain ingress fronts** are transparent proxies:
 `eth_sendRawTransaction` sent to a front is held and composed into the next Sync
 block; every other `eth_*` is forwarded to that front's source-chain RPC. They
-are enabled by the compose env `EEZ_L1_XCHAIN_PORT` / `EEZ_L2_XCHAIN_PORT`
-(**unset ⇒ that front is disabled** — there is no default port). Upstreams are
-`EEZ_L1_RPC_URL` / `EEZ_L2_RPC_URL` respectively.
+use the compose env `EEZ_L1_XCHAIN_PORT` / `EEZ_L2_XCHAIN_PORT`; both ports are
+required in composer mode. Follower and standalone modes do not start cross-chain
+ingress fronts. Upstreams are `EEZ_L1_RPC_URL` / `EEZ_L2_RPC_URL` respectively.
 
 `EEZ_MAX_USER_TXS_PER_BUNDLE` (compose, default `3`) caps how many user
 cross-chain txs ride in one `postBatch` bundle. Raise it only against a builder
