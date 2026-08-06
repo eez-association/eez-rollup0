@@ -165,7 +165,7 @@ impl CrossChainWiring {
     }
 
     /// Same as [`simulate_and_resolve`](Self::simulate_and_resolve) but
-    /// with an explicitly-chosen entry — `entry_id` + the `entry_client`
+    /// with an explicitly-chosen entry — `entry_rollup_id` + the `entry_client`
     /// that runs source simulation. The explicit entry lets one wiring
     /// compose either direction — `(L1, L1 client)` for an inbound L1→L2 call,
     /// `(L2, L2 client)` for an outbound L2→L1 call — picked per tx by
@@ -179,7 +179,7 @@ impl CrossChainWiring {
     #[allow(clippy::result_large_err)]
     pub fn simulate_and_resolve_recorded_for(
         &self,
-        entry_id: eez_protocol::RollupId,
+        entry_rollup_id: eez_protocol::RollupId,
         entry_client: &(dyn eez_protocol::executor::ChainClient + Send + Sync),
         raw_tx: &[u8],
     ) -> eez_protocol::ComposerResult<eez_protocol::Composition> {
@@ -187,7 +187,7 @@ impl CrossChainWiring {
 
         tracing::info!(
             name: "composer.simulate.start",
-            %entry_id,
+            %entry_rollup_id,
             tx_len = raw_tx.len(),
             rollup_count = self.rollups.len(),
             "simulate_and_resolve: starting composition pipeline"
@@ -210,7 +210,7 @@ impl CrossChainWiring {
         // Drive source simulation, including proxy dispatch through the
         // builder, then materialize the composition's source and target batches.
         // Capture the count first because `finalize` consumes the builder.
-        let mut builder = eez_protocol::CompositionBuilder::new(entry_id, rollups);
+        let mut builder = eez_protocol::CompositionBuilder::new(entry_rollup_id, rollups);
         entry_client
             .simulate_source_tx(raw_tx.to_vec(), &mut builder)
             .map_err(eez_protocol::CompositionError::from)?;
@@ -245,6 +245,12 @@ impl std::fmt::Debug for CrossChainWiring {
 /// backstops poison the compose-time simulation missed. After this many
 /// consecutive drops, the transaction and its nonce-dependent suffix are
 /// evicted so they cannot block the FIFO queue indefinitely.
+///
+/// KNOWN LIMITATION: drain-time simulations are isolated — every tx gets
+/// fresh sessions over the same pre-slot state (see
+/// `simulate_and_resolve_recorded_for`), so a state-dependent tx whose
+/// prerequisite is co-bundled in the same slot deterministically diverges
+/// from real execution and drops here after the retry budget.
 pub const MAX_BUNDLE_ATTEMPTS: u32 = 3;
 
 /// Classify a `simulate_and_resolve` failure. `true` = DETERMINISTIC:

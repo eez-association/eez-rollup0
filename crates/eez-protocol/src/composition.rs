@@ -1257,6 +1257,36 @@ mod tests {
         ));
     }
 
+    /// An entry-chain self-call (source == target == entry) slips past the
+    /// dispatch re-entry guard (which exempts the entry rollup) and past
+    /// `ensure_source_side_calls` (source *is* the entry) — finalize must
+    /// still reject it as outside the pinned profile.
+    #[test]
+    fn finalize_rejects_injected_same_chain_call() {
+        let mut rollups = HashMap::new();
+        rollups.insert(RollupId(0), entry_rollup([0u8; 32]));
+        rollups.insert(RollupId(1), rollup_with_session([0x11; 32]));
+        let mut builder = CompositionBuilder::new(RollupId(0), rollups);
+
+        builder
+            .dispatch_call(RollupId(0), make_request_from(0, RollupId(0)))
+            .expect("entry self-dispatch is exempt from the re-entry guard");
+
+        let error = builder
+            .finalize()
+            .expect_err("entry-chain self-calls are outside the supported profile");
+        assert!(matches!(
+            error.kind(),
+            crate::error::CompositionErrorKind::Protocol(protocol)
+                if matches!(
+                    protocol.kind(),
+                    crate::ProtocolErrorKind::Unsupported(
+                        "same-chain cross-chain calls are not supported"
+                    )
+                )
+        ));
+    }
+
     // ── Re-entry guard tests ──────────────────────────────────────
 
     /// A non-entry rollup dispatching back to itself must surface

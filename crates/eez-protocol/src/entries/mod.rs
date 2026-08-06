@@ -18,10 +18,18 @@ const UNSUCCESSFUL_CALL: &str = "unsuccessful cross-chain calls are not supporte
 const STATIC_CALL: &str = "static cross-chain calls are not supported";
 const REVERT_SPAN: &str = "cross-chain call revert spans are not supported";
 const NESTED_CALL: &str = "nested cross-chain calls are not supported";
+const SELF_CALL: &str = "same-chain cross-chain calls are not supported";
 
 /// Reject calls that the entry profile cannot represent exactly.
+///
+/// Self-calls (source == target) are rejected here as well as at dispatch:
+/// dispatch exempts the entry rollup, so an injected entry-chain self-call
+/// (misconfigured self-proxy) would otherwise materialize.
 pub(crate) fn ensure_materializable_calls(calls: &[ExecutedAction]) -> ProtocolResult<()> {
     for call in calls {
+        if call.source_rollup_id == call.target_rollup_id {
+            return Err(crate::ProtocolErrorKind::Unsupported(SELF_CALL).into());
+        }
         supported_return_data(call)?;
     }
     Ok(())

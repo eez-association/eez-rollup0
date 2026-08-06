@@ -287,15 +287,15 @@ pub fn build_cross_chain_sync_pairs(
     // N>=2 multi-call is NOT yet supported. An entry with multiple l2ToL1Calls
     // would be SILENTLY TRUNCATED to call[0] below (the
     // outbound `.first()` and build_inbound_system_txs both read only [0]),
-    // diverging the Sync-block root with no error — the #1 footgun called out in
-    // docs/multicall-design.md. Fail LOUD until multi-call lands. Today the
+    // diverging the Sync-block root with no error. Fail LOUD until multi-call
+    // lands (design parked; no doc yet). Today the
     // composer only ever produces single-call entries, so this never fires on
     // the happy path; it is the safe boundary for the parked feature.
     let reject_multicall = |entry: &ExecutionEntrySol, dir: &str| -> Result<(), String> {
         if entry.l2ToL1Calls.len() > 1 {
             return Err(format!(
                 "N>=2 multi-call {dir} entry not yet supported \
-                 (l2ToL1Calls={}); see docs/multicall-design.md",
+                 (l2ToL1Calls={}); multi-call support is parked",
                 entry.l2ToL1Calls.len(),
             ));
         }
@@ -548,8 +548,8 @@ mod tests {
     /// N>=2 multi-call is rejected LOUD, not silently truncated. An entry with
     /// Two `l2ToL1Calls` would lower to only call[0] today (the
     /// outbound `.first()` + build_inbound_system_txs read only [0]); the guard
-    /// turns that root-diverging footgun into a clear error pointing at the
-    /// parked design (docs/multicall-design.md).
+    /// turns that root-diverging footgun into a clear error for the parked
+    /// multi-call feature.
     #[test]
     fn cross_chain_sync_pairs_rejects_multicall_entries() {
         let cfg = ctx();
@@ -563,8 +563,8 @@ mod tests {
             .expect_err("N>=2 outbound must be rejected, not silently truncated");
         assert!(err.contains("multi-call outbound"), "err: {err}");
         assert!(
-            err.contains("multicall-design.md"),
-            "error must point at the design doc: {err}",
+            err.contains("multi-call support is parked"),
+            "error must state the feature is parked: {err}",
         );
 
         // Inbound entry with two calls → rejected.
