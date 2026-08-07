@@ -31,12 +31,13 @@ if [[ ! -d "$PROTOCOL_DIR/.git" && ! -f "$PROTOCOL_DIR/.git" ]]; then
     exit 1
 fi
 
-if ! grep -q "ExpectedLookup\\[\\] expectedLookups" "$PROTOCOL_DIR/src/interfaces/IEEZ.sol" 2>/dev/null \
-    || ! grep -q "expectedStateRoots" "$PROTOCOL_DIR/src/interfaces/IEEZ.sol" 2>/dev/null
-then
-    echo "sync-rollups-protocol is too old for this eez-node checkout." >&2
-    echo "Missing postAndVerifyBatch ABI fields expected by this checkout." >&2
+EXPECTED_PROTOCOL_COMMIT="$(git -C "$REPO" ls-files -s sync-rollups-protocol | awk '{print $2}')"
+ACTUAL_PROTOCOL_COMMIT="$(git -C "$PROTOCOL_DIR" rev-parse HEAD)"
+if [[ -z "$EXPECTED_PROTOCOL_COMMIT" || "$ACTUAL_PROTOCOL_COMMIT" != "$EXPECTED_PROTOCOL_COMMIT" ]]; then
+    echo "sync-rollups-protocol is not at the commit pinned by this checkout." >&2
     echo "Run: git submodule update --init --recursive sync-rollups-protocol" >&2
+    echo "Expected: $EXPECTED_PROTOCOL_COMMIT" >&2
+    echo "Actual:   $ACTUAL_PROTOCOL_COMMIT" >&2
     echo "Current submodule status:" >&2
     git -C "$REPO" submodule status sync-rollups-protocol >&2 || true
     exit 1
