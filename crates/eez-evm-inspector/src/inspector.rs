@@ -37,7 +37,7 @@ use revm::interpreter::{
     CallInputs, CallOutcome, CallScheme, Gas, InstructionResult, InterpreterResult,
 };
 
-use eez_protocol::{CompositionBuilder, ExecutorError, ProxyLookupConfig, RollupId};
+use eez_protocol::{CallMode, CompositionBuilder, ExecutorError, ProxyLookupConfig, RollupId};
 use eez_protocol::{ProxyInfo, decode_proxy_value, proxy_mapping_key};
 
 /// Bidirectional side-channel between source-sim and the overlay
@@ -73,10 +73,10 @@ use eez_protocol::{ProxyInfo, decode_proxy_value, proxy_mapping_key};
 ///   overlay executes within one source-sim hook, so the final
 ///   accumulated cache is what reaches source-sim.
 ///
-/// Single-threaded by design — `block_in_place` keeps source and
-/// overlay execution on the same worker. The `Mutex`es are therefore
-/// uncontended in steady state; they exist for borrow-checker
-/// satisfaction, not concurrent access.
+/// Single-threaded by design — the synchronous nested dispatch keeps
+/// source and overlay execution on the same worker. The `Mutex`es are
+/// therefore uncontended in steady state; they exist for
+/// borrow-checker satisfaction, not concurrent access.
 ///
 /// # Lifecycle
 ///
@@ -117,7 +117,7 @@ pub struct OverlayChannel {
 
 impl OverlayChannel {
     /// Push a pre-dispatch cache snapshot — called by every inspector
-    /// frame before `block_in_place`. Stack-based for recursive
+    /// frame before dispatching. Stack-based for recursive
     /// re-entry: `reentrantCrossChainCalls` re-enters L1's overlay
     /// multiple times within one source-sim tx; each frame's
     /// pre-snapshot nests cleanly via push/pop.
@@ -145,7 +145,7 @@ impl OverlayChannel {
 
     /// Push a post-execute cache snapshot — called by the overlay
     /// session at `commit_and_finish`. The matching inspector pops it
-    /// after `block_in_place` returns and applies the diff onto its
+    /// after the dispatch returns and applies the diff onto its
     /// own `&mut ctx`. Without the stack, two nested overlay executes'
     /// post-caches would collide.
     pub fn push_post_cache(&self, cache: CacheState) {
@@ -287,8 +287,8 @@ fn lookup_authorized_proxy_live<CTX: ContextTr + Host>(
 /// [`CompositionBuilder::annotate_revert_span`](eez_protocol::CompositionBuilder::annotate_revert_span). `recorded[..]` is preorder
 /// by construction — every call's slot index is fixed at
 /// `CompositionBuilder::open_call` time, BEFORE the session recurses — so
-/// `span = end - start` is exactly the on-chain `revertSpan` for the
-/// bracketed top-level call.
+/// `span = end - start` is the recorded-call scope of the reverted frame.
+/// The current entry profile rejects calls carrying such a scope.
 pub struct SessionInspector<'a> {
     /// Combined proxy-lookup configuration: the contract address to
     /// read and which slot to read from.
@@ -298,16 +298,13 @@ pub struct SessionInspector<'a> {
     dispatcher: &'a mut CompositionBuilder,
     /// Rollup id of the chain this inspector is running on — the
     /// `caller_id` passed to `dispatch_call` so the resulting
-    /// [`RecordedCall.caller_rollup_id`](eez_protocol::ExecutedAction::caller_rollup_id)
-    /// is correct for nested action-hash emission.
+    /// [`ExecutedAction::source_rollup_id`](eez_protocol::ExecutedAction::source_rollup_id)
+    /// is correct for nested cross-chain call hashing.
     caller_rollup_id: RollupId,
     /// First target execution error, if any.
     error: Option<ExecutorError>,
     call_depth: usize,
     proxy_lookups: usize,
-    /// Tokio runtime handle for bridging the sync `Inspector::call` hook
-    /// to the async `CompositionBuilder::dispatch_call`.
-    handle: tokio::runtime::Handle,
     /// Bidirectional side-channel between source-sim and the entry
     /// rollup's overlay session.
     overlay_channel: Option<OverlayChannelHandle>,
@@ -410,17 +407,9 @@ impl SessionInspectorFactory {
     /// back to the composer) are recorded as preorder children of
     /// the outer call by virtue of the dispatcher's `open_call`
     /// timing.
-    pub fn build<'a>(
-        &self,
-        dispatcher: &'a mut CompositionBuilder,
-        handle: tokio::runtime::Handle,
-    ) -> SessionInspector<'a> {
-        let mut insp = SessionInspector::new(
-            self.proxy_lookup.clone(),
-            dispatcher,
-            self.caller_rollup_id,
-            handle,
-        );
+    pub fn build<'a>(&self, dispatcher: &'a mut CompositionBuilder) -> SessionInspector<'a> {
+        let mut insp =
+            SessionInspector::new(self.proxy_lookup.clone(), dispatcher, self.caller_rollup_id);
         insp.overlay_channel = self.overlay_channel.clone();
         insp
     }
@@ -433,18 +422,16 @@ impl<'a> SessionInspector<'a> {
     /// call dispatches through the supplied [`CompositionBuilder`] and is
     /// recorded into the composition's preorder `recorded[..]` slice.
     ///
-    /// - `proxy_lookup`: the (contract, slot) pair to read
-    ///   `authorizedProxies` from on this chain. Derived from role at
-    ///   `main.rs` startup (entry → Rollups slot 3; follower → CCM slot 1).
+    /// - `proxy_lookup`: the (contract, slot) pair used to read
+    ///   `authorizedProxies` from the chain's `EEZ` or `EEZL2` manager.
+    ///   Both mappings currently occupy slot 0 through `EEZBase`.
     /// - `dispatcher`: dispatch surface for detected calls.
     /// - `caller_rollup_id`: this chain's rollup id — becomes the
     ///   `caller_id` on each dispatched call.
-    /// - `handle`: tokio runtime handle for the sync→async bridge.
     pub fn new(
         proxy_lookup: ProxyLookupConfig,
         dispatcher: &'a mut CompositionBuilder,
         caller_rollup_id: RollupId,
-        handle: tokio::runtime::Handle,
     ) -> Self {
         Self {
             proxy_lookup,
@@ -453,7 +440,6 @@ impl<'a> SessionInspector<'a> {
             error: None,
             call_depth: 0,
             proxy_lookups: 0,
-            handle,
             overlay_channel: None,
             frame_starts: Vec::new(),
         }
@@ -498,6 +484,12 @@ where
             return None;
         }
 
+        // Only mutable CALLs can represent cross-chain proxy calls.
+        // Leave all other call shapes to the EVM.
+        if inputs.is_static || !matches!(inputs.scheme, CallScheme::Call) {
+            return None;
+        }
+
         let calldata = inputs.input.bytes(context);
 
         tracing::trace!(
@@ -523,36 +515,19 @@ where
 
         let call_value = inputs.value.get();
 
-        let scheme = match inputs.scheme {
-            CallScheme::Call => "CALL",
-            CallScheme::CallCode => "CALLCODE",
-            CallScheme::DelegateCall => "DELEGATECALL",
-            CallScheme::StaticCall => "STATICCALL",
-        };
-
         let req = eez_protocol::ExecutionRequest {
+            call_mode: CallMode::Mutable,
             target_address: info.original_address,
             data: calldata.clone(),
             value: call_value,
             source_address: inputs.caller,
             source_rollup_id: self.caller_rollup_id,
         };
-        // Bridge sync Inspector::call → async CompositionBuilder::dispatch_call.
-        //
-        // Uses `tokio::task::block_in_place` to release the worker
-        // thread from tokio's runtime context for the duration of the
-        // dispatch, then `Handle::block_on` to drive the future. The
-        // dispatch runs on the SAME thread that's running source-sim's
-        // `evm.transact` — keeping cross-chain dispatch on a single
-        // thread and giving the overlay path direct access to
-        // source-sim's `&mut State<DB>` via the inspector's `&mut ctx`.
-        //
-        // Hard requirement: multi-threaded tokio runtime.
-        // `block_in_place` panics on single-threaded runtimes; the
-        // gRPC server's bidi Execute stream imposes the same
-        // constraint, so the workspace runs only on multi-threaded
-        // tokio.
-        //
+        // The dispatch is a plain nested call — it runs on the SAME
+        // thread that's running source-sim's `evm.transact`, keeping
+        // cross-chain dispatch on a single thread and giving the
+        // overlay path direct access to source-sim's `&mut State<DB>`
+        // via the inspector's `&mut ctx`.
         let caller_id = self.caller_rollup_id;
         // Overlay-path producer/consumer: source-sim's root-frame
         // inspector snapshots source's in-flight cache into the channel
@@ -619,18 +594,18 @@ where
             }
             // Apply live values to the cloned cache.
             for (addr, slot, value) in live_storage {
-                if let Some(acc) = cache.accounts.get_mut(&addr) {
-                    if let Some(plain) = acc.account.as_mut() {
-                        plain.storage.insert(slot, value);
-                    }
+                if let Some(acc) = cache.accounts.get_mut(&addr)
+                    && let Some(plain) = acc.account.as_mut()
+                {
+                    plain.storage.insert(slot, value);
                 }
             }
             for (addr, balance, nonce) in live_account_info {
-                if let Some(acc) = cache.accounts.get_mut(&addr) {
-                    if let Some(plain) = acc.account.as_mut() {
-                        plain.info.balance = balance;
-                        plain.info.nonce = nonce;
-                    }
+                if let Some(acc) = cache.accounts.get_mut(&addr)
+                    && let Some(plain) = acc.account.as_mut()
+                {
+                    plain.info.balance = balance;
+                    plain.info.nonce = nonce;
                 }
             }
             before_snapshot = Some(cache.clone());
@@ -638,14 +613,10 @@ where
                 channel.push_pre_snapshot(cache);
             }
         }
-        let sim = {
-            let handle = &self.handle;
-            let dispatcher = &mut *self.dispatcher;
-            tokio::task::block_in_place(|| {
-                handle.block_on(dispatcher.dispatch_call(info.original_rollup_id, caller_id, req))
-            })
-        };
-        // After block_in_place: any inner sessions on THIS rollup have
+        let sim = self
+            .dispatcher
+            .dispatch_call(info.original_rollup_id, caller_id, req);
+        // After the dispatch: any inner sessions on THIS rollup have
         // pushed their post-cache to `overlay_cache` (LIFO). Pop the
         // top and apply diff onto our `&mut ctx` so this frame's
         // continued execution sees the inner session's mutations.
@@ -656,12 +627,12 @@ where
                 .overlay_channel
                 .as_ref()
                 .and_then(|c| c.pop_post_cache());
-            if let (Some(before), Some(after)) = (before_snapshot.as_ref(), after_opt.as_ref()) {
-                if let Err(e) = crate::overlay::apply_overlay_diff(context, before, after) {
-                    self.record_error(ExecutorError::evm(format!(
-                        "overlay diff-apply failed: {e}"
-                    )));
-                }
+            if let (Some(before), Some(after)) = (before_snapshot.as_ref(), after_opt.as_ref())
+                && let Err(e) = crate::overlay::apply_overlay_diff(context, before, after)
+            {
+                self.record_error(ExecutorError::evm(format!(
+                    "overlay diff-apply failed: {e}"
+                )));
             }
             if let Some(channel) = &self.overlay_channel {
                 channel.pop_pre_snapshot();
@@ -690,7 +661,6 @@ where
             caller = %inputs.caller,
             proxy = %inputs.target_address,
             depth = self.call_depth,
-            scheme,
             calldata_len = calldata.len(),
             value = %call_value,
             target_result = if success { "ok" } else { "REVERT" },
@@ -706,7 +676,7 @@ where
 
         // Surface a failed cross-chain sim as `Revert` to the surrounding
         // EVM — the outer Solidity frame should see the call as reverted
-        // so try/catch + revertSpan accounting bracket the right range.
+        // so try/catch + reverted-frame accounting bracket the right range.
         let result = if success {
             InstructionResult::Return
         } else {
@@ -723,7 +693,7 @@ where
         // Pair with the snapshot pushed in `call`. If the frame ended
         // with `Revert` AND one or more dispatches happened inside it
         // (range non-empty), notify the dispatcher: those recorded
-        // calls' effects on the source state-delta chain are rolled
+        // calls' effects on the source state-update chain are rolled
         // back, and any in-memory target session that captured those
         // writes is evicted so the next dispatch reads pre-revert
         // disk state.
@@ -761,20 +731,22 @@ mod tests {
 
     use super::*;
     use alloy_primitives::{U256, address};
-    use eez_protocol::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
+    use eez_protocol::{EEZ_AUTHORIZED_PROXIES_SLOT, EEZL2_AUTHORIZED_PROXIES_SLOT};
     use revm::MainContext;
     use revm::context::Context;
     use revm::database::{CacheDB, EmptyDB};
 
-    const ROLLUPS_ADDR: Address = address!("0x1111111111111111111111111111111111111111");
+    const EEZ_ADDRESS: Address = address!("0x1111111111111111111111111111111111111111");
+    const EEZL2_ADDRESS: Address = address!("0x4444444444444444444444444444444444444444");
     const PROXY_ADDR: Address = address!("0x2222222222222222222222222222222222222222");
     const DESTINATION_ADDR: Address = address!("0x3333333333333333333333333333333333333333");
     const TARGET_ROLLUP: u64 = 42;
 
     fn packed_proxy_value(destination: Address, rollup_id: u64) -> U256 {
         let mut word = [0u8; 32];
-        word[4..12].copy_from_slice(&rollup_id.to_be_bytes());
-        word[12..32].copy_from_slice(destination.as_ref());
+        word[3..11].copy_from_slice(&rollup_id.to_be_bytes());
+        word[11..31].copy_from_slice(destination.as_ref());
+        word[31] = 1;
         U256::from_be_bytes(word)
     }
 
@@ -793,13 +765,13 @@ mod tests {
     fn unregistered_address_returns_none() {
         let mut ctx = fresh_context();
         ctx.journal_mut()
-            .load_account(ROLLUPS_ADDR)
-            .expect("load rollups account");
+            .load_account(EEZ_ADDRESS)
+            .expect("load EEZ account");
 
         let info = lookup_authorized_proxy_live(
             &mut ctx,
-            ROLLUPS_ADDR,
-            ROLLUPS_AUTHORIZED_PROXIES_SLOT,
+            EEZ_ADDRESS,
+            EEZ_AUTHORIZED_PROXIES_SLOT,
             PROXY_ADDR,
         );
         assert!(info.is_none());
@@ -807,23 +779,23 @@ mod tests {
 
     #[test]
     fn registered_in_db_returns_some_cold_read() {
-        let key = proxy_mapping_key(PROXY_ADDR, ROLLUPS_AUTHORIZED_PROXIES_SLOT);
+        let key = proxy_mapping_key(PROXY_ADDR, EEZ_AUTHORIZED_PROXIES_SLOT);
         let value = packed_proxy_value(DESTINATION_ADDR, TARGET_ROLLUP);
 
         let mut cache_db = CacheDB::<EmptyDB>::default();
         cache_db
-            .insert_account_storage(ROLLUPS_ADDR, key.into(), value)
+            .insert_account_storage(EEZ_ADDRESS, key.into(), value)
             .expect("populate storage");
 
         let mut ctx = Context::mainnet().with_db(cache_db);
         ctx.journal_mut()
-            .load_account(ROLLUPS_ADDR)
-            .expect("load rollups account");
+            .load_account(EEZ_ADDRESS)
+            .expect("load EEZ account");
 
         let info = lookup_authorized_proxy_live(
             &mut ctx,
-            ROLLUPS_ADDR,
-            ROLLUPS_AUTHORIZED_PROXIES_SLOT,
+            EEZ_ADDRESS,
+            EEZ_AUTHORIZED_PROXIES_SLOT,
             PROXY_ADDR,
         )
         .expect("proxy present in DB");
@@ -835,20 +807,20 @@ mod tests {
     #[test]
     fn registered_in_journal_returns_some_hot_read() {
         let mut ctx = fresh_context();
-        let key = proxy_mapping_key(PROXY_ADDR, ROLLUPS_AUTHORIZED_PROXIES_SLOT);
+        let key = proxy_mapping_key(PROXY_ADDR, EEZ_AUTHORIZED_PROXIES_SLOT);
         let value = packed_proxy_value(DESTINATION_ADDR, TARGET_ROLLUP);
 
         ctx.journal_mut()
-            .load_account(ROLLUPS_ADDR)
-            .expect("load rollups account");
+            .load_account(EEZ_ADDRESS)
+            .expect("load EEZ account");
         ctx.journal_mut()
-            .sstore(ROLLUPS_ADDR, key.into(), value)
+            .sstore(EEZ_ADDRESS, key.into(), value)
             .expect("journal sstore");
 
         let info = lookup_authorized_proxy_live(
             &mut ctx,
-            ROLLUPS_ADDR,
-            ROLLUPS_AUTHORIZED_PROXIES_SLOT,
+            EEZ_ADDRESS,
+            EEZ_AUTHORIZED_PROXIES_SLOT,
             PROXY_ADDR,
         )
         .expect("journal must expose in-tx writes to the inspector");
@@ -861,7 +833,7 @@ mod tests {
     fn wrong_source_contract_slot_returns_none() {
         // Populate the correct slot; reading an arbitrary other slot
         // must miss, not silently decode garbage.
-        let correct_slot = ROLLUPS_AUTHORIZED_PROXIES_SLOT;
+        let correct_slot = EEZ_AUTHORIZED_PROXIES_SLOT;
         let wrong_slot: u8 = 7;
         assert_ne!(
             correct_slot, wrong_slot,
@@ -873,15 +845,15 @@ mod tests {
 
         let mut cache_db = CacheDB::<EmptyDB>::default();
         cache_db
-            .insert_account_storage(ROLLUPS_ADDR, key.into(), value)
+            .insert_account_storage(EEZ_ADDRESS, key.into(), value)
             .expect("populate storage");
 
         let mut ctx = Context::mainnet().with_db(cache_db);
         ctx.journal_mut()
-            .load_account(ROLLUPS_ADDR)
-            .expect("load rollups account");
+            .load_account(EEZ_ADDRESS)
+            .expect("load EEZ account");
 
-        let info = lookup_authorized_proxy_live(&mut ctx, ROLLUPS_ADDR, wrong_slot, PROXY_ADDR);
+        let info = lookup_authorized_proxy_live(&mut ctx, EEZ_ADDRESS, wrong_slot, PROXY_ADDR);
         assert!(
             info.is_none(),
             "reading with the wrong slot must miss, not silently decode garbage"
@@ -891,13 +863,13 @@ mod tests {
     // ── New tests for ProxyLookupConfig variants ────────────────────
 
     #[test]
-    fn rollups_slot_path_reads_slot_0() {
+    fn eez_slot_path_reads_slot_0() {
         // ProxyLookupConfig with source_contract=EEZ routes to slot 0
         // (authorizedProxies declared on EEZBase, first storage slot
         // of every child).
         let config = ProxyLookupConfig {
-            contract_address: ROLLUPS_ADDR,
-            authorized_proxies_slot: ROLLUPS_AUTHORIZED_PROXIES_SLOT,
+            contract_address: EEZ_ADDRESS,
+            authorized_proxies_slot: EEZ_AUTHORIZED_PROXIES_SLOT,
         };
         assert_eq!(config.authorized_proxies_slot, 0u8);
 
@@ -919,20 +891,20 @@ mod tests {
             config.authorized_proxies_slot,
             PROXY_ADDR,
         )
-        .expect("Rollups-config path must find proxy");
+        .expect("EEZ config path must find proxy");
         assert_eq!(info.original_rollup_id, RollupId(TARGET_ROLLUP));
         assert_eq!(info.original_address, DESTINATION_ADDR);
     }
 
     #[test]
-    fn ccm_slot_path_reads_slot_0() {
+    fn eezl2_slot_path_reads_slot_0() {
         // ProxyLookupConfig with source_contract=EEZL2 routes to slot 0
         // (authorizedProxies on EEZBase, first storage slot). Same
         // value as the L1 path today — kept distinct so the two
         // constants diverging later breaks loudly.
         let config = ProxyLookupConfig {
-            contract_address: ROLLUPS_ADDR,
-            authorized_proxies_slot: CCM_AUTHORIZED_PROXIES_SLOT,
+            contract_address: EEZL2_ADDRESS,
+            authorized_proxies_slot: EEZL2_AUTHORIZED_PROXIES_SLOT,
         };
         assert_eq!(config.authorized_proxies_slot, 0u8);
 
@@ -954,7 +926,7 @@ mod tests {
             config.authorized_proxies_slot,
             PROXY_ADDR,
         )
-        .expect("CCM-config path must find proxy");
+        .expect("EEZL2 config path must find proxy");
         assert_eq!(info.original_rollup_id, RollupId(TARGET_ROLLUP));
         assert_eq!(info.original_address, DESTINATION_ADDR);
     }

@@ -109,7 +109,7 @@ pub struct DeriveOutcome {
     pub block_number: u64,
 }
 
-/// Clone-cheap handle to a spawned [`BlockCommitter`] actor. Carries
+/// Clone-cheap handle to the spawned block-committer actor. Carries
 /// an `Arc<RwLock<SealedHeader>>` head mirror the actor writes on every
 /// Sequence/Derive — fixes the `invalid payload attributes` race
 /// (Sequencer reads the post-Derive head without `CanonStateNotification`
@@ -376,8 +376,8 @@ where
     ///
     /// # Errors
     ///
-    /// - [`DriverError::engine_rpc`] on RPC transport failure.
-    /// - [`DriverError::invalid_forkchoice`] if reth rejects the
+    /// - an engine-RPC error on transport failure.
+    /// - an invalid-forkchoice error if reth rejects the
     ///   target hash (not on its canonical chain).
     /// - `committer_closed` if the actor is gone.
     pub async fn reorg_to(
@@ -707,10 +707,8 @@ where
         // `feed_witness=false` so the prover isn't double-fed the same block.
         // The block is already canonical (the FCU above), so the witness task's
         // `recovered_block(hash)` resolves on the first try.
-        if feed_witness {
-            if let Some(sender) = &self.witness_sender {
-                let _ = sender.send(block_hash);
-            }
+        if feed_witness && let Some(sender) = &self.witness_sender {
+            let _ = sender.send(block_hash);
         }
 
         Ok(DeriveOutcome {

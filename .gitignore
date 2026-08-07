@@ -23,6 +23,10 @@ infra/kurtosis/spamoor-plugins/startup-spammers-outbound.yaml
 
 data/
 chiado-*/
+# Per-network env files (private keys)
+.env.*
 
 # CI diagnostics.
 artifacts/
+# Per-network env files (private keys)
+.env.*

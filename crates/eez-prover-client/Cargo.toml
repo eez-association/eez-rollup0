@@ -4,7 +4,7 @@ version.workspace      = true
 edition.workspace      = true
 license.workspace      = true
 rust-version.workspace = true
-description            = "RemoteProver: the composer-side Prover impl that turns prove(ctx) into one Prove RPC round-trip to eez-proverd."
+description            = "RemoteProver: the composer-side Prover implementation for one eez-proof-signer RPC round-trip."
 
 [dependencies]
 eez-prover.workspace      = true

@@ -50,7 +50,7 @@ impl BatchLogChunks {
 }
 
 /// One decoded `BatchPosted` log: winner flag plus the claimed state
-/// roots from our rollup's `StateDelta`. The Deriver's catch-up scan and
+/// roots from our rollup's `StateUpdate`. The Deriver's catch-up scan and
 /// the live [`L1Watcher`](crate::L1Watcher) poll consume the same shape.
 #[derive(Debug, Clone)]
 pub struct ScannedBatch {
@@ -69,8 +69,8 @@ pub struct ScannedBatch {
     /// catch_up on restart-after-post.
     pub post_batch_input: Bytes,
     pub state_applied: bool,
-    /// How many of this batch's claimed roots L1 settled (0 = skip). See
-    /// [`attribute_settlement`].
+    /// How many of this batch's claimed roots L1 settled (0 = skip). Computed
+    /// by the scanner's settlement-attribution pass.
     pub settled_count: usize,
     /// Deepest claimed root L1 settled — this batch's actual post-batch endpoint.
     pub settled_final_state: Option<B256>,
@@ -209,22 +209,21 @@ pub(crate) async fn scan_batch_logs_range(
     Ok(out)
 }
 
-/// Our rollup's stateDelta chain in a batch: the first delta's `currentState`
-/// (pre-batch root) and the ordered per-delta `newState` roots.
+/// Our rollup's state-update chain in a batch: the first update's
+/// `currentState` (pre-batch root) and the ordered per-update `newState` roots.
 fn our_state_chain(
     batch: &ProofSystemBatchPerVerificationEntriesSol,
     rollup_id: u64,
 ) -> (Option<B256>, Vec<B256>) {
-    let rid = U256::from(rollup_id);
     let mut first_curr: Option<B256> = None;
     let mut new_states: Vec<B256> = Vec::new();
     for entry in &batch.entries {
-        for delta in &entry.stateDeltas {
-            if delta.rollupId == rid {
+        for update in &entry.stateUpdates {
+            if update.rollupId == rollup_id {
                 if first_curr.is_none() {
-                    first_curr = Some(delta.currentState);
+                    first_curr = Some(update.currentState);
                 }
-                new_states.push(delta.newState);
+                new_states.push(update.newState);
             }
         }
     }

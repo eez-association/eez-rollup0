@@ -1,0 +1,50 @@
+[package]
+name                   = "eez-proof-signer"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+description            = "EEZ attestation daemon: re-executes composer-streamed windows, binds supported settlement effects fail-closed, and signs the independently recomputed public-input hash."
+
+[dependencies]
+# The `prove.v1` wire this daemon serves.
+eez-control-rpc.workspace = true
+# Canonical `postAndVerifyBatch` ABI types and codec.
+eez-protocol.workspace = true
+
+alloy-consensus.workspace = true
+alloy-genesis.workspace = true
+alloy-primitives = { workspace = true, features = ["k256"] }
+alloy-rlp.workspace = true
+alloy-rpc-types-debug.workspace = true
+# The canonical signer type `SystemTxContext` stores; parsing the L2 system
+# key directly into it avoids a second secret representation.
+alloy-signer-local.workspace = true
+alloy-sol-types.workspace = true
+
+reth-chainspec.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-evm-ethereum.workspace = true
+reth-primitives-traits.workspace = true
+# The EEZ fork exposes the roots and transaction checkpoints consumed by the
+# validator while sharing the workspace's Reth revision.
+stateless-reth.workspace = true
+
+clap = { workspace = true, features = ["env"] }
+eyre.workspace = true
+prost.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[dev-dependencies]
+# Recorded calldata fixture decoding.
+hex.workspace = true
+# Client-side of the in-process Prove round-trip tests.
+tokio-stream = { workspace = true, features = ["net"] }
+
+[lints]
+workspace = true

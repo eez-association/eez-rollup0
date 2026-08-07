@@ -3,7 +3,7 @@
 //! The composer holds `Arc<dyn Prover>` and calls `prove(ctx)`; when that
 //! `Arc` is a [`RemoteProver`], the call maps [`ProvingContext`] to a
 //! `prove.v1` client-stream (a header then one chunk per window block), dials
-//! the configured `eez-proverd`, awaits the attestation, verifies it recovers
+//! the configured `eez-proof-signer`, awaits the attestation, verifies it recovers
 //! to the registered attester, and returns the 65-byte signature. Stateless:
 //! one round-trip, no feed/cursor/sink.
 
@@ -21,7 +21,7 @@ use eez_control_rpc::v1::{
 use eez_prover::{Prover, ProverError, ProverResult, ProvingContext};
 use tracing::{Level, event};
 
-/// A [`Prover`] that proves a window on a remote `eez-proverd` over the
+/// A [`Prover`] that proves a window on a remote `eez-proof-signer` over the
 /// `prove.v1.Prover` gRPC service. Cheap to clone (`Arc<Inner>`).
 #[derive(Debug, Clone)]
 pub struct RemoteProver {
@@ -30,7 +30,7 @@ pub struct RemoteProver {
 
 #[derive(Debug)]
 struct Inner {
-    /// The `eez-proverd` endpoint, e.g. `http://127.0.0.1:50061`.
+    /// The `eez-proof-signer` endpoint, e.g. `http://127.0.0.1:50061`.
     url: String,
     /// The proof system's registered attester. The returned signature MUST
     /// recover to this over the returned `publicInputsHash`, or the proof is
@@ -133,6 +133,7 @@ impl Prover for RemoteProver {
         event!(
             name: "eez.prover_client.attested",
             Level::INFO,
+            event_name = "eez.prover_client.attested",
             from = ctx.from_block,
             to = ctx.to_block,
             blocks = n_blocks,

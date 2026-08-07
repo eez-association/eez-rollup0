@@ -3,8 +3,7 @@
 //!
 //! Cross-chain txs (detected at `TxIngress` time per §5.4.5) sit here
 //! between submission and the next Sync slot, where they're drained,
-//! handed to the umbrella's
-//! [`eez_protocol::Composer`] for `simulate_and_resolve`, and the
+//! handed to the umbrella's [`crate::Composer`] for simulation, and the
 //! resulting `system_txs` get bundled into the Sync block.
 //!
 //! Held-pool drain semantics:
@@ -58,23 +57,65 @@ pub struct HeldTx {
     /// Cross-chain axis. Inbound and outbound txs of the same EOA keep
     /// independent nonce chains, keyed on `(sender, direction)`.
     pub direction: Direction,
+    /// Declared `max_fee_per_gas` (legacy: `gas_price`). The pool is FIFO,
+    /// so this buys no priority — it only enforces the replacement bump.
+    pub max_fee_per_gas: u128,
+    /// Effective priority fee (legacy/2930: `gas_price`, which is both cap
+    /// and tip). Replacements must bump it alongside the cap (geth rule).
+    pub priority_fee_per_gas: u128,
 }
 
-/// A nonce-contiguity admission failure.
+/// Minimum bump (percent) a queued-nonce replacement must offer on BOTH
+/// `max_fee_per_gas` and the priority fee, each over its replaced value
+/// (geth's price-bump rule). The cap bump bounds churn via the ingress
+/// balance check; the tip bump keeps a replacement a real better offer.
+pub const REPLACEMENT_TX_COST_PERCENT: u128 = 10;
+
+/// A pool admission failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NonceAdmissionError {
-    pub expected: u64,
-    pub on_chain: u64,
+pub enum AdmissionError {
+    /// Nonce is burned, reserved in-flight, or not the next unreserved slot.
+    Nonce { expected: u64, on_chain: u64 },
+    /// Queued-nonce replacement did not bump both fees by the required
+    /// percent. `required_*` values are what the replacement had to offer.
+    UnderpricedReplacement {
+        offered_max_fee: u128,
+        required_max_fee: u128,
+        offered_priority_fee: u128,
+        required_priority_fee: u128,
+    },
 }
 
+/// Smallest fee a replacement must offer over `replaced`: ≥10% more,
+/// always at least +1 (bars equal-fee churn).
+fn min_replacement_fee(replaced: u128) -> u128 {
+    let required_increase = (replaced.saturating_mul(REPLACEMENT_TX_COST_PERCENT) / 100).max(1);
+    replaced.saturating_add(required_increase)
+}
+
+/// All pool state under one lock, so queue membership, hash dedupe and
+/// nonce reservations can never disagree with each other.
 #[derive(Debug, Default)]
 struct PoolState {
+    /// Queued txs awaiting the next Sync-slot drain, in FIFO order.
     txs: VecDeque<HeldTx>,
+    /// Hashes of the queued txs — O(1) duplicate-submission check.
     by_hash: HashSet<TxHash>,
+    /// Txs drained into a bundle whose outcome is not yet known
+    /// (`hash → (sender, direction, nonce)`). The nonce stays reserved —
+    /// still counted by admission, not replaceable — until the bundle
+    /// settles (release) or fails (recovery re-queues the tx).
+    /// Invariant: every drained tx must eventually be released, re-queued,
+    /// or evicted by its caller; a forgotten reservation bricks its nonce
+    /// slot (admission forever expects past it).
     in_flight: HashMap<TxHash, (Address, Direction, u64)>,
 }
 
 impl PoolState {
+    /// Next nonce that keeps the `(sender, direction)` chain contiguous:
+    /// one past the highest queued-or-in-flight reservation, or `on_chain`
+    /// if there is none. Reservations below `on_chain` already landed and
+    /// are ignored. `None` on nonce overflow (chain is at `u64::MAX`).
     fn next_expected_nonce(
         &self,
         sender: Address,
@@ -100,6 +141,8 @@ impl PoolState {
         }
     }
 
+    /// Move a recovered tx from in-flight back to the queue front,
+    /// skipping the re-queue if the hash is already queued (idempotent).
     fn push_front_recovered(&mut self, tx: HeldTx) {
         self.release_in_flight(&tx);
         if self.by_hash.insert(tx.hash) {
@@ -107,12 +150,15 @@ impl PoolState {
         }
     }
 
+    /// Reserve a drained tx's nonce until its bundle resolves.
     fn mark_in_flight(&mut self, tx: &HeldTx) {
         self.in_flight
             .entry(tx.hash)
             .or_insert((tx.sender, tx.direction, tx.nonce));
     }
 
+    /// Drop a tx's nonce reservation (bundle settled, tx evicted, or
+    /// re-queued by recovery).
     fn release_in_flight(&mut self, tx: &HeldTx) {
         self.in_flight.remove(&tx.hash);
     }
@@ -139,10 +185,11 @@ impl HeldPool {
 
     /// Admit `tx` into the contiguous queued + in-flight nonce chain for
     /// `(sender, direction)`. A new hash at an existing queued nonce replaces
-    /// that transaction in place. In-flight nonces cannot be replaced.
+    /// that transaction in place, if it bumps `max_fee_per_gas` by
+    /// [`REPLACEMENT_TX_COST_PERCENT`]. In-flight nonces cannot be replaced.
     /// Reservations below `on_chain` have already landed and do not advance
     /// the expected nonce a second time. Duplicate hashes are idempotent.
-    pub fn push_contiguous(&self, tx: HeldTx, on_chain: u64) -> Result<(), NonceAdmissionError> {
+    pub fn push_contiguous(&self, tx: HeldTx, on_chain: u64) -> Result<(), AdmissionError> {
         let mut state = self.state.lock().expect("held_pool mutex poisoned");
         if state.by_hash.contains(&tx.hash) || state.in_flight.contains_key(&tx.hash) {
             return Ok(());
@@ -162,10 +209,24 @@ impl HeldPool {
             let expected = state
                 .next_expected_nonce(target_sender, target_direction, on_chain)
                 .unwrap_or(u64::MAX);
-            return Err(NonceAdmissionError { expected, on_chain });
+            return Err(AdmissionError::Nonce { expected, on_chain });
         }
 
         if let Some(queued_idx) = queued_match {
+            // Geth price-bump rule: BOTH fees must bump over the replaced tx.
+            let required_max_fee = min_replacement_fee(state.txs[queued_idx].max_fee_per_gas);
+            let required_priority_fee =
+                min_replacement_fee(state.txs[queued_idx].priority_fee_per_gas);
+            if tx.max_fee_per_gas < required_max_fee
+                || tx.priority_fee_per_gas < required_priority_fee
+            {
+                return Err(AdmissionError::UnderpricedReplacement {
+                    offered_max_fee: tx.max_fee_per_gas,
+                    required_max_fee,
+                    offered_priority_fee: tx.priority_fee_per_gas,
+                    required_priority_fee,
+                });
+            }
             let replacement_hash = tx.hash;
             let previous_hash = state.txs[queued_idx].hash;
             state.txs[queued_idx] = tx;
@@ -177,7 +238,7 @@ impl HeldPool {
         if state.in_flight.values().any(|(sender, direction, nonce)| {
             same_chain(*sender, *direction) && *nonce == target_nonce
         }) {
-            return Err(NonceAdmissionError {
+            return Err(AdmissionError::Nonce {
                 expected: state
                     .next_expected_nonce(target_sender, target_direction, on_chain)
                     .unwrap_or(u64::MAX),
@@ -187,13 +248,13 @@ impl HeldPool {
 
         let Some(expected) = state.next_expected_nonce(target_sender, target_direction, on_chain)
         else {
-            return Err(NonceAdmissionError {
+            return Err(AdmissionError::Nonce {
                 expected: u64::MAX,
                 on_chain,
             });
         };
         if target_nonce != expected {
-            return Err(NonceAdmissionError { expected, on_chain });
+            return Err(AdmissionError::Nonce { expected, on_chain });
         }
         state.by_hash.insert(tx.hash);
         state.txs.push_back(tx);
@@ -339,6 +400,8 @@ mod tests {
             raw_tx: Bytes::from(vec![byte; 32]),
             hash: TxHash::from(B256::repeat_byte(byte)),
             attempts: 0,
+            max_fee_per_gas: u128::from(byte),
+            priority_fee_per_gas: u128::from(byte),
             sender: Address::repeat_byte(byte),
             nonce: u64::from(byte),
             direction,
@@ -372,12 +435,46 @@ mod tests {
         replacement.hash = TxHash::from(B256::repeat_byte(9));
         assert_eq!(
             pool.push_contiguous(replacement, 1).unwrap_err(),
-            NonceAdmissionError {
+            AdmissionError::Nonce {
                 expected: 2,
                 on_chain: 1
             }
         );
         pool.release_in_flight_batch(&drained);
+    }
+
+    #[test]
+    fn underpriced_replacement_is_rejected() {
+        let pool = HeldPool::new();
+        let mut original = tx(1);
+        original.max_fee_per_gas = 100;
+        original.priority_fee_per_gas = 10;
+        insert(&pool, original, 1);
+
+        // Cap bumped but tip not (geth rule: BOTH must bump).
+        let mut replacement = tx(1);
+        replacement.hash = TxHash::from(B256::repeat_byte(9));
+        replacement.max_fee_per_gas = 110;
+        replacement.priority_fee_per_gas = 10;
+        assert_eq!(
+            pool.push_contiguous(replacement.clone(), 1).unwrap_err(),
+            AdmissionError::UnderpricedReplacement {
+                offered_max_fee: 110,
+                required_max_fee: 110,
+                offered_priority_fee: 10,
+                required_priority_fee: 11
+            }
+        );
+
+        // Tip bumped but cap not.
+        replacement.max_fee_per_gas = 109;
+        replacement.priority_fee_per_gas = 11;
+        assert!(pool.push_contiguous(replacement.clone(), 1).is_err());
+
+        // Both bumped → replaces.
+        replacement.max_fee_per_gas = 110;
+        pool.push_contiguous(replacement.clone(), 1).unwrap();
+        assert_eq!(pool.pop_all()[0].hash, replacement.hash);
     }
 
     #[test]
@@ -390,6 +487,8 @@ mod tests {
             raw_tx: Bytes::from(vec![h; 4]),
             hash: TxHash::from(B256::repeat_byte(h)),
             attempts: 0,
+            max_fee_per_gas: u128::from(h),
+            priority_fee_per_gas: u128::from(h),
             sender,
             nonce,
             direction: dir,
@@ -429,6 +528,8 @@ mod tests {
             raw_tx: Bytes::from(vec![h; 4]),
             hash: TxHash::from(B256::repeat_byte(h)),
             attempts: 0,
+            max_fee_per_gas: u128::from(h),
+            priority_fee_per_gas: u128::from(h),
             sender,
             nonce,
             direction,
@@ -475,6 +576,8 @@ mod tests {
             raw_tx: Bytes::from(vec![h; 4]),
             hash: TxHash::from(B256::repeat_byte(h)),
             attempts: 0,
+            max_fee_per_gas: u128::from(h),
+            priority_fee_per_gas: u128::from(h),
             sender,
             nonce,
             direction: Direction::Inbound,
@@ -488,7 +591,7 @@ mod tests {
         pool.push_contiguous(mk(1, 9), 0).unwrap();
         assert_eq!(
             pool.push_contiguous(mk(0, 8), 0).unwrap_err(),
-            NonceAdmissionError {
+            AdmissionError::Nonce {
                 expected: 3,
                 on_chain: 0
             }
@@ -509,6 +612,8 @@ mod tests {
             raw_tx: Bytes::from(vec![h; 4]),
             hash: TxHash::from(B256::repeat_byte(h)),
             attempts: 0,
+            max_fee_per_gas: u128::from(h),
+            priority_fee_per_gas: u128::from(h),
             sender,
             nonce,
             direction: Direction::Inbound,
@@ -529,7 +634,7 @@ mod tests {
         let err = pool.push_contiguous(mk(4, 4), 1).unwrap_err();
         assert_eq!(
             err,
-            NonceAdmissionError {
+            AdmissionError::Nonce {
                 expected: 3,
                 on_chain: 1
             }
@@ -546,6 +651,8 @@ mod tests {
             raw_tx: Bytes::from(vec![h; 4]),
             hash: TxHash::from(B256::repeat_byte(h)),
             attempts: 0,
+            max_fee_per_gas: u128::from(h),
+            priority_fee_per_gas: u128::from(h),
             sender,
             nonce: u64::MAX,
             direction: Direction::Inbound,
@@ -557,7 +664,7 @@ mod tests {
         assert_eq!(drained[0].hash, TxHash::from(B256::repeat_byte(2)));
         assert_eq!(
             pool.push_contiguous(mk(3), u64::MAX).unwrap_err(),
-            NonceAdmissionError {
+            AdmissionError::Nonce {
                 expected: u64::MAX,
                 on_chain: u64::MAX
             }
@@ -572,6 +679,8 @@ mod tests {
             raw_tx: Bytes::from(vec![h; 4]),
             hash: TxHash::from(B256::repeat_byte(h)),
             attempts: 0,
+            max_fee_per_gas: u128::from(h),
+            priority_fee_per_gas: u128::from(h),
             sender,
             nonce,
             direction: Direction::Inbound,
@@ -612,6 +721,8 @@ mod tests {
             raw_tx: Bytes::from(vec![h; 4]),
             hash: TxHash::from(B256::repeat_byte(h)),
             attempts: 0,
+            max_fee_per_gas: u128::from(h),
+            priority_fee_per_gas: u128::from(h),
             sender,
             nonce,
             direction: Direction::Inbound,
@@ -659,6 +770,8 @@ mod tests {
             raw_tx: Bytes::from(vec![h; 4]),
             hash: TxHash::from(B256::repeat_byte(h)),
             attempts: 0,
+            max_fee_per_gas: u128::from(h),
+            priority_fee_per_gas: u128::from(h),
             sender,
             nonce,
             direction: Direction::Inbound,

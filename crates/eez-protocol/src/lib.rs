@@ -1,5 +1,5 @@
 //! The eez cross-chain protocol: composition engine, composer,
-//! Solidity ABI types, flat action hashing, sequencing machinery, ZK
+//! Solidity ABI types, cross-chain call hashing, sequencing machinery, ZK
 //! substrate, checkpoint format.
 //!
 //! # Soundness model
@@ -19,12 +19,11 @@
 //!   place the `publicInputsHash` is reconstructed from a batch. The composer
 //!   AND an independently-built prover MUST call this same helper, byte-for-byte,
 //!   or their hashes diverge (the proof fails — or, if both share a wrong
-//!   assumption, a wrong hash verifies). It bakes in two assumptions today: a
-//!   single uniform verification key across all rollups, and `(timestamp,
-//!   blockHash) = (0, 0)` per rollup — a rollup that overrides
-//!   `getTimestampAndBlockHash` breaks the hash *silently*.
+//!   assumption, a wrong hash verifies). The initial integration supports one
+//!   uniform verification key, block number zero, no blobs, and no sender
+//!   binding; unsupported profiles are rejected explicitly.
 //! - **Settlement root.** Before signing, the prover checks the settlement
-//!   `StateDelta.newState` against the root reth actually produced for the block.
+//!   `StateUpdate.newState` against the root reth actually produced for the block.
 //!
 //! # Where to start reading
 //!
@@ -62,12 +61,15 @@ pub mod types;
 mod assertions;
 
 #[doc(inline)]
-pub use action::{compute_state_root_slot, cross_chain_call_hash};
+pub use action::{
+    CallHashInput, CallMode, common_cross_chain_call_hash, compute_state_root_slot,
+    l2_outbound_call_hash,
+};
 #[doc(inline)]
-pub use addresses::{CCM_ADDRESS, SYSTEM_ADDRESS};
+pub use addresses::EEZL2_ADDRESS;
 #[doc(inline)]
 pub use authorized_proxies::{
-    CCM_AUTHORIZED_PROXIES_SLOT, ProxyInfo, ROLLUPS_AUTHORIZED_PROXIES_SLOT, decode_proxy_value,
+    EEZ_AUTHORIZED_PROXIES_SLOT, EEZL2_AUTHORIZED_PROXIES_SLOT, ProxyInfo, decode_proxy_value,
     proxy_mapping_key,
 };
 #[doc(inline)]
@@ -91,11 +93,12 @@ pub use overlay::{
     AccountInfo, AccountOverlay, AccountStatus, ContractCode, EvmOverlay, StorageOverlay,
 };
 #[doc(inline)]
-pub use proof_plan::{
-    ProofPlan, ProofPlanInvariantError, RollupProofAssignment, TimestampAndBlockHash,
-};
+pub use proof_plan::{ProofPlan, ProofPlanInvariantError, RollupProofAssignment};
 #[doc(inline)]
-pub use public_inputs::{all_per_ps_hashes, entry_hash, public_inputs_hashes, shared_public_input};
+pub use public_inputs::{
+    PublicInputsError, all_per_ps_hashes, entry_hash, public_inputs_hashes, shared_public_input,
+    static_entry_hash,
+};
 #[doc(inline)]
 pub use rolling_hash::{EntryRollingHash, StaticCallRollingHash};
 #[doc(inline)]

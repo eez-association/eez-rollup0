@@ -516,7 +516,7 @@ impl L1Watcher {
             }
         }
 
-        if tick_count % FINALIZED_REFRESH_TICKS == 0 {
+        if tick_count.is_multiple_of(FINALIZED_REFRESH_TICKS) {
             self.refresh_finalized(provider, state).await?;
         }
 

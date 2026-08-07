@@ -1,1 +1,129 @@
-[{"name":"empty_one_rollup_one_ps","entryHashes":[],"lookupCallHashes":[],"blobHashes":[],"callData":"0x","crossProofSystemInteractions":"0x0000000000000000000000000000000000000000000000000000000000000000","proofSystemCount":1,"rollupAssignments":[{"rollupId":1,"proofSystemIndex":[0],"vkeys":["0x0000000000000000000000000000000000000000000000000000000000000042"],"blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","timestamp":"0"}],"expectedSharedPublicInput":"0xc93d3642a3c7fb95146031dac8d3817791f45a035e93fb6a7bd489e6e9814c8d","expectedPublicInputsHashes":["0x63a9a9427b5be1fee16be3d299624e8dbba9a8fecded173ea2467c6ba62fd805"]},{"name":"single_rollup_single_ps_full","entryHashes":["0x00000000000000000000000000000000000000000000000000000000000000aa","0x00000000000000000000000000000000000000000000000000000000000000bb"],"lookupCallHashes":["0x00000000000000000000000000000000000000000000000000000000000000cc"],"blobHashes":[],"callData":"0x0102030405","crossProofSystemInteractions":"0x0000000000000000000000000000000000000000000000000000000000000000","proofSystemCount":1,"rollupAssignments":[{"rollupId":1,"proofSystemIndex":[0],"vkeys":["0x0000000000000000000000000000000000000000000000000000000000000042"],"blockHash":"0x00000000000000000000000000000000000000000000000000000000deadbeef","timestamp":"1778573373"}],"expectedSharedPublicInput":"0x07d5c9b7af5e92d2ea2ec31a38250775328798e924c97c1653a2dbe269a25b30","expectedPublicInputsHashes":["0x41ac93a0fc90459e18736c701b4092f3cedc4cee0b4536944dfa7e924960f315"]},{"name":"multi_rollup_single_ps","entryHashes":["0x00000000000000000000000000000000000000000000000000000000000000aa"],"lookupCallHashes":[],"blobHashes":[],"callData":"0x","crossProofSystemInteractions":"0x0000000000000000000000000000000000000000000000000000000000000000","proofSystemCount":1,"rollupAssignments":[{"rollupId":1,"proofSystemIndex":[0],"vkeys":["0x0000000000000000000000000000000000000000000000000000000000000042"],"blockHash":"0x0000000000000000000000000000000000000000000000000000000000001000","timestamp":"1000"},{"rollupId":2,"proofSystemIndex":[0],"vkeys":["0x0000000000000000000000000000000000000000000000000000000000000043"],"blockHash":"0x0000000000000000000000000000000000000000000000000000000000001001","timestamp":"1001"},{"rollupId":5,"proofSystemIndex":[0],"vkeys":["0x0000000000000000000000000000000000000000000000000000000000000044"],"blockHash":"0x0000000000000000000000000000000000000000000000000000000000001002","timestamp":"1002"}],"expectedSharedPublicInput":"0x3ebf94a4e6d078d991d1f6b8cf56e45f7e6965c2d3012366b15864bbfa0d7073","expectedPublicInputsHashes":["0x99a89a5ee37a7ce6ea68171f5f7e72dd03789e6f280b0249a373e264b9d0f4eb"]},{"name":"single_rollup_multi_ps","entryHashes":["0x00000000000000000000000000000000000000000000000000000000000000aa"],"lookupCallHashes":[],"blobHashes":[],"callData":"0x","crossProofSystemInteractions":"0x0000000000000000000000000000000000000000000000000000000000000000","proofSystemCount":3,"rollupAssignments":[{"rollupId":1,"proofSystemIndex":[0,2],"vkeys":["0x0000000000000000000000000000000000000000000000000000000000000042","0x0000000000000000000000000000000000000000000000000000000000000099"],"blockHash":"0x00000000000000000000000000000000000000000000000000000000deadbeef","timestamp":"1778573373"}],"expectedSharedPublicInput":"0x3ebf94a4e6d078d991d1f6b8cf56e45f7e6965c2d3012366b15864bbfa0d7073","expectedPublicInputsHashes":["0xac4c51aea4eec6d158ea7eaa69651cad6f7cc70479bce2b8224ce3faee9e4a2c","0xf3647e49f4206741a2fe9f75d17511aedbe450d408a279afd71c03aad3b87584","0x304fdf195dfe8471faae3380695aadd94fd7c6f27be8e663e1b1d85b32b74d7b"]},{"name":"with_blob_hashes","entryHashes":[],"lookupCallHashes":[],"blobHashes":["0x000000000000000000000000000000000000000000000000000000000000b10b","0x000000000000000000000000000000000000000000000000000000000000b10c"],"callData":"0x","crossProofSystemInteractions":"0x0000000000000000000000000000000000000000000000000000000000000000","proofSystemCount":1,"rollupAssignments":[{"rollupId":1,"proofSystemIndex":[0],"vkeys":["0x0000000000000000000000000000000000000000000000000000000000000042"],"blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","timestamp":"0"}],"expectedSharedPublicInput":"0x7b1b8df2d437fa91948e961ba01cb5d3da66fec370baaf91fdae34b174260935","expectedPublicInputsHashes":["0xc96c4777020fe3c8ef1eb600769410d23555ae37af0c5a54eff20db77724ff19"]},{"name":"with_cross_proof_system_interactions","entryHashes":[],"lookupCallHashes":[],"blobHashes":[],"callData":"0x","crossProofSystemInteractions":"0x00000000000000000000000000000000000000000000000000000000feedface","proofSystemCount":1,"rollupAssignments":[{"rollupId":1,"proofSystemIndex":[0],"vkeys":["0x0000000000000000000000000000000000000000000000000000000000000042"],"blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","timestamp":"0"}],"expectedSharedPublicInput":"0xa0b30acf6b7c6d287e54487cbc52b934d08d2cbf462523909afa2fad260e6f6f","expectedPublicInputsHashes":["0xaab941c05da8f4b494fa00ae04ad232e3721f9777a6e420f54c38ab75b9e3a2a"]},{"name":"high_rollup_id","entryHashes":["0x00000000000000000000000000000000000000000000000000000000000000aa"],"lookupCallHashes":[],"blobHashes":[],"callData":"0x","crossProofSystemInteractions":"0x0000000000000000000000000000000000000000000000000000000000000000","proofSystemCount":1,"rollupAssignments":[{"rollupId":18446744073709551614,"proofSystemIndex":[0],"vkeys":["0x0000000000000000000000000000000000000000000000000000000000000042"],"blockHash":"0x0000000000000000000000000000000000000000000000000000000000000000","timestamp":"0"}],"expectedSharedPublicInput":"0x3ebf94a4e6d078d991d1f6b8cf56e45f7e6965c2d3012366b15864bbfa0d7073","expectedPublicInputsHashes":["0x93a74a2119578f44775c73fc4f1bab8a42d0ab1266661796373d3194ec92a99b"]}]
+{
+  "schemaVersion": 1,
+  "protocolCommit": "6fcc90b65063831cb7797e9fa361004064d28f9f",
+  "solidityOracle": "contracts/test/PublicInputsHashVectors.t.sol",
+  "vectors": [
+    {
+      "name": "empty_entry_single_rollup_single_ps",
+      "entryHashes": [],
+      "staticEntryHashes": [],
+      "blobHashes": [],
+      "callData": "0x",
+      "rollupAssignments": [
+        {
+          "rollupId": 1,
+          "proofSystemIndexes": [
+            0
+          ],
+          "vkeys": [
+            "0x0000000000000000000000000000000000000000000000000000000000000042"
+          ],
+          "customData": "0x"
+        }
+      ],
+      "proofSystemCount": 1,
+      "boundSender": "0x0000000000000000000000000000000000000000",
+      "expectedSharedPublicInput": "0x9cb76f48824c4b86548d571badcc9a0542b46deb1bcbff5ecfa63b60d113a3dd",
+      "expectedPublicInputsHashes": [
+        "0xd27632863985c23ae62bb5420b9b1b8d01ac1e64e31d4367cc61b46db364b49f"
+      ]
+    },
+    {
+      "name": "full_entry_and_calldata_single_rollup_single_ps",
+      "entryHashes": [
+        "0x2c4c8cbc9b39743790f04a13406c6c0e3ab6ca0bf5acb3b923f5549d3aabb759"
+      ],
+      "staticEntryHashes": [],
+      "blobHashes": [],
+      "callData": "0x0102030405",
+      "rollupAssignments": [
+        {
+          "rollupId": 1,
+          "proofSystemIndexes": [
+            0
+          ],
+          "vkeys": [
+            "0x0000000000000000000000000000000000000000000000000000000000000042"
+          ],
+          "customData": "0x"
+        }
+      ],
+      "proofSystemCount": 1,
+      "boundSender": "0x0000000000000000000000000000000000000000",
+      "expectedSharedPublicInput": "0xe5764fb1e66c094d0e624344415ffaf8d42687ef904dc61ea5b587f5d3e8b6a0",
+      "expectedPublicInputsHashes": [
+        "0x122a843ef260afd29aac762668d6f0c0f6f0a19c48734107ba770a8b81e1b8b0"
+      ]
+    },
+    {
+      "name": "multi_rollup_multi_ps",
+      "entryHashes": [],
+      "staticEntryHashes": [],
+      "blobHashes": [],
+      "callData": "0xaabbcc",
+      "rollupAssignments": [
+        {
+          "rollupId": 1,
+          "proofSystemIndexes": [
+            0,
+            2
+          ],
+          "vkeys": [
+            "0x0000000000000000000000000000000000000000000000000000000000000042",
+            "0x0000000000000000000000000000000000000000000000000000000000000099"
+          ],
+          "customData": "0x"
+        },
+        {
+          "rollupId": 2,
+          "proofSystemIndexes": [
+            1,
+            2
+          ],
+          "vkeys": [
+            "0x0000000000000000000000000000000000000000000000000000000000000043",
+            "0x0000000000000000000000000000000000000000000000000000000000000044"
+          ],
+          "customData": "0x"
+        }
+      ],
+      "proofSystemCount": 3,
+      "boundSender": "0x0000000000000000000000000000000000000000",
+      "expectedSharedPublicInput": "0x58a63c74be1cc3cbd8a0dc74bf4c862a0b18e5013ef0eacec2bf2e319398d718",
+      "expectedPublicInputsHashes": [
+        "0xb2121e16632ffd6860732ebe2af1a91ac4225b674667b95b3c8d5631598a7cb9",
+        "0x3c9874af807b93a58190c46b40539cee1e70563191f9d809ed0220c03ace0c24",
+        "0x70f74b384fe5841518e09eadcd178c46e6a7f62f9ca651e30c600ee23bb41a42"
+      ]
+    },
+    {
+      "name": "all_shared_input_dimensions",
+      "entryHashes": [],
+      "staticEntryHashes": [
+        "0x1a63bcaad1cc1d18331cee8e48f0074de3a9f1f887255d3dfdf44f62a08036c3"
+      ],
+      "blobHashes": [
+        "0x000000000000000000000000000000000000000000000000000000000000b10b"
+      ],
+      "callData": "0xa1b2c3",
+      "rollupAssignments": [
+        {
+          "rollupId": 1,
+          "proofSystemIndexes": [
+            0
+          ],
+          "vkeys": [
+            "0x0000000000000000000000000000000000000000000000000000000000000042"
+          ],
+          "customData": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c0570d"
+        }
+      ],
+      "proofSystemCount": 1,
+      "boundSender": "0x000000000000000000000000000000000000beef",
+      "expectedSharedPublicInput": "0x63337a6c8300ec03d53497260962ca38155db08c6b233088078cb26caf172845",
+      "expectedPublicInputsHashes": [
+        "0x18742f97fac6fcd3ca33e57739399b92eb55a4cf3465327a9dd274199ef677ef"
+      ]
+    }
+  ]
+}

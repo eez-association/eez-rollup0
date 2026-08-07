@@ -19,11 +19,10 @@ if [[ ! -d "$PROTOCOL_DIR/.git" && ! -f "$PROTOCOL_DIR/.git" ]]; then
     exit 1
 fi
 
-if ! grep -q "ExpectedLookup\\[\\] expectedLookups" "$PROTOCOL_DIR/src/interfaces/IEEZ.sol" 2>/dev/null \
-    || ! grep -q "expectedStateRoots" "$PROTOCOL_DIR/src/interfaces/IEEZ.sol" 2>/dev/null
-then
-    echo "sync-rollups-protocol is too old for this eez-node checkout." >&2
-    echo "Missing postAndVerifyBatch ABI fields expected by this checkout." >&2
+EXPECTED_PROTOCOL_COMMIT="$(git -C "$REPO" ls-files -s sync-rollups-protocol | awk '{print $2}')"
+ACTUAL_PROTOCOL_COMMIT="$(git -C "$PROTOCOL_DIR" rev-parse HEAD)"
+if [[ -z "$EXPECTED_PROTOCOL_COMMIT" || "$ACTUAL_PROTOCOL_COMMIT" != "$EXPECTED_PROTOCOL_COMMIT" ]]; then
+    echo "sync-rollups-protocol is not at the commit pinned by this checkout." >&2
     echo "Run: git submodule update --init --recursive sync-rollups-protocol" >&2
     echo "Current submodule status:" >&2
     git -C "$REPO" submodule status sync-rollups-protocol >&2 || true
@@ -38,30 +37,50 @@ echo "==> protocol submodule: $(git -C "$PROTOCOL_DIR" rev-parse --short HEAD)"
 yv() { grep -E "^[[:space:]]*$1:" "$ARGS_FILE" | head -1 \
         | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//'; }
 
-NODE_IMAGE="$(yv eez_node_image)";  NODE_IMAGE="${NODE_IMAGE:-eez-node:dev}"
-DEPLOY_IMAGE="$(yv deploy_image)";  DEPLOY_IMAGE="${DEPLOY_IMAGE:-eez-deploy:dev}"
+NODE_IMAGE="$(yv eez_node_image)";                NODE_IMAGE="${NODE_IMAGE:-eez-node:dev}"
+PROOF_SIGNER_IMAGE="$(yv proof_signer_image)";    PROOF_SIGNER_IMAGE="${PROOF_SIGNER_IMAGE:-eez-proof-signer:dev}"
+DEPLOY_IMAGE="$(yv deploy_image)";                DEPLOY_IMAGE="${DEPLOY_IMAGE:-eez-deploy:dev}"
 
 export DOCKER_BUILDKIT=1
 
+# Fast local build; set EEZ_OPTIMIZED_BUILD=1 for the full release profile.
+release_build_args=()
+if [[ "${EEZ_OPTIMIZED_BUILD:-0}" != "1" ]]; then
+    release_build_args=(
+        --build-arg CARGO_PROFILE_RELEASE_LTO=false
+        --build-arg CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+        --build-arg CARGO_PROFILE_RELEASE_DEBUG=0
+    )
+fi
+
 if [[ "${EEZ_SKIP_NODE_BUILD:-0}" != "1" ]]; then
     echo "==> building $NODE_IMAGE (fast CI profile)"
-    # Fast local build; set EEZ_OPTIMIZED_BUILD=1 for the full release profile.
-    node_build_args=()
-    if [[ "${EEZ_OPTIMIZED_BUILD:-0}" != "1" ]]; then
-        node_build_args=(
-            --build-arg CARGO_PROFILE_RELEASE_LTO=false
-            --build-arg CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
-            --build-arg CARGO_PROFILE_RELEASE_DEBUG=0
-        )
-    fi
-    docker build "${node_build_args[@]}" -t "$NODE_IMAGE" "$REPO"
+    docker build "${release_build_args[@]}" -t "$NODE_IMAGE" "$REPO"
+fi
+
+if [[ "${EEZ_SKIP_PROOF_SIGNER_BUILD:-0}" != "1" ]]; then
+    echo "==> building $PROOF_SIGNER_IMAGE (fast CI profile)"
+    docker build "${release_build_args[@]}" \
+        -f "$REPO/Dockerfile.signer" \
+        -t "$PROOF_SIGNER_IMAGE" "$REPO"
+else
+    echo "==> reusing $PROOF_SIGNER_IMAGE (EEZ_SKIP_PROOF_SIGNER_BUILD=1)"
 fi
 
 if [[ "${EEZ_SKIP_DEPLOY_BUILD:-0}" != "1" ]]; then
     echo "==> building $DEPLOY_IMAGE (foundry + contracts)"
-    docker build -f "$HERE/Dockerfile.deploy" -t "$DEPLOY_IMAGE" "$REPO"
+    docker build \
+        --build-arg "EEZ_NODE_IMAGE=$NODE_IMAGE" \
+        -f "$HERE/Dockerfile.deploy" \
+        -t "$DEPLOY_IMAGE" \
+        "$REPO"
 else
     echo "==> reusing $DEPLOY_IMAGE (EEZ_SKIP_DEPLOY_BUILD=1)"
+fi
+
+if [[ "${EEZ_PRUNE_BUILD_CACHE:-0}" == "1" ]]; then
+    echo "==> pruning Docker build cache"
+    docker builder prune --all --force
 fi
 
 echo "==> kurtosis run (enclave: $ENCLAVE)"
@@ -78,5 +97,6 @@ cat <<EOF
 ════════════════════════════════════════
 Inspect  : kurtosis enclave inspect $ENCLAVE
 Node log : kurtosis service logs -f $ENCLAVE eez-node
+Signer log: kurtosis service logs -f $ENCLAVE eez-proof-signer
 Tear down: bash testing/kurtosis/stop.sh
 EOF

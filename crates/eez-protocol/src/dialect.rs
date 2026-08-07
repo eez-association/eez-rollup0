@@ -1,4 +1,4 @@
-//! Per-chain dialect for entry encoding and CCM-verify batch construction.
+//! Per-chain dialect for entry encoding and target-chain batch construction.
 //!
 //! Two [`ChainDialect`] variants distinguish the two
 //! contract surfaces the protocol exposes:
@@ -14,7 +14,7 @@
 
 use crate::ExecutedAction;
 
-use crate::authorized_proxies::{CCM_AUTHORIZED_PROXIES_SLOT, ROLLUPS_AUTHORIZED_PROXIES_SLOT};
+use crate::authorized_proxies::{EEZ_AUTHORIZED_PROXIES_SLOT, EEZL2_AUTHORIZED_PROXIES_SLOT};
 
 /// Selects the contract ABI and entry-emission rules for one rollup.
 ///
@@ -38,12 +38,12 @@ impl ChainDialect {
     #[must_use]
     pub const fn proxy_lookup_slot(&self) -> u8 {
         match self {
-            Self::EvmL2Style => CCM_AUTHORIZED_PROXIES_SLOT,
-            Self::EvmL1Style => ROLLUPS_AUTHORIZED_PROXIES_SLOT,
+            Self::EvmL2Style => EEZL2_AUTHORIZED_PROXIES_SLOT,
+            Self::EvmL1Style => EEZ_AUTHORIZED_PROXIES_SLOT,
         }
     }
 
-    /// Whether the CCM execute transaction must be sent from the
+    /// Whether the target-chain execution transaction must be sent from the
     /// registered system address (L2-style) or is permissionless
     /// through the registered proxy (L1-style).
     #[must_use]
@@ -67,7 +67,7 @@ impl ChainDialect {
     /// In the multi-prover protocol, both L1 and L2 dispatch via
     /// the same `executeCrossChainCall(sourceAddress, callData)`
     /// entry point on the manager — invoked through the registered
-    /// proxy. The composer's CCM-verify simulation forges the
+    /// proxy. The composer's target-chain simulation forges the
     /// call from the proxy's address; this method returns the
     /// calldata for the outer ROUTING call (the proxy's `fallback`
     /// receives `outer_root.data` as-is and forwards to the
@@ -95,18 +95,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proxy_lookup_slot_l2_is_ccm() {
+    fn proxy_lookup_slot_l2_is_eezl2() {
         assert_eq!(
             ChainDialect::EvmL2Style.proxy_lookup_slot(),
-            CCM_AUTHORIZED_PROXIES_SLOT
+            EEZL2_AUTHORIZED_PROXIES_SLOT
         );
     }
 
     #[test]
-    fn proxy_lookup_slot_l1_is_rollups() {
+    fn proxy_lookup_slot_l1_is_eez() {
         assert_eq!(
             ChainDialect::EvmL1Style.proxy_lookup_slot(),
-            ROLLUPS_AUTHORIZED_PROXIES_SLOT
+            EEZ_AUTHORIZED_PROXIES_SLOT
         );
     }
 
