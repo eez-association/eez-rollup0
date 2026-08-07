@@ -103,7 +103,7 @@ grab() { grep -oE "$1=0x[0-9a-fA-F]{40}" | head -1 | cut -d= -f2; }
 has_code() { local c; c=$(cast code "$1" --rpc-url "$2" 2>/dev/null || echo 0x); [[ "$c" != "0x" && -n "$c" ]]; }
 
 create_l1_proxy() { forge_deploy "$L1" "$HH_KEY_0" CreateValueProxy.s.sol:CreateValueProxy \
-        'run(address,address,uint256)' "$EEZ_REGISTRY_ADDRESS" "$1" "$EEZ_ROLLUP_ID" | grab EEZ_VALUE_PROXY; }
+        'run(address,address,uint64)' "$EEZ_REGISTRY_ADDRESS" "$1" "$EEZ_ROLLUP_ID" | grab EEZ_VALUE_PROXY; }
 create_l2_proxy() { local tgt="$1" p nonce raw
     p=$(cast call "$EEZ_CCM_L2_PREDEPLOY" 'computeCrossChainProxyAddress(address,uint256)(address)' "$tgt" "$MAINNET_RID" --rpc-url "$L2" | tr -d '[:space:]')
     if ! has_code "$p" "$L2"; then

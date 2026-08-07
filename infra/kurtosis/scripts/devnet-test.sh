@@ -144,7 +144,7 @@ RECIPIENT_BEFORE=$(cast balance "$L2_RECIPIENT" --rpc-url "$L2_RPC")
 # ── Create CrossChainProxies on the shared L1 ────────────────────────
 echo "==> createCrossChainProxy(target=Value) on L1"
 SETTER_OUT=$(forge script script/CreateValueProxy.s.sol:CreateValueProxy \
-    --sig "run(address,address,uint256)" "$EEZ_REGISTRY_ADDRESS" "$EEZ_VALUE_ADDRESS" "$EEZ_ROLLUP_ID" \
+    --sig "run(address,address,uint64)" "$EEZ_REGISTRY_ADDRESS" "$EEZ_VALUE_ADDRESS" "$EEZ_ROLLUP_ID" \
     --rpc-url "$L1_RPC" --broadcast --private-key "$EEZ_OPERATOR_KEY" --skip-simulation 2>&1) || true
 SETTER_PROXY=$(echo "$SETTER_OUT" | grep -oE 'EEZ_VALUE_PROXY=0x[0-9a-fA-F]{40}' | head -1 | cut -d= -f2)
 [[ -n "$SETTER_PROXY" ]] || { echo "setter proxy create failed"; echo "$SETTER_OUT" | tail -30; exit 1; }
@@ -152,7 +152,7 @@ echo "    setter proxy  = $SETTER_PROXY"
 
 echo "==> createCrossChainProxy(target=L2_RECIPIENT) on L1"
 DEPOSIT_OUT=$(forge script script/CreateValueProxy.s.sol:CreateValueProxy \
-    --sig "run(address,address,uint256)" "$EEZ_REGISTRY_ADDRESS" "$L2_RECIPIENT" "$EEZ_ROLLUP_ID" \
+    --sig "run(address,address,uint64)" "$EEZ_REGISTRY_ADDRESS" "$L2_RECIPIENT" "$EEZ_ROLLUP_ID" \
     --rpc-url "$L1_RPC" --broadcast --private-key "$EEZ_OPERATOR_KEY" --skip-simulation 2>&1) || true
 DEPOSIT_PROXY=$(echo "$DEPOSIT_OUT" | grep -oE 'EEZ_VALUE_PROXY=0x[0-9a-fA-F]{40}' | head -1 | cut -d= -f2)
 [[ -n "$DEPOSIT_PROXY" ]] || { echo "deposit proxy create failed"; echo "$DEPOSIT_OUT" | tail -30; exit 1; }

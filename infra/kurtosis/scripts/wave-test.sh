@@ -200,7 +200,7 @@ L2_CHAIN_ID=$(cast chain-id --rpc-url "$L2")
 # L1 proxy = createCrossChainProxy(target_on_L2, rid=EEZ_ROLLUP_ID) on the L1 EEZ.
 create_l1_proxy() { # <target_on_L2> → proxy addr
     forge_deploy "$L1" "$HH_KEY_0" CreateValueProxy.s.sol:CreateValueProxy \
-        'run(address,address,uint256)' "$EEZ_REGISTRY_ADDRESS" "$1" "$EEZ_ROLLUP_ID" | grab EEZ_VALUE_PROXY
+        'run(address,address,uint64)' "$EEZ_REGISTRY_ADDRESS" "$1" "$EEZ_ROLLUP_ID" | grab EEZ_VALUE_PROXY
 }
 # L2 proxy = computeCrossChainProxyAddress(target_on_L1, MAINNET) then
 # createCrossChainProxy on the L2 CCM (a PURE L2 tx → normal L2 RPC).
