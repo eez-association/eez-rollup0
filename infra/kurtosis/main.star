@@ -23,9 +23,6 @@ BUILDER_FLASHBOTS_RPC_PORT = 8645
 MEV_RELAY_API_PORT = 9062
 SPAMOOR_IMAGE = "ethpandaops/spamoor@sha256:24818bf7ab76696b2dccb0c59cb419cce358cf1b4326a545012b031afd11658b"
 
-# L2 genesis state root for genesis.json. Recompute if genesis alloc changes.
-L2_GENESIS_STATE_ROOT = "0xd381d828f650845aa890778c74ad2de245f5b3f2a24763f243e19a6bafb4fec5"
-
 
 def run(plan, args):
     eth_args = args["ethereum_package"]
@@ -90,7 +87,6 @@ def run(plan, args):
             "EEZ_L2_SYSTEM_KEY": l2_system_key,
             "EEZ_DEPLOYMENTS_FILE": "/out/deployments.env",
             "EEZ_GENESIS_OUT": "/out/l2-genesis.json",
-            "EEZ_INITIAL_STATE_ROOT": L2_GENESIS_STATE_ROOT,
         },
         run = "mkdir -p /out && bash /repo/scripts/deploy.sh",
         store = [StoreSpec(src = "/out", name = "eez-deployments")],

@@ -11,6 +11,12 @@
 # ships its own ignore file (deploy.Dockerfile.dockerignore, used by BuildKit).
 #
 #   DOCKER_BUILDKIT=1 docker build -f infra/kurtosis/deploy.Dockerfile -t eez-deploy:dev .
+#
+# Copies eez-genesis-state-root from the eez-node image so deploy.sh can hash
+# the rendered L2 genesis without a Rust toolchain in this image.
+
+ARG EEZ_NODE_IMAGE=eez-node:dev
+FROM ${EEZ_NODE_IMAGE} AS node-tools
 
 FROM debian:bookworm-slim
 
@@ -24,6 +30,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV PATH="/root/.foundry/bin:${PATH}"
 RUN curl -L https://foundry.paradigm.xyz | bash \
     && foundryup -i "${FOUNDRY_VERSION}"
+
+COPY --from=node-tools /usr/local/bin/eez-genesis-state-root /usr/local/bin/eez-genesis-state-root
 
 WORKDIR /repo
 # deploy.sh resolves REPO from its own location and expects these siblings:
