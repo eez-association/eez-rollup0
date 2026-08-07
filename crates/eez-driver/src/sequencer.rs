@@ -402,6 +402,11 @@ where
         &mut self,
         sync_slot_block_height: u64,
     ) -> DriverResult<()> {
+        // Before the head read: a mid-slot verdict would otherwise wait K
+        // blocks, and recovery can reorg + substitute under us.
+        if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref() {
+            composer.recover_failed(*rollup_id).await;
+        }
         let last_header = self.committer.last_header();
         let head = last_header.number();
         // Reserve = Future blocks + the Sync block itself. Mirrors
@@ -450,6 +455,11 @@ where
         sync_slot_timestamp: u64,
         l1_head: u64,
     ) -> DriverResult<()> {
+        // Before the composition: a pending verdict would seed the whole burst
+        // on a doomed head, for compose_sync_slot to reorg away at its end.
+        if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref() {
+            composer.recover_failed(*rollup_id).await;
+        }
         let head = self.committer.last_header().number();
         // Catchup ignores the speculative cap (a steady-state bound): a
         // dropped pb heals by recomposing next trigger, which freezing to
@@ -591,7 +601,24 @@ where
                         l1_head,
                         "trigger too late for the immediate L1 slot; committing an empty block and holding the pool — next slot's batch covers it",
                     );
-                    None
+                    // Never the mempool-fed commit_one fallback — a tx-bearing
+                    // grid block is ineligible as a later batch boundary.
+                    if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref() {
+                        let parent = crate::slot::ParentContext {
+                            header: last_header.clone(),
+                        };
+                        composer
+                            .compose_sync_slot(
+                                *rollup_id,
+                                parent,
+                                expected_sync_ts,
+                                None,
+                                SyncSlotMode::Structural,
+                            )
+                            .await
+                    } else {
+                        None
+                    }
                 } else if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref() {
                     let parent = crate::slot::ParentContext {
                         header: last_header.clone(),

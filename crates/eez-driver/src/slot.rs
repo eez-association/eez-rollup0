@@ -145,6 +145,9 @@ pub enum SyncSlotMode {
     /// Behind-the-wall-clock catchup — empty Sync block; cross-chain
     /// waits for the next [`Steady`](Self::Steady) slot.
     Catchup,
+    /// Deferred-late slot — EMPTY block, no emission. Unlike the mempool-fed
+    /// `commit_one` fallback it keeps grid heights batch-boundary-eligible.
+    Structural,
 }
 
 /// Per-Sync-slot block producer for cross-chain content.
@@ -169,6 +172,12 @@ pub trait SyncSlotComposer: Send + Sync + 'static {
         target_l1_block: Option<u64>,
         mode: SyncSlotMode,
     ) -> Option<SyncSlotBlock>;
+
+    /// Run pending failed-bundle recovery before this tick's commit. May move
+    /// the head (reorg + substitution), so callers re-read it. Default: no-op.
+    async fn recover_failed(&self, rollup_id: u64) {
+        let _ = rollup_id;
+    }
 }
 
 /// Cheap clone-able handle for a [`SyncSlotComposer`].

@@ -762,6 +762,7 @@ fn main() -> eyre::Result<()> {
                 l1_watcher.clone(),
                 evm_config,
                 cross_chain,
+                timing,
             );
             if let Some(ws) = witness_source {
                 composer.set_witness_source(ws);

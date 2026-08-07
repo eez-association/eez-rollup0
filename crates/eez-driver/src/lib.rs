@@ -51,4 +51,4 @@ pub use slot::{
     SyncSlotMode, spawn_interval, spawn_l1_anchored,
 };
 #[doc(inline)]
-pub use timing::{MAX_BLOCKS_PER_CATCHUP, RollupTiming, SlotComposition};
+pub use timing::{MAX_BLOCKS_PER_BATCH, MAX_BLOCKS_PER_CATCHUP, RollupTiming, SlotComposition};
