@@ -29,6 +29,9 @@ ethereum_package:
     # Builder coinbase.
     prefunded_accounts: '{"0xb9e79D19f651a941757b35830232E7EFC77E1c79": {"balance": "1000000ETH"}}'
 
+  ethereum_genesis_generator_params:
+    image: ethpandaops/ethereum-genesis-generator:6.1.4
+
   mev_type: flashbots
   mev_params:
     mev_builder_image: ethpandaops/reth-rbuilder:develop

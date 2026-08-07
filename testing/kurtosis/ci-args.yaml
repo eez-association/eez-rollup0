@@ -18,6 +18,9 @@ ethereum_package:
     electra_fork_epoch: 0
     prefunded_accounts: '{"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266": {"balance": "1000000ETH"}, "0x70997970C51812dc3A010C7d01b50e0d17dc79C8": {"balance": "1000000ETH"}, "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC": {"balance": "1000000ETH"}, "0xb9e79D19f651a941757b35830232E7EFC77E1c79": {"balance": "1000000ETH"}}'
 
+  ethereum_genesis_generator_params:
+    image: ethpandaops/ethereum-genesis-generator:6.1.4
+
   mev_type: flashbots
   mev_params:
     mev_builder_image: ethpandaops/reth-rbuilder:develop

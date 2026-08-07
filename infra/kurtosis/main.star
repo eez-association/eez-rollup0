@@ -8,7 +8,7 @@
 #
 # Usage: kurtosis run . --args-file args.yaml
 
-ethereum_package = import_module("github.com/ethpandaops/ethereum-package/main.star")
+ethereum_package = import_module("github.com/ethpandaops/ethereum-package/main.star@199620b24ac979c676010c5a68b2893c2bce4f1f")
 
 # Pair A fixed ports inside the enclave.
 EMBEDDED_L1_RPC_PORT = 18545
