@@ -44,7 +44,7 @@ pub mod optimistic;
 pub mod rollup;
 
 #[doc(inline)]
-pub use composer::{Composer, CrossChainExecCtx};
+pub use composer::{Composer, CrossChainExecCtx, LocalSimHandles};
 #[doc(inline)]
 pub use held_pool::{AdmissionError, HeldPool, HeldTx};
 #[doc(inline)]

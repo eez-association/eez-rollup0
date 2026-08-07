@@ -5,9 +5,9 @@ use alloy_sol_types::SolCall;
 
 mod common;
 use common::{
-    DEV_CHAIN_ID, INBOUND_USER, ISetterWrapper, IValue, IValueNoRet, OUTBOUND_USER, SETTLE_TIMEOUT,
-    batches_posted, l2_balance, l2_value, pending_nonce, receipt_ok, setup_cross_chain,
-    sign_and_send, state_root, value_no_ret, wait_for,
+    DEV_CHAIN_ID, IGatedSetter, INBOUND_USER, ISetterWrapper, IValue, IValueNoRet, OUTBOUND_USER,
+    SETTLE_TIMEOUT, TARGET_DEPLOYER, batches_posted, l2_balance, l2_value, pending_nonce,
+    receipt_ok, setup_cross_chain, sign_and_send, state_root, value_no_ret, wait_for,
 };
 
 const WAVE_SETTERS: &[u64] = &[7, 11, 17];
@@ -351,6 +351,256 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
             .unwrap(),
         0,
         "composer must not fall back to eth_sendRawTransaction",
+    );
+    w.node.assert_no_process_death();
+}
+
+/// Same-sender outbound pair where tx #2 (`increment`) only simulates
+/// cleanly when it sees tx #1's (`setValue`) write from the same slot —
+/// exercises the carried L1 target session across outbound sims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outbound_state_chained_pair_survives_one_slot() {
+    let w = setup_cross_chain().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let l2_xchain = w.l2_xchain();
+
+    let nonce = pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
+    let set = sign_and_send(
+        &l2_xchain,
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        nonce,
+        Some(w.outbound_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(100u64),
+        }
+        .abi_encode(),
+        900_000,
+    )
+    .await
+    .expect("outbound setValue must be admitted");
+    let inc = sign_and_send(
+        &l2_xchain,
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        nonce + 1,
+        Some(w.outbound_proxy),
+        U256::ZERO,
+        IValue::incrementCall {
+            expectedCurrent: U256::from(100u64),
+        }
+        .abi_encode(),
+        900_000,
+    )
+    .await
+    .expect("outbound increment must be admitted");
+
+    assert_all_transactions_succeeded(&l2_rpc, &[set, inc], "outbound chained pair").await;
+    wait_for(SETTLE_TIMEOUT, || {
+        let l1_rpc = l1_rpc.clone();
+        async move {
+            Ok((l2_value(&l1_rpc, w.outbound_value).await? == U256::from(101u64)).then_some(()))
+        }
+    })
+    .await
+    .expect("outbound chained pair did not converge to 101 on L1");
+
+    assert_eq!(
+        w.node.log_count_matching(&["evicting"]).unwrap(),
+        0,
+        "a state-dependent outbound pair in one slot must not be evicted",
+    );
+    w.node.assert_no_process_death();
+}
+
+/// Same-sender inbound pair — exercises the carried L2 follower session
+/// (and the L1 source-cache carry) across inbound sims in one slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inbound_state_chained_pair_survives_one_slot() {
+    let w = setup_cross_chain().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let l1_xchain = w.l1_xchain();
+
+    let nonce = pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
+    let set = sign_and_send(
+        &l1_xchain,
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        nonce,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(200u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await
+    .expect("inbound setValue must be admitted");
+    let inc = sign_and_send(
+        &l1_xchain,
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        nonce + 1,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::incrementCall {
+            expectedCurrent: U256::from(200u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await
+    .expect("inbound increment must be admitted");
+
+    assert_all_transactions_succeeded(&l1_rpc, &[set, inc], "inbound chained pair").await;
+    wait_for(SETTLE_TIMEOUT, || {
+        let l2_rpc = l2_rpc.clone();
+        async move {
+            Ok((l2_value(&l2_rpc, w.value_l2).await? == U256::from(201u64)).then_some(()))
+        }
+    })
+    .await
+    .expect("inbound chained pair did not converge to 201 on L2");
+
+    assert_eq!(
+        w.node.log_count_matching(&["evicting"]).unwrap(),
+        0,
+        "a state-dependent inbound pair in one slot must not be evicted",
+    );
+    w.node.assert_no_process_death();
+}
+
+/// Cross-direction dependency in one slot: an outbound tx writes an L1
+/// value, and an inbound tx's source-side gate reads it — only the
+/// pass-boundary L1 harvest (outbound target-session cache seeding the
+/// inbound source sims) makes the gate pass at compose time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_direction_dependency_survives_one_slot() {
+    let w = setup_cross_chain().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+
+    let outbound = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
+        Some(w.outbound_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(300u64),
+        }
+        .abi_encode(),
+        900_000,
+    )
+    .await
+    .expect("outbound setValue must be admitted");
+    let inbound = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
+        Some(w.gated_setter),
+        U256::ZERO,
+        IGatedSetter::setViaProxyIfValueCall {
+            expected: U256::from(300u64),
+            v: U256::from(42u64),
+        }
+        .abi_encode(),
+        900_000,
+    )
+    .await
+    .expect("inbound gated setter must be admitted");
+
+    assert_all_transactions_succeeded(&l2_rpc, &[outbound], "cross-direction outbound").await;
+    assert_all_transactions_succeeded(&l1_rpc, &[inbound], "cross-direction inbound").await;
+    wait_for(SETTLE_TIMEOUT, || {
+        let l1_rpc = l1_rpc.clone();
+        async move {
+            Ok((l2_value(&l1_rpc, w.outbound_value).await? == U256::from(300u64)).then_some(()))
+        }
+    })
+    .await
+    .expect("outbound write did not converge to 300 on L1");
+    wait_for(SETTLE_TIMEOUT, || {
+        let l2_rpc = l2_rpc.clone();
+        async move {
+            Ok((l2_value(&l2_rpc, w.value_l2).await? == U256::from(42u64)).then_some(()))
+        }
+    })
+    .await
+    .expect("gated inbound effect did not converge to 42 on L2");
+
+    assert_eq!(
+        w.node.log_count_matching(&["evicting"]).unwrap(),
+        0,
+        "a cross-direction dependent pair in one slot must not be evicted",
+    );
+    w.node.assert_no_process_death();
+}
+
+/// A poison tx first in the drain must not taint the carried state the
+/// next (independent) tx simulates against — exercises the per-tx
+/// checkpoint/rollback unwind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn poison_first_does_not_taint_second_in_slot() {
+    let w = setup_cross_chain().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let l1_xchain = w.l1_xchain();
+
+    // Deterministic sim revert: value is 5, not 999 → poison eviction.
+    let _poison = sign_and_send(
+        &l1_xchain,
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::incrementCall {
+            expectedCurrent: U256::from(999u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await
+    .expect("poison increment must be admitted");
+    let good = sign_and_send(
+        &l1_xchain,
+        TARGET_DEPLOYER,
+        DEV_CHAIN_ID,
+        pending_nonce(&l1_rpc, TARGET_DEPLOYER).await.unwrap(),
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(55u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await
+    .expect("independent setValue must be admitted");
+
+    assert_all_transactions_succeeded(&l1_rpc, &[good], "post-poison independent").await;
+    wait_for(SETTLE_TIMEOUT, || {
+        let l2_rpc = l2_rpc.clone();
+        async move {
+            Ok((l2_value(&l2_rpc, w.value_l2).await? == U256::from(55u64)).then_some(()))
+        }
+    })
+    .await
+    .expect("independent tx after a poison tx did not converge to 55 on L2");
+
+    assert!(
+        w.node
+            .log_count_matching(&["fails simulation deterministically"])
+            .unwrap()
+            >= 1,
+        "the gated increment must be poison-evicted at compose time",
     );
     w.node.assert_no_process_death();
 }

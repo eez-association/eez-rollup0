@@ -516,23 +516,17 @@ fn main() -> eyre::Result<()> {
                     // over the chiado ChainSpec (source-sim needs only
                     // revm, not GnosisNode's AuRa paths). Both yield the
                     // same erased views, so composition is identical.
-                    let entry_client_view = match l1_variant {
+                    let l1_entry_client = match l1_variant {
                         EmbeddedL1::Ethereum(l1_handle) => {
                             let l1_provider = l1_handle.node.provider.clone();
                             let l1_evm_config = l1_handle.node.evm_config.clone();
-                            let entry_client = LocalChainClient::new_entry(
+                            LocalChainClient::new_entry(
                                 l1_provider,
                                 l1_evm_config,
                                 l1_rollup_id,
                                 eez_registry,
                                 eez_protocol::ChainDialect::EvmL1Style,
-                            );
-                            let entry_view: std::sync::Arc<
-                                dyn eez_protocol::executor::ChainClient
-                                    + Send
-                                    + Sync,
-                            > = entry_client.clone();
-                            entry_view
+                            )
                         }
                         EmbeddedL1::Chiado(chiado_handle) => {
                             // `GnosisChainSpec.inner` is the standard
@@ -547,21 +541,18 @@ fn main() -> eyre::Result<()> {
                             );
                             let l1_evm_config =
                                 reth_evm_ethereum::EthEvmConfig::new(Arc::clone(&l1_chain_spec));
-                            let entry_client = LocalChainClient::new_entry(
+                            LocalChainClient::new_entry(
                                 l1_provider,
                                 l1_evm_config,
                                 l1_rollup_id,
                                 eez_registry,
                                 eez_protocol::ChainDialect::EvmL1Style,
-                            );
-                            let entry_view: std::sync::Arc<
-                                dyn eez_protocol::executor::ChainClient
-                                    + Send
-                                    + Sync,
-                            > = entry_client.clone();
-                            entry_view
+                            )
                         }
                     };
+                    let entry_client_view: std::sync::Arc<
+                        dyn eez_protocol::executor::ChainClient + Send + Sync,
+                    > = l1_entry_client.clone();
 
                     // L2 follower — EvmL2Style. Its dispatch contract is the
                     // `EEZL2` predeploy, whose inherited `authorizedProxies`
@@ -577,7 +568,7 @@ fn main() -> eyre::Result<()> {
                         dyn eez_protocol::executor::ChainClient
                             + Send
                             + Sync,
-                    > = l2_follower;
+                    > = l2_follower.clone();
 
                     // L2 ENTRY client (follower's provider/dialect, but
                     // Role::Entry) — the follower client errors `Unavailable` for
@@ -593,7 +584,7 @@ fn main() -> eyre::Result<()> {
                         dyn eez_protocol::executor::ChainClient
                             + Send
                             + Sync,
-                    > = l2_entry;
+                    > = l2_entry.clone();
 
                     let entry_cfg = TargetConfig {
                         proxy_lookup: ProxyLookupConfig {
@@ -708,6 +699,14 @@ fn main() -> eyre::Result<()> {
                         rollups: wired_rollups,
                         exec_ctx,
                         l2_entry_client: l2_entry_view,
+                        // Concrete handles for drain-time state chaining
+                        // (anchor pinning + source-cache carry + session
+                        // seeding). Same instances as the erased views above.
+                        sim_handles: Some(eez_composer::composer::LocalSimHandles {
+                            l1_entry: l1_entry_client,
+                            l2_entry,
+                            l2_follower,
+                        }),
                     })
                 } else {
                     event!(

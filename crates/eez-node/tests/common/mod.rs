@@ -1494,6 +1494,7 @@ sol! {
     interface IValue {
         function value() external view returns (uint256);
         function setValue(uint256 v) external returns (bool changed, uint256 newValue);
+        function increment(uint256 expectedCurrent) external returns (uint256 newValue);
     }
     #[sol(rpc)]
     interface IValueNoRet {
@@ -1502,6 +1503,9 @@ sol! {
     }
     interface ISetterWrapper {
         function setViaProxy(uint256 v) external;
+    }
+    interface IGatedSetter {
+        function setViaProxyIfValue(uint256 expected, uint256 v) external;
     }
 }
 
@@ -1769,6 +1773,26 @@ pub async fn deploy_setter_wrapper(
     .await
 }
 
+/// Deploy `GatedSetter(gate, proxy)` — the cross-direction dependency
+/// probe for the chained-simulation tests.
+pub async fn deploy_gated_setter(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    gate: Address,
+    proxy: Address,
+) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("GatedSetter.sol/GatedSetter.json"),
+        (gate, proxy).abi_encode(),
+    )
+    .await
+}
+
 pub async fn value_no_ret(rpc_url: &str, value_addr: Address) -> Result<U256> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     Ok(IValueNoRet::new(value_addr, &provider)
@@ -2020,6 +2044,9 @@ pub struct CrossChainWorld {
     pub outbound_no_ret_proxy: Address,
     pub withdrawal_proxy: Address,
     pub outbound_wrapper: Address,
+    /// L1 `GatedSetter(outbound_value, setter_proxy)`: gates an inbound
+    /// cross-chain call on a value an outbound tx writes on L1.
+    pub gated_setter: Address,
     _datadir: tempfile::TempDir,
 }
 
@@ -2124,6 +2151,14 @@ pub async fn setup_cross_chain_with_env(
         create_l2_cross_chain_proxy(&l2_rpc, TARGET_DEPLOYER, withdrawal_recipient, 0).await?;
     let outbound_wrapper =
         deploy_setter_wrapper(&l2_rpc, TARGET_DEPLOYER, l2_chain_id, outbound_proxy).await?;
+    let gated_setter = deploy_gated_setter(
+        &l1_rpc,
+        TARGET_DEPLOYER,
+        DEV_CHAIN_ID,
+        outbound_value,
+        setter_proxy,
+    )
+    .await?;
 
     Ok(CrossChainWorld {
         node,
@@ -2144,6 +2179,7 @@ pub async fn setup_cross_chain_with_env(
         outbound_no_ret_proxy,
         withdrawal_proxy,
         outbound_wrapper,
+        gated_setter,
         _datadir: datadir,
     })
 }

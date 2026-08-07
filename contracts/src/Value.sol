@@ -29,4 +29,13 @@ contract Value {
         emit ValueSet(msg.sender, v);
         return (changed, v);
     }
+
+    /// State-dependent setter for the chained-simulation tests: only
+    /// succeeds when `value` already equals `expectedCurrent`.
+    function increment(uint256 expectedCurrent) external returns (uint256 newValue) {
+        require(value == expectedCurrent, "increment: unexpected current value");
+        value += 1;
+        emit ValueSet(msg.sender, value);
+        return value;
+    }
 }

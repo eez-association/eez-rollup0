@@ -75,6 +75,10 @@ impl LocalExecutionSession {
     /// `None` opens a fresh revm state. `overlay_channel` publishes cumulative
     /// state after execution so a suspended inspector can apply the diff.
     ///
+    /// `anchor` pins the session to a specific (possibly not-yet-canonical)
+    /// block: state opens via `state_by_block_hash` and the EVM env derives
+    /// from the anchor header. `None` opens the latest committed state.
+    ///
     /// # Errors
     ///
     /// Returns [`ExecutorErrorKind::Provider`] if reading the latest
@@ -86,25 +90,41 @@ impl LocalExecutionSession {
         inspector_factory: Option<SessionInspectorFactory>,
         cache: Option<CacheState>,
         overlay_channel: OverlayChannelHandle,
+        anchor: Option<reth_primitives_traits::SealedHeader<alloy_consensus::Header>>,
     ) -> ExecutorResult<Self> {
-        let num = provider
-            .provider
-            .best_block_number()
-            .map_err(provider_err)?;
-        tracing::debug!(block = num, "target session: best block number");
-
-        let header = provider
-            .headers
-            .header_by_number(num)
-            .map_err(provider_err)?
-            .ok_or_else(|| ExecutorError::from(ExecutorErrorKind::Missing("target header")))?;
-        tracing::debug!(
-            block = num,
-            state_root = %header.state_root,
-            "target session: opened header"
-        );
-
-        let state_prov = provider.provider.latest().map_err(provider_err)?;
+        let (header, state_prov) = match anchor {
+            Some(anchor) => {
+                tracing::debug!(
+                    block = anchor.number,
+                    state_root = %anchor.state_root,
+                    "target session: opening at pinned anchor"
+                );
+                let state_prov = provider
+                    .provider
+                    .state_by_block_hash(anchor.hash())
+                    .map_err(provider_err)?;
+                (anchor.into_header(), state_prov)
+            }
+            None => {
+                let num = provider
+                    .provider
+                    .best_block_number()
+                    .map_err(provider_err)?;
+                let header = provider
+                    .headers
+                    .header_by_number(num)
+                    .map_err(provider_err)?
+                    .ok_or_else(|| {
+                        ExecutorError::from(ExecutorErrorKind::Missing("target header"))
+                    })?;
+                tracing::debug!(
+                    block = num,
+                    state_root = %header.state_root,
+                    "target session: opened latest header"
+                );
+                (header, provider.provider.latest().map_err(provider_err)?)
+            }
+        };
 
         let mut evm_env = provider.evm_config.evm_env(&header).map_err(evm_err)?;
         let chain_id = evm_env.cfg_env.chain_id;
@@ -118,7 +138,7 @@ impl LocalExecutionSession {
         let state = builder.build();
 
         tracing::debug!(
-            block = num,
+            block = header.number,
             chain_id,
             %manager_address,
             "target session: ready"
@@ -346,20 +366,22 @@ impl TargetExecutionSession for LocalExecutionSession {
     }
 
     fn checkpoint(&mut self) -> ExecutorResult<eez_protocol::SessionSnapshot> {
-        // The snapshot restores no session state: the revm cache and bundle
-        // are not captured (full-snapshot rollback is planned separately).
-        // Annulled-call safety rests on batch materialization rejecting
-        // revert spans, so a composition with rolled-back calls never emits
-        // entries.
-        Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+        // Snapshot the revm cache. `transition_state`/`bundle_state` are not
+        // captured: rolled-back reads still resolve cache-first, and
+        // simulation sessions never call `take_bundle`, so restoring the
+        // cache restores all state visible to subsequent executions.
+        // Annulled-call safety additionally rests on batch materialization
+        // rejecting revert spans.
+        Ok(Box::new(self.state.cache.clone()) as Box<dyn std::any::Any + Send>)
     }
 
     fn rollback(&mut self, snapshot: eez_protocol::SessionSnapshot) -> ExecutorResult<()> {
-        snapshot.downcast::<()>().map_err(|_e| {
+        let cache = snapshot.downcast::<CacheState>().map_err(|_e| {
             ExecutorError::from(ExecutorErrorKind::Encoding(
                 "LocalExecutionSession::rollback: snapshot type mismatch".into(),
             ))
         })?;
+        self.state.cache = *cache;
         Ok(())
     }
 }

@@ -140,6 +140,47 @@ pub struct CrossChainWiring {
     /// must run against an L2 entry (the L2 follower's `ChainClient`
     /// errors `Unavailable` for source sim).
     pub l2_entry_client: Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+    /// Concrete local clients for drain-time state chaining (anchor
+    /// pinning, source-cache carry, session seeding). `None` for
+    /// non-local wirings: target-session carry still works, the
+    /// cache-based source/seed carry is disabled.
+    pub sim_handles: Option<LocalSimHandles>,
+}
+
+/// Concrete [`LocalChainClient`] handles backing [`CrossChainWiring`]'s
+/// type-erased clients. The drain loop uses these for the state-chaining
+/// side channels that cannot live on the object-safe `ChainClient` trait
+/// (revm `CacheState` must not appear in `eez-protocol` APIs).
+#[derive(Clone, Debug)]
+pub struct LocalSimHandles {
+    /// L1 entry client — same instance as `CrossChainWiring::entry_client`
+    /// and the L1 entry in `rollups`.
+    pub l1_entry: Arc<crate::local::LocalChainClient>,
+    /// L2 entry client — same instance as `CrossChainWiring::l2_entry_client`.
+    pub l2_entry: Arc<crate::local::LocalChainClient>,
+    /// L2 follower client — same instance as the L2 entry in `rollups`.
+    pub l2_follower: Arc<crate::local::LocalChainClient>,
+}
+
+impl LocalSimHandles {
+    fn all(&self) -> [&Arc<crate::local::LocalChainClient>; 3] {
+        [&self.l1_entry, &self.l2_entry, &self.l2_follower]
+    }
+}
+
+/// RAII guard clearing every drain-scoped simulation slot (anchors,
+/// source carries, session seeds) on all exit paths of a drain —
+/// including early minimal-path returns and transient aborts.
+struct DrainSimGuard<'a>(&'a LocalSimHandles);
+
+impl Drop for DrainSimGuard<'_> {
+    fn drop(&mut self) {
+        for client in self.0.all() {
+            client.clear_sim_anchor();
+            let _ = client.end_source_carry();
+            client.set_session_seed(None);
+        }
+    }
 }
 
 impl CrossChainWiring {
@@ -183,49 +224,114 @@ impl CrossChainWiring {
         entry_client: &(dyn eez_protocol::executor::ChainClient + Send + Sync),
         raw_tx: &[u8],
     ) -> eez_protocol::ComposerResult<eez_protocol::Composition> {
-        use eez_protocol::composition::Rollup;
-
-        tracing::info!(
-            name: "composer.simulate.start",
-            %entry_rollup_id,
-            tx_len = raw_tx.len(),
-            rollup_count = self.rollups.len(),
-            "simulate_and_resolve: starting composition pipeline"
-        );
-
-        // Assemble registered clients and configs with lazy sessions.
-        let mut rollups: HashMap<eez_protocol::RollupId, Rollup> =
-            HashMap::with_capacity(self.rollups.len());
-        for (rollup_id, (client, config)) in &self.rollups {
-            rollups.insert(
-                *rollup_id,
-                Rollup {
-                    client: Arc::clone(client),
-                    session: None,
-                    config: config.clone(),
-                },
-            );
-        }
-
-        // Drive source simulation, including proxy dispatch through the
-        // builder, then materialize the composition's source and target batches.
-        // Capture the count first because `finalize` consumes the builder.
-        let mut builder = eez_protocol::CompositionBuilder::new(entry_rollup_id, rollups);
-        entry_client
-            .simulate_source_tx(raw_tx.to_vec(), &mut builder)
-            .map_err(eez_protocol::CompositionError::from)?;
-        let recorded_count = builder.recorded_count();
-        let composition = builder.finalize()?;
-
-        tracing::info!(
-            name: "composer.simulate.complete",
-            target_count = composition.targets.len(),
-            recorded = recorded_count,
-            "composition complete"
-        );
-
-        Ok(composition)
+        // Throwaway carry: sessions die with the builder, as before.
+        let mut no_carry = HashMap::new();
+        simulate_and_resolve_chained_with(
+            &self.rollups,
+            entry_rollup_id,
+            entry_client,
+            raw_tx,
+            &mut no_carry,
+        )
     }
+
+    /// State-chained variant of [`Self::simulate_and_resolve_recorded_for`]:
+    /// target sessions seeded from `carried` continue accumulating state, and
+    /// on return (success OR failure) `carried` holds every live session —
+    /// minus the entry rollup's, whose re-entry writes already flowed into
+    /// the source state. The drain loop owns unwinding `carried` when the
+    /// simulated tx does not survive.
+    pub fn simulate_and_resolve_chained(
+        &self,
+        entry_rollup_id: eez_protocol::RollupId,
+        entry_client: &(dyn eez_protocol::executor::ChainClient + Send + Sync),
+        raw_tx: &[u8],
+        carried: &mut HashMap<
+            eez_protocol::RollupId,
+            Box<dyn eez_protocol::TargetExecutionSession + Send>,
+        >,
+    ) -> eez_protocol::ComposerResult<eez_protocol::Composition> {
+        simulate_and_resolve_chained_with(
+            &self.rollups,
+            entry_rollup_id,
+            entry_client,
+            raw_tx,
+            carried,
+        )
+    }
+}
+
+/// Simulate one source tx against the registered rollups, threading live
+/// target sessions through `carried` (see
+/// [`CrossChainWiring::simulate_and_resolve_chained`]). Free function so
+/// unit tests can drive it without a full [`CrossChainExecCtx`].
+#[allow(clippy::type_complexity)]
+fn simulate_and_resolve_chained_with(
+    registered: &HashMap<
+        eez_protocol::RollupId,
+        (
+            Arc<dyn eez_protocol::executor::ChainClient + Send + Sync>,
+            eez_protocol::TargetConfig,
+        ),
+    >,
+    entry_rollup_id: eez_protocol::RollupId,
+    entry_client: &(dyn eez_protocol::executor::ChainClient + Send + Sync),
+    raw_tx: &[u8],
+    carried: &mut HashMap<
+        eez_protocol::RollupId,
+        Box<dyn eez_protocol::TargetExecutionSession + Send>,
+    >,
+) -> eez_protocol::ComposerResult<eez_protocol::Composition> {
+    use eez_protocol::composition::Rollup;
+
+    tracing::info!(
+        name: "composer.simulate.start",
+        %entry_rollup_id,
+        tx_len = raw_tx.len(),
+        rollup_count = registered.len(),
+        carried_sessions = carried.len(),
+        "simulate_and_resolve: starting composition pipeline"
+    );
+
+    // Assemble registered clients and configs with lazy sessions.
+    let mut rollups: HashMap<eez_protocol::RollupId, Rollup> =
+        HashMap::with_capacity(registered.len());
+    for (rollup_id, (client, config)) in registered {
+        rollups.insert(
+            *rollup_id,
+            Rollup {
+                client: Arc::clone(client),
+                session: None,
+                config: config.clone(),
+            },
+        );
+    }
+
+    // Drive source simulation, including proxy dispatch through the
+    // builder, then materialize the composition's source and target batches.
+    // Capture the count first because `finalize` consumes the builder.
+    let mut builder = eez_protocol::CompositionBuilder::new(entry_rollup_id, rollups)
+        .with_sessions(std::mem::take(carried));
+    let sim = entry_client.simulate_source_tx(raw_tx.to_vec(), &mut builder);
+    // Recover live sessions BEFORE finalize consumes the builder and on the
+    // sim error path, so a failed tx never destroys the drain's carry. The
+    // entry rollup's session is a re-entry artifact: its writes were
+    // diff-applied onto the in-flight source state, which the drain carries
+    // separately — carrying the session too would double-apply them.
+    *carried = builder.take_sessions();
+    carried.remove(&entry_rollup_id);
+    sim.map_err(eez_protocol::CompositionError::from)?;
+    let recorded_count = builder.recorded_count();
+    let composition = builder.finalize()?;
+
+    tracing::info!(
+        name: "composer.simulate.complete",
+        target_count = composition.targets.len(),
+        recorded = recorded_count,
+        "composition complete"
+    );
+
+    Ok(composition)
 }
 
 impl std::fmt::Debug for CrossChainWiring {
@@ -238,19 +344,26 @@ impl std::fmt::Debug for CrossChainWiring {
 }
 
 /// Relay-drop retries before a held user_tx is evicted as probable
-/// poison. Poison is normally caught at COMPOSE time (a tx whose
-/// `simulate_and_resolve` deterministically fails — e.g. a wrong-proxy
-/// tx → `EmptyCalls`, or a revert — is evicted before it can enter a
-/// bundle). An atomic-relay drop re-queues its transactions; this bound
-/// backstops poison the compose-time simulation missed. After this many
-/// consecutive drops, the transaction and its nonce-dependent suffix are
-/// evicted so they cannot block the FIFO queue indefinitely.
+/// poison. Two distinct mechanisms, do not conflate them:
 ///
-/// KNOWN LIMITATION: drain-time simulations are isolated — every tx gets
-/// fresh sessions over the same pre-slot state (see
-/// `simulate_and_resolve_recorded_for`), so a state-dependent tx whose
-/// prerequisite is co-bundled in the same slot deterministically diverges
-/// from real execution and drops here after the retry budget.
+/// - COMPOSE-time poison: a tx whose `simulate_and_resolve_chained`
+///   deterministically fails (e.g. a wrong-proxy tx → `EmptyCalls`, or a
+///   revert) is evicted IMMEDIATELY, on its first drain, together with
+///   its same-sender nonce suffix. It never consumes an attempt.
+/// - This bound backstops the RELAY side only: a tx that simulated clean
+///   here but whose bundle the relay repeatedly drops (relay-side state
+///   divergence). After this many consecutive drops, the transaction and
+///   its nonce-dependent suffix are evicted so they cannot block the
+///   FIFO queue indefinitely.
+///
+/// Drain-time simulations are state-chained per slot (two passes
+/// mirroring canonical order — all outbound, then all inbound — each tx
+/// seeded with its in-slot predecessors' simulated writes on both
+/// chains; see `compose_cross_chain_batch`), so a state-dependent tx
+/// whose prerequisite is co-bundled in the same slot now simulates
+/// against that prerequisite's effects. Chaining is still a prediction:
+/// canonical execution and the relay remain authoritative, hence this
+/// backstop.
 pub const MAX_BUNDLE_ATTEMPTS: u32 = 3;
 
 /// Classify a `simulate_and_resolve` failure. `true` = DETERMINISTIC:
@@ -277,6 +390,88 @@ fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
         // register) — not the tx's fault → retry, don't evict.
         _ => false,
     }
+}
+
+/// Target sessions carried across the transactions of one drain, keyed by
+/// rollup. Threaded through `simulate_and_resolve_chained`.
+type CarriedSessions =
+    HashMap<eez_protocol::RollupId, Box<dyn eez_protocol::TargetExecutionSession + Send>>;
+
+/// Per-tx snapshots of every carried session, taken before simulating so a
+/// failed tx's target writes can be unwound.
+struct CarryCheckpoint {
+    snapshots: HashMap<eez_protocol::RollupId, eez_protocol::SessionSnapshot>,
+}
+
+/// Checkpoint every carried session. An error here is a composer fault
+/// (not the tx's) — callers abort the slot as transient.
+fn checkpoint_carried(
+    carried: &mut CarriedSessions,
+) -> Result<CarryCheckpoint, eez_protocol::ExecutorError> {
+    let mut snapshots = HashMap::with_capacity(carried.len());
+    for (id, session) in carried.iter_mut() {
+        snapshots.insert(*id, session.checkpoint()?);
+    }
+    Ok(CarryCheckpoint { snapshots })
+}
+
+/// Unwind a failed tx: drop sessions it newly opened, and roll every
+/// pre-existing session back to its checkpoint. A rollback failure drops
+/// that session from the carry (later sims degrade to fresh isolated
+/// sessions — under-informed, never corrupted) instead of aborting.
+fn unwind_carried(carried: &mut CarriedSessions, cp: CarryCheckpoint) {
+    carried.retain(|id, _| cp.snapshots.contains_key(id));
+    for (id, snap) in cp.snapshots {
+        let Some(session) = carried.get_mut(&id) else {
+            continue;
+        };
+        if let Err(e) = session.rollback(snap) {
+            tracing::warn!(
+                name: "composer.carry.rollback_failed",
+                rollup_id = %id,
+                error = %e,
+                "carried session rollback failed; dropping it from the drain carry",
+            );
+            carried.remove(&id);
+        }
+    }
+}
+
+/// Discard a failed tx's armed source carry (if any) and unwind its
+/// target-session writes.
+fn discard_and_unwind(
+    source_client: Option<&Arc<crate::local::LocalChainClient>>,
+    carried: &mut CarriedSessions,
+    cp: CarryCheckpoint,
+) {
+    if let Some(client) = source_client {
+        let _ = client.end_source_carry();
+    }
+    unwind_carried(carried, cp);
+}
+
+/// Commit a surviving tx's source carry into the drain's accumulated
+/// per-chain cache (keeps the previous cache when the sim recorded no
+/// poststate, e.g. under mock wirings).
+fn commit_source_carry(
+    source_client: Option<&Arc<crate::local::LocalChainClient>>,
+    cache: &mut Option<revm::database::CacheState>,
+) {
+    if let Some(client) = source_client
+        && let Some(post) = client.end_source_carry()
+    {
+        *cache = Some(post);
+    }
+}
+
+/// Drain every unprocessed tx (with its drain index) for a transient
+/// re-queue, preserving FIFO order.
+fn take_rest(slots: &mut [Option<HeldTx>]) -> Vec<(usize, HeldTx)> {
+    slots
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(i, s)| s.take().map(|h| (i, h)))
+        .collect()
 }
 
 alloy_sol_types::sol! {
@@ -1254,12 +1449,15 @@ where
         //   leading immediate entry, and the Sync block is empty.
 
         // ── Per-tx compose with poison isolation ─────────────────────
-        // Simulate each held tx independently:
-        //   - Ok                        → survivor, routed by direction.
+        // Simulate each held tx state-chained in canonical order (two
+        // passes, outbound then inbound — see below), each sim seeded with
+        // its in-slot predecessors' simulated writes:
+        //   - Ok                        → survivor, routed by direction;
+        //     its writes join the drain carry.
         //   - deterministic sim failure → POISON (e.g. a wrong-proxy tx
         //     → EmptyCalls, or a revert): evict it here (+ nonce-cascade)
-        //     so it can never freeze the pool, and keep composing the
-        //     survivors.
+        //     so it can never freeze the pool, unwind its simulated writes,
+        //     and keep composing the survivors.
         //   - transient sim failure     → abort the slot: re-queue
         //     everything, degrade to a minimal postBatch, retry next.
         // Only simulation-clean survivors reach the rich path. Recovery still
@@ -1300,7 +1498,10 @@ where
             pool.release_in_flight_batch(&stale);
         }
 
-        let mut survivors: Vec<HeldTx> = Vec::with_capacity(drained.len());
+        // Survivors keep their drain index: the two-pass loop below visits
+        // outbound before inbound, and downstream (bundle assembly, the
+        // optimistic ledger, transient re-queue) needs original FIFO order.
+        let mut survivors: Vec<(usize, HeldTx)> = Vec::with_capacity(drained.len());
         // Inbound survivors' compositions (their `source.batch` = the L1
         // deferred entries) feed `prepare_post_batch_raw`'s merge.
         let mut survivor_comps: Vec<eez_protocol::Composition> = Vec::with_capacity(drained.len());
@@ -1319,186 +1520,310 @@ where
         let mut poison_gaps: Vec<(Address, Direction, u64)> = Vec::new();
         // On a transient failure we abort the slot; this holds the error
         // string + the txs still needing re-queue (the failing tx + the
-        // unprocessed remainder; survivors are added below).
-        let mut transient: Option<(String, Vec<HeldTx>)> = None;
+        // unprocessed remainder), tagged with drain indices so the re-queue
+        // can be rebuilt in FIFO order across both passes; survivors are
+        // merged below.
+        let mut transient: Option<(String, Vec<(usize, HeldTx)>)> = None;
 
-        // Per-tx phase: each arm below runs a fresh CompositionBuilder through
-        // finalize — one multi-target Composition per surviving tx.
-        let mut iter = drained.into_iter().enumerate();
-        while let Some((idx, held)) = iter.next() {
-            if let Some(gap_at) = poison_gap_for(&poison_gaps, &held) {
-                event!(
-                    name: "eez.composer.cc_compose.poison_chain_evicted",
-                    Level::WARN,
-                    rollup_id,
-                    tx_idx = idx,
-                    tx_hash = %held.hash,
-                    sender = %held.sender,
-                    nonce = held.nonce,
-                    gap_at,
-                    "same-sender tx above an evicted poison nonce in the same drain; evicted (resubmit in order)",
-                );
-                poison.push(held);
-                continue;
-            }
-            // ── OUTBOUND (L2→L1) arm. Source-sim runs against the L2 ENTRY client
-            // (the L2 follower errors `Unavailable`). Stage each (settlement entry,
-            // its user tx); the load tx is built post-drain by the canonical
-            // builder. Zero entries → poison.
-            if held.direction == Direction::Outbound {
-                match cc.simulate_and_resolve_recorded_for(
-                    eez_protocol::RollupId(rollup_id),
-                    cc.l2_entry_client.as_ref(),
-                    held.raw_tx.as_ref(),
-                ) {
-                    Ok(composition) => {
-                        let l1_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = composition
-                            .targets
-                            .iter()
-                            .flat_map(|t| t.batch.entries.iter().cloned())
-                            .collect();
-                        if l1_entries.is_empty() {
-                            event!(
-                                name: "eez.composer.cc_compose.outbound_no_entries",
-                                Level::WARN,
-                                rollup_id,
-                                tx_idx = idx,
-                                tx_hash = %held.hash,
-                                "outbound tx produced no L1 settlement entry; evicting (resubmit required)",
-                            );
-                            push_poison_root(&mut poison, &mut poison_gaps, held);
-                            continue;
-                        }
-                        // `reject_multicall` covers multiple calls within one entry;
-                        // this guard covers one transaction producing multiple
-                        // entries. Each entry would pair with the same nonce-bearing
-                        // raw transaction, causing the Sync block to include it more
-                        // than once and fail replay.
-                        if l1_entries.len() > 1 {
-                            event!(
-                                name: "eez.composer.cc_compose.outbound_multicall_unsupported",
-                                Level::WARN,
-                                rollup_id,
-                                tx_idx = idx,
-                                tx_hash = %held.hash,
-                                entries = l1_entries.len(),
-                                "outbound tx made multiple cross-chain calls; evicting because one source transaction cannot back multiple entries",
-                            );
-                            push_poison_root(&mut poison, &mut poison_gaps, held);
-                            continue;
-                        }
-                        // Evict a withdrawal that would exceed the rollup's L1 escrow —
-                        // it would revert on-chain and drop the whole bundle.
-                        // "ether out" is the amount of Ether being withdrawn in this outbound settlement entry.
-                        // If missing, the entry is malformed and must be evicted.
-                        // Review once reentrancy is available
-                        let Some(need) = eez_protocol::entries::outbound_ether_out(&l1_entries[0])
-                        else {
-                            event!(name: "eez.composer.cc_compose.outbound_ether_out_missing", Level::WARN, rollup_id, tx_idx = idx, tx_hash = %held.hash, "outbound tx is missing ether out entry, likely malformed; evicting");
-                            push_poison_root(&mut poison, &mut poison_gaps, held);
-                            continue;
-                        };
-                        if need > U256::ZERO {
-                            if escrow_remaining.is_none() {
-                                escrow_remaining =
-                                    read_rollup_escrow(&ctx.l1_provider, rollup_id).await;
-                            }
-                            if let Some(avail) = escrow_remaining {
-                                if need > avail {
-                                    event!(
-                                        name: "eez.composer.cc_compose.outbound_over_escrow",
-                                        Level::WARN,
-                                        rollup_id,
-                                        tx_idx = idx,
-                                        tx_hash = %held.hash,
-                                        need = %need,
-                                        escrow = %avail,
-                                        "outbound withdrawal exceeds L1 rollup escrow; evicting at compose time (would revert InsufficientRollupBalance on L1 — resubmit required)",
-                                    );
-                                    push_poison_root(&mut poison, &mut poison_gaps, held);
-                                    continue;
-                                }
-                                escrow_remaining = Some(avail - need);
-                            }
-                        }
-                        for oe in &l1_entries {
-                            pending_out.push((oe.clone(), held.raw_tx.clone()));
-                        }
-                        outbound_entries.extend(l1_entries);
-                        // NOT pushed to `survivor_comps`: its `source.batch` is OUR
-                        // L2's entries (a dest=MAINNET call that must not settle on
-                        // L1). The L1 settlement is `outbound_entries`, spliced
-                        // separately with dest=rid.
-                        survivors.push(held);
-                    }
-                    Err(e) if sim_error_is_poison(&e) => {
-                        event!(
-                            name: "eez.composer.cc_compose.outbound_poison",
-                            Level::WARN,
-                            rollup_id,
-                            tx_idx = idx,
-                            tx_hash = %held.hash,
+        // ── Two-pass chained simulation ──────────────────────────────
+        // Canonical execution applies ALL outbound effects before ALL
+        // inbound ones on BOTH chains (Sync block: `[load_k, user_k]…`
+        // then deliveries; L1: settlements inline in postBatch, then the
+        // inbound user txs), so simulation replays state in that order:
+        // pass 1 = outbound txs in drain order, pass 2 = inbound txs in
+        // drain order, seeded from pass 1's accumulated simulated state.
+        //
+        // Carry components (each tx sees its predecessors' simulated writes):
+        // - `carried`: live target sessions threaded through
+        //   `simulate_and_resolve_chained` within a pass;
+        // - `l2_cache`/`l1_cache`: cumulative source-sim caches, armed on
+        //   the concrete local clients per tx and committed only when the
+        //   tx definitively survives;
+        // - anchors: L2 sims pinned to `parent_header` (the block the Sync
+        //   slot builds on); L1 stays at latest — there is no known L1
+        //   parent (the bundle may target NextBlock) and the carry overlays
+        //   every account the drain touches.
+        // A tx that fails is unwound: carried sessions roll back to their
+        // per-tx checkpoints, sessions it newly opened are dropped, and its
+        // armed source cache is discarded. Chaining remains a prediction —
+        // canonical execution and the relay stay authoritative.
+        let sim = cc.sim_handles.as_ref();
+        let _sim_guard = sim.map(DrainSimGuard);
+        if let Some(handles) = sim {
+            handles.l2_entry.pin_sim_anchor(parent_header.clone());
+            handles.l2_follower.pin_sim_anchor(parent_header.clone());
+        }
+        let mut l2_cache: Option<revm::database::CacheState> = None;
+        let mut l1_cache: Option<revm::database::CacheState> = None;
+        let mut carried: CarriedSessions = HashMap::new();
+        let mut slots: Vec<Option<HeldTx>> = drained.into_iter().map(Some).collect();
+
+        'passes: for pass_direction in [Direction::Outbound, Direction::Inbound] {
+            if pass_direction == Direction::Inbound {
+                // ── Pass boundary: seed the inbound pass. The outbound
+                // pass's L1 settlement writes live in the carried L1 target
+                // session — export its cache into `l1_cache` for the
+                // inbound source sims. `l2_cache` (outbound source writes)
+                // seeds the follower's first inbound target session. Any
+                // other leftover session is an L2 re-entry artifact whose
+                // surviving effects are impossible today (multi-entry
+                // outbound txs are evicted) — dropped.
+                if let Some(mut l1_session) = carried.remove(&cc.entry_rollup_id) {
+                    match l1_session.checkpoint() {
+                        Ok(snap) => match snap.downcast::<revm::database::CacheState>() {
+                            Ok(cache) => l1_cache = Some(*cache),
+                            Err(_) => tracing::warn!(
+                                name: "composer.carry.harvest_type_mismatch",
+                                "L1 session snapshot is not a CacheState; inbound pass runs unseeded on L1",
+                            ),
+                        },
+                        Err(e) => tracing::warn!(
+                            name: "composer.carry.harvest_failed",
                             error = %e,
-                            "outbound tx fails simulation deterministically; evicting",
-                        );
-                        push_poison_root(&mut poison, &mut poison_gaps, held);
-                    }
-                    Err(e) => {
-                        let mut rest = vec![held];
-                        rest.extend(iter.by_ref().map(|(_, h)| h));
-                        transient = Some((
-                            format!("simulate_and_resolve_recorded_for tx#{idx}: {e}"),
-                            rest,
-                        ));
-                        break;
+                            "L1 session checkpoint failed; inbound pass runs unseeded on L1",
+                        ),
                     }
                 }
-                continue;
+                carried.clear();
+                if let Some(handles) = sim {
+                    handles.l2_follower.set_session_seed(l2_cache.clone());
+                }
             }
 
-            // ── INBOUND (L1→L2) arm. Stage target-side derivation entries
-            // for L2 delivery; system transactions follow all outbound loads.
-            match cc.simulate_and_resolve(held.raw_tx.as_ref()) {
-                Ok(composition) => {
-                    let target_entries: Vec<_> = composition
-                        .targets
-                        .iter()
-                        .flat_map(|t| t.batch.entries.iter().cloned())
-                        .collect();
-                    let target_count = target_entries.len();
-                    pending_in.extend(target_entries);
-                    event!(
-                        name: "eez.composer.cc_compose.tx",
-                        Level::INFO,
-                        rollup_id,
-                        tx_idx = idx,
-                        target_count,
-                        "simulate_and_resolve produced {{target_count}} target(s) for held tx #{{tx_idx}}",
-                    );
-                    survivor_comps.push(composition);
-                    survivors.push(held);
+            for idx in 0..slots.len() {
+                if !slots[idx]
+                    .as_ref()
+                    .is_some_and(|h| h.direction == pass_direction)
+                {
+                    continue;
                 }
-                Err(e) if sim_error_is_poison(&e) => {
+                let held = slots[idx].take().expect("checked Some above");
+                if let Some(gap_at) = poison_gap_for(&poison_gaps, &held) {
                     event!(
-                        name: "eez.composer.cc_compose.poison_evicted",
+                        name: "eez.composer.cc_compose.poison_chain_evicted",
                         Level::WARN,
                         rollup_id,
                         tx_idx = idx,
                         tx_hash = %held.hash,
                         sender = %held.sender,
                         nonce = held.nonce,
-                        error = %e,
-                        "held tx fails simulation deterministically (e.g. wrong proxy → EmptyCalls, or revert); evicting — it can never compose, resubmit required",
+                        gap_at,
+                        "same-sender tx above an evicted poison nonce in the same drain; evicted (resubmit in order)",
                     );
-                    push_poison_root(&mut poison, &mut poison_gaps, held);
+                    poison.push(held);
+                    continue;
                 }
-                Err(e) => {
-                    // Transient (provider / transport / unavailable) —
-                    // abort the slot, re-queue this tx + the remainder.
-                    let mut rest = vec![held];
-                    rest.extend(iter.by_ref().map(|(_, h)| h));
-                    transient = Some((format!("simulate_and_resolve tx#{idx}: {e}"), rest));
-                    break;
+
+                // Per-tx carry bracket: checkpoint the carried sessions and
+                // arm the pass's source-cache carry so a failing tx can be
+                // fully unwound.
+                let cp = match checkpoint_carried(&mut carried) {
+                    Ok(cp) => cp,
+                    Err(e) => {
+                        // Composer fault, not the tx's — abort as transient.
+                        slots[idx] = Some(held);
+                        let rest = take_rest(&mut slots);
+                        transient = Some((
+                            format!("checkpoint carried sessions tx#{idx}: {e}"),
+                            rest,
+                        ));
+                        break 'passes;
+                    }
+                };
+                let source_client = sim.map(|handles| match pass_direction {
+                    Direction::Outbound => &handles.l2_entry,
+                    Direction::Inbound => &handles.l1_entry,
+                });
+                if let Some(client) = source_client {
+                    client.begin_source_carry(match pass_direction {
+                        Direction::Outbound => l2_cache.clone(),
+                        Direction::Inbound => l1_cache.clone(),
+                    });
+                }
+
+                if pass_direction == Direction::Outbound {
+                    // ── OUTBOUND (L2→L1) arm. Source-sim runs against the L2
+                    // ENTRY client (the L2 follower errors `Unavailable`).
+                    // Stage each (settlement entry, its user tx); the load tx
+                    // is built post-drain by the canonical builder. Zero
+                    // entries → poison.
+                    match cc.simulate_and_resolve_chained(
+                        eez_protocol::RollupId(rollup_id),
+                        cc.l2_entry_client.as_ref(),
+                        held.raw_tx.as_ref(),
+                        &mut carried,
+                    ) {
+                        Ok(composition) => {
+                            let l1_entries: Vec<eez_protocol::abi::ExecutionEntrySol> =
+                                composition
+                                    .targets
+                                    .iter()
+                                    .flat_map(|t| t.batch.entries.iter().cloned())
+                                    .collect();
+                            if l1_entries.is_empty() {
+                                event!(
+                                    name: "eez.composer.cc_compose.outbound_no_entries",
+                                    Level::WARN,
+                                    rollup_id,
+                                    tx_idx = idx,
+                                    tx_hash = %held.hash,
+                                    "outbound tx produced no L1 settlement entry; evicting (resubmit required)",
+                                );
+                                discard_and_unwind(source_client, &mut carried, cp);
+                                push_poison_root(&mut poison, &mut poison_gaps, held);
+                                continue;
+                            }
+                            // `reject_multicall` covers multiple calls within one entry;
+                            // this guard covers one transaction producing multiple
+                            // entries. Each entry would pair with the same nonce-bearing
+                            // raw transaction, causing the Sync block to include it more
+                            // than once and fail replay.
+                            if l1_entries.len() > 1 {
+                                event!(
+                                    name: "eez.composer.cc_compose.outbound_multicall_unsupported",
+                                    Level::WARN,
+                                    rollup_id,
+                                    tx_idx = idx,
+                                    tx_hash = %held.hash,
+                                    entries = l1_entries.len(),
+                                    "outbound tx made multiple cross-chain calls; evicting because one source transaction cannot back multiple entries",
+                                );
+                                discard_and_unwind(source_client, &mut carried, cp);
+                                push_poison_root(&mut poison, &mut poison_gaps, held);
+                                continue;
+                            }
+                            // Evict a withdrawal that would exceed the rollup's L1 escrow —
+                            // it would revert on-chain and drop the whole bundle.
+                            // "ether out" is the amount of Ether being withdrawn in this outbound settlement entry.
+                            // If missing, the entry is malformed and must be evicted.
+                            // Review once reentrancy is available
+                            let Some(need) =
+                                eez_protocol::entries::outbound_ether_out(&l1_entries[0])
+                            else {
+                                event!(name: "eez.composer.cc_compose.outbound_ether_out_missing", Level::WARN, rollup_id, tx_idx = idx, tx_hash = %held.hash, "outbound tx is missing ether out entry, likely malformed; evicting");
+                                discard_and_unwind(source_client, &mut carried, cp);
+                                push_poison_root(&mut poison, &mut poison_gaps, held);
+                                continue;
+                            };
+                            if need > U256::ZERO {
+                                if escrow_remaining.is_none() {
+                                    escrow_remaining =
+                                        read_rollup_escrow(&ctx.l1_provider, rollup_id).await;
+                                }
+                                if let Some(avail) = escrow_remaining {
+                                    if need > avail {
+                                        event!(
+                                            name: "eez.composer.cc_compose.outbound_over_escrow",
+                                            Level::WARN,
+                                            rollup_id,
+                                            tx_idx = idx,
+                                            tx_hash = %held.hash,
+                                            need = %need,
+                                            escrow = %avail,
+                                            "outbound withdrawal exceeds L1 rollup escrow; evicting at compose time (would revert InsufficientRollupBalance on L1 — resubmit required)",
+                                        );
+                                        discard_and_unwind(source_client, &mut carried, cp);
+                                        push_poison_root(&mut poison, &mut poison_gaps, held);
+                                        continue;
+                                    }
+                                    escrow_remaining = Some(avail - need);
+                                }
+                            }
+                            // Definitive survivor: commit its source-sim
+                            // writes into the drain carry.
+                            commit_source_carry(source_client, &mut l2_cache);
+                            for oe in &l1_entries {
+                                pending_out.push((oe.clone(), held.raw_tx.clone()));
+                            }
+                            outbound_entries.extend(l1_entries);
+                            // NOT pushed to `survivor_comps`: its `source.batch` is OUR
+                            // L2's entries (a dest=MAINNET call that must not settle on
+                            // L1). The L1 settlement is `outbound_entries`, spliced
+                            // separately with dest=rid.
+                            survivors.push((idx, held));
+                        }
+                        Err(e) if sim_error_is_poison(&e) => {
+                            event!(
+                                name: "eez.composer.cc_compose.outbound_poison",
+                                Level::WARN,
+                                rollup_id,
+                                tx_idx = idx,
+                                tx_hash = %held.hash,
+                                error = %e,
+                                "outbound tx fails simulation deterministically; evicting",
+                            );
+                            discard_and_unwind(source_client, &mut carried, cp);
+                            push_poison_root(&mut poison, &mut poison_gaps, held);
+                        }
+                        Err(e) => {
+                            slots[idx] = Some(held);
+                            let rest = take_rest(&mut slots);
+                            transient = Some((
+                                format!("simulate_and_resolve_chained (outbound) tx#{idx}: {e}"),
+                                rest,
+                            ));
+                            break 'passes;
+                        }
+                    }
+                } else {
+                    // ── INBOUND (L1→L2) arm. Stage target-side derivation
+                    // entries for L2 delivery; system transactions follow all
+                    // outbound loads.
+                    match cc.simulate_and_resolve_chained(
+                        cc.entry_rollup_id,
+                        cc.entry_client.as_ref(),
+                        held.raw_tx.as_ref(),
+                        &mut carried,
+                    ) {
+                        Ok(composition) => {
+                            // Definitive survivor: commit its source-sim
+                            // writes into the drain carry.
+                            commit_source_carry(source_client, &mut l1_cache);
+                            let target_entries: Vec<_> = composition
+                                .targets
+                                .iter()
+                                .flat_map(|t| t.batch.entries.iter().cloned())
+                                .collect();
+                            let target_count = target_entries.len();
+                            pending_in.extend(target_entries);
+                            event!(
+                                name: "eez.composer.cc_compose.tx",
+                                Level::INFO,
+                                rollup_id,
+                                tx_idx = idx,
+                                target_count,
+                                "simulate_and_resolve produced {{target_count}} target(s) for held tx #{{tx_idx}}",
+                            );
+                            survivor_comps.push(composition);
+                            survivors.push((idx, held));
+                        }
+                        Err(e) if sim_error_is_poison(&e) => {
+                            event!(
+                                name: "eez.composer.cc_compose.poison_evicted",
+                                Level::WARN,
+                                rollup_id,
+                                tx_idx = idx,
+                                tx_hash = %held.hash,
+                                sender = %held.sender,
+                                nonce = held.nonce,
+                                error = %e,
+                                "held tx fails simulation deterministically (e.g. wrong proxy → EmptyCalls, or revert); evicting — it can never compose, resubmit required",
+                            );
+                            discard_and_unwind(source_client, &mut carried, cp);
+                            push_poison_root(&mut poison, &mut poison_gaps, held);
+                        }
+                        Err(e) => {
+                            // Transient (provider / transport / unavailable) —
+                            // abort the slot, re-queue this tx + the remainder.
+                            slots[idx] = Some(held);
+                            let rest = take_rest(&mut slots);
+                            transient = Some((
+                                format!("simulate_and_resolve_chained (inbound) tx#{idx}: {e}"),
+                                rest,
+                            ));
+                            break 'passes;
+                        }
+                    }
                 }
             }
         }
@@ -1534,8 +1859,13 @@ where
                 "transient compose failure; re-queueing and degrading to minimal postBatch this slot",
             );
             if let Some(pool) = rollup.held_pool.as_ref() {
-                let mut requeue = survivors;
-                requeue.extend(rest);
+                // Merge survivors + remainder back into drain (FIFO) order —
+                // the two-pass loop visits outbound before inbound, so plain
+                // concatenation would misorder interleaved directions.
+                let mut indexed = survivors;
+                indexed.extend(rest);
+                indexed.sort_by_key(|(i, _)| *i);
+                let mut requeue: Vec<HeldTx> = indexed.into_iter().map(|(_, h)| h).collect();
                 let mut cascade_evicted = Vec::new();
                 requeue.retain(|tx| {
                     let Some(gap_at) = poison_gap_for(&poison_gaps, tx) else {
@@ -1569,6 +1899,12 @@ where
                 )
                 .await;
         }
+
+        // Restore drain order: pass 2 appended inbound survivors after all
+        // outbound ones; downstream (bundle assembly, the optimistic
+        // ledger) expects the original FIFO order.
+        survivors.sort_by_key(|(i, _)| *i);
+        let survivors: Vec<HeldTx> = survivors.into_iter().map(|(_, h)| h).collect();
 
         // Every held tx was poison (evicted) → nothing to compose. Still
         // emit a minimal postBatch so L1 keeps tracking L2's progression.
@@ -2679,5 +3015,259 @@ mod tests {
         let (fresh, stale) = partition_stale(Vec::new(), &HashMap::new());
         assert!(fresh.is_empty());
         assert!(stale.is_empty());
+    }
+
+    // ── Chained-simulation carry ─────────────────────────────────────
+
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use eez_protocol::{
+        CallMode, ChainClient, ChainDialect, CompositionBuilder, ExecutionOutcome,
+        ExecutionRequest, ExecutorError, ExecutorErrorKind, ExecutorResult, ProxyLookupConfig,
+        RollupId, SessionSnapshot, TargetConfig, TargetExecutionSession,
+    };
+
+    #[derive(Default)]
+    struct Counters {
+        sessions_opened: AtomicUsize,
+        executes: AtomicUsize,
+    }
+
+    struct CountingSession {
+        counters: Arc<Counters>,
+    }
+
+    impl TargetExecutionSession for CountingSession {
+        fn execute(
+            &mut self,
+            _req: ExecutionRequest,
+            _dispatcher: &mut CompositionBuilder,
+        ) -> ExecutorResult<ExecutionOutcome> {
+            self.counters.executes.fetch_add(1, Ordering::SeqCst);
+            Ok(ExecutionOutcome::Resolved {
+                return_data: Vec::new(),
+                gas_used: 21_000,
+                success: true,
+            })
+        }
+        fn checkpoint(&mut self) -> ExecutorResult<SessionSnapshot> {
+            Ok(Box::new(()) as SessionSnapshot)
+        }
+        fn rollback(&mut self, _snapshot: SessionSnapshot) -> ExecutorResult<()> {
+            Ok(())
+        }
+    }
+
+    struct CountingClient {
+        counters: Arc<Counters>,
+    }
+
+    impl ChainClient for CountingClient {
+        fn begin_execution_session(&self) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
+            self.counters.sessions_opened.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(CountingSession {
+                counters: Arc::clone(&self.counters),
+            }))
+        }
+    }
+
+    /// Entry client whose source sim dispatches exactly one call to
+    /// `target`, then optionally fails (after the target session opened).
+    struct ScriptedEntryClient {
+        source_rollup: RollupId,
+        target: RollupId,
+        fail_after_dispatch: bool,
+    }
+
+    impl ChainClient for ScriptedEntryClient {
+        fn begin_execution_session(&self) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
+            unreachable!("entry client never opens sessions in these tests")
+        }
+        fn simulate_source_tx(
+            &self,
+            _raw_tx: Vec<u8>,
+            dispatcher: &mut CompositionBuilder,
+        ) -> ExecutorResult<()> {
+            let req = ExecutionRequest {
+                call_mode: CallMode::Mutable,
+                target_address: Address::repeat_byte(0x42),
+                data: Bytes::new(),
+                value: U256::ZERO,
+                source_address: Address::repeat_byte(0x24),
+                source_rollup_id: self.source_rollup,
+            };
+            dispatcher.dispatch_call(self.target, req)?;
+            if self.fail_after_dispatch {
+                return Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
+                    "scripted post-dispatch failure".into(),
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    fn registered_with(
+        entries: Vec<(RollupId, Arc<dyn ChainClient + Send + Sync>)>,
+    ) -> HashMap<RollupId, (Arc<dyn ChainClient + Send + Sync>, TargetConfig)> {
+        entries
+            .into_iter()
+            .map(|(id, client)| {
+                let cfg = TargetConfig {
+                    proxy_lookup: ProxyLookupConfig {
+                        contract_address: Address::ZERO,
+                        authorized_proxies_slot: ChainDialect::EvmL1Style.proxy_lookup_slot(),
+                    },
+                    dialect: ChainDialect::EvmL1Style,
+                };
+                (id, (client, cfg))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chained_sim_carries_target_session_across_calls() {
+        let entry_id = RollupId(0);
+        let target_id = RollupId(7);
+        let counters = Arc::new(Counters::default());
+        let map = registered_with(vec![(
+            target_id,
+            Arc::new(CountingClient {
+                counters: Arc::clone(&counters),
+            }),
+        )]);
+        let entry = ScriptedEntryClient {
+            source_rollup: entry_id,
+            target: target_id,
+            fail_after_dispatch: false,
+        };
+
+        let mut carried = HashMap::new();
+        let first = simulate_and_resolve_chained_with(&map, entry_id, &entry, &[0u8], &mut carried);
+        assert!(carried.contains_key(&target_id), "first call must carry the target session");
+        let second =
+            simulate_and_resolve_chained_with(&map, entry_id, &entry, &[1u8], &mut carried);
+        assert!(carried.contains_key(&target_id));
+
+        // One session serviced both executes — the carry preserved identity.
+        assert_eq!(counters.sessions_opened.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.executes.load(Ordering::SeqCst), 2);
+        // Finalize outcome is not under test here (mock entries need not
+        // materialize).
+        let _ = (first, second);
+    }
+
+    #[test]
+    fn chained_sim_drops_entry_rollup_session_from_carry() {
+        let entry_id = RollupId(3);
+        let counters = Arc::new(Counters::default());
+        let map = registered_with(vec![(
+            entry_id,
+            Arc::new(CountingClient {
+                counters: Arc::clone(&counters),
+            }),
+        )]);
+        // Entry re-entry: dispatch targets the entry rollup itself.
+        let entry = ScriptedEntryClient {
+            source_rollup: entry_id,
+            target: entry_id,
+            fail_after_dispatch: false,
+        };
+
+        let mut carried = HashMap::new();
+        let _ = simulate_and_resolve_chained_with(&map, entry_id, &entry, &[0u8], &mut carried);
+        assert!(carried.is_empty(), "entry re-entry session must not be carried");
+        let _ = simulate_and_resolve_chained_with(&map, entry_id, &entry, &[1u8], &mut carried);
+        // Each call opened a fresh entry session — no carry for the entry.
+        assert_eq!(counters.sessions_opened.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn chained_sim_recovers_sessions_on_sim_error() {
+        let entry_id = RollupId(0);
+        let target_id = RollupId(9);
+        let counters = Arc::new(Counters::default());
+        let map = registered_with(vec![(
+            target_id,
+            Arc::new(CountingClient {
+                counters: Arc::clone(&counters),
+            }),
+        )]);
+        let entry = ScriptedEntryClient {
+            source_rollup: entry_id,
+            target: target_id,
+            fail_after_dispatch: true,
+        };
+
+        let mut carried = HashMap::new();
+        let result =
+            simulate_and_resolve_chained_with(&map, entry_id, &entry, &[0u8], &mut carried);
+        assert!(result.is_err(), "scripted failure must propagate");
+        assert!(
+            carried.contains_key(&target_id),
+            "the session opened by the failing tx must be recovered for the caller to unwind"
+        );
+    }
+
+    /// Session over a shared log; checkpoint/rollback clone and restore it,
+    /// mirroring `LocalExecutionSession`'s cache snapshot semantics.
+    struct StatefulSession {
+        log: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl TargetExecutionSession for StatefulSession {
+        fn execute(
+            &mut self,
+            _req: ExecutionRequest,
+            _dispatcher: &mut CompositionBuilder,
+        ) -> ExecutorResult<ExecutionOutcome> {
+            unreachable!("not dispatched in unwind tests")
+        }
+        fn checkpoint(&mut self) -> ExecutorResult<SessionSnapshot> {
+            Ok(Box::new(self.log.lock().unwrap().clone()) as SessionSnapshot)
+        }
+        fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()> {
+            let restored = snapshot.downcast::<Vec<u32>>().map_err(|_| {
+                ExecutorError::from(ExecutorErrorKind::Encoding(
+                    "StatefulSession snapshot mismatch".into(),
+                ))
+            })?;
+            *self.log.lock().unwrap() = *restored;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn unwind_restores_checkpoints_and_drops_new_sessions() {
+        let pre_existing = RollupId(1);
+        let newly_opened = RollupId(2);
+        let log = Arc::new(Mutex::new(vec![10, 20]));
+
+        let mut carried: CarriedSessions = HashMap::new();
+        carried.insert(
+            pre_existing,
+            Box::new(StatefulSession {
+                log: Arc::clone(&log),
+            }),
+        );
+        let cp = checkpoint_carried(&mut carried).expect("checkpoint");
+
+        // A failing tx mutates the pre-existing session and opens a new one.
+        log.lock().unwrap().push(99);
+        carried.insert(
+            newly_opened,
+            Box::new(StatefulSession {
+                log: Arc::new(Mutex::new(Vec::new())),
+            }),
+        );
+
+        unwind_carried(&mut carried, cp);
+
+        assert_eq!(*log.lock().unwrap(), vec![10, 20], "rollback must restore the checkpoint");
+        assert!(carried.contains_key(&pre_existing));
+        assert!(
+            !carried.contains_key(&newly_opened),
+            "sessions opened by the failed tx must be dropped"
+        );
     }
 }
