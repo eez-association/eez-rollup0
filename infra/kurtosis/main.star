@@ -33,9 +33,12 @@ def run(plan, args):
 
     poster_key = eez.get("poster_key", "")
     proof_signer_key = eez.get("proof_signer_key", "")
+    l2_system_key = eez.get("l2_system_key", "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
     if poster_key in ["", "0xCHANGE_ME"] or proof_signer_key in ["", "0xCHANGE_ME"]:
         fail("set eez.poster_key and eez.proof_signer_key in the args file " +
              "(bash infra/kurtosis/up.sh derives both automatically on first run)")
+    if l2_system_key in ["", "0xCHANGE_ME"]:
+        fail("set eez.l2_system_key in the args file")
 
     # Pair B: canonical L1, validators, MEV stack, and load/reorg services.
     eth = ethereum_package.run(plan, eth_args)
@@ -84,6 +87,7 @@ def run(plan, args):
             "EEZ_L1_RPC_URL": l1_el.rpc_http_url,
             "EEZ_L1_POSTER_KEY": poster_key,
             "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
+            "EEZ_L2_SYSTEM_KEY": l2_system_key,
             "EEZ_DEPLOYMENTS_FILE": "/out/deployments.env",
             "EEZ_GENESIS_OUT": "/out/l2-genesis.json",
             "EEZ_INITIAL_STATE_ROOT": L2_GENESIS_STATE_ROOT,
@@ -123,7 +127,7 @@ def run(plan, args):
         "EEZ_L2_XCHAIN_PORT": str(L2_XCHAIN_PORT),
         "EEZ_L2_AUTH_PORT": str(L2_ENGINE_PORT),
         "EEZ_L2_P2P_PORT": str(L2_P2P_PORT),
-        "EEZ_L2_SYSTEM_KEY": eez.get("l2_system_key", "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"),
+        "EEZ_L2_SYSTEM_KEY": l2_system_key,
         "EEZ_L2_SYSTEM_ADDRESS": eez.get("l2_system_address", "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
         "EEZ_CCM_L2_ADDRESS": eez.get("ccm_l2_address", "0x4200000000000000000000000000000000000007"),
         "EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS": eez.get("cross_chain_source_chain_ids", chain_id),
