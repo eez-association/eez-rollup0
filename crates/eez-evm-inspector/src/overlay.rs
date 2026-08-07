@@ -69,6 +69,12 @@ pub struct OverlayChannel {
 const POISONED: &str = "overlay channel mutex poisoned by a panicked dispatch";
 
 impl OverlayChannel {
+    /// Clear all snapshots at a transaction-composition boundary.
+    pub fn reset(&self) {
+        self.source_cache.lock().expect(POISONED).clear();
+        self.overlay_cache.lock().expect(POISONED).clear();
+    }
+
     /// Push a pre-dispatch cache snapshot for this rollup.
     pub fn push_pre_snapshot(&self, cache: CacheState) {
         self.source_cache.lock().expect(POISONED).push(cache);
@@ -347,6 +353,18 @@ mod tests {
         channel.push_post_cache(second.clone());
         assert_eq!(channel.pop_post_cache(), Some(second));
         assert_eq!(channel.pop_post_cache(), Some(first));
+        assert_eq!(channel.pop_post_cache(), None);
+    }
+
+    #[test]
+    fn reset_clears_both_overlay_stacks() {
+        let channel = OverlayChannel::default();
+        channel.push_pre_snapshot(CacheState::default());
+        channel.push_post_cache(CacheState::default());
+
+        channel.reset();
+
+        assert_eq!(channel.pop_pre_snapshot(), None);
         assert_eq!(channel.pop_post_cache(), None);
     }
 

@@ -101,6 +101,9 @@ pub type SessionSnapshot = Box<dyn std::any::Any + Send>;
 /// [`ExecutorErrorKind::Unavailable`] refusal.
 ///
 pub trait ChainClient: Send + Sync + 'static {
+    /// Reset client-local state that must not cross transaction compositions.
+    fn reset_composition_state(&self) {}
+
     /// Create a fresh stateful execution session.
     ///
     /// # Errors

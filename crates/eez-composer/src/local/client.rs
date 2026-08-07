@@ -165,6 +165,10 @@ impl LocalChainClient {
 }
 
 impl ChainClient for LocalChainClient {
+    fn reset_composition_state(&self) {
+        self.overlay_channel.reset();
+    }
+
     fn begin_execution_session(&self) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>> {
         tracing::debug!(
             rollup_id = %self.rollup_id,

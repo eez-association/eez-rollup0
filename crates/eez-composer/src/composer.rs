@@ -185,6 +185,13 @@ impl CrossChainWiring {
     ) -> eez_protocol::ComposerResult<eez_protocol::Composition> {
         use eez_protocol::composition::Rollup;
 
+        // Overlay snapshots are transaction-local. Clear every participating
+        // client so an unbalanced stack cannot affect this composition.
+        entry_client.reset_composition_state();
+        for (client, _) in self.rollups.values() {
+            client.reset_composition_state();
+        }
+
         tracing::info!(
             name: "composer.simulate.start",
             %entry_rollup_id,
