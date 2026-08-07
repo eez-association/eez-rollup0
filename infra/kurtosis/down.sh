@@ -14,5 +14,5 @@ echo "==> removing enclave '$ENCLAVE'"
 kurtosis enclave rm -f "$ENCLAVE" 2>/dev/null || true
 
 echo "✓ devnet torn down."
-echo "  (Locally-built images eez-node:dev / eez-deploy:dev are kept; remove with"
-echo "   'docker rmi eez-node:dev eez-deploy:dev' if you want to reclaim the space.)"
+echo "  (Locally-built images eez-node:dev / eez-proof-signer:dev / eez-deploy:dev are kept;"
+echo "   remove with 'docker rmi eez-node:dev eez-proof-signer:dev eez-deploy:dev' to reclaim space.)"

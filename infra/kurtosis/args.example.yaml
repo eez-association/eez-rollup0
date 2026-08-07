@@ -62,6 +62,7 @@ ethereum_package:
 eez:
   # Images built locally by up.sh.
   eez_node_image: eez-node:dev
+  proof_signer_image: eez-proof-signer:dev
   deploy_image: eez-deploy:dev
   follower_image: sigp/lighthouse:v8.1.2
 

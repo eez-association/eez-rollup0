@@ -8,10 +8,10 @@ single harness exercises both halves of an EEZ node at once — entirely inside
   flashbots relay, mev-boost, and spamoor, all run by
   [ethpandaops/ethereum-package](https://github.com/ethpandaops/ethereum-package).
   This is the block-builder / MEV side of the chain; it proposes every block.
-- **Pair A** — `eez-node`'s **embedded** reth (`EEZ_L1_EMBEDDED=1`) plus a
-  beacon-only follower Lighthouse that feeds it blocks. The embedded L1 gives
-  `EvmComposer` in-process state access, which is what makes cross-chain
-  composition possible.
+- **Pair A** — `eez-node`'s **embedded** reth (`EEZ_L1_EMBEDDED=1`), a remote
+  `eez-proof-signer`, plus a beacon-only follower Lighthouse that feeds it
+  blocks. The embedded L1 gives `EvmComposer` in-process state access, which is
+  what makes cross-chain composition possible.
 
 Both ELs sit on the **same** chain (one shared genesis, `CHAIN_ID=7331`).
 Every slot: rbuilder builds a block that includes `eez-node`'s bundle, a Pair B
@@ -130,7 +130,7 @@ the existing images:
 
 ```bash
 bash infra/kurtosis/down.sh
-EEZ_SKIP_NODE_BUILD=1 EEZ_SKIP_DEPLOY_BUILD=1 \
+EEZ_SKIP_NODE_BUILD=1 EEZ_SKIP_PROOF_SIGNER_BUILD=1 EEZ_SKIP_DEPLOY_BUILD=1 \
   bash infra/kurtosis/up.sh infra/kurtosis/args.yaml
 ```
 

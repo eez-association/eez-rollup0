@@ -4,7 +4,8 @@
 #   Pair B: ethereum-package L1, rbuilder, relay, mev-boost, spamoor,
 #           disruptoor, and observability services.
 #   Pair A: eez-node with embedded L1, composer, L2, cross-chain fronts,
-#           plus a follower Lighthouse for the embedded L1 Engine API.
+#           remote eez-proof-signer, plus a follower Lighthouse for the
+#           embedded L1 Engine API.
 #
 # Usage: kurtosis run . --args-file args.yaml
 
@@ -21,6 +22,7 @@ L2_XCHAIN_PORT = 18998
 # rbuilder exposes eth_sendBundle on its dedicated RPC port.
 BUILDER_FLASHBOTS_RPC_PORT = 8645
 MEV_RELAY_API_PORT = 9062
+PROOF_SIGNER_GRPC_PORT = 50061
 SPAMOOR_IMAGE = "ethpandaops/spamoor@sha256:24818bf7ab76696b2dccb0c59cb419cce358cf1b4326a545012b031afd11658b"
 
 
@@ -93,6 +95,39 @@ def run(plan, args):
         wait = "900s",
     )
 
+    signer_cmd = " ".join([
+        "set -eu;",
+        "test -f /out/deployments.env;",
+        "set -a; . /out/deployments.env; set +a;",
+        "exec eez-proof-signer",
+        "--listen-addr=0.0.0.0:{}".format(PROOF_SIGNER_GRPC_PORT),
+        "--chain-config=/out/l2-genesis.json",
+    ])
+
+    plan.add_service(
+        name = "eez-proof-signer",
+        config = ServiceConfig(
+            image = eez.get("proof_signer_image", "eez-proof-signer:dev"),
+            ports = {
+                "grpc": PortSpec(
+                    number = PROOF_SIGNER_GRPC_PORT,
+                    transport_protocol = "TCP",
+                    wait = "2m",
+                ),
+            },
+            files = {
+                "/out": deploy.files_artifacts[0],
+            },
+            env_vars = {
+                "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
+                "EEZ_L2_SYSTEM_KEY": l2_system_key,
+                "RUST_LOG": eez.get("proof_signer_rust_log", "info"),
+            },
+            entrypoint = ["/bin/sh", "-c"],
+            cmd = [signer_cmd],
+        ),
+    )
+
     # eez-node: embedded L1, composer, L2, and cross-chain fronts.
     eez_env = {
         "EEZ_L1_EMBEDDED": "1",
@@ -115,7 +150,8 @@ def run(plan, args):
         "EEZ_MAX_USER_TXS_PER_BUNDLE": str(eez.get("max_user_txs_per_bundle", 10)),
         "DEVNET_FEE_RECIPIENT": eez.get("fee_recipient", "0x0000000000000000000000000000000000000000"),
         "EEZ_L1_POSTER_KEY": poster_key,
-        "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
+        "EEZ_PROVER_URL": "http://eez-proof-signer:{}".format(PROOF_SIGNER_GRPC_PORT),
+        "EEZ_WITNESS_DB_PATH": "/data/witnesses",
         "EEZ_L2_DATADIR": "/data/l2",
         "EEZ_L2_HTTP_PORT": str(L2_RPC_PORT),
         "EEZ_L2_RPC_URL": "http://127.0.0.1:{}".format(L2_RPC_PORT),
@@ -287,4 +323,4 @@ def run(plan, args):
             ),
         )
 
-    plan.print("EEZ cross-chain devnet up: Pair B (ethereum-package) + Pair A (eez-node + follower), chain_id=" + chain_id)
+    plan.print("EEZ cross-chain devnet up: Pair B (ethereum-package) + Pair A (eez-node + proof-signer + follower), chain_id=" + chain_id)

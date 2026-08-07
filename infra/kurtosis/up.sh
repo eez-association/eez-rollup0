@@ -5,10 +5,11 @@
 #   bash infra/kurtosis/up.sh [args-file]    # default: infra/kurtosis/args.yaml
 #
 # Env knobs:
-#   EEZ_SKIP_NODE_BUILD=1    reuse an existing eez-node image
-#   EEZ_SKIP_DEPLOY_BUILD=1  reuse an existing eez-deploy image
-#   EEZ_OPTIMIZED_BUILD=1    build eez-node in release mode
-#   KURTOSIS_ENCLAVE=name    enclave name, default eez-devnet
+#   EEZ_SKIP_NODE_BUILD=1         reuse an existing eez-node image
+#   EEZ_SKIP_PROOF_SIGNER_BUILD=1 reuse an existing eez-proof-signer image
+#   EEZ_SKIP_DEPLOY_BUILD=1       reuse an existing eez-deploy image
+#   EEZ_OPTIMIZED_BUILD=1         build images in full release mode
+#   KURTOSIS_ENCLAVE=name         enclave name, default eez-devnet
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -161,23 +162,37 @@ PYEOF
     fi
 fi
 
-NODE_IMAGE="$(yv eez_node_image)";  NODE_IMAGE="${NODE_IMAGE:-eez-node:dev}"
-DEPLOY_IMAGE="$(yv deploy_image)";  DEPLOY_IMAGE="${DEPLOY_IMAGE:-eez-deploy:dev}"
+NODE_IMAGE="$(yv eez_node_image)";          NODE_IMAGE="${NODE_IMAGE:-eez-node:dev}"
+PROOF_SIGNER_IMAGE="$(yv proof_signer_image)"; PROOF_SIGNER_IMAGE="${PROOF_SIGNER_IMAGE:-eez-proof-signer:dev}"
+DEPLOY_IMAGE="$(yv deploy_image)";          DEPLOY_IMAGE="${DEPLOY_IMAGE:-eez-deploy:dev}"
 
 export DOCKER_BUILDKIT=1
 
+# Fast local build; set EEZ_OPTIMIZED_BUILD=1 for the full release profile.
+release_build_args=()
+if [[ "${EEZ_OPTIMIZED_BUILD:-0}" != "1" ]]; then
+    release_build_args=(
+        --build-arg CARGO_PROFILE_RELEASE_LTO=false
+        --build-arg CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+        --build-arg CARGO_PROFILE_RELEASE_DEBUG=0
+    )
+fi
+
 if [[ "${EEZ_SKIP_NODE_BUILD:-0}" != "1" ]]; then
     echo "==> building $NODE_IMAGE (repo Dockerfile, fast devnet profile)"
-    # Fast local build; set EEZ_OPTIMIZED_BUILD=1 for the full release profile.
-    node_build_args=()
-    if [[ "${EEZ_OPTIMIZED_BUILD:-0}" != "1" ]]; then
-        node_build_args=(
-            --build-arg CARGO_PROFILE_RELEASE_LTO=false
-            --build-arg CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
-            --build-arg CARGO_PROFILE_RELEASE_DEBUG=0
-        )
-    fi
-    docker build "${node_build_args[@]}" -t "$NODE_IMAGE" "$REPO"
+    docker build "${release_build_args[@]}" -t "$NODE_IMAGE" "$REPO"
+else
+    echo "==> reusing $NODE_IMAGE (EEZ_SKIP_NODE_BUILD=1)"
+fi
+
+if [[ "${EEZ_SKIP_PROOF_SIGNER_BUILD:-0}" != "1" ]]; then
+    echo "==> building $PROOF_SIGNER_IMAGE (Dockerfile.signer, fast devnet profile)"
+    docker build "${release_build_args[@]}" \
+        -f "$REPO/Dockerfile.signer" \
+        -t "$PROOF_SIGNER_IMAGE" \
+        "$REPO"
+else
+    echo "==> reusing $PROOF_SIGNER_IMAGE (EEZ_SKIP_PROOF_SIGNER_BUILD=1)"
 fi
 
 if [[ "${EEZ_SKIP_DEPLOY_BUILD:-0}" != "1" ]]; then
@@ -202,6 +217,7 @@ cat <<EOF
 ════════════════════════════════════════
 Inspect  : kurtosis enclave inspect $ENCLAVE
 Node log : kurtosis service logs -f $ENCLAVE eez-node
+Signer log: kurtosis service logs -f $ENCLAVE eez-proof-signer
 Reorgs   : bash infra/kurtosis/scripts/reorg-scheduler.sh   (drives disruptoor)
 Tear down: bash infra/kurtosis/down.sh
 EOF
