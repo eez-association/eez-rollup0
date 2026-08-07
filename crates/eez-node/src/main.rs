@@ -258,7 +258,7 @@ fn main() -> eyre::Result<()> {
                         l1_chain_id = %l1_handle.node.chain_spec().chain(),
                         "embedded L1 reth (devnet) ready",
                     );
-                    Some(EmbeddedL1::Dev(l1_handle))
+                    Some(EmbeddedL1::Ethereum(l1_handle))
                 }
                 l1_embedded::L1ChainKind::Testing => {
                     let node_cfg = l1_embedded::build_testing_node_config(&l1_cfg)?;

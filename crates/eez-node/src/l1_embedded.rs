@@ -148,27 +148,6 @@ pub fn build_devnet_node_config(cfg: &EmbeddedL1Config) -> Result<NodeConfig<Cha
     Ok(node_cfg)
 }
 
-/// Build a reth `NodeConfig<ChainSpec>` for the private PoS devnet L1
-/// (vanilla `EthereumNode`). Used when `kind == Devnet`.
-pub fn build_devnet_node_config(cfg: &EmbeddedL1Config) -> Result<NodeConfig<ChainSpec>> {
-    let (network_args, mut rpc_args) = build_network_rpc_args(cfg)?;
-    // External lighthouse (docker/host) dials the engine API in — bind
-    // to all interfaces (JWT guards it), same as the chiado path.
-    rpc_args.auth_addr = "0.0.0.0".parse().expect("static addr");
-    rpc_args.auth_jwtsecret = cfg.jwtsecret.clone();
-    let mut node_cfg = NodeConfig::new(cfg.dev_chain_spec.clone())
-        .with_datadir_args(DatadirArgs {
-            datadir: cfg.datadir.clone().into(),
-            ..DatadirArgs::default()
-        })
-        .with_network(network_args)
-        .with_rpc(rpc_args);
-    // No `.dev()` / block_time: blocks are CL-driven via engine API.
-    // Synchronous state-root path for determinism (matches Dev/Chiado).
-    node_cfg.engine.legacy_state_root_task_enabled = true;
-    Ok(node_cfg)
-}
-
 fn build_network_rpc_args(cfg: &EmbeddedL1Config) -> Result<(NetworkArgs, RpcServerArgs)> {
     let ws_port = cfg.http_port.checked_add(1).ok_or_else(|| {
         eyre::eyre!(
