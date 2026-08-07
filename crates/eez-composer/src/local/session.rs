@@ -20,8 +20,8 @@ use revm::DatabaseCommit;
 use revm::database::CacheState;
 
 use eez_protocol::{
-    CompositionBuilder, ExecutionOutcome, ExecutionRequest, ExecutorError, ExecutorErrorKind,
-    ExecutorResult, RollupId, TargetExecutionSession,
+    CallMode, CompositionBuilder, ExecutionOutcome, ExecutionRequest, ExecutorError,
+    ExecutorErrorKind, ExecutorResult, RollupId, TargetExecutionSession,
 };
 
 use super::provider::ChainProvider;
@@ -37,7 +37,7 @@ pub(super) const DIRECT_CALL_GAS_LIMIT: u64 = 30_000_000;
 /// `CompositionBuilder` through a `Rollup.session` slot for the
 /// lifetime of one composition.
 ///
-/// ## Limitation: direct call, not full CCM path
+/// ## Limitation: direct call, not full manager path
 ///
 /// The session calls the destination contract directly with the proxy
 /// address as `msg.sender` (computed via CREATE2). This gives the
@@ -50,7 +50,7 @@ pub struct LocalExecutionSession {
     state_provider: reth_storage_api::StateProviderBox,
     current_root: B256,
     chain_id: u64,
-    ccm_address: Address,
+    manager_address: Address,
     /// When `Some`, `execute()` runs each target call under a
     /// [`eez_evm_inspector::SessionInspector`] built from this factory — forwarding
     /// detected proxy CALLs to the dispatcher. `None` means a plain
@@ -75,7 +75,7 @@ impl std::fmt::Debug for LocalExecutionSession {
         f.debug_struct("LocalExecutionSession")
             .field("current_root", &self.current_root)
             .field("chain_id", &self.chain_id)
-            .field("ccm_address", &self.ccm_address)
+            .field("manager_address", &self.manager_address)
             .field("has_inspector_factory", &self.inspector_factory.is_some())
             .finish_non_exhaustive()
     }
@@ -110,7 +110,7 @@ impl LocalExecutionSession {
     /// fails.
     pub fn new(
         provider: &ChainProvider,
-        ccm_address: Address,
+        manager_address: Address,
         inspector_factory: Option<SessionInspectorFactory>,
         cache: Option<CacheState>,
         overlay_channel: Option<OverlayChannelHandle>,
@@ -150,7 +150,7 @@ impl LocalExecutionSession {
         tracing::debug!(
             block = num,
             chain_id,
-            %ccm_address,
+            %manager_address,
             %current_root,
             "target session: ready"
         );
@@ -162,7 +162,7 @@ impl LocalExecutionSession {
             state_provider: root_prov,
             current_root,
             chain_id,
-            ccm_address,
+            manager_address,
             inspector_factory,
             overlay_channel,
         })
@@ -170,27 +170,27 @@ impl LocalExecutionSession {
 
     /// Compute the target-chain proxy address for a given
     /// `(sourceAddress, sourceRollup)` via a static call to
-    /// `CCM.computeCrossChainProxyAddress()`.
+    /// the chain-local manager's `computeCrossChainProxyAddress()`.
     fn compute_proxy_address(
         &mut self,
         source_address: Address,
         source_rollup: RollupId,
     ) -> Option<Address> {
         alloy_sol_types::sol! {
-            function computeCrossChainProxyAddress(address originalAddress, uint256 originalRollupId) external view returns (address);
+            function computeCrossChainProxyAddress(address originalAddress, uint64 originalRollupId) external view returns (address);
         }
         use alloy_sol_types::SolCall;
 
         let calldata = computeCrossChainProxyAddressCall {
             originalAddress: source_address,
-            originalRollupId: U256::from(source_rollup.0),
+            originalRollupId: source_rollup.0,
         }
         .abi_encode();
 
         let tx_env = revm::context::TxEnv {
             caller: Address::ZERO,
             gas_limit: 1_000_000,
-            kind: alloy_primitives::TxKind::Call(self.ccm_address),
+            kind: alloy_primitives::TxKind::Call(self.manager_address),
             data: calldata.into(),
             chain_id: Some(self.chain_id),
             ..Default::default()
@@ -251,7 +251,7 @@ impl LocalExecutionSession {
     ///
     /// The target-side inspector fires from inside a scoped OS thread
     /// whose tokio entry is `Handle::block_on(...)`. This function
-    /// body MUST NOT introduce a real `.await` — doing so would try
+    /// body MUST NOT introduce a real `` — doing so would try
     /// to park back onto the outer runtime while the scoped thread
     /// is blocking a worker, producing a starvation deadlock. See
     /// the amendment C15 regression test.
@@ -383,26 +383,26 @@ impl LocalExecutionSession {
     }
 }
 
-#[async_trait::async_trait]
 impl TargetExecutionSession for LocalExecutionSession {
-    async fn execute(
+    fn execute(
         &mut self,
         req: ExecutionRequest,
         dispatcher: &mut CompositionBuilder,
     ) -> ExecutorResult<ExecutionOutcome> {
+        if req.call_mode == CallMode::Static {
+            return Err(ExecutorErrorKind::Unavailable(
+                "static target execution is not implemented".to_owned(),
+            )
+            .into());
+        }
         // Pitfall #3 invariant: this method runs SYNCHRONOUSLY under
         // the caller's `Handle::block_on`. Do NOT introduce a real
-        // `.await` on I/O here or in `execute_internal*` — the target-
+        // `` on I/O here or in `execute_internal*` — the target-
         // side inspector dispatches from a scoped OS thread that holds
         // a tokio worker, and a real await would park the outer
         // runtime.
-        debug_assert!(
-            tokio::runtime::Handle::try_current().is_ok(),
-            "LocalExecutionSession::execute must be called from within a tokio runtime"
-        );
         let outcome = if let Some(factory) = self.inspector_factory.clone() {
-            let handle = tokio::runtime::Handle::current();
-            let inspector = factory.build(dispatcher, handle);
+            let inspector = factory.build(dispatcher);
             self.execute_internal_with_inspector(
                 inspector,
                 &req.target_address,
@@ -425,14 +425,13 @@ impl TargetExecutionSession for LocalExecutionSession {
         Ok(outcome)
     }
 
-    async fn checkpoint(&mut self) -> ExecutorResult<eez_protocol::SessionSnapshot> {
+    fn checkpoint(&mut self) -> ExecutorResult<eez_protocol::SessionSnapshot> {
         // Opaque snapshot carrying the current root only. The full
-        // revm `State<DB>` deep-clone is tracked as known debt — see
-        // CLAUDE.md "Known limitations".
+        // revm `State<DB>` deep-clone remains known implementation debt.
         Ok(Box::new(self.current_root.0) as Box<dyn std::any::Any + Send>)
     }
 
-    async fn rollback(&mut self, snapshot: eez_protocol::SessionSnapshot) -> ExecutorResult<()> {
+    fn rollback(&mut self, snapshot: eez_protocol::SessionSnapshot) -> ExecutorResult<()> {
         let root: [u8; 32] = *snapshot.downcast::<[u8; 32]>().map_err(|_e| {
             ExecutorError::from(ExecutorErrorKind::Encoding(
                 "LocalExecutionSession::rollback: snapshot type mismatch".into(),
@@ -459,11 +458,9 @@ impl TargetExecutionSession for LocalExecutionSession {
 ///
 /// Restoring `info.nonce` to `original_info.nonce` (the disk value
 /// before the tx) keeps the slot fresh for the deterministic CREATE2.
-/// The real chain's flow handles this via
-/// `CCM.{_processCallAtScope,executeIncomingCrossChainCall}` which
-/// CREATE2-deploys the proxy BEFORE forwarding the call; our direct-
-/// call session shortcut needs the equivalent invariant restored
-/// post-hoc.
+/// The protocol's manager-mediated flow creates the proxy before forwarding
+/// the call. Our direct-call session shortcut needs the equivalent invariant
+/// restored post-hoc.
 fn restore_caller_nonce(
     changes: &mut revm::primitives::map::AddressHashMap<revm::state::Account>,
     caller: Address,

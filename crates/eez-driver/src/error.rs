@@ -1,9 +1,8 @@
 //! Error type returned by the driver.
 //!
-//! Follows M-ERRORS-CANONICAL-STRUCTS: a single public [`DriverError`] struct
-//! wrapping a private [`ErrorKind`] enum, with a captured [`Backtrace`]. The
-//! kind enum is private; callers discriminate via `is_*` helper methods so
-//! adding a variant doesn't break the public API.
+//! Exposes one public [`DriverError`] while keeping its error categories
+//! private. Callers discriminate via `is_*` helper methods so adding a
+//! category does not break the public API.
 //!
 //! All error construction goes through pub(crate) constructors that capture
 //! the backtrace once, at the construction site closest to the failure.

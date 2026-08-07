@@ -1,7 +1,7 @@
 //! Thin L1-interaction primitive: sends `postAndVerifyBatch` via
 //! `eth_sendBundle` and reads past `BatchPosted` events. Stateless —
-//! the [`Composer`](crate::Composer) owns cursors, batch construction,
-//! and prover orchestration.
+//! the runtime composer owns cursors, batch construction, and prover
+//! orchestration.
 //!
 //! `eth_sendBundle` pins inclusion to one L1 block. If the bundle
 //! isn't in that block we report [`SendOutcome::Dropped`] and the

@@ -9,14 +9,14 @@
 //! dispatch goes through the borrowed
 //! [`CompositionBuilder`].
 //!
-//! Both traits are `#[async_trait]` — one heap allocation per call
-//! in exchange for dyn-compatibility. Native `async fn in trait` is
-//! not dyn-compatible today, and the composer stores clients as trait
-//! objects so transports (local reth, gRPC peer, test fake) can swap
+//! Both traits are synchronous — every in-tree impl does in-process
+//! reth/EVM work with no I/O to await. The composer stores clients as
+//! trait objects so transports (local reth, test fake) can swap
 //! without upstream changes.
 
 use alloy_primitives::{Address, Bytes, U256};
 
+use crate::action::CallMode;
 use crate::composition::CompositionBuilder;
 use crate::error::ExecutorResult;
 #[allow(
@@ -30,17 +30,17 @@ use crate::types::ExecutionOutcome;
 /// Request for a single cross-chain execution on the target chain.
 #[derive(Debug, Clone)]
 pub struct ExecutionRequest {
-    /// Contract the target-chain call lands on. Spec: `Action.targetAddress`.
+    /// Effective EVM mode, including static context inherited from a parent call.
+    pub call_mode: CallMode,
+    /// Contract invoked on the destination chain.
     pub target_address: Address,
-    /// Encoded calldata for the target-chain call. Spec: `Action.data`.
+    /// Calldata sent to the destination contract.
     pub data: Bytes,
-    /// Native value sent with the call. Spec: `Action.value`.
+    /// Native value sent with the call.
     pub value: U256,
-    /// Original caller on the source chain — becomes `msg.sender` in the
-    /// target invocation. Spec: `Action.sourceAddress`.
+    /// Original caller on the source chain; becomes `msg.sender` at the destination.
     pub source_address: Address,
-    /// Rollup ID of the source chain; used for routing and action-hash
-    /// derivation. Spec: `Action.sourceRollupId`.
+    /// Rollup ID of the source chain, used for routing and call-hash derivation.
     pub source_rollup_id: RollupId,
 }
 
@@ -61,7 +61,6 @@ pub struct ExecutionRequest {
 /// nested cross-chain dispatch: a target-session inspector can call
 /// back into the composer through `dispatcher` to route a nested
 /// proxy call.
-#[async_trait::async_trait]
 pub trait TargetExecutionSession: Send {
     /// Execute a single call on the target chain.
     ///
@@ -76,7 +75,7 @@ pub trait TargetExecutionSession: Send {
     /// [`ExecutorErrorKind::Provider`]; the gRPC impl surfaces
     /// [`ExecutorErrorKind::Transport`] / [`ExecutorErrorKind::Serde`] /
     /// [`ExecutorErrorKind::Missing`].
-    async fn execute(
+    fn execute(
         &mut self,
         req: ExecutionRequest,
         dispatcher: &mut CompositionBuilder,
@@ -87,11 +86,11 @@ pub trait TargetExecutionSession: Send {
     /// restore the session to its pre-call state. Drop the snapshot
     /// to commit forward (no-op).
     ///
-    /// Used by the composer's revertSpan path:
+    /// Used to restore nested execution after a reverted frame:
     /// [`CompositionBuilder::open_call`] snapshots the target session
     /// BEFORE delegating to `execute`, stashes the snapshot keyed by
     /// call idx, and either drops it (success path) or rolls back
-    /// (revert-span path) when
+    /// (reverted-frame path) when
     /// [`CompositionBuilder::annotate_revert_span`] fires.
     ///
     /// The snapshot is type-erased via `Box<dyn Any + Send>` so the
@@ -104,7 +103,7 @@ pub trait TargetExecutionSession: Send {
     /// (deep-clones revm `State<DB>`'s 7 fields); the gRPC impl can
     /// surface [`ExecutorErrorKind::Transport`] /
     /// [`ExecutorErrorKind::Missing`].
-    async fn checkpoint(&mut self) -> ExecutorResult<SessionSnapshot>;
+    fn checkpoint(&mut self) -> ExecutorResult<SessionSnapshot>;
 
     /// Restore the session to the state captured by `snapshot`. The
     /// snapshot must have come from this session's `checkpoint` call;
@@ -114,7 +113,7 @@ pub trait TargetExecutionSession: Send {
     ///
     /// Returns [`ExecutorErrorKind::Decode`] if the snapshot's
     /// concrete type does not match this session's snapshot shape.
-    async fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()>;
+    fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()>;
 }
 
 /// Type-erased session snapshot. Each [`TargetExecutionSession`] impl
@@ -132,7 +131,6 @@ pub type SessionSnapshot = Box<dyn std::any::Any + Send>;
 ///
 /// Stored as `Arc<dyn ChainClient + Send + Sync>` in the composer's
 /// rollup map.
-#[async_trait::async_trait]
 pub trait ChainClient: Send + Sync + 'static {
     /// Read this chain's own latest block-header `stateRoot`.
     ///
@@ -147,7 +145,7 @@ pub trait ChainClient: Send + Sync + 'static {
     /// provider is inaccessible; [`ExecutorErrorKind::Unavailable`] when
     /// the implementation does not (or cannot) report its own header
     /// (e.g. a remote gRPC peer that does not expose this).
-    async fn current_state_root(&self) -> ExecutorResult<[u8; 32]>;
+    fn current_state_root(&self) -> ExecutorResult<[u8; 32]>;
 
     /// Create a fresh stateful execution session. The slot drain may
     /// keep the returned session alive across consecutive source txs
@@ -159,9 +157,7 @@ pub trait ChainClient: Send + Sync + 'static {
     /// [`ExecutorErrorKind::Provider`] / [`ExecutorErrorKind::Evm`] /
     /// [`ExecutorErrorKind::Missing`]; gRPC surfaces
     /// [`ExecutorErrorKind::Transport`].
-    async fn begin_execution_session(
-        &self,
-    ) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>>;
+    fn begin_execution_session(&self) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>>;
 
     /// Simulate a source-chain transaction, dispatching every detected
     /// cross-chain proxy call through `dispatcher`. Entry-role clients
@@ -179,7 +175,7 @@ pub trait ChainClient: Send + Sync + 'static {
     /// state provider is inaccessible. Returns [`ExecutorErrorKind::Evm`]
     /// if source EVM execution fails. Propagates any [`ExecutorError`]
     /// surfaced by `dispatcher` during proxy call dispatch.
-    async fn simulate_source_tx(
+    fn simulate_source_tx(
         &self,
         raw_tx: Vec<u8>,
         dispatcher: &mut CompositionBuilder,
@@ -203,7 +199,7 @@ pub trait ChainClient: Send + Sync + 'static {
     /// provider is inaccessible; [`ExecutorErrorKind::Transport`] for
     /// gRPC implementations; [`ExecutorErrorKind::Unavailable`] if the
     /// client does not host the committed-root storage.
-    async fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
+    fn stored_target_state_root(&self, rollup_id: RollupId) -> ExecutorResult<[u8; 32]> {
         let _ = rollup_id;
         Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
             "stored_target_state_root: client does not host the committed-root storage".into(),

@@ -10,7 +10,8 @@
 //! - [`SlotEvent::Live`] — fixed-interval tick, standalone-mode only.
 //!   Produced by [`spawn_interval`].
 //! - [`SlotEvent::SyncSlot`] — L1-anchored sync-slot trigger. Produced
-//!   by [`spawn_l1_anchored`], which subscribes to an [`L1HeadSource`]
+//!   by [`spawn_l1_anchored`], which subscribes to an
+//!   [`eez_l1::L1HeadStream`]
 //!   and sleeps until `L1.timestamp + proof_window_open` after each
 //!   head — i.e. the wall-clock moment when the prover should start
 //!   so the postBatch bundle reaches the relay before the next L1 block.

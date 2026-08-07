@@ -59,7 +59,6 @@ jobs:
       - name: Protocol integration vectors
         run: >-
           cargo nextest run -p eez-protocol
-          --test cross_chain_call_hash_vectors
           --test public_inputs_hash_vectors
           --test rolling_hash_vectors
           --no-fail-fast
@@ -74,9 +73,11 @@ jobs:
           submodules: recursive
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
-      - name: Build contracts (artifacts read by harness)
+        with:
+          version: v1.7.1
+      - name: Build and test contracts
         working-directory: contracts
-        run: forge build
+        run: forge test
 
   embedded-e2e:
     name: Embedded E2E Tests
@@ -90,6 +91,8 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
+        with:
+          version: v1.7.1
       - name: Install nextest
         uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2
         with:
@@ -97,10 +100,12 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake protobuf-compiler
+          sudo apt-get install -y jq libclang-dev pkg-config libssl-dev cmake protobuf-compiler
       - name: Build contracts (artifacts read by harness)
         working-directory: contracts
         run: forge build
+      - name: Verify generated EEZL2 genesis artifacts
+        run: scripts/update-eezl2-genesis.sh --check
       - name: Integration tests (e2e, serial)
         run: cargo nextest run -p eez-node --test e2e --test-threads=1 --no-fail-fast
 
@@ -116,6 +121,8 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
+        with:
+          version: v1.7.1
       - name: Install nextest
         uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2
         with:

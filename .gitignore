@@ -20,6 +20,10 @@ infra/kurtosis/args.yaml
 
 data/
 chiado-*/
+# Per-network env files (private keys)
+.env.*
 
 # CI diagnostics.
 artifacts/
+# Per-network env files (private keys)
+.env.*

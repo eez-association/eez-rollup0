@@ -12,8 +12,6 @@
 //!   `Reorg` / `Finalized` over a broadcast channel.
 //! - [`L1CanonicalHead`] — shared `posted_through` cursor (Deriver
 //!   writes; Composer / Sequencer / others read).
-//! - [`SubmitTrigger`] — Aggregator policy enum (S4.2 scaffold; the
-//!   Aggregator struct itself lands later in stage-N).
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 

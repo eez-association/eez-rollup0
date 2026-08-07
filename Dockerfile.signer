@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1.7
+
+FROM rust:1.94-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates clang cmake git libclang-dev libssl-dev pkg-config protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+
+# Build the signer from the repository workspace and its shared lockfile.
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+ARG CARGO_PROFILE_RELEASE_LTO=thin
+ARG CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+ARG CARGO_PROFILE_RELEASE_DEBUG=1
+ENV CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO} \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_PROFILE_RELEASE_CODEGEN_UNITS} \
+    CARGO_PROFILE_RELEASE_DEBUG=${CARGO_PROFILE_RELEASE_DEBUG} \
+    CARGO_TARGET_DIR=/build/target
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=eez-proof-signer-target,target=/build/target,sharing=locked \
+    cargo build \
+        --release \
+        --locked \
+        --package eez-proof-signer \
+        --bin eez-proof-signer \
+    && install -D -m 0555 /build/target/release/eez-proof-signer /out/eez-proof-signer \
+    && strip /out/eez-proof-signer
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder --chmod=0555 /out/eez-proof-signer /usr/local/bin/eez-proof-signer
+WORKDIR /app
+USER 65532:65532
+EXPOSE 50061/tcp
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/eez-proof-signer"]

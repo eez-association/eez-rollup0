@@ -3191,11 +3191,9 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
- "async-trait",
  "eez-protocol",
  "revm",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
 ]
 
@@ -3298,6 +3296,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "eez-proof-signer"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-genesis",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-debug",
+ "alloy-signer-local",
+ "alloy-sol-types",
+ "clap",
+ "eez-control-rpc",
+ "eez-protocol",
+ "eyre",
+ "hex",
+ "prost",
+ "reth-chainspec 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-ethereum-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-evm-ethereum 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-primitives-traits",
+ "serde_json",
+ "stateless",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+]
+
+[[package]]
 name = "eez-protocol"
 version = "0.1.0"
 dependencies = [
@@ -3352,27 +3381,6 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
-]
-
-[[package]]
-name = "eez-proverd"
-version = "0.1.0"
-dependencies = [
- "alloy-consensus",
- "alloy-primitives",
- "alloy-rlp",
- "clap",
- "eez-control-rpc",
- "eez-protocol",
- "eyre",
- "hex",
- "reth-ethereum-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-primitives-traits",
- "serde_json",
- "tokio",
- "tonic",
- "tracing",
- "tracing-subscriber 0.3.23",
 ]
 
 [[package]]
@@ -13518,6 +13526,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "stateless"
+version = "0.1.0"
+source = "git+https://github.com/eez-association/stateless?rev=4fc3806bdd0e6b296c761ef4d4b260938365cf45#4fc3806bdd0e6b296c761ef4d4b260938365cf45"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.5",
+ "alloy-genesis",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-debug",
+ "reth-chainspec 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-consensus 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-ethereum-consensus 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-ethereum-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-evm 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-primitives-traits",
+ "reth-trie-common 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "revm",
+ "revm-bytecode",
+ "revm-database-interface",
+ "revm-state",
+ "serde",
+ "serde_with",
+ "thiserror 2.0.18",
+ "tries",
+]
+
+[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14401,6 +14437,23 @@ checksum = "a1631b201eb031b563d2e85ca18ec8092508e262a3196ce9bd10a67ec87b9f5c"
 dependencies = [
  "hash-db",
  "rlp",
+]
+
+[[package]]
+name = "tries"
+version = "0.1.0"
+source = "git+https://github.com/eez-association/stateless?rev=4fc3806bdd0e6b296c761ef4d4b260938365cf45#4fc3806bdd0e6b296c761ef4d4b260938365cf45"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-debug",
+ "alloy-trie",
+ "itertools 0.14.0",
+ "reth-trie-common 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-trie-sparse 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "revm-database-interface",
+ "thiserror 2.0.18",
+ "zeth-mpt",
 ]
 
 [[package]]
@@ -15663,6 +15716,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "zeth-mpt"
+version = "0.1.0"
+source = "git+https://github.com/eez-association/stateless?rev=4fc3806bdd0e6b296c761ef4d4b260938365cf45#4fc3806bdd0e6b296c761ef4d4b260938365cf45"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-trie",
+ "arrayvec",
 ]
 
 [[package]]
