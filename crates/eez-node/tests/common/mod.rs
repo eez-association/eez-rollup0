@@ -6,7 +6,7 @@
 
 use std::{
     collections::HashSet,
-    net::TcpListener,
+    net::{TcpListener, UdpSocket},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
@@ -79,24 +79,58 @@ pub fn anvil_bin() -> String {
     "anvil".to_string()
 }
 
+/// Probe a currently available TCP port.
+///
+/// The listener is released on return, so this is not a reservation.
 pub fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.local_addr().expect("local_addr").port()
 }
 
-fn unique_free_port(used: &mut HashSet<u16>) -> u16 {
+fn probe_unique_tcp_port(used: &mut HashSet<u16>) -> u16 {
     loop {
-        let port = free_port();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind TCP probe");
+        let port = listener.local_addr().expect("TCP probe local_addr").port();
         if used.insert(port) {
             return port;
         }
     }
 }
 
-/// Pick an HTTP port whose implicit `port + 1` WS listener is also free.
-fn unique_free_http_port(used: &mut HashSet<u16>) -> u16 {
+fn probe_unique_udp_port(used: &mut HashSet<u16>) -> u16 {
     loop {
-        let http_port = free_port();
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind UDP probe");
+        let port = socket.local_addr().expect("UDP probe local_addr").port();
+        if used.insert(port) {
+            return port;
+        }
+    }
+}
+
+fn probe_unique_tcp_udp_port(used: &mut HashSet<u16>) -> u16 {
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind TCP probe");
+        let port = listener.local_addr().expect("TCP probe local_addr").port();
+        if used.contains(&port) {
+            continue;
+        }
+        let Ok(socket) = UdpSocket::bind(("127.0.0.1", port)) else {
+            continue;
+        };
+        drop(socket);
+        used.insert(port);
+        return port;
+    }
+}
+
+/// Probe an HTTP port whose implicit `port + 1` WS listener is also available.
+fn probe_unique_http_port(used: &mut HashSet<u16>) -> u16 {
+    loop {
+        let http_listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP probe");
+        let http_port = http_listener
+            .local_addr()
+            .expect("HTTP probe local_addr")
+            .port();
         let Some(ws_port) = http_port.checked_add(1) else {
             continue;
         };
@@ -859,17 +893,21 @@ impl NodeHandle {
         let (stdout, stderr) = (Stdio::from(f), Stdio::from(f2));
         // Reth defaults collide if any test or unrelated process holds them.
         // Each NodeHandle picks its own ephemeral ports for authrpc / http / ws / p2p.
+        // These are availability probes, not reservations: the sockets are
+        // released before the child binds. The set prevents deterministic
+        // collisions among one node's listeners.
         let mut used_ports = HashSet::new();
-        let authrpc_port = unique_free_port(&mut used_ports);
-        let http_port = unique_free_port(&mut used_ports);
-        let ws_port = unique_free_port(&mut used_ports);
-        let p2p_port = unique_free_port(&mut used_ports);
-        let l1_http_port = unique_free_http_port(&mut used_ports);
-        let l1_auth_port = unique_free_port(&mut used_ports);
-        let l1_p2p_port = unique_free_port(&mut used_ports);
-        let l1_discv5_port = unique_free_port(&mut used_ports);
-        let l1_xchain_port = unique_free_port(&mut used_ports);
-        let l2_xchain_port = unique_free_port(&mut used_ports);
+        let authrpc_port = probe_unique_tcp_port(&mut used_ports);
+        let http_port = probe_unique_tcp_port(&mut used_ports);
+        let ws_port = probe_unique_tcp_port(&mut used_ports);
+        let p2p_port = probe_unique_tcp_port(&mut used_ports);
+        let l1_http_port = probe_unique_http_port(&mut used_ports);
+        let l1_auth_port = probe_unique_tcp_port(&mut used_ports);
+        // Embedded L1 uses this numeric port for RLPx TCP and discovery UDP.
+        let l1_p2p_port = probe_unique_tcp_udp_port(&mut used_ports);
+        let l1_discv5_port = probe_unique_udp_port(&mut used_ports);
+        let l1_xchain_port = probe_unique_tcp_port(&mut used_ports);
+        let l2_xchain_port = probe_unique_tcp_port(&mut used_ports);
         let l1_datadir = datadir.join("embedded-l1");
         // Genesis: an explicit genesis_path (reorg fixture) wins, else the
         // Harness's shared wall-clock genesis (TEST_L2_GENESIS_ENV — same chain
