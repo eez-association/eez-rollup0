@@ -2513,7 +2513,7 @@ impl CrossChainConfig {
                 self.l1_genesis.0.to_string_lossy().into_owned(),
             ),
             ("EEZ_L1_POSTER_KEY", self.poster_key.to_string()),
-            // MockECDSA authorizes the deployer.
+            // ECDSAProofSystem authorizes the deployer.
             ("EEZ_PROOF_SIGNER_KEY", self.deployer_key.to_string()),
             ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
             ("EEZL2_ADDRESS", format!("{EEZL2_ADDRESS:#x}")),
