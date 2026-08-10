@@ -1,4 +1,4 @@
-//! Solidity ABI types for the pinned `sync-rollups-protocol` contracts.
+//! Solidity ABI types for the pinned `eez-core-protocol` contracts.
 //!
 //! The L1 types mirror `IEEZ.sol`; the separate L2 family mirrors
 //! `IEEZL2.sol`. Field order and integer widths are part of the wire ABI.
@@ -119,6 +119,13 @@ sol! {
     );
 }
 
+/// Alias for the batch accepted by the protocol's `postAndVerifyBatch` ABI.
+///
+/// Composition builds partial batches containing source-side or target-side
+/// entries. Downstream settlement may merge them and attach state updates,
+/// proof-system metadata, and proofs.
+pub type EvmBatch = ProofSystemBatchPerVerificationEntriesSol;
+
 /// Events whose ABI differs specifically on `EEZL2`.
 pub mod eez_l2_events {
     use alloy_sol_types::sol;
@@ -204,7 +211,7 @@ sol! {
 
 #[cfg(test)]
 mod selector_locks {
-    //! ABI pins from `sync-rollups-protocol` commit 6fcc90b.
+    //! ABI pins from `eez-core-protocol` commit 6fcc90b.
     use super::*;
     use alloy_sol_types::SolCall;
 

@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-PROTOCOL="$REPO/sync-rollups-protocol"
+PROTOCOL="$REPO/eez-core-protocol"
 GENERATOR="$REPO/scripts/solidity/GenerateEEZL2Runtime.s.sol"
 FIXTURE_PROFILE="$REPO/testing/kurtosis/l2-genesis-profile.json"
 EXPECTED_FOUNDRY_VERSION="1.7.1"

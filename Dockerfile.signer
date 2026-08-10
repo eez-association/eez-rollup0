@@ -2,32 +2,31 @@
 
 FROM rust:1.94-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates clang cmake git libclang-dev libssl-dev pkg-config protobuf-compiler \
+        ca-certificates clang cmake git libclang-dev libssl-dev pkg-config protobuf-compiler mold \
     && rm -rf /var/lib/apt/lists/*
+# mold for fast final links; Docker-only on purpose — host builds keep
+# the default linker (see the matching comment in Dockerfile).
+ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 WORKDIR /build
 
 # Build the signer from the repository workspace and its shared lockfile.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-ARG CARGO_PROFILE_RELEASE_LTO=thin
-ARG CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
-ARG CARGO_PROFILE_RELEASE_DEBUG=1
-ENV CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO} \
-    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_PROFILE_RELEASE_CODEGEN_UNITS} \
-    CARGO_PROFILE_RELEASE_DEBUG=${CARGO_PROFILE_RELEASE_DEBUG} \
-    CARGO_TARGET_DIR=/build/target
+ENV CARGO_TARGET_DIR=/build/target
 
+# `release` (workspace profile: cgu=16, stripped, thin LTO) is the
+# fast-to-build default; BUILD_PROFILE=maxperf for production binaries.
+ARG BUILD_PROFILE=release
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=eez-proof-signer-target,target=/build/target,sharing=locked \
     cargo build \
-        --release \
+        --profile "$BUILD_PROFILE" \
         --locked \
         --package eez-proof-signer \
         --bin eez-proof-signer \
-    && install -D -m 0555 /build/target/release/eez-proof-signer /out/eez-proof-signer \
-    && strip /out/eez-proof-signer
+    && install -D -m 0555 "/build/target/$BUILD_PROFILE/eez-proof-signer" /out/eez-proof-signer
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends netcat-openbsd \

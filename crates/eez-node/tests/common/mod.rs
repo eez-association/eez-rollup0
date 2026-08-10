@@ -5,7 +5,8 @@
 #![allow(dead_code)]
 
 use std::{
-    net::TcpListener,
+    collections::HashSet,
+    net::{TcpListener, UdpSocket},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicUsize, Ordering},
@@ -78,9 +79,72 @@ pub fn anvil_bin() -> String {
     "anvil".to_string()
 }
 
+/// Probe a currently available TCP port.
+///
+/// The listener is released on return, so this is not a reservation.
 pub fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     listener.local_addr().expect("local_addr").port()
+}
+
+fn probe_unique_tcp_port(used: &mut HashSet<u16>) -> u16 {
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind TCP probe");
+        let port = listener.local_addr().expect("TCP probe local_addr").port();
+        if used.insert(port) {
+            return port;
+        }
+    }
+}
+
+fn probe_unique_udp_port(used: &mut HashSet<u16>) -> u16 {
+    loop {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind UDP probe");
+        let port = socket.local_addr().expect("UDP probe local_addr").port();
+        if used.insert(port) {
+            return port;
+        }
+    }
+}
+
+fn probe_unique_tcp_udp_port(used: &mut HashSet<u16>) -> u16 {
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind TCP probe");
+        let port = listener.local_addr().expect("TCP probe local_addr").port();
+        if used.contains(&port) {
+            continue;
+        }
+        let Ok(socket) = UdpSocket::bind(("127.0.0.1", port)) else {
+            continue;
+        };
+        drop(socket);
+        used.insert(port);
+        return port;
+    }
+}
+
+/// Probe an HTTP port whose implicit `port + 1` WS listener is also available.
+fn probe_unique_http_port(used: &mut HashSet<u16>) -> u16 {
+    loop {
+        let http_listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP probe");
+        let http_port = http_listener
+            .local_addr()
+            .expect("HTTP probe local_addr")
+            .port();
+        let Some(ws_port) = http_port.checked_add(1) else {
+            continue;
+        };
+        if used.contains(&http_port) || used.contains(&ws_port) {
+            continue;
+        }
+        let Ok(ws_listener) = TcpListener::bind(("127.0.0.1", ws_port)) else {
+            continue;
+        };
+        drop(ws_listener);
+        used.insert(http_port);
+        used.insert(ws_port);
+        return http_port;
+    }
 }
 
 pub struct Anvil {
@@ -140,6 +204,8 @@ impl Anvil {
         cmd.args([
             "--port",
             &port.to_string(),
+            "--chain-id",
+            &DEV_CHAIN_ID.to_string(),
             "--block-time",
             &cfg.block_time_secs.to_string(),
             "--silent",
@@ -373,7 +439,7 @@ impl Harness {
             ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
             ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
             ("EEZ_L1_POSTER_KEY", opts.poster_key.to_string()),
-            ("EEZ_L1_CHAIN_ID", "31337".to_string()),
+            ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
             ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
             ("EEZL2_ADDRESS", format!("{EEZL2_ADDRESS:#x}")),
@@ -827,16 +893,21 @@ impl NodeHandle {
         let (stdout, stderr) = (Stdio::from(f), Stdio::from(f2));
         // Reth defaults collide if any test or unrelated process holds them.
         // Each NodeHandle picks its own ephemeral ports for authrpc / http / ws / p2p.
-        let authrpc_port = free_port();
-        let http_port = free_port();
-        let ws_port = free_port();
-        let p2p_port = free_port();
-        let l1_http_port = free_port();
-        let mut l1_auth_port = free_port();
-        while l1_auth_port == l1_http_port || l1_auth_port == l1_http_port.saturating_add(1) {
-            l1_auth_port = free_port();
-        }
-        let l1_p2p_port = free_port();
+        // These are availability probes, not reservations: the sockets are
+        // released before the child binds. The set prevents deterministic
+        // collisions among one node's listeners.
+        let mut used_ports = HashSet::new();
+        let authrpc_port = probe_unique_tcp_port(&mut used_ports);
+        let http_port = probe_unique_tcp_port(&mut used_ports);
+        let ws_port = probe_unique_tcp_port(&mut used_ports);
+        let p2p_port = probe_unique_tcp_port(&mut used_ports);
+        let l1_http_port = probe_unique_http_port(&mut used_ports);
+        let l1_auth_port = probe_unique_tcp_port(&mut used_ports);
+        // Embedded L1 uses this numeric port for RLPx TCP and discovery UDP.
+        let l1_p2p_port = probe_unique_tcp_udp_port(&mut used_ports);
+        let l1_discv5_port = probe_unique_udp_port(&mut used_ports);
+        let l1_xchain_port = probe_unique_tcp_port(&mut used_ports);
+        let l2_xchain_port = probe_unique_tcp_port(&mut used_ports);
         let l1_datadir = datadir.join("embedded-l1");
         // Genesis: an explicit genesis_path (reorg fixture) wins, else the
         // Harness's shared wall-clock genesis (TEST_L2_GENESIS_ENV — same chain
@@ -890,6 +961,9 @@ impl NodeHandle {
         cmd.env("EEZ_L1_HTTP_PORT", l1_http_port.to_string())
             .env("EEZ_L1_AUTH_PORT", l1_auth_port.to_string())
             .env("EEZ_L1_P2P_PORT", l1_p2p_port.to_string())
+            .env("EEZ_L1_DISCV5_PORT", l1_discv5_port.to_string())
+            .env("EEZ_L1_XCHAIN_PORT", l1_xchain_port.to_string())
+            .env("EEZ_L2_XCHAIN_PORT", l2_xchain_port.to_string())
             .env("EEZ_L1_DATADIR", &l1_datadir)
             // May be overridden below when a test uses another L2 upstream.
             .env("EEZ_L2_RPC_URL", format!("http://127.0.0.1:{http_port}"));

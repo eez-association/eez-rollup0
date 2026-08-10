@@ -6,7 +6,7 @@ This document specifies the behavior of `eez-proof-signer` for the currently
 supported single-rollup profile. It is intentionally narrower than the complete
 EEZ protocol.
 
-The protocol source used by this profile is the `sync-rollups-protocol`
+The protocol source used by this profile is the `eez-core-protocol`
 submodule at commit
 `6fcc90b65063831cb7797e9fa361004064d28f9f`. Stateless execution uses
 `eez-association/stateless` at commit
@@ -1010,7 +1010,7 @@ The principal sources for this specification are:
 - `src/attest.rs` and `../eez-protocol/src/signer.rs` for attestation;
 - `../eez-protocol/src/abi.rs`, `action.rs`, `rolling_hash.rs`,
   `public_inputs.rs`, and `system_tx.rs` for shared protocol mirrors; and
-- `../../sync-rollups-protocol/src/interfaces/IEEZ.sol`, `EEZ.sol`,
+- `../../eez-core-protocol/src/interfaces/IEEZ.sol`, `EEZ.sol`,
   `src/interfaces/IEEZL2.sol`, `src/L2/EEZL2.sol`, and
   `src/rollupContract/Rollup.sol` for pinned protocol behavior; and
 - `../../contracts/src/ECDSAProofSystem.sol` for the deployed ECDSA verifier.

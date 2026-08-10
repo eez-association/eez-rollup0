@@ -138,7 +138,7 @@ cleanup() {
 trap cleanup EXIT
 
 ROOT_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
-PROTOCOL_COMMIT="$(git -C "$REPO/sync-rollups-protocol" rev-parse HEAD)"
+PROTOCOL_COMMIT="$(git -C "$REPO/eez-core-protocol" rev-parse HEAD)"
 sed \
     -e "s|^[[:space:]]*eez_node_image:.*|  eez_node_image: $EEZ_NODE_IMAGE|" \
     -e "s|^[[:space:]]*proof_signer_image:.*|  proof_signer_image: $EEZ_PROOF_SIGNER_IMAGE|" \

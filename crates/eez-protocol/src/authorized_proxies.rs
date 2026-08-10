@@ -24,10 +24,9 @@
 //! the constant.
 //!
 //! Both constants are consumed at config build time as the
-//! `authorized_proxies_slot: u8` field on
-//! [`crate::ProxyLookupConfig`]. The inspector reads
-//! [`proxy_mapping_key`] / [`decode_proxy_value`] directly via the
-//! `u8` slot.
+//! `authorized_proxies_slot: u8` field on [`ProxyLookupConfig`]. The
+//! inspector reads [`proxy_mapping_key`] / [`decode_proxy_value`]
+//! directly via the `u8` slot.
 
 use crate::RollupId;
 use alloy_primitives::{Address, B256, U256, keccak256};
@@ -46,6 +45,21 @@ pub const EEZ_AUTHORIZED_PROXIES_SLOT: u8 = 0;
 /// reasoning as [`EEZ_AUTHORIZED_PROXIES_SLOT`] — inherited from
 /// `EEZBase` at slot 0.
 pub const EEZL2_AUTHORIZED_PROXIES_SLOT: u8 = 0;
+
+/// Combined proxy-lookup configuration for a registered rollup.
+///
+/// `contract_address` identifies the chain-local manager and
+/// `authorized_proxies_slot` identifies its mapping slot. Both supported
+/// manager contracts inherit `authorizedProxies` at slot zero from `EEZBase`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxyLookupConfig {
+    /// Address of the contract holding `authorizedProxies` on this chain.
+    pub contract_address: Address,
+    /// Storage slot index where `authorizedProxies` lives on
+    /// `contract_address`. The inspector reads
+    /// `keccak256(addr ++ slot)` to find a registered proxy.
+    pub authorized_proxies_slot: u8,
+}
 
 /// Information about a registered cross-chain proxy.
 #[derive(Debug, Clone, PartialEq, Eq)]
