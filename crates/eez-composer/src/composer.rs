@@ -3236,6 +3236,27 @@ mod tests {
         );
     }
 
+    /// The pre-prove gate sizes the batch with a `MAX_PROOF_BYTES` stand-in for
+    /// the proof it does not have yet. That is only safe if the stand-in is a
+    /// worst case: longer than any real proof, and priced at the dearer
+    /// non-zero-byte rate. Both halves are pinned here — if a proof system ever
+    /// returns something bigger, this fails before the gate turns optimistic and
+    /// the signing-side ceiling has to catch it instead.
+    #[test]
+    fn proof_placeholder_is_a_worst_case() {
+        /// r‖s‖v — the attestation `ECDSAProofSystem` verifies.
+        const ECDSA_PROOF_BYTES: usize = 65;
+        assert!(MAX_PROOF_BYTES >= ECDSA_PROOF_BYTES);
+        // Non-zero bytes are 4 EIP-7623 tokens, zeros are 1, so an all-0xff
+        // stand-in prices above any real proof of the same length.
+        let placeholder = vec![0xffu8; MAX_PROOF_BYTES];
+        let real = vec![0x11u8; ECDSA_PROOF_BYTES];
+        assert!(calldata_floor_gas(&placeholder) >= calldata_floor_gas(&real));
+        assert!(calldata_floor_gas(&placeholder) >= calldata_floor_gas(&vec![0u8; MAX_PROOF_BYTES]));
+        // Monotonic in length, so a shorter real proof can never cost more.
+        assert!(calldata_floor_gas(&vec![0xffu8; 96]) <= calldata_floor_gas(&placeholder));
+    }
+
     #[test]
     fn empty_candidate_grid_is_highest_first() {
         // The pure half of boundary selection: which on-grid offsets below the
