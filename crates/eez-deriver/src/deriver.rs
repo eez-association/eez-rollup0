@@ -1160,7 +1160,7 @@ where
                 // Rebuild exactly the steps L1 ran; `skip > 0` = it resumed
                 // mid-chain (see `ProducingSlice`).
                 let slice = ProducingSlice::split(settlement, outbound.len(), inbound.len());
-                let ob_skip = slice.ob_skip;
+                let outbound_skip = slice.outbound_skip;
                 if slice.leaves_entries_unconsumed(outbound.len(), inbound.len()) {
                     event!(
                         name: "eez.deriver.reconcile.partial_consumption",
@@ -1168,18 +1168,18 @@ where
                         tx_hash = %tx_hash,
                         outbound = outbound.len(),
                         inbound = inbound.len(),
-                        ob_skip = slice.ob_skip,
-                        ob_take = slice.ob_take,
-                        ib_skip = slice.ib_skip,
-                        ib_take = slice.ib_take,
+                        outbound_skip = slice.outbound_skip,
+                        outbound_take = slice.outbound_take,
+                        inbound_skip = slice.inbound_skip,
+                        inbound_take = slice.inbound_take,
                         anchor_applied = settlement.start == 0,
                         "L1 ran only part of this batch; reconstructing exactly that slice",
                     );
                 }
-                outbound.drain(..slice.ob_skip);
-                outbound.truncate(slice.ob_take);
-                inbound.drain(..slice.ib_skip);
-                inbound.truncate(slice.ib_take);
+                outbound.drain(..slice.outbound_skip);
+                outbound.truncate(slice.outbound_take);
+                inbound.drain(..slice.inbound_skip);
+                inbound.truncate(slice.inbound_take);
 
                 // The Sync block is the LAST block of the range; its user txs are
                 // the tail of `decoded.transactions`. Pair the i-th outbound entry
@@ -1200,12 +1200,12 @@ where
                 // every pair shifts by one. Those user txs are dropped, not
                 // appended: they belong to steps a competing batch already landed,
                 // so replaying them would spend already-spent nonces.
-                if sync_user_txs.len() < ob_skip + outbound.len() {
+                if sync_user_txs.len() < outbound_skip + outbound.len() {
                     return Err(DeriverError::local_diverged_with_msg(
                         from_block,
                         &format!(
                             "outbound entries ({} skipped + {} applied) exceed Sync-block user txs ({})",
-                            ob_skip,
+                            outbound_skip,
                             outbound.len(),
                             sync_user_txs.len(),
                         ),
@@ -1214,7 +1214,7 @@ where
                 let outbound_paired: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)> = outbound
                     .iter()
                     .cloned()
-                    .zip(sync_user_txs[ob_skip..].iter().cloned())
+                    .zip(sync_user_txs[outbound_skip..].iter().cloned())
                     .collect();
 
                 // Stash for the post-replay gate — it needs the
@@ -1240,7 +1240,8 @@ where
                         .into_iter()
                         .map(|b| b.to_vec())
                         .collect();
-                for t in &decoded.transactions[sync_user_start + ob_skip + outbound_paired.len()..]
+                for t in
+                    &decoded.transactions[sync_user_start + outbound_skip + outbound_paired.len()..]
                 {
                     full.push(t.clone());
                 }
@@ -1524,35 +1525,36 @@ where
 /// drop from the FRONT — which prefix truncation cannot express.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProducingSlice {
-    ob_skip: usize,
-    ob_take: usize,
-    ib_skip: usize,
-    ib_take: usize,
+    outbound_skip: usize,
+    outbound_take: usize,
+    inbound_skip: usize,
+    inbound_take: usize,
 }
 
 impl ProducingSlice {
     /// Project `settlement`'s producing run onto lists of the given lengths.
     fn split(settlement: eez_l1::Settlement, outbound_len: usize, inbound_len: usize) -> Self {
         let (skip, take) = settlement.producing_slice();
-        let ob_skip = skip.min(outbound_len);
-        let ob_take = take.min(outbound_len - ob_skip);
+        let outbound_skip = skip.min(outbound_len);
+        let outbound_take = take.min(outbound_len - outbound_skip);
         // Any skip beyond the outbound list falls through into inbound.
-        let ib_skip = skip.saturating_sub(ob_skip).min(inbound_len);
-        let ib_take = take
-            .saturating_sub(ob_take)
-            .min(inbound_len - ib_skip.min(inbound_len));
+        let inbound_skip = skip.saturating_sub(outbound_skip).min(inbound_len);
+        let inbound_take = take
+            .saturating_sub(outbound_take)
+            .min(inbound_len - inbound_skip.min(inbound_len));
         Self {
-            ob_skip,
-            ob_take,
-            ib_skip,
-            ib_take,
+            outbound_skip,
+            outbound_take,
+            inbound_skip,
+            inbound_take,
         }
     }
 
     /// True when entries are left over at the TAIL (partial consumption). A pure
     /// mid-chain resume does NOT trip this — front skips are counted in `*_skip`.
     const fn leaves_entries_unconsumed(&self, outbound_len: usize, inbound_len: usize) -> bool {
-        self.ob_skip + self.ob_take < outbound_len || self.ib_skip + self.ib_take < inbound_len
+        self.outbound_skip + self.outbound_take < outbound_len
+            || self.inbound_skip + self.inbound_take < inbound_len
     }
 }
 
@@ -1589,7 +1591,7 @@ mod producing_slice_tests {
 
     /// The superseded reconstruction: keep `settled_count - 1` entries from the
     /// FRONT (outbound first, then inbound). Its skips are structurally 0 — the
-    /// defect. Shaped as `(ob_skip, ob_take, ib_skip, ib_take)` to compare.
+    /// defect. Shaped as `(outbound_skip, outbound_take, inbound_skip, inbound_take)` to compare.
     fn old_prefix_split(
         settled_count: usize,
         outbound_len: usize,
@@ -1617,10 +1619,10 @@ mod producing_slice_tests {
         assert_eq!(
             s,
             ProducingSlice {
-                ob_skip: 0,
-                ob_take: 0,
-                ib_skip: 0,
-                ib_take: 1
+                outbound_skip: 0,
+                outbound_take: 0,
+                inbound_skip: 0,
+                inbound_take: 1
             },
         );
         assert!(!s.leaves_entries_unconsumed(0, 1));
@@ -1636,10 +1638,10 @@ mod producing_slice_tests {
         assert_eq!(
             s,
             ProducingSlice {
-                ob_skip: 0,
-                ob_take: 0,
-                ib_skip: 1,
-                ib_take: 1,
+                outbound_skip: 0,
+                outbound_take: 0,
+                inbound_skip: 1,
+                inbound_take: 1,
             },
         );
         // Front skips are counted, so nothing reads as left over.
@@ -1647,15 +1649,15 @@ mod producing_slice_tests {
 
         let old = old_prefix_split(1, 0, 2);
         assert_eq!(old, (0, 0, 0, 0), "prefix formula rebuilds nothing here");
-        assert_ne!((old.2, old.3), (s.ib_skip, s.ib_take));
+        assert_ne!((old.2, old.3), (s.inbound_skip, s.inbound_take));
     }
 
     /// A skip longer than the outbound list falls through into inbound.
     #[test]
     fn skip_and_take_span_outbound_into_inbound() {
         let s = ProducingSlice::split(settlement(3, 2), 2, 3);
-        assert_eq!((s.ob_skip, s.ob_take), (2, 0));
-        assert_eq!((s.ib_skip, s.ib_take), (0, 2));
+        assert_eq!((s.outbound_skip, s.outbound_take), (2, 0));
+        assert_eq!((s.inbound_skip, s.inbound_take), (0, 2));
     }
 
     /// Anchor ran: producing entries are `len - 1`, nothing skipped. The ordinary
@@ -1663,11 +1665,11 @@ mod producing_slice_tests {
     #[test]
     fn anchor_applied_matches_the_prefix_formula() {
         let s = ProducingSlice::split(settlement(0, 3), 1, 1);
-        assert_eq!(s.ob_skip, 0);
-        assert_eq!(s.ib_skip, 0);
-        assert_eq!((s.ob_take, s.ib_take), (1, 1));
+        assert_eq!(s.outbound_skip, 0);
+        assert_eq!(s.inbound_skip, 0);
+        assert_eq!((s.outbound_take, s.inbound_take), (1, 1));
         let old = old_prefix_split(3, 1, 1);
-        assert_eq!((old.1, old.3), (s.ob_take, s.ib_take));
+        assert_eq!((old.1, old.3), (s.outbound_take, s.inbound_take));
     }
 
     /// L1 stopped SHORT (a reverting user tx left its entry and the rest
@@ -1675,7 +1677,7 @@ mod producing_slice_tests {
     #[test]
     fn stopping_short_truncates_the_tail() {
         let s = ProducingSlice::split(settlement(0, 2), 0, 3);
-        assert_eq!((s.ib_skip, s.ib_take), (0, 1));
+        assert_eq!((s.inbound_skip, s.inbound_take), (0, 1));
         assert!(s.leaves_entries_unconsumed(0, 3));
     }
 
@@ -1683,10 +1685,10 @@ mod producing_slice_tests {
     #[test]
     fn oversized_run_clamps_to_available_entries() {
         let s = ProducingSlice::split(settlement(0, 99), 1, 1);
-        assert_eq!((s.ob_take, s.ib_take), (1, 1));
+        assert_eq!((s.outbound_take, s.inbound_take), (1, 1));
         let s = ProducingSlice::split(settlement(50, 99), 1, 1);
-        assert_eq!(s.ob_skip + s.ob_take, 1);
-        assert_eq!(s.ib_skip + s.ib_take, 1);
+        assert_eq!(s.outbound_skip + s.outbound_take, 1);
+        assert_eq!(s.inbound_skip + s.inbound_take, 1);
     }
 }
 
