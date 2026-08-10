@@ -9,7 +9,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::AbortHandle;
 use tokio::time::{Instant, timeout_at};
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{Level, Span, debug, error, info, trace, warn};
+use tracing::{Level, Span, debug, error, event, info, trace, warn};
 
 use super::ProveSvc;
 use super::settlement_job::{AttestationMaterial, validate_and_settle};
@@ -170,7 +170,10 @@ impl Prover for ProveSvc {
             None,
         )?;
 
-        info!(
+        event!(
+            name: "eez.proof_signer.window_signed",
+            Level::INFO,
+            event_name = "eez.proof_signer.window_signed",
             phase = "attestation",
             validated_from_block = declared_from_block,
             validated_to_block = declared_to_block,

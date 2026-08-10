@@ -7,110 +7,92 @@
 //!   Composition
 //!   ├── source:  SourceComposition
 //!   │             ├── rollup_id          : RollupId
-//!   │             ├── batch              : EvmBatch              table-loading batch
-//!   │             └── entry_payload      : Vec<u8>               encoded entry-chain calldata
-//!   │                                                            (L1-style: postAndVerifyBatch; L2-style: loadExecutionTable)
+//!   │             └── batch              : EvmBatch
 //!   │
-//!   └── targets: Vec<TargetComposition>                          one per target rollup, ordered
+//!   └── targets: Vec<TargetComposition>              non-empty targets, sorted by rollup ID
 //!                 ├── rollup_id            : RollupId
-//!                 ├── batch                : EvmBatch             table-loading batch
-//!                 ├── load_table_payload   : Vec<u8>              encoded load-execution-table calldata
-//!                 └── execute_payload      : Vec<u8>              encoded execute-cross-chain-call calldata
+//!                 └── batch                : EvmBatch
 //! ```
 //!
-//! Both sides carry the batch AND pre-encoded calldata so callers can
-//! either re-hash / verify the batch themselves or ship the payload
-//! straight into a wallet for signing + broadcast.
+//! `Composition` contains structured `EvmBatch` values, not encoded transaction
+//! calldata. Finalization converts each recorded call into entries for the entry
+//! rollup and the destination rollup. Downstream code consumes those entries to
+//! build system transactions and, for settlement, may merge batches and attach
+//! state updates and proof data before encoding submission calldata.
 
 use alloy_primitives::{Address, Bytes, U256};
 use serde::{Deserialize, Serialize};
 
-use crate::batch::EvmBatch;
+use crate::abi::EvmBatch;
+use crate::action::CallMode;
 use crate::rollup_id::RollupId;
 
-/// A cross-chain call detected, dispatched, and recorded with its
-/// execution outcome.
+/// A recorded cross-chain call and its target execution status.
 ///
-/// The outcome field is non-optional: `CompositionBuilder::dispatch_call`
-/// (the only constructor) runs after the target session has produced an
-/// outcome, so holding a `ExecutedAction` means the result is present.
+/// [`CompositionBuilder::open_call`](crate::CompositionBuilder::open_call)
+/// inserts the action with [`ExecutionOutcome::Pending`] before dispatching
+/// target execution. [`CompositionBuilder::close_call`](crate::CompositionBuilder::close_call)
+/// replaces it with the resolved result.
+/// Recording before target execution preserves preorder when execution
+/// dispatches nested calls.
 ///
-/// The action hash is not stored here. It is a derived value
-/// [`crate::entries::build_batch`] computes from these raw fields when
-/// building entries, keeping it the single source of truth for hashes.
+/// An `ExecutedAction` is not an ABI entry. Finalization can derive both
+/// source-side and target-side entries from the same recorded call.
+///
+/// Protocol call hashes are derived from these fields during entry
+/// materialization.
 #[derive(Debug, Clone)]
 pub struct ExecutedAction {
-    /// Address of the target contract on the target chain.
-    /// Spec: `Action.targetAddress` / `L2ToL1Call.targetAddress`.
+    /// Call mode observed at interception and committed to the call hash.
+    /// Current composition materialization accepts only mutable calls.
+    pub call_mode: CallMode,
+    /// Address invoked on the destination chain.
     pub target_address: Address,
-    /// Rollup ID of the target chain. Spec: `Action.targetRollupId`.
+    /// Rollup ID of the destination chain.
     pub target_rollup_id: RollupId,
-    /// Rollup ID of the chain that triggered this call. Spec:
-    /// `Action.sourceRollupId` / `L2ToL1Call.sourceRollupId`.
+    /// Rollup on which the intercepted call executed.
     ///
-    /// For top-level calls detected during source simulation: equal to
-    /// the entry rollup id. For nested calls dispatched by target-session
-    /// inspectors: the rollup id of the session that dispatched.
-    ///
-    /// Load-bearing for nested action-hash correctness: the upstream
-    /// CCM contracts emit `sourceRollupId = ROLLUP_ID` (their own id)
-    /// on nested cross-chain calls.
+    /// For a top-level call this is the entry rollup. For a nested dispatch it
+    /// is the rollup hosting the target session that observed the nested call.
+    /// This value participates in cross-chain call-hash derivation.
     pub source_rollup_id: RollupId,
-    /// Address of the caller on the source chain. Spec:
-    /// `Action.sourceAddress` / `L2ToL1Call.sourceAddress`.
+    /// Address of the caller on the source chain.
     pub source_address: Address,
-    /// Calldata for the cross-chain call. Spec: `Action.data`.
+    /// Calldata for the cross-chain call.
     pub data: Bytes,
-    /// Value transferred with the call. Spec: `Action.value`.
+    /// Native value transferred with the call.
     pub value: U256,
-    /// Execution outcome from the target-chain executor. `Pending`
-    /// from `Dispatcher::open_call` until `Dispatcher::close_call`
-    /// resolves it; `Resolved { .. }` thereafter.
+    /// Target execution result for this call.
     pub outcome: ExecutionOutcome,
-    /// Length of the revert span (in `recorded[..]` indices,
-    /// inclusive of this call) when this call's outer EVM frame
-    /// reverted. `None` for calls whose frames returned successfully
-    /// or whose revert was not observed.
+    /// Number of consecutive recorded calls covered by a reverted EVM frame,
+    /// starting with this call. Only the first call in a span carries this
+    /// value; `None` means no enclosing revert was observed.
     ///
-    /// Maps directly to the on-chain `L2ToL1Call.revertSpan` field
-    /// for top-level calls (see `IEEZ.sol`'s `L2ToL1Call` struct
-    /// under the multi-prover protocol; formerly
-    /// `CrossChainCall.revertSpan`). Populated post-close by
+    /// The materializer rejects calls with a revert span, preventing
+    /// reverted calls from being emitted as successful entries. The inspector
+    /// normally populates it after execution through
     /// [`CompositionBuilder::annotate_revert_span`](crate::CompositionBuilder::annotate_revert_span)
-    /// when the inspector observes the frame returning with
-    /// `InstructionResult::Revert`.
+    /// when it observes a reverted frame.
     pub revert_span: Option<u32>,
 }
 
-/// Lifecycle outcome of a recorded call.
+/// Target execution result for a recorded cross-chain call.
 ///
-/// The dispatch lifecycle is two-phase: `open_call` pushes a
-/// `Pending` record and returns its index; `close_call` rewrites
-/// that slot with `Resolved { .. }` once the target session has
-/// produced a real result. The split exists because the index must
-/// be fixed BEFORE recursing into `session.execute` — that's what
-/// makes `recorded[..]` preorder rather than post-order, which in
-/// turn makes the `revertSpan = recorded_count() - frame_start`
-/// arithmetic at `Inspector::call_end` correct without tree
-/// reconstruction.
-///
-/// Does NOT carry the checkpoint (overlay + witness); that lives on
-/// [`ExecutionResponse`](crate::ExecutionResponse).
+/// `open_call` records `Pending` before execution, fixing the action's preorder
+/// position, and `close_call` replaces it with `Resolved`. Session rollback
+/// checkpoints are maintained separately by
+/// [`CompositionBuilder`](crate::CompositionBuilder).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionOutcome {
     /// `open_call` placeholder. Replaced with `Resolved` by `close_call`.
     Pending,
     /// Final outcome supplied by the target session.
     Resolved {
-        /// Raw bytes returned by the call. Empty if the call returns nothing.
+        /// Raw target-EVM output, including revert data for an unsuccessful call.
         return_data: Vec<u8>,
-        /// State root before this call was executed.
-        pre_state_root: [u8; 32],
-        /// State root after this call completed.
-        post_state_root: [u8; 32],
         /// Gas consumed by this call.
         gas_used: u64,
-        /// `false` if the call reverted.
+        /// Whether target EVM execution completed successfully.
         success: bool,
     },
 }
@@ -127,26 +109,6 @@ impl ExecutionOutcome {
     #[must_use]
     pub fn is_pending(&self) -> bool {
         matches!(self, Self::Pending)
-    }
-
-    /// Borrow the post-state-root if resolved.
-    #[must_use]
-    pub fn post_state_root(&self) -> Option<&[u8; 32]> {
-        match self {
-            Self::Pending => None,
-            Self::Resolved {
-                post_state_root, ..
-            } => Some(post_state_root),
-        }
-    }
-
-    /// Borrow the pre-state-root if resolved.
-    #[must_use]
-    pub fn pre_state_root(&self) -> Option<&[u8; 32]> {
-        match self {
-            Self::Pending => None,
-            Self::Resolved { pre_state_root, .. } => Some(pre_state_root),
-        }
     }
 
     /// Borrow the return-data if resolved.
@@ -168,49 +130,36 @@ impl ExecutionOutcome {
     }
 }
 
-/// Source-chain output inside a `Composition`.
-///
-/// Mirrors [`TargetComposition`] so both sides of the composition carry
-/// raw entries AND pre-encoded calldata.
+/// Source-side execution batch for the entry rollup.
 #[derive(Debug, Clone)]
 pub struct SourceComposition {
-    /// Rollup ID of the source chain.
+    /// Entry rollup whose transaction was simulated.
     pub rollup_id: RollupId,
-    /// Table-loading batch the source rollup will consume.
+    /// Source-side entries derived from calls observed during simulation.
     pub batch: EvmBatch,
-    /// Encoded calldata for the entry-chain tx that loads `batch`.
-    /// Dialect-dependent: L1-style emits `postAndVerifyBatch(...)`;
-    /// L2-style emits `loadExecutionTable(...)`.
-    pub entry_payload: Vec<u8>,
 }
 
-/// Per-target output inside a `Composition`.
+/// Target-side batch for one non-entry rollup reached by recorded calls.
 ///
-/// Uses `Vec` (not `HashMap`) for ordering — upstream's invariant 2
-/// requires deterministic output from identical inputs.
+/// L1 targets contain immediate post-batch entries. L2 targets contain inbound
+/// sidecar entries used to construct system transactions.
 #[derive(Debug, Clone)]
 pub struct TargetComposition {
-    /// Rollup ID of the target chain this entry describes.
+    /// Destination rollup represented by this target batch.
     pub rollup_id: RollupId,
-    /// Table-loading batch this target rollup will consume.
+    /// Target-side entries derived from calls addressed to `rollup_id`.
     pub batch: EvmBatch,
-    /// Encoded payload for loading the target execution table.
-    pub load_table_payload: Vec<u8>,
-    /// Encoded payload for executing the first cross-chain call.
-    pub execute_payload: Vec<u8>,
 }
 
-/// Output of [`CompositionBuilder::finalize`](crate::CompositionBuilder::finalize) —
-/// everything needed for all chains.
+/// Source and target batches derived from one simulated entry transaction by
+/// [`CompositionBuilder::finalize`](crate::CompositionBuilder::finalize).
 ///
-/// Symmetric: the source side and every target side both carry entries
-/// AND pre-encoded calldata. Callers wrap each payload in a tx of their
-/// choice to finalize. `targets` ordering is significant (invariant 2).
-/// N=2 means `targets` has exactly one element; the design supports any N.
+/// Target outputs are non-empty and sorted by rollup ID. Transaction
+/// construction and settlement occur downstream.
 #[derive(Debug, Clone)]
 pub struct Composition {
-    /// Source-chain output (exactly one source per composition).
+    /// Batch output for the entry/source rollup.
     pub source: SourceComposition,
-    /// Per-target outputs, one per target rollup. Order is significant.
+    /// Non-empty target outputs, sorted by rollup ID.
     pub targets: Vec<TargetComposition>,
 }

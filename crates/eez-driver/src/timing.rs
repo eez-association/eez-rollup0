@@ -8,14 +8,14 @@
 //! - `proof_time_ms` — worst-case prover wall-clock budget.
 //! - `submission_slack_ms` — how early the proven bundle must reach the
 //!   relay before the next L1 slot. With `proof_time`, sizes the Future
-//!   region (see [`Self::future_count`]). Default 100 ms.
+//!   region (see [`RollupTiming::future_count`]). Default 100 ms.
 //!
-//! Derived helpers ([`Self::k`], [`Self::future_count`], [`Self::live_count`],
-//! [`Self::per_trigger_composition`]) compute the per-sync-slot block layout
-//! deterministically from these four fields. No I/O, no allocation; the
-//! Sequencer calls them once per trigger.
+//! Derived helpers ([`RollupTiming::k`], [`RollupTiming::future_count`],
+//! [`RollupTiming::live_count`], [`RollupTiming::per_trigger_composition`])
+//! compute the per-sync-slot block layout deterministically from these four
+//! fields. No I/O, no allocation; the Sequencer calls them once per trigger.
 //!
-//! Validation ([`Self::validate`]) refuses any of: non-integer K, K < 2,
+//! Validation ([`RollupTiming::validate`]) refuses any of: non-integer K, K < 2,
 //! `proof_time + slack ≥ l1_block_time`, `proof_time > (K-1) * l2_block_time`,
 //! or any zero field. Hard error at startup per `invariant 7` — the
 //! Sequencer refuses to start on misconfig rather than producing surprising
@@ -99,8 +99,8 @@ impl RollupTiming {
     ///
     /// # Errors
     ///
-    /// Returns [`DriverError::is_timing_config`] for any missing
-    /// required var, malformed value, or validation failure.
+    /// Returns [`DriverError`] for any missing required variable, malformed
+    /// value, or validation failure.
     pub fn from_env() -> DriverResult<Self> {
         let t = Self::new(
             parse_env(ENV_L1_BLOCK_TIME_MS)?,
@@ -128,7 +128,7 @@ impl RollupTiming {
     ///
     /// # Errors
     ///
-    /// Returns [`DriverError::is_timing_config`] for any of:
+    /// Returns [`DriverError`] for any of:
     /// - any zero field
     /// - `L2_block_time % 1000 != 0` — L2 block time must be whole
     ///   seconds. Block timestamps are unix integer-seconds and the

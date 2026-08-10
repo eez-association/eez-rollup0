@@ -59,10 +59,10 @@ fn settlement_pipeline_errors_have_stable_rpc_mappings() {
             "block_inspection",
         ),
         (
-            SettlementPipelineError::StateDeltaChain(
-                crate::settlement::StateDeltaChainError::NoEntries,
+            SettlementPipelineError::StateUpdateChain(
+                crate::settlement::StateUpdateChainError::NoEntries,
             ),
-            "state_delta_chain",
+            "state_update_chain",
         ),
         (
             SettlementPipelineError::EffectPrefix(
@@ -233,6 +233,7 @@ fn cancelled_settlement_stops_before_decoding_untrusted_input() {
         submitted_post_batch_calldata: b"not ABI calldata".to_vec(),
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
+        expected_l2_system_address: TEST_SYSTEM_ADDRESS,
         proof_system_vkey: test_proof_system_vkey(),
         expected_proof_system: test_proof_system(),
         system_transaction_reconstructor: &system_transaction_reconstructor,
@@ -295,21 +296,21 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
 
     let mut batch = anchor_batch();
     batch.entries.push(ExecutionEntrySol {
-        stateDeltas: vec![StateDeltaSol {
-            rollupId: U256::from(1),
+        stateUpdates: vec![StateUpdateSol {
+            rollupId: 1,
             currentState: B256::ZERO,
             newState: B256::ZERO,
             etherDelta: I256::try_from(value).unwrap(),
         }],
         proxyEntryHash: call_hash,
-        destinationRollupId: U256::from(1),
         l2ToL1Calls: Vec::new(),
         expectedL1ToL2Calls: Vec::new(),
-        expectedLookups: Vec::new(),
-        callCount: U256::ZERO,
-        returnData: return_data,
         rollingHash: B256::ZERO,
+        destinationRollupId: 1,
+        success: true,
+        returnData: return_data,
     });
+    eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
     batch.callData = settlement::encode_da_payload(&[Vec::new()], &[sidecar.abi_encode()]).into();
     let expected_hash = recompute_test_public_inputs_hash(&batch);
     let calldata = eez_protocol::entries::encode_postbatch(&batch);
@@ -324,6 +325,7 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
         submitted_post_batch_calldata: calldata,
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
+        expected_l2_system_address: TEST_SYSTEM_ADDRESS,
         proof_system_vkey: test_proof_system_vkey(),
         expected_proof_system: test_proof_system(),
         system_transaction_reconstructor: &system_transaction_reconstructor,
@@ -341,10 +343,8 @@ fn a_fully_bound_outbound_effect_is_authorized() {
         block_rlp,
         validate::SettlementBlockEvidence::for_test(
             vec![true, false],
-            vec![validate::OutboundEventObservation::for_test(
-                1,
-                0,
-                Some(call_hash),
+            vec![validate::OutboundEventObservation::decoded_for_test(
+                1, 0, call_hash, 0,
             )],
         ),
     );
@@ -361,6 +361,7 @@ fn a_fully_bound_outbound_effect_is_authorized() {
         submitted_post_batch_calldata: calldata,
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
+        expected_l2_system_address: TEST_SYSTEM_ADDRESS,
         proof_system_vkey: test_proof_system_vkey(),
         expected_proof_system: test_proof_system(),
         system_transaction_reconstructor: &system_transaction_reconstructor,
@@ -378,6 +379,7 @@ fn a_fully_bound_outbound_effect_is_authorized() {
         submitted_post_batch_calldata: mismatched_calldata,
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
+        expected_l2_system_address: TEST_SYSTEM_ADDRESS,
         proof_system_vkey: test_proof_system_vkey(),
         expected_proof_system: test_proof_system(),
         system_transaction_reconstructor: &system_transaction_reconstructor,

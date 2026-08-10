@@ -24,9 +24,8 @@ the spec are appropriate in repository documentation.
 
 ## Current implementation
 
-- Production always uses the in-process Stateless backend. Stateful and ZisK
-  backends are future work and are not selectable; the stub backend exists only
-  in tests.
+- Production always uses the in-process Stateless backend. No alternative
+  backend is selectable; the stub backend exists only in tests.
 - Exactly one request may be active across all connections. An overlap is
   rejected, not queued. The request permit covers ingestion through response
   construction and remains with a running detached worker until it exits.
@@ -76,10 +75,9 @@ See [architecture](docs/architecture.md),
 Use the shared workspace definitions instead of locally reproducing protocol
 algorithms, including:
 
-- `eez_protocol::entries::{decode_postbatch, encode_postbatch, decode_inbound,
-  outbound_ether_out}`;
+- `eez_protocol::entries::{decode_postbatch, encode_postbatch}`;
 - `eez_protocol::public_inputs::public_inputs_hashes`;
-- `eez_protocol::{cross_chain_call_hash, EcdsaProofSigner, SYSTEM_ADDRESS}`;
+- `eez_protocol::{common_cross_chain_call_hash, EcdsaProofSigner}`;
 - `eez_protocol::settlement::pair_end_positions`;
 - `eez_protocol::system_tx::{build_cross_chain_sync_pairs,
   interleave_sync_block_txs}`; and
@@ -89,13 +87,18 @@ System classification itself uses the backend's fork-aware recovered-sender
 evidence plus the exact transaction recipient. Do not replace it with a second
 settlement-side recovery merely to call a helper.
 
+Shared Composer-oriented entry helpers are building blocks, not signer
+authorization gates. They do not replace the stricter canonical decoding,
+execution binding, value, call-hash, and outcome checks in `settlement/`.
+
 ## Pinned Stateless fork
 
 The production dependency pins an exact commit from
 [`eez-association/stateless`](https://github.com/eez-association/stateless)
-directly in this crate's `Cargo.toml`. The fork exposes the computed pre-state
-and post-state roots and selected transaction-state checkpoints while
-preserving upstream Stateless/Reth consensus and execution validation.
+in the workspace root `Cargo.toml`; this crate consumes it through its workspace
+dependency. The fork exposes the computed pre-state and post-state roots and
+selected transaction-state checkpoints while preserving upstream
+Stateless/Reth consensus and execution validation.
 
 Keep changes to this fork narrow. Do not duplicate or replace upstream block,
 transaction-root, ommer, withdrawal, receipt, gas, or final-state validation.

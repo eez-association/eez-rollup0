@@ -5,7 +5,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use alloy_primitives::{Address, B256, Bytes};
-use eez_protocol::{EcdsaProofSigner, SYSTEM_ADDRESS, SignerError};
+use eez_protocol::{EcdsaProofSigner, SignerError};
 use thiserror::Error;
 
 use crate::service::AttestablePublicInputsHash;
@@ -46,12 +46,14 @@ impl fmt::Display for NonZeroProofSystemVkey {
 /// attestation configuration. The proof-system vkey is deliberately
 /// independent from the signing address: deployments may register a
 /// proof-system-specific vkey.
-/// The signing address must also differ from [`SYSTEM_ADDRESS`], whose key has
-/// separate authority to create reserved L2 transactions.
+/// The signing address must also differ from the deployment-configured L2
+/// system address, whose key has separate authority to create system
+/// transactions.
 pub(crate) struct Attester {
     signer: EcdsaProofSigner,
     proof_system_vkey: NonZeroProofSystemVkey,
     expected_proof_system: Address,
+    expected_l2_system_address: Address,
 }
 
 impl fmt::Debug for Attester {
@@ -61,6 +63,10 @@ impl fmt::Debug for Attester {
             .field("address", &self.address())
             .field("proof_system_vkey", &self.proof_system_vkey)
             .field("expected_proof_system", &self.expected_proof_system)
+            .field(
+                "expected_l2_system_address",
+                &self.expected_l2_system_address,
+            )
             .finish()
     }
 }
@@ -83,6 +89,7 @@ impl Attester {
         attestation_private_key: B256,
         proof_system_vkey: NonZeroProofSystemVkey,
         expected_proof_system: Address,
+        expected_l2_system_address: Address,
     ) -> Result<Self, AttesterConfigError> {
         if expected_proof_system == Address::ZERO {
             return Err(AttesterConfigError::ZeroProofSystem);
@@ -91,13 +98,14 @@ impl Attester {
             .map_err(|_| AttesterConfigError::InvalidPrivateKey)?;
         // System-transaction signing and public-input attestation are separate
         // authorities; one key must never confer both capabilities.
-        if signer.address() == SYSTEM_ADDRESS {
+        if signer.address() == expected_l2_system_address {
             return Err(AttesterConfigError::ReservedSystemAddress);
         }
         Ok(Self {
             signer,
             proof_system_vkey,
             expected_proof_system,
+            expected_l2_system_address,
         })
     }
 
@@ -116,6 +124,11 @@ impl Attester {
         self.expected_proof_system
     }
 
+    /// Return the deployment identity excluded from attestation authority.
+    pub(crate) const fn expected_l2_system_address(&self) -> Address {
+        self.expected_l2_system_address
+    }
+
     /// Sign a digest authorized by the complete request pipeline, without an
     /// EIP-191 prefix.
     pub(crate) fn sign(
@@ -131,6 +144,7 @@ mod tests {
     use alloy_primitives::{address, b256};
 
     use super::*;
+    use crate::testkit::{SYSTEM_PRIVATE_KEY, TEST_SYSTEM_ADDRESS};
 
     fn test_proof_system_vkey() -> NonZeroProofSystemVkey {
         NonZeroProofSystemVkey::new(B256::repeat_byte(0x42)).unwrap()
@@ -150,6 +164,7 @@ mod tests {
             attestation_key,
             test_proof_system_vkey(),
             test_proof_system(),
+            TEST_SYSTEM_ADDRESS,
         )
         .unwrap();
 
@@ -160,12 +175,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_the_reserved_system_identity_without_exposing_its_key() {
-        // Anvil account #0 derives the protocol's reserved system address.
-        let system_key = b256!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
+    fn system_identity_is_selected_by_deployment() {
+        let attester = Attester::new(
+            SYSTEM_PRIVATE_KEY,
+            test_proof_system_vkey(),
+            test_proof_system(),
+            Address::repeat_byte(0xbb),
+        )
+        .unwrap();
 
-        let error =
-            Attester::new(system_key, test_proof_system_vkey(), test_proof_system()).unwrap_err();
+        assert_eq!(attester.address(), TEST_SYSTEM_ADDRESS);
+    }
+
+    #[test]
+    fn rejects_the_reserved_system_identity_without_exposing_its_key() {
+        let error = Attester::new(
+            SYSTEM_PRIVATE_KEY,
+            test_proof_system_vkey(),
+            test_proof_system(),
+            TEST_SYSTEM_ADDRESS,
+        )
+        .unwrap_err();
         let displayed = error.to_string();
 
         assert_eq!(error, AttesterConfigError::ReservedSystemAddress);
@@ -173,6 +203,6 @@ mod tests {
             displayed,
             "attestation key must not derive the reserved L2 system address"
         );
-        assert!(!displayed.contains(&system_key.to_string()));
+        assert!(!displayed.contains(&SYSTEM_PRIVATE_KEY.to_string()));
     }
 }

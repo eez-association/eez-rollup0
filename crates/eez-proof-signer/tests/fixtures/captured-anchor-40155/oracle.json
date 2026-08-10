@@ -1,0 +1,22 @@
+{
+  "network": "chiado",
+  "captured_at": "2026-08-04T09:24:01Z",
+  "protocol_commit": "6fcc90b65063831cb7797e9fa361004064d28f9f",
+  "l1_transaction_hash": "0xf0440f5964ca692f51389032fc07e295173f504e99c86f174d66859c2c23ee26",
+  "l1_block_number": 22404583,
+  "l1_block_hash": "0xff940d379f57ccea1e7dcda95c83e7309ddd07d3cd68e35dff3803ca4d177aa4",
+  "rollup_id": 1,
+  "from_block": 40146,
+  "to_block": 40155,
+  "l2_chain_id": 1,
+  "l2_system_address": "0x1Bfd85fa86D9529A639Ebb18d0c1f0FE7eE39a17",
+  "proof_system": "0xa4d426365df96d4bf49d903245eb875d062017fe",
+  "proof_system_vkey": "0x00000000000000000000000007a664a2Aaef627811ade993DBdd8679dC807843",
+  "attester": "0x07a664a2Aaef627811ade993DBdd8679dC807843",
+  "window_pre_state_root": "0xdc0df53f30b99227793389d992c794a7febc40d89349cd4286a442ccfd847324",
+  "window_post_state_root": "0x5ebdf8ebfc58a39b33628e4d9c64399b606e3af552efd5686f80ccb1007736df",
+  "public_inputs_hash": "0x2b79886e5ca16d7896f5984a8c0d838f7ff3ec9eedba5a3dc5fd0563423d85a9",
+  "expected_test_signature": "0x027c9bc6fdf5cd2e458b7a73825ab724179c84e628b450cd5d3a1a8d1703f6970e7fb00ac5057fc301ce34305db19f74edcdc1a8edebd8cba1940a4054493a1a1c",
+  "postbatch_calldata_bytes": 1604,
+  "postbatch_calldata_sha256": "7a162a0f320aaa7a11d5bcc4e9f4044d082fd5ccd60b860064a618444447676f"
+}

@@ -36,6 +36,8 @@ jobs:
           docker system prune --all --force
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
+        with:
+          version: v1.7.1
       - name: Install Kurtosis
         run: |
           echo "deb [trusted=yes] https://sdk.kurtosis.com/kurtosis-cli-release-artifacts/ /" | sudo tee /etc/apt/sources.list.d/kurtosis.list

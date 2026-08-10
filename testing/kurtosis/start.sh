@@ -10,23 +10,22 @@ ARGS_FILE="${1:-$HERE/ci-args.yaml}"
 command -v kurtosis >/dev/null || { echo "kurtosis not found in PATH" >&2; exit 1; }
 command -v docker   >/dev/null || { echo "docker not found in PATH" >&2; exit 1; }
 
-PROTOCOL_DIR="$REPO/sync-rollups-protocol"
+PROTOCOL_DIR="$REPO/eez-core-protocol"
 
 # Fail before building images if the protocol submodule is missing or stale.
 if [[ ! -d "$PROTOCOL_DIR/.git" && ! -f "$PROTOCOL_DIR/.git" ]]; then
-    echo "sync-rollups-protocol submodule is not initialized." >&2
-    echo "Run: git submodule update --init --recursive sync-rollups-protocol" >&2
+    echo "eez-core-protocol submodule is not initialized." >&2
+    echo "Run: git submodule update --init --recursive eez-core-protocol" >&2
     exit 1
 fi
 
-if ! grep -q "ExpectedLookup\\[\\] expectedLookups" "$PROTOCOL_DIR/src/interfaces/IEEZ.sol" 2>/dev/null \
-    || ! grep -q "expectedStateRoots" "$PROTOCOL_DIR/src/interfaces/IEEZ.sol" 2>/dev/null
-then
-    echo "sync-rollups-protocol is too old for this eez-node checkout." >&2
-    echo "Missing postAndVerifyBatch ABI fields expected by this checkout." >&2
-    echo "Run: git submodule update --init --recursive sync-rollups-protocol" >&2
+EXPECTED_PROTOCOL_COMMIT="$(git -C "$REPO" ls-files -s eez-core-protocol | awk '{print $2}')"
+ACTUAL_PROTOCOL_COMMIT="$(git -C "$PROTOCOL_DIR" rev-parse HEAD)"
+if [[ -z "$EXPECTED_PROTOCOL_COMMIT" || "$ACTUAL_PROTOCOL_COMMIT" != "$EXPECTED_PROTOCOL_COMMIT" ]]; then
+    echo "eez-core-protocol is not at the commit pinned by this checkout." >&2
+    echo "Run: git submodule update --init --recursive eez-core-protocol" >&2
     echo "Current submodule status:" >&2
-    git -C "$REPO" submodule status sync-rollups-protocol >&2 || true
+    git -C "$REPO" submodule status eez-core-protocol >&2 || true
     exit 1
 fi
 
@@ -44,14 +43,11 @@ DEPLOY_IMAGE="$(yv deploy_image)";                DEPLOY_IMAGE="${DEPLOY_IMAGE:-
 
 export DOCKER_BUILDKIT=1
 
-# Fast local build; set EEZ_OPTIMIZED_BUILD=1 for the full release profile.
+# The default `release` profile is already the fast build; set
+# EEZ_OPTIMIZED_BUILD=1 for production (maxperf) binaries.
 release_build_args=()
-if [[ "${EEZ_OPTIMIZED_BUILD:-0}" != "1" ]]; then
-    release_build_args=(
-        --build-arg CARGO_PROFILE_RELEASE_LTO=false
-        --build-arg CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
-        --build-arg CARGO_PROFILE_RELEASE_DEBUG=0
-    )
+if [[ "${EEZ_OPTIMIZED_BUILD:-0}" == "1" ]]; then
+    release_build_args=(--build-arg BUILD_PROFILE=maxperf)
 fi
 
 if [[ "${EEZ_SKIP_NODE_BUILD:-0}" != "1" ]]; then
@@ -70,7 +66,11 @@ fi
 
 if [[ "${EEZ_SKIP_DEPLOY_BUILD:-0}" != "1" ]]; then
     echo "==> building $DEPLOY_IMAGE (foundry + contracts)"
-    docker build -f "$HERE/Dockerfile.deploy" -t "$DEPLOY_IMAGE" "$REPO"
+    docker build \
+        --build-arg "EEZ_NODE_IMAGE=$NODE_IMAGE" \
+        -f "$HERE/Dockerfile.deploy" \
+        -t "$DEPLOY_IMAGE" \
+        "$REPO"
 else
     echo "==> reusing $DEPLOY_IMAGE (EEZ_SKIP_DEPLOY_BUILD=1)"
 fi

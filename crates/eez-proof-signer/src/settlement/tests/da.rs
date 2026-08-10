@@ -1,5 +1,42 @@
 use super::*;
 
+/// Refresh the exact L1 commitment after a test mutates a claimed entry.
+fn refresh_l1_rolling_hash(entry: &mut ExecutionEntrySol) {
+    let mut rolling_hash = EntryRollingHash::seed_for_l1(
+        entry
+            .stateUpdates
+            .iter()
+            .map(|update| (update.rollupId, update.currentState)),
+        entry.proxyEntryHash,
+    );
+    match entry.l2ToL1Calls.as_slice() {
+        [] => {}
+        [call] => {
+            let mode = if call.isStatic {
+                CallMode::Static
+            } else {
+                CallMode::Mutable
+            };
+            let call_hash = common_cross_chain_call_hash(CallHashInput {
+                call_mode: mode,
+                source_address: call.sourceAddress,
+                source_rollup_id: RollupId(call.sourceRollupId),
+                target_address: call.targetAddress,
+                target_rollup_id: RollupId::MAINNET,
+                value: call.value,
+                data: &call.data,
+            });
+            rolling_hash.call_begin(call_hash);
+            rolling_hash.call_end(entry.success, &entry.returnData);
+        }
+        calls => panic!(
+            "DA fixture supports at most one L2-to-L1 call, got {}",
+            calls.len()
+        ),
+    }
+    entry.rollingHash = rolling_hash.current();
+}
+
 #[test]
 fn test_da_payload_encoder_matches_the_wire_format() {
     assert_eq!(
@@ -374,7 +411,8 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     let mut batch = effect_batch(&[B256::ZERO; 3], &[ClaimedEntryShape::Outbound]);
     let value = U256::from(7);
     batch.entries[1].l2ToL1Calls[0].value = value;
-    batch.entries[1].stateDeltas[0].etherDelta = -I256::try_from(value).unwrap();
+    batch.entries[1].stateUpdates[0].etherDelta = -I256::try_from(value).unwrap();
+    refresh_l1_rolling_hash(&mut batch.entries[1]);
     let mut settling = settling_with_outbound_pairs(1);
     settling
         .outbound_event_candidates_mut_for_test()
@@ -386,7 +424,8 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     let plan = effect_plan(&batch, &settling);
     let outbound = authorize_outbound_effects(&plan).unwrap();
     let mut sidecar = batch.entries[1].clone();
-    sidecar.stateDeltas.clear();
+    sidecar.stateUpdates.clear();
+    sidecar.rollingHash = B256::ZERO;
 
     let (_, mut user_payload) = block_and_payload_transactions(vec![user_transaction(7)]);
     let user = user_payload.pop().unwrap();
@@ -450,11 +489,11 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     );
 
     // Composer DA carries the pre-settlement projection, not the batch entry
-    // after its state delta has been attached.
-    let with_state_delta =
+    // after its state update has been attached.
+    let with_state_update =
         encode_da_payload(&[vec![user.clone()]], &[batch.entries[1].abi_encode()]);
     assert_eq!(
-        verify(&with_state_delta, [(41, settling_rlp.as_slice())]),
+        verify(&with_state_update, [(41, settling_rlp.as_slice())]),
         Err(DaPayloadError::L2EntryMismatch {
             entry_index: 0,
             transaction_index: 1,
@@ -504,8 +543,11 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
     );
     batch.entries[2].l2ToL1Calls[0].data = Bytes::from_static(&[0x02]);
     batch.entries[2].returnData = Bytes::from_static(&[0xca, 0xfe]);
-    batch.entries[2].rollingHash =
-        b256!("db02b0059bb85889526354ec94d73be8588724a34c54f401645973b5e525fa96");
+    refresh_l1_rolling_hash(&mut batch.entries[2]);
+    assert_eq!(
+        batch.entries[2].rollingHash,
+        b256!("78f69e61b6a717b35a9ded7bd8eb7b8782e70680d1335623833272cfa66f5921")
+    );
     let mut settling = settling_with_outbound_pairs(2);
     *settling.outbound_event_candidates_mut_for_test() = vec![
         observed_outbound_call(1, 0, &batch.entries[1].l2ToL1Calls[0]),
@@ -519,7 +561,8 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
         .skip(1)
         .cloned()
         .map(|mut entry| {
-            entry.stateDeltas.clear();
+            entry.stateUpdates.clear();
+            entry.rollingHash = B256::ZERO;
             entry
         })
         .collect::<Vec<_>>();
@@ -623,7 +666,9 @@ fn da_payload_binds_the_complete_mixed_sync_sequence_and_sidecar_order() {
         .unwrap();
     batch.entries[2].proxyEntryHash = inbound_observation.recomputed_call_hash;
     batch.entries[2].returnData = inbound_observation.return_data.clone();
-    batch.entries[2].stateDeltas[0].etherDelta = I256::try_from(inbound_observation.value).unwrap();
+    batch.entries[2].stateUpdates[0].etherDelta =
+        I256::try_from(inbound_observation.value).unwrap();
+    refresh_l1_rolling_hash(&mut batch.entries[2]);
     settling
         .outbound_event_candidates_mut_for_test()
         .push(observed_outbound_call(
@@ -636,7 +681,8 @@ fn da_payload_binds_the_complete_mixed_sync_sequence_and_sidecar_order() {
     let outbound = authorize_outbound_effects(&plan).unwrap();
     let inbound = verify_inbound_effect_entries(&plan).unwrap();
     let mut outbound_sidecar = batch.entries[1].clone();
-    outbound_sidecar.stateDeltas.clear();
+    outbound_sidecar.stateUpdates.clear();
+    outbound_sidecar.rollingHash = B256::ZERO;
     let inbound_sidecar = settling.inbound_candidates()[0]
         .inspection
         .as_ref()

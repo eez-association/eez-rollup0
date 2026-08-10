@@ -2,7 +2,7 @@
 
 use std::num::NonZeroU64;
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256};
 use eez_protocol::EvmBatch;
 use eez_protocol::abi::ProofSystemBatchPerVerificationEntriesSol;
 use eez_protocol::entries::decode_postbatch;
@@ -118,12 +118,8 @@ impl<'a> CheckedPublicInputProfile<'a> {
         &self,
         proof_system_vkey: NonZeroProofSystemVkey,
     ) -> Result<RecomputedPublicInputsHash, PublicInputError> {
-        let hashes = public_inputs_hashes(
-            self.canonical_batch.as_batch(),
-            proof_system_vkey.get(),
-            None,
-        )
-        .map_err(|error| PublicInputError::Computation(error.to_string()))?;
+        let hashes = public_inputs_hashes(self.canonical_batch.as_batch(), proof_system_vkey.get())
+            .map_err(|error| PublicInputError::Computation(error.to_string()))?;
         let [hash] = hashes.as_slice() else {
             return Err(PublicInputError::HashCount {
                 actual: hashes.len(),
@@ -183,40 +179,63 @@ fn validate_public_input_structure(
             batch.rollupIdsWithProofSystems.len()
         )));
     };
-    let expected_rollup = U256::from(expected_rollup_id.get());
+    let expected_rollup = expected_rollup_id.get();
     if rollup_assignment.rollupId != expected_rollup {
         return Err(invalid_structure(format!(
             "rollup assignment id {} does not match expected rollup id {expected_rollup_id}",
             rollup_assignment.rollupId
         )));
     }
-    if rollup_assignment.proofSystemIndex.as_slice() != [0] {
+    if rollup_assignment.proofSystemIndexes.as_slice() != [0] {
         return Err(invalid_structure(
             "rollup assignment proof-system indices must be exactly [0]",
         ));
     }
-    if batch.crossProofSystemInteractions != B256::ZERO {
+    if !batch.expectedStateRootPerRollup.is_empty() {
         return Err(invalid_structure(
-            "crossProofSystemInteractions must be zero in the single-proof-system profile",
+            "expectedStateRootPerRollup must be empty in the supported profile",
         ));
     }
 
-    let is_expected_rollup = |rollup_id: &U256| *rollup_id == expected_rollup;
     for (entry_index, entry) in batch.entries.iter().enumerate() {
-        if !is_expected_rollup(&entry.destinationRollupId) {
+        if entry.destinationRollupId != expected_rollup {
             return Err(invalid_structure(format!(
                 "entry {entry_index} destination rollup {} does not match expected rollup id {expected_rollup_id}",
                 entry.destinationRollupId,
             )));
         }
     }
-    for (lookup_index, lookup) in batch.l1ToL2lookupCalls.iter().enumerate() {
-        if !is_expected_rollup(&lookup.destinationRollupId) {
-            return Err(invalid_structure(format!(
-                "lookup {lookup_index} destination rollup {} does not match expected rollup id {expected_rollup_id}",
-                lookup.destinationRollupId,
-            )));
-        }
+
+    if !batch.staticEntries.is_empty() {
+        return Err(invalid_structure(format!(
+            "staticEntries must be empty in the supported profile, got {}",
+            batch.staticEntries.len()
+        )));
+    }
+    if !batch.immediateStaticEntryCount.is_zero() {
+        return Err(invalid_structure(format!(
+            "immediateStaticEntryCount must be zero, got {}",
+            batch.immediateStaticEntryCount
+        )));
+    }
+
+    let immediate_entry_count = usize::try_from(batch.immediateEntryCount).map_err(|_| {
+        invalid_structure(format!(
+            "immediateEntryCount {} does not fit in usize",
+            batch.immediateEntryCount
+        ))
+    })?;
+    // This profile supports only the complete leading L2-tx run. It does not
+    // admit additional nonzero-hash entries for the optional meta hook.
+    let leading_immediate_entries = batch
+        .entries
+        .iter()
+        .take_while(|entry| entry.proxyEntryHash == B256::ZERO)
+        .count();
+    if immediate_entry_count != leading_immediate_entries {
+        return Err(invalid_structure(format!(
+            "immediateEntryCount {immediate_entry_count} does not match the {leading_immediate_entries} leading entries with proxyEntryHash == 0"
+        )));
     }
 
     if batch.blockNumber != 0 {
@@ -231,8 +250,12 @@ fn validate_public_input_structure(
             batch.blobIndices.len()
         )));
     }
-    // No pin for the remaining fields: transient counts (L1 scheduling
-    // inputs) and `proofs` are outside the signed public-input preimage, and
+    if batch.bindMsgSenderInPublicInput {
+        return Err(invalid_structure(
+            "bindMsgSenderInPublicInput must be false in the supported profile",
+        ));
+    }
+    // `proofs` are verified on-chain but remain outside the signed preimage;
     // `callData` is bound by both the DA gate and the recomputed hash.
     Ok(())
 }

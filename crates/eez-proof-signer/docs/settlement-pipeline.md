@@ -25,7 +25,7 @@ first failure:
 flowchart LR
     PB[Submitted PostBatch calldata] --> DEC[CanonicalPostBatch]
     DEC --> PI[CheckedPublicInputProfile]
-    PI --> STATE[State-delta chain]
+    PI --> STATE[State-update chain]
     VW[ValidatedWindow] --> STATE
     STATE --> BLOCKS[Settling-block observations]
     VW --> BLOCKS
@@ -49,7 +49,7 @@ flowchart LR
    one-proof-system, timeless shape to the expected/configured deployment
    values. It retains the typed capability needed for later hash computation;
    it never accepts the wire hash as authoritative.
-3. `state_chain` requires exactly one expected-rollup delta per entry and a
+3. `state_chain` requires exactly one expected-rollup state update per entry and a
    continuous chain from `ValidatedWindow.window_pre_state_root` to
    `window_post_state_root`.
 4. `blocks` consumes the validated system-sender flags, receipt outcomes, and
@@ -57,8 +57,8 @@ flowchart LR
    privileged/effect evidence in `preceding_blocks` and derives the
    `settling_block` effect-candidate framing once.
 5. `effect_binding` enforces the leading-anchor and later-effect shapes,
-   including the anchor root and zero-value policy, then joins every submitted
-   effect, candidate transaction, and locally recomputed checkpoint by ordinal.
+   including the anchor root and zero anchor ether delta, then joins every
+   submitted effect, candidate transaction, and locally recomputed checkpoint by ordinal.
    It returns one ordered `BoundEffectSequence`.
 6. `inbound` returns `AuthorizedInboundEffects` only after canonical delivery
    transactions match their bound entries, call hashes, outcomes, values, and
@@ -97,7 +97,7 @@ that binding.
 The accepted sequence is one anchor, followed by supported outbound effects,
 then supported successful inbound effects. The current outbound subset is one
 success-expected call with the required accounting and event evidence. Failed
-or lookup-bearing inbound effects, outbound-after-inbound ordering, richer
+or nested/reentrant inbound effects, outbound-after-inbound ordering, richer
 outbound shapes, and ambiguous evidence reject before signing. Refer to
 `SPEC.md` for the exact shapes and equations.
 
@@ -106,7 +106,7 @@ outbound shapes, and ambiguous evidence reject before signing. Refer to
 | Module | Gate family |
 | --- | --- |
 | [`post_batch.rs`](../src/settlement/post_batch.rs) | `CanonicalPostBatch`, configured public-input profile, typed hash fold |
-| [`state_chain.rs`](../src/settlement/state_chain.rs) | State-delta continuity and validated window endpoints |
+| [`state_chain.rs`](../src/settlement/state_chain.rs) | State-update continuity and validated window endpoints |
 | [`effect_binding.rs`](../src/settlement/effect_binding.rs) | Entry classification and effect/checkpoint correspondence |
 | [`blocks.rs`](../src/settlement/blocks.rs) | Transaction roles, statuses, preceding-block policy |
 | [`inbound.rs`](../src/settlement/inbound.rs) | Strict inbound observation and entry authorization |
@@ -116,11 +116,13 @@ outbound shapes, and ambiguous evidence reject before signing. Refer to
 
 ## Attestation boundary
 
-The final signature commits to the complete supported batch through the
-typed `AttestablePublicInputsHash`. `RecomputedPublicInputsHash` proves local
-profile-checked computation, while only the complete settlement job can grant
-the attestable capability after every gate. The signing API accepts neither the
-weaker type nor the Composer-supplied wire hash. The signature proves neither
-that L1 will apply the transition nor that an expected outbound call will
-succeed in the future. Live-root checks, actual L1 execution, and dispatch
-scheduling remain outside this daemon's observation.
+The final signature commits to the complete mutable entries, `callData`, and
+the derived profile terms listed in `SPEC.md` section 12. Other batch carriers,
+including scheduling counts and proof bytes, are constrained only by admission
+and are not direct signature commitments. `RecomputedPublicInputsHash` proves
+local profile-checked computation, while only the complete settlement job can
+grant the attestable capability after every gate. The signing API accepts
+neither the weaker type nor the Composer-supplied wire hash. The signature
+proves neither that L1 will apply the transition nor that an expected outbound
+call will succeed in the future. Live-root checks, actual L1 execution, and
+dispatch scheduling remain outside this daemon's observation.

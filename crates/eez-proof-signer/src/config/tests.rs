@@ -2,6 +2,8 @@ use super::*;
 use clap::{CommandFactory, FromArgMatches};
 use std::process::Command;
 
+use crate::testkit::TEST_SYSTEM_ADDRESS_ARG;
+
 const ROLLUP_ENV_CHILD: &str = "EEZ_PROOF_SIGNER_ROLLUP_ENV_TEST_CHILD";
 const ROLLUP_ENV_CHILD_OK: &str = "rollup-env-child-ok";
 const TEST_VKEY: &str = "4242424242424242424242424242424242424242424242424242424242424242";
@@ -10,7 +12,7 @@ const TEST_ATTESTER_KEY: &str = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8
 const PREFIXED_TEST_ATTESTER_KEY: &str =
     "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 const TEST_ATTESTER_ADDRESS: &str = "70997970c51812dc3A010C7d01b50e0d17dc79C8";
-// Anvil account #0 derives the protocol's reserved L2 system address.
+// Deterministic deployment identity used only by configuration tests.
 const TEST_SYSTEM_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const PREFIXED_TEST_SYSTEM_KEY: &str =
     "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -31,6 +33,9 @@ fn parse_args<const N: usize>(args: [&str; N]) -> Result<Args, clap::Error> {
     }
     if !args.contains(&"--l2-system-key") {
         args.extend(["--l2-system-key", TEST_SYSTEM_KEY]);
+    }
+    if !args.contains(&"--l2-system-address") {
+        args.extend(["--l2-system-address", TEST_SYSTEM_ADDRESS_ARG]);
     }
     if !args.contains(&"--proof-system") {
         args.extend(["--proof-system", TEST_PROOF_SYSTEM]);
@@ -67,6 +72,10 @@ fn cli_parses_the_default_listen_addr() {
         PathBuf::from("chain-config.json")
     );
     assert_eq!(config.expected_rollup_id.get(), 7);
+    assert_eq!(
+        config.expected_l2_system_address,
+        TEST_SYSTEM_ADDRESS_ARG.parse::<Address>().unwrap()
+    );
     assert_eq!(
         config.attester.proof_system_vkey().get(),
         B256::repeat_byte(0x42)
@@ -182,6 +191,8 @@ fn rollup_id_uses_environment_fallback_with_cli_precedence() {
                 TEST_ATTESTER_ADDRESS,
                 "--l2-system-key",
                 TEST_SYSTEM_KEY,
+                "--l2-system-address",
+                TEST_SYSTEM_ADDRESS_ARG,
                 "--proof-system",
                 TEST_PROOF_SYSTEM,
             ],
@@ -199,6 +210,8 @@ fn rollup_id_uses_environment_fallback_with_cli_precedence() {
                 TEST_ATTESTER_ADDRESS,
                 "--l2-system-key",
                 TEST_SYSTEM_KEY,
+                "--l2-system-address",
+                TEST_SYSTEM_ADDRESS_ARG,
                 "--proof-system",
                 TEST_PROOF_SYSTEM,
             ],
@@ -293,6 +306,8 @@ fn vkey_is_mandatory_and_nonzero() {
             TEST_ATTESTER_ADDRESS,
             "--l2-system-key",
             TEST_SYSTEM_KEY,
+            "--l2-system-address",
+            TEST_SYSTEM_ADDRESS_ARG,
             "--proof-system",
             TEST_PROOF_SYSTEM,
         ])
@@ -420,6 +435,8 @@ fn signer_key_is_mandatory() {
             TEST_ATTESTER_ADDRESS,
             "--l2-system-key",
             TEST_SYSTEM_KEY,
+            "--l2-system-address",
+            TEST_SYSTEM_ADDRESS_ARG,
             "--proof-system",
             TEST_PROOF_SYSTEM,
         ])
@@ -534,7 +551,7 @@ fn signer_key_is_redacted_from_debug_help_and_clap_errors() {
 }
 
 #[test]
-fn l2_system_key_is_mandatory_and_pinned_to_the_reserved_address() {
+fn l2_system_key_and_deployment_address_are_mandatory_and_must_match() {
     assert!(
         parse_exact_args([
             "eez-proof-signer",
@@ -548,6 +565,8 @@ fn l2_system_key_is_mandatory_and_pinned_to_the_reserved_address() {
             TEST_ATTESTER_KEY,
             "--attester-address",
             TEST_ATTESTER_ADDRESS,
+            "--l2-system-address",
+            TEST_SYSTEM_ADDRESS_ARG,
             "--proof-system",
             TEST_PROOF_SYSTEM,
         ])
@@ -567,8 +586,32 @@ fn l2_system_key_is_mandatory_and_pinned_to_the_reserved_address() {
     ])
     .unwrap();
     let error = Config::from_args(args).unwrap_err().to_string();
-    assert!(error.contains(&format!("expected {}", eez_protocol::SYSTEM_ADDRESS)));
+    assert!(error.contains(&format!(
+        "expected {}",
+        TEST_SYSTEM_ADDRESS_ARG.parse::<Address>().unwrap()
+    )));
     assert!(!error.contains(OTHER_VALID_KEY));
+
+    assert!(
+        parse_exact_args([
+            "eez-proof-signer",
+            "--chain-config",
+            "chain-config.json",
+            "--rollup-id",
+            "1",
+            "--vkey",
+            TEST_VKEY,
+            "--signer-key",
+            TEST_ATTESTER_KEY,
+            "--attester-address",
+            TEST_ATTESTER_ADDRESS,
+            "--l2-system-key",
+            TEST_SYSTEM_KEY,
+            "--proof-system",
+            TEST_PROOF_SYSTEM,
+        ])
+        .is_err()
+    );
 }
 
 #[test]
@@ -627,6 +670,8 @@ fn proof_system_is_mandatory_and_nonzero() {
             TEST_ATTESTER_ADDRESS,
             "--l2-system-key",
             TEST_SYSTEM_KEY,
+            "--l2-system-address",
+            TEST_SYSTEM_ADDRESS_ARG,
         ])
         .is_err()
     );
@@ -662,6 +707,8 @@ fn attester_address_is_mandatory_and_must_match_the_signing_key() {
             TEST_ATTESTER_KEY,
             "--l2-system-key",
             TEST_SYSTEM_KEY,
+            "--l2-system-address",
+            TEST_SYSTEM_ADDRESS_ARG,
             "--proof-system",
             TEST_PROOF_SYSTEM,
         ])

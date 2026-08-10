@@ -3,7 +3,7 @@ pragma solidity ^0.8.28;
 
 import {Script, console} from "forge-std/Script.sol";
 
-import {EEZ} from "sync-rollups-protocol/src/EEZ.sol";
+import {EEZ} from "eez-core-protocol/src/EEZ.sol";
 
 /// @title RegisterRollup
 /// @notice Calls `EEZ.registerRollup(rollupContract, initialState)`. The
@@ -29,13 +29,9 @@ import {EEZ} from "sync-rollups-protocol/src/EEZ.sol";
 ///                              that starts from an empty trie, or the
 ///                              L2 genesis state root if known).
 contract RegisterRollup is Script {
-    function run(
-        address eez,
-        address rollupContract,
-        bytes32 initialState
-    ) external {
+    function run(address eez, address rollupContract, bytes32 initialState) external {
         vm.startBroadcast();
-        uint256 rollupId = EEZ(eez).registerRollup(rollupContract, initialState);
+        uint64 rollupId = EEZ(eez).registerRollup(rollupContract, initialState);
         vm.stopBroadcast();
         console.log("L2_ROLLUP_ID=%s", rollupId);
     }

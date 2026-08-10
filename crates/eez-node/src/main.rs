@@ -503,8 +503,8 @@ fn main() -> eyre::Result<()> {
                         |_| eyre::eyre!("EEZ_REGISTRY_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
                     )?)?;
 
-                    let ccm_l2: Address = Address::from_str(&env::var("EEZ_CCM_L2_ADDRESS").map_err(
-                        |_| eyre::eyre!("EEZ_CCM_L2_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
+                    let eezl2_address: Address = Address::from_str(&env::var("EEZL2_ADDRESS").map_err(
+                        |_| eyre::eyre!("EEZL2_ADDRESS required for the cross-chain composer (set by deploy.sh)"),
                     )?)?;
                     let l1_rollup_id_u64 = read_l1_rollup_id();
                     let l1_rollup_id = RollupId(l1_rollup_id_u64);
@@ -524,7 +524,6 @@ fn main() -> eyre::Result<()> {
                                 l1_provider,
                                 l1_evm_config,
                                 l1_rollup_id,
-                                eez_registry,
                                 eez_registry,
                                 eez_protocol::ChainDialect::EvmL1Style,
                             );
@@ -553,7 +552,6 @@ fn main() -> eyre::Result<()> {
                                 l1_evm_config,
                                 l1_rollup_id,
                                 eez_registry,
-                                eez_registry,
                                 eez_protocol::ChainDialect::EvmL1Style,
                             );
                             let entry_view: std::sync::Arc<
@@ -565,15 +563,14 @@ fn main() -> eyre::Result<()> {
                         }
                     };
 
-                    // L2 follower — EvmL2Style. `dispatch_address` =
-                    // `ccm_address` = CCM-L2 predeploy (where
-                    // authorizedProxies lives at slot 2).
+                    // L2 follower — EvmL2Style. Its dispatch contract is the
+                    // `EEZL2` predeploy, whose inherited `authorizedProxies`
+                    // mapping occupies slot 0.
                     let l2_follower = LocalChainClient::new_follower(
                         provider.clone(),
                         evm_config.clone(),
                         l2_rollup_id_typed,
-                        ccm_l2,
-                        ccm_l2,
+                        eezl2_address,
                         eez_protocol::ChainDialect::EvmL2Style,
                     );
                     let l2_follower_view: std::sync::Arc<
@@ -589,8 +586,7 @@ fn main() -> eyre::Result<()> {
                         provider.clone(),
                         evm_config.clone(),
                         l2_rollup_id_typed,
-                        ccm_l2,
-                        ccm_l2,
+                        eezl2_address,
                         eez_protocol::ChainDialect::EvmL2Style,
                     );
                     let l2_entry_view: std::sync::Arc<
@@ -609,7 +605,7 @@ fn main() -> eyre::Result<()> {
                     };
                     let l2_follower_cfg = TargetConfig {
                         proxy_lookup: ProxyLookupConfig {
-                            contract_address: ccm_l2,
+                            contract_address: eezl2_address,
                             authorized_proxies_slot: eez_protocol::ChainDialect::EvmL2Style
                                 .proxy_lookup_slot(),
                         },
@@ -619,7 +615,18 @@ fn main() -> eyre::Result<()> {
                     let mut wired_rollups = std::collections::HashMap::new();
                     wired_rollups
                         .insert(l1_rollup_id, (Arc::clone(&entry_client_view), entry_cfg));
-                    wired_rollups.insert(l2_rollup_id_typed, (l2_follower_view, l2_follower_cfg));
+                    // A colliding id would silently overwrite the L1 entry
+                    // registration (EEZ_L1_ROLLUP_ID defaults to 0).
+                    if wired_rollups
+                        .insert(l2_rollup_id_typed, (l2_follower_view, l2_follower_cfg))
+                        .is_some()
+                    {
+                        return Err(eyre::eyre!(
+                            "duplicate rollup id {l2_rollup_id_typed}: EEZ_ROLLUP_ID collides \
+                             with EEZ_L1_ROLLUP_ID; the L2 follower registration would \
+                             overwrite the L1 entry"
+                        ));
+                    }
             // CrossChainExecCtx: signer + L2 addresses needed to wrap
             // EvmComposer's `(load_table, execute)` calldata pairs
             // into signed legacy L2 system txs at Sync-slot time.
@@ -631,11 +638,6 @@ fn main() -> eyre::Result<()> {
                 let system_signer = PrivateKeySigner::from_bytes(&B256::from_str(
                     system_key.trim_start_matches("0x"),
                 )?)?;
-                let ccm_l2_address: Address = Address::from_str(
-                    &env::var("EEZ_CCM_L2_ADDRESS").map_err(|_| {
-                        eyre::eyre!("EEZ_CCM_L2_ADDRESS required (set by deploy.sh)")
-                    })?,
-                )?;
                 // Submission RPC for postBatch and inbound source-chain reads.
                 // This can differ from the embedded L1 used for local source
                 // simulation (the E2E harness deliberately uses Anvil here), so
@@ -664,12 +666,6 @@ fn main() -> eyre::Result<()> {
                         )
                     })?,
                 )?;
-                let l2_rollup_id_for_ctx: u64 = env::var("EEZ_ROLLUP_ID")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| {
-                        eyre::eyre!("EEZ_ROLLUP_ID required for L1 postBatch rollupIdsWithProofSystems[]")
-                    })?;
                 // 10 gwei comfortably exceeds the smoke user_tx's
                 // 2-gwei priority fee, so dev-reth's payload builder
                 // orders postBatch ahead of the user_tx within the
@@ -686,7 +682,7 @@ fn main() -> eyre::Result<()> {
                 // (dev reth, anvil) detected via JSON-RPC -32601.
                 let exec_ctx = Arc::new(eez_composer::CrossChainExecCtx {
                     system_signer,
-                    ccm_l2_address,
+                    eezl2_address,
                     l2_chain_id: chain_spec.chain().id(),
                     l2_gas_price: 1_000_000_000,
                     l2_gas_limit: 2_000_000,
@@ -696,7 +692,6 @@ fn main() -> eyre::Result<()> {
                     l1_chain_id: l1_submission_chain_id,
                     l1_post_batch_priority_fee,
                     ecdsa_proof_system_address,
-                    l2_rollup_id: l2_rollup_id_for_ctx,
                 });
                     event!(
                         name: "eez.node.evm_composer.ready",
@@ -704,7 +699,7 @@ fn main() -> eyre::Result<()> {
                         l1_rollup_id = l1_rollup_id_u64,
                         l2_rollup_id = rollup_id,
                         eez_registry = %eez_registry,
-                        ccm_l2 = %ccm_l2,
+                        %eezl2_address,
                         "cross-chain composer constructed (L1 entry + L2 follower)",
                     );
                     Some(CrossChainWiring {
@@ -731,11 +726,11 @@ fn main() -> eyre::Result<()> {
                 let ctx = &cc.exec_ctx;
                 eez_protocol::system_tx::SystemTxContext {
                     system_signer: ctx.system_signer.clone(),
-                    ccm_l2_address: ctx.ccm_l2_address,
+                    eezl2_address: ctx.eezl2_address,
                     l2_chain_id: ctx.l2_chain_id,
                     l2_gas_price: ctx.l2_gas_price,
                     l2_gas_limit: ctx.l2_gas_limit,
-                    this_rollup_id: ctx.l2_rollup_id,
+                    this_rollup_id: rollup_id,
                 }
             });
             let cross_chain_composer_wired = cross_chain.is_some();
@@ -825,13 +820,27 @@ fn main() -> eyre::Result<()> {
         let (sequencer, umbrella, system_tx_cfg, cross_chain_composer_wired, l1_source_chain_id) =
             composer_setup;
 
+        let l2_source_chain_id = chain_spec.chain().id();
+        // Resolve and validate both required fronts before spawning the deriver,
+        // sequencer, or composer. The fronts are required infrastructure, so a
+        // missing configuration or bad/unavailable upstream must fail launch
+        // rather than leave a healthy-looking node running without cross-chain
+        // ingress.
+        let mut xchain_fronts = Vec::new();
         if mode == Mode::Composer {
-            for port_env in ["EEZ_L1_XCHAIN_PORT", "EEZ_L2_XCHAIN_PORT"] {
-                require_xchain_composer_wiring(
-                    port_env,
-                    env::var_os(port_env).is_some(),
-                    cross_chain_composer_wired,
-                )?;
+            require_xchain_composer_wiring(cross_chain_composer_wired)?;
+            let l1_source_chain_id =
+                l1_source_chain_id.expect("composer mode sets L1 source chain id");
+            for spec in xchain_front_specs(l1_source_chain_id, l2_source_chain_id) {
+                let (port, url, parsed) =
+                    read_xchain_front_config(spec.port_env, spec.url_env)?;
+                let validation_provider = alloy_provider::RootProvider::new_http(parsed);
+                ingress::validate_cross_chain_front(
+                    &validation_provider,
+                    spec.expected_source_chain_id,
+                )
+                .await?;
+                xchain_fronts.push((spec, port, url, validation_provider));
             }
         }
 
@@ -839,7 +848,6 @@ fn main() -> eyre::Result<()> {
         // composer). A wired `SystemTxContext` makes it reconstruct the
         // same L2 system txs the composer produced (single-source STF).
         let l2_block_time_secs = timing.l2_block_time().as_secs();
-        let l2_source_chain_id = chain_spec.chain().id();
         let deriver = Deriver::new(
             l1_watcher.clone(),
             block_committer.clone(),
@@ -942,33 +950,22 @@ fn main() -> eyre::Result<()> {
             });
 
             // Cross-chain ingress fronts (see `run_cross_chain_front`) — one per
-            // SOURCE chain, sharing `held_pool`, gated on its port env (absent →
-            // no front for that chain):
+            // SOURCE chain, sharing `held_pool`. Both are required in composer mode:
             //   L1 front (EEZ_L1_XCHAIN_PORT → EEZ_L1_RPC_URL): L1→L2 Inbound.
             //   L2 front (EEZ_L2_XCHAIN_PORT → EEZ_L2_RPC_URL): L2→L1 Outbound.
-            let l1_source_chain_id =
-                l1_source_chain_id.expect("composer mode sets L1 source chain id");
-            for spec in xchain_front_specs(l1_source_chain_id, l2_source_chain_id) {
-                let Some((port, url, parsed)) =
-                    read_xchain_front_config(spec.port_env, spec.url_env)?
-                else {
-                    continue;
-                };
+            for (spec, port, url, validation_provider) in xchain_fronts {
                 let pool = Arc::clone(&held_pool);
-                let provider = alloy_provider::RootProvider::new_http(parsed);
                 task_executor.spawn_critical_task(spec.task, async move {
-                    if let Err(e) = ingress::run_cross_chain_front(
+                    ingress::run_cross_chain_front(
                         port,
                         url,
                         spec.direction,
                         pool,
-                        provider,
+                        validation_provider,
                         spec.expected_source_chain_id,
                     )
                     .await
-                    {
-                        event!(name: "eez.xchain_front.exited", Level::ERROR, error = %e, "cross-chain front exited");
-                    }
+                    .unwrap_or_else(|e| panic!("configured cross-chain front exited: {e:#}"));
                 });
             }
         }
@@ -980,7 +977,7 @@ fn main() -> eyre::Result<()> {
 /// Build a `SystemTxContext` for follower mode from env (the follower
 /// has no Composer to feed the composer-mode projection). Returns
 /// `Ok(None)` when cross-chain env isn't present → pure-user-tx follower
-/// mode. Reads `EEZ_L2_SYSTEM_KEY` / `EEZ_CCM_L2_ADDRESS` /
+/// mode. Reads `EEZ_L2_SYSTEM_KEY` / `EEZL2_ADDRESS` /
 /// `EEZ_ROLLUP_ID`; the `l2_gas_price` (1 gwei) and `l2_gas_limit` (2M)
 /// defaults mirror composer-mode so reconstructed system txs are
 /// byte-identical.
@@ -1002,21 +999,21 @@ where
             return Err(eyre::eyre!("EEZ_L2_SYSTEM_KEY contains non-UTF-8 bytes"));
         }
     };
-    let ccm_l2_str = env::var("EEZ_CCM_L2_ADDRESS")
-        .map_err(|_| eyre::eyre!("EEZ_CCM_L2_ADDRESS required when EEZ_L2_SYSTEM_KEY is set"))?;
+    let eezl2_address_str = env::var("EEZL2_ADDRESS")
+        .map_err(|_| eyre::eyre!("EEZL2_ADDRESS required when EEZ_L2_SYSTEM_KEY is set"))?;
     let rollup_id_str = env::var("EEZ_ROLLUP_ID")
         .map_err(|_| eyre::eyre!("EEZ_ROLLUP_ID required when EEZ_L2_SYSTEM_KEY is set"))?;
 
     let system_signer =
         PrivateKeySigner::from_bytes(&B256::from_str(system_key.trim_start_matches("0x"))?)?;
-    let ccm_l2_address: Address = Address::from_str(&ccm_l2_str)?;
+    let eezl2_address: Address = Address::from_str(&eezl2_address_str)?;
     let this_rollup_id: u64 = rollup_id_str
         .parse()
         .map_err(|e| eyre::eyre!("EEZ_ROLLUP_ID malformed: {e}"))?;
 
     Ok(Some(eez_protocol::system_tx::SystemTxContext {
         system_signer,
-        ccm_l2_address,
+        eezl2_address,
         l2_chain_id: chain_spec.chain().id(),
         l2_gas_price: 1_000_000_000,
         l2_gas_limit: 2_000_000,
@@ -1074,7 +1071,7 @@ fn xchain_front_specs(l1_chain_id: u64, l2_chain_id: u64) -> [XchainFrontSpec; 2
 fn read_xchain_front_config(
     port_env: &str,
     url_env: &str,
-) -> eyre::Result<Option<(u16, String, reqwest::Url)>> {
+) -> eyre::Result<(u16, String, reqwest::Url)> {
     let port = match env::var(port_env) {
         Ok(value) => Some(value),
         Err(env::VarError::NotPresent) => None,
@@ -1093,10 +1090,8 @@ fn parse_xchain_front_config(
     url_env: &str,
     port: Option<&str>,
     url: Option<&str>,
-) -> eyre::Result<Option<(u16, String, reqwest::Url)>> {
-    let Some(port_raw) = port else {
-        return Ok(None);
-    };
+) -> eyre::Result<(u16, String, reqwest::Url)> {
+    let port_raw = port.ok_or_else(|| eyre::eyre!("{port_env} is required in composer mode"))?;
     let port = port_raw
         .parse::<u16>()
         .map_err(|err| eyre::eyre!("{port_env}={port_raw:?} malformed: {err}"))?;
@@ -1106,23 +1101,19 @@ fn parse_xchain_front_config(
     let parsed = url_raw
         .parse::<reqwest::Url>()
         .map_err(|err| eyre::eyre!("{url_env}={url_raw:?} malformed: {err}"))?;
-    Ok(Some((port, url_raw.to_string(), parsed)))
+    Ok((port, url_raw.to_string(), parsed))
 }
 
-fn require_xchain_composer_wiring(
-    port_env: &str,
-    front_enabled: bool,
-    composer_wired: bool,
-) -> eyre::Result<()> {
-    if front_enabled && !composer_wired {
+fn require_xchain_composer_wiring(composer_wired: bool) -> eyre::Result<()> {
+    if !composer_wired {
         return Err(eyre::eyre!(
-            "{port_env} enables cross-chain ingress, but the cross-chain composer is unavailable; configure embedded L1 composition or unset {port_env}"
+            "composer mode requires cross-chain composer wiring; configure embedded L1 composition"
         ));
     }
     Ok(())
 }
 
-/// Build the [`EmbeddedL1Config`] from env; all vars optional, with testing
+/// Build the `EmbeddedL1Config` from env; all vars optional, with testing
 /// defaults so the smoke harness only overrides what it needs.
 ///
 ///   - `EEZ_L1_HTTP_PORT` — default `18545` (WS = http_port + 1)
@@ -1231,10 +1222,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn xchain_front_absent_port_disables_front() {
-        let parsed = parse_xchain_front_config("PORT", "URL", None, Some("http://127.0.0.1:8545"))
-            .expect("absent port is allowed");
-        assert!(parsed.is_none());
+    fn xchain_front_missing_port_fails_fast() {
+        let err = parse_xchain_front_config("PORT", "URL", None, Some("http://127.0.0.1:8545"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("PORT is required in composer mode"));
     }
 
     #[test]
@@ -1266,8 +1258,7 @@ mod tests {
     fn xchain_front_valid_config_is_returned() {
         let (port, url, parsed) =
             parse_xchain_front_config("PORT", "URL", Some("8546"), Some("http://127.0.0.1:8545"))
-                .expect("valid config")
-                .expect("front enabled");
+                .expect("valid config");
 
         assert_eq!(port, 8546);
         assert_eq!(url, "http://127.0.0.1:8545");
@@ -1276,13 +1267,12 @@ mod tests {
 
     #[test]
     fn xchain_front_requires_composer_wiring() {
-        let err = require_xchain_composer_wiring("PORT", true, false)
+        let err = require_xchain_composer_wiring(false)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("PORT enables cross-chain ingress"));
+        assert!(err.contains("composer mode requires cross-chain composer wiring"));
 
-        require_xchain_composer_wiring("PORT", true, true).unwrap();
-        require_xchain_composer_wiring("PORT", false, false).unwrap();
+        require_xchain_composer_wiring(true).unwrap();
     }
 
     #[test]

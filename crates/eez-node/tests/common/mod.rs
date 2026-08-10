@@ -4,8 +4,7 @@
 
 use std::{
     collections::HashSet,
-    fmt::Write as _,
-    net::TcpListener,
+    net::{TcpListener, UdpSocket},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
@@ -22,15 +21,7 @@ use alloy_rpc_types_eth::{BlockNumHash, BlockNumberOrTag, TransactionReceipt, Tr
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent, SolValue, sol};
 use anyhow::{Context, Result, anyhow, bail};
-use eez_control_rpc::MAX_MESSAGE_BYTES;
-use eez_control_rpc::v1::{
-    ProveChunk, ProveResponse, prove_chunk,
-    prover_client::ProverClient,
-    prover_server::{Prover, ProverServer},
-};
-use tokio::task::JoinHandle;
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{Request, Response, Status, Streaming};
+use eez_protocol::EEZL2_ADDRESS;
 
 /// Anvil's first default account (mnemonic `test test test test test test test test test test test junk`).
 pub const ANVIL_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -43,6 +34,9 @@ pub const ANVIL_KEY_4: &str = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f873
 pub const ANVIL_ATTESTER_KEY: &str =
     "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906");
+/// Dedicated deterministic L2 system identity; deliberately not an Anvil account.
+pub const L2_SYSTEM_KEY: &str =
+    "0x6f7d72ecb79c8bf1bd8e7c49a1c4a22741ab708f06bb19e5b5d44a6f0934a7c1";
 
 // K = L1/L2 = 2 matches standalone's 2s cadence and leaves one L2 slot for proving.
 const L1_BLOCK_TIME_SECS: u64 = 4;
@@ -79,17 +73,71 @@ fn anvil_bin() -> String {
     "anvil".to_string()
 }
 
-fn free_port() -> u16 {
+/// Probe a currently available TCP port.
+///
+/// The listener is released on return, so this is not a reservation.
+pub fn free_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.local_addr().expect("local_addr").port()
+}
+
+fn probe_unique_tcp_port(used: &mut HashSet<u16>) -> u16 {
     loop {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("local_addr").port();
-        if ASSIGNED_PORTS
-            .lock()
-            .expect("port mutex poisoned")
-            .insert(port)
-        {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind TCP probe");
+        let port = listener.local_addr().expect("TCP probe local_addr").port();
+        if used.insert(port) {
             return port;
         }
+    }
+}
+
+fn probe_unique_udp_port(used: &mut HashSet<u16>) -> u16 {
+    loop {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind UDP probe");
+        let port = socket.local_addr().expect("UDP probe local_addr").port();
+        if used.insert(port) {
+            return port;
+        }
+    }
+}
+
+fn probe_unique_tcp_udp_port(used: &mut HashSet<u16>) -> u16 {
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind TCP probe");
+        let port = listener.local_addr().expect("TCP probe local_addr").port();
+        if used.contains(&port) {
+            continue;
+        }
+        let Ok(socket) = UdpSocket::bind(("127.0.0.1", port)) else {
+            continue;
+        };
+        drop(socket);
+        used.insert(port);
+        return port;
+    }
+}
+
+/// Probe an HTTP port whose implicit `port + 1` WS listener is also available.
+fn probe_unique_http_port(used: &mut HashSet<u16>) -> u16 {
+    loop {
+        let http_listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP probe");
+        let http_port = http_listener
+            .local_addr()
+            .expect("HTTP probe local_addr")
+            .port();
+        let Some(ws_port) = http_port.checked_add(1) else {
+            continue;
+        };
+        if used.contains(&http_port) || used.contains(&ws_port) {
+            continue;
+        }
+        let Ok(ws_listener) = TcpListener::bind(("127.0.0.1", ws_port)) else {
+            continue;
+        };
+        drop(ws_listener);
+        used.insert(http_port);
+        used.insert(ws_port);
+        return http_port;
     }
 }
 
@@ -141,6 +189,8 @@ impl Anvil {
         cmd.args([
             "--port",
             &port.to_string(),
+            "--chain-id",
+            &DEV_CHAIN_ID.to_string(),
             "--block-time",
             &cfg.block_time_secs.to_string(),
             "--silent",
@@ -793,13 +843,10 @@ impl Harness {
             ("EEZ_L1_TARGET_RPC_URL", self.anvil.rpc_url.clone()),
             ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
             ("EEZ_L1_POSTER_KEY", opts.poster_key.to_string()),
-            ("EEZ_L1_CHAIN_ID", "31337".to_string()),
+            ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
-            ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
-            (
-                "EEZ_CCM_L2_ADDRESS",
-                "0x4200000000000000000000000000000000000007".to_string(),
-            ),
+            ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
+            ("EEZL2_ADDRESS", format!("{EEZL2_ADDRESS:#x}")),
             (
                 "EEZ_L1_BLOCK_TIME_MS",
                 (L1_BLOCK_TIME_SECS * 1000).to_string(),
@@ -896,20 +943,20 @@ sol! {
     #[sol(rpc)]
     interface IEEZ {
         event BatchPosted(uint256 rollupCount);
-        event L2ExecutionPerformed(uint256 indexed rollupId, bytes32 newState);
-        event ImmediateEntrySkipped(uint256 indexed transientIdx, bytes revertData);
-        function rollups(uint256 rollupId) external view returns (address rollupContract, bytes32 stateRoot, uint256 etherBalance);
+        event L2ExecutionPerformed(uint64 indexed rollupId, bytes32 newState);
+        event L2TxSkipped(uint256 indexed transientIdx, bytes revertData);
+        function rollups(uint64 rollupId) external view returns (address rollupContract, bytes32 stateRoot, uint256 etherBalance);
         function rollupCounter() external view returns (uint256);
-        function registerRollup(address rollupContract, bytes32 initialState) external returns (uint256 rollupId);
+        function registerRollup(address rollupContract, bytes32 initialState) external returns (uint64 rollupId);
     }
 }
 
 /// Reth's `--chain dev` genesis state root. Used as the `initialState`
 /// when registering the rollup so the very first batch's prestate
 /// (`l2_state_root(0)`) matches the on-chain `rollups[rid].stateRoot`.
-/// With the default `B256::ZERO`, every batch's `_applyStateDeltas`
+/// With the default `B256::ZERO`, every batch's `_applyStateUpdates`
 /// reverts with `StateRootMismatch`, caught by the try/catch,
-/// emitting `ImmediateEntrySkipped` instead of `L2ExecutionPerformed`.
+/// emitting `L2TxSkipped` instead of `L2ExecutionPerformed`.
 pub fn dev_genesis_state_root() -> B256 {
     reth_chainspec::DEV.genesis_header().state_root
 }
@@ -1062,7 +1109,7 @@ async fn deploy_contracts_with_initial(
         &provider,
         signer_addr,
         &out.join("EEZ.sol/EEZ.json"),
-        Vec::new(),
+        signer_addr.abi_encode(),
     )
     .await?;
     let deploy_block = provider.get_block_number().await?;
@@ -1204,16 +1251,23 @@ impl NodeHandle {
         let f = std::fs::File::create(&log_path).context("create log file")?;
         let f2 = f.try_clone().context("clone log file")?;
         let (stdout, stderr) = (Stdio::from(f), Stdio::from(f2));
-        let authrpc_port = free_port();
-        let http_port = free_port();
-        let ws_port = free_port();
-        let p2p_port = free_port();
-        let l1_http_port = free_port();
-        let mut l1_auth_port = free_port();
-        while l1_auth_port == l1_http_port || l1_auth_port == l1_http_port.saturating_add(1) {
-            l1_auth_port = free_port();
-        }
-        let l1_p2p_port = free_port();
+        // Reth defaults collide if any test or unrelated process holds them.
+        // Each NodeHandle picks its own ephemeral ports for authrpc / http / ws / p2p.
+        // These are availability probes, not reservations: the sockets are
+        // released before the child binds. The set prevents deterministic
+        // collisions among one node's listeners.
+        let mut used_ports = HashSet::new();
+        let authrpc_port = probe_unique_tcp_port(&mut used_ports);
+        let http_port = probe_unique_tcp_port(&mut used_ports);
+        let ws_port = probe_unique_tcp_port(&mut used_ports);
+        let p2p_port = probe_unique_tcp_port(&mut used_ports);
+        let l1_http_port = probe_unique_http_port(&mut used_ports);
+        let l1_auth_port = probe_unique_tcp_port(&mut used_ports);
+        // Embedded L1 uses this numeric port for RLPx TCP and discovery UDP.
+        let l1_p2p_port = probe_unique_tcp_udp_port(&mut used_ports);
+        let l1_discv5_port = probe_unique_udp_port(&mut used_ports);
+        let l1_xchain_port = probe_unique_tcp_port(&mut used_ports);
+        let l2_xchain_port = probe_unique_tcp_port(&mut used_ports);
         let l1_datadir = datadir.join("embedded-l1");
         let env_genesis = env
             .iter()
@@ -1267,6 +1321,9 @@ impl NodeHandle {
         cmd.env("EEZ_L1_HTTP_PORT", l1_http_port.to_string())
             .env("EEZ_L1_AUTH_PORT", l1_auth_port.to_string())
             .env("EEZ_L1_P2P_PORT", l1_p2p_port.to_string())
+            .env("EEZ_L1_DISCV5_PORT", l1_discv5_port.to_string())
+            .env("EEZ_L1_XCHAIN_PORT", l1_xchain_port.to_string())
+            .env("EEZ_L2_XCHAIN_PORT", l2_xchain_port.to_string())
             .env("EEZ_L1_DATADIR", &l1_datadir)
             // May be overridden below when a test uses another L2 upstream.
             .env("EEZ_L2_RPC_URL", format!("http://127.0.0.1:{http_port}"));
@@ -1670,7 +1727,7 @@ impl<'a> Chain<'a> {
         count_events(
             self.rpc_url,
             self.eez_address,
-            IEEZ::ImmediateEntrySkipped::SIGNATURE_HASH,
+            IEEZ::L2TxSkipped::SIGNATURE_HASH,
             self.deploy_block,
         )
         .await
@@ -1737,7 +1794,7 @@ pub async fn wait_for_l1_blocks(rpc_url: &str, target: u64, timeout: Duration) -
 pub async fn state_root(rpc_url: &str, eez: Address, rollup_id: u64) -> Result<B256> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let registry = IEEZ::new(eez, &provider);
-    let r = registry.rollups(U256::from(rollup_id)).call().await?;
+    let r = registry.rollups(rollup_id).call().await?;
     Ok(r.stateRoot)
 }
 
@@ -1984,19 +2041,16 @@ pub const DEV_CHAIN_ID: u64 = 1337;
 
 pub const FIRST_ROLLUP_ID: u64 = 1;
 
-/// CCM-L2 predeploy address in the L2 fixture genesis.
-pub const CCM_L2_ADDRESS: Address = address!("0x4200000000000000000000000000000000000007");
-
 sol! {
     #[sol(rpc)]
     interface IEEZProxy {
-        event CrossChainProxyCreated(address indexed proxy, address indexed originalAddress, uint256 indexed originalRollupId);
-        function createCrossChainProxy(address originalAddress, uint256 originalRollupId) external returns (address proxy);
+        event CrossChainProxyCreated(address indexed proxy, address indexed originalAddress, uint64 indexed originalRollupId);
+        function createCrossChainProxy(address originalAddress, uint64 originalRollupId) external returns (address proxy);
     }
     #[sol(rpc)]
-    interface ICCML2Proxy {
-        function createCrossChainProxy(address originalAddress, uint256 originalRollupId) external returns (address proxy);
-        function computeCrossChainProxyAddress(address originalAddress, uint256 originalRollupId) external view returns (address proxy);
+    interface IEEZL2Proxy {
+        function createCrossChainProxy(address originalAddress, uint64 originalRollupId) external returns (address proxy);
+        function computeCrossChainProxyAddress(address originalAddress, uint64 originalRollupId) external view returns (address proxy);
     }
     #[sol(rpc)]
     interface IValue {
@@ -2165,7 +2219,7 @@ pub async fn deploy_protocol_dev(
         key,
         DEV_CHAIN_ID,
         &out.join("EEZ.sol/EEZ.json"),
-        Vec::new(),
+        signer_addr.abi_encode(),
     )
     .await?;
     let provider = ProviderBuilder::new().connect_http(l1_rpc.parse()?);
@@ -2285,7 +2339,7 @@ pub async fn value_no_ret(rpc_url: &str, value_addr: Address) -> Result<U256> {
         .await?)
 }
 
-/// Create an outbound proxy through the CCM-L2 predeploy.
+/// Create an outbound proxy through the `EEZL2` predeploy.
 pub async fn create_l2_cross_chain_proxy(
     l2_rpc: &str,
     key: &str,
@@ -2293,9 +2347,9 @@ pub async fn create_l2_cross_chain_proxy(
     original_rollup_id: u64,
 ) -> Result<Address> {
     let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
-    let ccm = ICCML2Proxy::new(CCM_L2_ADDRESS, &provider);
-    let proxy = ccm
-        .computeCrossChainProxyAddress(target, U256::from(original_rollup_id))
+    let eezl2 = IEEZL2Proxy::new(EEZL2_ADDRESS, &provider);
+    let proxy = eezl2
+        .computeCrossChainProxyAddress(target, original_rollup_id)
         .call()
         .await?;
     let chain_id = provider.get_chain_id().await?;
@@ -2305,11 +2359,11 @@ pub async fn create_l2_cross_chain_proxy(
         key,
         chain_id,
         nonce,
-        Some(CCM_L2_ADDRESS),
+        Some(EEZL2_ADDRESS),
         U256::ZERO,
-        ICCML2Proxy::createCrossChainProxyCall {
+        IEEZL2Proxy::createCrossChainProxyCall {
             originalAddress: target,
-            originalRollupId: U256::from(original_rollup_id),
+            originalRollupId: original_rollup_id,
         }
         .abi_encode(),
         1_500_000,
@@ -2329,7 +2383,7 @@ pub async fn create_cross_chain_proxy(
 ) -> Result<Address> {
     let calldata = IEEZProxy::createCrossChainProxyCall {
         originalAddress: target,
-        originalRollupId: U256::from(rollup_id),
+        originalRollupId: rollup_id,
     }
     .abi_encode();
     let nonce = pending_nonce(l1_rpc, key).await?;
@@ -2459,8 +2513,10 @@ impl CrossChainConfig {
                 self.l1_genesis.0.to_string_lossy().into_owned(),
             ),
             ("EEZ_L1_POSTER_KEY", self.poster_key.to_string()),
-            ("EEZ_L2_SYSTEM_KEY", ANVIL_KEY.to_string()),
-            ("EEZ_CCM_L2_ADDRESS", format!("{CCM_L2_ADDRESS:#x}")),
+            // MockECDSA authorizes the deployer.
+            ("EEZ_PROOF_SIGNER_KEY", self.deployer_key.to_string()),
+            ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
+            ("EEZL2_ADDRESS", format!("{EEZL2_ADDRESS:#x}")),
             ("EEZ_L1_BLOCK_TIME_MS", "5000".to_string()),
             ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
             ("EEZ_PROOF_TIME_MS", "1000".to_string()),

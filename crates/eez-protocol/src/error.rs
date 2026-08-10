@@ -1,67 +1,25 @@
-//! Error types for the cross-chain protocol.
+//! Typed errors for protocol materialization, target execution, composition,
+//! and runtime composition orchestration.
 //!
-//! Four public error families — all follow the same **struct + kind +
-//! backtrace** shape. Matching goes through `.kind()`; construction is
-//! via `From<XxxErrorKind>` (or named helpers like
-//! [`ExecutorError::provider`]).
-//!
-//! # Hierarchy (wrapping direction)
-//!
-//! ```text
-//!   ComposerError                ← public face of Composer<P>
-//!       ├─ ComposerErrorKind::Protocol(ProtocolError)
-//!       └─ ComposerErrorKind::Executor(ExecutorError)
-//!
-//!   CompositionError             ← public face of compose_transaction
-//!       ├─ CompositionErrorKind::Protocol(ProtocolError)
-//!       └─ CompositionErrorKind::Executor(ExecutorError)
-//!
-//!   ProtocolError                ← pure protocol logic (entries, validation)
-//!       └─ ProtocolErrorKind     EmptyCalls | InvalidCheckpoint
-//!                                | UnknownTarget | InvalidEncoding
-//!                                | Unsupported
-//!
-//!   ExecutorError                ← target-chain client/session failures
-//!       └─ ExecutorErrorKind     Unavailable | Provider | Evm | Transport
-//!                                | Encoding | Serde | Missing
-//!                                | TargetTransactionReverted | Decode
-//!                                | EmptyBatch | InvalidReentry
-//! ```
-//!
-//! [`ComposerError`] flattens across the composition layer: the
-//! `From<CompositionError>` impl decomposes into the underlying
-//! protocol / executor layer, so a caller matches one level of
-//! `.kind()` instead of two.
-//!
-//! # Backtraces
-//!
-//! Each error records a [`Backtrace`] at construction. Backtrace
-//! capture is cheap when `RUST_BACKTRACE` is unset (the stdlib
-//! records the "disabled" sentinel); enabled backtraces are
-//! captured once per conversion point, so the wrapping chain shows
-//! where each layer intercepted.
+//! Public wrapper structs expose non-exhaustive kind enums through `kind()`.
+//! [`ComposerError`] flattens the intermediate
+//! [`CompositionError`] layer while preserving the originating protocol or
+//! executor error.
 
-use std::backtrace::Backtrace;
-
-/// Boxed source error — any `Send + Sync` error the underlying library
-/// emits. Used for `Provider`, `Evm`, `Transport`, and `Serde`
-/// variants so callers can inspect the root cause via
-/// `std::error::Error::source()` while keeping the protocol crate free
-/// of alloy/reth/tonic deps.
+/// Boxed source error used by provider-specific variants without exposing
+/// their concrete error types.
 ///
 /// Crate-private on purpose: downstream code shouldn't need to think
 /// about `Box<dyn Error>`. Use the public constructors
-/// ([`ExecutorError::provider`], [`ExecutorError::evm`],
-/// [`ExecutorError::transport`], [`ExecutorError::serde`]) — they
-/// accept any `impl std::error::Error + Send + Sync + 'static` and box
-/// it internally.
+/// ([`ExecutorError::provider`], [`ExecutorError::evm`]) — they accept
+/// any `impl std::error::Error + Send + Sync + 'static` and box it
+/// internally.
 pub(crate) type BoxedError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Generate the struct-layer boilerplate for an error type that wraps
-/// a `*Kind` enum plus a [`Backtrace`]. Emits the struct, its
-/// `kind()`/`backtrace()` accessors, `Display`, `Error::source`
-/// forwarding, and `From<*Kind>`. The corresponding `*Kind` enum is
-/// declared separately and carries the actual variants + thiserror.
+/// Generate the struct-layer boilerplate for an error type that wraps a
+/// `*Kind` enum. Emits the struct, its `kind()` accessor, `Display`,
+/// `Error::source` forwarding, and `From<*Kind>`. The corresponding `*Kind`
+/// enum is declared separately and carries the actual variants + thiserror.
 macro_rules! error_struct {
     (
         $(#[$meta:meta])*
@@ -70,7 +28,6 @@ macro_rules! error_struct {
         $(#[$meta])*
         $vis struct $name {
             kind: $kind,
-            bt: Backtrace,
         }
 
         impl $name {
@@ -78,10 +35,6 @@ macro_rules! error_struct {
             #[must_use]
             pub fn kind(&self) -> &$kind {
                 &self.kind
-            }
-            /// Backtrace captured at the construction site.
-            pub fn backtrace(&self) -> &Backtrace {
-                &self.bt
             }
         }
 
@@ -99,7 +52,7 @@ macro_rules! error_struct {
 
         impl From<$kind> for $name {
             fn from(kind: $kind) -> Self {
-                Self { kind, bt: Backtrace::capture() }
+                Self { kind }
             }
         }
     };
@@ -110,7 +63,7 @@ macro_rules! error_struct {
 error_struct! {
     /// Errors from pure protocol logic.
     ///
-    /// Wraps a [`ProtocolErrorKind`] plus a captured backtrace.
+    /// Wraps a [`ProtocolErrorKind`].
     #[derive(Debug)]
     pub struct ProtocolError wraps ProtocolErrorKind;
 }
@@ -122,29 +75,18 @@ pub enum ProtocolErrorKind {
     /// Composition was attempted with no cross-chain calls to include.
     #[error("no cross-chain calls to compose")]
     EmptyCalls,
-    /// Checkpoint content failed structural validation (e.g. per-rollup
-    /// state-delta chaining broke).
-    #[error("invalid checkpoint: {reason}")]
-    InvalidCheckpoint {
-        /// Human-readable description of the validation failure.
-        reason: String,
-    },
-    /// A recorded call references a rollup for which no target plan was
-    /// supplied.
+    /// A recorded call references an unregistered rollup.
     #[error("recorded call targets rollup {got}, which has no registered target plan")]
     UnknownTarget {
         /// The unknown rollup ID.
         got: crate::rollup_id::RollupId,
     },
-    /// Byte-level decoding of a chain-specific field (address, value,
-    /// calldata) failed.
+    /// A value required for protocol materialization is unresolved or
+    /// structurally incomplete.
     #[error("invalid encoding: {0}")]
     InvalidEncoding(String),
-    /// A protocol capability was invoked that this chain family does not
-    /// implement — e.g. a
-    /// [`build_l1_postbatch`](crate::entries::build_l1_postbatch)
-    /// impl that cannot actually settle outbound. Today only the
-    /// in-tree test fakes construct this variant.
+    /// The observed execution shape is outside the supported materialization
+    /// profile.
     #[error("unsupported protocol operation: {0}")]
     Unsupported(&'static str),
 }
@@ -157,7 +99,7 @@ pub type ProtocolResult<T> = Result<T, ProtocolError>;
 error_struct! {
     /// Errors from target-chain client/session implementations.
     ///
-    /// Wraps an [`ExecutorErrorKind`] plus a captured backtrace.
+    /// Wraps an [`ExecutorErrorKind`].
     #[derive(Debug)]
     pub struct ExecutorError wraps ExecutorErrorKind;
 }
@@ -172,14 +114,6 @@ impl ExecutorError {
     pub fn evm(e: impl Into<BoxedError>) -> Self {
         ExecutorErrorKind::Evm(e.into()).into()
     }
-    /// Build a `Transport` error from any `Error + Send + Sync + 'static`.
-    pub fn transport(e: impl Into<BoxedError>) -> Self {
-        ExecutorErrorKind::Transport(e.into()).into()
-    }
-    /// Build a `Serde` error from any `Error + Send + Sync + 'static`.
-    pub fn serde(e: impl Into<BoxedError>) -> Self {
-        ExecutorErrorKind::Serde(e.into()).into()
-    }
 }
 
 /// Variants of [`ExecutorError`].
@@ -193,73 +127,27 @@ pub enum ExecutorErrorKind {
     /// Underlying state/block provider failed (e.g. reth MDBX read).
     #[error("provider: {0}")]
     Provider(#[source] BoxedError),
-    /// EVM execution failed internally (revm halt, unknown opcode,
-    /// etc.). `TargetTransactionReverted` is distinct — it's the
-    /// contract-level revert.
-    ///
-    /// **Naming debt**: the variant name `Evm` is EVM-specific, but
-    /// the concept ("chain's execution engine failed internally") is
-    /// general. A future sibling chain family (WASM, Move, ...) would
-    /// need either this renamed to something like `EngineInternal`
-    /// (breaking API — `ExecutorError::evm` is the current public
-    /// constructor) or a fresh variant added (additive; the enum is
-    /// `#[non_exhaustive]`).
+    /// Target EVM setup or execution failed before a normal outcome could be
+    /// returned.
     #[error("evm: {0}")]
     Evm(#[source] BoxedError),
-    /// Wire-level failure (gRPC status, connection error).
-    #[error("transport: {0}")]
-    Transport(#[source] BoxedError),
-    /// Message crossed the wire but didn't decode (wrong byte length,
-    /// malformed proto field, bad address encoding).
+    /// Executor data has an invalid representation or concrete type.
     #[error("encoding: {0}")]
     Encoding(String),
-    /// Serialization / deserialization failure crossing the executor
-    /// boundary — typically a checkpoint blob. The exact backend
-    /// (`serde_json` today) is an implementation detail of the
-    /// transport crate, not part of this crate's public surface.
-    #[error("serde: {0}")]
-    Serde(#[source] BoxedError),
-    /// Expected data (header, outcome, etc.) was absent with no
-    /// underlying error to wrap — used for synthetic "`.ok_or_else`"
-    /// sites that aren't really provider failures.
+    /// Required provider or execution data was absent.
     #[error("missing {0}")]
     Missing(&'static str),
-    /// A target-chain transaction in a batch simulation reverted at
-    /// the contract level (distinct from internal EVM failures).
-    #[error("target transaction {index} reverted: return_data={return_data:?}")]
-    TargetTransactionReverted {
-        /// Zero-based position of the reverting transaction within the
-        /// simulated batch.
-        index: usize,
-        /// Raw revert data returned by the contract, if any.
-        return_data: Vec<u8>,
-    },
-    /// Failed to decode a higher-level structure (raw transaction,
-    /// checkpoint, etc.) — distinct from byte-level `Encoding`.
+    /// Failed to decode a higher-level input such as a raw transaction.
     #[error("decode: {0}")]
     Decode(String),
-    /// A batch simulation was asked to run with zero transactions.
-    /// Distinct from a successful batch with zero post-state change —
-    /// this signals the caller passed an empty slice, which the
-    /// upstream protocol's "invariant 7" (no silent failures) says
-    /// must be a loud error rather than a synthesized zero root.
-    #[error("batch simulation requires at least one transaction")]
-    EmptyBatch,
-    /// A nested dispatch attempted to route back to the same non-entry
-    /// chain that issued it (e.g. L2 → L2 self-dispatch).
-    /// Architecturally disallowed; L1→L2→L1 (re-entry through the
-    /// entry rollup) IS valid and is handled inline by the EVM
-    /// inspector via the overlay path. Raised by
-    /// [`Dispatcher::dispatch_call`](crate::CompositionBuilder::dispatch_call)'s
-    /// guard.
-    #[error(
-        "invalid re-entry: caller rollup {caller} attempted to dispatch to same rollup {target} \
-         (not the entry rollup)"
-    )]
+    /// A dispatch targeted a non-entry rollup that cannot safely accept
+    /// re-entry: either the caller targets itself or the target session is
+    /// already executing an outer call.
+    #[error("invalid re-entry from rollup {caller} to rollup {target}")]
     InvalidReentry {
         /// Rollup whose inspector issued the dispatch.
         caller: crate::rollup_id::RollupId,
-        /// Requested target rollup (equal to `caller`, not the entry).
+        /// Requested target rollup.
         target: crate::rollup_id::RollupId,
     },
 }
@@ -270,10 +158,9 @@ pub type ExecutorResult<T> = Result<T, ExecutorError>;
 // ── CompositionError ─────────────────────────────────────────────
 
 error_struct! {
-    /// Composition-pipeline error. `finalize` crosses the protocol /
-    /// executor boundary (CCM verification runs target-chain
-    /// simulation), so this type preserves both layers losslessly via
-    /// [`CompositionErrorKind`].
+    /// Error from composing one source transaction. Preserves protocol
+    /// materialization failures and target-execution failures from the
+    /// surrounding composition pipeline.
     #[derive(Debug)]
     pub struct CompositionError wraps CompositionErrorKind;
 }
@@ -306,26 +193,21 @@ impl From<ExecutorErrorKind> for CompositionError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CompositionErrorKind {
-    /// Protocol-layer failure during composition (entry building,
-    /// checkpoint validation, etc.).
+    /// Protocol-layer failure during entry building or composition validation.
     #[error("protocol: {0}")]
     Protocol(#[source] ProtocolError),
-    /// Target-chain execution failure raised during CCM verification.
+    /// Target-chain execution failure raised during composition.
     #[error("executor: {0}")]
     Executor(#[source] ExecutorError),
 }
 
-/// Shorthand for composition session results.
+/// Shorthand for composition results.
 pub type CompositionResult<T> = Result<T, CompositionError>;
 
 // ── ComposerError ────────────────────────────────────────────────
 
 error_struct! {
-    /// Errors from the generic [`Composer`](crate::Composer) orchestrator.
-    ///
-    /// Wraps the composition error family plus composer-specific
-    /// lifecycle failures (already-registered source/target, missing
-    /// registration).
+    /// Error surfaced by runtime composition orchestration.
     #[derive(Debug)]
     pub struct ComposerError wraps ComposerErrorKind;
 }
@@ -344,15 +226,8 @@ impl From<ExecutorError> for ComposerError {
 
 impl From<CompositionError> for ComposerError {
     fn from(e: CompositionError) -> Self {
-        // Decompose the composition error into its underlying layer so
-        // the composer surface flattens to a single-hop kind chain.
-        //
-        // Note: `e.bt` (the CompositionError's own backtrace) is
-        // discarded here. The inner ProtocolError / ExecutorError
-        // preserves the origin backtrace, which is what debugging
-        // needs. The discarded outer backtrace would just point at
-        // the `?` operator that performed this conversion —
-        // derivable from stack context already.
+        // Flatten the intermediate kind while preserving the originating
+        // protocol or executor error.
         match e.kind {
             CompositionErrorKind::Protocol(p) => ComposerErrorKind::Protocol(p).into(),
             CompositionErrorKind::Executor(ex) => ComposerErrorKind::Executor(ex).into(),

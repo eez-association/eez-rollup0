@@ -30,19 +30,25 @@ fn canonical_calldata_decodes_without_applying_later_semantic_gates() {
 }
 
 #[test]
-fn recorded_post_batch_decodes() {
-    let decoded = recorded_batch();
+fn target_batch_round_trips_through_the_canonical_abi() {
+    let expected = target_anchor_batch();
+    let decoded = decode_canonical_post_batch(encode_postbatch(&expected)).unwrap();
 
     assert_eq!(decoded.entries.len(), 1);
-    assert_eq!(decoded.entries[0].stateDeltas.len(), 1);
+    assert_eq!(decoded.entries[0].stateUpdates.len(), 1);
+    assert_eq!(
+        decoded.entries[0].abi_encode(),
+        expected.entries[0].abi_encode()
+    );
 }
 
 #[test]
-fn recorded_post_batch_has_a_valid_state_delta_chain() {
-    let root = b256!("f09d8f7da5bc5036f8dd9536c953e2212390a46fb3e553ece2b7d419131537b1");
+fn target_batch_has_a_valid_state_update_chain() {
+    let root = B256::repeat_byte(0x42);
 
     assert_eq!(
-        verify_state_delta_chain(&recorded_batch(), expected_rollup_id(), root, root).map(|_| ()),
+        verify_state_update_chain(&target_anchor_batch(), expected_rollup_id(), root, root)
+            .map(|_| ()),
         Ok(())
     );
 }
@@ -81,20 +87,16 @@ fn trailing_bytes_are_rejected() {
 }
 
 #[test]
-fn recomputes_the_recorded_public_input_hash() {
-    let proof_system_vkey = NonZeroProofSystemVkey::new(b256!(
-        "000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266"
-    ))
-    .unwrap();
-    let expected = b256!("e5cd0221135432a8f42b61e68f71f809d7e9b973c6866da2446fca8dd1339c98");
+fn signer_hash_matches_the_two_argument_protocol_api() {
+    let batch = target_anchor_batch();
+    let proof_system_vkey = test_proof_system_vkey();
+    let expected = public_inputs_hashes(&batch, proof_system_vkey.get()).unwrap()[0];
 
-    let batch = recorded_batch();
-    let expected_proof_system = batch.proofSystems[0];
     let result = recompute_public_input_hash(
         &batch,
         proof_system_vkey,
         expected_rollup_id(),
-        expected_proof_system,
+        EXPECTED_PROOF_SYSTEM,
     )
     .unwrap();
 
@@ -102,17 +104,16 @@ fn recomputes_the_recorded_public_input_hash() {
 }
 
 #[test]
-fn state_delta_endpoints_are_committed_and_bound_to_reexecution() {
+fn state_update_endpoints_are_committed_and_bound_to_reexecution() {
     let parent = B256::repeat_byte(0x11);
     let final_root = B256::repeat_byte(0x22);
     let wrong = B256::repeat_byte(0xee);
     let mut batch = carrier_batch();
-    batch
-        .entries
-        .push(state_entry(U256::from(1), parent, final_root));
+    batch.entries.push(state_entry(1, parent, final_root));
+    batch.immediateEntryCount = U256::from(1);
 
     assert_eq!(
-        verify_state_delta_chain(&batch, expected_rollup_id(), parent, final_root).map(|_| ()),
+        verify_state_update_chain(&batch, expected_rollup_id(), parent, final_root).map(|_| ()),
         Ok(())
     );
     let committed = recompute_public_input_hash(
@@ -124,7 +125,7 @@ fn state_delta_endpoints_are_committed_and_bound_to_reexecution() {
     .unwrap();
 
     let mut wrong_parent = batch.clone();
-    wrong_parent.entries[0].stateDeltas[0].currentState = wrong;
+    wrong_parent.entries[0].stateUpdates[0].currentState = wrong;
     assert_ne!(
         recompute_public_input_hash(
             &wrong_parent,
@@ -136,16 +137,16 @@ fn state_delta_endpoints_are_committed_and_bound_to_reexecution() {
         committed
     );
     assert_eq!(
-        verify_state_delta_chain(&wrong_parent, expected_rollup_id(), parent, final_root)
+        verify_state_update_chain(&wrong_parent, expected_rollup_id(), parent, final_root)
             .map(|_| ()),
-        Err(StateDeltaChainError::InitialRootMismatch {
+        Err(StateUpdateChainError::InitialRootMismatch {
             validated: parent,
             claimed: wrong,
         })
     );
 
     let mut wrong_final = batch;
-    wrong_final.entries[0].stateDeltas[0].newState = wrong;
+    wrong_final.entries[0].stateUpdates[0].newState = wrong;
     assert_ne!(
         recompute_public_input_hash(
             &wrong_final,
@@ -157,9 +158,9 @@ fn state_delta_endpoints_are_committed_and_bound_to_reexecution() {
         committed
     );
     assert_eq!(
-        verify_state_delta_chain(&wrong_final, expected_rollup_id(), parent, final_root)
+        verify_state_update_chain(&wrong_final, expected_rollup_id(), parent, final_root)
             .map(|_| ()),
-        Err(StateDeltaChainError::FinalMismatch {
+        Err(StateUpdateChainError::FinalMismatch {
             validated: final_root,
             claimed: wrong,
         })
@@ -169,7 +170,7 @@ fn state_delta_endpoints_are_committed_and_bound_to_reexecution() {
 #[test]
 fn proofs_are_not_an_input_to_the_hash_gate() {
     let mut batch = carrier_batch();
-    let hash = public_inputs_hashes(&batch, test_proof_system_vkey().get(), None).unwrap()[0];
+    let expected = public_inputs_hashes(&batch, test_proof_system_vkey().get()).unwrap()[0];
     batch.proofs = vec![Bytes::from_static(b"ignored"), Bytes::from(vec![0xaa; 65])];
 
     let result = recompute_public_input_hash(
@@ -180,32 +181,39 @@ fn proofs_are_not_an_input_to_the_hash_gate() {
     )
     .unwrap();
 
-    assert_eq!(result, hash);
+    assert_eq!(result, expected);
 }
 
 #[test]
-fn transient_counts_are_not_inputs_to_the_hash_gate() {
-    let batch = carrier_batch();
-    let expected = recompute_public_input_hash(
-        &batch,
-        test_proof_system_vkey(),
-        expected_rollup_id(),
-        EXPECTED_PROOF_SYSTEM,
-    )
-    .unwrap();
-    let mut rescheduled = batch;
-    rescheduled.transientExecutionEntryCount = U256::MAX;
-    rescheduled.transientLookupCallCount = U256::MAX;
+fn accepts_only_the_exact_leading_zero_proxy_run_as_immediate() {
+    let root = B256::ZERO;
+    let mut valid = carrier_batch();
+    valid.entries = vec![
+        state_entry(1, root, root),
+        state_entry(1, root, root),
+        state_entry(1, root, root),
+    ];
+    valid.entries[2].proxyEntryHash = B256::repeat_byte(0x33);
+    valid.immediateEntryCount = U256::from(2);
+    assert!(
+        recompute_public_input_hash(
+            &valid,
+            test_proof_system_vkey(),
+            expected_rollup_id(),
+            EXPECTED_PROOF_SYSTEM,
+        )
+        .is_ok()
+    );
 
-    let result = recompute_public_input_hash(
-        &rescheduled,
-        test_proof_system_vkey(),
-        expected_rollup_id(),
-        EXPECTED_PROOF_SYSTEM,
-    )
-    .unwrap();
-
-    assert_eq!(result, expected);
+    for (name, count) in [
+        ("count shorter than leading run", U256::from(1)),
+        ("count longer than leading run", U256::from(3)),
+        ("count does not fit usize", U256::MAX),
+    ] {
+        let mut batch = valid.clone();
+        batch.immediateEntryCount = count;
+        assert_structure_rejected(name, &batch);
+    }
 }
 
 #[test]
@@ -236,16 +244,12 @@ fn rejects_every_public_input_structural_violation() {
     cases.push(("no rollup assignments", batch));
 
     let mut batch = valid.clone();
-    batch.rollupIdsWithProofSystems[0].rollupId = U256::from(2);
+    batch.rollupIdsWithProofSystems[0].rollupId = 2;
     cases.push(("assignment for a different rollup", batch));
 
     let mut batch = valid.clone();
-    batch.rollupIdsWithProofSystems[0].rollupId = U256::ZERO;
+    batch.rollupIdsWithProofSystems[0].rollupId = 0;
     cases.push(("zero rollup id", batch));
-
-    let mut batch = valid.clone();
-    batch.rollupIdsWithProofSystems[0].rollupId = U256::from(u64::MAX) + U256::from(1);
-    cases.push(("rollup id above u64", batch));
 
     let mut batch = valid.clone();
     batch.rollupIdsWithProofSystems.push(rollup_row(2));
@@ -253,29 +257,40 @@ fn rejects_every_public_input_structural_violation() {
 
     for indices in [Vec::new(), vec![1], vec![0, 0], vec![0, 1]] {
         let mut batch = valid.clone();
-        batch.rollupIdsWithProofSystems[0].proofSystemIndex = indices;
+        batch.rollupIdsWithProofSystems[0].proofSystemIndexes = indices;
         cases.push(("invalid proof-system indices", batch));
     }
 
     let mut batch = valid.clone();
-    batch.crossProofSystemInteractions = B256::repeat_byte(0x42);
-    cases.push(("cross-proof-system interactions in single-PS mode", batch));
+    batch.expectedStateRootPerRollup = vec![ExpectedStateRootPerRollupSol {
+        rollupId: 1,
+        stateRoot: B256::ZERO,
+    }];
+    cases.push(("expected state-root pin", batch));
 
-    let mut batch = recorded_batch();
-    batch.entries[0].destinationRollupId = U256::from(2);
+    let mut batch = target_anchor_batch();
+    batch.entries[0].destinationRollupId = 2;
     cases.push(("entry destination outside batch", batch));
 
     let mut batch = valid.clone();
-    batch.l1ToL2lookupCalls.push(lookup(2));
-    cases.push(("lookup destination outside batch", batch));
+    batch.staticEntries.push(StaticExecutionEntrySol::default());
+    cases.push(("static entry", batch));
+
+    let mut batch = valid.clone();
+    batch.immediateStaticEntryCount = U256::from(1);
+    cases.push(("immediate static entry count", batch));
 
     let mut batch = valid.clone();
     batch.blockNumber = 1;
     cases.push(("bound block number", batch));
 
-    let mut batch = valid;
+    let mut batch = valid.clone();
     batch.blobIndices.push(U256::ZERO);
     cases.push(("blob index", batch));
+
+    let mut batch = valid;
+    batch.bindMsgSenderInPublicInput = true;
+    cases.push(("bound sender", batch));
 
     for (name, batch) in &cases {
         assert_structure_rejected(name, batch);

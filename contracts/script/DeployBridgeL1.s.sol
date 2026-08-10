@@ -2,7 +2,8 @@
 pragma solidity ^0.8.28;
 
 import {Script, console} from "forge-std/Script.sol";
-import {EEZ} from "sync-rollups-protocol/src/EEZ.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import {EEZ} from "eez-core-protocol/src/EEZ.sol";
 import {BridgeSender} from "../src/Bridge.sol";
 
 /// @notice Deploys the L1-side cross-chain bridge contracts:
@@ -27,7 +28,7 @@ contract DeployBridgeL1 is Script {
     function run() external {
         address eezAddr = vm.envAddress("EEZ_REGISTRY_ADDRESS");
         address l2DestAddr = vm.envAddress("EEZ_L2_BRIDGE_RECEIVER");
-        uint256 rollupId = vm.envUint("EEZ_ROLLUP_ID");
+        uint64 rollupId = SafeCast.toUint64(vm.envUint("EEZ_ROLLUP_ID"));
 
         EEZ eez = EEZ(eezAddr);
 

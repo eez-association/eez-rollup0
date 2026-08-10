@@ -35,19 +35,6 @@ use tracing::{debug, trace};
 // Re-exported so the prover-feed binary can pick a mode without depending on reth-trie.
 pub use reth_trie::ExecutionWitnessMode;
 
-/// Parse a `--witness.mode` flag value into an [`ExecutionWitnessMode`].
-///
-/// `canonical` = the minimized v2 format; `legacy` = the older format some
-/// stateless validators (e.g. ZisK's) expect. Used by the prover-feed
-/// binary (prover-chain P3).
-pub fn witness_mode_from_str(s: &str) -> eyre::Result<ExecutionWitnessMode> {
-    match s.to_ascii_lowercase().as_str() {
-        "canonical" => Ok(ExecutionWitnessMode::Canonical),
-        "legacy" => Ok(ExecutionWitnessMode::Legacy),
-        other => eyre::bail!("unknown witness mode {other:?} (expected `canonical` or `legacy`)"),
-    }
-}
-
 /// Re-execute `block` on its parent state and produce its execution witness
 /// (trie nodes + contract codes + key preimages + ancestor headers).
 ///

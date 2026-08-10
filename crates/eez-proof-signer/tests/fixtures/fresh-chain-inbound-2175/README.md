@@ -1,10 +1,12 @@
-# Fresh-chain successful-inbound settlement fixture
+# Pre-simplify inbound settlement fixture
 
 This fixture is a post-validation projection of the recorded window
 `[1561..2175]` from `fixtures/scenarios/fresh-chain-conformance`. Block 2175
 contains three successful inbound system transactions. The captured
 `PostBatch` commits to 615 block counts, 27 ordinary transactions and three
-L2-shape sidecars.
+L2-shape sidecars. Its entries use the superseded call-hash preimage, so the
+current signer retains this recording to prove that incompatible input is
+rejected before signing; it is not a positive conformance fixture.
 
 `postbatch.json` preserves every field and value from the exported recording
 object; the source file's SHA-256 is recorded separately in `oracle.json`.

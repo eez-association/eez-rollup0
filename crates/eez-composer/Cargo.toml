@@ -40,7 +40,6 @@ reth-payload-primitives.workspace         = true
 reth-primitives-traits.workspace          = true
 reth-revm.workspace                       = true
 reth-storage-api.workspace                = true
-reth-trie-common.workspace                = true
 
 # revm direct (overlay-channel paths in local/session.rs)
 revm.workspace = true
@@ -50,12 +49,6 @@ async-trait.workspace = true
 thiserror.workspace   = true
 tokio.workspace       = true
 tracing.workspace     = true
-
-[features]
-# TEST-ONLY (deriver-gate attack test): inject a corrupted OUTBOUND settlement
-# entry into postBatch so a live node exercises verify_outbound_authorized's
-# reject path. NEVER enabled in normal/release builds. Revert: `git restore`.
-fault-inject = []
 
 [lints]
 workspace = true

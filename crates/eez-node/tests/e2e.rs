@@ -116,8 +116,18 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
     seq_b.assert_no_divergence_failure_logs();
 }
 
-/// A composer keeps posting consistently across a restart of the same datadir.
-/// Batch count and height prove progress even when later empty blocks repeat a state root.
+/// Builder mode, sustained operation through a restart. Asserts every
+/// observable invariant in one place:
+///   - lockstep: `BatchPosted == L2ExecutionPerformed`, always;
+///   - zero `L2TxSkipped` (no prestate/rolling-hash misfire);
+///   - `latest_event.newState == rollups[rid].stateRoot` (event-state
+///     consistency);
+///   - state advances forward (≠ `B256::ZERO`, monotonic);
+///   - across restart: counts keep lockstep (no replay), state keeps
+///     advancing (`posted_through` re-seeded from on-chain logs).
+///
+/// Would have caught `immediateEntryCount = 0` (state never
+/// advances) AND any future replay bug across the restart boundary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn happy_case_composer_sustained() {
     let harness = Harness::fresh().await.unwrap();

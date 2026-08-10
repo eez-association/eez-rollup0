@@ -5,7 +5,7 @@ edition.workspace      = true
 license.workspace      = true
 rust-version.workspace = true
 readme                 = "README.md"
-description            = "EVM composer glue: revm Inspector for proxy-call detection + EVM-bound type aliases for the chain-agnostic Composer"
+description            = "EVM composer glue: revm inspector for proxy-call detection and shared-state overlays"
 
 [lints]
 workspace = true
@@ -19,7 +19,6 @@ eez-protocol.workspace = true
 # submission. The provider stack is wallet-filled by the caller; this
 # crate only depends on the trait surface, not on a concrete transport.
 alloy-primitives.workspace = true
-alloy-sol-types.workspace = true
 
 # EVM inspector (the one genuinely EVM-coupled piece in this crate)
 revm.workspace = true

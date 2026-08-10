@@ -1,73 +1,79 @@
 # eez-evm-inspector
 
-EVM-specific glue for the cross-chain composer.
+Detects cross-chain proxy calls while an EVM transaction executes and turns
+each one into a recorded, dispatched protocol call.
 
-This crate is deliberately tiny. It contributes:
+## Why a separate crate
 
-- **`SessionInspector`** — a `revm::Inspector` impl that detects
-  cross-chain proxy calls during source-chain EVM execution and
-  dispatches each one through a borrowed
-  `CompositionBuilder<EvmProtocol>`.
-- **Type aliases** binding the chain-agnostic `Composer<P>` /
-  `TargetConfig<P>` to `EvmProtocol` so downstream callers don't see
-  the generic parameter.
+Cross-chain composition needs to react to individual CALL opcodes, which only
+an EVM inspector can see. That couples this code to `revm`, and the coupling
+is deliberately confined here: [`eez-protocol`](../eez-protocol/) (types, ABI,
+`CompositionBuilder`) stays EVM-free so verifiers and external tools can
+consume it without the execution stack, while `eez-composer` wires this crate
+into reth.
 
-Everything else (orchestration, composition state, config types, the
-composer error families) lives in
-[`eez-protocol`](../eez-protocol/) as chain-agnostic
-generics; this crate only supplies the EVM-specific inspector and the
-type aliases.
-
-## Where it fits
-
-```
-eez-protocol   (traits + types + generic Composer<P>, CompositionBuilder<P>)
-        ↑
-eez-evm        (EvmProtocol + ABI + entry building)
-        ↑
-eez-evm-inspector   ← YOU ARE HERE  (SessionInspector + EVM aliases)
-        ↑
-eez-composer           (reth integration, wiring)
+```text
+eez-protocol            types, ABI, CompositionBuilder   (no revm)
+     ↑
+eez-evm-inspector       SessionInspector, overlay        (revm)
+     ↑
+eez-composer            reth integration, wiring
 ```
 
-## What this crate exports
+## How a call is detected and dispatched
 
-```rust
-// EVM-specific inspector + factory:
-pub use inspector::{SessionInspector, SessionInspectorFactory};
+`SessionInspector` hooks every mutable CALL during source simulation:
 
-// Overlay channel for shared-source-state nested dispatch:
-pub use inspector::{OverlayChannel, OverlayChannelHandle, new_overlay_channel};
+1. It reads `authorizedProxies[target]` from the **live** EVM state (revm
+   journal + DB), so proxies registered earlier in the same transaction or
+   block are visible — a pre-transaction snapshot would miss them.
+2. If the target is a registered proxy, the call is forwarded through
+   `CompositionBuilder::dispatch_call`, which executes it on the target
+   rollup's session and records it for batch materialization.
+3. The target's result is synthesized back into the source EVM as the CALL's
+   outcome — a failed dispatch surfaces as `Revert`, so Solidity `try/catch`
+   and revert accounting behave as if the call had run locally.
 
-// Overlay diff-apply + state-clone primitives:
-pub use overlay::{apply_overlay_diff, clone_state, OverlayError};
+The inspector also brackets every EVM frame with the dispatcher's
+recorded-call count. If a frame reverts after dispatching calls, that range is
+annotated as a revert span, and batch materialization refuses to emit those
+calls as successful entries.
 
-// Type aliases over the generic orchestrator:
-pub type Composer     = eez_protocol::Composer<EvmProtocol>;
-pub type TargetConfig = eez_protocol::TargetConfig<EvmProtocol>;
+## Nested re-entry: the overlay
 
-// Re-exports (chain-agnostic things callers shouldn't have to reach for):
-pub use eez_protocol::{
-    ComposerError, ComposerResult, DEFAULT_CCM_GAS_LIMIT, ProxyLookupConfig,
-};
-```
+A dispatched call may call back into the suspended rollup (flash-loan-style
+patterns). Its live `State` is mutably borrowed by the paused EVM, so the
+re-entered session cannot touch it directly. The overlay channel bridges that
+gap with cache snapshots:
 
-Downstream callers (e.g. `eez-composer`) `use eez_evm_inspector::{Composer, TargetConfig, ...}` and never deal with the `<EvmProtocol>` generic.
+1. Before every dispatch the inspector publishes a journal-refreshed snapshot
+   of its rollup's cache.
+2. A session that re-enters the rollup opens preloaded with that snapshot, so
+   it sees the in-flight state.
+3. The re-entered session publishes its post-execution cache; after dispatch
+   returns, the inspector applies the per-account, per-slot difference onto
+   the live state as journal entries — so an outer revert unwinds the applied
+   changes together with the source's own writes.
 
-## Running tests
+Snapshots are stacked, keeping recursive re-entry paired with its call frames.
+Mutations the diff cannot represent (SELFDESTRUCT) fail loudly instead of
+miscomposing.
+
+## Exports
+
+- `SessionInspector` / `SessionInspectorFactory` — detection and dispatch; the
+  factory is the only construction path.
+- `OverlayChannel`, `OverlayChannelHandle`, `new_overlay_channel` — snapshot
+  exchange for nested re-entry.
+- `apply_overlay_diff`, `OverlayError` — the diff-apply primitive and its
+  failure modes.
+
+## Tests
 
 ```bash
-cargo test -p eez-evm-inspector
+cargo test --package eez-evm-inspector
 ```
 
-Composer / composition-builder tests live in `eez-protocol` (the
-crate that owns the generic code). This crate's tests cover only
-`SessionInspector`-specific behavior.
-
-## Related docs
-
-- [`docs/CROSSCHAIN_EVM_COMPOSER.md`](../../docs/CROSSCHAIN_EVM_COMPOSER.md)
-  — design notes (why this crate is separate, what `OverlayChannel`
-  is, journal-aware snapshot rationale).
-- [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) — workspace
-  layering, data flows, transport polymorphism.
+The tests cover proxy lookup against live EVM state and overlay snapshot
+handling. Dispatch behavior is exercised by `eez-protocol`'s composition tests
+and `eez-node`'s cross-chain E2E suite.
