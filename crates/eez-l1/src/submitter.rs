@@ -395,7 +395,7 @@ impl Inner {
         &self,
         tx_hash: TxHash,
         target_block: u64,
-        pinned: Option<u64>,
+        pin_timestamp: Option<u64>,
         expected_final_state: Option<alloy_primitives::B256>,
     ) -> L1Result<SendOutcome> {
         // Failure must mean PROVABLY DEAD, not merely slow. A bundle is
@@ -435,7 +435,7 @@ impl Inner {
                     });
                 }
                 Ok(None) => {
-                    let verdict = match pinned {
+                    let verdict = match pin_timestamp {
                         Some(pin_ts) => {
                             pinned_slot_check(&target_provider, target_block, tx_hash, pin_ts).await
                         }

@@ -266,8 +266,12 @@ pub const MAX_BUNDLE_ATTEMPTS: u32 = 3;
 const POST_BATCH_EXECUTION_GAS_RESERVE: u64 = 4_000_000;
 
 /// Ceiling on a postBatch tx's gas limit, trimming a historical chunk's
-/// boundary. Under chiado's 17M block gas limit; `EEZ_MAX_POSTBATCH_GAS`.
+/// boundary. Under chiado's 17M block gas limit, and low enough to leave room
+/// for the bundled user_txs sharing the block; `EEZ_MAX_POSTBATCH_GAS`.
 const DEFAULT_MAX_POSTBATCH_GAS: u64 = 12_000_000;
+
+/// EIP-7825 cap
+const EIP_7825_TX_GAS_CAP: u64 = 16_777_216;
 
 /// EIP-7623 calldata floor. Below it the tx is INTRINSICALLY INVALID — no
 /// builder can include it and the bundle dies at simulation, silently.
@@ -336,12 +340,33 @@ fn clamp_max_blocks_per_batch(requested: u64, k: u64) -> u64 {
     k
 }
 
+/// Whether [`Composer::recover_failed_batch`] moved the canonical head. The
+/// caller needs it to know whether its slot parent is still current; deriving
+/// that by re-reading the head couples the two sites through a hash compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryOutcome {
+    /// A rollback and/or sibling commit landed — the caller's slot parent is stale.
+    HeadMoved,
+    /// Nothing was committed (bail, stale verdict, or nothing to roll back).
+    HeadUnchanged,
+}
+
 /// A budget with no room above the execution reserve can't fit even a minimal
 /// batch, so every emission path refuses forever — clamp loudly, like
 /// `clamp_max_blocks_per_batch`. `MIN_VIABLE` is the reserve plus room for a
 /// minimal batch's calldata floor.
 fn clamp_max_postbatch_gas(requested: u64) -> u64 {
     const MIN_VIABLE: u64 = POST_BATCH_EXECUTION_GAS_RESERVE + 1_000_000;
+    if requested > EIP_7825_TX_GAS_CAP {
+        event!(
+            name: "eez.composer.emission.gas_budget_clamped",
+            Level::WARN,
+            requested,
+            clamped_to = EIP_7825_TX_GAS_CAP,
+            "EEZ_MAX_POSTBATCH_GAS exceeds the EIP-7825 per-transaction cap; clamping",
+        );
+        return EIP_7825_TX_GAS_CAP;
+    }
     if requested >= MIN_VIABLE {
         return requested;
     }
@@ -550,7 +575,8 @@ struct Inner<L2: BlockReader> {
     /// in remote-prover mode; `None` (mock) leaves `blocks` empty.
     witness_source: std::sync::OnceLock<Arc<dyn eez_prover::ProvingWitnessSource>>,
     /// Bounds on what one postBatch may settle. Read from env once here so
-    /// every emission decision and the invariant-7 guard share one value.
+    /// the emission decision, the boundary math, and the span guard in
+    /// `prepare_post_batch_raw` can never disagree about the cap mid-run.
     emission: EmissionLimits,
 }
 
@@ -939,20 +965,16 @@ where
         // reorg it out) or permanently didn't (stale-parent bail —
         // nothing to roll back).
         if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
-            self.recover_failed_batch(rollup_id, rollup, failed).await;
-            // Recovery may leave the head in place (reinsert / stale-verdict);
-            // returning None then lets the mempool-fed commit_one fallback mint
-            // a tx-bearing block at this grid height. A moved head is covered by
-            // the Sequencer's stale-parent bail.
-            let head_unmoved = self
-                .inner
-                .committer
-                .get()
-                .is_some_and(|c| c.last_header().hash() == parent_header.hash());
-            if head_unmoved {
-                return self.build_empty_slot_block(rollup, &parent_header, timestamp);
-            }
-            return None;
+            // A moved head makes this slot's parent stale — the Sequencer's bail
+            // covers it. An UNCHANGED head (reinsert / stale-verdict) still owes
+            // the slot a block, and returning None there would let the
+            // mempool-fed commit_one fallback mint a tx-bearing grid block.
+            return match self.recover_failed_batch(rollup_id, rollup, failed).await {
+                RecoveryOutcome::HeadUnchanged => {
+                    self.build_empty_slot_block(rollup, &parent_header, timestamp)
+                }
+                RecoveryOutcome::HeadMoved => None,
+            };
         }
 
         let blocked = rollup.optimistic.blocking_height(cursor).is_some();
@@ -1113,7 +1135,7 @@ where
         };
         let cursor = rollup.l1_head.cursor();
         if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
-            self.recover_failed_batch(rollup_id, rollup, failed).await;
+            let _ = self.recover_failed_batch(rollup_id, rollup, failed).await;
         }
     }
 }
@@ -1173,8 +1195,11 @@ where
         rollup_id: u64,
         rollup: &RollupState<L2>,
         failed: crate::optimistic::FailedBatch,
-    ) {
+    ) -> RecoveryOutcome {
         let sync_height = failed.sync_height;
+        // Set by the two operations that move the head: the rollback and the
+        // sibling commit.
+        let mut outcome = RecoveryOutcome::HeadUnchanged;
         let Some(committer) = self.inner.committer.get() else {
             event!(
                 name: "eez.composer.recovery.no_committer",
@@ -1184,7 +1209,7 @@ where
                 "committer handle not wired; cannot recover failed batch",
             );
             rollup.optimistic.reinsert_failed(failed);
-            return;
+            return RecoveryOutcome::HeadUnchanged;
         };
         let mut landed = Vec::new();
         let mut receipt_error = None;
@@ -1209,7 +1234,7 @@ where
                 "user receipt lookup failed; retaining failed batch for retry",
             );
             rollup.optimistic.reinsert_failed(failed);
-            return;
+            return RecoveryOutcome::HeadUnchanged;
         }
         // Reorg only if the failed block (or descendants) actually
         // became canonical. Rich Sync blocks carry unsettled
@@ -1237,7 +1262,7 @@ where
                     cursor = rollup.l1_head.cursor(),
                     "failure verdict is stale — Deriver confirmed the batch from L1; dropping recovery",
                 );
-                return;
+                return RecoveryOutcome::HeadUnchanged;
             }
             let head = committer.last_header();
             if head.number() >= sync_height {
@@ -1251,8 +1276,9 @@ where
                         "reorg_to failed; keeping entry Failed — next slot retries",
                     );
                     rollup.optimistic.reinsert_failed(failed);
-                    return;
+                    return RecoveryOutcome::HeadUnchanged;
                 }
+                outcome = RecoveryOutcome::HeadMoved;
                 event!(
                     name: "eez.composer.recovery.rolled_back",
                     Level::WARN,
@@ -1292,14 +1318,17 @@ where
                         .commit_derived(built.payload, built.header, true)
                         .await
                     {
-                        Ok(_) => event!(
-                            name: "eez.composer.recovery.substituted",
-                            Level::WARN,
-                            rollup_id,
-                            sync_height,
-                            timestamp,
-                            "failed Sync block substituted with its empty sibling",
-                        ),
+                        Ok(_) => {
+                            outcome = RecoveryOutcome::HeadMoved;
+                            event!(
+                                name: "eez.composer.recovery.substituted",
+                                Level::WARN,
+                                rollup_id,
+                                sync_height,
+                                timestamp,
+                                "failed Sync block substituted with its empty sibling",
+                            );
+                        }
                         Err(err) => event!(
                             name: "eez.composer.recovery.substitute_failed",
                             Level::ERROR,
@@ -1430,6 +1459,7 @@ where
                 );
             }
         }
+        outcome
     }
 
     /// Simulate each drained transaction, construct canonical L2 system
@@ -2278,13 +2308,18 @@ where
                 .find_block_by_hash(hash, BlockSource::Any)
                 .map_err(|e| format!("find_block_by_hash({hash}, n={number}): {e}"))?
                 .ok_or_else(|| format!("local L2 block hash {hash} (n={number}) missing"))?;
+            // Extra per-block framing (ABI wrapper, length prefixes, anchor, proof) beyond raw tx
+            // bytes. Undercounting picks a boundary sign_post_batch_tx rejects on gas — and since
+            // it's a pure fn of (cursor, cap, K), every retry picks the same boundary and loops forever.
+            const PER_BLOCK_FRAMING_BYTES: u64 = 64;
             sizes.push(
                 block
                     .body()
                     .transactions()
                     .iter()
                     .map(|tx| Encodable2718::encode_2718_len(tx) as u64)
-                    .sum(),
+                    .sum::<u64>()
+                    .saturating_add(PER_BLOCK_FRAMING_BYTES),
             );
             hash = block.header().parent_hash();
             number -= 1;
