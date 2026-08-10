@@ -265,9 +265,18 @@ pub const MAX_BUNDLE_ATTEMPTS: u32 = 3;
 /// is ~500K; the rest is headroom for the bundled user_txs in the same block.
 const POST_BATCH_EXECUTION_GAS_RESERVE: u64 = 4_000_000;
 
+/// Stand-in length for `batch.proofs[0]` when the candidate is sized before the
+/// prover runs. An ECDSA attestation is 65 bytes; 128 covers it with slack, and
+/// the signing-side ceiling in `sign_post_batch_tx` is the backstop if a proof
+/// system ever returns more.
+const MAX_PROOF_BYTES: usize = 128;
+
 /// Ceiling on a postBatch tx's gas limit, trimming a historical chunk's
-/// boundary. Under chiado's 17M block gas limit; `EEZ_MAX_POSTBATCH_GAS`.
-const DEFAULT_MAX_POSTBATCH_GAS: u64 = 12_000_000;
+/// boundary; `EEZ_MAX_POSTBATCH_GAS` overrides within range. It is the EIP-7825
+/// per-tx gas cap (2^24) — nothing above it is valid at any block gas limit. A
+/// historical chunk bundles alone and may claim the whole block; headroom for
+/// bundled user_txs is [`POST_BATCH_EXECUTION_GAS_RESERVE`]'s job.
+const DEFAULT_MAX_POSTBATCH_GAS: u64 = 16_777_216;
 
 /// EIP-7623 calldata floor. Below it the tx is INTRINSICALLY INVALID — no
 /// builder can include it and the bundle dies at simulation, silently.
@@ -275,12 +284,6 @@ fn calldata_floor_gas(calldata: &[u8]) -> u64 {
     let nonzero = calldata.iter().filter(|byte| **byte != 0).count() as u64;
     let zero = calldata.len() as u64 - nonzero;
     21_000 + 10 * (zero + 4 * nonzero)
-}
-
-/// Floor gas for `bytes` bytes, all counted non-zero: the boundary trim prices
-/// a chunk before the batch exists, so it must never UNDER-estimate.
-const fn projected_floor_gas(bytes: u64) -> u64 {
-    21_000 + 40 * bytes
 }
 
 /// Emission bounds, resolved once at construction. `timing` is here for its
@@ -300,7 +303,11 @@ const PROOF_SIGNER_DEFAULT_REQUEST_WINDOW: u64 = 512;
 impl EmissionLimits {
     fn from_env(timing: RollupTiming) -> Self {
         let k = u64::from(timing.k());
-        let requested = env_u64("EEZ_MAX_BLOCKS_PER_BATCH").unwrap_or(MAX_BLOCKS_PER_BATCH);
+        let requested = std::env::var("EEZ_MAX_BLOCKS_PER_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(MAX_BLOCKS_PER_BATCH);
         let max_blocks = clamp_max_blocks_per_batch(requested, k);
         if max_blocks >= PROOF_SIGNER_DEFAULT_REQUEST_WINDOW {
             event!(
@@ -311,7 +318,11 @@ impl EmissionLimits {
                 "EEZ_MAX_BLOCKS_PER_BATCH meets or exceeds the proof signer's default request window; prove() will reject every chunk unless EEZ_PROOF_SIGNER_MAX_REQUEST_BLOCKS was raised to match",
             );
         }
-        let requested_gas = env_u64("EEZ_MAX_POSTBATCH_GAS").unwrap_or(DEFAULT_MAX_POSTBATCH_GAS);
+        let requested_gas = std::env::var("EEZ_MAX_POSTBATCH_GAS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_MAX_POSTBATCH_GAS);
         Self {
             timing,
             max_blocks,
@@ -336,13 +347,29 @@ fn clamp_max_blocks_per_batch(requested: u64, k: u64) -> u64 {
     k
 }
 
-/// A budget with no room above the execution reserve can't fit even a minimal
-/// batch, so every emission path refuses forever — clamp loudly, like
-/// `clamp_max_blocks_per_batch`. `MIN_VIABLE` is the reserve plus room for a
-/// minimal batch's calldata floor.
+/// Whether [`Composer::recover_failed_batch`] moved the canonical head, so the
+/// caller knows whether its slot still owes a block. Reported by the callee
+/// because only recovery knows which of its several exits committed anything.
+///
+/// Covers the callee's action only — a head the Deriver moved concurrently isn't
+/// distinguished, and needn't be: the block then goes out on a stale parent and
+/// `commit_one_prebuilt`'s stale-parent check discards it under the reconcile lock.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryOutcome {
+    /// A rollback and/or sibling commit landed — the caller's slot parent is stale.
+    HeadMoved,
+    /// Nothing was committed (bail, stale verdict, or nothing to roll back).
+    HeadUnchanged,
+}
+
+/// Both ends are unusable and clamp to the default: above it no tx is valid
+/// (EIP-7825), and with no room above the execution reserve every emission path
+/// refuses forever. `MIN_VIABLE` is the reserve plus room for a minimal batch's
+/// calldata floor.
 fn clamp_max_postbatch_gas(requested: u64) -> u64 {
     const MIN_VIABLE: u64 = POST_BATCH_EXECUTION_GAS_RESERVE + 1_000_000;
-    if requested >= MIN_VIABLE {
+    if (MIN_VIABLE..=DEFAULT_MAX_POSTBATCH_GAS).contains(&requested) {
         return requested;
     }
     event!(
@@ -351,27 +378,9 @@ fn clamp_max_postbatch_gas(requested: u64) -> u64 {
         requested,
         clamped_to = DEFAULT_MAX_POSTBATCH_GAS,
         reserve = POST_BATCH_EXECUTION_GAS_RESERVE,
-        "EEZ_MAX_POSTBATCH_GAS leaves no room above the execution reserve; every postBatch would be refused — clamping to the default",
+        "EEZ_MAX_POSTBATCH_GAS is out of range (must leave room above the execution reserve and stay within the EIP-7825 tx gas cap) — clamping to the default",
     );
     DEFAULT_MAX_POSTBATCH_GAS
-}
-
-/// Read a positive `u64` knob; absent, malformed, or zero → `None` (loud).
-fn env_u64(var: &str) -> Option<u64> {
-    let raw = std::env::var(var).ok()?;
-    match raw.trim().parse::<u64>() {
-        Ok(value) if value > 0 => Some(value),
-        _ => {
-            event!(
-                name: "eez.composer.emission.bad_env",
-                Level::ERROR,
-                env_var = var,
-                value = %raw,
-                "expected a positive integer; falling back to the built-in default",
-            );
-            None
-        }
-    }
 }
 
 /// Classify a `simulate_and_resolve` failure. `true` = DETERMINISTIC:
@@ -550,7 +559,8 @@ struct Inner<L2: BlockReader> {
     /// in remote-prover mode; `None` (mock) leaves `blocks` empty.
     witness_source: std::sync::OnceLock<Arc<dyn eez_prover::ProvingWitnessSource>>,
     /// Bounds on what one postBatch may settle. Read from env once here so
-    /// every emission decision and the invariant-7 guard share one value.
+    /// the emission decision, the boundary math, and the span guard in
+    /// `prepare_post_batch_raw` can never disagree about the cap mid-run.
     emission: EmissionLimits,
 }
 
@@ -939,20 +949,16 @@ where
         // reorg it out) or permanently didn't (stale-parent bail —
         // nothing to roll back).
         if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
-            self.recover_failed_batch(rollup_id, rollup, failed).await;
-            // Recovery may leave the head in place (reinsert / stale-verdict);
-            // returning None then lets the mempool-fed commit_one fallback mint
-            // a tx-bearing block at this grid height. A moved head is covered by
-            // the Sequencer's stale-parent bail.
-            let head_unmoved = self
-                .inner
-                .committer
-                .get()
-                .is_some_and(|c| c.last_header().hash() == parent_header.hash());
-            if head_unmoved {
-                return self.build_empty_slot_block(rollup, &parent_header, timestamp);
-            }
-            return None;
+            // A moved head makes this slot's parent stale — the Sequencer's bail
+            // covers it. An UNCHANGED head (reinsert / stale-verdict) still owes
+            // the slot a block, and returning None there would let the
+            // mempool-fed commit_one fallback mint a tx-bearing grid block.
+            return match self.recover_failed_batch(rollup_id, rollup, failed).await {
+                RecoveryOutcome::HeadUnchanged => {
+                    self.build_empty_slot_block(rollup, &parent_header, timestamp)
+                }
+                RecoveryOutcome::HeadMoved => None,
+            };
         }
 
         let blocked = rollup.optimistic.blocking_height(cursor).is_some();
@@ -1113,7 +1119,9 @@ where
         };
         let cursor = rollup.l1_head.cursor();
         if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
-            self.recover_failed_batch(rollup_id, rollup, failed).await;
+            // Deliberately ignored: a tick owes no block, and the Sequencer
+            // re-reads the head right after this hook returns.
+            let _ = self.recover_failed_batch(rollup_id, rollup, failed).await;
         }
     }
 }
@@ -1173,8 +1181,11 @@ where
         rollup_id: u64,
         rollup: &RollupState<L2>,
         failed: crate::optimistic::FailedBatch,
-    ) {
+    ) -> RecoveryOutcome {
         let sync_height = failed.sync_height;
+        // Set by the two operations that move the head: the rollback and the
+        // sibling commit.
+        let mut outcome = RecoveryOutcome::HeadUnchanged;
         let Some(committer) = self.inner.committer.get() else {
             event!(
                 name: "eez.composer.recovery.no_committer",
@@ -1184,7 +1195,7 @@ where
                 "committer handle not wired; cannot recover failed batch",
             );
             rollup.optimistic.reinsert_failed(failed);
-            return;
+            return RecoveryOutcome::HeadUnchanged;
         };
         let mut landed = Vec::new();
         let mut receipt_error = None;
@@ -1209,7 +1220,7 @@ where
                 "user receipt lookup failed; retaining failed batch for retry",
             );
             rollup.optimistic.reinsert_failed(failed);
-            return;
+            return RecoveryOutcome::HeadUnchanged;
         }
         // Reorg only if the failed block (or descendants) actually
         // became canonical. Rich Sync blocks carry unsettled
@@ -1237,7 +1248,7 @@ where
                     cursor = rollup.l1_head.cursor(),
                     "failure verdict is stale — Deriver confirmed the batch from L1; dropping recovery",
                 );
-                return;
+                return RecoveryOutcome::HeadUnchanged;
             }
             let head = committer.last_header();
             if head.number() >= sync_height {
@@ -1251,8 +1262,9 @@ where
                         "reorg_to failed; keeping entry Failed — next slot retries",
                     );
                     rollup.optimistic.reinsert_failed(failed);
-                    return;
+                    return RecoveryOutcome::HeadUnchanged;
                 }
+                outcome = RecoveryOutcome::HeadMoved;
                 event!(
                     name: "eez.composer.recovery.rolled_back",
                     Level::WARN,
@@ -1292,14 +1304,17 @@ where
                         .commit_derived(built.payload, built.header, true)
                         .await
                     {
-                        Ok(_) => event!(
-                            name: "eez.composer.recovery.substituted",
-                            Level::WARN,
-                            rollup_id,
-                            sync_height,
-                            timestamp,
-                            "failed Sync block substituted with its empty sibling",
-                        ),
+                        Ok(_) => {
+                            outcome = RecoveryOutcome::HeadMoved;
+                            event!(
+                                name: "eez.composer.recovery.substituted",
+                                Level::WARN,
+                                rollup_id,
+                                sync_height,
+                                timestamp,
+                                "failed Sync block substituted with its empty sibling",
+                            );
+                        }
                         Err(err) => event!(
                             name: "eez.composer.recovery.substitute_failed",
                             Level::ERROR,
@@ -1430,6 +1445,7 @@ where
                 );
             }
         }
+        outcome
     }
 
     /// Simulate each drained transaction, construct canonical L2 system
@@ -1966,9 +1982,12 @@ where
                 &pair_roots,
                 &outbound_entries,
                 &outbound_user_txs,
+                None, // rich slot: no boundary to step back to
             )
             .await
-        {
+            .and_then(|raw| {
+                raw.ok_or_else(|| "gas gate refused a batch prepared without a ceiling".to_string())
+            }) {
             Ok(r) => r,
             Err(e) => {
                 event!(
@@ -2092,12 +2111,15 @@ where
                 parent_header,
                 empty_built.header.state_root(),
                 Some(&empty_built.block),
-                &[], // no cross-chain effects → no per-effect roots
-                &[], // no outbound entries
-                &[], // no outbound user txs
+                &[],  // no cross-chain effects → no per-effect roots
+                &[],  // no outbound entries
+                &[],  // no outbound user txs
+                None, // minimal slot: no boundary to step back to
             )
             .await
-        {
+            .and_then(|raw| {
+                raw.ok_or_else(|| "gas gate refused a batch prepared without a ceiling".to_string())
+            }) {
             Ok(raw) => raw,
             Err(err) => {
                 event!(
@@ -2198,75 +2220,96 @@ where
                     limits.max_blocks,
                 )
             })?;
-        let boundary = self.select_chunk_boundary(rollup, cursor, snapped)?;
-
+        // Candidates highest-first; each is priced exactly by
+        // `prepare_post_batch_raw`, which returns `Ok(None)` when the range does
+        // not fit the gas budget — then step back a whole K and re-prepare. The
+        // gate precedes witness assembly and proving, so a rejected candidate
+        // costs one block walk plus one encode.
+        let candidates = self.empty_chunk_boundaries(rollup, cursor, snapped)?;
         let provider = rollup.l2_provider.as_ref();
-        let boundary_header = provider
-            .sealed_header(boundary)
-            .map_err(|e| format!("sealed_header({boundary}): {e}"))?
-            .ok_or_else(|| format!("local L2 header at boundary {boundary} missing"))?;
-        let boundary_parent = provider
-            .sealed_header(boundary - 1)
-            .map_err(|e| format!("sealed_header({}): {e}", boundary - 1))?
-            .ok_or_else(|| format!("local L2 header at {} missing", boundary - 1))?;
+        let mut over_budget = 0usize;
+        for boundary in candidates {
+            let boundary_header = provider
+                .sealed_header(boundary)
+                .map_err(|e| format!("sealed_header({boundary}): {e}"))?
+                .ok_or_else(|| format!("local L2 header at boundary {boundary} missing"))?;
+            let boundary_parent = provider
+                .sealed_header(boundary - 1)
+                .map_err(|e| format!("sealed_header({}): {e}", boundary - 1))?
+                .ok_or_else(|| format!("local L2 header at {} missing", boundary - 1))?;
 
-        event!(
-            name: "eez.composer.emission.historical_chunk",
-            Level::INFO,
-            rollup_id,
-            cursor,
-            boundary,
-            sync_height,
-            span = boundary - cursor,
-            backlog = sync_height - cursor,
-            "settlement backlog exceeds the batch cap; settling a bounded historical chunk",
-        );
+            let Some(raw) = self
+                .prepare_post_batch_raw(
+                    ctx,
+                    rollup_id,
+                    &[], // no compositions → leading immediate only
+                    &boundary_parent,
+                    boundary_header.state_root(),
+                    None, // terminal is committed → witnesses come from the store
+                    &[],
+                    &[],
+                    &[],
+                    Some(self.inner.emission.max_gas),
+                )
+                .await?
+            else {
+                over_budget += 1;
+                continue;
+            };
 
-        let raw = self
-            .prepare_post_batch_raw(
+            event!(
+                name: "eez.composer.emission.historical_chunk",
+                Level::INFO,
+                rollup_id,
+                cursor,
+                boundary,
+                sync_height,
+                span = boundary - cursor,
+                backlog = sync_height - cursor,
+                over_budget,
+                "settlement backlog exceeds the batch cap; settling a bounded historical chunk",
+            );
+
+            let post_batch_hash = alloy_primitives::keccak256(&raw);
+            rollup
+                .optimistic
+                .begin(boundary, post_batch_hash, boundary_parent, Vec::new());
+            // A past terminal can't be pinned to an L1 slot, so the bundle takes
+            // whichever block the relay lands it in.
+            self.spawn_bundle_observer(
                 ctx,
                 rollup_id,
-                &[], // no compositions → leading immediate only
-                &boundary_parent,
+                boundary,
+                vec![raw],
                 boundary_header.state_root(),
-                None, // terminal is committed → witnesses come from the store
-                &[],
-                &[],
-                &[],
-            )
-            .await?;
-        let post_batch_hash = alloy_primitives::keccak256(&raw);
-        rollup
-            .optimistic
-            .begin(boundary, post_batch_hash, boundary_parent, Vec::new());
-        // A past terminal can't be pinned to an L1 slot, so the bundle takes
-        // whichever block the relay lands it in.
-        self.spawn_bundle_observer(
-            ctx,
-            rollup_id,
-            boundary,
-            vec![raw],
-            boundary_header.state_root(),
-            Arc::clone(&rollup.optimistic),
-            BundleTarget::NextBlock,
-        );
-        Ok(())
+                Arc::clone(&rollup.optimistic),
+                BundleTarget::NextBlock,
+            );
+            return Ok(());
+        }
+        Err(format!(
+            "every empty on-grid boundary in ({cursor}, {snapped}] exceeds the {} gas budget \
+             ({over_budget} candidates priced); retrying next slot",
+            self.inner.emission.max_gas,
+        ))
     }
 
-    /// Highest on-grid height `<= snapped` that is EMPTY (the prover binds every
-    /// settling-block tx to a claimed entry) and whose range fits the gas budget.
-    fn select_chunk_boundary(
+    /// On-grid heights in `(cursor, snapped]` whose block is EMPTY, highest
+    /// first. Empty because the prover binds every settling-block tx to a
+    /// claimed entry, so a tx-bearing terminal is unattestable for an
+    /// anchor-only batch (§7c). Gas is NOT considered here — the caller prices
+    /// each candidate on its fully encoded batch.
+    fn empty_chunk_boundaries(
         &self,
         rollup: &RollupState<L2>,
         cursor: u64,
         snapped: u64,
-    ) -> Result<u64, String> {
-        let limits = self.inner.emission;
-        let k = u64::from(limits.timing.k());
+    ) -> Result<Vec<u64>, String> {
+        let k = u64::from(self.inner.emission.timing.k());
         let provider = rollup.l2_provider.as_ref();
-        // `sizes[i]` = serialized tx bytes of block `snapped - i`; 0 ⟺ empty
-        // (a tx never encodes to 0 bytes).
-        let mut sizes: Vec<u64> = Vec::new();
+        // Walk parent hashes rather than numbers: `block_by_number` races reth's
+        // provider index for the newest block.
+        let mut empty_at: Vec<bool> = Vec::new();
         let mut hash = provider
             .sealed_header(snapped)
             .map_err(|e| format!("sealed_header({snapped}): {e}"))?
@@ -2274,51 +2317,30 @@ where
             .hash();
         let mut number = snapped;
         while number > cursor {
-            let block = provider
-                .find_block_by_hash(hash, BlockSource::Any)
-                .map_err(|e| format!("find_block_by_hash({hash}, n={number}): {e}"))?
-                .ok_or_else(|| format!("local L2 block hash {hash} (n={number}) missing"))?;
-            sizes.push(
-                block
-                    .body()
-                    .transactions()
-                    .iter()
-                    .map(|tx| Encodable2718::encode_2718_len(tx) as u64)
-                    .sum(),
-            );
-            hash = block.header().parent_hash();
+            let header = provider
+                .sealed_header_by_hash(hash)
+                .map_err(|e| format!("sealed_header_by_hash({hash}, n={number}): {e}"))?
+                .ok_or_else(|| format!("local L2 header {hash} (n={number}) missing"))?;
+            empty_at
+                .push(header.transactions_root() == alloy_consensus::constants::EMPTY_ROOT_HASH);
+            hash = header.parent_hash();
             number -= 1;
         }
-        // `bytes_thru[i]` = total tx bytes of blocks `(cursor, snapped - i]`.
-        let mut bytes_thru = sizes.clone();
-        for i in (0..bytes_thru.len().saturating_sub(1)).rev() {
-            bytes_thru[i] += bytes_thru[i + 1];
+        let step = usize::try_from(k).map_err(|e| format!("K overflows usize: {e}"))?;
+        if step == 0 {
+            return Err("K is zero".to_string());
         }
-        let mut candidate = snapped;
-        while candidate > cursor {
-            let i = usize::try_from(snapped - candidate).map_err(|e| format!("offset: {e}"))?;
-            let fits = projected_floor_gas(bytes_thru[i]) + POST_BATCH_EXECUTION_GAS_RESERVE
-                <= limits.max_gas;
-            if sizes[i] == 0 && fits {
-                if candidate != snapped {
-                    event!(
-                        name: "eez.composer.emission.boundary_stepped_back",
-                        Level::WARN,
-                        cursor,
-                        snapped,
-                        boundary = candidate,
-                        tx_bytes = bytes_thru[i],
-                        max_gas = limits.max_gas,
-                        "chunk boundary stepped back past non-empty or over-budget grid blocks",
-                    );
-                }
-                return Ok(candidate);
-            }
-            candidate = candidate.saturating_sub(k);
+        let boundaries: Vec<u64> = (0..empty_at.len())
+            .step_by(step)
+            .filter(|&i| empty_at[i])
+            .map(|i| snapped - i as u64)
+            .collect();
+        if boundaries.is_empty() {
+            return Err(format!(
+                "no empty on-grid boundary in ({cursor}, {snapped}]; retrying next slot"
+            ));
         }
-        Err(format!(
-            "no empty on-grid boundary within the gas budget in ({cursor}, {snapped}]; retrying next slot"
-        ))
+        Ok(boundaries)
     }
 
     /// Spawn the background bundle-observer task. It owns the submission inputs
@@ -2389,7 +2411,8 @@ where
         pair_roots: &[B256],
         outbound_entries: &[eez_protocol::abi::ExecutionEntrySol],
         outbound_user_txs: &[Bytes],
-    ) -> Result<Bytes, String> {
+        gas_ceiling: Option<u64>,
+    ) -> Result<Option<Bytes>, String> {
         use alloy_sol_types::SolCall;
         use eez_protocol::abi::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
 
@@ -2741,6 +2764,38 @@ where
             .map_err(|e| format!("eez_payload_codec::encode: {e}"))?;
         batch.callData = alloy_primitives::Bytes::from(payload);
 
+        // Gas gate on the FULLY ENCODED candidate, before the expensive part.
+        // Sizing the real batch (not an estimate of it) is what keeps this in
+        // step with `sign_post_batch_tx` below: a range priced as fitting here
+        // and rejected there would be re-selected identically every slot, since
+        // the boundary is a pure function of `(cursor, cap, K)`. `proofs` is the
+        // only field still unset, so it is stood in for at worst-case length
+        // with non-zero bytes (zeros are 1 EIP-7623 token, non-zeros 4).
+        // Over the ceiling is NOT an error: the caller steps the boundary back
+        // by K and re-prepares. `None` ceiling = paths with no boundary to move
+        // (rich slot, minimal slot), which rely on the signing-side check.
+        if let Some(ceiling) = gas_ceiling {
+            let mut sized = batch.clone();
+            sized.proofs = vec![Bytes::from(vec![0xffu8; MAX_PROOF_BYTES])];
+            let projected = postAndVerifyBatchCall { batch: sized }.abi_encode();
+            let projected_gas =
+                calldata_floor_gas(&projected).saturating_add(POST_BATCH_EXECUTION_GAS_RESERVE);
+            if projected_gas > ceiling {
+                event!(
+                    name: "eez.composer.emission.candidate_over_budget",
+                    Level::DEBUG,
+                    rollup_id,
+                    from,
+                    to = sync_block_number,
+                    projected_gas,
+                    ceiling,
+                    calldata_bytes = projected.len(),
+                    "candidate range exceeds the postBatch gas budget; caller steps the boundary back",
+                );
+                return Ok(None);
+            }
+        }
+
         // Prove the assembled window (proofs[] empty — not part of the
         // publicInputsHash). Mock ignores the context; a remote prover re-executes
         // `blocks`. Settlement path, off block production.
@@ -2857,6 +2912,7 @@ where
             self.inner.emission.max_gas,
         )
         .await
+        .map(Some)
     }
 }
 
@@ -3004,8 +3060,10 @@ async fn sign_post_batch_tx(
     // Size-derived: a fixed limit sits below the floor once the batch grows,
     // and an under-floor tx is dropped at simulation with no on-chain trace.
     let gas_limit = calldata_floor_gas(&calldata).saturating_add(POST_BATCH_EXECUTION_GAS_RESERVE);
-    // Ceiling on every emission path, not just the historical chunks that
-    // pre-bound via select_chunk_boundary. Refusing degrades to
+    // Ceiling on every emission path. Historical chunks already priced this
+    // exact calldata pre-prove and stepped their boundary back until it fit, so
+    // reaching this is either a rich/minimal slot (no boundary to move) or a
+    // proof longer than MAX_PROOF_BYTES. Refusing degrades to
     // commit-without-emission; the grown backlog then settles as bounded chunks.
     if gas_limit > max_gas {
         return Err(format!(
@@ -3154,22 +3212,50 @@ mod tests {
         assert_eq!(calldata_floor_gas(&[0, 0xab, 0, 0xcd, 0]), 21_110);
         // A realistic batch's floor alone outgrows a multi-million fixed limit.
         assert!(calldata_floor_gas(&vec![0xff; 200 * 1024]) > 4_000_000);
-        // The projection must never sit below the exact floor.
-        let calldata = vec![0x11; 4096];
-        assert!(projected_floor_gas(calldata.len() as u64) >= calldata_floor_gas(&calldata));
     }
 
     #[test]
-    fn gas_budget_below_reserve_clamps_to_default() {
-        // Room above the reserve → honoured.
+    fn gas_budget_out_of_range_clamps_to_default() {
+        // In range → honoured.
         assert_eq!(clamp_max_postbatch_gas(12_000_000), 12_000_000);
-        // A budget equal to the reserve refuses every batch: floor + reserve
+        assert_eq!(
+            clamp_max_postbatch_gas(DEFAULT_MAX_POSTBATCH_GAS),
+            DEFAULT_MAX_POSTBATCH_GAS
+        );
+        // A budget at or below the reserve refuses every batch: floor + reserve
         // always exceeds it.
         assert_eq!(
             clamp_max_postbatch_gas(POST_BATCH_EXECUTION_GAS_RESERVE),
             DEFAULT_MAX_POSTBATCH_GAS
         );
         assert_eq!(clamp_max_postbatch_gas(1), DEFAULT_MAX_POSTBATCH_GAS);
+        // Above the EIP-7825 tx gas cap no tx is valid at any block limit.
+        assert_eq!(
+            clamp_max_postbatch_gas(DEFAULT_MAX_POSTBATCH_GAS + 1),
+            DEFAULT_MAX_POSTBATCH_GAS
+        );
+    }
+
+    #[test]
+    fn empty_candidate_grid_is_highest_first() {
+        // The pure half of boundary selection: which on-grid offsets below the
+        // snapped height are empty. Regression: an earlier revision folded a
+        // per-block framing allowance into the same vector that carried the
+        // emptiness flag, so NO candidate ever qualified and emission died.
+        let pick = |empty: &[bool], k: usize| -> Vec<usize> {
+            (0..empty.len()).step_by(k).filter(|&i| empty[i]).collect()
+        };
+        assert_eq!(pick(&[true; 12], 5), vec![0, 5, 10]);
+        // Snapped height carries txs → the next K down leads.
+        let mut e = [true; 12];
+        e[0] = false;
+        assert_eq!(pick(&e, 5), vec![5, 10]);
+        // Only off-grid blocks empty → nothing to settle at.
+        let mut e = [false; 12];
+        e[3] = true;
+        assert!(pick(&e, 5).is_empty());
+        // Range shorter than one step still offers the snapped height.
+        assert_eq!(pick(&[true, true, true], 5), vec![0]);
     }
 
     #[test]
