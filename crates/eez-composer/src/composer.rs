@@ -311,10 +311,11 @@ impl EmissionLimits {
                 "EEZ_MAX_BLOCKS_PER_BATCH meets or exceeds the proof signer's default request window; prove() will reject every chunk unless EEZ_PROOF_SIGNER_MAX_REQUEST_BLOCKS was raised to match",
             );
         }
+        let requested_gas = env_u64("EEZ_MAX_POSTBATCH_GAS").unwrap_or(DEFAULT_MAX_POSTBATCH_GAS);
         Self {
             timing,
             max_blocks,
-            max_gas: env_u64("EEZ_MAX_POSTBATCH_GAS").unwrap_or(DEFAULT_MAX_POSTBATCH_GAS),
+            max_gas: clamp_max_postbatch_gas(requested_gas),
         }
     }
 }
@@ -333,6 +334,26 @@ fn clamp_max_blocks_per_batch(requested: u64, k: u64) -> u64 {
         "EEZ_MAX_BLOCKS_PER_BATCH is below K; clamping to K so a bounded batch stays emittable",
     );
     k
+}
+
+/// A budget with no room above the execution reserve can't fit even a minimal
+/// batch, so every emission path refuses forever — clamp loudly, like
+/// `clamp_max_blocks_per_batch`. `MIN_VIABLE` is the reserve plus room for a
+/// minimal batch's calldata floor.
+fn clamp_max_postbatch_gas(requested: u64) -> u64 {
+    const MIN_VIABLE: u64 = POST_BATCH_EXECUTION_GAS_RESERVE + 1_000_000;
+    if requested >= MIN_VIABLE {
+        return requested;
+    }
+    event!(
+        name: "eez.composer.emission.gas_budget_clamped",
+        Level::ERROR,
+        requested,
+        clamped_to = DEFAULT_MAX_POSTBATCH_GAS,
+        reserve = POST_BATCH_EXECUTION_GAS_RESERVE,
+        "EEZ_MAX_POSTBATCH_GAS leaves no room above the execution reserve; every postBatch would be refused — clamping to the default",
+    );
+    DEFAULT_MAX_POSTBATCH_GAS
 }
 
 /// Read a positive `u64` knob; absent, malformed, or zero → `None` (loud).
@@ -937,11 +958,6 @@ where
         let blocked = rollup.optimistic.blocking_height(cursor).is_some();
         let sync_height = parent_number + 1;
         self.log_settlement_backlog(rollup_id, cursor, sync_height, blocked);
-        // Deferred-late: empty block, no emission — keeps grid heights empty
-        // by construction so they stay boundary-eligible.
-        if matches!(mode, SyncSlotMode::Empty) {
-            return self.build_empty_slot_block(rollup, &parent_header, timestamp);
-        }
         if blocked {
             event!(
                 name: "eez.composer.sync_slot.bundle_in_flight",
@@ -972,6 +988,15 @@ where
                     "historical chunk emission failed; committing Sync block without emission — same bounded range retries next slot",
                 );
             }
+            return self.build_empty_slot_block(rollup, &parent_header, timestamp);
+        }
+
+        // Deferred-late: the bundle missed its L1 slot, so suppress PINNED
+        // emission only. Ordered after bounded emission on purpose — a
+        // historical chunk targets NextBlock and carries no pin, so lateness
+        // can't invalidate it; checking first would starve a chronically late
+        // node (slow prover, relay latency) of settlement entirely.
+        if matches!(mode, SyncSlotMode::Empty) {
             return self.build_empty_slot_block(rollup, &parent_header, timestamp);
         }
 
@@ -3132,6 +3157,19 @@ mod tests {
         // The projection must never sit below the exact floor.
         let calldata = vec![0x11; 4096];
         assert!(projected_floor_gas(calldata.len() as u64) >= calldata_floor_gas(&calldata));
+    }
+
+    #[test]
+    fn gas_budget_below_reserve_clamps_to_default() {
+        // Room above the reserve → honoured.
+        assert_eq!(clamp_max_postbatch_gas(12_000_000), 12_000_000);
+        // A budget equal to the reserve refuses every batch: floor + reserve
+        // always exceeds it.
+        assert_eq!(
+            clamp_max_postbatch_gas(POST_BATCH_EXECUTION_GAS_RESERVE),
+            DEFAULT_MAX_POSTBATCH_GAS
+        );
+        assert_eq!(clamp_max_postbatch_gas(1), DEFAULT_MAX_POSTBATCH_GAS);
     }
 
     #[test]
