@@ -182,6 +182,59 @@ fn initial_log_scan_ranges(from_block: u64, to_block: u64) -> Vec<(u64, u64)> {
     ranges
 }
 
+/// True when a `get_logs` failure means "matched too much", not "was wrong".
+/// Providers cap RESULT COUNT, which no fixed block span can respect. Detected by
+/// message, since the wording is client-specific but the remedy — narrow — isn't.
+fn is_range_too_wide(err: &L1Error) -> bool {
+    let L1Error::Provider(msg) = err else {
+        return false;
+    };
+    let m = msg.to_ascii_lowercase();
+    m.contains("exceeds max results")
+        || m.contains("query returned more than")
+        || m.contains("more than 10000 results")
+        || m.contains("log response size exceeded")
+        || m.contains("response size exceeded")
+        || m.contains("query timeout exceeded")
+        || m.contains("range is too large")
+        || m.contains("block range too large")
+        || m.contains("too many results")
+}
+
+/// Scan `[from, to]`, halving the upper bound until the provider accepts. Returns
+/// the batches plus the block actually REACHED, which may be `< to` — callers must
+/// advance their cursor by that, not by `to`. Propagating the refusal instead makes
+/// no progress: the Watcher would retry the identical over-wide range forever.
+pub(crate) async fn scan_batch_logs_range_adaptive(
+    provider: &impl Provider,
+    eez: Address,
+    rollup_id: u64,
+    from: u64,
+    to: u64,
+) -> L1Result<(Vec<ScannedBatch>, u64)> {
+    let mut hi = to;
+    loop {
+        match scan_batch_logs_range(provider, eez, rollup_id, from, hi).await {
+            Ok(scanned) => return Ok((scanned, hi)),
+            Err(err) if is_range_too_wide(&err) && hi > from => {
+                let mid = from + (hi - from) / 2;
+                event!(
+                    name: "eez.l1.scan_batch_logs.chunk_narrowed",
+                    Level::WARN,
+                    from,
+                    requested_to = hi,
+                    narrowed_to = mid,
+                    error = %err,
+                    "get_logs matched more than the provider serves; halving the range and retrying",
+                );
+                hi = mid;
+            }
+            // A single block that still exceeds the cap is genuinely unservable.
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 pub(crate) async fn scan_next_batch_log_chunk(
     provider: &impl Provider,
     eez: Address,
@@ -192,8 +245,13 @@ pub(crate) async fn scan_next_batch_log_chunk(
         return Ok(None);
     };
 
-    let scanned = scan_batch_logs_range(provider, eez, rollup_id, from, to).await?;
+    let (scanned, reached) =
+        scan_batch_logs_range_adaptive(provider, eez, rollup_id, from, to).await?;
     chunks.ranges.pop();
+    if reached < to {
+        // Narrowed: re-queue the tail so no range is silently skipped.
+        chunks.ranges.push((reached + 1, to));
+    }
     Ok(Some(scanned))
 }
 
