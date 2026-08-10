@@ -190,6 +190,9 @@ echo "==> network ready: bundle inclusion observed"
 
 bash "$HERE/scripts/verify-cross-chain-waves.sh"
 
+echo "==> running inbound/outbound sequential bundle regression"
+bash "$HERE/scripts/verify-sequential-bundle-state.sh"
+
 capture_service_log eez-proof-signer
 capture_service_log eez-node
 verify_real_proof_path
@@ -205,6 +208,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         echo "- Proof-signer image: \`$EEZ_PROOF_SIGNER_IMAGE\`"
         echo "- Deploy image: \`$EEZ_DEPLOY_IMAGE\`"
         echo "- Inbound, outbound, mixed, and mixed-pure waves: pass"
+        echo "- Inbound/outbound sequential bundle regression: pass"
         echo "- Signed windows observed: $signed_window_count"
         echo "- Remote attestations observed: $remote_attestation_count"
         echo "- L1/L2 root divergence: 0"
