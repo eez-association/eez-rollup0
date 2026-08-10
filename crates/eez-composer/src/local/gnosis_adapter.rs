@@ -1,4 +1,4 @@
-//! Header-type shim: chiado L1 provider → [`LocalChainClient`]-compatible
+//! Header-type shim: chiado L1 provider → [`super::LocalChainClient`]-compatible
 //! provider.
 //!
 //! `LocalChainClient` requires

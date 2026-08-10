@@ -10,11 +10,7 @@
 //! ```text
 //!   ComposerError                ← public face of Composer<P>
 //!       ├─ ComposerErrorKind::Protocol(ProtocolError)
-//!       ├─ ComposerErrorKind::Executor(ExecutorError)
-//!       ├─ ComposerErrorKind::AlreadyRegistered { .. }     ← lifecycle
-//!       ├─ ComposerErrorKind::Misconfigured   { .. }       ← lifecycle
-//!       ├─ ComposerErrorKind::MissingRootReader            ← lifecycle
-//!       └─ ComposerErrorKind::LockPoisoned    { .. }       ← internal bug
+//!       └─ ComposerErrorKind::Executor(ExecutorError)
 //!
 //!   CompositionError             ← public face of compose_transaction
 //!       ├─ CompositionErrorKind::Protocol(ProtocolError)
@@ -144,11 +140,8 @@ pub enum ProtocolErrorKind {
     /// calldata) failed.
     #[error("invalid encoding: {0}")]
     InvalidEncoding(String),
-    /// A protocol capability was invoked that this chain family does not
-    /// implement — e.g. a
-    /// [`SettlesOutbound::build_settlement_batch`](crate::capabilities::SettlesOutbound::build_settlement_batch)
-    /// impl that cannot actually settle outbound. Today only the
-    /// in-tree test fakes construct this variant.
+    /// A protocol capability was invoked before its wire representation or
+    /// execution path was implemented, such as static-entry materialization.
     #[error("unsupported protocol operation: {0}")]
     Unsupported(&'static str),
 }
@@ -254,7 +247,7 @@ pub enum ExecutorErrorKind {
     /// Architecturally disallowed; L1→L2→L1 (re-entry through the
     /// entry rollup) IS valid and is handled inline by the EVM
     /// inspector via the overlay path. Raised by
-    /// [`Dispatcher::dispatch_call`](crate::Dispatcher::dispatch_call)'s
+    /// [`Dispatcher::dispatch_call`](crate::CompositionBuilder::dispatch_call)'s
     /// guard.
     #[error(
         "invalid re-entry: caller rollup {caller} attempted to dispatch to same rollup {target} \
@@ -275,8 +268,8 @@ pub type ExecutorResult<T> = Result<T, ExecutorError>;
 
 error_struct! {
     /// Composition-pipeline error. `finalize` crosses the protocol /
-    /// executor boundary (CCM verification runs target-chain
-    /// simulation), so this type preserves both layers losslessly via
+    /// executor boundary (composition runs target-chain simulation), so this
+    /// type preserves both layers losslessly via
     /// [`CompositionErrorKind`].
     #[derive(Debug)]
     pub struct CompositionError wraps CompositionErrorKind;
@@ -314,7 +307,7 @@ pub enum CompositionErrorKind {
     /// checkpoint validation, etc.).
     #[error("protocol: {0}")]
     Protocol(#[source] ProtocolError),
-    /// Target-chain execution failure raised during CCM verification.
+    /// Target-chain execution failure raised during composition.
     #[error("executor: {0}")]
     Executor(#[source] ExecutorError),
 }
@@ -325,7 +318,7 @@ pub type CompositionResult<T> = Result<T, CompositionError>;
 // ── ComposerError ────────────────────────────────────────────────
 
 error_struct! {
-    /// Errors from the generic [`Composer`](crate::Composer) orchestrator.
+    /// Errors from the generic runtime composer orchestrator.
     ///
     /// Wraps the composition error family plus composer-specific
     /// lifecycle failures (already-registered source/target, missing
@@ -386,41 +379,6 @@ pub enum ComposerErrorKind {
     /// Executor-layer failure surfaced through the orchestrator.
     #[error("executor: {0}")]
     Executor(#[source] ExecutorError),
-    /// A registration called a second time for a slot that only accepts
-    /// one entry (source client) or for an already-present key
-    /// (target rollup id).
-    #[error("already registered: {what}")]
-    AlreadyRegistered {
-        /// Which slot was double-registered — e.g. `"source client"` or
-        /// `"target client"`.
-        what: &'static str,
-    },
-    /// Startup / configuration failure with a compile-time-constant
-    /// reason — e.g. source or target clients not yet registered when
-    /// an operation is requested.
-    #[error("composer misconfigured: {reason}")]
-    Misconfigured {
-        /// Static human-readable reason for the misconfiguration.
-        reason: &'static str,
-    },
-    /// An internal [`std::sync`] lock was poisoned by a prior panic
-    /// while a critical section was held. Distinct from `Misconfigured`
-    /// because it signals a **programming bug** (a panic-and-recover
-    /// happened somewhere) rather than a configuration mistake.
-    #[error("internal lock poisoned: {what}")]
-    LockPoisoned {
-        /// Which lock was poisoned — e.g. `"target map"`.
-        what: &'static str,
-    },
-    /// `ComposerBuilder::build` was called without a prior
-    /// `.root_reader(...)` registration. Phase 1 of every
-    /// `simulate_and_resolve` call needs a `CommittedRootReader` to
-    /// read invariant-6 anchor roots; the builder fails-fast at
-    /// construction rather than at first dispatch.
-    #[error(
-        "composer build: no committed-root reader registered (call .root_reader(...) on the builder)"
-    )]
-    MissingRootReader,
 }
 
 /// Shorthand for composer results.

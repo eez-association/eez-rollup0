@@ -1,5 +1,6 @@
-# Packaged chiado node: eez-node (embedded chiado L1 + L2 + composer) +
-# lighthouse (drives the embedded L1). Single-L1 topology — no standalone
+# Packaged chiado stack: eez-node (embedded chiado L1 + L2 + composer),
+# eez-proof-signer, and lighthouse (drives the embedded L1). Single-L1
+# topology — no standalone
 # tip-follower reth: the bundle target-block oracle falls back to the
 # embedded L1 (EEZ_L1_TARGET_RPC_URL unset), which tracks the canonical
 # tip in steady state. The one-time protocol deploy is done against an
@@ -17,10 +18,39 @@
 #
 # Then: docker compose -f docker-compose.chiado-node.yml up
 #
-# Both services use host networking so lighthouse↔eez-node engine API and
+# All services use host networking so lighthouse↔eez-node engine API and
 # the embedded L1 / lighthouse libp2p peering work without port mapping.
 
 services:
+  eez-proof-signer:
+    build:
+      context: .
+      dockerfile: Dockerfile.signer
+    image: eez-proof-signer:local
+    container_name: eez-proof-signer-chiado
+    network_mode: host
+    restart: unless-stopped
+    # The default request deadline is 10 minutes; allow an admitted request
+    # to drain when Compose stops the service.
+    stop_grace_period: 11m
+    env_file:
+      - ./deployments.env
+    environment:
+      EEZ_PROOF_SIGNER_ADDR: 127.0.0.1:50061
+      EEZ_CHAIN_CONFIG: /app/genesis.json
+      EEZ_PROOF_SIGNER_KEY: "${EEZ_PROOF_SIGNER_KEY:?set EEZ_PROOF_SIGNER_KEY}"
+      EEZ_L2_SYSTEM_KEY: "${EEZ_L2_SYSTEM_KEY:?set EEZ_L2_SYSTEM_KEY}"
+      RUST_LOG: "${EEZ_PROOF_SIGNER_RUST_LOG:-info}"
+    volumes:
+      - ${FRESH_GENESIS:?set FRESH_GENESIS}:/app/genesis.json:ro
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "50061"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
+    logging:
+      driver: "local"
+
   eez-node:
     build:
       context: .
@@ -30,12 +60,20 @@ services:
     network_mode: host
     restart: unless-stopped
     stop_grace_period: 30s
-    # deployments.env (registry/proof-system/rollup-mgr/deploy-block, from
-    # the protocol deploy) + .env.chiado (keys + bundler URL).
+    depends_on:
+      eez-proof-signer:
+        condition: service_healthy
+    # Public deployment bindings come from the generated file. Private node
+    # inputs are mapped explicitly below so the attestation key is never
+    # injected into this container.
     env_file:
       - ./deployments.env
-      - ./.env.chiado
     environment:
+      EEZ_L1_POSTER_KEY: "${EEZ_L1_POSTER_KEY:?set EEZ_L1_POSTER_KEY}"
+      EEZ_L1_BUILDER_RPC_URL: "${EEZ_L1_BUILDER_RPC_URL:?set EEZ_L1_BUILDER_RPC_URL}"
+      EEZ_L2_SYSTEM_KEY: "${EEZ_L2_SYSTEM_KEY:?set EEZ_L2_SYSTEM_KEY}"
+      EEZ_PROVER_URL: http://127.0.0.1:50061
+      EEZ_WITNESS_DB_PATH: /l2/witnesses
       # Embedded chiado L1 (reth_gnosis) — single L1 for the whole node.
       EEZ_L1_EMBEDDED: "1"
       EEZ_L1_CHAIN: chiado
@@ -52,11 +90,11 @@ services:
       # oracle falls back to the embedded L1 (config.rs build_target_provider).
       EEZ_L1_ROLLUP_ID: "0"
       # Cross-chain wiring.
-      EEZ_CCM_L2_ADDRESS: "0x4200000000000000000000000000000000000007"
+      EEZL2_ADDRESS: "0x4200000000000000000000000000000000000007"
       EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS: "10200"
       # L2 RPC — outbound front upstream + composer L2 reads.
       EEZ_L2_RPC_URL: http://127.0.0.1:18688
-      # Transparent cross-chain ingress fronts (unset → that front is disabled).
+      # Transparent cross-chain ingress fronts (both required in composer mode).
       # Send L1→L2 (Inbound) txs to :18999, L2→L1 (Outbound) txs to :18998; every
       # other eth_* is transparently forwarded to the matching source-chain RPC.
       EEZ_L1_XCHAIN_PORT: "18999"
@@ -68,10 +106,9 @@ services:
       # Deterministic L1-anchored timings (must match any follower).
       EEZ_L1_BLOCK_TIME_MS: "5000"
       EEZ_L2_BLOCK_TIME_MS: "1000"
-      # proof_time small (mock ECDSA proof is near-instant) + slack >=1.3s so the
-      # rich bundle reaches the builder >=1.3s before its target slot. 2000/500
-      # was too tight -> frequent "trigger too late" Sync-slot deferrals.
-      EEZ_PROOF_TIME_MS: "500"
+      # Reserve time for remote stateless validation. The 2500ms proof budget
+      # plus 1300ms slack stays within the 4000ms schedulable L2 window.
+      EEZ_PROOF_TIME_MS: "${EEZ_PROOF_TIME_MS:-2500}"
       EEZ_SUBMISSION_SLACK_MS: "1300"
       # Don't freeze the sequencer when chiado bundles are slow to land.
       EEZ_MAX_SPECULATIVE_DEPTH: "0"

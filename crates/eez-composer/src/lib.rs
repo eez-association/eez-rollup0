@@ -28,7 +28,7 @@
 //!
 //! - S4.2 (this commit): umbrella + L1-anchored Scheduler in place;
 //!   `eez-l1::Composer` retires; logic moves here.
-//! - S4.7: per-rollup `HeldPool`; cross-chain handlers; `eez-evm`
+//! - S4.7: per-rollup `HeldPool`; cross-chain handlers; `eez-protocol`
 //!   inspector integration.
 //!
 //! See `docs/plans/IMPLEMENTATION.md` §5.4.8 (umbrella architecture) +
@@ -46,14 +46,12 @@ pub mod rollup;
 #[doc(inline)]
 pub use composer::{Composer, CrossChainExecCtx};
 #[doc(inline)]
-pub use held_pool::{HeldPool, HeldTx};
+pub use held_pool::{AdmissionError, HeldPool, HeldTx};
 #[doc(inline)]
 pub use ingress::Direction;
 
 #[doc(inline)]
-pub use local::{
-    BuildError, BuiltSyncBlock, EvmComposer, GnosisL1Adapter, LocalChainClient, build_sync_block,
-};
+pub use local::{BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient, build_sync_block};
 pub use optimistic::OptimisticallyIncluded;
 #[doc(inline)]
 pub use rollup::{RollupConfig, RollupState};

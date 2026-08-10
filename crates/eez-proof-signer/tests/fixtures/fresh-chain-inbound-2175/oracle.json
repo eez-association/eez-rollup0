@@ -1,0 +1,41 @@
+{
+  "recording": "fixtures/scenarios/fresh-chain-conformance",
+  "captured_at": "2026-07-13T13:32:39Z",
+  "from_block": 1561,
+  "to_block": 2175,
+  "expected_rollup_id": 1,
+  "l2_chain_id": 1,
+  "vkey": "0x00000000000000000000000007a664a2aaef627811ade993dbdd8679dc807843",
+  "proof_system": "0x67248530ae3730399dced3267b8051a29c7e82ae",
+  "batch_anchor_root": "0xd1c9992e4e989308107cf6803b5a79caba2d2e67b901125796761c705938c5f6",
+  "pre_settling_root": "0x69905d069f82ec82b3575f615101b49ed7de4cd4721d898bb1e75538d71489a9",
+  "final_state_root": "0x0eee96499bed5984f09a147116ea9dbbfdf95881557f9854765d14aeede26298",
+  "public_inputs_hash": "0x1b30affed04853df5991b6388c8d5884f13a8c54cc2af42ca005bb05383ce11d",
+  "settling_block_hash": "0xbbcfaa72c283b2ce8616a53c0ea91ab0b6346d59bd62db41d87b64c1b4e755b2",
+  "transaction_statuses": [true, true, true],
+  "transaction_state_checkpoints": [
+    {
+      "transaction_index": 0,
+      "state_root": "0x85f1df0fa25533910b50385f3b4391dec2088a435c78185ee0f9f7ab7209f60c"
+    },
+    {
+      "transaction_index": 1,
+      "state_root": "0x708dd8bfc0301ad3a163696fe1b0a6d51820d7b231178bab2911018590aa0633"
+    },
+    {
+      "transaction_index": 2,
+      "state_root": "0x0eee96499bed5984f09a147116ea9dbbfdf95881557f9854765d14aeede26298"
+    }
+  ],
+  "system_transaction_hashes": [
+    "0xb4d33df2d0ef417ffb6408a89c2e3a0be850bafef7c6b8a3ff36599dd471f477",
+    "0xb52a97e6196b4b982857f387a42f794cde69dbcd46b7ef37565af25a145a87f2",
+    "0xe115ec69fc763d0d53ff0f50386d8a4828b3062a2ae131cfffe725b5e3cc4f1d"
+  ],
+  "l2_entry_hashes": [
+    "0x5c06b52b37a169a96f17857aaff0819dd503b94221f7c4c437c637b7be78073f",
+    "0xe09f2dfc83b6185fd6ab1b5b48116107407a2f1b3dbf60132e5045e8400bc6dc",
+    "0xc372848cdb658acbaa409ddd9c3942254f3b0ea4cfd2d3749b1f0f8fb0333490"
+  ],
+  "source_postbatch_sha256": "cbdf9d83ad28516cc9d563e0cc85a5e8229a139abf02afff6f58cfd87c0bc1f8"
+}

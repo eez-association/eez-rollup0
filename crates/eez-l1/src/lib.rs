@@ -12,12 +12,9 @@
 //!   `Reorg` / `Finalized` over a broadcast channel.
 //! - [`L1CanonicalHead`] — shared `posted_through` cursor (Deriver
 //!   writes; Composer / Sequencer / others read).
-//! - [`SubmitTrigger`] — Aggregator policy enum (S4.2 scaffold; the
-//!   Aggregator struct itself lands later in stage-N).
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
-pub mod aggregator;
 pub mod config;
 pub mod error;
 pub mod l1_canonical_head;
@@ -27,15 +24,13 @@ pub mod scan;
 pub mod submitter;
 
 #[doc(inline)]
-pub use aggregator::SubmitTrigger;
-#[doc(inline)]
-pub use config::{SubmitterConfig, registry_deploy_block_from_env};
+pub use config::SubmitterConfig;
 #[doc(inline)]
 pub use error::{L1Error, L1Result};
 #[doc(inline)]
 pub use l1_canonical_head::{BatchRecord, L1CanonicalHead};
 #[doc(inline)]
-pub use l1_head_stream::L1HeadStream;
+pub use l1_head_stream::{L1HeadInfo, L1HeadStream};
 #[doc(inline)]
 pub use l1_watcher::{L1Event, L1Watcher, L1WatcherConfig};
 #[doc(inline)]

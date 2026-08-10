@@ -5,7 +5,7 @@
 //! [`Sequencer::run`] is the long-running loop. Each iteration handles one
 //! of:
 //!
-//! 1. A scheduler tick. [`Sequencer::advance`] runs in a loop, producing
+//! 1. A scheduler tick. `Sequencer::advance` runs in a loop, producing
 //!    blocks at deterministic `parent.timestamp() + BLOCK_TIME_SECS`
 //!    slots until the chain catches up to the tick's wall-clock target.
 //!    Most ticks produce a single block (the chain is on cadence); after
@@ -44,7 +44,6 @@ use tokio::sync::mpsc;
 use crate::block_committer::BlockCommitterHandle;
 use crate::error::{DriverError, DriverResult};
 use crate::slot::{SlotEvent, SlotKind, SyncSlotComposerHandle, SyncSlotMode};
-use crate::submit::{BatchCandidate, BatchEmitter, BatchPolicy};
 use crate::timing::{RollupTiming, SlotComposition};
 
 /// How often the sequencer re-publishes the current forkchoice state.
@@ -73,16 +72,9 @@ fn log_stale_parent(phase: &str) {
     );
 }
 
-/// L1-confirmed L2 head height. `eez_l1::L1CanonicalHead`
-/// implements this; the Sequencer uses it to bound speculative depth.
-pub trait ConfirmedHeadSource: Send + Sync + 'static {
-    /// Highest L2 block confirmed by an L1-landed batch.
-    fn confirmed_head(&self) -> u64;
-}
-
 struct SpeculativeLimit {
     max_depth: u64,
-    source: Arc<dyn ConfirmedHeadSource>,
+    source: Arc<eez_l1::L1CanonicalHead>,
 }
 
 impl fmt::Debug for SpeculativeLimit {
@@ -178,9 +170,6 @@ where
     /// Optional speculative-depth cap. None = no limit
     /// (single-composer / follower mode). See `DEFAULT_MAX_SPECULATIVE_DEPTH`.
     speculative_limit: Option<SpeculativeLimit>,
-    /// Optional [`BatchCandidate`] emitter. None on follower setups
-    /// where no Composer is co-located.
-    batch_emitter: Option<BatchEmitter>,
     /// Optional Sync-slot block producer + the rollup id it composes
     /// for (which HeldPool to drain). When present, called before each
     /// Sync block to fetch that rollup's cross-chain content. `None` =
@@ -196,7 +185,6 @@ where
         f.debug_struct("Sequencer")
             .field("committer", &self.committer)
             .field("speculative_limit", &self.speculative_limit)
-            .field("batch_emitter", &self.batch_emitter)
             .finish_non_exhaustive()
     }
 }
@@ -229,20 +217,27 @@ where
         schedule_rx: mpsc::Receiver<SlotEvent>,
         payload_builder: PayloadBuilderHandle<T>,
         timing: RollupTiming,
+        witness_sender: Option<mpsc::UnboundedSender<B256>>,
     ) -> DriverResult<Self>
     where
         P: BlockReader<Header = HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>
             + BlockIdReader,
     {
-        let committer =
-            BlockCommitterHandle::spawn_from_provider(provider, to_engine, payload_builder)?;
+        // Prover-feed (prover-chain P1): thread the witness channel into the
+        // committer so each PRODUCED block's hash is emitted at canonical commit
+        // for the out-of-loop capture task. `None` outside remote-prover mode.
+        let committer = BlockCommitterHandle::spawn_from_provider(
+            provider,
+            to_engine,
+            payload_builder,
+            witness_sender,
+        )?;
         Ok(Self {
             attributes,
             schedule_rx,
             committer,
             timing,
             speculative_limit: None,
-            batch_emitter: None,
             sync_slot_composer: None,
         })
     }
@@ -283,25 +278,9 @@ where
     pub fn with_speculative_limit(
         mut self,
         max_depth: u64,
-        source: Arc<dyn ConfirmedHeadSource>,
+        source: Arc<eez_l1::L1CanonicalHead>,
     ) -> Self {
         self.speculative_limit = Some(SpeculativeLimit { max_depth, source });
-        self
-    }
-
-    /// Attach a [`BatchCandidate`] sender. After each committed block,
-    /// the Sequencer evaluates `policy` and sends one candidate per
-    /// closed window. Backpressured: if the receiver is full, the
-    /// produce loop awaits — Composer falling behind slows block
-    /// production rather than dropping candidates.
-    #[must_use]
-    pub fn with_batch_emitter(
-        mut self,
-        rollup_id: u64,
-        policy: BatchPolicy,
-        tx: mpsc::Sender<BatchCandidate>,
-    ) -> Self {
-        self.batch_emitter = Some(BatchEmitter::new(rollup_id, policy, tx));
         self
     }
 
@@ -660,7 +639,7 @@ where
         let Some(limit) = &self.speculative_limit else {
             return false;
         };
-        let confirmed = limit.source.confirmed_head();
+        let confirmed = limit.source.cursor();
         let speculative_depth = head_number.saturating_sub(confirmed);
         if speculative_depth >= limit.max_depth {
             event!(
@@ -704,7 +683,9 @@ where
         let block_timestamp = built.header.timestamp();
         let _outcome = self
             .committer
-            .commit_derived(built.payload, built.header)
+            // feed_witness=true: this is a PRODUCED Sync block — emit it to the
+            // prover witness-capture feed (the follower/deriver passes false).
+            .commit_derived(built.payload, built.header, true)
             .await?;
 
         event!(
@@ -716,28 +697,11 @@ where
             block.timestamp = block_timestamp,
             "produced block {block_number} hash={block_hash} ts={block_timestamp} kind={kind}",
         );
-
-        if let Some(emitter) = self.batch_emitter.as_mut() {
-            if let Some(candidate) = emitter.on_block_committed(block_number) {
-                if let Err(err) = emitter.tx.send(candidate).await {
-                    event!(
-                        name: "eez.sequencer.batch_candidate.send_failed",
-                        Level::ERROR,
-                        rollup_id = candidate.rollup_id,
-                        to_block = candidate.to_block,
-                        error = %err,
-                        "batch candidate channel closed; downstream Composer task is gone",
-                    );
-                }
-            }
-        }
         Ok(())
     }
 
     /// Commit one block of the given kind at
-    /// `parent.timestamp() + L2_block_time`. Logs `eez.sequencer.block.produced`
-    /// and forwards a `BatchCandidate` to the emitter when the policy
-    /// closes a window.
+    /// `parent.timestamp() + L2_block_time`. Logs `eez.sequencer.block.produced`.
     async fn commit_one(
         &mut self,
         kind: SlotKind,
@@ -761,25 +725,6 @@ where
             block.timestamp = timestamp,
             "produced block {block_number} hash={block_hash} ts={timestamp} kind={kind}",
         );
-
-        if let Some(emitter) = self.batch_emitter.as_mut() {
-            if let Some(candidate) = emitter.on_block_committed(block_number) {
-                // Backpressured: if Composer is slow draining, this
-                // await pauses block production rather than dropping
-                // the window. Channel-closed = Composer task died;
-                // log loudly so the next layer of supervision sees it.
-                if let Err(err) = emitter.tx.send(candidate).await {
-                    event!(
-                        name: "eez.sequencer.batch_candidate.send_failed",
-                        Level::ERROR,
-                        rollup_id = candidate.rollup_id,
-                        to_block = candidate.to_block,
-                        error = %err,
-                        "batch candidate channel closed; downstream Composer task is gone",
-                    );
-                }
-            }
-        }
         Ok(())
     }
 }

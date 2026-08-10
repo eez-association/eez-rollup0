@@ -10,7 +10,8 @@
 //! - [`SlotEvent::Live`] — fixed-interval tick, standalone-mode only.
 //!   Produced by [`spawn_interval`].
 //! - [`SlotEvent::SyncSlot`] — L1-anchored sync-slot trigger. Produced
-//!   by [`spawn_l1_anchored`], which subscribes to an [`L1HeadSource`]
+//!   by [`spawn_l1_anchored`], which subscribes to an
+//!   [`eez_l1::L1HeadStream`]
 //!   and sleeps until `L1.timestamp + proof_window_open` after each
 //!   head — i.e. the wall-clock moment when the prover should start
 //!   so the postBatch bundle reaches the relay before the next L1 block.
@@ -108,37 +109,6 @@ pub enum SlotEvent {
     },
 }
 
-/// Minimal L1 head info the L1-anchored spawner needs.
-///
-/// Defined here (in `eez-driver`) so the spawner stays L1-implementation-
-/// agnostic. `eez-l1` provides an adapter
-/// (`eez_l1::L1HeadStream`) that implements [`L1HeadSource`] over its
-/// `broadcast::Receiver<L1Event>` — but a test or alternative
-/// L1-client crate can implement [`L1HeadSource`] just as well.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct L1HeadInfo {
-    pub block_number: u64,
-    pub block_hash: [u8; 32],
-    pub timestamp: u64,
-}
-
-/// Source of canonical L1 head events. Implemented by an adapter in
-/// `eez-l1`; consumed by [`spawn_l1_anchored`].
-///
-/// `next_head` returns `None` when the source closes (broadcast lagged
-/// past tolerance, `L1Watcher` task died, etc) — the spawner exits
-/// cleanly so the surrounding `spawn_critical_task` notices.
-///
-/// `next_head` must be cancel-safe: [`spawn_l1_anchored`] polls it
-/// inside a `tokio::select!` alongside its Live ticker, so the future
-/// is dropped and re-created whenever another branch wins. The
-/// `eez-l1` adapter satisfies this via `broadcast::Receiver::recv`
-/// (cancel-safe; no event is consumed by a cancelled call).
-#[async_trait]
-pub trait L1HeadSource: Send + 'static {
-    async fn next_head(&mut self) -> Option<L1HeadInfo>;
-}
-
 /// Pre-built Sync block produced by a [`SyncSlotComposer`] — ready to
 /// commit via [`BlockCommitterHandle::commit_derived`].
 ///
@@ -199,25 +169,6 @@ pub trait SyncSlotComposer: Send + Sync + 'static {
         target_l1_block: Option<u64>,
         mode: SyncSlotMode,
     ) -> Option<SyncSlotBlock>;
-}
-
-/// No-op [`SyncSlotComposer`] — used when no umbrella is wired
-/// (standalone-mode dev) or when the per-rollup `HeldPool` is absent.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoCrossChainContent;
-
-#[async_trait]
-impl SyncSlotComposer for NoCrossChainContent {
-    async fn compose_sync_slot(
-        &self,
-        _rollup_id: u64,
-        _parent: ParentContext,
-        _timestamp: u64,
-        _target_l1_block: Option<u64>,
-        _mode: SyncSlotMode,
-    ) -> Option<SyncSlotBlock> {
-        None
-    }
 }
 
 /// Cheap clone-able handle for a [`SyncSlotComposer`].
@@ -291,14 +242,11 @@ struct PendingSyncSlot {
 ///
 /// Exits when the source closes or the receiver is dropped.
 #[must_use]
-pub fn spawn_l1_anchored<S>(
-    mut source: S,
+pub fn spawn_l1_anchored(
+    mut source: eez_l1::L1HeadStream,
     timing: RollupTiming,
     l2_genesis_timestamp: u64,
-) -> mpsc::Receiver<SlotEvent>
-where
-    S: L1HeadSource,
-{
+) -> mpsc::Receiver<SlotEvent> {
     let (tx, rx) = mpsc::channel(8);
     tokio::spawn(async move {
         let mut ticker = interval_at(

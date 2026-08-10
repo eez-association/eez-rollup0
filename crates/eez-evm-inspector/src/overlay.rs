@@ -6,7 +6,7 @@
 //! counterpart to how reth's revm executes nested CALL opcodes by
 //! sharing the live `State<DB>`.
 //!
-//! The inspector's `tokio::task::block_in_place` bridge keeps
+//! The inspector's synchronous dispatch keeps
 //! source-sim's `evm.transact`, target-session execution, and
 //! nested-back-to-entry dispatch all on the same OS thread — no
 //! Send/Sync requirements, no cross-thread cloning. The overlay
@@ -39,7 +39,7 @@
 
 use revm::context_interface::journaled_state::account::JournaledAccountTr;
 use revm::context_interface::{ContextTr, Host, JournalTr};
-use revm::database::{AccountStatus, CacheState, State};
+use revm::database::{AccountStatus, CacheState, State, states::CacheAccount};
 use revm::primitives::Address;
 
 // Note on trait choice:
@@ -130,6 +130,15 @@ pub enum OverlayError {
     },
 }
 
+/// Whether the overlay introduced or changed a destroyed account.
+fn has_unsupported_destruction(
+    before: &CacheState,
+    address: &Address,
+    after_account: &CacheAccount,
+) -> bool {
+    after_account.status.was_destroyed() && before.accounts.get(address) != Some(after_account)
+}
+
 /// Apply the per-account, per-slot delta between two cache snapshots
 /// onto a live revm context's source state, via journal entries so the
 /// outer transaction's revert semantics propagate naturally.
@@ -138,7 +147,7 @@ pub enum OverlayError {
 ///
 /// Source-sim's inspector hook fires for a cross-chain CALL,
 /// snapshots source's cache as `before`, populates the source-cache
-/// side-channel, and drives the dispatch (`block_in_place`). During
+/// side-channel, and drives the dispatch. During
 /// that dispatch, an inner target session may dispatch back to the
 /// entry rollup; the entry rollup's session opens its `State` preloaded
 /// with `before` and accumulates per-overlay-call mutations. After the
@@ -201,17 +210,14 @@ where
     CTX: ContextTr + Host,
 {
     for (addr, after_acc) in &after.accounts {
-        // SELFDESTRUCT detection — `Destroyed` / `DestroyedChanged` /
-        // `DestroyedAgain` are revm's "this account was selfdestructed"
-        // status family. Loud-fail: no public API to apply this to
-        // source state, and the in-tree overlay path doesn't need it.
-        if matches!(
-            after_acc.status,
-            AccountStatus::Destroyed
-                | AccountStatus::DestroyedChanged
-                | AccountStatus::DestroyedAgain
-        ) {
+        // A destroyed account can be carried unchanged from the source
+        // snapshot. Only a new or changed destruction is a mutation that
+        // this diff-apply path cannot represent.
+        if has_unsupported_destruction(before, addr, after_acc) {
             return Err(OverlayError::Selfdestruct { address: *addr });
+        }
+        if after_acc.status.was_destroyed() {
+            continue;
         }
 
         // Filter: only apply for accounts the overlay actually modified.
@@ -318,5 +324,52 @@ mod tests {
             format!("{:?}", src.bal_state),
             format!("{:?}", cloned.bal_state),
         );
+    }
+
+    #[test]
+    fn unchanged_destroyed_account_is_not_a_new_selfdestruct() {
+        let address = Address::ZERO;
+        let mut before = CacheState::default();
+        before
+            .accounts
+            .insert(address, CacheAccount::new_destroyed());
+        let after = before.clone();
+
+        assert!(!has_unsupported_destruction(
+            &before,
+            &address,
+            &after.accounts[&address],
+        ));
+    }
+
+    #[test]
+    fn new_or_changed_destroyed_account_remains_unsupported() {
+        let address = Address::ZERO;
+        let before = CacheState::default();
+        let mut after = CacheState::default();
+        after
+            .accounts
+            .insert(address, CacheAccount::new_destroyed());
+
+        assert!(has_unsupported_destruction(
+            &before,
+            &address,
+            &after.accounts[&address],
+        ));
+
+        let mut before = after.clone();
+        after.accounts.get_mut(&address).unwrap().status = AccountStatus::DestroyedAgain;
+        assert!(has_unsupported_destruction(
+            &before,
+            &address,
+            &after.accounts[&address],
+        ));
+
+        before.accounts.get_mut(&address).unwrap().status = AccountStatus::Loaded;
+        assert!(has_unsupported_destruction(
+            &before,
+            &address,
+            &after.accounts[&address],
+        ));
     }
 }

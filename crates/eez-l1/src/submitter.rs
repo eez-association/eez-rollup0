@@ -1,7 +1,7 @@
 //! Thin L1-interaction primitive: sends `postAndVerifyBatch` via
 //! `eth_sendBundle` and reads past `BatchPosted` events. Stateless —
-//! the [`Composer`](crate::Composer) owns cursors, batch construction,
-//! and prover orchestration.
+//! the runtime composer owns cursors, batch construction, and prover
+//! orchestration.
 //!
 //! `eth_sendBundle` pins inclusion to one L1 block. If the bundle
 //! isn't in that block we report [`SendOutcome::Dropped`] and the
@@ -19,7 +19,7 @@ use alloy_primitives::{TxHash, U256, hex};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::Filter;
 use alloy_sol_types::SolEvent;
-use eez_evm::types::L2ExecutionPerformed;
+use eez_protocol::abi::L2ExecutionPerformed;
 use tracing::{Level, event};
 
 use crate::config::SubmitterConfig;
@@ -112,14 +112,6 @@ impl Submitter {
     #[must_use]
     pub fn poster_address(&self) -> alloy_primitives::Address {
         self.inner.config.poster.address()
-    }
-
-    /// Configured L1 RPC URL. Exposed so callers (e.g. the deriver) can
-    /// build their own provider against the same node to fetch a tx by
-    /// hash and re-decode it under a different `sol!` view.
-    #[must_use]
-    pub fn rpc_url(&self) -> reqwest::Url {
-        self.inner.config.rpc_url.clone()
     }
 
     /// Atomically bundle already-signed, 2718-encoded `raw_txs`
@@ -519,7 +511,7 @@ impl Inner {
 /// - [`L1Error::Provider`] on transport (DNS, TCP, JSON decode) failure.
 /// - [`L1Error::Submission`] when the relay HTTP status is non-2xx OR
 ///   the JSON body carries an `error` field.
-pub async fn post_bundle(
+async fn post_bundle(
     http: &reqwest::Client,
     builder_rpc_url: &str,
     raw_tx_hexes: &[&str],

@@ -6,18 +6,18 @@
 //! Deriver uses to replay L1-derived blocks
 //! (`eez_deriver::Deriver::execute_block`).
 
-use alloy_consensus::Header;
+use alloy_consensus::{BlockHeader, Header, Transaction};
 use alloy_eips::Decodable2718;
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT};
 use reth_chainspec::EthereumHardforks;
 use reth_ethereum_engine_primitives::EthEngineTypes;
-use reth_ethereum_primitives::TransactionSigned;
+use reth_ethereum_primitives::{Block, TransactionSigned};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes, execute::BlockBuilder};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_payload_primitives::PayloadTypes;
-use reth_primitives_traits::{SealedHeader, SignedTransaction};
+use reth_primitives_traits::{RecoveredBlock, SealedHeader, SignedTransaction, SignerRecoverable};
 use reth_revm::database::StateProviderDatabase;
 use reth_storage_api::StateProviderFactory;
 use revm::database::State;
@@ -53,6 +53,9 @@ pub struct BuiltSyncBlock {
     pub payload: ExecutionData,
     /// Sealed header of the new block (cursor mirror in the committer).
     pub header: SealedHeader<Header>,
+    /// The recovered Sync block. Remote-prover mode captures the endpoint witness
+    /// from here, since the block isn't committed yet (no store can serve it).
+    pub block: RecoveredBlock<Block>,
 }
 
 /// Build a Sync block on top of `parent`, executing `system_txs` (raw
@@ -140,8 +143,70 @@ where
     let outcome = builder
         .finish(state_provider.as_ref(), None)
         .map_err(|e| BuildError::Builder(format!("finish: {e}")))?;
-    let sealed_block = outcome.block.sealed_block().clone();
+    let block = outcome.block;
+    let sealed_block = block.sealed_block().clone();
     let header = sealed_block.sealed_header().clone();
     let payload = <EthEngineTypes as PayloadTypes>::block_to_payload(sealed_block, None);
-    Ok(BuiltSyncBlock { payload, header })
+    Ok(BuiltSyncBlock {
+        payload,
+        header,
+        block,
+    })
+}
+
+/// Per-effect intermediate L2 state roots — the root after each cross-chain
+/// effect's tx group (its pair-end), in tx order, one per effect.
+///
+/// The prover requires each settlement entry's `newState` to equal its effect's
+/// root (not the final Sync-block root), so the composer fills them with these.
+/// Computed by rebuilding the Sync block on each pair-end prefix of `sync_txs`;
+/// since our L2 blocks are state no-ops past the effects, a prefix block's root
+/// equals the full block's root at that tx. Settlement path only.
+///
+/// # Errors
+///
+/// See [`BuildError`]. A sync tx that fails to decode is treated as a non-system
+/// tx (pair-end), matching the prover's fail-safe flagging.
+pub fn sync_block_pair_roots<P>(
+    l2_provider: &P,
+    evm_config: &EthEvmConfig,
+    parent: &SealedHeader<Header>,
+    timestamp: u64,
+    suggested_fee_recipient: Address,
+    sync_txs: &[Bytes],
+    system_address: Address,
+    eezl2_address: Address,
+) -> Result<Vec<B256>, BuildError>
+where
+    P: StateProviderFactory,
+{
+    // Per-tx system flags must match the proof signer's classification so
+    // pair-end positions agree on both sides.
+    let flags: Vec<bool> = sync_txs
+        .iter()
+        .map(|raw| {
+            let Ok(tx) = TransactionSigned::decode_2718(&mut raw.as_ref()) else {
+                return false;
+            };
+            let to = tx.to();
+            tx.recover_signer().is_ok_and(|signer| {
+                eez_protocol::settlement::is_system_tx(signer, to, system_address, eezl2_address)
+            })
+        })
+        .collect();
+
+    eez_protocol::settlement::pair_end_positions(&flags)
+        .into_iter()
+        .map(|p| {
+            build_sync_block(
+                l2_provider,
+                evm_config,
+                parent,
+                timestamp,
+                suggested_fee_recipient,
+                &sync_txs[..=p],
+            )
+            .map(|prefix| prefix.header.state_root())
+        })
+        .collect()
 }

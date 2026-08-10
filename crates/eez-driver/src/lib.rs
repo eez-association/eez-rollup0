@@ -12,19 +12,17 @@
 //!
 //! ## Surface (Stage 4)
 //!
-//! - [`slot`] — `SlotKind`, `SlotEvent`, `L1HeadSource`, plus
+//! - [`slot`] — `SlotKind`, `SlotEvent`, plus
 //!   [`spawn_interval`] (standalone-mode) and [`spawn_l1_anchored`]
 //!   (production). Defines the protocol between Schedulers and
 //!   Sequencers.
 //! - [`Sequencer`] consumes [`SlotEvent`]s, builds payload attributes,
-//!   drives reth's engine, tracks head, emits [`BatchCandidate`]s.
+//!   drives reth's engine, tracks head.
 //! - [`RollupTiming`] + [`SlotComposition`] — per-rollup wall-clock
 //!   timing config and per-trigger Live/Future/Sync split.
-//! - [`submit`] — `BatchCandidate` schema and emission policy.
 //!
-//! Composition with `eez-l1` + `eez-composer`: this crate has zero L1
-//! dependencies; L1 wiring crosses the [`L1HeadSource`] trait boundary
-//! (impl lives in `eez-l1::L1HeadStream`).
+//! L1-anchored scheduling consumes an [`eez_l1::L1HeadStream`] through
+//! [`spawn_l1_anchored`]; higher-level composition remains in `eez-composer`.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
@@ -38,22 +36,19 @@ pub mod block_committer;
 pub mod error;
 pub mod sequencer;
 pub mod slot;
-pub mod submit;
 pub mod timing;
+pub mod witness;
 
 #[doc(inline)]
 pub use block_committer::{BlockCommitterHandle, CommitOutcome, DeriveOutcome, ForkchoiceOutcome};
 #[doc(inline)]
 pub use error::{DriverError, DriverResult};
 #[doc(inline)]
-pub use sequencer::{ConfirmedHeadSource, EthAttributesBuilder, Sequencer};
+pub use sequencer::{EthAttributesBuilder, Sequencer};
 #[doc(inline)]
 pub use slot::{
-    L1HeadInfo, L1HeadSource, NoCrossChainContent, ParentContext, SlotEvent, SlotKind,
-    SyncSlotBlock, SyncSlotComposer, SyncSlotComposerHandle, SyncSlotMode, spawn_interval,
-    spawn_l1_anchored,
+    ParentContext, SlotEvent, SlotKind, SyncSlotBlock, SyncSlotComposer, SyncSlotComposerHandle,
+    SyncSlotMode, spawn_interval, spawn_l1_anchored,
 };
-#[doc(inline)]
-pub use submit::{BatchCandidate, BatchPolicy};
 #[doc(inline)]
 pub use timing::{MAX_BLOCKS_PER_CATCHUP, RollupTiming, SlotComposition};

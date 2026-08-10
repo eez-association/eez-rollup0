@@ -1,6 +1,6 @@
-# Production-path CI network: canonical L1, builder stack, and eez-node.
+# Kurtosis E2E network: canonical L1, builder stack, and eez-node.
 
-ethereum_package = import_module("github.com/ethpandaops/ethereum-package/main.star")
+ethereum_package = import_module("github.com/ethpandaops/ethereum-package/main.star@199620b24ac979c676010c5a68b2893c2bce4f1f")
 
 # Pair A fixed ports inside the enclave.
 EMBEDDED_L1_RPC_PORT = 18545
@@ -11,9 +11,7 @@ L2_P2P_PORT = 30640
 L1_XCHAIN_PORT = 18999
 L2_XCHAIN_PORT = 18998
 BUILDER_FLASHBOTS_RPC_PORT = 8645
-
-# L2 genesis state root for genesis.json. Recompute if genesis alloc changes.
-L2_GENESIS_STATE_ROOT = "0xd381d828f650845aa890778c74ad2de245f5b3f2a24763f243e19a6bafb4fec5"
+PROOF_SIGNER_GRPC_PORT = 50061
 
 
 def run(plan, args):
@@ -22,8 +20,9 @@ def run(plan, args):
 
     poster_key = eez.get("poster_key", "")
     proof_signer_key = eez.get("proof_signer_key", "")
-    if poster_key in ["", "0xCHANGE_ME"] or proof_signer_key in ["", "0xCHANGE_ME"]:
-        fail("set eez.poster_key and eez.proof_signer_key in the args file " +
+    l2_system_key = eez.get("l2_system_key", "")
+    if poster_key in ["", "0xCHANGE_ME"] or proof_signer_key in ["", "0xCHANGE_ME"] or l2_system_key in ["", "0xCHANGE_ME"]:
+        fail("set eez.poster_key, eez.proof_signer_key, and eez.l2_system_key in the args file " +
              "(set deterministic test keys in the CI args file)")
 
     # Pair B: canonical L1, validators, and MEV stack.
@@ -69,13 +68,46 @@ def run(plan, args):
             "EEZ_L1_RPC_URL": l1_el.rpc_http_url,
             "EEZ_L1_POSTER_KEY": poster_key,
             "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
+            "EEZ_L2_SYSTEM_KEY": l2_system_key,
             "EEZ_DEPLOYMENTS_FILE": "/out/deployments.env",
             "EEZ_GENESIS_OUT": "/out/l2-genesis.json",
-            "EEZ_INITIAL_STATE_ROOT": L2_GENESIS_STATE_ROOT,
         },
         run = "mkdir -p /out && bash /repo/scripts/deploy.sh",
         store = [StoreSpec(src = "/out", name = "eez-deployments")],
         wait = "900s",
+    )
+
+    signer_cmd = " ".join([
+        "set -eu;",
+        "test -f /out/deployments.env;",
+        "set -a; . /out/deployments.env; set +a;",
+        "exec eez-proof-signer",
+        "--listen-addr=0.0.0.0:{}".format(PROOF_SIGNER_GRPC_PORT),
+        "--chain-config=/out/l2-genesis.json",
+    ])
+
+    plan.add_service(
+        name = "eez-proof-signer",
+        config = ServiceConfig(
+            image = eez.get("proof_signer_image", "eez-proof-signer:dev"),
+            ports = {
+                "grpc": PortSpec(
+                    number = PROOF_SIGNER_GRPC_PORT,
+                    transport_protocol = "TCP",
+                    wait = "2m",
+                ),
+            },
+            files = {
+                "/out": deploy.files_artifacts[0],
+            },
+            env_vars = {
+                "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
+                "EEZ_L2_SYSTEM_KEY": l2_system_key,
+                "RUST_LOG": eez.get("proof_signer_rust_log", "info"),
+            },
+            entrypoint = ["/bin/sh", "-c"],
+            cmd = [signer_cmd],
+        ),
     )
 
     # eez-node: embedded L1, composer, L2, and cross-chain fronts.
@@ -97,7 +129,8 @@ def run(plan, args):
         "EEZ_SUBMISSION_SLACK_MS": str(eez.get("submission_slack_ms", 2500)),
         "EEZ_MAX_SPECULATIVE_DEPTH": str(eez.get("max_speculative_depth", 0)),
         "EEZ_L1_POSTER_KEY": poster_key,
-        "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
+        "EEZ_PROVER_URL": "http://eez-proof-signer:{}".format(PROOF_SIGNER_GRPC_PORT),
+        "EEZ_WITNESS_DB_PATH": "/data/witnesses",
         "EEZ_L2_DATADIR": "/data/l2",
         "EEZ_L2_HTTP_PORT": str(L2_RPC_PORT),
         "EEZ_L2_RPC_URL": "http://127.0.0.1:{}".format(L2_RPC_PORT),
@@ -105,9 +138,8 @@ def run(plan, args):
         "EEZ_L2_XCHAIN_PORT": str(L2_XCHAIN_PORT),
         "EEZ_L2_AUTH_PORT": str(L2_ENGINE_PORT),
         "EEZ_L2_P2P_PORT": str(L2_P2P_PORT),
-        "EEZ_L2_SYSTEM_KEY": eez.get("l2_system_key", "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"),
-        "EEZ_L2_SYSTEM_ADDRESS": eez.get("l2_system_address", "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
-        "EEZ_CCM_L2_ADDRESS": eez.get("ccm_l2_address", "0x4200000000000000000000000000000000000007"),
+        "EEZ_L2_SYSTEM_KEY": l2_system_key,
+        "EEZL2_ADDRESS": "0x4200000000000000000000000000000000000007",
     }
 
     node_cmd = " ".join([

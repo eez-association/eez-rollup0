@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_eips::BlockNumberOrTag;
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::{Provider, ProviderBuilder};
 use tokio::sync::broadcast;
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
@@ -81,8 +81,6 @@ pub enum L1Event {
         /// Tx originator — the address that sent the postBatch.
         /// Composer uses this to detect external batches (based mode).
         submitter: Address,
-        /// `rollupCount` indexed param from the event.
-        rollup_count: U256,
         call_data: Bytes,
         /// The originating postBatch tx's full `postAndVerifyBatch` input,
         /// captured from the tx fetched by (block, index) during the scan.
@@ -518,7 +516,7 @@ impl L1Watcher {
             }
         }
 
-        if tick_count % FINALIZED_REFRESH_TICKS == 0 {
+        if tick_count.is_multiple_of(FINALIZED_REFRESH_TICKS) {
             self.refresh_finalized(provider, state).await?;
         }
 
@@ -616,7 +614,6 @@ impl L1Watcher {
                 l1_block_hash: b.l1_block_hash,
                 tx_hash: b.tx_hash,
                 submitter: b.submitter,
-                rollup_count: b.rollup_count,
                 call_data: b.call_data,
                 post_batch_input: b.post_batch_input,
                 state_applied: b.state_applied,

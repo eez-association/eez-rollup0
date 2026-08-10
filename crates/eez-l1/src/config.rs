@@ -20,7 +20,6 @@ const ENV_TARGET_RPC_URL: &str = "EEZ_L1_TARGET_RPC_URL";
 const ENV_POSTER_KEY: &str = "EEZ_L1_POSTER_KEY";
 const ENV_EEZ_ADDRESS: &str = "EEZ_REGISTRY_ADDRESS";
 const ENV_ROLLUP_ID: &str = "EEZ_ROLLUP_ID";
-const ENV_DEPLOY_BLOCK: &str = "EEZ_REGISTRY_DEPLOY_BLOCK";
 
 /// L1 connectivity for the [`Submitter`](crate::Submitter) — what's
 /// needed to send and read transactions against the EEZ registry.
@@ -115,17 +114,6 @@ impl SubmitterConfig {
             rollup_id: parse_u64(ENV_ROLLUP_ID)?,
         })
     }
-}
-
-/// Reads the EEZ registry deploy block without requiring composer-only
-/// settings such as proof-system addresses.
-///
-/// # Errors
-///
-/// Returns [`L1Error::Config`] if `EEZ_REGISTRY_DEPLOY_BLOCK` is
-/// missing or malformed.
-pub fn registry_deploy_block_from_env() -> L1Result<u64> {
-    parse_u64(ENV_DEPLOY_BLOCK)
 }
 
 fn require(name: &str) -> L1Result<String> {

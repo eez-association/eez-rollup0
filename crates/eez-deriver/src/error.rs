@@ -1,12 +1,10 @@
 //! Error type returned by the deriver.
 //!
-//! Follows M-ERRORS-CANONICAL-STRUCTS: a single public [`DeriverError`]
-//! struct wrapping a private [`ErrorKind`] enum, with a captured
-//! [`Backtrace`]. Callers discriminate via `is_*` helper methods so
-//! adding a variant doesn't break the public API.
+//! Exposes one public [`DeriverError`] while keeping its error categories
+//! private. Callers discriminate via `is_*` helper methods so adding a
+//! category does not break the public API.
 
 use core::fmt;
-use std::backtrace::Backtrace;
 
 /// Convenience [`Result`] alias used throughout the crate.
 pub type DeriverResult<T> = Result<T, DeriverError>;
@@ -14,7 +12,6 @@ pub type DeriverResult<T> = Result<T, DeriverError>;
 /// Error returned by [`Deriver`](crate::Deriver) operations.
 pub struct DeriverError {
     kind: ErrorKind,
-    backtrace: Backtrace,
 }
 
 #[derive(Debug)]
@@ -80,22 +77,7 @@ impl DeriverError {
     }
 
     fn new(kind: ErrorKind) -> Self {
-        Self {
-            kind,
-            backtrace: Backtrace::capture(),
-        }
-    }
-
-    /// Returns true if the underlying L2 provider failed.
-    #[must_use]
-    pub fn is_l2_provider(&self) -> bool {
-        matches!(self.kind, ErrorKind::L2Provider(_))
-    }
-
-    /// Returns true if the payload codec rejected an L1-posted batch.
-    #[must_use]
-    pub fn is_codec(&self) -> bool {
-        matches!(self.kind, ErrorKind::Codec(_))
+        Self { kind }
     }
 
     /// Returns true if L1 is missing data for an otherwise-observed
@@ -115,18 +97,6 @@ impl DeriverError {
     #[must_use]
     pub fn is_invalid_forkchoice(&self) -> bool {
         matches!(self.kind, ErrorKind::InvalidForkchoice(_))
-    }
-
-    /// Returns true if the local L2 diverged from an L1-confirmed batch.
-    /// Operator must reconcile — full replay is future work.
-    #[must_use]
-    pub fn is_local_diverged(&self) -> bool {
-        matches!(self.kind, ErrorKind::LocalDiverged { .. })
-    }
-
-    /// Returns the captured backtrace for diagnostics.
-    pub fn backtrace(&self) -> &Backtrace {
-        &self.backtrace
     }
 }
 
@@ -152,7 +122,6 @@ impl fmt::Debug for DeriverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeriverError")
             .field("kind", &self.kind)
-            .field("backtrace", &"<captured>")
             .finish()
     }
 }

@@ -21,7 +21,7 @@ use common::{
     wait_for_safe_prefix_convergence, wait_for_safe_state,
 };
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
+const DEFAULT_TIMEOUT: Duration = Duration::from_mins(3);
 
 fn with_composer_disabled(mut env: Vec<(&'static str, String)>) -> Vec<(&'static str, String)> {
     env.push(("EEZ_COMPOSER_DISABLED", "1".to_string()));
@@ -120,14 +120,14 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
 /// Builder mode, sustained operation through a restart. Asserts every
 /// observable invariant in one place:
 ///   - lockstep: `BatchPosted == L2ExecutionPerformed`, always;
-///   - zero `ImmediateEntrySkipped` (no prestate/rolling-hash misfire);
+///   - zero `L2TxSkipped` (no prestate/rolling-hash misfire);
 ///   - `latest_event.newState == rollups[rid].stateRoot` (event-state
 ///     consistency);
 ///   - state advances forward (≠ `B256::ZERO`, monotonic);
 ///   - across restart: counts keep lockstep (no replay), state keeps
 ///     advancing (`posted_through` re-seeded from on-chain logs).
 ///
-/// Would have caught `transientExecutionEntryCount = 0` (state never
+/// Would have caught `immediateEntryCount = 0` (state never
 /// advances) AND any future replay bug across the restart boundary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn happy_case_builder_sustained() {
@@ -262,7 +262,7 @@ async fn failure_l1_outage_recovery() {
     let _node = NodeHandle::spawn(datadir.path(), &harness.env()).unwrap();
 
     let n_before = chain
-        .wait_for_batches(2, Duration::from_secs(60))
+        .wait_for_batches(2, Duration::from_mins(1))
         .await
         .unwrap();
 
@@ -288,7 +288,7 @@ async fn failure_l1_outage_recovery() {
         .await
         .unwrap();
     chain
-        .wait_for_batches(n_before + 1, Duration::from_secs(60))
+        .wait_for_batches(n_before + 1, Duration::from_mins(1))
         .await
         .expect("composer did not recover after balance restored");
 }

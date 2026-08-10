@@ -1,13 +1,13 @@
 //! Reth-specific infrastructure for cross-chain composition.
 //!
-//! Composition orchestration (the per-tx `EvmComposer`, the revm
-//! Inspector, the proof-plan resolver) lives in `eez-evm-inspector`.
+//! Per-transaction composition building lives in `eez-protocol`; the revm
+//! inspector lives in `eez-evm-inspector`.
 //! This module provides the reth-backed implementation of the
 //! protocol traits the orchestrator drives:
 //!
 //! - [`LocalChainClient`] — unified chain client impl (entry or follower)
-//! - [`LocalExecutionSession`] — stateful per-source-tx target session
-//! - [`provider::ChainProvider`] / [`provider::HeaderReader`] — reth
+//! - `LocalExecutionSession` — stateful per-source-tx target session
+//! - `ChainProvider` / `HeaderReader` — reth
 //!   state access abstractions
 
 pub(crate) mod build;
@@ -17,11 +17,9 @@ pub(crate) mod provider;
 pub(crate) mod session;
 
 #[doc(inline)]
-pub use build::{BuildError, BuiltSyncBlock, build_sync_block};
+pub use build::{BuildError, BuiltSyncBlock, build_sync_block, sync_block_pair_roots};
 #[doc(inline)]
 pub use client::LocalChainClient;
-#[doc(inline)]
-pub use eez_evm_inspector::EvmComposer;
 #[doc(inline)]
 pub use gnosis_adapter::GnosisL1Adapter;
 // `Role` + `LocalExecutionSession` are implementation details of

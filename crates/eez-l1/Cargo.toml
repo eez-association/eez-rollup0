@@ -7,9 +7,7 @@ rust-version.workspace = true
 description            = "L1 RPC client + Submitter task that posts L2 batches to BatchPoster.sol."
 
 [dependencies]
-eez-driver.workspace        = true
-eez-evm.workspace           = true
-eez-payload-codec.workspace = true
+eez-protocol.workspace      = true
 
 # alloy
 alloy-consensus.workspace     = true
@@ -25,7 +23,6 @@ reqwest.workspace    = true
 serde_json.workspace = true
 
 # async + diagnostics
-async-trait.workspace = true
 fail.workspace        = true
 thiserror.workspace   = true
 tokio.workspace       = true
