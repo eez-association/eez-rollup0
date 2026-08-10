@@ -3,7 +3,7 @@ pragma solidity ^0.8.28;
 
 import {Script, console} from "forge-std/Script.sol";
 
-import {EEZ} from "sync-rollups-protocol/src/EEZ.sol";
+import {EEZ} from "eez-core-protocol/src/EEZ.sol";
 
 /// @title DeployEEZ
 /// @notice Deploys the central `EEZ.sol` registry on L1 with the address that

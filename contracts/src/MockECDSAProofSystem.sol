@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {IProofSystem} from "sync-rollups-protocol/src/interfaces/IProofSystem.sol";
+import {IProofSystem} from "eez-core-protocol/src/interfaces/IProofSystem.sol";
 
 /// @title MockECDSAProofSystem
 /// @notice Devnet-only `IProofSystem` that accepts any 65-byte ECDSA signature

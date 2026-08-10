@@ -3112,7 +3112,6 @@ dependencies = [
  "reth-primitives-traits",
  "reth-revm 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-storage-api 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-trie-common 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "revm",
  "thiserror 2.0.18",
  "tokio",
@@ -3190,7 +3189,6 @@ name = "eez-evm-inspector"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
- "alloy-sol-types",
  "eez-protocol",
  "revm",
  "thiserror 2.0.18",
@@ -3230,7 +3228,6 @@ dependencies = [
  "alloy-network",
  "alloy-primitives",
  "alloy-provider",
- "alloy-rlp",
  "alloy-rpc-types-debug",
  "alloy-rpc-types-eth",
  "alloy-signer-local",
@@ -3241,13 +3238,11 @@ dependencies = [
  "eez-composer",
  "eez-deriver",
  "eez-driver",
- "eez-evm-inspector",
  "eez-l1",
  "eez-protocol",
  "eez-prover",
  "eez-prover-client",
  "eyre",
- "gnosis-primitives",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -3282,7 +3277,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "tracing-subscriber 0.3.23",
  "url",
 ]
 
@@ -3336,7 +3330,6 @@ dependencies = [
  "alloy-primitives",
  "alloy-signer-local",
  "alloy-sol-types",
- "async-trait",
  "eez-payload-codec",
  "hex",
  "k256",
@@ -3346,7 +3339,6 @@ dependencies = [
  "serde_json",
  "sha3 0.10.9",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
 ]
 

@@ -3,8 +3,8 @@ pragma solidity ^0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 
-import {EEZ} from "sync-rollups-protocol/src/EEZ.sol";
-import {EEZL2} from "sync-rollups-protocol/src/L2/EEZL2.sol";
+import {EEZ} from "eez-core-protocol/src/EEZ.sol";
+import {EEZL2} from "eez-core-protocol/src/L2/EEZL2.sol";
 
 contract CallHashVectorsTest is Test {
     EEZ private eez;

@@ -8,8 +8,7 @@ use alloy_sol_types::{SolValue, sol};
 
 use tracing::debug;
 
-use crate::abi::{ExecutionEntrySol, StaticExecutionEntrySol};
-use crate::batch::EvmBatch;
+use crate::abi::{EvmBatch, ExecutionEntrySol, StaticExecutionEntrySol};
 
 // ── Per-element atomic hashes ─────────────────────────────────────
 
@@ -407,9 +406,9 @@ mod tests {
         ));
     }
 
-    fn carrier_batch() -> crate::batch::EvmBatch {
+    fn carrier_batch() -> crate::abi::EvmBatch {
         use crate::abi::RollupIdWithProofSystemsSol;
-        let mut batch = crate::batch::EvmBatch {
+        let mut batch = crate::abi::EvmBatch {
             proofSystems: vec![address!("00000000000000000000000000000000000000aa")],
             ..Default::default()
         };
