@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, chetna/tests]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -78,6 +78,41 @@ jobs:
       - name: Build and test contracts
         working-directory: contracts
         run: forge test
+
+  protocol-anvil-e2e:
+    name: Protocol Anvil E2E Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@c7450ba673e133f5ee30098b3b54f444d3a2ca2d # v1
+        with:
+          version: v1.7.1
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+      - name: Build protocol contracts
+        working-directory: eez-core-protocol
+        run: forge build
+      - name: Run complete protocol Anvil suite
+        working-directory: eez-core-protocol
+        env:
+          # Keep the protocol's same-block harness deterministic.
+          MAX_PARALLEL: "1"
+        run: bash script/e2e/shared/run-all-parallel.sh
+      - name: Upload protocol Anvil logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: protocol-anvil-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: eez-core-protocol/tmp/e2e-*/
+          if-no-files-found: warn
+          retention-days: 7
 
   embedded-e2e:
     name: Embedded E2E Tests

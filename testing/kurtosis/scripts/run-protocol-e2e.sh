@@ -1,22 +1,48 @@
 #!/usr/bin/env bash
-# Run the node-compatible counter scenario against an existing Kurtosis enclave.
+# Run supported eez-core-protocol scenarios against the CI enclave.
+# Multi-call scenarios remain disabled while the node rejects those shapes.
 set -euo pipefail
 
 KURTOSIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="$(cd "$KURTOSIS_DIR/../.." && pwd)"
-PROTOCOL="$REPO/sync-rollups-protocol"
+PROTOCOL="$REPO/eez-core-protocol"
 ENCLAVE="${KURTOSIS_ENCLAVE:-eez-ci}"
-RESULT_DIR="${EEZ_CI_RESULT_DIR:-$REPO/artifacts/production-path-ci}/protocol-e2e"
-EXPECTED_PROTOCOL="5c51e02b0f965ee8c94e9ed2c7e0e9f924d41fba"
+RESULT_DIR="${EEZ_CI_RESULT_DIR:-$REPO/artifacts/kurtosis-e2e}/protocol-e2e"
+
+SUPPORTED_SCENARIOS=(
+    bridge
+    counter
+    counterL2
+    deepNested
+    helloWorld
+    nestedCallRevert
+    nestedCounter
+    nestedCounterL2
+    reentrant
+    revertContinue
+    revertContinueL2
+    revertCounter
+    revertCounterL2
+)
+
+# Multi-call shapes are rejected by eez-protocol and eez-composer.
+UNSUPPORTED_SCENARIOS=(
+    multi-call-nested
+    multi-call-nestedL2
+    multi-call-twice
+    multi-call-two-diff
+)
 
 for tool in bash bc cast forge git jq kurtosis; do
     command -v "$tool" >/dev/null || { echo "$tool not found in PATH" >&2; exit 1; }
 done
 
+expected_protocol="$(git -C "$REPO" ls-files -s eez-core-protocol | awk '{print $2}')"
 actual_protocol="$(git -C "$PROTOCOL" rev-parse HEAD)"
-if [[ "$actual_protocol" != "$EXPECTED_PROTOCOL" ]]; then
-    echo "protocol E2E requires $EXPECTED_PROTOCOL; found $actual_protocol" >&2
-    echo "Run: git submodule update --init --recursive sync-rollups-protocol" >&2
+if [[ -z "$expected_protocol" || "$actual_protocol" != "$expected_protocol" ]]; then
+    echo "eez-core-protocol is not at the commit pinned by this checkout" >&2
+    echo "expected: ${expected_protocol:-missing}; found: $actual_protocol" >&2
+    echo "Run: git submodule update --init --recursive eez-core-protocol" >&2
     exit 1
 fi
 
@@ -42,29 +68,34 @@ done
 mkdir -p "$RESULT_DIR"
 deploy_dir="$(mktemp -d /tmp/eez-protocol-deployments.XXXXXX)"
 router_dir="$(mktemp -d /tmp/eez-protocol-cast.XXXXXX)"
+e2e_base="$PROTOCOL/script/e2e/shared/E2EBase.sh"
+e2e_base_backup="$deploy_dir/E2EBase.sh"
+cp "$e2e_base" "$e2e_base_backup"
 cleanup() {
+    cp "$e2e_base_backup" "$e2e_base"
     rm -rf "$deploy_dir" "$router_dir"
 }
 trap cleanup EXIT
 
+cat "$KURTOSIS_DIR/scripts/protocol-e2e-network-compat.sh" >>"$e2e_base"
+
 kurtosis files download "$ENCLAVE" eez-deployments "$deploy_dir" >/dev/null
 set -a
+# shellcheck disable=SC1091
 source "$deploy_dir/deployments.env"
 set +a
 
 ROLLUPS="${ROLLUPS:-$EEZ_REGISTRY_ADDRESS}"
-MANAGER_L2="${MANAGER_L2:-${EEZ_CCM_L2_ADDRESS:-0x4200000000000000000000000000000000000007}}"
-# Hardhat account #2 is prefunded on both Kurtosis chains and is not used by
-# the poster/prover services.
+MANAGER_L2="${MANAGER_L2:-${EEZL2_ADDRESS:-0x4200000000000000000000000000000000000007}}"
+# Hardhat account #2 is prefunded and unused by the CI services.
 PK="${PK:-0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a}"
 
 echo "==> protocol E2E endpoints"
+echo "    protocol:     $actual_protocol"
 echo "    L1 RPC/front: $EEZ_PROTOCOL_L1_RPC / $EEZ_PROTOCOL_L1_FRONT"
 echo "    L2 RPC/front: $EEZ_PROTOCOL_L2_RPC / $EEZ_PROTOCOL_L2_FRONT"
 echo "    registry:     $ROLLUPS"
 
-# CREATE2 factories are idempotent; account #2 is already funded on both
-# chains by the Kurtosis genesis configuration.
 (
     cd "$PROTOCOL"
     bash script/e2e/shared/prepare-network.sh \
@@ -75,27 +106,64 @@ echo "    registry:     $ROLLUPS"
 )
 
 EEZ_REAL_CAST="$(command -v cast)"
-EEZ_REAL_FORGE="$(command -v forge)"
-EEZ_PROTOCOL_VERIFY_FILE="$KURTOSIS_DIR/contracts/VerifyProtocol5c.s.sol"
-export EEZ_REAL_CAST EEZ_REAL_FORGE EEZ_PROTOCOL_VERIFY_FILE
+export EEZ_REAL_CAST
 ln -s "$KURTOSIS_DIR/scripts/protocol-e2e-cast" "$router_dir/cast"
-ln -s "$KURTOSIS_DIR/scripts/protocol-e2e-forge" "$router_dir/forge"
 
-log="$RESULT_DIR/counter.log"
-echo "════════════ RUNNING counter ════════════"
-if (
-    cd "$PROTOCOL"
-    PATH="$router_dir:$PATH" bash script/e2e/shared/run-network.sh \
-        script/e2e/counter/E2E.s.sol \
-        --l1-rpc "$EEZ_PROTOCOL_L1_RPC" \
-        --l2-rpc "$EEZ_PROTOCOL_L2_RPC" \
-        --pk "$PK" \
-        --rollups "$ROLLUPS" \
-        --manager-l2 "$MANAGER_L2"
-) >"$log" 2>&1; then
-    echo "RESULT counter: PASS"
+if [[ -n "${EEZ_PROTOCOL_SCENARIOS:-}" ]]; then
+    read -r -a scenarios <<<"$EEZ_PROTOCOL_SCENARIOS"
 else
-    echo "RESULT counter: FAIL"
-    tail -n 80 "$log"
-    exit 1
+    scenarios=("${SUPPORTED_SCENARIOS[@]}")
 fi
+
+passed=()
+failed=()
+for scenario in "${scenarios[@]}"; do
+    sol="script/e2e/$scenario/E2E.s.sol"
+    log="$RESULT_DIR/$scenario.log"
+    [[ -f "$PROTOCOL/$sol" ]] || { echo "missing protocol scenario: $sol" >&2; exit 1; }
+
+    echo "════════════ RUNNING $scenario ════════════"
+    if (
+        cd "$PROTOCOL"
+        PATH="$router_dir:$PATH" bash script/e2e/shared/run-network.sh \
+            "$sol" \
+            --l1-rpc "$EEZ_PROTOCOL_L1_RPC" \
+            --l2-rpc "$EEZ_PROTOCOL_L2_RPC" \
+            --pk "$PK" \
+            --rollups "$ROLLUPS" \
+            --manager-l2 "$MANAGER_L2" \
+            --l2-rollup-id "${EEZ_ROLLUP_ID:-1}"
+    ) >"$log" 2>&1; then
+        echo "RESULT $scenario: PASS"
+        passed+=("$scenario")
+    else
+        echo "RESULT $scenario: FAIL"
+        tail -n 120 "$log"
+        failed+=("$scenario")
+    fi
+done
+
+json_array() {
+    jq -cn --args '$ARGS.positional' "$@"
+}
+
+jq -n \
+    --arg protocol_commit "$actual_protocol" \
+    --argjson passed "$(json_array "${passed[@]}")" \
+    --argjson failed "$(json_array "${failed[@]}")" \
+    --argjson unsupported "$(json_array "${UNSUPPORTED_SCENARIOS[@]}")" \
+    '{protocol_commit: $protocol_commit, passed: $passed, failed: $failed, unsupported: $unsupported}' \
+    >"$RESULT_DIR/summary.json"
+
+echo "==> protocol E2E result: ${#passed[@]} passed, ${#failed[@]} failed"
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    {
+        echo "### Protocol network E2E"
+        echo
+        echo "- Passed: ${#passed[@]}"
+        echo "- Failed: ${#failed[@]}"
+        echo "- Explicitly unsupported multi-call scenarios: ${UNSUPPORTED_SCENARIOS[*]}"
+    } >>"$GITHUB_STEP_SUMMARY"
+fi
+
+(( ${#failed[@]} == 0 ))

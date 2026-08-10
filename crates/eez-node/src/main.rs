@@ -427,21 +427,8 @@ fn main() -> eyre::Result<()> {
         let rollup_config = RollupConfig::from_env()?;
         let l1_watcher_config = L1WatcherConfig::from_env()?;
 
-        // Target bundles from the builder's canonical L1 view.
-        let target_l1_rpc_url = submitter_config
-            .target_rpc_url
-            .clone()
-            .unwrap_or_else(|| submitter_config.rpc_url.clone());
         let submitter = Submitter::new(submitter_config);
-        let l1_watcher = L1Watcher::spawn(l1_watcher_config.clone());
-        let target_l1_watcher = if target_l1_rpc_url == l1_watcher_config.rpc_url {
-            l1_watcher.clone()
-        } else {
-            L1Watcher::spawn(L1WatcherConfig {
-                rpc_url: target_l1_rpc_url.clone(),
-                ..l1_watcher_config
-            })
-        };
+        let l1_watcher = L1Watcher::spawn(l1_watcher_config);
 
         // Composer-only: build the umbrella, then attach it to the
         // Sequencer built above (swapping in the L1-anchored schedule via
@@ -797,7 +784,7 @@ fn main() -> eyre::Result<()> {
             // schedule + composer hooks. Speculative depth already
             // applied above.
             let schedule_rx = spawn_l1_anchored(
-                L1HeadStream::from_watcher(&target_l1_watcher),
+                L1HeadStream::from_watcher(&l1_watcher),
                 timing,
                 l2_genesis_timestamp,
             );

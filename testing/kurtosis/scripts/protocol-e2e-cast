@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Transparent cast adapter for the protocol's 5c51e02 network runner.
-# Only held cross-chain submissions are redirected to the composer fronts;
-# reads, deployment transactions, nonce queries, and receipt queries continue
-# to use the canonical RPC endpoints.
+# Route protocol user submissions through the cross-chain fronts.
+# Keep reads, deployments, and receipt queries on the canonical RPCs.
 set -euo pipefail
 
 REAL_CAST="${EEZ_REAL_CAST:?EEZ_REAL_CAST must point to the real cast binary}"
@@ -21,9 +19,8 @@ if [[ "${1:-}" == "rpc" && "${2:-}" == "eth_sendRawTransaction" ]]; then
     exec "$REAL_CAST" "${args[@]}"
 fi
 
-# The compatible runner asks for the receipt immediately. A trigger sent to a
-# front is intentionally held until the composer includes its bundle, so poll
-# the normal chain RPC until the receipt appears.
+# Fronts hold user transactions until the composer includes their bundle.
+# Poll the canonical RPC because the upstream runner checks immediately.
 if [[ "${1:-}" == "receipt" ]]; then
     deadline=$((SECONDS + ${EEZ_PROTOCOL_RECEIPT_TIMEOUT_SECS:-420}))
     while ((SECONDS < deadline)); do
