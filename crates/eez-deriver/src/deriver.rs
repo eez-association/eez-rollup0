@@ -301,7 +301,7 @@ where
             // roots are phantoms). Skip the whole reconcile — no
             // cursor advance, no replay, no state check; the composer's
             // next slot re-attempts over the same range.
-            if batch.settled_count == 0 {
+            if batch.settlement.is_empty() {
                 event!(
                     name: "eez.deriver.catch_up.batch.unsettled",
                     Level::DEBUG,
@@ -321,13 +321,15 @@ where
             let batch_first_l2 = *cumulative_l2 + 1;
             let batch_last_l2 = *cumulative_l2 + decoded.block_count() as u64;
 
-            // Cursor-alignment guard (as in on_batch_posted): the batch's
-            // claimed `currentState` must equal our state root here, else
-            // this scan is misaligned with L1 — bail before replaying onto
-            // blocks that exist on no other node.
-            if let Some(claimed_current) = batch.claimed_current_state {
+            // Cursor-alignment guard (as in on_batch_posted): the root the
+            // batch's APPLIED run started from must equal our state root here,
+            // else this scan is misaligned with L1 — bail before replaying onto
+            // blocks that exist on no other node. `entry_state`, not the claimed
+            // `currentState`, so a batch whose leading hops a competing same-block
+            // batch already made isn't flagged as diverged.
+            if let Some(entry_state) = batch.settlement.entry_state {
                 let local_root = self.l2_state_root_at(*cumulative_l2)?;
-                if local_root != claimed_current {
+                if local_root != entry_state {
                     event!(
                         name: "eez.deriver.catch_up.cursor.misaligned",
                         Level::ERROR,
@@ -335,8 +337,9 @@ where
                         tx_hash = %batch.tx_hash,
                         cumulative_l2 = *cumulative_l2,
                         local_root = %local_root,
-                        claimed_current = %claimed_current,
-                        "batch currentState does not match local state root at the scan cursor; refusing to replay",
+                        entry_state = %entry_state,
+                        applied_start = batch.settlement.start,
+                        "root the batch's applied run started from does not match local state root at the scan cursor; refusing to replay",
                     );
                     return Err(DeriverError::local_diverged(batch_first_l2));
                 }
@@ -349,7 +352,7 @@ where
                     batch.post_batch_input.clone(),
                     batch.l1_block_number,
                     batch.tx_hash,
-                    batch.settled_count,
+                    batch.settlement,
                 )
                 .await?;
 
@@ -367,7 +370,7 @@ where
             // is a prefix root of the claimed chain, not its end.
             self.check_claimed_state(
                 batch.claimed_current_state,
-                batch.settled_final_state.or(batch.claimed_new_state),
+                batch.settlement.final_state.or(batch.claimed_new_state),
                 batch_first_l2,
                 batch_last_l2,
                 batch.l1_block_number,
@@ -700,8 +703,7 @@ where
                 call_data,
                 post_batch_input,
                 state_applied,
-                settled_count,
-                settled_final_state,
+                settlement,
                 claimed_current_state,
                 claimed_new_state,
                 ..
@@ -714,8 +716,7 @@ where
                     call_data,
                     post_batch_input,
                     state_applied,
-                    settled_count,
-                    settled_final_state,
+                    settlement,
                     claimed_current_state,
                     claimed_new_state,
                 )
@@ -751,8 +752,7 @@ where
         call_data: Bytes,
         post_batch_input: Bytes,
         state_applied: bool,
-        settled_count: usize,
-        settled_final_state: Option<B256>,
+        settlement: eez_l1::Settlement,
         claimed_current_state: Option<B256>,
         claimed_new_state: Option<B256>,
     ) -> DeriverResult<()> {
@@ -781,7 +781,7 @@ where
         // composer's next slot re-attempts. Without this gate the
         // deriver would replay the unsettled range, reorg L2, then fail
         // `check_claimed_state` as a spurious divergence.
-        if settled_count == 0 {
+        if settlement.is_empty() {
             event!(
                 name: "eez.deriver.batch.unsettled",
                 Level::INFO,
@@ -836,13 +836,15 @@ where
         let from_block = last_indexed_l2 + 1;
         let to_block = last_indexed_l2 + block_count;
 
-        // Cursor-alignment guard: the batch's claimed `currentState` must
-        // equal our state root at the cursor, else the local index is
-        // misaligned with L1 (e.g. a dropped event) — bail and let the
-        // run-loop resync re-anchor.
-        if let Some(claimed_current) = claimed_current_state {
+        // Cursor-alignment guard: the root the batch's APPLIED run started from
+        // must equal our state root at the cursor, else the local index is
+        // misaligned with L1 (e.g. a dropped event) — bail and let the run-loop
+        // resync re-anchor. `entry_state`, not the claimed `currentState`, so a
+        // batch whose leading hops a competing same-block batch already made
+        // isn't flagged as diverged.
+        if let Some(entry_state) = settlement.entry_state {
             let local_root = self.l2_state_root_at(last_indexed_l2)?;
-            if local_root != claimed_current {
+            if local_root != entry_state {
                 event!(
                     name: "eez.deriver.cursor.misaligned",
                     Level::ERROR,
@@ -850,8 +852,9 @@ where
                     tx_hash = %tx_hash,
                     last_indexed_l2,
                     local_root = %local_root,
-                    claimed_current = %claimed_current,
-                    "batch currentState does not match local state root at cursor; resync required",
+                    entry_state = %entry_state,
+                    applied_start = settlement.start,
+                    "root the batch's applied run started from does not match local state root at cursor; resync required",
                 );
                 return Err(DeriverError::local_diverged(from_block));
             }
@@ -867,7 +870,7 @@ where
                 post_batch_input,
                 l1_block_number,
                 tx_hash,
-                settled_count,
+                settlement,
             )
             .await?;
         event!(
@@ -886,7 +889,7 @@ where
         // claimed chain — never the claimed full-chain end.
         self.check_claimed_state(
             claimed_current_state,
-            settled_final_state.or(claimed_new_state),
+            settlement.final_state.or(claimed_new_state),
             from_block,
             to_block,
             l1_block_number,
@@ -1070,7 +1073,7 @@ where
         post_batch_input: Bytes,
         l1_block_number: u64,
         tx_hash: B256,
-        settled_count: usize,
+        settlement: eez_l1::Settlement,
     ) -> DeriverResult<u64> {
         // Cross-chain path (skipped when `system_tx_cfg` is `None`):
         // reconstruct the system txs the composer produced, from either
@@ -1099,10 +1102,9 @@ where
         // Producing entries are ordered `[anchor, outbound…, inbound…]`:
         // `postAndVerifyBatch` drains the leading `proxyEntryHash==0` run (anchor +
         // outbound) inline, then consumes the deferred inbound ones (`EEZ.sol:387`).
-        // Applied entries are always a PREFIX (a skipped immediate cascades via
-        // `StateUpdate.currentState` mismatch), so `settled_count - 1`
-        // splits outbound-first, then inbound. One path: inbound-only / outbound-only
-        // / mixed.
+        // `Settlement::producing_slice` says WHICH of those L1 actually ran, read
+        // off the settled roots — the anchor cannot be assumed to have run, since
+        // a competing same-block batch can supply its hop.
         //
         // `gate_outbound`: outbound entries L1 paid, stashed for the post-replay
         // gate (empty in the pure-user-tx path → no-op).
@@ -1155,24 +1157,29 @@ where
                     .into_iter()
                     .partition(|e| e.proxyEntryHash == alloy_primitives::B256::ZERO);
 
-                // Prefix split: applied non-anchor entries consume outbound first.
-                let applied = settled_count.saturating_sub(1);
-                let applied_outbound = applied.min(outbound.len());
-                let consumed_inbound = applied - applied_outbound;
-                if outbound.len() > applied_outbound || inbound.len() > consumed_inbound {
+                // Rebuild exactly the steps L1 ran; `skip > 0` = it resumed
+                // mid-chain (see `ProducingSlice`).
+                let slice = ProducingSlice::split(settlement, outbound.len(), inbound.len());
+                let ob_skip = slice.ob_skip;
+                if slice.leaves_entries_unconsumed(outbound.len(), inbound.len()) {
                     event!(
                         name: "eez.deriver.reconcile.partial_consumption",
                         Level::WARN,
                         tx_hash = %tx_hash,
                         outbound = outbound.len(),
                         inbound = inbound.len(),
-                        applied_outbound,
-                        consumed_inbound,
-                        "L1 settled only a prefix; truncating reconstruction to match",
+                        ob_skip = slice.ob_skip,
+                        ob_take = slice.ob_take,
+                        ib_skip = slice.ib_skip,
+                        ib_take = slice.ib_take,
+                        anchor_applied = settlement.start == 0,
+                        "L1 ran only part of this batch; reconstructing exactly that slice",
                     );
                 }
-                outbound.truncate(applied_outbound);
-                inbound.truncate(consumed_inbound);
+                outbound.drain(..slice.ob_skip);
+                outbound.truncate(slice.ob_take);
+                inbound.drain(..slice.ib_skip);
+                inbound.truncate(slice.ib_take);
 
                 // The Sync block is the LAST block of the range; its user txs are
                 // the tail of `decoded.transactions`. Pair the i-th outbound entry
@@ -1188,11 +1195,17 @@ where
                     .iter()
                     .map(|t| Bytes::from(t.clone()))
                     .collect();
-                if sync_user_txs.len() < outbound.len() {
+                // Outbound entries pair POSITIONALLY with the Sync block's user
+                // txs, so a skipped outbound entry must skip its user tx too, else
+                // every pair shifts by one. Those user txs are dropped, not
+                // appended: they belong to steps a competing batch already landed,
+                // so replaying them would spend already-spent nonces.
+                if sync_user_txs.len() < ob_skip + outbound.len() {
                     return Err(DeriverError::local_diverged_with_msg(
                         from_block,
                         &format!(
-                            "outbound entries ({}) exceed Sync-block user txs ({})",
+                            "outbound entries ({} skipped + {} applied) exceed Sync-block user txs ({})",
+                            ob_skip,
                             outbound.len(),
                             sync_user_txs.len(),
                         ),
@@ -1201,7 +1214,7 @@ where
                 let outbound_paired: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)> = outbound
                     .iter()
                     .cloned()
-                    .zip(sync_user_txs.iter().cloned())
+                    .zip(sync_user_txs[ob_skip..].iter().cloned())
                     .collect();
 
                 // Stash for the post-replay gate — it needs the
@@ -1227,7 +1240,8 @@ where
                         .into_iter()
                         .map(|b| b.to_vec())
                         .collect();
-                for t in &decoded.transactions[sync_user_start + outbound_paired.len()..] {
+                for t in &decoded.transactions[sync_user_start + ob_skip + outbound_paired.len()..]
+                {
                     full.push(t.clone());
                 }
                 event!(
@@ -1503,6 +1517,45 @@ where
     Ok(local_block.header().parent_hash == expected_parent_hash)
 }
 
+/// Which producing entries L1 ran, projected onto the partitioned
+/// `[outbound…, inbound…]` list (that concatenation is the claimed chain minus
+/// the anchor). A `skip` per list, not just a length: L1 resumes MID-CHAIN when
+/// a competing same-block batch already made the leading hops, so those entries
+/// drop from the FRONT — which prefix truncation cannot express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProducingSlice {
+    ob_skip: usize,
+    ob_take: usize,
+    ib_skip: usize,
+    ib_take: usize,
+}
+
+impl ProducingSlice {
+    /// Project `settlement`'s producing run onto lists of the given lengths.
+    fn split(settlement: eez_l1::Settlement, outbound_len: usize, inbound_len: usize) -> Self {
+        let (skip, take) = settlement.producing_slice();
+        let ob_skip = skip.min(outbound_len);
+        let ob_take = take.min(outbound_len - ob_skip);
+        // Any skip beyond the outbound list falls through into inbound.
+        let ib_skip = skip.saturating_sub(ob_skip).min(inbound_len);
+        let ib_take = take
+            .saturating_sub(ob_take)
+            .min(inbound_len - ib_skip.min(inbound_len));
+        Self {
+            ob_skip,
+            ob_take,
+            ib_skip,
+            ib_take,
+        }
+    }
+
+    /// True when entries are left over at the TAIL (partial consumption). A pure
+    /// mid-chain resume does NOT trip this — front skips are counted in `*_skip`.
+    const fn leaves_entries_unconsumed(&self, outbound_len: usize, inbound_len: usize) -> bool {
+        self.ob_skip + self.ob_take < outbound_len || self.ib_skip + self.ib_take < inbound_len
+    }
+}
+
 /// Decode outbound-call events emitted by the configured L2 manager.
 fn extract_outbound_call_observations<R>(
     receipts: &[R],
@@ -1523,6 +1576,118 @@ where
             OutboundCallObservation::new(event.data.crossChainCallHash, event.data.callGas)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod producing_slice_tests {
+    //! Two composers post into ONE L1 block: `pb1` claims `A→B` and lands, so
+    //! `pb2`'s leading step(s) are refused as redundant and L1 resumes MID-CHAIN
+    //! inside it. The deriver must rebuild exactly the steps that ran.
+
+    use super::ProducingSlice;
+    use eez_l1::Settlement;
+
+    /// The superseded reconstruction: keep `settled_count - 1` entries from the
+    /// FRONT (outbound first, then inbound). Its skips are structurally 0 — the
+    /// defect. Shaped as `(ob_skip, ob_take, ib_skip, ib_take)` to compare.
+    fn old_prefix_split(
+        settled_count: usize,
+        outbound_len: usize,
+        inbound_len: usize,
+    ) -> (usize, usize, usize, usize) {
+        let applied = settled_count.saturating_sub(1);
+        let applied_outbound = applied.min(outbound_len);
+        let consumed_inbound = (applied - applied_outbound).min(inbound_len);
+        (0, applied_outbound, 0, consumed_inbound)
+    }
+
+    fn settlement(start: usize, len: usize) -> Settlement {
+        Settlement {
+            start,
+            len,
+            final_state: None,
+            entry_state: None,
+        }
+    }
+
+    /// Anchor skipped, one producing step ran → rebuild that one, not zero.
+    #[test]
+    fn second_batch_rebuilds_the_single_step_that_ran() {
+        let s = ProducingSlice::split(settlement(1, 1), 0, 1);
+        assert_eq!(
+            s,
+            ProducingSlice {
+                ob_skip: 0,
+                ob_take: 0,
+                ib_skip: 0,
+                ib_take: 1
+            },
+        );
+        assert!(!s.leaves_entries_unconsumed(0, 1));
+    }
+
+    /// Competitor made the anchor AND the first producing hop, so L1 resumed at
+    /// the second. The prefix formula keeps the already-settled entry and drops
+    /// the one that ran — rebuilding a different tx than L1 executed.
+    #[test]
+    fn deeper_resume_skips_the_front_where_prefix_truncation_cannot() {
+        // claimed [anchor, p0, p1]; competitor made anchor + p0; only p1 ran.
+        let s = ProducingSlice::split(settlement(2, 1), 0, 2);
+        assert_eq!(
+            s,
+            ProducingSlice {
+                ob_skip: 0,
+                ob_take: 0,
+                ib_skip: 1,
+                ib_take: 1,
+            },
+        );
+        // Front skips are counted, so nothing reads as left over.
+        assert!(!s.leaves_entries_unconsumed(0, 2));
+
+        let old = old_prefix_split(1, 0, 2);
+        assert_eq!(old, (0, 0, 0, 0), "prefix formula rebuilds nothing here");
+        assert_ne!((old.2, old.3), (s.ib_skip, s.ib_take));
+    }
+
+    /// A skip longer than the outbound list falls through into inbound.
+    #[test]
+    fn skip_and_take_span_outbound_into_inbound() {
+        let s = ProducingSlice::split(settlement(3, 2), 2, 3);
+        assert_eq!((s.ob_skip, s.ob_take), (2, 0));
+        assert_eq!((s.ib_skip, s.ib_take), (0, 2));
+    }
+
+    /// Anchor ran: producing entries are `len - 1`, nothing skipped. The ordinary
+    /// single-composer path must derive exactly as the prefix formula did.
+    #[test]
+    fn anchor_applied_matches_the_prefix_formula() {
+        let s = ProducingSlice::split(settlement(0, 3), 1, 1);
+        assert_eq!(s.ob_skip, 0);
+        assert_eq!(s.ib_skip, 0);
+        assert_eq!((s.ob_take, s.ib_take), (1, 1));
+        let old = old_prefix_split(3, 1, 1);
+        assert_eq!((old.1, old.3), (s.ob_take, s.ib_take));
+    }
+
+    /// L1 stopped SHORT (a reverting user tx left its entry and the rest
+    /// unconsumed) — truncate the tail, no skip.
+    #[test]
+    fn stopping_short_truncates_the_tail() {
+        let s = ProducingSlice::split(settlement(0, 2), 0, 3);
+        assert_eq!((s.ib_skip, s.ib_take), (0, 1));
+        assert!(s.leaves_entries_unconsumed(0, 3));
+    }
+
+    /// A run longer than the available entries clamps instead of panicking.
+    #[test]
+    fn oversized_run_clamps_to_available_entries() {
+        let s = ProducingSlice::split(settlement(0, 99), 1, 1);
+        assert_eq!((s.ob_take, s.ib_take), (1, 1));
+        let s = ProducingSlice::split(settlement(50, 99), 1, 1);
+        assert_eq!(s.ob_skip + s.ob_take, 1);
+        assert_eq!(s.ib_skip + s.ib_take, 1);
+    }
 }
 
 #[cfg(test)]

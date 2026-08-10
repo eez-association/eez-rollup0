@@ -34,6 +34,6 @@ pub use l1_head_stream::{L1HeadInfo, L1HeadStream};
 #[doc(inline)]
 pub use l1_watcher::{L1Event, L1Watcher, L1WatcherConfig};
 #[doc(inline)]
-pub use scan::{BatchLogChunks, ScannedBatch};
+pub use scan::{BatchLogChunks, ScannedBatch, Settlement};
 #[doc(inline)]
 pub use submitter::{BundleTarget, SendOutcome, Submitter};
