@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run supported eez-core-protocol scenarios against the CI enclave.
-# Multi-call scenarios remain disabled while the node rejects those shapes.
+# The full scenario suite runs separately against Anvil in the normal CI.
 set -euo pipefail
 
 KURTOSIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -13,24 +13,24 @@ SUPPORTED_SCENARIOS=(
     bridge
     counter
     counterL2
-    deepNested
     helloWorld
+    revertCounter
+)
+
+# These table shapes are not yet supported by the Kurtosis network path.
+UNSUPPORTED_SCENARIOS=(
+    deepNested
+    multi-call-nested
+    multi-call-nestedL2
+    multi-call-twice
+    multi-call-two-diff
     nestedCallRevert
     nestedCounter
     nestedCounterL2
     reentrant
     revertContinue
     revertContinueL2
-    revertCounter
     revertCounterL2
-)
-
-# Multi-call shapes are rejected by eez-protocol and eez-composer.
-UNSUPPORTED_SCENARIOS=(
-    multi-call-nested
-    multi-call-nestedL2
-    multi-call-twice
-    multi-call-two-diff
 )
 
 for tool in bash bc cast forge git jq kurtosis; do
@@ -123,6 +123,8 @@ for scenario in "${scenarios[@]}"; do
     [[ -f "$PROTOCOL/$sol" ]] || { echo "missing protocol scenario: $sol" >&2; exit 1; }
 
     echo "════════════ RUNNING $scenario ════════════"
+    export EEZ_PROTOCOL_L2_SEARCH_START
+    EEZ_PROTOCOL_L2_SEARCH_START="$(cast block-number --rpc-url "$EEZ_PROTOCOL_L2_RPC")"
     if (
         cd "$PROTOCOL"
         PATH="$router_dir:$PATH" bash script/e2e/shared/run-network.sh \
@@ -162,7 +164,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         echo
         echo "- Passed: ${#passed[@]}"
         echo "- Failed: ${#failed[@]}"
-        echo "- Explicitly unsupported multi-call scenarios: ${UNSUPPORTED_SCENARIOS[*]}"
+        echo "- Unsupported network scenarios: ${UNSUPPORTED_SCENARIOS[*]}"
     } >>"$GITHUB_STEP_SUMMARY"
 fi
 
