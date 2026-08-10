@@ -306,13 +306,26 @@ struct EmissionLimits {
     max_gas: u64,
 }
 
+/// The proof signer's default `EEZ_PROOF_SIGNER_MAX_REQUEST_BLOCKS`.
+const PROOF_SIGNER_DEFAULT_REQUEST_WINDOW: u64 = 512;
+
 impl EmissionLimits {
     fn from_env(timing: RollupTiming) -> Self {
         let k = u64::from(timing.k());
         let requested = env_u64("EEZ_MAX_BLOCKS_PER_BATCH").unwrap_or(MAX_BLOCKS_PER_BATCH);
+        let max_blocks = clamp_max_blocks_per_batch(requested, k);
+        if max_blocks >= PROOF_SIGNER_DEFAULT_REQUEST_WINDOW {
+            event!(
+                name: "eez.composer.emission.cap_exceeds_prove_window",
+                Level::WARN,
+                max_blocks,
+                prove_window = PROOF_SIGNER_DEFAULT_REQUEST_WINDOW,
+                "EEZ_MAX_BLOCKS_PER_BATCH meets or exceeds the proof signer's default request window; prove() will reject every chunk unless EEZ_PROOF_SIGNER_MAX_REQUEST_BLOCKS was raised to match",
+            );
+        }
         Self {
             timing,
-            max_blocks: clamp_max_blocks_per_batch(requested, k),
+            max_blocks,
             max_gas: env_u64("EEZ_MAX_POSTBATCH_GAS").unwrap_or(DEFAULT_MAX_POSTBATCH_GAS),
         }
     }
@@ -922,8 +935,18 @@ where
         // nothing to roll back).
         if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
             self.recover_failed_batch(rollup_id, rollup, failed).await;
-            // Recovery owns the head now (substituted sibling, or a retreat to
-            // the parent); the Sequencer's stale-parent bail covers this slot.
+            // Recovery may leave the head in place (reinsert / stale-verdict);
+            // returning None then lets the mempool-fed commit_one fallback mint
+            // a tx-bearing block at this grid height. A moved head is covered by
+            // the Sequencer's stale-parent bail.
+            let head_unmoved = self
+                .inner
+                .committer
+                .get()
+                .is_some_and(|c| c.last_header().hash() == parent_header.hash());
+            if head_unmoved {
+                return self.build_empty_slot_block(rollup, &parent_header, timestamp);
+            }
             return None;
         }
 
@@ -932,7 +955,7 @@ where
         self.log_settlement_backlog(rollup_id, cursor, sync_height, blocked);
         // Deferred-late: empty block, no emission — keeps grid heights empty
         // by construction so they stay boundary-eligible.
-        if matches!(mode, SyncSlotMode::Structural) {
+        if matches!(mode, SyncSlotMode::Empty) {
             return self.build_empty_slot_block(rollup, &parent_header, timestamp);
         }
         if blocked {
@@ -2862,6 +2885,7 @@ where
             calldata,
             ctx.l1_chain_id,
             ctx.l1_post_batch_priority_fee,
+            self.inner.emission.max_gas,
         )
         .await
     }
@@ -2985,6 +3009,7 @@ async fn sign_post_batch_tx(
     calldata: Vec<u8>,
     chain_id: u64,
     priority_fee: u128,
+    max_gas: u64,
 ) -> Result<Bytes, String> {
     use alloy_consensus::TxEip1559;
     use alloy_eips::BlockNumberOrTag;
@@ -3013,6 +3038,16 @@ async fn sign_post_batch_tx(
     // Size-derived: a fixed limit sits below the floor once the batch grows,
     // and an under-floor tx is dropped at simulation with no on-chain trace.
     let gas_limit = calldata_floor_gas(&calldata).saturating_add(POST_BATCH_EXECUTION_GAS_RESERVE);
+    // Ceiling on every emission path, not just the historical chunks that
+    // pre-bound via select_chunk_boundary. Refusing degrades to
+    // commit-without-emission; the grown backlog then settles as bounded chunks.
+    if gas_limit > max_gas {
+        return Err(format!(
+            "postBatch gas {gas_limit} exceeds EEZ_MAX_POSTBATCH_GAS {max_gas} \
+             ({} calldata bytes); refusing emission — bounded chunks cover the range",
+            calldata.len(),
+        ));
+    }
 
     // Diagnostic only — from the outside a drained poster looks exactly like a
     // dead relay. Don't abort; the tx still lands if the base fee settles.

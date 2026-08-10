@@ -145,9 +145,10 @@ pub enum SyncSlotMode {
     /// Behind-the-wall-clock catchup — empty Sync block; cross-chain
     /// waits for the next [`Steady`](Self::Steady) slot.
     Catchup,
-    /// Deferred-late slot — EMPTY block, no emission. Unlike the mempool-fed
-    /// `commit_one` fallback it keeps grid heights batch-boundary-eligible.
-    Structural,
+    /// Deterministic EMPTY block, no emission (deferred-late slots). Unlike
+    /// the mempool-fed `commit_one` fallback it keeps grid heights
+    /// batch-boundary-eligible.
+    Empty,
 }
 
 /// Per-Sync-slot block producer for cross-chain content.

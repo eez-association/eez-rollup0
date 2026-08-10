@@ -601,8 +601,10 @@ where
                         l1_head,
                         "trigger too late for the immediate L1 slot; committing an empty block and holding the pool — next slot's batch covers it",
                     );
-                    // Never the mempool-fed commit_one fallback — a tx-bearing
-                    // grid block is ineligible as a later batch boundary.
+                    // Empty mode keeps this grid height batch-boundary-eligible
+                    // (a tx-bearing block is not). Not airtight: with no composer
+                    // wired, or if the empty build fails, control still falls
+                    // through to the mempool-fed commit_one below.
                     if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref() {
                         let parent = crate::slot::ParentContext {
                             header: last_header.clone(),
@@ -613,7 +615,7 @@ where
                                 parent,
                                 expected_sync_ts,
                                 None,
-                                SyncSlotMode::Structural,
+                                SyncSlotMode::Empty,
                             )
                             .await
                     } else {
