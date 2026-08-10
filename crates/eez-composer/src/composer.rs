@@ -3246,15 +3246,16 @@ mod tests {
     fn proof_placeholder_is_a_worst_case() {
         /// r‖s‖v — the attestation `ECDSAProofSystem` verifies.
         const ECDSA_PROOF_BYTES: usize = 65;
-        assert!(MAX_PROOF_BYTES >= ECDSA_PROOF_BYTES);
+        const { assert!(MAX_PROOF_BYTES >= ECDSA_PROOF_BYTES) };
         // Non-zero bytes are 4 EIP-7623 tokens, zeros are 1, so an all-0xff
         // stand-in prices above any real proof of the same length.
-        let placeholder = vec![0xffu8; MAX_PROOF_BYTES];
-        let real = vec![0x11u8; ECDSA_PROOF_BYTES];
-        assert!(calldata_floor_gas(&placeholder) >= calldata_floor_gas(&real));
-        assert!(calldata_floor_gas(&placeholder) >= calldata_floor_gas(&vec![0u8; MAX_PROOF_BYTES]));
+        let placeholder = [0xffu8; MAX_PROOF_BYTES];
+        assert!(
+            calldata_floor_gas(&placeholder) >= calldata_floor_gas(&[0x11u8; ECDSA_PROOF_BYTES])
+        );
+        assert!(calldata_floor_gas(&placeholder) >= calldata_floor_gas(&[0u8; MAX_PROOF_BYTES]));
         // Monotonic in length, so a shorter real proof can never cost more.
-        assert!(calldata_floor_gas(&vec![0xffu8; 96]) <= calldata_floor_gas(&placeholder));
+        assert!(calldata_floor_gas(&[0xffu8; 96]) <= calldata_floor_gas(&placeholder));
     }
 
     #[test]
