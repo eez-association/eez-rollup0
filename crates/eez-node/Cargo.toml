@@ -10,7 +10,6 @@ description            = "eez Rollup-0 node — vanilla reth driven by an eez se
 eez-composer.workspace      = true
 eez-deriver.workspace       = true
 eez-driver.workspace        = true
-eez-evm-inspector.workspace = true
 eez-l1.workspace            = true
 eez-protocol.workspace      = true
 eez-prover.workspace        = true
@@ -42,13 +41,11 @@ reth-libmdbx.workspace                    = true
 # Gnosis (chiado) L1 — provided when EEZ_L1_EMBEDDED=1 and the smoke
 # targets chiado; the L1 NodeBuilder uses these.
 reth_gnosis.workspace                     = true
-gnosis-primitives.workspace               = true
 
 # alloy
 alloy-consensus.workspace    = true
 alloy-eips.workspace         = true
 alloy-primitives.workspace   = true
-alloy-rlp.workspace          = true
 alloy-rpc-types-debug.workspace = true
 alloy-provider.workspace     = true
 alloy-signer-local.workspace = true
@@ -75,7 +72,6 @@ mimalloc.workspace           = true
 thiserror.workspace          = true
 tokio.workspace              = true
 tracing.workspace            = true
-tracing-subscriber.workspace = true
 url.workspace                = true
 
 [dev-dependencies]
@@ -91,11 +87,6 @@ anyhow = "1"
 reth-chainspec.workspace = true
 serde_json = "1"
 tempfile = "3"
-
-[features]
-# TEST-ONLY passthrough to eez-composer/fault-inject (deriver-gate attack test).
-# NEVER enabled in normal/release builds. Revert: `git restore`.
-fault-inject = ["eez-composer/fault-inject"]
 
 [lints]
 workspace = true

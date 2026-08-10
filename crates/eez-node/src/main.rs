@@ -628,7 +628,18 @@ fn main() -> eyre::Result<()> {
                     let mut wired_rollups = std::collections::HashMap::new();
                     wired_rollups
                         .insert(l1_rollup_id, (Arc::clone(&entry_client_view), entry_cfg));
-                    wired_rollups.insert(l2_rollup_id_typed, (l2_follower_view, l2_follower_cfg));
+                    // A colliding id would silently overwrite the L1 entry
+                    // registration (EEZ_L1_ROLLUP_ID defaults to 0).
+                    if wired_rollups
+                        .insert(l2_rollup_id_typed, (l2_follower_view, l2_follower_cfg))
+                        .is_some()
+                    {
+                        return Err(eyre::eyre!(
+                            "duplicate rollup id {l2_rollup_id_typed}: EEZ_ROLLUP_ID collides \
+                             with EEZ_L1_ROLLUP_ID; the L2 follower registration would \
+                             overwrite the L1 entry"
+                        ));
+                    }
             // CrossChainExecCtx: signer + L2 addresses needed to wrap
             // EvmComposer's `(load_table, execute)` calldata pairs
             // into signed legacy L2 system txs at Sync-slot time.

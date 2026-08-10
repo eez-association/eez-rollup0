@@ -3,7 +3,7 @@ src         = "src"
 test        = "test"
 script      = "script"
 out         = "out"
-# Match the sync-rollups-protocol submodule's compile settings exactly so
+# Match the eez-core-protocol submodule's compile settings exactly so
 # bytecode is byte-identical between this project's build and the
 # submodule's own. Drift here surfaces as CREATE2 mismatches at deploy
 # time and proof-vs-on-chain divergence.
@@ -13,18 +13,18 @@ optimizer_runs = 200
 via_ir      = true
 
 # Pull `forge-std` from the submodule's vendored copy, and include
-# `sync-rollups-protocol` as a library lookup path so Foundry discovers
+# `eez-core-protocol` as a library lookup path so Foundry discovers
 # EEZ.sol / Rollup.sol / IProofSystem.sol / interfaces / periphery
 # contracts and compiles them with the same settings as above.
 libs = [
-    "../sync-rollups-protocol/lib",
-    "../sync-rollups-protocol",
+    "../eez-core-protocol/lib",
+    "../eez-core-protocol",
 ]
 
-# `sync-rollups-protocol/src/...` imports resolve to the submodule.
+# `eez-core-protocol/src/...` imports resolve to the submodule.
 # Matches the pattern in /root/rollup-node/deployments/devnet/foundry.toml.
 remappings = [
-    "sync-rollups-protocol/=../sync-rollups-protocol/",
+    "eez-core-protocol/=../eez-core-protocol/",
 ]
 
 [fmt]
