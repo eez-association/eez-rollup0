@@ -12,11 +12,10 @@
 //!   ([`OptimisticallyIncluded::take_finalized`]) — a missed-reorg
 //!   backstop (invariant 7).
 //! - **Failed**: the observer only marks it
-//!   ([`OptimisticallyIncluded::mark_failed`]); the destructive recovery
-//!   (reorg to the Sync block's parent, re-push unburned txs) runs at
-//!   the next Sync slot ([`OptimisticallyIncluded::take_failed_for_recovery`]),
-//!   serialized against the Sequencer and Deriver to close the
-//!   observer-vs-commit TOCTOU.
+//!   ([`OptimisticallyIncluded::mark_failed`]); recovery (reorg to the parent,
+//!   substitute an empty sibling, re-push unburned txs) runs at the next slot
+//!   event, serialized against the Sequencer and Deriver to close the TOCTOU
+//!   ([`OptimisticallyIncluded::take_failed_for_recovery`]).
 //! - **Cursor-confirmed**: the Deriver's cursor passing the Sync height
 //!   proves settlement independently of the observer
 //!   ([`OptimisticallyIncluded::resolve_below_cursor`]); the
@@ -58,8 +57,8 @@ pub struct FailedBatch {
     pub parent: SealedHeader<alloy_consensus::Header>,
     /// The user txs whose effects the block carried.
     pub txs: Vec<HeldTx>,
-    /// Drop on a skipped L1 slot — recovery won't count it toward
-    /// poison-eviction. False for a genuine built-slot exclusion.
+    /// Drop not attributable to the txs (skipped L1 slot, relay transport
+    /// failure) — recovery re-queues without counting toward poison-eviction.
     pub slot_skipped: bool,
 }
 
@@ -92,7 +91,7 @@ struct InFlight {
     /// Settled first, while cursor confirmation owns the held pool's
     /// one-time in-flight cleanup.
     cursor_confirmed: bool,
-    /// Set by `mark_failed` when the drop was a skipped-slot miss.
+    /// Set by `mark_failed` when the drop wasn't the bundled txs' fault.
     slot_skipped: bool,
 }
 
@@ -187,8 +186,8 @@ impl OptimisticallyIncluded {
     /// the actual recovery (L2 reorg + re-push) happens in slot
     /// context via [`Self::take_failed_for_recovery`] — the observer
     /// task never mutates chain state. No-op if the entry is already
-    /// Settled (cursor confirmation wins) or gone. `slot_skipped` marks a
-    /// skipped-slot drop so recovery won't count it toward eviction.
+    /// Settled (cursor confirmation wins) or gone. See
+    /// [`FailedBatch::slot_skipped`] for the flag.
     pub fn mark_failed(&self, sync_height: u64, slot_skipped: bool) {
         let mut map = self.by_sync_height.lock().unwrap();
         if let Some(entry) = map.get_mut(&sync_height)

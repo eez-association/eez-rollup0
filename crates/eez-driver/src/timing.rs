@@ -43,10 +43,15 @@ use std::time::Duration;
 use crate::error::{DriverError, DriverResult};
 
 /// Cap on Live blocks produced per catchup trigger. Aligned with
-/// `MAX_BLOCKS_PER_BATCH` on the Composer side so one trigger's
+/// [`MAX_BLOCKS_PER_BATCH`] on the Composer side so one trigger's
 /// catchup output maps to exactly one postBatch submission. Drop to
 /// 100 if 300 turns out to produce calldata-gas pressure in practice.
 pub const MAX_BLOCKS_PER_CATCHUP: u64 = 300;
+
+/// Cap on one postBatch's SETTLEMENT range, where [`MAX_BLOCKS_PER_CATCHUP`]
+/// caps production. `EEZ_MAX_BLOCKS_PER_BATCH` overrides it, but over the
+/// signer's `EEZ_PROOF_SIGNER_MAX_REQUEST_BLOCKS` (512) emission wedges.
+pub const MAX_BLOCKS_PER_BATCH: u64 = MAX_BLOCKS_PER_CATCHUP;
 
 const ENV_L1_BLOCK_TIME_MS: &str = "EEZ_L1_BLOCK_TIME_MS";
 const ENV_L2_BLOCK_TIME_MS: &str = "EEZ_L2_BLOCK_TIME_MS";
@@ -318,6 +323,17 @@ impl RollupTiming {
                 future: remaining_future,
             }
         }
+    }
+
+    /// Terminal for a bounded settlement chunk: the largest height
+    /// `<= cursor + cap` sharing `sync_height`'s K-residue (the deriver rebuilds
+    /// a terminal by position). `None` if none lies strictly between the two.
+    #[must_use]
+    pub fn historical_chunk_boundary(self, cursor: u64, sync_height: u64, cap: u64) -> Option<u64> {
+        let k = u64::from(self.k());
+        let over = sync_height.saturating_sub(cursor.saturating_add(cap));
+        let boundary = sync_height.checked_sub(over.div_ceil(k).saturating_mul(k))?;
+        (boundary > cursor && boundary < sync_height).then_some(boundary)
     }
 }
 
@@ -675,6 +691,49 @@ mod tests {
             mainnet().per_trigger_composition(7, 6, MAX_BLOCKS_PER_CATCHUP),
             SlotComposition::Idle
         );
+    }
+
+    // --- historical_chunk_boundary (settlement dual of the grid snap) ---
+
+    #[test]
+    fn historical_boundary_is_past_on_grid_and_within_cap() {
+        // 6_005 is the genesis-offset case: sync heights carry a residue != 0
+        // mod K, and stepping back whole K's must keep that OFFSET grid.
+        let t = mainnet();
+        let k = u64::from(t.k());
+        for sync_height in [6_000u64, 6_005] {
+            for cursor in [0u64, 1, 7, 137, 5_000] {
+                let boundary = t
+                    .historical_chunk_boundary(cursor, sync_height, MAX_BLOCKS_PER_BATCH)
+                    .expect("backlog exceeds the cap for every cursor here");
+                assert_eq!(
+                    boundary % k,
+                    sync_height % k,
+                    "boundary {boundary} off-grid (cursor={cursor})"
+                );
+                assert!(boundary > cursor && boundary < sync_height);
+                assert!(boundary - cursor <= MAX_BLOCKS_PER_BATCH);
+            }
+        }
+    }
+
+    #[test]
+    fn historical_boundary_none_when_backlog_fits_cap() {
+        // Steady emission handles this — no historical chunk.
+        let t = mainnet();
+        assert_eq!(t.historical_chunk_boundary(100, 400, 300), None);
+        assert_eq!(t.historical_chunk_boundary(100, 100, 300), None);
+    }
+
+    #[test]
+    fn historical_boundary_none_when_no_grid_height_fits_the_cap() {
+        // K=6, grid ≡ 0 mod 6. From cursor 97 the next grid height is 102 —
+        // five blocks up, out of reach for a cap of 3, so nothing is emitted.
+        let t = mainnet();
+        assert_eq!(t.historical_chunk_boundary(97, 6_000, 3), None);
+        // A cap of at least K always reaches one: the step-back lands within
+        // K of `cursor + cap`. This is why the composer clamps the cap to K.
+        assert_eq!(t.historical_chunk_boundary(97, 6_000, 6), Some(102));
     }
 
     #[test]
