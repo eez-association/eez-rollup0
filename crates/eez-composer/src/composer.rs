@@ -322,11 +322,6 @@ impl EmissionLimits {
     }
 }
 
-/// Refusal for the paths whose terminal is fixed, so the range cannot shrink.
-fn gas_budget_refusal(max_gas: u64) -> String {
-    format!("range exceeds the {max_gas} postBatch gas budget; bounded chunks cover it")
-}
-
 /// Largest multiple of `k` not above `requested`, never below one `k`.
 const fn grid_aligned_cap(requested: u64, k: u64) -> u64 {
     if k == 0 {
@@ -1967,8 +1962,14 @@ where
                 &outbound_user_txs,
             )
             .await
-            .and_then(|raw| raw.ok_or_else(|| gas_budget_refusal(self.inner.emission.max_gas)))
-        {
+            .and_then(|raw| {
+                raw.ok_or_else(|| {
+                    format!(
+                        "range exceeds the {} postBatch gas budget; bounded chunks cover it",
+                        self.inner.emission.max_gas
+                    )
+                })
+            }) {
             Ok(r) => r,
             Err(e) => {
                 event!(
@@ -2097,10 +2098,34 @@ where
                 &[], // no outbound user txs
             )
             .await
-            .and_then(|raw| raw.ok_or_else(|| gas_budget_refusal(self.inner.emission.max_gas)))
-        {
+            .and_then(|raw| {
+                raw.ok_or_else(|| {
+                    format!(
+                        "range exceeds the {} postBatch gas budget; bounded chunks cover it",
+                        self.inner.emission.max_gas
+                    )
+                })
+            }) {
             Ok(raw) => raw,
             Err(err) => {
+                // The whole range will not fit; settle a bounded prefix of it so
+                // the range shrinks and the next slot's rich batch can fit.
+                let cursor = rollup.l1_head.cursor();
+                let sync_height = parent_header.number() + 1;
+                if let Err(chunk_err) = self
+                    .emit_historical_chunk(ctx, rollup_id, rollup, cursor, sync_height)
+                    .await
+                {
+                    event!(
+                        name: "eez.composer.emission.prefix_fallback_failed",
+                        Level::ERROR,
+                        rollup_id,
+                        cursor,
+                        sync_height,
+                        error = %chunk_err,
+                        "neither the full range nor a bounded prefix could be emitted",
+                    );
+                }
                 event!(
                     name: "eez.composer.phase1.prepare_failed",
                     Level::ERROR,
@@ -2190,15 +2215,18 @@ where
         sync_height: u64,
     ) -> Result<(), String> {
         let limits = self.inner.emission;
+        let k = u64::from(limits.timing.k());
+        // Under the cap the cap-bounded boundary is the sync height itself, which
+        // is not a PAST block — step one K down so a range too big can still shrink.
         let snapped = limits
             .timing
             .historical_chunk_boundary(cursor, sync_height, limits.max_blocks)
-            .ok_or_else(|| {
-                format!(
-                    "no on-grid boundary above cursor {cursor} within cap {} (sync height {sync_height})",
-                    limits.max_blocks,
-                )
-            })?;
+            .unwrap_or_else(|| sync_height.saturating_sub(k));
+        if snapped <= cursor {
+            return Err(format!(
+                "no on-grid boundary above cursor {cursor} below sync height {sync_height}"
+            ));
+        }
         // Candidates highest-first; each is priced exactly by
         // `prepare_post_batch_raw`, which returns `Ok(None)` when the range does
         // not fit the gas budget — then step back a whole K and re-prepare. The
