@@ -243,7 +243,6 @@ kurtosis files download \
 
 EEZ_BLOCKSCOUT_URL="$EEZ_DEVNET_L1_EXPLORER_API" \
 EEZ_L1_RPC_URL="$EEZ_DEVNET_L1_RPC" \
-EEZ_CONTRACTS_DIR="$PWD/contracts" \
 EEZ_BROADCAST_DIR="$EEZ_DEVNET_VERIFY_DIR/foundry-broadcast" \
   bash scripts/verify-blockscout.sh
 ```
