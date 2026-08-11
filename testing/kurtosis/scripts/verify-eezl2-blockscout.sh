@@ -17,6 +17,10 @@ done
 PROTOCOL="${EEZ_PROTOCOL_DIR:-$REPO/eez-core-protocol}"
 WAIT_SECS="${EEZ_BLOCKSCOUT_WAIT_SECS:-120}"
 URL="${EEZ_BLOCKSCOUT_URL%/}"
+BLOCKSCOUT_CURL_ARGS=(
+    --connect-timeout "${EEZ_BLOCKSCOUT_CONNECT_TIMEOUT_SECS:-5}"
+    --max-time "${EEZ_BLOCKSCOUT_REQUEST_TIMEOUT_SECS:-30}"
+)
 
 [[ -f "$EEZ_DEPLOYMENTS_FILE" ]] || {
     echo "deployment bindings not found: $EEZ_DEPLOYMENTS_FILE" >&2
@@ -44,7 +48,8 @@ runtime_hash="$(cast keccak "$runtime")"
 
 address_info=""
 for ((attempt = 0; attempt < WAIT_SECS; attempt++)); do
-    address_info="$(curl -fsS "$URL/api/v2/addresses/$EEZL2_ADDRESS" 2>/dev/null || true)"
+    address_info="$(curl "${BLOCKSCOUT_CURL_ARGS[@]}" -fsS \
+        "$URL/api/v2/addresses/$EEZL2_ADDRESS" 2>/dev/null || true)"
     if [[ "$(jq -r '.is_contract // false' <<<"$address_info" 2>/dev/null)" == "true" ]]; then
         break
     fi
@@ -87,7 +92,7 @@ standard_input="$(
 # Forge's submission path expects a creation transaction, which a genesis
 # predeploy cannot have. Submit the generated Standard JSON directly instead.
 # `constructorArguements` is the Etherscan-compatible API's historical spelling.
-response="$(curl -fsS -X POST "$URL/api" \
+response="$(curl "${BLOCKSCOUT_CURL_ARGS[@]}" -fsS -X POST "$URL/api" \
     --data module=contract \
     --data action=verifysourcecode \
     --data codeformat=solidity-standard-json-input \
@@ -105,7 +110,7 @@ fi
 
 result=""
 for ((attempt = 0; attempt < WAIT_SECS; attempt++)); do
-    response="$(curl -fsS --get "$URL/api" \
+    response="$(curl "${BLOCKSCOUT_CURL_ARGS[@]}" -fsS --get "$URL/api" \
         --data module=contract \
         --data action=checkverifystatus \
         --data-urlencode "guid=$guid")"
@@ -125,7 +130,8 @@ done
     exit 1
 }
 
-address_info="$(curl -fsS "$URL/api/v2/addresses/$EEZL2_ADDRESS")"
+address_info="$(curl "${BLOCKSCOUT_CURL_ARGS[@]}" -fsS \
+    "$URL/api/v2/addresses/$EEZL2_ADDRESS")"
 [[ "$(jq -r '.is_verified // false' <<<"$address_info")" == "true" ]] || {
     echo "Blockscout accepted verification but did not mark EEZL2 as verified" >&2
     exit 1

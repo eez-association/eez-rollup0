@@ -20,6 +20,8 @@
 #   EEZ_L1_RPC_URL       L1 RPC used for the chain-id filter and verification
 #   EEZ_CONTRACTS_DIR    Foundry project dir (default: <repo>/contracts)
 #   EEZ_BROADCAST_DIR    Foundry broadcast dir (default: <contracts>/broadcast)
+#   EEZ_BLOCKSCOUT_CONNECT_TIMEOUT_SECS  Connection timeout (default: 5)
+#   EEZ_BLOCKSCOUT_REQUEST_TIMEOUT_SECS  Whole-request timeout (default: 30)
 
 set -uo pipefail
 
@@ -36,6 +38,10 @@ SINCE="${1:-}"
 
 chain="$(cast chain-id --rpc-url "$EEZ_L1_RPC_URL" 2>/dev/null)" || { echo "blockscout: chain-id lookup failed; skipping"; exit 0; }
 URL="${EEZ_BLOCKSCOUT_URL%/}/api/"
+BLOCKSCOUT_CURL_ARGS=(
+    --connect-timeout "${EEZ_BLOCKSCOUT_CONNECT_TIMEOUT_SECS:-5}"
+    --max-time "${EEZ_BLOCKSCOUT_REQUEST_TIMEOUT_SECS:-30}"
+)
 
 echo "blockscout: verifying via $EEZ_BLOCKSCOUT_URL (chain $chain)"
 
@@ -58,7 +64,8 @@ find_broadcasts() {
 }
 
 is_verified() {
-    curl -fsS "${EEZ_BLOCKSCOUT_URL%/}/api/v2/addresses/$1" 2>/dev/null \
+    curl "${BLOCKSCOUT_CURL_ARGS[@]}" -fsS \
+        "${EEZ_BLOCKSCOUT_URL%/}/api/v2/addresses/$1" 2>/dev/null \
         | jq -e '.is_verified == true' >/dev/null 2>&1
 }
 
