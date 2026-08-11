@@ -363,13 +363,10 @@ where
                 last_l2_block: batch_last_l2,
             });
 
-            // Catch claimed-vs-derived drift now, during the sync,
-            // rather than waiting for a live event.
-            // The endpoint is what L1 ACTUALLY stored
-            // (`settled_final_state`), which under partial consumption
-            // is a prefix root of the claimed chain, not its end.
+            // Catch drift now, not at a live event. Both ends must be what L1
+            // ACTUALLY ran, not the claimed endpoints.
             self.check_claimed_state(
-                batch.claimed_current_state,
+                batch.settlement.entry_state.or(batch.claimed_current_state),
                 batch.settlement.final_state.or(batch.claimed_new_state),
                 batch_first_l2,
                 batch_last_l2,
@@ -884,11 +881,9 @@ where
             "per-block reconciliation complete (pre-divergence check)",
         );
 
-        // Endpoint = what L1 ACTUALLY stored (`settled_final_state`),
-        // which under partial consumption is a prefix root of the
-        // claimed chain — never the claimed full-chain end.
+        // Both ends are what L1 ACTUALLY ran, never the claimed chain's endpoints.
         self.check_claimed_state(
-            claimed_current_state,
+            settlement.entry_state.or(claimed_current_state),
             settlement.final_state.or(claimed_new_state),
             from_block,
             to_block,
@@ -1397,16 +1392,19 @@ where
     /// under the mock prover, which can't enforce linearity; halting
     /// here surfaces the mismatch at its origin rather than at our next
     /// post's `StateRootMismatch`.
+    ///
+    /// `entry_root` is [`eez_l1::Settlement::entry_state`], not the claimed chain
+    /// head — the claimed head would contradict the cursor guard on a mid-chain resume.
     fn check_claimed_state(
         &self,
-        claimed_current_state: Option<B256>,
+        entry_root: Option<B256>,
         claimed_new_state: Option<B256>,
         from_block: u64,
         to_block: u64,
         l1_block_number: u64,
         tx_hash: B256,
     ) -> DeriverResult<()> {
-        if let Some(claimed_curr) = claimed_current_state {
+        if let Some(claimed_curr) = entry_root {
             let pre = from_block.saturating_sub(1);
             let local_pre = self
                 .inner
@@ -1426,7 +1424,7 @@ where
                     pre_block = pre,
                     local_root = %local_pre,
                     claimed = %claimed_curr,
-                    "local L2 state root at from_block-1 differs from batch's claimed currentState",
+                    "local L2 state root at from_block-1 differs from the root the batch's applied run started from",
                 );
                 return Err(DeriverError::local_diverged(pre));
             }
@@ -1541,7 +1539,7 @@ impl ProducingSlice {
         let inbound_skip = skip.saturating_sub(outbound_skip).min(inbound_len);
         let inbound_take = take
             .saturating_sub(outbound_take)
-            .min(inbound_len - inbound_skip.min(inbound_len));
+            .min(inbound_len - inbound_skip);
         Self {
             outbound_skip,
             outbound_take,
@@ -1587,7 +1585,35 @@ mod producing_slice_tests {
     //! inside it. The deriver must rebuild exactly the steps that ran.
 
     use super::ProducingSlice;
+    use alloy_primitives::B256;
     use eez_l1::Settlement;
+
+    /// Cursor guard and `check_claimed_state` must agree on entry root, else a
+    /// mid-chain resume clears one and fails the other.
+    #[test]
+    fn state_check_entry_root_is_not_the_claimed_chain_head() {
+        let (a, b) = (B256::repeat_byte(0x0A), B256::repeat_byte(0x0B));
+        let claimed_head = Some(a);
+
+        // Mid-chain resume: B is what both guards check.
+        let resumed = Settlement {
+            start: 1,
+            len: 1,
+            final_state: None,
+            entry_state: Some(b),
+        };
+        assert_eq!(resumed.entry_state.or(claimed_head), Some(b));
+        assert_ne!(resumed.entry_state.or(claimed_head), claimed_head);
+
+        // Uncontested: unchanged.
+        let plain = Settlement {
+            start: 0,
+            len: 1,
+            final_state: None,
+            entry_state: claimed_head,
+        };
+        assert_eq!(plain.entry_state.or(claimed_head), claimed_head);
+    }
 
     /// The superseded reconstruction: keep `settled_count - 1` entries from the
     /// FRONT (outbound first, then inbound). Its skips are structurally 0 — the
