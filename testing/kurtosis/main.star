@@ -1,8 +1,9 @@
-# Kurtosis E2E network: canonical L1, builder stack, and eez-node.
+# Kurtosis local network: canonical L1, builder stack, and eez-node.
 
 ethereum_package = import_module(
     "github.com/ethpandaops/ethereum-package/main.star@199620b24ac979c676010c5a68b2893c2bce4f1f"
 )
+blockscout = import_module("./blockscout.star")
 
 # Pair A fixed ports inside the enclave.
 EMBEDDED_L1_RPC_PORT = 18545
@@ -14,11 +15,13 @@ L1_XCHAIN_PORT = 18999
 L2_XCHAIN_PORT = 18998
 BUILDER_FLASHBOTS_RPC_PORT = 8645
 PROOF_SIGNER_GRPC_PORT = 50061
+L2_CHAIN_ID = "6290"
 
 
 def run(plan, args):
     eth_args = args["ethereum_package"]
     eez = args.get("eez", {})
+    enable_explorers = eez.get("enable_explorers", False)
 
     poster_key = eez.get("poster_key", "")
     proof_signer_key = eez.get("proof_signer_key", "")
@@ -30,7 +33,7 @@ def run(plan, args):
     ):
         fail(
             "set eez.poster_key, eez.proof_signer_key, and eez.l2_system_key in the args file "
-            + "(set deterministic test keys in the CI args file)"
+            + "(set deterministic test keys in the selected args file)"
         )
 
     # Pair B: canonical L1, validators, and MEV stack.
@@ -63,6 +66,7 @@ def run(plan, args):
         )
 
     chain_id = str(eth_args.get("network_params", {}).get("network_id", "7331"))
+    l2_chain_id = L2_CHAIN_ID
 
     # Pair A engine API JWT.
     jwt = plan.run_sh(
@@ -84,7 +88,7 @@ def run(plan, args):
             "EEZ_DEPLOYMENTS_FILE": "/out/deployments.env",
             "EEZ_GENESIS_OUT": "/out/l2-genesis.json",
         },
-        run="mkdir -p /out && bash /repo/scripts/deploy.sh",
+        run="mkdir -p /out && bash /repo/scripts/deploy.sh && cp -R /repo/contracts/broadcast /out/foundry-broadcast",
         store=[StoreSpec(src="/out", name="eez-deployments")],
         wait="900s",
     )
@@ -167,7 +171,7 @@ def run(plan, args):
             "exec eez-node node",
             "--chain=/out/l2-genesis.json",
             "--datadir=$EEZ_L2_DATADIR",
-            "--http --http.addr=0.0.0.0 --http.port=$EEZ_L2_HTTP_PORT --http.api=eth,net,web3",
+            "--http --http.addr=0.0.0.0 --http.port=$EEZ_L2_HTTP_PORT --http.api=eth,net,web3,debug,trace",
             "--authrpc.addr=127.0.0.1 --authrpc.port=$EEZ_L2_AUTH_PORT",
             "--port=$EEZ_L2_P2P_PORT --discovery.port=$EEZ_L2_P2P_PORT",
             "--discovery.v5.port=$((EEZ_L2_P2P_PORT+1))",
@@ -257,4 +261,47 @@ def run(plan, args):
         ),
     )
 
-    plan.print("EEZ CI test network ready, chain_id=" + chain_id)
+    if enable_explorers:
+        explorer_params = {
+            "postgres_image": eez.get("blockscout_postgres_image", "postgres:alpine"),
+            "backend_image": eez.get(
+                "blockscout_image", "ghcr.io/blockscout/blockscout:latest"
+            ),
+            "verifier_image": eez.get(
+                "blockscout_verifier_image",
+                "ghcr.io/blockscout/smart-contract-verifier:latest",
+            ),
+            "frontend_image": eez.get(
+                "blockscout_frontend_image", "ghcr.io/blockscout/frontend:latest"
+            ),
+        }
+        blockscout.launch(
+            plan=plan,
+            prefix="l1",
+            network_name="EEZ L1",
+            chain_id=chain_id,
+            rpc_url=l1_el.rpc_http_url,
+            params=explorer_params,
+        )
+        l2_explorer_params = dict(explorer_params)
+        # EEZL2 is a genesis predeploy, so Blockscout must import the L2 alloc
+        # to classify it as a contract before accepting source verification.
+        # The Geth adapter understands alloc-based genesis files and uses the
+        # debug namespace exposed by the L2 Reth node for internal calls.
+        l2_explorer_params["json_rpc_variant"] = "geth"
+        l2_explorer_params["chain_spec_artifact"] = deploy.files_artifacts[0]
+        l2_explorer_params["chain_spec_path"] = "/chain-spec/l2-genesis.json"
+        blockscout.launch(
+            plan=plan,
+            prefix="l2",
+            network_name="EEZ L2",
+            chain_id=l2_chain_id,
+            rpc_url="http://eez-node:{}/".format(L2_RPC_PORT),
+            params=l2_explorer_params,
+        )
+
+    plan.print(
+        "EEZ local network ready, L1 chain_id={}, L2 chain_id={}".format(
+            chain_id, l2_chain_id
+        )
+    )
