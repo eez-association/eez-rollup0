@@ -48,9 +48,10 @@ use crate::error::{DriverError, DriverResult};
 /// 100 if 300 turns out to produce calldata-gas pressure in practice.
 pub const MAX_BLOCKS_PER_CATCHUP: u64 = 300;
 
-/// Cap on one postBatch's SETTLEMENT range, where [`MAX_BLOCKS_PER_CATCHUP`]
-/// caps production. `EEZ_MAX_BLOCKS_PER_BATCH` overrides it, but over the
-/// signer's `EEZ_PROOF_SIGNER_MAX_REQUEST_BLOCKS` (512) emission wedges.
+/// Cap on one postBatch's SETTLEMENT range, where [`MAX_BLOCKS_PER_CATCHUP`] caps
+/// production. `EEZ_MAX_BLOCKS_PER_BATCH` overrides it, rounded down to a multiple
+/// of K. A chunk shrinks no further than K blocks, so calldata heavier than
+/// `EEZ_MAX_POSTBATCH_GAS` allows over K blocks cannot settle at any cap.
 pub const MAX_BLOCKS_PER_BATCH: u64 = MAX_BLOCKS_PER_CATCHUP;
 
 const ENV_L1_BLOCK_TIME_MS: &str = "EEZ_L1_BLOCK_TIME_MS";
