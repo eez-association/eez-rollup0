@@ -573,6 +573,11 @@ impl L1Watcher {
 
     /// Fetches `BatchPosted` logs in `[from, to]` (winner tagging +
     /// tx decode) and emits one [`L1Event::BatchPosted`] per log.
+    ///
+    /// Non-adaptive by design: callers pass a single block, or `common+1..latest`
+    /// bounded by `2 * reorg_max_depth` (the far-behind guard caps `latest`, the
+    /// ancestor walk caps `common`), so a result-count refusal is out of reach.
+    /// Wide ranges go through [`scan_batch_logs_range_adaptive`] instead.
     async fn scan_batch_posted(
         &self,
         provider: &impl Provider,
