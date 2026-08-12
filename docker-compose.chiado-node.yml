@@ -107,9 +107,10 @@ services:
       EEZ_L1_BLOCK_TIME_MS: "5000"
       EEZ_L2_BLOCK_TIME_MS: "1000"
       # Reserve time for remote stateless validation. The 2500ms proof budget
-      # plus 1300ms slack stays within the 4000ms schedulable L2 window.
+      # plus 1300ms slack stays within the 4000ms schedulable L2 window — if
+      # either is raised, keep their sum at or below 4000ms.
       EEZ_PROOF_TIME_MS: "${EEZ_PROOF_TIME_MS:-2500}"
-      EEZ_SUBMISSION_SLACK_MS: "1300"
+      EEZ_SUBMISSION_SLACK_MS: "${EEZ_SUBMISSION_SLACK_MS:-1300}"
       # Don't freeze the sequencer when chiado bundles are slow to land.
       EEZ_MAX_SPECULATIVE_DEPTH: "0"
       # Multi-composer: tolerate + adopt batches posted by the competing
