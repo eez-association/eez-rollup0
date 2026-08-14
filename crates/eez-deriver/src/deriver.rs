@@ -318,8 +318,9 @@ where
                 continue;
             }
 
-            let batch_first_l2 = *cumulative_l2 + 1;
-            let batch_last_l2 = *cumulative_l2 + decoded.block_count() as u64;
+            let resumed = batch.settlement.start > 0;
+            let (batch_first_l2, batch_last_l2) =
+                batch_l2_range(*cumulative_l2, resumed, decoded.block_count() as u64);
 
             // Cursor-alignment guard (as in on_batch_posted): the root the
             // batch's APPLIED run started from must equal our state root here,
@@ -364,9 +365,16 @@ where
             });
 
             // Catch drift now, not at a live event. Both ends must be what L1
-            // ACTUALLY ran, not the claimed endpoints.
+            // ACTUALLY ran, not the claimed endpoints. Pre-check skipped when
+            // resumed: the cursor-alignment guard above already checked it, at
+            // `cumulative_l2` — `batch_first_l2 - 1` would check the wrong
+            // height now that a resumed batch doesn't advance past it.
             self.check_claimed_state(
-                batch.settlement.entry_state.or(batch.claimed_current_state),
+                if resumed {
+                    None
+                } else {
+                    batch.settlement.entry_state.or(batch.claimed_current_state)
+                },
                 batch.settlement.final_state.or(batch.claimed_new_state),
                 batch_first_l2,
                 batch_last_l2,
@@ -830,8 +838,8 @@ where
         // from_block is the next L2 block after the highest indexed
         // batch — the shared L1CanonicalHead is the source of truth.
         let last_indexed_l2 = self.inner.l1_head.last_indexed_l2();
-        let from_block = last_indexed_l2 + 1;
-        let to_block = last_indexed_l2 + block_count;
+        let resumed = settlement.start > 0;
+        let (from_block, to_block) = batch_l2_range(last_indexed_l2, resumed, block_count);
 
         // Cursor-alignment guard: the root the batch's APPLIED run started from
         // must equal our state root at the cursor, else the local index is
@@ -882,8 +890,15 @@ where
         );
 
         // Both ends are what L1 ACTUALLY ran, never the claimed chain's endpoints.
+        // Pre-check skipped when resumed: the cursor-alignment guard above
+        // already checked it, at `last_indexed_l2` — `from_block - 1` would
+        // check the wrong height now that a resumed batch doesn't advance past it.
         self.check_claimed_state(
-            settlement.entry_state.or(claimed_current_state),
+            if resumed {
+                None
+            } else {
+                settlement.entry_state.or(claimed_current_state)
+            },
             settlement.final_state.or(claimed_new_state),
             from_block,
             to_block,
@@ -1257,49 +1272,96 @@ where
             None => None,
         };
 
-        let mut tx_offset = 0usize;
         let mut replayed: u64 = 0;
         let stale_boundary = !local_batch_boundary_matches(&self.inner.l2_provider, from_block)?;
         let last_index = decoded.block_tx_counts.len().saturating_sub(1);
-        for (i, count) in decoded.block_tx_counts.iter().enumerate() {
-            let l2_block = from_block + i as u64;
-            let count_usize = usize::from(*count);
-            let user_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
-            tx_offset += count_usize;
-            // Per Rollup-1 §1.3 + §13.4.23 the composer always sets
-            // `to_block = sync_slot_block`, so the Sync block is the
-            // LAST block of every batch's range. Prepend system txs
-            // there; earlier blocks stay user-tx-only.
-            let is_sync_block = i == last_index;
-            // The Sync block's full tx list (system + outbound-user, interleaved,
-            // plus trailing non-cc user txs) was pre-built above; every other
-            // block is its user txs verbatim.
-            let block_txs: Vec<Vec<u8>> = match (is_sync_block, sync_block_txs.as_ref()) {
-                (true, Some(full)) => full.clone(),
-                _ => user_txs.to_vec(),
-            };
-            let matched = if stale_boundary {
-                false
-            } else {
-                local_block_matches(&self.inner.l2_provider, l2_block, &block_txs)?
-            };
-            let should_replay = stale_boundary || replayed > 0 || !matched;
+        let resumed = settlement.start > 0;
+        if resumed {
+            // The competing batch already committed this Sync block; only the
+            // entries this batch settled are new. Append them to its EXISTING
+            // content rather than a fresh block — see `batch_l2_range`.
+            if stale_boundary {
+                return Err(DeriverError::local_diverged_with_msg(
+                    from_block,
+                    "resumed batch's Sync block is missing or reorged; cannot append its \
+                     settled entries without the existing content",
+                ));
+            }
+            let mut block_txs: Vec<Vec<u8>> = self
+                .inner
+                .l2_provider
+                .block_by_number(from_block)
+                .map_err(DeriverError::l2_provider)?
+                .ok_or_else(|| {
+                    DeriverError::l2_provider(format!("local L2 block at {from_block} missing"))
+                })?
+                .body()
+                .transactions()
+                .iter()
+                .map(Encodable2718::encoded_2718)
+                .collect();
+            let new_content = sync_block_txs.clone().unwrap_or_default();
+            // `ends_with`, not equality: idempotent re-derivation (e.g. after a
+            // crash between this replay and recording it) must not re-append.
+            let already_applied = !new_content.is_empty() && block_txs.ends_with(&new_content);
             event!(
                 name: "eez.deriver.reconcile.block",
                 Level::DEBUG,
                 l1_block_number,
                 tx_hash = %tx_hash,
-                l2_block,
-                action = if should_replay { "replay" } else { "skip" },
-                tx_count = block_txs.len(),
-                replayed_so_far = replayed,
-                "reconciling batch block",
+                l2_block = from_block,
+                action = if already_applied { "skip" } else { "replay" },
+                tx_count = block_txs.len() + new_content.len(),
+                resumed_mid_chain = true,
+                "appending settled entries to the existing Sync block",
             );
-            if !should_replay {
-                continue;
+            if !already_applied {
+                block_txs.extend(new_content);
+                self.replay_block(from_block - 1, &block_txs).await?;
+                replayed = 1;
             }
-            self.replay_block(l2_block - 1, &block_txs).await?;
-            replayed += 1;
+        } else {
+            let mut tx_offset = 0usize;
+            for (i, count) in decoded.block_tx_counts.iter().enumerate() {
+                let l2_block = from_block + i as u64;
+                let count_usize = usize::from(*count);
+                let user_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
+                tx_offset += count_usize;
+                // Per Rollup-1 §1.3 + §13.4.23 the composer always sets
+                // `to_block = sync_slot_block`, so the Sync block is the
+                // LAST block of every batch's range. Prepend system txs
+                // there; earlier blocks stay user-tx-only.
+                let is_sync_block = i == last_index;
+                // The Sync block's full tx list (system + outbound-user, interleaved,
+                // plus trailing non-cc user txs) was pre-built above; every other
+                // block is its user txs verbatim.
+                let block_txs: Vec<Vec<u8>> = match (is_sync_block, sync_block_txs.as_ref()) {
+                    (true, Some(full)) => full.clone(),
+                    _ => user_txs.to_vec(),
+                };
+                let matched = if stale_boundary {
+                    false
+                } else {
+                    local_block_matches(&self.inner.l2_provider, l2_block, &block_txs)?
+                };
+                let should_replay = stale_boundary || replayed > 0 || !matched;
+                event!(
+                    name: "eez.deriver.reconcile.block",
+                    Level::DEBUG,
+                    l1_block_number,
+                    tx_hash = %tx_hash,
+                    l2_block,
+                    action = if should_replay { "replay" } else { "skip" },
+                    tx_count = block_txs.len(),
+                    replayed_so_far = replayed,
+                    "reconciling batch block",
+                );
+                if !should_replay {
+                    continue;
+                }
+                self.replay_block(l2_block - 1, &block_txs).await?;
+                replayed += 1;
+            }
         }
 
         // Outbound authorization gate (trace binding): every OUTBOUND settlement
@@ -1314,7 +1376,11 @@ where
                 .system_tx_cfg
                 .as_ref()
                 .expect("gate_outbound only populated under system_tx_cfg = Some");
-            let to_block = from_block + last_index as u64;
+            let to_block = if resumed {
+                from_block
+            } else {
+                from_block + last_index as u64
+            };
             let observed = self.observed_outbound_calls(to_block, cfg.eezl2_address)?;
             eez_protocol::outbound_gate::verify_outbound_authorized(
                 &gate_outbound,
@@ -1456,6 +1522,20 @@ where
             }
         }
         Ok(())
+    }
+}
+
+/// The L2 height range a batch's settled portion spans. A resumed batch
+/// (leading entries already consumed by a competing batch) settles entirely
+/// within the Sync block that competing batch already committed at
+/// `cumulative_l2` — appended in place, not a new block: splitting it into a
+/// fresh height would apply EIP-2935/EIP-4788's per-block state writes an
+/// extra time, diverging from the root the composer actually signed.
+const fn batch_l2_range(cumulative_l2: u64, resumed: bool, claimed_block_count: u64) -> (u64, u64) {
+    if resumed {
+        (cumulative_l2, cumulative_l2)
+    } else {
+        (cumulative_l2 + 1, cumulative_l2 + claimed_block_count)
     }
 }
 
@@ -1730,6 +1810,18 @@ mod producing_slice_tests {
 
         let buggy_boundary = s.outbound_skip + s.outbound_take;
         assert_ne!(buggy_boundary, original_outbound_len);
+    }
+
+    /// Two composers built from cursor 100, both claiming 101..=110: batch 1
+    /// (plain) spans that full range, advancing the cursor to 110; batch 2
+    /// (resumed) settles within that SAME Sync block, not a new one.
+    #[test]
+    fn resumed_batch_settles_within_the_existing_sync_block_not_a_new_one() {
+        let (first, last) = super::batch_l2_range(100, settlement(0, 2).start > 0, 10);
+        assert_eq!((first, last), (101, 110));
+
+        let (first, last) = super::batch_l2_range(110, settlement(2, 1).start > 0, 10);
+        assert_eq!((first, last), (110, 110));
     }
 }
 
