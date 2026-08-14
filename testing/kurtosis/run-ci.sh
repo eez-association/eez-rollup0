@@ -143,6 +143,7 @@ sed \
     -e "s|^[[:space:]]*eez_node_image:.*|  eez_node_image: $EEZ_NODE_IMAGE|" \
     -e "s|^[[:space:]]*proof_signer_image:.*|  proof_signer_image: $EEZ_PROOF_SIGNER_IMAGE|" \
     -e "s|^[[:space:]]*deploy_image:.*|  deploy_image: $EEZ_DEPLOY_IMAGE|" \
+    -e "s|^[[:space:]]*enable_explorers:.*|  enable_explorers: false|" \
     "$ARGS_TEMPLATE" >"$KURTOSIS_ARGS_FILE"
 
 bash "$HERE/start.sh" "$KURTOSIS_ARGS_FILE"
