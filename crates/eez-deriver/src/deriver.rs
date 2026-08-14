@@ -1151,6 +1151,9 @@ where
                 let (mut outbound, mut inbound): (Vec<_>, Vec<_>) = entries
                     .into_iter()
                     .partition(|e| e.proxyEntryHash == alloy_primitives::B256::ZERO);
+                // Captured before drain/truncate: all originally-claimed entries,
+                // settled or not, were paired 1:1 with Sync-block user txs.
+                let original_outbound_len = outbound.len();
 
                 // Rebuild exactly the steps L1 ran; `skip > 0` = it resumed
                 // mid-chain (see `ProducingSlice`).
@@ -1191,17 +1194,18 @@ where
                     .map(|t| Bytes::from(t.clone()))
                     .collect();
                 // Outbound entries pair POSITIONALLY with the Sync block's user
-                // txs, so a skipped outbound entry must skip its user tx too, else
-                // every pair shifts by one. Those user txs are dropped, not
-                // appended: they belong to steps a competing batch already landed,
-                // so replaying them would spend already-spent nonces.
-                if sync_user_txs.len() < outbound_skip + outbound.len() {
+                // txs, so a skipped OR unconsumed outbound entry must drop its user
+                // tx too, else every pair shifts by one. Neither ever lands on this
+                // chain as a bare tx: a skipped entry's tx already landed under the
+                // competing batch that consumed it; an unconsumed one is rolled back
+                // by the composer's own recovery (rich Sync blocks reorg out on
+                // partial settlement) and retried later. Checked against the
+                // pre-truncation count so the unconsumed tail is covered too.
+                if sync_user_txs.len() < original_outbound_len {
                     return Err(DeriverError::local_diverged_with_msg(
                         from_block,
                         &format!(
-                            "outbound entries ({} skipped + {} applied) exceed Sync-block user txs ({})",
-                            outbound_skip,
-                            outbound.len(),
+                            "outbound entries ({original_outbound_len}) exceed Sync-block user txs ({})",
                             sync_user_txs.len(),
                         ),
                     ));
@@ -1235,9 +1239,7 @@ where
                         .into_iter()
                         .map(|b| b.to_vec())
                         .collect();
-                for t in
-                    &decoded.transactions[sync_user_start + outbound_skip + outbound_paired.len()..]
-                {
+                for t in &decoded.transactions[sync_user_start + original_outbound_len..] {
                     full.push(t.clone());
                 }
                 event!(
@@ -1715,6 +1717,19 @@ mod producing_slice_tests {
         let s = ProducingSlice::split(settlement(50, 99), 1, 1);
         assert_eq!(s.outbound_skip + s.outbound_take, 1);
         assert_eq!(s.inbound_skip + s.inbound_take, 1);
+    }
+
+    /// The trailing-append boundary must skip unconsumed tail entries too, not
+    /// just `outbound_skip + outbound_take`.
+    #[test]
+    fn tail_truncation_boundary_must_skip_the_unconsumed_entry_too() {
+        let original_outbound_len = 2; // [E0, E1]
+        let s = ProducingSlice::split(settlement(0, 2), original_outbound_len, 0);
+        assert_eq!((s.outbound_skip, s.outbound_take), (0, 1));
+        assert!(s.leaves_entries_unconsumed(original_outbound_len, 0));
+
+        let buggy_boundary = s.outbound_skip + s.outbound_take;
+        assert_ne!(buggy_boundary, original_outbound_len);
     }
 }
 
