@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the candidate images and start the CI test network.
+# Build the selected images and start the local Kurtosis devnet.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -51,12 +51,12 @@ if [[ "${EEZ_OPTIMIZED_BUILD:-0}" == "1" ]]; then
 fi
 
 if [[ "${EEZ_SKIP_NODE_BUILD:-0}" != "1" ]]; then
-    echo "==> building $NODE_IMAGE (fast CI profile)"
+    echo "==> building $NODE_IMAGE (fast development profile)"
     docker build "${release_build_args[@]}" -t "$NODE_IMAGE" "$REPO"
 fi
 
 if [[ "${EEZ_SKIP_PROOF_SIGNER_BUILD:-0}" != "1" ]]; then
-    echo "==> building $PROOF_SIGNER_IMAGE (fast CI profile)"
+    echo "==> building $PROOF_SIGNER_IMAGE (fast development profile)"
     docker build "${release_build_args[@]}" \
         -f "$REPO/Dockerfile.signer" \
         -t "$PROOF_SIGNER_IMAGE" "$REPO"
@@ -82,7 +82,9 @@ fi
 
 echo "==> kurtosis run (enclave: $ENCLAVE)"
 kurtosis_flags=()
-if [[ "${KURTOSIS_PRIVILEGED:-1}" == "1" ]]; then
+# The included topology runs without privileged package execution. Keep this
+# opt-in for custom argument files or future package changes that require it.
+if [[ "${KURTOSIS_PRIVILEGED:-0}" == "1" ]]; then
     kurtosis_flags+=(--privileged)
 fi
 kurtosis run "${kurtosis_flags[@]}" --enclave "$ENCLAVE" "$HERE" --args-file "$ARGS_FILE"
@@ -90,10 +92,14 @@ kurtosis run "${kurtosis_flags[@]}" --enclave "$ENCLAVE" "$HERE" --args-file "$A
 cat <<EOF
 
 ════════════════════════════════════════
-  EEZ CI test network is up.
+  EEZ Kurtosis devnet is up.
 ════════════════════════════════════════
 Inspect  : kurtosis enclave inspect $ENCLAVE
 Node log : kurtosis service logs -f $ENCLAVE eez-node
 Signer log: kurtosis service logs -f $ENCLAVE eez-proof-signer
 Tear down: bash testing/kurtosis/stop.sh
 EOF
+
+if ! KURTOSIS_ENCLAVE="$ENCLAVE" bash "$HERE/ports.sh"; then
+    echo "warning: devnet started, but its endpoint summary could not be resolved" >&2
+fi

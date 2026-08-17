@@ -99,25 +99,17 @@ pub enum L1Event {
         /// the contract's state delta applied. `false` = loser
         /// (`ImmediateEntrySkipped`). Deriver reads this directly.
         state_applied: bool,
-        /// `L2ExecutionPerformed` events for our rollupId in the
-        /// postBatch's L1 block (counted per-block — deferred entries
-        /// emit from the bundled user_txs, not the postBatch tx). 0 =
-        /// nothing settled → Deriver skips the batch. Under partial
-        /// consumption (a reverting user_tx leaves its entry and the
-        /// rest unconsumed) this is the applied prefix: leading
-        /// immediate + consumed deferred entries.
-        settled_count: usize,
-        /// LAST applied entry's `newState` (log order) — L1's ACTUAL
-        /// stored root after this batch (a prefix endpoint under partial
-        /// consumption). The Deriver validates its replay endpoint
-        /// against THIS, never the claimed full-chain end.
-        settled_final_state: Option<B256>,
+        /// Which of this batch's claimed steps L1 actually ran, attributed
+        /// from the `L2ExecutionPerformed` events in the batch's own window
+        /// (its postBatch tx up to the next postBatch verifying our rollup).
+        /// `is_empty()` = nothing settled → Deriver skips the batch.
+        settlement: crate::scan::Settlement,
         /// FIRST stateDelta's `currentState` for our rollup. Deriver
         /// compares to local STF result at `from_block - 1` to catch
         /// claimed-vs-derived divergence at the batch entry point.
         claimed_current_state: Option<B256>,
         /// LAST stateDelta's `newState` for our rollup — the claimed
-        /// full-chain end. Diagnostics only; see `settled_final_state`.
+        /// full-chain end. Diagnostics only; see `settlement.final_state`.
         claimed_new_state: Option<B256>,
     },
     /// L1 finalized head advanced.
@@ -426,8 +418,24 @@ impl L1Watcher {
                      BatchPosted chunk and reseeding ring at the \
                      chunk boundary",
                 );
-                let scanned = self.fetch_batch_logs(provider, scan_from, chunk_to).await?;
-                self.emit_scanned_batches(scan_from, chunk_to, scanned);
+                // Narrowing may cover LESS than `chunk_to` when the range
+                // matches more logs than the provider serves; the ring must
+                // then be reseeded at the block actually reached, or we'd
+                // claim to have scanned blocks we never read.
+                let (scanned, reached) = crate::scan::scan_batch_logs_range_adaptive(
+                    provider,
+                    self.inner.config.eez,
+                    self.inner.config.rollup_id,
+                    scan_from,
+                    chunk_to,
+                )
+                .await?;
+                let boundary = if reached == chunk_to {
+                    boundary
+                } else {
+                    fetch_block_by_tag(provider, BlockNumberOrTag::Number(reached)).await?
+                };
+                self.emit_scanned_batches(scan_from, reached, scanned);
                 // INFO, not WARN: fires once per chunk during
                 // routine catch-up progress; the reorg reseed
                 // below keeps its WARN.
@@ -566,6 +574,11 @@ impl L1Watcher {
 
     /// Fetches `BatchPosted` logs in `[from, to]` without emitting —
     /// callers commit ring state only after this succeeds.
+    ///
+    /// Non-adaptive by design: callers pass a single block, or `common+1..latest`
+    /// bounded by `2 * reorg_max_depth` (the far-behind guard caps `latest`, the
+    /// ancestor walk caps `common`), so a result-count refusal is out of reach.
+    /// Wide ranges go through [`scan_batch_logs_range_adaptive`] instead.
     async fn fetch_batch_logs(
         &self,
         provider: &impl Provider,
@@ -609,8 +622,7 @@ impl L1Watcher {
                 call_data: b.call_data,
                 post_batch_input: b.post_batch_input,
                 state_applied: b.state_applied,
-                settled_count: b.settled_count,
-                settled_final_state: b.settled_final_state,
+                settlement: b.settlement,
                 claimed_current_state: b.claimed_current_state,
                 claimed_new_state: b.claimed_new_state,
             });
