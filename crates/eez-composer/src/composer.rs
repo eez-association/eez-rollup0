@@ -261,25 +261,17 @@ impl std::fmt::Debug for CrossChainWiring {
 /// from real execution and drops here after the retry budget.
 pub const MAX_BUNDLE_ATTEMPTS: u32 = 3;
 
-/// Execution envelope added on top of the EIP-7623 calldata floor. Execution
-/// is ~500K; the rest is headroom for the bundled user_txs in the same block.
+/// Execution allowance above the calldata floor — ~4x a rich batch's measured 0.93M.
 const POST_BATCH_EXECUTION_GAS_RESERVE: u64 = 4_000_000;
 
-/// Stand-in length for `batch.proofs[0]` when the candidate is sized before the
-/// prover runs. An ECDSA attestation is 65 bytes; 128 covers it with slack, and
-/// the signing-side ceiling in `sign_post_batch_tx` is the backstop if a proof
-/// system ever returns more.
+/// Stand-in for `proofs[0]` when sizing before the prover runs (ECDSA is 65 B).
 const MAX_PROOF_BYTES: usize = 128;
 
-/// Ceiling on a postBatch tx's gas limit, trimming a historical chunk's
-/// boundary; `EEZ_MAX_POSTBATCH_GAS` overrides within range. It is the EIP-7825
-/// per-tx gas cap (2^24) — nothing above it is valid at any block gas limit. A
-/// historical chunk bundles alone and may claim the whole block; headroom for
-/// bundled user_txs is [`POST_BATCH_EXECUTION_GAS_RESERVE`]'s job.
+/// Ceiling on a postBatch's gas limit (`EEZ_MAX_POSTBATCH_GAS` overrides): the
+/// EIP-7825 per-tx cap, above which no tx is valid at any block gas limit.
 const DEFAULT_MAX_POSTBATCH_GAS: u64 = 16_777_216;
 
-/// EIP-7623 calldata floor. Below it the tx is INTRINSICALLY INVALID — no
-/// builder can include it and the bundle dies at simulation, silently.
+/// EIP-7623 calldata floor — below it the tx is invalid and dies at simulation.
 fn calldata_floor_gas(calldata: &[u8]) -> u64 {
     let nonzero = calldata.iter().filter(|byte| **byte != 0).count() as u64;
     let zero = calldata.len() as u64 - nonzero;
@@ -297,63 +289,50 @@ struct EmissionLimits {
     max_gas: u64,
 }
 
-/// The proof signer's default `EEZ_PROOF_SIGNER_MAX_REQUEST_BLOCKS`.
-const PROOF_SIGNER_DEFAULT_REQUEST_WINDOW: u64 = 512;
-
 impl EmissionLimits {
     fn from_env(timing: RollupTiming) -> Self {
+        // Absent, malformed, and zero all mean "unset" — fall back to the default.
+        let read_var = |var: &str| {
+            std::env::var(var)
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&n| n > 0)
+        };
         let k = u64::from(timing.k());
-        let requested = std::env::var("EEZ_MAX_BLOCKS_PER_BATCH")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(MAX_BLOCKS_PER_BATCH);
-        let max_blocks = clamp_max_blocks_per_batch(requested, k);
-        if max_blocks >= PROOF_SIGNER_DEFAULT_REQUEST_WINDOW {
-            event!(
-                name: "eez.composer.emission.cap_exceeds_prove_window",
-                Level::WARN,
-                max_blocks,
-                prove_window = PROOF_SIGNER_DEFAULT_REQUEST_WINDOW,
-                "EEZ_MAX_BLOCKS_PER_BATCH meets or exceeds the proof signer's default request window; prove() will reject every chunk unless EEZ_PROOF_SIGNER_MAX_REQUEST_BLOCKS was raised to match",
-            );
-        }
-        let requested_gas = std::env::var("EEZ_MAX_POSTBATCH_GAS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(DEFAULT_MAX_POSTBATCH_GAS);
+        let requested_blocks = read_var("EEZ_MAX_BLOCKS_PER_BATCH");
+        let requested_gas = read_var("EEZ_MAX_POSTBATCH_GAS");
+        let max_blocks = grid_aligned_cap(requested_blocks.unwrap_or(MAX_BLOCKS_PER_BATCH), k);
+        let max_gas = clamp_max_postbatch_gas(requested_gas.unwrap_or(DEFAULT_MAX_POSTBATCH_GAS));
+        // The one place the effective bounds are visible, adjusted or not.
+        event!(
+            name: "eez.composer.emission.limits",
+            Level::INFO,
+            max_blocks,
+            max_gas,
+            k,
+            requested_blocks = ?requested_blocks,
+            requested_gas = ?requested_gas,
+            "emission bounds: at most {max_blocks} blocks and {max_gas} gas per postBatch",
+        );
         Self {
             timing,
             max_blocks,
-            max_gas: clamp_max_postbatch_gas(requested_gas),
+            max_gas,
         }
     }
 }
 
-/// A cap below K can't reach a grid height above the cursor, so emission
-/// would stop entirely — clamp loudly rather than honour the misconfig.
-fn clamp_max_blocks_per_batch(requested: u64, k: u64) -> u64 {
-    if requested >= k {
-        return requested;
+/// Largest multiple of `k` not above `requested`, never below one `k`.
+const fn grid_aligned_cap(requested: u64, k: u64) -> u64 {
+    if k == 0 {
+        return requested; // RollupTiming::validate rejects K < 2 upstream
     }
-    event!(
-        name: "eez.composer.emission.cap_clamped",
-        Level::ERROR,
-        requested,
-        k,
-        "EEZ_MAX_BLOCKS_PER_BATCH is below K; clamping to K so a bounded batch stays emittable",
-    );
-    k
+    let aligned = requested - requested % k;
+    if aligned == 0 { k } else { aligned }
 }
 
-/// Whether [`Composer::recover_failed_batch`] moved the canonical head, so the
-/// caller knows whether its slot still owes a block. Reported by the callee
-/// because only recovery knows which of its several exits committed anything.
-///
-/// Covers the callee's action only — a head the Deriver moved concurrently isn't
-/// distinguished, and needn't be: the block then goes out on a stale parent and
-/// `commit_one_prebuilt`'s stale-parent check discards it under the reconcile lock.
+/// Whether [`Composer::recover_failed_batch`] moved the head, so the caller knows
+/// whether its slot still owes a block.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryOutcome {
@@ -364,11 +343,10 @@ enum RecoveryOutcome {
 }
 
 /// Both ends are unusable and clamp to the default: above it no tx is valid
-/// (EIP-7825), and with no room above the execution reserve every emission path
-/// refuses forever. `MIN_VIABLE` is the reserve plus room for a minimal batch's
-/// calldata floor.
+/// (EIP-7825), and below `MIN_VIABLE` every emission path refuses forever.
 fn clamp_max_postbatch_gas(requested: u64) -> u64 {
-    const MIN_VIABLE: u64 = POST_BATCH_EXECUTION_GAS_RESERVE + 1_000_000;
+    // `calldata_floor_gas` never returns below its 21_000 base.
+    const MIN_VIABLE: u64 = POST_BATCH_EXECUTION_GAS_RESERVE + 21_000;
     if (MIN_VIABLE..=DEFAULT_MAX_POSTBATCH_GAS).contains(&requested) {
         return requested;
     }
@@ -1982,11 +1960,15 @@ where
                 &pair_roots,
                 &outbound_entries,
                 &outbound_user_txs,
-                None, // rich slot: no boundary to step back to
             )
             .await
             .and_then(|raw| {
-                raw.ok_or_else(|| "gas gate refused a batch prepared without a ceiling".to_string())
+                raw.ok_or_else(|| {
+                    format!(
+                        "range exceeds the {} postBatch gas budget; bounded chunks cover it",
+                        self.inner.emission.max_gas
+                    )
+                })
             }) {
             Ok(r) => r,
             Err(e) => {
@@ -2111,17 +2093,39 @@ where
                 parent_header,
                 empty_built.header.state_root(),
                 Some(&empty_built.block),
-                &[],  // no cross-chain effects → no per-effect roots
-                &[],  // no outbound entries
-                &[],  // no outbound user txs
-                None, // minimal slot: no boundary to step back to
+                &[], // no cross-chain effects → no per-effect roots
+                &[], // no outbound entries
+                &[], // no outbound user txs
             )
             .await
             .and_then(|raw| {
-                raw.ok_or_else(|| "gas gate refused a batch prepared without a ceiling".to_string())
+                raw.ok_or_else(|| {
+                    format!(
+                        "range exceeds the {} postBatch gas budget; bounded chunks cover it",
+                        self.inner.emission.max_gas
+                    )
+                })
             }) {
             Ok(raw) => raw,
             Err(err) => {
+                // The whole range will not fit; settle a bounded prefix of it so
+                // the range shrinks and the next slot's rich batch can fit.
+                let cursor = rollup.l1_head.cursor();
+                let sync_height = parent_header.number() + 1;
+                if let Err(chunk_err) = self
+                    .emit_historical_chunk(ctx, rollup_id, rollup, cursor, sync_height)
+                    .await
+                {
+                    event!(
+                        name: "eez.composer.emission.prefix_fallback_failed",
+                        Level::ERROR,
+                        rollup_id,
+                        cursor,
+                        sync_height,
+                        error = %chunk_err,
+                        "neither the full range nor a bounded prefix could be emitted",
+                    );
+                }
                 event!(
                     name: "eez.composer.phase1.prepare_failed",
                     Level::ERROR,
@@ -2211,15 +2215,18 @@ where
         sync_height: u64,
     ) -> Result<(), String> {
         let limits = self.inner.emission;
+        let k = u64::from(limits.timing.k());
+        // Under the cap the cap-bounded boundary is the sync height itself, which
+        // is not a PAST block — step one K down so a range too big can still shrink.
         let snapped = limits
             .timing
             .historical_chunk_boundary(cursor, sync_height, limits.max_blocks)
-            .ok_or_else(|| {
-                format!(
-                    "no on-grid boundary above cursor {cursor} within cap {} (sync height {sync_height})",
-                    limits.max_blocks,
-                )
-            })?;
+            .unwrap_or_else(|| sync_height.saturating_sub(k));
+        if snapped <= cursor {
+            return Err(format!(
+                "no on-grid boundary above cursor {cursor} below sync height {sync_height}"
+            ));
+        }
         // Candidates highest-first; each is priced exactly by
         // `prepare_post_batch_raw`, which returns `Ok(None)` when the range does
         // not fit the gas budget — then step back a whole K and re-prepare. The
@@ -2249,7 +2256,6 @@ where
                     &[],
                     &[],
                     &[],
-                    Some(self.inner.emission.max_gas),
                 )
                 .await?
             else {
@@ -2411,7 +2417,6 @@ where
         pair_roots: &[B256],
         outbound_entries: &[eez_protocol::abi::ExecutionEntrySol],
         outbound_user_txs: &[Bytes],
-        gas_ceiling: Option<u64>,
     ) -> Result<Option<Bytes>, String> {
         use alloy_sol_types::SolCall;
         use eez_protocol::abi::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
@@ -2764,36 +2769,27 @@ where
             .map_err(|e| format!("eez_payload_codec::encode: {e}"))?;
         batch.callData = alloy_primitives::Bytes::from(payload);
 
-        // Gas gate on the FULLY ENCODED candidate, before the expensive part.
-        // Sizing the real batch (not an estimate of it) is what keeps this in
-        // step with `sign_post_batch_tx` below: a range priced as fitting here
-        // and rejected there would be re-selected identically every slot, since
-        // the boundary is a pure function of `(cursor, cap, K)`. `proofs` is the
-        // only field still unset, so it is stood in for at worst-case length
-        // with non-zero bytes (zeros are 1 EIP-7623 token, non-zeros 4).
-        // Over the ceiling is NOT an error: the caller steps the boundary back
-        // by K and re-prepares. `None` ceiling = paths with no boundary to move
-        // (rich slot, minimal slot), which rely on the signing-side check.
-        if let Some(ceiling) = gas_ceiling {
-            let mut sized = batch.clone();
-            sized.proofs = vec![Bytes::from(vec![0xffu8; MAX_PROOF_BYTES])];
-            let projected = postAndVerifyBatchCall { batch: sized }.abi_encode();
-            let projected_gas =
-                calldata_floor_gas(&projected).saturating_add(POST_BATCH_EXECUTION_GAS_RESERVE);
-            if projected_gas > ceiling {
-                event!(
-                    name: "eez.composer.emission.candidate_over_budget",
-                    Level::DEBUG,
-                    rollup_id,
-                    from,
-                    to = sync_block_number,
-                    projected_gas,
-                    ceiling,
-                    calldata_bytes = projected.len(),
-                    "candidate range exceeds the postBatch gas budget; caller steps the boundary back",
-                );
-                return Ok(None);
-            }
+        // Priced on the encoded candidate before witnesses and proving; `Ok(None)`
+        // is over-budget, not an error, and the caller chooses what to do.
+        let ceiling = self.inner.emission.max_gas;
+        let mut sized = batch.clone();
+        sized.proofs = vec![Bytes::from(vec![0xffu8; MAX_PROOF_BYTES])];
+        let projected = postAndVerifyBatchCall { batch: sized }.abi_encode();
+        let projected_gas =
+            calldata_floor_gas(&projected).saturating_add(POST_BATCH_EXECUTION_GAS_RESERVE);
+        if projected_gas > ceiling {
+            event!(
+                name: "eez.composer.emission.candidate_over_budget",
+                Level::DEBUG,
+                rollup_id,
+                from,
+                to = sync_block_number,
+                projected_gas,
+                ceiling,
+                calldata_bytes = projected.len(),
+                "candidate range exceeds the postBatch gas budget",
+            );
+            return Ok(None);
         }
 
         // Prove the assembled window (proofs[] empty — not part of the
@@ -3218,6 +3214,13 @@ mod tests {
     fn gas_budget_out_of_range_clamps_to_default() {
         // In range → honoured.
         assert_eq!(clamp_max_postbatch_gas(12_000_000), 12_000_000);
+        // The floor itself is the cheapest any batch can be, so it must stand.
+        let min_viable = POST_BATCH_EXECUTION_GAS_RESERVE + 21_000;
+        assert_eq!(clamp_max_postbatch_gas(min_viable), min_viable);
+        assert_eq!(
+            clamp_max_postbatch_gas(min_viable - 1),
+            DEFAULT_MAX_POSTBATCH_GAS
+        );
         assert_eq!(
             clamp_max_postbatch_gas(DEFAULT_MAX_POSTBATCH_GAS),
             DEFAULT_MAX_POSTBATCH_GAS
@@ -3281,11 +3284,19 @@ mod tests {
     }
 
     #[test]
-    fn cap_below_k_clamps_to_k() {
-        assert_eq!(clamp_max_blocks_per_batch(300, 6), 300);
-        assert_eq!(clamp_max_blocks_per_batch(6, 6), 6);
-        // Below K no grid height is reachable above the cursor — clamp.
-        assert_eq!(clamp_max_blocks_per_batch(1, 6), 6);
+    fn grid_aligned_cap_rounds_down_to_k_multiples() {
+        // Already aligned → untouched. The default (300) divides by every K a
+        // sane deployment uses (12s/2s→6, 12s/3s→4, 5s/1s→5), so it rarely moves.
+        assert_eq!(grid_aligned_cap(300, 5), 300);
+        assert_eq!(grid_aligned_cap(300, 6), 300);
+        assert_eq!(grid_aligned_cap(300, 4), 300);
+        // Not aligned → the largest multiple below, since a boundary can only
+        // land on the grid; the remainder was never spendable.
+        assert_eq!(grid_aligned_cap(300, 7), 294);
+        assert_eq!(grid_aligned_cap(102, 5), 100);
+        // Below one K there is no reachable grid height above the cursor.
+        assert_eq!(grid_aligned_cap(3, 5), 5);
+        assert_eq!(grid_aligned_cap(5, 5), 5);
     }
 
     #[test]
