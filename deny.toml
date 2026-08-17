@@ -1,0 +1,56 @@
+# cargo-deny policy for the `Dependency Audit` CI job
+# (`cargo deny check advisories bans sources`). We build against a pinned reth
+# revision plus several git forks, so dependency drift is the main supply-chain
+# risk this job exists to catch: anything NOT listed below fails the build.
+
+[advisories]
+version = 2
+# `spin 0.9.8` is yanked and reachable only through postcard/heapless and
+# test-fuzz; a yank is not a vulnerability, so surface it without failing.
+yanked = "warn"
+# Only flag unmaintained crates we depend on directly. The reth tree drags in
+# six transitively (paste, bitmaps, bincode, atomic-polyfill, number_prefix,
+# proc-macro-error2) that we cannot drop without upstream moving first.
+unmaintained = "workspace"
+# Accepted for now, each with a reason. Revisit on every reth bump — the point
+# of the job is that a NEW advisory outside this list turns CI red.
+ignore = [
+    # anyhow `Error::downcast_mut()` unsoundness. Transitive; we never
+    # downcast_mut an anyhow error.
+    "RUSTSEC-2026-0190",
+    # crossbeam-epoch invalid pointer deref in the `fmt::Pointer` impl. Only
+    # reachable by formatting a dangling Atomic/Shared. Fixed in 0.9.20 — a
+    # lockfile-only bump, see the note in the PR description.
+    "RUSTSEC-2026-0204",
+    # hickory-proto NSEC3 unbounded loop and O(n^2) name-compression DoS.
+    # Reached via reth's p2p DNS discovery, which we do not enable.
+    "RUSTSEC-2026-0118",
+    "RUSTSEC-2026-0119",
+    # ruint Uint shift ops: wrong overflow flags / truncated shift amounts.
+    # Fixed in 1.20.0 (lockfile-only bump). Pinned here so the job is green
+    # rather than permanently red; bump and drop this entry.
+    "RUSTSEC-2026-0220",
+]
+
+[bans]
+# A reth dependency tree legitimately carries many duplicate versions; failing
+# on that would make this job noise rather than signal.
+multiple-versions = "allow"
+# Every git dependency is pinned by rev/tag in the workspace Cargo.toml and so
+# carries no version requirement, which cargo-deny reports as a wildcard.
+# Report it, do not fail on it — `sources` below is the real gate for those.
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Every git source in Cargo.lock must be listed here, so adding a new fork is a
+# deliberate, reviewed change rather than a silent one. Revisions and tags are
+# pinned in the workspace Cargo.toml.
+allow-git = [
+    "https://github.com/paradigmxyz/reth",
+    "https://github.com/eez-association/stateless",
+    "https://github.com/gnosischain/reth_gnosis",
+    "https://github.com/gnosischain/rust-primitives.git",
+    "https://github.com/sigp/discv5",
+]

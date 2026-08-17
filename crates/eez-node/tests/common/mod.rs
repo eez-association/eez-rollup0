@@ -1364,6 +1364,14 @@ impl NodeHandle {
         cfg: &NodeConfig<'_>,
         env: &[(&'static str, String)],
     ) -> Result<Self> {
+        if let Ok(root) = std::env::var("EEZ_TEST_DATADIR_DIR") {
+            let suffix = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let datadir = PathBuf::from(root)
+                .join(format!("eez-node-{name}-{}-{suffix}", std::process::id()));
+            std::fs::create_dir_all(&datadir)
+                .with_context(|| format!("create retained test datadir {}", datadir.display()))?;
+            return Self::start_with_datadir(name, &datadir, cfg, env).await;
+        }
         let datadir = tempfile::tempdir().context("datadir tempdir")?;
         let mut handle = Self::start_with_datadir(name, datadir.path(), cfg, env).await?;
         handle.keep_alive.push(datadir);
@@ -2598,7 +2606,33 @@ pub struct CrossChainWorld {
     pub prover_proxy: Option<ProverProxyHandle>,
     pub proof_signer: ProofSignerHandle,
     _witness_dir: tempfile::TempDir,
-    _datadir: tempfile::TempDir,
+    _datadir: CrossChainDatadir,
+}
+
+enum CrossChainDatadir {
+    Ephemeral(tempfile::TempDir),
+    Retained(PathBuf),
+}
+
+impl CrossChainDatadir {
+    fn new() -> Result<Self> {
+        let Ok(root) = std::env::var("EEZ_TEST_DATADIR_DIR") else {
+            return Ok(Self::Ephemeral(tempfile::tempdir()?));
+        };
+        let suffix = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            PathBuf::from(root).join(format!("eez-cross-chain-{}-{suffix}", std::process::id()));
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("create retained cross-chain datadir {}", path.display()))?;
+        Ok(Self::Retained(path))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Ephemeral(dir) => dir.path(),
+            Self::Retained(path) => path,
+        }
+    }
 }
 
 impl CrossChainWorld {
@@ -2683,7 +2717,7 @@ async fn setup_cross_chain_inner(
         .map_or(proof_signer.endpoint(), ProverProxyHandle::endpoint);
     let attester = attester_override.unwrap_or(signer_attester);
     let witness_dir = tempfile::tempdir().context("witness DB tempdir")?;
-    let datadir = tempfile::tempdir()?;
+    let datadir = CrossChainDatadir::new()?;
     let mut env = cfg.env();
     env.extend([
         ("EEZ_PROVER_URL", prover_url.to_string()),
