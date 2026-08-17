@@ -26,6 +26,12 @@ For each settlement interval, the Composer MUST:
 7. ABI-encode the final call, sign the L1 transaction with the poster key, and
    submit it to the configured EEZ contract.
 
+If proving cannot complete before the settlement cutoff, the
+[failure-handling fallback](#62-retry-procedure-and-settlement-cutoff) replaces
+steps 5 through 7 for that interval: the Composer commits an empty Sync block
+without submitting an unproved batch and retains the selected effects for a
+later interval.
+
 ```text
 batch = assemble_settlement_batch(selected_effects)
 batch.proofs = []
@@ -133,12 +139,14 @@ The first streamed chunk MUST contain exactly one `ProveHeader`:
   settled on L1. It MUST be nonzero.
 - `to_block` is the terminal Sync block and MUST be greater than or equal to
   `from_block`.
-- The range MUST cover exactly one settlement interval. Every block in
-  `[from_block, to_block)` MUST be an ordinary non-Sync L2 block, and
-  `to_block` MUST be the interval's Sync block. The range MUST NOT contain an
-  earlier Sync block. For an anchor-only batch, the terminal Sync block MAY
-  contain zero transactions; protocol-level system writes can still change its
-  state root.
+- The range MUST cover every L2 block after the last block settled on L1,
+  through the terminal Sync block. In the ordinary case this is one settlement
+  interval. After a deferred or failed settlement it MAY span multiple
+  intervals, and `[from_block, to_block)` MAY contain a previously committed
+  empty Sync block. Such a block is sent and validated like every other
+  intermediate block; the Composer MUST NOT skip it. For an anchor-only batch,
+  the terminal Sync block MAY contain zero transactions; protocol-level system
+  writes can still change its state root.
 - `post_batch` MUST be present and contain the calldata constructed in section
   3.1.
 - `post_batch.public_inputs_hash` is non-authoritative. The Composer SHOULD
@@ -251,19 +259,64 @@ public-input hash and calls
 No gRPC error yields a usable proof. Composer implementations SHOULD handle the
 canonical status codes as follows:
 
+### 6.1 Status classification
+
+Only the following statuses are retryable:
+
 | Code | Composer action |
 | --- | --- |
-| `InvalidArgument` | Fix malformed stream structure, bounds, widths, calldata, or DA encoding; do not retry unchanged input. |
-| `FailedPrecondition` | Treat the batch, window, deployment identity, or execution evidence as rejected; do not retry unchanged input. |
-| `ResourceExhausted` | Retry later if the prover is busy; otherwise reduce the request or coordinate a limit change. |
-| `DeadlineExceeded` | Retry the complete request only if the timeout was transient. |
-| `Cancelled` | Restart the complete request if it is still needed. |
-| `Internal` | Treat as a prover/operator fault; do not submit anything. |
+| `UNAVAILABLE` | The prover or transport is temporarily unavailable, including a prover that is busy or has not yet reached the required state. Retry the complete request. |
+| `DEADLINE_EXCEEDED` | The proving attempt did not complete before its RPC deadline. Retry the complete request if the Composer's settlement cutoff still permits it. |
+| `ABORTED` | The prover could not complete the attempt against a stable snapshot or concurrent state. Revalidate or rebuild the request from fresh Composer state, then restart the complete proving operation. |
+
+Every other non-`OK` status is non-retryable for the unchanged request. In
+particular:
+
+| Code | Composer action |
+| --- | --- |
+| `INVALID_ARGUMENT` | Fix malformed stream structure, bounds, widths, calldata, or DA encoding; do not retry unchanged input. |
+| `FAILED_PRECONDITION` | Treat the batch, window, deployment identity, or execution evidence as rejected; do not retry unchanged input. |
+| `RESOURCE_EXHAUSTED` | Treat the request as exceeding a fixed message, window, witness, or other deployed limit. Change the request or coordinate a limit change before retrying. |
+| `CANCELLED` | Respect the cancellation. It normally reflects caller cancellation and MUST NOT trigger an automatic retry. |
+| `INTERNAL` | Treat the failure as a prover or operator fault; do not retry automatically. |
+
+This default also covers codes not listed in the second table. Here,
+"non-retryable" means that the Composer MUST NOT automatically resend the same
+complete request. It does not require the Composer process to stop: the
+implementation may discard or recompose the request, correct its configuration,
+or alert an operator. The Composer MUST NOT infer retryability from a status
+message or implementation-specific error text.
+
+### 6.2 Retry procedure and settlement cutoff
+
+For a retryable status, each retry MUST open a new `Prove` call and resend the
+complete header and block stream. The Composer SHOULD use exponential backoff
+with random jitter, a capped delay, and a bound on total attempts or elapsed
+time, consistent with the [gRPC retry guidance](https://grpc.io/docs/guides/retry/).
+It MUST NOT sleep or begin another attempt if the remaining settlement window
+is too short for a complete stream, proving operation, response validation, L1
+transaction construction, and relay or submitter delivery.
+
+The Composer therefore MUST determine its latest safe settlement cutoff before
+starting an attempt and re-check it before every retry. Under the current EEZ
+slot profile, the proven bundle must reach the relay before the terminal Sync
+block's timestamp minus the configured submission slack. A third-party
+Composer MAY organize its scheduler differently, but MUST enforce an equivalent
+cutoff and reserve time for all post-proof work.
+
+If another complete attempt would miss that cutoff, the Composer MUST stop
+retrying, leave `batch.proofs` empty, and MUST NOT submit the unproved batch. It
+instead produces and commits an empty terminal Sync block to L2, without the
+selected effect transactions or a proof-dependent L1 submission. It preserves
+or re-queues the selected effects and tries them again in the next Sync
+interval. Because the L1 settlement cursor did not advance, the next successful
+proof request begins at the same `posted + 1` and includes the empty Sync block
+as an intermediate block.
 
 A malformed response, wrong signer, or invalid signature MUST be treated like
-a failed proving request. When the Composer performs the recommended local hash
-recomputation, a hash mismatch MUST be handled the same way. The Composer MUST
-NOT populate `batch.proofs` or submit the batch.
+a non-retryable failure for that request. When the Composer performs the
+recommended local hash recomputation, a hash mismatch MUST be handled the same
+way. The Composer MUST NOT populate `batch.proofs` or submit the batch.
 
 ## 7. Composer conformance
 
@@ -275,7 +328,9 @@ A Composer implementation SHOULD test:
 - accepted anchor-only, inbound, outbound, and mixed batch construction;
 - response length, signature encoding, hash, and registered-attester checks;
 - proof insertion without mutation of any other batch field;
-- retry behavior for every public gRPC status; and
+- the closed retryable-status allowlist, default non-retryable handling,
+  complete-stream exponential backoff, and settlement-cutoff fallback to an
+  empty Sync block; and
 - an end-to-end request whose response is accepted by the Composer and whose
   final `postAndVerifyBatch` succeeds against the deployed EEZ and
   `ECDSAProofSystem` contracts.
