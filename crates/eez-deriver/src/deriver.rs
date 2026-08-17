@@ -13,7 +13,7 @@ use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT, BlockCommitterHandle, DeriveOutcome};
-use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Watcher, ScannedBatch, Submitter};
+use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, ScannedBatch, Submitter};
 use eez_protocol::outbound_gate::OutboundCallObservation;
 use reth_chainspec::{ChainSpec, EthereumHardforks};
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -44,7 +44,6 @@ struct Inner<L2>
 where
     L2: BlockReader,
 {
-    l1_watcher: L1Watcher,
     committer: BlockCommitterHandle<EthEngineTypes>,
     l2_provider: Arc<L2>,
     submitter: Submitter,
@@ -86,7 +85,6 @@ where
             )
             .field("finalized_l2_block", &self.inner.l1_head.finalized_l2())
             .field("committer", &self.inner.committer)
-            .field("l1_watcher", &self.inner.l1_watcher)
             .finish_non_exhaustive()
     }
 }
@@ -113,7 +111,6 @@ where
     /// `l2_entries[]`) and prepends them to the batch's Sync block, so
     /// local replay is byte-identical. `None` is the pure-user-tx STF.
     pub fn new(
-        l1_watcher: L1Watcher,
         committer: BlockCommitterHandle<EthEngineTypes>,
         l2_provider: Arc<L2>,
         submitter: Submitter,
@@ -126,7 +123,6 @@ where
         let evm_config = EthEvmConfig::new(Arc::clone(&chain_spec));
         Self {
             inner: Arc::new(Inner {
-                l1_watcher,
                 committer,
                 l2_provider,
                 submitter,
@@ -151,7 +147,9 @@ where
     /// Reorg-aware catch-up from the latest canonical L1 batch already
     /// indexed locally, or from the registry deploy block if the index is
     /// empty. Scans historical `BatchPosted` events in chunks, replaying
-    /// non-matching L2 blocks and populating `L1CanonicalHead`.
+    /// non-matching L2 blocks and populating `L1CanonicalHead`. Returns
+    /// the inclusive L1 scan endpoint `(number, hash)` — the seed for
+    /// `L1Watcher::start`, which owns every block strictly after it.
     ///
     /// # Errors
     ///
@@ -161,7 +159,7 @@ where
     /// # Panics
     ///
     /// If the `batches` mutex is poisoned.
-    pub async fn catch_up(&self) -> DeriverResult<()> {
+    pub async fn catch_up(&self) -> DeriverResult<(u64, B256)> {
         let _guard = self.inner.committer.begin_reconcile().await;
         let old_cursor = self.inner.l1_head.cursor();
         let anchor = self.revalidate_index_tail().await?;
@@ -169,10 +167,26 @@ where
         if cursor < old_cursor {
             self.retreat_l2_to_cursor(cursor).await?;
         }
-        match anchor {
-            Some(anchor_l1_block) => self.sync_batches_inner(anchor_l1_block, cursor).await,
-            None => self.sync_batches_inner(self.inner.deploy_block, 0).await,
-        }
+        let end = match anchor {
+            Some(anchor_l1_block) => self.sync_batches_inner(anchor_l1_block, cursor).await?,
+            None => self.sync_batches_inner(self.inner.deploy_block, 0).await?,
+        };
+        let end_hash = self
+            .inner
+            .submitter
+            .canonical_l1_hash(end)
+            .await
+            .map_err(DeriverError::l1_scan)?
+            .ok_or_else(|| {
+                // The endpoint was `latest` moments ago; losing it means the
+                // source rewound mid-catch-up — retryable, not fatal.
+                DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
+                    block: end,
+                    tx_hash: B256::ZERO,
+                    detail: "catch-up endpoint block no longer served".into(),
+                })
+            })?;
+        Ok((end, end_hash))
     }
 
     /// Phase 1 of [`Self::catch_up`]: walk the index tail backward,
@@ -215,11 +229,12 @@ where
     /// each successful L1 chunk before fetching the next. If a later chunk
     /// reports an incomplete source, the next catch-up retry can resume from
     /// the latest canonical batch already indexed in [`L1CanonicalHead`].
+    /// Returns the inclusive L1 block the scan covered through.
     async fn sync_batches_inner(
         &self,
         from_l1_block: u64,
         cumulative_start: u64,
-    ) -> DeriverResult<()> {
+    ) -> DeriverResult<u64> {
         let local_head = self
             .inner
             .l2_provider
@@ -249,7 +264,7 @@ where
                 cursor = cumulative_start,
                 "scan completed without replaying any blocks",
             );
-            return Ok(());
+            return Ok(to_l1_block);
         }
 
         let mut cumulative_l2 = cumulative_start;
@@ -283,7 +298,7 @@ where
                 "scan completed without replaying any blocks",
             );
         }
-        Ok(())
+        Ok(to_l1_block)
     }
 
     async fn reconcile_scanned_batches(
@@ -573,23 +588,12 @@ where
             .await?)
     }
 
-    /// Runs the deriver loop. Subscribes to the `L1Watcher`'s event
-    /// broadcast and processes each event until the stream closes.
-    pub async fn run(self) {
-        // Subscribe FIRST. broadcast::channel only delivers events
-        // fired after the subscription; any event fired before is lost
-        // to this receiver. Subscribing here means events fired during
-        // the resync below are queued in the broadcast buffer and
-        // delivered to us once we enter the recv() loop.
-        let mut rx = self.inner.l1_watcher.subscribe();
-
-        // Resync: re-anchor against L1 to cover the window between
-        // main.rs's boot-time `catch_up` and the subscription above.
-        // Batches that landed in that window are visible neither in
-        // the boot scan nor in live events; a reorg in that window is
-        // worse — it invalidates batches the boot scan already
-        // indexed, and no Reorg event for it will ever arrive. Reorg-aware
-        // catch_up handles both.
+    /// Runs the deriver loop, processing each event on `rx` until the
+    /// stream closes. `rx` must be subscribed before the `L1Watcher`
+    /// starts so no event predates it.
+    pub async fn run(self, mut rx: broadcast::Receiver<L1Event>) {
+        // Defensive re-anchor: a cheap no-op in the normal boot order;
+        // load-bearing for any caller that subscribed rx late.
         if let Err(err) = self.catch_up().await {
             event!(
                 name: "eez.deriver.resync.failed",
@@ -660,7 +664,7 @@ where
     /// logged and retried at the next L1 event.
     async fn try_recover(&self) -> bool {
         match self.catch_up().await {
-            Ok(()) => {
+            Ok(_) => {
                 event!(
                     name: "eez.deriver.resync.recovered",
                     Level::INFO,

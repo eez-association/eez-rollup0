@@ -2,6 +2,13 @@
 //! advances. Emits [`L1Event`]s on a [`broadcast::Sender`] for the
 //! Deriver and Composer to consume.
 //!
+//! The watcher never picks its own baseline: [`L1Watcher::start`] takes
+//! the last block the caller already scanned (the Deriver's boot
+//! catch-up endpoint) and seeds the canonical ring with it. Every poll
+//! path scans `BatchPosted` logs before committing ring state or
+//! emitting events, so a failed cycle retries the identical range next
+//! tick.
+//!
 //! HTTP polling (reuses `SubmitterConfig::rpc_url`) — 2s interval, well
 //! inside gnosis 5s / Ethereum mainnet 12s block times.
 //!
@@ -212,19 +219,26 @@ impl std::fmt::Debug for L1Watcher {
 }
 
 impl L1Watcher {
-    /// Spawns the polling task on the current tokio runtime and returns
-    /// a handle.
+    /// Constructs a handle. Spawns nothing — call [`Self::start`] once
+    /// all subscribers exist.
     #[must_use]
-    pub fn spawn(config: L1WatcherConfig) -> Self {
+    pub fn new(config: L1WatcherConfig) -> Self {
         let (event_tx, _) = broadcast::channel(EVENT_BUFFER);
-        let watcher = Self {
+        Self {
             inner: Arc::new(Inner { config, event_tx }),
-        };
-        let runner = watcher.clone();
+        }
+    }
+
+    /// Spawns the polling task on the current tokio runtime, seeded at
+    /// `seed_number`/`seed_hash` — the last L1 block the caller already
+    /// scanned (the Deriver's boot catch-up endpoint). The watcher owns
+    /// and scans everything strictly after it. Call once, after all
+    /// subscribers exist.
+    pub fn start(&self, seed_number: u64, seed_hash: B256) {
+        let runner = self.clone();
         tokio::spawn(async move {
-            runner.run().await;
+            runner.run(seed_number, seed_hash).await;
         });
-        watcher
     }
 
     /// Returns a new receiver subscribed to all future [`L1Event`]s.
@@ -235,9 +249,10 @@ impl L1Watcher {
         self.inner.event_tx.subscribe()
     }
 
-    async fn run(self) {
+    async fn run(self, seed_number: u64, seed_hash: B256) {
         let provider = ProviderBuilder::new().connect_http(self.inner.config.rpc_url.clone());
         let mut state = WatcherState::new(self.inner.config.reorg_max_depth);
+        state.push_canonical(seed_number, seed_hash);
         let mut ticker = interval_at(Instant::now() + POLL_INTERVAL, POLL_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut tick_count: u64 = 0;
@@ -248,6 +263,7 @@ impl L1Watcher {
             eez = %self.inner.config.eez,
             poll_interval_secs = POLL_INTERVAL.as_secs(),
             reorg_max_depth = self.inner.config.reorg_max_depth,
+            seed_number,
             "L1 watcher polling started",
         );
 
@@ -280,210 +296,75 @@ impl L1Watcher {
         let latest_number = latest.number;
         let latest_hash = latest.hash;
         let latest_parent = latest.parent_hash;
+        let (tip_number, tip_hash) = state
+            .tip()
+            .expect("ring is seeded at start and never emptied");
         event!(
             name: "eez.l1_watcher.poll.tick",
             Level::INFO,
             tick = tick_count,
             latest_number,
-            tip = ?state.tip().map(|(n, _)| n),
+            tip = tip_number,
             "poll cycle: fetched latest L1 block",
         );
 
-        match state.tip() {
-            // First poll — seed the ring with the latest, emit NewHead.
-            None => {
-                event!(
-                    name: "eez.l1_watcher.poll.seed",
-                    Level::INFO,
-                    tick = tick_count,
-                    latest_number,
-                    "first poll: seeding canonical ring at latest L1 block",
-                );
-                state.push_canonical(latest_number, latest_hash);
-                self.emit(L1Event::NewHead {
-                    block_number: latest_number,
-                    block_hash: latest_hash,
-                    timestamp: latest.timestamp,
-                });
-                self.scan_batch_posted(provider, latest_number, latest_number)
-                    .await?;
-            }
+        if tip_hash == latest_hash {
             // No change since last poll.
-            Some((_, tip_hash)) if tip_hash == latest_hash => {}
-            // Normal extension by exactly one block.
-            Some((tip_number, tip_hash))
-                if tip_hash == latest_parent && latest_number == tip_number + 1 =>
-            {
-                state.push_canonical(latest_number, latest_hash);
-                self.emit(L1Event::NewHead {
-                    block_number: latest_number,
-                    block_hash: latest_hash,
-                    timestamp: latest.timestamp,
-                });
-                self.scan_batch_posted(provider, latest_number, latest_number)
-                    .await?;
-            }
+        } else if tip_hash == latest_parent && latest_number == tip_number + 1 {
+            // Normal extension by exactly one block — scan before the
+            // ring advances so a failed scan retries this block.
+            let scanned = self
+                .fetch_batch_logs(provider, latest_number, latest_number)
+                .await?;
+            state.push_canonical(latest_number, latest_hash);
+            self.emit(L1Event::NewHead {
+                block_number: latest_number,
+                block_hash: latest_hash,
+                timestamp: latest.timestamp,
+            });
+            self.emit_scanned_batches(latest_number, latest_number, scanned);
+        } else {
             // Either a reorg, a multi-block gap, or a far-behind tip.
-            Some((old_tip_number, old_tip_hash)) => {
-                // Far-behind first: when the gap exceeds the ring's
-                // depth, the parent-hash walk below is provably futile
-                // (it cannot descend to ring heights before exhausting
-                // reorg_max_depth), so skip straight to chunked
-                // catch-up instead of burning the walk's RPCs per tick.
-                let depth = state.reorg_max_depth as u64;
-                if latest_number > old_tip_number.saturating_add(depth) {
-                    // "Far behind" doesn't prove the old tip is
-                    // still canonical — swallowing a reorg across
-                    // the gap is the silent fallback invariant 7
-                    // forbids. Verify by height first.
-                    let at_old_height =
-                        fetch_block_by_tag(provider, BlockNumberOrTag::Number(old_tip_number))
-                            .await?;
-                    let reorged_across_gap = at_old_height.hash != old_tip_hash;
-                    if reorged_across_gap {
-                        // Old tip reorged out. Find the common
-                        // ancestor against the ring (bounded by
-                        // ≤ reorg_max_depth); none in bounds →
-                        // loud halt, not benign catch-up.
-                        let common = find_common_ancestor_by_height(provider, state)
-                            .await?
-                            .ok_or(L1Error::ReorgTooDeep {
-                                walked: state.reorg_max_depth,
-                                max: state.reorg_max_depth,
-                            })?;
-                        event!(
-                            name: "eez.l1_watcher.poll.catchup_reorg",
-                            Level::WARN,
-                            tick = tick_count,
-                            old_tip_number,
-                            old_tip_hash = %old_tip_hash,
-                            hash_at_old_height = %at_old_height.hash,
-                            common_ancestor_number = common.number,
-                            common_ancestor_hash = %common.hash,
-                            latest_number,
-                            "chain reorged across catch-up gap — old tip no \
-                             longer canonical; emitting Reorg and reseeding \
-                             at the ancestor before chunked catch-up",
-                        );
-                        self.emit(L1Event::Reorg {
-                            common_ancestor_number: common.number,
-                            common_ancestor_hash: common.hash,
-                            old_head_hash: old_tip_hash,
-                            new_head_number: latest_number,
-                            new_head_hash: latest_hash,
-                        });
-                        // Reseed at the ancestor so later ticks (and
-                        // any chunk failure) re-enter as a plain,
-                        // still-canonical catch-up — the Reorg is
-                        // never re-emitted.
-                        state.rewind_to(0);
-                        state.push_canonical(common.number, common.hash);
-                        return Ok(());
-                    }
-
-                    // Still-canonical catch-up: advance ONE chunk per
-                    // tick. Progress commits via the ring tip, so a
-                    // failed chunk costs nothing — the next tick
-                    // recomputes the same range from the tip.
-                    //
-                    // Reorg tolerance while catching up is boundary-only:
-                    // the reseed below leaves ONE ring entry. A reorg
-                    // above the boundary needs no retraction — the next
-                    // chunk re-scans canonical logs, and re-delivered
-                    // batches dedup downstream by tx hash. A reorg that
-                    // invalidates the boundary itself exceeds the ring
-                    // and halts loudly with ReorgTooDeep. Mid-catch-up
-                    // boundaries sit ≥ LOG_SCAN_CHUNK_BLOCKS below the
-                    // live tip, out of real reorg reach, so only the
-                    // final (at-latest) boundary is exposed — the same
-                    // window as any post-reseed single-entry ring.
-                    // Seeding several ancestors to restore near-tip
-                    // tolerance across catch-up is tracked as follow-up.
-                    let scan_from = old_tip_number + 1;
-                    let chunk_to = scan_from
-                        .saturating_add(crate::scan::LOG_SCAN_CHUNK_BLOCKS - 1)
-                        .min(latest_number);
-                    let boundary = if chunk_to == latest_number {
-                        BlockSnapshot {
-                            number: latest_number,
-                            hash: latest_hash,
-                            parent_hash: latest_parent,
-                            timestamp: latest.timestamp,
-                        }
-                    } else {
-                        fetch_block_by_tag(provider, BlockNumberOrTag::Number(chunk_to)).await?
-                    };
+            let (old_tip_number, old_tip_hash) = (tip_number, tip_hash);
+            // Far-behind first: when the gap exceeds the ring's
+            // depth, the parent-hash walk below is provably futile
+            // (it cannot descend to ring heights before exhausting
+            // reorg_max_depth), so skip straight to chunked
+            // catch-up instead of burning the walk's RPCs per tick.
+            let depth = state.reorg_max_depth as u64;
+            if latest_number > old_tip_number.saturating_add(depth) {
+                // "Far behind" doesn't prove the old tip is
+                // still canonical — swallowing a reorg across
+                // the gap is the silent fallback invariant 7
+                // forbids. Verify by height first.
+                let at_old_height =
+                    fetch_block_by_tag(provider, BlockNumberOrTag::Number(old_tip_number)).await?;
+                let reorged_across_gap = at_old_height.hash != old_tip_hash;
+                if reorged_across_gap {
+                    // Old tip reorged out. Find the common
+                    // ancestor against the ring (bounded by
+                    // ≤ reorg_max_depth); none in bounds →
+                    // loud halt, not benign catch-up.
+                    let common = find_common_ancestor_by_height(provider, state)
+                        .await?
+                        .ok_or(L1Error::ReorgTooDeep {
+                            walked: state.reorg_max_depth,
+                            max: state.reorg_max_depth,
+                        })?;
                     event!(
-                        name: "eez.l1_watcher.poll.catchup",
-                        Level::INFO,
-                        tick = tick_count,
-                        old_tip_number,
-                        scan_from,
-                        chunk_to,
-                        latest_number,
-                        reorg_max_depth = state.reorg_max_depth,
-                        "tip is far behind latest — scanning one \
-                         BatchPosted chunk and reseeding ring at the \
-                         chunk boundary",
-                    );
-                    let scanned = crate::scan::scan_batch_logs_range(
-                        provider,
-                        self.inner.config.eez,
-                        self.inner.config.rollup_id,
-                        scan_from,
-                        chunk_to,
-                    )
-                    .await?;
-                    self.emit_scanned_batches(scan_from, chunk_to, scanned);
-                    // INFO, not WARN: fires once per chunk during
-                    // routine catch-up progress; the reorg reseed
-                    // below keeps its WARN.
-                    event!(
-                        name: "eez.l1_watcher.ring.rewind",
-                        Level::INFO,
+                        name: "eez.l1_watcher.poll.catchup_reorg",
+                        Level::WARN,
                         tick = tick_count,
                         old_tip_number,
                         old_tip_hash = %old_tip_hash,
-                        new_tip_number = boundary.number,
-                        new_tip_hash = %boundary.hash,
-                        "reseeding ring at chunk boundary — dropping all \
-                         prior ring entries",
+                        hash_at_old_height = %at_old_height.hash,
+                        common_ancestor_number = common.number,
+                        common_ancestor_hash = %common.hash,
+                        latest_number,
+                        "chain reorged across catch-up gap — old tip no \
+                         longer canonical; emitting Reorg and reseeding \
+                         at the ancestor before chunked catch-up",
                     );
-                    state.rewind_to(0);
-                    state.push_canonical(boundary.number, boundary.hash);
-                    self.emit(L1Event::NewHead {
-                        block_number: boundary.number,
-                        block_hash: boundary.hash,
-                        timestamp: boundary.timestamp,
-                    });
-                    return Ok(());
-                }
-
-                // Walk back via parent_hash links until we hit a hash
-                // in our ring (common ancestor) or exceed
-                // reorg_max_depth.
-                let walked = walk_back_to_common(
-                    provider,
-                    latest_parent,
-                    latest_number.saturating_sub(1),
-                    state,
-                )
-                .await?;
-                let Some(common) = walked else {
-                    // Walk-back exhausted reorg_max_depth without a
-                    // common ancestor while the gap is within the
-                    // ring's depth — genuine deep reorg → loud halt.
-                    return Err(L1Error::ReorgTooDeep {
-                        walked: state.reorg_max_depth,
-                        max: state.reorg_max_depth,
-                    });
-                };
-
-                let was_reorg = old_tip_number > common.number || old_tip_hash != common.hash;
-                if was_reorg {
-                    // Reorg event first, then the ring rewind it
-                    // explains — every rewind below the old tip is
-                    // preceded by a Reorg emission.
                     self.emit(L1Event::Reorg {
                         common_ancestor_number: common.number,
                         common_ancestor_hash: common.hash,
@@ -491,29 +372,142 @@ impl L1Watcher {
                         new_head_number: latest_number,
                         new_head_hash: latest_hash,
                     });
-                    event!(
-                        name: "eez.l1_watcher.ring.rewind",
-                        Level::WARN,
-                        tick = tick_count,
-                        old_tip_number,
-                        old_tip_hash = %old_tip_hash,
-                        common_ancestor_number = common.number,
-                        common_ancestor_hash = %common.hash,
-                        new_head_number = latest_number,
-                        new_head_hash = %latest_hash,
-                        "reorg — rewinding ring to common ancestor",
-                    );
-                    state.rewind_to(common.number);
+                    // Reseed at the ancestor so later ticks (and
+                    // any chunk failure) re-enter as a plain,
+                    // still-canonical catch-up — the Reorg is
+                    // never re-emitted.
+                    state.rewind_to(0);
+                    state.push_canonical(common.number, common.hash);
+                    return Ok(());
                 }
-                // Walk forward from common+1 to latest, emitting NewHead
-                // for each missed block and scanning its BatchPosted
-                // logs.
-                let scan_from = common.number + 1;
-                self.fill_forward(provider, scan_from, latest_number, latest_hash, state)
-                    .await?;
-                self.scan_batch_posted(provider, scan_from, latest_number)
-                    .await?;
+
+                // Still-canonical catch-up: advance ONE chunk per
+                // tick. Progress commits via the ring tip, so a
+                // failed chunk costs nothing — the next tick
+                // recomputes the same range from the tip.
+                //
+                // Reorg tolerance while catching up is boundary-only:
+                // the reseed below leaves ONE ring entry. A reorg
+                // above the boundary needs no retraction — the next
+                // chunk re-scans canonical logs, and re-delivered
+                // batches dedup downstream by tx hash. A reorg that
+                // invalidates the boundary itself exceeds the ring
+                // and halts loudly with ReorgTooDeep. Mid-catch-up
+                // boundaries sit ≥ LOG_SCAN_CHUNK_BLOCKS below the
+                // live tip, out of real reorg reach, so only the
+                // final (at-latest) boundary is exposed — the same
+                // window as any post-reseed single-entry ring.
+                // Seeding several ancestors to restore near-tip
+                // tolerance across catch-up is tracked as follow-up.
+                let scan_from = old_tip_number + 1;
+                let chunk_to = scan_from
+                    .saturating_add(crate::scan::LOG_SCAN_CHUNK_BLOCKS - 1)
+                    .min(latest_number);
+                let boundary = if chunk_to == latest_number {
+                    BlockSnapshot {
+                        number: latest_number,
+                        hash: latest_hash,
+                        parent_hash: latest_parent,
+                        timestamp: latest.timestamp,
+                    }
+                } else {
+                    fetch_block_by_tag(provider, BlockNumberOrTag::Number(chunk_to)).await?
+                };
+                event!(
+                    name: "eez.l1_watcher.poll.catchup",
+                    Level::INFO,
+                    tick = tick_count,
+                    old_tip_number,
+                    scan_from,
+                    chunk_to,
+                    latest_number,
+                    reorg_max_depth = state.reorg_max_depth,
+                    "tip is far behind latest — scanning one \
+                     BatchPosted chunk and reseeding ring at the \
+                     chunk boundary",
+                );
+                let scanned = self.fetch_batch_logs(provider, scan_from, chunk_to).await?;
+                self.emit_scanned_batches(scan_from, chunk_to, scanned);
+                // INFO, not WARN: fires once per chunk during
+                // routine catch-up progress; the reorg reseed
+                // below keeps its WARN.
+                event!(
+                    name: "eez.l1_watcher.ring.rewind",
+                    Level::INFO,
+                    tick = tick_count,
+                    old_tip_number,
+                    old_tip_hash = %old_tip_hash,
+                    new_tip_number = boundary.number,
+                    new_tip_hash = %boundary.hash,
+                    "reseeding ring at chunk boundary — dropping all \
+                     prior ring entries",
+                );
+                state.rewind_to(0);
+                state.push_canonical(boundary.number, boundary.hash);
+                self.emit(L1Event::NewHead {
+                    block_number: boundary.number,
+                    block_hash: boundary.hash,
+                    timestamp: boundary.timestamp,
+                });
+                return Ok(());
             }
+
+            // Walk back via parent_hash links until we hit a hash
+            // in our ring (common ancestor) or exceed
+            // reorg_max_depth.
+            let walked = walk_back_to_common(
+                provider,
+                latest_parent,
+                latest_number.saturating_sub(1),
+                state,
+            )
+            .await?;
+            let Some(common) = walked else {
+                // Walk-back exhausted reorg_max_depth without a
+                // common ancestor while the gap is within the
+                // ring's depth — genuine deep reorg → loud halt.
+                return Err(L1Error::ReorgTooDeep {
+                    walked: state.reorg_max_depth,
+                    max: state.reorg_max_depth,
+                });
+            };
+
+            let was_reorg = old_tip_number > common.number || old_tip_hash != common.hash;
+            if was_reorg {
+                // Reorg event first, then the ring rewind it
+                // explains — every rewind below the old tip is
+                // preceded by a Reorg emission.
+                self.emit(L1Event::Reorg {
+                    common_ancestor_number: common.number,
+                    common_ancestor_hash: common.hash,
+                    old_head_hash: old_tip_hash,
+                    new_head_number: latest_number,
+                    new_head_hash: latest_hash,
+                });
+                event!(
+                    name: "eez.l1_watcher.ring.rewind",
+                    Level::WARN,
+                    tick = tick_count,
+                    old_tip_number,
+                    old_tip_hash = %old_tip_hash,
+                    common_ancestor_number = common.number,
+                    common_ancestor_hash = %common.hash,
+                    new_head_number = latest_number,
+                    new_head_hash = %latest_hash,
+                    "reorg — rewinding ring to common ancestor",
+                );
+                state.rewind_to(common.number);
+            }
+            // Walk forward from common+1 to latest, emitting NewHead
+            // for each missed block and scanning its BatchPosted
+            // logs.
+            let scan_from = common.number + 1;
+            let scanned = self
+                .fetch_batch_logs(provider, scan_from, latest_number)
+                .await?;
+            self.fill_forward(provider, scan_from, latest_number, latest_hash, state)
+                .await?;
+            self.emit_scanned_batches(scan_from, latest_number, scanned);
         }
 
         if tick_count.is_multiple_of(FINALIZED_REFRESH_TICKS) {
@@ -570,14 +564,14 @@ impl L1Watcher {
         Ok(())
     }
 
-    /// Fetches `BatchPosted` logs in `[from, to]` (winner tagging +
-    /// tx decode) and emits one [`L1Event::BatchPosted`] per log.
-    async fn scan_batch_posted(
+    /// Fetches `BatchPosted` logs in `[from, to]` without emitting —
+    /// callers commit ring state only after this succeeds.
+    async fn fetch_batch_logs(
         &self,
         provider: &impl Provider,
         from: u64,
         to: u64,
-    ) -> L1Result<()> {
+    ) -> L1Result<Vec<ScannedBatch>> {
         event!(
             name: "eez.l1_watcher.scan_batch_posted",
             Level::INFO,
@@ -585,16 +579,14 @@ impl L1Watcher {
             to,
             "scanning L1 range for BatchPosted logs",
         );
-        let scanned = crate::scan::scan_batch_logs_range(
+        crate::scan::scan_batch_logs_range(
             provider,
             self.inner.config.eez,
             self.inner.config.rollup_id,
             from,
             to,
         )
-        .await?;
-        self.emit_scanned_batches(from, to, scanned);
-        Ok(())
+        .await
     }
 
     fn emit_scanned_batches(&self, from: u64, to: u64, scanned: Vec<ScannedBatch>) {
@@ -1027,6 +1019,144 @@ mod tests {
             other => panic!("expected Reorg, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "reorg tick emits nothing else");
+    }
+
+    /// +1 path: a failed log scan must leave the ring untouched so the
+    /// identical range is retried next tick, not skipped forever.
+    #[tokio::test]
+    async fn extension_scan_failure_leaves_tip_then_retry_succeeds() {
+        let (watcher, mut rx) = test_watcher();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let tip_hash = B256::with_last_byte(0xAA);
+        let next_hash = B256::with_last_byte(0xBB);
+        let mut state = WatcherState::new(3);
+        state.push_canonical(10, tip_hash);
+
+        // Tick 1: latest = 11 (extension by one). Scan runs before the
+        // ring commits, so an injected failure must leave the tip alone.
+        asserter.push_success(&mock_block(11, next_hash, tip_hash, 100));
+        asserter.push_failure_msg("injected: log scan failed"); // first get_logs
+
+        watcher
+            .poll_cycle(&provider, &mut state, 1)
+            .await
+            .expect_err("injected failure must propagate");
+
+        assert_eq!(
+            state.tip(),
+            Some((10, tip_hash)),
+            "tip unchanged on failure"
+        );
+        assert!(rx.try_recv().is_err(), "no events leaked on failure");
+
+        // Tick 2: identical range retried — this time the scan succeeds.
+        asserter.push_success(&mock_block(11, next_hash, tip_hash, 100));
+        asserter.push_success(&serde_json::json!([])); // BatchPosted logs
+        asserter.push_success(&serde_json::json!([])); // winner logs
+
+        watcher
+            .poll_cycle(&provider, &mut state, 2)
+            .await
+            .expect("retry succeeds");
+
+        assert_eq!(state.tip(), Some((11, next_hash)), "ring advances on retry");
+        match rx.try_recv().expect("one event emitted") {
+            L1Event::NewHead {
+                block_number,
+                block_hash,
+                ..
+            } => {
+                assert_eq!(block_number, 11);
+                assert_eq!(block_hash, next_hash);
+            }
+            other => panic!("expected NewHead, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "nothing else emitted on retry");
+    }
+
+    /// Walk-back path: a scan failure after a common ancestor is found
+    /// must not advance the ring — retry re-walks and re-scans the
+    /// identical range.
+    #[tokio::test]
+    async fn walk_back_scan_failure_leaves_tip_then_retry_succeeds() {
+        let (watcher, mut rx) = test_watcher();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let tip_hash = B256::with_last_byte(0xAA); // height 10
+        let h11 = B256::with_last_byte(0x11); // height 11, parent = tip_hash
+        let h12 = B256::with_last_byte(0x12); // height 12 (latest), parent = h11
+        let mut state = WatcherState::new(3);
+        state.push_canonical(10, tip_hash);
+
+        // Tick 1: latest = 12. walk_back_to_common fetches block 11 by
+        // hash, whose parent (tip_hash) matches the ring at height 10 —
+        // common ancestor found, no reorg. Scan over [11, 12] fails.
+        asserter.push_success(&mock_block(12, h12, h11, 200));
+        asserter.push_success(&mock_block(11, h11, tip_hash, 110)); // walk-back fetch
+        asserter.push_failure_msg("injected: log scan failed"); // first get_logs
+
+        watcher
+            .poll_cycle(&provider, &mut state, 1)
+            .await
+            .expect_err("injected failure must propagate");
+
+        assert_eq!(
+            state.tip(),
+            Some((10, tip_hash)),
+            "tip unchanged on failure"
+        );
+        assert!(rx.try_recv().is_err(), "no events leaked on failure");
+
+        // Tick 2: identical range retried — walk-back, scan, then
+        // fill_forward's own block-by-hash fetches (h12, then h11).
+        asserter.push_success(&mock_block(12, h12, h11, 200));
+        asserter.push_success(&mock_block(11, h11, tip_hash, 110)); // walk-back fetch
+        asserter.push_success(&serde_json::json!([])); // BatchPosted logs
+        asserter.push_success(&serde_json::json!([])); // winner logs
+        asserter.push_success(&mock_block(12, h12, h11, 200)); // fill_forward: by-hash h12
+        asserter.push_success(&mock_block(11, h11, tip_hash, 110)); // fill_forward: by-hash h11
+
+        watcher
+            .poll_cycle(&provider, &mut state, 2)
+            .await
+            .expect("retry succeeds");
+
+        assert_eq!(state.tip(), Some((12, h12)), "ring reaches latest");
+        match rx.try_recv().expect("first event") {
+            L1Event::NewHead { block_number, .. } => assert_eq!(block_number, 11),
+            other => panic!("expected NewHead(11), got {other:?}"),
+        }
+        match rx.try_recv().expect("second event") {
+            L1Event::NewHead { block_number, .. } => assert_eq!(block_number, 12),
+            other => panic!("expected NewHead(12), got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "nothing else emitted on retry");
+    }
+
+    /// A seeded tip that still matches `latest` is a no-op cycle: no
+    /// scan, no events, ring untouched.
+    #[tokio::test]
+    async fn seeded_tip_unchanged_emits_nothing() {
+        let (watcher, mut rx) = test_watcher();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let hash = B256::with_last_byte(0x64);
+        let mut state = WatcherState::new(3);
+        state.push_canonical(100, hash);
+
+        asserter.push_success(&mock_block(100, hash, B256::with_last_byte(0x63), 1_000));
+
+        watcher
+            .poll_cycle(&provider, &mut state, 1)
+            .await
+            .expect("no-op cycle succeeds");
+
+        assert_eq!(state.tip(), Some((100, hash)), "tip unchanged");
+        assert!(rx.try_recv().is_err(), "no events on unchanged tip");
     }
 
     #[test]
