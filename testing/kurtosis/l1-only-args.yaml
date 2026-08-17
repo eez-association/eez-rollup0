@@ -5,7 +5,7 @@
 # bundled L2):
 #
 #   kurtosis run github.com/ethpandaops/ethereum-package \
-#     --enclave eez-l1-12s --args-file testing/kurtosis/l1-only.args.yaml
+#     --enclave eez-l1-12s --args-file testing/kurtosis/l1-only-args.yaml
 #
 # Same chain id (7331), same 12s cadence, same rbuilder/flashbots MEV stack as
 # the full devnet — just Pair B (reth EL + Lighthouse CL + rbuilder + relay).

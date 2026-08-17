@@ -9,7 +9,7 @@ same box; the fixed-port forwarding below makes the split work either way.
 
 ## What the enclave contains
 
-`testing/kurtosis/l1-only.args.yaml` is the upstream `ethereum-package`
+`testing/kurtosis/l1-only-args.yaml` is the upstream `ethereum-package`
 `ethereum_package:` block promoted to top level — no bundled L2:
 
 - `el-1-reth-lighthouse` + `cl-1-lighthouse-reth` — the validator pair, canonical EL
@@ -27,36 +27,43 @@ signer, #2 `0x3C44…` is target deployer.
 
 ## 1. Launch (Machine 1)
 
-`scripts/12s-l1-up.sh` is the whole runbook in one idempotent script: it
+`testing/kurtosis/scripts/12s-l1-up.sh` is the whole runbook in one idempotent script: it
 tears down the old enclave + forwarders, launches, resolves ports, forwards them
 to fixed ones, resolves the enode + CL peer-id, downloads the genesis artifact,
 and writes `machine2.env`.
 
 ```bash
 cd /root/eez-rollup0
-bash scripts/12s-l1-up.sh
+bash testing/kurtosis/scripts/12s-l1-up.sh
 ```
 
 Overrides: `KURTOSIS_ENCLAVE` (default `eez-l1-12s`), `KURTOSIS_ARGS_FILE`
-(default `testing/kurtosis/l1-only.args.yaml`), `IP1` (default = autodetected
-source IP).
+(default `testing/kurtosis/l1-only-args.yaml`), `IP1` (default = autodetected
+source IP), `BIND_ADDR` (default `0.0.0.0`).
+
+`BIND_ADDR=0.0.0.0` publishes **unauthenticated** EL and builder RPC on every
+network this host is attached to. That is the point on a throwaway devnet behind
+a firewall; anywhere else, set `BIND_ADDR` to the private address Machine 2
+reaches this host by.
 
 Requires on PATH: `kurtosis docker cast jq curl socat openssl`
-(`scripts/12s-l1-up.sh:19`).
+(`testing/kurtosis/scripts/12s-l1-up.sh:27`).
 
 The raw command underneath, if you want the enclave without the plumbing:
 
 ```bash
 kurtosis run github.com/ethpandaops/ethereum-package \
   --enclave eez-l1-12s \
-  --args-file testing/kurtosis/l1-only.args.yaml
+  --args-file testing/kurtosis/l1-only-args.yaml
 ```
 
 Teardown:
 
 ```bash
 kurtosis enclave rm -f eez-l1-12s
-pkill -f 'socat TCP-LISTEN'
+# The forwarders this script started, and only those ("PORT PID" per line).
+awk '{print $2}' .12s-l1-forwarders.pids | xargs -r kill
+rm -f .12s-l1-forwarders.pids
 docker rm -f bs-frontend-public
 ```
 
@@ -77,11 +84,13 @@ kurtosis port print eez-l1-12s el-2-reth-builder-lighthouse rbuilder-rpc
 kurtosis port print eez-l1-12s dora http
 ```
 
-> `testing/kurtosis/l1-endpoints.env` is a snapshot of one past instance and goes
-> stale the moment the enclave is recreated. Re-resolve; don't trust it.
+> `testing/kurtosis/l1-endpoints.env` holds the *forwarded* fixed ports below, so
+> it survives a recreate — but only while the step [4/7] forwarders are up. The
+> enclave's own random ports are never valid across a recreate; re-resolve those.
 
 Random ports are useless to a second machine, so step [4/7] socat-forwards them
-onto fixed, world-open ports:
+onto fixed ports on `BIND_ADDR` (default `0.0.0.0`). The step fails loudly if any
+of these ports is already taken, rather than handing Machine 2 dead endpoints:
 
 | Fixed port | Service | Consumer |
 |---|---|---|
@@ -103,7 +112,7 @@ cast rpc admin_nodeInfo --rpc-url http://127.0.0.1:$EL_RPC | jq -r .enode
 returns something like `enode://11056bed…76c0b@172.16.0.10:30303` — **that host
 is the container-internal IP and is unusable from outside the enclave.** Keep
 only the pubkey and re-attach the public host plus the forwarded P2P port
-(`scripts/12s-l1-up.sh:52`):
+(`testing/kurtosis/scripts/12s-l1-up.sh:88`):
 
 ```bash
 PUBKEY=$(cast rpc admin_nodeInfo --rpc-url http://127.0.0.1:$EL_RPC \

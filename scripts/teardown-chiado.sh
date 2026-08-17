@@ -9,9 +9,12 @@ COMPOSE_FILE="docker-compose.chiado-node.yml"
 
 [[ -f "$ENV_FILE" ]] || { echo "✗ $ENV_FILE missing — nothing to tear down (or wrong dir)"; exit 1; }
 
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" down
+docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" down || {
+    echo "ERROR: compose teardown failed"; exit 1; }
 
-left="$(docker ps --filter 'name=eez-node-chiado' --filter 'name=eez-proof-signer-chiado' --filter 'name=eez-chiado-lighthouse' --format '{{.Names}}')"
+# A failing `docker ps` would leave `left` empty and read as a clean teardown.
+left="$(docker ps --filter 'name=eez-node-chiado' --filter 'name=eez-proof-signer-chiado' --filter 'name=eez-chiado-lighthouse' --format '{{.Names}}')" || {
+    echo "ERROR: cannot verify container cleanup"; exit 1; }
 if [[ -n "$left" ]]; then
     echo "ERROR: cleanup incomplete. still running=[$left]"
     exit 1

@@ -103,6 +103,13 @@ services:
       # beyond ~3 (→ silent user_tx loss); raise only against a builder proven to
       # include larger bundles atomically. Host-env overridable (default 3).
       EEZ_MAX_USER_TXS_PER_BUNDLE: "${EEZ_MAX_USER_TXS_PER_BUNDLE:-3}"
+      # Emission + reorg bounds documented in .env.example. eez-node reads these
+      # from the process env, and this service takes no env_file beyond
+      # deployments.env, so they have to be forwarded explicitly. Defaults track
+      # the in-code ones (composer.rs, timing.rs, l1_watcher.rs).
+      EEZ_MAX_BLOCKS_PER_BATCH: "${EEZ_MAX_BLOCKS_PER_BATCH:-300}"
+      EEZ_MAX_POSTBATCH_GAS: "${EEZ_MAX_POSTBATCH_GAS:-16777216}"
+      EEZ_L1_REORG_MAX_DEPTH_BLOCKS: "${EEZ_L1_REORG_MAX_DEPTH_BLOCKS:-62}"
       # Deterministic L1-anchored timings (must match any follower).
       EEZ_L1_BLOCK_TIME_MS: "5000"
       EEZ_L2_BLOCK_TIME_MS: "1000"
