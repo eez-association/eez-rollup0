@@ -1349,24 +1349,6 @@ pub async fn count_events(
     Ok(logs.len())
 }
 
-/// Return the block number of the latest matching event.
-pub async fn latest_event_block(
-    rpc_url: &str,
-    contract: Address,
-    event_sig_hash: B256,
-) -> Result<Option<u64>> {
-    use alloy_rpc_types_eth::Filter;
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let filter = Filter::new()
-        .address(contract)
-        .event_signature(event_sig_hash);
-    Ok(provider
-        .get_logs(&filter)
-        .await?
-        .last()
-        .and_then(|log| log.block_number))
-}
-
 /// Count `BatchPosted` events on the EEZ contract since `from_block`.
 pub async fn batches_posted(l1_rpc: &str, eez: Address, from_block: u64) -> Result<usize> {
     count_events(l1_rpc, eez, IEEZ::BatchPosted::SIGNATURE_HASH, from_block).await
@@ -1584,6 +1566,7 @@ sol! {
     }
     #[sol(rpc)]
     interface IValue {
+        event ValueSet(address indexed by, uint256 newValue);
         function value() external view returns (uint256);
         function setValue(uint256 v) external returns (bool changed, uint256 newValue);
     }
@@ -1593,6 +1576,7 @@ sol! {
         function setValue(uint256 v) external;
     }
     interface ISetterWrapper {
+        event Wrapped(uint256 input, bool ok, bool changed, uint256 newValue);
         function setViaProxy(uint256 v) external;
     }
 }
@@ -1957,18 +1941,6 @@ pub async fn receipt_ok(rpc_url: &str, hash: alloy_primitives::TxHash) -> Result
         .get_transaction_receipt(hash)
         .await?
         .map(|r| r.status()))
-}
-
-/// Return the block number containing a transaction receipt.
-pub async fn receipt_block_number(
-    rpc_url: &str,
-    hash: alloy_primitives::TxHash,
-) -> Result<Option<u64>> {
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    Ok(provider
-        .get_transaction_receipt(hash)
-        .await?
-        .and_then(|receipt| receipt.block_number))
 }
 
 /// Cross-chain test node configuration.

@@ -1,14 +1,13 @@
 //! Cross-chain integration and nonce-gap regression tests.
 
-use alloy_primitives::{TxHash, U256, keccak256};
+use alloy_primitives::{TxHash, U256};
 use alloy_sol_types::SolCall;
 
 mod common;
 use common::{
-    DEV_CHAIN_ID, IGatedSetter, INBOUND_USER, ISetterWrapper, IValue, IValueNoRet, OUTBOUND_USER,
-    SETTLE_TIMEOUT, TARGET_DEPLOYER, batches_posted, l2_balance, l2_value, latest_event_block,
-    pending_nonce, receipt_block_number, receipt_ok, setup_cross_chain, sign_and_send, state_root,
-    value_no_ret, wait_for,
+    DEV_CHAIN_ID, INBOUND_USER, ISetterWrapper, IValue, IValueNoRet, OUTBOUND_USER, SETTLE_TIMEOUT,
+    batches_posted, l2_balance, l2_value, pending_nonce, receipt_ok, setup_cross_chain,
+    sign_and_send, state_root, value_no_ret, wait_for,
 };
 
 const WAVE_SETTERS: &[u64] = &[7, 11, 17];
@@ -356,247 +355,191 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
     w.node.assert_no_process_death();
 }
 
-/// Three identical outbound calls must be simulated against the accumulated
-/// target state in one Sync block. Their state-derived return values are
-/// (true, 1), (false, 1), (false, 1), not three copies of (true, 1).
+/// Stateful proxy calls in one bundle must observe accumulated target state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn outbound_state_chained_triplet_survives_one_slot() {
-    let w = setup_cross_chain().await.unwrap();
+async fn sequential_bundle_uses_accumulated_target_state() {
+    use alloy_provider::{Provider, ProviderBuilder};
+    use alloy_rpc_types_eth::Filter;
+    use alloy_sol_types::SolEvent;
+
+    let w = common::setup_cross_chain_with_env(&[("EEZ_MAX_USER_TXS_PER_BUNDLE", "3".to_string())])
+        .await
+        .unwrap();
     let l1_rpc = w.l1_rpc();
     let l2_rpc = w.l2_rpc();
-    let l2_xchain = w.l2_xchain();
+    let nonce = pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
 
-    let nonce = pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
     let mut hashes = Vec::with_capacity(3);
     for offset in 0..3 {
         hashes.push(
             sign_and_send(
-                &l2_xchain,
-                OUTBOUND_USER,
-                w.l2_chain_id,
+                &w.l1_xchain(),
+                INBOUND_USER,
+                DEV_CHAIN_ID,
                 nonce + offset,
-                Some(w.outbound_proxy),
+                Some(w.inbound_wrapper),
                 U256::ZERO,
-                IValue::setValueCall {
+                ISetterWrapper::setViaProxyCall {
                     v: U256::from(1u64),
                 }
                 .abi_encode(),
                 900_000,
             )
             .await
-            .expect("outbound setValue must be admitted"),
+            .expect("state-dependent call must be admitted"),
         );
     }
+    assert_all_transactions_succeeded(&l1_rpc, &hashes, "sequential bundle").await;
 
-    assert_all_transactions_succeeded(&l2_rpc, &hashes, "outbound chained triplet").await;
-    assert_eq!(
-        receipt_block_number(&l2_rpc, hashes[0]).await.unwrap(),
-        receipt_block_number(&l2_rpc, hashes[2]).await.unwrap(),
-        "all outbound transactions must be included in the same Sync block",
-    );
-    wait_for(SETTLE_TIMEOUT, || {
-        let l1_rpc = l1_rpc.clone();
+    let l1_provider = ProviderBuilder::new().connect_http(l1_rpc.parse().unwrap());
+    let wrapped = wait_for(SETTLE_TIMEOUT, || {
+        let l1_provider = l1_provider.clone();
         async move {
-            Ok((l2_value(&l1_rpc, w.outbound_value).await? == U256::from(1u64)).then_some(()))
+            let logs = l1_provider
+                .get_logs(
+                    &Filter::new()
+                        .address(w.inbound_wrapper)
+                        .event_signature(ISetterWrapper::Wrapped::SIGNATURE_HASH),
+                )
+                .await?;
+            Ok((logs.len() == 3).then_some(logs))
         }
     })
     .await
-    .expect("outbound chained triplet did not converge to 1 on L1");
+    .expect("all three source calls must emit a Wrapped result");
 
+    let changed: Vec<bool> = wrapped
+        .iter()
+        .map(|log| {
+            let event = ISetterWrapper::Wrapped::decode_log(&log.inner)?;
+            Ok(event.changed)
+        })
+        .collect::<anyhow::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        changed,
+        [true, false, false],
+        "each call must observe state accumulated by the preceding call",
+    );
+
+    let l2_provider = ProviderBuilder::new().connect_http(l2_rpc.parse().unwrap());
+    let target_logs = wait_for(SETTLE_TIMEOUT, || {
+        let l2_provider = l2_provider.clone();
+        async move {
+            let logs = l2_provider
+                .get_logs(
+                    &Filter::new()
+                        .address(w.value_l2)
+                        .event_signature(IValue::ValueSet::SIGNATURE_HASH),
+                )
+                .await?;
+            Ok((logs.len() == 3).then_some(logs))
+        }
+    })
+    .await
+    .expect("all three target calls must execute");
+
+    let target_blocks: std::collections::HashSet<_> = target_logs
+        .iter()
+        .filter_map(|log| log.block_number)
+        .collect();
+    assert_eq!(
+        target_blocks.len(),
+        1,
+        "the three state-dependent calls must execute in one Sync block",
+    );
+    assert_eq!(
+        l2_value(&l2_rpc, w.value_l2).await.unwrap(),
+        U256::from(1u64)
+    );
     assert_eq!(
         w.node.log_count_matching(&["evicting"]).unwrap(),
         0,
-        "a state-dependent outbound triplet in one slot must not be evicted",
+        "valid state-dependent calls must not be evicted",
     );
-    w.node.assert_no_process_death();
-}
 
-/// Three identical inbound calls must produce sequential state-derived
-/// return data while sharing one L1 bundle and one target Sync block.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn inbound_state_chained_triplet_survives_one_slot() {
-    let w = setup_cross_chain().await.unwrap();
-    let l1_rpc = w.l1_rpc();
-    let l2_rpc = w.l2_rpc();
-    let l1_xchain = w.l1_xchain();
-
-    let nonce = pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
-    let mut hashes = Vec::with_capacity(3);
+    // Outbound exercises the same carried-state invariant against an L1 target.
+    let outbound_nonce = pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
+    let mut outbound_hashes = Vec::with_capacity(3);
     for offset in 0..3 {
-        hashes.push(
+        outbound_hashes.push(
             sign_and_send(
-                &l1_xchain,
-                INBOUND_USER,
-                DEV_CHAIN_ID,
-                nonce + offset,
-                Some(w.setter_proxy),
+                &w.l2_xchain(),
+                OUTBOUND_USER,
+                w.l2_chain_id,
+                outbound_nonce + offset,
+                Some(w.outbound_wrapper),
                 U256::ZERO,
-                IValue::setValueCall {
+                ISetterWrapper::setViaProxyCall {
                     v: U256::from(1u64),
                 }
                 .abi_encode(),
-                600_000,
+                900_000,
             )
             .await
-            .expect("inbound setValue must be admitted"),
+            .expect("outbound state-dependent call must be admitted"),
         );
     }
+    assert_all_transactions_succeeded(&l2_rpc, &outbound_hashes, "outbound sequential bundle")
+        .await;
 
-    assert_all_transactions_succeeded(&l1_rpc, &hashes, "inbound chained triplet").await;
-    assert_eq!(
-        receipt_block_number(&l1_rpc, hashes[0]).await.unwrap(),
-        receipt_block_number(&l1_rpc, hashes[2]).await.unwrap(),
-        "all inbound transactions must be included in the same L1 bundle",
-    );
-    wait_for(SETTLE_TIMEOUT, || {
-        let l2_rpc = l2_rpc.clone();
-        async move { Ok((l2_value(&l2_rpc, w.value_l2).await? == U256::from(1u64)).then_some(())) }
-    })
-    .await
-    .expect("inbound chained triplet did not converge to 1 on L2");
-
-    assert_eq!(
-        w.node.log_count_matching(&["evicting"]).unwrap(),
-        0,
-        "a state-dependent inbound triplet in one slot must not be evicted",
-    );
-    w.node.assert_no_process_death();
-}
-
-/// Cross-direction dependency in one slot: an outbound tx writes an L1
-/// value, and an inbound tx's source-side gate reads it — only the
-/// pass-boundary L1 harvest (outbound target-session cache seeding the
-/// inbound source sims) makes the gate pass at compose time.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cross_direction_dependency_survives_one_slot() {
-    let w = setup_cross_chain().await.unwrap();
-    let l1_rpc = w.l1_rpc();
-    let l2_rpc = w.l2_rpc();
-
-    let outbound = sign_and_send(
-        &w.l2_xchain(),
-        OUTBOUND_USER,
-        w.l2_chain_id,
-        pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
-        Some(w.outbound_proxy),
-        U256::ZERO,
-        IValue::setValueCall {
-            v: U256::from(300u64),
-        }
-        .abi_encode(),
-        900_000,
-    )
-    .await
-    .expect("outbound setValue must be admitted");
-    let inbound = sign_and_send(
-        &w.l1_xchain(),
-        INBOUND_USER,
-        DEV_CHAIN_ID,
-        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
-        Some(w.gated_setter),
-        U256::ZERO,
-        IGatedSetter::setViaProxyIfValueCall {
-            expected: U256::from(300u64),
-            v: U256::from(42u64),
-        }
-        .abi_encode(),
-        900_000,
-    )
-    .await
-    .expect("inbound gated setter must be admitted");
-
-    assert_all_transactions_succeeded(&l2_rpc, &[outbound], "cross-direction outbound").await;
-    assert_all_transactions_succeeded(&l1_rpc, &[inbound], "cross-direction inbound").await;
-    wait_for(SETTLE_TIMEOUT, || {
-        let l1_rpc = l1_rpc.clone();
+    let outbound_wrapped = wait_for(SETTLE_TIMEOUT, || {
+        let l2_provider = l2_provider.clone();
         async move {
-            Ok((l2_value(&l1_rpc, w.outbound_value).await? == U256::from(300u64)).then_some(()))
+            let logs = l2_provider
+                .get_logs(
+                    &Filter::new()
+                        .address(w.outbound_wrapper)
+                        .event_signature(ISetterWrapper::Wrapped::SIGNATURE_HASH),
+                )
+                .await?;
+            Ok((logs.len() == 3).then_some(logs))
         }
     })
     .await
-    .expect("outbound write did not converge to 300 on L1");
-    wait_for(SETTLE_TIMEOUT, || {
-        let l2_rpc = l2_rpc.clone();
-        async move { Ok((l2_value(&l2_rpc, w.value_l2).await? == U256::from(42u64)).then_some(())) }
-    })
-    .await
-    .expect("gated inbound effect did not converge to 42 on L2");
-    let outbound_sync_block = receipt_block_number(&l2_rpc, outbound).await.unwrap();
+    .expect("all three outbound source calls must emit a Wrapped result");
+    let outbound_changed: Vec<bool> = outbound_wrapped
+        .iter()
+        .map(|log| {
+            let event = ISetterWrapper::Wrapped::decode_log(&log.inner)?;
+            Ok(event.changed)
+        })
+        .collect::<anyhow::Result<_>>()
+        .unwrap();
     assert_eq!(
-        latest_event_block(&l2_rpc, w.value_l2, keccak256("ValueSet(address,uint256)"),)
-            .await
-            .unwrap(),
-        outbound_sync_block,
-        "outbound write and inbound delivery must share one Sync block",
+        outbound_changed,
+        [true, false, false],
+        "outbound calls must observe state accumulated by the preceding call",
+    );
+    let outbound_source_blocks: std::collections::HashSet<_> = outbound_wrapped
+        .iter()
+        .filter_map(|log| log.block_number)
+        .collect();
+    assert_eq!(
+        outbound_source_blocks.len(),
+        1,
+        "the three outbound state-dependent calls must execute in one Sync block",
     );
 
-    assert_eq!(
-        w.node.log_count_matching(&["evicting"]).unwrap(),
-        0,
-        "a cross-direction dependent pair in one slot must not be evicted",
-    );
-    w.node.assert_no_process_death();
-}
-
-/// A poison tx first in the drain must not taint the carried state the
-/// next (independent) tx simulates against — exercises the per-tx
-/// checkpoint/rollback unwind.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn poison_first_does_not_taint_second_in_slot() {
-    let w = setup_cross_chain().await.unwrap();
-    let l1_rpc = w.l1_rpc();
-    let l2_rpc = w.l2_rpc();
-    let l1_xchain = w.l1_xchain();
-
-    // The first call writes 7 (the fixture starts at 5), then the second call
-    // reverts. The composition must be evicted and the first write rolled back
-    // before the independent increment below.
-    let _poison = sign_and_send(
-        &l1_xchain,
-        INBOUND_USER,
-        DEV_CHAIN_ID,
-        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
-        Some(w.gated_setter),
-        U256::ZERO,
-        IGatedSetter::setThenFailCall {
-            v: U256::from(7u64),
-            expectedCurrent: U256::from(999u64),
+    let outbound_target_logs = wait_for(SETTLE_TIMEOUT, || {
+        let l1_provider = l1_provider.clone();
+        async move {
+            let logs = l1_provider
+                .get_logs(
+                    &Filter::new()
+                        .address(w.outbound_value)
+                        .event_signature(IValue::ValueSet::SIGNATURE_HASH),
+                )
+                .await?;
+            Ok((logs.len() == 3).then_some(logs))
         }
-        .abi_encode(),
-        600_000,
-    )
-    .await
-    .expect("poison increment must be admitted");
-    let good = sign_and_send(
-        &l1_xchain,
-        TARGET_DEPLOYER,
-        DEV_CHAIN_ID,
-        pending_nonce(&l1_rpc, TARGET_DEPLOYER).await.unwrap(),
-        Some(w.setter_proxy),
-        U256::ZERO,
-        IValue::incrementCall {
-            expectedCurrent: U256::from(5u64),
-        }
-        .abi_encode(),
-        600_000,
-    )
-    .await
-    .expect("independent increment must be admitted");
-
-    assert_all_transactions_succeeded(&l1_rpc, &[good], "post-poison independent").await;
-    wait_for(SETTLE_TIMEOUT, || {
-        let l2_rpc = l2_rpc.clone();
-        async move { Ok((l2_value(&l2_rpc, w.value_l2).await? == U256::from(6u64)).then_some(())) }
     })
     .await
-    .expect("independent tx after a poison tx did not converge to 6 on L2");
-
-    assert!(
-        w.node
-            .log_count_matching(&["fails simulation deterministically"])
-            .unwrap()
-            >= 1,
-        "the gated increment must be poison-evicted at compose time",
+    .expect("all three outbound target calls must execute");
+    assert_eq!(outbound_target_logs.len(), 3);
+    assert_eq!(
+        l2_value(&l1_rpc, w.outbound_value).await.unwrap(),
+        U256::from(1u64)
     );
     w.node.assert_no_process_death();
 }

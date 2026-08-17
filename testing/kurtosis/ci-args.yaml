@@ -48,7 +48,6 @@ eez:
   proof_time_ms: 5000
   submission_slack_ms: 500
   max_speculative_depth: 0
-  max_user_txs_per_bundle: 3
 
   fee_recipient: "0x0000000000000000000000000000000000000000"
   # Dedicated deterministic devnet identity; deployment derives and funds its
