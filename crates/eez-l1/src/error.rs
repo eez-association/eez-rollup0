@@ -51,4 +51,11 @@ impl L1Error {
     pub const fn is_source_incomplete(&self) -> bool {
         matches!(self, Self::SourceIncomplete { .. })
     }
+
+    /// True for a transport failure (DNS, TCP, HTTP, decode) — the peer never
+    /// answered, so it says nothing about the payload we sent.
+    #[must_use]
+    pub const fn is_transport(&self) -> bool {
+        matches!(self, Self::Provider(_))
+    }
 }
