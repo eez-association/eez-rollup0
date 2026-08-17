@@ -4,6 +4,7 @@
 
 use std::{
     collections::HashSet,
+    fmt::Write as _,
     net::{TcpListener, UdpSocket},
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -21,7 +22,18 @@ use alloy_rpc_types_eth::{BlockNumHash, BlockNumberOrTag, TransactionReceipt, Tr
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolEvent, SolValue, sol};
 use anyhow::{Context, Result, anyhow, bail};
+use eez_control_rpc::{
+    MAX_MESSAGE_BYTES,
+    v1::{
+        ProveChunk, ProveResponse, prove_chunk,
+        prover_client::ProverClient,
+        prover_server::{Prover, ProverServer},
+    },
+};
 use eez_protocol::EEZL2_ADDRESS;
+use tokio::task::JoinHandle;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::{Request, Response, Status, Streaming};
 
 /// Anvil's first default account (mnemonic `test test test test test test test test test test test junk`).
 pub const ANVIL_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -1862,7 +1874,6 @@ pub async fn assert_latest_batch_signature(
     let public_inputs_hash = eez_protocol::public_inputs::public_inputs_hashes(
         &call.batch,
         expected_attester.into_word(),
-        None,
     )?
     .into_iter()
     .next()
