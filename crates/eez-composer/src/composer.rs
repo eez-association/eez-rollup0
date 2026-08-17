@@ -1040,7 +1040,7 @@ where
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n >= 1)
-            .unwrap_or(3);
+            .unwrap_or(10);
         let drained = pool.pop_n(max_user_txs);
         // When the pool is empty, do not return early. This slot attempts a
         // minimal postBatch whose leading immediate entry advances L1's stored
