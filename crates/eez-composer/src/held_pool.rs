@@ -32,7 +32,7 @@ use crate::ingress::Direction;
 #[derive(Debug, Clone)]
 pub struct HeldTx {
     /// RLP-encoded source transaction (signed envelope). Handed to
-    /// `EvmComposer::simulate_and_resolve` verbatim.
+    /// the composer's chained simulation verbatim.
     pub raw_tx: Bytes,
     /// Cached hash of the signed envelope, used for queued/in-flight dedupe.
     pub hash: TxHash,

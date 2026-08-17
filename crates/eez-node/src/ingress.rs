@@ -11,7 +11,8 @@
 //!
 //! No classification: the endpoint fixes the direction. Pure txs use the node's
 //! normal mempool RPC; one misdirected here is held then poison-evicted at
-//! compose time (`simulate_and_resolve` finds no cross-chain effect). One front
+//! compose time (the composer's chained simulation finds no cross-chain
+//! effect). One front
 //! per source chain (invariant 8).
 
 use std::net::SocketAddr;

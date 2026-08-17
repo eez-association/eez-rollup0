@@ -23,6 +23,7 @@ use eez_protocol::{
 };
 
 use super::provider::ChainProvider;
+use super::restore_synthetic_caller_nonce;
 
 /// Gas cap for simulated direct target calls; exhaustion is returned as an
 /// unsuccessful execution outcome.
@@ -198,7 +199,7 @@ impl LocalExecutionSession {
                 result.state,
             )
         };
-        restore_caller_nonce(&mut changes, caller);
+        restore_synthetic_caller_nonce(&mut changes, caller);
         Ok(self.commit_and_finish(return_data, gas_used, success, changes))
     }
 
@@ -238,7 +239,7 @@ impl LocalExecutionSession {
         if let Some(err) = inspector_error {
             return Err(err);
         }
-        restore_caller_nonce(&mut changes, caller);
+        restore_synthetic_caller_nonce(&mut changes, caller);
         Ok(self.commit_and_finish(return_data, gas_used, success, changes))
     }
 
@@ -361,34 +362,6 @@ impl TargetExecutionSession for LocalExecutionSession {
             ))
         })?;
         Ok(())
-    }
-}
-
-/// Restore the caller's nonce in `changes` to its pre-tx (`original_info`)
-/// value.
-///
-/// The session calls each cross-chain target with
-/// `msg.sender = compute_proxy_address(source_address, source_rollup)` —
-/// a deterministic CREATE2 slot that the protocol later deploys via
-/// `createCrossChainProxy`. revm's tx execution increments the caller's
-/// nonce by 1 (real-chain semantics for EOA senders), but in our session
-/// the caller is a CONTRACT slot, not an EOA. Bumping its nonce makes
-/// the address fail EIP-684's "code or nonce non-zero" collision check
-/// when a downstream `Bridge.bridgeTokens` later tries to CREATE2 a real
-/// `CrossChainProxy` at the same slot — burning ~28M gas and reverting
-/// the whole session with empty data.
-///
-/// Restoring `info.nonce` to `original_info.nonce` (the disk value
-/// before the tx) keeps the slot fresh for the deterministic CREATE2.
-/// The protocol's manager-mediated flow creates the proxy before forwarding
-/// the call. Our direct-call session shortcut needs the equivalent invariant
-/// restored post-hoc.
-fn restore_caller_nonce(
-    changes: &mut revm::primitives::map::AddressHashMap<revm::state::Account>,
-    caller: Address,
-) {
-    if let Some(account) = changes.get_mut(&caller) {
-        account.info.nonce = account.original_info.nonce;
     }
 }
 

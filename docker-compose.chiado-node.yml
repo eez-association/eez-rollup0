@@ -36,7 +36,8 @@ services:
     env_file:
       - ./deployments.env
     environment:
-      EEZ_PROOF_SIGNER_ADDR: 127.0.0.1:50061
+      EEZ_PROOF_SIGNER_ADDR: 127.0.0.1:${EEZ_SIGNER_PORT:-50061}
+      EEZ_PROOF_SIGNER_MAX_TRANSACTION_STATE_CHECKPOINTS: "${EEZ_SIGNER_MAX_CHECKPOINTS:-8}"
       EEZ_CHAIN_CONFIG: /app/genesis.json
       EEZ_PROOF_SIGNER_KEY: "${EEZ_PROOF_SIGNER_KEY:?set EEZ_PROOF_SIGNER_KEY}"
       EEZ_L2_SYSTEM_KEY: "${EEZ_L2_SYSTEM_KEY:?set EEZ_L2_SYSTEM_KEY}"
@@ -44,7 +45,7 @@ services:
     volumes:
       - ${FRESH_GENESIS:?set FRESH_GENESIS}:/app/genesis.json:ro
     healthcheck:
-      test: ["CMD", "nc", "-z", "127.0.0.1", "50061"]
+      test: ["CMD", "nc", "-z", "127.0.0.1", "${EEZ_SIGNER_PORT:-50061}"]
       interval: 5s
       timeout: 2s
       retries: 12
@@ -72,7 +73,7 @@ services:
       EEZ_L1_POSTER_KEY: "${EEZ_L1_POSTER_KEY:?set EEZ_L1_POSTER_KEY}"
       EEZ_L1_BUILDER_RPC_URL: "${EEZ_L1_BUILDER_RPC_URL:?set EEZ_L1_BUILDER_RPC_URL}"
       EEZ_L2_SYSTEM_KEY: "${EEZ_L2_SYSTEM_KEY:?set EEZ_L2_SYSTEM_KEY}"
-      EEZ_PROVER_URL: http://127.0.0.1:50061
+      EEZ_PROVER_URL: http://127.0.0.1:${EEZ_SIGNER_PORT:-50061}
       EEZ_WITNESS_DB_PATH: /l2/witnesses
       # Embedded chiado L1 (reth_gnosis) — single L1 for the whole node.
       EEZ_L1_EMBEDDED: "1"
@@ -99,10 +100,14 @@ services:
       # other eth_* is transparently forwarded to the matching source-chain RPC.
       EEZ_L1_XCHAIN_PORT: "18999"
       EEZ_L2_XCHAIN_PORT: "18998"
-      # Max user_txs bundled per postBatch. rbuilder-chiado partial-includes
-      # beyond ~3 (→ silent user_tx loss); raise only against a builder proven to
-      # include larger bundles atomically. Host-env overridable (default 3).
+      # Max user_txs bundled per postBatch (host-env overridable, default 3).
+      # Raising it needs BOTH knobs below sized to match: the signer's
+      # checkpoint quota (>= cap) and the postBatch gas reserve (~240k gas
+      # per deferred entry queued on L1); an under-gassed postBatch reverts
+      # in the builder's bundle simulation and the bundle drops silently.
       EEZ_MAX_USER_TXS_PER_BUNDLE: "${EEZ_MAX_USER_TXS_PER_BUNDLE:-3}"
+      # Execution reserve above the postBatch calldata floor.
+      EEZ_POSTBATCH_GAS_RESERVE: "${EEZ_POSTBATCH_GAS_RESERVE:-4000000}"
       # Deterministic L1-anchored timings (must match any follower).
       EEZ_L1_BLOCK_TIME_MS: "5000"
       EEZ_L2_BLOCK_TIME_MS: "1000"
