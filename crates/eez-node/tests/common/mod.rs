@@ -434,6 +434,7 @@ impl ProofSignerHandle {
     async fn spawn(cfg: &ProofSignerConfig<'_>) -> Result<Self> {
         let listen = format!("127.0.0.1:{}", free_port());
         let attester = signer_address(cfg.signer_key)?;
+        let l2_system_address = signer_address(L2_SYSTEM_KEY)?;
         let (log_path, log_dir) = test_log_destination("eez-proof-signer")?;
         let working_dir = tempfile::tempdir().context("proof signer working directory")?;
         let log = std::fs::File::create(&log_path).context("create proof signer log")?;
@@ -457,10 +458,12 @@ impl ProofSignerHandle {
                 &format!("{attester:#x}"),
                 "--proof-system",
                 &format!("{:#x}", cfg.proof_system),
+                "--l2-system-address",
+                &format!("{l2_system_address:#x}"),
             ])
             .env_clear()
             .env("EEZ_PROOF_SIGNER_KEY", cfg.signer_key)
-            .env("EEZ_L2_SYSTEM_KEY", ANVIL_KEY)
+            .env("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY)
             .env("NO_COLOR", "1")
             .env("RUST_LOG", "info")
             .stdout(Stdio::from(log))
