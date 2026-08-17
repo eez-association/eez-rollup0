@@ -31,7 +31,7 @@ use eez_driver::{
     witness::{ExecutionWitnessMode, block_witness},
 };
 use eez_l1::{BundleTarget, L1Event, SendOutcome, Submitter};
-use eez_prover::{BlockWitness, Prover};
+use eez_prover::{BlockWitness, Prover, ProvingContext};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
@@ -45,6 +45,7 @@ use crate::held_pool::HeldTx;
 use crate::ingress::Direction;
 use crate::local::{build_sync_block, sync_block_pair_roots};
 use crate::optimistic::OptimisticallyIncluded;
+use crate::prover_retry::prove_with_retry;
 use crate::rollup::RollupState;
 
 /// Runtime config for the cross-chain execution path on Sync slots.
@@ -1956,6 +1957,7 @@ where
                 &pair_roots,
                 &outbound_entries,
                 &outbound_user_txs,
+                bundle_target,
             )
             .await
             .and_then(|raw| {
@@ -2092,18 +2094,12 @@ where
                 &[], // no cross-chain effects → no per-effect roots
                 &[], // no outbound entries
                 &[], // no outbound user txs
+                bundle_target,
             )
             .await
-            .and_then(|raw| {
-                raw.ok_or_else(|| {
-                    format!(
-                        "range exceeds the {} postBatch gas budget; bounded chunks cover it",
-                        self.inner.emission.max_gas
-                    )
-                })
-            }) {
-            Ok(raw) => raw,
-            Err(err) => {
+        {
+            Ok(Some(raw)) => raw,
+            Ok(None) => {
                 // The whole range will not fit; settle a bounded prefix of it so
                 // the range shrinks and the next slot's rich batch can fit.
                 let cursor = rollup.l1_head.cursor();
@@ -2122,6 +2118,22 @@ where
                         "neither the full range nor a bounded prefix could be emitted",
                     );
                 }
+                event!(
+                    name: "eez.composer.phase1.prepare_failed",
+                    Level::ERROR,
+                    rollup_id,
+                    max_gas = self.inner.emission.max_gas,
+                    "minimal postBatch prepare failed; committing Sync block without emission — L1 catches up next slot",
+                );
+                return Ok(Some(SyncSlotBlock {
+                    payload: empty_built.payload,
+                    header: empty_built.header,
+                }));
+            }
+            Err(err) => {
+                // A proof/RPC/construction failure is not evidence that the
+                // encoded range is too large. In particular, do not start an
+                // unpinned historical proof after the pinned slot's retry cutoff.
                 event!(
                     name: "eez.composer.phase1.prepare_failed",
                     Level::ERROR,
@@ -2252,6 +2264,7 @@ where
                     &[],
                     &[],
                     &[],
+                    BundleTarget::NextBlock,
                 )
                 .await?
             else {
@@ -2413,6 +2426,7 @@ where
         pair_roots: &[B256],
         outbound_entries: &[eez_protocol::abi::ExecutionEntrySol],
         outbound_user_txs: &[Bytes],
+        bundle_target: BundleTarget,
     ) -> Result<Option<Bytes>, String> {
         use alloy_sol_types::SolCall;
         use eez_protocol::abi::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
@@ -2848,7 +2862,7 @@ where
             // Mock mode: the mock prover ignores per-block witnesses.
             None => Vec::new(),
         };
-        let proving_ctx = eez_prover::ProvingContext {
+        let proving_ctx = ProvingContext {
             rollup_id,
             from_block: from,
             to_block: sync_block_number,
@@ -2856,12 +2870,14 @@ where
             blocks: block_witnesses,
             l1_block_hash: None, // timeless batch (blockNumber 0)
         };
-        let proof = self
-            .inner
-            .prover
-            .prove(proving_ctx)
-            .await
-            .map_err(|e| format!("prover.prove: {e}"))?;
+        let proof = prove_with_retry(
+            self.inner.prover.as_ref(),
+            proving_ctx,
+            self.inner.emission.timing,
+            bundle_target,
+        )
+        .await
+        .map_err(|e| format!("prover.prove: {e}"))?;
         batch.proofs = vec![proof];
 
         let calldata = postAndVerifyBatchCall {

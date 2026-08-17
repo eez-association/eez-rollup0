@@ -29,6 +29,25 @@ use thiserror::Error;
 /// Result alias.
 pub type ProverResult<T> = Result<T, ProverError>;
 
+/// A transient proving failure for which the complete operation may be retried.
+///
+/// These variants are the transport-independent form of the Composer profile's
+/// retryable gRPC status allowlist. Prover implementations in any process or
+/// language map their wire status into this enum before returning through the
+/// [`Prover`] trait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum RetryableProverError {
+    /// The prover or its transport is temporarily unavailable.
+    #[error("UNAVAILABLE")]
+    Unavailable,
+    /// The proving attempt exceeded its deadline.
+    #[error("DEADLINE_EXCEEDED")]
+    DeadlineExceeded,
+    /// The attempt was aborted because its state or snapshot changed.
+    #[error("ABORTED")]
+    Aborted,
+}
+
 /// Error returned by [`Prover::prove`].
 #[derive(Debug, Error)]
 pub enum ProverError {
@@ -38,6 +57,25 @@ pub enum ProverError {
     /// The proving backend (remote daemon, witness source, …) failed.
     #[error("prover backend: {0}")]
     Backend(String),
+    /// A transient failure that permits retrying the complete proving operation.
+    #[error("retryable prover error ({kind}): {message}")]
+    Retryable {
+        /// Canonical retry classification.
+        kind: RetryableProverError,
+        /// Diagnostic detail; callers MUST NOT parse it for classification.
+        message: String,
+    },
+}
+
+impl ProverError {
+    /// Return the canonical retry classification, if this error is retryable.
+    #[must_use]
+    pub const fn retryable_kind(&self) -> Option<RetryableProverError> {
+        match self {
+            Self::Retryable { kind, .. } => Some(*kind),
+            Self::Signer(_) | Self::Backend(_) => None,
+        }
+    }
 }
 
 /// One settling-window block the prover re-executes: its consensus RLP plus

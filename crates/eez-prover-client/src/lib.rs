@@ -18,7 +18,8 @@ use eez_control_rpc::v1::{
     BlockWitness as WireBlockWitness, ExecutionWitness as WireWitness, PostBatch, ProveChunk,
     ProveHeader, prove_chunk, prover_client::ProverClient,
 };
-use eez_prover::{Prover, ProverError, ProverResult, ProvingContext};
+use eez_prover::{Prover, ProverError, ProverResult, ProvingContext, RetryableProverError};
+use tonic::{Code, Status};
 use tracing::{Level, event};
 
 /// A [`Prover`] that proves a window on a remote `eez-proof-signer` over the
@@ -112,15 +113,16 @@ impl Prover for RemoteProver {
         // can exceed tonic's 4 MiB default → `ResourceExhausted`. Server matches.
         let mut client = ProverClient::connect(self.inner.url.clone())
             .await
-            .map_err(|e| ProverError::Backend(format!("connect {}: {e}", self.inner.url)))?
+            .map_err(|error| ProverError::Retryable {
+                kind: RetryableProverError::Unavailable,
+                message: format!("connect {}: {error}", self.inner.url),
+            })?
             .max_encoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES)
             .max_decoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES);
         let resp = client
             .prove(tokio_stream::iter(chunks))
             .await
-            .map_err(|e| {
-                ProverError::Backend(format!("Prove {}-{}: {e}", ctx.from_block, ctx.to_block))
-            })?
+            .map_err(|status| map_rpc_status(ctx.from_block, ctx.to_block, status))?
             .into_inner();
 
         // Fail-closed: the attestation must recover to the REGISTERED attester
@@ -146,6 +148,23 @@ impl Prover for RemoteProver {
     fn vkey(&self) -> B256 {
         // Left-zero-pad the 20-byte attester into a B256 (the registry vkey).
         self.inner.attester.into_word()
+    }
+}
+
+/// Preserve the Composer profile's closed retryable-status allowlist across
+/// the transport-neutral [`Prover`] boundary. Every other non-OK status is a
+/// non-retryable backend rejection for the unchanged request.
+fn map_rpc_status(from_block: u64, to_block: u64, status: Status) -> ProverError {
+    let kind = match status.code() {
+        Code::Unavailable => Some(RetryableProverError::Unavailable),
+        Code::DeadlineExceeded => Some(RetryableProverError::DeadlineExceeded),
+        Code::Aborted => Some(RetryableProverError::Aborted),
+        _ => None,
+    };
+    let message = format!("Prove {from_block}-{to_block}: {status}");
+    match kind {
+        Some(kind) => ProverError::Retryable { kind, message },
+        None => ProverError::Backend(message),
     }
 }
 
@@ -198,7 +217,7 @@ mod tests {
         prover_server::{Prover as ProverService, ProverServer},
     };
     use std::str::FromStr;
-    use tonic::{Request, Response, Status, Streaming, transport::Server};
+    use tonic::{Request, Response, Streaming, transport::Server};
 
     /// Stub `Prove` server: drains the window stream and returns a fixed
     /// `publicInputsHash` signed by `signer` (the r||s||v packing L1 expects).
@@ -336,5 +355,41 @@ mod tests {
         // 65 bytes but not a valid signature over `hash` → recover fails or the
         // recovered address won't be the attester.
         assert!(verify_attestation(&[0u8; 65], hash.as_slice(), test_key().address()).is_err());
+    }
+
+    #[test]
+    fn rpc_status_retryability_is_a_closed_allowlist() {
+        let retryable = [
+            (Code::Unavailable, RetryableProverError::Unavailable),
+            (
+                Code::DeadlineExceeded,
+                RetryableProverError::DeadlineExceeded,
+            ),
+            (Code::Aborted, RetryableProverError::Aborted),
+        ];
+        for (code, expected) in retryable {
+            let error = map_rpc_status(5, 9, Status::new(code, "test"));
+            assert_eq!(error.retryable_kind(), Some(expected), "{code:?}");
+        }
+
+        for code in [
+            Code::Cancelled,
+            Code::Unknown,
+            Code::InvalidArgument,
+            Code::NotFound,
+            Code::AlreadyExists,
+            Code::PermissionDenied,
+            Code::ResourceExhausted,
+            Code::FailedPrecondition,
+            Code::OutOfRange,
+            Code::Unimplemented,
+            Code::Internal,
+            Code::DataLoss,
+            Code::Unauthenticated,
+        ] {
+            let error = map_rpc_status(5, 9, Status::new(code, "test"));
+            assert_eq!(error.retryable_kind(), None, "{code:?}");
+            assert!(matches!(error, ProverError::Backend(_)), "{code:?}");
+        }
     }
 }
