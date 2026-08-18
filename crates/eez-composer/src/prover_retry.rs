@@ -6,14 +6,18 @@ use alloy_primitives::Bytes;
 use eez_driver::RollupTiming;
 use eez_l1::BundleTarget;
 use eez_prover::{Prover, ProverError, ProvingContext, RetryableProverError};
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep_until, timeout};
 use tracing::{Level, event};
 
-/// A complete proving operation gets one initial attempt and at most two
-/// retries. The slot deadline remains the stronger bound for pinned batches.
-const MAX_PROVER_ATTEMPTS: u32 = 3;
-const INITIAL_PROVER_RETRY_BACKOFF: Duration = Duration::from_millis(100);
-const MAX_PROVER_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const INITIAL_PROVER_RETRY_BACKOFF_MS: u64 = 100;
+const MAX_PROVER_RETRY_BACKOFF_MS: u64 = 1_000;
+
+fn unix_time_millis() -> u64 {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// Latest wall-clock millisecond at which a full proof attempt may start.
 ///
@@ -34,28 +38,38 @@ fn proof_start_cutoff_ms(timing: RollupTiming, target: BundleTarget) -> Option<u
     )
 }
 
-fn unix_time_millis() -> u64 {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-}
-
 /// Exponential backoff with ±20% wall-clock jitter and a fixed cap.
 fn prover_retry_backoff(failed_attempt: u32) -> Duration {
+    let jitter_seed = u64::from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos(),
+    );
+    prover_retry_backoff_with_seed(failed_attempt, jitter_seed)
+}
+
+fn prover_retry_backoff_with_seed(failed_attempt: u32, jitter_seed: u64) -> Duration {
     let shift = failed_attempt.saturating_sub(1).min(31);
-    let base_ms = u64::try_from(INITIAL_PROVER_RETRY_BACKOFF.as_millis())
-        .unwrap_or(u64::MAX)
-        .saturating_mul(1u64 << shift)
-        .min(u64::try_from(MAX_PROVER_RETRY_BACKOFF.as_millis()).unwrap_or(u64::MAX));
+    let base_ms = (INITIAL_PROVER_RETRY_BACKOFF_MS << shift).min(MAX_PROVER_RETRY_BACKOFF_MS);
     let jitter = base_ms / 5;
-    let width = jitter.saturating_mul(2).saturating_add(1);
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    let offset = u64::from(seed) % width;
-    Duration::from_millis(base_ms.saturating_sub(jitter).saturating_add(offset))
+    let offset = jitter_seed % (jitter * 2 + 1);
+    Duration::from_millis(base_ms - jitter + offset)
+}
+
+fn retry_budget(
+    timing: RollupTiming,
+    target: BundleTarget,
+    now_ms: u64,
+) -> Result<Duration, ProverError> {
+    match proof_start_cutoff_ms(timing, target) {
+        Some(cutoff_ms) if now_ms > cutoff_ms => Err(ProverError::Retryable {
+            kind: RetryableProverError::DeadlineExceeded,
+            message: "Composer proof-attempt cutoff reached".to_owned(),
+        }),
+        Some(cutoff_ms) => Ok(Duration::from_millis(cutoff_ms - now_ms)),
+        None => Ok(timing.proof_time()),
+    }
 }
 
 /// Run one complete proving operation with the Composer profile's closed
@@ -67,15 +81,21 @@ pub(crate) async fn prove_with_retry(
     timing: RollupTiming,
     target: BundleTarget,
 ) -> Result<Bytes, ProverError> {
-    let cutoff_ms = proof_start_cutoff_ms(timing, target);
-    for attempt in 1..=MAX_PROVER_ATTEMPTS {
-        if cutoff_ms.is_some_and(|cutoff| unix_time_millis() > cutoff) {
-            return Err(ProverError::Retryable {
-                kind: RetryableProverError::DeadlineExceeded,
-                message: "Composer proof-attempt cutoff reached".to_owned(),
-            });
-        }
+    prove_with_retry_at(prover, ctx, timing, target, unix_time_millis()).await
+}
 
+async fn prove_with_retry_at(
+    prover: &dyn Prover,
+    ctx: ProvingContext,
+    timing: RollupTiming,
+    target: BundleTarget,
+    now_ms: u64,
+) -> Result<Bytes, ProverError> {
+    let budget = retry_budget(timing, target, now_ms)?;
+    let retry_deadline = Instant::now() + budget;
+    let mut attempt = 1_u32;
+
+    loop {
         let result = match timeout(timing.proof_time(), prover.prove(ctx.clone())).await {
             Ok(result) => result,
             Err(_) => Err(ProverError::Retryable {
@@ -93,36 +113,44 @@ pub(crate) async fn prove_with_retry(
         let Some(kind) = error.retryable_kind() else {
             return Err(error);
         };
-        if attempt == MAX_PROVER_ATTEMPTS {
-            return Err(error);
-        }
 
-        let delay = prover_retry_backoff(attempt);
-        let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
-        if cutoff_ms.is_some_and(|cutoff| unix_time_millis().saturating_add(delay_ms) > cutoff) {
+        let wake_at = Instant::now() + prover_retry_backoff(attempt);
+        if wake_at >= retry_deadline {
             event!(
                 name: "eez.composer.prover.retry_cutoff",
                 Level::WARN,
                 attempt,
                 ?kind,
-                delay_ms,
-                cutoff_ms,
-                "not retrying proof because the next complete attempt would miss the settlement cutoff",
+                ?target,
+                "not retrying proof because its retry budget is exhausted",
             );
             return Err(error);
         }
+
         event!(
             name: "eez.composer.prover.retry",
             Level::WARN,
             attempt,
             next_attempt = attempt + 1,
             ?kind,
-            delay_ms,
+            ?target,
             "retrying complete proof request after transient failure",
         );
-        sleep(delay).await;
+        sleep_until(wake_at).await;
+        // The planned wake was safe, but the runtime may resume this task late.
+        if Instant::now() >= retry_deadline {
+            event!(
+                name: "eez.composer.prover.retry_cutoff",
+                Level::WARN,
+                attempt,
+                ?kind,
+                ?target,
+                "proof retry budget exhausted while waiting",
+            );
+            return Err(error);
+        }
+        attempt += 1;
     }
-    unreachable!("MAX_PROVER_ATTEMPTS is nonzero")
 }
 
 #[cfg(test)]
@@ -171,6 +199,40 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct TimeoutProver {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Prover for TimeoutProver {
+        async fn prove(&self, _ctx: ProvingContext) -> Result<Bytes, ProverError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            std::future::pending().await
+        }
+
+        fn vkey(&self) -> B256 {
+            B256::ZERO
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct AlwaysRetryableProver {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Prover for AlwaysRetryableProver {
+        async fn prove(&self, _ctx: ProvingContext) -> Result<Bytes, ProverError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(retryable(RetryableProverError::Unavailable))
+        }
+
+        fn vkey(&self) -> B256 {
+            B256::ZERO
+        }
+    }
+
     fn retryable(kind: RetryableProverError) -> ProverError {
         ProverError::Retryable {
             kind,
@@ -182,18 +244,21 @@ mod tests {
         RollupTiming::new(2_000, 1_000, 500, 100)
     }
 
-    #[tokio::test]
+    const TEST_NOW_MS: u64 = 1_700_000_000_000;
+
+    #[tokio::test(start_paused = true)]
     async fn retryable_prover_error_retries_the_complete_operation() {
         let prover = ScriptedProver::new(vec![
             Err(retryable(RetryableProverError::Unavailable)),
             Ok(Bytes::from_static(b"proof")),
         ]);
 
-        let proof = prove_with_retry(
+        let proof = prove_with_retry_at(
             &prover,
             ProvingContext::default(),
             test_timing(),
             BundleTarget::NextBlock,
+            TEST_NOW_MS,
         )
         .await
         .unwrap();
@@ -202,17 +267,18 @@ mod tests {
         assert_eq!(prover.calls(), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn non_retryable_prover_error_is_attempted_once() {
         let prover = ScriptedProver::new(vec![Err(ProverError::Backend(
             "fatal test failure".to_owned(),
         ))]);
 
-        let error = prove_with_retry(
+        let error = prove_with_retry_at(
             &prover,
             ProvingContext::default(),
             test_timing(),
             BundleTarget::NextBlock,
+            TEST_NOW_MS,
         )
         .await
         .unwrap_err();
@@ -221,11 +287,11 @@ mod tests {
         assert_eq!(prover.calls(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn expired_slot_cutoff_starts_no_proof_attempt() {
         let prover = ScriptedProver::new(vec![Ok(Bytes::from_static(b"unexpected"))]);
 
-        let error = prove_with_retry(
+        let error = prove_with_retry_at(
             &prover,
             ProvingContext::default(),
             test_timing(),
@@ -233,6 +299,7 @@ mod tests {
                 block: 1,
                 timestamp: 1,
             },
+            TEST_NOW_MS,
         )
         .await
         .unwrap_err();
@@ -242,6 +309,81 @@ mod tests {
             Some(RetryableProverError::DeadlineExceeded)
         );
         assert_eq!(prover.calls(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_attempt_exhausts_the_next_block_retry_window() {
+        let prover = TimeoutProver::default();
+
+        let error = prove_with_retry_at(
+            &prover,
+            ProvingContext::default(),
+            test_timing(),
+            BundleTarget::NextBlock,
+            TEST_NOW_MS,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.retryable_kind(),
+            Some(RetryableProverError::DeadlineExceeded)
+        );
+        assert_eq!(prover.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn next_block_retries_until_its_total_wait_budget_is_exhausted() {
+        let timing = RollupTiming::new(5_000, 1_000, 2_000, 100);
+        let prover = AlwaysRetryableProver::default();
+        let started = Instant::now();
+
+        let error = prove_with_retry_at(
+            &prover,
+            ProvingContext::default(),
+            timing,
+            BundleTarget::NextBlock,
+            TEST_NOW_MS,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.retryable_kind(),
+            Some(RetryableProverError::Unavailable)
+        );
+        let elapsed = Instant::now().duration_since(started);
+        assert!(
+            elapsed >= Duration::from_millis(INITIAL_PROVER_RETRY_BACKOFF_MS * 4 / 5),
+            "retrying should include a real backoff rather than hot-looping"
+        );
+        assert!(elapsed < timing.proof_time());
+        assert!(
+            prover.calls.load(Ordering::Relaxed) > 3,
+            "the retry window should outlive the old three-attempt cap"
+        );
+    }
+
+    #[test]
+    fn backoff_stays_within_twenty_percent_of_its_capped_exponential_base() {
+        for attempt in 1_u32..=40 {
+            let shift = attempt.saturating_sub(1).min(31);
+            let base_ms =
+                (INITIAL_PROVER_RETRY_BACKOFF_MS << shift).min(MAX_PROVER_RETRY_BACKOFF_MS);
+            for seed in [0, 1, u64::MAX / 2, u64::MAX] {
+                let delay_ms =
+                    u64::try_from(prover_retry_backoff_with_seed(attempt, seed).as_millis())
+                        .unwrap();
+                assert!(
+                    delay_ms >= base_ms * 4 / 5,
+                    "attempt {attempt}, seed {seed}"
+                );
+                assert!(
+                    delay_ms <= base_ms * 6 / 5,
+                    "attempt {attempt}, seed {seed}"
+                );
+            }
+        }
     }
 
     #[test]

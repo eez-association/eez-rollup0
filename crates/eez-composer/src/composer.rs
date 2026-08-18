@@ -2097,9 +2097,16 @@ where
                 bundle_target,
             )
             .await
-        {
-            Ok(Some(raw)) => raw,
-            Ok(None) => {
+            .and_then(|raw| {
+                raw.ok_or_else(|| {
+                    format!(
+                        "range exceeds the {} postBatch gas budget; bounded chunks cover it",
+                        self.inner.emission.max_gas
+                    )
+                })
+            }) {
+            Ok(raw) => raw,
+            Err(err) => {
                 // The whole range will not fit; settle a bounded prefix of it so
                 // the range shrinks and the next slot's rich batch can fit.
                 let cursor = rollup.l1_head.cursor();
@@ -2118,22 +2125,6 @@ where
                         "neither the full range nor a bounded prefix could be emitted",
                     );
                 }
-                event!(
-                    name: "eez.composer.phase1.prepare_failed",
-                    Level::ERROR,
-                    rollup_id,
-                    max_gas = self.inner.emission.max_gas,
-                    "minimal postBatch prepare failed; committing Sync block without emission — L1 catches up next slot",
-                );
-                return Ok(Some(SyncSlotBlock {
-                    payload: empty_built.payload,
-                    header: empty_built.header,
-                }));
-            }
-            Err(err) => {
-                // A proof/RPC/construction failure is not evidence that the
-                // encoded range is too large. In particular, do not start an
-                // unpinned historical proof after the pinned slot's retry cutoff.
                 event!(
                     name: "eez.composer.phase1.prepare_failed",
                     Level::ERROR,

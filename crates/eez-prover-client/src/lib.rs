@@ -247,6 +247,19 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct UnavailableProver;
+
+    #[tonic::async_trait]
+    impl ProverService for UnavailableProver {
+        async fn prove(
+            &self,
+            _request: Request<Streaming<ProveChunk>>,
+        ) -> Result<Response<ProveResponse>, Status> {
+            Err(Status::unavailable("test prover is busy"))
+        }
+    }
+
     async fn spawn_stub(signer: PrivateKeySigner, hash: B256) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -258,6 +271,19 @@ mod tests {
                 .unwrap();
         });
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        format!("http://{addr}")
+    }
+
+    async fn spawn_unavailable_stub() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(ProverServer::new(UnavailableProver))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
         format!("http://{addr}")
     }
 
@@ -302,6 +328,39 @@ mod tests {
         assert!(
             matches!(err, ProverError::Backend(_)),
             "wrong-signer attestation must fail closed, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_failure_is_retryable_unavailable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let prover = RemoteProver::new(format!("http://{addr}"), Address::ZERO);
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            prover.prove(ProvingContext::default()),
+        )
+        .await
+        .expect("connection failure should be prompt")
+        .unwrap_err();
+
+        assert_eq!(
+            error.retryable_kind(),
+            Some(RetryableProverError::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_rpc_status_surfaces_as_retryable() {
+        let prover = RemoteProver::new(spawn_unavailable_stub().await, Address::ZERO);
+
+        let error = prover.prove(ProvingContext::default()).await.unwrap_err();
+
+        assert_eq!(
+            error.retryable_kind(),
+            Some(RetryableProverError::Unavailable)
         );
     }
 
