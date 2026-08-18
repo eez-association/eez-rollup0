@@ -6,7 +6,7 @@
 //! Deriver uses to replay L1-derived blocks
 //! (`eez_deriver::Deriver::execute_block`).
 //!
-//! [`PrefixState`] exposes the same construction as a LIVE, incrementally
+//! [`SyncBlockState`] exposes the same construction as a LIVE, incrementally
 //! extended state: the Sync block under construction is itself the composition
 //! session, so a claim read off it is the value the committed block produces.
 
@@ -39,7 +39,7 @@ use thiserror::Error;
 
 /// The revm state a Sync block is built over: the parent state provider plus
 /// every change committed by the block's txs so far.
-pub type PrefixDb = State<StateProviderDatabase<StateProviderBox>>;
+pub type DraftDb = State<StateProviderDatabase<StateProviderBox>>;
 
 /// Errors raised by [`build_sync_block`].
 #[derive(Debug, Error)]
@@ -134,11 +134,11 @@ fn recover_tx(raw: &Bytes, idx: usize) -> Result<Recovered<TransactionSigned>, B
 
 /// Open the revm state for a block built on `parent_hash`, optionally
 /// preloaded with an already-warmed cache.
-fn open_prefix_db(
+fn open_draft_db(
     provider: &dyn StateProviderFactory,
     parent_hash: B256,
     cache: Option<CacheState>,
-) -> Result<PrefixDb, BuildError> {
+) -> Result<DraftDb, BuildError> {
     let state_provider = provider
         .state_by_block_hash(parent_hash)
         .map_err(|e| BuildError::Provider(format!("state_by_block_hash({parent_hash}): {e}")))?;
@@ -230,7 +230,7 @@ where
 /// A reverted tx is a successful *execution* with `success == false` — only a
 /// tx revm refuses outright (nonce, balance, decode) is a [`BuildError`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecOutcome {
+pub struct TxOutcome {
     /// Receipt-level status: false for a revert or a halt.
     pub success: bool,
     /// Gas charged to the tx (after refunds), as the receipt reports it.
@@ -240,8 +240,8 @@ pub struct ExecOutcome {
     pub output: Bytes,
 }
 
-fn exec_outcome<H>(result: &ExecutionResult<H>) -> ExecOutcome {
-    ExecOutcome {
+fn exec_outcome<H>(result: &ExecutionResult<H>) -> TxOutcome {
+    TxOutcome {
         success: result.is_success(),
         gas_used: result.tx_gas_used(),
         output: result.output().cloned().unwrap_or_default(),
@@ -260,14 +260,14 @@ fn exec_outcome<H>(result: &ExecutionResult<H>) -> ExecOutcome {
 /// when a caller supplies none.
 fn execute_and_commit_inspected<I>(
     evm_config: &EthEvmConfig,
-    state: &mut PrefixDb,
+    state: &mut DraftDb,
     evm_env: &EvmEnvFor<EthEvmConfig>,
     raw: &Bytes,
     idx: usize,
     inspector: I,
-) -> Result<ExecOutcome, BuildError>
+) -> Result<TxOutcome, BuildError>
 where
-    I: for<'db> InspectorFor<EthEvmConfig, &'db mut PrefixDb>,
+    I: for<'db> InspectorFor<EthEvmConfig, &'db mut DraftDb>,
 {
     let recovered = recover_tx(raw, idx)?;
     let mut evm = evm_config.evm_with_env_and_inspector(state, evm_env.clone(), inspector);
@@ -294,26 +294,26 @@ where
 /// the state the committed block has at tx k. Post-execution changes
 /// (withdrawals, balance increments) are NOT applied — those belong to block
 /// close, not to mid-block state.
-pub struct PrefixState {
+pub struct SyncBlockState {
     provider: Arc<dyn StateProviderFactory>,
     evm_config: EthEvmConfig,
     parent_hash: B256,
     evm_env: EvmEnvFor<EthEvmConfig>,
-    state: PrefixDb,
+    state: DraftDb,
     /// Number of txs applied — the next tx's block position.
     applied: usize,
 }
 
-impl std::fmt::Debug for PrefixState {
+impl std::fmt::Debug for SyncBlockState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PrefixState")
+        f.debug_struct("SyncBlockState")
             .field("parent_hash", &self.parent_hash)
             .field("applied", &self.applied)
             .finish_non_exhaustive()
     }
 }
 
-impl PrefixState {
+impl SyncBlockState {
     /// Open the state of a Sync block on `parent` whose first `prefix_txs` have
     /// executed.
     ///
@@ -329,7 +329,7 @@ impl PrefixState {
         prefix_txs: &[Bytes],
     ) -> Result<Self, BuildError> {
         let parent_hash = parent.hash();
-        let mut state = open_prefix_db(provider.as_ref(), parent_hash, None)?;
+        let mut state = open_draft_db(provider.as_ref(), parent_hash, None)?;
         let attributes = next_block_attributes(evm_config, timestamp, suggested_fee_recipient);
         let evm_env = evm_config
             .next_evm_env(parent, &attributes)
@@ -371,7 +371,7 @@ impl PrefixState {
     /// # Errors
     ///
     /// See [`BuildError`].
-    pub fn execute_tx(&mut self, raw: &Bytes) -> Result<ExecOutcome, BuildError> {
+    pub fn execute_tx(&mut self, raw: &Bytes) -> Result<TxOutcome, BuildError> {
         let outcome = execute_and_commit_inspected(
             &self.evm_config,
             &mut self.state,
@@ -391,13 +391,13 @@ impl PrefixState {
     /// # Errors
     ///
     /// See [`BuildError`].
-    pub fn fork(&mut self) -> Result<PrefixFork, BuildError> {
-        let state = open_prefix_db(
+    pub fn fork(&mut self) -> Result<SyncBlockFork, BuildError> {
+        let state = open_draft_db(
             self.provider.as_ref(),
             self.parent_hash,
             Some(self.state.cache.clone()),
         )?;
-        Ok(PrefixFork {
+        Ok(SyncBlockFork {
             evm_config: self.evm_config.clone(),
             evm_env: self.evm_env.clone(),
             state,
@@ -406,7 +406,7 @@ impl PrefixState {
     }
 }
 
-/// Restore point of a [`PrefixFork`]. Forks never merge transitions, so the
+/// Restore point of a [`SyncBlockFork`]. Forks never merge transitions, so the
 /// cache carries every state effect a rollback must undo; `applied` rides along
 /// so a rewound fork also reports the right tx position.
 #[derive(Debug)]
@@ -415,30 +415,31 @@ pub struct ForkSnapshot {
     applied: usize,
 }
 
-/// A throwaway copy of a [`PrefixState`] for simulation: probes and source sims
-/// run here, and only their accepted effects are appended to the real block.
-pub struct PrefixFork {
+/// A throwaway copy of a [`SyncBlockState`] for simulation: probes and source
+/// sims run here, and only their accepted effects are appended to the real
+/// block.
+pub struct SyncBlockFork {
     evm_config: EthEvmConfig,
     evm_env: EvmEnvFor<EthEvmConfig>,
-    state: PrefixDb,
+    state: DraftDb,
     applied: usize,
 }
 
-impl std::fmt::Debug for PrefixFork {
+impl std::fmt::Debug for SyncBlockFork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PrefixFork")
+        f.debug_struct("SyncBlockFork")
             .field("applied", &self.applied)
             .finish_non_exhaustive()
     }
 }
 
-impl PrefixFork {
+impl SyncBlockFork {
     /// Execute one raw EIP-2718 tx on the fork and commit it there.
     ///
     /// # Errors
     ///
     /// See [`BuildError`].
-    pub fn execute_tx(&mut self, raw: &Bytes) -> Result<ExecOutcome, BuildError> {
+    pub fn execute_tx(&mut self, raw: &Bytes) -> Result<TxOutcome, BuildError> {
         let outcome = execute_and_commit_inspected(
             &self.evm_config,
             &mut self.state,
@@ -461,9 +462,9 @@ impl PrefixFork {
         &mut self,
         raw: &Bytes,
         inspector: I,
-    ) -> Result<ExecOutcome, BuildError>
+    ) -> Result<TxOutcome, BuildError>
     where
-        I: for<'db> InspectorFor<EthEvmConfig, &'db mut PrefixDb>,
+        I: for<'db> InspectorFor<EthEvmConfig, &'db mut DraftDb>,
     {
         let outcome = execute_and_commit_inspected(
             &self.evm_config,
@@ -493,7 +494,7 @@ impl PrefixFork {
 
     /// Raw state + env, for callers that drive their own EVM (a source
     /// simulation threading its inspector through this fork).
-    pub fn state_and_env(&mut self) -> (&mut PrefixDb, &EvmEnvFor<EthEvmConfig>) {
+    pub fn state_and_env(&mut self) -> (&mut DraftDb, &EvmEnvFor<EthEvmConfig>) {
         (&mut self.state, &self.evm_env)
     }
 }
@@ -667,8 +668,8 @@ mod tests {
             .expect("build sync block")
         }
 
-        fn open(&self, prefix: &[Bytes]) -> PrefixState {
-            PrefixState::open(
+        fn open(&self, prefix: &[Bytes]) -> SyncBlockState {
+            SyncBlockState::open(
                 Arc::new(self.provider.clone()),
                 &self.evm_config,
                 &self.parent,
@@ -689,9 +690,9 @@ mod tests {
         }
     }
 
-    /// THE equivalence guard: appending txs to a live [`PrefixState`] executes
-    /// them exactly as `build_sync_block`'s block builder does. Gas is the
-    /// witness — it is state-dependent (the second `SSTORE` is ~20k cheaper
+    /// THE equivalence guard: appending txs to a live [`SyncBlockState`]
+    /// executes them exactly as `build_sync_block`'s block builder does. Gas is
+    /// the witness — it is state-dependent (the second `SSTORE` is ~20k cheaper
     /// only if the first one's write is visible), so equal per-tx gas plus
     /// equal receipt status means both paths ran the same STF over the same
     /// intermediate states.
@@ -709,7 +710,7 @@ mod tests {
         assert_eq!(builder_gas[0], 21_000, "plain transfer");
 
         let mut prefix = f.open(&[]);
-        let outcomes: Vec<ExecOutcome> = f
+        let outcomes: Vec<TxOutcome> = f
             .txs
             .iter()
             .map(|raw| prefix.execute_tx(raw).expect("execute on prefix"))

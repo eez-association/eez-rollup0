@@ -27,9 +27,9 @@ pub use client::LocalChainClient;
 #[doc(inline)]
 pub use gnosis_adapter::GnosisL1Adapter;
 #[doc(inline)]
-pub use slot::LocalSlotHandles;
+pub use slot::LocalComposeClients;
 // Slot execution contexts are driven only by `composer.rs`.
-pub(crate) use slot::{L1ManagerExec, L1World, L2BlockProbeExec};
+pub(crate) use slot::{InboundL2TargetSession, L1SlotState, L1TargetSession};
 // `Role` + `LocalExecutionSession` are implementation details of
 // `local.rs` and `session.rs`; not re-exported beyond the crate.
 #[allow(unused_imports, reason = "future test/public consumers")]
@@ -46,7 +46,7 @@ pub(crate) use session::LocalExecutionSession;
 /// so leaving the bump in drifts the fork from the chain — and on an undeployed
 /// proxy slot it fails EIP-684's "code or nonce non-zero" check when the
 /// protocol later deploys the real `CrossChainProxy` there.
-pub(crate) fn restore_synthetic_caller_nonce(
+pub(crate) fn reset_frame_caller_nonce(
     changes: &mut revm::primitives::map::AddressHashMap<revm::state::Account>,
     addr: Address,
 ) {

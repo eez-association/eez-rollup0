@@ -14,7 +14,7 @@ recorded `returnData = 1`; real execution returns 1, 2, 3; the second
 delivery reverts `RollingHashMismatch` on-chain; the proof signer rejects
 the whole window; the txs re-queue at the front and the composer loops
 forever. The fix makes composition *chained*: the Sync block under
-construction **is** the L2 simulation state (`PrefixState`), a slot-pinned
+construction **is** the L2 simulation state (`SyncBlockState`), a slot-pinned
 L1 world accumulates surviving effects, claims are read off executions of
 the **real contract paths** (a probe of the canonical delivery tx; real
 `EEZ → proxy.executeOnBehalf` frames), and every accepted tx is appended
@@ -26,7 +26,7 @@ eviction at compose time.
 
 | Part | Files | What it covers |
 |---|---|---|
-| 1 | `eez-composer/src/local/build.rs`; `eez-protocol/src/system_tx.rs`, `abi.rs`; `Cargo.toml` | `PrefixState`/`PrefixFork` (block-is-the-session) + equivalence tests; canonical-builder factoring; new ABI surface |
+| 1 | `eez-composer/src/local/build.rs`; `eez-protocol/src/system_tx.rs`, `abi.rs`; `Cargo.toml` | `SyncBlockState`/`SyncBlockFork` (block-is-the-session) + equivalence tests; canonical-builder factoring; new ABI surface |
 | 2 | `eez-composer/src/local/slot.rs` (new), `client.rs`, `mod.rs`, `lib.rs` | The two real-path executors, probe inspector, source-sim seams |
 | 3 | `eez-composer/src/composer.rs` | The drain rework: two-phase canonical order, accept/evict protocol, keystone assert |
 | 4 | tests, harness, `main.rs`, CI, compose file, `Counter.sol` | Verification + wiring + operational knobs |
@@ -78,7 +78,7 @@ exposed as a *live* incrementally extended state, so "a claim read off it is
 the value the committed block produces." Accurate framing; the rest of the
 file delivers it.
 
-### Hunk 2 — imports and the `PrefixDb` alias
+### Hunk 2 — imports and the `DraftDb` alias
 
 Mostly mechanical import growth (`Evm as _`, `EvmEnvFor`, `InspectorFor`,
 `Recovered`, `StateProviderBox`, `CacheState`, `NoOpInspector`,
@@ -86,14 +86,14 @@ Mostly mechanical import growth (`Evm as _`, `EvmEnvFor`, `InspectorFor`,
 the new public alias:
 
 ```rust
-pub type PrefixDb = State<StateProviderDatabase<StateProviderBox>>;
+pub type DraftDb = State<StateProviderDatabase<StateProviderBox>>;
 ```
 
 Note the `StateProviderBox`: `build_sync_block` builds its `State` over a
 *borrowed* `&dyn StateProvider` (it must keep the provider alive separately
 to hand to `finish`), whereas the live path owns a boxed provider so the
 state can outlive the call that opened it. Same database, different
-ownership — the reason for the alias, and for `open_prefix_db` existing
+ownership — the reason for the alias, and for `open_draft_db` existing
 alongside the inline builder in `build_sync_block`.
 
 ### Hunk 3a — `BuiltSyncBlock.tx_successes`
@@ -119,9 +119,9 @@ The `NextBlockEnvAttributes` literal (timestamp, fee recipient,
 out of `build_sync_block` into a free function, comment and all.
 
 Pure extraction — no field changed. But it is the single most important
-extraction in the diff: `PrefixState::open` and `build_sync_block` now
+extraction in the diff: `SyncBlockState::open` and `build_sync_block` now
 *cannot* disagree about the block env. If they could, the divergence would be
-silent and nasty — e.g. `PrefixState` computing a claim under one timestamp
+silent and nasty — e.g. `SyncBlockState` computing a claim under one timestamp
 while the committed block executes under another, so `block.timestamp` reads
 differently and a return value the entry hash commits to changes. Sharing the
 constructor makes that class of bug unrepresentable instead of merely
@@ -132,7 +132,7 @@ unlikely.
 Decode-2718 + signer recovery, previously inline in `build_sync_block`'s
 loop, now a helper taking the block position for error labelling. Mechanical.
 
-### Hunk 3d — `open_prefix_db`
+### Hunk 3d — `open_draft_db`
 
 New helper: `state_by_block_hash(parent)` → `State::builder()` with bundle
 updates, plus an optional `with_cached_prestate(cache)`. The `Option<CacheState>`
@@ -147,19 +147,19 @@ the tx loop is `builder.execute_transaction(recover_tx(tx_bytes, idx)?)`;
 after `finish`, receipts are mapped into `tx_successes`. No behavior change
 beyond the new field being populated.
 
-### Hunk 5 — `ExecOutcome` and `exec_outcome`
+### Hunk 5 — `TxOutcome` and `exec_outcome`
 
 ```rust
-pub struct ExecOutcome { pub success: bool, pub gas_used: u64, pub output: Bytes }
+pub struct TxOutcome { pub success: bool, pub gas_used: u64, pub output: Bytes }
 ```
 
 The distinction encoded here drives the entire drain's evict-vs-degrade
 policy, so it is worth stating precisely: **a revert is a successful
-execution** — `Ok(ExecOutcome { success: false, output: <revert data> })`.
+execution** — `Ok(TxOutcome { success: false, output: <revert data> })`.
 Only a tx revm refuses outright (bad nonce, insufficient funds, undecodable)
 comes back as `Err(BuildError)`.
 
-Concretely, in the drain (`composer.rs::append_all`) `Ok(!success)` means
+Concretely, in the drain (`composer.rs::append_and_execute`) `Ok(!success)` means
 "this tx's own claim contradicts its execution → evict this tx, keep
 composing" while `Err` means "we couldn't even run it". Collapsing the two
 would either silently drop revert data (which the probe needs for the rolling
@@ -212,10 +212,10 @@ Two honest footnotes:
    `BUILDER_GAS_LIMIT` (30M) would therefore re-drain the same set next slot
    and fail the same way — the §8-finding-2 shape one layer down. Remote at
    today's bundle caps (~24 txs × ~300k), but a cumulative-gas counter on
-   `PrefixState` that evicts the offending tx would close it. Worth a
+   `SyncBlockState` that evicts the offending tx would close it. Worth a
    follow-up line, not a blocker.
 
-### Hunk 7 — `PrefixState`
+### Hunk 7 — `SyncBlockState`
 
 The centerpiece: provider + evm config + parent hash + the block's `evm_env` +
 the live `State` + `applied` (the count of txs applied, i.e. the next tx's
@@ -270,10 +270,10 @@ rebuilding from the accepted list, rather than restoring a cache, is what
 keeps the prefix *provably* equal to the block the canonical rebuild
 produces. At a 24-tx cap that is the right side of the trade.
 
-### Hunk 8 — `PrefixFork`
+### Hunk 8 — `SyncBlockFork`
 
 A throwaway copy: same fields minus the provider (it can't re-open, by
-construction). `execute_tx` mirrors `PrefixState`'s;
+construction). `execute_tx` mirrors `SyncBlockState`'s;
 `execute_tx_inspected(raw, inspector)` is the probe path, where the inspector
 captures the inner `EEZL2 → proxy` frame outcome that becomes the claim.
 `cache_snapshot()` / `restore_cache()` are the restore point the composition
@@ -285,12 +285,12 @@ env for callers that drive their own EVM — used by the source sim at
 
 The invariant this type carries is simply: nothing executed on a fork touches
 the block. Probes and source sims live here; only accepted effects get
-appended to the real `PrefixState`.
+appended to the real `SyncBlockState`.
 
 ### Hunk 9 — `sync_block_pair_roots` untouched
 
 Worth calling out that it is *correctly* left alone. It needs state **roots**,
-which only exist after block close — and `PrefixState` deliberately never
+which only exist after block close — and `SyncBlockState` deliberately never
 closes a block. So its build-per-prefix loop can't be swapped for the cheaper
 primitive; the two serve different questions ("what is the state mid-block"
 vs. "what is the root at this pair-end").
@@ -323,7 +323,7 @@ transfer) exercise plain transfer, state write, revert-with-data, warm rewrite,
 and a post-revert tx.
 
 - `prefix_state_execution_matches_build_sync_block` — appends all five to a
-  live `PrefixState` and compares status + gas against the built block, tx by
+  live `SyncBlockState` and compares status + gas against the built block, tx by
   tx. Also asserts the revert carries `0xdeadbeef` and the successful store
   returns 42. Anti-vacuity: `outcomes[1].gas_used > outcomes[3].gas_used +
   15_000` — the second store is cheap *only* if the first one's write is
@@ -492,10 +492,10 @@ worth revisiting only if CI wall time becomes the constraint.
 | Change | Before | After |
 |---|---|---|
 | `BuiltSyncBlock.tx_successes` | built block carried no receipt statuses; a reverted tx in the final block was invisible to the caller | per-tx receipt status surfaced; composer gates dispatch on all-success and degrades to a minimal postBatch otherwise |
-| `next_block_attributes` / `recover_tx` / `open_prefix_db` extraction | attributes + decode/recover inline in `build_sync_block` | shared helpers; `build_sync_block` and `PrefixState::open` cannot disagree on the block env |
-| `PrefixState` / `PrefixFork` / `ExecOutcome` | none — no live mid-block state existed; composition simulated over `provider.latest()` | new public API: live prefix state over the block under construction, forks for probes/source sims, per-tx outcome including revert data |
+| `next_block_attributes` / `recover_tx` / `open_draft_db` extraction | attributes + decode/recover inline in `build_sync_block` | shared helpers; `build_sync_block` and `SyncBlockState::open` cannot disagree on the block env |
+| `SyncBlockState` / `SyncBlockFork` / `TxOutcome` | none — no live mid-block state existed; composition simulated over `provider.latest()` | new public API: live prefix state over the block under construction, forks for probes/source sims, per-tx outcome including revert data |
 | `build_sync_block` core path | builder → pre-exec → per-tx → `finish` | unchanged (same order, same env, same `finish`); only the receipt mapping is new |
-| `sync_block_pair_roots` | rebuilds the block per pair-end for roots | none (untouched — roots require block close, which `PrefixState` deliberately never does) |
+| `sync_block_pair_roots` | rebuilds the block per pair-end for roots | none (untouched — roots require block close, which `SyncBlockState` deliberately never does) |
 | `build_inbound_system_txs` shape rejection | third inline copy of the predicate | calls shared `check_entry_shape`; identical rule, identical messages; foreign/empty `continue` filters unchanged |
 | `check_entry_shape` | private closure inside `build_cross_chain_sync_pairs` | public fn, same four rejections in the same order (pure lift) |
 | `build_outbound_pair` | inline PHASE-1 loop body | public per-entry fn; the drain and the canonical rebuild now share one lowering, making the "appended == rebuilt" assert meaningful |
@@ -510,10 +510,10 @@ worth revisiting only if CI wall time becomes the constraint.
    deliberately skips the builder's block-gas precheck, so a drain that
    overshoots `BUILDER_GAS_LIMIT` fails at the final `build_sync_block` and
    degrades + re-queues the same set, which will fail identically next slot. A
-   cumulative-gas counter on `PrefixState` that evicts the offending tx would
+   cumulative-gas counter on `SyncBlockState` that evicts the offending tx would
    turn it into a per-tx eviction — the same shape as design §8 finding 2, one
    layer down.
-2. **`PrefixState::fork` could take `&self`** — it only clones the cache, and
+2. **`SyncBlockState::fork` could take `&self`** — it only clones the cache, and
    the immutable signature would state "forking cannot disturb the block" in
    the type rather than in a comment.
 
@@ -559,14 +559,14 @@ change-set — not from ad-hoc `sol!` blocks here. And `DIRECT_CALL_GAS_LIMIT`, 
 `provider_err` are reused from `session.rs`, so the old file stays as the home of those shared
 bits even though its session type is now dormant on this path.
 
-### 1.3 `LocalSlotHandles` (`slot.rs:44-54`)
+### 1.3 `LocalComposeClients` (`slot.rs:44-54`)
 
 Two `Arc<LocalChainClient>`s, L1 entry and L2 entry, carried on `CrossChainWiring`
 (`composer.rs:143`) next to the existing type-erased `ChainClient` map, and populated in
 `eez-node/src/main.rs:697`.
 
 **Why it exists.** The drain needs surfaces the `ChainClient` trait deliberately does not have:
-`L1World::open`, `simulate_source_tx_on`, `chain_provider()`. The doc comment says exactly this —
+`L1SlotState::open`, `simulate_source_tx_on`, `chain_provider()`. The doc comment says exactly this —
 "both point at the same instances — the erased trait hides the simulation surfaces the drain
 drives". That is the honest framing: this is not a second registry, it is a concrete-typed view
 onto the same two clients.
@@ -590,7 +590,7 @@ sentence in review. The drain classifies failures by `ExecutorErrorKind`
 abort the slot), everything else is POISON (evict this tx, keep composing). So the kind chosen
 at each failure site *is* the eviction decision:
 
-- `L1World::open` uses `provider_err` / `Missing` → a provider hiccup at anchor time re-queues,
+- `L1SlotState::open` uses `provider_err` / `Missing` → a provider hiccup at anchor time re-queues,
   it does not evict user transactions. Correct.
 - every failure caused by the transaction itself — manager frame reverted, target reverted,
   probe never reached the proxy frame, delivery reverted — goes through `encoding_err` → poison.
@@ -598,10 +598,10 @@ at each failure site *is* the eviction decision:
   also means "this tx is structurally undeliverable". Not worth churn now, but if a new kind is
   ever added, `ExecutorErrorKind::Rejected` would document itself.
 
-### 1.5 `L1World` (`slot.rs:68-157`)
+### 1.5 `L1SlotState` (`slot.rs:68-157`)
 
 ```rust
-pub struct L1World {
+pub struct L1SlotState {
     pub anchor: SealedHeader<Header>,
     pub cache: CacheState,
 }
@@ -643,7 +643,7 @@ rather than the landing block's. This is the same bounded L1 base drift §5 alre
 using `next_evm_env` would be a *different* guess, not a truer one. Worth one comment line at
 `open_state` so the next reader doesn't have to derive it.
 
-### 1.6 `L1ManagerExec` — struct, `Debug`, `new` (`slot.rs:161-220`)
+### 1.6 `L1TargetSession` — struct, `Debug`, `new` (`slot.rs:161-220`)
 
 This is the outbound target session: for an L2→L1 call it replays exactly what
 `EEZ._processNCalls` will do inside the future `postAndVerifyBatch`.
@@ -725,7 +725,7 @@ Two details worth calling out because they are the difference between "mirrors t
 Note `create_proxy` uses `DIRECT_CALL_GAS_LIMIT` (clamped) rather than `VIEW_CALL_GAS_LIMIT`: a
 CREATE2 deployment is not a view. Correct.
 
-### 1.9 `impl TargetExecutionSession for L1ManagerExec` (`slot.rs:316-412`)
+### 1.9 `impl TargetExecutionSession for L1TargetSession` (`slot.rs:316-412`)
 
 **`execute` (`slot.rs:317-397`)** — the heart of the outbound path, in the contract's own order:
 
@@ -777,8 +777,8 @@ fn checkpoint(&mut self) -> ExecutorResult<SessionSnapshot> {
 
 `SessionSnapshot` is `Box<dyn Any + Send>`, so the type is checked at runtime only. The drain
 reclaims the boxed session via `take_sessions`, calls `checkpoint()`, downcasts to `CacheState`
-and commits it into `L1World::cache` on accept — `harvest_l1_cache` even repeats the constraint
-in its own doc ("The payload shape is pinned by `L1ManagerExec::checkpoint`: a boxed `CacheState`
+and commits it into `L1SlotState::cache` on accept — `take_l1_cache` even repeats the constraint
+in its own doc ("The payload shape is pinned by `L1TargetSession::checkpoint`: a boxed `CacheState`
 and nothing else"). Documenting it on both ends is right given `Any` gives no compiler help.
 
 The double duty is neat rather than clever: the same method serves (a) the builder's intra-tx
@@ -864,12 +864,12 @@ delivery, the SYSTEM_ADDRESS nonce cursor must go back with it or every subseque
 the composition is built at the wrong nonce and fails at execution. Small struct, real
 invariant.
 
-### 1.13 `L2BlockProbeExec` — struct, `new`, `entry_for`, `delivery_tx` (`slot.rs:476-568`)
+### 1.13 `InboundL2TargetSession` — struct, `new`, `l1_entry_for_call`, `delivery_tx` (`slot.rs:476-568`)
 
-The inbound target session. Its state is a `PrefixFork` (a throwaway copy of the Sync block
+The inbound target session. Its state is a `SyncBlockFork` (a throwaway copy of the Sync block
 under construction, `build.rs:395-471`), the `SystemTxContext`, and the delivery nonce cursor.
 
-`entry_for` (`slot.rs:517-553`) builds the **L1-shape** `ExecutionEntrySol` for one inbound call
+`l1_entry_for_call` (`slot.rs:517-553`) builds the **L1-shape** `ExecutionEntrySol` for one inbound call
 — the same shape a postBatch carries — because `build_inbound_system_txs` is the canonical
 batch→delivery lowering used by the deriver and the signer. Reusing it means the probe's delivery
 transaction is byte-identical to what a follower will reconstruct from L1, by construction rather
@@ -889,7 +889,7 @@ That is not paranoia: `build_inbound_system_txs` silently *skips* entries whose
 mix-up would otherwise yield an empty vec and a confusing downstream failure. Loud, per
 invariant 7.
 
-**Small observation.** `entry_for` computes the lean L2 entry to obtain `proxyEntryHash` and
+**Small observation.** `l1_entry_for_call` computes the lean L2 entry to obtain `proxyEntryHash` and
 `rollingHash`, but `build_inbound_system_txs` rebuilds that same lean entry internally from the
 L1-shape fields (`system_tx.rs:103-113`), so those two fields on the returned struct are inert
 for the lowering. They are identical by construction (same builder, same inputs), so this is
@@ -897,7 +897,7 @@ correctness-neutral — but a reader can spend a while looking for where the has
 One clause on the doc comment ("the hashes are recomputed by the canonical lowering; set here so
 the entry is well-formed") would save that trip.
 
-### 1.14 `impl TargetExecutionSession for L2BlockProbeExec` (`slot.rs:570-678`)
+### 1.14 `impl TargetExecutionSession for InboundL2TargetSession` (`slot.rs:570-678`)
 
 **Why two runs.** This is inherent, not an optimization choice, and the code says so. The rolling
 hash must be computed *inside* the transaction that produces it — `EEZL2._executeEntry` seeds it
@@ -966,7 +966,7 @@ contains the previous accepted delivery, so the claims are `1, 2, 3` and the win
 Nonce advance is `checked_add` with a loud error (`slot.rs:645-647`), and `checkpoint`/`rollback`
 carry both halves of the state as described in §1.12.
 
-**Small nit.** `PrefixFork::execute_tx*` increments its internal `applied` counter, and
+**Small nit.** `SyncBlockFork::execute_tx*` increments its internal `applied` counter, and
 `restore_cache` does not rewind it, so after a probe the fork's counter is one ahead of the
 transactions actually applied to it. `applied` is only passed as `idx` to `recover_tx` for error
 messages (`build.rs:248-270`), so this is cosmetic today — but if it ever feeds a block position
@@ -1030,8 +1030,8 @@ for the new commit. Mechanical.
 ### Hunk 2 — three accessors (`client.rs:167-190`)
 
 `chain_provider()`, `manager_address()`, `inspector_factory()` — all pure getters over data the
-client already held, added because `slot.rs` needs them (`L1World::open` reads headers/state,
-`L1ManagerExec::new` reads the manager address and the EVM config, `execute` builds the session
+client already held, added because `slot.rs` needs them (`L1SlotState::open` reads headers/state,
+`L1TargetSession::new` reads the manager address and the EVM config, `execute` builds the session
 inspector).
 
 `inspector_factory()` also removes a duplicate: `begin_execution_session` and the source-sim path
@@ -1052,7 +1052,7 @@ tx 1's simulation would run against a state where tx 0 never happened — stale 
 target storage, stale nonce. With the fork carried across, tx 1 sees tx 0's writes, so the call
 arguments and return data it claims match the order the bundle will actually execute in. The same
 mechanism carries phase-1 outbound manager effects into phase-2 inbound sims, since both draw
-from `L1World::cache`.
+from `L1SlotState::cache`.
 
 Nonce *validation* is a separate matter: `source_sim` sets `disable_nonce_check = true` (inherited
 behavior, needed because a system-signed source tx can legitimately sit at N+1 behind its
@@ -1060,7 +1060,7 @@ behavior, needed because a system-signed source tx can legitimately sit at N+1 b
 sender's nonce as a target or a CREATE would observe it — not nonce validation.
 
 The doc comment points at the constraint that the caller owns: the env "must already be derived
-from the fork's own header". `L1World::fork_state` and `PrefixFork::state_and_env` are the two
+from the fork's own header". `L1SlotState::fork_state` and `SyncBlockFork::state_and_env` are the two
 places that hold up that end.
 
 ### Hunk 4 — `source_sim`, the shared body (`client.rs:213-283`)
@@ -1115,9 +1115,9 @@ Small and worth being deliberate about.
   paths" — sitting alongside the existing `LocalChainClient` / `LocalExecutionSession` entries.
 - `pub(crate) mod slot;` matches the visibility of `build`, `client`, `provider`, `session`
   (`gnosis_adapter` remains `pub`). Modules stay crate-private; only chosen items are re-exported.
-- `pub use slot::LocalSlotHandles;` (`#[doc(inline)]`) — the single type that must cross the crate
+- `pub use slot::LocalComposeClients;` (`#[doc(inline)]`) — the single type that must cross the crate
   boundary, because `eez-node/src/main.rs:697` constructs it when wiring `CrossChainWiring`.
-- `pub(crate) use slot::{L1ManagerExec, L1World, L2BlockProbeExec};` with the comment "Slot
+- `pub(crate) use slot::{InboundL2TargetSession, L1SlotState, L1TargetSession};` with the comment "Slot
   execution contexts are driven only by `composer.rs`."
 
 That last line is the interesting choice. The three executors are `pub` **within their module**
@@ -1127,7 +1127,7 @@ exporting all four — would publish types whose contracts are only meaningful i
 (the `checkpoint`-payload hand-off, the anchor pinning, the accept-time commit protocol). Keeping
 them crate-internal keeps those invariants enforceable by reading one file.
 
-`lib.rs`: `LocalSlotHandles` joins the existing `#[doc(inline)] pub use local::{…}` list. One name
+`lib.rs`: `LocalComposeClients` joins the existing `#[doc(inline)] pub use local::{…}` list. One name
 added, nothing else touched.
 
 ---
@@ -1140,7 +1140,7 @@ added, nothing else touched.
 | Proxy existence | assumed; address computed, never deployed | `authorizedProxies` checked via the manager's own getter; missing → real permissionless `createCrossChainProxy` CREATE2 from the manager's frame (`slot.rs:290-313`) |
 | Escrow / value | `disable_balance_check = true` — value conjured, sim always paid | balance check ON; value drawn from the manager's real balance, short escrow fails at compose time (`slot.rs:203-208`) |
 | Frame gas | `disable_block_gas_limit = true`, 30M frames | clamped to the anchor block's gas limit (`frame_gas`, `slot.rs:225-227`); fixes the chiado 17M-limit poison-evict of every outbound tx |
-| L1 state lifetime | fresh `provider.latest()` per composition, post-state dropped at `finalize` | one `L1World` pinned at drain start, advanced commit-or-drop per surviving tx (`slot.rs:78-157`) |
+| L1 state lifetime | fresh `provider.latest()` per composition, post-state dropped at `finalize` | one `L1SlotState` pinned at drain start, advanced commit-or-drop per surviving tx (`slot.rs:78-157`) |
 | Target-session checkpoint | `Box::new(())`, rollback a no-op type check | real `CacheState` clone/restore; doubles as the drain's accept-time harvest payload (`slot.rs:399-411`) |
 | Inbound claim resolution | direct call to the target produced the claim; the delivery tx was verified only on-chain / at the proof signer | probe the canonical delivery on a fork of the Sync block, capture the real `EEZL2 → proxy` outcome, then run the canonical delivery for real — must succeed (`slot.rs:583-647`) |
 | Inbound nonce cursor | n/a | `delivery_nonce` advances per accepted delivery and rewinds with rollback via `ProbeSnapshot` (`slot.rs:469-474`, `663-677`) |
@@ -1151,7 +1151,7 @@ added, nothing else touched.
 | Source sim over a caller fork | did not exist | `simulate_source_tx_on` runs over caller-provided state + env and commits into it, so tx N+1 sees tx N (`client.rs:192-211`) |
 | Source-sim timing telemetry | five `timing.*_us` fields per call | removed — the field names described work the split function no longer does |
 | Client accessors | none | `chain_provider()`, `manager_address()`, `inspector_factory()`; `rollup_id()` proposed and audit-deleted (no callers) |
-| Crate surface | `local::{BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient, build_sync_block}` | plus `LocalSlotHandles`; the three executors stay `pub(crate)` |
+| Crate surface | `local::{BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient, build_sync_block}` | plus `LocalComposeClients`; the three executors stay `pub(crate)` |
 
 
 ---
@@ -1181,8 +1181,8 @@ Walkthrough in file order.
 
 ## Hunk 1 (~L43) — imports
 
-Pulls in the new slot machinery: `L1World`, `L1ManagerExec`, `L2BlockProbeExec`,
-`build::PrefixState`. Mechanical.
+Pulls in the new slot machinery: `L1SlotState`, `L1TargetSession`, `InboundL2TargetSession`,
+`build::SyncBlockState`. Mechanical.
 
 ## Hunk 2 (~L125) — `CrossChainWiring`: erased clients out, concrete handles in
 
@@ -1190,20 +1190,20 @@ Pulls in the new slot machinery: `L1World`, `L1ManagerExec`, `L2BlockProbeExec`,
 by one field:
 
 ```rust
-pub local: crate::local::LocalSlotHandles,   // { l1_entry, l2_entry: Arc<LocalChainClient> }
+pub local: crate::local::LocalComposeClients,   // { l1_entry, l2_entry: Arc<LocalChainClient> }
 ```
 
 **Why:** the drain now needs surfaces the erased `ChainClient` trait does not
-expose — `L1World::open`, `simulate_source_tx_on(.., state, env)`. Same
+expose — `L1SlotState::open`, `simulate_source_tx_on(.., state, env)`. Same
 instances that are registered in `rollups`; they share one overlay channel, so
 this is a second *view*, not a second client. It is a required field, not an
 `Option`: exactly one construction site exists
 (`eez-node/src/main.rs:697`) and it always has both.
 
-## Hunk 3 (~L137) — `simulate_and_resolve` / `simulate_and_resolve_recorded_for` deleted, `simulate_chained` added
+## Hunk 3 (~L137) — `simulate_and_resolve` / `simulate_and_resolve_recorded_for` deleted, `compose_chained` added
 
 Both `CrossChainWiring` methods are gone, replaced by a free function
-`simulate_chained(cc, entry_rollup_id, entry_client, raw_tx, sessions,
+`compose_chained(cc, entry_rollup_id, entry_client, raw_tx, sessions,
 source_state, source_env)`. Same pipeline (reset overlays → build the `Rollup`
 map → source-sim through the `CompositionBuilder` → `finalize`), three
 differences:
@@ -1239,10 +1239,10 @@ session. It is raised as `ExecutorErrorKind::Unavailable`, which
 transaction's fault, so the slot aborts and retries rather than evicting a
 user's tx.
 
-Helpers added alongside: `type SlotSessions` and `one_session()` — every drain
+Helpers added alongside: `type SlotSessions` and `seed_session()` — every drain
 composition seeds exactly one target chain.
 
-The `#[tracing::instrument]` span is carried over onto `simulate_chained`
+The `#[tracing::instrument]` span is carried over onto `compose_chained`
 (`skip_all`, fields `tx_len` + `entry_rollup_id`); the log line loses its
 `simulate_and_resolve:` prefix.
 
@@ -1294,7 +1294,7 @@ point (an 8M reserve must not let a 5M `EEZ_MAX_POSTBATCH_GAS` through).
 ## Hunk 6 (~L393) — reserve in the clamp-failure event + doc reference rename
 
 The `reserve = …` field on the out-of-range ERROR event reads the accessor.
-`sim_error_is_poison`'s doc now names `simulate_chained`. Mechanical.
+`sim_error_is_poison`'s doc now names `compose_chained`. Mechanical.
 
 ## Hunk 7 (~L547) — five new drain helpers
 
@@ -1311,13 +1311,13 @@ All private, all small:
   untouched other phase. Replaces the old inline
   `let mut rest = vec![held]; rest.extend(iter.by_ref()…)` idiom, which no
   longer covers the second phase.
-- **`append_all(&mut PrefixState, &[Bytes]) -> Option<(usize, String)>`** —
+- **`append_and_execute(&mut SyncBlockState, &[Bytes]) -> Option<(usize, String)>`** —
   appends txs to the block-in-progress, stopping at the first that reverts or
   fails to execute. `Some((position, why))` means the block is **half-extended**
   and must be reopened.
-- **`harvest_l1_cache(&mut SlotSessions, rollup_id)`** — removes the L1 session,
+- **`take_l1_cache(&mut SlotSessions, rollup_id)`** — removes the L1 session,
   `checkpoint()`s it, downcasts to `revm::database::CacheState`. The payload
-  shape is pinned by contract in `L1ManagerExec`'s doc comment
+  shape is pinned by contract in `L1TargetSession`'s doc comment
   (`local/slot.rs:164-170`); this is the one place that depends on it, and it
   errors rather than assumes.
 - **`truncated_hex`** — first 32 bytes of a revert payload for event messages.
@@ -1350,8 +1350,8 @@ common empty-drain slot opens no state at all, and the degrade path below
 re-queues exactly the post-stale set (stale txs have already been released).
 
 ```rust
-let reopen = |txs: &[Bytes]| PrefixState::open(l2_dyn.clone(), …, txs);
-let slot_ctx = L1World::open(&local.l1_entry).and_then(|world| reopen(&[]).map(…));
+let reopen = |txs: &[Bytes]| SyncBlockState::open(l2_dyn.clone(), …, txs);
+let slot_ctx = L1SlotState::open(&local.l1_entry).and_then(|world| reopen(&[]).map(…));
 ```
 
 - `reopen` **rebuilds from the accepted tx list**, it does not restore a cached
@@ -1408,9 +1408,9 @@ one loop) becomes its own `while let Some((idx, held)) = out_iter.next()` loop.
 The poison-gap pre-check at the top is unchanged (now duplicated, once per
 phase).
 
-**Contexts.** Per tx: an `L1ManagerExec` over a clone of the L1 world cache
+**Contexts.** Per tx: an `L1TargetSession` over a clone of the L1 world cache
 (this replays real `EEZ._processNCalls` frames — proxy auto-creation, escrow
-value drawn from EEZ's balance) plus a `prefix.fork()` of the block. The source
+value drawn from EEZ's balance) plus a `draft.fork()` of the block. The source
 sim runs the user tx on the L2 prefix fork through `local.l2_entry` (the L2
 follower client errors `Unavailable` for source sim, hence the entry client).
 Failure to build either context is transient → abort with `abort_rest(Some(this),
@@ -1427,10 +1427,10 @@ edit is the comment naming `check_entry_shape` instead of `reject_multicall`.
 // Block first, world second: a pair evicted at append must leave the L1 world untouched.
 let pairs_k = build_outbound_pair(&l1_entries[0], &held.raw_tx, &stf_cfg, nonce + system_txs_appended)?;
 let pair_txs = interleave_sync_block_txs(&pairs_k);
-if let Some((at, why)) = append_all(&mut prefix, &pair_txs) { … evict … prefix = reopen(&sync_txs)? … }
+if let Some((at, why)) = append_and_execute(&mut draft, &pair_txs) { … evict … draft = reopen(&sync_txs)? … }
 sync_txs.extend(pair_txs);
 system_txs_appended += pairs_k.len() as u64;
-match harvest_l1_cache(&mut sessions, cc.entry_rollup_id) { Ok(cache) => l1_world.cache = cache, … }
+match take_l1_cache(&mut sessions, cc.entry_rollup_id) { Ok(cache) => l1_state.cache = cache, … }
 ```
 
 Four things to notice:
@@ -1448,10 +1448,10 @@ Four things to notice:
    the block prefix, the tx is evicted (`cc_compose.append_reverted`) — it can
    never have landed on-chain either.
 3. **The prefix is reopened from `sync_txs` on append failure**, because a failed
-   `append_all` may be half-applied (the load succeeded, the user tx reverted).
+   `append_and_execute` may be half-applied (the load succeeded, the user tx reverted).
    Rebuilding from the accepted list is the only truth. If the rebuild itself
    fails, that is transient → abort.
-4. **Block first, world second.** `l1_world.cache` is only overwritten after the
+4. **Block first, world second.** `l1_state.cache` is only overwritten after the
    pair is safely in the block. A tx evicted at append leaves the L1 world
    byte-identical to before it was tried. If the session hand-off is what fails
    (`cc_compose.l1_session_lost`, ERROR), the slot cannot chain L1 any more and
@@ -1465,14 +1465,14 @@ NOT `survivor_comps`), except `pending_out.push` is now a single push of
 `len() > 1` was evicted above — and `survivors.push((idx, held))`.
 
 The poison/transient arms below are unchanged in classification; the transient
-one just uses `abort_rest` and renames the error prefix to `simulate_chained
+one just uses `abort_rest` and renames the error prefix to `compose_chained
 outbound tx#…`.
 
 ## Hunk 13 cont. (~L2035) — PHASE 2, inbound (L1→L2)
 
 Mirror image. Source sim runs the L1 user tx on a fork of the world
-(`l1_world.fork_state`); the L2 side is an `L2BlockProbeExec` over
-`prefix.fork()`, seeded with the current delivery nonce cursor, which builds the
+(`l1_state.fork_state`); the L2 side is an `InboundL2TargetSession` over
+`draft.fork()`, seeded with the current delivery nonce cursor, which builds the
 canonical delivery, executes it on the fork, and reads the claim off the real
 `EEZL2 → proxy` frame.
 
@@ -1517,7 +1517,7 @@ records `2`, and tx#2 records `3`; the block is signed. And if a claim ever
 freezing the slot.
 
 Then, in this order: `system_txs_appended += deliveries.len()`,
-`sync_txs.extend(deliveries)`, and finally `l1_world.cache = l1_state.cache` —
+`sync_txs.extend(deliveries)`, and finally `l1_state.cache = l1_fork.cache` —
 the source fork's committed writes become the world so later inbound sims see
 their predecessors. Same block-first/world-second discipline as phase 1. The
 returned sessions are dropped (`_sessions`): the probe's fork is throwaway; only
@@ -1633,7 +1633,7 @@ first reader in the process fixes the value for all of them.
 | Shape-error message wording | `"inbound system transaction uses an unsupported execution shape"` (one string for all shapes) | direction-tagged, shape-naming strings from `check_entry_shape` (`"N>=2 multi-call inbound entry not yet supported (l2ToL1Calls=2)…"`, `"nested outbound entry materialization is not supported"`, …) |
 | Error precedence when both directions are malformed in the post-drain rebuild | outbound shape error reported first (phase 1 built before inbound was checked) | inbound gate runs first in `build_cross_chain_sync_pairs`, so the inbound error wins — reachable only if the per-tx gates are bypassed. *(The ordering change itself lives in `eez-protocol/src/system_tx.rs`; it surfaces here as the `sync_pairs_failed` message.)* |
 | Public API | `CrossChainWiring::simulate_and_resolve` / `::simulate_and_resolve_recorded_for` exported | both deleted (zero live callers after the drain rework); with them goes the last unchained composition path anyone could call by accident |
-| `CrossChainWiring` construction | `entry_client` + `l2_entry_client` erased `ChainClient`s | one required `local: LocalSlotHandles` |
+| `CrossChainWiring` construction | `entry_client` + `l2_entry_client` erased `ChainClient`s | one required `local: LocalComposeClients` |
 | Tracing | `composer.simulate.start` logged `"simulate_and_resolve: starting…"` | `"starting composition pipeline"`; new events `phase2.slot_anchored`, `phase2.slot_setup_failed`, `phase2.canonical_mismatch`, `phase2.final_receipt_failed`, `cc_compose.shape_evicted`, `cc_compose.append_reverted`, `cc_compose.l1_session_lost`. No existing event was renamed in this file. |
 
 
@@ -1967,9 +1967,9 @@ Assertions:
   drain". This pins the FIFO-per-direction guarantee from design §3.
 - L1's `CallResult` return values are `[1, 6]`, i.e. the L1 world really advanced
   between the two source simulations (design §4 step 6: commit the
-  `L1ManagerExec` fork into the L1 world on accept).
+  `L1TargetSession` fork into the L1 world on accept).
 
-This is the test that specifically covers `L1World` advancement; tests 1 and 3
+This is the test that specifically covers `L1SlotState` advancement; tests 1 and 3
 cover the L2 block-prefix side. Together they cover both halves of "the world
 advances only by real frames."
 
@@ -2130,8 +2130,8 @@ the constructor result), and the erasure happens once, after the match:
 `let entry_client_view: Arc<dyn ChainClient + Send + Sync> = l1_entry_client.clone();`
 
 **Why.** The same instance now has to serve two consumers: the wiring's
-`rollups` map wants it erased, and the new `LocalSlotHandles` wants it concrete
-(so the drain can reach `L1World` / `simulate_source_tx_on`). They must be *one*
+`rollups` map wants it erased, and the new `LocalComposeClients` wants it concrete
+(so the drain can reach `L1SlotState` / `simulate_source_tx_on`). They must be *one*
 instance because they share a single overlay channel — two separate clients
 would mean two overlay worlds and the chained drain would silently lose effects.
 The new comment says exactly this.
@@ -2161,7 +2161,7 @@ documented (`composer.rs:140-142`) as "The same instances registered in
 `rollups` registers the `Role::Follower` client (`l2_follower_view`), while
 `local.l2_entry` is a separately constructed `Role::Entry` client over the same
 provider. Functionally fine — L2 target execution goes through
-`L2BlockProbeExec`, not through the erased client, and the follower client
+`InboundL2TargetSession`, not through the erased client, and the follower client
 deliberately errors `Unavailable` for source sims — but the comment overclaims.
 Worth a five-word correction so the next reader doesn't go hunting for a shared
 identity that isn't there.
@@ -2174,7 +2174,7 @@ longer needed now that nothing else consumes the erased view. Mechanical.
 ### 4.4 `CrossChainWiring` construction (main.rs:693–701)
 
 `entry_client` and `l2_entry_client` fields drop out; the new `local:
-LocalSlotHandles { l1_entry, l2_entry }` replaces them. Note `local` is a
+LocalComposeClients { l1_entry, l2_entry }` replaces them. Note `local` is a
 **required** field, not an `Option` — cross-chain composer mode always has an
 embedded L1 (this whole block is inside the `if embedded L1` arm), so there is no
 "wired but no local handles" state to represent. Correct call: an `Option` here
@@ -2297,8 +2297,8 @@ Two review points on this file:
 | **Port handling — `free_port()`** | stateless availability probe; `NodeHandle::spawn` kept a *separate* local used-set → the 4th node in a process could be re-handed a port an earlier node's lingering sockets still held, failing setup with "address already in use" | one process-wide `HANDED_OUT_PORTS` registry shared by every probe; a port is never handed out twice in a process; poison-tolerant lock so one panicking test doesn't cascade |
 | **Port handling — `CrossChainConfig::new`** | `free_port()` for HTTP, then a retry loop re-rolling auth until it differed from `http` and `http+1`; the implicit WS port was never reserved against later probes | `probe_unique_http_port` verifies and reserves both `http` and `http+1` in the shared registry; auth is a plain `free_port()` that cannot collide; retry loop deleted |
 | `contracts/src/Counter.sol` | no order-dependent fixture target with a scalar return | 19-line counter; `increment()`/`add()` return the new count, making the expected claim chain `1, 2, 3` readable at a glance |
-| `main.rs` L1/L2 entry clients | erased to `Arc<dyn ChainClient>` inside the match; concrete handle discarded | concrete `Arc<LocalChainClient>` bound first, erased once afterwards, so the wiring map and `LocalSlotHandles` share one instance (one overlay channel) |
-| `CrossChainWiring` fields (from main.rs's side) | `entry_client` + `l2_entry_client` (erased); `l2_entry_view` binding | both gone; required `local: LocalSlotHandles { l1_entry, l2_entry }` |
+| `main.rs` L1/L2 entry clients | erased to `Arc<dyn ChainClient>` inside the match; concrete handle discarded | concrete `Arc<LocalChainClient>` bound first, erased once afterwards, so the wiring map and `LocalComposeClients` share one instance (one overlay channel) |
+| `CrossChainWiring` fields (from main.rs's side) | `entry_client` + `l2_entry_client` (erased); `l2_entry_view` binding | both gone; required `local: LocalComposeClients { l1_entry, l2_entry }` |
 | `main.rs` / `ingress.rs` comments | referenced the deleted `simulate_and_resolve` | reworded to "the composer's chained simulation" (comment-only) |
 | `.github/workflows/ci.yml` | cross-chain job ran `--test cross_chain` | also runs `--test chained_interstate` (same serial job, same `forge build` prerequisite) |
 | **compose: signer port** | `50061` hardcoded in 3 places (signer addr, healthcheck, `EEZ_PROVER_URL`) — unmovable when the port is squatted by another worktree's processes | `${EEZ_SIGNER_PORT:-50061}` in all 3; default identical, whole stack relocatable with one export |

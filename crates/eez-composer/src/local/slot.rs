@@ -3,12 +3,13 @@
 //! Both implement [`TargetExecutionSession`], but neither approximates the
 //! protocol: each runs the real contract path the chain will run.
 //!
-//! - [`L1ManagerExec`] replays `EEZ._processNCalls`' frames (`EEZ.sol:1149-1178`)
-//!   over an [`L1World`] pinned at drain start, committing every surviving
-//!   effect so later simulations in the same slot observe it.
-//! - [`L2BlockProbeExec`] executes the canonical delivery system tx on a fork
-//!   of the Sync block under construction and reads the claim off the real
-//!   `EEZL2 → proxy` frame (`EEZL2.sol:547-552`) captured by
+//! - [`L1TargetSession`] replays `EEZ._processNCalls`' frames
+//!   (`EEZ.sol:1149-1178`) over an [`L1SlotState`] pinned at drain start,
+//!   committing every surviving effect so later simulations in the same slot
+//!   observe it.
+//! - [`InboundL2TargetSession`] executes the canonical delivery system tx on
+//!   a fork of the Sync block under construction and reads the claim off the
+//!   real `EEZL2 → proxy` frame (`EEZL2.sol:547-552`) captured by
 //!   [`ProbeInspector`].
 
 use std::sync::Arc;
@@ -39,9 +40,9 @@ use eez_protocol::{
     ExecutorErrorKind, ExecutorResult, RollupId, SessionSnapshot, TargetExecutionSession,
 };
 
-use super::build::{BuildError, ForkSnapshot, PrefixFork};
+use super::build::{BuildError, ForkSnapshot, SyncBlockFork};
 use super::client::LocalChainClient;
-use super::restore_synthetic_caller_nonce;
+use super::reset_frame_caller_nonce;
 use super::session::{DIRECT_CALL_GAS_LIMIT, evm_err, provider_err};
 
 /// The concrete local clients slot-scoped composition needs, alongside the
@@ -49,7 +50,8 @@ use super::session::{DIRECT_CALL_GAS_LIMIT, evm_err, provider_err};
 /// instance the wiring's rollups map holds (they must share one overlay
 /// channel); `l2_entry` is the dedicated L2 ENTRY client (the map holds the
 /// L2 follower). The erased trait hides the simulation surfaces
-/// ([`L1World`], [`LocalChainClient::simulate_source_tx_on`]) the drain drives.
+/// ([`L1SlotState`], [`LocalChainClient::simulate_source_tx_on`]) the drain
+/// drives.
 ///
 /// L2's two instances have SEPARATE overlay channels, so during an outbound
 /// composition a nested call from the L1 target back into L2 re-enters through
@@ -58,7 +60,7 @@ use super::session::{DIRECT_CALL_GAS_LIMIT, evm_err, provider_err};
 /// nested compositions are shape-gated to eviction; supporting them requires
 /// unifying the two L2 clients' channels first.
 #[derive(Debug, Clone)]
-pub struct LocalSlotHandles {
+pub struct LocalComposeClients {
     /// L1 entry client — the world the outbound manager frames run on.
     pub l1_entry: Arc<LocalChainClient>,
     /// L2 entry client — the chain whose Sync block is under construction.
@@ -108,14 +110,14 @@ fn fork_err(e: BuildError) -> ExecutorError {
 /// block later regardless, and a moving base would make claims depend on
 /// wall-clock arrival order (design §5, "L1 base drift").
 #[derive(Debug)]
-pub struct L1World {
+pub struct L1SlotState {
     /// L1 head at drain start; every fork opens its state here.
     pub anchor: SealedHeader<Header>,
     /// Effects committed by surviving transactions, seeded into each fork.
     pub cache: CacheState,
 }
 
-impl L1World {
+impl L1SlotState {
     /// Pin the client's best block and start with an empty effect cache.
     ///
     /// # Errors
@@ -192,16 +194,16 @@ impl L1World {
 // ── L1 manager execution ─────────────────────────────────────────
 
 /// Target-chain session that replays `EEZ._processNCalls`' frames on a fork of
-/// the [`L1World`].
+/// the [`L1SlotState`].
 ///
 /// ## Checkpoint payload contract
 ///
 /// [`checkpoint`](TargetExecutionSession::checkpoint) returns a boxed
 /// [`CacheState`] and nothing else. The drain relies on that: it reclaims the
 /// session through `CompositionBuilder::take_sessions`, calls `checkpoint()`,
-/// downcasts to `CacheState`, and commits it into `L1World::cache` on
+/// downcasts to `CacheState`, and commits it into `L1SlotState::cache` on
 /// survivor-accept. Changing the payload type breaks that hand-off.
-pub struct L1ManagerExec {
+pub struct L1TargetSession {
     client: Arc<LocalChainClient>,
     evm_config: EthEvmConfig,
     state: State<StateProviderDatabase<StateProviderBox>>,
@@ -210,16 +212,16 @@ pub struct L1ManagerExec {
     chain_id: u64,
 }
 
-impl std::fmt::Debug for L1ManagerExec {
+impl std::fmt::Debug for L1TargetSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("L1ManagerExec")
+        f.debug_struct("L1TargetSession")
             .field("manager", &self.manager)
             .field("chain_id", &self.chain_id)
             .finish_non_exhaustive()
     }
 }
 
-impl L1ManagerExec {
+impl L1TargetSession {
     /// Fork the L1 world: open the anchor's post-state seeded with the world's
     /// accumulated cache, under the manager-frame EVM env.
     ///
@@ -230,7 +232,7 @@ impl L1ManagerExec {
     ///
     /// Returns [`ExecutorErrorKind::Provider`] when the anchor state cannot be
     /// opened, [`ExecutorErrorKind::Evm`] when env construction fails.
-    pub fn new(world: &L1World, client: Arc<LocalChainClient>) -> ExecutorResult<Self> {
+    pub fn new(world: &L1SlotState, client: Arc<LocalChainClient>) -> ExecutorResult<Self> {
         let (state, mut evm_env) = world.open_state(&client, world.cache.clone())?;
         let chain_id = evm_env.cfg_env.chain_id;
         // Synthetic frames carry no fee market and no EOA sender; the balance
@@ -291,7 +293,7 @@ impl L1ManagerExec {
         let output = result.result.output().cloned().unwrap_or_default();
         if commit {
             let mut changes = result.state;
-            restore_synthetic_caller_nonce(&mut changes, Address::ZERO);
+            reset_frame_caller_nonce(&mut changes, Address::ZERO);
             self.state.commit(changes);
         }
         Ok(output)
@@ -346,7 +348,7 @@ impl L1ManagerExec {
     }
 }
 
-impl TargetExecutionSession for L1ManagerExec {
+impl TargetExecutionSession for L1TargetSession {
     fn execute(
         &mut self,
         req: ExecutionRequest,
@@ -414,7 +416,7 @@ impl TargetExecutionSession for L1ManagerExec {
         // committing it would tie the slot-shared world to whatever a future
         // revm decides to return in `result.state` for a revert.
         if success {
-            restore_synthetic_caller_nonce(&mut changes, self.manager);
+            reset_frame_caller_nonce(&mut changes, self.manager);
             self.state.commit(changes);
         }
 
@@ -445,7 +447,7 @@ impl TargetExecutionSession for L1ManagerExec {
     fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()> {
         let cache = snapshot
             .downcast::<CacheState>()
-            .map_err(|_e| encoding_err("L1ManagerExec::rollback: snapshot type mismatch"))?;
+            .map_err(|_e| encoding_err("L1TargetSession::rollback: snapshot type mismatch"))?;
         self.state.cache = *cache;
         Ok(())
     }
@@ -491,9 +493,9 @@ impl<CTX, I: Inspector<CTX>> Inspector<CTX> for SkipTopFrame<I> {
 
 // ── L2 block probe execution ─────────────────────────────────────
 
-/// Snapshot payload for [`L2BlockProbeExec`]: the fork's restore point plus the
-/// delivery nonce cursor, which advances per accepted delivery and must rewind
-/// with it.
+/// Snapshot payload for [`InboundL2TargetSession`]: the fork's restore point
+/// plus the delivery nonce cursor, which advances per accepted delivery and
+/// must rewind with it.
 struct ProbeSnapshot {
     fork: ForkSnapshot,
     delivery_nonce: u64,
@@ -507,28 +509,28 @@ struct ProbeSnapshot {
 /// run with that outcome folded in, which must succeed — the same on-chain
 /// compare (`EEZL2.sol:466`) the proof signer enforces; running it here turns a
 /// claim mismatch into a one-tx eviction instead of a rejected window.
-pub struct L2BlockProbeExec {
-    fork: PrefixFork,
+pub struct InboundL2TargetSession {
+    fork: SyncBlockFork,
     cfg: SystemTxContext,
     /// SYSTEM_ADDRESS nonce for the next delivery this composition appends.
     delivery_nonce: u64,
     this_rollup_id: u64,
 }
 
-impl std::fmt::Debug for L2BlockProbeExec {
+impl std::fmt::Debug for InboundL2TargetSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("L2BlockProbeExec")
+        f.debug_struct("InboundL2TargetSession")
             .field("delivery_nonce", &self.delivery_nonce)
             .field("this_rollup_id", &self.this_rollup_id)
             .finish_non_exhaustive()
     }
 }
 
-impl L2BlockProbeExec {
+impl InboundL2TargetSession {
     /// Open over `fork` (a fork of the block prefix) with the phase-2 nonce
     /// cursor for the first delivery this composition would append.
     #[must_use]
-    pub fn new(fork: PrefixFork, cfg: SystemTxContext, delivery_nonce: u64) -> Self {
+    pub fn new(fork: SyncBlockFork, cfg: SystemTxContext, delivery_nonce: u64) -> Self {
         let this_rollup_id = cfg.this_rollup_id;
         Self {
             fork,
@@ -541,7 +543,7 @@ impl L2BlockProbeExec {
     /// Build the L1-shape entry for one inbound call. `return_data` is the
     /// placeholder on the probe pass and the captured output on the real pass;
     /// the lean L2 entry (the canonical builder) supplies both hashes.
-    fn entry_for(
+    fn l1_entry_for_call(
         &self,
         req: &ExecutionRequest,
         return_data: Bytes,
@@ -594,7 +596,7 @@ impl L2BlockProbeExec {
     }
 }
 
-impl TargetExecutionSession for L2BlockProbeExec {
+impl TargetExecutionSession for InboundL2TargetSession {
     fn execute(
         &mut self,
         req: ExecutionRequest,
@@ -611,7 +613,7 @@ impl TargetExecutionSession for L2BlockProbeExec {
         // Placeholder return data: the entry hash is exact (it is computable a
         // priori) so the delivery reaches the proxy call; only the rolling-hash
         // compare afterwards can fail, and by then the frame has run.
-        let probe_entry = self.entry_for(&req, Bytes::new())?;
+        let probe_entry = self.l1_entry_for_call(&req, Bytes::new())?;
         let probe_tx = self.delivery_tx(&probe_entry)?;
 
         let snapshot = self.fork.snapshot();
@@ -655,7 +657,7 @@ impl TargetExecutionSession for L2BlockProbeExec {
         // Same state, same path, now with the observed outcome folded into the
         // rolling hash — the on-chain claim verifier. A failure here is claim
         // or state drift and the transaction must be evicted.
-        let final_entry = self.entry_for(&req, captured.output.clone())?;
+        let final_entry = self.l1_entry_for_call(&req, captured.output.clone())?;
         let final_tx = self.delivery_tx(&final_entry)?;
         let real = self.fork.execute_tx(&final_tx).map_err(fork_err)?;
         if !real.success {
@@ -667,7 +669,7 @@ impl TargetExecutionSession for L2BlockProbeExec {
         }
 
         self.delivery_nonce = self.delivery_nonce.checked_add(1).ok_or_else(|| {
-            encoding_err("SYSTEM_ADDRESS delivery nonce overflow in L2BlockProbeExec")
+            encoding_err("SYSTEM_ADDRESS delivery nonce overflow in InboundL2TargetSession")
         })?;
 
         tracing::debug!(
@@ -692,9 +694,9 @@ impl TargetExecutionSession for L2BlockProbeExec {
     }
 
     fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()> {
-        let snap = snapshot
-            .downcast::<ProbeSnapshot>()
-            .map_err(|_e| encoding_err("L2BlockProbeExec::rollback: snapshot type mismatch"))?;
+        let snap = snapshot.downcast::<ProbeSnapshot>().map_err(|_e| {
+            encoding_err("InboundL2TargetSession::rollback: snapshot type mismatch")
+        })?;
         self.fork.restore(snap.fork);
         self.delivery_nonce = snap.delivery_nonce;
         Ok(())

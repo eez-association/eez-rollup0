@@ -109,10 +109,10 @@ For each held tx (canonical order):
    intra-tx; keep the `a5411b4` semantics).
 2. Construct per-composition executors, injected via the existing
    `CompositionBuilder::with_sessions` (`eez-protocol/src/composition.rs:211`):
-   - `L1ManagerExec` — fork = clone of the L1 world cache over the pinned
+   - `L1TargetSession` — fork = clone of the L1 world cache over the pinned
      anchor.
-   - `L2BlockProbeExec` — fork = open prefix state of `sync_txs`; tracks the
-     delivery nonce cursor.
+   - `InboundL2TargetSession` — fork = open prefix state of `sync_txs`; tracks
+     the delivery nonce cursor.
    Both accumulate across `execute()` calls *within* the composition (a
    source tx dispatching several calls sees its own earlier effects) and
    implement real `checkpoint`/`rollback` (cache clone/restore) so the
@@ -132,7 +132,7 @@ For each held tx (canonical order):
      (`build_l2_outbound_entry` + `build_outbound_load_table_txs` at nonce
      `N+k`) to `sync_txs`; execute the extended prefix; **both receipts must
      succeed**, else evict the tx, truncate, continue. Commit the
-     `L1ManagerExec` fork into the L1 world.
+     `L1TargetSession` fork into the L1 world.
    - inbound: append the canonical delivery txs
      (`build_inbound_system_txs` at the phase-2 nonce cursor); execute;
      receipts must succeed (they re-run the on-chain claim compare — this is
@@ -216,7 +216,7 @@ Gas-dependent target behavior is out of scope on both chains
 | Piece | Where |
 |---|---|
 | `open_prefix_state` (execute prefix txs, return live `State` + env), receipts surfaced from `build_sync_block` | `eez-composer/src/local/build.rs` |
-| `L1ManagerExec`, `L2BlockProbeExec`, `ProbeInspector`, L1 world | `eez-composer/src/local/slot.rs` (new) |
+| `L1TargetSession`, `InboundL2TargetSession`, `ProbeInspector`, L1 world | `eez-composer/src/local/slot.rs` (new) |
 | `simulate_source_tx_with` (explicit base header/state, returns post `CacheState`) | `eez-composer/src/local/client.rs` |
 | Concrete local handles on the wiring | `eez-composer/src/composer.rs` (`CrossChainWiring`), populated by `eez-node/src/main.rs` |
 | Two-phase drain, accept/evict protocol, asserts | `eez-composer/src/composer.rs::compose_cross_chain_batch` |

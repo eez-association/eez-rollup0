@@ -23,7 +23,7 @@ use eez_protocol::{
 };
 
 use super::provider::ChainProvider;
-use super::restore_synthetic_caller_nonce;
+use super::reset_frame_caller_nonce;
 
 /// Gas cap for simulated direct target calls; exhaustion is returned as an
 /// unsuccessful execution outcome.
@@ -199,7 +199,7 @@ impl LocalExecutionSession {
                 result.state,
             )
         };
-        restore_synthetic_caller_nonce(&mut changes, caller);
+        reset_frame_caller_nonce(&mut changes, caller);
         Ok(self.commit_and_finish(return_data, gas_used, success, changes))
     }
 
@@ -239,7 +239,7 @@ impl LocalExecutionSession {
         if let Some(err) = inspector_error {
             return Err(err);
         }
-        restore_synthetic_caller_nonce(&mut changes, caller);
+        reset_frame_caller_nonce(&mut changes, caller);
         Ok(self.commit_and_finish(return_data, gas_used, success, changes))
     }
 

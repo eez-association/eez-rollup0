@@ -52,7 +52,7 @@ pub use ingress::Direction;
 
 #[doc(inline)]
 pub use local::{
-    BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient, LocalSlotHandles,
+    BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient, LocalComposeClients,
     build_sync_block,
 };
 pub use optimistic::OptimisticallyIncluded;

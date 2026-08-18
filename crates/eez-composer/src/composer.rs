@@ -44,8 +44,8 @@ use tracing::{Level, event};
 use crate::held_pool::HeldTx;
 use crate::ingress::Direction;
 use crate::local::{
-    BuildError, L1ManagerExec, L1World, L2BlockProbeExec, build::PrefixState, build_sync_block,
-    sync_block_pair_roots,
+    BuildError, InboundL2TargetSession, L1SlotState, L1TargetSession, build::SyncBlockState,
+    build_sync_block, sync_block_pair_roots,
 };
 use crate::optimistic::OptimisticallyIncluded;
 use crate::rollup::RollupState;
@@ -138,9 +138,9 @@ pub struct CrossChainWiring {
     /// composition batches.
     pub exec_ctx: Arc<CrossChainExecCtx>,
     /// Concrete local clients for slot-scoped chained composition, un-erased so
-    /// the drain can reach `L1World` and `simulate_source_tx_on`. The same
+    /// the drain can reach `L1SlotState` and `simulate_source_tx_on`. The same
     /// instances registered in `rollups`; they share one overlay channel.
-    pub local: crate::local::LocalSlotHandles,
+    pub local: crate::local::LocalComposeClients,
 }
 
 /// Target sessions for one composition, keyed by the rollup they execute on.
@@ -149,7 +149,7 @@ type SlotSessions =
 
 /// A one-entry [`SlotSessions`] — every drain composition seeds exactly one
 /// target chain.
-fn one_session(
+fn seed_session(
     rollup_id: eez_protocol::RollupId,
     session: impl eez_protocol::TargetExecutionSession + 'static,
 ) -> SlotSessions {
@@ -172,13 +172,13 @@ fn one_session(
 // Preserve the protocol crate's structured public error type.
 #[allow(clippy::result_large_err)]
 #[tracing::instrument(skip_all, fields(tx_len = raw_tx.len(), %entry_rollup_id))]
-fn simulate_chained(
+fn compose_chained(
     cc: &CrossChainWiring,
     entry_rollup_id: eez_protocol::RollupId,
     entry_client: &crate::local::LocalChainClient,
     raw_tx: &[u8],
     sessions: SlotSessions,
-    source_state: &mut crate::local::build::PrefixDb,
+    source_state: &mut crate::local::build::DraftDb,
     source_env: reth_evm::EvmEnvFor<EthEvmConfig>,
 ) -> eez_protocol::ComposerResult<(eez_protocol::Composition, SlotSessions)> {
     use eez_protocol::ChainClient as _;
@@ -275,7 +275,7 @@ impl std::fmt::Debug for CrossChainWiring {
 /// evicted so they cannot block the FIFO queue indefinitely.
 ///
 /// Drain-time simulations are chained per chain in canonical order
-/// (`simulate_chained` over the slot's L1 world and the Sync block under
+/// (`compose_chained` over the slot's L1 world and the Sync block under
 /// construction — `docs/CHAINED-INTERSTATE-DESIGN.md`), so a co-bundled
 /// prerequisite is already visible when its dependant composes. What this bound
 /// backstops is the residual: L1 state that moves between compose time and the
@@ -399,7 +399,7 @@ fn clamp_max_postbatch_gas(requested: u64) -> u64 {
     DEFAULT_MAX_POSTBATCH_GAS
 }
 
-/// Classify a [`simulate_chained`] failure. `true` = DETERMINISTIC:
+/// Classify a [`compose_chained`] failure. `true` = DETERMINISTIC:
 /// the composition is structurally invalid for this tx (no cross-chain
 /// call / revert / bad encoding), so the tx is poison and must be
 /// evicted before it can enter — and perpetually drop — a bundle.
@@ -573,7 +573,7 @@ fn abort_rest(
 /// that will not land. `Some((position, why))` means the block is half-extended
 /// and must be reopened on the accepted list. `why` carries its class, so the
 /// caller can tell a rejected tx from an unreachable backing store.
-fn append_all(prefix: &mut PrefixState, txs: &[Bytes]) -> Option<(usize, BuildError)> {
+fn append_and_execute(prefix: &mut SyncBlockState, txs: &[Bytes]) -> Option<(usize, BuildError)> {
     for (at, tx) in txs.iter().enumerate() {
         match prefix.execute_tx(tx) {
             Ok(outcome) if outcome.success => {}
@@ -593,9 +593,9 @@ fn append_all(prefix: &mut PrefixState, txs: &[Bytes]) -> Option<(usize, BuildEr
 }
 
 /// Take the L1 session's accumulated effects for commit into the slot's world.
-/// The payload shape is pinned by `L1ManagerExec::checkpoint`: a boxed
+/// The payload shape is pinned by `L1TargetSession::checkpoint`: a boxed
 /// `CacheState` and nothing else.
-fn harvest_l1_cache(
+fn take_l1_cache(
     sessions: &mut SlotSessions,
     l1_rollup_id: eez_protocol::RollupId,
 ) -> Result<revm::database::CacheState, String> {
@@ -1656,7 +1656,7 @@ where
         // keeps the prefix provably equal to the block the canonical rebuild
         // produces.
         let reopen = |txs: &[Bytes]| {
-            PrefixState::open(
+            SyncBlockState::open(
                 l2_dyn.clone(),
                 &self.inner.evm_config,
                 parent_header,
@@ -1665,14 +1665,14 @@ where
                 txs,
             )
         };
-        let slot_ctx = L1World::open(&local.l1_entry)
-            .map_err(|e| format!("L1World::open: {e}"))
+        let slot_ctx = L1SlotState::open(&local.l1_entry)
+            .map_err(|e| format!("L1SlotState::open: {e}"))
             .and_then(|world| {
                 reopen(&[])
-                    .map(|prefix| (world, prefix))
-                    .map_err(|e| format!("PrefixState::open: {e}"))
+                    .map(|draft| (world, draft))
+                    .map_err(|e| format!("SyncBlockState::open: {e}"))
             });
-        let (mut l1_world, mut prefix) = match slot_ctx {
+        let (mut l1_state, mut draft) = match slot_ctx {
             Ok(contexts) => contexts,
             Err(e) => {
                 event!(
@@ -1703,8 +1703,8 @@ where
             name: "eez.composer.phase2.slot_anchored",
             Level::INFO,
             rollup_id,
-            l1_anchor = l1_world.anchor.number(),
-            l1_anchor_hash = %l1_world.anchor.hash(),
+            l1_anchor = l1_state.anchor.number(),
+            l1_anchor_hash = %l1_state.anchor.hash(),
             drained = drained.len(),
             "L1 world pinned and Sync block prefix opened for this slot",
         );
@@ -1778,13 +1778,13 @@ where
                 continue;
             }
 
-            let contexts = L1ManagerExec::new(&l1_world, local.l1_entry.clone())
-                .map_err(|e| format!("L1ManagerExec::new: {e}"))
+            let contexts = L1TargetSession::new(&l1_state, local.l1_entry.clone())
+                .map_err(|e| format!("L1TargetSession::new: {e}"))
                 .and_then(|exec| {
-                    prefix
+                    draft
                         .fork()
                         .map(|fork| (exec, fork))
-                        .map_err(|e| format!("PrefixState::fork: {e}"))
+                        .map_err(|e| format!("SyncBlockState::fork: {e}"))
                 });
             let (l1_exec, mut fork) = match contexts {
                 Ok(contexts) => contexts,
@@ -1800,10 +1800,10 @@ where
                     break;
                 }
             };
-            let sessions = one_session(cc.entry_rollup_id, l1_exec);
+            let sessions = seed_session(cc.entry_rollup_id, l1_exec);
             let (state, env) = fork.state_and_env();
             let env = env.clone();
-            let sim = simulate_chained(
+            let sim = compose_chained(
                 cc,
                 eez_protocol::RollupId(rollup_id),
                 &local.l2_entry,
@@ -1911,7 +1911,7 @@ where
                         }
                     };
                     let pair_txs = eez_protocol::system_tx::interleave_sync_block_txs(&pairs_k);
-                    if let Some((at, why)) = append_all(&mut prefix, &pair_txs) {
+                    if let Some((at, why)) = append_and_execute(&mut draft, &pair_txs) {
                         // A backing-store failure says nothing about the tx —
                         // abort the slot instead of evicting a valid pair.
                         if why.is_provider() {
@@ -1938,7 +1938,7 @@ where
                         push_poison_root(&mut poison, &mut poison_gaps, held);
                         // A failed append may be half-applied; the accepted
                         // list is the only truth to rebuild from.
-                        prefix = match reopen(&sync_txs) {
+                        draft = match reopen(&sync_txs) {
                             Ok(rebuilt) => rebuilt,
                             Err(e) => {
                                 transient = Some((
@@ -1960,8 +1960,8 @@ where
                     }
 
                     // The world advances only now, behind the accepted block.
-                    match harvest_l1_cache(&mut sessions, cc.entry_rollup_id) {
-                        Ok(cache) => l1_world.cache = cache,
+                    match take_l1_cache(&mut sessions, cc.entry_rollup_id) {
+                        Ok(cache) => l1_state.cache = cache,
                         Err(e) => {
                             event!(
                                 name: "eez.composer.cc_compose.l1_session_lost",
@@ -2006,7 +2006,7 @@ where
                 }
                 Err(e) => {
                     transient = Some((
-                        format!("simulate_chained outbound tx#{idx}: {e}"),
+                        format!("compose_chained outbound tx#{idx}: {e}"),
                         abort_rest(
                             Some((idx, held)),
                             &mut out_iter,
@@ -2047,19 +2047,19 @@ where
                 continue;
             }
 
-            let contexts = prefix
+            let contexts = draft
                 .fork()
-                .map_err(|e| format!("PrefixState::fork: {e}"))
+                .map_err(|e| format!("SyncBlockState::fork: {e}"))
                 .map(|fork| {
-                    L2BlockProbeExec::new(fork, stf_cfg.clone(), nonce + system_txs_appended)
+                    InboundL2TargetSession::new(fork, stf_cfg.clone(), nonce + system_txs_appended)
                 })
                 .and_then(|probe| {
-                    l1_world
+                    l1_state
                         .fork_state(&local.l1_entry)
                         .map(|source| (probe, source))
-                        .map_err(|e| format!("L1World::fork_state: {e}"))
+                        .map_err(|e| format!("L1SlotState::fork_state: {e}"))
                 });
-            let (probe, (mut l1_state, l1_env)) = match contexts {
+            let (probe, (mut l1_fork, l1_env)) = match contexts {
                 Ok(contexts) => contexts,
                 Err(e) => {
                     transient = Some((
@@ -2069,14 +2069,14 @@ where
                     break;
                 }
             };
-            let sessions = one_session(eez_protocol::RollupId(rollup_id), probe);
-            let sim = simulate_chained(
+            let sessions = seed_session(eez_protocol::RollupId(rollup_id), probe);
+            let sim = compose_chained(
                 cc,
                 cc.entry_rollup_id,
                 &local.l1_entry,
                 held.raw_tx.as_ref(),
                 sessions,
-                &mut l1_state,
+                &mut l1_fork,
                 l1_env,
             );
             match sim {
@@ -2160,7 +2160,7 @@ where
                     // The delivery re-runs the on-chain claim compare, so this
                     // append IS the verifier: a revert means the claims and the
                     // block disagree and the tx must go.
-                    if let Some((at, why)) = append_all(&mut prefix, &deliveries) {
+                    if let Some((at, why)) = append_and_execute(&mut draft, &deliveries) {
                         // A backing-store failure says nothing about the tx —
                         // abort the slot instead of evicting a valid delivery.
                         if why.is_provider() {
@@ -2181,7 +2181,7 @@ where
                             "inbound delivery does not execute on the Sync block prefix; evicting the tx and rebuilding the prefix",
                         );
                         push_poison_root(&mut poison, &mut poison_gaps, held);
-                        prefix = match reopen(&sync_txs) {
+                        draft = match reopen(&sync_txs) {
                             Ok(rebuilt) => rebuilt,
                             Err(e) => {
                                 transient = Some((
@@ -2197,7 +2197,7 @@ where
                     sync_txs.extend(deliveries);
                     // The source fork carries the L1 user tx's committed writes;
                     // later inbound sims must observe them (design §4 step 6).
-                    l1_world.cache = l1_state.cache;
+                    l1_state.cache = l1_fork.cache;
 
                     let target_count = target_entries.len();
                     pending_in.extend(target_entries);
@@ -2230,7 +2230,7 @@ where
                     // Transient (provider / transport / unavailable) —
                     // abort the slot, re-queue this tx + the remainder.
                     transient = Some((
-                        format!("simulate_chained inbound tx#{idx}: {e}"),
+                        format!("compose_chained inbound tx#{idx}: {e}"),
                         abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
                     ));
                     break;

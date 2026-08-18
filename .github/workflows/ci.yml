@@ -135,4 +135,4 @@ jobs:
         working-directory: contracts
         run: forge build
       - name: Integration tests (cross-chain, serial)
-        run: cargo nextest run -p eez-node --test cross_chain --test-threads=1 --no-fail-fast
+        run: cargo nextest run -p eez-node --test cross_chain --test chained_interstate --test-threads=1 --no-fail-fast

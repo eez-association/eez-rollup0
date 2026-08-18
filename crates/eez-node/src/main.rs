@@ -694,7 +694,7 @@ fn main() -> eyre::Result<()> {
                         entry_rollup_id: l1_rollup_id,
                         rollups: wired_rollups,
                         exec_ctx,
-                        local: eez_composer::LocalSlotHandles {
+                        local: eez_composer::LocalComposeClients {
                             l1_entry: l1_entry_client,
                             l2_entry: l2_entry_client,
                         },
