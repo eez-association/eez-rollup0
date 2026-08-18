@@ -96,14 +96,15 @@ async fn prove_with_retry_at(
     let mut attempt = 1_u32;
 
     loop {
-        let result = match timeout(timing.proof_time(), prover.prove(ctx.clone())).await {
+        let attempt_timeout = match target {
+            BundleTarget::NextBlock => retry_deadline.saturating_duration_since(Instant::now()),
+            BundleTarget::Exact { .. } => timing.proof_time(),
+        };
+        let result = match timeout(attempt_timeout, prover.prove(ctx.clone())).await {
             Ok(result) => result,
             Err(_) => Err(ProverError::Retryable {
                 kind: RetryableProverError::DeadlineExceeded,
-                message: format!(
-                    "Composer proof attempt exceeded its {:?} budget",
-                    timing.proof_time()
-                ),
+                message: format!("Composer proof attempt exceeded its {attempt_timeout:?} budget"),
             }),
         };
         let error = match result {
@@ -233,6 +234,26 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct DelayedFailureThenStallProver {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Prover for DelayedFailureThenStallProver {
+        async fn prove(&self, _ctx: ProvingContext) -> Result<Bytes, ProverError> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                return Err(retryable(RetryableProverError::Unavailable));
+            }
+            std::future::pending().await
+        }
+
+        fn vkey(&self) -> B256 {
+            B256::ZERO
+        }
+    }
+
     fn retryable(kind: RetryableProverError) -> ProverError {
         ProverError::Retryable {
             kind,
@@ -330,6 +351,30 @@ mod tests {
             Some(RetryableProverError::DeadlineExceeded)
         );
         assert_eq!(prover.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn next_block_retry_attempt_uses_only_the_remaining_budget() {
+        let timing = RollupTiming::new(3_000, 1_000, 1_000, 100);
+        let prover = DelayedFailureThenStallProver::default();
+        let started = Instant::now();
+
+        let error = prove_with_retry_at(
+            &prover,
+            ProvingContext::default(),
+            timing,
+            BundleTarget::NextBlock,
+            TEST_NOW_MS,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.retryable_kind(),
+            Some(RetryableProverError::DeadlineExceeded)
+        );
+        assert_eq!(prover.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(Instant::now().duration_since(started), timing.proof_time());
     }
 
     #[tokio::test(start_paused = true)]
