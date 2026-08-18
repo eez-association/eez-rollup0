@@ -3,7 +3,7 @@
 //! Deriver and Composer to consume.
 //!
 //! The watcher never picks its own baseline: [`L1Watcher::start`] takes
-//! the last block the caller already scanned (the Deriver's boot
+//! a block the caller already scanned (the Deriver's finalized-clamped
 //! catch-up endpoint) and seeds the canonical ring with it. Every poll
 //! path scans `BatchPosted` logs before committing ring state or
 //! emitting events, so a failed cycle retries the identical range next
@@ -222,9 +222,9 @@ impl L1Watcher {
     }
 
     /// Spawns the polling task on the current tokio runtime, seeded at
-    /// `seed_number`/`seed_hash` — the last L1 block the caller already
-    /// scanned (the Deriver's boot catch-up endpoint). The watcher owns
-    /// and scans everything strictly after it. Call once, after all
+    /// `seed_number`/`seed_hash` — a block the caller already scanned
+    /// (the Deriver's finalized-clamped catch-up endpoint). The watcher
+    /// owns and scans everything strictly after it. Call once, after all
     /// subscribers exist.
     pub fn start(&self, seed_number: u64, seed_hash: B256) {
         let runner = self.clone();
@@ -386,11 +386,9 @@ impl L1Watcher {
                 // invalidates the boundary itself exceeds the ring
                 // and halts loudly with ReorgTooDeep. Mid-catch-up
                 // boundaries sit ≥ LOG_SCAN_CHUNK_BLOCKS below the
-                // live tip, out of real reorg reach, so only the
-                // final (at-latest) boundary is exposed — the same
-                // window as any post-reseed single-entry ring.
-                // Seeding several ancestors to restore near-tip
-                // tolerance across catch-up is tracked as follow-up.
+                // live tip, out of real reorg reach; the final
+                // (at-latest) boundary IS exposed, so it refills a full
+                // ancestor window instead of a single entry.
                 let scan_from = old_tip_number + 1;
                 let chunk_to = scan_from
                     .saturating_add(crate::scan::LOG_SCAN_CHUNK_BLOCKS - 1)
@@ -435,7 +433,11 @@ impl L1Watcher {
                 } else {
                     fetch_block_by_tag(provider, BlockNumberOrTag::Number(reached)).await?
                 };
-                self.emit_scanned_batches(scan_from, reached, scanned);
+                let window = if boundary.number == latest_number {
+                    fetch_ancestor_window(provider, boundary, state.reorg_max_depth).await?
+                } else {
+                    vec![(boundary.number, boundary.hash)]
+                };
                 // INFO, not WARN: fires once per chunk during
                 // routine catch-up progress; the reorg reseed
                 // below keeps its WARN.
@@ -447,16 +449,20 @@ impl L1Watcher {
                     old_tip_hash = %old_tip_hash,
                     new_tip_number = boundary.number,
                     new_tip_hash = %boundary.hash,
+                    window_len = window.len(),
                     "reseeding ring at chunk boundary — dropping all \
                      prior ring entries",
                 );
                 state.rewind_to(0);
-                state.push_canonical(boundary.number, boundary.hash);
+                for (number, hash) in window {
+                    state.push_canonical(number, hash);
+                }
                 self.emit(L1Event::NewHead {
                     block_number: boundary.number,
                     block_hash: boundary.hash,
                     timestamp: boundary.timestamp,
                 });
+                self.emit_scanned_batches(scan_from, reached, scanned);
                 return Ok(());
             }
 
@@ -754,6 +760,28 @@ async fn walk_back_to_common(
     Ok(None)
 }
 
+/// Parent-linked `(number, hash)` window ending at `boundary` (inclusive),
+/// oldest → newest, ≤ `depth` entries. Collects fully before the caller
+/// mutates the ring, so a fetch failure retries the identical chunk.
+async fn fetch_ancestor_window(
+    provider: &impl Provider,
+    boundary: BlockSnapshot,
+    depth: usize,
+) -> L1Result<Vec<(u64, B256)>> {
+    let mut collected: Vec<(u64, B256)> = Vec::with_capacity(depth);
+    collected.push((boundary.number, boundary.hash));
+    let mut parent_hash = boundary.parent_hash;
+    let mut number = boundary.number;
+    while collected.len() < depth && number > 0 {
+        let block = fetch_block_by_hash(provider, parent_hash).await?;
+        number = block.number;
+        parent_hash = block.parent_hash;
+        collected.push((number, block.hash));
+    }
+    collected.reverse();
+    Ok(collected)
+}
+
 /// Finds the most recent ring entry whose hash still matches the
 /// provider's canonical block at that height. Compares newest first,
 /// fetching by NUMBER (not hash) so the answer reflects the provider's
@@ -890,6 +918,11 @@ mod tests {
             Some((100_010, boundary_hash)),
             "ring reseeds at chunk boundary"
         );
+        assert_eq!(
+            state.recent.len(),
+            1,
+            "mid-catch-up boundary stays single-entry — out of real reorg reach"
+        );
         match rx.try_recv().expect("one event emitted") {
             L1Event::NewHead {
                 block_number,
@@ -905,7 +938,10 @@ mod tests {
         assert!(rx.try_recv().is_err(), "no further events on tick 1");
 
         // ── Tick 2: same latest → final chunk [100_011, 200_000]. Boundary
-        // == latest, so no extra boundary fetch (shortcut path).
+        // == latest (shortcut path, no extra boundary fetch); at the tip
+        // the ring refills an ancestor window (2 extra by-hash fetches).
+        let ancestor1_hash = B256::with_last_byte(0xA1);
+        let ancestor2_hash = B256::with_last_byte(0xA2);
         asserter.push_success(&mock_block(200_000, latest_hash, latest_parent, 5_000));
         asserter.push_success(&mock_block(
             100_010,
@@ -915,6 +951,9 @@ mod tests {
         ));
         asserter.push_success(&serde_json::json!([]));
         asserter.push_success(&serde_json::json!([]));
+        // Ancestor window: parent of latest, then grandparent.
+        asserter.push_success(&mock_block(199_999, latest_parent, ancestor2_hash, 4_999));
+        asserter.push_success(&mock_block(199_998, ancestor2_hash, ancestor1_hash, 4_998));
 
         watcher
             .poll_cycle(&provider, &mut state, 2)
@@ -926,6 +965,12 @@ mod tests {
             Some((200_000, latest_hash)),
             "ring reaches latest"
         );
+        assert_eq!(
+            state.recent.len(),
+            3,
+            "final at-tip boundary refills a full ancestor window"
+        );
+        assert_eq!(state.lookup_hash(latest_parent), Some(199_999));
         match rx.try_recv().expect("one event emitted") {
             L1Event::NewHead {
                 block_number,
@@ -937,6 +982,103 @@ mod tests {
             }
             other => panic!("expected NewHead at latest, got {other:?}"),
         }
+    }
+
+    /// A one-block reorg right after far-behind catch-up completes must
+    /// find its ancestor in the refilled ring — Reorg, not ReorgTooDeep.
+    #[tokio::test]
+    async fn shallow_reorg_after_far_behind_recovers() {
+        let (watcher, mut rx) = test_watcher();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let tip_hash = B256::with_last_byte(0xAA);
+        let latest_hash = B256::with_last_byte(0xBB);
+        let latest_parent = B256::with_last_byte(0xB0);
+        let grandparent_hash = B256::with_last_byte(0xA2);
+        let mut state = WatcherState::new(3);
+        state.push_canonical(10, tip_hash);
+
+        // ── Tick 1: gap (10 → 50_000) is far behind but fits in one
+        // LOG_SCAN_CHUNK_BLOCKS chunk, so the boundary lands directly on
+        // the live tip and the ring refills a 3-entry ancestor window.
+        asserter.push_success(&mock_block(50_000, latest_hash, latest_parent, 5_000));
+        asserter.push_success(&mock_block(10, tip_hash, B256::with_last_byte(9), 10)); // at_old_height check
+        asserter.push_success(&serde_json::json!([])); // BatchPosted logs
+        asserter.push_success(&serde_json::json!([])); // winner logs
+        asserter.push_success(&mock_block(49_999, latest_parent, grandparent_hash, 4_999));
+        asserter.push_success(&mock_block(
+            49_998,
+            grandparent_hash,
+            B256::with_last_byte(0xA1),
+            4_998,
+        ));
+
+        watcher
+            .poll_cycle(&provider, &mut state, 1)
+            .await
+            .expect("catch-up chunk succeeds");
+
+        assert_eq!(
+            state.recent.len(),
+            3,
+            "final boundary refills a full window"
+        );
+        assert_eq!(state.tip(), Some((50_000, latest_hash)));
+        assert_eq!(
+            state.lookup_hash(latest_parent),
+            Some(49_999),
+            "one hop back is in the ring"
+        );
+        match rx.try_recv().expect("NewHead at boundary") {
+            L1Event::NewHead { block_number, .. } => assert_eq!(block_number, 50_000),
+            other => panic!("expected NewHead, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "nothing else on tick 1");
+
+        // ── Tick 2: a one-block reorg replaces the tip — same height,
+        // new hash, parent = the ancestor the window just seeded. This
+        // must recover via Reorg, not ReorgTooDeep.
+        let replacement_hash = B256::with_last_byte(0xDD);
+        asserter.push_success(&mock_block(50_000, replacement_hash, latest_parent, 5_001));
+        asserter.push_success(&serde_json::json!([])); // BatchPosted logs
+        asserter.push_success(&serde_json::json!([])); // winner logs
+        asserter.push_success(&mock_block(50_000, replacement_hash, latest_parent, 5_001)); // fill_forward by-hash
+
+        watcher
+            .poll_cycle(&provider, &mut state, 2)
+            .await
+            .expect("shallow reorg recovers, not ReorgTooDeep");
+
+        match rx.try_recv().expect("Reorg event") {
+            L1Event::Reorg {
+                common_ancestor_number,
+                common_ancestor_hash,
+                old_head_hash,
+                new_head_number,
+                new_head_hash,
+            } => {
+                assert_eq!(common_ancestor_number, 49_999);
+                assert_eq!(common_ancestor_hash, latest_parent);
+                assert_eq!(old_head_hash, latest_hash);
+                assert_eq!(new_head_number, 50_000);
+                assert_eq!(new_head_hash, replacement_hash);
+            }
+            other => panic!("expected Reorg, got {other:?}"),
+        }
+        match rx.try_recv().expect("NewHead after reorg") {
+            L1Event::NewHead {
+                block_number,
+                block_hash,
+                ..
+            } => {
+                assert_eq!(block_number, 50_000);
+                assert_eq!(block_hash, replacement_hash);
+            }
+            other => panic!("expected NewHead, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "nothing else emitted");
+        assert_eq!(state.tip(), Some((50_000, replacement_hash)));
     }
 
     /// A failed chunk scan advances nothing: ring tip unchanged, zero

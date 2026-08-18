@@ -864,8 +864,8 @@ fn main() -> eyre::Result<()> {
         let mut catch_up_retry_delay = BOOT_CATCH_UP_INITIAL_RETRY_DELAY;
         let mut catch_up_attempts = 0_u64;
         let (l1_seed_number, l1_seed_hash) = loop {
-            match deriver.catch_up().await {
-                Ok(endpoint) => break endpoint,
+            match deriver.catch_up_with_seed().await {
+                Ok(seed) => break seed,
                 Err(err) if err.is_source_incomplete() => {
                     catch_up_attempts += 1;
                     event!(

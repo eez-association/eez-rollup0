@@ -31,6 +31,11 @@ use tracing::{Level, event};
 
 use crate::error::{DeriverError, DeriverResult};
 
+/// Watcher-seed lag when the L1 reports no finalized block (no CL yet /
+/// dev chain): two Ethereum epochs — deeper than any realistic reorg —
+/// so the seed is effectively immutable even without finality data.
+const NO_FINALITY_SEED_LAG: u64 = 64;
+
 /// L1-derived L2 consensus engine. Cheaply [`Clone`]able.
 #[derive(Clone)]
 pub struct Deriver<L2>
@@ -147,9 +152,7 @@ where
     /// Reorg-aware catch-up from the latest canonical L1 batch already
     /// indexed locally, or from the registry deploy block if the index is
     /// empty. Scans historical `BatchPosted` events in chunks, replaying
-    /// non-matching L2 blocks and populating `L1CanonicalHead`. Returns
-    /// the inclusive L1 scan endpoint `(number, hash)` — the seed for
-    /// `L1Watcher::start`, which owns every block strictly after it.
+    /// non-matching L2 blocks and populating `L1CanonicalHead`.
     ///
     /// # Errors
     ///
@@ -159,7 +162,91 @@ where
     /// # Panics
     ///
     /// If the `batches` mutex is poisoned.
-    pub async fn catch_up(&self) -> DeriverResult<(u64, B256)> {
+    pub async fn catch_up(&self) -> DeriverResult<()> {
+        self.catch_up_inner().await.map(|_| ())
+    }
+
+    /// [`Self::catch_up`], additionally returning the seed for
+    /// `L1Watcher::start`: the finalized block, clamped to the scan
+    /// endpoint (immutable, so scan and seed can never describe different
+    /// forks) and floored at the scan's own start — the revalidated anchor
+    /// batch, or `deploy_block - 1` on an empty index. The floor keeps the
+    /// watcher out of territory this catch-up did not itself read: blocks
+    /// below it carry no unindexed events, and a minimal L1 snapshot may
+    /// not serve their logs at all (pruned history). Boot-only — recovery
+    /// callers use [`Self::catch_up`] and never pay for the seed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::catch_up`]; additionally `SourceIncomplete` while the
+    /// L1 source cannot yet serve the seed block's hash.
+    pub async fn catch_up_with_seed(&self) -> DeriverResult<(u64, B256)> {
+        let end = self.catch_up_inner().await?;
+        // Anchor floor: (block, hash) of the newest still-canonical indexed
+        // batch — just revalidated, so the hash is trusted with no extra
+        // fetch. Empty index → deploy_block - 1, hash fetched below.
+        let (floor_number, floor_hash) = match self.inner.l1_head.last_indexed() {
+            Some(tail) => (tail.l1_block, Some(tail.l1_block_hash)),
+            None => (self.inner.deploy_block.saturating_sub(1), None),
+        };
+        let (seed_number, known_hash) = match self
+            .inner
+            .submitter
+            .finalized_block()
+            .await
+            .map_err(DeriverError::l1_scan)?
+        {
+            // In [floor, end]: seed at finalized directly — the hash can
+            // never change under us.
+            Some((number, hash)) if number <= end && number >= floor_number => (number, Some(hash)),
+            // Finalized below the floor: the floor wins (pruned-safe).
+            Some((number, _)) if number <= end => (floor_number, floor_hash),
+            // Finality caught up past a long scan: the endpoint itself is
+            // finalized, so fetching its hash below is race-free.
+            Some(_) if end >= floor_number => (end, None),
+            Some(_) => (floor_number, floor_hash),
+            // No finality data: seed NO_FINALITY_SEED_LAG below the
+            // endpoint — effectively immutable anyway; warn, stay loud.
+            None => {
+                let seed = end.saturating_sub(NO_FINALITY_SEED_LAG);
+                event!(
+                    name: "eez.deriver.catch_up.no_finalized",
+                    Level::WARN,
+                    scan_end = end,
+                    seed,
+                    "L1 reports no finalized block; seeding watcher below the scan endpoint",
+                );
+                if seed <= floor_number {
+                    (floor_number, floor_hash)
+                } else {
+                    (seed, None)
+                }
+            }
+        };
+        let seed_hash = match known_hash {
+            Some(hash) => hash,
+            None => self
+                .inner
+                .submitter
+                .canonical_l1_hash(seed_number)
+                .await
+                .map_err(DeriverError::l1_scan)?
+                .ok_or_else(|| {
+                    // Not served yet (source syncing toward the deploy block)
+                    // or rewound mid-catch-up — retryable, not fatal.
+                    DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
+                        block: seed_number,
+                        tx_hash: B256::ZERO,
+                        detail: "catch-up seed block not served by the L1 source yet".into(),
+                    })
+                })?,
+        };
+        Ok((seed_number, seed_hash))
+    }
+
+    /// Shared body of [`Self::catch_up`] / [`Self::catch_up_with_seed`].
+    /// Returns the inclusive L1 block the scan covered through.
+    async fn catch_up_inner(&self) -> DeriverResult<u64> {
         let _guard = self.inner.committer.begin_reconcile().await;
         let old_cursor = self.inner.l1_head.cursor();
         let anchor = self.revalidate_index_tail().await?;
@@ -167,26 +254,10 @@ where
         if cursor < old_cursor {
             self.retreat_l2_to_cursor(cursor).await?;
         }
-        let end = match anchor {
-            Some(anchor_l1_block) => self.sync_batches_inner(anchor_l1_block, cursor).await?,
-            None => self.sync_batches_inner(self.inner.deploy_block, 0).await?,
-        };
-        let end_hash = self
-            .inner
-            .submitter
-            .canonical_l1_hash(end)
-            .await
-            .map_err(DeriverError::l1_scan)?
-            .ok_or_else(|| {
-                // The endpoint was `latest` moments ago; losing it means the
-                // source rewound mid-catch-up — retryable, not fatal.
-                DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
-                    block: end,
-                    tx_hash: B256::ZERO,
-                    detail: "catch-up endpoint block no longer served".into(),
-                })
-            })?;
-        Ok((end, end_hash))
+        match anchor {
+            Some(anchor_l1_block) => self.sync_batches_inner(anchor_l1_block, cursor).await,
+            None => self.sync_batches_inner(self.inner.deploy_block, 0).await,
+        }
     }
 
     /// Phase 1 of [`Self::catch_up`]: walk the index tail backward,
@@ -672,7 +743,7 @@ where
     /// logged and retried at the next L1 event.
     async fn try_recover(&self) -> bool {
         match self.catch_up().await {
-            Ok(_) => {
+            Ok(()) => {
                 event!(
                     name: "eez.deriver.resync.recovered",
                     Level::INFO,
