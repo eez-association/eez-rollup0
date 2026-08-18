@@ -272,6 +272,11 @@ async fn failure_wrong_rollup_id() {
         .await
         .unwrap();
 
+    chain
+        .assert_failed_post_and_verify_batch(999, common::INVALID_PROOF_SYSTEM_CONFIG_SELECTOR)
+        .await
+        .expect("wrong-rollup batch did not reach L1 structural validation");
+
     assert_eq!(chain.batches_posted().await.unwrap(), 0);
     assert_eq!(chain.executions_performed().await.unwrap(), 0);
     assert_eq!(
@@ -329,7 +334,8 @@ async fn failure_poster_funds_recovery() {
     node.assert_no_process_death();
 }
 
-/// A proof signed by an unauthorized attester never reaches L1.
+/// A proof accepted by the composer but signed by an attester unauthorized
+/// by the deployed L1 proof system reaches L1 and reverts with InvalidProof.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failure_prover_signer_mismatch() {
     let harness = Harness::fresh().await.unwrap();
@@ -355,6 +361,11 @@ async fn failure_prover_signer_mismatch() {
         .wait_for_l1_blocks(5, Duration::from_secs(30))
         .await
         .unwrap();
+
+    chain
+        .assert_failed_post_and_verify_batch(harness.dep.rollup_id, common::INVALID_PROOF_SELECTOR)
+        .await
+        .expect("unauthorized-attester batch did not reach L1 proof verification");
 
     assert_eq!(chain.batches_posted().await.unwrap(), 0);
     assert_eq!(chain.executions_performed().await.unwrap(), 0);

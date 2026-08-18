@@ -20,7 +20,7 @@ use alloy_primitives::{Address, B256, Signature, U256, address, hex};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{BlockNumHash, BlockNumberOrTag, TransactionReceipt, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::{SolCall, SolEvent, SolValue, sol};
+use alloy_sol_types::{SolCall, SolError, SolEvent, SolValue, sol};
 use anyhow::{Context, Result, anyhow, bail};
 use eez_control_rpc::{
     MAX_MESSAGE_BYTES,
@@ -286,9 +286,10 @@ impl Drop for Anvil {
     }
 }
 
-/// Forwards `eth_sendBundle` payloads to Anvil as ordered raw transactions.
-/// Anvil has no builder API, and this forwarding is intentionally not atomic;
-/// tests therefore inspect every forwarded transaction receipt.
+/// Forwards single-transaction `eth_sendBundle` payloads to Anvil.
+///
+/// Anvil has no builder API, so the stub explicitly rejects bundles containing
+/// zero or multiple transactions instead of pretending to preserve atomicity.
 struct BundleStub {
     child: Child,
     url: String,
@@ -957,6 +958,8 @@ pub struct Deployment {
 sol! {
     #[sol(rpc)]
     interface IEEZ {
+        error InvalidProof();
+        error InvalidProofSystemConfig();
         event BatchPosted(uint256 rollupCount);
         event L2ExecutionPerformed(uint64 indexed rollupId, bytes32 newState);
         event L2TxSkipped(uint256 indexed transientIdx, bytes revertData);
@@ -965,6 +968,9 @@ sol! {
         function registerRollup(address rollupContract, bytes32 initialState) external returns (uint64 rollupId);
     }
 }
+
+pub const INVALID_PROOF_SELECTOR: [u8; 4] = IEEZ::InvalidProof::SELECTOR;
+pub const INVALID_PROOF_SYSTEM_CONFIG_SELECTOR: [u8; 4] = IEEZ::InvalidProofSystemConfig::SELECTOR;
 
 /// Reth's `--chain dev` genesis state root. Used as the `initialState`
 /// when registering the rollup so the very first batch's prestate
@@ -1799,6 +1805,85 @@ impl<'a> Chain<'a> {
         })
         .await
     }
+
+    /// Assert that a submitted `postAndVerifyBatch` for `expected_rollup_id`
+    /// was mined, reverted, and reproduces `expected_revert_selector` via
+    /// `eth_call` against the resulting chain state.
+    pub async fn assert_failed_post_and_verify_batch(
+        &self,
+        expected_rollup_id: u64,
+        expected_revert_selector: [u8; 4],
+    ) -> Result<()> {
+        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
+        let latest = provider.get_block_number().await?;
+
+        for block_number in self.deploy_block..=latest {
+            let Some(block) = provider
+                .get_block_by_number(BlockNumberOrTag::Number(block_number))
+                .full()
+                .await?
+            else {
+                continue;
+            };
+            for transaction in block.transactions.txns() {
+                if transaction.inner.to() != Some(self.eez_address)
+                    || !transaction
+                        .inner
+                        .input()
+                        .starts_with(&eez_protocol::abi::postAndVerifyBatchCall::SELECTOR)
+                {
+                    continue;
+                }
+                let call = eez_protocol::abi::postAndVerifyBatchCall::abi_decode(
+                    transaction.inner.input(),
+                )?;
+                if !call
+                    .batch
+                    .rollupIdsWithProofSystems
+                    .iter()
+                    .any(|rollup| rollup.rollupId == expected_rollup_id)
+                {
+                    continue;
+                }
+
+                let tx_hash = *transaction.inner.tx_hash();
+                let receipt = provider
+                    .get_transaction_receipt(tx_hash)
+                    .await?
+                    .ok_or_else(|| anyhow!("postAndVerifyBatch receipt {tx_hash} is missing"))?;
+                if receipt.status() {
+                    bail!(
+                        "postAndVerifyBatch transaction {tx_hash} for rollup {expected_rollup_id} succeeded"
+                    );
+                }
+
+                let replay = TransactionRequest::default()
+                    .from(transaction.inner.signer())
+                    .to(self.eez_address)
+                    .input(transaction.inner.input().clone().into());
+                let err = provider
+                    .call(replay)
+                    .await
+                    .expect_err("failed postAndVerifyBatch replay unexpectedly succeeded");
+                let expected = format!("0x{}", hex::encode(expected_revert_selector));
+                let error_response = err.as_error_resp().ok_or_else(|| {
+                    anyhow!("postAndVerifyBatch replay returned non-RPC error: {err}")
+                })?;
+                let observed = error_response.data.as_ref().map_or_else(
+                    || error_response.message.to_string(),
+                    |data| format!("{} {}", error_response.message, data.get()),
+                );
+                if !observed.contains(&expected) {
+                    bail!(
+                        "postAndVerifyBatch replay returned {observed}, expected selector {expected}"
+                    );
+                }
+                return Ok(());
+            }
+        }
+
+        bail!("no mined postAndVerifyBatch transaction found for rollup {expected_rollup_id}")
+    }
 }
 
 /// Wait until L1's `block_number >= target`. Lets tests assert "the
@@ -2535,8 +2620,6 @@ impl CrossChainConfig {
                 self.l1_genesis.0.to_string_lossy().into_owned(),
             ),
             ("EEZ_L1_POSTER_KEY", self.poster_key.to_string()),
-            // ECDSAProofSystem authorizes the deployer.
-            ("EEZ_PROOF_SIGNER_KEY", self.deployer_key.to_string()),
             ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
             ("EEZL2_ADDRESS", format!("{EEZL2_ADDRESS:#x}")),
             ("EEZ_L1_BLOCK_TIME_MS", "5000".to_string()),
@@ -2727,6 +2810,10 @@ async fn setup_cross_chain_inner(
             witness_dir.path().to_string_lossy().into_owned(),
         ),
     ]);
+    assert!(
+        !env.iter().any(|(name, _)| *name == "EEZ_PROOF_SIGNER_KEY"),
+        "remote composer environment must not contain the proof-signer key",
+    );
     let node = NodeHandle::spawn(datadir.path(), &env)?;
     let l1_rpc = cfg.l1_rpc_url();
     let l2_rpc = node.l2_rpc_url();
