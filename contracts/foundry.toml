@@ -21,10 +21,18 @@ libs = [
     "../eez-core-protocol",
 ]
 
+# Auto-detected remappings contain the checkout's absolute path. Besides
+# changing the Solidity metadata hash between the host and deployment image,
+# those paths make Blockscout's standard-JSON input refer to source names that
+# are not present in the request. Keep every external import relative instead.
+auto_detect_remappings = false
+
 # `eez-core-protocol/src/...` imports resolve to the submodule.
 # Matches the pattern in /root/rollup-node/deployments/devnet/foundry.toml.
 remappings = [
     "eez-core-protocol/=../eez-core-protocol/",
+    "@openzeppelin/contracts/=../eez-core-protocol/lib/openzeppelin-contracts/contracts/",
+    "forge-std/=../eez-core-protocol/lib/forge-std/src/",
 ]
 
 [fmt]
