@@ -399,6 +399,19 @@ Useful workload controls include:
 - `EEZ_STATE_ROOT_WAIT_SECS`: state-root convergence timeout; the default is 30
   seconds.
 
+### Run the state-chaining regression
+
+```bash
+bash testing/kurtosis/scripts/verify-state-chaining.sh
+```
+
+The regression covers both source- and destination-state chaining in each
+direction. It requires each group of three transactions to share one Sync
+block and asserts every ordered return: repeated destination calls return
+`changed = true, false, false`, while source-derived calls send `1, 2, 3`.
+It also verifies bundle settlement, proof-signer acceptance, and L1/L2
+state-root convergence.
+
 ### Run all included workloads
 
 The suite requires an output directory:
@@ -412,9 +425,10 @@ bash testing/kurtosis/scripts/verify-cross-chain-waves.sh
 
 Despite the variable's historical `CI` name, this command operates on the
 already-running local enclave and leaves it running. It executes one `inbound`,
-`outbound`, and `mixed` wave, followed by three `mixed-pure` waves. Per-mode
-output is stored under `$EEZ_CI_RESULT_DIR/checks`. Override the stress count
-with `EEZ_MIXED_PURE_WAVE_COUNT`.
+`outbound`, and `mixed` wave, followed by three `mixed-pure` waves and the
+inbound/outbound state-chaining regression. Per-mode output is stored under
+`$EEZ_CI_RESULT_DIR/checks`. Override the stress count with
+`EEZ_MIXED_PURE_WAVE_COUNT`.
 
 ## Customize the network
 
@@ -526,3 +540,4 @@ Kurtosis assigns different host ports automatically. Remember that
   the genesis-installed EEZL2 contract.
 - `scripts/cross-chain-wave.sh`: individual cross-chain workload modes.
 - `scripts/verify-cross-chain-waves.sh`: complete workload suite.
+- `scripts/verify-state-chaining.sh`: ordered same-Sync-block state-chaining regression.

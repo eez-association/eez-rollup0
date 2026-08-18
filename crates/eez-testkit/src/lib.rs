@@ -1729,6 +1729,7 @@ sol! {
     }
     #[sol(rpc)]
     interface ISetterWrapper {
+        event Wrapped(uint256 input, bool ok, bool changed, uint256 newValue);
         function setViaProxy(uint256 v) external;
         function setSameValueTwice(uint256 v) external;
         function completedProxyCalls() external view returns (uint256);

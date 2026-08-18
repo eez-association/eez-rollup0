@@ -80,6 +80,7 @@ write_result() {
         } + if $result == "pass" then {
             modes: ["inbound", "outbound", "mixed", "mixed-pure"],
             cross_chain_convergence: "pass",
+            state_chaining: "pass",
             l1_l2_root_divergence: 0,
             safe_head_convergence: "pass"
         } else {} end' >"$RESULT_DIR/result.json"
@@ -205,6 +206,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         echo "- Proof-signer image: \`$EEZ_PROOF_SIGNER_IMAGE\`"
         echo "- Deploy image: \`$EEZ_DEPLOY_IMAGE\`"
         echo "- Inbound, outbound, mixed, and mixed-pure waves: pass"
+        echo "- Inbound and outbound state chaining: pass"
         echo "- Signed windows observed: $signed_window_count"
         echo "- Remote attestations observed: $remote_attestation_count"
         echo "- L1/L2 root divergence: 0"

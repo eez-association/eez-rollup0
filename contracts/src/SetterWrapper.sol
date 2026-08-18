@@ -30,6 +30,12 @@ contract SetterWrapper {
         _setViaProxy(v);
     }
 
+    /// Derives the proxy-call calldata from source-chain state. Separate calls
+    /// composed together must therefore observe the preceding call count.
+    function setNextValueViaProxy() external {
+        _setViaProxy(completedProxyCalls + 1);
+    }
+
     /// Calls the same proxy twice with identical calldata. Both invocations
     /// deliberately share their semantic cross-chain hash; their ordered entry
     /// positions, rather than the hash, distinguish them.

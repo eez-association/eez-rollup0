@@ -21,3 +21,5 @@ run_check "cross-chain-wave-mixed-pure" \
     env EEZ_WAVE_MODE=mixed-pure \
         EEZ_WAVE_COUNT="${EEZ_MIXED_PURE_WAVE_COUNT:-3}" \
     bash "$HERE/cross-chain-wave.sh"
+
+run_check "state-chaining" bash "$HERE/verify-state-chaining.sh"

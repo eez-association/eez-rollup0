@@ -1,6 +1,8 @@
 //! Cross-chain integration and nonce-gap regression tests.
 
 use alloy_primitives::{Address, Bytes, TxHash, U256, keccak256};
+use alloy_provider::{Provider, ProviderBuilder};
+use alloy_rpc_types_eth::Filter;
 use alloy_sol_types::{SolCall, SolEvent, SolValue};
 
 use common::{
@@ -777,6 +779,34 @@ async fn outbound_identical_calls_in_separate_transactions_settle_as_ordered_ent
     let value = U256::from(79u64);
     let nonce = pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
     let call = ISetterWrapper::setViaProxyCall { v: value }.abi_encode();
+    assert_ne!(
+        l2_value(&l1_rpc, w.outbound_value).await.unwrap(),
+        value,
+        "the first call must change destination state for the ordered-return assertion",
+    );
+
+    let provider = ProviderBuilder::new().connect_http(l2_rpc.parse().unwrap());
+    let wrapped_filter = Filter::new()
+        .address(w.outbound_wrapper)
+        .event_signature(ISetterWrapper::Wrapped::SIGNATURE_HASH)
+        .from_block(0u64);
+    let wrapped_before = provider.get_logs(&wrapped_filter).await.unwrap().len();
+
+    // Submit immediately after a batch so both transactions are available to
+    // the next drain. The same-block assertion below fails if this window is
+    // missed instead of silently weakening the state-dependency scenario.
+    let batches_before = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
+        .await
+        .unwrap();
+    wait_for(SETTLE_TIMEOUT, || {
+        let l1_rpc = l1_rpc.clone();
+        async move {
+            let batches = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block).await?;
+            Ok((batches > batches_before).then_some(()))
+        }
+    })
+    .await
+    .expect("composer did not open a drain window");
 
     let first = sign_and_send(
         &w.l2_xchain(),
@@ -806,28 +836,54 @@ async fn outbound_identical_calls_in_separate_transactions_settle_as_ordered_ent
         .await;
 
     wait_for(SETTLE_TIMEOUT, || {
+        let provider = provider.clone();
+        let wrapped_filter = wrapped_filter.clone();
+        async move {
+            let count = provider.get_logs(&wrapped_filter).await?.len();
+            Ok((count == wrapped_before + 2).then_some(()))
+        }
+    })
+    .await
+    .expect("both ordered outbound calls did not return to the source wrapper");
+
+    let wrapped = provider.get_logs(&wrapped_filter).await.unwrap();
+    let wrapped = &wrapped[wrapped_before..];
+    let sync_block = wrapped[0]
+        .block_number
+        .expect("first wrapper result must belong to a mined Sync block");
+    assert_eq!(
+        wrapped[1].block_number,
+        Some(sync_block),
+        "the state dependency must be exercised within one Sync block",
+    );
+    assert_eq!(
+        [wrapped[0].transaction_hash, wrapped[1].transaction_hash],
+        [Some(first), Some(second)],
+        "wrapper results must retain source transaction order",
+    );
+    let results = wrapped
+        .iter()
+        .map(|log| {
+            let event = ISetterWrapper::Wrapped::decode_log(&log.inner).unwrap();
+            (event.input, event.ok, event.changed, event.newValue)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec![(value, true, true, value), (value, true, false, value),],
+        "the second call must observe the first call's destination-state change",
+    );
+
+    wait_for(SETTLE_TIMEOUT, || {
         let l1_rpc = l1_rpc.clone();
         async move { Ok((l2_value(&l1_rpc, w.outbound_value).await? == value).then_some(())) }
     })
     .await
-    .expect("duplicate calls did not reach L1");
-    wait_for(SETTLE_TIMEOUT, || {
-        let l2_rpc = l2_rpc.clone();
-        async move {
-            Ok(
-                (completed_proxy_calls(&l2_rpc, w.outbound_wrapper).await? == U256::from(2u64))
-                    .then_some(()),
-            )
-        }
-    })
-    .await
-    .expect("both ordered outbound proxy calls did not return to the wrapper");
+    .expect("ordered outbound calls did not settle on L1");
     assert_eq!(
-        last_proxy_result(&l2_rpc, w.outbound_wrapper)
-            .await
-            .unwrap(),
-        (false, value),
-        "the final ordered call must deliver its exact decoded return",
+        l2_value(&l1_rpc, w.outbound_value).await.unwrap(),
+        value,
+        "the ordered calls must leave the destination at the requested value",
     );
     w.node.assert_no_process_death();
 }
