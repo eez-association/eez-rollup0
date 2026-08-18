@@ -516,6 +516,7 @@ impl Harness {
         let mut env = vec![
             ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
             ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
+            ("EEZ_L1_TARGET_RPC_URL", self.anvil.rpc_url.clone()),
             ("EEZ_L1_POSTER_KEY", opts.poster_key.to_string()),
             ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
@@ -2323,6 +2324,7 @@ impl CrossChainConfig {
             ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_RPC_URL", self.l1_rpc_url()),
             ("EEZ_L1_BUILDER_RPC_URL", self.l1_rpc_url()),
+            ("EEZ_L1_TARGET_RPC_URL", self.l1_rpc_url()),
             ("EEZ_L1_XCHAIN_PORT", self.l1_xchain_port.to_string()),
             ("EEZ_L2_XCHAIN_PORT", self.l2_xchain_port.to_string()),
             ("EEZ_L1_HTTP_PORT", self.l1_http_port.to_string()),
