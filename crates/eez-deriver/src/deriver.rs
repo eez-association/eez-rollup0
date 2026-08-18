@@ -166,15 +166,9 @@ where
         self.catch_up_inner().await.map(|_| ())
     }
 
-    /// [`Self::catch_up`], additionally returning the seed for
-    /// `L1Watcher::start`: the finalized block, clamped to the scan
-    /// endpoint (immutable, so scan and seed can never describe different
-    /// forks) and floored at the scan's own start — the revalidated anchor
-    /// batch, or `deploy_block - 1` on an empty index. The floor keeps the
-    /// watcher out of territory this catch-up did not itself read: blocks
-    /// below it carry no unindexed events, and a minimal L1 snapshot may
-    /// not serve their logs at all (pruned history). Boot-only — recovery
-    /// callers use [`Self::catch_up`] and never pay for the seed.
+    /// [`Self::catch_up`], additionally returning the `L1Watcher::start`
+    /// seed: the finalized block, kept inside the range this scan read so
+    /// the seed is immutable and always servable. Boot-only.
     ///
     /// # Errors
     ///
@@ -188,6 +182,16 @@ where
         let (floor_number, floor_hash) = match self.inner.l1_head.last_indexed() {
             Some(tail) => (tail.l1_block, Some(tail.l1_block_hash)),
             None => (self.inner.deploy_block.saturating_sub(1), None),
+        };
+        // The floor is a lower bound on a seed that must also stay within what
+        // the scan read: a source that has not reached the deploy block yet
+        // (a fresh devnet L1 still syncing) has no such block to seed at, and
+        // waiting for one deadlocks boot. Seed at the endpoint instead — the
+        // watcher scans everything after it as the source advances.
+        let (floor_number, floor_hash) = if floor_number > end {
+            (end, None)
+        } else {
+            (floor_number, floor_hash)
         };
         let (seed_number, known_hash) = match self
             .inner
