@@ -701,17 +701,20 @@ async fn inbound_identical_wrapper_proxy_calls_settle_as_ordered_entries() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn outbound_identical_wrapper_proxy_calls_settle_as_ordered_entries() {
+async fn outbound_multiple_proxy_calls_in_one_transaction_are_evicted() {
     let w = setup_cross_chain().await.unwrap();
     let l1_rpc = w.l1_rpc();
     let l2_rpc = w.l2_rpc();
     let value = U256::from(79u64);
+    let source_nonce = pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
+    let destination_before = l2_value(&l1_rpc, w.outbound_value).await.unwrap();
+    let signal_cursor = w.node.signal_cursor().unwrap();
 
     let tx = sign_and_send(
         &w.l2_xchain(),
         OUTBOUND_USER,
         w.l2_chain_id,
-        pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
+        source_nonce,
         Some(w.outbound_wrapper),
         U256::ZERO,
         ISetterWrapper::setSameValueTwiceCall { v: value }.abi_encode(),
@@ -719,7 +722,88 @@ async fn outbound_identical_wrapper_proxy_calls_settle_as_ordered_entries() {
     )
     .await
     .expect("duplicate outbound proxy-call transaction must be admitted");
-    assert_all_transactions_succeeded(&l2_rpc, &[tx], "duplicate outbound proxy calls").await;
+
+    let tx_hash = tx.to_string();
+    wait_for(SETTLE_TIMEOUT, || async {
+        let rejected = w
+            .node
+            .signals_since(signal_cursor)?
+            .into_iter()
+            .any(|signal| {
+                signal.name == common::signals::COMPOSER_OUTBOUND_MULTICALL_UNSUPPORTED
+                    && signal
+                        .fields
+                        .get("tx_hash")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(tx_hash.as_str())
+                    && signal.u64("rollup_id").ok() == Some(w.cfg.rollup_id)
+                    && signal.u64("entries").ok() == Some(2)
+            });
+        Ok(rejected.then_some(()))
+    })
+    .await
+    .expect("composer did not report the unsupported outbound multicall");
+
+    assert_eq!(
+        receipt_ok(&l2_rpc, tx).await.unwrap(),
+        None,
+        "an evicted outbound multicall must not land on its source chain",
+    );
+    assert_eq!(
+        pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
+        source_nonce,
+        "eviction must release the unmined source nonce",
+    );
+    assert_eq!(
+        completed_proxy_calls(&l2_rpc, w.outbound_wrapper)
+            .await
+            .unwrap(),
+        U256::ZERO,
+        "the rejected source transaction must not execute its wrapper",
+    );
+    assert_eq!(
+        l2_value(&l1_rpc, w.outbound_value).await.unwrap(),
+        destination_before,
+        "the rejected outbound multicall must not mutate its destination",
+    );
+    w.node.assert_no_process_death();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outbound_identical_calls_in_separate_transactions_settle_as_ordered_entries() {
+    let w = setup_cross_chain().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let value = U256::from(79u64);
+    let nonce = pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
+    let call = ISetterWrapper::setViaProxyCall { v: value }.abi_encode();
+
+    let first = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        nonce,
+        Some(w.outbound_wrapper),
+        U256::ZERO,
+        call.clone(),
+        1_200_000,
+    )
+    .await
+    .expect("first duplicate outbound proxy-call transaction must be admitted");
+    let second = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        nonce + 1,
+        Some(w.outbound_wrapper),
+        U256::ZERO,
+        call,
+        1_200_000,
+    )
+    .await
+    .expect("second duplicate outbound proxy-call transaction must be admitted");
+    assert_all_transactions_succeeded(&l2_rpc, &[first, second], "duplicate outbound proxy calls")
+        .await;
 
     wait_for(SETTLE_TIMEOUT, || {
         let l1_rpc = l1_rpc.clone();

@@ -79,6 +79,8 @@ pub mod signals {
     pub const NODE_PANIC: &str = "eez.node.panic";
     pub const COMPOSER_BUNDLE_DISPATCHED: &str = "eez.composer.bundle.dispatched";
     pub const COMPOSER_PHASE1_BUNDLE_DISPATCHED: &str = "eez.composer.phase1.bundle.dispatched";
+    pub const COMPOSER_OUTBOUND_MULTICALL_UNSUPPORTED: &str =
+        "eez.composer.cc_compose.outbound_multicall_unsupported";
     pub const FOLLOWER_HEAD_ADVANCED: &str = "eez.node.follower.head.advanced";
     pub const FOLLOWER_HEAD_SYNCING: &str = "eez.node.follower.head.syncing";
     pub const L1_REORG_DETECTED: &str = "eez.l1_watcher.ring.rewind";
