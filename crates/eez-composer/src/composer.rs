@@ -1363,6 +1363,7 @@ where
                             sender = %tx.sender,
                             nonce = tx.nonce,
                             attempts = tx.attempts,
+                            test_signal = "eez.composer.recovery.poison_evicted",
                             "user_tx evicted after MAX_BUNDLE_ATTEMPTS relay drops (likely poison the compose-time sim missed); resubmit required",
                         );
                     } else {
@@ -1389,6 +1390,7 @@ where
                             sender = %t.sender,
                             nonce = t.nonce,
                             gap_at = nonce,
+                            test_signal = "eez.composer.recovery.nonce_chain_evicted",
                             "same-sender tx above an evicted nonce; gapped chain can never land — evicted (resubmit in order)",
                         );
                     }
@@ -1404,6 +1406,7 @@ where
                         sender = %t.sender,
                         nonce = t.nonce,
                         gap_at = nonce,
+                        test_signal = "eez.composer.recovery.nonce_chain_evicted",
                         "same-sender pooled tx above an evicted nonce; gapped chain can never land — evicted (resubmit in order)",
                     );
                 }
@@ -2017,6 +2020,7 @@ where
         event!(
             name: "eez.composer.bundle.dispatched",
             Level::INFO,
+            test_signal = "eez.composer.bundle.dispatched",
             rollup_id,
             sync_height,
             tx_count = bundle.len(),
@@ -2147,6 +2151,7 @@ where
         event!(
             name: "eez.composer.phase1.bundle.dispatched",
             Level::INFO,
+            test_signal = "eez.composer.phase1.bundle.dispatched",
             rollup_id,
             sync_height,
             "minimal postBatch dispatched to background observer (leading immediate only)",

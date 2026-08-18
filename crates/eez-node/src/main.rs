@@ -148,6 +148,17 @@ fn main() -> eyre::Result<()> {
     let mode = Mode::from_env();
 
     Cli::<EthereumChainSpecParser, NodeExt>::try_parse_from(argv)?.run(async move |builder, ext| {
+        let default_panic_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            event!(
+                name: "eez.node.panic",
+                Level::ERROR,
+                test_signal = "eez.node.panic",
+                panic = %info,
+                "node panic",
+            );
+            default_panic_hook(info);
+        }));
         event!(
             name: "eez.node.launching",
             Level::INFO,
@@ -889,6 +900,7 @@ fn main() -> eyre::Result<()> {
                     event!(
                         name: "eez.node.deriver.boot_catch_up.failed",
                         Level::ERROR,
+                        test_signal = "eez.node.deriver.boot_catch_up.failed",
                         mode = mode.name(),
                         error = %err,
                         "boot-time catch_up failed; refusing to start L1-active tasks before reconciliation",

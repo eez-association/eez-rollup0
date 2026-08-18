@@ -1,19 +1,24 @@
-//! Anvil-driven e2e harness: spawn L1, deploy protocol, spawn eez-node.
+//! Reusable Anvil-driven EEZ integration framework.
 //!
-//! Each test owns its own anvil port + datadir; harness drops kill both.
+//! The crate intentionally lives as a dev-dependency of protocol components:
+//! it owns process lifecycle, deterministic chain fixtures, transaction helpers,
+//! structured node signals, and the declarative scenario runner.
 
-#![allow(dead_code)]
+#![allow(missing_debug_implementations)]
 
 use std::{
     collections::HashSet,
     net::{TcpListener, UdpSocket},
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
-use alloy_primitives::{Address, B256, U256, address, hex};
+use alloy_primitives::{Address, B256, Bytes, U256, address, hex};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{BlockNumHash, BlockNumberOrTag, TransactionReceipt, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
@@ -57,11 +62,84 @@ pub const COMPOSER_INTERVAL_MULTI: Duration = Duration::from_secs(2);
 
 static LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// Stable values carried in the `test_signal` field of JSON tracing events.
+pub mod signals {
+    pub const BUNDLE_ACCEPTED: &str = "eez.node.l1_embedded.bundle.accepted";
+    pub const BUNDLE_MEMPOOL_FALLBACK: &str = "eez.submitter.bundle.mempool_fallback";
+    pub const DERIVER_REORG_NOOP: &str = "eez.deriver.l1.reorg.noop";
+    pub const DERIVER_REORG_RETREATED: &str = "eez.deriver.l1.reorg.retreated";
+    pub const DERIVER_STATE_DIVERGED_POST: &str = "eez.deriver.state.diverged_post";
+    pub const DERIVER_STATE_DIVERGED_PRE: &str = "eez.deriver.state.diverged_pre";
+    pub const DERIVER_SAFE_ADVANCED: &str = "eez.deriver.safe.advanced";
+    pub const DERIVER_FINALIZED_ADVANCED: &str = "eez.deriver.finalized.advanced";
+    pub const DERIVER_SYNC_BLOCK_BUILT: &str = "eez.deriver.reconcile.sync_block_built";
+    pub const DERIVER_RESYNC_FAILED: &str = "eez.deriver.resync.failed";
+    pub const DERIVER_COMMITTER_CLOSED: &str = "eez.deriver.committer.closed";
+    pub const NODE_BOOT_CATCH_UP_FAILED: &str = "eez.node.deriver.boot_catch_up.failed";
+    pub const NODE_PANIC: &str = "eez.node.panic";
+    pub const COMPOSER_BUNDLE_DISPATCHED: &str = "eez.composer.bundle.dispatched";
+    pub const COMPOSER_PHASE1_BUNDLE_DISPATCHED: &str = "eez.composer.phase1.bundle.dispatched";
+    pub const FOLLOWER_HEAD_ADVANCED: &str = "eez.node.follower.head.advanced";
+    pub const FOLLOWER_HEAD_SYNCING: &str = "eez.node.follower.head.syncing";
+    pub const L1_REORG_DETECTED: &str = "eez.l1_watcher.ring.rewind";
+    pub const TX_NONCE_CHAIN_EVICTED: &str = "eez.composer.recovery.nonce_chain_evicted";
+    pub const TX_POISON_EVICTED: &str = "eez.composer.recovery.poison_evicted";
+}
+
+/// One machine-readable tracing record emitted by an EEZ process.
+#[derive(Clone, Debug)]
+pub struct NodeSignal {
+    pub name: String,
+    pub fields: serde_json::Map<String, serde_json::Value>,
+}
+
+impl NodeSignal {
+    pub fn u64(&self, field: &str) -> Result<u64> {
+        let value = self
+            .fields
+            .get(field)
+            .ok_or_else(|| anyhow!("signal {} has no {field} field", self.name))?;
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|v| v.parse().ok()))
+            .ok_or_else(|| anyhow!("signal {} field {field} is not a u64: {value}", self.name))
+    }
+
+    pub fn b256(&self, field: &str) -> Result<B256> {
+        let value = self
+            .fields
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("signal {} has no string {field} field", self.name))?;
+        value
+            .parse()
+            .with_context(|| format!("signal {} has invalid {field}: {value}", self.name))
+    }
+}
+
 pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
         .expect("repo root")
+}
+
+/// Resolve the node executable without tying this crate to one Cargo test
+/// target. `EEZ_TEST_NODE_BIN` is the explicit cross-crate escape hatch; the
+/// Cargo integration-test variable and the normal debug output are fallbacks.
+pub fn eez_node_bin() -> Result<PathBuf> {
+    if let Some(path) =
+        std::env::var_os("EEZ_TEST_NODE_BIN").or_else(|| std::env::var_os("CARGO_BIN_EXE_eez-node"))
+    {
+        return Ok(path.into());
+    }
+    let path = repo_root().join("target/debug/eez-node");
+    if path.is_file() {
+        return Ok(path);
+    }
+    bail!(
+        "eez-node binary not found; set EEZ_TEST_NODE_BIN or build it with `cargo build -p eez-node`"
+    )
 }
 
 pub fn anvil_bin() -> String {
@@ -575,7 +653,7 @@ fn write_dev_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
 /// prefunded accounts (hardhat defaults), all hardforks at block 0,
 /// matches what the team uses for local reorg testing.
 pub fn reorg_genesis_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/genesis.json")
+    repo_root().join("crates/eez-node/tests/fixtures/genesis.json")
 }
 
 /// Genesis state root of `reorg_genesis_path()`. Computed by reading the
@@ -833,7 +911,7 @@ async fn deploy<P: Provider>(
 }
 
 pub struct NodeHandle {
-    child: Child,
+    child: Mutex<Child>,
     /// Human label for assertion messages ("c1", "c2", or the default "node").
     pub name: String,
     /// Where the node's merged stdout+stderr is written. Goes to
@@ -924,7 +1002,10 @@ impl NodeHandle {
             .map(|p| p.as_os_str().to_owned())
             .or(env_genesis)
             .unwrap_or_else(|| std::ffi::OsString::from("dev"));
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_eez-node"));
+        let mut cmd = Command::new(eez_node_bin()?);
+        let signal_filter = std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| {
+            "warn,eez_node=info,eez_l1=info,eez_composer=info,eez_deriver=info".to_string()
+        });
         cmd.current_dir(repo_root())
             .args(["node", "--chain"])
             .arg(&chain_arg)
@@ -932,6 +1013,12 @@ impl NodeHandle {
             .arg(datadir)
             .stdout(stdout)
             .args([
+                "--log.stdout.format",
+                "json",
+                "--log.stdout.filter",
+                &signal_filter,
+                "--log.file.max-files",
+                "0",
                 "--http",
                 "--http.addr",
                 "127.0.0.1",
@@ -975,7 +1062,7 @@ impl NodeHandle {
         }
         let child = cmd.spawn().context("spawn eez-node")?;
         Ok(Self {
-            child,
+            child: Mutex::new(child),
             name: name.to_string(),
             log_path,
             keep_alive: log_tempdir.into_iter().collect(),
@@ -1036,77 +1123,121 @@ impl NodeHandle {
     /// reorg test would silently pass even if reorg detection regressed
     /// and some unrelated re-derivation path re-converged state.
     pub async fn wait_for_reorg_seen(&self, timeout: Duration) -> Result<()> {
-        let patterns = [
-            "reorg rolled out",
-            "rewinding ring to common ancestor",
-            "l1.reorg.retreated",
-            "L1 reorg reported",
-        ];
         wait_for(timeout, || async {
-            Ok((self.log_count_matching(&patterns)? > 0).then_some(()))
+            Ok((self.count_signals(&[
+                signals::L1_REORG_DETECTED,
+                signals::DERIVER_REORG_RETREATED,
+                signals::DERIVER_REORG_NOOP,
+            ])? > 0)
+                .then_some(()))
         })
         .await
         .with_context(|| format!("{} deriver missed the reorg", self.name))
     }
 
-    /// Assert this node never logged a fatal-class line (process death
-    /// markers). Without this, every other invariant check is moot —
-    /// a dead node trivially "agrees" by virtue of having stopped.
+    /// Assert that the node process is still running. `Child::try_wait`
+    /// reaps and reports an exited child, unlike a PID signal probe, which
+    /// also succeeds for an unreaped zombie process.
     pub fn assert_no_process_death(&self) {
-        let patterns = ["Fatal", "UnexpectedStaticFile"];
-        assert_eq!(
-            self.log_count_matching(&patterns).unwrap(),
-            0,
-            "{} fatal error",
-            self.name,
-        );
+        let mut child = self.child.lock().expect("lock node child process");
+        match child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(status)) => panic!("{} process exited with {status}", self.name),
+            Err(err) => panic!("failed to query {} process status: {err}", self.name),
+        }
     }
 
     pub fn assert_no_divergence_failure_logs(&self) {
-        let patterns = [
-            "Fatal",
-            "UnexpectedStaticFile",
-            "eez.deriver.state.diverged",
-            "local L2 state root differs",
-            "engine rejected safe/finalized FCU",
-            "payload builder returned no payload",
-        ];
+        self.assert_no_process_death();
         assert_eq!(
-            self.log_count_matching(&patterns).unwrap(),
+            self.count_signals(&[
+                signals::DERIVER_STATE_DIVERGED_PRE,
+                signals::DERIVER_STATE_DIVERGED_POST,
+            ])
+            .unwrap(),
             0,
-            "{} logged a divergence/fatal-class failure",
+            "{} emitted a state-divergence signal",
+            self.name,
+        );
+        assert_eq!(
+            self.count_log_lines_containing_any(&[
+                "Fatal",
+                "UnexpectedStaticFile",
+                "engine rejected safe/finalized FCU",
+                "payload builder returned no payload",
+            ])
+            .unwrap(),
+            0,
+            "{} logged a fatal-class failure",
             self.name,
         );
     }
 
-    /// Count lines in `log_path` matching ANY of `patterns` (substring
-    /// match). Used by the multi-composer reorg test to assert
-    /// reorg handling on both composers AND zero `Fatal` /
-    /// `UnexpectedStaticFile` events.
-    pub fn log_count_matching(&self, patterns: &[&str]) -> Result<usize> {
+    fn count_log_lines_containing_any(&self, patterns: &[&str]) -> Result<usize> {
         let contents = std::fs::read_to_string(&self.log_path)
-            .with_context(|| format!("read log {}", self.log_path.display()))?;
+            .with_context(|| format!("read node log {}", self.log_path.display()))?;
         Ok(contents
             .lines()
-            .filter(|line| patterns.iter().any(|p| line.contains(p)))
+            .filter(|line| patterns.iter().any(|pattern| line.contains(pattern)))
             .count())
     }
 
-    /// Count log lines containing every supplied substring.
-    pub fn log_count_matching_all(&self, patterns: &[&str]) -> Result<usize> {
+    /// Decode the node's JSON tracing stream and count a stable signal field.
+    /// Human messages may change without invalidating assertions.
+    pub fn count_signal(&self, signal: &str) -> Result<usize> {
+        self.count_signals(&[signal])
+    }
+
+    pub fn count_signals(&self, signals: &[&str]) -> Result<usize> {
         let contents = std::fs::read_to_string(&self.log_path)
-            .with_context(|| format!("read log {}", self.log_path.display()))?;
+            .with_context(|| format!("read signal stream {}", self.log_path.display()))?;
         Ok(contents
             .lines()
-            .filter(|line| patterns.iter().all(|p| line.contains(p)))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|record| {
+                record
+                    .get("fields")
+                    .and_then(|fields| fields.get("test_signal"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .filter(|signal| signals.contains(&signal.as_str()))
             .count())
+    }
+
+    /// Line cursor for a subsequent [`Self::signals_since`] query.
+    pub fn signal_cursor(&self) -> Result<usize> {
+        let contents = std::fs::read_to_string(&self.log_path)
+            .with_context(|| format!("read signal stream {}", self.log_path.display()))?;
+        Ok(contents.lines().count())
+    }
+
+    /// Structured records emitted after `cursor`. Signal values are exact
+    /// tracing event names, while human-readable messages remain irrelevant.
+    pub fn signals_since(&self, cursor: usize) -> Result<Vec<NodeSignal>> {
+        let contents = std::fs::read_to_string(&self.log_path)
+            .with_context(|| format!("read signal stream {}", self.log_path.display()))?;
+        Ok(contents
+            .lines()
+            .skip(cursor)
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|record| {
+                let fields = record.get("fields")?.as_object()?.clone();
+                let name = fields.get("test_signal")?.as_str()?.to_owned();
+                Some(NodeSignal { name, fields })
+            })
+            .collect())
     }
 }
 
 impl Drop for NodeHandle {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let child = self
+            .child
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -1329,6 +1460,17 @@ pub async fn state_root(rpc_url: &str, eez: Address, rollup_id: u64) -> Result<B
     let registry = IEEZ::new(eez, &provider);
     let r = registry.rollups(rollup_id).call().await?;
     Ok(r.stateRoot)
+}
+
+pub async fn rollup_ether_balance(rpc_url: &str, eez: Address, rollup_id: u64) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let registry = IEEZ::new(eez, &provider);
+    Ok(registry.rollups(rollup_id).call().await?.etherBalance)
+}
+
+async fn account_balance(rpc_url: &str, address: Address) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(provider.get_balance(address).await?)
 }
 
 /// Count events of `event_sig_hash` emitted by `contract` since
@@ -1566,6 +1708,7 @@ sol! {
     }
     #[sol(rpc)]
     interface IValue {
+        event ValueSet(address indexed by, uint256 newValue);
         function value() external view returns (uint256);
         function setValue(uint256 v) external returns (bool changed, uint256 newValue);
     }
@@ -1574,8 +1717,43 @@ sol! {
         function value() external view returns (uint256);
         function setValue(uint256 v) external;
     }
+    #[sol(rpc)]
+    interface IEmptyCall {
+        function calls() external view returns (uint256);
+        function received() external view returns (uint256);
+        function lastValue() external view returns (uint256);
+        function setValue(uint256 next) external payable returns (uint256);
+    }
+    #[sol(rpc)]
     interface ISetterWrapper {
         function setViaProxy(uint256 v) external;
+        function setSameValueTwice(uint256 v) external;
+        function completedProxyCalls() external view returns (uint256);
+        function lastChanged() external view returns (bool);
+        function lastNewValue() external view returns (uint256);
+    }
+    #[sol(rpc)]
+    interface IReturnData {
+        function echo(bytes calldata value) external returns (bytes memory);
+        function emptyBytes() external returns (bytes memory);
+    }
+    #[sol(rpc)]
+    interface IReturnDataWrapper {
+        function callAndRecord(bytes calldata data) external;
+        function lastReturnDataLength() external view returns (uint256);
+        function lastReturnDataHash() external view returns (bytes32);
+    }
+    #[sol(rpc)]
+    interface INestedSetterInner {
+        function completedProxyCalls() external view returns (uint256);
+    }
+    #[sol(rpc)]
+    interface INestedSetterOuter {
+        function setViaInner(uint256 v) external;
+    }
+    #[sol(rpc)]
+    interface IEEZL2Direct {
+        function executeCrossChainCall(address sourceAddress, bytes calldata callData) external payable returns (bytes memory);
     }
 }
 
@@ -1809,6 +1987,18 @@ async fn deploy_value(rpc_url: &str, key: &str, chain_id: u64, initial: U256) ->
     .await
 }
 
+async fn deploy_empty_call(rpc_url: &str, key: &str, chain_id: u64) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("EmptyCall.sol/EmptyCall.json"),
+        Vec::new(),
+    )
+    .await
+}
+
 pub async fn deploy_value_no_ret(
     rpc_url: &str,
     key: &str,
@@ -1822,6 +2012,69 @@ pub async fn deploy_value_no_ret(
         chain_id,
         &out.join("ValueNoRet.sol/ValueNoRet.json"),
         initial.abi_encode(),
+    )
+    .await
+}
+
+async fn deploy_return_data(rpc_url: &str, key: &str, chain_id: u64) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("ReturnData.sol/ReturnData.json"),
+        Vec::new(),
+    )
+    .await
+}
+
+async fn deploy_return_data_wrapper(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    proxy: Address,
+) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("ReturnDataWrapper.sol/ReturnDataWrapper.json"),
+        proxy.abi_encode(),
+    )
+    .await
+}
+
+pub async fn deploy_nested_setter_inner(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    proxy: Address,
+) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("NestedSetterWrapper.sol/NestedSetterInner.json"),
+        proxy.abi_encode(),
+    )
+    .await
+}
+
+pub async fn deploy_nested_setter_outer(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    inner: Address,
+) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("NestedSetterWrapper.sol/NestedSetterOuter.json"),
+        inner.abi_encode(),
     )
     .await
 }
@@ -1847,6 +2100,55 @@ pub async fn value_no_ret(rpc_url: &str, value_addr: Address) -> Result<U256> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     Ok(IValueNoRet::new(value_addr, &provider)
         .value()
+        .call()
+        .await?)
+}
+
+pub async fn empty_call_state(rpc_url: &str, target: Address) -> Result<(U256, U256, U256)> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let target = IEmptyCall::new(target, &provider);
+    Ok((
+        target.calls().call().await?,
+        target.received().call().await?,
+        target.lastValue().call().await?,
+    ))
+}
+
+pub async fn completed_proxy_calls(rpc_url: &str, wrapper: Address) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(ISetterWrapper::new(wrapper, &provider)
+        .completedProxyCalls()
+        .call()
+        .await?)
+}
+
+pub async fn last_proxy_result(rpc_url: &str, wrapper: Address) -> Result<(bool, U256)> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let wrapper = ISetterWrapper::new(wrapper, &provider);
+    Ok((
+        wrapper.lastChanged().call().await?,
+        wrapper.lastNewValue().call().await?,
+    ))
+}
+
+pub async fn return_data_length(rpc_url: &str, wrapper: Address) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let wrapper = IReturnDataWrapper::new(wrapper, &provider);
+    Ok(wrapper.lastReturnDataLength().call().await?)
+}
+
+pub async fn return_data_hash(rpc_url: &str, wrapper: Address) -> Result<B256> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(IReturnDataWrapper::new(wrapper, &provider)
+        .lastReturnDataHash()
+        .call()
+        .await?)
+}
+
+pub async fn nested_proxy_calls(rpc_url: &str, inner: Address) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(INestedSetterInner::new(inner, &provider)
+        .completedProxyCalls()
         .call()
         .await?)
 }
@@ -1931,6 +2233,11 @@ pub async fn l2_value(l2_rpc: &str, value_addr: Address) -> Result<U256> {
 pub async fn l2_balance(l2_rpc: &str, addr: Address) -> Result<U256> {
     let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
     Ok(provider.get_balance(addr).await?)
+}
+
+pub async fn account_code(rpc_url: &str, addr: Address) -> Result<Bytes> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(provider.get_code_at(addr).await?)
 }
 
 pub async fn receipt_ok(rpc_url: &str, hash: alloy_primitives::TxHash) -> Result<Option<bool>> {
@@ -2030,8 +2337,14 @@ impl CrossChainConfig {
             ("EEZ_PROOF_SIGNER_KEY", self.deployer_key.to_string()),
             ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
             ("EEZL2_ADDRESS", format!("{EEZL2_ADDRESS:#x}")),
-            ("EEZ_L1_BLOCK_TIME_MS", "5000".to_string()),
-            ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
+            (
+                "EEZ_L1_BLOCK_TIME_MS",
+                CROSS_CHAIN_L1_BLOCK_TIME_MS.to_string(),
+            ),
+            (
+                "EEZ_L2_BLOCK_TIME_MS",
+                CROSS_CHAIN_L2_BLOCK_TIME_MS.to_string(),
+            ),
             ("EEZ_PROOF_TIME_MS", "1000".to_string()),
             ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
             ("EEZ_REGISTRY_ADDRESS", format!("{:#x}", self.eez_address)),
@@ -2066,6 +2379,9 @@ impl CrossChainConfig {
 
 pub const SETUP_TIMEOUT: Duration = Duration::from_secs(90);
 pub const SETTLE_TIMEOUT: Duration = Duration::from_mins(3);
+const CROSS_CHAIN_L1_BLOCK_TIME_MS: u64 = 5_000;
+const CROSS_CHAIN_L2_BLOCK_TIME_MS: u64 = 1_000;
+const CROSS_CHAIN_SYNC_INTERVAL: u64 = CROSS_CHAIN_L1_BLOCK_TIME_MS / CROSS_CHAIN_L2_BLOCK_TIME_MS;
 
 /// Separate deployer keeps CREATE addresses deterministic.
 pub const TARGET_DEPLOYER: &str = ANVIL_KEY_3;
@@ -2097,6 +2413,74 @@ pub struct CrossChainWorld {
     _datadir: tempfile::TempDir,
 }
 
+pub struct CrossChainEmptyCallWorld {
+    pub world: CrossChainWorld,
+    pub empty_call_l2: Address,
+    pub empty_call_proxy: Address,
+}
+
+impl std::ops::Deref for CrossChainEmptyCallWorld {
+    type Target = CrossChainWorld;
+
+    fn deref(&self) -> &Self::Target {
+        &self.world
+    }
+}
+
+pub struct CrossChainReturnDataWorld {
+    pub world: CrossChainWorld,
+    pub return_data_wrapper: Address,
+}
+
+impl std::ops::Deref for CrossChainReturnDataWorld {
+    type Target = CrossChainWorld;
+
+    fn deref(&self) -> &Self::Target {
+        &self.world
+    }
+}
+
+pub struct CrossChainNestedSetterWorld {
+    pub world: CrossChainWorld,
+    pub nested_setter_inner: Address,
+    pub nested_setter_outer: Address,
+}
+
+impl std::ops::Deref for CrossChainNestedSetterWorld {
+    type Target = CrossChainWorld;
+
+    fn deref(&self) -> &Self::Target {
+        &self.world
+    }
+}
+
+pub struct CrossChainOutboundReturnDataWorld {
+    pub world: CrossChainWorld,
+    pub return_data_wrapper: Address,
+}
+
+impl std::ops::Deref for CrossChainOutboundReturnDataWorld {
+    type Target = CrossChainWorld;
+
+    fn deref(&self) -> &Self::Target {
+        &self.world
+    }
+}
+
+pub struct CrossChainCodelessWorld {
+    pub world: CrossChainWorld,
+    pub inbound_wrapper: Address,
+    pub outbound_wrapper: Address,
+}
+
+impl std::ops::Deref for CrossChainCodelessWorld {
+    type Target = CrossChainWorld;
+
+    fn deref(&self) -> &Self::Target {
+        &self.world
+    }
+}
+
 impl CrossChainWorld {
     pub fn l1_rpc(&self) -> String {
         self.cfg.l1_rpc_url()
@@ -2112,9 +2496,642 @@ impl CrossChainWorld {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScenarioDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScenarioCall {
+    pub to: Address,
+    pub value: U256,
+    pub data: Vec<u8>,
+    pub gas_limit: u64,
+}
+
+impl ScenarioCall {
+    pub fn new(to: Address, data: Vec<u8>) -> Self {
+        Self {
+            to,
+            value: U256::ZERO,
+            data,
+            gas_limit: 900_000,
+        }
+    }
+}
+
+pub trait IntoTestU256 {
+    fn into_test_u256(self) -> U256;
+}
+
+impl IntoTestU256 for U256 {
+    fn into_test_u256(self) -> U256 {
+        self
+    }
+}
+
+impl IntoTestU256 for u64 {
+    fn into_test_u256(self) -> U256 {
+        U256::from(self)
+    }
+}
+
+pub fn setter_call(proxy: Address, value: impl IntoTestU256) -> ScenarioCall {
+    ScenarioCall::new(
+        proxy,
+        IValue::setValueCall {
+            v: value.into_test_u256(),
+        }
+        .abi_encode(),
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ValueRead(Address);
+
+pub const fn value_read(contract: Address) -> ValueRead {
+    ValueRead(contract)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StateSide {
+    L1,
+    L2,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StateExpectation {
+    side: StateSide,
+    read: ValueRead,
+    expected: U256,
+}
+
+#[derive(Clone, Debug)]
+struct ExecutedScenarioAction {
+    direction: ScenarioDirection,
+    value: U256,
+    nonce: u64,
+    hash: alloy_primitives::TxHash,
+}
+
+#[derive(Debug)]
+struct StandardOracleSnapshot {
+    signal_cursor: usize,
+    execution_states: Vec<B256>,
+    safe: Option<(u64, B256)>,
+    finalized: Option<(u64, B256)>,
+    rollup_ether_balance: U256,
+    eez_contract_balance: U256,
+    inbound_nonce: u64,
+    outbound_nonce: u64,
+    grid_residue: Option<u64>,
+}
+
+impl StandardOracleSnapshot {
+    async fn capture(world: &CrossChainWorld) -> Result<Self> {
+        let l1_rpc = world.l1_rpc();
+        let l2_rpc = world.l2_rpc();
+        let prior_signals = world.node.signals_since(0)?;
+        let grid_residue = prior_signals.iter().rev().find_map(|signal| {
+            signal
+                .fields
+                .get("sync_height")
+                .and_then(serde_json::Value::as_u64)
+                .map(|height| height % CROSS_CHAIN_SYNC_INTERVAL)
+        });
+        Ok(Self {
+            signal_cursor: world.node.signal_cursor()?,
+            execution_states: all_l2_execution_states(
+                &l1_rpc,
+                world.cfg.eez_address,
+                world.cfg.rollup_id,
+                world.dep.deploy_block,
+            )
+            .await?,
+            safe: block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Safe).await?,
+            finalized: block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Finalized).await?,
+            rollup_ether_balance: rollup_ether_balance(
+                &l1_rpc,
+                world.cfg.eez_address,
+                world.cfg.rollup_id,
+            )
+            .await?,
+            eez_contract_balance: account_balance(&l1_rpc, world.cfg.eez_address).await?,
+            inbound_nonce: pending_nonce(&l1_rpc, INBOUND_USER).await?,
+            outbound_nonce: pending_nonce(&l2_rpc, OUTBOUND_USER).await?,
+            grid_residue,
+        })
+    }
+
+    async fn assert_after(
+        &self,
+        world: &CrossChainWorld,
+        actions: &[ExecutedScenarioAction],
+        expect_settled: bool,
+        scenario_name: &str,
+    ) -> Result<()> {
+        world.node.assert_no_process_death();
+
+        let l1_rpc = world.l1_rpc();
+        let l2_rpc = world.l2_rpc();
+        let records = world.node.signals_since(self.signal_cursor)?;
+        let has_reorg = records.iter().any(|record| {
+            matches!(
+                record.name.as_str(),
+                signals::L1_REORG_DETECTED
+                    | signals::DERIVER_REORG_RETREATED
+                    | signals::DERIVER_REORG_NOOP
+            )
+        });
+        if records.iter().any(|record| {
+            matches!(
+                record.name.as_str(),
+                signals::DERIVER_STATE_DIVERGED_PRE
+                    | signals::DERIVER_STATE_DIVERGED_POST
+                    | signals::DERIVER_RESYNC_FAILED
+                    | signals::DERIVER_COMMITTER_CLOSED
+                    | signals::NODE_BOOT_CATCH_UP_FAILED
+                    | signals::NODE_PANIC
+            )
+        }) {
+            bail!("{scenario_name}: node emitted a divergence, fatal, or panic signal");
+        }
+
+        let safe = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Safe).await?;
+        let finalized = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Finalized).await?;
+        if let (Some(before), Some(after)) = (self.safe, safe)
+            && after.0 < before.0
+            && !has_reorg
+        {
+            bail!(
+                "{scenario_name}: safe head retreated {} -> {} without an L1 reorg signal",
+                before.0,
+                after.0
+            );
+        }
+        if let (Some(before), Some(after)) = (self.finalized, finalized)
+            && after.0 < before.0
+        {
+            bail!(
+                "{scenario_name}: finalized head retreated {} -> {}",
+                before.0,
+                after.0
+            );
+        }
+
+        let mut observed_safe = self.safe.map(|head| head.0).unwrap_or(0);
+        let mut reorg_authorized = false;
+        let mut observed_finalized = self.finalized.map(|head| head.0).unwrap_or(0);
+        let mut applied_entries = 0usize;
+        let mut settlement_points = Vec::new();
+        let mut grid_residue = self.grid_residue;
+        for record in &records {
+            match record.name.as_str() {
+                signals::L1_REORG_DETECTED
+                | signals::DERIVER_REORG_RETREATED
+                | signals::DERIVER_REORG_NOOP => reorg_authorized = true,
+                signals::DERIVER_SAFE_ADVANCED => {
+                    let next = record.u64("to_block")?;
+                    if next < observed_safe && !reorg_authorized {
+                        bail!(
+                            "{scenario_name}: safe signal retreated {observed_safe} -> {next} without an L1 reorg signal"
+                        );
+                    }
+                    observed_safe = next;
+                    reorg_authorized = false;
+                    let applied = record.u64("applied_entries")? as usize;
+                    applied_entries = applied_entries
+                        .checked_add(applied)
+                        .ok_or_else(|| anyhow!("{scenario_name}: applied-entry count overflow"))?;
+                    settlement_points.push((
+                        applied,
+                        record.b256("settled_state_root")?,
+                        record.b256("new_safe_state_root")?,
+                    ));
+                }
+                signals::DERIVER_FINALIZED_ADVANCED => {
+                    let next = record.u64("l2_finalized")?;
+                    if next < observed_finalized {
+                        bail!(
+                            "{scenario_name}: finalized signal retreated {observed_finalized} -> {next}"
+                        );
+                    }
+                    observed_finalized = next;
+                }
+                signals::COMPOSER_BUNDLE_DISPATCHED
+                | signals::COMPOSER_PHASE1_BUNDLE_DISPATCHED => {
+                    assert_sync_grid(record, &mut grid_residue, scenario_name)?;
+                }
+                signals::DERIVER_SYNC_BLOCK_BUILT => {
+                    assert_sync_grid(record, &mut grid_residue, scenario_name)?;
+                }
+                _ => {}
+            }
+        }
+
+        let execution_states = all_l2_execution_states(
+            &l1_rpc,
+            world.cfg.eez_address,
+            world.cfg.rollup_id,
+            world.dep.deploy_block,
+        )
+        .await?;
+        let new_execution_states = execution_states
+            .get(self.execution_states.len()..)
+            .ok_or_else(|| anyhow!("{scenario_name}: L2ExecutionPerformed history retreated"))?;
+        if new_execution_states.len() != applied_entries {
+            bail!(
+                "{scenario_name}: {} L2ExecutionPerformed events != {applied_entries} applied entries",
+                new_execution_states.len()
+            );
+        }
+        let mut event_offset = 0usize;
+        for (applied, settled_root, safe_root) in settlement_points {
+            event_offset += applied;
+            let event_root = new_execution_states
+                .get(event_offset.saturating_sub(1))
+                .ok_or_else(|| anyhow!("{scenario_name}: settlement has no matching L1 event"))?;
+            if *event_root != settled_root || settled_root != safe_root {
+                bail!("{scenario_name}: L1 and L2 roots differ at settlement point {event_offset}");
+            }
+        }
+        if safe.is_some() {
+            if expect_settled {
+                let committed =
+                    state_root(&l1_rpc, world.cfg.eez_address, world.cfg.rollup_id).await?;
+                let safe_root = safe_block_state_root(&l2_rpc)
+                    .await?
+                    .ok_or_else(|| anyhow!("{scenario_name}: safe L2 block is absent"))?;
+                if committed != safe_root {
+                    bail!("{scenario_name}: L1 committed root != L2 safe root");
+                }
+            }
+        }
+
+        assert_action_and_nonce_invariants(self, world, actions, scenario_name).await?;
+        if expect_settled {
+            assert_value_conservation(self, world, actions, scenario_name).await?;
+        }
+        Ok(())
+    }
+}
+
+fn assert_sync_grid(
+    record: &NodeSignal,
+    residue: &mut Option<u64>,
+    scenario_name: &str,
+) -> Result<()> {
+    let height = record.u64("sync_height")?;
+    let actual = height % CROSS_CHAIN_SYNC_INTERVAL;
+    match *residue {
+        Some(expected) if expected != actual => bail!(
+            "{scenario_name}: sync block {height} is off the deterministic K={} grid (residue {actual}, expected {expected})",
+            CROSS_CHAIN_SYNC_INTERVAL
+        ),
+        None => *residue = Some(actual),
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn assert_action_and_nonce_invariants(
+    before: &StandardOracleSnapshot,
+    world: &CrossChainWorld,
+    actions: &[ExecutedScenarioAction],
+    scenario_name: &str,
+) -> Result<()> {
+    let mut hashes = HashSet::with_capacity(actions.len());
+    let mut inbound = before.inbound_nonce;
+    let mut outbound = before.outbound_nonce;
+    for action in actions {
+        if !hashes.insert(action.hash) {
+            bail!("{scenario_name}: action hash {} was reused", action.hash);
+        }
+        let expected = match action.direction {
+            ScenarioDirection::Inbound => &mut inbound,
+            ScenarioDirection::Outbound => &mut outbound,
+        };
+        if action.nonce != *expected {
+            bail!(
+                "{scenario_name}: {:?} sender nonce {} was reused or skipped; expected {}",
+                action.direction,
+                action.nonce,
+                *expected
+            );
+        }
+        *expected += 1;
+    }
+    let actual_inbound = pending_nonce(&world.l1_rpc(), INBOUND_USER).await?;
+    let actual_outbound = pending_nonce(&world.l2_rpc(), OUTBOUND_USER).await?;
+    if actual_inbound < inbound || actual_outbound < outbound {
+        bail!("{scenario_name}: a sender nonce failed to advance monotonically");
+    }
+    Ok(())
+}
+
+async fn assert_value_conservation(
+    before: &StandardOracleSnapshot,
+    world: &CrossChainWorld,
+    actions: &[ExecutedScenarioAction],
+    scenario_name: &str,
+) -> Result<()> {
+    let mut inbound = U256::ZERO;
+    let mut outbound = U256::ZERO;
+    for action in actions {
+        match action.direction {
+            ScenarioDirection::Inbound => inbound += action.value,
+            ScenarioDirection::Outbound => outbound += action.value,
+        }
+    }
+    let after =
+        rollup_ether_balance(&world.l1_rpc(), world.cfg.eez_address, world.cfg.rollup_id).await?;
+    if before.rollup_ether_balance + inbound != after + outbound {
+        bail!(
+            "{scenario_name}: bridged value was not conserved (before={}, inbound={}, after={}, outbound={})",
+            before.rollup_ether_balance,
+            inbound,
+            after,
+            outbound
+        );
+    }
+    let contract_balance = account_balance(&world.l1_rpc(), world.cfg.eez_address).await?;
+    if contract_balance < after
+        || contract_balance + outbound < before.eez_contract_balance + inbound
+    {
+        bail!("{scenario_name}: L1 EEZ balance no longer backs bridged rollup funds");
+    }
+    Ok(())
+}
+
+/// Declarative cross-chain case. Calls and state oracles are data, so a matrix
+/// can be expressed as a `Vec<Scenario>` and run by [`run_scenarios`].
+#[derive(Debug)]
+pub struct Scenario {
+    name: String,
+    calls: Vec<(ScenarioDirection, ScenarioCall)>,
+    states: Vec<StateExpectation>,
+    expect_settled: bool,
+}
+
+impl Scenario {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            calls: Vec::new(),
+            states: Vec::new(),
+            expect_settled: false,
+        }
+    }
+
+    pub fn inbound(mut self, call: ScenarioCall) -> Self {
+        self.calls.push((ScenarioDirection::Inbound, call));
+        self
+    }
+
+    pub fn outbound(mut self, call: ScenarioCall) -> Self {
+        self.calls.push((ScenarioDirection::Outbound, call));
+        self
+    }
+
+    pub fn expect_l2_state(mut self, read: ValueRead, expected: impl IntoTestU256) -> Self {
+        self.states.push(StateExpectation {
+            side: StateSide::L2,
+            read,
+            expected: expected.into_test_u256(),
+        });
+        self
+    }
+
+    pub fn expect_l1_state(mut self, read: ValueRead, expected: impl IntoTestU256) -> Self {
+        self.states.push(StateExpectation {
+            side: StateSide::L1,
+            read,
+            expected: expected.into_test_u256(),
+        });
+        self
+    }
+
+    pub const fn expect_settled_fully(mut self) -> Self {
+        self.expect_settled = true;
+        self
+    }
+
+    pub async fn run(self, world: &CrossChainWorld) -> Result<()> {
+        let l1_rpc = world.l1_rpc();
+        let l2_rpc = world.l2_rpc();
+        let oracle = StandardOracleSnapshot::capture(world).await?;
+        let mut actions = Vec::with_capacity(self.calls.len());
+        for (direction, call) in self.calls {
+            let (ingress, receipt_rpc, key, chain_id) = match direction {
+                ScenarioDirection::Inbound => (
+                    world.l1_xchain(),
+                    l1_rpc.as_str(),
+                    INBOUND_USER,
+                    DEV_CHAIN_ID,
+                ),
+                ScenarioDirection::Outbound => (
+                    world.l2_xchain(),
+                    l2_rpc.as_str(),
+                    OUTBOUND_USER,
+                    world.l2_chain_id,
+                ),
+            };
+            let nonce = pending_nonce(receipt_rpc, key).await?;
+            let hash = sign_and_send(
+                &ingress,
+                key,
+                chain_id,
+                nonce,
+                Some(call.to),
+                call.value,
+                call.data,
+                call.gas_limit,
+            )
+            .await
+            .with_context(|| format!("{}: submit {direction:?} call", self.name))?;
+            wait_for(SETTLE_TIMEOUT, || async {
+                Ok(receipt_ok(receipt_rpc, hash)
+                    .await?
+                    .filter(|success| *success))
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "{}: {direction:?} call did not settle successfully",
+                    self.name
+                )
+            })?;
+            actions.push(ExecutedScenarioAction {
+                direction,
+                value: call.value,
+                nonce,
+                hash,
+            });
+        }
+
+        for expectation in self.states {
+            let rpc = match expectation.side {
+                StateSide::L1 => l1_rpc.as_str(),
+                StateSide::L2 => l2_rpc.as_str(),
+            };
+            wait_for(SETTLE_TIMEOUT, || async {
+                Ok(
+                    (l2_value(rpc, expectation.read.0).await? == expectation.expected)
+                        .then_some(()),
+                )
+            })
+            .await
+            .with_context(|| format!("{}: state expectation failed", self.name))?;
+        }
+
+        if self.expect_settled {
+            wait_for(SETTLE_TIMEOUT, || async {
+                let committed =
+                    state_root(&l1_rpc, world.cfg.eez_address, world.cfg.rollup_id).await?;
+                let safe = safe_block_state_root(&l2_rpc).await?;
+                Ok(safe.filter(|root| *root == committed).map(|_| ()))
+            })
+            .await
+            .with_context(|| {
+                format!("{}: committed and safe roots did not reconcile", self.name)
+            })?;
+        }
+
+        oracle
+            .assert_after(world, &actions, self.expect_settled, &self.name)
+            .await
+    }
+}
+
+pub async fn run_scenarios(
+    world: &CrossChainWorld,
+    scenarios: impl IntoIterator<Item = Scenario>,
+) -> Result<()> {
+    for scenario in scenarios {
+        scenario.run(world).await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod framework_tests {
+    use super::*;
+
+    #[test]
+    fn reorg_fixture_is_resolvable_after_testkit_extraction() {
+        assert!(reorg_genesis_path().is_file());
+        reorg_genesis_state_root().expect("parse reorg genesis fixture");
+    }
+}
+
 /// Start the shared cross-chain fixture.
 pub async fn setup_cross_chain() -> Result<CrossChainWorld> {
     setup_cross_chain_with_env(&[]).await
+}
+
+pub async fn setup_cross_chain_empty_call() -> Result<CrossChainEmptyCallWorld> {
+    let world = setup_cross_chain().await?;
+    let l1_rpc = world.l1_rpc();
+    let l2_rpc = world.l2_rpc();
+    let empty_call_l2 = deploy_empty_call(&l2_rpc, TARGET_DEPLOYER, world.l2_chain_id).await?;
+    let empty_call_proxy = create_cross_chain_proxy(
+        &l1_rpc,
+        world.cfg.deployer_key,
+        world.cfg.eez_address,
+        empty_call_l2,
+        world.cfg.rollup_id,
+    )
+    .await?;
+
+    Ok(CrossChainEmptyCallWorld {
+        world,
+        empty_call_l2,
+        empty_call_proxy,
+    })
+}
+
+pub async fn setup_cross_chain_return_data() -> Result<CrossChainReturnDataWorld> {
+    let world = setup_cross_chain().await?;
+    let l1_rpc = world.l1_rpc();
+    let l2_rpc = world.l2_rpc();
+    let return_data_l2 = deploy_return_data(&l2_rpc, TARGET_DEPLOYER, world.l2_chain_id).await?;
+    let return_data_proxy = create_cross_chain_proxy(
+        &l1_rpc,
+        world.cfg.deployer_key,
+        world.cfg.eez_address,
+        return_data_l2,
+        world.cfg.rollup_id,
+    )
+    .await?;
+    let return_data_wrapper =
+        deploy_return_data_wrapper(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID, return_data_proxy)
+            .await?;
+
+    Ok(CrossChainReturnDataWorld {
+        world,
+        return_data_wrapper,
+    })
+}
+
+pub async fn setup_cross_chain_nested_setter() -> Result<CrossChainNestedSetterWorld> {
+    let world = setup_cross_chain().await?;
+    let l1_rpc = world.l1_rpc();
+    let nested_setter_inner =
+        deploy_nested_setter_inner(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID, world.setter_proxy)
+            .await?;
+    let nested_setter_outer =
+        deploy_nested_setter_outer(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID, nested_setter_inner)
+            .await?;
+
+    Ok(CrossChainNestedSetterWorld {
+        world,
+        nested_setter_inner,
+        nested_setter_outer,
+    })
+}
+
+pub async fn setup_cross_chain_outbound_return_data() -> Result<CrossChainOutboundReturnDataWorld> {
+    let world = setup_cross_chain().await?;
+    let l1_rpc = world.l1_rpc();
+    let l2_rpc = world.l2_rpc();
+    let return_data_l1 = deploy_return_data(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID).await?;
+    let return_data_proxy =
+        create_l2_cross_chain_proxy(&l2_rpc, TARGET_DEPLOYER, return_data_l1, 0).await?;
+    let return_data_wrapper = deploy_return_data_wrapper(
+        &l2_rpc,
+        TARGET_DEPLOYER,
+        world.l2_chain_id,
+        return_data_proxy,
+    )
+    .await?;
+
+    Ok(CrossChainOutboundReturnDataWorld {
+        world,
+        return_data_wrapper,
+    })
+}
+
+pub async fn setup_cross_chain_codeless() -> Result<CrossChainCodelessWorld> {
+    let world = setup_cross_chain().await?;
+    let l1_rpc = world.l1_rpc();
+    let l2_rpc = world.l2_rpc();
+    let inbound_wrapper =
+        deploy_return_data_wrapper(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID, world.deposit_proxy)
+            .await?;
+    let outbound_wrapper = deploy_return_data_wrapper(
+        &l2_rpc,
+        TARGET_DEPLOYER,
+        world.l2_chain_id,
+        world.withdrawal_proxy,
+    )
+    .await?;
+
+    Ok(CrossChainCodelessWorld {
+        world,
+        inbound_wrapper,
+        outbound_wrapper,
+    })
 }
 
 /// Start the fixture with additional node environment variables.

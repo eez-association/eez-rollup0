@@ -160,6 +160,7 @@ where
                 event!(
                     name: "eez.node.follower.head.advanced",
                     Level::INFO,
+                    test_signal = "eez.node.follower.head.advanced",
                     block.number = number,
                     block.hash = %hash,
                     "follower advanced unsafe head to sequencer block",
@@ -170,6 +171,7 @@ where
                 event!(
                     name: "eez.node.follower.head.syncing",
                     Level::INFO,
+                    test_signal = "eez.node.follower.head.syncing",
                     block.number = number,
                     block.hash = %hash,
                     "reth accepted sequencer head as a sync target",

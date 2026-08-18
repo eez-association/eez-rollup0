@@ -11,7 +11,6 @@ use alloy_primitives::{B256, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::BlockNumberOrTag;
 
-mod common;
 use common::{
     ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
     AnvilConfig, Harness, NodeConfig, NodeHandle, block_number_and_hash_at, override_env,
@@ -20,6 +19,7 @@ use common::{
     wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
     wait_for_safe_prefix_convergence, wait_for_safe_state,
 };
+use eez_testkit as common;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_mins(3);
 
@@ -584,16 +584,16 @@ async fn happy_case_follower_sequencer_rpc() {
     .await
     .expect("follower safe block never matched the sequencer chain");
 
-    let unsafe_head_patterns = [
-        "follower advanced unsafe head to sequencer block",
-        "reth accepted sequencer head as a sync target",
+    let follower_head_signals = [
+        common::signals::FOLLOWER_HEAD_ADVANCED,
+        common::signals::FOLLOWER_HEAD_SYNCING,
     ];
-    let unsafe_head_events_before = follower.log_count_matching(&unsafe_head_patterns).unwrap();
+    let unsafe_head_events_before = follower.count_signals(&follower_head_signals).unwrap();
     seq.run_tx_spammer(ANVIL_KEY_1);
     common::wait_for(DEFAULT_TIMEOUT, || {
         std::future::ready(
             follower
-                .log_count_matching(&unsafe_head_patterns)
+                .count_signals(&follower_head_signals)
                 .map(|n| (n > unsafe_head_events_before).then_some(())),
         )
     })
@@ -827,7 +827,10 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
     // Proof the rogue path actually ran (not silently downgraded to L1-derived).
     assert!(
         follower
-            .log_count_matching(&["reth accepted sequencer head as a sync target"])
+            .count_signals(&[
+                common::signals::FOLLOWER_HEAD_ADVANCED,
+                common::signals::FOLLOWER_HEAD_SYNCING,
+            ])
             .unwrap()
             > 0,
         "follower never processed a rogue unsafe head",
