@@ -533,9 +533,9 @@ struct Inner<L2: BlockReader> {
     /// after the Sequencer spawns the actor. Slot-context recovery uses it to
     /// reorg an optimistically committed Sync block after L1 failure.
     committer: std::sync::OnceLock<BlockCommitterHandle<EthEngineTypes>>,
-    /// Per-block witnesses for [`eez_prover::ProvingContext::blocks`]. Set only
+    /// Per-block witnesses for [`eez_prover::ProvingContext::blocks`]. Present
     /// in remote-prover mode; `None` (mock) leaves `blocks` empty.
-    witness_source: std::sync::OnceLock<Arc<dyn eez_prover::ProvingWitnessSource>>,
+    witness_source: Option<Arc<dyn eez_prover::ProvingWitnessSource>>,
     /// Bounds on what one postBatch may settle. Read from env once here so
     /// the emission decision, the boundary math, and the span guard in
     /// `prepare_post_batch_raw` can never disagree about the cap mid-run.
@@ -565,6 +565,7 @@ where
         submitter: Submitter,
         evm_config: EthEvmConfig,
         cross_chain: CrossChainWiring,
+        witness_source: Option<Arc<dyn eez_prover::ProvingWitnessSource>>,
         timing: RollupTiming,
     ) -> Self {
         Self {
@@ -575,15 +576,10 @@ where
                 evm_config,
                 cross_chain,
                 committer: std::sync::OnceLock::new(),
-                witness_source: std::sync::OnceLock::new(),
+                witness_source,
                 emission: EmissionLimits::from_env(timing),
             }),
         }
-    }
-
-    /// Wire the proving-witness source (remote-prover mode only). Later calls no-op.
-    pub fn set_witness_source(&self, src: Arc<dyn eez_prover::ProvingWitnessSource>) {
-        let _ = self.inner.witness_source.set(src);
     }
 
     /// Wire the `BlockCommitter` handle after the Sequencer spawns the
@@ -2755,7 +2751,7 @@ where
         // Prove the assembled window (proofs[] empty — not part of the
         // publicInputsHash). Mock ignores the context; a remote prover re-executes
         // `blocks`. Settlement path, off block production.
-        let block_witnesses = match self.inner.witness_source.get() {
+        let block_witnesses = match self.inner.witness_source.as_ref() {
             // Remote-prover mode. Intermediate blocks `[from..sync)` are committed
             // (served by the witness store); a freshly-built endpoint isn't, so
             // capture it here from the in-memory block.

@@ -77,6 +77,24 @@ enum L1RoleRuntime<Sequencer, Composer> {
     },
 }
 
+enum WitnessCapture {
+    Disabled,
+    Remote {
+        sender: mpsc::UnboundedSender<B256>,
+        receiver: mpsc::UnboundedReceiver<B256>,
+        store: witness_source::WitnessStore,
+    },
+}
+
+impl WitnessCapture {
+    fn sender(&self) -> Option<mpsc::UnboundedSender<B256>> {
+        match self {
+            Self::Disabled => None,
+            Self::Remote { sender, .. } => Some(sender.clone()),
+        }
+    }
+}
+
 /// Embedded L1 reth handle — owned by `main` for the node lifetime so
 /// the L1 stays alive (drop tears it down). Generic over both variants'
 /// `NodeHandle` params because the AddOns type differs between
@@ -382,7 +400,7 @@ fn run<Ext: RoleArgs>(role: NodeRole) -> eyre::Result<()> {
         // hash here; a capture task re-executes it while parent state is fresh and
         // stores the witness for the composer. `None` otherwise. Created here to
         // thread `witness_sender` into the committer at spawn.
-        let (witness_sender, witness_rx, witness_store) =
+        let witness_capture =
             if role == NodeRole::Composer && env::var_os("EEZ_PROVER_URL").is_some() {
                 let (tx, rx) = mpsc::unbounded_channel::<B256>();
                 // Dedicated mdbx env (never reth's node DB); path env-configurable.
@@ -395,9 +413,13 @@ fn run<Ext: RoleArgs>(role: NodeRole) -> eyre::Result<()> {
                     path = %witness_db_path,
                     "persistent witness store opened",
                 );
-                (Some(tx), Some(rx), Some(store))
+                WitnessCapture::Remote {
+                    sender: tx,
+                    receiver: rx,
+                    store,
+                }
             } else {
-                (None, None, None)
+                WitnessCapture::Disabled
             };
 
         let mut sequencer = Sequencer::new(
@@ -407,7 +429,7 @@ fn run<Ext: RoleArgs>(role: NodeRole) -> eyre::Result<()> {
             schedule_rx,
             payload_builder_handle,
             timing,
-            witness_sender,
+            witness_capture.sender(),
         )?;
         if role != NodeRole::Standalone {
             let depth = env::var("EEZ_MAX_SPECULATIVE_DEPTH")
@@ -740,8 +762,12 @@ fn run<Ext: RoleArgs>(role: NodeRole) -> eyre::Result<()> {
             // composer's witness source with its store. Capturing at commit (parent
             // state still fresh) is why this works on a non-archival node. Spawned
             // before `evm_config` is moved into `Composer::new` below.
-            let witness_source = match (witness_rx, witness_store) {
-                (Some(rx), Some(store)) => {
+            let witness_source = match witness_capture {
+                WitnessCapture::Remote {
+                    receiver: rx,
+                    store,
+                    ..
+                } => {
                     let cap_provider = provider.clone();
                     let cap_evm = evm_config.clone();
                     let ws_provider = provider.clone();
@@ -766,7 +792,7 @@ fn run<Ext: RoleArgs>(role: NodeRole) -> eyre::Result<()> {
                         store, ws_provider, ws_evm,
                     )) as Arc<dyn eez_prover::ProvingWitnessSource>)
                 }
-                _ => None,
+                WitnessCapture::Disabled => None,
             };
             let composer = Composer::new(
                 rollups,
@@ -774,11 +800,9 @@ fn run<Ext: RoleArgs>(role: NodeRole) -> eyre::Result<()> {
                 submitter.clone(),
                 evm_config,
                 cross_chain,
+                witness_source,
                 timing,
             );
-            if let Some(ws) = witness_source {
-                composer.set_witness_source(ws);
-            }
             let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
 
             // Reuse the same Sequencer (and its single BlockCommitter
