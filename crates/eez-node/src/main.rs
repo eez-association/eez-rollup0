@@ -58,7 +58,9 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 const BOOT_CATCH_UP_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
-
+/// ~15 min at the capped backoff. Long enough to outlast a restarting L1,
+/// short enough that a permanently-refused RPC call surfaces as an exit.
+const BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES: u32 = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     Standalone,
@@ -823,11 +825,9 @@ fn main() -> eyre::Result<()> {
             composer_setup;
 
         let l2_source_chain_id = chain_spec.chain().id();
-        // Resolve and validate both required fronts before spawning the deriver,
-        // sequencer, or composer. The fronts are required infrastructure, so a
-        // missing configuration or bad/unavailable upstream must fail launch
-        // rather than leave a healthy-looking node running without cross-chain
-        // ingress.
+        // Resolve both required fronts. Misconfiguration still fails launch
+        // here; the upstream chain-id check runs after the L1 gate below, so a
+        // late L1 cannot stop the ports from binding.
         let mut xchain_fronts = Vec::new();
         if mode == Mode::Composer {
             require_xchain_composer_wiring(cross_chain_composer_wired)?;
@@ -837,11 +837,6 @@ fn main() -> eyre::Result<()> {
                 let (port, url, parsed) =
                     read_xchain_front_config(spec.port_env, spec.url_env)?;
                 let validation_provider = alloy_provider::RootProvider::new_http(parsed);
-                ingress::validate_cross_chain_front(
-                    &validation_provider,
-                    spec.expected_source_chain_id,
-                )
-                .await?;
                 xchain_fronts.push((spec, port, url, validation_provider));
             }
         }
@@ -861,12 +856,74 @@ fn main() -> eyre::Result<()> {
             system_tx_cfg,
         );
 
+        // Fronts bind BEFORE the L1 wait so orchestrator port checks see a
+        // live node; submissions are refused until `xchain_ready` flips below.
+        // L1 front = Inbound (L1→L2); L2 front = Outbound (L2→L1).
+        let xchain_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let xchain_checks: Vec<_> = xchain_fronts
+            .iter()
+            .map(|(spec, _, _, provider)| (spec.expected_source_chain_id, provider.clone()))
+            .collect();
+        for (spec, port, url, validation_provider) in xchain_fronts {
+            let pool = Arc::clone(&held_pool);
+            let ready = Arc::clone(&xchain_ready);
+            task_executor.spawn_critical_task(spec.task, async move {
+                ingress::run_cross_chain_front(
+                    port,
+                    url,
+                    spec.direction,
+                    pool,
+                    validation_provider,
+                    spec.expected_source_chain_id,
+                    ready,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("configured cross-chain front exited: {e:#}"));
+            });
+        }
+
+        // Wait until L1 can actually serve our history. Downstream then never
+        // has to encode "what if the L1 is empty / has no finality / is behind
+        // the deploy block" — those states simply cannot reach it.
+        wait_for_l1_ready(
+            &submitter,
+            rollup_config.deploy_block,
+            l1_source_chain_id.or_else(|| env::var("EEZ_L1_CHAIN_ID").ok()?.parse().ok()),
+        )
+        .await?;
+
+        for (expected_chain_id, provider) in &xchain_checks {
+            ingress::validate_cross_chain_front(provider, *expected_chain_id).await?;
+        }
+
         let mut catch_up_retry_delay = BOOT_CATCH_UP_INITIAL_RETRY_DELAY;
         let mut catch_up_attempts = 0_u64;
+        let mut transport_failures = 0_u32;
         let (l1_seed_number, l1_seed_hash) = loop {
             match deriver.catch_up_with_seed().await {
                 Ok(seed) => break seed,
-                Err(err) if err.is_source_incomplete() => {
+                // SourceIncomplete stays uncapped — only time fixes it.
+                // Transport does not: the alloy error is stringified into
+                // Provider, so a permanent JSON-RPC refusal is indistinguish-
+                // able from a dropped connection and would retry forever.
+                Err(err) if err.is_l1_transport() && {
+                    transport_failures += 1;
+                    transport_failures >= BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES
+                } =>
+                {
+                    event!(
+                        name: "eez.node.deriver.boot_catch_up.transport_exhausted",
+                        Level::ERROR,
+                        mode = mode.name(),
+                        transport_failures,
+                        error = %err,
+                        "L1 transport kept failing during boot catch-up; the endpoint is likely refusing a call we need, not merely unreachable",
+                    );
+                    return Err(eyre::eyre!(
+                        "boot-time deriver catch_up gave up after {transport_failures} L1 transport failures: {err}"
+                    ));
+                }
+                Err(err) if err.is_source_incomplete() || err.is_l1_transport() => {
                     catch_up_attempts += 1;
                     event!(
                         name: "eez.node.deriver.boot_catch_up.source_incomplete",
@@ -952,25 +1009,6 @@ fn main() -> eyre::Result<()> {
                 composer.run(composer_events).await;
             });
 
-            // Cross-chain ingress fronts (see `run_cross_chain_front`) — one per
-            // SOURCE chain, sharing `held_pool`. Both are required in composer mode:
-            //   L1 front (EEZ_L1_XCHAIN_PORT → EEZ_L1_RPC_URL): L1→L2 Inbound.
-            //   L2 front (EEZ_L2_XCHAIN_PORT → EEZ_L2_RPC_URL): L2→L1 Outbound.
-            for (spec, port, url, validation_provider) in xchain_fronts {
-                let pool = Arc::clone(&held_pool);
-                task_executor.spawn_critical_task(spec.task, async move {
-                    ingress::run_cross_chain_front(
-                        port,
-                        url,
-                        spec.direction,
-                        pool,
-                        validation_provider,
-                        spec.expected_source_chain_id,
-                    )
-                    .await
-                    .unwrap_or_else(|e| panic!("configured cross-chain front exited: {e:#}"));
-                });
-            }
         }
 
         // Start polling last: every consumer is subscribed and catch-up
@@ -980,9 +1018,184 @@ fn main() -> eyre::Result<()> {
             "eez-l1-watcher",
             l1_watcher.polling(l1_seed_number, l1_seed_hash),
         );
+        xchain_ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
         handle.wait_for_node_exit().await
     })
+}
+
+/// Blocks until L1 serves our history: head at or past the deploy block, and
+/// that block's header, logs, and tx bodies readable. Patience follows
+/// progress, not a clock — a stalled source fails loudly instead of hanging.
+async fn wait_for_l1_ready(
+    submitter: &Submitter,
+    deploy_block: u64,
+    expected_chain_id: Option<u64>,
+) -> eyre::Result<()> {
+    const POLL: Duration = Duration::from_secs(2);
+    // `eth_syncing` is false both when synced AND when sync never started, so
+    // head progress is the real signal. Generous: a CL that checkpoint-syncs
+    // first leaves the EL parked for minutes before it drives it.
+    const STALLED_POLLS: u32 = 450; // 15 min with no progress at all
+    // A self-reported sync buys patience, not immunity: a snap sync wedged on
+    // zero peers reports `syncing` forever with a frozen head, so an unbounded
+    // grant would hang exactly as hard as no detector at all.
+    const SYNCING_POLLS: u32 = 3_600; // 2 h of a sync that never arrives
+    // High-water marks, not last-sample: a head oscillating behind a
+    // load balancer would otherwise reset the counter every other poll.
+    let mut best_remaining = u64::MAX;
+    let mut stalled = 0_u32;
+    let mut waited = 0_u32;
+    // Without this the bail message blames pruning / wrong chain / a stale
+    // deploy block even when the real cause was a refused RPC call.
+    let mut last_err: Option<String> = None;
+    // Checked on the first successful probe, not before the loop — that
+    // skipped it on exactly the endpoint the gate exists for. Only when the
+    // expected id is known; never against a default.
+    let mut chain_verified = expected_chain_id.is_none();
+    // A legitimate checkpoint sync can sit here for half an hour; one WARN per
+    // 2s poll buries everything else. First and every 30th (~1/min).
+    let noisy = |n: u32| n <= 1 || n.is_multiple_of(30);
+    loop {
+        if !chain_verified {
+            match submitter.chain_id().await {
+                Ok(actual) => {
+                    let expected = expected_chain_id.expect("checked by chain_verified");
+                    if actual != expected {
+                        return Err(eyre::eyre!(
+                            "EEZ_L1_RPC_URL serves chain {actual}, expected {expected}"
+                        ));
+                    }
+                    chain_verified = true;
+                }
+                Err(err) => {
+                    // Captured and throttled like every other probe failure: a
+                    // permanently broken eth_chainId must name itself in the
+                    // bail message, not hide behind the generic guess.
+                    last_err = Some(format!("eth_chainId: {err}"));
+                    if noisy(waited) {
+                        event!(
+                            name: "eez.node.l1_chain_id_unavailable",
+                            Level::WARN,
+                            error = %err,
+                            "could not read the L1 chain id yet; will re-check before declaring ready",
+                        );
+                    }
+                }
+            }
+        }
+        match submitter.readiness().await {
+            Ok(state) if state.head >= deploy_block => {
+                match submitter.serves_history(deploy_block).await {
+                    // Serving history but the chain id never read: keep
+                    // polling rather than declare ready on an unverified chain.
+                    Ok(true) if chain_verified => {
+                        event!(
+                            name: "eez.node.l1_ready",
+                            Level::INFO,
+                            head = state.head,
+                            deploy_block,
+                            "L1 source can serve our history",
+                        );
+                        return Ok(());
+                    }
+                    // Tall enough but missing the history: pruned, or still
+                    // backfilling. Head movement says nothing about that, so
+                    // only a self-reported sync buys patience.
+                    Ok(serves) => {
+                        if state.syncing {
+                            stalled = 0;
+                        } else {
+                            stalled += 1;
+                        }
+                        if noisy(waited) {
+                            event!(
+                                name: "eez.node.l1_not_ready",
+                                Level::WARN,
+                                head = state.head,
+                                deploy_block,
+                                syncing = state.syncing,
+                                serves_history = serves,
+                                chain_verified,
+                                stalled_polls = stalled,
+                                "L1 is not ready to serve our history yet",
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        stalled += 1;
+                        last_err = Some(err.to_string());
+                        event!(
+                            name: "eez.node.l1_probe_failed",
+                            Level::WARN,
+                            error = %err,
+                            stalled_polls = stalled,
+                            "L1 history probe failed",
+                        );
+                    }
+                }
+            }
+            // Still below the deploy block: closing the gap IS head progress,
+            // so a `syncing` flag adds nothing here — only the gap counts.
+            Ok(state) => {
+                let remaining = deploy_block.saturating_sub(state.head);
+                if remaining < best_remaining {
+                    best_remaining = remaining;
+                    stalled = 0;
+                } else {
+                    stalled += 1;
+                }
+                if noisy(waited) {
+                    event!(
+                        name: "eez.node.l1_not_ready",
+                        Level::WARN,
+                        head = state.head,
+                        deploy_block,
+                        syncing = state.syncing,
+                        stalled_polls = stalled,
+                        "L1 has not reached the deploy block",
+                    );
+                }
+            }
+            Err(err) => {
+                stalled += 1;
+                last_err = Some(err.to_string());
+                event!(
+                    name: "eez.node.l1_probe_failed",
+                    Level::WARN,
+                    error = %err,
+                    stalled_polls = stalled,
+                    "L1 readiness probe failed",
+                );
+            }
+        }
+        waited += 1;
+        if waited >= SYNCING_POLLS {
+            return Err(eyre::eyre!(
+                "L1 never became ready to serve block {deploy_block}; it reported progress \
+                 but never arrived"
+            ));
+        }
+        if stalled >= STALLED_POLLS {
+            let cause = last_err.map_or_else(
+                || "it may be pruned, on the wrong chain, or EEZ_REGISTRY_DEPLOY_BLOCK may be stale".to_string(),
+                |err| format!("last error: {err}"),
+            );
+            return Err(eyre::eyre!(
+                "L1 made no progress toward serving block {deploy_block}; {cause}"
+            ));
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Read the L1 rollup id from env. Defaults to `0` to match the bridge
+/// E2E fixture's `MAINNET_ROLLUP_ID`.
+fn read_l1_rollup_id() -> u64 {
+    env::var("EEZ_L1_ROLLUP_ID")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// Build a `SystemTxContext` for follower mode from env (the follower
@@ -1030,15 +1243,6 @@ where
         l2_gas_limit: 2_000_000,
         this_rollup_id,
     }))
-}
-
-/// Read the L1 rollup id from env. Defaults to `0` to match the bridge
-/// E2E fixture's `MAINNET_ROLLUP_ID`.
-fn read_l1_rollup_id() -> u64 {
-    env::var("EEZ_L1_ROLLUP_ID")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0)
 }
 
 fn read_l1_chain_id() -> eyre::Result<u64> {

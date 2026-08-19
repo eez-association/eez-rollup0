@@ -179,9 +179,19 @@ fn upfront_cost(envelope: &TxEnvelope) -> Result<U256, String> {
         .ok_or_else(|| "upfront cost overflow: value + gas_limit * max_fee_per_gas".to_string())
 }
 
+/// Refusal returned while the node is still reconciling with L1. This text is
+/// a WIRE CONTRACT: the e2e helper and the shell harnesses under `scripts/` and
+/// `testing/kurtosis/` match on the substring "starting up" to retry. Changing
+/// it means changing them too.
+pub const STARTING_UP_MSG: &str =
+    "eez node is starting up; cross-chain submissions are not accepted yet";
+
 /// Shared, cheaply-clonable per-connection context.
 #[derive(Clone)]
 struct Ctx {
+    /// False until the deriver has reconciled with L1. Submissions are refused
+    /// until then rather than queued into a pool nothing is draining yet.
+    ready: Arc<std::sync::atomic::AtomicBool>,
     client: reqwest::Client,
     upstream_rpc_url: String,
     direction: Direction,
@@ -223,6 +233,7 @@ pub async fn run_cross_chain_front(
     held_pool: Arc<HeldPool>,
     validation_provider: RootProvider,
     expected_source_chain_id: u64,
+    ready: Arc<std::sync::atomic::AtomicBool>,
 ) -> eyre::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
@@ -239,6 +250,7 @@ pub async fn run_cross_chain_front(
         "cross-chain front listening (forward eth_* to source chain; intercept sendRawTransaction)",
     );
     let ctx = Ctx {
+        ready,
         client,
         upstream_rpc_url,
         direction,
@@ -395,6 +407,18 @@ async fn handle(
             Value::Null,
             -32600,
             "send cross-chain eth_sendRawTransaction singly, not in a JSON-RPC batch",
+        ));
+    }
+
+    // Refuse submissions until the node is live; accepting them would strand
+    // txs in a pool no one drains. Reads still pass through.
+    if json.get("method").and_then(Value::as_str) == Some("eth_sendRawTransaction")
+        && !ctx.ready.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Ok(rpc_error(
+            json.get("id").cloned().unwrap_or(Value::Null),
+            -32000,
+            STARTING_UP_MSG,
         ));
     }
 
@@ -1028,6 +1052,7 @@ mod tests {
             Arc::clone(&pool),
             inbound_provider,
             1,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
         ));
         let outbound_task = tokio::spawn(run_cross_chain_front(
             outbound_port,
@@ -1036,6 +1061,7 @@ mod tests {
             Arc::clone(&pool),
             outbound_provider,
             1,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
         ));
         wait_for_front(inbound_port).await;
         wait_for_front(outbound_port).await;
@@ -1063,5 +1089,52 @@ mod tests {
 
         inbound_task.abort();
         outbound_task.abort();
+    }
+
+    /// The `-32000 "starting up"` refusal is a wire contract: the e2e helper
+    /// and the wave harnesses retry on that text. Reads must still answer.
+    #[tokio::test]
+    async fn front_refuses_submissions_until_ready_without_touching_the_pool() {
+        let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(3)).unwrap();
+        let (_, tx) = signed_transfer(&signer, 0, 1, 1);
+
+        let pool = Arc::new(HeldPool::new());
+        let port = free_port();
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
+        asserter.push_success(&U256::from(1_000_000u64));
+        asserter.push_success(&0_u64);
+
+        let task = tokio::spawn(run_cross_chain_front(
+            port,
+            "http://127.0.0.1:1".into(),
+            Direction::Inbound,
+            Arc::clone(&pool),
+            provider,
+            1,
+            Arc::clone(&ready),
+        ));
+        wait_for_front(port).await;
+
+        let refused = send_raw(port, &tx, 1).await;
+        assert_eq!(refused["error"]["code"], -32000, "{refused}");
+        assert!(
+            refused["error"]["message"].as_str().unwrap() == STARTING_UP_MSG,
+            "harnesses match this text: {refused}"
+        );
+        assert_eq!(
+            refused["id"], 1,
+            "the caller's id must come back: {refused}"
+        );
+        assert!(pool.pop_all().is_empty(), "a refused tx must not be held");
+
+        ready.store(true, std::sync::atomic::Ordering::Relaxed);
+        let accepted = send_raw(port, &tx, 2).await;
+        assert!(accepted.get("error").is_none(), "{accepted}");
+        assert_eq!(pool.pop_all().len(), 1);
+
+        task.abort();
     }
 }

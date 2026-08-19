@@ -79,6 +79,22 @@ retry() {
     done
 }
 
+# send_raw <rpc_url> <raw_tx> [id] — nonzero on rejection, caller decides.
+# Fronts refuse submissions until the node has reconciled with L1; that is a
+# transient boot state, so wait it out rather than reporting it as a drop.
+send_raw() {
+    local resp i
+    for i in $(seq 1 120); do
+        resp=$(curl -s -X POST "$1" -H 'Content-Type: application/json' \
+            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$2\"],\"id\":${3:-1}}")
+        grep -q '"error"' <<<"$resp" || return 0
+        grep -q 'starting up' <<<"$resp" || { echo "    ✗ rejected tx: $resp" >&2; return 1; }
+        sleep 1
+    done
+    echo "    ✗ node still starting up after 120s" >&2
+    return 1
+}
+
 # ── Prereqs ──────────────────────────────────────────────────────────
 for t in cast forge jq docker; do command -v "$t" >/dev/null || { echo "$t not in PATH"; exit 1; }; done
 [[ -f "$REPO/deployments.env" ]] || { echo "deployments.env missing — run make deploy-protocol first"; exit 1; }
@@ -158,8 +174,7 @@ submit_wave() {
     for i in "${!RAW_TXS[@]}"; do
         local H; H=$(cast keccak "${RAW_TXS[$i]}")
         ALL_USER_TX_HASHES+=("$H"); TX_META+=("$H ${OP_KINDS[$i]} ${OP_ARGS[$i]}")
-        curl -s -X POST "$XCHAIN_L1" -H 'Content-Type: application/json' \
-            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"${RAW_TXS[$i]}\"],\"id\":$i}" >/dev/null
+        send_raw "$XCHAIN_L1" "${RAW_TXS[$i]}" "$i" || exit 1
     done
     echo "    wave $WAVE_ID submitted: ${#RAW_TXS[@]} ops [$OPS]"
 }
@@ -173,8 +188,7 @@ submit_filler() {
             --gas-limit 21000 --gas-price 1000000000 --priority-gas-price 1000000000 \
             --value 100000000 "$FILLER_RECIPIENT" 2>&1)
         [[ "$RAW" =~ ^0x[0-9a-fA-F]+$ ]] || break
-        curl -s -X POST "$L2_RPC" -H 'Content-Type: application/json' \
-            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$RAW\"],\"id\":99}" >/dev/null
+        send_raw "$L2_RPC" "$RAW" 99 || break
         sleep 1
     done
     echo "    filler: $COUNT L2-only transfers submitted"
