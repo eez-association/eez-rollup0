@@ -248,7 +248,7 @@ assert_proof_for_height() {
         node_evidence=$(sed -n "$((node_baseline + 1)),\$p" "$NODE_LOG" | strip_ansi)
         signer_evidence=$(sed -n "$((signer_baseline + 1)),\$p" "$SIGNER_LOG" | strip_ansi)
         settled=$(grep -F 'event_name="eez.composer.bundle.observed"' <<<"$node_evidence" \
-            | grep -F "sync_height=$sync_height" | grep -F 'settled=true' | tail -1 || true)
+            | grep -E "sync_height=$sync_height([^0-9]|\$)" | grep -F 'settled=true' | tail -1 || true)
         attested_hash=$(grep -F 'event_name="eez.prover_client.attested"' <<<"$node_evidence" \
             | grep -E "to=$sync_height([^0-9]|$)" | grep -oE 'hash=0x[0-9a-fA-F]{64}' \
             | tail -1 | cut -d= -f2 || true)

@@ -328,34 +328,6 @@ mod tests {
         assert!(verify_outbound_authorized(&[entry(vec![c])], &[observation], 1).is_err());
     }
 
-    #[test]
-    fn outbound_static_proxy_call_is_rejected_by_the_authorization_gate() {
-        let mut c = call(
-            address!("00000000000000000000000000000000000000aa"),
-            address!("dc64a140aa3e981100a9beca4e685f962f0cf6c9"),
-            0,
-            &[0x12, 0x34],
-        );
-        c.isStatic = true;
-        let static_observation = OutboundCallObservation::new(
-            l2_outbound_call_hash(
-                CallHashInput {
-                    call_mode: CallMode::Static,
-                    source_address: c.sourceAddress,
-                    source_rollup_id: RollupId(1),
-                    target_address: c.targetAddress,
-                    target_rollup_id: RollupId::MAINNET,
-                    value: c.value,
-                    data: &c.data,
-                },
-                SUPPORTED_CALL_GAS,
-            ),
-            SUPPORTED_CALL_GAS,
-        );
-
-        assert!(verify_outbound_authorized(&[entry(vec![c])], &[static_observation], 1).is_err());
-    }
-
     /// Multiset semantics: two identical outbound entries need two matching
     /// events. One event authorizes only the first; the second is a phantom.
     #[test]

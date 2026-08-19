@@ -518,7 +518,6 @@ impl Harness {
         let mut env = vec![
             ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
             ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
-            ("EEZ_L1_TARGET_RPC_URL", self.anvil.rpc_url.clone()),
             ("EEZ_L1_POSTER_KEY", opts.poster_key.to_string()),
             ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
@@ -1476,8 +1475,62 @@ async fn account_balance(rpc_url: &str, address: Address) -> Result<U256> {
     Ok(provider.get_balance(address).await?)
 }
 
-/// Count events of `event_sig_hash` emitted by `contract` since
-/// `from_block`. Used by tests that assert exact event counts.
+/// Derive the address seen as `msg.sender` on the destination chain.
+pub async fn cross_chain_source_proxy(
+    rpc_url: &str,
+    manager: Address,
+    original: Address,
+    original_rollup_id: u64,
+) -> Result<Address> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(IProxyDerivation::new(manager, &provider)
+        .computeCrossChainProxyAddress(original, original_rollup_id)
+        .call()
+        .await?)
+}
+
+/// Return the revert data from an `eth_call` that is expected to fail.
+pub async fn call_revert_data(
+    rpc_url: &str,
+    from: Address,
+    to: Address,
+    data: Vec<u8>,
+) -> Result<Bytes> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let request = TransactionRequest::default()
+        .from(from)
+        .to(to)
+        .input(Bytes::from(data).into());
+    match provider.call(request).await {
+        Ok(returned) => bail!("eth_call unexpectedly succeeded, returning {returned}"),
+        Err(err) => {
+            let payload = err
+                .as_error_resp()
+                .ok_or_else(|| anyhow!("eth_call failed without an RPC error payload: {err}"))?;
+            payload
+                .as_revert_data()
+                .ok_or_else(|| anyhow!("eth_call failed without revert data: {err}"))
+        }
+    }
+}
+
+/// Return matching logs in chain order.
+pub async fn events_since(
+    rpc_url: &str,
+    contract: Address,
+    event_sig_hash: B256,
+    from_block: u64,
+) -> Result<Vec<alloy_rpc_types_eth::Log>> {
+    use alloy_rpc_types_eth::Filter;
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let filter = Filter::new()
+        .address(contract)
+        .event_signature(event_sig_hash)
+        .from_block(from_block);
+    Ok(provider.get_logs(&filter).await?)
+}
+
+/// Count matching events emitted at or after `from_block`.
 pub async fn count_events(
     rpc_url: &str,
     contract: Address,
@@ -1737,6 +1790,24 @@ sol! {
         function lastNewValue() external view returns (uint256);
     }
     #[sol(rpc)]
+    interface IRevertingTarget {
+        error Rejected(uint256 seen);
+        function calls() external view returns (uint256);
+        function lastValue() external view returns (uint256);
+        function revertCustom(uint256 v) external payable;
+        function revertString(uint256 v) external payable;
+        function writeThenRevert(uint256 v) external payable;
+        function succeed(uint256 v) external payable returns (uint256);
+    }
+    #[sol(rpc)]
+    interface IRevertBubbleWrapper {
+        function callAndRecord(bytes calldata data) external;
+        function failures() external view returns (uint256);
+        function successes() external view returns (uint256);
+        function lastRevertLength() external view returns (uint256);
+        function lastRevertHash() external view returns (bytes32);
+    }
+    #[sol(rpc)]
     interface IReturnData {
         function echo(bytes calldata value) external returns (bytes memory);
         function emptyBytes() external returns (bytes memory);
@@ -1755,8 +1826,14 @@ sol! {
     interface INestedSetterOuter {
         function setViaInner(uint256 v) external;
     }
+    /// Derives the source proxy used on the destination chain.
+    #[sol(rpc)]
+    interface IProxyDerivation {
+        function computeCrossChainProxyAddress(address originalAddress, uint64 originalRollupId) external view returns (address);
+    }
     #[sol(rpc)]
     interface IEEZL2Direct {
+        error UnauthorizedProxy();
         function executeCrossChainCall(address sourceAddress, bytes calldata callData) external payable returns (bytes memory);
     }
 }
@@ -2020,6 +2097,35 @@ pub async fn deploy_value_no_ret(
     .await
 }
 
+async fn deploy_reverting_target(rpc_url: &str, key: &str, chain_id: u64) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("RevertingTarget.sol/RevertingTarget.json"),
+        Vec::new(),
+    )
+    .await
+}
+
+async fn deploy_revert_bubble_wrapper(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    proxy: Address,
+) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("RevertBubbleWrapper.sol/RevertBubbleWrapper.json"),
+        proxy.abi_encode(),
+    )
+    .await
+}
+
 async fn deploy_return_data(rpc_url: &str, key: &str, chain_id: u64) -> Result<Address> {
     let out = repo_root().join("contracts/out");
     deploy_raw(
@@ -2108,16 +2214,6 @@ pub async fn value_no_ret(rpc_url: &str, value_addr: Address) -> Result<U256> {
         .await?)
 }
 
-pub async fn empty_call_state(rpc_url: &str, target: Address) -> Result<(U256, U256, U256)> {
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let target = IEmptyCall::new(target, &provider);
-    Ok((
-        target.calls().call().await?,
-        target.received().call().await?,
-        target.lastValue().call().await?,
-    ))
-}
-
 pub async fn completed_proxy_calls(rpc_url: &str, wrapper: Address) -> Result<U256> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     Ok(ISetterWrapper::new(wrapper, &provider)
@@ -2133,28 +2229,6 @@ pub async fn last_proxy_result(rpc_url: &str, wrapper: Address) -> Result<(bool,
         wrapper.lastChanged().call().await?,
         wrapper.lastNewValue().call().await?,
     ))
-}
-
-pub async fn return_data_length(rpc_url: &str, wrapper: Address) -> Result<U256> {
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let wrapper = IReturnDataWrapper::new(wrapper, &provider);
-    Ok(wrapper.lastReturnDataLength().call().await?)
-}
-
-pub async fn return_data_hash(rpc_url: &str, wrapper: Address) -> Result<B256> {
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    Ok(IReturnDataWrapper::new(wrapper, &provider)
-        .lastReturnDataHash()
-        .call()
-        .await?)
-}
-
-pub async fn nested_proxy_calls(rpc_url: &str, inner: Address) -> Result<U256> {
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    Ok(INestedSetterInner::new(inner, &provider)
-        .completedProxyCalls()
-        .call()
-        .await?)
 }
 
 /// Create an outbound proxy through the `EEZL2` predeploy.
@@ -2327,7 +2401,6 @@ impl CrossChainConfig {
             ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_RPC_URL", self.l1_rpc_url()),
             ("EEZ_L1_BUILDER_RPC_URL", self.l1_rpc_url()),
-            ("EEZ_L1_TARGET_RPC_URL", self.l1_rpc_url()),
             ("EEZ_L1_XCHAIN_PORT", self.l1_xchain_port.to_string()),
             ("EEZ_L2_XCHAIN_PORT", self.l2_xchain_port.to_string()),
             ("EEZ_L1_HTTP_PORT", self.l1_http_port.to_string()),
@@ -2387,6 +2460,9 @@ pub const SETTLE_TIMEOUT: Duration = Duration::from_mins(3);
 const CROSS_CHAIN_L1_BLOCK_TIME_MS: u64 = 5_000;
 const CROSS_CHAIN_L2_BLOCK_TIME_MS: u64 = 1_000;
 const CROSS_CHAIN_SYNC_INTERVAL: u64 = CROSS_CHAIN_L1_BLOCK_TIME_MS / CROSS_CHAIN_L2_BLOCK_TIME_MS;
+
+/// L1's rollup ID in cross-chain identities.
+pub const L1_ROLLUP_ID: u64 = 0;
 
 /// Separate deployer keeps CREATE addresses deterministic.
 pub const TARGET_DEPLOYER: &str = ANVIL_KEY_3;
@@ -2472,6 +2548,26 @@ impl std::ops::Deref for CrossChainOutboundReturnDataWorld {
     }
 }
 
+/// A destination that reverts, reached through a source-side wrapper. Both
+/// directions are wired so one fixture covers inbound and outbound.
+pub struct CrossChainRevertWorld {
+    pub world: CrossChainWorld,
+    /// Reverting target on L2, called by `inbound_wrapper` on L1.
+    pub reverting_target_l2: Address,
+    pub inbound_wrapper: Address,
+    /// Reverting target on L1, called by `outbound_wrapper` on L2.
+    pub reverting_target_l1: Address,
+    pub outbound_wrapper: Address,
+}
+
+impl std::ops::Deref for CrossChainRevertWorld {
+    type Target = CrossChainWorld;
+
+    fn deref(&self) -> &Self::Target {
+        &self.world
+    }
+}
+
 pub struct CrossChainCodelessWorld {
     pub world: CrossChainWorld,
     pub inbound_wrapper: Address,
@@ -2524,6 +2620,19 @@ impl ScenarioCall {
             gas_limit: 900_000,
         }
     }
+
+    /// Set the value bridged by this call.
+    #[must_use]
+    pub fn with_value(mut self, value: impl IntoTestU256) -> Self {
+        self.value = value.into_test_u256();
+        self
+    }
+
+    #[must_use]
+    pub const fn with_gas_limit(mut self, gas_limit: u64) -> Self {
+        self.gas_limit = gas_limit;
+        self
+    }
 }
 
 pub trait IntoTestU256 {
@@ -2542,6 +2651,13 @@ impl IntoTestU256 for u64 {
     }
 }
 
+// Represent a `bytes32` getter result as a single word.
+impl IntoTestU256 for B256 {
+    fn into_test_u256(self) -> U256 {
+        U256::from_be_bytes(self.0)
+    }
+}
+
 pub fn setter_call(proxy: Address, value: impl IntoTestU256) -> ScenarioCall {
     ScenarioCall::new(
         proxy,
@@ -2552,11 +2668,26 @@ pub fn setter_call(proxy: Address, value: impl IntoTestU256) -> ScenarioCall {
     )
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct ValueRead(Address);
+/// A labeled single-word state read.
+#[derive(Clone, Debug)]
+pub struct StateRead {
+    target: Address,
+    calldata: Vec<u8>,
+    label: String,
+}
 
-pub const fn value_read(contract: Address) -> ValueRead {
-    ValueRead(contract)
+/// Read `Value.value()`.
+pub fn value_read(contract: Address) -> StateRead {
+    call_read(contract, "value()", IValue::valueCall {}.abi_encode())
+}
+
+/// Define a state read for a getter that returns one word.
+pub fn call_read(target: Address, label: impl Into<String>, calldata: Vec<u8>) -> StateRead {
+    StateRead {
+        target,
+        calldata,
+        label: label.into(),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2565,11 +2696,36 @@ enum StateSide {
     L2,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct StateExpectation {
     side: StateSide,
-    read: ValueRead,
+    read: StateRead,
     expected: U256,
+}
+
+// Execute a state read and decode its first 32-byte word.
+pub async fn read_state_word(rpc_url: &str, read: &StateRead) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let returned = provider
+        .call(
+            TransactionRequest::default()
+                .to(read.target)
+                .input(Bytes::from(read.calldata.clone()).into()),
+        )
+        .await
+        .with_context(|| format!("eth_call {} on {}", read.label, read.target))?;
+    let word: [u8; 32] = returned
+        .get(..32)
+        .and_then(|w| w.try_into().ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "{} on {} returned {} bytes; expected at least one word",
+                read.label,
+                read.target,
+                returned.len()
+            )
+        })?;
+    Ok(U256::from_be_bytes(word))
 }
 
 #[derive(Clone, Debug)]
@@ -2662,6 +2818,15 @@ impl StandardOracleSnapshot {
         }) {
             bail!("{scenario_name}: node emitted a divergence, fatal, or panic signal");
         }
+        // Every scenario submits valid single-call txs, so any eviction is a bug.
+        if records.iter().any(|record| {
+            matches!(
+                record.name.as_str(),
+                signals::TX_POISON_EVICTED | signals::TX_NONCE_CHAIN_EVICTED
+            )
+        }) {
+            bail!("{scenario_name}: a valid scenario transaction was evicted");
+        }
 
         let safe = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Safe).await?;
         let finalized = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Finalized).await?;
@@ -2688,7 +2853,6 @@ impl StandardOracleSnapshot {
         let mut observed_safe = self.safe.map(|head| head.0).unwrap_or(0);
         let mut reorg_authorized = false;
         let mut observed_finalized = self.finalized.map(|head| head.0).unwrap_or(0);
-        let mut applied_entries = 0usize;
         let mut settlement_points = Vec::new();
         let mut grid_residue = self.grid_residue;
         for record in &records {
@@ -2705,12 +2869,8 @@ impl StandardOracleSnapshot {
                     }
                     observed_safe = next;
                     reorg_authorized = false;
-                    let applied = record.u64("applied_entries")? as usize;
-                    applied_entries = applied_entries
-                        .checked_add(applied)
-                        .ok_or_else(|| anyhow!("{scenario_name}: applied-entry count overflow"))?;
                     settlement_points.push((
-                        applied,
+                        record.u64("applied_entries")? as usize,
                         record.b256("settled_state_root")?,
                         record.b256("new_safe_state_root")?,
                     ));
@@ -2725,10 +2885,8 @@ impl StandardOracleSnapshot {
                     observed_finalized = next;
                 }
                 signals::COMPOSER_BUNDLE_DISPATCHED
-                | signals::COMPOSER_PHASE1_BUNDLE_DISPATCHED => {
-                    assert_sync_grid(record, &mut grid_residue, scenario_name)?;
-                }
-                signals::DERIVER_SYNC_BLOCK_BUILT => {
+                | signals::COMPOSER_PHASE1_BUNDLE_DISPATCHED
+                | signals::DERIVER_SYNC_BLOCK_BUILT => {
                     assert_sync_grid(record, &mut grid_residue, scenario_name)?;
                 }
                 _ => {}
@@ -2742,35 +2900,50 @@ impl StandardOracleSnapshot {
             world.dep.deploy_block,
         )
         .await?;
-        let new_execution_states = execution_states
-            .get(self.execution_states.len()..)
-            .ok_or_else(|| anyhow!("{scenario_name}: L2ExecutionPerformed history retreated"))?;
-        if new_execution_states.len() != applied_entries {
-            bail!(
-                "{scenario_name}: {} L2ExecutionPerformed events != {applied_entries} applied entries",
-                new_execution_states.len()
-            );
+        if execution_states.len() < self.execution_states.len() {
+            bail!("{scenario_name}: L2ExecutionPerformed history retreated");
         }
-        let mut event_offset = 0usize;
+        // Anchored on roots and positions inside the full history, never on the
+        // baseline length. The snapshot's signal cursor and its L1 event query
+        // cannot be taken atomically while the deriver runs, so a settlement can
+        // land between them and be counted on one side only; its position in the
+        // event sequence is immune to that. Each settlement must appear after the
+        // previous one, and consecutive settlements must be exactly
+        // `applied_entries` events apart — a replay or a dropped entry breaks it.
+        let mut previous_index: Option<usize> = None;
         for (applied, settled_root, safe_root) in settlement_points {
-            event_offset += applied;
-            let event_root = new_execution_states
-                .get(event_offset.saturating_sub(1))
-                .ok_or_else(|| anyhow!("{scenario_name}: settlement has no matching L1 event"))?;
-            if *event_root != settled_root || settled_root != safe_root {
-                bail!("{scenario_name}: L1 and L2 roots differ at settlement point {event_offset}");
+            if settled_root != safe_root {
+                bail!(
+                    "{scenario_name}: L1 settled root {settled_root} != L2 safe block root {safe_root}"
+                );
             }
+            let search_from = previous_index.map_or(0, |previous| previous + 1);
+            let index = execution_states
+                .get(search_from..)
+                .and_then(|tail| tail.iter().position(|root| *root == settled_root))
+                .map(|offset| search_from + offset)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{scenario_name}: settled root {settled_root} has no L2ExecutionPerformed event after index {search_from}"
+                    )
+                })?;
+            if let Some(previous) = previous_index
+                && index - previous != applied
+            {
+                bail!(
+                    "{scenario_name}: settlement reported {applied} applied entries but sits {} L1 events after the previous one",
+                    index - previous
+                );
+            }
+            previous_index = Some(index);
         }
-        if safe.is_some() {
-            if expect_settled {
-                let committed =
-                    state_root(&l1_rpc, world.cfg.eez_address, world.cfg.rollup_id).await?;
-                let safe_root = safe_block_state_root(&l2_rpc)
-                    .await?
-                    .ok_or_else(|| anyhow!("{scenario_name}: safe L2 block is absent"))?;
-                if committed != safe_root {
-                    bail!("{scenario_name}: L1 committed root != L2 safe root");
-                }
+        if safe.is_some() && expect_settled {
+            let committed = state_root(&l1_rpc, world.cfg.eez_address, world.cfg.rollup_id).await?;
+            let safe_root = safe_block_state_root(&l2_rpc)
+                .await?
+                .ok_or_else(|| anyhow!("{scenario_name}: safe L2 block is absent"))?;
+            if committed != safe_root {
+                bail!("{scenario_name}: L1 committed root != L2 safe root");
             }
         }
 
@@ -2791,8 +2964,7 @@ fn assert_sync_grid(
     let actual = height % CROSS_CHAIN_SYNC_INTERVAL;
     match *residue {
         Some(expected) if expected != actual => bail!(
-            "{scenario_name}: sync block {height} is off the deterministic K={} grid (residue {actual}, expected {expected})",
-            CROSS_CHAIN_SYNC_INTERVAL
+            "{scenario_name}: sync block {height} is off the deterministic K={CROSS_CHAIN_SYNC_INTERVAL} grid (residue {actual}, expected {expected})"
         ),
         None => *residue = Some(actual),
         _ => {}
@@ -2827,10 +2999,14 @@ async fn assert_action_and_nonce_invariants(
         }
         *expected += 1;
     }
+    // Exact, not `>=`: these actors are scenario-private, so any nonce the
+    // scenario did not submit is unaccounted-for activity.
     let actual_inbound = pending_nonce(&world.l1_rpc(), INBOUND_USER).await?;
     let actual_outbound = pending_nonce(&world.l2_rpc(), OUTBOUND_USER).await?;
-    if actual_inbound < inbound || actual_outbound < outbound {
-        bail!("{scenario_name}: a sender nonce failed to advance monotonically");
+    if actual_inbound != inbound || actual_outbound != outbound {
+        bail!(
+            "{scenario_name}: sender nonces are {actual_inbound}/{actual_outbound}, expected {inbound}/{outbound}"
+        );
     }
     Ok(())
 }
@@ -2889,17 +3065,20 @@ impl Scenario {
         }
     }
 
+    #[must_use]
     pub fn inbound(mut self, call: ScenarioCall) -> Self {
         self.calls.push((ScenarioDirection::Inbound, call));
         self
     }
 
+    #[must_use]
     pub fn outbound(mut self, call: ScenarioCall) -> Self {
         self.calls.push((ScenarioDirection::Outbound, call));
         self
     }
 
-    pub fn expect_l2_state(mut self, read: ValueRead, expected: impl IntoTestU256) -> Self {
+    #[must_use]
+    pub fn expect_l2_state(mut self, read: StateRead, expected: impl IntoTestU256) -> Self {
         self.states.push(StateExpectation {
             side: StateSide::L2,
             read,
@@ -2908,7 +3087,8 @@ impl Scenario {
         self
     }
 
-    pub fn expect_l1_state(mut self, read: ValueRead, expected: impl IntoTestU256) -> Self {
+    #[must_use]
+    pub fn expect_l1_state(mut self, read: StateRead, expected: impl IntoTestU256) -> Self {
         self.states.push(StateExpectation {
             side: StateSide::L1,
             read,
@@ -2917,6 +3097,7 @@ impl Scenario {
         self
     }
 
+    #[must_use]
     pub const fn expect_settled_fully(mut self) -> Self {
         self.expect_settled = true;
         self
@@ -2975,19 +3156,31 @@ impl Scenario {
             });
         }
 
-        for expectation in self.states {
+        for expectation in &self.states {
             let rpc = match expectation.side {
                 StateSide::L1 => l1_rpc.as_str(),
                 StateSide::L2 => l2_rpc.as_str(),
             };
-            wait_for(SETTLE_TIMEOUT, || async {
+            let converged = wait_for(SETTLE_TIMEOUT, || async {
                 Ok(
-                    (l2_value(rpc, expectation.read.0).await? == expectation.expected)
+                    (read_state_word(rpc, &expectation.read).await? == expectation.expected)
                         .then_some(()),
                 )
             })
-            .await
-            .with_context(|| format!("{}: state expectation failed", self.name))?;
+            .await;
+            // Include the last observed value when a state expectation times out.
+            if converged.is_err() {
+                let actual = read_state_word(rpc, &expectation.read).await;
+                bail!(
+                    "{}: {:?} {} on {} is {:?}, expected {}",
+                    self.name,
+                    expectation.side,
+                    expectation.read.label,
+                    expectation.read.target,
+                    actual,
+                    expectation.expected,
+                );
+            }
         }
 
         if self.expect_settled {
@@ -3017,17 +3210,6 @@ pub async fn run_scenarios(
         scenario.run(world).await?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod framework_tests {
-    use super::*;
-
-    #[test]
-    fn reorg_fixture_is_resolvable_after_testkit_extraction() {
-        assert!(reorg_genesis_path().is_file());
-        reorg_genesis_state_root().expect("parse reorg genesis fixture");
-    }
 }
 
 /// Start the shared cross-chain fixture.
@@ -3114,6 +3296,42 @@ pub async fn setup_cross_chain_outbound_return_data() -> Result<CrossChainOutbou
     Ok(CrossChainOutboundReturnDataWorld {
         world,
         return_data_wrapper,
+    })
+}
+
+pub async fn setup_cross_chain_reverting() -> Result<CrossChainRevertWorld> {
+    let world = setup_cross_chain().await?;
+    let l1_rpc = world.l1_rpc();
+    let l2_rpc = world.l2_rpc();
+
+    let reverting_target_l2 =
+        deploy_reverting_target(&l2_rpc, TARGET_DEPLOYER, world.l2_chain_id).await?;
+    let inbound_proxy = create_cross_chain_proxy(
+        &l1_rpc,
+        world.cfg.deployer_key,
+        world.cfg.eez_address,
+        reverting_target_l2,
+        world.cfg.rollup_id,
+    )
+    .await?;
+    let inbound_wrapper =
+        deploy_revert_bubble_wrapper(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID, inbound_proxy).await?;
+
+    let reverting_target_l1 =
+        deploy_reverting_target(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID).await?;
+    let outbound_proxy =
+        create_l2_cross_chain_proxy(&l2_rpc, TARGET_DEPLOYER, reverting_target_l1, L1_ROLLUP_ID)
+            .await?;
+    let outbound_wrapper =
+        deploy_revert_bubble_wrapper(&l2_rpc, TARGET_DEPLOYER, world.l2_chain_id, outbound_proxy)
+            .await?;
+
+    Ok(CrossChainRevertWorld {
+        world,
+        reverting_target_l2,
+        inbound_wrapper,
+        reverting_target_l1,
+        outbound_wrapper,
     })
 }
 
@@ -3242,4 +3460,15 @@ pub async fn setup_cross_chain_with_env(
         outbound_wrapper,
         _datadir: datadir,
     })
+}
+
+#[cfg(test)]
+mod framework_tests {
+    use super::*;
+
+    #[test]
+    fn reorg_fixture_is_resolvable_after_testkit_extraction() {
+        assert!(reorg_genesis_path().is_file());
+        reorg_genesis_state_root().expect("parse reorg genesis fixture");
+    }
 }

@@ -3,17 +3,17 @@
 use alloy_primitives::{Address, Bytes, TxHash, U256, keccak256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::Filter;
-use alloy_sol_types::{SolCall, SolEvent, SolValue};
+use alloy_sol_types::{SolCall, SolError, SolEvent, SolValue};
 
 use common::{
-    DEV_CHAIN_ID, IEEZL2Direct, IEmptyCall, INBOUND_USER, INestedSetterOuter, IReturnData,
-    IReturnDataWrapper, ISetterWrapper, IValue, IValueNoRet, OUTBOUND_USER, SETTLE_TIMEOUT,
-    account_code, batches_posted, completed_proxy_calls, count_events, deploy_nested_setter_inner,
-    deploy_nested_setter_outer, empty_call_state, l2_balance, l2_value, last_proxy_result,
-    nested_proxy_calls, pending_nonce, receipt_ok, return_data_hash, return_data_length,
-    setup_cross_chain, setup_cross_chain_codeless, setup_cross_chain_empty_call,
-    setup_cross_chain_nested_setter, setup_cross_chain_outbound_return_data,
-    setup_cross_chain_return_data, sign_and_send, state_root, value_no_ret, wait_for,
+    DEV_CHAIN_ID, IEEZL2Direct, IEmptyCall, INBOUND_USER, INestedSetterInner, INestedSetterOuter,
+    IReturnData, IReturnDataWrapper, IRevertBubbleWrapper, IRevertingTarget, ISetterWrapper,
+    IValue, IValueNoRet, OUTBOUND_USER, SETTLE_TIMEOUT, account_code, batches_posted,
+    completed_proxy_calls, count_events, deploy_nested_setter_inner, deploy_nested_setter_outer,
+    l2_balance, l2_value, last_proxy_result, pending_nonce, receipt_ok, setup_cross_chain,
+    setup_cross_chain_codeless, setup_cross_chain_empty_call, setup_cross_chain_nested_setter,
+    setup_cross_chain_outbound_return_data, setup_cross_chain_return_data, sign_and_send,
+    state_root, value_no_ret, wait_for,
 };
 use eez_protocol::EEZL2_ADDRESS;
 use eez_testkit as common;
@@ -52,6 +52,95 @@ async fn assert_transaction_reverted(rpc_url: &str, hash: TxHash, label: &str) {
     assert!(!status, "{label} transaction {hash} unexpectedly succeeded");
 }
 
+fn calls_read(target: Address) -> common::StateRead {
+    common::call_read(target, "calls()", IEmptyCall::callsCall {}.abi_encode())
+}
+
+fn received_read(target: Address) -> common::StateRead {
+    common::call_read(
+        target,
+        "received()",
+        IEmptyCall::receivedCall {}.abi_encode(),
+    )
+}
+
+fn last_value_read(target: Address) -> common::StateRead {
+    common::call_read(
+        target,
+        "lastValue()",
+        IEmptyCall::lastValueCall {}.abi_encode(),
+    )
+}
+
+fn completed_calls_read(wrapper: Address) -> common::StateRead {
+    common::call_read(
+        wrapper,
+        "completedProxyCalls()",
+        ISetterWrapper::completedProxyCallsCall {}.abi_encode(),
+    )
+}
+
+fn return_length_read(wrapper: Address) -> common::StateRead {
+    common::call_read(
+        wrapper,
+        "lastReturnDataLength()",
+        IReturnDataWrapper::lastReturnDataLengthCall {}.abi_encode(),
+    )
+}
+
+fn return_hash_read(wrapper: Address) -> common::StateRead {
+    common::call_read(
+        wrapper,
+        "lastReturnDataHash()",
+        IReturnDataWrapper::lastReturnDataHashCall {}.abi_encode(),
+    )
+}
+
+// Derive the source address observed on the destination chain.
+async fn attributed_sender(
+    destination_rpc: &str,
+    manager: Address,
+    source: Address,
+    source_rollup_id: u64,
+) -> Address {
+    common::cross_chain_source_proxy(destination_rpc, manager, source, source_rollup_id)
+        .await
+        .expect("derive destination-side source proxy")
+}
+
+// Assert the number and sender of newly emitted `ValueSet` events.
+async fn assert_value_set_attribution(
+    rpc: &str,
+    target: Address,
+    before: usize,
+    expected_new: usize,
+    expected_sender: Address,
+    label: &str,
+) {
+    let logs = wait_for(SETTLE_TIMEOUT, || {
+        let rpc = rpc.to_owned();
+        async move {
+            let logs =
+                common::events_since(&rpc, target, IValue::ValueSet::SIGNATURE_HASH, 0).await?;
+            Ok((logs.len() >= before + expected_new).then_some(logs))
+        }
+    })
+    .await
+    .unwrap_or_else(|err| panic!("{label}: destination events were not retained: {err:#}"));
+    assert_eq!(
+        logs.len(),
+        before + expected_new,
+        "{label} must emit exactly {expected_new} new ValueSet event(s)",
+    );
+    for log in &logs[before..] {
+        let event = IValue::ValueSet::decode_log(&log.inner).expect("decode ValueSet");
+        assert_eq!(
+            event.by, expected_sender,
+            "{label} must attribute the destination write to the originating source proxy",
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn both_directions_zero_value_direct_proxy_success_single_call() {
     let w = setup_cross_chain().await.unwrap();
@@ -72,111 +161,61 @@ async fn both_directions_zero_value_direct_proxy_success_single_call() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inbound_empty_calldata_and_zero_value_is_not_skipped() {
-    // Zero calldata and zero value are still a materialized entry.
+    // Verify that an all-zero call is materialized without being rewritten.
     let w = setup_cross_chain_empty_call().await.unwrap();
-    let l1_rpc = w.l1_rpc();
-    let l2_rpc = w.l2_rpc();
-
-    let tx = sign_and_send(
-        &w.l1_xchain(),
-        INBOUND_USER,
-        DEV_CHAIN_ID,
-        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
-        Some(w.empty_call_proxy),
-        U256::ZERO,
-        Vec::new(),
-        600_000,
-    )
-    .await
-    .expect("empty-calldata inbound transaction must be admitted");
-    assert_all_transactions_succeeded(&l1_rpc, &[tx], "empty-calldata inbound").await;
-
-    // `calls` proves materialization; `received` and `lastValue` prove the
-    // all-zero call was not rewritten while crossing the boundary.
-    wait_for(SETTLE_TIMEOUT, || {
-        let l2_rpc = l2_rpc.clone();
-        async move {
-            Ok((empty_call_state(&l2_rpc, w.empty_call_l2).await?
-                == (U256::from(1u64), U256::ZERO, U256::ZERO))
-                .then_some(()))
-        }
-    })
-    .await
-    .expect("empty-calldata cross-chain entry was skipped");
-    w.node.assert_no_process_death();
+    common::Scenario::new("empty-calldata zero-value inbound")
+        .inbound(common::ScenarioCall::new(w.empty_call_proxy, Vec::new()).with_gas_limit(600_000))
+        .expect_l2_state(calls_read(w.empty_call_l2), 1u64)
+        .expect_l2_state(received_read(w.empty_call_l2), 0u64)
+        .expect_l2_state(last_value_read(w.empty_call_l2), 0u64)
+        .expect_settled_fully()
+        .run(&w)
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inbound_deposit_to_payable_contract_runs_fallback() {
-    // `EmptyCall` has no `receive`, so empty calldata exercises fallback.
+    // `EmptyCall` has no `receive`, so empty calldata exercises its fallback.
     let w = setup_cross_chain_empty_call().await.unwrap();
-    let l1_rpc = w.l1_rpc();
-    let l2_rpc = w.l2_rpc();
     let value = U256::from(123_456u64);
-
-    let tx = sign_and_send(
-        &w.l1_xchain(),
-        INBOUND_USER,
-        DEV_CHAIN_ID,
-        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
-        Some(w.empty_call_proxy),
-        value,
-        Vec::new(),
-        600_000,
-    )
-    .await
-    .expect("payable inbound deposit must be admitted");
-    assert_all_transactions_succeeded(&l1_rpc, &[tx], "payable inbound deposit").await;
-
-    // The fallback increments `calls` and accumulates only `msg.value`.
-    wait_for(SETTLE_TIMEOUT, || {
-        let l2_rpc = l2_rpc.clone();
-        async move {
-            Ok((empty_call_state(&l2_rpc, w.empty_call_l2).await?
-                == (U256::from(1u64), value, U256::ZERO))
-                .then_some(()))
-        }
-    })
-    .await
-    .expect("payable destination fallback did not receive the deposit");
-    w.node.assert_no_process_death();
+    common::Scenario::new("payable inbound deposit")
+        .inbound(
+            common::ScenarioCall::new(w.empty_call_proxy, Vec::new())
+                .with_value(value)
+                .with_gas_limit(600_000),
+        )
+        .expect_l2_state(calls_read(w.empty_call_l2), 1u64)
+        .expect_l2_state(received_read(w.empty_call_l2), value)
+        .expect_l2_state(last_value_read(w.empty_call_l2), 0u64)
+        .expect_settled_fully()
+        .run(&w)
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inbound_value_and_calldata_apply_atomically() {
-    // Assert the same destination frame sees both value and calldata.
+    // Bind the transferred value and decoded argument to one destination call.
     let w = setup_cross_chain_empty_call().await.unwrap();
-    let l1_rpc = w.l1_rpc();
-    let l2_rpc = w.l2_rpc();
     let value = U256::from(456_789u64);
     let next = U256::from(91u64);
-
-    let tx = sign_and_send(
-        &w.l1_xchain(),
-        INBOUND_USER,
-        DEV_CHAIN_ID,
-        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
-        Some(w.empty_call_proxy),
-        value,
-        IEmptyCall::setValueCall { next }.abi_encode(),
-        600_000,
-    )
-    .await
-    .expect("value-and-calldata inbound transaction must be admitted");
-    assert_all_transactions_succeeded(&l1_rpc, &[tx], "value-and-calldata inbound").await;
-
-    // One observation binds the call count, transferred value, and decoded arg.
-    wait_for(SETTLE_TIMEOUT, || {
-        let l2_rpc = l2_rpc.clone();
-        async move {
-            Ok((empty_call_state(&l2_rpc, w.empty_call_l2).await?
-                == (U256::from(1u64), value, next))
-                .then_some(()))
-        }
-    })
-    .await
-    .expect("destination did not receive value and calldata atomically");
-    w.node.assert_no_process_death();
+    common::Scenario::new("value-and-calldata inbound")
+        .inbound(
+            common::ScenarioCall::new(
+                w.empty_call_proxy,
+                IEmptyCall::setValueCall { next }.abi_encode(),
+            )
+            .with_value(value)
+            .with_gas_limit(600_000),
+        )
+        .expect_l2_state(calls_read(w.empty_call_l2), 1u64)
+        .expect_l2_state(received_read(w.empty_call_l2), value)
+        .expect_l2_state(last_value_read(w.empty_call_l2), next)
+        .expect_settled_fully()
+        .run(&w)
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -204,6 +243,25 @@ async fn direct_ccm_l2_outbound_call_is_rejected() {
 
     // Admission is expected; only execution must fail for an unauthorized caller.
     assert_transaction_reverted(&l2_rpc, tx, "direct CCM-L2 outbound").await;
+
+    // Pin the failure to `EEZL2`'s authorization check.
+    let revert_data = common::call_revert_data(
+        &l2_rpc,
+        caller,
+        EEZL2_ADDRESS,
+        IEEZL2Direct::executeCrossChainCallCall {
+            sourceAddress: caller,
+            callData: Bytes::new(),
+        }
+        .abi_encode(),
+    )
+    .await
+    .expect("direct CCM-L2 call must revert with data");
+    assert_eq!(
+        revert_data.as_ref(),
+        IEEZL2Direct::UnauthorizedProxy::SELECTOR.as_slice(),
+        "direct CCM-L2 access must be rejected as an unauthorized proxy",
+    );
     w.node.assert_no_process_death();
 }
 
@@ -220,6 +278,17 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
     let recipient_before = l2_balance(&l2_rpc, w.recipient).await.unwrap();
     let withdrawal_before = l2_balance(&l1_rpc, w.withdrawal_recipient).await.unwrap();
     let deposit_sum: u128 = WAVE_DEPOSITS.iter().sum();
+    // Deltas, not totals: batches and bundles counted from deployment include
+    // the background minimal batches the composer posts on an idle chain, so an
+    // absolute threshold can be met without this wave contributing anything.
+    let batches_before = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
+        .await
+        .unwrap();
+    let bundles_before = w
+        .node
+        .count_signal(common::signals::BUNDLE_ACCEPTED)
+        .unwrap();
+    let signal_cursor = w.node.signal_cursor().unwrap();
 
     let mut inbound_hashes = Vec::new();
     let mut outbound_hashes = Vec::new();
@@ -409,13 +478,29 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
     .await
     .expect("L1 stored stateRoot never matched L2 safe stateRoot");
 
-    let pb = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
+    let batches = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
         .await
         .unwrap();
     assert!(
-        pb >= WAVE_SETTERS.len(),
-        "expected ≥{} BatchPosted events, got {pb}",
+        batches >= batches_before + WAVE_SETTERS.len(),
+        "expected ≥{} new BatchPosted events, got {}",
         WAVE_SETTERS.len(),
+        batches - batches_before,
+    );
+    // Each wave's entries must actually have been applied on L1, not merely
+    // followed by enough batches: tie the settled entry count to the wave size.
+    let applied_entries: u64 = w
+        .node
+        .signals_since(signal_cursor)
+        .unwrap()
+        .iter()
+        .filter(|record| record.name == common::signals::DERIVER_SAFE_ADVANCED)
+        .map(|record| record.u64("applied_entries").unwrap_or(0))
+        .sum();
+    assert!(
+        applied_entries >= (inbound_hashes.len() + outbound_hashes.len()) as u64,
+        "settled entries ({applied_entries}) must cover every wave transaction ({})",
+        inbound_hashes.len() + outbound_hashes.len(),
     );
 
     assert_eq!(
@@ -425,7 +510,8 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
                 common::signals::DERIVER_STATE_DIVERGED_POST,
             ])
             .unwrap(),
-        0
+        0,
+        "zero state-root divergence events",
     );
     assert_eq!(
         w.node
@@ -434,15 +520,16 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
                 common::signals::TX_NONCE_CHAIN_EVICTED,
             ])
             .unwrap(),
-        0
+        0,
+        "all non-poison wave transactions must settle without eviction",
     );
 
     assert!(
         w.node
             .count_signal(common::signals::BUNDLE_ACCEPTED)
             .unwrap()
-            > 0,
-        "embedded dev L1 eth_sendBundle was exercised",
+            > bundles_before,
+        "embedded dev L1 eth_sendBundle was exercised by this wave",
     );
     assert_eq!(
         w.node
@@ -457,45 +544,37 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inbound_destination_events_are_retained_in_the_l2_block() {
     let w = setup_cross_chain().await.unwrap();
-    let l1_rpc = w.l1_rpc();
     let l2_rpc = w.l2_rpc();
-
-    let tx = sign_and_send(
-        &w.l1_xchain(),
-        INBOUND_USER,
-        DEV_CHAIN_ID,
-        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
-        Some(w.setter_proxy),
-        U256::ZERO,
-        IValue::setValueCall {
-            v: U256::from(61u64),
-        }
-        .abi_encode(),
-        600_000,
+    // Capture the event count before submitting the scenario.
+    let before = count_events(&l2_rpc, w.value_l2, IValue::ValueSet::SIGNATURE_HASH, 0)
+        .await
+        .unwrap();
+    // The destination must see the L1 sender's source proxy.
+    let expected_sender = attributed_sender(
+        &l2_rpc,
+        EEZL2_ADDRESS,
+        common::signer_address(INBOUND_USER).unwrap(),
+        common::L1_ROLLUP_ID,
     )
-    .await
-    .expect("event-emitting inbound transaction must be admitted");
-    assert_all_transactions_succeeded(&l1_rpc, &[tx], "event-emitting inbound").await;
+    .await;
 
-    // The destination event must survive execution of the derived L2 block.
-    wait_for(SETTLE_TIMEOUT, || {
-        let l2_rpc = l2_rpc.clone();
-        async move {
-            Ok(
-                (count_events(&l2_rpc, w.value_l2, IValue::ValueSet::SIGNATURE_HASH, 0).await?
-                    >= 1)
-                    .then_some(()),
-            )
-        }
-    })
-    .await
-    .expect("destination event was not retained in the L2 block");
-    assert_eq!(
-        l2_value(&l2_rpc, w.value_l2).await.unwrap(),
-        U256::from(61u64),
-        "the event must correspond to the requested destination write",
-    );
-    w.node.assert_no_process_death();
+    common::Scenario::new("event-emitting inbound")
+        .inbound(common::setter_call(w.setter_proxy, 61u64).with_gas_limit(600_000))
+        .expect_l2_state(common::value_read(w.value_l2), 61u64)
+        .expect_settled_fully()
+        .run(&w)
+        .await
+        .unwrap();
+
+    assert_value_set_attribution(
+        &l2_rpc,
+        w.value_l2,
+        before,
+        1,
+        expected_sender,
+        "event-emitting inbound",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -517,140 +596,69 @@ async fn codeless_registered_targets_complete_deterministically_in_both_directio
         "outbound target must be codeless",
     );
 
-    let inbound = sign_and_send(
-        &w.l1_xchain(),
-        INBOUND_USER,
-        DEV_CHAIN_ID,
-        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
-        Some(w.inbound_wrapper),
-        U256::ZERO,
-        data.clone(),
-        900_000,
-    )
-    .await
-    .expect("codeless inbound transaction must be admitted");
-    let outbound = sign_and_send(
-        &w.l2_xchain(),
-        OUTBOUND_USER,
-        w.l2_chain_id,
-        pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
-        Some(w.outbound_wrapper),
-        U256::ZERO,
-        data,
-        900_000,
-    )
-    .await
-    .expect("codeless outbound transaction must be admitted");
-    assert_all_transactions_succeeded(&l1_rpc, &[inbound], "codeless inbound").await;
-    assert_all_transactions_succeeded(&l2_rpc, &[outbound], "codeless outbound").await;
-
+    // The nonzero empty-buffer hash proves the wrapper ran.
     let empty_hash = keccak256(Bytes::new());
-    wait_for(SETTLE_TIMEOUT, || {
-        let l1_rpc = l1_rpc.clone();
-        async move {
-            Ok(
-                (return_data_length(&l1_rpc, w.inbound_wrapper).await? == U256::ZERO
-                    && return_data_hash(&l1_rpc, w.inbound_wrapper).await? == empty_hash)
-                    .then_some(()),
-            )
-        }
-    })
-    .await
-    .expect("codeless L2 target did not return the deterministic empty result");
-    wait_for(SETTLE_TIMEOUT, || {
-        let l2_rpc = l2_rpc.clone();
-        async move {
-            Ok(
-                (return_data_length(&l2_rpc, w.outbound_wrapper).await? == U256::ZERO
-                    && return_data_hash(&l2_rpc, w.outbound_wrapper).await? == empty_hash)
-                    .then_some(()),
-            )
-        }
-    })
-    .await
-    .expect("codeless L1 target did not return the deterministic empty result");
-
-    let (eez, rollup_id) = (w.cfg.eez_address, w.cfg.rollup_id);
-    wait_for(SETTLE_TIMEOUT, || {
-        let (l1_rpc, l2_rpc) = (l1_rpc.clone(), l2_rpc.clone());
-        async move {
-            let l1_root = state_root(&l1_rpc, eez, rollup_id).await?;
-            let l2_root = common::safe_block_state_root(&l2_rpc).await?;
-            Ok(l2_root.filter(|root| *root == l1_root).map(|_| ()))
-        }
-    })
-    .await
-    .expect("codeless calls did not reconcile the committed state roots");
-    w.node.assert_no_process_death();
+    common::Scenario::new("codeless registered targets")
+        .inbound(common::ScenarioCall::new(w.inbound_wrapper, data.clone()))
+        .outbound(common::ScenarioCall::new(w.outbound_wrapper, data))
+        .expect_l1_state(return_length_read(w.inbound_wrapper), 0u64)
+        .expect_l1_state(return_hash_read(w.inbound_wrapper), empty_hash)
+        .expect_l2_state(return_length_read(w.outbound_wrapper), 0u64)
+        .expect_l2_state(return_hash_read(w.outbound_wrapper), empty_hash)
+        .expect_settled_fully()
+        .run(&w)
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn outbound_dynamic_and_empty_bytes_returns_are_preserved_distinctly() {
+    // Length and hash distinguish dynamic bytes from ABI-encoded empty bytes.
     let w = setup_cross_chain_outbound_return_data().await.unwrap();
-    let l2_rpc = w.l2_rpc();
     let payload = Bytes::from(vec![0x5a; 96]);
-    let dynamic_return_hash = keccak256(payload.abi_encode());
-    let dynamic_tx = sign_and_send(
-        &w.l2_xchain(),
-        OUTBOUND_USER,
-        w.l2_chain_id,
-        pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
-        Some(w.return_data_wrapper),
-        U256::ZERO,
-        IReturnDataWrapper::callAndRecordCall {
-            data: IReturnData::echoCall { value: payload }.abi_encode().into(),
-        }
-        .abi_encode(),
-        1_200_000,
+    let wrapper = w.return_data_wrapper;
+    common::run_scenarios(
+        &w,
+        [
+            common::Scenario::new("outbound dynamic return")
+                .outbound(
+                    common::ScenarioCall::new(
+                        wrapper,
+                        IReturnDataWrapper::callAndRecordCall {
+                            data: IReturnData::echoCall {
+                                value: payload.clone(),
+                            }
+                            .abi_encode()
+                            .into(),
+                        }
+                        .abi_encode(),
+                    )
+                    .with_gas_limit(1_200_000),
+                )
+                .expect_l2_state(return_length_read(wrapper), 160u64)
+                .expect_l2_state(return_hash_read(wrapper), keccak256(payload.abi_encode()))
+                .expect_settled_fully(),
+            common::Scenario::new("outbound empty-bytes return")
+                .outbound(
+                    common::ScenarioCall::new(
+                        wrapper,
+                        IReturnDataWrapper::callAndRecordCall {
+                            data: IReturnData::emptyBytesCall {}.abi_encode().into(),
+                        }
+                        .abi_encode(),
+                    )
+                    .with_gas_limit(1_200_000),
+                )
+                .expect_l2_state(return_length_read(wrapper), 64u64)
+                .expect_l2_state(
+                    return_hash_read(wrapper),
+                    keccak256(Bytes::new().abi_encode()),
+                )
+                .expect_settled_fully(),
+        ],
     )
     .await
-    .expect("outbound dynamic-return transaction must be admitted");
-    assert_all_transactions_succeeded(&l2_rpc, &[dynamic_tx], "outbound dynamic return").await;
-    wait_for(SETTLE_TIMEOUT, || {
-        let l2_rpc = l2_rpc.clone();
-        async move {
-            Ok(
-                (return_data_length(&l2_rpc, w.return_data_wrapper).await? == U256::from(160u64)
-                    && return_data_hash(&l2_rpc, w.return_data_wrapper).await?
-                        == dynamic_return_hash)
-                    .then_some(()),
-            )
-        }
-    })
-    .await
-    .expect("outbound dynamic return data was truncated or altered");
-
-    let empty_tx = sign_and_send(
-        &w.l2_xchain(),
-        OUTBOUND_USER,
-        w.l2_chain_id,
-        pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
-        Some(w.return_data_wrapper),
-        U256::ZERO,
-        IReturnDataWrapper::callAndRecordCall {
-            data: IReturnData::emptyBytesCall {}.abi_encode().into(),
-        }
-        .abi_encode(),
-        1_200_000,
-    )
-    .await
-    .expect("outbound empty-bytes-return transaction must be admitted");
-    assert_all_transactions_succeeded(&l2_rpc, &[empty_tx], "outbound empty bytes return").await;
-    let empty_return_hash = keccak256(Bytes::new().abi_encode());
-    wait_for(SETTLE_TIMEOUT, || {
-        let l2_rpc = l2_rpc.clone();
-        async move {
-            Ok(
-                (return_data_length(&l2_rpc, w.return_data_wrapper).await? == U256::from(64u64)
-                    && return_data_hash(&l2_rpc, w.return_data_wrapper).await?
-                        == empty_return_hash)
-                    .then_some(()),
-            )
-        }
-    })
-    .await
-    .expect("outbound ABI-encoded empty bytes were not preserved");
-    w.node.assert_no_process_death();
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -658,48 +666,64 @@ async fn inbound_identical_wrapper_proxy_calls_settle_as_ordered_entries() {
     // Identical calls share a semantic hash; entry order must keep both alive.
     let w = setup_cross_chain().await.unwrap();
     let l1_rpc = w.l1_rpc();
-    let l2_rpc = w.l2_rpc();
     let value = U256::from(73u64);
-
-    let tx = sign_and_send(
-        &w.l1_xchain(),
-        INBOUND_USER,
-        DEV_CHAIN_ID,
-        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
-        Some(w.inbound_wrapper),
-        U256::ZERO,
-        ISetterWrapper::setSameValueTwiceCall { v: value }.abi_encode(),
-        1_200_000,
+    let wrapped_before = common::events_since(
+        &l1_rpc,
+        w.inbound_wrapper,
+        ISetterWrapper::Wrapped::SIGNATURE_HASH,
+        0,
     )
     .await
-    .expect("duplicate proxy-call transaction must be admitted");
+    .unwrap()
+    .len();
+    assert_ne!(
+        l2_value(&w.l2_rpc(), w.value_l2).await.unwrap(),
+        value,
+        "the first call must change destination state for the ordered-return assertion",
+    );
 
-    assert_all_transactions_succeeded(&l1_rpc, &[tx], "duplicate inbound proxy calls").await;
-    wait_for(SETTLE_TIMEOUT, || {
-        let l2_rpc = l2_rpc.clone();
-        async move { Ok((l2_value(&l2_rpc, w.value_l2).await? == value).then_some(())) }
-    })
-    .await
-    .expect("duplicate calls did not reach L2");
-
-    // The source wrapper advances only after decoding each independent return.
-    wait_for(SETTLE_TIMEOUT, || {
-        let l1_rpc = l1_rpc.clone();
-        async move {
-            Ok(
-                (completed_proxy_calls(&l1_rpc, w.inbound_wrapper).await? == U256::from(2u64))
-                    .then_some(()),
+    common::Scenario::new("duplicate inbound proxy calls")
+        .inbound(
+            common::ScenarioCall::new(
+                w.inbound_wrapper,
+                ISetterWrapper::setSameValueTwiceCall { v: value }.abi_encode(),
             )
-        }
-    })
+            .with_gas_limit(1_200_000),
+        )
+        .expect_l2_state(common::value_read(w.value_l2), value)
+        // Require both independent returns.
+        .expect_l1_state(completed_calls_read(w.inbound_wrapper), 2u64)
+        .expect_settled_fully()
+        .run(&w)
+        .await
+        .unwrap();
+
+    // Verify that the second return observes the first destination write.
+    let wrapped = common::events_since(
+        &l1_rpc,
+        w.inbound_wrapper,
+        ISetterWrapper::Wrapped::SIGNATURE_HASH,
+        0,
+    )
     .await
-    .expect("both ordered proxy calls did not return to the wrapper");
+    .unwrap();
+    let results = wrapped[wrapped_before..]
+        .iter()
+        .map(|log| {
+            let event = ISetterWrapper::Wrapped::decode_log(&log.inner).unwrap();
+            (event.input, event.ok, event.changed, event.newValue)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec![(value, true, true, value), (value, true, false, value)],
+        "the second ordered call must observe the first call's destination write",
+    );
     assert_eq!(
         last_proxy_result(&l1_rpc, w.inbound_wrapper).await.unwrap(),
         (false, value),
         "the final ordered call must deliver its exact decoded return",
     );
-    w.node.assert_no_process_death();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -746,27 +770,49 @@ async fn outbound_multiple_proxy_calls_in_one_transaction_are_evicted() {
     .await
     .expect("composer did not report the unsupported outbound multicall");
 
+    // The signal fires before poison-root handling and pool eviction finish, so
+    // an immediate absent-receipt check races and proves nothing about later
+    // blocks. Reusing the released nonce is the conclusive test: a replacement
+    // can only land if the rejected transaction is really gone from the pool,
+    // and once the replacement has mined the rejected hash can never appear.
+    let replacement = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        source_nonce,
+        Some(w.outbound_wrapper),
+        U256::ZERO,
+        ISetterWrapper::setViaProxyCall { v: value }.abi_encode(),
+        1_200_000,
+    )
+    .await
+    .expect("a replacement at the released nonce must be admitted");
+    assert_all_transactions_succeeded(&l2_rpc, &[replacement], "eviction replacement").await;
+
     assert_eq!(
         receipt_ok(&l2_rpc, tx).await.unwrap(),
         None,
-        "an evicted outbound multicall must not land on its source chain",
-    );
-    assert_eq!(
-        pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
-        source_nonce,
-        "eviction must release the unmined source nonce",
+        "an evicted outbound multicall must never land on its source chain",
     );
     assert_eq!(
         completed_proxy_calls(&l2_rpc, w.outbound_wrapper)
             .await
             .unwrap(),
-        U256::ZERO,
-        "the rejected source transaction must not execute its wrapper",
+        U256::from(1u64),
+        "only the replacement, never the rejected multicall, may execute the wrapper",
     );
-    assert_eq!(
-        l2_value(&l1_rpc, w.outbound_value).await.unwrap(),
-        destination_before,
-        "the rejected outbound multicall must not mutate its destination",
+    // The replacement writes the same value the rejected multicall would have,
+    // so a changed destination here means the replacement did it — and the
+    // wrapper counter above bounds it to exactly one call.
+    wait_for(SETTLE_TIMEOUT, || {
+        let l1_rpc = l1_rpc.clone();
+        async move { Ok((l2_value(&l1_rpc, w.outbound_value).await? == value).then_some(())) }
+    })
+    .await
+    .expect("the replacement outbound call did not reach its destination");
+    assert_ne!(
+        destination_before, value,
+        "the replacement must change destination state for that assertion to bind",
     );
     w.node.assert_no_process_death();
 }
@@ -892,166 +938,164 @@ async fn outbound_identical_calls_in_separate_transactions_settle_as_ordered_ent
 async fn outbound_destination_events_are_retained_in_the_l1_block() {
     let w = setup_cross_chain().await.unwrap();
     let l1_rpc = w.l1_rpc();
-    let l2_rpc = w.l2_rpc();
-
-    let tx = sign_and_send(
-        &w.l2_xchain(),
-        OUTBOUND_USER,
-        w.l2_chain_id,
-        pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
-        Some(w.outbound_proxy),
-        U256::ZERO,
-        IValue::setValueCall {
-            v: U256::from(67u64),
-        }
-        .abi_encode(),
-        900_000,
+    let before = count_events(
+        &l1_rpc,
+        w.outbound_value,
+        IValue::ValueSet::SIGNATURE_HASH,
+        0,
     )
     .await
-    .expect("event-emitting outbound transaction must be admitted");
-    assert_all_transactions_succeeded(&l2_rpc, &[tx], "event-emitting outbound").await;
+    .unwrap();
+    let expected_sender = attributed_sender(
+        &l1_rpc,
+        w.cfg.eez_address,
+        common::signer_address(OUTBOUND_USER).unwrap(),
+        w.cfg.rollup_id,
+    )
+    .await;
 
-    wait_for(SETTLE_TIMEOUT, || {
-        let l1_rpc = l1_rpc.clone();
-        async move {
-            Ok((count_events(
-                &l1_rpc,
-                w.outbound_value,
-                IValue::ValueSet::SIGNATURE_HASH,
-                0,
-            )
-            .await?
-                >= 1)
-                .then_some(()))
-        }
-    })
-    .await
-    .expect("destination event was not retained in the L1 block");
-    assert_eq!(
-        l2_value(&l1_rpc, w.outbound_value).await.unwrap(),
-        U256::from(67u64),
-        "the event must correspond to the requested destination write",
-    );
-    w.node.assert_no_process_death();
+    common::Scenario::new("event-emitting outbound")
+        .outbound(common::setter_call(w.outbound_proxy, 67u64))
+        .expect_l1_state(common::value_read(w.outbound_value), 67u64)
+        .expect_settled_fully()
+        .run(&w)
+        .await
+        .unwrap();
+
+    assert_value_set_attribution(
+        &l1_rpc,
+        w.outbound_value,
+        before,
+        1,
+        expected_sender,
+        "event-emitting outbound",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inbound_dynamic_and_empty_bytes_returns_are_preserved_distinctly() {
-    // Length detects truncation; hash verifies raw ABI bytes, not shape.
+    // Mirror the outbound return-data assertions.
     let w = setup_cross_chain_return_data().await.unwrap();
-    let l1_rpc = w.l1_rpc();
     let payload = Bytes::from(vec![0xa5; 96]);
-    let dynamic_call = IReturnData::echoCall {
-        value: payload.clone(),
-    }
-    .abi_encode();
-    let dynamic_return_hash = keccak256(payload.abi_encode());
-    let dynamic_tx = sign_and_send(
-        &w.l1_xchain(),
-        INBOUND_USER,
-        DEV_CHAIN_ID,
-        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
-        Some(w.return_data_wrapper),
-        U256::ZERO,
-        IReturnDataWrapper::callAndRecordCall {
-            data: dynamic_call.into(),
-        }
-        .abi_encode(),
-        1_200_000,
+    let wrapper = w.return_data_wrapper;
+    common::run_scenarios(
+        &w,
+        [
+            common::Scenario::new("inbound dynamic return")
+                .inbound(
+                    common::ScenarioCall::new(
+                        wrapper,
+                        IReturnDataWrapper::callAndRecordCall {
+                            data: IReturnData::echoCall {
+                                value: payload.clone(),
+                            }
+                            .abi_encode()
+                            .into(),
+                        }
+                        .abi_encode(),
+                    )
+                    .with_gas_limit(1_200_000),
+                )
+                .expect_l1_state(return_length_read(wrapper), 160u64)
+                .expect_l1_state(return_hash_read(wrapper), keccak256(payload.abi_encode()))
+                .expect_settled_fully(),
+            common::Scenario::new("inbound empty-bytes return")
+                .inbound(
+                    common::ScenarioCall::new(
+                        wrapper,
+                        IReturnDataWrapper::callAndRecordCall {
+                            data: IReturnData::emptyBytesCall {}.abi_encode().into(),
+                        }
+                        .abi_encode(),
+                    )
+                    .with_gas_limit(1_200_000),
+                )
+                .expect_l1_state(return_length_read(wrapper), 64u64)
+                .expect_l1_state(
+                    return_hash_read(wrapper),
+                    keccak256(Bytes::new().abi_encode()),
+                )
+                .expect_settled_fully(),
+        ],
     )
     .await
-    .expect("dynamic-return transaction must be admitted");
-    assert_all_transactions_succeeded(&l1_rpc, &[dynamic_tx], "dynamic return").await;
-
-    // Check both expected ABI size and exact raw return bytes.
-    wait_for(SETTLE_TIMEOUT, || {
-        let l1_rpc = l1_rpc.clone();
-        async move {
-            let len = return_data_length(&l1_rpc, w.return_data_wrapper).await?;
-            let hash = return_data_hash(&l1_rpc, w.return_data_wrapper).await?;
-            Ok((len == U256::from(160u64) && hash == dynamic_return_hash).then_some(()))
-        }
-    })
-    .await
-    .expect("dynamic return data was truncated or not recorded");
-
-    let empty_tx = sign_and_send(
-        &w.l1_xchain(),
-        INBOUND_USER,
-        DEV_CHAIN_ID,
-        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
-        Some(w.return_data_wrapper),
-        U256::ZERO,
-        IReturnDataWrapper::callAndRecordCall {
-            data: IReturnData::emptyBytesCall {}.abi_encode().into(),
-        }
-        .abi_encode(),
-        1_200_000,
-    )
-    .await
-    .expect("empty-bytes-return transaction must be admitted");
-    assert_all_transactions_succeeded(&l1_rpc, &[empty_tx], "empty bytes return").await;
-    let empty_return_hash = keccak256(Bytes::new().abi_encode());
-
-    // ABI-encoded `bytes(\"\")` is two words, unlike an empty return buffer.
-    wait_for(SETTLE_TIMEOUT, || {
-        let l1_rpc = l1_rpc.clone();
-        async move {
-            let len = return_data_length(&l1_rpc, w.return_data_wrapper).await?;
-            let hash = return_data_hash(&l1_rpc, w.return_data_wrapper).await?;
-            Ok((len == U256::from(64u64) && hash == empty_return_hash).then_some(()))
-        }
-    })
-    .await
-    .expect("ABI-encoded empty bytes must not be treated as no return data");
-    w.node.assert_no_process_death();
+    .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inbound_nested_contract_to_contract_to_proxy_preserves_source_attribution() {
-    // Only the inner frame invokes the proxy and receives its return.
+    // Only the inner frame invokes the proxy, so it must own the source identity.
     let w = setup_cross_chain_nested_setter().await.unwrap();
-    let l1_rpc = w.l1_rpc();
     let l2_rpc = w.l2_rpc();
     let value_l2 = w.world.value_l2;
     let value = U256::from(89u64);
-    let tx = sign_and_send(
-        &w.l1_xchain(),
-        INBOUND_USER,
-        DEV_CHAIN_ID,
-        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
-        Some(w.nested_setter_outer),
-        U256::ZERO,
-        INestedSetterOuter::setViaInnerCall { v: value }.abi_encode(),
-        1_200_000,
+    let before = count_events(&l2_rpc, value_l2, IValue::ValueSet::SIGNATURE_HASH, 0)
+        .await
+        .unwrap();
+    let inner_sender = attributed_sender(
+        &l2_rpc,
+        EEZL2_ADDRESS,
+        w.nested_setter_inner,
+        common::L1_ROLLUP_ID,
     )
-    .await
-    .expect("nested wrapper transaction must be admitted");
-    assert_all_transactions_succeeded(&l1_rpc, &[tx], "nested inbound proxy call").await;
-    wait_for(SETTLE_TIMEOUT, || {
-        let l2_rpc = l2_rpc.clone();
-        async move { Ok((l2_value(&l2_rpc, value_l2).await? == value).then_some(())) }
-    })
-    .await
-    .expect("nested proxy call did not reach L2");
+    .await;
+    let outer_sender = attributed_sender(
+        &l2_rpc,
+        EEZL2_ADDRESS,
+        w.nested_setter_outer,
+        common::L1_ROLLUP_ID,
+    )
+    .await;
+    let eoa_sender = attributed_sender(
+        &l2_rpc,
+        EEZL2_ADDRESS,
+        common::signer_address(INBOUND_USER).unwrap(),
+        common::L1_ROLLUP_ID,
+    )
+    .await;
+    assert!(
+        inner_sender != outer_sender && inner_sender != eoa_sender,
+        "the attribution candidates must be distinguishable for this assertion to mean anything",
+    );
 
-    // The return must target the inner caller, not the outer transaction entry.
-    wait_for(SETTLE_TIMEOUT, || {
-        let l1_rpc = l1_rpc.clone();
-        async move {
-            Ok(
-                (nested_proxy_calls(&l1_rpc, w.nested_setter_inner).await? == U256::from(1u64))
-                    .then_some(()),
+    common::Scenario::new("nested inbound proxy call")
+        .inbound(
+            common::ScenarioCall::new(
+                w.nested_setter_outer,
+                INestedSetterOuter::setViaInnerCall { v: value }.abi_encode(),
             )
-        }
-    })
-    .await
-    .expect("inner wrapper did not receive the cross-chain return");
-    w.node.assert_no_process_death();
+            .with_gas_limit(1_200_000),
+        )
+        .expect_l2_state(common::value_read(value_l2), value)
+        // The return must reach the inner caller.
+        .expect_l1_state(
+            common::call_read(
+                w.nested_setter_inner,
+                "completedProxyCalls()",
+                INestedSetterInner::completedProxyCallsCall {}.abi_encode(),
+            ),
+            1u64,
+        )
+        .expect_settled_fully()
+        .run(&w)
+        .await
+        .unwrap();
+
+    assert_value_set_attribution(
+        &l2_rpc,
+        value_l2,
+        before,
+        1,
+        inner_sender,
+        "nested inbound proxy call",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn outbound_nested_contract_to_contract_to_proxy_preserves_source_attribution() {
+    // The L1 destination must see the inner contract's source proxy.
     let w = setup_cross_chain().await.unwrap();
     let l1_rpc = w.l1_rpc();
     let l2_rpc = w.l2_rpc();
@@ -1067,31 +1111,242 @@ async fn outbound_nested_contract_to_contract_to_proxy_preserves_source_attribut
         .await
         .unwrap();
     let value = U256::from(97u64);
-
-    let tx = sign_and_send(
-        &w.l2_xchain(),
-        OUTBOUND_USER,
-        w.l2_chain_id,
-        pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
-        Some(outer),
-        U256::ZERO,
-        INestedSetterOuter::setViaInnerCall { v: value }.abi_encode(),
-        1_200_000,
+    let before = count_events(
+        &l1_rpc,
+        w.outbound_value,
+        IValue::ValueSet::SIGNATURE_HASH,
+        0,
     )
     .await
-    .expect("nested outbound wrapper transaction must be admitted");
-    assert_all_transactions_succeeded(&l2_rpc, &[tx], "nested outbound proxy call").await;
-    wait_for(SETTLE_TIMEOUT, || {
-        let l1_rpc = l1_rpc.clone();
-        async move { Ok((l2_value(&l1_rpc, w.outbound_value).await? == value).then_some(())) }
-    })
-    .await
-    .expect("nested proxy call did not reach L1");
-    wait_for(SETTLE_TIMEOUT, || {
-        let l2_rpc = l2_rpc.clone();
-        async move { Ok((nested_proxy_calls(&l2_rpc, inner).await? == U256::from(1u64)).then_some(())) }
-    })
-    .await
-    .expect("inner wrapper did not receive the cross-chain return");
-    w.node.assert_no_process_death();
+    .unwrap();
+    let inner_sender = attributed_sender(&l1_rpc, w.cfg.eez_address, inner, w.cfg.rollup_id).await;
+    let outer_sender = attributed_sender(&l1_rpc, w.cfg.eez_address, outer, w.cfg.rollup_id).await;
+    let eoa_sender = attributed_sender(
+        &l1_rpc,
+        w.cfg.eez_address,
+        common::signer_address(OUTBOUND_USER).unwrap(),
+        w.cfg.rollup_id,
+    )
+    .await;
+    assert!(
+        inner_sender != outer_sender && inner_sender != eoa_sender,
+        "the attribution candidates must be distinguishable for this assertion to mean anything",
+    );
+
+    common::Scenario::new("nested outbound proxy call")
+        .outbound(
+            common::ScenarioCall::new(
+                outer,
+                INestedSetterOuter::setViaInnerCall { v: value }.abi_encode(),
+            )
+            .with_gas_limit(1_200_000),
+        )
+        .expect_l1_state(common::value_read(w.outbound_value), value)
+        .expect_l2_state(
+            common::call_read(
+                inner,
+                "completedProxyCalls()",
+                INestedSetterInner::completedProxyCallsCall {}.abi_encode(),
+            ),
+            1u64,
+        )
+        .expect_settled_fully()
+        .run(&w)
+        .await
+        .unwrap();
+
+    assert_value_set_attribution(
+        &l1_rpc,
+        w.outbound_value,
+        before,
+        1,
+        inner_sender,
+        "nested outbound proxy call",
+    )
+    .await;
+}
+
+fn failures_read(wrapper: Address) -> common::StateRead {
+    common::call_read(
+        wrapper,
+        "failures()",
+        IRevertBubbleWrapper::failuresCall {}.abi_encode(),
+    )
+}
+
+fn successes_read(wrapper: Address) -> common::StateRead {
+    common::call_read(
+        wrapper,
+        "successes()",
+        IRevertBubbleWrapper::successesCall {}.abi_encode(),
+    )
+}
+
+fn revert_length_read(wrapper: Address) -> common::StateRead {
+    common::call_read(
+        wrapper,
+        "lastRevertLength()",
+        IRevertBubbleWrapper::lastRevertLengthCall {}.abi_encode(),
+    )
+}
+
+fn revert_hash_read(wrapper: Address) -> common::StateRead {
+    common::call_read(
+        wrapper,
+        "lastRevertHash()",
+        IRevertBubbleWrapper::lastRevertHashCall {}.abi_encode(),
+    )
+}
+
+fn target_calls_read(target: Address) -> common::StateRead {
+    common::call_read(
+        target,
+        "calls()",
+        IRevertingTarget::callsCall {}.abi_encode(),
+    )
+}
+
+fn target_last_value_read(target: Address) -> common::StateRead {
+    common::call_read(
+        target,
+        "lastValue()",
+        IRevertingTarget::lastValueCall {}.abi_encode(),
+    )
+}
+
+fn record_call(wrapper: Address, inner: Vec<u8>) -> common::ScenarioCall {
+    common::ScenarioCall::new(
+        wrapper,
+        IRevertBubbleWrapper::callAndRecordCall { data: inner.into() }.abi_encode(),
+    )
+    .with_gas_limit(1_200_000)
+}
+
+/// The three revert shapes a destination can produce, paired with the raw
+/// revert bytes each must deliver back to the source frame. `_executeEntry`
+/// re-reverts a failed entry with its recorded `returnData` verbatim, so the
+/// source sees the destination's own encoding, not a wrapper error.
+fn revert_cases(value: U256) -> [(&'static str, Vec<u8>, Vec<u8>); 3] {
+    let custom = IRevertingTarget::Rejected { seen: value }.abi_encode();
+    let string_reason = [
+        &keccak256(b"Error(string)")[..4],
+        &("reverting target".to_string(),).abi_encode_params()[..],
+    ]
+    .concat();
+    [
+        (
+            "custom error",
+            IRevertingTarget::revertCustomCall { v: value }.abi_encode(),
+            custom.clone(),
+        ),
+        (
+            "string reason",
+            IRevertingTarget::revertStringCall { v: value }.abi_encode(),
+            string_reason,
+        ),
+        (
+            // Writes two slots before reverting, so a surviving write is visible.
+            "write then revert",
+            IRevertingTarget::writeThenRevertCall { v: value }.abi_encode(),
+            custom,
+        ),
+    ]
+}
+
+/// Assert the destination frame left no trace. Called only after the scenario
+/// has settled, so a zero counter means rolled back rather than not yet run.
+async fn assert_destination_untouched(rpc: &str, target: Address, label: &str) {
+    for read in [target_calls_read(target), target_last_value_read(target)] {
+        let observed = common::read_state_word(rpc, &read).await.unwrap();
+        assert_eq!(
+            observed,
+            U256::ZERO,
+            "{label}: reverted destination must not persist state",
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inbound_reverting_destination_rolls_back_and_preserves_revert_data() {
+    let w = common::setup_cross_chain_reverting().await.unwrap();
+    let l2_rpc = w.l2_rpc();
+    let wrapper = w.inbound_wrapper;
+    let target = w.reverting_target_l2;
+    let value = U256::from(31u64);
+
+    let mut failures = 0u64;
+    for (label, inner, expected_revert) in revert_cases(value) {
+        failures += 1;
+        // The source tx itself succeeds (the wrapper records rather than
+        // bubbles), so `failures` advancing is proof the cross-chain call ran
+        // and came back failed — not that it was never attempted.
+        common::Scenario::new(format!("inbound reverting destination: {label}"))
+            .inbound(record_call(wrapper, inner))
+            .expect_l1_state(failures_read(wrapper), failures)
+            .expect_l1_state(successes_read(wrapper), 0u64)
+            .expect_l1_state(revert_length_read(wrapper), expected_revert.len() as u64)
+            .expect_l1_state(revert_hash_read(wrapper), keccak256(&expected_revert))
+            .expect_settled_fully()
+            .run(&w)
+            .await
+            .unwrap();
+        assert_destination_untouched(&l2_rpc, target, label).await;
+    }
+
+    // A valid call after three failures must still cross and commit, proving
+    // the failures left no poisoned entry or stuck nonce behind.
+    common::Scenario::new("inbound valid call after reverts")
+        .inbound(record_call(
+            wrapper,
+            IRevertingTarget::succeedCall { v: value }.abi_encode(),
+        ))
+        .expect_l2_state(target_calls_read(target), 1u64)
+        .expect_l2_state(target_last_value_read(target), value)
+        .expect_l1_state(successes_read(wrapper), 1u64)
+        .expect_l1_state(failures_read(wrapper), failures)
+        .expect_settled_fully()
+        .run(&w)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outbound_reverting_destination_rolls_back_and_preserves_revert_data() {
+    // Mirror of the inbound case with the sides swapped; source execution
+    // semantics differ per direction, so both are worth running.
+    let w = common::setup_cross_chain_reverting().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let wrapper = w.outbound_wrapper;
+    let target = w.reverting_target_l1;
+    let value = U256::from(37u64);
+
+    let mut failures = 0u64;
+    for (label, inner, expected_revert) in revert_cases(value) {
+        failures += 1;
+        common::Scenario::new(format!("outbound reverting destination: {label}"))
+            .outbound(record_call(wrapper, inner))
+            .expect_l2_state(failures_read(wrapper), failures)
+            .expect_l2_state(successes_read(wrapper), 0u64)
+            .expect_l2_state(revert_length_read(wrapper), expected_revert.len() as u64)
+            .expect_l2_state(revert_hash_read(wrapper), keccak256(&expected_revert))
+            .expect_settled_fully()
+            .run(&w)
+            .await
+            .unwrap();
+        assert_destination_untouched(&l1_rpc, target, label).await;
+    }
+
+    common::Scenario::new("outbound valid call after reverts")
+        .outbound(record_call(
+            wrapper,
+            IRevertingTarget::succeedCall { v: value }.abi_encode(),
+        ))
+        .expect_l1_state(target_calls_read(target), 1u64)
+        .expect_l1_state(target_last_value_read(target), value)
+        .expect_l2_state(successes_read(wrapper), 1u64)
+        .expect_l2_state(failures_read(wrapper), failures)
+        .expect_settled_fully()
+        .run(&w)
+        .await
+        .unwrap();
 }

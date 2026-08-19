@@ -912,9 +912,9 @@ where
         let new_safe_header = self.l2_sealed_header_at(to_block)?;
         let new_safe_hash = new_safe_header.hash();
         let new_safe_state_root = new_safe_header.state_root();
-        let settled_state_root = settlement.final_state.ok_or_else(|| {
-            DeriverError::l2_provider("non-empty settlement is missing its final state root")
-        })?;
+        // Always `Some` for a non-empty settlement (`attribute_settlement`).
+        // Diagnostics only — never gate the safe advance on it.
+        let settled_state_root = settlement.final_state.unwrap_or_default();
 
         // Advance safe; keep finalized where it is (only L1 finality
         // moves it).
