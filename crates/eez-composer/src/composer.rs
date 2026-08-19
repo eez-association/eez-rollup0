@@ -528,11 +528,10 @@ struct Inner<L2: BlockReader> {
     /// Cross-chain clients and execution context, guaranteed by the
     /// `eez-composer` entrypoint.
     cross_chain: CrossChainWiring,
-    /// Handle to the `BlockCommitter` actor (the sole engine-API
-    /// owner). Set once at startup via [`Composer::set_committer`]
-    /// after the Sequencer spawns the actor. Slot-context recovery uses it to
-    /// reorg an optimistically committed Sync block after L1 failure.
-    committer: std::sync::OnceLock<BlockCommitterHandle<EthEngineTypes>>,
+    /// Handle to the binary-owned `BlockCommitter` actor (the sole engine-API
+    /// owner), shared with the Sequencer and Deriver. Slot-context recovery
+    /// uses it to reorg an optimistically committed Sync block after L1 failure.
+    committer: BlockCommitterHandle<EthEngineTypes>,
     /// Per-block witnesses for [`eez_prover::ProvingContext::blocks`]. `None`
     /// means the configured in-process prover does not require block witnesses;
     /// it does not mean that the Composer has no prover.
@@ -566,6 +565,7 @@ where
         submitter: Submitter,
         evm_config: EthEvmConfig,
         cross_chain: CrossChainWiring,
+        committer: BlockCommitterHandle<EthEngineTypes>,
         witness_source: Option<Arc<dyn eez_prover::ProvingWitnessSource>>,
         timing: RollupTiming,
     ) -> Self {
@@ -576,19 +576,11 @@ where
                 submitter,
                 evm_config,
                 cross_chain,
-                committer: std::sync::OnceLock::new(),
+                committer,
                 witness_source,
                 emission: EmissionLimits::from_env(timing),
             }),
         }
-    }
-
-    /// Wire the `BlockCommitter` handle after the Sequencer spawns the
-    /// actor. Must be called before the first Sync slot in cross-chain
-    /// mode; the bundle-observer task needs it to reorg the L2 head on
-    /// bundle failure. Second and later calls are no-ops.
-    pub fn set_committer(&self, handle: BlockCommitterHandle<EthEngineTypes>) {
-        let _ = self.inner.committer.set(handle);
     }
 
     /// Run loop. Drains `l1_events` (subscribed by the caller before
@@ -1132,17 +1124,7 @@ where
         // Set by the two operations that move the head: the rollback and the
         // sibling commit.
         let mut outcome = RecoveryOutcome::HeadUnchanged;
-        let Some(committer) = self.inner.committer.get() else {
-            event!(
-                name: "eez.composer.recovery.no_committer",
-                Level::ERROR,
-                rollup_id,
-                sync_height,
-                "committer handle not wired; cannot recover failed batch",
-            );
-            rollup.optimistic.reinsert_failed(failed);
-            return RecoveryOutcome::HeadUnchanged;
-        };
+        let committer = &self.inner.committer;
         let mut landed = Vec::new();
         let mut receipt_error = None;
         for tx in &failed.txs {

@@ -30,8 +30,8 @@ use eez_composer::composer::CrossChainWiring;
 use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
 use eez_deriver::Deriver;
 use eez_driver::{
-    EthAttributesBuilder, RollupTiming, Sequencer, SlotEvent, SyncSlotComposerHandle,
-    spawn_interval, spawn_l1_anchored,
+    BlockCommitterHandle, DEFAULT_MAX_SPECULATIVE_DEPTH, EthAttributesBuilder, RollupTiming,
+    Sequencer, SyncSlotComposerHandle, spawn_interval, spawn_l1_anchored,
 };
 use eez_l1::{
     L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
@@ -223,15 +223,18 @@ async fn launch_dev_node(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         Level::INFO,
         "standalone mode — using default RollupTiming (L2=2s); set EEZ_*_TIME_MS to override",
     );
-    let sequencer = Sequencer::new(
+    let block_committer = BlockCommitterHandle::spawn_from_provider(
         &handle.node.provider,
-        EthAttributesBuilder::new(chain_spec),
         handle.node.add_ons_handle.beacon_engine_handle.clone(),
-        spawn_interval(timing.l2_block_time()),
         handle.node.payload_builder_handle.clone(),
-        timing,
         None,
     )?;
+    let sequencer = Sequencer::standalone(
+        EthAttributesBuilder::new(chain_spec),
+        block_committer,
+        spawn_interval(timing.l2_block_time()),
+        timing,
+    );
     event!(
         name: "eez.node.sequencer.spawned",
         Level::INFO,
@@ -272,28 +275,12 @@ async fn launch_follower(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Res
     let timing = RollupTiming::from_env()?;
     let l1_head = Arc::new(L1CanonicalHead::default());
 
-    // The follower needs the committer actor but never runs the Sequencer's
-    // production loop. This temporary channel is retired when actor ownership
-    // moves out of Sequencer.
-    let (_schedule_tx, schedule_rx) = mpsc::channel::<SlotEvent>(1);
-    let mut sequencer = Sequencer::new(
+    let block_committer = BlockCommitterHandle::spawn_from_provider(
         &provider,
-        EthAttributesBuilder::new(chain_spec.clone()),
         handle.node.add_ons_handle.beacon_engine_handle.clone(),
-        schedule_rx,
         handle.node.payload_builder_handle.clone(),
-        timing,
         None,
     )?;
-    let speculative_depth = env::var("EEZ_MAX_SPECULATIVE_DEPTH")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(64);
-    if speculative_depth != 0 {
-        sequencer = sequencer.with_speculative_limit(speculative_depth, Arc::clone(&l1_head));
-    }
-    let block_committer = sequencer.committer();
-    drop(sequencer);
 
     let submitter = Submitter::new(SubmitterConfig::from_env_read_only()?);
     let rollup_config = RollupConfig::from_env()?;
@@ -558,28 +545,16 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
 
     let attributes = EthAttributesBuilder::new(chain_spec.clone());
 
-    // Placeholder receiver, replaced with the L1-anchored schedule after
-    // the Composer has been built around this Sequencer's committer.
-    let (_schedule_tx, schedule_rx) = mpsc::channel::<SlotEvent>(1);
-
-    let mut sequencer = Sequencer::new(
+    let block_committer = BlockCommitterHandle::spawn_from_provider(
         &provider,
-        attributes,
         beacon_engine_handle,
-        schedule_rx,
         payload_builder_handle,
-        timing,
         witness_capture.sender(),
     )?;
     let depth = env::var("EEZ_MAX_SPECULATIVE_DEPTH")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(64);
-    if depth != 0 {
-        sequencer = sequencer.with_speculative_limit(depth, Arc::clone(&l1_head));
-    }
-
-    let block_committer = sequencer.committer();
+        .unwrap_or(DEFAULT_MAX_SPECULATIVE_DEPTH);
 
     let submitter_config = SubmitterConfig::from_env()?;
     let rollup_config = RollupConfig::from_env()?;
@@ -590,12 +565,9 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     // seed and every consumer has subscribed.
     let l1_watcher = L1Watcher::new(l1_watcher_config);
 
-    // Composer-only: build the umbrella, then attach it to the
-    // Sequencer built above (swapping in the L1-anchored schedule via
-    // `with_schedule_rx`). Must reuse that instance — its
-    // BlockCommitter actor is the one the Deriver shares; rebuilding
-    // would spawn a second actor with its own reconcile lock + head
-    // mirror, splitting the serialization domain.
+    // Build the Composer and Sequencer around the same binary-owned
+    // BlockCommitter handle. The Deriver receives another clone below, so all
+    // engine traffic shares one actor, reconcile lock, and head mirror.
     let (sequencer, composer, held_pool, system_tx_cfg, l1_source_chain_id) = {
         let rollup_id = rollup_config.rollup_id;
         let l1_variant = &embedded_l1;
@@ -882,27 +854,27 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             submitter.clone(),
             evm_config,
             cross_chain,
+            block_committer.clone(),
             witness_source,
             timing,
         );
         let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
 
-        // Reuse the same Sequencer (and its single BlockCommitter
-        // actor, shared with the Deriver) — swap in the L1-anchored
-        // schedule + composer hooks. Speculative depth already
-        // applied above.
         let schedule_rx = spawn_l1_anchored(
             L1HeadStream::from_watcher(&l1_watcher),
             timing,
             l2_genesis_timestamp,
         );
-        let sequencer = sequencer
-            .with_schedule_rx(schedule_rx)
-            .with_sync_slot_composer(rollup_id, sync_slot_handle);
-        // Hand the same BlockCommitter handle to the composer so its
-        // slot-context recovery can roll back failed optimistic Sync
-        // blocks — the actor stays the sole engine-API owner.
-        composer.set_committer(sequencer.committer());
+        let sequencer = Sequencer::composer(
+            attributes,
+            block_committer.clone(),
+            schedule_rx,
+            timing,
+            rollup_id,
+            sync_slot_handle,
+            depth,
+            Arc::clone(&l1_head),
+        );
         (
             sequencer,
             composer,
