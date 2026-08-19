@@ -1,0 +1,47 @@
+# L1-only 12s devnet args (ethereum-package), for deploying an external EEZ L2.
+#
+# This is the `ethereum_package:` block from args.example.yaml, promoted to the
+# top level so it can drive the upstream package directly (no eez-node / no
+# bundled L2):
+#
+#   kurtosis run github.com/ethpandaops/ethereum-package \
+#     --enclave eez-l1-12s --args-file testing/kurtosis/l1-only-args.yaml
+#
+# Same chain id (7331), same 12s cadence, same rbuilder/flashbots MEV stack as
+# the full devnet — just Pair B (reth EL + Lighthouse CL + rbuilder + relay).
+participants:
+  # One validator reth+Lighthouse pair (el-1). The flashbots MEV config below
+  # adds a second, separate builder pair (el-2-reth-builder) for the bundler.
+  - el_type: reth
+    el_image: ghcr.io/paradigmxyz/reth:latest
+    cl_type: lighthouse
+    cl_image: sigp/lighthouse:v8.1.2
+    count: 1
+
+network_params:
+  network_id: "7331"
+  seconds_per_slot: 12
+  slot_duration_ms: 12000
+  genesis_gaslimit: 60000000
+  min_validator_withdrawability_delay: 1
+  shard_committee_period: 1
+  deneb_fork_epoch: 0
+  electra_fork_epoch: 0
+  # Builder coinbase + hardhat dev accounts #0-#2 — the keys every eez script and
+  # the L2 deploy use (#0 = poster/L2-system 0xf39F…, #1 = proof signer 0x7099…,
+  # #2 = target deployer 0x3C44…). Must be single-line compact JSON — the genesis
+  # generator's yq rejects a multi-line folded scalar.
+  prefunded_accounts: '{"0xb9e79D19f651a941757b35830232E7EFC77E1c79":{"balance":"1000000ETH"},"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266":{"balance":"1000000ETH"},"0x70997970C51812dc3A010C7d01b50e0d17dc79C8":{"balance":"1000000ETH"},"0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC":{"balance":"1000000ETH"}}'
+
+mev_type: flashbots
+mev_params:
+  mev_builder_image: ethpandaops/reth-rbuilder:develop
+  mev_relay_image: ethpandaops/mev-boost-relay:main
+  mev_boost_image: ethpandaops/mev-boost:develop
+  mev_builder_cl_image: sigp/lighthouse:v8.1.2
+  mev_builder_subsidy: 1
+
+# Block explorers for visibility; no spamoor/disruptoor/assertoor.
+additional_services:
+  - dora
+  - blockscout

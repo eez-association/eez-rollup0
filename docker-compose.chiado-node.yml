@@ -87,8 +87,10 @@ services:
       EEZ_L1_DATADIR: /l1
       EEZ_L1_JWT_SECRET: /jwt/jwt.hex
       EEZ_L1_RPC_URL: http://127.0.0.1:18645
-      # EEZ_L1_TARGET_RPC_URL intentionally unset → bundle target-block
-      # oracle falls back to the embedded L1 (config.rs build_target_provider).
+      # Forwarded but empty by default - the bundle
+      # target-block oracle falls back to the embedded L1. Set it in
+      # .env.chiado
+      EEZ_L1_TARGET_RPC_URL: "${EEZ_L1_TARGET_RPC_URL:-}"
       EEZ_L1_ROLLUP_ID: "0"
       # Cross-chain wiring.
       EEZL2_ADDRESS: "0x4200000000000000000000000000000000000007"
@@ -108,13 +110,21 @@ services:
       EEZ_MAX_USER_TXS_PER_BUNDLE: "${EEZ_MAX_USER_TXS_PER_BUNDLE:-3}"
       # Execution reserve above the postBatch calldata floor.
       EEZ_POSTBATCH_GAS_RESERVE: "${EEZ_POSTBATCH_GAS_RESERVE:-4000000}"
+      # Emission + reorg bounds documented in .env.example. eez-node reads these
+      # from the process env, and this service takes no env_file beyond
+      # deployments.env, so they have to be forwarded explicitly. Defaults track
+      # the in-code ones (composer.rs, timing.rs, l1_watcher.rs).
+      EEZ_MAX_BLOCKS_PER_BATCH: "${EEZ_MAX_BLOCKS_PER_BATCH:-300}"
+      EEZ_MAX_POSTBATCH_GAS: "${EEZ_MAX_POSTBATCH_GAS:-16777216}"
+      EEZ_L1_REORG_MAX_DEPTH_BLOCKS: "${EEZ_L1_REORG_MAX_DEPTH_BLOCKS:-62}"
       # Deterministic L1-anchored timings (must match any follower).
       EEZ_L1_BLOCK_TIME_MS: "5000"
       EEZ_L2_BLOCK_TIME_MS: "1000"
       # Reserve time for remote stateless validation. The 2500ms proof budget
-      # plus 1300ms slack stays within the 4000ms schedulable L2 window.
+      # plus 1300ms slack stays within the 4000ms schedulable L2 window — if
+      # either is raised, keep their sum at or below 4000ms.
       EEZ_PROOF_TIME_MS: "${EEZ_PROOF_TIME_MS:-2500}"
-      EEZ_SUBMISSION_SLACK_MS: "1300"
+      EEZ_SUBMISSION_SLACK_MS: "${EEZ_SUBMISSION_SLACK_MS:-1300}"
       # Don't freeze the sequencer when chiado bundles are slow to land.
       EEZ_MAX_SPECULATIVE_DEPTH: "0"
       # Multi-composer: tolerate + adopt batches posted by the competing
