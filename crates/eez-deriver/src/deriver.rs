@@ -13,7 +13,7 @@ use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT, BlockCommitterHandle, DeriveOutcome};
-use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Watcher, ScannedBatch, Submitter};
+use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, ScannedBatch, Submitter};
 use eez_protocol::outbound_gate::OutboundCallObservation;
 use reth_chainspec::{ChainSpec, EthereumHardforks};
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -31,6 +31,15 @@ use tracing::{Level, event};
 
 use crate::error::{DeriverError, DeriverResult};
 
+/// Watcher seed: the finalized block, kept inside the range this scan read.
+/// Both bounds have wedged boot in the field. Separate fn so they stay
+/// unit-testable without a provider.
+fn choose_seed(floor: u64, end: u64, finalized: Option<u64>) -> u64 {
+    // `floor.min(end)` is load-bearing: `clamp` PANICS when min > max, which a
+    // rewound L1 can produce.
+    finalized.unwrap_or(floor).clamp(floor.min(end), end)
+}
+
 /// L1-derived L2 consensus engine. Cheaply [`Clone`]able.
 #[derive(Clone)]
 pub struct Deriver<L2>
@@ -44,7 +53,6 @@ struct Inner<L2>
 where
     L2: BlockReader,
 {
-    l1_watcher: L1Watcher,
     committer: BlockCommitterHandle<EthEngineTypes>,
     l2_provider: Arc<L2>,
     submitter: Submitter,
@@ -86,7 +94,6 @@ where
             )
             .field("finalized_l2_block", &self.inner.l1_head.finalized_l2())
             .field("committer", &self.inner.committer)
-            .field("l1_watcher", &self.inner.l1_watcher)
             .finish_non_exhaustive()
     }
 }
@@ -113,7 +120,6 @@ where
     /// `l2_entries[]`) and prepends them to the batch's Sync block, so
     /// local replay is byte-identical. `None` is the pure-user-tx STF.
     pub fn new(
-        l1_watcher: L1Watcher,
         committer: BlockCommitterHandle<EthEngineTypes>,
         l2_provider: Arc<L2>,
         submitter: Submitter,
@@ -126,7 +132,6 @@ where
         let evm_config = EthEvmConfig::new(Arc::clone(&chain_spec));
         Self {
             inner: Arc::new(Inner {
-                l1_watcher,
                 committer,
                 l2_provider,
                 submitter,
@@ -155,13 +160,82 @@ where
     ///
     /// # Errors
     ///
-    /// `l2_provider` (lookup / scan failure), `local_diverged` (replay
-    /// failure), `committer_closed`.
+    /// `l1_scan` (scan failure), `l2_provider` (lookup failure),
+    /// `local_diverged` (replay failure), `committer_closed`.
     ///
     /// # Panics
     ///
     /// If the `batches` mutex is poisoned.
     pub async fn catch_up(&self) -> DeriverResult<()> {
+        self.catch_up_inner().await.map(|_| ())
+    }
+
+    /// [`Self::catch_up`], additionally returning the `L1Watcher::polling`
+    /// seed: the finalized block, kept inside the range this scan read so
+    /// the seed is immutable and always servable. Boot-only.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::catch_up`]; additionally `SourceIncomplete` while the
+    /// L1 source cannot yet serve the seed block's hash.
+    pub async fn catch_up_with_seed(&self) -> DeriverResult<(u64, B256)> {
+        let end = self.catch_up_inner().await?;
+        // NOT canonicality-probed: at boot this tail is a batch THIS scan just
+        // found, with a hash straight from `get_logs`. Cross-checked below.
+        let indexed_tail = self.inner.l1_head.last_indexed();
+        let floor = indexed_tail
+            .as_ref()
+            .map_or_else(|| self.inner.deploy_block.saturating_sub(1), |t| t.l1_block);
+        let finalized = self
+            .inner
+            .submitter
+            .finalized_block()
+            .await
+            .map_err(DeriverError::l1_scan)?;
+        // No finality yet (a chain younger than two epochs) → the floor, which
+        // this scan read and the watcher's ancestor backfill makes reorg-safe.
+        let seed = choose_seed(floor, end, finalized.map(|(n, _)| n));
+        let canonical = self
+            .inner
+            .submitter
+            .canonical_l1_hash(seed)
+            .await
+            .map_err(DeriverError::l1_scan)?
+            .ok_or_else(|| {
+                // Not served yet, or rewound mid-scan — retryable, not fatal.
+                DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
+                    block: seed,
+                    tx_hash: B256::ZERO,
+                    detail: "catch-up seed block not served by the L1 source yet".into(),
+                })
+            })?;
+        // A batch this scan indexed at the seed height sitting on another fork
+        // means the chain moved under us: retry so `revalidate_index_tail` drops
+        // it. (A finalized seed needs no such check — it cannot reorg.)
+        if indexed_tail.is_some_and(|t| t.l1_block == seed && t.l1_block_hash != canonical) {
+            return Err(DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
+                block: seed,
+                tx_hash: B256::ZERO,
+                detail: "catch-up seed block reorged during the scan; retry".into(),
+            }));
+        }
+        event!(
+            name: "eez.deriver.catch_up.seed",
+            Level::INFO,
+            floor,
+            scan_end = end,
+            finalized = ?finalized.map(|(n, _)| n),
+            seed,
+            seed_hash = %canonical,
+            "watcher seed chosen",
+        );
+        Ok((seed, canonical))
+    }
+
+    /// Shared body of [`Self::catch_up`] / [`Self::catch_up_with_seed`].
+    /// Returns the inclusive L1 block covered: the scan's endpoint, or the
+    /// tip when the range was empty (nothing below it can hold our events).
+    async fn catch_up_inner(&self) -> DeriverResult<u64> {
         let _guard = self.inner.committer.begin_reconcile().await;
         let old_cursor = self.inner.l1_head.cursor();
         let anchor = self.revalidate_index_tail().await?;
@@ -187,8 +261,17 @@ where
                 .submitter
                 .canonical_l1_hash(tail.l1_block)
                 .await
-                .map_err(|e| DeriverError::l2_provider(format!("L1 canonicality probe: {e}")))?;
-            if canonical == Some(tail.l1_block_hash) {
+                .map_err(DeriverError::l1_scan)?;
+            // `None` is not proof of a reorg — retreating on it would unwind
+            // L2 to genesis, so retry instead.
+            let Some(canonical) = canonical else {
+                return Err(DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
+                    block: tail.l1_block,
+                    tx_hash: tail.tx_hash,
+                    detail: "indexed batch's L1 block not served; cannot judge canonicality".into(),
+                }));
+            };
+            if canonical == tail.l1_block_hash {
                 return Ok(Some(tail.l1_block));
             }
             let old_cursor = self.inner.l1_head.cursor();
@@ -201,7 +284,7 @@ where
                 Level::WARN,
                 l1_block = tail.l1_block,
                 indexed_hash = %tail.l1_block_hash,
-                canonical_hash = ?canonical,
+                canonical_hash = %canonical,
                 old_cursor,
                 new_cursor,
                 dropped_batches = dropped,
@@ -215,11 +298,12 @@ where
     /// each successful L1 chunk before fetching the next. If a later chunk
     /// reports an incomplete source, the next catch-up retry can resume from
     /// the latest canonical batch already indexed in [`L1CanonicalHead`].
+    /// Returns the inclusive L1 block the scan covered through.
     async fn sync_batches_inner(
         &self,
         from_l1_block: u64,
         cumulative_start: u64,
-    ) -> DeriverResult<()> {
+    ) -> DeriverResult<u64> {
         let local_head = self
             .inner
             .l2_provider
@@ -249,7 +333,7 @@ where
                 cursor = cumulative_start,
                 "scan completed without replaying any blocks",
             );
-            return Ok(());
+            return Ok(to_l1_block);
         }
 
         let mut cumulative_l2 = cumulative_start;
@@ -283,7 +367,7 @@ where
                 "scan completed without replaying any blocks",
             );
         }
-        Ok(())
+        Ok(to_l1_block)
     }
 
     async fn reconcile_scanned_batches(
@@ -581,23 +665,12 @@ where
             .await?)
     }
 
-    /// Runs the deriver loop. Subscribes to the `L1Watcher`'s event
-    /// broadcast and processes each event until the stream closes.
-    pub async fn run(self) {
-        // Subscribe FIRST. broadcast::channel only delivers events
-        // fired after the subscription; any event fired before is lost
-        // to this receiver. Subscribing here means events fired during
-        // the resync below are queued in the broadcast buffer and
-        // delivered to us once we enter the recv() loop.
-        let mut rx = self.inner.l1_watcher.subscribe();
-
-        // Resync: re-anchor against L1 to cover the window between
-        // main.rs's boot-time `catch_up` and the subscription above.
-        // Batches that landed in that window are visible neither in
-        // the boot scan nor in live events; a reorg in that window is
-        // worse — it invalidates batches the boot scan already
-        // indexed, and no Reorg event for it will ever arrive. Reorg-aware
-        // catch_up handles both.
+    /// Runs the deriver loop, processing each event on `rx` until the
+    /// stream closes. `rx` must be subscribed before the `L1Watcher`
+    /// starts so no event predates it.
+    pub async fn run(self, mut rx: broadcast::Receiver<L1Event>) {
+        // Defensive re-anchor: a cheap no-op in the normal boot order;
+        // load-bearing for any caller that subscribed rx late.
         if let Err(err) = self.catch_up().await {
             event!(
                 name: "eez.deriver.resync.failed",
@@ -1999,5 +2072,24 @@ mod outbound_wiring_tests {
             )
             .is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::choose_seed;
+
+    /// The seed must never leave `[floor, end]` — both bounds have been wrong
+    /// in the field, wedging boot each time.
+    #[test]
+    fn choose_seed_stays_within_the_scanned_range() {
+        assert_eq!(choose_seed(500, 1000, Some(968)), 968); // finality lags the tip
+        assert_eq!(choose_seed(990, 1000, Some(900)), 990); // finalized below floor
+        assert_eq!(choose_seed(500, 1000, Some(1010)), 1000); // finality past scan
+        // Chain too young to finalize: the floor is what the scan read.
+        assert_eq!(choose_seed(500, 1000, None), 500);
+        // Floor above the endpoint (L1 rewound under an indexed batch).
+        assert_eq!(choose_seed(999, 40, Some(20)), 40);
+        assert_eq!(choose_seed(0, 0, None), 0);
     }
 }

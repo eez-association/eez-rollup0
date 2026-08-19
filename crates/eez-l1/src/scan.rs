@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use alloy_consensus::Transaction;
+use alloy_consensus::transaction::TxHashRef;
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider;
@@ -24,6 +25,9 @@ pub(crate) const LOG_SCAN_CHUNK_BLOCKS: u64 = 100_000;
 struct SettledRoot {
     tx_index: u64,
     log_index: u64,
+    /// L1 block this root's log landed in — attribution requires it to
+    /// match the batch's block hash (fork-pinning).
+    block_hash: B256,
     root: B256,
 }
 
@@ -287,9 +291,10 @@ pub(crate) async fn scan_batch_logs_range(
         .get_logs(&winners_filter)
         .await
         .map_err(|e| L1Error::Provider(format!("get_logs(L2ExecutionPerformed): {e}")))?;
-    let winner_tx_hashes: HashSet<B256> = winner_logs
+    // Pinned by block hash too: the same tx can sit on both sides of a fork.
+    let winner_tx_hashes: HashSet<(B256, B256)> = winner_logs
         .iter()
-        .filter_map(|l| l.transaction_hash)
+        .filter_map(|l| Some((l.block_hash?, l.transaction_hash?)))
         .collect();
     // Settled roots per L1 block, in emission order and tagged with the emitting
     // tx index. Per-TX-INDEX because two composers can post for the same rollup
@@ -301,11 +306,15 @@ pub(crate) async fn scan_batch_logs_range(
         let (Some(bn), Some(tx_index)) = (l.block_number, l.transaction_index) else {
             continue;
         };
+        let block_hash = l.block_hash.ok_or_else(|| {
+            L1Error::Provider("L2ExecutionPerformed log missing block_hash".into())
+        })?;
         let data = l.data().data.as_ref();
         if data.len() == 32 {
             settled_by_block.entry(bn).or_default().push(SettledRoot {
                 tx_index,
                 log_index: l.log_index.unwrap_or_default(),
+                block_hash,
                 root: B256::from_slice(data),
             });
         }
@@ -329,21 +338,40 @@ pub(crate) async fn scan_batch_logs_range(
         let tx_hash = log
             .transaction_hash
             .ok_or_else(|| L1Error::Provider("BatchPosted log missing tx_hash".into()))?;
-        // Fetch the postBatch tx by (block, index), NOT by hash.
-        // Helps use pruned nodes.
+        // Fetch the postBatch tx by (block hash, index) — a minimal node has no
+        // tx-hash index, and (block NUMBER, index) alone can straddle a reorg.
         let tx_index = log
             .transaction_index
             .ok_or_else(|| L1Error::Provider("BatchPosted log missing transaction_index".into()))?;
-        let tx = fetch_log_transaction(provider, l1_block_number, tx_index, tx_hash).await?;
+        let tx = fetch_log_transaction(provider, l1_block_number, l1_block_hash, tx_index, tx_hash)
+            .await?;
         let submitter = tx.inner.signer();
         let input = tx.inner.input();
-        let decoded = postAndVerifyBatchCall::abi_decode(input)
-            .map_err(|e| L1Error::Provider(format!("decode postBatch({tx_hash}): {e}")))?;
+        // `BatchPosted` carries rollupCount, not rollupId, so we decode every
+        // rollup's batch — and a peer posting via a router yields undecodable
+        // input. Skip unless it settled OUR rollup (invariant 8).
+        let decoded = match postAndVerifyBatchCall::abi_decode(input) {
+            Ok(decoded) => decoded,
+            Err(e) if !winner_tx_hashes.contains(&(l1_block_hash, tx_hash)) => {
+                event!(
+                    name: "eez.l1_scan.foreign_batch_undecodable",
+                    Level::WARN,
+                    l1_block_number,
+                    tx_hash = %tx_hash,
+                    error = %e,
+                    "skipping an undecodable postBatch that did not settle our rollup",
+                );
+                continue;
+            }
+            Err(e) => {
+                return Err(L1Error::Decode(format!("decode postBatch({tx_hash}): {e}")));
+            }
+        };
         let _decoded_event = BatchPosted::decode_log(&alloy_primitives::Log {
             address: log.address(),
             data: log.data().clone(),
         })
-        .map_err(|e| L1Error::Provider(format!("decode BatchPosted({tx_hash}): {e}")))?;
+        .map_err(|e| L1Error::Decode(format!("decode BatchPosted({tx_hash}): {e}")))?;
         let (claimed_current_state, claimed_chain) = our_state_chain(&decoded.batch, rollup_id);
         decoded_batches.push(DecodedBatchLog {
             l1_block_number,
@@ -369,11 +397,11 @@ pub(crate) async fn scan_batch_logs_range(
     // our rollup. A batch owns the settled roots emitted from its own tx up to
     // (excluding) the next such boundary — its entries are provably dead past
     // that point, queue wiped.
-    let mut boundaries: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut boundaries: HashMap<(u64, B256), Vec<u64>> = HashMap::new();
     for b in &decoded_batches {
         if b.verifies_our_rollup {
             boundaries
-                .entry(b.l1_block_number)
+                .entry((b.l1_block_number, b.l1_block_hash))
                 .or_default()
                 .push(b.tx_index);
         }
@@ -386,18 +414,21 @@ pub(crate) async fn scan_batch_logs_range(
     let mut out: Vec<ScannedBatch> = Vec::with_capacity(decoded_batches.len());
     for b in decoded_batches {
         let window_end = boundaries
-            .get(&b.l1_block_number)
+            .get(&(b.l1_block_number, b.l1_block_hash))
             .and_then(|idxs| idxs.iter().copied().find(|&i| i > b.tx_index))
             .unwrap_or(u64::MAX);
-        let observed: Vec<B256> = settled_by_block
-            .get(&b.l1_block_number)
-            .map(|roots| {
-                roots
-                    .iter()
-                    .filter(|r| r.tx_index >= b.tx_index && r.tx_index < window_end)
-                    .map(|r| r.root)
-                    .collect()
-            })
+        // Roots at this height on a DIFFERENT hash mean the two log queries
+        // straddled a reorg; retry rather than silently settling empty.
+        let block_roots = settled_by_block.get(&b.l1_block_number);
+        if block_roots.is_some_and(|roots| roots.iter().all(|r| r.block_hash != b.l1_block_hash)) {
+            return Err(L1Error::SourceIncomplete {
+                block: b.l1_block_number,
+                tx_hash: b.tx_hash,
+                detail: "settlement logs are from another fork of this block; retry".into(),
+            });
+        }
+        let observed: Vec<B256> = block_roots
+            .map(|roots| window_roots(roots, b.tx_index, window_end, b.l1_block_hash))
             .unwrap_or_default();
         let settlement = attribute_settlement(b.claimed_current_state, &b.claimed_chain, &observed);
         out.push(ScannedBatch {
@@ -407,7 +438,7 @@ pub(crate) async fn scan_batch_logs_range(
             submitter: b.submitter,
             call_data: b.call_data,
             post_batch_input: b.post_batch_input,
-            state_applied: winner_tx_hashes.contains(&b.tx_hash),
+            state_applied: winner_tx_hashes.contains(&(b.l1_block_hash, b.tx_hash)),
             settlement,
             claimed_current_state: b.claimed_current_state,
             claimed_new_state: b.claimed_chain.last().copied(),
@@ -435,6 +466,21 @@ fn our_state_chain(
         }
     }
     (first_curr, new_states)
+}
+
+/// Roots settled inside this batch's tx-index window AND on this batch's own
+/// L1 block hash — a same-numbered root from a different fork never attributes.
+fn window_roots(
+    roots: &[SettledRoot],
+    tx_index: u64,
+    window_end: u64,
+    block_hash: B256,
+) -> Vec<B256> {
+    roots
+        .iter()
+        .filter(|r| r.tx_index >= tx_index && r.tx_index < window_end && r.block_hash == block_hash)
+        .map(|r| r.root)
+        .collect()
 }
 
 /// Which of this batch's claimed steps L1 ran (see [`Settlement`]). `observed` is
@@ -483,59 +529,62 @@ fn attribute_settlement(
     }
 }
 
+/// Fetches the postBatch tx by (block hash, index) — never by tx hash, which
+/// a minimal node can't serve. The fetched tx's own hash must match the
+/// log's, else a reorg swapped the block between the log fetch and this call.
 async fn fetch_log_transaction(
     provider: &impl Provider,
     l1_block_number: u64,
+    l1_block_hash: B256,
     tx_index: u64,
     tx_hash: B256,
 ) -> L1Result<alloy_rpc_types_eth::Transaction> {
-    if let Some(tx) = provider
-        .get_transaction_by_block_number_and_index(
-            BlockNumberOrTag::Number(l1_block_number),
-            tx_index as usize,
-        )
+    let Some(tx) = provider
+        .get_transaction_by_block_hash_and_index(l1_block_hash, tx_index as usize)
         .await
         .map_err(|e| {
             L1Error::Provider(format!(
-                "get_tx({l1_block_number}#{tx_index} for {tx_hash}): {e}"
+                "get_tx({l1_block_hash}#{tx_index} for {tx_hash}): {e}"
             ))
         })?
-    {
-        return Ok(tx);
-    }
+    else {
+        return Err(L1Error::SourceIncomplete {
+            block: l1_block_number,
+            tx_hash,
+            detail: format!("block-hash/index lookup returned null at tx index {tx_index}"),
+        });
+    };
 
-    event!(
-        name: "eez.l1.scan_batch_logs.tx_by_index_missing",
-        Level::WARN,
-        l1_block_number,
-        tx_index,
-        tx_hash = %tx_hash,
-        "postBatch tx missing by block/index; retrying same provider by hash",
-    );
-
-    provider
-        .get_transaction_by_hash(tx_hash)
-        .await
-        .map_err(|e| L1Error::Provider(format!("get_tx({tx_hash}): {e}")))?
-        .ok_or_else(|| L1Error::SourceIncomplete {
+    if *tx.inner.tx_hash() != tx_hash {
+        return Err(L1Error::SourceIncomplete {
             block: l1_block_number,
             tx_hash,
             detail: format!(
-                "block/index lookup returned null at tx index {tx_index}; tx-hash lookup also returned null"
+                "tx at ({l1_block_hash}, {tx_index}) does not match the log's tx hash — reorg during scan; retry"
             ),
-        })
+        });
+    }
+    Ok(tx)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchLogChunks, LOG_SCAN_CHUNK_BLOCKS, Settlement, attribute_settlement,
-        fetch_log_transaction, initial_log_scan_ranges, scan_next_batch_log_chunk,
+        BatchLogChunks, LOG_SCAN_CHUNK_BLOCKS, SettledRoot, Settlement, attribute_settlement,
+        fetch_log_transaction, initial_log_scan_ranges, scan_batch_logs_range,
+        scan_next_batch_log_chunk, window_roots,
     };
     use crate::error::L1Error;
-    use alloy_primitives::{Address, B256, Bytes, U256};
+    use alloy_consensus::transaction::TxHashRef;
+    use alloy_primitives::{Address, B256, Bytes, I256, U256};
     use alloy_provider::ProviderBuilder;
+    use alloy_sol_types::{SolCall, SolEvent};
     use alloy_transport::mock::Asserter;
+    use eez_protocol::abi::{
+        BatchPosted, ExecutionEntrySol, L2ExecutionPerformed,
+        ProofSystemBatchPerVerificationEntriesSol, RollupIdWithProofSystemsSol, StateUpdateSol,
+        postAndVerifyBatchCall,
+    };
 
     #[test]
     fn initial_log_scan_ranges_stack_order() {
@@ -840,9 +889,27 @@ mod tests {
         assert_eq!(attribute_settlement(None, &[b], &[z]), Settlement::NONE);
     }
 
+    /// A root logged against a DIFFERENT fork of the same block NUMBER (hash B,
+    /// not this batch's hash A) must not be attributed — it settles as empty,
+    /// exactly like any other non-matching root.
+    #[test]
+    fn window_roots_excludes_a_different_forks_root_at_the_same_block_number() {
+        let hash_a = B256::repeat_byte(0xA1);
+        let hash_b = B256::repeat_byte(0xB2);
+        let root = B256::repeat_byte(0x0D);
+        let roots = [SettledRoot {
+            tx_index: 0,
+            log_index: 0,
+            block_hash: hash_b,
+            root,
+        }];
+        assert!(window_roots(&roots, 0, u64::MAX, hash_a).is_empty());
+        assert_eq!(window_roots(&roots, 0, u64::MAX, hash_b), vec![root]);
+    }
+
     /// A minimal, serializable RPC transaction for mocked provider
-    /// responses. The signature is a fixed test vector — none of the
-    /// scan paths validate it.
+    /// responses. Signed with a fixed test vector, so its hash is
+    /// deterministic — the identity check compares against it.
     fn mock_rpc_transaction() -> alloy_rpc_types_eth::Transaction {
         use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy, transaction::Recovered};
         let tx = TxLegacy {
@@ -865,50 +932,170 @@ mod tests {
         }
     }
 
-    /// The boot-crash fix's linchpin: a tx the L1 serves by (block,
-    /// index) is returned directly; one missing by index falls back to
-    /// the by-hash lookup; missing by BOTH lookups classifies as
+    /// A `postAndVerifyBatch` tx carrying `input`, signed with a fixed test
+    /// vector — its hash is a deterministic function of `input` alone, so
+    /// distinct batches naturally get distinct hashes.
+    /// A postBatch tx for `rollup_id`, optionally claiming one
+    /// `current -> new` step. `salt` varies the encoding so each call yields a
+    /// distinct tx hash.
+    fn batch_tx(
+        rollup_id: u64,
+        step: Option<(B256, B256)>,
+        salt: u64,
+    ) -> alloy_rpc_types_eth::Transaction {
+        let batch = ProofSystemBatchPerVerificationEntriesSol {
+            rollupIdsWithProofSystems: vec![RollupIdWithProofSystemsSol {
+                rollupId: rollup_id,
+                proofSystemIndexes: vec![],
+            }],
+            immediateEntryCount: U256::from(salt),
+            entries: step
+                .map(|(current, new)| {
+                    vec![ExecutionEntrySol {
+                        stateUpdates: vec![StateUpdateSol {
+                            rollupId: rollup_id,
+                            currentState: current,
+                            newState: new,
+                            etherDelta: I256::ZERO,
+                        }],
+                        ..Default::default()
+                    }]
+                })
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        mock_post_batch_tx(postAndVerifyBatchCall { batch }.abi_encode())
+    }
+
+    fn mock_post_batch_tx(input: Vec<u8>) -> alloy_rpc_types_eth::Transaction {
+        use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy, transaction::Recovered};
+        let tx = TxLegacy {
+            chain_id: Some(1),
+            nonce: 0,
+            gas_price: 1,
+            gas_limit: 21_000,
+            to: alloy_primitives::TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            input: Bytes::from(input),
+        };
+        let signed = tx.into_signed(alloy_primitives::Signature::test_signature());
+        alloy_rpc_types_eth::Transaction {
+            inner: Recovered::new_unchecked(TxEnvelope::Legacy(signed), Address::ZERO),
+            block_hash: None,
+            block_number: None,
+            block_timestamp: None,
+            transaction_index: None,
+            effective_gas_price: None,
+        }
+    }
+
+    /// A `BatchPosted` log at the given (block, tx) coordinates.
+    fn batch_posted_log(
+        block_number: u64,
+        block_hash: B256,
+        tx_hash: B256,
+        tx_index: u64,
+    ) -> alloy_rpc_types_eth::Log {
+        alloy_rpc_types_eth::Log {
+            inner: alloy_primitives::Log {
+                address: Address::ZERO,
+                data: BatchPosted {
+                    rollupCount: U256::from(1),
+                }
+                .encode_log_data(),
+            },
+            block_hash: Some(block_hash),
+            block_number: Some(block_number),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: Some(tx_index),
+            log_index: Some(0),
+            removed: false,
+        }
+    }
+
+    /// An `L2ExecutionPerformed` log settling `root` for `rollup_id` at the
+    /// given (block, tx, log) coordinates.
+    fn settled_root_log(
+        rollup_id: u64,
+        root: B256,
+        block_number: u64,
+        block_hash: B256,
+        tx_hash: B256,
+        tx_index: u64,
+        log_index: u64,
+    ) -> alloy_rpc_types_eth::Log {
+        alloy_rpc_types_eth::Log {
+            inner: alloy_primitives::Log {
+                address: Address::ZERO,
+                data: L2ExecutionPerformed {
+                    rollupId: rollup_id,
+                    newState: root,
+                }
+                .encode_log_data(),
+            },
+            block_hash: Some(block_hash),
+            block_number: Some(block_number),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: Some(tx_index),
+            log_index: Some(log_index),
+            removed: false,
+        }
+    }
+
+    /// The boot-crash fix's linchpin: a tx the L1 serves at (block hash, index) is
+    /// returned when its hash matches the log's; a null lookup classifies as
     /// `SourceIncomplete` (retryable) rather than a fatal provider error.
     ///
-    /// The mock is a method-agnostic FIFO, so this pins response
-    /// consumption counts and the fallback/classification behavior —
-    /// not which RPC method each lookup used.
+    /// The mock is a method-agnostic FIFO, so this pins response consumption
+    /// counts and the classification behavior — not which RPC method was used.
     #[tokio::test]
-    async fn tx_lookup_falls_back_by_hash_then_classifies_source_incomplete() {
+    async fn tx_lookup_hits_by_hash_index_then_classifies_null_source_incomplete() {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
-        let tx_hash = B256::with_last_byte(0x51);
+        let real_hash = *mock_rpc_transaction().inner.tx_hash();
 
-        // (a) by-(block, index) hit: returned directly, no fallback call.
+        // (a) by-(block hash, index) hit, hash matches the log: accepted directly.
         asserter.push_success(&mock_rpc_transaction());
-        fetch_log_transaction(&provider, 14, 0, tx_hash)
+        fetch_log_transaction(&provider, 14, B256::ZERO, 0, real_hash)
             .await
             .expect("index lookup hit");
 
-        // (b) index lookup null → by-hash fallback hit.
+        // (b) null lookup → retryable SourceIncomplete carrying the block and
+        // tx hash context.
         asserter.push_success(&serde_json::Value::Null);
-        asserter.push_success(&mock_rpc_transaction());
-        fetch_log_transaction(&provider, 14, 0, tx_hash)
+        let err = fetch_log_transaction(&provider, 14, B256::ZERO, 7, real_hash)
             .await
-            .expect("hash fallback hit");
-
-        // (c) both lookups null → retryable SourceIncomplete carrying
-        // the block and tx hash context.
-        asserter.push_success(&serde_json::Value::Null);
-        asserter.push_success(&serde_json::Value::Null);
-        let err = fetch_log_transaction(&provider, 14, 7, tx_hash)
-            .await
-            .expect_err("both lookups null must not yield a tx");
+            .expect_err("null lookup must not yield a tx");
         assert!(err.is_source_incomplete(), "unexpected error: {err}");
         match err {
             L1Error::SourceIncomplete {
                 block, tx_hash: h, ..
             } => {
                 assert_eq!(block, 14);
-                assert_eq!(h, tx_hash);
+                assert_eq!(h, real_hash);
             }
             other => panic!("expected SourceIncomplete, got {other}"),
         }
+    }
+
+    /// A one-block reorg between the log fetch and this call can return a
+    /// DIFFERENT tx at the same (block hash, index) slot; the tx's own hash must
+    /// still match the log's, or it must be rejected — not laundered into the batch.
+    #[tokio::test]
+    async fn tx_lookup_rejects_a_tx_whose_hash_does_not_match_the_log() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let real_hash = *mock_rpc_transaction().inner.tx_hash();
+        let claimed_hash = B256::with_last_byte(0x51);
+        assert_ne!(claimed_hash, real_hash, "test vector must actually differ");
+
+        asserter.push_success(&mock_rpc_transaction());
+        let err = fetch_log_transaction(&provider, 14, B256::ZERO, 0, claimed_hash)
+            .await
+            .expect_err("mismatched tx must be rejected, not accepted");
+        assert!(err.is_source_incomplete(), "unexpected error: {err}");
     }
 
     /// A result-count refusal must NARROW the range, not abort the scan: the
@@ -999,5 +1186,176 @@ mod tests {
             *chunks.ranges.last().expect("tail range"),
             (100_000, 150_000)
         );
+    }
+
+    /// `state_applied` is pinned by `(block_hash, tx_hash)` — a settlement log
+    /// carrying the SAME tx hash but a DIFFERENT block hash (as a reorg would
+    /// produce) must not credit the batch.
+    #[tokio::test]
+    async fn state_applied_is_pinned_by_block_hash_not_tx_hash_alone() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let hash_a = B256::with_last_byte(0xA1);
+        let hash_b = B256::with_last_byte(0xB2);
+        let tx = batch_tx(1, None, 0);
+        let tx_hash = *tx.inner.tx_hash();
+
+        asserter.push_success(&vec![batch_posted_log(100, hash_a, tx_hash, 0)]);
+        asserter.push_success(&vec![
+            // Unrelated settlement on our OWN hash — keeps this distinct from
+            // the all-different-fork case (SourceIncomplete; tested separately).
+            settled_root_log(
+                1,
+                B256::repeat_byte(0xD4),
+                100,
+                hash_a,
+                B256::with_last_byte(0xC3),
+                1,
+                0,
+            ),
+            // Same tx hash as our postBatch tx, but a DIFFERENT block hash.
+            settled_root_log(1, B256::repeat_byte(0xE5), 100, hash_b, tx_hash, 2, 0),
+        ]);
+        asserter.push_success(&tx);
+
+        let scanned = scan_batch_logs_range(&provider, Address::ZERO, 1, 100, 100)
+            .await
+            .expect("scan succeeds");
+        assert_eq!(scanned.len(), 1);
+        assert!(
+            !scanned[0].state_applied,
+            "same tx hash on a different block hash must not mark state_applied"
+        );
+    }
+
+    /// Window boundaries are keyed by `(block_number, block_hash)` — a rival
+    /// batch on a DIFFERENT fork of the same block number must not truncate
+    /// our window.
+    #[tokio::test]
+    async fn boundaries_are_keyed_by_block_hash_not_number_alone() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let (hash_a, hash_b) = (B256::with_last_byte(0xA1), B256::with_last_byte(0xB2));
+        let (c0, c1) = (B256::repeat_byte(0x50), B256::repeat_byte(0x51));
+
+        let ours = batch_tx(1, Some((c0, c1)), 0);
+        let rival = batch_tx(1, None, 1); // same block NUMBER, different HASH
+        let boundary = batch_tx(1, None, 2); // our real next boundary, hash A
+        let (ours_hash, rival_hash, boundary_hash) = (
+            *ours.inner.tx_hash(),
+            *rival.inner.tx_hash(),
+            *boundary.inner.tx_hash(),
+        );
+
+        asserter.push_success(&vec![
+            batch_posted_log(500, hash_a, ours_hash, 3),
+            batch_posted_log(500, hash_b, rival_hash, 5),
+            batch_posted_log(500, hash_a, boundary_hash, 9),
+        ]);
+        asserter.push_success(&vec![
+            // tx_index 7: past the rival's 5, before our real boundary at 9.
+            settled_root_log(1, c1, 500, hash_a, B256::with_last_byte(0xF0), 7, 0),
+            // Decoy on the rival's hash so its own pass doesn't trip the
+            // all-roots-on-a-foreign-fork guard first.
+            settled_root_log(
+                1,
+                B256::repeat_byte(0x99),
+                500,
+                hash_b,
+                B256::with_last_byte(0xF1),
+                5,
+                0,
+            ),
+        ]);
+        asserter.push_success(&ours);
+        asserter.push_success(&rival);
+        asserter.push_success(&boundary);
+
+        let scanned = scan_batch_logs_range(&provider, Address::ZERO, 1, 500, 500)
+            .await
+            .expect("scan succeeds");
+        let ours = scanned
+            .iter()
+            .find(|b| b.tx_hash == ours_hash)
+            .expect("our batch scanned");
+        assert_eq!(
+            ours.settlement,
+            Settlement {
+                start: 0,
+                len: 1,
+                final_state: Some(c1),
+                entry_state: Some(c0),
+            },
+            "the rival on another fork must not cut our window at its tx_index"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_fork_settlement_logs_are_source_incomplete_not_empty() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let hash_a = B256::with_last_byte(0xA1);
+        let hash_b = B256::with_last_byte(0xB2);
+        let tx = batch_tx(1, None, 0);
+        let tx_hash = *tx.inner.tx_hash();
+
+        asserter.push_success(&vec![batch_posted_log(700, hash_a, tx_hash, 0)]);
+        asserter.push_success(&vec![settled_root_log(
+            1,
+            B256::repeat_byte(0x77),
+            700,
+            hash_b,
+            B256::with_last_byte(0xC3),
+            1,
+            0,
+        )]);
+        asserter.push_success(&tx);
+
+        let err = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
+            .await
+            .expect_err("all settlement roots on a different fork must not settle empty");
+        assert!(err.is_source_incomplete(), "unexpected error: {err}");
+    }
+
+    /// `BatchPosted` carries rollupCount, not rollupId, so a peer posting via a
+    /// router yields an input we cannot decode. That must not halt us — unless
+    /// the same tx settled OUR rollup, which we then genuinely cannot derive.
+    #[tokio::test]
+    async fn undecodable_foreign_batch_is_skipped_but_one_that_settled_us_is_fatal() {
+        let block_hash = B256::with_last_byte(0xA1);
+        let tx = mock_post_batch_tx(b"not a postAndVerifyBatch call".to_vec());
+        let tx_hash = *tx.inner.tx_hash();
+
+        // Did not settle our rollup: skipped, scan still succeeds.
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        asserter.push_success(&vec![batch_posted_log(700, block_hash, tx_hash, 0)]);
+        asserter.push_success(&Vec::<alloy_rpc_types_eth::Log>::new());
+        asserter.push_success(&tx);
+        let scanned = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
+            .await
+            .expect("a foreign undecodable batch must not fail the scan");
+        assert!(scanned.is_empty());
+
+        // Settled our rollup: we cannot derive it, so fail loudly.
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        asserter.push_success(&vec![batch_posted_log(700, block_hash, tx_hash, 0)]);
+        asserter.push_success(&vec![settled_root_log(
+            1,
+            B256::repeat_byte(0x77),
+            700,
+            block_hash,
+            tx_hash,
+            0,
+            0,
+        )]);
+        asserter.push_success(&tx);
+        let err = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
+            .await
+            .expect_err("an undecodable batch that moved our root must not be skipped");
+        assert!(err.is_terminal(), "unexpected error: {err}");
     }
 }

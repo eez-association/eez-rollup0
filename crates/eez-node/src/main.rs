@@ -428,7 +428,9 @@ fn main() -> eyre::Result<()> {
         let l1_watcher_config = L1WatcherConfig::from_env()?;
 
         let submitter = Submitter::new(submitter_config);
-        let l1_watcher = L1Watcher::spawn(l1_watcher_config);
+        // Handle only — polling starts after boot catch-up fixes the
+        // seed and every consumer has subscribed.
+        let l1_watcher = L1Watcher::new(l1_watcher_config);
 
         // Composer-only: build the umbrella, then attach it to the
         // Sequencer built above (swapping in the L1-anchored schedule via
@@ -770,7 +772,6 @@ fn main() -> eyre::Result<()> {
                 rollups,
                 prover,
                 submitter.clone(),
-                l1_watcher.clone(),
                 evm_config,
                 cross_chain,
                 timing,
@@ -850,7 +851,6 @@ fn main() -> eyre::Result<()> {
         // same L2 system txs the composer produced (single-source STF).
         let l2_block_time_secs = timing.l2_block_time().as_secs();
         let deriver = Deriver::new(
-            l1_watcher.clone(),
             block_committer.clone(),
             Arc::new(provider.clone()),
             submitter.clone(),
@@ -863,9 +863,9 @@ fn main() -> eyre::Result<()> {
 
         let mut catch_up_retry_delay = BOOT_CATCH_UP_INITIAL_RETRY_DELAY;
         let mut catch_up_attempts = 0_u64;
-        loop {
-            match deriver.catch_up().await {
-                Ok(()) => break,
+        let (l1_seed_number, l1_seed_hash) = loop {
+            match deriver.catch_up_with_seed().await {
+                Ok(seed) => break seed,
                 Err(err) if err.is_source_incomplete() => {
                     catch_up_attempts += 1;
                     event!(
@@ -896,7 +896,7 @@ fn main() -> eyre::Result<()> {
                     return Err(eyre::eyre!("boot-time deriver catch_up failed: {err}"));
                 }
             }
-        }
+        };
         event!(
             name: "eez.node.deriver.spawned",
             Level::INFO,
@@ -905,8 +905,9 @@ fn main() -> eyre::Result<()> {
             "spawning eez deriver",
         );
         let deriver_run = deriver.clone();
+        let deriver_events = l1_watcher.subscribe();
         task_executor.spawn_critical_task("eez-deriver", async move {
-            deriver_run.run().await;
+            deriver_run.run(deriver_events).await;
         });
 
         // Follower-only: optional sequencer-RPC unsafe-head overlay.
@@ -946,8 +947,9 @@ fn main() -> eyre::Result<()> {
             });
 
             event!(name: "eez.node.composer.spawned", Level::INFO, "spawning eez composer umbrella");
+            let composer_events = l1_watcher.subscribe();
             task_executor.spawn_critical_task("eez-composer", async move {
-                composer.run().await;
+                composer.run(composer_events).await;
             });
 
             // Cross-chain ingress fronts (see `run_cross_chain_front`) — one per
@@ -970,6 +972,14 @@ fn main() -> eyre::Result<()> {
                 });
             }
         }
+
+        // Start polling last: every consumer is subscribed and catch-up
+        // covered [deploy_block, seed], so the watcher owns all blocks
+        // strictly after its seed — no startup scan gap.
+        task_executor.spawn_critical_task(
+            "eez-l1-watcher",
+            l1_watcher.polling(l1_seed_number, l1_seed_hash),
+        );
 
         handle.wait_for_node_exit().await
     })
