@@ -218,12 +218,23 @@ async fn launch_dev_node(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         .await?;
 
     let chain_spec: Arc<_> = handle.node.chain_spec();
-    let timing = RollupTiming::standalone_default();
-    event!(
-        name: "eez.node.timing.standalone_default",
-        Level::INFO,
-        "standalone mode — using default RollupTiming (L2=2s); set EEZ_*_TIME_MS to override",
-    );
+    let timing = if env::var_os("EEZ_L2_BLOCK_TIME_MS").is_some() {
+        let timing = RollupTiming::from_env()?;
+        event!(
+            name: "eez.node.timing.standalone_configured",
+            Level::INFO,
+            l2_block_time_ms = timing.l2_block_time().as_millis(),
+            "standalone mode — using configured RollupTiming",
+        );
+        timing
+    } else {
+        event!(
+            name: "eez.node.timing.standalone_default",
+            Level::INFO,
+            "standalone mode — using default RollupTiming (L2=2s); set EEZ_*_TIME_MS to override",
+        );
+        RollupTiming::standalone_default()
+    };
     let block_committer = BlockCommitterHandle::spawn_from_provider(
         &handle.node.provider,
         handle.node.add_ons_handle.beacon_engine_handle.clone(),

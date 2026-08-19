@@ -364,6 +364,21 @@ impl Harness {
         Ok(h)
     }
 
+    /// Hardhat-funded fixture genesis with a wall-clock timestamp. Used when a
+    /// test needs the fixture's EIP-1559 configuration without making the
+    /// sequencer permanently late against a newly started L1.
+    pub async fn fresh_reorg() -> Result<Self> {
+        let ts = now_unix_secs();
+        let (gpath, gdir) = write_l2_genesis_at(ts)?;
+        let cfg = AnvilConfig {
+            genesis_timestamp: Some(ts),
+            ..AnvilConfig::for_reorg()
+        };
+        let mut h = Self::with_anvil_config(cfg, reorg_genesis_state_root()?).await?;
+        h.l2_genesis = Some((gpath, gdir));
+        Ok(h)
+    }
+
     /// Custom anvil config + explicit initial state root. Used by the
     /// reorg test which needs cancun + hardhat mnemonic + custom L2 genesis.
     pub async fn with_anvil_config(cfg: AnvilConfig, initial_state: B256) -> Result<Self> {
@@ -396,7 +411,7 @@ impl Harness {
         expect_external_batches: bool,
     ) -> Vec<(&'static str, String)> {
         self.env_for_options(NodeEnvOptions {
-            poster_key,
+            poster_key: Some(poster_key),
             proof_signer_key: Some(ANVIL_KEY),
             rollup_id: self.dep.rollup_id,
             expect_external_batches,
@@ -406,7 +421,7 @@ impl Harness {
 
     pub fn follower_env(&self, sequencer_rpc: Option<&str>) -> Vec<(&'static str, String)> {
         self.env_for_options(NodeEnvOptions {
-            poster_key: ANVIL_KEY,
+            poster_key: None,
             proof_signer_key: None,
             rollup_id: self.dep.rollup_id,
             expect_external_batches: true,
@@ -416,7 +431,7 @@ impl Harness {
 
     pub fn env_with_rollup_id(&self, rollup_id: u64) -> Vec<(&'static str, String)> {
         self.env_for_options(NodeEnvOptions {
-            poster_key: ANVIL_KEY,
+            poster_key: Some(ANVIL_KEY),
             proof_signer_key: Some(ANVIL_KEY),
             rollup_id,
             expect_external_batches: false,
@@ -426,7 +441,7 @@ impl Harness {
 
     pub fn env_with_proof_signer(&self, proof_signer_key: &str) -> Vec<(&'static str, String)> {
         self.env_for_options(NodeEnvOptions {
-            poster_key: ANVIL_KEY,
+            poster_key: Some(ANVIL_KEY),
             proof_signer_key: Some(proof_signer_key),
             rollup_id: self.dep.rollup_id,
             expect_external_batches: false,
@@ -437,8 +452,6 @@ impl Harness {
     fn env_for_options(&self, opts: NodeEnvOptions<'_>) -> Vec<(&'static str, String)> {
         let mut env = vec![
             ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
-            ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
-            ("EEZ_L1_POSTER_KEY", opts.poster_key.to_string()),
             ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
             ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
@@ -498,6 +511,10 @@ impl Harness {
             ),
         ];
 
+        if let Some(poster_key) = opts.poster_key {
+            env.push(("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()));
+            env.push(("EEZ_L1_POSTER_KEY", poster_key.to_string()));
+        }
         if let Some(proof_signer_key) = opts.proof_signer_key {
             env.push(("EEZ_PROOF_SIGNER_KEY", proof_signer_key.to_string()));
         }
@@ -509,7 +526,7 @@ impl Harness {
 }
 
 struct NodeEnvOptions<'a> {
-    poster_key: &'a str,
+    poster_key: Option<&'a str>,
     proof_signer_key: Option<&'a str>,
     rollup_id: u64,
     expect_external_batches: bool,

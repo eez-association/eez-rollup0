@@ -23,11 +23,6 @@ use common::{
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_mins(3);
 
-fn with_composer_disabled(mut env: Vec<(&'static str, String)>) -> Vec<(&'static str, String)> {
-    env.push(("EEZ_COMPOSER_DISABLED", "1".to_string()));
-    env
-}
-
 fn assert_no_divergence_failure_logs(nodes: &[&NodeHandle]) {
     for node in nodes {
         node.assert_no_divergence_failure_logs();
@@ -41,38 +36,48 @@ fn assert_no_divergence_failure_logs(nodes: &[&NodeHandle]) {
 /// in the same batch, even when those later tx lists match.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_sequencer_intra_batch_suffix_replay_converges() {
-    let harness = Harness::with_anvil_config(
-        AnvilConfig::for_reorg(),
-        reorg_genesis_state_root().unwrap(),
-    )
-    .await
-    .unwrap();
+    let harness = Harness::fresh_reorg().await.unwrap();
     let chain = harness.chain();
-    let genesis = reorg_genesis_path();
-    let cfg = NodeConfig {
-        genesis_path: Some(genesis.as_path()),
+    let stage_cfg = NodeConfig {
+        binary: NodeBinary::Dev,
+        ..Default::default()
+    };
+    let composer_cfg = NodeConfig {
+        binary: NodeBinary::Composer,
+        ..Default::default()
+    };
+    let follower_cfg = NodeConfig {
+        binary: NodeBinary::Follower,
         ..Default::default()
     };
 
     let primary_dir = tempfile::tempdir().unwrap();
     let mirror_dir = tempfile::tempdir().unwrap();
-    let seq_a_env_disabled = with_composer_disabled(harness.env_for(ANVIL_KEY, true));
-    let seq_b_env = with_composer_disabled(harness.env_for(ANVIL_KEY_4, true));
+    let seq_a_env = harness.env_for(ANVIL_KEY, true);
+    let seq_b_env = harness.env_for(ANVIL_KEY_4, true);
 
     let seq_a = NodeHandle::start_with_datadir(
         "intra-seq-a-stage",
         primary_dir.path(),
-        &cfg,
-        &seq_a_env_disabled,
+        &stage_cfg,
+        &seq_a_env,
     )
     .await
     .unwrap();
-    let seq_b = NodeHandle::start_with_datadir("intra-seq-b", mirror_dir.path(), &cfg, &seq_b_env)
-        .await
-        .unwrap();
+    let seq_b = NodeHandle::start_with_datadir(
+        "intra-seq-b-stage",
+        mirror_dir.path(),
+        &stage_cfg,
+        &seq_b_env,
+    )
+    .await
+    .unwrap();
 
     let seq_a_rpc = seq_a.l2_rpc_url();
     let seq_a_provider = ProviderBuilder::new().connect_http(seq_a_rpc.parse().unwrap());
+    wait_for_latest_height(&seq_a, 1, DEFAULT_TIMEOUT)
+        .await
+        .expect("development sequencer A did not produce its first block");
     let tx_hash = send_l2_value_transfer(&seq_a_rpc, ANVIL_KEY_1, ANVIL_ADDR, U256::from(1u64))
         .await
         .expect("submit L2 tx to sequencer A");
@@ -98,10 +103,19 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
         .expect("sequencer B did not stage enough local blocks");
 
     drop(seq_a);
+    drop(seq_b);
+    let seq_b = NodeHandle::start_with_datadir(
+        "intra-seq-b-follow",
+        mirror_dir.path(),
+        &follower_cfg,
+        &harness.follower_env(None),
+    )
+    .await
+    .unwrap();
     let seq_a = NodeHandle::start_with_datadir(
         "intra-seq-a-compose",
         primary_dir.path(),
-        &cfg,
+        &composer_cfg,
         &harness.env_for(ANVIL_KEY, true),
     )
     .await
