@@ -533,8 +533,9 @@ struct Inner<L2: BlockReader> {
     /// after the Sequencer spawns the actor. Slot-context recovery uses it to
     /// reorg an optimistically committed Sync block after L1 failure.
     committer: std::sync::OnceLock<BlockCommitterHandle<EthEngineTypes>>,
-    /// Per-block witnesses for [`eez_prover::ProvingContext::blocks`]. Present
-    /// in remote-prover mode; `None` (mock) leaves `blocks` empty.
+    /// Per-block witnesses for [`eez_prover::ProvingContext::blocks`]. `None`
+    /// means the configured in-process prover does not require block witnesses;
+    /// it does not mean that the Composer has no prover.
     witness_source: Option<Arc<dyn eez_prover::ProvingWitnessSource>>,
     /// Bounds on what one postBatch may settle. Read from env once here so
     /// the emission decision, the boundary math, and the span guard in
