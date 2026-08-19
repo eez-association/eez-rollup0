@@ -162,6 +162,7 @@ mod tests {
 
     use alloy_primitives::B256;
     use async_trait::async_trait;
+    use eez_prover::ActionableProverFailure;
 
     use super::*;
 
@@ -305,6 +306,31 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, ProverError::Backend(_)));
+        assert_eq!(prover.calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn actionable_prover_error_is_returned_without_retrying_same_request() {
+        let failure = ActionableProverFailure::Outbound {
+            transaction_index: 3,
+            transaction_hash: B256::repeat_byte(0xaa),
+        };
+        let prover = ScriptedProver::new(vec![Err(ProverError::Actionable {
+            failure,
+            message: "outbound transaction failed validation".to_owned(),
+        })]);
+
+        let error = prove_with_retry_at(
+            &prover,
+            ProvingContext::default(),
+            test_timing(),
+            BundleTarget::NextBlock,
+            TEST_NOW_MS,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.actionable_failure(), Some(failure));
         assert_eq!(prover.calls(), 1);
     }
 
