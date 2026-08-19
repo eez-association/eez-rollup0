@@ -1,151 +1,154 @@
 # Chained-interstate change review
 
-> A hunk-by-hunk walkthrough of everything in this change-set (staged +
-> unstaged working tree vs `2c6ad3d`), written for review. Each section
-> covers one file group in file order; every hunk is accounted for.
-> Design rationale lives in `docs/CHAINED-INTERSTATE-DESIGN.md`; this
-> document explains the *code*.
+This document walks through every change in the chained-interstate
+change-set, file by file, hunk by hunk. It explains what each change does,
+why it exists, and — where behavior changed — what happened before and
+what happens now.
+
+Read `docs/CHAINED-INTERSTATE-DESIGN.md` first. It explains the problem
+and the design in plain language, and defines the two words this document
+uses constantly: a **claim** (the promised result baked into a batch) and
+the **drain** (the once-per-slot moment the composer composes the held
+cross-chain transactions).
 
 ## The change in one paragraph
 
-Issue #88: the composer simulated each held cross-chain tx in isolation
-against the same pre-slot state. Three co-bundled `increment()` calls all
-recorded `returnData = 1`; real execution returns 1, 2, 3; the second
-delivery reverts `RollingHashMismatch` on-chain; the proof signer rejects
-the whole window; the txs re-queue at the front and the composer loops
-forever. The fix makes composition *chained*: the Sync block under
-construction **is** the L2 simulation state (`SyncBlockState`), a slot-pinned
-L1 world accumulates surviving effects, claims are read off executions of
-the **real contract paths** (a probe of the canonical delivery tx; real
-`EEZ → proxy.executeOnBehalf` frames), and every accepted tx is appended
-to the real block and receipt-checked immediately — so the on-chain
-compare that used to freeze the composer now costs a single tx an
-eviction at compose time.
+Issue #88: the composer simulated each held cross-chain transaction in
+isolation, against the same pre-slot state. Three co-bundled `increment()`
+calls each claimed "returns 1". The real block returned 1, 2, 3. The
+second delivery failed its on-chain check, the proof signer refused to
+sign the window, and the transactions re-queued forever. The fix: build
+the Sync block during composition and use it as the simulation state
+(`SyncBlockState`), keep one accumulated L1 state per slot
+(`L1SlotState`), read every claim off an execution of the real contract
+code, and append each accepted transaction to the real block with an
+immediate receipt check. A wrong claim now costs one transaction an
+eviction instead of freezing the composer.
 
 ## Reading map
 
 | Part | Files | What it covers |
 |---|---|---|
-| 1 | `eez-composer/src/local/build.rs`; `eez-protocol/src/system_tx.rs`, `abi.rs`; `Cargo.toml` | `SyncBlockState`/`SyncBlockFork` (block-is-the-session) + equivalence tests; canonical-builder factoring; new ABI surface |
-| 2 | `eez-composer/src/local/slot.rs` (new), `client.rs`, `mod.rs`, `lib.rs` | The two real-path executors, probe inspector, source-sim seams |
-| 3 | `eez-composer/src/composer.rs` | The drain rework: two-phase canonical order, accept/evict protocol, keystone assert |
-| 4 | tests, harness, `main.rs`, CI, compose file, `Counter.sol` | Verification + wiring + operational knobs |
-| A | — | Incidents from live chiado testing (why three late hunks exist) |
-| B | — | Headline behavior changes (each part ends with its full inventory) |
+| 1 | `local/build.rs`; `eez-protocol` (`system_tx.rs`, `abi.rs`); `Cargo.toml` | The block-as-simulation machinery and its equivalence tests; the canonical-builder helpers; new ABI entries |
+| 2 | `local/slot.rs` (new), `local/client.rs`, `local/mod.rs`, `lib.rs` | The two real-path execution sessions, the probe, the source-sim seams |
+| 3 | `composer.rs` | The drain rework: two passes in canonical order, the accept/evict protocol, the keystone and belt checks |
+| 4 | tests, harness, `main.rs`, CI, the compose file, `Counter.sol` | How it is verified and operated |
+| A | — | Why three hunks exist only because of live chiado testing |
+| B | — | The headline behavior changes (each part ends with its full table) |
 
-Parts are in dependency order — the drain (Part 3) consumes everything
-before it.
+The parts are in dependency order. The drain (Part 3) uses everything
+built in Parts 1 and 2.
 
 ## What deliberately did NOT change
 
 - Entry building, `prepare_post_batch_raw`, `sync_block_pair_roots`, the
-  deriver, the proof signer, the optimistic observer, held-pool
-  semantics, and the overlay/nested re-entry machinery are untouched.
-- The old `LocalExecutionSession` (direct-call shortcut) still exists in
-  `session.rs`; it is simply no longer on the claim path.
-- All existing tests pass unmodified (522 workspace tests; the full e2e
-  matrix re-verified after every step of this change).
-
-
+  deriver, the proof signer, the optimistic observer, the held pool, and
+  the overlay machinery for nested calls inside one transaction.
+- The old direct-call session (`local/session.rs`) still exists. It is
+  simply no longer on the claim path.
+- All pre-existing tests pass unmodified.
 
 ---
 
 # Part 1 — Execution foundations and protocol helpers
 
 
-The design doc's §2 claim is "the Sync block is the session": during
-composition, "L2 state right now" must be *exactly* the state the real block
-will have at that position — because every claim recorded during composition
-is later checked by executing that same block, on-chain and at the proof
-signer. These four files are where that claim is made true. `build.rs` grows
-the live prefix state, `system_tx.rs` makes the composer's incremental block
-and the canonical rebuild share one code path, `abi.rs` teaches the workspace
-the manager/proxy function signatures the new L1 executor drives, and the
-manifests pay for a mock provider so the equivalence can be tested at all.
+Recall the three `increment()` calls. They must claim 1, 2, 3 — not 1, 1, 1.
+So "the L2 state right now" during composition must be the exact state the real
+block will hold at that position. The design doc calls this "the Sync block is
+the session". Part 1 is where it becomes true.
+
+Four files do the groundwork:
+
+- `build.rs` grows the live block prefix, and hands out forks of it.
+- `system_tx.rs` makes the composer's incremental block and the canonical
+  rebuild share one lowering.
+- `abi.rs` adds the manager and proxy signatures the new L1 executor calls.
+- `Cargo.toml` pays for a mock provider, so the equivalence is unit-testable.
 
 Verified while reviewing: `cargo test -p eez-composer --lib local::build` —
 3 passed.
 
 ## `crates/eez-composer/src/local/build.rs`
 
-620 lines added, ~90 moved. Roughly a third is the new live-state type, a
+619 lines added, 35 removed. Roughly a third is the new live-state type, a
 third is helper extraction, and a third is tests.
 
 ### Hunk 1 — module doc
 
-Three lines saying what the file now is: the same block construction, also
-exposed as a *live* incrementally extended state, so "a claim read off it is
-the value the committed block produces." Accurate framing; the rest of the
-file delivers it.
+Three new lines. They say the file still builds a Sync block, and now also
+exposes that same construction as a *live* state that grows one tx at a time.
+"A claim read off it is the value the committed block produces." Accurate
+framing; the rest of the file delivers it.
 
 ### Hunk 2 — imports and the `DraftDb` alias
 
-Mostly mechanical import growth (`Evm as _`, `EvmEnvFor`, `InspectorFor`,
+The import growth is mechanical: `Evm as _`, `EvmEnvFor`, `InspectorFor`,
 `Recovered`, `StateProviderBox`, `CacheState`, `NoOpInspector`,
-`DatabaseCommit`, `ExecutionResult`, `Arc`). The one thing worth reading is
-the new public alias:
+`DatabaseCommit`, `ExecutionResult`, `Arc`.
+
+One new line is worth reading:
 
 ```rust
 pub type DraftDb = State<StateProviderDatabase<StateProviderBox>>;
 ```
 
-Note the `StateProviderBox`: `build_sync_block` builds its `State` over a
-*borrowed* `&dyn StateProvider` (it must keep the provider alive separately
-to hand to `finish`), whereas the live path owns a boxed provider so the
-state can outlive the call that opened it. Same database, different
-ownership — the reason for the alias, and for `open_draft_db` existing
-alongside the inline builder in `build_sync_block`.
+Note the `StateProviderBox`. `build_sync_block` builds its `State` over a
+*borrowed* `&dyn StateProvider`, because it must keep the provider alive
+separately to hand to `finish`. The live path owns a boxed provider instead, so
+the state can outlive the call that opened it. Same database, different
+ownership. That is the reason for the alias, and the reason `open_draft_db`
+exists alongside the inline builder inside `build_sync_block`.
 
 ### Hunk 3a — `BuiltSyncBlock.tx_successes`
 
-**Before:** the final build returned payload + header + block. Whether any tx
-in it *reverted* was invisible to the caller.
+Before: the final build returned payload, header, and block, and a reverted
+tx inside it was invisible to the caller. After: a `Vec<bool>` of receipt
+statuses in block order.
 
-**After:** a `Vec<bool>` of receipt statuses in block order.
-
-This is the belt half of the belt-and-braces. Each tx was already
-receipt-checked when it was appended to the live prefix; `tx_successes` lets
-the composer re-check the same thing on the final, independently built block
-(`composer.rs:2416`) and bail to a minimal postBatch if the two ever
-disagree. Given the whole point of the change is that appended state ==
-final-block state, this field is the assertion that says so out loud rather
-than trusting it.
+This is the belt half of belt-and-braces. Every tx was already receipt-checked
+when the drain appended it to the live prefix. `tx_successes` lets the composer
+re-check the same thing on the final, independently built block
+(`composer.rs:2452`). If the two ever disagree, the composer bails to a minimal
+postBatch. The whole design claims "appended state == final-block state", and
+this field is the assertion that says so out loud instead of trusting it.
 
 ### Hunk 3b — `next_block_attributes` extracted
 
-The `NextBlockEnvAttributes` literal (timestamp, fee recipient,
+The `NextBlockEnvAttributes` literal moves out of `build_sync_block` into a
+free function, comment and all. It carries timestamp, fee recipient,
 `prev_randao = 0`, `BUILDER_GAS_LIMIT`, cancun-gated
-`parent_beacon_block_root`, shanghai-gated `withdrawals`, `extra_data`) moves
-out of `build_sync_block` into a free function, comment and all.
+`parent_beacon_block_root`, shanghai-gated `withdrawals`, and `extra_data`.
+No field changed.
 
-Pure extraction — no field changed. But it is the single most important
-extraction in the diff: `SyncBlockState::open` and `build_sync_block` now
-*cannot* disagree about the block env. If they could, the divergence would be
-silent and nasty — e.g. `SyncBlockState` computing a claim under one timestamp
-while the committed block executes under another, so `block.timestamp` reads
-differently and a return value the entry hash commits to changes. Sharing the
-constructor makes that class of bug unrepresentable instead of merely
-unlikely.
+Pure extraction, and the single most important extraction in the diff.
+`SyncBlockState::open` and `build_sync_block` now *cannot* disagree about the
+block env. A disagreement would be silent and nasty. Say `SyncBlockState`
+computed a claim under one timestamp while the committed block executed under
+another: a contract reading `block.timestamp` returns a different value, and
+the entry hash commits to the wrong return data. One shared constructor makes
+that class of bug unrepresentable rather than merely unlikely.
 
 ### Hunk 3c — `recover_tx` extracted
 
-Decode-2718 + signer recovery, previously inline in `build_sync_block`'s
-loop, now a helper taking the block position for error labelling. Mechanical.
+Decode-2718 plus signer recovery. It was inline in `build_sync_block`'s tx loop;
+it is now a helper taking the block position for error labelling. Mechanical.
 
 ### Hunk 3d — `open_draft_db`
 
-New helper: `state_by_block_hash(parent)` → `State::builder()` with bundle
-updates, plus an optional `with_cached_prestate(cache)`. The `Option<CacheState>`
-is the fork seam — `None` for a fresh prefix, `Some(clone)` for a fork. Note
-this is the same `with_cached_prestate` mechanism the overlay/nested path
-already relies on in production, so it is not a new trust assumption.
+New helper. It calls `state_by_block_hash(parent)`, then `State::builder()`
+with bundle updates, plus an optional `with_cached_prestate(cache)`. That
+`Option<CacheState>` is the fork seam: `None` for a fresh prefix,
+`Some(clone)` for a fork. `with_cached_prestate` is the same mechanism the
+overlay/nested path already relies on in production, so it is not a new trust
+assumption.
 
 ### Hunk 4 — `build_sync_block` uses the helpers
 
-Three small edits: `attributes` now comes from `next_block_attributes(...)`;
-the tx loop is `builder.execute_transaction(recover_tx(tx_bytes, idx)?)`;
-after `finish`, receipts are mapped into `tx_successes`. No behavior change
-beyond the new field being populated.
+Three small edits. `attributes` now comes from `next_block_attributes(...)`.
+The tx loop becomes `builder.execute_transaction(recover_tx(tx_bytes, idx)?)`.
+After `finish`, receipts map into `tx_successes`. No behavior change beyond
+the new field being populated.
 
 ### Hunk 5 — `TxOutcome` and `exec_outcome`
 
@@ -153,77 +156,75 @@ beyond the new field being populated.
 pub struct TxOutcome { pub success: bool, pub gas_used: u64, pub output: Bytes }
 ```
 
-The distinction encoded here drives the entire drain's evict-vs-degrade
-policy, so it is worth stating precisely: **a revert is a successful
-execution** — `Ok(TxOutcome { success: false, output: <revert data> })`.
-Only a tx revm refuses outright (bad nonce, insufficient funds, undecodable)
-comes back as `Err(BuildError)`.
+One distinction here drives the drain's whole evict-vs-abort policy, so state
+it precisely. **A revert is a successful execution**:
+`Ok(TxOutcome { success: false, output: <revert data> })`. Only a tx revm
+refuses outright comes back as `Err(BuildError)` — bad nonce, insufficient
+funds, undecodable bytes.
 
-Concretely, in the drain (`composer.rs::append_and_execute`) `Ok(!success)` means
-"this tx's own claim contradicts its execution → evict this tx, keep
-composing" while `Err` means "we couldn't even run it". Collapsing the two
-would either silently drop revert data (which the probe needs for the rolling
-hash) or turn a single bad tx into a whole-slot failure.
+The drain then splits on the error class. A revert becomes
+`BuildError::ExecuteTx`, and the drain evicts that one tx and keeps composing
+(`composer.rs:576`). A database read failure becomes `BuildError::Provider`,
+and the drain aborts the slot rather than blame a valid tx
+(`composer.rs:1917`). Collapsing the two would either drop the revert data or
+turn a single bad tx into a whole-slot failure.
 
 `gas_used` is `result.tx_gas_used()` — gas after refunds, exactly what the
 receipt reports and what the header's `gas_used` accumulates. That identity is
-what makes the tests below work. `output` is `None → empty` for a halt, as
-documented.
+what makes the tests below work. `output` is empty when a tx halts without
+output, as documented.
 
 ### Hunk 6 — `execute_and_commit_inspected`
 
-The per-tx engine for the live paths: `recover_tx`, build an EVM over the
-state with the block's env, `transact(&recovered)`, snapshot the outcome,
-`db_mut().commit(result.state)`.
+The per-tx engine for the live paths. It calls `recover_tx`, builds an EVM
+over the state with the block's env, calls `transact(&recovered)`, snapshots
+the outcome, then calls `db_mut().commit(result.state)`.
 
-The load-bearing question is whether this really equals what
-`BlockBuilder::execute_transaction` does to *state*. I checked the pinned
-`alloy-evm` (0.34.0, `src/eth/block.rs`):
+The load-bearing question is whether this does the same thing to *state* as
+`BlockBuilder::execute_transaction`. I checked the pinned `alloy-evm` 0.34.0
+(`src/eth/block.rs`):
 
-- `execute_transaction_without_commit` = a block-gas-availability precheck,
-  then `self.evm.transact(tx_env)` — same call.
-- `commit_transaction` = `system_caller.on_state(...)` (a notification hook,
-  no-op unless a state hook was installed — the block builder installs none
-  here), gas counters, `receipts.push(build_receipt(...))`, then
-  `self.evm.db_mut().commit(state)` — same commit.
+- `execute_transaction_without_commit` does a block-gas-availability precheck,
+  then `self.evm.transact(tx_env)`. Same call.
+- `commit_transaction` calls `system_caller.on_state(...)`, updates gas
+  counters, pushes a receipt, then calls `self.evm.db_mut().commit(state)`.
+  Same commit. `on_state` is a notification hook and a no-op unless a state
+  hook is installed, and the block builder installs none here.
 
-So the claim holds: everything the builder does beyond this is receipts and
-block-gas bookkeeping, neither of which touches state. The doc comment says
+So the claim holds. Everything the builder does beyond this is receipts and
+block-gas bookkeeping, and neither touches state. The doc comment says
 exactly that, including that cumulative block gas is deliberately *not*
-tracked here and the final `build_sync_block` is what enforces it.
+tracked here and that the final `build_sync_block` is what enforces it.
 
 Two honest footnotes:
 
-1. The comment says the uninspected path "passes `NoOpInspector`, the same
-   inspector reth uses when a caller supplies none." True at the API level,
-   but not literally the same construction: reth's `evm_with_env` →
-   `EthEvmFactory::create_evm` → `EthEvmBuilder::new(db, env).build()` leaves
-   `inspect: false`, while `evm_with_env_and_inspector` calls
-   `activate_inspector`, setting `inspect: true` and taking revm's
-   inspector-enabled loop. With `NoOpInspector` the hooks do nothing, so
-   outcomes are identical — and the tests below cross precisely this boundary
-   (builder-executed prefix vs `transact`-executed tail, compared on gas), so
-   it is pinned rather than assumed. No change needed; just don't read the
-   comment as "identical construction."
-2. Skipping the block-gas precheck is deliberate and documented, but it does
-   move *where* an over-budget window fails: not per-tx at append time, but
-   at the final `build_sync_block`, which the composer treats as systemic
-   (re-queue survivors + degrade to minimal). A drain that overshoots
-   `BUILDER_GAS_LIMIT` (30M) would therefore re-drain the same set next slot
-   and fail the same way — the §8-finding-2 shape one layer down. Remote at
-   today's bundle caps (~24 txs × ~300k), but a cumulative-gas counter on
-   `SyncBlockState` that evicts the offending tx would close it. Worth a
-   follow-up line, not a blocker.
+1. The comment says the uninspected path passes `NoOpInspector`, "the same
+   inspector reth uses when a caller supplies none". True at the API level, not
+   literally the same construction. reth's `evm_with_env` leaves
+   `inspect: false`. `evm_with_env_and_inspector` calls `activate_inspector`,
+   which sets `inspect: true` and takes revm's inspector-enabled loop. With
+   `NoOpInspector` the hooks do nothing, so outcomes are identical. The tests
+   below cross precisely this boundary and compare gas, so it is pinned rather
+   than assumed. Just do not read the comment as "identical construction".
+2. Skipping the block-gas precheck is deliberate and documented. It does move
+   *where* an over-budget window fails: not per tx at append time, but at the
+   final `build_sync_block`. The composer treats that as systemic, so it
+   re-queues survivors and degrades to minimal. A drain that overshoots
+   `BUILDER_GAS_LIMIT` (30M) therefore re-drains the same set next slot and
+   fails the same way — the shape of design §7 finding 2, one layer down. It is
+   remote at today's caps of roughly 24 txs at 300k each. A cumulative-gas
+   counter on `SyncBlockState` that evicts the offending tx would close it.
+   Worth a follow-up line, not a blocker.
 
 ### Hunk 7 — `SyncBlockState`
 
-The centerpiece: provider + evm config + parent hash + the block's `evm_env` +
-the live `State` + `applied` (the count of txs applied, i.e. the next tx's
-block position; used for error labelling and to seed forks). Hand-written
-`Debug` because `State` isn't `Debug`.
+The centerpiece. It holds the provider, the evm config, the parent hash, the
+block's `evm_env`, the live `State`, and `applied`. `applied` counts the txs
+applied so far, which is also the next tx's block position; it labels errors
+and seeds forks. `Debug` is hand-written because `State` is not `Debug`.
 
-`open()` is where the §2 guarantee is actually established, and the sequencing
-matters:
+`open()` is where the design's §2 guarantee is actually established, and the
+sequencing matters:
 
 ```rust
 let mut builder = evm_config.builder_for_next_block(&mut state, parent, attributes)?;
@@ -236,75 +237,75 @@ for (idx, raw) in prefix_txs.iter().enumerate() {
 
 Three things to notice.
 
-*The prefix runs through the real `BlockBuilder`*, not through the cheaper
-`transact` path — so pre-execution changes (EIP-2935 block-hash write, beacon
-root) are applied exactly once, by the same code that applies them in the
-committed block.
+*The prefix runs through the real `BlockBuilder`*, not the cheaper `transact`
+path. So the pre-execution changes (EIP-2935 block-hash write, beacon root)
+are applied exactly once, by the same code that applies them in the committed
+block.
 
 *The builder is dropped without `finish()`.* This is the subtle, correct call.
 `finish` applies post-execution changes (withdrawals, balance increments) and
-computes the state root. Mid-block state must not include those: tx k+1 in a
+computes the state root. Mid-block state must not include those. Tx k+1 in a
 real block runs after tx k, **not** after block close. Calling `finish` here
-would produce a state that no position in the real block ever has. Because the
-builder holds `&mut state`, the commits it made stay behind when it drops —
-that is what leaves `state` sitting at the mid-block point.
+would produce a state that no position in the real block ever has. The
+builder holds `&mut state`, so the commits it made stay behind when it drops.
+That is what leaves `state` sitting at the mid-block point.
 
 *The stored `evm_env` is the builder's env.* I checked reth's
-`builder_for_next_block` (fd59fd2, `crates/evm/evm/src/lib.rs:410`): it does
+`builder_for_next_block` (fd59fd2, `crates/evm/evm/src/lib.rs:410`). It does
 `let evm_env = self.next_evm_env(parent, &attributes)?` and builds its EVM
 from that. `open` computes `next_evm_env(parent, &attributes)` from the same
-attributes, so the env `execute_tx` uses later is byte-for-byte the env the
+attributes. So the env `execute_tx` uses later is byte-for-byte the env the
 prefix ran under. Good.
 
-`execute_tx()` appends one tx via `execute_and_commit_inspected` with
-`NoOpInspector` and bumps `applied`. `fork()` opens a fresh `State` over the
+`execute_tx()` appends one tx through `execute_and_commit_inspected` with
+`NoOpInspector`, then bumps `applied`. `fork()` opens a fresh `State` over the
 same parent provider, preloaded with a *clone* of the live cache, carrying the
-same env and `applied` cursor.
+same env and the same `applied` cursor.
 
-Two small notes: `fork(&mut self)` only needs `&self` (it clones
-`self.state.cache`) — harmless, but a `&self` signature would document
-"forking cannot disturb the block" in the type. And `open` always re-executes
-the whole prefix from the parent, so an eviction-and-reopen cycle is O(n²) in
-a drain; that is a conscious trade, and `composer.rs:1647` says why —
-rebuilding from the accepted list, rather than restoring a cache, is what
-keeps the prefix *provably* equal to the block the canonical rebuild
-produces. At a 24-tx cap that is the right side of the trade.
+Two small notes. `fork(&mut self)` only needs `&self`, since it clones
+`self.state.cache`. Harmless, but a `&self` signature would document "forking
+cannot disturb the block" in the type. And `open` always re-executes the whole
+prefix from the parent, so an evict-and-reopen cycle is O(n²) across a drain.
+That is a conscious trade, and the code says why (`composer.rs:1655`).
+Rebuilding from the accepted list, rather than restoring a cache, is what keeps
+the prefix *provably* equal to the block the canonical rebuild produces. At a
+24-tx cap that is the right side of the trade.
 
 ### Hunk 8 — `SyncBlockFork`
 
-A throwaway copy: same fields minus the provider (it can't re-open, by
-construction). `execute_tx` mirrors `SyncBlockState`'s;
+A throwaway copy. Same fields minus the provider, so it cannot re-open, by
+construction. `execute_tx` mirrors `SyncBlockState`'s.
 `execute_tx_inspected(raw, inspector)` is the probe path, where the inspector
 captures the inner `EEZL2 → proxy` frame outcome that becomes the claim.
-`cache_snapshot()` / `restore_cache()` are the restore point the composition
-builder's revert-span rollback needs — the comment correctly justifies why the
-cache alone suffices (forks never merge transitions, so there is no
-`transition_state` to unwind). `state_and_env()` hands out the raw state and
-env for callers that drive their own EVM — used by the source sim at
-`composer.rs:1797`.
+`snapshot()` and `restore()` are the restore point the composition builder's
+revert-span rollback needs. `ForkSnapshot` carries the cache plus `applied`, and
+the comment correctly justifies why the cache is enough: forks never merge
+transitions, so there is no `transition_state` to unwind. `state_and_env()`
+hands out the raw state and env for callers that drive their own EVM, which is
+what the source sim does (`composer.rs:1804`).
 
-The invariant this type carries is simply: nothing executed on a fork touches
-the block. Probes and source sims live here; only accepted effects get
+The invariant this type carries is one sentence: nothing executed on a fork
+touches the block. Probes and source sims live here. Only accepted effects get
 appended to the real `SyncBlockState`.
 
 ### Hunk 9 — `sync_block_pair_roots` untouched
 
-Worth calling out that it is *correctly* left alone. It needs state **roots**,
-which only exist after block close — and `SyncBlockState` deliberately never
-closes a block. So its build-per-prefix loop can't be swapped for the cheaper
-primitive; the two serve different questions ("what is the state mid-block"
-vs. "what is the root at this pair-end").
+Worth calling out that leaving it alone is *correct*. It needs state **roots**,
+and roots only exist after block close. `SyncBlockState` deliberately never
+closes a block, so its build-per-prefix loop cannot be swapped for the cheaper
+primitive. The two answer different questions: "what is the state mid-block"
+versus "what is the root at this pair-end".
 
 ### Hunk 10 — tests
 
-Three tests, plus a fixture. They matter more than usual here, because the
-whole design rests on "the live path executes like the builder does," and that
+Three tests plus a fixture. They matter more than usual, because the whole
+design rests on "the live path executes like the builder does", and that
 equivalence is otherwise invisible.
 
-The mechanism is worth understanding. `MockEthProvider` (the new dev-dep) is a
-flat in-memory account store — I confirmed `state_by_block_hash` ignores the
-hash and returns the same provider — so state *roots* it produces are
-meaningless. The tests therefore use **per-tx gas as the witness**:
+The mechanism is worth understanding. `MockEthProvider` is the new dev-dep, a
+flat in-memory account store. I confirmed its `state_by_block_hash` ignores the
+hash and returns the same provider, so its state *roots* are meaningless. The
+tests use **per-tx gas as the witness** instead:
 
 ```rust
 fn builder_gas(&self) -> Vec<u64> {
@@ -313,119 +314,118 @@ fn builder_gas(&self) -> Vec<u64> {
 }
 ```
 
-i.e. build the block on every prefix and difference the header's `gas_used`,
-yielding exactly what the *builder* charged each tx. Gas is a state-dependent
-signal: the fixture's `STORE` contract does `SSTORE 1 → slot 0`, so a cold
-first write costs ~20k more than the warm repeat. Equal per-tx gas across the
-two paths therefore implies equal intermediate state, not just equal final
-answers. The fixture's 5 txs (transfer, store, reverter, store again,
-transfer) exercise plain transfer, state write, revert-with-data, warm rewrite,
-and a post-revert tx.
+It builds the block on every prefix and differences the header's `gas_used`.
+That yields exactly what the *builder* charged each tx. Gas is a
+state-dependent signal. The fixture's `STORE` contract does `SSTORE 1 → slot
+0`, so a cold first write costs about 20k more than the warm repeat. Equal
+per-tx gas across the two paths therefore implies equal intermediate state, not
+just equal final answers. The fixture's five txs are transfer, store, reverter,
+store again, transfer — plain transfer, state write, revert-with-data, warm
+rewrite, and a post-revert tx.
 
-- `prefix_state_execution_matches_build_sync_block` — appends all five to a
-  live `SyncBlockState` and compares status + gas against the built block, tx by
-  tx. Also asserts the revert carries `0xdeadbeef` and the successful store
+- `prefix_state_execution_matches_build_sync_block` appends all five to a live
+  `SyncBlockState` and compares status and gas against the built block, tx by
+  tx. It also asserts the revert carries `0xdeadbeef` and the successful store
   returns 42. Anti-vacuity: `outcomes[1].gas_used > outcomes[3].gas_used +
-  15_000` — the second store is cheap *only* if the first one's write is
-  visible, so the test fails if `open` ever restarts from the parent. Plus a
-  `builder_gas[0] == 21_000` ground-truth assert so the comparisons can't pass
+  15_000`. The second store is cheap *only* if the first one's write is
+  visible, so the test fails if `open` ever restarts from the parent. A
+  `builder_gas[0] == 21_000` ground-truth assert stops the comparisons passing
   on empty numbers.
-- `prefix_open_matches_the_same_position_in_the_block` — for every k, opens
-  the prefix `[0..k]` (builder-executed) and runs tx k through `execute_tx`
-  (`transact`-executed), checking it reproduces tx k's in-block outcome. This
-  is the one that pins the *seam* between the two execution mechanisms,
-  including the `inspect: true` vs `inspect: false` difference noted above.
-- `fork_is_isolated_and_cache_restore_rewinds` — a tx run on a fork produces
-  the same outcome when subsequently run on the block (so the fork wrote
-  nothing back), and `cache_snapshot` / `restore_cache` is a genuine restore
-  point (same tx, run → restore → re-run, identical outcome). Anti-vacuity is
-  the sharpest of the three: replaying a third time *without* a rewind must
-  `Err`, because the nonce is spent. That is precisely the property the
-  probe's snapshot/restore in `slot.rs` depends on — the replay is legal only
-  because the restore really rewound.
+- `prefix_open_matches_the_same_position_in_the_block` opens the prefix
+  `[0..k]` for every k and runs tx k through `execute_tx`. The prefix is
+  builder-executed and tx k is `transact`-executed, and tx k must reproduce its
+  in-block outcome. This is the test that pins the *seam* between the two
+  execution mechanisms, including the `inspect: true` versus `inspect: false`
+  difference noted above.
+- `fork_is_isolated_and_snapshot_restore_rewinds` checks two things. A tx run
+  on a fork produces the same outcome when it is then run on the block, so the
+  fork wrote nothing back. And `snapshot` / `restore` is a genuine restore
+  point: run, restore, re-run gives an identical outcome. Its anti-vacuity is
+  the sharpest of the three. A third replay *without* a rewind must `Err`,
+  because the nonce is spent. That is precisely the property the probe's
+  snapshot/restore in `slot.rs` depends on. The replay is legal only because
+  the restore really rewound.
 
-Honest limitation: because the mock returns the same state for any block hash,
-these tests verify execution equivalence, not parent-hash routing. That is the
-right scope — hash routing is covered by the e2e tests that run real nodes.
+Honest limitation: the mock returns the same state for any block hash, so these
+tests verify execution equivalence, not parent-hash routing. That is the right
+scope. Hash routing is covered by the e2e tests that run real nodes.
 
 ## `crates/eez-protocol/src/system_tx.rs`
 
-Two factorings. Neither changes what gets built on the happy path; both remove
+Two factorings. Neither changes what gets built on the happy path. Both remove
 a place where two copies of one rule could drift apart.
 
 ### Hunk 1 — module doc
 
-`simulate_and_resolve` → "chained simulation". One word; the old name no
+`simulate_and_resolve` becomes "chained simulation". One word. The old name no
 longer describes the path.
 
 ### Hunk 2 — `build_inbound_system_txs` calls the shared predicate
 
-**Before:** an inline `if !entry.success || entry.l2ToL1Calls.len() != 1 || …`
-block — a *third* hand-rolled copy of the same protocol rule (the closure in
-`build_cross_chain_sync_pairs` was the second).
+Before: an inline `if !entry.success || entry.l2ToL1Calls.len() != 1 || …`
+block, a *third* hand-rolled copy of the same protocol rule. The closure in
+`build_cross_chain_sync_pairs` was the second. After:
+`check_entry_shape(entry, "inbound")?`.
 
-**After:** `check_entry_shape(entry, "inbound")?`.
+Three copies of one predicate is a real drift hazard. Change the rule in one
+copy, and the composer accepts a shape the deriver rejects, or the reverse.
+That divergence only shows up as a signer rejection. Now there is one copy.
 
-Three copies of one predicate is a real drift hazard: change the rule in one,
-and the composer accepts a shape the deriver rejects (or vice versa) — a
-divergence that only shows up as a signer rejection. Now there is one.
-
-The two `continue` guards immediately above it stay, and correctly so: a
-foreign `destinationRollupId` and an empty `l2ToL1Calls` are *filters*
-("not ours" / "nothing to deliver"), not errors. Only what survives the filters
+The two `continue` guards immediately above it stay, and correctly so. A
+foreign `destinationRollupId` and an empty `l2ToL1Calls` are *filters*, not
+errors: "not ours" and "nothing to deliver". Only what survives the filters
 gets shape-checked.
 
 ### Hunk 3a — `check_entry_shape` (the ex-closure, now `pub`)
 
-Same four rejections in the same order (multi-call, nested, unsuccessful,
-static/revert-span/explicit-gas), same messages, plus a doc comment that
-carries over the original "would be SILENTLY TRUNCATED to call[0]" reasoning.
-The added paragraph is the important one: the composer calls it per entry at
-accept time and `build_cross_chain_sync_pairs` calls it over the whole set, so
-both gate on the exact same predicate.
+Same four rejections in the same order: multi-call, nested, unsuccessful, and
+static/revert-span/explicit-gas. Same messages. The doc comment carries over
+the original reasoning that extra calls "would be SILENTLY TRUNCATED to
+call[0]". The added paragraph is the important one. The composer calls this per
+entry at accept time, and `build_cross_chain_sync_pairs` calls it over the
+whole set. Both gate on the exact same predicate.
 
 ### Hunk 3b — `build_outbound_pair` (new)
 
-The ex-PHASE-1 loop body, lifted verbatim into a per-entry function:
-shape-check → take `l2ToL1Calls.first()` → `build_l2_outbound_entry` →
-`build_outbound_load_table_txs(slice::from_ref(&entry), cfg, starting_nonce)`
-→ wrap each load into a `SyncPair` with the user tx. (One load per entry
-today — `build_outbound_load_table_txs` emits one `loadExecutionTable` per
-entry — so this returns a single pair per call, but the `Vec` shape is
-preserved so the nonce arithmetic stays honest if that ever changes.)
+The ex-PHASE-1 loop body, lifted verbatim into a per-entry function. It
+shape-checks, takes `l2ToL1Calls.first()`, calls `build_l2_outbound_entry`,
+calls `build_outbound_load_table_txs(slice::from_ref(&entry), cfg,
+starting_nonce)`, then wraps each load into a `SyncPair` with the user tx.
+`build_outbound_load_table_txs` emits one `loadExecutionTable` per entry today,
+so this returns a single pair per call. The `Vec` shape is preserved so the
+nonce arithmetic stays honest if that ever changes.
 
 Why it exists: the drain appends pairs incrementally as each survivor is
-accepted (`composer.rs:1884`), and the post-drain canonical rebuild calls the
+accepted (`composer.rs:1892`), and the post-drain canonical rebuild calls the
 same function over the same entries in the same order. So the composer's
-incrementally-built block and the deriver/signer's canonical rebuild are
-byte-identical **by construction** — which is what gives the drain's keystone
-assert ("appended list == canonical rebuild") its teeth. If the drain had kept
-its own copy of this lowering, that assert would compare two copies of the same
-bug and pass.
+incrementally built block and the deriver/signer's canonical rebuild are
+byte-identical **by construction**. That is what gives the drain's keystone
+assert its teeth. If the drain had kept its own copy of this lowering, the
+assert would compare two copies of the same bug and pass.
 
 ### Hunk 4 — the pre-gate in `build_cross_chain_sync_pairs`
 
-**Before:** two pre-gate loops — all outbound entries checked, then all inbound
-— before anything was emitted.
+Before: two pre-gate loops, all outbound entries checked then all inbound,
+before anything was emitted. After: only the inbound loop remains, and outbound
+is gated inside PHASE 1 by `build_outbound_pair`, which checks its entry before
+building anything.
 
-**After:** only the inbound loop remains; outbound is gated inside PHASE 1 by
-`build_outbound_pair`, which checks its entry before building anything.
-
-The inbound half must stay, and the comment gives the real reason:
+The inbound half must stay, and the comment gives the real reason.
 `build_inbound_system_txs` `continue`s past foreign-destination entries
-*before* checking them, so without this loop an ill-shaped entry addressed to
+*before* checking them. Without this loop, an ill-shaped entry addressed to
 another rollup would never be shape-checked at all. The pre-gate is
 deliberately stricter than the emit path.
 
-The one accepted behavior change: with **both** a bad outbound and a bad
-inbound entry, the reported error flips from the outbound one to the inbound
-one, since the inbound loop now runs first. Error text only — the call fails
-either way, and nothing escapes (`pairs` is a local vec discarded on `Err`).
+One accepted behavior change. With **both** a bad outbound and a bad inbound
+entry, the reported error flips from the outbound one to the inbound one, since
+the inbound loop now runs first. Error text only. The call fails either way,
+and nothing escapes, because `pairs` is a local vec discarded on `Err`.
 
-Small note on the comment "a bad shape must fail the call, not half-build it":
-for outbound that was never a risk, since the function returns all-or-nothing.
-The sentence is true of the inbound gate's *purpose* (check before emitting),
-but the operative justification is the foreign-entry one in the next line.
+Small note on the comment "a bad shape must fail the call, not half-build it".
+For outbound that was never a risk, since the function returns all-or-nothing.
+The sentence is true of the inbound gate's *purpose*, which is check before
+emit. But the operative justification is the foreign-entry one on the next
+line.
 
 ### Hunk 5 — PHASE 1 body replaced by the call
 
@@ -435,7 +435,7 @@ nonce = nonce.checked_add(built.len() as u64)…;
 pairs.extend(built);
 ```
 
-`built.len() == loads.len()` (one pair per load), so the nonce advance is
+`built.len() == loads.len()`, one pair per load. So the nonce advance is
 identical to before, overflow check included. Pure move.
 
 ## `crates/eez-protocol/src/abi.rs`
@@ -446,159 +446,164 @@ identical to before, overflow check included. Pure move.
 `computeCrossChainProxyAddress(address,uint64)`, and
 `executeOnBehalf(address,uint64,bytes)`.
 
-Pure addition. The new L1 executor (`local/slot.rs`) replays the real
-`_processNCalls` path rather than shortcutting it — look up the proxy, deploy
-it permissionlessly if absent, then call through `executeOnBehalf` — so it
-needs these four signatures. `abi.rs` is the workspace's single ABI source, so
-they belong here rather than as file-local `sol!` macros next to each call
-site.
+Pure addition. The new L1 executor replays the real `_processNCalls` path
+rather than shortcutting it (`local/slot.rs`). It looks up the proxy, deploys
+it permissionlessly if absent, then calls through `executeOnBehalf`. That needs
+these four signatures. `abi.rs` is the workspace's single ABI source, so they
+belong here rather than in file-local `sol!` macros next to each call site.
 
-I checked all four against the pinned submodule (`eez-core-protocol` @
-`6fcc90b6`, matching the module's "ABI pins from commit 6fcc90b"):
-`CrossChainProxy.sol:50` matches `executeOnBehalf` including `payable`;
-`EEZBase.sol:156/176` match the two proxy functions; and the
-`authorizedProxies` getter's flattened return `(bool, address, uint64)`
-matches `struct ProxyInfo` in `IEEZ.sol:157`. The doc comment noting that
-Solidity flattens the struct into its three members is a helpful line to keep.
+I checked all four against the pinned submodule, `eez-core-protocol` at
+`6fcc90b6`, which matches the module's "ABI pins from commit 6fcc90b".
+`executeOnBehalf` matches including `payable` (`CrossChainProxy.sol:50`). The
+two proxy functions match (`EEZBase.sol:156` and `EEZBase.sol:176`). The
+`authorizedProxies` getter's flattened return `(bool, address, uint64)` matches
+`struct ProxyInfo` (`IEEZ.sol:157`). The doc comment noting that Solidity
+flattens the struct into its three members is a helpful line to keep.
 
 ### Hunk 2 — `manager_and_proxy_selectors_match_upstream`
 
-Four selector asserts with an explicit drift message each. I recomputed them
+Four selector asserts, each with an explicit drift message. I recomputed them
 with `cast sig` and all four match the pinned bytes: `0x8205f3e1`,
 `0xa7587c62`, `0xeb20c0aa`, `0x360d95b6`.
 
-This is the workspace's established guard, and the right one to reach for
-here: bytecode-coupled constants have bitten this project before (the
-`authorizedProxies` slot-constant episode), and a silently drifted selector on
-the manager path would surface as an unexplained `EmptyCalls`-shaped failure
-rather than a compile error.
+This is the workspace's established guard, and the right one to reach for here.
+Bytecode-coupled constants have bitten this project before, in the
+`authorizedProxies` slot-constant episode. A silently drifted selector on the
+manager path would surface as an unexplained `EmptyCalls`-shaped failure rather
+than a compile error.
 
 ## `crates/eez-composer/Cargo.toml` + `Cargo.lock`
 
 One new dev-dependency: `reth-provider` with the `test-utils` feature, for
-`MockEthProvider` in the prefix-state tests, plus the one-line lock entry. The
-cost is real and was flagged consciously: `reth-provider` is already a
+`MockEthProvider` in the prefix-state tests, plus the one-line lock entry.
+
+The cost is real and was flagged consciously. `reth-provider` is already a
 workspace dependency, so under resolver 2 the extra feature unifies across the
-graph for any invocation that builds tests — `cargo test` and
-`clippy --all-targets` pull a second feature set over the reth crates and pay
-the compile time. Production builds (`cargo build -p eez-node`) are untouched,
-since dev-dependency features never apply there. The alternative was no unit
-coverage at all for the one equivalence the whole design rests on — every
-other test in this workspace spawns real nodes — so this is the right call;
-worth revisiting only if CI wall time becomes the constraint.
+graph for any invocation that builds tests. `cargo test` and
+`clippy --all-targets` therefore pull a second feature set over the reth crates
+and pay the compile time. Production builds are untouched, since dev-dependency
+features never apply to `cargo build -p eez-node`. The alternative was no unit
+coverage at all for the one equivalence the whole design rests on, since every
+other test here spawns real nodes. Right call; revisit only if CI wall time
+becomes the constraint.
 
 ## Behavior-change inventory
 
 | Change | Before | After |
 |---|---|---|
-| `BuiltSyncBlock.tx_successes` | built block carried no receipt statuses; a reverted tx in the final block was invisible to the caller | per-tx receipt status surfaced; composer gates dispatch on all-success and degrades to a minimal postBatch otherwise |
-| `next_block_attributes` / `recover_tx` / `open_draft_db` extraction | attributes + decode/recover inline in `build_sync_block` | shared helpers; `build_sync_block` and `SyncBlockState::open` cannot disagree on the block env |
-| `SyncBlockState` / `SyncBlockFork` / `TxOutcome` | none — no live mid-block state existed; composition simulated over `provider.latest()` | new public API: live prefix state over the block under construction, forks for probes/source sims, per-tx outcome including revert data |
-| `build_sync_block` core path | builder → pre-exec → per-tx → `finish` | unchanged (same order, same env, same `finish`); only the receipt mapping is new |
-| `sync_block_pair_roots` | rebuilds the block per pair-end for roots | none (untouched — roots require block close, which `SyncBlockState` deliberately never does) |
-| `build_inbound_system_txs` shape rejection | third inline copy of the predicate | calls shared `check_entry_shape`; identical rule, identical messages; foreign/empty `continue` filters unchanged |
+| `BuiltSyncBlock.tx_successes` | the built block carried no receipt statuses; a reverted tx in it was invisible | per-tx receipt status surfaced; the composer gates dispatch on all-success and degrades to a minimal postBatch otherwise |
+| `next_block_attributes` / `recover_tx` / `open_draft_db` extraction | attributes plus decode/recover inline in `build_sync_block` | shared helpers; `build_sync_block` and `SyncBlockState::open` cannot disagree on the block env |
+| `SyncBlockState` / `SyncBlockFork` / `TxOutcome` | none; no live mid-block state existed, and composition simulated over `provider.latest()` | new public API: live prefix state over the block under construction, forks for probes and source sims, per-tx outcome including revert data |
+| `build_sync_block` core path | builder → pre-exec → per-tx → `finish` | unchanged: same order, same env, same `finish`; only the receipt mapping is new |
+| `sync_block_pair_roots` | rebuilds the block per pair-end for roots | untouched; roots need block close, which `SyncBlockState` deliberately never does |
+| `build_inbound_system_txs` shape rejection | third inline copy of the predicate | calls the shared `check_entry_shape`; same rule, same messages; the foreign/empty `continue` filters are unchanged |
 | `check_entry_shape` | private closure inside `build_cross_chain_sync_pairs` | public fn, same four rejections in the same order (pure lift) |
-| `build_outbound_pair` | inline PHASE-1 loop body | public per-entry fn; the drain and the canonical rebuild now share one lowering, making the "appended == rebuilt" assert meaningful |
-| Pre-gate ordering in `build_cross_chain_sync_pairs` | outbound entries gated first, then inbound, before any emission | inbound-only pre-gate (foreign entries would otherwise never be checked); outbound gated per entry inside PHASE 1. With one bad entry of each kind, the reported error flips outbound → inbound. Error text only |
-| Nonce arithmetic in PHASE 1 | `nonce += loads.len()`, checked | `nonce += built.len()`, checked — same count (one load per entry) |
-| Four `sol!` declarations + selector test in `abi.rs` | none (pure addition) | manager/proxy ABI lives in the single ABI source; all four selectors pinned and verified against `eez-core-protocol@6fcc90b` |
-| `reth-provider` `test-utils` dev-dependency | none (pure addition) | test/clippy builds compile a second reth feature set; production builds unaffected |
+| `build_outbound_pair` | inline PHASE-1 loop body | public per-entry fn; the drain and the canonical rebuild share one lowering, which is what makes the "appended == rebuilt" assert meaningful |
+| Pre-gate ordering in `build_cross_chain_sync_pairs` | outbound entries gated first, then inbound, before any emission | inbound-only pre-gate, because foreign entries would otherwise never be checked; outbound gated per entry inside PHASE 1. With one bad entry of each kind the reported error flips outbound → inbound. Error text only |
+| Nonce arithmetic in PHASE 1 | `nonce += loads.len()`, checked | `nonce += built.len()`, checked; same count, one load per entry |
+| Four `sol!` declarations plus selector test in `abi.rs` | none (pure addition) | manager/proxy ABI lives in the single ABI source; all four selectors pinned and verified against `eez-core-protocol@6fcc90b` |
+| `reth-provider` `test-utils` dev-dependency | none (pure addition) | test and clippy builds compile a second reth feature set; production builds unaffected |
 
 ### Follow-ups worth a line somewhere (neither blocking)
 
-1. **Block-gas overflow is a whole-window failure.** The live path
-   deliberately skips the builder's block-gas precheck, so a drain that
-   overshoots `BUILDER_GAS_LIMIT` fails at the final `build_sync_block` and
-   degrades + re-queues the same set, which will fail identically next slot. A
-   cumulative-gas counter on `SyncBlockState` that evicts the offending tx would
-   turn it into a per-tx eviction — the same shape as design §8 finding 2, one
-   layer down.
-2. **`SyncBlockState::fork` could take `&self`** — it only clones the cache, and
+1. **Block-gas overflow fails the whole window.** The live path deliberately
+   skips the builder's block-gas precheck. So a drain that overshoots
+   `BUILDER_GAS_LIMIT` fails at the final `build_sync_block`, degrades, and
+   re-queues the same set, which will fail identically next slot. A
+   cumulative-gas counter on `SyncBlockState` that evicts the offending tx
+   would turn it into a per-tx eviction. That is the shape of design §7
+   finding 2, one layer down.
+2. **`SyncBlockState::fork` could take `&self`.** It only clones the cache, and
    the immutable signature would state "forking cannot disturb the block" in
    the type rather than in a comment.
-
 
 ---
 
 # Part 2 — The slot execution contexts
 
+Reading order for this part:
 
-Scope of this section, in reading order:
+1. `crates/eez-composer/src/local/slot.rs` — new file, 773 lines. Reviewed whole, block by block.
+2. `crates/eez-composer/src/local/client.rs` — diff vs the pre-change file, hunk by hunk.
+3. `crates/eez-composer/src/local/mod.rs` and `crates/eez-composer/src/lib.rs` — visibility and export diff.
 
-1. `crates/eez-composer/src/local/slot.rs` — new file, 747 lines, staged. Reviewed whole, block by block.
-2. `crates/eez-composer/src/local/client.rs` — diff vs `HEAD`, hunk by hunk.
-3. `crates/eez-composer/src/local/mod.rs` + `crates/eez-composer/src/lib.rs` — visibility/export diff.
+One sentence frames everything below: **no approximations on the claim path.**
 
-The one sentence that frames everything below: **no approximations on the claim path.** The
-old target session (`local/session.rs`, still in the tree, no longer used by the drain) computed
-a claim by calling the target contract *directly*, with a computed proxy address forged into
-`msg.sender`, every EVM check disabled, and a nonce-restore hack to undo the damage. The two
-executors in `slot.rs` instead run the code the chain will actually run — `EEZ._processNCalls`'
-frames on L1, the canonical `executeIncomingCrossChainCall` delivery tx on L2 — so the numbers
-that end up in an entry's rolling hash are read off real executions rather than modelled.
+The old target session computed a claim by calling the target contract directly. It forged a
+computed proxy address into `msg.sender`, disabled every EVM check, and then undid the nonce
+damage with a hack. That file is still in the tree, and the drain no longer uses its session type
+(`local/session.rs`). The two executors in `slot.rs` run the code the chain will actually run:
+`EEZ._processNCalls`' frames on L1, and the canonical delivery system tx on L2. So the numbers
+that land in an entry's rolling hash are read off real executions, not modelled.
 
 ---
 
 ## 1. `crates/eez-composer/src/local/slot.rs`
 
-### 1.1 Module doc (`slot.rs:1-12`)
+### 1.1 Module doc (`slot.rs:1-13`)
 
-Three lines that pay for themselves: both types implement the same `TargetExecutionSession`
-trait, "but neither approximates the protocol: each runs the real contract path the chain will
-run", and each names the contract lines it mirrors (`EEZ.sol:1149-1178`, `EEZL2.sol:547-552`).
-Those citations are load-bearing for a reader who wants to verify the port, and I checked them —
-they land on the `sourceProxy.call{value:…}(abi.encodeCall(CrossChainProxy.executeOnBehalf, …))`
-sites plus the `_rollingHashCallEnd(success, retData)` fold on both chains. Good.
+Thirteen lines that pay for themselves. Both types implement `TargetExecutionSession`, and the
+doc says neither approximates the protocol. Each one names the contract lines it mirrors
+(`EEZ.sol:1149-1178`, `EEZL2.sol:547-552`). Those citations are load-bearing for anyone
+verifying the port, so I checked them. They land on the
+`sourceProxy.call{value:…}(abi.encodeCall(CrossChainProxy.executeOnBehalf, …))` sites, plus the
+`_rollingHashCallEnd(success, retData)` fold on both chains.
 
-### 1.2 Imports (`slot.rs:14-42`)
+### 1.2 Imports (`slot.rs:15-46`)
 
-Mechanical. Worth noting only that the ABI surface (`authorizedProxiesCall`,
-`computeCrossChainProxyAddressCall`, `createCrossChainProxyCall`, `executeOnBehalfCall`) comes
-from `eez_protocol::abi` — the single ABI source, with selector-pin tests added in the same
-change-set — not from ad-hoc `sol!` blocks here. And `DIRECT_CALL_GAS_LIMIT`, `evm_err`,
-`provider_err` are reused from `session.rs`, so the old file stays as the home of those shared
-bits even though its session type is now dormant on this path.
+Mechanical. Two things worth noting:
 
-### 1.3 `LocalComposeClients` (`slot.rs:44-54`)
+- The ABI surface comes from `eez_protocol::abi`, the single ABI source with selector-pin tests,
+  not from ad-hoc `sol!` blocks here (`slot.rs:32-35`).
+- `DIRECT_CALL_GAS_LIMIT`, `evm_err`, and `provider_err` are reused from `session.rs`
+  (`slot.rs:46`). The old file stays the home of those shared bits, even though its session type
+  is dormant on this path.
 
-Two `Arc<LocalChainClient>`s, L1 entry and L2 entry, carried on `CrossChainWiring`
-(`composer.rs:143`) next to the existing type-erased `ChainClient` map, and populated in
-`eez-node/src/main.rs:697`.
+### 1.3 `LocalComposeClients` (`slot.rs:48-68`)
 
-**Why it exists.** The drain needs surfaces the `ChainClient` trait deliberately does not have:
-`L1SlotState::open`, `simulate_source_tx_on`, `chain_provider()`. The doc comment says exactly this —
-"both point at the same instances — the erased trait hides the simulation surfaces the drain
-drives". That is the honest framing: this is not a second registry, it is a concrete-typed view
-onto the same two clients.
+Two `Arc<LocalChainClient>` handles, L1 entry and L2 entry. They ride on `CrossChainWiring`
+next to the existing type-erased `ChainClient` map (`composer.rs:125-144`), and are populated
+when the node wires the composer (`eez-node/src/main.rs:697`).
 
-**Why not the obvious alternative** (widen `ChainClient` with `fn open_world(&self)`): every
-`ChainClient` impl would then have to answer a question only the local reth-backed one can —
-the trait exists so that a future non-local client can be registered, and it would have to
-stub-or-lie. This is the "stub that lies" anti-pattern, avoided by keeping the concrete handle
-beside the erased one.
+**Why it exists.** The drain needs surfaces the `ChainClient` trait deliberately lacks:
+`L1SlotState::open`, `simulate_source_tx_on`, and `chain_provider()`. The doc comment says so
+outright. Both handles point at the same instances the erased map holds. This is not a second
+registry. It is a concrete-typed view onto the same two clients.
 
-### 1.4 Constants and `encoding_err` (`slot.rs:56-66`)
+**Why not the obvious alternative.** Widening `ChainClient` with an `open_world` method would
+force every impl to answer a question only the local reth-backed client can answer. A future
+non-local client would have to stub or lie. That is the "stub that lies" anti-pattern, avoided
+by keeping the concrete handle beside the erased one.
 
-`VIEW_CALL_GAS_LIMIT = 1_000_000` for the two view frames; `ZERO_CALL_GAS = 0` as
-`executeOnBehalf`'s `callGas` argument, with the reason inline — zero means "forward all
-remaining gas" (`CrossChainProxy.sol:60`) and is the only shape the protocol emits since
-`USE_GAS_LEFT` is off everywhere.
+The doc also records a known seam. L2's two instances have separate overlay channels, so a nested
+call back into L2 re-enters through the follower client and opens unseeded (`slot.rs:56-61`).
 
-`encoding_err` looks like a formatting helper but it is a **policy** helper, and that deserves a
-sentence in review. The drain classifies failures by `ExecutorErrorKind`
-(`composer.rs:409-426`): `Unavailable`/`Provider`/`Missing` are TRANSIENT (re-queue the tx,
-abort the slot), everything else is POISON (evict this tx, keep composing). So the kind chosen
-at each failure site *is* the eviction decision:
+### 1.4 Constants and the error-kind helpers (`slot.rs:70-101`)
 
-- `L1SlotState::open` uses `provider_err` / `Missing` → a provider hiccup at anchor time re-queues,
-  it does not evict user transactions. Correct.
-- every failure caused by the transaction itself — manager frame reverted, target reverted,
-  probe never reached the proxy frame, delivery reverted — goes through `encoding_err` → poison.
-  Correct policy, slightly misleading name; `Encoding` reads like "ABI problem" when it now
-  also means "this tx is structurally undeliverable". Not worth churn now, but if a new kind is
-  ever added, `ExecutorErrorKind::Rejected` would document itself.
+`VIEW_CALL_GAS_LIMIT = 1_000_000` caps the two view frames. `ZERO_CALL_GAS = 0` is
+`executeOnBehalf`'s `callGas` argument, and the reason sits inline: zero means "forward all
+remaining gas", and it is the only shape the protocol emits (`CrossChainProxy.sol:60`).
 
-### 1.5 `L1SlotState` (`slot.rs:68-157`)
+The three error constructors look like formatting helpers. They are **policy** helpers. The
+drain sorts failures by `ExecutorErrorKind` (`composer.rs:408-427`). `Unavailable`, `Provider`,
+and `Missing` are TRANSIENT: re-queue the tx and abort the slot. Everything else is POISON:
+evict this tx and keep composing. So the kind chosen at a failure site *is* the eviction
+decision.
+
+- `L1SlotState::open` uses `provider_err` and `Missing`, so a provider hiccup at anchor time
+  re-queues instead of evicting user transactions (`slot.rs:127-134`). Correct.
+- `transact_err` and `fork_err` split one revm failure two ways: a database read failure is the
+  store being unreachable and stays transient, everything else is a property of the tx and turns
+  poison (`slot.rs:82-101`). Correct, and the reason is in the doc comment.
+- Every failure caused by the transaction itself goes through `encoding_err`, so it turns poison
+  (`slot.rs:78-80`). That covers a reverted manager frame, a reverted target, a probe that never
+  reached the proxy frame, and a reverted delivery.
+
+The policy is right, the name slightly misleading. `Encoding` reads like "ABI problem", but it
+now also means "this tx is structurally undeliverable". Not worth churn today, though a new
+`ExecutorErrorKind::Rejected` would document itself.
+
+### 1.5 `L1SlotState` (`slot.rs:105-192`)
 
 ```rust
 pub struct L1SlotState {
@@ -607,49 +612,46 @@ pub struct L1SlotState {
 }
 ```
 
-**One per drain**, created at `composer.rs:1661`. The anchor is the L1 head at drain start and
-never moves. That pin is the point: the bundle lands at least one L1 block later no matter what,
-so a "fresher" base buys nothing real, and a *moving* base would make a transaction's claims
-depend on when it happened to arrive relative to L1 block production — the same set of held txs
-would compose differently on two runs. Pinning makes the drain a pure function of (held set,
-anchor). Design §5 owns the residual approximation ("L1 base drift") and lists the on-chain
-containment: `StateUpdate.currentState` gates at consumption, immediates skip rather than abort,
-deferred consumption is prefix-partial, and the optimistic observer reorgs L2 on any
-less-than-claimed settlement.
+One per drain, created at the top of the drain (`composer.rs:1668`). The anchor is the L1 head at
+drain start, and it never moves.
 
-`cache` is the commit-or-drop ledger. It holds **only** effects of transactions that survived —
-the drain writes it at accept points and nowhere else. That is why eviction needs no unwind
-machinery: a poisoned tx's fork is simply dropped (design §4.7, "rollback is structural, not
-mechanical").
+**Why pin it.** The bundle lands at least one L1 block later no matter what, so a fresher base
+buys nothing real. A moving base would be worse than useless. A transaction's claims would then
+depend on when it happened to arrive relative to L1 block production, and the same held set would
+compose differently on two runs. Pinning makes the drain a pure function of the held set and the
+anchor. Design §5 owns the residual approximation and lists the on-chain containment.
 
-- `open` (`slot.rs:92-110`) — best block number → header → `seal_slow`, empty cache, one debug
-  line naming the pinned block/hash. Errors are `Provider`/`Missing`, i.e. transient. Fine.
-- `open_state` (`slot.rs:114-137`) — the single door every fork goes through: state at the
-  anchor **hash** (not "latest", so it cannot drift mid-drain), the anchor's EVM env, and
-  `with_cached_prestate(seed)` to preload accumulated effects. `with_bundle_update()` is on but
-  nothing reads the bundle; see the checkpoint note in §1.7.
-- `fork_state` (`slot.rs:148-156`) — the inbound source-sim fork: anchor state + world cache +
-  the **plain** anchor env. The comment explains the split precisely: `simulate_source_tx_on`
-  applies its own source-sim cfg tweak (nonce check off), and the manager-frame tweaks
-  (base fee / EIP-3607 / gas cap) deliberately stay out of a path that executes a *real signed
-  user transaction*. Keeping those two envs distinct is the sort of thing that is easy to
-  collapse "for tidiness" and would quietly weaken the inbound sim.
+`cache` is the commit-or-drop ledger. It holds only the effects of transactions that survived,
+because the drain writes it at accept points and nowhere else. That is why eviction needs no
+unwind machinery. A poisoned tx's fork is simply dropped.
 
-**Observation (not a bug).** `open_state` builds the env with `evm_env(self.anchor.header())` —
-the env *of* the anchor block, not `next_evm_env` for anchor+1. So a target reading
-`block.number` / `block.timestamp` inside a manager frame sees the anchor's values while the
-real execution will see anchor+1 or later, and `frame_gas` clamps to the anchor's gas limit
-rather than the landing block's. This is the same bounded L1 base drift §5 already accepts, and
-using `next_evm_env` would be a *different* guess, not a truer one. Worth one comment line at
-`open_state` so the next reader doesn't have to derive it.
+- `open` (`slot.rs:127-145`) — best block number, then header, then `seal_slow`, then an empty
+  cache and one debug line naming the pinned block and hash. Errors are transient. Fine.
+- `open_state` (`slot.rs:149-172`) — the single door every fork goes through. It opens state at
+  the anchor **hash** rather than at "latest", so it cannot drift mid-drain. It uses the anchor's
+  EVM env and preloads accumulated effects with `with_cached_prestate(seed)`.
+  `with_bundle_update()` is on, but nothing reads the bundle. See the checkpoint note in §1.9.
+- `fork_state` (`slot.rs:183-191`) — the inbound source-sim fork: anchor state, plus the world
+  cache, plus the **plain** anchor env. The comment explains the split precisely.
+  `simulate_source_tx_on` applies its own source-sim tweak, which turns the nonce check off. The
+  manager-frame tweaks deliberately stay out of a path that executes a real signed user
+  transaction. Collapsing those two envs "for tidiness" would quietly weaken the inbound sim.
 
-### 1.6 `L1TargetSession` — struct, `Debug`, `new` (`slot.rs:161-220`)
+**Observation, not a bug.** `open_state` builds the env from the anchor block itself, not from
+`next_evm_env` for anchor+1 (`slot.rs:162-165`). So a target reading `block.number` or
+`block.timestamp` inside a manager frame sees the anchor's values, while real execution will see
+anchor+1 or later. `frame_gas` likewise clamps to the anchor's gas limit rather than the landing
+block's. This is the same bounded L1 base drift design §5 already accepts, and `next_evm_env`
+would be a *different* guess rather than a truer one. Worth one comment line at `open_state` so
+the next reader need not derive it.
 
-This is the outbound target session: for an L2→L1 call it replays exactly what
+### 1.6 `L1TargetSession` — struct, `Debug`, `new` (`slot.rs:196-255`)
+
+This is the outbound target session. For an L2→L1 call it replays exactly what
 `EEZ._processNCalls` will do inside the future `postAndVerifyBatch`.
 
-`new` opens a fork of the world (`world.cache.clone()` seeded) and then makes exactly four env
-edits:
+`new` forks the world by seeding `world.cache.clone()`, then makes exactly four env edits
+(`slot.rs:240-243`):
 
 ```rust
 evm_env.cfg_env.disable_base_fee = true;
@@ -658,23 +660,22 @@ evm_env.cfg_env.disable_nonce_check = true;
 evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
 ```
 
-**Before → After that matters here.** The old path called `session::disable_checks`
-(`session.rs:398-402`), which additionally set `disable_balance_check = true` and
-`disable_block_gas_limit = true`. Both are gone, on purpose, and the comment says why for the
-first: the frames are synthetic (no fee market, no EOA sender) so base-fee/3607/nonce checks are
-noise, **but the balance check stays on so escrow is real**.
+Take an L2→L1 withdrawal of 1 ETH. Before: `msg.sender` was a forged proxy address with balance
+checks off, so the value was conjured and the sim always succeeded. After: the value is drawn
+from the manager's actual balance at the anchor, exactly as `sourceProxy.call{value: …}` will
+draw it on-chain. A short escrow now fails here at compose time, costing one eviction, instead
+of failing at the builder's bundle simulation or after settlement.
 
-Concretely: an L2→L1 withdrawal of 1 ETH. Old world — `msg.sender` was a forged proxy address
-with balance checks off, so the value was conjured and the sim always "succeeded". New world —
-the value is drawn from the manager's actual balance at the anchor, exactly as
-`sourceProxy.call{value: …}` will draw it on-chain; if the escrow is short, the sim fails here,
-at compose time, costing one eviction, instead of at the builder's bundle simulation or after
-settlement.
+The mechanism behind that is what the four edits leave out. The old path called
+`session::disable_checks`, which also set `disable_balance_check` and `disable_block_gas_limit`
+(`session.rs:368-375`). Both are gone on purpose. The comment says why for the first: the frames
+are synthetic, with no fee market and no EOA sender, so base-fee, EIP-3607, and nonce checks are
+noise. The balance check stays on so escrow is real.
 
-`Debug` is hand-written to print `manager`/`chain_id` only — the revm `State` isn't `Debug` and
-would be unreadable anyway. Mechanical.
+`Debug` is hand-written and prints `manager` and `chain_id` only, because the revm `State` is not
+`Debug` and would be unreadable anyway (`slot.rs:215-222`).
 
-### 1.7 `frame_gas` (`slot.rs:225-227`)
+### 1.7 `frame_gas` (`slot.rs:257-262`)
 
 ```rust
 fn frame_gas(&self, requested: u64) -> u64 {
@@ -682,27 +683,27 @@ fn frame_gas(&self, requested: u64) -> u64 {
 }
 ```
 
-Three lines with a live-chain story behind them (design §8, finding 1). This clamp was added
-last, after chiado testing. chiado's L1 block gas limit is ~17M; `DIRECT_CALL_GAS_LIMIT` is 30M;
-revm refuses any transaction whose gas limit exceeds the block's, so **every** manager frame
-failed with "caller gas limit exceeds the block gas limit" — and since that failure is poison,
-every outbound composition evicted. Dev chains mask it completely (block limit ≥ 30M), which is
-why it only surfaced on a real chain.
+Three lines with a live-chain story behind them, recorded as design §7 finding 1. This clamp was
+added last, after chiado testing. chiado's L1 block gas limit is about 17M and
+`DIRECT_CALL_GAS_LIMIT` is 30M. revm refuses any transaction whose gas limit exceeds the block's,
+so **every** manager frame failed with "caller gas limit exceeds the block gas limit". That
+failure is poison, so every outbound composition evicted. Dev chains mask it completely, because
+their block limit is at or above 30M. That is why only a real chain surfaced it.
 
-**Why not the obvious alternative** — `disable_block_gas_limit = true`, which is what the old
-session did? Because clamping is *truer to the chain*: on-chain a call genuinely cannot be given
-more gas than the block allows, so a 25M-gas target that "passes" under a disabled limit would
-be a claim the L1 execution can never honor. Clamping fails the same transactions L1 would fail.
-The one-line doc comment on the fn says this in the same number of words.
+**Why not the obvious alternative.** Setting `disable_block_gas_limit = true` is what the old
+session did. Clamping is truer to the chain. On-chain a call genuinely cannot be given more gas
+than the block allows, so a 25M-gas target that "passes" under a disabled limit would be a claim
+L1 can never honor. Clamping fails the same transactions L1 would fail. The one-line doc comment
+on the function says this in the same number of words.
 
-### 1.8 `manager_frame`, `view_call`, `proxy_address`, `is_authorized_proxy`, `create_proxy` (`slot.rs:231-313`)
+### 1.8 `manager_frame`, `view_call`, `proxy_address`, `is_authorized_proxy`, `create_proxy` (`slot.rs:264-348`)
 
-`manager_frame` is the shared primitive: a synthetic tx from `Address::ZERO` to the manager with
-supplied calldata and clamped gas, run on the fork; a revert becomes a poison error carrying the
-raw output; on the `commit` path the caller's nonce bump is undone (see §1.10) before
-`self.state.commit(changes)`.
+`manager_frame` is the shared primitive (`slot.rs:266-300`). It runs a synthetic tx from
+`Address::ZERO` to the manager, with supplied calldata and clamped gas, on the fork. A revert
+becomes a poison error carrying the raw output. On the `commit` path the caller's nonce bump is
+undone before `self.state.commit(changes)`. See §1.11.
 
-The three callers mirror `EEZ.sol:1149-1152` one-for-one and the doc comments cite those lines:
+The three callers mirror the contract one-for-one, and their doc comments cite the lines:
 
 | Rust | Solidity |
 |---|---|
@@ -710,64 +711,64 @@ The three callers mirror `EEZ.sol:1149-1152` one-for-one and the doc comments ci
 | `is_authorized_proxy` | `if (!authorizedProxies[sourceProxy].isProxy)` |
 | `create_proxy` | `_createCrossChainProxyInternal(...)` via the permissionless `createCrossChainProxy` |
 
-Two details worth calling out because they are the difference between "mirrors the contract" and
-"looks like it mirrors the contract":
+Two details separate "mirrors the contract" from "looks like it mirrors the contract".
 
-- The proxy address is obtained by **asking the manager**, not by recomputing CREATE2 in Rust.
-  Memory `project_eez_iter9_10_partial` is exactly the scar tissue here (ported slot constants
-  that disagreed with our contracts). A view frame cannot drift from the deployed bytecode.
-- `create_proxy` runs the **real** `createCrossChainProxy`, so the CREATE2 deployment happens
-  from the manager's own frame with the manager's salt and the manager's `CrossChainProxy`
-  creation code (`EEZBase.sol:160-171`), and the `authorizedProxies[proxy] = ProxyInfo(...)`
-  registration lands in the fork. Deploying a proxy "by hand" into the cache would be a
-  bytecode-coupled guess of exactly the kind that broke before.
+- The proxy address is obtained by **asking the manager**, not by recomputing CREATE2 in Rust
+  (`slot.rs:308-322`). Ported slot constants that disagreed with our contracts are the scar
+  tissue here. A view frame cannot drift from the deployed bytecode.
+- `create_proxy` runs the **real** `createCrossChainProxy` (`slot.rs:334-348`). The CREATE2
+  deployment happens from the manager's own frame, with the manager's salt and the manager's
+  `CrossChainProxy` creation code (`EEZBase.sol:160-171`). The `authorizedProxies[proxy]`
+  registration lands in the fork as a side effect. Deploying a proxy by hand into the cache
+  would be exactly the bytecode-coupled guess that broke before.
 
-Note `create_proxy` uses `DIRECT_CALL_GAS_LIMIT` (clamped) rather than `VIEW_CALL_GAS_LIMIT`: a
-CREATE2 deployment is not a view. Correct.
+Note that `create_proxy` uses the clamped `DIRECT_CALL_GAS_LIMIT` rather than
+`VIEW_CALL_GAS_LIMIT`. A CREATE2 deployment is not a view. Correct.
 
-### 1.9 `impl TargetExecutionSession for L1TargetSession` (`slot.rs:316-412`)
+### 1.9 `impl TargetExecutionSession for L1TargetSession` (`slot.rs:351-454`)
 
-**`execute` (`slot.rs:317-397`)** — the heart of the outbound path, in the contract's own order:
+**`execute` (`slot.rs:352-439`)** is the heart of the outbound path, in the contract's own order:
 
-1. `CallMode::Static` refused (`Unavailable` → transient, same as the old session; static entries
-   are parked, design §6).
-2. compute proxy → if unauthorized, create it.
-3. build the frame: `caller = manager`, `to = proxy`,
-   `data = executeOnBehalf(target, 0, data)`, `value = req.value`.
+1. Refuse `CallMode::Static` with `Encoding`, which classifies POISON. A call mode is fixed by
+   the tx, so retrying re-fails forever. Static entries are parked, per design §6.
+2. Compute the proxy. If it is not authorized, create it.
+3. Build the frame: `caller = manager`, `to = proxy`, `data = executeOnBehalf(target, 0, data)`,
+   `value = req.value`.
 
-That shape is the whole point. The proxy's `executeOnBehalf` is transparent-proxy-style: it
-forwards only when `msg.sender == EEZ` and otherwise falls through to the cross-chain path
-(`CrossChainProxy.sol:50-64`). So the *only* way to get a faithful target execution is to enter
-through the manager. The old direct call with a forged proxy `msg.sender` bypassed the proxy
-contract entirely — a target that inspects `msg.sender` (or the proxy's own accounting) saw a
-different world than the chain will show it.
+That shape is the whole point. `executeOnBehalf` is transparent-proxy-style. It forwards only
+when `msg.sender == EEZ`, and otherwise falls through to the cross-chain path
+(`CrossChainProxy.sol:50-64`). So entering through the manager is the *only* way to get a
+faithful target execution. The old direct call with a forged proxy `msg.sender` bypassed the
+proxy contract entirely. A target that inspects `msg.sender`, or the proxy's own accounting, saw
+a different world than the chain will show it.
 
-4. The frame runs under `SkipTopFrame::new(self.client.inspector_factory().build(dispatcher))`
-   — see §1.10.
-5. `restore_nonce(&mut changes, self.manager)` then `commit`.
-6. The outcome is returned **raw**:
+4. Run the frame under `SkipTopFrame::new(self.client.inspector_factory().build(dispatcher))`.
+   See §1.10.
+5. Surface any error the session inspector raised, before looking at state (`slot.rs:411-413`).
+   A nested dispatch's failure must not be swallowed by a "successful" outer frame.
+6. On success, reset the manager's nonce and commit (`slot.rs:418-421`).
+7. Return the outcome **raw**:
 
 ```rust
 Ok(ExecutionOutcome::Resolved { return_data: return_data.to_vec(), gas_used, success })
 ```
 
-with the comment "The frame's raw output IS what `_processNCalls` folds into CALL_END
-(`EEZ.sol:1181`) — revert data included on failure." Verified against the contract: it does
+The comment says the frame's raw output IS what `_processNCalls` folds into CALL_END, revert data
+included on failure (`EEZ.sol:1181`). Verified against the contract: it does
 `(success, retData) = sourceProxy.call{value: …}(…)` and then `_rollingHashCallEnd(success,
-retData)`. And because `executeOnBehalf` re-reverts with the target's own revert bytes
-(`revert(add(result,0x20), mload(result))`), a failing target yields byte-identical revert data
-here and on-chain. No post-processing, no normalization — anything else would be a divergence
-source.
+retData)`. `executeOnBehalf` re-reverts with the target's own revert bytes, so a failing target
+yields byte-identical revert data here and on-chain. No post-processing and no normalization.
+Anything else would be a divergence source.
 
-One thing that looks wrong on a fast read and is right: `commit` happens even when
-`success == false`. revm has already discarded the reverted frame's journal, so `result.state`
-for a failed tx carries only touched accounts and the caller's nonce/fee changes — and the nonce
-is restored and the gas price is zero. Meanwhile the proxy *creation* from step 2 stays
-committed, which is exactly the on-chain behavior: `_processNCalls` creates the proxy first and
-catches the call failure as `(false, retData)`, so the deployment survives the failed call.
+The commit is guarded by `if success`, and that guard is deliberate (`slot.rs:415-421`). A
+reverted frame's only state today is the caller's nonce bump. Committing it anyway would tie the
+slot-shared world to whatever a future revm decides to return in `result.state` for a revert.
+Meanwhile the proxy created in step 2 stays committed, because `create_proxy` commits its own
+frame. That matches the chain: `_processNCalls` creates the proxy first, then catches the call
+failure as `(false, retData)`, so the deployment survives the failed call.
 
-**`checkpoint` / `rollback` (`slot.rs:399-411`)** — the payload contract, documented on the impl
-(`slot.rs:163-170`) and consumed at `composer.rs:589-605`:
+**`checkpoint` and `rollback` (`slot.rs:441-453`)** implement the payload contract documented on
+the impl (`slot.rs:196-205`):
 
 ```rust
 fn checkpoint(&mut self) -> ExecutorResult<SessionSnapshot> {
@@ -776,33 +777,33 @@ fn checkpoint(&mut self) -> ExecutorResult<SessionSnapshot> {
 ```
 
 `SessionSnapshot` is `Box<dyn Any + Send>`, so the type is checked at runtime only. The drain
-reclaims the boxed session via `take_sessions`, calls `checkpoint()`, downcasts to `CacheState`
-and commits it into `L1SlotState::cache` on accept — `take_l1_cache` even repeats the constraint
-in its own doc ("The payload shape is pinned by `L1TargetSession::checkpoint`: a boxed `CacheState`
-and nothing else"). Documenting it on both ends is right given `Any` gives no compiler help.
+reclaims the boxed session, calls `checkpoint()`, downcasts to `CacheState`, and commits it into
+`L1SlotState::cache` on accept. `take_l1_cache` repeats the constraint in its own doc, calling
+the payload a boxed `CacheState` and nothing else (`composer.rs:596-614`). Documenting it on
+both ends is right, because `Any` gives no compiler help.
 
-The double duty is neat rather than clever: the same method serves (a) the builder's intra-tx
-revert-span rollback and (b) the drain's end-of-tx harvest, because "the accumulated effects" is
-the same object in both cases.
+The double duty is neat rather than clever. The same method serves the builder's intra-tx
+revert-span rollback and the drain's end-of-tx harvest, because "the accumulated effects" is the
+same object in both cases.
 
-Cache-only restore is sound because simulation reads go exclusively through the cache; the
-bundle/transition state is never consulted. The comment says that. **Before → After**: the old
-session's `checkpoint` returned `Box::new(())` and its `rollback` was a no-op type check
-(`session.rs:345-362`), with a comment admitting that annulled-call safety rested entirely on
-batch materialization rejecting revert spans. So a reverted span inside a composition left its
-writes in the session. Now a revert span actually rewinds.
+Cache-only restore is sound because simulation reads go exclusively through the cache, and the
+bundle and transition state are never consulted. The comment says that. Before: the old session's
+`checkpoint` returned `Box::new(())` and its `rollback` was a no-op type check, with a comment
+admitting that annulled-call safety rested entirely on batch materialization rejecting revert
+spans (`session.rs:349-365`). So a reverted span inside a composition left its writes in the
+session. After: a revert span actually rewinds.
 
-### 1.10 `SkipTopFrame` (`slot.rs:414-450`)
+### 1.10 `SkipTopFrame` (`slot.rs:456-492`)
 
-Found in author review of the first implementation, and it is the subtlest thing in the file.
+Found in author review of the first implementation. It is the subtlest thing in the file.
 
-The session inspector fires on **every** call frame, and its job is: if the callee is an
-authorized proxy, intercept the frame and re-dispatch it through the composition builder. But the
-manager frame's own callee *is* an authorized proxy — so without the wrapper the inspector would
-intercept the very frame that IS the dispatch and re-dispatch it as a nested call. In practice
-every outbound transaction would have poison-evicted.
+The session inspector fires on **every** call frame. Its job is to intercept a frame whose callee
+is an authorized proxy and re-dispatch it through the composition builder. But the manager
+frame's own callee *is* an authorized proxy. Without the wrapper, the inspector would intercept
+the very frame that IS the dispatch and re-dispatch it as a nested call. In practice every
+outbound transaction would have poison-evicted.
 
-The wrapper is 30 lines and hides exactly one frame:
+The wrapper is 37 lines and hides exactly one frame:
 
 ```rust
 fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
@@ -813,137 +814,138 @@ fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOut
 }
 ```
 
-Nested proxy calls made *inside* the target still forward to the inner inspector and are recorded
-as `expectedL1ToL2Calls`, which the accept-time shape gate turns into a precise per-tx eviction
-(nested composition is parked, design §6). So the wrapper narrows the blindness to one frame
-rather than turning inspection off.
+Nested proxy calls made *inside* the target still forward to the inner inspector, and are
+recorded as `expectedL1ToL2Calls`. The accept-time shape gate turns those into a precise per-tx
+eviction, because nested composition is parked per design §6. So the wrapper narrows the
+blindness to one frame rather than turning inspection off.
 
-The documented consequence — "a revert of the top frame itself is not span-annotated" — is exact:
-`SessionInspector::call` pushes a dispatch-count marker and `call_end` pops it to emit
-`annotate_revert_span` (`eez-evm-inspector/src/inspector.rs:242-247, 361-375`). Skipping both
-halves for the top frame means no span annotation for it, which is acceptable precisely because
+The documented consequence is exact: a revert of the top frame itself is not span-annotated.
+`SessionInspector::call` pushes a dispatch-count marker, and `call_end` pops it to emit
+`annotate_revert_span` (`eez-evm-inspector/src/inspector.rs:242-247, 362-374`). Skipping both
+halves for the top frame means no span annotation for it. That is acceptable precisely because
 any composition with nested dispatches is shape-gated to eviction anyway.
 
-Three things I checked rather than assumed:
+Three things I checked rather than assumed.
 
 - **Stack balance under interception.** If the inner inspector returns `Some(outcome)` from
-  `call`, does revm still deliver `call_end`? Yes — `revm-inspector 19.0.0`
-  (`traits.rs:104-107`) calls `frame_end` immediately after a short-circuiting `frame_start`. So
-  both `SkipTopFrame::depth` and `SessionInspector::frame_starts` stay balanced. If that ever
-  changed upstream, both counters would skew; the depth field is the kind of thing worth a
-  regression test if the revm pin moves.
-- **Skipping both halves, not one.** Forwarding `call_end` while skipping `call` would
-  underflow the inner inspector's `frame_starts` and mis-attribute the next frame's revert span.
-  The `saturating_sub` + `> 0` check pairs them correctly.
-- **Hook coverage.** `SkipTopFrame` overrides only `call`/`call_end`; every other `Inspector`
-  hook falls back to the trait default (no-op) and therefore does **not** reach `inner`.
-  `SessionInspector` today implements exactly `call` and `call_end`, so nothing is dropped. Worth
-  a one-line comment on the wrapper, because the day someone adds `create_end` or `log` to
-  `SessionInspector` it will be silently ignored on this path only.
+  `call`, does revm still deliver `call_end`? Yes. `revm-inspector 19.0.0` calls `frame_end`
+  immediately after a short-circuiting `frame_start` (`traits.rs:104-107`). So both
+  `SkipTopFrame::depth` and `SessionInspector::frame_starts` stay balanced. If that changed
+  upstream, both counters would skew. The depth field is worth a regression test if the revm pin
+  moves.
+- **Skipping both halves, not one.** Forwarding `call_end` while skipping `call` would underflow
+  the inner inspector's `frame_starts` and mis-attribute the next frame's revert span. The
+  `saturating_sub` plus the `> 0` check pair them correctly (`slot.rs:486-491`).
+- **Hook coverage.** `SkipTopFrame` overrides only `call` and `call_end`. Every other `Inspector`
+  hook falls back to the no-op trait default, so it never reaches `inner`. `SessionInspector`
+  today implements exactly `call` and `call_end`, so nothing is dropped. Worth a one-line comment
+  on the wrapper: adding `create_end` or `log` to `SessionInspector` would be silently ignored
+  here.
 
-### 1.11 `restore_nonce` (`slot.rs:452-465`)
+### 1.11 `reset_frame_caller_nonce` (`local/mod.rs:40-56`)
 
-revm bumps a transaction sender's nonce. Here the "senders" are the manager contract and the
-synthetic `Address::ZERO` proxy-creation caller — neither is an EOA, and a contract account's
-nonce only governs CREATE, while every proxy is CREATE2. So the bump would drift the fork from
-the real chain for no reason, and the function resets `info.nonce` to `original_info.nonce`.
+revm bumps a transaction sender's nonce. Here the senders are the manager contract and the
+synthetic `Address::ZERO` proxy-creation caller. Neither is an EOA. A contract account's nonce
+only governs CREATE, and every proxy is CREATE2. So the bump would drift the fork from the real
+chain for no reason, and the function resets `info.nonce` to `original_info.nonce`.
 
-**Before → After.** The old `restore_caller_nonce` (`session.rs:386-397`) did the same
-mechanical thing for a much worse reason: the old session forged `msg.sender` as the *computed
-proxy address*, and bumping that address's nonce made a later real `CREATE2` at the same address
-fail EIP-684's "code or nonce non-zero" check, burning ~28M gas and reverting the whole session
-with empty data. The 12-line comment documenting that failure mode is a good marker of how much
-the shortcut cost. In the new design the shortcut is gone, so the remaining nonce restore is
-plain hygiene on synthetic senders — and the new comment is three lines instead of twelve,
-correctly.
+Before: the old `restore_caller_nonce` did the same mechanical thing for a much worse reason. The
+old session forged `msg.sender` as the computed proxy address, and bumping that address's nonce
+made a later real CREATE2 at the same address fail EIP-684's "code or nonce non-zero" check. That
+burned about 28M gas and reverted the whole session with empty data. The twelve-line comment
+documenting that failure mode marks how much the shortcut cost. After: the shortcut is gone, so
+the remaining nonce restore is plain hygiene on synthetic senders, and the new comment is short.
+It lives in `local/mod.rs` rather than in either executor, because `slot.rs` and `session.rs` both
+call it. One definition, one rationale.
 
-### 1.12 `ProbeSnapshot` (`slot.rs:469-474`)
+### 1.12 `ProbeSnapshot` (`slot.rs:496-502`)
 
-Cache **plus** `delivery_nonce`. Both halves must rewind together: if a revert span rolls back a
-delivery, the SYSTEM_ADDRESS nonce cursor must go back with it or every subsequent delivery in
-the composition is built at the wrong nonce and fails at execution. Small struct, real
-invariant.
+The fork's restore point plus `delivery_nonce`. Both halves must rewind together. If a revert
+span rolls back a delivery, the SYSTEM_ADDRESS nonce cursor must go back with it. Otherwise every
+later delivery in the composition is built at the wrong nonce and fails at execution. Small
+struct, real invariant. The fork half is a `ForkSnapshot`, which carries the cache and the
+applied-tx counter together, so restoring a fork also restores its tx position
+(`build.rs:409-416`).
 
-### 1.13 `InboundL2TargetSession` — struct, `new`, `l1_entry_for_call`, `delivery_tx` (`slot.rs:476-568`)
+### 1.13 `InboundL2TargetSession` — struct, `new`, `l1_entry_for_call`, `delivery_tx` (`slot.rs:504-597`)
 
-The inbound target session. Its state is a `SyncBlockFork` (a throwaway copy of the Sync block
-under construction, `build.rs:395-471`), the `SystemTxContext`, and the delivery nonce cursor.
+The inbound target session. Its state is a `SyncBlockFork`, a throwaway copy of the Sync block
+under construction (`build.rs:417-500`), plus the `SystemTxContext` and the delivery nonce cursor.
 
-`l1_entry_for_call` (`slot.rs:517-553`) builds the **L1-shape** `ExecutionEntrySol` for one inbound call
-— the same shape a postBatch carries — because `build_inbound_system_txs` is the canonical
-batch→delivery lowering used by the deriver and the signer. Reusing it means the probe's delivery
-transaction is byte-identical to what a follower will reconstruct from L1, by construction rather
-than by review. That is the same "single-source STF" discipline the composer/deriver split
-already relies on.
+`l1_entry_for_call` builds the **L1-shape** `ExecutionEntrySol` for one inbound call, which is
+the same shape a postBatch carries (`slot.rs:546-582`). It does that because
+`build_inbound_system_txs` is the canonical batch-to-delivery lowering the deriver and the signer
+both use. Reusing it makes the probe's delivery transaction byte-identical to what a follower
+will reconstruct from L1, by construction rather than by review. That is the same single-source
+STF discipline the composer and deriver split already relies on.
 
-`delivery_tx` (`slot.rs:556-567`) lowers exactly one entry at the current cursor and asserts the
-one-in/one-out shape:
+`delivery_tx` lowers exactly one entry at the current cursor, and asserts the one-in, one-out
+shape (`slot.rs:585-596`):
 
 ```rust
 let [tx] = <[Bytes; 1]>::try_from(txs).map_err(|txs| encoding_err(format!(
     "one inbound entry must lower to exactly one delivery tx; got {}", txs.len())))?;
 ```
 
-That is not paranoia: `build_inbound_system_txs` silently *skips* entries whose
-`destinationRollupId` doesn't match `cfg.this_rollup_id` (`system_tx.rs:89-91`), so a rollup-id
-mix-up would otherwise yield an empty vec and a confusing downstream failure. Loud, per
-invariant 7.
+That is not paranoia. `build_inbound_system_txs` silently skips entries whose
+`destinationRollupId` does not match `cfg.this_rollup_id` (`eez-protocol/src/system_tx.rs:89-91`).
+A rollup-id mix-up would otherwise yield an empty vec and a confusing downstream failure. Loud,
+per invariant 7.
 
-**Small observation.** `l1_entry_for_call` computes the lean L2 entry to obtain `proxyEntryHash` and
-`rollingHash`, but `build_inbound_system_txs` rebuilds that same lean entry internally from the
-L1-shape fields (`system_tx.rs:103-113`), so those two fields on the returned struct are inert
-for the lowering. They are identical by construction (same builder, same inputs), so this is
-correctness-neutral — but a reader can spend a while looking for where the hashes are consumed.
-One clause on the doc comment ("the hashes are recomputed by the canonical lowering; set here so
-the entry is well-formed") would save that trip.
+**Small observation.** `l1_entry_for_call` computes the lean L2 entry to obtain `proxyEntryHash`
+and `rollingHash`. But `build_inbound_system_txs` rebuilds that same lean entry internally from
+the L1-shape fields, so those two fields on the returned struct are inert for the lowering
+(`eez-protocol/src/system_tx.rs:103-113`). Same builder and same inputs, so this is
+correctness-neutral. A reader can still hunt a while for where the hashes are consumed, and one
+clause on the doc comment would save that trip.
 
-### 1.14 `impl TargetExecutionSession for InboundL2TargetSession` (`slot.rs:570-678`)
+### 1.14 `impl TargetExecutionSession for InboundL2TargetSession` (`slot.rs:599-704`)
 
 **Why two runs.** This is inherent, not an optimization choice, and the code says so. The rolling
-hash must be computed *inside* the transaction that produces it — `EEZL2._executeEntry` seeds it
+hash must be computed *inside* the transaction that produces it. `EEZL2._executeEntry` seeds it
 from `proxyEntryHash`, folds `(success, retData)` at `EEZL2.sol:551`, and compares against the
 claimed `entry.rollingHash` at `EEZL2.sol:466`. You cannot learn the true return data and land
 the final transaction in one pass, because the final transaction's own input depends on its own
 output.
 
-**Run 1, PROBE (`slot.rs:583-625`).** The entry is built with the *correct* `proxyEntryHash` —
-the call hash is computable a priori, it folds identity (`isStatic`, source, source rollup,
-target, target rollup, value, `callGas = 0`, data) but not return data — and a placeholder
-`returnData`. That matters: with the right entry hash the delivery passes
-`if (entry.proxyEntryHash != crossChainCallHash) revert EntryHashMismatch;`
-(`EEZL2.sol:308-311`) and reaches the real `EEZL2 → proxy → target` call. The transaction is
-then **expected** to revert at `RollingHashMismatch` — by which point the frame has already run
-and `ProbeInspector` has captured its `(success, retData)`, which is precisely what
-`_processNCalls` folds at `EEZL2.sol:547-552`.
+**Run 1, the probe (`slot.rs:612-654`).** The entry is built with the *correct* `proxyEntryHash`
+and a placeholder `returnData`. The call hash is computable a priori: it folds identity, meaning
+`isStatic`, source, source rollup, target, target rollup, value, `callGas = 0`, and data, but not
+return data. That matters. With the right entry hash the delivery passes the
+`EntryHashMismatch` check and reaches the real `EEZL2 → proxy → target` call
+(`EEZL2.sol:308-311`). The transaction is then **expected** to revert at `RollingHashMismatch`.
+By that point the frame has already run, and `ProbeInspector` has captured its
+`(success, retData)`. That pair is precisely what `_processNCalls` folds
+(`EEZL2.sol:547-552`).
 
-The snapshot/restore around the probe is load-bearing, not hygiene:
+The snapshot and restore around the probe are load-bearing, not hygiene:
 
 ```rust
-let snapshot = self.fork.cache_snapshot();
+let snapshot = self.fork.snapshot();
 … execute probe …
-self.fork.restore_cache(snapshot);
+self.fork.restore(snapshot);
 ```
 
 A reverted transaction still burns the SYSTEM_ADDRESS nonce and gas. Leaving the probe's effects
-in place would make the real run at the same nonce fail — the mechanism would eat itself. The
+in place would make the real run at the same nonce fail, so the mechanism would eat itself. The
 inline comment frames it as "the probe leaves no trace: its state effects are re-applied by the
-real run below", which is true but understates the necessity; "the probe must not consume the
-nonce the real run needs" is the sharper reason.
+real run below". True, but it understates the necessity. The sharper reason is that the probe
+must not consume the nonce the real run needs.
 
-The three-way match on `inspector.captures` is good failure design: zero captures means the
-delivery never reached the proxy frame (entry hash or table mismatch) and the message carries the
-probe's own success/output for diagnosis; more than one means a nested or multi-call shape, which
-is parked, and says so. Both are poison-kind, i.e. one eviction, not a slot degrade.
+The three-way match on `inspector.captures` is good failure design (`slot.rs:629-646`). Zero
+captures means the delivery never reached the proxy frame, from an entry-hash or table mismatch,
+and the message carries the probe's own success and output for diagnosis. More than one means a
+nested or multi-call shape, which is parked, and the message says so. Both are poison-kind, so
+each costs one eviction rather than a slot degrade.
 
-`!captured.success` → poison (`slot.rs:619-625`). Current policy: a *reverting target* on the
-inbound path cannot be represented, because `build_l2_incoming_entry` rejects `success == false`
-(`entries:279-281`). Worth being explicit that this is a policy statement about today's entry
-builders, not a protocol limit — the contract has a reverting-entry path
+A reverting target is also poison (`slot.rs:648-654`). That is a policy statement about today's
+entry builders, not a protocol limit. `build_l2_incoming_entry` rejects `success == false`
+(`eez-protocol/src/entries/mod.rs:279-281`), while the contract does have a reverting-entry path
 (`EEZL2.sol:471-478`).
 
-**Run 2, REAL (`slot.rs:627-647`).** Rebuild the entry with the captured output — the canonical
-builder recomputes the rolling hash with the shared fold — lower it, and execute on the fork. It
-**must** succeed:
+**Run 2, the real run (`slot.rs:656-669`).** Rebuild the entry with the captured output, so the
+canonical builder recomputes the rolling hash with the shared fold, lower it, and execute on the
+fork. It **must** succeed:
 
 ```rust
 if !real.success { return Err(encoding_err(format!(
@@ -951,36 +953,28 @@ if !real.success { return Err(encoding_err(format!(
 }
 ```
 
-This is the line that closes issue #88. It is the same on-chain claim verifier that previously
-fired at the proof signer — where it froze the whole window and the drain re-queued the same set
-to fail identically next slot — now firing at compose time, where the cost is one eviction. The
-verification moved, it did not get weaker.
+This is the line that closes issue #88. It is the same on-chain claim verifier that used to fire
+at the proof signer, where it froze the whole window and the drain re-queued the same set to fail
+identically next slot. It now fires at compose time, where the cost is one eviction. The
+verification moved. It did not get weaker.
 
-**Before → After, concretely (the #88 repro, design §9.1).** Three `increment()` calls against
-one stateful L2 target in one drain. Before: each was simulated against the same pre-slot state,
-so all three claimed a return of `1`; on-chain they execute sequentially, produce `1, 2, 3`, and
-the second delivery reverts `RollingHashMismatch` → the signer rejects the window → re-queue →
-identical failure forever. After: each probe runs on the fork of the block prefix that already
-contains the previous accepted delivery, so the claims are `1, 2, 3` and the window signs.
+**Before and after, on the #88 repro.** Three `increment()` calls hit one stateful L2 target in
+one drain. Before: each was simulated against the same pre-slot state, so all three claimed a
+return of 1. On-chain they execute in sequence and really return 1, 2, 3, so the second delivery
+reverts `RollingHashMismatch`, the signer rejects the window, the drain re-queues, and the same
+failure repeats forever. After: each probe runs on a fork of the block prefix that already
+contains the previous accepted delivery, so the claims are 1, 2, 3 and the window signs.
 
-Nonce advance is `checked_add` with a loud error (`slot.rs:645-647`), and `checkpoint`/`rollback`
-carry both halves of the state as described in §1.12.
+Nonce advance is `checked_add` with a loud error (`slot.rs:671-673`). `checkpoint` and `rollback`
+carry both halves of the state, as described in §1.12.
 
-**Small nit.** `SyncBlockFork::execute_tx*` increments its internal `applied` counter, and
-`restore_cache` does not rewind it, so after a probe the fork's counter is one ahead of the
-transactions actually applied to it. `applied` is only passed as `idx` to `recover_tx` for error
-messages (`build.rs:248-270`), so this is cosmetic today — but if it ever feeds a block position
-or a receipt index it becomes real. Either add `applied` to `ProbeSnapshot` or note on
-`restore_cache` that the counter is diagnostic only.
+### 1.15 `ProbeCapture` and `ProbeInspector` (`slot.rs:706-773`)
 
-### 1.15 `ProbeCapture` / `ProbeInspector` (`slot.rs:680-747`)
+`ProbeCapture` is `(success, output)`, with no gas field. An earlier draft had `gas_used` and
+audit removed it, rightly: `USE_GAS_LEFT` is off and hashes fold `callGas = 0`, so gas is not
+consensus-relevant on this path, and an unused field invites someone to start trusting it.
 
-`ProbeCapture` is `(success, output)` — deliberately no gas field (the earlier draft had
-`gas_used`; it was removed in audit, and rightly: `USE_GAS_LEFT` is off and hashes fold
-`callGas = 0`, so gas is not consensus-relevant on this path and an unused field invites someone
-to start trusting it).
-
-The match predicate is the contract's own call shape:
+The match predicate is the contract's own call shape (`slot.rs:753-759`):
 
 ```rust
 let matched = !inputs.is_static
@@ -989,146 +983,151 @@ let matched = !inputs.is_static
     && inputs.input.as_bytes(context).starts_with(&executeOnBehalfCall::SELECTOR);
 ```
 
-i.e. exactly the non-static `sourceProxy.call{value:…}(abi.encodeCall(executeOnBehalf, …))` at
-`EEZL2.sol:547-550`. The `caller == EEZL2` clause is what keeps a target that happens to call some
+That is exactly the non-static `sourceProxy.call{value:…}(abi.encodeCall(executeOnBehalf, …))`
+at `EEZL2.sol:547-550`. The `caller == EEZL2` clause keeps a target that happens to call some
 other proxy from being mistaken for the delivery frame.
 
-Capture happens in `call_end`, not `call` — the outcome is only known at frame end — with a
-`frames: Vec<bool>` acting as a depth/match stack so nested frames pop their own marker. Since
-`call` always returns `None` (this inspector observes, never intercepts) the pairing is
-unconditional.
+Capture happens in `call_end`, not `call`, because the outcome is only known at frame end
+(`slot.rs:764-772`). A `frames: Vec<bool>` acts as a depth-and-match stack, so nested frames pop
+their own marker. `call` always returns `None`, since this inspector observes and never
+intercepts, so the pairing is unconditional.
 
-Post-audit it is a plain `Vec` read through a `&mut` borrow (revm auto-implements `Inspector` for
+Post-audit it is a plain `Vec` read through a `&mut` borrow. revm auto-implements `Inspector` for
 `&mut I`, so `execute_tx_inspected(&probe_tx, &mut inspector)` type-checks and the caller keeps
-ownership). That replaced an `Arc<Mutex<…>>`: same guarantees, no lock, no poison branch, and the
-capture list is readable straight after the run. Right call — the inspector and its reader are
-the same thread, always.
+ownership. That replaced an `Arc<Mutex<…>>`: same guarantees, no lock, no poison branch, and the
+captures are readable straight after the run. The inspector and its reader are always one thread.
 
-`ProbeInspector::new` takes the EEZL2 address rather than reading it from the context; the hand
-written `Debug` prints the address and the open-frame depth. Mechanical.
+`ProbeInspector::new` takes the EEZL2 address rather than reading it from the context. The
+hand-written `Debug` prints the address and the open-frame depth. Mechanical.
 
 ### 1.16 Absent relative to the earlier draft
 
-Noted so a reviewer who saw the first version doesn't go looking: `final_cache`, `into_fork`, the
+Noted so a reviewer who saw the first version does not go looking. `final_cache`, `into_fork`, the
 `delivery_nonce()` accessor, two vacuous tests, and `ProbeCapture.gas_used` were all removed in
-audit — dead API surface that no caller reached. There is no `#[cfg(test)]` block in the file;
-coverage lives in `crates/eez-node/tests/chained_interstate.rs` plus the chiado runs of design §8,
-which is the right level for something whose whole contract is "the real chain agrees".
+audit. They were dead API surface no caller reached.
+There is no `#[cfg(test)]` block in the file either. Coverage lives in
+`crates/eez-node/tests/chained_interstate.rs` plus the chiado runs of design §7, which is the
+right level for something whose whole contract is "the real chain agrees".
 
 ---
 
-## 2. `crates/eez-composer/src/local/client.rs` (diff vs `HEAD`)
+## 2. `crates/eez-composer/src/local/client.rs`
 
-The theme: one source-simulation body, two entry points, and everything `slot.rs` needs exposed
-as small accessors.
+The theme: one source-simulation body, one entry point, and everything `slot.rs` needs exposed as
+small accessors.
 
-### Hunk 1 — imports (`client.rs:16-17`)
+### Hunk 1 — imports (`client.rs:15-18`)
 
-`StateProviderBox` for the caller-provided state type in the new signature, `revm::DatabaseCommit`
-for the new commit. Mechanical.
+`State` and `StateProviderBox` type the caller-provided state in the new signature.
+`revm::DatabaseCommit` backs the new commit. Mechanical.
 
-### Hunk 2 — three accessors (`client.rs:167-190`)
+### Hunk 2 — three accessors (`client.rs:168-191`)
 
-`chain_provider()`, `manager_address()`, `inspector_factory()` — all pure getters over data the
-client already held, added because `slot.rs` needs them (`L1SlotState::open` reads headers/state,
-`L1TargetSession::new` reads the manager address and the EVM config, `execute` builds the session
-inspector).
+`chain_provider()`, `manager_address()`, and `inspector_factory()` are pure getters over data the
+client already held. They exist because `slot.rs` needs them. `L1SlotState::open` reads headers
+and state, `L1TargetSession::new` reads the manager address and the EVM config, and `execute`
+builds the session inspector.
 
-`inspector_factory()` also removes a duplicate: `begin_execution_session` and the source-sim path
-each hand-built the same three-argument `SessionInspectorFactory::new(...)`. Now both call the
-accessor, so the proxy-lookup config / rollup id / overlay channel triple has one definition.
+`inspector_factory()` also removes a duplicate. `begin_execution_session` and the source-sim path
+each hand-built the same three-argument `SessionInspectorFactory::new`. Both now call the
+accessor, so the proxy-lookup config, rollup id, and overlay channel triple has one definition.
 
-Audit deleted a fourth accessor, `rollup_id()` — no callers. Correct instinct: an accessor with no
-consumer is API surface that has to be maintained and will eventually be used for the wrong thing.
+Audit deleted a fourth accessor, `rollup_id()`, which had no callers. Correct instinct. An
+accessor with no consumer is API surface that has to be maintained and will eventually be used
+for the wrong thing.
 
-### Hunk 3 — `simulate_source_tx_on` (`client.rs:192-211`)
+### Hunk 3 — `simulate_source_tx_on` (`client.rs:193-214`)
 
-The new public entry point. Same semantics as the trait method except the caller supplies the
-state and env, and **the result commits into that state**.
+The new public entry point. The caller supplies the state and env, and **the result commits into
+that state**.
 
-That commit is what makes the source side chained. Concretely, two inbound L1 transactions from
-the same sender at nonces 0 and 1 in one drain: with the old "open latest, discard" behavior,
-tx 1's simulation would run against a state where tx 0 never happened — stale balance, stale
-target storage, stale nonce. With the fork carried across, tx 1 sees tx 0's writes, so the call
-arguments and return data it claims match the order the bundle will actually execute in. The same
-mechanism carries phase-1 outbound manager effects into phase-2 inbound sims, since both draw
+That commit is what makes the source side chained. Take two inbound L1 transactions from the same
+sender, at nonces 0 and 1, in one drain. Before, with open-latest-and-discard: tx 1's simulation
+ran against a state where tx 0 never happened, so it saw a stale balance, stale target storage,
+and a stale nonce. After, with the fork carried across: tx 1 sees tx 0's writes, so the call
+arguments and return data it claims match the order the bundle will really execute in. The same
+mechanism carries phase-1 outbound manager effects into phase-2 inbound sims, because both draw
 from `L1SlotState::cache`.
 
-Nonce *validation* is a separate matter: `source_sim` sets `disable_nonce_check = true` (inherited
-behavior, needed because a system-signed source tx can legitimately sit at N+1 behind its
-`loadExecutionTable`), so the chaining benefit here is the visible **state**, including the
-sender's nonce as a target or a CREATE would observe it — not nonce validation.
+Nonce *validation* is a separate matter. `source_sim` sets `disable_nonce_check = true`, which is
+inherited behavior needed because a system-signed source tx can legitimately sit at N+1 behind its
+`loadExecutionTable` (`client.rs:249-253`). So the chaining benefit here is the visible **state**,
+including the sender's nonce as a target or a CREATE would observe it, and not nonce validation.
 
-The doc comment points at the constraint that the caller owns: the env "must already be derived
-from the fork's own header". `L1SlotState::fork_state` and `SyncBlockFork::state_and_env` are the two
-places that hold up that end.
+The doc comment names the constraint the caller owns: the env must already be derived from the
+fork's own header. `L1SlotState::fork_state` and `SyncBlockFork::state_and_env` are the two places
+that hold up that end.
 
-### Hunk 4 — `source_sim`, the shared body (`client.rs:213-283`)
+### Hunk 4 — `source_sim`, the shared body (`client.rs:216-290`)
 
-Everything from the entry-role gate through decode, tx env, inspected run, inspector-error check
-and commit now lives here once. Three things inside it are worth a line each:
+Everything from the entry-role gate through decode, tx env, inspected run, inspector-error check,
+and commit lives here once. Three things inside it are worth a line each.
 
-- The entry-role gate stays in the shared body with its original comment ("callers use the uniform
-  `ChainClient` interface for both roles") — so `simulate_source_tx_on` inherits the same refusal
-  and a follower client cannot be smuggled onto the new path.
-- The result is destructured to `(gas_used, success, changes)` with `changes: Option<_>`; a
-  transact error logs `source sim reverted` and yields `None`, so nothing is committed on that
-  branch. Same tolerant behavior as before for the trait path, and correct for the fork path.
-- The commit is guarded by a comment explaining why it is unconditional: *"The trait-method
-  caller's `State` is function-local, so committing into it is unobservable there; the fork caller
-  needs the writes."* This is the answer to the obvious alternative — an earlier draft had a
-  `CommitPostState` enum threading "commit or not" through the body, and audit removed it because
-  the flag could only ever have one observable value. One less parameter, one less thing to get
-  wrong at a call site; the comment carries the reasoning that the enum used to carry.
+- The entry-role gate stays in the shared body, so a follower client cannot be smuggled onto the
+  source-sim path (`client.rs:230-234`).
+- The result is destructured to `(gas_used, success, changes)` with `changes: Option<_>`, and the
+  two failure classes split (`client.rs:265-275`). A database error returns a transient provider
+  error, because an unreachable store is the slot's problem and must not degrade into an empty
+  composition the drain would read as poison. Any other transact error logs `source sim reverted`
+  and yields `None`, so nothing is committed on that branch.
+- The commit is unconditional, and a comment explains why: the writes are what the fork caller
+  needs, and committing into a function-local `State` would be unobservable anyway
+  (`client.rs:282-286`). This answers the obvious alternative. An earlier draft threaded a
+  `CommitPostState` enum through the body, and audit removed it because the flag could only ever
+  have one observable value. One less parameter and one less thing to get wrong at a call site.
+  The comment carries the reasoning the enum used to carry.
 
-The timing instrumentation (`t_total`/`t_decode`/`t_state`/`t_env`/`t_sim` and the
-`source simulation timing` event) is gone. Worth noting *why* rather than as a deletion: after the
-split, `state_us` and `env_us` measured work the function no longer does — on the
-`simulate_source_tx_on` path the state and env are handed in already open — so the fields would
-have reported near-zero and lied about where time goes. Dropping a metric that has become
-structurally wrong is better than keeping a familiar-looking number.
+The timing instrumentation is gone, and the reason matters more than the deletion. After the
+split, `state_us` and `env_us` measured work the function no longer does, because on the
+`simulate_source_tx_on` path the state and env arrive already open. The fields would have reported
+near-zero and lied about where time goes. Dropping a metric that has become structurally wrong
+beats keeping a familiar-looking number.
 
-### Hunk 5 — `begin_execution_session` (`client.rs:291-313`)
+### Hunk 5 — `begin_execution_session` (`client.rs:298-320`)
 
-Body unchanged except `Some(self.inspector_factory())` in place of the inline three-line
-construction. Mechanical, and it moved below the inherent-impl block in the file — the diff looks
-larger than the change because of that relocation.
+Body unchanged except for `Some(self.inspector_factory())` in place of the inline three-line
+construction. Mechanical. It also moved below the inherent-impl block, so the diff looks larger
+than the change.
 
-### Hunk 6 — `simulate_source_tx` trait impl (`client.rs:315-350`)
+### Hunk 6 — `ChainClient` loses `simulate_source_tx` (`eez-protocol/src/executor.rs:95-109`)
 
-Now just the "open at the tip" preamble — best block number → header → `provider.latest()` →
-`State::builder()` → `evm_env(&header)` — followed by `self.source_sim(...)`. Behavior is
-preserved bit-for-bit: it still opens latest, and its post-state still dies with the call, which
-the closing comment states outright ("Inspect only: the post-state dies with this call"). This
-matters because the trait method is still the path other (non-slot) callers use; the change-set
-does not quietly alter it.
+Before: entry-role clients overrode a `simulate_source_tx` trait method, which opened
+`provider.latest()`, ran the sim, and threw the post-state away. After: the trait method is gone,
+and source simulation lives only on the concrete entry client as `simulate_source_tx_on`.
+
+The trait's own doc gives the reason: source simulation runs over the caller's slot-scoped state,
+so it cannot be a uniform trait method. `ChainClient` now declares only
+`reset_composition_state` and `begin_execution_session`. The drain is the single caller of the
+remaining source-sim path (`composer.rs:222`), so nothing can reach the old open-latest behavior
+by accident.
 
 ---
 
 ## 3. `crates/eez-composer/src/local/mod.rs` and `crates/eez-composer/src/lib.rs`
 
-Small and worth being deliberate about.
+Small, and worth being deliberate about. In `mod.rs`:
 
-`mod.rs`:
+- The module doc gains one line for `slot`, describing it as slot-scoped execution contexts
+  driving the real contract paths. It sits alongside the existing `LocalChainClient` and
+  `LocalExecutionSession` entries.
+- `pub(crate) mod slot;` matches the visibility of `build`, `client`, `provider`, and `session`.
+  Only `gnosis_adapter` stays `pub`. Modules stay crate-private and only chosen items are
+  re-exported.
+- `pub use slot::LocalComposeClients;` with `#[doc(inline)]` is the single type that must cross
+  the crate boundary, because the node constructs it when wiring `CrossChainWiring`
+  (`eez-node/src/main.rs:697`).
+- `pub(crate) use slot::{InboundL2TargetSession, L1SlotState, L1TargetSession};` carries the
+  comment "Slot execution contexts are driven only by `composer.rs`."
 
-- module doc gains one line for `slot` — "slot-scoped execution contexts driving the real contract
-  paths" — sitting alongside the existing `LocalChainClient` / `LocalExecutionSession` entries.
-- `pub(crate) mod slot;` matches the visibility of `build`, `client`, `provider`, `session`
-  (`gnosis_adapter` remains `pub`). Modules stay crate-private; only chosen items are re-exported.
-- `pub use slot::LocalComposeClients;` (`#[doc(inline)]`) — the single type that must cross the crate
-  boundary, because `eez-node/src/main.rs:697` constructs it when wiring `CrossChainWiring`.
-- `pub(crate) use slot::{InboundL2TargetSession, L1SlotState, L1TargetSession};` with the comment "Slot
-  execution contexts are driven only by `composer.rs`."
-
-That last line is the interesting choice. The three executors are `pub` **within their module**
-(they need doc comments, `#[must_use]`, and public methods for `composer.rs`), but the re-export
-is `pub(crate)`, so the crate's external surface gains exactly one name. The alternative —
-exporting all four — would publish types whose contracts are only meaningful inside the drain
-(the `checkpoint`-payload hand-off, the anchor pinning, the accept-time commit protocol). Keeping
+That last line is the interesting choice. The three executors are `pub` **within their module**,
+because they need doc comments, `#[must_use]`, and public methods for `composer.rs`. The
+re-export is `pub(crate)`, so the crate's external surface gains exactly one name. Exporting all
+four would publish types whose contracts are only meaningful inside the drain: the
+checkpoint-payload hand-off, the anchor pinning, and the accept-time commit protocol. Keeping
 them crate-internal keeps those invariants enforceable by reading one file.
 
-`lib.rs`: `LocalComposeClients` joins the existing `#[doc(inline)] pub use local::{…}` list. One name
-added, nothing else touched.
+In `lib.rs`, `LocalComposeClients` joins the existing `#[doc(inline)] pub use local::{…}` list
+(`lib.rs:53-57`). One name added, nothing else touched.
 
 ---
 
@@ -1136,290 +1135,289 @@ added, nothing else touched.
 
 | Change | Before | After |
 |---|---|---|
-| L1 target execution path | direct call to the target with a computed proxy address forged as `msg.sender` (`session.rs` `build_tx_env`) | real frames: manager → `proxy.executeOnBehalf(target, 0, data)` → target, mirroring `EEZ._processNCalls` (`slot.rs:329-350`) |
-| Proxy existence | assumed; address computed, never deployed | `authorizedProxies` checked via the manager's own getter; missing → real permissionless `createCrossChainProxy` CREATE2 from the manager's frame (`slot.rs:290-313`) |
-| Escrow / value | `disable_balance_check = true` — value conjured, sim always paid | balance check ON; value drawn from the manager's real balance, short escrow fails at compose time (`slot.rs:203-208`) |
-| Frame gas | `disable_block_gas_limit = true`, 30M frames | clamped to the anchor block's gas limit (`frame_gas`, `slot.rs:225-227`); fixes the chiado 17M-limit poison-evict of every outbound tx |
-| L1 state lifetime | fresh `provider.latest()` per composition, post-state dropped at `finalize` | one `L1SlotState` pinned at drain start, advanced commit-or-drop per surviving tx (`slot.rs:78-157`) |
-| Target-session checkpoint | `Box::new(())`, rollback a no-op type check | real `CacheState` clone/restore; doubles as the drain's accept-time harvest payload (`slot.rs:399-411`) |
-| Inbound claim resolution | direct call to the target produced the claim; the delivery tx was verified only on-chain / at the proof signer | probe the canonical delivery on a fork of the Sync block, capture the real `EEZL2 → proxy` outcome, then run the canonical delivery for real — must succeed (`slot.rs:583-647`) |
-| Inbound nonce cursor | n/a | `delivery_nonce` advances per accepted delivery and rewinds with rollback via `ProbeSnapshot` (`slot.rs:469-474`, `663-677`) |
-| Reverting inbound target | claim recorded, failure surfaced later on-chain | poison at compose time, one eviction, drain continues (`slot.rs:619-625`) |
-| Top-frame inspection | n/a (no manager frame existed) | `SkipTopFrame` hides the outermost frame so the session inspector cannot re-dispatch the dispatch; nested proxy calls still recorded → shape-gated eviction (`slot.rs:414-450`) |
-| Nonce restore rationale | undo a bump on the forged proxy `msg.sender` to keep the CREATE2 slot fresh (EIP-684) | undo a bump on synthetic/contract senders only; the forged-sender hazard no longer exists (`slot.rs:452-465`) |
-| `simulate_source_tx` (trait) | opens latest, discards post-state | unchanged behavior; body now delegates to shared `source_sim` (`client.rs:315-350`) |
-| Source sim over a caller fork | did not exist | `simulate_source_tx_on` runs over caller-provided state + env and commits into it, so tx N+1 sees tx N (`client.rs:192-211`) |
+| L1 target execution path | direct call to the target with a computed proxy address forged as `msg.sender` (`session.rs` `build_tx_env`) | real frames: manager → `proxy.executeOnBehalf(target, 0, data)` → target, mirroring `EEZ._processNCalls` (`slot.rs:366-387`) |
+| Proxy existence | assumed; address computed, never deployed | `authorizedProxies` checked via the manager's own getter; missing → real permissionless `createCrossChainProxy` CREATE2 from the manager's frame (`slot.rs:307-348`) |
+| Escrow / value | `disable_balance_check = true` — value conjured, sim always paid | balance check ON; value drawn from the manager's real balance, short escrow fails at compose time (`slot.rs:238-243`) |
+| Frame gas | `disable_block_gas_limit = true`, 30M frames | clamped to the anchor block's gas limit (`frame_gas`, `slot.rs:257-262`); fixes the chiado 17M-limit poison-evict of every outbound tx |
+| L1 state lifetime | fresh `provider.latest()` per composition, post-state dropped at `finalize` | one `L1SlotState` pinned at drain start, advanced commit-or-drop per surviving tx (`slot.rs:105-192`) |
+| Target-session checkpoint | `Box::new(())`, rollback a no-op type check | real `CacheState` clone/restore; doubles as the drain's accept-time harvest payload (`slot.rs:441-453`) |
+| L1 frame commit on revert | n/a | committed only on success, so a revert cannot leak revm's `result.state` into the slot-shared world; the step-2 proxy creation still survives (`slot.rs:415-421`) |
+| Inbound claim resolution | direct call to the target produced the claim; the delivery tx was verified only on-chain / at the proof signer | probe the canonical delivery on a fork of the Sync block, capture the real `EEZL2 → proxy` outcome, then run the canonical delivery for real — must succeed (`slot.rs:612-669`) |
+| Inbound nonce cursor | n/a | `delivery_nonce` advances per accepted delivery and rewinds with rollback via `ProbeSnapshot` (`slot.rs:496-502`, `689-703`) |
+| Reverting inbound target | claim recorded, failure surfaced later on-chain | poison at compose time, one eviction, drain continues (`slot.rs:648-654`) |
+| Static call mode | refused as `Unavailable`, i.e. transient, so the tx re-queued forever | refused as `Encoding`, i.e. poison, so it evicts once (`slot.rs:359-364`) |
+| Top-frame inspection | n/a (no manager frame existed) | `SkipTopFrame` hides the outermost frame so the session inspector cannot re-dispatch the dispatch; nested proxy calls still recorded → shape-gated eviction (`slot.rs:456-492`) |
+| Nonce restore rationale | undo a bump on the forged proxy `msg.sender` to keep the CREATE2 slot fresh (EIP-684) | undo a bump on synthetic/contract senders only; the forged-sender hazard no longer exists (`local/mod.rs:40-56`) |
+| `simulate_source_tx` (trait) | on `ChainClient`; opened latest, discarded post-state | removed from the trait; source sim lives on the concrete entry client (`eez-protocol/src/executor.rs:95-109`) |
+| Source sim over a caller fork | did not exist | `simulate_source_tx_on` runs over caller-provided state + env and commits into it, so tx N+1 sees tx N (`client.rs:193-214`) |
 | Source-sim timing telemetry | five `timing.*_us` fields per call | removed — the field names described work the split function no longer does |
 | Client accessors | none | `chain_provider()`, `manager_address()`, `inspector_factory()`; `rollup_id()` proposed and audit-deleted (no callers) |
 | Crate surface | `local::{BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient, build_sync_block}` | plus `LocalComposeClients`; the three executors stay `pub(crate)` |
-
 
 ---
 
 # Part 3 — The drain rework
 
+The old drain simulated every held cross-chain tx on its own, against the same
+pre-slot state. So three `increment()` calls drained into one slot each recorded
+the claim "returns 1". The chain executes them as 1, 2, 3. Delivery #2 reverts
+`RollingHashMismatch` on-chain, the proof signer refuses the window, and the
+drain puts the same three transactions back at the front of the pool. The next
+slot fails identically. That is the freeze in issue #88.
 
-The drain used to simulate every held cross-chain tx in isolation against the
-same pre-slot state. Co-bundled order-dependent txs therefore recorded claims
-(returnData, and through it the rolling hash, and through *that* the entry
-identity) that real sequential execution contradicts. Concretely: three
-`increment()` calls drained into one slot all recorded `returnData = 1`; the
-chain executes them as `1, 2, 3`; delivery #2 reverts `RollingHashMismatch`
-on-chain; the proof signer refuses the window; the drain re-queues the same set
-at the FIFO front and the next slot fails identically — a freeze (issue #88).
-
-This file's half of the fix: the drain now keeps two slot-scoped worlds (the L1
-world pinned at the anchor, and the Sync block under construction), composes
-each tx on a *fork* of both, and — only on accept — appends the canonical txs to
-the block and commits the L1 effects to the world. The next composition sees its
-predecessors exactly as sequential execution will. Architecture:
-`docs/CHAINED-INTERSTATE-DESIGN.md`.
-
+This file holds half the fix. The drain now keeps two slot-scoped worlds: the
+local `l1_state` is the L1 world pinned at the anchor, and the local `draft` is
+the Sync block under construction. The drain composes each tx on a fork of both,
+and only on accept does it append the canonical txs to `draft` and commit the L1
+effects into `l1_state`. So each composition sees its predecessors exactly as
+sequential execution will. Architecture: `docs/CHAINED-INTERSTATE-DESIGN.md`.
 Walkthrough in file order.
 
 ---
 
 ## Hunk 1 (~L43) — imports
 
-Pulls in the new slot machinery: `L1SlotState`, `L1TargetSession`, `InboundL2TargetSession`,
-`build::SyncBlockState`. Mechanical.
+Pulls in the slot machinery: `L1SlotState`, `L1TargetSession`,
+`InboundL2TargetSession`, `build::SyncBlockState`. Mechanical.
 
 ## Hunk 2 (~L125) — `CrossChainWiring`: erased clients out, concrete handles in
 
-`entry_client` and `l2_entry_client` (both `Arc<dyn ChainClient>`) are replaced
-by one field:
+The two `Arc<dyn ChainClient>` fields `entry_client` and `l2_entry_client` go
+away, and one field replaces them.
 
 ```rust
 pub local: crate::local::LocalComposeClients,   // { l1_entry, l2_entry: Arc<LocalChainClient> }
 ```
 
-**Why:** the drain now needs surfaces the erased `ChainClient` trait does not
-expose — `L1SlotState::open`, `simulate_source_tx_on(.., state, env)`. Same
-instances that are registered in `rollups`; they share one overlay channel, so
-this is a second *view*, not a second client. It is a required field, not an
-`Option`: exactly one construction site exists
-(`eez-node/src/main.rs:697`) and it always has both.
+**Why:** the drain needs two surfaces the erased `ChainClient` trait does not
+expose, `L1SlotState::open` and `simulate_source_tx_on`. These are the same
+instances registered in `rollups`. They share one overlay channel, so this is a
+second *view*, not a second client. The field is required, not an `Option`:
+exactly one construction site exists, and it always has both
+(`eez-node/src/main.rs:697`).
 
 ## Hunk 3 (~L137) — `simulate_and_resolve` / `simulate_and_resolve_recorded_for` deleted, `compose_chained` added
 
-Both `CrossChainWiring` methods are gone, replaced by a free function
-`compose_chained(cc, entry_rollup_id, entry_client, raw_tx, sessions,
-source_state, source_env)`. Same pipeline (reset overlays → build the `Rollup`
-map → source-sim through the `CompositionBuilder` → `finalize`), three
-differences:
+Both `CrossChainWiring` methods are gone. A free function replaces them
+(`crates/eez-composer/src/composer.rs:175`):
 
-1. **Sessions are pre-seeded by the caller**, via the existing
-   `CompositionBuilder::with_sessions`. Tx N's target-side execution therefore
-   runs on a context that already contains tx N-1's accepted effects. Before,
-   every dispatch lazily opened a session at `provider.latest()`.
-2. **Source simulation runs on a caller-provided fork state + env**
-   (`simulate_source_tx_on`) instead of `provider.latest()`. So the *inputs* to
-   the claim are sequential too — a state-dependent call *argument* is as
-   fatal as a state-dependent return value (it changes the entry hash), which
-   is why both halves had to move.
-3. **Sessions are taken back before `finalize` and returned to the caller**:
+```rust
+compose_chained(cc, entry_rollup_id, entry_client, raw_tx, sessions, source_state, source_env)
+```
 
-   ```rust
-   let sessions = builder.take_sessions();   // before finalize consumes the builder
-   ```
+The pipeline is the same: reset the overlays, build the `Rollup` map, source-sim
+through the `CompositionBuilder`, then `finalize`. Three things differ.
 
-   This is the commit-or-drop seam. The accepted effects live in the sessions,
-   not in the `Composition`, so the caller commits them on accept and simply
-   *drops* them on eviction. No rollback machinery is needed because a
+1. **The caller pre-seeds the sessions**, via the existing
+   `CompositionBuilder::with_sessions`. So tx N's target-side execution runs on a
+   context that already holds tx N-1's accepted effects. Before: every dispatch
+   lazily opened a session at `provider.latest()`. After: the caller owns the
+   session and hands it in.
+2. **Source simulation runs on a caller-provided fork state and env**, through
+   `simulate_source_tx_on`, so the *inputs* to the claim are sequential too. A
+   state-dependent call *argument* is as fatal as a state-dependent return value,
+   because it changes the entry hash. Hence both halves had to move.
+3. **Sessions are taken back and returned to the caller**, via
+   `let sessions = builder.take_sessions();` before `finalize` consumes the
+   builder. This is the commit-or-drop seam. The accepted effects live in the
+   sessions, not in the `Composition`. The caller commits them on accept and
+   simply *drops* them on eviction. No rollback machinery is needed, because a
    non-survivor never touched shared state.
 
-New loud check, between `take_sessions` and `finalize`: if a session came back
-for a rollup that was never seeded (and is not the entry chain — entry-chain
-sessions are legitimate, overlay re-entry opens them there), it errors out. That
-means the dispatch opened a lazy session and ran **unchained**, off this slot's
-worlds — silently regressing to exactly the bug being fixed. Today it is
-unreachable; it can only fire once a third rollup is wired without a slot
-session. It is raised as `ExecutorErrorKind::Unavailable`, which
-`sim_error_is_poison` (L408) classifies **transient**: a wiring gap is not the
-transaction's fault, so the slot aborts and retries rather than evicting a
-user's tx.
+There is a new loud check between `take_sessions` and `finalize`. A session that
+comes back for a rollup nobody seeded is an error (`composer.rs:228`). Entry-chain
+sessions are exempt, because overlay re-entry legitimately opens one there. Any
+other unseeded session means the dispatch opened a lazy one and ran **unchained**,
+off this slot's worlds — the bug being fixed, silently. It is unreachable today,
+and can only fire once a third rollup is wired without a slot session. The error
+is `ExecutorErrorKind::Unavailable`, which `sim_error_is_poison` classifies
+**transient** (`composer.rs:408`). A wiring gap is not the transaction's fault, so
+the slot aborts and retries rather than evicting a user's tx.
 
-Helpers added alongside: `type SlotSessions` and `seed_session()` — every drain
-composition seeds exactly one target chain.
-
-The `#[tracing::instrument]` span is carried over onto `compose_chained`
-(`skip_all`, fields `tx_len` + `entry_rollup_id`); the log line loses its
-`simulate_and_resolve:` prefix.
-
-*Nit (out of scope for this file, worth a follow-up):* two stale doc references
-to `simulate_and_resolve` survive at `held_pool.rs:35` and `optimistic.rs:43`.
+Two helpers land alongside: `type SlotSessions` and `seed_session`
+(`composer.rs:147`). Every drain composition seeds exactly one target chain. The
+`#[tracing::instrument]` span carries over onto `compose_chained`, with
+`skip_all` and fields `tx_len` + `entry_rollup_id`. The log line loses its
+`simulate_and_resolve:` prefix. *Nit, since resolved:* the two stale doc
+references to `simulate_and_resolve` in `held_pool.rs` and `optimistic.rs` are
+gone from the current tree.
 
 ## Hunk 4 (~L267) — `MAX_BUNDLE_ATTEMPTS` doc rewrite, and the gas reserve becomes configurable
 
 Two unrelated things in one hunk.
 
 **(a) `MAX_BUNDLE_ATTEMPTS` doc.** The old text documented drain-time isolation
-as a KNOWN LIMITATION — "a state-dependent tx whose prerequisite is co-bundled
-in the same slot deterministically diverges from real execution and drops here
-after the retry budget". That limitation is what this branch removes. The new
-text says what the bound actually backstops now: L1 state that moves between
-compose time and the bundle's inclusion block. Doc-only; the value is still 3.
+as a KNOWN LIMITATION: a state-dependent tx whose prerequisite is co-bundled in
+the same slot diverges from real execution and drops after the retry budget.
+This branch removes that limitation. The new text says what the bound actually
+backstops now: L1 state that moves between compose time and the bundle's
+inclusion block. Doc-only. The value is still 3.
 
-**(b) `POST_BATCH_EXECUTION_GAS_RESERVE` → `DEFAULT_…` + accessor.** (This half
-is the unstaged addition, made after live chiado testing.)
+**(b) `POST_BATCH_EXECUTION_GAS_RESERVE` → `DEFAULT_…` plus an accessor**
+(`composer.rs:295`):
 
 ```rust
 fn post_batch_execution_gas_reserve() -> u64 {   // OnceLock, reads EEZ_POSTBATCH_GAS_RESERVE
 ```
 
-**Why:** measured on chiado, queueing ONE deferred entry inside
-`postAndVerifyBatch` costs ~240k gas (a 3-entry batch bills 841k against ~126k
-for a minimal one). A 24-effect postBatch therefore needs ~6M of execution
-*above* the calldata floor. The fixed 4M reserve made the postBatch revert
-out-of-gas **inside the block builder's bundle simulation**, and rbuilder drops
-such bundles silently — the only symptom is "pinned slot built without
-inclusion".
+**Why:** queueing ONE deferred entry inside `postAndVerifyBatch` costs ~240k gas
+on chiado. A 3-entry batch bills 841k against ~126k for a minimal one. So a
+24-effect postBatch needs ~6M of execution *above* the calldata floor. The fixed
+4M reserve made the postBatch revert out-of-gas inside the block builder's bundle
+simulation, and rbuilder drops such bundles silently. The only symptom is "pinned
+slot built without inclusion".
 
-**Before → After:** 24 effects, reserve 4M → postBatch is undersized, the whole
-bundle is dropped with no on-chain trace, forever. With
-`EEZ_POSTBATCH_GAS_RESERVE=8000000` the same 24-effect batch settles. Default is
-unchanged at 4M, so nothing moves unless the operator sets the env var. Read
-once via `OnceLock`.
-
-The durable fix (derive the reserve from the batch's entry count) is noted in
-the design doc §8.3, not done here.
+**Before:** 24 effects at a 4M reserve undersize the postBatch, so the whole
+bundle is dropped with no on-chain trace, forever. **After:**
+`EEZ_POSTBATCH_GAS_RESERVE=8000000` lets the same 24-effect batch settle. The
+default is still 4M, so nothing moves unless the operator sets the env var, and
+the value is read once via `OnceLock`. The durable fix derives the reserve from
+the batch's entry count; design doc §8.3 notes it, and it is not done here.
 
 ## Hunk 5 (~L384) — `clamp_max_postbatch_gas`: `MIN_VIABLE` const → `let`
 
-Forced by the previous hunk: the reserve is no longer a `const`, so
-`const MIN_VIABLE = RESERVE + 21_000` becomes a `let`. Same arithmetic, same
-clamping behavior — except the floor now moves with the env var, which is the
-point (an 8M reserve must not let a 5M `EEZ_MAX_POSTBATCH_GAS` through).
+The previous hunk forces this. The reserve is no longer a `const`, so
+`const MIN_VIABLE = RESERVE + 21_000` becomes `let min_viable`
+(`composer.rs:387`). Same arithmetic, same clamping. The floor now moves with the
+env var, which is the point: an 8M reserve must not let a 5M
+`EEZ_MAX_POSTBATCH_GAS` through.
 
 ## Hunk 6 (~L393) — reserve in the clamp-failure event + doc reference rename
 
 The `reserve = …` field on the out-of-range ERROR event reads the accessor.
-`sim_error_is_poison`'s doc now names `compose_chained`. Mechanical.
+`sim_error_is_poison`'s doc comment now names `compose_chained`. Mechanical.
 
 ## Hunk 7 (~L547) — five new drain helpers
 
-All private, all small:
+All private, all small (`composer.rs:553-624`):
 
 - **`restore_pool_order(Vec<(usize, HeldTx)>) -> Vec<HeldTx>`** — sorts by drain
-  index and drops it. Necessary because the drain now partitions into two
-  direction phases; without this, any re-queue would hand the pool back a
-  permutation of what it dealt out (all outbound before all inbound), silently
-  reordering the FIFO.
+  index, then drops it. The drain now partitions into two direction phases.
+  Without this helper, any re-queue would hand the pool back a permutation of
+  what it dealt out, all outbound before all inbound, silently reordering the
+  FIFO.
 - **`abort_rest(failing, rest_of_phase, other_phase)`** — assembles everything a
-  transient abort still owes the pool: the failing tx (absent when it was
-  already evicted as poison), the remainder of the current phase, and the whole
-  untouched other phase. Replaces the old inline
-  `let mut rest = vec![held]; rest.extend(iter.by_ref()…)` idiom, which no
-  longer covers the second phase.
-- **`append_and_execute(&mut SyncBlockState, &[Bytes]) -> Option<(usize, String)>`** —
-  appends txs to the block-in-progress, stopping at the first that reverts or
-  fails to execute. `Some((position, why))` means the block is **half-extended**
-  and must be reopened.
+  transient abort still owes the pool: the failing tx, the remainder of the
+  current phase, and the whole untouched other phase. The failing tx is absent
+  when it was already evicted as poison. This replaces the old inline
+  `let mut rest = vec![held]; rest.extend(iter.by_ref()…)` idiom, which no longer
+  covers the second phase.
+- **`append_and_execute(&mut SyncBlockState, &[Bytes]) -> Option<(usize, BuildError)>`** —
+  appends txs to the block-in-progress via `execute_tx`, stopping at the first
+  `TxOutcome` that is not a success. `Some((position, why))` means the block is
+  **half-extended** and must be reopened. `why` is a `BuildError`, not a string,
+  so the caller can tell a rejected tx from an unreachable backing store.
 - **`take_l1_cache(&mut SlotSessions, rollup_id)`** — removes the L1 session,
-  `checkpoint()`s it, downcasts to `revm::database::CacheState`. The payload
-  shape is pinned by contract in `L1TargetSession`'s doc comment
-  (`local/slot.rs:164-170`); this is the one place that depends on it, and it
-  errors rather than assumes.
-- **`truncated_hex`** — first 32 bytes of a revert payload for event messages.
+  calls `checkpoint()`, then downcasts to `revm::database::CacheState`. The
+  payload shape is pinned by contract in `L1TargetSession::checkpoint`
+  (`local/slot.rs:441`). This is the one place depending on it, and it errors
+  rather than assumes.
+- **`truncated_hex`** — first 32 bytes of a revert payload, for event messages.
 
 ## Hunk 8 (~L1156) — `Box::pin` at the single call site
 
-`compose_cross_chain_batch(...)` is now boxed before `.await`. The drain holds
-two live execution contexts (the L1 world and the prefix state), which pushed
-the future past clippy's `large_futures` 16KB bound. No behavior change.
+`compose_cross_chain_batch(...)` is now boxed before `.await`
+(`composer.rs:1168`). The drain holds two live execution contexts, the L1 world
+and the block prefix. That pushed the future past clippy's `large_futures` 16KB
+bound. No behavior change.
 
 ## Hunk 9 (~L1535) — `compose_cross_chain_batch` doc comment
 
-Reworded: "simulate each drained transaction" → "compose the drained
-transactions in canonical order over the slot's chained execution contexts"; the
+Reworded. "Simulate each drained transaction" becomes "compose the drained
+transactions in canonical order over the slot's chained execution contexts". The
 cadence note now says each per-tx `finalize` is seeded with the slot's live
 sessions. Doc-only.
 
 ## Hunk 10 (~L1586) — the drain's header comment
 
 The old comment described the two-path optimistic split plus "simulate each held
-tx independently". Rewritten to describe the two-phase chained drain and the
-per-tx accept/evict protocol. Doc-only, but it is the map for everything below,
-so worth reading in the file rather than the diff.
+tx independently". It now describes the two-phase chained drain and the per-tx
+accept/evict protocol. Doc-only, but it is the map for everything below, so read
+it in the file rather than the diff.
 
 ## Hunk 11 (~L1638) — slot execution contexts, and the drain's new bookkeeping
 
-The substantive setup. Placement matters and is deliberate: this sits **after**
-the empty-drain early return and **after** the stale-nonce partition, so the
-common empty-drain slot opens no state at all, and the degrade path below
-re-queues exactly the post-stale set (stale txs have already been released).
+This is the substantive setup, and its placement is deliberate. It sits *after*
+the empty-drain early return and *after* the stale-nonce partition
+(`composer.rs:1648`). So a common empty-drain slot opens no state at all, and the
+degrade path below re-queues exactly the post-stale set, because stale txs are
+already released.
 
 ```rust
 let reopen = |txs: &[Bytes]| SyncBlockState::open(l2_dyn.clone(), …, txs);
 let slot_ctx = L1SlotState::open(&local.l1_entry).and_then(|world| reopen(&[]).map(…));
 ```
 
-- `reopen` **rebuilds from the accepted tx list**, it does not restore a cached
+- `reopen` **rebuilds from the accepted tx list**; it does not restore a cached
   state. That is what keeps the prefix provably equal to the block the canonical
-  rebuild produces — the keystone assert (hunk 18) would otherwise be comparing
-  the block against a cache that drifted.
-- Failure to open either context is transient: nothing has been consumed, so the
-  whole (post-stale) drain goes back via `push_front_batch` and the slot degrades
-  to a minimal postBatch. New event `eez.composer.phase2.slot_setup_failed`.
+  rebuild produces. Otherwise the keystone check (hunk 18) would compare the
+  block against a cache that drifted.
+- Failing to open either context is transient. Nothing has been consumed, so the
+  whole post-stale drain goes back via `push_front_batch` and the slot degrades
+  to a minimal postBatch. New event: `eez.composer.phase2.slot_setup_failed`.
 - Success emits `eez.composer.phase2.slot_anchored` with the pinned L1 anchor
-  number + hash — the one line that tells you which L1 base every claim in this
-  slot was computed against.
+  number and hash. That is the one line telling you which L1 base every claim in
+  this slot was computed against.
 
 Three new pieces of state:
 
 - `sync_txs: Vec<Bytes>` — the Sync block's txs in canonical order, exactly as
   accepted. This is both what the prefix is rebuilt from and what the keystone
-  assert compares against.
+  check compares against.
 - `system_txs_appended: u64` — a **single** SYSTEM_ADDRESS nonce cursor. It
-  replaces two counters that were only ever summed at use sites, which is a
-  forgot-one-term bug waiting to happen. It reproduces the canonical builder's
-  two-phase allocation (outbound loads `N..N+K-1`, then inbound deliveries
-  `N+K..`) **by construction**, because phase 1 runs to completion before phase
-  2 starts. Note it counts *system* txs, not block txs: an accepted outbound
-  contributes 2 block txs (`load`, `user`) but only 1 nonce, which is why the
-  increment uses `pairs_k.len()` and not `pair_txs.len()`.
-- `survivors: Vec<(usize, HeldTx)>` — drain indices ride along so re-queues can
-  restore pool order across the two phases.
+  replaces two counters that were only ever summed at use sites, a forgot-one-term
+  bug waiting to happen. It reproduces the canonical builder's two-phase
+  allocation by construction: outbound loads take `N..N+K-1`, then inbound
+  deliveries take `N+K..`. That holds because phase 1 runs to completion before
+  phase 2 starts. Note it counts *system* txs, not block txs. An accepted
+  outbound contributes 2 block txs, `load` and `user`, but only 1 nonce. Hence
+  the increment uses `pairs_k.len()` and not `pair_txs.len()`.
+- `survivors: Vec<(usize, HeldTx)>` — drain indices ride along, so a re-queue
+  can restore pool order across the two phases.
 
 ## Hunk 12 (~L1733) — transient payload type, and the two-phase partition
 
-`transient` becomes `Option<(String, Vec<(usize, HeldTx)>)>` (indices). Then:
+`transient` becomes `Option<(String, Vec<(usize, HeldTx)>)>`, carrying indices.
+Then:
 
 ```rust
 let (outbounds, mut inbounds) = drained.into_iter().enumerate()
     .partition(|(_, held)| held.direction == Direction::Outbound);
 ```
 
-**Why this order, not drain order:** it is the real execution order on both
-chains. On L2 the Sync block is `[load_0, user_0, …, deliver_0, …]` per
-`build_cross_chain_sync_pairs`; on L1 the postBatch's inline outbound executions
+**Why this order, and not drain order:** it is the real execution order on both
+chains. On L2 the Sync block is `[load_0, user_0, …, deliver_0, …]`, per
+`build_cross_chain_sync_pairs`. On L1 the postBatch's inline outbound executions
 run inside `postAndVerifyBatch`, which precedes the bundle's inbound user txs.
-Composing in that order is what makes the chained state real rather than
-plausible.
+Composing in that order is what makes the chained state real rather than plausible.
 
-Safety of the partition: a sender's nonce chain is never reordered, because the
-two directions live on different chains, and poison-gap bookkeeping is keyed per
-`(sender, direction)`.
+The partition is safe for nonces. A sender's nonce chain is never reordered,
+because the two directions live on different chains, and poison-gap bookkeeping is
+keyed per `(sender, direction)`.
 
 ## Hunk 13 (~L1770) — PHASE 1, outbound (L2→L1)
 
-The old outbound arm (an `if held.direction == Outbound { … } continue;` inside
-one loop) becomes its own `while let Some((idx, held)) = out_iter.next()` loop.
-The poison-gap pre-check at the top is unchanged (now duplicated, once per
-phase).
+The old outbound arm was an `if held.direction == Outbound { … } continue;`
+inside one loop. It is now its own `while let Some((idx, held)) = out_iter.next()`
+loop (`composer.rs:1764`). The poison-gap pre-check at the top is unchanged, and
+now appears once per phase.
 
-**Contexts.** Per tx: an `L1TargetSession` over a clone of the L1 world cache
-(this replays real `EEZ._processNCalls` frames — proxy auto-creation, escrow
-value drawn from EEZ's balance) plus a `draft.fork()` of the block. The source
-sim runs the user tx on the L2 prefix fork through `local.l2_entry` (the L2
-follower client errors `Unavailable` for source sim, hence the entry client).
-Failure to build either context is transient → abort with `abort_rest(Some(this),
-&mut out_iter, mem::take(&mut inbounds))`.
+**Contexts.** Per tx the drain opens an `L1TargetSession` over a clone of the L1
+world cache. That replays real `EEZ._processNCalls` frames, including proxy
+auto-creation and escrow value drawn from EEZ's balance. Alongside it sits the
+`SyncBlockFork` from `draft.fork()`. The source sim runs the user tx on that L2
+fork through `local.l2_entry`, because the L2 follower client errors `Unavailable`
+for source sim. Failing to build either context is transient, so the drain aborts
+with `abort_rest(Some(this), &mut out_iter, mem::take(&mut inbounds))`.
 
-**Unchanged gates**, kept in the same order and still evicting: zero L1 entries
+**Unchanged gates**, in the same order, still evicting: zero L1 entries
 (`outbound_no_entries`), more than one entry per tx
-(`outbound_multicall_unsupported`), missing ether-out, over-escrow. The only
-edit is the comment naming `check_entry_shape` instead of `reject_multicall`.
+(`outbound_multicall_unsupported`), missing ether-out, and over-escrow. Two edits.
+A comment now names `check_entry_shape` instead of `reject_multicall`. And the
+escrow *debit* moved to accept, while the *check* stays here as the cheap early
+rejection: a tx evicted in between never draws the escrow down on L1, so a budget
+reduced for it would wrongly evict later legitimate withdrawals
+(`composer.rs:1955`).
 
 **New: the ACCEPT block.** This is the heart of the hunk.
 
@@ -1433,58 +1431,59 @@ system_txs_appended += pairs_k.len() as u64;
 match take_l1_cache(&mut sessions, cc.entry_rollup_id) { Ok(cache) => l1_state.cache = cache, … }
 ```
 
-Four things to notice:
+Four things to notice.
 
-1. **`build_outbound_pair` runs `check_entry_shape` itself**, so an entry the
-   Sync-block lowering cannot represent (multi-call, nested, unsuccessful,
-   static/revert-span/explicit-gas) comes back as its `Err` and evicts **this
-   tx** — event `cc_compose.shape_evicted`.
-   **Before → After:** the same bad shape used to sail through the drain and
-   blow up post-drain inside `build_cross_chain_sync_pairs`, which re-queued
-   *all* survivors and degraded the slot (`phase2.sync_pairs_failed`). Next slot
-   drained the same set and failed the same way: a freeze vector. Now one tx is
-   evicted and the other survivors still settle.
+1. **`build_outbound_pair` runs `check_entry_shape` itself.** So an entry the
+   Sync-block lowering cannot represent comes back as its `Err` and evicts
+   **this tx**, via `cc_compose.shape_evicted`. Unsupported shapes are multi-call,
+   nested, unsuccessful, static, revert-span, and explicit-gas.
+   **Before:** the same bad shape sailed through the drain and blew up post-drain
+   inside `build_cross_chain_sync_pairs`, which re-queued *all* survivors and
+   degraded the slot with `phase2.sync_pairs_failed`. The next slot drained the
+   same set and failed the same way, which is a freeze vector. **After:** one tx
+   is evicted and the other survivors still settle.
 2. **The append is a real receipt check.** If `[load, user]` does not execute on
-   the block prefix, the tx is evicted (`cc_compose.append_reverted`) — it can
-   never have landed on-chain either.
-3. **The prefix is reopened from `sync_txs` on append failure**, because a failed
-   `append_and_execute` may be half-applied (the load succeeded, the user tx reverted).
-   Rebuilding from the accepted list is the only truth. If the rebuild itself
-   fails, that is transient → abort.
-4. **Block first, world second.** `l1_state.cache` is only overwritten after the
+   the block prefix, the tx is evicted via `cc_compose.append_reverted`; it could
+   never have landed on-chain either. One carve-out: if `why.is_provider()` the
+   failure says nothing about the tx, so the slot aborts transiently instead of
+   evicting a valid pair (`composer.rs:1912`).
+3. **The prefix is reopened from `sync_txs` on append failure.** A failed
+   `append_and_execute` may be half-applied, with the load succeeding and the user
+   tx reverting. Rebuilding from the accepted list is the only truth. If the
+   rebuild itself fails, that is transient and the drain aborts.
+4. **Block first, world second.** `l1_state.cache` is only overwritten once the
    pair is safely in the block. A tx evicted at append leaves the L1 world
-   byte-identical to before it was tried. If the session hand-off is what fails
-   (`cc_compose.l1_session_lost`, ERROR), the slot cannot chain L1 any more and
-   aborts transiently — the block built so far is discarded wholesale by the
-   minimal path, so the fact that the pair is in `sync_txs` but not in
+   byte-identical to before it was tried. If the session hand-off is what fails,
+   the drain logs `cc_compose.l1_session_lost` at ERROR and aborts transiently,
+   because the slot cannot chain L1 any more. The minimal path then discards the
+   block built so far wholesale, so the pair sitting in `sync_txs` but not in
    `pending_out` at that instant is inert.
 
-Staging afterwards is unchanged (`pending_out`, `outbound_entries`, deliberately
-NOT `survivor_comps`), except `pending_out.push` is now a single push of
-`l1_entries[0]` rather than a loop over `l1_entries` — equivalent, since
-`len() > 1` was evicted above — and `survivors.push((idx, held))`.
-
-The poison/transient arms below are unchanged in classification; the transient
-one just uses `abort_rest` and renames the error prefix to `compose_chained
-outbound tx#…`.
+Staging afterwards is unchanged. It fills `pending_out` and `outbound_entries`,
+and deliberately NOT `survivor_comps`. Two edits: `pending_out.push` is now a
+single push of `l1_entries[0]` rather than a loop, equivalent because `len() > 1`
+was evicted above; and `survivors.push((idx, held))` records the index. The
+poison and transient arms below keep their classification, and the transient one
+just uses `abort_rest` and renames the error prefix to `compose_chained outbound
+tx#…`.
 
 ## Hunk 13 cont. (~L2035) — PHASE 2, inbound (L1→L2)
 
-Mirror image. Source sim runs the L1 user tx on a fork of the world
-(`l1_state.fork_state`); the L2 side is an `InboundL2TargetSession` over
-`draft.fork()`, seeded with the current delivery nonce cursor, which builds the
-canonical delivery, executes it on the fork, and reads the claim off the real
-`EEZL2 → proxy` frame.
+This is the mirror image (`composer.rs:2033`). The source sim runs the L1 user tx
+on a fork of the world, via `l1_state.fork_state`. The L2 side is an
+`InboundL2TargetSession` over `draft.fork()`, seeded with the current delivery
+nonce cursor. It builds the canonical delivery, executes it on the fork, and
+reads the claim off the real `EEZL2 → proxy` frame.
 
 ```rust
 let inbounds = if transient.is_some() { Vec::new() } else { inbounds };
 ```
 
-This guard is **provably redundant today** — all four phase-1 abort paths call
+This guard is **provably redundant today**. All four phase-1 abort paths call
 `std::mem::take(&mut inbounds)`, so the vector is already empty. It is kept
 deliberately as a 5-line belt: a future phase-1 abort path that forgets its
-`mem::take` would otherwise double-queue every inbound tx (once via `abort_rest`,
-once by falling into phase 2).
+`mem::take` would otherwise double-queue every inbound tx, once via `abort_rest`
+and once by falling into phase 2.
 
 **New shape gate at accept, both halves:**
 
@@ -1493,46 +1492,48 @@ target_entries.iter().try_for_each(|e| check_entry_shape(e, "inbound"))
     .and_then(|()| /* source entries with non-empty expectedL1ToL2Calls → Err */)
 ```
 
-Target-side shape first, then a scan of the *source* composition's entries for
-nested `expectedL1ToL2Calls` recordings. Nested composition is parked, so a
-nested recording is this tx's problem, not the slot's → evict
-(`cc_compose.shape_evicted`). Because of the `and_then`, a tx malformed on both
+Target-side shape runs first. Then the gate scans the *source* composition's
+entries for nested `expectedL1ToL2Calls` recordings. Nested composition is parked,
+so a nested recording is this tx's problem, not the slot's, and the tx is evicted
+via `cc_compose.shape_evicted`. Because of the `and_then`, a tx malformed on both
 halves reports the target-side error.
 
-**Delivery construction is now per-tx** (`build_inbound_system_txs` at
-`nonce + system_txs_appended`) with two eviction arms: an `Err` (shape rejected),
-and the odd case where every entry was skipped as foreign — impossible for
-own-rollup targets, so evict loudly rather than append nothing.
+**Delivery construction is now per-tx.** It calls `build_inbound_system_txs` at
+`nonce + system_txs_appended`, with two eviction arms: an `Err`, meaning the shape
+was rejected, and the odd case where every entry was skipped as foreign. The latter
+is impossible for own-rollup targets, so the drain evicts loudly rather than
+appending nothing.
 
 **The append is the verifier.** The appended delivery re-runs the exact
-`RollingHashMismatch` compare that used to explode at the proof signer.
+`RollingHashMismatch` compare that used to explode at the proof signer. The same
+`why.is_provider()` carve-out applies here: a backing-store failure aborts the
+slot instead of evicting a valid delivery (`composer.rs:2160`).
 
-**Before → After (the #88 example):** three co-bundled `increment()` calls. Old
-path: all three record `returnData = 1`, all three deliveries go into the block
-unchecked, the signer sees delivery #2 reverted, refuses the window, the drain
-re-queues all three, next slot repeats — permanent freeze. New path: tx#1's
-probe runs on a fork of the block that already contains tx#0's delivery, so it
-records `2`, and tx#2 records `3`; the block is signed. And if a claim ever
-*were* wrong, the append reverts and costs that ONE tx an eviction instead of
-freezing the slot.
+**Before → After, on the #88 example.** Before: three co-bundled `increment()`
+calls all record `returnData = 1`, all three deliveries enter the block
+unchecked, the signer sees delivery #2 reverted and refuses the window, the drain
+re-queues all three, and the next slot repeats forever. After: tx#1's probe runs
+on a fork of the block that already contains tx#0's delivery, so it records `2`,
+tx#2 records `3`, and the block is signed. And if a claim ever *were* wrong, the
+append reverts and costs that ONE tx an eviction instead of freezing the slot.
 
 Then, in this order: `system_txs_appended += deliveries.len()`,
-`sync_txs.extend(deliveries)`, and finally `l1_state.cache = l1_fork.cache` —
-the source fork's committed writes become the world so later inbound sims see
-their predecessors. Same block-first/world-second discipline as phase 1. The
-returned sessions are dropped (`_sessions`): the probe's fork is throwaway; only
+`sync_txs.extend(deliveries)`, and finally `l1_state.cache = l1_fork.cache`. The
+source fork's committed writes become the world, so later inbound sims see their
+predecessors. Same block-first, world-second discipline as phase 1. The returned
+sessions are dropped as `_sessions`, because the probe's fork is throwaway; only
 the canonical delivery, appended to the real prefix, counts.
 
 ## Hunk 14 (~L2171) — event message wording + `survivors.push((idx, held))`
 
-`"simulate_and_resolve produced {target_count} target(s)"` →
+`"simulate_and_resolve produced {target_count} target(s)"` becomes
 `"composition produced …"`. Mechanical.
 
 ## Hunk 15 (~L2193) — inbound transient arm
 
-Uses `abort_rest(Some((idx, held)), &mut in_iter, Vec::new())` (phase 2 is last,
-so there is no other phase to hand back) and renames the error prefix. Same
-classification as before.
+It uses `abort_rest(Some((idx, held)), &mut in_iter, Vec::new())`. Phase 2 is
+last, so there is no other phase to hand back. The error prefix is renamed.
+Classification is unchanged.
 
 ## Hunk 16 (~L2235) — restore pool order in the transient re-queue
 
@@ -1540,11 +1541,11 @@ classification as before.
 let mut requeue = restore_pool_order(requeue);
 ```
 
-**Before → After:** with a drain of `[in_A, out_B, in_C]`, the old code
-re-queued in drain order. Without this line the new code would re-queue
-`[out_B, in_A, in_C]` — the pool's FIFO permanently reshuffled by an
-implementation detail of the drain. Now the pool gets its own order back. The
-poison-cascade `retain` below is unchanged.
+**Before:** a drain of `[in_A, out_B, in_C]` was re-queued in drain order,
+trivially. **After:** without this line the new code would re-queue
+`[out_B, in_A, in_C]`, permanently reshuffling the pool's FIFO to match an
+implementation detail of the drain. With it, the pool gets its own order back, and
+the poison-cascade `retain` below is unchanged.
 
 ## Hunk 17 (~L2295) — restore pool order for survivors, post-drain
 
@@ -1552,13 +1553,13 @@ poison-cascade `retain` below is unchanged.
 let survivors: Vec<HeldTx> = restore_pool_order(survivors);
 ```
 
-Same reason, for the success path: past the drain, survivors are only ever used
-for re-queue on a degrade, and the pool is owed its own order. Note this is
-purely about the *pool*; the block's order is fixed by `pending_out` /
-`pending_in`, which are already in canonical order. The comment above the
-canonical builder is reworded "Build" → "Rebuild".
+Same reason, on the success path. Past the drain, survivors are only ever used for
+a re-queue on degrade, and the pool is owed its own order. This is purely about
+the *pool*: the block's order is fixed by `pending_out` and `pending_in`, which
+are already canonical. The comment above the canonical builder is reworded from
+"Build" to "Rebuild".
 
-## Hunk 18 (~L2336) — THE KEYSTONE ASSERT
+## Hunk 18 (~L2336) — THE KEYSTONE CHECK
 
 ```rust
 let canonical = interleave_sync_block_txs(&pairs);
@@ -1566,50 +1567,51 @@ if canonical != sync_txs { … ERROR + degrade … }
 ```
 
 The block this drain appended tx-by-tx must be byte-equal to what
-`build_cross_chain_sync_pairs` + `interleave_sync_block_txs` reconstructs from
-the same entries — the same rebuild the deriver and the proof signer perform.
-This is the single tie between the incremental construction and the canonical
-one, and the reason it holds by construction is that both sides go through
-`build_outbound_pair` / `build_inbound_system_txs` with the same nonce
+`build_cross_chain_sync_pairs` plus `interleave_sync_block_txs` reconstructs from
+the same entries. That is the same rebuild the deriver and the proof signer
+perform. This is the single tie between the incremental construction and the
+canonical one, and it holds by construction: both sides go through
+`build_outbound_pair` and `build_inbound_system_txs` with the same nonce
 allocation.
 
-Inequality is a **composer bug, never bad input**, so it does not evict anyone:
-loud ERROR (`phase2.canonical_mismatch`, with `first_divergent` index), re-queue
-survivors, degrade to minimal. Posting a block nobody else can rebuild would be
-strictly worse than posting nothing.
+Inequality is a **composer bug, never bad input**, so it evicts nobody. The drain
+logs `phase2.canonical_mismatch` at ERROR with a `first_divergent` index,
+re-queues survivors, and degrades to minimal. Posting a block nobody else can
+rebuild would be worse than posting nothing. Note `sync_txs` is no longer computed
+here; it is the drain's accumulator now, which is exactly what makes the
+comparison meaningful.
 
-Note `sync_txs` is no longer computed here — it is now the drain's accumulator,
-which is exactly what makes the comparison meaningful.
-
-## Hunk 19 (~L2410) — belt: every final receipt must be success
+## Hunk 19 (~L2410) — belt: every final receipt must be a success
 
 ```rust
 if let Some(first_failed) = built.tx_successes.iter().position(|s| !s) { … ERROR + degrade … }
 ```
 
 Every tx in the block was already receipt-verified on the very prefix
-`build_sync_block` re-executes, so this should be unreachable; if it fires, the
+`build_sync_block` re-executes, so this should be unreachable. If it fires, the
 block and the prefix disagree. Nothing in this failure class may reach the proof
-signer, so: `phase2.final_receipt_failed` (ERROR), re-queue, degrade.
+signer, so the drain logs `phase2.final_receipt_failed` at ERROR, re-queues, and
+degrades.
 
-**Before → After:** previously a reverted system tx in the built Sync block was
-not inspected here at all — it went out, and the proof signer rejected the
-window (the #88 tail). Now it never leaves the composer. Depends on
-`tx_successes` being surfaced from `build_sync_block` (`local/build.rs`).
+**Before:** a reverted system tx in the built Sync block was not inspected here at
+all, so it went out and the proof signer rejected the window — the #88 tail.
+**After:** it never leaves the composer, given `tx_successes` surfaced from
+`build_sync_block` (`local/build.rs:90`).
 
 ## Hunk 20 (~L3310) and Hunk 21 (~L3589) — reserve accessor at the two sizing sites
 
-`emission candidate sizing` and `sign_post_batch_tx`'s `gas_limit` both call
-`post_batch_execution_gas_reserve()` instead of reading the const. This is where
-the env override actually reaches the wire.
+Emission-candidate sizing and `sign_post_batch_tx`'s `gas_limit` both call
+`post_batch_execution_gas_reserve()` instead of reading the const
+(`composer.rs:3349`, `composer.rs:3629`). This is where the env override reaches
+the wire.
 
 ## Hunk 22–23 (~L3750, ~L3763) — `clamp_max_postbatch_gas` tests
 
-The test's `min_viable` and the "budget at or below the reserve" case now call
-the accessor. Same assertions. Note the tests are now coupled to process env: if
-`EEZ_POSTBATCH_GAS_RESERVE` is set in the test environment they still pass
-(everything is expressed relative to the accessor), but the `OnceLock` means the
-first reader in the process fixes the value for all of them.
+The test's `min_viable` and the "budget at or below the reserve" case now call the
+accessor (`composer.rs:3789`, `composer.rs:3802`). Same assertions. The tests are
+now coupled to process env: they still pass if `EEZ_POSTBATCH_GAS_RESERVE` is set,
+because everything is expressed relative to the accessor, but the `OnceLock` means
+the first reader in the process fixes the value for all of them.
 
 ---
 
@@ -1618,7 +1620,7 @@ first reader in the process fixes the value for all of them.
 | Change | Before | After |
 |---|---|---|
 | Claim computation for co-bundled txs | each tx simulated in isolation on the same pre-slot state; 3× `increment()` all claim `returnData=1` | each tx simulated on a fork of the L1 world + Sync block already containing its predecessors; claims are `1, 2, 3` |
-| A wrong claim's blast radius | delivery reverts on-chain → signer rejects the window → whole set re-queued → permanent freeze | append reverts at compose time → that ONE tx is evicted, the rest of the slot settles |
+| A wrong claim's blast radius | delivery reverts on-chain → signer rejects the window → whole set re-queued → permanent freeze | append reverts at compose time → that ONE tx is evicted, the rest of the slot settles (a backing-store failure aborts the slot instead) |
 | Drain processing order | pool FIFO order, direction interleaved | two phases: all outbound, then all inbound (canonical block/L1 order) |
 | Pool order after a re-queue | drain order preserved trivially | explicitly restored via `restore_pool_order`; without it the pool would be permanently reshuffled by the phase partition |
 | Unsupported entry shape (multi-call / nested / static / revert-span / unsuccessful) | surfaced post-drain from `build_cross_chain_sync_pairs` → `phase2.sync_pairs_failed` → whole slot degraded and re-drained the same set (freeze vector) | per-tx gate at accept → `cc_compose.shape_evicted`, tx evicted + nonce cascade, slot proceeds |
@@ -1636,199 +1638,201 @@ first reader in the process fixes the value for all of them.
 | `CrossChainWiring` construction | `entry_client` + `l2_entry_client` erased `ChainClient`s | one required `local: LocalComposeClients` |
 | Tracing | `composer.simulate.start` logged `"simulate_and_resolve: starting…"` | `"starting composition pipeline"`; new events `phase2.slot_anchored`, `phase2.slot_setup_failed`, `phase2.canonical_mismatch`, `phase2.final_receipt_failed`, `cc_compose.shape_evicted`, `cc_compose.append_reverted`, `cc_compose.l1_session_lost`. No existing event was renamed in this file. |
 
-
 ---
 
 # Part 4 — Tests, harness, wiring, and operational config
 
+This part reviews everything around the fix: the new tests, the harness they
+lean on, the node wiring, and the operational knobs. The design lives in
+`docs/CHAINED-INTERSTATE-DESIGN.md`, and two words from there are used
+throughout. A **claim** is a promise baked into a batch about what a cross-chain
+call returns. The **drain** is the once-per-Sync-slot moment when the composer
+takes held cross-chain transactions out of the pool and composes them.
 
-Scope of this section, in review order:
+Review order:
 
-1. `crates/eez-node/tests/chained_interstate.rs` — new file (staged)
-2. `crates/eez-node/tests/common/mod.rs` — harness diff
-3. `contracts/src/Counter.sol` — new file, **untracked**
-4. `crates/eez-node/src/main.rs` + `crates/eez-node/src/ingress.rs`
-5. `.github/workflows/ci.yml` + `docker-compose.chiado-node.yml` (both unstaged)
+1. `crates/eez-node/tests/chained_interstate.rs` — new file
+2. `crates/eez-node/tests/common/mod.rs` — harness changes
+3. `contracts/src/Counter.sol` — new fixture contract
+4. `crates/eez-node/src/main.rs` and `crates/eez-node/src/ingress.rs`
+5. `.github/workflows/ci.yml` and `docker-compose.chiado-node.yml`
 
-I read `docs/CHAINED-INTERSTATE-DESIGN.md` end to end (the verification list is
-**§9**, not §8 — §8 is the chiado findings; see the nit in 1.1), skimmed
-`crates/eez-node/tests/cross_chain.rs` for house style, and ran
-`cargo check -p eez-node --tests` — clean, exit 0, no warnings from our crates.
+I read the design doc end to end, skimmed `crates/eez-node/tests/cross_chain.rs`
+for house style, and ran `cargo check -p eez-node --tests`. It is clean, with no
+warnings from our crates.
 
 ---
 
-## 0. Read this first — the commit as staged does not build in CI
+## 0. Read this first — the change-set is committed
 
-`contracts/src/Counter.sol` is **untracked** (`?? contracts/src/Counter.sol`).
-All four new tests call `deploy_counter`, which reads
-`contracts/out/Counter.sol/Counter.json` — a `forge build` artifact.
-`contracts/out/` is gitignored (`.gitignore:5`), so the artifact is never
-committed; it is regenerated by the `forge build` step CI already runs before
-the e2e jobs.
+An earlier draft of this review flagged `contracts/src/Counter.sol` as untracked
+and the config files as unstaged. That is no longer true.
 
-That means: locally everything passes because `contracts/out/Counter.sol/Counter.json`
-exists on this machine from an earlier build. On a fresh CI checkout of the
-staged tree, `forge build` compiles a `src/` that has no `Counter.sol`, no
-artifact is produced, and `deploy_counter` fails at
-`read …/contracts/out/Counter.sol/Counter.json` — **all four tests fail in
-setup**, with an error that looks like a build problem rather than a missing
-file.
+`git status --short` now shows no part of the change-set. The only modified file
+is `docs/CHAINED-INTERSTATE-DESIGN.md`, plus a set of unrelated untracked docs.
 
-Fix: `git add contracts/src/Counter.sol` into the same commit as the tests.
-Same story, lower stakes, for the two unstaged config files: `.github/workflows/ci.yml`
-(without it the new binary never runs in CI at all) and
-`docker-compose.chiado-node.yml`.
+Two commits carry the work. `d1756b1` ("fix: chained inter-state") carries the
+composer change, the four tests, the harness diff, `Counter.sol`, the two
+`eez-node` source files, and the compose file. `bdb0d71` ("refactor: rename
+vars") carries the naming pass plus the one-line `ci.yml` change.
+
+One coupling is worth remembering, because it is easy to break later. All four
+tests call `deploy_counter`, which reads `contracts/out/Counter.sol/Counter.json`.
+That path is a `forge build` artifact and `contracts/out/` is gitignored
+(`.gitignore:5`). CI runs `forge build` in `contracts/` before the e2e job, so the
+artifact exists there. But a future fixture added without being committed would
+fail every test in setup, with an error that reads like a build problem.
 
 ---
 
 ## 1. `crates/eez-node/tests/chained_interstate.rs` (new, 644 lines)
 
-The four tests pin the four distinct properties of the issue-#88 fix. They are
-genuinely different properties, not four flavours of the same assertion —
-worth saying explicitly, because at a glance they all look like "send some
-cross-chain txs and check a counter":
+The four tests pin four different properties. They are not four flavours of one
+assertion, even though at a glance they all look like "send cross-chain
+transactions and check a counter".
 
 | Test | Property pinned |
 |---|---|
-| `three_order_dependent_inbound_calls_in_one_bundle` | claims chain (1, 2, 3) in one drain — the literal issue repro |
-| `mixed_direction_state_chain_in_one_slot` | canonical two-direction block order (outbound before inbound) |
-| `poison_mid_bundle_leaves_survivors_correct` | eviction isolation (1, 2 — not 1, 3) + no window freeze |
-| `same_sender_outbound_chain` | same-sender outbound nonce chain over a real L1 world (1, then 6) |
+| `three_order_dependent_inbound_calls_in_one_bundle` | claims chain 1, 2, 3 in one drain — the literal issue-#88 repro |
+| `mixed_direction_state_chain_in_one_slot` | canonical block order: outbound before inbound |
+| `poison_mid_bundle_leaves_survivors_correct` | eviction isolation, claims 1 and 2 not 1 and 3, plus no freeze |
+| `same_sender_outbound_chain` | same-sender outbound nonce chain over a real L1 world, results 1 then 6 |
 
 ### 1.1 Module doc (lines 1–9)
 
-States the failure precisely: isolated per-tx simulation over one pre-slot state
-produces claims the chain contradicts → `RollingHashMismatch` → signer rejects
-the window → the drain re-queues the same set forever. This is the right
-framing for a test file: it says what a red test *means*, not what the code does.
+The doc states the failure precisely. Isolated per-transaction simulation over
+one pre-slot state produces claims the chain contradicts. The delivery reverts
+with `RollingHashMismatch`, the proof signer rejects the window, and the drain
+re-queues the same set forever.
 
-Nit: it cites `docs/CHAINED-INTERSTATE-DESIGN.md §8`, but the verification plan
-these tests implement is **§9**; §8 is "Live-chain findings (chiado)". One-word fix.
+This is the right framing for a test file. It says what a red test *means*, not
+what the code does.
+
+The `§9` reference is correct: §9 is the verification plan these tests
+implement. Note the design doc has since been renumbered, so the live-chiado
+findings this review cites are now **§7**.
 
 ### 1.2 The `CallResult` event declaration (lines 27–32)
 
-A local `sol!` for `CallResult(uint256 indexed, uint256 indexed, bool, bytes)`.
+A local `sol!` declares `CallResult(uint256 indexed, uint256 indexed, bool, bytes)`.
 
-I verified this against both managers: `eez-core-protocol/src/L2/EEZL2.sol:135`
-and `eez-core-protocol/src/EEZ.sol:171`. The two declarations differ only in a
-parameter *name* (`callNumber` vs `l2ToL1CallNumber`), so topic0 is identical —
-exactly as the comment claims. Emitted at `EEZL2.sol:553` / `EEZ.sol:1181`,
-i.e. the value the manager actually folds into the rolling hash. Filtering by
-emitting address is the correct discriminator.
+I checked it against both managers. The two declarations differ only in one
+parameter *name*, so topic0 is identical (`EEZL2.sol:135`, `EEZ.sol:171`). The
+comment's claim holds. The event is emitted right where the manager folds the
+result into the rolling hash (`EEZL2.sol:553`, `EEZ.sol:1181`). Filtering by
+emitting address is the correct way to tell L1 from L2.
 
-Why this matters for the review: this event is the *ground truth* half of every
-test. The other half is the posted calldata. The tests compare the two.
+This event is the ground-truth half of every test. The posted calldata is the
+other half. The tests compare the two.
 
-### 1.3 `MAX_USER_TXS` / `cap_env()` (lines 34–40)
+### 1.3 `MAX_USER_TXS` / `cap_env()` (lines 36–40)
 
-Pins `EEZ_MAX_USER_TXS_PER_BUNDLE=3` for every test in the file rather than
-inheriting the composer default (`composer.rs:1125`, also 3 today).
+Every test in the file pins `EEZ_MAX_USER_TXS_PER_BUNDLE=3` rather than
+inheriting the composer default, which is also 3 today (`composer.rs:1132`).
 
-Good call, and the comment gives the reason: if someone lowers the default to 2,
-the three co-bundled `increment()` calls silently split across two drains and
-the test would no longer test co-bundling. It would then fail on the
-"must ride ONE postBatch" assertion rather than passing vacuously — so the pin
-plus that assertion are belt-and-braces in the right direction.
+The pin is a good call and the comment gives the reason. If someone lowered the
+default to 2, the three co-bundled `increment()` calls would split across two
+drains. The test would then fail on its "must ride ONE postBatch" assertion
+rather than passing vacuously. The pin and that assertion are belt-and-braces in
+the right direction.
 
-Small structural oddity: `MAX_USER_TXS` is a `(&str, &str)` tuple destructured
-in `cap_env()` as `MAX_USER_TXS.0` / `MAX_USER_TXS.1`. Two plain consts, or just
-inlining the literal into `cap_env`, reads better. Cosmetic.
+Small oddity: `MAX_USER_TXS` is a `(&str, &str)` tuple that `cap_env()`
+destructures as `.0` and `.1`. Two plain consts would read better. Cosmetic.
 
-### 1.4 `posted_batches` (lines 46–65) — the strongest signal in the file
+### 1.4 `posted_batches` (lines 47–65) — the strongest signal in the file
 
-Reads every `BatchPosted` log from the deploy block, fetches the posting
-transaction, and decodes its input with `decode_postbatch`
-(`eez-protocol/src/entries/mod.rs:593` — `postAndVerifyBatchCall::abi_decode`).
+The helper reads every `BatchPosted` log from the deploy block. For each one it
+fetches the posting transaction and decodes its input
+(`eez-protocol/src/entries/mod.rs:593`).
 
-This is what makes the tests convincing. The assertions are not against
-composer-internal state, or against a log line, or against a re-derived batch —
-they are against the **byte-for-byte calldata L1 accepted**. If the composer
-claimed `1, 1, 1`, that is what would come back here.
+This is what makes the tests convincing. The assertions run against the
+byte-for-byte calldata L1 accepted. They do not run against composer-internal
+state, a log line, or a re-derived batch. If the composer claimed 1, 1, 1, that
+is what comes back here.
 
-Cost note: every call re-scans from `deploy_block` and issues one
-`eth_getTransactionByHash` per batch. Negligible at four-batch scale; not a
-pattern to copy into a soak harness.
+Cost note: every call re-scans from the deploy block and issues one
+`eth_getTransactionByHash` per batch. That is negligible at four-batch scale.
+Do not copy the pattern into a soak harness.
 
-### 1.5 `inbound_claims` (lines 67–89)
+### 1.5 `inbound_claims` (lines 75–89)
 
-Filters entries with `proxyEntryHash != 0` (deferred = inbound consumption
-entries) and decodes each `returnData` as a `uint256`.
+The helper keeps entries with `proxyEntryHash != 0`, which are the deferred
+inbound consumption entries, and decodes each `returnData` as a `uint256`.
 
-The doc comment is honest about the weak spot: the on-chain entry is lean, so
-attribution is by *direction*, not by call identity — the entry binds its call
-only through `proxyEntryHash` and the call shape rides the DA sidecar. That is
-sound here only because the fixture generates no cross-chain traffic other than
-the test's own. Worth keeping that sentence; it is the kind of assumption that
-silently breaks the day someone adds background load to `setup_cross_chain`.
+The doc comment is honest about the weak spot. The on-chain entry is lean, so
+attribution is by *direction* rather than by call identity. That is sound here
+only because the fixture generates no cross-chain traffic other than the test's
+own. Keep that sentence. It is the kind of assumption that breaks silently the
+day someone adds background load to `setup_cross_chain`.
 
-The `unwrap_or_else(|| panic!(...))` on a non-32-byte return is right — a
-non-uint claim is a real failure, and printing the hex makes it debuggable
-(invariant 7 in test form).
+The `unwrap_or_else(|| panic!(...))` on a non-32-byte return is right. A
+non-uint claim is a real failure, and printing the hex makes it debuggable.
+That is invariant 7 in test form.
 
-### 1.6 `outbound_calls` (lines 91–103)
+### 1.6 `outbound_calls` (lines 94–103)
 
-Mirror image: immediate entries (`proxyEntryHash == 0`), flattened over
-`l2ToL1Calls`, filtered to the test's L1 target.
+This is the mirror image. It keeps immediate entries (`proxyEntryHash == 0`),
+flattens over `l2ToL1Calls`, and filters to the test's L1 target.
 
-The target filter is load-bearing: `prepare_post_batch_raw` prepends a leading
+The target filter is load-bearing. `prepare_post_batch_raw` prepends a leading
 immediate entry with no `l2ToL1Calls`, and other immediates may carry unrelated
 calls. Filtering by `targetAddress` drops both cleanly.
 
 ### 1.7 `CallOutcome` / `call_results` (lines 105–137)
 
-Decodes `CallResult` logs into `(block, tx, tx_index, success, return_data)`.
-`tx_index` is what test 2 uses to assert intra-block ordering; `block` is what
-test 1 uses to assert "one Sync block".
+The helper decodes `CallResult` logs into block, transaction hash, transaction
+index, success flag, and return data. Test 2 uses `tx_index` to assert
+intra-block ordering. Test 1 uses `block` to assert "one Sync block".
 
 The comment "a delivery that diverged from its claim reverts, taking its logs
-with it" is the key insight — absence of a log here is itself the #88 symptom,
-so `delivered.len() == 3` is a meaningful assertion, not bookkeeping.
+with it" is the key insight. The absence of a log here is itself the issue-#88
+symptom. So `delivered.len() == 3` is a real assertion, not bookkeeping.
 
-Same whole-chain scope caveat as `inbound_claims`: `from_block(0)` collects
-every `CallResult` the chain ever emitted. True-by-construction today (setup
-only deploys contracts and creates proxies), but it is a coupling to the fixture.
+Same whole-chain caveat as `inbound_claims`: `from_block(0)` collects every
+`CallResult` the chain ever emitted. True by construction today, since setup
+only deploys contracts and creates proxies. It is still a coupling to the
+fixture.
 
 ### 1.8 `assert_receipt_ok` / `wait_for_count` / `assert_reconciled` (lines 139–174)
 
-Three thin wrappers over the house `wait_for` + `SETTLE_TIMEOUT` (3 min).
-`assert_reconciled` is verbatim the reconciliation poll from `cross_chain.rs`
-(L1 `rollups[rid].stateRoot` vs the L2 **safe** block root) — correctly using
-`safe`, since the unsafe head is optimistic.
+These are three thin wrappers over the house `wait_for` plus a 3-minute
+`SETTLE_TIMEOUT`. `assert_reconciled` is verbatim the reconciliation poll from
+`cross_chain.rs`. It compares L1's stored `rollups[rid].stateRoot` against the
+L2 **safe** block root. Using `safe` is correct, because the unsafe head is
+optimistic.
 
-One inconsistency worth a decision: `wait_for_count` reads the counter at
-`latest` (alloy's default block tag), i.e. the *optimistic* head, while design
-§8 explicitly says "when reading L2 effects for verification, use the `safe`
-block tag — the unsafe head is optimistic and can roll back with a failed
-bundle." In practice the tests are still sound, because the load-bearing
-assertions that follow (`inbound_claims` from posted calldata, plus
-`assert_reconciled`) only pass on settled state — `wait_for_count` is really a
-progress gate, not a verification. But it is the one place the file diverges
-from its own design doc's advice, and if it ever flakes, this is why. Either
-switch it to `safe` or say in one line that it is deliberately a gate.
+One inconsistency is worth a decision. `wait_for_count` reads the counter at
+`latest`, which is the optimistic head. Design §7 says to verify L2 effects at
+the `safe` tag, because the unsafe head rolls back when a bundle fails.
 
-### 1.9 `open_drain_window` (lines 176–195) — how co-bundling is made deterministic
+The tests are still sound in practice. The load-bearing assertions that follow
+only pass on settled state: `inbound_claims` comes from posted calldata, and
+`assert_reconciled` compares settled roots. `wait_for_count` is really a
+progress gate, not a verification.
 
-This is the mechanism the whole file rests on, so it deserves scrutiny.
+Still, this is the one place the file diverges from its own design doc's advice.
+If it ever flakes, this is why. Either switch it to `safe` or say in one line
+that the gate is deliberate.
 
-It snapshots `batches_posted`, waits for that count to *rise*, and returns
-immediately. The argument: the composer keeps at most one postBatch in flight,
-so a fresh `BatchPosted` means the next drain is gated on the deriver clearing
-that batch — never sooner than the next L1 block, which is 5s on the embedded
-testing L1 (`TESTING_L1_BLOCK_TIME`, `eez-node/src/l1_embedded.rs:29` — verified).
-Submitting the txs takes milliseconds against that.
+### 1.9 `open_drain_window` (lines 186–195) — how co-bundling is made deterministic
 
-Two things make this acceptable rather than "hopeful":
+The whole file rests on this helper, so it deserves scrutiny.
 
-- The window is wide (seconds vs milliseconds), so it is not a tight race.
-- **Every test then asserts its claims arrived in exactly one posted batch.**
-  A missed window produces `claimed.len() == 2` and a failure message that says
-  so explicitly ("split batches mean the drain window was missed, not that the
-  invariant broke"). That is the correct design: the test cannot silently
-  weaken itself into a no-op.
+It snapshots the posted-batch count, waits for that count to rise, and returns
+immediately. The argument runs like this. The composer keeps at most one
+postBatch in flight. So a fresh `BatchPosted` means the next drain is gated on
+the deriver clearing that batch. That is never sooner than the next L1 block,
+which is 5s on the embedded testing L1 (`eez-node/src/l1_embedded.rs:29`).
+Submitting the transactions takes milliseconds against that.
 
-Nit: the doc says "Admitting three transactions at the ingress front takes
-~100ms"; measured submissions are ~11ms. Harmless either way, but numbers in
-comments should be the measured ones.
+Two things make this acceptable rather than hopeful. The window is wide: seconds
+against milliseconds, so it is not a tight race. And every test then asserts its
+claims arrived in exactly one posted batch. A missed window produces
+`claimed.len() == 2` and a failure message that says so. The test cannot
+silently weaken itself into a no-op.
+
+Nit: the doc comment says admitting three transactions takes ~100ms; measured
+submissions are ~11ms. Numbers in comments should be the measured ones.
 
 ### 1.10 `batches` / `assert_no_evictions` (lines 197–209)
 
@@ -1836,250 +1840,242 @@ comments should be the measured ones.
 `assert_no_evictions` asserts zero log lines containing `"evicting"` or
 `"evicted"`.
 
-Known limitation, same baseline as `cross_chain.rs:112`: this is a substring
-match over the raw log, so any line that merely contains the word counts. The
-composer's eviction messages do contain it
-(`composer.rs:1976` "…evicting", `composer.rs:2183` "…evicting — it can never
-compose"), so the check does fire on real evictions — it is over-broad, not
-under-broad, which is the safe direction. If you want to tighten it later, match
-the structured event names (`eez.composer.cc_compose.poison_evicted`,
-`…shape_evicted`, `…poison_chain_evicted`) instead of English.
+This is a substring match over the raw log, the same baseline as
+`cross_chain.rs:112`. Any line merely containing the word counts. The
+composer's real eviction messages do contain it (`composer.rs:2215`,
+`composer.rs:2036`), so the check does fire on real evictions. It is
+over-broad, not under-broad, which is the safe direction. To tighten it later,
+match the structured event names such as
+`eez.composer.cc_compose.poison_evicted` instead of English.
 
-### 1.11 Test 1 — `three_order_dependent_inbound_calls_in_one_bundle` (lines 211–312)
+### 1.11 Test 1 — `three_order_dependent_inbound_calls_in_one_bundle`
 
-**The literal issue #88 repro.** Deploy `Counter` on L2, create the L1-side
-cross-chain proxy for it, open a drain window, then push three `increment()`
-calls from one sender at nonces n, n+1, n+2 through the L1→L2 ingress front.
+The test deploys `Counter` on L2, creates the L1-side proxy for it, opens a
+drain window, then pushes three `increment()` calls from one sender at nonces
+n, n+1, n+2 through the L1→L2 ingress front.
 
-What it then asserts, in order of strength:
+It asserts four things, in rising order of strength:
 
-1. All three L1 user txs landed with status 1, and L2 `count() == 3`.
-2. **The claim chain, decoded from the posted `postAndVerifyBatch` calldata,
-   is `[1, 2, 3]`** — and rides exactly one batch.
-3. The three L2 deliveries all succeeded, share one block, and their
-   `CallResult.returnData` values are `[1, 2, 3]` — i.e. what the chain actually
-   computed equals what the composer claimed.
-4. Reconciled L1 root == L2 safe root; zero evictions; zero
-   `"local L2 state root"` divergence lines; no process death.
+1. All three L1 user transactions land with status 1, and L2 `count() == 3`.
+2. The claim chain decoded from the posted `postAndVerifyBatch` calldata is
+   `[1, 2, 3]`, and it rides exactly one batch.
+3. All three L2 deliveries succeed, share one block, and their
+   `CallResult.returnData` values are `[1, 2, 3]`.
+4. The L1 root reconciles with the L2 safe root, there are zero evictions, zero
+   `"local L2 state root"` divergence lines, and no process death.
 
-Assertion 2 is the one that would have caught the bug: pre-fix, all three
-entries carry `returnData = 1`, the second delivery folds `2`, reverts
-`RollingHashMismatch`, the signer rejects, nothing settles — so in practice the
-test would fail earlier, at `wait_for_count(… 3 …)` timing out after 3 minutes.
-Assertion 2 is what makes the *failure diagnosis* unambiguous rather than "it
-hung".
+Without the redesign, all three entries carry `returnData = 1`. The second
+delivery folds 2, reverts `RollingHashMismatch`, the signer rejects the window,
+and nothing settles.
 
-Assertion 3 is not redundant with 2: 2 proves what was claimed, 3 proves the
-chain agreed. Both are needed to state "claims are exact".
+Assertion 2 is the one that names the bug. In practice the test would fail
+earlier, at `wait_for_count(… 3 …)` timing out after 3 minutes. Assertion 2 is
+what turns "it hung" into an unambiguous diagnosis.
 
-Small thing: the loop uses a manually incremented `nonce` seeded from
-`pending_nonce` (which reads `getTransactionCount` at latest). That is correct
-here — held txs have not landed on L1 yet, so re-reading between submissions
-would hand back the same nonce three times. Worth knowing when copying this
-pattern.
+Assertion 3 is not redundant with 2. Assertion 2 proves what was claimed;
+assertion 3 proves the chain agreed. Both are needed to say "claims are exact".
 
-### 1.12 Test 2 — `mixed_direction_state_chain_in_one_slot` (lines 314–436)
+Small thing: the loop increments a `nonce` seeded once from `pending_nonce`.
+That is correct here, because held transactions have not landed on L1 yet.
+Re-reading between submissions would hand back the same nonce three times.
+Worth knowing when copying the pattern.
 
-Deploys a `Counter` on *each* chain, wires an L1-side proxy to the L2 counter
-and an L2-side proxy to the L1 counter, then submits one inbound `increment()`
-and one outbound `add(5)` into the same drain window.
+### 1.12 Test 2 — `mixed_direction_state_chain_in_one_slot`
 
-Assertions:
+The test deploys a `Counter` on *each* chain, wires an L1-side proxy to the L2
+counter and an L2-side proxy to the L1 counter, then submits one inbound
+`increment()` and one outbound `add(5)` into the same drain window.
 
-- Both user txs succeed; L2 count 1; L1 count 5.
-- Both directions ride **one** postBatch: `inbound_claims == [1]` and
-  `outbound_calls == [add(5) calldata]`.
-- **Canonical block order**, read from receipts: the outbound user tx and the
-  inbound delivery share a block, and
-  `outbound_receipt.transaction_index < delivered[0].tx_index`.
-- L1's own `CallResult` (emitted by `EEZ`, inside `postAndVerifyBatch`) returned
-  `5` — the outbound call really executed on L1, not just got carried.
+It asserts that both user transactions succeed, L2 count is 1 and L1 count is 5.
+It asserts both directions ride one postBatch. It asserts the canonical block
+order from receipts: the outbound user transaction and the inbound delivery
+share a block, and the outbound transaction index is lower. And it asserts
+L1's own `CallResult` returned 5, so the outbound call really executed on L1
+rather than just being carried.
 
-The ordering assertion is the point of this test and it is pinned the right way:
-from receipts, against `build_cross_chain_sync_pairs`' documented order
-(all outbound `[load_k, user_k]` pairs, then all inbound deliveries — design §3).
-A regression that flips the two passes in the drain shows up here immediately.
+Without the redesign the two directions are simulated against unrelated
+snapshots, so the composed Sync block need not match what the bundle does on L1
+and nothing is guaranteed to settle together.
 
-The `.filter(|o| o.success)` before mapping L1 return data is fine: a failed call
-is dropped from the vec, so the comparison to `vec![5]` still fails. It reads as
-if it might mask a failure; it doesn't.
+The ordering assertion is the point of this test, and it is pinned the right
+way. It reads receipts and checks them against the canonical builder's
+documented order: all outbound `[load, user]` pairs, then all inbound
+deliveries (design §3). A regression that flips the two passes shows up here
+immediately.
 
-### 1.13 Test 3 — `poison_mid_bundle_leaves_survivors_correct` (lines 438–559)
+The `.filter(|o| o.success)` before mapping L1 return data is fine. A failed
+call is dropped from the vec, so the comparison to `vec![5]` still fails. It
+reads as if it could mask a failure. It does not.
 
-Three txs into one window: `increment()` (survivor), a poison tx, `increment()`
-(survivor).
+### 1.13 Test 3 — `poison_mid_bundle_leaves_survivors_correct`
 
-The poison is the harness's established form — a cross-chain submission whose
-`to` is a plain address (`w.recipient`, `0x2222…`) rather than a proxy. I traced
-the composer path: the source sim records no cross-chain call → `EmptyCalls` →
-`sim_error_is_poison` → `eez.composer.cc_compose.poison_evicted` at
-`composer.rs:2181-2189`, message "…evicting — it can never compose, resubmit
-required". So the eviction is in-drain and deterministic, not a 3-strike
-post-dispatch eviction. Good: the test does not depend on retry timing.
+The test pushes three transactions into one window: `increment()`, a poison
+transaction, then `increment()`.
 
-The sender choice is the subtle part and the comment explains it: poison
-bookkeeping evicts the *rest of that sender's `(sender, direction)` nonce chain*
-(`push_poison_root` / `poison_chain_evicted`, `composer.rs:2009`). If the poison
-shared `INBOUND_USER` with the survivors, the second `increment()` would be
-evicted as a gapped successor and the test would be measuring the wrong thing.
-Hence the new `ANVIL_KEY_5`.
+Without the redesign the poison degrades the whole slot, and the survivors'
+claims come from isolated simulations that both say 1, so nothing settles.
 
-Assertions:
+The poison is the harness's established form. It is a cross-chain submission
+whose `to` is a plain address rather than a proxy. I traced the composer path:
+the source simulation records no cross-chain call, which yields `EmptyCalls`,
+which `sim_error_is_poison` recognises, which fires
+`eez.composer.cc_compose.poison_evicted` (`composer.rs:2215`). So the eviction
+happens in-drain and deterministically. It is not the 3-strike post-dispatch
+eviction. That matters: the test does not depend on retry timing.
 
-- Both survivors succeed; L2 count 2.
-- **`claimed[0] == [1, 2]`, one batch** — "survivor claims must close over the
-  evicted tx". This is the property: `[1, 3]` would mean the evicted tx's
-  simulated effect leaked into its successor's claim. Exactly the right shape to
-  pin, and it is only checkable because the claims are decoded from calldata.
-- The poison has **no L1 receipt** — dropped, not bundled.
-- At least one eviction was logged (the mirror of `assert_no_evictions`).
-- **No freeze**: a fourth `increment()` in a *later* window settles (count 3).
+The sender choice is the subtle part, and the comment explains it. Poison
+bookkeeping evicts the rest of that sender's `(sender, direction)` nonce chain
+(`composer.rs:2036`). If the poison shared `INBOUND_USER` with the survivors,
+the second `increment()` would be evicted as a gapped successor. The test would
+then measure the wrong thing. Hence the new `ANVIL_KEY_5`.
 
-That last block is the #76-adjacent property and it is the one I would have
-asked for if it weren't there. Without it, "the poison was evicted" is
-compatible with "and the window degraded forever after."
+It asserts that both survivors succeed and L2 count is 2. It asserts the
+survivor claims are `[1, 2]` in one batch, which is the property: `[1, 3]` would
+mean the evicted transaction's simulated effect leaked into its successor's
+claim. It asserts the poison has no L1 receipt, so it was dropped rather than
+bundled. It asserts at least one eviction was logged. And it asserts no freeze,
+by sending a fourth `increment()` in a later window and requiring count 3.
 
-Two honest limitations to note:
+That last block is the issue-#76-adjacent property, and it is the one I would
+have asked for if it were missing. Without it, "the poison was evicted" is
+compatible with "and the window degraded forever after".
 
-- `receipt_ok(poison) == None` is a point-in-time check. It proves the poison
-  had not landed *by then*; nothing proves it can never land later. Combined
-  with the eviction log assert this is fine, but the two assertions are jointly,
-  not individually, sufficient.
-- This test does not assert the `"local L2 state root"` divergence line count
-  (test 1 does). Since it deliberately drives an eviction path that rebuilds the
-  block prefix, it is arguably the test that most wants that check.
+Two honest limitations. First, `receipt_ok(poison) == None` is a point-in-time
+check. It proves the poison had not landed by then, not that it never can. The
+eviction-log assertion covers the gap, so the two are jointly sufficient rather
+than individually. Second, this test does not assert the `"local L2 state root"`
+divergence count that test 1 asserts. It drives an eviction path that rebuilds
+the block prefix, so it is arguably the test that most wants that check.
 
-### 1.14 Test 4 — `same_sender_outbound_chain` (lines 561–644)
+### 1.14 Test 4 — `same_sender_outbound_chain`
 
-Two outbound calls from **one** L2 sender at nonces n and n+1 —
-`increment()` then `add(5)` — against a stateful L1 target, in one slot.
+The test sends two outbound calls from one L2 sender at nonces n and n+1:
+`increment()` then `add(5)`, against a stateful L1 target, in one slot.
 
-`wait_for_count(l1, 6)` is the whole story in one line: 0 → 1 → 6. Under the old
-model both source sims see the same L1 snapshot (count 0) and claim `1` and `5`;
-`postAndVerifyBatch` re-executes them sequentially, folds `1` and `6`, and
-reverts.
+`wait_for_count(l1, 6)` is the whole story in one line. The L1 counter must go
+0 → 1 → 6.
 
-Assertions:
+Without the redesign both source simulations see the same L1 snapshot at count 0
+and claim 1 and 5. Then `postAndVerifyBatch` re-executes them sequentially,
+folds 1 and 6, and reverts.
 
-- Both L2 user txs succeed; L1 count 6.
-- Both calls ride **one** postBatch, in submission order —
-  `[increment calldata, add(5) calldata]` — "sender nonce order must survive the
-  drain". This pins the FIFO-per-direction guarantee from design §3.
-- L1's `CallResult` return values are `[1, 6]`, i.e. the L1 world really advanced
-  between the two source simulations (design §4 step 6: commit the
-  `L1TargetSession` fork into the L1 world on accept).
+It asserts both L2 user transactions succeed and the L1 count is 6. It asserts
+both calls ride one postBatch, in submission order, which pins the
+FIFO-per-direction guarantee from design §3. And it asserts L1's `CallResult`
+return values are `[1, 6]`, so the L1 world really advanced between the two
+source simulations.
 
-This is the test that specifically covers `L1SlotState` advancement; tests 1 and 3
-cover the L2 block-prefix side. Together they cover both halves of "the world
-advances only by real frames."
+This is the test that specifically covers `L1SlotState` advancement. Tests 1 and
+3 cover the L2 block-prefix side. Together they cover both halves of "the world
+advances only by real frames".
 
-### 1.15 Cross-cutting suggestions for the file
+### 1.15 Three cheap additions
 
-Nothing blocking, but three cheap additions would raise the file's value:
+Nothing blocking, but three additions would raise the file's value.
 
-1. **Assert the drain's own invariant events never fired.** Design §8 calls out
-   `canonical_mismatch`, `final_receipt_failed`, `l1_session_lost` as
-   "bug, not input condition" events — they exist at `composer.rs:2353`,
-   `composer.rs:2418`, `composer.rs:1940`. A single shared helper
-   (`log_count_matching(&["canonical_mismatch", "final_receipt_failed",
-   "l1_session_lost"]) == 0`) added to all four tests would turn silent
-   degradations into failures. The keystone byte-for-byte `sync_txs` equality
-   assert is exactly the sort of thing you want a CI signal on.
-2. **Apply the divergence check uniformly.** Only test 1 checks
-   `"local L2 state root"`. Folding it (and 1) into one `assert_clean(&w)` used
-   by all four keeps them consistent.
-3. `assert_no_evictions` and its inverse in test 3 could share the same pattern
-   list so they can never drift apart.
+First, assert the drain's own bug events never fired. Design §7 treats
+`canonical_mismatch`, `final_receipt_failed`, and `l1_session_lost` as bugs
+rather than input conditions (`composer.rs:2388`, `composer.rs:2453`,
+`composer.rs:1966`). One shared helper asserting all three are absent would
+turn silent degradations into failures. The keystone byte-for-byte equality
+check is exactly the sort of thing you want a CI signal on.
+
+Second, apply the divergence check uniformly. Only test 1 checks
+`"local L2 state root"`. Folding it and the bug-event check into one
+`assert_clean(&w)` used by all four keeps them consistent.
+
+Third, `assert_no_evictions` and its inverse in test 3 could share one pattern
+list, so they can never drift apart.
 
 ---
 
-## 2. `crates/eez-node/tests/common/mod.rs` (diff)
+## 2. `crates/eez-node/tests/common/mod.rs`
 
-### 2.1 `ANVIL_KEY_5` (hunk 1)
+### 2.1 `ANVIL_KEY_5`
 
-New constant with a comment explaining *why it exists* rather than what it is:
-eviction cascades along a sender's nonce chain, so poison needs its own sender.
-Keys 1–4 are already spoken for (`TARGET_DEPLOYER = ANVIL_KEY_3`,
-`INBOUND_USER = ANVIL_KEY_2`, `OUTBOUND_USER = ANVIL_KEY_4`).
+A new constant, with a comment that explains why it exists rather than what it
+is. Eviction cascades along a sender's nonce chain, so poison needs its own
+sender. Keys 1 through 4 are already assigned to roles.
 
-Verified: the key derives to `0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc`
-(anvil account #5) and that address is prefunded in reth's dev genesis
-(`crates/chainspec/res/genesis/dev.json`), which is what the embedded testing L1
-uses. So the poison tx is fundable and will be admitted — which the test needs,
-since it must fail at *composition*, not at ingress.
+I verified the key derives to anvil account #5,
+`0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc`. That address is prefunded in
+reth's dev genesis, which is what the embedded testing L1 uses. So the poison
+transaction is fundable and will be admitted. The test needs that: it must fail
+at composition, not at ingress.
 
-### 2.2 The port registry (hunks 2–4) — the one real behavior change in this file
+### 2.2 The port registry — the one real behavior change in this file
 
 **Before.** `free_port()` bound `127.0.0.1:0`, read the port, dropped the
-listener, returned it — a pure availability probe with no memory.
-`NodeHandle::spawn` kept its *own* local `HashSet` so one node's ~14 listeners
-wouldn't collide with each other. The two used-port sets were independent.
+listener, and returned it — a pure availability probe with no memory. Separately,
+`NodeHandle::spawn` kept its own local `HashSet` so one node's ~14 listeners
+would not collide with each other.
 
-**After.** One process-wide `LazyLock<Mutex<HashSet<u16>>>` (`HANDED_OUT_PORTS`)
-that every probe inserts into. `free_port()` is now
-`probe_unique_tcp_port(&mut handed_out_ports())`, and `spawn` takes the shared
-guard instead of a fresh set.
+**After.** One process-wide `HANDED_OUT_PORTS` registry records every port any
+probe hands out, and `spawn` takes a guard on that shared set instead of a fresh
+one.
 
-**Why.** A real observed flake: the 4th sequential test in one process failed
+The reason is an observed flake. The fourth sequential test in one process failed
 *in setup* with "address already in use". The OS happily re-offers an ephemeral
-port that an earlier node in the same process already bound — its sockets may
-still be lingering (TIME_WAIT, or the child simply still holding them) when the
-next node tries the real bind. With ~14 ports × 4 nodes in one binary, that
-collision stops being theoretical. Sharing one set across every probe in the
-process removes the re-hand entirely.
+port that an earlier node in the same process already bound. That node's sockets
+may still be lingering when the next node tries the real bind. With roughly 14
+ports across 4 nodes in one binary, the collision stops being theoretical.
+Sharing one set across every probe removes the re-hand entirely.
 
-Details worth noting:
+Four details worth noting.
 
-- `handed_out_ports()` uses `PoisonError::into_inner`, so a panicking test does
-  not poison the registry for the tests that follow. Correct choice for a test
-  harness — a poisoned mutex here would convert one real failure into three
-  cascading setup failures.
-- The explicit `drop(used_ports)` after the ten probes in `spawn` is
-  load-bearing, not tidiness: `std::sync::Mutex` is not reentrant, so anything
-  later in that long function calling `free_port()` would self-deadlock. Holding
-  the guard across the ten probes also serializes concurrent spawns, which is
-  free given the nextest serial config.
-- The set only grows. Bounded by ports-per-process (tens), so this is fine, and
-  a test process is short-lived.
-- Theoretical: `probe_unique_*` loop forever if the OS only ever offers
-  already-handed-out ports. Not reachable at these numbers.
+`handed_out_ports()` uses `PoisonError::into_inner`, so a panicking test does not
+poison the registry for the tests that follow. That is the right choice for a
+test harness. A poisoned mutex here would turn one real failure into three
+cascading setup failures.
 
-### 2.3 `CrossChainConfig::new` port selection (last hunk)
+The explicit `drop(used_ports)` after the probes in `spawn` is load-bearing, not
+tidiness. `std::sync::Mutex` is not reentrant, so anything later in that long
+function calling `free_port()` would self-deadlock. Holding the guard across the
+probes also serializes concurrent spawns, which is free given the nextest serial
+config.
 
-**Before.** `l1_http_port = free_port()`, then `l1_auth_port = free_port()` in a
-retry loop that re-rolled while it equalled `http` or `http + 1` — an ad-hoc
-guard for the L1's implicit WS listener at `http + 1`. It protected only against
-*that one* port, and only for *that one* draw: any later probe in the process
-could still hand out `http + 1`.
+The set only grows, bounded by ports-per-process, which is tens. A test process
+is short-lived, so this is fine. In theory `probe_unique_*` could loop forever if
+the OS only ever offered already-handed-out ports, but that is not reachable at
+these numbers.
 
-**After.** `l1_http_port = probe_unique_http_port(&mut handed_out_ports())`,
-which (pre-existing helper, `mod.rs:147`) verifies `http + 1` is actually
-bindable and inserts **both** into the shared set; then a plain `free_port()` for
-auth, which now cannot collide because both are already recorded.
+### 2.3 `CrossChainConfig::new` port selection
 
-Strictly stronger and shorter: the reservation is global instead of local, and
-the ad-hoc loop disappears. Same helper `NodeHandle::spawn` already used for its
-own L1 HTTP port, so the two paths now agree.
+**Before.** The code drew `l1_http_port` with `free_port()`, then drew
+`l1_auth_port` in a retry loop that re-rolled while it equalled `http` or
+`http + 1`. That was an ad-hoc guard for the L1's implicit WS listener at
+`http + 1`. It protected against that one port, for that one draw. Any later
+probe in the process could still hand out `http + 1`.
+
+**After.** `probe_unique_http_port` draws the HTTP port. That pre-existing
+helper verifies `http + 1` is bindable and inserts both into the shared registry
+(`mod.rs:147`). The auth port is then a plain `free_port()`, which cannot
+collide because both are already recorded.
+
+Strictly stronger and shorter. The reservation is global instead of local, and
+the retry loop disappears. `NodeHandle::spawn` already used the same helper for
+its own L1 HTTP port, so the two paths now agree.
 
 ### 2.4 `ICounter` in the shared `sol!` block
 
-Three functions: `count()` view, `increment() → uint256`, `add(uint256) → uint256`.
-`#[sol(rpc)]` so `counter_count` can call it through a provider. Sits alongside
-`IValue` / `ISetterWrapper` — consistent with the house pattern.
+Three functions: `count()` as a view, `increment()` returning `uint256`, and
+`add(uint256)` returning `uint256`. It carries `#[sol(rpc)]` so `counter_count`
+can call it through a provider. It sits alongside `IValue` and `ISetterWrapper`,
+consistent with the house pattern.
 
 ### 2.5 `deploy_counter` / `counter_count`
 
 `deploy_counter` is a three-line wrapper over `deploy_raw` with no constructor
-args. The reason these live in `common/` rather than in the test file is
-mechanical and correct: `deploy_raw` is private to the harness. `counter_count`
-is the same shape as the existing `value_no_ret` / `l2_value` helpers.
+arguments. These helpers live in `common/` rather than in the test file for a
+mechanical reason: `deploy_raw` is private to the harness. `counter_count` has
+the same shape as the existing `value_no_ret` and `l2_value` helpers.
 
-Note `deploy_counter` takes `rpc_url` and `chain_id` separately, so the same
-helper deploys on L1 and L2 — tests 2 and 4 use both. Good.
+Note `deploy_counter` takes `rpc_url` and `chain_id` separately, so one helper
+deploys on L1 and L2. Tests 2 and 4 use both.
 
 ---
 
-## 3. `contracts/src/Counter.sol` (new, UNTRACKED)
+## 3. `contracts/src/Counter.sol` (new, 19 lines)
 
 ```solidity
 contract Counter {
@@ -2089,31 +2085,29 @@ contract Counter {
 }
 ```
 
-19 lines, no events, no access control, no constructor.
+No events, no access control, no constructor.
 
-**Not staged.** See §0 — this is the one thing that must change before the
-commit is coherent, because the staged tests read its build artifact.
+It exists because it is the minimal *state-dependent* target. Each call's return
+value depends on its predecessors within the same block, which is exactly the
+shape issue #88 describes.
 
-**Why it exists.** It is the minimal *state-dependent* target: each call's
-return value depends on its predecessors within the same block, which is exactly
-the shape issue #88 describes. The existing `Value.sol` setter is also
-order-dependent (`setValue` returns `(changed, newValue)`), so it *could* have
-been used — but the expected claim sequence would then be a list of
-`(bool, uint256)` tuples that a reader has to simulate mentally. With a counter,
-"the claims must be 1, 2, 3" is readable at a glance, and a broken chain reads
-as "1, 1, 1" rather than a tuple diff. That is a real reviewability win for the
-file's headline test, and it is worth the 19 lines.
+The existing `Value.sol` setter is also order-dependent, so it could have been
+used. But `setValue` returns a `(bool, uint256)` tuple, so the expected claim
+sequence would be a list of tuples a reader has to simulate mentally. With a
+counter, "the claims must be 1, 2, 3" reads at a glance, and a broken chain
+reads as "1, 1, 1" rather than a tuple diff. That is a real reviewability win
+for the file's headline test, and it is worth 19 lines.
 
-**Wiring.** Identical to `Value.sol`: no checked-in artifacts, `contracts/out/`
-gitignored, the harness reads `contracts/out/Counter.sol/Counter.json`, and CI
-already runs `forge build` in `contracts/` before both e2e jobs. I checked for
-an artifact-name collision (foundry keys artifacts by *file* name): the only
-other counter in scope is the submodule's `CounterContracts.sol`, so no clash.
-`pragma ^0.8.28` is compatible with the pinned `solc = "0.8.34"`.
+Wiring is identical to `Value.sol`. No artifacts are checked in,
+`contracts/out/` is gitignored, the harness reads
+`contracts/out/Counter.sol/Counter.json`, and CI runs `forge build` before both
+e2e jobs. I checked for an artifact-name collision, since foundry keys artifacts
+by *file* name. The only other counter in scope is the submodule's
+`CounterContracts.sol`, so there is no clash. The `pragma ^0.8.28` is compatible
+with the pinned `solc = "0.8.34"`.
 
-Style nit: `Value.sol` uses natspec (`/// @title`, `/// @notice`); `Counter.sol`
-uses a free-form `///` block. Cosmetic, but the neighbouring file sets a
-convention.
+Style nit: `Value.sol` uses natspec tags while `Counter.sol` uses a free-form
+`///` block. Cosmetic, but the neighbouring file sets a convention.
 
 ---
 
@@ -2121,167 +2115,166 @@ convention.
 
 ### 4.1 L1 entry client: bind concrete, erase after (main.rs:519–558)
 
-**Before.** The `match l1_variant` arms each built a `LocalChainClient`, cloned
-it into a `Arc<dyn ChainClient>`, and the match *evaluated to the erased view*.
-The concrete handle went out of scope inside the arm.
+**Before.** Each `match l1_variant` arm built a `LocalChainClient`, cloned it
+into an `Arc<dyn ChainClient>`, and the match evaluated to that erased view. The
+concrete handle went out of scope inside the arm.
 
-**After.** The match evaluates to `Arc<LocalChainClient>` (the arms just return
-the constructor result), and the erasure happens once, after the match:
-`let entry_client_view: Arc<dyn ChainClient + Send + Sync> = l1_entry_client.clone();`
+**After.** The match evaluates to `Arc<LocalChainClient>`, and the erasure
+happens once after the match.
 
-**Why.** The same instance now has to serve two consumers: the wiring's
-`rollups` map wants it erased, and the new `LocalComposeClients` wants it concrete
-(so the drain can reach `L1SlotState` / `simulate_source_tx_on`). They must be *one*
-instance because they share a single overlay channel — two separate clients
-would mean two overlay worlds and the chained drain would silently lose effects.
-The new comment says exactly this.
+The reason is that one instance now serves two consumers. The wiring's `rollups`
+map wants it erased. The new `LocalComposeClients` wants it concrete, so the
+drain can reach `L1SlotState` and `simulate_source_tx_on`. They must be the same
+instance, because they share a single overlay channel. Two separate clients would
+mean two overlay worlds, and the chained drain would silently lose effects. The
+new comment says exactly this.
 
-Bonus: each arm loses four lines of `Arc<dyn …>` turbofish ceremony, so the two
-arms now differ only in how they build the provider/EvmConfig, which is the
-actual difference between them.
+A bonus: each arm loses four lines of turbofish ceremony. The two arms now differ
+only in how they build the provider and EvmConfig, which is the actual difference
+between them.
 
 ### 4.2 L2 entry client (main.rs:576–585)
 
-**Before.** `let l2_entry = …; let l2_entry_view: Arc<dyn ChainClient …> = l2_entry;`
-— erased and stored on the wiring as `l2_entry_client`.
+**Before.** The code built the client, erased it, and stored the erased view on
+the wiring as `l2_entry_client`.
 
-**After.** `let l2_entry_client = …` (concrete, `Arc<LocalChainClient>`), and the
-erased binding is gone entirely along with the wiring field it fed. That field
-was orphaned by the drain rework: nothing reads `CrossChainWiring.l2_entry_client`
-any more (I grepped — the only remaining hits are the two lines in main.rs itself).
+**After.** The binding is concrete, and the erased binding is gone along with the
+wiring field it fed. The drain rework orphaned that field. Nothing reads
+`CrossChainWiring.l2_entry_client` any more; I grepped, and the only remaining
+hits were the two lines in `main.rs` itself.
 
-The trailing comment was reworded from "the outbound source-sim
-`simulate_and_resolve_recorded_for`" to "the outbound source simulation" —
-the named function no longer exists.
+A trailing comment was reworded from the old function name to "the outbound
+source simulation", because the named function no longer exists.
 
-**One accuracy point on the new field's doc.** `CrossChainWiring.local` is
-documented (`composer.rs:140-142`) as "The same instances registered in
-`rollups`; they share one overlay channel." That is true for L1
-(`entry_client_view` is a clone of `l1_entry_client`) but **not** for L2:
-`rollups` registers the `Role::Follower` client (`l2_follower_view`), while
-`local.l2_entry` is a separately constructed `Role::Entry` client over the same
-provider. Functionally fine — L2 target execution goes through
+One accuracy point on the new field's doc. `CrossChainWiring.local` is
+documented as "the same instances registered in `rollups`; they share one
+overlay channel" (`composer.rs:140-142`). That holds for L1, because the erased
+view is a clone of the concrete client. It does not hold for L2. The `rollups`
+map registers the `Role::Follower` client, while `local.l2_entry` is a separately
+constructed `Role::Entry` client over the same provider.
+
+This is functionally fine. L2 target execution goes through
 `InboundL2TargetSession`, not through the erased client, and the follower client
-deliberately errors `Unavailable` for source sims — but the comment overclaims.
-Worth a five-word correction so the next reader doesn't go hunting for a shared
-identity that isn't there.
+deliberately errors `Unavailable` for source simulations. But the comment
+overclaims. A five-word correction stops the next reader hunting for a shared
+identity that is not there.
 
 ### 4.3 `wired_rollups` insert (main.rs:604–605)
 
-`Arc::clone(&entry_client_view)` → `entry_client_view`: the extra clone is no
-longer needed now that nothing else consumes the erased view. Mechanical.
+An `Arc::clone` becomes a plain move. The extra clone is no longer needed, since
+nothing else consumes the erased view. Mechanical.
 
 ### 4.4 `CrossChainWiring` construction (main.rs:693–701)
 
-`entry_client` and `l2_entry_client` fields drop out; the new `local:
-LocalComposeClients { l1_entry, l2_entry }` replaces them. Note `local` is a
-**required** field, not an `Option` — cross-chain composer mode always has an
-embedded L1 (this whole block is inside the `if embedded L1` arm), so there is no
-"wired but no local handles" state to represent. Correct call: an `Option` here
-would have created an unreachable `None` branch that the drain would have to
-handle.
+The `entry_client` and `l2_entry_client` fields drop out. The new
+`local: LocalComposeClients { l1_entry, l2_entry }` replaces them
+(`main.rs:697`).
+
+Note `local` is a required field, not an `Option`. Cross-chain composer mode
+always has an embedded L1, since this whole block sits inside the embedded-L1
+arm. There is no "wired but no local handles" state to represent. That is the
+right call. An `Option` here would create an unreachable `None` branch the drain
+would have to handle.
 
 ### 4.5 `ingress.rs` (comment only)
 
-One doc line: `simulate_and_resolve` (deleted) → "the composer's chained
-simulation". Same rewording as main.rs. The rewrap leaves a ragged
-"…effect). One front / per source chain (invariant 8)." — reflow when you next
-touch it.
+One doc line changes. It referenced the deleted `simulate_and_resolve` and now
+says "the composer's chained simulation". Same rewording as `main.rs`.
+
+The rewrap leaves a ragged line: "…effect). One front / per source chain
+(invariant 8)." Reflow it next time you touch the file.
 
 ---
 
 ## 5. CI and compose
 
-### 5.1 `.github/workflows/ci.yml` (unstaged)
+### 5.1 `.github/workflows/ci.yml`
 
-One line: `--test cross_chain` → `--test cross_chain --test chained_interstate`
-in the existing `cross-chain-e2e` job. Without it the new binary compiles in CI
-but never runs.
+One line changed in the existing `cross-chain-e2e` job. It ran
+`--test cross_chain` and now runs `--test cross_chain --test chained_interstate`
+(`ci.yml:138`). Without that, the new binary compiles in CI but never runs.
 
-Two things I checked so you don't have to:
+Two things I checked so you do not have to. The job already runs `forge build` in
+`contracts/` before the tests, so the `Counter.json` artifact is produced. And
+`.config/nextest.toml` serializes by `filter = "kind(test)"`, so the new binary
+joins the existing integration test-group automatically. No config change is
+needed, and the explicit `--test-threads=1` is belt-and-braces.
 
-- The job already runs `forge build` in `contracts/` before the tests, so the
-  `Counter.json` artifact is produced — **provided `Counter.sol` is committed**
-  (§0).
-- `.config/nextest.toml` serializes by `filter = "kind(test)"`, so the new binary
-  is covered by the existing integration test-group automatically; no config
-  change needed. The explicit `--test-threads=1` is belt-and-braces.
+One side note, not introduced here. `cargo test --workspace` is the pre-commit
+gate in `CLAUDE.md`, and it now compiles and runs two heavy node-spawning
+binaries in parallel. That is precisely what the nextest config exists to
+prevent. The problem pre-dates this change with `cross_chain` alone, but a
+second binary makes it likelier to bite. Worth a contributor-docs line.
 
-Side note, not introduced here: `cargo test --workspace` (the pre-commit gate in
-CLAUDE.md) now compiles and runs *two* heavy node-spawning binaries in parallel,
-which is precisely what the nextest config exists to prevent. Pre-existing with
-`cross_chain`; adding a second one makes it more likely to bite. Worth a line in
-the contributor docs at some point.
+### 5.2 `docker-compose.chiado-node.yml`
 
-### 5.2 `docker-compose.chiado-node.yml` (unstaged, operational)
+Three parameterizations, all overridable from the host env, all with unchanged
+defaults. A node started with no extra env behaves exactly as before. All three
+come straight out of the live chiado runs in design §7. All three are committed.
 
-Three parameterizations, all host-env overridable, **all defaults unchanged** —
-so a node started with no extra env behaves exactly as before. These come
-straight out of the live chiado runs (design §8).
+**a. `EEZ_SIGNER_PORT`, three sites.** Before, `50061` was hardcoded three
+times: the signer's `EEZ_PROOF_SIGNER_ADDR`, its healthcheck `nc -z`, and the
+node's `EEZ_PROVER_URL`. After, all three read `${EEZ_SIGNER_PORT:-50061}`
+(lines 39, 48, 76).
 
-**a. `EEZ_SIGNER_PORT` (3 sites).** Before, `50061` was hardcoded three times:
-the signer's `EEZ_PROOF_SIGNER_ADDR`, its healthcheck `nc -z`, and the node's
-`EEZ_PROVER_URL`. After, all three read `${EEZ_SIGNER_PORT:-50061}`.
+The reason: on this host both 50061 and 50062 were squatted by leftover
+signer and proverd processes from other worktrees. With the port hardcoded in
+three places there was no way to move the stack without editing the file. The
+three sites must move together, which is the argument for one variable rather
+than three overrides.
 
-Why: on this host, 50061 *and* 50062 were squatted by leftover signer/proverd
-processes from other worktrees, and with the port hardcoded in three places
-there was no way to move the stack without editing the file. The three sites
-must move together — which is the argument for a single variable rather than
-three overrides.
+**b. `EEZ_PROOF_SIGNER_MAX_TRANSACTION_STATE_CHECKPOINTS`.** A new passthrough,
+written as `${EEZ_SIGNER_MAX_CHECKPOINTS:-8}` (line 40). I verified the signer's
+own default is also 8, so the compose default is a no-op
+(`eez-proof-signer/src/config.rs:133-140`).
 
-**b. `EEZ_PROOF_SIGNER_MAX_TRANSACTION_STATE_CHECKPOINTS`
-(`${EEZ_SIGNER_MAX_CHECKPOINTS:-8}`).** New passthrough. I verified the signer's
-own default is 8 (`eez-proof-signer/src/config.rs:133-139`), so the compose
-default is a no-op.
-
-Why it needs a knob: the signer's stateless validator caps per-window
+It needs a knob because the signer's stateless validator caps per-window
 transaction-state checkpoints. A window with more effects than the cap fails
-`prepare_post_batch_raw` **deterministically**, so the drain degrades and
-requeues the same window forever — the #76 blind-spot shape one layer up
-(design §8 finding 2). The knob must be sized ≥ the effect count implied by
-`EEZ_MAX_USER_TXS_PER_BUNDLE`. The chiado run used 64 with a 24-tx bundle.
+`prepare_post_batch_raw` deterministically. The drain then degrades and requeues
+the same window forever, which is the issue-#76 shape one layer up. Size the
+quota at or above the effect count implied by `EEZ_MAX_USER_TXS_PER_BUNDLE`. The
+chiado run used 64 with a 24-transaction bundle.
 
-**c. `EEZ_POSTBATCH_GAS_RESERVE` (`${EEZ_POSTBATCH_GAS_RESERVE:-4000000}`).**
-Passthrough for the composer knob (`composer.rs:293-303`,
-`DEFAULT_POST_BATCH_EXECUTION_GAS_RESERVE = 4_000_000`), so again a no-op at
-default.
+**c. `EEZ_POSTBATCH_GAS_RESERVE`.** A passthrough for the composer knob, written
+as `${EEZ_POSTBATCH_GAS_RESERVE:-4000000}` (line 110). The composer default is
+also 4M, so this too is a no-op at default (`composer.rs:291`).
 
-Why: each deferred entry costs ~240k gas to queue inside `postAndVerifyBatch`,
-so a many-effect batch blows past a fixed 4M reserve, reverts **out of gas inside
-the builder's bundle simulation**, and rbuilder drops the bundle *silently*
-("pinned slot built without inclusion"). That is the worst failure shape there
-is — no error anywhere, just non-inclusion. The chiado run used 8M.
+It needs a knob because each deferred entry costs about 240k gas to queue inside
+`postAndVerifyBatch`. A many-effect batch blows past a fixed 4M reserve and
+reverts out of gas *inside the builder's bundle simulation*. rbuilder then drops
+the bundle silently. That is the worst failure shape there is: no error anywhere,
+just non-inclusion. The chiado run used 8M.
 
-Two review points on this file:
+Two review points on this file.
 
-- **Comment placement bug.** `EEZ_POSTBATCH_GAS_RESERVE` is inserted *between*
-  the three-line comment "Max user_txs bundled per postBatch. rbuilder-chiado
-  partial-includes beyond ~3 …" and the `EEZ_MAX_USER_TXS_PER_BUNDLE` line it
-  describes. As written, the comment now reads as documentation for the gas
-  reserve. Move the new line above the comment block, or give it its own
-  one-liner — it deserves one anyway, since "under-reserved postBatch → silent
-  bundle drop" is not guessable.
-- **Naming asymmetry.** `EEZ_POSTBATCH_GAS_RESERVE` uses the same name on host
-  and container; the checkpoint knob uses `EEZ_SIGNER_MAX_CHECKPOINTS` on the
-  host for `EEZ_PROOF_SIGNER_MAX_TRANSACTION_STATE_CHECKPOINTS` in the container.
-  Defensible (the real name is a mouthful) but inconsistent — an operator
-  exporting the long name will silently get the default.
-- Nothing enforces the couplings these three knobs have with
-  `EEZ_MAX_USER_TXS_PER_BUNDLE` (checkpoints ≥ effects, reserve ≳ 240k × entries).
-  Design §8 names the durable fixes — cap the drain at the prover's quota, derive
-  the reserve from entry count. A pointer to §8 in the compose comment would save
-  the next operator the two-hour debug both findings cost.
+The comment-placement problem an earlier draft flagged is fixed. The three-line
+comment about the bundle cap now sits directly above
+`EEZ_MAX_USER_TXS_PER_BUNDLE`, and `EEZ_POSTBATCH_GAS_RESERVE` has its own
+one-liner below it (lines 103–110).
+
+A naming asymmetry remains. `EEZ_POSTBATCH_GAS_RESERVE` uses the same name on
+host and container. The checkpoint knob uses the short `EEZ_SIGNER_MAX_CHECKPOINTS`
+on the host for the long container name. That is defensible, since the real name
+is a mouthful, but it is inconsistent. An operator who exports the long name will
+silently get the default.
+
+Nothing enforces the couplings these knobs have with
+`EEZ_MAX_USER_TXS_PER_BUNDLE`: checkpoints at or above the effect count, and the
+reserve above roughly 240k per entry. Design §7 names the durable fixes, which
+are capping the drain at the prover's quota and deriving the reserve from the
+entry count. A pointer to §7 in the compose comment would save the next operator
+the two-hour debug both findings cost.
 
 ---
 
 ## 6. Verification status
 
-- `cargo check -p eez-node --tests` — clean.
-- Author ran the four tests: 4/4 pass, ~350s wall, with the pre-existing suites
-  re-verified.
-- Honest limitation, unchanged from the existing baseline: the eviction
-  assertions are English-substring matches over the node log
-  (`"evicting"` / `"evicted"`), the same technique `cross_chain.rs` already uses.
+- `cargo check -p eez-node --tests` is clean.
+- The author ran the four tests: 4 of 4 pass in about 350s wall, with the
+  pre-existing suites re-verified.
+- One honest limitation, unchanged from the existing baseline. The eviction
+  assertions are English-substring matches over the node log, using the same
+  technique `cross_chain.rs` already uses.
 
 ---
 
@@ -2289,95 +2282,95 @@ Two review points on this file:
 
 | Change | Before | After |
 |---|---|---|
-| `crates/eez-node/tests/chained_interstate.rs` | no coverage of chained-interstate composition | 4 e2e tests pinning claim chaining, two-direction block order, poison isolation + no-freeze, same-sender outbound nonce chains |
-| Claim verification technique | effects checked via chain state / logs | claims decoded from the actual posted `postAndVerifyBatch` calldata and compared against the manager's own `CallResult` events |
-| Co-bundling determinism | n/a | `open_drain_window` aligns on a fresh `BatchPosted` (≥5s of headroom); every test asserts its claims rode ONE batch, so a missed window fails loudly |
-| `ANVIL_KEY_5` | keys 1–4, all assigned to roles | 5th prefunded sender available; poison gets its own `(sender, direction)` nonce chain |
-| `ICounter` / `deploy_counter` / `counter_count` | no stateful counter helper | shared harness helpers (needed here because `deploy_raw` is harness-private) |
-| **Port handling — `free_port()`** | stateless availability probe; `NodeHandle::spawn` kept a *separate* local used-set → the 4th node in a process could be re-handed a port an earlier node's lingering sockets still held, failing setup with "address already in use" | one process-wide `HANDED_OUT_PORTS` registry shared by every probe; a port is never handed out twice in a process; poison-tolerant lock so one panicking test doesn't cascade |
-| **Port handling — `CrossChainConfig::new`** | `free_port()` for HTTP, then a retry loop re-rolling auth until it differed from `http` and `http+1`; the implicit WS port was never reserved against later probes | `probe_unique_http_port` verifies and reserves both `http` and `http+1` in the shared registry; auth is a plain `free_port()` that cannot collide; retry loop deleted |
-| `contracts/src/Counter.sol` | no order-dependent fixture target with a scalar return | 19-line counter; `increment()`/`add()` return the new count, making the expected claim chain `1, 2, 3` readable at a glance |
-| `main.rs` L1/L2 entry clients | erased to `Arc<dyn ChainClient>` inside the match; concrete handle discarded | concrete `Arc<LocalChainClient>` bound first, erased once afterwards, so the wiring map and `LocalComposeClients` share one instance (one overlay channel) |
-| `CrossChainWiring` fields (from main.rs's side) | `entry_client` + `l2_entry_client` (erased); `l2_entry_view` binding | both gone; required `local: LocalComposeClients { l1_entry, l2_entry }` |
-| `main.rs` / `ingress.rs` comments | referenced the deleted `simulate_and_resolve` | reworded to "the composer's chained simulation" (comment-only) |
-| `.github/workflows/ci.yml` | cross-chain job ran `--test cross_chain` | also runs `--test chained_interstate` (same serial job, same `forge build` prerequisite) |
-| **compose: signer port** | `50061` hardcoded in 3 places (signer addr, healthcheck, `EEZ_PROVER_URL`) — unmovable when the port is squatted by another worktree's processes | `${EEZ_SIGNER_PORT:-50061}` in all 3; default identical, whole stack relocatable with one export |
-| **compose: signer checkpoint quota** | not set → signer's built-in default of 8; a window exceeding it fails `prepare_post_batch_raw` deterministically and the drain requeues forever | `EEZ_PROOF_SIGNER_MAX_TRANSACTION_STATE_CHECKPOINTS: ${EEZ_SIGNER_MAX_CHECKPOINTS:-8}`; default identical, raisable to match the bundle cap |
-| **compose: postBatch gas reserve** | not set → composer's 4M default; a many-effect batch (~240k gas per deferred entry) reverts OOG inside the builder's bundle simulation and is dropped silently | `EEZ_POSTBATCH_GAS_RESERVE: ${EEZ_POSTBATCH_GAS_RESERVE:-4000000}`; default identical, sizable to the bundle cap |
+| `tests/chained_interstate.rs` | no coverage of chained-interstate composition | 4 e2e tests pinning claim chaining, two-direction block order, poison isolation plus no-freeze, and same-sender outbound nonce chains |
+| Claim verification technique | effects checked via chain state and logs | claims decoded from the posted `postAndVerifyBatch` calldata, compared against the manager's own `CallResult` events |
+| Co-bundling determinism | not addressed | `open_drain_window` aligns on a fresh `BatchPosted`, giving at least 5s of headroom; every test asserts its claims rode one batch, so a missed window fails loudly |
+| `ANVIL_KEY_5` | keys 1 through 4, all assigned to roles | a 5th prefunded sender, so poison gets its own `(sender, direction)` nonce chain |
+| `ICounter` / `deploy_counter` / `counter_count` | no stateful counter helper | shared harness helpers, needed here because `deploy_raw` is harness-private |
+| Port handling — `free_port()` | a stateless availability probe; `spawn` kept a separate local used-set, so the 4th node in a process could be re-handed a port an earlier node's lingering sockets still held, failing setup with "address already in use" | one process-wide `HANDED_OUT_PORTS` registry shared by every probe, so no port is handed out twice in a process; the lock tolerates poisoning, so one panicking test does not cascade |
+| Port handling — `CrossChainConfig::new` | `free_port()` for HTTP, then a retry loop re-rolling auth until it differed from `http` and `http + 1`; the implicit WS port was never reserved against later probes | `probe_unique_http_port` verifies and reserves both `http` and `http + 1` in the shared registry; auth is a plain `free_port()` that cannot collide; the retry loop is deleted |
+| `contracts/src/Counter.sol` | no order-dependent fixture target with a scalar return | a 19-line counter whose `increment()` and `add()` return the new count, making the expected claim chain 1, 2, 3 readable at a glance |
+| `main.rs` L1 and L2 entry clients | erased to `Arc<dyn ChainClient>` inside the match; the concrete handle was discarded | the concrete `Arc<LocalChainClient>` is bound first and erased once afterwards, so the wiring map and `LocalComposeClients` share one instance and one overlay channel |
+| `CrossChainWiring` fields, from main.rs's side | erased `entry_client` and `l2_entry_client`, plus an `l2_entry_view` binding | all gone; a required `local: LocalComposeClients { l1_entry, l2_entry }` replaces them |
+| `main.rs` and `ingress.rs` comments | referenced the deleted `simulate_and_resolve` | reworded to "the composer's chained simulation"; comment-only |
+| `.github/workflows/ci.yml` | the cross-chain job ran `--test cross_chain` | it also runs `--test chained_interstate`, in the same serial job with the same `forge build` prerequisite |
+| compose: signer port | `50061` hardcoded in 3 places, so the stack could not move when another worktree squatted the port | `${EEZ_SIGNER_PORT:-50061}` in all 3; the default is identical and one export relocates the whole stack |
+| compose: signer checkpoint quota | unset, so the signer's built-in default of 8 applied; a window exceeding it failed `prepare_post_batch_raw` deterministically and the drain requeued forever | passed through as `${EEZ_SIGNER_MAX_CHECKPOINTS:-8}`; the default is identical and it can be raised to match the bundle cap |
+| compose: postBatch gas reserve | unset, so the composer's 4M default applied; a many-effect batch reverted out of gas inside the builder's bundle simulation and was dropped silently | passed through as `${EEZ_POSTBATCH_GAS_RESERVE:-4000000}`; the default is identical and it can be sized to the bundle cap |
 
-### Must-fix before commit
+### Must-fix items — all resolved
 
-1. `git add contracts/src/Counter.sol` — the staged tests depend on its build artifact; without it CI fails all four in setup.
-2. Stage `.github/workflows/ci.yml` (otherwise the new tests never run in CI) and `docker-compose.chiado-node.yml`.
-3. Module doc: `§8` → `§9` (verification).
+An earlier draft listed three blockers. All three are now done.
+
+1. `contracts/src/Counter.sol` is committed, in `d1756b1` alongside the tests.
+2. `.github/workflows/ci.yml` is committed, in `bdb0d71`.
+   `docker-compose.chiado-node.yml` is committed, in `d1756b1`.
+3. The module doc cites design `§9`, which is the verification plan. Correct.
 
 ### Worth doing
 
-4. Move the `EEZ_POSTBATCH_GAS_RESERVE` line out from between the `EEZ_MAX_USER_TXS_PER_BUNDLE` comment and its variable.
-5. Add `canonical_mismatch` / `final_receipt_failed` / `l1_session_lost` to a shared "clean run" assertion used by all four tests, and apply the `"local L2 state root"` check uniformly.
-6. Correct the `CrossChainWiring.local` doc: the shared-instance claim holds for L1, not for L2 (which is a distinct `Role::Entry` client).
-7. `wait_for_count` reads at `latest`; design §8 says read effects at `safe`. Either switch it or note that it is a progress gate, not a verification.
+Item 4 below is also done. Items 5 through 7 remain open.
 
+4. ~~Move the `EEZ_POSTBATCH_GAS_RESERVE` line out from between the
+   `EEZ_MAX_USER_TXS_PER_BUNDLE` comment and its variable.~~ Fixed; the gas
+   reserve now has its own comment.
+5. Add `canonical_mismatch`, `final_receipt_failed`, and `l1_session_lost` to a
+   shared "clean run" assertion used by all four tests, and apply the
+   `"local L2 state root"` check uniformly.
+6. Correct the `CrossChainWiring.local` doc. The shared-instance claim holds for
+   L1 but not for L2, which is a distinct `Role::Entry` client.
+7. `wait_for_count` reads at `latest`, while design §7 says to read effects at
+   `safe`. Either switch it or note that it is a progress gate rather than a
+   verification.
 
 ---
 
-## Appendix A — live-chiado incidents behind the three "late" hunks
+## Appendix A — the three hunks that came from live chiado testing
 
-Three hunks exist only because the change was validated on live chiado
-(fresh deploy, real rbuilder relay) after the dev e2e suite was already
-green. Each is a dev-environment blind spot worth knowing about:
+Three changes exist only because the change-set was validated on live
+chiado after the dev test suite was already green. Each one is a
+dev-environment blind spot. The design doc (§7) tells the full story;
+here is the short version.
 
-1. **`frame_gas` clamp** (`slot.rs`). Chiado's L1 block gas limit is
-   ~17M; `DIRECT_CALL_GAS_LIMIT` is 30M. revm rejects a tx whose gas
-   limit exceeds the block's, so every manager frame failed
-   ("caller gas limit exceeds the block gas limit") and every outbound
-   composition poison-evicted. Dev chains have ≥30M blocks and never see
-   this. Clamping to the anchor block's limit was chosen over the old
-   session's blanket `disable_block_gas_limit` because it matches what
-   the real chain enforces.
-2. **`EEZ_POSTBATCH_GAS_RESERVE`** (`composer.rs` + compose file).
-   Measured on chiado: queueing one deferred entry inside
-   `postAndVerifyBatch` costs ~240k gas (a 3-entry batch used 841k vs
-   ~126k for a minimal one). A 24-effect batch therefore needs ~6M of
-   execution above the calldata floor — the fixed 4M reserve made the
-   postBatch revert **out of gas inside the block builder's bundle
-   simulation**, and rbuilder drops such bundles silently. The relay has
-   no bundle tx-count limit (confirmed: it included a 25-tx bundle once
-   the request was honest); every "relay drop" we chased was our own
-   under-gassed request. The reserve is now env-tunable; the durable fix
-   (tracked) is deriving it from the batch's entry count.
-3. **Signer checkpoint quota + signer port** (compose file). The proof
-   signer caps per-window transaction-state checkpoints at 8 by default;
-   a 24-effect window fails `prepare_post_batch_raw` deterministically
-   and the drain requeues forever — the #76 blind-spot shape one layer
-   up. The knob must be sized ≥ the bundle cap (parameterized alongside
-   it). The signer port became parameterized because two leftover
-   processes on the host squatted 50061 and 50062.
+1. **`clamp_frame_gas` (`local/slot.rs`).** Chiado's block gas limit is
+   about 17M. The manager frames asked for 30M, and revm rejects any
+   transaction whose gas limit exceeds the block's. So every outbound
+   composition failed and evicted. Dev chains have bigger blocks and
+   never see this. The fix clamps each frame to the anchor block's limit
+   — which is also what the real chain enforces.
+2. **`EEZ_POSTBATCH_GAS_RESERVE` (`composer.rs` + the compose file).**
+   Storing one deferred entry on L1 costs about 240k gas. A 24-effect
+   postBatch therefore needs about 6M of execution gas, but the old fixed
+   reserve was 4M. The under-gassed postBatch reverted out of gas inside
+   the block builder's simulation, and the builder dropped the bundle
+   silently. The relay never had a bundle-size limit — it included a
+   25-transaction bundle happily once the gas was honest. The reserve is
+   now an env knob. The durable fix is deriving it from the entry count.
+3. **Signer knobs (the compose file).** The proof signer allows at most
+   `max_transaction_state_checkpoints` effects per window (default 8). A
+   bigger window fails deterministically and the composer retries it
+   forever. The knob is now parameterized next to the bundle cap so the
+   two are sized together. The signer port also became a parameter,
+   because leftover processes on the host had taken both default ports.
 
-Validated end state on chiado: full matrix (both directions ×
-direct/wrapper × setter/deposit/withdraw + reverts) semantically exact;
-120/120 paced load; the issue-#88 repro (3 same-sender nonce-ordered
-increments → results 1,2,3 in one Sync block); **24 inbound cross-chain
-txs settled in ONE Sync block** (`count()==24` at the safe head, results
-1..24) and **24 outbound in ONE Sync block**; zero divergence throughout;
-none of the new invariant events ever fired. Operational rule learned the
-hard way: verify L2 effects at the `safe` block tag — the unsafe head is
-optimistic and rolls back with failed bundles.
+One operating rule that came out of this: **check L2 effects at the
+`safe` block tag.** The unsafe head is optimistic. It rolls back when a
+bundle fails, and it fooled two test scripts during validation.
 
 ## Appendix B — headline behavior changes
 
-Each part ends with its full change/before/after inventory; these are the
-ones that matter most when operating or reviewing the system:
+Each part ends with its full change/before/after table. These are the
+changes that matter most when reviewing or operating the system:
 
 | Change | Before | After |
 |---|---|---|
-| Co-bundled order-dependent claims | Recorded against the same pre-slot state → signer rejects the window → txs requeue forever | Recorded against the accumulated chained state → windows sign; verified claims 1..24 in one Sync block on chiado |
-| Claim-mismatch blast radius | Whole slot degrades + requeues at the front (freeze) | The offending tx is evicted at append time; the slot and its survivors proceed |
-| Unsupported entry shapes (nested/multicall) | Failed post-drain in the canonical builder → whole-slot degrade, forever | Shape-gated per tx at accept → precise eviction with a loud event |
-| Target-side execution model | Direct call with a forged proxy `msg.sender` (+ nonce-restore hack) | The real contract paths: canonical delivery tx on the block prefix; real `EEZ → proxy.executeOnBehalf` frames with real escrow balance |
-| L2 simulation base | `provider.latest()` per tx, discarded | The Sync-block-in-progress prefix (byte-exact by construction, receipt-checked) |
-| L1 simulation base | `latest()` per tx, discarded | One anchor pinned per drain + commit-or-drop effect cache |
-| Composer/deriver block agreement | Implicit (same builders, invoked separately) | Asserted byte-for-byte every slot (keystone assert; ERROR + degrade on mismatch) |
-| `simulate_and_resolve` public API | Existed (isolated semantics) | Deleted — no unchained composition path remains |
-| postBatch gas sizing | Fixed 4M execution reserve | `EEZ_POSTBATCH_GAS_RESERVE` env knob (default unchanged); needed ≈ 240k × deferred entries |
-| Error precedence (both halves malformed) | Outbound shape error reported first | Inbound reported first (accepted trivial change) |
+| Co-bundled order-dependent claims | Recorded against the same pre-slot state; the signer rejected the window; the transactions re-queued forever | Recorded against the chained state; windows sign; verified up to 24 claims (1..24) in one Sync block on chiado |
+| Cost of a wrong claim | The whole slot degraded and retried forever (a freeze) | The one offending transaction is evicted at append time; the rest of the slot proceeds |
+| Unsupported entry shapes (nested, multicall, static) | Failed after the drain, degrading the whole slot forever | Evicted per transaction at accept time, with a loud event |
+| Target-side execution | A direct call with a forged proxy `msg.sender` plus a nonce-restore hack | The real contract paths: the canonical delivery on the block fork; real `EEZ → proxy.executeOnBehalf` frames with real escrow balances |
+| L2 simulation base | A fresh `latest()` state per transaction, then discarded | The Sync block under construction — byte-exact, receipt-checked |
+| L1 simulation base | A fresh `latest()` state per transaction, then discarded | One pinned anchor per drain plus a commit-or-drop effect cache |
+| Composer/deriver block agreement | Implicit (same builders, called separately) | Asserted byte-for-byte every slot (the keystone check) |
+| The old `simulate_and_resolve` API | Existed, with the isolated semantics | Deleted; no unchained composition path remains |
+| postBatch gas sizing | A fixed 4M execution reserve | The `EEZ_POSTBATCH_GAS_RESERVE` knob; a batch needs ~240k per deferred entry |
+| Error precedence when both directions are malformed | The outbound shape error reported first | The inbound one reports first (accepted, trivial) |
