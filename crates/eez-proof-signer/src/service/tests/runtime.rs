@@ -350,7 +350,7 @@ async fn a_validation_deadline_retains_the_request_slot_until_the_worker_finishe
     assert_eq!(observer.active_request_slot.available_permits(), 0);
 
     let saturated = server.prove(happy_window()).await;
-    assert_eq!(saturated.code(), Code::ResourceExhausted, "{saturated:?}");
+    assert_eq!(saturated.code(), Code::Unavailable, "{saturated:?}");
 
     release.send(()).expect("validation worker stopped early");
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -439,7 +439,7 @@ async fn the_request_slot_is_shared_across_connections_and_released_after_cancel
     .expect("first request did not acquire the request slot");
 
     let status = server.prove(happy_window()).await;
-    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    assert_eq!(status.code(), Code::Unavailable, "{status:?}");
 
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());

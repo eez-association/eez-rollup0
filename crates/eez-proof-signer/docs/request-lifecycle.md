@@ -81,7 +81,7 @@ work unit, not by the polling interval of the async runtime.
 If the RPC deadline expires after the blocking task starts, the request future
 returns but the worker continues until it reaches a cancellation boundary or
 completes first. It still owns the request permit, so an immediate retry
-receives `ResourceExhausted`. This is transient capacity, not persisted protocol
+receives `Unavailable`. This is transient capacity, not persisted protocol
 state: once the worker exits and a retry is admitted, the window is evaluated
 from scratch.
 
