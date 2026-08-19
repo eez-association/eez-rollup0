@@ -570,7 +570,7 @@ when the node wires the composer (`eez-node/src/main.rs:697`).
 outright. Both handles point at the same instances the erased map holds. This is not a second
 registry. It is a concrete-typed view onto the same two clients.
 
-**Why not the obvious alternative.** Widening `ChainClient` with an `open_world` method would
+**Why not the obvious alternative.** Widening `ChainClient` with an `open_state` method would
 force every impl to answer a question only the local reth-backed client can answer. A future
 non-local client would have to stub or lie. That is the "stub that lies" anti-pattern, avoided
 by keeping the concrete handle beside the erased one.
@@ -631,7 +631,7 @@ unwind machinery. A poisoned tx's fork is simply dropped.
   the anchor **hash** rather than at "latest", so it cannot drift mid-drain. It uses the anchor's
   EVM env and preloads accumulated effects with `with_cached_prestate(seed)`.
   `with_bundle_update()` is on, but nothing reads the bundle. See the checkpoint note in §1.9.
-- `fork_state` (`slot.rs:183-191`) — the inbound source-sim fork: anchor state, plus the world
+- `fork_state` (`slot.rs:183-191`) — the inbound source-sim fork: anchor state, plus the state
   cache, plus the **plain** anchor env. The comment explains the split precisely.
   `simulate_source_tx_on` applies its own source-sim tweak, which turns the nonce check off. The
   manager-frame tweaks deliberately stay out of a path that executes a real signed user
@@ -650,7 +650,7 @@ the next reader need not derive it.
 This is the outbound target session. For an L2→L1 call it replays exactly what
 `EEZ._processNCalls` will do inside the future `postAndVerifyBatch`.
 
-`new` forks the world by seeding `world.cache.clone()`, then makes exactly four env edits
+`new` forks the state by seeding `state.cache.clone()`, then makes exactly four env edits
 (`slot.rs:240-243`):
 
 ```rust
@@ -740,7 +740,7 @@ when `msg.sender == EEZ`, and otherwise falls through to the cross-chain path
 (`CrossChainProxy.sol:50-64`). So entering through the manager is the *only* way to get a
 faithful target execution. The old direct call with a forged proxy `msg.sender` bypassed the
 proxy contract entirely. A target that inspects `msg.sender`, or the proxy's own accounting, saw
-a different world than the chain will show it.
+a different state than the chain will show it.
 
 4. Run the frame under `SkipTopFrame::new(self.client.inspector_factory().build(dispatcher))`.
    See §1.10.
@@ -762,7 +762,7 @@ Anything else would be a divergence source.
 
 The commit is guarded by `if success`, and that guard is deliberate (`slot.rs:415-421`). A
 reverted frame's only state today is the caller's nonce bump. Committing it anyway would tie the
-slot-shared world to whatever a future revm decides to return in `result.state` for a revert.
+slot-shared state to whatever a future revm decides to return in `result.state` for a revert.
 Meanwhile the proxy created in step 2 stays committed, because `create_proxy` commits its own
 frame. That matches the chain: `_processNCalls` creates the proxy first, then catches the call
 failure as `(false, retData)`, so the deployment survives the failed call.
@@ -1141,7 +1141,7 @@ In `lib.rs`, `LocalComposeClients` joins the existing `#[doc(inline)] pub use lo
 | Frame gas | `disable_block_gas_limit = true`, 30M frames | clamped to the anchor block's gas limit (`frame_gas`, `slot.rs:257-262`); fixes the chiado 17M-limit poison-evict of every outbound tx |
 | L1 state lifetime | fresh `provider.latest()` per composition, post-state dropped at `finalize` | one `L1SlotState` pinned at drain start, advanced commit-or-drop per surviving tx (`slot.rs:105-192`) |
 | Target-session checkpoint | `Box::new(())`, rollback a no-op type check | real `CacheState` clone/restore; doubles as the drain's accept-time harvest payload (`slot.rs:441-453`) |
-| L1 frame commit on revert | n/a | committed only on success, so a revert cannot leak revm's `result.state` into the slot-shared world; the step-2 proxy creation still survives (`slot.rs:415-421`) |
+| L1 frame commit on revert | n/a | committed only on success, so a revert cannot leak revm's `result.state` into the slot-shared state; the step-2 proxy creation still survives (`slot.rs:415-421`) |
 | Inbound claim resolution | direct call to the target produced the claim; the delivery tx was verified only on-chain / at the proof signer | probe the canonical delivery on a fork of the Sync block, capture the real `EEZL2 → proxy` outcome, then run the canonical delivery for real — must succeed (`slot.rs:612-669`) |
 | Inbound nonce cursor | n/a | `delivery_nonce` advances per accepted delivery and rewinds with rollback via `ProbeSnapshot` (`slot.rs:496-502`, `689-703`) |
 | Reverting inbound target | claim recorded, failure surfaced later on-chain | poison at compose time, one eviction, drain continues (`slot.rs:648-654`) |
@@ -1165,8 +1165,8 @@ the claim "returns 1". The chain executes them as 1, 2, 3. Delivery #2 reverts
 drain puts the same three transactions back at the front of the pool. The next
 slot fails identically. That is the freeze in issue #88.
 
-This file holds half the fix. The drain now keeps two slot-scoped worlds: the
-local `l1_state` is the L1 world pinned at the anchor, and the local `draft` is
+This file holds half the fix. The drain now keeps two slot-scoped states: the
+local `l1_state` is the L1 state pinned at the anchor, and the local `draft` is
 the Sync block under construction. The drain composes each tx on a fork of both,
 and only on accept does it append the canonical txs to `draft` and commit the L1
 effects into `l1_state`. So each composition sees its predecessors exactly as
@@ -1228,7 +1228,7 @@ There is a new loud check between `take_sessions` and `finalize`. A session that
 comes back for a rollup nobody seeded is an error (`composer.rs:228`). Entry-chain
 sessions are exempt, because overlay re-entry legitimately opens one there. Any
 other unseeded session means the dispatch opened a lazy one and ran **unchained**,
-off this slot's worlds — the bug being fixed, silently. It is unreachable today,
+off this slot's states — the bug being fixed, silently. It is unreachable today,
 and can only fire once a third rollup is wired without a slot session. The error
 is `ExecutorErrorKind::Unavailable`, which `sim_error_is_poison` classifies
 **transient** (`composer.rs:408`). A wiring gap is not the transaction's fault, so
@@ -1317,7 +1317,7 @@ All private, all small (`composer.rs:553-624`):
 ## Hunk 8 (~L1156) — `Box::pin` at the single call site
 
 `compose_cross_chain_batch(...)` is now boxed before `.await`
-(`composer.rs:1168`). The drain holds two live execution contexts, the L1 world
+(`composer.rs:1168`). The drain holds two live execution contexts, the L1 state
 and the block prefix. That pushed the future past clippy's `large_futures` 16KB
 bound. No behavior change.
 
@@ -1345,7 +1345,7 @@ already released.
 
 ```rust
 let reopen = |txs: &[Bytes]| SyncBlockState::open(l2_dyn.clone(), …, txs);
-let slot_ctx = L1SlotState::open(&local.l1_entry).and_then(|world| reopen(&[]).map(…));
+let slot_ctx = L1SlotState::open(&local.l1_entry).and_then(|state| reopen(&[]).map(…));
 ```
 
 - `reopen` **rebuilds from the accepted tx list**; it does not restore a cached
@@ -1403,7 +1403,7 @@ loop (`composer.rs:1764`). The poison-gap pre-check at the top is unchanged, and
 now appears once per phase.
 
 **Contexts.** Per tx the drain opens an `L1TargetSession` over a clone of the L1
-world cache. That replays real `EEZ._processNCalls` frames, including proxy
+state cache. That replays real `EEZ._processNCalls` frames, including proxy
 auto-creation and escrow value drawn from EEZ's balance. Alongside it sits the
 `SyncBlockFork` from `draft.fork()`. The source sim runs the user tx on that L2
 fork through `local.l2_entry`, because the L2 follower client errors `Unavailable`
@@ -1422,7 +1422,7 @@ reduced for it would wrongly evict later legitimate withdrawals
 **New: the ACCEPT block.** This is the heart of the hunk.
 
 ```rust
-// Block first, world second: a pair evicted at append must leave the L1 world untouched.
+// Block first, state second: a pair evicted at append must leave the L1 state untouched.
 let pairs_k = build_outbound_pair(&l1_entries[0], &held.raw_tx, &stf_cfg, nonce + system_txs_appended)?;
 let pair_txs = interleave_sync_block_txs(&pairs_k);
 if let Some((at, why)) = append_and_execute(&mut draft, &pair_txs) { … evict … draft = reopen(&sync_txs)? … }
@@ -1451,8 +1451,8 @@ Four things to notice.
    `append_and_execute` may be half-applied, with the load succeeding and the user
    tx reverting. Rebuilding from the accepted list is the only truth. If the
    rebuild itself fails, that is transient and the drain aborts.
-4. **Block first, world second.** `l1_state.cache` is only overwritten once the
-   pair is safely in the block. A tx evicted at append leaves the L1 world
+4. **Block first, state second.** `l1_state.cache` is only overwritten once the
+   pair is safely in the block. A tx evicted at append leaves the L1 state
    byte-identical to before it was tried. If the session hand-off is what fails,
    the drain logs `cc_compose.l1_session_lost` at ERROR and aborts transiently,
    because the slot cannot chain L1 any more. The minimal path then discards the
@@ -1470,7 +1470,7 @@ tx#…`.
 ## Hunk 13 cont. (~L2035) — PHASE 2, inbound (L1→L2)
 
 This is the mirror image (`composer.rs:2033`). The source sim runs the L1 user tx
-on a fork of the world, via `l1_state.fork_state`. The L2 side is an
+on a fork of the state, via `l1_state.fork_state`. The L2 side is an
 `InboundL2TargetSession` over `draft.fork()`, seeded with the current delivery
 nonce cursor. It builds the canonical delivery, executes it on the fork, and
 reads the claim off the real `EEZL2 → proxy` frame.
@@ -1519,8 +1519,8 @@ append reverts and costs that ONE tx an eviction instead of freezing the slot.
 
 Then, in this order: `system_txs_appended += deliveries.len()`,
 `sync_txs.extend(deliveries)`, and finally `l1_state.cache = l1_fork.cache`. The
-source fork's committed writes become the world, so later inbound sims see their
-predecessors. Same block-first, world-second discipline as phase 1. The returned
+source fork's committed writes become the state, so later inbound sims see their
+predecessors. Same block-first, state-second discipline as phase 1. The returned
 sessions are dropped as `_sessions`, because the probe's fork is throwaway; only
 the canonical delivery, appended to the real prefix, counts.
 
@@ -1619,7 +1619,7 @@ the first reader in the process fixes the value for all of them.
 
 | Change | Before | After |
 |---|---|---|
-| Claim computation for co-bundled txs | each tx simulated in isolation on the same pre-slot state; 3× `increment()` all claim `returnData=1` | each tx simulated on a fork of the L1 world + Sync block already containing its predecessors; claims are `1, 2, 3` |
+| Claim computation for co-bundled txs | each tx simulated in isolation on the same pre-slot state; 3× `increment()` all claim `returnData=1` | each tx simulated on a fork of the L1 state + Sync block already containing its predecessors; claims are `1, 2, 3` |
 | A wrong claim's blast radius | delivery reverts on-chain → signer rejects the window → whole set re-queued → permanent freeze | append reverts at compose time → that ONE tx is evicted, the rest of the slot settles (a backing-store failure aborts the slot instead) |
 | Drain processing order | pool FIFO order, direction interleaved | two phases: all outbound, then all inbound (canonical block/L1 order) |
 | Pool order after a re-queue | drain order preserved trivially | explicitly restored via `restore_pool_order`; without it the pool would be permanently reshuffled by the phase partition |
@@ -1696,7 +1696,7 @@ transactions and check a counter".
 | `three_order_dependent_inbound_calls_in_one_bundle` | claims chain 1, 2, 3 in one drain — the literal issue-#88 repro |
 | `mixed_direction_state_chain_in_one_slot` | canonical block order: outbound before inbound |
 | `poison_mid_bundle_leaves_survivors_correct` | eviction isolation, claims 1 and 2 not 1 and 3, plus no freeze |
-| `same_sender_outbound_chain` | same-sender outbound nonce chain over a real L1 world, results 1 then 6 |
+| `same_sender_outbound_chain` | same-sender outbound nonce chain over a real L1 state, results 1 then 6 |
 
 ### 1.1 Module doc (lines 1–9)
 
@@ -1962,11 +1962,11 @@ folds 1 and 6, and reverts.
 It asserts both L2 user transactions succeed and the L1 count is 6. It asserts
 both calls ride one postBatch, in submission order, which pins the
 FIFO-per-direction guarantee from design §3. And it asserts L1's `CallResult`
-return values are `[1, 6]`, so the L1 world really advanced between the two
+return values are `[1, 6]`, so the L1 state really advanced between the two
 source simulations.
 
 This is the test that specifically covers `L1SlotState` advancement. Tests 1 and
-3 cover the L2 block-prefix side. Together they cover both halves of "the world
+3 cover the L2 block-prefix side. Together they cover both halves of "the state
 advances only by real frames".
 
 ### 1.15 Three cheap additions
@@ -2126,7 +2126,7 @@ The reason is that one instance now serves two consumers. The wiring's `rollups`
 map wants it erased. The new `LocalComposeClients` wants it concrete, so the
 drain can reach `L1SlotState` and `simulate_source_tx_on`. They must be the same
 instance, because they share a single overlay channel. Two separate clients would
-mean two overlay worlds, and the chained drain would silently lose effects. The
+mean two overlay states, and the chained drain would silently lose effects. The
 new comment says exactly this.
 
 A bonus: each arm loses four lines of turbofish ceremony. The two arms now differ

@@ -2119,7 +2119,7 @@ pub const OUTBOUND_USER: &str = ANVIL_KEY_4;
 pub const UNFUNDED_KEY: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
 
 /// Shared cross-chain integration fixture.
-pub struct CrossChainWorld {
+pub struct CrossChainState {
     pub node: NodeHandle,
     pub cfg: CrossChainConfig,
     pub dep: Deployment,
@@ -2141,7 +2141,7 @@ pub struct CrossChainWorld {
     _datadir: tempfile::TempDir,
 }
 
-impl CrossChainWorld {
+impl CrossChainState {
     pub fn l1_rpc(&self) -> String {
         self.cfg.l1_rpc_url()
     }
@@ -2157,14 +2157,14 @@ impl CrossChainWorld {
 }
 
 /// Start the shared cross-chain fixture.
-pub async fn setup_cross_chain() -> Result<CrossChainWorld> {
+pub async fn setup_cross_chain() -> Result<CrossChainState> {
     setup_cross_chain_with_env(&[]).await
 }
 
 /// Start the fixture with additional node environment variables.
 pub async fn setup_cross_chain_with_env(
     extra_env: &[(&'static str, String)],
-) -> Result<CrossChainWorld> {
+) -> Result<CrossChainState> {
     let cfg = CrossChainConfig::new()?;
     let datadir = tempfile::tempdir()?;
     let mut env = cfg.env();
@@ -2243,7 +2243,7 @@ pub async fn setup_cross_chain_with_env(
     let outbound_wrapper =
         deploy_setter_wrapper(&l2_rpc, TARGET_DEPLOYER, l2_chain_id, outbound_proxy).await?;
 
-    Ok(CrossChainWorld {
+    Ok(CrossChainState {
         node,
         cfg,
         dep,

@@ -61,7 +61,7 @@ use super::session::{DIRECT_CALL_GAS_LIMIT, evm_err, provider_err};
 /// unifying the two L2 clients' channels first.
 #[derive(Debug, Clone)]
 pub struct LocalComposeClients {
-    /// L1 entry client — the world the outbound manager frames run on.
+    /// L1 entry client — the state the outbound manager frames run on.
     pub l1_entry: Arc<LocalChainClient>,
     /// L2 entry client — the chain whose Sync block is under construction.
     pub l2_entry: Arc<LocalChainClient>,
@@ -100,7 +100,7 @@ fn fork_err(e: BuildError) -> ExecutorError {
     }
 }
 
-// ── L1 world ─────────────────────────────────────────────────────
+// ── L1 state ─────────────────────────────────────────────────────
 
 /// Slot-scoped simulated L1: an anchor header pinned at drain start plus the
 /// accumulated cache of every effect committed this slot (manager frames and
@@ -136,7 +136,7 @@ impl L1SlotState {
         tracing::debug!(
             block = num,
             hash = %anchor.hash(),
-            "L1 world anchored for this slot"
+            "L1 state anchored for this slot"
         );
         Ok(Self {
             anchor,
@@ -145,7 +145,7 @@ impl L1SlotState {
     }
 
     /// Anchor post-state preloaded with `seed`, plus the anchor's plain EVM
-    /// env. Every fork of this world opens through here.
+    /// env. Every fork of this state opens through here.
     fn open_state(
         &self,
         client: &LocalChainClient,
@@ -171,7 +171,7 @@ impl L1SlotState {
         Ok((state, evm_env))
     }
 
-    /// Open a fork of this world for an inbound SOURCE simulation: anchor
+    /// Open a fork of this state for an inbound SOURCE simulation: anchor
     /// post-state preloaded with the accumulated effect cache, plus the
     /// anchor's plain EVM env (`simulate_source_tx_on` applies its own
     /// source-sim cfg tweaks; the manager-frame tweaks stay out of it).
@@ -222,7 +222,7 @@ impl std::fmt::Debug for L1TargetSession {
 }
 
 impl L1TargetSession {
-    /// Fork the L1 world: open the anchor's post-state seeded with the world's
+    /// Fork the L1 state: open the anchor's post-state seeded with the state's
     /// accumulated cache, under the manager-frame EVM env.
     ///
     /// The balance check stays ON — escrowed value must really be payable from
@@ -232,8 +232,8 @@ impl L1TargetSession {
     ///
     /// Returns [`ExecutorErrorKind::Provider`] when the anchor state cannot be
     /// opened, [`ExecutorErrorKind::Evm`] when env construction fails.
-    pub fn new(world: &L1SlotState, client: Arc<LocalChainClient>) -> ExecutorResult<Self> {
-        let (state, mut evm_env) = world.open_state(&client, world.cache.clone())?;
+    pub fn new(state: &L1SlotState, client: Arc<LocalChainClient>) -> ExecutorResult<Self> {
+        let (state, mut evm_env) = state.open_state(&client, state.cache.clone())?;
         let chain_id = evm_env.cfg_env.chain_id;
         // Synthetic frames carry no fee market and no EOA sender; the balance
         // check is deliberately left on so escrow value is real.
@@ -343,7 +343,7 @@ impl L1TargetSession {
                     "createCrossChainProxy({source}, {source_rollup}): {e}"
                 ))
             })?;
-        tracing::debug!(%source, %source_rollup, "L1 world: proxy created");
+        tracing::debug!(%source, %source_rollup, "L1 state: proxy created");
         Ok(())
     }
 }
@@ -413,7 +413,7 @@ impl TargetExecutionSession for L1TargetSession {
         }
 
         // A reverted frame's only state today is the caller's nonce bump, but
-        // committing it would tie the slot-shared world to whatever a future
+        // committing it would tie the slot-shared state to whatever a future
         // revm decides to return in `result.state` for a revert.
         if success {
             reset_frame_caller_nonce(&mut changes, self.manager);

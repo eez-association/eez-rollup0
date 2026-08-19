@@ -227,7 +227,7 @@ fn compose_chained(
     let sessions = builder.take_sessions();
 
     // A session on a rollup nobody seeded means the dispatch opened a lazy one
-    // and ran UNCHAINED — off this slot's worlds (invariant 6/8). Entry-chain
+    // and ran UNCHAINED — off this slot's states (invariant 6/8). Entry-chain
     // sessions are legitimate: overlay re-entry opens them there.
     if let Some(unseeded) = sessions
         .keys()
@@ -238,7 +238,7 @@ fn compose_chained(
         return Err(eez_protocol::ExecutorError::from(
             eez_protocol::ExecutorErrorKind::Unavailable(format!(
                 "composition dispatched to rollup {unseeded}, which has no slot session; \
-                 it would execute unchained against chain state instead of this slot's world"
+                 it would execute unchained against chain state instead of this slot's state"
             )),
         )
         .into());
@@ -275,7 +275,7 @@ impl std::fmt::Debug for CrossChainWiring {
 /// evicted so they cannot block the FIFO queue indefinitely.
 ///
 /// Drain-time simulations are chained per chain in canonical order
-/// (`compose_chained` over the slot's L1 world and the Sync block under
+/// (`compose_chained` over the slot's L1 state and the Sync block under
 /// construction — `docs/CHAINED-INTERSTATE-DESIGN.md`), so a co-bundled
 /// prerequisite is already visible when its dependant composes. What this bound
 /// backstops is the residual: L1 state that moves between compose time and the
@@ -592,7 +592,7 @@ fn append_and_execute(prefix: &mut SyncBlockState, txs: &[Bytes]) -> Option<(usi
     None
 }
 
-/// Take the L1 session's accumulated effects for commit into the slot's world.
+/// Take the L1 session's accumulated effects for commit into the slot's state.
 /// The payload shape is pinned by `L1TargetSession::checkpoint`: a boxed
 /// `CacheState` and nothing else.
 fn take_l1_cache(
@@ -1600,10 +1600,10 @@ where
         // the leading immediate, empty Sync block) when the drain is empty, no
         // tx survives, or a build step fails.
         // The drain runs in canonical block order — all outbound, then all
-        // inbound — over two slot-scoped worlds: the L1 world pinned at the
+        // inbound — over two slot-scoped states: the L1 state pinned at the
         // anchor and the Sync block under construction. Each tx simulates on a
         // FORK of both and, on accept, appends its canonical txs to the block
-        // and commits its L1 effects to the world, so the next composition sees
+        // and commits its L1 effects to the state, so the next composition sees
         // its predecessors exactly as sequential execution will. Per tx: a
         // deterministic failure (sim, entry shape, reverting append) is POISON —
         // evict it plus its nonce cascade, rebuild the prefix, keep composing;
@@ -1646,7 +1646,7 @@ where
         }
 
         // ── Slot execution contexts (design §2) ──────────────────────
-        // One L1 world pinned at the anchor and one live Sync-block prefix,
+        // One L1 state pinned at the anchor and one live Sync-block prefix,
         // both advanced only by accepted transactions. Failing to open either
         // is transient: nothing has been consumed, so the whole drain goes
         // back to the pool untouched.
@@ -1667,9 +1667,9 @@ where
         };
         let slot_ctx = L1SlotState::open(&local.l1_entry)
             .map_err(|e| format!("L1SlotState::open: {e}"))
-            .and_then(|world| {
+            .and_then(|state| {
                 reopen(&[])
-                    .map(|draft| (world, draft))
+                    .map(|draft| (state, draft))
                     .map_err(|e| format!("SyncBlockState::open: {e}"))
             });
         let (mut l1_state, mut draft) = match slot_ctx {
@@ -1706,7 +1706,7 @@ where
             l1_anchor = l1_state.anchor.number(),
             l1_anchor_hash = %l1_state.anchor.hash(),
             drained = drained.len(),
-            "L1 world pinned and Sync block prefix opened for this slot",
+            "L1 state pinned and Sync block prefix opened for this slot",
         );
 
         // The Sync block's txs in canonical order, exactly as accepted: the
@@ -1757,9 +1757,9 @@ where
         // ── PHASE 1 — OUTBOUND (L2→L1) ───────────────────────────────
         // Source-sim runs on a fork of the Sync block against the L2 ENTRY
         // client (the L2 follower errors `Unavailable`); the L1 side executes
-        // real `_processNCalls` frames on a fork of the world. On accept the
+        // real `_processNCalls` frames on a fork of the state. On accept the
         // canonical `[load, user]` pair extends the block and the L1 frames
-        // commit to the world.
+        // commit to the state.
         let mut out_iter = outbounds.into_iter();
         while let Some((idx, held)) = out_iter.next() {
             if let Some(gap_at) = poison_gap_for(&poison_gaps, &held) {
@@ -1885,8 +1885,8 @@ where
                         }
                     }
                     // ── ACCEPT ───────────────────────────────────────
-                    // Block first, world second: a pair evicted at append must
-                    // leave the L1 world untouched. `build_outbound_pair` runs
+                    // Block first, state second: a pair evicted at append must
+                    // leave the L1 state untouched. `build_outbound_pair` runs
                     // the shape gate itself, so an entry the Sync-block lowering
                     // cannot represent comes back as its `Err`.
                     let pairs_k = match eez_protocol::system_tx::build_outbound_pair(
@@ -1959,7 +1959,7 @@ where
                         escrow_remaining = Some(avail.saturating_sub(need));
                     }
 
-                    // The world advances only now, behind the accepted block.
+                    // The state advances only now, behind the accepted block.
                     match take_l1_cache(&mut sessions, cc.entry_rollup_id) {
                         Ok(cache) => l1_state.cache = cache,
                         Err(e) => {
@@ -1970,7 +1970,7 @@ where
                                 tx_idx = idx,
                                 tx_hash = %held.hash,
                                 error = %e,
-                                "the L1 execution session did not come back from the composition; the slot's L1 world can no longer chain — degrading",
+                                "the L1 execution session did not come back from the composition; the slot's L1 state can no longer chain — degrading",
                             );
                             transient = Some((
                                 format!("L1 session hand-off tx#{idx}: {e}"),
@@ -2019,10 +2019,10 @@ where
         }
 
         // ── PHASE 2 — INBOUND (L1→L2) ────────────────────────────────
-        // Source-sim runs the L1 user tx on a fork of the world; the L2 side
+        // Source-sim runs the L1 user tx on a fork of the state; the L2 side
         // probes the canonical delivery on a fork of the block and reads the
         // claim off the real `EEZL2 → proxy` frame. On accept the delivery
-        // extends the block and the source fork's writes become the world.
+        // extends the block and the source fork's writes become the state.
         // A phase-1 abort already collected these txs into the re-queue set.
         let inbounds = if transient.is_some() {
             Vec::new()

@@ -18,7 +18,7 @@ use eez_protocol::{EEZL2_ADDRESS, EvmBatch, entries::decode_postbatch};
 
 mod common;
 use common::{
-    ANVIL_KEY_5, CrossChainWorld, DEV_CHAIN_ID, ICounter, IEEZ, INBOUND_USER, OUTBOUND_USER,
+    ANVIL_KEY_5, CrossChainState, DEV_CHAIN_ID, ICounter, IEEZ, INBOUND_USER, OUTBOUND_USER,
     SETTLE_TIMEOUT, TARGET_DEPLOYER, batches_posted, counter_count, create_cross_chain_proxy,
     create_l2_cross_chain_proxy, deploy_counter, pending_nonce, receipt_ok,
     setup_cross_chain_with_env, sign_and_send, state_root, wait_for,
@@ -158,7 +158,7 @@ async fn wait_for_count(rpc_url: &str, counter: Address, expected: u64, label: &
 }
 
 /// L1's stored `rollups[rid].stateRoot` must equal the L2 safe block's root.
-async fn assert_reconciled(w: &CrossChainWorld) {
+async fn assert_reconciled(w: &CrossChainState) {
     let (eez, rollup_id) = (w.cfg.eez_address, w.cfg.rollup_id);
     let (l1_rpc, l2_rpc) = (w.l1_rpc(), w.l2_rpc());
     wait_for(SETTLE_TIMEOUT, || {
@@ -183,7 +183,7 @@ async fn assert_reconciled(w: &CrossChainWorld) {
 /// transactions at the ingress front takes ~100ms against that. Co-bundling is
 /// still asserted from the posted batch itself, so a missed window fails the
 /// test instead of quietly weakening it.
-async fn open_drain_window(w: &CrossChainWorld) {
+async fn open_drain_window(w: &CrossChainState) {
     let (l1_rpc, eez, from) = (w.l1_rpc(), w.cfg.eez_address, w.dep.deploy_block);
     let before = batches_posted(&l1_rpc, eez, from).await.unwrap();
     wait_for(SETTLE_TIMEOUT, || {
@@ -194,13 +194,13 @@ async fn open_drain_window(w: &CrossChainWorld) {
     .expect("composer never posted a batch; cannot align on a drain window");
 }
 
-async fn batches(w: &CrossChainWorld) -> Vec<EvmBatch> {
+async fn batches(w: &CrossChainState) -> Vec<EvmBatch> {
     posted_batches(&w.l1_rpc(), w.cfg.eez_address, w.dep.deploy_block)
         .await
         .expect("read posted batches")
 }
 
-fn assert_no_evictions(w: &CrossChainWorld) {
+fn assert_no_evictions(w: &CrossChainState) {
     assert_eq!(
         w.node.log_count_matching(&["evicting", "evicted"]).unwrap(),
         0,
@@ -312,7 +312,7 @@ async fn three_order_dependent_inbound_calls_in_one_bundle() {
 }
 
 /// Both directions in one slot. Pins the canonical block order — outbound
-/// `[load, user]` pairs first, then inbound deliveries — and the L1 world
+/// `[load, user]` pairs first, then inbound deliveries — and the L1 state
 /// advancing by real frames: the outbound call executes inside
 /// `postAndVerifyBatch`, ahead of the inbound user tx in the same bundle.
 ///
@@ -559,7 +559,7 @@ async fn poison_mid_bundle_leaves_survivors_correct() {
 }
 
 /// Two outbound calls from ONE L2 sender (nonces n, n+1) in one slot against a
-/// stateful L1 target. The L1 world must advance by real frames between the
+/// stateful L1 target. The L1 state must advance by real frames between the
 /// two source simulations: `increment()` then `add(5)` leaves count 6, and the
 /// second call's claim is 6, not 5.
 ///
