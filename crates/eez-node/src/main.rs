@@ -976,7 +976,10 @@ fn main() -> eyre::Result<()> {
         // Start polling last: every consumer is subscribed and catch-up
         // covered [deploy_block, seed], so the watcher owns all blocks
         // strictly after its seed — no startup scan gap.
-        l1_watcher.start(l1_seed_number, l1_seed_hash);
+        task_executor.spawn_critical_task(
+            "eez-l1-watcher",
+            l1_watcher.polling(l1_seed_number, l1_seed_hash),
+        );
 
         handle.wait_for_node_exit().await
     })

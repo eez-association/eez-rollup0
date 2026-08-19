@@ -31,10 +31,14 @@ use tracing::{Level, event};
 
 use crate::error::{DeriverError, DeriverResult};
 
-/// Watcher-seed lag when the L1 reports no finalized block (no CL yet /
-/// dev chain): two Ethereum epochs — deeper than any realistic reorg —
-/// so the seed is effectively immutable even without finality data.
-const NO_FINALITY_SEED_LAG: u64 = 64;
+/// Watcher seed: the finalized block, kept inside the range this scan read.
+/// Both bounds have wedged boot in the field. Separate fn so they stay
+/// unit-testable without a provider.
+fn choose_seed(floor: u64, end: u64, finalized: Option<u64>) -> u64 {
+    // `floor.min(end)` is load-bearing: `clamp` PANICS when min > max, which a
+    // rewound L1 can produce.
+    finalized.unwrap_or(floor).clamp(floor.min(end), end)
+}
 
 /// L1-derived L2 consensus engine. Cheaply [`Clone`]able.
 #[derive(Clone)]
@@ -156,8 +160,8 @@ where
     ///
     /// # Errors
     ///
-    /// `l2_provider` (lookup / scan failure), `local_diverged` (replay
-    /// failure), `committer_closed`.
+    /// `l1_scan` (scan failure), `l2_provider` (lookup failure),
+    /// `local_diverged` (replay failure), `committer_closed`.
     ///
     /// # Panics
     ///
@@ -166,7 +170,7 @@ where
         self.catch_up_inner().await.map(|_| ())
     }
 
-    /// [`Self::catch_up`], additionally returning the `L1Watcher::start`
+    /// [`Self::catch_up`], additionally returning the `L1Watcher::polling`
     /// seed: the finalized block, kept inside the range this scan read so
     /// the seed is immutable and always servable. Boot-only.
     ///
@@ -176,80 +180,61 @@ where
     /// L1 source cannot yet serve the seed block's hash.
     pub async fn catch_up_with_seed(&self) -> DeriverResult<(u64, B256)> {
         let end = self.catch_up_inner().await?;
-        // Anchor floor: (block, hash) of the newest still-canonical indexed
-        // batch — just revalidated, so the hash is trusted with no extra
-        // fetch. Empty index → deploy_block - 1, hash fetched below.
-        let (floor_number, floor_hash) = match self.inner.l1_head.last_indexed() {
-            Some(tail) => (tail.l1_block, Some(tail.l1_block_hash)),
-            None => (self.inner.deploy_block.saturating_sub(1), None),
-        };
-        // The floor is a lower bound on a seed that must also stay within what
-        // the scan read: a source that has not reached the deploy block yet
-        // (a fresh devnet L1 still syncing) has no such block to seed at, and
-        // waiting for one deadlocks boot. Seed at the endpoint instead — the
-        // watcher scans everything after it as the source advances.
-        let (floor_number, floor_hash) = if floor_number > end {
-            (end, None)
-        } else {
-            (floor_number, floor_hash)
-        };
-        let (seed_number, known_hash) = match self
+        // NOT canonicality-probed: at boot this tail is a batch THIS scan just
+        // found, with a hash straight from `get_logs`. Cross-checked below.
+        let indexed_tail = self.inner.l1_head.last_indexed();
+        let floor = indexed_tail
+            .as_ref()
+            .map_or_else(|| self.inner.deploy_block.saturating_sub(1), |t| t.l1_block);
+        let finalized = self
             .inner
             .submitter
             .finalized_block()
             .await
+            .map_err(DeriverError::l1_scan)?;
+        // No finality yet (a chain younger than two epochs) → the floor, which
+        // this scan read and the watcher's ancestor backfill makes reorg-safe.
+        let seed = choose_seed(floor, end, finalized.map(|(n, _)| n));
+        let canonical = self
+            .inner
+            .submitter
+            .canonical_l1_hash(seed)
+            .await
             .map_err(DeriverError::l1_scan)?
-        {
-            // In [floor, end]: seed at finalized directly — the hash can
-            // never change under us.
-            Some((number, hash)) if number <= end && number >= floor_number => (number, Some(hash)),
-            // Finalized below the floor: the floor wins (pruned-safe).
-            Some((number, _)) if number <= end => (floor_number, floor_hash),
-            // Finality caught up past a long scan: the endpoint itself is
-            // finalized, so fetching its hash below is race-free.
-            Some(_) if end >= floor_number => (end, None),
-            Some(_) => (floor_number, floor_hash),
-            // No finality data: seed NO_FINALITY_SEED_LAG below the
-            // endpoint — effectively immutable anyway; warn, stay loud.
-            None => {
-                let seed = end.saturating_sub(NO_FINALITY_SEED_LAG);
-                event!(
-                    name: "eez.deriver.catch_up.no_finalized",
-                    Level::WARN,
-                    scan_end = end,
-                    seed,
-                    "L1 reports no finalized block; seeding watcher below the scan endpoint",
-                );
-                if seed <= floor_number {
-                    (floor_number, floor_hash)
-                } else {
-                    (seed, None)
-                }
-            }
-        };
-        let seed_hash = match known_hash {
-            Some(hash) => hash,
-            None => self
-                .inner
-                .submitter
-                .canonical_l1_hash(seed_number)
-                .await
-                .map_err(DeriverError::l1_scan)?
-                .ok_or_else(|| {
-                    // Not served yet (source syncing toward the deploy block)
-                    // or rewound mid-catch-up — retryable, not fatal.
-                    DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
-                        block: seed_number,
-                        tx_hash: B256::ZERO,
-                        detail: "catch-up seed block not served by the L1 source yet".into(),
-                    })
-                })?,
-        };
-        Ok((seed_number, seed_hash))
+            .ok_or_else(|| {
+                // Not served yet, or rewound mid-scan — retryable, not fatal.
+                DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
+                    block: seed,
+                    tx_hash: B256::ZERO,
+                    detail: "catch-up seed block not served by the L1 source yet".into(),
+                })
+            })?;
+        // A batch this scan indexed at the seed height sitting on another fork
+        // means the chain moved under us: retry so `revalidate_index_tail` drops
+        // it. (A finalized seed needs no such check — it cannot reorg.)
+        if indexed_tail.is_some_and(|t| t.l1_block == seed && t.l1_block_hash != canonical) {
+            return Err(DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
+                block: seed,
+                tx_hash: B256::ZERO,
+                detail: "catch-up seed block reorged during the scan; retry".into(),
+            }));
+        }
+        event!(
+            name: "eez.deriver.catch_up.seed",
+            Level::INFO,
+            floor,
+            scan_end = end,
+            finalized = ?finalized.map(|(n, _)| n),
+            seed,
+            seed_hash = %canonical,
+            "watcher seed chosen",
+        );
+        Ok((seed, canonical))
     }
 
     /// Shared body of [`Self::catch_up`] / [`Self::catch_up_with_seed`].
-    /// Returns the inclusive L1 block the scan covered through.
+    /// Returns the inclusive L1 block covered: the scan's endpoint, or the
+    /// tip when the range was empty (nothing below it can hold our events).
     async fn catch_up_inner(&self) -> DeriverResult<u64> {
         let _guard = self.inner.committer.begin_reconcile().await;
         let old_cursor = self.inner.l1_head.cursor();
@@ -276,8 +261,17 @@ where
                 .submitter
                 .canonical_l1_hash(tail.l1_block)
                 .await
-                .map_err(|e| DeriverError::l2_provider(format!("L1 canonicality probe: {e}")))?;
-            if canonical == Some(tail.l1_block_hash) {
+                .map_err(DeriverError::l1_scan)?;
+            // `None` is not proof of a reorg — retreating on it would unwind
+            // L2 to genesis, so retry instead.
+            let Some(canonical) = canonical else {
+                return Err(DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
+                    block: tail.l1_block,
+                    tx_hash: tail.tx_hash,
+                    detail: "indexed batch's L1 block not served; cannot judge canonicality".into(),
+                }));
+            };
+            if canonical == tail.l1_block_hash {
                 return Ok(Some(tail.l1_block));
             }
             let old_cursor = self.inner.l1_head.cursor();
@@ -290,7 +284,7 @@ where
                 Level::WARN,
                 l1_block = tail.l1_block,
                 indexed_hash = %tail.l1_block_hash,
-                canonical_hash = ?canonical,
+                canonical_hash = %canonical,
                 old_cursor,
                 new_cursor,
                 dropped_batches = dropped,
@@ -2078,5 +2072,24 @@ mod outbound_wiring_tests {
             )
             .is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::choose_seed;
+
+    /// The seed must never leave `[floor, end]` — both bounds have been wrong
+    /// in the field, wedging boot each time.
+    #[test]
+    fn choose_seed_stays_within_the_scanned_range() {
+        assert_eq!(choose_seed(500, 1000, Some(968)), 968); // finality lags the tip
+        assert_eq!(choose_seed(990, 1000, Some(900)), 990); // finalized below floor
+        assert_eq!(choose_seed(500, 1000, Some(1010)), 1000); // finality past scan
+        // Chain too young to finalize: the floor is what the scan read.
+        assert_eq!(choose_seed(500, 1000, None), 500);
+        // Floor above the endpoint (L1 rewound under an indexed batch).
+        assert_eq!(choose_seed(999, 40, Some(20)), 40);
+        assert_eq!(choose_seed(0, 0, None), 0);
     }
 }

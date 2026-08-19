@@ -2,12 +2,12 @@
 //! advances. Emits [`L1Event`]s on a [`broadcast::Sender`] for the
 //! Deriver and Composer to consume.
 //!
-//! The watcher never picks its own baseline: [`L1Watcher::start`] takes
+//! The watcher never picks its own baseline: [`L1Watcher::polling`] takes
 //! a block the caller already scanned (the Deriver's finalized-clamped
 //! catch-up endpoint) and seeds the canonical ring with it. Every poll
-//! path scans `BatchPosted` logs before committing ring state or
-//! emitting events, so a failed cycle retries the identical range next
-//! tick.
+//! path scans `BatchPosted` logs before advancing the ring forward or
+//! emitting heads, so a failed cycle retries the identical range next
+//! tick. A reorg retreat (Reorg + rewind) still precedes its scan.
 //!
 //! HTTP polling (reuses `SubmitterConfig::rpc_url`) — 2s interval, well
 //! inside gnosis 5s / Ethereum mainnet 12s block times.
@@ -53,6 +53,11 @@ const FINALIZED_REFRESH_TICKS: u64 = 6;
 /// events; downstream design must tolerate this (e.g., resync by
 /// reading on-chain state).
 const EVENT_BUFFER: usize = 256;
+
+/// Attempts to read the seed block and its ancestors before the watcher gives
+/// up — ~5 min at `POLL_INTERVAL`. Long enough to outlast a restarting L1,
+/// short enough to surface one that stopped serving a block it just served.
+const MAX_SEED_ATTEMPTS: u32 = 150;
 
 /// Event emitted by the [`L1Watcher`].
 #[derive(Debug, Clone)]
@@ -178,6 +183,11 @@ impl L1WatcherConfig {
             }
         };
 
+        if reorg_max_depth == 0 {
+            return Err(L1Error::Config(
+                "EEZ_L1_REORG_MAX_DEPTH_BLOCKS must be >= 1 (0 tolerates no reorg at all)".into(),
+            ));
+        }
         Ok(Self {
             rpc_url,
             eez,
@@ -211,7 +221,7 @@ impl std::fmt::Debug for L1Watcher {
 }
 
 impl L1Watcher {
-    /// Constructs a handle. Spawns nothing — call [`Self::start`] once
+    /// Constructs a handle. Spawns nothing — call [`Self::polling`] once
     /// all subscribers exist.
     #[must_use]
     pub fn new(config: L1WatcherConfig) -> Self {
@@ -221,16 +231,16 @@ impl L1Watcher {
         }
     }
 
-    /// Spawns the polling task on the current tokio runtime, seeded at
+    /// The polling loop, seeded at
     /// `seed_number`/`seed_hash` — a block the caller already scanned
     /// (the Deriver's finalized-clamped catch-up endpoint). The watcher
     /// owns and scans everything strictly after it. Call once, after all
     /// subscribers exist.
-    pub fn start(&self, seed_number: u64, seed_hash: B256) {
+    pub fn polling(&self, seed_number: u64, seed_hash: B256) -> impl Future<Output = ()> + use<> {
         let runner = self.clone();
-        tokio::spawn(async move {
+        async move {
             runner.run(seed_number, seed_hash).await;
-        });
+        }
     }
 
     /// Returns a new receiver subscribed to all future [`L1Event`]s.
@@ -244,7 +254,63 @@ impl L1Watcher {
     async fn run(self, seed_number: u64, seed_hash: B256) {
         let provider = ProviderBuilder::new().connect_http(self.inner.config.rpc_url.clone());
         let mut state = WatcherState::new(self.inner.config.reorg_max_depth);
-        state.push_canonical(seed_number, seed_hash);
+        // Seed fully before polling: a one-entry ring can't walk back a
+        // reorg, trading a retryable error now for ReorgTooDeep later.
+        let mut seed_attempts = 0_u32;
+        let seed_ts = loop {
+            if seed_attempts >= MAX_SEED_ATTEMPTS {
+                event!(
+                    name: "eez.l1_watcher.seed.exhausted",
+                    Level::ERROR,
+                    seed_number,
+                    seed_attempts,
+                    "L1 never served the seed block and its ancestors; stopping the node",
+                );
+                // Panic, not return: see the poll loop below. Returning here is
+                // worse still — no NewHead has been emitted, so the scheduler
+                // would never arm and the node would idle forever.
+                panic!(
+                    "L1 watcher could not seed at block {seed_number} after {seed_attempts} attempts"
+                );
+            }
+            match fetch_block_by_hash(&provider, seed_hash).await {
+                Ok(seed) => {
+                    match fetch_ancestor_window(&provider, seed, self.inner.config.reorg_max_depth)
+                        .await
+                    {
+                        Ok(window) => {
+                            for (number, hash) in window {
+                                state.push_canonical(number, hash);
+                            }
+                            break seed.timestamp;
+                        }
+                        Err(err) => event!(
+                            name: "eez.l1_watcher.seed.ancestors_unavailable",
+                            Level::WARN,
+                            seed_number,
+                            error = %err,
+                            "seed ancestors unavailable; retrying before polling",
+                        ),
+                    }
+                }
+                Err(err) => event!(
+                    name: "eez.l1_watcher.seed.unreadable",
+                    Level::WARN,
+                    seed_number,
+                    error = %err,
+                    "seed block unreadable; retrying before polling",
+                ),
+            }
+            seed_attempts += 1;
+            tokio::time::sleep(POLL_INTERVAL).await;
+        };
+        // The seed's NewHead arms the scheduler and is REQUIRED — without it a
+        // quiet L1 never produces one.
+        self.emit(L1Event::NewHead {
+            block_number: seed_number,
+            block_hash: seed_hash,
+            timestamp: seed_ts,
+        });
         let mut ticker = interval_at(Instant::now() + POLL_INTERVAL, POLL_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut tick_count: u64 = 0;
@@ -256,6 +322,7 @@ impl L1Watcher {
             poll_interval_secs = POLL_INTERVAL.as_secs(),
             reorg_max_depth = self.inner.config.reorg_max_depth,
             seed_number,
+            ring_entries = state.recent.len(),
             "L1 watcher polling started",
         );
 
@@ -263,6 +330,19 @@ impl L1Watcher {
             ticker.tick().await;
             tick_count += 1;
             if let Err(err) = self.poll_cycle(&provider, &mut state, tick_count).await {
+                // Retrying a deterministic error is an infinite silent stall.
+                // PANIC, don't return: reth's critical-task wrapper reports
+                // only panics, so a return exits just as quietly.
+                if err.is_terminal() {
+                    event!(
+                        name: "eez.l1_watcher.poll.terminal",
+                        Level::ERROR,
+                        error = %err,
+                        tick = tick_count,
+                        "L1 poll cycle failed unrecoverably; stopping the node",
+                    );
+                    panic!("L1 watcher stopped at tick {tick_count}: {err}");
+                }
                 event!(
                     name: "eez.l1_watcher.poll.failed",
                     Level::WARN,
@@ -364,12 +444,10 @@ impl L1Watcher {
                         new_head_number: latest_number,
                         new_head_hash: latest_hash,
                     });
-                    // Reseed at the ancestor so later ticks (and
-                    // any chunk failure) re-enter as a plain,
-                    // still-canonical catch-up — the Reorg is
-                    // never re-emitted.
-                    state.rewind_to(0);
-                    state.push_canonical(common.number, common.hash);
+                    // Retreat so later ticks re-enter as plain catch-up.
+                    // `common` is from the ring, so this KEEPS its ancestors —
+                    // clearing them would leave a ring that can't walk back.
+                    state.rewind_to(common.number);
                     return Ok(());
                 }
 
@@ -378,17 +456,9 @@ impl L1Watcher {
                 // failed chunk costs nothing — the next tick
                 // recomputes the same range from the tip.
                 //
-                // Reorg tolerance while catching up is boundary-only:
-                // the reseed below leaves ONE ring entry. A reorg
-                // above the boundary needs no retraction — the next
-                // chunk re-scans canonical logs, and re-delivered
-                // batches dedup downstream by tx hash. A reorg that
-                // invalidates the boundary itself exceeds the ring
-                // and halts loudly with ReorgTooDeep. Mid-catch-up
-                // boundaries sit ≥ LOG_SCAN_CHUNK_BLOCKS below the
-                // live tip, out of real reorg reach; the final
-                // (at-latest) boundary IS exposed, so it refills a full
-                // ancestor window instead of a single entry.
+                // Reorg tolerance here is boundary-only: a reorg above it
+                // needs no retraction, since the next chunk re-scans and
+                // re-delivered batches dedup by tx hash downstream.
                 let scan_from = old_tip_number + 1;
                 let chunk_to = scan_from
                     .saturating_add(crate::scan::LOG_SCAN_CHUNK_BLOCKS - 1)
@@ -433,7 +503,12 @@ impl L1Watcher {
                 } else {
                     fetch_block_by_tag(provider, BlockNumberOrTag::Number(reached)).await?
                 };
-                let window = if boundary.number == latest_number {
+                // Refill whenever the boundary is within reorg reach of the
+                // tip; a lone entry there can't walk back a one-block reorg.
+                // Narrowing and a short final chunk both land there.
+                let window = if latest_number.saturating_sub(boundary.number)
+                    < state.reorg_max_depth as u64
+                {
                     fetch_ancestor_window(provider, boundary, state.reorg_max_depth).await?
                 } else {
                     vec![(boundary.number, boundary.hash)]
@@ -516,12 +591,25 @@ impl L1Watcher {
             // for each missed block and scanning its BatchPosted
             // logs.
             let scan_from = common.number + 1;
-            let scanned = self
-                .fetch_batch_logs(provider, scan_from, latest_number)
+            let (scanned, reached) = crate::scan::scan_batch_logs_range_adaptive(
+                provider,
+                self.inner.config.eez,
+                self.inner.config.rollup_id,
+                scan_from,
+                latest_number,
+            )
+            .await?;
+            // Narrowed: commit only what was read; the next tick resumes there.
+            let (to, to_hash) = if reached == latest_number {
+                (latest_number, latest_hash)
+            } else {
+                let boundary =
+                    fetch_block_by_tag(provider, BlockNumberOrTag::Number(reached)).await?;
+                (reached, boundary.hash)
+            };
+            self.fill_forward(provider, scan_from, to, to_hash, state)
                 .await?;
-            self.fill_forward(provider, scan_from, latest_number, latest_hash, state)
-                .await?;
-            self.emit_scanned_batches(scan_from, latest_number, scanned);
+            self.emit_scanned_batches(scan_from, to, scanned);
         }
 
         if tick_count.is_multiple_of(FINALIZED_REFRESH_TICKS) {
@@ -581,10 +669,8 @@ impl L1Watcher {
     /// Fetches `BatchPosted` logs in `[from, to]` without emitting —
     /// callers commit ring state only after this succeeds.
     ///
-    /// Non-adaptive by design: callers pass a single block, or `common+1..latest`
-    /// bounded by `2 * reorg_max_depth` (the far-behind guard caps `latest`, the
-    /// ancestor walk caps `common`), so a result-count refusal is out of reach.
-    /// Wide ranges go through [`scan_batch_logs_range_adaptive`] instead.
+    /// Non-adaptive by design: the only caller passes a single block. Wider
+    /// ranges go through [`scan_batch_logs_range_adaptive`] instead.
     async fn fetch_batch_logs(
         &self,
         provider: &impl Provider,
@@ -681,6 +767,10 @@ struct WatcherState {
 
 impl WatcherState {
     fn new(reorg_max_depth: usize) -> Self {
+        // `L1WatcherConfig`'s fields are pub, so `from_env`'s rejection of 0 is
+        // not the only way in. At 0 every push pops itself, emptying the ring
+        // and panicking the tip lookup on the first tick.
+        let reorg_max_depth = reorg_max_depth.max(1);
         Self {
             recent: VecDeque::with_capacity(reorg_max_depth),
             reorg_max_depth,
@@ -1133,7 +1223,9 @@ mod tests {
         let stale_tip_hash = B256::with_last_byte(0xAA);
         let ancestor_hash = B256::with_last_byte(0x99);
         let replaced_hash = B256::with_last_byte(0xDD);
+        let older_hash = B256::with_last_byte(0x88);
         let mut state = WatcherState::new(3);
+        state.push_canonical(8, older_hash);
         state.push_canonical(9, ancestor_hash);
         state.push_canonical(10, stale_tip_hash);
 
@@ -1159,6 +1251,9 @@ mod tests {
             Some((9, ancestor_hash)),
             "ring reseeds at ancestor"
         );
+        // Retreat KEEPS ancestors below `common`; clearing them would leave a
+        // ring that can't walk back the next reorg.
+        assert_eq!(state.lookup_hash(older_hash), Some(8), "ancestor 8 dropped");
         match rx.try_recv().expect("one event emitted") {
             L1Event::Reorg {
                 common_ancestor_number,
@@ -1290,6 +1385,58 @@ mod tests {
         assert!(rx.try_recv().is_err(), "nothing else emitted on retry");
     }
 
+    /// Walk-back with a NARROWED (not failed) scan: the ring and NewHeads
+    /// must stop at `reached`, never `latest` — the tail is next tick's.
+    #[tokio::test]
+    async fn walk_back_narrowed_scan_reseeds_ring_at_reached_not_latest() {
+        let (watcher, mut rx) = test_watcher();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let tip_hash = B256::with_last_byte(0xAA); // height 10
+        let h11 = B256::with_last_byte(0x11); // height 11, parent = tip_hash
+        let h12 = B256::with_last_byte(0x12); // height 12, parent = h11
+        let h13 = B256::with_last_byte(0x13); // height 13 (latest), parent = h12
+        let mut state = WatcherState::new(3);
+        state.push_canonical(10, tip_hash);
+
+        // gap == reorg_max_depth → walk-back, not far-behind. Common ancestor
+        // is 10, no reorg. The [11, 13] scan is too wide and halves to [11,12].
+        asserter.push_success(&mock_block(13, h13, h12, 1_300));
+        asserter.push_success(&mock_block(12, h12, h11, 1_200)); // walk-back fetch
+        asserter.push_success(&mock_block(11, h11, tip_hash, 1_100)); // walk-back fetch
+        asserter.push_failure_msg("query returned more than 10000 results"); // get_logs [11,13]
+        asserter.push_success(&serde_json::json!([])); // get_logs [11,12] BatchPosted
+        asserter.push_success(&serde_json::json!([])); // get_logs [11,12] winners
+        asserter.push_success(&mock_block(12, h12, h11, 1_200)); // boundary fetch (reached != latest)
+        asserter.push_success(&mock_block(12, h12, h11, 1_200)); // fill_forward: by-hash h12
+        asserter.push_success(&mock_block(11, h11, tip_hash, 1_100)); // fill_forward: by-hash h11
+
+        watcher
+            .poll_cycle(&provider, &mut state, 1)
+            .await
+            .expect("narrowed scan must not propagate — reseeding at reached is the remedy");
+
+        assert_eq!(
+            state.tip(),
+            Some((12, h12)),
+            "ring reseeds at the NARROWED boundary, not latest (13)"
+        );
+        assert_eq!(state.recent.len(), 3);
+        match rx.try_recv().expect("first event") {
+            L1Event::NewHead { block_number, .. } => assert_eq!(block_number, 11),
+            other => panic!("expected NewHead(11), got {other:?}"),
+        }
+        match rx.try_recv().expect("second event") {
+            L1Event::NewHead { block_number, .. } => assert_eq!(block_number, 12),
+            other => panic!("expected NewHead(12), got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "NewHeads must stop at the narrowed boundary — none for 13"
+        );
+    }
+
     /// A seeded tip that still matches `latest` is a no-op cycle: no
     /// scan, no events, ring untouched.
     #[tokio::test]
@@ -1350,6 +1497,33 @@ mod tests {
         assert_eq!(state.tip(), Some((4, B256::with_last_byte(4))));
         assert!(state.lookup_hash(B256::with_last_byte(5)).is_none());
         assert_eq!(state.lookup_hash(B256::with_last_byte(4)), Some(4));
+    }
+
+    /// Depth 0 is constructible (pub fields) and would empty the ring.
+    #[test]
+    fn zero_reorg_depth_still_keeps_a_usable_ring() {
+        let mut state = WatcherState::new(0);
+        state.push_canonical(9, B256::with_last_byte(9));
+        assert_eq!(state.tip(), Some((9, B256::with_last_byte(9))));
+    }
+
+    /// Deterministic errors stop the loop; retryable ones must not.
+    #[test]
+    fn only_deterministic_errors_are_terminal() {
+        let depth = L1Error::ReorgTooDeep {
+            walked: 62,
+            max: 62,
+        };
+        let incomplete = L1Error::SourceIncomplete {
+            block: 1,
+            tx_hash: B256::ZERO,
+            detail: "warming up".into(),
+        };
+        assert!(L1Error::Decode("bad abi".into()).is_terminal());
+        assert!(depth.is_terminal());
+        // A malformed RPC response is retryable — re-requesting can succeed.
+        assert!(!L1Error::Provider("log missing block_hash".into()).is_terminal());
+        assert!(!incomplete.is_terminal());
     }
 
     #[test]
