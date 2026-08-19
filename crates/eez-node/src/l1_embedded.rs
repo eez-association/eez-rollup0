@@ -8,7 +8,7 @@
 //!   - **Testing** (vanilla EthereumNode, 5s auto-mine) — dev mode with the
 //!     non-atomic mock bundle RPC; the default. `EEZ_L1_CHAIN=testing`.
 //!
-//! The `NodeBuilder` launch is inline in [`crate::main`] — the
+//! The `NodeBuilder` launch is inline in [`crate::run`] — the
 //! nested-generic `NodeHandle` AddOns types resist a typed helper.
 
 use std::{path::PathBuf, sync::Arc};
