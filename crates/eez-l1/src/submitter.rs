@@ -1,7 +1,6 @@
-//! Thin L1-interaction primitive: sends `postAndVerifyBatch` via
-//! `eth_sendBundle` and reads past `BatchPosted` events. Stateless —
-//! the runtime composer owns cursors, batch construction, and prover
-//! orchestration.
+//! Thin signed L1-submission primitive: sends `postAndVerifyBatch` via
+//! `eth_sendBundle`. Read-only canonical-chain scans live in
+//! [`L1Reader`](crate::L1Reader).
 //!
 //! `eth_sendBundle` pins inclusion to one L1 block. If the bundle
 //! isn't in that block we report [`SendOutcome::Dropped`] and the
@@ -24,7 +23,7 @@ use tracing::{Level, event};
 
 use crate::config::SubmitterConfig;
 use crate::error::{L1Error, L1Result};
-use crate::scan::{BatchLogChunks, ScannedBatch, scan_next_batch_log_chunk};
+use crate::l1_reader::L1Reader;
 
 /// Wall-clock cap on the target-block + inclusion check.
 const TARGET_WAIT_BUDGET: Duration = Duration::from_secs(30);
@@ -74,6 +73,7 @@ pub struct Submitter {
 
 struct Inner {
     config: SubmitterConfig,
+    reader: L1Reader,
     http: reqwest::Client,
 }
 
@@ -89,9 +89,11 @@ impl Submitter {
     /// Build a Submitter from its config.
     #[must_use]
     pub fn new(config: SubmitterConfig) -> Self {
+        let reader = L1Reader::new(config.reader.clone());
         Self {
             inner: Arc::new(Inner {
                 config,
+                reader,
                 // Bounded timeout so a hanging/unreachable builder relay cannot
                 // stall the one-in-flight gate forever: a timed-out `eth_sendBundle`
                 // returns Err, which `observe_bundle_outcome` treats as a drop →
@@ -104,6 +106,14 @@ impl Submitter {
                     .unwrap_or_else(|_| reqwest::Client::new()),
             }),
         }
+    }
+
+    /// Clone the read-only canonical L1 client contained by this Submitter.
+    /// The Deriver uses it without gaining access to submission credentials or
+    /// builder routing.
+    #[must_use]
+    pub fn reader(&self) -> L1Reader {
+        self.inner.reader.clone()
     }
 
     /// L1 EOA address this Submitter sends from. Used by the Composer
@@ -213,74 +223,6 @@ impl Submitter {
             .is_some())
     }
 
-    /// Creates bounded `BatchPosted` log chunks from `from_block` to the
-    /// current L1 head. Call [`Self::next_batch_log_chunk`] to consume it.
-    ///
-    /// # Errors
-    ///
-    /// [`L1Error::Provider`] on RPC failure.
-    pub async fn batch_log_chunks(&self, from_block: u64) -> L1Result<BatchLogChunks> {
-        let provider = self.inner.build_provider();
-        let latest = provider
-            .get_block_number()
-            .await
-            .map_err(|e| L1Error::Provider(format!("get_block_number: {e}")))?;
-        Ok(BatchLogChunks::new(from_block, latest))
-    }
-
-    /// Scans and returns the next `BatchPosted` log chunk, or `None` when
-    /// the chunks are exhausted.
-    ///
-    /// # Errors
-    ///
-    /// - [`L1Error::Provider`] on RPC failure (log fetch, tx fetch).
-    /// - [`L1Error::SourceIncomplete`] when a canonical batch tx is not
-    ///   served by the L1 source yet — retryable once the source syncs.
-    pub async fn next_batch_log_chunk(
-        &self,
-        chunks: &mut BatchLogChunks,
-    ) -> L1Result<Option<Vec<ScannedBatch>>> {
-        let provider = self.inner.build_provider();
-        scan_next_batch_log_chunk(
-            &provider,
-            self.inner.config.eez,
-            self.inner.config.rollup_id,
-            chunks,
-        )
-        .await
-    }
-
-    /// Hash of the canonical L1 block at `number`, or `None` if none. Used by
-    /// the Deriver's resync to check whether an indexed batch is still canonical.
-    ///
-    /// # Errors
-    ///
-    /// [`L1Error::Provider`] on RPC failure.
-    pub async fn canonical_l1_hash(&self, number: u64) -> L1Result<Option<alloy_primitives::B256>> {
-        let provider = self.inner.build_provider();
-        Ok(provider
-            .get_block_by_number(BlockNumberOrTag::Number(number))
-            .await
-            .map_err(|e| L1Error::Provider(format!("get_block_by_number({number}): {e}")))?
-            .map(|b| b.header.hash))
-    }
-
-    /// The L1 source's finalized block `(number, hash)`, or `None` when the
-    /// source reports no finalized block yet (fresh embedded chiado before
-    /// the CL's first FCU; dev chains without a CL).
-    ///
-    /// # Errors
-    ///
-    /// [`L1Error::Provider`] on RPC failure.
-    pub async fn finalized_block(&self) -> L1Result<Option<(u64, alloy_primitives::B256)>> {
-        let provider = self.inner.build_provider();
-        Ok(provider
-            .get_block_by_number(BlockNumberOrTag::Finalized)
-            .await
-            .map_err(|e| L1Error::Provider(format!("get_block(finalized): {e}")))?
-            .map(|b| (b.header.number, b.header.hash)))
-    }
-
     /// Timestamp of an L1 block on the target chain, or `None` if absent.
     /// Distinguishes a skipped-slot drop from a genuine exclusion.
     pub async fn block_timestamp(&self, number: u64) -> L1Result<Option<u64>> {
@@ -294,14 +236,6 @@ impl Submitter {
 }
 
 impl Inner {
-    fn build_provider(&self) -> impl Provider + use<> {
-        // No wallet: writes go through the builder relay, reads
-        // don't need signing. Pre-sim sets `from` explicitly.
-        ProviderBuilder::new()
-            .disable_recommended_fillers()
-            .connect_http(self.config.rpc_url.clone())
-    }
-
     /// Provider used ONLY for target-block discovery on
     /// `BundleTarget::NextBlock`. Falls back to the main RPC when no
     /// override URL is set. See `SubmitterConfig::target_rpc_url`.
@@ -310,7 +244,7 @@ impl Inner {
             .config
             .target_rpc_url
             .clone()
-            .unwrap_or_else(|| self.config.rpc_url.clone());
+            .unwrap_or_else(|| self.reader.rpc_url());
         ProviderBuilder::new()
             .disable_recommended_fillers()
             .connect_http(url)
@@ -533,9 +467,9 @@ impl Inner {
         expected_final_state: Option<alloy_primitives::B256>,
     ) -> L1Result<bool> {
         let winners = Filter::new()
-            .address(self.config.eez)
+            .address(self.reader.eez())
             .event_signature(L2ExecutionPerformed::SIGNATURE_HASH)
-            .topic1(U256::from(self.config.rollup_id))
+            .topic1(U256::from(self.reader.rollup_id()))
             .from_block(l1_block)
             .to_block(l1_block);
         let logs = provider

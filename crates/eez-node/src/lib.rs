@@ -34,7 +34,8 @@ use eez_driver::{
     Sequencer, SyncSlotComposerHandle, spawn_interval, spawn_l1_anchored,
 };
 use eez_l1::{
-    L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
+    L1CanonicalHead, L1HeadStream, L1Reader, L1ReaderConfig, L1Watcher, L1WatcherConfig, Submitter,
+    SubmitterConfig,
 };
 use eez_prover::MockEcdsaProver;
 use mimalloc::MiMalloc;
@@ -282,7 +283,7 @@ async fn launch_follower(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Res
         None,
     )?;
 
-    let submitter = Submitter::new(SubmitterConfig::from_env_read_only()?);
+    let l1_reader = L1Reader::new(L1ReaderConfig::from_env()?);
     let rollup_config = RollupConfig::from_env()?;
     let l1_watcher = L1Watcher::new(L1WatcherConfig::from_env()?);
     let system_tx_cfg = build_follower_system_tx_cfg(&chain_spec)?;
@@ -296,7 +297,7 @@ async fn launch_follower(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Res
     let deriver = Deriver::new(
         block_committer.clone(),
         Arc::new(provider.clone()),
-        submitter,
+        l1_reader,
         chain_spec,
         timing.l2_block_time().as_secs(),
         rollup_config.deploy_block,
@@ -906,7 +907,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     let deriver = Deriver::new(
         block_committer.clone(),
         Arc::new(provider.clone()),
-        submitter.clone(),
+        submitter.reader(),
         chain_spec,
         l2_block_time_secs,
         rollup_config.deploy_block,
