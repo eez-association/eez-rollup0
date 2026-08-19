@@ -130,7 +130,6 @@ def run(plan, args):
 
     # eez-node: embedded L1, composer, L2, and cross-chain fronts.
     eez_env = {
-        "EEZ_L1_EMBEDDED": "1",
         "EEZ_L1_CHAIN": "devnet",
         "EEZ_L1_CHAIN_PATH": "/genesis/genesis.json",
         "EEZ_L1_JWT_SECRET": "/jwt/jwtsecret",

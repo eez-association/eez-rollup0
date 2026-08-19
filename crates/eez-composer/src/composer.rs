@@ -525,9 +525,9 @@ struct Inner<L2: BlockReader> {
     /// EVM config — used by [`build_sync_block`] to construct the
     /// per-Sync-slot block via reth-evm `BlockBuilder`.
     evm_config: EthEvmConfig,
-    /// Cross-chain clients and execution context. `None` when L1 is not wired,
-    /// such as in standalone or follower modes.
-    cross_chain: Option<CrossChainWiring>,
+    /// Cross-chain clients and execution context, guaranteed by the
+    /// `eez-composer` entrypoint.
+    cross_chain: CrossChainWiring,
     /// Handle to the `BlockCommitter` actor (the sole engine-API
     /// owner). Set once at startup via [`Composer::set_committer`]
     /// after the Sequencer spawns the actor. Slot-context recovery uses it to
@@ -564,7 +564,7 @@ where
         prover: Arc<dyn Prover>,
         submitter: Submitter,
         evm_config: EthEvmConfig,
-        cross_chain: Option<CrossChainWiring>,
+        cross_chain: CrossChainWiring,
         timing: RollupTiming,
     ) -> Self {
         Self {
@@ -715,9 +715,7 @@ where
                         tx_count = txs.len(),
                         "L1 reorg rolled out optimistic batches; re-queueing their user_txs",
                     );
-                    if let Some(pool) = rollup.held_pool.as_ref() {
-                        pool.push_front_batch(txs);
-                    }
+                    rollup.held_pool.push_front_batch(txs);
                 }
             }
             Ok(L1Event::Finalized { block_number, .. }) => {
@@ -745,9 +743,7 @@ where
                         for (sync_height, post_batch_hash, txs) in finalized {
                             match submitter.receipt_exists(post_batch_hash).await {
                                 Ok(true) => {
-                                    if let Some(pool) = held_pool.as_ref() {
-                                        pool.release_in_flight_batch(&txs);
-                                    }
+                                    held_pool.release_in_flight_batch(&txs);
                                     event!(
                                         name: "eez.composer.finality_audit.ok",
                                         Level::DEBUG,
@@ -770,9 +766,7 @@ where
                                         tx_count = txs.len(),
                                         "finalized batch has NO postBatch receipt on L1 — reorg rolled it out unobserved; re-queueing its user_txs (front)",
                                     );
-                                    if let Some(pool) = held_pool.as_ref() {
-                                        pool.push_front_batch(txs);
-                                    }
+                                    held_pool.push_front_batch(txs);
                                 }
                                 Err(err) => {
                                     // Inconclusive: re-queueing txs that
@@ -789,9 +783,7 @@ where
                                         error = %err,
                                         "finality-audit receipt lookup failed; ledger entry dropped UNAUDITED",
                                     );
-                                    if let Some(pool) = held_pool.as_ref() {
-                                        pool.release_in_flight_batch(&txs);
-                                    }
+                                    held_pool.release_in_flight_batch(&txs);
                                 }
                             }
                         }
@@ -869,27 +861,8 @@ where
             );
             None
         })?;
-        let Some(pool) = rollup.held_pool.as_ref() else {
-            event!(
-                name: "eez.composer.sync_slot.no_pool",
-                Level::WARN,
-                rollup_id,
-                "rollup has no HeldPool configured",
-            );
-            return None;
-        };
-        let Some(cc) = self.inner.cross_chain.as_ref() else {
-            if !pool.is_empty() {
-                event!(
-                    name: "eez.composer.sync_slot.cross_chain_unavailable",
-                    Level::ERROR,
-                    rollup_id,
-                    tx_count = pool.len(),
-                    "cross-chain composition is unavailable; retaining held transactions",
-                );
-            }
-            return None;
-        };
+        let pool = rollup.held_pool.as_ref();
+        let cc = &self.inner.cross_chain;
         // Use the Sequencer-supplied parent header directly (it reflects
         // the just-committed block via `last_header`'s mirror); a
         // best-block re-lookup can race reth's provider-index and build
@@ -1158,6 +1131,7 @@ where
         failed: crate::optimistic::FailedBatch,
     ) -> RecoveryOutcome {
         let sync_height = failed.sync_height;
+        let pool = rollup.held_pool.as_ref();
         // Set by the two operations that move the head: the rollback and the
         // sibling commit.
         let mut outcome = RecoveryOutcome::HeadUnchanged;
@@ -1212,9 +1186,7 @@ where
             // roll it back again, and every postBatch in between
             // anchors against the wrong root.
             if rollup.l1_head.cursor() >= sync_height {
-                if let Some(pool) = rollup.held_pool.as_ref() {
-                    pool.release_in_flight_batch(&failed.txs);
-                }
+                pool.release_in_flight_batch(&failed.txs);
                 event!(
                     name: "eez.composer.recovery.stale_verdict",
                     Level::WARN,
@@ -1315,7 +1287,7 @@ where
         // preserved across retries. An included-but-reverted tx has a
         // burned nonce — re-bundling it would poison the next bundle's
         // simulation.
-        if let Some(pool) = rollup.held_pool.as_ref() {
+        {
             let mut keep: Vec<crate::HeldTx> = Vec::with_capacity(failed.txs.len());
             let mut release: Vec<crate::HeldTx> = Vec::new();
             let mut dropped = 0usize;
@@ -1451,6 +1423,7 @@ where
             self.inner.rollups.get(&rollup_id).ok_or_else(|| {
                 format!("unknown rollup_id {rollup_id} in compose_cross_chain_batch")
             })?;
+        let pool = rollup.held_pool.as_ref();
         let state = rollup
             .l2_provider
             .state_by_block_hash(parent_hash)
@@ -1527,9 +1500,7 @@ where
                 "held tx nonce is below its canonical source-chain nonce; evicting stale tx",
             );
         }
-        if let Some(pool) = rollup.held_pool.as_ref() {
-            pool.release_in_flight_batch(&stale);
-        }
+        pool.release_in_flight_batch(&stale);
 
         let mut survivors: Vec<HeldTx> = Vec::with_capacity(drained.len());
         // Inbound survivors' compositions (their `source.batch` = the L1
@@ -1736,21 +1707,19 @@ where
 
         // Evict the poison txs' gapped higher nonces from the pool — once
         // a sender's nonce N is evicted, N+1.. can never land.
-        if let Some(pool) = rollup.held_pool.as_ref() {
-            for tx in &poison {
-                // Inclusive eviction releases the poison root's reservation too.
-                for t in pool.evict_chain_at_or_above(tx.sender, tx.direction, tx.nonce) {
-                    event!(
-                        name: "eez.composer.cc_compose.poison_chain_evicted",
-                        Level::WARN,
-                        rollup_id,
-                        tx_hash = %t.hash,
-                        sender = %t.sender,
-                        nonce = t.nonce,
-                        gap_at = tx.nonce,
-                        "same-sender tx above an evicted poison nonce; gapped chain can't land — evicted (resubmit in order)",
-                    );
-                }
+        for tx in &poison {
+            // Inclusive eviction releases the poison root's reservation too.
+            for t in pool.evict_chain_at_or_above(tx.sender, tx.direction, tx.nonce) {
+                event!(
+                    name: "eez.composer.cc_compose.poison_chain_evicted",
+                    Level::WARN,
+                    rollup_id,
+                    tx_hash = %t.hash,
+                    sender = %t.sender,
+                    nonce = t.nonce,
+                    gap_at = tx.nonce,
+                    "same-sender tx above an evicted poison nonce; gapped chain can't land — evicted (resubmit in order)",
+                );
             }
         }
 
@@ -1764,30 +1733,28 @@ where
                 survivors = survivors.len(),
                 "transient compose failure; re-queueing and degrading to minimal postBatch this slot",
             );
-            if let Some(pool) = rollup.held_pool.as_ref() {
-                let mut requeue = survivors;
-                requeue.extend(rest);
-                let mut cascade_evicted = Vec::new();
-                requeue.retain(|tx| {
-                    let Some(gap_at) = poison_gap_for(&poison_gaps, tx) else {
-                        return true;
-                    };
-                    event!(
-                        name: "eez.composer.cc_compose.poison_chain_evicted",
-                        Level::WARN,
-                        rollup_id,
-                        tx_hash = %tx.hash,
-                        sender = %tx.sender,
-                        nonce = tx.nonce,
-                        gap_at,
-                        "same-sender unprocessed tx above an evicted poison nonce; evicted instead of re-queued (resubmit in order)",
-                    );
-                    cascade_evicted.push(tx.clone());
-                    false
-                });
-                pool.release_in_flight_batch(&cascade_evicted);
-                pool.push_front_batch(requeue);
-            }
+            let mut requeue = survivors;
+            requeue.extend(rest);
+            let mut cascade_evicted = Vec::new();
+            requeue.retain(|tx| {
+                let Some(gap_at) = poison_gap_for(&poison_gaps, tx) else {
+                    return true;
+                };
+                event!(
+                    name: "eez.composer.cc_compose.poison_chain_evicted",
+                    Level::WARN,
+                    rollup_id,
+                    tx_hash = %tx.hash,
+                    sender = %tx.sender,
+                    nonce = tx.nonce,
+                    gap_at,
+                    "same-sender unprocessed tx above an evicted poison nonce; evicted instead of re-queued (resubmit in order)",
+                );
+                cascade_evicted.push(tx.clone());
+                false
+            });
+            pool.release_in_flight_batch(&cascade_evicted);
+            pool.push_front_batch(requeue);
             return self
                 .dispatch_minimal_postbatch(
                     ctx,
@@ -1846,9 +1813,7 @@ where
                     error = %e,
                     "build_cross_chain_sync_pairs failed; re-queueing survivors, degrading to minimal postBatch",
                 );
-                if let Some(pool) = rollup.held_pool.as_ref() {
-                    pool.push_front_batch(survivors);
-                }
+                pool.push_front_batch(survivors);
                 return self
                     .dispatch_minimal_postbatch(
                         ctx,
@@ -1884,9 +1849,7 @@ where
                     error = %e,
                     "build_sync_block failed; re-queueing survivors, degrading to minimal postBatch",
                 );
-                if let Some(pool) = rollup.held_pool.as_ref() {
-                    pool.push_front_batch(survivors);
-                }
+                pool.push_front_batch(survivors);
                 return self
                     .dispatch_minimal_postbatch(
                         ctx,
@@ -1922,9 +1885,7 @@ where
                     error = %e,
                     "sync_block_pair_roots failed; re-queueing survivors, degrading to minimal postBatch",
                 );
-                if let Some(pool) = rollup.held_pool.as_ref() {
-                    pool.push_front_batch(survivors);
-                }
+                pool.push_front_batch(survivors);
                 return self
                     .dispatch_minimal_postbatch(
                         ctx,
@@ -1977,9 +1938,7 @@ where
                     error = %e,
                     "prepare_post_batch_raw failed; re-queueing survivors, degrading to minimal postBatch",
                 );
-                if let Some(pool) = rollup.held_pool.as_ref() {
-                    pool.push_front_batch(survivors);
-                }
+                pool.push_front_batch(survivors);
                 return self
                     .dispatch_minimal_postbatch(
                         ctx,

@@ -166,11 +166,8 @@ impl PoolState {
 
 /// Per-rollup pool of held cross-chain transactions.
 ///
-/// Stored as `Option<HeldPool>` on
-/// [`RollupState`](crate::RollupState): `None` for rollups that don't
-/// participate in cross-chain composition (entry-only deployments or
-/// follower-only deployments without cross-chain content from this
-/// chain).
+/// Every [`RollupState`](crate::RollupState) owned by a composer has one;
+/// follower and development binaries do not construct `RollupState`.
 #[derive(Debug, Default)]
 pub struct HeldPool {
     state: Mutex<PoolState>,
