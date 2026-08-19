@@ -58,7 +58,7 @@ const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 /// Operational role selected by the invoking binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeRole {
+enum NodeRole {
     Standalone,
     Follower,
     Composer,
@@ -101,13 +101,48 @@ impl NodeRole {
     }
 }
 
-/// eez-node-specific CLI arguments layered on top of reth's CLI.
+trait RoleArgs: clap::Args + Clone + std::fmt::Debug + Send + Sync + 'static {
+    fn sequencer_rpc(&self) -> Option<url::Url>;
+}
+
+/// Composer and development nodes have no role-specific CLI arguments.
 #[derive(clap::Args, Debug, Clone)]
-struct NodeExt {
+struct NoRoleArgs {}
+
+impl RoleArgs for NoRoleArgs {
+    fn sequencer_rpc(&self) -> Option<url::Url> {
+        None
+    }
+}
+
+/// Follower-specific CLI arguments layered on top of reth's CLI.
+#[derive(clap::Args, Debug, Clone)]
+struct FollowerArgs {
     /// Sequencer JSON-RPC URL. In follower mode this enables the
     /// optional unsafe-head overlay; safe/finalized remain L1-derived.
     #[arg(long, env = "EEZ_SEQUENCER_RPC")]
     sequencer_rpc: Option<url::Url>,
+}
+
+impl RoleArgs for FollowerArgs {
+    fn sequencer_rpc(&self) -> Option<url::Url> {
+        self.sequencer_rpc.clone()
+    }
+}
+
+/// Launch a production composer node.
+pub fn run_composer() -> eyre::Result<()> {
+    run::<NoRoleArgs>(NodeRole::Composer)
+}
+
+/// Launch an L1-derived follower node.
+pub fn run_follower() -> eyre::Result<()> {
+    run::<FollowerArgs>(NodeRole::Follower)
+}
+
+/// Launch an unanchored local-development sequencer.
+pub fn run_dev_node() -> eyre::Result<()> {
+    run::<NoRoleArgs>(NodeRole::Standalone)
 }
 
 // Bootstrap wiring is linear; splitting it across helpers fragments the
@@ -115,7 +150,7 @@ struct NodeExt {
 // need every reth generic threaded through). The clippy.toml threshold
 // catches genuinely sprawling logic — the shared launcher is the exception.
 #[allow(clippy::too_many_lines)]
-pub fn run(role: NodeRole) -> eyre::Result<()> {
+fn run<Ext: RoleArgs>(role: NodeRole) -> eyre::Result<()> {
     let _ = dotenvy::dotenv();
     let _ = dotenvy::from_filename("deployments.env");
 
@@ -140,7 +175,7 @@ pub fn run(role: NodeRole) -> eyre::Result<()> {
         }
     }
 
-    Cli::<EthereumChainSpecParser, NodeExt>::try_parse_from(argv)?.run(async move |builder, ext| {
+    Cli::<EthereumChainSpecParser, Ext>::try_parse_from(argv)?.run(async move |builder, ext| {
         event!(
             name: "eez.node.launching",
             Level::INFO,
@@ -149,12 +184,6 @@ pub fn run(role: NodeRole) -> eyre::Result<()> {
         );
 
         warn_on_deprecated_env();
-        if role != NodeRole::Follower && ext.sequencer_rpc.is_some() {
-            return Err(eyre::eyre!(
-                "follower sequencer RPC can only be set in follower mode",
-            ));
-        }
-
         // Launch the embedded L1 reth first in composer mode — its
         // `StateProviderFactory` backs `LocalChainClient::new_entry` for
         // L1 source-tx simulation. Inline (not in `l1_embedded.rs`)
@@ -890,7 +919,7 @@ pub fn run(role: NodeRole) -> eyre::Result<()> {
         // L1 replay always boots first, so safe/finalized anchors are
         // reconciled before the overlay can move unsafe head.
         if let L1RoleRuntime::Follower { .. } = &composer_setup {
-            if let Some(sequencer_rpc) = ext.sequencer_rpc {
+            if let Some(sequencer_rpc) = ext.sequencer_rpc() {
                 let sequencer_rpc = RootProvider::new_http(sequencer_rpc);
                 let follower = UnsafeHeadFollower::new(
                     block_committer,
