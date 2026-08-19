@@ -7,7 +7,7 @@
 # The build is self-contained in `crates/` + `Cargo.{toml,lock}`; the
 # Solidity protocol submodule and `contracts/` are NOT needed (ABI is
 # inline `sol!`). Contract deploys are a separate `forge` step (see
-# scripts/devnet-test.sh + README).
+# scripts/deploy.sh + README).
 
 # ── chef base: toolchain + system deps reth/mdbx/secp256k1 need ───────
 FROM rust:1.94-bookworm AS chef

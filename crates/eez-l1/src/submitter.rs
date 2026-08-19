@@ -265,6 +265,22 @@ impl Submitter {
             .map(|b| b.header.hash))
     }
 
+    /// The L1 source's finalized block `(number, hash)`, or `None` when the
+    /// source reports no finalized block yet (fresh embedded chiado before
+    /// the CL's first FCU; dev chains without a CL).
+    ///
+    /// # Errors
+    ///
+    /// [`L1Error::Provider`] on RPC failure.
+    pub async fn finalized_block(&self) -> L1Result<Option<(u64, alloy_primitives::B256)>> {
+        let provider = self.inner.build_provider();
+        Ok(provider
+            .get_block_by_number(BlockNumberOrTag::Finalized)
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_block(finalized): {e}")))?
+            .map(|b| (b.header.number, b.header.hash)))
+    }
+
     /// Timestamp of an L1 block on the target chain, or `None` if absent.
     /// Distinguishes a skipped-slot drop from a genuine exclusion.
     pub async fn block_timestamp(&self, number: u64) -> L1Result<Option<u64>> {
