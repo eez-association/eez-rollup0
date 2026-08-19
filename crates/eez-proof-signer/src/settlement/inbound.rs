@@ -285,6 +285,30 @@ pub(crate) enum InboundEffectError {
     },
 }
 
+impl InboundEffectError {
+    /// Return the batch entry whose positioned inbound delivery reverted.
+    /// Envelope and claim mismatches stay non-actionable because they can
+    /// indicate a malformed request rather than a poisoned held transaction.
+    pub(crate) const fn poisoned_entry_index(&self) -> Option<usize> {
+        match self {
+            Self::InvalidObservation {
+                entry_index,
+                source: InboundObservationError::RevertedTransaction,
+                ..
+            } => Some(*entry_index),
+            Self::MissingCandidate { .. }
+            | Self::UnexpectedCandidate { .. }
+            | Self::InvalidObservation { .. }
+            | Self::InvalidEntryShape { .. }
+            | Self::DestinationRollupMismatch { .. }
+            | Self::CallHashMismatch { .. }
+            | Self::ReturnDataMismatch { .. }
+            | Self::ValueOutOfRange { .. }
+            | Self::EtherDeltaMismatch { .. } => None,
+        }
+    }
+}
+
 /// Successful inbound effects whose transaction, settlement entry, value, and
 /// canonical DA projection have all been bound positionally.
 /// Only [`authorize_inbound_effects`] can construct this in production.

@@ -1,5 +1,34 @@
 use super::*;
 
+#[test]
+fn only_positioned_outbound_observation_failures_identify_a_user_transaction() {
+    assert_eq!(
+        OutboundEffectError::MissingObservation {
+            entry_index: 1,
+            transaction_index: 3,
+        }
+        .poisoned_transaction_index(),
+        Some(3)
+    );
+    assert_eq!(
+        OutboundEffectError::UnexpectedObservation {
+            transaction_index: 2,
+            receipt_log_index: 0,
+        }
+        .poisoned_transaction_index(),
+        None
+    );
+    assert_eq!(
+        OutboundEffectError::RollingHashMismatch {
+            entry_index: 1,
+            recomputed: B256::ZERO,
+            claimed: B256::repeat_byte(0x11),
+        }
+        .poisoned_transaction_index(),
+        None
+    );
+}
+
 fn refresh_outbound_rolling_hash(entry: &mut ExecutionEntrySol) {
     let [update] = entry.stateUpdates.as_slice() else {
         panic!("outbound fixture must contain one state update");

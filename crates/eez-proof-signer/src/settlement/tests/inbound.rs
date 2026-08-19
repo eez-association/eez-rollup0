@@ -1,6 +1,28 @@
 use super::*;
 
 #[test]
+fn only_a_reverted_positioned_inbound_identifies_an_entry() {
+    assert_eq!(
+        InboundEffectError::InvalidObservation {
+            entry_index: 4,
+            transaction_index: 7,
+            source: InboundObservationError::RevertedTransaction,
+        }
+        .poisoned_entry_index(),
+        Some(4)
+    );
+    assert_eq!(
+        InboundEffectError::InvalidObservation {
+            entry_index: 4,
+            transaction_index: 7,
+            source: InboundObservationError::NonCanonicalAbi,
+        }
+        .poisoned_entry_index(),
+        None
+    );
+}
+
+#[test]
 fn inbound_candidate_requires_the_exact_l2_shape_and_rolling_hash() {
     use eez_protocol::abi::{
         ExpectedOutgoingCrossChainCallSol, L2StaticExecutionEntrySol,
