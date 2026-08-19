@@ -14,8 +14,8 @@ use alloy_rpc_types_eth::BlockNumberOrTag;
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
-    AnvilConfig, Harness, NodeConfig, NodeHandle, block_number_and_hash_at, override_env,
-    reorg_genesis_path, reorg_genesis_state_root, send_l2_value_transfer,
+    AnvilConfig, Harness, NodeBinary, NodeConfig, NodeHandle, block_number_and_hash_at,
+    override_env, reorg_genesis_path, reorg_genesis_state_root, send_l2_value_transfer,
     send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
     wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
     wait_for_safe_prefix_convergence, wait_for_safe_state,
@@ -51,6 +51,7 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
     let genesis = reorg_genesis_path();
     let cfg = NodeConfig {
         genesis_path: Some(genesis.as_path()),
+        ..Default::default()
     };
 
     let primary_dir = tempfile::tempdir().unwrap();
@@ -212,7 +213,11 @@ async fn happy_case_builder_sustained() {
     // land on a stateRoot the contract has attested, and agree with the
     // restarted node's safe block hash.
     let follower_env = harness.follower_env(None);
-    let follower = NodeHandle::start("follower", &NodeConfig::default(), &follower_env)
+    let follower_cfg = NodeConfig {
+        binary: NodeBinary::Follower,
+        ..Default::default()
+    };
+    let follower = NodeHandle::start("follower", &follower_cfg, &follower_env)
         .await
         .unwrap();
     wait_for_safe_state(&follower, &chain, B256::ZERO, DEFAULT_TIMEOUT)
@@ -359,6 +364,7 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     let genesis = reorg_genesis_path();
     let cfg = NodeConfig {
         genesis_path: Some(genesis.as_path()),
+        ..Default::default()
     };
     // Start both concurrently — sequential start lets c1 race alone
     // long enough to skew batch-race dynamics and (empirically) drop
@@ -474,7 +480,7 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     c2.assert_no_process_death();
 }
 
-/// Helper: spawn the unified `eez-node` binary in follower mode with a
+/// Helper: spawn the explicit `eez-follower` binary with a
 /// fresh datadir. `seq_rpc = Some(_)` sets `EEZ_SEQUENCER_RPC` for
 /// unsafe-head following; `None` runs L1-derived-only mode.
 async fn spawn_follower(
@@ -483,11 +489,14 @@ async fn spawn_follower(
     seq_rpc: Option<&str>,
 ) -> anyhow::Result<NodeHandle> {
     let env = harness.follower_env(seq_rpc);
-    let cfg = NodeConfig::default();
+    let cfg = NodeConfig {
+        binary: NodeBinary::Follower,
+        ..Default::default()
+    };
     NodeHandle::start(name, &cfg, &env).await
 }
 
-/// Unified `eez-node` in follower mode, L1-derived only (no
+/// `eez-follower` in L1-derived-only mode (no
 /// `EEZ_SEQUENCER_RPC`). The sequencer posts batches; the follower's
 /// Deriver alone must rebuild state and land on a contract-attested
 /// stateRoot.
@@ -528,7 +537,7 @@ async fn happy_case_follower_l1_derived() {
     seq.assert_no_process_death();
 }
 
-/// Unified `eez-node` follower with `EEZ_SEQUENCER_RPC` pointing at the sequencer.
+/// `eez-follower` with `EEZ_SEQUENCER_RPC` pointing at the sequencer.
 /// Asserts BOTH paths:
 ///   - safe head: still reaches a contract-attested stateRoot (the L1
 ///     deriver is authoritative) and matches the sequencer chain.
@@ -547,7 +556,11 @@ async fn happy_case_follower_sequencer_rpc() {
         "RUST_LOG",
         "warn,eez_node::follower=info",
     );
-    let follower = NodeHandle::start("follower", &NodeConfig::default(), &follower_env)
+    let follower_cfg = NodeConfig {
+        binary: NodeBinary::Follower,
+        ..Default::default()
+    };
+    let follower = NodeHandle::start("follower", &follower_cfg, &follower_env)
         .await
         .unwrap();
 
@@ -619,8 +632,10 @@ async fn happy_case_follower_l1_reorg_recovers() {
     let genesis = reorg_genesis_path();
     let seq_cfg = NodeConfig {
         genesis_path: Some(genesis.as_path()),
+        ..Default::default()
     };
     let follower_cfg = NodeConfig {
+        binary: NodeBinary::Follower,
         genesis_path: Some(genesis.as_path()),
     };
     let seq_env = harness.env();
@@ -783,6 +798,7 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
     // states move past genesis.
     let seq_cfg = NodeConfig {
         genesis_path: Some(genesis.as_path()),
+        ..Default::default()
     };
     let seq = NodeHandle::start("seq", &seq_cfg, &harness.env())
         .await
@@ -796,7 +812,11 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
         "RUST_LOG",
         std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
     )];
-    let rogue = NodeHandle::start("rogue", &NodeConfig::default(), &rogue_env)
+    let rogue_cfg = NodeConfig {
+        binary: NodeBinary::Dev,
+        ..Default::default()
+    };
+    let rogue = NodeHandle::start("rogue", &rogue_cfg, &rogue_env)
         .await
         .unwrap();
 
@@ -808,6 +828,7 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
         "warn,eez_node::follower=info",
     );
     let follower_cfg = NodeConfig {
+        binary: NodeBinary::Follower,
         genesis_path: Some(genesis.as_path()),
     };
     let follower = NodeHandle::start("follower", &follower_cfg, &follower_env)

@@ -123,7 +123,7 @@ pub struct ProvingContext {
 
 /// Produces the [`BlockWitness`] for a committed L2 block — the seam by which
 /// the composer fills [`ProvingContext::blocks`] without owning the reth
-/// provider itself. `eez-node` backs this with the node's provider +
+/// provider itself. `eez-composer` backs this with the node's provider +
 /// `eez_driver::witness`; the composer only calls it.
 pub trait ProvingWitnessSource: Send + Sync + std::fmt::Debug {
     /// Build the RLP + augmented witness for block `number`.

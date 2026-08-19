@@ -21,7 +21,7 @@
 //!               builds + posts batches, hosts the cross-chain
 //!               composition logic (S4.7+).
 //!                ↑
-//! eez-node      Binary. Decides follower vs composer mode at startup.
+//! eez-composer  Binary. Wires the complete composer stack at startup.
 //! ```
 //!
 //! # Stage 4 status

@@ -849,23 +849,43 @@ pub struct NodeHandle {
     pub http_port: u16,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub enum NodeBinary {
+    #[default]
+    Composer,
+    Follower,
+    Dev,
+}
+
+impl NodeBinary {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Composer => env!("CARGO_BIN_EXE_eez-composer"),
+            Self::Follower => env!("CARGO_BIN_EXE_eez-follower"),
+            Self::Dev => env!("CARGO_BIN_EXE_eez-dev-node"),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct NodeConfig<'a> {
+    /// Explicit node-role executable to launch.
+    pub binary: NodeBinary,
     /// Path to a custom genesis JSON. `None` uses `--chain dev`.
     pub genesis_path: Option<&'a std::path::Path>,
 }
 
 impl NodeHandle {
-    /// Spawn `eez-node` against `datadir` with `--chain dev` and the
+    /// Spawn `eez-composer` against `datadir` with `--chain dev` and the
     /// given env. See [`Self::spawn_with`] for custom genesis.
     pub fn spawn(datadir: &std::path::Path, env: &[(&'static str, String)]) -> Result<Self> {
         Self::spawn_with("node", datadir, &NodeConfig::default(), env)
     }
 
-    /// Spawn `eez-node` against `datadir` with the given config + env.
+    /// Spawn the configured node-role binary with the given config + env.
     /// Caller owns the datadir (e.g. a `tempfile::TempDir`) so
     /// kill+respawn tests can share state across handles. Uses the
-    /// test-built binary path (`CARGO_BIN_EXE_eez-node`) directly —
+    /// test-built binary path (`CARGO_BIN_EXE_eez-{composer,follower,dev-node}`) directly —
     /// skips the `cargo run` metadata-resolution overhead per spawn.
     pub fn spawn_with(
         name: &str,
@@ -924,7 +944,7 @@ impl NodeHandle {
             .map(|p| p.as_os_str().to_owned())
             .or(env_genesis)
             .unwrap_or_else(|| std::ffi::OsString::from("dev"));
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_eez-node"));
+        let mut cmd = Command::new(cfg.binary.path());
         cmd.current_dir(repo_root())
             .args(["node", "--chain"])
             .arg(&chain_arg)
