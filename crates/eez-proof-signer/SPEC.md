@@ -732,6 +732,45 @@ messages SHOULD remain stable and must not expose secrets.
 A malformed candidate that could otherwise disappear from consideration MUST
 be retained and rejected at its authorization gate.
 
+### 14.1 Actionable failed preconditions
+
+A `FailedPrecondition` response MAY carry one protobuf-encoded `ProveFailure`
+in the gRPC status-details field when the validated execution identifies one
+cross-chain candidate that the Composer can safely remove. The status code,
+not the details payload, remains authoritative for retry classification.
+
+`ProveFailure.actionable_failure` has exactly two supported variants:
+
+- `OutboundFailure` identifies the original signed L2 user transaction by its
+  zero-based index in the terminal Sync block and its canonical 32-byte
+  transaction hash. When the preceding synthetic load transaction reverted,
+  the failure still identifies the paired user transaction; rebuilding the
+  Sync block regenerates or removes both halves together.
+- `InboundFailure` identifies the claimed effect by its zero-based index in
+  `PostBatch.entries` and the 32-byte keccak hash of that entry's canonical ABI
+  encoding. The original signed L1 transaction is not present in the proof
+  request, so the Composer MUST resolve it through the request-local
+  entry-to-held-transaction mapping retained during composition.
+
+The signer MUST attach an outbound detail only when validated terminal-block
+execution safely identifies the original user transaction: a reverted
+canonical synthetic load/user pair, or a positioned outbound observation
+failure attributable to the user transaction. It MUST attach an inbound detail
+only for a positioned inbound delivery transaction that reverted. Structural,
+ordering, envelope, claim-only, missing-candidate, extra-observation, DA, and
+state-chain failures MUST remain non-actionable even when their diagnostic
+contains an index.
+
+Before changing pool state, the Composer MUST verify both fields against the
+exact rejected request: index and transaction hash for outbound, or index and
+canonical entry hash for inbound. Empty, malformed, unknown, wrong-width, or
+mismatched details MUST be handled as an ordinary non-actionable rejection.
+The Composer MUST NOT retry an unchanged request after an actionable failure.
+It MAY remove the resolved held transaction and its same-sender,
+same-direction nonce suffix, then rebuild and submit a smaller batch within the
+remaining slot budget. This recovery does not authorize bisection or eviction
+for failures that carry no valid typed detail.
+
 ## 15. Conformance and change control
 
 Changes to the ABI, selectors, call-hash formulas, rolling-hash formulas,
@@ -751,6 +790,8 @@ A compatible implementation MUST test at least:
 - outbound event provenance, canonical encoding, zero-`callGas` hash, L1
   rolling hash, ordering, source, and value;
 - exact DA projection, sidecars, and mixed Sync-block reconstruction;
+- actionable outbound/inbound failure attribution, reference validation, and
+  non-actionable fallback;
 - public-input vectors against the pinned Solidity formula; and
 - raw-digest ECDSA recovery, low-`s`, and `v` encoding.
 
