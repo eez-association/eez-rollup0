@@ -336,9 +336,19 @@ fn content_length_exceeds(req: &Request<hyper::body::Incoming>, max: usize) -> b
         .is_some_and(|len| len > max)
 }
 
+/// Submission-family JSON-RPC methods. Matched by prefix, not equality: a
+/// variant like `eth_sendRawTransactionConditional` must not slip past the
+/// readiness gate or the cross-chain intercept just by having a longer name.
+fn is_submission_method(method: &str) -> bool {
+    method.starts_with("eth_sendRawTransaction")
+}
+
+/// The one submission method this front knows how to route cross-chain.
+const SEND_RAW: &str = "eth_sendRawTransaction";
+
 fn batch_has_send_raw(json: &Value) -> bool {
     matches!(json, Value::Array(items) if items.iter().any(|it| {
-        it.get("method").and_then(Value::as_str) == Some("eth_sendRawTransaction")
+        it.get("method").and_then(Value::as_str).is_some_and(is_submission_method)
     }))
 }
 
@@ -353,7 +363,10 @@ fn all_forwarded_methods_are_eth(json: &Value) -> bool {
         Value::Object(_) => method_allowed(json),
         Value::Array(items) if !items.is_empty() => items.iter().all(|item| {
             method_allowed(item)
-                && item.get("method").and_then(Value::as_str) != Some("eth_sendRawTransaction")
+                && !item
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_submission_method)
         }),
         _ => false,
     }
@@ -412,9 +425,8 @@ async fn handle(
 
     // Refuse submissions until the node is live; accepting them would strand
     // txs in a pool no one drains. Reads still pass through.
-    if json.get("method").and_then(Value::as_str) == Some("eth_sendRawTransaction")
-        && !ctx.ready.load(std::sync::atomic::Ordering::Relaxed)
-    {
+    let method = json.get("method").and_then(Value::as_str).unwrap_or("");
+    if is_submission_method(method) && !ctx.ready.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(rpc_error(
             json.get("id").cloned().unwrap_or(Value::Null),
             -32000,
@@ -422,9 +434,19 @@ async fn handle(
         ));
     }
 
+    // A submission variant we do not route would otherwise be forwarded straight
+    // to the source chain, skipping the held pool entirely. Refuse it loudly.
+    if is_submission_method(method) && method != SEND_RAW {
+        return Ok(rpc_error(
+            json.get("id").cloned().unwrap_or(Value::Null),
+            -32601,
+            "only eth_sendRawTransaction is routed by the cross-chain front",
+        ));
+    }
+
     // Intercept a single `eth_sendRawTransaction`. Undecodable tx bytes fall
     // through so the upstream RPC produces the standard JSON-RPC error.
-    if json.get("method").and_then(Value::as_str) == Some("eth_sendRawTransaction")
+    if method == SEND_RAW
         && let Some(raw_hex) = json
             .get("params")
             .and_then(|p| p.get(0))
@@ -765,6 +787,20 @@ mod tests {
             !all_forwarded_methods_are_eth(&body),
             "sendRaw batches must be rejected before forwarding"
         );
+    }
+
+    /// A longer submission method must not slip past the gate or reach the
+    /// upstream chain unrouted just because it isn't the exact string.
+    #[test]
+    fn submission_variants_are_recognised_not_just_the_exact_method() {
+        assert!(is_submission_method("eth_sendRawTransaction"));
+        assert!(is_submission_method("eth_sendRawTransactionConditional"));
+        assert!(!is_submission_method("eth_getBalance"));
+        assert!(!is_submission_method("eth_call"));
+        // Batches carrying any variant are refused, not forwarded.
+        assert!(batch_has_send_raw(&json!([
+            {"jsonrpc": "2.0", "method": "eth_sendRawTransactionConditional", "params": [], "id": 1}
+        ])));
     }
 
     #[test]

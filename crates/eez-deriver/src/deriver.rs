@@ -266,7 +266,13 @@ where
             // L2 to genesis, so we retry. The head is reported because a head
             // ABOVE this block means pruned/rewound, which retrying won't fix.
             let Some(canonical) = canonical else {
-                let head = self.inner.submitter.readiness().await.map(|r| r.head).ok();
+                let head = self
+                    .inner
+                    .submitter
+                    .readiness()
+                    .await
+                    .map(|r| r.head_block_number)
+                    .ok();
                 return Err(DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
                     block: tail.l1_block,
                     tx_hash: tail.tx_hash,

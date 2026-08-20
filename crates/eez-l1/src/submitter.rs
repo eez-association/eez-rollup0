@@ -88,8 +88,8 @@ impl std::fmt::Debug for Submitter {
 /// What the L1 source can currently serve. See [`Submitter::readiness`].
 #[derive(Debug, Clone, Copy)]
 pub struct L1Readiness {
-    /// Highest block the source will serve.
-    pub head: u64,
+    /// Highest block number the source will serve.
+    pub head_block_number: u64,
     /// The source reports itself mid-sync (`eth_syncing` != false). Advisory:
     /// an endpoint that refuses `eth_syncing` reads as not-syncing rather than
     /// failing the whole probe.
@@ -295,6 +295,10 @@ impl Submitter {
             .from_block(block)
             .to_block(block)
             .address(self.inner.config.eez);
+        // The result is discarded on purpose: an empty `[]` is the normal case
+        // and still passes. This probes whether the endpoint SERVES eth_getLogs
+        // at all — some restrict or disable it, and the batch scan would then
+        // fail long after boot instead of here.
         provider
             .get_logs(&filter)
             .await
@@ -339,7 +343,10 @@ impl Submitter {
             .syncing()
             .await
             .is_ok_and(|s| !matches!(s, alloy_rpc_types_eth::SyncStatus::None));
-        Ok(L1Readiness { head, syncing })
+        Ok(L1Readiness {
+            head_block_number: head,
+            syncing,
+        })
     }
 
     /// The L1 source's finalized block `(number, hash)`, or `None` when the
