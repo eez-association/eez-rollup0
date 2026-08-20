@@ -759,7 +759,9 @@ failure attributable to the user transaction. It MUST attach an inbound detail
 only for a positioned inbound delivery transaction that reverted. Structural,
 ordering, envelope, claim-only, missing-candidate, extra-observation, DA, and
 state-chain failures MUST remain non-actionable even when their diagnostic
-contains an index.
+contains an index. A mismatch between a claimed entry's call hash and an
+execution observation is claim-only in both directions and MUST remain
+non-actionable.
 
 Before changing pool state, the Composer MUST verify both fields against the
 exact rejected request: index and transaction hash for outbound, or index and
@@ -770,6 +772,14 @@ It MAY remove the resolved held transaction and its same-sender,
 same-direction nonce suffix, then rebuild and submit a smaller batch within the
 remaining slot budget. This recovery does not authorize bisection or eviction
 for failures that carry no valid typed detail.
+
+The index-and-hash checks bind an actionable detail to the rejected request;
+they do not independently prove that the reported execution failure occurred.
+The Composer therefore trusts its configured prover not to falsely attribute a
+failure. A buggy or compromised prover can cause valid held transactions and
+their nonce suffixes to be evicted, requiring users to resubmit. Authenticating
+the Composer-prover transport prevents response injection but does not remove
+this configured-prover trust.
 
 ## 15. Conformance and change control
 

@@ -24,20 +24,25 @@ pub(crate) fn actionable_held_tx<'a>(
     failure: ActionableProverFailure,
     survivors: &'a [HeldTx],
     outbound_entry_count: usize,
-    inbound_entry_owners: &[B256],
+    inbound_compositions: &[(eez_protocol::Composition, B256)],
 ) -> Option<&'a HeldTx> {
     let (direction, held_hash) = match failure {
         ActionableProverFailure::Outbound {
             transaction_hash, ..
         } => (Direction::Outbound, transaction_hash),
         ActionableProverFailure::Inbound { entry_index, .. } => {
-            // PostBatch order is `[anchor | outbound... | inbound...]`, while
-            // `inbound_entry_owners` contains only the inbound suffix.
-            let inbound_index = entry_index.checked_sub(1 + outbound_entry_count)?;
-            (
-                Direction::Inbound,
-                *inbound_entry_owners.get(inbound_index)?,
-            )
+            // PostBatch order is `[anchor | outbound... | inbound...]`.
+            let mut inbound_index = entry_index.checked_sub(1 + outbound_entry_count)?;
+            let mut owner = None;
+            for (composition, held_hash) in inbound_compositions {
+                let entry_count = composition.source.batch.entries.len();
+                if inbound_index < entry_count {
+                    owner = Some(*held_hash);
+                    break;
+                }
+                inbound_index -= entry_count;
+            }
+            (Direction::Inbound, owner?)
         }
     };
     survivors
@@ -278,12 +283,28 @@ mod tests {
 
     #[test]
     fn actionable_failures_resolve_direction_specific_held_identities() {
+        fn composition(entry_count: usize) -> eez_protocol::Composition {
+            eez_protocol::Composition {
+                source: eez_protocol::SourceComposition {
+                    rollup_id: eez_protocol::RollupId(1),
+                    batch: eez_protocol::EvmBatch {
+                        entries: vec![Default::default(); entry_count],
+                        ..Default::default()
+                    },
+                },
+                targets: Vec::new(),
+            }
+        }
+
         let sender = Address::repeat_byte(0xc);
         let outbound = held(sender, Direction::Outbound, 1, 1);
         let inbound = held(sender, Direction::Inbound, 1, 2);
         let second_inbound = held(Address::repeat_byte(0xd), Direction::Inbound, 0, 3);
         let survivors = vec![outbound.clone(), inbound.clone(), second_inbound.clone()];
-        let inbound_owners = vec![inbound.hash, inbound.hash, second_inbound.hash];
+        let inbound_compositions = vec![
+            (composition(2), inbound.hash),
+            (composition(1), second_inbound.hash),
+        ];
 
         let resolved = actionable_held_tx(
             ActionableProverFailure::Outbound {
@@ -292,7 +313,7 @@ mod tests {
             },
             &survivors,
             2,
-            &inbound_owners,
+            &inbound_compositions,
         )
         .unwrap();
         assert_eq!(resolved.hash, outbound.hash);
@@ -305,7 +326,7 @@ mod tests {
             },
             &survivors,
             2,
-            &inbound_owners,
+            &inbound_compositions,
         )
         .unwrap();
         assert_eq!(resolved.hash, inbound.hash);
@@ -318,7 +339,7 @@ mod tests {
                 },
                 &survivors,
                 2,
-                &inbound_owners,
+                &inbound_compositions,
             )
             .is_none()
         );

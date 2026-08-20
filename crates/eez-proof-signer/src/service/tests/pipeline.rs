@@ -451,6 +451,47 @@ fn an_outbound_observation_failure_reports_the_user_transaction() {
 }
 
 #[test]
+fn an_outbound_claim_hash_mismatch_remains_non_actionable() {
+    let (mut batch, block_rlp, _user, call_hash) = canonical_outbound_case();
+    batch.entries[1].l2ToL1Calls[0].data = Bytes::from_static(b"different claim");
+    let settling_block = validate::ValidatedBlock::for_test(
+        5,
+        block_rlp,
+        validate::SettlementBlockEvidence::for_test(
+            vec![true, false],
+            vec![validate::OutboundEventObservation::decoded_for_test(
+                1, 0, call_hash, 0,
+            )],
+        ),
+    );
+    let validated = validated_single_block(
+        settling_block,
+        vec![true, true],
+        vec![checkpoint(1, B256::ZERO)],
+    );
+    let cancellation = CancellationToken::default();
+    let system_transaction_reconstructor =
+        test_system_transaction_reconstructor(expected_rollup_id(1));
+
+    let error = run_settlement(SettlementInput {
+        submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&batch),
+        validated_window: &validated,
+        expected_rollup_id: expected_rollup_id(1),
+        expected_l2_system_address: TEST_SYSTEM_ADDRESS,
+        proof_system_vkey: test_proof_system_vkey(),
+        expected_proof_system: test_proof_system(),
+        system_transaction_reconstructor: &system_transaction_reconstructor,
+        cancellation: &cancellation,
+    })
+    .unwrap_err();
+
+    assert_eq!(error.gate(), "outbound_effects");
+    let status = error.status();
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(status.details().is_empty());
+}
+
+#[test]
 fn a_fully_bound_outbound_effect_is_authorized() {
     let (batch, block_rlp, user, call_hash) = canonical_outbound_case();
     let settling_block = validate::ValidatedBlock::for_test(

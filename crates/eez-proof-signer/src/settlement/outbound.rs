@@ -114,9 +114,6 @@ impl OutboundEffectError {
             }
             | Self::UnsupportedCallGas {
                 transaction_index, ..
-            }
-            | Self::CallHashMismatch {
-                transaction_index, ..
             } => Some(*transaction_index),
             Self::MissingPrecedingSystemTransaction { .. }
             | Self::NonCanonicalEffectOrder { .. }
@@ -124,6 +121,7 @@ impl OutboundEffectError {
             | Self::L2ToL1CallCount { .. }
             | Self::DestinationRollupMismatch { .. }
             | Self::SourceRollupMismatch { .. }
+            | Self::CallHashMismatch { .. }
             | Self::RollingHashMismatch { .. }
             | Self::ReservedSourceAddress { .. }
             | Self::ValueOutOfRange { .. }

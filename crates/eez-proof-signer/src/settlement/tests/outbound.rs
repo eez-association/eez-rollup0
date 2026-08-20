@@ -27,6 +27,16 @@ fn only_positioned_outbound_observation_failures_identify_a_user_transaction() {
         .poisoned_transaction_index(),
         None
     );
+    assert_eq!(
+        OutboundEffectError::CallHashMismatch {
+            entry_index: 1,
+            transaction_index: 3,
+            recomputed: B256::ZERO,
+            observed: B256::repeat_byte(0x22),
+        }
+        .poisoned_transaction_index(),
+        None
+    );
 }
 
 fn refresh_outbound_rolling_hash(entry: &mut ExecutionEntrySol) {
