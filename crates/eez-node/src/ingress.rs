@@ -179,9 +179,17 @@ fn upfront_cost(envelope: &TxEnvelope) -> Result<U256, String> {
         .ok_or_else(|| "upfront cost overflow: value + gas_limit * max_fee_per_gas".to_string())
 }
 
+/// Refusal sent while the node is still reconciling with L1.
+/// WIRE CONTRACT: the e2e helper and the shell harnesses grep "starting up".
+pub const STARTING_UP_MSG: &str =
+    "eez node is starting up; cross-chain submissions are not accepted yet";
+
 /// Shared, cheaply-clonable per-connection context.
 #[derive(Clone)]
 struct Ctx {
+    /// False until the deriver has reconciled with L1. Submissions are refused
+    /// until then rather than queued into a pool nothing is draining yet.
+    ready: Arc<std::sync::atomic::AtomicBool>,
     client: reqwest::Client,
     upstream_rpc_url: String,
     direction: Direction,
@@ -223,6 +231,7 @@ pub async fn run_cross_chain_front(
     held_pool: Arc<HeldPool>,
     validation_provider: RootProvider,
     expected_source_chain_id: u64,
+    ready: Arc<std::sync::atomic::AtomicBool>,
 ) -> eyre::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
@@ -239,6 +248,7 @@ pub async fn run_cross_chain_front(
         "cross-chain front listening (forward eth_* to source chain; intercept sendRawTransaction)",
     );
     let ctx = Ctx {
+        ready,
         client,
         upstream_rpc_url,
         direction,
@@ -324,9 +334,18 @@ fn content_length_exceeds(req: &Request<hyper::body::Incoming>, max: usize) -> b
         .is_some_and(|len| len > max)
 }
 
+/// Prefix, not equality: `eth_sendRawTransactionConditional` must not slip
+/// past the readiness gate or the intercept just by having a longer name.
+fn is_submission_method(method: &str) -> bool {
+    method.starts_with("eth_sendRawTransaction")
+}
+
+/// The one submission method this front knows how to route cross-chain.
+const SEND_RAW: &str = "eth_sendRawTransaction";
+
 fn batch_has_send_raw(json: &Value) -> bool {
     matches!(json, Value::Array(items) if items.iter().any(|it| {
-        it.get("method").and_then(Value::as_str) == Some("eth_sendRawTransaction")
+        it.get("method").and_then(Value::as_str).is_some_and(is_submission_method)
     }))
 }
 
@@ -341,7 +360,10 @@ fn all_forwarded_methods_are_eth(json: &Value) -> bool {
         Value::Object(_) => method_allowed(json),
         Value::Array(items) if !items.is_empty() => items.iter().all(|item| {
             method_allowed(item)
-                && item.get("method").and_then(Value::as_str) != Some("eth_sendRawTransaction")
+                && !item
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_submission_method)
         }),
         _ => false,
     }
@@ -398,9 +420,30 @@ async fn handle(
         ));
     }
 
+    // Accepting these before the node is live would strand them in a pool
+    // nothing drains. Reads still pass through.
+    let method = json.get("method").and_then(Value::as_str).unwrap_or("");
+    if is_submission_method(method) && !ctx.ready.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(rpc_error(
+            json.get("id").cloned().unwrap_or(Value::Null),
+            -32000,
+            STARTING_UP_MSG,
+        ));
+    }
+
+    // An unrouted variant would be forwarded to the source chain, skipping the
+    // held pool entirely.
+    if is_submission_method(method) && method != SEND_RAW {
+        return Ok(rpc_error(
+            json.get("id").cloned().unwrap_or(Value::Null),
+            -32601,
+            "only eth_sendRawTransaction is routed by the cross-chain front",
+        ));
+    }
+
     // Intercept a single `eth_sendRawTransaction`. Undecodable tx bytes fall
     // through so the upstream RPC produces the standard JSON-RPC error.
-    if json.get("method").and_then(Value::as_str) == Some("eth_sendRawTransaction")
+    if method == SEND_RAW
         && let Some(raw_hex) = json
             .get("params")
             .and_then(|p| p.get(0))
@@ -743,6 +786,19 @@ mod tests {
         );
     }
 
+    /// A longer submission method must not slip past the gate.
+    #[test]
+    fn submission_variants_are_recognised_not_just_the_exact_method() {
+        assert!(is_submission_method("eth_sendRawTransaction"));
+        assert!(is_submission_method("eth_sendRawTransactionConditional"));
+        assert!(!is_submission_method("eth_getBalance"));
+        assert!(!is_submission_method("eth_call"));
+        // Batches carrying any variant are refused, not forwarded.
+        assert!(batch_has_send_raw(&json!([
+            {"jsonrpc": "2.0", "method": "eth_sendRawTransactionConditional", "params": [], "id": 1}
+        ])));
+    }
+
     #[test]
     fn only_eth_methods_are_forwardable() {
         assert!(all_forwarded_methods_are_eth(&json!({
@@ -1028,6 +1084,7 @@ mod tests {
             Arc::clone(&pool),
             inbound_provider,
             1,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
         ));
         let outbound_task = tokio::spawn(run_cross_chain_front(
             outbound_port,
@@ -1036,6 +1093,7 @@ mod tests {
             Arc::clone(&pool),
             outbound_provider,
             1,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
         ));
         wait_for_front(inbound_port).await;
         wait_for_front(outbound_port).await;
@@ -1063,5 +1121,51 @@ mod tests {
 
         inbound_task.abort();
         outbound_task.abort();
+    }
+
+    /// The refusal is a wire contract: harnesses retry on that text.
+    #[tokio::test]
+    async fn front_refuses_submissions_until_ready_without_touching_the_pool() {
+        let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(3)).unwrap();
+        let (_, tx) = signed_transfer(&signer, 0, 1, 1);
+
+        let pool = Arc::new(HeldPool::new());
+        let port = free_port();
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
+        asserter.push_success(&U256::from(1_000_000u64));
+        asserter.push_success(&0_u64);
+
+        let task = tokio::spawn(run_cross_chain_front(
+            port,
+            "http://127.0.0.1:1".into(),
+            Direction::Inbound,
+            Arc::clone(&pool),
+            provider,
+            1,
+            Arc::clone(&ready),
+        ));
+        wait_for_front(port).await;
+
+        let refused = send_raw(port, &tx, 1).await;
+        assert_eq!(refused["error"]["code"], -32000, "{refused}");
+        assert!(
+            refused["error"]["message"].as_str().unwrap() == STARTING_UP_MSG,
+            "harnesses match this text: {refused}"
+        );
+        assert_eq!(
+            refused["id"], 1,
+            "the caller's id must come back: {refused}"
+        );
+        assert!(pool.pop_all().is_empty(), "a refused tx must not be held");
+
+        ready.store(true, std::sync::atomic::Ordering::Relaxed);
+        let accepted = send_raw(port, &tx, 2).await;
+        assert!(accepted.get("error").is_none(), "{accepted}");
+        assert_eq!(pool.pop_all().len(), 1);
+
+        task.abort();
     }
 }

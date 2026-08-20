@@ -58,7 +58,9 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 const BOOT_CATCH_UP_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
-
+/// ~15 min at the capped backoff: outlasts a restarting L1, but a permanently
+/// refused RPC call still surfaces as an exit.
+const BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES: u32 = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
     Standalone,
@@ -823,11 +825,8 @@ fn main() -> eyre::Result<()> {
             composer_setup;
 
         let l2_source_chain_id = chain_spec.chain().id();
-        // Resolve and validate both required fronts before spawning the deriver,
-        // sequencer, or composer. The fronts are required infrastructure, so a
-        // missing configuration or bad/unavailable upstream must fail launch
-        // rather than leave a healthy-looking node running without cross-chain
-        // ingress.
+        // The upstream chain-id check runs after the L1 gate below, so a late
+        // L1 cannot stop the ports from binding.
         let mut xchain_fronts = Vec::new();
         if mode == Mode::Composer {
             require_xchain_composer_wiring(cross_chain_composer_wired)?;
@@ -837,11 +836,6 @@ fn main() -> eyre::Result<()> {
                 let (port, url, parsed) =
                     read_xchain_front_config(spec.port_env, spec.url_env)?;
                 let validation_provider = alloy_provider::RootProvider::new_http(parsed);
-                ingress::validate_cross_chain_front(
-                    &validation_provider,
-                    spec.expected_source_chain_id,
-                )
-                .await?;
                 xchain_fronts.push((spec, port, url, validation_provider));
             }
         }
@@ -861,12 +855,71 @@ fn main() -> eyre::Result<()> {
             system_tx_cfg,
         );
 
+        // Bound before the L1 wait so port checks see a live node; submissions
+        // are refused until `xchain_ready` flips below.
+        let xchain_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let xchain_checks: Vec<_> = xchain_fronts
+            .iter()
+            .map(|(spec, _, _, provider)| (spec.expected_source_chain_id, provider.clone()))
+            .collect();
+        for (spec, port, url, validation_provider) in xchain_fronts {
+            let pool = Arc::clone(&held_pool);
+            let ready = Arc::clone(&xchain_ready);
+            task_executor.spawn_critical_task(spec.task, async move {
+                ingress::run_cross_chain_front(
+                    port,
+                    url,
+                    spec.direction,
+                    pool,
+                    validation_provider,
+                    spec.expected_source_chain_id,
+                    ready,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("configured cross-chain front exited: {e:#}"));
+            });
+        }
+
+        // Downstream never has to handle an empty / lagging / pruned L1:
+        // those states cannot get past here.
+        // An embedded L1 knows its own chain id; every other path must be told.
+        let expected_l1_chain_id = match l1_source_chain_id {
+            Some(id) => id,
+            None => read_l1_chain_id()?,
+        };
+        wait_for_l1_ready(&submitter, rollup_config.deploy_block, expected_l1_chain_id).await?;
+
+        for (expected_chain_id, provider) in &xchain_checks {
+            ingress::validate_cross_chain_front(provider, *expected_chain_id).await?;
+        }
+
         let mut catch_up_retry_delay = BOOT_CATCH_UP_INITIAL_RETRY_DELAY;
         let mut catch_up_attempts = 0_u64;
+        let mut transport_failures = 0_u32;
         let (l1_seed_number, l1_seed_hash) = loop {
             match deriver.catch_up_with_seed().await {
                 Ok(seed) => break seed,
-                Err(err) if err.is_source_incomplete() => {
+                // SourceIncomplete is uncapped — only time fixes it. Transport
+                // is capped: a permanent JSON-RPC refusal is indistinguishable
+                // from a dropped connection, so it would retry forever.
+                Err(err) if err.is_l1_transport() && {
+                    transport_failures += 1;
+                    transport_failures >= BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES
+                } =>
+                {
+                    event!(
+                        name: "eez.node.deriver.boot_catch_up.transport_exhausted",
+                        Level::ERROR,
+                        mode = mode.name(),
+                        transport_failures,
+                        error = %err,
+                        "L1 transport kept failing during boot catch-up; the endpoint is likely refusing a call we need, not merely unreachable",
+                    );
+                    return Err(eyre::eyre!(
+                        "boot-time deriver catch_up gave up after {transport_failures} L1 transport failures: {err}"
+                    ));
+                }
+                Err(err) if err.is_source_incomplete() || err.is_l1_transport() => {
                     catch_up_attempts += 1;
                     event!(
                         name: "eez.node.deriver.boot_catch_up.source_incomplete",
@@ -952,25 +1005,6 @@ fn main() -> eyre::Result<()> {
                 composer.run(composer_events).await;
             });
 
-            // Cross-chain ingress fronts (see `run_cross_chain_front`) — one per
-            // SOURCE chain, sharing `held_pool`. Both are required in composer mode:
-            //   L1 front (EEZ_L1_XCHAIN_PORT → EEZ_L1_RPC_URL): L1→L2 Inbound.
-            //   L2 front (EEZ_L2_XCHAIN_PORT → EEZ_L2_RPC_URL): L2→L1 Outbound.
-            for (spec, port, url, validation_provider) in xchain_fronts {
-                let pool = Arc::clone(&held_pool);
-                task_executor.spawn_critical_task(spec.task, async move {
-                    ingress::run_cross_chain_front(
-                        port,
-                        url,
-                        spec.direction,
-                        pool,
-                        validation_provider,
-                        spec.expected_source_chain_id,
-                    )
-                    .await
-                    .unwrap_or_else(|e| panic!("configured cross-chain front exited: {e:#}"));
-                });
-            }
         }
 
         // Start polling last: every consumer is subscribed and catch-up
@@ -980,9 +1014,109 @@ fn main() -> eyre::Result<()> {
             "eez-l1-watcher",
             l1_watcher.polling(l1_seed_number, l1_seed_hash),
         );
+        xchain_ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
         handle.wait_for_node_exit().await
     })
+}
+
+/// Blocks until L1 serves our history: head at or past the deploy block, with
+/// that block's header, logs, and tx bodies readable. An L1 that stops making
+/// progress fails here instead of hanging.
+async fn wait_for_l1_ready(
+    submitter: &Submitter,
+    deploy_block: u64,
+    expected_l1_chain_id: u64,
+) -> eyre::Result<()> {
+    const POLL: Duration = Duration::from_secs(2);
+    const STALLED_POLLS: u32 = 450; // 15 min with no progress
+    const MAX_POLLS: u32 = 3_600; // 2 h overall, even while it claims to sync
+
+    let mut best_remaining = u64::MAX;
+    let mut stalled = 0_u32;
+    let mut waited = 0_u32;
+    let mut last_err: Option<String> = None;
+    let mut chain_verified = false;
+
+    loop {
+        // On the first answer, not before the loop — checking early skipped it
+        // on exactly the endpoint this gate exists for.
+        if !chain_verified {
+            match submitter.chain_id().await {
+                Ok(actual) if actual != expected_l1_chain_id => {
+                    return Err(eyre::eyre!(
+                        "EEZ_L1_RPC_URL serves chain {actual}, expected {expected_l1_chain_id}"
+                    ));
+                }
+                Ok(_) => chain_verified = true,
+                Err(err) => last_err = Some(format!("eth_chainId: {err}")),
+            }
+        }
+
+        // `progressing` resets the stall counter; `status` explains the wait.
+        let (progressing, status) = match submitter.readiness().await {
+            Err(err) => {
+                last_err = Some(err.to_string());
+                (false, format!("unreachable: {err}"))
+            }
+            Ok(state) if state.head_block_number < deploy_block => {
+                let remaining = deploy_block - state.head_block_number;
+                // High-water mark: an oscillating head would otherwise reset
+                // the stall counter every other poll.
+                let closer = remaining < best_remaining;
+                best_remaining = best_remaining.min(remaining);
+                (closer, format!("{remaining} blocks below the deploy block"))
+            }
+            Ok(state) => match submitter.serves_history(deploy_block).await {
+                Ok(true) if chain_verified => {
+                    event!(
+                        name: "eez.node.l1_ready",
+                        Level::INFO,
+                        head = state.head_block_number,
+                        deploy_block,
+                        "L1 source can serve our history",
+                    );
+                    return Ok(());
+                }
+                Ok(true) => (false, "chain id not read yet".to_string()),
+                // Tall enough but missing history: pruned, or backfilling.
+                // Head movement says nothing, so only a reported sync waits.
+                Ok(false) => (state.syncing, "does not serve the deploy block".to_string()),
+                Err(err) => {
+                    last_err = Some(err.to_string());
+                    (false, format!("history probe failed: {err}"))
+                }
+            },
+        };
+
+        stalled = if progressing { 0 } else { stalled + 1 };
+        waited += 1;
+        // A checkpoint sync can sit here for half an hour; ~1 WARN/min.
+        if waited <= 1 || waited.is_multiple_of(30) {
+            event!(
+                name: "eez.node.l1_not_ready",
+                Level::WARN,
+                deploy_block,
+                stalled_polls = stalled,
+                status,
+                "waiting for L1 to serve our history",
+            );
+        }
+        if stalled >= STALLED_POLLS || waited >= MAX_POLLS {
+            let cause = last_err.unwrap_or(status);
+            return Err(eyre::eyre!(
+                "L1 never became able to serve block {deploy_block}: {cause}"
+            ));
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+fn read_l1_rollup_id() -> u64 {
+    env::var("EEZ_L1_ROLLUP_ID")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// Build a `SystemTxContext` for follower mode from env (the follower
@@ -1032,23 +1166,15 @@ where
     }))
 }
 
-/// Read the L1 rollup id from env. Defaults to `0` to match the bridge
-/// E2E fixture's `MAINNET_ROLLUP_ID`.
-fn read_l1_rollup_id() -> u64 {
-    env::var("EEZ_L1_ROLLUP_ID")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0)
-}
-
+/// Required — a guessed default would assert the wrong chain, or skip the
+/// check entirely, on a misconfigured RPC.
 fn read_l1_chain_id() -> eyre::Result<u64> {
-    match env::var("EEZ_L1_CHAIN_ID") {
-        Ok(value) => value
-            .parse::<u64>()
-            .map_err(|err| eyre::eyre!("EEZ_L1_CHAIN_ID={value:?} malformed: {err}")),
-        Err(env::VarError::NotPresent) => Ok(1337),
-        Err(err) => Err(eyre::eyre!("EEZ_L1_CHAIN_ID is not valid unicode: {err}")),
-    }
+    let value = env::var("EEZ_L1_CHAIN_ID").map_err(|err| {
+        eyre::eyre!("EEZ_L1_CHAIN_ID is required (the L1 chain id this node derives from): {err}")
+    })?;
+    value
+        .parse::<u64>()
+        .map_err(|err| eyre::eyre!("EEZ_L1_CHAIN_ID={value:?} malformed: {err}"))
 }
 
 #[derive(Debug, Clone, Copy)]

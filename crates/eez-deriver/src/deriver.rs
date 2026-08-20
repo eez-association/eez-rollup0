@@ -262,13 +262,25 @@ where
                 .canonical_l1_hash(tail.l1_block)
                 .await
                 .map_err(DeriverError::l1_scan)?;
-            // `None` is not proof of a reorg — retreating on it would unwind
-            // L2 to genesis, so retry instead.
+            // `None` is not proof of a reorg — retreating would unwind L2 to
+            // genesis, so retry. A head ABOVE this block means pruned/rewound,
+            // which retrying won't fix; report it so that is diagnosable.
             let Some(canonical) = canonical else {
+                let head = self
+                    .inner
+                    .submitter
+                    .readiness()
+                    .await
+                    .map(|r| r.head_block_number)
+                    .ok();
                 return Err(DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
                     block: tail.l1_block,
                     tx_hash: tail.tx_hash,
-                    detail: "indexed batch's L1 block not served; cannot judge canonicality".into(),
+                    detail: format!(
+                        "indexed batch's L1 block not served; cannot judge canonicality \
+                         (source head: {head:?} — above this block means pruned or rewound, \
+                         not lagging)"
+                    ),
                 }));
             };
             if canonical == tail.l1_block_hash {
