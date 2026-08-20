@@ -85,6 +85,15 @@ impl std::fmt::Debug for Submitter {
     }
 }
 
+/// What the L1 source can currently serve. See [`Submitter::readiness`].
+#[derive(Debug, Clone, Copy)]
+pub struct L1Readiness {
+    /// Highest block number the source will serve.
+    pub head_block_number: u64,
+    /// Advisory: an endpoint that refuses `eth_syncing` reads as not-syncing.
+    pub syncing: bool,
+}
+
 impl Submitter {
     /// Build a Submitter from its config.
     #[must_use]
@@ -263,6 +272,76 @@ impl Submitter {
             .await
             .map_err(|e| L1Error::Provider(format!("get_block_by_number({number}): {e}")))?
             .map(|b| b.header.hash))
+    }
+
+    /// Whether the source serves `block`'s header, logs, and tx bodies — the
+    /// three things the batch scan reads.
+    ///
+    /// # Errors
+    ///
+    /// [`L1Error::Provider`] on RPC failure.
+    pub async fn serves_history(&self, block: u64) -> L1Result<bool> {
+        let provider = self.inner.build_provider();
+        let header = provider
+            .get_block_by_number(BlockNumberOrTag::Number(block))
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_block_by_number({block}): {e}")))?;
+        if header.is_none() {
+            return Ok(false);
+        }
+        let filter = alloy_rpc_types_eth::Filter::new()
+            .from_block(block)
+            .to_block(block)
+            .address(self.inner.config.eez);
+        // Result discarded: this asks whether eth_getLogs works at all (some
+        // endpoints restrict it), not whether the block has events.
+        provider
+            .get_logs(&filter)
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_logs probe at {block}: {e}")))?;
+        // The scan reads bodies only by (block hash, index), so a source that
+        // prunes them passes the probes above and stalls boot later.
+        // `None` here just means an empty block.
+        let header = header.expect("checked above");
+        provider
+            .get_transaction_by_block_hash_and_index(header.header.hash, 0)
+            .await
+            .map_err(|e| L1Error::Provider(format!("tx-by-index probe at {block}: {e}")))?;
+        Ok(true)
+    }
+
+    /// Chain id the configured L1 RPC serves.
+    ///
+    /// # Errors
+    ///
+    /// [`L1Error::Provider`] on RPC failure.
+    pub async fn chain_id(&self) -> L1Result<u64> {
+        self.inner
+            .build_provider()
+            .get_chain_id()
+            .await
+            .map_err(|e| L1Error::Provider(format!("eth_chainId: {e}")))
+    }
+
+    /// L1 head, and whether the node reports itself syncing.
+    ///
+    /// # Errors
+    ///
+    /// [`L1Error::Provider`] when the head is unreadable.
+    pub async fn readiness(&self) -> L1Result<L1Readiness> {
+        let provider = self.inner.build_provider();
+        let head = provider
+            .get_block_number()
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_block_number: {e}")))?;
+        let syncing = provider
+            .syncing()
+            .await
+            .is_ok_and(|s| !matches!(s, alloy_rpc_types_eth::SyncStatus::None));
+        Ok(L1Readiness {
+            head_block_number: head,
+            syncing,
+        })
     }
 
     /// The L1 source's finalized block `(number, hash)`, or `None` when the
