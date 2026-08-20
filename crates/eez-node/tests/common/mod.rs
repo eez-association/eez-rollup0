@@ -1687,8 +1687,21 @@ pub async fn sign_and_send(
     let env = TxEnvelope::from(tx.into_signed(sig));
     let hash = *env.tx_hash();
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let _ = provider.send_raw_transaction(&env.encoded_2718()).await?;
-    Ok(hash)
+    // Cross-chain fronts refuse submissions until the node has reconciled with
+    // L1; that is a transient boot state, so wait it out rather than failing.
+    let deadline = std::time::Instant::now() + Duration::from_mins(2);
+    loop {
+        match provider.send_raw_transaction(&env.encoded_2718()).await {
+            Ok(_) => return Ok(hash),
+            Err(err)
+                if err.to_string().contains("starting up")
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
 }
 
 pub async fn pending_nonce(rpc_url: &str, key: &str) -> Result<u64> {

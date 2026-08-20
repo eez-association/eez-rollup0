@@ -33,7 +33,7 @@ pub use l1_canonical_head::{BatchRecord, L1CanonicalHead};
 #[doc(inline)]
 pub use l1_head_stream::{L1HeadInfo, L1HeadStream};
 #[doc(inline)]
-pub use l1_reader::L1Reader;
+pub use l1_reader::{L1Reader, L1Readiness};
 #[doc(inline)]
 pub use l1_watcher::{L1Event, L1Watcher, L1WatcherConfig};
 #[doc(inline)]
