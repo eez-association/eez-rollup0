@@ -90,9 +90,7 @@ impl std::fmt::Debug for Submitter {
 pub struct L1Readiness {
     /// Highest block number the source will serve.
     pub head_block_number: u64,
-    /// The source reports itself mid-sync (`eth_syncing` != false). Advisory:
-    /// an endpoint that refuses `eth_syncing` reads as not-syncing rather than
-    /// failing the whole probe.
+    /// Advisory: an endpoint that refuses `eth_syncing` reads as not-syncing.
     pub syncing: bool,
 }
 
@@ -281,7 +279,7 @@ impl Submitter {
     ///
     /// # Errors
     ///
-    /// [`L1Error::Provider`] on RPC failure — surfaced, not retried.
+    /// [`L1Error::Provider`] on RPC failure.
     pub async fn serves_history(&self, block: u64) -> L1Result<bool> {
         let provider = self.inner.build_provider();
         let header = provider
@@ -295,17 +293,15 @@ impl Submitter {
             .from_block(block)
             .to_block(block)
             .address(self.inner.config.eez);
-        // The result is discarded on purpose: an empty `[]` is the normal case
-        // and still passes. This probes whether the endpoint SERVES eth_getLogs
-        // at all — some restrict or disable it, and the batch scan would then
-        // fail long after boot instead of here.
+        // Result discarded: this asks whether eth_getLogs works at all (some
+        // endpoints restrict it), not whether the block has events.
         provider
             .get_logs(&filter)
             .await
             .map_err(|e| L1Error::Provider(format!("get_logs probe at {block}: {e}")))?;
-        // The scan fetches bodies ONLY by (block hash, index), so a source
-        // that prunes them would pass the probes above and stall boot later.
-        // `None` at index 0 just means an empty block.
+        // The scan reads bodies only by (block hash, index), so a source that
+        // prunes them passes the probes above and stalls boot later.
+        // `None` here just means an empty block.
         let header = header.expect("checked above");
         provider
             .get_transaction_by_block_hash_and_index(header.header.hash, 0)
@@ -331,8 +327,7 @@ impl Submitter {
     ///
     /// # Errors
     ///
-    /// [`L1Error::Provider`] when the head is unreadable. `eth_syncing` is
-    /// advisory — an endpoint that omits it is not a broken source.
+    /// [`L1Error::Provider`] when the head is unreadable.
     pub async fn readiness(&self) -> L1Result<L1Readiness> {
         let provider = self.inner.build_provider();
         let head = provider

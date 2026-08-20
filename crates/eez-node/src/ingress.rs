@@ -179,10 +179,8 @@ fn upfront_cost(envelope: &TxEnvelope) -> Result<U256, String> {
         .ok_or_else(|| "upfront cost overflow: value + gas_limit * max_fee_per_gas".to_string())
 }
 
-/// Refusal returned while the node is still reconciling with L1. This text is
-/// a WIRE CONTRACT: the e2e helper and the shell harnesses under `scripts/` and
-/// `testing/kurtosis/` match on the substring "starting up" to retry. Changing
-/// it means changing them too.
+/// Refusal sent while the node is still reconciling with L1.
+/// WIRE CONTRACT: the e2e helper and the shell harnesses grep "starting up".
 pub const STARTING_UP_MSG: &str =
     "eez node is starting up; cross-chain submissions are not accepted yet";
 
@@ -336,9 +334,8 @@ fn content_length_exceeds(req: &Request<hyper::body::Incoming>, max: usize) -> b
         .is_some_and(|len| len > max)
 }
 
-/// Submission-family JSON-RPC methods. Matched by prefix, not equality: a
-/// variant like `eth_sendRawTransactionConditional` must not slip past the
-/// readiness gate or the cross-chain intercept just by having a longer name.
+/// Prefix, not equality: `eth_sendRawTransactionConditional` must not slip
+/// past the readiness gate or the intercept just by having a longer name.
 fn is_submission_method(method: &str) -> bool {
     method.starts_with("eth_sendRawTransaction")
 }
@@ -423,8 +420,8 @@ async fn handle(
         ));
     }
 
-    // Refuse submissions until the node is live; accepting them would strand
-    // txs in a pool no one drains. Reads still pass through.
+    // Accepting these before the node is live would strand them in a pool
+    // nothing drains. Reads still pass through.
     let method = json.get("method").and_then(Value::as_str).unwrap_or("");
     if is_submission_method(method) && !ctx.ready.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(rpc_error(
@@ -434,8 +431,8 @@ async fn handle(
         ));
     }
 
-    // A submission variant we do not route would otherwise be forwarded straight
-    // to the source chain, skipping the held pool entirely. Refuse it loudly.
+    // An unrouted variant would be forwarded to the source chain, skipping the
+    // held pool entirely.
     if is_submission_method(method) && method != SEND_RAW {
         return Ok(rpc_error(
             json.get("id").cloned().unwrap_or(Value::Null),
@@ -789,8 +786,7 @@ mod tests {
         );
     }
 
-    /// A longer submission method must not slip past the gate or reach the
-    /// upstream chain unrouted just because it isn't the exact string.
+    /// A longer submission method must not slip past the gate.
     #[test]
     fn submission_variants_are_recognised_not_just_the_exact_method() {
         assert!(is_submission_method("eth_sendRawTransaction"));
@@ -1127,8 +1123,7 @@ mod tests {
         outbound_task.abort();
     }
 
-    /// The `-32000 "starting up"` refusal is a wire contract: the e2e helper
-    /// and the wave harnesses retry on that text. Reads must still answer.
+    /// The refusal is a wire contract: harnesses retry on that text.
     #[tokio::test]
     async fn front_refuses_submissions_until_ready_without_touching_the_pool() {
         let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(3)).unwrap();

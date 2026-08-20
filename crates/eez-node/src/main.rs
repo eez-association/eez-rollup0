@@ -58,8 +58,8 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 const BOOT_CATCH_UP_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
-/// ~15 min at the capped backoff. Long enough to outlast a restarting L1,
-/// short enough that a permanently-refused RPC call surfaces as an exit.
+/// ~15 min at the capped backoff: outlasts a restarting L1, but a permanently
+/// refused RPC call still surfaces as an exit.
 const BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES: u32 = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -825,9 +825,8 @@ fn main() -> eyre::Result<()> {
             composer_setup;
 
         let l2_source_chain_id = chain_spec.chain().id();
-        // Resolve both required fronts. Misconfiguration still fails launch
-        // here; the upstream chain-id check runs after the L1 gate below, so a
-        // late L1 cannot stop the ports from binding.
+        // The upstream chain-id check runs after the L1 gate below, so a late
+        // L1 cannot stop the ports from binding.
         let mut xchain_fronts = Vec::new();
         if mode == Mode::Composer {
             require_xchain_composer_wiring(cross_chain_composer_wired)?;
@@ -856,9 +855,8 @@ fn main() -> eyre::Result<()> {
             system_tx_cfg,
         );
 
-        // Fronts bind BEFORE the L1 wait so orchestrator port checks see a
-        // live node; submissions are refused until `xchain_ready` flips below.
-        // L1 front = Inbound (L1→L2); L2 front = Outbound (L2→L1).
+        // Bound before the L1 wait so port checks see a live node; submissions
+        // are refused until `xchain_ready` flips below.
         let xchain_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let xchain_checks: Vec<_> = xchain_fronts
             .iter()
@@ -882,9 +880,8 @@ fn main() -> eyre::Result<()> {
             });
         }
 
-        // Wait until L1 can actually serve our history. Downstream then never
-        // has to encode "what if the L1 is empty / has no finality / is behind
-        // the deploy block" — those states simply cannot reach it.
+        // Downstream never has to handle an empty / lagging / pruned L1:
+        // those states cannot get past here.
         // An embedded L1 knows its own chain id; every other path must be told.
         let expected_l1_chain_id = match l1_source_chain_id {
             Some(id) => id,
@@ -902,10 +899,9 @@ fn main() -> eyre::Result<()> {
         let (l1_seed_number, l1_seed_hash) = loop {
             match deriver.catch_up_with_seed().await {
                 Ok(seed) => break seed,
-                // SourceIncomplete stays uncapped — only time fixes it.
-                // Transport does not: the alloy error is stringified into
-                // Provider, so a permanent JSON-RPC refusal is indistinguish-
-                // able from a dropped connection and would retry forever.
+                // SourceIncomplete is uncapped — only time fixes it. Transport
+                // is capped: a permanent JSON-RPC refusal is indistinguishable
+                // from a dropped connection, so it would retry forever.
                 Err(err) if err.is_l1_transport() && {
                     transport_failures += 1;
                     transport_failures >= BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES
@@ -1025,8 +1021,8 @@ fn main() -> eyre::Result<()> {
 }
 
 /// Blocks until L1 serves our history: head at or past the deploy block, with
-/// that block's header, logs, and tx bodies readable. Patience follows
-/// progress, so a source that stops progressing fails instead of hanging.
+/// that block's header, logs, and tx bodies readable. An L1 that stops making
+/// progress fails here instead of hanging.
 async fn wait_for_l1_ready(
     submitter: &Submitter,
     deploy_block: u64,
@@ -1043,8 +1039,8 @@ async fn wait_for_l1_ready(
     let mut chain_verified = false;
 
     loop {
-        // Verified on the first answer, not before the loop — checking early
-        // skipped it on exactly the endpoint this gate exists for.
+        // On the first answer, not before the loop — checking early skipped it
+        // on exactly the endpoint this gate exists for.
         if !chain_verified {
             match submitter.chain_id().await {
                 Ok(actual) if actual != expected_l1_chain_id => {
@@ -1065,8 +1061,8 @@ async fn wait_for_l1_ready(
             }
             Ok(state) if state.head_block_number < deploy_block => {
                 let remaining = deploy_block - state.head_block_number;
-                // High-water mark: a head oscillating behind a load balancer
-                // would otherwise reset the counter every other poll.
+                // High-water mark: an oscillating head would otherwise reset
+                // the stall counter every other poll.
                 let closer = remaining < best_remaining;
                 best_remaining = best_remaining.min(remaining);
                 (closer, format!("{remaining} blocks below the deploy block"))
@@ -1083,8 +1079,8 @@ async fn wait_for_l1_ready(
                     return Ok(());
                 }
                 Ok(true) => (false, "chain id not read yet".to_string()),
-                // Tall enough but missing history: pruned, or still backfilling.
-                // Head movement says nothing, so only a self-reported sync waits.
+                // Tall enough but missing history: pruned, or backfilling.
+                // Head movement says nothing, so only a reported sync waits.
                 Ok(false) => (state.syncing, "does not serve the deploy block".to_string()),
                 Err(err) => {
                     last_err = Some(err.to_string());
@@ -1095,8 +1091,7 @@ async fn wait_for_l1_ready(
 
         stalled = if progressing { 0 } else { stalled + 1 };
         waited += 1;
-        // A checkpoint sync can sit here for half an hour; one WARN per 2s poll
-        // buries everything else.
+        // A checkpoint sync can sit here for half an hour; ~1 WARN/min.
         if waited <= 1 || waited.is_multiple_of(30) {
             event!(
                 name: "eez.node.l1_not_ready",
@@ -1171,8 +1166,8 @@ where
     }))
 }
 
-/// The L1 chain this node derives from. Required: guessing it would assert the
-/// wrong chain, or skip the check entirely, on a misconfigured RPC.
+/// Required — a guessed default would assert the wrong chain, or skip the
+/// check entirely, on a misconfigured RPC.
 fn read_l1_chain_id() -> eyre::Result<u64> {
     let value = env::var("EEZ_L1_CHAIN_ID").map_err(|err| {
         eyre::eyre!("EEZ_L1_CHAIN_ID is required (the L1 chain id this node derives from): {err}")

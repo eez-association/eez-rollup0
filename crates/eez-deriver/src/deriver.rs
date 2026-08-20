@@ -262,9 +262,9 @@ where
                 .canonical_l1_hash(tail.l1_block)
                 .await
                 .map_err(DeriverError::l1_scan)?;
-            // `None` is not proof of a reorg — retreating on it would unwind
-            // L2 to genesis, so we retry. The head is reported because a head
-            // ABOVE this block means pruned/rewound, which retrying won't fix.
+            // `None` is not proof of a reorg — retreating would unwind L2 to
+            // genesis, so retry. A head ABOVE this block means pruned/rewound,
+            // which retrying won't fix; report it so that is diagnosable.
             let Some(canonical) = canonical else {
                 let head = self
                     .inner

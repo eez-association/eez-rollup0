@@ -251,8 +251,8 @@ echo "==> setup complete; running waves"
 RECEIPT_WAIT_SECS="${EEZ_RECEIPT_WAIT_SECS:-300}"
 WAVE_GAP_SECS="${EEZ_WAVE_GAP_SECS:-20}"
 FILLER_PER_GAP="${EEZ_FILLER_PER_GAP:-2}"
-# Inject one reverting cross-chain call per side per wave (bogus selector on a
-# target with no fallback). They must NOT settle, and must not disturb the rest.
+# One reverting cross-chain call per side per wave (bogus selector, no
+# fallback). They must NOT settle, and must not disturb the rest.
 INCLUDE_REVERTS="${EEZ_INCLUDE_REVERTS:-0}"
 PURE_RECIPIENT=0x2222222222222222222222222222222222222222
 
@@ -260,13 +260,11 @@ refresh_node_log() { docker logs "$(docker ps --format "{{.Names}}" | grep -m1 "
 refresh_signer_log() { docker logs "$(docker ps --format "{{.Names}}" | grep -m1 "eez-proof-signer--")" >"$SIGNER_LOG" 2>&1 || true; }
 strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
 
-# The mev-boost relay needs a few L1 slots before it includes anything. Firing
-# waves into that window burns MAX_BUNDLE_ATTEMPTS on relay drops and evicts
-# the ops as poison — a harness artifact that looks exactly like a node bug.
-# run-ci.sh gates on the same signal. Must sit BELOW the helpers it calls.
-# Count a registry event over a block range. Baselined per run: the verifier
-# runs several modes against ONE enclave, so counting from the deploy block
-# lets an earlier mode's events satisfy this mode's assertion.
+# The relay needs a few L1 slots before it includes anything. Firing into that
+# window burns MAX_BUNDLE_ATTEMPTS and evicts the ops as poison — a harness
+# artifact that looks exactly like a node bug.
+# Count a registry event from a block. Baselined per run: several modes share
+# one enclave, so counting from the deploy block would count their events too.
 registry_events() { # <event-sig> [from-block]
     cast logs --address "$EEZ_REGISTRY_ADDRESS" \
         --from-block "${2:-${EEZ_REGISTRY_DEPLOY_BLOCK:-0}}" --to-block latest \
@@ -277,13 +275,12 @@ settled_count() { refresh_node_log; strip_ansi <"$NODE_LOG" | grep -c "settled=t
 
 wait_for_builder() {
     local deadline=$(( SECONDS + ${EEZ_BUILDER_WARM_SECS:-600} )) base hits
-    # Baseline first: the verifier runs several modes against ONE enclave, so an
-    # earlier mode's settlements are still in the log and would match instantly.
+    # Baseline first: an earlier mode's settlements are still in the log.
     base=$(settled_count)
     echo "==> waiting for the builder to include a bundle"
     while :; do
-        # `grep -c`, not `grep -q`: -q exits on the first match, which SIGPIPEs
-        # sed, and `set -o pipefail` then reports the whole pipeline as failed.
+        # `-c` not `-q`: -q exits on first match, SIGPIPEs sed, and pipefail
+        # then reports the successful pipeline as failed.
         hits=$(settled_count)
         if (( ${hits:-0} > ${base:-0} )); then
             echo "    ✓ builder is including bundles ($((hits - base)) new this run)"; return 0
@@ -321,13 +318,13 @@ wait_nonce_at_least() {
 # front; fails loud if the admission gate rejects (invariant 7 is LOUD).
 send_front() {
     local resp i rc
-    # Fronts refuse submissions until the node has reconciled with L1 — a
-    # transient boot state, so wait it out; any other error is still fatal.
+    # Fronts refuse submissions until the node reconciles with L1; wait that
+    # out. Any other error is fatal.
     for i in $(seq 1 120); do
         resp=$(curl -sS --max-time 10 -X POST "$1" -H 'Content-Type: application/json' \
             -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$2\"],\"id\":1}" 2>/dev/null); rc=$?
-        # An empty body means curl never got an answer. Without this the
-        # `"error"` grep below misses, and a tx that was NEVER SENT reports success.
+        # Empty body = no answer. Without this the grep below misses and a tx
+        # that was NEVER SENT reports success.
         (( rc == 0 )) && [[ -n "$resp" ]] || {
             echo "    ✗ submit failed (curl rc=$rc, ${#resp} byte body)" >&2; return 1; }
         grep -q '"error"' <<<"$resp" || return 0
@@ -445,9 +442,9 @@ run_waves() {
     # write the same target through the same proxy, in submission order).
     local w
     # Baseline for the per-run event counts below.
-    L1_BLOCK_AT_START=$(retry cast block-number --rpc-url "$L1")
-    # Must run here, not at setup: bash resolves functions at CALL time, and
-    # every helper this needs is defined above only by this point.
+    # +1: the current head is already mined, so its events predate this run.
+    L1_FIRST_COUNTED_BLOCK=$(( $(retry cast block-number --rpc-url "$L1") + 1 ))
+    # Here, not at setup: the helpers it calls are defined above this point.
     wait_for_builder || return 1
     echo
     echo "==> firing $WAVES wave(s), mode=$MODE"
@@ -536,9 +533,8 @@ run_waves() {
     echo "==> assertions"
     local ok_all=1 signer_ok=0 attested_hash=""
 
-    # Reverting cross-chain calls: the destination call fails, so the op must
-    # never report success. Anything else (status=1) means a call that reverted
-    # on the far side was settled as if it had applied.
+    # The destination call fails, so status=1 would mean a call that reverted
+    # on the far side settled as if it had applied.
     if (( INCLUDE_REVERTS )); then
         local rh rev_total=0 rev_ok=0 rst
         for rh in "${REV_IN_HASHES[@]:-}"; do
@@ -588,7 +584,7 @@ run_waves() {
     # postBatches actually landed on L1 (the original bundle-drop symptom).
     # Counted from THIS run's starting block, not the deploy block.
     local PB_COUNT
-    PB_COUNT=$(registry_events "BatchPosted(uint256)" "$L1_BLOCK_AT_START")
+    PB_COUNT=$(registry_events "BatchPosted(uint256)" "$L1_FIRST_COUNTED_BLOCK")
     if (( PB_COUNT >= WAVES )); then
         echo "    ✓ postBatches on L1 this run: $PB_COUNT (≥ $WAVES waves)"
     else
@@ -596,7 +592,7 @@ run_waves() {
     fi
 
     local EXECUTION_COUNT
-    EXECUTION_COUNT=$(registry_events "L2ExecutionPerformed(uint64,bytes32)" "$L1_BLOCK_AT_START")
+    EXECUTION_COUNT=$(registry_events "L2ExecutionPerformed(uint64,bytes32)" "$L1_FIRST_COUNTED_BLOCK")
     if (( EXECUTION_COUNT > 0 )); then
         echo "    ✓ L2 execution events on L1 this run: $EXECUTION_COUNT"
     else
