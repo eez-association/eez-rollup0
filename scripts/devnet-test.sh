@@ -83,10 +83,14 @@ retry() {
 # Fronts refuse submissions until the node has reconciled with L1; that is a
 # transient boot state, so wait it out rather than reporting it as a drop.
 send_raw() {
-    local resp i
+    local resp i rc
     for i in $(seq 1 120); do
-        resp=$(curl -s -X POST "$1" -H 'Content-Type: application/json' \
-            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$2\"],\"id\":${3:-1}}")
+        resp=$(curl -sS --max-time 10 -X POST "$1" -H 'Content-Type: application/json' \
+            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$2\"],\"id\":${3:-1}}" 2>/dev/null); rc=$?
+        # An empty body means curl never got an answer. Without this the
+        # `"error"` grep below misses, and a tx that was NEVER SENT reports success.
+        (( rc == 0 )) && [[ -n "$resp" ]] || {
+            echo "    ✗ submit failed (curl rc=$rc, ${#resp} byte body)" >&2; return 1; }
         grep -q '"error"' <<<"$resp" || return 0
         grep -q 'starting up' <<<"$resp" || { echo "    ✗ rejected tx: $resp" >&2; return 1; }
         sleep 1

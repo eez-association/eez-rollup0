@@ -264,17 +264,29 @@ strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
 # waves into that window burns MAX_BUNDLE_ATTEMPTS on relay drops and evicts
 # the ops as poison — a harness artifact that looks exactly like a node bug.
 # run-ci.sh gates on the same signal. Must sit BELOW the helpers it calls.
+# Count a registry event over a block range. Baselined per run: the verifier
+# runs several modes against ONE enclave, so counting from the deploy block
+# lets an earlier mode's events satisfy this mode's assertion.
+registry_events() { # <event-sig> [from-block]
+    cast logs --address "$EEZ_REGISTRY_ADDRESS" \
+        --from-block "${2:-${EEZ_REGISTRY_DEPLOY_BLOCK:-0}}" --to-block latest \
+        "$1" --rpc-url "$L1" --json 2>/dev/null | jq 'length' 2>/dev/null || echo 0
+}
+
+settled_count() { refresh_node_log; strip_ansi <"$NODE_LOG" | grep -c "settled=true" || true; }
+
 wait_for_builder() {
-    local deadline=$(( SECONDS + ${EEZ_BUILDER_WARM_SECS:-600} ))
+    local deadline=$(( SECONDS + ${EEZ_BUILDER_WARM_SECS:-600} )) base hits
+    # Baseline first: the verifier runs several modes against ONE enclave, so an
+    # earlier mode's settlements are still in the log and would match instantly.
+    base=$(settled_count)
     echo "==> waiting for the builder to include a bundle"
     while :; do
-        refresh_node_log
         # `grep -c`, not `grep -q`: -q exits on the first match, which SIGPIPEs
         # sed, and `set -o pipefail` then reports the whole pipeline as failed.
-        local hits
-        hits=$(strip_ansi <"$NODE_LOG" | grep -c "settled=true" || true)
-        if (( ${hits:-0} > 0 )); then
-            echo "    ✓ builder is including bundles ($hits settled)"; return 0
+        hits=$(settled_count)
+        if (( ${hits:-0} > ${base:-0} )); then
+            echo "    ✓ builder is including bundles ($((hits - base)) new this run)"; return 0
         fi
         (( SECONDS < deadline )) || {
             echo "    ✗ no bundle included in ${EEZ_BUILDER_WARM_SECS:-600}s"; return 1
@@ -308,12 +320,16 @@ wait_nonce_at_least() {
 # send_front <front_url> <raw_tx> — eth_sendRawTransaction to a cross-chain
 # front; fails loud if the admission gate rejects (invariant 7 is LOUD).
 send_front() {
-    local resp i
+    local resp i rc
     # Fronts refuse submissions until the node has reconciled with L1 — a
     # transient boot state, so wait it out; any other error is still fatal.
     for i in $(seq 1 120); do
-        resp=$(curl -s -X POST "$1" -H 'Content-Type: application/json' \
-            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$2\"],\"id\":1}")
+        resp=$(curl -sS --max-time 10 -X POST "$1" -H 'Content-Type: application/json' \
+            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$2\"],\"id\":1}" 2>/dev/null); rc=$?
+        # An empty body means curl never got an answer. Without this the
+        # `"error"` grep below misses, and a tx that was NEVER SENT reports success.
+        (( rc == 0 )) && [[ -n "$resp" ]] || {
+            echo "    ✗ submit failed (curl rc=$rc, ${#resp} byte body)" >&2; return 1; }
         grep -q '"error"' <<<"$resp" || return 0
         grep -q 'starting up' <<<"$resp" || { echo "    ✗ front rejected tx: $resp" >&2; return 1; }
         sleep 1
@@ -428,6 +444,8 @@ run_waves() {
     # LAST so the wrapper's value is the expected final Value.value() (both
     # write the same target through the same proxy, in submission order).
     local w
+    # Baseline for the per-run event counts below.
+    L1_BLOCK_AT_START=$(retry cast block-number --rpc-url "$L1")
     # Must run here, not at setup: bash resolves functions at CALL time, and
     # every helper this needs is defined above only by this point.
     wait_for_builder || return 1
@@ -568,23 +586,19 @@ run_waves() {
     fi
 
     # postBatches actually landed on L1 (the original bundle-drop symptom).
+    # Counted from THIS run's starting block, not the deploy block.
     local PB_COUNT
-    PB_COUNT=$(cast logs --address "$EEZ_REGISTRY_ADDRESS" \
-        --from-block "${EEZ_REGISTRY_DEPLOY_BLOCK:-0}" --to-block latest \
-        "BatchPosted(uint256)" --rpc-url "$L1" --json 2>/dev/null | jq 'length' 2>/dev/null || echo 0)
+    PB_COUNT=$(registry_events "BatchPosted(uint256)" "$L1_BLOCK_AT_START")
     if (( PB_COUNT >= WAVES )); then
-        echo "    ✓ postBatches on L1: $PB_COUNT (≥ $WAVES waves)"
+        echo "    ✓ postBatches on L1 this run: $PB_COUNT (≥ $WAVES waves)"
     else
-        echo "    ✗ postBatches on L1: $PB_COUNT (expected ≥ $WAVES)"; ok_all=0
+        echo "    ✗ postBatches on L1 this run: $PB_COUNT (expected ≥ $WAVES)"; ok_all=0
     fi
 
     local EXECUTION_COUNT
-    EXECUTION_COUNT=$(cast logs --address "$EEZ_REGISTRY_ADDRESS" \
-        --from-block "${EEZ_REGISTRY_DEPLOY_BLOCK:-0}" --to-block latest \
-        "L2ExecutionPerformed(uint64,bytes32)" --rpc-url "$L1" --json 2>/dev/null \
-        | jq 'length' 2>/dev/null || echo 0)
+    EXECUTION_COUNT=$(registry_events "L2ExecutionPerformed(uint64,bytes32)" "$L1_BLOCK_AT_START")
     if (( EXECUTION_COUNT > 0 )); then
-        echo "    ✓ L2 execution events on L1: $EXECUTION_COUNT"
+        echo "    ✓ L2 execution events on L1 this run: $EXECUTION_COUNT"
     else
         echo "    ✗ no L2ExecutionPerformed event found"; ok_all=0
     fi
