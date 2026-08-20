@@ -885,13 +885,11 @@ fn main() -> eyre::Result<()> {
         // Wait until L1 can actually serve our history. Downstream then never
         // has to encode "what if the L1 is empty / has no finality / is behind
         // the deploy block" — those states simply cannot reach it.
-        // Composer mode always knows the L1 chain id (embedded, or read at
-        // setup). A follower only knows it if the operator set EEZ_L1_CHAIN_ID.
-        // `None` means "unknown" — we skip the check rather than assert against
-        // `read_l1_chain_id`'s 1337 dev default, which would fail every real
-        // follower that omits the var.
-        let expected_l1_chain_id =
-            l1_source_chain_id.or_else(|| env::var("EEZ_L1_CHAIN_ID").ok()?.parse().ok());
+        // An embedded L1 knows its own chain id; every other path must be told.
+        let expected_l1_chain_id = match l1_source_chain_id {
+            Some(id) => id,
+            None => read_l1_chain_id()?,
+        };
         wait_for_l1_ready(&submitter, rollup_config.deploy_block, expected_l1_chain_id).await?;
 
         for (expected_chain_id, provider) in &xchain_checks {
@@ -1032,7 +1030,7 @@ fn main() -> eyre::Result<()> {
 async fn wait_for_l1_ready(
     submitter: &Submitter,
     deploy_block: u64,
-    expected_chain_id: Option<u64>,
+    expected_l1_chain_id: u64,
 ) -> eyre::Result<()> {
     const POLL: Duration = Duration::from_secs(2);
     const STALLED_POLLS: u32 = 450; // 15 min with no progress
@@ -1042,20 +1040,19 @@ async fn wait_for_l1_ready(
     let mut stalled = 0_u32;
     let mut waited = 0_u32;
     let mut last_err: Option<String> = None;
-    // Cleared once checked; `None` up front means there is nothing to check.
-    let mut unverified_chain_id = expected_chain_id;
+    let mut chain_verified = false;
 
     loop {
         // Verified on the first answer, not before the loop — checking early
         // skipped it on exactly the endpoint this gate exists for.
-        if let Some(expected) = unverified_chain_id {
+        if !chain_verified {
             match submitter.chain_id().await {
-                Ok(actual) if actual != expected => {
+                Ok(actual) if actual != expected_l1_chain_id => {
                     return Err(eyre::eyre!(
-                        "EEZ_L1_RPC_URL serves chain {actual}, expected {expected}"
+                        "EEZ_L1_RPC_URL serves chain {actual}, expected {expected_l1_chain_id}"
                     ));
                 }
-                Ok(_) => unverified_chain_id = None,
+                Ok(_) => chain_verified = true,
                 Err(err) => last_err = Some(format!("eth_chainId: {err}")),
             }
         }
@@ -1075,7 +1072,7 @@ async fn wait_for_l1_ready(
                 (closer, format!("{remaining} blocks below the deploy block"))
             }
             Ok(state) => match submitter.serves_history(deploy_block).await {
-                Ok(true) if unverified_chain_id.is_none() => {
+                Ok(true) if chain_verified => {
                     event!(
                         name: "eez.node.l1_ready",
                         Level::INFO,
@@ -1174,14 +1171,15 @@ where
     }))
 }
 
+/// The L1 chain this node derives from. Required: guessing it would assert the
+/// wrong chain, or skip the check entirely, on a misconfigured RPC.
 fn read_l1_chain_id() -> eyre::Result<u64> {
-    match env::var("EEZ_L1_CHAIN_ID") {
-        Ok(value) => value
-            .parse::<u64>()
-            .map_err(|err| eyre::eyre!("EEZ_L1_CHAIN_ID={value:?} malformed: {err}")),
-        Err(env::VarError::NotPresent) => Ok(1337),
-        Err(err) => Err(eyre::eyre!("EEZ_L1_CHAIN_ID is not valid unicode: {err}")),
-    }
+    let value = env::var("EEZ_L1_CHAIN_ID").map_err(|err| {
+        eyre::eyre!("EEZ_L1_CHAIN_ID is required (the L1 chain id this node derives from): {err}")
+    })?;
+    value
+        .parse::<u64>()
+        .map_err(|err| eyre::eyre!("EEZ_L1_CHAIN_ID={value:?} malformed: {err}"))
 }
 
 #[derive(Debug, Clone, Copy)]
