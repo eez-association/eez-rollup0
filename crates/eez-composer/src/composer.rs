@@ -516,6 +516,35 @@ pub struct Composer<L2: BlockReader> {
     inner: Arc<Inner<L2>>,
 }
 
+/// Invalid composer dependency wiring rejected at construction.
+#[derive(Debug, thiserror::Error)]
+pub enum ComposerConfigError {
+    /// The submitter observes a different L1 account than the one signing
+    /// `postAndVerifyBatch`, so the Composer could misattribute its own batch.
+    #[error(
+        "L1 submission identity mismatch: Submitter poster {submitter_poster} does not match postBatch signer {post_batch_signer}"
+    )]
+    SubmissionIdentityMismatch {
+        /// Account whose receipts and `BatchPosted` events the Submitter tracks.
+        submitter_poster: Address,
+        /// Account signing the `postAndVerifyBatch` transaction.
+        post_batch_signer: Address,
+    },
+}
+
+fn ensure_submission_identity(
+    submitter_poster: Address,
+    post_batch_signer: Address,
+) -> Result<(), ComposerConfigError> {
+    if submitter_poster != post_batch_signer {
+        return Err(ComposerConfigError::SubmissionIdentityMismatch {
+            submitter_poster,
+            post_batch_signer,
+        });
+    }
+    Ok(())
+}
+
 struct Inner<L2: BlockReader> {
     /// Per-rollup state keyed by rollup ID.
     rollups: HashMap<u64, RollupState<L2>>,
@@ -558,18 +587,26 @@ where
     <L2 as TransactionsProvider>::Transaction: Encodable2718,
 {
     /// Constructs the umbrella. Synchronous — does no I/O.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ComposerConfigError::SubmissionIdentityMismatch`] when the
+    /// cross-chain postBatch signer does not match the Submitter's poster.
     pub fn new(
         rollups: HashMap<u64, RollupState<L2>>,
         prover: Arc<dyn Prover>,
-        submitter: Submitter,
         evm_config: EthEvmConfig,
         cross_chain: CrossChainWiring,
         committer: BlockCommitterHandle<EthEngineTypes>,
         witness_source: Option<Arc<dyn eez_prover::ProvingWitnessSource>>,
         timing: RollupTiming,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ComposerConfigError> {
+        let submitter = cross_chain.exec_ctx.submitter.clone();
+        let submitter_poster = submitter.poster_address();
+        let post_batch_signer = cross_chain.exec_ctx.l1_poster_signer.address();
+        ensure_submission_identity(submitter_poster, post_batch_signer)?;
+
+        Ok(Self {
             inner: Arc::new(Inner {
                 rollups,
                 prover,
@@ -580,7 +617,7 @@ where
                 witness_source,
                 emission: EmissionLimits::from_env(timing),
             }),
-        }
+        })
     }
 
     /// Run loop. Drains `l1_events` (subscribed by the caller before
@@ -3052,6 +3089,21 @@ async fn sign_post_batch_tx(
 mod tests {
     use super::*;
     use alloy_primitives::TxHash;
+
+    #[test]
+    fn submission_identity_must_match_post_batch_signer() {
+        let poster = Address::repeat_byte(0xa);
+        assert!(ensure_submission_identity(poster, poster).is_ok());
+
+        let err = ensure_submission_identity(poster, Address::repeat_byte(0xb)).unwrap_err();
+        assert!(matches!(
+            err,
+            ComposerConfigError::SubmissionIdentityMismatch {
+                submitter_poster,
+                post_batch_signer,
+            } if submitter_poster == poster && post_batch_signer == Address::repeat_byte(0xb)
+        ));
+    }
 
     fn held(sender: Address, direction: Direction, nonce: u64, hash_byte: u8) -> HeldTx {
         HeldTx {

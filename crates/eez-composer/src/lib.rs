@@ -45,7 +45,7 @@ mod prover_retry;
 pub mod rollup;
 
 #[doc(inline)]
-pub use composer::{Composer, CrossChainExecCtx};
+pub use composer::{Composer, ComposerConfigError, CrossChainExecCtx};
 #[doc(inline)]
 pub use held_pool::{AdmissionError, HeldPool, HeldTx};
 #[doc(inline)]

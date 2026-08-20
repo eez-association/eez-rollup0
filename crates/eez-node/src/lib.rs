@@ -56,6 +56,9 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 const BOOT_CATCH_UP_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+const L1_CHAIN_ID_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const L2_SYSTEM_TX_GAS_PRICE: u128 = 1_000_000_000;
+const L2_SYSTEM_TX_GAS_LIMIT: u64 = 2_000_000;
 
 /// Witness-capture resources selected by the mandatory composer prover.
 enum WitnessCapture {
@@ -624,7 +627,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                     "EEZL2_ADDRESS required for the cross-chain composer (set by deploy.sh)"
                 )
             })?)?;
-        let l1_rollup_id_u64 = read_l1_rollup_id();
+        let l1_rollup_id_u64 = read_l1_rollup_id()?;
         let l1_rollup_id = RollupId(l1_rollup_id_u64);
         let l2_rollup_id_typed = RollupId(rollup_id);
 
@@ -751,10 +754,11 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             .parse()
             .map_err(|e| eyre::eyre!("EEZ_L1_RPC_URL malformed: {e}"))?;
         let l1_provider = alloy_provider::RootProvider::new_http(l1_rpc_url.clone());
-        let l1_submission_chain_id = l1_provider
-            .get_chain_id()
-            .await
-            .map_err(|e| eyre::eyre!("read chain id from EEZ_L1_RPC_URL: {e}"))?;
+        let l1_submission_chain_id =
+            tokio::time::timeout(L1_CHAIN_ID_READ_TIMEOUT, l1_provider.get_chain_id())
+                .await
+                .map_err(|_| eyre::eyre!("timed out reading chain id from EEZ_L1_RPC_URL"))?
+                .map_err(|e| eyre::eyre!("read chain id from EEZ_L1_RPC_URL: {e}"))?;
         let l1_poster_key = env::var("EEZ_L1_POSTER_KEY")
             .map_err(|_| eyre::eyre!("EEZ_L1_POSTER_KEY required for L1 postBatch signing"))?;
         let l1_poster_signer =
@@ -784,8 +788,8 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             system_signer,
             eezl2_address,
             l2_chain_id: chain_spec.chain().id(),
-            l2_gas_price: 1_000_000_000,
-            l2_gas_limit: 2_000_000,
+            l2_gas_price: L2_SYSTEM_TX_GAS_PRICE,
+            l2_gas_limit: L2_SYSTEM_TX_GAS_LIMIT,
             l1_provider,
             submitter: submitter.clone(),
             l1_poster_signer,
@@ -863,13 +867,12 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         let composer = Composer::new(
             rollups,
             prover,
-            submitter.clone(),
             evm_config,
             cross_chain,
             block_committer.clone(),
             witness_source,
             timing,
-        );
+        )?;
         let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
 
         let schedule_rx = spawn_l1_anchored(
@@ -1055,19 +1058,31 @@ where
         system_signer,
         eezl2_address,
         l2_chain_id: chain_spec.chain().id(),
-        l2_gas_price: 1_000_000_000,
-        l2_gas_limit: 2_000_000,
+        l2_gas_price: L2_SYSTEM_TX_GAS_PRICE,
+        l2_gas_limit: L2_SYSTEM_TX_GAS_LIMIT,
         this_rollup_id,
     }))
 }
 
 /// Read the L1 rollup id from env. Defaults to `0` to match the bridge
-/// E2E fixture's `MAINNET_ROLLUP_ID`.
-fn read_l1_rollup_id() -> u64 {
-    env::var("EEZ_L1_ROLLUP_ID")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0)
+/// E2E fixture's `MAINNET_ROLLUP_ID` only when the variable is absent.
+fn read_l1_rollup_id() -> eyre::Result<u64> {
+    match env::var("EEZ_L1_ROLLUP_ID") {
+        Ok(raw) => parse_l1_rollup_id(Some(&raw)),
+        Err(env::VarError::NotPresent) => parse_l1_rollup_id(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(eyre::eyre!("EEZ_L1_ROLLUP_ID contains non-UTF-8 bytes"))
+        }
+    }
+}
+
+fn parse_l1_rollup_id(raw: Option<&str>) -> eyre::Result<u64> {
+    let Some(raw) = raw else {
+        return Ok(0);
+    };
+    raw.trim()
+        .parse::<u64>()
+        .map_err(|e| eyre::eyre!("EEZ_L1_ROLLUP_ID={raw:?} malformed: {e}"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1241,6 +1256,14 @@ fn warn_on_deprecated_env() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn l1_rollup_id_defaults_only_when_absent() {
+        assert_eq!(parse_l1_rollup_id(None).unwrap(), 0);
+        assert_eq!(parse_l1_rollup_id(Some(" 7 ")).unwrap(), 7);
+        let err = parse_l1_rollup_id(Some("1o")).unwrap_err().to_string();
+        assert!(err.contains("EEZ_L1_ROLLUP_ID=\"1o\" malformed"));
+    }
 
     #[test]
     fn xchain_front_missing_port_fails_fast() {

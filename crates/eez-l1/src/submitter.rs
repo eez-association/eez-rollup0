@@ -1,6 +1,6 @@
 //! Thin signed L1-submission primitive: sends `postAndVerifyBatch` via
 //! `eth_sendBundle`. Read-only canonical-chain scans live in
-//! [`L1Reader`](crate::L1Reader).
+//! [`L1Reader`].
 //!
 //! `eth_sendBundle` pins inclusion to one L1 block. If the bundle
 //! isn't in that block we report [`SendOutcome::Dropped`] and the
