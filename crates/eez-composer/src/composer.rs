@@ -24,7 +24,6 @@ use std::sync::Arc;
 use alloy_eips::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider as _;
-use alloy_sol_types::SolValue as _;
 use async_trait::async_trait;
 use eez_driver::{
     BlockCommitterHandle, MAX_BLOCKS_PER_BATCH, ParentContext, RollupTiming, SyncSlotBlock,
@@ -35,7 +34,7 @@ use eez_l1::{BundleTarget, L1Event, SendOutcome, Submitter};
 use eez_prover::{ActionableProverFailure, BlockWitness, Prover, ProverError, ProvingContext};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_evm_ethereum::EthEvmConfig;
-use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody, SignedTransaction};
+use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
 use reth_storage_api::{
     BlockReader, BlockSource, StateProvider, StateProviderFactory, TransactionsProvider,
 };
@@ -49,7 +48,9 @@ use crate::local::{
     build_sync_block, sync_block_pair_roots,
 };
 use crate::optimistic::OptimisticallyIncluded;
-use crate::prover_retry::prove_with_retry;
+use crate::prover_retry::{
+    actionable_held_tx, partition_retryable, prove_with_retry, validate_actionable_prover_failure,
+};
 use crate::rollup::RollupState;
 
 /// Runtime config for the cross-chain execution path on Sync slots.
@@ -652,88 +653,6 @@ fn truncated_hex(data: &Bytes) -> String {
         alloy_primitives::hex::encode_prefixed(&data[..MAX]),
         data.len()
     )
-}
-
-/// Resolve a request-validated proof failure to the held transaction that
-/// produced it. Inbound indices include the leading anchor and outbound-entry
-/// prefix, so the request-local owner vector starts after both.
-fn actionable_held_tx<'a>(
-    failure: ActionableProverFailure,
-    survivors: &'a [HeldTx],
-    outbound_entry_count: usize,
-    inbound_entry_owners: &[B256],
-) -> Option<&'a HeldTx> {
-    let (direction, held_hash) = match failure {
-        ActionableProverFailure::Outbound {
-            transaction_hash, ..
-        } => (Direction::Outbound, transaction_hash),
-        ActionableProverFailure::Inbound { entry_index, .. } => {
-            let inbound_index = entry_index.checked_sub(1 + outbound_entry_count)?;
-            (
-                Direction::Inbound,
-                *inbound_entry_owners.get(inbound_index)?,
-            )
-        }
-    };
-    survivors
-        .iter()
-        .find(|tx| tx.direction == direction && tx.hash == held_hash)
-}
-
-fn partition_poisoned_chain(survivors: Vec<HeldTx>, poison: &HeldTx) -> (Vec<HeldTx>, Vec<HeldTx>) {
-    survivors.into_iter().partition(|tx| {
-        tx.sender != poison.sender || tx.direction != poison.direction || tx.nonce < poison.nonce
-    })
-}
-
-/// Verify both references in an actionable failure against the exact request
-/// before allowing Composer state to change.
-fn validate_actionable_prover_failure(
-    failure: ActionableProverFailure,
-    batch: &eez_protocol::EvmBatch,
-    sync_block: Option<&reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>>,
-) -> Result<(), String> {
-    match failure {
-        ActionableProverFailure::Outbound {
-            transaction_index,
-            transaction_hash,
-        } => {
-            let block =
-                sync_block.ok_or("outbound proof failure has no in-memory terminal Sync block")?;
-            let transaction = block
-                .body()
-                .transactions()
-                .nth(transaction_index)
-                .ok_or_else(|| {
-                    format!(
-                        "outbound proof failure transaction index {transaction_index} is out of range"
-                    )
-                })?;
-            let actual = transaction.recalculate_hash();
-            if actual != transaction_hash {
-                return Err(format!(
-                    "outbound proof failure hash {transaction_hash} does not match transaction \
-                     {transaction_index} hash {actual}"
-                ));
-            }
-        }
-        ActionableProverFailure::Inbound {
-            entry_index,
-            entry_hash,
-        } => {
-            let entry = batch.entries.get(entry_index).ok_or_else(|| {
-                format!("inbound proof failure entry index {entry_index} is out of range")
-            })?;
-            let actual = alloy_primitives::keccak256(entry.abi_encode());
-            if actual != entry_hash {
-                return Err(format!(
-                    "inbound proof failure hash {entry_hash} does not match entry {entry_index} \
-                     hash {actual}"
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Composer umbrella. Cheaply [`Clone`]able (`Arc<Inner>`).
@@ -2729,7 +2648,7 @@ where
                         .await;
                 };
 
-                let (retry, evicted) = partition_poisoned_chain(survivors, &poison);
+                let (retry, evicted) = partition_retryable(survivors, &poison);
                 event!(
                     name: "eez.composer.prover.poison_ejected",
                     Level::WARN,
@@ -2739,16 +2658,28 @@ where
                     sender = %poison.sender,
                     direction = ?poison.direction,
                     nonce = poison.nonce,
-                    evicted = evicted.len(),
                     retrying = retry.len(),
                     "prover identified a poisoned held transaction; evicting its nonce-chain suffix and rebuilding the batch",
                 );
+                for in_flight in &evicted {
+                    event!(
+                        name: "eez.composer.prover.poison_in_flight_evicted",
+                        Level::WARN,
+                        rollup_id,
+                        tx_hash = %in_flight.hash,
+                        sender = %in_flight.sender,
+                        direction = ?in_flight.direction,
+                        nonce = in_flight.nonce,
+                        gap_at = poison.nonce,
+                        "in-flight transaction belongs to a prover-ejected nonce-chain suffix",
+                    );
+                }
                 if let Some(pool) = rollup.held_pool.as_ref() {
                     for queued in
                         pool.evict_chain_at_or_above(poison.sender, poison.direction, poison.nonce)
                     {
                         event!(
-                            name: "eez.composer.prover.poison_chain_evicted",
+                            name: "eez.composer.prover.poison_queued_evicted",
                             Level::WARN,
                             rollup_id,
                             tx_hash = %queued.hash,
@@ -2762,8 +2693,9 @@ where
                 }
 
                 // Each recursive attempt receives strictly fewer held
-                // transactions, so same-slot recomposition is bounded by the
-                // original drain size. The existing proof cutoff still applies.
+                // transactions, bounding recomposition by the original drain
+                // size. Exact-slot attempts also retain the timestamp-based
+                // proof cutoff.
                 return Box::pin(self.compose_cross_chain_batch(
                     cc,
                     rollup_id,
@@ -3935,7 +3867,6 @@ async fn sign_post_batch_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::SignableTransaction as _;
     use alloy_primitives::TxHash;
 
     fn held(sender: Address, direction: Direction, nonce: u64, hash_byte: u8) -> HeldTx {
@@ -3987,150 +3918,6 @@ mod tests {
 
         assert_eq!(poison.len(), 2);
         assert_eq!(gaps, vec![(sender, Direction::Inbound, 7)]);
-    }
-
-    #[test]
-    fn actionable_failures_resolve_direction_specific_held_identities() {
-        let sender = Address::repeat_byte(0xc);
-        let outbound = held(sender, Direction::Outbound, 1, 1);
-        let inbound = held(sender, Direction::Inbound, 1, 2);
-        let second_inbound = held(Address::repeat_byte(0xd), Direction::Inbound, 0, 3);
-        let survivors = vec![outbound.clone(), inbound.clone(), second_inbound.clone()];
-        let inbound_owners = vec![inbound.hash, inbound.hash, second_inbound.hash];
-
-        let resolved = actionable_held_tx(
-            ActionableProverFailure::Outbound {
-                transaction_index: 3,
-                transaction_hash: outbound.hash,
-            },
-            &survivors,
-            2,
-            &inbound_owners,
-        )
-        .unwrap();
-        assert_eq!(resolved.hash, outbound.hash);
-
-        // [anchor, outbound 0, outbound 1, inbound 0, inbound 1, inbound 2]
-        let resolved = actionable_held_tx(
-            ActionableProverFailure::Inbound {
-                entry_index: 4,
-                entry_hash: B256::repeat_byte(0xee),
-            },
-            &survivors,
-            2,
-            &inbound_owners,
-        )
-        .unwrap();
-        assert_eq!(resolved.hash, inbound.hash);
-
-        assert!(
-            actionable_held_tx(
-                ActionableProverFailure::Inbound {
-                    entry_index: 2,
-                    entry_hash: B256::repeat_byte(0xee),
-                },
-                &survivors,
-                2,
-                &inbound_owners,
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn proof_ejection_removes_only_the_same_direction_nonce_suffix() {
-        let sender = Address::repeat_byte(0xc);
-        let poison = held(sender, Direction::Inbound, 2, 2);
-        let survivors = vec![
-            held(sender, Direction::Inbound, 1, 1),
-            poison.clone(),
-            held(sender, Direction::Inbound, 3, 3),
-            held(sender, Direction::Outbound, 3, 4),
-            held(Address::repeat_byte(0xd), Direction::Inbound, 3, 5),
-        ];
-
-        let (retry, evicted) = partition_poisoned_chain(survivors, &poison);
-
-        assert_eq!(
-            retry.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
-            vec![
-                TxHash::repeat_byte(1),
-                TxHash::repeat_byte(4),
-                TxHash::repeat_byte(5),
-            ]
-        );
-        assert_eq!(
-            evicted.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
-            vec![TxHash::repeat_byte(2), TxHash::repeat_byte(3)]
-        );
-    }
-
-    #[test]
-    fn actionable_references_must_match_the_exact_proving_request() {
-        let transaction: reth_ethereum_primitives::TransactionSigned =
-            alloy_consensus::TxLegacy::default()
-                .into_signed(alloy_primitives::Signature::test_signature())
-                .into();
-        let transaction_hash = transaction.recalculate_hash();
-        let body: reth_ethereum_primitives::BlockBody = alloy_consensus::BlockBody {
-            transactions: vec![transaction],
-            ..Default::default()
-        };
-        let block = reth_primitives_traits::RecoveredBlock::new_unhashed(
-            reth_ethereum_primitives::Block::new(Default::default(), body),
-            vec![Address::ZERO],
-        );
-
-        let mut batch = eez_protocol::EvmBatch::default();
-        batch
-            .entries
-            .push(eez_protocol::abi::ExecutionEntrySol::default());
-        let entry_hash = alloy_primitives::keccak256(batch.entries[0].abi_encode());
-
-        assert!(
-            validate_actionable_prover_failure(
-                ActionableProverFailure::Outbound {
-                    transaction_index: 0,
-                    transaction_hash,
-                },
-                &batch,
-                Some(&block),
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_actionable_prover_failure(
-                ActionableProverFailure::Inbound {
-                    entry_index: 0,
-                    entry_hash,
-                },
-                &batch,
-                Some(&block),
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_actionable_prover_failure(
-                ActionableProverFailure::Outbound {
-                    transaction_index: 0,
-                    transaction_hash: B256::repeat_byte(0xff),
-                },
-                &batch,
-                Some(&block),
-            )
-            .is_err()
-        );
-        assert!(
-            validate_actionable_prover_failure(
-                ActionableProverFailure::Inbound {
-                    entry_index: 1,
-                    entry_hash,
-                },
-                &batch,
-                Some(&block),
-            )
-            .is_err()
-        );
     }
 
     #[test]

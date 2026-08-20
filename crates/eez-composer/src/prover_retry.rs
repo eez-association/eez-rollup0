@@ -1,16 +1,113 @@
-//! Composer-specific retry policy for complete proving operations.
+//! Composer-specific retry policy and actionable proof-failure recovery.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alloy_primitives::Bytes;
+use alloy_primitives::{B256, Bytes};
+use alloy_sol_types::SolValue as _;
 use eez_driver::RollupTiming;
 use eez_l1::BundleTarget;
-use eez_prover::{Prover, ProverError, ProvingContext, RetryableProverError};
+use eez_prover::{
+    ActionableProverFailure, Prover, ProverError, ProvingContext, RetryableProverError,
+};
+use reth_primitives_traits::SignedTransaction;
 use tokio::time::{Instant, sleep_until, timeout};
 use tracing::{Level, event};
 
+use crate::{Direction, HeldTx};
+
 const INITIAL_PROVER_RETRY_BACKOFF_MS: u64 = 100;
 const MAX_PROVER_RETRY_BACKOFF_MS: u64 = 1_000;
+
+/// Resolve a request-validated proof failure to the held transaction that
+/// produced it.
+pub(crate) fn actionable_held_tx<'a>(
+    failure: ActionableProverFailure,
+    survivors: &'a [HeldTx],
+    outbound_entry_count: usize,
+    inbound_entry_owners: &[B256],
+) -> Option<&'a HeldTx> {
+    let (direction, held_hash) = match failure {
+        ActionableProverFailure::Outbound {
+            transaction_hash, ..
+        } => (Direction::Outbound, transaction_hash),
+        ActionableProverFailure::Inbound { entry_index, .. } => {
+            // PostBatch order is `[anchor | outbound... | inbound...]`, while
+            // `inbound_entry_owners` contains only the inbound suffix.
+            let inbound_index = entry_index.checked_sub(1 + outbound_entry_count)?;
+            (
+                Direction::Inbound,
+                *inbound_entry_owners.get(inbound_index)?,
+            )
+        }
+    };
+    survivors
+        .iter()
+        .find(|tx| tx.direction == direction && tx.hash == held_hash)
+}
+
+pub(crate) fn partition_retryable(
+    survivors: Vec<HeldTx>,
+    poison: &HeldTx,
+) -> (Vec<HeldTx>, Vec<HeldTx>) {
+    survivors.into_iter().partition(|tx| {
+        tx.sender != poison.sender || tx.direction != poison.direction || tx.nonce < poison.nonce
+    })
+}
+
+/// Verify both references in an actionable failure against the exact request
+/// before allowing Composer state to change.
+///
+/// An honest, version-compatible prover answering the current request should
+/// always pass this gate. Failure means the details are malformed, stale,
+/// cross-request, malicious, or disagree with Composer's request encoding; in
+/// every case the hint remains non-actionable and pool state stays unchanged.
+pub(crate) fn validate_actionable_prover_failure(
+    failure: ActionableProverFailure,
+    batch: &eez_protocol::EvmBatch,
+    sync_block: Option<&reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>>,
+) -> Result<(), String> {
+    match failure {
+        ActionableProverFailure::Outbound {
+            transaction_index,
+            transaction_hash,
+        } => {
+            let block =
+                sync_block.ok_or("outbound proof failure has no in-memory terminal Sync block")?;
+            let transaction = block
+                .body()
+                .transactions()
+                .nth(transaction_index)
+                .ok_or_else(|| {
+                    format!(
+                        "outbound proof failure transaction index {transaction_index} is out of range"
+                    )
+                })?;
+            let actual = transaction.recalculate_hash();
+            if actual != transaction_hash {
+                return Err(format!(
+                    "outbound proof failure hash {transaction_hash} does not match transaction \
+                     {transaction_index} hash {actual}"
+                ));
+            }
+        }
+        ActionableProverFailure::Inbound {
+            entry_index,
+            entry_hash,
+        } => {
+            let entry = batch.entries.get(entry_index).ok_or_else(|| {
+                format!("inbound proof failure entry index {entry_index} is out of range")
+            })?;
+            let actual = alloy_primitives::keccak256(entry.abi_encode());
+            if actual != entry_hash {
+                return Err(format!(
+                    "inbound proof failure hash {entry_hash} does not match entry {entry_index} \
+                     hash {actual}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 
 fn unix_time_millis() -> u64 {
     let elapsed = SystemTime::now()
@@ -160,11 +257,168 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use alloy_primitives::B256;
+    use alloy_consensus::SignableTransaction as _;
+    use alloy_primitives::{Address, TxHash};
     use async_trait::async_trait;
-    use eez_prover::ActionableProverFailure;
 
     use super::*;
+
+    fn held(sender: Address, direction: Direction, nonce: u64, hash_byte: u8) -> HeldTx {
+        HeldTx {
+            raw_tx: Bytes::from(vec![hash_byte; 4]),
+            hash: TxHash::repeat_byte(hash_byte),
+            attempts: 0,
+            max_fee_per_gas: u128::from(hash_byte),
+            priority_fee_per_gas: u128::from(hash_byte),
+            sender,
+            nonce,
+            direction,
+        }
+    }
+
+    #[test]
+    fn actionable_failures_resolve_direction_specific_held_identities() {
+        let sender = Address::repeat_byte(0xc);
+        let outbound = held(sender, Direction::Outbound, 1, 1);
+        let inbound = held(sender, Direction::Inbound, 1, 2);
+        let second_inbound = held(Address::repeat_byte(0xd), Direction::Inbound, 0, 3);
+        let survivors = vec![outbound.clone(), inbound.clone(), second_inbound.clone()];
+        let inbound_owners = vec![inbound.hash, inbound.hash, second_inbound.hash];
+
+        let resolved = actionable_held_tx(
+            ActionableProverFailure::Outbound {
+                transaction_index: 3,
+                transaction_hash: outbound.hash,
+            },
+            &survivors,
+            2,
+            &inbound_owners,
+        )
+        .unwrap();
+        assert_eq!(resolved.hash, outbound.hash);
+
+        // [anchor, outbound 0, outbound 1, inbound 0, inbound 1, inbound 2]
+        let resolved = actionable_held_tx(
+            ActionableProverFailure::Inbound {
+                entry_index: 4,
+                entry_hash: B256::repeat_byte(0xee),
+            },
+            &survivors,
+            2,
+            &inbound_owners,
+        )
+        .unwrap();
+        assert_eq!(resolved.hash, inbound.hash);
+
+        assert!(
+            actionable_held_tx(
+                ActionableProverFailure::Inbound {
+                    entry_index: 2,
+                    entry_hash: B256::repeat_byte(0xee),
+                },
+                &survivors,
+                2,
+                &inbound_owners,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn proof_ejection_removes_only_the_same_direction_nonce_suffix() {
+        let sender = Address::repeat_byte(0xc);
+        let poison = held(sender, Direction::Inbound, 2, 2);
+        let survivors = vec![
+            held(sender, Direction::Inbound, 1, 1),
+            poison.clone(),
+            held(sender, Direction::Inbound, 3, 3),
+            held(sender, Direction::Outbound, 3, 4),
+            held(Address::repeat_byte(0xd), Direction::Inbound, 3, 5),
+        ];
+
+        let (retry, evicted) = partition_retryable(survivors, &poison);
+
+        assert_eq!(
+            retry.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
+            vec![
+                TxHash::repeat_byte(1),
+                TxHash::repeat_byte(4),
+                TxHash::repeat_byte(5),
+            ]
+        );
+        assert_eq!(
+            evicted.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
+            vec![TxHash::repeat_byte(2), TxHash::repeat_byte(3)]
+        );
+    }
+
+    #[test]
+    fn actionable_references_must_match_the_exact_proving_request() {
+        let transaction: reth_ethereum_primitives::TransactionSigned =
+            alloy_consensus::TxLegacy::default()
+                .into_signed(alloy_primitives::Signature::test_signature())
+                .into();
+        let transaction_hash = transaction.recalculate_hash();
+        let body: reth_ethereum_primitives::BlockBody = alloy_consensus::BlockBody {
+            transactions: vec![transaction],
+            ..Default::default()
+        };
+        let block = reth_primitives_traits::RecoveredBlock::new_unhashed(
+            reth_ethereum_primitives::Block::new(Default::default(), body),
+            vec![Address::ZERO],
+        );
+
+        let mut batch = eez_protocol::EvmBatch::default();
+        batch
+            .entries
+            .push(eez_protocol::abi::ExecutionEntrySol::default());
+        let entry_hash = alloy_primitives::keccak256(batch.entries[0].abi_encode());
+
+        assert!(
+            validate_actionable_prover_failure(
+                ActionableProverFailure::Outbound {
+                    transaction_index: 0,
+                    transaction_hash,
+                },
+                &batch,
+                Some(&block),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_actionable_prover_failure(
+                ActionableProverFailure::Inbound {
+                    entry_index: 0,
+                    entry_hash,
+                },
+                &batch,
+                Some(&block),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_actionable_prover_failure(
+                ActionableProverFailure::Outbound {
+                    transaction_index: 0,
+                    transaction_hash: B256::repeat_byte(0xff),
+                },
+                &batch,
+                Some(&block),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_actionable_prover_failure(
+                ActionableProverFailure::Inbound {
+                    entry_index: 1,
+                    entry_hash,
+                },
+                &batch,
+                Some(&block),
+            )
+            .is_err()
+        );
+    }
 
     #[derive(Debug)]
     struct ScriptedProver {

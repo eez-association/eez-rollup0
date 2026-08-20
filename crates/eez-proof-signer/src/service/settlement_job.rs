@@ -323,6 +323,8 @@ pub(super) fn run_settlement(
         validated_window.window_post_state_root(),
     )?;
 
+    // If an outbound load reverted, report its paired user transaction.
+    // Reverted inbound deliveries are handled by the inbound gate below.
     let settling_observations = settlement::inspect_validated_settling_block(
         settling_block.block(),
         settling_block.receipt_successes(),
