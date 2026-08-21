@@ -83,7 +83,7 @@ pub mod signals {
         "eez.composer.cc_compose.outbound_multicall_unsupported";
     pub const FOLLOWER_HEAD_ADVANCED: &str = "eez.node.follower.head.advanced";
     pub const FOLLOWER_HEAD_SYNCING: &str = "eez.node.follower.head.syncing";
-    pub const L1_REORG_DETECTED: &str = "eez.l1_watcher.ring.rewind";
+    pub const L1_REORG_DETECTED: &str = "eez.l1_watcher.reorg.detected";
     pub const TX_NONCE_CHAIN_EVICTED: &str = "eez.composer.recovery.nonce_chain_evicted";
     pub const TX_POISON_EVICTED: &str = "eez.composer.recovery.poison_evicted";
 }
@@ -1148,6 +1148,13 @@ impl NodeHandle {
             Ok(Some(status)) => panic!("{} process exited with {status}", self.name),
             Err(err) => panic!("failed to query {} process status: {err}", self.name),
         }
+        assert_eq!(
+            self.count_log_lines_containing_any(&["Fatal", "UnexpectedStaticFile"])
+                .unwrap(),
+            0,
+            "{} logged a fatal-class failure",
+            self.name,
+        );
     }
 
     pub fn assert_no_divergence_failure_logs(&self) {
@@ -1164,8 +1171,6 @@ impl NodeHandle {
         );
         assert_eq!(
             self.count_log_lines_containing_any(&[
-                "Fatal",
-                "UnexpectedStaticFile",
                 "engine rejected safe/finalized FCU",
                 "payload builder returned no payload",
             ])
@@ -2807,7 +2812,7 @@ impl StandardOracleSnapshot {
         expect_settled: bool,
         scenario_name: &str,
     ) -> Result<()> {
-        world.node.assert_no_process_death();
+        world.node.assert_no_divergence_failure_logs();
 
         let l1_rpc = world.l1_rpc();
         let l2_rpc = world.l2_rpc();
@@ -2886,8 +2891,8 @@ impl StandardOracleSnapshot {
                     reorg_authorized = false;
                     settlement_points.push((
                         record.u64("applied_entries")? as usize,
-                        record.b256("settled_state_root")?,
-                        record.b256("new_safe_state_root")?,
+                        record.b256("l1_settled_state_root")?,
+                        record.b256("l2_safe_state_root")?,
                     ));
                 }
                 signals::DERIVER_FINALIZED_ADVANCED => {
@@ -2926,20 +2931,20 @@ impl StandardOracleSnapshot {
         // previous one, and consecutive settlements must be exactly
         // `applied_entries` events apart — a replay or a dropped entry breaks it.
         let mut previous_index: Option<usize> = None;
-        for (applied, settled_root, safe_root) in settlement_points {
-            if settled_root != safe_root {
+        for (applied, l1_settled_root, l2_safe_root) in settlement_points {
+            if l1_settled_root != l2_safe_root {
                 bail!(
-                    "{scenario_name}: L1 settled root {settled_root} != L2 safe block root {safe_root}"
+                    "{scenario_name}: L1 settled root {l1_settled_root} != L2 safe block root {l2_safe_root}"
                 );
             }
             let search_from = previous_index.map_or(0, |previous| previous + 1);
             let index = execution_states
                 .get(search_from..)
-                .and_then(|tail| tail.iter().position(|root| *root == settled_root))
+                .and_then(|tail| tail.iter().position(|root| *root == l1_settled_root))
                 .map(|offset| search_from + offset)
                 .ok_or_else(|| {
                     anyhow!(
-                        "{scenario_name}: settled root {settled_root} has no L2ExecutionPerformed event after index {search_from}"
+                        "{scenario_name}: L1 settled root {l1_settled_root} has no L2ExecutionPerformed event after index {search_from}"
                     )
                 })?;
             if let Some(previous) = previous_index

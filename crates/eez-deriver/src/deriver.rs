@@ -996,10 +996,8 @@ where
 
         let new_safe_header = self.l2_sealed_header_at(to_block)?;
         let new_safe_hash = new_safe_header.hash();
-        let new_safe_state_root = new_safe_header.state_root();
-        // Always `Some` for a non-empty settlement (`attribute_settlement`).
-        // Diagnostics only — never gate the safe advance on it.
-        let settled_state_root = settlement.final_state.unwrap_or_default();
+        let l1_settled_state_root = settlement.final_state.unwrap_or_default();
+        let l2_safe_state_root = new_safe_header.state_root();
 
         // Advance safe; keep finalized where it is (only L1 finality
         // moves it).
@@ -1024,12 +1022,12 @@ where
             from_block,
             to_block,
             applied_entries = settlement.len,
-            settled_state_root = %settled_state_root,
+            l1_settled_state_root = %l1_settled_state_root,
             l1_block_number,
             tx_hash = %tx_hash,
             submitter = %submitter,
             new_safe_hash = %new_safe_hash,
-            new_safe_state_root = %new_safe_state_root,
+            l2_safe_state_root = %l2_safe_state_root,
             "advanced L2 safe head from L1-confirmed batch",
         );
         Ok(())
