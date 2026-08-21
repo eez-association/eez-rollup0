@@ -40,7 +40,7 @@ docker rm -f bs-frontend-public 2>/dev/null || true
 kurtosis enclave rm -f "$ENCLAVE" 2>/dev/null || true
 
 echo "==> [2/7] launch L1-only enclave ($ENCLAVE)"
-kurtosis run github.com/ethpandaops/ethereum-package --enclave "$ENCLAVE" --args-file "$ARGS" || {
+kurtosis run github.com/ethpandaops/ethereum-package@1bb26af56dfa6ea32297a93201a6374625717126 --enclave "$ENCLAVE" --args-file "$ARGS" || {
   echo "✗ failed to launch enclave $ENCLAVE" >&2; exit 1; }
 
 # host-port resolver: "kurtosis port print" → strip scheme, keep :PORT
@@ -52,11 +52,11 @@ EL_RPC=$(hp el-1-reth-lighthouse rpc)
 EL_P2P=$(hp el-1-reth-lighthouse tcp-discovery)
 CL_HTTP=$(hp cl-1-lighthouse-reth http)
 CL_P2P=$(hp cl-1-lighthouse-reth tcp-discovery)
-BUILDER=$(hp el-2-reth-builder-lighthouse rbuilder-rpc)
+BUILDER=$(hp el-2-reth-builder-lighthouse rbuilder-rpc)   # empty when the args file has no mev
 DORA=$(hp dora http)
 MEVWEB=$(hp mev-relay-website http)
 BS_API=$(hp blockscout http)
-for v in EL_RPC EL_P2P CL_HTTP CL_P2P BUILDER DORA MEVWEB BS_API; do
+for v in EL_RPC EL_P2P CL_HTTP CL_P2P DORA BS_API; do
   [[ "${!v}" =~ ^[0-9]+$ ]] || { echo "✗ could not resolve $v from enclave $ENCLAVE" >&2; exit 1; }
 done
 echo "    EL_RPC=127.0.0.1:$EL_RPC EL_P2P=$EL_P2P CL_HTTP=$CL_HTTP CL_P2P=$CL_P2P BUILDER=$BUILDER"
@@ -67,9 +67,9 @@ echo "==> [4/7] socat forwarders (bind=$BIND_ADDR)"
 : > "$FWD_PIDS"
 # Lines are "PORT PID" — teardown reads the PID, the failure check names the port.
 fwd() { nohup socat "TCP-LISTEN:$1,fork,reuseaddr,bind=$BIND_ADDR" "TCP:127.0.0.1:$2" >/dev/null 2>&1 </dev/null & echo "$1 $!" >> "$FWD_PIDS"; disown 2>/dev/null || true; }
-fwd 8545 "$EL_RPC"; fwd 8645 "$BUILDER"; fwd 5052 "$CL_HTTP"
+fwd 8545 "$EL_RPC"; [[ -n "$BUILDER" ]] && fwd 8645 "$BUILDER"; fwd 5052 "$CL_HTTP"
 fwd 30303 "$EL_P2P"; fwd 9010 "$CL_P2P"
-fwd 8080 "$DORA"; fwd 9060 "$MEVWEB"; fwd 4001 "$BS_API"
+fwd 8080 "$DORA"; [[ -n "$MEVWEB" ]] && fwd 9060 "$MEVWEB"; fwd 4001 "$BS_API"
 sleep 2
 # A forwarder that lost its port exits instantly, and its output is discarded —
 # without this the run reports success and hands Machine 2 a machine2.env whose

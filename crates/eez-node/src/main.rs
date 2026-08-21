@@ -1078,6 +1078,7 @@ async fn wait_for_l1_ready(
                     );
                     return Ok(());
                 }
+                // Reached when eth_chainId alone failed this tick.
                 Ok(true) => (false, "chain id not read yet".to_string()),
                 // Tall enough but missing history: pruned, or backfilling.
                 // Head movement says nothing, so only a reported sync waits.
