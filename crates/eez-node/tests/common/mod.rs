@@ -378,7 +378,8 @@ fn proof_signer_binary() -> Result<PathBuf> {
         return Ok(path);
     }
 
-    // Separate integration-test binaries can request the signer concurrently.
+    // Keeps concurrent test fns in this binary from each spawning their own
+    // build.
     let _build_guard = WORKSPACE_BUILD_LOCK
         .lock()
         .map_err(|_| anyhow!("workspace build lock poisoned"))?;
