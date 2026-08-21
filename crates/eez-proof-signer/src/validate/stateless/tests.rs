@@ -2,7 +2,6 @@ use std::num::NonZeroU64;
 
 use alloy_consensus::{Header, SignableTransaction as _, TxLegacy};
 use alloy_primitives::{B256, Bytes, Log, Signature, TxKind, U256, b256};
-use alloy_sol_types::SolEvent as _;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable as _;
 
