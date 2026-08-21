@@ -200,10 +200,10 @@ impl ProveSvc {
             .map_err(|_| {
                 warn!(
                     phase = "admission",
-                    grpc_code = ?tonic::Code::ResourceExhausted,
+                    grpc_code = ?tonic::Code::Unavailable,
                     "Prove request rejected: another request is active",
                 );
-                Status::resource_exhausted("another Prove request is already active")
+                Status::unavailable("another Prove request is already active")
             })?;
         debug!(phase = "admission", "Prove request admitted");
         Ok(request_permit)

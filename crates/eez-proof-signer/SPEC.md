@@ -177,7 +177,7 @@ declared block.
 ### 4.1 Single-flight execution
 
 Exactly one request may be admitted at a time. A second request MUST be
-rejected immediately with `ResourceExhausted`; it MUST NOT wait while holding an
+rejected immediately with `Unavailable`; it MUST NOT wait while holding an
 open stream.
 
 The active-request slot remains held through validation, settlement, signing,
@@ -723,7 +723,8 @@ messages SHOULD remain stable and must not expose secrets.
 | --- | --- |
 | `InvalidArgument` | Malformed stream structure; invalid widths or bounds; noncanonical/invalid PostBatch calldata; malformed or trailing DA payload. |
 | `FailedPrecondition` | Rollup identity mismatch; Stateless input rejection; unsupported batch profile; state/effect/inbound/outbound/DA semantic rejection. |
-| `ResourceExhausted` | Another request is active; a decoding, block, byte, witness-item, or checkpoint limit was exceeded; or block-vector storage could not be reserved. |
+| `Unavailable` | Another request is active. The same complete request may succeed after the active request releases the slot. |
+| `ResourceExhausted` | A decoding, block, byte, witness-item, or checkpoint limit was exceeded; or block-vector storage could not be reserved. |
 | `DeadlineExceeded` | Stream idle timeout or absolute request deadline. |
 | `Cancelled` | Cooperative stop after request cancellation. |
 | `Internal` | Backend-success output violates its contract; local invariant failure; impossible public-input computation/cardinality; reconstruction failures attributable to already validated internal evidence; signing failure. |

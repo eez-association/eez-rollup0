@@ -30,8 +30,8 @@ use eez_driver::{
     SyncSlotComposer, SyncSlotMode,
     witness::{ExecutionWitnessMode, block_witness},
 };
-use eez_l1::{BundleTarget, L1Event, L1Watcher, SendOutcome, Submitter};
-use eez_prover::{BlockWitness, Prover};
+use eez_l1::{BundleTarget, L1Event, SendOutcome, Submitter};
+use eez_prover::{BlockWitness, Prover, ProvingContext};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
@@ -45,6 +45,7 @@ use crate::held_pool::HeldTx;
 use crate::ingress::Direction;
 use crate::local::{build_sync_block, sync_block_pair_roots};
 use crate::optimistic::OptimisticallyIncluded;
+use crate::prover_retry::prove_with_retry;
 use crate::rollup::RollupState;
 
 /// Runtime config for the cross-chain execution path on Sync slots.
@@ -518,10 +519,9 @@ pub struct Composer<L2: BlockReader> {
 struct Inner<L2: BlockReader> {
     /// Per-rollup state keyed by rollup ID.
     rollups: HashMap<u64, RollupState<L2>>,
-    /// Shared across rollups: one prover, one submitter, one `L1Watcher`.
+    /// Shared across rollups: one prover, one submitter.
     prover: Arc<dyn Prover>,
     submitter: Submitter,
-    l1_watcher: L1Watcher,
     /// EVM config — used by [`build_sync_block`] to construct the
     /// per-Sync-slot block via reth-evm `BlockBuilder`.
     evm_config: EthEvmConfig,
@@ -548,7 +548,6 @@ impl<L2: BlockReader> std::fmt::Debug for Composer<L2> {
             .field("rollup_ids", &self.inner.rollups.keys().collect::<Vec<_>>())
             .field("prover", &self.inner.prover)
             .field("submitter", &self.inner.submitter)
-            .field("l1_watcher", &self.inner.l1_watcher)
             .finish()
     }
 }
@@ -564,7 +563,6 @@ where
         rollups: HashMap<u64, RollupState<L2>>,
         prover: Arc<dyn Prover>,
         submitter: Submitter,
-        l1_watcher: L1Watcher,
         evm_config: EthEvmConfig,
         cross_chain: Option<CrossChainWiring>,
         timing: RollupTiming,
@@ -574,7 +572,6 @@ where
                 rollups,
                 prover,
                 submitter,
-                l1_watcher,
                 evm_config,
                 cross_chain,
                 committer: std::sync::OnceLock::new(),
@@ -597,7 +594,8 @@ where
         let _ = self.inner.committer.set(handle);
     }
 
-    /// Run loop. Drains the `L1Watcher` broadcast: logs own/external
+    /// Run loop. Drains `l1_events` (subscribed by the caller before
+    /// the `L1Watcher` starts): logs own/external
     /// `BatchPosted` attribution and drives optimistic recovery on
     /// `Reorg`/`Finalized` (the cursor and its retreats are owned by
     /// the Deriver via the shared `L1CanonicalHead`).
@@ -607,8 +605,7 @@ where
     /// `compose_sync_slot` on its schedule), so this loop takes no
     /// batch-candidate input. Exits when the L1 event stream closes —
     /// the upstream `L1Watcher` task has exited.
-    pub async fn run(self) {
-        let mut l1_events = self.inner.l1_watcher.subscribe();
+    pub async fn run(self, mut l1_events: broadcast::Receiver<L1Event>) {
         let our_address = self.inner.submitter.poster_address();
 
         event!(
@@ -1960,6 +1957,7 @@ where
                 &pair_roots,
                 &outbound_entries,
                 &outbound_user_txs,
+                bundle_target,
             )
             .await
             .and_then(|raw| {
@@ -2096,6 +2094,7 @@ where
                 &[], // no cross-chain effects → no per-effect roots
                 &[], // no outbound entries
                 &[], // no outbound user txs
+                bundle_target,
             )
             .await
             .and_then(|raw| {
@@ -2256,6 +2255,7 @@ where
                     &[],
                     &[],
                     &[],
+                    BundleTarget::NextBlock,
                 )
                 .await?
             else {
@@ -2417,6 +2417,7 @@ where
         pair_roots: &[B256],
         outbound_entries: &[eez_protocol::abi::ExecutionEntrySol],
         outbound_user_txs: &[Bytes],
+        bundle_target: BundleTarget,
     ) -> Result<Option<Bytes>, String> {
         use alloy_sol_types::SolCall;
         use eez_protocol::abi::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
@@ -2852,7 +2853,7 @@ where
             // Mock mode: the mock prover ignores per-block witnesses.
             None => Vec::new(),
         };
-        let proving_ctx = eez_prover::ProvingContext {
+        let proving_ctx = ProvingContext {
             rollup_id,
             from_block: from,
             to_block: sync_block_number,
@@ -2860,12 +2861,14 @@ where
             blocks: block_witnesses,
             l1_block_hash: None, // timeless batch (blockNumber 0)
         };
-        let proof = self
-            .inner
-            .prover
-            .prove(proving_ctx)
-            .await
-            .map_err(|e| format!("prover.prove: {e}"))?;
+        let proof = prove_with_retry(
+            self.inner.prover.as_ref(),
+            proving_ctx,
+            self.inner.emission.timing,
+            bundle_target,
+        )
+        .await
+        .map_err(|e| format!("prover.prove: {e}"))?;
         batch.proofs = vec![proof];
 
         let calldata = postAndVerifyBatchCall {

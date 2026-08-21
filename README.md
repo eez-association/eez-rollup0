@@ -40,10 +40,11 @@ There's no separate L1 node to run. Cross-chain batches are submitted to
 Chiado's block builder; the L1 block to aim them at is read from the embedded
 L1 once it has caught up to the chain tip.
 
-> **One command** (after the one-time setup): `bash scripts/chiado-up.sh`
-> deploys the protocol, verifies the contracts on Blockscout, prepares the
-> datadirs, starts the stack, waits until it's healthy, and prints the RPC
-> URLs. The numbered steps below are that same flow done by hand.
+> **One command** (after the one-time setup + `.env`/`.env.chiado`): `bash
+> scripts/chiado-up.sh` deploys the protocol (skipped if already deployed),
+> prepares the datadirs, starts the stack, waits until it's healthy, and
+> prints the RPC URLs. The numbered steps below are that same flow done by
+> hand.
 
 ### One-time setup
 
@@ -82,8 +83,6 @@ cp .env.example .env
 #   EEZ_PROOF_SIGNER_KEY=<operator key>   (its address becomes the proof system's authorizedSigner)
 #   EEZ_L2_SYSTEM_KEY=<separate L2 system-transaction key>
 EEZ_DEPLOY_SKIP_SIMULATION=1 make deploy-protocol
-
-cp datadir/genesis.json ./data/genesis-fresh.json
 ```
 
 This deploys EEZ + ECDSAProofSystem + the rollup manager, registers the
@@ -165,5 +164,5 @@ raw-RPC — kept for reference.)
 cargo build --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace                  # Rust; `cd contracts && forge test` for Solidity
-bash scripts/teardown-chiado.sh         # stop node + lighthouse, release the L1 datadir
+bash scripts/teardown-chiado.sh         # stop eez-node + eez-proof-signer + lighthouse (datadirs untouched)
 ```
