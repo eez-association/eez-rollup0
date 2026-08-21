@@ -11,15 +11,15 @@ use alloy_primitives::{B256, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::BlockNumberOrTag;
 
-use common::{
+use eez_testkit::signals;
+use eez_testkit::{
     ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
-    AnvilConfig, Harness, NodeConfig, NodeHandle, block_number_and_hash_at, override_env,
-    reorg_genesis_path, reorg_genesis_state_root, send_l2_value_transfer,
+    AnvilConfig, Harness, NodeConfig, NodeHandle, block_number_and_hash_at, dev_genesis_state_root,
+    override_env, reorg_genesis_path, reorg_genesis_state_root, send_l2_value_transfer,
     send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
     wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
     wait_for_safe_prefix_convergence, wait_for_safe_state,
 };
-use eez_testkit as common;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_mins(3);
 
@@ -247,7 +247,7 @@ async fn failure_wrong_rollup_id() {
     assert_eq!(chain.executions_performed().await.unwrap(), 0);
     assert_eq!(
         chain.state_root().await.unwrap(),
-        common::dev_genesis_state_root()
+        dev_genesis_state_root()
     );
 }
 
@@ -314,7 +314,7 @@ async fn failure_prover_signer_mismatch() {
     assert_eq!(chain.executions_performed().await.unwrap(), 0);
     assert_eq!(
         chain.state_root().await.unwrap(),
-        common::dev_genesis_state_root()
+        dev_genesis_state_root()
     );
 }
 
@@ -560,7 +560,7 @@ async fn happy_case_follower_sequencer_rpc() {
         .expect("follower did not catch up via L1 replay");
 
     // The follower's safe head must be a real sequencer block.
-    common::wait_for(DEFAULT_TIMEOUT, || {
+    wait_for(DEFAULT_TIMEOUT, || {
         let seq_rpc = seq_rpc.clone();
         let follower_rpc = follower.l2_rpc_url();
         async move {
@@ -585,12 +585,12 @@ async fn happy_case_follower_sequencer_rpc() {
     .expect("follower safe block never matched the sequencer chain");
 
     let follower_head_signals = [
-        common::signals::FOLLOWER_HEAD_ADVANCED,
-        common::signals::FOLLOWER_HEAD_SYNCING,
+        signals::FOLLOWER_HEAD_ADVANCED,
+        signals::FOLLOWER_HEAD_SYNCING,
     ];
     let unsafe_head_events_before = follower.count_signals(&follower_head_signals).unwrap();
     seq.run_tx_spammer(ANVIL_KEY_1);
-    common::wait_for(DEFAULT_TIMEOUT, || {
+    wait_for(DEFAULT_TIMEOUT, || {
         std::future::ready(
             follower
                 .count_signals(&follower_head_signals)
@@ -699,7 +699,7 @@ async fn happy_case_follower_cross_safe_parity() {
 
     // Compare a block inside both followers' safe boundaries, then verify
     // that shared safe block is on the sequencer's chain.
-    common::wait_for(DEFAULT_TIMEOUT, || {
+    wait_for(DEFAULT_TIMEOUT, || {
         let f_l1_rpc = f_l1.l2_rpc_url();
         let f_seq_rpc = f_seq.l2_rpc_url();
         let seq_rpc = seq_rpc.clone();
@@ -828,8 +828,8 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
     assert!(
         follower
             .count_signals(&[
-                common::signals::FOLLOWER_HEAD_ADVANCED,
-                common::signals::FOLLOWER_HEAD_SYNCING,
+                signals::FOLLOWER_HEAD_ADVANCED,
+                signals::FOLLOWER_HEAD_SYNCING,
             ])
             .unwrap()
             > 0,

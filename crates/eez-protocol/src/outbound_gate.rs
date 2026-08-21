@@ -328,7 +328,7 @@ mod tests {
         assert!(verify_outbound_authorized(&[entry(vec![c])], &[observation], 1).is_err());
     }
 
-    /// Multiset semantics: two identical outbound entries need two matching
+    /// Multiset semantics: two IDENTICAL outbound entries need two matching
     /// events. One event authorizes only the first; the second is a phantom.
     #[test]
     fn gate_requires_one_event_per_entry() {
