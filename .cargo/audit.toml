@@ -11,21 +11,12 @@ ignore = [
     # anyhow `Error::downcast_mut()` unsoundness. Transitive; we never
     # downcast_mut an anyhow error.
     "RUSTSEC-2026-0190",
-    # crossbeam-epoch invalid pointer deref in `fmt::Pointer`. Fixed in
-    # 0.9.20, a lockfile-only bump.
-    "RUSTSEC-2026-0204",
     # hickory-proto NSEC3 unbounded loop (no patched release) and O(n^2) name
     # compression DoS. Reached via reth's p2p DNS discovery, not enabled here.
     "RUSTSEC-2026-0118",
     "RUSTSEC-2026-0119",
-    # ruint Uint shift ops: wrong overflow flags / truncated shift amounts.
-    # Fixed in 1.20.0, a lockfile-only bump.
-    "RUSTSEC-2026-0220",
 
     # ── seen only by cargo-audit's graph ───────────────────────────────────
-    # quinn-proto DoS. Fixed in 0.11.15, a lockfile-only bump. Reached through
-    # reth's QUIC discovery transport.
-    "RUSTSEC-2026-0185",
     # tracing-subscriber 0.2.x ANSI escape injection through log fields.
     # Requires a transitive dependency to move to 0.3.x; we log via 0.3
     # ourselves.
