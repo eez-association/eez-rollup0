@@ -634,9 +634,9 @@ run_waves() {
         echo "    ✗ no settled bundle found in the node log (grep 'settled=true')"; ok_all=0
     fi
 
-    # Zero divergence (legacy check is hard; deriver-side WARNs are residual).
+    # Zero production deriver divergence errors.
     local DIVERGED
-    DIVERGED=$(grep -c "local L2 state root differs" "$NODE_LOG" 2>/dev/null || true); DIVERGED=${DIVERGED:-0}
+    DIVERGED=$(grep -c "diverged from L1-confirmed batch" "$NODE_LOG" 2>/dev/null || true); DIVERGED=${DIVERGED:-0}
     if (( DIVERGED == 0 )); then
         echo "    ✓ zero state-root divergence events"
     else
