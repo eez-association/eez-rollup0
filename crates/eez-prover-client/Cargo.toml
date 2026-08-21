@@ -17,6 +17,7 @@ alloy-sol-types.workspace  = true
 
 async-trait.workspace = true
 tokio-stream.workspace = true
+tonic.workspace = true
 tracing.workspace      = true
 
 [dev-dependencies]
