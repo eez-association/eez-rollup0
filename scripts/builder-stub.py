@@ -4,11 +4,13 @@
 Real Flashbots-style relays accept bundles and try to include them in a
 specific L1 block. They don't consume the poster's nonce on miss.
 
-This stub fakes a relay: it accepts `eth_sendBundle`, extracts the
-single signed tx, and forwards it via `eth_sendRawTransaction` to a
-backing anvil. The nonce IS consumed on miss (anvil doesn't replay-
-protect), but the Composer's cursor-race guard + pending-nonce read
-keep it correct. Suitable for tests; not for production.
+This stub fakes a relay: it accepts single-transaction `eth_sendBundle`
+requests and forwards the signed tx via `eth_sendRawTransaction` to a
+backing anvil. Bundles containing zero or multiple transactions are
+rejected explicitly because forwarding them individually would not preserve
+bundle atomicity. The nonce IS consumed on miss (anvil doesn't replay-
+protect), but the Composer's cursor-race guard + pending-nonce read keeps it
+correct. Suitable for tests; not for production.
 
 Usage:
     builder-stub.py --listen 127.0.0.1:9001 --upstream http://127.0.0.1:8545
@@ -61,7 +63,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if body.get("method") == "eth_sendBundle":
             params = body["params"][0]
-            raw = params["txs"][0]
+            txs = params.get("txs", [])
+            if len(txs) != 1:
+                resp = json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": body.get("id"),
+                    "error": {
+                        "code": -32602,
+                        "message": "builder stub accepts exactly one transaction per bundle",
+                        "data": {"transactionCount": len(txs)},
+                    },
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+                return
+            raw = txs[0]
             target_hex = params.get("blockNumber", "0x0")
             target = int(target_hex, 16) if isinstance(target_hex, str) else int(target_hex)
 

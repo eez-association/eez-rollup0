@@ -37,19 +37,21 @@ where
     type PayloadBuilder =
         reth_ethereum_payload_builder::EthereumPayloadBuilder<Pool, Node::Provider, Evm>;
 
-    async fn build_payload_builder(
+    fn build_payload_builder(
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
         evm_config: Evm,
-    ) -> eyre::Result<Self::PayloadBuilder> {
-        Ok(reth_ethereum_payload_builder::EthereumPayloadBuilder::new(
-            ctx.provider().clone(),
-            pool,
-            evm_config,
-            EthereumBuilderConfig::new()
-                .with_gas_limit(BUILDER_GAS_LIMIT)
-                .with_extra_data(Bytes::from_static(BUILDER_EXTRA_DATA)),
+    ) -> impl Future<Output = eyre::Result<Self::PayloadBuilder>> {
+        std::future::ready(Ok(
+            reth_ethereum_payload_builder::EthereumPayloadBuilder::new(
+                ctx.provider().clone(),
+                pool,
+                evm_config,
+                EthereumBuilderConfig::new()
+                    .with_gas_limit(BUILDER_GAS_LIMIT)
+                    .with_extra_data(Bytes::from_static(BUILDER_EXTRA_DATA)),
+            ),
         ))
     }
 }
