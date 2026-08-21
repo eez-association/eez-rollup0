@@ -245,10 +245,7 @@ async fn failure_wrong_rollup_id() {
 
     assert_eq!(chain.batches_posted().await.unwrap(), 0);
     assert_eq!(chain.executions_performed().await.unwrap(), 0);
-    assert_eq!(
-        chain.state_root().await.unwrap(),
-        dev_genesis_state_root()
-    );
+    assert_eq!(chain.state_root().await.unwrap(), dev_genesis_state_root());
 }
 
 /// Poster's gas zeroed mid-flight via `anvil_setBalance(addr, 0)`.
@@ -312,10 +309,7 @@ async fn failure_prover_signer_mismatch() {
 
     assert_eq!(chain.batches_posted().await.unwrap(), 0);
     assert_eq!(chain.executions_performed().await.unwrap(), 0);
-    assert_eq!(
-        chain.state_root().await.unwrap(),
-        dev_genesis_state_root()
-    );
+    assert_eq!(chain.state_root().await.unwrap(), dev_genesis_state_root());
 }
 
 /// Two competing composers (different poster EOAs, same proof-signer

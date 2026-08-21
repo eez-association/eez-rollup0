@@ -14,11 +14,11 @@ use eez_testkit::{
     StateRead, TARGET_DEPLOYER, account_code, batches_posted, call_read, call_revert_data,
     completed_proxy_calls, count_events, cross_chain_source_proxy, deploy_nested_setter_inner,
     deploy_nested_setter_outer, events_since, l2_balance, l2_value, last_proxy_result,
-    pending_nonce, read_state_word, receipt_ok, run_scenarios, safe_block_state_root,
+    pending_nonce, read_state_word, receipt_ok, run_scenarios, safe_block_state_root, setter_call,
     setup_cross_chain, setup_cross_chain_codeless, setup_cross_chain_empty_call,
     setup_cross_chain_nested_setter, setup_cross_chain_outbound_return_data,
-    setup_cross_chain_return_data, setup_cross_chain_reverting, setter_call, sign_and_send,
-    signer_address, state_root, value_no_ret, value_read, wait_for,
+    setup_cross_chain_return_data, setup_cross_chain_reverting, sign_and_send, signer_address,
+    state_root, value_no_ret, value_read, wait_for,
 };
 
 const WAVE_SETTERS: &[u64] = &[7, 11, 17];
@@ -123,8 +123,7 @@ async fn assert_value_set_attribution(
     let logs = wait_for(SETTLE_TIMEOUT, || {
         let rpc = rpc.to_owned();
         async move {
-            let logs =
-                events_since(&rpc, target, IValue::ValueSet::SIGNATURE_HASH, 0).await?;
+            let logs = events_since(&rpc, target, IValue::ValueSet::SIGNATURE_HASH, 0).await?;
             Ok((logs.len() >= before + expected_new).then_some(logs))
         }
     })
@@ -149,14 +148,12 @@ async fn both_directions_zero_value_direct_proxy_success_single_call() {
     let w = setup_cross_chain().await.unwrap();
     run_scenarios(
         &w,
-        [
-            Scenario::new("A-01 bidirectional zero-value direct proxy")
-                .inbound(setter_call(w.setter_proxy, 41u64))
-                .outbound(setter_call(w.outbound_proxy, 43u64))
-                .expect_l2_state(value_read(w.value_l2), 41u64)
-                .expect_l1_state(value_read(w.outbound_value), 43u64)
-                .expect_settled_fully(),
-        ],
+        [Scenario::new("Bidirectional zero-value direct proxy")
+            .inbound(setter_call(w.setter_proxy, 41u64))
+            .outbound(setter_call(w.outbound_proxy, 43u64))
+            .expect_l2_state(value_read(w.value_l2), 41u64)
+            .expect_l1_state(value_read(w.outbound_value), 43u64)
+            .expect_settled_fully()],
     )
     .await
     .unwrap();
@@ -287,10 +284,7 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
     let batches_before = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
         .await
         .unwrap();
-    let bundles_before = w
-        .node
-        .count_signal(signals::BUNDLE_ACCEPTED)
-        .unwrap();
+    let bundles_before = w.node.count_signal(signals::BUNDLE_ACCEPTED).unwrap();
 
     let mut inbound_hashes = Vec::new();
     let mut outbound_hashes = Vec::new();
@@ -501,20 +495,14 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
     );
     assert_eq!(
         w.node
-            .count_signals(&[
-                signals::TX_POISON_EVICTED,
-                signals::TX_NONCE_CHAIN_EVICTED,
-            ])
+            .count_signals(&[signals::TX_POISON_EVICTED, signals::TX_NONCE_CHAIN_EVICTED,])
             .unwrap(),
         0,
         "all non-poison wave transactions must settle without eviction",
     );
 
     assert!(
-        w.node
-            .count_signal(signals::BUNDLE_ACCEPTED)
-            .unwrap()
-            > bundles_before,
+        w.node.count_signal(signals::BUNDLE_ACCEPTED).unwrap() > bundles_before,
         "embedded dev L1 eth_sendBundle was exercised by this wave",
     );
     assert_eq!(
@@ -1019,20 +1007,10 @@ async fn inbound_nested_contract_to_contract_to_proxy_preserves_source_attributi
     let before = count_events(&l2_rpc, value_l2, IValue::ValueSet::SIGNATURE_HASH, 0)
         .await
         .unwrap();
-    let inner_sender = attributed_sender(
-        &l2_rpc,
-        EEZL2_ADDRESS,
-        w.nested_setter_inner,
-        L1_ROLLUP_ID,
-    )
-    .await;
-    let outer_sender = attributed_sender(
-        &l2_rpc,
-        EEZL2_ADDRESS,
-        w.nested_setter_outer,
-        L1_ROLLUP_ID,
-    )
-    .await;
+    let inner_sender =
+        attributed_sender(&l2_rpc, EEZL2_ADDRESS, w.nested_setter_inner, L1_ROLLUP_ID).await;
+    let outer_sender =
+        attributed_sender(&l2_rpc, EEZL2_ADDRESS, w.nested_setter_outer, L1_ROLLUP_ID).await;
     let eoa_sender = attributed_sender(
         &l2_rpc,
         EEZL2_ADDRESS,
@@ -1085,14 +1063,10 @@ async fn outbound_nested_contract_to_contract_to_proxy_preserves_source_attribut
     let w = setup_cross_chain().await.unwrap();
     let l1_rpc = w.l1_rpc();
     let l2_rpc = w.l2_rpc();
-    let inner = deploy_nested_setter_inner(
-        &l2_rpc,
-        TARGET_DEPLOYER,
-        w.l2_chain_id,
-        w.outbound_proxy,
-    )
-    .await
-    .unwrap();
+    let inner =
+        deploy_nested_setter_inner(&l2_rpc, TARGET_DEPLOYER, w.l2_chain_id, w.outbound_proxy)
+            .await
+            .unwrap();
     let outer = deploy_nested_setter_outer(&l2_rpc, TARGET_DEPLOYER, w.l2_chain_id, inner)
         .await
         .unwrap();
