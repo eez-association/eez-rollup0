@@ -81,10 +81,13 @@ alloy-provider = { workspace = true, features = ["reqwest"] }
 alloy-rpc-types-eth.workspace = true
 alloy-sol-types.workspace = true
 anyhow = "1"
+eez-control-rpc.workspace = true
 eez-testkit.workspace = true
 reth-chainspec.workspace = true
 serde_json.workspace = true
 tempfile = "3"
+tokio-stream = { workspace = true, features = ["net"] }
+tonic.workspace = true
 
 [lints]
 workspace = true

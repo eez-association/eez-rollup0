@@ -1674,6 +1674,7 @@ where
                             tx_idx = idx,
                             tx_hash = %held.hash,
                             error = %e,
+                            test_signal = "eez.composer.cc_compose.outbound_poison_evicted",
                             "outbound tx fails simulation deterministically; evicting",
                         );
                         push_poison_root(&mut poison, &mut poison_gaps, held);
@@ -1723,6 +1724,7 @@ where
                         sender = %held.sender,
                         nonce = held.nonce,
                         error = %e,
+                        test_signal = "eez.composer.cc_compose.inbound_poison_evicted",
                         "held tx fails simulation deterministically (e.g. wrong proxy → EmptyCalls, or revert); evicting — it can never compose, resubmit required",
                     );
                     push_poison_root(&mut poison, &mut poison_gaps, held);

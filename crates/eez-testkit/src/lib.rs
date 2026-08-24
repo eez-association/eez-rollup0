@@ -8,59 +8,65 @@
 
 use std::{
     collections::HashSet,
+    fmt::Write as _,
     net::{TcpListener, UdpSocket},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
-        Mutex,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use alloy_primitives::{Address, B256, Bytes, U256, address, hex};
+use alloy_consensus::Transaction as _;
+use alloy_primitives::{Address, B256, Bytes, Signature, U256, address, hex};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{BlockNumHash, BlockNumberOrTag, TransactionReceipt, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::{SolCall, SolEvent, SolValue, sol};
+use alloy_sol_types::{SolCall, SolError, SolEvent, SolValue, sol};
 use anyhow::{Context, Result, anyhow, bail};
+use eez_control_rpc::{
+    MAX_MESSAGE_BYTES,
+    v1::{
+        ProveChunk, ProveResponse, prove_chunk,
+        prover_client::ProverClient,
+        prover_server::{Prover, ProverServer},
+    },
+};
 use eez_protocol::EEZL2_ADDRESS;
+use tokio::task::JoinHandle;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::{Request, Response, Status, Streaming};
 
 /// Anvil's first default account (mnemonic `test test test test test test test test test test test junk`).
 pub const ANVIL_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 pub const ANVIL_ADDR: Address = address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-/// Anvil's second default account — used for tests that need a key
-/// distinct from the deployer / authorized signer.
 pub const ANVIL_KEY_1: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 pub const ANVIL_KEY_2: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
 pub const ANVIL_KEY_3: &str = "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6";
 pub const ANVIL_KEY_4: &str = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a";
+// Kept separate from the poster key so signer-mismatch tests can replace it alone.
+pub const ANVIL_ATTESTER_KEY: &str =
+    "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906");
 /// Dedicated deterministic L2 system identity; deliberately not an Anvil account.
 pub const L2_SYSTEM_KEY: &str =
     "0x6f7d72ecb79c8bf1bd8e7c49a1c4a22741ab708f06bb19e5b5d44a6f0934a7c1";
 
-/// External anvil cadence for composer-mode e2e tests. K = L1/L2 = 3 (not 2):
-/// `RollupTiming::validate` needs proof+slack (1100ms) ≤ (K−1)·L2 = 2000ms.
-/// `EEZ_L1_BLOCK_TIME_MS` derives from this and must match the miner.
-pub const L1_BLOCK_TIME_SECS: u64 = 3;
+// K = L1/L2 = 2 matches standalone's 2s cadence and leaves one L2 slot for proving.
+const L1_BLOCK_TIME_SECS: u64 = 4;
 
-/// L2 genesis timestamp for the reorg fixture (`0x6490fdd2`); `for_reorg`
-/// anvil aligns to it. The dev path stamps genesis at wall-clock `now`
-/// ([`Harness::fresh`]) — the lateness gate reads a backdated genesis as late.
-pub const L2_GENESIS_TIMESTAMP: u64 = 0x6490_fdd2;
-
-/// Carries the Harness's shared L2 genesis path to every node it spawns
-/// (sequencer, follower, restarts) so they build the same chain; → `--chain`.
+// Consumed by the launcher as `--chain`; never forwarded to `eez-node`.
 const TEST_L2_GENESIS_ENV: &str = "EEZ_TEST_L2_GENESIS_PATH";
 
-/// Composer tick cadence for single-composer tests — max speed.
-pub const COMPOSER_INTERVAL_SINGLE: Duration = Duration::from_secs(1);
-/// Composer tick cadence for multi-composer contention — gives the
-/// deriver time to re-sync between ticks (1-tick-per-2-blocks ratio).
-pub const COMPOSER_INTERVAL_MULTI: Duration = Duration::from_secs(2);
+const TX_SPAM_INTERVAL: Duration = Duration::from_secs(1);
 
 static LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
+// Probe sockets are released before child processes bind. Remember their
+// ports so concurrent nodes in one test cannot select the same number.
+static ASSIGNED_PORTS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static WORKSPACE_BUILD_LOCK: Mutex<()> = Mutex::new(());
 
 /// Stable values carried in the `test_signal` field of JSON tracing events.
 pub mod signals {
@@ -81,6 +87,10 @@ pub mod signals {
     pub const COMPOSER_PHASE1_BUNDLE_DISPATCHED: &str = "eez.composer.phase1.bundle.dispatched";
     pub const COMPOSER_OUTBOUND_MULTICALL_UNSUPPORTED: &str =
         "eez.composer.cc_compose.outbound_multicall_unsupported";
+    pub const COMPOSER_INBOUND_POISON_EVICTED: &str =
+        "eez.composer.cc_compose.inbound_poison_evicted";
+    pub const COMPOSER_OUTBOUND_POISON_EVICTED: &str =
+        "eez.composer.cc_compose.outbound_poison_evicted";
     pub const FOLLOWER_HEAD_ADVANCED: &str = "eez.node.follower.head.advanced";
     pub const FOLLOWER_HEAD_SYNCING: &str = "eez.node.follower.head.syncing";
     pub const L1_REORG_DETECTED: &str = "eez.l1_watcher.reorg.detected";
@@ -163,8 +173,7 @@ pub fn anvil_bin() -> String {
 ///
 /// The listener is released on return, so this is not a reservation.
 pub fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("local_addr").port()
+    probe_unique_tcp_port(&mut ASSIGNED_PORTS.lock().expect("assigned ports lock"))
 }
 
 fn probe_unique_tcp_port(used: &mut HashSet<u16>) -> u16 {
@@ -230,56 +239,31 @@ fn probe_unique_http_port(used: &mut HashSet<u16>) -> u16 {
 pub struct Anvil {
     child: Child,
     pub rpc_url: String,
+    log_path: PathBuf,
+    _log_dir: Option<tempfile::TempDir>,
 }
 
-/// Anvil configuration. `Anvil::spawn(port)` is the default (3s block,
-/// random mnemonic). The multi-composer reorg test uses
-/// [`AnvilConfig::for_reorg`] which matches the hardhat mnemonic (so we
-/// have predictable prefunded EOAs) and enables the cancun hardfork
-/// (required by `anvil_reorg`).
-pub struct AnvilConfig {
-    pub block_time_secs: u64,
-    pub mnemonic: Option<&'static str>,
-    pub hardfork: Option<&'static str>,
-    pub gas_limit: Option<u64>,
-    pub genesis_timestamp: Option<u64>,
-}
-
-impl Default for AnvilConfig {
-    fn default() -> Self {
-        Self {
-            block_time_secs: L1_BLOCK_TIME_SECS,
-            mnemonic: None,
-            hardfork: None,
-            gas_limit: None,
-            genesis_timestamp: Some(L2_GENESIS_TIMESTAMP),
-        }
-    }
+struct AnvilConfig {
+    block_time_secs: u64,
+    gas_limit: u64,
+    genesis_timestamp: u64,
 }
 
 impl AnvilConfig {
-    /// 3s block time, hardhat mnemonic, cancun hardfork, 30M gas.
-    /// (Chiado uses 5s; tests prefer speed over fidelity. 3s blocks +
-    /// cancun still permit `anvil_reorg`.)
-    pub fn for_reorg() -> Self {
+    fn standard(genesis_timestamp: u64) -> Self {
         Self {
             block_time_secs: L1_BLOCK_TIME_SECS,
-            mnemonic: Some(HARDHAT_MNEMONIC),
-            hardfork: Some("cancun"),
-            gas_limit: Some(30_000_000),
-            genesis_timestamp: Some(L2_GENESIS_TIMESTAMP),
+            gas_limit: 30_000_000,
+            genesis_timestamp,
         }
     }
 }
 
-pub const HARDHAT_MNEMONIC: &str = "test test test test test test test test test test test junk";
-
 impl Anvil {
-    pub async fn spawn(port: u16) -> Result<Self> {
-        Self::spawn_with(port, AnvilConfig::default()).await
-    }
-
-    pub async fn spawn_with(port: u16, cfg: AnvilConfig) -> Result<Self> {
+    async fn spawn_with(port: u16, cfg: AnvilConfig) -> Result<Self> {
+        let (log_path, log_dir) = test_log_destination("anvil")?;
+        let log = std::fs::File::create(&log_path).context("create anvil log")?;
+        let err_log = log.try_clone().context("clone anvil log")?;
         let mut cmd = Command::new(anvil_bin());
         cmd.args([
             "--port",
@@ -290,51 +274,43 @@ impl Anvil {
             &cfg.block_time_secs.to_string(),
             "--silent",
         ]);
-        if let Some(m) = cfg.mnemonic {
-            cmd.args(["--mnemonic", m]);
-        }
-        if let Some(h) = cfg.hardfork {
-            cmd.args(["--hardfork", h]);
-        }
-        if let Some(g) = cfg.gas_limit {
-            cmd.args(["--gas-limit", &g.to_string()]);
-        }
-        if let Some(t) = cfg.genesis_timestamp {
-            cmd.args(["--timestamp", &t.to_string()]);
-        }
-        let child = cmd
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+        cmd.args(["--gas-limit", &cfg.gas_limit.to_string()]);
+        cmd.args(["--timestamp", &cfg.genesis_timestamp.to_string()]);
+        let mut child = cmd
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(err_log))
             .spawn()
             .context("spawn anvil")?;
         let rpc_url = format!("http://127.0.0.1:{port}");
         let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-        for _ in 0..50 {
+        let startup_timeout = Duration::from_secs(10);
+        let start = Instant::now();
+        while start.elapsed() < startup_timeout {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            if provider.get_block_number().await.is_ok() {
-                return Ok(Self { child, rpc_url });
+            let probe = tokio::time::timeout(Duration::from_secs(1), provider.get_block_number());
+            if matches!(probe.await, Ok(Ok(_))) {
+                return Ok(Self {
+                    child,
+                    rpc_url,
+                    log_path,
+                    _log_dir: log_dir,
+                });
+            }
+            if let Some(status) = child.try_wait().context("poll anvil process")? {
+                bail!(
+                    "anvil exited before RPC became ready with {status}; log:\n{}",
+                    std::fs::read_to_string(&log_path).unwrap_or_default(),
+                );
             }
         }
-        bail!("anvil did not start within 10s on port {port}");
-    }
-}
-
-impl Anvil {
-    /// SIGSTOP — pauses the anvil process. RPC stops responding.
-    /// Used to simulate L1 outage (rougher: kills RPC entirely).
-    pub fn pause(&self) -> Result<()> {
-        signal(self.child.id(), "STOP")
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!(
+            "anvil did not start within {startup_timeout:?} on port {port}; log:\n{}",
+            std::fs::read_to_string(&log_path).unwrap_or_default(),
+        );
     }
 
-    /// SIGCONT — resumes the anvil process.
-    pub fn resume(&self) -> Result<()> {
-        signal(self.child.id(), "CONT")
-    }
-
-    /// `anvil_setBalance` — sets the on-chain ETH balance of `addr`.
-    /// Used to simulate the more realistic "poster ran out of gas"
-    /// outage: anvil + RPC stay alive, but the node's tx broadcasts
-    /// revert at the simulation step with `insufficient funds`.
     pub async fn set_balance(&self, addr: Address, wei: U256) -> Result<()> {
         let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
         let _: serde_json::Value = provider
@@ -345,10 +321,6 @@ impl Anvil {
         Ok(())
     }
 
-    /// `anvil_reorg` — drops the most recent `depth` L1 blocks. Requires
-    /// the cancun hardfork (see [`AnvilConfig::for_reorg`]). The empty
-    /// array is the optional list of replacement txs (we use none —
-    /// blocks are dropped, nodes notice via head moving backward).
     pub async fn reorg(&self, depth: u64) -> Result<()> {
         let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
         let _: serde_json::Value = provider
@@ -360,93 +332,470 @@ impl Anvil {
     }
 }
 
-fn signal(pid: u32, sig: &str) -> Result<()> {
-    let status = Command::new("kill")
-        .args([&format!("-{sig}"), &pid.to_string()])
-        .status()
-        .context("spawn kill")?;
-    if !status.success() {
-        bail!("kill -{sig} {pid} failed");
-    }
-    Ok(())
-}
-
 impl Drop for Anvil {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "\n== anvil log tail ==\n{}",
+                last_lines(&self.log_path, 40, None)
+            );
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-/// Minimal `eth_sendBundle` stub: forwards bundles to anvil via
-/// `eth_sendRawTransaction`. Required because PR #6 routes submissions
-/// through `eth_sendBundle`, which anvil doesn't implement.
-pub struct BundleStub {
+/// Forwards single-transaction `eth_sendBundle` payloads to Anvil.
+///
+/// Anvil has no builder API, so the stub explicitly rejects bundles containing
+/// zero or multiple transactions instead of pretending to preserve atomicity.
+struct BundleStub {
     child: Child,
-    pub url: String,
+    url: String,
+    log_path: PathBuf,
+    _log_dir: Option<tempfile::TempDir>,
 }
 
 impl BundleStub {
-    pub async fn spawn(port: u16, upstream: &str) -> Result<Self> {
+    async fn spawn(port: u16, upstream: &str) -> Result<Self> {
         let script = repo_root().join("scripts/builder-stub.py");
         let listen = format!("127.0.0.1:{port}");
-        let child = Command::new("python3")
+        let (log_path, log_dir) = test_log_destination("builder-stub")?;
+        let log = std::fs::File::create(&log_path).context("create builder stub log")?;
+        let err_log = log.try_clone().context("clone builder stub log")?;
+        let mut child = Command::new("python3")
             .arg(script)
             .args(["--listen", &listen, "--upstream", upstream])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(err_log))
             .spawn()
             .context("spawn builder-stub.py")?;
         let url = format!("http://{listen}");
         for _ in 0..30 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             if std::net::TcpStream::connect(&listen).is_ok() {
-                return Ok(Self { child, url });
+                return Ok(Self {
+                    child,
+                    url,
+                    log_path,
+                    _log_dir: log_dir,
+                });
+            }
+            if let Some(status) = child.try_wait().context("poll builder stub process")? {
+                bail!(
+                    "builder stub exited before binding {listen} with {status}; log:\n{}",
+                    std::fs::read_to_string(&log_path).unwrap_or_default(),
+                );
             }
         }
-        bail!("builder-stub did not bind within 3s on {listen}");
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!(
+            "builder-stub did not bind within 3s on {listen}; log:\n{}",
+            std::fs::read_to_string(&log_path).unwrap_or_default(),
+        );
     }
 }
 
 impl Drop for BundleStub {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "\n== builder stub log tail ==\n{}",
+                last_lines(&self.log_path, 40, None),
+            );
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-/// Per-test fixture: anvil + bundle stub + deployed protocol. Every
-/// test starts with `let harness = Harness::fresh().await` (or
-/// `with_anvil_config` for the reorg test); eliminates the 4-line
-/// preamble duplicated across tests.
+/// Persists logs under `EEZ_TEST_LOG_DIR`, or owns them in a temporary directory.
+fn test_log_destination(name: &str) -> Result<(PathBuf, Option<tempfile::TempDir>)> {
+    if let Ok(dir) = std::env::var("EEZ_TEST_LOG_DIR") {
+        std::fs::create_dir_all(&dir).with_context(|| format!("create EEZ_TEST_LOG_DIR {dir}"))?;
+        let suffix = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = PathBuf::from(dir).join(format!("{name}-{}-{suffix}.log", std::process::id()));
+        return Ok((path, None));
+    }
+    let dir = tempfile::tempdir().context("log tempdir")?;
+    let path = dir.path().join(format!("{name}.log"));
+    Ok((path, Some(dir)))
+}
+
+fn proof_signer_binary() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("EEZ_TEST_PROOF_SIGNER_BIN") {
+        return Ok(path.into());
+    }
+    let current = std::env::current_exe().context("current test executable")?;
+    let target_profile = current
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| anyhow!("test executable has no target profile directory"))?;
+    let path = target_profile.join(format!("eez-proof-signer{}", std::env::consts::EXE_SUFFIX));
+    if path.is_file() {
+        return Ok(path);
+    }
+
+    // Keeps concurrent test fns in this binary from each spawning their own
+    // build.
+    let _build_guard = WORKSPACE_BUILD_LOCK
+        .lock()
+        .map_err(|_| anyhow!("workspace build lock poisoned"))?;
+    if !path.is_file() {
+        let profile = target_profile
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("target profile directory is not valid UTF-8"))?;
+        let mut command = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+        command.current_dir(repo_root()).args([
+            "build",
+            "--locked",
+            "-p",
+            "eez-proof-signer",
+            "--bin",
+            "eez-proof-signer",
+        ]);
+        if profile != "debug" {
+            command.args(["--profile", profile]);
+        }
+        let status = command.status().context("build eez-proof-signer")?;
+        if !status.success() {
+            bail!("building eez-proof-signer failed with {status}");
+        }
+    }
+    path.is_file()
+        .then_some(path)
+        .ok_or_else(|| anyhow!("eez-proof-signer build completed without producing the binary"))
+}
+
+/// Configuration for one real `eez-proof-signer` process.
+#[derive(Debug)]
+struct ProofSignerConfig<'a> {
+    chain_config: &'a std::path::Path,
+    rollup_id: u64,
+    signer_key: &'a str,
+    /// Registry vkey for `proof_system`; it may differ from `signer_key` in
+    /// unauthorized-signer tests.
+    vkey: B256,
+    proof_system: Address,
+}
+
+/// Owns a proof-signer process and its diagnostic log.
+#[derive(Debug)]
+pub struct ProofSignerHandle {
+    child: std::sync::Mutex<Child>,
+    endpoint: String,
+    log_path: PathBuf,
+    _log_dir: Option<tempfile::TempDir>,
+    _working_dir: tempfile::TempDir,
+}
+
+impl ProofSignerHandle {
+    async fn spawn(cfg: &ProofSignerConfig<'_>) -> Result<Self> {
+        let listen = format!("127.0.0.1:{}", free_port());
+        let attester = signer_address(cfg.signer_key)?;
+        let l2_system_address = signer_address(L2_SYSTEM_KEY)?;
+        let (log_path, log_dir) = test_log_destination("eez-proof-signer")?;
+        let working_dir = tempfile::tempdir().context("proof signer working directory")?;
+        let log = std::fs::File::create(&log_path).context("create proof signer log")?;
+        let err_log = log.try_clone().context("clone proof signer log")?;
+        let mut child = Command::new(proof_signer_binary()?)
+            // The signer also loads dotenv at startup. Keep its explicitly
+            // constructed test environment isolated from repository config.
+            .current_dir(working_dir.path())
+            .args([
+                "--listen-addr",
+                &listen,
+                "--chain-config",
+                cfg.chain_config
+                    .to_str()
+                    .context("non-UTF-8 L2 genesis path")?,
+                "--rollup-id",
+                &cfg.rollup_id.to_string(),
+                "--vkey",
+                &format!("{:#x}", cfg.vkey),
+                "--attester-address",
+                &format!("{attester:#x}"),
+                "--proof-system",
+                &format!("{:#x}", cfg.proof_system),
+                "--l2-system-address",
+                &format!("{l2_system_address:#x}"),
+            ])
+            .env_clear()
+            .env("EEZ_PROOF_SIGNER_KEY", cfg.signer_key)
+            .env("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY)
+            .env("NO_COLOR", "1")
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(err_log))
+            .spawn()
+            .context("spawn eez-proof-signer")?;
+
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if tokio::net::TcpStream::connect(&listen).await.is_ok() {
+                return Ok(Self {
+                    child: std::sync::Mutex::new(child),
+                    endpoint: format!("http://{listen}"),
+                    log_path,
+                    _log_dir: log_dir,
+                    _working_dir: working_dir,
+                });
+            }
+            if let Some(status) = child.try_wait().context("poll proof signer process")? {
+                bail!(
+                    "eez-proof-signer exited before binding with {status}; log:\n{}",
+                    std::fs::read_to_string(&log_path).unwrap_or_default()
+                );
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!(
+            "eez-proof-signer did not bind within 10s; log:\n{}",
+            std::fs::read_to_string(&log_path).unwrap_or_default()
+        )
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub fn log_tail(&self, max: usize) -> String {
+        last_lines(&self.log_path, max, None)
+    }
+
+    fn successful_attestations(&self) -> Result<usize> {
+        let contents = std::fs::read_to_string(&self.log_path)
+            .with_context(|| format!("read signer log {}", self.log_path.display()))?;
+        Ok(contents
+            .lines()
+            .filter(|line| line.contains("window validated and signed"))
+            .count())
+    }
+
+    pub fn exit_status(&self) -> Option<std::process::ExitStatus> {
+        self.child
+            .lock()
+            .expect("proof signer child mutex poisoned")
+            .try_wait()
+            .ok()
+            .flatten()
+    }
+
+    pub fn assert_alive(&self) {
+        if let Ok(Some(status)) = self
+            .child
+            .lock()
+            .expect("proof signer child mutex poisoned")
+            .try_wait()
+        {
+            panic!(
+                "eez-proof-signer exited with {status}; log:\n{}",
+                std::fs::read_to_string(&self.log_path).unwrap_or_default()
+            );
+        }
+    }
+}
+
+impl Drop for ProofSignerHandle {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "\n== proof signer log tail ==\n{}",
+                last_lines(&self.log_path, 60, None),
+            );
+        }
+        let child = self
+            .child
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ProverMutation {
+    None,
+    PostBatch,
+    Witness,
+}
+
+impl ProverMutation {
+    fn apply(self, chunks: &mut [ProveChunk]) -> Result<(), Status> {
+        match self {
+            Self::None => {}
+            Self::PostBatch => {
+                let calldata = chunks
+                    .iter_mut()
+                    .find_map(|chunk| match chunk.kind.as_mut() {
+                        Some(prove_chunk::Kind::Header(header)) => header
+                            .post_batch
+                            .as_mut()
+                            .map(|post_batch| &mut post_batch.abi_calldata),
+                        _ => None,
+                    })
+                    .ok_or_else(|| Status::internal("missing Prove header"))?;
+                let byte = calldata
+                    .last_mut()
+                    .ok_or_else(|| Status::internal("empty PostBatch calldata"))?;
+                *byte ^= 1;
+            }
+            Self::Witness => {
+                let witness = chunks
+                    .iter_mut()
+                    .find_map(|chunk| match chunk.kind.as_mut() {
+                        Some(prove_chunk::Kind::Block(block)) => block.witness.as_mut(),
+                        _ => None,
+                    })
+                    .ok_or_else(|| Status::internal("missing block witness"))?;
+                if let Some(byte) = witness.state.iter_mut().find_map(|node| node.first_mut()) {
+                    *byte ^= 1;
+                } else {
+                    witness.state.push(vec![0xff]);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct ProxyCounters {
+    attempts: AtomicUsize,
+    successes: AtomicUsize,
+    rejections: AtomicUsize,
+}
+
+#[derive(Clone, Debug)]
+struct ProverProxyService {
+    upstream: String,
+    mutation: ProverMutation,
+    counters: Arc<ProxyCounters>,
+}
+
+#[tonic::async_trait]
+impl Prover for ProverProxyService {
+    async fn prove(
+        &self,
+        request: Request<Streaming<ProveChunk>>,
+    ) -> Result<Response<ProveResponse>, Status> {
+        self.counters.attempts.fetch_add(1, Ordering::Relaxed);
+        let mut input = request.into_inner();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = input.message().await? {
+            chunks.push(chunk);
+        }
+        self.mutation.apply(&mut chunks)?;
+
+        let mut client = ProverClient::connect(self.upstream.clone())
+            .await
+            .map_err(|error| Status::unavailable(format!("connect upstream signer: {error}")))?
+            .max_encoding_message_size(MAX_MESSAGE_BYTES)
+            .max_decoding_message_size(MAX_MESSAGE_BYTES);
+        match client.prove(tokio_stream::iter(chunks)).await {
+            Ok(response) => {
+                self.counters.successes.fetch_add(1, Ordering::Relaxed);
+                Ok(response)
+            }
+            Err(status) => {
+                // Transport failures do not prove that the signer rejected the input.
+                if matches!(
+                    status.code(),
+                    tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition
+                ) {
+                    self.counters.rejections.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(Status::new(status.code(), status.message().to_string()))
+            }
+        }
+    }
+}
+
+/// Optional mutation proxy in front of a real proof signer.
+#[derive(Debug)]
+pub struct ProverProxyHandle {
+    endpoint: String,
+    counters: Arc<ProxyCounters>,
+    task: JoinHandle<()>,
+}
+
+impl ProverProxyHandle {
+    async fn spawn(upstream: String, mutation: ProverMutation) -> Result<Self> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let counters = Arc::new(ProxyCounters::default());
+        let service = ProverProxyService {
+            upstream,
+            mutation,
+            counters: Arc::clone(&counters),
+        };
+        let task = tokio::spawn(async move {
+            let server = ProverServer::new(service)
+                .max_decoding_message_size(MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_MESSAGE_BYTES);
+            let _ = tonic::transport::Server::builder()
+                .add_service(server)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+        Ok(Self {
+            endpoint: format!("http://{addr}"),
+            counters,
+            task,
+        })
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub fn attempts(&self) -> usize {
+        self.counters.attempts.load(Ordering::Relaxed)
+    }
+
+    pub fn successes(&self) -> usize {
+        self.counters.successes.load(Ordering::Relaxed)
+    }
+
+    pub fn rejections(&self) -> usize {
+        self.counters.rejections.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for ProverProxyHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Owns the L1, builder stub, deployment, genesis, and proof signers for a test.
 pub struct Harness {
     pub anvil: Anvil,
-    pub stub: BundleStub,
+    stub: BundleStub,
     pub dep: Deployment,
-    /// Wall-clock-stamped dev genesis shared by every node via
-    /// [`TEST_L2_GENESIS_ENV`] (the tempdir keeps it alive). `None` on the
-    /// reorg path, which passes its own genesis.
-    l2_genesis: Option<(PathBuf, tempfile::TempDir)>,
+    // The owning tempdir must outlive every node and signer using this genesis.
+    l2_genesis: (PathBuf, tempfile::TempDir),
+    // Each composer gets isolated state because the signer admits one request at a time.
+    provers: std::sync::Mutex<Vec<(ProofSignerHandle, tempfile::TempDir)>>,
 }
 
 impl Harness {
-    /// Default: dev-chain anvil + dev-genesis initial state. Anvil + L2
-    /// genesis share one wall-clock `now` so the lateness gate doesn't fire.
+    /// Starts a fixture with L1 and L2 genesis timestamps aligned to wall time.
     pub async fn fresh() -> Result<Self> {
         let ts = now_unix_secs();
-        let (gpath, gdir) = write_dev_genesis_at(ts)?;
-        let cfg = AnvilConfig {
-            genesis_timestamp: Some(ts),
-            ..AnvilConfig::default()
-        };
-        let mut h = Self::with_anvil_config(cfg, dev_genesis_state_root()).await?;
-        h.l2_genesis = Some((gpath, gdir));
-        Ok(h)
+        let l2_genesis = write_l2_genesis_at(ts)?;
+        let cfg = AnvilConfig::standard(ts);
+        Self::with_anvil_config(cfg, l2_genesis_state_root(), l2_genesis).await
     }
 
-    /// Custom anvil config + explicit initial state root. Used by the
-    /// reorg test which needs cancun + hardhat mnemonic + custom L2 genesis.
-    pub async fn with_anvil_config(cfg: AnvilConfig, initial_state: B256) -> Result<Self> {
+    async fn with_anvil_config(
+        cfg: AnvilConfig,
+        initial_state: B256,
+        l2_genesis: (PathBuf, tempfile::TempDir),
+    ) -> Result<Self> {
         let anvil = Anvil::spawn_with(free_port(), cfg).await?;
         let stub = BundleStub::spawn(free_port(), &anvil.rpc_url).await?;
         let dep = deploy_contracts_with_initial(&anvil.rpc_url, ANVIL_KEY, initial_state).await?;
@@ -454,7 +803,8 @@ impl Harness {
             anvil,
             stub,
             dep,
-            l2_genesis: None,
+            l2_genesis,
+            provers: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -462,29 +812,59 @@ impl Harness {
         Chain::new(&self.anvil, &self.dep)
     }
 
-    /// Default env for spawning `eez-node`. Poster + proof signer = anvil#0.
-    pub fn env(&self) -> Vec<(&'static str, String)> {
-        self.env_for(ANVIL_KEY, false)
+    /// Stages a local chain that can later restart as a composer or follower.
+    pub fn standalone_env(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("EEZ_L2_BLOCK_TIME_MS", "2000".to_string()),
+            (
+                "RUST_LOG",
+                std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
+            ),
+            (
+                TEST_L2_GENESIS_ENV,
+                self.l2_genesis.0.to_string_lossy().into_owned(),
+            ),
+        ]
     }
 
-    /// Env with parameterised poster key and external-batches flag. Used
-    /// by the multi-composer reorg test to spawn c1/c2 with different
-    /// poster EOAs (same proof signer per the contract's `authorizedSigner`).
-    pub fn env_for(
+    /// Counts signer successes so negative tests cannot pass because proving stalled.
+    pub fn successful_attestations(&self) -> Result<usize> {
+        self.provers
+            .lock()
+            .map_err(|_| anyhow!("prover registry poisoned"))?
+            .iter()
+            .try_fold(0usize, |total, (signer, _)| {
+                Ok(total + signer.successful_attestations()?)
+            })
+    }
+
+    pub fn l2_genesis_path(&self) -> &std::path::Path {
+        &self.l2_genesis.0
+    }
+
+    pub async fn env(&self) -> Result<Vec<(&'static str, String)>> {
+        self.env_for(ANVIL_KEY, false).await
+    }
+
+    pub async fn env_for(
         &self,
         poster_key: &str,
         expect_external_batches: bool,
-    ) -> Vec<(&'static str, String)> {
+    ) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
             poster_key,
-            proof_signer_key: Some(ANVIL_KEY),
+            proof_signer_key: Some(ANVIL_ATTESTER_KEY),
             rollup_id: self.dep.rollup_id,
             expect_external_batches,
             sequencer_rpc: None,
         })
+        .await
     }
 
-    pub fn follower_env(&self, sequencer_rpc: Option<&str>) -> Vec<(&'static str, String)> {
+    pub async fn follower_env(
+        &self,
+        sequencer_rpc: Option<&str>,
+    ) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
             poster_key: ANVIL_KEY,
             proof_signer_key: None,
@@ -492,19 +872,24 @@ impl Harness {
             expect_external_batches: true,
             sequencer_rpc,
         })
+        .await
     }
 
-    pub fn env_with_rollup_id(&self, rollup_id: u64) -> Vec<(&'static str, String)> {
+    pub async fn env_with_rollup_id(&self, rollup_id: u64) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
             poster_key: ANVIL_KEY,
-            proof_signer_key: Some(ANVIL_KEY),
+            proof_signer_key: Some(ANVIL_ATTESTER_KEY),
             rollup_id,
             expect_external_batches: false,
             sequencer_rpc: None,
         })
+        .await
     }
 
-    pub fn env_with_proof_signer(&self, proof_signer_key: &str) -> Vec<(&'static str, String)> {
+    pub async fn env_with_proof_signer(
+        &self,
+        proof_signer_key: &str,
+    ) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
             poster_key: ANVIL_KEY,
             proof_signer_key: Some(proof_signer_key),
@@ -512,13 +897,19 @@ impl Harness {
             expect_external_batches: false,
             sequencer_rpc: None,
         })
+        .await
     }
 
-    fn env_for_options(&self, opts: NodeEnvOptions<'_>) -> Vec<(&'static str, String)> {
+    async fn env_for_options(
+        &self,
+        opts: NodeEnvOptions<'_>,
+    ) -> Result<Vec<(&'static str, String)>> {
         let mut env = vec![
+            ("EEZ_L1_EMBEDDED", "1".to_string()),
+            ("EEZ_L1_CHAIN_PATH", "dev".to_string()),
             ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
-            ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
             ("EEZ_L1_TARGET_RPC_URL", self.anvil.rpc_url.clone()),
+            ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
             ("EEZ_L1_POSTER_KEY", opts.poster_key.to_string()),
             ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
@@ -528,7 +919,7 @@ impl Harness {
                 "EEZ_L1_BLOCK_TIME_MS",
                 (L1_BLOCK_TIME_SECS * 1000).to_string(),
             ),
-            ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
+            ("EEZ_L2_BLOCK_TIME_MS", "2000".to_string()),
             ("EEZ_PROOF_TIME_MS", "1000".to_string()),
             ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
             (
@@ -541,23 +932,13 @@ impl Harness {
             ),
             (
                 "EEZ_ECDSA_PROOF_SYSTEM_ADDRESS",
-                format!("{:#x}", self.dep.mock_ps_address),
+                format!("{:#x}", self.dep.proof_system_address),
             ),
             (
                 "EEZ_ROLLUP_MANAGER_ADDRESS",
                 format!("{:#x}", self.dep.rollup_manager_address),
             ),
             ("EEZ_ROLLUP_ID", opts.rollup_id.to_string()),
-            (
-                "EEZ_COMPOSER_INTERVAL_SECS",
-                if opts.expect_external_batches {
-                    COMPOSER_INTERVAL_MULTI
-                } else {
-                    COMPOSER_INTERVAL_SINGLE
-                }
-                .as_secs()
-                .to_string(),
-            ),
             (
                 "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES",
                 opts.expect_external_batches.to_string(),
@@ -572,20 +953,41 @@ impl Harness {
             ),
             (
                 TEST_L2_GENESIS_ENV,
-                self.l2_genesis
-                    .as_ref()
-                    .map(|(p, _)| p.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
+                self.l2_genesis.0.to_string_lossy().into_owned(),
             ),
         ];
 
-        if let Some(proof_signer_key) = opts.proof_signer_key {
-            env.push(("EEZ_PROOF_SIGNER_KEY", proof_signer_key.to_string()));
+        // A prover endpoint selects composer mode; omitting it selects follower mode.
+        if let Some(signer_key) = opts.proof_signer_key {
+            let genesis = self.l2_genesis_path();
+            let attester = signer_address(signer_key)?;
+            let signer = ProofSignerHandle::spawn(&ProofSignerConfig {
+                chain_config: genesis,
+                rollup_id: opts.rollup_id,
+                signer_key,
+                // Unauthorized-signer tests still hash the registry's vkey.
+                vkey: signer_address(ANVIL_ATTESTER_KEY)?.into_word(),
+                proof_system: self.dep.proof_system_address,
+            })
+            .await?;
+            let witness_dir = tempfile::tempdir().context("witness DB tempdir")?;
+            env.extend([
+                ("EEZ_PROVER_URL", signer.endpoint().to_owned()),
+                ("EEZ_ATTESTER_ADDRESS", format!("{attester:#x}")),
+                (
+                    "EEZ_WITNESS_DB_PATH",
+                    witness_dir.path().to_string_lossy().into_owned(),
+                ),
+            ]);
+            self.provers
+                .lock()
+                .map_err(|_| anyhow!("prover registry poisoned"))?
+                .push((signer, witness_dir));
         }
         if let Some(sequencer_rpc) = opts.sequencer_rpc {
             env.push(("EEZ_SEQUENCER_RPC", sequencer_rpc.to_string()));
         }
-        env
+        Ok(env)
     }
 }
 
@@ -600,7 +1002,7 @@ struct NodeEnvOptions<'a> {
 pub struct Deployment {
     pub eez_address: Address,
     pub deploy_block: u64,
-    pub mock_ps_address: Address,
+    pub proof_system_address: Address,
     pub rollup_manager_address: Address,
     pub rollup_id: u64,
 }
@@ -608,6 +1010,8 @@ pub struct Deployment {
 sol! {
     #[sol(rpc)]
     interface IEEZ {
+        error InvalidProof();
+        error InvalidProofSystemConfig();
         event BatchPosted(uint256 rollupCount);
         event L2ExecutionPerformed(uint64 indexed rollupId, bytes32 newState);
         event L2TxSkipped(uint256 indexed transientIdx, bytes revertData);
@@ -617,15 +1021,8 @@ sol! {
     }
 }
 
-/// Reth's `--chain dev` genesis state root. Used as the `initialState`
-/// when registering the rollup so the very first batch's prestate
-/// (`l2_state_root(0)`) matches the on-chain `rollups[rid].stateRoot`.
-/// With the default `B256::ZERO`, every batch's `_applyStateUpdates`
-/// reverts with `StateRootMismatch`, caught by the try/catch,
-/// emitting `L2TxSkipped` instead of `L2ExecutionPerformed`.
-pub fn dev_genesis_state_root() -> B256 {
-    reth_chainspec::DEV.genesis_header().state_root
-}
+pub const INVALID_PROOF_SELECTOR: [u8; 4] = IEEZ::InvalidProof::SELECTOR;
+pub const INVALID_PROOF_SYSTEM_CONFIG_SELECTOR: [u8; 4] = IEEZ::InvalidProofSystemConfig::SELECTOR;
 
 /// Wall-clock seconds for stamping test genesis + anvil, so the sequencer's
 /// defer-on-lateness gate doesn't read every trigger as late.
@@ -636,44 +1033,28 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
-/// Reth's dev genesis with timestamp set to `ts`, written to a temp file for
-/// `--chain`. Same alloc as `--chain dev` → state root still equals
-/// [`dev_genesis_state_root`]. The tempdir must outlive nodes using the path.
-fn write_dev_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
-    let mut genesis: alloy_genesis::Genesis = reth_chainspec::DEV.genesis().clone();
-    genesis.timestamp = ts;
-    let dir = tempfile::tempdir().context("genesis tempdir")?;
-    let path = dir.path().join("genesis.json");
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&genesis).context("serialize dev genesis")?,
-    )
-    .context("write dev genesis")?;
-    Ok((path, dir))
-}
-
-/// Path to the multi-composer reorg test's L2 genesis fixture. 23
-/// prefunded accounts (hardhat defaults), all hardforks at block 0,
-/// matches what the team uses for local reorg testing.
-pub fn reorg_genesis_path() -> PathBuf {
+/// The shared L2 genesis fixture used by every harness mode.
+pub fn l2_genesis_fixture_path() -> PathBuf {
     repo_root().join("crates/eez-node/tests/fixtures/genesis.json")
 }
 
-/// Genesis state root of `reorg_genesis_path()`. Computed by reading the
-/// JSON into reth's `Genesis` and converting to a `ChainSpec`.
-pub fn reorg_genesis_state_root() -> Result<B256> {
-    let raw = std::fs::read_to_string(reorg_genesis_path()).context("read genesis.json")?;
-    let genesis: alloy_genesis::Genesis =
-        serde_json::from_str(&raw).context("parse genesis.json")?;
-    let spec: reth_chainspec::ChainSpec = genesis.into();
-    Ok(spec.genesis_header().state_root)
+fn fixture_genesis() -> Result<alloy_genesis::Genesis> {
+    let raw = std::fs::read_to_string(l2_genesis_fixture_path()).context("read genesis.json")?;
+    serde_json::from_str(&raw).context("parse genesis.json")
 }
 
-/// Send one EIP-1559 value transfer on the L2 at `rpc_url` from
-/// `signing_key` to `to`. Used by the multi-composer reorg test's
-/// collector load. Builds,
-/// signs, and submits in one call; returns the tx hash. Rejects with
-/// nonce/funds/RPC errors propagated.
+/// State root registered on L1 for the shared L2 genesis fixture.
+pub fn l2_genesis_state_root() -> B256 {
+    static ROOT: LazyLock<B256> = LazyLock::new(|| {
+        let spec: reth_chainspec::ChainSpec =
+            fixture_genesis().expect("read L2 genesis fixture").into();
+        spec.genesis_header().state_root
+    });
+    *ROOT
+}
+
+/// Sign and submit one legacy L2 value transfer using the pool nonce and the
+/// node's current gas price.
 pub async fn send_l2_value_transfer(
     rpc_url: &str,
     signing_key: &str,
@@ -689,18 +1070,14 @@ pub async fn send_l2_value_transfer(
 
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let chain_id = provider.get_chain_id().await?;
-    let nonce = provider.get_transaction_count(from).await?;
-    let fees = provider.estimate_eip1559_fees().await?;
-
-    let mut tx = TxEip1559 {
-        chain_id,
+    let nonce = provider.get_transaction_count(from).pending().await?;
+    let mut tx = TxLegacy {
+        chain_id: Some(chain_id),
         nonce,
+        gas_price: provider.get_gas_price().await?,
         gas_limit: 21_000,
-        max_fee_per_gas: fees.max_fee_per_gas,
-        max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
         to: alloy_primitives::TxKind::Call(to),
         value,
-        access_list: alloy_rpc_types_eth::AccessList::default(),
         input: alloy_primitives::Bytes::default(),
     };
     let sig = signer.sign_transaction_sync(&mut tx)?;
@@ -739,20 +1116,7 @@ pub async fn send_l2_value_transfer_confirmed(
     Ok(hash)
 }
 
-/// Wait until `eth_blockNumber` responds at `rpc_url`. Used to confirm a
-/// just-spawned eez-node's L2 RPC is up before we send txs at it.
-pub async fn wait_for_l2_rpc(rpc_url: &str, timeout: Duration) -> Result<()> {
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    wait_for(timeout, || async {
-        Ok(provider.get_block_number().await.ok().map(|_| ()))
-    })
-    .await
-}
-
-/// Read the `stateRoot` of the latest `safe` block on the L2 at `rpc_url`.
-/// Returns `Ok(None)` while the L2 hasn't yet adopted any safe block
-/// (genesis L1 derivation pending). Used by the multi-composer reorg
-/// test to verify both composers settle on the same canonical L2 head.
+/// Return the latest safe block's state root, or `None` before one exists.
 pub async fn safe_block_state_root(rpc_url: &str) -> Result<Option<B256>> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let block = provider
@@ -772,26 +1136,13 @@ pub async fn block_number_and_hash_at(
     Ok(block.map(|b| (b.header.number, b.header.hash)))
 }
 
-/// Deploy `EEZ` + `MockECDSAProofSystem` + `Rollup`, then register the rollup.
-/// Pure alloy — reads compiled foundry artifacts and sends each deploy
-/// as an in-process tx. Mirrors `sync-rollups-composer`'s
-/// `tests/e2e_anvil.rs` pattern (and that of every other Rust rollup
-/// codebase surveyed). Prereq: `forge build` must have run in
-/// `contracts/`.
-pub async fn deploy_contracts(rpc_url: &str, key: &str) -> Result<Deployment> {
-    deploy_contracts_with_initial(rpc_url, key, dev_genesis_state_root()).await
-}
-
-/// Deploy with an explicit `initialState`. Use this when registering a
-/// rollup whose L2 will run a non-`--chain dev` genesis (the reorg
-/// test uses `reorg_genesis_state_root()`).
-pub async fn deploy_contracts_with_initial(
+/// Deploy and register the protocol with an explicit initial L2 state.
+async fn deploy_contracts_with_initial(
     rpc_url: &str,
     key: &str,
     initial_state: B256,
 ) -> Result<Deployment> {
-    // Anvil auto-signs for its default accounts when `from` is set; no wallet
-    // filler needed. Matches sync-rollups-composer's pattern.
+    // Anvil signs transactions from its default accounts.
     let signer: PrivateKeySigner = key
         .strip_prefix("0x")
         .unwrap_or(key)
@@ -811,24 +1162,22 @@ pub async fn deploy_contracts_with_initial(
     .await?;
     let deploy_block = provider.get_block_number().await?;
 
-    let mock_ps_address = deploy(
+    // Keep the authorized attester separate from the poster/deployer key.
+    let attester = signer_address(ANVIL_ATTESTER_KEY)?;
+    let proof_system_address = deploy(
         &provider,
         signer_addr,
-        &out.join("MockECDSAProofSystem.sol/MockECDSAProofSystem.json"),
-        signer_addr.abi_encode(),
+        &out.join("ECDSAProofSystem.sol/ECDSAProofSystem.json"),
+        attester.abi_encode(),
     )
     .await?;
 
     // Rollup(address eez, address owner, uint256 threshold,
     //        address[] proofSystems, bytes32[] vkeys)
-    let proof_systems: Vec<Address> = vec![mock_ps_address];
+    let proof_systems: Vec<Address> = vec![proof_system_address];
     // vkey embeds the authorized signer address; the registry treats vkey as
     // opaque but checks non-zero + membership (see DeployRollup.s.sol:60).
-    let vkeys: Vec<B256> = vec![B256::from_slice(&{
-        let mut padded = [0u8; 32];
-        padded[12..].copy_from_slice(signer_addr.as_slice());
-        padded
-    })];
+    let vkeys: Vec<B256> = vec![attester.into_word()];
     let rollup_manager_address = deploy(
         &provider,
         signer_addr,
@@ -870,7 +1219,7 @@ pub async fn deploy_contracts_with_initial(
     Ok(Deployment {
         eez_address,
         deploy_block,
-        mock_ps_address,
+        proof_system_address,
         rollup_manager_address,
         rollup_id,
     })
@@ -915,6 +1264,7 @@ async fn deploy<P: Provider>(
 
 pub struct NodeHandle {
     child: Mutex<Child>,
+    background_tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Human label for assertion messages ("c1", "c2", or the default "node").
     pub name: String,
     /// Where the node's merged stdout+stderr is written. Goes to
@@ -925,59 +1275,32 @@ pub struct NodeHandle {
     /// we allocated one, and the datadir if the handle created it via
     /// [`Self::start`]). They drop with the handle.
     keep_alive: Vec<tempfile::TempDir>,
-    /// L2 HTTP RPC port for this node — tracked so tests that need to
-    /// send L2 txs to it (the multi-composer reorg test's collector) can target it.
     pub http_port: u16,
 }
 
 #[derive(Default)]
 pub struct NodeConfig<'a> {
-    /// Path to a custom genesis JSON. `None` uses `--chain dev`.
     pub genesis_path: Option<&'a std::path::Path>,
 }
 
 impl NodeHandle {
-    /// Spawn `eez-node` against `datadir` with `--chain dev` and the
-    /// given env. See [`Self::spawn_with`] for custom genesis.
-    pub fn spawn(datadir: &std::path::Path, env: &[(&'static str, String)]) -> Result<Self> {
+    fn spawn(datadir: &std::path::Path, env: &[(&'static str, String)]) -> Result<Self> {
         Self::spawn_with("node", datadir, &NodeConfig::default(), env)
     }
 
-    /// Spawn `eez-node` against `datadir` with the given config + env.
-    /// Caller owns the datadir (e.g. a `tempfile::TempDir`) so
-    /// kill+respawn tests can share state across handles. Uses the
-    /// test-built binary path (`CARGO_BIN_EXE_eez-node`) directly —
-    /// skips the `cargo run` metadata-resolution overhead per spawn.
-    pub fn spawn_with(
+    fn spawn_with(
         name: &str,
         datadir: &std::path::Path,
         cfg: &NodeConfig<'_>,
         env: &[(&'static str, String)],
     ) -> Result<Self> {
-        let (log_path, log_tempdir) = if let Ok(d) = std::env::var("EEZ_TEST_LOG_DIR") {
-            let suffix = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let p = std::path::PathBuf::from(d).join(format!(
-                "eez-node-{name}-{}-{suffix}.log",
-                std::process::id()
-            ));
-            (p, None)
-        } else {
-            let td = tempfile::tempdir().context("log tempdir")?;
-            let p = td.path().join("eez-node.log");
-            (p, Some(td))
-        };
-        // tracing_subscriber's default writer is stdout; reth's panics go to stderr.
-        // Merge both into one log file so the reorg test can grep
-        // `reorg.retreated` and `Fatal | UnexpectedStaticFile` from a single stream.
+        let (log_path, log_tempdir) = test_log_destination(&format!("eez-node-{name}"))?;
         let f = std::fs::File::create(&log_path).context("create log file")?;
         let f2 = f.try_clone().context("clone log file")?;
         let (stdout, stderr) = (Stdio::from(f), Stdio::from(f2));
-        // Reth defaults collide if any test or unrelated process holds them.
-        // Each NodeHandle picks its own ephemeral ports for authrpc / http / ws / p2p.
-        // These are availability probes, not reservations: the sockets are
-        // released before the child binds. The set prevents deterministic
-        // collisions among one node's listeners.
-        let mut used_ports = HashSet::new();
+        // These are availability probes, not socket reservations. The global
+        // set prevents deterministic collisions among nodes in this process.
+        let mut used_ports = ASSIGNED_PORTS.lock().expect("assigned ports lock");
         let authrpc_port = probe_unique_tcp_port(&mut used_ports);
         let http_port = probe_unique_tcp_port(&mut used_ports);
         let ws_port = probe_unique_tcp_port(&mut used_ports);
@@ -990,10 +1313,6 @@ impl NodeHandle {
         let l1_xchain_port = probe_unique_tcp_port(&mut used_ports);
         let l2_xchain_port = probe_unique_tcp_port(&mut used_ports);
         let l1_datadir = datadir.join("embedded-l1");
-        // Genesis: an explicit genesis_path (reorg fixture) wins, else the
-        // Harness's shared wall-clock genesis (TEST_L2_GENESIS_ENV — same chain
-        // for sequencer/follower/restarts), else `--chain dev`. Wall-clock is
-        // required by the sequencer's defer-on-lateness gate.
         let env_genesis = env
             .iter()
             .find(|(k, _)| *k == TEST_L2_GENESIS_ENV)
@@ -1009,7 +1328,8 @@ impl NodeHandle {
         let signal_filter = std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| {
             "warn,eez_node=info,eez_l1=info,eez_composer=info,eez_deriver=info".to_string()
         });
-        cmd.current_dir(repo_root())
+        // Avoid loading repository dotenv files over the explicit fixture environment.
+        cmd.current_dir(datadir)
             .args(["node", "--chain"])
             .arg(&chain_arg)
             .arg("--datadir")
@@ -1040,6 +1360,7 @@ impl NodeHandle {
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("NO_COLOR", "1")
             .env(
                 "RUSTUP_HOME",
                 std::env::var("RUSTUP_HOME").unwrap_or_default(),
@@ -1066,6 +1387,7 @@ impl NodeHandle {
         let child = cmd.spawn().context("spawn eez-node")?;
         Ok(Self {
             child: Mutex::new(child),
+            background_tasks: Mutex::new(Vec::new()),
             name: name.to_string(),
             log_path,
             keep_alive: log_tempdir.into_iter().collect(),
@@ -1073,16 +1395,19 @@ impl NodeHandle {
         })
     }
 
-    /// Async convenience: allocate a fresh datadir tempdir, spawn the
-    /// node, wait for its L2 HTTP RPC to come up. Datadir is owned by
-    /// the returned handle (dropped with it). Use [`Self::spawn_with`]
-    /// directly when a test needs to share a datadir across handles
-    /// (kill+respawn).
     pub async fn start(
         name: &str,
         cfg: &NodeConfig<'_>,
         env: &[(&'static str, String)],
     ) -> Result<Self> {
+        if let Ok(root) = std::env::var("EEZ_TEST_DATADIR_DIR") {
+            let suffix = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let datadir = PathBuf::from(root)
+                .join(format!("eez-node-{name}-{}-{suffix}", std::process::id()));
+            std::fs::create_dir_all(&datadir)
+                .with_context(|| format!("create retained test datadir {}", datadir.display()))?;
+            return Self::start_with_datadir(name, &datadir, cfg, env).await;
+        }
         let datadir = tempfile::tempdir().context("datadir tempdir")?;
         let mut handle = Self::start_with_datadir(name, datadir.path(), cfg, env).await?;
         handle.keep_alive.push(datadir);
@@ -1096,7 +1421,9 @@ impl NodeHandle {
         env: &[(&'static str, String)],
     ) -> Result<Self> {
         let handle = Self::spawn_with(name, datadir, cfg, env)?;
-        wait_for_l2_rpc(&handle.l2_rpc_url(), Duration::from_mins(3)).await?;
+        handle
+            .wait_for_rpc(&handle.l2_rpc_url(), Duration::from_mins(3), "L2 RPC")
+            .await?;
         Ok(handle)
     }
 
@@ -1104,27 +1431,48 @@ impl NodeHandle {
         format!("http://127.0.0.1:{}", self.http_port)
     }
 
-    /// Detached 1-wei spammer from `from_key`. Errors swallowed
-    /// (`anvil_reorg` stales nonces). Aborted by runtime on test return.
+    /// Waits for RPC readiness while surfacing early process exits and logs.
+    pub async fn wait_for_rpc(&self, rpc_url: &str, timeout: Duration, label: &str) -> Result<()> {
+        let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            let probe = tokio::time::timeout(Duration::from_secs(1), provider.get_block_number());
+            if matches!(probe.await, Ok(Ok(_))) {
+                return Ok(());
+            }
+            if let Some(status) = self.exit_status() {
+                bail!(
+                    "{} exited with {status} before {label} became ready; log:\n{}",
+                    self.name,
+                    self.log_tail(80),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        bail!(
+            "{} {label} at {rpc_url} did not become ready within {timeout:?}; log:\n{}",
+            self.name,
+            self.log_tail(80),
+        )
+    }
+
+    /// Starts managed background traffic; the task is aborted with the node.
     pub fn run_tx_spammer(&self, from_key: &'static str) {
-        // 2× composer cadence: enough that every tick has ≥1 pending
-        // tx; faster just hammers the RPC.
-        let interval = COMPOSER_INTERVAL_MULTI / 2;
         let url = self.l2_rpc_url();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(interval).await;
+                tokio::time::sleep(TX_SPAM_INTERVAL).await;
                 let _ =
                     send_l2_value_transfer(&url, from_key, ANVIL_ADDR_3, U256::from(1u64)).await;
             }
         });
+        self.background_tasks
+            .lock()
+            .expect("node background task mutex poisoned")
+            .push(task);
     }
 
-    /// Wait until this node observes the L1 reorg. Some runs legitimately
-    /// have no stale confirmed batch on one node, in which case the
-    /// correct deriver action is an explicit no-op. Without this check the
-    /// reorg test would silently pass even if reorg detection regressed
-    /// and some unrelated re-derivation path re-converged state.
+    // Convergence alone can pass without exercising the reorg path.
     pub async fn wait_for_reorg_seen(&self, timeout: Duration) -> Result<()> {
         wait_for(timeout, || async {
             Ok((self.count_signals(&[
@@ -1142,14 +1490,15 @@ impl NodeHandle {
     /// reaps and reports an exited child, unlike a PID signal probe, which
     /// also succeeds for an unreaped zombie process.
     pub fn assert_no_process_death(&self) {
-        let mut child = self.child.lock().expect("lock node child process");
-        match child.try_wait() {
-            Ok(None) => {}
-            Ok(Some(status)) => panic!("{} process exited with {status}", self.name),
-            Err(err) => panic!("failed to query {} process status: {err}", self.name),
+        if let Some(status) = self.exit_status() {
+            panic!(
+                "{} exited unexpectedly with {status}; log:\n{}",
+                self.name,
+                self.log_tail(80),
+            );
         }
         assert_eq!(
-            self.count_log_lines_containing_any(&["Fatal", "UnexpectedStaticFile"])
+            self.log_count_matching(&["Fatal", "UnexpectedStaticFile"])
                 .unwrap(),
             0,
             "{} logged a fatal-class failure",
@@ -1170,7 +1519,7 @@ impl NodeHandle {
             self.name,
         );
         assert_eq!(
-            self.count_log_lines_containing_any(&[
+            self.log_count_matching(&[
                 "engine rejected safe/finalized FCU",
                 "payload builder returned no payload",
             ])
@@ -1181,7 +1530,7 @@ impl NodeHandle {
         );
     }
 
-    fn count_log_lines_containing_any(&self, patterns: &[&str]) -> Result<usize> {
+    pub fn log_count_matching(&self, patterns: &[&str]) -> Result<usize> {
         let contents = std::fs::read_to_string(&self.log_path)
             .with_context(|| format!("read node log {}", self.log_path.display()))?;
         Ok(contents
@@ -1213,11 +1562,29 @@ impl NodeHandle {
             .count())
     }
 
+    pub fn log_lines_matching(&self, patterns: &[&str], max: usize) -> String {
+        last_lines(&self.log_path, max, Some(patterns))
+    }
+
+    pub fn log_tail(&self, max: usize) -> String {
+        last_lines(&self.log_path, max, None)
+    }
+
+    pub fn exit_status(&self) -> Option<std::process::ExitStatus> {
+        self.child
+            .lock()
+            .expect("node child mutex poisoned")
+            .try_wait()
+            .ok()
+            .flatten()
+    }
+
     /// Line cursor for a subsequent [`Self::signals_since`] query.
     pub fn signal_cursor(&self) -> Result<usize> {
         let contents = std::fs::read_to_string(&self.log_path)
             .with_context(|| format!("read signal stream {}", self.log_path.display()))?;
-        Ok(contents.lines().count())
+        // Do not advance past a record whose write is still in progress.
+        Ok(contents.bytes().filter(|byte| *byte == b'\n').count())
     }
 
     /// Structured records emitted after `cursor`. Signal values are exact
@@ -1238,8 +1605,51 @@ impl NodeHandle {
     }
 }
 
+fn last_lines(path: &std::path::Path, max: usize, patterns: Option<&[&str]>) -> String {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return format!("<unreadable log {}>", path.display());
+    };
+    let selected: Vec<&str> = contents
+        .lines()
+        .filter(|line| patterns.is_none_or(|ps| ps.iter().any(|p| line.contains(p))))
+        .collect();
+    let skip = selected.len().saturating_sub(max);
+    selected[skip..].join("\n")
+}
+
+// The fmt subscriber prints these messages, not tracing event names.
+const SETTLEMENT_LOG_MARKERS: &[&str] = &[
+    "remote prover attested the window",
+    "dispatching bundle to builder",
+    "eth_sendBundle response received",
+    "bundle dropped",
+    "compose",
+    "postBatch",
+    "postAndVerifyBatch",
+    "InvalidProof",
+    "prover",
+    "attest",
+    "revert",
+    "ERROR",
+    "WARN",
+];
+
 impl Drop for NodeHandle {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "\n== {} node log tail ==\n{}",
+                self.name,
+                self.log_tail(100)
+            );
+        }
+        let tasks = self
+            .background_tasks
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for task in tasks.drain(..) {
+            task.abort();
+        }
         let child = self
             .child
             .get_mut()
@@ -1249,17 +1659,17 @@ impl Drop for NodeHandle {
     }
 }
 
-pub async fn l2_block_by_tag(rpc_url: &str, tag: BlockNumberOrTag) -> Result<Option<BlockNumHash>> {
+async fn l2_block_by_tag(rpc_url: &str, tag: BlockNumberOrTag) -> Result<Option<BlockNumHash>> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let block = provider.get_block_by_number(tag).await?;
     Ok(block.map(|b| BlockNumHash::new(b.header.number, b.header.hash)))
 }
 
-pub async fn l2_block_by_number(rpc_url: &str, number: u64) -> Result<Option<BlockNumHash>> {
+async fn l2_block_by_number(rpc_url: &str, number: u64) -> Result<Option<BlockNumHash>> {
     l2_block_by_tag(rpc_url, BlockNumberOrTag::Number(number)).await
 }
 
-pub async fn latest_block_snapshot(node: &NodeHandle) -> Result<Option<BlockNumHash>> {
+async fn latest_block_snapshot(node: &NodeHandle) -> Result<Option<BlockNumHash>> {
     l2_block_by_tag(&node.l2_rpc_url(), BlockNumberOrTag::Latest).await
 }
 
@@ -1275,13 +1685,8 @@ pub async fn wait_for_latest_height(
     .await
 }
 
-/// Wait until all nodes' safe tags have reached at least `min_height` and the
-/// nodes agree on the block hash at the common safe prefix height.
-///
-/// `min_height` is part of the test's contract: callers must choose a height
-/// above the stale/setup baseline for the scenario under test. Otherwise this
-/// helper could pass because every node still agrees on genesis or another old
-/// safe block, without proving the scenario actually advanced.
+/// Waits for nodes to agree at a safe height at or above `min_height`.
+/// The lower bound prevents stale agreement from satisfying convergence.
 pub async fn wait_for_safe_prefix_convergence(
     nodes: &[&NodeHandle],
     min_height: u64,
@@ -1296,7 +1701,7 @@ async fn wait_for_tag_prefix_convergence(
     min_height: u64,
     timeout: Duration,
 ) -> Result<BlockNumHash> {
-    wait_for(timeout, || async {
+    let result = wait_for(timeout, || async {
         let mut tag_blocks = Vec::with_capacity(nodes.len());
         for node in nodes {
             let Some(block) = l2_block_by_tag(&node.l2_rpc_url(), tag).await? else {
@@ -1324,7 +1729,60 @@ async fn wait_for_tag_prefix_convergence(
         let first = blocks[0];
         Ok(blocks.iter().all(|b| b.hash == first.hash).then_some(first))
     })
-    .await
+    .await;
+    let err = match result {
+        Ok(block) => return Ok(block),
+        Err(err) => err,
+    };
+
+    let mut diagnostics = String::new();
+    let mut diagnostic_height = None;
+    for node in nodes {
+        if let Ok(Some(block)) = l2_block_by_tag(&node.l2_rpc_url(), tag).await {
+            diagnostic_height = Some(
+                diagnostic_height.map_or(block.number, |height: u64| height.min(block.number)),
+            );
+        }
+    }
+    for node in nodes {
+        let latest = l2_block_by_tag(&node.l2_rpc_url(), BlockNumberOrTag::Latest)
+            .await
+            .ok()
+            .flatten();
+        let tagged = l2_block_by_tag(&node.l2_rpc_url(), tag)
+            .await
+            .ok()
+            .flatten();
+        let header = if let Some(height) = diagnostic_height {
+            let provider = ProviderBuilder::new().connect_http(node.l2_rpc_url().parse()?);
+            provider
+                .get_block_by_number(BlockNumberOrTag::Number(height))
+                .await
+                .ok()
+                .flatten()
+                .map(|block| block.header)
+        } else {
+            None
+        };
+        let _ = write!(
+            diagnostics,
+            "\n== {} convergence state ==\nexit={:?} latest={latest:?} target_tag={tagged:?} common_header={header:#?}\n{}\n",
+            node.name,
+            node.exit_status(),
+            node.log_lines_matching(
+                &[
+                    "advanced L2 safe head",
+                    "reconcile",
+                    "diverged",
+                    "reorg",
+                    "ERROR",
+                    "WARN",
+                ],
+                40,
+            ),
+        );
+    }
+    Err(err.context(format!("nodes did not converge:{diagnostics}")))
 }
 
 pub async fn wait_for<F, Fut, T>(timeout: Duration, mut f: F) -> Result<T>
@@ -1332,19 +1790,30 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<Option<T>>>,
 {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
+    let deadline = Instant::now() + timeout;
+    loop {
         if let Some(v) = f().await? {
             return Ok(v);
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(500))).await;
     }
     bail!("timed out after {timeout:?}");
 }
 
-/// Intent-revealing wrapper around `rpc_url + deployment` for queries
-/// that tests make repeatedly. Methods read like prose so tests stay
-/// short and the invariants stay visible.
+/// Registry counters and roots read from one L1 block.
+#[derive(Clone, Copy, Debug)]
+pub struct ChainSnapshot {
+    pub batches_posted: usize,
+    pub executions_performed: usize,
+    pub entries_skipped: usize,
+    pub state_root: B256,
+    pub latest_execution_state: Option<B256>,
+}
+
 pub struct Chain<'a> {
     rpc_url: &'a str,
     eez_address: Address,
@@ -1353,7 +1822,7 @@ pub struct Chain<'a> {
 }
 
 impl<'a> Chain<'a> {
-    pub fn new(anvil: &'a Anvil, dep: &Deployment) -> Self {
+    fn new(anvil: &'a Anvil, dep: &Deployment) -> Self {
         Self {
             rpc_url: &anvil.rpc_url,
             eez_address: dep.eez_address,
@@ -1372,44 +1841,48 @@ impl<'a> Chain<'a> {
         .await
     }
 
-    pub async fn executions_performed(&self) -> Result<usize> {
-        count_events(
-            self.rpc_url,
-            self.eez_address,
-            IEEZ::L2ExecutionPerformed::SIGNATURE_HASH,
-            self.deploy_block,
-        )
-        .await
+    /// Pin related reads to one L1 block so a batch landing between RPC calls
+    /// cannot manufacture a lockstep failure.
+    pub async fn snapshot(&self) -> Result<ChainSnapshot> {
+        let block = self.block_number().await?;
+        Ok(ChainSnapshot {
+            batches_posted: count_events_at(
+                self.rpc_url,
+                self.eez_address,
+                IEEZ::BatchPosted::SIGNATURE_HASH,
+                self.deploy_block,
+                Some(block),
+            )
+            .await?,
+            executions_performed: count_events_at(
+                self.rpc_url,
+                self.eez_address,
+                IEEZ::L2ExecutionPerformed::SIGNATURE_HASH,
+                self.deploy_block,
+                Some(block),
+            )
+            .await?,
+            entries_skipped: count_events_at(
+                self.rpc_url,
+                self.eez_address,
+                IEEZ::L2TxSkipped::SIGNATURE_HASH,
+                self.deploy_block,
+                Some(block),
+            )
+            .await?,
+            state_root: state_root_at(self.rpc_url, self.eez_address, self.rollup_id, Some(block))
+                .await?,
+            latest_execution_state: latest_l2_execution_state_at(
+                self.rpc_url,
+                self.eez_address,
+                self.rollup_id,
+                self.deploy_block,
+                Some(block),
+            )
+            .await?,
+        })
     }
 
-    pub async fn entries_skipped(&self) -> Result<usize> {
-        count_events(
-            self.rpc_url,
-            self.eez_address,
-            IEEZ::L2TxSkipped::SIGNATURE_HASH,
-            self.deploy_block,
-        )
-        .await
-    }
-
-    pub async fn state_root(&self) -> Result<B256> {
-        state_root(self.rpc_url, self.eez_address, self.rollup_id).await
-    }
-
-    pub async fn latest_execution_state(&self) -> Result<Option<B256>> {
-        latest_l2_execution_state(
-            self.rpc_url,
-            self.eez_address,
-            self.rollup_id,
-            self.deploy_block,
-        )
-        .await
-    }
-
-    /// All `newState` values the contract has attested via
-    /// `L2ExecutionPerformed`. Use this to assert "the node imported
-    /// a block whose stateRoot the contract has ever attested" without
-    /// racing against the contract's advancing head.
     pub async fn executed_states(&self) -> Result<Vec<B256>> {
         all_l2_execution_states(
             self.rpc_url,
@@ -1440,13 +1913,83 @@ impl<'a> Chain<'a> {
         .await
     }
 
-    /// Wait until `state_root()` becomes something other than `from`.
-    pub async fn wait_for_state_change(&self, from: B256, timeout: Duration) -> Result<B256> {
-        wait_for(timeout, || async {
-            let root = self.state_root().await?;
-            Ok((root != from).then_some(root))
-        })
-        .await
+    /// Assert that a submitted `postAndVerifyBatch` for `expected_rollup_id`
+    /// was mined, reverted, and reproduces `expected_revert_selector` via
+    /// `eth_call` against the resulting chain state.
+    pub async fn assert_failed_post_and_verify_batch(
+        &self,
+        expected_rollup_id: u64,
+        expected_revert_selector: [u8; 4],
+    ) -> Result<()> {
+        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
+        let latest = provider.get_block_number().await?;
+
+        for block_number in self.deploy_block..=latest {
+            let Some(block) = provider
+                .get_block_by_number(BlockNumberOrTag::Number(block_number))
+                .full()
+                .await?
+            else {
+                continue;
+            };
+            for transaction in block.transactions.txns() {
+                if transaction.inner.to() != Some(self.eez_address)
+                    || !transaction
+                        .inner
+                        .input()
+                        .starts_with(&eez_protocol::abi::postAndVerifyBatchCall::SELECTOR)
+                {
+                    continue;
+                }
+                let call = eez_protocol::abi::postAndVerifyBatchCall::abi_decode(
+                    transaction.inner.input(),
+                )?;
+                if !call
+                    .batch
+                    .rollupIdsWithProofSystems
+                    .iter()
+                    .any(|rollup| rollup.rollupId == expected_rollup_id)
+                {
+                    continue;
+                }
+
+                let tx_hash = *transaction.inner.tx_hash();
+                let receipt = provider
+                    .get_transaction_receipt(tx_hash)
+                    .await?
+                    .ok_or_else(|| anyhow!("postAndVerifyBatch receipt {tx_hash} is missing"))?;
+                if receipt.status() {
+                    bail!(
+                        "postAndVerifyBatch transaction {tx_hash} for rollup {expected_rollup_id} succeeded"
+                    );
+                }
+
+                let replay = TransactionRequest::default()
+                    .from(transaction.inner.signer())
+                    .to(self.eez_address)
+                    .input(transaction.inner.input().clone().into());
+                let err = provider
+                    .call(replay)
+                    .await
+                    .expect_err("failed postAndVerifyBatch replay unexpectedly succeeded");
+                let expected = format!("0x{}", hex::encode(expected_revert_selector));
+                let error_response = err.as_error_resp().ok_or_else(|| {
+                    anyhow!("postAndVerifyBatch replay returned non-RPC error: {err}")
+                })?;
+                let observed = error_response.data.as_ref().map_or_else(
+                    || error_response.message.to_string(),
+                    |data| format!("{} {}", error_response.message, data.get()),
+                );
+                if !observed.contains(&expected) {
+                    bail!(
+                        "postAndVerifyBatch replay returned {observed}, expected selector {expected}"
+                    );
+                }
+                return Ok(());
+            }
+        }
+
+        bail!("no mined postAndVerifyBatch transaction found for rollup {expected_rollup_id}")
     }
 }
 
@@ -1464,10 +2007,22 @@ pub async fn wait_for_l1_blocks(rpc_url: &str, target: u64, timeout: Duration) -
 }
 
 pub async fn state_root(rpc_url: &str, eez: Address, rollup_id: u64) -> Result<B256> {
+    state_root_at(rpc_url, eez, rollup_id, None).await
+}
+
+async fn state_root_at(
+    rpc_url: &str,
+    eez: Address,
+    rollup_id: u64,
+    block: Option<u64>,
+) -> Result<B256> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let registry = IEEZ::new(eez, &provider);
-    let r = registry.rollups(rollup_id).call().await?;
-    Ok(r.stateRoot)
+    let mut call = registry.rollups(rollup_id);
+    if let Some(block) = block {
+        call = call.block(BlockNumberOrTag::Number(block).into());
+    }
+    Ok(call.call().await?.stateRoot)
 }
 
 pub async fn rollup_ether_balance(rpc_url: &str, eez: Address, rollup_id: u64) -> Result<U256> {
@@ -1543,12 +2098,25 @@ pub async fn count_events(
     event_sig_hash: B256,
     from_block: u64,
 ) -> Result<usize> {
+    count_events_at(rpc_url, contract, event_sig_hash, from_block, None).await
+}
+
+async fn count_events_at(
+    rpc_url: &str,
+    contract: Address,
+    event_sig_hash: B256,
+    from_block: u64,
+    to_block: Option<u64>,
+) -> Result<usize> {
     use alloy_rpc_types_eth::Filter;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let filter = Filter::new()
+    let mut filter = Filter::new()
         .address(contract)
         .event_signature(event_sig_hash)
         .from_block(from_block);
+    if let Some(to_block) = to_block {
+        filter = filter.to_block(to_block);
+    }
     let logs = provider.get_logs(&filter).await?;
     Ok(logs.len())
 }
@@ -1558,22 +2126,78 @@ pub async fn batches_posted(l1_rpc: &str, eez: Address, from_block: u64) -> Resu
     count_events(l1_rpc, eez, IEEZ::BatchPosted::SIGNATURE_HASH, from_block).await
 }
 
-/// Return the `newState` of the latest `L2ExecutionPerformed` event
-/// emitted by `contract` for `rollup_id`, or `None` if none exist.
-/// Cross-checks the on-chain `stateRoot` against the per-batch event.
-pub async fn latest_l2_execution_state(
+/// Recomputes the latest batch's public-input hash and verifies its signature.
+pub async fn assert_latest_batch_signature(
+    l1_rpc: &str,
+    dep: &Deployment,
+    expected_attester: Address,
+) -> Result<()> {
+    use alloy_rpc_types_eth::Filter;
+
+    let provider = ProviderBuilder::new().connect_http(l1_rpc.parse()?);
+    let filter = Filter::new()
+        .address(dep.eez_address)
+        .event_signature(IEEZ::BatchPosted::SIGNATURE_HASH)
+        .from_block(dep.deploy_block);
+    let log = provider
+        .get_logs(&filter)
+        .await?
+        .pop()
+        .ok_or_else(|| anyhow!("no BatchPosted event"))?;
+    let tx_hash = log
+        .transaction_hash
+        .ok_or_else(|| anyhow!("BatchPosted log has no transaction hash"))?;
+    let receipt = provider
+        .get_transaction_receipt(tx_hash)
+        .await?
+        .ok_or_else(|| anyhow!("postAndVerifyBatch receipt is missing"))?;
+    if !receipt.status() {
+        bail!("postAndVerifyBatch transaction reverted");
+    }
+    let transaction = provider
+        .get_transaction_by_hash(tx_hash)
+        .await?
+        .ok_or_else(|| anyhow!("postAndVerifyBatch transaction is missing"))?;
+    let call = eez_protocol::abi::postAndVerifyBatchCall::abi_decode(transaction.inner.input())?;
+    let proof = call
+        .batch
+        .proofs
+        .first()
+        .ok_or_else(|| anyhow!("posted batch has no proof"))?;
+    let public_inputs_hash = eez_protocol::public_inputs::public_inputs_hashes(
+        &call.batch,
+        expected_attester.into_word(),
+    )?
+    .into_iter()
+    .next()
+    .ok_or_else(|| anyhow!("posted batch has no public-input hash"))?;
+    let signature = Signature::try_from(proof.as_ref()).context("decode posted signature")?;
+    let recovered = signature
+        .recover_address_from_prehash(&public_inputs_hash)
+        .context("recover posted signature")?;
+    if recovered != expected_attester {
+        bail!("posted proof recovered {recovered}, expected {expected_attester}");
+    }
+    Ok(())
+}
+
+async fn latest_l2_execution_state_at(
     rpc_url: &str,
     contract: Address,
     rollup_id: u64,
     from_block: u64,
+    to_block: Option<u64>,
 ) -> Result<Option<B256>> {
     use alloy_rpc_types_eth::Filter;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let filter = Filter::new()
+    let mut filter = Filter::new()
         .address(contract)
         .event_signature(IEEZ::L2ExecutionPerformed::SIGNATURE_HASH)
         .topic1(B256::from(U256::from(rollup_id)))
         .from_block(from_block);
+    if let Some(to_block) = to_block {
+        filter = filter.to_block(to_block);
+    }
     let mut logs = provider.get_logs(&filter).await?;
     let Some(last) = logs.pop() else {
         return Ok(None);
@@ -1582,8 +2206,6 @@ pub async fn latest_l2_execution_state(
     Ok(Some(decoded.newState))
 }
 
-/// All `newState` values from `L2ExecutionPerformed` events for
-/// `rollup_id`, in emission order.
 pub async fn all_l2_execution_states(
     rpc_url: &str,
     contract: Address,
@@ -1607,39 +2229,8 @@ pub async fn all_l2_execution_states(
         .collect()
 }
 
-/// Wait until `node.safe.stateRoot` appears in the contract's
-/// `L2ExecutionPerformed` history for this `Chain`. The attestation
-/// set grows monotonically, so this doesn't race the contract's
-/// advancing head: any past attestation matching the node's current
-/// safe head proves the node imported a block the contract has, at
-/// some point, declared canonical.
-pub async fn wait_for_node_caught_up(
-    node: &NodeHandle,
-    chain: &Chain<'_>,
-    timeout: Duration,
-) -> Result<()> {
-    wait_for(timeout, || async {
-        let node_root = safe_block_state_root(&node.l2_rpc_url())
-            .await
-            .ok()
-            .flatten();
-        let attested = chain.executed_states().await.unwrap_or_default();
-        Ok(match node_root {
-            Some(n) if n != B256::ZERO && attested.contains(&n) => Some(()),
-            _ => None,
-        })
-    })
-    .await
-}
-
-/// Wait until the node's safe `stateRoot` appears in the contract's
-/// `L2ExecutionPerformed` history for this `Chain` and differs from
-/// `genesis_root`. The attestation set grows monotonically, so this doesn't
-/// race the contract's advancing head: any past attestation matching the
-/// node's current safe head proves the node imported a block the contract
-/// has, at some point, declared canonical. Excluding `genesis_root` stops a
-/// node stuck at genesis from trivially passing by matching an empty-block
-/// attestation whose `newState` equals the registered initial state.
+/// Waits for a non-genesis safe state that appears anywhere in L1 execution history.
+/// Using the full history avoids racing an advancing on-chain head.
 pub async fn wait_for_safe_state(
     node: &NodeHandle,
     chain: &Chain<'_>,
@@ -1666,10 +2257,8 @@ pub async fn wait_for_safe_state(
     .await
 }
 
-/// Wait until `node`'s safe block carries a state root that was not attested
-/// before the scenario and is now present in the contract's execution history.
-/// Returns that safe block's `(number, hash)` so peers can be checked against
-/// the exact block, not just a repeated state root.
+/// Waits for a safe block whose state was newly attested after `previous_states`.
+/// The returned number and hash distinguish the exact block when state roots repeat.
 pub async fn wait_for_new_attested_safe_block(
     node: &NodeHandle,
     chain: &Chain<'_>,
@@ -1699,7 +2288,7 @@ pub async fn wait_for_new_attested_safe_block(
     .await
 }
 
-/// Wait until `node`'s safe chain includes `hash` at `number`.
+/// Waits until the safe chain contains the exact block hash at `number`.
 pub async fn wait_for_safe_chain_contains(
     node: &NodeHandle,
     number: u64,
@@ -1748,7 +2337,7 @@ pub fn override_env(
 
 // Cross-chain test fixture.
 
-use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
 use alloy_network::TxSignerSync;
 use alloy_network::eip2718::Encodable2718;
 
@@ -1810,8 +2399,6 @@ sol! {
         function callAndRecord(bytes calldata data) external;
         function failures() external view returns (uint256);
         function successes() external view returns (uint256);
-        function lastRevertLength() external view returns (uint256);
-        function lastRevertHash() external view returns (bytes32);
     }
     #[sol(rpc)]
     interface IReturnData {
@@ -1859,9 +2446,7 @@ fn write_fixture_genesis(
     chain_id: Option<u64>,
     filename: &str,
 ) -> Result<(PathBuf, tempfile::TempDir)> {
-    let raw = std::fs::read_to_string(reorg_genesis_path()).context("read fixture genesis")?;
-    let mut genesis: alloy_genesis::Genesis =
-        serde_json::from_str(&raw).context("parse fixture genesis")?;
+    let mut genesis = fixture_genesis()?;
     genesis.timestamp = ts;
     if let Some(id) = chain_id {
         genesis.config.chain_id = id;
@@ -1915,24 +2500,29 @@ pub async fn sign_and_send(
     let env = TxEnvelope::from(tx.into_signed(sig));
     let hash = *env.tx_hash();
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    // Cross-chain fronts refuse submissions until the node has reconciled with
-    // L1; that is a transient boot state, so wait it out rather than failing.
+    // Cross-chain fronts temporarily refuse submissions while starting or
+    // while a poison-held transaction with this nonce is being released.
     let deadline = std::time::Instant::now() + Duration::from_mins(2);
     loop {
         match provider.send_raw_transaction(&env.encoded_2718()).await {
             Ok(_) => return Ok(hash),
-            Err(err)
-                if err.to_string().contains("starting up")
-                    && std::time::Instant::now() < deadline =>
-            {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+            Err(err) if std::time::Instant::now() < deadline => {
+                let message = err.to_string();
+                if message.contains("starting up") || message.contains("transaction underpriced") {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                return Err(err.into());
             }
             Err(err) => return Err(err.into()),
         }
     }
 }
 
-pub async fn pending_nonce(rpc_url: &str, key: &str) -> Result<u64> {
+/// Return the confirmed nonce. Cross-chain ingress validates against the
+/// confirmed nonce plus held transactions, so using the pool's pending nonce
+/// here would count held transactions twice.
+pub async fn onchain_nonce(rpc_url: &str, key: &str) -> Result<u64> {
     let addr = signer_of(key)?.address();
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     Ok(provider.get_transaction_count(addr).await?)
@@ -1974,7 +2564,7 @@ async fn deploy_raw(
     let mut data = hex::decode(bytecode_hex).context("decode bytecode")?;
     data.extend_from_slice(&constructor_args);
 
-    let nonce = pending_nonce(rpc_url, key).await?;
+    let nonce = onchain_nonce(rpc_url, key).await?;
     let hash = sign_and_send(
         rpc_url,
         key,
@@ -1993,8 +2583,8 @@ async fn deploy_raw(
         .ok_or_else(|| anyhow!("no contract_address for {}", artifact_path.display()))
 }
 
-/// Deploy EEZ + MockECDSAProofSystem + Rollup on the embedded dev L1 and
-/// register the rollup. Addresses are deterministic (`CREATE(deployer, 0/1/2)`).
+/// Deploy EEZ + ECDSAProofSystem + Rollup on the embedded dev L1 and
+/// register the rollup. Contract addresses are deterministic.
 pub async fn deploy_protocol_dev(
     l1_rpc: &str,
     key: &str,
@@ -2015,11 +2605,11 @@ pub async fn deploy_protocol_dev(
     let provider = ProviderBuilder::new().connect_http(l1_rpc.parse()?);
     let deploy_block = provider.get_block_number().await?;
 
-    let mock_ps_address = deploy_raw(
+    let proof_system_address = deploy_raw(
         l1_rpc,
         key,
         DEV_CHAIN_ID,
-        &out.join("MockECDSAProofSystem.sol/MockECDSAProofSystem.json"),
+        &out.join("ECDSAProofSystem.sol/ECDSAProofSystem.json"),
         signer_addr.abi_encode(),
     )
     .await?;
@@ -2038,7 +2628,7 @@ pub async fn deploy_protocol_dev(
             eez_address,
             signer_addr,
             U256::from(1u64),
-            vec![mock_ps_address],
+            vec![proof_system_address],
             vkeys,
         )
             .abi_encode_params(),
@@ -2050,7 +2640,7 @@ pub async fn deploy_protocol_dev(
         initialState: initial_state,
     }
     .abi_encode();
-    let nonce = pending_nonce(l1_rpc, key).await?;
+    let nonce = onchain_nonce(l1_rpc, key).await?;
     let hash = sign_and_send(
         l1_rpc,
         key,
@@ -2069,7 +2659,7 @@ pub async fn deploy_protocol_dev(
     Ok(Deployment {
         eez_address,
         deploy_block,
-        mock_ps_address,
+        proof_system_address,
         rollup_manager_address,
         rollup_id,
     })
@@ -2264,7 +2854,7 @@ pub async fn create_l2_cross_chain_proxy(
         .call()
         .await?;
     let chain_id = provider.get_chain_id().await?;
-    let nonce = pending_nonce(l2_rpc, key).await?;
+    let nonce = onchain_nonce(l2_rpc, key).await?;
     let hash = sign_and_send(
         l2_rpc,
         key,
@@ -2297,7 +2887,7 @@ pub async fn create_cross_chain_proxy(
         originalRollupId: rollup_id,
     }
     .abi_encode();
-    let nonce = pending_nonce(l1_rpc, key).await?;
+    let nonce = onchain_nonce(l1_rpc, key).await?;
     let hash = sign_and_send(
         l1_rpc,
         key,
@@ -2345,7 +2935,7 @@ pub async fn receipt_ok(rpc_url: &str, hash: alloy_primitives::TxHash) -> Result
         .map(|r| r.status()))
 }
 
-/// Cross-chain test node configuration.
+/// Ports, addresses, keys, and genesis files for the cross-chain fixture.
 pub struct CrossChainConfig {
     pub l1_http_port: u16,
     pub l1_auth_port: u16,
@@ -2353,7 +2943,7 @@ pub struct CrossChainConfig {
     pub l1_xchain_port: u16,
     pub l2_xchain_port: u16,
     pub eez_address: Address,
-    pub mock_ps_address: Address,
+    pub proof_system_address: Address,
     pub rollup_manager_address: Address,
     pub rollup_id: u64,
     pub initial_state: B256,
@@ -2365,30 +2955,29 @@ pub struct CrossChainConfig {
 }
 
 impl CrossChainConfig {
-    pub fn new() -> Result<Self> {
+    fn new() -> Result<Self> {
         let deployer_key = ANVIL_KEY_1;
         let poster_key = ANVIL_KEY;
         let deployer = signer_of(deployer_key)?.address();
-        // Deploy order: EEZ(0), MockPS(1), Rollup(2).
+        // These CREATE nonces must match `deploy_protocol_dev`.
         let eez_address = deployer.create(0);
-        let mock_ps_address = deployer.create(1);
+        let proof_system_address = deployer.create(1);
         let rollup_manager_address = deployer.create(2);
-        let initial_state = reorg_genesis_state_root()?;
+        let initial_state = l2_genesis_state_root();
         let ts = now_unix_secs();
-        // Avoid the HTTP and adjacent WS ports.
-        let l1_http_port = free_port();
-        let mut l1_auth_port = free_port();
-        while l1_auth_port == l1_http_port || l1_auth_port == l1_http_port.saturating_add(1) {
-            l1_auth_port = free_port();
-        }
+        let l1_http_port =
+            probe_unique_http_port(&mut ASSIGNED_PORTS.lock().expect("assigned ports lock"));
+        let l1_auth_port = free_port();
         Ok(Self {
             l1_http_port,
             l1_auth_port,
-            l1_p2p_port: free_port(),
+            l1_p2p_port: probe_unique_tcp_udp_port(
+                &mut ASSIGNED_PORTS.lock().expect("assigned ports lock"),
+            ),
             l1_xchain_port: free_port(),
             l2_xchain_port: free_port(),
             eez_address,
-            mock_ps_address,
+            proof_system_address,
             rollup_manager_address,
             rollup_id: FIRST_ROLLUP_ID,
             initial_state,
@@ -2399,21 +2988,19 @@ impl CrossChainConfig {
         })
     }
 
-    pub fn l1_rpc_url(&self) -> String {
+    fn l1_rpc_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.l1_http_port)
     }
 
-    /// L1→L2 transaction ingress.
-    pub fn l1_xchain_url(&self) -> String {
+    fn l1_xchain_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.l1_xchain_port)
     }
 
-    /// L2→L1 transaction ingress.
-    pub fn l2_xchain_url(&self) -> String {
+    fn l2_xchain_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.l2_xchain_port)
     }
 
-    pub fn env(&self) -> Vec<(&'static str, String)> {
+    fn env(&self) -> Vec<(&'static str, String)> {
         vec![
             ("EEZ_L1_EMBEDDED", "1".to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
@@ -2431,8 +3018,6 @@ impl CrossChainConfig {
                 self.l1_genesis.0.to_string_lossy().into_owned(),
             ),
             ("EEZ_L1_POSTER_KEY", self.poster_key.to_string()),
-            // MockECDSA authorizes the deployer.
-            ("EEZ_PROOF_SIGNER_KEY", self.deployer_key.to_string()),
             ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
             ("EEZL2_ADDRESS", format!("{EEZL2_ADDRESS:#x}")),
             (
@@ -2449,14 +3034,13 @@ impl CrossChainConfig {
             ("EEZ_REGISTRY_DEPLOY_BLOCK", "0".to_string()),
             (
                 "EEZ_ECDSA_PROOF_SYSTEM_ADDRESS",
-                format!("{:#x}", self.mock_ps_address),
+                format!("{:#x}", self.proof_system_address),
             ),
             (
                 "EEZ_ROLLUP_MANAGER_ADDRESS",
                 format!("{:#x}", self.rollup_manager_address),
             ),
             ("EEZ_ROLLUP_ID", self.rollup_id.to_string()),
-            ("EEZ_COMPOSER_INTERVAL_SECS", "1".to_string()),
             ("EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES", "false".to_string()),
             (
                 "EEZ_L2_DATADIR",
@@ -2464,8 +3048,10 @@ impl CrossChainConfig {
             ),
             (
                 "RUST_LOG",
-                std::env::var("EEZ_TEST_LOG")
-                    .unwrap_or_else(|_| "warn,eez_node=info,eez_l1=info".to_string()),
+                std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| {
+                    "warn,eez_node=info,eez_l1=info,eez_composer=info,eez_prover_client=info"
+                        .to_string()
+                }),
             ),
             (
                 TEST_L2_GENESIS_ENV,
@@ -2476,7 +3062,7 @@ impl CrossChainConfig {
 }
 
 pub const SETUP_TIMEOUT: Duration = Duration::from_secs(90);
-pub const SETTLE_TIMEOUT: Duration = Duration::from_mins(3);
+pub const SETTLE_TIMEOUT: Duration = Duration::from_mins(5);
 const CROSS_CHAIN_L1_BLOCK_TIME_MS: u64 = 5_000;
 const CROSS_CHAIN_L2_BLOCK_TIME_MS: u64 = 1_000;
 const CROSS_CHAIN_SYNC_INTERVAL: u64 = CROSS_CHAIN_L1_BLOCK_TIME_MS / CROSS_CHAIN_L2_BLOCK_TIME_MS;
@@ -2488,10 +3074,8 @@ pub const L1_ROLLUP_ID: u64 = 0;
 pub const TARGET_DEPLOYER: &str = ANVIL_KEY_3;
 pub const INBOUND_USER: &str = ANVIL_KEY_2;
 pub const OUTBOUND_USER: &str = ANVIL_KEY_4;
-/// Valid key without genesis funding.
-pub const UNFUNDED_KEY: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
 
-/// Shared cross-chain integration fixture.
+/// Shared cross-chain integration fixture and its spawned processes.
 pub struct CrossChainWorld {
     pub node: NodeHandle,
     pub cfg: CrossChainConfig,
@@ -2511,7 +3095,37 @@ pub struct CrossChainWorld {
     pub outbound_no_ret_proxy: Address,
     pub withdrawal_proxy: Address,
     pub outbound_wrapper: Address,
-    _datadir: tempfile::TempDir,
+    /// Present only in signer-mutation tests.
+    pub prover_proxy: Option<ProverProxyHandle>,
+    pub proof_signer: ProofSignerHandle,
+    _witness_dir: tempfile::TempDir,
+    _datadir: CrossChainDatadir,
+}
+
+enum CrossChainDatadir {
+    Ephemeral(tempfile::TempDir),
+    Retained(PathBuf),
+}
+
+impl CrossChainDatadir {
+    fn new() -> Result<Self> {
+        let Ok(root) = std::env::var("EEZ_TEST_DATADIR_DIR") else {
+            return Ok(Self::Ephemeral(tempfile::tempdir()?));
+        };
+        let suffix = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            PathBuf::from(root).join(format!("eez-cross-chain-{}-{suffix}", std::process::id()));
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("create retained cross-chain datadir {}", path.display()))?;
+        Ok(Self::Retained(path))
+    }
+
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Ephemeral(dir) => dir.path(),
+            Self::Retained(path) => path,
+        }
+    }
 }
 
 pub struct CrossChainEmptyCallWorld {
@@ -2603,6 +3217,35 @@ impl std::ops::Deref for CrossChainCodelessWorld {
 }
 
 impl CrossChainWorld {
+    /// Collects node and signer state for settlement timeout failures.
+    pub fn settlement_diagnostics(&self) -> String {
+        let node_exit = self.node.exit_status();
+        let signer_exit = self.proof_signer.exit_status();
+        let proxy = self.prover_proxy.as_ref().map_or_else(
+            || "none (composer dials the signer directly)".to_owned(),
+            |proxy| {
+                format!(
+                    "{} attempts, {} attested, {} rejected",
+                    proxy.attempts(),
+                    proxy.successes(),
+                    proxy.rejections(),
+                )
+            },
+        );
+        format!(
+            "\n== settlement diagnostics ==\n\
+             node exit: {node_exit:?} (None = still running)\n\
+             signer exit: {signer_exit:?} (None = still running)\n\
+             prover proxy: {proxy}\n\
+             \n== node log, settlement lines ==\n{}\n\
+             \n== node log, tail ==\n{}\n\
+             \n== proof-signer log, tail ==\n{}\n",
+            self.node.log_lines_matching(SETTLEMENT_LOG_MARKERS, 60),
+            self.node.log_tail(40),
+            self.proof_signer.log_tail(60),
+        )
+    }
+
     pub fn l1_rpc(&self) -> String {
         self.cfg.l1_rpc_url()
     }
@@ -2799,8 +3442,8 @@ impl StandardOracleSnapshot {
             )
             .await?,
             eez_contract_balance: account_balance(&l1_rpc, world.cfg.eez_address).await?,
-            inbound_nonce: pending_nonce(&l1_rpc, INBOUND_USER).await?,
-            outbound_nonce: pending_nonce(&l2_rpc, OUTBOUND_USER).await?,
+            inbound_nonce: onchain_nonce(&l1_rpc, INBOUND_USER).await?,
+            outbound_nonce: onchain_nonce(&l2_rpc, OUTBOUND_USER).await?,
             grid_residue,
         })
     }
@@ -2838,7 +3481,7 @@ impl StandardOracleSnapshot {
         }) {
             bail!("{scenario_name}: node emitted a divergence, fatal, or panic signal");
         }
-        // Every scenario submits valid single-call txs, so any eviction is a bug.
+        // The scenario runner only submits valid calls, so any eviction is a bug.
         if records.iter().any(|record| {
             matches!(
                 record.name.as_str(),
@@ -3021,8 +3664,8 @@ async fn assert_action_and_nonce_invariants(
     }
     // Exact, not `>=`: these actors are scenario-private, so any nonce the
     // scenario did not submit is unaccounted-for activity.
-    let actual_inbound = pending_nonce(&world.l1_rpc(), INBOUND_USER).await?;
-    let actual_outbound = pending_nonce(&world.l2_rpc(), OUTBOUND_USER).await?;
+    let actual_inbound = onchain_nonce(&world.l1_rpc(), INBOUND_USER).await?;
+    let actual_outbound = onchain_nonce(&world.l2_rpc(), OUTBOUND_USER).await?;
     if actual_inbound != inbound || actual_outbound != outbound {
         bail!(
             "{scenario_name}: sender nonces are {actual_inbound}/{actual_outbound}, expected {inbound}/{outbound}"
@@ -3143,7 +3786,7 @@ impl Scenario {
                     world.l2_chain_id,
                 ),
             };
-            let nonce = pending_nonce(receipt_rpc, key).await?;
+            let nonce = onchain_nonce(receipt_rpc, key).await?;
             let hash = sign_and_send(
                 &ingress,
                 key,
@@ -3156,18 +3799,14 @@ impl Scenario {
             )
             .await
             .with_context(|| format!("{}: submit {direction:?} call", self.name))?;
-            wait_for(SETTLE_TIMEOUT, || async {
-                Ok(receipt_ok(receipt_rpc, hash)
-                    .await?
-                    .filter(|success| *success))
+            let succeeded = wait_for(SETTLE_TIMEOUT, || async {
+                receipt_ok(receipt_rpc, hash).await
             })
             .await
-            .with_context(|| {
-                format!(
-                    "{}: {direction:?} call did not settle successfully",
-                    self.name
-                )
-            })?;
+            .with_context(|| format!("{}: {direction:?} call was not mined", self.name))?;
+            if !succeeded {
+                bail!("{}: {direction:?} call reverted", self.name);
+            }
             actions.push(ExecutedScenarioAction {
                 direction,
                 value: call.value,
@@ -3234,7 +3873,15 @@ pub async fn run_scenarios(
 
 /// Start the shared cross-chain fixture.
 pub async fn setup_cross_chain() -> Result<CrossChainWorld> {
-    setup_cross_chain_with_env(&[]).await
+    setup_cross_chain_inner(None, None, &[]).await
+}
+
+/// Starts the fixture with a mutation proxy and expected attester override.
+pub async fn setup_cross_chain_proxied(
+    mutation: ProverMutation,
+    attester: Address,
+) -> Result<CrossChainWorld> {
+    setup_cross_chain_inner(Some(mutation), Some(attester), &[]).await
 }
 
 pub async fn setup_cross_chain_empty_call() -> Result<CrossChainEmptyCallWorld> {
@@ -3381,10 +4028,50 @@ pub async fn setup_cross_chain_codeless() -> Result<CrossChainCodelessWorld> {
 pub async fn setup_cross_chain_with_env(
     extra_env: &[(&'static str, String)],
 ) -> Result<CrossChainWorld> {
+    setup_cross_chain_inner(None, None, extra_env).await
+}
+
+async fn setup_cross_chain_inner(
+    mutation: Option<ProverMutation>,
+    attester_override: Option<Address>,
+    extra_env: &[(&'static str, String)],
+) -> Result<CrossChainWorld> {
     let cfg = CrossChainConfig::new()?;
-    let datadir = tempfile::tempdir()?;
+    let signer_attester = signer_address(cfg.deployer_key)?;
+    let proof_signer = ProofSignerHandle::spawn(&ProofSignerConfig {
+        chain_config: &cfg.l2_genesis.0,
+        rollup_id: cfg.rollup_id,
+        signer_key: cfg.deployer_key,
+        vkey: signer_address(cfg.deployer_key)?.into_word(),
+        proof_system: cfg.proof_system_address,
+    })
+    .await?;
+    let prover_proxy = match mutation {
+        Some(mutation) => {
+            Some(ProverProxyHandle::spawn(proof_signer.endpoint().to_owned(), mutation).await?)
+        }
+        None => None,
+    };
+    let prover_url = prover_proxy
+        .as_ref()
+        .map_or(proof_signer.endpoint(), ProverProxyHandle::endpoint);
+    let attester = attester_override.unwrap_or(signer_attester);
+    let witness_dir = tempfile::tempdir().context("witness DB tempdir")?;
+    let datadir = CrossChainDatadir::new()?;
     let mut env = cfg.env();
+    env.extend([
+        ("EEZ_PROVER_URL", prover_url.to_string()),
+        ("EEZ_ATTESTER_ADDRESS", format!("{attester:#x}")),
+        (
+            "EEZ_WITNESS_DB_PATH",
+            witness_dir.path().to_string_lossy().into_owned(),
+        ),
+    ]);
     env.extend_from_slice(extra_env);
+    assert!(
+        !env.iter().any(|(name, _)| *name == "EEZ_PROOF_SIGNER_KEY"),
+        "remote composer environment must not contain the proof-signer key",
+    );
     let node = NodeHandle::spawn(datadir.path(), &env)?;
     let l1_rpc = cfg.l1_rpc_url();
     let l2_rpc = node.l2_rpc_url();
@@ -3392,7 +4079,8 @@ pub async fn setup_cross_chain_with_env(
     let recipient: Address = address!("0x2222222222222222222222222222222222222222");
     let withdrawal_recipient: Address = address!("0x3333333333333333333333333333333333333333");
 
-    wait_for_l2_rpc(&l1_rpc, SETUP_TIMEOUT).await?;
+    node.wait_for_rpc(&l1_rpc, SETUP_TIMEOUT, "embedded L1 RPC")
+        .await?;
     let dep = deploy_protocol_dev(&l1_rpc, cfg.deployer_key, cfg.initial_state).await?;
     if dep.eez_address != cfg.eez_address {
         bail!("EEZ address not deterministic");
@@ -3405,7 +4093,7 @@ pub async fn setup_cross_chain_with_env(
         );
     }
 
-    wait_for_l2_rpc(&l2_rpc, SETUP_TIMEOUT).await?;
+    node.wait_for_rpc(&l2_rpc, SETUP_TIMEOUT, "L2 RPC").await?;
     let l2_chain_id = ProviderBuilder::new()
         .connect_http(l2_rpc.parse()?)
         .get_chain_id()
@@ -3478,6 +4166,9 @@ pub async fn setup_cross_chain_with_env(
         outbound_no_ret_proxy,
         withdrawal_proxy,
         outbound_wrapper,
+        prover_proxy,
+        proof_signer,
+        _witness_dir: witness_dir,
         _datadir: datadir,
     })
 }
@@ -3487,8 +4178,8 @@ mod framework_tests {
     use super::*;
 
     #[test]
-    fn reorg_fixture_is_resolvable_after_testkit_extraction() {
-        assert!(reorg_genesis_path().is_file());
-        reorg_genesis_state_root().expect("parse reorg genesis fixture");
+    fn l2_genesis_fixture_is_resolvable_after_testkit_extraction() {
+        assert!(l2_genesis_fixture_path().is_file());
+        let _ = l2_genesis_state_root();
     }
 }

@@ -8,17 +8,18 @@ use alloy_sol_types::{SolCall, SolError, SolEvent, SolValue};
 use eez_protocol::EEZL2_ADDRESS;
 use eez_testkit::signals;
 use eez_testkit::{
-    DEV_CHAIN_ID, IEEZL2Direct, IEmptyCall, INBOUND_USER, INestedSetterInner, INestedSetterOuter,
-    IReturnData, IReturnDataWrapper, IRevertBubbleWrapper, IRevertingTarget, ISetterWrapper,
-    IValue, IValueNoRet, L1_ROLLUP_ID, OUTBOUND_USER, SETTLE_TIMEOUT, Scenario, ScenarioCall,
-    StateRead, TARGET_DEPLOYER, account_code, batches_posted, call_read, call_revert_data,
+    ANVIL_KEY_1, DEV_CHAIN_ID, IEEZL2Direct, IEmptyCall, INBOUND_USER, INestedSetterInner,
+    INestedSetterOuter, IReturnData, IReturnDataWrapper, IRevertBubbleWrapper, IRevertingTarget,
+    ISetterWrapper, IValue, IValueNoRet, L1_ROLLUP_ID, OUTBOUND_USER, ProverMutation,
+    SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead, TARGET_DEPLOYER, account_code,
+    assert_latest_batch_signature, batches_posted, call_read, call_revert_data,
     completed_proxy_calls, count_events, cross_chain_source_proxy, deploy_nested_setter_inner,
     deploy_nested_setter_outer, events_since, l2_balance, l2_value, last_proxy_result,
-    pending_nonce, read_state_word, receipt_ok, run_scenarios, safe_block_state_root, setter_call,
+    onchain_nonce, read_state_word, receipt_ok, run_scenarios, safe_block_state_root, setter_call,
     setup_cross_chain, setup_cross_chain_codeless, setup_cross_chain_empty_call,
     setup_cross_chain_nested_setter, setup_cross_chain_outbound_return_data,
-    setup_cross_chain_return_data, setup_cross_chain_reverting, sign_and_send, signer_address,
-    state_root, value_no_ret, value_read, wait_for,
+    setup_cross_chain_proxied, setup_cross_chain_return_data, setup_cross_chain_reverting,
+    sign_and_send, signer_address, state_root, value_no_ret, value_read, wait_for,
 };
 
 const WAVE_SETTERS: &[u64] = &[7, 11, 17];
@@ -143,6 +144,193 @@ async fn assert_value_set_attribution(
     }
 }
 
+/// Exercise one signed and derived transaction in each direction, including
+/// verification of the posted proof's recomputed public-input hash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn minimal_bidirectional_cross_chain_smoke() {
+    let attester = signer_address(ANVIL_KEY_1).unwrap();
+    let w = setup_cross_chain().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+
+    let inbound = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(41u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await
+    .expect("inbound smoke transaction must be admitted");
+    let outbound = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
+        Some(w.outbound_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(43u64),
+        }
+        .abi_encode(),
+        900_000,
+    )
+    .await
+    .expect("outbound smoke transaction must be admitted");
+
+    assert_all_transactions_succeeded(&l1_rpc, &[inbound], "inbound smoke").await;
+    assert_all_transactions_succeeded(&l2_rpc, &[outbound], "outbound smoke").await;
+
+    let (eez, rollup_id) = (w.cfg.eez_address, w.cfg.rollup_id);
+    let converged = wait_for(SETTLE_TIMEOUT, || {
+        let (l1_rpc, l2_rpc) = (l1_rpc.clone(), l2_rpc.clone());
+        async move {
+            let inbound_applied = l2_value(&l2_rpc, w.value_l2).await? == U256::from(41u64);
+            let outbound_applied = l2_value(&l1_rpc, w.outbound_value).await? == U256::from(43u64);
+            let l1_root = state_root(&l1_rpc, eez, rollup_id).await?;
+            let l2_root = safe_block_state_root(&l2_rpc).await?;
+            Ok((inbound_applied && outbound_applied && l2_root == Some(l1_root)).then_some(()))
+        }
+    })
+    .await;
+    if let Err(err) = converged {
+        panic!(
+            "minimal smoke did not settle both directions: {err:#}{}",
+            w.settlement_diagnostics(),
+        );
+    }
+
+    assert!(
+        batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
+            .await
+            .unwrap()
+            >= 1,
+        "minimal smoke must post at least one batch",
+    );
+    assert_latest_batch_signature(&l1_rpc, &w.dep, attester)
+        .await
+        .expect("posted proof must recover over the recomputed public-input hash");
+    assert_eq!(
+        w.node
+            .count_signals(&[
+                signals::COMPOSER_INBOUND_POISON_EVICTED,
+                signals::COMPOSER_OUTBOUND_POISON_EVICTED,
+                signals::TX_POISON_EVICTED,
+                signals::TX_NONCE_CHAIN_EVICTED,
+            ])
+            .unwrap(),
+        0,
+        "valid smoke transactions must not be evicted",
+    );
+    w.node.assert_no_divergence_failure_logs();
+}
+
+async fn assert_real_signer_rejects(mutation: ProverMutation, tampered_input: &str) {
+    let attester = signer_address(ANVIL_KEY_1).unwrap();
+    let w = setup_cross_chain_proxied(mutation, attester).await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let proxy = w.prover_proxy.as_ref().expect("real signer proxy");
+
+    let rejected = wait_for(SETTLE_TIMEOUT, || async {
+        Ok((proxy.rejections() >= 1).then_some(()))
+    })
+    .await;
+    if rejected.is_err() {
+        w.proof_signer.assert_alive();
+        assert_ne!(
+            proxy.attempts(),
+            0,
+            "composer never proved a window, so tampered {tampered_input} was never exercised",
+        );
+        panic!(
+            "signer accepted tampered {tampered_input}: {} attempts, {} attested",
+            proxy.attempts(),
+            proxy.successes(),
+        );
+    }
+    let batches_after_rejection = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
+        .await
+        .unwrap();
+    let root_after_rejection = state_root(&l1_rpc, w.cfg.eez_address, w.cfg.rollup_id)
+        .await
+        .unwrap();
+    wait_for(SETTLE_TIMEOUT, || async {
+        Ok((proxy.rejections() >= 2).then_some(()))
+    })
+    .await
+    .expect("composer did not retry the rejected proof window");
+    assert_eq!(
+        batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
+            .await
+            .unwrap(),
+        batches_after_rejection,
+        "batch count advanced while the signer repeatedly rejected tampered {tampered_input}",
+    );
+    assert_eq!(
+        state_root(&l1_rpc, w.cfg.eez_address, w.cfg.rollup_id)
+            .await
+            .unwrap(),
+        root_after_rejection,
+        "state root advanced while the signer repeatedly rejected tampered {tampered_input}",
+    );
+    w.proof_signer.assert_alive();
+    w.node.assert_no_process_death();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_signer_rejects_tampered_post_batch_calldata() {
+    assert_real_signer_rejects(ProverMutation::PostBatch, "PostBatch calldata").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_signer_rejects_tampered_witness() {
+    assert_real_signer_rejects(ProverMutation::Witness, "witness").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_signer_attester_mismatch_never_submits_a_batch() {
+    let wrong_attester = Address::repeat_byte(0x44);
+    let w = setup_cross_chain_proxied(ProverMutation::None, wrong_attester)
+        .await
+        .unwrap();
+    let proxy = w.prover_proxy.as_ref().expect("real signer proxy");
+
+    let attested = wait_for(SETTLE_TIMEOUT, || async {
+        Ok((proxy.successes() >= 2).then_some(()))
+    })
+    .await;
+    if let Err(err) = attested {
+        w.proof_signer.assert_alive();
+        panic!("signer never returned the mismatched attestations: {err:#}");
+    }
+    assert_eq!(
+        proxy.rejections(),
+        0,
+        "the signer must have attested; only the composer may refuse here",
+    );
+    assert_eq!(
+        batches_posted(&w.l1_rpc(), w.cfg.eez_address, w.dep.deploy_block)
+            .await
+            .unwrap(),
+        0,
+        "an attestation from an unexpected signer must never reach L1",
+    );
+    assert_eq!(
+        state_root(&w.l1_rpc(), w.cfg.eez_address, w.cfg.rollup_id)
+            .await
+            .unwrap(),
+        w.cfg.initial_state,
+        "signer mismatch must leave the registered state root unchanged",
+    );
+    w.node.assert_no_process_death();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn both_directions_zero_value_direct_proxy_success_single_call() {
     let w = setup_cross_chain().await.unwrap();
@@ -228,7 +416,7 @@ async fn direct_ccm_l2_outbound_call_is_rejected() {
         &l2_rpc,
         OUTBOUND_USER,
         w.l2_chain_id,
-        pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
+        onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
         Some(EEZL2_ADDRESS),
         U256::ZERO,
         IEEZL2Direct::executeCrossChainCallCall {
@@ -294,8 +482,8 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
         // tick removes held transactions before they land on the source chain,
         // so caching nonces across waves races the ingress gate's
         // `on_chain + held` validation.
-        let mut l1_nonce = pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
-        let mut l2_nonce = pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
+        let mut l1_nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
+        let mut l2_nonce = onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
         let inbound_wave_start = inbound_hashes.len();
         let outbound_wave_start = outbound_hashes.len();
 
@@ -495,7 +683,12 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
     );
     assert_eq!(
         w.node
-            .count_signals(&[signals::TX_POISON_EVICTED, signals::TX_NONCE_CHAIN_EVICTED,])
+            .count_signals(&[
+                signals::COMPOSER_INBOUND_POISON_EVICTED,
+                signals::COMPOSER_OUTBOUND_POISON_EVICTED,
+                signals::TX_POISON_EVICTED,
+                signals::TX_NONCE_CHAIN_EVICTED,
+            ])
             .unwrap(),
         0,
         "all non-poison wave transactions must settle without eviction",
@@ -706,7 +899,7 @@ async fn outbound_multiple_proxy_calls_in_one_transaction_are_evicted() {
     let l1_rpc = w.l1_rpc();
     let l2_rpc = w.l2_rpc();
     let value = U256::from(79u64);
-    let source_nonce = pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
+    let source_nonce = onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
     let destination_before = l2_value(&l1_rpc, w.outbound_value).await.unwrap();
     let signal_cursor = w.node.signal_cursor().unwrap();
 
@@ -797,7 +990,7 @@ async fn outbound_identical_calls_in_separate_transactions_settle_as_ordered_ent
     let l1_rpc = w.l1_rpc();
     let l2_rpc = w.l2_rpc();
     let value = U256::from(79u64);
-    let nonce = pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
+    let nonce = onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
     let call = ISetterWrapper::setViaProxyCall { v: value }.abi_encode();
     assert_ne!(
         l2_value(&l1_rpc, w.outbound_value).await.unwrap(),
@@ -1142,22 +1335,6 @@ fn successes_read(wrapper: Address) -> StateRead {
     )
 }
 
-fn revert_length_read(wrapper: Address) -> StateRead {
-    call_read(
-        wrapper,
-        "lastRevertLength()",
-        IRevertBubbleWrapper::lastRevertLengthCall {}.abi_encode(),
-    )
-}
-
-fn revert_hash_read(wrapper: Address) -> StateRead {
-    call_read(
-        wrapper,
-        "lastRevertHash()",
-        IRevertBubbleWrapper::lastRevertHashCall {}.abi_encode(),
-    )
-}
-
 fn target_calls_read(target: Address) -> StateRead {
     call_read(
         target,
@@ -1182,39 +1359,24 @@ fn record_call(wrapper: Address, inner: Vec<u8>) -> ScenarioCall {
     .with_gas_limit(1_200_000)
 }
 
-/// The three revert shapes a destination can produce, paired with the raw
-/// revert bytes each must deliver back to the source frame. `_executeEntry`
-/// re-reverts a failed entry with its recorded `returnData` verbatim, so the
-/// source sees the destination's own encoding, not a wrapper error.
-fn revert_cases(value: U256) -> [(&'static str, Vec<u8>, Vec<u8>); 3] {
-    let custom = IRevertingTarget::Rejected { seen: value }.abi_encode();
-    let string_reason = [
-        &keccak256(b"Error(string)")[..4],
-        &("reverting target".to_string(),).abi_encode_params()[..],
-    ]
-    .concat();
+fn revert_cases(value: U256) -> [(&'static str, Vec<u8>); 3] {
     [
         (
             "custom error",
             IRevertingTarget::revertCustomCall { v: value }.abi_encode(),
-            custom.clone(),
         ),
         (
             "string reason",
             IRevertingTarget::revertStringCall { v: value }.abi_encode(),
-            string_reason,
         ),
         (
             // Writes two slots before reverting, so a surviving write is visible.
             "write then revert",
             IRevertingTarget::writeThenRevertCall { v: value }.abi_encode(),
-            custom,
         ),
     ]
 }
 
-/// Assert the destination frame left no trace. Called only after the scenario
-/// has settled, so a zero counter means rolled back rather than not yet run.
 async fn assert_destination_untouched(rpc: &str, target: Address, label: &str) {
     for read in [target_calls_read(target), target_last_value_read(target)] {
         let observed = read_state_word(rpc, &read).await.unwrap();
@@ -1226,35 +1388,79 @@ async fn assert_destination_untouched(rpc: &str, target: Address, label: &str) {
     }
 }
 
+async fn wait_for_poison_eviction(
+    w: &eez_testkit::CrossChainWorld,
+    cursor: usize,
+    hash: TxHash,
+    signal: &str,
+    label: &str,
+) {
+    let tx_hash = hash.to_string();
+    wait_for(SETTLE_TIMEOUT, || async {
+        let evicted = w.node.signals_since(cursor)?.into_iter().any(|record| {
+            record.name == signal
+                && record.fields.get("tx_hash").and_then(|v| v.as_str()) == Some(tx_hash.as_str())
+        });
+        Ok(evicted.then_some(()))
+    })
+    .await
+    .unwrap_or_else(|err| panic!("{label} was not poison-evicted: {err:#}"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn inbound_reverting_destination_rolls_back_and_preserves_revert_data() {
+async fn inbound_reverting_destination_is_evicted_without_state_changes() {
     let w = setup_cross_chain_reverting().await.unwrap();
+    let l1_rpc = w.l1_rpc();
     let l2_rpc = w.l2_rpc();
     let wrapper = w.inbound_wrapper;
     let target = w.reverting_target_l2;
     let value = U256::from(31u64);
 
-    let mut failures = 0u64;
-    for (label, inner, expected_revert) in revert_cases(value) {
-        failures += 1;
-        // The source tx itself succeeds (the wrapper records rather than
-        // bubbles), so `failures` advancing is proof the cross-chain call ran
-        // and came back failed — not that it was never attempted.
-        Scenario::new(format!("inbound reverting destination: {label}"))
-            .inbound(record_call(wrapper, inner))
-            .expect_l1_state(failures_read(wrapper), failures)
-            .expect_l1_state(successes_read(wrapper), 0u64)
-            .expect_l1_state(revert_length_read(wrapper), expected_revert.len() as u64)
-            .expect_l1_state(revert_hash_read(wrapper), keccak256(&expected_revert))
-            .expect_settled_fully()
-            .run(&w)
-            .await
-            .unwrap();
+    for (label, inner) in revert_cases(value) {
+        let nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
+        let call = record_call(wrapper, inner);
+        let cursor = w.node.signal_cursor().unwrap();
+        let hash = sign_and_send(
+            &w.l1_xchain(),
+            INBOUND_USER,
+            DEV_CHAIN_ID,
+            nonce,
+            Some(call.to),
+            call.value,
+            call.data,
+            call.gas_limit,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("submit inbound {label}: {err:#}"));
+        wait_for_poison_eviction(
+            &w,
+            cursor,
+            hash,
+            signals::COMPOSER_INBOUND_POISON_EVICTED,
+            label,
+        )
+        .await;
+        assert_eq!(
+            receipt_ok(&l1_rpc, hash).await.unwrap(),
+            None,
+            "inbound {label} must not settle on its source chain",
+        );
+        assert_eq!(
+            read_state_word(&l1_rpc, &failures_read(wrapper))
+                .await
+                .unwrap(),
+            U256::ZERO
+        );
+        assert_eq!(
+            read_state_word(&l1_rpc, &successes_read(wrapper))
+                .await
+                .unwrap(),
+            U256::ZERO
+        );
         assert_destination_untouched(&l2_rpc, target, label).await;
     }
 
-    // A valid call after three failures must still cross and commit, proving
-    // the failures left no poisoned entry or stuck nonce behind.
+    // Reusing the released nonce proves the poison entries left no stuck gap.
     Scenario::new("inbound valid call after reverts")
         .inbound(record_call(
             wrapper,
@@ -1263,7 +1469,7 @@ async fn inbound_reverting_destination_rolls_back_and_preserves_revert_data() {
         .expect_l2_state(target_calls_read(target), 1u64)
         .expect_l2_state(target_last_value_read(target), value)
         .expect_l1_state(successes_read(wrapper), 1u64)
-        .expect_l1_state(failures_read(wrapper), failures)
+        .expect_l1_state(failures_read(wrapper), 0u64)
         .expect_settled_fully()
         .run(&w)
         .await
@@ -1271,28 +1477,55 @@ async fn inbound_reverting_destination_rolls_back_and_preserves_revert_data() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn outbound_reverting_destination_rolls_back_and_preserves_revert_data() {
-    // Mirror of the inbound case with the sides swapped; source execution
-    // semantics differ per direction, so both are worth running.
+async fn outbound_reverting_destination_is_evicted_without_state_changes() {
     let w = setup_cross_chain_reverting().await.unwrap();
     let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
     let wrapper = w.outbound_wrapper;
     let target = w.reverting_target_l1;
     let value = U256::from(37u64);
 
-    let mut failures = 0u64;
-    for (label, inner, expected_revert) in revert_cases(value) {
-        failures += 1;
-        Scenario::new(format!("outbound reverting destination: {label}"))
-            .outbound(record_call(wrapper, inner))
-            .expect_l2_state(failures_read(wrapper), failures)
-            .expect_l2_state(successes_read(wrapper), 0u64)
-            .expect_l2_state(revert_length_read(wrapper), expected_revert.len() as u64)
-            .expect_l2_state(revert_hash_read(wrapper), keccak256(&expected_revert))
-            .expect_settled_fully()
-            .run(&w)
-            .await
-            .unwrap();
+    for (label, inner) in revert_cases(value) {
+        let nonce = onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
+        let call = record_call(wrapper, inner);
+        let cursor = w.node.signal_cursor().unwrap();
+        let hash = sign_and_send(
+            &w.l2_xchain(),
+            OUTBOUND_USER,
+            w.l2_chain_id,
+            nonce,
+            Some(call.to),
+            call.value,
+            call.data,
+            call.gas_limit,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("submit outbound {label}: {err:#}"));
+        wait_for_poison_eviction(
+            &w,
+            cursor,
+            hash,
+            signals::COMPOSER_OUTBOUND_POISON_EVICTED,
+            label,
+        )
+        .await;
+        assert_eq!(
+            receipt_ok(&l2_rpc, hash).await.unwrap(),
+            None,
+            "outbound {label} must not settle on its source chain",
+        );
+        assert_eq!(
+            read_state_word(&l2_rpc, &failures_read(wrapper))
+                .await
+                .unwrap(),
+            U256::ZERO
+        );
+        assert_eq!(
+            read_state_word(&l2_rpc, &successes_read(wrapper))
+                .await
+                .unwrap(),
+            U256::ZERO
+        );
         assert_destination_untouched(&l1_rpc, target, label).await;
     }
 
@@ -1304,7 +1537,7 @@ async fn outbound_reverting_destination_rolls_back_and_preserves_revert_data() {
         .expect_l1_state(target_calls_read(target), 1u64)
         .expect_l1_state(target_last_value_read(target), value)
         .expect_l2_state(successes_read(wrapper), 1u64)
-        .expect_l2_state(failures_read(wrapper), failures)
+        .expect_l2_state(failures_read(wrapper), 0u64)
         .expect_settled_fully()
         .run(&w)
         .await

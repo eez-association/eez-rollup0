@@ -17,11 +17,14 @@ alloy-rpc-types-eth.workspace = true
 alloy-signer-local.workspace = true
 alloy-sol-types.workspace = true
 anyhow = "1"
+eez-control-rpc.workspace = true
 eez-protocol.workspace = true
 reth-chainspec.workspace = true
 serde_json.workspace = true
 tempfile = "3"
 tokio.workspace = true
+tokio-stream = { workspace = true, features = ["net"] }
+tonic.workspace = true
 
 [lints]
 workspace = true
