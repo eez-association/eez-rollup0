@@ -2970,17 +2970,22 @@ impl CrossChainConfig {
         let rollup_manager_address = deployer.create(2);
         let initial_state = l2_genesis_state_root();
         let ts = now_unix_secs();
-        let l1_http_port =
-            probe_unique_http_port(&mut ASSIGNED_PORTS.lock().expect("assigned ports lock"));
-        let l1_auth_port = free_port();
+        let (l1_http_port, l1_auth_port, l1_p2p_port, l1_xchain_port, l2_xchain_port) = {
+            let mut ports = ASSIGNED_PORTS.lock().expect("assigned ports lock");
+            (
+                probe_unique_http_port(&mut ports),
+                probe_unique_tcp_port(&mut ports),
+                probe_unique_tcp_udp_port(&mut ports),
+                probe_unique_tcp_port(&mut ports),
+                probe_unique_tcp_port(&mut ports),
+            )
+        };
         Ok(Self {
             l1_http_port,
             l1_auth_port,
-            l1_p2p_port: probe_unique_tcp_udp_port(
-                &mut ASSIGNED_PORTS.lock().expect("assigned ports lock"),
-            ),
-            l1_xchain_port: free_port(),
-            l2_xchain_port: free_port(),
+            l1_p2p_port,
+            l1_xchain_port,
+            l2_xchain_port,
             eez_address,
             proof_system_address,
             rollup_manager_address,
