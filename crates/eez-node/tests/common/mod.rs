@@ -764,7 +764,13 @@ impl Harness {
     /// Stages a local chain that can later restart as a composer or follower.
     pub fn standalone_env(&self) -> Vec<(&'static str, String)> {
         vec![
+            (
+                "EEZ_L1_BLOCK_TIME_MS",
+                (L1_BLOCK_TIME_SECS * 1000).to_string(),
+            ),
             ("EEZ_L2_BLOCK_TIME_MS", "2000".to_string()),
+            ("EEZ_PROOF_TIME_MS", "1000".to_string()),
+            ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
             (
                 "RUST_LOG",
                 std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
@@ -1049,7 +1055,13 @@ pub async fn send_l2_value_transfer(
     let mut tx = TxLegacy {
         chain_id: Some(chain_id),
         nonce,
-        gas_price: provider.get_gas_price().await?,
+        // Reth's txpool requires a non-zero priority margin. The RPC gas-price
+        // suggestion can equal the current base fee during startup, which makes
+        // an otherwise valid legacy test transaction "underpriced".
+        gas_price: provider
+            .get_gas_price()
+            .await?
+            .saturating_add(2_000_000_000),
         gas_limit: 21_000,
         to: alloy_primitives::TxKind::Call(to),
         value,
