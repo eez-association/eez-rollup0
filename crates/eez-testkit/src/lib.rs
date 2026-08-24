@@ -1053,8 +1053,7 @@ pub fn l2_genesis_state_root() -> B256 {
     *ROOT
 }
 
-/// Sign and submit one legacy L2 value transfer using the pool nonce and the
-/// node's current gas price.
+/// Sign and submit one EIP-1559 L2 value transfer using the pool nonce.
 pub async fn send_l2_value_transfer(
     rpc_url: &str,
     signing_key: &str,
@@ -1071,13 +1070,16 @@ pub async fn send_l2_value_transfer(
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let chain_id = provider.get_chain_id().await?;
     let nonce = provider.get_transaction_count(from).pending().await?;
-    let mut tx = TxLegacy {
-        chain_id: Some(chain_id),
+    let fees = provider.estimate_eip1559_fees().await?;
+    let mut tx = TxEip1559 {
+        chain_id,
         nonce,
-        gas_price: provider.get_gas_price().await?,
         gas_limit: 21_000,
+        max_fee_per_gas: fees.max_fee_per_gas,
+        max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
         to: alloy_primitives::TxKind::Call(to),
         value,
+        access_list: alloy_rpc_types_eth::AccessList::default(),
         input: alloy_primitives::Bytes::default(),
     };
     let sig = signer.sign_transaction_sync(&mut tx)?;
@@ -1792,13 +1794,19 @@ where
 {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(v) = f().await? {
-            return Ok(v);
-        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
+        match tokio::time::timeout(remaining, f()).await {
+            Ok(result) => {
+                if let Some(v) = result? {
+                    return Ok(v);
+                }
+            }
+            Err(_) => break,
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
         tokio::time::sleep(remaining.min(Duration::from_millis(500))).await;
     }
     bail!("timed out after {timeout:?}");
@@ -2337,7 +2345,7 @@ pub fn override_env(
 
 // Cross-chain test fixture.
 
-use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
+use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_network::TxSignerSync;
 use alloy_network::eip2718::Encodable2718;
 
@@ -2500,19 +2508,16 @@ pub async fn sign_and_send(
     let env = TxEnvelope::from(tx.into_signed(sig));
     let hash = *env.tx_hash();
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    // Cross-chain fronts temporarily refuse submissions while starting or
-    // while a poison-held transaction with this nonce is being released.
+    // Cross-chain fronts temporarily refuse submissions while starting.
     let deadline = std::time::Instant::now() + Duration::from_mins(2);
     loop {
         match provider.send_raw_transaction(&env.encoded_2718()).await {
             Ok(_) => return Ok(hash),
-            Err(err) if std::time::Instant::now() < deadline => {
-                let message = err.to_string();
-                if message.contains("starting up") || message.contains("transaction underpriced") {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    continue;
-                }
-                return Err(err.into());
+            Err(err)
+                if err.to_string().contains("starting up")
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
             Err(err) => return Err(err.into()),
         }

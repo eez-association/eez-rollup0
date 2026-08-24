@@ -125,9 +125,12 @@ create_l2_proxy() {
     code=$(cast code "$proxy" --rpc-url "$L2" 2>/dev/null || echo 0x)
     if [[ "$code" == "0x" || -z "$code" ]]; then
         nonce=$(retry cast nonce "$L2_DEPLOYER" --rpc-url "$L2")
-        raw=$(cast mktx --chain-id "$chain_id" --private-key "$L2_DEPLOY_KEY" --nonce "$nonce" \
-            --gas-limit 1500000 --gas-price "$(gas_price_for "$L2")" \
+        raw=$(cast mktx --rpc-url "$L2" --chain-id "$chain_id" --private-key "$L2_DEPLOY_KEY" \
+            --nonce "$nonce" --gas-limit 1500000 --gas-price "$(gas_price_for "$L2")" \
+            --priority-gas-price "$PRIORITY_GAS_PRICE" \
             "$EEZL2_ADDRESS" 'createCrossChainProxy(address,uint64)' "$target" "$L1_ROLLUP_ID")
+        [[ "$raw" =~ ^0x[0-9a-fA-F]+$ ]] \
+            || { echo "could not build the L2 proxy creation transaction" >&2; return 1; }
         response=$(curl -s -X POST "$L2" -H 'Content-Type: application/json' \
             -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"],\"id\":1}")
         jq -e '.result != null' <<<"$response" >/dev/null \
@@ -313,10 +316,12 @@ run_scenario() {
         if [[ "$scenario" == "destination" ]]; then
             raw=$(cast mktx --chain-id "$chain_id" --private-key "$key" --nonce "$nonce" \
                 --gas-limit 800000 --gas-price "$gas_price" --priority-gas-price "$PRIORITY_GAS_PRICE" \
+                --rpc-url "$source_rpc" \
                 "$wrapper" 'setViaProxy(uint256)' 1)
         else
             raw=$(cast mktx --chain-id "$chain_id" --private-key "$key" --nonce "$nonce" \
                 --gas-limit 800000 --gas-price "$gas_price" --priority-gas-price "$PRIORITY_GAS_PRICE" \
+                --rpc-url "$source_rpc" \
                 "$wrapper" 'setNextValueViaProxy()')
         fi
         [[ "$raw" =~ ^0x[0-9a-fA-F]+$ ]] || { echo "could not build $direction transaction"; return 1; }
