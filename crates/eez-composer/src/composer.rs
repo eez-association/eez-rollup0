@@ -1674,7 +1674,6 @@ where
                             tx_idx = idx,
                             tx_hash = %held.hash,
                             error = %e,
-                            test_signal = "eez.composer.cc_compose.outbound_poison_evicted",
                             "outbound tx fails simulation deterministically; evicting",
                         );
                         push_poison_root(&mut poison, &mut poison_gaps, held);
@@ -1724,7 +1723,6 @@ where
                         sender = %held.sender,
                         nonce = held.nonce,
                         error = %e,
-                        test_signal = "eez.composer.cc_compose.inbound_poison_evicted",
                         "held tx fails simulation deterministically (e.g. wrong proxy → EmptyCalls, or revert); evicting — it can never compose, resubmit required",
                     );
                     push_poison_root(&mut poison, &mut poison_gaps, held);
@@ -1745,7 +1743,19 @@ where
         if let Some(pool) = rollup.held_pool.as_ref() {
             for tx in &poison {
                 // Inclusive eviction releases the poison root's reservation too.
-                for t in pool.evict_chain_at_or_above(tx.sender, tx.direction, tx.nonce) {
+                let evicted = pool.evict_chain_at_or_above(tx.sender, tx.direction, tx.nonce);
+                event!(
+                    name: "eez.composer.cc_compose.poison_eviction_completed",
+                    Level::WARN,
+                    test_signal = "eez.composer.cc_compose.poison_eviction_completed",
+                    rollup_id,
+                    tx_hash = %tx.hash,
+                    sender = %tx.sender,
+                    nonce = tx.nonce,
+                    direction = ?tx.direction,
+                    "poison transaction and its nonce-chain suffix evicted",
+                );
+                for t in evicted {
                     event!(
                         name: "eez.composer.cc_compose.poison_chain_evicted",
                         Level::WARN,

@@ -17,6 +17,8 @@ done
 
 # shellcheck disable=SC1091
 source "$K/ports.sh" >/dev/null
+# shellcheck disable=SC1091
+source "$K/scripts/lib.sh"
 : "${L1:=$EEZ_DEVNET_L1_RPC}"
 : "${L2:=$EEZ_DEVNET_L2_RPC}"
 : "${L1F:=$EEZ_DEVNET_L1_FRONT}"
@@ -44,106 +46,21 @@ fi
     || { echo "deployments.env is missing the registry address or rollup id"; exit 1; }
 
 L2_DEPLOY_KEY=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
-L2_DEPLOYER=$(cast wallet address --private-key "$L2_DEPLOY_KEY")
 INBOUND_KEY="${EEZ_STATE_CHAINING_IN_KEY:-0x$(openssl rand -hex 32)}"
 INBOUND_SENDER=$(cast wallet address --private-key "$INBOUND_KEY")
 OUTBOUND_KEY="${EEZ_STATE_CHAINING_OUT_KEY:-0x$(openssl rand -hex 32)}"
 OUTBOUND_SENDER=$(cast wallet address --private-key "$OUTBOUND_KEY")
 EEZL2_ADDRESS="${EEZL2_ADDRESS:-0x4200000000000000000000000000000000000007}"
 L1_ROLLUP_ID="${EEZ_L1_ROLLUP_ID:-0}"
-PRIORITY_GAS_PRICE="${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1}"
 RECEIPT_WAIT_SECS="${EEZ_STATE_CHAINING_WAIT_SECS:-300}"
 WRAPPED_TOPIC=$(cast keccak 'Wrapped(uint256,bool,bool,uint256)')
 
-yaml_value() {
-    grep -E "^[[:space:]]*$1:" "${KURTOSIS_ARGS_FILE:-$K/args.yaml}" 2>/dev/null | head -1 \
-        | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//'
-}
 FUNDING_KEY="${EEZ_FUND_FROM_KEY:-${EEZ_PROOF_SIGNER_KEY:-$(yaml_value proof_signer_key)}}"
 [[ -n "$FUNDING_KEY" ]] || { echo "could not resolve the L1 funding key"; exit 1; }
 L1_DEPLOY_KEY="${EEZ_L1_SETUP_KEY:-$FUNDING_KEY}"
 
-retry() {
-    local attempts=0 max="${RETRY_MAX:-6}" delay="${RETRY_DELAY:-3}" output rc
-    while :; do
-        if output=$("$@" 2>&1); then
-            printf '%s' "$output"
-            return 0
-        else
-            rc=$?
-        fi
-        (( ++attempts >= max )) && {
-            echo "retry: '$*' failed after $attempts attempts: $output" >&2
-            return "$rc"
-        }
-        sleep "$delay"
-    done
-}
-
-gas_price_for() {
-    local rpc="$1" gas_price base_hex base minimum
-    gas_price=$(cast gas-price --rpc-url "$rpc" 2>/dev/null || echo 1000000000)
-    gas_price="${EEZ_TEST_GAS_PRICE_WEI:-$gas_price}"
-    base_hex=$(cast block latest --field baseFeePerGas --rpc-url "$rpc" 2>/dev/null || echo 0)
-    base=$(cast to-dec "$base_hex" 2>/dev/null || echo 0)
-    minimum=$((2 * base + PRIORITY_GAS_PRICE))
-    (( gas_price < minimum )) && gas_price="$minimum"
-    echo "$gas_price"
-}
-
-fund() {
-    local rpc="$1" key="$2" from="$3" to="$4" nonce
-    nonce=$(retry cast nonce "$from" --rpc-url "$rpc")
-    cast send "$to" --value 10ether --private-key "$key" --nonce "$nonce" \
-        --gas-price "$(gas_price_for "$rpc")" --priority-gas-price "$PRIORITY_GAS_PRICE" \
-        --rpc-url "$rpc" >/dev/null
-}
-
-forge_deploy() {
-    local rpc="$1" key="$2" script="$3" signature="$4" gas_price output
-    shift 4
-    gas_price=$(gas_price_for "$rpc")
-    if ! output=$(cd "$REPO/contracts" && forge script "script/$script" --sig "$signature" "$@" \
-        --rpc-url "$rpc" --broadcast --private-key "$key" --gas-price "$gas_price" \
-        --skip-simulation 2>&1); then
-        printf '%s\n' "$output" >&2
-        return 1
-    fi
-    printf '%s\n' "$output"
-}
-
-grab_address() { grep -oE "$1=0x[0-9a-fA-F]{40}" | head -1 | cut -d= -f2; }
 refresh_node_log() { kurtosis service logs -a "$ENCLAVE" eez-node >"$NODE_LOG" 2>&1 || true; }
 refresh_signer_log() { kurtosis service logs -a "$ENCLAVE" eez-proof-signer >"$SIGNER_LOG" 2>&1 || true; }
-strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
-
-create_l2_proxy() {
-    local target="$1" proxy code nonce raw chain_id response
-    chain_id=$(cast chain-id --rpc-url "$L2")
-    proxy=$(cast call "$EEZL2_ADDRESS" 'computeCrossChainProxyAddress(address,uint64)(address)' \
-        "$target" "$L1_ROLLUP_ID" --rpc-url "$L2" | tr -d '[:space:]')
-    code=$(cast code "$proxy" --rpc-url "$L2" 2>/dev/null || echo 0x)
-    if [[ "$code" == "0x" || -z "$code" ]]; then
-        nonce=$(retry cast nonce "$L2_DEPLOYER" --rpc-url "$L2")
-        raw=$(cast mktx --rpc-url "$L2" --chain-id "$chain_id" --private-key "$L2_DEPLOY_KEY" \
-            --nonce "$nonce" --gas-limit 1500000 --gas-price "$(gas_price_for "$L2")" \
-            --priority-gas-price "$PRIORITY_GAS_PRICE" \
-            "$EEZL2_ADDRESS" 'createCrossChainProxy(address,uint64)' "$target" "$L1_ROLLUP_ID")
-        [[ "$raw" =~ ^0x[0-9a-fA-F]+$ ]] \
-            || { echo "could not build the L2 proxy creation transaction" >&2; return 1; }
-        response=$(curl -s -X POST "$L2" -H 'Content-Type: application/json' \
-            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"],\"id\":1}")
-        jq -e '.result != null' <<<"$response" >/dev/null \
-            || { echo "L2 proxy creation was rejected: $response" >&2; return 1; }
-        for _ in $(seq 1 30); do
-            code=$(cast code "$proxy" --rpc-url "$L2" 2>/dev/null || echo 0x)
-            [[ "$code" != "0x" && -n "$code" ]] && break
-            sleep 1
-        done
-    fi
-    [[ "$code" != "0x" && -n "$code" ]] || return 1
-    echo "$proxy"
-}
 
 wait_for_sync_boundary() {
     local baseline count=0 deadline
@@ -160,32 +77,16 @@ wait_for_sync_boundary() {
     return 1
 }
 
-send_front() {
-    local front="$1" raw="$2" expected_hash="$3" response returned_hash
-    response=$(curl -s -X POST "$front" -H 'Content-Type: application/json' \
-        -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"],\"id\":1}")
-    returned_hash=$(jq -er '.result // error("missing transaction hash")' <<<"$response" 2>/dev/null || true)
-    [[ "${returned_hash,,}" == "${expected_hash,,}" ]] \
-        || { echo "cross-chain front rejected or changed the transaction: $response" >&2; return 1; }
-}
-
-receipt_json() {
-    curl --max-time 3 -s -X POST -H 'Content-Type: application/json' \
-        --data "{\"jsonrpc\":\"2.0\",\"method\":\"eth_getTransactionReceipt\",\"params\":[\"$1\"],\"id\":1}" \
-        "$2" 2>/dev/null
-}
-
 wait_for_receipts() {
     local rpc="$1"
     shift
-    local hashes=("$@") deadline hash receipt status confirmed
+    local hashes=("$@") deadline hash status confirmed
     deadline=$((SECONDS + RECEIPT_WAIT_SECS))
     while (( SECONDS < deadline )); do
         confirmed=0
         for hash in "${hashes[@]}"; do
-            receipt=$(receipt_json "$hash" "$rpc" || true)
-            status=$(jq -r '.result.status // "missing"' <<<"$receipt" 2>/dev/null || echo missing)
-            [[ "$status" == "0x1" ]] && confirmed=$((confirmed + 1))
+            status=$(receipt_status "$hash" "$rpc")
+            [[ "$status" == "1" ]] && confirmed=$((confirmed + 1))
             [[ "$status" != "0x0" ]] || { echo "transaction $hash reverted" >&2; return 1; }
         done
         (( confirmed == ${#hashes[@]} )) && return 0
@@ -277,7 +178,7 @@ run_scenario() {
     local completed_before target_before target_event_count target_event_count_before target_event_deadline
     local expected_final
     local hashes=() actual_results=()
-    local expected_results=()
+    local expected_results=() index
 
     echo
     echo "==> $direction $scenario-state chaining: waiting for a fresh drain window"
@@ -389,8 +290,8 @@ cast block-number --rpc-url "$L1" >/dev/null || { echo "L1 RPC is not reachable"
 cast block-number --rpc-url "$L2" >/dev/null || { echo "L2 RPC is not reachable"; exit 1; }
 
 echo "==> funding fresh source accounts"
-fund "$L1" "$FUNDING_KEY" "$(cast wallet address --private-key "$FUNDING_KEY")" "$INBOUND_SENDER"
-fund "$L2" "$L2_DEPLOY_KEY" "$L2_DEPLOYER" "$OUTBOUND_SENDER"
+fund "$L1" "$FUNDING_KEY" "$INBOUND_SENDER"
+fund "$L2" "$L2_DEPLOY_KEY" "$OUTBOUND_SENDER"
 
 echo "==> deploying stateful targets and source-side wrappers"
 L2_VALUE=$(forge_deploy "$L2" "$L2_DEPLOY_KEY" DeployValueL2.s.sol:DeployValueL2 'run(uint256)' 0 \
@@ -402,7 +303,7 @@ L1_VALUE=$(forge_deploy "$L1" "$L1_DEPLOY_KEY" DeployValueL2.s.sol:DeployValueL2
 INBOUND_PROXY=$(forge_deploy "$L1" "$L1_DEPLOY_KEY" CreateValueProxy.s.sol:CreateValueProxy \
     'run(address,address,uint64)' "$EEZ_REGISTRY_ADDRESS" "$L2_VALUE" "$EEZ_ROLLUP_ID" \
     | grab_address EEZ_VALUE_PROXY)
-OUTBOUND_PROXY=$(create_l2_proxy "$L1_VALUE")
+OUTBOUND_PROXY=$(create_l2_proxy "$L1_VALUE" "$L2_DEPLOY_KEY" "$L1_ROLLUP_ID")
 [[ -n "$INBOUND_PROXY" && -n "$OUTBOUND_PROXY" ]] || { echo "proxy creation failed"; exit 1; }
 
 INBOUND_WRAPPER=$(forge_deploy "$L1" "$L1_DEPLOY_KEY" DeploySetterWrapperL1.s.sol:DeploySetterWrapperL1 \

@@ -155,9 +155,13 @@ jobs:
           retention-days: 7
 
   cross-chain-e2e:
-    name: Cross-Chain E2E Tests
+    name: Cross-Chain E2E Tests (shard ${{ matrix.shard }}/3)
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     env:
       EEZ_TEST_LOG_DIR: ${{ github.workspace }}/artifacts/cross-chain-e2e/logs
       EEZ_TEST_DATADIR_DIR: ${{ github.workspace }}/artifacts/cross-chain-e2e/datadirs
@@ -189,7 +193,8 @@ jobs:
         run: |
           mkdir -p artifacts/cross-chain-e2e
           set +e
-          cargo nextest run -P ci -p eez-node --test cross_chain --test-threads=1 --no-fail-fast --color=never 2>&1 \
+          cargo nextest run -P ci -p eez-node --test cross_chain --test-threads=1 \
+            --partition count:${{ matrix.shard }}/3 --no-fail-fast --color=never 2>&1 \
             | tee artifacts/cross-chain-e2e/nextest.log
           status=${PIPESTATUS[0]}
           set -e
@@ -198,7 +203,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: cross-chain-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          name: cross-chain-e2e-shard${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/cross-chain-e2e
           if-no-files-found: warn
           retention-days: 7

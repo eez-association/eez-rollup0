@@ -231,8 +231,7 @@ async fn minimal_bidirectional_cross_chain_smoke() {
     assert_eq!(
         w.node
             .count_signals(&[
-                signals::COMPOSER_INBOUND_POISON_EVICTED,
-                signals::COMPOSER_OUTBOUND_POISON_EVICTED,
+                signals::COMPOSER_POISON_EVICTION_COMPLETED,
                 signals::TX_POISON_EVICTED,
                 signals::TX_NONCE_CHAIN_EVICTED,
             ])
@@ -685,8 +684,7 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
     assert_eq!(
         w.node
             .count_signals(&[
-                signals::COMPOSER_INBOUND_POISON_EVICTED,
-                signals::COMPOSER_OUTBOUND_POISON_EVICTED,
+                signals::COMPOSER_POISON_EVICTION_COMPLETED,
                 signals::TX_POISON_EVICTED,
                 signals::TX_NONCE_CHAIN_EVICTED,
             ])
@@ -938,11 +936,15 @@ async fn outbound_multiple_proxy_calls_in_one_transaction_are_evicted() {
     .await
     .expect("composer did not report the unsupported outbound multicall");
 
-    // The signal fires before poison-root handling and pool eviction finish, so
-    // an immediate absent-receipt check races and proves nothing about later
-    // blocks. Reusing the released nonce is the conclusive test: a replacement
-    // can only land if the rejected transaction is really gone from the pool,
-    // and once the replacement has mined the rejected hash can never appear.
+    wait_for_poison_eviction(
+        &w,
+        signal_cursor,
+        tx,
+        "Outbound",
+        "unsupported outbound multicall",
+    )
+    .await;
+
     let replacement = sign_and_send(
         &w.l2_xchain(),
         OUTBOUND_USER,
@@ -1398,14 +1400,15 @@ async fn wait_for_poison_eviction(
     w: &eez_testkit::CrossChainWorld,
     cursor: usize,
     hash: TxHash,
-    signal: &str,
+    direction: &str,
     label: &str,
 ) {
     let tx_hash = hash.to_string();
     wait_for(SETTLE_TIMEOUT, || async {
         let evicted = w.node.signals_since(cursor)?.into_iter().any(|record| {
-            record.name == signal
+            record.name == signals::COMPOSER_POISON_EVICTION_COMPLETED
                 && record.fields.get("tx_hash").and_then(|v| v.as_str()) == Some(tx_hash.as_str())
+                && record.fields.get("direction").and_then(|v| v.as_str()) == Some(direction)
         });
         Ok(evicted.then_some(()))
     })
@@ -1438,14 +1441,7 @@ async fn inbound_reverting_destination_is_evicted_without_state_changes() {
         )
         .await
         .unwrap_or_else(|err| panic!("submit inbound {label}: {err:#}"));
-        wait_for_poison_eviction(
-            &w,
-            cursor,
-            hash,
-            signals::COMPOSER_INBOUND_POISON_EVICTED,
-            label,
-        )
-        .await;
+        wait_for_poison_eviction(&w, cursor, hash, "Inbound", label).await;
         assert_eq!(
             receipt_ok(&l1_rpc, hash).await.unwrap(),
             None,
@@ -1507,14 +1503,7 @@ async fn outbound_reverting_destination_is_evicted_without_state_changes() {
         )
         .await
         .unwrap_or_else(|err| panic!("submit outbound {label}: {err:#}"));
-        wait_for_poison_eviction(
-            &w,
-            cursor,
-            hash,
-            signals::COMPOSER_OUTBOUND_POISON_EVICTED,
-            label,
-        )
-        .await;
+        wait_for_poison_eviction(&w, cursor, hash, "Outbound", label).await;
         assert_eq!(
             receipt_ok(&l2_rpc, hash).await.unwrap(),
             None,

@@ -31,6 +31,8 @@ for t in cast forge jq curl kurtosis openssl; do command -v "$t" >/dev/null || {
 # L1 is the canonical shared chain; fronts are published by eez-node.
 # shellcheck disable=SC1091
 source "$K/ports.sh" >/dev/null
+# shellcheck disable=SC1091
+source "$K/scripts/lib.sh"
 : "${L1:=$EEZ_DEVNET_L1_RPC}"
 : "${L2:=$EEZ_DEVNET_L2_RPC}"
 : "${L1F:=$EEZ_DEVNET_L1_FRONT}"
@@ -64,13 +66,10 @@ HH_KEY_OUT="${EEZ_WAVE_OUT_KEY:-0x$(openssl rand -hex 32)}"
 HH_ADDR_OUT=$(cast wallet address --private-key "$HH_KEY_OUT")
 # Pure-L2 filler user.
 HH_KEY_PURE=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a  # #2 (L2 deployer, idle at wave time)
-HH_KEY_2_ADDR=$(cast wallet address --private-key "$HH_KEY_2")
 
 # EOAs funded on L1 so they can pay gas on the shared chain.
 L1_FUNDED_KEYS=("$HH_KEY_IN")
-_yaml() { grep -E "^[[:space:]]*$1:" "${KURTOSIS_ARGS_FILE:-$K/args.yaml}" 2>/dev/null | head -1 \
-    | sed -E 's/^[^:]*:[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//'; }
-FUND_FROM_KEY="${EEZ_FUND_FROM_KEY:-${EEZ_PROOF_SIGNER_KEY:-$(_yaml proof_signer_key)}}"
+FUND_FROM_KEY="${EEZ_FUND_FROM_KEY:-${EEZ_PROOF_SIGNER_KEY:-$(yaml_value proof_signer_key)}}"
 [[ -n "$FUND_FROM_KEY" ]] || { echo "could not resolve a funding key — set EEZ_FUND_FROM_KEY or check $K/args.yaml"; exit 1; }
 L1_SETUP_KEY="${EEZ_L1_SETUP_KEY:-$FUND_FROM_KEY}"
 
@@ -93,17 +92,6 @@ echo "    L2 front     = $L2F   (Outbound)"
 echo "    registry     = $EEZ_REGISTRY_ADDRESS  rollupId=${EEZ_ROLLUP_ID:-?}"
 echo "    users        = inbound:$HH_ADDR_IN outbound:$HH_ADDR_OUT"
 
-# Retry a read-only command (survives transient RPC hiccups under load).
-retry() {
-    local n=0 max="${RETRY_MAX:-6}" delay="${RETRY_DELAY:-3}" out rc
-    while :; do
-        out=$("$@" 2>&1); rc=$?
-        (( rc == 0 )) && { printf '%s' "$out"; return 0; }
-        (( ++n >= max )) && { echo "retry: '$*' failed after $n attempts: $out" >&2; return "$rc"; }
-        sleep "$delay"
-    done
-}
-
 # ── Reachability ─────────────────────────────────────────────────────
 L1_UP=$(cast block-number --rpc-url "$L1" 2>/dev/null || echo "")
 [[ -n "$L1_UP" ]] || { echo "L1 RPC $L1 not reachable — is the enclave up?"; exit 1; }
@@ -111,35 +99,8 @@ L2_UP=$(cast block-number --rpc-url "$L2" 2>/dev/null || echo "")
 [[ -n "$L2_UP" ]] || { echo "L2 RPC $L2 not reachable"; exit 1; }
 echo "    L1=$L1_UP L2=$L2_UP"
 
-PRIORITY_GAS_PRICE="${EEZ_TEST_PRIORITY_GAS_PRICE_WEI:-1}"
-
-gas_price_for() { # <rpc> -> max fee in wei
-    local rpc="$1" gp base_hex base minimum
-    gp=$(cast gas-price --rpc-url "$rpc" 2>/dev/null || echo 1000000000)
-    gp="${EEZ_TEST_GAS_PRICE_WEI:-$gp}"
-    base_hex=$(cast block latest --field baseFeePerGas --rpc-url "$rpc" 2>/dev/null || echo 0)
-    base=$(cast to-dec "$base_hex" 2>/dev/null || echo 0)
-    minimum=$((2 * base + PRIORITY_GAS_PRICE))
-    (( gp < minimum )) && gp="$minimum"
-    echo "$gp"
-}
-
-fund_l1() {
-    local to="$1" from_addr nonce
-    from_addr=$(cast wallet address --private-key "$FUND_FROM_KEY")
-    nonce=$(retry cast nonce "$from_addr" --rpc-url "$L1")
-    cast send "$to" --value 10ether --private-key "$FUND_FROM_KEY" --nonce "$nonce" \
-        --gas-price "$(gas_price_for "$L1")" \
-        --priority-gas-price "$PRIORITY_GAS_PRICE" --rpc-url "$L1" >/dev/null
-}
-
-fund_l2() {
-    local to="$1" nonce
-    nonce=$(retry cast nonce "$HH_KEY_2_ADDR" --rpc-url "$L2")
-    cast send "$to" --value 10ether --private-key "$HH_KEY_2" --nonce "$nonce" \
-        --gas-price "$(gas_price_for "$L2")" \
-        --priority-gas-price "$PRIORITY_GAS_PRICE" --rpc-url "$L2" >/dev/null
-}
+fund_l1() { fund "$L1" "$FUND_FROM_KEY" "$1"; }
+fund_l2() { fund "$L2" "$HH_KEY_2" "$1"; }
 
 # ── Fund L1-side actors ──────────────────────────────────────────────
 for k in "${L1_FUNDED_KEYS[@]}"; do
@@ -161,30 +122,18 @@ if [[ "$(cast balance "$HH_ADDR_OUT" --rpc-url "$L2" 2>/dev/null || echo 0)" == 
     fund_l2 "$HH_ADDR_OUT" || { echo "failed to fund $HH_ADDR_OUT on L2"; exit 1; }
 fi
 
-forge_deploy() { # <rpc> <key> <script:contract> <sig> <args...>  → echoes forge stdout
-    local rpc="$1" key="$2" sc="$3" sig="$4" gas_price out; shift 4
-    gas_price=$(gas_price_for "$rpc")
-    if ! out=$(cd "$REPO/contracts" && forge script "script/$sc" --sig "$sig" "$@" \
-        --rpc-url "$rpc" --broadcast --private-key "$key" --gas-price "$gas_price" --skip-simulation 2>&1); then
-        printf '%s\n' "$out" >&2
-        return 1
-    fi
-    printf '%s\n' "$out"
-}
-grab() { grep -oE "$1=0x[0-9a-fA-F]{40}" | head -1 | cut -d= -f2; }
-
 # ── Deploy L2 targets (Value + ValueNoRet) ───────────────────────────
 echo "==> deploying L2 targets (Value, ValueNoRet)"
-L2_VALUE=$(forge_deploy "$L2" "$HH_KEY_2" DeployValueL2.s.sol:DeployValueL2 'run(uint256)' 0 | grab EEZ_VALUE_ADDRESS)
-L2_VALUE_NORET=$(forge_deploy "$L2" "$HH_KEY_2" DeployValueNoRetL2.s.sol:DeployValueNoRetL2 'run(uint256)' 0 | grab EEZ_VALUE_NORET_ADDRESS)
+L2_VALUE=$(forge_deploy "$L2" "$HH_KEY_2" DeployValueL2.s.sol:DeployValueL2 'run(uint256)' 0 | grab_address EEZ_VALUE_ADDRESS)
+L2_VALUE_NORET=$(forge_deploy "$L2" "$HH_KEY_2" DeployValueNoRetL2.s.sol:DeployValueNoRetL2 'run(uint256)' 0 | grab_address EEZ_VALUE_NORET_ADDRESS)
 [[ -n "$L2_VALUE" && -n "$L2_VALUE_NORET" ]] || { echo "L2 target deploy failed"; exit 1; }
 echo "    L2 Value=$L2_VALUE  ValueNoRet=$L2_VALUE_NORET"
 
 # ── Deploy L1 outbound targets (Value + ValueNoRet on L1) ────────────
 if [[ "$MODE" == outbound || "$MODE" == mixed || "$MODE" == mixed-pure ]]; then
     echo "==> deploying L1 outbound targets (Value, ValueNoRet on L1)"
-    L1_VALUE=$(forge_deploy "$L1" "$L1_SETUP_KEY" DeployValueL2.s.sol:DeployValueL2 'run(uint256)' 0 | grab EEZ_VALUE_ADDRESS)
-    L1_VALUE_NORET=$(forge_deploy "$L1" "$L1_SETUP_KEY" DeployValueNoRetL2.s.sol:DeployValueNoRetL2 'run(uint256)' 0 | grab EEZ_VALUE_NORET_ADDRESS)
+    L1_VALUE=$(forge_deploy "$L1" "$L1_SETUP_KEY" DeployValueL2.s.sol:DeployValueL2 'run(uint256)' 0 | grab_address EEZ_VALUE_ADDRESS)
+    L1_VALUE_NORET=$(forge_deploy "$L1" "$L1_SETUP_KEY" DeployValueNoRetL2.s.sol:DeployValueNoRetL2 'run(uint256)' 0 | grab_address EEZ_VALUE_NORET_ADDRESS)
     [[ -n "$L1_VALUE" && -n "$L1_VALUE_NORET" ]] || { echo "L1 target deploy failed"; exit 1; }
     echo "    L1 Value=$L1_VALUE  ValueNoRet=$L1_VALUE_NORET"
 fi
@@ -195,28 +144,7 @@ L2_CHAIN_ID=$(cast chain-id --rpc-url "$L2")
 # L1 proxy = createCrossChainProxy(target_on_L2, rid=EEZ_ROLLUP_ID) on the L1 EEZ.
 create_l1_proxy() { # <target_on_L2> → proxy addr
     forge_deploy "$L1" "$L1_SETUP_KEY" CreateValueProxy.s.sol:CreateValueProxy \
-        'run(address,address,uint64)' "$EEZ_REGISTRY_ADDRESS" "$1" "$EEZ_ROLLUP_ID" | grab EEZ_VALUE_PROXY
-}
-# L2 proxy = computeCrossChainProxyAddress(target_on_L1, MAINNET) then
-# createCrossChainProxy on the L2 CCM (a PURE L2 tx → normal L2 RPC).
-create_l2_proxy() { # <target_on_L1> → proxy addr
-    local tgt="$1" p code nonce raw
-    p=$(cast call "$EEZL2_ADDRESS" 'computeCrossChainProxyAddress(address,uint64)(address)' "$tgt" "$MAINNET_RID" --rpc-url "$L2" | tr -d '[:space:]')
-    code=$(cast code "$p" --rpc-url "$L2" 2>/dev/null || echo 0x)
-    if [[ "$code" == "0x" || -z "$code" ]]; then
-        nonce=$(cast nonce "$HH_KEY_2_ADDR" --rpc-url "$L2")
-        raw=$(cast mktx --rpc-url "$L2" --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_2" --nonce "$nonce" \
-            --gas-limit 1500000 --gas-price "$(gas_price_for "$L2")" \
-            "$EEZL2_ADDRESS" 'createCrossChainProxy(address,uint64)' "$tgt" "$MAINNET_RID")
-        curl -s -X POST "$L2" -H 'Content-Type: application/json' \
-            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"],\"id\":1}" >/dev/null
-        for _ in $(seq 1 30); do
-            code=$(cast code "$p" --rpc-url "$L2" 2>/dev/null || echo 0x)
-            [[ "$code" != "0x" && -n "$code" ]] && break
-            sleep 1
-        done
-    fi
-    echo "$p"
+        'run(address,address,uint64)' "$EEZ_REGISTRY_ADDRESS" "$1" "$EEZ_ROLLUP_ID" | grab_address EEZ_VALUE_PROXY
 }
 
 echo "==> creating cross-chain proxies for the active mode"
@@ -228,18 +156,18 @@ if [[ "$MODE" == inbound || "$MODE" == mixed || "$MODE" == mixed-pure ]]; then
         || { echo "inbound proxy creation failed"; exit 1; }
     echo "    inbound proxies: setter=$IN_VALUE_PROXY noret=$IN_NORET_PROXY deposit=$IN_DEP_PROXY"
     # Inbound wrapper on L1 over the setter proxy.
-    IN_WRAPPER=$(forge_deploy "$L1" "$L1_SETUP_KEY" DeploySetterWrapperL1.s.sol:DeploySetterWrapperL1 'run(address)' "$IN_VALUE_PROXY" | grab EEZ_SETTER_WRAPPER)
+    IN_WRAPPER=$(forge_deploy "$L1" "$L1_SETUP_KEY" DeploySetterWrapperL1.s.sol:DeploySetterWrapperL1 'run(address)' "$IN_VALUE_PROXY" | grab_address EEZ_SETTER_WRAPPER)
     echo "    inbound wrapper (L1) = $IN_WRAPPER"
 fi
 if [[ "$MODE" == outbound || "$MODE" == mixed || "$MODE" == mixed-pure ]]; then
-    OUT_VALUE_PROXY=$(create_l2_proxy "$L1_VALUE")
-    OUT_NORET_PROXY=$(create_l2_proxy "$L1_VALUE_NORET")
-    OUT_WD_PROXY=$(create_l2_proxy "$L1_WD_RECIPIENT")
+    OUT_VALUE_PROXY=$(create_l2_proxy "$L1_VALUE" "$HH_KEY_2" "$MAINNET_RID")
+    OUT_NORET_PROXY=$(create_l2_proxy "$L1_VALUE_NORET" "$HH_KEY_2" "$MAINNET_RID")
+    OUT_WD_PROXY=$(create_l2_proxy "$L1_WD_RECIPIENT" "$HH_KEY_2" "$MAINNET_RID")
     [[ -n "$OUT_VALUE_PROXY" && -n "$OUT_NORET_PROXY" && -n "$OUT_WD_PROXY" ]] \
         || { echo "outbound proxy creation failed"; exit 1; }
     echo "    outbound proxies: setter=$OUT_VALUE_PROXY noret=$OUT_NORET_PROXY withdraw=$OUT_WD_PROXY"
     # Outbound wrapper on L2 over the outbound setter proxy.
-    OUT_WRAPPER=$(forge_deploy "$L2" "$HH_KEY_2" DeploySetterWrapperL1.s.sol:DeploySetterWrapperL1 'run(address)' "$OUT_VALUE_PROXY" | grab EEZ_SETTER_WRAPPER)
+    OUT_WRAPPER=$(forge_deploy "$L2" "$HH_KEY_2" DeploySetterWrapperL1.s.sol:DeploySetterWrapperL1 'run(address)' "$OUT_VALUE_PROXY" | grab_address EEZ_SETTER_WRAPPER)
     echo "    outbound wrapper (L2) = $OUT_WRAPPER"
 fi
 
@@ -256,7 +184,6 @@ PURE_RECIPIENT=0x2222222222222222222222222222222222222222
 
 refresh_node_log() { docker logs "$(docker ps --format "{{.Names}}" | grep -m1 "eez-node--")" >"$NODE_LOG" 2>&1 || true; }
 refresh_signer_log() { docker logs "$(docker ps --format "{{.Names}}" | grep -m1 "eez-proof-signer--")" >"$SIGNER_LOG" 2>&1 || true; }
-strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
 
 # The relay needs a few L1 slots before it includes anything. Firing into that
 # window burns MAX_BUNDLE_ATTEMPTS and evicts the ops as poison — a harness
@@ -290,24 +217,17 @@ wait_for_builder() {
     done
 }
 
-# receipt_status <hash> <rpc> → "1" mined-ok, "0x0" reverted, "missing"
-receipt_status() {
-    local r st
-    r=$(timeout 3 curl -s -X POST -H 'Content-Type: application/json' \
-        --data "{\"jsonrpc\":\"2.0\",\"method\":\"eth_getTransactionReceipt\",\"params\":[\"$1\"],\"id\":1}" \
-        "$2" 2>/dev/null)
-    st=$(echo "$r" | jq -r '.result.status // "missing"' 2>/dev/null)
-    [[ "$st" == "0x1" ]] && echo "1" || echo "${st:-missing}"
-}
-
+# The signal fires only after the held-pool chain eviction completes, so the
+# receipt check below cannot race it.
 wait_for_poison_eviction() {
-    local hash="$1" rpc="$2" signal="$3" label="$4"
+    local hash="$1" rpc="$2" direction="$3" label="$4"
     local deadline=$((SECONDS + ${EEZ_REVERT_EVICTION_WAIT_SECS:-60})) evidence
     while (( SECONDS < deadline )); do
         refresh_node_log
         evidence=$(strip_ansi <"$NODE_LOG" \
-            | grep -F "test_signal=\"$signal\"" \
+            | grep -F 'test_signal="eez.composer.cc_compose.poison_eviction_completed"' \
             | grep -F "tx_hash=$hash" \
+            | grep -E "direction=\"?$direction\"?" \
             | tail -1 || true)
         if [[ -n "$evidence" && "$(receipt_status "$hash" "$rpc")" == "missing" ]]; then
             return 0
@@ -327,27 +247,6 @@ wait_nonce_at_least() {
         sleep 5
     done
     echo "    ✗ timed out waiting for $label nonce >= $want" >&2
-    return 1
-}
-
-# send_front <front_url> <raw_tx> — eth_sendRawTransaction to a cross-chain
-# front; fails loud if the admission gate rejects (invariant 7 is LOUD).
-send_front() {
-    local resp i rc
-    # Fronts refuse submissions until the node reconciles with L1; wait that
-    # out. Any other error is fatal.
-    for i in $(seq 1 120); do
-        resp=$(curl -sS --max-time 10 -X POST "$1" -H 'Content-Type: application/json' \
-            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$2\"],\"id\":1}" 2>/dev/null); rc=$?
-        # Empty body = no answer. Without this the grep below misses and a tx
-        # that was NEVER SENT reports success.
-        (( rc == 0 )) && [[ -n "$resp" ]] || {
-            echo "    ✗ submit failed (curl rc=$rc, ${#resp} byte body)" >&2; return 1; }
-        grep -q '"error"' <<<"$resp" || return 0
-        grep -q 'starting up' <<<"$resp" || { echo "    ✗ front rejected tx: $resp" >&2; return 1; }
-        sleep 1
-    done
-    echo "    ✗ front still starting up after 120s" >&2
     return 1
 }
 
@@ -427,11 +326,11 @@ run_waves() {
         [[ "$raw" =~ ^0x[0-9a-fA-F]+$ ]] || { echo "    ✗ mktx failed ($side:$kind): $raw"; exit 1; }
         hash=$(cast keccak "$raw")
         if [[ "$side" == in ]]; then
-            send_front "$L1F" "$raw" || exit 1
+            send_front "$L1F" "$raw" "$hash" || exit 1
             if [[ "$kind" == rev ]]; then REV_IN_HASHES+=("$hash"); REV_IN_NONCE=$((REV_IN_NONCE + 1));
             else IN_HASHES+=("$hash"); IN_NONCE=$((IN_NONCE + 1)); fi
         else
-            send_front "$L2F" "$raw" || exit 1
+            send_front "$L2F" "$raw" "$hash" || exit 1
             if [[ "$kind" == rev ]]; then REV_OUT_HASHES+=("$hash"); REV_OUT_NONCE=$((REV_OUT_NONCE + 1));
             else OUT_HASHES+=("$hash"); OUT_NONCE=$((OUT_NONCE + 1)); fi
         fi
@@ -556,16 +455,14 @@ run_waves() {
         for rh in "${REV_IN_HASHES[@]:-}"; do
             [[ -n "$rh" ]] || continue
             rev_total=$((rev_total+1))
-            if wait_for_poison_eviction "$rh" "$L1" \
-                "eez.composer.cc_compose.inbound_poison_evicted" "inbound revert op"; then
+            if wait_for_poison_eviction "$rh" "$L1" Inbound "inbound revert op"; then
                 rev_ok=$((rev_ok+1))
             fi
         done
         for rh in "${REV_OUT_HASHES[@]:-}"; do
             [[ -n "$rh" ]] || continue
             rev_total=$((rev_total+1))
-            if wait_for_poison_eviction "$rh" "$L2" \
-                "eez.composer.cc_compose.outbound_poison_evicted" "outbound revert op"; then
+            if wait_for_poison_eviction "$rh" "$L2" Outbound "outbound revert op"; then
                 rev_ok=$((rev_ok+1))
             fi
         done

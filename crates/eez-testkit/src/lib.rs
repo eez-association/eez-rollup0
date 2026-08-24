@@ -87,16 +87,23 @@ pub mod signals {
     pub const COMPOSER_PHASE1_BUNDLE_DISPATCHED: &str = "eez.composer.phase1.bundle.dispatched";
     pub const COMPOSER_OUTBOUND_MULTICALL_UNSUPPORTED: &str =
         "eez.composer.cc_compose.outbound_multicall_unsupported";
-    pub const COMPOSER_INBOUND_POISON_EVICTED: &str =
-        "eez.composer.cc_compose.inbound_poison_evicted";
-    pub const COMPOSER_OUTBOUND_POISON_EVICTED: &str =
-        "eez.composer.cc_compose.outbound_poison_evicted";
+    pub const COMPOSER_POISON_EVICTION_COMPLETED: &str =
+        "eez.composer.cc_compose.poison_eviction_completed";
     pub const FOLLOWER_HEAD_ADVANCED: &str = "eez.node.follower.head.advanced";
     pub const FOLLOWER_HEAD_SYNCING: &str = "eez.node.follower.head.syncing";
     pub const L1_REORG_DETECTED: &str = "eez.l1_watcher.reorg.detected";
     pub const TX_NONCE_CHAIN_EVICTED: &str = "eez.composer.recovery.nonce_chain_evicted";
     pub const TX_POISON_EVICTED: &str = "eez.composer.recovery.poison_evicted";
 }
+
+pub const FATAL_SIGNALS: &[&str] = &[
+    signals::NODE_PANIC,
+    signals::NODE_BOOT_CATCH_UP_FAILED,
+    signals::DERIVER_RESYNC_FAILED,
+    signals::DERIVER_COMMITTER_CLOSED,
+    signals::DERIVER_STATE_DIVERGED_PRE,
+    signals::DERIVER_STATE_DIVERGED_POST,
+];
 
 /// One machine-readable tracing record emitted by an EEZ process.
 #[derive(Clone, Debug)]
@@ -1488,9 +1495,6 @@ impl NodeHandle {
         .with_context(|| format!("{} deriver missed the reorg", self.name))
     }
 
-    /// Assert that the node process is still running. `Child::try_wait`
-    /// reaps and reports an exited child, unlike a PID signal probe, which
-    /// also succeeds for an unreaped zombie process.
     pub fn assert_no_process_death(&self) {
         if let Some(status) = self.exit_status() {
             panic!(
@@ -1499,6 +1503,12 @@ impl NodeHandle {
                 self.log_tail(80),
             );
         }
+        assert_eq!(
+            self.count_signals(FATAL_SIGNALS).unwrap(),
+            0,
+            "{} emitted a panic, divergence, or fatal-lifecycle signal",
+            self.name,
+        );
         assert_eq!(
             self.log_count_matching(&["Fatal", "UnexpectedStaticFile"])
                 .unwrap(),
@@ -1510,16 +1520,6 @@ impl NodeHandle {
 
     pub fn assert_no_divergence_failure_logs(&self) {
         self.assert_no_process_death();
-        assert_eq!(
-            self.count_signals(&[
-                signals::DERIVER_STATE_DIVERGED_PRE,
-                signals::DERIVER_STATE_DIVERGED_POST,
-            ])
-            .unwrap(),
-            0,
-            "{} emitted a state-divergence signal",
-            self.name,
-        );
         assert_eq!(
             self.log_count_matching(&[
                 "engine rejected safe/finalized FCU",
@@ -1793,23 +1793,25 @@ where
     Fut: std::future::Future<Output = Result<Option<T>>>,
 {
     let deadline = Instant::now() + timeout;
+    let mut last_error: Option<anyhow::Error> = None;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
         match tokio::time::timeout(remaining, f()).await {
-            Ok(result) => {
-                if let Some(v) = result? {
-                    return Ok(v);
-                }
-            }
+            Ok(Ok(Some(value))) => return Ok(value),
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => last_error = Some(error),
             Err(_) => break,
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         tokio::time::sleep(remaining.min(Duration::from_millis(500))).await;
     }
-    bail!("timed out after {timeout:?}");
+    match last_error {
+        Some(error) => Err(error.context(format!("timed out after {timeout:?}; last poll failed"))),
+        None => bail!("timed out after {timeout:?}"),
+    }
 }
 
 /// Registry counters and roots read from one L1 block.
@@ -3072,7 +3074,7 @@ impl CrossChainConfig {
 }
 
 pub const SETUP_TIMEOUT: Duration = Duration::from_secs(90);
-pub const SETTLE_TIMEOUT: Duration = Duration::from_mins(5);
+pub const SETTLE_TIMEOUT: Duration = Duration::from_secs(90);
 const CROSS_CHAIN_L1_BLOCK_TIME_MS: u64 = 5_000;
 const CROSS_CHAIN_L2_BLOCK_TIME_MS: u64 = 1_000;
 const CROSS_CHAIN_SYNC_INTERVAL: u64 = CROSS_CHAIN_L1_BLOCK_TIME_MS / CROSS_CHAIN_L2_BLOCK_TIME_MS;
@@ -3478,17 +3480,10 @@ impl StandardOracleSnapshot {
                     | signals::DERIVER_REORG_NOOP
             )
         });
-        if records.iter().any(|record| {
-            matches!(
-                record.name.as_str(),
-                signals::DERIVER_STATE_DIVERGED_PRE
-                    | signals::DERIVER_STATE_DIVERGED_POST
-                    | signals::DERIVER_RESYNC_FAILED
-                    | signals::DERIVER_COMMITTER_CLOSED
-                    | signals::NODE_BOOT_CATCH_UP_FAILED
-                    | signals::NODE_PANIC
-            )
-        }) {
+        if records
+            .iter()
+            .any(|record| FATAL_SIGNALS.contains(&record.name.as_str()))
+        {
             bail!("{scenario_name}: node emitted a divergence, fatal, or panic signal");
         }
         // The scenario runner only submits valid calls, so any eviction is a bug.
@@ -3883,7 +3878,7 @@ pub async fn run_scenarios(
 
 /// Start the shared cross-chain fixture.
 pub async fn setup_cross_chain() -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(None, None, &[]).await
+    setup_cross_chain_inner(None, None).await
 }
 
 /// Starts the fixture with a mutation proxy and expected attester override.
@@ -3891,7 +3886,7 @@ pub async fn setup_cross_chain_proxied(
     mutation: ProverMutation,
     attester: Address,
 ) -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(Some(mutation), Some(attester), &[]).await
+    setup_cross_chain_inner(Some(mutation), Some(attester)).await
 }
 
 pub async fn setup_cross_chain_empty_call() -> Result<CrossChainEmptyCallWorld> {
@@ -4034,17 +4029,9 @@ pub async fn setup_cross_chain_codeless() -> Result<CrossChainCodelessWorld> {
     })
 }
 
-/// Start the fixture with additional node environment variables.
-pub async fn setup_cross_chain_with_env(
-    extra_env: &[(&'static str, String)],
-) -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(None, None, extra_env).await
-}
-
 async fn setup_cross_chain_inner(
     mutation: Option<ProverMutation>,
     attester_override: Option<Address>,
-    extra_env: &[(&'static str, String)],
 ) -> Result<CrossChainWorld> {
     let cfg = CrossChainConfig::new()?;
     let signer_attester = signer_address(cfg.deployer_key)?;
@@ -4077,7 +4064,6 @@ async fn setup_cross_chain_inner(
             witness_dir.path().to_string_lossy().into_owned(),
         ),
     ]);
-    env.extend_from_slice(extra_env);
     assert!(
         !env.iter().any(|(name, _)| *name == "EEZ_PROOF_SIGNER_KEY"),
         "remote composer environment must not contain the proof-signer key",
