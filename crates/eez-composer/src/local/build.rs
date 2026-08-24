@@ -151,8 +151,8 @@ fn open_draft_db(
     Ok(builder.build())
 }
 
-/// Build a Sync block on top of `parent`, executing `system_txs` (raw
-/// EIP-2718 bytes from the per-rollup `HeldPool`) in order.
+/// Build a Sync block on top of `parent`, executing `sync_txs` in order. The
+/// list is mixed: outbound pairs interleave a system load with its user tx.
 ///
 /// The returned [`BuiltSyncBlock`] is committed via
 /// [`BlockCommitterHandle::commit_derived`] — same engine-API tail
@@ -170,7 +170,7 @@ pub fn build_sync_block<P>(
     parent: &SealedHeader<Header>,
     timestamp: u64,
     suggested_fee_recipient: Address,
-    system_txs: &[Bytes],
+    sync_txs: &[Bytes],
 ) -> Result<BuiltSyncBlock, BuildError>
 where
     P: StateProviderFactory,
@@ -195,7 +195,7 @@ where
         .apply_pre_execution_changes()
         .map_err(|e| BuildError::Builder(format!("apply_pre_execution_changes: {e}")))?;
 
-    for (idx, tx_bytes) in system_txs.iter().enumerate() {
+    for (idx, tx_bytes) in sync_txs.iter().enumerate() {
         builder
             .execute_transaction(recover_tx(tx_bytes, idx)?)
             .map_err(|e| BuildError::ExecuteTx {
