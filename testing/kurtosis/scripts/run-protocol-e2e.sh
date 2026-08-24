@@ -11,18 +11,14 @@ RESULT_DIR="${EEZ_CI_RESULT_DIR:-$REPO/artifacts/kurtosis-e2e}/protocol-e2e"
 
 SUPPORTED_TARGETS=(
     one_way                           # bridge, counter, and counterL2
-    revert/L1_to_L2/revertCounter     # one-hop forced-revert scenario
 )
 
 UNSUPPORTED_TARGETS=(
-    multi_call                         # nested replay
-    multi_tx                           # chained state
-    nested                             # nested replay
-    reentrant                          # reentrancy
-    revert/L1_to_L2/nestedCallRevert   # nested replay
-    revert/L1_to_L2/revertContinue     # nested replay
-    revert/L2_to_L1/revertContinueL2   # nested replay
-    revert/L2_to_L1/revertCounterL2    # L2-to-L1 forced revert
+    multi_call   # nested replay
+    multi_tx     # chained state
+    nested       # nested replay
+    reentrant    # reentrancy
+    revert       # forced revert
 )
 
 for tool in bash bc cast forge git jq kurtosis; do
