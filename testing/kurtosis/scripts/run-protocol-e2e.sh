@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run supported eez-core-protocol scenario categories against the CI enclave.
+# Run supported eez-core-protocol scenarios against the CI enclave.
 # The full scenario suite runs separately against Anvil in the normal CI.
 set -euo pipefail
 
@@ -9,17 +9,20 @@ PROTOCOL="$REPO/eez-core-protocol"
 ENCLAVE="${KURTOSIS_ENCLAVE:-eez-ci}"
 RESULT_DIR="${EEZ_CI_RESULT_DIR:-$REPO/artifacts/kurtosis-e2e}/protocol-e2e"
 
-# Only one-way scenarios run on the network path today.
-SUPPORTED_CATEGORIES=(one_way)
+SUPPORTED_TARGETS=(
+    one_way                           # bridge, counter, and counterL2
+    revert/L1_to_L2/revertCounter     # one-hop forced-revert scenario
+)
 
-# These categories need capabilities the Kurtosis network path lacks (chained
-# state, nested replay, reentrancy); they stay Anvil-only for now.
-UNSUPPORTED_CATEGORIES=(
-    multi_call
-    multi_tx
-    nested
-    reentrant
-    revert
+UNSUPPORTED_TARGETS=(
+    multi_call                         # nested replay
+    multi_tx                           # chained state
+    nested                             # nested replay
+    reentrant                          # reentrancy
+    revert/L1_to_L2/nestedCallRevert   # nested replay
+    revert/L1_to_L2/revertContinue     # nested replay
+    revert/L2_to_L1/revertContinueL2   # nested replay
+    revert/L2_to_L1/revertCounterL2    # L2-to-L1 forced revert
 )
 
 for tool in bash bc cast forge git jq kurtosis; do
@@ -47,14 +50,13 @@ trap 'rm -rf "$deploy_dir"' EXIT
 
 kurtosis files download "$ENCLAVE" eez-deployments "$deploy_dir" >/dev/null
 set -a
-# shellcheck disable=SC1091
 source "$deploy_dir/deployments.env"
 set +a
 
 ROLLUPS="${ROLLUPS:-$EEZ_REGISTRY_ADDRESS}"
 MANAGER_L2="${MANAGER_L2:-${EEZL2_ADDRESS:-0x4200000000000000000000000000000000000007}}"
 
-# Hardhat account #2, prefunded on both chains.
+# Hardhat account #2, shared with the earlier cross-chain wave.
 PK="${PK:-0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a}"
 SENDER="$(cast wallet address --private-key "$PK")"
 
@@ -73,7 +75,7 @@ echo "    registry:     $ROLLUPS"
         --rollups "$ROLLUPS"
 )
 
-# prepare-network.sh only warns when the L2 funding bridge does not land.
+# prepare-network.sh only warns if its L2 funding bridge fails.
 min_l2_balance=10000000000000000
 l2_balance="$(cast balance "$SENDER" --rpc-url "$L2_RPC")"
 if (( $(echo "$l2_balance < $min_l2_balance" | bc) )); then
@@ -95,7 +97,7 @@ ENV
 if [[ -n "${EEZ_PROTOCOL_SCENARIOS:-}" ]]; then
     read -r -a targets <<<"$EEZ_PROTOCOL_SCENARIOS"
 else
-    targets=("${SUPPORTED_CATEGORIES[@]}")
+    targets=("${SUPPORTED_TARGETS[@]}")
 fi
 
 run_log="$RESULT_DIR/network-sequential.log"
@@ -132,7 +134,7 @@ jq -n \
     --argjson failed "$(json_array ${failed[@]+"${failed[@]}"})" \
     --argjson skipped "$(json_array ${skipped[@]+"${skipped[@]}"})" \
     --argjson targets "$(json_array ${targets[@]+"${targets[@]}"})" \
-    --argjson unsupported "$(json_array "${UNSUPPORTED_CATEGORIES[@]}")" \
+    --argjson unsupported "$(json_array "${UNSUPPORTED_TARGETS[@]}")" \
     '{protocol_commit: $protocol_commit, targets: $targets, passed: $passed,
       failed: $failed, skipped: $skipped, unsupported: $unsupported}' \
     >"$RESULT_DIR/summary.json"
@@ -142,11 +144,11 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     {
         echo "### Protocol network E2E"
         echo
-        echo "- Categories run: ${targets[*]}"
+        echo "- Targets run: ${targets[*]}"
         echo "- Passed: ${#passed[@]}"
         echo "- Failed: ${#failed[@]}"
         echo "- Skipped (local-only): ${#skipped[@]}"
-        echo "- Unsupported network categories: ${UNSUPPORTED_CATEGORIES[*]}"
+        echo "- Unsupported on this node: ${UNSUPPORTED_TARGETS[*]}"
     } >>"$GITHUB_STEP_SUMMARY"
 fi
 

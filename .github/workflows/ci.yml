@@ -83,7 +83,9 @@ jobs:
         run: forge test
       - name: Test core protocol contracts
         working-directory: eez-core-protocol
-        run: forge test --no-match-test 'test_Doc_OriginalValue_SeedInSetup|test_PostCost_Incremental'
+        run: >-
+          forge test --no-match-path 'script/*'
+          --no-match-test 'test_Doc_OriginalValue_SeedInSetup|test_PostCost_Incremental'
 
   dependency-audit:
     name: Dependency Audit
