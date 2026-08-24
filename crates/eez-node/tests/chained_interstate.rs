@@ -18,7 +18,7 @@ use eez_protocol::{EEZL2_ADDRESS, EvmBatch, entries::decode_postbatch};
 
 mod common;
 use common::{
-    ANVIL_KEY_5, CrossChainState, DEV_CHAIN_ID, ICounter, IEEZ, INBOUND_USER, OUTBOUND_USER,
+    ANVIL_KEY_6, CrossChainWorld, DEV_CHAIN_ID, ICounter, IEEZ, INBOUND_USER, OUTBOUND_USER,
     SETTLE_TIMEOUT, TARGET_DEPLOYER, batches_posted, counter_count, create_cross_chain_proxy,
     create_l2_cross_chain_proxy, deploy_counter, pending_nonce, receipt_ok,
     setup_cross_chain_with_env, sign_and_send, state_root, wait_for,
@@ -158,7 +158,7 @@ async fn wait_for_count(rpc_url: &str, counter: Address, expected: u64, label: &
 }
 
 /// L1's stored `rollups[rid].stateRoot` must equal the L2 safe block's root.
-async fn assert_reconciled(w: &CrossChainState) {
+async fn assert_reconciled(w: &CrossChainWorld) {
     let (eez, rollup_id) = (w.cfg.eez_address, w.cfg.rollup_id);
     let (l1_rpc, l2_rpc) = (w.l1_rpc(), w.l2_rpc());
     wait_for(SETTLE_TIMEOUT, || {
@@ -183,7 +183,7 @@ async fn assert_reconciled(w: &CrossChainState) {
 /// transactions at the ingress front takes ~100ms against that. Co-bundling is
 /// still asserted from the posted batch itself, so a missed window fails the
 /// test instead of quietly weakening it.
-async fn open_drain_window(w: &CrossChainState) {
+async fn open_drain_window(w: &CrossChainWorld) {
     let (l1_rpc, eez, from) = (w.l1_rpc(), w.cfg.eez_address, w.dep.deploy_block);
     let before = batches_posted(&l1_rpc, eez, from).await.unwrap();
     wait_for(SETTLE_TIMEOUT, || {
@@ -194,13 +194,13 @@ async fn open_drain_window(w: &CrossChainState) {
     .expect("composer never posted a batch; cannot align on a drain window");
 }
 
-async fn batches(w: &CrossChainState) -> Vec<EvmBatch> {
+async fn batches(w: &CrossChainWorld) -> Vec<EvmBatch> {
     posted_batches(&w.l1_rpc(), w.cfg.eez_address, w.dep.deploy_block)
         .await
         .expect("read posted batches")
 }
 
-fn assert_no_evictions(w: &CrossChainState) {
+fn assert_no_evictions(w: &CrossChainWorld) {
     assert_eq!(
         w.node.log_count_matching(&["evicting", "evicted"]).unwrap(),
         0,
@@ -483,9 +483,9 @@ async fn poison_mid_bundle_leaves_survivors_correct() {
     nonce += 1;
     let poison = sign_and_send(
         &w.l1_xchain(),
-        ANVIL_KEY_5,
+        ANVIL_KEY_6,
         DEV_CHAIN_ID,
-        pending_nonce(&l1_rpc, ANVIL_KEY_5).await.unwrap(),
+        pending_nonce(&l1_rpc, ANVIL_KEY_6).await.unwrap(),
         Some(w.recipient), // plain address: never a cross-chain proxy on L1
         U256::ZERO,
         ICounter::incrementCall {}.abi_encode(),
