@@ -34,13 +34,20 @@ const WAVE_DEPOSITS: &[u128] = &[
 async fn assert_all_transactions_succeeded(rpc_url: &str, hashes: &[TxHash], label: &str) {
     assert!(!hashes.is_empty(), "no {label} transactions were submitted");
     for &hash in hashes {
-        let rpc_url = rpc_url.to_owned();
-        let status = wait_for(SETTLE_TIMEOUT, move || {
-            let rpc_url = rpc_url.clone();
-            async move { receipt_ok(&rpc_url, hash).await }
-        })
-        .await
-        .unwrap_or_else(|err| panic!("{label} transaction {hash} did not land: {err:#}"));
+        let landed = wait_for(
+            SETTLE_TIMEOUT,
+            || async move { receipt_ok(rpc_url, hash).await },
+        )
+        .await;
+        let status = match landed {
+            Ok(status) => status,
+            Err(err) => {
+                panic!(
+                    "{label} transaction {hash} did not land: {err:#}{}",
+                    w.settlement_diagnostics()
+                );
+            }
+        };
         assert!(status, "{label} transaction {hash} reverted");
     }
 }
@@ -574,12 +581,14 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
         }
 
         assert_all_transactions_succeeded(
+            &w,
             &l1_rpc,
             &inbound_hashes[inbound_wave_start..],
             "inbound wave",
         )
         .await;
         assert_all_transactions_succeeded(
+            &w,
             &l2_rpc,
             &outbound_hashes[outbound_wave_start..],
             "outbound wave",
@@ -613,9 +622,13 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
     wait_for(SETTLE_TIMEOUT, || {
         let l1_rpc = l1_rpc.clone();
         async move {
-            Ok((l2_value(&l1_rpc, w.outbound_value).await?
-                == U256::from(*WAVE_SETTERS.last().unwrap() + 100))
-            .then_some(()))
+            let converged = l2_value(&l2_rpc, w.value_l2).await? == setter_final
+                && l2_value(&l1_rpc, w.outbound_value).await? == setter_final
+                && value_no_ret(&l2_rpc, w.inbound_no_ret).await? == no_ret_final
+                && value_no_ret(&l1_rpc, w.outbound_no_ret).await? == no_ret_final
+                && l2_balance(&l2_rpc, w.recipient).await? == recipient_final
+                && l2_balance(&l1_rpc, w.withdrawal_recipient).await? == withdrawal_final;
+            Ok(converged.then_some(()))
         }
     })
     .await
@@ -705,7 +718,7 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
         0,
         "composer must not fall back to eth_sendRawTransaction",
     );
-    w.node.assert_no_process_death();
+    w.node.assert_no_divergence_failure_logs();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
