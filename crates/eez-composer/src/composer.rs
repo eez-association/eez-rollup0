@@ -173,7 +173,7 @@ fn seed_session(
 // Preserve the protocol crate's structured public error type.
 #[allow(clippy::result_large_err)]
 #[tracing::instrument(skip_all, fields(tx_len = raw_tx.len(), %entry_rollup_id))]
-fn compose_chained(
+fn compose_crosschain(
     cc: &CrossChainWiring,
     entry_rollup_id: eez_protocol::RollupId,
     entry_client: &crate::local::LocalChainClient,
@@ -276,7 +276,7 @@ impl std::fmt::Debug for CrossChainWiring {
 /// evicted so they cannot block the FIFO queue indefinitely.
 ///
 /// Drain-time simulations are chained per chain in canonical order
-/// (`compose_chained` over the slot's L1 state and the Sync block under
+/// (`compose_crosschain` over the slot's L1 state and the Sync block under
 /// construction — `docs/CHAINED-INTERSTATE-DESIGN.md`), so a co-bundled
 /// prerequisite is already visible when its dependant composes. What this bound
 /// backstops is the residual: L1 state that moves between compose time and the
@@ -400,7 +400,7 @@ fn clamp_max_postbatch_gas(requested: u64) -> u64 {
     DEFAULT_MAX_POSTBATCH_GAS
 }
 
-/// Classify a [`compose_chained`] failure. `true` = DETERMINISTIC:
+/// Classify a [`compose_crosschain`] failure. `true` = DETERMINISTIC:
 /// the composition is structurally invalid for this tx (no cross-chain
 /// call / revert / bad encoding), so the tx is poison and must be
 /// evicted before it can enter — and perpetually drop — a bundle.
@@ -1800,7 +1800,7 @@ where
             let sessions = seed_session(cc.entry_rollup_id, l1_exec);
             let (state, env) = fork.state_and_env();
             let env = env.clone();
-            let sim = compose_chained(
+            let sim = compose_crosschain(
                 cc,
                 eez_protocol::RollupId(rollup_id),
                 &local.l2_entry,
@@ -2003,7 +2003,7 @@ where
                 }
                 Err(e) => {
                     transient = Some((
-                        format!("compose_chained outbound tx#{idx}: {e}"),
+                        format!("compose_crosschain outbound tx#{idx}: {e}"),
                         abort_rest(
                             Some((idx, held)),
                             &mut out_iter,
@@ -2067,7 +2067,7 @@ where
                 }
             };
             let sessions = seed_session(eez_protocol::RollupId(rollup_id), probe);
-            let sim = compose_chained(
+            let sim = compose_crosschain(
                 cc,
                 cc.entry_rollup_id,
                 &local.l1_entry,
@@ -2227,7 +2227,7 @@ where
                     // Transient (provider / transport / unavailable) —
                     // abort the slot, re-queue this tx + the remainder.
                     transient = Some((
-                        format!("compose_chained inbound tx#{idx}: {e}"),
+                        format!("compose_crosschain inbound tx#{idx}: {e}"),
                         abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
                     ));
                     break;
