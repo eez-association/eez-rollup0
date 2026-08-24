@@ -13,7 +13,7 @@ run_check() {
 
 for mode in inbound outbound mixed; do
     run_check "cross-chain-wave-$mode" \
-        env EEZ_WAVE_MODE="$mode" EEZ_WAVE_COUNT=1 \
+        env EEZ_WAVE_MODE="$mode" EEZ_WAVE_COUNT=1 EEZ_INCLUDE_REVERTS=1 \
         bash "$HERE/cross-chain-wave.sh"
 done
 

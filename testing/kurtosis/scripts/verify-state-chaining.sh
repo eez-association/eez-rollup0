@@ -15,14 +15,12 @@ for tool in cast forge jq curl kurtosis openssl; do
     command -v "$tool" >/dev/null || { echo "$tool not in PATH"; exit 1; }
 done
 
-port() { kurtosis port print "$ENCLAVE" "$1" "$2" 2>/dev/null || true; }
-http_url() { case "$1" in http*) echo "$1";; "") echo "";; *) echo "http://$1";; esac; }
-: "${L1:=$(http_url "$(port el-1-reth-lighthouse rpc)")}"
-: "${L2:=$(http_url "$(port eez-node l2-rpc)")}"
-: "${L1F:=$(http_url "$(port eez-node l1-xchain)")}"
-: "${L2F:=$(http_url "$(port eez-node l2-xchain)")}"
-[[ -n "$L1" && -n "$L2" && -n "$L1F" && -n "$L2F" ]] \
-    || { echo "could not resolve enclave ports — is '$ENCLAVE' up?"; exit 1; }
+# shellcheck disable=SC1091
+source "$K/ports.sh" >/dev/null
+: "${L1:=$EEZ_DEVNET_L1_RPC}"
+: "${L2:=$EEZ_DEVNET_L2_RPC}"
+: "${L1F:=$EEZ_DEVNET_L1_FRONT}"
+: "${L2F:=$EEZ_DEVNET_L2_FRONT}"
 
 NODE_LOG="${EEZ_NODE_LOG:-$LOG_DIR/state-chaining-node.log}"
 SIGNER_LOG="${EEZ_PROOF_SIGNER_LOG:-$LOG_DIR/state-chaining-proof-signer.log}"

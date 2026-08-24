@@ -29,14 +29,12 @@ WAVES="${EEZ_WAVE_COUNT:-3}"
 for t in cast forge jq curl kurtosis openssl; do command -v "$t" >/dev/null || { echo "$t not in PATH"; exit 1; }; done
 
 # L1 is the canonical shared chain; fronts are published by eez-node.
-_port() { kurtosis port print "$ENCLAVE" "$1" "$2" 2>/dev/null || true; }
-_http() { case "$1" in http*) echo "$1";; "") echo "";; *) echo "http://$1";; esac; }
-: "${L1:=$(_http "$(_port el-1-reth-lighthouse rpc)")}"
-: "${L2:=$(_http "$(_port eez-node l2-rpc)")}"
-: "${L1F:=$(_http "$(_port eez-node l1-xchain)")}"
-: "${L2F:=$(_http "$(_port eez-node l2-xchain)")}"
-[[ -n "$L1" && -n "$L2" && -n "$L1F" && -n "$L2F" ]] \
-    || { echo "could not resolve enclave ports — is '$ENCLAVE' up? (kurtosis enclave inspect $ENCLAVE)"; exit 1; }
+# shellcheck disable=SC1091
+source "$K/ports.sh" >/dev/null
+: "${L1:=$EEZ_DEVNET_L1_RPC}"
+: "${L2:=$EEZ_DEVNET_L2_RPC}"
+: "${L1F:=$EEZ_DEVNET_L1_FRONT}"
+: "${L2F:=$EEZ_DEVNET_L2_FRONT}"
 
 NODE_LOG="${EEZ_NODE_LOG:-$LOG_DIR/wave-$MODE-node.log}"
 SIGNER_LOG="${EEZ_PROOF_SIGNER_LOG:-$LOG_DIR/wave-$MODE-proof-signer.log}"
@@ -302,6 +300,24 @@ receipt_status() {
     [[ "$st" == "0x1" ]] && echo "1" || echo "${st:-missing}"
 }
 
+wait_for_poison_eviction() {
+    local hash="$1" rpc="$2" signal="$3" label="$4"
+    local deadline=$((SECONDS + ${EEZ_REVERT_EVICTION_WAIT_SECS:-60})) evidence
+    while (( SECONDS < deadline )); do
+        refresh_node_log
+        evidence=$(strip_ansi <"$NODE_LOG" \
+            | grep -F "test_signal=\"$signal\"" \
+            | grep -F "tx_hash=$hash" \
+            | tail -1 || true)
+        if [[ -n "$evidence" && "$(receipt_status "$hash" "$rpc")" == "missing" ]]; then
+            return 0
+        fi
+        sleep 2
+    done
+    echo "    ✗ $label was not poison-evicted without a source receipt: $hash" >&2
+    return 1
+}
+
 wait_nonce_at_least() {
     local rpc="$1" addr="$2" want="$3" label="$4"
     local wait_end=$(( SECONDS + RECEIPT_WAIT_SECS )) got
@@ -533,22 +549,28 @@ run_waves() {
     echo "==> assertions"
     local ok_all=1 signer_ok=0 attested_hash=""
 
-    # The destination call fails, so status=1 would mean a call that reverted
-    # on the far side settled as if it had applied.
+    # A deterministic destination failure must be evicted before source-chain
+    # execution, leaving no receipt and releasing the sender nonce.
     if (( INCLUDE_REVERTS )); then
-        local rh rev_total=0 rev_ok=0 rst
+        local rh rev_total=0 rev_ok=0
         for rh in "${REV_IN_HASHES[@]:-}"; do
             [[ -n "$rh" ]] || continue
-            rev_total=$((rev_total+1)); rst=$(receipt_status "$rh" "$L1")
-            [[ "$rst" != "1" ]] && rev_ok=$((rev_ok+1)) || echo "    ✗ inbound revert op settled as success: $rh"
+            rev_total=$((rev_total+1))
+            if wait_for_poison_eviction "$rh" "$L1" \
+                "eez.composer.cc_compose.inbound_poison_evicted" "inbound revert op"; then
+                rev_ok=$((rev_ok+1))
+            fi
         done
         for rh in "${REV_OUT_HASHES[@]:-}"; do
             [[ -n "$rh" ]] || continue
-            rev_total=$((rev_total+1)); rst=$(receipt_status "$rh" "$L2")
-            [[ "$rst" != "1" ]] && rev_ok=$((rev_ok+1)) || echo "    ✗ outbound revert op settled as success: $rh"
+            rev_total=$((rev_total+1))
+            if wait_for_poison_eviction "$rh" "$L2" \
+                "eez.composer.cc_compose.outbound_poison_evicted" "outbound revert op"; then
+                rev_ok=$((rev_ok+1))
+            fi
         done
         if (( rev_total > 0 && rev_ok == rev_total )); then
-            echo "    ✓ reverting cross-chain calls did not settle: $rev_ok/$rev_total"
+            echo "    ✓ reverting cross-chain calls were poison-evicted: $rev_ok/$rev_total"
         else
             echo "    ✗ reverting-call handling: $rev_ok/$rev_total behaved correctly"; ok_all=0
         fi

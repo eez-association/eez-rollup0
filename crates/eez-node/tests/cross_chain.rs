@@ -31,7 +31,12 @@ const WAVE_DEPOSITS: &[u128] = &[
 
 // The embedded bundle path preserves ordering but not all-or-nothing inclusion,
 // so a wave must check every source receipt independently.
-async fn assert_all_transactions_succeeded(rpc_url: &str, hashes: &[TxHash], label: &str) {
+async fn assert_all_transactions_succeeded(
+    w: &eez_testkit::CrossChainWorld,
+    rpc_url: &str,
+    hashes: &[TxHash],
+    label: &str,
+) {
     assert!(!hashes.is_empty(), "no {label} transactions were submitted");
     for &hash in hashes {
         let landed = wait_for(
@@ -191,8 +196,8 @@ async fn minimal_bidirectional_cross_chain_smoke() {
     .await
     .expect("outbound smoke transaction must be admitted");
 
-    assert_all_transactions_succeeded(&l1_rpc, &[inbound], "inbound smoke").await;
-    assert_all_transactions_succeeded(&l2_rpc, &[outbound], "outbound smoke").await;
+    assert_all_transactions_succeeded(&w, &l1_rpc, &[inbound], "inbound smoke").await;
+    assert_all_transactions_succeeded(&w, &l2_rpc, &[outbound], "outbound smoke").await;
 
     let (eez, rollup_id) = (w.cfg.eez_address, w.cfg.rollup_id);
     let converged = wait_for(SETTLE_TIMEOUT, || {
@@ -608,19 +613,13 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
         "every outbound wave operation must be submitted",
     );
 
-    let final_value = l2_value(&l2_rpc, w.value_l2).await.unwrap();
-    assert_eq!(
-        final_value,
-        U256::from(*WAVE_SETTERS.last().unwrap() + 100),
-        "inbound wrapper setter converged",
-    );
-    assert_eq!(
-        last_proxy_result(&l1_rpc, w.inbound_wrapper).await.unwrap(),
-        (true, U256::from(*WAVE_SETTERS.last().unwrap() + 100)),
-        "inbound wrapper must receive the exact destination return",
-    );
-    wait_for(SETTLE_TIMEOUT, || {
-        let l1_rpc = l1_rpc.clone();
+    // Source receipts prove admission; destination effects arrive after settlement.
+    let setter_final = U256::from(*WAVE_SETTERS.last().unwrap() + 100);
+    let no_ret_final = U256::from(*WAVE_SETTERS.last().unwrap() + 200);
+    let recipient_final = recipient_before + U256::from(deposit_sum);
+    let withdrawal_final = withdrawal_before + U256::from(deposit_sum);
+    let effects_converged = wait_for(SETTLE_TIMEOUT, || {
+        let (l1_rpc, l2_rpc) = (l1_rpc.clone(), l2_rpc.clone());
         async move {
             let converged = l2_value(&l2_rpc, w.value_l2).await? == setter_final
                 && l2_value(&l1_rpc, w.outbound_value).await? == setter_final
@@ -631,36 +630,25 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
             Ok(converged.then_some(()))
         }
     })
-    .await
-    .expect("outbound setter did not converge on L1");
+    .await;
+    if let Err(err) = effects_converged {
+        panic!(
+            "cross-chain wave effects did not converge: {err:#}{}",
+            w.settlement_diagnostics(),
+        );
+    }
+
+    assert_eq!(
+        last_proxy_result(&l1_rpc, w.inbound_wrapper).await.unwrap(),
+        (true, setter_final),
+        "inbound wrapper must receive the exact destination return",
+    );
     assert_eq!(
         last_proxy_result(&l2_rpc, w.outbound_wrapper)
             .await
             .unwrap(),
-        (true, U256::from(*WAVE_SETTERS.last().unwrap() + 100)),
+        (true, setter_final),
         "outbound wrapper must receive the exact destination return",
-    );
-    assert_eq!(
-        value_no_ret(&l2_rpc, w.inbound_no_ret).await.unwrap(),
-        U256::from(*WAVE_SETTERS.last().unwrap() + 200),
-        "inbound no-return setter converged",
-    );
-    assert_eq!(
-        value_no_ret(&l1_rpc, w.outbound_no_ret).await.unwrap(),
-        U256::from(*WAVE_SETTERS.last().unwrap() + 200),
-        "outbound no-return setter converged",
-    );
-
-    let recipient_after = l2_balance(&l2_rpc, w.recipient).await.unwrap();
-    assert_eq!(
-        recipient_after,
-        recipient_before + U256::from(deposit_sum),
-        "deposits converged",
-    );
-    assert_eq!(
-        l2_balance(&l1_rpc, w.withdrawal_recipient).await.unwrap(),
-        withdrawal_before + U256::from(deposit_sum),
-        "withdrawals converged on L1",
     );
 
     let (eez, rollup_id) = (w.cfg.eez_address, w.cfg.rollup_id);
@@ -967,7 +955,7 @@ async fn outbound_multiple_proxy_calls_in_one_transaction_are_evicted() {
     )
     .await
     .expect("a replacement at the released nonce must be admitted");
-    assert_all_transactions_succeeded(&l2_rpc, &[replacement], "eviction replacement").await;
+    assert_all_transactions_succeeded(&w, &l2_rpc, &[replacement], "eviction replacement").await;
 
     assert_eq!(
         receipt_ok(&l2_rpc, tx).await.unwrap(),
@@ -1058,8 +1046,13 @@ async fn outbound_identical_calls_in_separate_transactions_settle_as_ordered_ent
     )
     .await
     .expect("second duplicate outbound proxy-call transaction must be admitted");
-    assert_all_transactions_succeeded(&l2_rpc, &[first, second], "duplicate outbound proxy calls")
-        .await;
+    assert_all_transactions_succeeded(
+        &w,
+        &l2_rpc,
+        &[first, second],
+        "duplicate outbound proxy calls",
+    )
+    .await;
 
     wait_for(SETTLE_TIMEOUT, || {
         let provider = provider.clone();

@@ -150,18 +150,13 @@ sed \
 bash "$HERE/start.sh" "$KURTOSIS_ARGS_FILE"
 
 # Wait until the canonical L1 and candidate L2 RPCs answer.
-http_url() {
-    case "$1" in
-        "") printf '\n' ;;
-        http://* | https://*) printf '%s\n' "$1" ;;
-        *) printf 'http://%s\n' "$1" ;;
-    esac
-}
+# shellcheck disable=SC1091
+source "$HERE/ports.sh" >/dev/null
+l1="$EEZ_DEVNET_L1_RPC"
+l2="$EEZ_DEVNET_L2_RPC"
 
 deadline=$((SECONDS + ${EEZ_CI_READY_TIMEOUT_SECS:-900}))
 while (( SECONDS < deadline )); do
-    l1="$(http_url "$(kurtosis port print "$KURTOSIS_ENCLAVE" el-1-reth-lighthouse rpc 2>/dev/null || true)")"
-    l2="$(http_url "$(kurtosis port print "$KURTOSIS_ENCLAVE" eez-node l2-rpc 2>/dev/null || true)")"
     if [[ -n "$l1" && -n "$l2" ]] \
         && cast block-number --rpc-url "$l1" >/dev/null 2>&1 \
         && cast block-number --rpc-url "$l2" >/dev/null 2>&1; then
