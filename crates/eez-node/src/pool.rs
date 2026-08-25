@@ -173,66 +173,73 @@ where
 {
     type Pool = EezTransactionPool<Node::Provider, DiskFileBlobStore, Evm>;
 
-    async fn build_pool(
+    // Nothing here awaits, so `async fn` would build a state machine for no
+    // reason; an `async move` body instead would just trip `manual_async_fn`.
+    fn build_pool(
         self,
         ctx: &BuilderContext<Node>,
         evm_config: Evm,
-    ) -> eyre::Result<Self::Pool> {
-        let pool_config = ctx.pool_config();
+    ) -> impl Future<Output = eyre::Result<Self::Pool>> + Send {
+        // Closure only so the body keeps using `?`.
+        let build = move || -> eyre::Result<Self::Pool> {
+            let pool_config = ctx.pool_config();
 
-        let blobs_disabled = ctx.config().txpool.disable_blobs_support
-            || ctx.config().txpool.blobpool_max_count == 0;
+            let blobs_disabled = ctx.config().txpool.disable_blobs_support
+                || ctx.config().txpool.blobpool_max_count == 0;
 
-        let blob_cache_size = if let Some(blob_cache_size) = pool_config.blob_cache_size {
-            Some(blob_cache_size)
-        } else {
-            let current_timestamp = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)?
-                .as_secs();
-            let blob_params = ctx
-                .chain_spec()
-                .blob_params_at_timestamp(current_timestamp)
-                .unwrap_or_else(BlobParams::cancun);
-            Some((blob_params.target_blob_count * EPOCH_SLOTS * 2) as u32)
+            let blob_cache_size = if let Some(blob_cache_size) = pool_config.blob_cache_size {
+                Some(blob_cache_size)
+            } else {
+                let current_timestamp = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)?
+                    .as_secs();
+                let blob_params = ctx
+                    .chain_spec()
+                    .blob_params_at_timestamp(current_timestamp)
+                    .unwrap_or_else(BlobParams::cancun);
+                Some((blob_params.target_blob_count * EPOCH_SLOTS * 2) as u32)
+            };
+
+            let blob_store = create_blob_store_with_cache(ctx, blob_cache_size)?;
+
+            let eth_validator =
+                TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone(), evm_config)
+                    .set_eip4844(!blobs_disabled)
+                    .kzg_settings(ctx.kzg_settings()?)
+                    .with_max_tx_input_bytes(ctx.config().txpool.max_tx_input_bytes)
+                    .with_local_transactions_config(pool_config.local_transactions_config.clone())
+                    .set_tx_fee_cap(ctx.config().rpc.rpc_tx_fee_cap)
+                    .with_max_tx_gas_limit(ctx.config().txpool.max_tx_gas_limit)
+                    .with_minimum_priority_fee(ctx.config().txpool.minimum_priority_fee)
+                    .with_additional_tasks(ctx.config().txpool.additional_validation_tasks)
+                    .build_with_tasks(ctx.task_executor().clone(), blob_store.clone());
+
+            if eth_validator.validator().eip4844() {
+                // KZG setup is slow, so warm it off the first-block path.
+                let kzg_settings = eth_validator.validator().kzg_settings().clone();
+                ctx.task_executor().spawn_blocking_task(async move {
+                    let _ = kzg_settings.get();
+                });
+            }
+
+            let system_address = self.system_address;
+            let validator =
+                eth_validator.map(|inner| SystemAddressGate::new(inner, system_address));
+
+            let transaction_pool = TxPoolBuilder::new(ctx)
+                .with_validator(validator)
+                .build_and_spawn_maintenance_task(blob_store, pool_config)?;
+
+            event!(
+                name: "eez.node.pool.ready",
+                Level::INFO,
+                system_address = ?system_address,
+                "L2 transaction pool initialized with the SYSTEM_ADDRESS gate",
+            );
+
+            Ok(transaction_pool)
         };
-
-        let blob_store = create_blob_store_with_cache(ctx, blob_cache_size)?;
-
-        let eth_validator =
-            TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone(), evm_config)
-                .set_eip4844(!blobs_disabled)
-                .kzg_settings(ctx.kzg_settings()?)
-                .with_max_tx_input_bytes(ctx.config().txpool.max_tx_input_bytes)
-                .with_local_transactions_config(pool_config.local_transactions_config.clone())
-                .set_tx_fee_cap(ctx.config().rpc.rpc_tx_fee_cap)
-                .with_max_tx_gas_limit(ctx.config().txpool.max_tx_gas_limit)
-                .with_minimum_priority_fee(ctx.config().txpool.minimum_priority_fee)
-                .with_additional_tasks(ctx.config().txpool.additional_validation_tasks)
-                .build_with_tasks(ctx.task_executor().clone(), blob_store.clone());
-
-        if eth_validator.validator().eip4844() {
-            // KZG setup is slow, so warm it off the first-block path.
-            let kzg_settings = eth_validator.validator().kzg_settings().clone();
-            ctx.task_executor().spawn_blocking_task(async move {
-                let _ = kzg_settings.get();
-            });
-        }
-
-        let system_address = self.system_address;
-        let validator = eth_validator.map(|inner| SystemAddressGate::new(inner, system_address));
-
-        let transaction_pool = TxPoolBuilder::new(ctx)
-            .with_validator(validator)
-            .build_and_spawn_maintenance_task(blob_store, pool_config)?;
-
-        event!(
-            name: "eez.node.pool.ready",
-            Level::INFO,
-            system_address = ?system_address,
-            "L2 transaction pool initialized with the SYSTEM_ADDRESS gate",
-        );
-
-        Ok(transaction_pool)
+        std::future::ready(build())
     }
 }
 
@@ -255,19 +262,19 @@ mod tests {
         type Transaction = EthPooledTransaction;
         type Block = reth_ethereum_primitives::Block;
 
-        async fn validate_transaction(
+        fn validate_transaction(
             &self,
             _origin: TransactionOrigin,
             transaction: Self::Transaction,
-        ) -> TransactionValidationOutcome<Self::Transaction> {
-            TransactionValidationOutcome::Valid {
+        ) -> impl Future<Output = TransactionValidationOutcome<Self::Transaction>> + Send {
+            std::future::ready(TransactionValidationOutcome::Valid {
                 balance: U256::ZERO,
                 state_nonce: 0,
                 bytecode_hash: None,
                 transaction: ValidTransaction::Valid(transaction),
                 propagate: false,
                 authorities: None,
-            }
+            })
         }
     }
 
