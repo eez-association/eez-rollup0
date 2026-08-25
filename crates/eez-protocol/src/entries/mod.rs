@@ -419,7 +419,7 @@ pub fn build_l1_inbound_entry(
 /// Although represented by the shared batch type, each entry carries the L2
 /// proxy hash, incoming-call descriptor, and rolling hash needed to reconstruct
 /// the canonical L2 system transaction.
-pub(crate) fn build_l1_inbound_sidecar(
+pub(crate) fn build_inbound_target_entries(
     calls: &[ExecutedAction],
     target_rollup_id: RollupId,
 ) -> ProtocolResult<EvmBatch> {
