@@ -24,7 +24,8 @@ rebuild the whole L2 chain from L1 alone. The supported L1 is Gnosis **Chiado**
   keeps what L1 confirms.
 - **Can be re-derived from L1.** A **follower** rebuilds the identical L2
   chain just by reading L1 (the `BatchPosted` events) and re-running the same
-  transactions — no need to trust the sequencer.
+  transactions — no need to trust the sequencer for safe state. Before L1
+  inclusion, it can follow complete sequencer-signed payloads over libp2p.
 
 `eez-proof-signer` statelessly re-executes each proposed batch and validates
 its settlement effects before signing the recomputed public-input hash.
@@ -83,6 +84,7 @@ cp .env.example .env
 #   EEZ_L1_RPC_URL=<tip chiado RPC>   EEZ_L1_POSTER_KEY=<operator key>
 #   EEZ_PROOF_SIGNER_KEY=<operator key>   (its address becomes the proof system's authorizedSigner)
 #   EEZ_L2_SYSTEM_KEY=<separate L2 system-transaction key>
+#   EEZ_UNSAFE_BLOCK_SIGNER_KEY=<separate unsafe-payload signing key>
 EEZ_DEPLOY_SKIP_SIMULATION=1 make deploy-protocol
 ```
 
@@ -135,6 +137,22 @@ start cross-chain ingress fronts. Upstreams are `EEZ_L1_RPC_URL` /
 cross-chain txs ride in one `postBatch` bundle. Raise it only against a builder
 proven to include larger bundles atomically — rbuilder-chiado silently drops the
 excess beyond ~3, which is lost tx inclusion, so measure before bumping.
+
+### Signed unsafe-block P2P
+
+`eez-composer` signs each canonicalized execution payload with
+`EEZ_UNSAFE_BLOCK_SIGNER_KEY` and publishes it on the chain-scoped libp2p
+topic `/eez/<chain-id>/4/blocks`. `eez-follower` requires the corresponding
+`EEZ_UNSAFE_BLOCK_SIGNER_ADDRESS`; it verifies the chain-bound signature,
+payload block hash, and safe-chain ancestry before importing through Engine
+API. It never fetches unsafe heads from the sequencer RPC.
+
+Configure `EEZ_P2P_LISTEN_ADDR` (default `/ip4/0.0.0.0/tcp/9300`) on each
+node and give followers one or more comma-separated composer multiaddrs in
+`EEZ_P2P_PEERS`. Gossip uses Snappy-compressed, libp2p-signed messages. A
+bounded 256-payload request/response cache fills short gaps for late or
+temporarily disconnected followers; L1 derivation remains the durable source
+for safe history.
 
 ### Exercise it
 
