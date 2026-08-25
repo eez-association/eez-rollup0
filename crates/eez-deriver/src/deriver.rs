@@ -6,6 +6,7 @@
 //! STF-replay pattern adapted from `based-rollup`'s `build_derived_block`
 //! at `/root/sync-rollups-composer/crates/based-rollup/src/driver/protocol_txs.rs:453`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -79,6 +80,9 @@ where
     /// L1-entries → L2 system-tx prepending in `reconcile_batch_blocks`;
     /// `None` falls back to pure-user-tx STF. See [`Deriver::new`] docs.
     system_tx_cfg: Option<eez_protocol::system_tx::SystemTxContext>,
+    /// L2 datadir holding the boot checkpoint. `None` disables it, which is
+    /// the old behaviour: boot rescans from the deploy block.
+    checkpoint_dir: Option<PathBuf>,
 }
 
 impl<L2> std::fmt::Debug for Deriver<L2>
@@ -128,6 +132,7 @@ where
         deploy_block: u64,
         l1_head: Arc<L1CanonicalHead>,
         system_tx_cfg: Option<eez_protocol::system_tx::SystemTxContext>,
+        checkpoint_dir: Option<PathBuf>,
     ) -> Self {
         let evm_config = EthEvmConfig::new(Arc::clone(&chain_spec));
         Self {
@@ -142,8 +147,85 @@ where
                 l1_head,
                 safe_l2_block: AtomicU64::new(0),
                 system_tx_cfg,
+                checkpoint_dir,
             }),
         }
+    }
+
+    /// Record the last indexed batch so the next boot resumes there. Best
+    /// effort: a write failure costs a slow boot, never correctness.
+    fn save_checkpoint(&self) {
+        let Some(dir) = self.inner.checkpoint_dir.as_deref() else {
+            return;
+        };
+        let Some(tail) = self.inner.l1_head.last_indexed() else {
+            return;
+        };
+        let l2_state_root = match self.l2_state_root_at(tail.last_l2_block) {
+            Ok(root) => root,
+            Err(err) => {
+                event!(
+                    name: "eez.deriver.checkpoint.no_local_root",
+                    Level::WARN,
+                    l2_block = tail.last_l2_block,
+                    error = %err,
+                    "no local root at the indexed tip; skipping the boot checkpoint",
+                );
+                return;
+            }
+        };
+        let checkpoint = crate::checkpoint::ReconcileCheckpoint {
+            l1_block: tail.l1_block,
+            l1_block_hash: tail.l1_block_hash,
+            tx_hash: tail.tx_hash,
+            l2_cursor: tail.last_l2_block,
+            l2_state_root,
+        };
+        if let Err(err) = checkpoint.save(dir) {
+            event!(
+                name: "eez.deriver.checkpoint.write_failed",
+                Level::WARN,
+                dir = %dir.display(),
+                error = %err,
+                "boot checkpoint not written; the next boot rescans from the deploy block",
+            );
+        }
+    }
+
+    /// Checkpoint to seed the boot scan from, or `None` to rescan from the
+    /// deploy block. [`ReconcileCheckpoint::usable_with`] decides.
+    async fn checkpoint_seed(&self) -> Option<crate::checkpoint::ReconcileCheckpoint> {
+        let checkpoint =
+            crate::checkpoint::ReconcileCheckpoint::load(self.inner.checkpoint_dir.as_deref()?)?;
+        let canonical = self
+            .inner
+            .l1_reader
+            .canonical_l1_hash(checkpoint.l1_block)
+            .await
+            .ok()
+            .flatten();
+        let local_root = self.l2_state_root_at(checkpoint.l2_cursor).ok();
+        if let Err(reason) = checkpoint.usable_with(canonical, local_root) {
+            event!(
+                name: "eez.deriver.checkpoint.rejected",
+                Level::WARN,
+                l1_block = checkpoint.l1_block,
+                l2_cursor = checkpoint.l2_cursor,
+                canonical = ?canonical,
+                local_root = ?local_root,
+                reason,
+                "boot checkpoint rejected; rescanning from the deploy block",
+            );
+            return None;
+        }
+        event!(
+            name: "eez.deriver.checkpoint.seeded",
+            Level::INFO,
+            l1_block = checkpoint.l1_block,
+            l2_cursor = checkpoint.l2_cursor,
+            "boot seeded from checkpoint; scanning forward instead of from the deploy block",
+        );
+        Some(checkpoint)
     }
 
     /// Current cursor — highest L2 block confirmed by any L1-landed
@@ -245,7 +327,20 @@ where
         }
         match anchor {
             Some(anchor_l1_block) => self.sync_batches_inner(anchor_l1_block, cursor).await,
-            None => self.sync_batches_inner(self.inner.deploy_block, 0).await,
+            // Every boot has an empty index. The checkpoint keeps the scan
+            // short (`docs/issues/deep-reverify-cost.md`).
+            None => match self.checkpoint_seed().await {
+                Some(seed) => {
+                    self.inner.l1_head.append(BatchRecord {
+                        l1_block: seed.l1_block,
+                        l1_block_hash: seed.l1_block_hash,
+                        tx_hash: seed.tx_hash,
+                        last_l2_block: seed.l2_cursor,
+                    });
+                    self.sync_batches_inner(seed.l1_block, seed.l2_cursor).await
+                }
+                None => self.sync_batches_inner(self.inner.deploy_block, 0).await,
+            },
         }
     }
 
@@ -496,6 +591,7 @@ where
         // of them are skipped as already-processed.
         if !new_batches.is_empty() {
             self.inner.l1_head.append_many(new_batches);
+            self.save_checkpoint();
         }
 
         // Advance safe once per chunk, not per batch: two batches in one L1 block
@@ -1019,6 +1115,9 @@ where
             tx_hash,
             last_l2_block: settled_end.unwrap_or(to_block),
         });
+        // After the index, so the checkpoint never names a batch the index does
+        // not hold; the blocks it points at are already committed locally.
+        self.save_checkpoint();
 
         // Safe moves once per L1 block, at its last batch: a resumed batch rewrites
         // the height its same-block predecessor settled, orphaning that safe hash.

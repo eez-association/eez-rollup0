@@ -13,9 +13,12 @@
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+pub mod checkpoint;
 pub mod deriver;
 pub mod error;
 
+#[doc(inline)]
+pub use checkpoint::ReconcileCheckpoint;
 #[doc(inline)]
 pub use deriver::Deriver;
 #[doc(inline)]
