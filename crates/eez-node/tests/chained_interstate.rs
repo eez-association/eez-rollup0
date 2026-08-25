@@ -200,9 +200,15 @@ async fn batches(w: &CrossChainWorld) -> Vec<EvmBatch> {
         .expect("read posted batches")
 }
 
+/// Match the eviction MESSAGES, not the word. Every drain reports its counts as
+/// `evicted_poison=N evicted_stale=N`, so "evicted" hits those field names even
+/// at zero; "evicting" is only ever the verb, and every eviction path logs one
+/// of these per transaction.
 fn assert_no_evictions(w: &CrossChainWorld) {
     assert_eq!(
-        w.node.log_count_matching(&["evicting", "evicted"]).unwrap(),
+        w.node
+            .log_count_matching(&["evicting", "evicted instead"])
+            .unwrap(),
         0,
         "composable transactions must not be evicted",
     );
