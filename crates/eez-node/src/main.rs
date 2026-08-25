@@ -8,8 +8,8 @@
 //! # Modes
 //!
 //! Mode is decided by env-var presence at startup. "Can attest" =
-//! `EEZ_PROVER_URL` (remote prover; composer needs only `EEZ_ATTESTER_ADDRESS`,
-//! never the key) OR `EEZ_PROOF_SIGNER_KEY` (local mock signer):
+//! `EEZ_PROVER_URL` (the composer needs only `EEZ_ATTESTER_ADDRESS`, never the
+//! proof signer's key):
 //!
 //! | `EEZ_L1_RPC_URL` | can attest | Mode | Stack |
 //! |---|---|---|---|
@@ -39,7 +39,6 @@ use eez_driver::{
 use eez_l1::{
     L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
 };
-use eez_prover::MockEcdsaProver;
 use mimalloc::MiMalloc;
 use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
 use reth_node_builder::components::BasicPayloadServiceBuilder;
@@ -85,14 +84,15 @@ enum EmbeddedL1<Ethereum, Chiado> {
 impl Mode {
     fn from_env() -> Self {
         let l1_enabled = env::var_os("EEZ_L1_RPC_URL").is_some();
-        // A composer needs an attestation source: a remote prover
-        // (`EEZ_PROVER_URL`, which holds the key remotely — the composer only
-        // needs `EEZ_ATTESTER_ADDRESS`) or a local mock signer
-        // (`EEZ_PROOF_SIGNER_KEY`). Either presence marks composer mode; a
-        // follower has L1 but neither.
-        let can_attest = env::var_os("EEZ_PROVER_URL").is_some()
-            || env::var_os("EEZ_PROOF_SIGNER_KEY").is_some();
-        match (l1_enabled, can_attest) {
+        // A composer needs the standalone proof signer. The signer key must
+        // never enter this process; the composer only receives its endpoint
+        // and public attester address.
+        let can_attest = env::var_os("EEZ_PROVER_URL").is_some();
+        Self::from_presence(l1_enabled, can_attest)
+    }
+
+    const fn from_presence(l1_enabled: bool, prover_url_present: bool) -> Self {
+        match (l1_enabled, prover_url_present) {
             (false, _) => Self::Standalone,
             (true, false) => Self::Follower,
             (true, true) => Self::Composer,
@@ -441,29 +441,18 @@ fn main() -> eyre::Result<()> {
         // would spawn a second actor with its own reconcile lock + head
         // mirror, splitting the serialization domain.
         let composer_setup = if mode == Mode::Composer {
-            // Attestation source. Remote mode (`EEZ_PROVER_URL`) holds NO signing
-            // key in the composer: it dials eez-proof-signer and only verifies that each
-            // attestation recovers to the configured attester address (the on-chain
-            // proof-system check is authoritative; this is a fail-fast).
-            let prover: Arc<dyn eez_prover::Prover> = match env::var("EEZ_PROVER_URL") {
-                Ok(url) => {
-                    let attester = env::var("EEZ_ATTESTER_ADDRESS").map_err(|_| {
-                        eyre::eyre!("EEZ_ATTESTER_ADDRESS required in remote-prover mode")
-                    })?;
-                    let attester = Address::from_str(attester.trim())
-                        .map_err(|e| eyre::eyre!("EEZ_ATTESTER_ADDRESS: {e}"))?;
-                    Arc::new(eez_prover_client::RemoteProver::new(url, attester))
-                }
-                Err(_) => {
-                    let key = env::var("EEZ_PROOF_SIGNER_KEY").map_err(|_| {
-                        eyre::eyre!("EEZ_PROOF_SIGNER_KEY required in mock-prover mode")
-                    })?;
-                    let signer = PrivateKeySigner::from_bytes(&B256::from_str(
-                        key.trim_start_matches("0x"),
-                    )?)?;
-                    Arc::new(MockEcdsaProver::new(signer))
-                }
-            };
+            // The standalone eez-proof-signer owns the attestation key. This
+            // process only dials it and verifies that each response recovers to
+            // the configured public attester address (the on-chain proof-system
+            // check remains authoritative; this is a fail-fast).
+            let prover_url = env::var("EEZ_PROVER_URL")
+                .map_err(|_| eyre::eyre!("EEZ_PROVER_URL required in composer mode"))?;
+            let attester = env::var("EEZ_ATTESTER_ADDRESS")
+                .map_err(|_| eyre::eyre!("EEZ_ATTESTER_ADDRESS required in composer mode"))?;
+            let attester = Address::from_str(attester.trim())
+                .map_err(|e| eyre::eyre!("EEZ_ATTESTER_ADDRESS: {e}"))?;
+            let prover: Arc<dyn eez_prover::Prover> =
+                Arc::new(eez_prover_client::RemoteProver::new(prover_url, attester));
             let rollup_id = rollup_config.rollup_id;
             let l1_source_chain_id = match embedded_l1.as_ref() {
                 Some(EmbeddedL1::Ethereum(l1_handle)) => {
@@ -1348,7 +1337,7 @@ fn warn_on_deprecated_env() {
                 name: "eez.node.env.deprecated",
                 Level::WARN,
                 env = name,
-                "env var is ignored; mode is derived from EEZ_L1_RPC_URL + (EEZ_PROVER_URL | EEZ_PROOF_SIGNER_KEY) presence (see crate docs)."
+                "env var is ignored; mode is derived from EEZ_L1_RPC_URL + EEZ_PROVER_URL presence (see crate docs)."
             );
         }
     }
@@ -1357,6 +1346,14 @@ fn warn_on_deprecated_env() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mode_requires_prover_url_for_composer() {
+        assert_eq!(Mode::from_presence(false, false), Mode::Standalone);
+        assert_eq!(Mode::from_presence(false, true), Mode::Standalone);
+        assert_eq!(Mode::from_presence(true, false), Mode::Follower);
+        assert_eq!(Mode::from_presence(true, true), Mode::Composer);
+    }
 
     #[test]
     fn xchain_front_missing_port_fails_fast() {

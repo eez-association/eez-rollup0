@@ -533,8 +533,7 @@ struct Inner<L2: BlockReader> {
     /// after the Sequencer spawns the actor. Slot-context recovery uses it to
     /// reorg an optimistically committed Sync block after L1 failure.
     committer: std::sync::OnceLock<BlockCommitterHandle<EthEngineTypes>>,
-    /// Per-block witnesses for [`eez_prover::ProvingContext::blocks`]. Set only
-    /// in remote-prover mode; `None` (mock) leaves `blocks` empty.
+    /// Per-block witnesses for [`eez_prover::ProvingContext::blocks`].
     witness_source: std::sync::OnceLock<Arc<dyn eez_prover::ProvingWitnessSource>>,
     /// Bounds on what one postBatch may settle. Read from env once here so
     /// the emission decision, the boundary math, and the span guard in
@@ -581,7 +580,7 @@ where
         }
     }
 
-    /// Wire the proving-witness source (remote-prover mode only). Later calls no-op.
+    /// Wire the proving-witness source. Later calls no-op.
     pub fn set_witness_source(&self, src: Arc<dyn eez_prover::ProvingWitnessSource>) {
         let _ = self.inner.witness_source.set(src);
     }
@@ -2606,7 +2605,7 @@ where
 
         // The validating proof path enforces that the chain ends at the Sync
         // block's final root. Debug builds also check the local stitching
-        // invariant here, including when a mock prover is configured.
+        // invariant here before the proof signer independently validates it.
         debug_assert_eq!(
             batch
                 .entries
@@ -2794,10 +2793,10 @@ where
         }
 
         // Prove the assembled window (proofs[] empty — not part of the
-        // publicInputsHash). Mock ignores the context; a remote prover re-executes
-        // `blocks`. Settlement path, off block production.
+        // publicInputsHash). The proof signer re-executes `blocks`. Settlement
+        // path, off block production.
         let block_witnesses = match self.inner.witness_source.get() {
-            // Remote-prover mode. Intermediate blocks `[from..sync)` are committed
+            // Intermediate blocks `[from..sync)` are committed
             // (served by the witness store); a freshly-built endpoint isn't, so
             // capture it here from the in-memory block.
             Some(src) => {
@@ -2850,7 +2849,7 @@ where
                 .await
                 .map_err(|e| format!("witness spawn_blocking join: {e}"))??
             }
-            // Mock mode: the mock prover ignores per-block witnesses.
+            // Tests may use a lightweight prover without a witness source.
             None => Vec::new(),
         };
         let proving_ctx = ProvingContext {
