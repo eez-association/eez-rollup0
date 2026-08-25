@@ -1,13 +1,15 @@
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use futures_util::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, Swarm, SwarmBuilder,
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
     gossipsub::{self, IdentTopic, MessageAuthenticity, ValidationMode},
     identity, noise,
-    swarm::SwarmEvent,
+    request_response::{self, ProtocolSupport},
+    swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::{Level, event};
@@ -17,6 +19,8 @@ use crate::blocks_topic;
 const COMMAND_BUFFER: usize = 64;
 const EVENT_BUFFER: usize = 128;
 const REDIAL_INTERVAL: Duration = Duration::from_secs(5);
+/// Number of recent signed payloads retained for follower gap recovery.
+pub const BACKFILL_CACHE_SIZE: usize = 256;
 
 /// OP-compatible maximum uncompressed GossipSub block size.
 pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
@@ -74,6 +78,8 @@ pub enum NetworkEvent {
     PeerSubscribed(PeerId),
     /// A Snappy-decoded signed unsafe-block message.
     Message(Vec<u8>),
+    /// No connected publisher had the requested historical payload.
+    BackfillUnavailable(u64),
 }
 
 /// P2P setup and runtime-boundary failures.
@@ -100,7 +106,45 @@ pub enum NetworkError {
 }
 
 enum NetworkCommand {
-    Publish(Vec<u8>),
+    Publish { block_number: u64, message: Vec<u8> },
+    RequestPayload(u64),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PayloadRequest {
+    block_number: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PayloadResponse {
+    block_number: u64,
+    /// Snappy-compressed signed message, or `None` when absent from cache.
+    message: Option<Vec<u8>>,
+}
+
+#[derive(NetworkBehaviour)]
+#[behaviour(to_swarm = "BehaviourEvent")]
+struct Behaviour {
+    gossip: gossipsub::Behaviour,
+    backfill: request_response::cbor::Behaviour<PayloadRequest, PayloadResponse>,
+}
+
+#[derive(Debug)]
+enum BehaviourEvent {
+    Gossip(gossipsub::Event),
+    Backfill(request_response::Event<PayloadRequest, PayloadResponse>),
+}
+
+impl From<gossipsub::Event> for BehaviourEvent {
+    fn from(event: gossipsub::Event) -> Self {
+        Self::Gossip(event)
+    }
+}
+
+impl From<request_response::Event<PayloadRequest, PayloadResponse>> for BehaviourEvent {
+    fn from(event: request_response::Event<PayloadRequest, PayloadResponse>) -> Self {
+        Self::Backfill(event)
+    }
 }
 
 /// Clone-cheap command handle for a running network service.
@@ -111,9 +155,20 @@ pub struct NetworkHandle {
 
 impl NetworkHandle {
     /// Queue one signed, uncompressed unsafe-block message for Snappy + GossipSub publication.
-    pub async fn publish(&self, message: Vec<u8>) -> Result<(), NetworkError> {
+    pub async fn publish(&self, block_number: u64, message: Vec<u8>) -> Result<(), NetworkError> {
         self.commands
-            .send(NetworkCommand::Publish(message))
+            .send(NetworkCommand::Publish {
+                block_number,
+                message,
+            })
+            .await
+            .map_err(|_| NetworkError::ServiceStopped)
+    }
+
+    /// Request one missing payload by block number from a connected peer.
+    pub async fn request_payload(&self, block_number: u64) -> Result<(), NetworkError> {
+        self.commands
+            .send(NetworkCommand::RequestPayload(block_number))
             .await
             .map_err(|_| NetworkError::ServiceStopped)
     }
@@ -121,11 +176,13 @@ impl NetworkHandle {
 
 /// Single-owner libp2p event loop.
 pub struct NetworkService {
-    swarm: Swarm<gossipsub::Behaviour>,
+    swarm: Swarm<Behaviour>,
     topic: IdentTopic,
     peers: Vec<Multiaddr>,
     commands: mpsc::Receiver<NetworkCommand>,
     events: mpsc::Sender<NetworkEvent>,
+    subscribed_peers: Vec<PeerId>,
+    payload_cache: BTreeMap<u64, Vec<u8>>,
 }
 
 impl std::fmt::Debug for NetworkService {
@@ -157,9 +214,21 @@ impl NetworkService {
             .message_id_fn(message_id_fn)
             .build()
             .map_err(|error| NetworkError::GossipConfig(error.to_string()))?;
-        let behaviour =
+        let gossip =
             gossipsub::Behaviour::new(MessageAuthenticity::Signed(identity.clone()), gossip_config)
                 .map_err(|error| NetworkError::GossipConfig(error.to_string()))?;
+        let backfill_protocol =
+            StreamProtocol::try_from_owned(format!("/eez/{}/payload_by_number/1", config.chain_id))
+                .map_err(|error| NetworkError::GossipConfig(error.to_string()))?;
+        let backfill_codec =
+            request_response::cbor::codec::Codec::<PayloadRequest, PayloadResponse>::default()
+                .set_response_size_maximum((MAX_MESSAGE_SIZE + 1024) as u64);
+        let backfill = request_response::Behaviour::with_codec(
+            backfill_codec,
+            [(backfill_protocol, ProtocolSupport::Full)],
+            request_response::Config::default(),
+        );
+        let behaviour = Behaviour { gossip, backfill };
         let mut swarm = SwarmBuilder::with_existing_identity(identity)
             .with_tokio()
             .with_tcp(
@@ -176,6 +245,7 @@ impl NetworkService {
         let topic = IdentTopic::new(topic_name.clone());
         swarm
             .behaviour_mut()
+            .gossip
             .subscribe(&topic)
             .map_err(|error| NetworkError::Subscribe {
                 topic: topic_name,
@@ -197,6 +267,8 @@ impl NetworkService {
                 peers: config.peers,
                 commands,
                 events: events_tx,
+                subscribed_peers: Vec::new(),
+                payload_cache: BTreeMap::new(),
             },
             NetworkHandle {
                 commands: command_tx,
@@ -212,10 +284,17 @@ impl NetworkService {
             tokio::select! {
                 _ = redial.tick() => self.dial_static_peers(),
                 command = self.commands.recv() => {
-                    let Some(NetworkCommand::Publish(message)) = command else {
+                    let Some(command) = command else {
                         return;
                     };
-                    self.publish(message);
+                    match command {
+                        NetworkCommand::Publish { block_number, message } => {
+                            self.publish(block_number, message);
+                        }
+                        NetworkCommand::RequestPayload(block_number) => {
+                            self.request_payload(block_number);
+                        }
+                    }
                 }
                 swarm_event = self.swarm.select_next_some() => {
                     self.on_swarm_event(swarm_event).await;
@@ -238,7 +317,7 @@ impl NetworkService {
         }
     }
 
-    fn publish(&mut self, message: Vec<u8>) {
+    fn publish(&mut self, block_number: u64, message: Vec<u8>) {
         let compressed = match compress(&message) {
             Ok(compressed) => compressed,
             Err(error) => {
@@ -251,9 +330,14 @@ impl NetworkService {
                 return;
             }
         };
+        self.payload_cache.insert(block_number, compressed.clone());
+        while self.payload_cache.len() > BACKFILL_CACHE_SIZE {
+            self.payload_cache.pop_first();
+        }
         match self
             .swarm
             .behaviour_mut()
+            .gossip
             .publish(self.topic.clone(), compressed)
         {
             Ok(message_id) => event!(
@@ -271,7 +355,25 @@ impl NetworkService {
         }
     }
 
-    async fn on_swarm_event(&mut self, event: SwarmEvent<gossipsub::Event>) {
+    fn request_payload(&mut self, block_number: u64) {
+        if self.subscribed_peers.is_empty() {
+            event!(
+                name: "eez.p2p.backfill.no_peer",
+                Level::DEBUG,
+                block.number = block_number,
+                "cannot request unsafe payload without a subscribed peer",
+            );
+            return;
+        }
+        for peer_id in self.subscribed_peers.clone() {
+            self.swarm
+                .behaviour_mut()
+                .backfill
+                .send_request(&peer_id, PayloadRequest { block_number });
+        }
+    }
+
+    async fn on_swarm_event(&mut self, event: SwarmEvent<BehaviourEvent>) {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 event!(
@@ -283,15 +385,28 @@ impl NetworkService {
                 );
                 let _ = self.events.send(NetworkEvent::Listening(address)).await;
             }
-            SwarmEvent::Behaviour(gossipsub::Event::Subscribed { peer_id, topic })
-                if topic == self.topic.hash() =>
-            {
+            SwarmEvent::Behaviour(BehaviourEvent::Gossip(gossipsub::Event::Subscribed {
+                peer_id,
+                topic,
+            })) if topic == self.topic.hash() => {
+                if !self.subscribed_peers.contains(&peer_id) {
+                    self.subscribed_peers.push(peer_id);
+                }
                 let _ = self
                     .events
                     .send(NetworkEvent::PeerSubscribed(peer_id))
                     .await;
             }
-            SwarmEvent::Behaviour(gossipsub::Event::Message { message, .. }) => {
+            SwarmEvent::Behaviour(BehaviourEvent::Gossip(gossipsub::Event::Unsubscribed {
+                peer_id,
+                topic,
+            })) if topic == self.topic.hash() => {
+                self.subscribed_peers.retain(|peer| *peer != peer_id);
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Gossip(gossipsub::Event::Message {
+                message,
+                ..
+            })) => {
                 let message = match decompress(&message.data) {
                     Ok(message) => message,
                     Err(error) => {
@@ -306,7 +421,67 @@ impl NetworkService {
                 };
                 let _ = self.events.send(NetworkEvent::Message(message)).await;
             }
+            SwarmEvent::Behaviour(BehaviourEvent::Backfill(event)) => {
+                self.on_backfill_event(event).await;
+            }
+            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                self.subscribed_peers.retain(|peer| *peer != peer_id);
+            }
             _ => {}
+        }
+    }
+
+    async fn on_backfill_event(
+        &mut self,
+        event: request_response::Event<PayloadRequest, PayloadResponse>,
+    ) {
+        let request_response::Event::Message { message, .. } = event else {
+            return;
+        };
+        match message {
+            request_response::Message::Request {
+                request, channel, ..
+            } => {
+                let response = PayloadResponse {
+                    block_number: request.block_number,
+                    message: self.payload_cache.get(&request.block_number).cloned(),
+                };
+                if self
+                    .swarm
+                    .behaviour_mut()
+                    .backfill
+                    .send_response(channel, response)
+                    .is_err()
+                {
+                    event!(
+                        name: "eez.p2p.backfill.response_failed",
+                        Level::DEBUG,
+                        block.number = request.block_number,
+                        "backfill response channel closed",
+                    );
+                }
+            }
+            request_response::Message::Response { response, .. } => {
+                let Some(message) = response.message else {
+                    let _ = self
+                        .events
+                        .send(NetworkEvent::BackfillUnavailable(response.block_number))
+                        .await;
+                    return;
+                };
+                match decompress(&message) {
+                    Ok(message) => {
+                        let _ = self.events.send(NetworkEvent::Message(message)).await;
+                    }
+                    Err(error) => event!(
+                        name: "eez.p2p.backfill.decode_rejected",
+                        Level::WARN,
+                        block.number = response.block_number,
+                        %error,
+                        "rejected malformed Snappy backfill payload",
+                    ),
+                }
+            }
         }
     }
 }
@@ -400,7 +575,7 @@ mod tests {
         .unwrap();
 
         let expected = vec![0x5a; 8_192];
-        publish_handle.publish(expected.clone()).await.unwrap();
+        publish_handle.publish(42, expected.clone()).await.unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -413,7 +588,64 @@ mod tests {
                     assert_eq!(message, expected);
                     break;
                 }
-                NetworkEvent::Listening(_) | NetworkEvent::PeerSubscribed(_) => {}
+                NetworkEvent::Listening(_)
+                | NetworkEvent::PeerSubscribed(_)
+                | NetworkEvent::BackfillUnavailable(_) => {}
+            }
+        }
+
+        publisher_task.abort();
+        follower_task.abort();
+    }
+
+    #[tokio::test]
+    async fn subscribed_peer_can_backfill_cached_message() {
+        let (publisher, publish_handle, mut publisher_events) =
+            NetworkService::new(local_config(0, Vec::new())).unwrap();
+        let publisher_task = tokio::spawn(publisher.run());
+        let publish_addr = match timeout(Duration::from_secs(5), publisher_events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            NetworkEvent::Listening(address) => address,
+            event => panic!("expected listen address, got {event:?}"),
+        };
+        let expected = vec![0xa5; 8_192];
+        publish_handle.publish(42, expected.clone()).await.unwrap();
+
+        let (follower, follower_handle, mut follower_events) =
+            NetworkService::new(local_config(0, vec![publish_addr])).unwrap();
+        let follower_task = tokio::spawn(follower.run());
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(
+                    follower_events.recv().await,
+                    Some(NetworkEvent::PeerSubscribed(_))
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        follower_handle.request_payload(42).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match timeout(remaining, follower_events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                NetworkEvent::Message(message) => {
+                    assert_eq!(message, expected);
+                    break;
+                }
+                NetworkEvent::Listening(_)
+                | NetworkEvent::PeerSubscribed(_)
+                | NetworkEvent::BackfillUnavailable(_) => {}
             }
         }
 

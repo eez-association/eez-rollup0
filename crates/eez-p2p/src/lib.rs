@@ -19,7 +19,9 @@
 
 mod network;
 
-pub use network::{NetworkConfig, NetworkEvent, NetworkHandle, NetworkService};
+pub use network::{
+    BACKFILL_CACHE_SIZE, NetworkConfig, NetworkEvent, NetworkHandle, NetworkService,
+};
 
 use alloy_eips::eip7685::{EMPTY_REQUESTS_HASH, Requests, RequestsOrHash};
 use alloy_primitives::{Address, B256, Signature, U256, keccak256};
