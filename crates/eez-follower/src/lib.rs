@@ -70,14 +70,9 @@ struct FollowerArgs {
 }
 
 impl FollowerArgs {
-    fn network_config(
-        &self,
-        chain_id: u64,
-        authorized_signer: Address,
-    ) -> eyre::Result<NetworkConfig> {
+    fn network_config(&self, chain_id: u64) -> eyre::Result<NetworkConfig> {
         NetworkConfig::parse(
             chain_id,
-            authorized_signer,
             &self.p2p_listen_addr,
             self.p2p_peers.iter().map(String::as_str),
         )
@@ -266,7 +261,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
 
     if let Some(unsafe_block_signer_address) = ext.unsafe_block_signer_address {
         let (p2p_service, p2p_handle, p2p_events) =
-            NetworkService::new(ext.network_config(l2_chain_id, unsafe_block_signer_address)?)?;
+            NetworkService::new(ext.network_config(l2_chain_id)?)?;
         task_executor.spawn_critical_task("eez-unsafe-block-p2p", p2p_service.run());
         let follower = UnsafeHeadFollower::new(
             block_committer,
