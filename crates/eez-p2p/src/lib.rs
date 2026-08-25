@@ -282,18 +282,6 @@ pub fn verify_payload(
     chain_id: u64,
     authorized_signer: Address,
 ) -> Result<ExecutionData, ProtocolError> {
-    let body = authenticate_message(message, chain_id, authorized_signer)?;
-    decode_body(body)
-}
-
-/// Authenticate the application-layer signature before decoding an untrusted
-/// execution payload. The network service uses this cheaper boundary to avoid
-/// relaying unauthorized messages through GossipSub.
-fn authenticate_message(
-    message: &[u8],
-    chain_id: u64,
-    authorized_signer: Address,
-) -> Result<&[u8], ProtocolError> {
     if message.len() <= SIGNATURE_LEN {
         return Err(ProtocolError::MessageTooShort {
             actual: message.len(),
@@ -316,7 +304,7 @@ fn authenticate_message(
             expected: authorized_signer,
         });
     }
-    Ok(body)
+    decode_body(body)
 }
 
 #[cfg(test)]
