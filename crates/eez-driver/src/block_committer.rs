@@ -27,7 +27,7 @@ use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{BuiltPayload, ExecutionPayload, PayloadKind, PayloadTypes};
 use reth_primitives_traits::{HeaderTy, NodePrimitives, SealedHeader, SealedHeaderFor};
 use reth_storage_api::{BlockIdReader, BlockReader};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{Level, event};
 
 use crate::error::{DriverError, DriverResult};
@@ -37,6 +37,10 @@ use crate::error::{DriverError, DriverResult};
 /// more than a couple at a time would indicate the engine is wedged
 /// anyway.
 const COMMAND_BUFFER: usize = 16;
+
+/// Locally produced payloads are consumed immediately by one publisher task.
+/// Extra capacity absorbs short network stalls without delaying engine traffic.
+const PRODUCED_PAYLOAD_BUFFER: usize = 64;
 
 /// Successful result of [`BlockCommitterHandle::commit_sequenced`].
 pub struct CommitOutcome<T: PayloadTypes> {
@@ -116,6 +120,7 @@ pub struct DeriveOutcome {
 /// lag).
 pub struct BlockCommitterHandle<T: PayloadTypes> {
     sender: mpsc::Sender<CommitCommand<T>>,
+    produced_payloads: broadcast::Sender<T::ExecutionData>,
     last_header: Arc<RwLock<SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>>>,
     /// Held by Deriver across a whole batch reconcile; blocks
     /// `commit_sequenced` so sequencer ticks can't interleave
@@ -126,6 +131,7 @@ impl<T: PayloadTypes> Clone for BlockCommitterHandle<T> {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            produced_payloads: self.produced_payloads.clone(),
             last_header: Arc::clone(&self.last_header),
             reconcile_lock: Arc::clone(&self.reconcile_lock),
         }
@@ -159,6 +165,7 @@ where
         witness_sender: Option<mpsc::UnboundedSender<B256>>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(COMMAND_BUFFER);
+        let (produced_payloads, _) = broadcast::channel(PRODUCED_PAYLOAD_BUFFER);
         let initial_hash = initial_header.hash();
         let last_header = Arc::new(RwLock::new(initial_header));
         let actor = Actor {
@@ -170,10 +177,12 @@ where
             safe_header,
             finalized_hash,
             witness_sender,
+            produced_payloads: produced_payloads.clone(),
         };
         tokio::spawn(actor.run());
         Self {
             sender,
+            produced_payloads,
             last_header,
             reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -257,6 +266,16 @@ where
         SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>: Clone,
     {
         self.last_header.read().unwrap().clone()
+    }
+
+    /// Subscribe to complete payloads after this committer canonicalizes them.
+    ///
+    /// Only locally produced blocks are emitted: normal sequencer builds and
+    /// pre-built Sync blocks whose `feed_witness` flag is true. L1 replay on a
+    /// follower does not echo blocks back into the unsafe-block network.
+    #[must_use]
+    pub fn subscribe_produced_payloads(&self) -> broadcast::Receiver<T::ExecutionData> {
+        self.produced_payloads.subscribe()
     }
 
     /// Builds a payload with the given attributes if the actor's head
@@ -479,6 +498,9 @@ struct Actor<T: PayloadTypes> {
     /// Sync block via `commit_one_prebuilt`); a follower / L1-reconcile re-derive
     /// passes `feed_witness=false` so the prover isn't double-fed the same block.
     witness_sender: Option<mpsc::UnboundedSender<B256>>,
+    /// Complete locally produced payloads, emitted only after newPayload and
+    /// the canonicalizing forkchoice update both succeed.
+    produced_payloads: broadcast::Sender<T::ExecutionData>,
 }
 
 impl<T> Actor<T>
@@ -673,6 +695,7 @@ where
     ) -> DriverResult<DeriveOutcome> {
         let block_hash = payload.block_hash();
         let block_number = payload.block_number();
+        let produced_payload = feed_witness.then(|| payload.clone());
 
         let np = self
             .to_engine
@@ -710,6 +733,9 @@ where
         if feed_witness && let Some(sender) = &self.witness_sender {
             let _ = sender.send(block_hash);
         }
+        if let Some(payload) = produced_payload {
+            let _ = self.produced_payloads.send(payload);
+        }
 
         Ok(DeriveOutcome {
             block_hash,
@@ -745,7 +771,12 @@ where
             .map_err(DriverError::engine_rpc)?;
 
         let header: SealedHeader<_> = payload.block().sealed_header().clone();
-        let exec_payload = T::block_to_payload(payload.block().clone(), None);
+        // Convert the actual builder artifact, not only its sealed block. The
+        // built payload retains the EIP-7685 request list required by
+        // newPayloadV4 and unsafe-block propagation; a block header carries
+        // only the requests hash.
+        let exec_payload = T::ExecutionData::from(payload.clone());
+        let produced_payload = exec_payload.clone();
 
         let np = self
             .to_engine
@@ -780,6 +811,7 @@ where
         if let Some(sender) = &self.witness_sender {
             let _ = sender.send(header.hash());
         }
+        let _ = self.produced_payloads.send(produced_payload);
         Ok(CommitOutcome { header })
     }
 }
