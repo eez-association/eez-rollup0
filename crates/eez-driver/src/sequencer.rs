@@ -170,6 +170,9 @@ where
     /// Optional speculative-depth cap. None = no limit
     /// (single-composer / follower mode). See `DEFAULT_MAX_SPECULATIVE_DEPTH`.
     speculative_limit: Option<SpeculativeLimit>,
+    /// Consecutive Sync blocks skipped for off-grid drift. A skip self-heals
+    /// next trigger; a run of them is a stall and must be loud (invariant 7).
+    off_grid_skips: u32,
     /// Optional Sync-slot block producer + the rollup id it composes
     /// for (which HeldPool to drain). When present, called before each
     /// Sync block to fetch that rollup's cross-chain content. `None` =
@@ -238,6 +241,7 @@ where
             committer,
             timing,
             speculative_limit: None,
+            off_grid_skips: 0,
             sync_slot_composer: None,
         })
     }
@@ -446,6 +450,20 @@ where
         ready_ms > deadline_ms
     }
 
+    /// One skip self-heals next trigger; a run of them means production is
+    /// wedged, so escalate past a few.
+    fn note_off_grid_skip(&mut self) {
+        self.off_grid_skips = self.off_grid_skips.saturating_add(1);
+        if self.off_grid_skips >= 3 {
+            event!(
+                name: "eez.sequencer.sync_slot.off_grid_stalled",
+                Level::ERROR,
+                consecutive_skips = self.off_grid_skips,
+                "consecutive Sync blocks skipped for off-grid drift; production is not advancing",
+            );
+        }
+    }
+
     /// L1-anchored handler: read current head, compute the per-trigger
     /// Live/Future/Sync split via
     /// [`RollupTiming::per_trigger_composition`], produce accordingly.
@@ -480,6 +498,13 @@ where
             "computed per-trigger slot composition",
         );
 
+        // Target an absolute height, not a count. The committer is shared, so a
+        // count re-derived from a moved head would land the Sync block off-grid.
+        let terminal = match comp {
+            SlotComposition::Catchup { live } => Some(head + live + 1),
+            SlotComposition::Slot { .. } | SlotComposition::Idle => None,
+        };
+
         match comp {
             SlotComposition::Idle => {}
             SlotComposition::Catchup { live } => {
@@ -500,6 +525,17 @@ where
                 // Terminal Sync block, parent-paced. Empty
                 // (`SyncSlotMode::Catchup`): a behind block can't ts-align its
                 // postBatch, so cross-chain waits for the next Slot.
+                if terminal != Some(self.committer.last_header().number() + 1) {
+                    event!(
+                        name: "eez.sequencer.sync_slot.off_grid_skipped",
+                        Level::WARN,
+                        head_now = self.committer.last_header().number(),
+                        terminal = ?terminal,
+                        "head moved during the burst; skipping the Sync block rather than placing it off-grid",
+                    );
+                    self.note_off_grid_skip();
+                    return Ok(());
+                }
                 let last_header = self.committer.last_header();
                 let sync_ts = last_header
                     .timestamp()
@@ -525,6 +561,7 @@ where
                         }
                         return Err(err);
                     }
+                    self.off_grid_skips = 0;
                 } else {
                     match self.commit_one(SlotKind::Sync, &last_header).await {
                         Ok(()) => {}
@@ -534,6 +571,7 @@ where
                         }
                         Err(err) => return Err(err),
                     }
+                    self.off_grid_skips = 0;
                 }
             }
             SlotComposition::Slot { live, future } => {
@@ -573,17 +611,19 @@ where
                     .timestamp()
                     .saturating_add(self.timing.l2_block_time().as_secs());
                 if expected_sync_ts != sync_slot_timestamp {
-                    // Equal on-grid; a mismatch means off-grid drift. Stamp
-                    // the parent-derived (re-derivable) value so the deriver
-                    // can still reproduce the block.
+                    // The head moved under us. This block would settle, and an
+                    // off-grid root wedges the deriver. Skip; next trigger realigns.
                     event!(
-                        name: "eez.sequencer.sync_slot.timestamp_mismatch",
+                        name: "eez.sequencer.sync_slot.off_grid_skipped",
                         Level::WARN,
                         expected = expected_sync_ts,
                         sync_slot_timestamp,
                         head = last_header.number(),
-                        "sync-slot timestamp drift: parent + L2_block_time != Scheduler-supplied sync_slot_timestamp; producing with parent-derived value",
+                        sync_slot_block_height,
+                        "sync-slot drift: parent + L2_block_time != the L1-derived sync timestamp; skipping the Sync block rather than settling off-grid",
                     );
+                    self.note_off_grid_skip();
+                    return Ok(());
                 }
 
                 // Defer-on-lateness: a late trigger that can't land the bundle
@@ -647,6 +687,7 @@ where
                         }
                         Err(err) => return Err(err),
                     }
+                    self.off_grid_skips = 0;
                     return Ok(());
                 }
 
@@ -658,6 +699,7 @@ where
                     }
                     Err(err) => return Err(err),
                 }
+                self.off_grid_skips = 0;
             }
         }
         Ok(())
