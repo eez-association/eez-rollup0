@@ -66,9 +66,6 @@ const TEST_L2_GENESIS_ENV: &str = "EEZ_TEST_L2_GENESIS_PATH";
 const TX_SPAM_INTERVAL: Duration = Duration::from_secs(1);
 
 static LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
-// Probe sockets are released before child processes bind. Remember their
-// ports so concurrent nodes in one test cannot select the same number.
-static ASSIGNED_PORTS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 static WORKSPACE_BUILD_LOCK: Mutex<()> = Mutex::new(());
 
 /// Stable values carried in the `test_signal` field of JSON tracing events.
@@ -3022,9 +3019,18 @@ impl CrossChainConfig {
         let rollup_manager_address = deployer.create(2);
         let initial_state = l2_genesis_state_root();
         let ts = now_unix_secs();
-        // Reserves the adjacent WS port too, so no later probe hands it out.
-        let l1_http_port = probe_unique_http_port(&mut handed_out_ports());
-        let l1_auth_port = free_port();
+        // Reserve every listener port under one lock. The HTTP probe also
+        // reserves its adjacent WS port.
+        let (l1_http_port, l1_auth_port, l1_p2p_port, l1_xchain_port, l2_xchain_port) = {
+            let mut ports = handed_out_ports();
+            (
+                probe_unique_http_port(&mut ports),
+                probe_unique_tcp_port(&mut ports),
+                probe_unique_tcp_udp_port(&mut ports),
+                probe_unique_tcp_port(&mut ports),
+                probe_unique_tcp_port(&mut ports),
+            )
+        };
         Ok(Self {
             l1_http_port,
             l1_auth_port,

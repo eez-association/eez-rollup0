@@ -173,12 +173,12 @@ assert_proof_for_height() {
 run_scenario() {
     local direction="$1" scenario="$2" source_rpc="$3" front="$4" key="$5" sender="$6"
     local wrapper="$7" target="$8" target_rpc="$9"
-    local chain_id nonce gas_price raw hash node_baseline signer_baseline
+    local chain_id nonce gas_price raw hash value node_baseline signer_baseline
     local source_blocks all_target_logs target_logs target_blocks sync_height final_value result
     local completed_before target_before target_event_count target_event_count_before target_event_deadline
     local expected_final
     local hashes=() actual_results=()
-    local expected_results=() index
+    local expected_results=() index step
 
     echo
     echo "==> $direction $scenario-state chaining: waiting for a fresh drain window"
@@ -196,29 +196,47 @@ run_scenario() {
     target_event_count_before=$(jq -r 'length' <<<"$all_target_logs")
     target_event_count="$target_event_count_before"
 
-    if [[ "$scenario" == "destination" ]]; then
-        [[ "$completed_before" == "3" && "$target_before" == "3" ]] || {
-            echo "$direction destination scenario requires wrapper count=3 and target value=3; got $completed_before and $target_before" >&2
+    case "$scenario" in
+        source)
+            [[ "$completed_before" == "0" && "$target_before" == "0" ]] || {
+                echo "$direction source scenario requires fresh wrapper and target state; got $completed_before and $target_before" >&2
+                return 1
+            }
+            expected_results=('[1,true,true,1]' '[2,true,true,2]' '[3,true,true,3]')
+            expected_final=3
+            ;;
+        destination)
+            [[ "$completed_before" == "3" && "$target_before" == "3" ]] || {
+                echo "$direction destination scenario requires wrapper count=3 and target value=3; got $completed_before and $target_before" >&2
+                return 1
+            }
+            expected_results=('[1,true,true,1]' '[1,true,false,1]' '[1,true,false,1]')
+            expected_final=1
+            ;;
+        mixed)
+            [[ "$completed_before" == "6" && "$target_before" == "1" ]] || {
+                echo "$direction mixed scenario requires wrapper count=6 and target value=1; got $completed_before and $target_before" >&2
+                return 1
+            }
+            # The fixed middle call sees the first write; the final derived call sees both frames.
+            expected_results=('[7,true,true,7]' '[7,true,false,7]' '[9,true,true,9]')
+            expected_final=9
+            ;;
+        *)
+            echo "unknown state-chaining scenario: $scenario" >&2
             return 1
-        }
-        expected_results=('[1,true,true,1]' '[1,true,false,1]' '[1,true,false,1]')
-        expected_final=1
-    else
-        [[ "$completed_before" == "0" && "$target_before" == "0" ]] || {
-            echo "$direction source scenario requires fresh wrapper and target state; got $completed_before and $target_before" >&2
-            return 1
-        }
-        expected_results=('[1,true,true,1]' '[2,true,true,2]' '[3,true,true,3]')
-        expected_final=3
-    fi
+            ;;
+    esac
 
     echo "==> $direction $scenario-state chaining: submitting three separate transactions"
-    for _ in 1 2 3; do
-        if [[ "$scenario" == "destination" ]]; then
+    for step in 1 2 3; do
+        if [[ "$scenario" == "destination" || ( "$scenario" == "mixed" && "$step" == "2" ) ]]; then
+            value=1
+            [[ "$scenario" == "mixed" ]] && value=7
             raw=$(cast mktx --chain-id "$chain_id" --private-key "$key" --nonce "$nonce" \
                 --gas-limit 800000 --gas-price "$gas_price" --priority-gas-price "$PRIORITY_GAS_PRICE" \
                 --rpc-url "$source_rpc" \
-                "$wrapper" 'setViaProxy(uint256)' 1)
+                "$wrapper" 'setViaProxy(uint256)' "$value")
         else
             raw=$(cast mktx --chain-id "$chain_id" --private-key "$key" --nonce "$nonce" \
                 --gas-limit 800000 --gas-price "$gas_price" --priority-gas-price "$PRIORITY_GAS_PRICE" \
@@ -278,6 +296,78 @@ run_scenario() {
     assert_root_convergence "$sync_height"
 }
 
+run_mixed_direction_scenario() {
+    local node_baseline signer_baseline inbound_nonce outbound_nonce l1_gas_price l2_gas_price
+    local inbound_raw outbound_raw inbound_hash outbound_hash inbound_result outbound_result
+    local l2_events_before l2_events event_deadline inbound_block outbound_block sync_height
+
+    echo
+    echo "==> mixed-direction state chaining: waiting for a fresh drain window"
+    # Build on the final state of the six directional scenarios above.
+    [[ $(retry cast call "$INBOUND_WRAPPER" 'completedProxyCalls()(uint256)' --rpc-url "$L1") == "9" ]]
+    [[ $(retry cast call "$OUTBOUND_WRAPPER" 'completedProxyCalls()(uint256)' --rpc-url "$L2") == "9" ]]
+    [[ $(retry cast call "$L2_VALUE" 'value()(uint256)' --rpc-url "$L2") == "9" ]]
+    [[ $(retry cast call "$L1_VALUE" 'value()(uint256)' --rpc-url "$L1") == "9" ]]
+
+    wait_for_sync_boundary
+    refresh_signer_log
+    node_baseline=$(wc -l <"$NODE_LOG")
+    signer_baseline=$(wc -l <"$SIGNER_LOG")
+    inbound_nonce=$(retry cast nonce "$INBOUND_SENDER" --rpc-url "$L1")
+    outbound_nonce=$(retry cast nonce "$OUTBOUND_SENDER" --rpc-url "$L2")
+    l1_gas_price=$(gas_price_for "$L1")
+    l2_gas_price=$(gas_price_for "$L2")
+    l2_events=$(retry cast logs --address "$L2_VALUE" --from-block 0 --to-block latest \
+        'ValueSet(address,uint256)' --rpc-url "$L2" --json)
+    l2_events_before=$(jq -r 'length' <<<"$l2_events")
+
+    inbound_raw=$(cast mktx --chain-id "$(cast chain-id --rpc-url "$L1")" \
+        --private-key "$INBOUND_KEY" --nonce "$inbound_nonce" --gas-limit 800000 \
+        --gas-price "$l1_gas_price" --priority-gas-price "$PRIORITY_GAS_PRICE" --rpc-url "$L1" \
+        "$INBOUND_WRAPPER" 'setViaProxy(uint256)' 11)
+    outbound_raw=$(cast mktx --chain-id "$(cast chain-id --rpc-url "$L2")" \
+        --private-key "$OUTBOUND_KEY" --nonce "$outbound_nonce" --gas-limit 800000 \
+        --gas-price "$l2_gas_price" --priority-gas-price "$PRIORITY_GAS_PRICE" --rpc-url "$L2" \
+        "$OUTBOUND_WRAPPER" 'setViaProxy(uint256)' 13)
+    [[ "$inbound_raw" =~ ^0x[0-9a-fA-F]+$ && "$outbound_raw" =~ ^0x[0-9a-fA-F]+$ ]] \
+        || { echo "could not build mixed-direction transactions" >&2; return 1; }
+    inbound_hash=$(cast keccak "$inbound_raw")
+    outbound_hash=$(cast keccak "$outbound_raw")
+    send_front "$L1F" "$inbound_raw" "$inbound_hash"
+    send_front "$L2F" "$outbound_raw" "$outbound_hash"
+
+    wait_for_receipts "$L1" "$inbound_hash"
+    wait_for_receipts "$L2" "$outbound_hash"
+    inbound_result=$(wrapped_result "$inbound_hash" "$L1" "$INBOUND_WRAPPER")
+    outbound_result=$(wrapped_result "$outbound_hash" "$L2" "$OUTBOUND_WRAPPER")
+    [[ "$inbound_result" == '[11,true,true,11]' ]] \
+        || { echo "mixed inbound returned $inbound_result" >&2; return 1; }
+    [[ "$outbound_result" == '[13,true,true,13]' ]] \
+        || { echo "mixed outbound returned $outbound_result" >&2; return 1; }
+
+    event_deadline=$((SECONDS + RECEIPT_WAIT_SECS))
+    while (( SECONDS < event_deadline )); do
+        l2_events=$(retry cast logs --address "$L2_VALUE" --from-block 0 --to-block latest \
+            'ValueSet(address,uint256)' --rpc-url "$L2" --json)
+        (( $(jq -r 'length' <<<"$l2_events") >= l2_events_before + 1 )) && break
+        sleep 3
+    done
+    [[ $(jq -r 'length' <<<"$l2_events") == "$((l2_events_before + 1))" ]] \
+        || { echo "mixed inbound destination effect was not unique" >&2; return 1; }
+    inbound_block=$(jq -er '.[-1].blockNumber' <<<"$l2_events")
+    outbound_block=$(receipt_json "$outbound_hash" "$L2" | jq -er '.result.blockNumber')
+    # Pin the canonical mixed-direction order from the Rust regression.
+    [[ "${inbound_block,,}" == "${outbound_block,,}" ]] \
+        || { echo "mixed-direction calls split across L2 blocks: inbound=$inbound_block outbound=$outbound_block" >&2; return 1; }
+
+    [[ $(retry cast call "$L2_VALUE" 'value()(uint256)' --rpc-url "$L2") == "11" ]]
+    [[ $(retry cast call "$L1_VALUE" 'value()(uint256)' --rpc-url "$L1") == "13" ]]
+    sync_height=$(cast to-dec "$inbound_block")
+    echo "    ✓ inbound delivery and outbound source transaction share Sync height $sync_height"
+    assert_proof_for_height "$sync_height" "$node_baseline" "$signer_baseline"
+    assert_root_convergence "$sync_height"
+}
+
 echo "════════════════════════════════════════════════════════════════"
 echo " STATE CHAINING TEST (kurtosis)"
 echo "════════════════════════════════════════════════════════════════"
@@ -316,10 +406,15 @@ run_scenario inbound source "$L1" "$L1F" "$INBOUND_KEY" "$INBOUND_SENDER" \
     "$INBOUND_WRAPPER" "$L2_VALUE" "$L2"
 run_scenario inbound destination "$L1" "$L1F" "$INBOUND_KEY" "$INBOUND_SENDER" \
     "$INBOUND_WRAPPER" "$L2_VALUE" "$L2"
+run_scenario inbound mixed "$L1" "$L1F" "$INBOUND_KEY" "$INBOUND_SENDER" \
+    "$INBOUND_WRAPPER" "$L2_VALUE" "$L2"
 run_scenario outbound source "$L2" "$L2F" "$OUTBOUND_KEY" "$OUTBOUND_SENDER" \
     "$OUTBOUND_WRAPPER" "$L1_VALUE" "$L1"
 run_scenario outbound destination "$L2" "$L2F" "$OUTBOUND_KEY" "$OUTBOUND_SENDER" \
     "$OUTBOUND_WRAPPER" "$L1_VALUE" "$L1"
+run_scenario outbound mixed "$L2" "$L2F" "$OUTBOUND_KEY" "$OUTBOUND_SENDER" \
+    "$OUTBOUND_WRAPPER" "$L1_VALUE" "$L1"
+run_mixed_direction_scenario
 
 echo
-echo "==> STATE CHAINING TEST PASSED (source + destination, inbound + outbound)"
+echo "==> STATE CHAINING TEST PASSED"

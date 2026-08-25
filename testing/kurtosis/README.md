@@ -405,12 +405,15 @@ Useful workload controls include:
 bash testing/kurtosis/scripts/verify-state-chaining.sh
 ```
 
-The regression covers both source- and destination-state chaining in each
-direction. It requires each group of three transactions to share one Sync
-block and asserts every ordered return: repeated destination calls return
-`changed = true, false, false`, while source-derived calls send `1, 2, 3`.
-It also verifies bundle settlement, proof-signer acceptance, and L1/L2
-state-root convergence.
+The regression covers source-state, destination-state, and mixed-operation
+chaining in each direction. It requires each group of three transactions to
+share one Sync block and asserts every ordered return: repeated destination
+calls return `changed = true, false, false`, source-derived calls send
+`1, 2, 3`, and the mixed sequence proves that fixed and source-derived calls
+see one another's intermediate state. A final mixed-direction drain verifies
+that an outbound source transaction and inbound delivery share the canonical
+L2 Sync block. Every scenario also verifies bundle settlement, proof-signer
+acceptance, and L1/L2 state-root convergence.
 
 ### Run all included workloads
 
