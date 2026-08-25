@@ -346,12 +346,17 @@ async fn identical_outbound_calls_in_separate_transactions_chain_state() {
     .await
     .expect("both identical outbound calls did not return to the source wrapper");
 
-    let carried: Vec<Vec<Bytes>> = batches(&w)
-        .await
-        .iter()
-        .map(|batch| outbound_calls(batch, w.outbound_value))
-        .filter(|calls| !calls.is_empty())
-        .collect();
+    let carried: Vec<Vec<Bytes>> = wait_for(SETTLE_TIMEOUT, || async {
+        let carried: Vec<Vec<Bytes>> = batches(&w)
+            .await
+            .iter()
+            .map(|batch| outbound_calls(batch, w.outbound_value))
+            .filter(|calls| !calls.is_empty())
+            .collect();
+        Ok((!carried.is_empty()).then_some(carried))
+    })
+    .await
+    .expect("identical outbound calls never reached L1");
     assert_eq!(
         carried,
         vec![vec![Bytes::from(call.clone()), Bytes::from(call)]],

@@ -23,8 +23,8 @@ signed_window_count=0
 remote_attestation_count=0
 export KURTOSIS_ARGS_FILE="$RESULT_DIR/ci-args.yaml"
 
-SIGNED_WINDOW_EVENT='event_name="eez.proof_signer.window_signed"'
-REMOTE_ATTESTATION_EVENT='event_name="eez.prover_client.attested"'
+SIGNED_WINDOW_EVENT='eez.proof_signer.window_signed'
+REMOTE_ATTESTATION_EVENT='eez.prover_client.attested'
 
 capture_service_log() {
     local service="$1"

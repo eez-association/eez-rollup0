@@ -226,8 +226,8 @@ wait_for_poison_eviction() {
         refresh_node_log
         evidence=$(strip_ansi <"$NODE_LOG" \
             | grep -F 'eez.composer.cc_compose.poison_eviction_completed' \
-            | grep -F "tx_hash=$hash" \
-            | grep -E "direction=\"?$direction\"?" \
+            | grep -E "tx_hash=$hash|\"tx_hash\":\"$hash\"" \
+            | grep -E "direction=\"?$direction\"?|\"direction\":\"$direction\"" \
             | tail -1 || true)
         if [[ -n "$evidence" && "$(receipt_status "$hash" "$rpc")" == "missing" ]]; then
             return 0

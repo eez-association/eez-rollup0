@@ -1847,6 +1847,7 @@ where
                         event!(
                             name: "eez.composer.cc_compose.outbound_multicall_unsupported",
                             Level::WARN,
+                            event_name = "eez.composer.cc_compose.outbound_multicall_unsupported",
                             rollup_id,
                             tx_idx = idx,
                             tx_hash = %held.hash,

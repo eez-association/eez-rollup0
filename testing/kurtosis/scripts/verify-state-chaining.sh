@@ -65,11 +65,11 @@ refresh_signer_log() { kurtosis service logs -a "$ENCLAVE" eez-proof-signer >"$S
 wait_for_sync_boundary() {
     local baseline count=0 deadline
     refresh_node_log
-    baseline=$(strip_ansi <"$NODE_LOG" | grep -Fc 'eez.composer.sync_slot.pool_drained' || true)
+    baseline=$(strip_ansi <"$NODE_LOG" | grep -Fc 'eez.composer.sync_slot.drain' || true)
     deadline=$((SECONDS + ${EEZ_SYNC_BOUNDARY_WAIT_SECS:-60}))
     while (( SECONDS < deadline )); do
         refresh_node_log
-        count=$(strip_ansi <"$NODE_LOG" | grep -Fc 'eez.composer.sync_slot.pool_drained' || true)
+        count=$(strip_ansi <"$NODE_LOG" | grep -Fc 'eez.composer.sync_slot.drain' || true)
         (( count > baseline )) && return 0
         sleep 1
     done
@@ -149,16 +149,19 @@ assert_proof_for_height() {
         refresh_signer_log
         node_evidence=$(sed -n "$((node_baseline + 1)),\$p" "$NODE_LOG" | strip_ansi)
         signer_evidence=$(sed -n "$((signer_baseline + 1)),\$p" "$SIGNER_LOG" | strip_ansi)
-        settled=$(grep -F 'event_name="eez.composer.bundle.observed"' <<<"$node_evidence" \
-            | grep -E "sync_height=$sync_height([^0-9]|\$)" | grep -F 'settled=true' | tail -1 || true)
-        attested_hash=$(grep -F 'event_name="eez.prover_client.attested"' <<<"$node_evidence" \
-            | grep -E "to=$sync_height([^0-9]|$)" | grep -oE 'hash=0x[0-9a-fA-F]{64}' \
-            | tail -1 | cut -d= -f2 || true)
+        settled=$(grep -F 'eez.composer.bundle.observed' <<<"$node_evidence" \
+            | grep -E "sync_height=$sync_height([^0-9]|\$)|\"sync_height\":$sync_height([^0-9]|\$)" \
+            | grep -E 'settled=true|"settled":true' | tail -1 || true)
+        attested_hash=$(grep -F 'eez.prover_client.attested' <<<"$node_evidence" \
+            | grep -E "to=$sync_height([^0-9]|$)|\"to\":$sync_height([^0-9]|$)" \
+            | grep -oE 'hash[":=]+"?0x[0-9a-fA-F]{64}' \
+            | tail -1 | sed -E 's/^hash[":=]+"?//' || true)
         signed=""
         if [[ -n "$attested_hash" ]]; then
-            signed=$(grep -F 'event_name="eez.proof_signer.window_signed"' <<<"$signer_evidence" \
-                | grep -E "validated_to_block=$sync_height([^0-9]|$)" \
-                | grep -F "recomputed_public_inputs_hash=$attested_hash" | tail -1 || true)
+            signed=$(grep -F 'eez.proof_signer.window_signed' <<<"$signer_evidence" \
+                | grep -E "validated_to_block=$sync_height([^0-9]|$)|\"validated_to_block\":$sync_height([^0-9]|$)" \
+                | grep -E "recomputed_public_inputs_hash=$attested_hash|\"recomputed_public_inputs_hash\":\"$attested_hash\"" \
+                | tail -1 || true)
         fi
         [[ -n "$settled" && -n "$signed" ]] && {
             echo "    ✓ bundle settled and proof signer validated Sync height $sync_height"
