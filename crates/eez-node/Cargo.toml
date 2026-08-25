@@ -11,6 +11,7 @@ eez-composer.workspace      = true
 eez-deriver.workspace       = true
 eez-driver.workspace        = true
 eez-l1.workspace            = true
+eez-p2p.workspace           = true
 eez-protocol.workspace      = true
 eez-prover.workspace        = true
 eez-prover-client.workspace = true

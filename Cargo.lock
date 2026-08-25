@@ -3473,6 +3473,7 @@ dependencies = [
  "eez-deriver",
  "eez-driver",
  "eez-l1",
+ "eez-p2p",
  "eez-protocol",
  "eez-prover",
  "eez-prover-client",
