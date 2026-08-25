@@ -1,16 +1,21 @@
 //! Signed unsafe-block protocol shared by composers and followers.
 //!
-//! The wire message is `signature || body`, where `signature` is the 65-byte
-//! Ethereum `r || s || y_parity` signature and `body` is the SSZ-encoded
-//! Engine API V4 request tuple:
+//! The wire message is `signature || engine_version || body`, where `signature`
+//! is the 65-byte Ethereum `r || s || y_parity` signature and `body` is the
+//! SSZ-encoded Engine API request tuple for that endpoint version:
 //!
 //! ```text
-//! (ExecutionPayloadV3, blob_versioned_hashes, parent_beacon_block_root,
-//!  execution_requests)
+//! V1: ExecutionPayloadV1
+//! V2: ExecutionPayloadV2
+//! V3: (ExecutionPayloadV3, blob_versioned_hashes, parent_beacon_block_root)
+//! V4: (ExecutionPayloadV3, blob_versioned_hashes, parent_beacon_block_root,
+//!      execution_requests)
+//! V5: (ExecutionPayloadV4, blob_versioned_hashes, parent_beacon_block_root,
+//!      execution_requests)
 //! ```
 //!
-//! Keeping the body identical to Reth's SSZ `engine_newPayloadV4` request
-//! avoids a second fork-specific payload representation at the trust boundary.
+//! Keeping each body identical to Reth's SSZ Engine API request avoids a
+//! second fork-specific payload representation at the trust boundary.
 
 mod network;
 
@@ -20,7 +25,8 @@ use alloy_eips::eip7685::{EMPTY_REQUESTS_HASH, Requests, RequestsOrHash};
 use alloy_primitives::{Address, B256, Signature, U256, keccak256};
 use alloy_rpc_types_engine::{
     CancunPayloadFields, ExecutionData, ExecutionPayload, ExecutionPayloadSidecar,
-    ExecutionPayloadV3, PraguePayloadFields,
+    ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3, ExecutionPayloadV4,
+    PraguePayloadFields,
 };
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
@@ -29,7 +35,7 @@ use ssz::{Decode, Encode};
 /// Byte length of an Ethereum recoverable signature.
 pub const SIGNATURE_LEN: usize = 65;
 
-/// Protocol version tracks the Engine API request shape carried by the topic.
+/// Signed-block protocol version carried by the topic.
 pub const PROTOCOL_VERSION: u8 = 4;
 
 /// Returns the chain-scoped GossipSub topic for signed unsafe blocks.
@@ -44,9 +50,15 @@ pub enum ProtocolError {
     /// Message cannot contain a complete signature and body.
     #[error("signed block is too short: got {actual} bytes, need more than {SIGNATURE_LEN}")]
     MessageTooShort { actual: usize },
-    /// The execution payload is not the Cancun/Prague payload carried by V4.
-    #[error("only ExecutionPayloadV3 is supported on the V4 unsafe-block topic")]
+    /// The payload and sidecar combination is internally inconsistent.
+    #[error("unsupported execution payload and sidecar combination")]
     UnsupportedPayload,
+    /// The body does not identify its Engine API request version.
+    #[error("signed payload body is missing its Engine API version")]
+    MissingEngineVersion,
+    /// The body identifies an Engine API request shape this protocol cannot decode.
+    #[error("unsupported Engine API payload version {0}")]
+    UnsupportedEngineVersion(u8),
     /// Required Cancun fields are absent.
     #[error("payload is missing Cancun sidecar fields")]
     MissingCancunFields,
@@ -54,7 +66,7 @@ pub enum ProtocolError {
     #[error("payload is missing the Prague execution-request list")]
     MissingExecutionRequests,
     /// SSZ decoding failed.
-    #[error("invalid V4 execution payload SSZ: {0}")]
+    #[error("invalid Engine API execution payload SSZ: {0}")]
     InvalidSsz(String),
     /// Signature parsing failed.
     #[error("invalid sequencer signature: {0}")]
@@ -85,51 +97,141 @@ pub enum ProtocolError {
     BlockHashMismatch { claimed: B256, computed: B256 },
 }
 
-/// Encode complete Engine API V4 input as the signed message body.
-pub fn encode_body(data: &ExecutionData) -> Result<Vec<u8>, ProtocolError> {
-    let ExecutionPayload::V3(payload) = &data.payload else {
-        return Err(ProtocolError::UnsupportedPayload);
-    };
-    let cancun = data
-        .sidecar
-        .cancun()
-        .ok_or(ProtocolError::MissingCancunFields)?;
-    let prague = data
-        .sidecar
-        .prague()
-        .ok_or(ProtocolError::MissingExecutionRequests)?;
-    let empty_requests = Requests::default();
-    let requests = match &prague.requests {
-        RequestsOrHash::Requests(requests) => requests,
-        RequestsOrHash::Hash(hash) if *hash == EMPTY_REQUESTS_HASH => &empty_requests,
-        RequestsOrHash::Hash(_) => return Err(ProtocolError::MissingExecutionRequests),
-    };
+const PAYLOAD_ONLY_V4: u8 = 0x84;
 
-    Ok((
-        payload.clone(),
-        cancun.versioned_hashes.clone(),
-        cancun.parent_beacon_block_root,
-        requests.iter().cloned().collect::<Vec<_>>(),
-    )
-        .as_ssz_bytes())
+/// Encode a complete Engine API V1 through V5 input as the signed message body.
+///
+/// Reth's `dev` chain can activate Amsterdam on a header without Cancun
+/// sidecar fields. That non-mainnet combination uses `PAYLOAD_ONLY_V4`; normal
+/// rollup chains stay byte-identical to the corresponding Engine API request.
+pub fn encode_body(data: &ExecutionData) -> Result<Vec<u8>, ProtocolError> {
+    let (engine_version, encoded) =
+        match (&data.payload, data.sidecar.cancun(), data.sidecar.prague()) {
+            (ExecutionPayload::V1(payload), None, None) => (1, payload.as_ssz_bytes()),
+            (ExecutionPayload::V2(payload), None, None) => (2, payload.as_ssz_bytes()),
+            (ExecutionPayload::V3(payload), Some(cancun), None) => (
+                3,
+                (
+                    payload.clone(),
+                    cancun.versioned_hashes.clone(),
+                    cancun.parent_beacon_block_root,
+                )
+                    .as_ssz_bytes(),
+            ),
+            (ExecutionPayload::V3(payload), Some(cancun), Some(prague)) => (
+                4,
+                (
+                    payload.clone(),
+                    cancun.versioned_hashes.clone(),
+                    cancun.parent_beacon_block_root,
+                    execution_requests(prague)?,
+                )
+                    .as_ssz_bytes(),
+            ),
+            (ExecutionPayload::V4(payload), Some(cancun), Some(prague)) => (
+                5,
+                (
+                    payload.clone(),
+                    cancun.versioned_hashes.clone(),
+                    cancun.parent_beacon_block_root,
+                    execution_requests(prague)?,
+                )
+                    .as_ssz_bytes(),
+            ),
+            (ExecutionPayload::V4(payload), None, None) => {
+                (PAYLOAD_ONLY_V4, payload.as_ssz_bytes())
+            }
+            (ExecutionPayload::V3(_) | ExecutionPayload::V4(_), None, _) => {
+                return Err(ProtocolError::MissingCancunFields);
+            }
+            (ExecutionPayload::V4(_), Some(_), None) => {
+                return Err(ProtocolError::MissingExecutionRequests);
+            }
+            (ExecutionPayload::V1(_) | ExecutionPayload::V2(_), _, _) => {
+                return Err(ProtocolError::UnsupportedPayload);
+            }
+        };
+    let mut body = Vec::with_capacity(1 + encoded.len());
+    body.push(engine_version);
+    body.extend_from_slice(&encoded);
+    Ok(body)
 }
 
-/// Decode an Engine API V4 body and reject a payload whose header hash does not match its fields.
+fn execution_requests(
+    prague: &PraguePayloadFields,
+) -> Result<Vec<alloy_primitives::Bytes>, ProtocolError> {
+    match &prague.requests {
+        RequestsOrHash::Requests(requests) => Ok(requests.iter().cloned().collect()),
+        RequestsOrHash::Hash(hash) if *hash == EMPTY_REQUESTS_HASH => Ok(Vec::new()),
+        RequestsOrHash::Hash(_) => Err(ProtocolError::MissingExecutionRequests),
+    }
+}
+
+/// Decode a fork-aware Engine API body and reject a payload whose hash does not match its fields.
 pub fn decode_body(body: &[u8]) -> Result<ExecutionData, ProtocolError> {
-    let (payload, versioned_hashes, parent_beacon_block_root, execution_requests) =
-        <(
-            ExecutionPayloadV3,
-            Vec<B256>,
-            B256,
-            Vec<alloy_primitives::Bytes>,
-        )>::from_ssz_bytes(body)
-        .map_err(|error| ProtocolError::InvalidSsz(format!("{error:?}")))?;
-    let claimed = payload.payload_inner.payload_inner.block_hash;
-    let sidecar = ExecutionPayloadSidecar::v4(
-        CancunPayloadFields::new(parent_beacon_block_root, versioned_hashes),
-        PraguePayloadFields::new(RequestsOrHash::Requests(Requests::new(execution_requests))),
-    );
-    let data = ExecutionData::new(payload.into(), sidecar);
+    let (&engine_version, body) = body
+        .split_first()
+        .ok_or(ProtocolError::MissingEngineVersion)?;
+    let data = match engine_version {
+        1 => {
+            let payload = ExecutionPayloadV1::from_ssz_bytes(body)
+                .map_err(|error| ProtocolError::InvalidSsz(format!("{error:?}")))?;
+            ExecutionData::new(payload.into(), ExecutionPayloadSidecar::none())
+        }
+        2 => {
+            let payload = ExecutionPayloadV2::from_ssz_bytes(body)
+                .map_err(|error| ProtocolError::InvalidSsz(format!("{error:?}")))?;
+            ExecutionData::new(payload.into(), ExecutionPayloadSidecar::none())
+        }
+        3 => {
+            let (payload, hashes, root) =
+                <(ExecutionPayloadV3, Vec<B256>, B256)>::from_ssz_bytes(body)
+                    .map_err(|error| ProtocolError::InvalidSsz(format!("{error:?}")))?;
+            ExecutionData::new(
+                payload.into(),
+                ExecutionPayloadSidecar::v3(CancunPayloadFields::new(root, hashes)),
+            )
+        }
+        4 => {
+            let (payload, hashes, root, requests) = <(
+                ExecutionPayloadV3,
+                Vec<B256>,
+                B256,
+                Vec<alloy_primitives::Bytes>,
+            )>::from_ssz_bytes(body)
+            .map_err(|error| ProtocolError::InvalidSsz(format!("{error:?}")))?;
+            ExecutionData::new(
+                payload.into(),
+                ExecutionPayloadSidecar::v4(
+                    CancunPayloadFields::new(root, hashes),
+                    PraguePayloadFields::new(RequestsOrHash::Requests(Requests::new(requests))),
+                ),
+            )
+        }
+        5 => {
+            let (payload, hashes, root, requests) = <(
+                ExecutionPayloadV4,
+                Vec<B256>,
+                B256,
+                Vec<alloy_primitives::Bytes>,
+            )>::from_ssz_bytes(body)
+            .map_err(|error| ProtocolError::InvalidSsz(format!("{error:?}")))?;
+            ExecutionData::new(
+                payload.into(),
+                ExecutionPayloadSidecar::v4(
+                    CancunPayloadFields::new(root, hashes),
+                    PraguePayloadFields::new(RequestsOrHash::Requests(Requests::new(requests))),
+                ),
+            )
+        }
+        PAYLOAD_ONLY_V4 => {
+            let payload = ExecutionPayloadV4::from_ssz_bytes(body)
+                .map_err(|error| ProtocolError::InvalidSsz(format!("{error:?}")))?;
+            ExecutionData::new(payload.into(), ExecutionPayloadSidecar::none())
+        }
+        version => return Err(ProtocolError::UnsupportedEngineVersion(version)),
+    };
+    let claimed = data.block_hash();
     let computed = data
         .clone()
         .into_block_raw()
@@ -159,6 +261,10 @@ pub fn sign_payload(
     signer: &PrivateKeySigner,
 ) -> Result<Vec<u8>, ProtocolError> {
     let body = encode_body(data)?;
+    // Fail locally when a reconstructed payload lacks fork-specific data (for
+    // example, Amsterdam's full block access list) instead of publishing a
+    // signed message every follower must reject.
+    decode_body(&body)?;
     let signature = signer
         .sign_hash_sync(&signing_hash(chain_id, &body))
         .map_err(|error| ProtocolError::Signing(error.to_string()))?;
@@ -204,14 +310,14 @@ mod tests {
     use super::*;
     use alloy_consensus::{Block, BlockBody, Header, TxEnvelope};
     use alloy_eips::eip4895::Withdrawals;
-    use alloy_primitives::Bloom;
+    use alloy_primitives::{Bloom, Bytes};
 
-    fn test_payload() -> ExecutionData {
+    fn test_block() -> Block<TxEnvelope> {
         let body = BlockBody::<TxEnvelope> {
             withdrawals: Some(Withdrawals::default()),
             ..BlockBody::default()
         };
-        let block = Block::new(
+        Block::new(
             Header {
                 parent_hash: B256::repeat_byte(0x11),
                 beneficiary: Address::repeat_byte(0x22),
@@ -232,7 +338,11 @@ mod tests {
                 ..Header::default()
             },
             body,
-        );
+        )
+    }
+
+    fn test_payload() -> ExecutionData {
+        let block = test_block();
         let payload = ExecutionPayloadV3::from_block_slow(&block);
         ExecutionData::new(
             payload.into(),
@@ -241,6 +351,50 @@ mod tests {
                 PraguePayloadFields::new(Requests::default()),
             ),
         )
+    }
+
+    fn test_amsterdam_payload() -> ExecutionData {
+        let mut block = test_block();
+        let block_access_list = Bytes::from_static(&[0xc0]);
+        block.header.block_access_list_hash = Some(keccak256(&block_access_list));
+        block.header.slot_number = Some(99);
+        let payload = ExecutionPayloadV4::from_block_unchecked_with_bal(
+            block.hash_slow(),
+            &block,
+            block_access_list,
+        );
+        ExecutionData::new(
+            payload.into(),
+            ExecutionPayloadSidecar::v4(
+                CancunPayloadFields::new(B256::repeat_byte(0x66), Vec::new()),
+                PraguePayloadFields::new(Requests::default()),
+            ),
+        )
+    }
+
+    fn test_dev_amsterdam_payload() -> ExecutionData {
+        let mut block = test_block();
+        block.header.parent_beacon_block_root = None;
+        block.header.requests_hash = None;
+        let block_access_list = Bytes::from_static(&[0xc0]);
+        block.header.block_access_list_hash = Some(keccak256(&block_access_list));
+        block.header.slot_number = Some(99);
+        let payload = ExecutionPayloadV4::from_block_unchecked_with_bal(
+            block.hash_slow(),
+            &block,
+            block_access_list,
+        );
+        ExecutionData::new(payload.into(), ExecutionPayloadSidecar::none())
+    }
+
+    fn test_shanghai_payload() -> ExecutionData {
+        let mut block = test_block();
+        block.header.blob_gas_used = None;
+        block.header.excess_blob_gas = None;
+        block.header.parent_beacon_block_root = None;
+        block.header.requests_hash = None;
+        let payload = ExecutionPayloadV2::from_block_slow(&block);
+        ExecutionData::new(payload.into(), ExecutionPayloadSidecar::none())
     }
 
     fn test_signer(last_byte: u8) -> PrivateKeySigner {
@@ -260,6 +414,43 @@ mod tests {
         );
         assert_eq!(decoded.sidecar.versioned_hashes(), Some(&Vec::new()));
         assert_eq!(decoded.sidecar.requests(), Some(&Requests::default()));
+    }
+
+    #[test]
+    fn v5_body_roundtrip_preserves_amsterdam_fields() {
+        let original = test_amsterdam_payload();
+        let body = encode_body(&original).unwrap();
+        assert_eq!(body[0], 5);
+        let decoded = decode_body(&body).unwrap();
+
+        assert_eq!(decoded.block_hash(), original.block_hash());
+        let ExecutionPayload::V4(decoded) = decoded.payload else {
+            panic!("expected Amsterdam payload")
+        };
+        assert_eq!(decoded.block_access_list, Bytes::from_static(&[0xc0]));
+        assert_eq!(decoded.slot_number, 99);
+    }
+
+    #[test]
+    fn payload_only_dev_amsterdam_roundtrip_preserves_hash() {
+        let original = test_dev_amsterdam_payload();
+        let body = encode_body(&original).unwrap();
+        assert_eq!(body[0], PAYLOAD_ONLY_V4);
+        let decoded = decode_body(&body).unwrap();
+
+        assert_eq!(decoded.block_hash(), original.block_hash());
+        assert!(decoded.sidecar.cancun().is_none());
+        assert!(decoded.sidecar.prague().is_none());
+    }
+
+    #[test]
+    fn v2_body_roundtrip_preserves_shanghai_payload() {
+        let original = test_shanghai_payload();
+        let body = encode_body(&original).unwrap();
+        assert_eq!(body[0], 2);
+        let decoded = decode_body(&body).unwrap();
+
+        assert_eq!(decoded.block_hash(), original.block_hash());
     }
 
     #[test]
