@@ -781,21 +781,21 @@ impl Harness {
             proof_signer_key: Some(ANVIL_ATTESTER_KEY),
             rollup_id: self.dep.rollup_id,
             expect_external_batches,
-            sequencer_rpc: None,
+            p2p_peer: None,
         })
         .await
     }
 
     pub async fn follower_env(
         &self,
-        sequencer_rpc: Option<&str>,
+        p2p_peer: Option<&str>,
     ) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
             poster_key: None,
             proof_signer_key: None,
             rollup_id: self.dep.rollup_id,
             expect_external_batches: true,
-            sequencer_rpc,
+            p2p_peer,
         })
         .await
     }
@@ -806,7 +806,7 @@ impl Harness {
             proof_signer_key: Some(ANVIL_ATTESTER_KEY),
             rollup_id,
             expect_external_batches: false,
-            sequencer_rpc: None,
+            p2p_peer: None,
         })
         .await
     }
@@ -820,7 +820,7 @@ impl Harness {
             proof_signer_key: Some(proof_signer_key),
             rollup_id: self.dep.rollup_id,
             expect_external_batches: false,
-            sequencer_rpc: None,
+            p2p_peer: None,
         })
         .await
     }
@@ -883,7 +883,13 @@ impl Harness {
                 ("EEZ_L1_TARGET_RPC_URL", self.anvil.rpc_url.clone()),
                 ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
                 ("EEZ_L1_POSTER_KEY", poster_key.to_string()),
+                ("EEZ_UNSAFE_BLOCK_SIGNER_KEY", ANVIL_KEY.to_string()),
             ]);
+        } else {
+            env.push((
+                "EEZ_UNSAFE_BLOCK_SIGNER_ADDRESS",
+                format!("{:#x}", signer_address(ANVIL_KEY)?),
+            ));
         }
 
         // Composer tests use the real remote-prover path. Followers omit it.
@@ -913,8 +919,8 @@ impl Harness {
                 .map_err(|_| anyhow!("prover registry poisoned"))?
                 .push((signer, witness_dir));
         }
-        if let Some(sequencer_rpc) = opts.sequencer_rpc {
-            env.push(("EEZ_SEQUENCER_RPC", sequencer_rpc.to_string()));
+        if let Some(p2p_peer) = opts.p2p_peer {
+            env.push(("EEZ_P2P_PEERS", p2p_peer.to_string()));
         }
         Ok(env)
     }
@@ -925,7 +931,7 @@ struct NodeEnvOptions<'a> {
     proof_signer_key: Option<&'a str>,
     rollup_id: u64,
     expect_external_batches: bool,
-    sequencer_rpc: Option<&'a str>,
+    p2p_peer: Option<&'a str>,
 }
 
 pub struct Deployment {
@@ -1207,6 +1213,7 @@ pub struct NodeHandle {
     /// Owned node database. CI retains it only if this test unwinds in failure.
     owned_datadir: Option<FailureDatadir>,
     pub http_port: u16,
+    pub unsafe_p2p_port: u16,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1282,6 +1289,7 @@ impl NodeHandle {
         let http_lease = PortLease::tcp();
         let ws_lease = PortLease::tcp();
         let p2p_lease = PortLease::tcp();
+        let unsafe_p2p_lease = PortLease::tcp();
         let l1_http_lease = PortLease::http_pair();
         let l1_auth_lease = PortLease::tcp();
         // Embedded L1 uses this numeric port for RLPx TCP and discovery UDP.
@@ -1293,6 +1301,7 @@ impl NodeHandle {
         let http_port = http_lease.port();
         let ws_port = ws_lease.port();
         let p2p_port = p2p_lease.port();
+        let unsafe_p2p_port = unsafe_p2p_lease.port();
         let l1_http_port = l1_http_lease.port();
         let l1_auth_port = l1_auth_lease.port();
         let l1_p2p_port = l1_p2p_lease.port();
@@ -1304,6 +1313,7 @@ impl NodeHandle {
             http_lease,
             ws_lease,
             p2p_lease,
+            unsafe_p2p_lease,
             l1_http_lease,
             l1_auth_lease,
             l1_p2p_lease,
@@ -1376,6 +1386,10 @@ impl NodeHandle {
             .env("EEZ_L1_DISCV5_PORT", l1_discv5_port.to_string())
             .env("EEZ_L1_XCHAIN_PORT", l1_xchain_port.to_string())
             .env("EEZ_L2_XCHAIN_PORT", l2_xchain_port.to_string())
+            .env(
+                "EEZ_P2P_LISTEN_ADDR",
+                format!("/ip4/127.0.0.1/tcp/{unsafe_p2p_port}"),
+            )
             .env("EEZ_L1_DATADIR", &l1_datadir)
             // May be overridden below when a test uses another L2 upstream.
             .env("EEZ_L2_RPC_URL", format!("http://127.0.0.1:{http_port}"));
@@ -1398,6 +1412,7 @@ impl NodeHandle {
             _keep_alive: log_tempdir.into_iter().collect(),
             owned_datadir: None,
             http_port,
+            unsafe_p2p_port,
         })
     }
 
@@ -1428,6 +1443,10 @@ impl NodeHandle {
 
     pub fn l2_rpc_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.http_port)
+    }
+
+    pub fn unsafe_p2p_addr(&self) -> String {
+        format!("/ip4/127.0.0.1/tcp/{}", self.unsafe_p2p_port)
     }
 
     /// Waits for RPC readiness while surfacing early process exits and logs.
