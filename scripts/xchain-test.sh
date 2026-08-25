@@ -266,6 +266,9 @@ else
   echo "==> settling (up to 300s)"; EXP_V=$((40+WAVES+100)); OK=1
   for _ in $(seq 1 100); do [[ "$(cast call "$L1_VALUE" 'value()(uint256)' --rpc-url "$L1" 2>/dev/null|awk '{print $1}')" == "$EXP_V" && "$(cast call "$L2_VALUE" 'value()(uint256)' --rpc-url "$L2" 2>/dev/null|awk '{print $1}')" == "$EXP_V" ]] && break; sleep 3; done
   echo "    --- effect assertions ---"
+  # Recipients are random per run; print them or a failed assertion cannot be
+  # post-mortemed after the script exits.
+  echo "    (deposit recipient $L2_DEP_RECIPIENT on L2, withdraw recipient $L1_WD_RECIPIENT on L1)"
   chk(){ [[ "$1" == "$2" ]] && echo "    ✓ $3 == $1" || { echo "    ✗ $3 got=$1 want=$2"; OK=0; }; }
   chk "$(cast call "$L2_VALUE" 'value()(uint256)' --rpc-url "$L2"|awk '{print $1}')" "$EXP_V" "L2 Value (inbound wrapper)"
   chk "$(cast call "$L1_VALUE" 'value()(uint256)' --rpc-url "$L1"|awk '{print $1}')" "$EXP_V" "L1 Value (outbound wrapper)"
