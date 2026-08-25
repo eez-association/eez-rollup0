@@ -1061,18 +1061,13 @@ pub async fn send_l2_value_transfer(
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let chain_id = provider.get_chain_id().await?;
     let nonce = provider.get_transaction_count(from).await?;
-    // A legacy tx's single `gas_price` must cover the base fee at inclusion, and
-    // `eth_gasPrice` reports the LATEST base fee with a zero tip — no margin, so
-    // it goes stale as soon as blocks fill. A 1559 cap tolerates that by design.
-    let mut tx = TxEip1559 {
-        chain_id,
+    let mut tx = TxLegacy {
+        chain_id: Some(chain_id),
         nonce,
-        max_fee_per_gas: 100_000_000_000,
-        max_priority_fee_per_gas: 1_000_000_000,
+        gas_price: provider.get_gas_price().await?,
         gas_limit: 21_000,
         to: alloy_primitives::TxKind::Call(to),
         value,
-        access_list: alloy_rpc_types_eth::AccessList::default(),
         input: alloy_primitives::Bytes::default(),
     };
     let sig = signer.sign_transaction_sync(&mut tx)?;
@@ -2166,7 +2161,7 @@ pub fn override_env(
 
 // Cross-chain test fixture.
 
-use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
 use alloy_network::TxSignerSync;
 use alloy_network::eip2718::Encodable2718;
 
