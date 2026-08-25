@@ -17,10 +17,11 @@ use eez_protocol::{EEZL2_ADDRESS, EvmBatch, entries::decode_postbatch};
 use eez_testkit::signals;
 use eez_testkit::{
     ANVIL_KEY_6, CrossChainWorld, DEV_CHAIN_ID, ICounter, IEEZ, INBOUND_USER, ISetterWrapper,
-    OUTBOUND_USER, SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead, TARGET_DEPLOYER, call_read,
-    counter_count, create_cross_chain_proxy, create_l2_cross_chain_proxy, deploy_counter,
-    events_since, l2_value, last_proxy_result, onchain_nonce, receipt_ok, safe_block_state_root,
-    setup_cross_chain, setup_cross_chain_with_env, sign_and_send, state_root, value_read, wait_for,
+    IValue, OUTBOUND_USER, SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead, TARGET_DEPLOYER,
+    call_read, counter_count, create_cross_chain_proxy, create_l2_cross_chain_proxy,
+    deploy_counter, events_since, l2_value, last_proxy_result, onchain_nonce, receipt_ok,
+    safe_block_state_root, setup_cross_chain, setup_cross_chain_with_env, sign_and_send,
+    state_root, value_read, wait_for,
 };
 
 sol! {
@@ -293,7 +294,8 @@ async fn identical_outbound_calls_in_separate_transactions_chain_state() {
     let w = setup_cross_chain_with_env(&cap_env()).await.unwrap();
     let (l1_rpc, l2_rpc) = (w.l1_rpc(), w.l2_rpc());
     let value = U256::from(79u64);
-    let call = ISetterWrapper::setViaProxyCall { v: value }.abi_encode();
+    let wrapper_call = ISetterWrapper::setViaProxyCall { v: value }.abi_encode();
+    let destination_call = IValue::setValueCall { v: value }.abi_encode();
     let provider = ProviderBuilder::new().connect_http(l2_rpc.parse().unwrap());
     let wrapped_filter = Filter::new()
         .address(w.outbound_wrapper)
@@ -315,7 +317,7 @@ async fn identical_outbound_calls_in_separate_transactions_chain_state() {
         nonce,
         Some(w.outbound_wrapper),
         U256::ZERO,
-        call.clone(),
+        wrapper_call.clone(),
         1_200_000,
     )
     .await
@@ -327,7 +329,7 @@ async fn identical_outbound_calls_in_separate_transactions_chain_state() {
         nonce + 1,
         Some(w.outbound_wrapper),
         U256::ZERO,
-        call.clone(),
+        wrapper_call,
         1_200_000,
     )
     .await
@@ -359,7 +361,10 @@ async fn identical_outbound_calls_in_separate_transactions_chain_state() {
     .expect("identical outbound calls never reached L1");
     assert_eq!(
         carried,
-        vec![vec![Bytes::from(call.clone()), Bytes::from(call)]],
+        vec![vec![
+            Bytes::from(destination_call.clone()),
+            Bytes::from(destination_call),
+        ]],
         "both identical calls must ride one postBatch in source order",
     );
 

@@ -69,8 +69,7 @@ HH_KEY_PURE=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a  
 
 # EOAs funded on L1 so they can pay gas on the shared chain.
 L1_FUNDED_KEYS=("$HH_KEY_IN")
-FUND_FROM_KEY="${EEZ_FUND_FROM_KEY:-$(yaml_value poster_key)}"
-[[ -n "$FUND_FROM_KEY" ]] || { echo "could not resolve a funding key — set EEZ_FUND_FROM_KEY or eez.poster_key"; exit 1; }
+FUND_FROM_KEY="${EEZ_FUND_FROM_KEY:-$HH_KEY_2}"
 L1_SETUP_KEY="${EEZ_L1_SETUP_KEY:-$FUND_FROM_KEY}"
 
 EEZL2_ADDRESS="${EEZL2_ADDRESS:-0x4200000000000000000000000000000000000007}"
@@ -572,13 +571,17 @@ run_waves() {
     local signer_line=""
     refresh_node_log
     refresh_signer_log
-    attested_hash=$(strip_ansi <"$NODE_LOG" | grep 'remote prover attested the window' \
-        | grep -oE 'hash=0x[0-9a-fA-F]{64}' | tail -1 | cut -d= -f2 || true)
+    attested_hash=$(strip_ansi <"$NODE_LOG" \
+        | grep -E 'remote prover attested the window|eez.prover_client.attested' \
+        | grep -oE 'hash[":=]+"?0x[0-9a-fA-F]{64}' \
+        | tail -1 | sed -E 's/^hash[":=]+"?//' || true)
     if [[ -n "$attested_hash" ]]; then
         signer_line=$(strip_ansi <"$SIGNER_LOG" \
-            | grep -F "recomputed_public_inputs_hash=$attested_hash" | tail -1 || true)
+            | grep -E 'window validated and signed|eez.proof_signer.window_signed' \
+            | grep -E "recomputed_public_inputs_hash=$attested_hash|\"recomputed_public_inputs_hash\":\"$attested_hash\"" \
+            | tail -1 || true)
     fi
-    if [[ "$signer_line" == *"window validated and signed"* ]]; then
+    if [[ -n "$signer_line" ]]; then
         signer_ok=1
     fi
 

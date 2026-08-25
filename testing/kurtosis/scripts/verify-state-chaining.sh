@@ -55,8 +55,7 @@ L1_ROLLUP_ID="${EEZ_L1_ROLLUP_ID:-0}"
 RECEIPT_WAIT_SECS="${EEZ_STATE_CHAINING_WAIT_SECS:-300}"
 WRAPPED_TOPIC=$(cast keccak 'Wrapped(uint256,bool,bool,uint256)')
 
-FUNDING_KEY="${EEZ_FUND_FROM_KEY:-$(yaml_value poster_key)}"
-[[ -n "$FUNDING_KEY" ]] || { echo "could not resolve the L1 funding key from EEZ_FUND_FROM_KEY or eez.poster_key"; exit 1; }
+FUNDING_KEY="${EEZ_FUND_FROM_KEY:-$L2_DEPLOY_KEY}"
 L1_DEPLOY_KEY="${EEZ_L1_SETUP_KEY:-$FUNDING_KEY}"
 
 refresh_node_log() { kurtosis service logs -a "$ENCLAVE" eez-node >"$NODE_LOG" 2>&1 || true; }
