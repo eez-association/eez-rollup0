@@ -13,7 +13,9 @@ use reth_evm::{ConfigureEvm, Evm as _};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::SignerRecoverable;
 use reth_revm::{database::StateProviderDatabase, db::State};
-use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderFactory};
+use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderBox, StateProviderFactory};
+use revm::DatabaseCommit;
+use revm::context::result::EVMError;
 
 use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
 use eez_protocol::{
@@ -162,6 +164,131 @@ impl LocalChainClient {
             authorized_proxies_slot: self.dialect.proxy_lookup_slot(),
         }
     }
+
+    /// Reth handles (state factory, headers, `EvmConfig`) backing this chain.
+    #[must_use]
+    pub fn chain_provider(&self) -> &ChainProvider {
+        &self.provider
+    }
+
+    /// Contract holding this chain's `authorizedProxies` mapping and driving
+    /// cross-chain execution: `EEZ` on L1, `EEZL2` on L2.
+    #[must_use]
+    pub fn manager_address(&self) -> Address {
+        self.role.dispatch_address()
+    }
+
+    /// The inspector factory both `begin_execution_session` and
+    /// [`Self::simulate_source_tx_on`] build: this chain's proxy lookup, rollup
+    /// id, and overlay channel.
+    #[must_use]
+    pub fn inspector_factory(&self) -> SessionInspectorFactory {
+        SessionInspectorFactory::new(
+            self.proxy_lookup_config(),
+            self.rollup_id,
+            Arc::clone(&self.overlay_channel),
+        )
+    }
+
+    /// Source-simulate a raw tx over a caller-provided live state + env — a
+    /// fork of the slot's execution context — COMMITTING the result state into
+    /// that fork so later simulations see this tx's writes.
+    ///
+    /// Entry-role only; the caller owns the env, which must already be derived
+    /// from the fork's own header.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecutorErrorKind::Unavailable`] on a follower client,
+    /// [`ExecutorErrorKind::Decode`] when the raw tx cannot be decoded or its
+    /// signer recovered, [`ExecutorErrorKind::Provider`] when the backing store
+    /// fails mid-execution, plus any error a nested dispatch raises.
+    pub fn simulate_source_tx_on(
+        &self,
+        raw_tx: Vec<u8>,
+        dispatcher: &mut CompositionBuilder,
+        state: &mut State<StateProviderDatabase<StateProviderBox>>,
+        evm_env: reth_evm::EvmEnvFor<EthEvmConfig>,
+    ) -> ExecutorResult<()> {
+        self.source_sim(raw_tx, dispatcher, state, evm_env)
+    }
+
+    /// Shared source-simulation body: decode, build the tx env, run under the
+    /// session inspector, commit.
+    fn source_sim(
+        &self,
+        raw_tx: Vec<u8>,
+        dispatcher: &mut CompositionBuilder,
+        state: &mut State<StateProviderDatabase<StateProviderBox>>,
+        evm_env: reth_evm::EvmEnvFor<EthEvmConfig>,
+    ) -> ExecutorResult<()> {
+        use alloy_eips::eip2718::Decodable2718;
+
+        // Only entry-role clients are authorized to simulate source
+        // transactions. Keep the check here because callers use the uniform
+        // `ChainClient` interface for both roles.
+        let Role::Entry { .. } = &self.role else {
+            return Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
+                "simulate_source_tx_on called on follower LocalChainClient".into(),
+            )));
+        };
+
+        let mut raw: &[u8] = &raw_tx;
+        let tx = TransactionSigned::decode_2718(&mut raw)
+            .map_err(|e| ExecutorError::from(ExecutorErrorKind::Decode(e.to_string())))?;
+        let signer = tx
+            .recover_signer()
+            .map_err(|e| ExecutorError::from(ExecutorErrorKind::Decode(e.to_string())))?;
+
+        tracing::info!(
+            ?signer,
+            to = ?alloy_consensus::Transaction::to(&tx),
+            "simulating source tx for cross-chain call detection"
+        );
+
+        let recovered = reth_primitives_traits::Recovered::new_unchecked(tx, signer);
+        let tx_env = self.provider.evm_config.tx_env(&recovered);
+
+        // The source-simulation inspector dispatches every detected proxy CALL
+        // through the composition builder, which records calls in preorder.
+        // Attach the cache channel around each downstream dispatch.
+        let inspector = self.inspector_factory().build(dispatcher);
+        let mut evm =
+            self.provider
+                .evm_config
+                .evm_with_env_and_inspector(&mut *state, evm_env, inspector);
+        let (gas_used, success, changes) = match evm.transact(tx_env) {
+            Ok(r) => (r.result.tx_gas_used(), r.result.is_success(), Some(r.state)),
+            // The backing store is unreachable — that is the slot's problem, not
+            // the tx's, so it must not degrade into an empty composition (which
+            // the drain reads as poison and evicts on).
+            Err(EVMError::Database(e)) => return Err(ExecutorError::provider(e)),
+            // Rejected before execution (nonce, balance, fee). Same outcome as a
+            // revert — no calls, so the drain evicts — but named for what it is.
+            Err(EVMError::Transaction(e)) => {
+                tracing::warn!(%e, "source tx rejected at validation; it records no cross-chain call");
+                (0, false, None)
+            }
+            Err(e) => {
+                tracing::warn!(%e, "source sim reverted");
+                (0, false, None)
+            }
+        };
+        let inspector_error = evm.inspector_mut().take_error();
+        drop(evm);
+
+        if let Some(err) = inspector_error {
+            return Err(err);
+        }
+        // The trait-method caller's `State` is function-local, so committing
+        // into it is unobservable there; the fork caller needs the writes.
+        if let Some(changes) = changes {
+            state.commit(changes);
+        }
+
+        tracing::info!(gas_used, success, "source simulation complete");
+        Ok(())
+    }
 }
 
 impl ChainClient for LocalChainClient {
@@ -179,11 +306,7 @@ impl ChainClient for LocalChainClient {
         // Inspect every target session because nested proxy calls may dispatch
         // again. The inspector exchanges cache snapshots through this client's
         // configured channel.
-        let inspector_factory = Some(SessionInspectorFactory::new(
-            self.proxy_lookup_config(),
-            self.rollup_id,
-            Arc::clone(&self.overlay_channel),
-        ));
+        let inspector_factory = Some(self.inspector_factory());
         // Preload the top cache snapshot when one is available.
         let preloaded_cache = self.overlay_channel.peek_pre_snapshot();
         let manager_address = self.role.dispatch_address();
@@ -195,126 +318,5 @@ impl ChainClient for LocalChainClient {
             self.overlay_channel.clone(),
         )?;
         Ok(Box::new(session))
-    }
-
-    fn simulate_source_tx(
-        &self,
-        raw_tx: Vec<u8>,
-        dispatcher: &mut CompositionBuilder,
-    ) -> ExecutorResult<()> {
-        use alloy_eips::eip2718::Decodable2718;
-        use std::time::Instant;
-
-        // Only entry-role clients are authorized to simulate source
-        // transactions. Keep the check here because callers use the uniform
-        // `ChainClient` interface for both roles.
-        let Role::Entry { .. } = &self.role else {
-            return Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
-                "simulate_source_tx called on follower LocalChainClient".into(),
-            )));
-        };
-
-        let t_total = Instant::now();
-
-        // ── 1. Decode raw tx ──────────────────────────────────────
-        let t_decode = Instant::now();
-        let mut raw: &[u8] = &raw_tx;
-        let tx = TransactionSigned::decode_2718(&mut raw)
-            .map_err(|e| ExecutorError::from(ExecutorErrorKind::Decode(e.to_string())))?;
-        let signer = tx
-            .recover_signer()
-            .map_err(|e| ExecutorError::from(ExecutorErrorKind::Decode(e.to_string())))?;
-        let decode_us = t_decode.elapsed().as_micros();
-
-        tracing::info!(
-            ?signer,
-            to = ?alloy_consensus::Transaction::to(&tx),
-            "simulating source tx for cross-chain call detection"
-        );
-
-        // ── 2. Open source state ──────────────────────────────────
-        let t_state = Instant::now();
-        let latest_num = self
-            .provider
-            .headers
-            .best_block_number()
-            .map_err(ExecutorError::provider)?;
-        let header = self
-            .provider
-            .headers
-            .header_by_number(latest_num)
-            .map_err(ExecutorError::provider)?
-            .ok_or_else(|| {
-                ExecutorError::from(ExecutorErrorKind::Missing("source header at latest block"))
-            })?;
-        // Own the provider for the lifetime of the revm state.
-        let evm_state = self
-            .provider
-            .provider
-            .latest()
-            .map_err(ExecutorError::provider)?;
-        let db = StateProviderDatabase::new(evm_state);
-        let mut state = State::builder().with_database(db).build();
-        let state_us = t_state.elapsed().as_micros();
-
-        // ── 3. Run source EVM with inspector ──────────────────────
-        let t_env = Instant::now();
-        let mut evm_env = self
-            .provider
-            .evm_config
-            .evm_env(&header)
-            .map_err(ExecutorError::evm)?;
-        // A system-signed source transaction can use nonce N+1 because the
-        // preceding `loadExecutionTable` transaction consumes nonce N, while
-        // source simulation reads parent state. Disable only nonce validation
-        // so inspection can run; retain the other transaction checks.
-        evm_env.cfg_env.disable_nonce_check = true;
-        let recovered = reth_primitives_traits::Recovered::new_unchecked(tx, signer);
-        let tx_env = self.provider.evm_config.tx_env(&recovered);
-        let env_us = t_env.elapsed().as_micros();
-
-        let t_sim = Instant::now();
-
-        // The source-simulation inspector dispatches every detected proxy CALL
-        // through the composition builder, which records calls in preorder.
-        // Attach the cache channel around each downstream dispatch.
-        let factory = SessionInspectorFactory::new(
-            self.proxy_lookup_config(),
-            self.rollup_id,
-            Arc::clone(&self.overlay_channel),
-        );
-        let inspector = factory.build(dispatcher);
-        let mut evm = self
-            .provider
-            .evm_config
-            .evm_with_env_and_inspector(&mut state, evm_env, inspector);
-        let (gas_used, success) = match evm.transact(tx_env) {
-            Ok(r) => (r.result.tx_gas_used(), r.result.is_success()),
-            Err(e) => {
-                tracing::warn!(%e, "source sim reverted");
-                (0, false)
-            }
-        };
-        let inspector_error = evm.inspector_mut().take_error();
-        drop(evm);
-        let sim_us = t_sim.elapsed().as_micros();
-
-        if let Some(err) = inspector_error {
-            return Err(err);
-        }
-
-        tracing::info!(gas_used, success, "source simulation complete");
-
-        let total_us = t_total.elapsed().as_micros();
-        tracing::debug!(
-            timing.decode_us = decode_us,
-            timing.state_us = state_us,
-            timing.env_us = env_us,
-            timing.sim_us = sim_us,
-            timing.total_us = total_us,
-            "source simulation timing"
-        );
-
-        Ok(())
     }
 }

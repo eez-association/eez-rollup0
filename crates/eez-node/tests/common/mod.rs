@@ -42,6 +42,9 @@ pub const ANVIL_KEY_1: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8
 pub const ANVIL_KEY_2: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
 pub const ANVIL_KEY_3: &str = "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6";
 pub const ANVIL_KEY_4: &str = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a";
+/// Second cross-chain sender. Eviction cascades along one sender's nonce chain,
+/// so a poison tx needs its own sender to leave co-bundled survivors alone.
+pub const ANVIL_KEY_6: &str = "0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e";
 // Account #0 derives the reserved L2 system address and cannot attest.
 pub const ANVIL_ATTESTER_KEY: &str =
     "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
@@ -85,12 +88,28 @@ fn anvil_bin() -> String {
     "anvil".to_string()
 }
 
-/// Probe a currently available TCP port.
+/// Every port handed out anywhere in this test process.
+///
+/// Probes are availability checks, not reservations, so without a shared
+/// record a later spawn can be handed a port an earlier node in the same
+/// process already used — its lingering sockets then fail the real bind with
+/// `address already in use`. Serial test binaries spawn several nodes per
+/// process, so the record has to outlive the individual spawn.
+static HANDED_OUT_PORTS: std::sync::LazyLock<std::sync::Mutex<HashSet<u16>>> =
+    std::sync::LazyLock::new(std::sync::Mutex::default);
+
+fn handed_out_ports() -> std::sync::MutexGuard<'static, HashSet<u16>> {
+    HANDED_OUT_PORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Probe a currently available TCP port, distinct from every port this process
+/// has already handed out.
 ///
 /// The listener is released on return, so this is not a reservation.
 pub fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("local_addr").port()
+    probe_unique_tcp_port(&mut handed_out_ports())
 }
 
 fn probe_unique_tcp_port(used: &mut HashSet<u16>) -> u16 {
@@ -1312,9 +1331,10 @@ impl NodeHandle {
         // Reth defaults collide if any test or unrelated process holds them.
         // Each NodeHandle picks its own ephemeral ports for authrpc / http / ws / p2p.
         // These are availability probes, not reservations: the sockets are
-        // released before the child binds. The set prevents deterministic
-        // collisions among one node's listeners.
-        let mut used_ports = HashSet::new();
+        // released before the child binds. The process-wide record prevents
+        // collisions among one node's listeners AND across the nodes a serial
+        // test binary spawns one after another.
+        let mut used_ports = handed_out_ports();
         let authrpc_port = probe_unique_tcp_port(&mut used_ports);
         let http_port = probe_unique_tcp_port(&mut used_ports);
         let ws_port = probe_unique_tcp_port(&mut used_ports);
@@ -1326,6 +1346,7 @@ impl NodeHandle {
         let l1_discv5_port = probe_unique_udp_port(&mut used_ports);
         let l1_xchain_port = probe_unique_tcp_port(&mut used_ports);
         let l2_xchain_port = probe_unique_tcp_port(&mut used_ports);
+        drop(used_ports);
         let l1_datadir = datadir.join("embedded-l1");
         let env_genesis = env
             .iter()
@@ -2209,6 +2230,13 @@ sol! {
     interface ISetterWrapper {
         function setViaProxy(uint256 v) external;
     }
+    /// Order-dependent target: each call returns state left by the previous one.
+    #[sol(rpc)]
+    interface ICounter {
+        function count() external view returns (uint256);
+        function increment() external returns (uint256 newCount);
+        function add(uint256 x) external returns (uint256 newCount);
+    }
 }
 
 /// Write the L2 fixture genesis with a current timestamp.
@@ -2488,6 +2516,24 @@ pub async fn deploy_setter_wrapper(
     .await
 }
 
+/// Deploy `Counter` (no constructor args) on either chain.
+pub async fn deploy_counter(rpc_url: &str, key: &str, chain_id: u64) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("Counter.sol/Counter.json"),
+        Vec::new(),
+    )
+    .await
+}
+
+pub async fn counter_count(rpc_url: &str, counter: Address) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(ICounter::new(counter, &provider).count().call().await?)
+}
+
 pub async fn value_no_ret(rpc_url: &str, value_addr: Address) -> Result<U256> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     Ok(IValueNoRet::new(value_addr, &provider)
@@ -2616,12 +2662,9 @@ impl CrossChainConfig {
         let rollup_manager_address = deployer.create(2);
         let initial_state = reorg_genesis_state_root()?;
         let ts = now_unix_secs();
-        // Avoid the HTTP and adjacent WS ports.
-        let l1_http_port = free_port();
-        let mut l1_auth_port = free_port();
-        while l1_auth_port == l1_http_port || l1_auth_port == l1_http_port.saturating_add(1) {
-            l1_auth_port = free_port();
-        }
+        // Reserves the adjacent WS port too, so no later probe hands it out.
+        let l1_http_port = probe_unique_http_port(&mut handed_out_ports());
+        let l1_auth_port = free_port();
         Ok(Self {
             l1_http_port,
             l1_auth_port,
@@ -2814,7 +2857,14 @@ impl CrossChainWorld {
 
 /// Start the shared cross-chain fixture.
 pub async fn setup_cross_chain() -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(None, None).await
+    setup_cross_chain_inner(None, None, &[]).await
+}
+
+/// Start the fixture with additional node environment variables.
+pub async fn setup_cross_chain_with_env(
+    extra_env: &[(&'static str, String)],
+) -> Result<CrossChainWorld> {
+    setup_cross_chain_inner(None, None, extra_env).await
 }
 
 /// Starts the fixture with a mutation proxy and expected attester override.
@@ -2822,12 +2872,13 @@ pub async fn setup_cross_chain_proxied(
     mutation: ProverMutation,
     attester: Address,
 ) -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(Some(mutation), Some(attester)).await
+    setup_cross_chain_inner(Some(mutation), Some(attester), &[]).await
 }
 
 async fn setup_cross_chain_inner(
     mutation: Option<ProverMutation>,
     attester_override: Option<Address>,
+    extra_env: &[(&'static str, String)],
 ) -> Result<CrossChainWorld> {
     let cfg = CrossChainConfig::new()?;
     let signer_attester = signer_address(cfg.deployer_key)?;
@@ -2860,6 +2911,8 @@ async fn setup_cross_chain_inner(
             witness_dir.path().to_string_lossy().into_owned(),
         ),
     ]);
+    // Before the assertion below, so caller-supplied vars are checked too.
+    env.extend_from_slice(extra_env);
     assert!(
         !env.iter().any(|(name, _)| *name == "EEZ_PROOF_SIGNER_KEY"),
         "remote composer environment must not contain the proof-signer key",

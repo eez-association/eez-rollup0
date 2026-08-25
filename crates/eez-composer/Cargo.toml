@@ -51,6 +51,9 @@ tokio.workspace       = true
 tracing.workspace     = true
 
 [dev-dependencies]
+# MockEthProvider: an in-memory StateProviderFactory for the prefix-state
+# equivalence test (no datadir, no engine API).
+reth-provider = { workspace = true, features = ["test-utils"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
