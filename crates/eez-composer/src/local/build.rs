@@ -238,6 +238,9 @@ pub struct TxOutcome {
     /// Return data if `success`, revert data otherwise; empty if the tx halted
     /// without output.
     pub output: Bytes,
+    /// Logs the tx emitted. The composer checks the outbound calls it actually
+    /// made against the entries it composed.
+    pub logs: Vec<alloy_primitives::Log>,
 }
 
 fn exec_outcome<H>(result: &ExecutionResult<H>) -> TxOutcome {
@@ -245,6 +248,7 @@ fn exec_outcome<H>(result: &ExecutionResult<H>) -> TxOutcome {
         success: result.is_success(),
         gas_used: result.tx_gas_used(),
         output: result.output().cloned().unwrap_or_default(),
+        logs: result.logs().to_vec(),
     }
 }
 

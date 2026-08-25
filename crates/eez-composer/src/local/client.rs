@@ -220,7 +220,7 @@ impl LocalChainClient {
         raw_tx: Vec<u8>,
         dispatcher: &mut CompositionBuilder,
         state: &mut State<StateProviderDatabase<StateProviderBox>>,
-        mut evm_env: reth_evm::EvmEnvFor<EthEvmConfig>,
+        evm_env: reth_evm::EvmEnvFor<EthEvmConfig>,
     ) -> ExecutorResult<()> {
         use alloy_eips::eip2718::Decodable2718;
 
@@ -246,11 +246,6 @@ impl LocalChainClient {
             "simulating source tx for cross-chain call detection"
         );
 
-        // A system-signed source transaction can use nonce N+1 because the
-        // preceding `loadExecutionTable` transaction consumes nonce N, while
-        // source simulation reads parent state. Disable only nonce validation
-        // so inspection can run; retain the other transaction checks.
-        evm_env.cfg_env.disable_nonce_check = true;
         let recovered = reth_primitives_traits::Recovered::new_unchecked(tx, signer);
         let tx_env = self.provider.evm_config.tx_env(&recovered);
 
@@ -268,6 +263,12 @@ impl LocalChainClient {
             // the tx's, so it must not degrade into an empty composition (which
             // the drain reads as poison and evicts on).
             Err(EVMError::Database(e)) => return Err(ExecutorError::provider(e)),
+            // Rejected before execution (nonce, balance, fee). Same outcome as a
+            // revert — no calls, so the drain evicts — but named for what it is.
+            Err(EVMError::Transaction(e)) => {
+                tracing::warn!(%e, "source tx rejected at validation; it records no cross-chain call");
+                (0, false, None)
+            }
             Err(e) => {
                 tracing::warn!(%e, "source sim reverted");
                 (0, false, None)

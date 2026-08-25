@@ -574,12 +574,18 @@ fn abort_rest(
 /// that will not land. `Some((position, why))` means the block is half-extended
 /// and must be reopened on the accepted list. `why` carries its class, so the
 /// caller can tell a rejected tx from an unreachable backing store.
-fn append_and_execute(prefix: &mut SyncBlockState, txs: &[Bytes]) -> Option<(usize, BuildError)> {
+/// Append `txs` to the block and execute them. `Ok` carries their logs, so the
+/// caller can check what a tx actually did against what it composed.
+fn append_and_execute(
+    prefix: &mut SyncBlockState,
+    txs: &[Bytes],
+) -> Result<Vec<alloy_primitives::Log>, (usize, BuildError)> {
+    let mut logs = Vec::new();
     for (at, tx) in txs.iter().enumerate() {
         match prefix.execute_tx(tx) {
-            Ok(outcome) if outcome.success => {}
+            Ok(outcome) if outcome.success => logs.extend(outcome.logs),
             Ok(outcome) => {
-                return Some((
+                return Err((
                     at,
                     BuildError::ExecuteTx {
                         idx: at,
@@ -587,10 +593,10 @@ fn append_and_execute(prefix: &mut SyncBlockState, txs: &[Bytes]) -> Option<(usi
                     },
                 ));
             }
-            Err(e) => return Some((at, e)),
+            Err(e) => return Err((at, e)),
         }
     }
-    None
+    Ok(logs)
 }
 
 /// Take the L1 session's accumulated effects for commit into the slot's state.
@@ -1783,7 +1789,7 @@ where
                         .map(|fork| (exec, fork))
                         .map_err(|e| format!("SyncBlockState::fork: {e}"))
                 });
-            let (l1_exec, mut fork) = match contexts {
+            let (l1_exec, mut l2_fork) = match contexts {
                 Ok(contexts) => contexts,
                 Err(e) => {
                     transient = Some((
@@ -1798,7 +1804,7 @@ where
                 }
             };
             let sessions = seed_session(cc.entry_rollup_id, l1_exec);
-            let (state, env) = fork.state_and_env();
+            let (state, env) = l2_fork.state_and_env();
             let env = env.clone();
             let sim = compose_crosschain(
                 cc,
@@ -1908,33 +1914,74 @@ where
                         }
                     };
                     let pair_txs = eez_protocol::system_tx::interleave_sync_block_txs(&pairs_k);
-                    if let Some((at, why)) = append_and_execute(&mut draft, &pair_txs) {
-                        // A backing-store failure says nothing about the tx —
-                        // abort the slot instead of evicting a valid pair.
-                        if why.is_provider() {
-                            transient = Some((
-                                format!("outbound append tx#{idx} at {at}: {why}"),
-                                abort_rest(
-                                    Some((idx, held)),
-                                    &mut out_iter,
-                                    std::mem::take(&mut inbounds),
-                                ),
-                            ));
-                            break;
+                    let pair_logs = match append_and_execute(&mut draft, &pair_txs) {
+                        Ok(logs) => logs,
+                        Err((at, why)) => {
+                            // A backing-store failure says nothing about the tx —
+                            // abort the slot instead of evicting a valid pair.
+                            if why.is_provider() {
+                                transient = Some((
+                                    format!("outbound append tx#{idx} at {at}: {why}"),
+                                    abort_rest(
+                                        Some((idx, held)),
+                                        &mut out_iter,
+                                        std::mem::take(&mut inbounds),
+                                    ),
+                                ));
+                                break;
+                            }
+                            event!(
+                                name: "eez.composer.cc_compose.append_reverted",
+                                Level::WARN,
+                                rollup_id,
+                                tx_idx = idx,
+                                tx_hash = %held.hash,
+                                appended_idx = at,
+                                error = %why,
+                                "outbound [load, user] pair does not execute on the Sync block prefix; evicting the tx and rebuilding the prefix",
+                            );
+                            push_poison_root(&mut poison, &mut poison_gaps, held);
+                            // A failed append may be half-applied; the accepted
+                            // list is the only truth to rebuild from.
+                            draft = match reopen(&sync_txs) {
+                                Ok(rebuilt) => rebuilt,
+                                Err(e) => {
+                                    transient = Some((
+                                        format!("Sync block prefix rebuild after tx#{idx}: {e}"),
+                                        abort_rest(
+                                            None,
+                                            &mut out_iter,
+                                            std::mem::take(&mut inbounds),
+                                        ),
+                                    ));
+                                    break;
+                                }
+                            };
+                            continue;
                         }
+                    };
+                    // The entry was composed from a sim that ran WITHOUT the
+                    // preceding load tx, so re-check it against what the user tx
+                    // actually did here (`docs/issues/outbound-sim-divergence.md`).
+                    let observed = eez_protocol::outbound_gate::observations_from_logs(
+                        &pair_logs,
+                        stf_cfg.eezl2_address,
+                    );
+                    if let Err(e) = eez_protocol::outbound_gate::verify_outbound_authorized(
+                        &l1_entries,
+                        &observed,
+                        rollup_id,
+                    ) {
                         event!(
-                            name: "eez.composer.cc_compose.append_reverted",
+                            name: "eez.composer.cc_compose.outbound_unobserved",
                             Level::WARN,
                             rollup_id,
                             tx_idx = idx,
                             tx_hash = %held.hash,
-                            appended_idx = at,
-                            error = %why,
-                            "outbound [load, user] pair does not execute on the Sync block prefix; evicting the tx and rebuilding the prefix",
+                            error = %e,
+                            "composed outbound entry does not match the call the tx made on the Sync block; evicting",
                         );
                         push_poison_root(&mut poison, &mut poison_gaps, held);
-                        // A failed append may be half-applied; the accepted
-                        // list is the only truth to rebuild from.
                         draft = match reopen(&sync_txs) {
                             Ok(rebuilt) => rebuilt,
                             Err(e) => {
@@ -2157,7 +2204,7 @@ where
                     // The delivery re-runs the on-chain claim compare, so this
                     // append IS the verifier: a revert means the claims and the
                     // block disagree and the tx must go.
-                    if let Some((at, why)) = append_and_execute(&mut draft, &deliveries) {
+                    if let Err((at, why)) = append_and_execute(&mut draft, &deliveries) {
                         // A backing-store failure says nothing about the tx —
                         // abort the slot instead of evicting a valid delivery.
                         if why.is_provider() {
