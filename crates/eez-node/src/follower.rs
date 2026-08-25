@@ -72,8 +72,7 @@ pub(crate) struct UnsafeHeadFollower<P> {
     chain_id: u64,
     authorized_signer: Address,
     network_events: mpsc::Receiver<NetworkEvent>,
-    /// Keeps the network command side alive for this task's lifetime.
-    _network: NetworkHandle,
+    network: NetworkHandle,
     /// Local chain reader: resolves the current safe anchor and the
     /// candidate head's ancestry for the compatibility check.
     local: P,
@@ -97,7 +96,7 @@ where
             chain_id,
             authorized_signer,
             network_events,
-            _network: network,
+            network,
             local,
             last_head: None,
         }
@@ -116,15 +115,29 @@ where
                         );
                         return;
                     };
-                    if let NetworkEvent::Message(message) = event
-                        && let Err(err) = self.advance(&message).await
-                    {
-                        event!(
-                            name: "eez.node.follower.advance.failed",
-                            Level::WARN,
-                            error = %err,
-                            "signed unsafe-block import failed",
-                        );
+                    match event {
+                        NetworkEvent::PeerSubscribed(_) => {
+                            self.request_next_payload().await;
+                        }
+                        NetworkEvent::Message(message) => {
+                            if let Err(err) = self.advance(&message).await {
+                                event!(
+                                    name: "eez.node.follower.advance.failed",
+                                    Level::WARN,
+                                    error = %err,
+                                    "signed unsafe-block import failed",
+                                );
+                            }
+                        }
+                        NetworkEvent::BackfillUnavailable(number) => {
+                            event!(
+                                name: "eez.node.follower.backfill.unavailable",
+                                Level::DEBUG,
+                                block.number = number,
+                                "peer has no cached signed unsafe payload at requested height",
+                            );
+                        }
+                        NetworkEvent::Listening(_) => {}
                     }
                 }
                 _ = fcu_interval.tick() => {
@@ -157,8 +170,13 @@ where
 
         // Exclude a deriver safe-head move between the ancestry verdict and
         // newPayload + FCU. The committer actor still serializes engine calls.
-        let _reconcile_guard = self.committer.begin_reconcile().await;
+        let reconcile_guard = self.committer.begin_reconcile().await;
         let current_head = self.committer.last_header();
+        if number < current_head.number()
+            || (number == current_head.number() && hash == current_head.hash())
+        {
+            return Ok(());
+        }
         let compatibility = if header.number() == current_head.number().saturating_add(1)
             && header.parent_hash() == current_head.hash()
         {
@@ -189,6 +207,9 @@ where
                     block.hash = %hash,
                     "signed unsafe block ancestry is not locally available; skipping",
                 );
+                drop(reconcile_guard);
+                self.request_payload(current_head.number().saturating_add(1))
+                    .await;
                 return Ok(());
             }
         }
@@ -205,7 +226,26 @@ where
             block.hash = %hash,
             "follower imported verified sequencer payload and advanced unsafe head",
         );
+        drop(reconcile_guard);
+        self.request_payload(number.saturating_add(1)).await;
         Ok(())
+    }
+
+    async fn request_next_payload(&self) {
+        self.request_payload(self.committer.last_header().number().saturating_add(1))
+            .await;
+    }
+
+    async fn request_payload(&self, block_number: u64) {
+        if let Err(error) = self.network.request_payload(block_number).await {
+            event!(
+                name: "eez.node.follower.backfill.request_failed",
+                Level::WARN,
+                block.number = block_number,
+                %error,
+                "could not request missing signed unsafe payload",
+            );
+        }
     }
 }
 

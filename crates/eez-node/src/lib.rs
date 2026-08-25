@@ -37,12 +37,15 @@ use eez_l1::{
     L1CanonicalHead, L1HeadStream, L1Reader, L1ReaderConfig, L1Watcher, L1WatcherConfig, Submitter,
     SubmitterConfig,
 };
-use eez_p2p::{NetworkConfig, NetworkService, sign_payload};
+use eez_p2p::{BACKFILL_CACHE_SIZE, NetworkConfig, NetworkService, sign_payload};
 use eez_prover::MockEcdsaProver;
 use mimalloc::MiMalloc;
 use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
+use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_builder::{NodeBuilder, WithLaunchContext, components::BasicPayloadServiceBuilder};
 use reth_node_ethereum::EthereumNode;
+use reth_payload_primitives::PayloadTypes;
+use reth_storage_api::{BlockIdReader, BlockReader, TransactionVariant};
 use tokio::sync::mpsc;
 use tracing::{Level, event};
 
@@ -632,6 +635,8 @@ async fn launch_composer(builder: L2NodeBuilder, ext: ComposerArgs) -> eyre::Res
     let unsafe_block_signer_address = unsafe_block_signer.address();
     let (p2p_service, p2p_handle, _p2p_events) =
         NetworkService::new(ext.p2p.network_config(l2_chain_id)?)?;
+    let p2p_seed_handle = p2p_handle.clone();
+    let p2p_seed_signer = unsafe_block_signer.clone();
     task_executor.spawn_critical_task("eez-unsafe-block-p2p", p2p_service.run());
     task_executor.spawn_critical_task("eez-unsafe-block-publisher", async move {
         loop {
@@ -651,7 +656,7 @@ async fn launch_composer(builder: L2NodeBuilder, ext: ComposerArgs) -> eyre::Res
                     )
                 });
             p2p_handle
-                .publish(message)
+                .publish(block_number, message)
                 .await
                 .unwrap_or_else(|error| panic!("unsafe-block P2P service stopped: {error}"));
         }
@@ -1100,6 +1105,53 @@ async fn launch_composer(builder: L2NodeBuilder, ext: ComposerArgs) -> eyre::Res
             }
         }
     };
+
+    // Rebuild the bounded recovery window after reconciliation. The live
+    // publisher only observes newly produced blocks, while a restarting
+    // composer may already have locally persisted unsafe descendants.
+    let unsafe_head = block_committer.last_header().number;
+    let safe_number = provider
+        .safe_block_num_hash()
+        .map_err(|error| eyre::eyre!("read L2 safe head for P2P cache: {error}"))?
+        .map_or(0, |safe| safe.number);
+    let first_cached = safe_number
+        .saturating_add(1)
+        .max(unsafe_head.saturating_sub(BACKFILL_CACHE_SIZE.saturating_sub(1) as u64));
+    let mut seeded = 0_u64;
+    for number in first_cached..=unsafe_head {
+        let block = provider
+            .recovered_block(number.into(), TransactionVariant::WithHash)
+            .map_err(|error| eyre::eyre!("read L2 block {number} for P2P cache: {error}"))?
+            .ok_or_else(|| eyre::eyre!("L2 block {number} missing while seeding P2P cache"))?;
+        let payload =
+            <EthEngineTypes as PayloadTypes>::block_to_payload(block.into_sealed_block(), None);
+        let message = match sign_payload(&payload, l2_chain_id, &p2p_seed_signer) {
+            Ok(message) => message,
+            Err(error) => {
+                event!(
+                    name: "eez.node.composer.p2p.cache_seed_incomplete",
+                    Level::WARN,
+                    block.number = number,
+                    %error,
+                    "persisted block lacks complete fork-specific payload data; stopping P2P cache seeding",
+                );
+                break;
+            }
+        };
+        p2p_seed_handle
+            .publish(number, message)
+            .await
+            .map_err(|error| eyre::eyre!("seed signed-block P2P cache: {error}"))?;
+        seeded += 1;
+    }
+    event!(
+        name: "eez.node.composer.p2p.cache_seeded",
+        Level::INFO,
+        first_block = first_cached,
+        last_block = unsafe_head,
+        blocks = seeded,
+        "seeded signed unsafe-block recovery cache",
+    );
     event!(
         name: "eez.node.deriver.spawned",
         Level::INFO,

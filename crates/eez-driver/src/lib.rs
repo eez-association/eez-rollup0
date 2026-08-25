@@ -40,7 +40,7 @@ pub mod timing;
 pub mod witness;
 
 #[doc(inline)]
-pub use block_committer::{BlockCommitterHandle, CommitOutcome, DeriveOutcome, ForkchoiceOutcome};
+pub use block_committer::{BlockCommitterHandle, CommitOutcome, DeriveOutcome};
 #[doc(inline)]
 pub use error::{DriverError, DriverResult};
 #[doc(inline)]
