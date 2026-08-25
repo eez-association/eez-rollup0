@@ -155,7 +155,7 @@ fn main() -> eyre::Result<()> {
             event!(
                 name: "eez.node.panic",
                 Level::ERROR,
-                test_signal = "eez.node.panic",
+                event_name = "eez.node.panic",
                 panic = %info,
                 "node panic",
             );
@@ -943,7 +943,7 @@ fn main() -> eyre::Result<()> {
                     event!(
                         name: "eez.node.deriver.boot_catch_up.failed",
                         Level::ERROR,
-                        test_signal = "eez.node.deriver.boot_catch_up.failed",
+                        event_name = "eez.node.deriver.boot_catch_up.failed",
                         mode = mode.name(),
                         error = %err,
                         "boot-time catch_up failed; refusing to start L1-active tasks before reconciliation",

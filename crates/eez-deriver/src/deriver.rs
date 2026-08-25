@@ -294,7 +294,7 @@ where
             event!(
                 name: "eez.deriver.l1.reorg.retreated",
                 Level::WARN,
-                test_signal = "eez.deriver.l1.reorg.retreated",
+                event_name = "eez.deriver.l1.reorg.retreated",
                 l1_block = tail.l1_block,
                 indexed_hash = %tail.l1_block_hash,
                 canonical_hash = %canonical,
@@ -688,7 +688,7 @@ where
             event!(
                 name: "eez.deriver.resync.failed",
                 Level::ERROR,
-                test_signal = "eez.deriver.resync.failed",
+                event_name = "eez.deriver.resync.failed",
                 error = %err,
                 "post-subscribe resync failed; deriver may have a gap",
             );
@@ -708,7 +708,7 @@ where
                             event!(
                                 name: "eez.deriver.committer.closed",
                                 Level::ERROR,
-                                test_signal = "eez.deriver.committer.closed",
+                                event_name = "eez.deriver.committer.closed",
                                 error = %err,
                                 "block committer gone; deriver exiting",
                             );
@@ -1018,7 +1018,7 @@ where
         event!(
             name: "eez.deriver.safe.advanced",
             Level::INFO,
-            test_signal = "eez.deriver.safe.advanced",
+            event_name = "eez.deriver.safe.advanced",
             from_block,
             to_block,
             applied_entries = settlement.len,
@@ -1053,7 +1053,7 @@ where
             event!(
                 name: "eez.deriver.l1.reorg.noop",
                 Level::WARN,
-                test_signal = "eez.deriver.l1.reorg.noop",
+                event_name = "eez.deriver.l1.reorg.noop",
                 common_ancestor_number,
                 old_head_hash = %old_head_hash,
                 new_head_number,
@@ -1069,7 +1069,7 @@ where
         event!(
             name: "eez.deriver.l1.reorg.retreated",
             Level::WARN,
-            test_signal = "eez.deriver.l1.reorg.retreated",
+            event_name = "eez.deriver.l1.reorg.retreated",
             common_ancestor_number,
             old_head_hash = %old_head_hash,
             new_head_number,
@@ -1131,7 +1131,7 @@ where
         event!(
             name: "eez.deriver.finalized.advanced",
             Level::INFO,
-            test_signal = "eez.deriver.finalized.advanced",
+            event_name = "eez.deriver.finalized.advanced",
             l1_finalized_block,
             l2_finalized = bounded,
             "advanced L2 finalized head from L1 finality",
@@ -1357,7 +1357,7 @@ where
                 event!(
                     name: "eez.deriver.reconcile.sync_block_built",
                     Level::INFO,
-                    test_signal = "eez.deriver.reconcile.sync_block_built",
+                    event_name = "eez.deriver.reconcile.sync_block_built",
                     tx_hash = %tx_hash,
                     sync_height = from_block + decoded.block_tx_counts.len().saturating_sub(1) as u64,
                     outbound = outbound_paired.len(),
@@ -1586,7 +1586,7 @@ where
                 event!(
                     name: "eez.deriver.state.diverged_pre",
                     Level::ERROR,
-                    test_signal = "eez.deriver.state.diverged_pre",
+                    event_name = "eez.deriver.state.diverged_pre",
                     l1_block_number,
                     tx_hash = %tx_hash,
                     pre_block = pre,
@@ -1611,7 +1611,7 @@ where
                 event!(
                     name: "eez.deriver.state.diverged_post",
                     Level::ERROR,
-                    test_signal = "eez.deriver.state.diverged_post",
+                    event_name = "eez.deriver.state.diverged_post",
                     l1_block_number,
                     tx_hash = %tx_hash,
                     to_block,

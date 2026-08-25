@@ -137,6 +137,7 @@ jobs:
       - name: Verify generated EEZL2 genesis artifacts
         run: scripts/update-eezl2-genesis.sh --check
       - name: Integration tests (e2e, serial)
+        timeout-minutes: 40
         run: |
           mkdir -p artifacts/embedded-e2e
           set +e
@@ -186,6 +187,7 @@ jobs:
       - name: Build proof signer (launched by harness)
         run: cargo build -p eez-proof-signer --locked
       - name: Integration tests (cross-chain, serial)
+        timeout-minutes: 75
         run: |
           mkdir -p artifacts/cross-chain-e2e
           set +e

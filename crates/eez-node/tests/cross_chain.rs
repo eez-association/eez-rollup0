@@ -6,7 +6,7 @@ use alloy_sol_types::{SolCall, SolError, SolEvent, SolValue};
 use eez_protocol::EEZL2_ADDRESS;
 use eez_testkit::signals;
 use eez_testkit::{
-    ANVIL_KEY_1, DEV_CHAIN_ID, IEEZL2Direct, IEmptyCall, INBOUND_USER, INestedSetterInner,
+    ANVIL_ATTESTER_KEY, DEV_CHAIN_ID, IEEZL2Direct, IEmptyCall, INBOUND_USER, INestedSetterInner,
     INestedSetterOuter, IReturnData, IReturnDataWrapper, IRevertBubbleWrapper, IRevertingTarget,
     ISetterWrapper, IValue, IValueNoRet, L1_ROLLUP_ID, OUTBOUND_USER, ProverMutation,
     SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead, TARGET_DEPLOYER, account_code,
@@ -150,7 +150,7 @@ async fn assert_value_set_attribution(
 /// verification of the posted proof's recomputed public-input hash.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn minimal_bidirectional_cross_chain_smoke() {
-    let attester = signer_address(ANVIL_KEY_1).unwrap();
+    let attester = signer_address(ANVIL_ATTESTER_KEY).unwrap();
     let w = setup_cross_chain().await.unwrap();
     let l1_rpc = w.l1_rpc();
     let l2_rpc = w.l2_rpc();
@@ -233,7 +233,7 @@ async fn minimal_bidirectional_cross_chain_smoke() {
 }
 
 async fn assert_real_signer_rejects(mutation: ProverMutation, tampered_input: &str) {
-    let attester = signer_address(ANVIL_KEY_1).unwrap();
+    let attester = signer_address(ANVIL_ATTESTER_KEY).unwrap();
     let w = setup_cross_chain_proxied(mutation, attester).await.unwrap();
     let l1_rpc = w.l1_rpc();
     let proxy = w.prover_proxy.as_ref().expect("real signer proxy");

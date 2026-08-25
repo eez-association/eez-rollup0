@@ -576,7 +576,7 @@ impl L1Watcher {
                 event!(
                     name: "eez.l1_watcher.reorg.detected",
                     Level::WARN,
-                    test_signal = "eez.l1_watcher.reorg.detected",
+                    event_name = "eez.l1_watcher.reorg.detected",
                     tick = tick_count,
                     old_tip_number,
                     old_tip_hash = %old_tip_hash,

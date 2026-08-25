@@ -14,13 +14,13 @@ use alloy_rpc_types_eth::Filter;
 use alloy_sol_types::{SolCall, SolEvent, sol};
 use anyhow::{Context, Result};
 use eez_protocol::{EEZL2_ADDRESS, EvmBatch, entries::decode_postbatch};
+use eez_testkit::signals;
 use eez_testkit::{
     ANVIL_KEY_6, CrossChainWorld, DEV_CHAIN_ID, ICounter, IEEZ, INBOUND_USER, ISetterWrapper,
-    OUTBOUND_USER, SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead, TARGET_DEPLOYER,
-    batches_posted, call_read, counter_count, create_cross_chain_proxy,
-    create_l2_cross_chain_proxy, deploy_counter, events_since, l2_value, last_proxy_result,
-    onchain_nonce, receipt_ok, safe_block_state_root, setup_cross_chain,
-    setup_cross_chain_with_env, sign_and_send, state_root, value_read, wait_for,
+    OUTBOUND_USER, SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead, TARGET_DEPLOYER, call_read,
+    counter_count, create_cross_chain_proxy, create_l2_cross_chain_proxy, deploy_counter,
+    events_since, l2_value, last_proxy_result, onchain_nonce, receipt_ok, safe_block_state_root,
+    setup_cross_chain, setup_cross_chain_with_env, sign_and_send, state_root, value_read, wait_for,
 };
 
 sol! {
@@ -172,25 +172,20 @@ async fn assert_reconciled(w: &CrossChainWorld) {
     .expect("L1 stored stateRoot never matched the L2 safe stateRoot");
 }
 
-/// Return at the start of a drain window, so everything submitted next lands
-/// in ONE drain.
-///
-/// Deterministic by construction: the composer keeps at most one postBatch in
-/// flight, so a fresh `BatchPosted` means the next drain is gated on the
-/// deriver clearing that batch — never sooner than the following L1 block
-/// (5s on the embedded testing L1, `TESTING_L1_BLOCK_TIME`). Admitting three
-/// transactions at the ingress front takes ~100ms against that. Co-bundling is
-/// still asserted from the posted batch itself, so a missed window fails the
-/// test instead of quietly weakening it.
+/// Return just after the composer drains its pool. Transactions submitted next
+/// receive a complete collection interval before the following drain.
 async fn open_drain_window(w: &CrossChainWorld) {
-    let (l1_rpc, eez, from) = (w.l1_rpc(), w.cfg.eez_address, w.dep.deploy_block);
-    let before = batches_posted(&l1_rpc, eez, from).await.unwrap();
-    wait_for(SETTLE_TIMEOUT, || {
-        let l1_rpc = l1_rpc.clone();
-        async move { Ok((batches_posted(&l1_rpc, eez, from).await? > before).then_some(())) }
+    let cursor = w.node.signal_cursor().unwrap();
+    wait_for(SETTLE_TIMEOUT, || async {
+        let drained = w
+            .node
+            .signals_since(cursor)?
+            .iter()
+            .any(|signal| signal.name == signals::COMPOSER_POOL_DRAINED);
+        Ok(drained.then_some(()))
     })
     .await
-    .expect("composer never posted a batch; cannot align on a drain window");
+    .expect("composer did not report a fresh pool-drain boundary");
 }
 
 async fn batches(w: &CrossChainWorld) -> Vec<EvmBatch> {
@@ -283,6 +278,112 @@ async fn repeated_inbound_calls_in_one_source_transaction_chain_state() {
         last_proxy_result(&l1_rpc, w.inbound_wrapper).await.unwrap(),
         (false, value),
         "the final ordered call must return the post-write state",
+    );
+
+    assert_reconciled(&w).await;
+    assert_no_evictions(&w);
+    w.node.assert_no_process_death();
+}
+
+/// Two outbound transactions with identical calls must remain distinct ordered
+/// entries. The second execution observes the first write and returns
+/// `changed = false`; semantic-hash deduplication would drop that result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identical_outbound_calls_in_separate_transactions_chain_state() {
+    let w = setup_cross_chain_with_env(&cap_env()).await.unwrap();
+    let (l1_rpc, l2_rpc) = (w.l1_rpc(), w.l2_rpc());
+    let value = U256::from(79u64);
+    let call = ISetterWrapper::setViaProxyCall { v: value }.abi_encode();
+    let provider = ProviderBuilder::new().connect_http(l2_rpc.parse().unwrap());
+    let wrapped_filter = Filter::new()
+        .address(w.outbound_wrapper)
+        .event_signature(ISetterWrapper::Wrapped::SIGNATURE_HASH)
+        .from_block(0u64);
+    let wrapped_before = provider.get_logs(&wrapped_filter).await.unwrap().len();
+    assert_ne!(
+        l2_value(&l1_rpc, w.outbound_value).await.unwrap(),
+        value,
+        "the first call must change destination state",
+    );
+
+    open_drain_window(&w).await;
+    let nonce = onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
+    let first = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        nonce,
+        Some(w.outbound_wrapper),
+        U256::ZERO,
+        call.clone(),
+        1_200_000,
+    )
+    .await
+    .expect("first identical outbound call must be admitted");
+    let second = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        nonce + 1,
+        Some(w.outbound_wrapper),
+        U256::ZERO,
+        call.clone(),
+        1_200_000,
+    )
+    .await
+    .expect("second identical outbound call must be admitted");
+
+    assert_receipt_ok(&l2_rpc, first, "first identical outbound call").await;
+    assert_receipt_ok(&l2_rpc, second, "second identical outbound call").await;
+    wait_for(SETTLE_TIMEOUT, || {
+        let provider = provider.clone();
+        let wrapped_filter = wrapped_filter.clone();
+        async move {
+            let count = provider.get_logs(&wrapped_filter).await?.len();
+            Ok((count == wrapped_before + 2).then_some(()))
+        }
+    })
+    .await
+    .expect("both identical outbound calls did not return to the source wrapper");
+
+    let carried: Vec<Vec<Bytes>> = batches(&w)
+        .await
+        .iter()
+        .map(|batch| outbound_calls(batch, w.outbound_value))
+        .filter(|calls| !calls.is_empty())
+        .collect();
+    assert_eq!(
+        carried,
+        vec![vec![Bytes::from(call.clone()), Bytes::from(call)]],
+        "both identical calls must ride one postBatch in source order",
+    );
+
+    let wrapped = provider.get_logs(&wrapped_filter).await.unwrap();
+    let wrapped = &wrapped[wrapped_before..];
+    let sync_block = wrapped[0]
+        .block_number
+        .expect("first wrapper result must belong to a mined Sync block");
+    assert_eq!(
+        wrapped[1].block_number,
+        Some(sync_block),
+        "both calls must execute in one Sync block",
+    );
+    assert_eq!(
+        [wrapped[0].transaction_hash, wrapped[1].transaction_hash],
+        [Some(first), Some(second)],
+        "wrapper results must retain source transaction order",
+    );
+    let results = wrapped
+        .iter()
+        .map(|log| {
+            let event = ISetterWrapper::Wrapped::decode_log(&log.inner).unwrap();
+            (event.input, event.ok, event.changed, event.newValue)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec![(value, true, true, value), (value, true, false, value)],
+        "the second call must observe the first destination write",
     );
 
     assert_reconciled(&w).await;

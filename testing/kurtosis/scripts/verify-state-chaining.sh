@@ -55,8 +55,8 @@ L1_ROLLUP_ID="${EEZ_L1_ROLLUP_ID:-0}"
 RECEIPT_WAIT_SECS="${EEZ_STATE_CHAINING_WAIT_SECS:-300}"
 WRAPPED_TOPIC=$(cast keccak 'Wrapped(uint256,bool,bool,uint256)')
 
-FUNDING_KEY="${EEZ_FUND_FROM_KEY:-${EEZ_PROOF_SIGNER_KEY:-$(yaml_value proof_signer_key)}}"
-[[ -n "$FUNDING_KEY" ]] || { echo "could not resolve the L1 funding key"; exit 1; }
+FUNDING_KEY="${EEZ_FUND_FROM_KEY:-$(yaml_value poster_key)}"
+[[ -n "$FUNDING_KEY" ]] || { echo "could not resolve the L1 funding key from EEZ_FUND_FROM_KEY or eez.poster_key"; exit 1; }
 L1_DEPLOY_KEY="${EEZ_L1_SETUP_KEY:-$FUNDING_KEY}"
 
 refresh_node_log() { kurtosis service logs -a "$ENCLAVE" eez-node >"$NODE_LOG" 2>&1 || true; }
@@ -65,11 +65,11 @@ refresh_signer_log() { kurtosis service logs -a "$ENCLAVE" eez-proof-signer >"$S
 wait_for_sync_boundary() {
     local baseline count=0 deadline
     refresh_node_log
-    baseline=$(strip_ansi <"$NODE_LOG" | grep -Fc 'compose_sync_slot invoked' || true)
+    baseline=$(strip_ansi <"$NODE_LOG" | grep -Fc 'eez.composer.sync_slot.pool_drained' || true)
     deadline=$((SECONDS + ${EEZ_SYNC_BOUNDARY_WAIT_SECS:-60}))
     while (( SECONDS < deadline )); do
         refresh_node_log
-        count=$(strip_ansi <"$NODE_LOG" | grep -Fc 'compose_sync_slot invoked' || true)
+        count=$(strip_ansi <"$NODE_LOG" | grep -Fc 'eez.composer.sync_slot.pool_drained' || true)
         (( count > baseline )) && return 0
         sleep 1
     done
@@ -177,15 +177,10 @@ run_scenario() {
     local source_blocks all_target_logs target_logs target_blocks sync_height final_value result
     local completed_before target_before target_event_count target_event_count_before target_event_deadline
     local expected_final
-    local hashes=() actual_results=()
+    local hashes=() raw_transactions=() actual_results=()
     local expected_results=() index step
 
     echo
-    echo "==> $direction $scenario-state chaining: waiting for a fresh drain window"
-    wait_for_sync_boundary
-    refresh_signer_log
-    node_baseline=$(wc -l <"$NODE_LOG")
-    signer_baseline=$(wc -l <"$SIGNER_LOG")
     chain_id=$(cast chain-id --rpc-url "$source_rpc")
     nonce=$(retry cast nonce "$sender" --rpc-url "$source_rpc")
     gas_price=$(gas_price_for "$source_rpc")
@@ -228,7 +223,7 @@ run_scenario() {
             ;;
     esac
 
-    echo "==> $direction $scenario-state chaining: submitting three separate transactions"
+    echo "==> $direction $scenario-state chaining: preparing three separate transactions"
     for step in 1 2 3; do
         if [[ "$scenario" == "destination" || ( "$scenario" == "mixed" && "$step" == "2" ) ]]; then
             value=1
@@ -245,9 +240,20 @@ run_scenario() {
         fi
         [[ "$raw" =~ ^0x[0-9a-fA-F]+$ ]] || { echo "could not build $direction transaction"; return 1; }
         hash=$(cast keccak "$raw")
-        send_front "$front" "$raw" "$hash"
+        raw_transactions+=("$raw")
         hashes+=("$hash")
         nonce=$((nonce + 1))
+    done
+
+    echo "==> $direction $scenario-state chaining: waiting for a fresh drain window"
+    wait_for_sync_boundary
+    refresh_signer_log
+    node_baseline=$(wc -l <"$NODE_LOG")
+    signer_baseline=$(wc -l <"$SIGNER_LOG")
+
+    echo "==> $direction $scenario-state chaining: submitting prepared transactions"
+    for index in 0 1 2; do
+        send_front "$front" "${raw_transactions[$index]}" "${hashes[$index]}"
     done
 
     wait_for_receipts "$source_rpc" "${hashes[@]}"
@@ -302,17 +308,13 @@ run_mixed_direction_scenario() {
     local l2_events_before l2_events event_deadline inbound_block outbound_block sync_height
 
     echo
-    echo "==> mixed-direction state chaining: waiting for a fresh drain window"
+    echo "==> mixed-direction state chaining: preparing transactions"
     # Build on the final state of the six directional scenarios above.
     [[ $(retry cast call "$INBOUND_WRAPPER" 'completedProxyCalls()(uint256)' --rpc-url "$L1") == "9" ]]
     [[ $(retry cast call "$OUTBOUND_WRAPPER" 'completedProxyCalls()(uint256)' --rpc-url "$L2") == "9" ]]
     [[ $(retry cast call "$L2_VALUE" 'value()(uint256)' --rpc-url "$L2") == "9" ]]
     [[ $(retry cast call "$L1_VALUE" 'value()(uint256)' --rpc-url "$L1") == "9" ]]
 
-    wait_for_sync_boundary
-    refresh_signer_log
-    node_baseline=$(wc -l <"$NODE_LOG")
-    signer_baseline=$(wc -l <"$SIGNER_LOG")
     inbound_nonce=$(retry cast nonce "$INBOUND_SENDER" --rpc-url "$L1")
     outbound_nonce=$(retry cast nonce "$OUTBOUND_SENDER" --rpc-url "$L2")
     l1_gas_price=$(gas_price_for "$L1")
@@ -333,6 +335,14 @@ run_mixed_direction_scenario() {
         || { echo "could not build mixed-direction transactions" >&2; return 1; }
     inbound_hash=$(cast keccak "$inbound_raw")
     outbound_hash=$(cast keccak "$outbound_raw")
+
+    echo "==> mixed-direction state chaining: waiting for a fresh drain window"
+    wait_for_sync_boundary
+    refresh_signer_log
+    node_baseline=$(wc -l <"$NODE_LOG")
+    signer_baseline=$(wc -l <"$SIGNER_LOG")
+
+    echo "==> mixed-direction state chaining: submitting prepared transactions"
     send_front "$L1F" "$inbound_raw" "$inbound_hash"
     send_front "$L2F" "$outbound_raw" "$outbound_hash"
 

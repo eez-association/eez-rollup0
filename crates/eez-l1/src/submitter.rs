@@ -438,7 +438,7 @@ impl Inner {
                 event!(
                     name: "eez.submitter.bundle.mempool_fallback",
                     Level::INFO,
-                    test_signal = "eez.submitter.bundle.mempool_fallback",
+                    event_name = "eez.submitter.bundle.mempool_fallback",
                     target_block,
                     tx_count = raw_txs.len(),
                     "relay has no eth_sendBundle; submitting txs via mempool in order",

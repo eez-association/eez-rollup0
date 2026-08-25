@@ -975,6 +975,7 @@ where
         event!(
             name: "eez.composer.sync_slot.invoked",
             Level::INFO,
+            event_name = "eez.composer.sync_slot.invoked",
             rollup_id,
             timestamp,
             mode = ?mode,
@@ -1149,6 +1150,7 @@ where
         event!(
             name: "eez.composer.sync_slot.drain",
             Level::DEBUG,
+            event_name = "eez.composer.sync_slot.drain",
             rollup_id,
             cursor,
             parent_number,
@@ -1482,7 +1484,7 @@ where
                             sender = %tx.sender,
                             nonce = tx.nonce,
                             attempts = tx.attempts,
-                            test_signal = "eez.composer.recovery.poison_evicted",
+                            event_name = "eez.composer.recovery.poison_evicted",
                             "user_tx evicted after MAX_BUNDLE_ATTEMPTS relay drops (likely poison the compose-time sim missed); resubmit required",
                         );
                     } else {
@@ -1509,7 +1511,7 @@ where
                             sender = %t.sender,
                             nonce = t.nonce,
                             gap_at = nonce,
-                            test_signal = "eez.composer.recovery.nonce_chain_evicted",
+                            event_name = "eez.composer.recovery.nonce_chain_evicted",
                             "same-sender tx above an evicted nonce; gapped chain can never land — evicted (resubmit in order)",
                         );
                     }
@@ -1525,7 +1527,7 @@ where
                         sender = %t.sender,
                         nonce = t.nonce,
                         gap_at = nonce,
-                        test_signal = "eez.composer.recovery.nonce_chain_evicted",
+                        event_name = "eez.composer.recovery.nonce_chain_evicted",
                         "same-sender pooled tx above an evicted nonce; gapped chain can never land — evicted (resubmit in order)",
                     );
                 }
@@ -1783,7 +1785,6 @@ where
                 poison.push(held);
                 continue;
             }
-
             let contexts = L1TargetSession::new(&l1_state, local.l1_entry.clone())
                 .map_err(|e| format!("L1TargetSession::new: {e}"))
                 .and_then(|exec| {
@@ -2294,7 +2295,7 @@ where
                 event!(
                     name: "eez.composer.cc_compose.poison_eviction_completed",
                     Level::WARN,
-                    test_signal = "eez.composer.cc_compose.poison_eviction_completed",
+                    event_name = "eez.composer.cc_compose.poison_eviction_completed",
                     rollup_id,
                     tx_hash = %tx.hash,
                     sender = %tx.sender,
@@ -2647,7 +2648,7 @@ where
         event!(
             name: "eez.composer.bundle.dispatched",
             Level::INFO,
-            test_signal = "eez.composer.bundle.dispatched",
+            event_name = "eez.composer.bundle.dispatched",
             rollup_id,
             sync_height,
             tx_count = bundle.len(),
@@ -2779,7 +2780,7 @@ where
         event!(
             name: "eez.composer.phase1.bundle.dispatched",
             Level::INFO,
-            test_signal = "eez.composer.phase1.bundle.dispatched",
+            event_name = "eez.composer.phase1.bundle.dispatched",
             rollup_id,
             sync_height,
             "minimal postBatch dispatched to background observer (leading immediate only)",

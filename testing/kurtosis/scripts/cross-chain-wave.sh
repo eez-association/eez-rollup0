@@ -69,8 +69,8 @@ HH_KEY_PURE=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a  
 
 # EOAs funded on L1 so they can pay gas on the shared chain.
 L1_FUNDED_KEYS=("$HH_KEY_IN")
-FUND_FROM_KEY="${EEZ_FUND_FROM_KEY:-${EEZ_PROOF_SIGNER_KEY:-$(yaml_value proof_signer_key)}}"
-[[ -n "$FUND_FROM_KEY" ]] || { echo "could not resolve a funding key — set EEZ_FUND_FROM_KEY or check $K/args.yaml"; exit 1; }
+FUND_FROM_KEY="${EEZ_FUND_FROM_KEY:-$(yaml_value poster_key)}"
+[[ -n "$FUND_FROM_KEY" ]] || { echo "could not resolve a funding key — set EEZ_FUND_FROM_KEY or eez.poster_key"; exit 1; }
 L1_SETUP_KEY="${EEZ_L1_SETUP_KEY:-$FUND_FROM_KEY}"
 
 EEZL2_ADDRESS="${EEZL2_ADDRESS:-0x4200000000000000000000000000000000000007}"
@@ -225,7 +225,7 @@ wait_for_poison_eviction() {
     while (( SECONDS < deadline )); do
         refresh_node_log
         evidence=$(strip_ansi <"$NODE_LOG" \
-            | grep -F 'test_signal="eez.composer.cc_compose.poison_eviction_completed"' \
+            | grep -F 'eez.composer.cc_compose.poison_eviction_completed' \
             | grep -F "tx_hash=$hash" \
             | grep -E "direction=\"?$direction\"?" \
             | tail -1 || true)

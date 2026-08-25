@@ -360,9 +360,9 @@ network must remain available.
 ## Generate test traffic
 
 The workload scripts discover the enclave ports and deployment artifact
-automatically. They also read the deterministic L1 funding key from
-`KURTOSIS_ARGS_FILE`, so that variable must point to the arguments file used to
-start the network.
+automatically. They also read the deterministic L1 poster key (never the proof
+signer key) as their funding account from `KURTOSIS_ARGS_FILE`, so that variable
+must point to the arguments file used to start the network.
 
 ### Run one cross-chain workload
 

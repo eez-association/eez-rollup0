@@ -6,10 +6,13 @@
 
 #![allow(missing_debug_implementations)]
 
+mod artifacts;
+mod ports;
+pub mod signals;
+
 use std::{
     collections::HashSet,
     fmt::Write as _,
-    net::{TcpListener, UdpSocket},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
@@ -39,6 +42,9 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, Streaming};
 
+pub use crate::signals::NodeSignal;
+use crate::{artifacts::FailureDatadir, ports::PortLease};
+
 /// Anvil's first default account (mnemonic `test test test test test test test test test test test junk`).
 pub const ANVIL_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 pub const ANVIL_ADDR: Address = address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
@@ -49,7 +55,7 @@ pub const ANVIL_KEY_4: &str = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f873
 /// Second cross-chain sender. Eviction cascades along one sender's nonce chain,
 /// so a poison tx needs its own sender to leave co-bundled survivors alone.
 pub const ANVIL_KEY_6: &str = "0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e";
-// Account #0 derives the reserved L2 system address and cannot attest.
+/// Unfunded proof-signer identity, separate from every transaction sender.
 pub const ANVIL_ATTESTER_KEY: &str =
     "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906");
@@ -68,73 +74,7 @@ const TX_SPAM_INTERVAL: Duration = Duration::from_secs(1);
 static LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static WORKSPACE_BUILD_LOCK: Mutex<()> = Mutex::new(());
 
-/// Stable values carried in the `test_signal` field of JSON tracing events.
-pub mod signals {
-    pub const BUNDLE_ACCEPTED: &str = "eez.node.l1_embedded.bundle.accepted";
-    pub const BUNDLE_MEMPOOL_FALLBACK: &str = "eez.submitter.bundle.mempool_fallback";
-    pub const DERIVER_REORG_NOOP: &str = "eez.deriver.l1.reorg.noop";
-    pub const DERIVER_REORG_RETREATED: &str = "eez.deriver.l1.reorg.retreated";
-    pub const DERIVER_STATE_DIVERGED_POST: &str = "eez.deriver.state.diverged_post";
-    pub const DERIVER_STATE_DIVERGED_PRE: &str = "eez.deriver.state.diverged_pre";
-    pub const DERIVER_SAFE_ADVANCED: &str = "eez.deriver.safe.advanced";
-    pub const DERIVER_FINALIZED_ADVANCED: &str = "eez.deriver.finalized.advanced";
-    pub const DERIVER_SYNC_BLOCK_BUILT: &str = "eez.deriver.reconcile.sync_block_built";
-    pub const DERIVER_RESYNC_FAILED: &str = "eez.deriver.resync.failed";
-    pub const DERIVER_COMMITTER_CLOSED: &str = "eez.deriver.committer.closed";
-    pub const NODE_BOOT_CATCH_UP_FAILED: &str = "eez.node.deriver.boot_catch_up.failed";
-    pub const NODE_PANIC: &str = "eez.node.panic";
-    pub const COMPOSER_BUNDLE_DISPATCHED: &str = "eez.composer.bundle.dispatched";
-    pub const COMPOSER_PHASE1_BUNDLE_DISPATCHED: &str = "eez.composer.phase1.bundle.dispatched";
-    pub const COMPOSER_OUTBOUND_MULTICALL_UNSUPPORTED: &str =
-        "eez.composer.cc_compose.outbound_multicall_unsupported";
-    pub const COMPOSER_POISON_EVICTION_COMPLETED: &str =
-        "eez.composer.cc_compose.poison_eviction_completed";
-    pub const FOLLOWER_HEAD_ADVANCED: &str = "eez.node.follower.head.advanced";
-    pub const FOLLOWER_HEAD_SYNCING: &str = "eez.node.follower.head.syncing";
-    pub const L1_REORG_DETECTED: &str = "eez.l1_watcher.reorg.detected";
-    pub const TX_NONCE_CHAIN_EVICTED: &str = "eez.composer.recovery.nonce_chain_evicted";
-    pub const TX_POISON_EVICTED: &str = "eez.composer.recovery.poison_evicted";
-}
-
-pub const FATAL_SIGNALS: &[&str] = &[
-    signals::NODE_PANIC,
-    signals::NODE_BOOT_CATCH_UP_FAILED,
-    signals::DERIVER_RESYNC_FAILED,
-    signals::DERIVER_COMMITTER_CLOSED,
-    signals::DERIVER_STATE_DIVERGED_PRE,
-    signals::DERIVER_STATE_DIVERGED_POST,
-];
-
-/// One machine-readable tracing record emitted by an EEZ process.
-#[derive(Clone, Debug)]
-pub struct NodeSignal {
-    pub name: String,
-    pub fields: serde_json::Map<String, serde_json::Value>,
-}
-
-impl NodeSignal {
-    pub fn u64(&self, field: &str) -> Result<u64> {
-        let value = self
-            .fields
-            .get(field)
-            .ok_or_else(|| anyhow!("signal {} has no {field} field", self.name))?;
-        value
-            .as_u64()
-            .or_else(|| value.as_str().and_then(|v| v.parse().ok()))
-            .ok_or_else(|| anyhow!("signal {} field {field} is not a u64: {value}", self.name))
-    }
-
-    pub fn b256(&self, field: &str) -> Result<B256> {
-        let value = self
-            .fields
-            .get(field)
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| anyhow!("signal {} has no string {field} field", self.name))?;
-        value
-            .parse()
-            .with_context(|| format!("signal {} has invalid {field}: {value}", self.name))
-    }
-}
+pub const FATAL_SIGNALS: &[&str] = signals::FATAL;
 
 pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -176,90 +116,6 @@ pub fn anvil_bin() -> String {
     "anvil".to_string()
 }
 
-/// Every port handed out anywhere in this test process.
-///
-/// Probes are availability checks, not reservations, so without a shared
-/// record a later spawn can be handed a port an earlier node in the same
-/// process already used — its lingering sockets then fail the real bind with
-/// `address already in use`. Serial test binaries spawn several nodes per
-/// process, so the record has to outlive the individual spawn.
-static HANDED_OUT_PORTS: std::sync::LazyLock<std::sync::Mutex<HashSet<u16>>> =
-    std::sync::LazyLock::new(std::sync::Mutex::default);
-
-fn handed_out_ports() -> std::sync::MutexGuard<'static, HashSet<u16>> {
-    HANDED_OUT_PORTS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Probe a currently available TCP port, distinct from every port this process
-/// has already handed out.
-///
-/// The listener is released on return, so this is not a reservation.
-pub fn free_port() -> u16 {
-    probe_unique_tcp_port(&mut handed_out_ports())
-}
-
-fn probe_unique_tcp_port(used: &mut HashSet<u16>) -> u16 {
-    loop {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind TCP probe");
-        let port = listener.local_addr().expect("TCP probe local_addr").port();
-        if used.insert(port) {
-            return port;
-        }
-    }
-}
-
-fn probe_unique_udp_port(used: &mut HashSet<u16>) -> u16 {
-    loop {
-        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind UDP probe");
-        let port = socket.local_addr().expect("UDP probe local_addr").port();
-        if used.insert(port) {
-            return port;
-        }
-    }
-}
-
-fn probe_unique_tcp_udp_port(used: &mut HashSet<u16>) -> u16 {
-    loop {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind TCP probe");
-        let port = listener.local_addr().expect("TCP probe local_addr").port();
-        if used.contains(&port) {
-            continue;
-        }
-        let Ok(socket) = UdpSocket::bind(("127.0.0.1", port)) else {
-            continue;
-        };
-        drop(socket);
-        used.insert(port);
-        return port;
-    }
-}
-
-/// Probe an HTTP port whose implicit `port + 1` WS listener is also available.
-fn probe_unique_http_port(used: &mut HashSet<u16>) -> u16 {
-    loop {
-        let http_listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP probe");
-        let http_port = http_listener
-            .local_addr()
-            .expect("HTTP probe local_addr")
-            .port();
-        let Some(ws_port) = http_port.checked_add(1) else {
-            continue;
-        };
-        if used.contains(&http_port) || used.contains(&ws_port) {
-            continue;
-        }
-        let Ok(ws_listener) = TcpListener::bind(("127.0.0.1", ws_port)) else {
-            continue;
-        };
-        drop(ws_listener);
-        used.insert(http_port);
-        used.insert(ws_port);
-        return http_port;
-    }
-}
-
 pub struct Anvil {
     child: Child,
     pub rpc_url: String,
@@ -284,7 +140,8 @@ impl AnvilConfig {
 }
 
 impl Anvil {
-    async fn spawn_with(port: u16, cfg: AnvilConfig) -> Result<Self> {
+    async fn spawn_with(port_lease: PortLease, cfg: AnvilConfig) -> Result<Self> {
+        let port = port_lease.port();
         let (log_path, log_dir) = test_log_destination("anvil")?;
         let log = std::fs::File::create(&log_path).context("create anvil log")?;
         let err_log = log.try_clone().context("clone anvil log")?;
@@ -300,11 +157,9 @@ impl Anvil {
         ]);
         cmd.args(["--gas-limit", &cfg.gas_limit.to_string()]);
         cmd.args(["--timestamp", &cfg.genesis_timestamp.to_string()]);
-        let mut child = cmd
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(err_log))
-            .spawn()
-            .context("spawn anvil")?;
+        cmd.stdout(Stdio::from(log)).stderr(Stdio::from(err_log));
+        drop(port_lease);
+        let mut child = cmd.spawn().context("spawn anvil")?;
         let rpc_url = format!("http://127.0.0.1:{port}");
         let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
         let startup_timeout = Duration::from_secs(10);
@@ -381,19 +236,21 @@ struct BundleStub {
 }
 
 impl BundleStub {
-    async fn spawn(port: u16, upstream: &str) -> Result<Self> {
+    async fn spawn(port_lease: PortLease, upstream: &str) -> Result<Self> {
+        let port = port_lease.port();
         let script = repo_root().join("scripts/builder-stub.py");
         let listen = format!("127.0.0.1:{port}");
         let (log_path, log_dir) = test_log_destination("builder-stub")?;
         let log = std::fs::File::create(&log_path).context("create builder stub log")?;
         let err_log = log.try_clone().context("clone builder stub log")?;
-        let mut child = Command::new("python3")
+        let mut command = Command::new("python3");
+        command
             .arg(script)
             .args(["--listen", &listen, "--upstream", upstream])
             .stdout(Stdio::from(log))
-            .stderr(Stdio::from(err_log))
-            .spawn()
-            .context("spawn builder-stub.py")?;
+            .stderr(Stdio::from(err_log));
+        drop(port_lease);
+        let mut child = command.spawn().context("spawn builder-stub.py")?;
         let url = format!("http://{listen}");
         for _ in 0..30 {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -517,14 +374,16 @@ pub struct ProofSignerHandle {
 
 impl ProofSignerHandle {
     async fn spawn(cfg: &ProofSignerConfig<'_>) -> Result<Self> {
-        let listen = format!("127.0.0.1:{}", free_port());
+        let port_lease = PortLease::tcp();
+        let listen = format!("127.0.0.1:{}", port_lease.port());
         let attester = signer_address(cfg.signer_key)?;
         let l2_system_address = signer_address(L2_SYSTEM_KEY)?;
         let (log_path, log_dir) = test_log_destination("eez-proof-signer")?;
         let working_dir = tempfile::tempdir().context("proof signer working directory")?;
         let log = std::fs::File::create(&log_path).context("create proof signer log")?;
         let err_log = log.try_clone().context("clone proof signer log")?;
-        let mut child = Command::new(proof_signer_binary()?)
+        let mut command = Command::new(proof_signer_binary()?);
+        command
             // The signer also loads dotenv at startup. Keep its explicitly
             // constructed test environment isolated from repository config.
             .current_dir(working_dir.path())
@@ -552,9 +411,9 @@ impl ProofSignerHandle {
             .env("NO_COLOR", "1")
             .env("RUST_LOG", "info")
             .stdout(Stdio::from(log))
-            .stderr(Stdio::from(err_log))
-            .spawn()
-            .context("spawn eez-proof-signer")?;
+            .stderr(Stdio::from(err_log));
+        drop(port_lease);
+        let mut child = command.spawn().context("spawn eez-proof-signer")?;
 
         for _ in 0..100 {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -595,7 +454,8 @@ impl ProofSignerHandle {
             .with_context(|| format!("read signer log {}", self.log_path.display()))?;
         Ok(contents
             .lines()
-            .filter(|line| line.contains("window validated and signed"))
+            .filter_map(signals::parse)
+            .filter(|signal| signal.name == "eez.proof_signer.window_signed")
             .count())
     }
 
@@ -820,8 +680,8 @@ impl Harness {
         initial_state: B256,
         l2_genesis: (PathBuf, tempfile::TempDir),
     ) -> Result<Self> {
-        let anvil = Anvil::spawn_with(free_port(), cfg).await?;
-        let stub = BundleStub::spawn(free_port(), &anvil.rpc_url).await?;
+        let anvil = Anvil::spawn_with(PortLease::tcp(), cfg).await?;
+        let stub = BundleStub::spawn(PortLease::tcp(), &anvil.rpc_url).await?;
         let dep = deploy_contracts_with_initial(&anvil.rpc_url, ANVIL_KEY, initial_state).await?;
         Ok(Self {
             anvil,
@@ -1295,12 +1155,12 @@ pub struct NodeHandle {
     pub name: String,
     /// Where the node's merged stdout+stderr is written. Goes to
     /// `EEZ_TEST_LOG_DIR/eez-node-<pid>.log` if that env var is set,
-    /// otherwise inside a tempdir held in `keep_alive`.
+    /// otherwise inside a tempdir held by this handle.
     pub log_path: PathBuf,
-    /// Tempdirs whose lifetime is tied to this handle (the log dir if
-    /// we allocated one, and the datadir if the handle created it via
-    /// [`Self::start`]). They drop with the handle.
-    keep_alive: Vec<tempfile::TempDir>,
+    /// Tempdirs whose lifetime is tied to this handle (currently the log dir).
+    _keep_alive: Vec<tempfile::TempDir>,
+    /// Owned node database. CI retains it only if this test unwinds in failure.
+    owned_datadir: Option<FailureDatadir>,
     pub http_port: u16,
 }
 
@@ -1310,39 +1170,59 @@ pub struct NodeConfig<'a> {
 }
 
 impl NodeHandle {
-    fn spawn(datadir: &std::path::Path, env: &[(&'static str, String)]) -> Result<Self> {
-        Self::spawn_with("node", datadir, &NodeConfig::default(), env)
-    }
-
     fn spawn_with(
         name: &str,
         datadir: &std::path::Path,
         cfg: &NodeConfig<'_>,
         env: &[(&'static str, String)],
     ) -> Result<Self> {
+        Self::spawn_with_reservations(name, datadir, cfg, env, Vec::new())
+    }
+
+    fn spawn_with_reservations(
+        name: &str,
+        datadir: &std::path::Path,
+        cfg: &NodeConfig<'_>,
+        env: &[(&'static str, String)],
+        mut port_leases: Vec<PortLease>,
+    ) -> Result<Self> {
         let (log_path, log_tempdir) = test_log_destination(&format!("eez-node-{name}"))?;
         let f = std::fs::File::create(&log_path).context("create log file")?;
         let f2 = f.try_clone().context("clone log file")?;
         let (stdout, stderr) = (Stdio::from(f), Stdio::from(f2));
-        // Reth defaults collide if any test or unrelated process holds them.
-        // Each NodeHandle picks its own ephemeral ports for authrpc / http / ws / p2p.
-        // These are availability probes, not reservations: the sockets are
-        // released before the child binds. The process-wide record prevents
-        // collisions among one node's listeners AND across the nodes a serial
-        // test binary spawns one after another.
-        let mut used_ports = handed_out_ports();
-        let authrpc_port = probe_unique_tcp_port(&mut used_ports);
-        let http_port = probe_unique_tcp_port(&mut used_ports);
-        let ws_port = probe_unique_tcp_port(&mut used_ports);
-        let p2p_port = probe_unique_tcp_port(&mut used_ports);
-        let l1_http_port = probe_unique_http_port(&mut used_ports);
-        let l1_auth_port = probe_unique_tcp_port(&mut used_ports);
+        let authrpc_lease = PortLease::tcp();
+        let http_lease = PortLease::tcp();
+        let ws_lease = PortLease::tcp();
+        let p2p_lease = PortLease::tcp();
+        let l1_http_lease = PortLease::http_pair();
+        let l1_auth_lease = PortLease::tcp();
         // Embedded L1 uses this numeric port for RLPx TCP and discovery UDP.
-        let l1_p2p_port = probe_unique_tcp_udp_port(&mut used_ports);
-        let l1_discv5_port = probe_unique_udp_port(&mut used_ports);
-        let l1_xchain_port = probe_unique_tcp_port(&mut used_ports);
-        let l2_xchain_port = probe_unique_tcp_port(&mut used_ports);
-        drop(used_ports);
+        let l1_p2p_lease = PortLease::tcp_udp();
+        let l1_discv5_lease = PortLease::udp();
+        let l1_xchain_lease = PortLease::tcp();
+        let l2_xchain_lease = PortLease::tcp();
+        let authrpc_port = authrpc_lease.port();
+        let http_port = http_lease.port();
+        let ws_port = ws_lease.port();
+        let p2p_port = p2p_lease.port();
+        let l1_http_port = l1_http_lease.port();
+        let l1_auth_port = l1_auth_lease.port();
+        let l1_p2p_port = l1_p2p_lease.port();
+        let l1_discv5_port = l1_discv5_lease.port();
+        let l1_xchain_port = l1_xchain_lease.port();
+        let l2_xchain_port = l2_xchain_lease.port();
+        port_leases.extend([
+            authrpc_lease,
+            http_lease,
+            ws_lease,
+            p2p_lease,
+            l1_http_lease,
+            l1_auth_lease,
+            l1_p2p_lease,
+            l1_discv5_lease,
+            l1_xchain_lease,
+            l2_xchain_lease,
+        ]);
         let l1_datadir = datadir.join("embedded-l1");
         let env_genesis = env
             .iter()
@@ -1415,13 +1295,18 @@ impl NodeHandle {
             }
             cmd.env(*k, v);
         }
+        // Keep every selected port bound until the child command is complete.
+        // The subprocess bind itself cannot be atomic, but this leaves only the
+        // unavoidable drop/spawn boundary exposed to another process.
+        drop(port_leases);
         let child = cmd.spawn().context("spawn eez-node")?;
         Ok(Self {
             child: Mutex::new(child),
             background_tasks: Mutex::new(Vec::new()),
             name: name.to_string(),
             log_path,
-            keep_alive: log_tempdir.into_iter().collect(),
+            _keep_alive: log_tempdir.into_iter().collect(),
+            owned_datadir: None,
             http_port,
         })
     }
@@ -1431,17 +1316,10 @@ impl NodeHandle {
         cfg: &NodeConfig<'_>,
         env: &[(&'static str, String)],
     ) -> Result<Self> {
-        if let Ok(root) = std::env::var("EEZ_TEST_DATADIR_DIR") {
-            let suffix = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let datadir = PathBuf::from(root)
-                .join(format!("eez-node-{name}-{}-{suffix}", std::process::id()));
-            std::fs::create_dir_all(&datadir)
-                .with_context(|| format!("create retained test datadir {}", datadir.display()))?;
-            return Self::start_with_datadir(name, &datadir, cfg, env).await;
-        }
-        let datadir = tempfile::tempdir().context("datadir tempdir")?;
+        let mut datadir = FailureDatadir::new(&format!("eez-node-{name}"))?;
         let mut handle = Self::start_with_datadir(name, datadir.path(), cfg, env).await?;
-        handle.keep_alive.push(datadir);
+        datadir.fixture_ready();
+        handle.owned_datadir = Some(datadir);
         Ok(handle)
     }
 
@@ -1574,15 +1452,8 @@ impl NodeHandle {
             .with_context(|| format!("read signal stream {}", self.log_path.display()))?;
         Ok(contents
             .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter_map(|record| {
-                record
-                    .get("fields")
-                    .and_then(|fields| fields.get("test_signal"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            })
-            .filter(|signal| signals.contains(&signal.as_str()))
+            .filter_map(signals::parse)
+            .filter(|signal| signals.contains(&signal.name.as_str()))
             .count())
     }
 
@@ -1619,12 +1490,7 @@ impl NodeHandle {
         Ok(contents
             .lines()
             .skip(cursor)
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter_map(|record| {
-                let fields = record.get("fields")?.as_object()?.clone();
-                let name = fields.get("test_signal")?.as_str()?.to_owned();
-                Some(NodeSignal { name, fields })
-            })
+            .filter_map(signals::parse)
             .collect())
     }
 }
@@ -2623,16 +2489,18 @@ async fn deploy_raw(
 /// register the rollup. Contract addresses are deterministic.
 pub async fn deploy_protocol_dev(
     l1_rpc: &str,
-    key: &str,
+    deployer_key: &str,
+    attester_key: &str,
     initial_state: B256,
 ) -> Result<Deployment> {
-    let signer = signer_of(key)?;
+    let signer = signer_of(deployer_key)?;
     let signer_addr = signer.address();
+    let attester = signer_address(attester_key)?;
     let out = repo_root().join("contracts/out");
 
     let eez_address = deploy_raw(
         l1_rpc,
-        key,
+        deployer_key,
         DEV_CHAIN_ID,
         &out.join("EEZ.sol/EEZ.json"),
         signer_addr.abi_encode(),
@@ -2643,21 +2511,21 @@ pub async fn deploy_protocol_dev(
 
     let proof_system_address = deploy_raw(
         l1_rpc,
-        key,
+        deployer_key,
         DEV_CHAIN_ID,
         &out.join("ECDSAProofSystem.sol/ECDSAProofSystem.json"),
-        signer_addr.abi_encode(),
+        attester.abi_encode(),
     )
     .await?;
 
     let vkeys: Vec<B256> = vec![B256::from_slice(&{
         let mut padded = [0u8; 32];
-        padded[12..].copy_from_slice(signer_addr.as_slice());
+        padded[12..].copy_from_slice(attester.as_slice());
         padded
     })];
     let rollup_manager_address = deploy_raw(
         l1_rpc,
-        key,
+        deployer_key,
         DEV_CHAIN_ID,
         &out.join("Rollup.sol/Rollup.json"),
         (
@@ -2676,10 +2544,10 @@ pub async fn deploy_protocol_dev(
         initialState: initial_state,
     }
     .abi_encode();
-    let nonce = onchain_nonce(l1_rpc, key).await?;
+    let nonce = onchain_nonce(l1_rpc, deployer_key).await?;
     let hash = sign_and_send(
         l1_rpc,
-        key,
+        deployer_key,
         DEV_CHAIN_ID,
         nonce,
         Some(eez_address),
@@ -3003,14 +2871,18 @@ pub struct CrossChainConfig {
     pub initial_state: B256,
     /// Kept separate from the poster key for deterministic CREATE addresses.
     pub deployer_key: &'static str,
+    /// Unfunded identity used only by the standalone proof signer.
+    pub attester_key: &'static str,
     pub poster_key: &'static str,
     pub l1_genesis: (PathBuf, tempfile::TempDir),
     pub l2_genesis: (PathBuf, tempfile::TempDir),
+    port_leases: Vec<PortLease>,
 }
 
 impl CrossChainConfig {
     fn new() -> Result<Self> {
         let deployer_key = ANVIL_KEY_1;
+        let attester_key = ANVIL_ATTESTER_KEY;
         let poster_key = ANVIL_KEY;
         let deployer = signer_of(deployer_key)?.address();
         // These CREATE nonces must match `deploy_protocol_dev`.
@@ -3019,18 +2891,16 @@ impl CrossChainConfig {
         let rollup_manager_address = deployer.create(2);
         let initial_state = l2_genesis_state_root();
         let ts = now_unix_secs();
-        // Reserve every listener port under one lock. The HTTP probe also
-        // reserves its adjacent WS port.
-        let (l1_http_port, l1_auth_port, l1_p2p_port, l1_xchain_port, l2_xchain_port) = {
-            let mut ports = handed_out_ports();
-            (
-                probe_unique_http_port(&mut ports),
-                probe_unique_tcp_port(&mut ports),
-                probe_unique_tcp_udp_port(&mut ports),
-                probe_unique_tcp_port(&mut ports),
-                probe_unique_tcp_port(&mut ports),
-            )
-        };
+        let l1_http_lease = PortLease::http_pair();
+        let l1_auth_lease = PortLease::tcp();
+        let l1_p2p_lease = PortLease::tcp_udp();
+        let l1_xchain_lease = PortLease::tcp();
+        let l2_xchain_lease = PortLease::tcp();
+        let l1_http_port = l1_http_lease.port();
+        let l1_auth_port = l1_auth_lease.port();
+        let l1_p2p_port = l1_p2p_lease.port();
+        let l1_xchain_port = l1_xchain_lease.port();
+        let l2_xchain_port = l2_xchain_lease.port();
         Ok(Self {
             l1_http_port,
             l1_auth_port,
@@ -3043,10 +2913,22 @@ impl CrossChainConfig {
             rollup_id: FIRST_ROLLUP_ID,
             initial_state,
             deployer_key,
+            attester_key,
             poster_key,
             l1_genesis: write_l1_dev_genesis_at(ts)?,
             l2_genesis: write_l2_genesis_at(ts)?,
+            port_leases: vec![
+                l1_http_lease,
+                l1_auth_lease,
+                l1_p2p_lease,
+                l1_xchain_lease,
+                l2_xchain_lease,
+            ],
         })
+    }
+
+    fn take_port_leases(&mut self) -> Vec<PortLease> {
+        std::mem::take(&mut self.port_leases)
     }
 
     fn l1_rpc_url(&self) -> String {
@@ -3160,33 +3042,7 @@ pub struct CrossChainWorld {
     pub prover_proxy: Option<ProverProxyHandle>,
     pub proof_signer: ProofSignerHandle,
     _witness_dir: tempfile::TempDir,
-    _datadir: CrossChainDatadir,
-}
-
-enum CrossChainDatadir {
-    Ephemeral(tempfile::TempDir),
-    Retained(PathBuf),
-}
-
-impl CrossChainDatadir {
-    fn new() -> Result<Self> {
-        let Ok(root) = std::env::var("EEZ_TEST_DATADIR_DIR") else {
-            return Ok(Self::Ephemeral(tempfile::tempdir()?));
-        };
-        let suffix = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path =
-            PathBuf::from(root).join(format!("eez-cross-chain-{}-{suffix}", std::process::id()));
-        std::fs::create_dir_all(&path)
-            .with_context(|| format!("create retained cross-chain datadir {}", path.display()))?;
-        Ok(Self::Retained(path))
-    }
-
-    fn path(&self) -> &std::path::Path {
-        match self {
-            Self::Ephemeral(dir) => dir.path(),
-            Self::Retained(path) => path,
-        }
-    }
+    _datadir: FailureDatadir,
 }
 
 pub struct CrossChainEmptyCallWorld {
@@ -4090,13 +3946,13 @@ async fn setup_cross_chain_inner(
     attester_override: Option<Address>,
     extra_env: &[(&'static str, String)],
 ) -> Result<CrossChainWorld> {
-    let cfg = CrossChainConfig::new()?;
-    let signer_attester = signer_address(cfg.deployer_key)?;
+    let mut cfg = CrossChainConfig::new()?;
+    let signer_attester = signer_address(cfg.attester_key)?;
     let proof_signer = ProofSignerHandle::spawn(&ProofSignerConfig {
         chain_config: &cfg.l2_genesis.0,
         rollup_id: cfg.rollup_id,
-        signer_key: cfg.deployer_key,
-        vkey: signer_address(cfg.deployer_key)?.into_word(),
+        signer_key: cfg.attester_key,
+        vkey: signer_address(cfg.attester_key)?.into_word(),
         proof_system: cfg.proof_system_address,
     })
     .await?;
@@ -4111,7 +3967,7 @@ async fn setup_cross_chain_inner(
         .map_or(proof_signer.endpoint(), ProverProxyHandle::endpoint);
     let attester = attester_override.unwrap_or(signer_attester);
     let witness_dir = tempfile::tempdir().context("witness DB tempdir")?;
-    let datadir = CrossChainDatadir::new()?;
+    let mut datadir = FailureDatadir::new("eez-cross-chain")?;
     let mut env = cfg.env();
     env.extend([
         ("EEZ_PROVER_URL", prover_url.to_string()),
@@ -4127,7 +3983,13 @@ async fn setup_cross_chain_inner(
         !env.iter().any(|(name, _)| *name == "EEZ_PROOF_SIGNER_KEY"),
         "remote composer environment must not contain the proof-signer key",
     );
-    let node = NodeHandle::spawn(datadir.path(), &env)?;
+    let node = NodeHandle::spawn_with_reservations(
+        "node",
+        datadir.path(),
+        &NodeConfig::default(),
+        &env,
+        cfg.take_port_leases(),
+    )?;
     let l1_rpc = cfg.l1_rpc_url();
     let l2_rpc = node.l2_rpc_url();
 
@@ -4136,7 +3998,13 @@ async fn setup_cross_chain_inner(
 
     node.wait_for_rpc(&l1_rpc, SETUP_TIMEOUT, "embedded L1 RPC")
         .await?;
-    let dep = deploy_protocol_dev(&l1_rpc, cfg.deployer_key, cfg.initial_state).await?;
+    let dep = deploy_protocol_dev(
+        &l1_rpc,
+        cfg.deployer_key,
+        cfg.attester_key,
+        cfg.initial_state,
+    )
+    .await?;
     if dep.eez_address != cfg.eez_address {
         bail!("EEZ address not deterministic");
     }
@@ -4202,6 +4070,7 @@ async fn setup_cross_chain_inner(
     let outbound_wrapper =
         deploy_setter_wrapper(&l2_rpc, TARGET_DEPLOYER, l2_chain_id, outbound_proxy).await?;
 
+    datadir.fixture_ready();
     Ok(CrossChainWorld {
         node,
         cfg,
