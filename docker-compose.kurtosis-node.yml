@@ -1,0 +1,154 @@
+# eez L2 against an external Kurtosis devnet L1 (12s blocks, chain 7331).
+#
+# eez-node embeds a reth L1 that joins the enclave as a trusted peer, a
+# lighthouse follower drives that reth over the engine API, and the composer,
+# L2 and cross-chain fronts run on top. Bundles go to the enclave's rbuilder;
+# eez-proof-signer validates windows remotely. All host networking.
+#
+# Setup and the enclave values this needs: .env.kurtosis.example.
+#   docker compose --env-file .env.kurtosis -f docker-compose.kurtosis-node.yml up -d
+#
+# L1 12s / L2 2s, so K=6. The embedded L1 uses 18645/18661 rather than reth's
+# defaults so it can coexist with another reth on the host.
+
+# Own project name, so `up`/`down` here cannot recreate or stop the services of
+# another compose file in this directory.
+name: kurtosisnode
+
+services:
+  eez-proof-signer:
+    build:
+      context: .
+      dockerfile: Dockerfile.signer
+    image: eez-proof-signer:local
+    container_name: eez-proof-signer-kurtosis
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 11m
+    env_file:
+      - ./deployments.env
+    environment:
+      EEZ_PROOF_SIGNER_ADDR: 127.0.0.1:${EEZ_SIGNER_PORT:-50081}
+      EEZ_PROOF_SIGNER_MAX_TRANSACTION_STATE_CHECKPOINTS: "${EEZ_SIGNER_MAX_CHECKPOINTS:-64}"
+      EEZ_CHAIN_CONFIG: /app/genesis.json
+      EEZ_PROOF_SIGNER_KEY: "${EEZ_PROOF_SIGNER_KEY:?set EEZ_PROOF_SIGNER_KEY}"
+      EEZ_L2_SYSTEM_KEY: "${EEZ_L2_SYSTEM_KEY:?set EEZ_L2_SYSTEM_KEY}"
+      RUST_LOG: "${EEZ_PROOF_SIGNER_RUST_LOG:-info}"
+    volumes:
+      - ${FRESH_GENESIS:?deploy writes ./datadir/genesis.json}:/app/genesis.json:ro
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "${EEZ_SIGNER_PORT:-50081}"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
+    logging:
+      driver: "local"
+
+  eez-node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: eez-node:local
+    container_name: eez-node-kurtosis
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      eez-proof-signer:
+        condition: service_healthy
+    # deployments.env (registry/proof-system/rollup id from the deploy) +
+    # .env.kurtosis (L1 endpoints/enode/CL + keys + host paths + knobs).
+    env_file:
+      - ./deployments.env
+      - ./.env.kurtosis
+    environment:
+      # ── Embedded L1 = a reth "devnet" node that joins the Kurtosis L1 ──
+      EEZ_L1_EMBEDDED: "1"
+      EEZ_L1_CHAIN: devnet
+      EEZ_L1_CHAIN_PATH: /genesis/genesis.json
+      EEZ_L1_CHAIN_ID: "7331"
+      EEZ_L1_HTTP_PORT: "18645"
+      EEZ_L1_AUTH_PORT: "18661"
+      # Embedded reth P2P — MUST differ from the L2 reth's --port (30640).
+      EEZ_L1_P2P_PORT: "30544"
+      EEZ_L1_DATADIR: /l1
+      EEZ_L1_JWT_SECRET: /jwt/jwt.hex
+      EEZ_L1_RPC_URL: http://127.0.0.1:18645
+      # Remote window validation.
+      EEZ_PROVER_URL: http://127.0.0.1:${EEZ_SIGNER_PORT:-50081}
+      # ── Cross-chain wiring ──
+      EEZ_CCM_L2_ADDRESS: "0x4200000000000000000000000000000000000007"
+      EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS: "7331"
+      EEZ_L2_RPC_URL: http://127.0.0.1:18688
+      EEZ_L1_XCHAIN_PORT: "18999"    # L1→L2 inbound front
+      EEZ_L2_XCHAIN_PORT: "18998"    # L2→L1 outbound front
+      # Bundle sizing. Keep at or below EEZ_SIGNER_MAX_CHECKPOINTS (one
+      # checkpoint per bundled tx), and small enough that the whole bundle fits
+      # one L1 block — a 60M devnet block is roomy, a 17M chain is not.
+      EEZ_MAX_USER_TXS_PER_BUNDLE: "${EEZ_MAX_USER_TXS_PER_BUNDLE:-50}"
+      # ── Timing (12s L1 / 2s L2 → K=6; proof+slack=3000 < 12000) ──
+      EEZ_L1_BLOCK_TIME_MS: "12000"
+      EEZ_L2_BLOCK_TIME_MS: "2000"
+      EEZ_PROOF_TIME_MS: "2000"
+      EEZ_SUBMISSION_SLACK_MS: "1000"
+      EEZ_MAX_SPECULATIVE_DEPTH: "0"
+      # ── L2 ──
+      EEZ_L2_DATADIR: /l2
+      EEZ_L2_GENESIS_PATH: /app/genesis.json
+    volumes:
+      - ${L1_GENESIS_DIR:?point at the enclave's l1-genesis artifact}:/genesis:ro
+      - ${L2_DATA_DIR:?set L2_DATA_DIR}:/l2
+      - ${JWT_FILE:?openssl rand -hex 32 > this}:/jwt/jwt.hex:ro
+      - ${FRESH_GENESIS:?deploy writes ./datadir/genesis.json}:/app/genesis.json:ro
+    command:
+      - node
+      - --chain=/app/genesis.json
+      - --datadir=/l2
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=18688
+      - --http.api=eth,net,web3
+      - --authrpc.addr=127.0.0.1
+      - --authrpc.port=18684
+      - --port=30640
+      - --discovery.port=30640
+      - --discovery.v5.port=30641
+      - --ipcdisable
+      - --disable-discovery
+      - --db.read-transaction-timeout=0
+      - --engine.persistence-threshold=256
+      - --engine.memory-block-buffer-target=128
+    logging:
+      driver: "local"
+
+  lighthouse:
+    image: sigp/lighthouse:v8.1.2
+    container_name: eez-kurtosis-follower
+    network_mode: host
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      - eez-node
+    volumes:
+      - ${L1_GENESIS_DIR}:/testnet:ro
+      - ${JWT_FILE}:/jwt/jwt.hex:ro
+    command:
+      - lighthouse
+      - beacon_node
+      - --testnet-dir=/testnet
+      - --execution-endpoint=http://127.0.0.1:18661
+      - --jwt-secrets=/jwt/jwt.hex
+      - --checkpoint-sync-url=${L1_BEACON_URL}
+      - --libp2p-addresses=${CL_MULTIADDR}
+      - --trusted-peers=${CL_PEERID}
+      - --disable-packet-filter
+      - --enable-private-discovery
+      - --disable-enr-auto-update
+      - --http
+      - --http-address=127.0.0.1
+      - --http-port=5252
+      - --listen-address=0.0.0.0
+      - --port=9909
+      - --datadir=/data
+    logging:
+      driver: "local"

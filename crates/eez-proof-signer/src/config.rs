@@ -132,10 +132,13 @@ struct Args {
 
     /// Maximum transaction-state checkpoints derived from the settling block.
     /// A zero limit rejects every settling block with an effect-candidate boundary.
+    ///
+    /// One checkpoint per bundled cross-chain tx, so this must stay at or above
+    /// the composer's `EEZ_MAX_USER_TXS_PER_BUNDLE` or full bundles are rejected.
     #[arg(
         long,
         env = "EEZ_PROOF_SIGNER_MAX_TRANSACTION_STATE_CHECKPOINTS",
-        default_value = "8"
+        default_value = "64"
     )]
     max_transaction_state_checkpoints: usize,
 

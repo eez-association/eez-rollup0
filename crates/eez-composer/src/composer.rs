@@ -1398,13 +1398,15 @@ where
         }
 
         let pool_len_before = pool.len();
-        // A small batch limits how many txs an atomic-relay drop re-queues; three
-        // is a default, not a builder limit. The real bound is the gas projection.
+        // Caps how many txs an atomic-relay drop re-queues, not how big a batch
+        // may be — gas does that. Must stay at or below the signer's checkpoint
+        // quota, since each bundled tx costs one; lower it on an L1 whose block
+        // cannot hold the postBatch plus this many user txs.
         let max_user_txs = std::env::var("EEZ_MAX_USER_TXS_PER_BUNDLE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n >= 1)
-            .unwrap_or(3);
+            .unwrap_or(50);
         let drained = pool.pop_n(max_user_txs);
         // When the pool is empty, do not return early. This slot attempts a
         // minimal postBatch whose leading immediate entry advances L1's stored
