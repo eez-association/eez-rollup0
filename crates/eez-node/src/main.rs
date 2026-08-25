@@ -50,7 +50,9 @@ use tracing::{Level, event};
 use follower::UnsafeHeadFollower;
 
 mod payload;
+mod pool;
 use payload::EezPayloadBuilder;
+use pool::EezPoolBuilder;
 
 /// Per M-MIMALLOC-APPS — meaningful win on allocation-heavy workloads.
 #[global_allocator]
@@ -301,10 +303,14 @@ fn main() -> eyre::Result<()> {
         // L2 reth. `EezPayloadBuilder` writes `gas_limit`/`extra_data` from
         // shared `eez-driver` constants so deriver replay and sequencer builds
         // yield identical headers.
+        let l2_system_address = read_l2_system_address(mode)?;
         let handle = builder
             .with_types::<EthereumNode>()
             .with_components(
                 EthereumNode::components()
+                    // Keeps SYSTEM_ADDRESS txs out of the pool: a reorged-out
+                    // Sync block must not leak system txs into a Live block.
+                    .pool(EezPoolBuilder::new(l2_system_address))
                     .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder)),
             )
             .with_add_ons(reth_node_ethereum::node::EthereumAddOns::default())
@@ -1099,6 +1105,51 @@ async fn wait_for_l1_ready(
             ));
         }
         tokio::time::sleep(POLL).await;
+    }
+}
+
+/// The SYSTEM_ADDRESS the pool refuses: `EEZ_L2_SYSTEM_ADDRESS`, else derived
+/// from `EEZ_L2_SYSTEM_KEY`. Errors on a bad value, or composer mode with none.
+fn read_l2_system_address(mode: Mode) -> eyre::Result<Option<Address>> {
+    let configured = match env::var("EEZ_L2_SYSTEM_ADDRESS") {
+        Ok(raw) => Some(
+            Address::from_str(raw.trim())
+                .map_err(|e| eyre::eyre!("EEZ_L2_SYSTEM_ADDRESS malformed: {e}"))?,
+        ),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(eyre::eyre!(
+                "EEZ_L2_SYSTEM_ADDRESS contains non-UTF-8 bytes"
+            ));
+        }
+        Err(env::VarError::NotPresent) => match env::var("EEZ_L2_SYSTEM_KEY") {
+            Ok(raw) => Some(
+                PrivateKeySigner::from_bytes(&B256::from_str(
+                    raw.trim().trim_start_matches("0x"),
+                )?)?
+                .address(),
+            ),
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(eyre::eyre!("EEZ_L2_SYSTEM_KEY contains non-UTF-8 bytes"));
+            }
+            Err(env::VarError::NotPresent) => None,
+        },
+    };
+
+    match (mode, configured) {
+        (Mode::Composer, None) => Err(eyre::eyre!(
+            "EEZ_L2_SYSTEM_ADDRESS (or EEZ_L2_SYSTEM_KEY) is required in composer mode: the \
+             L2 pool must refuse SYSTEM_ADDRESS transactions"
+        )),
+        (Mode::Follower, None) => {
+            event!(
+                name: "eez.node.pool.system_gate_disabled",
+                Level::WARN,
+                "no EEZ_L2_SYSTEM_ADDRESS / EEZ_L2_SYSTEM_KEY — the L2 pool accepts any \
+                 sender; only safe for a pure-user-tx follower",
+            );
+            Ok(None)
+        }
+        _ => Ok(configured),
     }
 }
 
