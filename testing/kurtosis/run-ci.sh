@@ -184,7 +184,11 @@ done
 }
 echo "==> network ready: bundle inclusion observed"
 
+echo "==> running native cross-chain wave suite"
 bash "$HERE/scripts/verify-cross-chain-waves.sh"
+
+echo "==> running eez-core-protocol network scenario suite"
+bash "$HERE/scripts/run-protocol-e2e.sh"
 
 capture_service_log eez-proof-signer
 capture_service_log eez-node
@@ -202,6 +206,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         echo "- Deploy image: \`$EEZ_DEPLOY_IMAGE\`"
         echo "- Inbound, outbound, mixed, and mixed-pure waves: pass"
         echo "- Inbound, outbound, and mixed-direction state chaining: pass"
+        echo "- Supported protocol network scenarios: pass"
         echo "- Signed windows observed: $signed_window_count"
         echo "- Remote attestations observed: $remote_attestation_count"
         echo "- L1/L2 root divergence: 0"
