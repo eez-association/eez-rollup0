@@ -181,11 +181,11 @@ async fn open_drain_window(w: &CrossChainWorld) {
             .node
             .signals_since(cursor)?
             .iter()
-            .any(|signal| signal.name == signals::COMPOSER_POOL_DRAINED);
+            .any(|signal| signal.name == signals::COMPOSER_SYNC_SLOT_DRAIN);
         Ok(drained.then_some(()))
     })
     .await
-    .expect("composer did not report a fresh pool-drain boundary");
+    .expect("composer did not report a fresh sync-slot drain boundary");
 }
 
 async fn batches(w: &CrossChainWorld) -> Vec<EvmBatch> {
