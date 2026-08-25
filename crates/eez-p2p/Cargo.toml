@@ -13,7 +13,13 @@ alloy-rpc-types-engine = { workspace = true, features = ["ssz"] }
 alloy-signer.workspace = true
 alloy-signer-local.workspace = true
 ethereum_ssz.workspace = true
+futures-util.workspace = true
+libp2p.workspace = true
+sha2.workspace = true
+snap.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 alloy-consensus.workspace = true

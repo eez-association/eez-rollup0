@@ -12,6 +12,10 @@
 //! Keeping the body identical to Reth's SSZ `engine_newPayloadV4` request
 //! avoids a second fork-specific payload representation at the trust boundary.
 
+mod network;
+
+pub use network::{NetworkConfig, NetworkEvent, NetworkHandle, NetworkService};
+
 use alloy_eips::eip7685::{EMPTY_REQUESTS_HASH, Requests, RequestsOrHash};
 use alloy_primitives::{Address, B256, Signature, U256, keccak256};
 use alloy_rpc_types_engine::{
