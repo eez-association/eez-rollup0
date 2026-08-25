@@ -32,6 +32,38 @@ pub struct NetworkConfig {
     pub peers: Vec<Multiaddr>,
 }
 
+impl NetworkConfig {
+    /// Parse CLI/environment multiaddrs into a typed configuration.
+    pub fn parse<'a>(
+        chain_id: u64,
+        listen_addr: &str,
+        peers: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, NetworkError> {
+        let listen_addr = listen_addr
+            .parse()
+            .map_err(|error| NetworkError::InvalidAddress {
+                address: listen_addr.to_owned(),
+                error: format!("{error:?}"),
+            })?;
+        let peers = peers
+            .into_iter()
+            .map(|address| {
+                address
+                    .parse()
+                    .map_err(|error| NetworkError::InvalidAddress {
+                        address: address.to_owned(),
+                        error: format!("{error:?}"),
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            chain_id,
+            listen_addr,
+            peers,
+        })
+    }
+}
+
 /// Observable network events. The node consumes [`Message`](Self::Message);
 /// listening and subscription events are also useful to tests and operators.
 #[derive(Debug)]
@@ -47,6 +79,9 @@ pub enum NetworkEvent {
 /// P2P setup and runtime-boundary failures.
 #[derive(Debug, thiserror::Error)]
 pub enum NetworkError {
+    /// A configured listen or peer multiaddr is malformed.
+    #[error("invalid P2P multiaddr {address:?}: {error}")]
+    InvalidAddress { address: String, error: String },
     /// GossipSub configuration was invalid.
     #[error("invalid GossipSub configuration: {0}")]
     GossipConfig(String),

@@ -13,6 +13,7 @@ eez-deriver.workspace       = true
 eez-driver = { workspace = true, features = ["witness"] }
 eez-l1.workspace            = true
 eez-node-common = { workspace = true, features = ["l1-startup"] }
+eez-p2p.workspace           = true
 eez-protocol.workspace      = true
 eez-prover.workspace        = true
 eez-prover-client.workspace = true
@@ -63,6 +64,7 @@ serde_json.workspace = true
 postcard.workspace   = true
 
 # app
+clap.workspace    = true
 eyre.workspace    = true
 tokio.workspace   = true
 tracing.workspace = true
