@@ -1,0 +1,22 @@
+[package]
+name                   = "eez-p2p"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+description            = "Signed unsafe-block wire protocol and P2P transport for EEZ rollups."
+
+[dependencies]
+alloy-eips.workspace = true
+alloy-primitives.workspace = true
+alloy-rpc-types-engine = { workspace = true, features = ["ssz"] }
+alloy-signer.workspace = true
+alloy-signer-local.workspace = true
+ethereum_ssz.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+alloy-consensus.workspace = true
+
+[lints]
+workspace = true
