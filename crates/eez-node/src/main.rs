@@ -520,23 +520,20 @@ fn main() -> eyre::Result<()> {
                     // over the chiado ChainSpec (source-sim needs only
                     // revm, not GnosisNode's AuRa paths). Both yield the
                     // same erased views, so composition is identical.
-                    let entry_client_view = match l1_variant {
+                    // Bind the CONCRETE client: the erased `ChainClient` view
+                    // and the slot handles must be the same instance (they
+                    // share one overlay channel).
+                    let l1_entry_client: Arc<LocalChainClient> = match l1_variant {
                         EmbeddedL1::Ethereum(l1_handle) => {
                             let l1_provider = l1_handle.node.provider.clone();
                             let l1_evm_config = l1_handle.node.evm_config.clone();
-                            let entry_client = LocalChainClient::new_entry(
+                            LocalChainClient::new_entry(
                                 l1_provider,
                                 l1_evm_config,
                                 l1_rollup_id,
                                 eez_registry,
                                 eez_protocol::ChainDialect::EvmL1Style,
-                            );
-                            let entry_view: std::sync::Arc<
-                                dyn eez_protocol::executor::ChainClient
-                                    + Send
-                                    + Sync,
-                            > = entry_client.clone();
-                            entry_view
+                            )
                         }
                         EmbeddedL1::Chiado(chiado_handle) => {
                             // `GnosisChainSpec.inner` is the standard
@@ -551,21 +548,18 @@ fn main() -> eyre::Result<()> {
                             );
                             let l1_evm_config =
                                 reth_evm_ethereum::EthEvmConfig::new(Arc::clone(&l1_chain_spec));
-                            let entry_client = LocalChainClient::new_entry(
+                            LocalChainClient::new_entry(
                                 l1_provider,
                                 l1_evm_config,
                                 l1_rollup_id,
                                 eez_registry,
                                 eez_protocol::ChainDialect::EvmL1Style,
-                            );
-                            let entry_view: std::sync::Arc<
-                                dyn eez_protocol::executor::ChainClient
-                                    + Send
-                                    + Sync,
-                            > = entry_client.clone();
-                            entry_view
+                            )
                         }
                     };
+                    let entry_client_view: std::sync::Arc<
+                        dyn eez_protocol::executor::ChainClient + Send + Sync,
+                    > = l1_entry_client.clone();
 
                     // L2 follower — EvmL2Style. Its dispatch contract is the
                     // `EEZL2` predeploy, whose inherited `authorizedProxies`
@@ -585,19 +579,14 @@ fn main() -> eyre::Result<()> {
 
                     // L2 ENTRY client (follower's provider/dialect, but
                     // Role::Entry) — the follower client errors `Unavailable` for
-                    // the outbound source-sim `simulate_and_resolve_recorded_for`.
-                    let l2_entry = LocalChainClient::new_entry(
+                    // the outbound source simulation.
+                    let l2_entry_client = LocalChainClient::new_entry(
                         provider.clone(),
                         evm_config.clone(),
                         l2_rollup_id_typed,
                         eezl2_address,
                         eez_protocol::ChainDialect::EvmL2Style,
                     );
-                    let l2_entry_view: std::sync::Arc<
-                        dyn eez_protocol::executor::ChainClient
-                            + Send
-                            + Sync,
-                    > = l2_entry;
 
                     let entry_cfg = TargetConfig {
                         proxy_lookup: ProxyLookupConfig {
@@ -617,8 +606,7 @@ fn main() -> eyre::Result<()> {
                     };
 
                     let mut wired_rollups = std::collections::HashMap::new();
-                    wired_rollups
-                        .insert(l1_rollup_id, (Arc::clone(&entry_client_view), entry_cfg));
+                    wired_rollups.insert(l1_rollup_id, (entry_client_view, entry_cfg));
                     // A colliding id would silently overwrite the L1 entry
                     // registration (EEZ_L1_ROLLUP_ID defaults to 0).
                     if wired_rollups
@@ -708,10 +696,12 @@ fn main() -> eyre::Result<()> {
                     );
                     Some(CrossChainWiring {
                         entry_rollup_id: l1_rollup_id,
-                        entry_client: entry_client_view,
                         rollups: wired_rollups,
                         exec_ctx,
-                        l2_entry_client: l2_entry_view,
+                        local: eez_composer::LocalComposeClients {
+                            l1_entry: l1_entry_client,
+                            l2_entry: l2_entry_client,
+                        },
                     })
                 } else {
                     event!(

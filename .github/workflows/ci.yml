@@ -230,7 +230,7 @@ jobs:
         run: |
           mkdir -p artifacts/cross-chain-e2e
           set +e
-          cargo nextest run -p eez-node --test cross_chain --test-threads=1 --retries 2 --no-fail-fast --color=never 2>&1 \
+          cargo nextest run -p eez-node --test cross_chain --test chained_interstate --test-threads=1 --retries 2 --no-fail-fast --color=never 2>&1 \
             | tee artifacts/cross-chain-e2e/nextest.log
           status=${PIPESTATUS[0]}
           set -e
