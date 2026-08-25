@@ -1,7 +1,7 @@
 //! Single source of truth for building signed L2 inbound system txs.
 //!
 //! Given the cross-chain entries that will land in a `postBatch` —
-//! whether observed locally by the composer's `simulate_and_resolve`
+//! whether observed locally by the composer's chained simulation
 //! or read from L1's `BatchPosted` event by the deriver — produce
 //! the **same** signed `executeIncomingCrossChainCall(...)` system
 //! txs that should appear at the head of the L2 Sync block.
@@ -92,17 +92,7 @@ pub fn build_inbound_system_txs(
         if entry.l2ToL1Calls.is_empty() {
             continue;
         }
-        if !entry.success
-            || entry.l2ToL1Calls.len() != 1
-            || !entry.expectedL1ToL2Calls.is_empty()
-            || entry.l2ToL1Calls[0].isStatic
-            || entry.l2ToL1Calls[0].revertNextNCalls != 0
-            || entry.l2ToL1Calls[0].gas != 0
-        {
-            return Err(
-                "inbound system transaction uses an unsupported execution shape".to_owned(),
-            );
-        }
+        check_entry_shape(entry, "inbound")?;
         let outer = &entry.l2ToL1Calls[0];
         let source_rollup = outer.sourceRollupId;
         // Build the lean L2 mirror, then encode
@@ -243,6 +233,96 @@ pub fn interleave_sync_block_txs(pairs: &[SyncPair]) -> Vec<Bytes> {
     out
 }
 
+/// Reject the entry shapes the Sync-block lowering cannot represent.
+///
+/// N>=2 multi-call is NOT yet supported. An entry with multiple l2ToL1Calls
+/// would be SILENTLY TRUNCATED to call[0] by the lowering (the outbound
+/// `.first()` and [`build_inbound_system_txs`] both read only [0]), diverging
+/// the Sync-block root with no error. Fail LOUD until multi-call lands (design
+/// parked; no doc yet). Today the composer only ever produces single-call
+/// entries, so this never fires on the happy path; it is the safe boundary for
+/// the parked feature.
+///
+/// The composer calls this per entry at accept time and
+/// [`build_cross_chain_sync_pairs`] calls it over the whole drained set, so
+/// both sides gate on the exact same predicate.
+///
+/// `dir` names the direction (`"outbound"` / `"inbound"`) in the error.
+///
+/// # Errors
+/// Returns a `String` error naming the offending shape.
+pub fn check_entry_shape(entry: &ExecutionEntrySol, dir: &str) -> Result<(), String> {
+    if entry.l2ToL1Calls.len() > 1 {
+        return Err(format!(
+            "N>=2 multi-call {dir} entry not yet supported \
+             (l2ToL1Calls={}); multi-call support is parked",
+            entry.l2ToL1Calls.len(),
+        ));
+    }
+    if !entry.expectedL1ToL2Calls.is_empty() {
+        return Err(format!(
+            "nested {dir} entry materialization is not supported"
+        ));
+    }
+    if !entry.success {
+        return Err(format!("unsuccessful {dir} entry is not supported"));
+    }
+    if entry
+        .l2ToL1Calls
+        .iter()
+        .any(|call| call.isStatic || call.revertNextNCalls != 0 || call.gas != 0)
+    {
+        return Err(format!(
+            "{dir} entry uses static, revert-span, or explicit-gas semantics that are not supported"
+        ));
+    }
+    Ok(())
+}
+
+/// Lower ONE outbound L2→L1 entry to its `[load | user]` Sync pairs, starting
+/// at `starting_nonce`.
+///
+/// The per-entry unit [`build_cross_chain_sync_pairs`] builds its PHASE 1
+/// from. The composer appends these pairs to the block as each survivor is
+/// accepted and the post-drain canonical rebuild replays the same per-entry
+/// calls in the same order, so the incremental block and the canonical layout
+/// are byte-identical BY CONSTRUCTION.
+///
+/// # Errors
+/// Rejects unsupported entry shapes ([`check_entry_shape`]), an entry with no
+/// `l2ToL1Call`, and signing failures.
+pub fn build_outbound_pair(
+    entry: &ExecutionEntrySol,
+    user_tx: &Bytes,
+    cfg: &SystemTxContext,
+    starting_nonce: u64,
+) -> Result<Vec<SyncPair>, String> {
+    check_entry_shape(entry, "outbound")?;
+    let call = entry
+        .l2ToL1Calls
+        .first()
+        .ok_or_else(|| "outbound entry must contain exactly one l2ToL1Call; found 0".to_string())?;
+    let l2_entry = build_l2_outbound_entry(OutboundEntry {
+        target: call.targetAddress,
+        source: call.sourceAddress,
+        value: call.value,
+        data: call.data.clone(),
+        l2_rollup_id: RollupId(cfg.this_rollup_id),
+        return_data: entry.returnData.clone(),
+        success: entry.success,
+    })
+    .map_err(|error| error.to_string())?;
+    let loads =
+        build_outbound_load_table_txs(std::slice::from_ref(&l2_entry), cfg, starting_nonce)?;
+    Ok(loads
+        .into_iter()
+        .map(|load| SyncPair {
+            system_tx: load,
+            user_tx: Some(user_tx.clone()),
+        })
+        .collect())
+}
+
 /// THE canonical Sync-block `SyncPair` builder — the SINGLE source of truth
 /// both the composer (to commit the Sync block) and the deriver (to
 /// reconstruct it) call, so the two are byte-identical BY CONSTRUCTION: no
@@ -284,73 +364,22 @@ pub fn build_cross_chain_sync_pairs(
     let mut nonce = starting_nonce;
     let mut pairs: Vec<SyncPair> = Vec::with_capacity(outbound.len() + inbound.len());
 
-    // N>=2 multi-call is NOT yet supported. An entry with multiple l2ToL1Calls
-    // would be SILENTLY TRUNCATED to call[0] below (the
-    // outbound `.first()` and build_inbound_system_txs both read only [0]),
-    // diverging the Sync-block root with no error. Fail LOUD until multi-call
-    // lands (design parked; no doc yet). Today the
-    // composer only ever produces single-call entries, so this never fires on
-    // the happy path; it is the safe boundary for the parked feature.
-    let reject_multicall = |entry: &ExecutionEntrySol, dir: &str| -> Result<(), String> {
-        if entry.l2ToL1Calls.len() > 1 {
-            return Err(format!(
-                "N>=2 multi-call {dir} entry not yet supported \
-                 (l2ToL1Calls={}); multi-call support is parked",
-                entry.l2ToL1Calls.len(),
-            ));
-        }
-        if !entry.expectedL1ToL2Calls.is_empty() {
-            return Err(format!(
-                "nested {dir} entry materialization is not supported"
-            ));
-        }
-        if !entry.success {
-            return Err(format!("unsuccessful {dir} entry is not supported"));
-        }
-        if entry
-            .l2ToL1Calls
-            .iter()
-            .any(|call| call.isStatic || call.revertNextNCalls != 0 || call.gas != 0)
-        {
-            return Err(format!(
-                "{dir} entry uses static, revert-span, or explicit-gas semantics that are not supported"
-            ));
-        }
-        Ok(())
-    };
-    for (entry, _) in outbound {
-        reject_multicall(entry, "outbound")?;
-    }
+    // Gate the inbound half before emitting anything: a bad shape must fail the
+    // call, not half-build it. Inbound needs its own gate because
+    // `build_inbound_system_txs` skips foreign entries before checking them.
+    // Outbound is gated by `build_outbound_pair`, which checks its entry first.
     for entry in inbound {
-        reject_multicall(entry, "inbound")?;
+        check_entry_shape(entry, "inbound")?;
     }
 
     // ── PHASE 1 — outbound: each loadExecutionTable immediately paired with
     // its consuming user tx (the self-clean requires consume-before-next-load).
     for (entry, user_tx) in outbound {
-        let call = entry.l2ToL1Calls.first().ok_or_else(|| {
-            "outbound entry must contain exactly one l2ToL1Call; found 0".to_string()
-        })?;
-        let l2_entry = build_l2_outbound_entry(OutboundEntry {
-            target: call.targetAddress,
-            source: call.sourceAddress,
-            value: call.value,
-            data: call.data.clone(),
-            l2_rollup_id: RollupId(cfg.this_rollup_id),
-            return_data: entry.returnData.clone(),
-            success: entry.success,
-        })
-        .map_err(|error| error.to_string())?;
-        let loads = build_outbound_load_table_txs(std::slice::from_ref(&l2_entry), cfg, nonce)?;
+        let built = build_outbound_pair(entry, user_tx, cfg, nonce)?;
         nonce = nonce
-            .checked_add(loads.len() as u64)
+            .checked_add(built.len() as u64)
             .ok_or_else(|| "SYSTEM_ADDRESS nonce overflow (outbound loads)".to_string())?;
-        for load in loads {
-            pairs.push(SyncPair {
-                system_tx: load,
-                user_tx: Some(user_tx.clone()),
-            });
-        }
+        pairs.extend(built);
     }
 
     // ── PHASE 2 — inbound deliveries, continuing the SYSTEM_ADDRESS nonce

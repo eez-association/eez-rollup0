@@ -1747,18 +1747,12 @@ fn extract_outbound_call_observations<R>(
 where
     R: alloy_consensus::TxReceipt<Log = alloy_primitives::Log>,
 {
-    use alloy_sol_types::SolEvent as _;
-    use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
-
-    receipts
+    let logs: Vec<alloy_primitives::Log> = receipts
         .iter()
         .flat_map(alloy_consensus::TxReceipt::logs)
-        .filter(|log| log.address == eez_l2)
-        .filter_map(|log| CrossChainCallExecuted::decode_log_validate(log).ok())
-        .map(|event| {
-            OutboundCallObservation::new(event.data.crossChainCallHash, event.data.callGas)
-        })
-        .collect()
+        .cloned()
+        .collect();
+    eez_protocol::outbound_gate::observations_from_logs(&logs, eez_l2)
 }
 
 #[cfg(test)]

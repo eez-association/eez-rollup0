@@ -2,9 +2,9 @@
 //! composition.
 //!
 //! [`ChainClient`] opens stateful target sessions for registered rollups.
-//! Entry-role implementations also override `simulate_source_tx`; its default
-//! returns [`ExecutorErrorKind::Unavailable`]. Nested cross-chain dispatch
-//! goes through the borrowed [`CompositionBuilder`].
+//! Source simulation is not on this trait: it runs over the caller's own
+//! slot-scoped state, so it lives on the concrete entry-role client. Nested
+//! cross-chain dispatch goes through the borrowed [`CompositionBuilder`].
 //!
 //! Both traits are synchronous because execution is in-process. Trait objects
 //! let local implementations and test fakes share the same orchestration.
@@ -14,7 +14,6 @@ use alloy_primitives::{Address, Bytes, U256};
 use crate::action::CallMode;
 use crate::composition::CompositionBuilder;
 use crate::error::ExecutorResult;
-use crate::error::{ExecutorError, ExecutorErrorKind};
 use crate::rollup_id::RollupId;
 use crate::types::ExecutionOutcome;
 
@@ -85,8 +84,8 @@ pub trait TargetExecutionSession: Send {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Encoding`] when the snapshot has the wrong
-    /// concrete type for this session.
+    /// Returns [`ExecutorErrorKind::Encoding`](crate::error::ExecutorErrorKind::Encoding)
+    /// when the snapshot has the wrong concrete type for this session.
     fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()>;
 }
 
@@ -96,10 +95,7 @@ pub type SessionSnapshot = Box<dyn std::any::Any + Send>;
 
 /// Uniform chain-client interface every registered rollup satisfies.
 ///
-/// The runtime composer talks to every rollup through this trait.
-/// `simulate_source_tx` is role-specific and defaults to an
-/// [`ExecutorErrorKind::Unavailable`] refusal.
-///
+/// The runtime composer opens every rollup's target sessions through this trait.
 pub trait ChainClient: Send + Sync + 'static {
     /// Reset client-local state that must not cross transaction compositions.
     fn reset_composition_state(&self) {}
@@ -110,27 +106,4 @@ pub trait ChainClient: Send + Sync + 'static {
     ///
     /// Returns an executor error when the session cannot be initialized.
     fn begin_execution_session(&self) -> ExecutorResult<Box<dyn TargetExecutionSession + Send>>;
-
-    /// Simulate a source-chain transaction, dispatching every detected
-    /// cross-chain proxy call through `dispatcher`. Entry-role clients
-    /// only; the default refuses with
-    /// [`ExecutorErrorKind::Unavailable`] so follower registrations
-    /// fail loudly if they ever reach source simulation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ExecutorErrorKind::Decode`] if the raw transaction cannot be
-    /// decoded, [`ExecutorErrorKind::Provider`] if source state is inaccessible,
-    /// or [`ExecutorErrorKind::Evm`] if EVM setup fails. Propagates errors from
-    /// nested dispatch.
-    fn simulate_source_tx(
-        &self,
-        raw_tx: Vec<u8>,
-        dispatcher: &mut CompositionBuilder,
-    ) -> ExecutorResult<()> {
-        let _ = (raw_tx, dispatcher);
-        Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
-            "simulate_source_tx: not an entry-role client".into(),
-        )))
-    }
 }
