@@ -1,9 +1,10 @@
 use std::{collections::BTreeMap, time::Duration};
 
+use alloy_primitives::Address;
 use futures_util::StreamExt;
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
-    gossipsub::{self, IdentTopic, MessageAuthenticity, ValidationMode},
+    gossipsub::{self, IdentTopic, MessageAcceptance, MessageAuthenticity, ValidationMode},
     identity, noise,
     request_response::{self, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
@@ -14,11 +15,19 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::{Level, event};
 
-use crate::blocks_topic;
+use crate::{authenticate_message, blocks_topic};
 
 const COMMAND_BUFFER: usize = 64;
 const EVENT_BUFFER: usize = 128;
 const REDIAL_INTERVAL: Duration = Duration::from_secs(5);
+// GossipSub defaults mirrored from op-node's canonical implementation:
+// https://github.com/ethereum-optimism/optimism/blob/d41f9e6af629df5a6666366b9f0dbf26184c2984/op-node/p2p/gossip.go
+const GOSSIP_HEARTBEAT: Duration = Duration::from_millis(500);
+const SEEN_MESSAGES_TTL: Duration = Duration::from_secs(65);
+const DEFAULT_MESH_D: usize = 8;
+const DEFAULT_MESH_D_LOW: usize = 6;
+const DEFAULT_MESH_D_HIGH: usize = 12;
+const DEFAULT_MESH_D_LAZY: usize = 6;
 /// Number of recent signed payloads retained for follower gap recovery.
 pub const BACKFILL_CACHE_SIZE: usize = 256;
 
@@ -30,6 +39,8 @@ pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 pub struct NetworkConfig {
     /// Rollup chain ID, used in the GossipSub topic.
     pub chain_id: u64,
+    /// Consensus identity authorized to sign unsafe blocks.
+    pub authorized_signer: Address,
     /// Local TCP listen address, for example `/ip4/0.0.0.0/tcp/9300`.
     pub listen_addr: Multiaddr,
     /// Static peers to dial. A `/p2p/<peer-id>` suffix is optional.
@@ -40,6 +51,7 @@ impl NetworkConfig {
     /// Parse CLI/environment multiaddrs into a typed configuration.
     pub fn parse<'a>(
         chain_id: u64,
+        authorized_signer: Address,
         listen_addr: &str,
         peers: impl IntoIterator<Item = &'a str>,
     ) -> Result<Self, NetworkError> {
@@ -62,6 +74,7 @@ impl NetworkConfig {
             .collect::<Result<_, _>>()?;
         Ok(Self {
             chain_id,
+            authorized_signer,
             listen_addr,
             peers,
         })
@@ -127,12 +140,16 @@ struct PayloadResponse {
 struct Behaviour {
     gossip: gossipsub::Behaviour,
     backfill: request_response::cbor::Behaviour<PayloadRequest, PayloadResponse>,
+    ping: libp2p::ping::Behaviour,
+    identify: libp2p::identify::Behaviour,
 }
 
 #[derive(Debug)]
 enum BehaviourEvent {
     Gossip(gossipsub::Event),
     Backfill(request_response::Event<PayloadRequest, PayloadResponse>),
+    Ping(libp2p::ping::Event),
+    Identify(Box<libp2p::identify::Event>),
 }
 
 impl From<gossipsub::Event> for BehaviourEvent {
@@ -144,6 +161,18 @@ impl From<gossipsub::Event> for BehaviourEvent {
 impl From<request_response::Event<PayloadRequest, PayloadResponse>> for BehaviourEvent {
     fn from(event: request_response::Event<PayloadRequest, PayloadResponse>) -> Self {
         Self::Backfill(event)
+    }
+}
+
+impl From<libp2p::ping::Event> for BehaviourEvent {
+    fn from(event: libp2p::ping::Event) -> Self {
+        Self::Ping(event)
+    }
+}
+
+impl From<libp2p::identify::Event> for BehaviourEvent {
+    fn from(event: libp2p::identify::Event) -> Self {
+        Self::Identify(Box::new(event))
     }
 }
 
@@ -183,6 +212,8 @@ pub struct NetworkService {
     events: mpsc::Sender<NetworkEvent>,
     subscribed_peers: Vec<PeerId>,
     payload_cache: BTreeMap<u64, Vec<u8>>,
+    authorized_signer: Address,
+    chain_id: u64,
 }
 
 impl std::fmt::Debug for NetworkService {
@@ -204,19 +235,32 @@ impl NetworkService {
     pub fn new(
         config: NetworkConfig,
     ) -> Result<(Self, NetworkHandle, mpsc::Receiver<NetworkEvent>), NetworkError> {
-        let identity = identity::Keypair::generate_ed25519();
-        let message_id_fn = |message: &gossipsub::Message| {
-            gossipsub::MessageId::from(Sha256::digest(&message.data).to_vec())
-        };
+        // OP Stack uses a secp256k1 network identity independently of the
+        // application-layer sequencer key.
+        let identity = identity::Keypair::generate_secp256k1();
         let gossip_config = gossipsub::ConfigBuilder::default()
-            .validation_mode(ValidationMode::Strict)
+            .mesh_n(DEFAULT_MESH_D)
+            .mesh_n_low(DEFAULT_MESH_D_LOW)
+            .mesh_n_high(DEFAULT_MESH_D_HIGH)
+            .gossip_lazy(DEFAULT_MESH_D_LAZY)
+            .heartbeat_interval(GOSSIP_HEARTBEAT)
+            .fanout_ttl(Duration::from_secs(24))
+            .history_length(12)
+            .history_gossip(3)
+            .flood_publish(false)
+            .support_floodsub()
             .max_transmit_size(MAX_MESSAGE_SIZE)
-            .message_id_fn(message_id_fn)
+            .duplicate_cache_time(SEEN_MESSAGES_TTL)
+            // Messages have no libp2p author/signature. Noise authenticates
+            // the peer connection; the sequencer signature authenticates the
+            // consensus payload.
+            .validation_mode(ValidationMode::None)
+            .validate_messages()
+            .message_id_fn(compute_message_id)
             .build()
             .map_err(|error| NetworkError::GossipConfig(error.to_string()))?;
-        let gossip =
-            gossipsub::Behaviour::new(MessageAuthenticity::Signed(identity.clone()), gossip_config)
-                .map_err(|error| NetworkError::GossipConfig(error.to_string()))?;
+        let gossip = gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, gossip_config)
+            .map_err(|error| NetworkError::GossipConfig(error.to_string()))?;
         let backfill_protocol =
             StreamProtocol::try_from_owned(format!("/eez/{}/payload_by_number/1", config.chain_id))
                 .map_err(|error| NetworkError::GossipConfig(error.to_string()))?;
@@ -228,11 +272,21 @@ impl NetworkService {
             [(backfill_protocol, ProtocolSupport::Full)],
             request_response::Config::default(),
         );
-        let behaviour = Behaviour { gossip, backfill };
+        let ping = libp2p::ping::Behaviour::default();
+        let identify = libp2p::identify::Behaviour::new(libp2p::identify::Config::new(
+            "/eez/1.0.0".to_owned(),
+            identity.public(),
+        ));
+        let behaviour = Behaviour {
+            gossip,
+            backfill,
+            ping,
+            identify,
+        };
         let mut swarm = SwarmBuilder::with_existing_identity(identity)
             .with_tokio()
             .with_tcp(
-                tcp::Config::default(),
+                tcp::Config::default().nodelay(true),
                 noise::Config::new,
                 yamux::Config::default,
             )
@@ -269,6 +323,8 @@ impl NetworkService {
                 events: events_tx,
                 subscribed_peers: Vec::new(),
                 payload_cache: BTreeMap::new(),
+                authorized_signer: config.authorized_signer,
+                chain_id: config.chain_id,
             },
             NetworkHandle {
                 commands: command_tx,
@@ -318,6 +374,15 @@ impl NetworkService {
     }
 
     fn publish(&mut self, block_number: u64, message: Vec<u8>) {
+        if let Err(error) = authenticate_message(&message, self.chain_id, self.authorized_signer) {
+            event!(
+                name: "eez.p2p.block.publish_rejected",
+                Level::ERROR,
+                %error,
+                "refusing to publish an unauthenticated unsafe block",
+            );
+            return;
+        }
         let compressed = match compress(&message) {
             Ok(compressed) => compressed,
             Err(error) => {
@@ -404,26 +469,59 @@ impl NetworkService {
                 self.subscribed_peers.retain(|peer| *peer != peer_id);
             }
             SwarmEvent::Behaviour(BehaviourEvent::Gossip(gossipsub::Event::Message {
+                propagation_source,
+                message_id,
                 message,
-                ..
             })) => {
-                let message = match decompress(&message.data) {
-                    Ok(message) => message,
+                let decoded = match decompress(&message.data).and_then(|decoded| {
+                    authenticate_message(&decoded, self.chain_id, self.authorized_signer)
+                        .map_err(|error| error.to_string())?;
+                    Ok(decoded)
+                }) {
+                    Ok(decoded) => decoded,
                     Err(error) => {
                         event!(
-                            name: "eez.p2p.block.decode_rejected",
-                            Level::WARN,
+                            name: "eez.p2p.block.validation_rejected",
+                            Level::DEBUG,
                             %error,
-                            "rejected malformed Snappy unsafe-block message",
+                            "rejected unauthenticated unsafe-block gossip",
                         );
+                        self.swarm
+                            .behaviour_mut()
+                            .gossip
+                            .report_message_validation_result(
+                                &message_id,
+                                &propagation_source,
+                                MessageAcceptance::Reject,
+                            );
                         return;
                     }
                 };
-                let _ = self.events.send(NetworkEvent::Message(message)).await;
+                self.swarm
+                    .behaviour_mut()
+                    .gossip
+                    .report_message_validation_result(
+                        &message_id,
+                        &propagation_source,
+                        MessageAcceptance::Accept,
+                    );
+                let _ = self.events.send(NetworkEvent::Message(decoded)).await;
             }
             SwarmEvent::Behaviour(BehaviourEvent::Backfill(event)) => {
                 self.on_backfill_event(event).await;
             }
+            SwarmEvent::Behaviour(BehaviourEvent::Ping(event)) => event!(
+                name: "eez.p2p.peer.ping",
+                Level::TRACE,
+                ?event,
+                "unsafe-block peer ping event",
+            ),
+            SwarmEvent::Behaviour(BehaviourEvent::Identify(event)) => event!(
+                name: "eez.p2p.peer.identified",
+                Level::TRACE,
+                ?event,
+                "unsafe-block peer identify event",
+            ),
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 self.subscribed_peers.retain(|peer| *peer != peer_id);
             }
@@ -469,9 +567,13 @@ impl NetworkService {
                         .await;
                     return;
                 };
-                match decompress(&message) {
-                    Ok(message) => {
-                        let _ = self.events.send(NetworkEvent::Message(message)).await;
+                match decompress(&message).and_then(|decoded| {
+                    authenticate_message(&decoded, self.chain_id, self.authorized_signer)
+                        .map_err(|error| error.to_string())?;
+                    Ok(decoded)
+                }) {
+                    Ok(decoded) => {
+                        let _ = self.events.send(NetworkEvent::Message(decoded)).await;
                     }
                     Err(error) => event!(
                         name: "eez.p2p.backfill.decode_rejected",
@@ -484,6 +586,31 @@ impl NetworkService {
             }
         }
     }
+}
+
+/// OP Stack content-based message ID: SHA-256 over a Snappy validity
+/// domain, the length-prefixed topic, and the decompressed payload. The
+/// 20-byte truncation matches op-node and prevents alternate valid Snappy
+/// encodings from bypassing GossipSub deduplication.
+///
+/// The Rust layout and golden vectors are cross-checked against Kona:
+/// <https://github.com/ethereum-optimism/optimism/blob/d41f9e6af629df5a6666366b9f0dbf26184c2984/rust/kona/crates/node/gossip/src/config.rs>
+fn compute_message_id(message: &gossipsub::Message) -> gossipsub::MessageId {
+    const INVALID_SNAPPY_DOMAIN: [u8; 4] = [0, 0, 0, 0];
+    const VALID_SNAPPY_DOMAIN: [u8; 4] = [1, 0, 0, 0];
+
+    let decompressed = decompress(&message.data).ok();
+    let (domain, payload) = decompressed.as_deref().map_or_else(
+        || (INVALID_SNAPPY_DOMAIN, message.data.as_slice()),
+        |payload| (VALID_SNAPPY_DOMAIN, payload),
+    );
+    let topic = message.topic.as_str().as_bytes();
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update((topic.len() as u64).to_le_bytes());
+    hasher.update(topic);
+    hasher.update(payload);
+    gossipsub::MessageId::from(hasher.finalize()[..20].to_vec())
 }
 
 fn compress(message: &[u8]) -> Result<Vec<u8>, String> {
@@ -526,14 +653,29 @@ fn decompress(message: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::{B256, hex};
+    use alloy_signer::SignerSync;
+    use alloy_signer_local::PrivateKeySigner;
     use tokio::time::{Instant, timeout};
+
+    fn test_signer() -> PrivateKeySigner {
+        PrivateKeySigner::from_bytes(&B256::repeat_byte(0x11)).unwrap()
+    }
 
     fn local_config(port: u16, peers: Vec<Multiaddr>) -> NetworkConfig {
         NetworkConfig {
             chain_id: 1234,
+            authorized_signer: test_signer().address(),
             listen_addr: format!("/ip4/127.0.0.1/tcp/{port}").parse().unwrap(),
             peers,
         }
+    }
+
+    fn signed_message(body: &[u8]) -> Vec<u8> {
+        let signature = test_signer()
+            .sign_hash_sync(&crate::signing_hash(1234, body))
+            .unwrap();
+        [signature.as_rsy().as_slice(), body].concat()
     }
 
     #[test]
@@ -541,6 +683,27 @@ mod tests {
         let message = vec![0x42; 32_000];
         assert_eq!(decompress(&compress(&message).unwrap()).unwrap(), message);
         assert!(compress(&vec![0; MAX_MESSAGE_SIZE + 1]).is_err());
+    }
+
+    #[test]
+    fn message_id_matches_op_node_golden_vectors() {
+        let make = |data: Vec<u8>| gossipsub::Message {
+            source: None,
+            data,
+            sequence_number: None,
+            topic: gossipsub::TopicHash::from_raw("test"),
+        };
+        assert_eq!(
+            compute_message_id(&make(vec![1, 2, 3, 4, 5])).0,
+            hex!("b6897dcba59347fedcd694cc0f5117093c9dc727").to_vec(),
+        );
+        let valid = snap::raw::Encoder::new()
+            .compress_vec(&[1, 2, 3, 4, 5])
+            .unwrap();
+        assert_eq!(
+            compute_message_id(&make(valid)).0,
+            hex!("adbe547b27f41294a08a09210a5e8531e83cdc16").to_vec(),
+        );
     }
 
     #[tokio::test]
@@ -574,7 +737,7 @@ mod tests {
         .await
         .unwrap();
 
-        let expected = vec![0x5a; 8_192];
+        let expected = signed_message(&vec![0x5a; 8_192]);
         publish_handle.publish(42, expected.clone()).await.unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -611,7 +774,7 @@ mod tests {
             NetworkEvent::Listening(address) => address,
             event => panic!("expected listen address, got {event:?}"),
         };
-        let expected = vec![0xa5; 8_192];
+        let expected = signed_message(&vec![0xa5; 8_192]);
         publish_handle.publish(42, expected.clone()).await.unwrap();
 
         let (follower, follower_handle, mut follower_events) =
