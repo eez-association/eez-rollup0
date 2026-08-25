@@ -28,7 +28,7 @@ tokio              = { version = "1", features = ["full"] }
 async-trait        = "0.1"
 dotenvy            = "0.15"
 futures-util       = "0.3"
-libp2p             = { version = "0.56", default-features = false, features = ["cbor", "gossipsub", "macros", "noise", "request-response", "tcp", "tokio", "yamux"] }
+libp2p             = { version = "0.56", default-features = false, features = ["cbor", "gossipsub", "identify", "macros", "noise", "ping", "request-response", "secp256k1", "tcp", "tokio", "yamux"] }
 tracing            = "0.1"
 tracing-subscriber = "0.3"
 thiserror          = "2"

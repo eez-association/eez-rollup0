@@ -709,8 +709,15 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
         .get_chain_id()
         .await
         .unwrap();
+    let signer = ANVIL_KEY_1.parse::<PrivateKeySigner>().unwrap();
     let (rogue, rogue_handle, mut rogue_events) = NetworkService::new(
-        NetworkConfig::parse(chain_id, "/ip4/127.0.0.1/tcp/0", std::iter::empty()).unwrap(),
+        NetworkConfig::parse(
+            chain_id,
+            signer.address(),
+            "/ip4/127.0.0.1/tcp/0",
+            std::iter::empty(),
+        )
+        .unwrap(),
     )
     .unwrap();
     let rogue_task = tokio::spawn(rogue.run());
@@ -723,7 +730,7 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
     let follower_env = override_env(
         harness.follower_env(Some(&rogue_addr)).await.unwrap(),
         "RUST_LOG",
-        "warn,eez_node::follower=info",
+        "warn,eez_node::follower=info,eez_p2p=debug",
     );
     let follower_cfg = NodeConfig {
         binary: NodeBinary::Follower,
@@ -758,7 +765,6 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
     // Sign a body with a different key. Authorization is checked before SSZ,
     // so the body need not be a valid execution payload for this boundary test.
     let body = vec![0x42; 128];
-    let signer = ANVIL_KEY_1.parse::<PrivateKeySigner>().unwrap();
     let signature = signer
         .sign_hash_sync(&signing_hash(chain_id, &body))
         .unwrap();

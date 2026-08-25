@@ -126,9 +126,14 @@ struct P2pArgs {
 }
 
 impl P2pArgs {
-    fn network_config(&self, chain_id: u64) -> eyre::Result<NetworkConfig> {
+    fn network_config(
+        &self,
+        chain_id: u64,
+        authorized_signer: Address,
+    ) -> eyre::Result<NetworkConfig> {
         NetworkConfig::parse(
             chain_id,
+            authorized_signer,
             &self.p2p_listen_addr,
             self.p2p_peers.iter().map(String::as_str),
         )
@@ -433,8 +438,10 @@ async fn launch_follower(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Res
         deriver.run(deriver_events).await;
     });
 
-    let (p2p_service, p2p_handle, p2p_events) =
-        NetworkService::new(ext.p2p.network_config(l2_chain_id)?)?;
+    let (p2p_service, p2p_handle, p2p_events) = NetworkService::new(
+        ext.p2p
+            .network_config(l2_chain_id, ext.unsafe_block_signer_address)?,
+    )?;
     task_executor.spawn_critical_task("eez-unsafe-block-p2p", p2p_service.run());
     let follower = UnsafeHeadFollower::new(
         block_committer,
@@ -633,8 +640,10 @@ async fn launch_composer(builder: L2NodeBuilder, ext: ComposerArgs) -> eyre::Res
     let mut produced_payloads = block_committer.subscribe_produced_payloads();
     let unsafe_block_signer = unsafe_block_signer_from_env()?;
     let unsafe_block_signer_address = unsafe_block_signer.address();
-    let (p2p_service, p2p_handle, _p2p_events) =
-        NetworkService::new(ext.p2p.network_config(l2_chain_id)?)?;
+    let (p2p_service, p2p_handle, _p2p_events) = NetworkService::new(
+        ext.p2p
+            .network_config(l2_chain_id, unsafe_block_signer_address)?,
+    )?;
     let p2p_seed_handle = p2p_handle.clone();
     let p2p_seed_signer = unsafe_block_signer.clone();
     task_executor.spawn_critical_task("eez-unsafe-block-p2p", p2p_service.run());
