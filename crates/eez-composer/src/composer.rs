@@ -1146,10 +1146,10 @@ where
         // bundle contains only `postBatch` in this path.
         let drained_count = drained.len();
         // Per-slot drain visibility (pool depth vs how many txs this bundle
-        // took) — DEBUG so it doesn't spam the steady-state INFO stream.
+        // took).
         event!(
             name: "eez.composer.sync_slot.drain",
-            Level::DEBUG,
+            Level::INFO,
             event_name = "eez.composer.sync_slot.drain",
             rollup_id,
             cursor,
