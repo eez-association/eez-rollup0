@@ -8,6 +8,7 @@ members = [
     "crates/eez-evm-inspector",
     "crates/eez-l1",
     "crates/eez-node",
+    "crates/eez-p2p",
     "crates/eez-payload-codec",
     "crates/eez-proof-signer",
     "crates/eez-protocol",
@@ -123,6 +124,7 @@ alloy-rpc-types-eth    = { version = "2", default-features = false }
 alloy-signer           = { version = "2", default-features = false }
 alloy-signer-local     = { version = "2", default-features = false }
 alloy-sol-types        = { version = "1", default-features = false }
+ethereum_ssz           = "0.10.4"
 fail                   = "0.5"
 k256                   = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 url                    = "2"
@@ -141,6 +143,7 @@ eez-deriver        = { path = "crates/eez-deriver" }
 eez-driver         = { path = "crates/eez-driver" }
 eez-evm-inspector  = { path = "crates/eez-evm-inspector" }
 eez-l1             = { path = "crates/eez-l1" }
+eez-p2p            = { path = "crates/eez-p2p" }
 eez-payload-codec  = { path = "crates/eez-payload-codec" }
 eez-protocol       = { path = "crates/eez-protocol" }
 eez-prover         = { path = "crates/eez-prover" }
