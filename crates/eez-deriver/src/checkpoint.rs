@@ -10,9 +10,9 @@
 //! This records the last batch whose effects are committed locally. Boot seeds
 //! the index from it and scans forward, so the cost is O(gap) not O(history).
 //!
-//! Every field is a precondition the loader re-checks against L1 and local
-//! state. Anything unverifiable is discarded and boot falls back to the full
-//! scan — slow, never wrong.
+//! Nothing here is trusted. The loader re-checks the root against local state;
+//! the seeded record's L1 hash is re-checked by `revalidate_index_tail`. Either
+//! check failing falls back to the full scan — slow, never wrong.
 
 use std::fs;
 use std::io;
