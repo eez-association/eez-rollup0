@@ -102,13 +102,11 @@ services:
       EEZ_L1_XCHAIN_PORT: "18999"
       EEZ_L2_XCHAIN_PORT: "18998"
       # Max user_txs bundled per postBatch (host-env overridable, default 3).
-      # Raising it needs BOTH knobs below sized to match: the signer's
-      # checkpoint quota (>= cap) and the postBatch gas reserve (~240k gas
-      # per deferred entry queued on L1); an under-gassed postBatch reverts
-      # in the builder's bundle simulation and the bundle drops silently.
+      # Raising it needs the signer's checkpoint quota below sized to match
+      # (>= cap). The postBatch's own gas needs no knob: the composer projects
+      # it from contract-pinned constants and cuts the drain when it would
+      # cross EEZ_MAX_POSTBATCH_GAS.
       EEZ_MAX_USER_TXS_PER_BUNDLE: "${EEZ_MAX_USER_TXS_PER_BUNDLE:-3}"
-      # Execution reserve above the postBatch calldata floor.
-      EEZ_POSTBATCH_GAS_RESERVE: "${EEZ_POSTBATCH_GAS_RESERVE:-4000000}"
       # Emission + reorg bounds documented in .env.example. eez-node reads these
       # from the process env, and this service takes no env_file beyond
       # deployments.env, so they have to be forwarded explicitly. Defaults track
