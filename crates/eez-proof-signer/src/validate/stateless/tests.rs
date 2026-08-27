@@ -223,34 +223,10 @@ fn outbound_observations_preserve_receipt_log_order_and_duplicates() {
 }
 
 #[test]
-fn checkpoint_plan_enforces_its_exact_limit() {
-    let plan = CheckpointPlan::try_new(vec![0, 2], 2).unwrap();
-    assert_eq!(plan.transaction_indices, [0, 2]);
-
-    assert!(matches!(
-        CheckpointPlan::try_new(vec![0, 2], 1),
-        Err(ValidationError::CheckpointLimit {
-            requested: 2,
-            max: 1,
-        })
-    ));
-}
-
-#[test]
-fn zero_checkpoint_limit_allows_only_an_empty_plan() {
-    assert!(CheckpointPlan::try_new(Vec::new(), 0).is_ok());
-    assert!(matches!(
-        CheckpointPlan::try_new(vec![0], 0),
-        Err(ValidationError::CheckpointLimit {
-            requested: 1,
-            max: 0,
-        })
-    ));
-}
-
-#[test]
 fn checkpoint_response_must_match_the_plan_exactly() {
-    let plan = CheckpointPlan::try_new(vec![0, 2], 2).unwrap();
+    let plan = CheckpointPlan {
+        transaction_indices: vec![0, 2],
+    };
     assert!(
         plan.verify_returned(&[checkpoint(0), checkpoint(2)])
             .is_ok()
@@ -291,10 +267,45 @@ fn checkpoint_plan_is_derived_from_recovered_transactions() {
     );
 
     let (plan, system_sender_flags) =
-        CheckpointPlan::from_recovered_block(&recovered, 2, TEST_SYSTEM_ADDRESS).unwrap();
+        CheckpointPlan::from_recovered_block(&recovered, TEST_SYSTEM_ADDRESS);
 
     assert_eq!(system_sender_flags, [true, false, true]);
     assert_eq!(plan.transaction_indices, [1, 2]);
+}
+
+#[test]
+fn checkpoint_plan_includes_every_inbound_boundary() {
+    let transaction = || {
+        TxLegacy {
+            to: TxKind::Call(EEZL2_ADDRESS),
+            ..Default::default()
+        }
+        .into_signed(alloy_primitives::Signature::test_signature())
+        .into()
+    };
+
+    for transaction_count in [8, 9, 64, 65] {
+        let block = Block::new(
+            Default::default(),
+            alloy_consensus::BlockBody {
+                transactions: std::iter::repeat_with(transaction)
+                    .take(transaction_count)
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        let recovered =
+            RecoveredBlock::new_unhashed(block, vec![TEST_SYSTEM_ADDRESS; transaction_count]);
+
+        let (plan, system_sender_flags) =
+            CheckpointPlan::from_recovered_block(&recovered, TEST_SYSTEM_ADDRESS);
+
+        assert_eq!(system_sender_flags, vec![true; transaction_count]);
+        assert_eq!(
+            plan.transaction_indices,
+            (0..transaction_count).collect::<Vec<_>>()
+        );
+    }
 }
 
 #[test]
@@ -393,7 +404,6 @@ fn selected_checkpoints_flow_through_the_stateless_adapter() {
         .validate_blocks(
             std::slice::from_mut(&mut input),
             &CancellationToken::default(),
-            expected.len(),
         )
         .unwrap();
 
@@ -414,14 +424,13 @@ fn selected_checkpoints_flow_through_the_stateless_adapter() {
 
 #[test]
 fn real_checkpoints_do_not_classify_the_legacy_inbound_selector() {
-    let (mut input, chain_config, expected_checkpoints) = checkpoint_fixture();
+    let (mut input, chain_config, _) = checkpoint_fixture();
     let block_number = input.declared_number;
     let block_rlp = input.rlp.clone();
     let mut output = Backend::new(chain_config, TEST_SYSTEM_ADDRESS)
         .validate_blocks(
             std::slice::from_mut(&mut input),
             &CancellationToken::default(),
-            expected_checkpoints.len(),
         )
         .unwrap();
     let block_output = output.blocks.remove(0);
@@ -442,40 +451,14 @@ fn real_checkpoints_do_not_classify_the_legacy_inbound_selector() {
 }
 
 #[test]
-fn a_plan_over_quota_is_rejected_before_checkpoint_execution() {
-    let (mut input, chain_config, expected) = checkpoint_fixture();
-    let witness_items = input.witness.state.len();
-
-    let error = Backend::new(chain_config, TEST_SYSTEM_ADDRESS)
-        .validate_blocks(
-            std::slice::from_mut(&mut input),
-            &CancellationToken::default(),
-            expected.len() - 1,
-        )
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        ValidationError::CheckpointLimit {
-            requested,
-            max,
-        } if requested == expected.len() && max == expected.len() - 1
-    ));
-    assert_eq!(input.witness.state.len(), witness_items);
-}
-
-#[test]
 fn pre_cancelled_validation_does_not_consume_the_witness() {
     let cancellation = CancellationToken::default();
     cancellation.cancel();
     let mut input = fixture_input();
     let state_items = input.witness.state.len();
 
-    let result = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS).validate_blocks(
-        std::slice::from_mut(&mut input),
-        &cancellation,
-        usize::MAX,
-    );
+    let result = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS)
+        .validate_blocks(std::slice::from_mut(&mut input), &cancellation);
 
     assert!(matches!(result, Err(ValidationError::Cancelled)));
     assert_eq!(input.witness.state.len(), state_items);
