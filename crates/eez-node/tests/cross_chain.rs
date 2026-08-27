@@ -187,6 +187,76 @@ async fn real_signer_rejects_tampered_witness() {
     assert_real_signer_rejects(ProverMutation::Witness, "witness").await;
 }
 
+/// `ResourceExhausted` is opaque to the Composer (including the real signer's
+/// checkpoint-quota rejection from #120). A valid transaction may be sacrificed,
+/// but it must leave the retry loop after the bounded number of proof episodes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opaque_prover_rejection_eventually_evicts_the_candidate() {
+    let attester = signer_address(ANVIL_KEY_1).unwrap();
+    let w = setup_cross_chain_proxied(ProverMutation::ResourceExhausted, attester)
+        .await
+        .unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let starting_nonce = pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
+    let starting_value = l2_value(&l2_rpc, w.value_l2).await.unwrap();
+    let tx_hash = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        starting_nonce,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall { v: U256::from(76) }.abi_encode(),
+        600_000,
+    )
+    .await
+    .expect("valid transaction must be admitted before the prover rejects its batch");
+
+    let evicted = wait_for(SETTLE_TIMEOUT, || async {
+        let logs = w
+            .node
+            .log_lines_matching(&["potentially valid user_tx evicted"], 20);
+        Ok(logs
+            .lines()
+            .any(|line| line.contains("ERROR") && line.contains(&tx_hash.to_string()))
+            .then_some(()))
+    })
+    .await;
+    if let Err(error) = evicted {
+        panic!(
+            "opaque prover rejection did not reach bounded eviction: {error:#}{}",
+            w.settlement_diagnostics(),
+        );
+    }
+
+    let proxy = w.prover_proxy.as_ref().expect("rejection proxy");
+    assert!(
+        proxy.rejections() >= 3,
+        "eviction must require three distinct rejected proof episodes"
+    );
+    assert_eq!(
+        receipt_ok(&l1_rpc, tx_hash).await.unwrap(),
+        None,
+        "a sacrificed valid transaction must not appear to have landed"
+    );
+    assert_eq!(
+        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
+        starting_nonce,
+        "the rejected transaction must not burn its source nonce"
+    );
+    assert_eq!(
+        l2_value(&l2_rpc, w.value_l2).await.unwrap(),
+        starting_value,
+        "the rejected cross-chain call must not change its target value"
+    );
+    assert!(
+        proxy.successes() > 0,
+        "anchor-only fallback proofs must remain healthy so recovery can make progress"
+    );
+    w.node.assert_no_process_death();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_signer_attester_mismatch_never_submits_a_batch() {
     let wrong_attester = Address::repeat_byte(0x44);
