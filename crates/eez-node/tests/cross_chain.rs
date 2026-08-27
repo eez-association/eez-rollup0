@@ -187,15 +187,12 @@ async fn real_signer_rejects_tampered_witness() {
     assert_real_signer_rejects(ProverMutation::Witness, "witness").await;
 }
 
-/// `ResourceExhausted` is opaque to the Composer (including the real signer's
-/// checkpoint-quota rejection from #120). A valid transaction may be sacrificed,
-/// but it must leave the retry loop after the bounded number of proof episodes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn opaque_prover_rejection_eventually_evicts_the_candidate() {
+/// Whether the response is intrinsically opaque (`ResourceExhausted`, including
+/// #120) or becomes opaque because its actionable identity is unsafe, a valid
+/// transaction may be sacrificed but must leave the retry loop at the bound.
+async fn assert_opaque_prover_rejection_eventually_evicts_the_candidate(mutation: ProverMutation) {
     let attester = signer_address(ANVIL_KEY_1).unwrap();
-    let w = setup_cross_chain_proxied(ProverMutation::ResourceExhausted, attester)
-        .await
-        .unwrap();
+    let w = setup_cross_chain_proxied(mutation, attester).await.unwrap();
     let l1_rpc = w.l1_rpc();
     let l2_rpc = w.l2_rpc();
     let starting_nonce = pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
@@ -254,7 +251,33 @@ async fn opaque_prover_rejection_eventually_evicts_the_candidate() {
         proxy.successes() > 0,
         "anchor-only fallback proofs must remain healthy so recovery can make progress"
     );
+    if matches!(mutation, ProverMutation::MismatchedActionable) {
+        let logs = w.node.log_lines_matching(
+            &["actionable failure details that do not match the current request"],
+            20,
+        );
+        assert!(
+            logs.lines().any(|line| line.contains("ERROR")),
+            "mismatched actionable details must produce a severe diagnostic log"
+        );
+    }
     w.node.assert_no_process_death();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn opaque_prover_rejection_eventually_evicts_the_candidate() {
+    assert_opaque_prover_rejection_eventually_evicts_the_candidate(
+        ProverMutation::ResourceExhausted,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mismatched_actionable_rejection_eventually_evicts_the_candidate() {
+    assert_opaque_prover_rejection_eventually_evicts_the_candidate(
+        ProverMutation::MismatchedActionable,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

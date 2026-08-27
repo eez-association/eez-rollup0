@@ -3719,8 +3719,19 @@ where
                 let Some(failure) = error.actionable_failure() else {
                     return Err(PreparePostBatchError::Prover(error));
                 };
-                validate_actionable_prover_failure(failure, &batch, sync_block)
-                    .map_err(PreparePostBatchError::Build)?;
+                if let Err(validation_error) =
+                    validate_actionable_prover_failure(failure, &batch, sync_block)
+                {
+                    event!(
+                        name: "eez.composer.prover.actionable_invalid",
+                        Level::ERROR,
+                        rollup_id,
+                        failure = %failure,
+                        error = %validation_error,
+                        "prover supplied actionable failure details that do not match the current request; treating the rejection as opaque",
+                    );
+                    return Err(PreparePostBatchError::Prover(error));
+                }
                 return Err(PreparePostBatchError::Actionable(failure));
             }
         };

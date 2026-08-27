@@ -23,9 +23,9 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolError, SolEvent, SolValue, sol};
 use anyhow::{Context, Result, anyhow, bail};
 use eez_control_rpc::{
-    MAX_MESSAGE_BYTES,
+    MAX_MESSAGE_BYTES, encode_prove_failure,
     v1::{
-        ProveChunk, ProveResponse, prove_chunk,
+        InboundFailure, ProveChunk, ProveFailure, ProveResponse, prove_chunk, prove_failure,
         prover_client::ProverClient,
         prover_server::{Prover, ProverServer},
     },
@@ -585,6 +585,9 @@ pub enum ProverMutation {
     /// is the status returned by the real signer when its checkpoint quota is
     /// exceeded.
     ResourceExhausted,
+    /// A typed rejection whose candidate identity cannot belong to the current
+    /// request. The Composer must treat it as opaque rather than acting on it.
+    MismatchedActionable,
 }
 
 impl ProverMutation {
@@ -621,7 +624,7 @@ impl ProverMutation {
                     witness.state.push(vec![0xff]);
                 }
             }
-            Self::ResourceExhausted => {
+            Self::ResourceExhausted | Self::MismatchedActionable => {
                 let calldata = chunks
                     .iter()
                     .find_map(|chunk| match chunk.kind.as_ref() {
@@ -638,9 +641,27 @@ impl ProverMutation {
                 // quota is exercised only by effect candidates, so leave
                 // anchor-only historical/minimal proofs healthy.
                 if batch.entries.len() > 1 {
-                    return Err(Status::resource_exhausted(
-                        "window validation checkpoint quota exceeded",
-                    ));
+                    return match self {
+                        Self::ResourceExhausted => Err(Status::resource_exhausted(
+                            "window validation checkpoint quota exceeded",
+                        )),
+                        Self::MismatchedActionable => {
+                            let failure = ProveFailure {
+                                actionable_failure: Some(
+                                    prove_failure::ActionableFailure::Inbound(InboundFailure {
+                                        entry_index: u32::MAX,
+                                        entry_hash: vec![0xff; 32],
+                                    }),
+                                ),
+                            };
+                            Err(Status::with_details(
+                                tonic::Code::FailedPrecondition,
+                                "candidate identity does not match the request",
+                                encode_prove_failure(&failure).into(),
+                            ))
+                        }
+                        Self::None | Self::PostBatch | Self::Witness => unreachable!(),
+                    };
                 }
             }
         }
@@ -675,7 +696,10 @@ impl Prover for ProverProxyService {
             chunks.push(chunk);
         }
         if let Err(status) = self.mutation.apply(&mut chunks) {
-            if matches!(status.code(), tonic::Code::ResourceExhausted) {
+            if matches!(
+                status.code(),
+                tonic::Code::ResourceExhausted | tonic::Code::FailedPrecondition
+            ) {
                 self.counters.rejections.fetch_add(1, Ordering::Relaxed);
             }
             return Err(status);
