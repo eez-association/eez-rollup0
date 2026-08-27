@@ -54,8 +54,8 @@ stateDiagram-v2
 The aggregate byte quota is based on the canonical encoded size of decoded
 known protobuf fields. It is not a replacement for the per-message ceiling,
 which also bounds unknown or non-canonical bytes in one protobuf message body.
-Block and witness-item limits cover different cost dimensions and remain
-independent.
+Block, byte, and witness-item limits cover different cost dimensions and
+remain independent.
 
 ## Cancellation is cooperative
 
