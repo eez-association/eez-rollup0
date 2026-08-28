@@ -174,12 +174,12 @@ Select either non-default role explicitly:
 
 ```bash
 # L1-derived follower; optionally add `--sequencer-rpc <URL>` after `node`.
-cargo run -p eez-node --bin eez-follower -- node \
+cargo run -p eez-follower -- node \
   --chain "$EEZ_L2_GENESIS_PATH" \
   --datadir "$EEZ_L2_DATADIR"
 
 # Unanchored interval sequencer for local development.
-cargo run -p eez-node --bin eez-dev-node -- node \
+cargo run -p eez-dev-node -- node \
   --chain "$EEZ_L2_GENESIS_PATH" \
   --datadir "$EEZ_L2_DATADIR"
 ```

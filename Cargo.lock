@@ -3338,7 +3338,6 @@ name = "eez-node"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
- "alloy-contract",
  "alloy-eips 2.0.5",
  "alloy-genesis",
  "alloy-network",
@@ -3347,10 +3346,7 @@ dependencies = [
  "alloy-rpc-types-debug",
  "alloy-rpc-types-eth",
  "alloy-signer-local",
- "alloy-sol-types",
- "anyhow",
  "eez-composer",
- "eez-control-rpc",
  "eez-deriver",
  "eez-driver",
  "eez-l1",
@@ -3386,8 +3382,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-stream",
- "tonic",
  "tracing",
 ]
 
@@ -3414,6 +3408,34 @@ dependencies = [
  "reth-transaction-pool 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "eez-node-e2e"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-contract",
+ "alloy-genesis",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types-eth",
+ "alloy-signer-local",
+ "alloy-sol-types",
+ "anyhow",
+ "eez-control-rpc",
+ "eez-dev-node",
+ "eez-follower",
+ "eez-node",
+ "eez-protocol",
+ "eyre",
+ "reth-chainspec 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]

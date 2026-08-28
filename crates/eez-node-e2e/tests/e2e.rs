@@ -549,7 +549,7 @@ async fn happy_case_follower_sequencer_rpc() {
     let follower_env = override_env(
         harness.follower_env(Some(&seq_rpc)).await.unwrap(),
         "RUST_LOG",
-        "warn,eez_node::follower=info",
+        "warn,eez_follower::unsafe_head=info",
     );
     let follower_cfg = NodeConfig {
         binary: NodeBinary::Follower,
@@ -722,7 +722,7 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
             .await
             .unwrap(),
         "RUST_LOG",
-        "warn,eez_node::follower=info",
+        "warn,eez_follower::unsafe_head=info",
     );
     let follower_cfg = NodeConfig {
         binary: NodeBinary::Follower,
