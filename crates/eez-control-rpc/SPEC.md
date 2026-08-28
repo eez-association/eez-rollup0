@@ -100,11 +100,42 @@ entries[i].stateUpdates[0].currentState = entries[i - 1].stateUpdates[0].newStat
 entries[last].stateUpdates[0].newState = terminal Sync-block state root
 ```
 
-For a batch with effects, the anchor ends at the terminal block's parent state
-root and each effect entry ends at its corresponding locally computed
-post-transaction state root. For an anchor-only batch, the anchor ends at the
-terminal block's final state root. The Composer MUST finalize every entry's L1
-rolling hash only after these state updates have been stitched.
+The anchor is `entries[0]` and is not counted as a cross-chain effect. Effect
+`i` is `entries[i + 1]`. Let `P` be the terminal Sync block's parent state root,
+and let `R[i]` be the state root immediately after effect `i`'s effect-ending
+transaction:
+
+- for an outbound effect, the effect-ending transaction is the user
+  transaction in its `[system load, user]` pair; the system load alone is not a
+  checkpoint; and
+- for an inbound effect, the effect-ending transaction is its system delivery
+  transaction.
+
+Each `R[i]` MUST be derived from execution of the exact terminal-block
+transaction prefix through that transaction from state `P`, using the same
+block execution environment as the complete terminal block. A Composer MAY
+capture these checkpoints during one complete execution or execute the prefixes
+separately.
+
+Let `U[j] = entries[j].stateUpdates[0]`. For a batch with `E > 0` effects, the
+state updates MUST be:
+
+```text
+U[0].currentState = state root at posted       // anchor
+U[0].newState = P
+
+U[1].currentState = P                          // effect 0
+U[i + 1].currentState = R[i - 1]               for every 0 < i < E
+U[i + 1].newState = R[i]                       for every 0 <= i < E
+
+R[E - 1] = terminal Sync-block final state root
+```
+
+For an anchor-only batch (`E = 0`), there are no effect checkpoints:
+`U[0].currentState` is the state root at `posted` and `U[0].newState` is the
+terminal Sync block's final state root. The Composer MUST finalize every entry's
+L1 rolling hash only after all state updates have been assigned, because the
+rolling-hash seed commits to those updates.
 
 The exact accepted anchor, outbound, and inbound entry shapes are defined in
 the [proof-signer profile](../eez-proof-signer/SPEC.md#8-state-update-chain-and-effect-binding).
@@ -145,8 +176,8 @@ The first streamed chunk MUST contain exactly one `ProveHeader`:
   intervals, and `[from_block, to_block)` MAY contain a previously committed
   empty Sync block. Such a block is sent and validated like every other
   intermediate block; the Composer MUST NOT skip it. For an anchor-only batch,
-  the terminal Sync block MAY contain zero transactions; protocol-level system
-  writes can still change its state root.
+  the terminal Sync block MUST contain zero transactions; protocol-level
+  system writes can still change its state root.
 - `post_batch` MUST be present and contain the calldata constructed in section
   3.1.
 - `post_batch.public_inputs_hash` is non-authoritative. The Composer SHOULD
@@ -202,6 +233,33 @@ After sending the `to_block` witness, the Composer MUST close the request
 stream. A partial stream is not resumable; retrying requires a new complete
 `Prove` call.
 
+### 3.5 Prover acceptance checks
+
+The Composer should expect the prover to return a proof only when all of the
+following checks pass:
+
+- the stream has the required header-first shape, declared range, block order,
+  rollup identity, field widths, and resource bounds;
+- every block exact-decodes, matches its submitted number, hash, parent hash,
+  and configured chain rules, and re-executes to its committed state root;
+- the blocks form one state-continuous window and contain settlement activity
+  only in the terminal Sync block;
+- `post_batch.abi_calldata` is the canonical encoding of the supported batch
+  profile and matches the configured rollup and proof system;
+- the entry state updates form the required chain, and every effect entry's
+  `newState` matches the corresponding post-transaction root described in
+  section 3.1;
+- every inbound and outbound entry matches the applicable executed transaction,
+  receipt, event, call hash, value, and ether-delta evidence for that effect;
+- `callData` exactly describes the validated block transactions and effect
+  sidecars, including byte-exact reconstruction of omitted terminal system
+  transactions; and
+- the prover can independently recompute the batch's sole `publicInputsHash`.
+
+Any failed check returns no proof. The complete accepted profile and rejection
+rules are defined in the
+[`eez-proof-signer` specification](../eez-proof-signer/SPEC.md#5-stream-admission).
+
 ## 4. Transport behavior
 
 A block witness may exceed gRPC's usual 4 MiB default. Composer implementations
@@ -226,7 +284,7 @@ The Composer MUST reject the response unless:
 - recovering the signature over `public_inputs_hash` yields the attester
   registered for the configured `ECDSAProofSystem`.
 
-The Composer SHOULD also recompute the current profile's sole
+The Composer MUST also recompute the current profile's sole
 `publicInputsHash` from the exact request batch and registered vkey, then require
 it to equal `response.public_inputs_hash`. The normative hash construction is
 in [proof-signer section 12](../eez-proof-signer/SPEC.md#12-public-input-recomputation),
@@ -313,10 +371,10 @@ interval. Because the L1 settlement cursor did not advance, the next successful
 proof request begins at the same `posted + 1` and includes the empty Sync block
 as an intermediate block.
 
-A malformed response, wrong signer, or invalid signature MUST be treated like
-a non-retryable failure for that request. When the Composer performs the
-recommended local hash recomputation, a hash mismatch MUST be handled the same
-way. The Composer MUST NOT populate `batch.proofs` or submit the batch.
+A malformed response, wrong signer, invalid signature, or mismatch between the
+locally recomputed hash and `response.public_inputs_hash` MUST be treated like a
+non-retryable failure for that request. The Composer MUST NOT populate
+`batch.proofs` or submit the batch.
 
 ## 7. Composer conformance
 
@@ -326,7 +384,9 @@ A Composer implementation SHOULD test:
 - block hash widths, parent adjacency, exact RLP, and augmented witness
   generation;
 - accepted anchor-only, inbound, outbound, and mixed batch construction;
-- response length, signature encoding, hash, and registered-attester checks;
+- response length, signature encoding, hash, and registered-attester checks,
+  including rejection of a valid registered-attester signature over a hash for
+  a different batch;
 - proof insertion without mutation of any other batch field;
 - the closed retryable-status allowlist, default non-retryable handling,
   complete-stream exponential backoff, and settlement-cutoff fallback to an
