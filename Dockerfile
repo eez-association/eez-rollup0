@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# eez-node image. Builds the `eez-node` binary (release) with cargo-chef
+# eez-node image. Builds the production node binaries (release) with cargo-chef
 # dependency-layer caching — reth is a large, rarely-changing tree, so
 # the cooked-deps layer is reused across code changes.
 #
