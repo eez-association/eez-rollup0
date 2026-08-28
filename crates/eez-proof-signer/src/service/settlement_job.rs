@@ -3,6 +3,7 @@
 use std::num::NonZeroU64;
 
 use alloy_primitives::{Address, B256};
+use eez_control_rpc::v1::{InboundFailure, OutboundFailure, ProveFailure, prove_failure};
 use tokio::time::Instant;
 use tonic::Status;
 
@@ -139,6 +140,11 @@ pub(super) struct SettlementInput<'a> {
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum SettlementPipelineError {
+    #[error("{source}")]
+    Actionable {
+        source: Box<SettlementPipelineError>,
+        failure: ProveFailure,
+    },
     #[error(transparent)]
     PostBatchCalldata(#[from] settlement::PostBatchDecodeError),
     #[error(transparent)]
@@ -162,6 +168,7 @@ pub(super) enum SettlementPipelineError {
 impl SettlementPipelineError {
     pub(super) const fn gate(&self) -> &'static str {
         match self {
+            Self::Actionable { source, .. } => source.gate(),
             Self::PostBatchCalldata(_) => "post_batch_calldata",
             Self::PublicInputs(_) => "public_inputs",
             Self::BlockInspection(_) => "block_inspection",
@@ -176,7 +183,18 @@ impl SettlementPipelineError {
 
     /// Map every pipeline error to its public gRPC code and message.
     pub(super) fn status(&self) -> Status {
+        if let Self::Actionable { source, failure } = self {
+            let status = source.status();
+            debug_assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+            return Status::with_details(
+                status.code(),
+                status.message(),
+                eez_control_rpc::encode_prove_failure(failure).into(),
+            );
+        }
+
         let (code, message) = match self {
+            Self::Actionable { .. } => unreachable!("handled above"),
             Self::PostBatchCalldata(_) => {
                 (tonic::Code::InvalidArgument, "invalid PostBatch calldata")
             }
@@ -258,6 +276,18 @@ impl SettlementPipelineError {
         };
         Status::new(code, message)
     }
+
+    /// Attach a machine-readable eviction hint without changing the public
+    /// status code, message, or settlement gate.
+    fn with_actionable(self, failure: Option<ProveFailure>) -> Self {
+        match failure {
+            Some(failure) => Self::Actionable {
+                source: Box::new(self),
+                failure,
+            },
+            None => self,
+        }
+    }
 }
 
 /// Run the synchronous settlement gates, stopping at the first failure.
@@ -293,11 +323,17 @@ pub(super) fn run_settlement(
         validated_window.window_post_state_root(),
     )?;
 
+    // If an outbound load reverted, report its paired user transaction.
+    // Reverted inbound deliveries are handled by the inbound gate below.
     let settling_observations = settlement::inspect_validated_settling_block(
         settling_block.block(),
         settling_block.receipt_successes(),
         expected_rollup_id,
-    )?;
+    )
+    .map_err(|error| {
+        let failure = actionable_block_inspection_failure(&error, settling_block.block());
+        SettlementPipelineError::BlockInspection(error).with_actionable(failure)
+    })?;
     settlement::verify_validated_intermediate_blocks(validated_window.preceding_blocks())?;
 
     let bound_effects = settlement::bind_effects_to_execution(
@@ -310,12 +346,21 @@ pub(super) fn run_settlement(
     // Direction-specific gates turn the ordered bindings into the only effect
     // capabilities accepted by exact DA reconstruction.
     let authorized_inbound_effects =
-        settlement::authorize_inbound_effects(&bound_effects, expected_rollup_id)?;
+        settlement::authorize_inbound_effects(&bound_effects, expected_rollup_id).map_err(
+            |error| {
+                let failure = actionable_inbound_failure(&error, &canonical_batch);
+                SettlementPipelineError::InboundEffects(error).with_actionable(failure)
+            },
+        )?;
     let authorized_outbound_effects = settlement::authorize_outbound_effects(
         &bound_effects,
         expected_rollup_id,
         expected_l2_system_address,
-    )?;
+    )
+    .map_err(|error| {
+        let failure = actionable_outbound_failure(&error, settling_block.block());
+        SettlementPipelineError::OutboundEffects(error).with_actionable(failure)
+    })?;
 
     ensure_settlement_active(cancellation)?;
 
@@ -332,6 +377,52 @@ pub(super) fn run_settlement(
     let recomputed_public_inputs_hash =
         checked_public_input_profile.recompute_public_inputs_hash(proof_system_vkey)?;
     Ok(AttestablePublicInputsHash(recomputed_public_inputs_hash))
+}
+
+fn actionable_block_inspection_failure(
+    error: &settlement::BlockInspectionError,
+    block: &validate::ValidatedBlock,
+) -> Option<ProveFailure> {
+    let settlement::BlockInspectionError::RevertedSystemTransaction { index } = error else {
+        return None;
+    };
+    let (transaction_index, transaction_hash) =
+        settlement::paired_outbound_transaction(block, *index)?;
+    outbound_failure(transaction_index, transaction_hash)
+}
+
+fn actionable_outbound_failure(
+    error: &settlement::OutboundEffectError,
+    block: &validate::ValidatedBlock,
+) -> Option<ProveFailure> {
+    let transaction_index = error.poisoned_transaction_index()?;
+    let transaction_hash = settlement::transaction_hash_at(block, transaction_index)?;
+    outbound_failure(transaction_index, transaction_hash)
+}
+
+fn outbound_failure(transaction_index: usize, transaction_hash: B256) -> Option<ProveFailure> {
+    Some(ProveFailure {
+        actionable_failure: Some(prove_failure::ActionableFailure::Outbound(
+            OutboundFailure {
+                transaction_index: transaction_index.try_into().ok()?,
+                transaction_hash: transaction_hash.as_slice().to_vec(),
+            },
+        )),
+    })
+}
+
+fn actionable_inbound_failure(
+    error: &settlement::InboundEffectError,
+    batch: &settlement::CanonicalPostBatch,
+) -> Option<ProveFailure> {
+    let entry_index = error.poisoned_entry_index()?;
+    let entry_hash = batch.entry_hash_at(entry_index)?;
+    Some(ProveFailure {
+        actionable_failure: Some(prove_failure::ActionableFailure::Inbound(InboundFailure {
+            entry_index: entry_index.try_into().ok()?,
+            entry_hash: entry_hash.as_slice().to_vec(),
+        })),
+    })
 }
 
 /// Stop settlement work after its request has been cancelled.

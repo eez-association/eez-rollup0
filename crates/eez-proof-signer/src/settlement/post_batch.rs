@@ -2,7 +2,8 @@
 
 use std::num::NonZeroU64;
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, keccak256};
+use alloy_sol_types::SolValue as _;
 use eez_protocol::EvmBatch;
 use eez_protocol::abi::ProofSystemBatchPerVerificationEntriesSol;
 use eez_protocol::entries::decode_postbatch;
@@ -30,6 +31,14 @@ pub(crate) struct CanonicalPostBatch(EvmBatch);
 impl CanonicalPostBatch {
     pub(super) const fn as_batch(&self) -> &EvmBatch {
         &self.0
+    }
+
+    /// Hash one canonical entry for request-local Composer correlation.
+    pub(crate) fn entry_hash_at(&self, index: usize) -> Option<B256> {
+        self.0
+            .entries
+            .get(index)
+            .map(|entry| keccak256(entry.abi_encode()))
     }
 
     #[cfg(test)]
