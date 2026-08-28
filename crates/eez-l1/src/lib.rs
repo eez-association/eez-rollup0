@@ -5,9 +5,9 @@
 //! umbrella crate; `eez-l1` now exposes only the L1-side building
 //! blocks the umbrella (and the Deriver) compose with.
 //!
-//! - [`Submitter`] — the thin L1 send primitive: `postAndVerifyBatch`
-//!   via the bundle relay, plus a startup scan of past `BatchPosted`
-//!   events.
+//! - [`L1Reader`] — read-only historical batch scans and canonicality checks.
+//! - [`Submitter`] — the signed L1 send primitive: `postAndVerifyBatch`
+//!   via the bundle relay.
 //! - [`L1Watcher`] — polls L1, fans out `NewHead` / `BatchPosted` /
 //!   `Reorg` / `Finalized` over a broadcast channel.
 //! - [`L1CanonicalHead`] — shared `posted_through` cursor (Deriver
@@ -19,12 +19,13 @@ pub mod config;
 pub mod error;
 pub mod l1_canonical_head;
 pub mod l1_head_stream;
+pub mod l1_reader;
 pub mod l1_watcher;
 pub mod scan;
 pub mod submitter;
 
 #[doc(inline)]
-pub use config::SubmitterConfig;
+pub use config::{L1ReaderConfig, SubmitterConfig};
 #[doc(inline)]
 pub use error::{L1Error, L1Result};
 #[doc(inline)]
@@ -32,8 +33,10 @@ pub use l1_canonical_head::{BatchRecord, L1CanonicalHead};
 #[doc(inline)]
 pub use l1_head_stream::{L1HeadInfo, L1HeadStream};
 #[doc(inline)]
+pub use l1_reader::{L1Reader, L1Readiness};
+#[doc(inline)]
 pub use l1_watcher::{L1Event, L1Watcher, L1WatcherConfig};
 #[doc(inline)]
 pub use scan::{BatchLogChunks, ScannedBatch, Settlement};
 #[doc(inline)]
-pub use submitter::{BundleTarget, L1Readiness, SendOutcome, Submitter};
+pub use submitter::{BundleTarget, SendOutcome, Submitter};

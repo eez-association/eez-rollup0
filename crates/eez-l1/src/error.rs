@@ -6,7 +6,7 @@ use thiserror::Error;
 /// Convenience [`Result`] alias.
 pub type L1Result<T> = Result<T, L1Error>;
 
-/// Error returned by the [`Submitter`](crate::Submitter).
+/// Error returned by L1 readers, watchers, and the [`Submitter`](crate::Submitter).
 #[derive(Debug, Error)]
 pub enum L1Error {
     /// Bad / missing env var, malformed URL, etc.
