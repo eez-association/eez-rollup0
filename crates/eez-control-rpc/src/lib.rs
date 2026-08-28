@@ -14,17 +14,38 @@ mod generated;
 /// Tonic-generated protobuf module for the `prove.v1` package.
 pub use generated::v1;
 
+use prost::Message;
+
 /// Max size of a single `Prove` gRPC message, applied to BOTH the client
 /// (encode) and server (decode).
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Encode one typed [`v1::ProveFailure`] for the gRPC status-details field.
+#[must_use]
+pub fn encode_prove_failure(failure: &v1::ProveFailure) -> Vec<u8> {
+    failure.encode_to_vec()
+}
+
+/// Decode a typed [`v1::ProveFailure`] from the gRPC status-details field.
+///
+/// # Errors
+///
+/// Returns [`prost::DecodeError`] when the details are not a valid
+/// `prove.v1.ProveFailure` protobuf payload.
+pub fn decode_prove_failure(details: &[u8]) -> Result<v1::ProveFailure, prost::DecodeError> {
+    v1::ProveFailure::decode(details)
+}
 
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
     use prost::Message;
 
-    use super::MAX_MESSAGE_BYTES;
-    use super::v1::{ProveChunk, ProveHeader, ProveResponse, prove_chunk};
+    use super::v1::{
+        OutboundFailure, ProveChunk, ProveFailure, ProveHeader, ProveResponse, prove_chunk,
+        prove_failure,
+    };
+    use super::{MAX_MESSAGE_BYTES, decode_prove_failure, encode_prove_failure};
 
     #[test]
     fn prove_header_round_trips_through_protobuf() {
@@ -52,6 +73,23 @@ mod tests {
 
         assert_eq!(ProveResponse::decode(encoded.as_slice()).unwrap(), response);
         assert!(ProveResponse::decode(&encoded[..encoded.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn prove_failure_details_round_trip() {
+        let failure = ProveFailure {
+            actionable_failure: Some(prove_failure::ActionableFailure::Outbound(
+                OutboundFailure {
+                    transaction_index: 3,
+                    transaction_hash: vec![0x44; 32],
+                },
+            )),
+        };
+
+        assert_eq!(
+            decode_prove_failure(&encode_prove_failure(&failure)).unwrap(),
+            failure
+        );
     }
 
     proptest! {
