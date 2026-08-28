@@ -9,7 +9,7 @@
 //! emitting heads, so a failed cycle retries the identical range next
 //! tick. A reorg retreat (Reorg + rewind) still precedes its scan.
 //!
-//! HTTP polling (reuses `SubmitterConfig::rpc_url`) — 2s interval, well
+//! HTTP polling (reuses the `EEZ_L1_RPC_URL` read by `L1ReaderConfig`) — 2s interval, well
 //! inside gnosis 5s / Ethereum mainnet 12s block times.
 //!
 //! Reorg detection walks back via `parent_hash` against a ring of recent
@@ -124,8 +124,8 @@ pub enum L1Event {
 /// Configuration for the [`L1Watcher`].
 #[derive(Debug, Clone)]
 pub struct L1WatcherConfig {
-    /// L1 RPC endpoint (HTTP / HTTPS). Reuse
-    /// [`SubmitterConfig::rpc_url`](crate::SubmitterConfig::rpc_url).
+    /// L1 RPC endpoint (HTTP / HTTPS). Uses the same `EEZ_L1_RPC_URL` as
+    /// [`L1ReaderConfig`](crate::L1ReaderConfig).
     pub rpc_url: Url,
     /// Deployed `EEZ` (rollups registry) address. Used to filter
     /// `BatchPosted` log events.
