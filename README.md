@@ -160,6 +160,30 @@ EEZ_RESTART=1 EEZ_MODE=load ... bash scripts/xchain-test.sh                    #
 (`scripts/devnet-test.sh` is the earlier, simpler driver — setter+deposit only,
 raw-RPC — kept for reference.)
 
+## Run node roles locally
+
+`eez-composer` is the package default. Run it directly, or use `make run-node`:
+
+```bash
+cargo run -p eez-node -- node \
+  --chain "$EEZ_L2_GENESIS_PATH" \
+  --datadir "$EEZ_L2_DATADIR"
+```
+
+Select either non-default role explicitly:
+
+```bash
+# L1-derived follower; optionally add `--sequencer-rpc <URL>` after `node`.
+cargo run -p eez-node --bin eez-follower -- node \
+  --chain "$EEZ_L2_GENESIS_PATH" \
+  --datadir "$EEZ_L2_DATADIR"
+
+# Unanchored interval sequencer for local development.
+cargo run -p eez-node --bin eez-dev-node -- node \
+  --chain "$EEZ_L2_GENESIS_PATH" \
+  --datadir "$EEZ_L2_DATADIR"
+```
+
 ## Build, test, teardown
 
 ```bash
