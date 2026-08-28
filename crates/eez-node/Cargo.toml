@@ -10,7 +10,7 @@ default-run            = "eez-composer"
 [dependencies]
 eez-composer.workspace      = true
 eez-deriver.workspace       = true
-eez-driver.workspace        = true
+eez-driver = { workspace = true, features = ["witness"] }
 eez-l1.workspace            = true
 eez-node-common = { workspace = true, features = ["l1-startup"] }
 eez-protocol.workspace      = true
