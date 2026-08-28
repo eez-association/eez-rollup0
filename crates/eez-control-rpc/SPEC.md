@@ -27,7 +27,7 @@ For each settlement interval, the Composer MUST:
    submit it to the configured EEZ contract.
 
 If proving cannot complete before the settlement cutoff, the
-[failure-handling fallback](#62-retry-procedure-and-settlement-cutoff) replaces
+[failure-handling fallback](#63-retry-procedure-and-settlement-cutoff) replaces
 steps 5 through 7 for that interval: the Composer commits an empty Sync block
 without submitting an unproved batch and retains the selected effects for a
 later interval.
@@ -345,7 +345,59 @@ implementation may discard or recompose the request, correct its configuration,
 or alert an operator. The Composer MUST NOT infer retryability from a status
 message or implementation-specific error text.
 
-### 6.2 Retry procedure and settlement cutoff
+### 6.2 Actionable failed preconditions
+
+A `FAILED_PRECONDITION` status MAY carry a protobuf-encoded
+`prove.v1.ProveFailure` in its gRPC binary status-details field. The Composer
+MUST decode the details bytes directly as `ProveFailure`, without a
+`google.rpc.Status` wrapper. The gRPC status code remains authoritative:
+details attached to any other status MUST NOT authorize candidate removal or
+change that status's retry classification.
+
+`ProveFailure.actionable_failure` has two defined variants:
+
+- `OutboundFailure.transaction_index` is the zero-based position of the
+  original signed L2 user transaction in the terminal Sync block, not the
+  position of its preceding system-load transaction.
+  `OutboundFailure.transaction_hash` is that transaction's canonical 32-byte
+  signed transaction hash.
+- `InboundFailure.entry_index` indexes the complete `PostBatch.entries` array:
+  the anchor occupies index zero, so the first effect is at index one.
+  `InboundFailure.entry_hash` is the 32-byte
+  `keccak256(abi.encode(PostBatch.entries[entry_index]))`.
+
+The original signed L1 transaction for an inbound effect is not present in the
+`Prove` request. A Composer that supports actionable recovery MUST therefore
+retain its request-local candidate-to-entry mapping until the RPC completes.
+
+Before changing any candidate or pool state, the Composer MUST bind both fields
+of the selected variant to the exact rejected request:
+
+1. require the hash field to be exactly 32 bytes and the index to be in range;
+2. recompute the transaction or entry hash at that index and require an exact
+   match; and
+3. resolve that exact transaction or entry through request-local state retained
+   during composition to the original selected candidate.
+
+An empty, malformed, unknown, wrong-width, out-of-range, mismatched, stale, or
+unresolvable detail MUST be handled as an ordinary non-actionable
+`FAILED_PRECONDITION`. The Composer MUST NOT infer a candidate identity from
+the status message, diagnostic text, an index alone, or a hash alone.
+
+After a valid detail is resolved, the Composer MUST NOT resend the rejected
+request unchanged. It MAY remove the identified candidate and its same-sender,
+same-direction nonce suffix, then rebuild the batch, terminal Sync block,
+witnesses, and complete `Prove` stream from the remaining candidates. The
+rebuilt attempt is subject to the same settlement cutoff as any other proving
+attempt. This recovery does not authorize bisection or candidate removal when
+no valid typed detail is present.
+
+Index-and-hash validation binds the detail to the rejected request; it does not
+independently prove that the reported execution failure occurred. Candidate
+removal therefore trusts the configured prover, even when the transport is
+authenticated.
+
+### 6.3 Retry procedure and settlement cutoff
 
 For a retryable status, each retry MUST open a new `Prove` call and resend the
 complete header and block stream. The Composer SHOULD use exponential backoff
@@ -388,9 +440,13 @@ A Composer implementation SHOULD test:
   including rejection of a valid registered-attester signature over a hash for
   a different batch;
 - proof insertion without mutation of any other batch field;
-- the closed retryable-status allowlist, default non-retryable handling,
-  complete-stream exponential backoff, and settlement-cutoff fallback to an
-  empty Sync block; and
+- the closed retryable-status allowlist and default non-retryable handling;
+- accepted outbound and inbound actionable details, plus fail-closed handling
+  of details on the wrong status and empty, malformed, unknown, wrong-width,
+  out-of-range, mismatched, stale, or unresolvable details;
+- request-local actionable-failure resolution, dependent-candidate handling,
+  complete recomposition, exponential backoff, and settlement-cutoff fallback
+  to an empty Sync block; and
 - an end-to-end request whose response is accepted by the Composer and whose
   final `postAndVerifyBatch` succeeds against the deployed EEZ and
   `ECDSAProofSystem` contracts.
