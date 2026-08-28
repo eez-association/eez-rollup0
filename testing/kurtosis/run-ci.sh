@@ -138,11 +138,12 @@ cleanup() {
 trap cleanup EXIT
 
 ROOT_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
-PROTOCOL_COMMIT="$(git -C "$REPO/sync-rollups-protocol" rev-parse HEAD)"
+PROTOCOL_COMMIT="$(git -C "$REPO/eez-core-protocol" rev-parse HEAD)"
 sed \
     -e "s|^[[:space:]]*eez_node_image:.*|  eez_node_image: $EEZ_NODE_IMAGE|" \
     -e "s|^[[:space:]]*proof_signer_image:.*|  proof_signer_image: $EEZ_PROOF_SIGNER_IMAGE|" \
     -e "s|^[[:space:]]*deploy_image:.*|  deploy_image: $EEZ_DEPLOY_IMAGE|" \
+    -e "s|^[[:space:]]*enable_explorers:.*|  enable_explorers: false|" \
     "$ARGS_TEMPLATE" >"$KURTOSIS_ARGS_FILE"
 
 bash "$HERE/start.sh" "$KURTOSIS_ARGS_FILE"
@@ -187,7 +188,11 @@ done
 }
 echo "==> network ready: bundle inclusion observed"
 
+echo "==> running native cross-chain wave suite"
 bash "$HERE/scripts/verify-cross-chain-waves.sh"
+
+echo "==> running eez-core-protocol network scenario suite"
+bash "$HERE/scripts/run-protocol-e2e.sh"
 
 capture_service_log eez-proof-signer
 capture_service_log eez-node
@@ -204,6 +209,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         echo "- Proof-signer image: \`$EEZ_PROOF_SIGNER_IMAGE\`"
         echo "- Deploy image: \`$EEZ_DEPLOY_IMAGE\`"
         echo "- Inbound, outbound, mixed, and mixed-pure waves: pass"
+        echo "- Supported protocol network scenarios: pass"
         echo "- Signed windows observed: $signed_window_count"
         echo "- Remote attestations observed: $remote_attestation_count"
         echo "- L1/L2 root divergence: 0"

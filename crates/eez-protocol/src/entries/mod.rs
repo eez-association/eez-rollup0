@@ -1,32 +1,50 @@
 //! Entry construction and ABI encoding for the pinned protocol.
 //!
-//! The current materializer intentionally supports one narrow profile: mutable,
-//! successful, top-level calls with no revert span. Unsupported execution
-//! shapes are rejected before an entry is emitted.
+//! The materializer accepts mutable, successful, top-level calls with no
+//! revert span. It rejects other shapes before emitting entries.
 
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_sol_types::SolCall;
 use tracing::{debug, trace};
 
 use crate::abi::{
-    CrossChainCallSol, ExecutionEntrySol, ExpectedL1ToL2CallSol, ExpectedOutgoingCrossChainCallSol,
-    L2ExecutionEntrySol, L2StaticExecutionEntrySol, L2ToL1CallSol, StaticExecutionEntrySol,
-    loadExecutionTableCall, postAndVerifyBatchCall,
+    CrossChainCallSol, EvmBatch, ExecutionEntrySol, L2ExecutionEntrySol, L2ToL1CallSol,
+    postAndVerifyBatchCall,
 };
 use crate::action::{CallHashInput, CallMode, common_cross_chain_call_hash, l2_outbound_call_hash};
-use crate::batch::EvmBatch;
-use crate::dialect::ChainDialect;
 use crate::{ExecutedAction, ProtocolResult, RollupId, rolling_hash::EntryRollingHash};
 
 const UNSUCCESSFUL_CALL: &str = "unsuccessful cross-chain calls are not supported";
 const STATIC_CALL: &str = "static cross-chain calls are not supported";
 const REVERT_SPAN: &str = "cross-chain call revert spans are not supported";
 const NESTED_CALL: &str = "nested cross-chain calls are not supported";
+const SELF_CALL: &str = "same-chain cross-chain calls are not supported";
 
-/// Reject calls that the current entry profile cannot represent exactly.
+/// Reject calls that the entry profile cannot represent exactly.
+///
+/// Self-calls (source == target) are rejected here as well as at dispatch:
+/// dispatch exempts the entry rollup, so an injected entry-chain self-call
+/// (misconfigured self-proxy) would otherwise materialize.
 pub(crate) fn ensure_materializable_calls(calls: &[ExecutedAction]) -> ProtocolResult<()> {
     for call in calls {
+        if call.source_rollup_id == call.target_rollup_id {
+            return Err(crate::ProtocolErrorKind::Unsupported(SELF_CALL).into());
+        }
         supported_return_data(call)?;
+    }
+    Ok(())
+}
+
+/// Reject calls that did not originate on the batch's source rollup.
+pub(crate) fn ensure_source_side_calls<'a>(
+    calls: impl IntoIterator<Item = &'a ExecutedAction>,
+    source_rollup_id: RollupId,
+) -> ProtocolResult<()> {
+    if calls
+        .into_iter()
+        .any(|call| call.source_rollup_id != source_rollup_id)
+    {
+        return Err(crate::ProtocolErrorKind::Unsupported(NESTED_CALL).into());
     }
     Ok(())
 }
@@ -46,14 +64,8 @@ pub(crate) fn ensure_materializable_calls(calls: &[ExecutedAction]) -> ProtocolR
 #[tracing::instrument(level = "debug", name = "build_batch", skip_all, fields(source = %source_rollup_id), err)]
 pub fn build_batch(
     recorded: &[ExecutedAction],
-    attribution: &crate::SourceAttribution<'_>,
     source_rollup_id: RollupId,
-    raw_tx: &[u8],
 ) -> ProtocolResult<EvmBatch> {
-    // State updates and raw L1 transaction routing are attached by the
-    // settlement path, after this source-side table is built.
-    let _ = (attribution, raw_tx);
-
     ensure_materializable_calls(recorded)?;
     let group = recorded
         .iter()
@@ -62,12 +74,7 @@ pub fn build_batch(
         })
         .collect::<Vec<_>>();
 
-    if group
-        .iter()
-        .any(|call| call.source_rollup_id != source_rollup_id)
-    {
-        return Err(crate::ProtocolErrorKind::Unsupported(NESTED_CALL).into());
-    }
+    ensure_source_side_calls(group.iter().copied(), source_rollup_id)?;
 
     let entries = group
         .into_iter()
@@ -150,10 +157,9 @@ pub(crate) fn build_l1_postbatch(
 /// Finalize every mutable L1 entry after the Composer has attached its ordered
 /// state updates.
 ///
-/// The supported profile is deliberately narrow: every entry must be
-/// successful, have at least one `StateUpdate`, contain no reentrant expected
-/// calls, and contain at most one flat mutable call with no gas limit or revert
-/// span.
+/// Every entry must be successful, have at least one `StateUpdate`, contain no
+/// reentrant expected calls, and contain at most one flat mutable call with no
+/// gas limit or revert span.
 ///
 /// # Errors
 ///
@@ -250,7 +256,7 @@ pub struct IncomingEntry {
     pub l2_rollup_id: RollupId,
     /// Precomputed return data.
     pub return_data: Bytes,
-    /// Precomputed execution outcome; only success is currently supported.
+    /// Precomputed execution outcome; unsuccessful outcomes are rejected.
     pub success: bool,
 }
 
@@ -321,7 +327,7 @@ pub struct OutboundEntry {
     pub l2_rollup_id: RollupId,
     /// Precomputed L1 return data.
     pub return_data: Bytes,
-    /// Precomputed execution outcome; only success is currently supported.
+    /// Precomputed execution outcome; unsuccessful outcomes are rejected.
     pub success: bool,
 }
 
@@ -410,9 +416,10 @@ pub fn build_l1_inbound_entry(
 
 /// Build the target-L2 sidecar used to reconstruct incoming system calls.
 ///
-/// Although carried in the shared L1-shaped batch type, these entries contain
-/// the exact L2 seed and flat-call fold that survives lowering to the L2 ABI.
-pub(crate) fn build_l1_inbound_sidecar(
+/// Although represented by the shared batch type, each entry carries the L2
+/// proxy hash, incoming-call descriptor, and rolling hash needed to reconstruct
+/// the canonical L2 system transaction.
+pub(crate) fn build_inbound_target_entries(
     calls: &[ExecutedAction],
     target_rollup_id: RollupId,
 ) -> ProtocolResult<EvmBatch> {
@@ -520,15 +527,15 @@ pub struct DecodedInbound {
     pub source: Address,
     /// Precomputed return data committed by the entry.
     pub return_data: Bytes,
-    /// Explicit entry outcome. The current supported profile always returns
-    /// `true` and rejects unsuccessful entries.
+    /// Validated entry outcome. Decoding rejects unsuccessful entries, so this
+    /// is always `true`.
     pub success: bool,
 }
 
 /// Decode and validate the supported single-call incoming entry shape.
 ///
-/// The success flag is read directly from the target ABI and checked against
-/// the rolling hash; it is no longer inferred by trying both Boolean values.
+/// The decoder reads `success` from the target ABI and includes it when
+/// verifying the rolling hash.
 #[must_use]
 pub fn decode_inbound(calldata: &[u8]) -> Option<DecodedInbound> {
     let call = crate::abi::executeIncomingCrossChainCallCall::abi_decode(calldata).ok()?;
@@ -585,78 +592,6 @@ pub fn encode_postbatch(batch: &EvmBatch) -> Vec<u8> {
 /// Decode `EEZ.postAndVerifyBatch` calldata.
 pub fn decode_postbatch(calldata: &[u8]) -> alloy_sol_types::Result<EvmBatch> {
     Ok(postAndVerifyBatchCall::abi_decode(calldata)?.batch)
-}
-
-/// Encode a batch for its configured L1 or L2 table-loading dialect.
-#[must_use]
-pub fn encode_table_payload(batch: &EvmBatch, dialect: &ChainDialect) -> Vec<u8> {
-    if dialect.is_zk_poster() {
-        encode_postbatch(batch)
-    } else {
-        encode_load_table(batch)
-    }
-}
-
-/// Lower a shared batch into the exact L2 table ABI and encode it.
-#[must_use]
-pub fn encode_load_table(batch: &EvmBatch) -> Vec<u8> {
-    loadExecutionTableCall {
-        _entries: batch.entries.iter().map(lower_entry_to_l2).collect(),
-        _staticEntries: batch
-            .staticEntries
-            .iter()
-            .map(lower_static_entry_to_l2)
-            .collect(),
-    }
-    .abi_encode()
-}
-
-fn lower_entry_to_l2(entry: &ExecutionEntrySol) -> L2ExecutionEntrySol {
-    L2ExecutionEntrySol {
-        proxyEntryHash: entry.proxyEntryHash,
-        incomingCalls: entry.l2ToL1Calls.iter().map(lower_call_to_l2).collect(),
-        expectedOutgoingCalls: entry
-            .expectedL1ToL2Calls
-            .iter()
-            .map(lower_expected_call_to_l2)
-            .collect(),
-        rollingHash: entry.rollingHash,
-        success: entry.success,
-        returnData: entry.returnData.clone(),
-    }
-}
-
-fn lower_static_entry_to_l2(entry: &StaticExecutionEntrySol) -> L2StaticExecutionEntrySol {
-    L2StaticExecutionEntrySol {
-        proxyEntryHash: entry.proxyEntryHash,
-        incomingCalls: entry.l2ToL1Calls.iter().map(lower_call_to_l2).collect(),
-        rollingHash: entry.rollingHash,
-        success: entry.success,
-        returnData: entry.returnData.clone(),
-    }
-}
-
-fn lower_call_to_l2(call: &L2ToL1CallSol) -> CrossChainCallSol {
-    CrossChainCallSol {
-        revertNextNCalls: call.revertNextNCalls,
-        isStatic: call.isStatic,
-        gas: call.gas,
-        sourceAddress: call.sourceAddress,
-        sourceRollupId: call.sourceRollupId,
-        targetAddress: call.targetAddress,
-        value: call.value,
-        data: call.data.clone(),
-    }
-}
-
-fn lower_expected_call_to_l2(call: &ExpectedL1ToL2CallSol) -> ExpectedOutgoingCrossChainCallSol {
-    ExpectedOutgoingCrossChainCallSol {
-        expectedOutgoingHash: call.expectedL1toL2Hash,
-        incomingCalls: call.l2ToL1Calls.iter().map(lower_call_to_l2).collect(),
-        revertedOrStaticRollingHash: call.revertedOrStaticRollingHash,
-        success: call.success,
-        returnData: call.returnData.clone(),
-    }
 }
 
 fn supported_return_data(call: &ExecutedAction) -> ProtocolResult<&[u8]> {
@@ -725,7 +660,6 @@ fn l1_call_from_action(call: &ExecutedAction) -> L2ToL1CallSol {
     }
 }
 
-/// Hash a source-side action using the supported zero-`callGas` profile.
 fn source_side_call_hash(call: &ExecutedAction) -> B256 {
     common_cross_chain_call_hash(CallHashInput {
         call_mode: call.call_mode,
@@ -748,13 +682,11 @@ fn batch_with_entries(entries: Vec<ExecutionEntrySol>, immediate_count: usize) -
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use alloy_primitives::{I256, address};
 
     use super::*;
-    use crate::abi::{ExpectedStateRootPerRollupSol, StateUpdateSol};
-    use crate::{ExecutionOutcome, SourceAttribution};
+    use crate::ExecutionOutcome;
+    use crate::abi::StateUpdateSol;
 
     fn record(target: RollupId, source: RollupId) -> ExecutedAction {
         ExecutedAction {
@@ -767,20 +699,11 @@ mod tests {
             value: U256::ZERO,
             outcome: ExecutionOutcome::Resolved {
                 return_data: vec![0xab],
-                pre_state_root: [0u8; 32],
-                post_state_root: [1u8; 32],
                 gas_used: 21_000,
                 success: true,
             },
             revert_span: None,
         }
-    }
-
-    fn empty_attribution() -> (
-        HashMap<RollupId, [u8; 32]>,
-        HashMap<RollupId, Vec<[u8; 32]>>,
-    ) {
-        (HashMap::new(), HashMap::new())
     }
 
     fn state_update(rollup_id: u64, current_state: B256) -> StateUpdateSol {
@@ -816,34 +739,18 @@ mod tests {
 
     #[test]
     fn build_batch_rejects_nested_calls() {
-        let (initial, per_tx) = empty_attribution();
-        let attribution = SourceAttribution {
-            initial_roots: &initial,
-            per_tx_roots_by_rollup: &per_tx,
-        };
         let calls = [
             record(RollupId(1), RollupId::MAINNET),
             record(RollupId::MAINNET, RollupId(1)),
         ];
 
-        assert!(build_batch(&calls, &attribution, RollupId::MAINNET, &[]).is_err());
+        assert!(build_batch(&calls, RollupId::MAINNET).is_err());
     }
 
     #[test]
     fn source_l2_entry_is_seed_only_and_uses_gas_aware_key() {
-        let (initial, per_tx) = empty_attribution();
-        let attribution = SourceAttribution {
-            initial_roots: &initial,
-            per_tx_roots_by_rollup: &per_tx,
-        };
         let action = record(RollupId::MAINNET, RollupId(7));
-        let batch = build_batch(
-            std::slice::from_ref(&action),
-            &attribution,
-            RollupId(7),
-            &[],
-        )
-        .unwrap();
+        let batch = build_batch(std::slice::from_ref(&action), RollupId(7)).unwrap();
         let entry = &batch.entries[0];
         let expected_key = l2_outbound_call_hash(
             CallHashInput {
@@ -1084,72 +991,10 @@ mod tests {
     }
 
     #[test]
-    fn l2_lowering_preserves_target_fields_and_static_array() {
-        let nested_call = L2ToL1CallSol {
-            revertNextNCalls: 0,
-            isStatic: false,
-            gas: 0,
-            sourceAddress: Address::ZERO,
-            sourceRollupId: 7,
-            targetAddress: address!("00000000000000000000000000000000000000aa"),
-            value: U256::ZERO,
-            data: Bytes::new(),
-        };
-        let entry = ExecutionEntrySol {
-            proxyEntryHash: B256::with_last_byte(1),
-            l2ToL1Calls: vec![nested_call.clone()],
-            expectedL1ToL2Calls: vec![ExpectedL1ToL2CallSol {
-                expectedL1toL2Hash: B256::with_last_byte(2),
-                l2ToL1Calls: vec![nested_call],
-                revertedOrStaticRollingHash: B256::with_last_byte(3),
-                success: true,
-                returnData: Bytes::from_static(&[4]),
-            }],
-            rollingHash: B256::with_last_byte(5),
-            success: true,
-            returnData: Bytes::from_static(&[6]),
-            ..Default::default()
-        };
-        let static_entry = StaticExecutionEntrySol {
-            expectedStateRoots: vec![ExpectedStateRootPerRollupSol {
-                rollupId: 7,
-                stateRoot: B256::with_last_byte(8),
-            }],
-            proxyEntryHash: B256::with_last_byte(9),
-            l2ToL1Calls: Vec::new(),
-            rollingHash: B256::with_last_byte(10),
-            destinationRollupId: 7,
-            success: true,
-            returnData: Bytes::from_static(&[11]),
-        };
-        let mut batch = EvmBatch::default();
-        batch.entries.push(entry);
-        batch.staticEntries.push(static_entry);
-
-        let calldata = encode_load_table(&batch);
-        let decoded = loadExecutionTableCall::abi_decode(&calldata).unwrap();
-        assert_eq!(decoded._entries.len(), 1);
-        assert_eq!(decoded._entries[0].incomingCalls[0].sourceRollupId, 7);
-        assert_eq!(
-            decoded._entries[0].expectedOutgoingCalls[0].expectedOutgoingHash,
-            B256::with_last_byte(2)
-        );
-        assert!(decoded._entries[0].success);
-        assert_eq!(decoded._staticEntries.len(), 1);
-        assert_eq!(
-            decoded._staticEntries[0].proxyEntryHash,
-            B256::with_last_byte(9)
-        );
-    }
-
-    #[test]
-    fn postbatch_round_trip_and_table_selectors_match() {
+    fn postbatch_round_trip_uses_pinned_selector() {
         let batch = EvmBatch::default();
         let encoded = encode_postbatch(&batch);
         assert_eq!(&encoded[..4], &postAndVerifyBatchCall::SELECTOR);
         assert_eq!(decode_postbatch(&encoded).unwrap().entries.len(), 0);
-
-        let l2 = encode_load_table(&batch);
-        assert_eq!(&l2[..4], &loadExecutionTableCall::SELECTOR);
     }
 }

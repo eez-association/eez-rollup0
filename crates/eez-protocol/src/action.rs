@@ -1,8 +1,8 @@
-//! Cross-chain call-hash and per-rollup state-root slot derivation.
+//! Cross-chain call-hash derivation.
 //!
 //! The protocol formula hashes the call kind, source pair, target pair, value,
-//! call gas, and calldata. Most paths commit zero call gas; calls leaving an
-//! L2 may instead commit the manager-entry `callGas`.
+//! call gas, and calldata. `call_gas` follows the source manager's
+//! `USE_GAS_LEFT` policy: zero when disabled, otherwise manager-entry gas.
 
 use crate::RollupId;
 use alloy_primitives::{Address, B256, U256, keccak256};
@@ -57,9 +57,8 @@ pub struct CallHashInput<'a> {
 
 /// Compute the hash for a call leaving an L2.
 ///
-/// `EEZL2` supplies the manager-entry `call_gas` value to the shared protocol
-/// formula. The supported deployment uses `USE_GAS_LEFT = false`, so
-/// production callers currently pass zero.
+/// `call_gas` must match the source manager's `USE_GAS_LEFT` policy: zero when
+/// disabled, otherwise the observed manager-entry gas.
 #[must_use]
 pub fn l2_outbound_call_hash(input: CallHashInput<'_>, call_gas: u64) -> B256 {
     cross_chain_call_hash(input, call_gas)
@@ -91,34 +90,6 @@ fn cross_chain_call_hash(input: CallHashInput<'_>, call_gas: u64) -> B256 {
         )
             .abi_encode_params(),
     )
-}
-
-/// Storage slot of `mapping(uint64 => RollupConfig) public rollups`
-/// on `EEZ.sol` — slot 2, after `authorizedProxies` (0) and
-/// `rollupCounter` (1). Verify with `forge inspect EEZ storage`.
-const ROLLUPS_MAPPING_SLOT: u8 = 2;
-
-/// Compute the Solidity storage slot for `rollups[rollupId].stateRoot`
-/// on `EEZ.sol`.
-///
-/// The current `RollupConfig` layout is:
-///
-/// ```solidity
-/// struct RollupConfig {
-///     address rollupContract;   // +0
-///     bytes32 stateRoot;        // +1
-///     uint256 etherBalance;     // +2
-/// }
-/// ```
-#[must_use]
-pub fn compute_state_root_slot(rollup_id: RollupId) -> B256 {
-    let mut data = [0u8; 64];
-    // Solidity mapping keys occupy one 32-byte word.
-    data[24..32].copy_from_slice(&rollup_id.0.to_be_bytes());
-    data[63] = ROLLUPS_MAPPING_SLOT;
-    let base = keccak256(data);
-    // `stateRoot` is the second word in `RollupConfig`.
-    B256::from(U256::from_be_bytes(base.0) + U256::from(1))
 }
 
 #[cfg(test)]
@@ -221,31 +192,5 @@ mod tests {
             l2_outbound_call_hash(input, u64::MAX),
             b256!("7f04915c437db6536fe9d746b135ed834b391532e4be8beadd898ad1f592895f")
         );
-    }
-
-    #[test]
-    fn state_root_slot_known_value() {
-        let slot = compute_state_root_slot(RollupId(1));
-        assert_ne!(slot, B256::ZERO);
-        assert_eq!(slot, compute_state_root_slot(RollupId(1)));
-        assert_ne!(
-            compute_state_root_slot(RollupId(1)),
-            compute_state_root_slot(RollupId(2))
-        );
-    }
-
-    #[test]
-    fn state_root_slot_known_value_for_rollup_one() {
-        // Hard-coded oracle: `keccak256(abi.encode(uint256(1),
-        // uint256(2))) + 1` — the slot of `rollups[1].stateRoot`
-        // (`rollups` mapping at slot 2, `stateRoot` at +1). Computed
-        // offline via `cast keccak` so this is an independent witness,
-        // not a re-derivation of the function's own formula; fails
-        // loudly if the mapping slot or `RollupConfig` shape moves.
-        let slot = compute_state_root_slot(RollupId(1));
-        let expected: B256 = "0xe90b7bceb6e7df5418fb78d8ee546e97c83a08bbccc01a0644d599ccd2a7c2e1"
-            .parse()
-            .expect("hex");
-        assert_eq!(slot, expected, "slot {slot} != {expected}");
     }
 }

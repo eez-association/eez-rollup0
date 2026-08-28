@@ -1,13 +1,14 @@
 //! Cross-chain integration and nonce-gap regression tests.
 
-use alloy_primitives::{TxHash, U256};
+use alloy_primitives::{Address, TxHash, U256};
 use alloy_sol_types::SolCall;
 
 mod common;
 use common::{
-    DEV_CHAIN_ID, INBOUND_USER, ISetterWrapper, IValue, IValueNoRet, OUTBOUND_USER, SETTLE_TIMEOUT,
-    batches_posted, l2_balance, l2_value, pending_nonce, receipt_ok, setup_cross_chain,
-    sign_and_send, state_root, value_no_ret, wait_for,
+    ANVIL_KEY_1, DEV_CHAIN_ID, INBOUND_USER, ISetterWrapper, IValue, IValueNoRet, OUTBOUND_USER,
+    ProverMutation, SETTLE_TIMEOUT, assert_latest_batch_signature, batches_posted, l2_balance,
+    l2_value, pending_nonce, receipt_ok, setup_cross_chain, setup_cross_chain_proxied,
+    sign_and_send, signer_address, state_root, value_no_ret, wait_for,
 };
 
 const WAVE_SETTERS: &[u64] = &[7, 11, 17];
@@ -17,25 +18,37 @@ const WAVE_DEPOSITS: &[u128] = &[
     3_000_000_000_000_000,
 ];
 
-/// The embedded bundle path preserves order but is not atomic like rbuilder,
-/// so every submitted valid transaction must be verified independently.
-async fn assert_all_transactions_succeeded(rpc_url: &str, hashes: &[TxHash], label: &str) {
+async fn assert_all_transactions_succeeded(
+    w: &common::CrossChainWorld,
+    rpc_url: &str,
+    hashes: &[TxHash],
+    label: &str,
+) {
     assert!(!hashes.is_empty(), "no {label} transactions were submitted");
     for &hash in hashes {
-        let rpc_url = rpc_url.to_owned();
-        let status = wait_for(SETTLE_TIMEOUT, move || {
-            let rpc_url = rpc_url.clone();
-            async move { receipt_ok(&rpc_url, hash).await }
-        })
-        .await
-        .unwrap_or_else(|err| panic!("{label} transaction {hash} did not land: {err:#}"));
+        let landed = wait_for(
+            SETTLE_TIMEOUT,
+            || async move { receipt_ok(rpc_url, hash).await },
+        )
+        .await;
+        let status = match landed {
+            Ok(status) => status,
+            Err(err) => {
+                panic!(
+                    "{label} transaction {hash} did not land: {err:#}{}",
+                    w.settlement_diagnostics()
+                );
+            }
+        };
         assert!(status, "{label} transaction {hash} reverted");
     }
 }
 
-/// Runs one transaction in each direction through the full node pipeline.
+/// Exercises one real signed and derived transaction in each direction.
+/// The final signature check covers the recomputed public-input hash from L1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn minimal_bidirectional_cross_chain_smoke() {
+    let attester = signer_address(ANVIL_KEY_1).unwrap();
     let w = setup_cross_chain().await.unwrap();
     let l1_rpc = w.l1_rpc();
     let l2_rpc = w.l2_rpc();
@@ -71,35 +84,27 @@ async fn minimal_bidirectional_cross_chain_smoke() {
     .await
     .expect("outbound smoke transaction must be admitted");
 
-    assert_all_transactions_succeeded(&l1_rpc, &[inbound], "inbound smoke").await;
-    assert_all_transactions_succeeded(&l2_rpc, &[outbound], "outbound smoke").await;
-
-    wait_for(SETTLE_TIMEOUT, || {
-        let l2_rpc = l2_rpc.clone();
-        async move { Ok((l2_value(&l2_rpc, w.value_l2).await? == U256::from(41u64)).then_some(())) }
-    })
-    .await
-    .expect("inbound smoke effect did not reach L2");
-    wait_for(SETTLE_TIMEOUT, || {
-        let l1_rpc = l1_rpc.clone();
-        async move {
-            Ok((l2_value(&l1_rpc, w.outbound_value).await? == U256::from(43u64)).then_some(()))
-        }
-    })
-    .await
-    .expect("outbound smoke effect did not reach L1");
+    assert_all_transactions_succeeded(&w, &l1_rpc, &[inbound], "inbound smoke").await;
+    assert_all_transactions_succeeded(&w, &l2_rpc, &[outbound], "outbound smoke").await;
 
     let (eez, rollup_id) = (w.cfg.eez_address, w.cfg.rollup_id);
-    wait_for(SETTLE_TIMEOUT, || {
+    let converged = wait_for(SETTLE_TIMEOUT, || {
         let (l1_rpc, l2_rpc) = (l1_rpc.clone(), l2_rpc.clone());
         async move {
+            let inbound_applied = l2_value(&l2_rpc, w.value_l2).await? == U256::from(41u64);
+            let outbound_applied = l2_value(&l1_rpc, w.outbound_value).await? == U256::from(43u64);
             let l1_root = state_root(&l1_rpc, eez, rollup_id).await?;
             let l2_root = common::safe_block_state_root(&l2_rpc).await?;
-            Ok(l2_root.filter(|root| *root == l1_root).map(|_| ()))
+            Ok((inbound_applied && outbound_applied && l2_root == Some(l1_root)).then_some(()))
         }
     })
-    .await
-    .expect("minimal smoke never reconciled L1 and L2 safe state roots");
+    .await;
+    if let Err(err) = converged {
+        panic!(
+            "minimal smoke did not settle both directions: {err:#}{}",
+            w.settlement_diagnostics(),
+        );
+    }
 
     assert!(
         batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
@@ -108,20 +113,120 @@ async fn minimal_bidirectional_cross_chain_smoke() {
             >= 1,
         "minimal smoke must post at least one batch",
     );
-    assert_eq!(
-        w.node.log_count_matching(&["local L2 state root"]).unwrap(),
-        0,
-        "minimal smoke must not diverge",
-    );
+    assert_latest_batch_signature(&l1_rpc, &w.dep, attester)
+        .await
+        .expect("posted proof must recover over the recomputed public-input hash");
     assert_eq!(
         w.node.log_count_matching(&["evicting"]).unwrap(),
         0,
         "valid smoke transactions must not be evicted",
     );
+    w.node.assert_no_divergence_failure_logs();
+}
+
+async fn assert_real_signer_rejects(mutation: ProverMutation, tampered_input: &str) {
+    let attester = signer_address(ANVIL_KEY_1).unwrap();
+    let w = setup_cross_chain_proxied(mutation, attester).await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let proxy = w.prover_proxy.as_ref().expect("real signer proxy");
+
+    // A signer rejection distinguishes validation from a stalled proof path.
+    let rejected = wait_for(SETTLE_TIMEOUT, || async {
+        Ok((proxy.rejections() >= 1).then_some(()))
+    })
+    .await;
+    if rejected.is_err() {
+        w.proof_signer.assert_alive();
+        assert_ne!(
+            proxy.attempts(),
+            0,
+            "composer never proved a window, so tampered {tampered_input} was never exercised",
+        );
+        panic!(
+            "signer accepted tampered {tampered_input}: {} attempts, {} attested",
+            proxy.attempts(),
+            proxy.successes(),
+        );
+    }
+    let batches_after_rejection = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
+        .await
+        .unwrap();
+    let root_after_rejection = state_root(&l1_rpc, w.cfg.eez_address, w.cfg.rollup_id)
+        .await
+        .unwrap();
+    wait_for(SETTLE_TIMEOUT, || async {
+        Ok((proxy.rejections() >= 2).then_some(()))
+    })
+    .await
+    .expect("composer did not retry the rejected proof window");
+    assert_eq!(
+        batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
+            .await
+            .unwrap(),
+        batches_after_rejection,
+        "batch count advanced while the signer repeatedly rejected tampered {tampered_input}",
+    );
+    assert_eq!(
+        state_root(&l1_rpc, w.cfg.eez_address, w.cfg.rollup_id)
+            .await
+            .unwrap(),
+        root_after_rejection,
+        "state root advanced while the signer repeatedly rejected tampered {tampered_input}",
+    );
+    w.proof_signer.assert_alive();
     w.node.assert_no_process_death();
 }
 
-/// Runs mixed waves with direct, no-return, wrapper, and value-transfer calls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_signer_rejects_tampered_post_batch_calldata() {
+    assert_real_signer_rejects(ProverMutation::PostBatch, "PostBatch calldata").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_signer_rejects_tampered_witness() {
+    assert_real_signer_rejects(ProverMutation::Witness, "witness").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_signer_attester_mismatch_never_submits_a_batch() {
+    let wrong_attester = Address::repeat_byte(0x44);
+    let w = setup_cross_chain_proxied(ProverMutation::None, wrong_attester)
+        .await
+        .unwrap();
+    let proxy = w.prover_proxy.as_ref().expect("real signer proxy");
+    // Successful responses prove that rejection occurs in the composer.
+    let attested = wait_for(SETTLE_TIMEOUT, || async {
+        Ok((proxy.successes() >= 2).then_some(()))
+    })
+    .await;
+    if let Err(err) = attested {
+        w.proof_signer.assert_alive();
+        panic!("signer never returned the mismatched attestations: {err:#}");
+    }
+    assert_eq!(
+        proxy.rejections(),
+        0,
+        "the signer must have attested; only the composer may refuse here",
+    );
+
+    assert_eq!(
+        batches_posted(&w.l1_rpc(), w.cfg.eez_address, w.dep.deploy_block)
+            .await
+            .unwrap(),
+        0,
+        "an attestation from an unexpected signer must never reach L1",
+    );
+    assert_eq!(
+        state_root(&w.l1_rpc(), w.cfg.eez_address, w.cfg.rollup_id)
+            .await
+            .unwrap(),
+        w.cfg.initial_state,
+        "signer mismatch must leave the registered state root unchanged",
+    );
+    w.node.assert_no_process_death();
+}
+
+/// Exercises mixed bidirectional calls and transfers over repeated waves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mixed_cross_chain_wave_matrix_over_bundle() {
     let w = setup_cross_chain().await.unwrap();
@@ -234,12 +339,14 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
         }
 
         assert_all_transactions_succeeded(
+            &w,
             &l1_rpc,
             &inbound_hashes[inbound_wave_start..],
             "inbound wave",
         )
         .await;
         assert_all_transactions_succeeded(
+            &w,
             &l2_rpc,
             &outbound_hashes[outbound_wave_start..],
             "outbound wave",
@@ -259,44 +366,30 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
         "every outbound wave operation must be submitted",
     );
 
-    let final_value = l2_value(&l2_rpc, w.value_l2).await.unwrap();
-    assert_eq!(
-        final_value,
-        U256::from(*WAVE_SETTERS.last().unwrap() + 100),
-        "inbound wrapper setter converged",
-    );
-    wait_for(SETTLE_TIMEOUT, || {
-        let l1_rpc = l1_rpc.clone();
+    // Source receipts prove admission; destination effects arrive after settlement.
+    let setter_final = U256::from(*WAVE_SETTERS.last().unwrap() + 100);
+    let no_ret_final = U256::from(*WAVE_SETTERS.last().unwrap() + 200);
+    let recipient_final = recipient_before + U256::from(deposit_sum);
+    let withdrawal_final = withdrawal_before + U256::from(deposit_sum);
+    let effects_converged = wait_for(SETTLE_TIMEOUT, || {
+        let (l1_rpc, l2_rpc) = (l1_rpc.clone(), l2_rpc.clone());
         async move {
-            Ok((l2_value(&l1_rpc, w.outbound_value).await?
-                == U256::from(*WAVE_SETTERS.last().unwrap() + 100))
-            .then_some(()))
+            let converged = l2_value(&l2_rpc, w.value_l2).await? == setter_final
+                && l2_value(&l1_rpc, w.outbound_value).await? == setter_final
+                && value_no_ret(&l2_rpc, w.inbound_no_ret).await? == no_ret_final
+                && value_no_ret(&l1_rpc, w.outbound_no_ret).await? == no_ret_final
+                && l2_balance(&l2_rpc, w.recipient).await? == recipient_final
+                && l2_balance(&l1_rpc, w.withdrawal_recipient).await? == withdrawal_final;
+            Ok(converged.then_some(()))
         }
     })
-    .await
-    .expect("outbound setter did not converge on L1");
-    assert_eq!(
-        value_no_ret(&l2_rpc, w.inbound_no_ret).await.unwrap(),
-        U256::from(*WAVE_SETTERS.last().unwrap() + 200),
-        "inbound no-return setter converged",
-    );
-    assert_eq!(
-        value_no_ret(&l1_rpc, w.outbound_no_ret).await.unwrap(),
-        U256::from(*WAVE_SETTERS.last().unwrap() + 200),
-        "outbound no-return setter converged",
-    );
-
-    let recipient_after = l2_balance(&l2_rpc, w.recipient).await.unwrap();
-    assert_eq!(
-        recipient_after,
-        recipient_before + U256::from(deposit_sum),
-        "deposits converged",
-    );
-    assert_eq!(
-        l2_balance(&l1_rpc, w.withdrawal_recipient).await.unwrap(),
-        withdrawal_before + U256::from(deposit_sum),
-        "withdrawals converged on L1",
-    );
+    .await;
+    if let Err(err) = effects_converged {
+        panic!(
+            "cross-chain wave effects did not converge: {err:#}{}",
+            w.settlement_diagnostics(),
+        );
+    }
 
     let (eez, rollup_id) = (w.cfg.eez_address, w.cfg.rollup_id);
     wait_for(SETTLE_TIMEOUT, || {
@@ -319,11 +412,6 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
         WAVE_SETTERS.len(),
     );
 
-    assert_eq!(
-        w.node.log_count_matching(&["local L2 state root"]).unwrap(),
-        0,
-        "zero state-root divergence events",
-    );
     assert_eq!(
         w.node
             .log_count_matching(&["user_tx evicted after"])
@@ -352,5 +440,5 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
         0,
         "composer must not fall back to eth_sendRawTransaction",
     );
-    w.node.assert_no_process_death();
+    w.node.assert_no_divergence_failure_logs();
 }

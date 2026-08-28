@@ -58,10 +58,8 @@ mimalloc           = "0.1"
 clap               = { version = "4", features = ["derive"] }
 
 # reth — pinned to mediocregopher/partial-persistence-clean tip (contains the receipts-reorg truncation fix).
-reth-chain-state                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-chainspec                  = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-cli                        = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-cli-runner                 = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-db                         = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-engine-primitives          = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-ethereum-cli               = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
@@ -120,13 +118,11 @@ alloy-network          = { version = "2", default-features = false }
 alloy-primitives       = { version = "1", default-features = false }
 alloy-provider         = { version = "2", default-features = false, features = ["reqwest"] }
 alloy-rlp              = { version = "0.3", features = ["derive"] }
-alloy-rpc-client       = { version = "2", default-features = false }
 alloy-rpc-types-engine = { version = "2", default-features = false }
 alloy-rpc-types-eth    = { version = "2", default-features = false }
 alloy-signer           = { version = "2", default-features = false }
 alloy-signer-local     = { version = "2", default-features = false }
 alloy-sol-types        = { version = "1", default-features = false }
-alloy-transport-http   = { version = "2", default-features = false }
 fail                   = "0.5"
 k256                   = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 url                    = "2"
@@ -138,7 +134,6 @@ serde_json             = "1"
 # jsonrpsee — used by eez-node's TxIngress middleware (eth_sendRawTransaction override).
 # Pinned to whatever reth's pinned rev uses; cargo resolves the right minor.
 jsonrpsee              = { version = "0.26", features = ["server", "macros"] }
-tower                  = { version = "0.5", features = ["util"] }
 
 # internal crates
 eez-composer       = { path = "crates/eez-composer" }
@@ -150,13 +145,54 @@ eez-payload-codec  = { path = "crates/eez-payload-codec" }
 eez-protocol       = { path = "crates/eez-protocol" }
 eez-prover         = { path = "crates/eez-prover" }
 
-[profile.release]
-lto = "thin"
-codegen-units = 1
-debug = 1
-
+# Profiles copied from reth (paradigmxyz/reth Cargo.toml), minus its
+# hivetests/reproducible CI profiles. `release` is the fast-to-build
+# default (the Docker images use it); `maxperf` is reth's
+# production-release profile when top runtime speed is worth the
+# build time; `profiling` keeps symbols for perf tooling.
 [profile.dev]
+# https://davidlattimore.github.io/posts/2024/02/04/speeding-up-the-rust-edit-build-run-cycle.html
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+# Not in reth: this workspace predates the copy and keeps opt-level 1
+# so a dev-built node stays usable for local runs.
 opt-level = 1
+
+# Speed up tests.
+[profile.dev.package]
+proptest.opt-level = 3
+rand_chacha.opt-level = 3
+rand_xorshift.opt-level = 3
+unarray.opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+debug = "none"
+strip = "symbols"
+panic = "unwind"
+codegen-units = 16
+
+# Use the `--profile profiling` flag to show symbols in release mode.
+# e.g. `cargo build --profile profiling`
+[profile.profiling]
+inherits = "release"
+debug = "full"
+strip = "none"
+
+# Include debug info in benchmarks too.
+[profile.bench]
+inherits = "profiling"
+
+[profile.maxperf]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+[profile.maxperf-symbols]
+inherits = "maxperf"
+debug = "full"
+strip = "none"
 
 [workspace.lints.rust]
 ambiguous_negative_literals  = "warn"

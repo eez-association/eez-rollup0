@@ -19,7 +19,7 @@
 //!
 //! # Spec anchors
 //!
-//! The shapes here mirror the upstream `sync-rollups-protocol`
+//! The shapes here mirror the upstream `eez-core-protocol`
 //! Solidity contracts (not vendored in this repo); the
 //! `publicInputsHash` fold and on-chain `_validateStructure` are
 //! the construction this plan is shaped to feed.

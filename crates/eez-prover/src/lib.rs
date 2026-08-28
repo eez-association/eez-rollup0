@@ -29,6 +29,50 @@ use thiserror::Error;
 /// Result alias.
 pub type ProverResult<T> = Result<T, ProverError>;
 
+/// A transient proving failure for which the complete operation may be retried.
+///
+/// These variants are the transport-independent form of the Composer profile's
+/// retryable gRPC status allowlist. Prover implementations in any process or
+/// language map their wire status into this enum before returning through the
+/// [`Prover`] trait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum RetryableProverError {
+    /// The prover or its transport is temporarily unavailable.
+    #[error("UNAVAILABLE")]
+    Unavailable,
+    /// The proving attempt exceeded its deadline.
+    #[error("DEADLINE_EXCEEDED")]
+    DeadlineExceeded,
+    /// The attempt was aborted because its state or snapshot changed.
+    #[error("ABORTED")]
+    Aborted,
+}
+
+/// A proof rejection that identifies one held cross-chain candidate.
+///
+/// The Composer may remove the identified candidate and rebuild. Other proof
+/// failures deliberately remain ordinary backend errors and must not trigger
+/// eviction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ActionableProverFailure {
+    /// The terminal Sync block contains the poisoned outbound user transaction.
+    #[error("outbound transaction {transaction_index} ({transaction_hash})")]
+    Outbound {
+        /// Zero-based position of the original user transaction in the Sync block.
+        transaction_index: usize,
+        /// Canonical signed transaction hash, equal to `HeldTx.hash`.
+        transaction_hash: B256,
+    },
+    /// The posted batch contains the poisoned inbound effect entry.
+    #[error("inbound entry {entry_index} ({entry_hash})")]
+    Inbound {
+        /// Zero-based position in `PostBatch.entries`.
+        entry_index: usize,
+        /// Keccak256 of the canonical `ExecutionEntrySol` ABI encoding.
+        entry_hash: B256,
+    },
+}
+
 /// Error returned by [`Prover::prove`].
 #[derive(Debug, Error)]
 pub enum ProverError {
@@ -38,6 +82,42 @@ pub enum ProverError {
     /// The proving backend (remote daemon, witness source, …) failed.
     #[error("prover backend: {0}")]
     Backend(String),
+    /// The prover rejected one attributable cross-chain candidate.
+    #[error("actionable prover rejection ({failure}): {message}")]
+    Actionable {
+        /// Candidate identity the Composer may safely resolve and remove.
+        failure: ActionableProverFailure,
+        /// Diagnostic detail; callers MUST NOT parse it for classification.
+        message: String,
+    },
+    /// A transient failure that permits retrying the complete proving operation.
+    #[error("retryable prover error ({kind}): {message}")]
+    Retryable {
+        /// Canonical retry classification.
+        kind: RetryableProverError,
+        /// Diagnostic detail; callers MUST NOT parse it for classification.
+        message: String,
+    },
+}
+
+impl ProverError {
+    /// Return the canonical retry classification, if this error is retryable.
+    #[must_use]
+    pub const fn retryable_kind(&self) -> Option<RetryableProverError> {
+        match self {
+            Self::Retryable { kind, .. } => Some(*kind),
+            Self::Signer(_) | Self::Backend(_) | Self::Actionable { .. } => None,
+        }
+    }
+
+    /// Return an attributable candidate rejection, if present.
+    #[must_use]
+    pub const fn actionable_failure(&self) -> Option<ActionableProverFailure> {
+        match self {
+            Self::Actionable { failure, .. } => Some(*failure),
+            Self::Signer(_) | Self::Backend(_) | Self::Retryable { .. } => None,
+        }
+    }
 }
 
 /// One settling-window block the prover re-executes: its consensus RLP plus

@@ -138,6 +138,7 @@ fn settlement_pipeline_errors_have_stable_rpc_mappings() {
         let status = error.status();
         assert_eq!(status.code(), Code::FailedPrecondition);
         assert_eq!(status.message(), "settlement validation rejected");
+        assert!(status.details().is_empty());
     }
 
     let invalid_evidence_errors = [
@@ -288,9 +289,10 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
         ..Default::default()
     };
     let block = reth_ethereum_primitives::Block::new(Default::default(), body);
+    let block_rlp = alloy_rlp::encode(block);
     let settling_block = validate::ValidatedBlock::for_test(
         5,
-        alloy_rlp::encode(block),
+        block_rlp.clone(),
         validate::SettlementBlockEvidence::for_test(vec![true], Vec::new()),
     );
 
@@ -322,7 +324,7 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
         test_system_transaction_reconstructor(expected_rollup_id(1));
 
     let run = run_settlement(SettlementInput {
-        submitted_post_batch_calldata: calldata,
+        submitted_post_batch_calldata: calldata.clone(),
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
         expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -333,6 +335,160 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
     });
 
     assert_eq!(run.unwrap().into_inner(), expected_hash);
+
+    let reverted_block = validate::ValidatedBlock::for_test(
+        5,
+        block_rlp,
+        validate::SettlementBlockEvidence::for_test(vec![true], Vec::new()),
+    );
+    let reverted = validated_single_block(reverted_block, vec![false], checkpoints.to_vec());
+    let error = run_settlement(SettlementInput {
+        submitted_post_batch_calldata: calldata,
+        validated_window: &reverted,
+        expected_rollup_id: expected_rollup_id(1),
+        expected_l2_system_address: TEST_SYSTEM_ADDRESS,
+        proof_system_vkey: test_proof_system_vkey(),
+        expected_proof_system: test_proof_system(),
+        system_transaction_reconstructor: &system_transaction_reconstructor,
+        cancellation: &cancellation,
+    })
+    .unwrap_err();
+    assert_eq!(error.gate(), "inbound_effects");
+    let status = error.status();
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    let failure = eez_control_rpc::decode_prove_failure(status.details()).unwrap();
+    let prove_failure::ActionableFailure::Inbound(inbound) = failure.actionable_failure.unwrap()
+    else {
+        panic!("reverted inbound must return an inbound failure");
+    };
+    assert_eq!(inbound.entry_index, 1);
+    assert_eq!(
+        inbound.entry_hash,
+        keccak256(batch.entries[1].abi_encode()).as_slice()
+    );
+}
+
+#[test]
+fn a_reverted_outbound_load_reports_the_paired_user_transaction() {
+    let (batch, block_rlp, user, _call_hash) = canonical_outbound_case();
+    let settling_block = validate::ValidatedBlock::for_test(
+        5,
+        block_rlp,
+        validate::SettlementBlockEvidence::for_test(vec![true, false], Vec::new()),
+    );
+    let validated = validated_single_block(
+        settling_block,
+        vec![false, true],
+        vec![checkpoint(1, B256::ZERO)],
+    );
+    let cancellation = CancellationToken::default();
+    let system_transaction_reconstructor =
+        test_system_transaction_reconstructor(expected_rollup_id(1));
+
+    let error = run_settlement(SettlementInput {
+        submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&batch),
+        validated_window: &validated,
+        expected_rollup_id: expected_rollup_id(1),
+        expected_l2_system_address: TEST_SYSTEM_ADDRESS,
+        proof_system_vkey: test_proof_system_vkey(),
+        expected_proof_system: test_proof_system(),
+        system_transaction_reconstructor: &system_transaction_reconstructor,
+        cancellation: &cancellation,
+    })
+    .unwrap_err();
+
+    assert_eq!(error.gate(), "block_inspection");
+    let status = error.status();
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    let failure = eez_control_rpc::decode_prove_failure(status.details()).unwrap();
+    let prove_failure::ActionableFailure::Outbound(outbound) = failure.actionable_failure.unwrap()
+    else {
+        panic!("reverted load must return an outbound failure");
+    };
+    assert_eq!(outbound.transaction_index, 1);
+    assert_eq!(outbound.transaction_hash, keccak256(user).as_slice());
+}
+
+#[test]
+fn an_outbound_observation_failure_reports_the_user_transaction() {
+    let (batch, block_rlp, user, _call_hash) = canonical_outbound_case();
+    let settling_block = validate::ValidatedBlock::for_test(
+        5,
+        block_rlp,
+        validate::SettlementBlockEvidence::for_test(vec![true, false], Vec::new()),
+    );
+    let validated = validated_single_block(
+        settling_block,
+        vec![true, true],
+        vec![checkpoint(1, B256::ZERO)],
+    );
+    let cancellation = CancellationToken::default();
+    let system_transaction_reconstructor =
+        test_system_transaction_reconstructor(expected_rollup_id(1));
+
+    let error = run_settlement(SettlementInput {
+        submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&batch),
+        validated_window: &validated,
+        expected_rollup_id: expected_rollup_id(1),
+        expected_l2_system_address: TEST_SYSTEM_ADDRESS,
+        proof_system_vkey: test_proof_system_vkey(),
+        expected_proof_system: test_proof_system(),
+        system_transaction_reconstructor: &system_transaction_reconstructor,
+        cancellation: &cancellation,
+    })
+    .unwrap_err();
+
+    assert_eq!(error.gate(), "outbound_effects");
+    let status = error.status();
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    let failure = eez_control_rpc::decode_prove_failure(status.details()).unwrap();
+    let prove_failure::ActionableFailure::Outbound(outbound) = failure.actionable_failure.unwrap()
+    else {
+        panic!("missing outbound observation must return an outbound failure");
+    };
+    assert_eq!(outbound.transaction_index, 1);
+    assert_eq!(outbound.transaction_hash, keccak256(user).as_slice());
+}
+
+#[test]
+fn an_outbound_claim_hash_mismatch_remains_non_actionable() {
+    let (mut batch, block_rlp, _user, call_hash) = canonical_outbound_case();
+    batch.entries[1].l2ToL1Calls[0].data = Bytes::from_static(b"different claim");
+    let settling_block = validate::ValidatedBlock::for_test(
+        5,
+        block_rlp,
+        validate::SettlementBlockEvidence::for_test(
+            vec![true, false],
+            vec![validate::OutboundEventObservation::decoded_for_test(
+                1, 0, call_hash, 0,
+            )],
+        ),
+    );
+    let validated = validated_single_block(
+        settling_block,
+        vec![true, true],
+        vec![checkpoint(1, B256::ZERO)],
+    );
+    let cancellation = CancellationToken::default();
+    let system_transaction_reconstructor =
+        test_system_transaction_reconstructor(expected_rollup_id(1));
+
+    let error = run_settlement(SettlementInput {
+        submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&batch),
+        validated_window: &validated,
+        expected_rollup_id: expected_rollup_id(1),
+        expected_l2_system_address: TEST_SYSTEM_ADDRESS,
+        proof_system_vkey: test_proof_system_vkey(),
+        expected_proof_system: test_proof_system(),
+        system_transaction_reconstructor: &system_transaction_reconstructor,
+        cancellation: &cancellation,
+    })
+    .unwrap_err();
+
+    assert_eq!(error.gate(), "outbound_effects");
+    let status = error.status();
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(status.details().is_empty());
 }
 
 #[test]

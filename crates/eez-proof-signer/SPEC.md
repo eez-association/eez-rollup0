@@ -6,7 +6,7 @@ This document specifies the behavior of `eez-proof-signer` for the currently
 supported single-rollup profile. It is intentionally narrower than the complete
 EEZ protocol.
 
-The protocol source used by this profile is the `sync-rollups-protocol`
+The protocol source used by this profile is the `eez-core-protocol`
 submodule at commit
 `6fcc90b65063831cb7797e9fa361004064d28f9f`. Stateless execution uses
 `eez-association/stateless` at commit
@@ -177,7 +177,7 @@ declared block.
 ### 4.1 Single-flight execution
 
 Exactly one request may be admitted at a time. A second request MUST be
-rejected immediately with `ResourceExhausted`; it MUST NOT wait while holding an
+rejected immediately with `Unavailable`; it MUST NOT wait while holding an
 open stream.
 
 The active-request slot remains held through validation, settlement, signing,
@@ -723,13 +723,63 @@ messages SHOULD remain stable and must not expose secrets.
 | --- | --- |
 | `InvalidArgument` | Malformed stream structure; invalid widths or bounds; noncanonical/invalid PostBatch calldata; malformed or trailing DA payload. |
 | `FailedPrecondition` | Rollup identity mismatch; Stateless input rejection; unsupported batch profile; state/effect/inbound/outbound/DA semantic rejection. |
-| `ResourceExhausted` | Another request is active; a decoding, block, byte, witness-item, or checkpoint limit was exceeded; or block-vector storage could not be reserved. |
+| `Unavailable` | Another request is active. The same complete request may succeed after the active request releases the slot. |
+| `ResourceExhausted` | A decoding, block, byte, witness-item, or checkpoint limit was exceeded; or block-vector storage could not be reserved. |
 | `DeadlineExceeded` | Stream idle timeout or absolute request deadline. |
 | `Cancelled` | Cooperative stop after request cancellation. |
 | `Internal` | Backend-success output violates its contract; local invariant failure; impossible public-input computation/cardinality; reconstruction failures attributable to already validated internal evidence; signing failure. |
 
 A malformed candidate that could otherwise disappear from consideration MUST
 be retained and rejected at its authorization gate.
+
+### 14.1 Actionable failed preconditions
+
+A `FailedPrecondition` response MAY carry one protobuf-encoded `ProveFailure`
+in the gRPC status-details field when the validated execution identifies one
+cross-chain candidate that the Composer can safely remove. The status code,
+not the details payload, remains authoritative for retry classification.
+
+`ProveFailure.actionable_failure` has exactly two supported variants:
+
+- `OutboundFailure` identifies the original signed L2 user transaction by its
+  zero-based index in the terminal Sync block and its canonical 32-byte
+  transaction hash. When the preceding synthetic load transaction reverted,
+  the failure still identifies the paired user transaction; rebuilding the
+  Sync block regenerates or removes both halves together.
+- `InboundFailure` identifies the claimed effect by its zero-based index in
+  `PostBatch.entries` and the 32-byte keccak hash of that entry's canonical ABI
+  encoding. The original signed L1 transaction is not present in the proof
+  request, so the Composer MUST resolve it through the request-local
+  entry-to-held-transaction mapping retained during composition.
+
+The signer MUST attach an outbound detail only when validated terminal-block
+execution safely identifies the original user transaction: a reverted
+canonical synthetic load/user pair, or a positioned outbound observation
+failure attributable to the user transaction. It MUST attach an inbound detail
+only for a positioned inbound delivery transaction that reverted. Structural,
+ordering, envelope, claim-only, missing-candidate, extra-observation, DA, and
+state-chain failures MUST remain non-actionable even when their diagnostic
+contains an index. A mismatch between a claimed entry's call hash and an
+execution observation is claim-only in both directions and MUST remain
+non-actionable.
+
+Before changing pool state, the Composer MUST verify both fields against the
+exact rejected request: index and transaction hash for outbound, or index and
+canonical entry hash for inbound. Empty, malformed, unknown, wrong-width, or
+mismatched details MUST be handled as an ordinary non-actionable rejection.
+The Composer MUST NOT retry an unchanged request after an actionable failure.
+It MAY remove the resolved held transaction and its same-sender,
+same-direction nonce suffix, then rebuild and submit a smaller batch within the
+remaining slot budget. This recovery does not authorize bisection or eviction
+for failures that carry no valid typed detail.
+
+The index-and-hash checks bind an actionable detail to the rejected request;
+they do not independently prove that the reported execution failure occurred.
+The Composer therefore trusts its configured prover not to falsely attribute a
+failure. A buggy or compromised prover can cause valid held transactions and
+their nonce suffixes to be evicted, requiring users to resubmit. Authenticating
+the Composer-prover transport prevents response injection but does not remove
+this configured-prover trust.
 
 ## 15. Conformance and change control
 
@@ -750,6 +800,8 @@ A compatible implementation MUST test at least:
 - outbound event provenance, canonical encoding, zero-`callGas` hash, L1
   rolling hash, ordering, source, and value;
 - exact DA projection, sidecars, and mixed Sync-block reconstruction;
+- actionable outbound/inbound failure attribution, reference validation, and
+  non-actionable fallback;
 - public-input vectors against the pinned Solidity formula; and
 - raw-digest ECDSA recovery, low-`s`, and `v` encoding.
 
@@ -1010,7 +1062,7 @@ The principal sources for this specification are:
 - `src/attest.rs` and `../eez-protocol/src/signer.rs` for attestation;
 - `../eez-protocol/src/abi.rs`, `action.rs`, `rolling_hash.rs`,
   `public_inputs.rs`, and `system_tx.rs` for shared protocol mirrors; and
-- `../../sync-rollups-protocol/src/interfaces/IEEZ.sol`, `EEZ.sol`,
+- `../../eez-core-protocol/src/interfaces/IEEZ.sol`, `EEZ.sol`,
   `src/interfaces/IEEZL2.sol`, `src/L2/EEZL2.sol`, and
   `src/rollupContract/Rollup.sol` for pinned protocol behavior; and
 - `../../contracts/src/ECDSAProofSystem.sol` for the deployed ECDSA verifier.

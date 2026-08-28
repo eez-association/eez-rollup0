@@ -41,17 +41,21 @@ pub mod held_pool;
 pub mod ingress;
 pub mod local;
 pub mod optimistic;
+mod prover_retry;
 pub mod rollup;
 
 #[doc(inline)]
 pub use composer::{Composer, CrossChainExecCtx};
 #[doc(inline)]
-pub use held_pool::{HeldPool, HeldTx};
+pub use held_pool::{AdmissionError, HeldPool, HeldTx};
 #[doc(inline)]
 pub use ingress::Direction;
 
 #[doc(inline)]
-pub use local::{BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient, build_sync_block};
+pub use local::{
+    BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient, LocalComposeClients,
+    build_sync_block,
+};
 pub use optimistic::OptimisticallyIncluded;
 #[doc(inline)]
 pub use rollup::{RollupConfig, RollupState};

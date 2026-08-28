@@ -81,9 +81,34 @@ work unit, not by the polling interval of the async runtime.
 If the RPC deadline expires after the blocking task starts, the request future
 returns but the worker continues until it reaches a cancellation boundary or
 completes first. It still owns the request permit, so an immediate retry
-receives `ResourceExhausted`. This is transient capacity, not persisted protocol
+receives `Unavailable`. This is transient capacity, not persisted protocol
 state: once the worker exits and a retry is admitted, the window is evaluated
 from scratch.
+
+## Actionable settlement rejection
+
+Most settlement rejections are deliberately non-actionable: Composer retains
+the held transactions and falls back to its normal recovery path. A safely
+attributable `FailedPrecondition` instead carries one typed `ProveFailure` in
+the status details:
+
+```text
+outbound -> terminal Sync-block user tx index + signed tx hash
+inbound  -> PostBatch entry index + canonical entry hash
+```
+
+Composer accepts the hint only after both references match the exact rejected
+request. An outbound reference directly resolves the outbound held
+transaction; its preceding synthetic load is regenerated with the Sync block.
+An inbound reference resolves through the entry-to-held-transaction mapping
+that Composer retained while merging inbound source entries.
+
+The resolved transaction and its same-sender, same-direction nonce suffix are
+evicted. Composer then reruns simulation, Sync-block construction, settlement
+stitching, witness collection, and proving with the remaining candidates. Each
+attempt removes at least one candidate, so same-slot recomposition is bounded;
+the normal exact-slot proof cutoff still applies. The unchanged rejected
+request is never sent through the transient retry loop.
 
 ## Graceful shutdown
 

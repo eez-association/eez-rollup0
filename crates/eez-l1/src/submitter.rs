@@ -85,6 +85,15 @@ impl std::fmt::Debug for Submitter {
     }
 }
 
+/// What the L1 source can currently serve. See [`Submitter::readiness`].
+#[derive(Debug, Clone, Copy)]
+pub struct L1Readiness {
+    /// Highest block number the source will serve.
+    pub head_block_number: u64,
+    /// Advisory: an endpoint that refuses `eth_syncing` reads as not-syncing.
+    pub syncing: bool,
+}
+
 impl Submitter {
     /// Build a Submitter from its config.
     #[must_use]
@@ -265,6 +274,92 @@ impl Submitter {
             .map(|b| b.header.hash))
     }
 
+    /// Whether the source serves `block`'s header, logs, and tx bodies — the
+    /// three things the batch scan reads.
+    ///
+    /// # Errors
+    ///
+    /// [`L1Error::Provider`] on RPC failure.
+    pub async fn serves_history(&self, block: u64) -> L1Result<bool> {
+        let provider = self.inner.build_provider();
+        let header = provider
+            .get_block_by_number(BlockNumberOrTag::Number(block))
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_block_by_number({block}): {e}")))?;
+        if header.is_none() {
+            return Ok(false);
+        }
+        let filter = alloy_rpc_types_eth::Filter::new()
+            .from_block(block)
+            .to_block(block)
+            .address(self.inner.config.eez);
+        // Result discarded: this asks whether eth_getLogs works at all (some
+        // endpoints restrict it), not whether the block has events.
+        provider
+            .get_logs(&filter)
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_logs probe at {block}: {e}")))?;
+        // The scan reads bodies only by (block hash, index), so a source that
+        // prunes them passes the probes above and stalls boot later.
+        // `None` here just means an empty block.
+        let header = header.expect("checked above");
+        provider
+            .get_transaction_by_block_hash_and_index(header.header.hash, 0)
+            .await
+            .map_err(|e| L1Error::Provider(format!("tx-by-index probe at {block}: {e}")))?;
+        Ok(true)
+    }
+
+    /// Chain id the configured L1 RPC serves.
+    ///
+    /// # Errors
+    ///
+    /// [`L1Error::Provider`] on RPC failure.
+    pub async fn chain_id(&self) -> L1Result<u64> {
+        self.inner
+            .build_provider()
+            .get_chain_id()
+            .await
+            .map_err(|e| L1Error::Provider(format!("eth_chainId: {e}")))
+    }
+
+    /// L1 head, and whether the node reports itself syncing.
+    ///
+    /// # Errors
+    ///
+    /// [`L1Error::Provider`] when the head is unreadable.
+    pub async fn readiness(&self) -> L1Result<L1Readiness> {
+        let provider = self.inner.build_provider();
+        let head = provider
+            .get_block_number()
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_block_number: {e}")))?;
+        let syncing = provider
+            .syncing()
+            .await
+            .is_ok_and(|s| !matches!(s, alloy_rpc_types_eth::SyncStatus::None));
+        Ok(L1Readiness {
+            head_block_number: head,
+            syncing,
+        })
+    }
+
+    /// The L1 source's finalized block `(number, hash)`, or `None` when the
+    /// source reports no finalized block yet (fresh embedded chiado before
+    /// the CL's first FCU; dev chains without a CL).
+    ///
+    /// # Errors
+    ///
+    /// [`L1Error::Provider`] on RPC failure.
+    pub async fn finalized_block(&self) -> L1Result<Option<(u64, alloy_primitives::B256)>> {
+        let provider = self.inner.build_provider();
+        Ok(provider
+            .get_block_by_number(BlockNumberOrTag::Finalized)
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_block(finalized): {e}")))?
+            .map(|b| (b.header.number, b.header.hash)))
+    }
+
     /// Timestamp of an L1 block on the target chain, or `None` if absent.
     /// Distinguishes a skipped-slot drop from a genuine exclusion.
     pub async fn block_timestamp(&self, number: u64) -> L1Result<Option<u64>> {
@@ -329,8 +424,15 @@ impl Inner {
         .await
         {
             Ok(()) => {
-                self.observe(post_batch_hash, target_block, expected_final_state)
-                    .await
+                // Relay path: the builder honors the min/max timestamp pin, so
+                // an Exact target's `pin_timestamp` unlocks the early verdict.
+                self.observe(
+                    post_batch_hash,
+                    target_block,
+                    pin_timestamp,
+                    expected_final_state,
+                )
+                .await
             }
             Err(L1Error::BundleRpcUnsupported) => {
                 event!(
@@ -366,7 +468,9 @@ impl Inner {
                         );
                     }
                 }
-                self.observe(post_batch_hash, target_block, expected_final_state)
+                // No bundle API, no timestamp pin: these txs can genuinely land
+                // in a later block, so the conservative rule is the only one.
+                self.observe(post_batch_hash, target_block, None, expected_final_state)
                     .await
             }
             Err(other) => Err(other),
@@ -379,10 +483,14 @@ impl Inner {
     /// target produced false `Dropped` verdicts), then derive
     /// `state_applied` from the inclusion block's `L2ExecutionPerformed`
     /// events via [`Self::settlement_in_block`].
+    ///
+    /// `pinned` is the timestamp pin, set only for an [`BundleTarget::Exact`]
+    /// bundle the relay accepted — those get the early verdict below.
     async fn observe(
         &self,
         tx_hash: TxHash,
         target_block: u64,
+        pin_timestamp: Option<u64>,
         expected_final_state: Option<alloy_primitives::B256>,
     ) -> L1Result<SendOutcome> {
         // Failure must mean PROVABLY DEAD, not merely slow. A bundle is
@@ -397,6 +505,9 @@ impl Inner {
         // would re-open the false-death window. If the tip later reorgs
         // the bundle in, downstream converges it (Watcher → Deriver →
         // recovery cursor re-check drops the stale verdict).
+        //
+        // `pinned` buys a slot without weakening that: min == max timestamp
+        // leaves one satisfiable height, so the block there decides it.
         let start = tokio::time::Instant::now();
         let target_provider = self.build_target_provider();
         let mut slow_logged = false;
@@ -418,23 +529,46 @@ impl Inner {
                         state_applied,
                     });
                 }
-                Ok(None) => match target_provider.get_block_number().await {
-                    Ok(head) if head > target_block => {
-                        return Ok(dropped(
-                            tx_hash,
-                            target_block,
-                            "target block passed without inclusion",
-                        ));
+                Ok(None) => {
+                    let verdict = match pin_timestamp {
+                        Some(pin_ts) => {
+                            pinned_slot_check(&target_provider, target_block, tx_hash, pin_ts).await
+                        }
+                        None => PinnedVerdict::Pending,
+                    };
+                    match verdict {
+                        PinnedVerdict::Excluded => {
+                            return Ok(dropped(
+                                tx_hash,
+                                target_block,
+                                "pinned slot built without inclusion",
+                            ));
+                        }
+                        PinnedVerdict::SlotSkipped => {
+                            return Ok(dropped(tx_hash, target_block, "pinned slot skipped"));
+                        }
+                        // Our tx IS in the pinned block; only the receipt read
+                        // trails it. Poll on, skipping the head rule.
+                        PinnedVerdict::Included => {}
+                        PinnedVerdict::Pending => match target_provider.get_block_number().await {
+                            Ok(head) if head > target_block => {
+                                return Ok(dropped(
+                                    tx_hash,
+                                    target_block,
+                                    "target block passed without inclusion",
+                                ));
+                            }
+                            Ok(_) => {}
+                            Err(err) => event!(
+                                name: "eez.submitter.observe.head_read_failed",
+                                Level::WARN,
+                                tx_hash = %tx_hash,
+                                error = %err,
+                                "head read failed during bundle observation; retrying",
+                            ),
+                        },
                     }
-                    Ok(_) => {}
-                    Err(err) => event!(
-                        name: "eez.submitter.observe.head_read_failed",
-                        Level::WARN,
-                        tx_hash = %tx_hash,
-                        error = %err,
-                        "head read failed during bundle observation; retrying",
-                    ),
-                },
+                }
                 Err(err) => event!(
                     name: "eez.submitter.observe.receipt_read_failed",
                     Level::WARN,
@@ -574,6 +708,68 @@ async fn post_bundle(
     Ok(())
 }
 
+/// Verdict for a relay-submitted, timestamp-pinned bundle, read off the
+/// canonical block at the pinned height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinnedVerdict {
+    /// Height not built (or not visible) yet — no verdict.
+    Pending,
+    /// Our postBatch is in it; the receipt follows.
+    Included,
+    /// Built without us; atomic bundles land in that block or nowhere.
+    Excluded,
+    /// Another timestamp filled the height. Timestamps strictly increase, so
+    /// no later block can satisfy `minTimestamp == maxTimestamp == pin_ts`.
+    SlotSkipped,
+}
+
+/// `block` is `(timestamp, contains our tx)` at the pinned height, `None` while
+/// unobservable. Inclusion outranks a timestamp mismatch — in is in.
+fn pinned_verdict(block: Option<(u64, bool)>, pin_ts: u64) -> PinnedVerdict {
+    match block {
+        None => PinnedVerdict::Pending,
+        Some((_, true)) => PinnedVerdict::Included,
+        Some((ts, false)) if ts == pin_ts => PinnedVerdict::Excluded,
+        Some(_) => PinnedVerdict::SlotSkipped,
+    }
+}
+
+/// Read the canonical block at the pinned height (hashes only) and apply
+/// [`pinned_verdict`]. RPC failures yield `Pending`, never a verdict.
+async fn pinned_slot_check<P: Provider>(
+    provider: &P,
+    target_block: u64,
+    tx_hash: TxHash,
+    pin_ts: u64,
+) -> PinnedVerdict {
+    match provider
+        .get_block_by_number(BlockNumberOrTag::Number(target_block))
+        .hashes()
+        .await
+    {
+        Ok(block) => pinned_verdict(
+            block.map(|b| {
+                (
+                    b.header.timestamp,
+                    b.transactions.hashes().any(|h| h == tx_hash),
+                )
+            }),
+            pin_ts,
+        ),
+        Err(err) => {
+            event!(
+                name: "eez.submitter.observe.pinned_block_read_failed",
+                Level::WARN,
+                tx_hash = %tx_hash,
+                target_block,
+                error = %err,
+                "pinned block read failed during bundle observation; retrying",
+            );
+            PinnedVerdict::Pending
+        }
+    }
+}
+
 fn dropped(tx_hash: TxHash, target_block: u64, reason: &'static str) -> SendOutcome {
     event!(
         name: "eez.submitter.bundle.dropped",
@@ -586,5 +782,43 @@ fn dropped(tx_hash: TxHash, target_block: u64, reason: &'static str) -> SendOutc
     SendOutcome::Dropped {
         tx_hash,
         target_block,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PinnedVerdict, pinned_verdict};
+
+    const PIN: u64 = 1_700_000_012;
+
+    #[test]
+    fn pinned_verdict_covers_every_arm() {
+        for (case, block, want) in [
+            ("height unbuilt", None, PinnedVerdict::Pending),
+            (
+                "block carries our tx",
+                Some((PIN, true)),
+                PinnedVerdict::Included,
+            ),
+            (
+                "pinned slot built without us",
+                Some((PIN, false)),
+                PinnedVerdict::Excluded,
+            ),
+            (
+                "timestamp mismatch",
+                Some((PIN + 5, false)),
+                PinnedVerdict::SlotSkipped,
+            ),
+            // Inclusion is the stronger fact: a builder that ignored the pin
+            // still settled us, so never call that height a skip.
+            (
+                "included despite mismatch",
+                Some((PIN + 5, true)),
+                PinnedVerdict::Included,
+            ),
+        ] {
+            assert_eq!(pinned_verdict(block, PIN), want, "{case}");
+        }
     }
 }

@@ -26,7 +26,8 @@ use da::encoded_bytes_match;
 use inbound::inspect_inbound_candidate;
 
 pub(crate) use blocks::{
-    BlockInspectionError, inspect_validated_settling_block, verify_validated_intermediate_blocks,
+    BlockInspectionError, inspect_validated_settling_block, paired_outbound_transaction,
+    transaction_hash_at, verify_validated_intermediate_blocks,
 };
 #[cfg(test)]
 pub(crate) use blocks::{

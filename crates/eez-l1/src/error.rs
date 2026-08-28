@@ -12,9 +12,13 @@ pub enum L1Error {
     /// Bad / missing env var, malformed URL, etc.
     #[error("configuration error: {0}")]
     Config(String),
-    /// Anything that went wrong talking to L1 (RPC transport, contract call decode).
+    /// Anything that went wrong talking to L1 (RPC transport, JSON-RPC error).
     #[error("L1 provider error: {0}")]
     Provider(String),
+    /// On-chain BYTES we cannot decode. Deterministic, so callers fail loudly
+    /// rather than loop. A malformed RPC *response* is `Provider`, not this.
+    #[error("L1 decode error: {0}")]
+    Decode(String),
     /// L1 exposed canonical metadata but not all data needed to decode
     /// or replay it yet. This is expected while a local L1 source is
     /// warming up and should be retried by boot reconciliation.
@@ -50,5 +54,21 @@ impl L1Error {
     #[must_use]
     pub const fn is_source_incomplete(&self) -> bool {
         matches!(self, Self::SourceIncomplete { .. })
+    }
+
+    /// True for a transport failure (DNS, TCP, HTTP) — the peer never answered,
+    /// so it says nothing about the payload we sent. Decode failures are NOT
+    /// transport: they are deterministic and never clear on retry.
+    #[must_use]
+    pub const fn is_transport(&self) -> bool {
+        matches!(self, Self::Provider(_))
+    }
+
+    /// True when retrying re-reads the same bytes or re-walks the same chain,
+    /// so a polling caller would spin forever instead of failing. Both arms
+    /// document operator intervention; this is what makes that real.
+    #[must_use]
+    pub const fn is_terminal(&self) -> bool {
+        matches!(self, Self::Decode(_) | Self::ReorgTooDeep { .. })
     }
 }
