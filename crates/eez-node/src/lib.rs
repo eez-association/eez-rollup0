@@ -1,21 +1,11 @@
-//! Shared launcher for the explicit eez Rollup-0 node-role binaries.
+//! Launcher for the production eez Composer node.
 //!
 //! Wraps reth with our composer stack: reth provides the EVM, storage,
 //! networking, RPC, and engine; we provide block production
 //! (Sequencer + Scheduler), L1 anchoring (`L1Watcher` + Deriver), and
 //! batch submission (Composer umbrella).
 //!
-//! # Roles
-//!
-//! Role selection belongs to the executable, not to incidental environment
-//! variable presence:
-//!
-//! - `eez-composer`: L1-anchored sequencing, proving, posting, and cross-chain ingress.
-//! - `eez-follower`: L1-derived replay with an optional unsafe-head RPC overlay.
-//! - `eez-dev-node`: unanchored interval sequencing for local development.
-
 mod bundle_rpc;
-mod follower;
 mod ingress;
 mod l1_embedded;
 mod witness_source;
@@ -23,36 +13,28 @@ mod witness_source;
 use std::{collections::HashMap, env, str::FromStr, sync::Arc, time::Duration};
 
 use alloy_primitives::{Address, B256};
-use alloy_provider::{Provider as _, RootProvider};
+use alloy_provider::Provider as _;
 use alloy_signer_local::PrivateKeySigner;
-use clap::Parser as _;
 use eez_composer::composer::CrossChainWiring;
 use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
 use eez_deriver::Deriver;
 use eez_driver::{
     BlockCommitterHandle, DEFAULT_MAX_SPECULATIVE_DEPTH, EthAttributesBuilder, RollupTiming,
-    Sequencer, SyncSlotComposerHandle, spawn_interval, spawn_l1_anchored,
+    Sequencer, SyncSlotComposerHandle, spawn_l1_anchored,
 };
 use eez_l1::{
-    L1CanonicalHead, L1HeadStream, L1Reader, L1ReaderConfig, L1Watcher, L1WatcherConfig, Submitter,
-    SubmitterConfig,
+    L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
+};
+use eez_node_common::{
+    EezPayloadBuilder, L2NodeBuilder, NoRoleArgs, node_cli, wait_for_l1_ready,
+    warn_on_deprecated_env,
 };
 use eez_prover::MockEcdsaProver;
-use mimalloc::MiMalloc;
-use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
-use reth_node_builder::{NodeBuilder, WithLaunchContext, components::BasicPayloadServiceBuilder};
+use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
+use reth_node_builder::components::BasicPayloadServiceBuilder;
 use reth_node_ethereum::EthereumNode;
 use tokio::sync::mpsc;
 use tracing::{Level, event};
-
-use follower::UnsafeHeadFollower;
-
-mod payload;
-use payload::EezPayloadBuilder;
-
-/// Per M-MIMALLOC-APPS — meaningful win on allocation-heavy workloads.
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
 
 const BOOT_CATCH_UP_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
@@ -101,63 +83,9 @@ enum EmbeddedL1<Ethereum, Chiado> {
     Chiado(Chiado),
 }
 
-/// Composer and development nodes have no role-specific CLI arguments.
-#[derive(clap::Args, Debug, Clone)]
-struct NoRoleArgs {}
-
-/// Follower-specific CLI arguments layered on top of reth's CLI.
-#[derive(clap::Args, Debug, Clone)]
-struct FollowerArgs {
-    /// Sequencer JSON-RPC URL. In follower mode this enables the
-    /// optional unsafe-head overlay; safe/finalized remain L1-derived.
-    #[arg(long, env = "EEZ_SEQUENCER_RPC")]
-    sequencer_rpc: Option<url::Url>,
-}
-
 /// Launch a production composer node.
 pub fn run_composer() -> eyre::Result<()> {
     node_cli::<NoRoleArgs>()?.run(launch_composer)
-}
-
-/// Launch an L1-derived follower node.
-pub fn run_follower() -> eyre::Result<()> {
-    node_cli::<FollowerArgs>()?.run(launch_follower)
-}
-
-/// Launch an unanchored local-development sequencer.
-pub fn run_dev_node() -> eyre::Result<()> {
-    node_cli::<NoRoleArgs>()?.run(launch_dev_node)
-}
-
-type L2NodeBuilder =
-    WithLaunchContext<NodeBuilder<reth_db::DatabaseEnv, reth_chainspec::ChainSpec>>;
-
-fn node_cli<Ext>() -> eyre::Result<Cli<EthereumChainSpecParser, Ext>>
-where
-    Ext: clap::Args + std::fmt::Debug,
-{
-    let _ = dotenvy::dotenv();
-    let _ = dotenvy::from_filename("deployments.env");
-
-    if std::env::var_os("RUST_BACKTRACE").is_none() {
-        // SAFETY: set during single-threaded startup before any other thread is spawned.
-        unsafe {
-            std::env::set_var("RUST_BACKTRACE", "1");
-        }
-    }
-
-    // Engine API FCUs may intentionally unwind the L2 head during recovery.
-    let mut argv: Vec<String> = std::env::args().collect();
-    for flag in [
-        "--engine.always-process-payload-attributes-on-canonical-head",
-        "--engine.allow-unwind-canonical-header",
-    ] {
-        if !argv.iter().any(|a| a == flag) {
-            argv.push(flag.to_owned());
-        }
-    }
-
-    Ok(Cli::<EthereumChainSpecParser, Ext>::try_parse_from(argv)?)
 }
 
 fn composer_proving_from_env() -> eyre::Result<ComposerProving> {
@@ -203,225 +131,6 @@ fn composer_proving_from_env() -> eyre::Result<ComposerProving> {
             Err(eyre::eyre!("EEZ_PROVER_URL contains non-UTF-8 bytes"))
         }
     }
-}
-
-async fn launch_dev_node(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Result<()> {
-    event!(
-        name: "eez.node.launching",
-        Level::INFO,
-        mode = "standalone",
-        "launching eez development node",
-    );
-    warn_on_deprecated_env();
-
-    let handle = builder
-        .with_types::<EthereumNode>()
-        .with_components(
-            EthereumNode::components().payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder)),
-        )
-        .with_add_ons(reth_node_ethereum::node::EthereumAddOns::default())
-        .launch_with_debug_capabilities()
-        .await?;
-
-    let chain_spec: Arc<_> = handle.node.chain_spec();
-    let timing = if env::var_os("EEZ_L2_BLOCK_TIME_MS").is_some() {
-        let timing = RollupTiming::from_env()?;
-        event!(
-            name: "eez.node.timing.standalone_configured",
-            Level::INFO,
-            l2_block_time_ms = timing.l2_block_time().as_millis(),
-            "standalone mode — using configured RollupTiming",
-        );
-        timing
-    } else {
-        event!(
-            name: "eez.node.timing.standalone_default",
-            Level::INFO,
-            "standalone mode — using default RollupTiming (L2=2s); set EEZ_*_TIME_MS to override",
-        );
-        RollupTiming::standalone_default()
-    };
-    let block_committer = BlockCommitterHandle::spawn_from_provider(
-        &handle.node.provider,
-        handle.node.add_ons_handle.beacon_engine_handle.clone(),
-        handle.node.payload_builder_handle.clone(),
-        None,
-    )?;
-    let sequencer = Sequencer::standalone(
-        EthAttributesBuilder::new(chain_spec),
-        block_committer,
-        spawn_interval(timing.l2_block_time()),
-        timing,
-    );
-    event!(
-        name: "eez.node.sequencer.spawned",
-        Level::INFO,
-        mode = "standalone",
-        "spawning eez sequencer",
-    );
-    handle
-        .node
-        .task_executor
-        .spawn_critical_task("eez-sequencer", async move {
-            sequencer.run().await;
-        });
-
-    handle.wait_for_node_exit().await
-}
-
-async fn launch_follower(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
-    event!(
-        name: "eez.node.launching",
-        Level::INFO,
-        mode = "follower",
-        "launching eez follower",
-    );
-    warn_on_deprecated_env();
-
-    let handle = builder
-        .with_types::<EthereumNode>()
-        .with_components(
-            EthereumNode::components().payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder)),
-        )
-        .with_add_ons(reth_node_ethereum::node::EthereumAddOns::default())
-        .launch_with_debug_capabilities()
-        .await?;
-
-    let chain_spec: Arc<_> = handle.node.chain_spec();
-    let provider = handle.node.provider.clone();
-    let task_executor = handle.node.task_executor.clone();
-    let timing = RollupTiming::from_env()?;
-    let l1_head = Arc::new(L1CanonicalHead::default());
-
-    let block_committer = BlockCommitterHandle::spawn_from_provider(
-        &provider,
-        handle.node.add_ons_handle.beacon_engine_handle.clone(),
-        handle.node.payload_builder_handle.clone(),
-        None,
-    )?;
-
-    let l1_reader_config = L1ReaderConfig::from_env()?;
-    let deploy_block = l1_reader_config.deploy_block;
-    let l1_reader = L1Reader::new(l1_reader_config);
-    let l1_watcher = L1Watcher::new(L1WatcherConfig::from_env()?);
-    let system_tx_cfg = build_follower_system_tx_cfg(&chain_spec)?;
-    event!(
-        name: "eez.node.follower.system_tx_cfg",
-        Level::INFO,
-        enabled = system_tx_cfg.is_some(),
-        "cross-chain system tx reconstruction config loaded",
-    );
-
-    let deriver = Deriver::new(
-        block_committer.clone(),
-        Arc::new(provider.clone()),
-        l1_reader.clone(),
-        chain_spec,
-        timing.l2_block_time().as_secs(),
-        deploy_block,
-        Arc::clone(&l1_head),
-        system_tx_cfg,
-    );
-
-    wait_for_l1_ready(&l1_reader, deploy_block, read_l1_chain_id()?).await?;
-
-    let mut retry_delay = BOOT_CATCH_UP_INITIAL_RETRY_DELAY;
-    let mut attempts = 0_u64;
-    let mut transport_failures = 0_u32;
-    let (l1_seed_number, l1_seed_hash) = loop {
-        match deriver.catch_up_with_seed().await {
-            Ok(seed) => break seed,
-            Err(err)
-                if err.is_l1_transport() && {
-                    transport_failures += 1;
-                    transport_failures >= BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES
-                } =>
-            {
-                event!(
-                    name: "eez.node.deriver.boot_catch_up.transport_exhausted",
-                    Level::ERROR,
-                    mode = "follower",
-                    transport_failures,
-                    error = %err,
-                    "L1 transport kept failing during boot catch-up; the endpoint is likely refusing a call we need, not merely unreachable",
-                );
-                return Err(eyre::eyre!(
-                    "boot-time deriver catch_up gave up after {transport_failures} L1 transport failures: {err}"
-                ));
-            }
-            Err(err) if err.is_source_incomplete() || err.is_l1_transport() => {
-                attempts += 1;
-                event!(
-                    name: "eez.node.deriver.boot_catch_up.source_incomplete",
-                    Level::WARN,
-                    mode = "follower",
-                    attempts,
-                    retry_delay_secs = retry_delay.as_secs(),
-                    error = %err,
-                    "boot-time catch_up could not read all L1 source data yet; retrying before starting L1-active tasks",
-                );
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = Duration::from_secs(
-                    retry_delay
-                        .as_secs()
-                        .saturating_mul(2)
-                        .min(BOOT_CATCH_UP_MAX_RETRY_DELAY.as_secs()),
-                );
-            }
-            Err(err) => {
-                event!(
-                    name: "eez.node.deriver.boot_catch_up.failed",
-                    Level::ERROR,
-                    mode = "follower",
-                    error = %err,
-                    "boot-time catch_up failed; refusing to start L1-active tasks before reconciliation",
-                );
-                return Err(eyre::eyre!("boot-time deriver catch_up failed: {err}"));
-            }
-        }
-    };
-
-    event!(
-        name: "eez.node.deriver.spawned",
-        Level::INFO,
-        mode = "follower",
-        initial_posted_through = deriver.cursor(),
-        "spawning eez deriver",
-    );
-    let deriver_events = l1_watcher.subscribe();
-    task_executor.spawn_critical_task("eez-deriver", async move {
-        deriver.run(deriver_events).await;
-    });
-
-    if let Some(sequencer_rpc) = ext.sequencer_rpc {
-        let follower = UnsafeHeadFollower::new(
-            block_committer,
-            RootProvider::new_http(sequencer_rpc),
-            provider,
-            timing.l2_block_time(),
-        );
-        event!(
-            name: "eez.node.follower.sequencer_rpc.spawned",
-            Level::INFO,
-            "spawning sequencer-RPC unsafe-head follower",
-        );
-        task_executor.spawn_critical_task("eez-node-follower-unsafe-head", async move {
-            follower.run().await;
-        });
-    } else {
-        event!(
-            name: "eez.node.follower.l1_derived_only",
-            Level::INFO,
-            "EEZ_SEQUENCER_RPC not set; running L1-derived-only follower",
-        );
-    }
-
-    task_executor.spawn_critical_task(
-        "eez-l1-watcher",
-        l1_watcher.polling(l1_seed_number, l1_seed_hash),
-    );
-
-    handle.wait_for_node_exit().await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -562,7 +271,8 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     let handle = builder
         .with_types::<EthereumNode>()
         .with_components(
-            EthereumNode::components().payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder)),
+            EthereumNode::components()
+                .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder::default())),
         )
         .with_add_ons(reth_node_ethereum::node::EthereumAddOns::default())
         .launch_with_debug_capabilities()
@@ -1066,137 +776,6 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     handle.wait_for_node_exit().await
 }
 
-/// Blocks until L1 serves our history: head at or past the deploy block, with
-/// that block's header, logs, and tx bodies readable. An L1 that stops making
-/// progress fails here instead of hanging.
-async fn wait_for_l1_ready(
-    l1_reader: &L1Reader,
-    deploy_block: u64,
-    expected_l1_chain_id: u64,
-) -> eyre::Result<()> {
-    const POLL: Duration = Duration::from_secs(2);
-    const STALLED_POLLS: u32 = 450; // 15 min with no progress
-    const MAX_POLLS: u32 = 3_600; // 2 h overall, even while it claims to sync
-
-    let mut best_remaining = u64::MAX;
-    let mut stalled = 0_u32;
-    let mut waited = 0_u32;
-    let mut last_err: Option<String> = None;
-    let mut chain_verified = false;
-
-    loop {
-        if !chain_verified {
-            match l1_reader.chain_id().await {
-                Ok(actual) if actual != expected_l1_chain_id => {
-                    return Err(eyre::eyre!(
-                        "EEZ_L1_RPC_URL serves chain {actual}, expected {expected_l1_chain_id}"
-                    ));
-                }
-                Ok(_) => chain_verified = true,
-                Err(err) => last_err = Some(format!("eth_chainId: {err}")),
-            }
-        }
-
-        let (progressing, status) = match l1_reader.readiness().await {
-            Err(err) => {
-                last_err = Some(err.to_string());
-                (false, format!("unreachable: {err}"))
-            }
-            Ok(state) if state.head_block_number < deploy_block => {
-                let remaining = deploy_block - state.head_block_number;
-                let closer = remaining < best_remaining;
-                best_remaining = best_remaining.min(remaining);
-                (closer, format!("{remaining} blocks below the deploy block"))
-            }
-            Ok(state) => match l1_reader.serves_history(deploy_block).await {
-                Ok(true) if chain_verified => {
-                    event!(
-                        name: "eez.node.l1_ready",
-                        Level::INFO,
-                        head = state.head_block_number,
-                        deploy_block,
-                        "L1 source can serve our history",
-                    );
-                    return Ok(());
-                }
-                Ok(true) => (false, "chain id not read yet".to_string()),
-                Ok(false) => (state.syncing, "does not serve the deploy block".to_string()),
-                Err(err) => {
-                    last_err = Some(err.to_string());
-                    (false, format!("history probe failed: {err}"))
-                }
-            },
-        };
-
-        stalled = if progressing { 0 } else { stalled + 1 };
-        waited += 1;
-        if waited <= 1 || waited.is_multiple_of(30) {
-            event!(
-                name: "eez.node.l1_not_ready",
-                Level::WARN,
-                deploy_block,
-                stalled_polls = stalled,
-                status,
-                "waiting for L1 to serve our history",
-            );
-        }
-        if stalled >= STALLED_POLLS || waited >= MAX_POLLS {
-            let cause = last_err.unwrap_or(status);
-            return Err(eyre::eyre!(
-                "L1 never became able to serve block {deploy_block}: {cause}"
-            ));
-        }
-        tokio::time::sleep(POLL).await;
-    }
-}
-
-/// Build a `SystemTxContext` for follower mode from env (the follower
-/// has no Composer to feed the composer-mode projection). Returns
-/// `Ok(None)` when cross-chain env isn't present → pure-user-tx follower
-/// mode. Reads `EEZ_L2_SYSTEM_KEY` / `EEZL2_ADDRESS` /
-/// `EEZ_ROLLUP_ID`; the `l2_gas_price` (1 gwei) and `l2_gas_limit` (2M)
-/// defaults mirror composer-mode so reconstructed system txs are
-/// byte-identical.
-///
-/// # Errors
-///
-/// `eyre::Error` for malformed env values; missing required vars →
-/// `Ok(None)`.
-fn build_follower_system_tx_cfg<ChainSpec>(
-    chain_spec: &ChainSpec,
-) -> eyre::Result<Option<eez_protocol::system_tx::SystemTxContext>>
-where
-    ChainSpec: reth_chainspec::EthChainSpec,
-{
-    let system_key = match env::var("EEZ_L2_SYSTEM_KEY") {
-        Ok(system_key) => system_key,
-        Err(env::VarError::NotPresent) => return Ok(None),
-        Err(env::VarError::NotUnicode(_)) => {
-            return Err(eyre::eyre!("EEZ_L2_SYSTEM_KEY contains non-UTF-8 bytes"));
-        }
-    };
-    let eezl2_address_str = env::var("EEZL2_ADDRESS")
-        .map_err(|_| eyre::eyre!("EEZL2_ADDRESS required when EEZ_L2_SYSTEM_KEY is set"))?;
-    let rollup_id_str = env::var("EEZ_ROLLUP_ID")
-        .map_err(|_| eyre::eyre!("EEZ_ROLLUP_ID required when EEZ_L2_SYSTEM_KEY is set"))?;
-
-    let system_signer =
-        PrivateKeySigner::from_bytes(&B256::from_str(system_key.trim_start_matches("0x"))?)?;
-    let eezl2_address: Address = Address::from_str(&eezl2_address_str)?;
-    let this_rollup_id: u64 = rollup_id_str
-        .parse()
-        .map_err(|e| eyre::eyre!("EEZ_ROLLUP_ID malformed: {e}"))?;
-
-    Ok(Some(eez_protocol::system_tx::SystemTxContext {
-        system_signer,
-        eezl2_address,
-        l2_chain_id: chain_spec.chain().id(),
-        l2_gas_price: L2_SYSTEM_TX_GAS_PRICE,
-        l2_gas_limit: L2_SYSTEM_TX_GAS_LIMIT,
-        this_rollup_id,
-    }))
-}
-
 /// Read the L1 rollup id from env. Defaults to `0` to match the bridge
 /// E2E fixture's `MAINNET_ROLLUP_ID` only when the variable is absent.
 fn read_l1_rollup_id() -> eyre::Result<u64> {
@@ -1216,17 +795,6 @@ fn parse_l1_rollup_id(raw: Option<&str>) -> eyre::Result<u64> {
     raw.trim()
         .parse::<u64>()
         .map_err(|e| eyre::eyre!("EEZ_L1_ROLLUP_ID={raw:?} malformed: {e}"))
-}
-
-/// Required for followers: guessing would either assert the wrong source
-/// chain or silently skip the configured RPC's identity check.
-fn read_l1_chain_id() -> eyre::Result<u64> {
-    let value = env::var("EEZ_L1_CHAIN_ID").map_err(|err| {
-        eyre::eyre!("EEZ_L1_CHAIN_ID is required (the L1 chain id this node derives from): {err}")
-    })?;
-    value
-        .parse::<u64>()
-        .map_err(|err| eyre::eyre!("EEZ_L1_CHAIN_ID={value:?} malformed: {err}"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1378,23 +946,6 @@ fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
         jwtsecret,
         trusted_peers,
     })
-}
-
-fn warn_on_deprecated_env() {
-    for name in [
-        "EEZ_COMPOSER_INTERVAL_SECS",
-        "EEZ_SEQUENCER_DISABLED",
-        "EEZ_COMPOSER_DISABLED",
-    ] {
-        if env::var_os(name).is_some() {
-            event!(
-                name: "eez.node.env.deprecated",
-                Level::WARN,
-                env = name,
-                "env var is ignored; select the node role with the eez-composer, eez-follower, or eez-dev-node executable."
-            );
-        }
-    }
 }
 
 #[cfg(test)]

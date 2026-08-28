@@ -12,6 +12,7 @@ eez-composer.workspace      = true
 eez-deriver.workspace       = true
 eez-driver.workspace        = true
 eez-l1.workspace            = true
+eez-node-common = { workspace = true, features = ["l1-startup"] }
 eez-protocol.workspace      = true
 eez-prover.workspace        = true
 eez-prover-client.workspace = true
@@ -21,8 +22,6 @@ reth-chainspec.workspace                  = true
 reth-cli.workspace                        = true
 reth-db.workspace                         = true
 reth-ethereum-cli.workspace               = true
-reth-ethereum-engine-primitives.workspace = true
-reth-ethereum-payload-builder.workspace   = true
 reth-ethereum-primitives.workspace        = true
 reth-evm.workspace                        = true
 reth-evm-ethereum.workspace               = true
@@ -31,11 +30,9 @@ reth-node-api.workspace                   = true
 reth-node-builder.workspace               = true
 reth-node-core.workspace                  = true
 reth-node-ethereum.workspace              = true
-reth-primitives-traits.workspace          = true
 reth-rpc-eth-api.workspace                = true
 reth-storage-api.workspace                = true
 reth-tasks.workspace                      = true
-reth-transaction-pool.workspace           = true
 # Persistent witness store: dedicated mdbx env, separate from reth's node DB.
 reth-libmdbx.workspace                    = true
 
@@ -66,14 +63,9 @@ serde_json.workspace = true
 postcard.workspace   = true
 
 # app
-clap.workspace               = true
-dotenvy.workspace            = true
-eyre.workspace               = true
-mimalloc.workspace           = true
-thiserror.workspace          = true
-tokio.workspace              = true
-tracing.workspace            = true
-url.workspace                = true
+eyre.workspace    = true
+tokio.workspace   = true
+tracing.workspace = true
 
 [dev-dependencies]
 alloy-consensus.workspace = true
