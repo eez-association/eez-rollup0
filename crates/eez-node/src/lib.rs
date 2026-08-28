@@ -300,8 +300,9 @@ async fn launch_follower(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Res
         None,
     )?;
 
-    let l1_reader = L1Reader::new(L1ReaderConfig::from_env()?);
-    let rollup_config = RollupConfig::from_env()?;
+    let l1_reader_config = L1ReaderConfig::from_env()?;
+    let deploy_block = l1_reader_config.deploy_block;
+    let l1_reader = L1Reader::new(l1_reader_config);
     let l1_watcher = L1Watcher::new(L1WatcherConfig::from_env()?);
     let system_tx_cfg = build_follower_system_tx_cfg(&chain_spec)?;
     event!(
@@ -317,12 +318,12 @@ async fn launch_follower(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Res
         l1_reader.clone(),
         chain_spec,
         timing.l2_block_time().as_secs(),
-        rollup_config.deploy_block,
+        deploy_block,
         Arc::clone(&l1_head),
         system_tx_cfg,
     );
 
-    wait_for_l1_ready(&l1_reader, rollup_config.deploy_block, read_l1_chain_id()?).await?;
+    wait_for_l1_ready(&l1_reader, deploy_block, read_l1_chain_id()?).await?;
 
     let mut retry_delay = BOOT_CATCH_UP_INITIAL_RETRY_DELAY;
     let mut attempts = 0_u64;
@@ -596,6 +597,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         .unwrap_or(DEFAULT_MAX_SPECULATIVE_DEPTH);
 
     let submitter_config = SubmitterConfig::from_env()?;
+    let deploy_block = submitter_config.reader.deploy_block;
     let rollup_config = RollupConfig::from_env()?;
     let l1_watcher_config = L1WatcherConfig::from_env()?;
 
@@ -937,7 +939,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         submitter.reader(),
         chain_spec,
         l2_block_time_secs,
-        rollup_config.deploy_block,
+        deploy_block,
         Arc::clone(&l1_head),
         Some(system_tx_cfg),
     );
@@ -968,7 +970,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     }
 
     let l1_reader = submitter.reader();
-    wait_for_l1_ready(&l1_reader, rollup_config.deploy_block, l1_source_chain_id).await?;
+    wait_for_l1_ready(&l1_reader, deploy_block, l1_source_chain_id).await?;
     for (expected_chain_id, provider) in &xchain_checks {
         ingress::validate_cross_chain_front(provider, *expected_chain_id).await?;
     }
