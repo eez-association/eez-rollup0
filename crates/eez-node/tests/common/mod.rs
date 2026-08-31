@@ -1354,12 +1354,38 @@ pub enum NodeBinary {
 }
 
 impl NodeBinary {
-    fn path(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
-            Self::Composer => env!("CARGO_BIN_EXE_eez-composer"),
-            Self::Follower => env!("CARGO_BIN_EXE_eez-follower"),
-            Self::Dev => env!("CARGO_BIN_EXE_eez-dev-node"),
+            Self::Composer => "eez-composer",
+            Self::Follower => "eez-follower",
+            Self::Dev => "eez-dev-node",
         }
+    }
+
+    fn path(self) -> Result<PathBuf> {
+        let name = self.name();
+        if let Some(path) = std::env::var_os(format!("CARGO_BIN_EXE_{name}")) {
+            return Ok(path.into());
+        }
+
+        // Resolve at runtime so this harness also works when shared through a
+        // support crate, where Cargo does not expose `CARGO_BIN_EXE_*` to
+        // `env!`. Test executables sit in `<target>/<profile>/deps`, alongside
+        // the role binaries' parent directory.
+        let current = std::env::current_exe().context("current test executable")?;
+        let target_profile = current
+            .parent()
+            .and_then(std::path::Path::parent)
+            .ok_or_else(|| anyhow!("test executable has no target profile directory"))?;
+        let path = target_profile.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        if path.is_file() {
+            return Ok(path);
+        }
+
+        bail!(
+            "{name} binary not found next to the test profile at {}; build the eez-node package binaries before running the harness",
+            target_profile.display(),
+        )
     }
 }
 
@@ -1416,7 +1442,7 @@ impl NodeHandle {
             .map(|p| p.as_os_str().to_owned())
             .or(env_genesis)
             .unwrap_or_else(|| std::ffi::OsString::from("dev"));
-        let mut cmd = Command::new(cfg.binary.path());
+        let mut cmd = Command::new(cfg.binary.path()?);
         // Each role binary loads dotenv files from its working directory. Running from
         // the datadir prevents repository settings from changing the explicit
         // test configuration or redirecting L1 traffic to a developer endpoint.
