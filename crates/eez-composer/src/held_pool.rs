@@ -381,6 +381,7 @@ impl HeldPool {
 mod tests {
     use super::*;
     use alloy_primitives::B256;
+    use proptest::prelude::*;
 
     fn insert(pool: &HeldPool, tx: HeldTx, on_chain: u64) {
         pool.push_contiguous(tx, on_chain).unwrap();
@@ -400,6 +401,91 @@ mod tests {
             sender: Address::repeat_byte(byte),
             nonce: u64::from(byte),
             direction,
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(192))]
+
+        /// Arbitrary admission/drain/recovery/settlement interleavings preserve
+        /// FIFO within each sender+direction chain and keep every live
+        /// transaction represented exactly once.
+        #[test]
+        fn held_pool_state_machine_preserves_fifo_and_ownership(
+            operations in proptest::collection::vec((0u8..4, 0u8..4, any::<bool>(), 0usize..8), 1..160),
+        ) {
+            let pool = HeldPool::new();
+            let mut next_hash = 1u8;
+            let mut drained = Vec::<HeldTx>::new();
+            let mut live = HashSet::<TxHash>::new();
+
+            for (kind, sender_tag, outbound, amount) in operations {
+                match kind {
+                    0 => {
+                        let sender = Address::repeat_byte(sender_tag.saturating_add(1));
+                        let direction = if outbound { Direction::Outbound } else { Direction::Inbound };
+                        let nonce = pool
+                            .state
+                            .lock()
+                            .unwrap()
+                            .next_expected_nonce(sender, direction, 0)
+                            .unwrap_or(u64::MAX);
+                        let hash = TxHash::from(B256::with_last_byte(next_hash));
+                        next_hash = next_hash.wrapping_add(1);
+                        let tx = HeldTx {
+                            raw_tx: Bytes::from(hash.as_slice().to_vec()),
+                            hash,
+                            attempts: 0,
+                            max_fee_per_gas: 1_000,
+                            priority_fee_per_gas: 100,
+                            sender,
+                            nonce,
+                            direction,
+                        };
+                        if pool.push_contiguous(tx, 0).is_ok() {
+                            live.insert(hash);
+                        }
+                    }
+                    1 => drained.extend(pool.pop_n(amount)),
+                    2 => {
+                        pool.push_front_batch(std::mem::take(&mut drained));
+                    }
+                    _ => {
+                        pool.release_in_flight_batch(&drained);
+                        for tx in drained.drain(..) {
+                            live.remove(&tx.hash);
+                        }
+                    }
+                }
+
+                let state = pool.state.lock().unwrap();
+                let represented = state
+                    .txs
+                    .iter()
+                    .map(|tx| tx.hash)
+                    .chain(state.in_flight.keys().copied())
+                    .collect::<Vec<_>>();
+                let unique = represented.iter().copied().collect::<HashSet<_>>();
+                prop_assert_eq!(represented.len(), unique.len(), "a tx exists in two pool states");
+                prop_assert_eq!(&unique, &live, "a live tx was duplicated or silently lost");
+
+                for sender_tag in 1u8..=4 {
+                    let sender = Address::repeat_byte(sender_tag);
+                    for direction in [Direction::Inbound, Direction::Outbound] {
+                        let nonces = state
+                            .txs
+                            .iter()
+                            .filter(|tx| tx.sender == sender && tx.direction == direction)
+                            .map(|tx| tx.nonce)
+                            .collect::<Vec<_>>();
+                        prop_assert!(
+                            nonces.windows(2).all(|pair| pair[0] < pair[1]),
+                            "per-sender FIFO violated: {:?}",
+                            nonces,
+                        );
+                    }
+                }
+            }
         }
     }
 

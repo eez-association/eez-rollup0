@@ -298,16 +298,24 @@ mod tests {
         }
     }
 
-    async fn spawn_stub(signer: PrivateKeySigner, hash: B256) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    fn serve_stub(
+        listener: tokio::net::TcpListener,
+        signer: PrivateKeySigner,
+        hash: B256,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             Server::builder()
                 .add_service(ProverServer::new(StubProver { signer, hash }))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await
                 .unwrap();
-        });
+        })
+    }
+
+    async fn spawn_stub(signer: PrivateKeySigner, hash: B256) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        serve_stub(listener, signer, hash);
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         format!("http://{addr}")
     }
@@ -402,6 +410,36 @@ mod tests {
         );
     }
 
+    /// `RemoteProver` must not retain a dead transport. Each proof call
+    /// reconnects to the configured endpoint, so the same client recovers when
+    /// the signer process is replaced on the same address.
+    #[tokio::test]
+    async fn remote_prover_reconnects_after_server_restart() {
+        let key = test_key();
+        let attester = key.address();
+        let hash = B256::repeat_byte(0x7c);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let first_server = serve_stub(listener, key.clone(), hash);
+        let prover = RemoteProver::new(format!("http://{addr}"), attester);
+
+        prover
+            .prove(ProvingContext::default())
+            .await
+            .expect("first signer instance must attest");
+
+        first_server.abort();
+        let _ = first_server.await;
+        let replacement_listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let replacement_server = serve_stub(replacement_listener, key, hash);
+
+        prover
+            .prove(ProvingContext::default())
+            .await
+            .expect("client must reconnect to the replacement signer");
+        replacement_server.abort();
+    }
+
     /// Pack a signature the way the prover does (r||s||v, v+27).
     fn sign_65(signer: &PrivateKeySigner, hash: B256) -> Vec<u8> {
         let sig = signer.sign_hash_sync(&hash).unwrap();
@@ -430,6 +468,24 @@ mod tests {
         let sig = sign_65(&key, hash);
         let wrong = address!("0x00000000000000000000000000000000000000ff");
         assert!(verify_attestation(&sig, hash.as_slice(), wrong).is_err());
+    }
+
+    /// An otherwise valid signature is bound to one public-input hash;
+    /// replaying it for a different window hash must fail closed.
+    #[test]
+    fn signature_replayed_for_a_different_window_hash_is_rejected() {
+        let key = test_key();
+        let first_window_hash = B256::repeat_byte(0x7c);
+        let different_window_hash = B256::repeat_byte(0x7d);
+        let signature = sign_65(&key, first_window_hash);
+
+        let error = verify_attestation(
+            &signature,
+            different_window_hash.as_slice(),
+            key.address(),
+        )
+        .expect_err("a signature must not authenticate a different window");
+        assert!(matches!(error, ProverError::Backend(_)), "{error:?}");
     }
 
     #[test]

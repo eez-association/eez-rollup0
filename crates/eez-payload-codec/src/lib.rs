@@ -160,9 +160,117 @@ struct Body {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn tx(byte: u8, n: usize) -> RawTx {
         vec![byte; n]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Every supported payload shape round-trips without losing empty
+        /// blocks, transaction boundaries, or L2 sidecar entries.
+        #[test]
+        fn arbitrary_payload_round_trips(
+            blocks in proptest::collection::vec(
+                proptest::collection::vec(
+                    proptest::collection::vec(any::<u8>(), 0..128),
+                    0..8,
+                ),
+                0..12,
+            ),
+            l2_entries in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 0..256),
+                0..12,
+            ),
+        ) {
+            let encoded = encode(&blocks, &l2_entries).expect("generated block sizes fit u16");
+            let decoded = decode(&encoded).expect("encoded payload must decode");
+            let expected_counts = blocks.iter().map(|block| block.len() as u16).collect::<Vec<_>>();
+            let expected_txs = blocks.iter().flatten().cloned().collect::<Vec<_>>();
+
+            prop_assert_eq!(decoded.block_tx_counts, expected_counts);
+            prop_assert_eq!(decoded.transactions, expected_txs);
+            prop_assert_eq!(decoded.l2_entries, l2_entries);
+        }
+
+        /// Arbitrary hostile input is a total operation. A malformed payload
+        /// may return any documented error, but it must never panic.
+        #[test]
+        fn arbitrary_bytes_never_panic(
+            bytes in proptest::collection::vec(any::<u8>(), 0..4096),
+        ) {
+            let outcome = std::panic::catch_unwind(|| decode(&bytes));
+            prop_assert!(outcome.is_ok(), "decode panicked for {} bytes", bytes.len());
+        }
+    }
+
+    /// Wire bytes are consensus-facing. These vectors deliberately use opaque
+    /// transaction and L2-entry bytes: the codec must preserve their boundaries
+    /// without interpreting either payload.
+    #[test]
+    fn payload_codec_golden_vectors_cover_all_wire_shapes() {
+        struct Vector {
+            name: &'static str,
+            blocks: Vec<Vec<RawTx>>,
+            l2_entries: Vec<Vec<u8>>,
+            encoded_hex: &'static str,
+        }
+
+        let vectors = [
+            Vector {
+                name: "empty range",
+                blocks: vec![],
+                l2_entries: vec![],
+                encoded_hex: "00c3c0c0c0",
+            },
+            Vector {
+                name: "one empty block, no L2 entries",
+                blocks: vec![vec![]],
+                l2_entries: vec![],
+                encoded_hex: "00c4c180c0c0",
+            },
+            Vector {
+                name: "mixed blocks and value-bearing L2 entry sidecars",
+                blocks: vec![
+                    vec![vec![0x01]],
+                    vec![],
+                    vec![vec![0x82, 0xab, 0xcd], vec![0x7f]],
+                ],
+                l2_entries: vec![vec![], vec![0xde, 0xad, 0xbe, 0xef], vec![0x00]],
+                encoded_hex: "00d3c3018002c6018382abcd7fc78084deadbeef00",
+            },
+        ];
+
+        for vector in vectors {
+            let expected = alloy_primitives::hex::decode(vector.encoded_hex).unwrap();
+            let encoded = encode(&vector.blocks, &vector.l2_entries).unwrap();
+            assert_eq!(encoded, expected, "{} encoding drifted", vector.name);
+
+            let decoded = decode(&expected).unwrap();
+            assert_eq!(
+                decoded.block_tx_counts,
+                vector
+                    .blocks
+                    .iter()
+                    .map(|block| u16::try_from(block.len()).unwrap())
+                    .collect::<Vec<_>>(),
+                "{} block boundaries drifted",
+                vector.name,
+            );
+            assert_eq!(
+                decoded.transactions,
+                vector.blocks.into_iter().flatten().collect::<Vec<_>>(),
+                "{} transaction bytes drifted",
+                vector.name,
+            );
+            assert_eq!(
+                decoded.l2_entries, vector.l2_entries,
+                "{} L2 entry bytes drifted",
+                vector.name,
+            );
+        }
     }
 
     #[test]
