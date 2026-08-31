@@ -5,6 +5,7 @@ edition.workspace      = true
 license.workspace      = true
 rust-version.workspace = true
 description            = "eez Rollup-0 node — vanilla reth driven by an eez sequencer."
+default-run            = "eez-composer"
 
 [dependencies]
 eez-composer.workspace      = true
@@ -38,7 +39,7 @@ reth-transaction-pool.workspace           = true
 # Persistent witness store: dedicated mdbx env, separate from reth's node DB.
 reth-libmdbx.workspace                    = true
 
-# Gnosis (chiado) L1 — provided when EEZ_L1_EMBEDDED=1 and the smoke
+# Gnosis (chiado) L1 — embedded by eez-composer; the smoke
 # targets chiado; the L1 NodeBuilder uses these.
 reth_gnosis.workspace                     = true
 

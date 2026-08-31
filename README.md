@@ -34,8 +34,9 @@ unbound mock signature.
 
 ## Run a chiado L2 (Docker)
 
-Runs three containers: `eez-node` (which embeds a Chiado L1 node alongside the
-L2 + composer), `eez-proof-signer`, and a **lighthouse** consensus client that drives the L1.
+Runs three containers: `eez-node` (whose entrypoint is the `eez-composer`
+binary, embedding a Chiado L1 node alongside the L2), `eez-proof-signer`, and a
+**lighthouse** consensus client that drives the L1.
 There's no separate L1 node to run. Cross-chain batches are submitted to
 Chiado's block builder; the L1 block to aim them at is read from the embedded
 L1 once it has caught up to the chain tip.
@@ -126,8 +127,9 @@ The two **cross-chain ingress fronts** are transparent proxies:
 `eth_sendRawTransaction` sent to a front is held and composed into the next Sync
 block; every other `eth_*` is forwarded to that front's source-chain RPC. They
 use the compose env `EEZ_L1_XCHAIN_PORT` / `EEZ_L2_XCHAIN_PORT`; both ports are
-required in composer mode. Follower and standalone modes do not start cross-chain
-ingress fronts. Upstreams are `EEZ_L1_RPC_URL` / `EEZ_L2_RPC_URL` respectively.
+required by `eez-composer`. The `eez-follower` and `eez-dev-node` binaries do not
+start cross-chain ingress fronts. Upstreams are `EEZ_L1_RPC_URL` /
+`EEZ_L2_RPC_URL` respectively.
 
 `EEZ_MAX_USER_TXS_PER_BUNDLE` (compose, default `3`) caps how many user
 cross-chain txs ride in one `postBatch` bundle. Raise it only against a builder
@@ -157,6 +159,30 @@ EEZ_RESTART=1 EEZ_MODE=load ... bash scripts/xchain-test.sh                    #
 
 (`scripts/devnet-test.sh` is the earlier, simpler driver — setter+deposit only,
 raw-RPC — kept for reference.)
+
+## Run node roles locally
+
+`eez-composer` is the package default. Run it directly, or use `make run-node`:
+
+```bash
+cargo run -p eez-node -- node \
+  --chain "$EEZ_L2_GENESIS_PATH" \
+  --datadir "$EEZ_L2_DATADIR"
+```
+
+Select either non-default role explicitly:
+
+```bash
+# L1-derived follower; optionally add `--sequencer-rpc <URL>` after `node`.
+cargo run -p eez-node --bin eez-follower -- node \
+  --chain "$EEZ_L2_GENESIS_PATH" \
+  --datadir "$EEZ_L2_DATADIR"
+
+# Unanchored interval sequencer for local development.
+cargo run -p eez-node --bin eez-dev-node -- node \
+  --chain "$EEZ_L2_GENESIS_PATH" \
+  --datadir "$EEZ_L2_DATADIR"
+```
 
 ## Build, test, teardown
 

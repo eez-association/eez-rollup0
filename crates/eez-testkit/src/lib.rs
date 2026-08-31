@@ -30,9 +30,9 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolError, SolEvent, SolValue, sol};
 use anyhow::{Context, Result, anyhow, bail};
 use eez_control_rpc::{
-    MAX_MESSAGE_BYTES,
+    MAX_MESSAGE_BYTES, encode_prove_failure,
     v1::{
-        ProveChunk, ProveResponse, prove_chunk,
+        InboundFailure, ProveChunk, ProveFailure, ProveResponse, prove_chunk, prove_failure,
         prover_client::ProverClient,
         prover_server::{Prover, ProverServer},
     },
@@ -505,6 +505,13 @@ pub enum ProverMutation {
     None,
     PostBatch,
     Witness,
+    /// Deterministic opaque rejection used to exercise Composer recovery. This
+    /// is the status returned by the real signer when its checkpoint quota is
+    /// exceeded.
+    ResourceExhausted,
+    /// A typed rejection whose candidate identity cannot belong to the current
+    /// request. The Composer must treat it as opaque rather than acting on it.
+    MismatchedActionable,
 }
 
 impl ProverMutation {
@@ -541,6 +548,46 @@ impl ProverMutation {
                     witness.state.push(vec![0xff]);
                 }
             }
+            Self::ResourceExhausted | Self::MismatchedActionable => {
+                let calldata = chunks
+                    .iter()
+                    .find_map(|chunk| match chunk.kind.as_ref() {
+                        Some(prove_chunk::Kind::Header(header)) => header
+                            .post_batch
+                            .as_ref()
+                            .map(|post_batch| post_batch.abi_calldata.as_slice()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| Status::internal("missing Prove header"))?;
+                let batch = eez_protocol::entries::decode_postbatch(calldata)
+                    .map_err(|error| Status::internal(format!("decode PostBatch: {error}")))?;
+                // Entry zero is the state-chain anchor. The real checkpoint
+                // quota is exercised only by effect candidates, so leave
+                // anchor-only historical/minimal proofs healthy.
+                if batch.entries.len() > 1 {
+                    return match self {
+                        Self::ResourceExhausted => Err(Status::resource_exhausted(
+                            "window validation checkpoint quota exceeded",
+                        )),
+                        Self::MismatchedActionable => {
+                            let failure = ProveFailure {
+                                actionable_failure: Some(
+                                    prove_failure::ActionableFailure::Inbound(InboundFailure {
+                                        entry_index: u32::MAX,
+                                        entry_hash: vec![0xff; 32],
+                                    }),
+                                ),
+                            };
+                            Err(Status::with_details(
+                                tonic::Code::FailedPrecondition,
+                                "candidate identity does not match the request",
+                                encode_prove_failure(&failure).into(),
+                            ))
+                        }
+                        Self::None | Self::PostBatch | Self::Witness => unreachable!(),
+                    };
+                }
+            }
         }
         Ok(())
     }
@@ -572,7 +619,15 @@ impl Prover for ProverProxyService {
         while let Some(chunk) = input.message().await? {
             chunks.push(chunk);
         }
-        self.mutation.apply(&mut chunks)?;
+        if let Err(status) = self.mutation.apply(&mut chunks) {
+            if matches!(
+                status.code(),
+                tonic::Code::ResourceExhausted | tonic::Code::FailedPrecondition
+            ) {
+                self.counters.rejections.fetch_add(1, Ordering::Relaxed);
+            }
+            return Err(status);
+        }
 
         let mut client = ProverClient::connect(self.upstream.clone())
             .await
@@ -588,7 +643,9 @@ impl Prover for ProverProxyService {
                 // Transport failures do not prove that the signer rejected the input.
                 if matches!(
                     status.code(),
-                    tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition
+                    tonic::Code::InvalidArgument
+                        | tonic::Code::FailedPrecondition
+                        | tonic::Code::ResourceExhausted
                 ) {
                     self.counters.rejections.fetch_add(1, Ordering::Relaxed);
                 }
@@ -699,7 +756,13 @@ impl Harness {
     /// Stages a local chain that can later restart as a composer or follower.
     pub fn standalone_env(&self) -> Vec<(&'static str, String)> {
         vec![
+            (
+                "EEZ_L1_BLOCK_TIME_MS",
+                (L1_BLOCK_TIME_SECS * 1000).to_string(),
+            ),
             ("EEZ_L2_BLOCK_TIME_MS", "2000".to_string()),
+            ("EEZ_PROOF_TIME_MS", "1000".to_string()),
+            ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
             (
                 "RUST_LOG",
                 std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
@@ -736,7 +799,7 @@ impl Harness {
         expect_external_batches: bool,
     ) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
-            poster_key,
+            poster_key: Some(poster_key),
             proof_signer_key: Some(ANVIL_ATTESTER_KEY),
             rollup_id: self.dep.rollup_id,
             expect_external_batches,
@@ -750,7 +813,7 @@ impl Harness {
         sequencer_rpc: Option<&str>,
     ) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
-            poster_key: ANVIL_KEY,
+            poster_key: None,
             proof_signer_key: None,
             rollup_id: self.dep.rollup_id,
             expect_external_batches: true,
@@ -761,7 +824,7 @@ impl Harness {
 
     pub async fn env_with_rollup_id(&self, rollup_id: u64) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
-            poster_key: ANVIL_KEY,
+            poster_key: Some(ANVIL_KEY),
             proof_signer_key: Some(ANVIL_ATTESTER_KEY),
             rollup_id,
             expect_external_batches: false,
@@ -775,7 +838,7 @@ impl Harness {
         proof_signer_key: &str,
     ) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
-            poster_key: ANVIL_KEY,
+            poster_key: Some(ANVIL_KEY),
             proof_signer_key: Some(proof_signer_key),
             rollup_id: self.dep.rollup_id,
             expect_external_batches: false,
@@ -789,12 +852,8 @@ impl Harness {
         opts: NodeEnvOptions<'_>,
     ) -> Result<Vec<(&'static str, String)>> {
         let mut env = vec![
-            ("EEZ_L1_EMBEDDED", "1".to_string()),
             ("EEZ_L1_CHAIN_PATH", "dev".to_string()),
             ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
-            ("EEZ_L1_TARGET_RPC_URL", self.anvil.rpc_url.clone()),
-            ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
-            ("EEZ_L1_POSTER_KEY", opts.poster_key.to_string()),
             ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
             ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
@@ -841,7 +900,15 @@ impl Harness {
             ),
         ];
 
-        // A prover endpoint selects composer mode; omitting it selects follower mode.
+        if let Some(poster_key) = opts.poster_key {
+            env.extend([
+                ("EEZ_L1_TARGET_RPC_URL", self.anvil.rpc_url.clone()),
+                ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
+                ("EEZ_L1_POSTER_KEY", poster_key.to_string()),
+            ]);
+        }
+
+        // Composer tests use the real remote-prover path. Followers omit it.
         if let Some(signer_key) = opts.proof_signer_key {
             let genesis = self.l2_genesis_path();
             let attester = signer_address(signer_key)?;
@@ -876,7 +943,7 @@ impl Harness {
 }
 
 struct NodeEnvOptions<'a> {
-    poster_key: &'a str,
+    poster_key: Option<&'a str>,
     proof_signer_key: Option<&'a str>,
     rollup_id: u64,
     expect_external_batches: bool,
@@ -1164,8 +1231,28 @@ pub struct NodeHandle {
     pub http_port: u16,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub enum NodeBinary {
+    #[default]
+    Composer,
+    Follower,
+    Dev,
+}
+
+impl NodeBinary {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Composer => env!("CARGO_BIN_EXE_eez-composer"),
+            Self::Follower => env!("CARGO_BIN_EXE_eez-follower"),
+            Self::Dev => env!("CARGO_BIN_EXE_eez-dev-node"),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct NodeConfig<'a> {
+    /// Explicit node-role executable to launch.
+    pub binary: NodeBinary,
     pub genesis_path: Option<&'a std::path::Path>,
 }
 
@@ -1235,11 +1322,13 @@ impl NodeHandle {
             .map(|p| p.as_os_str().to_owned())
             .or(env_genesis)
             .unwrap_or_else(|| std::ffi::OsString::from("dev"));
-        let mut cmd = Command::new(eez_node_bin()?);
+        let mut cmd = Command::new(cfg.binary.path());
         let signal_filter = std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| {
             "warn,eez_node=info,eez_l1=info,eez_composer=info,eez_deriver=info".to_string()
         });
-        // Avoid loading repository dotenv files over the explicit fixture environment.
+        // Each role binary loads dotenv files from its working directory. Running from
+        // the datadir prevents repository settings from changing the explicit
+        // test configuration or redirecting L1 traffic to a developer endpoint.
         cmd.current_dir(datadir)
             .args(["node", "--chain"])
             .arg(&chain_arg)
@@ -1299,7 +1388,7 @@ impl NodeHandle {
         // The subprocess bind itself cannot be atomic, but this leaves only the
         // unavoidable drop/spawn boundary exposed to another process.
         drop(port_leases);
-        let child = cmd.spawn().context("spawn eez-node")?;
+        let child = cmd.spawn().context("spawn eez node role")?;
         Ok(Self {
             child: Mutex::new(child),
             background_tasks: Mutex::new(Vec::new()),
@@ -2945,7 +3034,6 @@ impl CrossChainConfig {
 
     fn env(&self) -> Vec<(&'static str, String)> {
         vec![
-            ("EEZ_L1_EMBEDDED", "1".to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
             ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_RPC_URL", self.l1_rpc_url()),

@@ -92,12 +92,9 @@ pub struct RollupState<L2> {
     pub config: RollupConfig,
     pub l2_provider: Arc<L2>,
     pub l1_head: Arc<L1CanonicalHead>,
-    /// Per-rollup cross-chain held-tx pool. `None` for rollups that
-    /// don't participate in cross-chain composition (entry-only
-    /// deployments without cross-chain content, or pure-follower
-    /// roles). When present, drained on each Sync-slot trigger by
-    /// the umbrella's `compose_sync_slot`.
-    pub held_pool: Option<Arc<HeldPool>>,
+    /// Per-rollup cross-chain held-tx pool, drained on each Sync-slot
+    /// trigger by the umbrella's `compose_sync_slot`.
+    pub held_pool: Arc<HeldPool>,
     /// Ledger of optimistically-committed Sync blocks whose L1 bundle
     /// is in flight or settled-but-unfinalized. Always present (empty
     /// map costs nothing); only the cross-chain compose path writes it.
