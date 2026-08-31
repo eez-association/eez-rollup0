@@ -65,7 +65,8 @@ pub(crate) fn partition_retryable(
 /// An honest, version-compatible prover answering the current request should
 /// always pass this gate. Failure means the details are malformed, stale,
 /// cross-request, malicious, or disagree with Composer's request encoding; in
-/// every case the hint remains non-actionable and pool state stays unchanged.
+/// every case the hint remains non-actionable. The caller may count the request
+/// as an opaque prover rejection, but must not use the hint to select pool entries.
 pub(crate) fn validate_actionable_prover_failure(
     failure: ActionableProverFailure,
     batch: &eez_protocol::EvmBatch,

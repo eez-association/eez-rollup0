@@ -23,9 +23,9 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolError, SolEvent, SolValue, sol};
 use anyhow::{Context, Result, anyhow, bail};
 use eez_control_rpc::{
-    MAX_MESSAGE_BYTES,
+    MAX_MESSAGE_BYTES, encode_prove_failure,
     v1::{
-        ProveChunk, ProveResponse, prove_chunk,
+        InboundFailure, ProveChunk, ProveFailure, ProveResponse, prove_chunk, prove_failure,
         prover_client::ProverClient,
         prover_server::{Prover, ProverServer},
     },
@@ -581,6 +581,13 @@ pub enum ProverMutation {
     None,
     PostBatch,
     Witness,
+    /// Deterministic opaque rejection used to exercise Composer recovery. This
+    /// is the status returned by the real signer when its checkpoint quota is
+    /// exceeded.
+    ResourceExhausted,
+    /// A typed rejection whose candidate identity cannot belong to the current
+    /// request. The Composer must treat it as opaque rather than acting on it.
+    MismatchedActionable,
 }
 
 impl ProverMutation {
@@ -617,6 +624,46 @@ impl ProverMutation {
                     witness.state.push(vec![0xff]);
                 }
             }
+            Self::ResourceExhausted | Self::MismatchedActionable => {
+                let calldata = chunks
+                    .iter()
+                    .find_map(|chunk| match chunk.kind.as_ref() {
+                        Some(prove_chunk::Kind::Header(header)) => header
+                            .post_batch
+                            .as_ref()
+                            .map(|post_batch| post_batch.abi_calldata.as_slice()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| Status::internal("missing Prove header"))?;
+                let batch = eez_protocol::entries::decode_postbatch(calldata)
+                    .map_err(|error| Status::internal(format!("decode PostBatch: {error}")))?;
+                // Entry zero is the state-chain anchor. The real checkpoint
+                // quota is exercised only by effect candidates, so leave
+                // anchor-only historical/minimal proofs healthy.
+                if batch.entries.len() > 1 {
+                    return match self {
+                        Self::ResourceExhausted => Err(Status::resource_exhausted(
+                            "window validation checkpoint quota exceeded",
+                        )),
+                        Self::MismatchedActionable => {
+                            let failure = ProveFailure {
+                                actionable_failure: Some(
+                                    prove_failure::ActionableFailure::Inbound(InboundFailure {
+                                        entry_index: u32::MAX,
+                                        entry_hash: vec![0xff; 32],
+                                    }),
+                                ),
+                            };
+                            Err(Status::with_details(
+                                tonic::Code::FailedPrecondition,
+                                "candidate identity does not match the request",
+                                encode_prove_failure(&failure).into(),
+                            ))
+                        }
+                        Self::None | Self::PostBatch | Self::Witness => unreachable!(),
+                    };
+                }
+            }
         }
         Ok(())
     }
@@ -648,7 +695,15 @@ impl Prover for ProverProxyService {
         while let Some(chunk) = input.message().await? {
             chunks.push(chunk);
         }
-        self.mutation.apply(&mut chunks)?;
+        if let Err(status) = self.mutation.apply(&mut chunks) {
+            if matches!(
+                status.code(),
+                tonic::Code::ResourceExhausted | tonic::Code::FailedPrecondition
+            ) {
+                self.counters.rejections.fetch_add(1, Ordering::Relaxed);
+            }
+            return Err(status);
+        }
 
         let mut client = ProverClient::connect(self.upstream.clone())
             .await
@@ -664,7 +719,9 @@ impl Prover for ProverProxyService {
                 // Transport failures do not prove that the signer rejected the input.
                 if matches!(
                     status.code(),
-                    tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition
+                    tonic::Code::InvalidArgument
+                        | tonic::Code::FailedPrecondition
+                        | tonic::Code::ResourceExhausted
                 ) {
                     self.counters.rejections.fetch_add(1, Ordering::Relaxed);
                 }
