@@ -345,6 +345,11 @@ implementation may discard or recompose the request, correct its configuration,
 or alert an operator. The Composer MUST NOT infer retryability from a status
 message or implementation-specific error text.
 
+A Composer SHOULD define a bounded recovery policy for repeated non-retryable
+prover rejections so that one composition cannot indefinitely prevent
+settlement progress. The policy is implementation-defined and MUST NOT rely on
+unvalidated failure details.
+
 ### 6.2 Actionable failed preconditions
 
 A `FAILED_PRECONDITION` status MAY carry a protobuf-encoded
@@ -389,8 +394,7 @@ request unchanged. It MAY remove the identified candidate and its same-sender,
 same-direction nonce suffix, then rebuild the batch, terminal Sync block,
 witnesses, and complete `Prove` stream from the remaining candidates. The
 rebuilt attempt is subject to the same settlement cutoff as any other proving
-attempt. This recovery does not authorize bisection or candidate removal when
-no valid typed detail is present.
+attempt.
 
 Index-and-hash validation binds the detail to the rejected request; it does not
 independently prove that the reported execution failure occurred. Candidate
