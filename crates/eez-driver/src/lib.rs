@@ -12,10 +12,8 @@
 //!
 //! ## Surface (Stage 4)
 //!
-//! - [`slot`] — `SlotKind`, `SlotEvent`, plus
-//!   [`spawn_interval`] (standalone-mode) and [`spawn_l1_anchored`]
-//!   (production). Defines the protocol between Schedulers and
-//!   Sequencers.
+//! - [`slot`] — `SlotKind`, `SlotEvent`, and [`spawn_l1_anchored`]. Defines
+//!   the protocol between Schedulers and Sequencers.
 //! - [`Sequencer`] consumes [`SlotEvent`]s, builds payload attributes,
 //!   drives reth's engine, tracks head.
 //! - [`RollupTiming`] + [`SlotComposition`] — per-rollup wall-clock
@@ -49,7 +47,7 @@ pub use sequencer::{DEFAULT_MAX_SPECULATIVE_DEPTH, EthAttributesBuilder, Sequenc
 #[doc(inline)]
 pub use slot::{
     ParentContext, SlotEvent, SlotKind, SyncSlotBlock, SyncSlotComposer, SyncSlotComposerHandle,
-    SyncSlotMode, spawn_interval, spawn_l1_anchored,
+    SyncSlotMode, spawn_l1_anchored,
 };
 #[doc(inline)]
 pub use timing::{MAX_BLOCKS_PER_BATCH, MAX_BLOCKS_PER_CATCHUP, RollupTiming, SlotComposition};

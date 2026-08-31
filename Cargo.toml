@@ -4,7 +4,6 @@ members = [
     "crates/eez-composer",
     "crates/eez-control-rpc",
     "crates/eez-deriver",
-    "crates/eez-dev-node",
     "crates/eez-driver",
     "crates/eez-evm-inspector",
     "crates/eez-follower",
@@ -142,7 +141,6 @@ jsonrpsee              = { version = "0.26", features = ["server", "macros"] }
 # internal crates
 eez-composer       = { path = "crates/eez-composer" }
 eez-deriver        = { path = "crates/eez-deriver" }
-eez-dev-node       = { path = "crates/eez-dev-node" }
 eez-driver         = { path = "crates/eez-driver" }
 eez-evm-inspector  = { path = "crates/eez-evm-inspector" }
 eez-follower       = { path = "crates/eez-follower" }

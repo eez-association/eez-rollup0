@@ -17,7 +17,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 pub type L2NodeBuilder =
     WithLaunchContext<NodeBuilder<reth_db::DatabaseEnv, reth_chainspec::ChainSpec>>;
 
-/// Composer and development nodes have no role-specific CLI arguments.
+/// Composer nodes have no role-specific CLI arguments.
 #[derive(clap::Args, Debug, Clone)]
 pub struct NoRoleArgs {}
 
@@ -66,7 +66,7 @@ pub fn warn_on_deprecated_env() {
                 name: "eez.node.env.deprecated",
                 Level::WARN,
                 env = name,
-                "env var is ignored; select the node role with the eez-composer, eez-follower, or eez-dev-node executable."
+                "env var is ignored; select the node role with the eez-composer or eez-follower executable."
             );
         }
     }
