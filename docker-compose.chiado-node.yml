@@ -76,7 +76,6 @@ services:
       EEZ_PROVER_URL: http://127.0.0.1:${EEZ_SIGNER_PORT:-50061}
       EEZ_WITNESS_DB_PATH: /l2/witnesses
       # Embedded chiado L1 (reth_gnosis) — single L1 for the whole node.
-      EEZ_L1_EMBEDDED: "1"
       EEZ_L1_CHAIN: chiado
       EEZ_L1_CHAIN_ID: "10200"
       EEZ_L1_HTTP_PORT: "18645"

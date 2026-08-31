@@ -31,7 +31,7 @@ use eez_driver::{
     witness::{ExecutionWitnessMode, block_witness},
 };
 use eez_l1::{BundleTarget, L1Event, SendOutcome, Submitter};
-use eez_prover::{BlockWitness, Prover, ProvingContext};
+use eez_prover::{ActionableProverFailure, BlockWitness, Prover, ProverError, ProvingContext};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
@@ -48,7 +48,9 @@ use crate::local::{
     build_sync_block, sync_block_pair_roots,
 };
 use crate::optimistic::OptimisticallyIncluded;
-use crate::prover_retry::prove_with_retry;
+use crate::prover_retry::{
+    actionable_held_tx, partition_retryable, prove_with_retry, validate_actionable_prover_failure,
+};
 use crate::rollup::RollupState;
 
 /// Runtime config for the cross-chain execution path on Sync slots.
@@ -381,6 +383,28 @@ enum RecoveryOutcome {
     HeadUnchanged,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum PreparePostBatchError {
+    #[error("{0}")]
+    Build(String),
+    #[error("prover.prove: {0}")]
+    Prover(#[source] ProverError),
+    #[error("prover rejected {0}")]
+    Actionable(ActionableProverFailure),
+}
+
+impl From<String> for PreparePostBatchError {
+    fn from(error: String) -> Self {
+        Self::Build(error)
+    }
+}
+
+impl From<&str> for PreparePostBatchError {
+    fn from(error: &str) -> Self {
+        Self::Build(error.to_owned())
+    }
+}
+
 /// Both ends are unusable and clamp to the default: above it no tx is valid
 /// (EIP-7825), and below `MIN_VIABLE` every emission path refuses forever.
 fn clamp_max_postbatch_gas(requested: u64) -> u64 {
@@ -637,6 +661,35 @@ pub struct Composer<L2: BlockReader> {
     inner: Arc<Inner<L2>>,
 }
 
+/// Invalid composer dependency wiring rejected at construction.
+#[derive(Debug, thiserror::Error)]
+pub enum ComposerConfigError {
+    /// The submitter observes a different L1 account than the one signing
+    /// `postAndVerifyBatch`, so the Composer could misattribute its own batch.
+    #[error(
+        "L1 submission identity mismatch: Submitter poster {submitter_poster} does not match postBatch signer {post_batch_signer}"
+    )]
+    SubmissionIdentityMismatch {
+        /// Account whose receipts and `BatchPosted` events the Submitter tracks.
+        submitter_poster: Address,
+        /// Account signing the `postAndVerifyBatch` transaction.
+        post_batch_signer: Address,
+    },
+}
+
+fn ensure_submission_identity(
+    submitter_poster: Address,
+    post_batch_signer: Address,
+) -> Result<(), ComposerConfigError> {
+    if submitter_poster != post_batch_signer {
+        return Err(ComposerConfigError::SubmissionIdentityMismatch {
+            submitter_poster,
+            post_batch_signer,
+        });
+    }
+    Ok(())
+}
+
 struct Inner<L2: BlockReader> {
     /// Per-rollup state keyed by rollup ID.
     rollups: HashMap<u64, RollupState<L2>>,
@@ -646,17 +699,17 @@ struct Inner<L2: BlockReader> {
     /// EVM config — used by [`build_sync_block`] to construct the
     /// per-Sync-slot block via reth-evm `BlockBuilder`.
     evm_config: EthEvmConfig,
-    /// Cross-chain clients and execution context. `None` when L1 is not wired,
-    /// such as in standalone or follower modes.
-    cross_chain: Option<CrossChainWiring>,
-    /// Handle to the `BlockCommitter` actor (the sole engine-API
-    /// owner). Set once at startup via [`Composer::set_committer`]
-    /// after the Sequencer spawns the actor. Slot-context recovery uses it to
-    /// reorg an optimistically committed Sync block after L1 failure.
-    committer: std::sync::OnceLock<BlockCommitterHandle<EthEngineTypes>>,
-    /// Per-block witnesses for [`eez_prover::ProvingContext::blocks`]. Set only
-    /// in remote-prover mode; `None` (mock) leaves `blocks` empty.
-    witness_source: std::sync::OnceLock<Arc<dyn eez_prover::ProvingWitnessSource>>,
+    /// Cross-chain clients and execution context, guaranteed by the
+    /// `eez-composer` entrypoint.
+    cross_chain: CrossChainWiring,
+    /// Handle to the binary-owned `BlockCommitter` actor (the sole engine-API
+    /// owner), shared with the Sequencer and Deriver. Slot-context recovery
+    /// uses it to reorg an optimistically committed Sync block after L1 failure.
+    committer: BlockCommitterHandle<EthEngineTypes>,
+    /// Per-block witnesses for [`eez_prover::ProvingContext::blocks`]. `None`
+    /// means the configured in-process prover does not require block witnesses;
+    /// it does not mean that the Composer has no prover.
+    witness_source: Option<Arc<dyn eez_prover::ProvingWitnessSource>>,
     /// Bounds on what one postBatch may settle. Read from env once here so
     /// the emission decision, the boundary math, and the span guard in
     /// `prepare_post_batch_raw` can never disagree about the cap mid-run.
@@ -679,40 +732,37 @@ where
     <L2 as TransactionsProvider>::Transaction: Encodable2718,
 {
     /// Constructs the umbrella. Synchronous — does no I/O.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ComposerConfigError::SubmissionIdentityMismatch`] when the
+    /// cross-chain postBatch signer does not match the Submitter's poster.
     pub fn new(
         rollups: HashMap<u64, RollupState<L2>>,
         prover: Arc<dyn Prover>,
-        submitter: Submitter,
         evm_config: EthEvmConfig,
-        cross_chain: Option<CrossChainWiring>,
+        cross_chain: CrossChainWiring,
+        committer: BlockCommitterHandle<EthEngineTypes>,
+        witness_source: Option<Arc<dyn eez_prover::ProvingWitnessSource>>,
         timing: RollupTiming,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ComposerConfigError> {
+        let submitter = cross_chain.exec_ctx.submitter.clone();
+        let submitter_poster = submitter.poster_address();
+        let post_batch_signer = cross_chain.exec_ctx.l1_poster_signer.address();
+        ensure_submission_identity(submitter_poster, post_batch_signer)?;
+
+        Ok(Self {
             inner: Arc::new(Inner {
                 rollups,
                 prover,
                 submitter,
                 evm_config,
                 cross_chain,
-                committer: std::sync::OnceLock::new(),
-                witness_source: std::sync::OnceLock::new(),
+                committer,
+                witness_source,
                 emission: EmissionLimits::from_env(timing),
             }),
-        }
-    }
-
-    /// Wire the proving-witness source (remote-prover mode only). Later calls no-op.
-    pub fn set_witness_source(&self, src: Arc<dyn eez_prover::ProvingWitnessSource>) {
-        let _ = self.inner.witness_source.set(src);
-    }
-
-    /// Wire the `BlockCommitter` handle after the Sequencer spawns the
-    /// actor. Must be called before the first Sync slot in cross-chain
-    /// mode; the bundle-observer task needs it to reorg the L2 head on
-    /// bundle failure. Second and later calls are no-ops.
-    pub fn set_committer(&self, handle: BlockCommitterHandle<EthEngineTypes>) {
-        let _ = self.inner.committer.set(handle);
+        })
     }
 
     /// Run loop. Drains `l1_events` (subscribed by the caller before
@@ -836,9 +886,7 @@ where
                         tx_count = txs.len(),
                         "L1 reorg rolled out optimistic batches; re-queueing their user_txs",
                     );
-                    if let Some(pool) = rollup.held_pool.as_ref() {
-                        pool.push_front_batch(txs);
-                    }
+                    rollup.held_pool.push_front_batch(txs);
                 }
             }
             Ok(L1Event::Finalized { block_number, .. }) => {
@@ -866,9 +914,7 @@ where
                         for (sync_height, post_batch_hash, txs) in finalized {
                             match submitter.receipt_exists(post_batch_hash).await {
                                 Ok(true) => {
-                                    if let Some(pool) = held_pool.as_ref() {
-                                        pool.release_in_flight_batch(&txs);
-                                    }
+                                    held_pool.release_in_flight_batch(&txs);
                                     event!(
                                         name: "eez.composer.finality_audit.ok",
                                         Level::DEBUG,
@@ -891,9 +937,7 @@ where
                                         tx_count = txs.len(),
                                         "finalized batch has NO postBatch receipt on L1 — reorg rolled it out unobserved; re-queueing its user_txs (front)",
                                     );
-                                    if let Some(pool) = held_pool.as_ref() {
-                                        pool.push_front_batch(txs);
-                                    }
+                                    held_pool.push_front_batch(txs);
                                 }
                                 Err(err) => {
                                     // Inconclusive: re-queueing txs that
@@ -910,9 +954,7 @@ where
                                         error = %err,
                                         "finality-audit receipt lookup failed; ledger entry dropped UNAUDITED",
                                     );
-                                    if let Some(pool) = held_pool.as_ref() {
-                                        pool.release_in_flight_batch(&txs);
-                                    }
+                                    held_pool.release_in_flight_batch(&txs);
                                 }
                             }
                         }
@@ -990,27 +1032,8 @@ where
             );
             None
         })?;
-        let Some(pool) = rollup.held_pool.as_ref() else {
-            event!(
-                name: "eez.composer.sync_slot.no_pool",
-                Level::WARN,
-                rollup_id,
-                "rollup has no HeldPool configured",
-            );
-            return None;
-        };
-        let Some(cc) = self.inner.cross_chain.as_ref() else {
-            if !pool.is_empty() {
-                event!(
-                    name: "eez.composer.sync_slot.cross_chain_unavailable",
-                    Level::ERROR,
-                    rollup_id,
-                    tx_count = pool.len(),
-                    "cross-chain composition is unavailable; retaining held transactions",
-                );
-            }
-            return None;
-        };
+        let pool = rollup.held_pool.as_ref();
+        let cc = &self.inner.cross_chain;
         // Use the Sequencer-supplied parent header directly (it reflects
         // the just-committed block via `last_header`'s mirror); a
         // best-block re-lookup can race reth's provider-index and build
@@ -1280,20 +1303,11 @@ where
         failed: crate::optimistic::FailedBatch,
     ) -> RecoveryOutcome {
         let sync_height = failed.sync_height;
+        let pool = rollup.held_pool.as_ref();
         // Set by the two operations that move the head: the rollback and the
         // sibling commit.
         let mut outcome = RecoveryOutcome::HeadUnchanged;
-        let Some(committer) = self.inner.committer.get() else {
-            event!(
-                name: "eez.composer.recovery.no_committer",
-                Level::ERROR,
-                rollup_id,
-                sync_height,
-                "committer handle not wired; cannot recover failed batch",
-            );
-            rollup.optimistic.reinsert_failed(failed);
-            return RecoveryOutcome::HeadUnchanged;
-        };
+        let committer = &self.inner.committer;
         let mut landed = Vec::new();
         let mut receipt_error = None;
         for tx in &failed.txs {
@@ -1334,9 +1348,7 @@ where
             // roll it back again, and every postBatch in between
             // anchors against the wrong root.
             if rollup.l1_head.cursor() >= sync_height {
-                if let Some(pool) = rollup.held_pool.as_ref() {
-                    pool.release_in_flight_batch(&failed.txs);
-                }
+                pool.release_in_flight_batch(&failed.txs);
                 event!(
                     name: "eez.composer.recovery.stale_verdict",
                     Level::WARN,
@@ -1437,7 +1449,7 @@ where
         // preserved across retries. An included-but-reverted tx has a
         // burned nonce — re-bundling it would poison the next bundle's
         // simulation.
-        if let Some(pool) = rollup.held_pool.as_ref() {
+        {
             let mut keep: Vec<crate::HeldTx> = Vec::with_capacity(failed.txs.len());
             let mut release: Vec<crate::HeldTx> = Vec::new();
             let mut dropped = 0usize;
@@ -1575,6 +1587,7 @@ where
             self.inner.rollups.get(&rollup_id).ok_or_else(|| {
                 format!("unknown rollup_id {rollup_id} in compose_cross_chain_batch")
             })?;
+        let pool = rollup.held_pool.as_ref();
         let state = rollup
             .l2_provider
             .state_by_block_hash(parent_hash)
@@ -1644,9 +1657,7 @@ where
                 "held tx nonce is below its canonical source-chain nonce; evicting stale tx",
             );
         }
-        if let Some(pool) = rollup.held_pool.as_ref() {
-            pool.release_in_flight_batch(&stale);
-        }
+        pool.release_in_flight_batch(&stale);
 
         // ── Slot execution contexts (design §2) ──────────────────────
         // One L1 state pinned at the anchor and one live Sync-block prefix,
@@ -1686,9 +1697,7 @@ where
                     drained = drained.len(),
                     "slot execution contexts unavailable; re-queueing the whole drain, degrading to minimal postBatch",
                 );
-                if let Some(pool) = rollup.held_pool.as_ref() {
-                    pool.push_front_batch(drained);
-                }
+                pool.push_front_batch(drained);
                 return self
                     .dispatch_minimal_postbatch(
                         ctx,
@@ -1727,7 +1736,10 @@ where
         let mut survivors: Vec<(usize, HeldTx)> = Vec::with_capacity(drained.len());
         // Inbound survivors' compositions (their `source.batch` = the L1
         // deferred entries) feed `prepare_post_batch_raw`'s merge.
-        let mut survivor_comps: Vec<eez_protocol::Composition> = Vec::with_capacity(drained.len());
+        // Keep each inbound composition attached to its HeldTx. The same
+        // compositions feed batch assembly and actionable entry resolution.
+        let mut survivor_comps: Vec<(eez_protocol::Composition, B256)> =
+            Vec::with_capacity(drained.len());
         // Staged for the post-drain canonical rebuild, which must reproduce
         // `sync_txs` byte-for-byte. `pending_out` pairs an outbound settlement
         // entry with its user tx; `pending_in` holds inbound target-side
@@ -2253,7 +2265,7 @@ where
                         target_count,
                         "composition produced {{target_count}} target(s) for held tx #{{tx_idx}}",
                     );
-                    survivor_comps.push(composition);
+                    survivor_comps.push((composition, held.hash));
                     survivors.push((idx, held));
                 }
                 Err(e) if sim_error_is_poison(&e) => {
@@ -2284,21 +2296,19 @@ where
 
         // Evict the poison txs' gapped higher nonces from the pool — once
         // a sender's nonce N is evicted, N+1.. can never land.
-        if let Some(pool) = rollup.held_pool.as_ref() {
-            for tx in &poison {
-                // Inclusive eviction releases the poison root's reservation too.
-                for t in pool.evict_chain_at_or_above(tx.sender, tx.direction, tx.nonce) {
-                    event!(
-                        name: "eez.composer.cc_compose.poison_chain_evicted",
-                        Level::WARN,
-                        rollup_id,
-                        tx_hash = %t.hash,
-                        sender = %t.sender,
-                        nonce = t.nonce,
-                        gap_at = tx.nonce,
-                        "same-sender tx above an evicted poison nonce; gapped chain can't land — evicted (resubmit in order)",
-                    );
-                }
+        for tx in &poison {
+            // Inclusive eviction releases the poison root's reservation too.
+            for t in pool.evict_chain_at_or_above(tx.sender, tx.direction, tx.nonce) {
+                event!(
+                    name: "eez.composer.cc_compose.poison_chain_evicted",
+                    Level::WARN,
+                    rollup_id,
+                    tx_hash = %t.hash,
+                    sender = %t.sender,
+                    nonce = t.nonce,
+                    gap_at = tx.nonce,
+                    "same-sender tx above an evicted poison nonce; gapped chain can't land — evicted (resubmit in order)",
+                );
             }
         }
 
@@ -2312,32 +2322,30 @@ where
                 survivors = survivors.len(),
                 "transient compose failure; re-queueing and degrading to minimal postBatch this slot",
             );
-            if let Some(pool) = rollup.held_pool.as_ref() {
-                let mut requeue = survivors;
-                requeue.extend(rest);
-                // Both phases contribute; the pool is owed its own FIFO order.
-                let mut requeue = restore_pool_order(requeue);
-                let mut cascade_evicted = Vec::new();
-                requeue.retain(|tx| {
-                    let Some(gap_at) = poison_gap_for(&poison_gaps, tx) else {
-                        return true;
-                    };
-                    event!(
-                        name: "eez.composer.cc_compose.poison_chain_evicted",
-                        Level::WARN,
-                        rollup_id,
-                        tx_hash = %tx.hash,
-                        sender = %tx.sender,
-                        nonce = tx.nonce,
-                        gap_at,
-                        "same-sender unprocessed tx above an evicted poison nonce; evicted instead of re-queued (resubmit in order)",
-                    );
-                    cascade_evicted.push(tx.clone());
-                    false
-                });
-                pool.release_in_flight_batch(&cascade_evicted);
-                pool.push_front_batch(requeue);
-            }
+            let mut requeue = survivors;
+            requeue.extend(rest);
+            // Both phases contribute; the pool is owed its own FIFO order.
+            let mut requeue = restore_pool_order(requeue);
+            let mut cascade_evicted = Vec::new();
+            requeue.retain(|tx| {
+                let Some(gap_at) = poison_gap_for(&poison_gaps, tx) else {
+                    return true;
+                };
+                event!(
+                    name: "eez.composer.cc_compose.poison_chain_evicted",
+                    Level::WARN,
+                    rollup_id,
+                    tx_hash = %tx.hash,
+                    sender = %tx.sender,
+                    nonce = tx.nonce,
+                    gap_at,
+                    "same-sender unprocessed tx above an evicted poison nonce; evicted instead of re-queued (resubmit in order)",
+                );
+                cascade_evicted.push(tx.clone());
+                false
+            });
+            pool.release_in_flight_batch(&cascade_evicted);
+            pool.push_front_batch(requeue);
             return self
                 .dispatch_minimal_postbatch(
                     ctx,
@@ -2399,9 +2407,7 @@ where
                     error = %e,
                     "build_cross_chain_sync_pairs failed; re-queueing survivors, degrading to minimal postBatch",
                 );
-                if let Some(pool) = rollup.held_pool.as_ref() {
-                    pool.push_front_batch(survivors);
-                }
+                pool.push_front_batch(survivors);
                 return self
                     .dispatch_minimal_postbatch(
                         ctx,
@@ -2438,9 +2444,7 @@ where
                 first_divergent,
                 "the incrementally appended Sync block disagrees with the canonical rebuild — a composer bug, never bad input; re-queueing survivors, degrading to minimal postBatch",
             );
-            if let Some(pool) = rollup.held_pool.as_ref() {
-                pool.push_front_batch(survivors);
-            }
+            pool.push_front_batch(survivors);
             return self
                 .dispatch_minimal_postbatch(
                     ctx,
@@ -2474,9 +2478,7 @@ where
                     error = %e,
                     "build_sync_block failed; re-queueing survivors, degrading to minimal postBatch",
                 );
-                if let Some(pool) = rollup.held_pool.as_ref() {
-                    pool.push_front_batch(survivors);
-                }
+                pool.push_front_batch(survivors);
                 return self
                     .dispatch_minimal_postbatch(
                         ctx,
@@ -2502,9 +2504,7 @@ where
                 tx_count = built.tx_successes.len(),
                 "a Sync-block tx reverted in the final build although it succeeded when appended; re-queueing survivors, degrading to minimal postBatch",
             );
-            if let Some(pool) = rollup.held_pool.as_ref() {
-                pool.push_front_batch(survivors);
-            }
+            pool.push_front_batch(survivors);
             return self
                 .dispatch_minimal_postbatch(
                     ctx,
@@ -2539,9 +2539,7 @@ where
                     error = %e,
                     "sync_block_pair_roots failed; re-queueing survivors, degrading to minimal postBatch",
                 );
-                if let Some(pool) = rollup.held_pool.as_ref() {
-                    pool.push_front_batch(survivors);
-                }
+                pool.push_front_batch(survivors);
                 return self
                     .dispatch_minimal_postbatch(
                         ctx,
@@ -2555,7 +2553,10 @@ where
                     .await;
             }
         };
-        let comp_refs: Vec<&eez_protocol::Composition> = survivor_comps.iter().collect();
+        let comp_refs: Vec<&eez_protocol::Composition> = survivor_comps
+            .iter()
+            .map(|(composition, _)| composition)
+            .collect();
         // Outbound user txs (the SyncPair user halves) travel in the sync-block
         // DA slot — the deriver can't reconstruct them from the postBatch entries
         // (only the system/load txs are). Empty for inbound-only.
@@ -2579,13 +2580,138 @@ where
             .await
             .and_then(|raw| {
                 raw.ok_or_else(|| {
-                    format!(
+                    PreparePostBatchError::Build(format!(
                         "range exceeds the {} postBatch gas budget; bounded chunks cover it",
                         self.inner.emission.max_gas
-                    )
+                    ))
                 })
             }) {
             Ok(r) => r,
+            Err(PreparePostBatchError::Actionable(failure)) => {
+                let Some(poison) = actionable_held_tx(
+                    failure,
+                    &survivors,
+                    outbound_entries.len(),
+                    &survivor_comps,
+                )
+                .cloned() else {
+                    event!(
+                        name: "eez.composer.prover.actionable_unresolved",
+                        Level::ERROR,
+                        rollup_id,
+                        failure = %failure,
+                        "validated proof failure has no matching HeldTx; retaining survivors and degrading to minimal postBatch",
+                    );
+                    pool.push_front_batch(survivors);
+                    return self
+                        .dispatch_minimal_postbatch(
+                            ctx,
+                            rollup_id,
+                            rollup,
+                            parent_header,
+                            timestamp,
+                            suggested_fee_recipient,
+                            bundle_target,
+                        )
+                        .await;
+                };
+
+                let (retry, evicted) = partition_retryable(survivors, &poison);
+                event!(
+                    name: "eez.composer.prover.poison_ejected",
+                    Level::WARN,
+                    rollup_id,
+                    failure = %failure,
+                    tx_hash = %poison.hash,
+                    sender = %poison.sender,
+                    direction = ?poison.direction,
+                    nonce = poison.nonce,
+                    retrying = retry.len(),
+                    "prover identified a poisoned held transaction; evicting its nonce-chain suffix and rebuilding the batch",
+                );
+                for in_flight in &evicted {
+                    event!(
+                        name: "eez.composer.prover.poison_in_flight_evicted",
+                        Level::WARN,
+                        rollup_id,
+                        tx_hash = %in_flight.hash,
+                        sender = %in_flight.sender,
+                        direction = ?in_flight.direction,
+                        nonce = in_flight.nonce,
+                        gap_at = poison.nonce,
+                        "in-flight transaction belongs to a prover-ejected nonce-chain suffix",
+                    );
+                }
+                for queued in
+                    pool.evict_chain_at_or_above(poison.sender, poison.direction, poison.nonce)
+                {
+                    event!(
+                        name: "eez.composer.prover.poison_queued_evicted",
+                        Level::WARN,
+                        rollup_id,
+                        tx_hash = %queued.hash,
+                        sender = %queued.sender,
+                        direction = ?queued.direction,
+                        nonce = queued.nonce,
+                        gap_at = poison.nonce,
+                        "queued transaction depends on a prover-ejected nonce; evicting suffix",
+                    );
+                }
+
+                // Each recursive attempt receives strictly fewer held
+                // transactions, bounding recomposition by the original drain
+                // size. Exact-slot attempts also retain the timestamp-based
+                // proof cutoff.
+                // The recursive call owns `retry`; retain this level's exact
+                // set so a pre-classification error can requeue it locally.
+                let retry_after_error = retry.clone();
+                let recomposed = Box::pin(self.compose_cross_chain_batch(
+                    cc,
+                    rollup_id,
+                    retry,
+                    parent_header,
+                    timestamp,
+                    suggested_fee_recipient,
+                    bundle_target,
+                ))
+                .await;
+                return match recomposed {
+                    Ok(result) => Ok(result),
+                    Err(error) => {
+                        event!(
+                            name: "eez.composer.prover.recompose_failed",
+                            Level::ERROR,
+                            rollup_id,
+                            error = %error,
+                            retrying = retry_after_error.len(),
+                            "recomposition failed before classifying its candidates; re-queueing only the remaining candidates",
+                        );
+                        pool.push_front_batch(retry_after_error);
+                        let fallback = self
+                            .dispatch_minimal_postbatch(
+                                ctx,
+                                rollup_id,
+                                rollup,
+                                parent_header,
+                                timestamp,
+                                suggested_fee_recipient,
+                                bundle_target,
+                            )
+                            .await
+                            .unwrap_or_else(|fallback_error| {
+                                event!(
+                                    name: "eez.composer.prover.recompose_fallback_failed",
+                                    Level::ERROR,
+                                    rollup_id,
+                                    error = %fallback_error,
+                                    "minimal postBatch failed after recomposition error; Sequencer commits its fallback Sync block",
+                                );
+                                None
+                            });
+                        Ok(fallback)
+                    }
+                };
+            }
             Err(e) => {
                 event!(
                     name: "eez.composer.phase2.prepare_failed",
@@ -2594,9 +2720,7 @@ where
                     error = %e,
                     "prepare_post_batch_raw failed; re-queueing survivors, degrading to minimal postBatch",
                 );
-                if let Some(pool) = rollup.held_pool.as_ref() {
-                    pool.push_front_batch(survivors);
-                }
+                pool.push_front_batch(survivors);
                 return self
                     .dispatch_minimal_postbatch(
                         ctx,
@@ -2716,10 +2840,10 @@ where
             .await
             .and_then(|raw| {
                 raw.ok_or_else(|| {
-                    format!(
+                    PreparePostBatchError::Build(format!(
                         "range exceeds the {} postBatch gas budget; bounded chunks cover it",
                         self.inner.emission.max_gas
-                    )
+                    ))
                 })
             }) {
             Ok(raw) => raw,
@@ -2874,7 +2998,8 @@ where
                     &[],
                     BundleTarget::NextBlock,
                 )
-                .await?
+                .await
+                .map_err(|error| error.to_string())?
             else {
                 over_budget += 1;
                 continue;
@@ -3035,7 +3160,7 @@ where
         outbound_entries: &[eez_protocol::abi::ExecutionEntrySol],
         outbound_user_txs: &[Bytes],
         bundle_target: BundleTarget,
-    ) -> Result<Option<Bytes>, String> {
+    ) -> Result<Option<Bytes>, PreparePostBatchError> {
         use alloy_sol_types::SolCall;
         use eez_protocol::abi::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
 
@@ -3187,7 +3312,8 @@ where
                 "settlement stitch: {effect_k} effect entries but {} per-effect roots \
                  (pair-end/entry misalignment)",
                 pair_roots.len(),
-            ));
+            )
+            .into());
         }
 
         // Stitch the per-rollup state-update chain: EEZ.sol `_applyStateUpdates`
@@ -3280,7 +3406,8 @@ where
             return Err(format!(
                 "sync block {sync_block_number} <= L1-confirmed cursor {posted}; \
                  composer is behind its own posted batches"
-            ));
+            )
+            .into());
         }
         // Invariant 7: `compose_sync_slot` bounds every range, so reaching this
         // is a decision-layer bug, not an operating condition.
@@ -3290,7 +3417,8 @@ where
                 "batch range {from}..={sync_block_number} spans {span} blocks, over \
                  MAX_BLOCKS_PER_BATCH ({}) — emission bug",
                 self.inner.emission.max_blocks,
-            ));
+            )
+            .into());
         }
         let span_len = usize::try_from(span).map_err(|e| format!("batch span overflow: {e}"))?;
         let mut blocks_rev: Vec<Vec<Vec<u8>>> = Vec::with_capacity(span_len.saturating_sub(1));
@@ -3348,7 +3476,8 @@ where
                     return Err(format!(
                         "intermediate block {cursor_number} carries a system transaction; \
                          emission is blocked until the failed Sync block is recovered"
-                    ));
+                    )
+                    .into());
                 }
             }
             blocks_rev.push(tx_bytes);
@@ -3413,7 +3542,7 @@ where
         // Prove the assembled window (proofs[] empty — not part of the
         // publicInputsHash). Mock ignores the context; a remote prover re-executes
         // `blocks`. Settlement path, off block production.
-        let block_witnesses = match self.inner.witness_source.get() {
+        let block_witnesses = match self.inner.witness_source.as_ref() {
             // Remote-prover mode. Intermediate blocks `[from..sync)` are committed
             // (served by the witness store); a freshly-built endpoint isn't, so
             // capture it here from the in-memory block.
@@ -3478,14 +3607,24 @@ where
             blocks: block_witnesses,
             l1_block_hash: None, // timeless batch (blockNumber 0)
         };
-        let proof = prove_with_retry(
+        let proof = match prove_with_retry(
             self.inner.prover.as_ref(),
             proving_ctx,
             self.inner.emission.timing,
             bundle_target,
         )
         .await
-        .map_err(|e| format!("prover.prove: {e}"))?;
+        {
+            Ok(proof) => proof,
+            Err(error) => {
+                let Some(failure) = error.actionable_failure() else {
+                    return Err(PreparePostBatchError::Prover(error));
+                };
+                validate_actionable_prover_failure(failure, &batch, sync_block)
+                    .map_err(PreparePostBatchError::Build)?;
+                return Err(PreparePostBatchError::Actionable(failure));
+            }
+        };
         batch.proofs = vec![proof];
 
         let calldata = postAndVerifyBatchCall {
@@ -3518,7 +3657,7 @@ where
             .and_then(|s| s.parse::<Address>().ok())
             .ok_or("EEZ_REGISTRY_ADDRESS missing or not a valid address")?;
 
-        sign_post_batch_tx(
+        Ok(sign_post_batch_tx(
             &ctx.l1_poster_signer,
             &ctx.l1_provider,
             eez_address,
@@ -3528,7 +3667,7 @@ where
             self.inner.emission.max_gas,
         )
         .await
-        .map(Some)
+        .map(Some)?)
     }
 }
 
@@ -3731,7 +3870,24 @@ async fn sign_post_batch_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::held_pool::HeldPool;
     use alloy_primitives::TxHash;
+    use alloy_sol_types::SolValue as _;
+
+    #[test]
+    fn submission_identity_must_match_post_batch_signer() {
+        let poster = Address::repeat_byte(0xa);
+        assert!(ensure_submission_identity(poster, poster).is_ok());
+
+        let err = ensure_submission_identity(poster, Address::repeat_byte(0xb)).unwrap_err();
+        assert!(matches!(
+            err,
+            ComposerConfigError::SubmissionIdentityMismatch {
+                submitter_poster,
+                post_batch_signer,
+            } if submitter_poster == poster && post_batch_signer == Address::repeat_byte(0xb)
+        ));
+    }
 
     fn held(sender: Address, direction: Direction, nonce: u64, hash_byte: u8) -> HeldTx {
         HeldTx {
@@ -3782,6 +3938,110 @@ mod tests {
 
         assert_eq!(poison.len(), 2);
         assert_eq!(gaps, vec![(sender, Direction::Inbound, 7)]);
+    }
+
+    #[test]
+    fn recursive_error_requeues_only_candidates_remaining_after_prover_eviction() {
+        let pool = HeldPool::new();
+        let sender = Address::repeat_byte(0xc);
+        let poison = held(sender, Direction::Inbound, 0, 1);
+        let suffix = held(sender, Direction::Inbound, 1, 2);
+        let independent = held(Address::repeat_byte(0xd), Direction::Inbound, 0, 3);
+        pool.push_contiguous(poison.clone(), 0).unwrap();
+        pool.push_contiguous(suffix.clone(), 0).unwrap();
+        pool.push_contiguous(independent.clone(), 0).unwrap();
+
+        let survivors = pool.pop_all();
+        let (retry, evicted) = partition_retryable(survivors, &poison);
+        assert_eq!(
+            evicted.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
+            vec![poison.hash, suffix.hash]
+        );
+        assert!(
+            pool.evict_chain_at_or_above(poison.sender, poison.direction, poison.nonce)
+                .is_empty()
+        );
+
+        // Mirrors the recursive-error arm: only its owned retry set returns to
+        // the pool; the outer original drain must never be requeued.
+        pool.push_front_batch(retry);
+        let queued = pool.pop_all();
+        assert_eq!(
+            queued.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
+            vec![independent.hash]
+        );
+        pool.release_in_flight_batch(&queued);
+        assert!(pool.push_contiguous(poison, 0).is_ok());
+    }
+
+    #[test]
+    fn inbound_owner_mapping_follows_post_batch_entry_order() {
+        fn entry(marker: u8) -> eez_protocol::abi::ExecutionEntrySol {
+            eez_protocol::abi::ExecutionEntrySol {
+                returnData: Bytes::from(vec![marker]),
+                ..Default::default()
+            }
+        }
+
+        fn composition(
+            entries: Vec<eez_protocol::abi::ExecutionEntrySol>,
+        ) -> eez_protocol::Composition {
+            eez_protocol::Composition {
+                source: eez_protocol::SourceComposition {
+                    rollup_id: eez_protocol::RollupId(1),
+                    batch: eez_protocol::EvmBatch {
+                        entries,
+                        ..Default::default()
+                    },
+                },
+                targets: Vec::new(),
+            }
+        }
+
+        let first = held(Address::repeat_byte(0xa), Direction::Inbound, 0, 0xa);
+        let second = held(Address::repeat_byte(0xb), Direction::Inbound, 0, 0xb);
+        let compositions = vec![
+            (composition(vec![entry(0xa1), entry(0xa2)]), first.hash),
+            (composition(vec![entry(0xb1)]), second.hash),
+        ];
+
+        let outbound = [entry(0x01), entry(0x02)];
+        // Canonical postBatch order is anchor, outbound entries, then the
+        // inbound entries grouped by their owning composition.
+        let mut entries = vec![entry(0)];
+        entries.extend(outbound.iter().cloned());
+        entries.extend(
+            compositions
+                .iter()
+                .flat_map(|(composition, _)| composition.source.batch.entries.iter().cloned()),
+        );
+        let batch = eez_protocol::EvmBatch {
+            entries,
+            ..Default::default()
+        };
+        assert_eq!(
+            batch
+                .entries
+                .iter()
+                .map(|entry| entry.returnData[0])
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 0xa1, 0xa2, 0xb1]
+        );
+
+        let survivors = vec![first.clone(), second.clone()];
+        for (entry_index, expected) in [(4, first.hash), (5, second.hash)] {
+            let failure = ActionableProverFailure::Inbound {
+                entry_index,
+                entry_hash: alloy_primitives::keccak256(batch.entries[entry_index].abi_encode()),
+            };
+            validate_actionable_prover_failure(failure, &batch, None).unwrap();
+            assert_eq!(
+                actionable_held_tx(failure, &survivors, outbound.len(), &compositions)
+                    .unwrap()
+                    .hash,
+                expected
+            );
+        }
     }
 
     #[test]

@@ -44,7 +44,7 @@ pub use block_committer::{BlockCommitterHandle, CommitOutcome, DeriveOutcome, Fo
 #[doc(inline)]
 pub use error::{DriverError, DriverResult};
 #[doc(inline)]
-pub use sequencer::{EthAttributesBuilder, Sequencer};
+pub use sequencer::{DEFAULT_MAX_SPECULATIVE_DEPTH, EthAttributesBuilder, Sequencer};
 #[doc(inline)]
 pub use slot::{
     ParentContext, SlotEvent, SlotKind, SyncSlotBlock, SyncSlotComposer, SyncSlotComposerHandle,

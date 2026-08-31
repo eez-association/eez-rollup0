@@ -783,7 +783,13 @@ impl Harness {
     /// Stages a local chain that can later restart as a composer or follower.
     pub fn standalone_env(&self) -> Vec<(&'static str, String)> {
         vec![
+            (
+                "EEZ_L1_BLOCK_TIME_MS",
+                (L1_BLOCK_TIME_SECS * 1000).to_string(),
+            ),
             ("EEZ_L2_BLOCK_TIME_MS", "2000".to_string()),
+            ("EEZ_PROOF_TIME_MS", "1000".to_string()),
+            ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
             (
                 "RUST_LOG",
                 std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
@@ -820,7 +826,7 @@ impl Harness {
         expect_external_batches: bool,
     ) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
-            poster_key,
+            poster_key: Some(poster_key),
             proof_signer_key: Some(ANVIL_ATTESTER_KEY),
             rollup_id: self.dep.rollup_id,
             expect_external_batches,
@@ -834,7 +840,7 @@ impl Harness {
         sequencer_rpc: Option<&str>,
     ) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
-            poster_key: ANVIL_KEY,
+            poster_key: None,
             proof_signer_key: None,
             rollup_id: self.dep.rollup_id,
             expect_external_batches: true,
@@ -845,7 +851,7 @@ impl Harness {
 
     pub async fn env_with_rollup_id(&self, rollup_id: u64) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
-            poster_key: ANVIL_KEY,
+            poster_key: Some(ANVIL_KEY),
             proof_signer_key: Some(ANVIL_ATTESTER_KEY),
             rollup_id,
             expect_external_batches: false,
@@ -859,7 +865,7 @@ impl Harness {
         proof_signer_key: &str,
     ) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
-            poster_key: ANVIL_KEY,
+            poster_key: Some(ANVIL_KEY),
             proof_signer_key: Some(proof_signer_key),
             rollup_id: self.dep.rollup_id,
             expect_external_batches: false,
@@ -873,12 +879,8 @@ impl Harness {
         opts: NodeEnvOptions<'_>,
     ) -> Result<Vec<(&'static str, String)>> {
         let mut env = vec![
-            ("EEZ_L1_EMBEDDED", "1".to_string()),
             ("EEZ_L1_CHAIN_PATH", "dev".to_string()),
             ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
-            ("EEZ_L1_TARGET_RPC_URL", self.anvil.rpc_url.clone()),
-            ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
-            ("EEZ_L1_POSTER_KEY", opts.poster_key.to_string()),
             ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
             ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
@@ -925,7 +927,15 @@ impl Harness {
             ),
         ];
 
-        // A prover endpoint selects composer mode; omitting it selects follower mode.
+        if let Some(poster_key) = opts.poster_key {
+            env.extend([
+                ("EEZ_L1_TARGET_RPC_URL", self.anvil.rpc_url.clone()),
+                ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
+                ("EEZ_L1_POSTER_KEY", poster_key.to_string()),
+            ]);
+        }
+
+        // Composer tests use the real remote-prover path. Followers omit it.
         if let Some(signer_key) = opts.proof_signer_key {
             let genesis = self.l2_genesis_path();
             let attester = signer_address(signer_key)?;
@@ -960,7 +970,7 @@ impl Harness {
 }
 
 struct NodeEnvOptions<'a> {
-    poster_key: &'a str,
+    poster_key: Option<&'a str>,
     proof_signer_key: Option<&'a str>,
     rollup_id: u64,
     expect_external_batches: bool,
@@ -1064,7 +1074,13 @@ pub async fn send_l2_value_transfer(
     let mut tx = TxLegacy {
         chain_id: Some(chain_id),
         nonce,
-        gas_price: provider.get_gas_price().await?,
+        // Reth's txpool requires a non-zero priority margin. The RPC gas-price
+        // suggestion can equal the current base fee during startup, which makes
+        // an otherwise valid legacy test transaction "underpriced".
+        gas_price: provider
+            .get_gas_price()
+            .await?
+            .saturating_add(2_000_000_000),
         gas_limit: 21_000,
         to: alloy_primitives::TxKind::Call(to),
         value,
@@ -1272,8 +1288,28 @@ pub struct NodeHandle {
     pub http_port: u16,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub enum NodeBinary {
+    #[default]
+    Composer,
+    Follower,
+    Dev,
+}
+
+impl NodeBinary {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Composer => env!("CARGO_BIN_EXE_eez-composer"),
+            Self::Follower => env!("CARGO_BIN_EXE_eez-follower"),
+            Self::Dev => env!("CARGO_BIN_EXE_eez-dev-node"),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct NodeConfig<'a> {
+    /// Explicit node-role executable to launch.
+    pub binary: NodeBinary,
     pub genesis_path: Option<&'a std::path::Path>,
 }
 
@@ -1323,10 +1359,10 @@ impl NodeHandle {
             .map(|p| p.as_os_str().to_owned())
             .or(env_genesis)
             .unwrap_or_else(|| std::ffi::OsString::from("dev"));
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_eez-node"));
-        // eez-node loads dotenv files from its working directory. Running from
+        let mut cmd = Command::new(cfg.binary.path());
+        // Each role binary loads dotenv files from its working directory. Running from
         // the datadir prevents repository settings from changing the explicit
-        // test mode or redirecting L1 traffic to a developer endpoint.
+        // test configuration or redirecting L1 traffic to a developer endpoint.
         cmd.current_dir(datadir)
             .args(["node", "--chain"])
             .arg(&chain_arg)
@@ -1376,7 +1412,7 @@ impl NodeHandle {
             }
             cmd.env(*k, v);
         }
-        let child = cmd.spawn().context("spawn eez-node")?;
+        let child = cmd.spawn().context("spawn eez node role")?;
         Ok(Self {
             child: std::sync::Mutex::new(child),
             background_tasks: std::sync::Mutex::new(Vec::new()),
@@ -2661,7 +2697,6 @@ impl CrossChainConfig {
 
     fn env(&self) -> Vec<(&'static str, String)> {
         vec![
-            ("EEZ_L1_EMBEDDED", "1".to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
             ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_RPC_URL", self.l1_rpc_url()),
