@@ -1,4 +1,4 @@
-//! Configuration for the [`Submitter`](crate::Submitter) (send-path),
+//! Configuration for read-only L1 access and signed batch submission,
 //! populated from `EEZ_*` environment variables.
 //!
 //! Per-rollup composer/orchestration knobs (rollup id, proof system,
@@ -8,7 +8,7 @@
 
 use std::{env, str::FromStr};
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::Address;
 use alloy_signer_local::PrivateKeySigner;
 use url::Url;
 
@@ -21,23 +21,11 @@ const ENV_POSTER_KEY: &str = "EEZ_L1_POSTER_KEY";
 const ENV_EEZ_ADDRESS: &str = "EEZ_REGISTRY_ADDRESS";
 const ENV_ROLLUP_ID: &str = "EEZ_ROLLUP_ID";
 
-/// L1 connectivity for the [`Submitter`](crate::Submitter) — what's
-/// needed to send and read transactions against the EEZ registry.
+/// Read-only L1 connectivity used by the Deriver's canonical-chain scans.
 #[derive(Clone)]
-pub struct SubmitterConfig {
+pub struct L1ReaderConfig {
     /// L1 RPC endpoint (HTTP / HTTPS).
     pub rpc_url: Url,
-    /// L1 builder relay accepting `eth_sendBundle`. All postBatch txs
-    /// go here; `rpc_url` is used for reads only.
-    pub builder_rpc_url: Url,
-    /// Optional RPC used ONLY for `BundleTarget::NextBlock` target-block
-    /// calculation. The embedded L1 can lag the canonical tip by 2-3
-    /// blocks, so `target = local.latest + slack` lands already-past and
-    /// the bundler drops it; point this at a tip-following node to pick
-    /// an unproposed future block. `None` → falls back to `rpc_url`.
-    pub target_rpc_url: Option<Url>,
-    /// EOA that signs L1 txs (pays gas).
-    pub poster: PrivateKeySigner,
     /// Deployed `EEZ` (rollups registry) address.
     pub eez: Address,
     /// Our rollup's id. Used by the batch-log scanner to filter the
@@ -46,18 +34,62 @@ pub struct SubmitterConfig {
     pub rollup_id: u64,
 }
 
+impl std::fmt::Debug for L1ReaderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("L1ReaderConfig")
+            .field("rpc_url", &self.rpc_url.as_str())
+            .field("eez", &self.eez)
+            .field("rollup_id", &self.rollup_id)
+            .finish()
+    }
+}
+
+impl L1ReaderConfig {
+    /// Read the canonical-chain scan configuration from `EEZ_*` env vars.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`L1Error::Config`] for any missing required var or
+    /// malformed value.
+    pub fn from_env() -> L1Result<Self> {
+        Ok(Self {
+            rpc_url: parse_url(ENV_RPC_URL)?,
+            eez: parse_address(ENV_EEZ_ADDRESS)?,
+            rollup_id: parse_u64(ENV_ROLLUP_ID)?,
+        })
+    }
+}
+
+/// Signed submission configuration. Read-side settings are grouped in
+/// [`L1ReaderConfig`]; the remaining fields exist only for posting batches.
+#[derive(Clone)]
+pub struct SubmitterConfig {
+    /// Canonical L1 source used for reads and as the default target-tip RPC.
+    pub reader: L1ReaderConfig,
+    /// L1 builder relay accepting `eth_sendBundle`. All postBatch txs
+    /// go here; [`L1ReaderConfig::rpc_url`] is used for reads only.
+    pub builder_rpc_url: Url,
+    /// Optional RPC used ONLY for `BundleTarget::NextBlock` target-block
+    /// calculation. The embedded L1 can lag the canonical tip by 2-3
+    /// blocks, so `target = local.latest + slack` lands already-past and
+    /// the bundler drops it; point this at a tip-following node to pick
+    /// an unproposed future block. `None` falls back to
+    /// [`L1ReaderConfig::rpc_url`].
+    pub target_rpc_url: Option<Url>,
+    /// EOA that signs L1 txs (pays gas).
+    pub poster: PrivateKeySigner,
+}
+
 impl std::fmt::Debug for SubmitterConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SubmitterConfig")
-            .field("rpc_url", &self.rpc_url.as_str())
+            .field("reader", &self.reader)
             .field("builder_rpc_url", &self.builder_rpc_url.as_str())
             .field(
                 "target_rpc_url",
                 &self.target_rpc_url.as_ref().map(Url::as_str),
             )
             .field("poster", &self.poster.address())
-            .field("eez", &self.eez)
-            .field("rollup_id", &self.rollup_id)
             .finish()
     }
 }
@@ -81,37 +113,12 @@ impl SubmitterConfig {
         // Flashbots-style relay. On the embedded dev/testing L1 the node
         // serves `eth_sendBundle` itself (see `eez-node::bundle_rpc`), so
         // set this to the same value as EEZ_L1_RPC_URL.
-        let rpc_url = parse_url(ENV_RPC_URL)?;
         let builder_rpc_url = parse_url(ENV_BUILDER_RPC_URL)?;
         Ok(Self {
-            rpc_url,
+            reader: L1ReaderConfig::from_env()?,
             builder_rpc_url,
             target_rpc_url,
             poster: parse_key(ENV_POSTER_KEY)?,
-            eez: parse_address(ENV_EEZ_ADDRESS)?,
-            rollup_id: parse_u64(ENV_ROLLUP_ID)?,
-        })
-    }
-
-    /// Read L1 config for read-only consumers. If
-    /// `EEZ_L1_POSTER_KEY` is absent, install a deterministic dummy key
-    /// because scan paths never sign or send transactions.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`L1Error::Config`] for any missing required read-side var
-    /// or malformed value.
-    pub fn from_env_read_only() -> L1Result<Self> {
-        let rpc_url = parse_url(ENV_RPC_URL)?;
-        Ok(Self {
-            rpc_url: rpc_url.clone(),
-            builder_rpc_url: rpc_url,
-            // Read-only / scan consumers never compute a NextBlock
-            // target, so the override is irrelevant here.
-            target_rpc_url: None,
-            poster: parse_key_or_dummy(ENV_POSTER_KEY)?,
-            eez: parse_address(ENV_EEZ_ADDRESS)?,
-            rollup_id: parse_u64(ENV_ROLLUP_ID)?,
         })
     }
 }
@@ -132,29 +139,6 @@ fn parse_key(name: &str) -> L1Result<PrivateKeySigner> {
     let raw = require(name)?;
     PrivateKeySigner::from_str(raw.trim_start_matches("0x"))
         .map_err(|e| L1Error::Config(format!("{name}: {e}")))
-}
-
-fn parse_key_or_dummy(name: &str) -> L1Result<PrivateKeySigner> {
-    match env::var(name) {
-        Ok(raw) => {
-            let raw = raw.trim();
-            if raw.is_empty() {
-                dummy_key(name)
-            } else {
-                PrivateKeySigner::from_str(raw.trim_start_matches("0x"))
-                    .map_err(|e| L1Error::Config(format!("{name}: {e}")))
-            }
-        }
-        Err(env::VarError::NotPresent) => dummy_key(name),
-        Err(env::VarError::NotUnicode(_)) => {
-            Err(L1Error::Config(format!("{name} contains non-UTF-8 bytes")))
-        }
-    }
-}
-
-fn dummy_key(name: &str) -> L1Result<PrivateKeySigner> {
-    PrivateKeySigner::from_bytes(&B256::with_last_byte(1))
-        .map_err(|e| L1Error::Config(format!("dummy {name}: {e}")))
 }
 
 fn parse_u64(name: &str) -> L1Result<u64> {

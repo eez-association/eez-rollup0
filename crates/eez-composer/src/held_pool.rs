@@ -32,18 +32,16 @@ use crate::ingress::Direction;
 #[derive(Debug, Clone)]
 pub struct HeldTx {
     /// RLP-encoded source transaction (signed envelope). Handed to
-    /// `EvmComposer::simulate_and_resolve` verbatim.
+    /// the composer's chained simulation verbatim.
     pub raw_tx: Bytes,
     /// Cached hash of the signed envelope, used for queued/in-flight dedupe.
     pub hash: TxHash,
-    /// Failed-bundle attempts so far. Bundles are strict
-    /// all-or-nothing, so a deterministically-reverting tx fails every
-    /// bundle it joins — and from outside, a "tx reverts in builder
-    /// simulation" drop is indistinguishable from a "no builder slot"
-    /// drop. Recovery increments this on each re-queue and EVICTS the
-    /// tx (loud WARN, user resubmits) at
+    /// Failed settlement attempts so far. A proof rejection or bundle drop
+    /// may be caused by a poison transaction even when compose-time simulation
+    /// accepted it. Recovery increments this once per failed episode and
+    /// EVICTS the tx (loud ERROR, user resubmits) at
     /// [`MAX_BUNDLE_ATTEMPTS`](crate::composer::MAX_BUNDLE_ATTEMPTS),
-    /// so one poison tx can't fail every postBatch forever.
+    /// so one candidate set cannot fail every postBatch forever.
     pub attempts: u32,
     /// Recovered L1 sender. Together with `nonce`, lets the pool and
     /// the eviction path keep each sender's nonce chain CONTIGUOUS:
@@ -166,11 +164,8 @@ impl PoolState {
 
 /// Per-rollup pool of held cross-chain transactions.
 ///
-/// Stored as `Option<HeldPool>` on
-/// [`RollupState`](crate::RollupState): `None` for rollups that don't
-/// participate in cross-chain composition (entry-only deployments or
-/// follower-only deployments without cross-chain content from this
-/// chain).
+/// Every [`RollupState`](crate::RollupState) owned by a composer has one;
+/// follower and development binaries do not construct `RollupState`.
 #[derive(Debug, Default)]
 pub struct HeldPool {
     state: Mutex<PoolState>,

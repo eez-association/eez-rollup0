@@ -347,7 +347,7 @@ impl CompositionBuilder {
                 );
                 batch
             } else {
-                let batch = entries::build_l1_inbound_sidecar(&group_calls, *rollup_id)?;
+                let batch = entries::build_inbound_target_entries(&group_calls, *rollup_id)?;
                 tracing::debug!(
                     name: "composer.inbound_sidecar",
                     %rollup_id,

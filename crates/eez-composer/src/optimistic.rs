@@ -40,11 +40,12 @@ use crate::held_pool::HeldTx;
 /// a reverting tx is excluded → the whole bundle drops, so the outcome
 /// can't distinguish "relay bad luck" from "a tx would revert" — both
 /// look like a drop. Poison is therefore caught earlier, at compose
-/// time (a tx whose `simulate_and_resolve` deterministically fails is
+/// time (a tx whose chained simulation deterministically fails is
 /// evicted before it can ever enter a bundle); a drop that reaches
 /// recovery is treated as bad luck and re-queued, with
 /// [`MAX_BUNDLE_ATTEMPTS`](crate::composer::MAX_BUNDLE_ATTEMPTS) as a
-/// backstop for poison the compose-time sim view missed.
+/// backstop for poison the compose-time sim view missed. The same bound covers
+/// proof failures, so one counter follows a transaction across both paths.
 #[derive(Debug)]
 pub struct FailedBatch {
     /// L2 height of the optimistically-committed Sync block.

@@ -29,14 +29,11 @@ use std::{sync::Arc, time::Duration};
 
 use alloy_primitives::{Address, B256};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_engine_primitives::ConsensusEngineHandle;
 use reth_ethereum_engine_primitives::EthPayloadAttributes;
-use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{BuiltPayload, PayloadTypes};
 use reth_primitives_traits::{
     AlloyBlockHeader, HeaderTy, NodePrimitives, SealedHeader, SealedHeaderFor,
 };
-use reth_storage_api::{BlockIdReader, BlockReader};
 use tracing::{Level, event};
 
 use tokio::sync::mpsc;
@@ -72,16 +69,30 @@ fn log_stale_parent(phase: &str) {
     );
 }
 
-struct SpeculativeLimit {
-    max_depth: u64,
-    source: Arc<eez_l1::L1CanonicalHead>,
+enum SequencingMode {
+    Standalone,
+    Composer {
+        rollup_id: u64,
+        composer: SyncSlotComposerHandle,
+        max_speculative_depth: u64,
+        l1_head: Arc<eez_l1::L1CanonicalHead>,
+    },
 }
 
-impl fmt::Debug for SpeculativeLimit {
+impl fmt::Debug for SequencingMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SpeculativeLimit")
-            .field("max_depth", &self.max_depth)
-            .finish_non_exhaustive()
+        match self {
+            Self::Standalone => f.write_str("Standalone"),
+            Self::Composer {
+                rollup_id,
+                max_speculative_depth,
+                ..
+            } => f
+                .debug_struct("Composer")
+                .field("rollup_id", rollup_id)
+                .field("max_speculative_depth", max_speculative_depth)
+                .finish_non_exhaustive(),
+        }
     }
 }
 
@@ -167,14 +178,9 @@ where
     /// compute per-trigger Live/Future/Sync block composition and per-
     /// block timestamps.
     timing: RollupTiming,
-    /// Optional speculative-depth cap. None = no limit
-    /// (single-composer / follower mode). See `DEFAULT_MAX_SPECULATIVE_DEPTH`.
-    speculative_limit: Option<SpeculativeLimit>,
-    /// Optional Sync-slot block producer + the rollup id it composes
-    /// for (which HeldPool to drain). When present, called before each
-    /// Sync block to fetch that rollup's cross-chain content. `None` =
-    /// empty Sync blocks.
-    sync_slot_composer: Option<(u64, SyncSlotComposerHandle)>,
+    /// Role-specific sequencing dependencies. Composer mode always has its
+    /// Sync-slot composer and L1-confirmed head; standalone mode has neither.
+    mode: SequencingMode,
 }
 
 impl<T, ChainSpec> fmt::Debug for Sequencer<T, ChainSpec>
@@ -184,7 +190,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Sequencer")
             .field("committer", &self.committer)
-            .field("speculative_limit", &self.speculative_limit)
+            .field("mode", &self.mode)
             .finish_non_exhaustive()
     }
 }
@@ -206,89 +212,51 @@ where
         + Sync
         + 'static,
 {
-    /// Constructs a sequencer by spawning a `BlockCommitter` seeded
-    /// from reth's current best head plus persisted safe/finalized
-    /// anchors. Sharing that handle with the Deriver keeps all engine
-    /// traffic serialized through one task.
-    pub fn new<P>(
-        provider: &P,
+    /// Construct an unanchored development sequencer around the binary-owned
+    /// `BlockCommitter` actor.
+    #[must_use]
+    pub fn standalone(
         attributes: EthAttributesBuilder<ChainSpec>,
-        to_engine: ConsensusEngineHandle<T>,
+        committer: BlockCommitterHandle<T>,
         schedule_rx: mpsc::Receiver<SlotEvent>,
-        payload_builder: PayloadBuilderHandle<T>,
         timing: RollupTiming,
-        witness_sender: Option<mpsc::UnboundedSender<B256>>,
-    ) -> DriverResult<Self>
-    where
-        P: BlockReader<Header = HeaderTy<<T::BuiltPayload as BuiltPayload>::Primitives>>
-            + BlockIdReader,
-    {
-        // Prover-feed (prover-chain P1): thread the witness channel into the
-        // committer so each PRODUCED block's hash is emitted at canonical commit
-        // for the out-of-loop capture task. `None` outside remote-prover mode.
-        let committer = BlockCommitterHandle::spawn_from_provider(
-            provider,
-            to_engine,
-            payload_builder,
-            witness_sender,
-        )?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             attributes,
             schedule_rx,
             committer,
             timing,
-            speculative_limit: None,
-            sync_slot_composer: None,
-        })
+            mode: SequencingMode::Standalone,
+        }
     }
 
-    /// Replace the schedule receiver. Composer mode constructs the
-    /// Sequencer early with a placeholder channel (so the single
-    /// `BlockCommitter` actor exists for the Deriver wiring), then swaps
-    /// in the L1-anchored scheduler's receiver once the `L1Watcher` is
-    /// up. One Sequencer / one committer actor / one reconcile lock —
-    /// a second Sequencer would split the lock and head mirror across
-    /// two actors.
+    /// Construct an L1-anchored composer sequencer. All composer-only
+    /// dependencies are mandatory and share the binary-owned committer with
+    /// the Composer and Deriver.
     #[must_use]
-    pub fn with_schedule_rx(mut self, schedule_rx: mpsc::Receiver<SlotEvent>) -> Self {
-        self.schedule_rx = schedule_rx;
-        self
-    }
-
-    /// Attach a [`SyncSlotComposerHandle`] for `rollup_id`. When set,
-    /// the Sequencer calls it before each Sync block to fetch the
-    /// cross-chain system txs for that rollup. None = empty Sync
-    /// blocks (no cross-chain content).
-    #[must_use]
-    pub fn with_sync_slot_composer(
-        mut self,
+    #[allow(clippy::too_many_arguments)]
+    pub fn composer(
+        attributes: EthAttributesBuilder<ChainSpec>,
+        committer: BlockCommitterHandle<T>,
+        schedule_rx: mpsc::Receiver<SlotEvent>,
+        timing: RollupTiming,
         rollup_id: u64,
         composer: SyncSlotComposerHandle,
+        max_speculative_depth: u64,
+        l1_head: Arc<eez_l1::L1CanonicalHead>,
     ) -> Self {
-        self.sync_slot_composer = Some((rollup_id, composer));
-        self
-    }
-
-    /// Cap blocks above `source`'s L1-confirmed head; `advance` pauses
-    /// past `max_depth` so the Deriver gets time to replay L1 batches
-    /// without state-pruning churn. Skip for single-composer /
-    /// follower setups. Use `DEFAULT_MAX_SPECULATIVE_DEPTH` for the
-    /// typical based-mode deployment.
-    #[must_use]
-    pub fn with_speculative_limit(
-        mut self,
-        max_depth: u64,
-        source: Arc<eez_l1::L1CanonicalHead>,
-    ) -> Self {
-        self.speculative_limit = Some(SpeculativeLimit { max_depth, source });
-        self
-    }
-
-    /// Clone-cheap handle to the underlying `BlockCommitter` actor.
-    /// Other components (Deriver) push commands through the same task.
-    #[must_use]
-    pub fn committer(&self) -> BlockCommitterHandle<T> {
-        self.committer.clone()
+        Self {
+            attributes,
+            schedule_rx,
+            committer,
+            timing,
+            mode: SequencingMode::Composer {
+                rollup_id,
+                composer,
+                max_speculative_depth,
+                l1_head,
+            },
+        }
     }
 
     /// Runs the sequencer loop until cancellation. Errors during advance
@@ -402,11 +370,18 @@ where
         &mut self,
         sync_slot_block_height: u64,
     ) -> DriverResult<()> {
+        let Some((rollup_id, composer)) = self.composer_context() else {
+            event!(
+                name: "eez.sequencer.mode_mismatch",
+                Level::ERROR,
+                event = "live_tick",
+                "standalone sequencer received an L1-anchored event",
+            );
+            return Ok(());
+        };
         // Before the head read: a mid-slot verdict would otherwise wait K
         // blocks, and recovery can reorg + substitute under us.
-        if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref() {
-            composer.recover_failed(*rollup_id).await;
-        }
+        composer.recover_failed(rollup_id).await;
         let last_header = self.committer.last_header();
         let head = last_header.number();
         // Reserve = Future blocks + the Sync block itself. Mirrors
@@ -455,11 +430,18 @@ where
         sync_slot_timestamp: u64,
         l1_head: u64,
     ) -> DriverResult<()> {
+        let Some((rollup_id, composer)) = self.composer_context() else {
+            event!(
+                name: "eez.sequencer.mode_mismatch",
+                Level::ERROR,
+                event = "sync_slot",
+                "standalone sequencer received an L1-anchored event",
+            );
+            return Ok(());
+        };
         // Before the composition: a pending verdict would seed the whole burst
         // on a doomed head, for compose_sync_slot to reorg away at its end.
-        if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref() {
-            composer.recover_failed(*rollup_id).await;
-        }
+        composer.recover_failed(rollup_id).await;
         let head = self.committer.last_header().number();
         // Catchup ignores the speculative cap (a steady-state bound): a
         // dropped pb heals by recomposing next trigger, which freezing to
@@ -505,18 +487,13 @@ where
                     .timestamp()
                     .saturating_add(self.timing.l2_block_time().as_secs());
 
-                let prebuilt = if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref()
-                {
-                    let parent = crate::slot::ParentContext {
-                        header: last_header.clone(),
-                    };
-                    composer
-                        // Catch-up: next-available L1 block (unpinned), empty.
-                        .compose_sync_slot(*rollup_id, parent, sync_ts, None, SyncSlotMode::Catchup)
-                        .await
-                } else {
-                    None
+                let parent = crate::slot::ParentContext {
+                    header: last_header.clone(),
                 };
+                let prebuilt = composer
+                    // Catch-up: next-available L1 block (unpinned), empty.
+                    .compose_sync_slot(rollup_id, parent, sync_ts, None, SyncSlotMode::Catchup)
+                    .await;
                 if let Some(built) = prebuilt {
                     if let Err(err) = self.commit_one_prebuilt(SlotKind::Sync, built).await {
                         if err.is_stale_parent() {
@@ -602,26 +579,21 @@ where
                         "trigger too late for the immediate L1 slot; committing an empty block and holding the pool — next slot's batch covers it",
                     );
                     // Empty mode keeps this grid height batch-boundary-eligible
-                    // (a tx-bearing block is not). Not airtight: with no composer
-                    // wired, or if the empty build fails, control still falls
-                    // through to the mempool-fed commit_one below.
-                    if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref() {
-                        let parent = crate::slot::ParentContext {
-                            header: last_header.clone(),
-                        };
-                        composer
-                            .compose_sync_slot(
-                                *rollup_id,
-                                parent,
-                                expected_sync_ts,
-                                None,
-                                SyncSlotMode::Empty,
-                            )
-                            .await
-                    } else {
-                        None
-                    }
-                } else if let Some((rollup_id, composer)) = self.sync_slot_composer.as_ref() {
+                    // (a tx-bearing block is not). If the empty build fails,
+                    // control falls through to the mempool-fed commit below.
+                    let parent = crate::slot::ParentContext {
+                        header: last_header.clone(),
+                    };
+                    composer
+                        .compose_sync_slot(
+                            rollup_id,
+                            parent,
+                            expected_sync_ts,
+                            None,
+                            SyncSlotMode::Empty,
+                        )
+                        .await
+                } else {
                     let parent = crate::slot::ParentContext {
                         header: last_header.clone(),
                     };
@@ -629,15 +601,13 @@ where
                         // Steady: aim the immediate next L1 block, pinned to
                         // expected_sync_ts (re-derivable; == the L1 slot ts on-grid).
                         .compose_sync_slot(
-                            *rollup_id,
+                            rollup_id,
                             parent,
                             expected_sync_ts,
                             Some(l1_head + 1),
                             SyncSlotMode::Steady,
                         )
                         .await
-                } else {
-                    None
                 };
                 if let Some(built) = prebuilt {
                     match self.commit_one_prebuilt(SlotKind::Sync, built).await {
@@ -665,24 +635,43 @@ where
 
     /// True if the speculative-depth limit is reached; logged at DEBUG.
     fn speculative_limit_paused(&self, head_number: u64) -> bool {
-        let Some(limit) = &self.speculative_limit else {
-            return false;
+        let (max_depth, source) = match &self.mode {
+            SequencingMode::Standalone => return false,
+            SequencingMode::Composer {
+                max_speculative_depth,
+                l1_head,
+                ..
+            } => (*max_speculative_depth, l1_head),
         };
-        let confirmed = limit.source.cursor();
+        if max_depth == 0 {
+            return false;
+        }
+        let confirmed = source.cursor();
         let speculative_depth = head_number.saturating_sub(confirmed);
-        if speculative_depth >= limit.max_depth {
+        if speculative_depth >= max_depth {
             event!(
                 name: "eez.sequencer.speculative.paused",
                 Level::DEBUG,
                 head_number,
                 confirmed,
                 speculative_depth,
-                max_depth = limit.max_depth,
+                max_depth,
                 "paused: speculative depth at cap; waiting for Deriver to catch up",
             );
             return true;
         }
         false
+    }
+
+    fn composer_context(&self) -> Option<(u64, SyncSlotComposerHandle)> {
+        match &self.mode {
+            SequencingMode::Standalone => None,
+            SequencingMode::Composer {
+                rollup_id,
+                composer,
+                ..
+            } => Some((*rollup_id, Arc::clone(composer))),
+        }
     }
 
     /// Commit a pre-built Sync block (from the cross-chain composer)

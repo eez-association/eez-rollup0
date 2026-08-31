@@ -9,7 +9,7 @@ use alloy_rpc_types_eth::BlockNumberOrTag;
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
-    Harness, NodeConfig, NodeHandle, block_number_and_hash_at, override_env,
+    Harness, NodeBinary, NodeConfig, NodeHandle, block_number_and_hash_at, override_env,
     reorg_genesis_state_root, send_l2_value_transfer, send_l2_value_transfer_confirmed, wait_for,
     wait_for_latest_height, wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
     wait_for_safe_prefix_convergence, wait_for_safe_state,
@@ -24,7 +24,16 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
     let harness = Harness::for_reorg().await.unwrap();
     let chain = harness.chain();
     let genesis = harness.l2_genesis_path();
-    let cfg = NodeConfig {
+    let stage_cfg = NodeConfig {
+        binary: NodeBinary::Dev,
+        genesis_path: Some(genesis),
+    };
+    let composer_cfg = NodeConfig {
+        binary: NodeBinary::Composer,
+        genesis_path: Some(genesis),
+    };
+    let follower_cfg = NodeConfig {
+        binary: NodeBinary::Follower,
         genesis_path: Some(genesis),
     };
 
@@ -35,7 +44,7 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
     let seq_a = NodeHandle::start_with_datadir(
         "intra-seq-a-stage",
         primary_dir.path(),
-        &cfg,
+        &stage_cfg,
         &standalone_env,
     )
     .await
@@ -43,7 +52,7 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
     let seq_b = NodeHandle::start_with_datadir(
         "intra-seq-b-stage",
         mirror_dir.path(),
-        &cfg,
+        &stage_cfg,
         &standalone_env,
     )
     .await
@@ -85,7 +94,7 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
     let seq_b = NodeHandle::start_with_datadir(
         "intra-seq-b-follow",
         mirror_dir.path(),
-        &cfg,
+        &follower_cfg,
         &follower_env,
     )
     .await
@@ -98,7 +107,7 @@ async fn multi_sequencer_intra_batch_suffix_replay_converges() {
     let seq_a = NodeHandle::start_with_datadir(
         "intra-seq-a-compose",
         primary_dir.path(),
-        &cfg,
+        &composer_cfg,
         &composer_env,
     )
     .await
@@ -228,7 +237,11 @@ async fn happy_case_composer_sustained() {
     );
 
     let follower_env = harness.follower_env(None).await.unwrap();
-    let follower = NodeHandle::start("follower", &NodeConfig::default(), &follower_env)
+    let follower_cfg = NodeConfig {
+        binary: NodeBinary::Follower,
+        ..Default::default()
+    };
+    let follower = NodeHandle::start("follower", &follower_cfg, &follower_env)
         .await
         .unwrap();
     wait_for_safe_state(&follower, &chain, B256::ZERO, DEFAULT_TIMEOUT)
@@ -385,6 +398,7 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     let genesis = harness.l2_genesis_path();
     let cfg = NodeConfig {
         genesis_path: Some(genesis),
+        ..Default::default()
     };
     let env1 = harness.env_for(ANVIL_KEY, true).await.unwrap();
     let env2 = harness.env_for(ANVIL_KEY_4, true).await.unwrap();
@@ -490,7 +504,11 @@ async fn spawn_follower(
     seq_rpc: Option<&str>,
 ) -> anyhow::Result<NodeHandle> {
     let env = harness.follower_env(seq_rpc).await?;
-    NodeHandle::start(name, &NodeConfig::default(), &env).await
+    let cfg = NodeConfig {
+        binary: NodeBinary::Follower,
+        ..Default::default()
+    };
+    NodeHandle::start(name, &cfg, &env).await
 }
 
 /// An L1-only follower reconstructs an attested safe state without a sequencer RPC.
@@ -533,7 +551,11 @@ async fn happy_case_follower_sequencer_rpc() {
         "RUST_LOG",
         "warn,eez_node::follower=info",
     );
-    let follower = NodeHandle::start("follower", &NodeConfig::default(), &follower_env)
+    let follower_cfg = NodeConfig {
+        binary: NodeBinary::Follower,
+        ..Default::default()
+    };
+    let follower = NodeHandle::start("follower", &follower_cfg, &follower_env)
         .await
         .unwrap();
 
@@ -575,14 +597,19 @@ async fn happy_case_follower_l1_reorg_recovers() {
     let harness = Harness::for_reorg().await.unwrap();
     let chain = harness.chain();
     let genesis = harness.l2_genesis_path();
-    let cfg = NodeConfig {
+    let seq_cfg = NodeConfig {
+        genesis_path: Some(genesis),
+        ..Default::default()
+    };
+    let follower_cfg = NodeConfig {
+        binary: NodeBinary::Follower,
         genesis_path: Some(genesis),
     };
     let seq_env = harness.env().await.unwrap();
     let follower_env = harness.follower_env(None).await.unwrap();
     let (seq, follower) = tokio::try_join!(
-        NodeHandle::start("seq", &cfg, &seq_env),
-        NodeHandle::start("follower", &cfg, &follower_env),
+        NodeHandle::start("seq", &seq_cfg, &seq_env),
+        NodeHandle::start("follower", &follower_cfg, &follower_env),
     )
     .unwrap();
     seq.run_tx_spammer(ANVIL_KEY_1);
@@ -668,10 +695,11 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
     let chain = harness.chain();
     let genesis = harness.l2_genesis_path();
 
-    let cfg = NodeConfig {
+    let seq_cfg = NodeConfig {
         genesis_path: Some(genesis),
+        ..Default::default()
     };
-    let seq = NodeHandle::start("seq", &cfg, &harness.env().await.unwrap())
+    let seq = NodeHandle::start("seq", &seq_cfg, &harness.env().await.unwrap())
         .await
         .unwrap();
     seq.run_tx_spammer(ANVIL_KEY_1);
@@ -680,7 +708,11 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
         "RUST_LOG",
         std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
     )];
-    let rogue = NodeHandle::start("rogue", &NodeConfig::default(), &rogue_env)
+    let rogue_cfg = NodeConfig {
+        binary: NodeBinary::Dev,
+        ..Default::default()
+    };
+    let rogue = NodeHandle::start("rogue", &rogue_cfg, &rogue_env)
         .await
         .unwrap();
 
@@ -692,7 +724,11 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
         "RUST_LOG",
         "warn,eez_node::follower=info",
     );
-    let follower = NodeHandle::start("follower", &cfg, &follower_env)
+    let follower_cfg = NodeConfig {
+        binary: NodeBinary::Follower,
+        genesis_path: Some(genesis),
+    };
+    let follower = NodeHandle::start("follower", &follower_cfg, &follower_env)
         .await
         .unwrap();
 

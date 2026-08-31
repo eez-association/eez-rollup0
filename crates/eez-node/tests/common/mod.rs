@@ -23,9 +23,9 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{SolCall, SolError, SolEvent, SolValue, sol};
 use anyhow::{Context, Result, anyhow, bail};
 use eez_control_rpc::{
-    MAX_MESSAGE_BYTES,
+    MAX_MESSAGE_BYTES, encode_prove_failure,
     v1::{
-        ProveChunk, ProveResponse, prove_chunk,
+        InboundFailure, ProveChunk, ProveFailure, ProveResponse, prove_chunk, prove_failure,
         prover_client::ProverClient,
         prover_server::{Prover, ProverServer},
     },
@@ -42,6 +42,9 @@ pub const ANVIL_KEY_1: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8
 pub const ANVIL_KEY_2: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
 pub const ANVIL_KEY_3: &str = "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6";
 pub const ANVIL_KEY_4: &str = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a";
+/// Second cross-chain sender. Eviction cascades along one sender's nonce chain,
+/// so a poison tx needs its own sender to leave co-bundled survivors alone.
+pub const ANVIL_KEY_6: &str = "0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e";
 // Account #0 derives the reserved L2 system address and cannot attest.
 pub const ANVIL_ATTESTER_KEY: &str =
     "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
@@ -85,12 +88,28 @@ fn anvil_bin() -> String {
     "anvil".to_string()
 }
 
-/// Probe a currently available TCP port.
+/// Every port handed out anywhere in this test process.
+///
+/// Probes are availability checks, not reservations, so without a shared
+/// record a later spawn can be handed a port an earlier node in the same
+/// process already used — its lingering sockets then fail the real bind with
+/// `address already in use`. Serial test binaries spawn several nodes per
+/// process, so the record has to outlive the individual spawn.
+static HANDED_OUT_PORTS: std::sync::LazyLock<std::sync::Mutex<HashSet<u16>>> =
+    std::sync::LazyLock::new(std::sync::Mutex::default);
+
+fn handed_out_ports() -> std::sync::MutexGuard<'static, HashSet<u16>> {
+    HANDED_OUT_PORTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Probe a currently available TCP port, distinct from every port this process
+/// has already handed out.
 ///
 /// The listener is released on return, so this is not a reservation.
 pub fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("local_addr").port()
+    probe_unique_tcp_port(&mut handed_out_ports())
 }
 
 fn probe_unique_tcp_port(used: &mut HashSet<u16>) -> u16 {
@@ -562,6 +581,13 @@ pub enum ProverMutation {
     None,
     PostBatch,
     Witness,
+    /// Deterministic opaque rejection used to exercise Composer recovery. This
+    /// is the status returned by the real signer when its checkpoint quota is
+    /// exceeded.
+    ResourceExhausted,
+    /// A typed rejection whose candidate identity cannot belong to the current
+    /// request. The Composer must treat it as opaque rather than acting on it.
+    MismatchedActionable,
 }
 
 impl ProverMutation {
@@ -598,6 +624,46 @@ impl ProverMutation {
                     witness.state.push(vec![0xff]);
                 }
             }
+            Self::ResourceExhausted | Self::MismatchedActionable => {
+                let calldata = chunks
+                    .iter()
+                    .find_map(|chunk| match chunk.kind.as_ref() {
+                        Some(prove_chunk::Kind::Header(header)) => header
+                            .post_batch
+                            .as_ref()
+                            .map(|post_batch| post_batch.abi_calldata.as_slice()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| Status::internal("missing Prove header"))?;
+                let batch = eez_protocol::entries::decode_postbatch(calldata)
+                    .map_err(|error| Status::internal(format!("decode PostBatch: {error}")))?;
+                // Entry zero is the state-chain anchor. The real checkpoint
+                // quota is exercised only by effect candidates, so leave
+                // anchor-only historical/minimal proofs healthy.
+                if batch.entries.len() > 1 {
+                    return match self {
+                        Self::ResourceExhausted => Err(Status::resource_exhausted(
+                            "window validation checkpoint quota exceeded",
+                        )),
+                        Self::MismatchedActionable => {
+                            let failure = ProveFailure {
+                                actionable_failure: Some(
+                                    prove_failure::ActionableFailure::Inbound(InboundFailure {
+                                        entry_index: u32::MAX,
+                                        entry_hash: vec![0xff; 32],
+                                    }),
+                                ),
+                            };
+                            Err(Status::with_details(
+                                tonic::Code::FailedPrecondition,
+                                "candidate identity does not match the request",
+                                encode_prove_failure(&failure).into(),
+                            ))
+                        }
+                        Self::None | Self::PostBatch | Self::Witness => unreachable!(),
+                    };
+                }
+            }
         }
         Ok(())
     }
@@ -629,7 +695,15 @@ impl Prover for ProverProxyService {
         while let Some(chunk) = input.message().await? {
             chunks.push(chunk);
         }
-        self.mutation.apply(&mut chunks)?;
+        if let Err(status) = self.mutation.apply(&mut chunks) {
+            if matches!(
+                status.code(),
+                tonic::Code::ResourceExhausted | tonic::Code::FailedPrecondition
+            ) {
+                self.counters.rejections.fetch_add(1, Ordering::Relaxed);
+            }
+            return Err(status);
+        }
 
         let mut client = ProverClient::connect(self.upstream.clone())
             .await
@@ -645,7 +719,9 @@ impl Prover for ProverProxyService {
                 // Transport failures do not prove that the signer rejected the input.
                 if matches!(
                     status.code(),
-                    tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition
+                    tonic::Code::InvalidArgument
+                        | tonic::Code::FailedPrecondition
+                        | tonic::Code::ResourceExhausted
                 ) {
                     self.counters.rejections.fetch_add(1, Ordering::Relaxed);
                 }
@@ -764,7 +840,13 @@ impl Harness {
     /// Stages a local chain that can later restart as a composer or follower.
     pub fn standalone_env(&self) -> Vec<(&'static str, String)> {
         vec![
+            (
+                "EEZ_L1_BLOCK_TIME_MS",
+                (L1_BLOCK_TIME_SECS * 1000).to_string(),
+            ),
             ("EEZ_L2_BLOCK_TIME_MS", "2000".to_string()),
+            ("EEZ_PROOF_TIME_MS", "1000".to_string()),
+            ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
             (
                 "RUST_LOG",
                 std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
@@ -801,7 +883,7 @@ impl Harness {
         expect_external_batches: bool,
     ) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
-            poster_key,
+            poster_key: Some(poster_key),
             proof_signer_key: Some(ANVIL_ATTESTER_KEY),
             rollup_id: self.dep.rollup_id,
             expect_external_batches,
@@ -815,7 +897,7 @@ impl Harness {
         sequencer_rpc: Option<&str>,
     ) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
-            poster_key: ANVIL_KEY,
+            poster_key: None,
             proof_signer_key: None,
             rollup_id: self.dep.rollup_id,
             expect_external_batches: true,
@@ -826,7 +908,7 @@ impl Harness {
 
     pub async fn env_with_rollup_id(&self, rollup_id: u64) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
-            poster_key: ANVIL_KEY,
+            poster_key: Some(ANVIL_KEY),
             proof_signer_key: Some(ANVIL_ATTESTER_KEY),
             rollup_id,
             expect_external_batches: false,
@@ -840,7 +922,7 @@ impl Harness {
         proof_signer_key: &str,
     ) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
-            poster_key: ANVIL_KEY,
+            poster_key: Some(ANVIL_KEY),
             proof_signer_key: Some(proof_signer_key),
             rollup_id: self.dep.rollup_id,
             expect_external_batches: false,
@@ -854,12 +936,8 @@ impl Harness {
         opts: NodeEnvOptions<'_>,
     ) -> Result<Vec<(&'static str, String)>> {
         let mut env = vec![
-            ("EEZ_L1_EMBEDDED", "1".to_string()),
             ("EEZ_L1_CHAIN_PATH", "dev".to_string()),
             ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
-            ("EEZ_L1_TARGET_RPC_URL", self.anvil.rpc_url.clone()),
-            ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
-            ("EEZ_L1_POSTER_KEY", opts.poster_key.to_string()),
             ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
             ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
@@ -906,7 +984,15 @@ impl Harness {
             ),
         ];
 
-        // A prover endpoint selects composer mode; omitting it selects follower mode.
+        if let Some(poster_key) = opts.poster_key {
+            env.extend([
+                ("EEZ_L1_TARGET_RPC_URL", self.anvil.rpc_url.clone()),
+                ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
+                ("EEZ_L1_POSTER_KEY", poster_key.to_string()),
+            ]);
+        }
+
+        // Composer tests use the real remote-prover path. Followers omit it.
         if let Some(signer_key) = opts.proof_signer_key {
             let genesis = self.l2_genesis_path();
             let attester = signer_address(signer_key)?;
@@ -941,7 +1027,7 @@ impl Harness {
 }
 
 struct NodeEnvOptions<'a> {
-    poster_key: &'a str,
+    poster_key: Option<&'a str>,
     proof_signer_key: Option<&'a str>,
     rollup_id: u64,
     expect_external_batches: bool,
@@ -1045,7 +1131,13 @@ pub async fn send_l2_value_transfer(
     let mut tx = TxLegacy {
         chain_id: Some(chain_id),
         nonce,
-        gas_price: provider.get_gas_price().await?,
+        // Reth's txpool requires a non-zero priority margin. The RPC gas-price
+        // suggestion can equal the current base fee during startup, which makes
+        // an otherwise valid legacy test transaction "underpriced".
+        gas_price: provider
+            .get_gas_price()
+            .await?
+            .saturating_add(2_000_000_000),
         gas_limit: 21_000,
         to: alloy_primitives::TxKind::Call(to),
         value,
@@ -1253,8 +1345,28 @@ pub struct NodeHandle {
     pub http_port: u16,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub enum NodeBinary {
+    #[default]
+    Composer,
+    Follower,
+    Dev,
+}
+
+impl NodeBinary {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Composer => env!("CARGO_BIN_EXE_eez-composer"),
+            Self::Follower => env!("CARGO_BIN_EXE_eez-follower"),
+            Self::Dev => env!("CARGO_BIN_EXE_eez-dev-node"),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct NodeConfig<'a> {
+    /// Explicit node-role executable to launch.
+    pub binary: NodeBinary,
     pub genesis_path: Option<&'a std::path::Path>,
 }
 
@@ -1276,9 +1388,10 @@ impl NodeHandle {
         // Reth defaults collide if any test or unrelated process holds them.
         // Each NodeHandle picks its own ephemeral ports for authrpc / http / ws / p2p.
         // These are availability probes, not reservations: the sockets are
-        // released before the child binds. The set prevents deterministic
-        // collisions among one node's listeners.
-        let mut used_ports = HashSet::new();
+        // released before the child binds. The process-wide record prevents
+        // collisions among one node's listeners AND across the nodes a serial
+        // test binary spawns one after another.
+        let mut used_ports = handed_out_ports();
         let authrpc_port = probe_unique_tcp_port(&mut used_ports);
         let http_port = probe_unique_tcp_port(&mut used_ports);
         let ws_port = probe_unique_tcp_port(&mut used_ports);
@@ -1290,6 +1403,7 @@ impl NodeHandle {
         let l1_discv5_port = probe_unique_udp_port(&mut used_ports);
         let l1_xchain_port = probe_unique_tcp_port(&mut used_ports);
         let l2_xchain_port = probe_unique_tcp_port(&mut used_ports);
+        drop(used_ports);
         let l1_datadir = datadir.join("embedded-l1");
         let env_genesis = env
             .iter()
@@ -1302,10 +1416,10 @@ impl NodeHandle {
             .map(|p| p.as_os_str().to_owned())
             .or(env_genesis)
             .unwrap_or_else(|| std::ffi::OsString::from("dev"));
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_eez-node"));
-        // eez-node loads dotenv files from its working directory. Running from
+        let mut cmd = Command::new(cfg.binary.path());
+        // Each role binary loads dotenv files from its working directory. Running from
         // the datadir prevents repository settings from changing the explicit
-        // test mode or redirecting L1 traffic to a developer endpoint.
+        // test configuration or redirecting L1 traffic to a developer endpoint.
         cmd.current_dir(datadir)
             .args(["node", "--chain"])
             .arg(&chain_arg)
@@ -1355,7 +1469,7 @@ impl NodeHandle {
             }
             cmd.env(*k, v);
         }
-        let child = cmd.spawn().context("spawn eez-node")?;
+        let child = cmd.spawn().context("spawn eez node role")?;
         Ok(Self {
             child: std::sync::Mutex::new(child),
             background_tasks: std::sync::Mutex::new(Vec::new()),
@@ -2173,6 +2287,13 @@ sol! {
     interface ISetterWrapper {
         function setViaProxy(uint256 v) external;
     }
+    /// Order-dependent target: each call returns state left by the previous one.
+    #[sol(rpc)]
+    interface ICounter {
+        function count() external view returns (uint256);
+        function increment() external returns (uint256 newCount);
+        function add(uint256 x) external returns (uint256 newCount);
+    }
 }
 
 /// Write the L2 fixture genesis with a current timestamp.
@@ -2452,6 +2573,24 @@ pub async fn deploy_setter_wrapper(
     .await
 }
 
+/// Deploy `Counter` (no constructor args) on either chain.
+pub async fn deploy_counter(rpc_url: &str, key: &str, chain_id: u64) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("Counter.sol/Counter.json"),
+        Vec::new(),
+    )
+    .await
+}
+
+pub async fn counter_count(rpc_url: &str, counter: Address) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(ICounter::new(counter, &provider).count().call().await?)
+}
+
 pub async fn value_no_ret(rpc_url: &str, value_addr: Address) -> Result<U256> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     Ok(IValueNoRet::new(value_addr, &provider)
@@ -2580,12 +2719,9 @@ impl CrossChainConfig {
         let rollup_manager_address = deployer.create(2);
         let initial_state = reorg_genesis_state_root()?;
         let ts = now_unix_secs();
-        // Avoid the HTTP and adjacent WS ports.
-        let l1_http_port = free_port();
-        let mut l1_auth_port = free_port();
-        while l1_auth_port == l1_http_port || l1_auth_port == l1_http_port.saturating_add(1) {
-            l1_auth_port = free_port();
-        }
+        // Reserves the adjacent WS port too, so no later probe hands it out.
+        let l1_http_port = probe_unique_http_port(&mut handed_out_ports());
+        let l1_auth_port = free_port();
         Ok(Self {
             l1_http_port,
             l1_auth_port,
@@ -2618,7 +2754,6 @@ impl CrossChainConfig {
 
     fn env(&self) -> Vec<(&'static str, String)> {
         vec![
-            ("EEZ_L1_EMBEDDED", "1".to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
             ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_RPC_URL", self.l1_rpc_url()),
@@ -2778,7 +2913,14 @@ impl CrossChainWorld {
 
 /// Start the shared cross-chain fixture.
 pub async fn setup_cross_chain() -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(None, None).await
+    setup_cross_chain_inner(None, None, &[]).await
+}
+
+/// Start the fixture with additional node environment variables.
+pub async fn setup_cross_chain_with_env(
+    extra_env: &[(&'static str, String)],
+) -> Result<CrossChainWorld> {
+    setup_cross_chain_inner(None, None, extra_env).await
 }
 
 /// Starts the fixture with a mutation proxy and expected attester override.
@@ -2786,12 +2928,13 @@ pub async fn setup_cross_chain_proxied(
     mutation: ProverMutation,
     attester: Address,
 ) -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(Some(mutation), Some(attester)).await
+    setup_cross_chain_inner(Some(mutation), Some(attester), &[]).await
 }
 
 async fn setup_cross_chain_inner(
     mutation: Option<ProverMutation>,
     attester_override: Option<Address>,
+    extra_env: &[(&'static str, String)],
 ) -> Result<CrossChainWorld> {
     let cfg = CrossChainConfig::new()?;
     let signer_attester = signer_address(cfg.deployer_key)?;
@@ -2824,6 +2967,8 @@ async fn setup_cross_chain_inner(
             witness_dir.path().to_string_lossy().into_owned(),
         ),
     ]);
+    // Before the assertion below, so caller-supplied vars are checked too.
+    env.extend_from_slice(extra_env);
     assert!(
         !env.iter().any(|(name, _)| *name == "EEZ_PROOF_SIGNER_KEY"),
         "remote composer environment must not contain the proof-signer key",

@@ -21,7 +21,7 @@
 //!               builds + posts batches, hosts the cross-chain
 //!               composition logic (S4.7+).
 //!                ↑
-//! eez-node      Binary. Decides follower vs composer mode at startup.
+//! eez-composer  Binary. Wires the complete composer stack at startup.
 //! ```
 //!
 //! # Stage 4 status
@@ -45,14 +45,17 @@ mod prover_retry;
 pub mod rollup;
 
 #[doc(inline)]
-pub use composer::{Composer, CrossChainExecCtx};
+pub use composer::{Composer, ComposerConfigError, CrossChainExecCtx};
 #[doc(inline)]
 pub use held_pool::{AdmissionError, HeldPool, HeldTx};
 #[doc(inline)]
 pub use ingress::Direction;
 
 #[doc(inline)]
-pub use local::{BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient, build_sync_block};
+pub use local::{
+    BuildError, BuiltSyncBlock, GnosisL1Adapter, LocalChainClient, LocalComposeClients,
+    build_sync_block,
+};
 pub use optimistic::OptimisticallyIncluded;
 #[doc(inline)]
 pub use rollup::{RollupConfig, RollupState};

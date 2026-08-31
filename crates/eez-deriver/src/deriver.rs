@@ -13,7 +13,7 @@ use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT, BlockCommitterHandle, DeriveOutcome};
-use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, ScannedBatch, Submitter};
+use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Reader, ScannedBatch};
 use eez_protocol::outbound_gate::OutboundCallObservation;
 use reth_chainspec::{ChainSpec, EthereumHardforks};
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -55,7 +55,7 @@ where
 {
     committer: BlockCommitterHandle<EthEngineTypes>,
     l2_provider: Arc<L2>,
-    submitter: Submitter,
+    l1_reader: L1Reader,
     evm_config: EthEvmConfig,
     /// Chainspec-aware deriver
     chain_spec: Arc<ChainSpec>,
@@ -122,7 +122,7 @@ where
     pub fn new(
         committer: BlockCommitterHandle<EthEngineTypes>,
         l2_provider: Arc<L2>,
-        submitter: Submitter,
+        l1_reader: L1Reader,
         chain_spec: Arc<ChainSpec>,
         l2_block_time_secs: u64,
         deploy_block: u64,
@@ -134,7 +134,7 @@ where
             inner: Arc::new(Inner {
                 committer,
                 l2_provider,
-                submitter,
+                l1_reader,
                 evm_config,
                 chain_spec,
                 l2_block_time_secs,
@@ -188,7 +188,7 @@ where
             .map_or_else(|| self.inner.deploy_block.saturating_sub(1), |t| t.l1_block);
         let finalized = self
             .inner
-            .submitter
+            .l1_reader
             .finalized_block()
             .await
             .map_err(DeriverError::l1_scan)?;
@@ -197,7 +197,7 @@ where
         let seed = choose_seed(floor, end, finalized.map(|(n, _)| n));
         let canonical = self
             .inner
-            .submitter
+            .l1_reader
             .canonical_l1_hash(seed)
             .await
             .map_err(DeriverError::l1_scan)?
@@ -258,7 +258,7 @@ where
         while let Some(tail) = self.inner.l1_head.last_indexed() {
             let canonical = self
                 .inner
-                .submitter
+                .l1_reader
                 .canonical_l1_hash(tail.l1_block)
                 .await
                 .map_err(DeriverError::l1_scan)?;
@@ -268,7 +268,7 @@ where
             let Some(canonical) = canonical else {
                 let head = self
                     .inner
-                    .submitter
+                    .l1_reader
                     .readiness()
                     .await
                     .map(|r| r.head_block_number)
@@ -323,7 +323,7 @@ where
             .map_err(DeriverError::l2_provider)?;
         let mut chunks = self
             .inner
-            .submitter
+            .l1_reader
             .batch_log_chunks(from_l1_block)
             .await
             .map_err(DeriverError::l1_scan)?;
@@ -352,7 +352,7 @@ where
         let mut total_replayed: u64 = 0;
         while let Some(scanned_batches) = self
             .inner
-            .submitter
+            .l1_reader
             .next_batch_log_chunk(&mut chunks)
             .await
             .map_err(DeriverError::l1_scan)?
@@ -1730,18 +1730,12 @@ fn extract_outbound_call_observations<R>(
 where
     R: alloy_consensus::TxReceipt<Log = alloy_primitives::Log>,
 {
-    use alloy_sol_types::SolEvent as _;
-    use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
-
-    receipts
+    let logs: Vec<alloy_primitives::Log> = receipts
         .iter()
         .flat_map(alloy_consensus::TxReceipt::logs)
-        .filter(|log| log.address == eez_l2)
-        .filter_map(|log| CrossChainCallExecuted::decode_log_validate(log).ok())
-        .map(|event| {
-            OutboundCallObservation::new(event.data.crossChainCallHash, event.data.callGas)
-        })
-        .collect()
+        .cloned()
+        .collect();
+    eez_protocol::outbound_gate::observations_from_logs(&logs, eez_l2)
 }
 
 #[cfg(test)]
