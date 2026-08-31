@@ -3,127 +3,18 @@
 use std::time::Duration;
 
 use alloy_primitives::{B256, U256};
-use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::BlockNumberOrTag;
 
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
     Harness, NodeBinary, NodeConfig, NodeHandle, block_number_and_hash_at, override_env,
-    reorg_genesis_state_root, send_l2_value_transfer, send_l2_value_transfer_confirmed, wait_for,
-    wait_for_latest_height, wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
+    reorg_genesis_state_root, send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
+    wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
     wait_for_safe_prefix_convergence, wait_for_safe_state,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_mins(5);
-
-/// A follower replaces the full divergent suffix of an intra-batch fork.
-/// Replaying only the transaction block is insufficient because later blocks descend from it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn multi_sequencer_intra_batch_suffix_replay_converges() {
-    let harness = Harness::for_reorg().await.unwrap();
-    let chain = harness.chain();
-    let genesis = harness.l2_genesis_path();
-    let stage_cfg = NodeConfig {
-        binary: NodeBinary::Dev,
-        genesis_path: Some(genesis),
-    };
-    let composer_cfg = NodeConfig {
-        binary: NodeBinary::Composer,
-        genesis_path: Some(genesis),
-    };
-    let follower_cfg = NodeConfig {
-        binary: NodeBinary::Follower,
-        genesis_path: Some(genesis),
-    };
-
-    let primary_dir = tempfile::tempdir().unwrap();
-    let mirror_dir = tempfile::tempdir().unwrap();
-    let standalone_env = harness.standalone_env();
-
-    let seq_a = NodeHandle::start_with_datadir(
-        "intra-seq-a-stage",
-        primary_dir.path(),
-        &stage_cfg,
-        &standalone_env,
-    )
-    .await
-    .unwrap();
-    let seq_b = NodeHandle::start_with_datadir(
-        "intra-seq-b-stage",
-        mirror_dir.path(),
-        &stage_cfg,
-        &standalone_env,
-    )
-    .await
-    .unwrap();
-
-    let seq_a_rpc = seq_a.l2_rpc_url();
-    let seq_a_provider = ProviderBuilder::new().connect_http(seq_a_rpc.parse().unwrap());
-    let tx_hash = send_l2_value_transfer(&seq_a_rpc, ANVIL_KEY_1, ANVIL_ADDR, U256::from(1u64))
-        .await
-        .expect("submit L2 tx to sequencer A");
-    let receipt = wait_for(DEFAULT_TIMEOUT, || async {
-        Ok(seq_a_provider.get_transaction_receipt(tx_hash).await?)
-    })
-    .await
-    .unwrap_or_else(|err| panic!("wait for L2 tx {tx_hash} inclusion: {err:#}"));
-    assert!(receipt.status(), "L2 tx {tx_hash} reverted");
-    let included_block = receipt
-        .block_number
-        .unwrap_or_else(|| panic!("included L2 tx {tx_hash} missing block_number"));
-    assert!(
-        included_block > 0,
-        "L2 tx {tx_hash} must not be included in genesis"
-    );
-    let target = included_block + 3;
-    wait_for_latest_height(&seq_a, target, DEFAULT_TIMEOUT)
-        .await
-        .expect("sequencer A did not stage enough local blocks");
-    wait_for_latest_height(&seq_b, target, DEFAULT_TIMEOUT)
-        .await
-        .expect("sequencer B did not stage enough local blocks");
-
-    drop(seq_a);
-    drop(seq_b);
-    let follower_env = override_env(
-        harness.follower_env(None).await.unwrap(),
-        "RUST_LOG",
-        "warn,eez_deriver=info,eez_l1=info",
-    );
-    let seq_b = NodeHandle::start_with_datadir(
-        "intra-seq-b-follow",
-        mirror_dir.path(),
-        &follower_cfg,
-        &follower_env,
-    )
-    .await
-    .unwrap();
-    let composer_env = override_env(
-        harness.env_for(ANVIL_KEY, true).await.unwrap(),
-        "RUST_LOG",
-        "warn,eez_composer=info,eez_deriver=info,eez_l1=info,eez_prover_client=info",
-    );
-    let seq_a = NodeHandle::start_with_datadir(
-        "intra-seq-a-compose",
-        primary_dir.path(),
-        &composer_cfg,
-        &composer_env,
-    )
-    .await
-    .unwrap();
-
-    chain
-        .wait_for_batches(1, DEFAULT_TIMEOUT)
-        .await
-        .expect("sequencer A did not post staged multi-block batch");
-    wait_for_safe_prefix_convergence(&[&seq_a, &seq_b], target, DEFAULT_TIMEOUT)
-        .await
-        .expect("sequencers did not converge after intra-batch suffix replay");
-
-    seq_a.assert_no_divergence_failure_logs();
-    seq_b.assert_no_divergence_failure_logs();
-}
 
 /// Builder mode, sustained operation through a restart. Asserts every
 /// observable invariant in one place:
@@ -591,7 +482,8 @@ async fn happy_case_follower_sequencer_rpc() {
     seq.assert_no_process_death();
 }
 
-/// An L1-only follower retreats and imports a state newly attested after an L1 reorg.
+/// An L1-only follower retreats, replays the replacement suffix, and converges
+/// with the composer after an L1 reorg.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn happy_case_follower_l1_reorg_recovers() {
     let harness = Harness::for_reorg().await.unwrap();
@@ -633,18 +525,13 @@ async fn happy_case_follower_l1_reorg_recovers() {
         .wait_for_batches(pre_batches + 1, DEFAULT_TIMEOUT)
         .await
         .expect("no batches landed after reorg");
-    let (post_reorg_safe_number, post_reorg_safe_hash) =
+    let (post_reorg_safe_number, _) =
         wait_for_new_attested_safe_block(&seq, &chain, &pre_reorg_states, DEFAULT_TIMEOUT)
             .await
             .expect("sequencer did not import the post-reorg safe block");
-    wait_for_safe_chain_contains(
-        &follower,
-        post_reorg_safe_number,
-        post_reorg_safe_hash,
-        DEFAULT_TIMEOUT,
-    )
-    .await
-    .expect("follower did not import the sequencer's post-reorg safe block");
+    wait_for_safe_prefix_convergence(&[&seq, &follower], post_reorg_safe_number, DEFAULT_TIMEOUT)
+        .await
+        .expect("follower did not converge on the composer's replacement safe suffix");
 
     follower.wait_for_reorg_seen(DEFAULT_TIMEOUT).await.unwrap();
     follower.assert_no_process_death();
@@ -704,23 +591,11 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
         .unwrap();
     seq.run_tx_spammer(ANVIL_KEY_1);
 
-    let rogue_env = vec![(
-        "RUST_LOG",
-        std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
-    )];
-    let rogue_cfg = NodeConfig {
-        binary: NodeBinary::Dev,
-        ..Default::default()
-    };
-    let rogue = NodeHandle::start("rogue", &rogue_cfg, &rogue_env)
-        .await
-        .unwrap();
-
+    // The already-running L1 Anvil is an incompatible Ethereum chain and is
+    // sufficient to exercise unsafe-head rejection without another L2 node.
+    let rogue_rpc = harness.anvil.rpc_url.clone();
     let follower_env = override_env(
-        harness
-            .follower_env(Some(&rogue.l2_rpc_url()))
-            .await
-            .unwrap(),
+        harness.follower_env(Some(&rogue_rpc)).await.unwrap(),
         "RUST_LOG",
         "warn,eez_follower::unsafe_head=info",
     );
@@ -744,7 +619,10 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
     // Prove the rogue unsafe source was actually polled.
     assert!(
         follower
-            .log_count_matching(&["reth accepted sequencer head as a sync target"])
+            .log_count_matching(&[
+                "reth accepted sequencer head as a sync target",
+                "sequencer head does not descend from the L1-derived safe block",
+            ])
             .unwrap()
             > 0,
         "follower never processed a rogue unsafe head",

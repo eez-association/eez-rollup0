@@ -8,7 +8,6 @@ description            = "Cross-role integration tests for eez node binaries."
 publish                = false
 
 [dependencies]
-eez-dev-node.workspace = true
 eez-follower.workspace = true
 eez-node.workspace     = true
 eyre.workspace         = true
