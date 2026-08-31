@@ -169,11 +169,12 @@ cargo run -p eez-node -- node \
   --datadir "$EEZ_L2_DATADIR"
 ```
 
-Select the non-default follower role explicitly:
+Select the non-default follower role explicitly. `EEZ_L1_CHAIN_ID` must match
+the numeric chain ID served by `EEZ_L1_RPC_URL`:
 
 ```bash
 # L1-derived follower; optionally add `--sequencer-rpc <URL>` after `node`.
-cargo run -p eez-follower -- node \
+EEZ_L1_CHAIN_ID="<numeric-l1-chain-id>" cargo run -p eez-follower -- node \
   --chain "$EEZ_L2_GENESIS_PATH" \
   --datadir "$EEZ_L2_DATADIR"
 ```
