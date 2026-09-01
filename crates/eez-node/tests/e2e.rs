@@ -394,7 +394,7 @@ async fn failure_prover_signer_mismatch() {
 /// They must produce newly attested work before old-prefix agreement can pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn happy_case_two_composers_l1_reorg_recovers() {
-    let harness = Harness::for_reorg().await.unwrap();
+    let harness = Harness::fresh().await.unwrap();
     let chain = harness.chain();
     let genesis = harness.l2_genesis_path();
     let cfg = NodeConfig {
@@ -412,7 +412,7 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     c1.run_tx_spammer(ANVIL_KEY_1);
     c2.run_tx_spammer(ANVIL_KEY_2);
 
-    let pre_batches = chain
+    chain
         .wait_for_batches(4, DEFAULT_TIMEOUT)
         .await
         .expect("pre-reorg: ≥4 combined batches");
@@ -426,6 +426,16 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
 
     // Depth three crosses the bundle target and retreats at least one posted batch.
     harness.anvil.reorg(3).await.unwrap();
+
+    // Do not inject post-reorg work against a stale L2 head. Both Derivers must
+    // finish retreating before the transaction below establishes new progress.
+    tokio::try_join!(
+        c1.wait_for_reorg_retreat(DEFAULT_TIMEOUT),
+        c2.wait_for_reorg_retreat(DEFAULT_TIMEOUT),
+    )
+    .expect("both composers should finish retreating after the L1 reorg");
+    let post_reorg_batches = chain.batches_posted().await.unwrap();
+
     send_l2_value_transfer_confirmed(
         &c1.l2_rpc_url(),
         ANVIL_KEY_3,
@@ -438,7 +448,7 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
 
     // Require post-reorg progress before accepting convergence.
     chain
-        .wait_for_batches(pre_batches + 1, DEFAULT_TIMEOUT)
+        .wait_for_batches(post_reorg_batches + 1, DEFAULT_TIMEOUT)
         .await
         .expect("no batches landed after reorg");
     tokio::try_join!(
@@ -491,9 +501,6 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     wait_for_safe_prefix_convergence(&[&c1, &c2], post_reorg_target_height, DEFAULT_TIMEOUT)
         .await
         .expect("composers did not converge on post-reorg safe block hashes");
-
-    c1.wait_for_reorg_seen(DEFAULT_TIMEOUT).await.unwrap();
-    c2.wait_for_reorg_seen(DEFAULT_TIMEOUT).await.unwrap();
 
     c1.assert_no_process_death();
     c2.assert_no_process_death();

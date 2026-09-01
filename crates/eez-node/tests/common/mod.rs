@@ -1338,9 +1338,9 @@ pub struct NodeHandle {
     /// `EEZ_TEST_LOG_DIR/eez-node-<pid>.log` if that env var is set,
     /// otherwise inside a tempdir held in `keep_alive`.
     pub log_path: PathBuf,
-    /// Tempdirs whose lifetime is tied to this handle (the log dir if
-    /// we allocated one, and the datadir if the handle created it via
-    /// [`Self::start`]). They drop with the handle.
+    /// Tempdirs whose lifetime is tied to this handle (the isolated working
+    /// directory, the log dir if allocated, and the datadir if the handle
+    /// created it via [`Self::start`]). They drop with the handle.
     keep_alive: Vec<tempfile::TempDir>,
     pub http_port: u16,
 }
@@ -1382,6 +1382,7 @@ impl NodeHandle {
         env: &[(&'static str, String)],
     ) -> Result<Self> {
         let (log_path, log_tempdir) = test_log_destination(&format!("eez-node-{name}"))?;
+        let working_dir = tempfile::tempdir().context("node working directory")?;
         let f = std::fs::File::create(&log_path).context("create log file")?;
         let f2 = f.try_clone().context("clone log file")?;
         let (stdout, stderr) = (Stdio::from(f), Stdio::from(f2));
@@ -1417,10 +1418,10 @@ impl NodeHandle {
             .or(env_genesis)
             .unwrap_or_else(|| std::ffi::OsString::from("dev"));
         let mut cmd = Command::new(cfg.binary.path());
-        // Each role binary loads dotenv files from its working directory. Running from
-        // the datadir prevents repository settings from changing the explicit
-        // test configuration or redirecting L1 traffic to a developer endpoint.
-        cmd.current_dir(datadir)
+        // Each role binary searches its working directory and ancestors for dotenv
+        // files. The retained datadir may live below the repository, so use a separate
+        // temporary directory to keep repository settings out of the explicit test env.
+        cmd.current_dir(working_dir.path())
             .args(["node", "--chain"])
             .arg(&chain_arg)
             .arg("--datadir")
@@ -1470,12 +1471,14 @@ impl NodeHandle {
             cmd.env(*k, v);
         }
         let child = cmd.spawn().context("spawn eez node role")?;
+        let mut keep_alive: Vec<_> = log_tempdir.into_iter().collect();
+        keep_alive.push(working_dir);
         Ok(Self {
             child: std::sync::Mutex::new(child),
             background_tasks: std::sync::Mutex::new(Vec::new()),
             name: name.to_string(),
             log_path,
-            keep_alive: log_tempdir.into_iter().collect(),
+            keep_alive,
             http_port,
         })
     }
@@ -1570,6 +1573,19 @@ impl NodeHandle {
         })
         .await
         .with_context(|| format!("{} deriver missed the reorg", self.name))
+    }
+
+    /// Wait until the Deriver has finished retreating its confirmed L2 cursor.
+    pub async fn wait_for_reorg_retreat(&self, timeout: Duration) -> Result<()> {
+        wait_for(timeout, || async {
+            Ok((self.log_count_matching(&[
+                "L1 reorg rolled out confirmed batches; L2 safe cursor retreated",
+                "L1 reorg rolled out confirmed batches; L2 head retreated",
+            ])? > 0)
+                .then_some(()))
+        })
+        .await
+        .with_context(|| format!("{} deriver did not finish the reorg retreat", self.name))
     }
 
     /// Assert this node never logged a fatal-class line (process death
