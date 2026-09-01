@@ -11,8 +11,10 @@ use eez_deriver::Deriver;
 use eez_driver::{BlockCommitterHandle, RollupTiming};
 use eez_l1::{L1CanonicalHead, L1Reader, L1ReaderConfig, L1Watcher, L1WatcherConfig};
 use eez_node_common::{
-    EezPayloadBuilder, L2NodeBuilder, node_cli, wait_for_l1_ready, warn_on_deprecated_env,
+    EezPayloadBuilder, EezPoolBuilder, L2NodeBuilder, node_cli, wait_for_l1_ready,
+    warn_on_deprecated_env,
 };
+use reth_chainspec::EthChainSpec as _;
 use reth_node_builder::components::BasicPayloadServiceBuilder;
 use reth_node_ethereum::EthereumNode;
 use tracing::{Level, event};
@@ -26,6 +28,25 @@ const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES: u32 = 32;
 const L2_SYSTEM_TX_GAS_PRICE: u128 = 1_000_000_000;
 const L2_SYSTEM_TX_GAS_LIMIT: u64 = 2_000_000;
+
+struct FollowerSystemConfig {
+    system_signer: PrivateKeySigner,
+    eezl2_address: Address,
+    this_rollup_id: u64,
+}
+
+impl FollowerSystemConfig {
+    fn into_context(self, l2_chain_id: u64) -> eez_protocol::system_tx::SystemTxContext {
+        eez_protocol::system_tx::SystemTxContext {
+            system_signer: self.system_signer,
+            eezl2_address: self.eezl2_address,
+            l2_chain_id,
+            l2_gas_price: L2_SYSTEM_TX_GAS_PRICE,
+            l2_gas_limit: L2_SYSTEM_TX_GAS_LIMIT,
+            this_rollup_id: self.this_rollup_id,
+        }
+    }
+}
 
 /// Follower-specific CLI arguments layered on top of reth's CLI.
 #[derive(clap::Args, Debug, Clone)]
@@ -54,11 +75,19 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         "launching eez follower",
     );
     warn_on_deprecated_env();
+    // A production follower must reconstruct the Composer's Sync-block system
+    // transactions byte-for-byte. Read every required value before launching
+    // reth so a misconfigured follower never appears healthy.
+    let system_config = read_system_config()?;
+    let system_address = system_config.system_signer.address();
 
     let handle = builder
         .with_types::<EthereumNode>()
         .with_components(
             EthereumNode::components()
+                // Reorged-out system transactions must not leak from reth's
+                // reinjection path into an ordinary Live block.
+                .pool(EezPoolBuilder::new(system_address))
                 .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder::default())),
         )
         .with_add_ons(reth_node_ethereum::node::EthereumAddOns::default())
@@ -82,11 +111,11 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
     let deploy_block = l1_reader_config.deploy_block;
     let l1_reader = L1Reader::new(l1_reader_config);
     let l1_watcher = L1Watcher::new(L1WatcherConfig::from_env()?);
-    let system_tx_cfg = build_system_tx_config(&chain_spec)?;
+    let system_tx_cfg = system_config.into_context(chain_spec.chain().id());
     event!(
         name: "eez.node.follower.system_tx_cfg",
         Level::INFO,
-        enabled = system_tx_cfg.is_some(),
+        %system_address,
         "cross-chain system tx reconstruction config loaded",
     );
 
@@ -98,7 +127,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         timing.l2_block_time().as_secs(),
         deploy_block,
         Arc::clone(&l1_head),
-        system_tx_cfg,
+        Some(system_tx_cfg),
     );
 
     wait_for_l1_ready(&l1_reader, deploy_block, read_l1_chain_id()?).await?;
@@ -202,40 +231,33 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
     handle.wait_for_node_exit().await
 }
 
-/// Build deterministic system-transaction reconstruction config from env.
-fn build_system_tx_config<ChainSpec>(
-    chain_spec: &ChainSpec,
-) -> eyre::Result<Option<eez_protocol::system_tx::SystemTxContext>>
-where
-    ChainSpec: reth_chainspec::EthChainSpec,
-{
-    let system_key = match env::var("EEZ_L2_SYSTEM_KEY") {
-        Ok(system_key) => system_key,
-        Err(env::VarError::NotPresent) => return Ok(None),
-        Err(env::VarError::NotUnicode(_)) => {
-            return Err(eyre::eyre!("EEZ_L2_SYSTEM_KEY contains non-UTF-8 bytes"));
-        }
-    };
-    let eezl2_address_str = env::var("EEZL2_ADDRESS")
-        .map_err(|_| eyre::eyre!("EEZL2_ADDRESS required when EEZ_L2_SYSTEM_KEY is set"))?;
-    let rollup_id_str = env::var("EEZ_ROLLUP_ID")
-        .map_err(|_| eyre::eyre!("EEZ_ROLLUP_ID required when EEZ_L2_SYSTEM_KEY is set"))?;
+/// Read the mandatory system-transaction identity before follower startup.
+fn read_system_config() -> eyre::Result<FollowerSystemConfig> {
+    let system_key = required_env("EEZ_L2_SYSTEM_KEY")?;
+    let eezl2_address = required_env("EEZL2_ADDRESS")?;
+    let rollup_id = required_env("EEZ_ROLLUP_ID")?;
 
     let system_signer =
         PrivateKeySigner::from_bytes(&B256::from_str(system_key.trim_start_matches("0x"))?)?;
-    let eezl2_address: Address = Address::from_str(&eezl2_address_str)?;
-    let this_rollup_id: u64 = rollup_id_str
+    let eezl2_address = Address::from_str(&eezl2_address)
+        .map_err(|err| eyre::eyre!("EEZL2_ADDRESS malformed: {err}"))?;
+    let this_rollup_id = rollup_id
         .parse()
         .map_err(|e| eyre::eyre!("EEZ_ROLLUP_ID malformed: {e}"))?;
 
-    Ok(Some(eez_protocol::system_tx::SystemTxContext {
+    Ok(FollowerSystemConfig {
         system_signer,
         eezl2_address,
-        l2_chain_id: chain_spec.chain().id(),
-        l2_gas_price: L2_SYSTEM_TX_GAS_PRICE,
-        l2_gas_limit: L2_SYSTEM_TX_GAS_LIMIT,
         this_rollup_id,
-    }))
+    })
+}
+
+fn required_env(name: &str) -> eyre::Result<String> {
+    match env::var(name) {
+        Ok(value) => Ok(value),
+        Err(env::VarError::NotPresent) => Err(eyre::eyre!("{name} is required in follower mode")),
+        Err(env::VarError::NotUnicode(_)) => Err(eyre::eyre!("{name} contains non-UTF-8 bytes")),
+    }
 }
 
 /// Required for followers: guessing would either assert the wrong source

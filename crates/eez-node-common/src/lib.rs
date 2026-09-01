@@ -8,6 +8,8 @@ use tracing::{Level, event};
 
 mod payload;
 pub use payload::EezPayloadBuilder;
+mod pool;
+pub use pool::EezPoolBuilder;
 
 /// Per M-MIMALLOC-APPS — meaningful win on allocation-heavy workloads.
 #[global_allocator]

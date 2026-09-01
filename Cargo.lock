@@ -3377,6 +3377,8 @@ dependencies = [
 name = "eez-node-common"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.5",
  "alloy-primitives",
  "clap",
  "dotenvy",
@@ -3393,7 +3395,9 @@ dependencies = [
  "reth-evm 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-node-api 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-node-builder 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-primitives-traits",
  "reth-transaction-pool 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]

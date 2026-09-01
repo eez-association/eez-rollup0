@@ -1824,6 +1824,47 @@ impl<'a> Chain<'a> {
         }
     }
 
+    /// Deployment coordinates, for tests that build their own L1 calls.
+    pub fn rpc_url(&self) -> &str {
+        self.rpc_url
+    }
+    pub fn eez_address(&self) -> Address {
+        self.eez_address
+    }
+    pub fn deploy_block(&self) -> u64 {
+        self.deploy_block
+    }
+    pub fn rollup_id(&self) -> u64 {
+        self.rollup_id
+    }
+
+    /// Anvil uses `--block-time`, so `evm_setAutomine` does not stop it.
+    /// Interval 0 pauses block production; restore with `L1_BLOCK_TIME_SECS`.
+    pub async fn set_interval_mining(&self, secs: u64) -> Result<()> {
+        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
+        let _: serde_json::Value = provider
+            .client()
+            .request("anvil_setIntervalMining", (secs,))
+            .await
+            .context("anvil_setIntervalMining")?;
+        Ok(())
+    }
+
+    /// Mine exactly one block.
+    pub async fn mine(&self) -> Result<()> {
+        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
+        let _: serde_json::Value = provider
+            .client()
+            .request("evm_mine", ())
+            .await
+            .context("evm_mine")?;
+        Ok(())
+    }
+
+    pub const fn block_time_secs() -> u64 {
+        L1_BLOCK_TIME_SECS
+    }
+
     pub async fn batches_posted(&self) -> Result<usize> {
         count_events(
             self.rpc_url,

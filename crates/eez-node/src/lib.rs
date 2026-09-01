@@ -26,7 +26,7 @@ use eez_l1::{
     L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
 };
 use eez_node_common::{
-    EezPayloadBuilder, L2NodeBuilder, NoRoleArgs, node_cli, wait_for_l1_ready,
+    EezPayloadBuilder, EezPoolBuilder, L2NodeBuilder, NoRoleArgs, node_cli, wait_for_l1_ready,
     warn_on_deprecated_env,
 };
 use eez_prover::MockEcdsaProver;
@@ -148,6 +148,11 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         prover,
         witness_capture,
     } = composer_proving_from_env()?;
+    let system_key = env::var("EEZ_L2_SYSTEM_KEY")
+        .map_err(|_| eyre::eyre!("EEZ_L2_SYSTEM_KEY required in composer mode"))?;
+    let system_signer =
+        PrivateKeySigner::from_bytes(&B256::from_str(system_key.trim_start_matches("0x"))?)?;
+    let system_address = system_signer.address();
     // Launch the embedded L1 reth first in composer mode — its
     // `StateProviderFactory` backs `LocalChainClient::new_entry` for
     // L1 source-tx simulation. Inline (not in `l1_embedded.rs`)
@@ -272,6 +277,9 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         .with_types::<EthereumNode>()
         .with_components(
             EthereumNode::components()
+                // Reorged-out system transactions must not leak from reth's
+                // reinjection path into an ordinary Live block.
+                .pool(EezPoolBuilder::new(system_address))
                 .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder::default())),
         )
         .with_add_ons(reth_node_ethereum::node::EthereumAddOns::default())
@@ -467,11 +475,6 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         // into signed legacy L2 system txs at Sync-slot time.
         // Constructed only when EvmComposer is constructed —
         // both are tied to embedded L1 mode.
-        let system_key = env::var("EEZ_L2_SYSTEM_KEY").map_err(|_| {
-            eyre::eyre!("EEZ_L2_SYSTEM_KEY required when the cross-chain composer is wired")
-        })?;
-        let system_signer =
-            PrivateKeySigner::from_bytes(&B256::from_str(system_key.trim_start_matches("0x"))?)?;
         // Submission RPC for postBatch and inbound source-chain reads.
         // This can differ from the embedded L1 used for local source
         // simulation (the E2E harness deliberately uses Anvil here), so

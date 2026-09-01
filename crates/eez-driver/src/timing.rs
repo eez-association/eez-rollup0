@@ -385,6 +385,95 @@ mod tests {
         RollupTiming::new(5_000, 1_000, 200, 1_700)
     }
 
+    /// After an off-grid settlement the cursor sits one below the grid. The next
+    /// trigger must still end ON the grid — the range just gets longer.
+    #[test]
+    fn an_off_grid_cursor_realigns_on_the_next_slot() {
+        let t = mainnet();
+        let k = u64::from(t.k());
+        // Off-grid head/cursor: one below an on-grid sync height.
+        let head = 174_197_u64;
+        assert_ne!(head % k, 0, "fixture must be off-grid");
+
+        // Next grid height above it.
+        let sync = 174_198_u64;
+        let comp = t.per_trigger_composition(head, sync, 64);
+        let produced = match comp {
+            SlotComposition::Slot { live, future } => live + future + 1,
+            SlotComposition::Catchup { live } => live + 1,
+            SlotComposition::Idle => 0,
+        };
+        assert!(produced > 0, "must produce the realigning Sync block");
+        assert_eq!(head + produced, sync, "terminal must land on the grid");
+        assert_eq!((head + produced) % k, 0);
+
+        // The drift cannot persist: the next target is absolute, so the span
+        // stretches to reach it (K+1 here) instead of inheriting the offset.
+        let far = t.per_trigger_composition(head, sync + k, 300);
+        let produced_far = match far {
+            SlotComposition::Slot { live, future } => live + future + 1,
+            SlotComposition::Catchup { live } => live + 1,
+            SlotComposition::Idle => 0,
+        };
+        assert_eq!(
+            head + produced_far,
+            sync + k,
+            "must reach the absolute target"
+        );
+        assert_eq!(produced_far, k + 1, "one longer-than-K span realigns it");
+
+        // A whole slot later: still on-grid, normal K-block span.
+        let sync2 = sync + k;
+        let comp2 = t.per_trigger_composition(sync, sync2, 64);
+        let produced2 = match comp2 {
+            SlotComposition::Slot { live, future } => live + future + 1,
+            SlotComposition::Catchup { live } => live + 1,
+            SlotComposition::Idle => 0,
+        };
+        assert_eq!(sync + produced2, sync2);
+    }
+
+    #[test]
+    fn catchup_terminal_is_on_grid_and_a_moved_head_is_detectable() {
+        let t = mainnet();
+        let k = u64::from(t.k());
+        let sync = 174_198_u64; // on-grid: 174198 % 6 == 0
+        assert_eq!(sync % k, 0, "fixture must be on-grid");
+        let mut checked = 0_u32;
+
+        for head in (sync - 400)..(sync - 1) {
+            let SlotComposition::Catchup { live } = t.per_trigger_composition(head, sync, 64)
+            else {
+                continue;
+            };
+            // The terminal the burst intends is on-grid, always.
+            let terminal = head + live + 1;
+            assert_eq!(terminal % k, 0, "terminal off-grid for head {head}");
+            // Producing `live` blocks from a head one higher lands off-grid:
+            // why the burst must target `terminal`, not count blocks.
+            assert_ne!((head + 1 + live + 1) % k, 0, "a moved head must shift it");
+            checked += 1;
+        }
+        assert!(checked > 0, "fixture produced no Catchup compositions");
+    }
+
+    /// Both snap paths step by whole K, so the arithmetic cannot place a
+    /// terminal off-grid — the live drift came from production, not from here.
+    #[test]
+    fn historical_chunk_boundary_stays_on_the_sync_height_grid() {
+        let t = mainnet();
+        let k = u64::from(t.k());
+        let sync = 174_198_u64;
+        for cursor in (sync - 500)..(sync - 10) {
+            for cap in [6_u64, 12, 60, 300] {
+                if let Some(b) = t.historical_chunk_boundary(cursor, sync, cap) {
+                    assert_eq!((sync - b) % k, 0, "boundary off-grid: {b}");
+                    assert!(b > cursor && b < sync);
+                }
+            }
+        }
+    }
+
     #[test]
     fn mainnet_validates() {
         mainnet().validate().expect("mainnet config is valid");

@@ -717,6 +717,86 @@ mod tests {
         }
     }
 
+    /// A mid-chain resume rebuilds only the tail, which must be byte-equal to the
+    /// composer's suffix: offset the nonce by txs the prefix EMITS, not entry count.
+    #[test]
+    fn resumed_tail_matches_full_build_when_offset_by_prefix_emitted_txs() {
+        let cfg = ctx();
+        let n = 11u64;
+        let (u0, u1) = (Bytes::from(vec![0xa0]), Bytes::from(vec![0xa1]));
+        let o0 = outbound_entry();
+        let mut o1 = outbound_entry();
+        o1.l2ToL1Calls[0].data = Bytes::from(vec![0x99, 0x88]);
+        // An inbound entry for ANOTHER rollup: passes the shape gate, emits no
+        // system tx on this L2.
+        let mut foreign = inbound_entry();
+        foreign.destinationRollupId = 2;
+        let in1 = inbound_entry();
+
+        // Composer: the whole claimed chain, nonces N.. in emit order.
+        let full = build_cross_chain_sync_pairs(
+            &[(o0.clone(), u0.clone()), (o1.clone(), u1.clone())],
+            &[foreign.clone(), in1.clone()],
+            &cfg,
+            n,
+        )
+        .unwrap();
+        assert_eq!(
+            full.len(),
+            3,
+            "2 outbound loads + 1 delivery (the foreign entry emits none)"
+        );
+        assert_eq!(
+            full.iter()
+                .map(|p| nonce_of(&p.system_tx))
+                .collect::<Vec<_>>(),
+            vec![n, n + 1, n + 2],
+        );
+
+        // Deriver resume: a competing batch already settled the prefix
+        // (1 outbound + the foreign inbound); only the rest ran under this batch.
+        let (skip_out, skip_in) = (1usize, 1usize);
+        let prefix =
+            build_cross_chain_sync_pairs(&[(o0, u0)], std::slice::from_ref(&foreign), &cfg, n)
+                .unwrap();
+        assert_eq!(
+            prefix.len(),
+            1,
+            "the foreign entry contributes no system tx"
+        );
+        assert_ne!(
+            prefix.len(),
+            skip_out + skip_in,
+            "the emitted count must differ from the entry count here, else the \
+             offset assertion below is vacuous",
+        );
+
+        let tail_out = [(o1, u1)];
+        let tail_in = [in1];
+        let tail_at =
+            |start: u64| build_cross_chain_sync_pairs(&tail_out, &tail_in, &cfg, start).unwrap();
+
+        let tail = tail_at(n + prefix.len() as u64);
+        assert_eq!(tail.len(), full.len() - prefix.len());
+        for (t, f) in tail.iter().zip(&full[prefix.len()..]) {
+            assert_eq!(
+                t.system_tx, f.system_tx,
+                "rebuilt tail system tx must be byte-equal to the committed one",
+            );
+            assert_eq!(t.user_tx, f.user_tx);
+        }
+
+        // Negative control: no offset, or the entry-count offset, re-nonces the
+        // tail into different bytes and derivation halts.
+        for wrong in [0u64, (skip_out + skip_in) as u64] {
+            assert_ne!(
+                tail_at(n + wrong)[0].system_tx,
+                full[prefix.len()].system_tx,
+                "offset {wrong} must NOT reproduce the committed tail",
+            );
+        }
+    }
+
     /// Phase-C invariant (the migration plan's ★ HIGHEST-RISK item): the composer
     /// EMITS the inbound system tx from its in-memory entries; the standalone deriver
     /// REBUILDS it from the L1 `postBatch` (encode → on-chain → decode). The shared
