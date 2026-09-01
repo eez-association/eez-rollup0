@@ -298,11 +298,11 @@ async fn real_signer_rejects_tampered_witness() {
 /// #120) or becomes opaque because its actionable identity is unsafe, a valid
 /// transaction may be sacrificed but must leave the retry loop at the bound.
 async fn assert_opaque_prover_rejection_eventually_evicts_the_candidate(mutation: ProverMutation) {
-    let attester = signer_address(ANVIL_KEY_1).unwrap();
+    let attester = signer_address(ANVIL_ATTESTER_KEY).unwrap();
     let w = setup_cross_chain_proxied(mutation, attester).await.unwrap();
     let l1_rpc = w.l1_rpc();
     let l2_rpc = w.l2_rpc();
-    let starting_nonce = pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
+    let starting_nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
     let starting_value = l2_value(&l2_rpc, w.value_l2).await.unwrap();
     let tx_hash = sign_and_send(
         &w.l1_xchain(),
@@ -345,7 +345,7 @@ async fn assert_opaque_prover_rejection_eventually_evicts_the_candidate(mutation
         "a sacrificed valid transaction must not appear to have landed"
     );
     assert_eq!(
-        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
+        onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
         starting_nonce,
         "the rejected transaction must not burn its source nonce"
     );

@@ -9,9 +9,10 @@ use alloy_rpc_types_eth::BlockNumberOrTag;
 use eez_testkit::signals;
 use eez_testkit::{
     ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
-    Harness, NodeBinary, NodeConfig, NodeHandle, block_number_and_hash_at, override_env,
-    reorg_genesis_state_root, send_l2_value_transfer, send_l2_value_transfer_confirmed, wait_for,
-    wait_for_latest_height, wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
+    Harness, INVALID_PROOF_SELECTOR, INVALID_PROOF_SYSTEM_CONFIG_SELECTOR, NodeBinary, NodeConfig,
+    NodeHandle, block_number_and_hash_at, l2_genesis_state_root, override_env,
+    send_l2_value_transfer, send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
+    wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
     wait_for_safe_prefix_convergence, wait_for_safe_state,
 };
 
