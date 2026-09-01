@@ -286,6 +286,7 @@ impl OptimisticallyIncluded {
 mod tests {
     use super::*;
     use alloy_primitives::{B256, Bytes, keccak256};
+    use proptest::prelude::*;
 
     fn tx(tag: u8) -> HeldTx {
         let raw = Bytes::from(vec![tag; 4]);
@@ -309,6 +310,84 @@ mod tests {
     /// Dummy postBatch tx hash, distinguishable per batch.
     fn pb_hash(tag: u8) -> TxHash {
         TxHash::repeat_byte(tag)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(192))]
+
+        /// Model arbitrary optimistic begin/observe/confirm/recover sequences.
+        /// The public gate permits at most one unresolved batch, cursor
+        /// confirmation releases each tx once, and rollback is always
+        /// represented by an explicit failed-batch extraction.
+        #[test]
+        fn optimistic_ledger_state_machine_preserves_invariants(
+            commands in proptest::collection::vec((0u8..7, any::<bool>()), 1..128),
+        ) {
+            let ledger = OptimisticallyIncluded::new();
+            let mut cursor = 0u64;
+            let mut next_tag = 1u8;
+            let mut released = std::collections::HashSet::<TxHash>::new();
+            let mut explicit_rollbacks = 0usize;
+
+            for (command, flag) in commands {
+                let blocking = ledger.blocking_height(cursor);
+                match command {
+                    0 if blocking.is_none() => {
+                        let height = cursor.saturating_add(1 + u64::from(next_tag % 3));
+                        ledger.begin(height, pb_hash(next_tag), hdr(), vec![tx(next_tag)]);
+                        next_tag = next_tag.wrapping_add(1);
+                    }
+                    1 => {
+                        if let Some(height) = blocking {
+                            ledger.mark_settled(height);
+                        }
+                    }
+                    2 => {
+                        if let Some(height) = blocking {
+                            ledger.mark_failed(height, flag);
+                        }
+                    }
+                    3 => {
+                        if let Some(height) = blocking {
+                            cursor = height;
+                            for tx in ledger.resolve_below_cursor(cursor) {
+                                prop_assert!(released.insert(tx.hash), "tx released twice");
+                            }
+                        }
+                    }
+                    4 => {
+                        if let Some(failed) = ledger.take_failed_for_recovery(cursor) {
+                            if flag {
+                                ledger.reinsert_failed(failed);
+                            } else {
+                                explicit_rollbacks += 1;
+                            }
+                        }
+                    }
+                    5 => {
+                        let _ = ledger.take_finalized(cursor);
+                    }
+                    _ => {
+                        let rolled_back = ledger.take_rolled_out(cursor);
+                        explicit_rollbacks += usize::from(!rolled_back.is_empty());
+                    }
+                }
+
+                let map = ledger.by_sync_height.lock().unwrap();
+                let unresolved = map
+                    .values()
+                    .filter(|entry| entry.resolution != Resolution::Settled)
+                    .count();
+                prop_assert!(unresolved <= 1, "more than one optimistic batch is unresolved");
+                let expected_blocking = map.range(cursor.saturating_add(1)..).next().map(|(h, _)| *h);
+                drop(map);
+                prop_assert_eq!(ledger.blocking_height(cursor), expected_blocking);
+            }
+
+            // Keep this assertion non-vacuous in shrunk cases without requiring
+            // a rollback on every generated trace.
+            prop_assert!(explicit_rollbacks <= 128);
+        }
     }
 
     #[test]

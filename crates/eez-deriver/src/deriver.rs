@@ -1764,6 +1764,7 @@ mod producing_slice_tests {
     use super::ProducingSlice;
     use alloy_primitives::B256;
     use eez_l1::Settlement;
+    use proptest::prelude::*;
 
     /// Cursor guard and `check_claimed_state` must agree on entry root, else a
     /// mid-chain resume clears one and fails the other.
@@ -1812,6 +1813,41 @@ mod producing_slice_tests {
             len,
             final_state: None,
             entry_state: None,
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// For every settlement run and outbound/inbound partition,
+        /// reconstruction selects exactly the consumed producing prefix/run.
+        /// An anchor at claimed index zero never becomes a system transaction,
+        /// and a resumed batch skips the already-landed producing prefix.
+        #[test]
+        fn reconcile_selects_exact_settled_producing_run(
+            start in 0usize..96,
+            len in 0usize..96,
+            outbound_len in 0usize..48,
+            inbound_len in 0usize..48,
+        ) {
+            let total = outbound_len + inbound_len;
+            let settlement = settlement(start, len);
+            let (raw_skip, raw_take) = settlement.producing_slice();
+            let expected_skip = raw_skip.min(total);
+            let expected_take = raw_take.min(total - expected_skip);
+            let slice = ProducingSlice::split(settlement, outbound_len, inbound_len);
+
+            prop_assert_eq!(slice.outbound_skip, expected_skip.min(outbound_len));
+            prop_assert_eq!(slice.outbound_take + slice.inbound_take, expected_take);
+            prop_assert_eq!(
+                slice.outbound_skip + slice.inbound_skip,
+                expected_skip,
+                "the full already-consumed prefix must be skipped",
+            );
+            prop_assert_eq!(
+                slice.leaves_entries_unconsumed(outbound_len, inbound_len),
+                expected_skip + expected_take < total,
+            );
         }
     }
 

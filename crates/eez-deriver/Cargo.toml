@@ -41,5 +41,8 @@ alloy-rpc-types-engine.workspace = true
 tokio.workspace   = true
 tracing.workspace = true
 
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true

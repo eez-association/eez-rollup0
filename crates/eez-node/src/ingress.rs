@@ -635,6 +635,48 @@ mod tests {
         assert_eq!(pool.len(), 1);
     }
 
+    /// Retrying the exact same signed submission is idempotent at the ingress
+    /// boundary. The caller receives the same canonical hash and the HeldPool
+    /// contains one logical transaction.
+    #[tokio::test]
+    async fn submitting_the_same_raw_transaction_twice_holds_one_entry() {
+        let (_, envelope, raw) = signed_eip1559(31337, U256::ZERO, 21_000, 1);
+        let pool = HeldPool::new();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
+        for _ in 0..2 {
+            asserter.push_success(&U256::from(1_000_000u64));
+            asserter.push_success(&0_u64);
+        }
+
+        let first = gate_and_hold(
+            &envelope,
+            &raw,
+            Direction::Inbound,
+            &pool,
+            31337,
+            &provider,
+        )
+        .await;
+        let duplicate = gate_and_hold(
+            &envelope,
+            &raw,
+            Direction::Inbound,
+            &pool,
+            31337,
+            &provider,
+        )
+        .await;
+
+        let (Admission::Held(first_hash), Admission::Held(duplicate_hash)) = (first, duplicate)
+        else {
+            panic!("both submissions must be acknowledged as held");
+        };
+        assert_eq!(first_hash, duplicate_hash);
+        assert_eq!(pool.len(), 1, "duplicate submission must not duplicate work");
+        assert_eq!(pool.pop_all()[0].hash, first_hash);
+    }
+
     #[tokio::test]
     async fn wrong_source_chain_id_is_rejected_without_pool_mutation() {
         let (signer, envelope, raw) = signed_eip1559(1, U256::ZERO, 21_000, 1);
