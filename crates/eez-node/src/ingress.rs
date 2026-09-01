@@ -14,6 +14,9 @@
 //! compose time (the composer's chained simulation finds no cross-chain
 //! effect). One front
 //! per source chain (invariant 8).
+//!
+//! Answered at the door, not held then evicted: a creation has no target, so it
+//! is forwarded to the source chain; a codeless target is rejected with why.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -47,9 +50,8 @@ pub enum Admission {
     Rejected(String),
 }
 
-/// Admission gate: recover the signer, validate nonce + balance against the
-/// SOURCE chain (`validation_provider`), and push into `held_pool` with
-/// `direction`.
+/// Checks the target's code, the nonce and the balance on the SOURCE chain
+/// (`validation_provider`), then holds the tx under `direction`.
 ///
 /// A new nonce must be the first unreserved nonce at or above the source-chain
 /// nonce for this direction. An existing queued nonce may be replaced in
@@ -73,6 +75,28 @@ pub async fn gate_and_hold(
     let Ok(sender) = envelope.recover_signer() else {
         return Admission::Rejected("signature recovery failed".into());
     };
+    // The front forwards creations, so HTTP never gets here. This guards direct
+    // callers of a public fn.
+    let Some(to) = envelope.to() else {
+        return Admission::Rejected(
+            "creations are not cross-chain: a contract creation has no target; submit deploys to the chain's own RPC".into(),
+        );
+    };
+    // No code at `to` means no manager frame can ever run, so holding this tx
+    // would only end in an evict.
+    match validation_provider.get_code_at(to).await {
+        Ok(code) if code.is_empty() => {
+            return Admission::Rejected(format!(
+                "target {to} has no code on the source chain — a cross-chain call must target a deployed contract or proxy; create the proxy first (createCrossChainProxy on the manager) or use the bridge, then resubmit"
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Admission::Rejected(format!(
+                "source-chain code lookup failed for target {to}: {e}"
+            ));
+        }
+    }
     let nonce = envelope.nonce();
     // This checks one transaction; simulation enforces cumulative affordability.
     let balance = match validation_provider.get_balance(sender).await {
@@ -474,6 +498,17 @@ async fn intercept_send_raw(
 ) -> Option<Response<Full<HyperBytes>>> {
     let raw: Bytes = raw_hex.parse().ok()?;
     let envelope = TxEnvelope::decode_2718(&mut raw.as_ref()).ok()?;
+    // A creation has no target, so it can never compose. Forwarding deploys it
+    // on the source chain, which is what the sender wanted.
+    if envelope.is_create() {
+        event!(
+            name: "eez.xchain_front.create_forwarded",
+            Level::INFO,
+            direction = ?ctx.direction,
+            "contract creation forwarded to the source chain's RPC",
+        );
+        return None;
+    }
     let id = json.get("id").cloned().unwrap_or(Value::Null);
     let resp_body = match gate_and_hold(
         &envelope,
@@ -619,14 +654,21 @@ mod tests {
         }
     }
 
+    /// One admitted tx makes three lookups: code, balance, nonce. The mock
+    /// answers in push order, not by method, so the order matters.
+    fn push_admission_lookups(asserter: &Asserter, balance: u64, nonce: u64) {
+        asserter.push_success(&Bytes::from_static(&[0x60, 0x00]));
+        asserter.push_success(&U256::from(balance));
+        asserter.push_success(&nonce);
+    }
+
     #[tokio::test]
     async fn matching_source_chain_id_is_accepted() {
         let (_, envelope, raw) = signed_eip1559(31337, U256::ZERO, 21_000, 1);
         let pool = HeldPool::new();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
-        asserter.push_success(&U256::from(1_000_000u64));
-        asserter.push_success(&0_u64);
+        push_admission_lookups(&asserter, 1_000_000, 0);
 
         let admission =
             gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await;
@@ -686,8 +728,7 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
         for _ in 0..3 {
-            asserter.push_success(&U256::from(10_000_000u64));
-            asserter.push_success(&0_u64);
+            push_admission_lookups(&asserter, 10_000_000, 0);
         }
 
         assert!(matches!(
@@ -897,13 +938,10 @@ mod tests {
         let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
 
         for _ in 0..2 {
-            asserter.push_success(&U256::from(1_000_000u64));
-            asserter.push_success(&0_u64);
+            push_admission_lookups(&asserter, 1_000_000, 0);
         }
-        asserter.push_success(&U256::from(1_000_000u64));
-        asserter.push_success(&1_u64);
-        asserter.push_success(&U256::from(1_000_000u64));
-        asserter.push_success(&1_u64);
+        push_admission_lookups(&asserter, 1_000_000, 1);
+        push_admission_lookups(&asserter, 1_000_000, 1);
 
         assert!(matches!(
             gate_and_hold(&first, &first_raw, Direction::Inbound, &pool, 1, &provider,).await,
@@ -961,8 +999,7 @@ mod tests {
         let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
 
         for _ in 0..4 {
-            asserter.push_success(&U256::from(10_000_000u64));
-            asserter.push_success(&0_u64);
+            push_admission_lookups(&asserter, 10_000_000, 0);
         }
 
         let Admission::Held(original_hash) = gate_and_hold(
@@ -1069,14 +1106,12 @@ mod tests {
         let inbound_provider =
             ProviderBuilder::default().connect_mocked_client(inbound_asserter.clone());
         for _ in 0..3 {
-            inbound_asserter.push_success(&U256::from(1_000_000u64));
-            inbound_asserter.push_success(&0_u64);
+            push_admission_lookups(&inbound_asserter, 1_000_000, 0);
         }
         let outbound_asserter = Asserter::new();
         let outbound_provider =
             ProviderBuilder::default().connect_mocked_client(outbound_asserter.clone());
-        outbound_asserter.push_success(&U256::from(1_000_000u64));
-        outbound_asserter.push_success(&0_u64);
+        push_admission_lookups(&outbound_asserter, 1_000_000, 0);
 
         let inbound_task = tokio::spawn(run_cross_chain_front(
             inbound_port,
@@ -1136,8 +1171,7 @@ mod tests {
 
         let asserter = Asserter::new();
         let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
-        asserter.push_success(&U256::from(1_000_000u64));
-        asserter.push_success(&0_u64);
+        push_admission_lookups(&asserter, 1_000_000, 0);
 
         let task = tokio::spawn(run_cross_chain_front(
             port,
@@ -1168,5 +1202,151 @@ mod tests {
         assert_eq!(pool.pop_all().len(), 1);
 
         task.abort();
+    }
+
+    /// Upstream RPC stub: records every request body, answers with `result`.
+    async fn stub_upstream(result: &'static str) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let recorder = Arc::clone(&recorder);
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let recorder = Arc::clone(&recorder);
+                        async move {
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
+                            recorder
+                                .lock()
+                                .unwrap()
+                                .push(String::from_utf8_lossy(&body).into_owned());
+                            Ok::<_, hyper::Error>(json_response(
+                                json!({"jsonrpc": "2.0", "result": result, "id": 1}).to_string(),
+                            ))
+                        }
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), seen)
+    }
+
+    fn signed_creation(signer: &PrivateKeySigner) -> Bytes {
+        let mut tx = TxEip1559 {
+            chain_id: 1,
+            nonce: 0,
+            gas_limit: 100_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Create,
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: Bytes::from_static(&[0x60, 0x00]),
+        };
+        let sig = signer.sign_transaction_sync(&mut tx).unwrap();
+        Bytes::from(TxEnvelope::from(tx.into_signed(sig)).encoded_2718())
+    }
+
+    /// A deploy sent to a front must reach the source chain, not the held pool.
+    #[tokio::test]
+    async fn creation_is_forwarded_upstream_and_never_held() {
+        const UPSTREAM_HASH: &str =
+            "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+        let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(7)).unwrap();
+        let raw = signed_creation(&signer);
+        let (upstream, seen) = stub_upstream(UPSTREAM_HASH).await;
+        let pool = Arc::new(HeldPool::new());
+        let port = free_port();
+        // Empty asserter: the gate must not run a single lookup for a creation.
+        let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
+
+        let task = tokio::spawn(run_cross_chain_front(
+            port,
+            upstream,
+            Direction::Outbound,
+            Arc::clone(&pool),
+            provider,
+            1,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ));
+        wait_for_front(port).await;
+
+        let response = send_raw(port, &raw, 9).await;
+        assert_eq!(response["result"], UPSTREAM_HASH, "{response}");
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "upstream must receive the creation exactly once: {bodies:?}"
+        );
+        assert!(
+            bodies[0].contains("eth_sendRawTransaction"),
+            "the raw creation must be relayed verbatim: {}",
+            bodies[0]
+        );
+        assert!(pool.pop_all().is_empty(), "a creation must not be held");
+
+        task.abort();
+    }
+
+    /// A target with no code has no proxy to route through, so it is rejected at
+    /// the door with the remedy instead of a quiet compose-time evict.
+    #[tokio::test]
+    async fn codeless_target_is_rejected_with_the_remedy_and_pool_untouched() {
+        let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(8)).unwrap();
+        let (_, raw) = signed_transfer(&signer, 0, 1, 1);
+        let pool = Arc::new(HeldPool::new());
+        let port = free_port();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
+        // Empty code, then a good balance and nonce, so only the code check can
+        // be what rejects this tx.
+        asserter.push_success(&Bytes::new());
+        asserter.push_success(&U256::from(1_000_000u64));
+        asserter.push_success(&0_u64);
+
+        let task = tokio::spawn(run_cross_chain_front(
+            port,
+            "http://127.0.0.1:1".into(),
+            Direction::Inbound,
+            Arc::clone(&pool),
+            provider,
+            1,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ));
+        wait_for_front(port).await;
+
+        let rejected = send_raw(port, &raw, 1).await;
+        assert_eq!(rejected["error"]["code"], -32000, "{rejected}");
+        let msg = rejected["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("has no code on the source chain"), "{msg}");
+        assert!(msg.contains("createCrossChainProxy"), "{msg}");
+        assert!(msg.contains("resubmit"), "{msg}");
+        assert!(pool.pop_all().is_empty(), "a rejected tx must not be held");
+
+        task.abort();
+    }
+
+    /// `gate_and_hold` is public; a creation reaching it directly must not panic.
+    #[tokio::test]
+    async fn gate_refuses_a_creation_defensively() {
+        let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(7)).unwrap();
+        let raw = signed_creation(&signer);
+        let envelope = TxEnvelope::decode_2718(&mut raw.as_ref()).unwrap();
+        let pool = HeldPool::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
+
+        let msg = rejection(
+            gate_and_hold(&envelope, &raw, Direction::Outbound, &pool, 1, &provider).await,
+        );
+
+        assert!(msg.contains("creations are not cross-chain"), "{msg}");
+        assert_eq!(pool.len(), 0);
     }
 }
