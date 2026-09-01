@@ -305,6 +305,10 @@ const POSTBATCH_BASE_GAS_PIN: u64 = 160_000;
 /// deploy for a new sender. Same pin test; measured 334k worst case, 10% slack.
 const POSTBATCH_ENTRY_GAS_PIN: u64 = 370_000;
 
+/// Below this the drain admits nothing and evicts the first held tx as poison.
+const MIN_VIABLE_POSTBATCH_GAS: u64 =
+    projected_postbatch_gas(2, 0, 0).saturating_add(POSTBATCH_DRAIN_MARGIN);
+
 /// EIP-7623 calldata floor — below it the tx is invalid and dies at simulation.
 fn calldata_floor_gas(calldata: &[u8]) -> u64 {
     let nonzero = calldata.iter().filter(|byte| **byte != 0).count() as u64;
@@ -321,7 +325,7 @@ fn calldata_gas(bytes: &[u8]) -> u64 {
 
 /// Whole-postBatch gas on EIP-7623's standard branch: tx base, calldata, pins,
 /// probed target calls. The floor branch is checked in `sign_post_batch_tx`.
-fn projected_postbatch_gas(entry_count: u64, calldata_gas: u64, target_gas: u64) -> u64 {
+const fn projected_postbatch_gas(entry_count: u64, calldata_gas: u64, target_gas: u64) -> u64 {
     21_000_u64
         .saturating_add(POSTBATCH_BASE_GAS_PIN)
         .saturating_add(POSTBATCH_ENTRY_GAS_PIN.saturating_mul(entry_count))
@@ -621,11 +625,10 @@ impl From<&str> for PreparePostBatchError {
 }
 
 /// Both ends are unusable and clamp to the default: above it no tx is valid
-/// (EIP-7825), and below `MIN_VIABLE` every emission path refuses forever.
+/// (EIP-7825), and below [`MIN_VIABLE_POSTBATCH_GAS`] every emission path
+/// refuses forever.
 fn clamp_max_postbatch_gas(requested: u64) -> u64 {
-    // The cheapest batch there is: the tx base plus one leading immediate entry.
-    let min_viable: u64 = projected_postbatch_gas(1, 0, 0);
-    if (min_viable..=DEFAULT_MAX_POSTBATCH_GAS).contains(&requested) {
+    if (MIN_VIABLE_POSTBATCH_GAS..=DEFAULT_MAX_POSTBATCH_GAS).contains(&requested) {
         return requested;
     }
     event!(
@@ -633,8 +636,8 @@ fn clamp_max_postbatch_gas(requested: u64) -> u64 {
         Level::ERROR,
         requested,
         clamped_to = DEFAULT_MAX_POSTBATCH_GAS,
-        min_viable,
-        "EEZ_MAX_POSTBATCH_GAS is out of range (must leave room above the cheapest batch's execution and stay within the EIP-7825 tx gas cap) — clamping to the default",
+        min_viable = MIN_VIABLE_POSTBATCH_GAS,
+        "EEZ_MAX_POSTBATCH_GAS is out of range (must leave room for the drain margin plus one held tx, and stay within the EIP-7825 tx gas cap) — clamping to the default",
     );
     DEFAULT_MAX_POSTBATCH_GAS
 }
@@ -4629,11 +4632,12 @@ mod tests {
     fn gas_budget_out_of_range_clamps_to_default() {
         // In range → honoured.
         assert_eq!(clamp_max_postbatch_gas(12_000_000), 12_000_000);
-        // The cheapest batch there is must stand.
-        let min_viable = projected_postbatch_gas(1, 0, 0);
-        assert_eq!(clamp_max_postbatch_gas(min_viable), min_viable);
         assert_eq!(
-            clamp_max_postbatch_gas(min_viable - 1),
+            clamp_max_postbatch_gas(MIN_VIABLE_POSTBATCH_GAS),
+            MIN_VIABLE_POSTBATCH_GAS
+        );
+        assert_eq!(
+            clamp_max_postbatch_gas(MIN_VIABLE_POSTBATCH_GAS - 1),
             DEFAULT_MAX_POSTBATCH_GAS
         );
         assert_eq!(
@@ -4645,6 +4649,50 @@ mod tests {
         assert_eq!(
             clamp_max_postbatch_gas(DEFAULT_MAX_POSTBATCH_GAS + 1),
             DEFAULT_MAX_POSTBATCH_GAS
+        );
+    }
+
+    /// The forge pin test re-declares both constants as literals, so a change
+    /// here would leave it measuring the old value in silence. Bind them.
+    #[test]
+    fn solidity_pin_test_mirrors_the_rust_gas_pins() {
+        let sol = include_str!("../../../contracts/test/PostBatchGasPins.t.sol");
+        for (name, rust) in [
+            ("POSTBATCH_BASE_GAS_PIN", POSTBATCH_BASE_GAS_PIN),
+            ("POSTBATCH_ENTRY_GAS_PIN", POSTBATCH_ENTRY_GAS_PIN),
+        ] {
+            let decl = format!("uint256 private constant {name} = ");
+            let rest = sol
+                .split(&decl)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} is not declared in PostBatchGasPins.t.sol"));
+            let literal: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '_')
+                .collect();
+            let sol_value: u64 = literal
+                .replace('_', "")
+                .parse()
+                .unwrap_or_else(|e| panic!("{name} literal {literal:?}: {e}"));
+            assert_eq!(
+                sol_value, rust,
+                "{name} drifted: Solidity pins {sol_value}, Rust projects {rust}",
+            );
+        }
+    }
+
+    /// Any ceiling the clamp accepts must let the drain take at least one tx.
+    #[test]
+    fn the_lowest_accepted_ceiling_still_admits_one_held_tx() {
+        let mut budget = PostBatchGasBudget::new(MIN_VIABLE_POSTBATCH_GAS);
+        assert!(
+            budget.try_accept(TxL1Gas {
+                entries: 1,
+                calldata_gas: 0,
+                target_gas: 0,
+            }),
+            "the lowest accepted ceiling admits no tx — every drain would evict \
+             its first held tx as poison",
         );
     }
 
