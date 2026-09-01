@@ -44,7 +44,8 @@ use crate::held_pool::HeldTx;
 /// evicted before it can ever enter a bundle); a drop that reaches
 /// recovery is treated as bad luck and re-queued, with
 /// [`MAX_BUNDLE_ATTEMPTS`](crate::composer::MAX_BUNDLE_ATTEMPTS) as a
-/// backstop for poison the compose-time sim view missed.
+/// backstop for poison the compose-time sim view missed. The same bound covers
+/// proof failures, so one counter follows a transaction across both paths.
 #[derive(Debug)]
 pub struct FailedBatch {
     /// L2 height of the optimistically-committed Sync block.

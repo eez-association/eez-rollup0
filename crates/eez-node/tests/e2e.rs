@@ -9,9 +9,10 @@ use alloy_rpc_types_eth::BlockNumberOrTag;
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
-    Harness, NodeBinary, NodeConfig, NodeHandle, block_number_and_hash_at, override_env,
-    reorg_genesis_state_root, send_l2_value_transfer, send_l2_value_transfer_confirmed, wait_for,
-    wait_for_latest_height, wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
+    ANVIL_KEY_6, Harness, NodeBinary, NodeConfig, NodeHandle, block_number_and_hash_at,
+    override_env, reorg_genesis_state_root, safe_block_state_root, send_l2_value_transfer,
+    send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
+    wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
     wait_for_safe_prefix_convergence, wait_for_safe_state,
 };
 
@@ -496,6 +497,111 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
 
     c1.assert_no_process_death();
     c2.assert_no_process_death();
+}
+
+/// Three composers racing on one L1, no reorg and no injected fault, so the
+/// loser's batch is redundant every slot. Checks each composer stays converged
+/// with what L1 recorded rather than wedging on a divergence it cannot resync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_composer_steady_state_stays_converged_with_l1() {
+    const COMPOSERS: usize = 3;
+    /// Enough to catch a composer that converges once then drifts.
+    const SETTLEMENTS: usize = 24;
+
+    let harness = Harness::fresh().await.unwrap();
+    let chain = harness.chain();
+    let cfg = NodeConfig {
+        genesis_path: Some(harness.l2_genesis_path()),
+        ..Default::default()
+    };
+
+    // Distinct posters: a shared key serialises them on nonces, so no race.
+    let poster_keys = [ANVIL_KEY, ANVIL_KEY_4, ANVIL_KEY_6];
+    let spam_keys = [ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3];
+    let mut nodes = Vec::with_capacity(COMPOSERS);
+    for (i, poster) in poster_keys.iter().take(COMPOSERS).enumerate() {
+        // `expect_external_batches`: peer batches are normal here, not an error.
+        let env = harness.env_for(poster, true).await.unwrap();
+        let name: &'static str = ["mc1", "mc2", "mc3"][i];
+        nodes.push((name, NodeHandle::start(name, &cfg, &env).await.unwrap()));
+    }
+    for ((_, node), key) in nodes.iter().zip(spam_keys) {
+        node.run_tx_spammer(key);
+    }
+
+    // Comparing against L1's CURRENT root would race, since L1 advances while
+    // we read. So: the safe root must be one L1 recorded (soundness), and the
+    // safe height must keep rising (liveness — a wedged deriver stops).
+    let mut last_safe = vec![0u64; nodes.len()];
+    let mut advanced = 0usize;
+    let mut compared = 0usize;
+    for settled in 1..=SETTLEMENTS {
+        chain
+            .wait_for_batches(settled, DEFAULT_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| panic!("stalled at settlement {settled} of {SETTLEMENTS}: {e:#}"));
+
+        // Every root L1 recorded: a lagging composer is fine, an invented
+        // one is not.
+        let recorded = chain.executed_states().await.unwrap();
+        for (i, (name, node)) in nodes.iter().enumerate() {
+            node.assert_no_process_death();
+            let Some((number, _hash)) =
+                block_number_and_hash_at(&node.l2_rpc_url(), BlockNumberOrTag::Safe)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("{name}: safe block unreadable at {settled}: {e:#}")
+                    })
+            else {
+                continue; // no attested block yet; nothing to judge
+            };
+            if number == 0 {
+                continue;
+            }
+            let safe_root = safe_block_state_root(&node.l2_rpc_url())
+                .await
+                .unwrap()
+                .unwrap_or_default();
+            compared += 1;
+            assert!(
+                recorded.contains(&safe_root),
+                "{name} safe root {safe_root} at L2 height {number} was never recorded by L1 \
+                 (settlement {settled}); the composer derived a chain L1 did not ratify",
+            );
+            if number > last_safe[i] {
+                advanced += 1;
+                last_safe[i] = number;
+            }
+        }
+    }
+
+    // Surfaced so a pass is auditable — a run that compared nothing would
+    // otherwise look identical to a real one.
+    eprintln!(
+        "multi-composer: root comparisons={compared} l1_recorded_roots={} final_safe_heights={last_safe:?}",
+        chain.executed_states().await.unwrap().len(),
+    );
+
+    // Caught up AND still moving: a wedged deriver attests a few then stops.
+    for (i, (name, _)) in nodes.iter().enumerate() {
+        assert!(
+            last_safe[i] > 0,
+            "{name} never attested a safe block — it never caught up to L1 at all",
+        );
+    }
+    assert!(
+        advanced >= SETTLEMENTS,
+        "safe heads advanced only {advanced} times across {SETTLEMENTS} settlements and \
+         {COMPOSERS} composers — at least one composer stopped tracking L1",
+    );
+    // Allow a startup window: early settlements can precede a composer's
+    // first attested safe block.
+    let floor = (SETTLEMENTS - 3) * COMPOSERS;
+    assert!(
+        compared >= floor,
+        "only {compared} root comparisons (floor {floor}) across {SETTLEMENTS} settlements × \
+         {COMPOSERS} composers — the soundness check was mostly skipped, so this proves little",
+    );
 }
 
 async fn spawn_follower(
