@@ -472,6 +472,7 @@ where
                     batch.settlement.entry_state.or(batch.claimed_current_state)
                 },
                 batch.settlement.final_state.or(batch.claimed_new_state),
+                anchor,
                 batch_first_l2,
                 batch_last_l2,
                 scan_sync_hash,
@@ -1002,6 +1003,7 @@ where
                 settlement.entry_state.or(claimed_current_state)
             },
             settlement.final_state.or(claimed_new_state),
+            anchor,
             from_block,
             to_block,
             sync_block_hash,
@@ -1466,6 +1468,19 @@ where
                      settled entries without the existing content",
                 ));
             }
+            // Which Sync block these entries land in (issue #121).
+            event!(
+                name: "eez.deriver.resumed.placement",
+                Level::INFO,
+                l1_block_number,
+                tx_hash = %tx_hash,
+                from_block,
+                applied_start = settlement.start,
+                applied_len = settlement.len,
+                entry_state = ?settlement.entry_state,
+                claimed_block_count = decoded.block_count(),
+                "resumed batch placement: appending settled entries to Sync block {from_block}",
+            );
             let mut block_txs: Vec<Vec<u8>> = self
                 .inner
                 .l2_provider
@@ -1530,8 +1545,9 @@ where
                 }
                 block_txs.extend(new_content);
                 let outcome = self.replay_block(from_block - 1, &block_txs).await?;
-                // A same-height replacement is invisible to by-number reads until
-                // persistence, so later reads must go by this hash.
+                // No later block follows this one to make it canonical, so
+                // reading by number can still return the old block. Only an
+                // issue here; a forward replay is extended by the next commit.
                 sync_block_hash = Some(outcome.block_hash);
                 replayed = 1;
             }
@@ -1689,10 +1705,13 @@ where
         &self,
         entry_root: Option<B256>,
         claimed_new_state: Option<B256>,
+        // Block the applied run started from. The endpoint is in
+        // `[anchor, to_block]`, anchor included.
+        anchor: u64,
         from_block: u64,
         to_block: u64,
-        // Hash of the block replayed at `to_block`, if any: the post-root must be
-        // read by hash, since by-number lags persistence.
+        // Hash of the block replayed at `to_block`. Needed only when a
+        // resumed batch rewrote the tip; see `sync_block_hash`.
         to_block_hash: Option<B256>,
         l1_block_number: u64,
         tx_hash: B256,
@@ -1740,7 +1759,9 @@ where
                 );
                 return Err(DeriverError::local_diverged(to_block));
             }
-            let window = to_block.saturating_sub(from_block).saturating_add(1);
+            // A depth, not a block count. `from_block` is `anchor + 1` when
+            // fresh and `anchor` when resumed, so measure from the anchor.
+            let window = to_block.saturating_sub(anchor);
             if let Some(settled_end) = find_batch_anchor(to_block, claimed_new, window, |block| {
                 self.l2_state_root_at(block)
             })? {
@@ -2394,6 +2415,75 @@ mod batch_anchor_tests {
         let anchor =
             find_batch_anchor(cursor, B256::repeat_byte(0xEE), 6, |b| Ok(root_at(b))).expect("ok");
         assert!(anchor.is_none(), "unknown root must not be anchored");
+    }
+
+    /// Endpoint depth is measured from the ANCHOR, not `from_block`, which is
+    /// `anchor + 1` when fresh and `anchor` when resumed. Both from-relative
+    /// forms are wrong in opposite directions.
+    ///
+    /// The anchor is a legitimate endpoint: a single-block batch's leading
+    /// immediate is a no-op (`newState == parent.stateRoot == root(anchor)`),
+    /// so L1 can accept it and leave the root there.
+    #[test]
+    fn endpoint_depth_is_measured_from_the_anchor() {
+        for count in [1_u64, 6] {
+            let anchor = 174_192_u64;
+            let (from, to) = batch_l2_range(anchor, false, count);
+            let probe = |b| Ok(root_at(b));
+
+            assert_eq!(
+                find_batch_anchor(to, root_at(anchor), to - anchor, probe).expect("lookup"),
+                Some(anchor),
+                "count={count}: the anchor must stay reachable",
+            );
+            // `to - from` misses it — one short for a fresh batch.
+            assert!(
+                find_batch_anchor(to, root_at(anchor), to - from, probe)
+                    .expect("lookup")
+                    .is_none(),
+                "count={count}: from-relative depth wrongly excludes the anchor",
+            );
+            for endpoint in from..=to {
+                assert_eq!(
+                    find_batch_anchor(to, root_at(endpoint), to - anchor, probe).expect("lookup"),
+                    Some(endpoint),
+                );
+            }
+            assert!(
+                find_batch_anchor(to, root_at(anchor - 1), to - anchor, probe)
+                    .expect("lookup")
+                    .is_none(),
+                "count={count}: a root predating the run must not be accepted",
+            );
+        }
+    }
+
+    /// A resumed batch collapses onto the anchor (`from == to == anchor`), so
+    /// its only valid endpoint is that block — depth 0. The inclusive count
+    /// would reach the anchor's parent and accept a root predating the batch.
+    #[test]
+    fn resumed_batch_endpoint_is_its_own_sync_block_only() {
+        let anchor = 174_197_u64;
+        let (from, to) = batch_l2_range(anchor, true, 10);
+        assert_eq!((from, to), (anchor, anchor));
+        assert_eq!(to - anchor, 0);
+
+        assert_eq!(
+            find_batch_anchor(to, root_at(anchor), 0, |b| Ok(root_at(b))).expect("lookup"),
+            Some(anchor),
+        );
+        assert!(
+            find_batch_anchor(to, root_at(anchor - 1), 0, |b| Ok(root_at(b)))
+                .expect("lookup")
+                .is_none(),
+            "must not settle at its predecessor's root",
+        );
+        // The old inclusive count accepted exactly that.
+        assert_eq!(
+            find_batch_anchor(to, root_at(anchor - 1), to - from + 1, |b| Ok(root_at(b)))
+                .expect("lookup"),
+            Some(anchor - 1),
+        );
     }
 
     #[test]

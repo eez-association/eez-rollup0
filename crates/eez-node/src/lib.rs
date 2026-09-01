@@ -1234,28 +1234,39 @@ where
 /// The SYSTEM_ADDRESS the L2 pool refuses: `EEZ_L2_SYSTEM_ADDRESS`, else
 /// derived from `EEZ_L2_SYSTEM_KEY`. `None` when neither is set — each role
 /// decides whether that is fatal.
+///
+/// Both set and disagreeing is fatal: the key signs, so a differing address
+/// would gate a sender that never appears and leave the real one open.
 fn read_l2_system_address() -> eyre::Result<Option<Address>> {
+    let from_key = l2_system_key_address()?;
     match env::var("EEZ_L2_SYSTEM_ADDRESS") {
         Ok(raw) => {
-            Ok(Some(Address::from_str(raw.trim()).map_err(|e| {
-                eyre::eyre!("EEZ_L2_SYSTEM_ADDRESS malformed: {e}")
-            })?))
+            let address = Address::from_str(raw.trim())
+                .map_err(|e| eyre::eyre!("EEZ_L2_SYSTEM_ADDRESS malformed: {e}"))?;
+            eyre::ensure!(
+                from_key.is_none_or(|k| k == address),
+                "EEZ_L2_SYSTEM_ADDRESS {address} does not match EEZ_L2_SYSTEM_KEY"
+            );
+            Ok(Some(address))
         }
+        Err(env::VarError::NotPresent) => Ok(from_key),
         Err(env::VarError::NotUnicode(_)) => Err(eyre::eyre!(
             "EEZ_L2_SYSTEM_ADDRESS contains non-UTF-8 bytes"
         )),
-        Err(env::VarError::NotPresent) => match env::var("EEZ_L2_SYSTEM_KEY") {
-            Ok(raw) => Ok(Some(
-                PrivateKeySigner::from_bytes(&B256::from_str(
-                    raw.trim().trim_start_matches("0x"),
-                )?)?
+    }
+}
+
+/// Address of `EEZ_L2_SYSTEM_KEY`, if set.
+fn l2_system_key_address() -> eyre::Result<Option<Address>> {
+    match env::var("EEZ_L2_SYSTEM_KEY") {
+        Ok(raw) => Ok(Some(
+            PrivateKeySigner::from_bytes(&B256::from_str(raw.trim().trim_start_matches("0x"))?)?
                 .address(),
-            )),
-            Err(env::VarError::NotUnicode(_)) => {
-                Err(eyre::eyre!("EEZ_L2_SYSTEM_KEY contains non-UTF-8 bytes"))
-            }
-            Err(env::VarError::NotPresent) => Ok(None),
-        },
+        )),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(eyre::eyre!("EEZ_L2_SYSTEM_KEY contains non-UTF-8 bytes"))
+        }
     }
 }
 
