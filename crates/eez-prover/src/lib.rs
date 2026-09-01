@@ -95,7 +95,7 @@ impl ProverError {
     pub const fn retryable_kind(&self) -> Option<RetryableProverError> {
         match self {
             Self::Retryable { kind, .. } => Some(*kind),
-            Self::Signer(_) | Self::Backend(_) | Self::Actionable { .. } => None,
+            Self::Backend(_) | Self::Actionable { .. } => None,
         }
     }
 
@@ -104,7 +104,7 @@ impl ProverError {
     pub const fn actionable_failure(&self) -> Option<ActionableProverFailure> {
         match self {
             Self::Actionable { failure, .. } => Some(*failure),
-            Self::Signer(_) | Self::Backend(_) | Self::Retryable { .. } => None,
+            Self::Backend(_) | Self::Retryable { .. } => None,
         }
     }
 }
