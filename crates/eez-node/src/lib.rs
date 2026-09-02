@@ -342,6 +342,7 @@ async fn launch_follower(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Res
         rollup_config.deploy_block,
         Arc::clone(&l1_head),
         system_tx_cfg,
+        read_checkpoint_dir(),
     );
 
     wait_for_l1_ready(&l1_reader, rollup_config.deploy_block, read_l1_chain_id()?).await?;
@@ -976,6 +977,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         rollup_config.deploy_block,
         Arc::clone(&l1_head),
         Some(system_tx_cfg),
+        read_checkpoint_dir(),
     );
 
     // Bind before the L1 wait so port checks see a live front. Submissions are
@@ -1289,6 +1291,25 @@ fn parse_l1_rollup_id(raw: Option<&str>) -> eyre::Result<u64> {
     raw.trim()
         .parse::<u64>()
         .map_err(|e| eyre::eyre!("EEZ_L1_ROLLUP_ID={raw:?} malformed: {e}"))
+}
+
+/// Where the deriver persists its boot checkpoint. Decided once: a missing
+/// directory means this var is not our datadir, and retrying the write every
+/// batch would only spam.
+fn read_checkpoint_dir() -> Option<std::path::PathBuf> {
+    let dir = env::var("EEZ_L2_DATADIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_dir());
+    if dir.is_none() {
+        event!(
+            name: "eez.node.checkpoint.disabled",
+            Level::INFO,
+            configured = ?env::var("EEZ_L2_DATADIR").ok(),
+            "no usable EEZ_L2_DATADIR; boot will rescan L1 from the deploy block",
+        );
+    }
+    dir
 }
 
 /// Required for followers: guessing would either assert the wrong source
