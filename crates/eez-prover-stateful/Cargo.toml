@@ -1,0 +1,39 @@
+[package]
+name                   = "eez-prover-stateful"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+description            = "Node-backed proof-signer backend for an L1-derived EEZ follower."
+
+[dependencies]
+eez-proof-signer.workspace = true
+
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-primitives.workspace = true
+alloy-rpc-types-debug.workspace = true
+
+reth-chainspec.workspace = true
+reth-consensus.workspace = true
+reth-ethereum-consensus.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-evm.workspace = true
+reth-evm-ethereum.workspace = true
+reth-execution-types.workspace = true
+reth-primitives-traits.workspace = true
+reth-revm.workspace = true
+reth-storage-api.workspace = true
+revm.workspace = true
+
+eyre.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+eez-proof-signer = { workspace = true, features = ["test-utils"] }
+alloy-rlp.workspace = true
+reth-provider = { workspace = true, features = ["test-utils"] }

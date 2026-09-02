@@ -361,6 +361,12 @@ struct CheckedBackendWindowOutput {
 /// A validation failure classified for the RPC boundary.
 #[derive(Debug, Error)]
 pub enum ValidationError {
+    /// The backend cannot currently acquire the required validation state.
+    #[error("{0}")]
+    Unavailable(String),
+    /// The backend's validation snapshot changed while work was in progress.
+    #[error("{0}")]
+    Aborted(String),
     /// The backend rejected the input before claiming successful validation.
     #[error("{0}")]
     Rejected(String),

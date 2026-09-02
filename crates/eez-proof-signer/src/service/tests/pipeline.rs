@@ -218,6 +218,28 @@ fn settlement_pipeline_errors_have_stable_rpc_mappings() {
 }
 
 #[test]
+fn transient_validation_errors_have_stable_rpc_mappings() {
+    let cases = [
+        (
+            validate::ValidationError::Unavailable("synthetic".to_owned()),
+            Code::Unavailable,
+            "validation backend is temporarily unavailable",
+        ),
+        (
+            validate::ValidationError::Aborted("synthetic".to_owned()),
+            Code::Aborted,
+            "validation backend snapshot changed during validation",
+        ),
+    ];
+
+    for (error, code, message) in cases {
+        let status = PipelineError::Validation(error).status();
+        assert_eq!(status.code(), code);
+        assert_eq!(status.message(), message);
+    }
+}
+
+#[test]
 fn cancelled_settlement_stops_before_decoding_untrusted_input() {
     let cancellation = CancellationToken::default();
     cancellation.cancel();
