@@ -378,15 +378,14 @@ pub enum ValidationError {
 /// Execution-evidence source used by the shared settlement and signing pipeline.
 /// Implementations are trusted to derive all evidence from replay.
 pub trait ValidationBackend: std::fmt::Debug + Send + Sync + 'static {
-    /// Bind common service identity exactly once before validation begins.
-    fn initialize(
-        &mut self,
-        chain_id: u64,
-        expected_l2_system_address: alloy_primitives::Address,
-    ) -> eyre::Result<()>;
-
     /// Static identifier used only in diagnostics.
     fn label(&self) -> &'static str;
+
+    /// EIP-155 identity fixed by the backend's execution rules.
+    fn chain_id(&self) -> u64;
+
+    /// Deployment address used to classify privileged L2 transactions.
+    fn expected_l2_system_address(&self) -> alloy_primitives::Address;
 
     /// Replay every admitted block and return evidence for the shared checks.
     /// `witnesses[i]` belongs to `blocks[i]` and may be consumed by the backend.
@@ -396,69 +395,41 @@ pub trait ValidationBackend: std::fmt::Debug + Send + Sync + 'static {
         witnesses: &mut [ExecutionWitness],
         cancellation: &CancellationToken,
     ) -> Result<BackendWindowOutput, ValidationError>;
+
+    /// Number of queued actions exposed only by the canned unit-test backend.
+    #[cfg(test)]
+    fn remaining_test_actions(&self) -> Option<usize> {
+        None
+    }
 }
 
-/// Validation backend selected at startup.
+/// Fully configured execution backend used by the shared validation pipeline.
 #[derive(Debug)]
-pub enum Validator {
-    /// A validation backend using the shared checked-evidence boundary.
-    #[non_exhaustive]
-    Backend {
-        /// Backend-specific execution-evidence acquisition.
-        backend: Box<dyn ValidationBackend>,
-        /// EIP-155 chain id supplied by the service wiring.
-        chain_id: u64,
-        /// L2 system address supplied by the service wiring.
-        expected_l2_system_address: alloy_primitives::Address,
-    },
-    /// Canned responses for service-level tests.
-    #[cfg(test)]
-    Stub(testing::StubValidator),
+pub struct Validator {
+    backend: Box<dyn ValidationBackend>,
 }
 
 impl Validator {
-    /// Bind one execution backend to the service identity.
-    pub fn from_backend(
-        mut backend: impl ValidationBackend,
-        chain_id: u64,
-        expected_l2_system_address: alloy_primitives::Address,
-    ) -> eyre::Result<Self> {
-        backend.initialize(chain_id, expected_l2_system_address)?;
-        Ok(Self::Backend {
+    /// Erase one fully configured backend behind the shared runtime boundary.
+    pub fn from_backend(backend: impl ValidationBackend) -> Self {
+        Self {
             backend: Box::new(backend),
-            chain_id,
-            expected_l2_system_address,
-        })
+        }
     }
 
     /// Static, non-sensitive identifier for startup logs.
     pub fn label(&self) -> &'static str {
-        match self {
-            Self::Backend { backend, .. } => backend.label(),
-            #[cfg(test)]
-            Self::Stub(_) => "stub",
-        }
+        self.backend.label()
     }
 
     /// EIP-155 chain id from the operator-configured replay specification.
     pub fn chain_id(&self) -> u64 {
-        match self {
-            Self::Backend { chain_id, .. } => *chain_id,
-            #[cfg(test)]
-            Self::Stub(_) => 1,
-        }
+        self.backend.chain_id()
     }
 
     /// Deployment address used by this backend to classify system transactions.
     pub fn expected_l2_system_address(&self) -> alloy_primitives::Address {
-        match self {
-            Self::Backend {
-                expected_l2_system_address,
-                ..
-            } => *expected_l2_system_address,
-            #[cfg(test)]
-            Self::Stub(backend) => backend.expected_l2_system_address,
-        }
+        self.backend.expected_l2_system_address()
     }
 
     /// Validate admitted blocks through the same checked boundary as production.
@@ -505,18 +476,8 @@ impl Validator {
         witnesses: &mut [ExecutionWitness],
         cancellation: &CancellationToken,
     ) -> Result<BackendWindowOutput, ValidationError> {
-        match self {
-            Self::Backend { backend, .. } => {
-                backend.validate_blocks(blocks, witnesses, cancellation)
-            }
-            #[cfg(test)]
-            Self::Stub(stub) => {
-                if cancellation.is_cancelled() {
-                    return Err(ValidationError::Cancelled);
-                }
-                stub.next_response()
-            }
-        }
+        self.backend
+            .validate_blocks(blocks, witnesses, cancellation)
     }
 }
 

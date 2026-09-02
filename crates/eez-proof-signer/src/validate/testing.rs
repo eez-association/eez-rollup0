@@ -48,7 +48,6 @@ impl BackendBlockOutput {
 #[derive(Debug)]
 enum StubAction {
     Respond(Result<BackendWindowOutput, String>),
-    ValidationError(ValidationError),
     Block {
         started: oneshot::Sender<()>,
         release: mpsc::Receiver<()>,
@@ -59,13 +58,13 @@ enum StubAction {
 
 /// Canned per-call actions, served in order; a call past the end fails loudly.
 #[derive(Debug)]
-pub struct StubValidator {
+struct StubBackend {
     actions: Mutex<VecDeque<StubAction>>,
-    pub(super) expected_l2_system_address: alloy_primitives::Address,
+    expected_l2_system_address: alloy_primitives::Address,
 }
 
-impl StubValidator {
-    pub(super) fn next_response(&self) -> Result<BackendWindowOutput, ValidationError> {
+impl StubBackend {
+    fn next_response(&self) -> Result<BackendWindowOutput, ValidationError> {
         let action = self.actions.lock().unwrap().pop_front().ok_or_else(|| {
             ValidationError::InternalInvariant(
                 "stub validator ran out of canned actions".to_owned(),
@@ -73,7 +72,6 @@ impl StubValidator {
         })?;
         let response = match action {
             StubAction::Respond(response) => response,
-            StubAction::ValidationError(error) => return Err(error),
             StubAction::Block {
                 started,
                 release,
@@ -96,19 +94,41 @@ impl StubValidator {
     }
 }
 
+impl ValidationBackend for StubBackend {
+    fn label(&self) -> &'static str {
+        "stub"
+    }
+
+    fn chain_id(&self) -> u64 {
+        1
+    }
+
+    fn expected_l2_system_address(&self) -> alloy_primitives::Address {
+        self.expected_l2_system_address
+    }
+
+    fn validate_blocks(
+        &self,
+        _blocks: &[AdmittedBlock],
+        _witnesses: &mut [ExecutionWitness],
+        cancellation: &CancellationToken,
+    ) -> Result<BackendWindowOutput, ValidationError> {
+        if cancellation.is_cancelled() {
+            return Err(ValidationError::Cancelled);
+        }
+        self.next_response()
+    }
+
+    fn remaining_test_actions(&self) -> Option<usize> {
+        Some(self.actions.lock().unwrap().len())
+    }
+}
+
 impl Validator {
     /// A stub backend serving `responses` in order.
     pub(crate) fn stub(responses: Vec<Result<BackendWindowOutput, String>>) -> Self {
-        Self::Stub(StubValidator {
+        Self::from_backend(StubBackend {
             actions: Mutex::new(responses.into_iter().map(StubAction::Respond).collect()),
-            expected_l2_system_address: crate::testkit::TEST_SYSTEM_ADDRESS,
-        })
-    }
-
-    /// A stub returning one classified validation failure.
-    pub(crate) fn stub_validation_error(error: ValidationError) -> Self {
-        Self::Stub(StubValidator {
-            actions: Mutex::new([StubAction::ValidationError(error)].into()),
             expected_l2_system_address: crate::testkit::TEST_SYSTEM_ADDRESS,
         })
     }
@@ -135,7 +155,7 @@ impl Validator {
     ) -> (Self, oneshot::Receiver<()>, mpsc::Sender<()>) {
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let validator = Self::Stub(StubValidator {
+        let validator = Self::from_backend(StubBackend {
             actions: Mutex::new(
                 [StubAction::Block {
                     started: started_tx,
@@ -151,7 +171,7 @@ impl Validator {
 
     /// A stub whose next validation panics.
     pub(crate) fn panicking_stub() -> Self {
-        Self::Stub(StubValidator {
+        Self::from_backend(StubBackend {
             actions: Mutex::new([StubAction::Panic].into()),
             expected_l2_system_address: crate::testkit::TEST_SYSTEM_ADDRESS,
         })
@@ -159,12 +179,9 @@ impl Validator {
 
     /// Number of canned actions remaining.
     pub(crate) fn stub_remaining(&self) -> usize {
-        match self {
-            Self::Stub(stub) => stub.actions.lock().unwrap().len(),
-            Self::Backend { .. } => {
-                panic!("stub_remaining called on a production backend")
-            }
-        }
+        self.backend
+            .remaining_test_actions()
+            .expect("stub_remaining called on a production backend")
     }
 }
 

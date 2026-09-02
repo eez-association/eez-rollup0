@@ -118,11 +118,11 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
         "{}/tests/fixtures/{FIXTURE}/chain-config.json",
         env!("CARGO_MANIFEST_DIR")
     );
-    let backend = Backend::from_chain_document_file(chain_path.as_ref()).unwrap();
+    let system_address = SYSTEM_ADDRESS.parse::<Address>().unwrap();
+    let backend = Backend::from_chain_document_file(chain_path.as_ref(), system_address).unwrap();
     let chain_id = backend.chain_id();
     assert_eq!(chain_id, fixture_u64(&oracle, "l2_chain_id"));
-    let system_address = SYSTEM_ADDRESS.parse::<Address>().unwrap();
-    let validator = Validator::from_backend(backend, chain_id, system_address).unwrap();
+    let validator = Validator::from_backend(backend);
     let attester = Attester::new(
         ATTESTER_KEY.parse().unwrap(),
         proof_system_vkey,

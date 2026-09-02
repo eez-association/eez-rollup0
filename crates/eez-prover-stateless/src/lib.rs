@@ -31,15 +31,13 @@ pub async fn run() -> eyre::Result<()> {
     let listen_addr = config.listen_addr;
     let limits = config.limits;
     let expected_l2_system_address = config.expected_l2_system_address;
-    let backend = Backend::from_chain_document_file(&config.chain_document_path)?;
-    let chain_id = backend.chain_id();
+    let backend =
+        Backend::from_chain_document_file(&config.chain_document_path, expected_l2_system_address)?;
     eez_proof_signer::serve(
         ServerConfig {
             listen_addr,
             limits,
-            chain_id,
             expected_rollup_id: config.expected_rollup_id,
-            expected_l2_system_address,
             attester: config.attester,
             system_transaction_key: config.system_transaction_key,
         },
