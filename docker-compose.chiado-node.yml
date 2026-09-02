@@ -73,6 +73,8 @@ services:
       EEZ_L1_POSTER_KEY: "${EEZ_L1_POSTER_KEY:?set EEZ_L1_POSTER_KEY}"
       EEZ_L1_BUILDER_RPC_URL: "${EEZ_L1_BUILDER_RPC_URL:?set EEZ_L1_BUILDER_RPC_URL}"
       EEZ_L2_SYSTEM_KEY: "${EEZ_L2_SYSTEM_KEY:?set EEZ_L2_SYSTEM_KEY}"
+      EEZ_UNSAFE_BLOCK_SIGNER_KEY: "${EEZ_UNSAFE_BLOCK_SIGNER_KEY:?set EEZ_UNSAFE_BLOCK_SIGNER_KEY}"
+      EEZ_P2P_LISTEN_ADDR: "/ip4/0.0.0.0/tcp/9300"
       EEZ_PROVER_URL: http://127.0.0.1:${EEZ_SIGNER_PORT:-50061}
       EEZ_WITNESS_DB_PATH: /l2/witnesses
       # Embedded chiado L1 (reth_gnosis) — single L1 for the whole node.

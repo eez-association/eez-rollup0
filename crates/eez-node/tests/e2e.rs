@@ -5,6 +5,9 @@ use std::time::Duration;
 use alloy_primitives::{B256, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::BlockNumberOrTag;
+use alloy_signer::SignerSync;
+use alloy_signer_local::PrivateKeySigner;
+use eez_p2p::{NetworkConfig, NetworkEvent, NetworkService, signing_hash};
 
 mod common;
 use common::{
@@ -607,9 +610,9 @@ async fn multi_composer_steady_state_stays_converged_with_l1() {
 async fn spawn_follower(
     name: &str,
     harness: &Harness,
-    seq_rpc: Option<&str>,
+    p2p_peer: Option<&str>,
 ) -> anyhow::Result<NodeHandle> {
-    let env = harness.follower_env(seq_rpc).await?;
+    let env = harness.follower_env(p2p_peer).await?;
     let cfg = NodeConfig {
         binary: NodeBinary::Follower,
         ..Default::default()
@@ -642,18 +645,18 @@ async fn happy_case_follower_l1_derived() {
     seq.assert_no_process_death();
 }
 
-/// Sequencer RPC advances unsafe state while L1 remains safe-authoritative.
+/// Signed P2P payloads advance unsafe state while L1 remains safe-authoritative.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn happy_case_follower_sequencer_rpc() {
+async fn happy_case_follower_signed_p2p() {
     let harness = Harness::fresh().await.unwrap();
     let chain = harness.chain();
     let seq = NodeHandle::start("seq", &NodeConfig::default(), &harness.env().await.unwrap())
         .await
         .unwrap();
 
-    let seq_rpc = seq.l2_rpc_url();
+    let seq_peer = seq.unsafe_p2p_addr();
     let follower_env = override_env(
-        harness.follower_env(Some(&seq_rpc)).await.unwrap(),
+        harness.follower_env(Some(&seq_peer)).await.unwrap(),
         "RUST_LOG",
         "warn,eez_node::follower=info",
     );
@@ -677,10 +680,8 @@ async fn happy_case_follower_sequencer_rpc() {
         .await
         .expect("follower safe block never matched the sequencer chain");
 
-    let unsafe_head_patterns = [
-        "follower advanced unsafe head to sequencer block",
-        "reth accepted sequencer head as a sync target",
-    ];
+    let unsafe_head_patterns =
+        ["follower imported verified sequencer payload and advanced unsafe head"];
     let unsafe_head_events_before = follower.log_count_matching(&unsafe_head_patterns).unwrap();
     seq.run_tx_spammer(ANVIL_KEY_1);
     common::wait_for(DEFAULT_TIMEOUT, || {
@@ -691,7 +692,7 @@ async fn happy_case_follower_sequencer_rpc() {
         )
     })
     .await
-    .expect("follower never reported a sequencer-RPC unsafe-head FCU outcome");
+    .expect("follower never imported a signed P2P unsafe payload");
 
     follower.assert_no_process_death();
     seq.assert_no_process_death();
@@ -771,10 +772,10 @@ async fn happy_case_follower_cross_safe_parity() {
         .await
         .expect("sequencer landed batches");
 
-    let seq_rpc = seq.l2_rpc_url();
+    let seq_peer = seq.unsafe_p2p_addr();
     let (f_l1, f_seq) = tokio::try_join!(
         spawn_follower("f_l1", &harness, None),
-        spawn_follower("f_seq", &harness, Some(&seq_rpc)),
+        spawn_follower("f_seq", &harness, Some(&seq_peer)),
     )
     .unwrap();
     wait_for_safe_state(&f_l1, &chain, B256::ZERO, DEFAULT_TIMEOUT)
@@ -793,8 +794,7 @@ async fn happy_case_follower_cross_safe_parity() {
     seq.assert_no_process_death();
 }
 
-/// A rogue unsafe source cannot move the follower's L1-derived safe head.
-/// A log assertion separately proves the follower actually polled the rogue source.
+/// A transport peer without the authorized sequencer key cannot feed an unsafe head.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
     let harness = Harness::for_reorg().await.unwrap();
@@ -810,23 +810,24 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
         .unwrap();
     seq.run_tx_spammer(ANVIL_KEY_1);
 
-    let rogue_env = vec![(
-        "RUST_LOG",
-        std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
-    )];
-    let rogue_cfg = NodeConfig {
-        binary: NodeBinary::Dev,
-        ..Default::default()
-    };
-    let rogue = NodeHandle::start("rogue", &rogue_cfg, &rogue_env)
+    let chain_id = ProviderBuilder::new()
+        .connect_http(seq.l2_rpc_url().parse().unwrap())
+        .get_chain_id()
         .await
         .unwrap();
+    let (rogue, rogue_handle, mut rogue_events) = NetworkService::new(
+        NetworkConfig::parse(chain_id, "/ip4/127.0.0.1/tcp/0", std::iter::empty()).unwrap(),
+    )
+    .unwrap();
+    let rogue_task = tokio::spawn(rogue.run());
+    let rogue_addr = loop {
+        if let NetworkEvent::Listening(address) = rogue_events.recv().await.unwrap() {
+            break address.to_string();
+        }
+    };
 
     let follower_env = override_env(
-        harness
-            .follower_env(Some(&rogue.l2_rpc_url()))
-            .await
-            .unwrap(),
+        harness.follower_env(Some(&rogue_addr)).await.unwrap(),
         "RUST_LOG",
         "warn,eez_node::follower=info",
     );
@@ -847,17 +848,42 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
     .await
     .expect("follower safe head did not reach a non-genesis attested stateRoot while on the rogue");
 
-    // Prove the rogue unsafe source was actually polled.
-    assert!(
-        follower
-            .log_count_matching(&["reth accepted sequencer head as a sync target"])
-            .unwrap()
-            > 0,
-        "follower never processed a rogue unsafe head",
-    );
+    tokio::time::timeout(DEFAULT_TIMEOUT, async {
+        loop {
+            if matches!(
+                rogue_events.recv().await,
+                Some(NetworkEvent::PeerSubscribed(_))
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("follower never subscribed to rogue P2P peer");
+
+    // Sign a body with a different key. Authorization is checked before SSZ,
+    // so the body need not be a valid execution payload for this boundary test.
+    let body = vec![0x42; 128];
+    let signer = ANVIL_KEY_1.parse::<PrivateKeySigner>().unwrap();
+    let signature = signer
+        .sign_hash_sync(&signing_hash(chain_id, &body))
+        .unwrap();
+    let mut message = signature.as_rsy().to_vec();
+    message.extend_from_slice(&body);
+    rogue_handle.publish(1, message).await.unwrap();
+    wait_for(DEFAULT_TIMEOUT, || {
+        std::future::ready(
+            follower
+                .log_count_matching(&["unauthorized unsafe-block signer"])
+                .map(|count| (count > 0).then_some(())),
+        )
+    })
+    .await
+    .expect("follower did not reject the unauthorized sequencer signature");
 
     follower.assert_no_process_death();
     seq.assert_no_process_death();
+    rogue_task.abort();
 }
 
 /// A late follower backfills the complete pre-existing batch history.

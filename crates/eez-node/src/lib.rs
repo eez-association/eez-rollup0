@@ -11,7 +11,7 @@
 //! variable presence:
 //!
 //! - `eez-composer`: L1-anchored sequencing, proving, posting, and cross-chain ingress.
-//! - `eez-follower`: L1-derived replay with an optional unsafe-head RPC overlay.
+//! - `eez-follower`: L1-derived replay plus verified signed unsafe blocks over P2P.
 //! - `eez-dev-node`: unanchored interval sequencing for local development.
 
 mod bundle_rpc;
@@ -23,7 +23,7 @@ mod witness_source;
 use std::{collections::HashMap, env, str::FromStr, sync::Arc, time::Duration};
 
 use alloy_primitives::{Address, B256};
-use alloy_provider::{Provider as _, RootProvider};
+use alloy_provider::Provider as _;
 use alloy_signer_local::PrivateKeySigner;
 use clap::Parser as _;
 use eez_composer::composer::CrossChainWiring;
@@ -37,11 +37,15 @@ use eez_l1::{
     L1CanonicalHead, L1HeadStream, L1Reader, L1ReaderConfig, L1Watcher, L1WatcherConfig, Submitter,
     SubmitterConfig,
 };
+use eez_p2p::{BACKFILL_CACHE_SIZE, NetworkConfig, NetworkService, sign_payload};
 use eez_prover::MockEcdsaProver;
 use mimalloc::MiMalloc;
 use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
+use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_builder::{NodeBuilder, WithLaunchContext, components::BasicPayloadServiceBuilder};
 use reth_node_ethereum::EthereumNode;
+use reth_payload_primitives::PayloadTypes;
+use reth_storage_api::{BlockIdReader, BlockReader, TransactionVariant};
 use tokio::sync::mpsc;
 use tracing::{Level, event};
 
@@ -107,18 +111,54 @@ enum EmbeddedL1<Ethereum, Chiado> {
 #[derive(clap::Args, Debug, Clone)]
 struct NoRoleArgs {}
 
+/// Chain-scoped signed-block P2P transport settings.
+#[derive(clap::Args, Debug, Clone)]
+struct P2pArgs {
+    /// libp2p TCP listen multiaddr.
+    #[arg(
+        long,
+        env = "EEZ_P2P_LISTEN_ADDR",
+        default_value = "/ip4/0.0.0.0/tcp/9300"
+    )]
+    p2p_listen_addr: String,
+
+    /// Comma-separated static libp2p peer multiaddrs.
+    #[arg(long, env = "EEZ_P2P_PEERS", value_delimiter = ',')]
+    p2p_peers: Vec<String>,
+}
+
+impl P2pArgs {
+    fn network_config(&self, chain_id: u64) -> eyre::Result<NetworkConfig> {
+        NetworkConfig::parse(
+            chain_id,
+            &self.p2p_listen_addr,
+            self.p2p_peers.iter().map(String::as_str),
+        )
+        .map_err(Into::into)
+    }
+}
+
+/// Composer-specific CLI arguments.
+#[derive(clap::Args, Debug, Clone)]
+struct ComposerArgs {
+    #[command(flatten)]
+    p2p: P2pArgs,
+}
+
 /// Follower-specific CLI arguments layered on top of reth's CLI.
 #[derive(clap::Args, Debug, Clone)]
 struct FollowerArgs {
-    /// Sequencer JSON-RPC URL. In follower mode this enables the
-    /// optional unsafe-head overlay; safe/finalized remain L1-derived.
-    #[arg(long, env = "EEZ_SEQUENCER_RPC")]
-    sequencer_rpc: Option<url::Url>,
+    #[command(flatten)]
+    p2p: P2pArgs,
+
+    /// Address authorized to sign this rollup's unsafe blocks.
+    #[arg(long, env = "EEZ_UNSAFE_BLOCK_SIGNER_ADDRESS")]
+    unsafe_block_signer_address: Address,
 }
 
 /// Launch a production composer node.
 pub fn run_composer() -> eyre::Result<()> {
-    node_cli::<NoRoleArgs>()?.run(launch_composer)
+    node_cli::<ComposerArgs>()?.run(launch_composer)
 }
 
 /// Launch an L1-derived follower node.
@@ -310,6 +350,7 @@ async fn launch_follower(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Res
         .await?;
 
     let chain_spec: Arc<_> = handle.node.chain_spec();
+    let l2_chain_id = chain_spec.chain().id();
     let provider = handle.node.provider.clone();
     let task_executor = handle.node.task_executor.clone();
     let timing = RollupTiming::from_env()?;
@@ -415,28 +456,26 @@ async fn launch_follower(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Res
         deriver.run(deriver_events).await;
     });
 
-    if let Some(sequencer_rpc) = ext.sequencer_rpc {
-        let follower = UnsafeHeadFollower::new(
-            block_committer,
-            RootProvider::new_http(sequencer_rpc),
-            provider,
-            timing.l2_block_time(),
-        );
-        event!(
-            name: "eez.node.follower.sequencer_rpc.spawned",
-            Level::INFO,
-            "spawning sequencer-RPC unsafe-head follower",
-        );
-        task_executor.spawn_critical_task("eez-node-follower-unsafe-head", async move {
-            follower.run().await;
-        });
-    } else {
-        event!(
-            name: "eez.node.follower.l1_derived_only",
-            Level::INFO,
-            "EEZ_SEQUENCER_RPC not set; running L1-derived-only follower",
-        );
-    }
+    let (p2p_service, p2p_handle, p2p_events) =
+        NetworkService::new(ext.p2p.network_config(l2_chain_id)?)?;
+    task_executor.spawn_critical_task("eez-unsafe-block-p2p", p2p_service.run());
+    let follower = UnsafeHeadFollower::new(
+        block_committer,
+        provider,
+        l2_chain_id,
+        ext.unsafe_block_signer_address,
+        p2p_events,
+        p2p_handle,
+    );
+    event!(
+        name: "eez.node.follower.p2p.spawned",
+        Level::INFO,
+        signer = %ext.unsafe_block_signer_address,
+        "spawning signed P2P unsafe-block follower",
+    );
+    task_executor.spawn_critical_task("eez-node-follower-unsafe-head", async move {
+        follower.run().await;
+    });
 
     task_executor.spawn_critical_task(
         "eez-l1-watcher",
@@ -447,7 +486,7 @@ async fn launch_follower(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Res
 }
 
 #[allow(clippy::too_many_lines)]
-async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Result<()> {
+async fn launch_composer(builder: L2NodeBuilder, ext: ComposerArgs) -> eyre::Result<()> {
     event!(
         name: "eez.node.launching",
         Level::INFO,
@@ -606,6 +645,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
 
     let chain_spec: Arc<_> = handle.node.chain_spec();
     let l2_genesis_timestamp = chain_spec.genesis().timestamp;
+    let l2_chain_id = chain_spec.chain().id();
     let provider = handle.node.provider.clone();
     let payload_builder_handle = handle.node.payload_builder_handle.clone();
     let beacon_engine_handle = handle.node.add_ons_handle.beacon_engine_handle.clone();
@@ -627,6 +667,43 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         payload_builder_handle,
         witness_capture.sender(),
     )?;
+    let mut produced_payloads = block_committer.subscribe_produced_payloads();
+    let unsafe_block_signer = unsafe_block_signer_from_env()?;
+    let unsafe_block_signer_address = unsafe_block_signer.address();
+    let (p2p_service, p2p_handle, _p2p_events) =
+        NetworkService::new(ext.p2p.network_config(l2_chain_id)?)?;
+    let p2p_seed_handle = p2p_handle.clone();
+    let p2p_seed_signer = unsafe_block_signer.clone();
+    task_executor.spawn_critical_task("eez-unsafe-block-p2p", p2p_service.run());
+    task_executor.spawn_critical_task("eez-unsafe-block-publisher", async move {
+        loop {
+            let payload = match produced_payloads.recv().await {
+                Ok(payload) => payload,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    panic!("unsafe-block publisher lagged and skipped {skipped} committed payloads")
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            };
+            let block_number = payload.block_number();
+            let block_hash = payload.block_hash();
+            let message =
+                sign_payload(&payload, l2_chain_id, &unsafe_block_signer).unwrap_or_else(|error| {
+                    panic!(
+                        "could not encode/sign produced block {block_number} {block_hash}: {error}"
+                    )
+                });
+            p2p_handle
+                .publish(block_number, message)
+                .await
+                .unwrap_or_else(|error| panic!("unsafe-block P2P service stopped: {error}"));
+        }
+    });
+    event!(
+        name: "eez.node.composer.p2p.spawned",
+        Level::INFO,
+        signer = %unsafe_block_signer_address,
+        "spawning signed unsafe-block P2P publisher",
+    );
     let depth = env::var("EEZ_MAX_SPECULATIVE_DEPTH")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -1066,6 +1143,53 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             }
         }
     };
+
+    // Rebuild the bounded recovery window after reconciliation. The live
+    // publisher only observes newly produced blocks, while a restarting
+    // composer may already have locally persisted unsafe descendants.
+    let unsafe_head = block_committer.last_header().number;
+    let safe_number = provider
+        .safe_block_num_hash()
+        .map_err(|error| eyre::eyre!("read L2 safe head for P2P cache: {error}"))?
+        .map_or(0, |safe| safe.number);
+    let first_cached = safe_number
+        .saturating_add(1)
+        .max(unsafe_head.saturating_sub(BACKFILL_CACHE_SIZE.saturating_sub(1) as u64));
+    let mut seeded = 0_u64;
+    for number in first_cached..=unsafe_head {
+        let block = provider
+            .recovered_block(number.into(), TransactionVariant::WithHash)
+            .map_err(|error| eyre::eyre!("read L2 block {number} for P2P cache: {error}"))?
+            .ok_or_else(|| eyre::eyre!("L2 block {number} missing while seeding P2P cache"))?;
+        let payload =
+            <EthEngineTypes as PayloadTypes>::block_to_payload(block.into_sealed_block(), None);
+        let message = match sign_payload(&payload, l2_chain_id, &p2p_seed_signer) {
+            Ok(message) => message,
+            Err(error) => {
+                event!(
+                    name: "eez.node.composer.p2p.cache_seed_incomplete",
+                    Level::WARN,
+                    block.number = number,
+                    %error,
+                    "persisted block lacks complete fork-specific payload data; stopping P2P cache seeding",
+                );
+                break;
+            }
+        };
+        p2p_seed_handle
+            .publish(number, message)
+            .await
+            .map_err(|error| eyre::eyre!("seed signed-block P2P cache: {error}"))?;
+        seeded += 1;
+    }
+    event!(
+        name: "eez.node.composer.p2p.cache_seeded",
+        Level::INFO,
+        first_block = first_cached,
+        last_block = unsafe_head,
+        blocks = seeded,
+        "seeded signed unsafe-block recovery cache",
+    );
     event!(
         name: "eez.node.deriver.spawned",
         Level::INFO,
@@ -1321,6 +1445,12 @@ fn read_l1_chain_id() -> eyre::Result<u64> {
     value
         .parse::<u64>()
         .map_err(|err| eyre::eyre!("EEZ_L1_CHAIN_ID={value:?} malformed: {err}"))
+}
+
+fn unsafe_block_signer_from_env() -> eyre::Result<PrivateKeySigner> {
+    let key = env::var("EEZ_UNSAFE_BLOCK_SIGNER_KEY")
+        .map_err(|_| eyre::eyre!("EEZ_UNSAFE_BLOCK_SIGNER_KEY is required in composer mode"))?;
+    PrivateKeySigner::from_bytes(&B256::from_str(key.trim_start_matches("0x"))?).map_err(Into::into)
 }
 
 #[derive(Debug, Clone, Copy)]

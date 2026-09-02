@@ -1,26 +1,29 @@
-//! Sequencer-RPC unsafe-head follower.
+//! Signed P2P unsafe-block follower.
 //!
 //! Safe and finalized are owned by the L1 deriver through
-//! `BlockCommitterHandle::advance_safe_finalized`. This task only asks
-//! reth to point unsafe head at the sequencer's latest block while that
-//! head remains compatible with the L1-derived anchors.
+//! `BlockCommitterHandle::advance_safe_finalized`. This task authenticates
+//! complete sequencer payloads, checks their ancestry against those anchors,
+//! and imports them through the same serialized Engine API actor.
 //!
 //! Compatibility is enforced here, not by reth: the engine only requires
 //! safe/finalized to be *known*, so it would canonicalize a head whose
 //! ancestry conflicts with our safe block. Before each FCU we accept heads
 //! already on the local canonical chain, otherwise walk the candidate's local
-//! ancestry to the safe height and reject proven conflicts; unverifiable
-//! (unsynced) ancestry stays optimistic.
+//! ancestry to the safe height. Unverifiable ancestry fails closed until a
+//! missing-parent sync path supplies the gap.
 
 use std::time::Duration;
 
-use alloy_eips::{BlockNumHash, BlockNumberOrTag};
-use alloy_provider::{Provider, RootProvider};
-use eez_driver::{BlockCommitterHandle, ForkchoiceOutcome};
+use alloy_consensus::BlockHeader;
+use alloy_eips::BlockNumHash;
+use alloy_primitives::Address;
+use eez_driver::BlockCommitterHandle;
+use eez_p2p::{NetworkEvent, NetworkHandle, verify_payload};
 use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_primitives_traits::SealedHeader;
 use reth_storage_api::{BlockIdReader, HeaderProvider};
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tracing::{Level, event};
 
 /// Keepalive cadence: re-publish the current forkchoice state so reth's
@@ -33,9 +36,13 @@ const MAX_ANCESTRY_WALK: u64 = 1024;
 
 #[derive(Debug, Error)]
 enum FollowerError {
-    /// Sequencer JSON-RPC transport or decode failure.
-    #[error("sequencer RPC error: {0}")]
-    Rpc(String),
+    /// Signed block authentication, SSZ, or block-hash failure.
+    #[error("invalid signed unsafe block: {0}")]
+    Protocol(String),
+
+    /// Execution payload could not be converted into a block header.
+    #[error("invalid execution payload: {0}")]
+    Payload(String),
 
     /// Local chain provider failure while validating a candidate head.
     #[error("local provider error: {0}")]
@@ -57,17 +64,18 @@ enum SafeCompat {
     Unverifiable,
 }
 
-/// Polls the sequencer RPC for unsafe heads and routes every engine call
-/// through the shared [`BlockCommitterHandle`].
+/// Verifies P2P unsafe blocks and routes every engine call through the shared
+/// [`BlockCommitterHandle`].
 #[derive(Debug)]
 pub(crate) struct UnsafeHeadFollower<P> {
     committer: BlockCommitterHandle<EthEngineTypes>,
-    sequencer_rpc: RootProvider,
+    chain_id: u64,
+    authorized_signer: Address,
+    network_events: mpsc::Receiver<NetworkEvent>,
+    network: NetworkHandle,
     /// Local chain reader: resolves the current safe anchor and the
     /// candidate head's ancestry for the compatibility check.
     local: P,
-    /// Cadence for polling the sequencer RPC for new unsafe heads.
-    poll_interval: Duration,
     last_head: Option<alloy_primitives::B256>,
 }
 
@@ -77,32 +85,59 @@ where
 {
     pub(crate) fn new(
         committer: BlockCommitterHandle<EthEngineTypes>,
-        sequencer_rpc: RootProvider,
         local: P,
-        poll_interval: Duration,
+        chain_id: u64,
+        authorized_signer: Address,
+        network_events: mpsc::Receiver<NetworkEvent>,
+        network: NetworkHandle,
     ) -> Self {
         Self {
             committer,
-            sequencer_rpc,
+            chain_id,
+            authorized_signer,
+            network_events,
+            network,
             local,
-            poll_interval,
             last_head: None,
         }
     }
 
     pub(crate) async fn run(mut self) {
-        let mut poll = tokio::time::interval(self.poll_interval);
         let mut fcu_interval = tokio::time::interval(FCU_REFRESH);
         loop {
             tokio::select! {
-                _ = poll.tick() => {
-                    if let Err(err) = self.advance().await {
+                event = self.network_events.recv() => {
+                    let Some(event) = event else {
                         event!(
-                            name: "eez.node.follower.advance.failed",
-                            Level::WARN,
-                            error = %err,
-                            "sequencer unsafe-head advance failed; will retry",
+                            name: "eez.node.follower.p2p.stopped",
+                            Level::ERROR,
+                            "unsafe-block P2P event stream stopped",
                         );
+                        return;
+                    };
+                    match event {
+                        NetworkEvent::PeerSubscribed(_) => {
+                            self.request_next_payload().await;
+                        }
+                        NetworkEvent::Message(message) => {
+                            if let Err(err) = self.advance(&message).await {
+                                event!(
+                                    name: "eez.node.follower.advance.failed",
+                                    Level::WARN,
+                                    error = %err,
+                                    "signed unsafe-block import failed",
+                                );
+                            }
+                        }
+                        NetworkEvent::BackfillUnavailable(number) => {
+                            event!(
+                                name: "eez.node.follower.backfill.unavailable",
+                                Level::DEBUG,
+                                block.number = number,
+                                "peer has no cached signed unsafe payload at requested height",
+                            );
+                        }
+                        NetworkEvent::Listening(_) => {}
                     }
                 }
                 _ = fcu_interval.tick() => {
@@ -119,74 +154,97 @@ where
         }
     }
 
-    async fn advance(&mut self) -> Result<(), FollowerError> {
-        let Some(block) = self
-            .sequencer_rpc
-            .get_block_by_number(BlockNumberOrTag::Latest)
-            .await
-            .map_err(|e| FollowerError::Rpc(e.to_string()))?
-        else {
-            event!(
-                name: "eez.node.follower.block.not_yet_produced",
-                Level::DEBUG,
-                "sequencer reports no latest block yet",
-            );
-            return Ok(());
-        };
-
-        let number = block.header.number;
-        let hash = block.header.hash;
+    async fn advance(&mut self, message: &[u8]) -> Result<(), FollowerError> {
+        let payload = verify_payload(message, self.chain_id, self.authorized_signer)
+            .map_err(|error| FollowerError::Protocol(error.to_string()))?;
+        let number = payload.block_number();
+        let hash = payload.block_hash();
         if self.last_head == Some(hash) {
             return Ok(());
         }
+        let block = payload
+            .clone()
+            .into_block_raw()
+            .map_err(|error| FollowerError::Payload(error.to_string()))?;
+        let header = SealedHeader::new(block.header, hash);
+
+        // Exclude a deriver safe-head move between the ancestry verdict and
+        // newPayload + FCU. The committer actor still serializes engine calls.
+        let reconcile_guard = self.committer.begin_reconcile().await;
+        let current_head = self.committer.last_header();
+        if number < current_head.number()
+            || (number == current_head.number() && hash == current_head.hash())
+        {
+            return Ok(());
+        }
+        let compatibility = if header.number() == current_head.number().saturating_add(1)
+            && header.parent_hash() == current_head.hash()
+        {
+            SafeCompat::Extends
+        } else {
+            check_extends_safe(&self.local, &header, hash)?
+        };
 
         // Reject candidates whose ancestry provably conflicts with the
         // L1-derived safe anchor before they reach the engine.
-        if check_extends_safe(&self.local, &block.header.inner, hash)? == SafeCompat::Conflicts {
-            event!(
-                name: "eez.node.follower.head.conflicts_safe",
-                Level::WARN,
-                block.number = number,
-                block.hash = %hash,
-                "sequencer head does not descend from the L1-derived safe block; skipping",
-            );
-            return Ok(());
-        }
-
-        let header = SealedHeader::new(block.header.inner, hash);
-        match self.committer.advance_unsafe_head(header).await {
-            Ok(ForkchoiceOutcome::Valid) => {
-                self.last_head = Some(hash);
+        match compatibility {
+            SafeCompat::Extends => {}
+            SafeCompat::Conflicts => {
                 event!(
-                    name: "eez.node.follower.head.advanced",
-                    Level::INFO,
-                    block.number = number,
-                    block.hash = %hash,
-                    "follower advanced unsafe head to sequencer block",
-                );
-                Ok(())
-            }
-            Ok(ForkchoiceOutcome::Syncing) => {
-                event!(
-                    name: "eez.node.follower.head.syncing",
-                    Level::INFO,
-                    block.number = number,
-                    block.hash = %hash,
-                    "reth accepted sequencer head as a sync target",
-                );
-                Ok(())
-            }
-            Ok(ForkchoiceOutcome::InvalidState) => {
-                event!(
-                    name: "eez.node.follower.head.inconsistent",
+                    name: "eez.node.follower.head.conflicts_safe",
                     Level::WARN,
                     block.number = number,
                     block.hash = %hash,
-                    "sequencer head is incompatible with current L1-derived anchors; dropping unsafe head",
+                    "signed unsafe block does not descend from the L1-derived safe block; skipping",
                 );
-                Ok(())
+                return Ok(());
             }
-            Err(err) => Err(FollowerError::Driver(err.to_string())),
+            SafeCompat::Unverifiable => {
+                event!(
+                    name: "eez.node.follower.head.missing_ancestry",
+                    Level::WARN,
+                    block.number = number,
+                    block.hash = %hash,
+                    "signed unsafe block ancestry is not locally available; skipping",
+                );
+                drop(reconcile_guard);
+                self.request_payload(current_head.number().saturating_add(1))
+                    .await;
+                return Ok(());
+            }
+        }
+
+        self.committer
+            .commit_derived(payload, header, false)
+            .await
+            .map_err(|error| FollowerError::Driver(error.to_string()))?;
+        self.last_head = Some(hash);
+        event!(
+            name: "eez.node.follower.head.advanced",
+            Level::INFO,
+            block.number = number,
+            block.hash = %hash,
+            "follower imported verified sequencer payload and advanced unsafe head",
+        );
+        drop(reconcile_guard);
+        self.request_payload(number.saturating_add(1)).await;
+        Ok(())
+    }
+
+    async fn request_next_payload(&self) {
+        self.request_payload(self.committer.last_header().number().saturating_add(1))
+            .await;
+    }
+
+    async fn request_payload(&self, block_number: u64) {
+        if let Err(error) = self.network.request_payload(block_number).await {
+            event!(
+                name: "eez.node.follower.backfill.request_failed",
+                Level::WARN,
+                block.number = block_number,
+                %error,
+                "could not request missing signed unsafe payload",
+            );
         }
     }
 }
