@@ -74,6 +74,27 @@ pub fn warn_on_deprecated_env() {
     }
 }
 
+/// Select the L2 datadir used for the deriver's boot checkpoint.
+///
+/// A missing or unusable directory disables checkpoint persistence for this
+/// process, avoiding a failed write after every settled batch.
+#[must_use]
+pub fn read_checkpoint_dir() -> Option<std::path::PathBuf> {
+    let dir = std::env::var("EEZ_L2_DATADIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_dir());
+    if dir.is_none() {
+        event!(
+            name: "eez.node.checkpoint.disabled",
+            Level::INFO,
+            configured = ?std::env::var("EEZ_L2_DATADIR").ok(),
+            "no usable EEZ_L2_DATADIR; boot will rescan L1 from the deploy block",
+        );
+    }
+    dir
+}
+
 /// Blocks until L1 serves the configured history and matches the expected chain.
 ///
 /// # Errors

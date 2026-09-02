@@ -11,8 +11,8 @@ use eez_deriver::Deriver;
 use eez_driver::{BlockCommitterHandle, RollupTiming};
 use eez_l1::{L1CanonicalHead, L1Reader, L1ReaderConfig, L1Watcher, L1WatcherConfig};
 use eez_node_common::{
-    EezPayloadBuilder, EezPoolBuilder, L2NodeBuilder, node_cli, wait_for_l1_ready,
-    warn_on_deprecated_env,
+    EezPayloadBuilder, EezPoolBuilder, L2NodeBuilder, node_cli, read_checkpoint_dir,
+    wait_for_l1_ready, warn_on_deprecated_env,
 };
 use reth_chainspec::EthChainSpec as _;
 use reth_node_builder::components::BasicPayloadServiceBuilder;
@@ -128,6 +128,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         deploy_block,
         Arc::clone(&l1_head),
         Some(system_tx_cfg),
+        read_checkpoint_dir(),
     );
 
     wait_for_l1_ready(&l1_reader, deploy_block, read_l1_chain_id()?).await?;

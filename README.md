@@ -30,7 +30,9 @@ rebuild the whole L2 chain from L1 alone. The supported L1 is Gnosis **Chiado**
 its settlement effects before signing the recomputed public-input hash.
 `ECDSAProofSystem` verifies that hash-bound attestation on L1. This is not yet
 a succinct validity proof, but the deployed verifier no longer accepts an
-unbound mock signature.
+unbound mock signature. The
+[Composer-to-prover gRPC specification](crates/eez-control-rpc/SPEC.md) defines
+request construction, response validation, and the prove-to-L1 handoff.
 
 ## Run a chiado L2 (Docker)
 

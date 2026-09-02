@@ -26,8 +26,8 @@ use eez_l1::{
     L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
 };
 use eez_node_common::{
-    EezPayloadBuilder, EezPoolBuilder, L2NodeBuilder, NoRoleArgs, node_cli, wait_for_l1_ready,
-    warn_on_deprecated_env,
+    EezPayloadBuilder, EezPoolBuilder, L2NodeBuilder, NoRoleArgs, node_cli, read_checkpoint_dir,
+    wait_for_l1_ready, warn_on_deprecated_env,
 };
 use eez_prover::MockEcdsaProver;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
@@ -655,6 +655,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         deploy_block,
         Arc::clone(&l1_head),
         Some(system_tx_cfg),
+        read_checkpoint_dir(),
     );
 
     // Bind before the L1 wait so port checks see a live front. Submissions are

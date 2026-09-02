@@ -565,6 +565,16 @@ impl CompositionBuilder {
         self.recorded.len()
     }
 
+    /// Gas the probed target calls used, as a guess at what they cost for real.
+    /// An outbound one runs inline in `postAndVerifyBatch`, which must pay it.
+    #[must_use]
+    pub fn recorded_gas_used(&self) -> u64 {
+        self.recorded
+            .iter()
+            .filter_map(|action| action.outcome.gas_used())
+            .sum()
+    }
+
     /// Mark the bracketing call with `revert_span` and queue checkpoints for
     /// recorded calls in that range. Rollbacks are coalesced per rollup and
     /// applied before a later dispatch.

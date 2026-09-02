@@ -581,9 +581,9 @@ pub enum ProverMutation {
     None,
     PostBatch,
     Witness,
-    /// Deterministic opaque rejection used to exercise Composer recovery. This
-    /// is the status returned by the real signer when its checkpoint quota is
-    /// exceeded.
+    /// Deterministic opaque rejection used to exercise Composer recovery. The
+    /// real signer can return this for remaining resource quotas such as
+    /// aggregate request bytes or witness items.
     ResourceExhausted,
     /// A typed rejection whose candidate identity cannot belong to the current
     /// request. The Composer must treat it as opaque rather than acting on it.
@@ -637,13 +637,12 @@ impl ProverMutation {
                     .ok_or_else(|| Status::internal("missing Prove header"))?;
                 let batch = eez_protocol::entries::decode_postbatch(calldata)
                     .map_err(|error| Status::internal(format!("decode PostBatch: {error}")))?;
-                // Entry zero is the state-chain anchor. The real checkpoint
-                // quota is exercised only by effect candidates, so leave
-                // anchor-only historical/minimal proofs healthy.
+                // Exercise the rejection only on effect-bearing batches, so
+                // anchor-only historical/minimal proofs remain healthy.
                 if batch.entries.len() > 1 {
                     return match self {
                         Self::ResourceExhausted => Err(Status::resource_exhausted(
-                            "window validation checkpoint quota exceeded",
+                            "window validation resource quota exceeded",
                         )),
                         Self::MismatchedActionable => {
                             let failure = ProveFailure {

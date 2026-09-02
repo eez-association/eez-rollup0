@@ -72,6 +72,23 @@ impl L1CanonicalHead {
         self.batches.lock().unwrap().last().copied()
     }
 
+    /// How many indexed batches share `l1_block`. The boot checkpoint uses
+    /// this: a resume seeds the index with one batch hash, so any earlier
+    /// batch in the same block would be rescanned with the cursor already
+    /// past it.
+    ///
+    /// # Panics
+    ///
+    /// If the `batches` mutex is poisoned.
+    pub fn count_at_l1_block(&self, l1_block: u64) -> usize {
+        self.batches
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|b| b.l1_block == l1_block)
+            .count()
+    }
+
     /// `true` iff `tx_hash` is already indexed. Used by the Deriver
     /// to dedup live `BatchPosted` events against the catch-up scan.
     ///
@@ -220,6 +237,46 @@ mod tests {
         ]);
         assert_eq!(head.cursor(), 70);
         assert_eq!(head.known_tx_hashes().len(), 3);
+    }
+
+    /// What the boot checkpoint's guard rests on: more than one batch in the
+    /// tail's L1 block means a resume would seed one hash and replay the other.
+    #[test]
+    fn count_at_l1_block_counts_that_block_only() {
+        let head = L1CanonicalHead::default();
+        head.append_many([
+            record(100, 0xaa, 50),
+            record(100, 0xbb, 60), // shares block 100 — the shape the guard rejects
+            record(101, 0xcc, 70),
+        ]);
+        assert_eq!(
+            head.count_at_l1_block(100),
+            2,
+            "both same-block batches count"
+        );
+        assert_eq!(
+            head.count_at_l1_block(101),
+            1,
+            "a sole batch is the safe shape"
+        );
+        assert_eq!(
+            head.count_at_l1_block(102),
+            0,
+            "an unindexed block holds none"
+        );
+
+        // An L1 reorg must not leave the guard reading dropped batches.
+        head.retreat_on_l1_reorg(100);
+        assert_eq!(
+            head.count_at_l1_block(101),
+            0,
+            "retreat removes the block's batches"
+        );
+        assert_eq!(
+            head.count_at_l1_block(100),
+            2,
+            "at-or-below the ancestor survives"
+        );
     }
 
     #[test]
