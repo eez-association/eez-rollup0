@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
@@ -192,11 +193,36 @@ where
         }
     }
 
+    /// Bounded wait for the L1 head to reach `block`. Best effort: on timeout
+    /// the caller reads whatever L1 serves and the usual validation decides.
+    async fn await_l1_head(&self, block: u64) {
+        const POLL: Duration = Duration::from_secs(2);
+        const POLLS: u32 = 30;
+        for _ in 0..POLLS {
+            match self.inner.l1_reader.readiness().await {
+                Ok(state) if state.head_block_number >= block => return,
+                _ => tokio::time::sleep(POLL).await,
+            }
+        }
+        event!(
+            name: "eez.deriver.checkpoint.l1_behind",
+            Level::WARN,
+            l1_block = block,
+            "L1 head still below the checkpoint block; validating anyway",
+        );
+    }
+
     /// Checkpoint to seed the boot scan from, or `None` to rescan from the
     /// deploy block. [`ReconcileCheckpoint::usable_with`] decides.
     async fn checkpoint_seed(&self) -> Option<crate::checkpoint::ReconcileCheckpoint> {
         let checkpoint =
             crate::checkpoint::ReconcileCheckpoint::load(self.inner.checkpoint_dir.as_deref()?)?;
+        // The checkpoint names the tip we last indexed. A restart brings the L1
+        // back with us, so for a few seconds its head sits below that block and
+        // every hash read is `None` — discarding the checkpoint then is a
+        // verdict about timing, not canonicality. Once the head is level, a
+        // missing or different hash is real reorg evidence and still rejects.
+        self.await_l1_head(checkpoint.l1_block).await;
         let canonical = self
             .inner
             .l1_reader
