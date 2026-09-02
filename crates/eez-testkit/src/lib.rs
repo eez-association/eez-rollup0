@@ -333,7 +333,7 @@ fn proof_signer_binary() -> Result<PathBuf> {
             "build",
             "--locked",
             "-p",
-            "eez-proof-signer",
+            "eez-prover-stateless",
             "--bin",
             "eez-proof-signer",
         ]);

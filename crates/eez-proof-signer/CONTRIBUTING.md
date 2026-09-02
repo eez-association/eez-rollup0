@@ -24,8 +24,8 @@ the spec are appropriate in repository documentation.
 
 ## Current implementation
 
-- Production always uses the in-process Stateless backend. No alternative
-  backend is selectable; the stub backend exists only in tests.
+- The production witness-backed backend lives in `eez-prover-stateless` and
+  inherits this crate's service pipeline.
 - Exactly one request may be active across all connections. An overlap is
   rejected, not queued. The request permit covers ingestion through response
   construction and remains with a running detached worker until it exits.
@@ -107,9 +107,9 @@ needs focused fixture coverage.
 
 ## Change discipline
 
-- Put protocol-neutral backend checks in `validate.rs`, Stateless-specific
-  behavior in `validate/stateless.rs`, and settlement rules in the focused
-  `settlement/` module that owns the gate.
+- Put protocol-neutral backend checks in `validate.rs`, shared replay helpers
+  in `validate/support.rs`, backend-specific behavior in the owning prover
+  crate, and settlement rules in the focused `settlement/` module.
 - Preserve exact decoding and byte equality at trust boundaries. Do not replace
   a canonical comparison with a looser semantic approximation.
 - Keep untrusted DA parsing bounded and borrowed; do not allocate collections
@@ -130,6 +130,7 @@ cargo check --package eez-proof-signer --all-targets --locked
 cargo clippy --package eez-proof-signer --all-targets --all-features --locked -- -D warnings
 cargo test --package eez-proof-signer --locked
 RUSTDOCFLAGS='-D warnings' cargo doc --package eez-proof-signer --no-deps --locked
+cargo test --package eez-prover-stateless --locked
 ```
 
 Before updating the dependency pin, verify the fork change from a checkout of

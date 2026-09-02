@@ -9,15 +9,24 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use alloy_consensus::{EthereumReceipt, Transaction as _};
 #[cfg(test)]
 use alloy_genesis::ChainConfig;
 use alloy_genesis::Genesis;
 use alloy_primitives::Address;
-use alloy_sol_types::SolEvent as _;
-use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
-use eez_protocol::settlement::{is_system_tx, pair_end_positions};
-use reth_chainspec::{ChainSpec, EthereumHardforks as _};
+use alloy_rpc_types_debug::ExecutionWitness;
+use eez_proof_signer::cancel::CancellationToken;
+use eez_proof_signer::validate::support::{
+    CheckpointPlan, check_cancellation, decode_match_and_recover_signers, observe_outbound_events,
+    system_sender_flags,
+};
+use eez_proof_signer::validate::{
+    BackendBlockOutput, BackendWindowOutput, SettlementBlockEvidence, TransactionStateCheckpoint,
+    ValidationBackend, ValidationError,
+};
+use eez_proof_signer::window::AdmittedBlock;
+#[cfg(test)]
+use eez_proof_signer::window::testing::admitted_block_parts_mut;
+use reth_chainspec::ChainSpec;
 use reth_ethereum_primitives::Block;
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::RecoveredBlock;
@@ -28,79 +37,11 @@ use stateless_reth::{
 };
 use tracing::{debug, info, trace};
 
-use super::{
-    BackendBlockOutput, BackendWindowOutput, DecodedOutboundEvent, OutboundEventObservation,
-    SettlementBlockEvidence, TransactionStateCheckpoint, ValidationError,
-};
-use crate::EEZL2_ADDRESS;
-use crate::cancel::CancellationToken;
-use crate::window::AdmittedBlock;
-
 mod chain_config;
 
 use chain_config::{ChainDocumentKind, load_chain_document};
 
 const DEBUG_PROGRESS_INTERVAL: usize = 100;
-
-/// Transaction boundaries at which settlement framing needs state roots.
-///
-/// The indices are derived locally from the recovered block. Composer-supplied
-/// metadata never participates in checkpoint selection.
-#[derive(Debug, PartialEq, Eq)]
-struct CheckpointPlan {
-    transaction_indices: Vec<usize>,
-}
-
-impl CheckpointPlan {
-    /// Derive effect-candidate boundaries and system-sender flags from the
-    /// locally recovered transactions.
-    fn from_recovered_block(
-        block: &RecoveredBlock<Block>,
-        expected_l2_system_address: Address,
-    ) -> (Self, Vec<bool>) {
-        let transaction_count = block.body().transactions.len();
-        let mut system_sender_flags = Vec::with_capacity(transaction_count);
-        let mut sync_system_transaction_flags = Vec::with_capacity(transaction_count);
-        for transaction in block.transactions_recovered() {
-            let is_system_sender = transaction.signer() == expected_l2_system_address;
-            system_sender_flags.push(is_system_sender);
-            sync_system_transaction_flags.push(is_system_tx(
-                transaction.signer(),
-                transaction.to(),
-                expected_l2_system_address,
-                EEZL2_ADDRESS,
-            ));
-        }
-        let plan = Self {
-            transaction_indices: pair_end_positions(&sync_system_transaction_flags),
-        };
-        (plan, system_sender_flags)
-    }
-
-    /// Check that a checkpoint-capable backend honored the selection exactly.
-    fn verify_returned(
-        &self,
-        checkpoints: &[TransactionStateCheckpoint],
-    ) -> Result<(), ValidationError> {
-        let selection_matches = checkpoints.len() == self.transaction_indices.len()
-            && checkpoints
-                .iter()
-                .zip(&self.transaction_indices)
-                .all(|(checkpoint, requested)| checkpoint.transaction_index == *requested);
-        if !selection_matches {
-            let returned = checkpoints
-                .iter()
-                .map(|checkpoint| checkpoint.transaction_index)
-                .collect::<Vec<_>>();
-            return Err(ValidationError::InvalidBackendOutput(format!(
-                "stateless checkpoint response targeted transaction indices {returned:?}; \
-                 requested {:?}",
-                self.transaction_indices,
-            )));
-        }
-        Ok(())
-    }
-}
 
 /// Signer-recovered settling block prepared before replay.
 ///
@@ -115,27 +56,19 @@ struct PreparedSettlingBlock {
 
 /// In-process Stateless/Reth backend configured from operator-selected rules.
 #[derive(Debug)]
-pub(crate) struct Backend {
+pub struct Backend {
     chain_spec: Arc<ChainSpec>,
     evm_config: EthEvmConfig,
-    expected_l2_system_address: Address,
+    expected_l2_system_address: Option<Address>,
 }
 
 impl Backend {
     /// EIP-155 identity pinned by the loaded execution chain specification.
-    pub(super) fn chain_id(&self) -> u64 {
+    pub fn chain_id(&self) -> u64 {
         self.chain_spec.chain().id()
     }
 
-    /// Deployment address used to classify privileged L2 transactions.
-    pub(super) const fn expected_l2_system_address(&self) -> Address {
-        self.expected_l2_system_address
-    }
-
-    pub(super) fn from_chain_document_file(
-        path: &Path,
-        expected_l2_system_address: Address,
-    ) -> eyre::Result<Self> {
+    pub fn from_chain_document_file(path: &Path) -> eyre::Result<Self> {
         let (genesis, document_kind) = load_chain_document(path)?;
         let chain_config = &genesis.config;
         let genesis_timestamp =
@@ -151,47 +84,76 @@ impl Backend {
             ?genesis_timestamp,
             "stateless chain configuration details",
         );
-        Ok(Self::from_genesis(genesis, expected_l2_system_address))
+        Ok(Self::from_genesis(genesis))
     }
 
     #[cfg(test)]
     pub(super) fn new(chain_config: ChainConfig, expected_l2_system_address: Address) -> Self {
-        Self::from_genesis(
-            Genesis {
-                config: chain_config,
-                ..Default::default()
-            },
-            expected_l2_system_address,
-        )
+        let mut backend = Self::from_genesis(Genesis {
+            config: chain_config,
+            ..Default::default()
+        });
+        backend.expected_l2_system_address = Some(expected_l2_system_address);
+        backend
     }
 
-    fn from_genesis(genesis: Genesis, expected_l2_system_address: Address) -> Self {
+    fn from_genesis(genesis: Genesis) -> Self {
         let chain_spec = Arc::new(ChainSpec::from_genesis(genesis));
         let evm_config = EthEvmConfig::new(Arc::clone(&chain_spec));
         Self {
             chain_spec,
             evm_config,
-            expected_l2_system_address,
+            expected_l2_system_address: None,
         }
     }
 
     #[cfg(test)]
     pub(super) fn validate(
         &self,
-        blocks: &[AdmittedBlock],
+        mut blocks: Vec<AdmittedBlock>,
     ) -> Result<BackendWindowOutput, ValidationError> {
-        self.validate_blocks(&mut blocks.to_vec(), &CancellationToken::default())
+        self.validate_admitted(&mut blocks, &CancellationToken::default())
     }
 
-    /// Replay every admitted block and return associated per-block output. The
-    /// caller still consumes and checks that output before exposing settlement evidence.
-    pub(super) fn validate_blocks(
+    #[cfg(test)]
+    fn validate_admitted(
         &self,
         blocks: &mut [AdmittedBlock],
         cancellation: &CancellationToken,
     ) -> Result<BackendWindowOutput, ValidationError> {
+        let mut witnesses = blocks
+            .iter_mut()
+            .map(|block| std::mem::take(admitted_block_parts_mut(block).witness))
+            .collect::<Vec<_>>();
+        let result = self.validate_blocks_inner(blocks, &mut witnesses, cancellation);
+        if result.is_err() {
+            for (block, witness) in blocks.iter_mut().zip(witnesses) {
+                *admitted_block_parts_mut(block).witness = witness;
+            }
+        }
+        result
+    }
+
+    /// Replay every admitted block and return associated per-block output. The
+    /// caller still consumes and checks that output before exposing settlement evidence.
+    fn validate_blocks_inner(
+        &self,
+        blocks: &[AdmittedBlock],
+        witnesses: &mut [ExecutionWitness],
+        cancellation: &CancellationToken,
+    ) -> Result<BackendWindowOutput, ValidationError> {
+        let expected_l2_system_address = self.expected_l2_system_address.ok_or_else(|| {
+            ValidationError::InternalInvariant("stateless backend was not initialized".to_owned())
+        })?;
         let validation_started = Instant::now();
         let total_blocks = blocks.len();
+        if witnesses.len() != total_blocks {
+            return Err(ValidationError::InternalInvariant(format!(
+                "stateless backend received {} blocks and {} witnesses",
+                total_blocks,
+                witnesses.len(),
+            )));
+        }
         let mut block_outputs = Vec::<BackendBlockOutput>::with_capacity(total_blocks);
         let mut window_pre_state_root = None;
 
@@ -204,7 +166,7 @@ impl Backend {
                 let recovered_block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
                 let (checkpoint_plan, system_sender_flags) = CheckpointPlan::from_recovered_block(
                     &recovered_block,
-                    self.expected_l2_system_address,
+                    expected_l2_system_address,
                 );
                 Ok(PreparedSettlingBlock {
                     block: recovered_block,
@@ -214,7 +176,7 @@ impl Backend {
             })
             .transpose()?;
 
-        for (index, admitted) in blocks.iter_mut().enumerate() {
+        for (index, (admitted, witness)) in blocks.iter().zip(witnesses).enumerate() {
             check_cancellation(cancellation, index, total_blocks)?;
             let block_started = Instant::now();
             let block_ordinal = index + 1;
@@ -234,7 +196,7 @@ impl Backend {
             } else {
                 let recovered_block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
                 let system_sender_flags =
-                    system_sender_flags(&recovered_block, self.expected_l2_system_address);
+                    system_sender_flags(&recovered_block, expected_l2_system_address);
                 (recovered_block, None, system_sender_flags)
             };
             let block_number = recovered_block.header().number;
@@ -244,7 +206,7 @@ impl Backend {
             trace!(
                 block_ordinal,
                 block_number,
-                claimed_block_hash = %admitted.claimed_hash,
+                claimed_block_hash = %admitted.claimed_hash(),
                 timestamp,
                 transactions = transaction_count,
                 "validating stateless block",
@@ -254,15 +216,15 @@ impl Backend {
             // Successful Stateless output means consensus, witness pre-state,
             // execution receipts, and the recomputed post-state commitment all
             // passed. Only a non-empty final selection uses the checkpoint path.
-            let witness = std::mem::take(&mut admitted.witness);
+            let witness = std::mem::take(witness);
             let (stateless_output, transaction_state_checkpoints) = match checkpoint_plan {
-                Some(plan) if !plan.transaction_indices.is_empty() => {
+                Some(plan) if !plan.transaction_indices().is_empty() => {
                     let output = stateless_validation_recovered_with_state_checkpoints(
                         recovered_block,
                         witness,
                         Arc::clone(&self.chain_spec),
                         self.evm_config.clone(),
-                        &plan.transaction_indices,
+                        plan.transaction_indices(),
                     )
                     .map_err(|error| map_stateless_error(block_number, error))?;
                     let checkpoints = output
@@ -377,6 +339,39 @@ impl Backend {
     }
 }
 
+impl ValidationBackend for Backend {
+    fn initialize(
+        &mut self,
+        chain_id: u64,
+        expected_l2_system_address: Address,
+    ) -> eyre::Result<()> {
+        eyre::ensure!(
+            chain_id == self.chain_id(),
+            "configured L2 chain id {chain_id} does not match stateless chain id {}",
+            self.chain_id(),
+        );
+        eyre::ensure!(
+            self.expected_l2_system_address.is_none(),
+            "stateless backend already initialized",
+        );
+        self.expected_l2_system_address = Some(expected_l2_system_address);
+        Ok(())
+    }
+
+    fn label(&self) -> &'static str {
+        "stateless"
+    }
+
+    fn validate_blocks(
+        &self,
+        blocks: &[AdmittedBlock],
+        witnesses: &mut [ExecutionWitness],
+        cancellation: &CancellationToken,
+    ) -> Result<BackendWindowOutput, ValidationError> {
+        self.validate_blocks_inner(blocks, witnesses, cancellation)
+    }
+}
+
 /// Classify a rejected local checkpoint plan as an internal invariant failure;
 /// all other Stateless errors reject the input.
 fn map_stateless_error(block_number: u64, error: StatelessValidationError) -> ValidationError {
@@ -394,127 +389,8 @@ fn map_stateless_error(block_number: u64, error: StatelessValidationError) -> Va
     }
 }
 
-/// Classify each locally recovered signer for later settlement policy.
-fn system_sender_flags(
-    block: &RecoveredBlock<Block>,
-    expected_l2_system_address: Address,
-) -> Vec<bool> {
-    block
-        .transactions_recovered()
-        .map(|transaction| transaction.signer() == expected_l2_system_address)
-        .collect()
-}
-
-/// Stop between non-interruptible block executions after request cancellation.
-fn check_cancellation(
-    cancellation: &CancellationToken,
-    validated_blocks: usize,
-    total_blocks: usize,
-) -> Result<(), ValidationError> {
-    if cancellation.is_cancelled() {
-        debug!(
-            validated_blocks,
-            total_blocks, "stateless validation stopped after request cancellation",
-        );
-        Err(ValidationError::Cancelled)
-    } else {
-        Ok(())
-    }
-}
-
 fn elapsed_millis(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-/// Exact-decode Composer-supplied RLP and match its identity to stream metadata.
-/// The returned block is still untrusted until Stateless accepts it.
-fn decode_and_match_stream_metadata(admitted: &AdmittedBlock) -> Result<Block, ValidationError> {
-    let block = alloy_rlp::decode_exact::<Block>(&admitted.rlp).map_err(|error| {
-        ValidationError::Rejected(format!(
-            "block {} carries invalid consensus RLP: {error}",
-            admitted.declared_number,
-        ))
-    })?;
-    if block.header.number != admitted.declared_number {
-        return Err(ValidationError::Rejected(format!(
-            "decoded block number {} does not match streamed block {}",
-            block.header.number, admitted.declared_number,
-        )));
-    }
-    if block.header.parent_hash != admitted.claimed_parent_hash {
-        return Err(ValidationError::Rejected(format!(
-            "decoded parent hash {} for block {} does not match streamed parent hash {}",
-            block.header.parent_hash, admitted.declared_number, admitted.claimed_parent_hash,
-        )));
-    }
-    let computed_hash = block.header.hash_slow();
-    if computed_hash != admitted.claimed_hash {
-        return Err(ValidationError::Rejected(format!(
-            "computed block hash {computed_hash} for block {} does not match streamed block hash {}",
-            admitted.declared_number, admitted.claimed_hash,
-        )));
-    }
-    Ok(block)
-}
-
-/// Exact-decode, match stream metadata, and recover transaction signers under
-/// the configured fork rules. Signer recovery is not execution validation.
-fn decode_match_and_recover_signers(
-    admitted: &AdmittedBlock,
-    chain_spec: &ChainSpec,
-) -> Result<RecoveredBlock<Block>, ValidationError> {
-    let block = decode_and_match_stream_metadata(admitted)?;
-    let number = block.header.number;
-    recover_block(block, chain_spec).map_err(|error| {
-        ValidationError::Rejected(format!(
-            "block {number} transaction recovery failed: {error}",
-        ))
-    })
-}
-
-/// Homestead (EIP-2) forbids high-s signatures, so enforce the low-s rule
-/// during recovery only for blocks where that fork is active.
-fn recover_block(
-    block: Block,
-    chain_spec: &ChainSpec,
-) -> Result<RecoveredBlock<Block>, reth_primitives_traits::transaction::signed::RecoveryError> {
-    if chain_spec.is_homestead_active_at_block(block.header.number) {
-        RecoveredBlock::try_recover(block)
-    } else {
-        RecoveredBlock::try_recover_unchecked(block)
-    }
-}
-
-/// Retain every EEZL2 outbound-event candidate with receipt provenance.
-///
-/// Matching emitter/signature logs remain observations in receipt order.
-/// Canonical encodings expose the emitted hash and manager-entry gas;
-/// malformed or non-canonical encodings remain undecoded observations.
-fn observe_outbound_events(
-    validated_receipts: &[EthereumReceipt],
-) -> Vec<OutboundEventObservation> {
-    let mut observations = Vec::new();
-    for (transaction_index, receipt) in validated_receipts.iter().enumerate() {
-        for (receipt_log_index, log) in receipt.logs.iter().enumerate() {
-            if log.address != EEZL2_ADDRESS
-                || log.data.topics().first() != Some(&CrossChainCallExecuted::SIGNATURE_HASH)
-            {
-                continue;
-            }
-            let decoded_event = CrossChainCallExecuted::decode_log_validate(log)
-                .ok()
-                .filter(|decoded| &CrossChainCallExecuted::encode_log(decoded) == log)
-                .map(|decoded| {
-                    DecodedOutboundEvent::new(decoded.data.crossChainCallHash, decoded.data.callGas)
-                });
-            observations.push(OutboundEventObservation {
-                transaction_index,
-                receipt_log_index,
-                decoded_event,
-            });
-        }
-    }
-    observations
 }
 
 #[cfg(test)]
