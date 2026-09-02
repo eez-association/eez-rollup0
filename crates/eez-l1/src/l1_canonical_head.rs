@@ -249,14 +249,34 @@ mod tests {
             record(100, 0xbb, 60), // shares block 100 — the shape the guard rejects
             record(101, 0xcc, 70),
         ]);
-        assert_eq!(head.count_at_l1_block(100), 2, "both same-block batches count");
-        assert_eq!(head.count_at_l1_block(101), 1, "a sole batch is the safe shape");
-        assert_eq!(head.count_at_l1_block(102), 0, "an unindexed block holds none");
+        assert_eq!(
+            head.count_at_l1_block(100),
+            2,
+            "both same-block batches count"
+        );
+        assert_eq!(
+            head.count_at_l1_block(101),
+            1,
+            "a sole batch is the safe shape"
+        );
+        assert_eq!(
+            head.count_at_l1_block(102),
+            0,
+            "an unindexed block holds none"
+        );
 
         // An L1 reorg must not leave the guard reading dropped batches.
         head.retreat_on_l1_reorg(100);
-        assert_eq!(head.count_at_l1_block(101), 0, "retreat removes the block's batches");
-        assert_eq!(head.count_at_l1_block(100), 2, "at-or-below the ancestor survives");
+        assert_eq!(
+            head.count_at_l1_block(101),
+            0,
+            "retreat removes the block's batches"
+        );
+        assert_eq!(
+            head.count_at_l1_block(100),
+            2,
+            "at-or-below the ancestor survives"
+        );
     }
 
     #[test]
