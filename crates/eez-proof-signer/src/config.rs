@@ -130,18 +130,6 @@ struct Args {
     )]
     max_request_witness_items: NonZeroUsize,
 
-    /// Maximum transaction-state checkpoints derived from the settling block.
-    /// A zero limit rejects every settling block with an effect-candidate boundary.
-    ///
-    /// One checkpoint per bundled cross-chain tx, so this must stay at or above
-    /// the composer's `EEZ_MAX_USER_TXS_PER_BUNDLE` or full bundles are rejected.
-    #[arg(
-        long,
-        env = "EEZ_PROOF_SIGNER_MAX_TRANSACTION_STATE_CHECKPOINTS",
-        default_value = "64"
-    )]
-    max_transaction_state_checkpoints: usize,
-
     /// Maximum silence while awaiting the next streamed message.
     #[arg(
         long,
@@ -208,7 +196,6 @@ impl Config {
                 max_window_blocks: args.max_request_blocks,
                 max_window_bytes: args.max_request_bytes,
                 max_window_witness_items: args.max_request_witness_items,
-                max_transaction_state_checkpoints: args.max_transaction_state_checkpoints,
                 stream_idle_timeout: Duration::from_secs(args.stream_idle_timeout_secs.get()),
                 request_timeout: Duration::from_secs(args.request_timeout_secs.get()),
             })?,

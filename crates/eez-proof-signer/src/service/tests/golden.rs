@@ -281,14 +281,7 @@ fn captured_five_field_outbound_events_are_not_decoded_as_target_events() {
     let admitted = assembler.finish().unwrap();
     let (_, admitted_blocks) = admitted.into_parts();
     let validated = validator
-        .validate_window(
-            admitted_blocks,
-            &CancellationToken::default(),
-            oracle["transaction_state_checkpoints"]
-                .as_array()
-                .unwrap()
-                .len(),
-        )
+        .validate_window(admitted_blocks, &CancellationToken::default())
         .unwrap();
     assert_eq!(
         validated.window_pre_state_root(),

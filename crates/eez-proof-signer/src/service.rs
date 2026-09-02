@@ -34,7 +34,6 @@ pub(crate) struct ServiceLimitsParams {
     pub(crate) max_window_blocks: NonZeroUsize,
     pub(crate) max_window_bytes: NonZeroUsize,
     pub(crate) max_window_witness_items: NonZeroUsize,
-    pub(crate) max_transaction_state_checkpoints: usize,
     pub(crate) stream_idle_timeout: Duration,
     pub(crate) request_timeout: Duration,
 }
@@ -42,13 +41,10 @@ pub(crate) struct ServiceLimitsParams {
 /// Runtime limits shared by every service clone.
 ///
 /// The request deadline covers ingestion through signing; the idle timeout
-/// applies to each streamed-message wait. The checkpoint limit caps how many
-/// settling-block transaction-state roots the locally derived checkpoint plan
-/// may request.
+/// applies to each streamed-message wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ServiceLimits {
     window_limits: window::WindowLimits,
-    max_transaction_state_checkpoints: usize,
     stream_idle_timeout: Duration,
     request_timeout: Duration,
 }
@@ -59,7 +55,6 @@ impl ServiceLimits {
             max_window_blocks,
             max_window_bytes,
             max_window_witness_items,
-            max_transaction_state_checkpoints,
             stream_idle_timeout,
             request_timeout,
         } = params;
@@ -77,7 +72,6 @@ impl ServiceLimits {
                 payload_bytes: max_window_bytes.get(),
                 witness_items: max_window_witness_items.get(),
             },
-            max_transaction_state_checkpoints,
             stream_idle_timeout,
             request_timeout,
         })
@@ -86,10 +80,6 @@ impl ServiceLimits {
     /// Aggregate window quotas enforced during stream admission.
     pub(crate) fn window_limits(self) -> window::WindowLimits {
         self.window_limits
-    }
-
-    pub(crate) fn max_transaction_state_checkpoints(self) -> usize {
-        self.max_transaction_state_checkpoints
     }
 
     pub(crate) fn stream_idle_timeout(self) -> Duration {

@@ -29,7 +29,6 @@ services:
       - ./deployments.env
     environment:
       EEZ_PROOF_SIGNER_ADDR: 127.0.0.1:${EEZ_SIGNER_PORT:-50081}
-      EEZ_PROOF_SIGNER_MAX_TRANSACTION_STATE_CHECKPOINTS: "${EEZ_SIGNER_MAX_CHECKPOINTS:-64}"
       EEZ_CHAIN_CONFIG: /app/genesis.json
       EEZ_PROOF_SIGNER_KEY: "${EEZ_PROOF_SIGNER_KEY:?set EEZ_PROOF_SIGNER_KEY}"
       EEZ_L2_SYSTEM_KEY: "${EEZ_L2_SYSTEM_KEY:?set EEZ_L2_SYSTEM_KEY}"
@@ -82,9 +81,8 @@ services:
       EEZ_L2_RPC_URL: http://127.0.0.1:18688
       EEZ_L1_XCHAIN_PORT: "18999"    # L1→L2 inbound front
       EEZ_L2_XCHAIN_PORT: "18998"    # L2→L1 outbound front
-      # Bundle sizing. Keep at or below EEZ_SIGNER_MAX_CHECKPOINTS (one
-      # checkpoint per bundled tx), and small enough that the whole bundle fits
-      # one L1 block — a 60M devnet block is roomy, a 17M chain is not.
+      # Keep the whole bundle small enough to fit one L1 block — a 60M devnet
+      # block is roomy, a 17M chain is not.
       EEZ_MAX_USER_TXS_PER_BUNDLE: "${EEZ_MAX_USER_TXS_PER_BUNDLE:-50}"
       # ── Timing (12s L1 / 2s L2 → K=6; proof+slack=3000 < 12000) ──
       EEZ_L1_BLOCK_TIME_MS: "12000"

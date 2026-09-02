@@ -135,7 +135,6 @@ The CLI value takes precedence.
 | `--max-request-blocks` | `EEZ_PROOF_SIGNER_MAX_REQUEST_BLOCKS` | `512` | Nonzero. |
 | `--max-request-bytes` | `EEZ_PROOF_SIGNER_MAX_REQUEST_BYTES` | `536870912` | Nonzero. |
 | `--max-request-witness-items` | `EEZ_PROOF_SIGNER_MAX_REQUEST_WITNESS_ITEMS` | `1000000` | Nonzero. |
-| `--max-transaction-state-checkpoints` | `EEZ_PROOF_SIGNER_MAX_TRANSACTION_STATE_CHECKPOINTS` | `8` | May be zero. |
 | `--stream-idle-timeout-secs` | `EEZ_PROOF_SIGNER_STREAM_IDLE_TIMEOUT_SECS` | `120` | Nonzero and representable as an `Instant` deadline. |
 | `--request-timeout-secs` | `EEZ_PROOF_SIGNER_REQUEST_TIMEOUT_SECS` | `600` | Nonzero and representable as an `Instant` deadline. |
 
@@ -300,9 +299,9 @@ An absent `system[i + 1]` at block end is treated as `true`. Thus an outbound
 inbound system transaction ends at itself.
 
 The Composer MUST NOT nominate checkpoint positions. The complete plan MUST be
-derived and checked against `max_transaction_state_checkpoints` before earlier
-blocks are replayed. The backend MUST return exactly the requested positions in
-strict order. Preceding blocks MUST return no checkpoints.
+derived before earlier blocks are replayed. The backend MUST return exactly the
+requested positions in strict order. Preceding blocks MUST return no
+checkpoints.
 
 ### 6.3 Stateless replay guarantees
 
@@ -724,7 +723,7 @@ messages SHOULD remain stable and must not expose secrets.
 | `InvalidArgument` | Malformed stream structure; invalid widths or bounds; noncanonical/invalid PostBatch calldata; malformed or trailing DA payload. |
 | `FailedPrecondition` | Rollup identity mismatch; Stateless input rejection; unsupported batch profile; state/effect/inbound/outbound/DA semantic rejection. |
 | `Unavailable` | Another request is active. The same complete request may succeed after the active request releases the slot. |
-| `ResourceExhausted` | A decoding, block, byte, witness-item, or checkpoint limit was exceeded; or block-vector storage could not be reserved. |
+| `ResourceExhausted` | A decoding, block, byte, or witness-item limit was exceeded; or block-vector storage could not be reserved. |
 | `DeadlineExceeded` | Stream idle timeout or absolute request deadline. |
 | `Cancelled` | Cooperative stop after request cancellation. |
 | `Internal` | Backend-success output violates its contract; local invariant failure; impossible public-input computation/cardinality; reconstruction failures attributable to already validated internal evidence; signing failure. |
@@ -792,7 +791,7 @@ A compatible implementation MUST test at least:
 - every stream ordering, identity, and quota boundary;
 - strict chain-document parsing and secret redaction;
 - exact RLP identity/hash binding and backend-output association;
-- checkpoint selection, quota, returned positions, and roots;
+- checkpoint selection, returned positions, and roots;
 - canonical PostBatch decoding and every profile pin;
 - state-chain endpoints, continuity, effect count/order/kind, and checkpoints;
 - inbound outer/inner equality, call hash, rolling hash, value, and canonical

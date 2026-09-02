@@ -1401,10 +1401,9 @@ where
         }
 
         let pool_len_before = pool.len();
-        // Caps how many txs an atomic-relay drop re-queues, not how big a batch
-        // may be — gas does that. Must stay at or below the signer's checkpoint
-        // quota, since each bundled tx costs one; lower it on an L1 whose block
-        // cannot hold the postBatch plus this many user txs.
+        // Caps how many held transactions one bundle attempts and therefore how
+        // many an atomic-relay drop re-queues. L1 block gas remains the hard
+        // protocol constraint, so deployments may need a lower cap.
         let max_user_txs = std::env::var("EEZ_MAX_USER_TXS_PER_BUNDLE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())

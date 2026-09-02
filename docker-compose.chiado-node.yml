@@ -37,7 +37,6 @@ services:
       - ./deployments.env
     environment:
       EEZ_PROOF_SIGNER_ADDR: 127.0.0.1:${EEZ_SIGNER_PORT:-50061}
-      EEZ_PROOF_SIGNER_MAX_TRANSACTION_STATE_CHECKPOINTS: "${EEZ_SIGNER_MAX_CHECKPOINTS:-64}"
       EEZ_CHAIN_CONFIG: /app/genesis.json
       EEZ_PROOF_SIGNER_KEY: "${EEZ_PROOF_SIGNER_KEY:?set EEZ_PROOF_SIGNER_KEY}"
       EEZ_L2_SYSTEM_KEY: "${EEZ_L2_SYSTEM_KEY:?set EEZ_L2_SYSTEM_KEY}"
@@ -107,8 +106,7 @@ services:
       EEZ_L2_XCHAIN_PORT: "18998"
       # Lower than the in-code default (50) because the whole bundle
       # [postBatch, user_tx...] has to fit a 17M chiado block, not the 60M a
-      # devnet L1 gives: 9M cap + 12 * 400k = 13.8M. The signer's checkpoint
-      # quota above must stay at or above this.
+      # devnet L1 gives: 9M cap + 12 * 400k = 13.8M.
       EEZ_MAX_USER_TXS_PER_BUNDLE: "${EEZ_MAX_USER_TXS_PER_BUNDLE:-12}"
       # Emission + reorg bounds documented in .env.example. eez-node reads these
       # from the process env, and this service takes no env_file beyond

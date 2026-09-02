@@ -52,29 +52,12 @@ struct CheckpointPlan {
 }
 
 impl CheckpointPlan {
-    /// Enforce the checkpoint trie-reconstruction quota.
-    fn try_new(
-        transaction_indices: Vec<usize>,
-        max_checkpoints: usize,
-    ) -> Result<Self, ValidationError> {
-        if transaction_indices.len() > max_checkpoints {
-            return Err(ValidationError::CheckpointLimit {
-                requested: transaction_indices.len(),
-                max: max_checkpoints,
-            });
-        }
-        Ok(Self {
-            transaction_indices,
-        })
-    }
-
     /// Derive effect-candidate boundaries and system-sender flags from the
     /// locally recovered transactions.
     fn from_recovered_block(
         block: &RecoveredBlock<Block>,
-        max_checkpoints: usize,
         expected_l2_system_address: Address,
-    ) -> Result<(Self, Vec<bool>), ValidationError> {
+    ) -> (Self, Vec<bool>) {
         let transaction_count = block.body().transactions.len();
         let mut system_sender_flags = Vec::with_capacity(transaction_count);
         let mut sync_system_transaction_flags = Vec::with_capacity(transaction_count);
@@ -88,11 +71,10 @@ impl CheckpointPlan {
                 EEZL2_ADDRESS,
             ));
         }
-        let plan = Self::try_new(
-            pair_end_positions(&sync_system_transaction_flags),
-            max_checkpoints,
-        )?;
-        Ok((plan, system_sender_flags))
+        let plan = Self {
+            transaction_indices: pair_end_positions(&sync_system_transaction_flags),
+        };
+        (plan, system_sender_flags)
     }
 
     /// Check that a checkpoint-capable backend honored the selection exactly.
@@ -124,7 +106,7 @@ impl CheckpointPlan {
 ///
 /// This block is exact-decoded and its signers are recovered, but it remains
 /// untrusted until Stateless accepts the same `RecoveredBlock`. Preparing it
-/// early lets an excessive checkpoint plan fail before earlier blocks execute.
+/// early keeps checkpoint selection independent from execution side effects.
 struct PreparedSettlingBlock {
     block: RecoveredBlock<Block>,
     checkpoint_plan: CheckpointPlan,
@@ -198,11 +180,7 @@ impl Backend {
         &self,
         blocks: &[AdmittedBlock],
     ) -> Result<BackendWindowOutput, ValidationError> {
-        self.validate_blocks(
-            &mut blocks.to_vec(),
-            &CancellationToken::default(),
-            usize::MAX,
-        )
+        self.validate_blocks(&mut blocks.to_vec(), &CancellationToken::default())
     }
 
     /// Replay every admitted block and return associated per-block output. The
@@ -211,15 +189,14 @@ impl Backend {
         &self,
         blocks: &mut [AdmittedBlock],
         cancellation: &CancellationToken,
-        max_transaction_state_checkpoints: usize,
     ) -> Result<BackendWindowOutput, ValidationError> {
         let validation_started = Instant::now();
         let total_blocks = blocks.len();
         let mut block_outputs = Vec::<BackendBlockOutput>::with_capacity(total_blocks);
         let mut window_pre_state_root = None;
 
-        // Derive and quota-check the final block's checkpoint plan before any
-        // witness is consumed or earlier block is replayed.
+        // Derive the final block's complete checkpoint plan before any witness
+        // is consumed or earlier block is replayed.
         check_cancellation(cancellation, 0, total_blocks)?;
         let mut prepared_settling_block = blocks
             .last()
@@ -227,9 +204,8 @@ impl Backend {
                 let recovered_block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
                 let (checkpoint_plan, system_sender_flags) = CheckpointPlan::from_recovered_block(
                     &recovered_block,
-                    max_transaction_state_checkpoints,
                     self.expected_l2_system_address,
-                )?;
+                );
                 Ok(PreparedSettlingBlock {
                     block: recovered_block,
                     checkpoint_plan,
