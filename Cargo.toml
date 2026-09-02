@@ -13,6 +13,7 @@ members = [
     "crates/eez-node-e2e",
     "crates/eez-payload-codec",
     "crates/eez-proof-signer",
+    "crates/eez-prover-stateful",
     "crates/eez-prover-stateless",
     "crates/eez-protocol",
     "crates/eez-prover",
@@ -64,15 +65,18 @@ clap               = { version = "4", features = ["derive"] }
 
 # reth — pinned to mediocregopher/partial-persistence-clean tip (contains the receipts-reorg truncation fix).
 reth-chainspec                  = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-consensus                  = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-cli                        = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-db                         = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-engine-primitives          = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-ethereum-cli               = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-ethereum-consensus         = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-ethereum-payload-builder   = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-ethereum-primitives        = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-evm                        = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-evm-ethereum               = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-execution-types            = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-network-peers              = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-node-api                   = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-node-builder               = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
@@ -153,6 +157,7 @@ eez-payload-codec  = { path = "crates/eez-payload-codec" }
 eez-proof-signer   = { path = "crates/eez-proof-signer" }
 eez-protocol       = { path = "crates/eez-protocol" }
 eez-prover         = { path = "crates/eez-prover" }
+eez-prover-stateful  = { path = "crates/eez-prover-stateful" }
 eez-prover-stateless = { path = "crates/eez-prover-stateless" }
 eez-testkit        = { path = "crates/eez-testkit" }
 
