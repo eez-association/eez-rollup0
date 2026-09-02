@@ -25,6 +25,7 @@ pub struct CheckpointPlan {
 
 impl CheckpointPlan {
     /// Construct a plan from locally selected transaction boundaries.
+    #[cfg(feature = "test-utils")]
     pub fn new(transaction_indices: Vec<usize>) -> Self {
         Self {
             transaction_indices,
@@ -49,7 +50,9 @@ impl CheckpointPlan {
                 EEZL2_ADDRESS,
             ));
         }
-        let plan = Self::new(pair_end_positions(&sync_system_transaction_flags));
+        let plan = Self {
+            transaction_indices: pair_end_positions(&sync_system_transaction_flags),
+        };
         (plan, system_sender_flags)
     }
 

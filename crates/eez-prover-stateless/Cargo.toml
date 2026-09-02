@@ -37,6 +37,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
 eez-control-rpc.workspace = true
+eez-proof-signer = { workspace = true, features = ["test-utils"] }
 hex.workspace = true
 tokio-stream = { workspace = true, features = ["net"] }
 tonic.workspace = true

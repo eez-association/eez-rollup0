@@ -59,7 +59,7 @@ struct PreparedSettlingBlock {
 pub struct Backend {
     chain_spec: Arc<ChainSpec>,
     evm_config: EthEvmConfig,
-    expected_l2_system_address: Option<Address>,
+    expected_l2_system_address: Address,
 }
 
 impl Backend {
@@ -68,7 +68,11 @@ impl Backend {
         self.chain_spec.chain().id()
     }
 
-    pub fn from_chain_document_file(path: &Path) -> eyre::Result<Self> {
+    /// Load execution rules and bind the deployment's privileged L2 identity.
+    pub fn from_chain_document_file(
+        path: &Path,
+        expected_l2_system_address: Address,
+    ) -> eyre::Result<Self> {
         let (genesis, document_kind) = load_chain_document(path)?;
         let chain_config = &genesis.config;
         let genesis_timestamp =
@@ -84,26 +88,27 @@ impl Backend {
             ?genesis_timestamp,
             "stateless chain configuration details",
         );
-        Ok(Self::from_genesis(genesis))
+        Ok(Self::from_genesis(genesis, expected_l2_system_address))
     }
 
     #[cfg(test)]
     pub(super) fn new(chain_config: ChainConfig, expected_l2_system_address: Address) -> Self {
-        let mut backend = Self::from_genesis(Genesis {
-            config: chain_config,
-            ..Default::default()
-        });
-        backend.expected_l2_system_address = Some(expected_l2_system_address);
-        backend
+        Self::from_genesis(
+            Genesis {
+                config: chain_config,
+                ..Default::default()
+            },
+            expected_l2_system_address,
+        )
     }
 
-    fn from_genesis(genesis: Genesis) -> Self {
+    fn from_genesis(genesis: Genesis, expected_l2_system_address: Address) -> Self {
         let chain_spec = Arc::new(ChainSpec::from_genesis(genesis));
         let evm_config = EthEvmConfig::new(Arc::clone(&chain_spec));
         Self {
             chain_spec,
             evm_config,
-            expected_l2_system_address: None,
+            expected_l2_system_address,
         }
     }
 
@@ -142,9 +147,7 @@ impl Backend {
         witnesses: &mut [ExecutionWitness],
         cancellation: &CancellationToken,
     ) -> Result<BackendWindowOutput, ValidationError> {
-        let expected_l2_system_address = self.expected_l2_system_address.ok_or_else(|| {
-            ValidationError::InternalInvariant("stateless backend was not initialized".to_owned())
-        })?;
+        let expected_l2_system_address = self.expected_l2_system_address;
         let validation_started = Instant::now();
         let total_blocks = blocks.len();
         if witnesses.len() != total_blocks {
@@ -340,26 +343,16 @@ impl Backend {
 }
 
 impl ValidationBackend for Backend {
-    fn initialize(
-        &mut self,
-        chain_id: u64,
-        expected_l2_system_address: Address,
-    ) -> eyre::Result<()> {
-        eyre::ensure!(
-            chain_id == self.chain_id(),
-            "configured L2 chain id {chain_id} does not match stateless chain id {}",
-            self.chain_id(),
-        );
-        eyre::ensure!(
-            self.expected_l2_system_address.is_none(),
-            "stateless backend already initialized",
-        );
-        self.expected_l2_system_address = Some(expected_l2_system_address);
-        Ok(())
-    }
-
     fn label(&self) -> &'static str {
         "stateless"
+    }
+
+    fn chain_id(&self) -> u64 {
+        self.chain_id()
+    }
+
+    fn expected_l2_system_address(&self) -> Address {
+        self.expected_l2_system_address
     }
 
     fn validate_blocks(

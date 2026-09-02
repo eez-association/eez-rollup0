@@ -9,7 +9,6 @@ use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use alloy_primitives::Address;
 use eyre::WrapErr as _;
 use tracing::{info, warn};
 
@@ -36,9 +35,7 @@ pub use validate::{ValidationBackend, Validator};
 pub struct ServerConfig {
     pub listen_addr: SocketAddr,
     pub limits: ServiceLimits,
-    pub chain_id: u64,
     pub expected_rollup_id: NonZeroU64,
-    pub expected_l2_system_address: Address,
     pub attester: Attester,
     pub system_transaction_key: SystemTransactionKey,
 }
@@ -52,13 +49,11 @@ pub async fn serve(
     let ServerConfig {
         listen_addr,
         limits,
-        chain_id,
         expected_rollup_id,
-        expected_l2_system_address,
         attester,
         system_transaction_key,
     } = config;
-    let validator = Validator::from_backend(backend, chain_id, expected_l2_system_address)?;
+    let validator = Validator::from_backend(backend);
     log_server_config(
         listen_addr,
         limits,

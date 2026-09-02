@@ -6,6 +6,9 @@ license.workspace      = true
 rust-version.workspace = true
 description            = "Shared EEZ proof-signer gRPC, settlement-validation, and attestation pipeline."
 
+[features]
+test-utils = []
+
 [dependencies]
 # The `prove.v1` wire this daemon serves.
 eez-control-rpc.workspace = true

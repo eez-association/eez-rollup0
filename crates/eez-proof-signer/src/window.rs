@@ -83,6 +83,7 @@ impl AdmittedBlock {
 
 /// Helpers used by validation-backend tests in downstream crates.
 #[doc(hidden)]
+#[cfg(any(test, feature = "test-utils"))]
 pub mod testing {
     use super::{AdmittedBlock, B256, ExecutionWitness};
 
