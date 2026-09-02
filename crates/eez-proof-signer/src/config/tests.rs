@@ -94,7 +94,7 @@ fn cli_parses_the_default_listen_addr() {
             max_window_blocks: NonZeroUsize::new(512).unwrap(),
             max_window_bytes: NonZeroUsize::new(512 * 1024 * 1024).unwrap(),
             max_window_witness_items: NonZeroUsize::new(1_000_000).unwrap(),
-            max_transaction_state_checkpoints: 8,
+            max_transaction_state_checkpoints: 64,
             stream_idle_timeout: Duration::from_mins(2),
             request_timeout: Duration::from_mins(10),
         })
