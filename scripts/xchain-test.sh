@@ -150,6 +150,17 @@ fund_pool(){ # <funder_key> <rpc> <amount> <key...>
     done
     for _ in $(seq 1 45); do [[ "$(cast nonce "$faddr" --rpc-url "$rpc" 2>/dev/null||echo "$n0")" -ge "$((n0+i2))" ]] && break; sleep 2; done
   done
+  # The last round's re-funding is still unverified here: the wait above only
+  # proves the funder's nonce moved, which is exactly what this function already
+  # says is not proof of payment. Rescan, or a successful final retry is reported
+  # as a failure and sends the reader chasing a funding bug that does not exist.
+  missing=()
+  for k in "${keys[@]}"; do
+    a=$(cast wallet address --private-key "$k")
+    b=$(cast balance "$a" --rpc-url "$rpc" 2>/dev/null || echo 0)
+    [[ "$(python3 -c "print(1 if ${b:-0} < $want_min else 0)")" == 1 ]] && missing+=("$k")
+  done
+  [[ "${#missing[@]}" -eq 0 ]] && { echo "    balances verified ${#keys[@]}/${#keys[@]}"; return 0; }
   echo "    ✗ ${#missing[@]} sender(s) STILL underfunded — their cross-chain txs will fail simulation"
   return 1; }
 
