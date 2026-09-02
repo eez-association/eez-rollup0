@@ -162,6 +162,17 @@ where
         let Some(tail) = self.inner.l1_head.last_indexed() else {
             return;
         };
+        // A resume seeds only this batch's hash, so an earlier batch in the same
+        // block would replay with the cursor past it; a slow boot beats a wrong one.
+        if self.inner.l1_head.count_at_l1_block(tail.l1_block) > 1 {
+            event!(
+                name: "eez.deriver.checkpoint.multi_batch_block",
+                Level::DEBUG,
+                l1_block = tail.l1_block,
+                "L1 block holds more than one indexed batch; skipping the boot checkpoint",
+            );
+            return;
+        }
         let l2_state_root = match self.l2_state_root_at(tail.last_l2_block) {
             Ok(root) => root,
             Err(err) => {
