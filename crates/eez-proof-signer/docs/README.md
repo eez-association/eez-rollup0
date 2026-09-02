@@ -15,7 +15,7 @@ of maintaining a second copy.
 | The daemon as a whole and where code belongs | [Architecture](architecture.md) |
 | Which values are submitted, computed, validated, or authorized | [Data provenance](data-provenance.md) |
 | Single-request admission, deadlines, cancellation, and shutdown | [Request lifecycle](request-lifecycle.md) |
-| What Stateless proves and what reaches settlement | [Validation evidence](validation-evidence.md) |
+| What backend evidence reaches settlement | [Validation evidence](validation-evidence.md) |
 | How a validated window becomes a signed digest | [Settlement pipeline](settlement-pipeline.md) |
 | Operator configuration and production behavior | [Operations](operations.md) |
 
@@ -27,9 +27,8 @@ changing `service/`; Operations is aimed at deployment and incident diagnosis.
 
 - **Window:** the inclusive L2 block span streamed in one `Prove` RPC.
 - **Batch:** the `PostBatch.abi_calldata` decoded as an `EvmBatch`.
-- **Stateless / stateless:** `Stateless` names the upstream witness-backed
-  validator; lowercase “stateless service” means that this daemon persists no
-  request-derived protocol state.
+- **Stateless:** the upstream witness-backed validator used by
+  `eez-prover-stateless`.
 - **Settling block:** the final block in the streamed window; its transactions
   carry the effects bound to the posted batch.
 - **Effect candidate:** a locally derived transaction-framing boundary that may
@@ -42,7 +41,7 @@ changing `service/`; Operations is aimed at deployment and incident diagnosis.
   those projections and retained user transactions.
 - **Admission:** cheap stream-shape, identity, and quota checks. Admission does
   not establish consensus or execution correctness.
-- **Validation:** Stateless/Reth re-execution plus shared backend-contract
+- **Validation:** backend re-execution plus shared backend-contract
   checks.
 - **Settlement:** gates that join the decoded batch to validated execution
   evidence and exact DA bytes.
@@ -69,14 +68,10 @@ only when one flat test file would obscure the same ownership boundary:
 
 - [`src/window/tests.rs`](../src/window/tests.rs) covers structural admission
   and quotas;
-- [`src/config/tests.rs`](../src/config/tests.rs) covers startup parsing,
-  precedence, limits, and secret redaction;
 - [`src/validate/tests.rs`](../src/validate/tests.rs) covers the backend-neutral
   backend-output contract;
-- [`src/validate/stateless/tests.rs`](../src/validate/stateless/tests.rs) covers
-  the production adapter and evidence;
-- [`src/validate/stateless/chain_config/tests.rs`](../src/validate/stateless/chain_config/tests.rs)
-  covers strict operator-configured chain-document loading;
+- [`eez-prover-stateless/src/backend/tests.rs`](../../eez-prover-stateless/src/backend/tests.rs)
+  covers witness-backed replay and evidence;
 - [`src/settlement/tests/`](../src/settlement/tests) mirrors the focused
   settlement gate modules;
 - [`src/service/tests/`](../src/service/tests) covers in-process gRPC

@@ -9,14 +9,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// block execution and at selected settlement phase boundaries so detached
 /// work stops after the request future exits.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct CancellationToken(Arc<AtomicBool>);
+pub struct CancellationToken(Arc<AtomicBool>);
 
 impl CancellationToken {
-    pub(crate) fn cancel(&self) {
+    pub fn cancel(&self) {
         self.0.store(true, Ordering::Release);
     }
 
-    pub(crate) fn is_cancelled(&self) -> bool {
+    pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
 }

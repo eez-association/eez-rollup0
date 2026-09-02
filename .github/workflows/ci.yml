@@ -170,7 +170,7 @@ jobs:
         working-directory: contracts
         run: forge build
       - name: Build proof signer (launched by harness)
-        run: cargo build -p eez-proof-signer --locked
+        run: cargo build -p eez-prover-stateless --bin eez-proof-signer --locked
       - name: Verify generated EEZL2 genesis artifacts
         run: scripts/update-eezl2-genesis.sh --check
       - name: Integration tests (e2e, serial)
@@ -225,7 +225,7 @@ jobs:
         working-directory: contracts
         run: forge build
       - name: Build proof signer (launched by harness)
-        run: cargo build -p eez-proof-signer --locked
+        run: cargo build -p eez-prover-stateless --bin eez-proof-signer --locked
       - name: Integration tests (cross-chain, serial)
         run: |
           mkdir -p artifacts/cross-chain-e2e

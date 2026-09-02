@@ -3,49 +3,48 @@
 //! Values move through explicit trust stages: Composer supplies structurally
 //! admitted blocks; this module exact-decodes and re-executes them; a consuming
 //! cross-check binds every backend result to its admitted block; only then does
-//! [`ValidatedWindow`] expose the evidence used by settlement.
-
-use std::path::Path;
+//! the validated window expose the evidence used by settlement.
 
 use alloy_primitives::B256;
+use alloy_rpc_types_debug::ExecutionWitness;
 use thiserror::Error;
 
 use crate::cancel::CancellationToken;
 use crate::window::{AdmittedBlock, AdmittedBlocks};
 
-mod stateless;
+pub mod support;
 
 type EthereumBlock = reth_ethereum_primitives::Block;
 
 /// A cumulative state root locally recomputed during successful block replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TransactionStateCheckpoint {
+pub struct TransactionStateCheckpoint {
     /// Zero-based position of the transaction within its block.
-    pub(crate) transaction_index: usize,
+    pub transaction_index: usize,
     /// State root immediately after this transaction, before post-block changes.
-    pub(crate) state_root: B256,
+    pub state_root: B256,
 }
 
 /// Successful backend output for one block before the shared consuming check.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct BackendBlockOutput {
+pub struct BackendBlockOutput {
     /// Block number exact-decoded by the backend from consensus RLP.
-    pub(crate) decoded_number: u64,
+    pub decoded_number: u64,
     /// Parent hash exact-decoded by the backend from consensus RLP.
-    pub(crate) decoded_parent_hash: B256,
+    pub decoded_parent_hash: B256,
     /// Hash computed from the exact-decoded block header.
-    pub(crate) computed_hash: B256,
+    pub computed_hash: B256,
     /// Transaction count in the exact-decoded block body.
-    pub(crate) decoded_transaction_count: usize,
+    pub decoded_transaction_count: usize,
     /// Receipt success flag for every replayed transaction, in block order.
-    pub(crate) receipt_successes: Vec<bool>,
+    pub receipt_successes: Vec<bool>,
     /// Locally computed roots at selected transaction boundaries, strictly
     /// ordered by transaction index. Non-settling blocks have no checkpoints.
-    pub(crate) transaction_state_checkpoints: Vec<TransactionStateCheckpoint>,
+    pub transaction_state_checkpoints: Vec<TransactionStateCheckpoint>,
     /// Post-state root recomputed and matched against the block header.
-    pub(crate) post_state_root: B256,
+    pub post_state_root: B256,
     /// Locally derived facts retained specifically for settlement gates.
-    pub(crate) settlement_evidence: SettlementBlockEvidence,
+    pub settlement_evidence: SettlementBlockEvidence,
 }
 
 /// Successful backend output for a contiguous block window.
@@ -53,23 +52,23 @@ pub(crate) struct BackendBlockOutput {
 /// This is not settlement-ready until the consuming cross-check binds each
 /// computed hash and transaction count to its corresponding admitted block.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct BackendWindowOutput {
+pub struct BackendWindowOutput {
     /// Validated state root from which the first block was replayed.
-    pub(crate) pre_state_root: B256,
+    pub pre_state_root: B256,
     /// One associated output per replayed block, oldest first.
-    pub(crate) blocks: Vec<BackendBlockOutput>,
+    pub blocks: Vec<BackendBlockOutput>,
 }
 
 /// Canonically decoded fields used to bind an outbound effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DecodedOutboundEvent {
+pub struct DecodedOutboundEvent {
     call_hash: B256,
     call_gas: u64,
 }
 
 impl DecodedOutboundEvent {
     /// Construct fields recovered from one canonical `EEZL2` event.
-    pub(in crate::validate) const fn new(call_hash: B256, call_gas: u64) -> Self {
+    pub const fn new(call_hash: B256, call_gas: u64) -> Self {
         Self {
             call_hash,
             call_gas,
@@ -77,14 +76,14 @@ impl DecodedOutboundEvent {
     }
 
     /// Hash emitted for the executed call.
-    pub(crate) const fn call_hash(&self) -> B256 {
+    pub const fn call_hash(&self) -> B256 {
         self.call_hash
     }
 
     /// Manager-entry gas value included in the emitted hash.
     ///
     /// This is distinct from any gas limit forwarded to the destination.
-    pub(crate) const fn call_gas(&self) -> u64 {
+    pub const fn call_gas(&self) -> u64 {
         self.call_gas
     }
 }
@@ -96,13 +95,13 @@ impl DecodedOutboundEvent {
 /// candidate lets settlement fail closed instead of silently ignoring it.
 /// Production construction is restricted to validation backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OutboundEventObservation {
+pub struct OutboundEventObservation {
     /// Zero-based transaction position within the block.
-    pub(in crate::validate) transaction_index: usize,
+    pub transaction_index: usize,
     /// Zero-based log position within that transaction's receipt.
-    pub(in crate::validate) receipt_log_index: usize,
+    pub receipt_log_index: usize,
     /// Decoded fields, when the complete event is canonical.
-    pub(in crate::validate) decoded_event: Option<DecodedOutboundEvent>,
+    pub decoded_event: Option<DecodedOutboundEvent>,
 }
 
 impl OutboundEventObservation {
@@ -154,12 +153,12 @@ impl OutboundEventObservation {
 /// Production construction is restricted to validation backends; settlement
 /// receives only immutable views.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct SettlementBlockEvidence {
+pub struct SettlementBlockEvidence {
     /// Whether each transaction's fork-aware recovered signer is the reserved
     /// system address, in exact block order.
-    pub(in crate::validate) system_sender_flags: Vec<bool>,
+    pub system_sender_flags: Vec<bool>,
     /// Outbound event candidates, in transaction and receipt-log order.
-    pub(in crate::validate) observed_outbound_events: Vec<OutboundEventObservation>,
+    pub observed_outbound_events: Vec<OutboundEventObservation>,
 }
 
 impl SettlementBlockEvidence {
@@ -361,7 +360,7 @@ struct CheckedBackendWindowOutput {
 
 /// A validation failure classified for the RPC boundary.
 #[derive(Debug, Error)]
-pub(crate) enum ValidationError {
+pub enum ValidationError {
     /// The backend rejected the input before claiming successful validation.
     #[error("{0}")]
     Rejected(String),
@@ -376,63 +375,87 @@ pub(crate) enum ValidationError {
     Cancelled,
 }
 
+/// Execution-evidence source used by the shared settlement and signing pipeline.
+/// Implementations are trusted to derive all evidence from replay.
+pub trait ValidationBackend: std::fmt::Debug + Send + Sync + 'static {
+    /// Bind common service identity exactly once before validation begins.
+    fn initialize(
+        &mut self,
+        chain_id: u64,
+        expected_l2_system_address: alloy_primitives::Address,
+    ) -> eyre::Result<()>;
+
+    /// Static identifier used only in diagnostics.
+    fn label(&self) -> &'static str;
+
+    /// Replay every admitted block and return evidence for the shared checks.
+    /// `witnesses[i]` belongs to `blocks[i]` and may be consumed by the backend.
+    fn validate_blocks(
+        &self,
+        blocks: &[AdmittedBlock],
+        witnesses: &mut [ExecutionWitness],
+        cancellation: &CancellationToken,
+    ) -> Result<BackendWindowOutput, ValidationError>;
+}
+
 /// Validation backend selected at startup.
 #[derive(Debug)]
-pub(crate) enum Validator {
-    /// In-process re-execution using each block's streamed witness.
-    Stateless(stateless::Backend),
+pub enum Validator {
+    /// A validation backend using the shared checked-evidence boundary.
+    #[non_exhaustive]
+    Backend {
+        /// Backend-specific execution-evidence acquisition.
+        backend: Box<dyn ValidationBackend>,
+        /// EIP-155 chain id supplied by the service wiring.
+        chain_id: u64,
+        /// L2 system address supplied by the service wiring.
+        expected_l2_system_address: alloy_primitives::Address,
+    },
     /// Canned responses for service-level tests.
     #[cfg(test)]
     Stub(testing::StubValidator),
 }
 
 impl Validator {
-    /// Construct the production backend from the operator-configured execution
-    /// rules. Composer never supplies this trust input.
-    pub(crate) fn stateless(
-        chain_document_path: &Path,
+    /// Bind one execution backend to the service identity.
+    pub fn from_backend(
+        mut backend: impl ValidationBackend,
+        chain_id: u64,
         expected_l2_system_address: alloy_primitives::Address,
     ) -> eyre::Result<Self> {
-        stateless::Backend::from_chain_document_file(
-            chain_document_path,
+        backend.initialize(chain_id, expected_l2_system_address)?;
+        Ok(Self::Backend {
+            backend: Box::new(backend),
+            chain_id,
             expected_l2_system_address,
-        )
-        .map(Self::Stateless)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn stateless_for_test(
-        chain_config: alloy_genesis::ChainConfig,
-        expected_l2_system_address: alloy_primitives::Address,
-    ) -> Self {
-        Self::Stateless(stateless::Backend::new(
-            chain_config,
-            expected_l2_system_address,
-        ))
+        })
     }
 
     /// Static, non-sensitive identifier for startup logs.
-    pub(crate) fn label(&self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
-            Self::Stateless(_) => "stateless",
+            Self::Backend { backend, .. } => backend.label(),
             #[cfg(test)]
             Self::Stub(_) => "stub",
         }
     }
 
     /// EIP-155 chain id from the operator-configured replay specification.
-    pub(crate) fn chain_id(&self) -> u64 {
+    pub fn chain_id(&self) -> u64 {
         match self {
-            Self::Stateless(backend) => backend.chain_id(),
+            Self::Backend { chain_id, .. } => *chain_id,
             #[cfg(test)]
             Self::Stub(_) => 1,
         }
     }
 
     /// Deployment address used by this backend to classify system transactions.
-    pub(crate) fn expected_l2_system_address(&self) -> alloy_primitives::Address {
+    pub fn expected_l2_system_address(&self) -> alloy_primitives::Address {
         match self {
-            Self::Stateless(backend) => backend.expected_l2_system_address(),
+            Self::Backend {
+                expected_l2_system_address,
+                ..
+            } => *expected_l2_system_address,
             #[cfg(test)]
             Self::Stub(backend) => backend.expected_l2_system_address,
         }
@@ -464,7 +487,11 @@ impl Validator {
         cancellation: &CancellationToken,
     ) -> Result<ValidatedWindow, ValidationError> {
         let mut blocks = blocks.into_vec();
-        let output = self.run_backend(&mut blocks, cancellation)?;
+        let mut witnesses = blocks
+            .iter_mut()
+            .map(AdmittedBlock::take_witness)
+            .collect::<Vec<_>>();
+        let output = self.run_backend(&blocks, &mut witnesses, cancellation)?;
         check_backend_window_output(blocks, output)
             .map(CheckedBackendWindowOutput::into_validated_window)
             .map_err(|error| ValidationError::InvalidBackendOutput(error.to_string()))
@@ -474,18 +501,20 @@ impl Validator {
     /// Composer-facing claims until `check_backend_window_output` consumes it.
     fn run_backend(
         &self,
-        blocks: &mut [AdmittedBlock],
+        blocks: &[AdmittedBlock],
+        witnesses: &mut [ExecutionWitness],
         cancellation: &CancellationToken,
     ) -> Result<BackendWindowOutput, ValidationError> {
         match self {
-            Self::Stateless(backend) => backend.validate_blocks(blocks, cancellation),
+            Self::Backend { backend, .. } => {
+                backend.validate_blocks(blocks, witnesses, cancellation)
+            }
             #[cfg(test)]
             Self::Stub(stub) => {
                 if cancellation.is_cancelled() {
                     return Err(ValidationError::Cancelled);
                 }
                 stub.next_response()
-                    .map_err(|error| ValidationError::Rejected(error.to_string()))
             }
         }
     }

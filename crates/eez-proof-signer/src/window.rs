@@ -28,10 +28,10 @@ use thiserror::Error;
 /// Prost made while decoding the current message; tonic's per-message limit
 /// bounds that stage. These are service defenses, not protocol bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct WindowLimits {
-    pub(crate) blocks: usize,
-    pub(crate) payload_bytes: usize,
-    pub(crate) witness_items: usize,
+pub struct WindowLimits {
+    pub blocks: usize,
+    pub payload_bytes: usize,
+    pub witness_items: usize,
 }
 
 /// One block retained after stream-level structural checks.
@@ -39,8 +39,9 @@ pub(crate) struct WindowLimits {
 /// Admission checks its declared number, hash widths, witness presence, and
 /// adjacency between streamed hash claims. Backend validation binds and checks
 /// the RLP, hashes, and witness.
+#[derive(Debug)]
 #[cfg_attr(test, derive(Clone))]
-pub(crate) struct AdmittedBlock {
+pub struct AdmittedBlock {
     /// Composer-declared number, checked against the admitted window range.
     pub(crate) declared_number: u64,
     /// Composer-claimed hash; backend validation must re-derive it from RLP.
@@ -52,6 +53,95 @@ pub(crate) struct AdmittedBlock {
     pub(crate) witness: ExecutionWitness,
 }
 
+impl AdmittedBlock {
+    /// Composer-declared block number admitted from the stream.
+    pub const fn declared_number(&self) -> u64 {
+        self.declared_number
+    }
+
+    /// Composer-claimed block hash admitted from the stream.
+    pub const fn claimed_hash(&self) -> B256 {
+        self.claimed_hash
+    }
+
+    /// Composer-claimed parent hash admitted from the stream.
+    pub const fn claimed_parent_hash(&self) -> B256 {
+        self.claimed_parent_hash
+    }
+
+    /// Exact consensus RLP admitted from the stream.
+    pub fn rlp(&self) -> &[u8] {
+        &self.rlp
+    }
+
+    /// Move the admitted execution witness into a consuming backend.
+    #[doc(hidden)]
+    pub(crate) fn take_witness(&mut self) -> ExecutionWitness {
+        std::mem::take(&mut self.witness)
+    }
+}
+
+/// Helpers used by validation-backend tests in downstream crates.
+#[doc(hidden)]
+pub mod testing {
+    use super::{AdmittedBlock, B256, ExecutionWitness};
+
+    /// Mutable admitted fields exposed only for downstream backend tests.
+    #[derive(Debug)]
+    pub struct AdmittedBlockPartsMut<'a> {
+        pub declared_number: &'a mut u64,
+        pub claimed_hash: &'a mut B256,
+        pub claimed_parent_hash: &'a mut B256,
+        pub rlp: &'a mut Vec<u8>,
+        pub witness: &'a mut ExecutionWitness,
+    }
+
+    /// Construct an admitted block without running the gRPC stream assembler.
+    pub fn admitted_block_from_consensus_rlp(
+        declared_number: u64,
+        claimed_hash: B256,
+        claimed_parent_hash: B256,
+        rlp: Vec<u8>,
+    ) -> AdmittedBlock {
+        admitted_block_with_witness(
+            declared_number,
+            claimed_hash,
+            claimed_parent_hash,
+            rlp,
+            ExecutionWitness::default(),
+        )
+    }
+
+    /// Construct an admitted block with an execution witness for backend tests.
+    pub fn admitted_block_with_witness(
+        declared_number: u64,
+        claimed_hash: B256,
+        claimed_parent_hash: B256,
+        rlp: Vec<u8>,
+        witness: ExecutionWitness,
+    ) -> AdmittedBlock {
+        AdmittedBlock {
+            declared_number,
+            claimed_hash,
+            claimed_parent_hash,
+            rlp,
+            witness,
+        }
+    }
+
+    /// Borrow all admitted fields mutably for downstream backend tests.
+    pub fn admitted_block_parts_mut(block: &mut AdmittedBlock) -> AdmittedBlockPartsMut<'_> {
+        AdmittedBlockPartsMut {
+            declared_number: &mut block.declared_number,
+            claimed_hash: &mut block.claimed_hash,
+            claimed_parent_hash: &mut block.claimed_parent_hash,
+            rlp: &mut block.rlp,
+            witness: &mut block.witness,
+        }
+    }
+}
+
+#[cfg(test)]
 impl AdmittedBlock {
     /// Construct the minimal admitted block used by downstream unit tests.
     #[cfg(test)]
@@ -104,9 +194,10 @@ impl AdmittedWindow {
 /// Nonempty block sequence produced only by an identity-checked assembler.
 ///
 /// Keeping the vector behind this private constructor prevents production
-/// callers from bypassing [`AdmittedWindow`]'s stream and identity checks when
+/// callers from bypassing the admitted window's stream and identity checks when
 /// invoking validation.
-pub(crate) struct AdmittedBlocks(Vec<AdmittedBlock>);
+#[derive(Debug)]
+pub struct AdmittedBlocks(Vec<AdmittedBlock>);
 
 impl AdmittedBlocks {
     /// Borrow the structurally admitted blocks in stream order.

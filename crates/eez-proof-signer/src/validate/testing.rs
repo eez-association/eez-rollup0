@@ -48,6 +48,7 @@ impl BackendBlockOutput {
 #[derive(Debug)]
 enum StubAction {
     Respond(Result<BackendWindowOutput, String>),
+    ValidationError(ValidationError),
     Block {
         started: oneshot::Sender<()>,
         release: mpsc::Receiver<()>,
@@ -58,37 +59,39 @@ enum StubAction {
 
 /// Canned per-call actions, served in order; a call past the end fails loudly.
 #[derive(Debug)]
-pub(crate) struct StubValidator {
+pub struct StubValidator {
     actions: Mutex<VecDeque<StubAction>>,
     pub(super) expected_l2_system_address: alloy_primitives::Address,
 }
 
 impl StubValidator {
-    pub(super) fn next_response(&self) -> eyre::Result<BackendWindowOutput> {
-        let action = self
-            .actions
-            .lock()
-            .unwrap()
-            .pop_front()
-            .ok_or_else(|| eyre::eyre!("stub validator ran out of canned actions"))?;
+    pub(super) fn next_response(&self) -> Result<BackendWindowOutput, ValidationError> {
+        let action = self.actions.lock().unwrap().pop_front().ok_or_else(|| {
+            ValidationError::InternalInvariant(
+                "stub validator ran out of canned actions".to_owned(),
+            )
+        })?;
         let response = match action {
             StubAction::Respond(response) => response,
+            StubAction::ValidationError(error) => return Err(error),
             StubAction::Block {
                 started,
                 release,
                 response,
             } => {
                 let _ = started.send(());
-                release
-                    .recv()
-                    .map_err(|_| eyre::eyre!("blocking stub release sender was dropped"))?;
+                release.recv().map_err(|_| {
+                    ValidationError::InternalInvariant(
+                        "blocking stub release sender was dropped".to_owned(),
+                    )
+                })?;
                 response
             }
             StubAction::Panic => panic!("stub validator panicked"),
         };
         match response {
             Ok(output) => Ok(output),
-            Err(reason) => Err(eyre::eyre!("{reason}")),
+            Err(reason) => Err(ValidationError::Rejected(reason)),
         }
     }
 }
@@ -98,6 +101,14 @@ impl Validator {
     pub(crate) fn stub(responses: Vec<Result<BackendWindowOutput, String>>) -> Self {
         Self::Stub(StubValidator {
             actions: Mutex::new(responses.into_iter().map(StubAction::Respond).collect()),
+            expected_l2_system_address: crate::testkit::TEST_SYSTEM_ADDRESS,
+        })
+    }
+
+    /// A stub returning one classified validation failure.
+    pub(crate) fn stub_validation_error(error: ValidationError) -> Self {
+        Self::Stub(StubValidator {
+            actions: Mutex::new([StubAction::ValidationError(error)].into()),
             expected_l2_system_address: crate::testkit::TEST_SYSTEM_ADDRESS,
         })
     }
@@ -150,7 +161,9 @@ impl Validator {
     pub(crate) fn stub_remaining(&self) -> usize {
         match self {
             Self::Stub(stub) => stub.actions.lock().unwrap().len(),
-            Self::Stateless(_) => panic!("stub_remaining called on the stateless backend"),
+            Self::Backend { .. } => {
+                panic!("stub_remaining called on a production backend")
+            }
         }
     }
 }
