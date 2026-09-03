@@ -6,10 +6,9 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::Filter;
-use alloy_sol_types::{SolCall, SolEvent};
+use alloy_sol_types::SolEvent;
 use eez_protocol::abi::{
     BatchPosted, L2ExecutionPerformed, ProofSystemBatchPerVerificationEntriesSol,
-    postAndVerifyBatchCall,
 };
 use tracing::{Level, event};
 
@@ -350,7 +349,11 @@ pub(crate) async fn scan_batch_logs_range(
         // `BatchPosted` carries rollupCount, not rollupId, so we decode every
         // rollup's batch — and a peer posting via a router yields undecodable
         // input. Skip unless it settled OUR rollup (invariant 8).
-        let decoded = match postAndVerifyBatchCall::abi_decode(input) {
+        // A peer can post through a ROUTER: the top-level selector is the
+        // router's, with the real `postAndVerifyBatch` calldata forwarded
+        // verbatim as a `bytes` arg. Decode through that wrapper so a routed
+        // batch that DID settle our rollup still derives (invariant 1).
+        let decoded = match eez_protocol::entries::decode_postbatch_input(input) {
             Ok(decoded) => decoded,
             Err(e) if !winner_tx_hashes.contains(&(l1_block_hash, tx_hash)) => {
                 event!(
@@ -372,7 +375,7 @@ pub(crate) async fn scan_batch_logs_range(
             data: log.data().clone(),
         })
         .map_err(|e| L1Error::Decode(format!("decode BatchPosted({tx_hash}): {e}")))?;
-        let (claimed_current_state, claimed_chain) = our_state_chain(&decoded.batch, rollup_id);
+        let (claimed_current_state, claimed_chain) = our_state_chain(&decoded, rollup_id);
         decoded_batches.push(DecodedBatchLog {
             l1_block_number,
             l1_block_hash,
@@ -382,11 +385,10 @@ pub(crate) async fn scan_batch_logs_range(
             // A batch verifies (and therefore wipes) our rollup iff it lists it
             // — the same array `postAndVerifyBatch` loops over to mark verified.
             verifies_our_rollup: decoded
-                .batch
                 .rollupIdsWithProofSystems
                 .iter()
                 .any(|r| r.rollupId == rollup_id),
-            call_data: decoded.batch.callData,
+            call_data: decoded.callData,
             post_batch_input: input.clone(),
             claimed_current_state,
             claimed_chain,

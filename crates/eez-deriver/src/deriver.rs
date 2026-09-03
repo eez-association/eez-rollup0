@@ -1416,22 +1416,20 @@ where
                     // re-fetch by tx hash here — that lookup fails on a pruned
                     // or still-resyncing embedded L1 and crashed boot catch_up
                     // on restart-after-post.
-                    use alloy_sol_types::SolCall as _;
-                    let call =
-                        eez_protocol::abi::postAndVerifyBatchCall::abi_decode(&post_batch_input)
-                            .map_err(|e| {
-                                DeriverError::l2_provider(format!(
-                                    "decode postBatch({tx_hash}): {e}"
-                                ))
-                            })?;
+                    // Wrapped-aware: a peer may post through a router, so the
+                    // captured input's top-level selector can be the router's.
+                    let batch = eez_protocol::entries::decode_postbatch_input(&post_batch_input)
+                        .map_err(|e| {
+                            DeriverError::l2_provider(format!("decode postBatch({tx_hash}): {e}"))
+                        })?;
                     event!(
                         name: "eez.deriver.reconcile.fallback_entries",
                         Level::INFO,
                         tx_hash = %tx_hash,
-                        entries = call.batch.entries.len(),
+                        entries = batch.entries.len(),
                         "decoding scanned on-chain postBatch entries (codec v1 fallback)",
                     );
-                    call.batch.entries
+                    batch.entries
                 } else {
                     use alloy_sol_types::SolValue as _;
                     let mut out = Vec::with_capacity(decoded.l2_entries.len());

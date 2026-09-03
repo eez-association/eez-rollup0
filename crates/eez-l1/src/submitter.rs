@@ -264,6 +264,28 @@ impl Inner {
         pin_timestamp: Option<u64>,
         expected_final_state: Option<alloy_primitives::B256>,
     ) -> L1Result<SendOutcome> {
+        // Catch-up fast path. An unpinned target (`BundleTarget::NextBlock`,
+        // hence `pin_timestamp == None`) carrying a LONE postBatch needs
+        // neither the timestamp pin nor bundle atomicity, so the relay buys
+        // nothing here — and can cost everything: a builder that only proposes
+        // slots it holds a bundle for leaves the tx private to that builder,
+        // never in the public mempool, so a builder that stops proposing
+        // stalls the settlement backlog indefinitely. The mempool is included
+        // by whichever payload source wins the slot. Live slots are grid-bound
+        // (`Exact`, pinned) and multi-tx bundles need ordered atomicity, so
+        // both keep the relay path below.
+        if pin_timestamp.is_none() && raw_txs.len() == 1 {
+            event!(
+                name: "eez.submitter.bundle.mempool_direct",
+                Level::INFO,
+                target_block,
+                "catch-up postBatch: submitting via mempool (unpinned, no atomicity needed)",
+            );
+            self.submit_via_mempool(raw_txs).await?;
+            return self
+                .observe(post_batch_hash, target_block, None, expected_final_state)
+                .await;
+        }
         let hexes: Vec<String> = raw_txs
             .iter()
             .map(|t| hex::encode_prefixed(t.as_ref()))
@@ -309,32 +331,7 @@ impl Inner {
                         "relay has no eth_sendBundle; submitting the lone postBatch via mempool",
                     );
                 }
-                let target_provider = self.build_target_provider();
-                for (idx, raw) in raw_txs.iter().enumerate() {
-                    if let Err(err) = alloy_provider::Provider::send_raw_transaction(
-                        &target_provider,
-                        raw.as_ref(),
-                    )
-                    .await
-                    {
-                        // postBatch rejection is fatal for the slot;
-                        // a rejected user_tx (stale nonce after a
-                        // re-push) is logged and skipped — the rest of
-                        // the submission stands on its own.
-                        if idx == 0 {
-                            return Err(L1Error::Submission(format!(
-                                "mempool fallback: postBatch rejected: {err}"
-                            )));
-                        }
-                        event!(
-                            name: "eez.submitter.mempool.user_tx_rejected",
-                            Level::WARN,
-                            tx_idx = idx,
-                            error = %err,
-                            "mempool fallback: user_tx rejected; continuing without it",
-                        );
-                    }
-                }
+                self.submit_via_mempool(raw_txs).await?;
                 // No bundle API, no timestamp pin: these txs can genuinely land
                 // in a later block, so the conservative rule is the only one.
                 self.observe(post_batch_hash, target_block, None, expected_final_state)
@@ -342,6 +339,34 @@ impl Inner {
             }
             Err(other) => Err(other),
         }
+    }
+
+    /// Submit `raw_txs` to the L1 mempool in order (postBatch first).
+    ///
+    /// postBatch rejection is fatal for the slot; a rejected user_tx (stale
+    /// nonce after a re-push) is logged and skipped — the rest of the
+    /// submission stands on its own.
+    async fn submit_via_mempool(&self, raw_txs: &[alloy_primitives::Bytes]) -> L1Result<()> {
+        let target_provider = self.build_target_provider();
+        for (idx, raw) in raw_txs.iter().enumerate() {
+            if let Err(err) =
+                alloy_provider::Provider::send_raw_transaction(&target_provider, raw.as_ref()).await
+            {
+                if idx == 0 {
+                    return Err(L1Error::Submission(format!(
+                        "mempool fallback: postBatch rejected: {err}"
+                    )));
+                }
+                event!(
+                    name: "eez.submitter.mempool.user_tx_rejected",
+                    Level::WARN,
+                    tx_idx = idx,
+                    error = %err,
+                    "mempool fallback: user_tx rejected; continuing without it",
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Bundle observation, transport-agnostic: poll for the postBatch

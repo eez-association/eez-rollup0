@@ -594,6 +594,70 @@ pub fn decode_postbatch(calldata: &[u8]) -> alloy_sol_types::Result<EvmBatch> {
     Ok(postAndVerifyBatchCall::abi_decode(calldata)?.batch)
 }
 
+/// Decode a batch from a top-level L1 tx `input` that a peer may have posted
+/// through a ROUTER.
+///
+/// A competing composer can post via an intermediary contract (router /
+/// multicall / batch-poster): the tx targets that contract with its OWN
+/// selector and carries the real `postAndVerifyBatch` calldata verbatim as a
+/// `bytes` argument. EEZ still emits `BatchPosted` + `L2ExecutionPerformed`,
+/// so such a batch can settle our rollup — and then derivation must
+/// reconstruct from it (invariant 1: L1 is canonical). Matching only the
+/// top-level selector rejects it and stalls the chain.
+///
+/// Tries a direct decode, then the first embedded occurrence of the
+/// `postAndVerifyBatch` selector that decodes cleanly. Propagates the direct
+/// error when nothing decodes, so a genuinely foreign call still reports the
+/// selector mismatch.
+pub fn decode_postbatch_input(input: &[u8]) -> alloy_sol_types::Result<EvmBatch> {
+    let direct = decode_postbatch(input);
+    if direct.is_ok() {
+        return direct;
+    }
+    let selector = postAndVerifyBatchCall::SELECTOR;
+    let mut from = 0usize;
+    while let Some(pos) = input
+        .get(from..)
+        .and_then(|tail| tail.windows(selector.len()).position(|w| w == selector))
+    {
+        let at = from + pos;
+        if let Some(batch) = decode_postbatch_at(input, at) {
+            return Ok(batch);
+        }
+        from = at + 1;
+    }
+    direct
+}
+
+/// Decode an embedded `postAndVerifyBatch` call starting at `at`.
+///
+/// Prefers the exactly-sized slice when the preceding 32-byte word is a
+/// plausible ABI `bytes` length: a router pads the forwarded call up to a
+/// 32-byte boundary, and that trailing padding can fail a strict decode.
+fn decode_postbatch_at(input: &[u8], at: usize) -> Option<EvmBatch> {
+    if at >= 32 {
+        let word = &input[at - 32..at];
+        if word[..24].iter().all(|b| *b == 0) {
+            let len = u64::from_be_bytes(word[24..].try_into().ok()?) as usize;
+            if len >= selector_len() {
+                if let Some(end) = at.checked_add(len) {
+                    if end <= input.len() {
+                        if let Ok(batch) = decode_postbatch(&input[at..end]) {
+                            return Some(batch);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    decode_postbatch(input.get(at..)?).ok()
+}
+
+/// Length of an ABI function selector.
+const fn selector_len() -> usize {
+    4
+}
+
 fn supported_return_data(call: &ExecutedAction) -> ProtocolResult<&[u8]> {
     if call.outcome.is_pending() {
         return Err(crate::ProtocolErrorKind::InvalidEncoding(
@@ -996,5 +1060,47 @@ mod tests {
         let encoded = encode_postbatch(&batch);
         assert_eq!(&encoded[..4], &postAndVerifyBatchCall::SELECTOR);
         assert_eq!(decode_postbatch(&encoded).unwrap().entries.len(), 0);
+    }
+
+    /// Wrap `inner` the way a router does: its own selector, a head word
+    /// pointing at the `bytes` arg, the length, then the 32-byte-padded call.
+    fn wrap_in_router(inner: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0x6f, 0xad, 0xcf, 0x72]); // arbitrary router selector
+        out.extend_from_slice(&U256::from(32).to_be_bytes::<32>()); // offset to bytes
+        out.extend_from_slice(&U256::from(inner.len()).to_be_bytes::<32>());
+        out.extend_from_slice(inner);
+        out.resize(out.len() + (32 - inner.len() % 32) % 32, 0); // tail padding
+        out
+    }
+
+    #[test]
+    fn decodes_postbatch_posted_through_a_router() {
+        // A peer posting via a router must still derive: the top-level
+        // selector is the router's, the real call rides as a `bytes` arg.
+        let mut batch = EvmBatch::default();
+        batch.immediateEntryCount = U256::from(1);
+        let inner = encode_postbatch(&batch);
+        let wrapped = wrap_in_router(&inner);
+
+        assert_ne!(&wrapped[..4], &postAndVerifyBatchCall::SELECTOR);
+        assert!(decode_postbatch(&wrapped).is_err(), "direct decode must fail");
+        assert_eq!(
+            decode_postbatch_input(&wrapped).unwrap().immediateEntryCount,
+            U256::from(1),
+        );
+        // The unwrapped form still works through the same entry point.
+        assert_eq!(
+            decode_postbatch_input(&inner).unwrap().immediateEntryCount,
+            U256::from(1),
+        );
+    }
+
+    #[test]
+    fn rejects_calldata_with_no_postbatch_inside() {
+        // A genuinely foreign call reports the selector mismatch rather than
+        // silently returning an empty batch.
+        let foreign = [vec![0x6f, 0xad, 0xcf, 0x72], vec![0u8; 128]].concat();
+        assert!(decode_postbatch_input(&foreign).is_err());
     }
 }
