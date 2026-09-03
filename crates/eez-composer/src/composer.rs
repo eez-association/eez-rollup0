@@ -69,6 +69,8 @@ pub struct CrossChainExecCtx {
     /// `EEZL2` address, where SYSTEM_ADDRESS calls both
     /// `loadExecutionTable` and `executeIncomingCrossChainCall`.
     pub eezl2_address: Address,
+    /// Deployed L1 EEZ registry used for escrow reads and postBatch calls.
+    pub eez_registry_address: Address,
     /// L2 chain id for EIP-155 signing.
     pub l2_chain_id: u64,
     /// L2 system tx gas_price (legacy). 1 gwei is plenty above
@@ -289,7 +291,7 @@ pub const MAX_BUNDLE_ATTEMPTS: u32 = 3;
 /// Stand-in for `proofs[0]` when sizing before the prover runs (ECDSA is 65 B).
 const MAX_PROOF_BYTES: usize = 128;
 
-/// Ceiling on a postBatch's gas limit (`EEZ_MAX_POSTBATCH_GAS` overrides): the
+/// Ceiling on a postBatch's gas limit: the
 /// EIP-7825 per-tx cap, above which no tx is valid at any block gas limit.
 const DEFAULT_MAX_POSTBATCH_GAS: u64 = 16_777_216;
 
@@ -453,20 +455,29 @@ struct EmissionLimits {
     max_gas: u64,
 }
 
+/// Runtime bounds for one Composer instance.
+#[derive(Debug, Clone, Copy)]
+pub struct ComposerLimits {
+    pub max_blocks_per_batch: u64,
+    pub max_postbatch_gas: u64,
+    pub max_user_txs_per_bundle: usize,
+}
+
+impl Default for ComposerLimits {
+    fn default() -> Self {
+        Self {
+            max_blocks_per_batch: MAX_BLOCKS_PER_BATCH,
+            max_postbatch_gas: DEFAULT_MAX_POSTBATCH_GAS,
+            max_user_txs_per_bundle: 50,
+        }
+    }
+}
+
 impl EmissionLimits {
-    fn from_env(timing: RollupTiming) -> Self {
-        // Absent, malformed, and zero all mean "unset" — fall back to the default.
-        let read_var = |var: &str| {
-            std::env::var(var)
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|&n| n > 0)
-        };
+    fn new(timing: RollupTiming, limits: ComposerLimits) -> Self {
         let k = u64::from(timing.k());
-        let requested_blocks = read_var("EEZ_MAX_BLOCKS_PER_BATCH");
-        let requested_gas = read_var("EEZ_MAX_POSTBATCH_GAS");
-        let max_blocks = grid_aligned_cap(requested_blocks.unwrap_or(MAX_BLOCKS_PER_BATCH), k);
-        let max_gas = clamp_max_postbatch_gas(requested_gas.unwrap_or(DEFAULT_MAX_POSTBATCH_GAS));
+        let max_blocks = grid_aligned_cap(limits.max_blocks_per_batch, k);
+        let max_gas = clamp_max_postbatch_gas(limits.max_postbatch_gas);
         // The one place the effective bounds are visible, adjusted or not.
         event!(
             name: "eez.composer.emission.limits",
@@ -474,8 +485,8 @@ impl EmissionLimits {
             max_blocks,
             max_gas,
             k,
-            requested_blocks = ?requested_blocks,
-            requested_gas = ?requested_gas,
+            requested_blocks = limits.max_blocks_per_batch,
+            requested_gas = limits.max_postbatch_gas,
             "emission bounds: at most {max_blocks} blocks and {max_gas} gas per postBatch",
         );
         Self {
@@ -637,7 +648,7 @@ fn clamp_max_postbatch_gas(requested: u64) -> u64 {
         requested,
         clamped_to = DEFAULT_MAX_POSTBATCH_GAS,
         min_viable = MIN_VIABLE_POSTBATCH_GAS,
-        "EEZ_MAX_POSTBATCH_GAS is out of range (must leave room for the drain margin plus one held tx, and stay within the EIP-7825 tx gas cap) — clamping to the default",
+        "configured max_postbatch_gas is out of range (must leave room for the drain margin plus one held tx, and stay within the EIP-7825 tx gas cap) — clamping to the default",
     );
     DEFAULT_MAX_POSTBATCH_GAS
 }
@@ -685,11 +696,11 @@ alloy_sol_types::sol! {
 /// L1-confirmed escrow (`rollups(rid).etherBalance`) an outbound withdrawal draws
 /// down. `None` on any read failure, so the caller skips this early rejection;
 /// the on-chain escrow check remains authoritative.
-async fn read_rollup_escrow(provider: &alloy_provider::RootProvider, rid: u64) -> Option<U256> {
-    let eez = std::env::var("EEZ_REGISTRY_ADDRESS")
-        .ok()?
-        .parse::<Address>()
-        .ok()?;
+async fn read_rollup_escrow(
+    provider: &alloy_provider::RootProvider,
+    eez: Address,
+    rid: u64,
+) -> Option<U256> {
     IEEZReader::new(eez, provider)
         .rollups(rid)
         .call()
@@ -924,6 +935,8 @@ pub enum ComposerConfigError {
         /// Account signing the `postAndVerifyBatch` transaction.
         post_batch_signer: Address,
     },
+    #[error("max_user_txs_per_bundle must be >= 1")]
+    EmptyBundleLimit,
 }
 
 fn ensure_submission_identity(
@@ -963,6 +976,8 @@ struct Inner<L2: BlockReader> {
     /// the emission decision, the boundary math, and the span guard in
     /// `prepare_post_batch_raw` can never disagree about the cap mid-run.
     emission: EmissionLimits,
+    /// Maximum number of held user transactions attempted in one L1 bundle.
+    max_user_txs_per_bundle: usize,
 }
 
 impl<L2: BlockReader> std::fmt::Debug for Composer<L2> {
@@ -994,11 +1009,15 @@ where
         committer: BlockCommitterHandle<EthEngineTypes>,
         witness_source: Option<Arc<dyn eez_prover::ProvingWitnessSource>>,
         timing: RollupTiming,
+        limits: ComposerLimits,
     ) -> Result<Self, ComposerConfigError> {
         let submitter = cross_chain.exec_ctx.submitter.clone();
         let submitter_poster = submitter.poster_address();
         let post_batch_signer = cross_chain.exec_ctx.l1_poster_signer.address();
         ensure_submission_identity(submitter_poster, post_batch_signer)?;
+        if limits.max_user_txs_per_bundle == 0 {
+            return Err(ComposerConfigError::EmptyBundleLimit);
+        }
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -1009,7 +1028,8 @@ where
                 cross_chain,
                 committer,
                 witness_source,
-                emission: EmissionLimits::from_env(timing),
+                emission: EmissionLimits::new(timing, limits),
+                max_user_txs_per_bundle: limits.max_user_txs_per_bundle,
             }),
         })
     }
@@ -1404,12 +1424,7 @@ where
         // Caps how many held transactions one bundle attempts and therefore how
         // many an atomic-relay drop re-queues. L1 block gas remains the hard
         // protocol constraint, so deployments may need a lower cap.
-        let max_user_txs = std::env::var("EEZ_MAX_USER_TXS_PER_BUNDLE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(50);
-        let drained = pool.pop_n(max_user_txs);
+        let drained = pool.pop_n(self.inner.max_user_txs_per_bundle);
         // When the pool is empty, do not return early. This slot attempts a
         // minimal postBatch whose leading immediate entry advances L1's stored
         // root to the empty Sync block's final state root. Without it, L1's view
@@ -2086,8 +2101,12 @@ where
                     // the debit happens at accept below.
                     if need > U256::ZERO {
                         if escrow_remaining.is_none() {
-                            escrow_remaining =
-                                read_rollup_escrow(&ctx.l1_provider, rollup_id).await;
+                            escrow_remaining = read_rollup_escrow(
+                                &ctx.l1_provider,
+                                ctx.eez_registry_address,
+                                rollup_id,
+                            )
+                            .await;
                         }
                         if let Some(avail) = escrow_remaining
                             && need > avail
@@ -4089,17 +4108,10 @@ where
             "postBatch anchors: currentState at cursor, claimed final at Sync block",
         );
 
-        // Read the deployment-specific EEZ registry address from the
-        // environment and reject missing or malformed values.
-        let eez_address = std::env::var("EEZ_REGISTRY_ADDRESS")
-            .ok()
-            .and_then(|s| s.parse::<Address>().ok())
-            .ok_or("EEZ_REGISTRY_ADDRESS missing or not a valid address")?;
-
         Ok(sign_post_batch_tx(
             &ctx.l1_poster_signer,
             &ctx.l1_provider,
-            eez_address,
+            ctx.eez_registry_address,
             calldata,
             ctx.l1_chain_id,
             ctx.l1_post_batch_priority_fee,
@@ -4284,7 +4296,7 @@ async fn sign_post_batch_tx(
     let floor_gas = calldata_floor_gas(&calldata);
     if floor_gas > max_gas {
         return Err(format!(
-            "postBatch calldata floor {floor_gas} exceeds EEZ_MAX_POSTBATCH_GAS {max_gas} \
+            "postBatch calldata floor {floor_gas} exceeds max_postbatch_gas {max_gas} \
              ({} calldata bytes); refusing emission — bounded chunks cover the range",
             calldata.len(),
         ));

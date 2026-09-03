@@ -13,8 +13,8 @@
 # Config (see README):
 #   .env         — deploy inputs: EEZ_L1_RPC_URL (a TIP chiado RPC), keys,
 #                  optionally EEZ_BLOCKSCOUT_URL.
-#   .env.chiado  — docker host paths + funded keys + bundler URL. Consumed by
-#                  `docker compose --env-file .env.chiado`.
+#   .env.chiado  — docker host paths + funded keys + bundler URL. On first run
+#                  these inputs render the eez-composer config file.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO"
 COMPOSE=(docker compose --env-file .env.chiado -f docker-compose.chiado-node.yml)
@@ -29,6 +29,7 @@ for v in L1_SNAPSHOT_DIR JWT_FILE CHIADO_CONFIG_DIR; do
 done
 : "${L2_DATA_DIR:?set L2_DATA_DIR in .env.chiado}"
 : "${LIGHTHOUSE_DATA:?set LIGHTHOUSE_DATA in .env.chiado}"
+: "${EEZ_COMPOSER_CONFIG:?set EEZ_COMPOSER_CONFIG in .env.chiado}"
 
 # ── 1. Deploy the protocol ─────────────────────────────────────────────
 if [[ -f deployments.env ]]; then
@@ -41,6 +42,61 @@ else
 fi
 set -a; source deployments.env; set +a
 : "${EEZ_REGISTRY_ADDRESS:?deploy did not write EEZ_REGISTRY_ADDRESS}"
+
+if [[ ! -f "$EEZ_COMPOSER_CONFIG" ]]; then
+    echo "    rendering $EEZ_COMPOSER_CONFIG"
+    mkdir -p "$(dirname "$EEZ_COMPOSER_CONFIG")"
+    (
+      umask 077
+      cat > "$EEZ_COMPOSER_CONFIG" <<EOF
+l2_system_key = "$EEZ_L2_SYSTEM_KEY"
+expect_external_batches = true
+max_speculative_depth = 0
+
+[l1]
+rpc_url = "http://127.0.0.1:18645"
+chain_id = 10200
+registry_address = "$EEZ_REGISTRY_ADDRESS"
+registry_deploy_block = $EEZ_REGISTRY_DEPLOY_BLOCK
+rollup_id = $EEZ_ROLLUP_ID
+
+[timing]
+l1_block_time_ms = 5000
+l2_block_time_ms = 1000
+proof_time_ms = ${EEZ_PROOF_TIME_MS:-2500}
+submission_slack_ms = ${EEZ_SUBMISSION_SLACK_MS:-1300}
+
+[prover]
+url = "http://127.0.0.1:${EEZ_SIGNER_PORT:-50061}"
+attester_address = "$EEZ_ATTESTER_ADDRESS"
+
+[submission]
+builder_rpc_url = "$EEZ_L1_BUILDER_RPC_URL"
+poster_key = "$EEZ_L1_POSTER_KEY"
+proof_system_address = "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS"
+
+[cross_chain]
+l1_port = 18999
+l2_port = 18998
+
+[embedded_l1]
+kind = "chiado"
+datadir = "/l1"
+http_port = 18645
+auth_port = ${L1_AUTH_PORT:-18551}
+p2p_port = 30544
+jwt_secret = "/jwt/jwt.hex"
+
+[limits]
+max_user_txs_per_bundle = ${EEZ_MAX_USER_TXS_PER_BUNDLE:-3}
+EOF
+    )
+    if [[ -n "${EEZ_L1_TARGET_RPC_URL:-}" ]]; then
+        sed -i.bak "/^poster_key/i\\
+target_rpc_url = \"$EEZ_L1_TARGET_RPC_URL\"" "$EEZ_COMPOSER_CONFIG"
+        rm -f "$EEZ_COMPOSER_CONFIG.bak"
+    fi
+fi
 
 # ── 2. Prepare datadirs ─────────────────────────────────────────────────
 echo "==> [2/5] preparing datadirs"

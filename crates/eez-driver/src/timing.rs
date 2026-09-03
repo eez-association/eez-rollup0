@@ -36,8 +36,6 @@
 //! | chiado      | 5 000   | 1 000   | 200   | 1 700 | 5 | 1      | 3    | 3 000        |
 //! | chiado-slow | 4 000   | 2 000   | 1 500 | 100   | 2 | 0      | 1    | 2 000        |
 
-use std::env;
-use std::num::ParseIntError;
 use std::time::Duration;
 
 use crate::error::{DriverError, DriverResult};
@@ -49,24 +47,17 @@ use crate::error::{DriverError, DriverResult};
 pub const MAX_BLOCKS_PER_CATCHUP: u64 = 300;
 
 /// Cap on one postBatch's SETTLEMENT range, where [`MAX_BLOCKS_PER_CATCHUP`] caps
-/// production. `EEZ_MAX_BLOCKS_PER_BATCH` overrides it, rounded down to a multiple
-/// of K. A chunk shrinks no further than K blocks, so calldata heavier than
-/// `EEZ_MAX_POSTBATCH_GAS` allows over K blocks cannot settle at any cap.
+/// production. The Composer can lower it, rounded down to a multiple of K. A
+/// chunk shrinks no further than K blocks, so calldata heavier than the
+/// configured postBatch gas bound allows over K blocks cannot settle.
 pub const MAX_BLOCKS_PER_BATCH: u64 = MAX_BLOCKS_PER_CATCHUP;
-
-const ENV_L1_BLOCK_TIME_MS: &str = "EEZ_L1_BLOCK_TIME_MS";
-const ENV_L2_BLOCK_TIME_MS: &str = "EEZ_L2_BLOCK_TIME_MS";
-const ENV_PROOF_TIME_MS: &str = "EEZ_PROOF_TIME_MS";
-const ENV_SUBMISSION_SLACK_MS: &str = "EEZ_SUBMISSION_SLACK_MS";
-
-const DEFAULT_SUBMISSION_SLACK_MS: u32 = 100;
 
 /// Per-rollup timing configuration. Cheap `Copy` value type (four
 /// `u32` fields).
 //
 // `_ms` postfixes are intentional: each field carries milliseconds at
-// the raw-arithmetic layer (env parsing + integer validation in
-// `validate()`). The `Duration` accessors below — `l1_block_time()`,
+// the raw-arithmetic layer (integer validation in `validate()`). The
+// `Duration` accessors below — `l1_block_time()`,
 // `l2_block_time()`, etc — are the typed view. Dropping `_ms` would
 // lose the unit at the integer boundary and is more confusing than the
 // repetition is worth.
@@ -81,8 +72,7 @@ pub struct RollupTiming {
 
 impl RollupTiming {
     /// Construct from raw values. Does not validate — call
-    /// [`Self::validate`] before relying on derived methods, or use
-    /// [`Self::from_env`] which validates as part of loading.
+    /// [`Self::validate`] before relying on derived methods.
     #[must_use]
     pub const fn new(
         l1_block_time_ms: u32,
@@ -96,26 +86,6 @@ impl RollupTiming {
             proof_time_ms,
             submission_slack_ms,
         }
-    }
-
-    /// Read fields from `EEZ_L1_BLOCK_TIME_MS`, `EEZ_L2_BLOCK_TIME_MS`,
-    /// `EEZ_PROOF_TIME_MS`, `EEZ_SUBMISSION_SLACK_MS` (the slack
-    /// defaults to 100 ms if unset). Runs [`Self::validate`] on the
-    /// result.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DriverError`] for any missing required variable, malformed
-    /// value, or validation failure.
-    pub fn from_env() -> DriverResult<Self> {
-        let t = Self::new(
-            parse_env(ENV_L1_BLOCK_TIME_MS)?,
-            parse_env(ENV_L2_BLOCK_TIME_MS)?,
-            parse_env(ENV_PROOF_TIME_MS)?,
-            parse_env_or(ENV_SUBMISSION_SLACK_MS, DEFAULT_SUBMISSION_SLACK_MS)?,
-        );
-        t.validate()?;
-        Ok(t)
     }
 
     /// Verify the invariants from §5.4.4. Hard error on violation;
@@ -342,25 +312,6 @@ pub enum SlotComposition {
     /// blocks + 1 Sync block (always implicit when this variant is
     /// returned).
     Slot { live: u64, future: u64 },
-}
-
-fn parse_env(name: &str) -> DriverResult<u32> {
-    let raw =
-        env::var(name).map_err(|_| DriverError::timing_config(format!("{name} is required")))?;
-    raw.parse::<u32>()
-        .map_err(|e: ParseIntError| DriverError::timing_config(format!("{name}: {e}")))
-}
-
-fn parse_env_or(name: &str, default: u32) -> DriverResult<u32> {
-    match env::var(name) {
-        Ok(v) => v
-            .parse::<u32>()
-            .map_err(|e: ParseIntError| DriverError::timing_config(format!("{name}: {e}"))),
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(env::VarError::NotUnicode(_)) => Err(DriverError::timing_config(format!(
-            "{name} contains non-UTF-8 bytes"
-        ))),
-    }
 }
 
 #[cfg(test)]

@@ -1,9 +1,9 @@
 # Packaged chiado stack: eez-node (embedded chiado L1 + L2 + composer),
 # eez-proof-signer, and lighthouse (drives the embedded L1). Single-L1
 # topology — no standalone
-# tip-follower reth: the bundle target-block oracle falls back to the
-# embedded L1 (EEZ_L1_TARGET_RPC_URL unset), which tracks the canonical
-# tip in steady state. The one-time protocol deploy is done against an
+# tip-follower reth: the Composer config omits submission.target_rpc_url, so
+# the target-block oracle falls back to the embedded L1, which tracks the
+# canonical tip in steady state. The one-time protocol deploy is done against an
 # external chiado RPC before `up` (see README / scripts/devnet-test.sh).
 #
 # Prereqs (one-time, see README):
@@ -63,80 +63,15 @@ services:
     depends_on:
       eez-proof-signer:
         condition: service_healthy
-    # Public deployment bindings come from the generated file. Private node
-    # inputs are mapped explicitly below so the attestation key is never
-    # injected into this container.
-    env_file:
-      - ./deployments.env
+    # All eez-composer settings, including deployment bindings, come from one
+    # role-specific file. Only the standard tracing filter remains an env var.
     environment:
-      EEZ_L1_POSTER_KEY: "${EEZ_L1_POSTER_KEY:?set EEZ_L1_POSTER_KEY}"
-      EEZ_L1_BUILDER_RPC_URL: "${EEZ_L1_BUILDER_RPC_URL:?set EEZ_L1_BUILDER_RPC_URL}"
-      EEZ_L2_SYSTEM_KEY: "${EEZ_L2_SYSTEM_KEY:?set EEZ_L2_SYSTEM_KEY}"
-      EEZ_PROVER_URL: http://127.0.0.1:${EEZ_SIGNER_PORT:-50061}
-      EEZ_WITNESS_DB_PATH: /l2/witnesses
-      # Embedded chiado L1 (reth_gnosis) — single L1 for the whole node.
-      EEZ_L1_CHAIN: chiado
-      EEZ_L1_CHAIN_ID: "10200"
-      EEZ_L1_HTTP_PORT: "18645"
-      # Embedded-L1 engine-API port. Override (L1_AUTH_PORT) if the host
-      # already runs a reth on 18551 (e.g. a standalone chiado-reth).
-      EEZ_L1_AUTH_PORT: "${L1_AUTH_PORT:-18551}"
-      EEZ_L1_P2P_PORT: "30544"
-      EEZ_L1_DATADIR: /l1
-      EEZ_L1_JWT_SECRET: /jwt/jwt.hex
-      EEZ_L1_RPC_URL: http://127.0.0.1:18645
-      # Forwarded but empty by default - the bundle
-      # target-block oracle falls back to the embedded L1. Set it in
-      # .env.chiado
-      EEZ_L1_TARGET_RPC_URL: "${EEZ_L1_TARGET_RPC_URL:-}"
-      # Without this the embedded L1 falls back to the persisted
-      # known-peers.json, which fills with cross-network noise and
-      # leaves it on 0 peers, unable to backfill.
-      EEZ_L1_TRUSTED_PEERS: "${EEZ_L1_TRUSTED_PEERS:-}"
-      EEZ_L1_ROLLUP_ID: "0"
-      # Cross-chain wiring.
-      EEZL2_ADDRESS: "0x4200000000000000000000000000000000000007"
-      EEZ_CROSS_CHAIN_SOURCE_CHAIN_IDS: "10200"
-      # L2 RPC — outbound front upstream + composer L2 reads.
-      EEZ_L2_RPC_URL: http://127.0.0.1:18688
-      # Transparent cross-chain ingress fronts (both required in composer mode).
-      # Send L1→L2 (Inbound) txs to :18999, L2→L1 (Outbound) txs to :18998; every
-      # other eth_* is transparently forwarded to the matching source-chain RPC.
-      EEZ_L1_XCHAIN_PORT: "18999"
-      EEZ_L2_XCHAIN_PORT: "18998"
-      # Lower than the in-code default (50) because the whole bundle
-      # [postBatch, user_tx...] has to fit a 17M chiado block, not the 60M a
-      # devnet L1 gives: 9M cap + 12 * 400k = 13.8M.
-      EEZ_MAX_USER_TXS_PER_BUNDLE: "${EEZ_MAX_USER_TXS_PER_BUNDLE:-12}"
-      # Emission + reorg bounds documented in .env.example. eez-node reads these
-      # from the process env, and this service takes no env_file beyond
-      # deployments.env, so they have to be forwarded explicitly. Defaults track
-      # the in-code ones (composer.rs, timing.rs, l1_watcher.rs).
-      EEZ_MAX_BLOCKS_PER_BATCH: "${EEZ_MAX_BLOCKS_PER_BATCH:-300}"
-      EEZ_MAX_POSTBATCH_GAS: "${EEZ_MAX_POSTBATCH_GAS:-16777216}"
-      EEZ_L1_REORG_MAX_DEPTH_BLOCKS: "${EEZ_L1_REORG_MAX_DEPTH_BLOCKS:-62}"
-      # Deterministic L1-anchored timings (must match any follower).
-      EEZ_L1_BLOCK_TIME_MS: "5000"
-      EEZ_L2_BLOCK_TIME_MS: "1000"
-      # Reserve time for remote stateless validation. The 2500ms proof budget
-      # plus 1300ms slack stays within the 4000ms schedulable L2 window — if
-      # either is raised, keep their sum at or below 4000ms.
-      EEZ_PROOF_TIME_MS: "${EEZ_PROOF_TIME_MS:-2500}"
-      EEZ_SUBMISSION_SLACK_MS: "${EEZ_SUBMISSION_SLACK_MS:-1300}"
-      # Don't freeze the sequencer when chiado bundles are slow to land.
-      EEZ_MAX_SPECULATIVE_DEPTH: "0"
-      # Multi-composer: tolerate + adopt batches posted by the competing
-      # composer instead of erroring "someone else is sequencing".
-      EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES: "true"
-      # L2.
-      EEZ_L2_DATADIR: /l2
-      EEZ_L2_GENESIS_PATH: /app/genesis.json
-      # EEZ_INITIAL_STATE_ROOT comes from deployments.env (deploy.sh writes it,
-      # matched to the genesis alloc) — the mounted genesis must produce that root.
+      RUST_LOG: "${EEZ_NODE_RUST_LOG:-info}"
     volumes:
       - ${L1_SNAPSHOT_DIR:?set L1_SNAPSHOT_DIR (reth download target)}:/l1
       - ${L2_DATA_DIR:?set L2_DATA_DIR}:/l2
       - ${JWT_FILE:?set JWT_FILE}:/jwt/jwt.hex:ro
+      - ${EEZ_COMPOSER_CONFIG:?set EEZ_COMPOSER_CONFIG}:/app/eez-composer.toml:ro
       # Fresh-timestamp L2 genesis overriding the (stale) baked one, so the
       # L1-anchored scheduler starts near grid-height 0 instead of racing
       # millions of blocks. Root is timestamp-independent (matches the
@@ -146,6 +81,7 @@ services:
       - node
       - --chain=/app/genesis.json
       - --datadir=/l2
+      - --eez.config=/app/eez-composer.toml
       - --http
       - --http.addr=0.0.0.0
       - --http.port=18688

@@ -94,10 +94,10 @@ rollup, deploys the L1 bridge contracts, and writes **`deployments.env`**
 The deploy derives the public L2 system address from `EEZ_L2_SYSTEM_KEY`,
 generates and funds its canonical EEZL2 genesis, and registers that exact state
 root; the private key is never written to `deployments.env`. It also writes the
-L2 **`datadir/genesis.json`** whose timestamp is pinned to the deploy block. The
-container loads `deployments.env` automatically; `.env.chiado`'s
-`FRESH_GENESIS` points at that genesis (default `./datadir/genesis.json`), so
-**deploy must run before `up`** — there is no separate genesis-creation step.
+L2 **`datadir/genesis.json`** whose timestamp is pinned to the deploy block.
+`.env.chiado`'s `FRESH_GENESIS` points at that genesis (default
+`./datadir/genesis.json`), so **deploy must run before `up`** — there is no
+separate genesis-creation step.
 (Set `EEZ_BLOCKSCOUT_URL` first to also verify the contracts on Blockscout —
 opt-in.)
 
@@ -107,6 +107,11 @@ opt-in.)
 cp .env.chiado.example .env.chiado    # host paths + funded keys + bundler URL
 docker compose --env-file .env.chiado -f docker-compose.chiado-node.yml up
 ```
+
+The one-command `scripts/chiado-up.sh` path writes `EEZ_COMPOSER_CONFIG` on its
+first run after deployment. For a manual launch, copy
+`eez-composer.example.toml`, fill the deployment addresses and secrets, and set
+`EEZ_COMPOSER_CONFIG` to that file. Keep it private: it contains signing keys.
 
 The embedded L1 checkpoint-syncs (lighthouse, ~5 min) and catches up past the
 deploy block; then the L2 sequencer + composer run. Health checks:
@@ -128,11 +133,11 @@ cast block-number --rpc-url http://localhost:18688   # L2 producing
 The two **cross-chain ingress fronts** are transparent proxies:
 `eth_sendRawTransaction` sent to a front is held and composed into the next Sync
 block; every other `eth_*` is forwarded to that front's source-chain RPC. They
-use the compose env `EEZ_L1_XCHAIN_PORT` / `EEZ_L2_XCHAIN_PORT`; both ports are
-required by `eez-composer`. The `eez-follower` binary does not start cross-chain
-ingress fronts. Upstreams are `EEZ_L1_RPC_URL` / `EEZ_L2_RPC_URL` respectively.
+use `cross_chain.l1_port` / `cross_chain.l2_port` in the Composer config. The
+`eez-follower` binary does not start cross-chain ingress fronts. The L1 upstream
+is `l1.rpc_url`; the L2 upstream is the Composer's local reth HTTP endpoint.
 
-`EEZ_MAX_USER_TXS_PER_BUNDLE` (compose, default `3`) caps how many user
+`limits.max_user_txs_per_bundle` (default `50`) caps how many user
 cross-chain txs ride in one `postBatch` bundle. Raise it only against a builder
 proven to include larger bundles atomically — rbuilder-chiado silently drops the
 excess beyond ~3, which is lost tx inclusion, so measure before bumping.
@@ -166,24 +171,25 @@ raw-RPC — kept for reference.)
 `eez-composer` is the package default. Run it directly, or use `make run-node`:
 
 ```bash
+cp eez-composer.example.toml eez-composer.toml
+# Fill only the values used by this Composer.
 cargo run -p eez-node -- node \
-  --chain "$EEZ_L2_GENESIS_PATH" \
-  --datadir "$EEZ_L2_DATADIR"
+  --chain ./datadir/genesis.json \
+  --datadir ./data/eez-l2 \
+  --eez.config ./eez-composer.toml
 ```
 
-Select the non-default follower role explicitly. `EEZ_L1_CHAIN_ID` must match
-the numeric chain ID served by `EEZ_L1_RPC_URL`. A follower also requires the
-system signer and L2 execution identity so it can reconstruct Sync blocks:
+Select the non-default follower role explicitly. `l1.chain_id` must match the
+numeric chain ID served by `l1.rpc_url`. A follower also requires the system
+signer so it can reconstruct Sync blocks:
 
 ```bash
-# L1-derived follower; optionally add `--sequencer-rpc <URL>` after `node`.
-EEZ_L1_CHAIN_ID="<numeric-l1-chain-id>" \
-EEZ_L2_SYSTEM_KEY="<system-private-key>" \
-EEZL2_ADDRESS="<eezl2-contract-address>" \
-EEZ_ROLLUP_ID="<numeric-rollup-id>" \
+cp eez-follower.example.toml eez-follower.toml
+# Add sequencer_rpc to the TOML only when the unsafe-head overlay is wanted.
 cargo run -p eez-follower -- node \
-  --chain "$EEZ_L2_GENESIS_PATH" \
-  --datadir "$EEZ_L2_DATADIR"
+  --chain ./datadir/genesis.json \
+  --datadir ./data/eez-follower \
+  --eez.config ./eez-follower.toml
 ```
 
 ## Build, test, teardown

@@ -6,6 +6,7 @@ use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
 use reth_node_builder::{NodeBuilder, WithLaunchContext};
 use tracing::{Level, event};
 
+pub mod config;
 mod payload;
 pub use payload::EezPayloadBuilder;
 mod pool;
@@ -19,10 +20,6 @@ static GLOBAL: MiMalloc = MiMalloc;
 pub type L2NodeBuilder =
     WithLaunchContext<NodeBuilder<reth_db::DatabaseEnv, reth_chainspec::ChainSpec>>;
 
-/// Composer nodes have no role-specific CLI arguments.
-#[derive(clap::Args, Debug, Clone)]
-pub struct NoRoleArgs {}
-
 /// Parse the shared reth CLI and layer role-specific arguments on top.
 ///
 /// # Errors
@@ -32,9 +29,6 @@ pub fn node_cli<Ext>() -> eyre::Result<Cli<EthereumChainSpecParser, Ext>>
 where
     Ext: clap::Args + std::fmt::Debug,
 {
-    let _ = dotenvy::dotenv();
-    let _ = dotenvy::from_filename("deployments.env");
-
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         // SAFETY: set during single-threaded startup before any other thread is spawned.
         unsafe {
@@ -56,40 +50,19 @@ where
     Ok(Cli::<EthereumChainSpecParser, Ext>::try_parse_from(argv)?)
 }
 
-/// Warn about obsolete runtime role selectors now replaced by explicit binaries.
-pub fn warn_on_deprecated_env() {
-    for name in [
-        "EEZ_COMPOSER_INTERVAL_SECS",
-        "EEZ_SEQUENCER_DISABLED",
-        "EEZ_COMPOSER_DISABLED",
-    ] {
-        if std::env::var_os(name).is_some() {
-            event!(
-                name: "eez.node.env.deprecated",
-                Level::WARN,
-                env = name,
-                "env var is ignored; select the node role with the eez-composer or eez-follower executable."
-            );
-        }
-    }
-}
-
 /// Select the L2 datadir used for the deriver's boot checkpoint.
 ///
 /// A missing or unusable directory disables checkpoint persistence for this
 /// process, avoiding a failed write after every settled batch.
 #[must_use]
-pub fn read_checkpoint_dir() -> Option<std::path::PathBuf> {
-    let dir = std::env::var("EEZ_L2_DATADIR")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .filter(|dir| dir.is_dir());
+pub fn checkpoint_dir(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = path.is_dir().then(|| path.to_path_buf());
     if dir.is_none() {
         event!(
             name: "eez.node.checkpoint.disabled",
             Level::INFO,
-            configured = ?std::env::var("EEZ_L2_DATADIR").ok(),
-            "no usable EEZ_L2_DATADIR; boot will rescan L1 from the deploy block",
+            configured = %path.display(),
+            "L2 datadir is not usable for checkpoints; boot will rescan L1 from the deploy block",
         );
     }
     dir
@@ -124,7 +97,7 @@ pub async fn wait_for_l1_ready(
             match l1_reader.chain_id().await {
                 Ok(actual) if actual != expected_l1_chain_id => {
                     return Err(eyre::eyre!(
-                        "EEZ_L1_RPC_URL serves chain {actual}, expected {expected_l1_chain_id}"
+                        "configured L1 RPC serves chain {actual}, expected {expected_l1_chain_id}"
                     ));
                 }
                 Ok(_) => chain_verified = true,

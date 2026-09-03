@@ -1,0 +1,41 @@
+# Copy to eez-composer.toml and replace every CHANGE_ME value.
+l2_system_key = "0xCHANGE_ME"
+expect_external_batches = true
+max_speculative_depth = 0
+
+[l1]
+rpc_url = "http://127.0.0.1:18645"
+chain_id = 10200
+registry_address = "0xCHANGE_ME"
+registry_deploy_block = 0
+rollup_id = 1
+
+[timing]
+l1_block_time_ms = 5000
+l2_block_time_ms = 1000
+proof_time_ms = 2500
+submission_slack_ms = 1300
+
+[prover]
+url = "http://127.0.0.1:50061"
+attester_address = "0xCHANGE_ME"
+
+[submission]
+builder_rpc_url = "https://CHANGE_ME"
+poster_key = "0xCHANGE_ME"
+proof_system_address = "0xCHANGE_ME"
+
+[cross_chain]
+l1_port = 18999
+l2_port = 18998
+
+[embedded_l1]
+kind = "chiado"
+datadir = "/l1"
+http_port = 18645
+auth_port = 18551
+p2p_port = 30544
+jwt_secret = "/jwt/jwt.hex"
+
+[limits]
+max_user_txs_per_bundle = 3

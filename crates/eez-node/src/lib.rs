@@ -6,30 +6,27 @@
 //! batch submission (Composer umbrella).
 //!
 mod bundle_rpc;
+pub mod config;
 mod ingress;
 mod l1_embedded;
 mod witness_source;
 
-use std::{collections::HashMap, env, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use alloy_primitives::{Address, B256};
-use alloy_provider::Provider as _;
-use alloy_signer_local::PrivateKeySigner;
+use alloy_primitives::B256;
 use eez_composer::composer::CrossChainWiring;
 use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
 use eez_deriver::Deriver;
 use eez_driver::{
-    BlockCommitterHandle, DEFAULT_MAX_SPECULATIVE_DEPTH, EthAttributesBuilder, RollupTiming,
-    Sequencer, SyncSlotComposerHandle, spawn_l1_anchored,
+    BlockCommitterHandle, EthAttributesBuilder, Sequencer, SyncSlotComposerHandle,
+    spawn_l1_anchored,
 };
-use eez_l1::{
-    L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
-};
+use eez_l1::{L1CanonicalHead, L1HeadStream, L1Watcher, Submitter, SubmitterConfig};
 use eez_node_common::{
-    EezPayloadBuilder, EezPoolBuilder, L2NodeBuilder, NoRoleArgs, node_cli, read_checkpoint_dir,
-    wait_for_l1_ready, warn_on_deprecated_env,
+    EezPayloadBuilder, EezPoolBuilder, L2NodeBuilder, checkpoint_dir,
+    config::{ConfigArgs, load},
+    node_cli, wait_for_l1_ready,
 };
-use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_builder::components::BasicPayloadServiceBuilder;
 use reth_node_ethereum::EthereumNode;
 use tokio::sync::mpsc;
@@ -40,31 +37,8 @@ const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// ~15 min at the capped backoff: outlasts a restarting L1, but a permanently
 /// refused RPC call still surfaces as an exit.
 const BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES: u32 = 32;
-const L1_CHAIN_ID_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const L2_SYSTEM_TX_GAS_PRICE: u128 = 1_000_000_000;
 const L2_SYSTEM_TX_GAS_LIMIT: u64 = 2_000_000;
-
-/// Witness-capture resources selected by the mandatory composer prover.
-enum WitnessCapture {
-    Remote {
-        sender: mpsc::UnboundedSender<B256>,
-        receiver: mpsc::UnboundedReceiver<B256>,
-        store: witness_source::WitnessStore,
-    },
-}
-
-struct ComposerProving {
-    prover: Arc<dyn eez_prover::Prover>,
-    witness_capture: WitnessCapture,
-}
-
-impl WitnessCapture {
-    fn sender(&self) -> mpsc::UnboundedSender<B256> {
-        match self {
-            Self::Remote { sender, .. } => sender.clone(),
-        }
-    }
-}
 
 /// Embedded L1 reth handle — owned by `main` for the node lifetime so
 /// the L1 stays alive (drop tears it down). Generic over both variants'
@@ -82,59 +56,42 @@ enum EmbeddedL1<Ethereum, Chiado> {
 
 /// Launch a production composer node.
 pub fn run_composer() -> eyre::Result<()> {
-    node_cli::<NoRoleArgs>()?.run(launch_composer)
-}
-
-fn composer_proving_from_env() -> eyre::Result<ComposerProving> {
-    let url = env::var("EEZ_PROVER_URL")
-        .map_err(|_| eyre::eyre!("EEZ_PROVER_URL is required for composer proving"))?;
-    if url.trim().is_empty() {
-        return Err(eyre::eyre!("EEZ_PROVER_URL must not be empty"));
-    }
-    let attester = env::var("EEZ_ATTESTER_ADDRESS")
-        .map_err(|_| eyre::eyre!("EEZ_ATTESTER_ADDRESS is required for composer proving"))?;
-    let attester =
-        Address::from_str(attester.trim()).map_err(|e| eyre::eyre!("EEZ_ATTESTER_ADDRESS: {e}"))?;
-    let (sender, receiver) = mpsc::unbounded_channel::<B256>();
-    let witness_db_path =
-        env::var("EEZ_WITNESS_DB_PATH").unwrap_or_else(|_| "eez-witnesses".to_owned());
-    let store = witness_source::new_store(std::path::Path::new(&witness_db_path))?;
-    event!(
-        name: "eez.node.witness_store.opened",
-        Level::INFO,
-        path = %witness_db_path,
-        "persistent witness store opened",
-    );
-    Ok(ComposerProving {
-        prover: Arc::new(eez_prover_client::RemoteProver::new(url, attester)),
-        witness_capture: WitnessCapture::Remote {
-            sender,
-            receiver,
-            store,
-        },
-    })
+    node_cli::<ConfigArgs>()?.run(launch_composer)
 }
 
 #[allow(clippy::too_many_lines)]
-async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Result<()> {
+async fn launch_composer(builder: L2NodeBuilder, ext: ConfigArgs) -> eyre::Result<()> {
+    let config: config::Config = load(&ext.eez_config_path)?;
+    config.validate()?;
+    let timing = config.timing.build()?;
+    let system_signer = config.l2_system_key.signer()?;
+    let system_address = system_signer.address();
+    let poster_signer = config.submission.poster_key.signer()?;
+    let embedded_l1_config = config.embedded_l1.build()?;
+    let l2_datadir = builder.config().datadir().data_dir().to_path_buf();
+    eyre::ensure!(builder.config().rpc.http, "Composer requires reth HTTP RPC");
+    let l2_rpc_url = format!("http://127.0.0.1:{}", builder.config().rpc.http_port);
+
+    let witness_db_path = l2_datadir.join("witnesses");
+    let (witness_sender, witness_receiver) = mpsc::unbounded_channel::<B256>();
+    let witness_store = witness_source::new_store(&witness_db_path)?;
+    let prover: Arc<dyn eez_prover::Prover> = Arc::new(eez_prover_client::RemoteProver::new(
+        config.prover.url.to_string(),
+        config.prover.attester_address,
+    ));
+    event!(
+        name: "eez.node.witness_store.opened",
+        Level::INFO,
+        path = %witness_db_path.display(),
+        "persistent witness store opened",
+    );
     event!(
         name: "eez.node.launching",
         Level::INFO,
         mode = "composer",
+        config = %ext.eez_config_path.display(),
         "launching eez composer",
     );
-
-    warn_on_deprecated_env();
-    // Fail before launching either reth if no usable prover is configured.
-    let ComposerProving {
-        prover,
-        witness_capture,
-    } = composer_proving_from_env()?;
-    let system_key = env::var("EEZ_L2_SYSTEM_KEY")
-        .map_err(|_| eyre::eyre!("EEZ_L2_SYSTEM_KEY required in composer mode"))?;
-    let system_signer =
-        PrivateKeySigner::from_bytes(&B256::from_str(system_key.trim_start_matches("0x"))?)?;
-    let system_address = system_signer.address();
     // Launch the embedded L1 reth first in composer mode — its
     // `StateProviderFactory` backs `LocalChainClient::new_entry` for
     // L1 source-tx simulation. Inline (not in `l1_embedded.rs`)
@@ -154,7 +111,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     // alloy-Header bound. Returns an `EmbeddedL1` owning the NodeHandle so
     // the L1 outlives the node.
     let embedded_l1: EmbeddedL1<_, _> = {
-        let l1_cfg = build_embedded_l1_config()?;
+        let l1_cfg = embedded_l1_config;
         match l1_cfg.kind {
             l1_embedded::L1ChainKind::Devnet => {
                 let node_cfg = l1_embedded::build_devnet_node_config(&l1_cfg)?;
@@ -281,30 +238,31 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     // (only in follower/composer modes).
     let l1_head = Arc::new(L1CanonicalHead::default());
 
-    let timing = RollupTiming::from_env()?;
-
     let attributes = EthAttributesBuilder::new(chain_spec.clone());
 
     let block_committer = BlockCommitterHandle::spawn_from_provider(
         &provider,
         beacon_engine_handle,
         payload_builder_handle,
-        Some(witness_capture.sender()),
+        Some(witness_sender),
     )?;
-    let depth = env::var("EEZ_MAX_SPECULATIVE_DEPTH")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_MAX_SPECULATIVE_DEPTH);
 
-    let submitter_config = SubmitterConfig::from_env()?;
+    let submitter_config = SubmitterConfig {
+        reader: config.l1.reader(),
+        builder_rpc_url: config.submission.builder_rpc_url.clone(),
+        target_rpc_url: config.submission.target_rpc_url.clone(),
+        poster: poster_signer.clone(),
+    };
     let deploy_block = submitter_config.reader.deploy_block;
-    let rollup_config = RollupConfig::from_env()?;
-    let l1_watcher_config = L1WatcherConfig::from_env()?;
+    let rollup_config = RollupConfig {
+        rollup_id: config.l1.rollup_id,
+        expect_external_batches: config.expect_external_batches,
+    };
 
     let submitter = Submitter::new(submitter_config);
     // Handle only — polling starts after boot catch-up fixes the
     // seed and every consumer has subscribed.
-    let l1_watcher = L1Watcher::new(l1_watcher_config);
+    let l1_watcher = L1Watcher::new(config.l1.watcher());
 
     // Build the Composer and Sequencer around the same binary-owned
     // BlockCommitter handle. The Deriver receives another clone below, so all
@@ -340,21 +298,9 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         use eez_protocol::rollup_id::RollupId;
         use eez_protocol::{ProxyLookupConfig, TargetConfig};
 
-        let eez_registry: Address =
-            Address::from_str(&env::var("EEZ_REGISTRY_ADDRESS").map_err(|_| {
-                eyre::eyre!(
-                    "EEZ_REGISTRY_ADDRESS required for the cross-chain composer (set by deploy.sh)"
-                )
-            })?)?;
-
-        let eezl2_address: Address =
-            Address::from_str(&env::var("EEZL2_ADDRESS").map_err(|_| {
-                eyre::eyre!(
-                    "EEZL2_ADDRESS required for the cross-chain composer (set by deploy.sh)"
-                )
-            })?)?;
-        let l1_rollup_id_u64 = read_l1_rollup_id()?;
-        let l1_rollup_id = RollupId(l1_rollup_id_u64);
+        let eez_registry = config.l1.registry_address;
+        let eezl2_address = eez_protocol::EEZL2_ADDRESS;
+        let l1_rollup_id = RollupId(0);
         let l2_rollup_id_typed = RollupId(rollup_id);
 
         // L1 entry differs per kind: Devnet/Testing use the native
@@ -440,16 +386,15 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
 
         let mut wired_rollups = std::collections::HashMap::new();
         wired_rollups.insert(l1_rollup_id, (entry_client_view, entry_cfg));
-        // A colliding id would silently overwrite the L1 entry
-        // registration (EEZ_L1_ROLLUP_ID defaults to 0).
+        // A colliding id would silently overwrite the fixed L1 source entry.
         if wired_rollups
             .insert(l2_rollup_id_typed, (l2_follower_view, l2_follower_cfg))
             .is_some()
         {
             return Err(eyre::eyre!(
-                "duplicate rollup id {l2_rollup_id_typed}: EEZ_ROLLUP_ID collides \
-                     with EEZ_L1_ROLLUP_ID; the L2 follower registration would \
-                     overwrite the L1 entry"
+                "duplicate rollup id {l2_rollup_id_typed}: L2 rollup id collides \
+                     with the fixed L1 source rollup id; the L2 follower \
+                     registration would overwrite the L1 entry"
             ));
         }
         // CrossChainExecCtx: signer + L2 addresses needed to wrap
@@ -459,38 +404,10 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         // both are tied to embedded L1 mode.
         // Submission RPC for postBatch and inbound source-chain reads.
         // This can differ from the embedded L1 used for local source
-        // simulation (the E2E harness deliberately uses Anvil here), so
-        // derive the signing chain ID from this provider rather than the
-        // embedded chain spec.
-        let l1_rpc_url: reqwest::Url = env::var("EEZ_L1_RPC_URL")
-            .map_err(|_| eyre::eyre!("EEZ_L1_RPC_URL required for L1 forwarding"))?
-            .parse()
-            .map_err(|e| eyre::eyre!("EEZ_L1_RPC_URL malformed: {e}"))?;
+        // simulation (the E2E harness deliberately uses Anvil here), so use
+        // the chain ID paired with this provider in the L1 config.
+        let l1_rpc_url = config.l1.rpc_url.clone();
         let l1_provider = alloy_provider::RootProvider::new_http(l1_rpc_url.clone());
-        let l1_submission_chain_id =
-            tokio::time::timeout(L1_CHAIN_ID_READ_TIMEOUT, l1_provider.get_chain_id())
-                .await
-                .map_err(|_| eyre::eyre!("timed out reading chain id from EEZ_L1_RPC_URL"))?
-                .map_err(|e| eyre::eyre!("read chain id from EEZ_L1_RPC_URL: {e}"))?;
-        let l1_poster_key = env::var("EEZ_L1_POSTER_KEY")
-            .map_err(|_| eyre::eyre!("EEZ_L1_POSTER_KEY required for L1 postBatch signing"))?;
-        let l1_poster_signer =
-            PrivateKeySigner::from_bytes(&B256::from_str(l1_poster_key.trim_start_matches("0x"))?)?;
-        let ecdsa_proof_system_address: Address =
-            Address::from_str(&env::var("EEZ_ECDSA_PROOF_SYSTEM_ADDRESS").map_err(|_| {
-                eyre::eyre!(
-                    "EEZ_ECDSA_PROOF_SYSTEM_ADDRESS required for L1 postBatch \
-                         proofSystems[0]"
-                )
-            })?)?;
-        // 10 gwei comfortably exceeds the smoke user_tx's
-        // 2-gwei priority fee, so dev-reth's payload builder
-        // orders postBatch ahead of the user_tx within the
-        // L1 block.
-        let l1_post_batch_priority_fee: u128 = env::var("EEZ_L1_POSTBATCH_PRIORITY_FEE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10_000_000_000);
         // One submission path everywhere: the composer always
         // routes `[postBatch, user_tx_1, …]` through the shared
         // Submitter. The Submitter owns the transport decision —
@@ -500,20 +417,21 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         let exec_ctx = Arc::new(eez_composer::CrossChainExecCtx {
             system_signer,
             eezl2_address,
+            eez_registry_address: eez_registry,
             l2_chain_id: chain_spec.chain().id(),
             l2_gas_price: L2_SYSTEM_TX_GAS_PRICE,
             l2_gas_limit: L2_SYSTEM_TX_GAS_LIMIT,
             l1_provider,
             submitter: submitter.clone(),
-            l1_poster_signer,
-            l1_chain_id: l1_submission_chain_id,
-            l1_post_batch_priority_fee,
-            ecdsa_proof_system_address,
+            l1_poster_signer: poster_signer,
+            l1_chain_id: config.l1.chain_id,
+            l1_post_batch_priority_fee: config.submission.priority_fee,
+            ecdsa_proof_system_address: config.submission.proof_system_address,
         });
         event!(
             name: "eez.node.evm_composer.ready",
             Level::INFO,
-            l1_rollup_id = l1_rollup_id_u64,
+            l1_rollup_id = l1_rollup_id.0,
             l2_rollup_id = rollup_id,
             eez_registry = %eez_registry,
             %eezl2_address,
@@ -548,36 +466,31 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         // composer's witness source with its store. Capturing at commit (parent
         // state still fresh) is why this works on a non-archival node. Spawned
         // before `evm_config` is moved into `Composer::new` below.
-        let witness_source = match witness_capture {
-            WitnessCapture::Remote {
-                receiver: rx,
-                store,
-                ..
-            } => {
-                let cap_provider = provider.clone();
-                let cap_evm = evm_config.clone();
-                let ws_provider = provider.clone();
-                let ws_evm = evm_config.clone();
-                let cap_store = Arc::clone(&store);
-                // Purge floor = L1-FINALIZED height (a reorg could un-settle a posted batch).
-                let cap_l1_head = Arc::clone(&l1_head);
-                task_executor.spawn_critical_task("eez-witness-capture", async move {
-                    witness_source::run_capture(rx, cap_store, cap_provider, cap_evm, move || {
-                        cap_l1_head.finalized_l2()
-                    })
-                    .await;
-                });
-                // Hybrid: read the store, else re-exec on demand the newest block
-                // the async capture hasn't drained yet (state still retained; fast
-                // for near-empty blocks).
-                Some(Arc::new(witness_source::NodeWitnessSource::new(
-                    store,
-                    ws_provider,
-                    ws_evm,
-                ))
-                    as Arc<dyn eez_prover::ProvingWitnessSource>)
-            }
-        };
+        let cap_provider = provider.clone();
+        let cap_evm = evm_config.clone();
+        let ws_provider = provider.clone();
+        let ws_evm = evm_config.clone();
+        let cap_store = Arc::clone(&witness_store);
+        // Purge floor = L1-FINALIZED height (a reorg could un-settle a posted batch).
+        let cap_l1_head = Arc::clone(&l1_head);
+        task_executor.spawn_critical_task("eez-witness-capture", async move {
+            witness_source::run_capture(
+                witness_receiver,
+                cap_store,
+                cap_provider,
+                cap_evm,
+                move || cap_l1_head.finalized_l2(),
+            )
+            .await;
+        });
+        // Hybrid: read the store, else re-exec on demand the newest block
+        // the async capture hasn't drained yet (state still retained; fast
+        // for near-empty blocks).
+        let witness_source = Some(Arc::new(witness_source::NodeWitnessSource::new(
+            witness_store,
+            ws_provider,
+            ws_evm,
+        )) as Arc<dyn eez_prover::ProvingWitnessSource>);
         let composer = Composer::new(
             rollups,
             prover,
@@ -586,6 +499,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             block_committer.clone(),
             witness_source,
             timing,
+            config.limits.into(),
         )?;
         let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
 
@@ -601,7 +515,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             timing,
             rollup_id,
             sync_slot_handle,
-            depth,
+            config.max_speculative_depth,
             Arc::clone(&l1_head),
         );
         (
@@ -617,9 +531,28 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     // Resolve both required fronts now. Their upstream chain-id checks run
     // after the L1 readiness gate so the ports can bind while L1 catches up.
     let mut xchain_fronts = Vec::new();
-    for spec in xchain_front_specs(l1_source_chain_id, l2_source_chain_id) {
-        let (port, url, parsed) = read_xchain_front_config(spec.port_env, spec.url_env)?;
-        let validation_provider = alloy_provider::RootProvider::new_http(parsed);
+    let front_configs = [
+        (
+            XchainFrontSpec {
+                direction: eez_composer::Direction::Inbound,
+                task: "eez-l1-xchain-front",
+                expected_source_chain_id: l1_source_chain_id,
+            },
+            config.cross_chain.l1_port,
+            config.l1.rpc_url.to_string(),
+        ),
+        (
+            XchainFrontSpec {
+                direction: eez_composer::Direction::Outbound,
+                task: "eez-l2-xchain-front",
+                expected_source_chain_id: l2_source_chain_id,
+            },
+            config.cross_chain.l2_port,
+            l2_rpc_url,
+        ),
+    ];
+    for (spec, port, url) in front_configs {
+        let validation_provider = alloy_provider::RootProvider::new_http(url.parse()?);
         xchain_fronts.push((spec, port, url, validation_provider));
     }
 
@@ -636,7 +569,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         deploy_block,
         Arc::clone(&l1_head),
         Some(system_tx_cfg),
-        read_checkpoint_dir(),
+        checkpoint_dir(&l2_datadir),
     );
 
     // Bind before the L1 wait so port checks see a live front. Submissions are
@@ -761,244 +694,9 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     handle.wait_for_node_exit().await
 }
 
-/// Read the L1 rollup id from env. Defaults to `0` to match the bridge
-/// E2E fixture's `MAINNET_ROLLUP_ID` only when the variable is absent.
-fn read_l1_rollup_id() -> eyre::Result<u64> {
-    match env::var("EEZ_L1_ROLLUP_ID") {
-        Ok(raw) => parse_l1_rollup_id(Some(&raw)),
-        Err(env::VarError::NotPresent) => parse_l1_rollup_id(None),
-        Err(env::VarError::NotUnicode(_)) => {
-            Err(eyre::eyre!("EEZ_L1_ROLLUP_ID contains non-UTF-8 bytes"))
-        }
-    }
-}
-
-fn parse_l1_rollup_id(raw: Option<&str>) -> eyre::Result<u64> {
-    let Some(raw) = raw else {
-        return Ok(0);
-    };
-    raw.trim()
-        .parse::<u64>()
-        .map_err(|e| eyre::eyre!("EEZ_L1_ROLLUP_ID={raw:?} malformed: {e}"))
-}
-
 #[derive(Debug, Clone, Copy)]
 struct XchainFrontSpec {
-    port_env: &'static str,
-    url_env: &'static str,
     direction: eez_composer::Direction,
     task: &'static str,
     expected_source_chain_id: u64,
-}
-
-fn xchain_front_specs(l1_chain_id: u64, l2_chain_id: u64) -> [XchainFrontSpec; 2] {
-    [
-        XchainFrontSpec {
-            port_env: "EEZ_L1_XCHAIN_PORT",
-            url_env: "EEZ_L1_RPC_URL",
-            direction: eez_composer::Direction::Inbound,
-            task: "eez-l1-xchain-front",
-            expected_source_chain_id: l1_chain_id,
-        },
-        XchainFrontSpec {
-            port_env: "EEZ_L2_XCHAIN_PORT",
-            url_env: "EEZ_L2_RPC_URL",
-            direction: eez_composer::Direction::Outbound,
-            task: "eez-l2-xchain-front",
-            expected_source_chain_id: l2_chain_id,
-        },
-    ]
-}
-
-fn read_xchain_front_config(
-    port_env: &str,
-    url_env: &str,
-) -> eyre::Result<(u16, String, reqwest::Url)> {
-    let port = match env::var(port_env) {
-        Ok(value) => Some(value),
-        Err(env::VarError::NotPresent) => None,
-        Err(err) => return Err(eyre::eyre!("{port_env} is not valid unicode: {err}")),
-    };
-    let url = match env::var(url_env) {
-        Ok(value) => Some(value),
-        Err(env::VarError::NotPresent) => None,
-        Err(err) => return Err(eyre::eyre!("{url_env} is not valid unicode: {err}")),
-    };
-    parse_xchain_front_config(port_env, url_env, port.as_deref(), url.as_deref())
-}
-
-fn parse_xchain_front_config(
-    port_env: &str,
-    url_env: &str,
-    port: Option<&str>,
-    url: Option<&str>,
-) -> eyre::Result<(u16, String, reqwest::Url)> {
-    let port_raw = port.ok_or_else(|| eyre::eyre!("{port_env} is required in composer mode"))?;
-    let port = port_raw
-        .parse::<u16>()
-        .map_err(|err| eyre::eyre!("{port_env}={port_raw:?} malformed: {err}"))?;
-    let Some(url_raw) = url else {
-        return Err(eyre::eyre!("{port_env} is set but {url_env} is missing"));
-    };
-    let parsed = url_raw
-        .parse::<reqwest::Url>()
-        .map_err(|err| eyre::eyre!("{url_env}={url_raw:?} malformed: {err}"))?;
-    Ok((port, url_raw.to_string(), parsed))
-}
-
-/// Build the `EmbeddedL1Config` from env; all vars optional, with testing
-/// defaults so the smoke harness only overrides what it needs.
-///
-///   - `EEZ_L1_HTTP_PORT` — default `18545` (WS = http_port + 1)
-///   - `EEZ_L1_AUTH_PORT` — default `http_port + 6`
-///   - `EEZ_L1_P2P_PORT`  — default `30444` (P2P + discv4)
-///   - `EEZ_L1_DISCV5_PORT` — default `p2p_port + 10` (discv5 UDP)
-///   - `EEZ_L1_DATADIR`   — default `$TMPDIR/eez-l1-embedded` (ephemeral)
-///   - `EEZ_L1_CHAIN_PATH` — L1 genesis JSON; unset → reth's `dev`
-///     chainspec (all forks at genesis, no funded accounts)
-fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
-    use reth_cli::chainspec::ChainSpecParser;
-
-    let http_port = env::var("EEZ_L1_HTTP_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(18545);
-    // Auth RPC port — kept clear of the WS port (which
-    // build_network_rpc_args derives as http_port + 1) and configurable
-    // so it can dodge a default-port collision with other nodes on the
-    // host. Defaults to http_port + 6.
-    let auth_port = env::var("EEZ_L1_AUTH_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(http_port.wrapping_add(6));
-    let p2p_port = env::var("EEZ_L1_P2P_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(30444);
-    // discv5 UDP port — kept separate from p2p_port (discv4) and
-    // configurable so it can dodge a default-port collision with other
-    // nodes on the host. Defaults to p2p_port + 10.
-    let discv5_port = env::var("EEZ_L1_DISCV5_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(p2p_port.wrapping_add(10));
-    let datadir = env::var("EEZ_L1_DATADIR").map_or_else(
-        |_| std::env::temp_dir().join("eez-l1-embedded"),
-        std::path::PathBuf::from,
-    );
-
-    // Chain spec: explicit path wins. Otherwise default to reth's
-    // built-in `dev` chainspec — same shape `reth --chain dev` uses,
-    // which has all forks (including Cancun/Prague where supported)
-    // active at genesis with a couple of pre-funded dev EOAs.
-    let chain_arg = env::var("EEZ_L1_CHAIN_PATH").unwrap_or_else(|_| "dev".to_string());
-    let dev_chain_spec = EthereumChainSpecParser::parse(&chain_arg)
-        .map_err(|e| eyre::eyre!("EEZ_L1_CHAIN_PATH={chain_arg}: {e}"))?;
-
-    // L1 chain selector: `testing` (vanilla EthereumNode, auto-mine 5s),
-    // `devnet` (EthereumNode + external CL), or `chiado`
-    // (reth_gnosis::GnosisNode, real chiado state). The
-    // `dev_chain_spec` is consumed by testing/devnet paths.
-    let kind = l1_embedded::L1ChainKind::from_env();
-
-    // JWT secret path — required for chiado/devnet (lighthouse engine API
-    // auth); optional for testing mode (no external CL).
-    let jwtsecret = env::var("EEZ_L1_JWT_SECRET")
-        .ok()
-        .map(std::path::PathBuf::from);
-
-    let trusted_peers = env::var("EEZ_L1_TRUSTED_PEERS")
-        .ok()
-        .map(|peers| {
-            peers
-                .split([',', ' '])
-                .map(str::trim)
-                .filter(|peer| !peer.is_empty())
-                .map(str::parse)
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
-
-    Ok(l1_embedded::EmbeddedL1Config {
-        dev_chain_spec,
-        kind,
-        datadir,
-        http_port,
-        auth_port,
-        p2p_port,
-        discv5_port,
-        jwtsecret,
-        trusted_peers,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn l1_rollup_id_defaults_only_when_absent() {
-        assert_eq!(parse_l1_rollup_id(None).unwrap(), 0);
-        assert_eq!(parse_l1_rollup_id(Some(" 7 ")).unwrap(), 7);
-        let err = parse_l1_rollup_id(Some("1o")).unwrap_err().to_string();
-        assert!(err.contains("EEZ_L1_ROLLUP_ID=\"1o\" malformed"));
-    }
-
-    #[test]
-    fn xchain_front_missing_port_fails_fast() {
-        let err = parse_xchain_front_config("PORT", "URL", None, Some("http://127.0.0.1:8545"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("PORT is required in composer mode"));
-    }
-
-    #[test]
-    fn xchain_front_malformed_port_fails_fast() {
-        let err =
-            parse_xchain_front_config("PORT", "URL", Some("not-a-port"), Some("http://127.0.0.1"))
-                .unwrap_err()
-                .to_string();
-        assert!(err.contains("PORT=\"not-a-port\" malformed"));
-    }
-
-    #[test]
-    fn xchain_front_missing_upstream_fails_fast() {
-        let err = parse_xchain_front_config("PORT", "URL", Some("8546"), None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("PORT is set but URL is missing"));
-    }
-
-    #[test]
-    fn xchain_front_malformed_upstream_fails_fast() {
-        let err = parse_xchain_front_config("PORT", "URL", Some("8546"), Some("not a url"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("URL=\"not a url\" malformed"));
-    }
-
-    #[test]
-    fn xchain_front_valid_config_is_returned() {
-        let (port, url, parsed) =
-            parse_xchain_front_config("PORT", "URL", Some("8546"), Some("http://127.0.0.1:8545"))
-                .expect("valid config");
-
-        assert_eq!(port, 8546);
-        assert_eq!(url, "http://127.0.0.1:8545");
-        assert_eq!(parsed.as_str(), "http://127.0.0.1:8545/");
-    }
-
-    #[test]
-    fn xchain_front_specs_assign_source_chain_ids() {
-        let specs = xchain_front_specs(31_337, 90_210);
-
-        assert_eq!(specs[0].port_env, "EEZ_L1_XCHAIN_PORT");
-        assert_eq!(specs[0].direction, eez_composer::Direction::Inbound);
-        assert_eq!(specs[0].expected_source_chain_id, 31_337);
-
-        assert_eq!(specs[1].port_env, "EEZ_L2_XCHAIN_PORT");
-        assert_eq!(specs[1].direction, eez_composer::Direction::Outbound);
-        assert_eq!(specs[1].expected_source_chain_id, 90_210);
-    }
 }
