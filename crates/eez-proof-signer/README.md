@@ -15,6 +15,6 @@ recomputed public-input hash.
   commands.
 
 The service is single-flight and fails closed: any admission, validation,
-settlement, deadline, or signing failure returns no signature. The existing
-witness-backed implementation lives in
-[`eez-prover-stateless`](../eez-prover-stateless).
+settlement, deadline, or signing failure returns no signature. Backend
+implementations live in [`eez-prover-stateless`](../eez-prover-stateless) and
+[`eez-prover-stateful`](../eez-prover-stateful).

@@ -8,7 +8,7 @@ EEZ protocol.
 
 The protocol source used by this profile is the `eez-core-protocol`
 submodule at commit
-`6fcc90b65063831cb7797e9fa361004064d28f9f`. Stateless execution uses
+`6fcc90b65063831cb7797e9fa361004064d28f9f`. The stateless backend uses
 `eez-association/stateless` at commit
 `4fc3806bdd0e6b296c761ef4d4b260938365cf45`.
 
@@ -21,9 +21,11 @@ document MUST be updated atomically.
 ## 1. Purpose and supported profile
 
 The signer accepts one Composer-supplied L2 block window, validates every block
-with witness-backed Stateless/Reth execution, binds one canonical
+with one operator-selected production backend, binds one canonical
 `postAndVerifyBatch` payload to the validated execution, recomputes the one
-supported public-input hash, and signs that hash.
+supported public-input hash, and signs that hash. The supported backends are
+witness-backed Stateless/Reth execution and node-backed execution over an
+L1-derived follower's canonical L2 database.
 
 The only supported execution-entry sequence is:
 
@@ -52,7 +54,8 @@ locally recomputed public-input hash only under all rules in this document.
 The signature does **not** establish:
 
 - canonical L2 ancestry, fork choice, finality, or sequencer authorization;
-- that the witness-backed pre-state is an operator-trusted chain checkpoint;
+- that the witness-backed pre-state is an operator-trusted chain checkpoint, or
+  which execution backend produced the validation evidence;
 - current L1 registry state or future on-chain applicability of a state update;
 - successful future execution of an L1 target call;
 - proof-system registration, threshold configuration, or verification-key
@@ -106,10 +109,10 @@ Values are classified as follows:
 | --- | --- |
 | Operator configuration | Authoritative for execution-chain rules, expected rollup ID, proof-system address and vkey, attester identity, system-transaction key, and resource limits. The deployment MUST use the fixed EEZL2 address and MUST bind its configured system address to the configured system-transaction key. |
 | Composer stream | Untrusted, including range, hashes, RLP, witness, settlement calldata, and claimed public-input hash. |
-| Stateless/Reth output | Security-critical derived evidence. It MUST be consumed and checked against the corresponding admitted blocks before settlement uses it. |
+| Validation-backend output | Security-critical derived evidence. It MUST be consumed and checked against the corresponding admitted blocks before settlement uses it. The backend is trusted to derive that evidence by the replay rules in section 6. |
 | Pinned EEZ contracts | Authoritative for on-chain ABI layouts, selectors, hashes, and execution behavior. |
 | `eez-protocol` mirrors | Shared local implementations used by the signer; they MUST match the pinned contracts and independent vectors. |
-| Live L1/L2 network state | Not queried by the signer. |
+| Live L1/L2 network state | The stateless backend does not query it. The stateful backend treats its L1-derived follower's canonical L2 database and chain specification as operator-trusted input, subject to the snapshot checks in section 6.4. |
 
 Names in code and diagnostics SHOULD preserve this distinction. Composer values
 SHOULD be described as `claimed`, `declared`, or `submitted`; replay results as
@@ -117,6 +120,8 @@ SHOULD be described as `claimed`, `declared`, or `submitted`; replay results as
 direction-specific gate as `authorized`.
 
 ## 3. Startup configuration
+
+### 3.1 Standalone stateless service
 
 Every option is available as a CLI flag with the listed environment fallback.
 The CLI value takes precedence.
@@ -149,6 +154,28 @@ The chain document MUST contain an explicit `chainId`. Unknown supported-level
 and extension fields MUST be rejected rather than silently ignored. A complete
 Genesis document supplies its timestamp and genesis fields; a bare
 `ChainConfig` uses the implementation's default Genesis values.
+
+### 3.2 Follower-hosted stateful service
+
+The stateful backend runs inside `eez-node` and is configured only through the
+environment. It is enabled when `EEZ_STATEFUL_PROOF_SIGNER_ADDR` is present;
+otherwise the node MUST NOT expose the stateful `Prove` service. It MUST run
+only in follower mode without `EEZ_SEQUENCER_RPC`, so its database view is
+derived from L1 rather than a sequencer's unsafe head.
+
+The stateful service uses the running follower's chain specification and L2
+EIP-155 chain ID instead of `EEZ_CHAIN_CONFIG`. It uses the common deployment
+variables from section 3.1 except that:
+
+- `EEZ_STATEFUL_PROOF_SIGNER_ADDR` supplies the listen address and has no
+  default;
+- `EEZ_STATEFUL_PROOF_SIGNER_KEY` supplies the attestation private key; and
+- `EEZ_PROOF_SIGNER_REQUEST_TIMEOUT_SECS` defaults to `240`, leaving margin
+  below Reth's default 300-second MDBX read-transaction limit.
+
+The remaining shared resource-limit and identity defaults are unchanged. The
+stateful service MUST apply the same secret-redaction, attester-address,
+system-key, and fixed EEZL2-address checks as the stateless service.
 
 The active deployment bindings are:
 
@@ -254,6 +281,10 @@ For block index `i`, admission MUST require:
 - the aggregate quotas remain within limits; and
 - for `i > 0`, the claimed parent hash equals the preceding claimed block hash.
 
+The wire profile requires a witness for every backend. The stateless backend
+MUST use it for replay. The stateful backend MAY ignore its contents, but the
+service MUST still enforce all witness presence and quota rules above.
+
 EOF is accepted only after exactly the declared number of blocks. Extra,
 missing, duplicated, or reordered blocks MUST be rejected.
 
@@ -262,9 +293,17 @@ admission.
 
 ## 6. Execution validation
 
-The production backend is always the pinned in-process Stateless/Reth backend.
-The operator-configured chain document determines fork rules and the EIP-155
-chain ID; the Composer cannot override either.
+The operator selects exactly one production backend when the service starts:
+
+- the standalone service uses the pinned in-process Stateless/Reth backend;
+  or
+- an L1-derived-only follower may host the stateful Reth backend over its local
+  canonical database.
+
+For the stateless backend, the operator-configured chain document determines
+fork rules and the EIP-155 chain ID. For the stateful backend, the running
+follower's chain specification determines them. The Composer cannot override
+either backend's execution rules or chain identity.
 
 ### 6.1 Decode and identity binding
 
@@ -326,7 +365,31 @@ block's computed post-state root. The resulting window therefore exposes:
 This telescope is self-consistency, not proof that the first pre-state belongs
 to the canonical chain.
 
-### 6.4 Settlement evidence
+### 6.4 Stateful replay guarantees
+
+For a request covering `m..=n`, the stateful backend MUST:
+
+1. require `m > 0` and identify block `m - 1` as the anchor;
+2. return `Unavailable` if the follower has not reached the anchor or cannot
+   currently read required canonical state;
+3. reject the request if the claimed anchor, or any requested block already in
+   the follower's canonical view, conflicts with the local canonical hash;
+4. open historical state at the canonical anchor and replay every proposed
+   block through `n` in one disposable state overlay;
+5. apply sections 6.1 and 6.2 and validate each block's consensus/header rules,
+   transactions, receipts, block hash, post-state root, and selected
+   post-transaction state roots against the continuously updated overlay; and
+6. after replay, re-read the anchor and every requested height known canonical
+   at completion, returning `Aborted` if that snapshot changed.
+
+The stateful backend MUST NOT commit the replay overlay to the follower
+database. Success and failure therefore require no database rollback. The
+follower database and chain specification are within this backend's operator
+trust boundary; the snapshot check prevents signing across an observed local
+reorganization but does not prove global canonicality or finality to a verifier
+of the signature.
+
+### 6.5 Settlement evidence
 
 From the validated block and receipts, the backend MUST retain:
 
@@ -721,8 +784,9 @@ messages SHOULD remain stable and must not expose secrets.
 | gRPC code | Principal cases |
 | --- | --- |
 | `InvalidArgument` | Malformed stream structure; invalid widths or bounds; noncanonical/invalid PostBatch calldata; malformed or trailing DA payload. |
-| `FailedPrecondition` | Rollup identity mismatch; Stateless input rejection; unsupported batch profile; state/effect/inbound/outbound/DA semantic rejection. |
-| `Unavailable` | Another request is active. The same complete request may succeed after the active request releases the slot. |
+| `FailedPrecondition` | Rollup identity mismatch; backend input rejection, including a stateful canonical conflict; unsupported batch profile; state/effect/inbound/outbound/DA semantic rejection. |
+| `Unavailable` | Another request is active; the stateful follower is behind the required anchor; or required local canonical data is temporarily unavailable. The same complete request may succeed after the transient condition clears. |
+| `Aborted` | The stateful follower's relevant canonical snapshot changed during validation. |
 | `ResourceExhausted` | A decoding, block, byte, or witness-item limit was exceeded; or block-vector storage could not be reserved. |
 | `DeadlineExceeded` | Stream idle timeout or absolute request deadline. |
 | `Cancelled` | Cooperative stop after request cancellation. |
@@ -789,7 +853,7 @@ supported profile are security-sensitive.
 A compatible implementation MUST test at least:
 
 - every stream ordering, identity, and quota boundary;
-- strict chain-document parsing and secret redaction;
+- strict backend-configuration parsing and secret redaction;
 - exact RLP identity/hash binding and backend-output association;
 - checkpoint selection, returned positions, and roots;
 - canonical PostBatch decoding and every profile pin;
@@ -803,6 +867,12 @@ A compatible implementation MUST test at least:
   non-actionable fallback;
 - public-input vectors against the pinned Solidity formula; and
 - raw-digest ECDSA recovery, low-`s`, and `v` encoding.
+
+Each enabled execution backend MUST also test its trust boundary. The stateless
+backend MUST cover strict chain-document and witness-backed replay behavior. The
+stateful backend MUST cover follower lag, canonical conflicts, historical-state
+replay, disposable multi-block overlays, and canonical snapshot changes during
+validation.
 
 The root Kurtosis gate MUST also observe at least one successful signer
 attestation and one node-side acceptance of a remote attestation while running
@@ -1057,6 +1127,9 @@ The principal sources for this specification are:
 - `src/validate.rs`, `src/validate/support.rs`,
   `../eez-prover-stateless/src/backend.rs`, and
   `../eez-prover-stateless/src/backend/chain_config.rs` for replay evidence;
+- `../eez-prover-stateful/src/config.rs`,
+  `../eez-prover-stateful/src/backend.rs`, and `../eez-node/src/lib.rs` for the
+  follower-hosted stateful profile;
 - `src/settlement/` for canonical decoding, profile, state, effect, inbound,
   outbound, DA, and system-transaction gates;
 - `src/attest.rs` and `../eez-protocol/src/signer.rs` for attestation;

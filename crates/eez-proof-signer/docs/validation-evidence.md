@@ -10,6 +10,8 @@ the operator-configured chain rules and produces the commitments later used by
 settlement.
 
 This guide follows the witness-backed `eez-prover-stateless` implementation.
+The node-backed implementation produces the same `BackendWindowOutput` contract
+and is described in [`eez-prover-stateful`](../../eez-prover-stateful/README.md).
 
 ```mermaid
 flowchart TB

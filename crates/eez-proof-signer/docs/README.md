@@ -72,6 +72,8 @@ only when one flat test file would obscure the same ownership boundary:
   backend-output contract;
 - [`eez-prover-stateless/src/backend/tests.rs`](../../eez-prover-stateless/src/backend/tests.rs)
   covers witness-backed replay and evidence;
+- [`eez-prover-stateful/src/backend/tests.rs`](../../eez-prover-stateful/src/backend/tests.rs)
+  covers follower-backed replay and canonical snapshot handling;
 - [`src/settlement/tests/`](../src/settlement/tests) mirrors the focused
   settlement gate modules;
 - [`src/service/tests/`](../src/service/tests) covers in-process gRPC

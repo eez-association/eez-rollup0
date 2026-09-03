@@ -62,6 +62,12 @@ impl PipelineError {
     pub(super) fn status(&self) -> Status {
         match self {
             Self::Validation(error) => match error {
+                validate::ValidationError::Unavailable(_) => {
+                    Status::unavailable("validation backend is temporarily unavailable")
+                }
+                validate::ValidationError::Aborted(_) => {
+                    Status::aborted("validation backend snapshot changed during validation")
+                }
                 validate::ValidationError::Rejected(_) => {
                     Status::failed_precondition("window validation rejected")
                 }

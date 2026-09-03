@@ -46,12 +46,14 @@ flowchart LR
 | [`validate.rs`](../src/validate.rs) | Associated backend-output contract, shared cross-checks, `ValidatedWindow` normalization |
 | [`validate/support.rs`](../src/validate/support.rs) | Decode/recovery, checkpoint planning, and evidence helpers shared by backends |
 | [`eez-prover-stateless`](../../eez-prover-stateless/src/backend.rs) | Witness-backed Stateless/Reth execution |
+| [`eez-prover-stateful`](../../eez-prover-stateful/src/backend.rs) | Follower-state-backed Reth execution |
 | [`settlement/`](../src/settlement.rs) | Focused batch, block, state, inbound, outbound, and DA gates |
 | [`attest.rs`](../src/attest.rs) | Attestation identity and typed attestable-hash signing |
 | [`cancel.rs`](../src/cancel.rs) | Cooperative cancellation shared with synchronous work |
 
-This is a library crate. `eez-prover-stateless` owns the standalone binary,
-CLI, and witness-backed validation backend.
+This is a library crate. `eez-prover-stateless` owns the standalone binary and
+CLI, while `eez-prover-stateful` supplies a backend to the copy of this service
+hosted by `eez-node`.
 
 The split follows trust boundaries, not just file size. `window` may reject
 malformed structure but cannot claim a block is valid. `validate` may prove

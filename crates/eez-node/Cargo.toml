@@ -15,6 +15,7 @@ eez-l1.workspace            = true
 eez-protocol.workspace      = true
 eez-prover.workspace        = true
 eez-prover-client.workspace = true
+eez-prover-stateful.workspace = true
 
 # reth
 reth-chainspec.workspace                  = true
