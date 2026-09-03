@@ -16,7 +16,7 @@ import {
 } from "eez-core-protocol/src/interfaces/IEEZ.sol";
 import {Rollup} from "eez-core-protocol/src/rollupContract/Rollup.sol";
 
-import {MockECDSAProofSystem} from "../src/MockECDSAProofSystem.sol";
+import {ECDSAProofSystem} from "../src/ECDSAProofSystem.sol";
 
 /// Empty body, so the per-entry marginal prices EEZ.sol's own bookkeeping
 /// instead of the callee's work.
@@ -117,7 +117,7 @@ contract PostBatchGasPinsTest is Test {
     /// proxy deployed inside the batch.
     function _rung(uint256 outboundEntries, bool preCreateProxies) private returns (uint256 gasUsed) {
         delete touched;
-        (EEZ eez, MockECDSAProofSystem proofSystem) = _deployProtocol();
+        (EEZ eez, ECDSAProofSystem proofSystem) = _deployProtocol();
         EmptyTarget target = new EmptyTarget();
         touched.push(address(target));
 
@@ -130,10 +130,10 @@ contract PostBatchGasPinsTest is Test {
 
     /// Mirrors `scripts/deploy.sh`: registry, proof system, threshold-1 manager
     /// whose vkey is the signer-address membership ticket, then `registerRollup`.
-    function _deployProtocol() private returns (EEZ eez, MockECDSAProofSystem proofSystem) {
+    function _deployProtocol() private returns (EEZ eez, ECDSAProofSystem proofSystem) {
         address prover = vm.addr(PROVER_KEY);
         eez = new EEZ(address(0xDEAD));
-        proofSystem = new MockECDSAProofSystem(prover);
+        proofSystem = new ECDSAProofSystem(prover);
 
         address[] memory proofSystems = new address[](1);
         proofSystems[0] = address(proofSystem);
@@ -151,7 +151,7 @@ contract PostBatchGasPinsTest is Test {
     /// all immediate, with state deltas chained from the live root.
     function _postCall(
         EEZ eez,
-        MockECDSAProofSystem proofSystem,
+        ECDSAProofSystem proofSystem,
         address target,
         uint256 outboundEntries,
         bool preCreateProxies
@@ -195,7 +195,6 @@ contract PostBatchGasPinsTest is Test {
         uint64[] memory indexes = new uint64[](1);
         rollupIds[0] = RollupIdWithProofSystems({rollupId: ROLLUP_ID, proofSystemIndexes: indexes});
         bytes[] memory proofs = new bytes[](1);
-        proofs[0] = _proof(proofSystem);
 
         ProofSystemBatchPerVerificationEntries memory batch = ProofSystemBatchPerVerificationEntries({
             expectedStateRootPerRollup: new ExpectedStateRootPerRollup[](0),
@@ -211,6 +210,7 @@ contract PostBatchGasPinsTest is Test {
             blockNumber: 0,
             bindMsgSenderInPublicInput: false
         });
+        batch.proofs[0] = _proof(_publicInputsHash(batch));
         return abi.encodeCall(EEZ.postAndVerifyBatch, (batch));
     }
 
@@ -271,10 +271,33 @@ contract PostBatchGasPinsTest is Test {
         }
     }
 
-    /// `MockECDSAProofSystem` recovers against a fixed digest and ignores the
-    /// public input, so one signature attests any batch.
-    function _proof(MockECDSAProofSystem proofSystem) private view returns (bytes memory) {
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(PROVER_KEY, proofSystem.MOCK_PROVER_DIGEST());
+    /// Mirrors `EEZ._verifyProofSystemBatch` for this single-rollup,
+    /// single-proof-system, timeless batch.
+    function _publicInputsHash(ProofSystemBatchPerVerificationEntries memory batch) private pure returns (bytes32) {
+        bytes32[] memory entryHashes = new bytes32[](batch.entries.length);
+        for (uint256 i = 0; i < batch.entries.length; i++) {
+            entryHashes[i] = keccak256(abi.encode(batch.entries[i]));
+        }
+
+        bytes32[] memory customDataHashes = new bytes32[](1);
+        customDataHashes[0] = keccak256(abi.encode(ROLLUP_ID, bytes("")));
+        bytes32 sharedPublicInput = keccak256(
+            abi.encodePacked(
+                abi.encode(entryHashes),
+                abi.encode(new bytes32[](0)),
+                abi.encode(new bytes32[](0)),
+                keccak256(batch.callData),
+                abi.encode(customDataHashes),
+                address(0)
+            )
+        );
+        bytes32 vkey = bytes32(uint256(uint160(vm.addr(PROVER_KEY))));
+        bytes32 accumulator = keccak256(abi.encode(bytes32(0), ROLLUP_ID, vkey));
+        return keccak256(abi.encodePacked(sharedPublicInput, accumulator));
+    }
+
+    function _proof(bytes32 publicInputsHash) private pure returns (bytes memory) {
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(PROVER_KEY, publicInputsHash);
         return abi.encodePacked(r, s, v);
     }
 }
