@@ -47,7 +47,9 @@ use tracing::{Level, event};
 use follower::UnsafeHeadFollower;
 
 mod payload;
+mod pool;
 use payload::EezPayloadBuilder;
+use pool::EezPoolBuilder;
 
 /// Per M-MIMALLOC-APPS — meaningful win on allocation-heavy workloads.
 #[global_allocator]
@@ -195,11 +197,18 @@ async fn launch_dev_node(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         "launching eez development node",
     );
     warn_on_deprecated_env();
+    // Standalone produces no system txs, so the gate is inert without a
+    // configured address — no warning, nothing to leak.
+    let l2_system_address = read_l2_system_address()?;
 
     let handle = builder
         .with_types::<EthereumNode>()
         .with_components(
-            EthereumNode::components().payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder)),
+            EthereumNode::components()
+                // Keeps SYSTEM_ADDRESS txs out of the pool: a reorged-out
+                // Sync block must not leak system txs into a Live block.
+                .pool(EezPoolBuilder::new(l2_system_address))
+                .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder)),
         )
         .with_add_ons(reth_node_ethereum::node::EthereumAddOns::default())
         .launch_with_debug_capabilities()
@@ -259,11 +268,24 @@ async fn launch_follower(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Res
         "launching eez follower",
     );
     warn_on_deprecated_env();
+    let l2_system_address = read_l2_system_address()?;
+    if l2_system_address.is_none() {
+        event!(
+            name: "eez.node.pool.system_gate_disabled",
+            Level::WARN,
+            "no EEZ_L2_SYSTEM_ADDRESS / EEZ_L2_SYSTEM_KEY — the L2 pool accepts any \
+             sender; only safe for a pure-user-tx follower",
+        );
+    }
 
     let handle = builder
         .with_types::<EthereumNode>()
         .with_components(
-            EthereumNode::components().payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder)),
+            EthereumNode::components()
+                // Keeps SYSTEM_ADDRESS txs out of the pool: a reorged-out
+                // Sync block must not leak system txs into a Live block.
+                .pool(EezPoolBuilder::new(l2_system_address))
+                .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder)),
         )
         .with_add_ons(reth_node_ethereum::node::EthereumAddOns::default())
         .launch_with_debug_capabilities()
@@ -302,6 +324,7 @@ async fn launch_follower(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Res
         rollup_config.deploy_block,
         Arc::clone(&l1_head),
         system_tx_cfg,
+        read_checkpoint_dir(),
     );
 
     wait_for_l1_ready(&l1_reader, rollup_config.deploy_block, read_l1_chain_id()?).await?;
@@ -537,13 +560,27 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         }
     };
 
+    // A composer signs system txs, so the pool MUST know which sender to
+    // refuse — without it a reorged-out Sync block's system txs could be
+    // re-mined into a Live block.
+    let l2_system_address = Some(read_l2_system_address()?.ok_or_else(|| {
+        eyre::eyre!(
+            "EEZ_L2_SYSTEM_ADDRESS (or EEZ_L2_SYSTEM_KEY) is required in composer mode: the \
+             L2 pool must refuse SYSTEM_ADDRESS transactions"
+        )
+    })?);
+
     // L2 reth. `EezPayloadBuilder` writes `gas_limit`/`extra_data` from
     // shared `eez-driver` constants so deriver replay and sequencer builds
     // yield identical headers.
     let handle = builder
         .with_types::<EthereumNode>()
         .with_components(
-            EthereumNode::components().payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder)),
+            EthereumNode::components()
+                // Keeps SYSTEM_ADDRESS txs out of the pool: a reorged-out
+                // Sync block must not leak system txs into a Live block.
+                .pool(EezPoolBuilder::new(l2_system_address))
+                .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder)),
         )
         .with_add_ons(reth_node_ethereum::node::EthereumAddOns::default())
         .launch_with_debug_capabilities()
@@ -921,6 +958,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         rollup_config.deploy_block,
         Arc::clone(&l1_head),
         Some(system_tx_cfg),
+        read_checkpoint_dir(),
     );
 
     // Bind before the L1 wait so port checks see a live front. Submissions are
@@ -1176,6 +1214,45 @@ where
     }))
 }
 
+/// The SYSTEM_ADDRESS the L2 pool refuses: `EEZ_L2_SYSTEM_ADDRESS`, else
+/// derived from `EEZ_L2_SYSTEM_KEY`. `None` when neither is set — each role
+/// decides whether that is fatal.
+///
+/// Both set and disagreeing is fatal: the key signs, so a differing address
+/// would gate a sender that never appears and leave the real one open.
+fn read_l2_system_address() -> eyre::Result<Option<Address>> {
+    let from_key = l2_system_key_address()?;
+    match env::var("EEZ_L2_SYSTEM_ADDRESS") {
+        Ok(raw) => {
+            let address = Address::from_str(raw.trim())
+                .map_err(|e| eyre::eyre!("EEZ_L2_SYSTEM_ADDRESS malformed: {e}"))?;
+            eyre::ensure!(
+                from_key.is_none_or(|k| k == address),
+                "EEZ_L2_SYSTEM_ADDRESS {address} does not match EEZ_L2_SYSTEM_KEY"
+            );
+            Ok(Some(address))
+        }
+        Err(env::VarError::NotPresent) => Ok(from_key),
+        Err(env::VarError::NotUnicode(_)) => Err(eyre::eyre!(
+            "EEZ_L2_SYSTEM_ADDRESS contains non-UTF-8 bytes"
+        )),
+    }
+}
+
+/// Address of `EEZ_L2_SYSTEM_KEY`, if set.
+fn l2_system_key_address() -> eyre::Result<Option<Address>> {
+    match env::var("EEZ_L2_SYSTEM_KEY") {
+        Ok(raw) => Ok(Some(
+            PrivateKeySigner::from_bytes(&B256::from_str(raw.trim().trim_start_matches("0x"))?)?
+                .address(),
+        )),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(eyre::eyre!("EEZ_L2_SYSTEM_KEY contains non-UTF-8 bytes"))
+        }
+    }
+}
+
 /// Read the L1 rollup id from env. Defaults to `0` to match the bridge
 /// E2E fixture's `MAINNET_ROLLUP_ID` only when the variable is absent.
 fn read_l1_rollup_id() -> eyre::Result<u64> {
@@ -1195,6 +1272,25 @@ fn parse_l1_rollup_id(raw: Option<&str>) -> eyre::Result<u64> {
     raw.trim()
         .parse::<u64>()
         .map_err(|e| eyre::eyre!("EEZ_L1_ROLLUP_ID={raw:?} malformed: {e}"))
+}
+
+/// Where the deriver persists its boot checkpoint. Decided once: a missing
+/// directory means this var is not our datadir, and retrying the write every
+/// batch would only spam.
+fn read_checkpoint_dir() -> Option<std::path::PathBuf> {
+    let dir = env::var("EEZ_L2_DATADIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_dir());
+    if dir.is_none() {
+        event!(
+            name: "eez.node.checkpoint.disabled",
+            Level::INFO,
+            configured = ?env::var("EEZ_L2_DATADIR").ok(),
+            "no usable EEZ_L2_DATADIR; boot will rescan L1 from the deploy block",
+        );
+    }
+    dir
 }
 
 /// Required for followers: guessing would either assert the wrong source

@@ -46,9 +46,8 @@ For each admitted window, the adapter:
    computed block hash to the Composer claims retained in `AdmittedBlock`.
 2. Recovers transaction signers with the fork-aware rules from that same chain
    specification.
-3. Derives the settling-block checkpoint positions locally from the
-   recovered transaction framing, then applies the operator checkpoint quota.
-   The Composer cannot nominate positions.
+3. Derives every settling-block checkpoint position locally from the recovered
+   transaction framing. The Composer cannot nominate or suppress positions.
 4. Establishes the validated, witness-backed pre-state root, executes the block
    with Stateless/Reth, applies post-execution consensus checks, and recomputes
    the post-state root before matching it to the block-header commitment.

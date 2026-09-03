@@ -94,7 +94,6 @@ fn cli_parses_the_default_listen_addr() {
             max_window_blocks: NonZeroUsize::new(512).unwrap(),
             max_window_bytes: NonZeroUsize::new(512 * 1024 * 1024).unwrap(),
             max_window_witness_items: NonZeroUsize::new(1_000_000).unwrap(),
-            max_transaction_state_checkpoints: 8,
             stream_idle_timeout: Duration::from_mins(2),
             request_timeout: Duration::from_mins(10),
         })
@@ -789,40 +788,4 @@ fn the_removed_concurrency_option_is_rejected() {
         ])
         .is_err()
     );
-}
-
-#[test]
-fn zero_transaction_state_checkpoint_limit_is_allowed() {
-    let args = parse_args([
-        "eez-proof-signer",
-        "--chain-config",
-        "chain-config.json",
-        "--rollup-id",
-        "1",
-        "--max-transaction-state-checkpoints",
-        "0",
-    ])
-    .unwrap();
-
-    let config = Config::from_args(args).unwrap();
-    assert_eq!(config.limits.max_transaction_state_checkpoints(), 0);
-}
-
-#[test]
-fn malformed_transaction_state_checkpoint_limits_are_rejected() {
-    for value in ["-1", "not-a-number", "18446744073709551616"] {
-        assert!(
-            parse_args([
-                "eez-proof-signer",
-                "--chain-config",
-                "chain-config.json",
-                "--rollup-id",
-                "1",
-                "--max-transaction-state-checkpoints",
-                value,
-            ])
-            .is_err(),
-            "accepted invalid checkpoint limit {value:?}",
-        );
-    }
 }

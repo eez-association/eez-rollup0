@@ -581,9 +581,9 @@ pub enum ProverMutation {
     None,
     PostBatch,
     Witness,
-    /// Deterministic opaque rejection used to exercise Composer recovery. This
-    /// is the status returned by the real signer when its checkpoint quota is
-    /// exceeded.
+    /// Deterministic opaque rejection used to exercise Composer recovery. The
+    /// real signer can return this for remaining resource quotas such as
+    /// aggregate request bytes or witness items.
     ResourceExhausted,
     /// A typed rejection whose candidate identity cannot belong to the current
     /// request. The Composer must treat it as opaque rather than acting on it.
@@ -637,13 +637,12 @@ impl ProverMutation {
                     .ok_or_else(|| Status::internal("missing Prove header"))?;
                 let batch = eez_protocol::entries::decode_postbatch(calldata)
                     .map_err(|error| Status::internal(format!("decode PostBatch: {error}")))?;
-                // Entry zero is the state-chain anchor. The real checkpoint
-                // quota is exercised only by effect candidates, so leave
-                // anchor-only historical/minimal proofs healthy.
+                // Exercise the rejection only on effect-bearing batches, so
+                // anchor-only historical/minimal proofs remain healthy.
                 if batch.entries.len() > 1 {
                     return match self {
                         Self::ResourceExhausted => Err(Status::resource_exhausted(
-                            "window validation checkpoint quota exceeded",
+                            "window validation resource quota exceeded",
                         )),
                         Self::MismatchedActionable => {
                             let failure = ProveFailure {
@@ -1871,6 +1870,47 @@ impl<'a> Chain<'a> {
             deploy_block: dep.deploy_block,
             rollup_id: dep.rollup_id,
         }
+    }
+
+    /// Deployment coordinates, for tests that build their own L1 calls.
+    pub fn rpc_url(&self) -> &str {
+        self.rpc_url
+    }
+    pub fn eez_address(&self) -> Address {
+        self.eez_address
+    }
+    pub fn deploy_block(&self) -> u64 {
+        self.deploy_block
+    }
+    pub fn rollup_id(&self) -> u64 {
+        self.rollup_id
+    }
+
+    /// Anvil uses `--block-time`, so `evm_setAutomine` does not stop it.
+    /// Interval 0 pauses block production; restore with `L1_BLOCK_TIME_SECS`.
+    pub async fn set_interval_mining(&self, secs: u64) -> Result<()> {
+        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
+        let _: serde_json::Value = provider
+            .client()
+            .request("anvil_setIntervalMining", (secs,))
+            .await
+            .context("anvil_setIntervalMining")?;
+        Ok(())
+    }
+
+    /// Mine exactly one block.
+    pub async fn mine(&self) -> Result<()> {
+        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
+        let _: serde_json::Value = provider
+            .client()
+            .request("evm_mine", ())
+            .await
+            .context("evm_mine")?;
+        Ok(())
+    }
+
+    pub const fn block_time_secs() -> u64 {
+        L1_BLOCK_TIME_SECS
     }
 
     pub async fn batches_posted(&self) -> Result<usize> {

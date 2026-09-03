@@ -37,7 +37,6 @@ services:
       - ./deployments.env
     environment:
       EEZ_PROOF_SIGNER_ADDR: 127.0.0.1:${EEZ_SIGNER_PORT:-50061}
-      EEZ_PROOF_SIGNER_MAX_TRANSACTION_STATE_CHECKPOINTS: "${EEZ_SIGNER_MAX_CHECKPOINTS:-8}"
       EEZ_CHAIN_CONFIG: /app/genesis.json
       EEZ_PROOF_SIGNER_KEY: "${EEZ_PROOF_SIGNER_KEY:?set EEZ_PROOF_SIGNER_KEY}"
       EEZ_L2_SYSTEM_KEY: "${EEZ_L2_SYSTEM_KEY:?set EEZ_L2_SYSTEM_KEY}"
@@ -90,6 +89,10 @@ services:
       # target-block oracle falls back to the embedded L1. Set it in
       # .env.chiado
       EEZ_L1_TARGET_RPC_URL: "${EEZ_L1_TARGET_RPC_URL:-}"
+      # Without this the embedded L1 falls back to the persisted
+      # known-peers.json, which fills with cross-network noise and
+      # leaves it on 0 peers, unable to backfill.
+      EEZ_L1_TRUSTED_PEERS: "${EEZ_L1_TRUSTED_PEERS:-}"
       EEZ_L1_ROLLUP_ID: "0"
       # Cross-chain wiring.
       EEZL2_ADDRESS: "0x4200000000000000000000000000000000000007"
@@ -101,14 +104,10 @@ services:
       # other eth_* is transparently forwarded to the matching source-chain RPC.
       EEZ_L1_XCHAIN_PORT: "18999"
       EEZ_L2_XCHAIN_PORT: "18998"
-      # Max user_txs bundled per postBatch (host-env overridable, default 3).
-      # Raising it needs BOTH knobs below sized to match: the signer's
-      # checkpoint quota (>= cap) and the postBatch gas reserve (~240k gas
-      # per deferred entry queued on L1); an under-gassed postBatch reverts
-      # in the builder's bundle simulation and the bundle drops silently.
-      EEZ_MAX_USER_TXS_PER_BUNDLE: "${EEZ_MAX_USER_TXS_PER_BUNDLE:-3}"
-      # Execution reserve above the postBatch calldata floor.
-      EEZ_POSTBATCH_GAS_RESERVE: "${EEZ_POSTBATCH_GAS_RESERVE:-4000000}"
+      # Lower than the in-code default (50) because the whole bundle
+      # [postBatch, user_tx...] has to fit a 17M chiado block, not the 60M a
+      # devnet L1 gives: 9M cap + 12 * 400k = 13.8M.
+      EEZ_MAX_USER_TXS_PER_BUNDLE: "${EEZ_MAX_USER_TXS_PER_BUNDLE:-12}"
       # Emission + reorg bounds documented in .env.example. eez-node reads these
       # from the process env, and this service takes no env_file beyond
       # deployments.env, so they have to be forwarded explicitly. Defaults track
