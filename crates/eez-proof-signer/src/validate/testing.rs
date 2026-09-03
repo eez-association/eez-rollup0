@@ -58,19 +58,18 @@ enum StubAction {
 
 /// Canned per-call actions, served in order; a call past the end fails loudly.
 #[derive(Debug)]
-pub(crate) struct StubValidator {
+struct StubBackend {
     actions: Mutex<VecDeque<StubAction>>,
-    pub(super) expected_l2_system_address: alloy_primitives::Address,
+    expected_l2_system_address: alloy_primitives::Address,
 }
 
-impl StubValidator {
-    pub(super) fn next_response(&self) -> eyre::Result<BackendWindowOutput> {
-        let action = self
-            .actions
-            .lock()
-            .unwrap()
-            .pop_front()
-            .ok_or_else(|| eyre::eyre!("stub validator ran out of canned actions"))?;
+impl StubBackend {
+    fn next_response(&self) -> Result<BackendWindowOutput, ValidationError> {
+        let action = self.actions.lock().unwrap().pop_front().ok_or_else(|| {
+            ValidationError::InternalInvariant(
+                "stub validator ran out of canned actions".to_owned(),
+            )
+        })?;
         let response = match action {
             StubAction::Respond(response) => response,
             StubAction::Block {
@@ -79,24 +78,56 @@ impl StubValidator {
                 response,
             } => {
                 let _ = started.send(());
-                release
-                    .recv()
-                    .map_err(|_| eyre::eyre!("blocking stub release sender was dropped"))?;
+                release.recv().map_err(|_| {
+                    ValidationError::InternalInvariant(
+                        "blocking stub release sender was dropped".to_owned(),
+                    )
+                })?;
                 response
             }
             StubAction::Panic => panic!("stub validator panicked"),
         };
         match response {
             Ok(output) => Ok(output),
-            Err(reason) => Err(eyre::eyre!("{reason}")),
+            Err(reason) => Err(ValidationError::Rejected(reason)),
         }
+    }
+}
+
+impl ValidationBackend for StubBackend {
+    fn label(&self) -> &'static str {
+        "stub"
+    }
+
+    fn chain_id(&self) -> u64 {
+        1
+    }
+
+    fn expected_l2_system_address(&self) -> alloy_primitives::Address {
+        self.expected_l2_system_address
+    }
+
+    fn validate_blocks(
+        &self,
+        _blocks: &[AdmittedBlock],
+        _witnesses: &mut [ExecutionWitness],
+        cancellation: &CancellationToken,
+    ) -> Result<BackendWindowOutput, ValidationError> {
+        if cancellation.is_cancelled() {
+            return Err(ValidationError::Cancelled);
+        }
+        self.next_response()
+    }
+
+    fn remaining_test_actions(&self) -> Option<usize> {
+        Some(self.actions.lock().unwrap().len())
     }
 }
 
 impl Validator {
     /// A stub backend serving `responses` in order.
     pub(crate) fn stub(responses: Vec<Result<BackendWindowOutput, String>>) -> Self {
-        Self::Stub(StubValidator {
+        Self::from_backend(StubBackend {
             actions: Mutex::new(responses.into_iter().map(StubAction::Respond).collect()),
             expected_l2_system_address: crate::testkit::TEST_SYSTEM_ADDRESS,
         })
@@ -124,7 +155,7 @@ impl Validator {
     ) -> (Self, oneshot::Receiver<()>, mpsc::Sender<()>) {
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let validator = Self::Stub(StubValidator {
+        let validator = Self::from_backend(StubBackend {
             actions: Mutex::new(
                 [StubAction::Block {
                     started: started_tx,
@@ -140,7 +171,7 @@ impl Validator {
 
     /// A stub whose next validation panics.
     pub(crate) fn panicking_stub() -> Self {
-        Self::Stub(StubValidator {
+        Self::from_backend(StubBackend {
             actions: Mutex::new([StubAction::Panic].into()),
             expected_l2_system_address: crate::testkit::TEST_SYSTEM_ADDRESS,
         })
@@ -148,10 +179,9 @@ impl Validator {
 
     /// Number of canned actions remaining.
     pub(crate) fn stub_remaining(&self) -> usize {
-        match self {
-            Self::Stub(stub) => stub.actions.lock().unwrap().len(),
-            Self::Stateless(_) => panic!("stub_remaining called on the stateless backend"),
-        }
+        self.backend
+            .remaining_test_actions()
+            .expect("stub_remaining called on a production backend")
     }
 }
 

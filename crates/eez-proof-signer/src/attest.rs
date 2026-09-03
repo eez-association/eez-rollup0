@@ -12,14 +12,14 @@ use crate::service::AttestablePublicInputsHash;
 
 /// Operator-configured, non-zero proof-system verification key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NonZeroProofSystemVkey(B256);
+pub struct NonZeroProofSystemVkey(B256);
 
 impl NonZeroProofSystemVkey {
-    pub(crate) fn new(value: B256) -> Option<Self> {
+    pub fn new(value: B256) -> Option<Self> {
         (value != B256::ZERO).then_some(Self(value))
     }
 
-    pub(crate) const fn get(self) -> B256 {
+    pub const fn get(self) -> B256 {
         self.0
     }
 }
@@ -49,7 +49,7 @@ impl fmt::Display for NonZeroProofSystemVkey {
 /// The signing address must also differ from the deployment-configured L2
 /// system address, whose key has separate authority to create system
 /// transactions.
-pub(crate) struct Attester {
+pub struct Attester {
     signer: EcdsaProofSigner,
     proof_system_vkey: NonZeroProofSystemVkey,
     expected_proof_system: Address,
@@ -73,7 +73,7 @@ impl fmt::Debug for Attester {
 
 /// Startup errors that are safe to display without revealing key material.
 #[derive(Debug, Error, PartialEq, Eq)]
-pub(crate) enum AttesterConfigError {
+pub enum AttesterConfigError {
     #[error("attestation key is not a valid secp256k1 private key")]
     InvalidPrivateKey,
     #[error("attestation key must not derive the reserved L2 system address")]
@@ -85,7 +85,7 @@ pub(crate) enum AttesterConfigError {
 impl Attester {
     /// Construct one complete identity, rejecting invalid or reserved signing
     /// keys and a zero proof-system address before the server starts.
-    pub(crate) fn new(
+    pub fn new(
         attestation_private_key: B256,
         proof_system_vkey: NonZeroProofSystemVkey,
         expected_proof_system: Address,
@@ -110,22 +110,22 @@ impl Attester {
     }
 
     /// Return the attestation address derived from the configured private key.
-    pub(crate) fn address(&self) -> Address {
+    pub fn address(&self) -> Address {
         self.signer.address()
     }
 
     /// Return the independently configured proof-system verification key.
-    pub(crate) const fn proof_system_vkey(&self) -> NonZeroProofSystemVkey {
+    pub const fn proof_system_vkey(&self) -> NonZeroProofSystemVkey {
         self.proof_system_vkey
     }
 
     /// Return the expected proof-system contract address selected at startup.
-    pub(crate) const fn expected_proof_system(&self) -> Address {
+    pub const fn expected_proof_system(&self) -> Address {
         self.expected_proof_system
     }
 
     /// Return the deployment identity excluded from attestation authority.
-    pub(crate) const fn expected_l2_system_address(&self) -> Address {
+    pub const fn expected_l2_system_address(&self) -> Address {
         self.expected_l2_system_address
     }
 

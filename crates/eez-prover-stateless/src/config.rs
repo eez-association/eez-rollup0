@@ -13,9 +13,9 @@ use std::time::Duration;
 use alloy_primitives::{Address, B256};
 use clap::Parser;
 
-use crate::attest::{Attester, NonZeroProofSystemVkey};
-use crate::service::{ServiceLimits, ServiceLimitsParams};
-use crate::settlement::SystemTransactionKey;
+use eez_proof_signer::{
+    Attester, NonZeroProofSystemVkey, ServiceLimits, ServiceLimitsParams, SystemTransactionKey,
+};
 
 /// An infallibly parsed CLI secret that retains only decoded bytes.
 ///

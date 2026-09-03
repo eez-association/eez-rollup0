@@ -462,23 +462,6 @@ fn happy_window() -> Vec<ProveChunk> {
     ]
 }
 
-fn stateless_window() -> Vec<ProveChunk> {
-    let consensus_header = alloy_consensus::Header {
-        number: 5,
-        parent_hash: alloy_primitives::B256::repeat_byte(0x04),
-        ..Default::default()
-    };
-    let hash = consensus_header.hash_slow();
-    let consensus_block = alloy_consensus::Block::<
-        alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
-    >::new(consensus_header, Default::default());
-    let mut chunk = block_chunk(5, 0x04, 0x05);
-    let block = block_mut(&mut chunk);
-    block.hash = hash.to_vec();
-    block.rlp = alloy_rlp::encode(consensus_block);
-    vec![header_chunk(5, 5), chunk]
-}
-
 type TestTransaction = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>;
 
 fn single_non_system_transaction_window() -> Vec<ProveChunk> {

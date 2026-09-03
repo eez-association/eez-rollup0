@@ -1,9 +1,10 @@
 # eez-proof-signer
 
-`eez-proof-signer` is the EEZ validation and attestation daemon. It accepts one
-composer-streamed L2 block window, re-executes every block with Stateless,
-binds the supported settlement effects and DA payload to that execution, and
-signs the independently recomputed public-input hash.
+`eez-proof-signer` is the shared EEZ validation and attestation service
+library. It admits one Composer-streamed L2 block window, checks execution
+evidence returned by a configured backend, binds the supported settlement
+effects and DA payload to that evidence, and signs the independently
+recomputed public-input hash.
 
 - [`SPEC.md`](SPEC.md) is the normative protocol and compatibility contract.
 - [`../eez-control-rpc/SPEC.md`](../eez-control-rpc/SPEC.md) specifies how a
@@ -13,6 +14,7 @@ signs the independently recomputed public-input hash.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) records contributor constraints and verification
   commands.
 
-The current production backend is in-process Stateless. The service is
-single-flight and fails closed: any admission, validation, settlement,
-deadline, or signing failure returns no signature.
+The service is single-flight and fails closed: any admission, validation,
+settlement, deadline, or signing failure returns no signature. The existing
+witness-backed implementation lives in
+[`eez-prover-stateless`](../eez-prover-stateless).

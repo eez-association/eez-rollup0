@@ -10,6 +10,7 @@ members = [
     "crates/eez-node",
     "crates/eez-payload-codec",
     "crates/eez-proof-signer",
+    "crates/eez-prover-stateless",
     "crates/eez-protocol",
     "crates/eez-prover",
     "crates/eez-prover-client",
@@ -142,8 +143,10 @@ eez-driver         = { path = "crates/eez-driver" }
 eez-evm-inspector  = { path = "crates/eez-evm-inspector" }
 eez-l1             = { path = "crates/eez-l1" }
 eez-payload-codec  = { path = "crates/eez-payload-codec" }
+eez-proof-signer   = { path = "crates/eez-proof-signer" }
 eez-protocol       = { path = "crates/eez-protocol" }
 eez-prover         = { path = "crates/eez-prover" }
+eez-prover-stateless = { path = "crates/eez-prover-stateless" }
 
 # Profiles copied from reth (paradigmxyz/reth Cargo.toml), minus its
 # hivetests/reproducible CI profiles. `release` is the fast-to-build

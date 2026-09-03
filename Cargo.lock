@@ -3374,13 +3374,11 @@ name = "eez-proof-signer"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
- "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-debug",
  "alloy-signer-local",
  "alloy-sol-types",
- "clap",
  "eez-control-rpc",
  "eez-protocol",
  "eyre",
@@ -3388,16 +3386,13 @@ dependencies = [
  "prost",
  "reth-chainspec 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-ethereum-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
- "reth-evm-ethereum 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-primitives-traits",
  "serde_json",
- "stateless",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tonic",
  "tracing",
- "tracing-subscriber 0.3.23",
 ]
 
 [[package]]
@@ -3449,6 +3444,35 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
+]
+
+[[package]]
+name = "eez-prover-stateless"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-genesis",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-debug",
+ "alloy-sol-types",
+ "clap",
+ "eez-control-rpc",
+ "eez-proof-signer",
+ "eez-protocol",
+ "eyre",
+ "hex",
+ "reth-chainspec 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-ethereum-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-evm-ethereum 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "reth-primitives-traits",
+ "serde_json",
+ "stateless",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]

@@ -12,7 +12,7 @@ checkpoint, event, receipt status, or DA sidecar authorizes an effect by itself.
 | Input | Provenance |
 | --- | --- |
 | Submitted `PostBatch` calldata | Composer input; `CanonicalPostBatch` proves only complete canonical decoding |
-| `ValidatedWindow` | Cross-checked Stateless output plus exact admitted block bytes and locally derived evidence |
+| `ValidatedWindow` | Cross-checked backend output plus exact admitted block bytes and locally derived evidence |
 | Expected rollup ID, configured proof-system address and proof-system vkey | Independent operator-configured deployment bindings |
 | `SystemTransactionReconstructor` | Operator-configured system key combined with chain ID, expected rollup ID, and the fixed EEZL2 address |
 
@@ -89,7 +89,7 @@ still construct a positive-effect payload.
 
 The exact DA comparison closes a separate gap: hashing `callData` commits to
 Composer bytes, but does not by itself prove that those bytes describe the
-blocks Stateless executed. Reconstruction and raw EIP-2718 equality provide
+blocks the backend executed. Reconstruction and raw EIP-2718 equality provide
 that binding.
 
 ## Active profile
