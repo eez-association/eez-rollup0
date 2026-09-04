@@ -655,6 +655,10 @@ async fn poison_mid_bundle_leaves_survivors_correct() {
     )
     .await
     .unwrap();
+    let non_proxy = deploy_counter(&l1_rpc, w.cfg.deployer_key, DEV_CHAIN_ID)
+        .await
+        .unwrap();
+
     open_drain_window(&w).await;
     let mut nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
     let first = sign_and_send(
@@ -675,7 +679,7 @@ async fn poison_mid_bundle_leaves_survivors_correct() {
         ANVIL_KEY_6,
         DEV_CHAIN_ID,
         onchain_nonce(&l1_rpc, ANVIL_KEY_6).await.unwrap(),
-        Some(w.recipient), // plain address: never a cross-chain proxy on L1
+        Some(non_proxy),
         U256::ZERO,
         ICounter::incrementCall {}.abi_encode(),
         600_000,

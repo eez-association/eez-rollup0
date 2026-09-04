@@ -912,6 +912,7 @@ where
                 event!(
                     name: "eez.deriver.committer.closed",
                     Level::ERROR,
+                    event_name = "eez.deriver.committer.closed",
                     error = %err,
                     "block committer gone; deriver exiting",
                 );
@@ -921,6 +922,7 @@ where
                 event!(
                     name: "eez.deriver.resync.failed",
                     Level::ERROR,
+                    event_name = "eez.deriver.resync.failed",
                     error = %err,
                     "resync failed; will retry after the next L1 event",
                 );

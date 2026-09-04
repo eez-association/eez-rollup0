@@ -548,6 +548,7 @@ fn recover_settlement_failure(
             event!(
                 name: "eez.composer.recovery.poison_evicted",
                 Level::ERROR,
+                event_name = "eez.composer.recovery.poison_evicted",
                 rollup_id,
                 source = ?source,
                 tx_hash = %tx.hash,
@@ -573,6 +574,7 @@ fn recover_settlement_failure(
                 event!(
                     name: "eez.composer.recovery.nonce_chain_evicted",
                     Level::ERROR,
+                    event_name = "eez.composer.recovery.nonce_chain_evicted",
                     rollup_id,
                     source = ?source,
                     tx_hash = %tx.hash,
@@ -590,6 +592,7 @@ fn recover_settlement_failure(
             event!(
                 name: "eez.composer.recovery.nonce_chain_evicted",
                 Level::ERROR,
+                event_name = "eez.composer.recovery.nonce_chain_evicted",
                 rollup_id,
                 source = ?source,
                 tx_hash = %tx.hash,

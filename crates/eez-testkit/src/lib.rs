@@ -3518,15 +3518,36 @@ impl StandardOracleSnapshot {
                 .and_then(serde_json::Value::as_u64)
                 .map(|height| height % CROSS_CHAIN_SYNC_INTERVAL)
         });
-        Ok(Self {
-            signal_cursor: world.node.signal_cursor()?,
-            execution_states: all_l2_execution_states(
+        // Bracket the log cursor with identical L1 histories. If a settlement
+        // lands across the cursor read, the history changes and we retry.
+        let mut aligned_boundary = None;
+        for _ in 0..10 {
+            let before = all_l2_execution_states(
                 &l1_rpc,
                 world.cfg.eez_address,
                 world.cfg.rollup_id,
                 world.dep.deploy_block,
             )
-            .await?,
+            .await?;
+            let cursor = world.node.signal_cursor()?;
+            let after = all_l2_execution_states(
+                &l1_rpc,
+                world.cfg.eez_address,
+                world.cfg.rollup_id,
+                world.dep.deploy_block,
+            )
+            .await?;
+            if before == after {
+                aligned_boundary = Some((after, cursor));
+                break;
+            }
+        }
+        let (execution_states, signal_cursor) = aligned_boundary.ok_or_else(|| {
+            anyhow!("could not align L1 execution history with the node signal stream")
+        })?;
+        Ok(Self {
+            execution_states,
+            signal_cursor,
             safe: block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Safe).await?,
             finalized: block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Finalized).await?,
             rollup_ether_balance: rollup_ether_balance(
@@ -3590,6 +3611,18 @@ impl StandardOracleSnapshot {
                 after.0
             );
         }
+        if let (Some(before), Some(after)) = (self.safe, safe)
+            && after.0 == before.0
+            && after.1 != before.1
+            && !has_reorg
+        {
+            bail!(
+                "{scenario_name}: safe hash changed at height {} without an L1 reorg signal: {} -> {}",
+                before.0,
+                before.1,
+                after.1
+            );
+        }
         if let (Some(before), Some(after)) = (self.finalized, finalized)
             && after.0 < before.0
         {
@@ -3597,6 +3630,17 @@ impl StandardOracleSnapshot {
                 "{scenario_name}: finalized head retreated {} -> {}",
                 before.0,
                 after.0
+            );
+        }
+        if let (Some(before), Some(after)) = (self.finalized, finalized)
+            && after.0 == before.0
+            && after.1 != before.1
+        {
+            bail!(
+                "{scenario_name}: finalized hash changed at height {}: {} -> {}",
+                before.0,
+                before.1,
+                after.1
             );
         }
 
@@ -3653,21 +3697,17 @@ impl StandardOracleSnapshot {
         if execution_states.len() < self.execution_states.len() {
             bail!("{scenario_name}: L2ExecutionPerformed history retreated");
         }
-        // Anchored on roots and positions inside the full history, never on the
-        // baseline length. The snapshot's signal cursor and its L1 event query
-        // cannot be taken atomically while the deriver runs, so a settlement can
-        // land between them and be counted on one side only; its position in the
-        // event sequence is immune to that. Each settlement must appear after the
-        // previous one, and consecutive settlements must be exactly
-        // `applied_entries` events apart — a replay or a dropped entry breaks it.
-        let mut previous_index: Option<usize> = None;
+        // The cursor and L1 baseline are aligned above, so every observed
+        // settlement, including the first, must extend the history by exactly
+        // `applied_entries`.
+        let mut previous_event_count = self.execution_states.len();
         for (applied, l1_settled_root, l2_safe_root) in settlement_points {
             if l1_settled_root != l2_safe_root {
                 bail!(
                     "{scenario_name}: L1 settled root {l1_settled_root} != L2 safe block root {l2_safe_root}"
                 );
             }
-            let search_from = previous_index.map_or(0, |previous| previous + 1);
+            let search_from = previous_event_count;
             let index = execution_states
                 .get(search_from..)
                 .and_then(|tail| tail.iter().position(|root| *root == l1_settled_root))
@@ -3677,15 +3717,14 @@ impl StandardOracleSnapshot {
                         "{scenario_name}: L1 settled root {l1_settled_root} has no L2ExecutionPerformed event after index {search_from}"
                     )
                 })?;
-            if let Some(previous) = previous_index
-                && index - previous != applied
-            {
+            let event_count = index + 1;
+            if event_count - previous_event_count != applied {
                 bail!(
                     "{scenario_name}: settlement reported {applied} applied entries but sits {} L1 events after the previous one",
-                    index - previous
+                    event_count - previous_event_count
                 );
             }
-            previous_index = Some(index);
+            previous_event_count = event_count;
         }
         if safe.is_some() && expect_settled {
             let committed = state_root(&l1_rpc, world.cfg.eez_address, world.cfg.rollup_id).await?;
