@@ -163,14 +163,13 @@ def run(plan, args):
     node_cmd = " ".join(
         [
             "set -eu;",
-            "echo 'eez-node: sourcing /out/deployments.env';",
             "test -f /out/deployments.env;",
-            "grep -E '^(EEZ_REGISTRY_ADDRESS|EEZ_REGISTRY_DEPLOY_BLOCK|EEZ_ROLLUP_ID|EEZ_INITIAL_STATE_ROOT|EEZ_L1_L2_PROXY|EEZ_L1_BRIDGE_SENDER)=' /out/deployments.env;",
             "set -a; . /out/deployments.env; set +a;",
-            'echo "eez-node: loaded EEZ_REGISTRY_ADDRESS=$EEZ_REGISTRY_ADDRESS EEZ_ROLLUP_ID=$EEZ_ROLLUP_ID EEZ_INITIAL_STATE_ROOT=$EEZ_INITIAL_STATE_ROOT";',
             "exec eez-composer node",
             "--chain=/out/l2-genesis.json",
             "--datadir=$EEZ_L2_DATADIR",
+            "--log.stdout.format=json",
+            "--log.file.max-files=0",
             "--http --http.addr=0.0.0.0 --http.port=$EEZ_L2_HTTP_PORT --http.api=eth,net,web3,debug,trace",
             "--authrpc.addr=127.0.0.1 --authrpc.port=$EEZ_L2_AUTH_PORT",
             "--port=$EEZ_L2_P2P_PORT --discovery.port=$EEZ_L2_P2P_PORT",

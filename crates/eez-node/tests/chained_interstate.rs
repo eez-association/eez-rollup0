@@ -567,8 +567,10 @@ async fn mixed_direction_state_chain_in_one_slot() {
     .await
     .expect("outbound add must be admitted");
 
-    assert_receipt_ok(&l1_rpc, inbound, "inbound increment").await;
-    assert_receipt_ok(&l2_rpc, outbound, "outbound add").await;
+    tokio::join!(
+        assert_receipt_ok(&l1_rpc, inbound, "inbound increment"),
+        assert_receipt_ok(&l2_rpc, outbound, "outbound add"),
+    );
     wait_for_count(&l2_rpc, l2_counter, 1, "L2 counter").await;
     wait_for_count(&l1_rpc, l1_counter, 5, "L1 counter").await;
 

@@ -186,8 +186,12 @@ async fn minimal_bidirectional_cross_chain_smoke() {
     .await
     .expect("outbound smoke transaction must be admitted");
 
-    assert_all_transactions_succeeded(&w, &l1_rpc, &[inbound], "inbound smoke").await;
-    assert_all_transactions_succeeded(&w, &l2_rpc, &[outbound], "outbound smoke").await;
+    let inbound_hashes = [inbound];
+    let outbound_hashes = [outbound];
+    tokio::join!(
+        assert_all_transactions_succeeded(&w, &l1_rpc, &inbound_hashes, "inbound smoke"),
+        assert_all_transactions_succeeded(&w, &l2_rpc, &outbound_hashes, "outbound smoke"),
+    );
 
     let (eez, rollup_id) = (w.cfg.eez_address, w.cfg.rollup_id);
     let converged = wait_for(SETTLE_TIMEOUT, || {
@@ -550,7 +554,7 @@ async fn direct_ccm_l2_outbound_call_is_rejected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
     // Sustained matrix: direct, no-return, wrapper, and value-transfer calls
-    // in both directions. Per-wave receipt checks avoid ingress nonce races.
+    // in both directions.
     let w = setup_cross_chain().await.unwrap();
     let l1_rpc = w.l1_rpc();
     let l1_xchain = w.l1_xchain();
@@ -572,10 +576,9 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
     let mut outbound_hashes = Vec::new();
 
     for (set_v, dep_v) in WAVE_SETTERS.iter().zip(WAVE_DEPOSITS.iter()) {
-        // Let each wave settle before deriving the next source nonces. A compose
-        // tick removes held transactions before they land on the source chain,
-        // so caching nonces across waves races the ingress gate's
-        // `on_chain + held` validation.
+        // Each wave settles before the next source nonces are derived. A compose
+        // tick can leave the prior wave in flight, so deriving from chain state
+        // before its receipts land would reuse those reserved nonces.
         let mut l1_nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
         let mut l2_nonce = onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
         let inbound_wave_start = inbound_hashes.len();
@@ -667,20 +670,20 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
             l2_nonce += 1;
         }
 
-        assert_all_transactions_succeeded(
-            &w,
-            &l1_rpc,
-            &inbound_hashes[inbound_wave_start..],
-            "inbound wave",
-        )
-        .await;
-        assert_all_transactions_succeeded(
-            &w,
-            &l2_rpc,
-            &outbound_hashes[outbound_wave_start..],
-            "outbound wave",
-        )
-        .await;
+        tokio::join!(
+            assert_all_transactions_succeeded(
+                &w,
+                &l1_rpc,
+                &inbound_hashes[inbound_wave_start..],
+                "inbound wave",
+            ),
+            assert_all_transactions_succeeded(
+                &w,
+                &l2_rpc,
+                &outbound_hashes[outbound_wave_start..],
+                "outbound wave",
+            ),
+        );
     }
 
     let expected_per_direction = WAVE_SETTERS.len() * 4;

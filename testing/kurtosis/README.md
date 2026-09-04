@@ -377,7 +377,7 @@ Available modes are:
 | --- | --- |
 | `inbound` | L1-to-L2 calls, including a deposit and direct/wrapped contract calls. |
 | `outbound` | L2-to-L1 calls, including a withdrawal and direct/wrapped contract calls. |
-| `mixed` | Inbound and outbound calls submitted for the same Sync block. |
+| `mixed` | Inbound and outbound calls exercised in one workload. |
 | `mixed-pure` | Mixed traffic plus ordinary L2 mempool transactions between waves. |
 
 Each workload verifies transaction inclusion, cross-chain state convergence,
@@ -396,6 +396,8 @@ Useful workload controls include:
   default is two.
 - `EEZ_RECEIPT_WAIT_SECS`: transaction inclusion timeout; the default is 300
   seconds.
+- `EEZ_EFFECTS_WAIT_SECS`: destination-state convergence timeout after source
+  receipts land; the default is 120 seconds.
 - `EEZ_STATE_ROOT_WAIT_SECS`: state-root convergence timeout; the default is 30
   seconds.
 
@@ -410,10 +412,12 @@ chaining in each direction. It requires each group of three transactions to
 share one Sync block and asserts every ordered return: repeated destination
 calls return `changed = true, false, false`, source-derived calls send
 `1, 2, 3`, and the mixed sequence proves that fixed and source-derived calls
-see one another's intermediate state. A final mixed-direction drain verifies
-that an outbound source transaction and inbound delivery share the canonical
-L2 Sync block. Every scenario also verifies bundle settlement, proof-signer
-acceptance, and L1/L2 state-root convergence.
+see one another's intermediate state. It also places a deployed non-proxy
+between two valid inbound calls and verifies that only the poison transaction
+is evicted while both ordered survivors settle. A final mixed-direction drain
+verifies that an outbound source transaction and inbound delivery share the
+canonical L2 Sync block. Every scenario also verifies bundle settlement,
+proof-signer acceptance, and L1/L2 state-root convergence.
 
 ### Run all included workloads
 

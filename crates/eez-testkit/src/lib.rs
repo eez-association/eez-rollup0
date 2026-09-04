@@ -1550,7 +1550,7 @@ impl NodeHandle {
             .with_context(|| format!("read node log {}", self.log_path.display()))?;
         Ok(contents
             .lines()
-            .filter(|line| patterns.iter().any(|pattern| line.contains(pattern)))
+            .filter(|line| json_line_matches(line, patterns))
             .count())
     }
 
@@ -1614,13 +1614,19 @@ fn last_lines(path: &std::path::Path, max: usize, patterns: Option<&[&str]>) -> 
     };
     let selected: Vec<&str> = contents
         .lines()
-        .filter(|line| patterns.is_none_or(|ps| ps.iter().any(|p| line.contains(p))))
+        .filter(|line| patterns.is_none_or(|patterns| json_line_matches(line, patterns)))
         .collect();
     let skip = selected.len().saturating_sub(max);
     selected[skip..].join("\n")
 }
 
-// The fmt subscriber prints these messages, not tracing event names.
+fn json_line_matches(line: &str, patterns: &[&str]) -> bool {
+    serde_json::from_str::<serde_json::Value>(line).is_ok()
+        && patterns.iter().any(|pattern| line.contains(pattern))
+}
+
+// These diagnostic filters inspect message fields inside JSON records. Test
+// assertions use stable event names wherever the producer exposes one.
 const SETTLEMENT_LOG_MARKERS: &[&str] = &[
     "remote prover attested the window",
     "dispatching bundle to builder",

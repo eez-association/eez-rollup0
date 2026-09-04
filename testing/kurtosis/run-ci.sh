@@ -173,7 +173,7 @@ L2="$l2" bash "$HERE/scripts/verify-eezl2-deployment.sh"
 
 while (( SECONDS < deadline )); do
     node_logs="$(timeout 10s kurtosis service logs "$KURTOSIS_ENCLAVE" eez-node 2>/dev/null || true)"
-    if grep -qE 'bundle outcome observed.*Included' <<<"$node_logs"; then
+    if grep -qE '"event_name":"eez.composer.bundle.observed".*"outcome":"Included' <<<"$node_logs"; then
         break
     fi
     sleep 5

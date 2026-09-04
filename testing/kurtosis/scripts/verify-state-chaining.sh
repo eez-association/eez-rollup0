@@ -50,6 +50,8 @@ INBOUND_KEY="${EEZ_STATE_CHAINING_IN_KEY:-0x$(openssl rand -hex 32)}"
 INBOUND_SENDER=$(cast wallet address --private-key "$INBOUND_KEY")
 OUTBOUND_KEY="${EEZ_STATE_CHAINING_OUT_KEY:-0x$(openssl rand -hex 32)}"
 OUTBOUND_SENDER=$(cast wallet address --private-key "$OUTBOUND_KEY")
+POISON_KEY="${EEZ_STATE_CHAINING_POISON_KEY:-0x$(openssl rand -hex 32)}"
+POISON_SENDER=$(cast wallet address --private-key "$POISON_KEY")
 EEZL2_ADDRESS="${EEZL2_ADDRESS:-0x4200000000000000000000000000000000000007}"
 L1_ROLLUP_ID="${EEZ_L1_ROLLUP_ID:-0}"
 RECEIPT_WAIT_SECS="${EEZ_STATE_CHAINING_WAIT_SECS:-300}"
@@ -62,13 +64,17 @@ refresh_node_log() { kurtosis service logs -a "$ENCLAVE" eez-node >"$NODE_LOG" 2
 refresh_signer_log() { kurtosis service logs -a "$ENCLAVE" eez-proof-signer >"$SIGNER_LOG" 2>&1 || true; }
 
 wait_for_sync_boundary() {
+    # These scenarios assert that all prepared calls share one composed Sync
+    # slot, so submit them immediately after the previous pool snapshot.
     local baseline count=0 deadline
     refresh_node_log
-    baseline=$(strip_ansi <"$NODE_LOG" | grep -Fc 'eez.composer.sync_slot.drain' || true)
+    baseline=$(strip_ansi <"$NODE_LOG" \
+        | grep -Fc '"event_name":"eez.composer.sync_slot.drain"' || true)
     deadline=$((SECONDS + ${EEZ_SYNC_BOUNDARY_WAIT_SECS:-60}))
     while (( SECONDS < deadline )); do
         refresh_node_log
-        count=$(strip_ansi <"$NODE_LOG" | grep -Fc 'eez.composer.sync_slot.drain' || true)
+        count=$(strip_ansi <"$NODE_LOG" \
+            | grep -Fc '"event_name":"eez.composer.sync_slot.drain"' || true)
         (( count > baseline )) && return 0
         sleep 1
     done
@@ -148,18 +154,18 @@ assert_proof_for_height() {
         refresh_signer_log
         node_evidence=$(sed -n "$((node_baseline + 1)),\$p" "$NODE_LOG" | strip_ansi)
         signer_evidence=$(sed -n "$((signer_baseline + 1)),\$p" "$SIGNER_LOG" | strip_ansi)
-        settled=$(grep -F 'eez.composer.bundle.observed' <<<"$node_evidence" \
-            | grep -E "sync_height=$sync_height([^0-9]|\$)|\"sync_height\":$sync_height([^0-9]|\$)" \
-            | grep -E 'settled=true|"settled":true' | tail -1 || true)
-        attested_hash=$(grep -F 'eez.prover_client.attested' <<<"$node_evidence" \
-            | grep -E "to=$sync_height([^0-9]|$)|\"to\":$sync_height([^0-9]|$)" \
-            | grep -oE 'hash[":=]+"?0x[0-9a-fA-F]{64}' \
-            | tail -1 | sed -E 's/^hash[":=]+"?//' || true)
+        settled=$(grep -F '"event_name":"eez.composer.bundle.observed"' <<<"$node_evidence" \
+            | grep -F "\"sync_height\":$sync_height," \
+            | grep -F '"settled":true' | tail -1 || true)
+        attested_hash=$(grep -F '"event_name":"eez.prover_client.attested"' <<<"$node_evidence" \
+            | grep -F "\"to\":$sync_height," \
+            | grep -oE '"hash":"0x[0-9a-fA-F]{64}"' \
+            | tail -1 | cut -d'"' -f4 || true)
         signed=""
         if [[ -n "$attested_hash" ]]; then
-            signed=$(grep -F 'eez.proof_signer.window_signed' <<<"$signer_evidence" \
-                | grep -E "validated_to_block=$sync_height([^0-9]|$)|\"validated_to_block\":$sync_height([^0-9]|$)" \
-                | grep -E "recomputed_public_inputs_hash=$attested_hash|\"recomputed_public_inputs_hash\":\"$attested_hash\"" \
+            signed=$(grep -F '"event_name":"eez.proof_signer.window_signed"' <<<"$signer_evidence" \
+                | grep -F "\"validated_to_block\":$sync_height," \
+                | grep -F "\"recomputed_public_inputs_hash\":\"$attested_hash\"" \
                 | tail -1 || true)
         fi
         [[ -n "$settled" && -n "$signed" ]] && {
@@ -380,6 +386,106 @@ run_mixed_direction_scenario() {
     assert_root_convergence "$sync_height"
 }
 
+run_poison_mid_bundle_scenario() {
+    local target proxy wrapper survivor_nonce poison_nonce gas_price
+    local first_raw poison_raw second_raw first_hash poison_hash second_hash
+    local node_baseline signer_baseline source_blocks target_logs target_blocks sync_height
+    local poison_target_before deadline evidence first_result second_result
+
+    echo
+    echo "==> inbound poison-mid-bundle recovery: deploying an isolated state chain"
+    target=$(forge_deploy "$L2" "$L2_DEPLOY_KEY" DeployValueL2.s.sol:DeployValueL2 \
+        'run(uint256)' 0 | grab_address EEZ_VALUE_ADDRESS)
+    proxy=$(forge_deploy "$L1" "$L1_DEPLOY_KEY" CreateValueProxy.s.sol:CreateValueProxy \
+        'run(address,address,uint64)' "$EEZ_REGISTRY_ADDRESS" "$target" "$EEZ_ROLLUP_ID" \
+        | grab_address EEZ_VALUE_PROXY)
+    wrapper=$(forge_deploy "$L1" "$L1_DEPLOY_KEY" DeploySetterWrapperL1.s.sol:DeploySetterWrapperL1 \
+        'run(address)' "$proxy" | grab_address EEZ_SETTER_WRAPPER)
+    [[ -n "$target" && -n "$proxy" && -n "$wrapper" ]] \
+        || { echo "poison recovery deployment failed" >&2; return 1; }
+
+    survivor_nonce=$(retry cast nonce "$INBOUND_SENDER" --rpc-url "$L1")
+    poison_nonce=$(retry cast nonce "$POISON_SENDER" --rpc-url "$L1")
+    gas_price=$(gas_price_for "$L1")
+    poison_target_before=$(retry cast call "$L1_VALUE" 'value()(uint256)' --rpc-url "$L1")
+
+    first_raw=$(cast mktx --chain-id "$(cast chain-id --rpc-url "$L1")" \
+        --private-key "$INBOUND_KEY" --nonce "$survivor_nonce" --gas-limit 800000 \
+        --gas-price "$gas_price" --priority-gas-price "$PRIORITY_GAS_PRICE" \
+        "$wrapper" 'setNextValueViaProxy()')
+    poison_raw=$(cast mktx --chain-id "$(cast chain-id --rpc-url "$L1")" \
+        --private-key "$POISON_KEY" --nonce "$poison_nonce" --gas-limit 600000 \
+        --gas-price "$gas_price" --priority-gas-price "$PRIORITY_GAS_PRICE" \
+        "$L1_VALUE" 'setValue(uint256)' 999)
+    second_raw=$(cast mktx --chain-id "$(cast chain-id --rpc-url "$L1")" \
+        --private-key "$INBOUND_KEY" --nonce "$((survivor_nonce + 1))" --gas-limit 800000 \
+        --gas-price "$gas_price" --priority-gas-price "$PRIORITY_GAS_PRICE" \
+        "$wrapper" 'setNextValueViaProxy()')
+    [[ "$first_raw" =~ ^0x[0-9a-fA-F]+$ && "$poison_raw" =~ ^0x[0-9a-fA-F]+$ \
+        && "$second_raw" =~ ^0x[0-9a-fA-F]+$ ]] \
+        || { echo "could not build poison recovery transactions" >&2; return 1; }
+    first_hash=$(cast keccak "$first_raw")
+    poison_hash=$(cast keccak "$poison_raw")
+    second_hash=$(cast keccak "$second_raw")
+
+    # The placement is the assertion: valid, deployed non-proxy, valid in one
+    # drain. A separate poison sender avoids intentionally evicting a survivor.
+    wait_for_sync_boundary
+    refresh_node_log
+    refresh_signer_log
+    node_baseline=$(wc -l <"$NODE_LOG")
+    signer_baseline=$(wc -l <"$SIGNER_LOG")
+    send_front "$L1F" "$first_raw" "$first_hash"
+    send_front "$L1F" "$poison_raw" "$poison_hash"
+    send_front "$L1F" "$second_raw" "$second_hash"
+
+    wait_for_receipts "$L1" "$first_hash" "$second_hash"
+    first_result=$(wrapped_result "$first_hash" "$L1" "$wrapper")
+    second_result=$(wrapped_result "$second_hash" "$L1" "$wrapper")
+    [[ "$first_result" == '[1,true,true,1]' && "$second_result" == '[2,true,true,2]' ]] \
+        || { echo "poison survivors returned $first_result and $second_result" >&2; return 1; }
+    source_blocks=$(unique_receipt_block "$L1" "$first_hash" "$second_hash")
+    [[ $(wc -l <<<"$source_blocks" | tr -d ' ') == 1 ]] \
+        || { echo "poison survivors landed in different source blocks" >&2; return 1; }
+
+    deadline=$((SECONDS + RECEIPT_WAIT_SECS))
+    evidence=""
+    while (( SECONDS < deadline )); do
+        refresh_node_log
+        evidence=$(sed -n "$((node_baseline + 1)),\$p" "$NODE_LOG" | strip_ansi \
+            | grep -F '"event_name":"eez.composer.cc_compose.poison_eviction_completed"' \
+            | grep -F "\"tx_hash\":\"$poison_hash\"" \
+            | grep -F '"direction":"Inbound"' | tail -1 || true)
+        [[ -n "$evidence" ]] && break
+        sleep 2
+    done
+    [[ -n "$evidence" && "$(receipt_status "$poison_hash" "$L1")" == "missing" ]] \
+        || { echo "deployed non-proxy was not poison-evicted" >&2; return 1; }
+    [[ $(retry cast call "$L1_VALUE" 'value()(uint256)' --rpc-url "$L1") == "$poison_target_before" ]] \
+        || { echo "poison transaction changed its source target" >&2; return 1; }
+
+    deadline=$((SECONDS + RECEIPT_WAIT_SECS))
+    target_logs='[]'
+    while (( SECONDS < deadline )); do
+        target_logs=$(retry cast logs --address "$target" --from-block 0 --to-block latest \
+            'ValueSet(address,uint256)' --rpc-url "$L2" --json)
+        (( $(jq -r 'length' <<<"$target_logs") >= 2 )) && break
+        sleep 3
+    done
+    [[ $(jq -r 'length' <<<"$target_logs") == 2 ]] \
+        || { echo "poison survivors did not produce exactly two destination effects" >&2; return 1; }
+    target_blocks=$(jq -r '[.[].blockNumber] | unique | .[]' <<<"$target_logs")
+    [[ $(wc -l <<<"$target_blocks" | tr -d ' ') == 1 ]] \
+        || { echo "poison survivors split across Sync blocks" >&2; return 1; }
+    [[ $(retry cast call "$target" 'value()(uint256)' --rpc-url "$L2") == "2" ]] \
+        || { echo "poison survivor chain did not converge to value 2" >&2; return 1; }
+
+    sync_height=$(cast to-dec "$target_blocks")
+    echo "    ✓ poison evicted; both ordered survivors settled in Sync height $sync_height"
+    assert_proof_for_height "$sync_height" "$node_baseline" "$signer_baseline"
+    assert_root_convergence "$sync_height"
+}
+
 echo "════════════════════════════════════════════════════════════════"
 echo " STATE CHAINING TEST (kurtosis)"
 echo "════════════════════════════════════════════════════════════════"
@@ -394,6 +500,7 @@ cast block-number --rpc-url "$L2" >/dev/null || { echo "L2 RPC is not reachable"
 echo "==> funding fresh source accounts"
 fund "$L1" "$FUNDING_KEY" "$INBOUND_SENDER"
 fund "$L2" "$L2_DEPLOY_KEY" "$OUTBOUND_SENDER"
+fund "$L1" "$FUNDING_KEY" "$POISON_SENDER"
 
 echo "==> deploying stateful targets and source-side wrappers"
 L2_VALUE=$(forge_deploy "$L2" "$L2_DEPLOY_KEY" DeployValueL2.s.sol:DeployValueL2 'run(uint256)' 0 \
@@ -426,6 +533,7 @@ run_scenario outbound destination "$L2" "$L2F" "$OUTBOUND_KEY" "$OUTBOUND_SENDER
     "$OUTBOUND_WRAPPER" "$L1_VALUE" "$L1"
 run_scenario outbound mixed "$L2" "$L2F" "$OUTBOUND_KEY" "$OUTBOUND_SENDER" \
     "$OUTBOUND_WRAPPER" "$L1_VALUE" "$L1"
+run_poison_mid_bundle_scenario
 run_mixed_direction_scenario
 
 echo
