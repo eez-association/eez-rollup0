@@ -633,11 +633,8 @@ async fn mixed_direction_state_chain_in_one_slot() {
 /// rather than reserving it a slot (claims 1 and 3) — and composition must
 /// keep running instead of freezing the window.
 ///
-/// Poison here is the harness's established form (`scripts/xchain-test.sh`): a
-/// cross-chain submission whose `to` is not a proxy, so the source simulation
-/// records no cross-chain call and the tx can never compose. Its sender is
-/// distinct from the survivors' because eviction cascades along a sender's
-/// nonce chain.
+/// Poison targets a DEPLOYED non-proxy: no cross-chain call is recorded, so it
+/// can never compose. Codeless targets are refused at the front now.
 ///
 /// Without the redesign the poison degrades the whole slot and the survivors'
 /// claims come from isolated sims (both `1`), so nothing settles at all.
@@ -658,7 +655,6 @@ async fn poison_mid_bundle_leaves_survivors_correct() {
     )
     .await
     .unwrap();
-
     open_drain_window(&w).await;
     let mut nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
     let first = sign_and_send(

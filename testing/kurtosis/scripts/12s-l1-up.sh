@@ -40,7 +40,13 @@ docker rm -f bs-frontend-public 2>/dev/null || true
 kurtosis enclave rm -f "$ENCLAVE" 2>/dev/null || true
 
 echo "==> [2/7] launch L1-only enclave ($ENCLAVE)"
-kurtosis run github.com/ethpandaops/ethereum-package --enclave "$ENCLAVE" --args-file "$ARGS" || {
+# Pinned to the commit before ethereum-package#1461 ("default execution
+# clients to discv5-only with ENR bootnodes"). After it, reth ELs are given
+# --bootnodes=enr:..., which ethpandaops/reth-rbuilder cannot parse — its
+# newest published build (2026-07-17) only accepts enode URLs, so the
+# builder refuses to start and the enclave never comes up.
+PACKAGE="${ETHEREUM_PACKAGE:-github.com/ethpandaops/ethereum-package@199620b24ac979c676010c5a68b2893c2bce4f1f}"
+kurtosis run "$PACKAGE" --enclave "$ENCLAVE" --args-file "$ARGS" || {
   echo "✗ failed to launch enclave $ENCLAVE" >&2; exit 1; }
 
 # host-port resolver: "kurtosis port print" → strip scheme, keep :PORT

@@ -290,14 +290,27 @@ impl Inner {
                 .await
             }
             Err(L1Error::BundleRpcUnsupported) => {
-                event!(
-                    name: "eez.submitter.bundle.mempool_fallback",
-                    Level::INFO,
-                    event_name = "eez.submitter.bundle.mempool_fallback",
-                    target_block,
-                    tx_count = raw_txs.len(),
-                    "relay has no eth_sendBundle; submitting txs via mempool in order",
-                );
+                // A multi-tx bundle needs its order kept: the deferred entries
+                // chain, so a reordered user tx finds no entry and reverts.
+                if raw_txs.len() > 1 {
+                    event!(
+                        name: "eez.submitter.bundle.mempool_fallback",
+                        Level::WARN,
+                        event_name = "eez.submitter.bundle.mempool_fallback",
+                        target_block,
+                        tx_count = raw_txs.len(),
+                        "relay has no eth_sendBundle; the mempool does NOT guarantee bundle order, so bundled user txs may revert",
+                    );
+                } else {
+                    event!(
+                        name: "eez.submitter.bundle.mempool_fallback",
+                        Level::INFO,
+                        event_name = "eez.submitter.bundle.mempool_fallback",
+                        target_block,
+                        tx_count = raw_txs.len(),
+                        "relay has no eth_sendBundle; submitting the lone postBatch via mempool",
+                    );
+                }
                 let target_provider = self.build_target_provider();
                 for (idx, raw) in raw_txs.iter().enumerate() {
                     if let Err(err) = alloy_provider::Provider::send_raw_transaction(

@@ -49,7 +49,14 @@ PACE_N="${EEZ_PACE_N:-0}"; PACE_INT="${EEZ_PACE_INTERVAL:-10}"
 DO_RESTART="${EEZ_RESTART:-0}"
 
 # ── Keys (testnet only) ──────────────────────────────────────────────
-OP=0x2248a31395af28e24349c8e566c19475a79cb610389204ab26bc585493e5cf27       # funded operator (L1 deploys + funding)
+# Funds every ephemeral sender this run creates, on BOTH chains. Its address
+# must hold funds before you start — see the preflight check below, which
+# refuses to run rather than failing later inside the matrix.
+#
+# Not a chain-agnostic default: a chiado operator is broke on a devnet L1 and
+# vice versa. Override per environment, e.g. hardhat #1 on a Kurtosis devnet:
+#   EEZ_OP_KEY=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
+OP="${EEZ_OP_KEY:-0x2248a31395af28e24349c8e566c19475a79cb610389204ab26bc585493e5cf27}"
 HH_KEY_2=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a  # L2 deployer / pure sender (genesis alloc)
 HH_ADDR_2=0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC
 # Fresh random recipients per run — a FIXED recipient's cross-chain proxy would
@@ -60,7 +67,20 @@ L2_DEP_RECIPIENT=$(rand_addr); L1_WD_RECIPIENT=$(rand_addr)
 
 for t in cast forge jq curl docker python3; do command -v "$t" >/dev/null || { echo "✗ $t not in PATH"; exit 1; }; done
 docker inspect "$NODE_CONTAINER" >/dev/null 2>&1 || { echo "✗ container '$NODE_CONTAINER' not up — run scripts/chiado-up.sh"; exit 1; }
-[[ "$(cast chain-id --rpc-url "$L1" 2>/dev/null)" == "10200" ]] || { echo "✗ embedded L1 not on :18645"; exit 1; }
+[[ "$(cast chain-id --rpc-url "$L1" 2>/dev/null)" == "${EEZ_L1_CHAIN_ID:-10200}" ]] || { echo "✗ embedded L1 chain-id != ${EEZ_L1_CHAIN_ID:-10200} on :18645"; exit 1; }
+# The funder must be solvent on BOTH chains before anything is submitted. An
+# unfunded funder otherwise surfaces much later as "lack of funds for max fee"
+# on a random sender, which reads like a protocol failure.
+OP_ADDR=$(cast wallet address --private-key "$OP")
+OP_MIN="${EEZ_OP_MIN_WEI:-2000000000000000000}"          # 2 ETH covers a matrix run
+for pair in "L1:$L1" "L2:$L2"; do
+  bal=$(cast balance "$OP_ADDR" --rpc-url "${pair#*:}" 2>/dev/null || echo 0)
+  [[ "$(python3 -c "print(1 if ${bal:-0} >= $OP_MIN else 0)")" == 1 ]] || {
+    echo "✗ funder $OP_ADDR has ${bal:-0} wei on ${pair%%:*} (need >= $OP_MIN)."
+    echo "  Send funds to $OP_ADDR on ${pair%%:*}, or set EEZ_OP_KEY to a funded key."
+    exit 1; }
+done
+echo "  funder $OP_ADDR solvent on both chains"
 [[ -f "$REPO/deployments.env" ]] || { echo "✗ deployments.env missing — deploy first"; exit 1; }
 set -a; source "$REPO/deployments.env"; set +a
 L1_CID=$(cast chain-id --rpc-url "$L1"); L2_CID=$(cast chain-id --rpc-url "$L2")
@@ -108,7 +128,41 @@ fund_pool(){ # <funder_key> <rpc> <amount> <key...>
     local ok=0; for _ in $(seq 1 45); do [[ "$(cast nonce "$faddr" --rpc-url "$rpc" 2>/dev/null||echo "$n0")" -ge "$((n0+i))" ]] && { ok=1; break; }; sleep 2; done
     [[ "$ok" == 1 ]] || { echo "    ⚠ batch stalled at $sent/${#keys[@]} (funder txs not mining — node not including mempool?)"; return 1; }
     sent=$((sent+i)); echo "    funded $sent/${#keys[@]}"
-  done; return 0; }
+  done
+  # The funder's nonce advancing does NOT mean every recipient got paid. A
+  # dropped straggler leaves a 0-balance sender, which only surfaces much later
+  # as "lack of funds for max fee" when its cross-chain tx is simulated.
+  local want_min i2 k a b; local -a missing=()
+  want_min=$(python3 -c "print($amt // 2)")
+  for round in 1 2 3; do
+    missing=()
+    for k in "${keys[@]}"; do
+      a=$(cast wallet address --private-key "$k")
+      b=$(cast balance "$a" --rpc-url "$rpc" 2>/dev/null || echo 0)
+      [[ "$(python3 -c "print(1 if ${b:-0} < $want_min else 0)")" == 1 ]] && missing+=("$k")
+    done
+    [[ "${#missing[@]}" -eq 0 ]] && { echo "    balances verified ${#keys[@]}/${#keys[@]}"; return 0; }
+    echo "    ⚠ round $round: ${#missing[@]} sender(s) underfunded — re-funding"
+    n0=$(cast nonce "$faddr" --rpc-url "$rpc"); i2=0
+    for k in "${missing[@]}"; do
+      cast send "$(cast wallet address --private-key "$k")" --value "$amt" --private-key "$fk" --rpc-url "$rpc" --nonce "$((n0+i2))" --gas-price 2000000000 --priority-gas-price 1500000000 --async >/dev/null 2>&1
+      i2=$((i2+1))
+    done
+    for _ in $(seq 1 45); do [[ "$(cast nonce "$faddr" --rpc-url "$rpc" 2>/dev/null||echo "$n0")" -ge "$((n0+i2))" ]] && break; sleep 2; done
+  done
+  # The last round's re-funding is still unverified here: the wait above only
+  # proves the funder's nonce moved, which is exactly what this function already
+  # says is not proof of payment. Rescan, or a successful final retry is reported
+  # as a failure and sends the reader chasing a funding bug that does not exist.
+  missing=()
+  for k in "${keys[@]}"; do
+    a=$(cast wallet address --private-key "$k")
+    b=$(cast balance "$a" --rpc-url "$rpc" 2>/dev/null || echo 0)
+    [[ "$(python3 -c "print(1 if ${b:-0} < $want_min else 0)")" == 1 ]] && missing+=("$k")
+  done
+  [[ "${#missing[@]}" -eq 0 ]] && { echo "    balances verified ${#keys[@]}/${#keys[@]}"; return 0; }
+  echo "    ✗ ${#missing[@]} sender(s) STILL underfunded — their cross-chain txs will fail simulation"
+  return 1; }
 
 fdep(){ local rpc="$1" key="$2" sc="$3" sig="$4"; shift 4; local addr n0
   addr=$(cast wallet address --private-key "$key"); n0=$(cast nonce "$addr" --rpc-url "$rpc" 2>/dev/null); n0=${n0:-0}
@@ -223,6 +277,9 @@ else
   echo "==> settling (up to 300s)"; EXP_V=$((40+WAVES+100)); OK=1
   for _ in $(seq 1 100); do [[ "$(cast call "$L1_VALUE" 'value()(uint256)' --rpc-url "$L1" 2>/dev/null|awk '{print $1}')" == "$EXP_V" && "$(cast call "$L2_VALUE" 'value()(uint256)' --rpc-url "$L2" 2>/dev/null|awk '{print $1}')" == "$EXP_V" ]] && break; sleep 3; done
   echo "    --- effect assertions ---"
+  # Recipients are random per run; print them or a failed assertion cannot be
+  # post-mortemed after the script exits.
+  echo "    (deposit recipient $L2_DEP_RECIPIENT on L2, withdraw recipient $L1_WD_RECIPIENT on L1)"
   chk(){ [[ "$1" == "$2" ]] && echo "    ✓ $3 == $1" || { echo "    ✗ $3 got=$1 want=$2"; OK=0; }; }
   chk "$(cast call "$L2_VALUE" 'value()(uint256)' --rpc-url "$L2"|awk '{print $1}')" "$EXP_V" "L2 Value (inbound wrapper)"
   chk "$(cast call "$L1_VALUE" 'value()(uint256)' --rpc-url "$L1"|awk '{print $1}')" "$EXP_V" "L1 Value (outbound wrapper)"
@@ -249,10 +306,22 @@ PY
 )
 pbb=$(grep -oE 'l1_block: [0-9]+' <<<"$clean"|grep -oE '[0-9]+$'|sort -n|uniq); consec=0 gap=0 prev=""
 for b in $pbb; do [[ -n "$prev" ]] && { [[ $((b-prev)) -eq 1 ]] && consec=$((consec+1)) || gap=$((gap+1)); }; prev=$b; done
-drops=$(grep -c 'target block passed without inclusion' <<<"$clean"); evict=$(grep -c 'evicted after MAX_BUNDLE_ATTEMPTS' <<<"$clean")
+# Count the authoritative outcome, not a message only some drop paths emit.
+drops=$(grep -c 'outcome=Dropped' <<<"$clean")
+# Both eviction paths: 3-strike bundle give-up AND deterministic simulation failure.
+evict=$(grep -cE 'evicted after MAX_BUNDLE_ATTEMPTS|fails simulation deterministically; evicting' <<<"$clean")
 div=$(grep -cE 'diverged from L1-confirmed|local L2 state root differs' <<<"$clean")
-l1r=$(cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' "$EEZ_ROLLUP_ID" --rpc-url "$L1" 2>/dev/null|sed -n '2p'|tr -d '[:space:]')
-l2r=$(cast block safe --rpc-url "$L2" --json 2>/dev/null|jq -r '.stateRoot//empty'); recon=$([[ -n "$l1r" && "${l1r,,}" == "${l2r,,}" ]] && echo PASS || echo FAIL)
+# L2 safe lags L1 stored by up to one batch, so a single sample false-FAILs
+# often. Retry and pass on any match; a real divergence never matches, and
+# `div` catches it independently.
+recon=FAIL; recon_n=0
+for _ in $(seq 1 12); do
+  recon_n=$((recon_n+1))
+  l1r=$(cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' "$EEZ_ROLLUP_ID" --rpc-url "$L1" 2>/dev/null|sed -n '2p'|tr -d '[:space:]')
+  l2r=$(cast block safe --rpc-url "$L2" --json 2>/dev/null|jq -r '.stateRoot//empty')
+  [[ -n "$l1r" && "${l1r,,}" == "${l2r,,}" ]] && { recon=PASS; break; }
+  sleep 5
+done
 
 echo; echo "════════════════════ RESULTS ($MODE) ════════════════════"
 if [[ "$MODE" == load ]]; then
@@ -261,6 +330,6 @@ if [[ "$MODE" == load ]]; then
   printf "  TOTAL settled: %s/%s\n" "$((IN_OK+OUT_OK))" "$((IN_N+OUT_N))"
 fi
 echo "  N+1 next-slot hit-rate: $n1   |  postBatch L1 blocks: consecutive=$consec gapped=$gap"
-echo "  bundle target-misses(drops)=$drops  evictions(3-strike)=$evict  |  divergence=$div  reconcile=$recon"
+echo "  bundle target-misses(drops)=$drops  evictions=$evict  |  divergence=$div  reconcile=$recon (after $recon_n sample(s))"
 echo "═══════════════════════════════════════════════════════════"
 [[ "${OK:-1}" == 1 && "$div" -eq 0 && "$recon" == PASS ]] && { echo "✓ PASS (sound: 0 divergence, L1==L2)"; exit 0; } || { echo "✗ CHECK (see above)"; exit 1; }

@@ -26,8 +26,8 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider as _;
 use async_trait::async_trait;
 use eez_driver::{
-    BlockCommitterHandle, MAX_BLOCKS_PER_BATCH, ParentContext, RollupTiming, SyncSlotBlock,
-    SyncSlotComposer, SyncSlotMode,
+    BUILDER_GAS_LIMIT, BlockCommitterHandle, MAX_BLOCKS_PER_BATCH, ParentContext, RollupTiming,
+    SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
     witness::{ExecutionWitnessMode, block_witness},
 };
 use eez_l1::{BundleTarget, L1Event, SendOutcome, Submitter};
@@ -167,6 +167,8 @@ fn seed_session(
 /// The sessions come back with the composition: the caller commits their
 /// effects on accept and drops them on eviction.
 ///
+/// Third element is the probed target gas: the call runs again inside
+/// `postAndVerifyBatch`, so the budget charges for it.
 /// # Errors
 ///
 /// Source-side executor failures and composition/finalize failures, classified
@@ -183,7 +185,7 @@ fn compose_crosschain(
     sessions: SlotSessions,
     source_state: &mut crate::local::build::DraftDb,
     source_env: reth_evm::EvmEnvFor<EthEvmConfig>,
-) -> eez_protocol::ComposerResult<(eez_protocol::Composition, SlotSessions)> {
+) -> eez_protocol::ComposerResult<(eez_protocol::Composition, SlotSessions, u64)> {
     use eez_protocol::ChainClient as _;
     use eez_protocol::composition::Rollup;
 
@@ -225,6 +227,7 @@ fn compose_crosschain(
         .simulate_source_tx_on(raw_tx.to_vec(), &mut builder, source_state, source_env)
         .map_err(eez_protocol::CompositionError::from)?;
     let recorded_count = builder.recorded_count();
+    let target_gas = builder.recorded_gas_used();
     // Reclaimed before `finalize` consumes the builder — the accepted effects
     // live in the sessions, not in the composition.
     let sessions = builder.take_sessions();
@@ -253,10 +256,11 @@ fn compose_crosschain(
         name: "composer.simulate.complete",
         target_count = composition.targets.len(),
         recorded = recorded_count,
+        target_gas,
         "composition complete"
     );
 
-    Ok((composition, sessions))
+    Ok((composition, sessions, target_gas))
 }
 
 impl std::fmt::Debug for CrossChainWiring {
@@ -282,26 +286,6 @@ impl std::fmt::Debug for CrossChainWiring {
 /// bundle's inclusion block.
 pub const MAX_BUNDLE_ATTEMPTS: u32 = 3;
 
-/// Default execution allowance above the calldata floor — ~4x a small rich
-/// batch's measured 0.93M. Deferred-entry queue writes cost ~240k gas EACH,
-/// so a many-effect batch outgrows this: `EEZ_POSTBATCH_GAS_RESERVE`
-/// overrides. An under-reserved postBatch reverts out-of-gas in the
-/// builder's bundle simulation and is dropped SILENTLY — size it to the
-/// intended `EEZ_MAX_USER_TXS_PER_BUNDLE`.
-const DEFAULT_POST_BATCH_EXECUTION_GAS_RESERVE: u64 = 4_000_000;
-
-/// Execution reserve above the calldata floor (`EEZ_POSTBATCH_GAS_RESERVE`
-/// overrides; read once).
-fn post_batch_execution_gas_reserve() -> u64 {
-    static RESERVE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *RESERVE.get_or_init(|| {
-        std::env::var("EEZ_POSTBATCH_GAS_RESERVE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_POST_BATCH_EXECUTION_GAS_RESERVE)
-    })
-}
-
 /// Stand-in for `proofs[0]` when sizing before the prover runs (ECDSA is 65 B).
 const MAX_PROOF_BYTES: usize = 128;
 
@@ -309,11 +293,153 @@ const MAX_PROOF_BYTES: usize = 128;
 /// EIP-7825 per-tx cap, above which no tx is valid at any block gas limit.
 const DEFAULT_MAX_POSTBATCH_GAS: u64 = 16_777_216;
 
+/// The belt prices bytes the drain cannot see (ABI framing, proof, DA shape), so
+/// the drain must stop earlier or the same set requeues forever. Gap seen: 230k.
+const POSTBATCH_DRAIN_MARGIN: u64 = 600_000;
+
+/// Execution for a batch with just the leading immediate entry, calldata aside.
+/// Measured 139k, 10% slack; pinned by `contracts/test/PostBatchGasPins.t.sol`.
+const POSTBATCH_BASE_GAS_PIN: u64 = 160_000;
+
+/// One more entry costs EEZ.sol hashing, a state SSTORE, and a CREATE2 proxy
+/// deploy for a new sender. Same pin test; measured 334k worst case, 10% slack.
+const POSTBATCH_ENTRY_GAS_PIN: u64 = 370_000;
+
+/// Below this the drain admits nothing and evicts the first held tx as poison.
+const MIN_VIABLE_POSTBATCH_GAS: u64 =
+    projected_postbatch_gas(2, 0, 0).saturating_add(POSTBATCH_DRAIN_MARGIN);
+
 /// EIP-7623 calldata floor — below it the tx is invalid and dies at simulation.
 fn calldata_floor_gas(calldata: &[u8]) -> u64 {
     let nonzero = calldata.iter().filter(|byte| **byte != 0).count() as u64;
     let zero = calldata.len() as u64 - nonzero;
     21_000 + 10 * (zero + 4 * nonzero)
+}
+
+/// Exact standard-rate calldata gas: 4 per zero byte, 16 per non-zero byte.
+fn calldata_gas(bytes: &[u8]) -> u64 {
+    let nonzero = bytes.iter().filter(|byte| **byte != 0).count() as u64;
+    let zero = bytes.len() as u64 - nonzero;
+    4 * zero + 16 * nonzero
+}
+
+/// Whole-postBatch gas on EIP-7623's standard branch: tx base, calldata, pins,
+/// probed target calls. The floor branch is checked in `sign_post_batch_tx`.
+const fn projected_postbatch_gas(entry_count: u64, calldata_gas: u64, target_gas: u64) -> u64 {
+    21_000_u64
+        .saturating_add(POSTBATCH_BASE_GAS_PIN)
+        .saturating_add(POSTBATCH_ENTRY_GAS_PIN.saturating_mul(entry_count))
+        .saturating_add(calldata_gas)
+        .saturating_add(target_gas)
+}
+
+/// What one accepted held tx adds to the postBatch projection, per term.
+#[derive(Debug, Clone, Copy)]
+struct TxL1Gas {
+    /// `batch.entries` rows it contributes, each costing [`POSTBATCH_ENTRY_GAS_PIN`].
+    entries: u64,
+    /// Standard-rate gas for every byte it puts in the postBatch calldata.
+    calldata_gas: u64,
+    /// Probed cost of the target call EEZ.sol runs inline (outbound only).
+    target_gas: u64,
+}
+
+/// L1 gas one accepted tx adds. `da_entries`/`da_tx` are its DA copies; only
+/// outbound pays `target_gas` inline.
+fn projected_tx_l1_gas(
+    batch_entries: &[eez_protocol::abi::ExecutionEntrySol],
+    da_entries: &[eez_protocol::abi::ExecutionEntrySol],
+    da_tx: &[u8],
+    target_gas: u64,
+) -> TxL1Gas {
+    use alloy_sol_types::SolValue as _;
+    let encoded = |entries: &[eez_protocol::abi::ExecutionEntrySol]| -> u64 {
+        entries
+            .iter()
+            .map(|entry| calldata_gas(&entry.abi_encode()))
+            .sum()
+    };
+    TxL1Gas {
+        entries: batch_entries.len() as u64,
+        calldata_gas: encoded(batch_entries)
+            .saturating_add(encoded(da_entries))
+            .saturating_add(calldata_gas(da_tx)),
+        target_gas,
+    }
+}
+
+/// Running gas projection, so the drain stops before it builds a batch no L1
+/// block can run (EIP-7825 caps one tx at ~16.7M).
+#[derive(Debug, Clone, Copy)]
+struct PostBatchGasBudget {
+    cap: u64,
+    /// Running total, seeded with the leading immediate entry every postBatch
+    /// carries. The projection is linear, so costs just add.
+    projected: u64,
+}
+
+impl PostBatchGasBudget {
+    fn new(max_gas: u64) -> Self {
+        Self {
+            cap: max_gas.saturating_sub(POSTBATCH_DRAIN_MARGIN),
+            projected: projected_postbatch_gas(1, 0, 0),
+        }
+    }
+
+    /// Charge `cost` if it fits. `false` leaves the projection untouched, so the
+    /// caller can defer this tx and stop draining.
+    fn try_accept(&mut self, cost: TxL1Gas) -> bool {
+        let next = self
+            .projected
+            .saturating_add(POSTBATCH_ENTRY_GAS_PIN.saturating_mul(cost.entries))
+            .saturating_add(cost.calldata_gas)
+            .saturating_add(cost.target_gas);
+        if next > self.cap {
+            return false;
+        }
+        self.projected = next;
+        true
+    }
+}
+
+/// What the drain can do with a pair wanting `declared` gas on a Sync block
+/// that already holds `gas_used`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockGasFit {
+    /// Room in this block — accept.
+    Accept,
+    /// No room here, but an emptier block would take it: hold for a later slot.
+    Defer,
+    /// Over the whole block limit, so no slot can ever take it.
+    Unfittable,
+}
+
+/// Whether a pair fits the L2 Sync block. Sums DECLARED limits, which is what
+/// the builder refuses on; over-estimating only defers early, never overflows.
+const fn block_gas_fit(gas_used: u64, declared: u64, block_gas_limit: u64) -> BlockGasFit {
+    if gas_used.saturating_add(declared) <= block_gas_limit {
+        BlockGasFit::Accept
+    } else if declared > block_gas_limit {
+        BlockGasFit::Unfittable
+    } else {
+        BlockGasFit::Defer
+    }
+}
+
+/// Declared gas limit of a raw tx. An undecodable tx counts as the whole block
+/// so it is refused, never read as free space (`invariant 7`).
+fn declared_gas_limit(raw: &Bytes) -> u64 {
+    use alloy_consensus::Transaction as _;
+    use alloy_eips::eip2718::Decodable2718 as _;
+    reth_ethereum_primitives::TransactionSigned::decode_2718(&mut raw.as_ref())
+        .map_or(u64::MAX, |tx| tx.gas_limit())
+}
+
+/// The refused pair's numbers, for the block-gas cut event.
+#[derive(Debug, Clone, Copy)]
+struct BlockGasCut {
+    gas_used: u64,
+    declared: u64,
 }
 
 /// Emission bounds, resolved once at construction. `timing` is here for its
@@ -323,7 +449,7 @@ struct EmissionLimits {
     timing: RollupTiming,
     /// Cap on a batch's block span, `cursor+1 ..= terminal`.
     max_blocks: u64,
-    /// Cap on a postBatch tx's gas limit (floor + reserve).
+    /// Gas limit every postBatch is signed with, and the cap the drain uses.
     max_gas: u64,
 }
 
@@ -499,11 +625,10 @@ impl From<&str> for PreparePostBatchError {
 }
 
 /// Both ends are unusable and clamp to the default: above it no tx is valid
-/// (EIP-7825), and below `MIN_VIABLE` every emission path refuses forever.
+/// (EIP-7825), and below [`MIN_VIABLE_POSTBATCH_GAS`] every emission path
+/// refuses forever.
 fn clamp_max_postbatch_gas(requested: u64) -> u64 {
-    // `calldata_floor_gas` never returns below its 21_000 base.
-    let min_viable: u64 = post_batch_execution_gas_reserve() + 21_000;
-    if (min_viable..=DEFAULT_MAX_POSTBATCH_GAS).contains(&requested) {
+    if (MIN_VIABLE_POSTBATCH_GAS..=DEFAULT_MAX_POSTBATCH_GAS).contains(&requested) {
         return requested;
     }
     event!(
@@ -511,8 +636,8 @@ fn clamp_max_postbatch_gas(requested: u64) -> u64 {
         Level::ERROR,
         requested,
         clamped_to = DEFAULT_MAX_POSTBATCH_GAS,
-        reserve = post_batch_execution_gas_reserve(),
-        "EEZ_MAX_POSTBATCH_GAS is out of range (must leave room above the execution reserve and stay within the EIP-7825 tx gas cap) — clamping to the default",
+        min_viable = MIN_VIABLE_POSTBATCH_GAS,
+        "EEZ_MAX_POSTBATCH_GAS is out of range (must leave room for the drain margin plus one held tx, and stay within the EIP-7825 tx gas cap) — clamping to the default",
     );
     DEFAULT_MAX_POSTBATCH_GAS
 }
@@ -685,6 +810,37 @@ fn abort_rest(
     rest.extend(rest_of_phase);
     rest.extend(other_phase);
     rest
+}
+
+/// Back to the pool front in FIFO order, no attempt counted: nothing failed.
+/// One above a nonce evicted this drain is dropped; it can never land.
+fn requeue_unprocessed(
+    pool: &crate::HeldPool,
+    rollup_id: u64,
+    poison_gaps: &[(Address, Direction, u64)],
+    txs: Vec<(usize, HeldTx)>,
+) {
+    let mut requeue = restore_pool_order(txs);
+    let mut cascade_evicted = Vec::new();
+    requeue.retain(|tx| {
+        let Some(gap_at) = poison_gap_for(poison_gaps, tx) else {
+            return true;
+        };
+        event!(
+            name: "eez.composer.cc_compose.poison_chain_evicted",
+            Level::WARN,
+            rollup_id,
+            tx_hash = %tx.hash,
+            sender = %tx.sender,
+            nonce = tx.nonce,
+            gap_at,
+            "same-sender unprocessed tx above an evicted poison nonce; evicted instead of re-queued (resubmit in order)",
+        );
+        cascade_evicted.push(tx.clone());
+        false
+    });
+    pool.release_in_flight_batch(&cascade_evicted);
+    pool.push_front_batch(requeue);
 }
 
 /// Append `txs` to the Sync block under construction, stopping at the first one
@@ -1246,14 +1402,14 @@ where
         }
 
         let pool_len_before = pool.len();
-        // Cap user transactions per submission. A smaller batch limits how many
-        // transactions an atomic-relay drop re-queues. Overflow drains over
-        // later slots; three is a default, not a builder limit.
+        // Caps how many held transactions one bundle attempts and therefore how
+        // many an atomic-relay drop re-queues. L1 block gas remains the hard
+        // protocol constraint, so deployments may need a lower cap.
         let max_user_txs = std::env::var("EEZ_MAX_USER_TXS_PER_BUNDLE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n >= 1)
-            .unwrap_or(3);
+            .unwrap_or(50);
         let drained = pool.pop_n(max_user_txs);
         // When the pool is empty, do not return early. This slot attempts a
         // minimal postBatch whose leading immediate entry advances L1's stored
@@ -1787,6 +1943,9 @@ where
         let mut pending_out: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)> = Vec::new();
         let mut pending_in: Vec<eez_protocol::abi::ExecutionEntrySol> = Vec::new();
         let mut outbound_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = Vec::new();
+        // Probed gas of the accepted outbound target calls; they re-execute
+        // inside postAndVerifyBatch, so its gas limit must cover them.
+        let mut outbound_target_gas: u64 = 0;
         // Escrow drawn down per outbound withdrawal (read once, lazily) so several
         // in one slot can't collectively over-drain. `None` = not yet read.
         let mut escrow_remaining: Option<U256> = None;
@@ -1796,6 +1955,17 @@ where
         // string + the txs still needing re-queue (the failing tx + the
         // unprocessed remainder of both phases; survivors are added below).
         let mut transient: Option<(String, Vec<(usize, HeldTx)>)> = None;
+        // Gas, not the tx cap, is what really bounds this bundle; overflow stays
+        // held for later slots.
+        let mut budget = PostBatchGasBudget::new(self.inner.emission.max_gas);
+        // Set by a budget cut: the tx that did not fit plus everything after it,
+        // owed back to the pool unpenalized.
+        let mut deferred: Vec<(usize, HeldTx)> = Vec::new();
+        // Cost of the tx that tripped the budget, for the cut event.
+        let mut rejected_cost: Option<u64> = None;
+        // Set instead when it was the L2 block's gas, not the postBatch's, that
+        // ran out. The two are mutually exclusive: the first refusal ends the drain.
+        let mut block_gas_cut: Option<BlockGasCut> = None;
 
         // Canonical block order is all outbound pairs then all inbound
         // deliveries, and L1 splits the same way physically (postBatch
@@ -1866,7 +2036,7 @@ where
                 env,
             );
             match sim {
-                Ok((composition, mut sessions)) => {
+                Ok((composition, mut sessions, target_gas)) => {
                     let l1_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = composition
                         .targets
                         .iter()
@@ -1937,6 +2107,57 @@ where
                             push_poison_root(&mut poison, &mut poison_gaps, held);
                             continue;
                         }
+                    }
+                    // `[load, user]` must fit the Sync block or `build_sync_block`
+                    // hard-errors. Before the L1 budget, so a refusal costs nothing.
+                    let declared = stf_cfg
+                        .l2_gas_limit
+                        .saturating_add(declared_gas_limit(&held.raw_tx));
+                    match block_gas_fit(draft.gas_used(), declared, BUILDER_GAS_LIMIT) {
+                        BlockGasFit::Accept => {}
+                        BlockGasFit::Defer => {
+                            block_gas_cut = Some(BlockGasCut {
+                                gas_used: draft.gas_used(),
+                                declared,
+                            });
+                            deferred = abort_rest(
+                                Some((idx, held)),
+                                &mut out_iter,
+                                std::mem::take(&mut inbounds),
+                            );
+                            break;
+                        }
+                        BlockGasFit::Unfittable => {
+                            event!(
+                                name: "eez.composer.cc_compose.block_gas_unfittable",
+                                Level::WARN,
+                                rollup_id,
+                                tx_idx = idx,
+                                tx_hash = %held.hash,
+                                declared,
+                                block_gas_limit = BUILDER_GAS_LIMIT,
+                                "outbound [load, user] pair declares more gas than a whole L2 block; no slot can ever take it — evicting (resubmit with a lower gas limit)",
+                            );
+                            push_poison_root(&mut poison, &mut poison_gaps, held);
+                            continue;
+                        }
+                    }
+                    // Gate before accept: this entry settles inline, so over
+                    // the cap the whole bundle dies silently (invariant 7).
+                    let cost =
+                        projected_tx_l1_gas(&l1_entries, &l1_entries, &held.raw_tx, target_gas);
+                    if !budget.try_accept(cost) {
+                        rejected_cost = Some(projected_postbatch_gas(
+                            cost.entries,
+                            cost.calldata_gas,
+                            cost.target_gas,
+                        ));
+                        deferred = abort_rest(
+                            Some((idx, held)),
+                            &mut out_iter,
+                            std::mem::take(&mut inbounds),
+                        );
+                        break;
                     }
                     // ── ACCEPT ───────────────────────────────────────
                     // Block first, state second: a pair evicted at append must
@@ -2081,6 +2302,7 @@ where
 
                     pending_out.push((l1_entries[0].clone(), held.raw_tx.clone()));
                     outbound_entries.extend(l1_entries);
+                    outbound_target_gas = outbound_target_gas.saturating_add(target_gas);
                     // NOT pushed to `survivor_comps`: its `source.batch` is OUR
                     // L2's entries (a dest=MAINNET call that must not settle on
                     // L1). The L1 settlement is `outbound_entries`, spliced
@@ -2175,7 +2397,7 @@ where
                 l1_env,
             );
             match sim {
-                Ok((composition, _sessions)) => {
+                Ok((composition, _sessions, _probe_gas)) => {
                     let target_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = composition
                         .targets
                         .iter()
@@ -2218,6 +2440,54 @@ where
                         continue;
                     }
 
+                    // Same gate: one delivery tx per entry, each at `l2_gas_limit`.
+                    // Foreign entries never ship, so this over-counts at worst.
+                    let declared = stf_cfg
+                        .l2_gas_limit
+                        .saturating_mul(target_entries.len() as u64);
+                    match block_gas_fit(draft.gas_used(), declared, BUILDER_GAS_LIMIT) {
+                        BlockGasFit::Accept => {}
+                        BlockGasFit::Defer => {
+                            block_gas_cut = Some(BlockGasCut {
+                                gas_used: draft.gas_used(),
+                                declared,
+                            });
+                            deferred = abort_rest(Some((idx, held)), &mut in_iter, Vec::new());
+                            break;
+                        }
+                        BlockGasFit::Unfittable => {
+                            event!(
+                                name: "eez.composer.cc_compose.block_gas_unfittable",
+                                Level::WARN,
+                                rollup_id,
+                                tx_idx = idx,
+                                tx_hash = %held.hash,
+                                declared,
+                                deliveries = target_entries.len(),
+                                block_gas_limit = BUILDER_GAS_LIMIT,
+                                "inbound deliveries declare more gas than a whole L2 block; no slot can ever take them — evicting (resubmit as separate calls)",
+                            );
+                            push_poison_root(&mut poison, &mut poison_gaps, held);
+                            continue;
+                        }
+                    }
+                    // Same gate, no target gas: a deferred entry only queues
+                    // here, and its L1 half is a separate bundled tx.
+                    let cost = projected_tx_l1_gas(
+                        &composition.source.batch.entries,
+                        &target_entries,
+                        &[],
+                        0,
+                    );
+                    if !budget.try_accept(cost) {
+                        rejected_cost = Some(projected_postbatch_gas(
+                            cost.entries,
+                            cost.calldata_gas,
+                            cost.target_gas,
+                        ));
+                        deferred = abort_rest(Some((idx, held)), &mut in_iter, Vec::new());
+                        break;
+                    }
                     // ── ACCEPT ───────────────────────────────────────
                     let deliveries = match eez_protocol::system_tx::build_inbound_system_txs(
                         &target_entries,
@@ -2333,6 +2603,63 @@ where
             }
         }
 
+        // ── Budget cut: settle what fits, keep the rest held. ─────────
+        // Normal under load. Before the poison sweep, so an eviction here rides
+        // the same nonce cascade.
+        let deferred_was_empty = deferred.is_empty();
+        if !deferred.is_empty() {
+            let deferred_count = deferred.len();
+            let accepted_count = survivors.len();
+            // A block-gas cut needs gas on the block, which needs an accepted tx,
+            // so the eviction branch below can only ever be an L1-budget cut.
+            debug_assert!(
+                accepted_count > 0 || block_gas_cut.is_none(),
+                "a block-gas cut cannot happen with nothing accepted"
+            );
+            if accepted_count == 0 {
+                // It lost against the whole budget, so no slot is roomier and
+                // re-queueing would block the FIFO forever. It sits first.
+                let (_, head) = deferred.remove(0);
+                event!(
+                    name: "eez.composer.sync_slot.gas_budget_cut",
+                    Level::WARN,
+                    rollup_id,
+                    accepted_count,
+                    deferred_count,
+                    projected_gas = budget.projected,
+                    rejected_cost = rejected_cost.unwrap_or(0),
+                    budget = budget.cap,
+                    tx_hash = %head.hash,
+                    "the first held tx alone exceeds the postBatch gas budget; it can never settle — evicting it (resubmit a cheaper call)",
+                );
+                push_poison_root(&mut poison, &mut poison_gaps, head);
+            } else if let Some(BlockGasCut { gas_used, declared }) = block_gas_cut {
+                event!(
+                    name: "eez.composer.sync_slot.block_gas_cut",
+                    Level::INFO,
+                    rollup_id,
+                    accepted_count,
+                    deferred_count,
+                    gas_used,
+                    declared,
+                    block_gas_limit = BUILDER_GAS_LIMIT,
+                    "Sync block gas limit reached; {{deferred_count}} held tx(s) stay queued for a later Sync slot",
+                );
+            } else {
+                event!(
+                    name: "eez.composer.sync_slot.gas_budget_cut",
+                    Level::INFO,
+                    rollup_id,
+                    accepted_count,
+                    deferred_count,
+                    projected_gas = budget.projected,
+                    rejected_cost = rejected_cost.unwrap_or(0),
+                    budget = budget.cap,
+                    "postBatch gas budget reached; {{deferred_count}} held tx(s) stay queued for a later Sync slot",
+                );
+            }
+        }
+
         // Evict the poison txs' gapped higher nonces from the pool — once
         // a sender's nonce N is evicted, N+1.. can never land.
         for tx in &poison {
@@ -2363,7 +2690,17 @@ where
             }
         }
 
+        if !deferred.is_empty() {
+            requeue_unprocessed(pool, rollup_id, &poison_gaps, deferred);
+        }
+
         // ── Transient abort: re-queue survivors + remainder, minimal. ──
+        // A cut empties the inbound queue, so phase 2 can't also fail here.
+        // Asserted so a future edit can't double-push the survivors.
+        debug_assert!(
+            transient.is_none() || deferred_was_empty,
+            "budget cut and transient abort are mutually exclusive"
+        );
         if let Some((err, rest)) = transient {
             event!(
                 name: "eez.composer.phase2.transient",
@@ -2373,30 +2710,10 @@ where
                 survivors = survivors.len(),
                 "transient compose failure; re-queueing and degrading to minimal postBatch this slot",
             );
+            // Both phases contribute; the pool is owed its own FIFO order.
             let mut requeue = survivors;
             requeue.extend(rest);
-            // Both phases contribute; the pool is owed its own FIFO order.
-            let mut requeue = restore_pool_order(requeue);
-            let mut cascade_evicted = Vec::new();
-            requeue.retain(|tx| {
-                let Some(gap_at) = poison_gap_for(&poison_gaps, tx) else {
-                    return true;
-                };
-                event!(
-                    name: "eez.composer.cc_compose.poison_chain_evicted",
-                    Level::WARN,
-                    rollup_id,
-                    tx_hash = %tx.hash,
-                    sender = %tx.sender,
-                    nonce = tx.nonce,
-                    gap_at,
-                    "same-sender unprocessed tx above an evicted poison nonce; evicted instead of re-queued (resubmit in order)",
-                );
-                cascade_evicted.push(tx.clone());
-                false
-            });
-            pool.release_in_flight_batch(&cascade_evicted);
-            pool.push_front_batch(requeue);
+            requeue_unprocessed(pool, rollup_id, &poison_gaps, requeue);
             return self
                 .dispatch_minimal_postbatch(
                     ctx,
@@ -2410,8 +2727,8 @@ where
                 .await;
         }
 
-        // Every held tx was poison (evicted) → nothing to compose. Still
-        // emit a minimal postBatch so L1 keeps tracking L2's progression.
+        // Nothing composed (all evicted or over budget). Still post a minimal
+        // batch so L1 keeps tracking L2's progression.
         if survivors.is_empty() {
             let evicted = poison.len() + stale.len();
             event!(
@@ -2419,7 +2736,7 @@ where
                 Level::WARN,
                 rollup_id,
                 evicted,
-                "all held txs were stale or failed simulation deterministically; emitting minimal postBatch",
+                "no held tx survived the drain (stale, deterministic failure, or over the gas budget); emitting minimal postBatch",
             );
             return self
                 .dispatch_minimal_postbatch(
@@ -2626,6 +2943,7 @@ where
                 &pair_roots,
                 &outbound_entries,
                 &outbound_user_txs,
+                outbound_target_gas,
                 bundle_target,
             )
             .await
@@ -2949,6 +3267,7 @@ where
                 &[], // no cross-chain effects → no per-effect roots
                 &[], // no outbound entries
                 &[], // no outbound user txs
+                0,   // no inline outbound target calls
                 bundle_target,
             )
             .await
@@ -3111,6 +3430,7 @@ where
                     &[],
                     &[],
                     &[],
+                    0, // no inline outbound target calls
                     BundleTarget::NextBlock,
                 )
                 .await
@@ -3256,6 +3576,8 @@ where
     /// `sync_block` is the terminal, `Some` only while freshly built; `None`
     /// (historical chunk) takes its witness from the store like the rest.
     ///
+    /// `outbound_target_gas`: probed cost of the target calls EEZ.sol runs
+    /// inline, which calldata size cannot predict.
     /// # Errors
     ///
     /// Returns an error for missing chain data, inconsistent IDs or roots,
@@ -3274,6 +3596,7 @@ where
         pair_roots: &[B256],
         outbound_entries: &[eez_protocol::abi::ExecutionEntrySol],
         outbound_user_txs: &[Bytes],
+        outbound_target_gas: u64,
         bundle_target: BundleTarget,
     ) -> Result<Option<Bytes>, PreparePostBatchError> {
         use alloy_sol_types::SolCall;
@@ -3464,7 +3787,7 @@ where
 
         // The validating proof path enforces that the chain ends at the Sync
         // block's final root. Debug builds also check the local stitching
-        // invariant here, including when a mock prover is configured.
+        // invariant here before the proof signer independently validates it.
         debug_assert_eq!(
             batch
                 .entries
@@ -3637,8 +3960,14 @@ where
         let mut sized = batch.clone();
         sized.proofs = vec![Bytes::from(vec![0xffu8; MAX_PROOF_BYTES])];
         let projected = postAndVerifyBatchCall { batch: sized }.abi_encode();
-        let projected_gas =
-            calldata_floor_gas(&projected).saturating_add(post_batch_execution_gas_reserve());
+        // EIP-7623 charges max(standard, floor). Standard now covers the bytes the
+        // drain could not see; floor is what a fat, entry-light batch hits.
+        let projected_gas = projected_postbatch_gas(
+            batch.entries.len() as u64,
+            calldata_gas(&projected),
+            outbound_target_gas,
+        )
+        .max(calldata_floor_gas(&projected));
         if projected_gas > ceiling {
             event!(
                 name: "eez.composer.emission.candidate_over_budget",
@@ -3711,7 +4040,7 @@ where
                 .await
                 .map_err(|e| format!("witness spawn_blocking join: {e}"))??
             }
-            // Mock mode: the mock prover ignores per-block witnesses.
+            // Tests may use a lightweight prover without a witness source.
             None => Vec::new(),
         };
         let proving_ctx = ProvingContext {
@@ -3963,18 +4292,15 @@ async fn sign_post_batch_tx(
     let base_fee = u128::from(latest.header.base_fee_per_gas.unwrap_or(0));
     let max_fee_per_gas = base_fee.saturating_mul(2).saturating_add(priority_fee);
 
-    // Size-derived: a fixed limit sits below the floor once the batch grows,
-    // and an under-floor tx is dropped at simulation with no on-chain trace.
-    let gas_limit =
-        calldata_floor_gas(&calldata).saturating_add(post_batch_execution_gas_reserve());
-    // Ceiling on every emission path. Historical chunks already priced this
-    // exact calldata pre-prove and stepped their boundary back until it fit, so
-    // reaching this is either a rich/minimal slot (no boundary to move) or a
-    // proof longer than MAX_PROOF_BYTES. Refusing degrades to
-    // commit-without-emission; the grown backlog then settles as bounded chunks.
-    if gas_limit > max_gas {
+    // Only gas USED is charged, so sign at the ceiling and let the drain's
+    // projection bound the batch.
+    let gas_limit = max_gas;
+    // A calldata floor over the cap is invalid at ANY gas limit. Refusing means
+    // no emission this slot; bounded chunks cover the range later.
+    let floor_gas = calldata_floor_gas(&calldata);
+    if floor_gas > max_gas {
         return Err(format!(
-            "postBatch gas {gas_limit} exceeds EEZ_MAX_POSTBATCH_GAS {max_gas} \
+            "postBatch calldata floor {floor_gas} exceeds EEZ_MAX_POSTBATCH_GAS {max_gas} \
              ({} calldata bytes); refusing emission — bounded chunks cover the range",
             calldata.len(),
         ));
@@ -4321,21 +4647,16 @@ mod tests {
     fn gas_budget_out_of_range_clamps_to_default() {
         // In range → honoured.
         assert_eq!(clamp_max_postbatch_gas(12_000_000), 12_000_000);
-        // The floor itself is the cheapest any batch can be, so it must stand.
-        let min_viable = post_batch_execution_gas_reserve() + 21_000;
-        assert_eq!(clamp_max_postbatch_gas(min_viable), min_viable);
         assert_eq!(
-            clamp_max_postbatch_gas(min_viable - 1),
+            clamp_max_postbatch_gas(MIN_VIABLE_POSTBATCH_GAS),
+            MIN_VIABLE_POSTBATCH_GAS
+        );
+        assert_eq!(
+            clamp_max_postbatch_gas(MIN_VIABLE_POSTBATCH_GAS - 1),
             DEFAULT_MAX_POSTBATCH_GAS
         );
         assert_eq!(
             clamp_max_postbatch_gas(DEFAULT_MAX_POSTBATCH_GAS),
-            DEFAULT_MAX_POSTBATCH_GAS
-        );
-        // A budget at or below the reserve refuses every batch: floor + reserve
-        // always exceeds it.
-        assert_eq!(
-            clamp_max_postbatch_gas(post_batch_execution_gas_reserve()),
             DEFAULT_MAX_POSTBATCH_GAS
         );
         assert_eq!(clamp_max_postbatch_gas(1), DEFAULT_MAX_POSTBATCH_GAS);
@@ -4343,6 +4664,50 @@ mod tests {
         assert_eq!(
             clamp_max_postbatch_gas(DEFAULT_MAX_POSTBATCH_GAS + 1),
             DEFAULT_MAX_POSTBATCH_GAS
+        );
+    }
+
+    /// The forge pin test re-declares both constants as literals, so a change
+    /// here would leave it measuring the old value in silence. Bind them.
+    #[test]
+    fn solidity_pin_test_mirrors_the_rust_gas_pins() {
+        let sol = include_str!("../../../contracts/test/PostBatchGasPins.t.sol");
+        for (name, rust) in [
+            ("POSTBATCH_BASE_GAS_PIN", POSTBATCH_BASE_GAS_PIN),
+            ("POSTBATCH_ENTRY_GAS_PIN", POSTBATCH_ENTRY_GAS_PIN),
+        ] {
+            let decl = format!("uint256 private constant {name} = ");
+            let rest = sol
+                .split(&decl)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} is not declared in PostBatchGasPins.t.sol"));
+            let literal: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '_')
+                .collect();
+            let sol_value: u64 = literal
+                .replace('_', "")
+                .parse()
+                .unwrap_or_else(|e| panic!("{name} literal {literal:?}: {e}"));
+            assert_eq!(
+                sol_value, rust,
+                "{name} drifted: Solidity pins {sol_value}, Rust projects {rust}",
+            );
+        }
+    }
+
+    /// Any ceiling the clamp accepts must let the drain take at least one tx.
+    #[test]
+    fn the_lowest_accepted_ceiling_still_admits_one_held_tx() {
+        let mut budget = PostBatchGasBudget::new(MIN_VIABLE_POSTBATCH_GAS);
+        assert!(
+            budget.try_accept(TxL1Gas {
+                entries: 1,
+                calldata_gas: 0,
+                target_gas: 0,
+            }),
+            "the lowest accepted ceiling admits no tx — every drain would evict \
+             its first held tx as poison",
         );
     }
 
@@ -4404,6 +4769,164 @@ mod tests {
         // Below one K there is no reachable grid height above the cursor.
         assert_eq!(grid_aligned_cap(3, 5), 5);
         assert_eq!(grid_aligned_cap(5, 5), 5);
+    }
+
+    /// Gas one outbound target call used on L1, measured on a kurtosis devnet
+    /// (the same run measured ~336k marginal per outbound entry in total).
+    const MEASURED_TARGET_GAS: u64 = 47_763;
+
+    /// An outbound settlement entry of realistic size: one L1 call with a
+    /// 4-byte selector plus two words of arguments.
+    fn outbound_entry() -> eez_protocol::abi::ExecutionEntrySol {
+        eez_protocol::abi::ExecutionEntrySol {
+            l2ToL1Calls: vec![eez_protocol::abi::L2ToL1CallSol {
+                revertNextNCalls: 0,
+                isStatic: false,
+                gas: 0,
+                sourceAddress: Address::repeat_byte(0x11),
+                sourceRollupId: 1,
+                targetAddress: Address::repeat_byte(0x22),
+                value: U256::ZERO,
+                data: Bytes::from(vec![0x55u8; 68]),
+            }],
+            destinationRollupId: 1,
+            success: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn projection_charges_the_pins_the_calldata_and_the_probed_target() {
+        // The cheapest postBatch: tx base + base pin + one leading entry.
+        assert_eq!(
+            projected_postbatch_gas(1, 0, 0),
+            21_000 + POSTBATCH_BASE_GAS_PIN + POSTBATCH_ENTRY_GAS_PIN
+        );
+        // Entries are linear in the pin; calldata and probed target gas add raw.
+        assert_eq!(
+            projected_postbatch_gas(4, 500, 100),
+            21_000 + POSTBATCH_BASE_GAS_PIN + 4 * POSTBATCH_ENTRY_GAS_PIN + 600
+        );
+        // Standard EIP-7623 rates, well under the 10-per-token floor the
+        // signing path refuses on.
+        assert_eq!(calldata_gas(&[]), 0);
+        assert_eq!(calldata_gas(&[0, 0xab, 0, 0xcd, 0]), 3 * 4 + 2 * 16);
+        // The bug this replaces: at a 50-tx bundle cap the real cost passes the
+        // EIP-7825 per-tx cap, so no gas limit makes the batch postable.
+        assert!(
+            projected_postbatch_gas(51, 0, 50 * MEASURED_TARGET_GAS) > DEFAULT_MAX_POSTBATCH_GAS,
+            "50 outbound entries must be recognised as unpostable",
+        );
+    }
+
+    #[test]
+    fn drain_budget_cuts_the_accepted_prefix_below_the_cap() {
+        let entries = [outbound_entry()];
+        let raw_tx = vec![0x77u8; 180];
+        let cost = projected_tx_l1_gas(&entries, &entries, &raw_tx, MEASURED_TARGET_GAS);
+        // Every term is charged: one entry, the inline call, and the calldata for
+        // the entry in `batch.entries` plus its DA copy and the raw tx.
+        assert_eq!(cost.entries, 1);
+        assert_eq!(cost.target_gas, MEASURED_TARGET_GAS);
+        let encoded = {
+            use alloy_sol_types::SolValue as _;
+            calldata_gas(&entries[0].abi_encode())
+        };
+        assert_eq!(cost.calldata_gas, 2 * encoded + calldata_gas(&raw_tx));
+
+        let mut budget = PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS);
+        // The drain leaves the belt's margin below the cap, or the belt refuses
+        // what the drain accepted and the same set requeues forever.
+        assert_eq!(
+            budget.cap,
+            DEFAULT_MAX_POSTBATCH_GAS - POSTBATCH_DRAIN_MARGIN
+        );
+        let per_tx = POSTBATCH_ENTRY_GAS_PIN + cost.calldata_gas + cost.target_gas;
+        let expected = (budget.cap - budget.projected) / per_tx;
+        let mut accepted = 0u64;
+        // The drain never offers more than the per-bundle cap.
+        while accepted < 50 && budget.try_accept(cost) {
+            accepted += 1;
+        }
+        assert_eq!(accepted, expected);
+        // The cut is what makes the batch postable at all.
+        assert!(accepted < 50);
+        assert!(budget.projected <= DEFAULT_MAX_POSTBATCH_GAS);
+        // A rejected tx leaves the projection untouched, so the accepted prefix
+        // is exactly what the batch will carry.
+        let projected = budget.projected;
+        assert!(!budget.try_accept(cost));
+        assert_eq!(budget.projected, projected);
+        // The drain and the prepare-time belt agree on the same entries: the
+        // leading immediate plus one per accepted tx.
+        assert_eq!(
+            projected,
+            projected_postbatch_gas(
+                accepted + 1,
+                accepted * cost.calldata_gas,
+                accepted * MEASURED_TARGET_GAS,
+            )
+        );
+    }
+
+    /// Two outbound pairs near the EIP-7825 cap overflow a 30M block, so the
+    /// second must be refused before `build_sync_block` hard-errors on it.
+    #[test]
+    fn block_gas_fit_refuses_the_second_fat_outbound_pair() {
+        // Live shapes: 30M block, 2M `loadExecutionTable`, a user tx declaring
+        // 16.7M and burning 13.3M of it.
+        const LOAD: u64 = 2_000_000;
+        const USER_DECLARED: u64 = 16_700_000;
+        const USER_BURNED: u64 = 13_300_000;
+        const LOAD_BURNED: u64 = 100_000;
+        let pair = LOAD + USER_DECLARED;
+
+        // Pair 1 fits an empty block.
+        assert_eq!(
+            block_gas_fit(0, pair, BUILDER_GAS_LIMIT),
+            BlockGasFit::Accept,
+        );
+        // Pair 2 sees the burn of pair 1 and does not.
+        let after_one = LOAD_BURNED + USER_BURNED;
+        assert_eq!(
+            block_gas_fit(after_one, pair, BUILDER_GAS_LIMIT),
+            BlockGasFit::Defer,
+            "the second fat pair must be deferred, not built",
+        );
+        // Ground truth for the deferral: the builder itself would refuse pair 2's
+        // user tx, since its declared limit exceeds what the block has left.
+        assert!(USER_DECLARED > BUILDER_GAS_LIMIT - after_one - LOAD_BURNED);
+
+        // Exact boundary: equal fits, one over defers.
+        assert_eq!(
+            block_gas_fit(BUILDER_GAS_LIMIT - pair, pair, BUILDER_GAS_LIMIT),
+            BlockGasFit::Accept,
+        );
+        assert_eq!(
+            block_gas_fit(BUILDER_GAS_LIMIT - pair + 1, pair, BUILDER_GAS_LIMIT),
+            BlockGasFit::Defer,
+        );
+
+        // Head of line: a pair over the whole block is unfittable at any prefix,
+        // so it is evicted rather than deferred forever.
+        assert_eq!(
+            block_gas_fit(0, BUILDER_GAS_LIMIT + 1, BUILDER_GAS_LIMIT),
+            BlockGasFit::Unfittable,
+        );
+        assert_eq!(
+            block_gas_fit(after_one, BUILDER_GAS_LIMIT + 1, BUILDER_GAS_LIMIT),
+            BlockGasFit::Unfittable,
+        );
+        // An undecodable tx counts as the whole block, so it can never be
+        // mistaken for free space.
+        assert_eq!(
+            declared_gas_limit(&Bytes::from_static(b"not a tx")),
+            u64::MAX
+        );
+        assert_eq!(
+            block_gas_fit(0, u64::MAX, BUILDER_GAS_LIMIT),
+            BlockGasFit::Unfittable,
+        );
     }
 
     #[test]
