@@ -128,53 +128,74 @@ def run(plan, args):
         ),
     )
 
-    # eez-node: embedded L1, composer, L2, and cross-chain fronts.
-    eez_env = {
-        "EEZ_L1_CHAIN": "devnet",
-        "EEZ_L1_CHAIN_PATH": "/genesis/genesis.json",
-        "EEZ_L1_JWT_SECRET": "/jwt/jwtsecret",
-        "EEZ_L1_HTTP_PORT": str(EMBEDDED_L1_RPC_PORT),
-        "EEZ_L1_AUTH_PORT": str(EMBEDDED_L1_ENGINE_PORT),
-        "EEZ_L1_CHAIN_ID": chain_id,
-        "EEZ_L1_RPC_URL": "http://127.0.0.1:{}".format(EMBEDDED_L1_RPC_PORT),
-        "EEZ_L1_TARGET_RPC_URL": l1_el.rpc_http_url,
-        "EEZ_L1_BUILDER_RPC_URL": builder_rpc,
-        "EEZ_L1_TRUSTED_PEERS": l1_el.enode,
-        "EEZ_L1_BLOCK_TIME_MS": str(eez.get("l1_block_time_ms", 12000)),
-        "EEZ_L2_BLOCK_TIME_MS": str(eez.get("l2_block_time_ms", 2000)),
-        "EEZ_PROOF_TIME_MS": str(eez.get("proof_time_ms", 5000)),
-        "EEZ_SUBMISSION_SLACK_MS": str(eez.get("submission_slack_ms", 2500)),
-        "EEZ_MAX_SPECULATIVE_DEPTH": str(eez.get("max_speculative_depth", 0)),
-        "EEZ_L1_POSTER_KEY": poster_key,
-        "EEZ_PROVER_URL": "http://eez-proof-signer:{}".format(PROOF_SIGNER_GRPC_PORT),
-        "EEZ_WITNESS_DB_PATH": "/data/witnesses",
-        "EEZ_L2_DATADIR": "/data/l2",
-        "EEZ_L2_HTTP_PORT": str(L2_RPC_PORT),
-        "EEZ_L2_RPC_URL": "http://127.0.0.1:{}".format(L2_RPC_PORT),
-        "EEZ_L1_XCHAIN_PORT": str(L1_XCHAIN_PORT),
-        "EEZ_L2_XCHAIN_PORT": str(L2_XCHAIN_PORT),
-        "EEZ_L2_AUTH_PORT": str(L2_ENGINE_PORT),
-        "EEZ_L2_P2P_PORT": str(L2_P2P_PORT),
-        "EEZ_L2_SYSTEM_KEY": l2_system_key,
-        "EEZL2_ADDRESS": "0x4200000000000000000000000000000000000007",
-    }
-
-    node_cmd = " ".join(
+    # The deployment-specific values are expanded into one file before exec;
+    # eez-composer itself receives no EEZ_* environment configuration.
+    node_config = "\n".join(
         [
-            "set -eu;",
-            "echo 'eez-node: sourcing /out/deployments.env';",
-            "test -f /out/deployments.env;",
-            "grep -E '^(EEZ_REGISTRY_ADDRESS|EEZ_REGISTRY_DEPLOY_BLOCK|EEZ_ROLLUP_ID|EEZ_INITIAL_STATE_ROOT|EEZ_L1_L2_PROXY|EEZ_L1_BRIDGE_SENDER)=' /out/deployments.env;",
-            "set -a; . /out/deployments.env; set +a;",
-            'echo "eez-node: loaded EEZ_REGISTRY_ADDRESS=$EEZ_REGISTRY_ADDRESS EEZ_ROLLUP_ID=$EEZ_ROLLUP_ID EEZ_INITIAL_STATE_ROOT=$EEZ_INITIAL_STATE_ROOT";',
+            'l2_system_key = "{}"'.format(l2_system_key),
+            "max_speculative_depth = {}".format(eez.get("max_speculative_depth", 0)),
+            "",
+            "[l1]",
+            'rpc_url = "http://127.0.0.1:{}"'.format(EMBEDDED_L1_RPC_PORT),
+            "chain_id = {}".format(chain_id),
+            'registry_address = "$EEZ_REGISTRY_ADDRESS"',
+            "registry_deploy_block = $EEZ_REGISTRY_DEPLOY_BLOCK",
+            "rollup_id = $EEZ_ROLLUP_ID",
+            "",
+            "[timing]",
+            "l1_block_time_ms = {}".format(eez.get("l1_block_time_ms", 12000)),
+            "l2_block_time_ms = {}".format(eez.get("l2_block_time_ms", 2000)),
+            "proof_time_ms = {}".format(eez.get("proof_time_ms", 5000)),
+            "submission_slack_ms = {}".format(eez.get("submission_slack_ms", 2500)),
+            "",
+            "[prover]",
+            'url = "http://eez-proof-signer:{}"'.format(PROOF_SIGNER_GRPC_PORT),
+            'attester_address = "$EEZ_ATTESTER_ADDRESS"',
+            "",
+            "[submission]",
+            'builder_rpc_url = "{}"'.format(builder_rpc),
+            'target_rpc_url = "{}"'.format(l1_el.rpc_http_url),
+            'poster_key = "{}"'.format(poster_key),
+            'proof_system_address = "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS"',
+            "",
+            "[cross_chain]",
+            "l1_port = {}".format(L1_XCHAIN_PORT),
+            "l2_port = {}".format(L2_XCHAIN_PORT),
+            "",
+            "[embedded_l1]",
+            'kind = "devnet"',
+            'chain = "/genesis/genesis.json"',
+            'datadir = "/data/embedded-l1"',
+            "http_port = {}".format(EMBEDDED_L1_RPC_PORT),
+            "auth_port = {}".format(EMBEDDED_L1_ENGINE_PORT),
+            "p2p_port = 30444",
+            'jwt_secret = "/jwt/jwtsecret"',
+            'trusted_peers = ["{}"]'.format(l1_el.enode),
+        ]
+    )
+
+    node_exec = " ".join(
+        [
             "exec eez-composer node",
             "--chain=/out/l2-genesis.json",
-            "--datadir=$EEZ_L2_DATADIR",
-            "--http --http.addr=0.0.0.0 --http.port=$EEZ_L2_HTTP_PORT --http.api=eth,net,web3,debug,trace",
-            "--authrpc.addr=127.0.0.1 --authrpc.port=$EEZ_L2_AUTH_PORT",
-            "--port=$EEZ_L2_P2P_PORT --discovery.port=$EEZ_L2_P2P_PORT",
-            "--discovery.v5.port=$((EEZ_L2_P2P_PORT+1))",
+            "--datadir=/data/l2",
+            "--eez.config=/tmp/eez-composer.toml",
+            "--http --http.addr=0.0.0.0 --http.port={} --http.api=eth,net,web3,debug,trace".format(L2_RPC_PORT),
+            "--authrpc.addr=127.0.0.1 --authrpc.port={}".format(L2_ENGINE_PORT),
+            "--port={} --discovery.port={}".format(L2_P2P_PORT, L2_P2P_PORT),
+            "--discovery.v5.port={}".format(L2_P2P_PORT + 1),
             "--ipcdisable --disable-discovery",
+        ]
+    )
+    node_cmd = "\n".join(
+        [
+            "set -eu",
+            "test -f /out/deployments.env",
+            ". /out/deployments.env",
+            "cat > /tmp/eez-composer.toml <<EOF",
+            node_config,
+            "EOF",
+            node_exec,
         ]
     )
 
@@ -208,7 +229,7 @@ def run(plan, args):
                 "/genesis": "el_cl_genesis_data",
                 "/jwt": jwt.files_artifacts[0],
             },
-            env_vars=eez_env,
+            env_vars={"RUST_LOG": eez.get("eez_node_rust_log", "info")},
             entrypoint=["/bin/sh", "-c"],
             cmd=[node_cmd],
         ),

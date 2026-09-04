@@ -1,0 +1,15 @@
+# Copy to eez-follower.toml and replace every CHANGE_ME value.
+l2_system_key = "0xCHANGE_ME"
+
+[l1]
+rpc_url = "https://CHANGE_ME"
+chain_id = 10200
+registry_address = "0xCHANGE_ME"
+registry_deploy_block = 0
+rollup_id = 1
+
+[timing]
+l1_block_time_ms = 5000
+l2_block_time_ms = 1000
+proof_time_ms = 2500
+submission_slack_ms = 1300
