@@ -23,7 +23,7 @@ use reth_primitives_traits::SealedHeader;
 use reth_revm::{database::StateProviderDatabase, db::State, db::bal::EvmDatabaseError};
 use reth_storage_api::StateProviderBox;
 use reth_storage_api::errors::provider::ProviderError;
-use revm::context::result::EVMError;
+use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context_interface::ContextTr;
 use revm::database::CacheState;
 use revm::interpreter::{CallInputs, CallOutcome, CallScheme};
@@ -79,13 +79,19 @@ fn encoding_err(msg: impl Into<String>) -> ExecutorError {
     ExecutorError::from(ExecutorErrorKind::Encoding(msg.into()))
 }
 
-/// Classify a `transact` failure. Everything but a database read is a property
-/// of the transaction (`Evm` ⇒ poison); a database read failure is the backing
-/// store being unreachable, which `Provider` marks transient so the slot aborts
-/// and retries instead of evicting a sound tx.
+/// Classify a `transact` failure. A database read failure is transient, and an
+/// insufficient target balance is state-dependent; other validation failures
+/// are properties of the transaction (`Evm` ⇒ poison).
 fn transact_err(e: EVMError<EvmDatabaseError<ProviderError>>) -> ExecutorError {
     match e {
         EVMError::Database(db) => provider_err(db),
+        EVMError::Transaction(InvalidTransaction::LackOfFundForMaxFee { fee, balance }) => {
+            ExecutorErrorKind::InsufficientFunds {
+                available: *balance,
+                required: *fee,
+            }
+            .into()
+        }
         other => evm_err(other),
     }
 }
@@ -769,5 +775,29 @@ impl<CTX: ContextTr> Inspector<CTX> for ProbeInspector {
             success: outcome.result.is_ok(),
             output: outcome.result.output.clone(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::U256;
+
+    #[test]
+    fn lack_of_funds_is_classified_as_state_dependent() {
+        let error = transact_err(EVMError::Transaction(
+            InvalidTransaction::LackOfFundForMaxFee {
+                fee: Box::new(U256::from(10)),
+                balance: Box::new(U256::from(3)),
+            },
+        ));
+
+        assert!(matches!(
+            error.kind(),
+            ExecutorErrorKind::InsufficientFunds {
+                available,
+                required,
+            } if *available == U256::from(3) && *required == U256::from(10)
+        ));
     }
 }
