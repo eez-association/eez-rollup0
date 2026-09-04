@@ -29,7 +29,6 @@ use eez_node_common::{
     EezPayloadBuilder, EezPoolBuilder, L2NodeBuilder, NoRoleArgs, node_cli, read_checkpoint_dir,
     wait_for_l1_ready, warn_on_deprecated_env,
 };
-use eez_prover::MockEcdsaProver;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_builder::components::BasicPayloadServiceBuilder;
 use reth_node_ethereum::EthereumNode;
@@ -47,7 +46,6 @@ const L2_SYSTEM_TX_GAS_LIMIT: u64 = 2_000_000;
 
 /// Witness-capture resources selected by the mandatory composer prover.
 enum WitnessCapture {
-    NotRequired,
     Remote {
         sender: mpsc::UnboundedSender<B256>,
         receiver: mpsc::UnboundedReceiver<B256>,
@@ -61,10 +59,9 @@ struct ComposerProving {
 }
 
 impl WitnessCapture {
-    fn sender(&self) -> Option<mpsc::UnboundedSender<B256>> {
+    fn sender(&self) -> mpsc::UnboundedSender<B256> {
         match self {
-            Self::NotRequired => None,
-            Self::Remote { sender, .. } => Some(sender.clone()),
+            Self::Remote { sender, .. } => sender.clone(),
         }
     }
 }
@@ -89,48 +86,33 @@ pub fn run_composer() -> eyre::Result<()> {
 }
 
 fn composer_proving_from_env() -> eyre::Result<ComposerProving> {
-    match env::var("EEZ_PROVER_URL") {
-        Ok(url) => {
-            if url.trim().is_empty() {
-                return Err(eyre::eyre!("EEZ_PROVER_URL must not be empty"));
-            }
-            let attester = env::var("EEZ_ATTESTER_ADDRESS")
-                .map_err(|_| eyre::eyre!("EEZ_ATTESTER_ADDRESS required in remote-prover mode"))?;
-            let attester = Address::from_str(attester.trim())
-                .map_err(|e| eyre::eyre!("EEZ_ATTESTER_ADDRESS: {e}"))?;
-            let (sender, receiver) = mpsc::unbounded_channel::<B256>();
-            let witness_db_path =
-                env::var("EEZ_WITNESS_DB_PATH").unwrap_or_else(|_| "eez-witnesses".to_owned());
-            let store = witness_source::new_store(std::path::Path::new(&witness_db_path))?;
-            event!(
-                name: "eez.node.witness_store.opened",
-                Level::INFO,
-                path = %witness_db_path,
-                "persistent witness store opened",
-            );
-            Ok(ComposerProving {
-                prover: Arc::new(eez_prover_client::RemoteProver::new(url, attester)),
-                witness_capture: WitnessCapture::Remote {
-                    sender,
-                    receiver,
-                    store,
-                },
-            })
-        }
-        Err(env::VarError::NotPresent) => {
-            let key = env::var("EEZ_PROOF_SIGNER_KEY")
-                .map_err(|_| eyre::eyre!("EEZ_PROOF_SIGNER_KEY required in local-prover mode"))?;
-            let signer =
-                PrivateKeySigner::from_bytes(&B256::from_str(key.trim_start_matches("0x"))?)?;
-            Ok(ComposerProving {
-                prover: Arc::new(MockEcdsaProver::new(signer)),
-                witness_capture: WitnessCapture::NotRequired,
-            })
-        }
-        Err(env::VarError::NotUnicode(_)) => {
-            Err(eyre::eyre!("EEZ_PROVER_URL contains non-UTF-8 bytes"))
-        }
+    let url = env::var("EEZ_PROVER_URL")
+        .map_err(|_| eyre::eyre!("EEZ_PROVER_URL is required for composer proving"))?;
+    if url.trim().is_empty() {
+        return Err(eyre::eyre!("EEZ_PROVER_URL must not be empty"));
     }
+    let attester = env::var("EEZ_ATTESTER_ADDRESS")
+        .map_err(|_| eyre::eyre!("EEZ_ATTESTER_ADDRESS is required for composer proving"))?;
+    let attester =
+        Address::from_str(attester.trim()).map_err(|e| eyre::eyre!("EEZ_ATTESTER_ADDRESS: {e}"))?;
+    let (sender, receiver) = mpsc::unbounded_channel::<B256>();
+    let witness_db_path =
+        env::var("EEZ_WITNESS_DB_PATH").unwrap_or_else(|_| "eez-witnesses".to_owned());
+    let store = witness_source::new_store(std::path::Path::new(&witness_db_path))?;
+    event!(
+        name: "eez.node.witness_store.opened",
+        Level::INFO,
+        path = %witness_db_path,
+        "persistent witness store opened",
+    );
+    Ok(ComposerProving {
+        prover: Arc::new(eez_prover_client::RemoteProver::new(url, attester)),
+        witness_capture: WitnessCapture::Remote {
+            sender,
+            receiver,
+            store,
+        },
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -307,7 +289,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         &provider,
         beacon_engine_handle,
         payload_builder_handle,
-        witness_capture.sender(),
+        Some(witness_capture.sender()),
     )?;
     let depth = env::var("EEZ_MAX_SPECULATIVE_DEPTH")
         .ok()
@@ -595,7 +577,6 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                 ))
                     as Arc<dyn eez_prover::ProvingWitnessSource>)
             }
-            WitnessCapture::NotRequired => None,
         };
         let composer = Composer::new(
             rollups,

@@ -3771,7 +3771,7 @@ where
 
         // The validating proof path enforces that the chain ends at the Sync
         // block's final root. Debug builds also check the local stitching
-        // invariant here, including when a mock prover is configured.
+        // invariant here before the proof signer independently validates it.
         debug_assert_eq!(
             batch
                 .entries
@@ -4024,7 +4024,7 @@ where
                 .await
                 .map_err(|e| format!("witness spawn_blocking join: {e}"))??
             }
-            // Mock mode: the mock prover ignores per-block witnesses.
+            // Tests may use a lightweight prover without a witness source.
             None => Vec::new(),
         };
         let proving_ctx = ProvingContext {
