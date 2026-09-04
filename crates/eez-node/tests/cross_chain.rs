@@ -26,10 +26,17 @@ async fn assert_all_transactions_succeeded(
 ) {
     assert!(!hashes.is_empty(), "no {label} transactions were submitted");
     for &hash in hashes {
-        let landed = wait_for(
-            SETTLE_TIMEOUT,
-            || async move { receipt_ok(rpc_url, hash).await },
-        )
+        let hash_string = hash.to_string();
+        let landed = wait_for(SETTLE_TIMEOUT, || async {
+            if let Some(status) = receipt_ok(rpc_url, hash).await? {
+                return Ok(Some(status));
+            }
+            let evictions = w.node.log_lines_matching(&["evict"], 20);
+            if let Some(line) = evictions.lines().find(|line| line.contains(&hash_string)) {
+                anyhow::bail!("transaction was permanently evicted before landing: {line}");
+            }
+            Ok(None)
+        })
         .await;
         let status = match landed {
             Ok(status) => status,
