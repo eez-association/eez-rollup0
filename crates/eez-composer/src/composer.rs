@@ -172,8 +172,9 @@ fn seed_session(
 /// # Errors
 ///
 /// Source-side executor failures and composition/finalize failures, classified
-/// by [`sim_error_is_poison`]. A source simulation that merely reverts is not
-/// an error here — it finalizes to an empty composition, classified downstream.
+/// by the drain as poison, state-dependent, or transient. A source simulation
+/// that merely reverts is not an error here — it finalizes to an empty
+/// composition, classified downstream.
 // Preserve the protocol crate's structured public error type.
 #[allow(clippy::result_large_err)]
 #[tracing::instrument(skip_all, fields(tx_len = raw_tx.len(), %entry_rollup_id))]
@@ -646,8 +647,9 @@ fn clamp_max_postbatch_gas(requested: u64) -> u64 {
 /// the composition is structurally invalid for this tx (no cross-chain
 /// call / revert / bad encoding), so the tx is poison and must be
 /// evicted before it can enter — and perpetually drop — a bundle.
-/// `false` = TRANSIENT (chain unreachable / provider / transport /
-/// missing data), which a retry may clear → re-queue, don't evict.
+/// `false` = STATE-DEPENDENT OR TRANSIENT, which a retry may clear. The drain
+/// handles insufficient funds separately; other non-poison errors abort the
+/// slot and re-queue.
 fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
     use eez_protocol::{ComposerErrorKind, ExecutorErrorKind};
     match err.kind() {
@@ -661,11 +663,21 @@ fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
             ExecutorErrorKind::Unavailable(_)
                 | ExecutorErrorKind::Provider(_)
                 | ExecutorErrorKind::Missing(_)
+                | ExecutorErrorKind::InsufficientFunds { .. }
         ),
         // Lifecycle / internal (misconfigured, lock poisoned, double
         // register) — not the tx's fault → retry, don't evict.
         _ => false,
     }
+}
+
+fn sim_error_is_insufficient_funds(err: &eez_protocol::ComposerError) -> bool {
+    use eez_protocol::{ComposerErrorKind, ExecutorErrorKind};
+    matches!(
+        err.kind(),
+        ComposerErrorKind::Executor(error)
+            if matches!(error.kind(), ExecutorErrorKind::InsufficientFunds { .. })
+    )
 }
 
 alloy_sol_types::sol! {
@@ -788,6 +800,19 @@ fn push_poison_root(
         poison_gaps.push(gap);
     }
     poison.push(tx);
+}
+
+fn push_deferred_root(
+    deferred: &mut Vec<(usize, HeldTx)>,
+    deferred_gaps: &mut Vec<(Address, Direction, u64)>,
+    idx: usize,
+    tx: HeldTx,
+) {
+    let gap = (tx.sender, tx.direction, tx.nonce);
+    if !deferred_gaps.contains(&gap) {
+        deferred_gaps.push(gap);
+    }
+    deferred.push((idx, tx));
 }
 
 /// Drop the drain indices, restoring the pool's FIFO order. The drain composes
@@ -1949,6 +1974,11 @@ where
         let mut escrow_remaining: Option<U256> = None;
         let mut poison: Vec<HeldTx> = Vec::new();
         let mut poison_gaps: Vec<(Address, Direction, u64)> = Vec::new();
+        // A temporarily underfunded outbound root and its same-sender nonce
+        // suffix stay held, while unrelated outbounds and all inbounds may
+        // still settle and change the balance for the next slot.
+        let mut funding_deferred: Vec<(usize, HeldTx)> = Vec::new();
+        let mut funding_gaps: Vec<(Address, Direction, u64)> = Vec::new();
         // On a transient failure we abort the slot; this holds the error
         // string + the txs still needing re-queue (the failing tx + the
         // unprocessed remainder of both phases; survivors are added below).
@@ -1997,6 +2027,21 @@ where
                     "same-sender tx above an evicted poison nonce in the same drain; evicted (resubmit in order)",
                 );
                 poison.push(held);
+                continue;
+            }
+            if let Some(gap_at) = poison_gap_for(&funding_gaps, &held) {
+                event!(
+                    name: "eez.composer.cc_compose.outbound_funding_chain_deferred",
+                    Level::INFO,
+                    rollup_id,
+                    tx_idx = idx,
+                    tx_hash = %held.hash,
+                    sender = %held.sender,
+                    nonce = held.nonce,
+                    gap_at,
+                    "same-sender tx above an underfunded outbound nonce; holding for a later slot",
+                );
+                funding_deferred.push((idx, held));
                 continue;
             }
 
@@ -2071,8 +2116,8 @@ where
                         push_poison_root(&mut poison, &mut poison_gaps, held);
                         continue;
                     }
-                    // Evict a withdrawal that would exceed the rollup's L1 escrow —
-                    // it would revert on-chain and drop the whole bundle.
+                    // Defer a withdrawal that currently exceeds the rollup's L1
+                    // escrow; an inbound deposit may make it valid next slot.
                     // "ether out" is the amount of Ether being withdrawn in this outbound settlement entry.
                     // If missing, the entry is malformed and must be evicted.
                     // Review once reentrancy is available
@@ -2094,15 +2139,15 @@ where
                         {
                             event!(
                                 name: "eez.composer.cc_compose.outbound_over_escrow",
-                                Level::WARN,
+                                Level::INFO,
                                 rollup_id,
                                 tx_idx = idx,
                                 tx_hash = %held.hash,
                                 need = %need,
                                 escrow = %avail,
-                                "outbound withdrawal exceeds L1 rollup escrow; evicting at compose time (would revert InsufficientRollupBalance on L1 — resubmit required)",
+                                "outbound withdrawal exceeds current L1 rollup escrow; holding this sender's nonce chain for a later slot",
                             );
-                            push_poison_root(&mut poison, &mut poison_gaps, held);
+                            push_deferred_root(&mut funding_deferred, &mut funding_gaps, idx, held);
                             continue;
                         }
                     }
@@ -2306,6 +2351,20 @@ where
                     // L1). The L1 settlement is `outbound_entries`, spliced
                     // separately with dest=rid.
                     survivors.push((idx, held));
+                }
+                Err(e) if sim_error_is_insufficient_funds(&e) => {
+                    event!(
+                        name: "eez.composer.cc_compose.outbound_funding_deferred",
+                        Level::INFO,
+                        rollup_id,
+                        tx_idx = idx,
+                        tx_hash = %held.hash,
+                        sender = %held.sender,
+                        nonce = held.nonce,
+                        error = %e,
+                        "outbound target lacks funds; holding this sender's nonce chain while inbounds continue",
+                    );
+                    push_deferred_root(&mut funding_deferred, &mut funding_gaps, idx, held);
                 }
                 Err(e) if sim_error_is_poison(&e) => {
                     event!(
@@ -2676,10 +2735,6 @@ where
             }
         }
 
-        if !deferred.is_empty() {
-            requeue_unprocessed(pool, rollup_id, &poison_gaps, deferred);
-        }
-
         // ── Transient abort: re-queue survivors + remainder, minimal. ──
         // A cut empties the inbound queue, so phase 2 can't also fail here.
         // Asserted so a future edit can't double-push the survivors.
@@ -2697,7 +2752,8 @@ where
                 "transient compose failure; re-queueing and degrading to minimal postBatch this slot",
             );
             // Both phases contribute; the pool is owed its own FIFO order.
-            let mut requeue = survivors;
+            let mut requeue = funding_deferred;
+            requeue.extend(survivors);
             requeue.extend(rest);
             requeue_unprocessed(pool, rollup_id, &poison_gaps, requeue);
             return self
@@ -2713,7 +2769,12 @@ where
                 .await;
         }
 
-        // Nothing composed (all evicted or over budget). Still post a minimal
+        funding_deferred.extend(deferred);
+        if !funding_deferred.is_empty() {
+            requeue_unprocessed(pool, rollup_id, &poison_gaps, funding_deferred);
+        }
+
+        // Nothing composed (all evicted or deferred). Still post a minimal
         // batch so L1 keeps tracking L2's progression.
         if survivors.is_empty() {
             let evicted = poison.len() + stale.len();
@@ -2722,7 +2783,7 @@ where
                 Level::WARN,
                 rollup_id,
                 evicted,
-                "no held tx survived the drain (stale, deterministic failure, or over the gas budget); emitting minimal postBatch",
+                "no held tx survived the drain (stale, deterministic failure, temporarily underfunded, or over the gas budget); emitting minimal postBatch",
             );
             return self
                 .dispatch_minimal_postbatch(
@@ -4398,6 +4459,34 @@ mod tests {
 
         assert_eq!(poison.len(), 2);
         assert_eq!(gaps, vec![(sender, Direction::Inbound, 7)]);
+    }
+
+    #[test]
+    fn insufficient_target_funds_are_not_poison() {
+        let error =
+            eez_protocol::ComposerError::from(eez_protocol::ExecutorErrorKind::InsufficientFunds {
+                available: U256::ZERO,
+                required: U256::from(1),
+            });
+
+        assert!(sim_error_is_insufficient_funds(&error));
+        assert!(!sim_error_is_poison(&error));
+    }
+
+    #[test]
+    fn push_deferred_root_records_nonce_gap_and_index() {
+        let sender = Address::repeat_byte(0xd);
+        let tx = held(sender, Direction::Outbound, 2, 1);
+        let mut deferred = Vec::new();
+        let mut gaps = Vec::new();
+
+        push_deferred_root(&mut deferred, &mut gaps, 4, tx.clone());
+        push_deferred_root(&mut deferred, &mut gaps, 5, tx);
+
+        assert_eq!(deferred.len(), 2);
+        assert_eq!(deferred[0].0, 4);
+        assert_eq!(deferred[1].0, 5);
+        assert_eq!(gaps, vec![(sender, Direction::Outbound, 2)]);
     }
 
     #[test]
