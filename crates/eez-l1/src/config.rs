@@ -1,10 +1,9 @@
 //! Configuration for read-only L1 access and signed batch submission,
 //! populated from `EEZ_*` environment variables.
 //!
-//! Per-rollup composer/orchestration knobs (rollup id, proof system,
-//! deploy block, mode flag) now live in
-//! `eez-composer::RollupConfig` per the S4.2 umbrella extraction. See
-//! `docs/plans/IMPLEMENTATION.md` §5.4.8.
+//! Per-rollup composer/orchestration knobs remain in
+//! `eez-composer::RollupConfig`; the registry deploy block lives here because
+//! it defines the lower bound of the L1 reader's historical scan.
 
 use std::{env, str::FromStr};
 
@@ -20,6 +19,7 @@ const ENV_TARGET_RPC_URL: &str = "EEZ_L1_TARGET_RPC_URL";
 const ENV_POSTER_KEY: &str = "EEZ_L1_POSTER_KEY";
 const ENV_EEZ_ADDRESS: &str = "EEZ_REGISTRY_ADDRESS";
 const ENV_ROLLUP_ID: &str = "EEZ_ROLLUP_ID";
+const ENV_REGISTRY_DEPLOY_BLOCK: &str = "EEZ_REGISTRY_DEPLOY_BLOCK";
 
 /// Read-only L1 connectivity used by the Deriver's canonical-chain scans.
 #[derive(Clone)]
@@ -32,6 +32,9 @@ pub struct L1ReaderConfig {
     /// `L2ExecutionPerformed(rollupId indexed, ...)` event topic so
     /// each historical batch is tagged winner / loser.
     pub rollup_id: u64,
+    /// L1 block where `EEZ` was deployed. Lower bound for historical batch
+    /// scans and boot-time source-readiness checks.
+    pub deploy_block: u64,
 }
 
 impl std::fmt::Debug for L1ReaderConfig {
@@ -40,6 +43,7 @@ impl std::fmt::Debug for L1ReaderConfig {
             .field("rpc_url", &self.rpc_url.as_str())
             .field("eez", &self.eez)
             .field("rollup_id", &self.rollup_id)
+            .field("deploy_block", &self.deploy_block)
             .finish()
     }
 }
@@ -56,6 +60,7 @@ impl L1ReaderConfig {
             rpc_url: parse_url(ENV_RPC_URL)?,
             eez: parse_address(ENV_EEZ_ADDRESS)?,
             rollup_id: parse_u64(ENV_ROLLUP_ID)?,
+            deploy_block: parse_u64(ENV_REGISTRY_DEPLOY_BLOCK)?,
         })
     }
 }

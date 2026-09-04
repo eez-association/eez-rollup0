@@ -49,15 +49,15 @@ impl PoolTransactionError for SystemAddressRejected {
 }
 
 /// Rejects L2 SYSTEM_ADDRESS txs; a reorg re-injects them and a Live block
-/// carrying one fail-closes emission. `None` = off (node builds no system txs).
+/// carrying one fail-closes emission.
 #[derive(Debug)]
 pub struct SystemAddressGate<V> {
     inner: V,
-    system_address: Option<Address>,
+    system_address: Address,
 }
 
 impl<V> SystemAddressGate<V> {
-    pub const fn new(inner: V, system_address: Option<Address>) -> Self {
+    pub const fn new(inner: V, system_address: Address) -> Self {
         Self {
             inner,
             system_address,
@@ -72,7 +72,7 @@ where
     /// The pool tx carries its recovered sender, so this is a compare, not an
     /// ECDSA recovery.
     fn is_system_sender(&self, tx: &V::Transaction) -> bool {
-        self.system_address == Some(tx.sender())
+        self.system_address == tx.sender()
     }
 
     fn reject(tx: V::Transaction) -> TransactionValidationOutcome<V::Transaction> {
@@ -151,13 +151,13 @@ where
 
 /// Copy of [`reth_node_ethereum::node::EthereumPoolBuilder`] that wraps the
 /// Ethereum validator in [`SystemAddressGate`].
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct EezPoolBuilder {
-    system_address: Option<Address>,
+    system_address: Address,
 }
 
 impl EezPoolBuilder {
-    pub const fn new(system_address: Option<Address>) -> Self {
+    pub const fn new(system_address: Address) -> Self {
         Self { system_address }
     }
 }
@@ -233,7 +233,7 @@ where
             event!(
                 name: "eez.node.pool.ready",
                 Level::INFO,
-                system_address = ?system_address,
+                %system_address,
                 "L2 transaction pool initialized with the SYSTEM_ADDRESS gate",
             );
 
@@ -296,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_system_sender_and_admits_others() {
-        let gate = SystemAddressGate::new(AcceptAll, Some(SYSTEM));
+        let gate = SystemAddressGate::new(AcceptAll, SYSTEM);
 
         let out = gate
             .validate_transaction(TransactionOrigin::External, pooled_tx(SYSTEM, 0))
@@ -314,7 +314,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_keeps_input_order() {
-        let gate = SystemAddressGate::new(AcceptAll, Some(SYSTEM));
+        let gate = SystemAddressGate::new(AcceptAll, SYSTEM);
         let batch = vec![
             (TransactionOrigin::External, pooled_tx(USER, 0)),
             (TransactionOrigin::External, pooled_tx(SYSTEM, 1)),
@@ -333,14 +333,5 @@ mod tests {
         assert!(out[0].is_valid());
         assert!(out[1].is_invalid());
         assert!(out[2].is_valid());
-    }
-
-    #[tokio::test]
-    async fn unset_system_address_is_a_pass_through() {
-        let gate = SystemAddressGate::new(AcceptAll, None);
-        let out = gate
-            .validate_transaction(TransactionOrigin::External, pooled_tx(SYSTEM, 0))
-            .await;
-        assert!(out.is_valid());
     }
 }

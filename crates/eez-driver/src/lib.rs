@@ -12,10 +12,8 @@
 //!
 //! ## Surface (Stage 4)
 //!
-//! - [`slot`] — `SlotKind`, `SlotEvent`, plus
-//!   [`spawn_interval`] (standalone-mode) and [`spawn_l1_anchored`]
-//!   (production). Defines the protocol between Schedulers and
-//!   Sequencers.
+//! - [`slot`] — `SlotKind`, `SlotEvent`, and [`spawn_l1_anchored`]. Defines
+//!   the protocol between Schedulers and Sequencers.
 //! - [`Sequencer`] consumes [`SlotEvent`]s, builds payload attributes,
 //!   drives reth's engine, tracks head.
 //! - [`RollupTiming`] + [`SlotComposition`] — per-rollup wall-clock
@@ -27,7 +25,7 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 /// Shared by `Deriver::execute_block` and reth's payload builder (via
-/// `eez_node::payload::EezPayloadBuilder`). Single source of truth — no
+/// `eez_node_common::EezPayloadBuilder`). Single source of truth — no
 /// CLI flag for either path to drift from.
 pub const BUILDER_EXTRA_DATA: &[u8] = &[];
 pub const BUILDER_GAS_LIMIT: u64 = 30_000_000;
@@ -37,6 +35,7 @@ pub mod error;
 pub mod sequencer;
 pub mod slot;
 pub mod timing;
+#[cfg(feature = "witness")]
 pub mod witness;
 
 #[doc(inline)]
@@ -48,7 +47,7 @@ pub use sequencer::{DEFAULT_MAX_SPECULATIVE_DEPTH, EthAttributesBuilder, Sequenc
 #[doc(inline)]
 pub use slot::{
     ParentContext, SlotEvent, SlotKind, SyncSlotBlock, SyncSlotComposer, SyncSlotComposerHandle,
-    SyncSlotMode, spawn_interval, spawn_l1_anchored,
+    SyncSlotMode, spawn_l1_anchored,
 };
 #[doc(inline)]
 pub use timing::{MAX_BLOCKS_PER_BATCH, MAX_BLOCKS_PER_CATCHUP, RollupTiming, SlotComposition};

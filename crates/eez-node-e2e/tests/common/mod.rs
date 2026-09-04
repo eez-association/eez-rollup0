@@ -53,7 +53,7 @@ pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E
 pub const L2_SYSTEM_KEY: &str =
     "0x6f7d72ecb79c8bf1bd8e7c49a1c4a22741ab708f06bb19e5b5d44a6f0934a7c1";
 
-// K = L1/L2 = 2 matches standalone's 2s cadence and leaves one L2 slot for proving.
+// K = L1/L2 = 2 leaves one L2 slot for proving.
 const L1_BLOCK_TIME_SECS: u64 = 4;
 
 // Consumed by the launcher as `--chain`; never forwarded to `eez-node`.
@@ -836,27 +836,6 @@ impl Harness {
         Chain::new(&self.anvil, &self.dep)
     }
 
-    /// Stages a local chain that can later restart as a composer or follower.
-    pub fn standalone_env(&self) -> Vec<(&'static str, String)> {
-        vec![
-            (
-                "EEZ_L1_BLOCK_TIME_MS",
-                (L1_BLOCK_TIME_SECS * 1000).to_string(),
-            ),
-            ("EEZ_L2_BLOCK_TIME_MS", "2000".to_string()),
-            ("EEZ_PROOF_TIME_MS", "1000".to_string()),
-            ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
-            (
-                "RUST_LOG",
-                std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
-            ),
-            (
-                TEST_L2_GENESIS_ENV,
-                self.l2_genesis.0.to_string_lossy().into_owned(),
-            ),
-        ]
-    }
-
     /// Counts signer successes so negative tests cannot pass because proving stalled.
     pub fn successful_attestations(&self) -> Result<usize> {
         self.provers
@@ -1349,7 +1328,6 @@ pub enum NodeBinary {
     #[default]
     Composer,
     Follower,
-    Dev,
 }
 
 impl NodeBinary {
@@ -1357,7 +1335,6 @@ impl NodeBinary {
         match self {
             Self::Composer => "eez-composer",
             Self::Follower => "eez-follower",
-            Self::Dev => "eez-dev-node",
         }
     }
 
@@ -1382,7 +1359,7 @@ impl NodeBinary {
         }
 
         bail!(
-            "{name} binary not found next to the test profile at {}; build the eez-node package binaries before running the harness",
+            "{name} binary not found next to the test profile at {}; build the node-role binaries before running the harness",
             target_profile.display(),
         )
     }
