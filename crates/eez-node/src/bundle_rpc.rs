@@ -108,6 +108,7 @@ where
         event!(
             name: "eez.node.l1_embedded.bundle.accepted",
             Level::INFO,
+            event_name = "eez.node.l1_embedded.bundle.accepted",
             tx_count = bundle.txs.len(),
             target_block = bundle.block_number.as_deref().unwrap_or("next"),
             "embedded dev L1 eth_sendBundle: forwarded txs to pool in order",

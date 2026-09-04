@@ -376,6 +376,7 @@ async fn launch_follower(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Res
                 event!(
                     name: "eez.node.deriver.boot_catch_up.failed",
                     Level::ERROR,
+                    event_name = "eez.node.deriver.boot_catch_up.failed",
                     mode = "follower",
                     error = %err,
                     "boot-time catch_up failed; refusing to start L1-active tasks before reconciliation",
@@ -1039,6 +1040,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                 event!(
                     name: "eez.node.deriver.boot_catch_up.failed",
                     Level::ERROR,
+                    event_name = "eez.node.deriver.boot_catch_up.failed",
                     mode = "composer",
                     error = %err,
                     "boot-time catch_up failed; refusing to start L1-active tasks before reconciliation",

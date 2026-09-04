@@ -548,6 +548,7 @@ fn recover_settlement_failure(
             event!(
                 name: "eez.composer.recovery.poison_evicted",
                 Level::ERROR,
+                event_name = "eez.composer.recovery.poison_evicted",
                 rollup_id,
                 source = ?source,
                 tx_hash = %tx.hash,
@@ -573,6 +574,7 @@ fn recover_settlement_failure(
                 event!(
                     name: "eez.composer.recovery.nonce_chain_evicted",
                     Level::ERROR,
+                    event_name = "eez.composer.recovery.nonce_chain_evicted",
                     rollup_id,
                     source = ?source,
                     tx_hash = %tx.hash,
@@ -590,6 +592,7 @@ fn recover_settlement_failure(
             event!(
                 name: "eez.composer.recovery.nonce_chain_evicted",
                 Level::ERROR,
+                event_name = "eez.composer.recovery.nonce_chain_evicted",
                 rollup_id,
                 source = ?source,
                 tx_hash = %tx.hash,
@@ -1266,6 +1269,7 @@ where
         event!(
             name: "eez.composer.sync_slot.invoked",
             Level::INFO,
+            event_name = "eez.composer.sync_slot.invoked",
             rollup_id,
             timestamp,
             mode = ?mode,
@@ -1417,10 +1421,11 @@ where
         // bundle contains only `postBatch` in this path.
         let drained_count = drained.len();
         // Per-slot drain visibility (pool depth vs how many txs this bundle
-        // took) — DEBUG so it doesn't spam the steady-state INFO stream.
+        // took).
         event!(
             name: "eez.composer.sync_slot.drain",
-            Level::DEBUG,
+            Level::INFO,
+            event_name = "eez.composer.sync_slot.drain",
             rollup_id,
             cursor,
             parent_number,
@@ -1999,7 +2004,6 @@ where
                 poison.push(held);
                 continue;
             }
-
             let contexts = L1TargetSession::new(&l1_state, local.l1_entry.clone())
                 .map_err(|e| format!("L1TargetSession::new: {e}"))
                 .and_then(|exec| {
@@ -2062,6 +2066,7 @@ where
                         event!(
                             name: "eez.composer.cc_compose.outbound_multicall_unsupported",
                             Level::WARN,
+                            event_name = "eez.composer.cc_compose.outbound_multicall_unsupported",
                             rollup_id,
                             tx_idx = idx,
                             tx_hash = %held.hash,
@@ -2662,7 +2667,19 @@ where
         // a sender's nonce N is evicted, N+1.. can never land.
         for tx in &poison {
             // Inclusive eviction releases the poison root's reservation too.
-            for t in pool.evict_chain_at_or_above(tx.sender, tx.direction, tx.nonce) {
+            let evicted = pool.evict_chain_at_or_above(tx.sender, tx.direction, tx.nonce);
+            event!(
+                name: "eez.composer.cc_compose.poison_eviction_completed",
+                Level::WARN,
+                event_name = "eez.composer.cc_compose.poison_eviction_completed",
+                rollup_id,
+                tx_hash = %tx.hash,
+                sender = %tx.sender,
+                nonce = tx.nonce,
+                direction = ?tx.direction,
+                "poison transaction and its nonce-chain suffix evicted",
+            );
+            for t in evicted {
                 event!(
                     name: "eez.composer.cc_compose.poison_chain_evicted",
                     Level::WARN,
@@ -3173,6 +3190,7 @@ where
         event!(
             name: "eez.composer.bundle.dispatched",
             Level::INFO,
+            event_name = "eez.composer.bundle.dispatched",
             rollup_id,
             sync_height,
             tx_count = bundle.len(),
@@ -3305,6 +3323,7 @@ where
         event!(
             name: "eez.composer.phase1.bundle.dispatched",
             Level::INFO,
+            event_name = "eez.composer.phase1.bundle.dispatched",
             rollup_id,
             sync_height,
             "minimal postBatch dispatched to background observer (leading immediate only)",

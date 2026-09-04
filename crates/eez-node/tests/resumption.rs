@@ -18,9 +18,8 @@ use eez_protocol::abi::{
 };
 use eez_protocol::signer::EcdsaProofSigner;
 
-mod common;
-use common::{
-    ANVIL_ATTESTER_KEY, ANVIL_KEY_1, Harness, NodeConfig, NodeHandle, wait_for,
+use eez_testkit::{
+    ANVIL_ATTESTER_KEY, ANVIL_KEY_1, Chain, Harness, NodeConfig, NodeHandle, wait_for,
     wait_for_latest_height,
 };
 
@@ -166,7 +165,7 @@ async fn resumed_batch_settles_only_its_new_suffix() {
     // Mine exactly one block, then hand pacing back to anvil.
     chain.mine().await.unwrap();
     chain
-        .set_interval_mining(common::Chain::block_time_secs())
+        .set_interval_mining(Chain::block_time_secs())
         .await
         .unwrap();
 

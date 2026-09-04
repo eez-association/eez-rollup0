@@ -1,12 +1,16 @@
-# Integration tests under `crates/*/tests/` spawn anvil + python stub +
-# 1–2 reth processes per test. With nextest's default parallelism that
-# can blow past CI runner memory limits and produce flaky timing
-# (composer cadence assumptions in the harness). Force serial execution
-# for the integration-test binaries; unit tests still run in parallel.
+# The eez-node integration tests spawn Anvil, a builder stub, and multiple
+# reth processes. Keep those tests serial without constraining other packages.
 [[profile.default.overrides]]
-filter = "kind(test)"
+filter = "package(eez-node) & kind(test)"
 threads-required = "num-cpus"
 test-group = "integration"
 
 [test-groups]
 integration = { max-threads = 1 }
+
+# CI retries for diagnostics, but a pass on retry is still a failure: a flaky
+# integration test must not make the branch green.
+[profile.ci]
+inherits = "default"
+retries = 2
+flaky-result = "fail"

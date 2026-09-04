@@ -360,9 +360,9 @@ network must remain available.
 ## Generate test traffic
 
 The workload scripts discover the enclave ports and deployment artifact
-automatically. They also read the deterministic L1 funding key from
-`KURTOSIS_ARGS_FILE`, so that variable must point to the arguments file used to
-start the network.
+automatically. They also read the deterministic L1 poster key (never the proof
+signer key) as their funding account from `KURTOSIS_ARGS_FILE`, so that variable
+must point to the arguments file used to start the network.
 
 ### Run one cross-chain workload
 
@@ -377,7 +377,7 @@ Available modes are:
 | --- | --- |
 | `inbound` | L1-to-L2 calls, including a deposit and direct/wrapped contract calls. |
 | `outbound` | L2-to-L1 calls, including a withdrawal and direct/wrapped contract calls. |
-| `mixed` | Inbound and outbound calls submitted for the same Sync block. |
+| `mixed` | Inbound and outbound calls exercised in one workload. |
 | `mixed-pure` | Mixed traffic plus ordinary L2 mempool transactions between waves. |
 
 Each workload verifies transaction inclusion, cross-chain state convergence,
@@ -396,8 +396,28 @@ Useful workload controls include:
   default is two.
 - `EEZ_RECEIPT_WAIT_SECS`: transaction inclusion timeout; the default is 300
   seconds.
+- `EEZ_EFFECTS_WAIT_SECS`: destination-state convergence timeout after source
+  receipts land; the default is 120 seconds.
 - `EEZ_STATE_ROOT_WAIT_SECS`: state-root convergence timeout; the default is 30
   seconds.
+
+### Run the state-chaining regression
+
+```bash
+bash testing/kurtosis/scripts/verify-state-chaining.sh
+```
+
+The regression covers source-state, destination-state, and mixed-operation
+chaining in each direction. It requires each group of three transactions to
+share one Sync block and asserts every ordered return: repeated destination
+calls return `changed = true, false, false`, source-derived calls send
+`1, 2, 3`, and the mixed sequence proves that fixed and source-derived calls
+see one another's intermediate state. It also places a deployed non-proxy
+between two valid inbound calls and verifies that only the poison transaction
+is evicted while both ordered survivors settle. A final mixed-direction drain
+verifies that an outbound source transaction and inbound delivery share the
+canonical L2 Sync block. Every scenario also verifies bundle settlement,
+proof-signer acceptance, and L1/L2 state-root convergence.
 
 ### Run all included workloads
 
@@ -412,9 +432,10 @@ bash testing/kurtosis/scripts/verify-cross-chain-waves.sh
 
 Despite the variable's historical `CI` name, this command operates on the
 already-running local enclave and leaves it running. It executes one `inbound`,
-`outbound`, and `mixed` wave, followed by three `mixed-pure` waves. Per-mode
-output is stored under `$EEZ_CI_RESULT_DIR/checks`. Override the stress count
-with `EEZ_MIXED_PURE_WAVE_COUNT`.
+`outbound`, and `mixed` wave, followed by three `mixed-pure` waves and the
+inbound/outbound state-chaining regression. Per-mode output is stored under
+`$EEZ_CI_RESULT_DIR/checks`. Override the stress count with
+`EEZ_MIXED_PURE_WAVE_COUNT`.
 
 ## Customize the network
 
@@ -526,3 +547,4 @@ Kurtosis assigns different host ports automatically. Remember that
   the genesis-installed EEZL2 contract.
 - `scripts/cross-chain-wave.sh`: individual cross-chain workload modes.
 - `scripts/verify-cross-chain-waves.sh`: complete workload suite.
+- `scripts/verify-state-chaining.sh`: ordered same-Sync-block state-chaining regression.

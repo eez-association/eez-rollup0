@@ -1,12 +1,11 @@
 //! Chained-interstate slot composition (issue #88, `docs/CHAINED-INTERSTATE-DESIGN.md` §9).
 //!
-//! Every test here co-bundles order-dependent cross-chain transactions into a
-//! single drain. The composer must simulate them chained, in canonical order,
-//! so the claims it records (`returnData` → rolling hash) are what sequential
-//! on-chain execution produces. Isolated per-tx simulation over one pre-slot
-//! state produces claims the chain contradicts: the delivery reverts with
-//! `RollingHashMismatch`, the proof signer rejects the window, and the drain
-//! re-queues the same set forever.
+//! Every test here composes order-dependent cross-chain calls into a single
+//! drain. The composer must simulate them in canonical order so the claims it
+//! records (`returnData` → rolling hash) match sequential on-chain execution.
+//! Isolated simulation over one pre-slot state produces claims the chain
+//! contradicts: delivery reverts with `RollingHashMismatch`, the proof signer
+//! rejects the window, and the drain re-queues the same set forever.
 
 use alloy_consensus::Transaction as _;
 use alloy_primitives::{Address, B256, Bytes, TxHash, U256, hex};
@@ -15,13 +14,14 @@ use alloy_rpc_types_eth::Filter;
 use alloy_sol_types::{SolCall, SolEvent, sol};
 use anyhow::{Context, Result};
 use eez_protocol::{EEZL2_ADDRESS, EvmBatch, entries::decode_postbatch};
-
-mod common;
-use common::{
-    ANVIL_KEY_6, CrossChainWorld, DEV_CHAIN_ID, ICounter, IEEZ, INBOUND_USER, OUTBOUND_USER,
-    SETTLE_TIMEOUT, TARGET_DEPLOYER, batches_posted, counter_count, create_cross_chain_proxy,
-    create_l2_cross_chain_proxy, deploy_counter, pending_nonce, receipt_ok,
-    setup_cross_chain_with_env, sign_and_send, state_root, wait_for,
+use eez_testkit::signals;
+use eez_testkit::{
+    ANVIL_KEY_6, CrossChainWorld, DEV_CHAIN_ID, ICounter, IEEZ, INBOUND_USER, ISetterWrapper,
+    IValue, OUTBOUND_USER, SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead, TARGET_DEPLOYER,
+    call_read, counter_count, create_cross_chain_proxy, create_l2_cross_chain_proxy,
+    deploy_counter, events_since, l2_value, last_proxy_result, onchain_nonce, receipt_ok,
+    safe_block_state_root, setup_cross_chain, setup_cross_chain_with_env, sign_and_send,
+    state_root, value_read, wait_for,
 };
 
 sol! {
@@ -165,7 +165,7 @@ async fn assert_reconciled(w: &CrossChainWorld) {
         let (l1_rpc, l2_rpc) = (l1_rpc.clone(), l2_rpc.clone());
         async move {
             let l1_root = state_root(&l1_rpc, eez, rollup_id).await?;
-            let l2_root = common::safe_block_state_root(&l2_rpc).await?;
+            let l2_root = safe_block_state_root(&l2_rpc).await?;
             Ok(l2_root.filter(|root| *root == l1_root).map(|_| ()))
         }
     })
@@ -173,25 +173,20 @@ async fn assert_reconciled(w: &CrossChainWorld) {
     .expect("L1 stored stateRoot never matched the L2 safe stateRoot");
 }
 
-/// Return at the start of a drain window, so everything submitted next lands
-/// in ONE drain.
-///
-/// Deterministic by construction: the composer keeps at most one postBatch in
-/// flight, so a fresh `BatchPosted` means the next drain is gated on the
-/// deriver clearing that batch — never sooner than the following L1 block
-/// (5s on the embedded testing L1, `TESTING_L1_BLOCK_TIME`). Admitting three
-/// transactions at the ingress front takes ~100ms against that. Co-bundling is
-/// still asserted from the posted batch itself, so a missed window fails the
-/// test instead of quietly weakening it.
+/// Return just after the composer drains its pool. Transactions submitted next
+/// receive a complete collection interval before the following drain.
 async fn open_drain_window(w: &CrossChainWorld) {
-    let (l1_rpc, eez, from) = (w.l1_rpc(), w.cfg.eez_address, w.dep.deploy_block);
-    let before = batches_posted(&l1_rpc, eez, from).await.unwrap();
-    wait_for(SETTLE_TIMEOUT, || {
-        let l1_rpc = l1_rpc.clone();
-        async move { Ok((batches_posted(&l1_rpc, eez, from).await? > before).then_some(())) }
+    let cursor = w.node.signal_cursor().unwrap();
+    wait_for(SETTLE_TIMEOUT, || async {
+        let drained = w
+            .node
+            .signals_since(cursor)?
+            .iter()
+            .any(|signal| signal.name == signals::COMPOSER_SYNC_SLOT_DRAIN);
+        Ok(drained.then_some(()))
     })
     .await
-    .expect("composer never posted a batch; cannot align on a drain window");
+    .expect("composer did not report a fresh sync-slot drain boundary");
 }
 
 async fn batches(w: &CrossChainWorld) -> Vec<EvmBatch> {
@@ -212,6 +207,198 @@ fn assert_no_evictions(w: &CrossChainWorld) {
         0,
         "composable transactions must not be evicted",
     );
+}
+
+fn completed_calls_read(wrapper: Address) -> StateRead {
+    call_read(
+        wrapper,
+        "completedProxyCalls()",
+        ISetterWrapper::completedProxyCallsCall {}.abi_encode(),
+    )
+}
+
+/// Two identical inbound calls from one L1 transaction. The composer must keep
+/// both ordered entries: the first changes destination state and the second
+/// observes it, returning `changed = false` instead of being deduplicated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_inbound_calls_in_one_source_transaction_chain_state() {
+    let w = setup_cross_chain().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let value = U256::from(73u64);
+    let wrapped_before = events_since(
+        &l1_rpc,
+        w.inbound_wrapper,
+        ISetterWrapper::Wrapped::SIGNATURE_HASH,
+        0,
+    )
+    .await
+    .unwrap()
+    .len();
+    assert_ne!(
+        l2_value(&w.l2_rpc(), w.value_l2).await.unwrap(),
+        value,
+        "the first call must change destination state",
+    );
+
+    Scenario::new("repeated inbound calls in one source transaction")
+        .inbound(
+            ScenarioCall::new(
+                w.inbound_wrapper,
+                ISetterWrapper::setSameValueTwiceCall { v: value }.abi_encode(),
+            )
+            .with_gas_limit(1_200_000),
+        )
+        .expect_l2_state(value_read(w.value_l2), value)
+        .expect_l1_state(completed_calls_read(w.inbound_wrapper), 2u64)
+        .expect_settled_fully()
+        .run(&w)
+        .await
+        .unwrap();
+
+    let wrapped = events_since(
+        &l1_rpc,
+        w.inbound_wrapper,
+        ISetterWrapper::Wrapped::SIGNATURE_HASH,
+        0,
+    )
+    .await
+    .unwrap();
+    let results = wrapped[wrapped_before..]
+        .iter()
+        .map(|log| {
+            let event = ISetterWrapper::Wrapped::decode_log(&log.inner).unwrap();
+            (event.input, event.ok, event.changed, event.newValue)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec![(value, true, true, value), (value, true, false, value)],
+        "the repeated call must observe the first destination write",
+    );
+    assert_eq!(
+        last_proxy_result(&l1_rpc, w.inbound_wrapper).await.unwrap(),
+        (false, value),
+        "the final ordered call must return the post-write state",
+    );
+
+    assert_reconciled(&w).await;
+    assert_no_evictions(&w);
+    w.node.assert_no_process_death();
+}
+
+/// Two outbound transactions with identical calls must remain distinct ordered
+/// entries. The second execution observes the first write and returns
+/// `changed = false`; semantic-hash deduplication would drop that result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identical_outbound_calls_in_separate_transactions_chain_state() {
+    let w = setup_cross_chain_with_env(&cap_env()).await.unwrap();
+    let (l1_rpc, l2_rpc) = (w.l1_rpc(), w.l2_rpc());
+    let value = U256::from(79u64);
+    let wrapper_call = ISetterWrapper::setViaProxyCall { v: value }.abi_encode();
+    let destination_call = IValue::setValueCall { v: value }.abi_encode();
+    let provider = ProviderBuilder::new().connect_http(l2_rpc.parse().unwrap());
+    let wrapped_filter = Filter::new()
+        .address(w.outbound_wrapper)
+        .event_signature(ISetterWrapper::Wrapped::SIGNATURE_HASH)
+        .from_block(0u64);
+    let wrapped_before = provider.get_logs(&wrapped_filter).await.unwrap().len();
+    assert_ne!(
+        l2_value(&l1_rpc, w.outbound_value).await.unwrap(),
+        value,
+        "the first call must change destination state",
+    );
+
+    open_drain_window(&w).await;
+    let nonce = onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
+    let first = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        nonce,
+        Some(w.outbound_wrapper),
+        U256::ZERO,
+        wrapper_call.clone(),
+        1_200_000,
+    )
+    .await
+    .expect("first identical outbound call must be admitted");
+    let second = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        nonce + 1,
+        Some(w.outbound_wrapper),
+        U256::ZERO,
+        wrapper_call,
+        1_200_000,
+    )
+    .await
+    .expect("second identical outbound call must be admitted");
+
+    assert_receipt_ok(&l2_rpc, first, "first identical outbound call").await;
+    assert_receipt_ok(&l2_rpc, second, "second identical outbound call").await;
+    wait_for(SETTLE_TIMEOUT, || {
+        let provider = provider.clone();
+        let wrapped_filter = wrapped_filter.clone();
+        async move {
+            let count = provider.get_logs(&wrapped_filter).await?.len();
+            Ok((count == wrapped_before + 2).then_some(()))
+        }
+    })
+    .await
+    .expect("both identical outbound calls did not return to the source wrapper");
+
+    let carried: Vec<Vec<Bytes>> = wait_for(SETTLE_TIMEOUT, || async {
+        let carried: Vec<Vec<Bytes>> = batches(&w)
+            .await
+            .iter()
+            .map(|batch| outbound_calls(batch, w.outbound_value))
+            .filter(|calls| !calls.is_empty())
+            .collect();
+        Ok((!carried.is_empty()).then_some(carried))
+    })
+    .await
+    .expect("identical outbound calls never reached L1");
+    assert_eq!(
+        carried,
+        vec![vec![
+            Bytes::from(destination_call.clone()),
+            Bytes::from(destination_call),
+        ]],
+        "both identical calls must ride one postBatch in source order",
+    );
+
+    let wrapped = provider.get_logs(&wrapped_filter).await.unwrap();
+    let wrapped = &wrapped[wrapped_before..];
+    let sync_block = wrapped[0]
+        .block_number
+        .expect("first wrapper result must belong to a mined Sync block");
+    assert_eq!(
+        wrapped[1].block_number,
+        Some(sync_block),
+        "both calls must execute in one Sync block",
+    );
+    assert_eq!(
+        [wrapped[0].transaction_hash, wrapped[1].transaction_hash],
+        [Some(first), Some(second)],
+        "wrapper results must retain source transaction order",
+    );
+    let results = wrapped
+        .iter()
+        .map(|log| {
+            let event = ISetterWrapper::Wrapped::decode_log(&log.inner).unwrap();
+            (event.input, event.ok, event.changed, event.newValue)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        vec![(value, true, true, value), (value, true, false, value)],
+        "the second call must observe the first destination write",
+    );
+
+    assert_reconciled(&w).await;
+    assert_no_evictions(&w);
+    w.node.assert_no_process_death();
 }
 
 /// THE issue #88 repro. Three L1→L2 `increment()` calls against one stateful
@@ -240,7 +427,7 @@ async fn three_order_dependent_inbound_calls_in_one_bundle() {
     .unwrap();
 
     open_drain_window(&w).await;
-    let mut nonce = pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
+    let mut nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
     let mut hashes = Vec::new();
     for _ in 0..3 {
         hashes.push(
@@ -359,7 +546,7 @@ async fn mixed_direction_state_chain_in_one_slot() {
         &w.l1_xchain(),
         INBOUND_USER,
         DEV_CHAIN_ID,
-        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
+        onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
         Some(inbound_proxy),
         U256::ZERO,
         ICounter::incrementCall {}.abi_encode(),
@@ -371,7 +558,7 @@ async fn mixed_direction_state_chain_in_one_slot() {
         &w.l2_xchain(),
         OUTBOUND_USER,
         w.l2_chain_id,
-        pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
+        onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
         Some(outbound_proxy),
         U256::ZERO,
         add_five.clone(),
@@ -380,8 +567,10 @@ async fn mixed_direction_state_chain_in_one_slot() {
     .await
     .expect("outbound add must be admitted");
 
-    assert_receipt_ok(&l1_rpc, inbound, "inbound increment").await;
-    assert_receipt_ok(&l2_rpc, outbound, "outbound add").await;
+    tokio::join!(
+        assert_receipt_ok(&l1_rpc, inbound, "inbound increment"),
+        assert_receipt_ok(&l2_rpc, outbound, "outbound add"),
+    );
     wait_for_count(&l2_rpc, l2_counter, 1, "L2 counter").await;
     wait_for_count(&l1_rpc, l1_counter, 5, "L1 counter").await;
 
@@ -468,14 +657,12 @@ async fn poison_mid_bundle_leaves_survivors_correct() {
     )
     .await
     .unwrap();
-    // Real code, no proxy: `increment()` succeeds on L1 and records no
-    // cross-chain call, so composition finalizes empty and evicts.
     let non_proxy = deploy_counter(&l1_rpc, w.cfg.deployer_key, DEV_CHAIN_ID)
         .await
         .unwrap();
 
     open_drain_window(&w).await;
-    let mut nonce = pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
+    let mut nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
     let first = sign_and_send(
         &w.l1_xchain(),
         INBOUND_USER,
@@ -493,7 +680,7 @@ async fn poison_mid_bundle_leaves_survivors_correct() {
         &w.l1_xchain(),
         ANVIL_KEY_6,
         DEV_CHAIN_ID,
-        pending_nonce(&l1_rpc, ANVIL_KEY_6).await.unwrap(),
+        onchain_nonce(&l1_rpc, ANVIL_KEY_6).await.unwrap(),
         Some(non_proxy),
         U256::ZERO,
         ICounter::incrementCall {}.abi_encode(),
@@ -551,7 +738,7 @@ async fn poison_mid_bundle_leaves_survivors_correct() {
         &w.l1_xchain(),
         INBOUND_USER,
         DEV_CHAIN_ID,
-        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
+        onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
         Some(proxy),
         U256::ZERO,
         ICounter::incrementCall {}.abi_encode(),
@@ -593,7 +780,7 @@ async fn same_sender_outbound_chain() {
     .abi_encode();
 
     open_drain_window(&w).await;
-    let mut nonce = pending_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
+    let mut nonce = onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
     let mut hashes = Vec::new();
     for input in [increment.clone(), add_five.clone()] {
         hashes.push(

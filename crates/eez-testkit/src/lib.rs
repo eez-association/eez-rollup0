@@ -1,11 +1,18 @@
-//! Shared process and chain fixtures for node integration tests.
+//! Reusable Anvil-driven EEZ integration framework.
+//!
+//! The crate intentionally lives as a dev-dependency of protocol components:
+//! it owns process lifecycle, deterministic chain fixtures, transaction helpers,
+//! structured node signals, and the declarative scenario runner.
 
-#![allow(dead_code)]
+#![allow(missing_debug_implementations)]
+
+mod artifacts;
+mod ports;
+pub mod signals;
 
 use std::{
     collections::HashSet,
     fmt::Write as _,
-    net::{TcpListener, UdpSocket},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
@@ -16,7 +23,7 @@ use std::{
 };
 
 use alloy_consensus::Transaction as _;
-use alloy_primitives::{Address, B256, Signature, U256, address, hex};
+use alloy_primitives::{Address, B256, Bytes, Signature, U256, address, hex};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{BlockNumHash, BlockNumberOrTag, TransactionReceipt, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
@@ -35,6 +42,9 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, Streaming};
 
+pub use crate::signals::NodeSignal;
+use crate::{artifacts::FailureDatadir, ports::PortLease};
+
 /// Anvil's first default account (mnemonic `test test test test test test test test test test test junk`).
 pub const ANVIL_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 pub const ANVIL_ADDR: Address = address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
@@ -45,7 +55,7 @@ pub const ANVIL_KEY_4: &str = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f873
 /// Second cross-chain sender. Eviction cascades along one sender's nonce chain,
 /// so a poison tx needs its own sender to leave co-bundled survivors alone.
 pub const ANVIL_KEY_6: &str = "0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e";
-// Account #0 derives the reserved L2 system address and cannot attest.
+/// Unfunded proof-signer identity, separate from every transaction sender.
 pub const ANVIL_ATTESTER_KEY: &str =
     "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906");
@@ -62,18 +72,36 @@ const TEST_L2_GENESIS_ENV: &str = "EEZ_TEST_L2_GENESIS_PATH";
 const TX_SPAM_INTERVAL: Duration = Duration::from_secs(1);
 
 static LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
-// Keep released probe ports unique within each integration-test process.
-static ASSIGNED_PORTS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 static WORKSPACE_BUILD_LOCK: Mutex<()> = Mutex::new(());
 
-fn repo_root() -> PathBuf {
+pub const FATAL_SIGNALS: &[&str] = signals::FATAL;
+
+pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
         .expect("repo root")
 }
 
-fn anvil_bin() -> String {
+/// Resolve the node executable without tying this crate to one Cargo test
+/// target. `EEZ_TEST_NODE_BIN` is the explicit cross-crate escape hatch; the
+/// Cargo integration-test variable and the normal debug output are fallbacks.
+pub fn eez_node_bin() -> Result<PathBuf> {
+    if let Some(path) =
+        std::env::var_os("EEZ_TEST_NODE_BIN").or_else(|| std::env::var_os("CARGO_BIN_EXE_eez-node"))
+    {
+        return Ok(path.into());
+    }
+    let path = repo_root().join("target/debug/eez-node");
+    if path.is_file() {
+        return Ok(path);
+    }
+    bail!(
+        "eez-node binary not found; set EEZ_TEST_NODE_BIN or build it with `cargo build -p eez-node`"
+    )
+}
+
+pub fn anvil_bin() -> String {
     for path in [
         "/root/.foundry/bin/anvil",
         &format!(
@@ -88,90 +116,6 @@ fn anvil_bin() -> String {
     "anvil".to_string()
 }
 
-/// Every port handed out anywhere in this test process.
-///
-/// Probes are availability checks, not reservations, so without a shared
-/// record a later spawn can be handed a port an earlier node in the same
-/// process already used — its lingering sockets then fail the real bind with
-/// `address already in use`. Serial test binaries spawn several nodes per
-/// process, so the record has to outlive the individual spawn.
-static HANDED_OUT_PORTS: std::sync::LazyLock<std::sync::Mutex<HashSet<u16>>> =
-    std::sync::LazyLock::new(std::sync::Mutex::default);
-
-fn handed_out_ports() -> std::sync::MutexGuard<'static, HashSet<u16>> {
-    HANDED_OUT_PORTS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Probe a currently available TCP port, distinct from every port this process
-/// has already handed out.
-///
-/// The listener is released on return, so this is not a reservation.
-pub fn free_port() -> u16 {
-    probe_unique_tcp_port(&mut handed_out_ports())
-}
-
-fn probe_unique_tcp_port(used: &mut HashSet<u16>) -> u16 {
-    loop {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind TCP probe");
-        let port = listener.local_addr().expect("TCP probe local_addr").port();
-        if used.insert(port) {
-            return port;
-        }
-    }
-}
-
-fn probe_unique_udp_port(used: &mut HashSet<u16>) -> u16 {
-    loop {
-        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind UDP probe");
-        let port = socket.local_addr().expect("UDP probe local_addr").port();
-        if used.insert(port) {
-            return port;
-        }
-    }
-}
-
-fn probe_unique_tcp_udp_port(used: &mut HashSet<u16>) -> u16 {
-    loop {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind TCP probe");
-        let port = listener.local_addr().expect("TCP probe local_addr").port();
-        if used.contains(&port) {
-            continue;
-        }
-        let Ok(socket) = UdpSocket::bind(("127.0.0.1", port)) else {
-            continue;
-        };
-        drop(socket);
-        used.insert(port);
-        return port;
-    }
-}
-
-/// Probe an HTTP port whose implicit `port + 1` WS listener is also available.
-fn probe_unique_http_port(used: &mut HashSet<u16>) -> u16 {
-    loop {
-        let http_listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP probe");
-        let http_port = http_listener
-            .local_addr()
-            .expect("HTTP probe local_addr")
-            .port();
-        let Some(ws_port) = http_port.checked_add(1) else {
-            continue;
-        };
-        if used.contains(&http_port) || used.contains(&ws_port) {
-            continue;
-        }
-        let Ok(ws_listener) = TcpListener::bind(("127.0.0.1", ws_port)) else {
-            continue;
-        };
-        drop(ws_listener);
-        used.insert(http_port);
-        used.insert(ws_port);
-        return http_port;
-    }
-}
-
 pub struct Anvil {
     child: Child,
     pub rpc_url: String,
@@ -181,9 +125,7 @@ pub struct Anvil {
 
 struct AnvilConfig {
     block_time_secs: u64,
-    mnemonic: Option<&'static str>,
-    hardfork: Option<&'static str>,
-    gas_limit: Option<u64>,
+    gas_limit: u64,
     genesis_timestamp: u64,
 }
 
@@ -191,28 +133,15 @@ impl AnvilConfig {
     fn standard(genesis_timestamp: u64) -> Self {
         Self {
             block_time_secs: L1_BLOCK_TIME_SECS,
-            mnemonic: None,
-            hardfork: None,
-            gas_limit: None,
-            genesis_timestamp,
-        }
-    }
-
-    fn for_reorg(genesis_timestamp: u64) -> Self {
-        Self {
-            block_time_secs: L1_BLOCK_TIME_SECS,
-            mnemonic: Some(HARDHAT_MNEMONIC),
-            hardfork: Some("cancun"),
-            gas_limit: Some(30_000_000),
+            gas_limit: 30_000_000,
             genesis_timestamp,
         }
     }
 }
 
-const HARDHAT_MNEMONIC: &str = "test test test test test test test test test test test junk";
-
 impl Anvil {
-    async fn spawn_with(port: u16, cfg: AnvilConfig) -> Result<Self> {
+    async fn spawn_with(port_lease: PortLease, cfg: AnvilConfig) -> Result<Self> {
+        let port = port_lease.port();
         let (log_path, log_dir) = test_log_destination("anvil")?;
         let log = std::fs::File::create(&log_path).context("create anvil log")?;
         let err_log = log.try_clone().context("clone anvil log")?;
@@ -226,21 +155,11 @@ impl Anvil {
             &cfg.block_time_secs.to_string(),
             "--silent",
         ]);
-        if let Some(m) = cfg.mnemonic {
-            cmd.args(["--mnemonic", m]);
-        }
-        if let Some(h) = cfg.hardfork {
-            cmd.args(["--hardfork", h]);
-        }
-        if let Some(g) = cfg.gas_limit {
-            cmd.args(["--gas-limit", &g.to_string()]);
-        }
+        cmd.args(["--gas-limit", &cfg.gas_limit.to_string()]);
         cmd.args(["--timestamp", &cfg.genesis_timestamp.to_string()]);
-        let mut child = cmd
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(err_log))
-            .spawn()
-            .context("spawn anvil")?;
+        cmd.stdout(Stdio::from(log)).stderr(Stdio::from(err_log));
+        drop(port_lease);
+        let mut child = cmd.spawn().context("spawn anvil")?;
         let rpc_url = format!("http://127.0.0.1:{port}");
         let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
         let startup_timeout = Duration::from_secs(10);
@@ -317,19 +236,21 @@ struct BundleStub {
 }
 
 impl BundleStub {
-    async fn spawn(port: u16, upstream: &str) -> Result<Self> {
+    async fn spawn(port_lease: PortLease, upstream: &str) -> Result<Self> {
+        let port = port_lease.port();
         let script = repo_root().join("scripts/builder-stub.py");
         let listen = format!("127.0.0.1:{port}");
         let (log_path, log_dir) = test_log_destination("builder-stub")?;
         let log = std::fs::File::create(&log_path).context("create builder stub log")?;
         let err_log = log.try_clone().context("clone builder stub log")?;
-        let mut child = Command::new("python3")
+        let mut command = Command::new("python3");
+        command
             .arg(script)
             .args(["--listen", &listen, "--upstream", upstream])
             .stdout(Stdio::from(log))
-            .stderr(Stdio::from(err_log))
-            .spawn()
-            .context("spawn builder-stub.py")?;
+            .stderr(Stdio::from(err_log));
+        drop(port_lease);
+        let mut child = command.spawn().context("spawn builder-stub.py")?;
         let url = format!("http://{listen}");
         for _ in 0..30 {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -453,14 +374,16 @@ pub struct ProofSignerHandle {
 
 impl ProofSignerHandle {
     async fn spawn(cfg: &ProofSignerConfig<'_>) -> Result<Self> {
-        let listen = format!("127.0.0.1:{}", free_port());
+        let port_lease = PortLease::tcp();
+        let listen = format!("127.0.0.1:{}", port_lease.port());
         let attester = signer_address(cfg.signer_key)?;
         let l2_system_address = signer_address(L2_SYSTEM_KEY)?;
         let (log_path, log_dir) = test_log_destination("eez-proof-signer")?;
         let working_dir = tempfile::tempdir().context("proof signer working directory")?;
         let log = std::fs::File::create(&log_path).context("create proof signer log")?;
         let err_log = log.try_clone().context("clone proof signer log")?;
-        let mut child = Command::new(proof_signer_binary()?)
+        let mut command = Command::new(proof_signer_binary()?);
+        command
             // The signer also loads dotenv at startup. Keep its explicitly
             // constructed test environment isolated from repository config.
             .current_dir(working_dir.path())
@@ -488,9 +411,9 @@ impl ProofSignerHandle {
             .env("NO_COLOR", "1")
             .env("RUST_LOG", "info")
             .stdout(Stdio::from(log))
-            .stderr(Stdio::from(err_log))
-            .spawn()
-            .context("spawn eez-proof-signer")?;
+            .stderr(Stdio::from(err_log));
+        drop(port_lease);
+        let mut child = command.spawn().context("spawn eez-proof-signer")?;
 
         for _ in 0..100 {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -531,7 +454,8 @@ impl ProofSignerHandle {
             .with_context(|| format!("read signer log {}", self.log_path.display()))?;
         Ok(contents
             .lines()
-            .filter(|line| line.contains("window validated and signed"))
+            .filter_map(signals::parse)
+            .filter(|signal| signal.name == "eez.proof_signer.window_signed")
             .count())
     }
 
@@ -802,17 +726,9 @@ impl Harness {
     /// Starts a fixture with L1 and L2 genesis timestamps aligned to wall time.
     pub async fn fresh() -> Result<Self> {
         let ts = now_unix_secs();
-        let l2_genesis = write_dev_genesis_at(ts)?;
-        let cfg = AnvilConfig::standard(ts);
-        Self::with_anvil_config(cfg, dev_genesis_state_root(), l2_genesis).await
-    }
-
-    /// Starts the reorg fixture with one timestamp shared by Anvil and the L2.
-    pub async fn for_reorg() -> Result<Self> {
-        let ts = now_unix_secs();
         let l2_genesis = write_l2_genesis_at(ts)?;
-        let cfg = AnvilConfig::for_reorg(ts);
-        Self::with_anvil_config(cfg, reorg_genesis_state_root()?, l2_genesis).await
+        let cfg = AnvilConfig::standard(ts);
+        Self::with_anvil_config(cfg, l2_genesis_state_root(), l2_genesis).await
     }
 
     async fn with_anvil_config(
@@ -820,8 +736,8 @@ impl Harness {
         initial_state: B256,
         l2_genesis: (PathBuf, tempfile::TempDir),
     ) -> Result<Self> {
-        let anvil = Anvil::spawn_with(free_port(), cfg).await?;
-        let stub = BundleStub::spawn(free_port(), &anvil.rpc_url).await?;
+        let anvil = Anvil::spawn_with(PortLease::tcp(), cfg).await?;
+        let stub = BundleStub::spawn(PortLease::tcp(), &anvil.rpc_url).await?;
         let dep = deploy_contracts_with_initial(&anvil.rpc_url, ANVIL_KEY, initial_state).await?;
         Ok(Self {
             anvil,
@@ -1058,16 +974,6 @@ sol! {
 pub const INVALID_PROOF_SELECTOR: [u8; 4] = IEEZ::InvalidProof::SELECTOR;
 pub const INVALID_PROOF_SYSTEM_CONFIG_SELECTOR: [u8; 4] = IEEZ::InvalidProofSystemConfig::SELECTOR;
 
-/// Reth's `--chain dev` genesis state root. Used as the `initialState`
-/// when registering the rollup so the very first batch's prestate
-/// (`l2_state_root(0)`) matches the on-chain `rollups[rid].stateRoot`.
-/// With the default `B256::ZERO`, every batch's `_applyStateUpdates`
-/// reverts with `StateRootMismatch`, caught by the try/catch,
-/// emitting `L2TxSkipped` instead of `L2ExecutionPerformed`.
-pub fn dev_genesis_state_root() -> B256 {
-    reth_chainspec::DEV.genesis_header().state_root
-}
-
 /// Wall-clock seconds for stamping test genesis + anvil, so the sequencer's
 /// defer-on-lateness gate doesn't read every trigger as late.
 fn now_unix_secs() -> u64 {
@@ -1077,40 +983,27 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
-/// Reth's dev genesis with timestamp set to `ts`, written to a temp file for
-/// `--chain`. Same alloc as `--chain dev` → state root still equals
-/// [`dev_genesis_state_root`]. The tempdir must outlive nodes using the path.
-fn write_dev_genesis_at(ts: u64) -> Result<(PathBuf, tempfile::TempDir)> {
-    let mut genesis: alloy_genesis::Genesis = reth_chainspec::DEV.genesis().clone();
-    genesis.timestamp = ts;
-    let dir = tempfile::tempdir().context("genesis tempdir")?;
-    let path = dir.path().join("genesis.json");
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&genesis).context("serialize dev genesis")?,
-    )
-    .context("write dev genesis")?;
-    Ok((path, dir))
+/// The shared L2 genesis fixture used by every harness mode.
+pub fn l2_genesis_fixture_path() -> PathBuf {
+    repo_root().join("crates/eez-node/tests/fixtures/genesis.json")
 }
 
-/// L2 genesis fixture used by reorg scenarios.
-fn reorg_genesis_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/genesis.json")
+fn fixture_genesis() -> Result<alloy_genesis::Genesis> {
+    let raw = std::fs::read_to_string(l2_genesis_fixture_path()).context("read genesis.json")?;
+    serde_json::from_str(&raw).context("parse genesis.json")
 }
 
-/// Genesis state root of `reorg_genesis_path()`. Computed by reading the
-/// JSON into reth's `Genesis` and converting to a `ChainSpec`.
-pub fn reorg_genesis_state_root() -> Result<B256> {
-    let raw = std::fs::read_to_string(reorg_genesis_path()).context("read genesis.json")?;
-    let genesis: alloy_genesis::Genesis =
-        serde_json::from_str(&raw).context("parse genesis.json")?;
-    let spec: reth_chainspec::ChainSpec = genesis.into();
-    Ok(spec.genesis_header().state_root)
+/// State root registered on L1 for the shared L2 genesis fixture.
+pub fn l2_genesis_state_root() -> B256 {
+    static ROOT: LazyLock<B256> = LazyLock::new(|| {
+        let spec: reth_chainspec::ChainSpec =
+            fixture_genesis().expect("read L2 genesis fixture").into();
+        spec.genesis_header().state_root
+    });
+    *ROOT
 }
 
-/// Sign and submit one legacy L2 value transfer. The default dev L2 does not
-/// expose EIP-1559 fee estimation, so a legacy transaction keeps background
-/// traffic valid on both the dev chain and the Cancun reorg fixture.
+/// Sign and submit one EIP-1559 L2 value transfer using the pool nonce.
 pub async fn send_l2_value_transfer(
     rpc_url: &str,
     signing_key: &str,
@@ -1126,20 +1019,17 @@ pub async fn send_l2_value_transfer(
 
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let chain_id = provider.get_chain_id().await?;
-    let nonce = provider.get_transaction_count(from).await?;
-    let mut tx = TxLegacy {
-        chain_id: Some(chain_id),
+    let nonce = provider.get_transaction_count(from).pending().await?;
+    let fees = provider.estimate_eip1559_fees().await?;
+    let mut tx = TxEip1559 {
+        chain_id,
         nonce,
-        // Reth's txpool requires a non-zero priority margin. The RPC gas-price
-        // suggestion can equal the current base fee during startup, which makes
-        // an otherwise valid legacy test transaction "underpriced".
-        gas_price: provider
-            .get_gas_price()
-            .await?
-            .saturating_add(2_000_000_000),
         gas_limit: 21_000,
+        max_fee_per_gas: fees.max_fee_per_gas,
+        max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
         to: alloy_primitives::TxKind::Call(to),
         value,
+        access_list: alloy_rpc_types_eth::AccessList::default(),
         input: alloy_primitives::Bytes::default(),
     };
     let sig = signer.sign_transaction_sync(&mut tx)?;
@@ -1178,10 +1068,7 @@ pub async fn send_l2_value_transfer_confirmed(
     Ok(hash)
 }
 
-/// Read the `stateRoot` of the latest `safe` block on the L2 at `rpc_url`.
-/// Returns `Ok(None)` while the L2 hasn't yet adopted any safe block
-/// (genesis L1 derivation pending). Used by the multi-composer reorg
-/// test to verify both composers settle on the same canonical L2 head.
+/// Return the latest safe block's state root, or `None` before one exists.
 pub async fn safe_block_state_root(rpc_url: &str) -> Result<Option<B256>> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let block = provider
@@ -1227,8 +1114,7 @@ async fn deploy_contracts_with_initial(
     .await?;
     let deploy_block = provider.get_block_number().await?;
 
-    // The attester is NOT the deployer: `key` is also the L2 system key here,
-    // and the signer refuses to attest with a key deriving the system address.
+    // Keep the authorized attester separate from the poster/deployer key.
     let attester = signer_address(ANVIL_ATTESTER_KEY)?;
     let proof_system_address = deploy(
         &provider,
@@ -1329,18 +1215,18 @@ async fn deploy<P: Provider>(
 }
 
 pub struct NodeHandle {
-    child: std::sync::Mutex<Child>,
-    background_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    child: Mutex<Child>,
+    background_tasks: Mutex<Vec<JoinHandle<()>>>,
     /// Human label for assertion messages ("c1", "c2", or the default "node").
     pub name: String,
     /// Where the node's merged stdout+stderr is written. Goes to
     /// `EEZ_TEST_LOG_DIR/eez-node-<pid>.log` if that env var is set,
-    /// otherwise inside a tempdir held in `keep_alive`.
+    /// otherwise inside a tempdir held by this handle.
     pub log_path: PathBuf,
-    /// Tempdirs whose lifetime is tied to this handle (the log dir if
-    /// we allocated one, and the datadir if the handle created it via
-    /// [`Self::start`]). They drop with the handle.
-    keep_alive: Vec<tempfile::TempDir>,
+    /// Tempdirs whose lifetime is tied to this handle (currently the log dir).
+    _keep_alive: Vec<tempfile::TempDir>,
+    /// Owned node database. CI retains it only if this test unwinds in failure.
+    owned_datadir: Option<FailureDatadir>,
     pub http_port: u16,
 }
 
@@ -1367,10 +1253,9 @@ impl NodeBinary {
             return Ok(path.into());
         }
 
-        // Resolve at runtime so this harness also works when shared through a
-        // support crate, where Cargo does not expose `CARGO_BIN_EXE_*` to
-        // `env!`. Test executables sit in `<target>/<profile>/deps`, alongside
-        // the role binaries' parent directory.
+        // `eez-testkit` is compiled as a library, where Cargo does not expose
+        // `CARGO_BIN_EXE_*` to `env!`. At test runtime the executable sits in
+        // `<target>/<profile>/deps`, alongside the role binaries' parent dir.
         let current = std::env::current_exe().context("current test executable")?;
         let target_profile = current
             .parent()
@@ -1396,39 +1281,59 @@ pub struct NodeConfig<'a> {
 }
 
 impl NodeHandle {
-    fn spawn(datadir: &std::path::Path, env: &[(&'static str, String)]) -> Result<Self> {
-        Self::spawn_with("node", datadir, &NodeConfig::default(), env)
-    }
-
     fn spawn_with(
         name: &str,
         datadir: &std::path::Path,
         cfg: &NodeConfig<'_>,
         env: &[(&'static str, String)],
     ) -> Result<Self> {
+        Self::spawn_with_reservations(name, datadir, cfg, env, Vec::new())
+    }
+
+    fn spawn_with_reservations(
+        name: &str,
+        datadir: &std::path::Path,
+        cfg: &NodeConfig<'_>,
+        env: &[(&'static str, String)],
+        mut port_leases: Vec<PortLease>,
+    ) -> Result<Self> {
         let (log_path, log_tempdir) = test_log_destination(&format!("eez-node-{name}"))?;
         let f = std::fs::File::create(&log_path).context("create log file")?;
         let f2 = f.try_clone().context("clone log file")?;
         let (stdout, stderr) = (Stdio::from(f), Stdio::from(f2));
-        // Reth defaults collide if any test or unrelated process holds them.
-        // Each NodeHandle picks its own ephemeral ports for authrpc / http / ws / p2p.
-        // These are availability probes, not reservations: the sockets are
-        // released before the child binds. The process-wide record prevents
-        // collisions among one node's listeners AND across the nodes a serial
-        // test binary spawns one after another.
-        let mut used_ports = handed_out_ports();
-        let authrpc_port = probe_unique_tcp_port(&mut used_ports);
-        let http_port = probe_unique_tcp_port(&mut used_ports);
-        let ws_port = probe_unique_tcp_port(&mut used_ports);
-        let p2p_port = probe_unique_tcp_port(&mut used_ports);
-        let l1_http_port = probe_unique_http_port(&mut used_ports);
-        let l1_auth_port = probe_unique_tcp_port(&mut used_ports);
+        let authrpc_lease = PortLease::tcp();
+        let http_lease = PortLease::tcp();
+        let ws_lease = PortLease::tcp();
+        let p2p_lease = PortLease::tcp();
+        let l1_http_lease = PortLease::http_pair();
+        let l1_auth_lease = PortLease::tcp();
         // Embedded L1 uses this numeric port for RLPx TCP and discovery UDP.
-        let l1_p2p_port = probe_unique_tcp_udp_port(&mut used_ports);
-        let l1_discv5_port = probe_unique_udp_port(&mut used_ports);
-        let l1_xchain_port = probe_unique_tcp_port(&mut used_ports);
-        let l2_xchain_port = probe_unique_tcp_port(&mut used_ports);
-        drop(used_ports);
+        let l1_p2p_lease = PortLease::tcp_udp();
+        let l1_discv5_lease = PortLease::udp();
+        let l1_xchain_lease = PortLease::tcp();
+        let l2_xchain_lease = PortLease::tcp();
+        let authrpc_port = authrpc_lease.port();
+        let http_port = http_lease.port();
+        let ws_port = ws_lease.port();
+        let p2p_port = p2p_lease.port();
+        let l1_http_port = l1_http_lease.port();
+        let l1_auth_port = l1_auth_lease.port();
+        let l1_p2p_port = l1_p2p_lease.port();
+        let l1_discv5_port = l1_discv5_lease.port();
+        let l1_xchain_port = l1_xchain_lease.port();
+        let l2_xchain_port = l2_xchain_lease.port();
+        port_leases.extend([
+            authrpc_lease,
+            http_lease,
+            ws_lease,
+            p2p_lease,
+            l1_http_lease,
+            l1_auth_lease,
+            l1_p2p_lease,
+            l1_discv5_lease,
+            l1_xchain_lease,
+            l2_xchain_lease,
+        ]);
         let l1_datadir = datadir.join("embedded-l1");
         let env_genesis = env
             .iter()
@@ -1442,6 +1347,9 @@ impl NodeHandle {
             .or(env_genesis)
             .unwrap_or_else(|| std::ffi::OsString::from("dev"));
         let mut cmd = Command::new(cfg.binary.path()?);
+        let signal_filter = std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| {
+            "warn,eez_node=info,eez_l1=info,eez_composer=info,eez_deriver=info".to_string()
+        });
         // Each role binary loads dotenv files from its working directory. Running from
         // the datadir prevents repository settings from changing the explicit
         // test configuration or redirecting L1 traffic to a developer endpoint.
@@ -1452,6 +1360,12 @@ impl NodeHandle {
             .arg(datadir)
             .stdout(stdout)
             .args([
+                "--log.stdout.format",
+                "json",
+                "--log.stdout.filter",
+                &signal_filter,
+                "--log.file.max-files",
+                "0",
                 "--http",
                 "--http.addr",
                 "127.0.0.1",
@@ -1494,13 +1408,18 @@ impl NodeHandle {
             }
             cmd.env(*k, v);
         }
+        // Keep every selected port bound until the child command is complete.
+        // The subprocess bind itself cannot be atomic, but this leaves only the
+        // unavoidable drop/spawn boundary exposed to another process.
+        drop(port_leases);
         let child = cmd.spawn().context("spawn eez node role")?;
         Ok(Self {
-            child: std::sync::Mutex::new(child),
-            background_tasks: std::sync::Mutex::new(Vec::new()),
+            child: Mutex::new(child),
+            background_tasks: Mutex::new(Vec::new()),
             name: name.to_string(),
             log_path,
-            keep_alive: log_tempdir.into_iter().collect(),
+            _keep_alive: log_tempdir.into_iter().collect(),
+            owned_datadir: None,
             http_port,
         })
     }
@@ -1510,17 +1429,10 @@ impl NodeHandle {
         cfg: &NodeConfig<'_>,
         env: &[(&'static str, String)],
     ) -> Result<Self> {
-        if let Ok(root) = std::env::var("EEZ_TEST_DATADIR_DIR") {
-            let suffix = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let datadir = PathBuf::from(root)
-                .join(format!("eez-node-{name}-{}-{suffix}", std::process::id()));
-            std::fs::create_dir_all(&datadir)
-                .with_context(|| format!("create retained test datadir {}", datadir.display()))?;
-            return Self::start_with_datadir(name, &datadir, cfg, env).await;
-        }
-        let datadir = tempfile::tempdir().context("datadir tempdir")?;
+        let mut datadir = FailureDatadir::new(&format!("eez-node-{name}"))?;
         let mut handle = Self::start_with_datadir(name, datadir.path(), cfg, env).await?;
-        handle.keep_alive.push(datadir);
+        datadir.fixture_ready();
+        handle.owned_datadir = Some(datadir);
         Ok(handle)
     }
 
@@ -1584,22 +1496,18 @@ impl NodeHandle {
 
     // Convergence alone can pass without exercising the reorg path.
     pub async fn wait_for_reorg_seen(&self, timeout: Duration) -> Result<()> {
-        let patterns = [
-            "reorg rolled out",
-            "rewinding ring to common ancestor",
-            "l1.reorg.retreated",
-            "L1 reorg reported",
-        ];
         wait_for(timeout, || async {
-            Ok((self.log_count_matching(&patterns)? > 0).then_some(()))
+            Ok((self.count_signals(&[
+                signals::L1_REORG_DETECTED,
+                signals::DERIVER_REORG_RETREATED,
+                signals::DERIVER_REORG_NOOP,
+            ])? > 0)
+                .then_some(()))
         })
         .await
         .with_context(|| format!("{} deriver missed the reorg", self.name))
     }
 
-    /// Assert this node never logged a fatal-class line (process death
-    /// markers). Without this, every other invariant check is moot —
-    /// a dead node trivially "agrees" by virtue of having stopped.
     pub fn assert_no_process_death(&self) {
         if let Some(status) = self.exit_status() {
             panic!(
@@ -1608,37 +1516,57 @@ impl NodeHandle {
                 self.log_tail(80),
             );
         }
-        let patterns = ["Fatal", "UnexpectedStaticFile"];
         assert_eq!(
-            self.log_count_matching(&patterns).unwrap(),
+            self.count_signals(FATAL_SIGNALS).unwrap(),
             0,
-            "{} fatal error",
+            "{} emitted a panic, divergence, or fatal-lifecycle signal",
+            self.name,
+        );
+        assert_eq!(
+            self.log_count_matching(&["Fatal", "UnexpectedStaticFile"])
+                .unwrap(),
+            0,
+            "{} logged a fatal-class failure",
             self.name,
         );
     }
 
     pub fn assert_no_divergence_failure_logs(&self) {
         self.assert_no_process_death();
-        let patterns = [
-            "eez.deriver.state.diverged",
-            "local L2 state root differs",
-            "engine rejected safe/finalized FCU",
-            "payload builder returned no payload",
-        ];
         assert_eq!(
-            self.log_count_matching(&patterns).unwrap(),
+            self.log_count_matching(&[
+                "engine rejected safe/finalized FCU",
+                "payload builder returned no payload",
+            ])
+            .unwrap(),
             0,
-            "{} logged a divergence/fatal-class failure",
+            "{} logged a fatal-class failure",
             self.name,
         );
     }
 
     pub fn log_count_matching(&self, patterns: &[&str]) -> Result<usize> {
         let contents = std::fs::read_to_string(&self.log_path)
-            .with_context(|| format!("read log {}", self.log_path.display()))?;
+            .with_context(|| format!("read node log {}", self.log_path.display()))?;
         Ok(contents
             .lines()
-            .filter(|line| patterns.iter().any(|p| line.contains(p)))
+            .filter(|line| json_line_matches(line, patterns))
+            .count())
+    }
+
+    /// Decode the node's JSON tracing stream and count a stable signal field.
+    /// Human messages may change without invalidating assertions.
+    pub fn count_signal(&self, signal: &str) -> Result<usize> {
+        self.count_signals(&[signal])
+    }
+
+    pub fn count_signals(&self, signals: &[&str]) -> Result<usize> {
+        let contents = std::fs::read_to_string(&self.log_path)
+            .with_context(|| format!("read signal stream {}", self.log_path.display()))?;
+        Ok(contents
+            .lines()
+            .filter_map(signals::parse)
+            .filter(|signal| signals.contains(&signal.name.as_str()))
             .count())
     }
 
@@ -1658,6 +1586,26 @@ impl NodeHandle {
             .ok()
             .flatten()
     }
+
+    /// Line cursor for a subsequent [`Self::signals_since`] query.
+    pub fn signal_cursor(&self) -> Result<usize> {
+        let contents = std::fs::read_to_string(&self.log_path)
+            .with_context(|| format!("read signal stream {}", self.log_path.display()))?;
+        // Do not advance past a record whose write is still in progress.
+        Ok(contents.bytes().filter(|byte| *byte == b'\n').count())
+    }
+
+    /// Structured records emitted after `cursor`. Signal values are exact
+    /// tracing event names, while human-readable messages remain irrelevant.
+    pub fn signals_since(&self, cursor: usize) -> Result<Vec<NodeSignal>> {
+        let contents = std::fs::read_to_string(&self.log_path)
+            .with_context(|| format!("read signal stream {}", self.log_path.display()))?;
+        Ok(contents
+            .lines()
+            .skip(cursor)
+            .filter_map(signals::parse)
+            .collect())
+    }
 }
 
 fn last_lines(path: &std::path::Path, max: usize, patterns: Option<&[&str]>) -> String {
@@ -1666,13 +1614,19 @@ fn last_lines(path: &std::path::Path, max: usize, patterns: Option<&[&str]>) -> 
     };
     let selected: Vec<&str> = contents
         .lines()
-        .filter(|line| patterns.is_none_or(|ps| ps.iter().any(|p| line.contains(p))))
+        .filter(|line| patterns.is_none_or(|patterns| json_line_matches(line, patterns)))
         .collect();
     let skip = selected.len().saturating_sub(max);
     selected[skip..].join("\n")
 }
 
-// The fmt subscriber prints these messages, not tracing event names.
+fn json_line_matches(line: &str, patterns: &[&str]) -> bool {
+    serde_json::from_str::<serde_json::Value>(line).is_ok()
+        && patterns.iter().any(|pattern| line.contains(pattern))
+}
+
+// These diagnostic filters inspect message fields inside JSON records. Test
+// assertions use stable event names wherever the producer exposes one.
 const SETTLEMENT_LOG_MARKERS: &[&str] = &[
     "remote prover attested the window",
     "dispatching bundle to builder",
@@ -1695,7 +1649,7 @@ impl Drop for NodeHandle {
             eprintln!(
                 "\n== {} node log tail ==\n{}",
                 self.name,
-                self.log_tail(100),
+                self.log_tail(100)
             );
         }
         let tasks = self
@@ -1845,14 +1799,36 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<Option<T>>>,
 {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if let Some(v) = f().await? {
-            return Ok(v);
+    let deadline = Instant::now() + timeout;
+    let mut last_error: Option<anyhow::Error> = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        match tokio::time::timeout(remaining, f()).await {
+            Ok(Ok(Some(value))) => return Ok(value),
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => break,
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(remaining.min(Duration::from_millis(500))).await;
     }
-    bail!("timed out after {timeout:?}");
+    match last_error {
+        Some(error) => Err(error.context(format!("timed out after {timeout:?}; last poll failed"))),
+        None => bail!("timed out after {timeout:?}"),
+    }
+}
+
+/// Registry counters and roots read from one L1 block.
+#[derive(Clone, Copy, Debug)]
+pub struct ChainSnapshot {
+    pub batches_posted: usize,
+    pub executions_performed: usize,
+    pub entries_skipped: usize,
+    pub state_root: B256,
+    pub latest_execution_state: Option<B256>,
 }
 
 pub struct Chain<'a> {
@@ -1947,14 +1923,46 @@ impl<'a> Chain<'a> {
         state_root(self.rpc_url, self.eez_address, self.rollup_id).await
     }
 
-    pub async fn latest_execution_state(&self) -> Result<Option<B256>> {
-        latest_l2_execution_state(
-            self.rpc_url,
-            self.eez_address,
-            self.rollup_id,
-            self.deploy_block,
-        )
-        .await
+    /// Pin related reads to one L1 block so a batch landing between RPC calls
+    /// cannot manufacture a lockstep failure.
+    pub async fn snapshot(&self) -> Result<ChainSnapshot> {
+        let block = self.block_number().await?;
+        Ok(ChainSnapshot {
+            batches_posted: count_events_at(
+                self.rpc_url,
+                self.eez_address,
+                IEEZ::BatchPosted::SIGNATURE_HASH,
+                self.deploy_block,
+                Some(block),
+            )
+            .await?,
+            executions_performed: count_events_at(
+                self.rpc_url,
+                self.eez_address,
+                IEEZ::L2ExecutionPerformed::SIGNATURE_HASH,
+                self.deploy_block,
+                Some(block),
+            )
+            .await?,
+            entries_skipped: count_events_at(
+                self.rpc_url,
+                self.eez_address,
+                IEEZ::L2TxSkipped::SIGNATURE_HASH,
+                self.deploy_block,
+                Some(block),
+            )
+            .await?,
+            state_root: state_root_at(self.rpc_url, self.eez_address, self.rollup_id, Some(block))
+                .await?,
+            latest_execution_state: latest_l2_execution_state_at(
+                self.rpc_url,
+                self.eez_address,
+                self.rollup_id,
+                self.deploy_block,
+                Some(block),
+            )
+            .await?,
+        })
     }
 
     pub async fn executed_states(&self) -> Result<Vec<B256>> {
@@ -2081,26 +2089,116 @@ pub async fn wait_for_l1_blocks(rpc_url: &str, target: u64, timeout: Duration) -
 }
 
 pub async fn state_root(rpc_url: &str, eez: Address, rollup_id: u64) -> Result<B256> {
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let registry = IEEZ::new(eez, &provider);
-    let r = registry.rollups(rollup_id).call().await?;
-    Ok(r.stateRoot)
+    state_root_at(rpc_url, eez, rollup_id, None).await
 }
 
-/// Count events of `event_sig_hash` emitted by `contract` since
-/// `from_block`. Used by tests that assert exact event counts.
-async fn count_events(
+async fn state_root_at(
+    rpc_url: &str,
+    eez: Address,
+    rollup_id: u64,
+    block: Option<u64>,
+) -> Result<B256> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let registry = IEEZ::new(eez, &provider);
+    let mut call = registry.rollups(rollup_id);
+    if let Some(block) = block {
+        call = call.block(BlockNumberOrTag::Number(block).into());
+    }
+    Ok(call.call().await?.stateRoot)
+}
+
+pub async fn rollup_ether_balance(rpc_url: &str, eez: Address, rollup_id: u64) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let registry = IEEZ::new(eez, &provider);
+    Ok(registry.rollups(rollup_id).call().await?.etherBalance)
+}
+
+async fn account_balance(rpc_url: &str, address: Address) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(provider.get_balance(address).await?)
+}
+
+/// Derive the address seen as `msg.sender` on the destination chain.
+pub async fn cross_chain_source_proxy(
+    rpc_url: &str,
+    manager: Address,
+    original: Address,
+    original_rollup_id: u64,
+) -> Result<Address> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(IProxyDerivation::new(manager, &provider)
+        .computeCrossChainProxyAddress(original, original_rollup_id)
+        .call()
+        .await?)
+}
+
+/// Return the revert data from an `eth_call` that is expected to fail.
+pub async fn call_revert_data(
+    rpc_url: &str,
+    from: Address,
+    to: Address,
+    data: Vec<u8>,
+) -> Result<Bytes> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let request = TransactionRequest::default()
+        .from(from)
+        .to(to)
+        .input(Bytes::from(data).into());
+    match provider.call(request).await {
+        Ok(returned) => bail!("eth_call unexpectedly succeeded, returning {returned}"),
+        Err(err) => {
+            let payload = err
+                .as_error_resp()
+                .ok_or_else(|| anyhow!("eth_call failed without an RPC error payload: {err}"))?;
+            payload
+                .as_revert_data()
+                .ok_or_else(|| anyhow!("eth_call failed without revert data: {err}"))
+        }
+    }
+}
+
+/// Return matching logs in chain order.
+pub async fn events_since(
     rpc_url: &str,
     contract: Address,
     event_sig_hash: B256,
     from_block: u64,
-) -> Result<usize> {
+) -> Result<Vec<alloy_rpc_types_eth::Log>> {
     use alloy_rpc_types_eth::Filter;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let filter = Filter::new()
         .address(contract)
         .event_signature(event_sig_hash)
         .from_block(from_block);
+    Ok(provider.get_logs(&filter).await?)
+}
+
+/// Count matching events emitted at or after `from_block`.
+pub async fn count_events(
+    rpc_url: &str,
+    contract: Address,
+    event_sig_hash: B256,
+    from_block: u64,
+) -> Result<usize> {
+    count_events_at(rpc_url, contract, event_sig_hash, from_block, None).await
+}
+
+async fn count_events_at(
+    rpc_url: &str,
+    contract: Address,
+    event_sig_hash: B256,
+    from_block: u64,
+    to_block: Option<u64>,
+) -> Result<usize> {
+    use alloy_rpc_types_eth::Filter;
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let mut filter = Filter::new()
+        .address(contract)
+        .event_signature(event_sig_hash)
+        .from_block(from_block);
+    if let Some(to_block) = to_block {
+        filter = filter.to_block(to_block);
+    }
     let logs = provider.get_logs(&filter).await?;
     Ok(logs.len())
 }
@@ -2165,22 +2263,23 @@ pub async fn assert_latest_batch_signature(
     Ok(())
 }
 
-/// Return the `newState` of the latest `L2ExecutionPerformed` event
-/// emitted by `contract` for `rollup_id`, or `None` if none exist.
-/// Cross-checks the on-chain `stateRoot` against the per-batch event.
-pub async fn latest_l2_execution_state(
+async fn latest_l2_execution_state_at(
     rpc_url: &str,
     contract: Address,
     rollup_id: u64,
     from_block: u64,
+    to_block: Option<u64>,
 ) -> Result<Option<B256>> {
     use alloy_rpc_types_eth::Filter;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let filter = Filter::new()
+    let mut filter = Filter::new()
         .address(contract)
         .event_signature(IEEZ::L2ExecutionPerformed::SIGNATURE_HASH)
         .topic1(B256::from(U256::from(rollup_id)))
         .from_block(from_block);
+    if let Some(to_block) = to_block {
+        filter = filter.to_block(to_block);
+    }
     let mut logs = provider.get_logs(&filter).await?;
     let Some(last) = logs.pop() else {
         return Ok(None);
@@ -2320,7 +2419,7 @@ pub fn override_env(
 
 // Cross-chain test fixture.
 
-use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
+use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_network::TxSignerSync;
 use alloy_network::eip2718::Encodable2718;
 
@@ -2342,6 +2441,7 @@ sol! {
     }
     #[sol(rpc)]
     interface IValue {
+        event ValueSet(address indexed by, uint256 newValue);
         function value() external view returns (uint256);
         function setValue(uint256 v) external returns (bool changed, uint256 newValue);
     }
@@ -2350,8 +2450,66 @@ sol! {
         function value() external view returns (uint256);
         function setValue(uint256 v) external;
     }
+    #[sol(rpc)]
+    interface IEmptyCall {
+        function calls() external view returns (uint256);
+        function received() external view returns (uint256);
+        function lastValue() external view returns (uint256);
+        function setValue(uint256 next) external payable returns (uint256);
+    }
+    #[sol(rpc)]
     interface ISetterWrapper {
+        event Wrapped(uint256 input, bool ok, bool changed, uint256 newValue);
         function setViaProxy(uint256 v) external;
+        function setSameValueTwice(uint256 v) external;
+        function completedProxyCalls() external view returns (uint256);
+        function lastChanged() external view returns (bool);
+        function lastNewValue() external view returns (uint256);
+    }
+    #[sol(rpc)]
+    interface IRevertingTarget {
+        error Rejected(uint256 seen);
+        function calls() external view returns (uint256);
+        function lastValue() external view returns (uint256);
+        function revertCustom(uint256 v) external payable;
+        function revertString(uint256 v) external payable;
+        function writeThenRevert(uint256 v) external payable;
+        function succeed(uint256 v) external payable returns (uint256);
+    }
+    #[sol(rpc)]
+    interface IRevertBubbleWrapper {
+        function callAndRecord(bytes calldata data) external;
+        function failures() external view returns (uint256);
+        function successes() external view returns (uint256);
+    }
+    #[sol(rpc)]
+    interface IReturnData {
+        function echo(bytes calldata value) external returns (bytes memory);
+        function emptyBytes() external returns (bytes memory);
+    }
+    #[sol(rpc)]
+    interface IReturnDataWrapper {
+        function callAndRecord(bytes calldata data) external;
+        function lastReturnDataLength() external view returns (uint256);
+        function lastReturnDataHash() external view returns (bytes32);
+    }
+    #[sol(rpc)]
+    interface INestedSetterInner {
+        function completedProxyCalls() external view returns (uint256);
+    }
+    #[sol(rpc)]
+    interface INestedSetterOuter {
+        function setViaInner(uint256 v) external;
+    }
+    /// Derives the source proxy used on the destination chain.
+    #[sol(rpc)]
+    interface IProxyDerivation {
+        function computeCrossChainProxyAddress(address originalAddress, uint64 originalRollupId) external view returns (address);
+    }
+    #[sol(rpc)]
+    interface IEEZL2Direct {
+        error UnauthorizedProxy();
+        function executeCrossChainCall(address sourceAddress, bytes calldata callData) external payable returns (bytes memory);
     }
     /// Order-dependent target: each call returns state left by the previous one.
     #[sol(rpc)]
@@ -2377,9 +2535,7 @@ fn write_fixture_genesis(
     chain_id: Option<u64>,
     filename: &str,
 ) -> Result<(PathBuf, tempfile::TempDir)> {
-    let raw = std::fs::read_to_string(reorg_genesis_path()).context("read fixture genesis")?;
-    let mut genesis: alloy_genesis::Genesis =
-        serde_json::from_str(&raw).context("parse fixture genesis")?;
+    let mut genesis = fixture_genesis()?;
     genesis.timestamp = ts;
     if let Some(id) = chain_id {
         genesis.config.chain_id = id;
@@ -2433,8 +2589,7 @@ pub async fn sign_and_send(
     let env = TxEnvelope::from(tx.into_signed(sig));
     let hash = *env.tx_hash();
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    // Cross-chain fronts refuse submissions until the node has reconciled with
-    // L1; that is a transient boot state, so wait it out rather than failing.
+    // Cross-chain fronts temporarily refuse submissions while starting.
     let deadline = std::time::Instant::now() + Duration::from_mins(2);
     loop {
         match provider.send_raw_transaction(&env.encoded_2718()).await {
@@ -2450,7 +2605,10 @@ pub async fn sign_and_send(
     }
 }
 
-pub async fn pending_nonce(rpc_url: &str, key: &str) -> Result<u64> {
+/// Return the confirmed nonce. Cross-chain ingress validates against the
+/// confirmed nonce plus held transactions, so using the pool's pending nonce
+/// here would count held transactions twice.
+pub async fn onchain_nonce(rpc_url: &str, key: &str) -> Result<u64> {
     let addr = signer_of(key)?.address();
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     Ok(provider.get_transaction_count(addr).await?)
@@ -2492,7 +2650,7 @@ async fn deploy_raw(
     let mut data = hex::decode(bytecode_hex).context("decode bytecode")?;
     data.extend_from_slice(&constructor_args);
 
-    let nonce = pending_nonce(rpc_url, key).await?;
+    let nonce = onchain_nonce(rpc_url, key).await?;
     let hash = sign_and_send(
         rpc_url,
         key,
@@ -2515,16 +2673,18 @@ async fn deploy_raw(
 /// register the rollup. Contract addresses are deterministic.
 pub async fn deploy_protocol_dev(
     l1_rpc: &str,
-    key: &str,
+    deployer_key: &str,
+    attester_key: &str,
     initial_state: B256,
 ) -> Result<Deployment> {
-    let signer = signer_of(key)?;
+    let signer = signer_of(deployer_key)?;
     let signer_addr = signer.address();
+    let attester = signer_address(attester_key)?;
     let out = repo_root().join("contracts/out");
 
     let eez_address = deploy_raw(
         l1_rpc,
-        key,
+        deployer_key,
         DEV_CHAIN_ID,
         &out.join("EEZ.sol/EEZ.json"),
         signer_addr.abi_encode(),
@@ -2535,21 +2695,21 @@ pub async fn deploy_protocol_dev(
 
     let proof_system_address = deploy_raw(
         l1_rpc,
-        key,
+        deployer_key,
         DEV_CHAIN_ID,
         &out.join("ECDSAProofSystem.sol/ECDSAProofSystem.json"),
-        signer_addr.abi_encode(),
+        attester.abi_encode(),
     )
     .await?;
 
     let vkeys: Vec<B256> = vec![B256::from_slice(&{
         let mut padded = [0u8; 32];
-        padded[12..].copy_from_slice(signer_addr.as_slice());
+        padded[12..].copy_from_slice(attester.as_slice());
         padded
     })];
     let rollup_manager_address = deploy_raw(
         l1_rpc,
-        key,
+        deployer_key,
         DEV_CHAIN_ID,
         &out.join("Rollup.sol/Rollup.json"),
         (
@@ -2568,10 +2728,10 @@ pub async fn deploy_protocol_dev(
         initialState: initial_state,
     }
     .abi_encode();
-    let nonce = pending_nonce(l1_rpc, key).await?;
+    let nonce = onchain_nonce(l1_rpc, deployer_key).await?;
     let hash = sign_and_send(
         l1_rpc,
-        key,
+        deployer_key,
         DEV_CHAIN_ID,
         nonce,
         Some(eez_address),
@@ -2605,6 +2765,18 @@ async fn deploy_value(rpc_url: &str, key: &str, chain_id: u64, initial: U256) ->
     .await
 }
 
+async fn deploy_empty_call(rpc_url: &str, key: &str, chain_id: u64) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("EmptyCall.sol/EmptyCall.json"),
+        Vec::new(),
+    )
+    .await
+}
+
 pub async fn deploy_value_no_ret(
     rpc_url: &str,
     key: &str,
@@ -2618,6 +2790,98 @@ pub async fn deploy_value_no_ret(
         chain_id,
         &out.join("ValueNoRet.sol/ValueNoRet.json"),
         initial.abi_encode(),
+    )
+    .await
+}
+
+async fn deploy_reverting_target(rpc_url: &str, key: &str, chain_id: u64) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("RevertingTarget.sol/RevertingTarget.json"),
+        Vec::new(),
+    )
+    .await
+}
+
+async fn deploy_revert_bubble_wrapper(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    proxy: Address,
+) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("RevertBubbleWrapper.sol/RevertBubbleWrapper.json"),
+        proxy.abi_encode(),
+    )
+    .await
+}
+
+async fn deploy_return_data(rpc_url: &str, key: &str, chain_id: u64) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("ReturnData.sol/ReturnData.json"),
+        Vec::new(),
+    )
+    .await
+}
+
+async fn deploy_return_data_wrapper(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    proxy: Address,
+) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("ReturnDataWrapper.sol/ReturnDataWrapper.json"),
+        proxy.abi_encode(),
+    )
+    .await
+}
+
+pub async fn deploy_nested_setter_inner(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    proxy: Address,
+) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("NestedSetterWrapper.sol/NestedSetterInner.json"),
+        proxy.abi_encode(),
+    )
+    .await
+}
+
+pub async fn deploy_nested_setter_outer(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    inner: Address,
+) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("NestedSetterWrapper.sol/NestedSetterOuter.json"),
+        inner.abi_encode(),
     )
     .await
 }
@@ -2665,6 +2929,23 @@ pub async fn value_no_ret(rpc_url: &str, value_addr: Address) -> Result<U256> {
         .await?)
 }
 
+pub async fn completed_proxy_calls(rpc_url: &str, wrapper: Address) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(ISetterWrapper::new(wrapper, &provider)
+        .completedProxyCalls()
+        .call()
+        .await?)
+}
+
+pub async fn last_proxy_result(rpc_url: &str, wrapper: Address) -> Result<(bool, U256)> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let wrapper = ISetterWrapper::new(wrapper, &provider);
+    Ok((
+        wrapper.lastChanged().call().await?,
+        wrapper.lastNewValue().call().await?,
+    ))
+}
+
 /// Create an outbound proxy through the `EEZL2` predeploy.
 pub async fn create_l2_cross_chain_proxy(
     l2_rpc: &str,
@@ -2679,7 +2960,7 @@ pub async fn create_l2_cross_chain_proxy(
         .call()
         .await?;
     let chain_id = provider.get_chain_id().await?;
-    let nonce = pending_nonce(l2_rpc, key).await?;
+    let nonce = onchain_nonce(l2_rpc, key).await?;
     let hash = sign_and_send(
         l2_rpc,
         key,
@@ -2712,7 +2993,7 @@ pub async fn create_cross_chain_proxy(
         originalRollupId: rollup_id,
     }
     .abi_encode();
-    let nonce = pending_nonce(l1_rpc, key).await?;
+    let nonce = onchain_nonce(l1_rpc, key).await?;
     let hash = sign_and_send(
         l1_rpc,
         key,
@@ -2747,6 +3028,11 @@ pub async fn l2_balance(l2_rpc: &str, addr: Address) -> Result<U256> {
     Ok(provider.get_balance(addr).await?)
 }
 
+pub async fn account_code(rpc_url: &str, addr: Address) -> Result<Bytes> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    Ok(provider.get_code_at(addr).await?)
+}
+
 pub async fn receipt_ok(rpc_url: &str, hash: alloy_primitives::TxHash) -> Result<Option<bool>> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     Ok(provider
@@ -2769,41 +3055,64 @@ pub struct CrossChainConfig {
     pub initial_state: B256,
     /// Kept separate from the poster key for deterministic CREATE addresses.
     pub deployer_key: &'static str,
+    /// Unfunded identity used only by the standalone proof signer.
+    pub attester_key: &'static str,
     pub poster_key: &'static str,
     pub l1_genesis: (PathBuf, tempfile::TempDir),
     pub l2_genesis: (PathBuf, tempfile::TempDir),
+    port_leases: Vec<PortLease>,
 }
 
 impl CrossChainConfig {
     fn new() -> Result<Self> {
         let deployer_key = ANVIL_KEY_1;
+        let attester_key = ANVIL_ATTESTER_KEY;
         let poster_key = ANVIL_KEY;
         let deployer = signer_of(deployer_key)?.address();
         // These CREATE nonces must match `deploy_protocol_dev`.
         let eez_address = deployer.create(0);
         let proof_system_address = deployer.create(1);
         let rollup_manager_address = deployer.create(2);
-        let initial_state = reorg_genesis_state_root()?;
+        let initial_state = l2_genesis_state_root();
         let ts = now_unix_secs();
-        // Reserves the adjacent WS port too, so no later probe hands it out.
-        let l1_http_port = probe_unique_http_port(&mut handed_out_ports());
-        let l1_auth_port = free_port();
+        let l1_http_lease = PortLease::http_pair();
+        let l1_auth_lease = PortLease::tcp();
+        let l1_p2p_lease = PortLease::tcp_udp();
+        let l1_xchain_lease = PortLease::tcp();
+        let l2_xchain_lease = PortLease::tcp();
+        let l1_http_port = l1_http_lease.port();
+        let l1_auth_port = l1_auth_lease.port();
+        let l1_p2p_port = l1_p2p_lease.port();
+        let l1_xchain_port = l1_xchain_lease.port();
+        let l2_xchain_port = l2_xchain_lease.port();
         Ok(Self {
             l1_http_port,
             l1_auth_port,
-            l1_p2p_port: free_port(),
-            l1_xchain_port: free_port(),
-            l2_xchain_port: free_port(),
+            l1_p2p_port,
+            l1_xchain_port,
+            l2_xchain_port,
             eez_address,
             proof_system_address,
             rollup_manager_address,
             rollup_id: FIRST_ROLLUP_ID,
             initial_state,
             deployer_key,
+            attester_key,
             poster_key,
             l1_genesis: write_l1_dev_genesis_at(ts)?,
             l2_genesis: write_l2_genesis_at(ts)?,
+            port_leases: vec![
+                l1_http_lease,
+                l1_auth_lease,
+                l1_p2p_lease,
+                l1_xchain_lease,
+                l2_xchain_lease,
+            ],
         })
+    }
+
+    fn take_port_leases(&mut self) -> Vec<PortLease> {
+        std::mem::take(&mut self.port_leases)
     }
 
     fn l1_rpc_url(&self) -> String {
@@ -2823,8 +3132,8 @@ impl CrossChainConfig {
             ("EEZ_L1_CHAIN", "testing".to_string()),
             ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_RPC_URL", self.l1_rpc_url()),
-            ("EEZ_L1_TARGET_RPC_URL", self.l1_rpc_url()),
             ("EEZ_L1_BUILDER_RPC_URL", self.l1_rpc_url()),
+            ("EEZ_L1_TARGET_RPC_URL", self.l1_rpc_url()),
             ("EEZ_L1_XCHAIN_PORT", self.l1_xchain_port.to_string()),
             ("EEZ_L2_XCHAIN_PORT", self.l2_xchain_port.to_string()),
             ("EEZ_L1_HTTP_PORT", self.l1_http_port.to_string()),
@@ -2837,8 +3146,14 @@ impl CrossChainConfig {
             ("EEZ_L1_POSTER_KEY", self.poster_key.to_string()),
             ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
             ("EEZL2_ADDRESS", format!("{EEZL2_ADDRESS:#x}")),
-            ("EEZ_L1_BLOCK_TIME_MS", "5000".to_string()),
-            ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
+            (
+                "EEZ_L1_BLOCK_TIME_MS",
+                CROSS_CHAIN_L1_BLOCK_TIME_MS.to_string(),
+            ),
+            (
+                "EEZ_L2_BLOCK_TIME_MS",
+                CROSS_CHAIN_L2_BLOCK_TIME_MS.to_string(),
+            ),
             ("EEZ_PROOF_TIME_MS", "1000".to_string()),
             ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
             ("EEZ_REGISTRY_ADDRESS", format!("{:#x}", self.eez_address)),
@@ -2873,7 +3188,13 @@ impl CrossChainConfig {
 }
 
 pub const SETUP_TIMEOUT: Duration = Duration::from_secs(90);
-pub const SETTLE_TIMEOUT: Duration = Duration::from_mins(5);
+pub const SETTLE_TIMEOUT: Duration = Duration::from_secs(90);
+const CROSS_CHAIN_L1_BLOCK_TIME_MS: u64 = 5_000;
+const CROSS_CHAIN_L2_BLOCK_TIME_MS: u64 = 1_000;
+const CROSS_CHAIN_SYNC_INTERVAL: u64 = CROSS_CHAIN_L1_BLOCK_TIME_MS / CROSS_CHAIN_L2_BLOCK_TIME_MS;
+
+/// L1's rollup ID in cross-chain identities.
+pub const L1_ROLLUP_ID: u64 = 0;
 
 /// Separate deployer keeps CREATE addresses deterministic.
 pub const TARGET_DEPLOYER: &str = ANVIL_KEY_3;
@@ -2904,32 +3225,94 @@ pub struct CrossChainWorld {
     pub prover_proxy: Option<ProverProxyHandle>,
     pub proof_signer: ProofSignerHandle,
     _witness_dir: tempfile::TempDir,
-    _datadir: CrossChainDatadir,
+    _datadir: FailureDatadir,
 }
 
-enum CrossChainDatadir {
-    Ephemeral(tempfile::TempDir),
-    Retained(PathBuf),
+pub struct CrossChainEmptyCallWorld {
+    pub world: CrossChainWorld,
+    pub empty_call_l2: Address,
+    pub empty_call_proxy: Address,
 }
 
-impl CrossChainDatadir {
-    fn new() -> Result<Self> {
-        let Ok(root) = std::env::var("EEZ_TEST_DATADIR_DIR") else {
-            return Ok(Self::Ephemeral(tempfile::tempdir()?));
-        };
-        let suffix = LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path =
-            PathBuf::from(root).join(format!("eez-cross-chain-{}-{suffix}", std::process::id()));
-        std::fs::create_dir_all(&path)
-            .with_context(|| format!("create retained cross-chain datadir {}", path.display()))?;
-        Ok(Self::Retained(path))
+impl std::ops::Deref for CrossChainEmptyCallWorld {
+    type Target = CrossChainWorld;
+
+    fn deref(&self) -> &Self::Target {
+        &self.world
     }
+}
 
-    fn path(&self) -> &std::path::Path {
-        match self {
-            Self::Ephemeral(dir) => dir.path(),
-            Self::Retained(path) => path,
-        }
+pub struct CrossChainReturnDataWorld {
+    pub world: CrossChainWorld,
+    pub return_data_wrapper: Address,
+}
+
+impl std::ops::Deref for CrossChainReturnDataWorld {
+    type Target = CrossChainWorld;
+
+    fn deref(&self) -> &Self::Target {
+        &self.world
+    }
+}
+
+pub struct CrossChainNestedSetterWorld {
+    pub world: CrossChainWorld,
+    pub nested_setter_inner: Address,
+    pub nested_setter_outer: Address,
+}
+
+impl std::ops::Deref for CrossChainNestedSetterWorld {
+    type Target = CrossChainWorld;
+
+    fn deref(&self) -> &Self::Target {
+        &self.world
+    }
+}
+
+pub struct CrossChainOutboundReturnDataWorld {
+    pub world: CrossChainWorld,
+    pub return_data_wrapper: Address,
+}
+
+impl std::ops::Deref for CrossChainOutboundReturnDataWorld {
+    type Target = CrossChainWorld;
+
+    fn deref(&self) -> &Self::Target {
+        &self.world
+    }
+}
+
+/// A destination that reverts, reached through a source-side wrapper. Both
+/// directions are wired so one fixture covers inbound and outbound.
+pub struct CrossChainRevertWorld {
+    pub world: CrossChainWorld,
+    /// Reverting target on L2, called by `inbound_wrapper` on L1.
+    pub reverting_target_l2: Address,
+    pub inbound_wrapper: Address,
+    /// Reverting target on L1, called by `outbound_wrapper` on L2.
+    pub reverting_target_l1: Address,
+    pub outbound_wrapper: Address,
+}
+
+impl std::ops::Deref for CrossChainRevertWorld {
+    type Target = CrossChainWorld;
+
+    fn deref(&self) -> &Self::Target {
+        &self.world
+    }
+}
+
+pub struct CrossChainCodelessWorld {
+    pub world: CrossChainWorld,
+    pub inbound_wrapper: Address,
+    pub outbound_wrapper: Address,
+}
+
+impl std::ops::Deref for CrossChainCodelessWorld {
+    type Target = CrossChainWorld;
+
+    fn deref(&self) -> &Self::Target {
+        &self.world
     }
 }
 
@@ -2977,6 +3360,649 @@ impl CrossChainWorld {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScenarioDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScenarioCall {
+    pub to: Address,
+    pub value: U256,
+    pub data: Vec<u8>,
+    pub gas_limit: u64,
+}
+
+impl ScenarioCall {
+    pub fn new(to: Address, data: Vec<u8>) -> Self {
+        Self {
+            to,
+            value: U256::ZERO,
+            data,
+            gas_limit: 900_000,
+        }
+    }
+
+    /// Set the value bridged by this call.
+    #[must_use]
+    pub fn with_value(mut self, value: impl IntoTestU256) -> Self {
+        self.value = value.into_test_u256();
+        self
+    }
+
+    #[must_use]
+    pub const fn with_gas_limit(mut self, gas_limit: u64) -> Self {
+        self.gas_limit = gas_limit;
+        self
+    }
+}
+
+pub trait IntoTestU256 {
+    fn into_test_u256(self) -> U256;
+}
+
+impl IntoTestU256 for U256 {
+    fn into_test_u256(self) -> U256 {
+        self
+    }
+}
+
+impl IntoTestU256 for u64 {
+    fn into_test_u256(self) -> U256 {
+        U256::from(self)
+    }
+}
+
+// Represent a `bytes32` getter result as a single word.
+impl IntoTestU256 for B256 {
+    fn into_test_u256(self) -> U256 {
+        U256::from_be_bytes(self.0)
+    }
+}
+
+pub fn setter_call(proxy: Address, value: impl IntoTestU256) -> ScenarioCall {
+    ScenarioCall::new(
+        proxy,
+        IValue::setValueCall {
+            v: value.into_test_u256(),
+        }
+        .abi_encode(),
+    )
+}
+
+/// A labeled single-word state read.
+#[derive(Clone, Debug)]
+pub struct StateRead {
+    target: Address,
+    calldata: Vec<u8>,
+    label: String,
+}
+
+/// Read `Value.value()`.
+pub fn value_read(contract: Address) -> StateRead {
+    call_read(contract, "value()", IValue::valueCall {}.abi_encode())
+}
+
+/// Define a state read for a getter that returns one word.
+pub fn call_read(target: Address, label: impl Into<String>, calldata: Vec<u8>) -> StateRead {
+    StateRead {
+        target,
+        calldata,
+        label: label.into(),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StateSide {
+    L1,
+    L2,
+}
+
+#[derive(Clone, Debug)]
+struct StateExpectation {
+    side: StateSide,
+    read: StateRead,
+    expected: U256,
+}
+
+// Execute a state read and decode its first 32-byte word.
+pub async fn read_state_word(rpc_url: &str, read: &StateRead) -> Result<U256> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let returned = provider
+        .call(
+            TransactionRequest::default()
+                .to(read.target)
+                .input(Bytes::from(read.calldata.clone()).into()),
+        )
+        .await
+        .with_context(|| format!("eth_call {} on {}", read.label, read.target))?;
+    let word: [u8; 32] = returned
+        .get(..32)
+        .and_then(|w| w.try_into().ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "{} on {} returned {} bytes; expected at least one word",
+                read.label,
+                read.target,
+                returned.len()
+            )
+        })?;
+    Ok(U256::from_be_bytes(word))
+}
+
+#[derive(Clone, Debug)]
+struct ExecutedScenarioAction {
+    direction: ScenarioDirection,
+    value: U256,
+    nonce: u64,
+    hash: alloy_primitives::TxHash,
+}
+
+#[derive(Debug)]
+struct StandardOracleSnapshot {
+    signal_cursor: usize,
+    execution_states: Vec<B256>,
+    safe: Option<(u64, B256)>,
+    finalized: Option<(u64, B256)>,
+    rollup_ether_balance: U256,
+    eez_contract_balance: U256,
+    inbound_nonce: u64,
+    outbound_nonce: u64,
+    grid_residue: Option<u64>,
+}
+
+impl StandardOracleSnapshot {
+    async fn capture(world: &CrossChainWorld) -> Result<Self> {
+        let l1_rpc = world.l1_rpc();
+        let l2_rpc = world.l2_rpc();
+        let prior_signals = world.node.signals_since(0)?;
+        let grid_residue = prior_signals.iter().rev().find_map(|signal| {
+            signal
+                .fields
+                .get("sync_height")
+                .and_then(serde_json::Value::as_u64)
+                .map(|height| height % CROSS_CHAIN_SYNC_INTERVAL)
+        });
+        // Bracket the log cursor with identical L1 histories. If a settlement
+        // lands across the cursor read, the history changes and we retry.
+        let mut aligned_boundary = None;
+        for _ in 0..10 {
+            let before = all_l2_execution_states(
+                &l1_rpc,
+                world.cfg.eez_address,
+                world.cfg.rollup_id,
+                world.dep.deploy_block,
+            )
+            .await?;
+            let cursor = world.node.signal_cursor()?;
+            let after = all_l2_execution_states(
+                &l1_rpc,
+                world.cfg.eez_address,
+                world.cfg.rollup_id,
+                world.dep.deploy_block,
+            )
+            .await?;
+            if before == after {
+                aligned_boundary = Some((after, cursor));
+                break;
+            }
+        }
+        let (execution_states, signal_cursor) = aligned_boundary.ok_or_else(|| {
+            anyhow!("could not align L1 execution history with the node signal stream")
+        })?;
+        Ok(Self {
+            execution_states,
+            signal_cursor,
+            safe: block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Safe).await?,
+            finalized: block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Finalized).await?,
+            rollup_ether_balance: rollup_ether_balance(
+                &l1_rpc,
+                world.cfg.eez_address,
+                world.cfg.rollup_id,
+            )
+            .await?,
+            eez_contract_balance: account_balance(&l1_rpc, world.cfg.eez_address).await?,
+            inbound_nonce: onchain_nonce(&l1_rpc, INBOUND_USER).await?,
+            outbound_nonce: onchain_nonce(&l2_rpc, OUTBOUND_USER).await?,
+            grid_residue,
+        })
+    }
+
+    async fn assert_after(
+        &self,
+        world: &CrossChainWorld,
+        actions: &[ExecutedScenarioAction],
+        expect_settled: bool,
+        scenario_name: &str,
+    ) -> Result<()> {
+        world.node.assert_no_divergence_failure_logs();
+
+        let l1_rpc = world.l1_rpc();
+        let l2_rpc = world.l2_rpc();
+        let records = world.node.signals_since(self.signal_cursor)?;
+        let has_reorg = records.iter().any(|record| {
+            matches!(
+                record.name.as_str(),
+                signals::L1_REORG_DETECTED
+                    | signals::DERIVER_REORG_RETREATED
+                    | signals::DERIVER_REORG_NOOP
+            )
+        });
+        if records
+            .iter()
+            .any(|record| FATAL_SIGNALS.contains(&record.name.as_str()))
+        {
+            bail!("{scenario_name}: node emitted a divergence, fatal, or panic signal");
+        }
+        // The scenario runner only submits valid calls, so any eviction is a bug.
+        if records.iter().any(|record| {
+            matches!(
+                record.name.as_str(),
+                signals::TX_POISON_EVICTED | signals::TX_NONCE_CHAIN_EVICTED
+            )
+        }) {
+            bail!("{scenario_name}: a valid scenario transaction was evicted");
+        }
+
+        let safe = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Safe).await?;
+        let finalized = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Finalized).await?;
+        if let (Some(before), Some(after)) = (self.safe, safe)
+            && after.0 < before.0
+            && !has_reorg
+        {
+            bail!(
+                "{scenario_name}: safe head retreated {} -> {} without an L1 reorg signal",
+                before.0,
+                after.0
+            );
+        }
+        if let (Some(before), Some(after)) = (self.safe, safe)
+            && after.0 == before.0
+            && after.1 != before.1
+            && !has_reorg
+        {
+            bail!(
+                "{scenario_name}: safe hash changed at height {} without an L1 reorg signal: {} -> {}",
+                before.0,
+                before.1,
+                after.1
+            );
+        }
+        if let (Some(before), Some(after)) = (self.finalized, finalized)
+            && after.0 < before.0
+        {
+            bail!(
+                "{scenario_name}: finalized head retreated {} -> {}",
+                before.0,
+                after.0
+            );
+        }
+        if let (Some(before), Some(after)) = (self.finalized, finalized)
+            && after.0 == before.0
+            && after.1 != before.1
+        {
+            bail!(
+                "{scenario_name}: finalized hash changed at height {}: {} -> {}",
+                before.0,
+                before.1,
+                after.1
+            );
+        }
+
+        let mut observed_safe = self.safe.map(|head| head.0).unwrap_or(0);
+        let mut reorg_authorized = false;
+        let mut observed_finalized = self.finalized.map(|head| head.0).unwrap_or(0);
+        let mut settlement_points = Vec::new();
+        let mut grid_residue = self.grid_residue;
+        for record in &records {
+            match record.name.as_str() {
+                signals::L1_REORG_DETECTED
+                | signals::DERIVER_REORG_RETREATED
+                | signals::DERIVER_REORG_NOOP => reorg_authorized = true,
+                signals::DERIVER_SAFE_ADVANCED => {
+                    let next = record.u64("to_block")?;
+                    if next < observed_safe && !reorg_authorized {
+                        bail!(
+                            "{scenario_name}: safe signal retreated {observed_safe} -> {next} without an L1 reorg signal"
+                        );
+                    }
+                    observed_safe = next;
+                    reorg_authorized = false;
+                    settlement_points.push((
+                        record.u64("applied_entries")? as usize,
+                        record.b256("l1_settled_state_root")?,
+                        record.b256("l2_safe_state_root")?,
+                    ));
+                }
+                signals::DERIVER_FINALIZED_ADVANCED => {
+                    let next = record.u64("l2_finalized")?;
+                    if next < observed_finalized {
+                        bail!(
+                            "{scenario_name}: finalized signal retreated {observed_finalized} -> {next}"
+                        );
+                    }
+                    observed_finalized = next;
+                }
+                signals::COMPOSER_BUNDLE_DISPATCHED
+                | signals::COMPOSER_PHASE1_BUNDLE_DISPATCHED
+                | signals::DERIVER_SYNC_BLOCK_BUILT => {
+                    assert_sync_grid(record, &mut grid_residue, scenario_name)?;
+                }
+                _ => {}
+            }
+        }
+
+        let execution_states = all_l2_execution_states(
+            &l1_rpc,
+            world.cfg.eez_address,
+            world.cfg.rollup_id,
+            world.dep.deploy_block,
+        )
+        .await?;
+        if execution_states.len() < self.execution_states.len() {
+            bail!("{scenario_name}: L2ExecutionPerformed history retreated");
+        }
+        // The cursor and L1 baseline are aligned above, so every observed
+        // settlement, including the first, must extend the history by exactly
+        // `applied_entries`.
+        let mut previous_event_count = self.execution_states.len();
+        for (applied, l1_settled_root, l2_safe_root) in settlement_points {
+            if l1_settled_root != l2_safe_root {
+                bail!(
+                    "{scenario_name}: L1 settled root {l1_settled_root} != L2 safe block root {l2_safe_root}"
+                );
+            }
+            let search_from = previous_event_count;
+            let index = execution_states
+                .get(search_from..)
+                .and_then(|tail| tail.iter().position(|root| *root == l1_settled_root))
+                .map(|offset| search_from + offset)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{scenario_name}: L1 settled root {l1_settled_root} has no L2ExecutionPerformed event after index {search_from}"
+                    )
+                })?;
+            let event_count = index + 1;
+            if event_count - previous_event_count != applied {
+                bail!(
+                    "{scenario_name}: settlement reported {applied} applied entries but sits {} L1 events after the previous one",
+                    event_count - previous_event_count
+                );
+            }
+            previous_event_count = event_count;
+        }
+        if safe.is_some() && expect_settled {
+            let committed = state_root(&l1_rpc, world.cfg.eez_address, world.cfg.rollup_id).await?;
+            let safe_root = safe_block_state_root(&l2_rpc)
+                .await?
+                .ok_or_else(|| anyhow!("{scenario_name}: safe L2 block is absent"))?;
+            if committed != safe_root {
+                bail!("{scenario_name}: L1 committed root != L2 safe root");
+            }
+        }
+
+        assert_action_and_nonce_invariants(self, world, actions, scenario_name).await?;
+        if expect_settled {
+            assert_value_conservation(self, world, actions, scenario_name).await?;
+        }
+        Ok(())
+    }
+}
+
+fn assert_sync_grid(
+    record: &NodeSignal,
+    residue: &mut Option<u64>,
+    scenario_name: &str,
+) -> Result<()> {
+    let height = record.u64("sync_height")?;
+    let actual = height % CROSS_CHAIN_SYNC_INTERVAL;
+    match *residue {
+        Some(expected) if expected != actual => bail!(
+            "{scenario_name}: sync block {height} is off the deterministic K={CROSS_CHAIN_SYNC_INTERVAL} grid (residue {actual}, expected {expected})"
+        ),
+        None => *residue = Some(actual),
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn assert_action_and_nonce_invariants(
+    before: &StandardOracleSnapshot,
+    world: &CrossChainWorld,
+    actions: &[ExecutedScenarioAction],
+    scenario_name: &str,
+) -> Result<()> {
+    let mut hashes = HashSet::with_capacity(actions.len());
+    let mut inbound = before.inbound_nonce;
+    let mut outbound = before.outbound_nonce;
+    for action in actions {
+        if !hashes.insert(action.hash) {
+            bail!("{scenario_name}: action hash {} was reused", action.hash);
+        }
+        let expected = match action.direction {
+            ScenarioDirection::Inbound => &mut inbound,
+            ScenarioDirection::Outbound => &mut outbound,
+        };
+        if action.nonce != *expected {
+            bail!(
+                "{scenario_name}: {:?} sender nonce {} was reused or skipped; expected {}",
+                action.direction,
+                action.nonce,
+                *expected
+            );
+        }
+        *expected += 1;
+    }
+    // Exact, not `>=`: these actors are scenario-private, so any nonce the
+    // scenario did not submit is unaccounted-for activity.
+    let actual_inbound = onchain_nonce(&world.l1_rpc(), INBOUND_USER).await?;
+    let actual_outbound = onchain_nonce(&world.l2_rpc(), OUTBOUND_USER).await?;
+    if actual_inbound != inbound || actual_outbound != outbound {
+        bail!(
+            "{scenario_name}: sender nonces are {actual_inbound}/{actual_outbound}, expected {inbound}/{outbound}"
+        );
+    }
+    Ok(())
+}
+
+async fn assert_value_conservation(
+    before: &StandardOracleSnapshot,
+    world: &CrossChainWorld,
+    actions: &[ExecutedScenarioAction],
+    scenario_name: &str,
+) -> Result<()> {
+    let mut inbound = U256::ZERO;
+    let mut outbound = U256::ZERO;
+    for action in actions {
+        match action.direction {
+            ScenarioDirection::Inbound => inbound += action.value,
+            ScenarioDirection::Outbound => outbound += action.value,
+        }
+    }
+    let after =
+        rollup_ether_balance(&world.l1_rpc(), world.cfg.eez_address, world.cfg.rollup_id).await?;
+    if before.rollup_ether_balance + inbound != after + outbound {
+        bail!(
+            "{scenario_name}: bridged value was not conserved (before={}, inbound={}, after={}, outbound={})",
+            before.rollup_ether_balance,
+            inbound,
+            after,
+            outbound
+        );
+    }
+    let contract_balance = account_balance(&world.l1_rpc(), world.cfg.eez_address).await?;
+    if contract_balance < after
+        || contract_balance + outbound < before.eez_contract_balance + inbound
+    {
+        bail!("{scenario_name}: L1 EEZ balance no longer backs bridged rollup funds");
+    }
+    Ok(())
+}
+
+/// Declarative cross-chain case. Calls and state oracles are data, so a matrix
+/// can be expressed as a `Vec<Scenario>` and run by [`run_scenarios`].
+#[derive(Debug)]
+pub struct Scenario {
+    name: String,
+    calls: Vec<(ScenarioDirection, ScenarioCall)>,
+    states: Vec<StateExpectation>,
+    expect_settled: bool,
+}
+
+impl Scenario {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            calls: Vec::new(),
+            states: Vec::new(),
+            expect_settled: false,
+        }
+    }
+
+    #[must_use]
+    pub fn inbound(mut self, call: ScenarioCall) -> Self {
+        self.calls.push((ScenarioDirection::Inbound, call));
+        self
+    }
+
+    #[must_use]
+    pub fn outbound(mut self, call: ScenarioCall) -> Self {
+        self.calls.push((ScenarioDirection::Outbound, call));
+        self
+    }
+
+    #[must_use]
+    pub fn expect_l2_state(mut self, read: StateRead, expected: impl IntoTestU256) -> Self {
+        self.states.push(StateExpectation {
+            side: StateSide::L2,
+            read,
+            expected: expected.into_test_u256(),
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn expect_l1_state(mut self, read: StateRead, expected: impl IntoTestU256) -> Self {
+        self.states.push(StateExpectation {
+            side: StateSide::L1,
+            read,
+            expected: expected.into_test_u256(),
+        });
+        self
+    }
+
+    #[must_use]
+    pub const fn expect_settled_fully(mut self) -> Self {
+        self.expect_settled = true;
+        self
+    }
+
+    pub async fn run(self, world: &CrossChainWorld) -> Result<()> {
+        let l1_rpc = world.l1_rpc();
+        let l2_rpc = world.l2_rpc();
+        let oracle = StandardOracleSnapshot::capture(world).await?;
+        let mut actions = Vec::with_capacity(self.calls.len());
+        for (direction, call) in self.calls {
+            let (ingress, receipt_rpc, key, chain_id) = match direction {
+                ScenarioDirection::Inbound => (
+                    world.l1_xchain(),
+                    l1_rpc.as_str(),
+                    INBOUND_USER,
+                    DEV_CHAIN_ID,
+                ),
+                ScenarioDirection::Outbound => (
+                    world.l2_xchain(),
+                    l2_rpc.as_str(),
+                    OUTBOUND_USER,
+                    world.l2_chain_id,
+                ),
+            };
+            let nonce = onchain_nonce(receipt_rpc, key).await?;
+            let hash = sign_and_send(
+                &ingress,
+                key,
+                chain_id,
+                nonce,
+                Some(call.to),
+                call.value,
+                call.data,
+                call.gas_limit,
+            )
+            .await
+            .with_context(|| format!("{}: submit {direction:?} call", self.name))?;
+            let succeeded = wait_for(SETTLE_TIMEOUT, || async {
+                receipt_ok(receipt_rpc, hash).await
+            })
+            .await
+            .with_context(|| format!("{}: {direction:?} call was not mined", self.name))?;
+            if !succeeded {
+                bail!("{}: {direction:?} call reverted", self.name);
+            }
+            actions.push(ExecutedScenarioAction {
+                direction,
+                value: call.value,
+                nonce,
+                hash,
+            });
+        }
+
+        for expectation in &self.states {
+            let rpc = match expectation.side {
+                StateSide::L1 => l1_rpc.as_str(),
+                StateSide::L2 => l2_rpc.as_str(),
+            };
+            let converged = wait_for(SETTLE_TIMEOUT, || async {
+                Ok(
+                    (read_state_word(rpc, &expectation.read).await? == expectation.expected)
+                        .then_some(()),
+                )
+            })
+            .await;
+            // Include the last observed value when a state expectation times out.
+            if converged.is_err() {
+                let actual = read_state_word(rpc, &expectation.read).await;
+                bail!(
+                    "{}: {:?} {} on {} is {:?}, expected {}",
+                    self.name,
+                    expectation.side,
+                    expectation.read.label,
+                    expectation.read.target,
+                    actual,
+                    expectation.expected,
+                );
+            }
+        }
+
+        if self.expect_settled {
+            wait_for(SETTLE_TIMEOUT, || async {
+                let committed =
+                    state_root(&l1_rpc, world.cfg.eez_address, world.cfg.rollup_id).await?;
+                let safe = safe_block_state_root(&l2_rpc).await?;
+                Ok(safe.filter(|root| *root == committed).map(|_| ()))
+            })
+            .await
+            .with_context(|| {
+                format!("{}: committed and safe roots did not reconcile", self.name)
+            })?;
+        }
+
+        oracle
+            .assert_after(world, &actions, self.expect_settled, &self.name)
+            .await
+    }
+}
+
+pub async fn run_scenarios(
+    world: &CrossChainWorld,
+    scenarios: impl IntoIterator<Item = Scenario>,
+) -> Result<()> {
+    for scenario in scenarios {
+        scenario.run(world).await?;
+    }
+    Ok(())
+}
+
 /// Start the shared cross-chain fixture.
 pub async fn setup_cross_chain() -> Result<CrossChainWorld> {
     setup_cross_chain_inner(None, None, &[]).await
@@ -2997,18 +4023,158 @@ pub async fn setup_cross_chain_proxied(
     setup_cross_chain_inner(Some(mutation), Some(attester), &[]).await
 }
 
+pub async fn setup_cross_chain_empty_call() -> Result<CrossChainEmptyCallWorld> {
+    let world = setup_cross_chain().await?;
+    let l1_rpc = world.l1_rpc();
+    let l2_rpc = world.l2_rpc();
+    let empty_call_l2 = deploy_empty_call(&l2_rpc, TARGET_DEPLOYER, world.l2_chain_id).await?;
+    let empty_call_proxy = create_cross_chain_proxy(
+        &l1_rpc,
+        world.cfg.deployer_key,
+        world.cfg.eez_address,
+        empty_call_l2,
+        world.cfg.rollup_id,
+    )
+    .await?;
+
+    Ok(CrossChainEmptyCallWorld {
+        world,
+        empty_call_l2,
+        empty_call_proxy,
+    })
+}
+
+pub async fn setup_cross_chain_return_data() -> Result<CrossChainReturnDataWorld> {
+    let world = setup_cross_chain().await?;
+    let l1_rpc = world.l1_rpc();
+    let l2_rpc = world.l2_rpc();
+    let return_data_l2 = deploy_return_data(&l2_rpc, TARGET_DEPLOYER, world.l2_chain_id).await?;
+    let return_data_proxy = create_cross_chain_proxy(
+        &l1_rpc,
+        world.cfg.deployer_key,
+        world.cfg.eez_address,
+        return_data_l2,
+        world.cfg.rollup_id,
+    )
+    .await?;
+    let return_data_wrapper =
+        deploy_return_data_wrapper(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID, return_data_proxy)
+            .await?;
+
+    Ok(CrossChainReturnDataWorld {
+        world,
+        return_data_wrapper,
+    })
+}
+
+pub async fn setup_cross_chain_nested_setter() -> Result<CrossChainNestedSetterWorld> {
+    let world = setup_cross_chain().await?;
+    let l1_rpc = world.l1_rpc();
+    let nested_setter_inner =
+        deploy_nested_setter_inner(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID, world.setter_proxy)
+            .await?;
+    let nested_setter_outer =
+        deploy_nested_setter_outer(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID, nested_setter_inner)
+            .await?;
+
+    Ok(CrossChainNestedSetterWorld {
+        world,
+        nested_setter_inner,
+        nested_setter_outer,
+    })
+}
+
+pub async fn setup_cross_chain_outbound_return_data() -> Result<CrossChainOutboundReturnDataWorld> {
+    let world = setup_cross_chain().await?;
+    let l1_rpc = world.l1_rpc();
+    let l2_rpc = world.l2_rpc();
+    let return_data_l1 = deploy_return_data(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID).await?;
+    let return_data_proxy =
+        create_l2_cross_chain_proxy(&l2_rpc, TARGET_DEPLOYER, return_data_l1, 0).await?;
+    let return_data_wrapper = deploy_return_data_wrapper(
+        &l2_rpc,
+        TARGET_DEPLOYER,
+        world.l2_chain_id,
+        return_data_proxy,
+    )
+    .await?;
+
+    Ok(CrossChainOutboundReturnDataWorld {
+        world,
+        return_data_wrapper,
+    })
+}
+
+pub async fn setup_cross_chain_reverting() -> Result<CrossChainRevertWorld> {
+    let world = setup_cross_chain().await?;
+    let l1_rpc = world.l1_rpc();
+    let l2_rpc = world.l2_rpc();
+
+    let reverting_target_l2 =
+        deploy_reverting_target(&l2_rpc, TARGET_DEPLOYER, world.l2_chain_id).await?;
+    let inbound_proxy = create_cross_chain_proxy(
+        &l1_rpc,
+        world.cfg.deployer_key,
+        world.cfg.eez_address,
+        reverting_target_l2,
+        world.cfg.rollup_id,
+    )
+    .await?;
+    let inbound_wrapper =
+        deploy_revert_bubble_wrapper(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID, inbound_proxy).await?;
+
+    let reverting_target_l1 =
+        deploy_reverting_target(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID).await?;
+    let outbound_proxy =
+        create_l2_cross_chain_proxy(&l2_rpc, TARGET_DEPLOYER, reverting_target_l1, L1_ROLLUP_ID)
+            .await?;
+    let outbound_wrapper =
+        deploy_revert_bubble_wrapper(&l2_rpc, TARGET_DEPLOYER, world.l2_chain_id, outbound_proxy)
+            .await?;
+
+    Ok(CrossChainRevertWorld {
+        world,
+        reverting_target_l2,
+        inbound_wrapper,
+        reverting_target_l1,
+        outbound_wrapper,
+    })
+}
+
+pub async fn setup_cross_chain_codeless() -> Result<CrossChainCodelessWorld> {
+    let world = setup_cross_chain().await?;
+    let l1_rpc = world.l1_rpc();
+    let l2_rpc = world.l2_rpc();
+    let inbound_wrapper =
+        deploy_return_data_wrapper(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID, world.deposit_proxy)
+            .await?;
+    let outbound_wrapper = deploy_return_data_wrapper(
+        &l2_rpc,
+        TARGET_DEPLOYER,
+        world.l2_chain_id,
+        world.withdrawal_proxy,
+    )
+    .await?;
+
+    Ok(CrossChainCodelessWorld {
+        world,
+        inbound_wrapper,
+        outbound_wrapper,
+    })
+}
+
 async fn setup_cross_chain_inner(
     mutation: Option<ProverMutation>,
     attester_override: Option<Address>,
     extra_env: &[(&'static str, String)],
 ) -> Result<CrossChainWorld> {
-    let cfg = CrossChainConfig::new()?;
-    let signer_attester = signer_address(cfg.deployer_key)?;
+    let mut cfg = CrossChainConfig::new()?;
+    let signer_attester = signer_address(cfg.attester_key)?;
     let proof_signer = ProofSignerHandle::spawn(&ProofSignerConfig {
         chain_config: &cfg.l2_genesis.0,
         rollup_id: cfg.rollup_id,
-        signer_key: cfg.deployer_key,
-        vkey: signer_address(cfg.deployer_key)?.into_word(),
+        signer_key: cfg.attester_key,
+        vkey: signer_address(cfg.attester_key)?.into_word(),
         proof_system: cfg.proof_system_address,
     })
     .await?;
@@ -3023,7 +4189,7 @@ async fn setup_cross_chain_inner(
         .map_or(proof_signer.endpoint(), ProverProxyHandle::endpoint);
     let attester = attester_override.unwrap_or(signer_attester);
     let witness_dir = tempfile::tempdir().context("witness DB tempdir")?;
-    let datadir = CrossChainDatadir::new()?;
+    let mut datadir = FailureDatadir::new("eez-cross-chain")?;
     let mut env = cfg.env();
     env.extend([
         ("EEZ_PROVER_URL", prover_url.to_string()),
@@ -3039,7 +4205,13 @@ async fn setup_cross_chain_inner(
         !env.iter().any(|(name, _)| *name == "EEZ_PROOF_SIGNER_KEY"),
         "remote composer environment must not contain the proof-signer key",
     );
-    let node = NodeHandle::spawn(datadir.path(), &env)?;
+    let node = NodeHandle::spawn_with_reservations(
+        "node",
+        datadir.path(),
+        &NodeConfig::default(),
+        &env,
+        cfg.take_port_leases(),
+    )?;
     let l1_rpc = cfg.l1_rpc_url();
     let l2_rpc = node.l2_rpc_url();
 
@@ -3048,7 +4220,13 @@ async fn setup_cross_chain_inner(
 
     node.wait_for_rpc(&l1_rpc, SETUP_TIMEOUT, "embedded L1 RPC")
         .await?;
-    let dep = deploy_protocol_dev(&l1_rpc, cfg.deployer_key, cfg.initial_state).await?;
+    let dep = deploy_protocol_dev(
+        &l1_rpc,
+        cfg.deployer_key,
+        cfg.attester_key,
+        cfg.initial_state,
+    )
+    .await?;
     if dep.eez_address != cfg.eez_address {
         bail!("EEZ address not deterministic");
     }
@@ -3114,6 +4292,7 @@ async fn setup_cross_chain_inner(
     let outbound_wrapper =
         deploy_setter_wrapper(&l2_rpc, TARGET_DEPLOYER, l2_chain_id, outbound_proxy).await?;
 
+    datadir.fixture_ready();
     Ok(CrossChainWorld {
         node,
         cfg,
@@ -3138,4 +4317,15 @@ async fn setup_cross_chain_inner(
         _witness_dir: witness_dir,
         _datadir: datadir,
     })
+}
+
+#[cfg(test)]
+mod framework_tests {
+    use super::*;
+
+    #[test]
+    fn l2_genesis_fixture_is_resolvable_after_testkit_extraction() {
+        assert!(l2_genesis_fixture_path().is_file());
+        let _ = l2_genesis_state_root();
+    }
 }
