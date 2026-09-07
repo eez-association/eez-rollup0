@@ -1,13 +1,10 @@
 # eez-rollup0 — operational entry points.
 #
-# Reads configuration from .env (gitignored). Copy .env.example first.
-# Deployment outputs land in deployments.env (gitignored, auto-written
-# by scripts/deploy.sh, auto-read by eez-node at startup via dotenvy).
+# Deployment reads .env (gitignored). Runtime node settings live in TOML.
 
 SHELL := /bin/bash
 
-# Surface .env values to recipes for any direct-shell consumers.
-# (The Rust binary auto-loads .env via dotenvy regardless.)
+# Surface deployment inputs to deploy recipes.
 ifneq (,$(wildcard .env))
     include .env
     export
@@ -19,6 +16,10 @@ endif
 
 .PHONY: help check test fmt build deploy-protocol run-node clean-l2 clean-deploy
 
+EEZ_CONFIG ?= eez-composer.toml
+L2_GENESIS ?= datadir/genesis.json
+L2_DATADIR ?= data/eez-l2
+
 help:
 	@echo "Targets:"
 	@echo "  make build            - cargo build the workspace"
@@ -27,7 +28,7 @@ help:
 	@echo "  make fmt              - cargo fmt + forge fmt"
 	@echo "  make deploy-protocol  - deploy EEZ + ECDSA PS + Rollup manager + register; writes deployments.env"
 	@echo "  make run-node         - run the composer against the configured L2 datadir"
-	@echo "  make clean-l2         - rm EEZ_L2_DATADIR (fresh L2 chain)"
+	@echo "  make clean-l2         - rm L2_DATADIR (fresh L2 chain)"
 	@echo "  make clean-deploy     - rm deployments.env (fresh contract addresses on next deploy)"
 
 # ─── Rust ─────────────────────────────────────────────────────────────────
@@ -58,24 +59,23 @@ fmt:
 #   4. RegisterRollup            → EEZ_ROLLUP_ID = 1
 #   5. DeployBridgeL1            → L1 cross-chain bridge contracts
 #
-# Outputs land in deployments.env (gitignored). eez-node loads it
-# alongside .env at startup, so a successful deploy means `make run-node`
-# Just Works without any paste-the-address-into-.env step.
+# Outputs land in deployments.env (gitignored). Copy those public bindings into
+# eez-composer.toml before starting the node.
 deploy-protocol:
 	@./scripts/deploy.sh
 
 # ─── Node ─────────────────────────────────────────────────────────────────
 run-node:
-	@test -n "$(EEZ_L2_DATADIR)" || (echo "EEZ_L2_DATADIR not set; copy .env.example to .env" && exit 1)
-	@test -n "$(EEZ_L2_GENESIS_PATH)" -a -f "$(EEZ_L2_GENESIS_PATH)" \
-		|| (echo "EEZ_L2_GENESIS_PATH not set or file missing; run make deploy-protocol first" && exit 1)
+	@test -f "$(EEZ_CONFIG)" || (echo "$(EEZ_CONFIG) missing; copy eez-composer.example.toml and fill it in" && exit 1)
+	@test -f "$(L2_GENESIS)" || (echo "$(L2_GENESIS) missing; run make deploy-protocol first" && exit 1)
 	cargo run -p eez-node -- node \
-		--chain $(EEZ_L2_GENESIS_PATH) \
-		--datadir $(EEZ_L2_DATADIR) \
+		--chain "$(L2_GENESIS)" \
+		--datadir "$(L2_DATADIR)" \
+		--eez.config "$(EEZ_CONFIG)"
 
 clean-l2:
-	@test -n "$(EEZ_L2_DATADIR)" || (echo "EEZ_L2_DATADIR not set" && exit 1)
-	rm -rf $(EEZ_L2_DATADIR)
+	@test -n "$(L2_DATADIR)" || (echo "L2_DATADIR not set" && exit 1)
+	rm -rf "$(L2_DATADIR)"
 
 clean-deploy:
 	rm -f deployments.env

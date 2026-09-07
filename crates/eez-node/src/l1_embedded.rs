@@ -1,12 +1,12 @@
 //! Embedded L1 reth — config builder for the second `NodeBuilder` that
 //! composer mode launches alongside the L2 reth. Runtime modes:
 //!   - **Devnet** (vanilla EthereumNode, CL-driven) — private PoS L1.
-//!     `EEZ_L1_CHAIN=devnet`.
+//!     Selected by the Composer config.
 //!   - **Chiado** (reth_gnosis::GnosisNode) — real chiado state from the
 //!     mounted datadir, driven via engine-API by an external lighthouse
-//!     CL. `EEZ_L1_CHAIN=chiado`.
+//!     CL.
 //!   - **Testing** (vanilla EthereumNode, 5s auto-mine) — dev mode with the
-//!     non-atomic mock bundle RPC; the default. `EEZ_L1_CHAIN=testing`.
+//!     non-atomic mock bundle RPC; the default.
 //!
 //! The `NodeBuilder` launch is inline in [`crate::run_composer`] — the
 //! nested-generic `NodeHandle` AddOns types resist a typed helper.
@@ -28,9 +28,9 @@ use reth_node_core::{
 /// split the two `send_raw_transaction` roundtrips across blocks.
 pub const TESTING_L1_BLOCK_TIME: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Which L1 chain the embedded L1 NodeBuilder should serve. Selected
-/// by `EEZ_L1_CHAIN` env at startup; defaults to `Testing`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which L1 chain the embedded L1 NodeBuilder should serve.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum L1ChainKind {
     /// `reth_gnosis::GnosisNode` loading the chiado preset; no
     /// auto-mine — engine API driven by an external lighthouse CL.
@@ -38,21 +38,11 @@ pub enum L1ChainKind {
     /// Private PoS Ethereum node driven by an external consensus client.
     Devnet,
     /// Vanilla `EthereumNode` in dev mode (5s auto-mine, --chain dev) with the non-atomic mock bundle RPC.
+    #[default]
     Testing,
 }
 
-impl L1ChainKind {
-    pub fn from_env() -> Self {
-        match std::env::var("EEZ_L1_CHAIN").as_deref() {
-            Ok("chiado") => Self::Chiado,
-            Ok("devnet") => Self::Devnet,
-            _ => Self::Testing,
-        }
-    }
-}
-
-/// Config knobs for the embedded L1 launch. All read from env in
-/// `eez-node::main`; defaults match a no-config-needed testing workflow.
+/// Resolved settings for the embedded L1 launch.
 #[derive(Debug, Clone)]
 pub struct EmbeddedL1Config {
     /// L1 dev chain spec (genesis + hardforks). Used by Testing and Devnet;

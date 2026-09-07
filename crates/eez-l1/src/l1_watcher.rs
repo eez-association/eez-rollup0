@@ -9,7 +9,7 @@
 //! emitting heads, so a failed cycle retries the identical range next
 //! tick. A reorg retreat (Reorg + rewind) still precedes its scan.
 //!
-//! HTTP polling (reuses the `EEZ_L1_RPC_URL` read by `L1ReaderConfig`) — 2s interval, well
+//! HTTP polling (reuses the configured L1 reader endpoint) — 2s interval, well
 //! inside gnosis 5s / Ethereum mainnet 12s block times.
 //!
 //! Reorg detection walks back via `parent_hash` against a ring of recent
@@ -127,8 +127,7 @@ pub enum L1Event {
 /// Configuration for the [`L1Watcher`].
 #[derive(Debug, Clone)]
 pub struct L1WatcherConfig {
-    /// L1 RPC endpoint (HTTP / HTTPS). Uses the same `EEZ_L1_RPC_URL` as
-    /// [`L1ReaderConfig`](crate::L1ReaderConfig).
+    /// L1 RPC endpoint (HTTP / HTTPS).
     pub rpc_url: Url,
     /// Deployed `EEZ` (rollups registry) address. Used to filter
     /// `BatchPosted` log events.
@@ -141,63 +140,6 @@ pub struct L1WatcherConfig {
     /// bound. Configurable so dev / testnet operators can tighten or
     /// loosen.
     pub reorg_max_depth: usize,
-}
-
-impl L1WatcherConfig {
-    /// Read from `EEZ_*` env vars. Shares `EEZ_L1_RPC_URL` +
-    /// `EEZ_REGISTRY_ADDRESS` with the other configs;
-    /// `EEZ_L1_REORG_MAX_DEPTH_BLOCKS` is L1Watcher-specific (default
-    /// 62).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`L1Error::Config`] for any missing required var or
-    /// malformed value.
-    pub fn from_env() -> L1Result<Self> {
-        use std::env;
-        use std::str::FromStr;
-
-        let rpc_url_raw = env::var("EEZ_L1_RPC_URL")
-            .map_err(|_| L1Error::Config("EEZ_L1_RPC_URL is required (see .env.example)".into()))?;
-        let rpc_url = Url::parse(&rpc_url_raw)
-            .map_err(|e| L1Error::Config(format!("EEZ_L1_RPC_URL: {e}")))?;
-
-        let eez_raw = env::var("EEZ_REGISTRY_ADDRESS").map_err(|_| {
-            L1Error::Config("EEZ_REGISTRY_ADDRESS is required (see .env.example)".into())
-        })?;
-        let eez = Address::from_str(&eez_raw)
-            .map_err(|e| L1Error::Config(format!("EEZ_REGISTRY_ADDRESS: {e}")))?;
-
-        let rollup_id_raw = env::var("EEZ_ROLLUP_ID")
-            .map_err(|_| L1Error::Config("EEZ_ROLLUP_ID is required (see .env.example)".into()))?;
-        let rollup_id = rollup_id_raw
-            .parse::<u64>()
-            .map_err(|e| L1Error::Config(format!("EEZ_ROLLUP_ID: {e}")))?;
-
-        let reorg_max_depth = match env::var("EEZ_L1_REORG_MAX_DEPTH_BLOCKS") {
-            Ok(v) => v
-                .parse::<usize>()
-                .map_err(|e| L1Error::Config(format!("EEZ_L1_REORG_MAX_DEPTH_BLOCKS: {e}")))?,
-            Err(env::VarError::NotPresent) => 62,
-            Err(_) => {
-                return Err(L1Error::Config(
-                    "EEZ_L1_REORG_MAX_DEPTH_BLOCKS contains non-UTF-8 bytes".into(),
-                ));
-            }
-        };
-
-        if reorg_max_depth == 0 {
-            return Err(L1Error::Config(
-                "EEZ_L1_REORG_MAX_DEPTH_BLOCKS must be >= 1 (0 tolerates no reorg at all)".into(),
-            ));
-        }
-        Ok(Self {
-            rpc_url,
-            eez,
-            rollup_id,
-            reorg_max_depth,
-        })
-    }
 }
 
 /// [`L1Watcher`] handle. Cheaply [`Clone`]able — clones share the same
@@ -777,8 +719,7 @@ struct WatcherState {
 
 impl WatcherState {
     fn new(reorg_max_depth: usize) -> Self {
-        // `L1WatcherConfig`'s fields are pub, so `from_env`'s rejection of 0 is
-        // not the only way in. At 0 every push pops itself, emptying the ring
+        // `L1WatcherConfig`'s fields are pub. At 0 every push pops itself, emptying the ring
         // and panicking the tip lookup on the first tick.
         let reorg_max_depth = reorg_max_depth.max(1);
         Self {

@@ -1,18 +1,18 @@
 //! Launcher for the L1-derived eez follower node.
 
+pub mod config;
 mod unsafe_head;
 
-use std::{env, str::FromStr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
-use alloy_primitives::{Address, B256};
 use alloy_provider::RootProvider;
-use alloy_signer_local::PrivateKeySigner;
 use eez_deriver::Deriver;
-use eez_driver::{BlockCommitterHandle, RollupTiming};
-use eez_l1::{L1CanonicalHead, L1Reader, L1ReaderConfig, L1Watcher, L1WatcherConfig};
+use eez_driver::BlockCommitterHandle;
+use eez_l1::{L1CanonicalHead, L1Reader, L1Watcher};
 use eez_node_common::{
-    EezPayloadBuilder, EezPoolBuilder, L2NodeBuilder, node_cli, read_checkpoint_dir,
-    wait_for_l1_ready, warn_on_deprecated_env,
+    EezPayloadBuilder, EezPoolBuilder, L2NodeBuilder, checkpoint_dir,
+    config::{ConfigArgs, load},
+    node_cli, wait_for_l1_ready,
 };
 use reth_chainspec::EthChainSpec as _;
 use reth_node_builder::components::BasicPayloadServiceBuilder;
@@ -29,34 +29,6 @@ const BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES: u32 = 32;
 const L2_SYSTEM_TX_GAS_PRICE: u128 = 1_000_000_000;
 const L2_SYSTEM_TX_GAS_LIMIT: u64 = 2_000_000;
 
-struct FollowerSystemConfig {
-    system_signer: PrivateKeySigner,
-    eezl2_address: Address,
-    this_rollup_id: u64,
-}
-
-impl FollowerSystemConfig {
-    fn into_context(self, l2_chain_id: u64) -> eez_protocol::system_tx::SystemTxContext {
-        eez_protocol::system_tx::SystemTxContext {
-            system_signer: self.system_signer,
-            eezl2_address: self.eezl2_address,
-            l2_chain_id,
-            l2_gas_price: L2_SYSTEM_TX_GAS_PRICE,
-            l2_gas_limit: L2_SYSTEM_TX_GAS_LIMIT,
-            this_rollup_id: self.this_rollup_id,
-        }
-    }
-}
-
-/// Follower-specific CLI arguments layered on top of reth's CLI.
-#[derive(clap::Args, Debug, Clone)]
-struct FollowerArgs {
-    /// Sequencer JSON-RPC URL. When set, this enables the optional unsafe-head
-    /// overlay; safe and finalized remain L1-derived.
-    #[arg(long, env = "EEZ_SEQUENCER_RPC")]
-    sequencer_rpc: Option<url::Url>,
-}
-
 /// Launch an L1-derived follower node.
 ///
 /// # Errors
@@ -64,22 +36,23 @@ struct FollowerArgs {
 /// Returns an error when configuration is invalid or either reth or the L1
 /// bootstrap fails.
 pub fn run() -> eyre::Result<()> {
-    node_cli::<FollowerArgs>()?.run(launch)
+    node_cli::<ConfigArgs>()?.run(launch)
 }
 
-async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
+async fn launch(builder: L2NodeBuilder, ext: ConfigArgs) -> eyre::Result<()> {
+    let config: config::Config = load(&ext.eez_config_path)?;
+    config.validate()?;
+    let timing = config.timing.build()?;
+    let system_signer = config.l2_system_key.signer()?;
+    let system_address = system_signer.address();
+    let l2_datadir = builder.config().datadir().data_dir().to_path_buf();
     event!(
         name: "eez.node.launching",
         Level::INFO,
         mode = "follower",
+        config = %ext.eez_config_path.display(),
         "launching eez follower",
     );
-    warn_on_deprecated_env();
-    // A production follower must reconstruct the Composer's Sync-block system
-    // transactions byte-for-byte. Read every required value before launching
-    // reth so a misconfigured follower never appears healthy.
-    let system_config = read_system_config()?;
-    let system_address = system_config.system_signer.address();
 
     let handle = builder
         .with_types::<EthereumNode>()
@@ -97,7 +70,6 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
     let chain_spec: Arc<_> = handle.node.chain_spec();
     let provider = handle.node.provider.clone();
     let task_executor = handle.node.task_executor.clone();
-    let timing = RollupTiming::from_env()?;
     let l1_head = Arc::new(L1CanonicalHead::default());
 
     let block_committer = BlockCommitterHandle::spawn_from_provider(
@@ -107,11 +79,18 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         None,
     )?;
 
-    let l1_reader_config = L1ReaderConfig::from_env()?;
+    let l1_reader_config = config.l1.reader();
     let deploy_block = l1_reader_config.deploy_block;
     let l1_reader = L1Reader::new(l1_reader_config);
-    let l1_watcher = L1Watcher::new(L1WatcherConfig::from_env()?);
-    let system_tx_cfg = system_config.into_context(chain_spec.chain().id());
+    let l1_watcher = L1Watcher::new(config.l1.watcher());
+    let system_tx_cfg = eez_protocol::system_tx::SystemTxContext {
+        system_signer,
+        eezl2_address: eez_protocol::EEZL2_ADDRESS,
+        l2_chain_id: chain_spec.chain().id(),
+        l2_gas_price: L2_SYSTEM_TX_GAS_PRICE,
+        l2_gas_limit: L2_SYSTEM_TX_GAS_LIMIT,
+        this_rollup_id: config.l1.rollup_id,
+    };
     event!(
         name: "eez.node.follower.system_tx_cfg",
         Level::INFO,
@@ -128,10 +107,10 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         deploy_block,
         Arc::clone(&l1_head),
         Some(system_tx_cfg),
-        read_checkpoint_dir(),
+        checkpoint_dir(&l2_datadir),
     );
 
-    wait_for_l1_ready(&l1_reader, deploy_block, read_l1_chain_id()?).await?;
+    wait_for_l1_ready(&l1_reader, deploy_block, config.l1.chain_id).await?;
 
     let mut retry_delay = BOOT_CATCH_UP_INITIAL_RETRY_DELAY;
     let mut attempts = 0_u64;
@@ -201,7 +180,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         deriver.run(deriver_events).await;
     });
 
-    if let Some(sequencer_rpc) = ext.sequencer_rpc {
+    if let Some(sequencer_rpc) = config.sequencer_rpc {
         let follower = UnsafeHeadFollower::new(
             block_committer,
             RootProvider::new_http(sequencer_rpc),
@@ -220,7 +199,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         event!(
             name: "eez.node.follower.l1_derived_only",
             Level::INFO,
-            "EEZ_SEQUENCER_RPC not set; running L1-derived-only follower",
+            "no sequencer RPC configured; running L1-derived-only follower",
         );
     }
 
@@ -230,44 +209,4 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
     );
 
     handle.wait_for_node_exit().await
-}
-
-/// Read the mandatory system-transaction identity before follower startup.
-fn read_system_config() -> eyre::Result<FollowerSystemConfig> {
-    let system_key = required_env("EEZ_L2_SYSTEM_KEY")?;
-    let eezl2_address = required_env("EEZL2_ADDRESS")?;
-    let rollup_id = required_env("EEZ_ROLLUP_ID")?;
-
-    let system_signer =
-        PrivateKeySigner::from_bytes(&B256::from_str(system_key.trim_start_matches("0x"))?)?;
-    let eezl2_address = Address::from_str(&eezl2_address)
-        .map_err(|err| eyre::eyre!("EEZL2_ADDRESS malformed: {err}"))?;
-    let this_rollup_id = rollup_id
-        .parse()
-        .map_err(|e| eyre::eyre!("EEZ_ROLLUP_ID malformed: {e}"))?;
-
-    Ok(FollowerSystemConfig {
-        system_signer,
-        eezl2_address,
-        this_rollup_id,
-    })
-}
-
-fn required_env(name: &str) -> eyre::Result<String> {
-    match env::var(name) {
-        Ok(value) => Ok(value),
-        Err(env::VarError::NotPresent) => Err(eyre::eyre!("{name} is required in follower mode")),
-        Err(env::VarError::NotUnicode(_)) => Err(eyre::eyre!("{name} contains non-UTF-8 bytes")),
-    }
-}
-
-/// Required for followers: guessing would either assert the wrong source
-/// chain or silently skip the configured RPC's identity check.
-fn read_l1_chain_id() -> eyre::Result<u64> {
-    let value = env::var("EEZ_L1_CHAIN_ID").map_err(|err| {
-        eyre::eyre!("EEZ_L1_CHAIN_ID is required (the L1 chain id this node derives from): {err}")
-    })?;
-    value
-        .parse::<u64>()
-        .map_err(|err| eyre::eyre!("EEZ_L1_CHAIN_ID={value:?} malformed: {err}"))
 }

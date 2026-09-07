@@ -33,6 +33,10 @@ thiserror.workspace = true
 tokio.workspace     = true
 tracing.workspace   = true
 url.workspace       = true
+serde.workspace     = true
+
+[dev-dependencies]
+toml.workspace = true
 
 [lints]
 workspace = true

@@ -1,5 +1,5 @@
 # Lighthouse beacon node (chiado) for the embedded reth_gnosis L1 running
-# inside `eez-node` (composer mode, EEZ_L1_CHAIN=chiado).
+# inside `eez-node` (Composer config: embedded_l1.kind = "chiado").
 #
 # Lighthouse runs as a separate container with `network_mode: host` so it
 # can dial the eez-node's L1 authrpc on the host (default 127.0.0.1:18551).
@@ -9,8 +9,8 @@
 #
 # Required env (export before `docker compose up`):
 #   - EEZ_L1_JWT_SECRET           — absolute host path to the shared
-#                                    jwt.hex (the same path passed to
-#                                    eez-node via `EEZ_L1_JWT_SECRET`).
+#                                    jwt.hex (also set as embedded_l1.jwt_secret
+#                                    in the Composer config).
 #   - EEZ_CHIADO_LIGHTHOUSE_DATA  — host path for lighthouse state (will
 #                                    be created if absent).
 #   - EEZ_CHIADO_CONFIG_DIR       — host path containing the chiado

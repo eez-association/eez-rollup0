@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Machine 1: (re)launch the Kurtosis L1-only devnet in a consistent state and
-# expose it to Machine 2 + the world via socat. Emits machine2.env (enode / CL
-# multiaddr / endpoints) and prints the browser UI URLs. Idempotent — safe to
-# re-run; it tears down the old enclave + forwarders first.
+# expose it to Machine 2 + the world via socat. Emits the Compose/deployment
+# handoff plus a role-specific Composer config. Idempotent — safe to re-run; it
+# tears down the old enclave + forwarders first.
 #
 #   bash testing/kurtosis/scripts/12s-l1-up.sh
 #
@@ -113,25 +113,66 @@ if [[ -n "$FE" ]]; then
     --entrypoint ./entrypoint.sh ghcr.io/blockscout/frontend:latest node server.js >/dev/null && echo "    bs-frontend-public up on :4000"
 fi
 
-echo "==> [7/7] download L1 genesis + write machine2.env"
+echo "==> [7/7] download L1 genesis + write Machine 2 handoff"
 rm -rf "$REPO/l1-genesis"; kurtosis files download "$ENCLAVE" el_cl_genesis_data "$REPO/l1-genesis" >/dev/null 2>&1
 # Plain KEY=VAL (no `export`) so it works as a docker-compose --env-file AND is
 # sourceable with `set -a; source machine2.env; set +a`.
 cat > "$REPO/machine2.env" <<EOF
 # ── Machine 1 Kurtosis L1 ($IP1) → Machine 2 eez stack. Regenerated $(date -u +%FT%TZ 2>/dev/null || echo now). ──
 # scp -r <M1>:$REPO/l1-genesis  ->  Machine 2 ; ports below are socat-forwarded from $BIND_ADDR.
-EEZ_L1_CHAIN_ID=7331
-EEZ_L1_BLOCK_TIME_MS=12000
-EEZ_L1_TARGET_RPC_URL=http://$IP1:8545
-EEZ_L1_BUILDER_RPC_URL=http://$IP1:8645
+EEZ_L1_RPC_URL=http://$IP1:8545
 L1_BEACON_URL=http://$IP1:5052
-EEZ_L1_TRUSTED_PEERS=enode://$PUBKEY@$IP1:30303
 CL_MULTIADDR=/ip4/$IP1/tcp/9010/p2p/$PEERID
 CL_PEERID=$PEERID
 EOF
+cat > "$REPO/machine2-composer.toml" <<EOF
+# Replace CHANGE_ME values after make deploy-protocol on Machine 2.
+l2_system_key = "0xCHANGE_ME"
+expect_external_batches = true
+max_speculative_depth = 0
+
+[l1]
+rpc_url = "http://127.0.0.1:18645"
+chain_id = 7331
+registry_address = "0xCHANGE_ME"
+registry_deploy_block = 0
+rollup_id = 1
+
+[timing]
+l1_block_time_ms = 12000
+l2_block_time_ms = 2000
+proof_time_ms = 2000
+submission_slack_ms = 1000
+
+[prover]
+url = "http://127.0.0.1:50081"
+attester_address = "0xCHANGE_ME"
+
+[submission]
+builder_rpc_url = "http://$IP1:8645"
+target_rpc_url = "http://$IP1:8545"
+poster_key = "0xCHANGE_ME"
+proof_system_address = "0xCHANGE_ME"
+priority_fee = 30000000000
+
+[cross_chain]
+l1_port = 18999
+l2_port = 18998
+
+[embedded_l1]
+kind = "devnet"
+chain = "/genesis/genesis.json"
+datadir = "/l1"
+http_port = 18645
+auth_port = 18661
+p2p_port = 30544
+jwt_secret = "/jwt/jwt.hex"
+trusted_peers = ["enode://$PUBKEY@$IP1:30303"]
+EOF
+chmod 600 "$REPO/machine2-composer.toml"
 echo
 echo "════════ Machine 1 L1 up ════════"
-echo " machine2.env  -> $REPO/machine2.env   (scp to Machine 2 + the l1-genesis dir)"
+echo " handoff files  -> $REPO/machine2.env and machine2-composer.toml"
 echo " Browser UIs:   blockscout http://$IP1:4000   dora http://$IP1:8080   mev-relay http://$IP1:9060"
 echo " EL RPC http://$IP1:8545 (7331)   builder http://$IP1:8645   beacon http://$IP1:5052"
 echo "═════════════════════════════════"

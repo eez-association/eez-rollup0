@@ -26,7 +26,7 @@
 #
 # Knobs: EEZ_MODE, EEZ_WAVE_COUNT(3), EEZ_IN_N(100), EEZ_OUT_N(100),
 #        EEZ_PACE_N(0=burst), EEZ_PACE_INTERVAL(10), EEZ_RESTART(0),
-#        EEZ_MAX_USER_TXS_PER_BUNDLE (informational; set on the node, not here),
+#        limits.max_user_txs_per_bundle in the Composer config (informational),
 #        NODE_CONTAINER(eez-node-chiado).
 
 set -uo pipefail
@@ -67,7 +67,7 @@ L2_DEP_RECIPIENT=$(rand_addr); L1_WD_RECIPIENT=$(rand_addr)
 
 for t in cast forge jq curl docker python3; do command -v "$t" >/dev/null || { echo "✗ $t not in PATH"; exit 1; }; done
 docker inspect "$NODE_CONTAINER" >/dev/null 2>&1 || { echo "✗ container '$NODE_CONTAINER' not up — run scripts/chiado-up.sh"; exit 1; }
-[[ "$(cast chain-id --rpc-url "$L1" 2>/dev/null)" == "${EEZ_L1_CHAIN_ID:-10200}" ]] || { echo "✗ embedded L1 chain-id != ${EEZ_L1_CHAIN_ID:-10200} on :18645"; exit 1; }
+[[ "$(cast chain-id --rpc-url "$L1" 2>/dev/null)" == "10200" ]] || { echo "✗ embedded L1 chain-id != 10200 on :18645"; exit 1; }
 # The funder must be solvent on BOTH chains before anything is submitted. An
 # unfunded funder otherwise surfaces much later as "lack of funds for max fee"
 # on a random sender, which reads like a protocol failure.
@@ -87,7 +87,12 @@ L1_CID=$(cast chain-id --rpc-url "$L1"); L2_CID=$(cast chain-id --rpc-url "$L2")
 NODE_LOG="$(mktemp)"; SINCE_TS="$(date +%s)"       # scope log metrics to THIS run
 refresh_log(){ docker logs --since "$SINCE_TS" "$NODE_CONTAINER" >"$NODE_LOG" 2>&1 || true; }
 trap 'rm -f "$NODE_LOG"' EXIT
-CAP="$(docker exec "$NODE_CONTAINER" printenv EEZ_MAX_USER_TXS_PER_BUNDLE 2>/dev/null || echo 3)"
+CAP="$(docker exec "$NODE_CONTAINER" awk -F= '
+  /^[[:space:]]*max_user_txs_per_bundle[[:space:]]*=/ {
+    gsub(/[[:space:]]/, "", $2); print $2; exit
+  }
+' /app/eez-composer.toml 2>/dev/null || true)"
+CAP="${CAP:-50}"
 echo "════ XCHAIN TEST ════  mode=$MODE  bundle_cap=$CAP  restart=$DO_RESTART  (L2=$(cast block-number --rpc-url "$L2"))"
 
 # ── Shared helpers ───────────────────────────────────────────────────

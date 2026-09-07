@@ -3067,12 +3067,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dotenvy"
-version = "0.15.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
-
-[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3294,8 +3288,10 @@ dependencies = [
  "reth-node-ethereum 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-primitives-traits",
  "reth-storage-api 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "serde",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
  "tracing",
  "url",
 ]
@@ -3371,7 +3367,9 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -3381,8 +3379,8 @@ dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
  "alloy-primitives",
+ "alloy-signer-local",
  "clap",
- "dotenvy",
  "eez-driver",
  "eez-l1",
  "eyre",
@@ -3398,9 +3396,12 @@ dependencies = [
  "reth-node-builder 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-primitives-traits",
  "reth-transaction-pool 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
+ "serde",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -3420,6 +3421,7 @@ dependencies = [
  "eez-control-rpc",
  "eez-follower",
  "eez-node",
+ "eez-node-common",
  "eez-protocol",
  "eyre",
  "reth-chainspec 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
@@ -3427,7 +3429,9 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
+ "url",
 ]
 
 [[package]]

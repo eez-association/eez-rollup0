@@ -1365,6 +1365,155 @@ impl NodeBinary {
     }
 }
 
+fn setting<'a>(settings: &'a [(&str, String)], name: &str) -> Option<&'a str> {
+    settings
+        .iter()
+        .find_map(|(key, value)| (*key == name).then_some(value.as_str()))
+}
+
+fn required_setting<'a>(settings: &'a [(&str, String)], name: &str) -> Result<&'a str> {
+    setting(settings, name).ok_or_else(|| anyhow!("missing test node setting {name}"))
+}
+
+fn parse_setting<T>(settings: &[(&str, String)], name: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    required_setting(settings, name)?
+        .parse()
+        .map_err(|err| anyhow!("invalid test node setting {name}: {err}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_node_config(
+    datadir: &std::path::Path,
+    binary: NodeBinary,
+    settings: &[(&str, String)],
+    l1_http_port: u16,
+    l1_auth_port: u16,
+    l1_p2p_port: u16,
+    l1_discv5_port: u16,
+    l1_xchain_port: u16,
+    l2_xchain_port: u16,
+) -> Result<PathBuf> {
+    use eez_node_common::config::{L1Config, SecretKey, TimingConfig};
+
+    let l1 = L1Config {
+        rpc_url: parse_setting(settings, "EEZ_L1_RPC_URL")?,
+        chain_id: parse_setting(settings, "EEZ_L1_CHAIN_ID")?,
+        registry_address: parse_setting(settings, "EEZ_REGISTRY_ADDRESS")?,
+        registry_deploy_block: parse_setting(settings, "EEZ_REGISTRY_DEPLOY_BLOCK")?,
+        rollup_id: parse_setting(settings, "EEZ_ROLLUP_ID")?,
+        reorg_max_depth: setting(settings, "EEZ_L1_REORG_MAX_DEPTH_BLOCKS")
+            .map(str::parse)
+            .transpose()?
+            .unwrap_or(62),
+    };
+    let timing = TimingConfig {
+        l1_block_time_ms: parse_setting(settings, "EEZ_L1_BLOCK_TIME_MS")?,
+        l2_block_time_ms: parse_setting(settings, "EEZ_L2_BLOCK_TIME_MS")?,
+        proof_time_ms: parse_setting(settings, "EEZ_PROOF_TIME_MS")?,
+        submission_slack_ms: setting(settings, "EEZ_SUBMISSION_SLACK_MS")
+            .map(str::parse)
+            .transpose()?
+            .unwrap_or(100),
+    };
+    let l2_system_key: SecretKey = parse_setting(settings, "EEZ_L2_SYSTEM_KEY")?;
+
+    let contents = match binary {
+        NodeBinary::Follower => toml::to_string_pretty(&eez_follower::config::Config {
+            l1,
+            timing,
+            l2_system_key,
+            sequencer_rpc: setting(settings, "EEZ_SEQUENCER_RPC")
+                .map(str::parse)
+                .transpose()?,
+        })?,
+        NodeBinary::Composer => {
+            let mut limits = eez_node::config::LimitsConfig::default();
+            if let Some(value) = setting(settings, "EEZ_MAX_BLOCKS_PER_BATCH") {
+                limits.max_blocks_per_batch = value.parse()?;
+            }
+            if let Some(value) = setting(settings, "EEZ_MAX_POSTBATCH_GAS") {
+                limits.max_postbatch_gas = value.parse()?;
+            }
+            if let Some(value) = setting(settings, "EEZ_MAX_USER_TXS_PER_BUNDLE") {
+                limits.max_user_txs_per_bundle = value.parse()?;
+            }
+            let kind = match setting(settings, "EEZ_L1_CHAIN").unwrap_or("testing") {
+                "testing" => eez_node::config::EmbeddedL1Kind::Testing,
+                "devnet" => eez_node::config::EmbeddedL1Kind::Devnet,
+                "chiado" => eez_node::config::EmbeddedL1Kind::Chiado,
+                other => bail!("invalid test node setting EEZ_L1_CHAIN={other:?}"),
+            };
+            toml::to_string_pretty(&eez_node::config::Config {
+                l1,
+                timing,
+                prover: eez_node::config::ProverConfig {
+                    url: parse_setting(settings, "EEZ_PROVER_URL")?,
+                    attester_address: parse_setting(settings, "EEZ_ATTESTER_ADDRESS")?,
+                },
+                submission: eez_node::config::SubmissionConfig {
+                    builder_rpc_url: parse_setting(settings, "EEZ_L1_BUILDER_RPC_URL")?,
+                    target_rpc_url: setting(settings, "EEZ_L1_TARGET_RPC_URL")
+                        .map(str::parse)
+                        .transpose()?,
+                    poster_key: parse_setting(settings, "EEZ_L1_POSTER_KEY")?,
+                    proof_system_address: parse_setting(
+                        settings,
+                        "EEZ_ECDSA_PROOF_SYSTEM_ADDRESS",
+                    )?,
+                    priority_fee: setting(settings, "EEZ_L1_POSTBATCH_PRIORITY_FEE")
+                        .map(str::parse)
+                        .transpose()?
+                        .unwrap_or(10_000_000_000),
+                },
+                cross_chain: eez_node::config::CrossChainConfig {
+                    l1_port: l1_xchain_port,
+                    l2_port: l2_xchain_port,
+                },
+                embedded_l1: eez_node::config::EmbeddedL1Settings {
+                    kind,
+                    chain: required_setting(settings, "EEZ_L1_CHAIN_PATH")?.to_owned(),
+                    datadir: datadir.join("embedded-l1"),
+                    http_port: l1_http_port,
+                    auth_port: Some(l1_auth_port),
+                    p2p_port: l1_p2p_port,
+                    discv5_port: Some(l1_discv5_port),
+                    jwt_secret: setting(settings, "EEZ_L1_JWT_SECRET").map(PathBuf::from),
+                    trusted_peers: setting(settings, "EEZ_L1_TRUSTED_PEERS")
+                        .map(|peers| {
+                            peers
+                                .split([',', ' '])
+                                .filter(|peer| !peer.is_empty())
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                },
+                l2_system_key,
+                expect_external_batches: setting(settings, "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES")
+                    .map(str::parse)
+                    .transpose()?
+                    .unwrap_or(false),
+                max_speculative_depth: setting(settings, "EEZ_MAX_SPECULATIVE_DEPTH")
+                    .map(str::parse)
+                    .transpose()?
+                    .unwrap_or(64),
+                limits,
+            })?
+        }
+    };
+    let path = datadir.join(match binary {
+        NodeBinary::Composer => "eez-composer.toml",
+        NodeBinary::Follower => "eez-follower.toml",
+    });
+    std::fs::write(&path, contents)
+        .with_context(|| format!("write node config {}", path.display()))?;
+    Ok(path)
+}
+
 #[derive(Default)]
 pub struct NodeConfig<'a> {
     /// Explicit node-role executable to launch.
@@ -1398,15 +1547,29 @@ impl NodeHandle {
         let http_port = probe_unique_tcp_port(&mut used_ports);
         let ws_port = probe_unique_tcp_port(&mut used_ports);
         let p2p_port = probe_unique_tcp_port(&mut used_ports);
-        let l1_http_port = probe_unique_http_port(&mut used_ports);
-        let l1_auth_port = probe_unique_tcp_port(&mut used_ports);
+        let l1_http_port = setting(env, "EEZ_L1_HTTP_PORT")
+            .map(str::parse)
+            .transpose()?
+            .unwrap_or_else(|| probe_unique_http_port(&mut used_ports));
+        let l1_auth_port = setting(env, "EEZ_L1_AUTH_PORT")
+            .map(str::parse)
+            .transpose()?
+            .unwrap_or_else(|| probe_unique_tcp_port(&mut used_ports));
         // Embedded L1 uses this numeric port for RLPx TCP and discovery UDP.
-        let l1_p2p_port = probe_unique_tcp_udp_port(&mut used_ports);
+        let l1_p2p_port = setting(env, "EEZ_L1_P2P_PORT")
+            .map(str::parse)
+            .transpose()?
+            .unwrap_or_else(|| probe_unique_tcp_udp_port(&mut used_ports));
         let l1_discv5_port = probe_unique_udp_port(&mut used_ports);
-        let l1_xchain_port = probe_unique_tcp_port(&mut used_ports);
-        let l2_xchain_port = probe_unique_tcp_port(&mut used_ports);
+        let l1_xchain_port = setting(env, "EEZ_L1_XCHAIN_PORT")
+            .map(str::parse)
+            .transpose()?
+            .unwrap_or_else(|| probe_unique_tcp_port(&mut used_ports));
+        let l2_xchain_port = setting(env, "EEZ_L2_XCHAIN_PORT")
+            .map(str::parse)
+            .transpose()?
+            .unwrap_or_else(|| probe_unique_tcp_port(&mut used_ports));
         drop(used_ports);
-        let l1_datadir = datadir.join("embedded-l1");
         let env_genesis = env
             .iter()
             .find(|(k, _)| *k == TEST_L2_GENESIS_ENV)
@@ -1418,15 +1581,25 @@ impl NodeHandle {
             .map(|p| p.as_os_str().to_owned())
             .or(env_genesis)
             .unwrap_or_else(|| std::ffi::OsString::from("dev"));
+        let config_path = write_node_config(
+            datadir,
+            cfg.binary,
+            env,
+            l1_http_port,
+            l1_auth_port,
+            l1_p2p_port,
+            l1_discv5_port,
+            l1_xchain_port,
+            l2_xchain_port,
+        )?;
         let mut cmd = Command::new(cfg.binary.path()?);
-        // Each role binary loads dotenv files from its working directory. Running from
-        // the datadir prevents repository settings from changing the explicit
-        // test configuration or redirecting L1 traffic to a developer endpoint.
         cmd.current_dir(datadir)
             .args(["node", "--chain"])
             .arg(&chain_arg)
             .arg("--datadir")
             .arg(datadir)
+            .arg("--eez.config")
+            .arg(&config_path)
             .stdout(stdout)
             .args([
                 "--http",
@@ -1456,20 +1629,8 @@ impl NodeHandle {
                 "CARGO_HOME",
                 std::env::var("CARGO_HOME").unwrap_or_default(),
             );
-        cmd.env("EEZ_L1_HTTP_PORT", l1_http_port.to_string())
-            .env("EEZ_L1_AUTH_PORT", l1_auth_port.to_string())
-            .env("EEZ_L1_P2P_PORT", l1_p2p_port.to_string())
-            .env("EEZ_L1_DISCV5_PORT", l1_discv5_port.to_string())
-            .env("EEZ_L1_XCHAIN_PORT", l1_xchain_port.to_string())
-            .env("EEZ_L2_XCHAIN_PORT", l2_xchain_port.to_string())
-            .env("EEZ_L1_DATADIR", &l1_datadir)
-            // May be overridden below when a test uses another L2 upstream.
-            .env("EEZ_L2_RPC_URL", format!("http://127.0.0.1:{http_port}"));
-        for (k, v) in env {
-            if *k == TEST_L2_GENESIS_ENV {
-                continue; // test-only marker (consumed as --chain above)
-            }
-            cmd.env(*k, v);
+        if let Some(rust_log) = setting(env, "RUST_LOG") {
+            cmd.env("RUST_LOG", rust_log);
         }
         let child = cmd.spawn().context("spawn eez node role")?;
         Ok(Self {

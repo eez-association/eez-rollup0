@@ -10,7 +10,7 @@
 //! Persistent (mdbx), not RAM: the node is non-archival, so by settlement time an
 //! older block's parent state is pruned — a RAM store lost on restart couldn't
 //! re-derive it, stalling a restart with an unsettled backlog. Dedicated env
-//! (never reth's node DB; path `EEZ_WITNESS_DB_PATH`), keyed by block number.
+//! (never reth's node DB), keyed by block number.
 //!
 //! Purge floor = L1-FINALIZED (not merely-posted) L2 height: an L1 reorg could
 //! roll a posted batch out and need its witness back. The endpoint (uncommitted

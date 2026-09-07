@@ -30,7 +30,7 @@ signer, #2 `0x3C44…` is target deployer.
 `testing/kurtosis/scripts/12s-l1-up.sh` is the whole runbook in one idempotent script: it
 tears down the old enclave + forwarders, launches, resolves ports, forwards them
 to fixed ones, resolves the enode + CL peer-id, downloads the genesis artifact,
-and writes `machine2.env`.
+and writes `machine2.env` plus `machine2-composer.toml`.
 
 ```bash
 cd /root/eez-rollup0
@@ -94,10 +94,10 @@ of these ports is already taken, rather than handing Machine 2 dead endpoints:
 
 | Fixed port | Service | Consumer |
 |---|---|---|
-| 8545 | canonical EL RPC (`el-1`) | `EEZ_L1_TARGET_RPC_URL` — tip oracle for N+1 targeting |
-| 8645 | rbuilder RPC | `EEZ_L1_BUILDER_RPC_URL` — `eth_sendBundle` |
+| 8545 | canonical EL RPC (`el-1`) | `submission.target_rpc_url` — tip oracle for N+1 targeting |
+| 8645 | rbuilder RPC | `submission.builder_rpc_url` — `eth_sendBundle` |
 | 5052 | beacon HTTP (`cl-1`) | `L1_BEACON_URL` — follower checkpoint-sync |
-| 30303 | EL P2P | the enode in `EEZ_L1_TRUSTED_PEERS` |
+| 30303 | EL P2P | the enode in `embedded_l1.trusted_peers` |
 | 9010 | CL P2P | the multiaddr in `CL_MULTIADDR` |
 | 8080 | dora | browser |
 | 9060 | mev-relay website | browser |
@@ -138,30 +138,31 @@ kurtosis files download eez-l1-12s el_cl_genesis_data ./l1-genesis
 
 One artifact, both halves:
 
-- `genesis.json` → `EEZ_L1_CHAIN_PATH` for eez-node's embedded reth
+- `genesis.json` → `embedded_l1.chain` for eez-node's embedded reth
 - `config.yaml` + `genesis.ssz` → `--testnet-dir` for the follower lighthouse
 
 ## 5. Handing off to Machine 2
 
-Step [7/7] writes `machine2.env` — plain `KEY=VAL`, so it works both as a
-`docker compose --env-file` and with `set -a; source machine2.env; set +a`:
+Step [7/7] writes `machine2.env` for Compose substitution and deployment:
 
 ```
-EEZ_L1_CHAIN_ID=7331
-EEZ_L1_BLOCK_TIME_MS=12000
-EEZ_L1_TARGET_RPC_URL=http://$IP1:8545
-EEZ_L1_BUILDER_RPC_URL=http://$IP1:8645
+EEZ_L1_RPC_URL=http://$IP1:8545
 L1_BEACON_URL=http://$IP1:5052
-EEZ_L1_TRUSTED_PEERS=enode://$PUBKEY@$IP1:30303
 CL_MULTIADDR=/ip4/$IP1/tcp/9010/p2p/$PEERID
 CL_PEERID=$PEERID
 ```
+
+It also writes `machine2-composer.toml`. That file already contains the current
+timing, builder, target-oracle, and trusted-peer settings; after deployment,
+replace its `CHANGE_ME` values and deploy-block placeholder from
+`deployments.env`.
 
 Ship both to Machine 2:
 
 ```bash
 scp -r <M1>:/root/eez-rollup0/l1-genesis   ./l1-genesis
 scp    <M1>:/root/eez-rollup0/machine2.env .
+scp    <M1>:/root/eez-rollup0/machine2-composer.toml ./eez-composer.toml
 ```
 
 Then, on Machine 2:
@@ -169,7 +170,9 @@ Then, on Machine 2:
 ```bash
 cp .env.kurtosis.example .env.kurtosis     # merge machine2.env values in
 openssl rand -hex 32 > ./data/jwt.hex      # embedded reth ↔ follower JWT
-make deploy-protocol                       # against EEZ_L1_TARGET_RPC_URL
+set -a; source .env.kurtosis; set +a
+make deploy-protocol                       # against EEZ_L1_RPC_URL
+# Fill eez-composer.toml CHANGE_ME/deploy-block values from deployments.env.
 docker compose --env-file .env.kurtosis -f docker-compose.kurtosis-node.yml up -d
 ```
 
@@ -188,7 +191,7 @@ Timing is 12s L1 / 2s L2 → K=6, with `proof + slack = 3000ms < 12000ms`
 - **Recreating the enclave invalidates the handoff.** New enode, new peer-id, new
   genesis, new random ports — re-scp `l1-genesis/`, refresh `machine2.env`, and
   redeploy the protocol.
-- **Embedded L1 P2P must not collide with L2 reth.** `EEZ_L1_P2P_PORT=30544` vs
+- **Embedded L1 P2P must not collide with L2 reth.** `embedded_l1.p2p_port=30544` vs
   the L2's `--port=30640`.
 - **Fund the poster before a run.** A drained poster looks exactly like a dead
   builder: postBatch is accepted but excluded, `posted` sticks, and the batch

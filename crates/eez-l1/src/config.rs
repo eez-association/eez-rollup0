@@ -1,25 +1,12 @@
-//! Configuration for read-only L1 access and signed batch submission,
-//! populated from `EEZ_*` environment variables.
+//! Configuration for read-only L1 access and signed batch submission.
 //!
 //! Per-rollup composer/orchestration knobs remain in
 //! `eez-composer::RollupConfig`; the registry deploy block lives here because
 //! it defines the lower bound of the L1 reader's historical scan.
 
-use std::{env, str::FromStr};
-
 use alloy_primitives::Address;
 use alloy_signer_local::PrivateKeySigner;
 use url::Url;
-
-use crate::error::{L1Error, L1Result};
-
-const ENV_RPC_URL: &str = "EEZ_L1_RPC_URL";
-const ENV_BUILDER_RPC_URL: &str = "EEZ_L1_BUILDER_RPC_URL";
-const ENV_TARGET_RPC_URL: &str = "EEZ_L1_TARGET_RPC_URL";
-const ENV_POSTER_KEY: &str = "EEZ_L1_POSTER_KEY";
-const ENV_EEZ_ADDRESS: &str = "EEZ_REGISTRY_ADDRESS";
-const ENV_ROLLUP_ID: &str = "EEZ_ROLLUP_ID";
-const ENV_REGISTRY_DEPLOY_BLOCK: &str = "EEZ_REGISTRY_DEPLOY_BLOCK";
 
 /// Read-only L1 connectivity used by the Deriver's canonical-chain scans.
 #[derive(Clone)]
@@ -45,23 +32,6 @@ impl std::fmt::Debug for L1ReaderConfig {
             .field("rollup_id", &self.rollup_id)
             .field("deploy_block", &self.deploy_block)
             .finish()
-    }
-}
-
-impl L1ReaderConfig {
-    /// Read the canonical-chain scan configuration from `EEZ_*` env vars.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`L1Error::Config`] for any missing required var or
-    /// malformed value.
-    pub fn from_env() -> L1Result<Self> {
-        Ok(Self {
-            rpc_url: parse_url(ENV_RPC_URL)?,
-            eez: parse_address(ENV_EEZ_ADDRESS)?,
-            rollup_id: parse_u64(ENV_ROLLUP_ID)?,
-            deploy_block: parse_u64(ENV_REGISTRY_DEPLOY_BLOCK)?,
-        })
     }
 }
 
@@ -97,57 +67,4 @@ impl std::fmt::Debug for SubmitterConfig {
             .field("poster", &self.poster.address())
             .finish()
     }
-}
-
-impl SubmitterConfig {
-    /// Read from `EEZ_*` env vars.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`L1Error::Config`] for any missing required var or
-    /// malformed value.
-    pub fn from_env() -> L1Result<Self> {
-        let target_rpc_url = match env::var(ENV_TARGET_RPC_URL) {
-            Ok(raw) if !raw.is_empty() => Some(
-                Url::parse(&raw)
-                    .map_err(|e| L1Error::Config(format!("{ENV_TARGET_RPC_URL}: {e}")))?,
-            ),
-            _ => None,
-        };
-        // Builder relay endpoint. On chiado this is an external
-        // Flashbots-style relay. On the embedded dev/testing L1 the node
-        // serves `eth_sendBundle` itself (see `eez-node::bundle_rpc`), so
-        // set this to the same value as EEZ_L1_RPC_URL.
-        let builder_rpc_url = parse_url(ENV_BUILDER_RPC_URL)?;
-        Ok(Self {
-            reader: L1ReaderConfig::from_env()?,
-            builder_rpc_url,
-            target_rpc_url,
-            poster: parse_key(ENV_POSTER_KEY)?,
-        })
-    }
-}
-
-fn require(name: &str) -> L1Result<String> {
-    env::var(name).map_err(|_| L1Error::Config(format!("{name} is required (see .env.example)")))
-}
-
-fn parse_url(name: &str) -> L1Result<Url> {
-    Url::parse(&require(name)?).map_err(|e| L1Error::Config(format!("{name}: {e}")))
-}
-
-fn parse_address(name: &str) -> L1Result<Address> {
-    Address::from_str(&require(name)?).map_err(|e| L1Error::Config(format!("{name}: {e}")))
-}
-
-fn parse_key(name: &str) -> L1Result<PrivateKeySigner> {
-    let raw = require(name)?;
-    PrivateKeySigner::from_str(raw.trim_start_matches("0x"))
-        .map_err(|e| L1Error::Config(format!("{name}: {e}")))
-}
-
-fn parse_u64(name: &str) -> L1Result<u64> {
-    require(name)?
-        .parse::<u64>()
-        .map_err(|e| L1Error::Config(format!("{name}: {e}")))
 }
