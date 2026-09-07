@@ -118,16 +118,6 @@ impl RollupTiming {
         Ok(t)
     }
 
-    /// Standalone-dev default: mainnet-shaped (L1=12s, L2=2s, proof=4s,
-    /// slack=100ms). Used when no L1 stack is configured — only the
-    /// `l2_block_time()` accessor is meaningful in that path; the
-    /// other fields exist for type completeness. Production deployments
-    /// MUST use [`Self::from_env`] so misconfig is loud.
-    #[must_use]
-    pub const fn standalone_default() -> Self {
-        Self::new(12_000, 2_000, 4_000, 100)
-    }
-
     /// Verify the invariants from §5.4.4. Hard error on violation;
     /// `eez-node` startup refuses to spawn the Sequencer rather than
     /// producing surprising block patterns from a misconfigured set.

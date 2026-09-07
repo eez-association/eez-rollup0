@@ -1,0 +1,43 @@
+[package]
+name                   = "eez-node-common"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+description            = "Shared reth bootstrap substrate for eez node-role binaries."
+
+[features]
+default = []
+l1-startup = ["dep:eez-l1"]
+
+[dependencies]
+eez-driver.workspace = true
+eez-l1 = { workspace = true, optional = true }
+
+alloy-primitives.workspace                = true
+alloy-eips.workspace                      = true
+reth-chainspec.workspace                  = true
+reth-db.workspace                         = true
+reth-ethereum-cli.workspace               = true
+reth-ethereum-engine-primitives.workspace = true
+reth-ethereum-payload-builder.workspace   = true
+reth-ethereum-primitives.workspace        = true
+reth-evm.workspace                        = true
+reth-node-api.workspace                   = true
+reth-node-builder.workspace               = true
+reth-primitives-traits.workspace          = true
+reth-transaction-pool.workspace           = true
+
+clap.workspace     = true
+dotenvy.workspace  = true
+eyre.workspace     = true
+mimalloc.workspace = true
+thiserror.workspace = true
+tokio.workspace    = true
+tracing.workspace  = true
+
+[dev-dependencies]
+alloy-consensus.workspace = true
+
+[lints]
+workspace = true

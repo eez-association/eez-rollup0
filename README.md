@@ -129,9 +129,8 @@ The two **cross-chain ingress fronts** are transparent proxies:
 `eth_sendRawTransaction` sent to a front is held and composed into the next Sync
 block; every other `eth_*` is forwarded to that front's source-chain RPC. They
 use the compose env `EEZ_L1_XCHAIN_PORT` / `EEZ_L2_XCHAIN_PORT`; both ports are
-required by `eez-composer`. The `eez-follower` and `eez-dev-node` binaries do not
-start cross-chain ingress fronts. Upstreams are `EEZ_L1_RPC_URL` /
-`EEZ_L2_RPC_URL` respectively.
+required by `eez-composer`. The `eez-follower` binary does not start cross-chain
+ingress fronts. Upstreams are `EEZ_L1_RPC_URL` / `EEZ_L2_RPC_URL` respectively.
 
 `EEZ_MAX_USER_TXS_PER_BUNDLE` (compose, default `3`) caps how many user
 cross-chain txs ride in one `postBatch` bundle. Raise it only against a builder
@@ -172,16 +171,17 @@ cargo run -p eez-node -- node \
   --datadir "$EEZ_L2_DATADIR"
 ```
 
-Select either non-default role explicitly:
+Select the non-default follower role explicitly. `EEZ_L1_CHAIN_ID` must match
+the numeric chain ID served by `EEZ_L1_RPC_URL`. A follower also requires the
+system signer and L2 execution identity so it can reconstruct Sync blocks:
 
 ```bash
 # L1-derived follower; optionally add `--sequencer-rpc <URL>` after `node`.
-cargo run -p eez-node --bin eez-follower -- node \
-  --chain "$EEZ_L2_GENESIS_PATH" \
-  --datadir "$EEZ_L2_DATADIR"
-
-# Unanchored interval sequencer for local development.
-cargo run -p eez-node --bin eez-dev-node -- node \
+EEZ_L1_CHAIN_ID="<numeric-l1-chain-id>" \
+EEZ_L2_SYSTEM_KEY="<system-private-key>" \
+EEZL2_ADDRESS="<eezl2-contract-address>" \
+EEZ_ROLLUP_ID="<numeric-rollup-id>" \
+cargo run -p eez-follower -- node \
   --chain "$EEZ_L2_GENESIS_PATH" \
   --datadir "$EEZ_L2_DATADIR"
 ```
