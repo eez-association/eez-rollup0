@@ -97,6 +97,13 @@ fn settlement_pipeline_errors_have_stable_rpc_mappings() {
             "da_payload",
         ),
         (
+            SettlementPipelineError::DaPayload(crate::settlement::DaPayloadError::FromBlock {
+                expected: 2,
+                actual: 1,
+            }),
+            "da_payload",
+        ),
+        (
             SettlementPipelineError::DaPayload(
                 crate::settlement::DaPayloadError::UnexpectedItems {
                     field: "transactions",
@@ -312,7 +319,8 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
         returnData: return_data,
     });
     eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
-    batch.callData = settlement::encode_da_payload(&[Vec::new()], &[sidecar.abi_encode()]).into();
+    batch.callData =
+        settlement::encode_da_payload(5, &[Vec::new()], &[sidecar.abi_encode()]).into();
     let expected_hash = recompute_test_public_inputs_hash(&batch);
     let calldata = eez_protocol::entries::encode_postbatch(&batch);
     let statuses = [true];
@@ -527,7 +535,7 @@ fn a_fully_bound_outbound_effect_is_authorized() {
 
     let mut mismatched_da = batch;
     mismatched_da.callData =
-        settlement::encode_da_payload(&[vec![user]], &[mismatched_da.entries[1].abi_encode()])
+        settlement::encode_da_payload(5, &[vec![user]], &[mismatched_da.entries[1].abi_encode()])
             .into();
     let mismatched_calldata = eez_protocol::entries::encode_postbatch(&mismatched_da);
     let run = run_settlement(SettlementInput {

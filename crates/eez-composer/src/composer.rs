@@ -3995,7 +3995,7 @@ where
                     .map(eez_protocol::abi::ExecutionEntrySol::abi_encode),
             )
             .collect();
-        let payload = eez_payload_codec::encode(&blocks, &l2_entries_bytes)
+        let payload = eez_payload_codec::encode(from, &blocks, &l2_entries_bytes)
             .map_err(|e| format!("eez_payload_codec::encode: {e}"))?;
         batch.callData = alloy_primitives::Bytes::from(payload);
 

@@ -145,15 +145,17 @@ will return no proof.
 `callData` MUST be:
 
 ```text
-0x00 || RLP([blockTxCounts, transactions, l2Entries])
+0x00 || RLP([fromBlock, blockTxCounts, transactions, l2Entries])
 ```
 
-It MUST describe every block in the request window. For blocks before the
-terminal block it contains every transaction byte-for-byte. For the terminal
-Sync block it omits outbound system loads and inbound system deliveries while
-retaining outbound user transactions. `l2Entries` contains one derivation
-sidecar per effect, ordered outbound first and then inbound. The exact encoding
-and sidecar projections are specified in the
+`fromBlock` MUST equal the header's `from_block`; `to_block` is derived from
+`fromBlock + blockTxCounts.length - 1` and is therefore not encoded separately.
+The payload MUST describe every block in the request window. For blocks before
+the terminal block it contains every transaction byte-for-byte. For the
+terminal Sync block it omits outbound system loads and inbound system
+deliveries while retaining outbound user transactions. `l2Entries` contains
+one derivation sidecar per effect, ordered outbound first and then inbound. The
+exact encoding and sidecar projections are specified in the
 [DA profile](../eez-proof-signer/SPEC.md#11-data-availability-and-sync-block-verification).
 
 After assembling the batch, the Composer MUST exact-encode the complete

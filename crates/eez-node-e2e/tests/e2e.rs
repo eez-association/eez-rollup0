@@ -442,7 +442,7 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
 
     // Require post-reorg progress before accepting convergence.
     chain
-        .wait_for_batches(pre_batches + 1, DEFAULT_TIMEOUT)
+        .wait_for_batches_or_node_failure(pre_batches + 1, &[&c1, &c2], DEFAULT_TIMEOUT)
         .await
         .expect("no batches landed after reorg");
     tokio::try_join!(

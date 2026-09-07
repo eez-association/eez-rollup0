@@ -547,16 +547,8 @@ where
             }
 
             let resumed = batch.settlement.start > 0;
-            // Anchor on the batch's own start, not our cursor: a competing
-            // composer's batch can cover a range that begins below it.
-            let anchor = match batch.settlement.entry_state {
-                Some(entry_state) => self
-                    .batch_anchor(*cumulative_l2, entry_state, decoded.block_count() as u64)?
-                    .unwrap_or(*cumulative_l2),
-                None => *cumulative_l2,
-            };
-            let (batch_first_l2, batch_last_l2) =
-                batch_l2_range(anchor, resumed, decoded.block_count() as u64);
+            let (anchor, batch_first_l2, batch_last_l2) =
+                self.batch_placement(*cumulative_l2, &decoded, batch.settlement)?;
 
             // Cursor guard (as in on_batch_posted): a root this batch cannot leave at
             // the cursor means the scan is off L1, and replaying would fork us alone.
@@ -1065,19 +1057,12 @@ where
             );
         }
 
-        // from_block is the next L2 block after the highest indexed
-        // batch — the shared L1CanonicalHead is the source of truth.
+        // The payload binds the batch to its original L2 range. A competing
+        // batch may have moved the indexed cursor into that range already.
         let last_indexed_l2 = self.inner.l1_head.last_indexed_l2();
         let resumed = settlement.start > 0;
-        // Anchor on the batch's own start, not our cursor: a competing
-        // composer's batch can cover a range that begins below it.
-        let anchor = match settlement.entry_state {
-            Some(entry_state) => self
-                .batch_anchor(last_indexed_l2, entry_state, block_count)?
-                .unwrap_or(last_indexed_l2),
-            None => last_indexed_l2,
-        };
-        let (from_block, to_block) = batch_l2_range(anchor, resumed, block_count);
+        let (anchor, from_block, to_block) =
+            self.batch_placement(last_indexed_l2, &decoded, settlement)?;
 
         // Cursor guard: a root this batch cannot leave at the cursor means the local
         // index is off L1 (e.g. a dropped event); let the run-loop resync re-anchor.
@@ -1334,17 +1319,24 @@ where
         Ok(self.l2_sealed_header_at(l2_block)?.hash())
     }
 
-    /// Block whose root is `entry_state`: where this batch's run starts. A
-    /// competing composer's batch can begin below our cursor, so search back.
-    fn batch_anchor(
+    /// Resolve this batch's absolute L2 placement. A resumed settlement
+    /// rewrites the already-indexed Sync block where its skipped prefix landed.
+    fn batch_placement(
         &self,
         cursor: u64,
-        entry_state: B256,
-        window: u64,
-    ) -> DeriverResult<Option<u64>> {
-        anchor_with_overlap_log(cursor, entry_state, window, |block| {
-            self.l2_state_root_at(block)
-        })
+        decoded: &eez_payload_codec::DecodedBatch,
+        settlement: eez_l1::Settlement,
+    ) -> DeriverResult<(u64, u64, u64)> {
+        let block_count = decoded.block_count() as u64;
+        let resumed = settlement.start > 0;
+        authenticated_batch_placement(decoded.from_block, cursor, resumed, block_count).ok_or_else(
+            || {
+                DeriverError::local_diverged_with_msg(
+                    cursor,
+                    "batch cursor falls outside its authenticated L2 range",
+                )
+            },
+        )
     }
 
     fn l2_state_root_at(&self, l2_block: u64) -> DeriverResult<B256> {
@@ -1597,7 +1589,7 @@ where
         if resumed {
             // The competing batch already committed this Sync block; only the
             // entries this batch settled are new. Append them to its EXISTING
-            // content rather than a fresh block — see `batch_l2_range`.
+            // content rather than a fresh block.
             if stale_boundary {
                 return Err(DeriverError::local_diverged_with_msg(
                     from_block,
@@ -1898,9 +1890,11 @@ where
             // A depth, not a block count. `from_block` is `anchor + 1` when
             // fresh and `anchor` when resumed, so measure from the anchor.
             let window = to_block.saturating_sub(anchor);
-            if let Some(settled_end) = find_batch_anchor(to_block, claimed_new, window, |block| {
-                self.l2_state_root_at(block)
-            })? {
+            if let Some(settled_end) =
+                find_settled_endpoint(to_block, claimed_new, window, |block| {
+                    self.l2_state_root_at(block)
+                })?
+            {
                 if settled_end != to_block {
                     event!(
                         name: "eez.deriver.state.settled_prefix",
@@ -1954,45 +1948,18 @@ where
     }
 }
 
-/// [`find_batch_anchor`] plus the overlap log. Free fn so a test can drive it
-/// with a closure and assert the event, with no live `Deriver`.
-///
-/// # Errors
-/// Propagates `root_at` failures.
-fn anchor_with_overlap_log(
-    cursor: u64,
-    entry_state: B256,
-    window: u64,
-    root_at: impl FnMut(u64) -> DeriverResult<B256>,
-) -> DeriverResult<Option<u64>> {
-    let anchor = find_batch_anchor(cursor, entry_state, window, root_at)?;
-    // Overlapping range: a competing composer's batch starts below our cursor.
-    if let Some(anchor) = anchor
-        && anchor != cursor
-    {
-        event!(
-            name: "eez.deriver.batch.anchored_below_cursor",
-            Level::INFO,
-            cursor,
-            anchor,
-            "batch anchored below the cursor; its range overlaps ours",
-        );
-    }
-    Ok(anchor)
-}
-
-/// Walks back from `cursor` for the block whose root is `entry_state`. `None`
-/// means the batch starts outside the window, which the caller treats as loud.
-fn find_batch_anchor(
-    cursor: u64,
-    entry_state: B256,
+/// Walk back from `to_block` for the block whose root L1 settled. `None`
+/// means the claimed endpoint is outside the authenticated batch range.
+fn find_settled_endpoint(
+    to_block: u64,
+    settled_state: B256,
     window: u64,
     mut root_at: impl FnMut(u64) -> DeriverResult<B256>,
 ) -> DeriverResult<Option<u64>> {
-    let floor = cursor.saturating_sub(window);
-    let mut block = cursor;
+    let floor = to_block.saturating_sub(window);
+    let mut block = to_block;
     loop {
-        if root_at(block)? == entry_state {
+        if root_at(block)? == settled_state {
             return Ok(Some(block));
         }
         if block == floor {
@@ -2002,13 +1969,32 @@ fn find_batch_anchor(
     }
 }
 
-/// L2 heights a batch's settled part covers. A resumed batch reuses the Sync
-/// block at `cumulative_l2`; a fresh height would re-apply EIP-2935/4788.
-const fn batch_l2_range(cumulative_l2: u64, resumed: bool, claimed_block_count: u64) -> (u64, u64) {
+/// Place a current-format batch from its authenticated start. A resumed batch
+/// rewrites the cursor where its already-settled prefix landed; a fresh batch
+/// retains its original range even when a no-op competitor advanced the cursor
+/// without changing the state root.
+const fn authenticated_batch_placement(
+    from_block: u64,
+    cursor: u64,
+    resumed: bool,
+    block_count: u64,
+) -> Option<(u64, u64, u64)> {
+    let Some(anchor) = from_block.checked_sub(1) else {
+        return None;
+    };
+    let Some(distance) = block_count.checked_sub(1) else {
+        return None;
+    };
+    let Some(to_block) = from_block.checked_add(distance) else {
+        return None;
+    };
     if resumed {
-        (cumulative_l2, cumulative_l2)
+        if cursor < from_block || cursor > to_block {
+            return None;
+        }
+        Some((cursor, cursor, cursor))
     } else {
-        (cumulative_l2 + 1, cumulative_l2 + claimed_block_count)
+        Some((anchor, from_block, to_block))
     }
 }
 
@@ -2336,11 +2322,12 @@ mod producing_slice_tests {
     /// (resumed) settles within that SAME Sync block, not a new one.
     #[test]
     fn resumed_batch_settles_within_the_existing_sync_block_not_a_new_one() {
-        let (first, last) = super::batch_l2_range(100, settlement(0, 2).start > 0, 10);
-        assert_eq!((first, last), (101, 110));
+        let fresh = super::authenticated_batch_placement(101, 100, settlement(0, 2).start > 0, 10);
+        assert_eq!(fresh, Some((100, 101, 110)));
 
-        let (first, last) = super::batch_l2_range(110, settlement(2, 1).start > 0, 10);
-        assert_eq!((first, last), (110, 110));
+        let resumed =
+            super::authenticated_batch_placement(101, 110, settlement(2, 1).start > 0, 10);
+        assert_eq!(resumed, Some((110, 110, 110)));
     }
 }
 
@@ -2522,161 +2509,75 @@ mod outbound_wiring_tests {
 }
 
 #[cfg(test)]
-mod batch_anchor_tests {
-    //! Two composers on one rollup post OVERLAPPING ranges: B's cursor sits a
-    //! block behind A's, so B's batch starts below A's cursor (live 2026-08-24).
-
-    use super::{batch_l2_range, find_batch_anchor};
+mod batch_placement_tests {
+    use super::{authenticated_batch_placement, find_settled_endpoint};
     use alloy_primitives::B256;
 
-    /// Roots of the live stall: B's batch covered 174192..174197, A's cursor was
-    /// 174192, and L1's stored root was block 174197's.
     fn root_at(block: u64) -> B256 {
         B256::with_last_byte(u8::try_from(block % 251).expect("fits"))
     }
 
     #[test]
-    fn overlapping_batch_anchors_below_the_cursor_and_lands_on_the_settled_block() {
-        let cursor = 174_192_u64;
-        let block_count = 6_u64;
-        // B's batch declares the root of 174191 as where its run starts.
-        let entry_state = root_at(174_191);
-
-        let anchor = find_batch_anchor(cursor, entry_state, block_count, |b| Ok(root_at(b)))
-            .expect("lookup")
-            .expect("anchor is inside the window");
-        assert_eq!(anchor, 174_191);
-
-        // Anchored: the range is B's real one and ends where L1 stored its root.
+    fn authenticated_start_places_an_overlapping_batch_below_the_cursor() {
         assert_eq!(
-            batch_l2_range(anchor, false, block_count),
-            (174_192, 174_197)
-        );
-        // Cursor-relative (the bug): one block too high, so the endpoint check
-        // compared L1's stored root against block 174198 and refused.
-        assert_eq!(
-            batch_l2_range(cursor, false, block_count),
-            (174_193, 174_198)
+            authenticated_batch_placement(174_192, 174_192, false, 6),
+            Some((174_191, 174_192, 174_197))
         );
     }
 
     #[test]
-    fn a_partial_settlement_endpoint_is_found_below_the_claimed_range_end() {
-        // Live 2026-08-24: the batch claimed 174193..174198, but L1 stopped at
-        // the hop whose newState is block 174197's root.
-        let claimed_end = 174_198_u64;
-        let settled = find_batch_anchor(claimed_end, root_at(174_197), 6, |b| Ok(root_at(b)))
-            .expect("lookup")
-            .expect("endpoint inside the window");
-        assert_eq!(settled, 174_197);
-        assert_ne!(settled, claimed_end, "cursor must not run past L1's root");
+    fn authenticated_start_is_unambiguous_when_empty_blocks_repeat_a_root() {
+        assert_eq!(
+            authenticated_batch_placement(13, 16, false, 4),
+            Some((12, 13, 16))
+        );
     }
 
     #[test]
-    fn a_full_settlement_endpoint_is_the_range_end() {
-        let claimed_end = 174_198_u64;
-        let settled = find_batch_anchor(claimed_end, root_at(claimed_end), 6, |b| Ok(root_at(b)))
-            .expect("lookup")
-            .expect("endpoint");
-        assert_eq!(settled, claimed_end);
+    fn resumed_batch_rewrites_only_a_cursor_inside_its_original_window() {
+        assert_eq!(
+            authenticated_batch_placement(13, 16, true, 4),
+            Some((16, 16, 16))
+        );
+        assert_eq!(authenticated_batch_placement(13, 17, true, 4), None);
     }
 
     #[test]
-    fn disjoint_batch_still_anchors_at_the_cursor() {
-        let cursor = 1_000_u64;
-        let anchor = find_batch_anchor(cursor, root_at(cursor), 6, |b| Ok(root_at(b)))
-            .expect("lookup")
-            .expect("anchor");
-        assert_eq!(anchor, cursor);
-        assert_eq!(batch_l2_range(anchor, false, 6), (1_001, 1_006));
+    fn partial_settlement_endpoint_is_found_inside_the_authenticated_range() {
+        let to = 174_198_u64;
+        let settled =
+            find_settled_endpoint(to, root_at(174_197), 6, |b| Ok(root_at(b))).expect("lookup");
+        assert_eq!(settled, Some(174_197));
     }
 
     #[test]
-    fn a_root_outside_the_window_stays_loud() {
-        let cursor = 1_000_u64;
-        let anchor =
-            find_batch_anchor(cursor, B256::repeat_byte(0xEE), 6, |b| Ok(root_at(b))).expect("ok");
-        assert!(anchor.is_none(), "unknown root must not be anchored");
-    }
-
-    /// Endpoint depth is measured from the ANCHOR, not `from_block`, which is
-    /// `anchor + 1` when fresh and `anchor` when resumed. Both from-relative
-    /// forms are wrong in opposite directions.
-    ///
-    /// The anchor is a legitimate endpoint: a single-block batch's leading
-    /// immediate is a no-op (`newState == parent.stateRoot == root(anchor)`),
-    /// so L1 can accept it and leave the root there.
-    #[test]
-    fn endpoint_depth_is_measured_from_the_anchor() {
-        for count in [1_u64, 6] {
-            let anchor = 174_192_u64;
-            let (from, to) = batch_l2_range(anchor, false, count);
-            let probe = |b| Ok(root_at(b));
-
-            assert_eq!(
-                find_batch_anchor(to, root_at(anchor), to - anchor, probe).expect("lookup"),
-                Some(anchor),
-                "count={count}: the anchor must stay reachable",
-            );
-            // `to - from` misses it — one short for a fresh batch.
-            assert!(
-                find_batch_anchor(to, root_at(anchor), to - from, probe)
-                    .expect("lookup")
-                    .is_none(),
-                "count={count}: from-relative depth wrongly excludes the anchor",
-            );
-            for endpoint in from..=to {
-                assert_eq!(
-                    find_batch_anchor(to, root_at(endpoint), to - anchor, probe).expect("lookup"),
-                    Some(endpoint),
-                );
-            }
-            assert!(
-                find_batch_anchor(to, root_at(anchor - 1), to - anchor, probe)
-                    .expect("lookup")
-                    .is_none(),
-                "count={count}: a root predating the run must not be accepted",
-            );
-        }
-    }
-
-    /// A resumed batch collapses onto the anchor (`from == to == anchor`), so
-    /// its only valid endpoint is that block — depth 0. The inclusive count
-    /// would reach the anchor's parent and accept a root predating the batch.
-    #[test]
-    fn resumed_batch_endpoint_is_its_own_sync_block_only() {
-        let anchor = 174_197_u64;
-        let (from, to) = batch_l2_range(anchor, true, 10);
-        assert_eq!((from, to), (anchor, anchor));
-        assert_eq!(to - anchor, 0);
+    fn endpoint_search_includes_the_anchor_but_not_its_parent() {
+        let anchor = 174_192_u64;
+        let to = 174_198_u64;
+        let probe = |b| Ok(root_at(b));
 
         assert_eq!(
-            find_batch_anchor(to, root_at(anchor), 0, |b| Ok(root_at(b))).expect("lookup"),
-            Some(anchor),
+            find_settled_endpoint(to, root_at(anchor), to - anchor, probe).expect("lookup"),
+            Some(anchor)
         );
         assert!(
-            find_batch_anchor(to, root_at(anchor - 1), 0, |b| Ok(root_at(b)))
+            find_settled_endpoint(to, root_at(anchor - 1), to - anchor, probe)
                 .expect("lookup")
-                .is_none(),
-            "must not settle at its predecessor's root",
-        );
-        // The old inclusive count accepted exactly that.
-        assert_eq!(
-            find_batch_anchor(to, root_at(anchor - 1), to - from + 1, |b| Ok(root_at(b)))
-                .expect("lookup"),
-            Some(anchor - 1),
+                .is_none()
         );
     }
 
     #[test]
-    fn search_is_bounded_by_the_window() {
-        let cursor = 1_000_u64;
+    fn endpoint_search_is_bounded_by_the_authenticated_range() {
+        let to = 1_000_u64;
         let mut reads = 0_u32;
-        let _ = find_batch_anchor(cursor, B256::repeat_byte(0xEE), 6, |b| {
+        let result = find_settled_endpoint(to, B256::repeat_byte(0xEE), 6, |b| {
             reads += 1;
             Ok(root_at(b))
-        });
-        assert_eq!(reads, 7, "cursor plus the window, nothing deeper");
+        })
+        .expect("lookup");
+        assert!(result.is_none());
+        assert_eq!(reads, 7, "range end plus six predecessors");
     }
 }
 

@@ -148,7 +148,7 @@ async fn mismatched_immediate_entry_count_is_rejected() {
     let mut window = happy_window();
     replace_post_batch(
         &mut window,
-        public_input_post_batch_for_empty_blocks(batch, 3),
+        public_input_post_batch_for_empty_blocks(batch, 5, 3),
     );
 
     let status = server.prove(window).await;
@@ -349,7 +349,7 @@ async fn distinct_reexecuted_roots_are_attested_when_the_anchor_matches() {
     let mut window = happy_window();
     replace_post_batch(
         &mut window,
-        public_input_post_batch_for_empty_blocks(batch, 3),
+        public_input_post_batch_for_empty_blocks(batch, 5, 3),
     );
 
     let _response = server.attest(window).await;
@@ -368,7 +368,7 @@ async fn a_matching_nondefault_rollup_identity_is_attested() {
     header_mut(&mut window[0]).rollup_id = ROLLUP_ID;
     replace_post_batch(
         &mut window,
-        public_input_post_batch_for_empty_blocks(anchor_batch_for(ROLLUP_ID), 3),
+        public_input_post_batch_for_empty_blocks(anchor_batch_for(ROLLUP_ID), 5, 3),
     );
 
     let _response = server.attest(window).await;
@@ -545,7 +545,7 @@ async fn a_batch_for_a_different_proof_system_is_rejected() {
     let mut window = happy_window();
     replace_post_batch(
         &mut window,
-        public_input_post_batch_for_empty_blocks(batch, 3),
+        public_input_post_batch_for_empty_blocks(batch, 5, 3),
     );
 
     let status = server.prove(window).await;
@@ -581,7 +581,7 @@ async fn malformed_or_trailing_da_payload_is_an_invalid_argument() {
     ];
     let inner = inner(Validator::stub(backend_outputs));
     let server = TestServer::new(Arc::clone(&inner)).await;
-    let mut trailing = settlement::encode_da_payload(&vec![Vec::new(); 3], &[]);
+    let mut trailing = settlement::encode_da_payload(5, &vec![Vec::new(); 3], &[]);
     trailing.push(0xff);
 
     for payload in [vec![0x00], trailing] {

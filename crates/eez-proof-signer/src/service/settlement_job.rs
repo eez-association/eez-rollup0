@@ -254,6 +254,7 @@ impl SettlementPipelineError {
                     "validation backend returned invalid output",
                 ),
                 settlement::DaPayloadError::BlockCount { .. }
+                | settlement::DaPayloadError::FromBlock { .. }
                 | settlement::DaPayloadError::UnexpectedItems { .. }
                 | settlement::DaPayloadError::ProjectedTransactionCount { .. }
                 | settlement::DaPayloadError::TransactionMismatch { .. }

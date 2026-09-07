@@ -234,7 +234,7 @@ fn outbound_case(value: U256) -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256
     };
     let block = reth_ethereum_primitives::Block::new(Default::default(), body);
     batch.callData =
-        settlement::encode_da_payload(&[vec![user.clone()]], &[sidecar.abi_encode()]).into();
+        settlement::encode_da_payload(5, &[vec![user.clone()]], &[sidecar.abi_encode()]).into();
     (batch, alloy_rlp::encode(block), user, call_hash)
 }
 
@@ -291,6 +291,7 @@ fn mixed_outbound_inbound_case() -> (eez_protocol::EvmBatch, Vec<u8>, B256) {
     };
     let block = reth_ethereum_primitives::Block::new(Default::default(), body);
     batch.callData = settlement::encode_da_payload(
+        5,
         &[vec![user]],
         &[outbound_sidecar.abi_encode(), inbound_sidecar.abi_encode()],
     )
@@ -344,6 +345,7 @@ fn header_chunk(from: u64, to: u64) -> ProveChunk {
             to_block: to,
             post_batch: Some(public_input_post_batch_for_empty_blocks(
                 anchor_batch(),
+                from,
                 block_count,
             )),
         })),
@@ -351,7 +353,7 @@ fn header_chunk(from: u64, to: u64) -> ProveChunk {
 }
 
 fn public_input_post_batch() -> PostBatch {
-    public_input_post_batch_for_empty_blocks(anchor_batch(), 3)
+    public_input_post_batch_for_empty_blocks(anchor_batch(), 5, 3)
 }
 
 fn public_input_post_batch_for(batch: eez_protocol::EvmBatch) -> PostBatch {
@@ -363,9 +365,11 @@ fn public_input_post_batch_for(batch: eez_protocol::EvmBatch) -> PostBatch {
 
 fn public_input_post_batch_for_empty_blocks(
     mut batch: eez_protocol::EvmBatch,
+    from_block: u64,
     block_count: usize,
 ) -> PostBatch {
-    batch.callData = settlement::encode_da_payload(&vec![Vec::new(); block_count], &[]).into();
+    batch.callData =
+        settlement::encode_da_payload(from_block, &vec![Vec::new(); block_count], &[]).into();
     public_input_post_batch_for(batch)
 }
 
@@ -413,6 +417,9 @@ fn block_mut(chunk: &mut ProveChunk) -> &mut BlockWitness {
 }
 
 fn da_payload_for_window(window: &[ProveChunk]) -> Vec<u8> {
+    let Some(prove_chunk::Kind::Header(header)) = &window[0].kind else {
+        panic!("test window does not start with a header");
+    };
     let blocks = window
         .iter()
         .skip(1)
@@ -425,7 +432,7 @@ fn da_payload_for_window(window: &[ProveChunk]) -> Vec<u8> {
             block.body.encoded_2718_transactions_iter().collect()
         })
         .collect::<Vec<_>>();
-    settlement::encode_da_payload(&blocks, &[])
+    settlement::encode_da_payload(header.from_block, &blocks, &[])
 }
 
 fn replace_batch_bound_to_window(window: &mut [ProveChunk], mut batch: eez_protocol::EvmBatch) {

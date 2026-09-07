@@ -2,6 +2,7 @@
 //!
 //! ```text
 //!   payload := tagByte ‖ rlp([
+//!     fromBlock,        # first L2 block covered by this batch
 //!     blockTxCounts,    # list of uint16, length == toBlock - fromBlock + 1
 //!                       # entry i = number of user txs in block (fromBlock + i)
 //!                       # 0 means empty block
@@ -17,16 +18,11 @@
 //!   ])
 //!
 //!   tagByte:
-//!     0x00  the current (and only) format
+//!     0x00  format shown above
 //! ```
 //!
-//! Single format on the wire today; the one-byte tag prefix leaves
-//! room to add another later without breaking the decoder.
-//!
-//! `fromBlock` and `toBlock` are **not** in this encoding. Callers supply the
-//! absolute block range from their surrounding protocol context; this codec
-//! only preserves the number of covered blocks and each block's transaction
-//! count.
+//! `toBlock` is derived from `fromBlock + blockTxCounts.len() - 1`; carrying it
+//! separately would be redundant.
 //!
 //! Decode invariants enforced (§8.3):
 //!  - `sum(blockTxCounts) == len(transactions)`
@@ -41,9 +37,7 @@ use alloy_rlp::{Decodable, Encodable};
 /// A raw EIP-2718 signed transaction. Opaque to this crate.
 pub type RawTx = Vec<u8>;
 
-/// Tag byte for the current (and only) calldata format. The one-byte
-/// prefix lets a future format swap add a new tag without ambiguity;
-/// [`decode`] dispatches on it.
+/// Tag byte for the calldata format.
 pub const TAG_CALLDATA: u8 = 0x00;
 
 /// Convenience [`Result`] alias.
@@ -55,9 +49,15 @@ pub enum CodecError {
     /// Payload was empty or missing the tag byte.
     #[error("payload too short ({0} bytes)")]
     TooShort(usize),
-    /// Tag byte didn't match the current format.
+    /// Tag byte didn't match the supported format.
     #[error("unsupported tag byte 0x{0:02x}; expected 0x{TAG_CALLDATA:02x}")]
     UnsupportedTag(u8),
+    /// Current-format payloads cannot include the genesis block.
+    #[error("fromBlock must be greater than zero")]
+    ZeroFromBlock,
+    /// The explicit start plus the encoded block count exceeded `u64`.
+    #[error("block range overflows u64: fromBlock {from_block}, block count {block_count}")]
+    BlockRangeOverflow { from_block: u64, block_count: u64 },
     /// RLP decoding failed.
     #[error("rlp decode failed: {0}")]
     Rlp(#[from] alloy_rlp::Error),
@@ -72,6 +72,8 @@ pub enum CodecError {
 /// A decoded batch payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedBatch {
+    /// First L2 block covered.
+    pub from_block: u64,
     /// Per-block user-tx counts. Length = number of L2 blocks covered.
     pub block_tx_counts: Vec<u16>,
     /// Flat list of raw EIP-2718 signed transactions in block-major order.
@@ -102,7 +104,15 @@ impl DecodedBatch {
 /// # Errors
 ///
 /// - [`CodecError::BlockTxCountOverflow`] if any block has > `u16::MAX` txs.
-pub fn encode(blocks: &[Vec<RawTx>], l2_entries: &[Vec<u8>]) -> CodecResult<Vec<u8>> {
+pub fn encode(
+    from_block: u64,
+    blocks: &[Vec<RawTx>],
+    l2_entries: &[Vec<u8>],
+) -> CodecResult<Vec<u8>> {
+    if from_block == 0 {
+        return Err(CodecError::ZeroFromBlock);
+    }
+    validate_range(from_block, blocks.len())?;
     let mut block_tx_counts: Vec<u16> = Vec::with_capacity(blocks.len());
     for (i, b) in blocks.iter().enumerate() {
         let n = u64::try_from(b.len()).unwrap_or(u64::MAX);
@@ -111,6 +121,7 @@ pub fn encode(blocks: &[Vec<RawTx>], l2_entries: &[Vec<u8>]) -> CodecResult<Vec<
     }
     let transactions: Vec<RawTx> = blocks.iter().flatten().cloned().collect();
     let body = Body {
+        from_block,
         block_tx_counts,
         transactions,
         l2_entries: l2_entries.to_vec(),
@@ -126,8 +137,7 @@ pub fn encode(blocks: &[Vec<RawTx>], l2_entries: &[Vec<u8>]) -> CodecResult<Vec<
 /// # Errors
 ///
 /// - [`CodecError::TooShort`] if `payload` is empty.
-/// - [`CodecError::UnsupportedTag`] if the leading byte isn't
-///   [`TAG_CALLDATA`].
+/// - [`CodecError::UnsupportedTag`] if the leading byte isn't supported.
 /// - [`CodecError::Rlp`] if the RLP body is malformed.
 /// - [`CodecError::TxCountMismatch`] if `sum(blockTxCounts) != transactions.len()`.
 pub fn decode(payload: &[u8]) -> CodecResult<DecodedBatch> {
@@ -138,20 +148,43 @@ pub fn decode(payload: &[u8]) -> CodecResult<DecodedBatch> {
         return Err(CodecError::UnsupportedTag(tag));
     }
     let body = Body::decode(&mut &rest[..])?;
-    let expected: u64 = body.block_tx_counts.iter().map(|n| u64::from(*n)).sum();
-    let got = body.transactions.len() as u64;
+    if body.from_block == 0 {
+        return Err(CodecError::ZeroFromBlock);
+    }
+    validate_range(body.from_block, body.block_tx_counts.len())?;
+    let Body {
+        from_block,
+        block_tx_counts,
+        transactions,
+        l2_entries,
+    } = body;
+    let expected: u64 = block_tx_counts.iter().map(|n| u64::from(*n)).sum();
+    let got = transactions.len() as u64;
     if expected != got {
         return Err(CodecError::TxCountMismatch { expected, got });
     }
     Ok(DecodedBatch {
-        block_tx_counts: body.block_tx_counts,
-        transactions: body.transactions,
-        l2_entries: body.l2_entries,
+        from_block,
+        block_tx_counts,
+        transactions,
+        l2_entries,
     })
+}
+
+fn validate_range(from_block: u64, block_count: usize) -> CodecResult<()> {
+    let block_count = u64::try_from(block_count).unwrap_or(u64::MAX);
+    if block_count != 0 && from_block.checked_add(block_count - 1).is_none() {
+        return Err(CodecError::BlockRangeOverflow {
+            from_block,
+            block_count,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, alloy_rlp::RlpEncodable, alloy_rlp::RlpDecodable)]
 struct Body {
+    from_block: u64,
     block_tx_counts: Vec<u16>,
     transactions: Vec<RawTx>,
     l2_entries: Vec<Vec<u8>>,
@@ -168,8 +201,9 @@ mod tests {
     #[test]
     fn roundtrip_single_block_with_two_txs() {
         let blocks = vec![vec![tx(0xa1, 64), tx(0xa2, 32)]];
-        let bytes = encode(&blocks, &[]).unwrap();
+        let bytes = encode(41, &blocks, &[]).unwrap();
         let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.from_block, 41);
         assert_eq!(decoded.block_tx_counts, vec![2u16]);
         assert_eq!(decoded.transactions.len(), 2);
         assert!(decoded.l2_entries.is_empty());
@@ -184,8 +218,9 @@ mod tests {
             vec![],
             vec![tx(0x05, 24)],
         ];
-        let bytes = encode(&blocks, &[]).unwrap();
+        let bytes = encode(41, &blocks, &[]).unwrap();
         let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.from_block, 41);
         assert_eq!(decoded.block_tx_counts, vec![1, 0, 3, 0, 1]);
         assert_eq!(decoded.transactions.len(), 5);
         assert_eq!(decoded.block_count(), 5);
@@ -193,20 +228,39 @@ mod tests {
 
     #[test]
     fn tag_byte_is_first_byte() {
-        let bytes = encode(&[vec![]], &[]).unwrap();
+        let bytes = encode(41, &[vec![]], &[]).unwrap();
         assert_eq!(bytes[0], TAG_CALLDATA);
     }
 
     #[test]
     fn block_overflow_rejected_on_encode() {
         let blocks = vec![vec![tx(0, 1); usize::from(u16::MAX) + 1]];
-        let err = encode(&blocks, &[]).unwrap_err();
+        let err = encode(41, &blocks, &[]).unwrap_err();
         assert!(matches!(err, CodecError::BlockTxCountOverflow(_, 0)));
     }
 
     #[test]
     fn too_short_rejected_on_decode() {
         assert!(matches!(decode(&[]).unwrap_err(), CodecError::TooShort(_)));
+    }
+
+    #[test]
+    fn zero_from_block_rejected() {
+        assert!(matches!(
+            encode(0, &[vec![]], &[]).unwrap_err(),
+            CodecError::ZeroFromBlock
+        ));
+    }
+
+    #[test]
+    fn overflowing_block_range_rejected() {
+        assert!(matches!(
+            encode(u64::MAX, &[vec![], vec![]], &[]).unwrap_err(),
+            CodecError::BlockRangeOverflow {
+                from_block: u64::MAX,
+                block_count: 2
+            }
+        ));
     }
 
     #[test]
@@ -234,11 +288,30 @@ mod tests {
             vec![0xde, 0xad, 0xbe, 0xef],
             vec![0xca, 0xfe, 0xba, 0xbe, 0x00, 0x11, 0x22, 0x33],
         ];
-        let bytes = encode(&blocks, &l2_entries).unwrap();
+        let bytes = encode(41, &blocks, &l2_entries).unwrap();
         assert_eq!(bytes[0], TAG_CALLDATA);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.block_tx_counts, vec![0u16, 1u16, 0u16]);
         assert_eq!(decoded.transactions.len(), 1);
         assert_eq!(decoded.l2_entries, l2_entries);
+    }
+
+    #[test]
+    fn payload_without_from_block_is_rejected() {
+        #[derive(alloy_rlp::RlpEncodable)]
+        struct HeightUnboundBody {
+            block_tx_counts: Vec<u16>,
+            transactions: Vec<RawTx>,
+            l2_entries: Vec<Vec<u8>>,
+        }
+
+        let body = HeightUnboundBody {
+            block_tx_counts: vec![1, 0],
+            transactions: vec![tx(0xa1, 8)],
+            l2_entries: vec![],
+        };
+        let mut encoded = vec![TAG_CALLDATA];
+        body.encode(&mut encoded);
+        assert!(matches!(decode(&encoded), Err(CodecError::Rlp(_))));
     }
 }

@@ -553,13 +553,15 @@ nonnegative `int256`.
 The batch `callData` MUST have this exact shape:
 
 ```text
-0x00 || RLP([blockTxCounts, transactions, l2Entries])
+0x00 || RLP([fromBlock, blockTxCounts, transactions, l2Entries])
 ```
 
-There MUST be no trailing bytes or fields. `blockTxCounts` contains one RLP
-`u16` per validated block. `transactions` and `l2Entries` are RLP lists whose
-items are themselves RLP lists of byte values; decoding each item MUST recover
-the exact EIP-2718 transaction bytes or ABI sidecar bytes being compared.
+There MUST be no trailing bytes or fields. `fromBlock` MUST equal the first
+validated block number. `blockTxCounts` contains one RLP `u16` per validated
+block; the terminal block number is derived from these two values rather than
+encoded redundantly. `transactions` and `l2Entries` are RLP lists whose items
+are themselves RLP lists of byte values; decoding each item MUST recover the
+exact EIP-2718 transaction bytes or ABI sidecar bytes being compared.
 
 For every block before the terminal block, `blockTxCounts` MUST equal the exact
 validated transaction count and every transaction byte string MUST match in

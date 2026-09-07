@@ -15,7 +15,7 @@ use crate::cancel::CancellationToken;
 use crate::testkit::TEST_SYSTEM_ADDRESS;
 use crate::{settlement, validate};
 
-const PINNED_PROTOCOL_COMMIT: &str = "6fcc90b65063831cb7797e9fa361004064d28f9f";
+const PINNED_CAPTURE_PROTOCOL_COMMIT: &str = "6fcc90b65063831cb7797e9fa361004064d28f9f";
 
 fn fixture_hex(value: &str) -> Vec<u8> {
     let value = value.trim();
@@ -41,14 +41,13 @@ fn fixture_u64(value: &serde_json::Value, field: &str) -> u64 {
 }
 
 #[tokio::test]
-async fn captured_current_protocol_window_is_validated_and_signed() {
+async fn captured_window_is_validated_and_signed_with_current_range_binding() {
     const FIXTURE: &str = "captured-anchor-40155";
 
     let oracle = fixture_json(FIXTURE, "oracle.json");
-    let expected_hash = fixture_str(&oracle, "public_inputs_hash")
+    let captured_hash = fixture_str(&oracle, "public_inputs_hash")
         .parse::<B256>()
         .unwrap();
-    let expected_signature = fixture_hex(fixture_str(&oracle, "expected_test_signature"));
     let captured_attester = fixture_str(&oracle, "attester").parse::<Address>().unwrap();
     let proof_system = fixture_str(&oracle, "proof_system")
         .parse::<Address>()
@@ -65,24 +64,24 @@ async fn captured_current_protocol_window_is_validated_and_signed() {
 
     assert_eq!(
         fixture_str(&oracle, "protocol_commit"),
-        PINNED_PROTOCOL_COMMIT
+        PINNED_CAPTURE_PROTOCOL_COMMIT
     );
     assert_eq!(rollup_id, 1);
 
-    let calldata = fixture_hex(&fixture(FIXTURE, "postbatch.hex"));
+    let captured_calldata = fixture_hex(&fixture(FIXTURE, "postbatch.hex"));
     assert_eq!(
-        calldata.len(),
+        captured_calldata.len(),
         usize::try_from(fixture_u64(&oracle, "postbatch_calldata_bytes")).unwrap()
     );
-    let captured_batch = settlement::decode_canonical_post_batch(calldata.clone()).unwrap();
-    assert_eq!(captured_batch.proofSystems.as_slice(), &[proof_system]);
-    let [captured_proof] = captured_batch.proofs.as_slice() else {
+    let mut batch = settlement::decode_canonical_post_batch(captured_calldata).unwrap();
+    assert_eq!(batch.proofSystems.as_slice(), &[proof_system]);
+    let [captured_proof] = batch.proofs.as_slice() else {
         panic!("captured batch must carry exactly one proof");
     };
     let captured_signature = Signature::try_from(captured_proof.as_ref()).unwrap();
     assert_eq!(
         captured_signature
-            .recover_address_from_prehash(&expected_hash)
+            .recover_address_from_prehash(&captured_hash)
             .unwrap(),
         captured_attester,
     );
@@ -93,6 +92,16 @@ async fn captured_current_protocol_window_is_validated_and_signed() {
         recorded_blocks.len(),
         usize::try_from(to - from + 1).unwrap()
     );
+    batch.callData =
+        settlement::encode_da_payload(from, &vec![Vec::new(); recorded_blocks.len()], &[]).into();
+    let expected_hash = settlement::recompute_public_input_hash(
+        &batch,
+        proof_system_vkey,
+        expected_rollup_id(rollup_id),
+        proof_system,
+    )
+    .unwrap();
+    let calldata = eez_protocol::entries::encode_postbatch(&batch);
     let mut window = vec![ProveChunk {
         kind: Some(prove_chunk::Kind::Header(ProveHeader {
             rollup_id,
@@ -148,9 +157,7 @@ async fn captured_current_protocol_window_is_validated_and_signed() {
     );
 
     let response = TestServer::new(state).await.attest(window).await;
-
     assert_eq!(response.public_inputs_hash, expected_hash.as_slice());
-    assert_eq!(response.signature, expected_signature);
     let signature = Signature::try_from(response.signature.as_slice()).unwrap();
     assert_eq!(
         signature

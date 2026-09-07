@@ -20,6 +20,8 @@ pub(crate) enum DaPayloadError {
     Decode { reason: String },
     #[error("batch callData has {trailing} trailing bytes")]
     TrailingBytes { trailing: usize },
+    #[error("batch callData starts at block {actual}; validated window starts at {expected}")]
+    FromBlock { expected: u64, actual: u64 },
     #[error("batch callData covers {actual} blocks; validated window has {expected}")]
     BlockCount { expected: usize, actual: usize },
     #[error("batch callData contains unexpected {field} items after the expected {expected}")]
@@ -79,6 +81,7 @@ const CALL_DATA_TAG: u8 = 0;
 /// Keeping slices into the original calldata avoids copying transactions and
 /// effect sidecars supplied by an untrusted composer.
 struct DaPayloadCursor<'a> {
+    from_block: u64,
     block_tx_counts: &'a [u8],
     transactions: &'a [u8],
     l2_entries: &'a [u8],
@@ -103,6 +106,8 @@ impl<'a> DaPayloadCursor<'a> {
             });
         }
 
+        let from_block =
+            u64::decode(&mut body).map_err(|error| invalid_da_payload(error.to_string()))?;
         let block_tx_counts = decode_list(&mut body)?;
         let transactions = decode_list(&mut body)?;
         let l2_entries = decode_list(&mut body)?;
@@ -110,6 +115,7 @@ impl<'a> DaPayloadCursor<'a> {
             return Err(invalid_da_payload("payload body has unexpected fields"));
         }
         Ok(Self {
+            from_block,
             block_tx_counts,
             transactions,
             l2_entries,
@@ -190,7 +196,17 @@ fn verify_encoded_da_payload<'a, I>(
 where
     I: ExactSizeIterator<Item = (u64, &'a [u8])>,
 {
+    let mut intermediate_blocks = intermediate_blocks.peekable();
+    let expected_from_block = intermediate_blocks
+        .peek()
+        .map_or(settling_block.0, |(number, _)| *number);
     let mut payload_cursor = DaPayloadCursor::decode(encoded_payload)?;
+    if payload_cursor.from_block != expected_from_block {
+        return Err(DaPayloadError::FromBlock {
+            expected: expected_from_block,
+            actual: payload_cursor.from_block,
+        });
+    }
     let expected_blocks = intermediate_blocks.len() + 1;
     let omitted_terminal_count = outbound_effects
         .len()
@@ -559,17 +575,23 @@ pub(super) fn encoded_bytes_match(
 }
 
 #[cfg(test)]
-pub(crate) fn encode_da_payload(blocks: &[Vec<Vec<u8>>], l2_entries: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn encode_da_payload(
+    from_block: u64,
+    blocks: &[Vec<Vec<u8>>],
+    l2_entries: &[Vec<u8>],
+) -> Vec<u8> {
     use alloy_rlp::Encodable as _;
 
     #[derive(alloy_rlp::RlpEncodable)]
     struct Body {
+        from_block: u64,
         block_tx_counts: Vec<u16>,
         transactions: Vec<Vec<u8>>,
         l2_entries: Vec<Vec<u8>>,
     }
 
     let body = Body {
+        from_block,
         block_tx_counts: blocks
             .iter()
             .map(|block| u16::try_from(block.len()).expect("test block exceeds u16::MAX txs"))

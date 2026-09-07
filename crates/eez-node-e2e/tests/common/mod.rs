@@ -66,6 +66,13 @@ static LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static ASSIGNED_PORTS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 static WORKSPACE_BUILD_LOCK: Mutex<()> = Mutex::new(());
 
+const DIVERGENCE_FAILURE_MARKERS: &[&str] = &[
+    "eez.deriver.state.diverged",
+    "local L2 state root differs",
+    "engine rejected safe/finalized FCU",
+    "payload builder returned no payload",
+];
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -1596,18 +1603,32 @@ impl NodeHandle {
 
     pub fn assert_no_divergence_failure_logs(&self) {
         self.assert_no_process_death();
-        let patterns = [
-            "eez.deriver.state.diverged",
-            "local L2 state root differs",
-            "engine rejected safe/finalized FCU",
-            "payload builder returned no payload",
-        ];
         assert_eq!(
-            self.log_count_matching(&patterns).unwrap(),
+            self.log_count_matching(DIVERGENCE_FAILURE_MARKERS).unwrap(),
             0,
             "{} logged a divergence/fatal-class failure",
             self.name,
         );
+    }
+
+    /// Return a failure that makes continued progress impossible. Long waits
+    /// poll this so a deterministic deriver error is reported immediately
+    /// instead of being mislabeled as a slow CI timeout.
+    pub fn progress_failure(&self) -> Option<String> {
+        if let Some(status) = self.exit_status() {
+            return Some(format!(
+                "{} exited unexpectedly with {status}; log:\n{}",
+                self.name,
+                self.log_tail(80),
+            ));
+        }
+        let lines = self.log_lines_matching(DIVERGENCE_FAILURE_MARKERS, 20);
+        (!lines.is_empty()).then(|| {
+            format!(
+                "{} logged a divergence/fatal-class failure:\n{lines}",
+                self.name
+            )
+        })
     }
 
     pub fn log_count_matching(&self, patterns: &[&str]) -> Result<usize> {
@@ -1958,6 +1979,26 @@ impl<'a> Chain<'a> {
     /// Wait until ≥ `n` `BatchPosted` events visible.
     pub async fn wait_for_batches(&self, n: usize, timeout: Duration) -> Result<usize> {
         wait_for(timeout, || async {
+            let count = self.batches_posted().await?;
+            Ok((count >= n).then_some(count))
+        })
+        .await
+    }
+
+    /// Wait for L1 batch progress, but stop as soon as a watched node reports
+    /// a deterministic failure that makes the target unreachable.
+    pub async fn wait_for_batches_or_node_failure(
+        &self,
+        n: usize,
+        nodes: &[&NodeHandle],
+        timeout: Duration,
+    ) -> Result<usize> {
+        wait_for(timeout, || async {
+            for node in nodes {
+                if let Some(failure) = node.progress_failure() {
+                    bail!(failure);
+                }
+            }
             let count = self.batches_posted().await?;
             Ok((count >= n).then_some(count))
         })
