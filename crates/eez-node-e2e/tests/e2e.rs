@@ -3,19 +3,132 @@
 use std::time::Duration;
 
 use alloy_primitives::{B256, U256};
+use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::BlockNumberOrTag;
 
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
-    ANVIL_KEY_6, Harness, NodeBinary, NodeConfig, NodeHandle, block_number_and_hash_at,
-    override_env, reorg_genesis_state_root, safe_block_state_root,
-    send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
+    ANVIL_KEY_6, Harness, L2_SYSTEM_KEY, NodeBinary, NodeConfig, NodeHandle,
+    block_number_and_hash_at, override_env, reorg_genesis_state_root, safe_block_state_root,
+    send_l2_value_transfer, send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
     wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
     wait_for_safe_prefix_convergence, wait_for_safe_state,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// A follower replaces the full divergent suffix of an intra-batch fork.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_composer_intra_batch_suffix_replay_converges() {
+    let harness = Harness::for_reorg().await.unwrap();
+    let chain = harness.chain();
+    let genesis = harness.l2_genesis_path();
+    let composer_cfg = NodeConfig {
+        genesis_path: Some(genesis),
+        ..Default::default()
+    };
+    let follower_cfg = NodeConfig {
+        binary: NodeBinary::Follower,
+        genesis_path: Some(genesis),
+    };
+
+    let primary_dir = tempfile::tempdir().unwrap();
+    let mirror_dir = tempfile::tempdir().unwrap();
+    // The deterministic system key is not funded on Anvil. Both composers can
+    // therefore sequence and prove, but neither can land a batch while the two
+    // divergent local histories are being staged.
+    let primary_stage_env = harness.env_for(L2_SYSTEM_KEY, true).await.unwrap();
+    let mirror_stage_env = harness.env_for(L2_SYSTEM_KEY, true).await.unwrap();
+    let (primary, mirror) = tokio::try_join!(
+        NodeHandle::start_with_datadir(
+            "intra-primary-stage",
+            primary_dir.path(),
+            &composer_cfg,
+            &primary_stage_env,
+        ),
+        NodeHandle::start_with_datadir(
+            "intra-mirror-stage",
+            mirror_dir.path(),
+            &composer_cfg,
+            &mirror_stage_env,
+        ),
+    )
+    .unwrap();
+
+    let primary_rpc = primary.l2_rpc_url();
+    let primary_provider = ProviderBuilder::new().connect_http(primary_rpc.parse().unwrap());
+    let tx_hash = send_l2_value_transfer(&primary_rpc, ANVIL_KEY_1, ANVIL_ADDR, U256::from(1u64))
+        .await
+        .expect("submit divergent L2 transaction to primary composer");
+    let receipt = wait_for(DEFAULT_TIMEOUT, || async {
+        Ok(primary_provider.get_transaction_receipt(tx_hash).await?)
+    })
+    .await
+    .unwrap_or_else(|err| panic!("wait for L2 tx {tx_hash} inclusion: {err:#}"));
+    assert!(receipt.status(), "L2 tx {tx_hash} reverted");
+    let included_block = receipt
+        .block_number
+        .unwrap_or_else(|| panic!("included L2 tx {tx_hash} missing block_number"));
+    assert!(included_block > 0, "transaction must not land in genesis");
+
+    let target = included_block + 3;
+    let (primary_target, mirror_target) = tokio::try_join!(
+        wait_for_latest_height(&primary, target, DEFAULT_TIMEOUT),
+        wait_for_latest_height(&mirror, target, DEFAULT_TIMEOUT),
+    )
+    .expect("composers did not stage a multi-block suffix");
+    assert_ne!(
+        primary_target.hash, mirror_target.hash,
+        "the staged suffix must actually diverge",
+    );
+    assert_eq!(
+        chain.batches_posted().await.unwrap(),
+        0,
+        "unfunded staging composers must not settle either history",
+    );
+
+    drop(primary);
+    drop(mirror);
+
+    let follower_env = override_env(
+        harness.follower_env(None).await.unwrap(),
+        "RUST_LOG",
+        "warn,eez_deriver=info,eez_l1=info",
+    );
+    let mirror = NodeHandle::start_with_datadir(
+        "intra-mirror-follow",
+        mirror_dir.path(),
+        &follower_cfg,
+        &follower_env,
+    )
+    .await
+    .unwrap();
+    let composer_env = override_env(
+        harness.env_for(ANVIL_KEY, true).await.unwrap(),
+        "RUST_LOG",
+        "warn,eez_composer=info,eez_deriver=info,eez_l1=info,eez_prover_client=info",
+    );
+    let primary = NodeHandle::start_with_datadir(
+        "intra-primary-compose",
+        primary_dir.path(),
+        &composer_cfg,
+        &composer_env,
+    )
+    .await
+    .unwrap();
+
+    chain
+        .wait_for_batches(1, DEFAULT_TIMEOUT)
+        .await
+        .expect("primary composer did not post its staged multi-block batch");
+    wait_for_safe_prefix_convergence(&[&primary, &mirror], target, DEFAULT_TIMEOUT)
+        .await
+        .expect("follower did not replace the complete divergent suffix");
+
+    primary.assert_no_divergence_failure_logs();
+    mirror.assert_no_divergence_failure_logs();
+}
 
 /// Builder mode, sustained operation through a restart. Asserts every
 /// observable invariant in one place:
@@ -722,20 +835,54 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
     .await
     .expect("follower safe head did not reach a non-genesis attested stateRoot while on the rogue");
 
-    // Prove the rogue unsafe source was actually polled.
-    assert!(
-        follower
-            .log_count_matching(&[
-                "reth accepted sequencer head as a sync target",
-                "sequencer head does not descend from the L1-derived safe block",
-            ])
-            .unwrap()
-            > 0,
-        "follower never processed a rogue unsafe head",
+    // Stop canonical batch production and let any already-submitted batch land
+    // before fixing the safe anchor used by this assertion.
+    drop(seq);
+    chain
+        .wait_for_l1_blocks(1, Duration::from_secs(15))
+        .await
+        .expect("L1 did not flush after stopping the composer");
+    wait_for_safe_state(
+        &follower,
+        &chain,
+        reorg_genesis_state_root().unwrap(),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("follower did not derive the composer's final landed batch");
+    let safe_before = block_number_and_hash_at(&follower.l2_rpc_url(), BlockNumberOrTag::Safe)
+        .await
+        .unwrap()
+        .expect("follower has a safe head");
+
+    // The rogue RPC is Anvil. Force its unrelated block number above the L2
+    // safe height, making its ancestry locally unknown rather than a
+    // timing-dependent equal-height/below-safe conflict.
+    while chain.block_number().await.unwrap() <= safe_before.0 {
+        chain.mine().await.unwrap();
+    }
+    let syncing_pattern = ["reth accepted sequencer head as a sync target"];
+    let syncing_before = follower.log_count_matching(&syncing_pattern).unwrap();
+    wait_for(DEFAULT_TIMEOUT, || {
+        std::future::ready(
+            follower
+                .log_count_matching(&syncing_pattern)
+                .map(|count| (count > syncing_before).then_some(())),
+        )
+    })
+    .await
+    .expect("follower did not offer the unknown rogue head as a sync target");
+
+    let safe_after = block_number_and_hash_at(&follower.l2_rpc_url(), BlockNumberOrTag::Safe)
+        .await
+        .unwrap();
+    assert_eq!(
+        safe_after,
+        Some(safe_before),
+        "processing the rogue sync target must not move the L1-derived safe head",
     );
 
     follower.assert_no_process_death();
-    seq.assert_no_process_death();
 }
 
 /// A late follower backfills the complete pre-existing batch history.
