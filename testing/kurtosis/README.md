@@ -412,12 +412,16 @@ chaining in each direction. It requires each group of three transactions to
 share one Sync block and asserts every ordered return: repeated destination
 calls return `changed = true, false, false`, source-derived calls send
 `1, 2, 3`, and the mixed sequence proves that fixed and source-derived calls
-see one another's intermediate state. It also places a deployed non-proxy
-between two valid inbound calls and verifies that only the poison transaction
-is evicted while both ordered survivors settle. A final mixed-direction drain
-verifies that an outbound source transaction and inbound delivery share the
-canonical L2 Sync block. Every scenario also verifies bundle settlement,
-proof-signer acceptance, and L1/L2 state-root convergence.
+see one another's intermediate state. An isolated inbound scenario makes two
+identical proxy calls from one source transaction, verifies the ordered
+`changed = true, false` results, and confirms its `postBatch` and user
+transaction landed in the same builder-produced L1 block. The suite also
+places a deployed non-proxy between two valid inbound calls and verifies that
+only the poison transaction is evicted while both ordered survivors settle. A
+final mixed-direction drain verifies that an outbound source transaction and
+inbound delivery share the canonical L2 Sync block. Every scenario also
+verifies bundle settlement, proof-signer acceptance, and L1/L2 state-root
+convergence.
 
 ### Run all included workloads
 

@@ -112,6 +112,18 @@ wrapped_result() {
     cast decode-abi --json 'wrapped()(uint256,bool,bool,uint256)' "$data" | jq -c .
 }
 
+wrapped_results() {
+    local hash="$1" rpc="$2" wrapper="$3" receipt data
+    receipt=$(receipt_json "$hash" "$rpc")
+    data=$(jq -er --arg address "${wrapper,,}" --arg topic "${WRAPPED_TOPIC,,}" \
+        '.result.logs[] | select((.address | ascii_downcase) == $address)
+          | select((.topics[0] | ascii_downcase) == $topic) | .data' \
+        <<<"$receipt")
+    while IFS= read -r event_data; do
+        cast decode-abi --json 'wrapped()(uint256,bool,bool,uint256)' "$event_data" | jq -c .
+    done <<<"$data"
+}
+
 unique_receipt_block() {
     local rpc="$1"
     shift
@@ -486,6 +498,85 @@ run_poison_mid_bundle_scenario() {
     assert_root_convergence "$sync_height"
 }
 
+run_repeated_inbound_source_transaction_scenario() {
+    local target proxy wrapper nonce gas_price raw hash result
+    local node_baseline signer_baseline deadline target_logs target_blocks sync_height
+    local source_block source_block_dec evidence rich_bundle settled_bundle
+
+    echo
+    echo "==> repeated inbound calls in one source transaction: deploying an isolated state chain"
+    target=$(forge_deploy "$L2" "$L2_DEPLOY_KEY" DeployValueL2.s.sol:DeployValueL2 \
+        'run(uint256)' 0 | grab_address EEZ_VALUE_ADDRESS)
+    proxy=$(forge_deploy "$L1" "$L1_DEPLOY_KEY" CreateValueProxy.s.sol:CreateValueProxy \
+        'run(address,address,uint64)' "$EEZ_REGISTRY_ADDRESS" "$target" "$EEZ_ROLLUP_ID" \
+        | grab_address EEZ_VALUE_PROXY)
+    wrapper=$(forge_deploy "$L1" "$L1_DEPLOY_KEY" DeploySetterWrapperL1.s.sol:DeploySetterWrapperL1 \
+        'run(address)' "$proxy" | grab_address EEZ_SETTER_WRAPPER)
+    [[ -n "$target" && -n "$proxy" && -n "$wrapper" ]] \
+        || { echo "repeated-inbound deployment failed" >&2; return 1; }
+
+    nonce=$(retry cast nonce "$INBOUND_SENDER" --rpc-url "$L1")
+    gas_price=$(gas_price_for "$L1")
+    raw=$(cast mktx --chain-id "$(cast chain-id --rpc-url "$L1")" \
+        --private-key "$INBOUND_KEY" --nonce "$nonce" --gas-limit 1200000 \
+        --gas-price "$gas_price" --priority-gas-price "$PRIORITY_GAS_PRICE" --rpc-url "$L1" \
+        "$wrapper" 'setSameValueTwice(uint256)' 73)
+    [[ "$raw" =~ ^0x[0-9a-fA-F]+$ ]] \
+        || { echo "could not build repeated-inbound transaction" >&2; return 1; }
+    hash=$(cast keccak "$raw")
+
+    wait_for_sync_boundary
+    refresh_node_log
+    refresh_signer_log
+    node_baseline=$(wc -l <"$NODE_LOG")
+    signer_baseline=$(wc -l <"$SIGNER_LOG")
+    send_front "$L1F" "$raw" "$hash"
+
+    wait_for_receipts "$L1" "$hash"
+    result=$(wrapped_results "$hash" "$L1" "$wrapper" | jq -sc .)
+    [[ "$result" == '[[73,true,true,73],[73,true,false,73]]' ]] \
+        || { echo "repeated inbound call returned $result" >&2; return 1; }
+    [[ $(retry cast call "$wrapper" 'completedProxyCalls()(uint256)' --rpc-url "$L1") == "2" ]] \
+        || { echo "repeated inbound source transaction did not complete both proxy calls" >&2; return 1; }
+    [[ $(retry cast call "$wrapper" 'lastChanged()(bool)' --rpc-url "$L1") == "false" ]] \
+        || { echo "second identical inbound call did not observe the first write" >&2; return 1; }
+    [[ $(retry cast call "$target" 'value()(uint256)' --rpc-url "$L2") == "73" ]] \
+        || { echo "repeated inbound destination value did not converge to 73" >&2; return 1; }
+
+    deadline=$((SECONDS + RECEIPT_WAIT_SECS))
+    target_logs='[]'
+    while (( SECONDS < deadline )); do
+        target_logs=$(retry cast logs --address "$target" --from-block 0 --to-block latest \
+            'ValueSet(address,uint256)' --rpc-url "$L2" --json)
+        (( $(jq -r 'length' <<<"$target_logs") >= 2 )) && break
+        sleep 3
+    done
+    [[ $(jq -r 'length' <<<"$target_logs") == "2" ]] \
+        || { echo "repeated inbound transaction did not produce exactly two destination effects" >&2; return 1; }
+    target_blocks=$(jq -r '[.[].blockNumber] | unique | .[]' <<<"$target_logs")
+    [[ $(wc -l <<<"$target_blocks" | tr -d ' ') == 1 ]] \
+        || { echo "repeated inbound destination calls split across Sync blocks" >&2; return 1; }
+    sync_height=$(cast to-dec "$target_blocks")
+
+    assert_proof_for_height "$sync_height" "$node_baseline" "$signer_baseline"
+    assert_root_convergence "$sync_height"
+
+    source_block=$(receipt_json "$hash" "$L1" | jq -er '.result.blockNumber')
+    source_block_dec=$(cast to-dec "$source_block")
+    refresh_node_log
+    evidence=$(sed -n "$((node_baseline + 1)),\$p" "$NODE_LOG" | strip_ansi)
+    rich_bundle=$(grep -F '"event_name":"eez.composer.bundle.dispatched"' <<<"$evidence" \
+        | grep -F "\"sync_height\":$sync_height," | grep -F '"tx_count":2' | tail -1 || true)
+    settled_bundle=$(grep -F '"event_name":"eez.composer.bundle.observed"' <<<"$evidence" \
+        | grep -F "\"sync_height\":$sync_height," \
+        | grep -F "l1_block: $source_block_dec" | grep -F '"settled":true' | tail -1 || true)
+    [[ -n "$rich_bundle" && -n "$settled_bundle" ]] || {
+        echo "postBatch and repeated-inbound user transaction were not proven in one atomic L1 bundle" >&2
+        return 1
+    }
+    echo "    ✓ both identical calls preserved order; postBatch and user transaction landed in L1 block $source_block_dec"
+}
+
 echo "════════════════════════════════════════════════════════════════"
 echo " STATE CHAINING TEST (kurtosis)"
 echo "════════════════════════════════════════════════════════════════"
@@ -535,6 +626,7 @@ run_scenario outbound mixed "$L2" "$L2F" "$OUTBOUND_KEY" "$OUTBOUND_SENDER" \
     "$OUTBOUND_WRAPPER" "$L1_VALUE" "$L1"
 run_poison_mid_bundle_scenario
 run_mixed_direction_scenario
+run_repeated_inbound_source_transaction_scenario
 
 echo
 echo "==> STATE CHAINING TEST PASSED"

@@ -937,25 +937,40 @@ async fn outbound_multiple_proxy_calls_in_one_transaction_are_evicted() {
     .expect("duplicate outbound proxy-call transaction must be admitted");
 
     let tx_hash = tx.to_string();
-    wait_for(SETTLE_TIMEOUT, || async {
-        let rejected = w
-            .node
-            .signals_since(signal_cursor)?
-            .into_iter()
-            .any(|signal| {
-                signal.name == signals::COMPOSER_OUTBOUND_MULTICALL_UNSUPPORTED
-                    && signal
-                        .fields
-                        .get("tx_hash")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(tx_hash.as_str())
-                    && signal.u64("rollup_id").ok() == Some(w.cfg.rollup_id)
-                    && signal.u64("entries").ok() == Some(2)
-            });
-        Ok(rejected.then_some(()))
+    let rejected_as_multicall = wait_for(SETTLE_TIMEOUT, || async {
+        let records = w.node.signals_since(signal_cursor)?;
+        let rejected_as_multicall = records.iter().any(|signal| {
+            signal.name == signals::COMPOSER_OUTBOUND_MULTICALL_UNSUPPORTED
+                && signal
+                    .fields
+                    .get("tx_hash")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(tx_hash.as_str())
+                && signal.u64("rollup_id").ok() == Some(w.cfg.rollup_id)
+                && signal.u64("entries").ok() == Some(2)
+        });
+        if rejected_as_multicall {
+            return Ok(Some(true));
+        }
+        // A generic poison eviction is terminal too. Surface it immediately as
+        // the wrong classification instead of waiting 90 seconds for a signal
+        // that can no longer arrive.
+        let generically_evicted = records.iter().any(|signal| {
+            signal.name == signals::COMPOSER_POISON_EVICTION_COMPLETED
+                && signal
+                    .fields
+                    .get("tx_hash")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(tx_hash.as_str())
+        });
+        Ok(generically_evicted.then_some(false))
     })
     .await
     .expect("composer did not report the unsupported outbound multicall");
+    assert!(
+        rejected_as_multicall,
+        "composer poison-evicted the outbound transaction before classifying its two proxy calls as an unsupported multicall",
+    );
 
     wait_for_poison_eviction(
         &w,

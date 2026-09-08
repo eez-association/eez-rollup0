@@ -13,7 +13,7 @@ pub mod signals;
 use std::{
     collections::HashSet,
     fmt::Write as _,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         Arc, LazyLock, Mutex,
@@ -63,7 +63,7 @@ pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E
 pub const L2_SYSTEM_KEY: &str =
     "0x6f7d72ecb79c8bf1bd8e7c49a1c4a22741ab708f06bb19e5b5d44a6f0934a7c1";
 
-// K = L1/L2 = 2 matches standalone's 2s cadence and leaves one L2 slot for proving.
+// K = L1/L2 = 2 leaves one L2 slot for proving.
 const L1_BLOCK_TIME_SECS: u64 = 4;
 
 // Consumed by the launcher as `--chain`; never forwarded to `eez-node`.
@@ -752,27 +752,6 @@ impl Harness {
         Chain::new(&self.anvil, &self.dep)
     }
 
-    /// Stages a local chain that can later restart as a composer or follower.
-    pub fn standalone_env(&self) -> Vec<(&'static str, String)> {
-        vec![
-            (
-                "EEZ_L1_BLOCK_TIME_MS",
-                (L1_BLOCK_TIME_SECS * 1000).to_string(),
-            ),
-            ("EEZ_L2_BLOCK_TIME_MS", "2000".to_string()),
-            ("EEZ_PROOF_TIME_MS", "1000".to_string()),
-            ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
-            (
-                "RUST_LOG",
-                std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| "warn".to_string()),
-            ),
-            (
-                TEST_L2_GENESIS_ENV,
-                self.l2_genesis.0.to_string_lossy().into_owned(),
-            ),
-        ]
-    }
-
     /// Counts signer successes so negative tests cannot pass because proving stalled.
     pub fn successful_attestations(&self) -> Result<usize> {
         self.provers
@@ -985,7 +964,7 @@ fn now_unix_secs() -> u64 {
 
 /// The shared L2 genesis fixture used by every harness mode.
 pub fn l2_genesis_fixture_path() -> PathBuf {
-    repo_root().join("crates/eez-node/tests/fixtures/genesis.json")
+    repo_root().join("crates/eez-node-e2e/tests/fixtures/genesis.json")
 }
 
 fn fixture_genesis() -> Result<alloy_genesis::Genesis> {
@@ -1235,7 +1214,6 @@ pub enum NodeBinary {
     #[default]
     Composer,
     Follower,
-    Dev,
 }
 
 impl NodeBinary {
@@ -1243,7 +1221,6 @@ impl NodeBinary {
         match self {
             Self::Composer => "eez-composer",
             Self::Follower => "eez-follower",
-            Self::Dev => "eez-dev-node",
         }
     }
 
@@ -1267,7 +1244,7 @@ impl NodeBinary {
         }
 
         bail!(
-            "{name} binary not found next to the test profile at {}; build the eez-node package binaries before running the harness",
+            "{name} binary not found next to the test profile at {}; build the node-role binaries before running the harness",
             target_profile.display(),
         )
     }
@@ -1543,6 +1520,43 @@ impl NodeHandle {
             "{} logged a fatal-class failure",
             self.name,
         );
+    }
+
+    /// Report a terminal node failure that makes further test progress
+    /// impossible. Long-running waits use this to surface the actual failure
+    /// instead of eventually reporting an unrelated timeout.
+    pub fn progress_failure(&self) -> Result<Option<String>> {
+        if let Some(status) = self.exit_status() {
+            return Ok(Some(format!(
+                "{} exited unexpectedly with {status}; log:\n{}",
+                self.name,
+                self.log_tail(80),
+            )));
+        }
+
+        if self.count_signals(FATAL_SIGNALS)? > 0 {
+            return Ok(Some(format!(
+                "{} emitted a panic, divergence, or fatal-lifecycle signal:\n{}",
+                self.name,
+                self.log_lines_matching(FATAL_SIGNALS, 20),
+            )));
+        }
+
+        let fatal_log_markers = [
+            "engine rejected safe/finalized FCU",
+            "payload builder returned no payload",
+            "Fatal",
+            "UnexpectedStaticFile",
+        ];
+        if self.log_count_matching(&fatal_log_markers)? > 0 {
+            return Ok(Some(format!(
+                "{} logged a fatal-class failure:\n{}",
+                self.name,
+                self.log_lines_matching(&fatal_log_markers, 20),
+            )));
+        }
+
+        Ok(None)
     }
 
     pub fn log_count_matching(&self, patterns: &[&str]) -> Result<usize> {
@@ -1995,6 +2009,26 @@ impl<'a> Chain<'a> {
         .await
     }
 
+    /// Wait for L1 batch progress, failing immediately if any watched node
+    /// reports a terminal condition that makes the target unreachable.
+    pub async fn wait_for_batches_or_node_failure(
+        &self,
+        n: usize,
+        nodes: &[&NodeHandle],
+        timeout: Duration,
+    ) -> Result<usize> {
+        wait_for(timeout, || async {
+            for node in nodes {
+                if let Some(failure) = node.progress_failure()? {
+                    bail!(failure);
+                }
+            }
+            let count = self.batches_posted().await?;
+            Ok((count >= n).then_some(count))
+        })
+        .await
+    }
+
     /// Assert that a submitted `postAndVerifyBatch` for `expected_rollup_id`
     /// was mined, reverted, and reproduces `expected_revert_selector` via
     /// `eth_call` against the resulting chain state.
@@ -2294,6 +2328,29 @@ pub async fn all_l2_execution_states(
     rollup_id: u64,
     from_block: u64,
 ) -> Result<Vec<B256>> {
+    Ok(
+        all_l2_execution_events(rpc_url, contract, rollup_id, from_block)
+            .await?
+            .into_iter()
+            .map(|event| event.state)
+            .collect(),
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct L2ExecutionEvent {
+    state: B256,
+    block_number: u64,
+    transaction_hash: B256,
+    log_index: u64,
+}
+
+async fn all_l2_execution_events(
+    rpc_url: &str,
+    contract: Address,
+    rollup_id: u64,
+    from_block: u64,
+) -> Result<Vec<L2ExecutionEvent>> {
     use alloy_rpc_types_eth::Filter;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let filter = Filter::new()
@@ -2304,9 +2361,22 @@ pub async fn all_l2_execution_states(
     let logs = provider.get_logs(&filter).await?;
     logs.into_iter()
         .map(|log| {
-            IEEZ::L2ExecutionPerformed::decode_log(&log.inner)
-                .map(|d| d.newState)
-                .map_err(Into::into)
+            let block_number = log
+                .block_number
+                .ok_or_else(|| anyhow!("L2ExecutionPerformed log is missing block_number"))?;
+            let transaction_hash = log
+                .transaction_hash
+                .ok_or_else(|| anyhow!("L2ExecutionPerformed log is missing transaction_hash"))?;
+            let log_index = log
+                .log_index
+                .ok_or_else(|| anyhow!("L2ExecutionPerformed log is missing log_index"))?;
+            let decoded = IEEZ::L2ExecutionPerformed::decode_log(&log.inner)?;
+            Ok(L2ExecutionEvent {
+                state: decoded.newState,
+                block_number,
+                transaction_hash,
+                log_index,
+            })
         })
         .collect()
 }
@@ -2438,6 +2508,7 @@ sol! {
     interface IEEZL2Proxy {
         function createCrossChainProxy(address originalAddress, uint64 originalRollupId) external returns (address proxy);
         function computeCrossChainProxyAddress(address originalAddress, uint64 originalRollupId) external view returns (address proxy);
+        function authorizedProxies(address proxy) external view returns (bool isProxy, address originalAddress, uint64 originalRollupId);
     }
     #[sol(rpc)]
     interface IValue {
@@ -2460,6 +2531,7 @@ sol! {
     #[sol(rpc)]
     interface ISetterWrapper {
         event Wrapped(uint256 input, bool ok, bool changed, uint256 newValue);
+        function proxy() external view returns (address);
         function setViaProxy(uint256 v) external;
         function setSameValueTwice(uint256 v) external;
         function completedProxyCalls() external view returns (uint256);
@@ -2667,6 +2739,46 @@ async fn deploy_raw(
     receipt
         .contract_address
         .ok_or_else(|| anyhow!("no contract_address for {}", artifact_path.display()))
+}
+
+/// Reject a stale Foundry artifact before a fixture deploys bytecode that does
+/// not match the Rust ABI used to construct its transactions.
+fn require_artifact_method(
+    artifact_path: &Path,
+    signature: &str,
+    expected_selector: [u8; 4],
+) -> Result<()> {
+    let artifact: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(artifact_path)
+            .with_context(|| format!("read {}", artifact_path.display()))?,
+    )?;
+    let expected = hex::encode(expected_selector);
+    let actual = artifact["methodIdentifiers"]
+        .get(signature)
+        .and_then(serde_json::Value::as_str);
+    if actual != Some(expected.as_str()) {
+        bail!(
+            "stale Solidity artifact {}: expected {signature} selector {expected}, found {}; rebuild with `cd contracts && forge build`",
+            artifact_path.display(),
+            actual.unwrap_or("missing"),
+        );
+    }
+
+    let deployed_bytecode = artifact["deployedBytecode"]["object"]
+        .as_str()
+        .ok_or_else(|| {
+            anyhow!(
+                "deployedBytecode.object missing in {}",
+                artifact_path.display()
+            )
+        })?;
+    if !deployed_bytecode.contains(&format!("63{expected}")) {
+        bail!(
+            "stale Solidity artifact {}: deployed bytecode does not dispatch {signature} ({expected}); rebuild with `cd contracts && forge build`",
+            artifact_path.display(),
+        );
+    }
+    Ok(())
 }
 
 /// Deploy EEZ + ECDSAProofSystem + Rollup on the embedded dev L1 and
@@ -2893,14 +3005,64 @@ pub async fn deploy_setter_wrapper(
     proxy: Address,
 ) -> Result<Address> {
     let out = repo_root().join("contracts/out");
-    deploy_raw(
-        rpc_url,
-        key,
-        chain_id,
-        &out.join("SetterWrapper.sol/SetterWrapper.json"),
-        proxy.abi_encode(),
-    )
+    let artifact = out.join("SetterWrapper.sol/SetterWrapper.json");
+    require_artifact_method(
+        &artifact,
+        "setSameValueTwice(uint256)",
+        ISetterWrapper::setSameValueTwiceCall::SELECTOR,
+    )?;
+    deploy_raw(rpc_url, key, chain_id, &artifact, proxy.abi_encode()).await
+}
+
+/// Wait until the outbound fixture is readable and Composer observes an L2
+/// parent after that state is deployed. Deployment receipts alone are not a
+/// sufficient hand-off boundary: ingress reads latest state, while composition
+/// executes against the parent selected for its Sync block. Observe invocation
+/// rather than drain because catch-up and in-flight slots return before draining.
+async fn wait_for_outbound_fixture_parent(
+    node: &NodeHandle,
+    l2_rpc: &str,
+    wrapper: Address,
+    proxy: Address,
+) -> Result<()> {
+    let provider = ProviderBuilder::new().connect_http(l2_rpc.parse()?);
+
+    let wrapper_code = provider.get_code_at(wrapper).await?;
+    if wrapper_code.is_empty() {
+        bail!("outbound fixture wrapper {wrapper} has no code");
+    }
+    let configured_proxy = ISetterWrapper::new(wrapper, &provider)
+        .proxy()
+        .call()
+        .await?;
+    if configured_proxy != proxy {
+        bail!("outbound fixture wrapper {wrapper} points to {configured_proxy}, expected {proxy}");
+    }
+    let proxy_code = provider.get_code_at(proxy).await?;
+    if proxy_code.is_empty() {
+        bail!("outbound fixture proxy {proxy} has no code");
+    }
+    let proxy_info = IEEZL2Proxy::new(EEZL2_ADDRESS, &provider)
+        .authorizedProxies(proxy)
+        .call()
+        .await?;
+    if !proxy_info.isProxy {
+        bail!("outbound fixture proxy {proxy} is not authorized by EEZL2");
+    }
+
+    let fixture_height = provider.get_block_number().await?;
+    let cursor = node.signal_cursor()?;
+    wait_for(SETUP_TIMEOUT, || async {
+        let covered = node
+            .signals_since(cursor)?
+            .into_iter()
+            .any(|signal| signal.name == signals::COMPOSER_SYNC_SLOT_INVOKED);
+        Ok(covered.then_some(()))
+    })
     .await
+    .with_context(|| {
+        format!("Composer did not start a Sync slot after outbound fixture height {fixture_height}")
+    })
 }
 
 /// Deploy `Counter` (no constructor args) on either chain.
@@ -3502,7 +3664,7 @@ struct ExecutedScenarioAction {
 #[derive(Debug)]
 struct StandardOracleSnapshot {
     signal_cursor: usize,
-    execution_states: Vec<B256>,
+    execution_events: Vec<L2ExecutionEvent>,
     safe: Option<(u64, B256)>,
     finalized: Option<(u64, B256)>,
     rollup_ether_balance: U256,
@@ -3528,7 +3690,7 @@ impl StandardOracleSnapshot {
         // lands across the cursor read, the history changes and we retry.
         let mut aligned_boundary = None;
         for _ in 0..10 {
-            let before = all_l2_execution_states(
+            let before = all_l2_execution_events(
                 &l1_rpc,
                 world.cfg.eez_address,
                 world.cfg.rollup_id,
@@ -3536,7 +3698,7 @@ impl StandardOracleSnapshot {
             )
             .await?;
             let cursor = world.node.signal_cursor()?;
-            let after = all_l2_execution_states(
+            let after = all_l2_execution_events(
                 &l1_rpc,
                 world.cfg.eez_address,
                 world.cfg.rollup_id,
@@ -3548,11 +3710,11 @@ impl StandardOracleSnapshot {
                 break;
             }
         }
-        let (execution_states, signal_cursor) = aligned_boundary.ok_or_else(|| {
+        let (execution_events, signal_cursor) = aligned_boundary.ok_or_else(|| {
             anyhow!("could not align L1 execution history with the node signal stream")
         })?;
         Ok(Self {
-            execution_states,
+            execution_events,
             signal_cursor,
             safe: block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Safe).await?,
             finalized: block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Finalized).await?,
@@ -3618,16 +3780,18 @@ impl StandardOracleSnapshot {
             );
         }
         if let (Some(before), Some(after)) = (self.safe, safe)
-            && after.0 == before.0
-            && after.1 != before.1
-            && !has_reorg
+            && after.0 >= before.0
         {
-            bail!(
-                "{scenario_name}: safe hash changed at height {} without an L1 reorg signal: {} -> {}",
-                before.0,
-                before.1,
-                after.1
-            );
+            let canonical_before =
+                block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Number(before.0)).await?;
+            if canonical_before.map(|(_, hash)| hash) != Some(before.1) && !has_reorg {
+                bail!(
+                    "{scenario_name}: captured safe block {} at height {} left the canonical ancestry without an L1 reorg signal; canonical block is {:?}",
+                    before.1,
+                    before.0,
+                    canonical_before,
+                );
+            }
         }
         if let (Some(before), Some(after)) = (self.finalized, finalized)
             && after.0 < before.0
@@ -3639,15 +3803,18 @@ impl StandardOracleSnapshot {
             );
         }
         if let (Some(before), Some(after)) = (self.finalized, finalized)
-            && after.0 == before.0
-            && after.1 != before.1
+            && after.0 >= before.0
         {
-            bail!(
-                "{scenario_name}: finalized hash changed at height {}: {} -> {}",
-                before.0,
-                before.1,
-                after.1
-            );
+            let canonical_before =
+                block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Number(before.0)).await?;
+            if canonical_before.map(|(_, hash)| hash) != Some(before.1) {
+                bail!(
+                    "{scenario_name}: captured finalized block {} at height {} left the canonical ancestry; canonical block is {:?}",
+                    before.1,
+                    before.0,
+                    canonical_before,
+                );
+            }
         }
 
         let mut observed_safe = self.safe.map(|head| head.0).unwrap_or(0);
@@ -3673,6 +3840,8 @@ impl StandardOracleSnapshot {
                         record.u64("applied_entries")? as usize,
                         record.b256("l1_settled_state_root")?,
                         record.b256("l2_safe_state_root")?,
+                        record.u64("l1_block_number")?,
+                        record.b256("tx_hash")?,
                     ));
                 }
                 signals::DERIVER_FINALIZED_ADVANCED => {
@@ -3693,44 +3862,59 @@ impl StandardOracleSnapshot {
             }
         }
 
-        let execution_states = all_l2_execution_states(
+        let execution_events = all_l2_execution_events(
             &l1_rpc,
             world.cfg.eez_address,
             world.cfg.rollup_id,
             world.dep.deploy_block,
         )
         .await?;
-        if execution_states.len() < self.execution_states.len() {
+        if execution_events.len() < self.execution_events.len() {
             bail!("{scenario_name}: L2ExecutionPerformed history retreated");
         }
-        // The cursor and L1 baseline are aligned above, so every observed
-        // settlement, including the first, must extend the history by exactly
-        // `applied_entries`.
-        let mut previous_event_count = self.execution_states.len();
-        for (applied, l1_settled_root, l2_safe_root) in settlement_points {
+        for (applied, l1_settled_root, l2_safe_root, l1_block_number, batch_tx_hash) in
+            settlement_points
+        {
             if l1_settled_root != l2_safe_root {
                 bail!(
                     "{scenario_name}: L1 settled root {l1_settled_root} != L2 safe block root {l2_safe_root}"
                 );
             }
-            let search_from = previous_event_count;
-            let index = execution_states
-                .get(search_from..)
-                .and_then(|tail| tail.iter().position(|root| *root == l1_settled_root))
-                .map(|offset| search_from + offset)
+            // A signal can be written after the snapshot cursor even though its
+            // L1 event was already captured. Bind the signal to its immutable L1
+            // block instead of assuming the independently sampled streams share
+            // an index boundary. The event may be in a different transaction
+            // from `batch_tx_hash`: deferred inbound execution emits it from the
+            // bundled user transaction rather than postBatch.
+            let endpoint = execution_events
+                .iter()
+                .rfind(|event| {
+                    event.block_number == l1_block_number && event.state == l1_settled_root
+                })
                 .ok_or_else(|| {
                     anyhow!(
-                        "{scenario_name}: L1 settled root {l1_settled_root} has no L2ExecutionPerformed event after index {search_from}"
+                        "{scenario_name}: batch {batch_tx_hash} reported L1 settled root {l1_settled_root}, but L1 block {l1_block_number} has no matching L2ExecutionPerformed event"
                     )
                 })?;
-            let event_count = index + 1;
-            if event_count - previous_event_count != applied {
+
+            // A delayed signal for an event already present at capture belongs
+            // to the pre-scenario boundary and must not be charged to this run.
+            if self.execution_events.contains(endpoint) {
+                continue;
+            }
+
+            let events_through_endpoint = execution_events
+                .iter()
+                .filter(|event| {
+                    event.block_number == l1_block_number && event.log_index <= endpoint.log_index
+                })
+                .count();
+            if events_through_endpoint < applied {
                 bail!(
-                    "{scenario_name}: settlement reported {applied} applied entries but sits {} L1 events after the previous one",
-                    event_count - previous_event_count
+                    "{scenario_name}: batch {batch_tx_hash} reported {applied} applied entries, but its endpoint is only event {events_through_endpoint} in L1 block {l1_block_number} (emitted by {})",
+                    endpoint.transaction_hash,
                 );
             }
-            previous_event_count = event_count;
         }
         if safe.is_some() && expect_settled {
             let committed = state_root(&l1_rpc, world.cfg.eez_address, world.cfg.rollup_id).await?;
@@ -4291,6 +4475,8 @@ async fn setup_cross_chain_inner(
         create_l2_cross_chain_proxy(&l2_rpc, TARGET_DEPLOYER, withdrawal_recipient, 0).await?;
     let outbound_wrapper =
         deploy_setter_wrapper(&l2_rpc, TARGET_DEPLOYER, l2_chain_id, outbound_proxy).await?;
+
+    wait_for_outbound_fixture_parent(&node, &l2_rpc, outbound_wrapper, outbound_proxy).await?;
 
     datadir.fixture_ready();
     Ok(CrossChainWorld {

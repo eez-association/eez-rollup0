@@ -17,11 +17,10 @@ use eez_protocol::{EEZL2_ADDRESS, EvmBatch, entries::decode_postbatch};
 use eez_testkit::signals;
 use eez_testkit::{
     ANVIL_KEY_6, CrossChainWorld, DEV_CHAIN_ID, ICounter, IEEZ, INBOUND_USER, ISetterWrapper,
-    IValue, OUTBOUND_USER, SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead, TARGET_DEPLOYER,
-    call_read, counter_count, create_cross_chain_proxy, create_l2_cross_chain_proxy,
-    deploy_counter, events_since, l2_value, last_proxy_result, onchain_nonce, receipt_ok,
-    safe_block_state_root, setup_cross_chain, setup_cross_chain_with_env, sign_and_send,
-    state_root, value_read, wait_for,
+    IValue, OUTBOUND_USER, SETTLE_TIMEOUT, TARGET_DEPLOYER, counter_count,
+    create_cross_chain_proxy, create_l2_cross_chain_proxy, deploy_counter, l2_value, onchain_nonce,
+    receipt_ok, safe_block_state_root, setup_cross_chain_with_env, sign_and_send, state_root,
+    wait_for,
 };
 
 sol! {
@@ -207,83 +206,6 @@ fn assert_no_evictions(w: &CrossChainWorld) {
         0,
         "composable transactions must not be evicted",
     );
-}
-
-fn completed_calls_read(wrapper: Address) -> StateRead {
-    call_read(
-        wrapper,
-        "completedProxyCalls()",
-        ISetterWrapper::completedProxyCallsCall {}.abi_encode(),
-    )
-}
-
-/// Two identical inbound calls from one L1 transaction. The composer must keep
-/// both ordered entries: the first changes destination state and the second
-/// observes it, returning `changed = false` instead of being deduplicated.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn repeated_inbound_calls_in_one_source_transaction_chain_state() {
-    let w = setup_cross_chain().await.unwrap();
-    let l1_rpc = w.l1_rpc();
-    let value = U256::from(73u64);
-    let wrapped_before = events_since(
-        &l1_rpc,
-        w.inbound_wrapper,
-        ISetterWrapper::Wrapped::SIGNATURE_HASH,
-        0,
-    )
-    .await
-    .unwrap()
-    .len();
-    assert_ne!(
-        l2_value(&w.l2_rpc(), w.value_l2).await.unwrap(),
-        value,
-        "the first call must change destination state",
-    );
-
-    Scenario::new("repeated inbound calls in one source transaction")
-        .inbound(
-            ScenarioCall::new(
-                w.inbound_wrapper,
-                ISetterWrapper::setSameValueTwiceCall { v: value }.abi_encode(),
-            )
-            .with_gas_limit(1_200_000),
-        )
-        .expect_l2_state(value_read(w.value_l2), value)
-        .expect_l1_state(completed_calls_read(w.inbound_wrapper), 2u64)
-        .expect_settled_fully()
-        .run(&w)
-        .await
-        .unwrap();
-
-    let wrapped = events_since(
-        &l1_rpc,
-        w.inbound_wrapper,
-        ISetterWrapper::Wrapped::SIGNATURE_HASH,
-        0,
-    )
-    .await
-    .unwrap();
-    let results = wrapped[wrapped_before..]
-        .iter()
-        .map(|log| {
-            let event = ISetterWrapper::Wrapped::decode_log(&log.inner).unwrap();
-            (event.input, event.ok, event.changed, event.newValue)
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        results,
-        vec![(value, true, true, value), (value, true, false, value)],
-        "the repeated call must observe the first destination write",
-    );
-    assert_eq!(
-        last_proxy_result(&l1_rpc, w.inbound_wrapper).await.unwrap(),
-        (false, value),
-        "the final ordered call must return the post-write state",
-    );
-
-    assert_reconciled(&w).await;
-    assert_no_evictions(&w);
-    w.node.assert_no_process_death();
 }
 
 /// Two outbound transactions with identical calls must remain distinct ordered

@@ -14,6 +14,7 @@ pub const DERIVER_RESYNC_FAILED: &str = "eez.deriver.resync.failed";
 pub const DERIVER_COMMITTER_CLOSED: &str = "eez.deriver.committer.closed";
 pub const NODE_BOOT_CATCH_UP_FAILED: &str = "eez.node.deriver.boot_catch_up.failed";
 pub const COMPOSER_BUNDLE_DISPATCHED: &str = "eez.composer.bundle.dispatched";
+pub const COMPOSER_SYNC_SLOT_INVOKED: &str = "eez.composer.sync_slot.invoked";
 pub const COMPOSER_SYNC_SLOT_DRAIN: &str = "eez.composer.sync_slot.drain";
 pub const COMPOSER_PHASE1_BUNDLE_DISPATCHED: &str = "eez.composer.phase1.bundle.dispatched";
 pub const COMPOSER_OUTBOUND_MULTICALL_UNSUPPORTED: &str =
