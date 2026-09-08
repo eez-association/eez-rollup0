@@ -6,9 +6,15 @@ use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
 use reth_node_builder::{NodeBuilder, WithLaunchContext};
 use tracing::{Level, event};
 
+mod node;
+pub use node::EezNode;
+mod rpc;
+pub use rpc::eez_add_ons;
 mod payload;
 pub use payload::EezPayloadBuilder;
+mod payload_builder;
 mod pool;
+mod pool_transaction;
 pub use pool::EezPoolBuilder;
 
 /// Per M-MIMALLOC-APPS — meaningful win on allocation-heavy workloads.

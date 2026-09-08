@@ -31,7 +31,6 @@ services:
       EEZ_PROOF_SIGNER_ADDR: 127.0.0.1:${EEZ_SIGNER_PORT:-50081}
       EEZ_CHAIN_CONFIG: /app/genesis.json
       EEZ_PROOF_SIGNER_KEY: "${EEZ_PROOF_SIGNER_KEY:?set EEZ_PROOF_SIGNER_KEY}"
-      EEZ_L2_SYSTEM_KEY: "${EEZ_L2_SYSTEM_KEY:?set EEZ_L2_SYSTEM_KEY}"
       RUST_LOG: "${EEZ_PROOF_SIGNER_RUST_LOG:-info}"
     volumes:
       - ${FRESH_GENESIS:?deploy writes ./datadir/genesis.json}:/app/genesis.json:ro

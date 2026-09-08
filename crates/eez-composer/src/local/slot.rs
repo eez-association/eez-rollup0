@@ -17,8 +17,8 @@ use std::sync::Arc;
 use alloy_consensus::Header;
 use alloy_primitives::{Address, Bytes, TxKind};
 use alloy_sol_types::SolCall;
+use eez_evm::EezEvmConfig;
 use reth_evm::{ConfigureEvm, Evm as _};
-use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::SealedHeader;
 use reth_revm::{database::StateProviderDatabase, db::State, db::bal::EvmDatabaseError};
 use reth_storage_api::StateProviderBox;
@@ -152,7 +152,7 @@ impl L1SlotState {
         seed: CacheState,
     ) -> ExecutorResult<(
         State<StateProviderDatabase<StateProviderBox>>,
-        reth_evm::EvmEnvFor<EthEvmConfig>,
+        reth_evm::EvmEnvFor<EezEvmConfig>,
     )> {
         let provider = client.chain_provider();
         let state_prov = provider
@@ -185,7 +185,7 @@ impl L1SlotState {
         client: &LocalChainClient,
     ) -> ExecutorResult<(
         State<StateProviderDatabase<StateProviderBox>>,
-        reth_evm::EvmEnvFor<EthEvmConfig>,
+        reth_evm::EvmEnvFor<EezEvmConfig>,
     )> {
         self.open_state(client, self.cache.clone())
     }
@@ -205,9 +205,9 @@ impl L1SlotState {
 /// survivor-accept. Changing the payload type breaks that hand-off.
 pub struct L1TargetSession {
     client: Arc<LocalChainClient>,
-    evm_config: EthEvmConfig,
+    evm_config: EezEvmConfig,
     state: State<StateProviderDatabase<StateProviderBox>>,
-    evm_env: reth_evm::EvmEnvFor<EthEvmConfig>,
+    evm_env: reth_evm::EvmEnvFor<EezEvmConfig>,
     manager: Address,
     chain_id: u64,
 }

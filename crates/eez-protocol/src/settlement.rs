@@ -1,20 +1,11 @@
 //! Settlement transaction-framing helpers shared by the composer and proof
 //! signer.
 
-use alloy_primitives::Address;
-
-/// A sync-block transaction is a system transaction iff its recovered signer
-/// matches the deployment's system address and it targets `EEZL2`.
-/// The proof signer and composer must use the same deployment values so their
-/// pair-end positions, and therefore per-effect settlement roots, agree.
+/// Native system transactions are identified by their reserved envelope type.
+/// Sender recovery alone cannot grant this classification to an Ethereum tx.
 #[must_use]
-pub fn is_system_tx(
-    signer: Address,
-    to: Option<Address>,
-    expected_system_address: Address,
-    eezl2_address: Address,
-) -> bool {
-    signer == expected_system_address && to == Some(eezl2_address)
+pub fn is_system_tx(tx: &eez_primitives::EezTxEnvelope) -> bool {
+    matches!(tx, eez_primitives::EezTxEnvelope::System(_))
 }
 
 /// Pair-end tx positions in a sync block — one per settled cross-chain effect,
@@ -32,34 +23,7 @@ pub fn pair_end_positions(is_system: &[bool]) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::address;
-
-    use super::{is_system_tx, pair_end_positions};
-
-    #[test]
-    fn system_transaction_identity_uses_deployment_addresses() {
-        let system_address = address!("1111111111111111111111111111111111111111");
-        let eezl2_address = address!("2222222222222222222222222222222222222222");
-
-        assert!(is_system_tx(
-            system_address,
-            Some(eezl2_address),
-            system_address,
-            eezl2_address,
-        ));
-        assert!(!is_system_tx(
-            address!("3333333333333333333333333333333333333333"),
-            Some(eezl2_address),
-            system_address,
-            eezl2_address,
-        ));
-        assert!(!is_system_tx(
-            system_address,
-            Some(address!("4444444444444444444444444444444444444444")),
-            system_address,
-            eezl2_address,
-        ));
-    }
+    use super::pair_end_positions;
 
     /// A pair ends at every user (non-system) tx, at a system tx followed by a
     /// system tx, and at the last tx regardless. A system tx followed by a user

@@ -7,6 +7,8 @@ rust-version.workspace = true
 description            = "Composer umbrella — owns per-rollup Sequencer/Scheduler/HeldPool maps and the shared Aggregator/Submitter/Prover."
 
 [dependencies]
+eez-primitives.workspace = true
+eez-evm.workspace = true
 # Internal — protocol, EVM port + inspector, and the existing umbrella siblings
 eez-driver = { workspace = true, features = ["witness"] }
 eez-evm-inspector.workspace  = true
@@ -32,10 +34,8 @@ alloy-sol-types.workspace        = true
 # reth (state + revm + chainspec + evm + trie for LocalChainClient + sessions,
 # engine-primitives + payload-primitives for build_sync_block → ExecutionData)
 reth-chainspec.workspace                  = true
-reth-ethereum-engine-primitives.workspace = true
 reth-ethereum-primitives.workspace        = true
 reth-evm.workspace                        = true
-reth-evm-ethereum.workspace               = true
 reth-payload-primitives.workspace         = true
 reth-primitives-traits.workspace          = true
 reth-revm.workspace                       = true

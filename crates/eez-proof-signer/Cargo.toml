@@ -7,12 +7,15 @@ rust-version.workspace = true
 description            = "EEZ attestation daemon: re-executes composer-streamed windows, binds supported settlement effects fail-closed, and signs the independently recomputed public-input hash."
 
 [dependencies]
+eez-primitives.workspace = true
+eez-evm.workspace = true
 # The `prove.v1` wire this daemon serves.
 eez-control-rpc.workspace = true
 # Canonical `postAndVerifyBatch` ABI types and codec.
 eez-protocol.workspace = true
 
 alloy-consensus.workspace = true
+alloy-eips.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives = { workspace = true, features = ["k256"] }
 alloy-rlp.workspace = true

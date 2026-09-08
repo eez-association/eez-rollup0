@@ -114,19 +114,20 @@ impl ServiceState {
         validator: validate::Validator,
         expected_rollup_id: NonZeroU64,
         attester: Attester,
-        system_transaction_key: settlement::SystemTransactionKey,
     ) -> eyre::Result<Self> {
-        let expected_l2_system_address = system_transaction_key.address();
+        let expected_l2_system_address = eez_primitives::SYSTEM_ADDRESS;
         eyre::ensure!(
             validator.expected_l2_system_address() == expected_l2_system_address,
-            "validator and system-transaction key use different L2 system addresses"
+            "validator and native system transactions use different L2 system addresses"
         );
         eyre::ensure!(
             attester.expected_l2_system_address() == expected_l2_system_address,
-            "attester and system-transaction key use different L2 system addresses"
+            "attester and native system transactions use different L2 system addresses"
         );
-        let system_transaction_reconstructor =
-            system_transaction_key.into_reconstructor(validator.chain_id(), expected_rollup_id);
+        let system_transaction_reconstructor = settlement::SystemTransactionReconstructor::new(
+            validator.chain_id(),
+            expected_rollup_id,
+        );
         Ok(Self {
             validator,
             expected_rollup_id,

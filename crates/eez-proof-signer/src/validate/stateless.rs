@@ -9,17 +9,17 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use alloy_consensus::{EthereumReceipt, Transaction as _};
 #[cfg(test)]
 use alloy_genesis::ChainConfig;
 use alloy_genesis::Genesis;
 use alloy_primitives::Address;
 use alloy_sol_types::SolEvent as _;
+use eez_evm::EezEvmConfig;
+use eez_primitives::Block;
+use eez_primitives::Receipt as EthereumReceipt;
 use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
 use eez_protocol::settlement::{is_system_tx, pair_end_positions};
 use reth_chainspec::{ChainSpec, EthereumHardforks as _};
-use reth_ethereum_primitives::Block;
-use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::RecoveredBlock;
 use stateless_reth::validation::StatelessValidationError;
 use stateless_reth::{
@@ -64,12 +64,7 @@ impl CheckpointPlan {
         for transaction in block.transactions_recovered() {
             let is_system_sender = transaction.signer() == expected_l2_system_address;
             system_sender_flags.push(is_system_sender);
-            sync_system_transaction_flags.push(is_system_tx(
-                transaction.signer(),
-                transaction.to(),
-                expected_l2_system_address,
-                EEZL2_ADDRESS,
-            ));
+            sync_system_transaction_flags.push(is_system_tx(&transaction));
         }
         let plan = Self {
             transaction_indices: pair_end_positions(&sync_system_transaction_flags),
@@ -117,7 +112,7 @@ struct PreparedSettlingBlock {
 #[derive(Debug)]
 pub(crate) struct Backend {
     chain_spec: Arc<ChainSpec>,
-    evm_config: EthEvmConfig,
+    evm_config: EezEvmConfig,
     expected_l2_system_address: Address,
 }
 
@@ -167,7 +162,7 @@ impl Backend {
 
     fn from_genesis(genesis: Genesis, expected_l2_system_address: Address) -> Self {
         let chain_spec = Arc::new(ChainSpec::from_genesis(genesis));
-        let evm_config = EthEvmConfig::new(Arc::clone(&chain_spec));
+        let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec));
         Self {
             chain_spec,
             evm_config,

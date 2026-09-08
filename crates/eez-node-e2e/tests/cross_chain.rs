@@ -328,6 +328,30 @@ async fn mixed_cross_chain_wave_matrix_over_bundle() {
     let l2_xchain = w.l2_xchain();
     let l2_rpc = w.l2_rpc();
 
+    // Outbound entries execute before the inbound source transactions in a
+    // batch. Seed real escrow in an earlier settled deposit; a withdrawal
+    // cannot spend the deposit from its own wave before that deposit executes.
+    let escrow = U256::from(WAVE_DEPOSITS.iter().sum::<u128>());
+    let before_seed = l2_balance(&l2_rpc, w.recipient).await.unwrap();
+    let seed = sign_and_send(
+        &l1_xchain,
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
+        Some(w.deposit_proxy),
+        escrow,
+        Vec::new(),
+        600_000,
+    )
+    .await
+    .unwrap();
+    assert_all_transactions_succeeded(&w, &l1_rpc, &[seed], "escrow seed").await;
+    wait_for(SETTLE_TIMEOUT, || async {
+        Ok((l2_balance(&l2_rpc, w.recipient).await? == before_seed + escrow).then_some(()))
+    })
+    .await
+    .expect("escrow seed must settle before mixed withdrawals");
+
     let recipient_before = l2_balance(&l2_rpc, w.recipient).await.unwrap();
     let withdrawal_before = l2_balance(&l1_rpc, w.withdrawal_recipient).await.unwrap();
     let deposit_sum: u128 = WAVE_DEPOSITS.iter().sum();

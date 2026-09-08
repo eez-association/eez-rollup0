@@ -52,8 +52,8 @@ fn validated_settling_block_rejects_unbound_sender_fact_count() {
 }
 
 #[test]
-fn typed_transactions_can_be_system_transactions() {
-    let rlp = block_rlp(vec![transaction(EIP1559_SYSTEM_TX)]);
+fn native_transactions_are_system_transactions() {
+    let rlp = block_rlp(vec![transaction(SYSTEM_TX)]);
 
     let facts = inspect_settling_block(&rlp, &[true], expected_rollup_id()).unwrap();
 
@@ -63,10 +63,9 @@ fn typed_transactions_can_be_system_transactions() {
 
 #[test]
 fn signature_recovery_failures_are_not_system_transactions() {
-    let invalid_signature = TransactionSigned::new_unhashed(
-        transaction(SYSTEM_TX).into_typed_transaction(),
-        Signature::new(U256::ZERO, U256::ZERO, false),
-    );
+    let invalid_signature = alloy_consensus::TxLegacy::default()
+        .into_signed(Signature::new(U256::ZERO, U256::ZERO, false))
+        .into();
     let rlp = block_rlp(vec![invalid_signature]);
 
     let facts = inspect_settling_block(&rlp, &[false], expected_rollup_id()).unwrap();
@@ -76,16 +75,11 @@ fn signature_recovery_failures_are_not_system_transactions() {
 }
 
 #[test]
-fn reserved_system_sender_cannot_masquerade_as_a_user() {
-    for transaction in [
-        transaction(SYSTEM_SIGNER_OTHER_TARGET_TX),
-        transaction(CREATE_TX),
-    ] {
-        let rlp = block_rlp(vec![transaction]);
-        assert_eq!(
-            inspect_settling_block(&rlp, &[true], expected_rollup_id()),
-            Err(BlockInspectionError::ReservedSystemSender { index: 0 })
-        );
+fn signed_user_transactions_do_not_gain_system_identity() {
+    for encoded in [SYSTEM_SIGNER_OTHER_TARGET_TX, CREATE_TX, EIP1559_SYSTEM_TX] {
+        let rlp = block_rlp(vec![transaction(encoded)]);
+        let facts = inspect_settling_block(&rlp, &[true], expected_rollup_id()).unwrap();
+        assert_eq!(facts.system_sender_flags(), [false]);
     }
 }
 
@@ -400,10 +394,9 @@ fn inbound_binding_rejects_a_candidate_hidden_inside_an_outbound_pair() {
 
 #[test]
 fn intermediate_blocks_without_a_recovered_system_signer_are_accepted() {
-    let invalid_signature = TransactionSigned::new_unhashed(
-        transaction(SYSTEM_TX).into_typed_transaction(),
-        Signature::new(U256::ZERO, U256::ZERO, false),
-    );
+    let invalid_signature = alloy_consensus::TxLegacy::default()
+        .into_signed(Signature::new(U256::ZERO, U256::ZERO, false))
+        .into();
     let empty = block_rlp(Vec::new());
     let unrecoverable = block_rlp(vec![invalid_signature]);
 
@@ -417,28 +410,21 @@ fn intermediate_blocks_without_a_recovered_system_signer_are_accepted() {
 }
 
 #[test]
-fn intermediate_system_signers_are_rejected_regardless_of_recipient() {
-    for encoded in [
-        SYSTEM_TX,
-        EIP1559_SYSTEM_TX,
-        SYSTEM_SIGNER_OTHER_TARGET_TX,
-        CREATE_TX,
-    ] {
-        let preceding = TransactionSigned::new_unhashed(
-            transaction(SYSTEM_TX).into_typed_transaction(),
-            Signature::new(U256::ZERO, U256::ZERO, false),
-        );
-        let rlp = block_rlp(vec![preceding, transaction(encoded)]);
+fn intermediate_native_transactions_are_rejected() {
+    let encoded = SYSTEM_TX;
+    let preceding = alloy_consensus::TxLegacy::default()
+        .into_signed(Signature::new(U256::ZERO, U256::ZERO, false))
+        .into();
+    let rlp = block_rlp(vec![preceding, transaction(encoded)]);
 
-        assert_eq!(
-            verify_no_intermediate_system_transactions([(41, rlp.as_slice())]),
-            Err(BlockInspectionError::IntermediateSystemTransaction {
-                block_number: 41,
-                transaction_index: 1,
-            }),
-            "fixture {encoded} was accepted"
-        );
-    }
+    assert_eq!(
+        verify_no_intermediate_system_transactions([(41, rlp.as_slice())]),
+        Err(BlockInspectionError::IntermediateSystemTransaction {
+            block_number: 41,
+            transaction_index: 1,
+        }),
+        "fixture {encoded} was accepted"
+    );
 }
 
 #[test]

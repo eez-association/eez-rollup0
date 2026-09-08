@@ -9,10 +9,9 @@ fn admitted_block(number: u64, hash: u8) -> AdmittedBlock {
 }
 
 fn admitted_block_with_transactions(number: u64, hash: u8, count: usize) -> AdmittedBlock {
-    let transaction: alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844> =
-        TxLegacy::default()
-            .into_signed(alloy_primitives::Signature::test_signature())
-            .into();
+    let transaction: eez_primitives::EezTxEnvelope = TxLegacy::default()
+        .into_signed(alloy_primitives::Signature::test_signature())
+        .into();
     let body = alloy_consensus::BlockBody {
         transactions: vec![transaction; count],
         ..Default::default()

@@ -9,9 +9,9 @@ description            = "Engine-API consumer that drives a reth node to produce
 [features]
 default = []
 witness = [
+    "dep:eez-primitives",
     "dep:eez-prover",
     "dep:eyre",
-    "dep:reth-ethereum-primitives",
     "dep:reth-evm",
     "dep:reth-revm",
     "dep:reth-trie",
@@ -21,6 +21,7 @@ witness = [
 
 [dependencies]
 # eez — enabled only for the Composer's per-block proving witness path.
+eez-primitives = { workspace = true, optional = true }
 eez-prover = { workspace = true, optional = true }
 
 eez-l1.workspace = true
@@ -28,7 +29,6 @@ eez-l1.workspace = true
 reth-chainspec.workspace                  = true
 reth-engine-primitives.workspace          = true
 reth-ethereum-engine-primitives.workspace = true
-reth-ethereum-primitives = { workspace = true, optional = true }
 reth-evm = { workspace = true, optional = true }
 reth-payload-builder.workspace            = true
 reth-payload-primitives.workspace         = true

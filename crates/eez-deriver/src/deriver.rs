@@ -15,13 +15,13 @@ use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT, BlockCommitterHandle, DeriveOutcome};
+use eez_evm::EezEvmConfig;
 use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Reader, ScannedBatch};
+use eez_primitives::EezTxEnvelope as TransactionSigned;
+use eez_primitives::engine::EezEngineTypes;
 use eez_protocol::outbound_gate::OutboundCallObservation;
 use reth_chainspec::{ChainSpec, EthereumHardforks};
-use reth_ethereum_engine_primitives::EthEngineTypes;
-use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes, execute::BlockBuilder};
-use reth_evm_ethereum::EthEvmConfig;
 use reth_payload_primitives::PayloadTypes;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody, SealedHeader, SignedTransaction};
 use reth_provider::StateProviderFactory;
@@ -55,10 +55,10 @@ struct Inner<L2>
 where
     L2: BlockReader,
 {
-    committer: BlockCommitterHandle<EthEngineTypes>,
+    committer: BlockCommitterHandle<EezEngineTypes>,
     l2_provider: Arc<L2>,
     l1_reader: L1Reader,
-    evm_config: EthEvmConfig,
+    evm_config: EezEvmConfig,
     /// Chainspec-aware deriver
     chain_spec: Arc<ChainSpec>,
     /// L2 block time in seconds — `execute_block` derives each block's
@@ -120,12 +120,12 @@ where
     /// cursor) don't pollute the index.
     ///
     /// `system_tx_cfg = Some(_)` enables the cross-chain STF path: the
-    /// deriver reconstructs the same `SYSTEM_ADDRESS`-signed system txs
+    /// deriver reconstructs the same native system transactions
     /// the composer produced (from the postBatch's `entries[]` /
     /// `l2_entries[]`) and prepends them to the batch's Sync block, so
     /// local replay is byte-identical. `None` is the pure-user-tx STF.
     pub fn new(
-        committer: BlockCommitterHandle<EthEngineTypes>,
+        committer: BlockCommitterHandle<EezEngineTypes>,
         l2_provider: Arc<L2>,
         l1_reader: L1Reader,
         chain_spec: Arc<ChainSpec>,
@@ -135,7 +135,7 @@ where
         system_tx_cfg: Option<eez_protocol::system_tx::SystemTxContext>,
         checkpoint_dir: Option<PathBuf>,
     ) -> Self {
-        let evm_config = EthEvmConfig::new(Arc::clone(&chain_spec));
+        let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec));
         Self {
             inner: Arc::new(Inner {
                 committer,
@@ -793,7 +793,7 @@ where
 
         let sealed_block = outcome.block.sealed_block().clone();
         let sealed_header = sealed_block.sealed_header().clone();
-        let execution_data = <EthEngineTypes as PayloadTypes>::block_to_payload(sealed_block, None);
+        let execution_data = <EezEngineTypes as PayloadTypes>::block_to_payload(sealed_block, None);
         Ok((execution_data, sealed_header))
     }
 
@@ -1795,11 +1795,8 @@ where
     /// SYSTEM_ADDRESS account nonce at the L2 parent block. Both
     /// composer and deriver query this at the same block hash; reth
     /// is deterministic so they read identical values, which makes
-    /// the signed system-tx hashes byte-equal.
+    /// the native system-tx hashes byte-equal.
     fn system_address_nonce_at(&self, parent_block_number: u64) -> DeriverResult<u64> {
-        let Some(cfg) = self.inner.system_tx_cfg.as_ref() else {
-            return Ok(0);
-        };
         let parent_header = self
             .inner
             .l2_provider
@@ -1815,7 +1812,7 @@ where
             .l2_provider
             .state_by_block_hash(parent_header.hash())
             .map_err(DeriverError::l2_provider)?;
-        let system_address = cfg.system_signer.address();
+        let system_address = eez_primitives::SYSTEM_ADDRESS;
         Ok(state
             .account_nonce(&system_address)
             .map_err(DeriverError::l2_provider)?

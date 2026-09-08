@@ -1,4 +1,4 @@
-# The Dockerfile only needs Cargo.{toml,lock}, crates/, genesis.json.
+# The Dockerfile only needs Cargo.{toml,lock}, crates/, vendor/, genesis.json.
 # Everything else (esp. the 20 GB chiado snapshot + target/) must stay out
 # of the build context or `docker build` ships it to the daemon.
 .git/

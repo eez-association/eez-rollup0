@@ -29,7 +29,7 @@ usage:
 The default mode regenerates the committed test genesis files from
 testing/kurtosis/l2-genesis-profile.json. --render creates a deployment-specific
 genesis without modifying committed files. Private keys are never accepted;
-the deployment derives the public system address before invoking this script.
+the deployment uses the reserved native system address.
 EOF
 }
 
@@ -125,8 +125,8 @@ if [[ ! "$system_address" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
     exit 1
 fi
 system_address="$(cast to-check-sum-address "$system_address")"
-if [[ "${system_address,,}" == "0x0000000000000000000000000000000000000000" ]]; then
-    echo "system address must be non-zero" >&2
+if [[ "$(printf '%s' "$system_address" | tr '[:upper:]' '[:lower:]')" != "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076" ]]; then
+    echo "system address must be the reserved native address 0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076" >&2
     exit 1
 fi
 if [[ ! "$system_balance" =~ ^0x[0-9a-fA-F]+$ ]] || [[ "$system_balance" =~ ^0x0+$ ]]; then
@@ -162,12 +162,15 @@ cp -a "$PROTOCOL/lib" "$build_root/lib"
 mkdir "$build_root/script"
 cp "$GENERATOR" "$build_root/script/GenerateEEZL2Runtime.s.sol"
 
-forge_output="$({
+if ! forge_output="$({
     cd "$build_root"
     forge script script/GenerateEEZL2Runtime.s.sol:GenerateEEZL2Runtime \
         --sig "run(uint64,address,bool)" \
         "$rollup_id" "$system_address" "$USE_GAS_LEFT"
-} 2>&1)"
+} 2>&1)"; then
+    printf '%s\n' "$forge_output" >&2
+    exit 1
+fi
 runtime="$(sed -n 's/^  \(0x[0-9a-fA-F]*\)$/\1/p' <<<"$forge_output")"
 
 if [[ -z "$runtime" || "$runtime" == *$'\n'* ]]; then
@@ -235,7 +238,7 @@ render_genesis() {
     mkdir -p "$(dirname "$destination")"
     local tmp
     tmp="$(mktemp "$build_root/genesis.XXXXXX")"
-    if ! jq -e --arg predeploy "${EEZL2_ADDRESS,,}" \
+    if ! jq -e --arg predeploy "$(printf '%s' "$EEZL2_ADDRESS" | tr '[:upper:]' '[:lower:]')" \
         '.alloc | type == "object" and has($predeploy) and (.[$predeploy].code | type == "string")' \
         "$base" >/dev/null
     then
@@ -243,14 +246,17 @@ render_genesis() {
         exit 1
     fi
     jq \
-        --arg predeploy "${EEZL2_ADDRESS,,}" \
+        --arg predeploy "$(printf '%s' "$EEZL2_ADDRESS" | tr '[:upper:]' '[:lower:]')" \
         --arg runtime "$runtime" \
-        --arg system_address "${system_address,,}" \
+        --arg system_address "$(printf '%s' "$system_address" | tr '[:upper:]' '[:lower:]')" \
         --arg system_balance "$system_balance" \
         '.alloc[$predeploy].code = $runtime
          | .alloc[$system_address].balance = $system_balance' \
         "$base" >"$tmp"
-    chmod --reference="$base" "$tmp"
+    python3 - "$base" "$tmp" <<'PY_MODE'
+import os, stat, sys
+os.chmod(sys.argv[2], stat.S_IMODE(os.stat(sys.argv[1]).st_mode))
+PY_MODE
     printf '%s\n' "$tmp"
 }
 
@@ -279,7 +285,10 @@ write_profile() {
             foundryVersion: $foundry_version
         }' >"$tmp"
     if [[ -e "$destination" ]]; then
-        chmod --reference="$destination" "$tmp"
+        python3 - "$destination" "$tmp" <<'PYMODE'
+import os, stat, sys
+os.chmod(sys.argv[2], stat.S_IMODE(os.stat(sys.argv[1]).st_mode))
+PYMODE
     else
         chmod 0644 "$tmp"
     fi

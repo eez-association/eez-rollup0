@@ -247,11 +247,8 @@ fn cancelled_settlement_stops_before_decoding_untrusted_input() {
 #[test]
 fn an_elapsed_deadline_stops_the_pipeline_between_validation_and_settlement() {
     let mut input = AdmittedBlock::test(5, 0x04, 0x05);
-    let empty_body: reth_ethereum_primitives::BlockBody = Default::default();
-    input.rlp = alloy_rlp::encode(reth_ethereum_primitives::Block::new(
-        Default::default(),
-        empty_body,
-    ));
+    let empty_body: eez_primitives::BlockBody = Default::default();
+    input.rlp = alloy_rlp::encode(eez_primitives::Block::new(Default::default(), empty_body));
     let inputs = vec![input];
     let state = inner(Validator::stub(vec![Ok(backend_output_for(&inputs))]));
     // A deadline captured now is already past when the boundary between
@@ -283,11 +280,11 @@ fn an_elapsed_deadline_stops_the_pipeline_between_validation_and_settlement() {
 fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
     let value = U256::from(7);
     let (transaction, call_hash, return_data, sidecar) = strict_inbound_transaction(value);
-    let body: reth_ethereum_primitives::BlockBody = alloy_consensus::BlockBody {
+    let body: eez_primitives::BlockBody = alloy_consensus::BlockBody {
         transactions: vec![transaction],
         ..Default::default()
     };
-    let block = reth_ethereum_primitives::Block::new(Default::default(), body);
+    let block = eez_primitives::Block::new(Default::default(), body);
     let block_rlp = alloy_rlp::encode(block);
     let settling_block = validate::ValidatedBlock::for_test(
         5,

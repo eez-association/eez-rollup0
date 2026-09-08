@@ -15,7 +15,6 @@ use clap::Parser;
 
 use crate::attest::{Attester, NonZeroProofSystemVkey};
 use crate::service::{ServiceLimits, ServiceLimitsParams};
-use crate::settlement::SystemTransactionKey;
 
 /// An infallibly parsed CLI secret that retains only decoded bytes.
 ///
@@ -88,16 +87,6 @@ struct Args {
     #[arg(long = "attester-address", env = "EEZ_ATTESTER_ADDRESS")]
     expected_attester_address: Address,
 
-    /// Private secp256k1 key for the deployment-configured L2 system address,
-    /// used to reconstruct system transactions omitted from Sync-block DA.
-    #[arg(
-        long = "l2-system-key",
-        env = "EEZ_L2_SYSTEM_KEY",
-        value_name = "32-BYTE-HEX",
-        hide_env_values = true
-    )]
-    system_transaction_key: SecretKeyArg,
-
     /// L2 system address embedded in the deployed EEZL2 contract.
     #[arg(long = "l2-system-address", env = "EEZ_L2_SYSTEM_ADDRESS")]
     expected_l2_system_address: Address,
@@ -154,10 +143,9 @@ pub(crate) struct Config {
     pub(crate) chain_document_path: PathBuf,
     /// Expected L1 rollup-registry ID, distinct from the L2 EIP-155 chain ID.
     pub(crate) expected_rollup_id: NonZeroU64,
-    /// Deployment-configured privileged L2 transaction signer.
+    /// Reserved native L2 transaction sender.
     pub(crate) expected_l2_system_address: Address,
     pub(crate) attester: Attester,
-    pub(crate) system_transaction_key: SystemTransactionKey,
     pub(crate) limits: ServiceLimits,
 }
 
@@ -180,18 +168,16 @@ impl Config {
             attester.address() == args.expected_attester_address,
             "attestation key does not match the expected attester address"
         );
-        let system_transaction_key = SystemTransactionKey::new(
-            args.system_transaction_key.into_key("L2 system")?,
-            args.expected_l2_system_address,
-        )
-        .map_err(eyre::Report::new)?;
+        eyre::ensure!(
+            args.expected_l2_system_address == eez_primitives::SYSTEM_ADDRESS,
+            "native system transactions require the reserved EEZ system address"
+        );
         Ok(Self {
             listen_addr: args.listen_addr,
             chain_document_path: args.chain_document_path,
             expected_rollup_id: args.expected_rollup_id,
             expected_l2_system_address: args.expected_l2_system_address,
             attester,
-            system_transaction_key,
             limits: ServiceLimits::new(ServiceLimitsParams {
                 max_window_blocks: args.max_request_blocks,
                 max_window_bytes: args.max_request_bytes,

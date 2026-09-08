@@ -30,10 +30,10 @@ use eez_driver::{
     SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
     witness::{ExecutionWitnessMode, block_witness},
 };
+use eez_evm::EezEvmConfig;
 use eez_l1::{BundleTarget, L1Event, SendOutcome, Submitter};
+use eez_primitives::engine::EezEngineTypes;
 use eez_prover::{ActionableProverFailure, BlockWitness, Prover, ProverError, ProvingContext};
-use reth_ethereum_engine_primitives::EthEngineTypes;
-use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
 use reth_storage_api::{
     BlockReader, BlockSource, StateProvider, StateProviderFactory, TransactionsProvider,
@@ -65,7 +65,6 @@ pub struct CrossChainExecCtx {
     /// Signing key for SYSTEM_ADDRESS — must match `EEZL2`'s
     /// `SYSTEM_ADDRESS` immutable. Used for `loadExecutionTable` and
     /// `executeIncomingCrossChainCall` system transactions.
-    pub system_signer: alloy_signer_local::PrivateKeySigner,
     /// `EEZL2` address, where SYSTEM_ADDRESS calls both
     /// `loadExecutionTable` and `executeIncomingCrossChainCall`.
     pub eezl2_address: Address,
@@ -90,7 +89,7 @@ pub struct CrossChainExecCtx {
     /// plain execution RPCs).
     pub submitter: eez_l1::Submitter,
     /// L1 EOA whose key signs the `postAndVerifyBatch` transaction. Different from
-    /// `system_signer` (which is the L2 SYSTEM_ADDRESS). For dev
+    /// the reserved L2 SYSTEM_ADDRESS. For dev
     /// smoke this is typically the hardhat #0 deployer key; in
     /// production this is the based-rollup composer's L1 wallet.
     pub l1_poster_signer: alloy_signer_local::PrivateKeySigner,
@@ -114,7 +113,7 @@ pub struct CrossChainExecCtx {
 impl std::fmt::Debug for CrossChainExecCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CrossChainExecCtx")
-            .field("system_address", &self.system_signer.address())
+            .field("system_address", &eez_primitives::SYSTEM_ADDRESS)
             .field("eezl2_address", &self.eezl2_address)
             .field("l2_chain_id", &self.l2_chain_id)
             .field("l2_gas_price", &self.l2_gas_price)
@@ -137,7 +136,7 @@ pub struct CrossChainWiring {
             eez_protocol::TargetConfig,
         ),
     >,
-    /// Runtime context for deriving and signing L2 system transactions from
+    /// Runtime context for deriving and encoding L2 system transactions from
     /// composition batches.
     pub exec_ctx: Arc<CrossChainExecCtx>,
     /// Concrete local clients for slot-scoped chained composition, un-erased so
@@ -184,7 +183,7 @@ fn compose_crosschain(
     raw_tx: &[u8],
     sessions: SlotSessions,
     source_state: &mut crate::local::build::DraftDb,
-    source_env: reth_evm::EvmEnvFor<EthEvmConfig>,
+    source_env: reth_evm::EvmEnvFor<EezEvmConfig>,
 ) -> eez_protocol::ComposerResult<(eez_protocol::Composition, SlotSessions, u64)> {
     use eez_protocol::ChainClient as _;
     use eez_protocol::composition::Rollup;
@@ -947,14 +946,14 @@ struct Inner<L2: BlockReader> {
     submitter: Submitter,
     /// EVM config — used by [`build_sync_block`] to construct the
     /// per-Sync-slot block via reth-evm `BlockBuilder`.
-    evm_config: EthEvmConfig,
+    evm_config: EezEvmConfig,
     /// Cross-chain clients and execution context, guaranteed by the
     /// `eez-composer` entrypoint.
     cross_chain: CrossChainWiring,
     /// Handle to the binary-owned `BlockCommitter` actor (the sole engine-API
     /// owner), shared with the Sequencer and Deriver. Slot-context recovery
     /// uses it to reorg an optimistically committed Sync block after L1 failure.
-    committer: BlockCommitterHandle<EthEngineTypes>,
+    committer: BlockCommitterHandle<EezEngineTypes>,
     /// Per-block witnesses for [`eez_prover::ProvingContext::blocks`]. `None`
     /// means the configured in-process prover does not require block witnesses;
     /// it does not mean that the Composer has no prover.
@@ -989,9 +988,9 @@ where
     pub fn new(
         rollups: HashMap<u64, RollupState<L2>>,
         prover: Arc<dyn Prover>,
-        evm_config: EthEvmConfig,
+        evm_config: EezEvmConfig,
         cross_chain: CrossChainWiring,
-        committer: BlockCommitterHandle<EthEngineTypes>,
+        committer: BlockCommitterHandle<EezEngineTypes>,
         witness_source: Option<Arc<dyn eez_prover::ProvingWitnessSource>>,
         timing: RollupTiming,
     ) -> Result<Self, ComposerConfigError> {
@@ -1785,7 +1784,7 @@ where
             .l2_provider
             .state_by_block_hash(parent_hash)
             .map_err(|e| format!("state_by_block_hash({parent_hash}): {e}"))?;
-        let system_address = ctx.system_signer.address();
+        let system_address = eez_primitives::SYSTEM_ADDRESS;
         // Base SYSTEM_ADDRESS nonce; the canonical builder advances it
         // internally (outbound loads, then inbound deliveries) post-drain.
         let nonce = state
@@ -1794,7 +1793,6 @@ where
             .unwrap_or(0);
 
         let stf_cfg = eez_protocol::system_tx::SystemTxContext {
-            system_signer: ctx.system_signer.clone(),
             eezl2_address: ctx.eezl2_address,
             l2_chain_id: ctx.l2_chain_id,
             l2_gas_price: ctx.l2_gas_price,
@@ -2881,8 +2879,6 @@ where
             timestamp,
             suggested_fee_recipient,
             &sync_txs,
-            ctx.system_signer.address(),
-            ctx.eezl2_address,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -3574,9 +3570,7 @@ where
         compositions: &[&eez_protocol::Composition],
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         sync_block_state_root: B256,
-        sync_block: Option<
-            &reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>,
-        >,
+        sync_block: Option<&reth_primitives_traits::RecoveredBlock<eez_primitives::Block>>,
         pair_roots: &[B256],
         outbound_entries: &[eez_protocol::abi::ExecutionEntrySol],
         outbound_user_txs: &[Bytes],
@@ -3873,7 +3867,7 @@ where
             // SYSTEM_ADDRESS-signed forms so an unrecovered failed Sync block
             // cannot reintroduce phantom cross-chain effects.
             for enc in &tx_bytes {
-                let is_system = if enc.first() == Some(&0x7E) {
+                let is_system = if enc.first() == Some(&eez_primitives::SYSTEM_TX_TYPE) {
                     true
                 } else {
                     use alloy_eips::eip2718::Decodable2718 as _;
@@ -3892,7 +3886,7 @@ where
                              intermediate block {cursor_number}: {e}"
                         )
                     })?;
-                    signer == ctx.system_signer.address()
+                    signer == eez_primitives::SYSTEM_ADDRESS
                 };
                 if is_system {
                     return Err(format!(

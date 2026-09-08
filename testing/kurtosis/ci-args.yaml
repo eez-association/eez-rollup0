@@ -50,6 +50,3 @@ eez:
   max_speculative_depth: 0
 
   fee_recipient: "0x0000000000000000000000000000000000000000"
-  # Dedicated deterministic devnet identity; deployment derives and funds its
-  # address in the generated L2 genesis.
-  l2_system_key: "0x6f7d72ecb79c8bf1bd8e7c49a1c4a22741ab708f06bb19e5b5d44a6f0934a7c1"

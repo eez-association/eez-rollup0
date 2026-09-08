@@ -1,0 +1,38 @@
+[package]
+name = "eez-primitives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["serde"]
+serde = []
+
+[dependencies]
+alloy-consensus = { workspace = true, features = ["serde", "k256"] }
+alloy-eips.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-rlp.workspace = true
+alloy-evm.workspace = true
+reth-codecs.workspace = true
+reth-primitives-traits = { workspace = true, features = ["serde", "reth-codec"] }
+reth-ethereum-primitives.workspace = true
+revm.workspace = true
+serde.workspace = true
+
+reth-engine-primitives.workspace = true
+reth-payload-primitives.workspace = true
+reth-ethereum-engine-primitives.workspace = true
+alloy-rpc-types-engine.workspace = true
+
+reth-rpc-traits.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-network.workspace = true
+alloy-serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

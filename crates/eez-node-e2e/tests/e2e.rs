@@ -9,7 +9,7 @@ use alloy_rpc_types_eth::BlockNumberOrTag;
 mod common;
 use common::{
     ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
-    ANVIL_KEY_6, Harness, L2_SYSTEM_KEY, NodeBinary, NodeConfig, NodeHandle,
+    ANVIL_KEY_6, Harness, NodeBinary, NodeConfig, NodeHandle, STAGING_USER_KEY,
     block_number_and_hash_at, override_env, reorg_genesis_state_root, safe_block_state_root,
     send_l2_value_transfer, send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
     wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
@@ -35,11 +35,11 @@ async fn multi_composer_intra_batch_suffix_replay_converges() {
 
     let primary_dir = tempfile::tempdir().unwrap();
     let mirror_dir = tempfile::tempdir().unwrap();
-    // The deterministic system key is not funded on Anvil. Both composers can
+    // The staging user key is not funded on Anvil. Both composers can
     // therefore sequence and prove, but neither can land a batch while the two
     // divergent local histories are being staged.
-    let primary_stage_env = harness.env_for(L2_SYSTEM_KEY, true).await.unwrap();
-    let mirror_stage_env = harness.env_for(L2_SYSTEM_KEY, true).await.unwrap();
+    let primary_stage_env = harness.env_for(STAGING_USER_KEY, true).await.unwrap();
+    let mirror_stage_env = harness.env_for(STAGING_USER_KEY, true).await.unwrap();
     let (primary, mirror) = tokio::try_join!(
         NodeHandle::start_with_datadir(
             "intra-primary-stage",
@@ -842,12 +842,19 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
         .wait_for_l1_blocks(1, Duration::from_secs(15))
         .await
         .expect("L1 did not flush after stopping the composer");
-    wait_for_safe_state(
-        &follower,
-        &chain,
-        reorg_genesis_state_root().unwrap(),
-        DEFAULT_TIMEOUT,
-    )
+    let final_state = chain
+        .latest_execution_state()
+        .await
+        .unwrap()
+        .expect("composer settled a batch before stopping");
+    // An arbitrary historical attestation is insufficient here: a final batch
+    // may have landed while the composer was shutting down.
+    wait_for(DEFAULT_TIMEOUT, || async {
+        Ok(
+            (safe_block_state_root(&follower.l2_rpc_url()).await? == Some(final_state))
+                .then_some(()),
+        )
+    })
     .await
     .expect("follower did not derive the composer's final landed batch");
     let safe_before = block_number_and_hash_at(&follower.l2_rpc_url(), BlockNumberOrTag::Safe)

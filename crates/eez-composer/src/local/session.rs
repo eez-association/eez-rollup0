@@ -9,9 +9,9 @@
 
 use alloy_primitives::{Address, Bytes, U256};
 
+use eez_evm::EezEvmConfig;
 use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory};
 use reth_evm::{ConfigureEvm, Evm as _};
-use reth_evm_ethereum::EthEvmConfig;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::{BlockNumReader, StateProviderFactory};
 use revm::DatabaseCommit;
@@ -43,9 +43,9 @@ pub(super) const DIRECT_CALL_GAS_LIMIT: u64 = 30_000_000;
 /// source simulation synchronous return data, but it does not reproduce
 /// the full `executeIncomingCrossChainCall` path.
 pub struct LocalExecutionSession {
-    evm_config: EthEvmConfig,
+    evm_config: EezEvmConfig,
     state: State<StateProviderDatabase<reth_storage_api::StateProviderBox>>,
-    evm_env: reth_evm::EvmEnvFor<EthEvmConfig>,
+    evm_env: reth_evm::EvmEnvFor<EezEvmConfig>,
     chain_id: u64,
     manager_address: Address,
     /// Optional factory for inspecting nested proxy calls. `None` disables
@@ -365,7 +365,7 @@ impl TargetExecutionSession for LocalExecutionSession {
     }
 }
 
-pub(super) fn disable_checks(env: &mut reth_evm::EvmEnvFor<EthEvmConfig>) {
+pub(super) fn disable_checks(env: &mut reth_evm::EvmEnvFor<EezEvmConfig>) {
     env.cfg_env.disable_base_fee = true;
     env.cfg_env.disable_balance_check = true;
     env.cfg_env.disable_nonce_check = true;

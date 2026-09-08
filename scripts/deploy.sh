@@ -33,7 +33,6 @@ source "$ENV_FILE"
 : "${EEZ_L1_RPC_URL:?EEZ_L1_RPC_URL not set in .env}"
 : "${EEZ_L1_POSTER_KEY:?EEZ_L1_POSTER_KEY not set in .env}"
 : "${EEZ_PROOF_SIGNER_KEY:?EEZ_PROOF_SIGNER_KEY not set in .env}"
-: "${EEZ_L2_SYSTEM_KEY:?EEZ_L2_SYSTEM_KEY not set in .env}"
 
 configured_initial_state_root="${EEZ_INITIAL_STATE_ROOT:-}"
 
@@ -45,9 +44,9 @@ EEZ_DEPLOY_KEY="${EEZ_DEPLOY_KEY:-$EEZ_L1_POSTER_KEY}"
 AUTHORIZED_SIGNER="$(cast wallet address --private-key "$EEZ_PROOF_SIGNER_KEY")"
 PROOF_SYSTEM_VKEY="0x000000000000000000000000${AUTHORIZED_SIGNER#0x}"
 OWNER="$(cast wallet address --private-key "$EEZ_DEPLOY_KEY")"
-EEZ_L2_SYSTEM_ADDRESS="$(cast wallet address --private-key "$EEZ_L2_SYSTEM_KEY")"
+EEZ_L2_SYSTEM_ADDRESS="0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076"
 if [[ "${AUTHORIZED_SIGNER,,}" == "${EEZ_L2_SYSTEM_ADDRESS,,}" ]]; then
-    echo "deploy: proof attestation and L2 system keys must be different" >&2
+    echo "deploy: proof attester must differ from the reserved L2 system address" >&2
     exit 1
 fi
 
@@ -283,8 +282,7 @@ EEZ_L2_BRIDGE_RECEIVER=$EEZ_L2_BRIDGE_RECEIVER
 
 # EEZL2 predeploy baked into genesis.json.
 EEZL2_ADDRESS=0x4200000000000000000000000000000000000007
-# Public deployment binding derived from EEZ_L2_SYSTEM_KEY. The secret key is
-# deliberately not written to this file.
+# Reserved sender for unsigned native L2 system transactions.
 EEZ_L2_SYSTEM_ADDRESS=$EEZ_L2_SYSTEM_ADDRESS
 EEZ_L2_EEZL2_CODE_HASH=$EEZ_L2_EEZL2_CODE_HASH
 EOF

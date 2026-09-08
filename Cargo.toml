@@ -14,6 +14,9 @@ members = [
     "crates/eez-payload-codec",
     "crates/eez-proof-signer",
     "crates/eez-protocol",
+    "crates/eez-primitives",
+    "crates/eez-evm",
+    "vendor/stateless",
     "crates/eez-prover",
     "crates/eez-prover-client",
 ]
@@ -60,6 +63,11 @@ mimalloc           = "0.1"
 # CLI
 clap               = { version = "4", features = ["derive"] }
 
+reth-codecs = { version = "0.3.1" }
+reth-rpc-traits = "0.3.1"
+alloy-consensus-any = { version = "=2.0.5", features = ["serde"] }
+alloy-serde = "=2.0.5"
+
 # reth — pinned to mediocregopher/partial-persistence-clean tip (contains the receipts-reorg truncation fix).
 reth-chainspec                  = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-cli                        = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
@@ -83,6 +91,7 @@ reth-primitives-traits          = { version = "0.3.1", default-features = false 
 reth-provider                   = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-revm                       = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-rpc-eth-api                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-storage-errors = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-storage-api                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-tasks                      = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-trie                       = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
@@ -90,9 +99,29 @@ reth-trie-common                = { git = "https://github.com/paradigmxyz/reth",
 # libmdbx (reth's own mdbx binding) — backs the persistent witness store in a
 # DEDICATED env (never reth's node DB). Same rev so we don't link a 2nd mdbx build.
 reth-libmdbx                    = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-consensus-common = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-errors = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-execution-cache = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-payload-builder-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-ethereum-consensus = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-engine-local = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-rpc = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-rpc-convert = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+
+tries = { git = "https://github.com/eez-association/stateless", rev = "4fc3806bdd0e6b296c761ef4d4b260938365cf45" }
+
+reth-consensus = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb", default-features = false }
+
+revm-bytecode = { version = "=10.0.0", default-features = false }
+revm-database-interface = { version = "=11.0.1", default-features = false }
+revm-state = { version = "=11.0.1", default-features = false }
+
+serde_with = { version = "3.16", default-features = false, features = ["alloc", "macros"] }
 
 # Stateless execution, aligned with the same Reth revision used by the node.
-stateless-reth = { package = "stateless", git = "https://github.com/eez-association/stateless", rev = "4fc3806bdd0e6b296c761ef4d4b260938365cf45" }
+stateless-reth = { package = "stateless", path = "vendor/stateless" }
 
 # reth_gnosis — Gnosis chain (chiado / gnosis mainnet) NodeBuilder.
 # Pinned to the rollup0-fd59fd22 branch which is the reth_gnosis
@@ -113,6 +142,7 @@ revm                            = { version = "38", default-features = false, fe
 #   primitives / sol-types / signer-local                                → 1.x
 # Mismatched majors here will cause duplicate alloy types in the dep graph
 # (manifesting as "trait bound not satisfied" errors at integration sites).
+alloy-evm              = { version = "=0.34.0" }
 alloy-consensus        = { version = "=2.0.5", default-features = false }
 alloy-contract         = { version = "2", default-features = false }
 alloy-eips             = { version = "=2.0.5", default-features = false }
@@ -139,6 +169,8 @@ serde_json             = "1"
 jsonrpsee              = { version = "0.26", features = ["server", "macros"] }
 
 # internal crates
+eez-evm = { path = "crates/eez-evm" }
+eez-primitives = { path = "crates/eez-primitives" }
 eez-composer       = { path = "crates/eez-composer" }
 eez-deriver        = { path = "crates/eez-deriver" }
 eez-driver         = { path = "crates/eez-driver" }

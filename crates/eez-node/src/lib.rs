@@ -25,12 +25,12 @@ use eez_driver::{
 use eez_l1::{
     L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
 };
+use eez_node_common::EezNode;
 use eez_node_common::{
-    EezPayloadBuilder, EezPoolBuilder, L2NodeBuilder, NoRoleArgs, node_cli, read_checkpoint_dir,
-    wait_for_l1_ready, warn_on_deprecated_env,
+    L2NodeBuilder, NoRoleArgs, node_cli, read_checkpoint_dir, wait_for_l1_ready,
+    warn_on_deprecated_env,
 };
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
-use reth_node_builder::components::BasicPayloadServiceBuilder;
 use reth_node_ethereum::EthereumNode;
 use tokio::sync::mpsc;
 use tracing::{Level, event};
@@ -130,11 +130,6 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         prover,
         witness_capture,
     } = composer_proving_from_env()?;
-    let system_key = env::var("EEZ_L2_SYSTEM_KEY")
-        .map_err(|_| eyre::eyre!("EEZ_L2_SYSTEM_KEY required in composer mode"))?;
-    let system_signer =
-        PrivateKeySigner::from_bytes(&B256::from_str(system_key.trim_start_matches("0x"))?)?;
-    let system_address = system_signer.address();
     // Launch the embedded L1 reth first in composer mode — its
     // `StateProviderFactory` backs `LocalChainClient::new_entry` for
     // L1 source-tx simulation. Inline (not in `l1_embedded.rs`)
@@ -256,15 +251,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     // shared `eez-driver` constants so deriver replay and sequencer builds
     // yield identical headers.
     let handle = builder
-        .with_types::<EthereumNode>()
-        .with_components(
-            EthereumNode::components()
-                // Reorged-out system transactions must not leak from reth's
-                // reinjection path into an ordinary Live block.
-                .pool(EezPoolBuilder::new(system_address))
-                .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder::default())),
-        )
-        .with_add_ons(reth_node_ethereum::node::EthereumAddOns::default())
+        .node(EezNode)
         .launch_with_debug_capabilities()
         .await?;
 
@@ -331,7 +318,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         // (build_sync_block → reth-evm BlockBuilder). Same chain spec
         // the engine uses, so blocks produced here pass validation
         // when reth ingests them via newPayload.
-        let evm_config = reth_evm_ethereum::EthEvmConfig::new(chain_spec.clone());
+        let evm_config = eez_evm::EezEvmConfig::new(chain_spec.clone());
 
         // Build the cross-chain composer over the mandatory embedded L1.
         // Inlined because the `FullNode` AddOns type resists a typed helper
@@ -357,16 +344,13 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         let l1_rollup_id = RollupId(l1_rollup_id_u64);
         let l2_rollup_id_typed = RollupId(rollup_id);
 
-        // L1 entry differs per kind: Devnet/Testing use the native
-        // provider + EvmConfig; Chiado wraps it in
-        // `GnosisL1Adapter` and builds a fresh `EthEvmConfig`
-        // over the chiado ChainSpec (source-sim needs only
-        // revm, not GnosisNode's AuRa paths). Both yield the
-        // same concrete client type, so composition is identical.
+        // Source simulation shares the Ethereum EVM rules through EezEvmConfig.
+        // L1 consensus still uses the upstream Ethereum/Gnosis node executor;
+        // the EEZ envelope is used here only by the local composition client.
         let l1_entry_client: Arc<LocalChainClient> = match l1_variant {
             EmbeddedL1::Ethereum(l1_handle) => {
                 let l1_provider = l1_handle.node.provider.clone();
-                let l1_evm_config = l1_handle.node.evm_config.clone();
+                let l1_evm_config = eez_evm::EezEvmConfig::new(l1_handle.node.chain_spec());
                 LocalChainClient::new_entry(
                     l1_provider,
                     l1_evm_config,
@@ -384,8 +368,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                 let l1_chain_spec: Arc<reth_chainspec::ChainSpec> =
                     Arc::new(gnosis_chain_spec.inner.clone());
                 let l1_provider = GnosisL1Adapter::new(chiado_handle.node.provider.clone());
-                let l1_evm_config =
-                    reth_evm_ethereum::EthEvmConfig::new(Arc::clone(&l1_chain_spec));
+                let l1_evm_config = eez_evm::EezEvmConfig::new(Arc::clone(&l1_chain_spec));
                 LocalChainClient::new_entry(
                     l1_provider,
                     l1_evm_config,
@@ -454,7 +437,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         }
         // CrossChainExecCtx: signer + L2 addresses needed to wrap
         // EvmComposer's `(load_table, execute)` calldata pairs
-        // into signed legacy L2 system txs at Sync-slot time.
+        // into unsigned native L2 system txs at Sync-slot time.
         // Constructed only when EvmComposer is constructed —
         // both are tied to embedded L1 mode.
         // Submission RPC for postBatch and inbound source-chain reads.
@@ -498,7 +481,6 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         // ordered mempool submission on plain execution RPCs
         // (dev reth, anvil) detected via JSON-RPC -32601.
         let exec_ctx = Arc::new(eez_composer::CrossChainExecCtx {
-            system_signer,
             eezl2_address,
             l2_chain_id: chain_spec.chain().id(),
             l2_gas_price: L2_SYSTEM_TX_GAS_PRICE,
@@ -536,7 +518,6 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         let deriver_system_tx_cfg = {
             let ctx = &cross_chain.exec_ctx;
             eez_protocol::system_tx::SystemTxContext {
-                system_signer: ctx.system_signer.clone(),
                 eezl2_address: ctx.eezl2_address,
                 l2_chain_id: ctx.l2_chain_id,
                 l2_gas_price: ctx.l2_gas_price,

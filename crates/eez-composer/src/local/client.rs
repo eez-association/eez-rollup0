@@ -8,9 +8,9 @@
 use std::sync::Arc;
 
 use alloy_primitives::Address;
-use reth_ethereum_primitives::TransactionSigned;
+use eez_evm::EezEvmConfig;
+use eez_primitives::EezTxEnvelope as TransactionSigned;
 use reth_evm::{ConfigureEvm, Evm as _};
-use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::SignerRecoverable;
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderBox, StateProviderFactory};
@@ -82,7 +82,7 @@ impl std::fmt::Debug for LocalChainClient {
 }
 
 impl LocalChainClient {
-    fn build_chain_provider<P>(provider: &P, evm_config: EthEvmConfig) -> ChainProvider
+    fn build_chain_provider<P>(provider: &P, evm_config: EezEvmConfig) -> ChainProvider
     where
         P: StateProviderFactory
             + HeaderProvider<Header = alloy_consensus::Header>
@@ -104,7 +104,7 @@ impl LocalChainClient {
     /// Build an entry-role client.
     pub fn new_entry<P>(
         provider: P,
-        evm_config: EthEvmConfig,
+        evm_config: EezEvmConfig,
         rollup_id: RollupId,
         dispatch_address: Address,
         dialect: eez_protocol::ChainDialect,
@@ -131,7 +131,7 @@ impl LocalChainClient {
     /// Build a follower-role client.
     pub fn new_follower<P>(
         provider: P,
-        evm_config: EthEvmConfig,
+        evm_config: EezEvmConfig,
         rollup_id: RollupId,
         dispatch_address: Address,
         dialect: eez_protocol::ChainDialect,
@@ -208,7 +208,7 @@ impl LocalChainClient {
         raw_tx: Vec<u8>,
         dispatcher: &mut CompositionBuilder,
         state: &mut State<StateProviderDatabase<StateProviderBox>>,
-        evm_env: reth_evm::EvmEnvFor<EthEvmConfig>,
+        evm_env: reth_evm::EvmEnvFor<EezEvmConfig>,
     ) -> ExecutorResult<()> {
         self.source_sim(raw_tx, dispatcher, state, evm_env)
     }
@@ -220,7 +220,7 @@ impl LocalChainClient {
         raw_tx: Vec<u8>,
         dispatcher: &mut CompositionBuilder,
         state: &mut State<StateProviderDatabase<StateProviderBox>>,
-        evm_env: reth_evm::EvmEnvFor<EthEvmConfig>,
+        evm_env: reth_evm::EvmEnvFor<EezEvmConfig>,
     ) -> ExecutorResult<()> {
         use alloy_eips::eip2718::Decodable2718;
 

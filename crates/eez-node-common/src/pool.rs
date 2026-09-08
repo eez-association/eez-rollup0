@@ -3,10 +3,11 @@
 
 use std::{any::Any, time::SystemTime};
 
+use crate::pool_transaction::EezPooledTransaction;
 use alloy_eips::{eip7840::BlobParams, merge::EPOCH_SLOTS};
 use alloy_primitives::Address;
+use eez_primitives::EezTxEnvelope;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::ConfigureEvm;
 use reth_node_api::{NodePrimitives, PrimitivesTy};
 use reth_node_builder::{
@@ -16,8 +17,8 @@ use reth_node_builder::{
 };
 use reth_primitives_traits::SealedBlock;
 use reth_transaction_pool::{
-    CoinbaseTipOrdering, EthPooledTransaction, Pool, PoolTransaction, TransactionOrigin,
-    TransactionValidationOutcome, TransactionValidationTaskExecutor, TransactionValidator,
+    CoinbaseTipOrdering, Pool, PoolTransaction, TransactionOrigin, TransactionValidationOutcome,
+    TransactionValidationTaskExecutor, TransactionValidator,
     blobstore::DiskFileBlobStore,
     error::{InvalidPoolTransactionError, PoolTransactionError},
     validate::EthTransactionValidator,
@@ -27,9 +28,9 @@ use tracing::{Level, event};
 /// reth's Ethereum pool with [`SystemAddressGate`] around its validator.
 pub type EezTransactionPool<Client, S, Evm> = Pool<
     TransactionValidationTaskExecutor<
-        SystemAddressGate<EthTransactionValidator<Client, EthPooledTransaction, Evm>>,
+        SystemAddressGate<EthTransactionValidator<Client, EezPooledTransaction, Evm>>,
     >,
-    CoinbaseTipOrdering<EthPooledTransaction>,
+    CoinbaseTipOrdering<EezPooledTransaction>,
     S,
 >;
 
@@ -166,7 +167,7 @@ impl<Types, Node, Evm> PoolBuilder<Node, Evm> for EezPoolBuilder
 where
     Types: NodeTypes<
             ChainSpec: EthereumHardforks,
-            Primitives: NodePrimitives<SignedTx = TransactionSigned>,
+            Primitives: NodePrimitives<SignedTx = EezTxEnvelope>,
         >,
     Node: FullNodeTypes<Types = Types>,
     Evm: ConfigureEvm<Primitives = PrimitivesTy<Types>> + Clone + 'static,
@@ -247,7 +248,8 @@ where
 mod tests {
     use alloy_consensus::{TxLegacy, transaction::Recovered};
     use alloy_primitives::{Signature, TxKind, U256, address};
-    use reth_ethereum_primitives::Transaction;
+    use reth_ethereum_primitives::{Transaction, TransactionSigned};
+    use reth_transaction_pool::EthPooledTransaction;
     use reth_transaction_pool::validate::ValidTransaction;
 
     use super::*;

@@ -150,7 +150,6 @@ fn main() {
     println!();
     println!("######## DERIVER SyncPair RECONSTRUCTION (build_cross_chain_sync_pairs) ########");
     {
-        use alloy_signer_local::PrivateKeySigner;
         use eez_protocol::system_tx::{
             SystemTxContext, build_cross_chain_sync_pairs, interleave_sync_block_txs,
         };
@@ -177,12 +176,8 @@ fn main() {
                     .map(|t| alloy_primitives::Bytes::from(t.clone())),
             )
             .collect();
-        // This diagnostic only needs the transaction shape and nonce assignment,
-        // so an arbitrary example key is sufficient. The printed load calldata is
-        // independent of that key.
+        // Reconstruction requires only public configuration and the parent nonce.
         let cfg = SystemTxContext {
-            system_signer: PrivateKeySigner::from_bytes(&alloy_primitives::B256::with_last_byte(1))
-                .unwrap(),
             eezl2_address: alloy_primitives::address!("4200000000000000000000000000000000000007"),
             l2_chain_id: 1,
             l2_gas_price: 1_000_000_000,
@@ -218,7 +213,7 @@ fn main() {
     println!("######## FULL TX DECODE (block-major) ########");
     use alloy_consensus::Transaction as _;
     use alloy_eips::eip2718::Decodable2718 as _;
-    use reth_ethereum_primitives::TransactionSigned;
+    use eez_primitives::EezTxEnvelope as TransactionSigned;
     use reth_primitives_traits::SignerRecoverable as _;
     let from_block = 501u64;
     // map flat tx index -> L2 block

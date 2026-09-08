@@ -17,7 +17,7 @@ use std::time::Duration;
 use alloy_eips::{BlockNumHash, BlockNumberOrTag};
 use alloy_provider::{Provider, RootProvider};
 use eez_driver::{BlockCommitterHandle, ForkchoiceOutcome};
-use reth_ethereum_engine_primitives::EthEngineTypes;
+use eez_primitives::engine::EezEngineTypes;
 use reth_primitives_traits::SealedHeader;
 use reth_storage_api::{BlockIdReader, HeaderProvider};
 use thiserror::Error;
@@ -61,7 +61,7 @@ enum SafeCompat {
 /// through the shared [`BlockCommitterHandle`].
 #[derive(Debug)]
 pub(crate) struct UnsafeHeadFollower<P> {
-    committer: BlockCommitterHandle<EthEngineTypes>,
+    committer: BlockCommitterHandle<EezEngineTypes>,
     sequencer_rpc: RootProvider,
     /// Local chain reader: resolves the current safe anchor and the
     /// candidate head's ancestry for the compatibility check.
@@ -76,7 +76,7 @@ where
     P: HeaderProvider<Header = alloy_consensus::Header> + BlockIdReader,
 {
     pub(crate) fn new(
-        committer: BlockCommitterHandle<EthEngineTypes>,
+        committer: BlockCommitterHandle<EezEngineTypes>,
         sequencer_rpc: RootProvider,
         local: P,
         poll_interval: Duration,

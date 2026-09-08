@@ -439,7 +439,12 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     let raw_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
     let transactions = raw_transactions
         .iter()
-        .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+        .map(|raw| {
+            <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                raw.as_ref(),
+            )
+            .unwrap()
+        })
         .collect::<Vec<_>>();
     let settling_rlp = block_rlp(transactions);
     let verifier = system_transactions();
@@ -475,7 +480,12 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     let extra_block = block_rlp(
         extra_transactions
             .into_iter()
-            .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+            .map(|raw| {
+                <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                    raw.as_ref(),
+                )
+                .unwrap()
+            })
             .collect(),
     );
     let extra_transaction =
@@ -524,7 +534,12 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     .unwrap();
     let wrong_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&wrong_pairs)
         .into_iter()
-        .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+        .map(|raw| {
+            <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                raw.as_ref(),
+            )
+            .unwrap()
+        })
         .collect::<Vec<_>>();
     let wrong_block = block_rlp(wrong_transactions);
     assert_eq!(
@@ -588,7 +603,12 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
     let settling_rlp = block_rlp(
         raw_transactions
             .iter()
-            .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+            .map(|raw| {
+                <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                    raw.as_ref(),
+                )
+                .unwrap()
+            })
             .collect(),
     );
     let encoded_sidecars = sidecars
@@ -638,7 +658,12 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
     let wrong_block = block_rlp(
         mutated_second_load
             .into_iter()
-            .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+            .map(|raw| {
+                <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                    raw.as_ref(),
+                )
+                .unwrap()
+            })
             .collect(),
     );
     assert_eq!(
@@ -702,7 +727,12 @@ fn da_payload_binds_the_complete_mixed_sync_sequence_and_sidecar_order() {
     let raw_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
     let transactions = raw_transactions
         .iter()
-        .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+        .map(|raw| {
+            <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                raw.as_ref(),
+            )
+            .unwrap()
+        })
         .collect::<Vec<_>>();
     let settling_rlp = block_rlp(transactions);
     let sidecars = vec![outbound_sidecar.abi_encode(), inbound_sidecar.abi_encode()];
@@ -739,7 +769,12 @@ fn da_payload_binds_the_complete_mixed_sync_sequence_and_sidecar_order() {
     let reordered_block = block_rlp(
         reordered
             .into_iter()
-            .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+            .map(|raw| {
+                <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                    raw.as_ref(),
+                )
+                .unwrap()
+            })
             .collect(),
     );
     assert_eq!(
