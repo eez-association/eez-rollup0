@@ -785,6 +785,20 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
         0,
         "all non-poison wave transactions must settle without eviction",
     );
+    assert!(
+        w.node
+            .log_count_matching(&["temporarily underfunded outbound tx re-queued for a later slot"])
+            .unwrap()
+            >= WAVE_SETTERS.len(),
+        "every deposit-funded withdrawal wave must exercise the bounded funding retry",
+    );
+    assert_eq!(
+        w.node
+            .log_count_matching(&["underfunded outbound tx exhausted MAX_BUNDLE_ATTEMPTS"])
+            .unwrap(),
+        0,
+        "deposit-funded withdrawals must settle before exhausting their retry limit",
+    );
 
     assert!(
         w.node.count_signal(signals::BUNDLE_ACCEPTED).unwrap() > bundles_before,

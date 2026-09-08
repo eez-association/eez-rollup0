@@ -273,11 +273,11 @@ impl std::fmt::Debug for CrossChainWiring {
     }
 }
 
-/// Failed settlement attempts before a held user_tx is evicted as probable
-/// poison. This covers both relay drops and proof requests that still fail
-/// after their retry episode. After this many failures, the transaction and
-/// its nonce-dependent suffix are evicted so they cannot block the FIFO queue
-/// indefinitely.
+/// Failed inclusion attempts before a held user_tx is evicted as probable
+/// poison. This covers funding deferrals, relay drops, and proof requests that
+/// still fail after their retry episode. After this many failures, the
+/// transaction and its nonce-dependent suffix are evicted so they cannot block
+/// the FIFO queue indefinitely.
 ///
 /// Drain-time simulations are chained per chain in canonical order
 /// (`compose_crosschain` over the slot's L1 state and the Sync block under
@@ -816,6 +816,37 @@ fn push_deferred_root(
         deferred_gaps.push(gap);
     }
     deferred.push((idx, tx));
+}
+
+/// Count one failed inclusion attempt at the point where the actual root is
+/// classified as underfunded. Its untried nonce suffix never calls this helper.
+fn advance_funding_retry(rollup_id: u64, mut tx: HeldTx) -> (HeldTx, bool) {
+    tx.attempts = tx.attempts.saturating_add(1);
+    let exhausted = tx.attempts >= MAX_BUNDLE_ATTEMPTS;
+    if exhausted {
+        event!(
+            name: "eez.composer.cc_compose.funding_retry_exhausted",
+            Level::ERROR,
+            rollup_id,
+            tx_hash = %tx.hash,
+            sender = %tx.sender,
+            nonce = tx.nonce,
+            attempts = tx.attempts,
+            "underfunded outbound tx exhausted MAX_BUNDLE_ATTEMPTS; evicting its nonce chain (resubmit after funding)",
+        );
+    } else {
+        event!(
+            name: "eez.composer.cc_compose.funding_retry",
+            Level::INFO,
+            rollup_id,
+            tx_hash = %tx.hash,
+            sender = %tx.sender,
+            nonce = tx.nonce,
+            attempts = tx.attempts,
+            "temporarily underfunded outbound tx re-queued for a later slot",
+        );
+    }
+    (tx, exhausted)
 }
 
 /// Drop the drain indices, restoring the pool's FIFO order. The drain composes
@@ -2151,9 +2182,19 @@ where
                                 tx_hash = %held.hash,
                                 need = %need,
                                 escrow = %avail,
-                                "outbound withdrawal exceeds current L1 rollup escrow; holding this sender's nonce chain for a later slot",
+                                "outbound withdrawal exceeds current L1 rollup escrow; applying bounded funding retry to this sender's nonce chain",
                             );
-                            push_deferred_root(&mut funding_deferred, &mut funding_gaps, idx, held);
+                            let (held, exhausted) = advance_funding_retry(rollup_id, held);
+                            if exhausted {
+                                push_poison_root(&mut poison, &mut poison_gaps, held);
+                            } else {
+                                push_deferred_root(
+                                    &mut funding_deferred,
+                                    &mut funding_gaps,
+                                    idx,
+                                    held,
+                                );
+                            }
                             continue;
                         }
                     }
@@ -2368,9 +2409,14 @@ where
                         sender = %held.sender,
                         nonce = held.nonce,
                         error = %e,
-                        "outbound target lacks funds; holding this sender's nonce chain while inbounds continue",
+                        "outbound target lacks funds; applying bounded funding retry while inbounds continue",
                     );
-                    push_deferred_root(&mut funding_deferred, &mut funding_gaps, idx, held);
+                    let (held, exhausted) = advance_funding_retry(rollup_id, held);
+                    if exhausted {
+                        push_poison_root(&mut poison, &mut poison_gaps, held);
+                    } else {
+                        push_deferred_root(&mut funding_deferred, &mut funding_gaps, idx, held);
+                    }
                 }
                 Err(e) if sim_error_is_poison(&e) => {
                     event!(
@@ -4507,6 +4553,56 @@ mod tests {
         assert_eq!(deferred[0].0, 4);
         assert_eq!(deferred[1].0, 5);
         assert_eq!(gaps, vec![(sender, Direction::Outbound, 2)]);
+    }
+
+    #[test]
+    fn funding_retry_exhausts_on_the_third_attempt() {
+        let sender = Address::repeat_byte(0xd);
+        for (attempts, expected, exhausted) in [(0, 1, false), (1, 2, false), (2, 3, true)] {
+            let mut tx = held(sender, Direction::Outbound, 0, 1);
+            tx.attempts = attempts;
+            let (tx, actual_exhausted) = advance_funding_retry(1, tx);
+            assert_eq!(tx.attempts, expected);
+            assert_eq!(actual_exhausted, exhausted);
+        }
+    }
+
+    #[test]
+    fn funding_retry_limit_evicts_the_full_nonce_suffix() {
+        let pool = HeldPool::new();
+        let sender = Address::repeat_byte(0xd);
+        let mut root = held(sender, Direction::Outbound, 0, 1);
+        root.attempts = MAX_BUNDLE_ATTEMPTS - 1;
+        let in_flight_suffix = held(sender, Direction::Outbound, 1, 2);
+        let queued_suffix = held(sender, Direction::Outbound, 2, 3);
+        let opposite_direction = held(sender, Direction::Inbound, 0, 4);
+        let independent = held(Address::repeat_byte(0xe), Direction::Outbound, 0, 5);
+        pool.push_contiguous(root, 0).unwrap();
+        pool.push_contiguous(in_flight_suffix, 0).unwrap();
+        pool.push_contiguous(queued_suffix, 0).unwrap();
+        let mut deferred: Vec<_> = pool.pop_n(2).into_iter().enumerate().collect();
+        pool.push_contiguous(opposite_direction.clone(), 0).unwrap();
+        pool.push_contiguous(independent.clone(), 0).unwrap();
+
+        let mut poison = Vec::new();
+        let mut poison_gaps = Vec::new();
+        let (_, root) = deferred.remove(0);
+        let (root, exhausted) = advance_funding_retry(1, root);
+        assert!(exhausted);
+        push_poison_root(&mut poison, &mut poison_gaps, root);
+        assert_eq!(poison.len(), 1);
+        assert_eq!(poison_gaps, vec![(sender, Direction::Outbound, 0)]);
+        for tx in &poison {
+            let _ = pool.evict_chain_at_or_above(tx.sender, tx.direction, tx.nonce);
+        }
+        requeue_unprocessed(&pool, 1, &poison_gaps, deferred);
+
+        let remaining = pool.pop_all();
+        assert_eq!(
+            remaining.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
+            vec![opposite_direction.hash, independent.hash]
+        );
+        pool.release_in_flight_batch(&remaining);
     }
 
     #[test]
