@@ -84,14 +84,13 @@ standalone chiado-reth.
 cp .env.example .env
 #   EEZ_L1_RPC_URL=<tip chiado RPC>   EEZ_L1_POSTER_KEY=<operator key>
 #   EEZ_PROOF_SIGNER_KEY=<operator key>   (its address becomes the proof system's authorizedSigner)
-#   EEZ_L2_SYSTEM_KEY=<separate L2 system-transaction key>
 EEZ_DEPLOY_SKIP_SIMULATION=1 make deploy-protocol
 ```
 
 This deploys EEZ + ECDSAProofSystem + the rollup manager, registers the
 rollup, deploys the L1 bridge contracts, and writes **`deployments.env`**
 (registry, proof system, rollup id, deploy block, bridge, and EEZL2 addresses).
-The deploy derives the public L2 system address from `EEZ_L2_SYSTEM_KEY`,
+The deploy uses reserved native system address `0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076`,
 generates and funds its canonical EEZL2 genesis, and registers that exact state
 root; the private key is never written to `deployments.env`. It also writes the
 L2 **`datadir/genesis.json`** whose timestamp is pinned to the deploy block. The
@@ -172,13 +171,14 @@ cargo run -p eez-node -- node \
 ```
 
 Select the non-default follower role explicitly. `EEZ_L1_CHAIN_ID` must match
-the numeric chain ID served by `EEZ_L1_RPC_URL`. A follower also requires the
-system signer and L2 execution identity so it can reconstruct Sync blocks:
+the numeric chain ID served by `EEZ_L1_RPC_URL`. A follower requires only public
+L2 execution configuration to reconstruct Sync blocks. Native system transactions
+use the reserved address and need no signing key (see
+[the wire format and upgrade requirements](docs/native-system-transactions.md)):
 
 ```bash
 # L1-derived follower; optionally add `--sequencer-rpc <URL>` after `node`.
 EEZ_L1_CHAIN_ID="<numeric-l1-chain-id>" \
-EEZ_L2_SYSTEM_KEY="<system-private-key>" \
 EEZL2_ADDRESS="<eezl2-contract-address>" \
 EEZ_ROLLUP_ID="<numeric-rollup-id>" \
 cargo run -p eez-follower -- node \

@@ -144,7 +144,7 @@ mod tests {
     use alloy_primitives::{address, b256};
 
     use super::*;
-    use crate::testkit::{SYSTEM_PRIVATE_KEY, TEST_SYSTEM_ADDRESS};
+    use crate::testkit::{LEGACY_PRIVATE_KEY, LEGACY_SIGNER_ADDRESS, TEST_SYSTEM_ADDRESS};
 
     fn test_proof_system_vkey() -> NonZeroProofSystemVkey {
         NonZeroProofSystemVkey::new(B256::repeat_byte(0x42)).unwrap()
@@ -177,23 +177,23 @@ mod tests {
     #[test]
     fn system_identity_is_selected_by_deployment() {
         let attester = Attester::new(
-            SYSTEM_PRIVATE_KEY,
+            LEGACY_PRIVATE_KEY,
             test_proof_system_vkey(),
             test_proof_system(),
             Address::repeat_byte(0xbb),
         )
         .unwrap();
 
-        assert_eq!(attester.address(), TEST_SYSTEM_ADDRESS);
+        assert_eq!(attester.address(), LEGACY_SIGNER_ADDRESS);
     }
 
     #[test]
     fn rejects_the_reserved_system_identity_without_exposing_its_key() {
         let error = Attester::new(
-            SYSTEM_PRIVATE_KEY,
+            LEGACY_PRIVATE_KEY,
             test_proof_system_vkey(),
             test_proof_system(),
-            TEST_SYSTEM_ADDRESS,
+            LEGACY_SIGNER_ADDRESS,
         )
         .unwrap_err();
         let displayed = error.to_string();
@@ -203,6 +203,6 @@ mod tests {
             displayed,
             "attestation key must not derive the reserved L2 system address"
         );
-        assert!(!displayed.contains(&SYSTEM_PRIVATE_KEY.to_string()));
+        assert!(!displayed.contains(&LEGACY_PRIVATE_KEY.to_string()));
     }
 }

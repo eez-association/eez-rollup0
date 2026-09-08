@@ -10,6 +10,8 @@ mod artifacts;
 mod ports;
 pub mod signals;
 
+pub mod native;
+
 use std::{
     collections::HashSet,
     fmt::Write as _,
@@ -59,8 +61,8 @@ pub const ANVIL_KEY_6: &str = "0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d
 pub const ANVIL_ATTESTER_KEY: &str =
     "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906");
-/// Dedicated deterministic L2 system identity; deliberately not an Anvil account.
-pub const L2_SYSTEM_KEY: &str =
+/// Unfunded ordinary sender used to stage divergent speculative history.
+pub const STAGING_USER_KEY: &str =
     "0x6f7d72ecb79c8bf1bd8e7c49a1c4a22741ab708f06bb19e5b5d44a6f0934a7c1";
 
 // K = L1/L2 = 2 leaves one L2 slot for proving.
@@ -202,6 +204,14 @@ impl Anvil {
 
     pub async fn reorg(&self, depth: u64) -> Result<()> {
         let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
+        // Anvil rebuilds the suffix immediately. Without an explicit timestamp
+        // interval, all replacement blocks inherit the ancestor's timestamp,
+        // violating the L1 slot cadence used for deterministic L2 derivation.
+        let _: serde_json::Value = provider
+            .client()
+            .request("anvil_setBlockTimestampInterval", (L1_BLOCK_TIME_SECS,))
+            .await
+            .context("anvil_setBlockTimestampInterval")?;
         let _: serde_json::Value = provider
             .client()
             .request("anvil_reorg", (depth, Vec::<serde_json::Value>::new()))
@@ -377,7 +387,7 @@ impl ProofSignerHandle {
         let port_lease = PortLease::tcp();
         let listen = format!("127.0.0.1:{}", port_lease.port());
         let attester = signer_address(cfg.signer_key)?;
-        let l2_system_address = signer_address(L2_SYSTEM_KEY)?;
+        let l2_system_address = eez_primitives::SYSTEM_ADDRESS;
         let (log_path, log_dir) = test_log_destination("eez-proof-signer")?;
         let working_dir = tempfile::tempdir().context("proof signer working directory")?;
         let log = std::fs::File::create(&log_path).context("create proof signer log")?;
@@ -407,7 +417,6 @@ impl ProofSignerHandle {
             ])
             .env_clear()
             .env("EEZ_PROOF_SIGNER_KEY", cfg.signer_key)
-            .env("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY)
             .env("NO_COLOR", "1")
             .env("RUST_LOG", "info")
             .stdout(Stdio::from(log))
@@ -834,7 +843,6 @@ impl Harness {
             ("EEZ_L1_RPC_URL", self.anvil.rpc_url.clone()),
             ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
             ("EEZ_L1_CHAIN", "testing".to_string()),
-            ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
             ("EEZL2_ADDRESS", format!("{EEZL2_ADDRESS:#x}")),
             (
                 "EEZ_L1_BLOCK_TIME_MS",
@@ -3197,10 +3205,14 @@ pub async fn account_code(rpc_url: &str, addr: Address) -> Result<Bytes> {
 
 pub async fn receipt_ok(rpc_url: &str, hash: alloy_primitives::TxHash) -> Result<Option<bool>> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    Ok(provider
-        .get_transaction_receipt(hash)
-        .await?
-        .map(|r| r.status()))
+    // Native system receipts carry type 0x76, outside Ethereum's closed enum.
+    let receipt: Option<
+        TransactionReceipt<alloy_consensus_any::AnyReceiptEnvelope<alloy_rpc_types_eth::Log>>,
+    > = provider
+        .client()
+        .request("eth_getTransactionReceipt", (hash,))
+        .await?;
+    Ok(receipt.map(|r| alloy_network::ReceiptResponse::status(&r)))
 }
 
 /// Ports, addresses, keys, and genesis files for the cross-chain fixture.
@@ -3306,7 +3318,6 @@ impl CrossChainConfig {
                 self.l1_genesis.0.to_string_lossy().into_owned(),
             ),
             ("EEZ_L1_POSTER_KEY", self.poster_key.to_string()),
-            ("EEZ_L2_SYSTEM_KEY", L2_SYSTEM_KEY.to_string()),
             ("EEZL2_ADDRESS", format!("{EEZL2_ADDRESS:#x}")),
             (
                 "EEZ_L1_BLOCK_TIME_MS",

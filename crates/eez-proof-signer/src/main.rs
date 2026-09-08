@@ -74,7 +74,6 @@ async fn main() -> eyre::Result<()> {
             validator,
             config.expected_rollup_id,
             config.attester,
-            config.system_transaction_key,
         )?),
         limits,
     );

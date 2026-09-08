@@ -12,6 +12,7 @@ WORKDIR /build
 # Build the signer from the repository workspace and its shared lockfile.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 
 ENV CARGO_TARGET_DIR=/build/target
 

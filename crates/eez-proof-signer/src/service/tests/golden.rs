@@ -7,9 +7,7 @@ use eez_control_rpc::v1::{
     BlockWitness, ExecutionWitness, PostBatch, ProveChunk, ProveHeader, prove_chunk,
 };
 
-use super::{
-    ServiceState, TestServer, expected_rollup_id, test_attester_for, test_system_transaction_key,
-};
+use super::{ServiceState, TestServer, expected_rollup_id, test_attester_for};
 use crate::attest::NonZeroProofSystemVkey;
 use crate::cancel::CancellationToken;
 use crate::testkit::TEST_SYSTEM_ADDRESS;
@@ -108,7 +106,7 @@ async fn captured_current_protocol_window_is_validated_and_signed() {
     for recorded in recorded_blocks {
         let number = fixture_u64(recorded, "number");
         let rlp = fixture_hex(&fixture(FIXTURE, &format!("block-{number}.rlp.hex")));
-        let block = alloy_rlp::decode_exact::<reth_ethereum_primitives::Block>(&rlp).unwrap();
+        let block = alloy_rlp::decode_exact::<eez_primitives::Block>(&rlp).unwrap();
         let hash = block.header.hash_slow();
         assert_eq!(number, block.header.number);
         assert_eq!(hash, fixture_str(recorded, "hash").parse::<B256>().unwrap());
@@ -138,13 +136,7 @@ async fn captured_current_protocol_window_is_validated_and_signed() {
     let test_attester = test_attester_for(proof_system_vkey, proof_system);
     let test_attester_address = test_attester.address();
     let state = Arc::new(
-        ServiceState::new(
-            validator,
-            expected_rollup_id(rollup_id),
-            test_attester,
-            test_system_transaction_key(),
-        )
-        .unwrap(),
+        ServiceState::new(validator, expected_rollup_id(rollup_id), test_attester).unwrap(),
     );
 
     let response = TestServer::new(state).await.attest(window).await;
@@ -230,7 +222,7 @@ fn captured_five_field_outbound_events_are_not_decoded_as_target_events() {
     }];
     for (number, encoded_rlp, encoded_witness) in &blocks {
         let rlp = fixture_hex(encoded_rlp);
-        let block = alloy_rlp::decode_exact::<reth_ethereum_primitives::Block>(&rlp).unwrap();
+        let block = alloy_rlp::decode_exact::<eez_primitives::Block>(&rlp).unwrap();
         assert_eq!(block.header.number, *number);
         chunks.push(ProveChunk {
             kind: Some(prove_chunk::Kind::Block(BlockWitness {

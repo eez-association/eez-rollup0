@@ -23,8 +23,8 @@
 use alloy_consensus::{BlockHeader, Header};
 use alloy_primitives::{B256, Bytes, U256, keccak256};
 use alloy_rpc_types_debug::ExecutionWitness;
+use eez_primitives::{Block, EezPrimitives};
 use eez_prover::BlockWitness;
-use reth_ethereum_primitives::{Block, EthPrimitives};
 use reth_evm::{ConfigureEvm, execute::Executor};
 use reth_primitives_traits::RecoveredBlock;
 use reth_revm::{database::StateProviderDatabase, witness::ExecutionWitnessRecord};
@@ -73,7 +73,7 @@ pub fn block_witness<P, E>(
 ) -> eyre::Result<BlockWitness>
 where
     P: StateProviderFactory + HeaderProvider<Header = Header>,
-    E: ConfigureEvm<Primitives = EthPrimitives>,
+    E: ConfigureEvm<Primitives = EezPrimitives>,
 {
     let witness = block_execution_witness(provider, evm_config, block, mode)?;
     Ok(BlockWitness {
@@ -93,7 +93,7 @@ pub fn block_execution_witness<P, E>(
 ) -> eyre::Result<ExecutionWitness>
 where
     P: StateProviderFactory + HeaderProvider<Header = Header>,
-    E: ConfigureEvm<Primitives = EthPrimitives>,
+    E: ConfigureEvm<Primitives = EezPrimitives>,
 {
     let parent_hash = block.header().parent_hash();
     let block_number = block.header().number();
