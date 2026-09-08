@@ -37,7 +37,7 @@ implementation deliberately uses an L1-derived-only view.
 
 The service uses the deployment settings shared with the stateless signer:
 `EEZ_ROLLUP_ID`, `EEZ_VKEY`, `EEZ_PROOF_SYSTEM`, `EEZ_ATTESTER_ADDRESS`,
-`EEZ_L2_SYSTEM_KEY`, and `EEZ_L2_SYSTEM_ADDRESS`. Its attestation secret uses a
+and `EEZ_L2_SYSTEM_ADDRESS` (the reserved native system address). Its attestation secret uses a
 distinct name, `EEZ_STATEFUL_PROOF_SIGNER_KEY`, so enabling it does not put the
 node into Composer mode.
 

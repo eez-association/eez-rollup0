@@ -5,6 +5,7 @@ use std::num::NonZeroU64;
 use alloy_consensus::{SignableTransaction as _, Transaction as _};
 use alloy_primitives::{Address, B256, Bytes, I256, Signature, U256, address, b256};
 use alloy_sol_types::{SolCall as _, SolValue as _};
+use eez_primitives::{BlockBody, EezTxEnvelope as TransactionSigned};
 use eez_protocol::EvmBatch;
 use eez_protocol::abi::{
     ExecutionEntrySol, ExpectedL1ToL2CallSol, ExpectedOutgoingCrossChainCallSol,
@@ -20,12 +21,10 @@ use eez_protocol::{
     CallHashInput, CallMode, EntryRollingHash, RollupId, common_cross_chain_call_hash,
     l2_outbound_call_hash,
 };
-use reth_ethereum_primitives::{BlockBody, TransactionSigned};
 use reth_primitives_traits::{BlockBody as _, SignerRecoverable as _};
 
 use crate::testkit::{
-    SYSTEM_PRIVATE_KEY, SYSTEM_TX, TEST_SYSTEM_ADDRESS, checkpoint, system_transaction_context,
-    test_proof_system_vkey,
+    SYSTEM_TX, TEST_SYSTEM_ADDRESS, checkpoint, system_transaction_context, test_proof_system_vkey,
 };
 use crate::validate::{OutboundEventObservation, SettlementBlockEvidence, ValidatedBlock};
 
@@ -34,8 +33,7 @@ use super::{
     CanonicalPostBatch, ClaimedEntryShape, DaPayloadError, EffectPrefixError, EthereumBlock,
     InboundCandidate, InboundEffectError, InboundObservationError, ObservedEffectKind,
     OutboundEffectError, PostBatchDecodeError, PublicInputError, SettlingBlockObservations,
-    StateUpdateChainError, SystemTransactionKey,
-    authorize_inbound_effects as authorize_inbound_effects_for_rollup,
+    StateUpdateChainError, authorize_inbound_effects as authorize_inbound_effects_for_rollup,
     authorize_outbound_effects as authorize_outbound_effects_for_rollup, bind_effects_to_execution,
     decode_canonical_post_batch, encode_da_payload, inspect_inbound_candidate,
     inspect_settling_block, inspect_validated_settling_block, recompute_public_input_hash,
@@ -46,9 +44,7 @@ use super::{
 const EXPECTED_PROOF_SYSTEM: Address = address!("00000000000000000000000000000000000000aa");
 
 fn system_transactions() -> super::SystemTransactionReconstructor {
-    SystemTransactionKey::new(SYSTEM_PRIVATE_KEY, TEST_SYSTEM_ADDRESS)
-        .unwrap()
-        .into_reconstructor(1, NonZeroU64::new(1).unwrap())
+    super::SystemTransactionReconstructor::new(1, NonZeroU64::new(1).unwrap())
 }
 
 fn build_inbound_transactions(
@@ -59,7 +55,12 @@ fn build_inbound_transactions(
     eez_protocol::system_tx::build_inbound_system_txs(entries, context, starting_nonce)
         .unwrap()
         .into_iter()
-        .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+        .map(|raw| {
+            <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                raw.as_ref(),
+            )
+            .unwrap()
+        })
         .collect()
 }
 
@@ -399,10 +400,13 @@ fn l2_expected_outgoing_call() -> ExpectedOutgoingCrossChainCallSol {
 }
 
 fn transaction(encoded: &str) -> TransactionSigned {
-    alloy_rlp::decode_exact(hex::decode(encoded).unwrap()).unwrap()
+    <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(
+        &hex::decode(encoded).unwrap(),
+    )
+    .unwrap()
 }
 
-/// Build a canonically signed system transaction carrying the current inbound ABI.
+/// Build a canonical native system transaction carrying the current inbound ABI.
 fn target_system_inbound_transaction() -> TransactionSigned {
     let mut call = l2_to_l1_call();
     call.sourceRollupId = RollupId::MAINNET.0;

@@ -24,8 +24,8 @@ use alloy_eips::BlockHashOrNumber;
 use alloy_primitives::{B256, Bytes};
 use alloy_rpc_types_debug::ExecutionWitness;
 use eez_driver::witness::{ExecutionWitnessMode, block_witness};
+use eez_primitives::{Block, EezPrimitives};
 use eez_prover::{BlockWitness, ProvingWitnessSource};
-use reth_ethereum_primitives::{Block, EthPrimitives};
 use reth_evm::ConfigureEvm;
 use reth_libmdbx::{DatabaseFlags, Environment, Geometry, WriteFlags};
 use reth_storage_api::{BlockReader, HeaderProvider, StateProviderFactory, TransactionVariant};
@@ -216,7 +216,7 @@ where
         + HeaderProvider<Header = Header>
         + Send
         + Sync,
-    E: ConfigureEvm<Primitives = EthPrimitives> + Send + Sync,
+    E: ConfigureEvm<Primitives = EezPrimitives> + Send + Sync,
 {
     fn block_witness(&self, number: u64) -> Result<BlockWitness, String> {
         match self.store.get(number) {
@@ -274,7 +274,7 @@ fn build_block_witness<P, E>(
 ) -> Result<BlockWitness, String>
 where
     P: BlockReader<Block = Block> + StateProviderFactory + HeaderProvider<Header = Header>,
-    E: ConfigureEvm<Primitives = EthPrimitives>,
+    E: ConfigureEvm<Primitives = EezPrimitives>,
 {
     let block = provider
         .recovered_block(id, TransactionVariant::WithHash)
@@ -303,7 +303,7 @@ pub async fn run_capture<P, E, F>(
         + Send
         + Sync
         + 'static,
-    E: ConfigureEvm<Primitives = EthPrimitives> + Clone + Send + Sync + 'static,
+    E: ConfigureEvm<Primitives = EezPrimitives> + Clone + Send + Sync + 'static,
     F: Fn() -> u64 + Send + 'static,
 {
     while let Some(hash) = rx.recv().await {

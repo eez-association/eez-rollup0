@@ -4,7 +4,7 @@
 # dependency-layer caching — reth is a large, rarely-changing tree, so
 # the cooked-deps layer is reused across code changes.
 #
-# The build is self-contained in `crates/` + `Cargo.{toml,lock}`; the
+# The build is self-contained in `crates/`, `vendor/`, and `Cargo.{toml,lock}`; the
 # Solidity protocol submodule and `contracts/` are NOT needed (ABI is
 # inline `sol!`). Contract deploys are a separate `forge` step (see
 # scripts/deploy.sh + README).
@@ -27,6 +27,7 @@ WORKDIR /build
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ── builder: cook deps (cached), then build eez-node ─────────────────
@@ -53,6 +54,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
 # Workspace sources; only this layer rebuilds on first-party code changes.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=eez-node-target,target=/build/target,sharing=locked \
