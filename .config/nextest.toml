@@ -1,7 +1,7 @@
-# The eez-node integration tests spawn Anvil, a builder stub, and multiple
+# The eez-node-e2e integration tests spawn Anvil, a builder stub, and multiple
 # reth processes. Keep those tests serial without constraining other packages.
 [[profile.default.overrides]]
-filter = "package(eez-node) & kind(test)"
+filter = "package(eez-node-e2e) & kind(test)"
 threads-required = "num-cpus"
 test-group = "integration"
 

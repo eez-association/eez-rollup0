@@ -116,6 +116,9 @@ pub enum L1Event {
         /// LAST stateDelta's `newState` for our rollup — the claimed
         /// full-chain end. Diagnostics only; see `settlement.final_state`.
         claimed_new_state: Option<B256>,
+        /// `true` for the LAST batch of its L1 block. The Deriver waits for it to
+        /// move safe: two batches in one L1 block can rewrite the same L2 height.
+        last_in_l1_block: bool,
     },
     /// L1 finalized head advanced.
     Finalized { block_number: u64, block_hash: B256 },
@@ -706,7 +709,13 @@ impl L1Watcher {
                 "emitting BatchPosted events to subscribers",
             );
         }
-        for b in scanned {
+        // A scan range never splits an L1 block and `get_logs` returns ascending by
+        // (block, tx index), so a block's batches are adjacent and peeking is enough.
+        let mut batches = scanned.into_iter().peekable();
+        while let Some(b) = batches.next() {
+            let last_in_l1_block = batches
+                .peek()
+                .is_none_or(|next| next.l1_block_number != b.l1_block_number);
             self.emit(L1Event::BatchPosted {
                 l1_block_number: b.l1_block_number,
                 l1_block_hash: b.l1_block_hash,
@@ -718,6 +727,7 @@ impl L1Watcher {
                 settlement: b.settlement,
                 claimed_current_state: b.claimed_current_state,
                 claimed_new_state: b.claimed_new_state,
+                last_in_l1_block,
             });
         }
     }
@@ -1459,6 +1469,78 @@ mod tests {
 
         assert_eq!(state.tip(), Some((100, hash)), "tip unchanged");
         assert!(rx.try_recv().is_err(), "no events on unchanged tip");
+    }
+
+    fn scanned_batch(l1_block_number: u64, tx: u8) -> ScannedBatch {
+        ScannedBatch {
+            l1_block_number,
+            l1_block_hash: B256::with_last_byte(
+                u8::try_from(l1_block_number).expect("test block numbers fit in u8"),
+            ),
+            tx_hash: B256::with_last_byte(tx),
+            submitter: Address::ZERO,
+            call_data: Bytes::new(),
+            post_batch_input: Bytes::new(),
+            state_applied: true,
+            settlement: crate::scan::Settlement::NONE,
+            claimed_current_state: None,
+            claimed_new_state: None,
+        }
+    }
+
+    fn emitted_flags(rx: &mut broadcast::Receiver<L1Event>) -> Vec<(B256, bool)> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                L1Event::BatchPosted {
+                    tx_hash,
+                    last_in_l1_block,
+                    ..
+                } => out.push((tx_hash, last_in_l1_block)),
+                other => panic!("expected BatchPosted, got {other:?}"),
+            }
+        }
+        out
+    }
+
+    /// The flag gates the Deriver's safe advance, so only the block's last batch
+    /// may carry it.
+    #[test]
+    fn last_in_l1_block_marks_only_each_block_final_batch() {
+        let (watcher, mut rx) = test_watcher();
+
+        // Block 100 holds two batches (two composers), block 101 holds one.
+        watcher.emit_scanned_batches(
+            100,
+            101,
+            vec![
+                scanned_batch(100, 0xA1),
+                scanned_batch(100, 0xA2),
+                scanned_batch(101, 0xB1),
+            ],
+        );
+
+        assert_eq!(
+            emitted_flags(&mut rx),
+            vec![
+                (B256::with_last_byte(0xA1), false),
+                (B256::with_last_byte(0xA2), true),
+                (B256::with_last_byte(0xB1), true),
+            ],
+        );
+    }
+
+    /// A block with one batch must not defer: nothing follows it.
+    #[test]
+    fn sole_batch_in_l1_block_is_last() {
+        let (watcher, mut rx) = test_watcher();
+
+        watcher.emit_scanned_batches(100, 100, vec![scanned_batch(100, 0xC1)]);
+
+        assert_eq!(
+            emitted_flags(&mut rx),
+            vec![(B256::with_last_byte(0xC1), true)],
+        );
     }
 
     #[test]

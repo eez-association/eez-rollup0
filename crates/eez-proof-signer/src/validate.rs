@@ -371,9 +371,6 @@ pub(crate) enum ValidationError {
     /// Locally prepared validation state violated an implementation invariant.
     #[error("{0}")]
     InternalInvariant(String),
-    /// The locally derived checkpoint plan exceeds the operator's quota.
-    #[error("transaction checkpoint plan requests {requested} roots; maximum is {max}")]
-    CheckpointLimit { requested: usize, max: usize },
     /// The request disappeared while a synchronous backend was still active.
     #[error("validation cancelled")]
     Cancelled,
@@ -455,7 +452,6 @@ impl Validator {
         self.validate_window(
             AdmittedBlocks::for_test(blocks.to_vec()),
             &CancellationToken::default(),
-            usize::MAX,
         )
     }
 
@@ -466,11 +462,9 @@ impl Validator {
         &self,
         blocks: AdmittedBlocks,
         cancellation: &CancellationToken,
-        max_transaction_state_checkpoints: usize,
     ) -> Result<ValidatedWindow, ValidationError> {
         let mut blocks = blocks.into_vec();
-        let output =
-            self.run_backend(&mut blocks, cancellation, max_transaction_state_checkpoints)?;
+        let output = self.run_backend(&mut blocks, cancellation)?;
         check_backend_window_output(blocks, output)
             .map(CheckedBackendWindowOutput::into_validated_window)
             .map_err(|error| ValidationError::InvalidBackendOutput(error.to_string()))
@@ -482,12 +476,9 @@ impl Validator {
         &self,
         blocks: &mut [AdmittedBlock],
         cancellation: &CancellationToken,
-        max_transaction_state_checkpoints: usize,
     ) -> Result<BackendWindowOutput, ValidationError> {
         match self {
-            Self::Stateless(backend) => {
-                backend.validate_blocks(blocks, cancellation, max_transaction_state_checkpoints)
-            }
+            Self::Stateless(backend) => backend.validate_blocks(blocks, cancellation),
             #[cfg(test)]
             Self::Stub(stub) => {
                 if cancellation.is_cancelled() {

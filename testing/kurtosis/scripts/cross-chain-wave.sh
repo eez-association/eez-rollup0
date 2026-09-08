@@ -4,7 +4,7 @@
 # MODES (EEZ_WAVE_MODE, default "mixed"):
 #   inbound     — L1→L2 only (deposit + setValue + setValueNoRet, direct + wrapper)
 #   outbound    — L2→L1 only (withdraw + setValue + setValueNoRet, direct + wrapper)
-#   mixed       — inbound AND outbound, submitted together so they share a Sync block
+#   mixed       — inbound AND outbound traffic in one workload
 #   mixed-pure  — mixed + pure-L2 filler txs interleaved
 #
 # Cross-chain submission goes to the transparent FRONTS published by eez-node:
@@ -195,7 +195,12 @@ registry_events() { # <event-sig> [from-block]
         "$1" --rpc-url "$L1" --json 2>/dev/null | jq 'length' 2>/dev/null || echo 0
 }
 
-settled_count() { refresh_node_log; strip_ansi <"$NODE_LOG" | grep -c "settled=true" || true; }
+settled_count() {
+    refresh_node_log
+    strip_ansi <"$NODE_LOG" \
+        | grep -F '"event_name":"eez.composer.bundle.observed"' \
+        | grep -Fc '"settled":true' || true
+}
 
 wait_for_builder() {
     local deadline=$(( SECONDS + ${EEZ_BUILDER_WARM_SECS:-600} )) base hits
@@ -224,9 +229,9 @@ wait_for_poison_eviction() {
     while (( SECONDS < deadline )); do
         refresh_node_log
         evidence=$(strip_ansi <"$NODE_LOG" \
-            | grep -F 'eez.composer.cc_compose.poison_eviction_completed' \
-            | grep -E "tx_hash=$hash|\"tx_hash\":\"$hash\"" \
-            | grep -E "direction=\"?$direction\"?|\"direction\":\"$direction\"" \
+            | grep -F '"event_name":"eez.composer.cc_compose.poison_eviction_completed"' \
+            | grep -F "\"tx_hash\":\"$hash\"" \
+            | grep -F "\"direction\":\"$direction\"" \
             | tail -1 || true)
         if [[ -n "$evidence" && "$(receipt_status "$hash" "$rpc")" == "missing" ]]; then
             return 0
@@ -405,8 +410,9 @@ run_waves() {
         for h in "${IN_HASHES[@]:-}";  do [[ -n "$h" && "$(receipt_status "$h" "$L1")" == "1" ]] && confirmed=$((confirmed+1)); done
         for h in "${OUT_HASHES[@]:-}"; do [[ -n "$h" && "$(receipt_status "$h" "$L2")" == "1" ]] && confirmed=$((confirmed+1)); done
         refresh_node_log
-        evicted=$(grep -c "evicted" "$NODE_LOG" 2>/dev/null || true); evicted=${evicted:-0}
-        local line="    progress: $confirmed/$total confirmed, $evicted eviction log line(s) (elapsed ${SECONDS}s)"
+        evicted=$(grep -c '"event_name":"eez.composer.cc_compose.poison_eviction_completed"' \
+            "$NODE_LOG" 2>/dev/null || true); evicted=${evicted:-0}
+        local line="    progress: $confirmed/$total confirmed, $evicted poison eviction(s) (elapsed ${SECONDS}s)"
         [[ "$line" != "$last_line" ]] && { echo "$line"; last_line="$line"; }
         (( confirmed >= total )) && { echo "    all confirmed"; break; }
         sleep 5
@@ -415,9 +421,6 @@ run_waves() {
         echo "    ✗ only $confirmed/$total cross-chain transactions succeeded" >&2
         exit 1
     fi
-    echo "    settling 15s..."; sleep 15
-    refresh_node_log
-
     # ── Confirmed view (only receipt-confirmed ops count) ──────────────
     local m mh mside mkind marg
     local IN_LAST_VALUE="" IN_LAST_NORET="" IN_DEP_SUM=0
@@ -445,7 +448,29 @@ run_waves() {
     # ── Assertions ──────────────────────────────────────────────────────
     echo
     echo "==> assertions"
-    local ok_all=1 signer_ok=0 attested_hash=""
+    local ok_all=1 signer_ok=0 attested_hash="" effects_ready=0
+    local effects_deadline=$((SECONDS + ${EEZ_EFFECTS_WAIT_SECS:-120})) v n d
+
+    while (( SECONDS < effects_deadline )); do
+        effects_ready=1
+        if (( do_in )); then
+            v=$(retry cast call "$L2_VALUE" 'value()(uint256)' --rpc-url "$L2")
+            n=$(retry cast call "$L2_VALUE_NORET" 'value()(uint256)' --rpc-url "$L2")
+            d=$(retry cast balance "$L2_DEP_RECIPIENT" --rpc-url "$L2")
+            [[ "$v" == "$IN_LAST_VALUE" && "$n" == "$IN_LAST_NORET" \
+                && "$d" == "$((DEP_BEFORE + IN_DEP_SUM))" ]] || effects_ready=0
+        fi
+        if (( do_out )); then
+            v=$(retry cast call "$L1_VALUE" 'value()(uint256)' --rpc-url "$L1")
+            n=$(retry cast call "$L1_VALUE_NORET" 'value()(uint256)' --rpc-url "$L1")
+            d=$(retry cast balance "$L1_WD_RECIPIENT" --rpc-url "$L1")
+            [[ "$v" == "$OUT_LAST_VALUE" && "$n" == "$OUT_LAST_NORET" \
+                && "$d" == "$((WD_BEFORE + OUT_WD_SUM))" ]] || effects_ready=0
+        fi
+        (( effects_ready )) && break
+        sleep 3
+    done
+    (( effects_ready )) || { echo "    ✗ cross-chain effects did not converge"; ok_all=0; }
 
     # A deterministic destination failure must be evicted before source-chain
     # execution, leaving no receipt and releasing the sender nonce.
@@ -481,7 +506,6 @@ run_waves() {
     }
 
     if (( do_in )); then
-        local v n d
         v=$(retry cast call "$L2_VALUE" 'value()(uint256)' --rpc-url "$L2")
         n=$(retry cast call "$L2_VALUE_NORET" 'value()(uint256)' --rpc-url "$L2")
         d=$(retry cast balance "$L2_DEP_RECIPIENT" --rpc-url "$L2")
@@ -490,7 +514,6 @@ run_waves() {
         check_eq "inbound deposits converged (L2 recipient bal)"   "$d" "$((DEP_BEFORE + IN_DEP_SUM))"
     fi
     if (( do_out )); then
-        local v n d
         v=$(retry cast call "$L1_VALUE" 'value()(uint256)' --rpc-url "$L1")
         n=$(retry cast call "$L1_VALUE_NORET" 'value()(uint256)' --rpc-url "$L1")
         d=$(retry cast balance "$L1_WD_RECIPIENT" --rpc-url "$L1")
@@ -520,8 +543,11 @@ run_waves() {
     # L1's stored state root must converge with the current L2 safe block.
     local LAST_SETTLED="" L1_TRACKED="" L1_RECHECK="" L2_ROOT="" L2_SAFE=0 SAFE_BLOCK=""
     local root_deadline=$((SECONDS + ${EEZ_STATE_ROOT_WAIT_SECS:-30})) root_matched=0
-    LAST_SETTLED=$(strip_ansi <"$NODE_LOG" | grep "bundle outcome observed" | grep "settled=true" \
-        | grep -oE "sync_height=[0-9]+" | grep -oE "[0-9]+" | sort -n | tail -1 || true)
+    LAST_SETTLED=$(strip_ansi <"$NODE_LOG" \
+        | grep -F '"event_name":"eez.composer.bundle.observed"' \
+        | grep -F '"settled":true' \
+        | grep -oE '"sync_height":[0-9]+' | grep -oE '[0-9]+' \
+        | sort -n | tail -1 || true)
     if [[ -n "$LAST_SETTLED" ]]; then
         while (( SECONDS < root_deadline )); do
             L1_TRACKED=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' \
@@ -549,12 +575,12 @@ run_waves() {
             echo "    ✗ L2 safe head $L2_SAFE is below settled height $LAST_SETTLED"; ok_all=0
         fi
     else
-        echo "    ✗ no settled bundle found in the node log (grep 'settled=true')"; ok_all=0
+        echo "    ✗ no settled bundle found in the node log"; ok_all=0
     fi
 
     # Zero production deriver divergence errors.
     local DIVERGED
-    DIVERGED=$(grep -c "diverged from L1-confirmed batch" "$NODE_LOG" 2>/dev/null || true); DIVERGED=${DIVERGED:-0}
+    DIVERGED=$(grep -c '"event_name":"eez.deriver.state.diverged_' "$NODE_LOG" 2>/dev/null || true); DIVERGED=${DIVERGED:-0}
     if (( DIVERGED == 0 )); then
         echo "    ✓ zero state-root divergence events"
     else
@@ -563,7 +589,8 @@ run_waves() {
 
     # Dropped-bundle telemetry.
     local DROPS
-    DROPS=$(grep -c "bundle dropped" "$NODE_LOG" 2>/dev/null || true); DROPS=${DROPS:-0}
+    DROPS=$(grep -F '"event_name":"eez.composer.bundle.observed"' "$NODE_LOG" 2>/dev/null \
+        | grep -c '"outcome":"Dropped' || true); DROPS=${DROPS:-0}
     echo "    ℹ dropped-bundle log lines: $DROPS"
 
     # Correlate the composer's accepted attestation with the signer's completed
@@ -572,13 +599,13 @@ run_waves() {
     refresh_node_log
     refresh_signer_log
     attested_hash=$(strip_ansi <"$NODE_LOG" \
-        | grep -E 'remote prover attested the window|eez.prover_client.attested' \
-        | grep -oE 'hash[":=]+"?0x[0-9a-fA-F]{64}' \
-        | tail -1 | sed -E 's/^hash[":=]+"?//' || true)
+        | grep -F '"event_name":"eez.prover_client.attested"' \
+        | grep -oE '"hash":"0x[0-9a-fA-F]{64}"' \
+        | tail -1 | cut -d'"' -f4 || true)
     if [[ -n "$attested_hash" ]]; then
         signer_line=$(strip_ansi <"$SIGNER_LOG" \
-            | grep -E 'window validated and signed|eez.proof_signer.window_signed' \
-            | grep -E "recomputed_public_inputs_hash=$attested_hash|\"recomputed_public_inputs_hash\":\"$attested_hash\"" \
+            | grep -F '"event_name":"eez.proof_signer.window_signed"' \
+            | grep -F "\"recomputed_public_inputs_hash\":\"$attested_hash\"" \
             | tail -1 || true)
     fi
     if [[ -n "$signer_line" ]]; then

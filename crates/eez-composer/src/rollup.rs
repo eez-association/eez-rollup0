@@ -1,7 +1,7 @@
 //! Per-rollup state held by the [`Composer`](crate::Composer) umbrella.
 //!
 //! [`RollupConfig`] is the immutable, env-derived knobs for one rollup
-//! (its id, proof system address, mode flag). [`RollupState`] adds the
+//! (its id and mode flag). [`RollupState`] adds the
 //! runtime references the umbrella reads while building batches: the
 //! local L2 provider, the L1-confirmed cursor.
 //!
@@ -20,14 +20,6 @@ use crate::optimistic::OptimisticallyIncluded;
 pub struct RollupConfig {
     /// `rollupId` returned by `EEZ.registerRollup` for this L2.
     pub rollup_id: u64,
-    /// L1 block where `EEZ` was deployed. Lower bound for the startup
-    /// `BatchPosted` log scan that seeds the L1-confirmed cursor.
-    ///
-    /// Semantically a global value (one EEZ contract serves all
-    /// rollups). Held per-rollup for now to keep this S4.2 move
-    /// minimal; refactor to a top-level field when multi-rollup
-    /// startup orchestration lands.
-    pub deploy_block: u64,
     /// Based-rollup mode flag. `true`: external batches log at INFO
     /// (anyone can post). `false`: external batches log at ERROR (this
     /// rollup is sequenced, no one else should be posting). Same code
@@ -36,8 +28,7 @@ pub struct RollupConfig {
 }
 
 impl RollupConfig {
-    /// Read from `EEZ_*` env vars: `EEZ_ROLLUP_ID`,
-    /// `EEZ_ECDSA_PROOF_SYSTEM_ADDRESS`, `EEZ_REGISTRY_DEPLOY_BLOCK`,
+    /// Read from `EEZ_*` env vars: `EEZ_ROLLUP_ID` and
     /// `EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES` (defaults to `false`).
     ///
     /// # Errors
@@ -51,10 +42,6 @@ impl RollupConfig {
             .map_err(|_| L1Error::Config("EEZ_ROLLUP_ID is required".into()))?
             .parse::<u64>()
             .map_err(|e| L1Error::Config(format!("EEZ_ROLLUP_ID: {e}")))?;
-        let deploy_block = env::var("EEZ_REGISTRY_DEPLOY_BLOCK")
-            .map_err(|_| L1Error::Config("EEZ_REGISTRY_DEPLOY_BLOCK is required".into()))?
-            .parse::<u64>()
-            .map_err(|e| L1Error::Config(format!("EEZ_REGISTRY_DEPLOY_BLOCK: {e}")))?;
         let expect_external_batches = match env::var("EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES") {
             Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
                 "1" | "true" | "yes" | "on" => true,
@@ -75,7 +62,6 @@ impl RollupConfig {
 
         Ok(Self {
             rollup_id,
-            deploy_block,
             expect_external_batches,
         })
     }

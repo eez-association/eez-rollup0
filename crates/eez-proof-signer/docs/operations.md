@@ -41,7 +41,6 @@ independent:
 - aggregate known-field protobuf bytes;
 - declared block count;
 - aggregate witness item count;
-- locally selected transaction checkpoint count;
 - per-message idle timeout; and
 - end-to-end request deadline.
 

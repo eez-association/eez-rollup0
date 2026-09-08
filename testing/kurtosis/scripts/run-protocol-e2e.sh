@@ -11,11 +11,13 @@ RESULT_DIR="${EEZ_CI_RESULT_DIR:-$REPO/artifacts/kurtosis-e2e}/protocol-e2e"
 
 SUPPORTED_TARGETS=(
     one_way                           # bridge, counter, and counterL2
+    multi_tx                          # chained state across separate txs
 )
 
+# One cross-chain call per transaction is the supported shape; several in one
+# transaction is not. These must be rejected without stalling the network.
 UNSUPPORTED_TARGETS=(
-    multi_call   # nested replay
-    multi_tx     # chained state
+    multi_call   # >1 cross-chain call in a single tx
     nested       # nested replay
     reentrant    # reentrancy
     revert       # forced revert

@@ -56,7 +56,6 @@ async fn main() -> eyre::Result<()> {
         max_request_blocks = window_limits.blocks,
         max_request_bytes = window_limits.payload_bytes,
         max_request_witness_items = window_limits.witness_items,
-        max_transaction_state_checkpoints = limits.max_transaction_state_checkpoints(),
         max_decoding_message_bytes = limits.max_decoding_message_bytes(),
         stream_idle_timeout_secs = limits.stream_idle_timeout().as_secs(),
         request_timeout_secs = limits.request_timeout().as_secs(),

@@ -31,7 +31,6 @@ fn service_limits_reject_invalid_boundaries() {
                 max_window_blocks: nz(1),
                 max_window_bytes: nz(1024),
                 max_window_witness_items: nz(1024),
-                max_transaction_state_checkpoints: 8,
                 stream_idle_timeout: idle_timeout,
                 request_timeout,
             })
@@ -76,20 +75,6 @@ async fn a_mismatched_header_rollup_is_rejected_without_waiting_for_eof() {
     assert_eq!(status.message(), "window rollup identity rejected");
     assert_eq!(inner.validator.stub_remaining(), 1);
     drop(sender);
-}
-
-#[tokio::test]
-async fn a_checkpoint_plan_above_the_configured_limit_is_resource_exhausted() {
-    let validator = Validator::stateless_for_test(Default::default(), TEST_SYSTEM_ADDRESS);
-    let server = TestServer::with_limits(inner(validator), limits_with_checkpoint_limit(0)).await;
-
-    let status = server.prove(stateless_transaction_window()).await;
-
-    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
-    assert_eq!(
-        status.message(),
-        "window validation checkpoint quota exceeded"
-    );
 }
 
 #[tokio::test]

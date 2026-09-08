@@ -285,7 +285,6 @@ impl ProveSvc {
         // here because no earlier phase has blocking work to stop.
         let cancellation = CancellationToken::default();
         let worker_cancellation = cancellation.clone();
-        let max_transaction_state_checkpoints = self.limits.max_transaction_state_checkpoints();
         let deadline = timing.deadline;
         // Blocking tasks do not inherit the async request span automatically.
         let span = Span::current();
@@ -295,7 +294,6 @@ impl ProveSvc {
                     &state,
                     blocks,
                     submitted_post_batch_calldata,
-                    max_transaction_state_checkpoints,
                     deadline,
                     &worker_cancellation,
                 )

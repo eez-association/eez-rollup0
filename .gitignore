@@ -22,3 +22,5 @@ chiado-*/
 artifacts/
 # Per-network env files (private keys)
 .env.*
+# ...except the templates, which carry placeholders instead of keys.
+!.env.*.example

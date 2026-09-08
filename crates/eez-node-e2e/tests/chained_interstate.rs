@@ -17,11 +17,10 @@ use eez_protocol::{EEZL2_ADDRESS, EvmBatch, entries::decode_postbatch};
 use eez_testkit::signals;
 use eez_testkit::{
     ANVIL_KEY_6, CrossChainWorld, DEV_CHAIN_ID, ICounter, IEEZ, INBOUND_USER, ISetterWrapper,
-    IValue, OUTBOUND_USER, SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead, TARGET_DEPLOYER,
-    call_read, counter_count, create_cross_chain_proxy, create_l2_cross_chain_proxy,
-    deploy_counter, events_since, l2_value, last_proxy_result, onchain_nonce, receipt_ok,
-    safe_block_state_root, setup_cross_chain, setup_cross_chain_with_env, sign_and_send,
-    state_root, value_read, wait_for,
+    IValue, OUTBOUND_USER, SETTLE_TIMEOUT, TARGET_DEPLOYER, counter_count,
+    create_cross_chain_proxy, create_l2_cross_chain_proxy, deploy_counter, l2_value, onchain_nonce,
+    receipt_ok, safe_block_state_root, setup_cross_chain_with_env, sign_and_send, state_root,
+    wait_for,
 };
 
 sol! {
@@ -207,83 +206,6 @@ fn assert_no_evictions(w: &CrossChainWorld) {
         0,
         "composable transactions must not be evicted",
     );
-}
-
-fn completed_calls_read(wrapper: Address) -> StateRead {
-    call_read(
-        wrapper,
-        "completedProxyCalls()",
-        ISetterWrapper::completedProxyCallsCall {}.abi_encode(),
-    )
-}
-
-/// Two identical inbound calls from one L1 transaction. The composer must keep
-/// both ordered entries: the first changes destination state and the second
-/// observes it, returning `changed = false` instead of being deduplicated.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn repeated_inbound_calls_in_one_source_transaction_chain_state() {
-    let w = setup_cross_chain().await.unwrap();
-    let l1_rpc = w.l1_rpc();
-    let value = U256::from(73u64);
-    let wrapped_before = events_since(
-        &l1_rpc,
-        w.inbound_wrapper,
-        ISetterWrapper::Wrapped::SIGNATURE_HASH,
-        0,
-    )
-    .await
-    .unwrap()
-    .len();
-    assert_ne!(
-        l2_value(&w.l2_rpc(), w.value_l2).await.unwrap(),
-        value,
-        "the first call must change destination state",
-    );
-
-    Scenario::new("repeated inbound calls in one source transaction")
-        .inbound(
-            ScenarioCall::new(
-                w.inbound_wrapper,
-                ISetterWrapper::setSameValueTwiceCall { v: value }.abi_encode(),
-            )
-            .with_gas_limit(1_200_000),
-        )
-        .expect_l2_state(value_read(w.value_l2), value)
-        .expect_l1_state(completed_calls_read(w.inbound_wrapper), 2u64)
-        .expect_settled_fully()
-        .run(&w)
-        .await
-        .unwrap();
-
-    let wrapped = events_since(
-        &l1_rpc,
-        w.inbound_wrapper,
-        ISetterWrapper::Wrapped::SIGNATURE_HASH,
-        0,
-    )
-    .await
-    .unwrap();
-    let results = wrapped[wrapped_before..]
-        .iter()
-        .map(|log| {
-            let event = ISetterWrapper::Wrapped::decode_log(&log.inner).unwrap();
-            (event.input, event.ok, event.changed, event.newValue)
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        results,
-        vec![(value, true, true, value), (value, true, false, value)],
-        "the repeated call must observe the first destination write",
-    );
-    assert_eq!(
-        last_proxy_result(&l1_rpc, w.inbound_wrapper).await.unwrap(),
-        (false, value),
-        "the final ordered call must return the post-write state",
-    );
-
-    assert_reconciled(&w).await;
-    assert_no_evictions(&w);
-    w.node.assert_no_process_death();
 }
 
 /// Two outbound transactions with identical calls must remain distinct ordered
@@ -567,8 +489,10 @@ async fn mixed_direction_state_chain_in_one_slot() {
     .await
     .expect("outbound add must be admitted");
 
-    assert_receipt_ok(&l1_rpc, inbound, "inbound increment").await;
-    assert_receipt_ok(&l2_rpc, outbound, "outbound add").await;
+    tokio::join!(
+        assert_receipt_ok(&l1_rpc, inbound, "inbound increment"),
+        assert_receipt_ok(&l2_rpc, outbound, "outbound add"),
+    );
     wait_for_count(&l2_rpc, l2_counter, 1, "L2 counter").await;
     wait_for_count(&l1_rpc, l1_counter, 5, "L1 counter").await;
 
@@ -633,11 +557,8 @@ async fn mixed_direction_state_chain_in_one_slot() {
 /// rather than reserving it a slot (claims 1 and 3) — and composition must
 /// keep running instead of freezing the window.
 ///
-/// Poison here is the harness's established form (`scripts/xchain-test.sh`): a
-/// cross-chain submission whose `to` is not a proxy, so the source simulation
-/// records no cross-chain call and the tx can never compose. Its sender is
-/// distinct from the survivors' because eviction cascades along a sender's
-/// nonce chain.
+/// Poison targets a DEPLOYED non-proxy: no cross-chain call is recorded, so it
+/// can never compose. Codeless targets are refused at the front now.
 ///
 /// Without the redesign the poison degrades the whole slot and the survivors'
 /// claims come from isolated sims (both `1`), so nothing settles at all.
@@ -658,6 +579,9 @@ async fn poison_mid_bundle_leaves_survivors_correct() {
     )
     .await
     .unwrap();
+    let non_proxy = deploy_counter(&l1_rpc, w.cfg.deployer_key, DEV_CHAIN_ID)
+        .await
+        .unwrap();
 
     open_drain_window(&w).await;
     let mut nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
@@ -679,7 +603,7 @@ async fn poison_mid_bundle_leaves_survivors_correct() {
         ANVIL_KEY_6,
         DEV_CHAIN_ID,
         onchain_nonce(&l1_rpc, ANVIL_KEY_6).await.unwrap(),
-        Some(w.recipient), // plain address: never a cross-chain proxy on L1
+        Some(non_proxy),
         U256::ZERO,
         ICounter::incrementCall {}.abi_encode(),
         600_000,

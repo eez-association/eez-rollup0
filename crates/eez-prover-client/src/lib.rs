@@ -479,12 +479,8 @@ mod tests {
         let different_window_hash = B256::repeat_byte(0x7d);
         let signature = sign_65(&key, first_window_hash);
 
-        let error = verify_attestation(
-            &signature,
-            different_window_hash.as_slice(),
-            key.address(),
-        )
-        .expect_err("a signature must not authenticate a different window");
+        let error = verify_attestation(&signature, different_window_hash.as_slice(), key.address())
+            .expect_err("a signature must not authenticate a different window");
         assert!(matches!(error, ProverError::Backend(_)), "{error:?}");
     }
 

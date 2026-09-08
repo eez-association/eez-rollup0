@@ -71,9 +71,6 @@ impl PipelineError {
                 validate::ValidationError::InternalInvariant(_) => {
                     Status::internal("request pipeline invariant failed")
                 }
-                validate::ValidationError::CheckpointLimit { .. } => {
-                    Status::resource_exhausted("window validation checkpoint quota exceeded")
-                }
                 validate::ValidationError::Cancelled => {
                     Status::cancelled("Prove request cancelled")
                 }
@@ -94,14 +91,10 @@ pub(super) fn validate_and_settle(
     state: &ServiceState,
     blocks: window::AdmittedBlocks,
     submitted_post_batch_calldata: Vec<u8>,
-    max_transaction_state_checkpoints: usize,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<AttestationMaterial, PipelineError> {
-    let validated_window =
-        state
-            .validator
-            .validate_window(blocks, cancellation, max_transaction_state_checkpoints)?;
+    let validated_window = state.validator.validate_window(blocks, cancellation)?;
     if Instant::now() >= deadline {
         return Err(PipelineError::DeadlineBeforeSettlement);
     }

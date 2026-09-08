@@ -309,7 +309,6 @@ fn normalizes_validated_output_for_settlement() {
         .validate_window(
             AdmittedBlocks::for_test(window),
             &CancellationToken::default(),
-            usize::MAX,
         )
         .unwrap();
 
@@ -339,7 +338,6 @@ fn uses_the_window_pre_state_as_the_settling_pre_state_for_one_block() {
         .validate_window(
             AdmittedBlocks::for_test(window),
             &CancellationToken::default(),
-            usize::MAX,
         )
         .unwrap();
 

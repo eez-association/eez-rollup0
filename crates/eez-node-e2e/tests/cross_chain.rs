@@ -186,8 +186,12 @@ async fn minimal_bidirectional_cross_chain_smoke() {
     .await
     .expect("outbound smoke transaction must be admitted");
 
-    assert_all_transactions_succeeded(&w, &l1_rpc, &[inbound], "inbound smoke").await;
-    assert_all_transactions_succeeded(&w, &l2_rpc, &[outbound], "outbound smoke").await;
+    let inbound_hashes = [inbound];
+    let outbound_hashes = [outbound];
+    tokio::join!(
+        assert_all_transactions_succeeded(&w, &l1_rpc, &inbound_hashes, "inbound smoke"),
+        assert_all_transactions_succeeded(&w, &l2_rpc, &outbound_hashes, "outbound smoke"),
+    );
 
     let (eez, rollup_id) = (w.cfg.eez_address, w.cfg.rollup_id);
     let converged = wait_for(SETTLE_TIMEOUT, || {
@@ -294,15 +298,15 @@ async fn real_signer_rejects_tampered_witness() {
     assert_real_signer_rejects(ProverMutation::Witness, "witness").await;
 }
 
-/// Whether the response is intrinsically opaque (`ResourceExhausted`, including
-/// #120) or becomes opaque because its actionable identity is unsafe, a valid
-/// transaction may be sacrificed but must leave the retry loop at the bound.
+/// Whether the response is intrinsically opaque (`ResourceExhausted`) or becomes
+/// opaque because its actionable identity is unsafe, a valid transaction may be
+/// sacrificed but must leave the retry loop at the bound.
 async fn assert_opaque_prover_rejection_eventually_evicts_the_candidate(mutation: ProverMutation) {
-    let attester = signer_address(ANVIL_KEY_1).unwrap();
+    let attester = signer_address(ANVIL_ATTESTER_KEY).unwrap();
     let w = setup_cross_chain_proxied(mutation, attester).await.unwrap();
     let l1_rpc = w.l1_rpc();
     let l2_rpc = w.l2_rpc();
-    let starting_nonce = pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
+    let starting_nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
     let starting_value = l2_value(&l2_rpc, w.value_l2).await.unwrap();
     let tx_hash = sign_and_send(
         &w.l1_xchain(),
@@ -345,7 +349,7 @@ async fn assert_opaque_prover_rejection_eventually_evicts_the_candidate(mutation
         "a sacrificed valid transaction must not appear to have landed"
     );
     assert_eq!(
-        pending_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
+        onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
         starting_nonce,
         "the rejected transaction must not burn its source nonce"
     );
@@ -550,7 +554,7 @@ async fn direct_ccm_l2_outbound_call_is_rejected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
     // Sustained matrix: direct, no-return, wrapper, and value-transfer calls
-    // in both directions. Per-wave receipt checks avoid ingress nonce races.
+    // in both directions.
     let w = setup_cross_chain().await.unwrap();
     let l1_rpc = w.l1_rpc();
     let l1_xchain = w.l1_xchain();
@@ -572,10 +576,9 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
     let mut outbound_hashes = Vec::new();
 
     for (set_v, dep_v) in WAVE_SETTERS.iter().zip(WAVE_DEPOSITS.iter()) {
-        // Let each wave settle before deriving the next source nonces. A compose
-        // tick removes held transactions before they land on the source chain,
-        // so caching nonces across waves races the ingress gate's
-        // `on_chain + held` validation.
+        // Each wave settles before the next source nonces are derived. A compose
+        // tick can leave the prior wave in flight, so deriving from chain state
+        // before its receipts land would reuse those reserved nonces.
         let mut l1_nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
         let mut l2_nonce = onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
         let inbound_wave_start = inbound_hashes.len();
@@ -667,20 +670,20 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
             l2_nonce += 1;
         }
 
-        assert_all_transactions_succeeded(
-            &w,
-            &l1_rpc,
-            &inbound_hashes[inbound_wave_start..],
-            "inbound wave",
-        )
-        .await;
-        assert_all_transactions_succeeded(
-            &w,
-            &l2_rpc,
-            &outbound_hashes[outbound_wave_start..],
-            "outbound wave",
-        )
-        .await;
+        tokio::join!(
+            assert_all_transactions_succeeded(
+                &w,
+                &l1_rpc,
+                &inbound_hashes[inbound_wave_start..],
+                "inbound wave",
+            ),
+            assert_all_transactions_succeeded(
+                &w,
+                &l2_rpc,
+                &outbound_hashes[outbound_wave_start..],
+                "outbound wave",
+            ),
+        );
     }
 
     let expected_per_direction = WAVE_SETTERS.len() * 4;
@@ -934,25 +937,40 @@ async fn outbound_multiple_proxy_calls_in_one_transaction_are_evicted() {
     .expect("duplicate outbound proxy-call transaction must be admitted");
 
     let tx_hash = tx.to_string();
-    wait_for(SETTLE_TIMEOUT, || async {
-        let rejected = w
-            .node
-            .signals_since(signal_cursor)?
-            .into_iter()
-            .any(|signal| {
-                signal.name == signals::COMPOSER_OUTBOUND_MULTICALL_UNSUPPORTED
-                    && signal
-                        .fields
-                        .get("tx_hash")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(tx_hash.as_str())
-                    && signal.u64("rollup_id").ok() == Some(w.cfg.rollup_id)
-                    && signal.u64("entries").ok() == Some(2)
-            });
-        Ok(rejected.then_some(()))
+    let rejected_as_multicall = wait_for(SETTLE_TIMEOUT, || async {
+        let records = w.node.signals_since(signal_cursor)?;
+        let rejected_as_multicall = records.iter().any(|signal| {
+            signal.name == signals::COMPOSER_OUTBOUND_MULTICALL_UNSUPPORTED
+                && signal
+                    .fields
+                    .get("tx_hash")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(tx_hash.as_str())
+                && signal.u64("rollup_id").ok() == Some(w.cfg.rollup_id)
+                && signal.u64("entries").ok() == Some(2)
+        });
+        if rejected_as_multicall {
+            return Ok(Some(true));
+        }
+        // A generic poison eviction is terminal too. Surface it immediately as
+        // the wrong classification instead of waiting 90 seconds for a signal
+        // that can no longer arrive.
+        let generically_evicted = records.iter().any(|signal| {
+            signal.name == signals::COMPOSER_POISON_EVICTION_COMPLETED
+                && signal
+                    .fields
+                    .get("tx_hash")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(tx_hash.as_str())
+        });
+        Ok(generically_evicted.then_some(false))
     })
     .await
     .expect("composer did not report the unsupported outbound multicall");
+    assert!(
+        rejected_as_multicall,
+        "composer poison-evicted the outbound transaction before classifying its two proxy calls as an unsupported multicall",
+    );
 
     wait_for_poison_eviction(
         &w,

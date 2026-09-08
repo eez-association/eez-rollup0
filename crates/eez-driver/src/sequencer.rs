@@ -69,33 +69,6 @@ fn log_stale_parent(phase: &str) {
     );
 }
 
-enum SequencingMode {
-    Standalone,
-    Composer {
-        rollup_id: u64,
-        composer: SyncSlotComposerHandle,
-        max_speculative_depth: u64,
-        l1_head: Arc<eez_l1::L1CanonicalHead>,
-    },
-}
-
-impl fmt::Debug for SequencingMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Standalone => f.write_str("Standalone"),
-            Self::Composer {
-                rollup_id,
-                max_speculative_depth,
-                ..
-            } => f
-                .debug_struct("Composer")
-                .field("rollup_id", rollup_id)
-                .field("max_speculative_depth", max_speculative_depth)
-                .finish_non_exhaustive(),
-        }
-    }
-}
-
 /// Builds [`EthPayloadAttributes`] for the next block.
 ///
 /// Stage 1 produces minimal valid attributes: a strictly-increasing timestamp
@@ -178,9 +151,13 @@ where
     /// compute per-trigger Live/Future/Sync block composition and per-
     /// block timestamps.
     timing: RollupTiming,
-    /// Role-specific sequencing dependencies. Composer mode always has its
-    /// Sync-slot composer and L1-confirmed head; standalone mode has neither.
-    mode: SequencingMode,
+    rollup_id: u64,
+    composer: SyncSlotComposerHandle,
+    max_speculative_depth: u64,
+    l1_head: Arc<eez_l1::L1CanonicalHead>,
+    /// Consecutive Sync blocks skipped for off-grid drift. A skip self-heals
+    /// next trigger; a run of them is a stall and must be loud (invariant 7).
+    off_grid_skips: u32,
 }
 
 impl<T, ChainSpec> fmt::Debug for Sequencer<T, ChainSpec>
@@ -190,7 +167,8 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Sequencer")
             .field("committer", &self.committer)
-            .field("mode", &self.mode)
+            .field("rollup_id", &self.rollup_id)
+            .field("max_speculative_depth", &self.max_speculative_depth)
             .finish_non_exhaustive()
     }
 }
@@ -212,24 +190,6 @@ where
         + Sync
         + 'static,
 {
-    /// Construct an unanchored development sequencer around the binary-owned
-    /// `BlockCommitter` actor.
-    #[must_use]
-    pub fn standalone(
-        attributes: EthAttributesBuilder<ChainSpec>,
-        committer: BlockCommitterHandle<T>,
-        schedule_rx: mpsc::Receiver<SlotEvent>,
-        timing: RollupTiming,
-    ) -> Self {
-        Self {
-            attributes,
-            schedule_rx,
-            committer,
-            timing,
-            mode: SequencingMode::Standalone,
-        }
-    }
-
     /// Construct an L1-anchored composer sequencer. All composer-only
     /// dependencies are mandatory and share the binary-owned committer with
     /// the Composer and Deriver.
@@ -250,12 +210,11 @@ where
             schedule_rx,
             committer,
             timing,
-            mode: SequencingMode::Composer {
-                rollup_id,
-                composer,
-                max_speculative_depth,
-                l1_head,
-            },
+            rollup_id,
+            composer,
+            max_speculative_depth,
+            l1_head,
+            off_grid_skips: 0,
         }
     }
 
@@ -301,7 +260,6 @@ where
     /// Dispatch on slot event variant.
     async fn advance(&mut self, event: SlotEvent) -> DriverResult<()> {
         match event {
-            SlotEvent::Live { target_timestamp } => self.advance_live_tick(target_timestamp).await,
             SlotEvent::SyncSlot {
                 block_height,
                 timestamp,
@@ -319,47 +277,6 @@ where
         }
     }
 
-    /// Interval-mode handler: greedy backfill of Live blocks until the
-    /// chain is within one L2 block-time of `target_wall`, capped at
-    /// [`MAX_BLOCKS_PER_CATCHUP`](crate::MAX_BLOCKS_PER_CATCHUP) per
-    /// invocation so the run-loop stays responsive to FCU refreshes
-    /// and the next schedule event.
-    async fn advance_live_tick(&mut self, target_wall: u64) -> DriverResult<()> {
-        let l2_block_time = self.timing.l2_block_time().as_secs();
-        let mut produced: u64 = 0;
-
-        while produced < crate::MAX_BLOCKS_PER_CATCHUP {
-            let last_header = self.committer.last_header();
-            let gap = target_wall.saturating_sub(last_header.timestamp());
-            if gap < l2_block_time {
-                break;
-            }
-            if self.speculative_limit_paused(last_header.number()) {
-                break;
-            }
-            match self.commit_one(SlotKind::Live, &last_header).await {
-                Ok(()) => {}
-                Err(err) if err.is_stale_parent() => {
-                    log_stale_parent("backfill.live");
-                    break;
-                }
-                Err(err) => return Err(err),
-            }
-            produced += 1;
-        }
-
-        if produced == crate::MAX_BLOCKS_PER_CATCHUP {
-            event!(
-                name: "eez.sequencer.backfill.yield",
-                Level::INFO,
-                target_timestamp = target_wall,
-                last_block_timestamp = self.committer.last_header().timestamp(),
-                "hit per-trigger block cap; continuing catch-up on next tick",
-            );
-        }
-        Ok(())
-    }
-
     /// L1-anchored wall-clock tick handler: commit exactly ONE Live
     /// block, and only while the head is below the live region of the
     /// next sync slot (`sync_slot_block_height - future_count - 1`).
@@ -370,15 +287,8 @@ where
         &mut self,
         sync_slot_block_height: u64,
     ) -> DriverResult<()> {
-        let Some((rollup_id, composer)) = self.composer_context() else {
-            event!(
-                name: "eez.sequencer.mode_mismatch",
-                Level::ERROR,
-                event = "live_tick",
-                "standalone sequencer received an L1-anchored event",
-            );
-            return Ok(());
-        };
+        let rollup_id = self.rollup_id;
+        let composer = Arc::clone(&self.composer);
         // Before the head read: a mid-slot verdict would otherwise wait K
         // blocks, and recovery can reorg + substitute under us.
         composer.recover_failed(rollup_id).await;
@@ -421,6 +331,20 @@ where
         ready_ms > deadline_ms
     }
 
+    /// One skip self-heals next trigger; a run of them means production is
+    /// wedged, so escalate past a few.
+    fn note_off_grid_skip(&mut self) {
+        self.off_grid_skips = self.off_grid_skips.saturating_add(1);
+        if self.off_grid_skips >= 3 {
+            event!(
+                name: "eez.sequencer.sync_slot.off_grid_stalled",
+                Level::ERROR,
+                consecutive_skips = self.off_grid_skips,
+                "consecutive Sync blocks skipped for off-grid drift; production is not advancing",
+            );
+        }
+    }
+
     /// L1-anchored handler: read current head, compute the per-trigger
     /// Live/Future/Sync split via
     /// [`RollupTiming::per_trigger_composition`], produce accordingly.
@@ -430,15 +354,8 @@ where
         sync_slot_timestamp: u64,
         l1_head: u64,
     ) -> DriverResult<()> {
-        let Some((rollup_id, composer)) = self.composer_context() else {
-            event!(
-                name: "eez.sequencer.mode_mismatch",
-                Level::ERROR,
-                event = "sync_slot",
-                "standalone sequencer received an L1-anchored event",
-            );
-            return Ok(());
-        };
+        let rollup_id = self.rollup_id;
+        let composer = Arc::clone(&self.composer);
         // Before the composition: a pending verdict would seed the whole burst
         // on a doomed head, for compose_sync_slot to reorg away at its end.
         composer.recover_failed(rollup_id).await;
@@ -462,6 +379,13 @@ where
             "computed per-trigger slot composition",
         );
 
+        // Target an absolute height, not a count. The committer is shared, so a
+        // count re-derived from a moved head would land the Sync block off-grid.
+        let terminal = match comp {
+            SlotComposition::Catchup { live } => Some(head + live + 1),
+            SlotComposition::Slot { .. } | SlotComposition::Idle => None,
+        };
+
         match comp {
             SlotComposition::Idle => {}
             SlotComposition::Catchup { live } => {
@@ -482,6 +406,17 @@ where
                 // Terminal Sync block, parent-paced. Empty
                 // (`SyncSlotMode::Catchup`): a behind block can't ts-align its
                 // postBatch, so cross-chain waits for the next Slot.
+                if terminal != Some(self.committer.last_header().number() + 1) {
+                    event!(
+                        name: "eez.sequencer.sync_slot.off_grid_skipped",
+                        Level::WARN,
+                        head_now = self.committer.last_header().number(),
+                        terminal = ?terminal,
+                        "head moved during the burst; skipping the Sync block rather than placing it off-grid",
+                    );
+                    self.note_off_grid_skip();
+                    return Ok(());
+                }
                 let last_header = self.committer.last_header();
                 let sync_ts = last_header
                     .timestamp()
@@ -502,6 +437,7 @@ where
                         }
                         return Err(err);
                     }
+                    self.off_grid_skips = 0;
                 } else {
                     match self.commit_one(SlotKind::Sync, &last_header).await {
                         Ok(()) => {}
@@ -511,6 +447,7 @@ where
                         }
                         Err(err) => return Err(err),
                     }
+                    self.off_grid_skips = 0;
                 }
             }
             SlotComposition::Slot { live, future } => {
@@ -550,17 +487,19 @@ where
                     .timestamp()
                     .saturating_add(self.timing.l2_block_time().as_secs());
                 if expected_sync_ts != sync_slot_timestamp {
-                    // Equal on-grid; a mismatch means off-grid drift. Stamp
-                    // the parent-derived (re-derivable) value so the deriver
-                    // can still reproduce the block.
+                    // The head moved under us. This block would settle, and an
+                    // off-grid root wedges the deriver. Skip; next trigger realigns.
                     event!(
-                        name: "eez.sequencer.sync_slot.timestamp_mismatch",
+                        name: "eez.sequencer.sync_slot.off_grid_skipped",
                         Level::WARN,
                         expected = expected_sync_ts,
                         sync_slot_timestamp,
                         head = last_header.number(),
-                        "sync-slot timestamp drift: parent + L2_block_time != Scheduler-supplied sync_slot_timestamp; producing with parent-derived value",
+                        sync_slot_block_height,
+                        "sync-slot drift: parent + L2_block_time != the L1-derived sync timestamp; skipping the Sync block rather than settling off-grid",
                     );
+                    self.note_off_grid_skip();
+                    return Ok(());
                 }
 
                 // Defer-on-lateness: a late trigger that can't land the bundle
@@ -617,6 +556,7 @@ where
                         }
                         Err(err) => return Err(err),
                     }
+                    self.off_grid_skips = 0;
                     return Ok(());
                 }
 
@@ -628,6 +568,7 @@ where
                     }
                     Err(err) => return Err(err),
                 }
+                self.off_grid_skips = 0;
             }
         }
         Ok(())
@@ -635,43 +576,24 @@ where
 
     /// True if the speculative-depth limit is reached; logged at DEBUG.
     fn speculative_limit_paused(&self, head_number: u64) -> bool {
-        let (max_depth, source) = match &self.mode {
-            SequencingMode::Standalone => return false,
-            SequencingMode::Composer {
-                max_speculative_depth,
-                l1_head,
-                ..
-            } => (*max_speculative_depth, l1_head),
-        };
-        if max_depth == 0 {
+        if self.max_speculative_depth == 0 {
             return false;
         }
-        let confirmed = source.cursor();
+        let confirmed = self.l1_head.cursor();
         let speculative_depth = head_number.saturating_sub(confirmed);
-        if speculative_depth >= max_depth {
+        if speculative_depth >= self.max_speculative_depth {
             event!(
                 name: "eez.sequencer.speculative.paused",
                 Level::DEBUG,
                 head_number,
                 confirmed,
                 speculative_depth,
-                max_depth,
+                max_depth = self.max_speculative_depth,
                 "paused: speculative depth at cap; waiting for Deriver to catch up",
             );
             return true;
         }
         false
-    }
-
-    fn composer_context(&self) -> Option<(u64, SyncSlotComposerHandle)> {
-        match &self.mode {
-            SequencingMode::Standalone => None,
-            SequencingMode::Composer {
-                rollup_id,
-                composer,
-                ..
-            } => Some((*rollup_id, Arc::clone(composer))),
-        }
     }
 
     /// Commit a pre-built Sync block (from the cross-chain composer)

@@ -302,7 +302,7 @@ fi
 
 genesis_files=(
     "$REPO/genesis.json"
-    "$REPO/crates/eez-node/tests/fixtures/genesis.json"
+    "$REPO/crates/eez-node-e2e/tests/fixtures/genesis.json"
 )
 rendered_files=()
 for genesis in "${genesis_files[@]}"; do
