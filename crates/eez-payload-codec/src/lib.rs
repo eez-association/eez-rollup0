@@ -239,7 +239,7 @@ mod tests {
                     vec![vec![0x82, 0xab, 0xcd], vec![0x7f]],
                 ],
                 l2_entries: vec![vec![], vec![0xde, 0xad, 0xbe, 0xef], vec![0x00]],
-                encoded_hex: "00d3c3018002c6018382abcd7fc78084deadbeef00",
+                encoded_hex: "00ddc3018002cbc101c6818281ab81cdc17fccc0c881de81ad81be81efc180",
             },
         ];
 

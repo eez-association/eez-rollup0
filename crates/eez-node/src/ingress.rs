@@ -687,8 +687,7 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
         for _ in 0..2 {
-            asserter.push_success(&U256::from(1_000_000u64));
-            asserter.push_success(&0_u64);
+            push_admission_lookups(&asserter, 1_000_000, 0);
         }
 
         let first =
