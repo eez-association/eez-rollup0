@@ -506,4 +506,153 @@ mod tests {
         assert!(pool.take_rolled_out(0).is_empty());
         assert_eq!(pool.blocking_height(12), Some(15));
     }
+
+    #[test]
+    fn resolved_gate_allows_the_next_sync_slot() {
+        let pool = OptimisticallyIncluded::new();
+        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+        pool.mark_settled(10);
+
+        // The relay verdict alone is deliberately insufficient.
+        assert_eq!(pool.blocking_height(9), Some(10));
+        assert_eq!(pool.resolve_below_cursor(10).len(), 1);
+        assert_eq!(pool.blocking_height(10), None);
+
+        // A subsequent slot can take the one-in-flight reservation.
+        pool.begin(11, pb_hash(0xb), hdr(), vec![tx(2)]);
+        assert_eq!(pool.blocking_height(10), Some(11));
+    }
+
+    #[test]
+    fn consecutive_failed_batches_leave_no_stale_gate_or_transactions() {
+        let pool = OptimisticallyIncluded::new();
+
+        for (height, tag) in [(10, 1), (11, 2)] {
+            pool.begin(height, pb_hash(tag), hdr(), vec![tx(tag)]);
+            pool.mark_failed(height, false);
+            let failed = pool
+                .take_failed_for_recovery(height - 1)
+                .expect("failed batch must be recovered exactly once");
+            assert_eq!(failed.sync_height, height);
+            assert_eq!(failed.txs.len(), 1);
+            assert!(pool.take_failed_for_recovery(height - 1).is_none());
+            assert_eq!(pool.blocking_height(height - 1), None);
+        }
+
+        assert!(pool.by_sync_height.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn peer_consuming_the_same_held_transaction_reconciles_each_ledger_once() {
+        // Both composers selected the same raw user transaction but signed
+        // different postBatch envelopes. The peer's canonical batch consumes the
+        // shared entry, so each local ledger releases its reservation exactly once.
+        let shared = tx(1);
+        let composer_a = OptimisticallyIncluded::new();
+        let composer_b = OptimisticallyIncluded::new();
+        composer_a.begin(10, pb_hash(0xa), hdr(), vec![shared.clone()]);
+        composer_b.begin(10, pb_hash(0xb), hdr(), vec![shared]);
+
+        composer_b.mark_settled(10);
+        let winner_release = composer_b.resolve_below_cursor(10);
+        let peer_release = composer_a.resolve_below_cursor(10);
+        assert_eq!(winner_release.len(), 1);
+        assert_eq!(peer_release.len(), 1);
+        assert_eq!(winner_release[0].hash, peer_release[0].hash);
+        assert!(composer_a.resolve_below_cursor(10).is_empty());
+        assert!(composer_b.resolve_below_cursor(10).is_empty());
+        assert!(composer_a.take_failed_for_recovery(0).is_none());
+        assert!(composer_b.take_failed_for_recovery(0).is_none());
+    }
+
+    #[test]
+    #[ignore = "known defect: cursor confirmation has no postBatch identity"]
+    fn rival_post_batch_at_same_height_does_not_resolve_local_entry() {
+        use eez_l1::{BatchRecord, L1CanonicalHead};
+
+        let local_hash = pb_hash(0xa);
+        let rival_hash = pb_hash(0xb);
+        let ledger = OptimisticallyIncluded::new();
+        ledger.begin(10, local_hash, hdr(), vec![tx(1)]);
+
+        // Model the only signal the composer currently consumes: the deriver
+        // indexed a peer's batch and advanced the shared cursor to our height.
+        let canonical = L1CanonicalHead::default();
+        canonical.append(BatchRecord {
+            l1_block: 100,
+            l1_block_hash: B256::repeat_byte(0xc),
+            tx_hash: rival_hash,
+            last_l2_block: 10,
+        });
+        assert!(!canonical.contains_l1_tx(&local_hash));
+
+        let released = ledger.resolve_below_cursor(canonical.cursor());
+        assert!(
+            released.is_empty(),
+            "a peer's canonical batch must not release our held transaction"
+        );
+        let map = ledger.by_sync_height.lock().unwrap();
+        let local = map.get(&10).expect("local entry remains owned");
+        assert_eq!(local.resolution, Resolution::Pending);
+        assert!(!local.cursor_confirmed);
+    }
+
+    #[test]
+    #[ignore = "known defect: peer cursor advancement overrides the local Failed verdict"]
+    fn rival_cursor_does_not_override_failure_when_observer_finishes_first() {
+        let ledger = OptimisticallyIncluded::new();
+        ledger.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+        ledger.mark_failed(10, false);
+
+        let released = ledger.resolve_below_cursor(10);
+        assert!(
+            released.is_empty(),
+            "unrelated cursor advancement must not convert Failed to Settled"
+        );
+        let map = ledger.by_sync_height.lock().unwrap();
+        assert_eq!(map.get(&10).unwrap().resolution, Resolution::Failed);
+    }
+
+    #[test]
+    #[ignore = "known defect: a failure arriving after peer cursor advancement is ignored"]
+    fn late_failure_remains_recoverable_after_rival_cursor_advances() {
+        let ledger = OptimisticallyIncluded::new();
+        ledger.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+
+        let released = ledger.resolve_below_cursor(10);
+        ledger.mark_failed(10, false);
+
+        assert!(
+            released.is_empty(),
+            "peer confirmation must not release the local reservation"
+        );
+        let map = ledger.by_sync_height.lock().unwrap();
+        assert_eq!(map.get(&10).unwrap().resolution, Resolution::Failed);
+        assert!(!map.get(&10).unwrap().cursor_confirmed);
+    }
+
+    #[test]
+    #[ignore = "known defect: take_finalized removes ownership before an RPC audit completes"]
+    fn inconclusive_finality_audit_keeps_the_entry_for_retry() {
+        let ledger = OptimisticallyIncluded::new();
+        ledger.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+        ledger.mark_settled(10);
+
+        // The caller took the candidate, then its receipt RPC returned Err.
+        // With no conclusive present/absent result, the next audit must still
+        // be able to claim exactly the same entry.
+        let first_attempt = ledger.take_finalized(10);
+        assert_eq!(first_attempt.len(), 1);
+        drop(first_attempt);
+
+        let retry = ledger.take_finalized(10);
+        assert_eq!(
+            retry.len(),
+            1,
+            "an inconclusive audit must retain ownership"
+        );
+        assert_eq!(retry[0].0, 10);
+        assert_eq!(retry[0].1, pb_hash(0xa));
+        assert_eq!(retry[0].2.len(), 1);
+    }
 }

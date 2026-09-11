@@ -4933,6 +4933,59 @@ mod tests {
     }
 
     #[test]
+    fn eip_7825_user_cap_is_independent_of_sync_block_fit() {
+        // An invalid user limit can still fit in the aggregate Sync-block budget.
+        const EIP_7825_TX_GAS_LIMIT: u64 = 1 << 24;
+        const SYSTEM_TX_GAS_LIMIT: u64 = 2_000_000;
+        let invalid_user_limit = EIP_7825_TX_GAS_LIMIT + 1;
+        let pair_limit = SYSTEM_TX_GAS_LIMIT + invalid_user_limit;
+
+        assert_eq!(
+            block_gas_fit(0, pair_limit, BUILDER_GAS_LIMIT),
+            BlockGasFit::Accept,
+            "block capacity alone must not be treated as user-transaction validity",
+        );
+        assert!(invalid_user_limit > EIP_7825_TX_GAS_LIMIT);
+        assert!(pair_limit < BUILDER_GAS_LIMIT);
+    }
+
+    #[test]
+    fn declared_user_gas_limit_preserves_eip_7825_boundary() {
+        // The drain must compare the decoded user limit, not the aggregate pair.
+        use alloy_consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
+        use alloy_network::{TxSignerSync as _, eip2718::Encodable2718 as _};
+        use alloy_primitives::{Address, TxKind, U256};
+        use alloy_signer_local::PrivateKeySigner;
+
+        const EIP_7825_TX_GAS_LIMIT: u64 = 1 << 24;
+        let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap();
+        let encode = |gas_limit| {
+            let mut tx = TxEip1559 {
+                chain_id: 6290,
+                nonce: 0,
+                gas_limit,
+                max_fee_per_gas: 1,
+                max_priority_fee_per_gas: 1,
+                to: TxKind::Call(Address::ZERO),
+                value: U256::ZERO,
+                access_list: Default::default(),
+                input: Bytes::new(),
+            };
+            let signature = signer.sign_transaction_sync(&mut tx).unwrap();
+            Bytes::from(TxEnvelope::from(tx.into_signed(signature)).encoded_2718())
+        };
+
+        assert_eq!(
+            declared_gas_limit(&encode(EIP_7825_TX_GAS_LIMIT)),
+            EIP_7825_TX_GAS_LIMIT,
+        );
+        assert_eq!(
+            declared_gas_limit(&encode(EIP_7825_TX_GAS_LIMIT + 1)),
+            EIP_7825_TX_GAS_LIMIT + 1,
+        );
+    }
+
+    #[test]
     fn stale_partition_fails_open_without_a_source_nonce() {
         let tx = held(Address::repeat_byte(0xf), Direction::Outbound, 9, 1);
         let (fresh, stale) = partition_stale(vec![tx.clone()], &HashMap::new());

@@ -24,6 +24,7 @@ import urllib.request
 
 class Handler(http.server.BaseHTTPRequestHandler):
     upstream = ""
+    mode = "forward"
 
     def log_message(self, *_):
         pass
@@ -61,7 +62,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(400)
             return
 
-        if body.get("method") == "eth_sendBundle":
+        if body.get("method") == "eez_setBuilderMode":
+            mode = body.get("params", [None])[0]
+            if mode not in ("forward", "drop", "method_not_found"):
+                resp = json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": body.get("id"),
+                    "error": {"code": -32602, "message": "invalid builder stub mode"},
+                }).encode()
+            else:
+                Handler.mode = mode
+                resp = json.dumps({
+                    "jsonrpc": "2.0", "id": body.get("id"), "result": mode,
+                }).encode()
+        elif body.get("method") == "eth_sendBundle" and Handler.mode == "method_not_found":
+            resp = json.dumps({
+                "jsonrpc": "2.0",
+                "id": body.get("id"),
+                "error": {"code": -32601, "message": "method not found"},
+            }).encode()
+        elif body.get("method") == "eth_sendBundle" and Handler.mode == "drop":
+            # Model a relay that accepts a bundle but never includes it.
+            resp = json.dumps({
+                "jsonrpc": "2.0",
+                "id": body.get("id"),
+                "result": {"bundleHash": "0x" + "00" * 32},
+            }).encode()
+        elif body.get("method") == "eth_sendBundle":
             params = body["params"][0]
             txs = params.get("txs", [])
             if len(txs) != 1:

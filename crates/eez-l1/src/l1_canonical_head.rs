@@ -308,4 +308,27 @@ mod tests {
         assert_eq!(head.highest_l2_at_or_below_l1(101), Some(70));
         assert_eq!(head.highest_l2_at_or_below_l1(99), None);
     }
+
+    #[test]
+    fn alternating_composer_batches_advance_one_linear_cursor_without_gaps() {
+        // Transaction hashes alternate between two poster identities. The canonical
+        // index must retain every batch and advance through the exact L2 sequence.
+        let head = L1CanonicalHead::default();
+        for (l1_block, tx_byte, l2_height) in [
+            (100, 0xa1, 1),
+            (101, 0xb1, 2),
+            (102, 0xa2, 3),
+            (103, 0xb2, 4),
+        ] {
+            assert_eq!(head.cursor(), l2_height - 1);
+            head.append(record(l1_block, tx_byte, l2_height));
+            assert_eq!(head.cursor(), l2_height);
+            assert!(head.contains_l1_tx(&B256::with_last_byte(tx_byte)));
+        }
+        assert_eq!(head.known_tx_hashes().len(), 4);
+        assert_eq!(head.highest_l2_at_or_below_l1(100), Some(1));
+        assert_eq!(head.highest_l2_at_or_below_l1(101), Some(2));
+        assert_eq!(head.highest_l2_at_or_below_l1(102), Some(3));
+        assert_eq!(head.highest_l2_at_or_below_l1(103), Some(4));
+    }
 }

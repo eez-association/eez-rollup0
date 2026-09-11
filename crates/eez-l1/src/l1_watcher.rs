@@ -1567,6 +1567,110 @@ mod tests {
         assert_eq!(state.lookup_hash(B256::with_last_byte(2)), Some(2));
     }
 
+    fn depth_boundary_state() -> WatcherState {
+        let canonical = |number: u64| B256::with_last_byte(number as u8);
+        let mut state = WatcherState::new(3);
+        for number in 97..=100 {
+            state.push_canonical(number, canonical(number));
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn reorg_below_depth_ceiling_finds_the_common_ancestor() {
+        let canonical = |number: u64| B256::with_last_byte(number as u8);
+        let state = depth_boundary_state();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let new_99 = B256::with_last_byte(0xd9);
+        asserter.push_success(&mock_block(99, new_99, canonical(98), 99));
+        let common = walk_back_to_common(&provider, new_99, 99, &state)
+            .await
+            .unwrap()
+            .expect("depth below cap is handled");
+        assert_eq!(common.number, 98);
+    }
+
+    #[tokio::test]
+    #[ignore = "known boundary defect: a depth-D ring retains the tip plus only D-1 ancestors"]
+    async fn reorg_exactly_at_depth_ceiling_finds_the_common_ancestor() {
+        let canonical = |number: u64| B256::with_last_byte(number as u8);
+        let state = depth_boundary_state();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let new_99 = B256::with_last_byte(0xe9);
+        let new_98 = B256::with_last_byte(0xe8);
+        asserter.push_success(&mock_block(99, new_99, new_98, 99));
+        asserter.push_success(&mock_block(98, new_98, canonical(97), 98));
+        asserter.push_success(&mock_block(97, canonical(97), canonical(96), 97));
+        let common = walk_back_to_common(&provider, new_99, 99, &state)
+            .await
+            .unwrap()
+            .expect("reorg exactly at cap is handled");
+        assert_eq!(common.number, 97);
+    }
+
+    #[tokio::test]
+    async fn reorg_beyond_depth_ceiling_has_no_common_ancestor() {
+        let canonical = |number: u64| B256::with_last_byte(number as u8);
+        let state = depth_boundary_state();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let new_99 = B256::with_last_byte(0xf9);
+        let new_98 = B256::with_last_byte(0xf8);
+        let new_97 = B256::with_last_byte(0xf7);
+        asserter.push_success(&mock_block(99, new_99, new_98, 99));
+        asserter.push_success(&mock_block(98, new_98, new_97, 98));
+        asserter.push_success(&mock_block(97, new_97, canonical(96), 97));
+        assert!(
+            walk_back_to_common(&provider, new_99, 99, &state)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "known finality defect: refresh_finalized currently accepts a replacement finalized hash"]
+    async fn changed_finalized_block_is_a_loud_failure_not_a_new_finality_event() {
+        // A finalized height cannot legitimately acquire a replacement hash.
+        let (watcher, mut rx) = test_watcher();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let finalized_a = B256::with_last_byte(0xa0);
+        let finalized_b = B256::with_last_byte(0xb0);
+        let parent = B256::with_last_byte(0x9f);
+        let mut state = WatcherState::new(3);
+
+        asserter.push_success(&mock_block(100, finalized_a, parent, 1_000));
+        watcher
+            .refresh_finalized(&provider, &mut state)
+            .await
+            .expect("first finalized observation is accepted");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(L1Event::Finalized {
+                block_number: 100,
+                block_hash,
+            }) if block_hash == finalized_a
+        ));
+
+        // Do not overwrite the remembered finality boundary or emit a new event.
+        asserter.push_success(&mock_block(100, finalized_b, parent, 1_001));
+        let result = watcher.refresh_finalized(&provider, &mut state).await;
+        assert!(
+            result.is_err(),
+            "a mutated finalized block must halt loudly; state became {:?}",
+            state.last_finalized_hash
+        );
+        assert_eq!(state.last_finalized_hash, Some(finalized_a));
+        assert!(
+            rx.try_recv().is_err(),
+            "no replacement Finalized event may escape after the invariant violation"
+        );
+    }
+
     #[test]
     fn watcher_state_rewinds() {
         let mut state = WatcherState::new(10);

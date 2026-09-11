@@ -266,6 +266,71 @@ mod tests {
         assert_eq!(ReconcileCheckpoint::load(dir.path()), Some(cp));
     }
 
+    #[test]
+    fn complete_newer_temp_generation_cannot_shadow_the_committed_checkpoint() {
+        // A fully written temp file is still not a committed generation.
+        let dir = tempfile::tempdir().unwrap();
+        let committed = sample();
+        committed.save(dir.path()).unwrap();
+        let uncommitted = ReconcileCheckpoint {
+            l1_block: committed.l1_block + 1,
+            l2_cursor: committed.l2_cursor + 10,
+            ..committed
+        };
+        fs::write(
+            ReconcileCheckpoint::path(dir.path()).with_extension("tmp"),
+            uncommitted.encode(),
+        )
+        .unwrap();
+
+        assert_eq!(ReconcileCheckpoint::load(dir.path()), Some(committed));
+    }
+
+    #[test]
+    fn temp_only_first_generation_is_not_a_checkpoint() {
+        // A first-write crash may leave only the uncommitted temp file.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            ReconcileCheckpoint::path(dir.path()).with_extension("tmp"),
+            sample().encode(),
+        )
+        .unwrap();
+
+        assert_eq!(ReconcileCheckpoint::load(dir.path()), None);
+    }
+
+    #[test]
+    fn failed_replacement_preserves_the_previous_generation() {
+        // A directory at the temp path deterministically makes replacement fail.
+        let dir = tempfile::tempdir().unwrap();
+        let committed = sample();
+        committed.save(dir.path()).unwrap();
+        fs::create_dir(ReconcileCheckpoint::path(dir.path()).with_extension("tmp")).unwrap();
+
+        let newer = ReconcileCheckpoint {
+            l1_block: committed.l1_block + 1,
+            ..committed
+        };
+        assert!(newer.save(dir.path()).is_err());
+        assert_eq!(ReconcileCheckpoint::load(dir.path()), Some(committed));
+    }
+
+    #[test]
+    #[ignore = "known parser ambiguity: duplicate fields currently use the last value"]
+    fn duplicate_fields_are_rejected_instead_of_last_value_winning() {
+        let original = sample();
+        for duplicate in [
+            "l1_block=999",
+            "l1_block_hash=0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "tx_hash=0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "l2_cursor=999",
+            "l2_state_root=0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        ] {
+            let ambiguous = format!("{}{duplicate}\n", original.encode());
+            assert_eq!(ReconcileCheckpoint::decode(&ambiguous), None, "{duplicate}");
+        }
+    }
+
     /// The whole safety argument: a checkpoint is adopted ONLY when both
     /// recorded facts still hold. Every other combination must fall back.
     #[test]
