@@ -594,6 +594,65 @@ pub fn decode_postbatch(calldata: &[u8]) -> alloy_sol_types::Result<EvmBatch> {
     Ok(postAndVerifyBatchCall::abi_decode(calldata)?.batch)
 }
 
+/// One `postAndVerifyBatch` call found inside an L1 transaction's `input`.
+#[derive(Debug)]
+pub struct PostBatchCandidate<'a> {
+    /// The exact bytes this decoded from, so a caller can store calldata that
+    /// still decodes selector-strict.
+    pub calldata: &'a [u8],
+    /// The batch those bytes carry.
+    pub batch: EvmBatch,
+}
+
+/// Every `postAndVerifyBatch` call embedded in `input`, in byte order.
+///
+/// A router forwards the real call as a `bytes` argument, so the top-level
+/// selector proves nothing. Complete rather than first-match: an input can hold
+/// several real calls, or bytes that merely look like one, and only the
+/// caller's execution context can pick between them.
+#[must_use]
+pub fn postbatch_candidates(input: &[u8]) -> Vec<PostBatchCandidate<'_>> {
+    let selector = postAndVerifyBatchCall::SELECTOR;
+    let mut found = Vec::new();
+    let mut from = 0usize;
+    while let Some(pos) = input
+        .get(from..)
+        .and_then(|tail| tail.windows(selector.len()).position(|w| w == selector))
+    {
+        let at = from + pos;
+        if let Some(candidate) = candidate_at(input, at) {
+            found.push(candidate);
+        }
+        from = at + 1;
+    }
+    found
+}
+
+/// Decode the call starting at `at`, preferring the exactly-sized slice a
+/// router forwarded so the stored calldata carries none of the wrapper's tail.
+fn candidate_at(input: &[u8], at: usize) -> Option<PostBatchCandidate<'_>> {
+    let exact = forwarded_len(input, at).and_then(|len| input.get(at..at.checked_add(len)?));
+    [exact, input.get(at..)]
+        .into_iter()
+        .flatten()
+        .find_map(|calldata| {
+            decode_postbatch(calldata)
+                .ok()
+                .map(|batch| PostBatchCandidate { calldata, batch })
+        })
+}
+
+/// Length of the ABI `bytes` argument an embedded call sits in, read from the
+/// preceding word when it looks like one: 24 zero bytes, then a usable length.
+fn forwarded_len(input: &[u8], at: usize) -> Option<usize> {
+    let word = input.get(at.checked_sub(32)?..at)?;
+    if !word[..24].iter().all(|b| *b == 0) {
+        return None;
+    }
+    let len = usize::try_from(u64::from_be_bytes(word[24..].try_into().ok()?)).ok()?;
+    (len >= postAndVerifyBatchCall::SELECTOR.len()).then_some(len)
+}
+
 fn supported_return_data(call: &ExecutedAction) -> ProtocolResult<&[u8]> {
     if call.outcome.is_pending() {
         return Err(crate::ProtocolErrorKind::InvalidEncoding(
@@ -996,5 +1055,83 @@ mod tests {
         let encoded = encode_postbatch(&batch);
         assert_eq!(&encoded[..4], &postAndVerifyBatchCall::SELECTOR);
         assert_eq!(decode_postbatch(&encoded).unwrap().entries.len(), 0);
+    }
+
+    /// Wrap `calls` the way a router does: its own selector, one head word per
+    /// forwarded `bytes` arg, then each length-prefixed, 32-byte-padded call.
+    fn wrap_in_router(calls: &[&[u8]]) -> Vec<u8> {
+        let mut out = vec![0x6f, 0xad, 0xcf, 0x72]; // arbitrary router selector
+        let mut offset = 32 * calls.len();
+        for call in calls {
+            out.extend_from_slice(&U256::from(offset).to_be_bytes::<32>());
+            offset += 32 + call.len().next_multiple_of(32);
+        }
+        for call in calls {
+            out.extend_from_slice(&U256::from(call.len()).to_be_bytes::<32>());
+            out.extend_from_slice(call);
+            out.resize(
+                out.len() + (call.len().next_multiple_of(32) - call.len()),
+                0,
+            );
+        }
+        out
+    }
+
+    fn batch_with(immediate: u64) -> EvmBatch {
+        EvmBatch {
+            immediateEntryCount: U256::from(immediate),
+            ..Default::default()
+        }
+    }
+
+    /// A plain postBatch is its own single candidate, calldata unchanged.
+    #[test]
+    fn a_direct_call_is_its_own_candidate() {
+        let encoded = encode_postbatch(&batch_with(1));
+        let found = postbatch_candidates(&encoded);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].calldata, &encoded[..]);
+        assert_eq!(found[0].batch.immediateEntryCount, U256::from(1));
+    }
+
+    /// A router-posted batch: the top-level selector is the router's, and the
+    /// real call rides as a padded `bytes` arg. The candidate's calldata is the
+    /// forwarded call exactly — no wrapper tail, so it stays selector-strict.
+    #[test]
+    fn a_router_wrapped_call_is_found_with_its_exact_calldata() {
+        let inner = encode_postbatch(&batch_with(1));
+        let wrapped = wrap_in_router(&[&inner]);
+
+        assert_ne!(&wrapped[..4], &postAndVerifyBatchCall::SELECTOR);
+        assert!(
+            decode_postbatch(&wrapped).is_err(),
+            "direct decode must fail"
+        );
+        let found = postbatch_candidates(&wrapped);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].calldata, &inner[..], "padding must not be carried");
+        assert_eq!(found[0].batch.immediateEntryCount, U256::from(1));
+    }
+
+    /// A multicall router runs several calls in one tx. Every one is
+    /// enumerated, in byte order — first-match would lose all but the first.
+    #[test]
+    fn every_embedded_call_is_enumerated_in_byte_order() {
+        let first = encode_postbatch(&batch_with(11));
+        let second = encode_postbatch(&batch_with(22));
+        let wrapped = wrap_in_router(&[&first, &second]);
+
+        let found = postbatch_candidates(&wrapped);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].batch.immediateEntryCount, U256::from(11));
+        assert_eq!(found[1].batch.immediateEntryCount, U256::from(22));
+    }
+
+    /// Calldata holding no postAndVerifyBatch yields nothing to choose from,
+    /// so a caller reports the selector mismatch instead of an empty batch.
+    #[test]
+    fn foreign_calldata_yields_no_candidates() {
+        let foreign = [vec![0x6f, 0xad, 0xcf, 0x72], vec![0u8; 128]].concat();
+        assert!(postbatch_candidates(&foreign).is_empty());
     }
 }
