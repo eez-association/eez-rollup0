@@ -11,6 +11,7 @@ description            = "EEZ attestation daemon: re-executes composer-streamed 
 eez-control-rpc.workspace = true
 # Canonical `postAndVerifyBatch` ABI types and codec.
 eez-protocol.workspace = true
+eez-payload-codec.workspace = true
 
 alloy-consensus.workspace = true
 alloy-genesis.workspace = true

@@ -40,6 +40,15 @@ fn fixture_u64(value: &serde_json::Value, field: &str) -> u64 {
     value[field].as_u64().unwrap()
 }
 
+/// Captured from Chiado under the RLP DA payload: `postbatch.hex` is the exact
+/// calldata mined in a real transaction, with a recorded digest and an
+/// independently generated signature. `native_block_span_v0` changes the bytes
+/// inside `batch.callData`, so this artifact can no longer validate and cannot
+/// be edited into one that does — a real anchor has to be recaptured on the new
+/// format and the fixture (calldata, digest, expected signature) regenerated
+/// with it. Ignored, not deleted: it is the only end-to-end regression anchor
+/// against captured production data.
+#[ignore = "fixture captures the pre-span DA payload; recapture on the new format"]
 #[tokio::test]
 async fn captured_current_protocol_window_is_validated_and_signed() {
     const FIXTURE: &str = "captured-anchor-40155";
